@@ -1,9 +1,16 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  canonicalKeys,
+  canonicalShapes,
+  nestedWire,
+} from "./cache-affinity-canonical.test-fixtures.js";
+import {
   asJson,
   canonicalizeAffinitySurface,
   extractAffinityLayers,
+  MAX_CANONICAL_DEPTH,
+  stableJson,
 } from "./cache-affinity-layers.js";
 
 const extractorSource = readFileSync(
@@ -576,4 +583,54 @@ describe("extractAffinityLayers", () => {
       }).consumedKeys,
     ).not.toContain("tools");
   });
+});
+
+describe("R2 canonical JSON contract", () => {
+  it.each(canonicalKeys.flatMap((key) => canonicalShapes.map((shape) => ({ key, shape }))))(
+    "preserves own $key in $shape wire JSON",
+    ({ key, shape }) => {
+      const leaf = `{${JSON.stringify(key)}:{"const":"one"},"__proto__":{"const":"one"}}`;
+      const wire =
+        shape === "array" ? `[${leaf}]` : shape === "mixed" ? `{"nested":[${leaf}]}` : leaf;
+      const parsed = JSON.parse(wire);
+      const converted = asJson(parsed)!;
+      const text = stableJson(converted);
+      expect(JSON.parse(text)).toEqual(parsed);
+      expect(text).toContain('"__proto__":{"const":"one"}');
+      expect(text).toContain(`${JSON.stringify(key)}:{"const":"one"}`);
+    },
+  );
+
+  it("own key ordering is stable and duplicate wire keys are last-wins", () => {
+    const one = asJson(JSON.parse('{"__proto__":{"const":1},"0":0,"":2,"constructor":3}'))!;
+    const two = asJson(
+      JSON.parse('{"constructor":3,"":2,"0":0,"__proto__":{"const":0},"__proto__":{"const":1}}'),
+    )!;
+    expect(stableJson(one)).toBe(stableJson(two));
+    expect(
+      Object.getOwnPropertyDescriptor(JSON.parse(stableJson(two)), "__proto__")?.value,
+    ).toEqual({ const: 1 });
+    expect(stableJson(two)).not.toBe(
+      stableJson(asJson(JSON.parse('{"constructor":3,"":2,"0":0,"__proto__":{"const":0}}'))!),
+    );
+  });
+
+  it.each(canonicalShapes)(
+    "bounds $0 recursion before descending and rejects the whole value",
+    (shape) => {
+      expect(asJson(JSON.parse(nestedWire(MAX_CANONICAL_DEPTH, shape)))).toBeDefined();
+      for (const depth of [MAX_CANONICAL_DEPTH + 1, 10_000]) {
+        const parsed = JSON.parse(nestedWire(depth, shape));
+        expect(() => asJson(parsed)).not.toThrow();
+        expect(asJson(parsed)).toBeUndefined();
+      }
+    },
+  );
+});
+
+it("R2 converter enforces the exact 2 MiB size boundary atomically", () => {
+  const atBound = "x".repeat(2 * 1024 * 1024 - 2);
+  expect(asJson(atBound)).toBe(atBound);
+  expect(asJson(`${atBound}x`)).toBeUndefined();
+  expect(asJson({ first: "safe", last: atBound })).toBeUndefined();
 });

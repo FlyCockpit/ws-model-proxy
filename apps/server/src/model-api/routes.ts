@@ -7095,21 +7095,25 @@ async function relaySelectedModelNoFailover({
           ),
         )
       : null;
-  const boundMaterial =
-    boundAffinityTarget && requestedModelPoolId
-      ? affinityPrefixDigests({
-          ownerId: requester.userId,
-          resourceOwnerId: selected.userId,
-          poolId: requestedModelPoolId,
-          securityScope: requester.limitKey,
-          accessGrantId: poolAccess?.accessGrantId,
-          surface: "OPENAI_RESPONSES",
-          payload: operation.contextInput!,
-          headers: request.headers,
-          sessionBinding: operation.sessionBinding,
-          runtimeIdentity: boundAffinityTarget.targetIdentity,
-        })
-      : null;
+  let boundMaterial: ReturnType<typeof affinityPrefixDigests> | null = null;
+  if (boundAffinityTarget && requestedModelPoolId) {
+    try {
+      boundMaterial = affinityPrefixDigests({
+        ownerId: requester.userId,
+        resourceOwnerId: selected.userId,
+        poolId: requestedModelPoolId,
+        securityScope: requester.limitKey,
+        accessGrantId: poolAccess?.accessGrantId,
+        surface: "OPENAI_RESPONSES",
+        payload: operation.contextInput!,
+        headers: request.headers,
+        sessionBinding: operation.sessionBinding,
+        runtimeIdentity: boundAffinityTarget.targetIdentity,
+      });
+    } catch (error) {
+      metadataUpdateError(error);
+    }
+  }
   const boundSessionId =
     selectedPoolMember?.ModelPool?.affinityEnabled &&
     boundMaterial &&

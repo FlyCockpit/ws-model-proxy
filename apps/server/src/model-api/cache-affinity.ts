@@ -7,12 +7,13 @@ import {
   canonicalizeAffinitySurface,
   extractAffinityLayers,
   type JsonValue,
+  MAX_CANONICAL_BYTES,
+  stableJson,
 } from "./cache-affinity-layers.js";
 
 const DIGEST_VERSION = 5;
 const MAX_PREFIXES_PER_REQUEST = 64;
 const MAX_INSTRUCTION_PREFIXES = 8;
-const MAX_CANONICAL_BYTES = 2 * 1024 * 1024;
 
 export type AffinityPolicy = {
   enabled: boolean;
@@ -105,15 +106,6 @@ export function buildAffinityTargetIdentity(parts: {
     purpose: "cacheAffinity",
     value: stableJson({ version: 2, ...parts }),
   });
-}
-
-function stableJson(value: JsonValue): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-  return `{${Object.keys(value)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${stableJson(value[key]!)}`)
-    .join(",")}}`;
 }
 
 export const FREE_SAMPLING_PARAMS = [
@@ -251,8 +243,39 @@ export type AffinityMaterial = {
   parentTipDepth?: number;
 };
 
+function unidentifiableMaterial(canonicalBytes = MAX_CANONICAL_BYTES + 1): AffinityMaterial {
+  return {
+    bindingDigest: "",
+    rootDigest: "",
+    instructionDigests: [],
+    digests: [],
+    nodes: [],
+    routingNodes: [],
+    conversationDigest: null,
+    hasExplicitConversation: false,
+    isContinuation: false,
+    identifiable: false,
+    canonicalBytes,
+    missingParent: false,
+  };
+}
+
+/** Advisory identity must never reject a served request or expose partial material. */
+export function affinityPrefixDigests(
+  args: Parameters<typeof buildAffinityMaterial>[0],
+): AffinityMaterial {
+  try {
+    const payload = asJson(args.payload);
+    if (!payload || typeof payload !== "object" || Array.isArray(payload))
+      return unidentifiableMaterial();
+    return buildAffinityMaterial({ ...args, payload });
+  } catch {
+    return unidentifiableMaterial();
+  }
+}
+
 /** One chain for both routing warmth and session continuity; only its tail is retained. */
-export function affinityPrefixDigests({
+function buildAffinityMaterial({
   ownerId,
   resourceOwnerId,
   poolId,
@@ -353,6 +376,7 @@ export function affinityPrefixDigests({
     nodes.push({ digest: tip, depth });
     if (nodes.length > MAX_PREFIXES_PER_REQUEST) nodes.shift();
   }
+  if (canonicalBytes > MAX_CANONICAL_BYTES) return unidentifiableMaterial(canonicalBytes);
   const missingParent =
     canonicalSurface === "openai-responses" &&
     typeof payload.previous_response_id === "string" &&

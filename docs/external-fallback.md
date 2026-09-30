@@ -292,11 +292,14 @@ full history containing the same create+delta units can match those retained
 nodes when it contains continuation evidence (assistant/tool output). A
 user-only history stays fresh under the starter rule. A missing/expired parent
 publishes no delta-only nodes, including with a client id; that id can still
-identify the session footprint. Histories over 2 MB publish no nodes or lineage,
-but retain instruction routing hints and the last 64 under-cap chain hints.
-These hints never enter identity resolution. Without a client id, unidentifiable
-requests write no per-session footprint; routing hints share one fresh id per
-completion, so overwritten hints do not create phantom protected sessions.
+identify the session footprint. Canonicalization preserves every own JSON key,
+including `__proto__`. Its depth limit is 128 (request root at depth 0; each object
+property or array entry adds one level), and its canonical JSON / cumulative
+identity size cap is 2 MiB. Exceeding either bound makes the **whole request
+unidentifiable**: no identity nodes, routing or instruction hints, client session
+footprint, or Responses lineage are published. Affinity errors also fail closed;
+the request is still served, including bound Responses follow-ups. Realistic
+nested schemas within both bounds remain identifiable.
 
 Retention keeps at most 64 nodes and one tip per identifiable session, plus a
 separate session footprint. Pruning removes hints for discarded conversation

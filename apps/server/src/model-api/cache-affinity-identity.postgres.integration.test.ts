@@ -3,6 +3,13 @@
 import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
+import {
+  canonicalPayloadWire,
+  depthPayloadWire,
+  depthRows,
+} from "./cache-affinity-canonical.test-fixtures.js";
+import { MAX_CANONICAL_DEPTH } from "./cache-affinity-layers.js";
+
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
   throw new Error(
@@ -141,6 +148,165 @@ integration("cache-prefix identity #160", () => {
     target: row.target(0),
     now: new Date("2030-01-01T00:00:00Z"),
   });
+  it.each(["parameter", "tools", "instructions", "messages"] as const)(
+    "R2 wire __proto__ changes %s roots or nodes and committed sessions PG",
+    async (location) => {
+      if (!db) return;
+      const args = { ...argsFor(await fixture()), surface: "openai-responses" };
+      const request = (value: string) =>
+        JSON.parse(
+          canonicalPayloadWire(
+            location,
+            `{"nested":[{"__proto__":{"const":${JSON.stringify(value)}}}]}`,
+          ),
+        );
+      const first = await service.rememberAffinity({ ...args, payload: request("one") });
+      const second = await service.rememberAffinity({ ...args, payload: request("two") });
+      expect(first).not.toBeNull();
+      expect(second).not.toBeNull();
+      expect(second!.sessionId).not.toBe(first!.sessionId);
+      if (location !== "messages") expect(second!.rootDigest).not.toBe(first!.rootDigest);
+      expect(second!.tipDigest).not.toBe(first!.tipDigest);
+    },
+  );
+
+  it.each(depthRows)(
+    "R2 PG $location $shape depth $depth has no partial identity or lineage",
+    async ({ location, shape, depth }) => {
+      if (!db) return;
+      const args = { ...argsFor(await fixture()), surface: "openai-responses" };
+      const payload = JSON.parse(depthPayloadWire(location, depth, shape));
+      const material = service.affinityPrefixDigests({
+        ...args,
+        payload,
+        runtimeIdentity: args.target.targetIdentity,
+      });
+      expect(material.identifiable).toBe(depth === MAX_CANONICAL_DEPTH);
+      if (depth === MAX_CANONICAL_DEPTH) {
+        expect(await service.rememberAffinity({ ...args, payload })).not.toBeNull();
+        expect(
+          await db.cacheAffinityNode.count({ where: { poolId: args.poolId } }),
+        ).toBeGreaterThan(0);
+        return;
+      }
+      const parent = await service.rememberAffinity({
+        ...args,
+        payload: { input: "parent", conversation: "client" },
+      });
+      const beforeNodes = await db.cacheAffinityNode.findMany({
+        where: { poolId: args.poolId },
+        orderBy: { id: "asc" },
+      });
+      const beforeRecords = await db.cacheAffinityRecord.findMany({
+        where: { poolId: args.poolId },
+        orderBy: { id: "asc" },
+      });
+      const bound = { ...payload, previous_response_id: "parent", conversation: "client" };
+      const boundMaterial = service.affinityPrefixDigests({
+        ...args,
+        payload: bound,
+        sessionBinding: parent!,
+        runtimeIdentity: args.target.targetIdentity,
+      });
+      expect(boundMaterial).toMatchObject({
+        identifiable: false,
+        nodes: [],
+        routingNodes: [],
+        instructionDigests: [],
+        digests: [],
+      });
+      expect(boundMaterial.clientSessionId).toBeUndefined();
+      expect(boundMaterial.boundSessionId).toBeUndefined();
+      for (let attempt = 0; attempt < 2; attempt++)
+        expect(
+          await service.rememberAffinity({ ...args, payload: bound, sessionBinding: parent! }),
+        ).toBeNull();
+      expect(
+        await db.cacheAffinityNode.findMany({
+          where: { poolId: args.poolId },
+          orderBy: { id: "asc" },
+        }),
+      ).toEqual(beforeNodes);
+      expect(
+        await db.cacheAffinityRecord.findMany({
+          where: { poolId: args.poolId },
+          orderBy: { id: "asc" },
+        }),
+      ).toEqual(beforeRecords);
+      // Neither a client id nor a server binding survives refusal. Ordinary starters
+      // after these refused writes still allocate fresh, independent sessions.
+      const starters = [];
+      for (let attempt = 0; attempt < 2; attempt++)
+        starters.push(await service.rememberAffinity({ ...args, payload: { input: "fresh" } }));
+      expect(starters[0]!.sessionId).not.toBe(starters[1]!.sessionId);
+      expect(starters.every((starter) => starter!.sessionId !== parent!.sessionId)).toBe(true);
+    },
+  );
+
+  it("R2 client-id root changes prune all old hints and bound turns retain only their own root PG", async () => {
+    if (!db) return;
+    const args = { ...argsFor(await fixture()), surface: "openai-responses" };
+    const initial = await service.rememberAffinity({
+      ...args,
+      payload: { conversation: "client", instructions: "root A", input: baseHistory },
+    });
+    const oldNodes = await db.cacheAffinityNode.findMany({
+      where: { sessionId: initial!.sessionId },
+    });
+    const changed = await service.rememberAffinity({
+      ...args,
+      payload: { conversation: "client", instructions: "root B", input: baseHistory },
+    });
+    expect(changed!.sessionId).toBe(initial!.sessionId);
+    expect(changed!.rootDigest).not.toBe(initial!.rootDigest);
+    expect(
+      await db.cacheAffinityNode.count({
+        where: { sessionId: initial!.sessionId, rootDigest: initial!.rootDigest },
+      }),
+    ).toBe(0);
+    expect(
+      await db.cacheAffinityRecord.count({
+        where: {
+          sessionId: initial!.sessionId,
+          prefixDigest: { in: oldNodes.map((node) => node.nodeDigest) },
+        },
+      }),
+    ).toBe(0);
+    // A durable older response may still be followed after a stateless root change.
+    // The explicit client id is authoritative; root B is not ancestry of root A.
+    const follow = await service.rememberAffinity({
+      ...args,
+      sessionBinding: initial!,
+      payload: {
+        previous_response_id: "original-response",
+        conversation: "client",
+        input: [u("delta")],
+      },
+    });
+    expect(follow!.sessionId).toBe(initial!.sessionId);
+    expect(follow!.rootDigest).toBe(initial!.rootDigest);
+    expect(follow!.tipDepth).toBe(initial!.tipDepth + 1);
+    const nodes = await db.cacheAffinityNode.findMany({ where: { sessionId: follow!.sessionId } });
+    expect(nodes).toHaveLength(1);
+    expect(nodes.every((node) => node.rootDigest === follow!.rootDigest)).toBe(true);
+    expect(nodes[0]).toMatchObject({ nodeDigest: follow!.tipDigest, isTip: true });
+    const next = await service.rememberAffinity({
+      ...args,
+      sessionBinding: follow!,
+      payload: {
+        previous_response_id: "next-response",
+        conversation: "client",
+        input: [u("next delta")],
+      },
+    });
+    const retained = await db.cacheAffinityNode.findMany({ where: { sessionId: next!.sessionId } });
+    expect(retained).toHaveLength(2);
+    expect(retained.every((node) => node.rootDigest === next!.rootDigest)).toBe(true);
+    expect(retained.some((node) => node.nodeDigest === follow!.tipDigest && !node.isTip)).toBe(
+      true,
+    );
+  });
+
   const permutations = <T>(items: T[]): T[][] =>
     items.length === 0
       ? [[]]
@@ -1289,7 +1455,6 @@ integration("cache-prefix identity #160", () => {
             ? { system: "rules", messages: units }
             : { messages: [{ role: "system", content: "rules" }, ...units] };
       };
-      const hintSessions = new Set<string>();
       for (let turn = 0; turn < 3; turn++) {
         const now = new Date(args.now.getTime() + turn);
         const payload = requestFor(turn);
@@ -1297,24 +1462,19 @@ integration("cache-prefix identity #160", () => {
           await service.rememberAffinity({ ...args, now, payload, estimatedTokens: 20000 }),
         ).toBeNull();
         expect(await db.cacheAffinityNode.count({ where: { poolId: args.poolId } })).toBe(0);
-        const rows = await db.cacheAffinityRecord.findMany({ where: { poolId: args.poolId } });
-        expect(rows).toHaveLength(65);
-        expect(rows.every((row) => row.prefixDigest !== null)).toBe(true);
-        expect(new Set(rows.map((row) => row.sessionId)).size).toBe(1);
-        hintSessions.add(rows[0]!.sessionId);
+        expect(await db.cacheAffinityRecord.count({ where: { poolId: args.poolId } })).toBe(0);
         const ranked = await service.rankAffinityTargets({
           ...args,
           now,
-          payload: requestFor(turn + 1),
+          payload,
           targets: [args.target],
           scoreSingleTarget: true,
         });
-        expect(ranked.prefixDepths[args.target.executionTargetId]).toBe(80);
-        expect(ranked.instructionDepths?.[args.target.executionTargetId]).toBe(1);
+        expect(ranked.prefixDepths[args.target.executionTargetId] ?? 0).toBe(0);
+        expect(ranked.instructionDepths?.[args.target.executionTargetId] ?? 0).toBe(0);
         expect(ranked.matchedSessionIds).toEqual({});
-        const affine = service.isAffinityTargetWarm(ranked, args.target.executionTargetId);
-        expect(affine).toBe(true);
-        const sessions =
+        expect(service.isAffinityTargetWarm(ranked, args.target.executionTargetId)).toBe(false);
+        expect(
           (
             await warm.loadWarmSessions({
               ownerId: args.resourceOwnerId,
@@ -1322,28 +1482,9 @@ integration("cache-prefix identity #160", () => {
               policy: { windowSeconds: 300, minTokens: 8192 },
               now,
             })
-          ).get(args.target.capacityId) ?? [];
-        expect(sessions).toHaveLength(1);
-        expect(sessions[0]?.tokens).toBe(20000);
-        const load = { slots: 1, active: 0, kvBudgetTokens: null };
-        expect(
-          warm.memberProtectionVerdict({
-            load,
-            protectedSessions: sessions,
-            requestTokens: 20000,
-            affine: false,
-          }).state,
-        ).toBe("PROTECTED");
-        expect(
-          warm.memberProtectionVerdict({
-            load,
-            protectedSessions: sessions,
-            requestTokens: 20000,
-            affine,
-          }).state,
-        ).toBe("FREE");
+          ).get(args.target.capacityId) ?? [],
+        ).toEqual([]);
       }
-      expect(hintSessions.size).toBe(3);
     },
   );
 

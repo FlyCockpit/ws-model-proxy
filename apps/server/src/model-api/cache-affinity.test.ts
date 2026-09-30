@@ -1,5 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  canonicalKeys,
+  canonicalLocations,
+  canonicalPayloadWire,
+  canonicalShapes,
+  depthPayloadWire,
+  depthRows,
+} from "./cache-affinity-canonical.test-fixtures.js";
+import { MAX_CANONICAL_DEPTH } from "./cache-affinity-layers.js";
+
 const db = vi.hoisted(() => ({
   cacheAffinityNode: {
     findFirst: vi.fn(),
@@ -1452,10 +1462,8 @@ describe("cache affinity", () => {
       const material = affinityPrefixDigests(digestArgs("runtime", request, surface));
       expect(material.identifiable).toBe(false);
       expect(material.nodes).toEqual([]);
-      expect(material.routingNodes).toHaveLength(64);
-      expect(material.routingNodes[0]?.depth).toBe(17);
-      expect(material.routingNodes.at(-1)?.depth).toBe(80);
-      expect(material.instructionDigests).toHaveLength(1);
+      expect(material.routingNodes).toEqual([]);
+      expect(material.instructionDigests).toEqual([]);
       db.$queryRaw.mockClear();
       expect(
         await resolveAffinitySession(
@@ -2830,4 +2838,217 @@ describe("cache affinity", () => {
     expect(result.reasons["target-a"]).toContain("confirmed:true");
     expect(result.reasons["target-b"]).toContain("confirmed:false");
   });
+});
+
+describe("R2 adversarial identity material", () => {
+  it.each(
+    ["openai-chat", "anthropic-messages", "openai-responses"].flatMap((surface) =>
+      canonicalLocations.flatMap((location) =>
+        canonicalShapes.flatMap((shape) =>
+          canonicalKeys.map((key) => ({ surface, location, shape, key })),
+        ),
+      ),
+    ),
+  )(
+    "wire $surface $key changes $location $shape identity without losing any key",
+    ({ surface, location, shape, key }) => {
+      const request = (value: string) => {
+        const leaf = `{${JSON.stringify(key)}:{"const":${JSON.stringify(value)}},"__proto__":{"const":${JSON.stringify(value)}}}`;
+        const wire =
+          shape === "array" ? `[${leaf}]` : shape === "mixed" ? `{"nested":[${leaf}]}` : leaf;
+        return JSON.parse(canonicalPayloadWire(location, wire, surface));
+      };
+      const one = affinityPrefixDigests(digestArgs("runtime", request("one"), surface));
+      const two = affinityPrefixDigests(digestArgs("runtime", request("two"), surface));
+      expect(one.identifiable).toBe(true);
+      expect(two.identifiable).toBe(true);
+      if (location === "messages") expect(two.nodes).not.toEqual(one.nodes);
+      else {
+        expect(two.rootDigest).not.toBe(one.rootDigest);
+        expect(two.nodes).not.toEqual(one.nodes);
+      }
+      const protoOnly = (value: string) => {
+        const leaf = `{${JSON.stringify(key)}:{"const":"one"},"__proto__":{"const":${JSON.stringify(value)}}}`;
+        const wire =
+          shape === "array" ? `[${leaf}]` : shape === "mixed" ? `{"nested":[${leaf}]}` : leaf;
+        return affinityPrefixDigests(
+          digestArgs("runtime", JSON.parse(canonicalPayloadWire(location, wire, surface)), surface),
+        );
+      };
+      expect(protoOnly("one").nodes).not.toEqual(protoOnly("two").nodes);
+      // Independently change the selected key while holding __proto__ constant.
+      const selectedOnly = JSON.parse(
+        canonicalPayloadWire(
+          location,
+          `{${JSON.stringify(key)}:{"const":"two"}${key === "__proto__" ? "" : ',"__proto__":{"const":"one"}'}}`,
+          surface,
+        ),
+      );
+      const selectedBefore = JSON.parse(
+        canonicalPayloadWire(
+          location,
+          `{${JSON.stringify(key)}:{"const":"one"}${key === "__proto__" ? "" : ',"__proto__":{"const":"one"}'}}`,
+          surface,
+        ),
+      );
+      expect(affinityPrefixDigests(digestArgs("runtime", selectedOnly, surface)).nodes).not.toEqual(
+        affinityPrefixDigests(digestArgs("runtime", selectedBefore, surface)).nodes,
+      );
+    },
+  );
+
+  it.each(depthRows)(
+    "$location $shape depth $depth is atomic across rank, resolver and writer",
+    async ({ location, shape, depth }) => {
+      const request = JSON.parse(depthPayloadWire(location, depth, shape));
+      const args = digestArgs("runtime", request, "openai-responses");
+      const material = affinityPrefixDigests(args);
+      expect(material.identifiable).toBe(depth === MAX_CANONICAL_DEPTH);
+      if (depth === MAX_CANONICAL_DEPTH) {
+        expect(material.nodes.length).toBeGreaterThan(0);
+        return;
+      }
+      const withCarrier = { ...args, payload: { ...request, conversation: "must-not-link" } };
+      const unsafe = affinityPrefixDigests(withCarrier);
+      expect(unsafe).toMatchObject({
+        nodes: [],
+        routingNodes: [],
+        digests: [],
+        instructionDigests: [],
+        conversationDigest: null,
+        identifiable: false,
+      });
+      expect(unsafe.clientSessionId).toBeUndefined();
+      expect(unsafe.boundSessionId).toBeUndefined();
+      expect(unsafe.parentTipDigest).toBeUndefined();
+      expect(unsafe.parentTipDepth).toBeUndefined();
+      db.$transaction.mockClear();
+      expect(
+        await rememberAffinity({ ...withCarrier, target: target("target", "runtime"), policy }),
+      ).toBeNull();
+      expect(db.$transaction).not.toHaveBeenCalled();
+      expect(
+        await resolveAffinitySession(
+          db,
+          { userId: "owner", tenantUserId: "owner", poolId: "pool", executionTargetId: "target" },
+          unsafe,
+          new Date(),
+        ),
+      ).toBeNull();
+      const ranked = await rankAffinityTargets({
+        ...withCarrier,
+        policy,
+        targets: [target("target", "runtime")],
+        scoreSingleTarget: true,
+      });
+      expect(ranked.matchedSessionIds).toEqual({});
+      expect(ranked.prefixDepths.target ?? 0).toBe(0);
+      expect(ranked.instructionDepths?.target ?? 0).toBe(0);
+    },
+  );
+
+  it("realistic depth-20 schema preserves odd keys, key order and duplicate last-wins", () => {
+    const schema =
+      '{"type":"object","properties":{"__proto__":{"const":1},"constructor":{"type":"string"}},"additionalProperties":false}';
+    let deep = schema;
+    for (let level = 0; level < 7; level++)
+      deep = `{"type":"object","properties":{"child":${deep}},"required":["child"],"additionalProperties":false}`;
+    const first = affinityPrefixDigests(
+      digestArgs("runtime", JSON.parse(canonicalPayloadWire("tools", deep)), "openai-responses"),
+    );
+    const reordered = deep.replace(
+      '"type":"object","properties"',
+      '"additionalProperties":false,"type":"object","properties"',
+    );
+    const second = affinityPrefixDigests(
+      digestArgs(
+        "runtime",
+        JSON.parse(canonicalPayloadWire("tools", reordered)),
+        "openai-responses",
+      ),
+    );
+    expect(first.identifiable).toBe(true);
+    expect(second.rootDigest).toBe(first.rootDigest);
+    const changed = deep.replace('"const":1', '"const":1,"const":2');
+    expect(
+      affinityPrefixDigests(
+        digestArgs(
+          "runtime",
+          JSON.parse(canonicalPayloadWire("tools", changed)),
+          "openai-responses",
+        ),
+      ).rootDigest,
+    ).not.toBe(first.rootDigest);
+  });
+
+  it("canonicalization failures cannot escape affinityPrefixDigests or leave partial identity", () => {
+    const throwing = {
+      messages: [{ role: "user", content: "U" }],
+      get tools(): unknown {
+        throw new Error("getter failure");
+      },
+    };
+    expect(() => affinityPrefixDigests(digestArgs("runtime", throwing))).not.toThrow();
+    expect(affinityPrefixDigests(digestArgs("runtime", throwing))).toMatchObject({
+      identifiable: false,
+      nodes: [],
+      instructionDigests: [],
+      routingNodes: [],
+    });
+  });
+});
+
+it.each([false, true])(
+  "R2 bound cumulative 2 MiB cap clears all identity client=%s",
+  async (client) => {
+    const args = digestArgs("runtime", { input: "parent" }, "openai-responses");
+    const first = affinityPrefixDigests(args);
+    const sessionBinding = {
+      sessionId: "parent",
+      bindingDigest: first.bindingDigest,
+      rootDigest: first.rootDigest,
+      tipDigest: first.nodes.at(-1)!.digest,
+      tipDepth: 1,
+      canonicalBytes: 2 * 1024 * 1024,
+    };
+    const request = {
+      ...args,
+      sessionBinding,
+      payload: {
+        previous_response_id: "parent",
+        input: "delta",
+        ...(client ? { conversation: "client" } : {}),
+      },
+    };
+    const material = affinityPrefixDigests(request);
+    expect(material).toMatchObject({
+      identifiable: false,
+      nodes: [],
+      routingNodes: [],
+      instructionDigests: [],
+      digests: [],
+      conversationDigest: null,
+    });
+    expect(material.clientSessionId).toBeUndefined();
+    expect(material.boundSessionId).toBeUndefined();
+    expect(material.parentTipDigest).toBeUndefined();
+    expect(material.parentTipDepth).toBeUndefined();
+    db.$transaction.mockClear();
+    expect(
+      await rememberAffinity({ ...request, policy, target: target("target", "runtime") }),
+    ).toBeNull();
+    expect(db.$transaction).not.toHaveBeenCalled();
+  },
+);
+
+it("R2 wire __proto__ in legacy Chat function schemas binds the root", () => {
+  const request = (value: number) =>
+    JSON.parse(
+      `{"messages":[{"role":"user","content":"U"},{"role":"assistant","content":"A"}],"functions":[{"name":"lookup","parameters":{"properties":{"__proto__":{"const":${value}}}}}]}`,
+    );
+  const one = affinityPrefixDigests(digestArgs("runtime", request(1)));
+  const two = affinityPrefixDigests(digestArgs("runtime", request(2)));
+  expect(one.identifiable).toBe(true);
+  expect(two.rootDigest).not.toBe(one.rootDigest);
+  expect(two.nodes).not.toEqual(one.nodes);
 });

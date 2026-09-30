@@ -28,20 +28,90 @@ export function canonicalizeAffinitySurface(surface: string): AffinityProtocolSu
   return null;
 }
 
+// Request root is depth 0; each property or array entry adds one level.
+export const MAX_CANONICAL_DEPTH = 128;
+export const MAX_CANONICAL_BYTES = 2 * 1024 * 1024;
+
+/** One bounded converter; an exceeded budget rejects the entire value. */
 export function asJson(value: unknown): JsonValue | undefined {
-  if (value === null || typeof value === "boolean" || typeof value === "string") return value;
-  if (typeof value === "number" && Number.isFinite(value)) return value;
-  if (Array.isArray(value)) {
-    const values = value.map(asJson);
-    return values.some((entry) => entry === undefined) ? undefined : (values as JsonValue[]);
+  let bytes = 0;
+  const charge = (size: number) => {
+    bytes += size;
+    if (bytes > MAX_CANONICAL_BYTES) throw new RangeError("Affinity canonical size limit");
+  };
+  const convert = (entry: unknown, depth: number): JsonValue | undefined => {
+    if (depth > MAX_CANONICAL_DEPTH) throw new RangeError("Affinity canonical depth limit");
+    if (
+      entry === null ||
+      typeof entry === "boolean" ||
+      typeof entry === "string" ||
+      (typeof entry === "number" && Number.isFinite(entry))
+    ) {
+      charge(Buffer.byteLength(JSON.stringify(entry)));
+      return entry;
+    }
+    if (typeof entry !== "object") return undefined;
+    charge(2);
+    if (Array.isArray(entry)) {
+      const result: JsonValue[] = [];
+      for (const nested of entry) {
+        const parsed = convert(nested, depth + 1);
+        if (parsed === undefined) return undefined;
+        if (result.length) charge(1);
+        result.push(parsed);
+      }
+      return result;
+    }
+    const result: Record<string, JsonValue> = Object.create(null);
+    let count = 0;
+    for (const key of Object.keys(entry)) {
+      charge(Buffer.byteLength(JSON.stringify(key)) + 1 + (count++ ? 1 : 0));
+      const parsed = convert((entry as Record<string, unknown>)[key], depth + 1);
+      if (parsed !== undefined)
+        Object.defineProperty(result, key, {
+          value: parsed,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+    }
+    return result;
+  };
+  try {
+    return convert(value, 0);
+  } catch {
+    return undefined;
   }
-  if (typeof value !== "object") return undefined;
-  const result: Record<string, JsonValue> = {};
-  for (const [key, nested] of Object.entries(value)) {
-    const parsed = asJson(nested);
-    if (parsed !== undefined) result[key] = parsed;
+}
+
+/** Serialize own keys only; iterative traversal also handles synthetic layer wrappers. */
+export function stableJson(value: JsonValue): string {
+  const pieces: string[] = [];
+  const pending: Array<{ value: JsonValue } | { text: string }> = [{ value }];
+  while (pending.length) {
+    const item = pending.pop()!;
+    if ("text" in item) {
+      pieces.push(item.text);
+      continue;
+    }
+    const entry = item.value;
+    if (entry === null || typeof entry !== "object") {
+      pieces.push(JSON.stringify(entry));
+      continue;
+    }
+    const array = Array.isArray(entry);
+    const keys = Object.keys(entry).sort();
+    pieces.push(array ? "[" : "{");
+    pending.push({ text: array ? "]" : "}" });
+    const count = array ? entry.length : keys.length;
+    for (let i = count - 1; i >= 0; i--) {
+      if (i < count - 1) pending.push({ text: "," });
+      const key = keys[i]!;
+      pending.push({ value: array ? entry[i]! : entry[key]! });
+      if (!array) pending.push({ text: `${JSON.stringify(key)}:` });
+    }
   }
-  return result;
+  return pieces.join("");
 }
 
 function emptyLayers(): AffinityLayers {

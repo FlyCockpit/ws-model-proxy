@@ -40,6 +40,9 @@ vi.mock("@ws-model-proxy/env/shared", () => ({
   env: { DATABASE_URL: "postgresql://routes-test", NODE_ENV: "test" },
 }));
 
+import { depthPayloadWire, depthRows } from "./cache-affinity-canonical.test-fixtures.js";
+import { MAX_CANONICAL_DEPTH } from "./cache-affinity-layers.js";
+
 const affinity = vi.hoisted(() => ({
   rank: vi.fn(),
   remember: vi.fn(),
@@ -13444,294 +13447,408 @@ describe("model API routes", () => {
       "x-claude-code-session-id",
     ].map((header) => ({ name: header, header })),
   ];
-  it.each(
-    identityCarriers.flatMap((carrier) =>
+  it.each([
+    ...identityCarriers.flatMap((carrier) =>
       [false, true].flatMap((invalid) =>
-        ["local", "overflow", "bound Responses"].map((path) => ({ ...carrier, invalid, path })),
+        ["local", "overflow", "bound Responses"].map((path) => ({
+          ...carrier,
+          invalid,
+          path,
+          sameParent: false,
+          canonical: undefined as (typeof depthRows)[number] | undefined,
+          materialError: false,
+        })),
       ),
     ),
-  )("U3 $path $name invalid=$invalid reaches identity rank and remember", async (row) => {
-    const actual =
-      await vi.importActual<typeof import("./cache-affinity.js")>("./cache-affinity.js");
-    const materialFor = (args: Parameters<typeof actual.rememberAffinity>[0]) =>
-      actual.affinityPrefixDigests({ ...args, runtimeIdentity: args.target.targetIdentity });
-    const written: Array<{
-      args: Parameters<typeof actual.rememberAffinity>[0];
-      sessionId: string;
-    }> = [];
-    affinity.remember.mockImplementation(
-      async (args: Parameters<typeof actual.rememberAffinity>[0]) => {
-        const material = materialFor(args);
-        const sessionId = material.clientSessionId ?? material.boundSessionId ?? "native-warm";
-        written.push({ args, sessionId });
-        return {
-          sessionId,
-          bindingDigest: material.bindingDigest,
-          rootDigest: material.rootDigest,
-          tipDigest: material.nodes.at(-1)?.digest ?? "",
-          tipDepth: material.nodes.at(-1)?.depth ?? 0,
-          canonicalBytes: material.canonicalBytes,
-          estimatedTokens: 20000,
-        };
-      },
-    );
-    affinity.rank.mockImplementation(actual.rankAffinityTargets);
-    db.cacheAffinityRecord.findMany.mockResolvedValue([]);
-    db.capacityLease.groupBy.mockResolvedValue([]);
-    db.capacityWaiter.groupBy.mockResolvedValue([]);
-    db.cacheAffinityNode.findFirst.mockResolvedValue({ sessionId: "native-warm" });
-    db.$queryRaw.mockImplementation((query) =>
-      Promise.resolve(
-        (query.strings ?? query).join("").includes("cache_affinity_node")
-          ? []
-          : [{ now: new Date() }],
-      ),
-    );
-    const value = row.invalid ? "bad#id" : "route-client";
-    const headers = new Headers({
-      authorization: "Bearer wsmp_model_test",
-      "content-type": "application/json",
-    });
-    if ("header" in row && row.header) headers.set(row.header, value);
-    const carrier =
-      "body" in row && row.body
-        ? { [row.body]: "object" in row && row.object ? { id: value } : value }
-        : {};
-    const members = ["a", "b"].map((name) =>
-      poolMemberRow({
-        id: `member-${name}`,
-        discoveredModelId: `model-${name}`,
-        upstreamModelId: `upstream-${name}`,
-        cliDeviceId: `cli-${name}`,
-        affinityEnabled: true,
-      }),
-    );
-    db.poolMember.findMany.mockResolvedValue(members);
-    db.discoveredModel.findUnique.mockResolvedValue(
-      directRow({ id: "model-a", upstreamModelId: "upstream-a", cliDeviceId: "cli-a" }),
-    );
-    const manager = new FakeRelayManager();
-    manager.activeCliDeviceIds = ["cli-a", "cli-b"];
-    const runtime = admittingCapacityRuntime();
-    const app = appWith(manager, runtime);
-    const isBound = row.path === "bound Responses";
-    if (isBound) {
-      const initial = app.request("/responses", {
-        method: "POST",
-        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
-        body: JSON.stringify({ model: poolTarget.modelId, input: "create" }),
+    ...identityCarriers
+      .filter((carrier) => "body" in carrier)
+      .map((carrier) => ({
+        ...carrier,
+        invalid: true,
+        path: "bound Responses",
+        sameParent: true,
+        canonical: undefined as (typeof depthRows)[number] | undefined,
+        materialError: false,
+      })),
+    ...depthRows.map((canonical) => ({
+      name: `R2 ${canonical.location} ${canonical.shape} depth ${canonical.depth}`,
+      invalid: true,
+      path: "bound Responses",
+      sameParent: false,
+      canonical,
+      materialError: false,
+    })),
+    {
+      name: "R2 material construction error",
+      invalid: true,
+      path: "bound Responses",
+      sameParent: false,
+      canonical: undefined,
+      materialError: true,
+    },
+  ])(
+    "U3 $path $name invalid=$invalid sameParent=$sameParent reaches identity rank and remember",
+    async (row) => {
+      const actual =
+        await vi.importActual<typeof import("./cache-affinity.js")>("./cache-affinity.js");
+      const materialFor = (args: Parameters<typeof actual.rememberAffinity>[0]) =>
+        actual.affinityPrefixDigests({ ...args, runtimeIdentity: args.target.targetIdentity });
+      const written: Array<{
+        args: Parameters<typeof actual.rememberAffinity>[0];
+        sessionId: string | null;
+      }> = [];
+      affinity.remember.mockImplementation(
+        async (args: Parameters<typeof actual.rememberAffinity>[0]) => {
+          const material = materialFor(args);
+          const sessionId = material.identifiable
+            ? (material.clientSessionId ?? material.boundSessionId ?? "native-warm")
+            : null;
+          written.push({ args, sessionId });
+          if (!sessionId) return null;
+          return {
+            sessionId,
+            bindingDigest: material.bindingDigest,
+            rootDigest: material.rootDigest,
+            tipDigest: material.nodes.at(-1)?.digest ?? "",
+            tipDepth: material.nodes.at(-1)?.depth ?? 0,
+            canonicalBytes: material.canonicalBytes,
+            estimatedTokens: 20000,
+          };
+        },
+      );
+      affinity.rank.mockImplementation(actual.rankAffinityTargets);
+      db.cacheAffinityRecord.findMany.mockResolvedValue([]);
+      db.capacityLease.groupBy.mockResolvedValue([]);
+      db.capacityWaiter.groupBy.mockResolvedValue([]);
+      db.cacheAffinityNode.findFirst.mockResolvedValue({ sessionId: "native-warm" });
+      db.$queryRaw.mockImplementation((query) =>
+        Promise.resolve(
+          (query.strings ?? query).join("").includes("cache_affinity_node")
+            ? []
+            : [{ now: new Date() }],
+        ),
+      );
+      const value = row.invalid ? "bad#id" : "route-client";
+      const headers = new Headers({
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
       });
-      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
-      await completeJsonRelay({
-        manager,
-        requestId: requireSent(manager).requestId,
-        body: { id: "resp_carrier", object: "response" },
-      });
-      await (await initial).text();
-      mockStickyRecord({
-        ...db.responseStickinessRecord.upsert.mock.calls[0]![0].create,
-        SelectedExecutionTarget: { discoveredModelId: "model-a" },
-      });
-      affinity.rank.mockClear();
-      affinity.remember.mockClear();
-      written.length = 0;
-      vi.mocked(runtime.acquire).mockClear();
-    }
-    if (row.path === "overflow") {
-      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
-        directModels: [],
-        modelPools: [externalPoolTarget],
-      });
-      externalConsent.poolIds = [externalPoolTarget.id];
-      db.poolMember.findMany.mockResolvedValue([]);
-      const publicModule =
-        await vi.importActual<typeof import("./public-overflow.js")>("./public-overflow.js");
-      publicOverflow.dispatch.mockImplementation(publicModule.dispatchPublicOverflow);
-      publicOverflow.list.mockImplementation(publicModule.listPublicOverflowTargets);
-      const providers = ["a", "b"].map((name) => {
-        const target = externalProviderTarget(`overflow-${name}`);
-        return {
-          id: target.poolMemberId,
-          publicOrder: 0,
-          ExecutionTarget: {
-            id: target.executionTargetId,
-            inferenceCapacityId: target.inferenceCapacityId,
-            ProviderModel: {
-              id: target.providerModelId,
-              userId: "user-id",
-              upstreamModelId: target.upstreamModelId,
-              contextWindow: target.contextWindow,
-              maxOutputTokens: target.maxOutputTokens,
-              nativeCapabilities: {
-                protocols: ["openai"],
-                surfaces: ["openai-chat"],
-                streaming: true,
-                features: [],
+      if (row.canonical && row.canonical.depth > MAX_CANONICAL_DEPTH)
+        headers.set("x-session-id", "route-client");
+      if ("header" in row && row.header) headers.set(row.header, value);
+      const carrier =
+        "body" in row && row.body
+          ? { [row.body]: "object" in row && row.object ? { id: value } : value }
+          : {};
+      const toolsCapabilities =
+        row.canonical?.location === "tools"
+          ? {
+              version: 3,
+              protocol: "openai-compatible",
+              surfaces: {
+                openaiResponses: {
+                  source: "declared",
+                  confidence: "exact",
+                  supported: true,
+                  streaming: true,
+                  tools: true,
+                  parallelTools: true,
+                  responsesLifecycle: { statefulFollowUps: true },
+                },
               },
-              healthStatus: "HEALTHY",
-              enabled: true,
-              deletedAt: null,
-              ProviderAccount: {
-                id: target.providerAccountId,
+            }
+          : null;
+      const members = ["a", "b"].map((name) =>
+        poolMemberRow({
+          id: `member-${name}`,
+          discoveredModelId: `model-${name}`,
+          upstreamModelId: `upstream-${name}`,
+          cliDeviceId: `cli-${name}`,
+          affinityEnabled: true,
+          capabilityOverrideMetadata: toolsCapabilities,
+        }),
+      );
+      db.poolMember.findMany.mockResolvedValue(members);
+      db.discoveredModel.findUnique.mockResolvedValue(
+        directRow({
+          id: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          capabilityOverrideMetadata: toolsCapabilities,
+        }),
+      );
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+      const runtime = admittingCapacityRuntime();
+      const app = appWith(manager, runtime);
+      const isBound = row.path === "bound Responses";
+      if (isBound) {
+        const initial = app.request("/responses", {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: JSON.stringify({
+            model: poolTarget.modelId,
+            input: "create",
+            ...(row.sameParent ? carrier : {}),
+            ...(row.canonical?.depth === MAX_CANONICAL_DEPTH
+              ? JSON.parse(
+                  depthPayloadWire(
+                    row.canonical.location,
+                    row.canonical.depth,
+                    row.canonical.shape,
+                  ),
+                )
+              : {}),
+          }),
+        });
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        await completeJsonRelay({
+          manager,
+          requestId: requireSent(manager).requestId,
+          body: { id: "resp_carrier", object: "response" },
+        });
+        await (await initial).text();
+        mockStickyRecord({
+          ...db.responseStickinessRecord.upsert.mock.calls[0]![0].create,
+          SelectedExecutionTarget: { discoveredModelId: "model-a" },
+        });
+        affinity.rank.mockClear();
+        affinity.remember.mockClear();
+        written.length = 0;
+        vi.mocked(runtime.acquire).mockClear();
+        if (row.materialError)
+          affinity.material.mockImplementationOnce(() => {
+            throw new Error("canonicalization unavailable");
+          });
+      }
+      if (row.path === "overflow") {
+        mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+          directModels: [],
+          modelPools: [externalPoolTarget],
+        });
+        externalConsent.poolIds = [externalPoolTarget.id];
+        db.poolMember.findMany.mockResolvedValue([]);
+        const publicModule =
+          await vi.importActual<typeof import("./public-overflow.js")>("./public-overflow.js");
+        publicOverflow.dispatch.mockImplementation(publicModule.dispatchPublicOverflow);
+        publicOverflow.list.mockImplementation(publicModule.listPublicOverflowTargets);
+        const providers = ["a", "b"].map((name) => {
+          const target = externalProviderTarget(`overflow-${name}`);
+          return {
+            id: target.poolMemberId,
+            publicOrder: 0,
+            ExecutionTarget: {
+              id: target.executionTargetId,
+              inferenceCapacityId: target.inferenceCapacityId,
+              ProviderModel: {
+                id: target.providerModelId,
                 userId: "user-id",
-                providerType: "openai",
-                baseUrl: target.baseUrl,
-                authType: "BEARER",
+                upstreamModelId: target.upstreamModelId,
+                contextWindow: target.contextWindow,
+                maxOutputTokens: target.maxOutputTokens,
+                nativeCapabilities: {
+                  protocols: ["openai"],
+                  surfaces: ["openai-chat"],
+                  streaming: true,
+                  features: [],
+                },
                 healthStatus: "HEALTHY",
                 enabled: true,
                 deletedAt: null,
-                CurrentCredential: {
-                  ...target.credential,
-                  algorithm: "AES-256-GCM",
-                  status: "ACTIVE",
+                ProviderAccount: {
+                  id: target.providerAccountId,
+                  userId: "user-id",
+                  providerType: "openai",
+                  baseUrl: target.baseUrl,
+                  authType: "BEARER",
+                  healthStatus: "HEALTHY",
+                  enabled: true,
+                  deletedAt: null,
+                  CurrentCredential: {
+                    ...target.credential,
+                    algorithm: "AES-256-GCM",
+                    status: "ACTIVE",
+                  },
                 },
               },
             },
+          };
+        });
+        const pool = {
+          id: "pool-id",
+          userId: "user-id",
+          fallbackEnabled: true,
+          fallbackForGrantees: false,
+          User: ACTIVE_POOL_OWNER,
+          PoolMembers: providers,
+          affinityEnabled: true,
+          affinityTtlSeconds: 600,
+          affinityMaxRecords: 100,
+          affinityPrefixWeight: 100,
+          affinityConversationWeight: 150,
+          affinityConfirmedCacheWeight: 250,
+          affinityLoadPenaltyWeight: 100,
+        };
+        db.modelPool.findFirst.mockResolvedValue(pool);
+        db.modelApiToken.findUnique.mockResolvedValue({
+          userId: "user-id",
+          scopeMode: "ALL_VISIBLE",
+          allowExternal: true,
+          revokedAt: null,
+          expiresAt: null,
+        });
+        db.providerAttempt.groupBy.mockResolvedValue([]);
+        db.providerPricingVersion.findFirst.mockResolvedValue(null);
+        db.providerModel.findFirst.mockResolvedValue(providers[0]!.ExecutionTarget.ProviderModel);
+        db.providerAccount.findFirst.mockResolvedValue({
+          providerType: "openai",
+          allowDataCollection: false,
+        });
+        db.providerCredential.findFirst.mockResolvedValue(
+          providers[0]!.ExecutionTarget.ProviderModel.ProviderAccount.CurrentCredential,
+        );
+        db.providerCredential.update.mockResolvedValue({ id: "credential" });
+        const delegates = {
+          modelApiToken: {
+            findUnique: async () => ({
+              userId: "user-id",
+              scopeMode: "ALL_VISIBLE",
+              allowExternal: true,
+            }),
           },
+          user: { findUnique: async () => ACTIVE_POOL_OWNER },
         };
+        db.$queryRaw.mockImplementation((strings: TemplateStringsArray, ...values: unknown[]) =>
+          strings.join("").includes('AS "requesterValid"')
+            ? mockRequesterValidityQuery(strings, values, delegates)
+            : Promise.resolve([{ now: new Date() }]),
+        );
+        db.poolMember.findFirst.mockResolvedValue(providers[0]);
+        const budget = await import("./provider-budget.js");
+        vi.spyOn(budget, "admitProviderBudget").mockResolvedValue({
+          admitted: true,
+          providerAttemptId: "anchor",
+          reservationIds: ["reservation"],
+        });
+        vi.spyOn(budget, "reconcileProviderBudget").mockResolvedValue(undefined);
+        const attempts = await import("./provider-attempt-runtime.js");
+        vi.spyOn(attempts, "allocateProviderFence").mockResolvedValue(1n);
+        vi.spyOn(attempts, "claimProviderHealthTrial").mockResolvedValue("READY");
+        vi.spyOn(attempts, "recordProviderAttemptEvent").mockResolvedValue(undefined);
+        vi.spyOn(attempts, "recordProviderOutcome").mockResolvedValue(true);
+        vi.spyOn(attempts, "heartbeatProviderAttempt").mockResolvedValue(true);
+        const credentials = await import("@ws-model-proxy/api/lib/provider-credential-crypto");
+        vi.spyOn(credentials, "decryptProviderCredential").mockReturnValue("test-key");
+        const upstream = Object.assign(
+          Readable.from([
+            Buffer.from(
+              JSON.stringify({ choices: [], usage: { prompt_tokens: 5, completion_tokens: 1 } }),
+            ),
+          ]),
+          { statusCode: 200, headers: { "content-type": "application/json" }, complete: true },
+        );
+        vi.spyOn(
+          await import("@ws-model-proxy/api/lib/provider-egress"),
+          "providerHttpsRequest",
+        ).mockResolvedValue(upstream as unknown as IncomingMessage);
+      }
+      const payload = isBound
+        ? {
+            model: poolTarget.modelId,
+            previous_response_id: "resp_carrier",
+            input: "delta",
+            ...carrier,
+          }
+        : {
+            model: row.path === "overflow" ? EXTERNAL_MODEL_ID : poolTarget.modelId,
+            messages: [{ role: "user", content: "starter" }],
+            ...carrier,
+          };
+      const pending = app.request(isBound ? "/responses" : "/chat/completions", {
+        method: "POST",
+        headers,
+        body: row.canonical
+          ? `${depthPayloadWire(row.canonical.location, row.canonical.depth, row.canonical.shape).slice(0, -1)},"model":${JSON.stringify(poolTarget.modelId)},"previous_response_id":"resp_carrier"}`
+          : JSON.stringify(payload),
       });
-      const pool = {
-        id: "pool-id",
-        userId: "user-id",
-        fallbackEnabled: true,
-        fallbackForGrantees: false,
-        User: ACTIVE_POOL_OWNER,
-        PoolMembers: providers,
-        affinityEnabled: true,
-        affinityTtlSeconds: 600,
-        affinityMaxRecords: 100,
-        affinityPrefixWeight: 100,
-        affinityConversationWeight: 150,
-        affinityConfirmedCacheWeight: 250,
-        affinityLoadPenaltyWeight: 100,
-      };
-      db.modelPool.findFirst.mockResolvedValue(pool);
-      db.modelApiToken.findUnique.mockResolvedValue({
-        userId: "user-id",
-        scopeMode: "ALL_VISIBLE",
-        allowExternal: true,
-        revokedAt: null,
-        expiresAt: null,
+      if (row.path !== "overflow") {
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(isBound ? 2 : 1));
+        await completeJsonRelay({
+          manager,
+          requestId: requireSent(manager, isBound ? 1 : 0).requestId,
+          body: isBound ? { id: "resp_carrier_next", object: "response" } : { choices: [] },
+        });
+      }
+      const response = await pending;
+      const responseText = await response.text();
+      const dispatchResult =
+        row.path === "overflow" ? await publicOverflow.dispatch.mock.results[0]?.value : undefined;
+      expect(response.status, `${responseText}; dispatch=${dispatchResult?.reason}`).toBe(200);
+      await vi.waitFor(() => expect(affinity.remember).toHaveBeenCalledTimes(1));
+      const write = written[0]!;
+      const material = materialFor(write.args);
+      const reference = materialFor({
+        ...write.args,
+        headers: new Headers(),
+        payload: { ...write.args.payload, conversation: "route-client" },
       });
-      db.providerAttempt.groupBy.mockResolvedValue([]);
-      db.providerPricingVersion.findFirst.mockResolvedValue(null);
-      db.providerModel.findFirst.mockResolvedValue(providers[0]!.ExecutionTarget.ProviderModel);
-      db.providerAccount.findFirst.mockResolvedValue({
-        providerType: "openai",
-        allowDataCollection: false,
-      });
-      db.providerCredential.findFirst.mockResolvedValue(
-        providers[0]!.ExecutionTarget.ProviderModel.ProviderAccount.CurrentCredential,
-      );
-      db.providerCredential.update.mockResolvedValue({ id: "credential" });
-      const delegates = {
-        modelApiToken: {
-          findUnique: async () => ({
-            userId: "user-id",
-            scopeMode: "ALL_VISIBLE",
-            allowExternal: true,
-          }),
-        },
-        user: { findUnique: async () => ACTIVE_POOL_OWNER },
-      };
-      db.$queryRaw.mockImplementation((strings: TemplateStringsArray, ...values: unknown[]) =>
-        strings.join("").includes('AS "requesterValid"')
-          ? mockRequesterValidityQuery(strings, values, delegates)
-          : Promise.resolve([{ now: new Date() }]),
-      );
-      db.poolMember.findFirst.mockResolvedValue(providers[0]);
-      const budget = await import("./provider-budget.js");
-      vi.spyOn(budget, "admitProviderBudget").mockResolvedValue({
-        admitted: true,
-        providerAttemptId: "anchor",
-        reservationIds: ["reservation"],
-      });
-      vi.spyOn(budget, "reconcileProviderBudget").mockResolvedValue(undefined);
-      const attempts = await import("./provider-attempt-runtime.js");
-      vi.spyOn(attempts, "allocateProviderFence").mockResolvedValue(1n);
-      vi.spyOn(attempts, "claimProviderHealthTrial").mockResolvedValue("READY");
-      vi.spyOn(attempts, "recordProviderAttemptEvent").mockResolvedValue(undefined);
-      vi.spyOn(attempts, "recordProviderOutcome").mockResolvedValue(true);
-      vi.spyOn(attempts, "heartbeatProviderAttempt").mockResolvedValue(true);
-      const credentials = await import("@ws-model-proxy/api/lib/provider-credential-crypto");
-      vi.spyOn(credentials, "decryptProviderCredential").mockReturnValue("test-key");
-      const upstream = Object.assign(
-        Readable.from([
-          Buffer.from(
-            JSON.stringify({ choices: [], usage: { prompt_tokens: 5, completion_tokens: 1 } }),
-          ),
-        ]),
-        { statusCode: 200, headers: { "content-type": "application/json" }, complete: true },
-      );
-      vi.spyOn(
-        await import("@ws-model-proxy/api/lib/provider-egress"),
-        "providerHttpsRequest",
-      ).mockResolvedValue(upstream as unknown as IncomingMessage);
-    }
-    const payload = isBound
-      ? {
-          model: poolTarget.modelId,
-          previous_response_id: "resp_carrier",
-          input: "delta",
-          ...carrier,
+      expect(material.clientSessionId).toBe(row.invalid ? undefined : reference.clientSessionId);
+      if (!row.invalid) {
+        expect(write.sessionId).toBe(reference.clientSessionId);
+        expect(materialFor({ ...write.args, ownerId: "other-tenant" }).clientSessionId).not.toBe(
+          write.sessionId,
+        );
+      }
+      if (isBound) {
+        expect(affinity.rank).not.toHaveBeenCalled();
+        const losesIdentity =
+          (row.invalid && "body" in row && !row.sameParent) ||
+          (row.canonical !== undefined && row.canonical.depth > MAX_CANONICAL_DEPTH) ||
+          row.materialError;
+        expect(vi.mocked(runtime.acquire).mock.calls[0]![0].warmSessionIds).toEqual(
+          losesIdentity ? [] : [row.invalid ? "native-warm" : reference.clientSessionId],
+        );
+        if (losesIdentity) {
+          expect(material.nodes).toEqual([]);
+          expect(write.sessionId).toBeNull();
+          const successor = db.responseStickinessRecord.upsert.mock.calls.at(-1)![0].create;
+          expect(successor.warmSessionId).toBeNull();
+          expect(successor.warmTipDigest).toBeNull();
         }
-      : {
-          model: row.path === "overflow" ? EXTERNAL_MODEL_ID : poolTarget.modelId,
-          messages: [{ role: "user", content: "starter" }],
-          ...carrier,
-        };
-    const pending = app.request(isBound ? "/responses" : "/chat/completions", {
-      method: "POST",
-      headers,
-      body: JSON.stringify(payload),
-    });
-    if (row.path !== "overflow") {
-      await vi.waitFor(() => expect(manager.sent).toHaveLength(isBound ? 2 : 1));
-      await completeJsonRelay({
-        manager,
-        requestId: requireSent(manager, isBound ? 1 : 0).requestId,
-        body: isBound ? { id: "resp_carrier_next", object: "response" } : { choices: [] },
-      });
-    }
-    const response = await pending;
-    const responseText = await response.text();
-    const dispatchResult =
-      row.path === "overflow" ? await publicOverflow.dispatch.mock.results[0]?.value : undefined;
-    expect(response.status, `${responseText}; dispatch=${dispatchResult?.reason}`).toBe(200);
-    await vi.waitFor(() => expect(affinity.remember).toHaveBeenCalledTimes(1));
-    const write = written[0]!;
-    const material = materialFor(write.args);
-    const reference = materialFor({
-      ...write.args,
-      headers: new Headers(),
-      payload: { ...write.args.payload, conversation: "route-client" },
-    });
-    expect(material.clientSessionId).toBe(row.invalid ? undefined : reference.clientSessionId);
-    if (!row.invalid) {
-      expect(write.sessionId).toBe(reference.clientSessionId);
-      expect(materialFor({ ...write.args, ownerId: "other-tenant" }).clientSessionId).not.toBe(
-        write.sessionId,
-      );
-    }
-    if (isBound) {
-      expect(affinity.rank).not.toHaveBeenCalled();
-      expect(vi.mocked(runtime.acquire).mock.calls[0]![0].warmSessionIds).toEqual([
-        row.invalid ? "native-warm" : reference.clientSessionId,
-      ]);
-    } else {
-      expect(affinity.rank).toHaveBeenCalledTimes(1);
-      const rankArgs = affinity.rank.mock.calls[0]![0];
-      const ranked = await affinity.rank.mock.results[0]!.value;
-      const rankMaterial = actual.affinityPrefixDigests({
-        ...rankArgs,
-        runtimeIdentity: write.args.target.targetIdentity,
-      });
-      expect(rankMaterial.clientSessionId).toBe(material.clientSessionId);
-      expect(ranked.matchedSessionIds?.[write.args.target.executionTargetId]).toBe(
-        row.invalid ? undefined : reference.clientSessionId,
-      );
-    }
-  });
+        if (row.sameParent) {
+          expect(material.boundSessionId).toBe("native-warm");
+          expect(material.nodes.at(-1)?.depth).toBe(2);
+        }
+        if (row.canonical) {
+          expect(material.identifiable).toBe(row.canonical.depth === MAX_CANONICAL_DEPTH);
+          if (row.canonical.depth > MAX_CANONICAL_DEPTH) {
+            expect(material.instructionDigests).toEqual([]);
+            expect(material.routingNodes).toEqual([]);
+            expect(material.digests).toEqual([]);
+            expect(material.clientSessionId).toBeUndefined();
+            expect(material.boundSessionId).toBeUndefined();
+            expect(material.parentTipDigest).toBeUndefined();
+            expect(material.parentTipDepth).toBeUndefined();
+          }
+          expect(response.status).toBe(200);
+          const upstream = JSON.parse(firstBodyChunkText(requireSent(manager, 1)));
+          expect(upstream.model).toBe("upstream-a");
+        }
+      } else {
+        expect(affinity.rank).toHaveBeenCalledTimes(1);
+        const rankArgs = affinity.rank.mock.calls[0]![0];
+        const ranked = await affinity.rank.mock.results[0]!.value;
+        const rankMaterial = actual.affinityPrefixDigests({
+          ...rankArgs,
+          runtimeIdentity: write.args.target.targetIdentity,
+        });
+        expect(rankMaterial.clientSessionId).toBe(material.clientSessionId);
+        expect(ranked.matchedSessionIds?.[write.args.target.executionTargetId]).toBe(
+          row.invalid ? undefined : reference.clientSessionId,
+        );
+      }
+    },
+  );
 
   describe("C1a-2 native Responses warm-session binding", () => {
     it.each([
