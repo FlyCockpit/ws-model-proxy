@@ -751,6 +751,11 @@ impl LineMasker {
         if blank {
             // a blank line ends the until-blank run; blocks pass through it
             self.until_blank = None;
+            // whitespace-only lines inside an indentation run are part of it (their
+            // bytes are masked); an empty line carries no bytes
+            if !line.is_empty() {
+                masked_by = self.blocks.iter().map(|block| block.opener).max();
+            }
         } else {
             let indent = indent_of(line);
             let kinds = indent_kinds(line);
@@ -1374,13 +1379,18 @@ mod tests {
             assert!(view.overlaps_span(&view.spans[0].view));
             assert!(view.overlaps_span(&view.spans[1].view));
         }
-        for blank in ["", "  \t"] {
-            let text = format!("API_KEY anything\n{blank}\nvisible\n");
-            assert_eq!(
-                masked(FileClass::Plain, &text),
-                format!("⟦redacted line⟧\n{blank}\nvisible\n")
-            );
-        }
+        assert_eq!(
+            masked(FileClass::Plain, "API_KEY anything\n\nvisible\n"),
+            "⟦redacted line⟧\n\nvisible\n"
+        );
+        // a whitespace-only line inside the run has bytes: they are masked too
+        assert_eq!(
+            masked(
+                FileClass::Plain,
+                "API_KEY anything\n  \t\n  deeper\nvisible\n"
+            ),
+            "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\nvisible\n"
+        );
         assert_eq!(
             masked(FileClass::Plain, "x API_KEY\ny HF_TOKEN\nz\nvisible\n"),
             "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\nvisible\n"
