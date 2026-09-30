@@ -1485,6 +1485,49 @@ mod exchange_callers {
     }
 
     #[test]
+    fn a_replace_reports_a_file_deleted_before_the_commit_as_gone() {
+        let fx = Fx::new();
+        fx.put("doc.txt", "original\n");
+        inject(Errno::ENOENT);
+        let error = edit(&fx).expect_err("the exchange found nothing to replace");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(fx.leftovers("").is_empty());
+    }
+
+    #[test]
+    fn an_overwrite_onto_another_name_of_the_same_file_refuses_and_keeps_it() {
+        let fx = Fx::new();
+        fx.put("src.txt", "mine");
+        std::fs::hard_link(fx.root.join("src.txt"), fx.root.join("dst.txt")).unwrap();
+        let etag = fx.etag("dst.txt");
+        let r = rename(
+            &fx,
+            json!({ "from": fx.p("src.txt"), "to": fx.p("dst.txt"), "overwrite": true, "expectedEtag": etag }),
+        );
+        assert_eq!(code(r), ErrorCode::InvalidInput);
+        assert_eq!(fx.get("src.txt"), "mine");
+        assert_eq!(fx.get("dst.txt"), "mine");
+    }
+
+    // A case-only overwrite rename on a case-insensitive volume (macOS default)
+    // names the same file twice: it is refused and the file stays.
+    #[test]
+    fn a_case_only_overwrite_rename_never_deletes_the_file() {
+        let fx = Fx::new();
+        fx.put("Foo.txt", "mine");
+        if !fx.root.join("foo.txt").exists() {
+            return; // case-sensitive volume: two distinct names, nothing to check
+        }
+        let etag = fx.etag("Foo.txt");
+        let r = rename(
+            &fx,
+            json!({ "from": fx.p("Foo.txt"), "to": fx.p("foo.txt"), "overwrite": true, "expectedEtag": etag }),
+        );
+        assert_eq!(code(r), ErrorCode::InvalidInput);
+        assert_eq!(fx.get("foo.txt"), "mine");
+    }
+
+    #[test]
     fn an_overwrite_maps_unsupported_errors_to_unsupported_and_others_to_their_own_error() {
         for errno in [Errno::EINVAL, Errno::ENOSYS] {
             let fx = Fx::new();

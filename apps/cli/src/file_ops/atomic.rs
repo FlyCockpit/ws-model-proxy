@@ -176,7 +176,10 @@ pub(crate) fn replace(
 /// object we put there (a double race must not delete a third object). Crash
 /// states: between the exchange and the unlink the old file is under the staging
 /// name (no data is lost). On other platforms and filesystems without exchange,
-/// a plain rename is used and a race remains after the final re-check.
+/// a plain rename is used and a race remains after the final re-check. Known
+/// residual, tracked in #165: a same-user external writer racing the undo swap or
+/// the cleanup unlink after the exchange can displace or delete its own successor,
+/// and a failed undo is reported as an ordinary conflict.
 fn commit_stage(
     dir: &OwnedFd,
     stage: &OsStr,

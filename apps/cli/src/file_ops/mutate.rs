@@ -179,6 +179,16 @@ pub(crate) fn rename(
                 "the destination is a directory or special file and is not overwritten",
             ));
         }
+        // Two names for one object (a hard link, or a case-insensitive / normalizing
+        // volume where both names resolve to the same entry): an exchange would swap
+        // the name with itself and the unlink of the source name would then delete
+        // the only entry. Nothing is replaced, so refuse (plain rename is no option:
+        // it reopens the race the exchange closes).
+        if dst.same_object(&src) {
+            return Err(FileError::invalid(
+                "source and destination are the same file",
+            ));
+        }
         ops.policy.check_identity(Access::Write, dst)?;
         let current = object_etag(ops, &to, dst, cancel)?.unwrap_or_default();
         if args.expected_etag.as_deref() != Some(current.as_str()) {
@@ -210,7 +220,8 @@ pub(crate) fn rename(
 /// under the source name; after `linkat` and before the unlink both names exist.
 /// Neither loses data. The undo moves back whatever object the move actually put
 /// at the destination (a same-user cross-process successor in that window is the
-/// accepted residual).
+/// accepted residual, together with a failed undo and a cleanup unlink that races
+/// a successor: tracked in #165).
 fn commit_rename(
     from: &Resolved,
     to: &Resolved,
