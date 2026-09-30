@@ -1,7 +1,15 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  cleanup,
+  configure,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import {
   endOfLocalDay,
@@ -144,6 +152,12 @@ vi.mock("@/utils/orpc", () => {
 
 import { CliCommandDevices } from "./cli-command-devices";
 import { McpTokensPanel } from "./mcp-tokens-panel";
+
+// `waitFor` polls until the awaited async work (WebCrypto on the thread pool, React
+// transitions) completes and returns as soon as it does; the timeout only bounds a
+// genuine hang. RTL's 1 s default is shorter than this file's slowest completion on a
+// loaded CI or shared host, which showed up as one-off failures in passing tests.
+configure({ asyncUtilTimeout: 10_000 });
 
 const token = {
   id: "token-1",

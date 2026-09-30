@@ -1967,7 +1967,7 @@ function id16(fill = 3): string {
   return Buffer.alloc(16, fill).toString("base64url");
 }
 
-function hello24(features?: {
+function helloCli(features?: {
   humanTerminal?: boolean;
   mcpCommandMode?: "off" | "supervised" | "unsupervised";
   terminalApproval?: boolean;
@@ -1975,7 +1975,7 @@ function hello24(features?: {
 }) {
   return JSON.stringify({
     type: "hello",
-    id: "hello-24",
+    id: "hello-cli",
     protocolVersion: "2.8",
     cli: {
       slug: "desktop",
@@ -2005,7 +2005,7 @@ describe("relay terminal and exec sessions", () => {
   async function register(
     manager: InstanceType<typeof RelaySessionManager>,
     socket: FakeSocket,
-    frame = hello24(),
+    frame = helloCli(),
   ) {
     manager.acceptAuthenticatedSocket({ socket, identity, now });
     await manager.handleTextFrame(socket, frame, now);
@@ -2015,7 +2015,7 @@ describe("relay terminal and exec sessions", () => {
   it("persists allowFileToolsAsRoot from hello and reports the file features live", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
-    const frame = JSON.parse(hello24()) as {
+    const frame = JSON.parse(helloCli()) as {
       cli: { capabilities: { features: Record<string, unknown> } };
     };
     frame.cli.capabilities.features.allowFileToolsAsRoot = true;
@@ -2075,7 +2075,7 @@ describe("relay terminal and exec sessions", () => {
   it("echoes the client protocol version and persists reported columns only from hello", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
-    await register(manager, socket, hello24({ mcpCommandMode: "supervised" }));
+    await register(manager, socket, helloCli({ mcpCommandMode: "supervised" }));
     expect(JSON.parse(String(socket.sends[0])).protocolVersion).toBe("2.8");
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -2120,7 +2120,7 @@ describe("relay terminal and exec sessions", () => {
 
   it("clears the reported hostname when a hello omits it", async () => {
     const manager = new RelaySessionManager();
-    const frame = JSON.parse(hello24()) as { cli: Record<string, unknown> };
+    const frame = JSON.parse(helloCli()) as { cli: Record<string, unknown> };
     delete frame.cli.hostname;
     await register(manager, new FakeSocket(), JSON.stringify(frame));
     expect(db.cliDevice.upsert.mock.calls[0]?.[0].update).toMatchObject({
@@ -2132,7 +2132,7 @@ describe("relay terminal and exec sessions", () => {
     [
       "a 2.6 hello (a released 0.4.x CLI)",
       (() => {
-        const frame = JSON.parse(hello24()) as {
+        const frame = JSON.parse(helloCli()) as {
           protocolVersion: string;
           cli: { capabilities: Record<string, unknown> & { features: Record<string, unknown> } };
         };
@@ -2146,7 +2146,7 @@ describe("relay terminal and exec sessions", () => {
     [
       "a 2.5 hello",
       (() => {
-        const frame = JSON.parse(hello24()) as {
+        const frame = JSON.parse(helloCli()) as {
           protocolVersion: string;
           cli: { capabilities: Record<string, unknown> };
         };
@@ -2186,7 +2186,7 @@ describe("relay terminal and exec sessions", () => {
     [
       "a 2.6 hello carrying cli.label",
       (() => {
-        const frame = JSON.parse(hello24()) as { cli: Record<string, unknown> };
+        const frame = JSON.parse(helloCli()) as { cli: Record<string, unknown> };
         frame.cli.label = "Desktop";
         return JSON.stringify(frame);
       })(),
@@ -2194,7 +2194,7 @@ describe("relay terminal and exec sessions", () => {
     [
       "a 2.9 hello (a CLI newer than this server)",
       (() => {
-        const frame = JSON.parse(hello24()) as {
+        const frame = JSON.parse(helloCli()) as {
           protocolVersion: string;
           cli: { capabilities: Record<string, unknown> };
         };
@@ -2208,7 +2208,7 @@ describe("relay terminal and exec sessions", () => {
       // still 2.8, so the capability comparison would not refuse this frame.
       "a 2.9 hello whose capability echo still says 2.8",
       (() => {
-        const frame = JSON.parse(hello24()) as { protocolVersion: string };
+        const frame = JSON.parse(helloCli()) as { protocolVersion: string };
         frame.protocolVersion = "2.9";
         return JSON.stringify(frame);
       })(),
@@ -2240,7 +2240,7 @@ describe("relay terminal and exec sessions", () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
-    const frame = JSON.parse(hello24()) as {
+    const frame = JSON.parse(helloCli()) as {
       protocolVersion: string;
       cli: { version?: string; capabilities: Record<string, unknown> };
     };
@@ -2284,7 +2284,7 @@ describe("relay terminal and exec sessions", () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
-    const frame = JSON.parse(hello24()) as {
+    const frame = JSON.parse(helloCli()) as {
       protocolVersion: string;
       cli: { version?: string; capabilities: Record<string, unknown> };
     };
@@ -2311,7 +2311,7 @@ describe("relay terminal and exec sessions", () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
-    const frame = JSON.parse(hello24()) as {
+    const frame = JSON.parse(helloCli()) as {
       protocolVersion: string;
       cli: { version?: string; capabilities: Record<string, unknown> };
     };
@@ -2445,7 +2445,7 @@ describe("relay terminal and exec sessions", () => {
     });
     const replacement = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: replacement, identity, now });
-    await manager.handleTextFrame(replacement, hello24(), now);
+    await manager.handleTextFrame(replacement, helloCli(), now);
     expect(again.closes).toEqual([{ code: 1000, reason: "replaced" }]);
     expect(
       again.sends
@@ -2518,16 +2518,7 @@ describe("relay terminal and exec sessions", () => {
   });
 });
 
-function hello25(features?: {
-  terminalApproval?: boolean;
-  mcpCommandMode?: "off" | "supervised" | "unsupervised";
-}) {
-  const frame = JSON.parse(hello24(features)) as { id: string };
-  frame.id = "hello-25";
-  return JSON.stringify(frame);
-}
-
-describe("relay protocol 2.5 terminal viewers", () => {
+describe("relay terminal viewers", () => {
   type Event = import("./session-manager.js").TerminalLifecycleEvent;
   let events: Event[] = [];
 
@@ -2567,7 +2558,7 @@ describe("relay protocol 2.5 terminal viewers", () => {
     );
   }
 
-  async function setup(frame = hello25()) {
+  async function setup(frame = helloCli()) {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity, now });
@@ -2648,14 +2639,14 @@ describe("relay protocol 2.5 terminal viewers", () => {
     expect(manager.dispatchExecStart(command, { command: "pwd" })).toBe(true);
   });
 
-  it("keeps a 2.5 CLI identity proof for the terminal list", async () => {
+  it("keeps a CLI identity proof for the terminal list", async () => {
     const identityKey = Buffer.alloc(65, 3);
     identityKey[0] = 0x04;
     const terminalIdentity = {
       publicKey: identityKey.toString("base64url"),
       signature: Buffer.alloc(64, 7).toString("base64url"),
     };
-    const frame = JSON.parse(hello25()) as { cli: { capabilities: Record<string, unknown> } };
+    const frame = JSON.parse(helloCli()) as { cli: { capabilities: Record<string, unknown> } };
     frame.cli.capabilities.terminalIdentity = terminalIdentity;
     const { manager } = await setup(JSON.stringify(frame));
     expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
@@ -2664,14 +2655,14 @@ describe("relay protocol 2.5 terminal viewers", () => {
     });
   });
 
-  it("reports no identity for a 2.5 CLI that sent none", async () => {
+  it("reports no identity for a CLI that sent none", async () => {
     const { manager } = await setup();
     expect(
       manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")?.terminalIdentity,
     ).toBeNull();
   });
 
-  it("lets two 2.5 viewers coexist without a detached event", async () => {
+  it("lets two viewers coexist without a detached event", async () => {
     const { manager, socket } = await setup();
     const terminalId = id16(20);
     const opener = await openTerminal(manager, socket, terminalId);
@@ -2762,7 +2753,7 @@ describe("relay protocol 2.5 terminal viewers", () => {
   });
 
   it("stamps the sending viewer's id on browser input and refuses a pending tab", async () => {
-    const { manager, socket } = await setup(hello25({ terminalApproval: true }));
+    const { manager, socket } = await setup(helloCli({ terminalApproval: true }));
     const terminalId = id16(20);
     const opener = await openTerminal(manager, socket, terminalId);
     const body = new Uint8Array([7]);
@@ -2781,7 +2772,7 @@ describe("relay protocol 2.5 terminal viewers", () => {
   });
 
   it("approves pending viewers independently and tells only the requester", async () => {
-    const { manager, socket } = await setup(hello25({ terminalApproval: true }));
+    const { manager, socket } = await setup(helloCli({ terminalApproval: true }));
     const terminalId = id16(20);
     await openTerminal(manager, socket, terminalId);
     const b = attach(manager, "b", terminalId);
@@ -2884,7 +2875,7 @@ describe("relay protocol 2.5 terminal viewers", () => {
   });
 
   it("caps viewers plus pending approvals at eight per terminal", async () => {
-    const { manager, socket } = await setup(hello25({ terminalApproval: true }));
+    const { manager, socket } = await setup(helloCli({ terminalApproval: true }));
     const terminalId = id16(20);
     await openTerminal(manager, socket, terminalId);
     for (let index = 1; index < 8; index += 1) {
@@ -2900,7 +2891,7 @@ describe("relay protocol 2.5 terminal viewers", () => {
   });
 
   it("expires pending viewers and cleans up every attachment when a tab goes away", async () => {
-    const { manager, socket } = await setup(hello25({ terminalApproval: true }));
+    const { manager, socket } = await setup(helloCli({ terminalApproval: true }));
     const terminalId = id16(20);
     await openTerminal(manager, socket, terminalId);
     const b = attach(manager, "b", terminalId);
@@ -2925,7 +2916,7 @@ describe("relay protocol 2.5 terminal viewers", () => {
     expect(events).toEqual([]);
   });
 
-  it.each([["2.6", hello25({ terminalApproval: true })]])(
+  it.each([["current", helloCli({ terminalApproval: true })]])(
     "closes an expired approval handshake on the %s CLI and a late term.opened",
     async (_, frame) => {
       const { manager, socket } = await setup(frame);
@@ -2984,7 +2975,7 @@ describe("relay protocol 2.5 terminal viewers", () => {
   });
 
   it("sends exit to every viewer and pending tab, and drops all viewers on CLI disconnect", async () => {
-    const { manager, socket } = await setup(hello25({ terminalApproval: true }));
+    const { manager, socket } = await setup(helloCli({ terminalApproval: true }));
     const terminalId = id16(20);
     await openTerminal(manager, socket, terminalId);
     attach(manager, "b", terminalId);

@@ -1,7 +1,15 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  configure,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { type ComponentType, cloneElement, type ReactElement, type ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -169,6 +177,12 @@ vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
 }));
 
 import { Route } from "./chat-test";
+
+// `waitFor` polls until the awaited async work (WebCrypto on the thread pool, React
+// transitions) completes and returns as soon as it does; the timeout only bounds a
+// genuine hang. RTL's 1 s default is shorter than this file's slowest completion on a
+// loaded CI or shared host, which showed up as one-off failures in passing tests.
+configure({ asyncUtilTimeout: 10_000 });
 
 const directModel = {
   id: "direct-1",

@@ -34,13 +34,14 @@ integration("usage rollups with real PostgreSQL", () => {
   let rollup: typeof import("./usage-rollup.js");
   let retention: typeof import("./usage-retention.js");
 
+  // Cold-imports large module graphs; a bound on a hang, not on speed (10 s default flaked on a contended host).
   beforeAll(async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
     db = createFixturePrismaClient(databaseUrl);
     rollup = await import("./usage-rollup.js");
     retention = await import("./usage-retention.js");
-  });
+  }, 120_000);
 
   afterAll(async () => {
     await db?.$disconnect();

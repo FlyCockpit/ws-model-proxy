@@ -55,6 +55,7 @@ integration("engine process capacity lifecycle", () => {
   const envKeys = ["DATABASE_URL", "NODE_ENV", "BETTER_AUTH_SECRET", "BETTER_AUTH_URL"] as const;
   const createdUserIds: string[] = [];
   const savedEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+  // Cold-imports large module graphs; a bound on a hang, not on speed (10 s default flaked on a contended host).
   beforeAll(async () => {
     if (!databaseUrl) throw new Error("URL required");
     process.env.DATABASE_URL = databaseUrl;
@@ -74,7 +75,7 @@ integration("engine process capacity lifecycle", () => {
       ]);
     modules = { registration, lifecycle, access, router, db, factory, store, discovered };
     fixture = createFixturePrismaClient(databaseUrl);
-  });
+  }, 120_000);
   afterAll(async () => {
     // Leave no live admission rows for another file sharing this database.
     const where = { userId: { in: createdUserIds } };
