@@ -134,6 +134,58 @@ describe("cache affinity", () => {
     db.capacityWaiter.groupBy.mockResolvedValue([]);
   });
 
+  it.each(["bound", "mismatched", "default", "forged", "disabled", "deleted pool"] as const)(
+    "C1a-2 writer binding: %s",
+    async (state) => {
+      const servedTarget = target("native", "native-runtime");
+      const args = {
+        ...digestArgs(servedTarget.targetIdentity, { input: "next only" }, "OPENAI_RESPONSES"),
+        policy: { ...policy, enabled: state !== "disabled" },
+        target: servedTarget,
+      };
+      const bindingDigest = affinityPrefixDigests(args).bindingDigest;
+      const sessionBinding =
+        state === "bound" || state === "mismatched"
+          ? {
+              sessionId: "durable-session",
+              bindingDigest: state === "bound" ? bindingDigest : "wrong-scope",
+            }
+          : undefined;
+      if (state === "deleted pool") db.modelPool.findFirst.mockResolvedValue(null);
+      const binding = await rememberAffinity({
+        ...args,
+        sessionBinding,
+        payload: {
+          ...args.payload,
+          ...(state === "forged"
+            ? {
+                sessionBinding: { sessionId: "forged-session", bindingDigest },
+                warmSessionId: "forged-session",
+                warmBindingDigest: bindingDigest,
+              }
+            : {}),
+        },
+      });
+      if (state === "disabled" || state === "deleted pool") {
+        expect(binding).toBeNull();
+        expect(db.cacheAffinityRecord.upsert).not.toHaveBeenCalled();
+        return;
+      }
+      expect(binding).toEqual({ sessionId: expect.any(String), bindingDigest });
+      if (state === "bound") expect(binding?.sessionId).toBe("durable-session");
+      else {
+        expect(binding?.sessionId).not.toBe("durable-session");
+        expect(binding?.sessionId).not.toBe("forged-session");
+      }
+      expect(db.cacheAffinityRecord.upsert).toHaveBeenCalledWith(
+        expect.objectContaining({
+          create: expect.objectContaining({ sessionId: binding?.sessionId }),
+          update: expect.objectContaining({ sessionId: binding?.sessionId }),
+        }),
+      );
+    },
+  );
+
   it("separates tenants, runtimes, surfaces, ordered content, tools, and parameters", () => {
     const digest = (overrides: Partial<Parameters<typeof affinityPrefixDigests>[0]> = {}) =>
       affinityPrefixDigests({

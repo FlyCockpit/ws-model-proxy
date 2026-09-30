@@ -60,6 +60,18 @@ export type AffinityDecision = {
   matchedSessionIds?: Record<string, string>;
 };
 
+/** Durable internal Responses binding; the digest binds caller, pool, grant and runtime. */
+export type AffinitySessionBinding = { sessionId: string; bindingDigest: string };
+
+export function scopedAffinitySessionId(
+  binding: AffinitySessionBinding | null | undefined,
+  bindingDigest: string,
+): string | undefined {
+  return binding?.sessionId && binding.bindingDigest === bindingDigest
+    ? binding.sessionId
+    : undefined;
+}
+
 /** A stored record as far as session identity is concerned. */
 export type SessionIdentityRecord = {
   id: string;
@@ -554,6 +566,7 @@ export async function rememberAffinity({
   target,
   estimatedTokens,
   engineCacheConfirmed,
+  sessionBinding,
   now = new Date(),
 }: {
   ownerId: string;
@@ -573,9 +586,11 @@ export async function rememberAffinity({
    * usage) leaves any previously stored value untouched.
    */
   engineCacheConfirmed?: boolean;
+  /** Internal native Responses continuation, read only from the durable sticky row. */
+  sessionBinding?: AffinitySessionBinding;
   now?: Date;
-}): Promise<void> {
-  if (!policy.enabled) return;
+}): Promise<AffinitySessionBinding | null> {
+  if (!policy.enabled) return null;
   const material = affinityPrefixDigests({
     ownerId,
     resourceOwnerId,
@@ -591,14 +606,15 @@ export async function rememberAffinity({
     material.digests.length === 0 &&
     !material.conversationDigest
   ) {
-    return;
+    return null;
   }
+  const boundSessionId = scopedAffinitySessionId(sessionBinding, material.bindingDigest);
   const expiresAt = new Date(now.getTime() + policy.ttlSeconds * 1000);
   // Every record this call writes (created or refreshed) carries the same
   // `lastUsedAt` and `sessionId`: warm-session protection (S-C,
   // ./warm-protection.ts) groups records into one session by the id, dates it
   // by its newest record and sizes it by that instant's `estimatedTokens`.
-  await prisma.$transaction(async (tx) => {
+  return prisma.$transaction(async (tx) => {
     // Serialize retention enforcement per owner/pool so concurrent successful
     // requests cannot race past the configured bound: the cache-affinity
     // fence, taken before any row (writer class H,
@@ -610,7 +626,7 @@ export async function rememberAffinity({
       where: { id: poolId, userId: resourceOwnerId },
       select: { id: true },
     });
-    if (!pool) return;
+    if (!pool) return null;
     await tx.cacheAffinityRecord.deleteMany({
       where: {
         userId: resourceOwnerId,
@@ -620,8 +636,10 @@ export async function rememberAffinity({
       },
     });
     // The session this request continues (or a new one), read under the pool
-    // lock so concurrent writers of one conversation agree on it.
+    // fence so concurrent writers of one conversation agree on it. A scoped
+    // native binding also identifies continuations carrying only the new input.
     const sessionId =
+      boundSessionId ??
       continuedSessionKey(
         await tx.cacheAffinityRecord.findMany({
           where: {
@@ -653,7 +671,8 @@ export async function rememberAffinity({
           isContinuation: material.isContinuation,
           digests: material.digests,
         },
-      ) ?? randomUUID();
+      ) ??
+      randomUUID();
     const upsertPrefix = async (prefixDigest: string, prefixDepth: number) => {
       await tx.cacheAffinityRecord.upsert({
         where: {
@@ -755,6 +774,7 @@ export async function rememberAffinity({
         where: { id: { in: overflow.map(({ id }) => id) } },
       });
     }
+    return { sessionId, bindingDigest: material.bindingDigest };
   });
 }
 

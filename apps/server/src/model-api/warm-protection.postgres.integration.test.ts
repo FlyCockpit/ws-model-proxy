@@ -48,6 +48,213 @@ integration("warm-session protection with real PostgreSQL", () => {
     });
   }
 
+  it.each([
+    { linked: true, state: "FREE", idle: 0 },
+    { linked: false, state: "PROTECTED", idle: 2 },
+  ] as const)(
+    "C1a-2 native continuations linked=$linked",
+    async ({ linked, state, idle }) => {
+      process.env.BETTER_AUTH_SECRET ??= "cache-affinity-integration-secret-32-bytes";
+      process.env.BETTER_AUTH_URL ??= "http://localhost:3000";
+      const affinity = await import("./cache-affinity.js");
+      const owner = await user("native-responses");
+      const suffix = crypto.randomUUID();
+      try {
+        const device = await db.cliDevice.create({
+          data: { userId: owner.id, slug: `device-${suffix}` },
+        });
+        const endpoint = await db.endpoint.create({
+          data: {
+            userId: owner.id,
+            cliDeviceId: device.id,
+            slug: `endpoint-${suffix}`,
+            label: "Native",
+          },
+        });
+        const pool = await db.modelPool.create({
+          data: {
+            userId: owner.id,
+            slug: `pool-${suffix}`,
+            name: "Native Responses",
+            affinityEnabled: true,
+          },
+        });
+        const capacity = await db.inferenceCapacity.create({
+          data: {
+            userId: owner.id,
+            label: `capacity-${suffix}`,
+            runtimeIdentityKey: `runtime-${suffix}`,
+            runtimeModel: "native-responses",
+            hardConcurrencyLimit: 4,
+          },
+        });
+        const model = await db.discoveredModel.create({
+          data: {
+            userId: owner.id,
+            endpointId: endpoint.id,
+            upstreamModelId: "native-responses",
+            encodedModelId: `native-${suffix}`,
+          },
+        });
+        const target = await db.executionTarget.update({
+          where: { discoveredModelId: model.id },
+          data: { inferenceCapacityId: capacity.id },
+        });
+        const member = await db.poolMember.create({
+          data: {
+            poolId: pool.id,
+            executionTargetId: target.id,
+            discoveredModelId: model.id,
+          },
+        });
+        const now = new Date();
+        const policy = {
+          enabled: true,
+          ttlSeconds: 3600,
+          maxRecords: 100,
+          prefixWeight: 100,
+          conversationWeight: 150,
+          confirmedCacheWeight: 250,
+          loadPenaltyWeight: 100,
+        };
+        const args = {
+          ownerId: owner.id,
+          resourceOwnerId: owner.id,
+          poolId: pool.id,
+          securityScope: owner.id,
+          surface: "OPENAI_RESPONSES",
+          policy,
+          now,
+          estimatedTokens: 20_000,
+          target: {
+            poolMemberId: member.id,
+            executionTargetId: target.id,
+            targetIdentity: `identity-${suffix}`,
+            capacityId: capacity.id,
+            hardConcurrencyLimit: 4,
+            healthPenalty: 0,
+            publicEgressPenalty: 0,
+            costPenalty: 0,
+          },
+        };
+        for (const index of [1, 2]) {
+          const binding = await affinity.rememberAffinity({
+            ...args,
+            payload: { input: `conversation ${index}` },
+          });
+          expect(binding).toMatchObject({
+            sessionId: expect.any(String),
+            bindingDigest: expect.any(String),
+          });
+          const record = await db.responseStickinessRecord.create({
+            data: {
+              userId: owner.id,
+              routingKeyDigest: `response-${index}-${suffix}`,
+              routingVersion: 2,
+              targetModelPoolId: pool.id,
+              selectedExecutionTargetId: target.id,
+              selectedDiscoveredModelId: model.id,
+              warmSessionId: binding!.sessionId,
+              warmBindingDigest: binding!.bindingDigest,
+              expiresAt: new Date(now.getTime() + 60_000),
+            },
+          });
+          // Read the durable sticky row, as bound create does. No shared prefix
+          // or body hint is needed when the next request carries only new input.
+          const stored = await db.responseStickinessRecord.findUniqueOrThrow({
+            where: { id: record.id },
+          });
+          const sessionBinding = {
+            sessionId: stored.warmSessionId!,
+            bindingDigest: stored.warmBindingDigest!,
+          };
+          const payload = { input: `new input ${index}`, previous_response_id: `resp_${index}` };
+          const material = affinity.affinityPrefixDigests({
+            ...args,
+            payload,
+            runtimeIdentity: args.target.targetIdentity,
+          });
+          const sessionId = affinity.scopedAffinitySessionId(
+            sessionBinding,
+            material.bindingDigest,
+          );
+          expect(sessionId).toBe(binding!.sessionId);
+          const refreshed = await affinity.rememberAffinity({ ...args, payload, sessionBinding });
+          expect(refreshed).toEqual(binding);
+          const id = crypto.randomUUID();
+          const request = await db.admissionRequest.create({
+            data: {
+              userId: owner.id,
+              requestId: id,
+              attemptId: id,
+              sourceKind: "POOL",
+              poolId: pool.id,
+              basePriority: 16,
+              enqueueSequence: BigInt(index),
+              connectionOwner: "native-responses-test",
+              heartbeatAt: now,
+              state: "ADMITTED",
+              warmSessionIds: linked && sessionId ? [sessionId] : [],
+            },
+          });
+          await db.capacityLease.create({
+            data: {
+              userId: owner.id,
+              admissionRequestId: request.id,
+              requestId: id,
+              attemptId: id,
+              capacityId: capacity.id,
+              executionTargetId: target.id,
+              poolId: pool.id,
+              poolMemberId: member.id,
+              priority: 16,
+              reservationClass: 0,
+              fencingToken: BigInt(index),
+              ownerServerInstance: "native-responses-test",
+              acquiredAt: now,
+              heartbeatAt: now,
+              expiresAt: new Date(now.getTime() + 60_000),
+            },
+          });
+        }
+        const snapshot = await warm.warmProtectionSource.load({
+          ownerId: owner.id,
+          capacityIds: [capacity.id],
+          policy: {
+            enabled: true,
+            windowSeconds: 300,
+            minTokens: 8192,
+            share: "EQUAL_SHARE",
+            fixedPercent: null,
+          },
+        });
+        expect(snapshot.activeByCapacity.get(capacity.id)).toBe(2);
+        const sessions = snapshot.sessionsByCapacity.get(capacity.id) ?? [];
+        expect(sessions).toHaveLength(2);
+        expect(sessions.map((session) => session.inFlight)).toEqual([linked, linked]);
+        const load = { slots: 4, active: 2, kvBudgetTokens: null };
+        const protection = {
+          enabled: true,
+          windowSeconds: 300,
+          minTokens: 8192,
+          share: "EQUAL_SHARE" as const,
+          fixedPercent: null,
+        };
+        const verdict = warm.memberProtectionVerdict({
+          load,
+          protectedSessions: warm.protectedWarmSessions(sessions, load, protection),
+          requestTokens: 20_000,
+          affine: false,
+        });
+        expect(verdict).toMatchObject({ state, idleProtectedSessions: idle, protectedSessions: 2 });
+      } finally {
+        await db.capacityLease.deleteMany({ where: { userId: owner.id } });
+        await db.user.deleteMany({ where: { id: owner.id } });
+      }
+    },
+    60_000,
+  );
+
   it("groups a session's records by session id and reads overrides, in bounded time", async () => {
     if (!databaseUrl) return;
     const suffix = crypto.randomUUID();

@@ -1508,6 +1508,9 @@ model ResponseStickinessRecord {
   updatedAt                 DateTime  @default(now()) @updatedAt
   userId                    String
   modelApiTokenId           String?
+  /// Scoped warm-session identity from successful local pool Responses creates only.
+  warmSessionId             String?
+  warmBindingDigest         String?
   routingKeyDigest          String
   /// Version 2+ rows are bound to immutable ExecutionTarget identities and
   /// must never fall back to legacy discovered-model columns after deletion.
