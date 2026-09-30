@@ -16,7 +16,12 @@
  *     drop them (move = DELETE ... RETURNING + additive hourly upsert in ONE
  *     transaction, so a crash rolls both back and nothing is lost or doubled).
  *  4. Delete hourly rollups older than 13 months.
- *  5. Hot-path history sweeps (DL-1 design (d), #78; @ws-model-proxy/db/hot-path-sweeps):
+ *  5. Delete agent audit events (cli_agent_action_event, plain ids, no FKs)
+ *     older than CLI_AGENT_ACTION_RETENTION_DAYS, in `FOR UPDATE SKIP LOCKED`
+ *     batches ordered by the (createdAt) index, and audit events whose user
+ *     no longer exists (an independent bound for a row that outlived the
+ *     deletion drain and the deleted-user purge).
+ *  6. Hot-path history sweeps (DL-1 design (d), #78; @ws-model-proxy/db/hot-path-sweeps):
  *     terminal admission history older than RELAY_REQUEST_RETENTION_DAYS (it
  *     no longer blocks a parent delete, so it needs its own bound), the rest
  *     of deleted users' history (the `deleted_user_purge` queue), and the
@@ -40,6 +45,7 @@
  * next run.
  */
 
+import { CLI_AGENT_ACTION_RETENTION_DAYS } from "@ws-model-proxy/config/cli-agent-audit";
 import {
   USAGE_ROLLUP_HOUR_RETENTION_DAYS,
   USAGE_ROLLUP_MINUTE_RETENTION_DAYS,
@@ -83,6 +89,7 @@ export type UsageRetentionResult = {
   relayRequestsDeleted: number;
   minuteRowsCompacted: number;
   hourRowsDeleted: number;
+  agentActionsDeleted: number;
   routingVerdictsDeleted: number;
   admissionHistoryPruned: number;
   deletedUserRowsPurged: number;
@@ -316,6 +323,65 @@ export async function deleteExpiredHourRollups({
   }
 }
 
+export async function deleteExpiredCliAgentActions({
+  prisma = defaultPrisma as RetentionPrisma,
+  now,
+  retentionDays = CLI_AGENT_ACTION_RETENTION_DAYS,
+  batch = USAGE_RETENTION_BATCH,
+}: {
+  prisma?: RetentionPrisma;
+  now: Date;
+  retentionDays?: number;
+  batch?: number;
+}): Promise<number> {
+  const cutoff = new Date(now.getTime() - retentionDays * DAY_MS);
+  let deleted = 0;
+  for (;;) {
+    if (isDbShutdownFenceArmed()) return deleted;
+    const count = await prisma.$executeRaw`
+      DELETE FROM cli_agent_action_event
+       WHERE ctid IN (
+         SELECT ctid FROM cli_agent_action_event
+          WHERE "createdAt" < ${cutoff}
+          ORDER BY "createdAt"
+          LIMIT ${batch}
+          FOR UPDATE SKIP LOCKED)`;
+    deleted += count;
+    if (count < batch) return deleted;
+  }
+}
+
+/**
+ * Deletes audit events whose user no longer exists. The audit table has no
+ * foreign key (plain ids), so the user delete's drain and the deleted-user
+ * purge queue (@ws-model-proxy/db/hot-path-sweeps) are the prompt paths; this
+ * recurring anti-join is the independent bound for a row that outlived both (a
+ * writer suspended between its owner check and its insert past the purge
+ * grace, or a purge backlog). `FOR UPDATE SKIP LOCKED` batches, fence between
+ * batches, like the expiry step; `user` is read only.
+ */
+export async function deleteOrphanCliAgentActions({
+  prisma = defaultPrisma as RetentionPrisma,
+  batch = USAGE_RETENTION_BATCH,
+}: {
+  prisma?: RetentionPrisma;
+  batch?: number;
+} = {}): Promise<number> {
+  let deleted = 0;
+  for (;;) {
+    if (isDbShutdownFenceArmed()) return deleted;
+    const count = await prisma.$executeRaw`
+      DELETE FROM cli_agent_action_event
+       WHERE ctid IN (
+         SELECT e.ctid FROM cli_agent_action_event e
+          WHERE NOT EXISTS (SELECT 1 FROM "user" u WHERE u.id = e."userId")
+          LIMIT ${batch}
+          FOR UPDATE OF e SKIP LOCKED)`;
+    deleted += count;
+    if (count < batch) return deleted;
+  }
+}
+
 export async function deleteExpiredRoutingVerdicts({
   prisma = defaultPrisma as RetentionPrisma,
   now,
@@ -368,6 +434,9 @@ export async function runUsageRetention({
   });
   const minuteRowsCompacted = await compactMinuteRollups({ prisma, now, batch });
   const hourRowsDeleted = await deleteExpiredHourRollups({ prisma, now, batch });
+  const agentActionsDeleted =
+    (await deleteExpiredCliAgentActions({ prisma, now, batch })) +
+    (await deleteOrphanCliAgentActions({ prisma, batch }));
   const routingVerdictsDeleted = await deleteExpiredRoutingVerdicts({ prisma, now, batch });
   const admissionHistoryPruned = await pruneTerminalCapacityHistory(prisma, {
     before: new Date(now.getTime() - retentionDays * DAY_MS),
@@ -386,6 +455,7 @@ export async function runUsageRetention({
     relayRequestsDeleted,
     minuteRowsCompacted,
     hourRowsDeleted,
+    agentActionsDeleted,
     routingVerdictsDeleted,
     admissionHistoryPruned,
     deletedUserRowsPurged: purged.rows,
@@ -417,6 +487,7 @@ export function startUsageRetention({
         result.relayRequestsDeleted +
         result.minuteRowsCompacted +
         result.hourRowsDeleted +
+        result.agentActionsDeleted +
         result.admissionHistoryPruned +
         result.deletedUserRowsPurged +
         result.orphanCapacityRuntimeDeleted +
@@ -424,7 +495,7 @@ export function startUsageRetention({
         result.routingVerdictsDeleted;
       if (total > 0)
         console.log(
-          `[metrics] retention: reaped ${result.abandonedReaped}, deleted ${result.relayRequestsDeleted} relay request(s), compacted ${result.minuteRowsCompacted} minute rollup(s), deleted ${result.hourRowsDeleted} hourly rollup(s), pruned ${result.admissionHistoryPruned} admission request(s), purged ${result.deletedUserRowsPurged} deleted-user row(s), deleted ${result.orphanCapacityRuntimeDeleted} orphan capacity runtime row(s), deleted ${result.expiredStickinessDeleted} expired stickiness binding(s), deleted ${result.routingVerdictsDeleted} expired routing verdict(s).`,
+          `[metrics] retention: reaped ${result.abandonedReaped}, deleted ${result.relayRequestsDeleted} relay request(s), compacted ${result.minuteRowsCompacted} minute rollup(s), deleted ${result.hourRowsDeleted} hourly rollup(s), deleted ${result.agentActionsDeleted} agent audit event(s), pruned ${result.admissionHistoryPruned} admission request(s), purged ${result.deletedUserRowsPurged} deleted-user row(s), deleted ${result.orphanCapacityRuntimeDeleted} orphan capacity runtime row(s), deleted ${result.expiredStickinessDeleted} expired stickiness binding(s), deleted ${result.routingVerdictsDeleted} expired routing verdict(s).`,
         );
     } catch (error) {
       // Prisma errors can carry SQL and parameters; log the class only.

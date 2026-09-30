@@ -2019,6 +2019,8 @@ where
         }
         FrameFault::RejectExec { command_id } => {
             tracing::warn!(command_id, "refusing a malformed exec command request");
+            // `reject_malformed` builds the refusal through `exec_rejected`,
+            // which logs that command's one outcome line.
             send_outbound_frames(socket, execs.reject_malformed(&command_id))
         }
         FrameFault::RejectSupervised { command_id } => {
@@ -2026,6 +2028,9 @@ where
                 command_id,
                 "refusing a malformed supervised command request"
             );
+            // The request never reaches `TerminalRegistry`, so this is that
+            // command's one outcome line.
+            crate::sessions::log_command_rejected("supervised", &command_id, "bad_command");
             send_control(
                 socket,
                 &ClientControlMessage::SupervisedRejected {
@@ -3306,6 +3311,29 @@ mod tests {
         written: Vec<u8>,
     }
 
+    /// Collects `tracing` output for tests (an in-memory writer).
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut inner) = self.0.lock() {
+                inner.extend_from_slice(bytes);
+            }
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
+        type Writer = LogBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
     impl io::Read for SinkStream {
         fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
             Ok(0)
@@ -3330,6 +3358,62 @@ mod tests {
             tungstenite::protocol::Role::Server,
             None,
         )
+    }
+
+    /// A malformed `exec.start` / `term.spawn` names a command but cannot be
+    /// read as a request, so it never reaches a registry. The daemon still
+    /// owes that command its one outcome line (AC 8): without the explicit
+    /// log here, a refused command would leave no CLI-side record at all.
+    #[test]
+    fn malformed_command_requests_log_one_rejection_each() {
+        let buf = LogBuf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let (tx, _rx) = mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
+            let mut terminals = TerminalRegistry::new(tx);
+            let (exec_tx, _exec_rx) =
+                mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
+            let mut execs = ExecRegistry::new(exec_tx, DEFAULT_EXEC_TIMEOUT);
+            let error = anyhow::anyhow!("malformed relay frame");
+            // Each frame names a command but its command string is NUL-bearing:
+            // `control_frame_fault` attributes it and `apply_frame_fault`
+            // refuses it without ever reaching a registry.
+            for frame in [
+                r#"{"type":"exec.start","commandId":"cmd-exec-9f3a","command":"x\u0000y"}"#,
+                r#"{"type":"term.spawn","commandId":"cmd-sup-9f3a","command":"x\u0000y"}"#,
+            ] {
+                let mut socket = sink_socket();
+                let fault = crate::protocol::control_frame_fault(frame);
+                assert!(
+                    apply_frame_fault(&mut socket, fault, &mut terminals, &mut execs, &error)
+                        .is_ok(),
+                    "a refused command is not fatal"
+                );
+                assert!(
+                    !socket.get_ref().written.is_empty(),
+                    "the refusal frame is written back"
+                );
+            }
+        });
+        let log = String::from_utf8(buf.0.lock().map(|b| b.clone()).unwrap_or_default())
+            .unwrap_or_default();
+        // Count only the outcome lines: the `warn!` above also names the id.
+        let outcomes = |command_id: &str| {
+            log.lines()
+                .filter(|line| line.contains("command operation") && line.contains(command_id))
+                .count()
+        };
+        assert_eq!(outcomes("cmd-exec-9f3a"), 1, "{log}");
+        assert_eq!(outcomes("cmd-sup-9f3a"), 1, "{log}");
+        assert!(log.contains("rejected:bad_command"), "{log}");
+        assert!(
+            !log.contains("x\\u0000y") && !log.contains("x\u{0}"),
+            "the command text leaked: {log}"
+        );
     }
 
     #[test]

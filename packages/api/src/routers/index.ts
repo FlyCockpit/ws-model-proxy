@@ -6,6 +6,7 @@ import { providerCredentialKeyringConfigured } from "../lib/provider-credential-
 import { adminObservabilityRouter } from "./admin-observability";
 import { authRouter } from "./auth";
 import { capacityManagementRouter } from "./capacity-management";
+import { cliAgentActivityRouter } from "./cli-agent-activity";
 import { cliCredentialsRouter } from "./cli-credentials";
 import { devicesRouter } from "./devices";
 import { forwarderManagementRouter } from "./forwarder-management";
@@ -78,6 +79,9 @@ export const appRouter = {
   devices: devicesRouter,
   forwarderManagement: forwarderManagementRouter,
   cliCredentials: cliCredentialsRouter,
+  // Owner-scoped agent audit log (metadata only); MCP read tool
+  // `forwarder_cli_activity_list`, visible under the CLI-tool access rule.
+  cliAgentActivity: cliAgentActivityRouter,
   capacityManagement: capacityManagementRouter,
   modelApiTokens: modelApiTokensRouter,
   overview: overviewRouter,
