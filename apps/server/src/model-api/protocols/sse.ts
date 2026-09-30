@@ -1,6 +1,7 @@
 import { AdapterError } from "./errors.js";
 
 export type SseRecord = { event?: string; data: string; id?: string };
+type RecordObserver = (record: SseRecord, endByteOffset: number) => void;
 
 /** Incremental SSE decoder: arbitrary byte boundaries, LF/CRLF, comments and multiline data. */
 export class SseDecoder {
@@ -8,19 +9,27 @@ export class SseDecoder {
   readonly #maxBufferBytes: number;
   #buffer = "";
   #finished = false;
+  #consumedBytes = 0;
+  readonly #prefix: number[] = [];
 
   constructor({ maxBufferBytes = 1024 * 1024 }: { maxBufferBytes?: number } = {}) {
     this.#maxBufferBytes = maxBufferBytes;
   }
 
-  push(chunk: Uint8Array): SseRecord[] {
+  push(chunk: Uint8Array, observe?: RecordObserver): SseRecord[] {
     if (this.#finished) throw new AdapterError("stream_closed", "SSE decoder is already closed.");
+    // TextDecoder strips a leading UTF-8 BOM, but record offsets include it.
+    if (this.#prefix.length < 3) {
+      for (const byte of chunk.subarray(0, 3 - this.#prefix.length)) this.#prefix.push(byte);
+      if (this.#prefix[0] === 0xef && this.#prefix[1] === 0xbb && this.#prefix[2] === 0xbf)
+        this.#consumedBytes += 3;
+    }
     try {
       this.#buffer += this.#decoder.decode(chunk, { stream: true });
     } catch {
       throw new AdapterError("invalid_utf8", "SSE stream was not valid UTF-8.");
     }
-    const records = this.#drain(false);
+    const records = this.#drain(false, observe);
     this.#guard();
     return records;
   }
@@ -44,11 +53,12 @@ export class SseDecoder {
     }
   }
 
-  #drain(final: boolean): SseRecord[] {
+  #drain(final: boolean, observe?: RecordObserver): SseRecord[] {
     const records: SseRecord[] = [];
     while (true) {
       const match = /\r\n\r\n|\n\n|\r\r/.exec(this.#buffer);
       if (!match) break;
+      const frame = this.#buffer.slice(0, match.index + match[0].length);
       const raw = this.#buffer
         .slice(0, match.index)
         .replaceAll("\r\n", "\n")
@@ -56,8 +66,12 @@ export class SseDecoder {
       if (new TextEncoder().encode(raw).byteLength > this.#maxBufferBytes)
         throw new AdapterError("stream_buffer_exceeded", "SSE event exceeded the bounded buffer.");
       this.#buffer = this.#buffer.slice(match.index + match[0].length);
+      this.#consumedBytes += new TextEncoder().encode(frame).byteLength;
       const record = parseRecord(raw);
-      if (record) records.push(record);
+      if (record) {
+        records.push(record);
+        observe?.(record, this.#consumedBytes);
+      }
     }
     if (final && this.#buffer.length > 0) {
       throw new AdapterError("truncated_stream", "SSE stream ended inside an event.");
