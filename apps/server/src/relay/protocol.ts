@@ -158,7 +158,7 @@ const v28FeatureSchema = z
      * until the read grant ships (P4); reported now so the fleet upgrades once.
      */
     mcpFileRead: z.boolean(),
-    /** 2.8: the CLI has `fileRoots` configured (mandatory for the read grant). False until P4. */
+    /** 2.8: the CLI has `fileRoots` configured (mandatory for the read grant). */
     fileRootsConfigured: z.boolean(),
     /** 2.8: `wsmp config set-file-tools-as-root on` (default off). */
     allowFileToolsAsRoot: z.boolean(),

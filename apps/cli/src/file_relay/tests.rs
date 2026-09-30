@@ -162,6 +162,19 @@ fn read_grant_admit_matrix() {
 }
 
 #[test]
+fn only_the_four_read_ops_are_read_class() {
+    for op in ["read", "stat", "list", "search"] {
+        assert!(is_read_op(op), "{op}");
+    }
+    for op in [
+        "edit", "write", "rename", "mkdir", "delete", "", "READ", "read ", "unknown",
+    ] {
+        assert!(!is_read_op(op), "{op:?}");
+    }
+    assert_eq!(OPS.iter().filter(|op| is_read_op(op)).count(), 4);
+}
+
+#[test]
 fn read_grant_admit_literal_rows() {
     use McpCommandMode::{Off, Supervised, Unsupervised};
     // (local, server, read, grant, switch, roots) -> result, at euid 1000.

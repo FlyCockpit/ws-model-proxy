@@ -57,6 +57,12 @@ pub const OPS: [&str; 9] = [
     "read", "stat", "list", "search", "edit", "write", "rename", "mkdir", "delete",
 ];
 
+/// The read class: the only ops the read grant can admit. Anything else,
+/// including an unknown name, is write-class and fails closed.
+pub fn is_read_op(op: &str) -> bool {
+    matches!(op, "read" | "stat" | "list" | "search")
+}
+
 /// A frame a settled op wants sent, in order.
 #[derive(Debug, Clone)]
 pub enum FileFrame {
@@ -433,7 +439,7 @@ impl FileRelay {
         if let Err(reason) = admit(
             self.mode,
             permission,
-            matches!(op, "read" | "stat" | "list" | "search"),
+            is_read_op(op),
             self.read_switch,
             policy.roots_configured(),
             policy.euid(),

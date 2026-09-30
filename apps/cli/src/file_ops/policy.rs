@@ -127,7 +127,7 @@ impl Policy {
                 "secret files and their directories are read-only through the file tools",
             ));
         }
-        if self.roots_required && !self.roots.iter().any(|root| full.starts_with(root)) {
+        if !self.within_roots(full) {
             return Err(FileError::denied(
                 "path is outside the configured file roots",
             ));
@@ -149,6 +149,15 @@ impl Policy {
             }
         }
         Ok(())
+    }
+
+    /// The lexical roots check, shared by every access. Configured roots that
+    /// did not resolve leave `roots` empty but `roots_required` set: nothing
+    /// is inside them, so the policy stays closed instead of falling open.
+    /// (Kept separate from the Linux-only kernel guard so it is testable, and
+    /// binding on every platform.)
+    pub(crate) fn within_roots(&self, full: &Path) -> bool {
+        !self.roots_required || self.roots.iter().any(|root| full.starts_with(root))
     }
 
     /// Kernel second guard on Linux, using nix's safe openat2 wrapper.
@@ -403,6 +412,20 @@ mod tests {
             ErrorCode::PathDenied
         );
         assert!(p.roots_configured());
+    }
+
+    #[test]
+    fn roots_check_is_closed_for_unresolved_roots_on_every_platform() {
+        let dir = tempfile::tempdir().expect("dir");
+        let broken = Policy::new(vec![dir.path().join("missing")], vec![], false);
+        assert!(!broken.within_roots(dir.path()));
+        assert!(!broken.within_roots(&dir.path().join("missing").join("x")));
+        let open = Policy::new(vec![], vec![], false);
+        assert!(open.within_roots(dir.path()));
+        let real = std::fs::canonicalize(dir.path()).expect("canonical");
+        let good = Policy::new(vec![real.clone()], vec![], false);
+        assert!(good.within_roots(&real.join("a")));
+        assert!(!good.within_roots(&real.with_file_name("elsewhere")));
     }
 
     #[test]

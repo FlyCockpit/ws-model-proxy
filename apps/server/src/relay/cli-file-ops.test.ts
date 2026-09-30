@@ -339,6 +339,66 @@ describe("cli file ops", () => {
     },
   );
 
+  describe("each read-grant site decides from its own source", () => {
+    const liveOf = () => {
+      const real = relaySessionManager.getLiveCliFeatures(["desktop"]).get("desktop");
+      if (!real) throw new Error("no live snapshot");
+      return real;
+    };
+
+    it("admission reads the dashboard grant from the database, not the session copy", async () => {
+      db.cliDevice.findUnique.mockImplementation(deviceRow("OFF", { mcpFileRead: false }));
+      const socket = await connect("desktop", "off", true, true);
+      // The session still holds a stale `true` (a revoke has not been applied yet).
+      relaySessionManager.applyFeatureGrants("desktop", {
+        allowHumanTerminal: false,
+        mcpCommandMode: "off",
+        mcpFileRead: true,
+      });
+      await expect(start(socket, "read", readArgs)).resolves.toEqual({
+        ok: false,
+        code: "grant_disabled",
+      });
+      expect(socket.frames("file.op")).toEqual([]);
+    });
+
+    it("admission reads the live roots report from the connection", async () => {
+      db.cliDevice.findUnique.mockImplementation(deviceRow("OFF", { mcpFileRead: true }));
+      const socket = await connect("desktop", "off", true, true);
+      relaySessionManager.applyFeatureGrants("desktop", {
+        allowHumanTerminal: false,
+        mcpCommandMode: "off",
+        mcpFileRead: true,
+      });
+      const live = liveOf();
+      vi.spyOn(relaySessionManager, "getLiveCliFeatures").mockReturnValue(
+        new Map([["desktop", { ...live, fileRootsConfigured: false }]]),
+      );
+      await expect(start(socket, "read", readArgs)).resolves.toEqual({
+        ok: false,
+        code: "grant_disabled",
+      });
+      expect(socket.frames("file.op")).toEqual([]);
+    });
+
+    it("the dispatch gate re-checks roots on the session even when admission passed", async () => {
+      db.cliDevice.findUnique.mockImplementation(deviceRow("OFF", { mcpFileRead: true }));
+      const socket = await connect("desktop", "off", true, false);
+      relaySessionManager.applyFeatureGrants("desktop", {
+        allowHumanTerminal: false,
+        mcpCommandMode: "off",
+        mcpFileRead: true,
+      });
+      const live = liveOf();
+      vi.spyOn(relaySessionManager, "getLiveCliFeatures").mockReturnValue(
+        new Map([["desktop", { ...live, fileRootsConfigured: true }]]),
+      );
+      const outcome = await start(socket, "read", readArgs);
+      expect(outcome).toMatchObject({ ok: false });
+      expect(socket.frames("file.op")).toEqual([]);
+    });
+  });
+
   it.each(["off", "supervised", "unsupervised"] as const)(
     "grant-off sweep on %s cancels only reads that lose permission",
     async (mode) => {

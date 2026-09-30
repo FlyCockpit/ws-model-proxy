@@ -94,4 +94,19 @@ it("missing PAT flags or scopes never authorize a CLI capability", () => {
     expect(cliTokenAllows({ scopes: ["mcp:read", "mcp:write"] }, capability)).toBe(false);
   }
   expect(cliTokenAllows({ allowCliFileRead: true, scopes: ["mcp:read"] }, "file_read")).toBe(true);
+  // The read-only flag never reaches write-class or command capabilities.
+  for (const capability of ["command", "file_write"] as const) {
+    expect(cliTokenAllows({ allowCliFileRead: true, scopes: ["mcp:read"] }, capability)).toBe(
+      false,
+    );
+    expect(
+      cliTokenAllows({ allowCliFileRead: true, scopes: ["mcp:read", "mcp:write"] }, capability),
+    ).toBe(false);
+    expect(cliTokenAllows({ allowCliCommands: true, scopes: ["mcp:read"] }, capability)).toBe(
+      false,
+    );
+  }
+  expect(cliTokenAllows({ allowCliCommands: true, scopes: ["mcp:write"] }, "file_write")).toBe(
+    true,
+  );
 });
