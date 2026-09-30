@@ -29,3 +29,33 @@ pub(super) fn is_unsupported(errno: Errno) -> bool {
     matches!(errno, Errno::EINVAL | Errno::ENOSYS)
         || (cfg!(target_os = "macos") && errno == Errno::ENOTSUP)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The set of errors that mean "this filesystem has no exchange". Every other
+    /// error must stay an error: a silent fallback would be a plain overwrite.
+    #[test]
+    fn only_exchange_less_errors_are_unsupported() {
+        for errno in [Errno::EINVAL, Errno::ENOSYS] {
+            assert!(is_unsupported(errno), "{errno}");
+        }
+        assert_eq!(
+            is_unsupported(Errno::ENOTSUP),
+            cfg!(target_os = "macos"),
+            "ENOTSUP is the macOS swap-unsupported errno"
+        );
+        for errno in [
+            Errno::ENOENT,
+            Errno::EPERM,
+            Errno::EACCES,
+            Errno::EXDEV,
+            Errno::EIO,
+            Errno::EBUSY,
+            Errno::EISDIR,
+        ] {
+            assert!(!is_unsupported(errno), "{errno}");
+        }
+    }
+}

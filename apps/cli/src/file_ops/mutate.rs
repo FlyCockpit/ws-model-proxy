@@ -324,6 +324,39 @@ fn exists_error() -> FileError {
     FileError::new(ErrorCode::Exists, "the destination already exists")
 }
 
+/// An overwrite has no non-atomic fallback: a filesystem without exchange refuses
+/// it as unsupported and every other errno is its own error.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn overwrite_exchange_error(errno: Errno) -> FileError {
+    if is_unsupported(errno) {
+        FileError::new(
+            ErrorCode::Unsupported,
+            "this filesystem cannot replace a destination atomically",
+        )
+    } else {
+        FileError::errno(errno)
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod exchange_error_tests {
+    use super::*;
+
+    #[test]
+    fn overwrite_refuses_an_exchange_less_filesystem_as_unsupported_only() {
+        for errno in [Errno::EINVAL, Errno::ENOSYS] {
+            assert_eq!(overwrite_exchange_error(errno).code, ErrorCode::Unsupported);
+        }
+        for errno in [Errno::EPERM, Errno::EXDEV, Errno::EACCES, Errno::EIO] {
+            assert_ne!(
+                overwrite_exchange_error(errno).code,
+                ErrorCode::Unsupported,
+                "{errno}"
+            );
+        }
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn exchange_over(from: &Resolved, to: &Resolved, src: &Stat, dst: &Stat) -> FileResult<()> {
     let swap = || {
@@ -336,13 +369,7 @@ fn exchange_over(from: &Resolved, to: &Resolved, src: &Stat, dst: &Stat) -> File
     };
     match swap() {
         Ok(()) => {}
-        Err(errno) if is_unsupported(errno) => {
-            return Err(FileError::new(
-                ErrorCode::Unsupported,
-                "this filesystem cannot replace a destination atomically",
-            ));
-        }
-        Err(errno) => return Err(FileError::errno(errno)),
+        Err(errno) => return Err(overwrite_exchange_error(errno)),
     }
     let moved_ok = matches!(to.lstat(), Ok(Some(ref now)) if now.same_object(src));
     let old_ok = matches!(from.lstat(), Ok(Some(ref now)) if now.same_object(dst));
