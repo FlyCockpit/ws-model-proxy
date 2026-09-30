@@ -8,9 +8,12 @@
  */
 
 /**
- * Per-stream view the model sees. `totalBytes` is the full stream count.
+ * Per-stream view the model sees. `totalBytes` counts CLI-masked bytes before
+ * head/tail retention (not the original command's raw byte count).
  * `text` is lossy UTF-8 of the retained head and tail, with credential
- * substrings removed. Other secrets are not redacted.
+ * substrings removed. The CLI masks private-key blocks, secret-name token lines
+ * and their continuation, secret flag values and HF token file output first.
+ * Other secrets are not masked; the terminal viewer still sees raw output.
  */
 export type CliStreamText = {
   text: string;
@@ -24,6 +27,10 @@ export type BoundedByteView = {
   tail: Uint8Array;
   totalBytes: number;
 };
+
+/** Shared command-tool notice; CLI masking is accidental-disclosure protection. */
+export const CLI_COMMAND_OUTPUT_NOTICE =
+  "Before command output leaves the node, the CLI masks private key blocks (through the matching END label), whole lines containing secret-name tokens and the following non-blank line plus indentation/quote/backslash continuation, secret flag value tails (--api-key/--hf-token-style flags), and output from commands naming .cache/huggingface/token or .huggingface/token. Token lines use ⟦redacted line⟧; KEY=⟦redacted:N⟧ is only the file tools' dotenv view. A line over 64 KiB is masked whole, along with the next non-blank line and subsequent lines indented deeper than column 0; normal scanning then resumes. Accepted residual: more than 1 MiB of live masking-state input makes the remaining stream fail closed through EOF. The person's terminal viewer is unchanged; shared/review output and byte totals are masked. Other secrets (vendor tokens such as ghp_ or sk-, JWTs, cloud credentials) are NOT masked. The server also removes substrings matching wsmp_model_, wsmp_cli_, wsmp_device_, or wsmp_mcp_ followed by credential characters. On an unsupervised node masking is not a security boundary: a command can print a secret in an unrecognized form.";
 
 /** First bytes retained per stream (the runtime cap). */
 export const CLI_STREAM_HEAD_MAX_BYTES = 8192;

@@ -25,6 +25,7 @@ pub mod logging;
 pub mod media;
 pub mod metric_sources;
 pub mod output;
+pub mod output_mask;
 pub mod paths;
 pub mod probe;
 pub mod protocol;

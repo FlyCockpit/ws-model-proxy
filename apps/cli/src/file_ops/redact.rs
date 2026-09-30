@@ -2037,6 +2037,7 @@ mod tests {
     /// masks, for every window start, whenever the file has no masked run longer
     /// than the lookback (`long_construct`, the case edits refuse to create).
     /// Random documents from a small hostile line pool, tiny lookback.
+    #[cfg(unix)] // The windowed reader is Unix-only; command masking also builds elsewhere.
     #[test]
     fn a_windowed_read_masks_at_least_what_the_full_view_masks() {
         use crate::file_ops::read::lookback_start_with;

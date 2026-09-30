@@ -275,6 +275,31 @@ beforeEach(() => {
 });
 
 describe("MCP tool manifest — exact catalog", () => {
+  it("all command catalog entries disclose CLI masking and its limits", () => {
+    for (const name of [
+      "forwarder_cli_command_run",
+      "forwarder_cli_supervised_command_start",
+      "forwarder_cli_command_result",
+    ]) {
+      const description = MCP_TOOL_MANIFEST.find((entry) => entry.name === name)?.descriptionNote;
+      for (const phrase of [
+        "secret-name tokens",
+        "following non-blank line",
+        "private key blocks",
+        "--api-key/--hf-token",
+        ".huggingface/token",
+        "NOT masked",
+        "not a security boundary",
+        "A line over 64 KiB is masked whole, along with the next non-blank line",
+        "subsequent lines indented deeper than column 0; normal scanning then resumes",
+        "more than 1 MiB of live masking-state input makes the remaining stream fail closed through EOF",
+      ]) {
+        expect(description).toContain(phrase);
+      }
+      expect(description).not.toContain("A line over 64 KiB or more than 1 MiB");
+    }
+  });
+
   it("contains exactly 29 read + 55 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);

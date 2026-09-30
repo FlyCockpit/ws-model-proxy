@@ -1404,7 +1404,7 @@ describe("CLI command tools", () => {
     }
   });
 
-  it("tells the model that other secrets in command output are NOT redacted", async () => {
+  it("discloses the masked output classes and the unsupervised limitation", async () => {
     const authInfo = buildAuthInfo(["mcp:write"]);
     bindRequest(authInfo, "req-list", PAT_WITH_CLI);
     const handler = createMcpTransport();
@@ -1416,12 +1416,32 @@ describe("CLI command tools", () => {
     const resultTool = body.result?.tools?.find(
       (tool) => tool.name === "forwarder_cli_command_result",
     );
-    expect(run?.description).toContain("NOT redacted");
+    const supervised = body.result?.tools?.find(
+      (tool) => tool.name === "forwarder_cli_supervised_command_start",
+    );
+    for (const tool of [run, resultTool, supervised]) {
+      for (const phrase of [
+        "private key blocks",
+        "secret-name tokens",
+        "following non-blank line",
+        "continuation",
+        "--api-key/--hf-token",
+        ".cache/huggingface/token",
+        "dotenv view",
+        "NOT masked",
+        "not a security boundary",
+        "A line over 64 KiB is masked whole, along with the next non-blank line",
+        "subsequent lines indented deeper than column 0; normal scanning then resumes",
+        "more than 1 MiB of live masking-state input makes the remaining stream fail closed through EOF",
+      ]) {
+        expect(tool?.description).toContain(phrase);
+      }
+      expect(tool?.description).not.toContain("A line over 64 KiB or more than 1 MiB");
+    }
     expect(
       (run as { annotations?: { destructiveHint?: boolean } } | undefined)?.annotations
         ?.destructiveHint,
     ).toBe(true);
-    expect(resultTool?.description).toContain("NOT redacted");
     expect(run?.description).toContain('confirm: "RUN"');
     expect(resultTool?.description).not.toContain('confirm: "RUN"');
   });
