@@ -237,11 +237,11 @@ fn secret_files_return_a_masked_view() {
         "{}",
         r.text
     );
-    // plain file: only secret-named assignments
+    // Plain files mask token lines and the next line; a blank ends that scope.
     fx.put(
         "run.sh",
         format!(
-            "export X_API_KEY=abcdef\nmax_tokens=4096\n{}\n",
+            "export X_API_KEY=abcdef\n\nmax_tokens=4096\n{}\n",
             aws_style_id()
         ),
     );
@@ -252,11 +252,10 @@ fn secret_files_return_a_masked_view() {
     assert!(!r.text.contains("abcdef"));
 }
 
-/// AC 32's named negative: a `~/.aws/credentials`-shaped file is not a secret
-/// class (the classifier has no cloud-credential rule) and its lower-case keys
-/// are outside the assignment name set, so the content is returned as it is.
+/// The path has no cloud-specific class; its case-insensitive `_key` word
+/// nevertheless goes through the same bounded token rule as every plain file.
 #[test]
-fn an_aws_credentials_file_is_not_masked_by_class_or_name() {
+fn a_plain_credentials_file_uses_case_insensitive_token_masking() {
     let fx = Fx::new();
     fx.put(
         ".aws/credentials",
@@ -264,20 +263,17 @@ fn an_aws_credentials_file_is_not_masked_by_class_or_name() {
     );
     let r = fx.read(".aws/credentials");
     assert!(!r.secret_file);
-    assert_eq!(r.redactions, 0);
-    assert!(
-        r.text
-            .contains("aws_secret_access_key = examplesecretvalue"),
-        "{}",
-        r.text
-    );
-    // and there is nothing for an edit to probe: the view is the raw text
+    assert_eq!(r.redactions, 1);
+    assert!(r.text.contains("[default]") && r.text.contains("EXAMPLEKEYIDVALUE"));
+    assert!(!r.text.contains("examplesecretvalue"), "{}", r.text);
+    assert!(r.text.contains("⟦redacted line: aws_secret_access_key⟧"));
+    // Reads and the edit view agree on the protected source range.
     let view = super::super::redact::mask(
         super::super::redact::FileClass::Plain,
         &fx.get(".aws/credentials"),
     );
-    assert_eq!(view.redactions(), 0);
-    assert_eq!(view.text, fx.get(".aws/credentials"));
+    assert_eq!(view.redactions(), 1);
+    assert!(!view.text.contains("examplesecretvalue"));
 }
 
 #[test]

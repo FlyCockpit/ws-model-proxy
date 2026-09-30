@@ -232,10 +232,23 @@ fn a_multi_line_quoted_value_in_a_plain_file_is_masked_in_every_window() {
 }
 
 #[test]
-fn colon_assignments_without_a_space_are_masked_by_read_search_and_edit() {
+fn tokens_without_assignment_syntax_are_masked_by_read_search_and_edit() {
     let fx = Fx::new();
-    fx.put("cfg.txt", "HF_TOKEN:hunter2\nother\n");
-    assert!(!fx.read("cfg.txt").text.contains("hunter2"));
+    fx.put(
+        "cfg.txt",
+        "prefix apiKey hunter2\nfollowing-value\nvisible\n",
+    );
+    let read = fx.read("cfg.txt").text;
+    assert!(!read.contains("hunter2") && !read.contains("following-value"));
+    assert!(read.contains("⟦redacted line: apiKey⟧") && read.contains("visible"));
+    let searched = fx
+        .ops
+        .search(
+            &args(json!({ "root": fx.p(""), "pattern": "following-value" })),
+            &fx.cancel,
+        )
+        .unwrap();
+    assert!(searched.matches.is_empty());
     let probe = fx.ops.edit(
         &args(
             json!({ "path": fx.p("cfg.txt"), "edits": [{ "oldText": "hunter2", "newText": "x" }] }),
@@ -591,11 +604,11 @@ fn edits_cannot_manufacture_a_masked_run_longer_than_the_read_lookback() {
     let fx = Fx::new();
     fx.put("cfg.sh", "echo start\nPASSWORD=hunter2-secret\necho end\n");
     let filler = "filler filler filler filler\n".repeat(700_000 / 28);
-    // step 1: PASSWORD=" opens a run of ~700 KB: allowed
+    // Step 1 adds an opener before the protected line: a run of ~700 KB is allowed.
     fx.ops
         .edit(
             &args(json!({ "path": fx.p("cfg.sh"), "edits": [{
-                "oldText": "PASSWORD=", "newText": format!("PASSWORD=\"\n{filler}") }] })),
+                "oldText": "echo start\n", "newText": format!("echo start\nPASSWORD=\"\n{filler}") }] })),
             &fx.cancel,
         )
         .expect("a run inside the lookback is fine");
@@ -855,7 +868,7 @@ fn a_secret_flag_with_a_line_continuation_only_hides_its_value() {
     let fx = Fx::new();
     fx.put(
         "start.sh",
-        "#!/bin/sh\nexec llama-server \\\n  --api-key \"$LLAMA_API_KEY\" \\\n  --ctx-size 32768 \\\n  --port 8080\n",
+        "#!/bin/sh\nexec llama-server \\\n  --api-key \"$KEY\" \\\n  --ctx-size 32768 \\\n  --port 8080\n",
     );
     let r = fx.read("start.sh");
     assert!(
@@ -1052,62 +1065,52 @@ fn a_private_key_in_an_ordinary_file_is_masked_for_read_search_and_diff() {
     assert!(fx.read("pub.txt").text.contains("PUBLICBODY"));
 }
 
-// ---- name/value pairs: padding, order, env lists, short names ---------------------
+// ---- bounded token lines protect source bytes through every read window -------
 
 #[test]
-fn a_name_value_pair_is_masked_whatever_the_padding_order_or_name_length() {
+fn token_lines_and_their_following_lines_are_protected_in_every_window() {
     let fx = Fx::new();
-    // reversed order inside an env list, and inline both ways
-    fx.put(
-        "deploy.yaml",
-        "containers:\n  env:\n    - value: pairsecretone\n      name: DB_PASSWORD\n    - name: PUBLIC\n      value: shown\n",
-    );
-    let r = fx.read("deploy.yaml").text;
-    assert!(!r.contains("pairsecretone"), "{r}");
-    fx.put(
-        "task.json",
-        "{\"env\": [{\"value\": \"reversedsecret\", \"name\": \"API_KEY\"}, {\"name\": \"DB_PASSWORD\", \"value\": \"forwardsecret\"}]}\n",
-    );
-    let r = fx.read("task.json").text;
-    assert!(
-        !r.contains("reversedsecret") && !r.contains("forwardsecret"),
-        "{r}"
-    );
-    // the shortest names in every shape
-    fx.put(
-        "short.txt",
-        "ENV _TOKEN shortenvsecret\nARG _KEY shortargsecret\nsetenv _SECRET shortsetsecret\n- name: _TOKEN\n  value: shortpairsecret\n{\"name\": \"_KEY\", \"value\": \"shortinlinesecret\"}\n",
-    );
-    let r = fx.read("short.txt").text;
-    for leaked in [
-        "shortenvsecret",
-        "shortargsecret",
-        "shortsetsecret",
-        "shortpairsecret",
-        "shortinlinesecret",
+    for (name, token_line, value_line) in [
+        (
+            "deploy.yaml",
+            "  - name: api_key",
+            "    value: fixture-value",
+        ),
+        ("node.js", "const apiKey =", "  'fixture-value';"),
+        ("notes.txt", "credential hf-token", "fixture-value"),
     ] {
-        assert!(!r.contains(leaked), "{leaked} in {r}");
-    }
-    // the value stays masked when accepted edits pad between the name and the value:
-    // each edit is small, the total distance is longer than the lookback
-    fx.put(
-        "pad.yaml",
-        "- name: SECRET_KEY\n  x: 1\n  y: 2\n  value: padsecretvalue\n",
-    );
-    let padding = "p".repeat(700_000);
-    for (old, line) in [("y: 2", "y"), ("y: ", "y")] {
-        let etag = fx.etag("pad.yaml");
-        let _ = fx.ops.edit(
-            &args(
-                json!({ "path": fx.p("pad.yaml"), "expectedEtag": etag, "edits": [{
-                "oldText": old, "newText": format!("{line}: {padding}") }] }),
-            ),
-            &fx.cancel,
+        fx.put(
+            name,
+            format!("intro\n{token_line}\n{value_line}\nvisible\n"),
         );
+        for start in [1, 2, 3, -2] {
+            let read = fx.read_with(json!({ "path": fx.p(name), "startLine": start }));
+            assert!(
+                !read.text.contains("fixture-value"),
+                "{name}: {}",
+                read.text
+            );
+            assert!(read.text.contains("visible"), "{name}: {}", read.text);
+        }
+        for line in [2, 3] {
+            let result = fx.ops.edit(
+                &args(
+                    json!({ "path": fx.p(name), "expectedEtag": fx.etag(name), "edits": [{
+                    "startLine": line, "endLine": line, "newText": "replacement\n" }] }),
+                ),
+                &fx.cancel,
+            );
+            assert_eq!(code(result), ErrorCode::RedactedSpan, "{name}: {line}");
+        }
+        fx.ops
+            .edit(
+                &args(json!({ "path": fx.p(name), "edits": [{
+                "oldText": "visible", "newText": "edited" }] })),
+                &fx.cancel,
+            )
+            .unwrap();
+        assert!(fx.get(name).ends_with("edited\n"));
     }
-    // refused, or applied with the value still masked in every window
-    let last = fx.read_with(json!({ "path": fx.p("pad.yaml"), "startLine": -1 }));
-    assert!(!last.text.contains("padsecretvalue"), "{}", last.text);
 }
 
 #[test]
@@ -1364,17 +1367,6 @@ fn a_successor_inserted_before_the_commit_is_preserved_and_the_edit_conflicts() 
         .unwrap();
     assert_eq!(fx2.get("doc.txt"), "edited\n");
     assert!(fx2.leftovers("").is_empty());
-}
-
-#[test]
-fn a_compact_json_environment_array_masks_reversed_pairs_on_following_lines() {
-    let fx = Fx::new();
-    fx.put(
-        "task.json",
-        "{\"containerDefinitions\": [{\"environment\": [{\n      \"value\": \"compactsecret\",\n      \"name\": \"DB_PASSWORD\"\n    }]}]}\n",
-    );
-    let r = fx.read("task.json").text;
-    assert!(!r.contains("compactsecret"), "{r}");
 }
 
 // ---- the large-file tail contract: complete, marked, or refused -------------------

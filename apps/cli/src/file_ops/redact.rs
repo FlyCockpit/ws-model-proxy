@@ -1,50 +1,35 @@
-//! Secret masking for file content (plan sections 3.4 and 11, D5 as narrowed
-//! by the owner). The design is `design-r2.md`: masking is fail-closed.
+//! Bounded secret masking for accidental disclosure (`design-r3.md`).
 //!
-//! What is masked, and nothing else:
+//! In ordinary files, a case-insensitive secret-name word masks its WHOLE line
+//! as `⟦redacted line: NAME⟧`, and the following non-blank line as
+//! `⟦redacted line⟧`. Words are maximal `[A-Za-z0-9_-]+` runs that do not start
+//! with `-`: they end in `_TOKEN`, `_KEY`, `_SECRET`, `_PASSWORD`, `apikey`,
+//! `api-key`, `api_key`, `hf-token` or `hf_token`, or equal `PASSWORD`.
+//! The suffix must end the word; `MAX_TOKENS`, `TOKENS` and `KEYBOARD` stay
+//! visible. Words starting with `-` use the separate secret-flag rule, which
+//! masks the value tail of `--api-key VALUE` and its continuations.
 //!
-//! 1. Private keys: files named `id_*` (not `*.pub`) and the non-public files
-//!    under `.ssh` are masked whole, and a `-----BEGIN ... PRIVATE KEY-----`
-//!    block is masked by CONTENT in every file, through its END line (to the end
-//!    of the scanned region when there is none). Public keys and certificates
-//!    stay visible.
-//! 2. Environment variables. In dotenv-shaped files (`.env`, `*.env`, `.env.*`,
-//!    `.envrc`, `service.env`) only blank lines, comments and the `KEY` of a
-//!    simple `KEY=` / `export KEY=` line are shown; every other line is masked
-//!    whole. In any other file, from the first secret-named assignment
-//!    (`NAME=value`, `NAME: value`, `NAME:value`, `"NAME":"value"`,
-//!    `Environment=NAME=value`, compose `environment:` entries) whose upper-case
-//!    name **is** `PASSWORD` or ends in `_TOKEN`, `_KEY`, `_SECRET` or
-//!    `PASSWORD`, the whole rest of the physical line is masked. Lower-case and
-//!    mixed-case names (`hf_token=`, `Password=`) are not secret names: the
-//!    issue's name set is upper case, as the tests pin.
-//! 3. The Hugging Face token files (`token` and `stored_tokens` under
-//!    `~/.cache/huggingface` and `~/.huggingface`) and the values of `--api-key`, `--hf-token`,
-//!    `--token`, `--password`, `--secret`-style command-line flags (again to the
-//!    end of the line), including a value on the following line (`\`
-//!    continuation or a YAML/JSON list item).
+//! Dotenv files retain their own rule: only blanks, comments and the KEY of a
+//! simple `KEY=` / `export KEY=` line are shown; unknown lines are masked whole.
+//! Comments containing a secret-name word use the whole-line rule. Hugging Face
+//! token files and non-public `.ssh` files are masked by class. Private-key PEM
+//! blocks are masked by content in every file through the matching END label;
+//! an END closes only the innermost opener of its own label. Public keys and
+//! certificates stay visible. There is no vendor-prefix credential scanner.
 //!
-//! The scanner never decides where a value ENDS. A value that opens a multi-line
-//! form (a quote left open, a trailing `\`, a YAML `|`/`>` block scalar) keeps the
-//! following lines masked until a STRUCTURAL end: the first blank line, or for a
-//! block scalar the first line at or below the key line's indentation, or the end
-//! of the scanned region. It never ends at a closing quote. Masked values are
-//! counted in characters; the length itself is not returned.
+//! A token line can open a quote, trailing backslash or YAML-like block. These
+//! constructs end only at a structural boundary: a blank line, or a dedent for
+//! a YAML block, never at a closing quote. Openers are scanned even inside masked
+//! runs, and all open constructs contribute masks (restartable union semantics).
+//! Reads feed the bounded [`LOOKBACK_BYTES`] context plus its preceding line;
+//! constructs beyond that lookback are a documented residual. [`mask`]
+//! records every replacement as a span without changing line counts. Edits
+//! cannot touch spans or expose surviving masked bytes, and cannot create a
+//! construct longer than the lookback. Mask markers are refused on write-back.
 //!
-//! There is deliberately no vendor-prefix scanner and no cloud-credential list.
-//!
-//! Masking is applied before any windowing, so a cut never shows half a secret.
-//! A window is masked with the state of the [`LOOKBACK_BYTES`] before it. It never
-//! adds or removes a line: every replacement stays on its line (a masked block
-//! replaces each line), so line numbers in the masked view are line numbers in the
-//! real file. The masked view is the only text the edit engine matches against,
-//! which means an edit cannot probe a masked value, and an edit that would move a
-//! masked byte out of the masked view is refused.
-//!
-//! The class of a path is decided from the path only (Unicode-folded, no
-//! trailing dots or spaces, on every OS; no filesystem search). Secret-class files and directories are
-//! read-only through the tools: [`is_secret_scope`] is what `Policy::check_path`
-//! refuses for every mutation.
+//! Path classification is Unicode-folded, ignores trailing dots/spaces and
+//! never searches other files. Secret-class paths and directories are read-only
+//! through [`is_secret_scope`] and `Policy::check_path`.
 
 use std::ops::Range;
 use std::path::Path;
@@ -304,58 +289,6 @@ pub const LOOKBACK_BYTES: usize = 1024 * 1024;
 /// `--max-tokens`, `--tokenizer` and `--token-limit` stay visible.
 const SECRET_FLAG_SUFFIX: &str = "api[-_]?key|token|secret|password";
 
-/// A secret name: exactly `PASSWORD`, or an upper-case name (it may start with
-/// `_`) that ends in `_TOKEN`, `_KEY`, `_SECRET` or `PASSWORD`. Names without a
-/// prefix (`TOKEN=`, `KEY=`) stay visible.
-const SECRET_NAME: &str =
-    r"(?:[A-Z_][A-Z0-9_]*)?(?:_TOKEN|_KEY|_SECRET)|[A-Z_][A-Z0-9_]*PASSWORD|PASSWORD";
-
-/// Space-separated environment forms: Dockerfile `ENV NAME value`, `ARG`,
-/// csh `setenv NAME value`.
-static ENV_WORD: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        r"^[ \t]*(?i:env|arg|setenv)[ \t]+({SECRET_NAME})[ \t]+"
-    ))
-    .expect("env word regex")
-});
-/// Inline Kubernetes/ECS name/value pair: `{"name": "DB_PASSWORD", "value": "..."}`.
-static INLINE_PAIR: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        r#"["']?name["']?[ \t]*:[ \t]*["']?(?:{SECRET_NAME})["']?[ \t]*,[^{{}}]*?["']?value["']?[ \t]*:[ \t]*"#
-    ))
-    .expect("inline pair regex")
-});
-/// The reversed inline pair: `{"value": "...", "name": "DB_PASSWORD"}`; group 1 is
-/// everything up to the start of the value.
-static INLINE_PAIR_REV: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        r#"(["']?value["']?[ \t]*:[ \t]*).*[ \t]*,[ \t]*["']?name["']?[ \t]*:[ \t]*["']?(?:{SECRET_NAME})["']?"#
-    ))
-    .expect("reversed inline pair regex")
-});
-/// An environment list header (`env:`, `environment:`, `"env": [`): every `value:`
-/// line below it is masked, whatever order the item's fields come in.
-static ENV_LIST: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^[ \t]*-?[ \t]*["']?(?:env|environment|envs|variables)["']?[ \t]*:[ \t]*[\[{]?[ \t\r]*$"#)
-        .expect("env list regex")
-});
-/// A JSON environment array that opens on the same line as its first object
-/// (`"environment": [{`): the header may be anywhere in the line.
-static ENV_LIST_JSON: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"["'](?:env|environment|envs|variables)["'][ \t]*:[ \t]*\["#)
-        .expect("json env list regex")
-});
-/// `name: SECRET_NAME` alone on a line (Kubernetes `env:` items, JSON objects):
-/// its `value:` sibling follows.
-static NAME_LINE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(&format!(
-        r#"^[ \t]*-?[ \t]*["']?name["']?[ \t]*:[ \t]*["']?(?:{SECRET_NAME})["']?[ \t]*,?[ \t\r]*$"#
-    ))
-    .expect("name line regex")
-});
-static VALUE_KEY: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"^[ \t]*-?[ \t]*["']?value["']?[ \t]*:[ \t]*"#).expect("value key regex")
-});
 static FLAG: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
         r#"(?:^|[^A-Za-z0-9_-])-{{1,2}}[A-Za-z0-9_-]*?(?:{SECRET_FLAG_SUFFIX})(=|[ \t]+|\\[nrt]|["']?,[ \t]*)"#
@@ -377,17 +310,6 @@ static DOTENV_ASSIGN: LazyLock<Regex> = LazyLock::new(|| {
 static BLOCK_SCALAR: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?:![^\s]*[ \t]+)?[|>][+\-0-9]*[ \t]*(?:#.*)?$").expect("block scalar regex")
 });
-/// A cheap pre-filter: lines without any of these words cannot hold a secret name
-/// or flag (names are upper case, flags any case), so clean text costs one scan.
-fn has_trigger(text: &str) -> bool {
-    [
-        "TOKEN", "KEY", "SECRET", "PASSWORD", "token", "key", "secret", "password", "Token", "Key",
-        "Secret", "Password",
-    ]
-    .iter()
-    .any(|word| text.contains(word))
-}
-
 fn is_variable_reference(value: &str) -> bool {
     let inner = if let Some(rest) = value.strip_prefix("${") {
         match rest.strip_suffix('}') {
@@ -506,153 +428,62 @@ fn construct_for_tail(
 
 type LineMask = (Range<usize>, String);
 
-fn is_word_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-/// One secret candidate: where its masked tail starts and what it opens.
-type Candidate = (usize, Construct);
-
-/// The assignment separators, longest first.
-const SEPARATORS: [&str; 6] = ["::=", "?=", "+=", ":=", "=", ":"];
-
-/// The first secret-named assignment of `line`. Its value is the whole rest of
-/// the line (never "up to the next space or quote"). The name is exactly
-/// `PASSWORD`, or upper case (it may start with `_`) and ends in `_TOKEN`, `_KEY`,
-/// `_SECRET` or `PASSWORD`; it is followed by an optional (escaped) quote, an
-/// optional `]`, blanks and a separator (`=`, `:`, `?=`, `+=`, `:=`, `::=`).
-/// Parsed by hand: this runs on every line that mentions a trigger word, and a
-/// regex with captures is an order of magnitude slower in a debug build.
-fn first_assignment(line: &str) -> Option<Candidate> {
+/// Maximal ASCII words are scanned once; suffix checks inspect only their ends.
+/// A dash-prefixed word belongs exclusively to the flag recognizer.
+fn first_secret_name(line: &str) -> Option<Range<usize>> {
     let bytes = line.as_bytes();
-    let is_name = |b: u8| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_';
-    // One left-to-right pass: `run_start` is the start of the run of name bytes
-    // that contains the current position (a walk back per suffix was quadratic on
-    // `_KEY_KEY_KEY...`).
-    let mut run_start = 0_usize;
-    for (i, byte) in bytes.iter().enumerate() {
-        if !is_name(*byte) {
-            run_start = i + 1;
+    let mut at = 0;
+    while at < bytes.len() {
+        if !(bytes[at].is_ascii_alphanumeric() || matches!(bytes[at], b'_' | b'-')) {
+            at += 1;
             continue;
         }
-        let rest = &line[i..];
-        let Some(suffix) = ["_TOKEN", "_KEY", "_SECRET", "PASSWORD"]
-            .into_iter()
-            .find(|suffix| rest.starts_with(suffix))
-        else {
-            continue;
-        };
-        let end = i + suffix.len();
-        let start = run_start;
-        // `_TOKEN`, `_KEY`, `_SECRET` and `PASSWORD` are names by themselves;
-        // `TOKEN=` and `KEY=` (no underscore) stay visible
-        let first_ok = bytes
-            .get(start)
-            .is_some_and(|b| b.is_ascii_uppercase() || *b == b'_');
-        if !first_ok {
-            continue;
-        }
-        // a name that continues past the suffix (`X_KEYS`) is not this suffix
-        if bytes.get(end).is_some_and(|b| is_name(*b)) {
-            continue;
-        }
-        // the word-start rule: not glued to a preceding lower-case word (`fooBAR_KEY`)
-        if start > 0 && is_word_byte(bytes[start - 1]) {
-            continue;
-        }
-        // optional escaped quote, optional `]`, blanks, then the separator
-        let mut at = end;
-        if bytes.get(at) == Some(&b'\\') && matches!(bytes.get(at + 1), Some(b'"' | b'\'')) {
-            at += 2;
-        } else if matches!(bytes.get(at), Some(b'"' | b'\'')) {
+        let start = at;
+        while at < bytes.len()
+            && (bytes[at].is_ascii_alphanumeric() || matches!(bytes[at], b'_' | b'-'))
+        {
             at += 1;
         }
-        while matches!(bytes.get(at), Some(b' ' | b'\t')) {
-            at += 1;
+        let word = &bytes[start..at];
+        if word[0] != b'-'
+            && (word.eq_ignore_ascii_case(b"PASSWORD")
+                || [
+                    &b"_TOKEN"[..],
+                    b"_KEY",
+                    b"_SECRET",
+                    b"_PASSWORD",
+                    b"apikey",
+                    b"api-key",
+                    b"api_key",
+                    b"hf-token",
+                    b"hf_token",
+                ]
+                .iter()
+                .any(|suffix| {
+                    word.len() >= suffix.len()
+                        && word[word.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+                }))
+        {
+            return Some(start..at);
         }
-        if bytes.get(at) == Some(&b']') {
-            at += 1;
-        }
-        while matches!(bytes.get(at), Some(b' ' | b'\t')) {
-            at += 1;
-        }
-        let Some(sep) = SEPARATORS.iter().find(|sep| line[at..].starts_with(**sep)) else {
-            continue;
-        };
-        let mut value_at = at + sep.len();
-        while matches!(bytes.get(value_at), Some(b' ' | b'\t')) {
-            value_at += 1;
-        }
-        let after = &line[value_at..];
-        // `NAME == x` is a comparison
-        if sep.ends_with('=') && line[at + sep.len()..].starts_with('=') {
-            continue;
-        }
-        // `NAME::path` is not an assignment (`NAME:value` and `NAME: value` are)
-        if *sep == ":" && line[at + 1..].starts_with(':') {
-            continue;
-        }
-        let tail = after;
-        let trimmed = tail.trim_end();
-        if trimmed == "\\" {
-            // a lone backslash hides nothing, but the value is on the next line
-            return Some((line.len(), Construct::UntilBlank));
-        }
-        let colon = *sep == ":";
-        if colon && trimmed.is_empty() {
-            // `KEY:` with the value on the following, deeper lines (YAML)
-            return Some((
-                line.len(),
-                Construct::Block {
-                    line_indent: indent_of(line),
-                },
-            ));
-        }
-        if value_is_public(without_continuation(trimmed)) {
-            continue;
-        }
-        let construct = construct_for_tail(tail, colon, indent_of(line), quote_left_open(line));
-        return Some((value_at, construct));
     }
     None
 }
 
-/// A JSON key can spell an ASCII letter as `\u00XX` (`"API\u005fKEY"`). The
-/// line is decoded (ASCII escapes only) into a shadow string with a byte map, the
-/// assignment recognizer runs on it, and the candidate maps back to the original
-/// offsets, so the mask covers the source bytes.
-fn first_assignment_escaped(line: &str) -> Option<Candidate> {
-    if !line.contains("\\u00") {
-        return None;
-    }
-    let bytes = line.as_bytes();
-    let mut decoded = String::with_capacity(line.len());
-    let mut map: Vec<usize> = Vec::with_capacity(line.len() + 1);
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\\'
-            && bytes.get(i + 1) == Some(&b'u')
-            && bytes.get(i + 2..i + 4) == Some(b"00")
-            && let Some(hex) = line.get(i + 4..i + 6)
-            && let Ok(value) = u8::from_str_radix(hex, 16)
-            && value.is_ascii()
-        {
-            decoded.push(value as char);
-            map.push(i);
-            i += 6;
-            continue;
-        }
-        let ch = line[i..].chars().next()?;
-        decoded.push(ch);
-        for _ in 0..ch.len_utf8() {
-            map.push(i);
-        }
-        i += ch.len_utf8();
-    }
-    map.push(bytes.len());
-    let (start, construct) = first_assignment(&decoded)?;
-    Some((*map.get(start)?, construct))
+/// The constructs after a token, without parsing assignments or file formats.
+/// A quoted YAML key may end just before its colon. Quote parity is always
+/// computed over the entire line, including text before the token.
+fn construct_after_name(line: &str, end: usize) -> Construct {
+    let tail = line[end..].trim_start_matches([' ', '\t', '\'', '"']);
+    let (tail, colon) = match tail.strip_prefix(':') {
+        Some(tail) => (tail, true),
+        None => (tail, false),
+    };
+    construct_for_tail(tail, colon, indent_of(line), quote_left_open(line))
 }
+
+/// One secret flag candidate: where its masked tail starts and what it opens.
+type Candidate = (usize, Construct);
 
 /// The first secret flag of `line` (`--token abc`, `--api-key=abc`).
 fn first_flag(line: &str) -> Option<Candidate> {
@@ -686,73 +517,6 @@ fn first_flag(line: &str) -> Option<Candidate> {
         ));
     }
     None
-}
-
-/// `ENV NAME value` / `setenv NAME value`.
-fn first_env_word(line: &str) -> Option<Candidate> {
-    let head = line.trim_start().as_bytes();
-    let directive = [&b"env"[..], b"arg", b"setenv"]
-        .iter()
-        .any(|word| head.len() >= word.len() && head[..word.len()].eq_ignore_ascii_case(word));
-    if !directive {
-        return None;
-    }
-    let caps = ENV_WORD.captures(line)?;
-    let start = caps.get(0)?.end();
-    let tail = &line[start..];
-    let trimmed = tail.trim_end();
-    if trimmed == "\\" {
-        // a lone backslash hides nothing, but the value is on the next line
-        return Some((line.len(), Construct::UntilBlank));
-    }
-    if trimmed.is_empty() || value_is_public(without_continuation(trimmed)) {
-        return None;
-    }
-    Some((
-        start,
-        construct_for_tail(tail, false, indent_of(line), quote_left_open(line)),
-    ))
-}
-
-/// Inline `{"name": "DB_PASSWORD", "value": "..."}` pair.
-fn first_inline_pair(line: &str) -> Option<Candidate> {
-    if !(line.contains("name") && line.contains("value")) {
-        return None;
-    }
-    let forward = INLINE_PAIR.find(line).map(|m| m.end());
-    let reversed = INLINE_PAIR_REV
-        .captures(line)
-        .and_then(|caps| caps.get(1))
-        .map(|group| group.end());
-    // the earliest value of either order (the mask runs to the end of the line)
-    let start = match (forward, reversed) {
-        (Some(a), Some(b)) => a.min(b),
-        (a, b) => a.or(b)?,
-    };
-    let tail = &line[start..];
-    let trimmed = tail.trim_end();
-    if trimmed.is_empty() || value_is_public(without_continuation(trimmed)) {
-        return None;
-    }
-    Some((
-        start,
-        construct_for_tail(tail, false, indent_of(line), quote_left_open(line)),
-    ))
-}
-
-/// The earliest secret candidate of a line (assignment, flag, `ENV` word form or
-/// inline name/value pair).
-fn first_secret(line: &str) -> Option<Candidate> {
-    [
-        first_assignment(line),
-        first_assignment_escaped(line),
-        first_flag(line),
-        first_env_word(line),
-        first_inline_pair(line),
-    ]
-    .into_iter()
-    .flatten()
-    .min_by_key(|candidate| candidate.0)
 }
 
 /// The mask for the tail of `line` starting at `start` (none when empty), to the
@@ -879,10 +643,8 @@ struct OpenBlock {
 /// the lookback from its (latest) opener is flagged ([`Self::long_run`]) and edits
 /// refuse to create one.
 ///
-/// State: a `PRIVATE KEY` block flag, "the previous line ended with a secret
-/// flag", a few lines of Kubernetes name/value pairing, an until-blank run and
-/// the open YAML blocks. Command-output masking (a later phase) reuses this as a
-/// streaming scanner.
+/// State: per-label PEM opener lists, previous-line secret token/flag flags,
+/// an until-blank run and open YAML blocks. Command output reuses this scanner.
 #[derive(Debug, Clone)]
 pub struct LineMasker {
     class: FileClass,
@@ -895,15 +657,8 @@ pub struct LineMasker {
     /// Offset of the latest opener of the run that masks lines until a blank line.
     until_blank: Option<usize>,
     blocks: Vec<OpenBlock>,
-    /// Open `env:` / `environment:` lists: their `value:` lines are masked.
-    env_blocks: Vec<OpenBlock>,
-    /// Lines left in which a `value:` line belongs to a `name: SECRET_NAME` line,
-    /// and the offset of that name line.
-    pair_lines: u8,
-    pair_opener: usize,
-    /// Offset of the earlier line whose content decided that THIS line is masked
-    /// through a prerequisite (a name line, an env list header).
-    dep: Option<usize>,
+    /// The previous line contained a secret-name token (one line of scope).
+    pending_token_line: bool,
     /// Offset of the next line when the caller does not supply one.
     next_at: usize,
     long_run: bool,
@@ -922,10 +677,7 @@ impl LineMasker {
             pending_flag_value: false,
             until_blank: None,
             blocks: Vec::new(),
-            env_blocks: Vec::new(),
-            pair_lines: 0,
-            pair_opener: 0,
-            dep: None,
+            pending_token_line: false,
             next_at: 0,
             long_run: false,
         }
@@ -976,24 +728,18 @@ impl LineMasker {
         // 1. which open constructs mask this line (the latest opener decides how far
         //    back a reader would have to look)
         let mut masked_by: Option<usize> = None;
-        let mut env_open: Option<usize> = None;
         if blank {
             // a blank line ends the until-blank run; blocks pass through it
             self.until_blank = None;
         } else {
             let indent = indent_of(line);
             self.blocks.retain(|block| block.indent < indent);
-            // an item `- ...` at the header's own indentation still belongs to the list
-            let item = line.trim_start().starts_with('-');
-            self.env_blocks
-                .retain(|block| block.indent < indent || (item && block.indent == indent));
             masked_by = self
                 .blocks
                 .iter()
                 .map(|block| block.opener)
                 .chain(self.until_blank)
                 .max();
-            env_open = self.env_blocks.iter().map(|block| block.opener).max();
         }
         // private-key blocks (any file): from a BEGIN line through the END line of the
         // same label. The markers of a line apply in byte order (`END CERT-----BEGIN
@@ -1020,37 +766,36 @@ impl LineMasker {
         let pem_opener = pem_open_at_start.or(pem_touched.then_some(at));
         masked_by = masked_by.max(pem_opener);
         // 2. the line's own rules and openers, always (union semantics)
-        self.dep = None;
-        let (masks, opened) = self.scan_body(line, at, env_open);
-        if let Some(opener) = masked_by.max(self.dep)
+        let (masks, opened) = self.scan_body(line);
+        if let Some(opener) = masked_by
             && at.saturating_sub(opener) > self.lookback
         {
             self.long_run = true;
         }
         // 3. register what this line opened or closed
-        // a construct opened by a line whose own masking rests on a prerequisite line
-        // (a name line, an env list header) is charged to that prerequisite: a reader
-        // that cannot see it cannot mask the construct either
-        let opener_at = self.dep.map_or(at, |dep| dep.min(at));
         match opened {
             Construct::None => {}
-            Construct::UntilBlank => self.until_blank = Some(opener_at),
+            Construct::UntilBlank => self.until_blank = Some(at),
             Construct::Block { line_indent } => {
                 self.blocks.retain(|block| block.indent != line_indent);
                 self.blocks.push(OpenBlock {
                     indent: line_indent,
-                    opener: opener_at,
+                    opener: at,
                 });
             }
         }
-        if (line.contains("env") || line.contains("variables"))
-            && (ENV_LIST.is_match(line) || ENV_LIST_JSON.is_match(line))
-        {
-            let indent = indent_of(line);
-            self.env_blocks.retain(|block| block.indent != indent);
-            self.env_blocks.push(OpenBlock { indent, opener: at });
+        // PEM content stays opaque even when its body happens to contain a name.
+        if pem_touched {
+            return vec![(0..line.len(), token_bare())];
         }
         if masked_by.is_some() {
+            if masks.len() == 1
+                && masks
+                    .first()
+                    .is_some_and(|(range, _)| range.start == 0 && range.end == line.len())
+            {
+                return masks;
+            }
             return vec![(0..line.len(), token_bare())];
         }
         if masks.is_empty() {
@@ -1061,22 +806,19 @@ impl LineMasker {
     }
 
     /// The class and generic rules over `line` (ranges relative to `line`).
-    fn scan_body(
-        &mut self,
-        line: &str,
-        at: usize,
-        env_open: Option<usize>,
-    ) -> (Vec<LineMask>, Construct) {
+    fn scan_body(&mut self, line: &str) -> (Vec<LineMask>, Construct) {
         let mut masks: Vec<LineMask> = Vec::new();
         let mut construct = Construct::None;
         let mut generic = true;
         match self.class {
             FileClass::SshPrivateKey => {
+                generic = false;
                 if !line.trim().is_empty() {
                     masks.push((0..line.len(), token_bare()));
                 }
             }
             FileClass::HfToken => {
+                generic = false;
                 if !line.trim().is_empty() {
                     masks.push((0..line.len(), token(line.chars().count())));
                 }
@@ -1114,40 +856,25 @@ impl LineMasker {
                 masks.extend(tail_mask(line, range.start));
                 construct = opened;
             }
-            // Kubernetes/ECS style: `name: SECRET_NAME` then `value: ...`
-            let mut next_pair = self.pair_lines.saturating_sub(1);
-            let value_key = (self.pair_lines > 0 || env_open.is_some())
-                .then(|| VALUE_KEY.find(line))
-                .flatten();
-            if let Some(m) = value_key {
-                masks.extend(tail_mask(line, m.end()));
-                construct = construct_for_tail(
-                    &line[m.end()..],
-                    true,
-                    indent_of(line),
-                    quote_left_open(line),
-                );
-                // the prerequisite lines (a name line, an env list header) can be
-                // far above: a reader must be able to see them
-                if self.pair_lines > 0 {
-                    self.dep = Some(self.pair_opener);
+            if let Some(name) = first_secret_name(line) {
+                construct = construct_after_name(line, name.end);
+                masks = vec![(
+                    0..line.len(),
+                    format!("{MASK_OPEN} line: {}{MASK_CLOSE}", &line[name]),
+                )];
+                self.pending_token_line = true;
+            } else {
+                if let Some((start, opened)) = first_flag(line) {
+                    masks.extend(tail_mask(line, start));
+                    construct = opened;
                 }
-                self.dep = self.dep.max(env_open);
-                next_pair = 0;
-            } else if self.pair_lines > 0 && line.trim().is_empty() {
-                next_pair = 0;
+                if self.pending_token_line && !line.trim().is_empty() {
+                    masks = vec![(0..line.len(), format!("{MASK_OPEN} line{MASK_CLOSE}"))];
+                }
+                self.pending_token_line = false;
             }
-            if line.contains("name") && NAME_LINE.is_match(line) {
-                next_pair = 3;
-                self.pair_opener = at;
-            }
-            self.pair_lines = next_pair;
-            if (has_trigger(line) || line.contains("\\u00"))
-                && let Some((start, opened)) = first_secret(line)
-            {
-                masks.extend(tail_mask(line, start));
-                construct = opened;
-            }
+        } else {
+            self.pending_token_line = false;
         }
         self.pending_flag_value = line.contains('-') && FLAG_AT_END.is_match(line);
         (masks, construct)
@@ -1185,9 +912,6 @@ pub fn mask(class: FileClass, text: &str) -> MaskedView {
 
 /// [`mask`] with an explicit lookback (tests use a tiny one).
 pub(crate) fn mask_with_lookback(class: FileClass, text: &str, lookback: usize) -> MaskedView {
-    if class == FileClass::Plain && !has_trigger(text) {
-        return MaskedView::from_parts(text.to_string(), Vec::new(), false);
-    }
     let mut masker = LineMasker::with_lookback(class, lookback);
     let mut out = String::with_capacity(text.len());
     let mut spans = Vec::new();
@@ -1222,333 +946,266 @@ mod tests {
         mask(class, text).text
     }
 
-    /// Every row: (class, input, exact masked output). Adversarial rows cover
-    /// quoting, whitespace, CRLF, multiple assignments per line, references,
-    /// visible near-matches, and continuation lines (flag and quoted value).
+    /// Real configuration samples go through one format-agnostic token rule.
     #[test]
-    fn masking_table() {
-        use FileClass::{Dotenv, HfToken, Plain};
-        let aws = aws_style_id();
-        let rows: &[(FileClass, &str, &str)] = &[
-            // dotenv shape: every assignment masked, names and comments visible
+    fn real_world_samples_mask_values_without_format_grammars() {
+        // Values are ordinary fixture text, not vendor credential patterns.
+        let rows = [
             (
-                Dotenv,
-                "HF_TOKEN=abc123\n",
-                "HF_TOKEN=\u{27E6}redacted:6\u{27E7}\n",
-            ),
-            (Dotenv, "PORT=8080\n", "PORT=\u{27E6}redacted:4\u{27E7}\n"),
-            (Dotenv, "# comment\n\n", "# comment\n\n"),
-            (
-                Dotenv,
-                "export A = \"x y z\"\n",
-                "export A = \u{27E6}redacted:7\u{27E7}\n",
-            ),
-            (Dotenv, "A='multi word value'  \n", "A=⟦redacted:20⟧\n"),
-            (
-                Dotenv,
-                "A=\r\nB=x\r\n",
-                "A=\r\nB=\u{27E6}redacted:1\u{27E7}\r\n",
-            ),
-            (Dotenv, "A=b=c=d\n", "A=\u{27E6}redacted:5\u{27E7}\n"),
-            (Dotenv, "A=$abc\n", "A=\u{27E6}redacted:4\u{27E7}\n"),
-            (
-                Dotenv,
-                "  KEY.NAME-1=v\n",
-                "  KEY.NAME-1=\u{27E6}redacted:1\u{27E7}\n",
+                "dotenv",
+                FileClass::Dotenv,
+                "# service\nAPI_KEY=value-one\nPORT=8080\n",
+                "value-one",
             ),
             (
-                Dotenv,
-                "# OLD_API_KEY=sk-live-xyz\n",
-                "# OLD_API_KEY=\u{27E6}redacted:11\u{27E7}\n",
-            ),
-            (Dotenv, "A=\u{e9}\u{e9}\n", "A=\u{27E6}redacted:2\u{27E7}\n"),
-            (
-                Dotenv,
-                "no_trailing_newline=x",
-                "no_trailing_newline=\u{27E6}redacted:1\u{27E7}",
-            ),
-            // generic env rule in any file
-            (
-                Plain,
-                "export HF_TOKEN=hf_abc\n",
-                "export HF_TOKEN=\u{27E6}redacted:6\u{27E7}\n",
+                "compose list",
+                FileClass::Plain,
+                "services:\n  app:\n    environment:\n      - api_key=value-one\n      - PORT=8080\n",
+                "value-one",
             ),
             (
-                Plain,
-                "DB_PASSWORD: s3cr3t\n",
-                "DB_PASSWORD: \u{27E6}redacted:6\u{27E7}\n",
+                "compose map",
+                FileClass::Plain,
+                "services:\n  app:\n    environment:\n      Db_Password: value-one\n      PORT: 8080\n",
+                "value-one",
             ),
             (
-                Plain,
-                "Environment=API_KEY=abc\n",
-                "Environment=API_KEY=\u{27E6}redacted:3\u{27E7}\n",
+                "Kubernetes",
+                FileClass::Plain,
+                "env:\n  - name: openai_api_key\n    value: value-one\n",
+                "value-one",
             ),
             (
-                Plain,
-                "Environment=\"API_KEY=abc\"\n",
-                "Environment=\"API_KEY=⟦redacted:4⟧\n",
+                "Kubernetes inline reversed",
+                FileClass::Plain,
+                "env:\n  - {value: value-one, name: API_KEY}\n",
+                "value-one",
             ),
             (
-                Plain,
-                "  - HF_TOKEN=abc\n",
-                "  - HF_TOKEN=\u{27E6}redacted:3\u{27E7}\n",
+                "Kubernetes reference",
+                FileClass::Plain,
+                "env:\n  - name: API_KEY\n    valueFrom: {secretKeyRef: {name: value-one, key: credential}}\n",
+                "value-one",
             ),
             (
-                Plain,
-                "  HF_TOKEN: \"quoted value\"\n",
-                "  HF_TOKEN: \u{27E6}redacted:14\u{27E7}\n",
+                "JSON",
+                FileClass::Plain,
+                "{\"apiKey\": \"value-one\", \"public\": true}\n",
+                "value-one",
             ),
             (
-                Plain,
-                "\"HF_TOKEN\": \"abc\",\n",
-                "\"HF_TOKEN\": ⟦redacted:6⟧\n",
+                "JSON separate value",
+                FileClass::Plain,
+                "{\"api-key\":\n  \"value-one\"}\n",
+                "value-one",
             ),
             (
-                Plain,
-                "A_SECRET='it\\'s'\n",
-                "A_SECRET=\u{27E6}redacted:7\u{27E7}\n",
-            ),
-            (Plain, "X_KEY=1 Y_SECRET=2\n", "X_KEY=⟦redacted:12⟧\n"),
-            (Plain, "FOO_TOKEN=\n", "FOO_TOKEN=\n"),
-            (Plain, "FOO_TOKEN=\"\"\n", "FOO_TOKEN=\"\"\n"),
-            (
-                Plain,
-                "FOO_TOKEN=${FOO_TOKEN}\n",
-                "FOO_TOKEN=${FOO_TOKEN}\n",
-            ),
-            (Plain, "FOO_TOKEN=$OTHER\n", "FOO_TOKEN=$OTHER\n"),
-            (
-                Plain,
-                "FOO_TOKEN=$abc\n",
-                "FOO_TOKEN=\u{27E6}redacted:4\u{27E7}\n",
-            ),
-            // bare `PASSWORD` and `PASSWORD`-suffixed names (G1-1); names without
-            // an underscore prefix (`TOKEN=`) stay visible
-            (Plain, "PASSWORD=hunter2\n", "PASSWORD=⟦redacted:7⟧\n"),
-            (Plain, "PASSWORD: hunter2\n", "PASSWORD: ⟦redacted:7⟧\n"),
-            (Plain, "PASSWORD:\"a b\"\n", "PASSWORD:⟦redacted:5⟧\n"),
-            (Plain, "PASSWORD=\n", "PASSWORD=\n"),
-            (Plain, "PASSWORD=${PASSWORD}\n", "PASSWORD=${PASSWORD}\n"),
-            (Plain, "MYPASSWORD=x\n", "MYPASSWORD=⟦redacted:1⟧\n"),
-            (Plain, "TOKEN=abc\n", "TOKEN=abc\n"),
-            (
-                Plain,
-                "Environment=PASSWORD=abc\n",
-                "Environment=PASSWORD=⟦redacted:3⟧\n",
-            ),
-            // lower-case and mixed-case names are outside the issue's name set
-            (Plain, "hf_token=abc123\n", "hf_token=abc123\n"),
-            (Plain, "Password=hunter2\n", "Password=hunter2\n"),
-            (Plain, "password=hunter2\n", "password=hunter2\n"),
-            // `:` with no space is an assignment only when the value is quoted
-            // (minified JSON); elsewhere it is a scalar key/value line (G1-2)
-            (
-                Plain,
-                "{\"HF_TOKEN\":\"sk-live-abc\"}\n",
-                "{\"HF_TOKEN\":⟦redacted:14⟧\n",
+                "Dockerfile ENV",
+                FileClass::Plain,
+                "FROM scratch\nENV api_key value-one\n",
+                "value-one",
             ),
             (
-                Plain,
-                "{\"HF_TOKEN\":\"a\",\"X_KEY\":\"b\"}\n",
-                "{\"HF_TOKEN\":⟦redacted:16⟧\n",
+                "Dockerfile ARG",
+                FileClass::Plain,
+                "FROM scratch\nARG db_password=value-one\n",
+                "value-one",
             ),
             (
-                Plain,
-                "HF_TOKEN:\"sk-live-abc\"\n",
-                "HF_TOKEN:⟦redacted:13⟧\n",
+                "shell export",
+                FileClass::Plain,
+                "export Hf_Token='value-one'\n",
+                "value-one",
             ),
             (
-                Plain,
-                "[\n{\"A_SECRET\":\"x\"}\n]\n",
-                "[\n{\"A_SECRET\":⟦redacted:4⟧\n]\n",
-            ),
-            // visible near-matches: comparisons, unquoted scalars, names without
-            // an underscore prefix, and numbers that only look like values
-            (Plain, "if PASSWORD == 3\n", "if PASSWORD == 3\n"),
-            (Plain, "  HF_TOKEN: keep-me\n", "  HF_TOKEN: ⟦redacted:7⟧\n"),
-            // over-masking is the accepted direction: `NAME:value` is an assignment
-            (
-                Plain,
-                "URL_KEY:8080/path\n",
-                "URL_KEY:\u{27E6}redacted:9\u{27E7}\n",
+                "Python",
+                FileClass::Plain,
+                "os.environ[\"api_key\"] = \"value-one\"\n",
+                "value-one",
             ),
             (
-                Plain,
-                "PASSWORD:abc\n",
-                "PASSWORD:\u{27E6}redacted:3\u{27E7}\n",
+                "Node",
+                FileClass::Plain,
+                "const config = { apiKey: 'value-one' };\n",
+                "value-one",
             ),
             (
-                Plain,
-                "HF_TOKEN:hunter2\n",
-                "HF_TOKEN:\u{27E6}redacted:7\u{27E7}\n",
-            ),
-            // a quoted value that spans lines masks every following line until a blank
-            // line (never at the closing quote), in any class
-            (
-                Plain,
-                "X_TOKEN=\"first\nsecond\nthird\" tail\nafter\n",
-                "X_TOKEN=⟦redacted:6⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n",
+                "Actions env",
+                FileClass::Plain,
+                "env:\n  API_KEY: value-one\n",
+                "value-one",
             ),
             (
-                Plain,
-                "X_KEY: 'a\nb'\nY_KEY=z\n",
-                "X_KEY: ⟦redacted:2⟧\n⟦redacted⟧\n⟦redacted⟧\n",
+                "Actions with",
+                FileClass::Plain,
+                "with:\n  api-key: value-one\n",
+                "value-one",
             ),
             (
-                Plain,
-                "--token \"a\nb\"\nplain\n",
-                "--token ⟦redacted:2⟧\n⟦redacted⟧\n⟦redacted⟧\n",
+                "Actions run",
+                FileClass::Plain,
+                "run: echo \"API_KEY=$X\" >> $GITHUB_ENV\n",
+                "$X",
             ),
-            (
-                Plain,
-                "DESCRIPTION: \"X_KEY: keep\"\n",
-                "DESCRIPTION: \"X_KEY: ⟦redacted:5⟧\n",
-            ),
-            (
-                Plain,
-                "note: \"A_TOKEN=b stays\"\n",
-                "note: \"A_TOKEN=⟦redacted:8⟧\n",
-            ),
-            (
-                Plain,
-                "{\"note\":\"HF_TOKEN=x\"}\n",
-                "{\"note\":\"HF_TOKEN=⟦redacted:3⟧\n",
-            ),
-            (
-                Plain,
-                "{\"X_KEY\":\"ok\",\"resp\":{\"note\":\"a,b\"}}\n",
-                "{\"X_KEY\":⟦redacted:27⟧\n",
-            ),
-            (
-                Plain,
-                "\"quoted\", X_KEY=abc\n",
-                "\"quoted\", X_KEY=⟦redacted:3⟧\n",
-            ),
-            // the older hidden default: the name is part of a larger word
-            (Plain, "MYKEY=1\n", "MYKEY=1\n"),
-            (Plain, "reKEY=x\n", "reKEY=x\n"),
-            // multi-line quoted values (G1-3)
-            (
-                Dotenv,
-                "A=\"first\nSECOND\"\nB=x\n",
-                "A=⟦redacted:6⟧\n⟦redacted⟧\n⟦redacted⟧\n",
-            ),
-            (
-                Dotenv,
-                "A=\"one\ntwo\nthree\n",
-                "A=⟦redacted:4⟧\n⟦redacted⟧\n⟦redacted⟧\n",
-            ),
-            (
-                Dotenv,
-                "A=\"x\" B=1\nC=\"y\nz\"\n",
-                "A=⟦redacted:7⟧\nC=⟦redacted:2⟧\n⟦redacted⟧\n",
-            ),
-            (
-                Dotenv,
-                "PATH=\"/usr/bin:/bin\"\nNEXT=2\n",
-                "PATH=⟦redacted:15⟧\nNEXT=⟦redacted:1⟧\n",
-            ),
-            (Dotenv, "A=\nB=\"x\"\n", "A=\nB=⟦redacted:3⟧\n"),
-            (
-                Dotenv,
-                "A='it\\'s fine'\nB=2\n",
-                "A=⟦redacted:12⟧\nB=⟦redacted:1⟧\n",
-            ),
-            // a quote closed on the same line is a one-line value
-            (
-                Dotenv,
-                "A=\"x\" # tail\nB=2\n",
-                "A=⟦redacted:10⟧\nB=⟦redacted:1⟧\n",
-            ),
-            // visible near-matches that must stay as they are (see above)
-            (Plain, "max_tokens=4096\n", "max_tokens=4096\n"),
-            (Plain, "MAX_TOKENS=4096\n", "MAX_TOKENS=4096\n"),
-            (Plain, "TOKEN_LIMIT=5\n", "TOKEN_LIMIT=5\n"),
-            (Plain, "KEY=1\n", "KEY=1\n"),
-            (Plain, "if X_KEY == 3\n", "if X_KEY == 3\n"),
-            (Plain, "X_KEY==3\n", "X_KEY==3\n"),
-            (Plain, "URL_KEY::path\n", "URL_KEY::path\n"),
-            (
-                Plain,
-                "X_KEY:nospace\n",
-                "X_KEY:\u{27E6}redacted:7\u{27E7}\n",
-            ),
-            (
-                Plain,
-                "sk-ant-api03-abcdefghijklmnop\n",
-                "sk-ant-api03-abcdefghijklmnop\n",
-            ),
-            (
-                Plain,
-                "ghp_abcdefghijklmnopqrstuvwxyz0123456789\n",
-                "ghp_abcdefghijklmnopqrstuvwxyz0123456789\n",
-            ),
-            (Plain, aws.as_str(), aws.as_str()),
-            (
-                Plain,
-                "Authorization: Bearer abcdefghijklmn\n",
-                "Authorization: Bearer abcdefghijklmn\n",
-            ),
-            // flags
-            (
-                Plain,
-                "llama-server --api-key sk-1 --ctx-size 4096\n",
-                "llama-server --api-key ⟦redacted:20⟧\n",
-            ),
-            (
-                Plain,
-                "--hf-token=hf_abc\n",
-                "--hf-token=\u{27E6}redacted:6\u{27E7}\n",
-            ),
-            (
-                Plain,
-                "cmd: run --api_key 'a b' --x\n",
-                "cmd: run --api_key ⟦redacted:9⟧\n",
-            ),
-            (
-                Plain,
-                "\"cmd\": \"run --api-key abc\"\n",
-                "\"cmd\": \"run --api-key \u{27E6}redacted:4\u{27E7}\n",
-            ),
-            (Plain, "\"--api-key=abc\"\n", "\"--api-key=⟦redacted:4⟧\n"),
-            (Plain, "--token-limit 5\n", "--token-limit 5\n"),
-            (Plain, "--api-key --other\n", "--api-key ⟦redacted:7⟧\n"),
-            (Plain, "--api-key=$KEY\n", "--api-key=$KEY\n"),
-            (Plain, "--api-key-file /run/k\n", "--api-key-file /run/k\n"),
-            (
-                Plain,
-                "run \\\n  --api-key \\\n  s3cret \\\n  --next\n",
-                "run \\\n  --api-key \\\n⟦redacted⟧\n⟦redacted⟧\n",
-            ),
-            (
-                Plain,
-                "args:\n  - \"--hf-token\"\n  - hf_abc\n  - --x\n",
-                "args:\n  - \"--hf-token\"\n  - \u{27E6}redacted:6\u{27E7}\n  - --x\n",
-            ),
-            (
-                Plain,
-                "args: [\"--password\", \"pw\"]\n",
-                "args: [\"--password\", ⟦redacted:5⟧\n",
-            ),
-            (
-                Plain,
-                "  - --secret\n  - --flag\n",
-                "  - --secret\n  - ⟦redacted:6⟧\n",
-            ),
-            // hf token file
-            (HfToken, "hf_abcdef\n", "\u{27E6}redacted:9\u{27E7}\n"),
-            (HfToken, "\n", "\n"),
         ];
-        let mut bad = Vec::new();
-        for (class, input, expected) in rows {
-            let got = masked(*class, input);
-            if &got != expected {
-                bad.push(format!(
-                    "class {class:?} input {input:?}\n   want {expected:?}\n   got  {got:?}"
-                ));
+        for (sample, class, input, value) in rows {
+            let view = mask(class, input);
+            assert!(!view.text.contains(value), "{sample}: {:?}", view.text);
+            assert!(!view.spans.is_empty(), "{sample}");
+            if class == FileClass::Plain {
+                assert!(
+                    view.text.contains("⟦redacted line:"),
+                    "{sample}: {:?}",
+                    view.text
+                );
             }
+            assert_eq!(
+                view.text.matches('\n').count(),
+                input.matches('\n').count(),
+                "{sample}"
+            );
         }
-        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    #[test]
+    fn token_words_mask_whole_lines_and_exactly_one_following_nonblank_line() {
+        for name in [
+            "_TOKEN",
+            "_KEY",
+            "_SECRET",
+            "_PASSWORD",
+            "Password",
+            "9_api_key",
+            "openaiApiKey",
+            "api-key",
+            "hf-token",
+            "Hf_Token",
+            "aPi_kEy",
+            "my-PASSWORD_KEY",
+        ] {
+            let text = format!("prefix {name} suffix\r\nnext value\r\nvisible\r\n");
+            let view = mask(FileClass::Plain, &text);
+            assert_eq!(
+                view.text,
+                format!("⟦redacted line: {name}⟧\r\n⟦redacted line⟧\r\nvisible\r\n")
+            );
+            assert_eq!(view.spans.len(), 2);
+            assert_eq!(
+                &text[view.spans[0].orig.clone()],
+                format!("prefix {name} suffix")
+            );
+            assert_eq!(&text[view.spans[1].orig.clone()], "next value");
+            assert!(view.overlaps_span(&view.spans[0].view));
+            assert!(view.overlaps_span(&view.spans[1].view));
+        }
+        for blank in ["", "  \t"] {
+            let text = format!("API_KEY anything\n{blank}\nvisible\n");
+            assert_eq!(
+                masked(FileClass::Plain, &text),
+                format!("⟦redacted line: API_KEY⟧\n{blank}\nvisible\n")
+            );
+        }
+        assert_eq!(
+            masked(FileClass::Plain, "x API_KEY\ny HF_TOKEN\nz\nvisible\n"),
+            "⟦redacted line: API_KEY⟧\n⟦redacted line: HF_TOKEN⟧\n⟦redacted line⟧\nvisible\n"
+        );
+        assert_eq!(
+            masked(FileClass::Plain, "é API_KEY=é\n"),
+            "⟦redacted line: API_KEY⟧\n"
+        );
+    }
+
+    #[test]
+    fn nonsecret_words_and_public_content_stay_visible() {
+        let public = pem("PUBLIC KEY", "PUBLICBODY\n");
+        let cert = pem("CERTIFICATE", "CERTBODY\n");
+        let aws = aws_style_id();
+        for text in [
+            "max_tokens=4096\n",
+            "MAX_TOKENS=4096\n",
+            "--max-tokens 4096\n",
+            "TOKENS\n",
+            "KEYBOARD\n",
+            "TOKEN=example\n",
+            "KEY=example\n",
+            "MYPASSWORD=example\n",
+            "PASSWORDPASSWORD\n",
+            "A_TOKENB\n",
+            "API_KEYS\n",
+            "api-key-file\n",
+            "hf-tokenizer\n",
+            "plain prose about a token and a key\n",
+            "--api-key-file path\n",
+            "--tokenizer gpt2 --token-limit 5\n",
+            public.as_str(),
+            cert.as_str(),
+            aws.as_str(),
+        ] {
+            assert_eq!(masked(FileClass::Plain, text), text, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn dotenv_and_secret_flags_keep_their_class_and_tail_rules() {
+        let private_block = pem("PRIVATE KEY", "API_KEY\n");
+        for (class, text, expected) in [
+            (
+                FileClass::Dotenv,
+                "HF_TOKEN=value-one\nPORT=8080\n",
+                "HF_TOKEN=⟦redacted:9⟧\nPORT=⟦redacted:4⟧\n",
+            ),
+            (
+                FileClass::Dotenv,
+                "# apiKey=value-one\n# next\n# shown\n",
+                "⟦redacted line: apiKey⟧\n⟦redacted line⟧\n# shown\n",
+            ),
+            (
+                FileClass::Dotenv,
+                "A=\nB=\"x\"\nunknown line\n",
+                "A=\nB=⟦redacted:3⟧\n⟦redacted⟧\n",
+            ),
+            (FileClass::Dotenv, "# comment\n\n", "# comment\n\n"),
+            (
+                FileClass::Plain,
+                "run --api-key value-one --ctx 4\nvisible\n",
+                "run --api-key ⟦redacted:17⟧\nvisible\n",
+            ),
+            (
+                FileClass::Plain,
+                "--hf-token=value-one\n",
+                "--hf-token=⟦redacted:9⟧\n",
+            ),
+            (
+                FileClass::Plain,
+                "run --token\n-value\nvisible\n",
+                "run --token\n⟦redacted:6⟧\nvisible\n",
+            ),
+            (
+                FileClass::Plain,
+                "--api-key=$KEY\nvisible\n",
+                "--api-key=$KEY\nvisible\n",
+            ),
+            (
+                FileClass::Plain,
+                "args:\n  - \"--hf-token\"\n  - value-one\n  - --x\n",
+                "args:\n  - \"--hf-token\"\n  - ⟦redacted:9⟧\n  - --x\n",
+            ),
+            (
+                FileClass::Plain,
+                "--api-key \\\nvalue-one \\\nnext\n\nvisible\n",
+                "--api-key \\\n⟦redacted:11⟧\n⟦redacted⟧\n\nvisible\n",
+            ),
+            (FileClass::HfToken, "value-one\n\n", "⟦redacted:9⟧\n\n"),
+            (FileClass::HfToken, "apiKey\n", "⟦redacted:6⟧\n"),
+            (FileClass::SshPrivateKey, "API_KEY\n", "⟦redacted⟧\n"),
+            (
+                FileClass::Plain,
+                private_block.as_str(),
+                "⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n",
+            ),
+        ] {
+            assert_eq!(masked(class, text), expected, "{class:?}: {text:?}");
+        }
     }
 
     /// A PEM block with a run-time label: the committed source must not contain a
@@ -1779,17 +1436,20 @@ mod tests {
 
     #[test]
     fn span_mapping_round_trips_positions() {
-        let text = "a=1\nB_TOKEN=hunter22\nz=9\n";
+        let text = "a=1\nB_TOKEN=hunter22\nz=9\n\nend\n";
         let view = mask(FileClass::Plain, text);
-        assert_eq!(view.text, "a=1\nB_TOKEN=\u{27E6}redacted:8\u{27E7}\nz=9\n");
-        assert_eq!(view.redactions(), 1);
-        let z_view = view.text.find("z=9").unwrap();
-        let z_orig = text.find("z=9").unwrap();
+        assert_eq!(
+            view.text,
+            "a=1\n⟦redacted line: B_TOKEN⟧\n⟦redacted line⟧\n\nend\n"
+        );
+        assert_eq!(view.redactions(), 2);
+        let z_view = view.text.find("end").unwrap();
+        let z_orig = text.find("end").unwrap();
         assert_eq!(view.to_orig(z_view), z_orig);
         let span = &view.spans[0];
         assert!(view.overlaps_span(&(span.view.start - 1..span.view.start + 1)));
         assert!(!view.overlaps_span(&(0..span.view.start)));
-        assert!(!view.overlaps_span(&(span.view.end..view.text.len())));
+        assert!(!view.overlaps_span(&(span.view.end..span.view.end + 1)));
         assert!(view.overlaps_span(&(span.view.start + 2..span.view.start + 2)));
         assert!(!view.overlaps_span(&(span.view.start..span.view.start)));
     }
@@ -1820,7 +1480,7 @@ mod tests {
     }
 
     /// About 1 MiB of mixed text: config lines, prose, env assignments, flags,
-    /// and a few secrets, so both the trigger fast path and the regex path run.
+    /// and a few secret names, exercising tokenization and flag recognition.
     fn mixed_corpus(repeat: usize) -> String {
         let block = "# deployment notes for the model node\n\
             exec llama-server --ctx-size 32768 --port 8080 --threads 16 \\\n\
@@ -1851,279 +1511,24 @@ mod tests {
         out
     }
 
-    /// The fail-closed contract (design-r2): for each input, none of the listed
-    /// secret substrings may survive in the masked view, whatever shape the value
-    /// takes. One row per shape; a shape that leaks is a bug in the rules, not a
-    /// reason to add a parser for that shape.
+    /// Token lines open the retained multi-line constructs without format parsers.
     #[test]
-    fn no_byte_of_a_secret_value_survives_in_any_shape() {
-        use FileClass::{Dotenv, PemKey, Plain};
-        let rows: &[(FileClass, &str, &[&str])] = &[
-            // value extent: spaces, quotes, bearer tokens, YAML '' , shell concatenation
-            (
-                Plain,
-                "  - DB_PASSWORD=correct horse battery staple\n",
-                &["horse", "battery", "staple"],
-            ),
-            (
-                Plain,
-                "Environment=\"DB_PASSWORD=correct horse\"\n",
-                &["correct", "horse"],
-            ),
-            (
-                Plain,
-                "AUTH_TOKEN: Bearer eyJhbGciOi.payload.sig\n",
-                &["Bearer", "eyJhbGciOi", "payload"],
-            ),
-            (
-                Plain,
-                "API_KEY: 'pa''ssword-tail'\n",
-                &["ssword-tail", "pa'"],
-            ),
-            (Plain, "API_KEY='abc'\"defsecret\"\n", &["abc", "defsecret"]),
-            (
-                Plain,
-                "export API_KEY=abc\\ defsecret\n",
-                &["abc", "defsecret"],
-            ),
-            (
-                Plain,
-                "{\"a\":1,\"X_KEY\":\"s1\",\"b\":\"s2\"}\n",
-                &["s1", "s2"],
-            ),
-            (Plain, "run --token a b c\n", &["a b c"]),
-            // multi-line forms
-            (
-                Plain,
-                "TLS_KEY: |\n  MIIEvQIBADAN\n  AQEFAASCBKcw\nother: 1\n",
-                &["MIIEvQ", "AQEFAA"],
-            ),
-            (
-                Plain,
-                "API_KEY: >-\n  sk-live-folded\n",
-                &["sk-live-folded"],
-            ),
-            (
-                Plain,
-                "TLS_KEY = \"\"\"\nMIIEtriple\n\"\"\"\n",
-                &["MIIEtriple"],
-            ),
-            (
-                Plain,
-                "API_KEY = '''\nsk-live-triple\n'''\n",
-                &["sk-live-triple"],
-            ),
-            (
-                Plain,
-                "export API_KEY=abc\\\ndefsecret\n",
-                &["abc", "defsecret"],
-            ),
-            (Plain, "export API_KEY=\\\ndefsecret\n", &["defsecret"]),
-            (
-                Plain,
-                "K_TOKEN=\"line1\nline2-secret\nline3-secret\"\n",
-                &["line1", "line2-secret", "line3-secret"],
-            ),
-            (
-                Plain,
-                "K_TOKEN=\"a1\nb1\" X_KEY=\"c1\nd1\"\n",
-                &["c1", "d1"],
-            ),
-            // env files: unknown means masked
-            (
-                Dotenv,
-                "A=\"x\nMIIEbase64body=\n-----\"\n",
-                &["MIIEbase64body"],
-            ),
-            (
-                Dotenv,
-                "not an assignment secret words\n",
-                &["secret", "words"],
-            ),
-            (Dotenv, "A=\"x1\ny1\" B=\"s1\ns2\"\n", &["s1", "s2"]),
-            (Dotenv, "# OLD_API_KEY=sk-live-old\n", &["sk-live-old"]),
-            (Dotenv, "KEY: value with colon\n", &["value with colon"]),
-            (
-                Dotenv,
-                "  export DB_URL = value-one two  # note\n",
-                &["value-one", "two", "note"],
-            ),
-            (PemKey, "# note\nK_TOKEN=\"a\nb\"\n", &["b\""]),
-            // stage-3 round 3 (C3a-1..6): masking ends only at a blank line or a dedent,
-            // never at a closing quote
-            (
-                Plain,
-                "API_KEY: 'first1\n  second1''tail-secret1\n  third1'\nvisible: 1\n",
-                &["second1", "tail-secret1", "third1"],
-            ),
-            (
-                Plain,
-                "K_TOKEN='a1'\"b1\nc1\"\n\nvisible\n",
-                &["a1", "b1", "c1"],
-            ),
-            (
-                Plain,
-                "K_TOKEN=\"x1\\\nc1\"\\\nd1\ne1\n\nvisible\n",
-                &["x1", "c1", "d1", "e1"],
-            ),
-            (
-                Plain,
-                "export K_TOKEN=abc1\\\n\"open1\nmore1\n\nvisible\n",
-                &["abc1", "open1", "more1"],
-            ),
-            (
-                Plain,
-                "K_TOKEN=\"\"\"x1\"\"\" ; A_KEY=\"open2\nmore2\n\nv\n",
-                &["x1", "open2", "more2"],
-            ),
-            (
-                Plain,
-                "K_TOKEN=abc1'def1\nghi1'\n\nvisible\n",
-                &["abc1", "def1", "ghi1"],
-            ),
-            (
-                Dotenv,
-                "K_TOKEN=abc1'def1\nNEXT_KEY=ghi1'\n\nB=1\n",
-                &["abc1", "def1", "NEXT_KEY", "ghi1"],
-            ),
-            (
-                Plain,
-                "\"K_TOKEN\": |\n one1\n two1\nvisible: 1\n",
-                &["one1", "two1"],
-            ),
-            (Plain, "run --token -secret1 --x\n", &["secret1"]),
-            (Plain, "run --api-key\n-secret2\n", &["secret2"]),
-            (Plain, "run --password=-secret3\n", &["secret3"]),
-            (
-                Plain,
-                "K_TOKEN=abc1\u{a0}\u{2002}\n",
-                &["\u{a0}", "\u{2002}"],
-            ),
-            (Plain, "K_TOKEN=abc1   \n", &["   "]),
-            (Plain, "_DEPLOY_TOKEN=lead-secret\n", &["lead-secret"]),
-            (
-                Plain,
-                "_TOKEN=short-secret\n_KEY: short-key-secret\n_SECRET=x-secret\n",
-                &["short-secret", "short-key-secret", "x-secret"],
-            ),
-            (Plain, "  export __A_KEY: under-secret\n", &["under-secret"]),
-            // stage-3 round 3 (Opus C3b-4/5): quote escapes, glued text, other flag prefixes
-            (
-                Plain,
-                "X_TOKEN: 'first-secret\nsec''ret-tail-part'\n\nvisible\n",
-                &["first-secret", "ret-tail-part"],
-            ),
-            (
-                Plain,
-                "export X_TOKEN=\"first-secret\nsecond\"glued-tail-part\n\nvisible\n",
-                &["first-secret", "glued-tail-part"],
-            ),
-            (Plain, "cmd {--token brace-secret}\n", &["brace-secret"]),
-            (Plain, "a;--token semi-secret\n", &["semi-secret"]),
-            (Plain, "a|--api-key pipe-secret\n", &["pipe-secret"]),
-            (Plain, "a&&--password=and-secret\n", &["and-secret"]),
-            // stage-3 round 4 (Opus C4a-2/6/8): YAML values on following lines, prefixed
-            // flags, other assignment and environment shapes
-            (
-                Plain,
-                "environment:\n  API_KEY:\n        SECRETXA1\n  HF_TOKEN: !!str\n        SECRETXB2\n  DB_PASSWORD: &pw\n        SECRETXC3\n  OPENAI_API_KEY: SECRETXD4-first\n        SECRETXE5-second\nnext: 1\n",
-                &[
-                    "SECRETXA1",
-                    "SECRETXB2",
-                    "SECRETXC3",
-                    "SECRETXD4",
-                    "SECRETXE5",
-                ],
-            ),
-            (Plain, "aider --openai-api-key SECRETX1\n", &["SECRETX1"]),
-            (Plain, "aider --anthropic-api-key=SECRETX2\n", &["SECRETX2"]),
-            (Plain, "server -token SECRETX3\n", &["SECRETX3"]),
-            (Plain, "llm --apikey SECRETX4\n", &["SECRETX4"]),
-            (
-                Plain,
-                "{\"args\": \"--api-key\\nSECRETXJ2\"}\n",
-                &["SECRETXJ2"],
-            ),
-            (
-                Plain,
-                "env:\n  - name: OPENAI_API_KEY\n    value: SECRETXK8S\n",
-                &["SECRETXK8S"],
-            ),
-            (
-                Plain,
-                "{\"name\": \"DB_PASSWORD\", \"value\": \"SECRETXECS\"}\n",
-                &["SECRETXECS"],
-            ),
-            (
-                Plain,
-                "{\"cfg\": \"{\\\"API_KEY\\\":\\\"SECRETXJ1\\\"}\"}\n",
-                &["SECRETXJ1"],
-            ),
-            (
-                Plain,
-                "os.environ[\"API_KEY\"] = \"SECRETX5\"\n",
-                &["SECRETX5"],
-            ),
-            (
-                Plain,
-                "API_KEY ?= SECRETX6\nAPI_KEY ::= SECRETX7\nAPI_KEY += SECRETX8\nAPI_KEY := SECRETX9\n",
-                &["SECRETX6", "SECRETX7", "SECRETX8", "SECRETX9"],
-            ),
-            (
-                Plain,
-                "ENV API_KEY SECRETXL1\nsetenv DB_PASSWORD SECRETXL2\nARG X_TOKEN SECRETXL3\n",
-                &["SECRETXL1", "SECRETXL2", "SECRETXL3"],
-            ),
-            (Plain, "API_KEY='$FOO\nSECRETXL4'\n\nv\n", &["SECRETXL4"]),
-            // round 6: variants inside the kept env shapes
-            (
-                Plain,
-                "ENV API_KEY \\\nenvcont-secret\n\nv\n",
-                &["envcont-secret"],
-            ),
-            (
-                Plain,
-                "env API_KEY lowerenv-secret\nArg DB_PASSWORD mixedarg-secret\n",
-                &["lowerenv-secret", "mixedarg-secret"],
-            ),
-            (
-                Plain,
-                "os.environ[\"API_KEY\" ] = \"space-secret\"\nos.environ[ \"X_TOKEN\" ] = 'sp2-secret'\n",
-                &["space-secret", "sp2-secret"],
-            ),
-            (
-                Plain,
-                "{\"name\": \"DB_PASSWORD\", \"other\": 1, \"valueFrom\": null, \"value\": \"between-secret\"}\n",
-                &["between-secret"],
-            ),
-            (
-                Plain,
-                "env:\n- value: indentless-secret\n  name: API_KEY\n- value: second-indentless\n  name: X_TOKEN\nnext: 1\n",
-                &["indentless-secret", "second-indentless"],
-            ),
-            (
-                Plain,
-                "{\"API\\u005fKEY\": \"uni-secret\", \"\\u0044B_PASSWORD\":\"uni2-secret\"}\n",
-                &["uni-secret", "uni2-secret"],
-            ),
-            (
-                Plain,
-                "{\"\\u0041\\u0050\\u0049_\\u004b\\u0045\\u0059\": \"fullyescaped-secret\"}\n",
-                &["fullyescaped-secret"],
-            ),
+    fn token_line_constructs_mask_through_structural_ends() {
+        let rows = [
+            "api_key: |\n  first-value\n\n  second-value\nvisible: yes\n",
+            "api-key: >-\n  first-value\n  second-value\nvisible: yes\n",
+            "'Hf_Token': !tag |+2 # note\n  first-value\n  second-value\nvisible: yes\n",
+            "apiKey = \"\"\"\nfirst-value\n\"\"\"second-value\n\nvisible\n",
+            "Password='first-value'\"open\nsecond-value\"\nthird-value\n\nvisible\n",
+            "foo_secret=first-value\\\nsecond-value\nthird-value\n\nvisible\n",
         ];
-        let mut leaks = Vec::new();
-        for (class, input, secrets) in rows {
-            let view = masked(*class, input);
-            for secret in *secrets {
-                if view.contains(secret) {
-                    leaks.push(format!(
-                        "{class:?} {input:?}: `{secret}` survives in {view:?}"
-                    ));
-                }
+        for text in rows {
+            let view = masked(FileClass::Plain, text);
+            for value in ["first-value", "second-value", "third-value"] {
+                assert!(!view.contains(value), "{text:?}: {view:?}");
             }
+            assert!(view.contains("visible"), "{text:?}: {view:?}");
         }
-        assert!(leaks.is_empty(), "{}", leaks.join("\n"));
     }
 
     #[test]
@@ -2131,35 +1536,26 @@ mod tests {
         let text = "a:\n  TLS_KEY: |\n    line1\n\n    line2\n  other: shown\nb: shown\n";
         assert_eq!(
             masked(FileClass::Plain, text),
-            "a:\n  TLS_KEY: \u{27E6}redacted:1\u{27E7}\n\u{27E6}redacted\u{27E7}\n\n\u{27E6}redacted\u{27E7}\n  other: shown\nb: shown\n"
+            "a:\n⟦redacted line: TLS_KEY⟧\n⟦redacted line⟧\n\n\u{27E6}redacted\u{27E7}\n  other: shown\nb: shown\n"
         );
     }
 
     #[test]
-    fn public_names_stay_visible_and_a_string_opened_before_the_name_is_not_a_continuation() {
-        use FileClass::Plain;
-        for line in [
-            "run --max-tokens 4096\n",
-            "run --tokenizer gpt2 --token-limit 5\n",
-            "if PASSWORD == 3\n",
-            "kube-token is a name\n",
-            "max_tokens=4096\n",
-            "  name: API_KEY\n  valueFrom:\n    secretKeyRef: shown\n",
-        ] {
-            let view = masked(Plain, line);
-            if line.contains("valueFrom") {
-                assert!(view.contains("secretKeyRef: shown"), "{view:?}");
-            } else {
-                assert_eq!(view, line, "{line:?}");
-            }
-        }
-        // the closing quote of a string opened BEFORE the name is not a value quote
+    fn whole_line_quote_parity_does_not_open_a_spurious_continuation() {
         assert_eq!(
             masked(
-                Plain,
-                "run: echo \"HF_TOKEN=$X\" >> $ENV\nnext: 1\n- run: make\n"
+                FileClass::Plain,
+                "run: echo \"HF_TOKEN=$X\" >> $GITHUB_ENV\nnext: 1\nvisible: yes\n"
             ),
-            "run: echo \"HF_TOKEN=\u{27E6}redacted:11\u{27E7}\nnext: 1\n- run: make\n"
+            "⟦redacted line: HF_TOKEN⟧\n⟦redacted line⟧\nvisible: yes\n"
+        );
+        // A name/value reference occupies only the one line covered by the rule.
+        assert_eq!(
+            masked(
+                FileClass::Plain,
+                "  name: API_KEY\n  valueFrom: {secretKeyRef: {name: service, key: credential}}\nvisible: yes\n"
+            ),
+            "⟦redacted line: API_KEY⟧\n⟦redacted line⟧\nvisible: yes\n"
         );
     }
 
@@ -2171,21 +1567,21 @@ mod tests {
         // a deeper sibling of a list item is over-masked, never leaked)
         assert_eq!(
             masked(Plain, "\"K_TOKEN\": |\n one\n\n two\nvisible: 1\n"),
-            "\"K_TOKEN\": \u{27E6}redacted:1\u{27E7}\n\u{27E6}redacted\u{27E7}\n\n\u{27E6}redacted\u{27E7}\nvisible: 1\n"
+            "⟦redacted line: K_TOKEN⟧\n⟦redacted line⟧\n\n\u{27E6}redacted\u{27E7}\nvisible: 1\n"
         );
         assert_eq!(
             masked(Plain, "- K_KEY: >-\n    body\n  sibling: 1\ntop: 1\n"),
-            "- K_KEY: \u{27E6}redacted:2\u{27E7}\n\u{27E6}redacted\u{27E7}\n\u{27E6}redacted\u{27E7}\ntop: 1\n"
+            "⟦redacted line: K_KEY⟧\n⟦redacted line⟧\n\u{27E6}redacted\u{27E7}\ntop: 1\n"
         );
         // every other multi-line form ends at the first blank line, not at a quote
         assert_eq!(
             masked(Plain, "K_TOKEN=\"a\nb\" tail\nc\n\nvisible\n"),
-            "K_TOKEN=\u{27E6}redacted:2\u{27E7}\n\u{27E6}redacted\u{27E7}\n\u{27E6}redacted\u{27E7}\n\nvisible\n"
+            "⟦redacted line: K_TOKEN⟧\n⟦redacted line⟧\n\u{27E6}redacted\u{27E7}\n\nvisible\n"
         );
         // a region that never reaches a blank line is masked to its end
         assert_eq!(
             masked(Plain, "K_TOKEN=\"a\nb\nc\n"),
-            "K_TOKEN=\u{27E6}redacted:2\u{27E7}\n\u{27E6}redacted\u{27E7}\n\u{27E6}redacted\u{27E7}\n"
+            "⟦redacted line: K_TOKEN⟧\n⟦redacted line⟧\n\u{27E6}redacted\u{27E7}\n"
         );
     }
 
@@ -2272,6 +1668,9 @@ mod tests {
             "PASSWORD".repeat(100_000),
             "A_TOKENB".repeat(100_000),
             "_KEY_TOKEN_SECRET".repeat(50_000),
+            "_key".repeat(200_000),
+            "password".repeat(100_000),
+            "a_tokenb".repeat(100_000),
         ];
         for text in &corpora {
             for class in [FileClass::Plain, FileClass::Dotenv] {
@@ -2279,6 +1678,17 @@ mod tests {
                 let view = mask(class, text);
                 std::hint::black_box(&view);
                 let took = started.elapsed();
+                if class == FileClass::Plain {
+                    let has_name = !text.starts_with("PASSWORD")
+                        && !text.starts_with("password")
+                        && !text.starts_with("A_TOKENB")
+                        && !text.starts_with("a_tokenb");
+                    if text.starts_with('_') {
+                        assert!(view.text.starts_with("⟦redacted line: "));
+                    } else if !has_name {
+                        assert_eq!(view.text, *text);
+                    }
+                }
                 // superlinear behaviour measured minutes here; a linear scan is
                 // milliseconds (seconds is generous for a loaded debug build)
                 assert!(
@@ -2312,10 +1722,10 @@ mod tests {
             let mut masker = LineMasker::new(class);
             assert_eq!(
                 masker.mask_line("K_TOKEN=\"one"),
-                "K_TOKEN=\u{27E6}redacted:4\u{27E7}"
+                "⟦redacted line: K_TOKEN⟧"
             );
             assert!(masker.in_continuation());
-            assert_eq!(masker.mask_line("two"), "\u{27E6}redacted\u{27E7}");
+            assert_eq!(masker.mask_line("two"), "⟦redacted line⟧");
             // a closing quote does not end masking; only the blank line does
             assert_eq!(masker.mask_line("three\" ok"), "\u{27E6}redacted\u{27E7}");
             assert_eq!(masker.mask_line("still masked"), "\u{27E6}redacted\u{27E7}");
@@ -2370,7 +1780,7 @@ mod tests {
         let mut checked = 0;
         // hand-written shapes first (a reader that starts INSIDE a run whose body holds
         // an opener), then random documents from the pool
-        let fixed: [&[&str]; 9] = [
+        let fixed: [&[&str]; 6] = [
             // interleaved private-key blocks of three labels: an END closes only its own
             // block, so a reader that starts after `BEGIN X` still masks the RSA body
             &[
@@ -2387,15 +1797,6 @@ mod tests {
                 concat!("-----END ", "RSA PRIVATE KEY-----"),
                 "outro",
             ],
-            // a name line, comments, then the value header with a trailing comment
-            &[
-                "- name: X_TOKEN",
-                "  # a comment line",
-                "  # another comment line here",
-                "  value: |  # note",
-                "    BODY-secret-line",
-                "next: 1",
-            ],
             &[
                 concat!("-----BEGIN ", "RSA PRIVATE KEY-----"),
                 concat!("-----BEGIN ", "EC PRIVATE KEY-----"),
@@ -2404,46 +1805,6 @@ mod tests {
                 "more-secret-body",
                 concat!("-----END ", "RSA PRIVATE KEY-----"),
                 "after",
-            ],
-            // the env header is just inside the lookback of the `value:` line, its
-            // block's continuation is just outside: the block is charged to the header
-            &[
-                "env:",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "",
-                "  - value: |",
-                "      cont-secret-line",
-                "next: 1",
-            ],
-            &[
-                "- name: X_TOKEN",
-                "  x: 12345678901234567890123456789012345678901234567890",
-                "  y: 2",
-                "  value: |",
-                "    cont-secret-line",
-                "next: 1",
             ],
             &[
                 "E_KEY: |",

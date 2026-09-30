@@ -384,10 +384,7 @@ fn masked_spans_cannot_be_targeted_and_cannot_be_probed() {
     );
     let etag = fx.etag("run.conf");
     // touching the secret value is refused ...
-    for old in [
-        "TOKEN=\u{27E6}redacted:13\u{27E7}",
-        "\u{27E6}redacted:13\u{27E7}",
-    ] {
+    for old in ["⟦redacted line: HF_TOKEN⟧", "HF_TOKEN", "⟦redacted line⟧"] {
         let code = edit_err(&fx, "run.conf", json!([{ "oldText": old, "newText": "x" }])).code;
         assert!(matches!(code, ErrorCode::RedactedSpan), "{old}: {code:?}");
     }
@@ -405,14 +402,18 @@ fn masked_spans_cannot_be_targeted_and_cannot_be_probed() {
             "{guess}"
         );
     }
-    // a line-range edit over the secret line is refused, other lines are fine
-    let over = edit(
-        &fx,
-        "run.conf",
-        Some(&etag),
-        json!([{ "startLine": 2, "endLine": 2, "newText": "HF_TOKEN=new\n" }]),
-    );
-    assert_eq!(over.unwrap_err().code, ErrorCode::RedactedSpan);
+    // Both the token line and its following line are protected, including dry runs.
+    for line in [2, 3] {
+        for dry in [true, false] {
+            let over = fx.ops.edit(
+                &args(json!({ "path": fx.p("run.conf"), "expectedEtag": etag,
+                    "edits": [{ "startLine": line, "endLine": line, "newText": "replacement\n" }],
+                    "dryRun": dry })),
+                &fx.cancel,
+            );
+            assert_eq!(code(over), ErrorCode::RedactedSpan);
+        }
+    }
     let r = edit(
         &fx,
         "run.conf",
@@ -454,16 +455,19 @@ fn masked_spans_cannot_be_targeted_and_cannot_be_probed() {
 
 #[test]
 fn an_edit_that_changes_the_masking_context_cannot_unmask_a_value() {
-    // masking depends on the surrounding text: renaming the key, commenting the
-    // line out, closing a quote early or inserting a key-block end would move real
-    // bytes out of the masked spans. The edit and its dry run are refused.
+    // The diagnostic includes the token name inside the span: renaming it is
+    // refused, as are insertions that would expose surviving masked bytes.
+    // Both actual edits and dry runs enforce the same invariant.
     let fx = Fx::new();
-    fx.put("cfg.yaml", "API_KEY: sk-live-plainsecret\nother: 1\n");
+    fx.put(
+        "cfg.yaml",
+        "API_KEY: sk-live-plainsecret\nnext: masked\nother: 1\n",
+    );
     fx.put("multi.txt", "X_TOKEN=\"line1\nline2-multisecret\"\ntail\n");
     let cases: [(&str, serde_json::Value); 4] = [
         (
             "cfg.yaml",
-            json!([{ "oldText": "API_KEY:", "newText": "API_KEX:" }]),
+            json!([{ "oldText": "API_KEY", "newText": "API_KEX" }]),
         ),
         (
             "cfg.yaml",
@@ -471,7 +475,7 @@ fn an_edit_that_changes_the_masking_context_cannot_unmask_a_value() {
         ),
         (
             "multi.txt",
-            json!([{ "oldText": "X_TOKEN=", "newText": "X_TOKEX=" }]),
+            json!([{ "oldText": "X_TOKEN", "newText": "X_TOKEX" }]),
         ),
         (
             "multi.txt",
@@ -498,7 +502,7 @@ fn an_edit_that_changes_the_masking_context_cannot_unmask_a_value() {
     assert_eq!(code(r), ErrorCode::RedactedSpan);
     assert_eq!(
         fx.get("cfg.yaml"),
-        "API_KEY: sk-live-plainsecret\nother: 1\n"
+        "API_KEY: sk-live-plainsecret\nnext: masked\nother: 1\n"
     );
     // one masked value is unmasked while the others stay masked: still refused
     fx.put(
