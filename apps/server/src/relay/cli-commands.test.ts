@@ -925,7 +925,7 @@ describe("cli commands", () => {
 
     it("records one completed event with the exit status and no output", async () => {
       const socket = await connect();
-      const result = await startCliCommand({ ...base, command: "run --api-key sk-secret-9 x" });
+      const result = await startCliCommand({ ...base, command: "curl --api-key sk-secret-9 x" });
       if (!result.ok) throw new Error("expected start");
       expect(events()).toEqual([]);
       await relaySessionManager.handleTextFrame(
@@ -955,10 +955,10 @@ describe("cli commands", () => {
         mcpTokenId: "token-audit",
       });
       const path = String(events()[0]?.path);
-      expect(path).toMatch(/^hmac-sha256:[0-9a-f]{64} run$/);
+      expect(path).toMatch(/^hmac-sha256:[0-9a-f]{64} curl$/);
       expect(JSON.stringify(events())).not.toContain("sk-secret-9");
       // No stored field of the row may contain any argument text.
-      expect(path.split(" ").slice(1).join(" ")).toBe("run");
+      expect(path.split(" ").slice(1).join(" ")).toBe("curl");
     });
 
     it("maps a signalled exec to signal:<name> and a timeout to timed_out", async () => {
@@ -1011,7 +1011,7 @@ describe("cli commands", () => {
 
     it("stores the hash of the command text and its program, never a preview", async () => {
       const socket = await connect();
-      const command = "SECRET_TOKEN=abcdefghijklmnopqrstuvwxyz tool run";
+      const command = "SECRET_TOKEN=abcdefghijklmnopqrstuvwxyz git run";
       const result = await startCliCommand({ ...base, command });
       if (!result.ok) throw new Error("expected start");
       await relaySessionManager.handleTextFrame(
@@ -1024,10 +1024,10 @@ describe("cli commands", () => {
         }),
       );
       const path = String(events()[0]?.path ?? "");
-      // The first word is a secret-bearing assignment: it is never stored, and
-      // it is not skipped either (cmd has no inline assignment): the program is `?`.
+      // The first word is a secret-bearing assignment: it is skipped and never
+      // stored; the program is the allowlisted word after it.
       expect(path).not.toContain("abcdefghij");
-      expect(path.split(" ").slice(1).join(" ")).toBe("?");
+      expect(path.split(" ").slice(1).join(" ")).toBe("git");
       expect(path.slice(0, path.indexOf(" "))).toBe(`hmac-sha256:${commandAuditDigest(command)}`);
     });
 
