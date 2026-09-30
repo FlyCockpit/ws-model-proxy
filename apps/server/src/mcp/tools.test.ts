@@ -57,12 +57,13 @@ const cliRuntime = vi.hoisted(() => ({
 
 vi.mock("../relay/cli-commands.js", () => cliRuntime);
 
-const fileRuntime = vi.hoisted(() => ({ runFileOp: vi.fn() }));
+const fileRuntime = vi.hoisted(() => ({ runFileOp: vi.fn(), auditRefusedFileInput: vi.fn() }));
 
 vi.mock("../relay/cli-file-ops.js", () => ({
   runFileOp: fileRuntime.runFileOp,
   cancelFileOpsForToken: vi.fn(),
   sweepExpiredFileOps: vi.fn(),
+  auditRefusedFileInput: fileRuntime.auditRefusedFileInput,
 }));
 
 // The full-chain test drives the Phase 4 request handler whose verifier is
@@ -2293,6 +2294,27 @@ describe("CLI file tools", () => {
       if (field !== "(input)") expect(issues?.some((i) => i.path.join(".") === field)).toBe(true);
     }
     expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+  });
+
+  it("audits an input refused in the MCP layer as a refusal (#104)", async () => {
+    fileRuntime.auditRefusedFileInput.mockClear();
+    await call("forwarder_cli_file_read", { cliDeviceId: "cli-1", path: "~/a", surprise: 1 });
+    await call("forwarder_cli_file_write", {
+      cliDeviceId: "cli-1",
+      path: "~/n",
+      content: "not base64!!",
+      encoding: "base64",
+      confirm: "RUN",
+    });
+    expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledTimes(2);
+    expect(fileRuntime.auditRefusedFileInput.mock.calls[1]?.[0]).toMatchObject({
+      op: "write",
+      userId: USER.id,
+      tokenId: "token-pat-1",
+    });
+    expect(JSON.stringify(fileRuntime.auditRefusedFileInput.mock.calls)).not.toContain(
+      "not base64",
+    );
   });
 
   it("keeps unchanged:true in the ifNoneMatch answer", async () => {

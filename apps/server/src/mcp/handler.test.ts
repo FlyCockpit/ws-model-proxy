@@ -59,6 +59,7 @@ vi.mock("../relay/cli-file-ops.js", () => ({
   runFileOp: vi.fn(),
   cancelFileOpsForToken: vi.fn(),
   sweepExpiredFileOps: vi.fn(),
+  auditRefusedFileInput: vi.fn(),
 }));
 
 /** Minimal well-typed CallToolResult for the probe tool. */

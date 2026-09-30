@@ -295,6 +295,63 @@ describe("cli file ops", () => {
     resetFileOpsForTests();
   });
 
+  it("reports a mutation's io_error or too_large rejection as an unknown outcome, a read's as definitive", async () => {
+    const socket = await connect();
+    for (const reason of ["io_error", "too_large"]) {
+      const write = start(socket, "edit", editArgs);
+      await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+      await answer(
+        socket,
+        JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason }),
+      );
+      await expect(write).resolves.toEqual({ ok: false, code: reason, outcome: "unknown" });
+      socket.sends.length = 0;
+      const read = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+      await answer(
+        socket,
+        JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason }),
+      );
+      await expect(read).resolves.toEqual({ ok: false, code: reason });
+      socket.sends.length = 0;
+    }
+    // Other CLI refusals of a mutation stay definitive.
+    const conflict = start(socket, "edit", editArgs);
+    await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+    await answer(
+      socket,
+      JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason: "no_match" }),
+    );
+    await expect(conflict).resolves.toEqual({ ok: false, code: "no_match" });
+  });
+
+  it("gives the rate slot back for an op that was never sent", async () => {
+    const socket = await connect();
+    // A send that throws leaves nothing at the CLI; the slot must not stay spent.
+    const realSend = socket.send.bind(socket);
+    let armed = true;
+    socket.send = (data) => {
+      if (armed) {
+        armed = false;
+        throw new Error("socket send failed");
+      }
+      realSend(data);
+    };
+    const first = await runFileOp({
+      ...OP_TOKEN,
+      cliDeviceId: "desktop",
+      op: "delete",
+      args: { path: "~/a" },
+    });
+    expect(first.ok).toBe(false);
+    for (let index = 0; index < FILE_MUTATIONS_PER_MINUTE_PER_USER; index += 1) {
+      const outcome = start(socket, "mkdir", { path: `~/d${index}` });
+      await waitFor(() => expect(socket.frames("file.op").length).toBe(index + 1));
+      await answer(socket, resultFor(lastOpId(socket), "mkdir", { created: true }));
+      await expect(outcome).resolves.toMatchObject({ ok: true });
+    }
+  });
+
   describe("audit (#104 part B)", () => {
     const events = () => audit.record.mock.calls.map(([event]) => event as Record<string, unknown>);
 
@@ -464,6 +521,34 @@ describe("cli file ops", () => {
       expect(events()).toHaveLength(2);
       expect(events()[0]).toMatchObject({ outcome: "cancelled", reason: "timeout" });
       expect(events()[1]).toMatchObject({ outcome: "cancelled", reason: "offline" });
+    });
+
+    it("records a mutation's unknown outcome after a too_large rejection, and CLI mode refusals as refused", async () => {
+      const socket = await connect();
+      const big = start(socket, "edit", editArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await answer(
+        socket,
+        JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason: "too_large" }),
+      );
+      await big;
+      const root = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(2));
+      await answer(
+        socket,
+        JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason: "unsupported" }),
+      );
+      await root;
+      expect(events()[0]).toMatchObject({
+        kind: "file_edit",
+        outcome: "unknown",
+        reason: "too_large",
+      });
+      expect(events()[1]).toMatchObject({
+        kind: "file_read",
+        outcome: "refused",
+        reason: "unsupported",
+      });
     });
 
     it("records an aborted op exactly once, with the CLI's final answer", async () => {

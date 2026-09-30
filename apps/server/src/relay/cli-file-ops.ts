@@ -141,6 +141,17 @@ function takeRateSlot(
   return { ok: true };
 }
 
+/** Gives back the slot of an op that was never sent (nothing reached the CLI). */
+function refundRateSlot(userId: string, mutating: boolean, at: number): void {
+  for (const map of mutating ? [opTimesByUser, mutationTimesByUser] : [opTimesByUser]) {
+    const times = map.get(userId);
+    if (!times) continue;
+    const index = times.lastIndexOf(at);
+    if (index >= 0) times.splice(index, 1);
+    if (times.length === 0) map.delete(userId);
+  }
+}
+
 function pendingCounts(userId: string, cliDeviceId: string): { user: number; cli: number } {
   let user = 0;
   let cli = 0;
@@ -243,10 +254,30 @@ function auditOutcomeOf(
   if (outcome.ok) return { outcome: "completed", reason: null };
   if (outcome.outcome === "unknown") return { outcome: "unknown", reason: outcome.code };
   if (!audit.registered) return { outcome: "refused", reason: outcome.code };
+  // The CLI's own refusals (root, load): nothing ran.
+  if (outcome.code === "unsupported" || outcome.code === "limit") {
+    return { outcome: "refused", reason: outcome.code };
+  }
   return {
     outcome: CANCELLED_CODES.has(outcome.code) ? "cancelled" : "failed",
     reason: outcome.code,
   };
+}
+
+/**
+ * An input the MCP layer refused before `runFileOp` (strict shape, content the
+ * relay cannot carry): recorded as a refusal like the commands' `invalid_command`.
+ * The device is unverified there, so the row stores the unknown-device id.
+ */
+export function auditRefusedFileInput(input: {
+  userId: string;
+  tokenId: string;
+  cliDeviceId: string;
+  op: FileOp;
+  args: unknown;
+}): void {
+  const audit = newFileAudit({ ...input, expiresAt: null });
+  recordFileAudit(audit, { ok: false, code: "invalid_input" });
 }
 
 /** The ONE call site of `recordCliAgentAction` for file ops. Never throws. */
@@ -302,8 +333,19 @@ function serverFailure(record: FileOpRecord, code: FileOpErrorCode): FileOpFailu
   return { ok: false, code, ...(record.mutating ? { outcome: "unknown" as const } : {}) };
 }
 
-function rejectionFailure(reason: FileRejectReason, detail?: FileRejectDetail): FileOpFailure {
-  // The CLI's own refusals are definitive: nothing was committed.
+function rejectionFailure(
+  reason: FileRejectReason,
+  detail: FileRejectDetail | undefined,
+  mutating: boolean,
+): FileOpFailure {
+  // The CLI's own refusals are definitive (nothing was committed), with one
+  // exception: after its commit point the file library can still fail (a
+  // directory sync, a post-rename check) and the CLI cannot send a result that
+  // is too big. For a mutation those two say nothing about whether the change
+  // was made, so the outcome is unknown and the agent must file_stat first.
+  if (mutating && (reason === "io_error" || reason === "too_large")) {
+    return { ok: false, code: reason, outcome: "unknown" };
+  }
   if (reason === "bad_frame") return { ok: false, code: "io_error" };
   return { ok: false, code: reason, ...(detail ? { detail } : {}) };
 }
@@ -373,7 +415,7 @@ function newRecord(input: {
       finishResult(record, frame, text);
     },
     markRejected(reason, detail) {
-      settle(record, rejectionFailure(reason, detail));
+      settle(record, rejectionFailure(reason, detail, record.mutating));
     },
     markMalformed() {
       settle(record, serverFailure(record, "io_error"));
@@ -480,7 +522,8 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
   if (counts.cli >= FILE_OPS_PER_CLI || counts.user >= FILE_OPS_PER_USER) {
     return { ok: false, code: "limit", retryAfterMs: CONCURRENCY_RETRY_AFTER_MS };
   }
-  const slot = takeRateSlot(input.userId, mutating, Date.now());
+  const slotAt = Date.now();
+  const slot = takeRateSlot(input.userId, mutating, slotAt);
   if (!slot.ok) return { ok: false, code: "limit", retryAfterMs: slot.retryAfterMs };
 
   return await new Promise<FileOpOutcome>((resolve) => {
@@ -510,6 +553,7 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
       pendingById.delete(opId);
       record.settled = true;
       audit.registered = false;
+      refundRateSlot(input.userId, mutating, slotAt);
       relaySessionManager.forgetFileOp(record.cliDeviceId, opId);
       const refusal = relaySessionManager.fileOpModeRefusal(input.cliDeviceId, opClass);
       resolve({ ok: false, code: refusal ?? "offline" });

@@ -133,6 +133,7 @@ vi.mock("../relay/cli-file-ops.js", () => ({
   runFileOp: vi.fn(),
   cancelFileOpsForToken: vi.fn(),
   sweepExpiredFileOps: vi.fn(),
+  auditRefusedFileInput: vi.fn(),
 }));
 
 vi.mock("@ws-model-proxy/env/server", () => {

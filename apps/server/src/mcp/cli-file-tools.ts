@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+  auditRefusedFileInput,
   type FileOpFailure,
   type FileOpOutcome,
   type FileOpSuccess,
@@ -35,9 +36,6 @@ export const FILE_TOOLS = [
 ] as const satisfies ReadonlyArray<{ name: string; op: FileOp; target: string }>;
 
 export type FileToolName = (typeof FILE_TOOLS)[number]["name"];
-
-/** Read-class ops run without changing anything; write-class ops need `confirm`. */
-export const FILE_READ_OPS: ReadonlySet<FileOp> = new Set(["read", "stat", "list", "search"]);
 
 /**
  * Largest read window the MCP layer asks for. The CLI's own cap is 128 KiB,
@@ -232,6 +230,16 @@ function fail(outcome: FileOpOutcome): never {
   throw new McpCliFileError(outcome);
 }
 
+/** The only request fields an audit row may see: never content, edits or patterns. */
+function auditArgsOf(input: unknown): Record<string, unknown> {
+  const record = asRecord(input);
+  const out: Record<string, unknown> = {};
+  for (const key of ["path", "root", "from", "paths", "expectedEtag"]) {
+    if (record[key] !== undefined) out[key] = record[key];
+  }
+  return out;
+}
+
 /** Run one tool's op and return the settled success (`{op, result}`), or throw `McpCliFileError`. */
 export async function runForwarderCliFileTool(
   op: FileOp,
@@ -243,13 +251,29 @@ export async function runForwarderCliFileTool(
   // shape is enforced here, and its issues reach the agent as named fields.
   const checked = strictInput(op).safeParse(input);
   if (!checked.success) {
+    auditRefusedFileInput({
+      userId: deps.userId,
+      tokenId: pat.tokenId,
+      cliDeviceId: "",
+      op,
+      args: auditArgsOf(input),
+    });
     throw new McpCliFileError(
       { ok: false, code: "invalid_input" },
       { issues: checked.error.issues },
     );
   }
   const adapted = adaptFileToolInput(op, checked.data);
-  if (adapted === null) return fail({ ok: false, code: "invalid_input" });
+  if (adapted === null) {
+    auditRefusedFileInput({
+      userId: deps.userId,
+      tokenId: pat.tokenId,
+      cliDeviceId: "",
+      op,
+      args: auditArgsOf(checked.data),
+    });
+    return fail({ ok: false, code: "invalid_input" });
+  }
   const outcome = await runFileOp({
     userId: deps.userId,
     tokenId: pat.tokenId,
@@ -376,7 +400,7 @@ export const FILE_ETAG_NOTICE =
   "Every result that touches a file carries etag. Pass it as expectedEtag to edit, write (ifExists replace), rename (overwrite) and delete; a stale etag returns error.code conflict with currentEtag. Line-range edits and replace require expectedEtag. Etags reset when the wsmp daemon restarts: after offline, re-read or file_stat before editing.";
 
 export const FILE_UNKNOWN_OUTCOME_NOTICE =
-  'If a write-class call fails with timeout or offline (error.outcome "unknown"), the change may or may not have been made: call forwarder_cli_file_stat with hash true and compare the etag before retrying. Retries carry expectedEtag, so a repeated write is safe.';
+  'If a write-class call fails with timeout, offline or io_error (error.outcome "unknown"), the change may or may not have been made: call forwarder_cli_file_stat with hash true and compare the etag before retrying. A retry that carries expectedEtag is safe (a stale etag returns conflict); an exact-match edit without expectedEtag is NOT idempotent, so check with file_stat first. The same applies to a write-class io_error or too_large (error.outcome "unknown").';
 
 export const FILE_LIMITS_NOTICE =
   "Limits: 120 file operations per minute per user (30 changing ones), 4 at once per CLI and 16 per user; over the limit returns error.code limit with retryAfterMs. Operations are never queued and time out after 30 seconds.";

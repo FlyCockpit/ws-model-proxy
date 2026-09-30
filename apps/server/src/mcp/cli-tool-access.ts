@@ -44,10 +44,6 @@ const CLI_TOOL_CAPABILITIES: ReadonlyMap<string, CliToolCapability> = new Map([
   ["forwarder_cli_file_delete", "file_write"],
 ]);
 
-export function cliToolCapability(name: string): CliToolCapability | undefined {
-  return CLI_TOOL_CAPABILITIES.get(name);
-}
-
 export function isCliTool(name: string): boolean {
   return CLI_TOOL_CAPABILITIES.has(name);
 }

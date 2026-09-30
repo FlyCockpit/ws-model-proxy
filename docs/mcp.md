@@ -134,8 +134,10 @@ until then a supervised node refuses file tools. `listCliDevices` reports
 an agent can see what works without trial calls. The CLI refuses every file tool as
 `unsupported` when it runs as root unless `wsmp config set-file-tools-as-root on`.
 The CLI re-checks its own mode on every operation; a server request never overrides it.
-The protected set (the wsmp state directory, `service.env`, `config.json` for writes,
-`/proc`, `/sys`, `/dev` and other special files) is refused as `path_denied`.
+The protected set (wsmp's named state files `device-auth.json`, `terminal-identity.json`,
+the terminal approval files, `instances.json` and `relay-control.sock`; `service.env`;
+`config.json` and its lock for writes; and the special trees `/proc`, `/sys` and `/dev`)
+is refused as `path_denied` or `special_file`.
 
 **Masking boundary.** The CLI masks, before anything is windowed: (1) in dotenv and env
 files (`.env`, `*.env`, `.envrc`, `service.env`) every value, shown as `KEY=⟦redacted:N⟧`

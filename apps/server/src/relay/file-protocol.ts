@@ -358,20 +358,6 @@ export const FILE_DATA_FIELDS = {
 } as const;
 export type FileDataOp = keyof typeof FILE_DATA_FIELDS;
 export const fileDataFieldSchema = z.enum(["text", "entries", "matches", "diff"]);
-export type FileDataField = z.infer<typeof fileDataFieldSchema>;
-
-/** Raw (strict, per op) result shapes by op. */
-export const fileResultSchemas = {
-  read: readResultSchema,
-  stat: statResultSchema,
-  list: listResultSchema,
-  search: searchResultSchema,
-  edit: editResultSchema,
-  write: writeResultSchema,
-  rename: renameResultSchema,
-  mkdir: mkdirResultSchema,
-  delete: deleteResultSchema,
-} as const;
 
 /** `op` + `result` as a discriminated union (also the `supervised.done.fileResult` body). */
 export const fileOpResultSchema = z.discriminatedUnion("op", [

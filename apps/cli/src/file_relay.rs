@@ -265,16 +265,40 @@ fn frames_for(op_id: &str, op: &str, outcome: FileResult<Value>) -> (Vec<FileFra
             );
         }
     };
-    let too_large = || {
-        (
-            vec![FileFrame::Control(rejected(op_id, "too_large", None))],
-            "too_large".to_string(),
-        )
-    };
-    let (result, data) = match split_result(op, value) {
-        Ok(split) => split,
-        Err(_) => return too_large(),
-    };
+    let mutating = matches!(op, "edit" | "write" | "rename" | "mkdir" | "delete");
+    let mut value = value;
+    if let Some(frames) = encode_result(op_id, op, value.clone()) {
+        return (frames, "ok".to_string());
+    }
+    if mutating {
+        // The change is already committed: a result that is too big must never
+        // become a definitive refusal. Shed the optional bulk (hunk list, then
+        // the diff) and encode again.
+        for field in ["hunks", "diff"] {
+            if let Some(object) = value.as_object_mut() {
+                object.remove(field);
+            }
+            if let Some(frames) = encode_result(op_id, op, value.clone()) {
+                return (frames, "ok".to_string());
+            }
+        }
+        // Still too big (not expected): say the outcome is not known. The server
+        // reports a mutating `io_error` as `outcome: "unknown"`.
+        return (
+            vec![FileFrame::Control(rejected(op_id, "io_error", None))],
+            "io_error".to_string(),
+        );
+    }
+    (
+        vec![FileFrame::Control(rejected(op_id, "too_large", None))],
+        "too_large".to_string(),
+    )
+}
+
+/// The wire frames of one successful result, or `None` when it cannot be sent
+/// (a spilled body over one frame, or a control frame over 64 KiB).
+fn encode_result(op_id: &str, op: &str, value: Value) -> Option<Vec<FileFrame>> {
+    let (result, data) = split_result(op, value).ok()?;
     let (data_field, body_bytes, body) = match data {
         Some((field, bytes)) => (Some(field.to_string()), Some(bytes.len()), Some(bytes)),
         None => (None, None, None),
@@ -288,7 +312,7 @@ fn frames_for(op_id: &str, op: &str, outcome: FileResult<Value>) -> (Vec<FileFra
     };
     match serde_json::to_string(&message) {
         Ok(text) if text.len() <= RELAY_JSON_CONTROL_MAX_BYTES => {}
-        _ => return too_large(),
+        _ => return None,
     }
     let mut frames = vec![FileFrame::Control(message)];
     if let Some(bytes) = body {
@@ -299,7 +323,7 @@ fn frames_for(op_id: &str, op: &str, outcome: FileResult<Value>) -> (Vec<FileFra
             bytes,
         ));
     }
-    (frames, "ok".to_string())
+    Some(frames)
 }
 
 /// THE settle point: every op, however it ends (result, error, refusal, bad

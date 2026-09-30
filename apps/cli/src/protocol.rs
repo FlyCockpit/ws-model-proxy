@@ -3431,7 +3431,7 @@ mod relay_28_vectors {
     #[test]
     fn a_malformed_file_op_is_rejected_by_name_and_other_bad_file_frames_are_ignored() {
         let id = "AAECAwQFBgcICQoLDA0ODw";
-        // Missing `args`: unparseable, but it names its op.
+        // Missing `args`: unparsable, but it names its op.
         let missing = format!(r#"{{"type":"file.op","opId":"{id}","op":"read"}}"#);
         assert!(parse_server_control(&missing).is_err());
         assert!(matches!(
