@@ -1,4 +1,5 @@
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
+import { notifyUserBanned, onUserBanned } from "@ws-model-proxy/auth/user-ban-listeners";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -12,6 +13,7 @@ import {
   parseRelayBinaryFrame,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
 } from "./protocol.js";
+import { cancelRelayWorkForBannedUser } from "./user-ban.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -37,6 +39,7 @@ const { relaySessionManager } = await import("./session-manager.js");
 const {
   auditRefusedFileInput,
   cancelFileOpsForToken,
+  cancelFileOpsForUser,
   FILE_MUTATIONS_PER_MINUTE_PER_USER,
   FILE_OP_DEADLINE_MS,
   FILE_OPS_PER_CLI,
@@ -2547,6 +2550,240 @@ describe("cli file ops", () => {
       expect(sweepExpiredFileOps(Date.now())).toBe(0);
       expect(sweepExpiredFileOps(Date.now() + 6_000)).toBe(1);
       await expect(outcome).resolves.toEqual({ ok: false, code: "token_inactive" });
+    });
+  });
+  describe("ban fence (#159)", () => {
+    let unsubscribe: () => void;
+    beforeEach(() => {
+      // The same subscription apps/server/src/app.ts makes.
+      unsubscribe = onUserBanned(cancelRelayWorkForBannedUser);
+    });
+    afterEach(async () => {
+      unsubscribe();
+      await resetRelaySessions();
+      resetFileOpsForTests();
+    });
+
+    /** A second owner with their own device, to prove the fence is per user. */
+    async function connectOtherUser() {
+      const other = new FakeSocket();
+      relaySessionManager.acceptAuthenticatedSocket({
+        socket: other,
+        identity: { ...identity, id: "token-id-other", userId: "other-user" },
+        now,
+      });
+      await relaySessionManager.handleTextFrame(other, hello("laptop", "unsupervised"), now);
+      other.sends.length = 0;
+      db.cliDevice.findUnique.mockImplementation((args: { where: { id: string } }) => ({
+        id: args.where.id,
+        userId: args.where.id === "laptop" ? "other-user" : "user-id",
+        mcpCommandMode: "UNSUPERVISED",
+      }));
+      return other;
+    }
+
+    /** A promise's state without awaiting it: true once it has settled. */
+    function tracked<T>(promise: Promise<T>) {
+      const state = { settled: false };
+      void promise.then(
+        () => {
+          state.settled = true;
+        },
+        () => {
+          state.settled = true;
+        },
+      );
+      return state;
+    }
+
+    it("a ban during a long read and a long mutating op cancels both, and only that user's", async () => {
+      const socket = await connect();
+      const other = await connectOtherUser();
+      // Three ops in flight, none answered by the CLI: they would run to their 30 s deadline.
+      const read = start(socket, "read", readArgs);
+      const edit = start(socket, "edit", editArgs, { tokenId: "second-token" });
+      const otherRead = start(other, "read", readArgs, {
+        userId: "other-user",
+        tokenId: "token-other",
+        cliDeviceId: "laptop",
+      });
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(2));
+      await waitFor(() => expect(other.frames("file.op")).toHaveLength(1));
+      const states = [tracked(read), tracked(edit), tracked(otherRead)];
+      await flush();
+      expect(states.map((state) => state.settled)).toEqual([false, false, false]);
+
+      // The ban commits; the post-commit notification runs the listener.
+      await notifyUserBanned("user-id");
+
+      // Every token of the banned user ends at once (not at the deadline). The mutation's outcome is unknown.
+      await expect(read).resolves.toEqual({ ok: false, code: "token_inactive" });
+      await expect(edit).resolves.toEqual({
+        ok: false,
+        code: "token_inactive",
+        outcome: "unknown",
+      });
+      expect(socket.frames("file.cancel").map((frame) => frame.opId)).toEqual(
+        socket.frames("file.op").map((frame) => frame.opId),
+      );
+      // Their socket is not closed by a ban.
+      expect(socket.closes).toEqual([]);
+      // The other user's op is untouched, still completes normally, and was never cancelled.
+      expect(states[2]?.settled).toBe(false);
+      expect(other.frames("file.cancel")).toEqual([]);
+      await answer(other, resultFor(lastOpId(other), "read", readResult));
+      await expect(otherRead).resolves.toMatchObject({ ok: true });
+      // A cancelled op leaves no record or slot behind (the mocked owner row is unbanned here).
+      const next = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(3));
+      await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+      await expect(next).resolves.toMatchObject({ ok: true });
+    });
+
+    it("refuses an op whose admission is still reading when the ban lands", async () => {
+      const socket = await connect();
+      let release!: (row: unknown) => void;
+      let entered!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      // The ban has committed but the owner read already returned the pre-ban row.
+      db.user.findUnique.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release = resolve;
+            entered();
+          }),
+      );
+      const started = runFileOp({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+        op: "read",
+        args: readArgs,
+      });
+      await reached;
+      await notifyUserBanned("user-id");
+      release({ banned: false, banExpires: null, deletionRequestedAt: null });
+      await expect(started).resolves.toEqual({ ok: false, code: "token_inactive" });
+      expect(socket.frames("file.op")).toEqual([]);
+      expect(openCliAgentAdmissionCountForTests()).toBe(0);
+    });
+
+    it("cancelFileOpsForUser alone also refuses an op still in admission, and ends a registered one", async () => {
+      const socket = await connect();
+      let release!: (row: unknown) => void;
+      let entered!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      db.user.findUnique.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            release = resolve;
+            entered();
+          }),
+      );
+      const reading = runFileOp({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+        op: "read",
+        args: readArgs,
+      });
+      await reached;
+      cancelFileOpsForUser("user-id");
+      release({ banned: false, banExpires: null, deletionRequestedAt: null });
+      await expect(reading).resolves.toEqual({ ok: false, code: "token_inactive" });
+      expect(socket.frames("file.op")).toEqual([]);
+      const running = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      cancelFileOpsForUser("user-id");
+      await expect(running).resolves.toEqual({ ok: false, code: "token_inactive" });
+    });
+
+    it("does not mark another user's open admission", async () => {
+      const socket = await connect();
+      let release!: (row: unknown) => void;
+      let entered!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      db.user.findUnique.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release = resolve;
+            entered();
+          }),
+      );
+      const started = runFileOp({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+        op: "read",
+        args: readArgs,
+      });
+      await reached;
+      await notifyUserBanned("someone-else");
+      release({ banned: false, banExpires: null, deletionRequestedAt: null });
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+      await expect(started).resolves.toMatchObject({ ok: true });
+    });
+
+    it("an op started after the ban is refused by the owner read, and the ban sweep leaves later ops of an unbanned user alone", async () => {
+      const socket = await connect();
+      db.user.findUnique.mockResolvedValue({
+        banned: true,
+        banExpires: null,
+        deletionRequestedAt: null,
+      });
+      await notifyUserBanned("user-id");
+      await expect(
+        runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: readArgs }),
+      ).resolves.toEqual({ ok: false, code: "token_inactive" });
+      expect(socket.frames("file.op")).toEqual([]);
+      // Unbanned again: the earlier sweep holds no state, so a new op runs.
+      db.user.findUnique.mockResolvedValue({
+        banned: false,
+        banExpires: null,
+        deletionRequestedAt: null,
+      });
+      const again = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+      await expect(again).resolves.toMatchObject({ ok: true });
+    });
+
+    it("revoking the CLI credential during a long read and a long mutating op ends both (the revoke half of #159)", async () => {
+      const socket = await connect();
+      const read = start(socket, "read", readArgs);
+      const edit = start(socket, "edit", editArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(2));
+      const ids = socket.frames("file.op").map((frame) => frame.opId);
+      // Another credential's revoke leaves them alone.
+      await relaySessionManager.closeSessionsForRevokedCredentials({
+        kind: "cliToken",
+        ids: ["some-other-token"],
+      });
+      expect(socket.closes).toEqual([]);
+      // What `onCliCredentialsRevoked` runs after the revoking write committed.
+      await relaySessionManager.closeSessionsForRevokedCredentials({
+        kind: "cliToken",
+        ids: [identity.id],
+      });
+      await expect(read).resolves.toEqual({ ok: false, code: "offline" });
+      await expect(edit).resolves.toEqual({ ok: false, code: "offline", outcome: "unknown" });
+      expect(socket.frames("file.cancel").map((frame) => frame.opId)).toEqual(ids);
+      expect(socket.closes).toEqual([{ code: 1008, reason: "access_denied" }]);
+    });
+
+    it("records the cancelled op in the audit as cancelled with token_inactive", async () => {
+      const socket = await connect();
+      const outcome = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await notifyUserBanned("user-id");
+      await outcome;
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.objectContaining({ outcome: "cancelled", reason: "token_inactive" }),
+      );
     });
   });
 });

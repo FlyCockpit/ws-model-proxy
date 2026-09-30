@@ -23,6 +23,7 @@ import {
   readCliAgentAdmission,
   resetCliAgentAdmissionsForTests,
   revokeOpenCliAgentAdmissions,
+  revokeOpenCliAgentAdmissionsForUser,
 } from "./cli-agent-admission.js";
 import { recordCliAgentAction } from "./cli-agent-audit.js";
 import { commandAuditDigest } from "./command-audit-digest.js";
@@ -518,17 +519,39 @@ export function waitCliCommand(
   });
 }
 
-export function cancelCommandsForToken(tokenId: string) {
-  // Starts still between their first await and their record refuse.
-  revokeOpenCliAgentAdmissions(tokenId);
-  for (const command of commandsById.values()) {
-    if (command.tokenId !== tokenId || command.status !== "running") continue;
+/** Who a cancel sweep ends: every record of one token, or of one user. */
+type CancelScope = { tokenId: string } | { userId: string };
+
+function inCancelScope(record: { tokenId: string; userId: string }, scope: CancelScope): boolean {
+  return "tokenId" in scope ? record.tokenId === scope.tokenId : record.userId === scope.userId;
+}
+
+/** The ONE sweep behind the token and user cancels: running exec and active supervised requests. */
+function cancelCommandsIn(scope: CancelScope, reason: "token_revoked" | "user_banned") {
+  for (const command of [...commandsById.values()]) {
+    if (!inCancelScope(command, scope) || command.status !== "running") continue;
     relaySessionManager.dispatchExecCancel(command.cliDeviceId, command.commandId);
   }
   for (const record of [...supervisedById.values()]) {
-    if (record.tokenId !== tokenId || !isActiveSupervised(record.status)) continue;
-    endSupervisedFromServer(record, "token_revoked");
+    if (!inCancelScope(record, scope) || !isActiveSupervised(record.status)) continue;
+    endSupervisedFromServer(record, reason);
   }
+}
+
+export function cancelCommandsForToken(tokenId: string) {
+  // Starts still between their first await and their record refuse.
+  revokeOpenCliAgentAdmissions(tokenId);
+  cancelCommandsIn({ tokenId }, "token_revoked");
+}
+
+/**
+ * A user was banned: end every running command and active supervised request
+ * they own, and refuse starts still reading (#159). Covers every token of the
+ * user, so a token minted or used after the ban started is ended too.
+ */
+export function cancelCommandsForUser(userId: string) {
+  revokeOpenCliAgentAdmissionsForUser(userId);
+  cancelCommandsIn({ userId }, "user_banned");
 }
 
 /** Test isolation. Production callers must not drop in-flight commands. */
@@ -725,7 +748,7 @@ function exitSupervised(
  */
 function endSupervisedFromServer(
   record: SupervisedRecord,
-  reason: "token_revoked" | "token_expired" | "stop_unanswered",
+  reason: "token_revoked" | "user_banned" | "token_expired" | "stop_unanswered",
 ) {
   if (record.status === "awaiting_output_review") {
     // The command already ran; nobody released its output.

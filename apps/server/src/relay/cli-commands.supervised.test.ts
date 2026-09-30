@@ -4,9 +4,11 @@ import {
   mcpCommandModeFromDb,
   mcpCommandRefusals,
 } from "@ws-model-proxy/api/lib/mcp-command-mode";
+import { notifyUserBanned, onUserBanned } from "@ws-model-proxy/auth/user-ban-listeners";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { encodeRelayBinaryFrame, RELAY_REQUEST_BODY_WINDOW_CHUNKS } from "./protocol.js";
+import { cancelRelayWorkForBannedUser } from "./user-ban.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -1141,6 +1143,97 @@ describe("supervised commands", () => {
         rejectionReason: "rejected",
       });
       expect(JSON.stringify(snapshot(request.commandId))).not.toContain("unknown-code-9f3a");
+    });
+  });
+
+  describe("ban fence (#159)", () => {
+    let unsubscribe: () => void;
+    beforeEach(() => {
+      // The same subscription apps/server/src/app.ts makes.
+      unsubscribe = onUserBanned(cancelRelayWorkForBannedUser);
+    });
+    afterEach(() => unsubscribe());
+
+    it("a ban ends every waiting, running and unreleased request of the user, through any token", async () => {
+      const socket = await connect();
+      // Output waiting for review first: it counts toward no live limit.
+      const awaitingReview = await spawnedAndAccepted(socket, { tokenId: "token-c" });
+      await say(socket, {
+        type: "supervised.done",
+        commandId: awaitingReview.commandId,
+        exitCode: 0,
+        review: true,
+      });
+      expect(snapshot(awaitingReview.commandId, "token-c")?.status).toBe("awaiting_output_review");
+      const live = await spawnedAndAccepted(socket, { tokenId: "token-d" });
+      expect(snapshot(live.commandId, "token-d")?.status).toBe("running");
+      const waiting = await started({ tokenId: "token-a" });
+      await say(socket, { type: "term.spawned", ...waiting });
+      expect(snapshot(waiting.commandId, "token-a")?.status).toBe("awaiting_user");
+      socket.sends.length = 0;
+
+      await notifyUserBanned("user-id");
+
+      expect(snapshot(waiting.commandId, "token-a")).toMatchObject({
+        status: "cancelled",
+        rejectionReason: "user_banned",
+      });
+      expect(snapshot(live.commandId, "token-d")).toMatchObject({
+        status: "cancelled",
+        rejectionReason: "user_banned",
+      });
+      // The unreleased output is withheld for good, never handed to the agent.
+      expect(snapshot(awaitingReview.commandId, "token-c")).toMatchObject({
+        status: "exited",
+        output: { mode: "redacted" },
+        shared: null,
+      });
+      // The CLI is told to close every terminal; nothing else keeps running.
+      expect(
+        sent(socket, "supervised.cancel")
+          .map((message) => message.commandId)
+          .sort(),
+      ).toEqual([waiting.commandId, live.commandId, awaitingReview.commandId].sort());
+      expect(listPendingSupervised("user-id")).toEqual([]);
+    });
+
+    it("leaves another user's requests alone and accepts new ones after", async () => {
+      const socket = await connect();
+      const mine = await started({ tokenId: "token-a" });
+      await say(socket, { type: "term.spawned", ...mine });
+      await notifyUserBanned("someone-else");
+      expect(snapshot(mine.commandId, "token-a")?.status).toBe("awaiting_user");
+      // Only the banned user's own requests end; a later start (the mocks say unbanned) is admitted.
+      await notifyUserBanned("user-id");
+      expect(snapshot(mine.commandId, "token-a")?.status).toBe("cancelled");
+      await expect(start()).resolves.toMatchObject({ ok: true });
+    });
+
+    it("refuses a start whose admission is still reading when the ban lands", async () => {
+      const socket = await connect();
+      let release: () => void = () => {};
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let entered: () => void = () => {};
+      const reached = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const owner = db.user.findUnique.getMockImplementation();
+      db.user.findUnique.mockImplementation(
+        async (args: { select?: { deletionRequestedAt?: boolean } }) => {
+          if (!args.select?.deletionRequestedAt) return owner?.(args);
+          entered();
+          await gate;
+          return { banned: false, banExpires: null, deletionRequestedAt: null };
+        },
+      );
+      const pending = start();
+      await reached;
+      await notifyUserBanned("user-id");
+      release();
+      await expect(pending).resolves.toEqual({ ok: false, error: "token_inactive" });
+      expect(socket.sends).toEqual([]);
     });
   });
 

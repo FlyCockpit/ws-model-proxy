@@ -1,8 +1,10 @@
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
+import { notifyUserBanned, onUserBanned } from "@ws-model-proxy/auth/user-ban-listeners";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { commandAuditDigest } from "./command-audit-digest.js";
 import { encodeRelayBinaryFrame, RELAY_REQUEST_BODY_WINDOW_CHUNKS } from "./protocol.js";
+import { cancelRelayWorkForBannedUser } from "./user-ban.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -29,6 +31,7 @@ const audit = recordCliAgentAction as unknown as MockInstance;
 const { relaySessionManager } = await import("./session-manager.js");
 const {
   cancelCommandsForToken,
+  cancelCommandsForUser,
   resetCliCommandsForTests,
   snapshotCliCommand,
   startCliCommand,
@@ -1110,6 +1113,135 @@ describe("cli commands", () => {
         ["refused", "rejected"],
       ]);
       expect(JSON.stringify(events())).not.toContain("unknown-code-9f3a");
+    });
+  });
+
+  describe("ban fence (#159)", () => {
+    let unsubscribe: () => void;
+    beforeEach(() => {
+      // The same subscription apps/server/src/app.ts makes.
+      unsubscribe = onUserBanned(cancelRelayWorkForBannedUser);
+    });
+    afterEach(() => unsubscribe());
+
+    const execCancels = (socket: FakeSocket) =>
+      socket.sends
+        .filter((send): send is string => typeof send === "string")
+        .map((send) => JSON.parse(send) as { type: string; commandId?: string })
+        .filter((frame) => frame.type === "exec.cancel");
+
+    it("a ban during long-running commands cancels every command of that user on the CLI, and only theirs", async () => {
+      const socket = await connect("desktop");
+      // A second owner's CLI and command.
+      const otherSocket = new FakeSocket();
+      relaySessionManager.acceptAuthenticatedSocket({
+        socket: otherSocket,
+        identity: { ...identity, id: "token-id-other", userId: "other-user" },
+        now,
+      });
+      await relaySessionManager.handleTextFrame(
+        otherSocket,
+        hello("laptop", { mcpCommandMode: "unsupervised" }),
+        now,
+      );
+      db.cliDevice.findUnique.mockImplementation(async (args: { where: { id: string } }) => ({
+        id: args.where.id,
+        userId: args.where.id === "laptop" ? "other-user" : "user-id",
+        mcpCommandMode: "UNSUPERVISED",
+      }));
+      socket.sends.length = 0;
+      otherSocket.sends.length = 0;
+      const start = (userId: string, tokenId: string, cliDeviceId: string, command: string) =>
+        startCliCommand({ userId, tokenId, expiresAt: null, cliDeviceId, command });
+      // Two tokens of the banned user and one command of another user, none finished.
+      const first = await start("user-id", "token-a", "desktop", "sleep 3600");
+      const second = await start("user-id", "token-b", "desktop", "sleep 3601");
+      const others = await start("other-user", "token-o", "laptop", "sleep 3602");
+      if (!first.ok || !second.ok || !others.ok) throw new Error("expected three running commands");
+      expect(snapshotCliCommand(first.commandId, "user-id", "token-a")?.status).toBe("running");
+
+      await notifyUserBanned("user-id");
+
+      expect(execCancels(socket).map((frame) => frame.commandId)).toEqual([
+        first.commandId,
+        second.commandId,
+      ]);
+      expect(execCancels(otherSocket)).toEqual([]);
+      // The socket stays open; the CLI answers the cancel with its exec.done like a token revoke.
+      expect(socket.closes).toEqual([]);
+    });
+
+    it("revoking the CLI credential ends a long-running command on the CLI too (the revoke half of #159)", async () => {
+      const socket = await connect("desktop");
+      socket.sends.length = 0;
+      const started = await startCliCommand({
+        userId: "user-id",
+        tokenId: "token-a",
+        expiresAt: null,
+        cliDeviceId: "desktop",
+        command: "sleep 3600",
+      });
+      if (!started.ok) throw new Error("start refused");
+      await relaySessionManager.closeSessionsForRevokedCredentials({
+        kind: "cliToken",
+        ids: [identity.id],
+      });
+      expect(execCancels(socket).map((frame) => frame.commandId)).toEqual([started.commandId]);
+      expect(socket.closes).toEqual([{ code: 1008, reason: "access_denied" }]);
+    });
+
+    it("refuses a start whose admission is still reading when the ban lands", async () => {
+      const socket = await connect("desktop");
+      socket.sends.length = 0;
+      const owner = pauseOwnerRead();
+      const started = startCliCommand({
+        userId: "user-id",
+        tokenId: "token",
+        expiresAt: null,
+        cliDeviceId: "desktop",
+        command: "pwd",
+      });
+      await owner.reached;
+      await notifyUserBanned("user-id");
+      owner.release();
+      await expect(started).resolves.toEqual({ ok: false, error: "token_inactive" });
+      expect(execStarts(socket)).toEqual([]);
+    });
+
+    it("cancelCommandsForUser alone also refuses a start still in admission", async () => {
+      const socket = await connect("desktop");
+      socket.sends.length = 0;
+      const owner = pauseOwnerRead();
+      const started = startCliCommand({
+        userId: "user-id",
+        tokenId: "token",
+        expiresAt: null,
+        cliDeviceId: "desktop",
+        command: "pwd",
+      });
+      await owner.reached;
+      cancelCommandsForUser("user-id");
+      owner.release();
+      await expect(started).resolves.toEqual({ ok: false, error: "token_inactive" });
+      expect(execStarts(socket)).toEqual([]);
+    });
+
+    it("does not refuse a start whose admission reads for another user's ban", async () => {
+      const socket = await connect("desktop");
+      socket.sends.length = 0;
+      const owner = pauseOwnerRead();
+      const started = startCliCommand({
+        userId: "user-id",
+        tokenId: "token",
+        expiresAt: null,
+        cliDeviceId: "desktop",
+        command: "pwd",
+      });
+      await owner.reached;
+      await notifyUserBanned("someone-else");
+      owner.release();
+      await expect(started).resolves.toMatchObject({ ok: true });
+      expect(execStarts(socket)).toHaveLength(1);
     });
   });
 });

@@ -257,6 +257,15 @@ under the other spelling between the check and the rename can lose that entry.
 server before the `wsmp` CLI: a server that predates it treats the CLI's rejection frame
 as malformed and drops the relay session (the retained files stay on disk).
 
+**Revocation and bans.** Revoking or narrowing a personal token, revoking a CLI
+credential or device, and deleting a user end that principal's in-flight file operations and
+commands at once (`token_inactive` or `offline`; a write-class call carries
+`error.outcome: "unknown"`). Banning a user (the dashboard archive action, or the admin ban
+or an admin update that sets the ban) does the same for every token the user holds, including
+commands still waiting for a person's confirmation, and refuses calls still being admitted;
+the CLI's relay connection stays up. The cancel runs in the server process that performed the
+ban: another replica ends the work at its deadline and refuses the user's next call.
+
 **Limits.** 120 file operations per minute per user, of which at most 30 change files;
 4 in flight per CLI and 16 per user. Over a limit the error is `limit` with `retryAfterMs`.
 Operations are never queued and time out after 30 seconds (search and hashing have shorter
