@@ -126,6 +126,7 @@ and scopes are reread at admission, and narrowing cancels pending operations.
 and the CLI's own `wsmp config set-mcp-commands` mode in its live hello.
 The read grant requires ALL of dashboard `mcpFileRead`, live CLI `mcpFileRead`,
 and live `fileRootsConfigured`; missing or stale features never authorize it.
+If a post-commit device-grant refresh cannot read the current policy, live terminal, command, and file authority (including unsupervised access) is withdrawn and pending work is cancelled until a successful refresh or reconnect.
 
 | Effective mode | Read grant | read, stat, list, search | edit, write, rename, mkdir, delete |
 | --- | --- | --- | --- |

@@ -5358,6 +5358,36 @@ describe("setCliDeviceFeatureGrants", () => {
     expect(hook).not.toHaveBeenCalled();
   });
 
+  it.each([false, true])(
+    "only invokes refresh after a successful commit (committed=%s)",
+    async (committed) => {
+      db.cliDevice.findUnique.mockResolvedValue(deviceRow());
+      const hook = vi.fn(() => {
+        throw new Error("refresh failed");
+      });
+      if (committed) {
+        db.cliDevice.update.mockResolvedValue({
+          id: "cli-id",
+          allowHumanTerminal: false,
+          mcpCommandMode: "OFF",
+          mcpFileRead: false,
+        });
+      } else {
+        db.cliDevice.update.mockRejectedValueOnce(new Error("commit failed"));
+      }
+      await expect(
+        grantsClient("user-id", hook).setCliDeviceFeatureGrants({
+          cliDeviceId: "cli-id",
+          fileRead: false,
+        }),
+      ).rejects.toThrow(committed ? "refresh failed" : "commit failed");
+      expect(db.cliDevice.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { mcpFileRead: false } }),
+      );
+      expect(hook).toHaveBeenCalledTimes(committed ? 1 : 0);
+    },
+  );
+
   it("summarizes granted reads using live consent only, and preserves the reported fields", async () => {
     db.cliDevice.findMany.mockResolvedValue([
       {

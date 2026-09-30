@@ -1743,14 +1743,10 @@ mod tests {
         std::os::unix::fs::symlink(&models, &alias).expect("root alias");
         let good = validate_file_roots(&[PathBuf::from("~/models")], Some(&home)).expect("tilde");
         assert_eq!(good, vec![models.clone()]);
-        // macOS (APFS) refuses non-UTF-8 names, so this row is Linux-only.
-        #[cfg(target_os = "linux")]
-        let non_utf8 = {
-            use std::os::unix::ffi::OsStrExt;
-            let path = home.join(std::ffi::OsStr::from_bytes(b"non-utf8-\xff"));
-            std::fs::create_dir(&path).expect("non-UTF-8 directory");
-            path
-        };
+        // Rejected by the UTF-8 check before any filesystem access, so nothing is created
+        // (macOS APFS refuses to create such names).
+        use std::os::unix::ffi::OsStrExt;
+        let non_utf8 = home.join(std::ffi::OsStr::from_bytes(b"non-utf8-\xff"));
         let many: Vec<_> = (0..=MAX_FILE_ROOTS)
             .map(|n| {
                 let p = home.join(format!("root-{n}"));
@@ -1769,7 +1765,6 @@ mod tests {
             vec![models.clone(), alias.clone()],
             vec![home.join("models/../models")],
             many,
-            #[cfg(target_os = "linux")]
             vec![non_utf8],
             vec![PathBuf::from(format!("/{}", "x".repeat(4096)))],
         ];

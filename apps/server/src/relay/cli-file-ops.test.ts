@@ -247,6 +247,16 @@ function flush() {
   return new Promise<void>((resolve) => setImmediate(resolve));
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 function lastOpId(socket: FakeSocket): string {
   const frames = socket.frames("file.op");
   const opId = frames[frames.length - 1]?.opId;
@@ -472,6 +482,230 @@ describe("cli file ops", () => {
       }
     },
   );
+
+  describe("post-commit device grant refresh", () => {
+    const policy = (mode: Mode, mcpFileRead: boolean) => ({
+      id: "desktop",
+      userId: "user-id",
+      allowHumanTerminal: false,
+      mcpCommandMode: mode.toUpperCase(),
+      mcpFileRead,
+    });
+    const queue = () =>
+      Reflect.get(relaySessionManager, "featureGrantsRefreshByCliDeviceId") as Map<
+        string,
+        Promise<void>
+      >;
+
+    async function grantedRead(mode: Mode) {
+      db.cliDevice.findUnique.mockResolvedValue(policy(mode, true));
+      db.mcpPersonalToken.findFirst.mockResolvedValue({
+        ...liveToken(),
+        allowCliCommands: false,
+        allowCliFileRead: true,
+        scopes: ["mcp:read"],
+      });
+      const socket = await connect("desktop", mode, true, true);
+      await relaySessionManager.onCliFeatureGrantsChanged("desktop");
+      const outcome = runFileOp({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+        op: "read",
+        args: readArgs,
+      });
+      await flush();
+      expect(socket.frames("file.op")).toHaveLength(1);
+      return { socket, outcome, opId: lastOpId(socket) };
+    }
+
+    // Missing rows already failed closed; pin that default alongside read errors.
+    it.each(
+      (["off", "supervised", "unsupervised"] as const).flatMap((mode) =>
+        (["throws", "missing"] as const).map((failure) => ({ mode, failure })),
+      ),
+    )(
+      "$failure refresh on $mode withdraws authority and recovers on retry",
+      async ({ mode, failure }) => {
+        const { socket, outcome, opId } = await grantedRead(mode);
+        const metrics = vi.spyOn(relaySessionManager, "onRemoteMetricSourcesChanged");
+        // Durable revocation precedes the hook, but its policy read is unavailable.
+        db.cliDevice.findUnique.mockResolvedValue(policy("off", false));
+        if (failure === "throws")
+          db.cliDevice.findUnique.mockRejectedValueOnce(new Error("db down"));
+        else db.cliDevice.findUnique.mockResolvedValueOnce(null);
+        const refresh = relaySessionManager.onCliFeatureGrantsChanged("desktop");
+        if (failure === "throws") await expect(refresh).rejects.toThrow("db down");
+        else await refresh;
+        expect(metrics).toHaveBeenCalledTimes(1);
+        expect(socket.frames("file.cancel")).toEqual([{ type: "file.cancel", opId }]);
+        await expect(outcome).resolves.toEqual({ ok: false, code: "grant_disabled" });
+        expect(relaySessionManager.fileOpModeRefusal("desktop", "read")).toBe("grant_disabled");
+        expect(queue().size).toBe(0);
+        await answer(socket, resultFor(opId, "read", readResult));
+        expect(audit.record).toHaveBeenCalledTimes(1);
+        expect(audit.record).toHaveBeenLastCalledWith(
+          expect.objectContaining({ outcome: "cancelled", reason: "grant_disabled" }),
+        );
+
+        db.cliDevice.findUnique.mockResolvedValue(policy(mode, true));
+        await relaySessionManager.onCliFeatureGrantsChanged("desktop");
+        const retry = runFileOp({
+          ...OP_TOKEN,
+          cliDeviceId: "desktop",
+          op: "read",
+          args: readArgs,
+        });
+        await flush();
+        expect(socket.frames("file.op")).toHaveLength(2);
+        await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+        await expect(retry).resolves.toMatchObject({ ok: true });
+        expect(metrics).toHaveBeenCalledTimes(2);
+        expect(queue().size).toBe(0);
+      },
+    );
+
+    // These legitimate rows pin the existing verdict-based reconciliation
+    // through the refresh hook, including unchanged unsupervised permission.
+    it.each([
+      { mode: "off", readGrant: true, refusal: null },
+      { mode: "off", readGrant: false, refusal: "grant_disabled" },
+      { mode: "supervised", readGrant: false, refusal: "supervised_only" },
+      { mode: "unsupervised", readGrant: false, refusal: null },
+    ] as const)(
+      "successful $mode refresh readGrant=$readGrant cancels only lost permission",
+      async ({ mode, readGrant, refusal }) => {
+        const { socket, outcome, opId } = await grantedRead(mode);
+        db.cliDevice.findUnique.mockResolvedValue(policy(mode, readGrant));
+        await relaySessionManager.onCliFeatureGrantsChanged("desktop");
+        expect(socket.frames("file.cancel")).toHaveLength(refusal === null ? 0 : 1);
+        await answer(socket, resultFor(opId, "read", readResult));
+        await expect(outcome).resolves.toMatchObject(
+          refusal === null ? { ok: true } : { ok: false, code: refusal },
+        );
+        expect(queue().size).toBe(0);
+      },
+    );
+
+    it.each(
+      ([false, true] as const).flatMap((latestGrant) =>
+        (["A-first", "B-first"] as const).map((completionOrder) => ({
+          latestGrant,
+          completionOrder,
+        })),
+      ),
+    )(
+      "serializes $completionOrder reads, retaining latestGrant=$latestGrant",
+      async ({ latestGrant, completionOrder }) => {
+        const { socket, outcome, opId } = await grantedRead("off");
+        const metrics = vi
+          .spyOn(relaySessionManager, "onRemoteMetricSourcesChanged")
+          .mockResolvedValue(false);
+        const firstRead = deferred<ReturnType<typeof policy>>();
+        const secondRead = deferred<ReturnType<typeof policy>>();
+        db.cliDevice.findUnique.mockClear();
+        db.cliDevice.findUnique
+          .mockImplementationOnce(() => firstRead.promise)
+          .mockImplementationOnce(() => secondRead.promise);
+        const first = relaySessionManager.onCliFeatureGrantsChanged("desktop");
+        await flush();
+        const second = relaySessionManager.onCliFeatureGrantsChanged("desktop");
+        await flush();
+        // B must not even start its DB read while A owns the device queue.
+        expect(db.cliDevice.findUnique).toHaveBeenCalledTimes(1);
+        if (completionOrder === "B-first") secondRead.resolve(policy("off", latestGrant));
+        firstRead.resolve(policy("off", !latestGrant));
+        await first;
+        if (completionOrder === "A-first") {
+          // A's cleanup must not delete B's still-pending tail.
+          await flush();
+          expect(queue().has("desktop")).toBe(true);
+          secondRead.resolve(policy("off", latestGrant));
+        }
+        await second;
+        expect(db.cliDevice.findUnique).toHaveBeenCalledTimes(2);
+        expect(metrics).toHaveBeenCalledTimes(2);
+        expect(relaySessionManager.fileOpModeRefusal("desktop", "read")).toBe(
+          latestGrant ? null : "grant_disabled",
+        );
+        // Either A or B withdrew the grant; an old pending result stays cancelled
+        // even when the latest commit legitimately re-enables new operations.
+        expect(socket.frames("file.cancel")).toEqual([{ type: "file.cancel", opId }]);
+        await answer(socket, resultFor(opId, "read", readResult));
+        await expect(outcome).resolves.toEqual({ ok: false, code: "grant_disabled" });
+        db.cliDevice.findUnique.mockResolvedValue(policy("off", latestGrant));
+        const next = runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: readArgs });
+        await flush();
+        expect(socket.frames("file.op")).toHaveLength(latestGrant ? 2 : 1);
+        if (latestGrant) await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+        await expect(next).resolves.toMatchObject(
+          latestGrant ? { ok: true } : { ok: false, code: "grant_disabled" },
+        );
+        expect(queue().size).toBe(0);
+      },
+    );
+
+    it("a rejected tail releases the next refresh and keeps other devices independent", async () => {
+      const { socket, outcome, opId } = await grantedRead("off");
+      const metrics = vi
+        .spyOn(relaySessionManager, "onRemoteMetricSourcesChanged")
+        .mockResolvedValue(false);
+      const failedRead = deferred<ReturnType<typeof policy>>();
+      const retryRead = deferred<ReturnType<typeof policy>>();
+      db.cliDevice.findUnique.mockImplementation((args: { where: { id: string } }) =>
+        args.where.id === "desktop" ? retryRead.promise : Promise.resolve(policy("off", false)),
+      );
+      db.cliDevice.findUnique.mockImplementationOnce(() => failedRead.promise);
+      const failed = relaySessionManager.onCliFeatureGrantsChanged("desktop");
+      const rejected = expect(failed).rejects.toThrow("db down");
+      await flush();
+      const retry = relaySessionManager.onCliFeatureGrantsChanged("desktop");
+      await relaySessionManager.onCliFeatureGrantsChanged("other-device");
+      expect(queue().has("desktop")).toBe(true);
+      expect(queue().has("other-device")).toBe(false);
+      failedRead.reject(new Error("db down"));
+      await rejected;
+      await flush();
+      expect(socket.frames("file.cancel")).toEqual([{ type: "file.cancel", opId }]);
+      await expect(outcome).resolves.toEqual({ ok: false, code: "grant_disabled" });
+      expect(queue().has("desktop")).toBe(true);
+      retryRead.resolve(policy("off", true));
+      await retry;
+      expect(relaySessionManager.fileOpModeRefusal("desktop", "read")).toBe(null);
+      expect(metrics).toHaveBeenCalledTimes(3);
+      expect(queue().size).toBe(0);
+    });
+
+    // The admission's owner read is last; policy loss while it is paused
+    // must still deny dispatch despite the already-read, granted device row.
+    it.each(["revoke", "read-error"] as const)(
+      "%s during a paused owner read cannot dispatch",
+      async (change) => {
+        const { socket, outcome, opId } = await grantedRead("off");
+        const ownerRead = deferred<{ slug: string }>();
+        db.user.findUnique.mockImplementationOnce(() => ownerRead.promise);
+        const paused = runFileOp({
+          ...OP_TOKEN,
+          cliDeviceId: "desktop",
+          op: "read",
+          args: readArgs,
+        });
+        await flush();
+        expect(openCliAgentAdmissionCountForTests()).toBe(1);
+        db.cliDevice.findUnique.mockResolvedValue(policy("off", false));
+        if (change === "read-error")
+          db.cliDevice.findUnique.mockRejectedValueOnce(new Error("db down"));
+        const refresh = relaySessionManager.onCliFeatureGrantsChanged("desktop");
+        if (change === "read-error") await expect(refresh).rejects.toThrow("db down");
+        else await refresh;
+        await expect(outcome).resolves.toEqual({ ok: false, code: "grant_disabled" });
+        ownerRead.resolve({ slug: "owner" });
+        await expect(paused).resolves.toEqual({ ok: false, code: "grant_disabled" });
+        expect(openCliAgentAdmissionCountForTests()).toBe(0);
+        expect(socket.frames("file.op")).toHaveLength(1);
+        expect(socket.frames("file.cancel")).toEqual([{ type: "file.cancel", opId }]);
+      },
+    );
+  });
 
   it("read-only token consent is reread at admission, and its cancellation ends a pending read", async () => {
     const token = {

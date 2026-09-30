@@ -607,6 +607,7 @@ function closeWithProtocolError(socket: RelaySocket, message: string) {
 export class RelaySessionManager {
   private sessionsBySocket = new Map<RelaySocket, SessionState>();
   private sessionsByCliDeviceId = new Map<string, SessionState>();
+  private featureGrantsRefreshByCliDeviceId = new Map<string, Promise<void>>();
   /**
    * Highest connection generation this process has installed or settled per
    * device. Hello results can complete out of order, so an older-committed
@@ -1378,21 +1379,46 @@ export class RelaySessionManager {
   }
 
   async onCliFeatureGrantsChanged(cliDeviceId: string) {
+    // Called only after the device policy commits. Own the per-device queue
+    // through the read, apply and metric push; different devices stay independent.
+    // A failed tail must not poison the next refresh or leave an idle entry.
+    const previous = this.featureGrantsRefreshByCliDeviceId.get(cliDeviceId);
+    const refresh = (previous ?? Promise.resolve())
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          const device = await prisma.cliDevice.findUnique({
+            where: { id: cliDeviceId },
+            select: { allowHumanTerminal: true, mcpCommandMode: true, mcpFileRead: true },
+          });
+          this.applyFeatureGrants(cliDeviceId, {
+            allowHumanTerminal: device?.allowHumanTerminal === true,
+            mcpCommandMode: device ? mcpCommandModeFromDb(device.mcpCommandMode) : "off",
+            mcpFileRead: device?.mcpFileRead === true,
+          });
+        } catch (error) {
+          // Unknown committed policy cannot retain old authority, including
+          // unsupervised access. Reconciliation cancels work before we rethrow.
+          this.applyFeatureGrants(cliDeviceId, {
+            allowHumanTerminal: false,
+            mcpCommandMode: "off",
+            mcpFileRead: false,
+          });
+          throw error;
+        } finally {
+          // Leaving `unsupervised` withdraws remote metric sources at once, even
+          // when the grant read above failed: the push re-reads the committed
+          // mode itself and fails closed (an empty list) on any error.
+          await this.onRemoteMetricSourcesChanged(cliDeviceId);
+        }
+      });
+    this.featureGrantsRefreshByCliDeviceId.set(cliDeviceId, refresh);
     try {
-      const device = await prisma.cliDevice.findUnique({
-        where: { id: cliDeviceId },
-        select: { allowHumanTerminal: true, mcpCommandMode: true, mcpFileRead: true },
-      });
-      this.applyFeatureGrants(cliDeviceId, {
-        allowHumanTerminal: device?.allowHumanTerminal === true,
-        mcpCommandMode: device ? mcpCommandModeFromDb(device.mcpCommandMode) : "off",
-        mcpFileRead: device?.mcpFileRead === true,
-      });
+      await refresh;
     } finally {
-      // Leaving `unsupervised` withdraws remote metric sources at once, even
-      // when the grant read above failed: the push re-reads the committed
-      // mode itself and fails closed (an empty list) on any error.
-      await this.onRemoteMetricSourcesChanged(cliDeviceId);
+      if (this.featureGrantsRefreshByCliDeviceId.get(cliDeviceId) === refresh) {
+        this.featureGrantsRefreshByCliDeviceId.delete(cliDeviceId);
+      }
     }
   }
 

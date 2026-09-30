@@ -2208,9 +2208,15 @@ fn config_read_grant_is_explicit_and_roots_are_validated() {
         .args(["config", "set-file-read", "on"])
         .assert()
         .success();
+    // `~` expands through the platform home directory, which HOME redirects on Unix only.
+    let root_arg = if cfg!(unix) {
+        "~/models".to_string()
+    } else {
+        models.to_str().expect("utf-8 temp path").to_string()
+    };
     cli(&config, &state)
         .env("HOME", tmp.path())
-        .args(["config", "set-file-roots", "~/models"])
+        .args(["config", "set-file-roots", &root_arg])
         .assert()
         .success();
     let disk: Value = serde_json::from_slice(&fs::read(&config).expect("config")).expect("json");
