@@ -19,6 +19,7 @@ pub struct TerminalStartup {
     allow_human_terminal: bool,
     mcp_command_mode: McpCommandMode,
     require_terminal_approval: bool,
+    allow_remote_metric_sources: bool,
 }
 
 impl TerminalStartup {
@@ -51,6 +52,7 @@ impl TerminalStartup {
             allow_human_terminal: config.allow_human_terminal,
             mcp_command_mode: config.mcp_command_mode,
             require_terminal_approval: config.require_terminal_approval,
+            allow_remote_metric_sources: config.allow_remote_metric_sources,
         }
     }
 
@@ -79,6 +81,11 @@ impl TerminalStartup {
         self.require_terminal_approval
     }
 
+    /// The local remote-metric-source opt-in, fixed for the daemon's lifetime.
+    pub fn allow_remote_metric_sources(&self) -> bool {
+        self.allow_remote_metric_sources
+    }
+
     /// `cli_slug` is the slug this hello reports; the identity signs it with
     /// the ECDH key.
     pub fn capabilities(&self, cli_slug: &str) -> CliCapabilities {
@@ -94,6 +101,7 @@ impl TerminalStartup {
             allow_human_terminal: self.allow_human_terminal,
             mcp_command_mode: self.mcp_command_mode,
             require_terminal_approval: self.require_terminal_approval,
+            allow_remote_metric_sources: self.allow_remote_metric_sources,
             terminal_public_key_b64url: self.key.public_b64url().to_string(),
             terminal_identity,
         })
@@ -119,6 +127,7 @@ mod tests {
             allow_human_terminal: true,
             mcp_command_mode: McpCommandMode::Unsupervised,
             require_terminal_approval: true,
+            allow_remote_metric_sources: true,
             ..Config::default()
         };
         let startup = TerminalStartup::capture(&config).expect("startup");
@@ -126,8 +135,23 @@ mod tests {
         config.allow_human_terminal = false;
         config.mcp_command_mode = McpCommandMode::Off;
         config.require_terminal_approval = false;
+        config.allow_remote_metric_sources = false;
         let capabilities = hello_capabilities(&startup, &config, "desk-01");
         assert!(capabilities.features.human_terminal);
+        assert!(
+            capabilities.features.remote_metric_sources,
+            "the opt-in is read once at startup"
+        );
+        assert!(
+            !TerminalStartup::from_key(
+                CliTerminalKey::generate().expect("key"),
+                &Config::default()
+            )
+            .capabilities("desk-01")
+            .features
+            .remote_metric_sources,
+            "off by default"
+        );
         assert_eq!(
             capabilities.features.mcp_command_mode,
             McpCommandMode::Unsupervised

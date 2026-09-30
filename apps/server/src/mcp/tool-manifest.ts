@@ -37,6 +37,7 @@ import {
   adaptCliCommandResultInput,
   adaptCliCommandRunInput,
   adaptCliSupervisedStartInput,
+  CLI_AGENT_ACTIVITY_NOTICE,
   CLI_COMMAND_OUTPUT_NOTICE,
   CLI_SUPERVISED_COMMAND_NOTICE,
   runForwarderCliCommand,
@@ -408,12 +409,29 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.listCliDevices),
   },
   {
+    name: "forwarder_cli_activity_list",
+    target: "cliAgentActivity.list",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    descriptionNote: CLI_AGENT_ACTIVITY_NOTICE,
+    invokeProcedure: procedureInvoker((client) => client.cliAgentActivity.list),
+  },
+  {
     name: "forwarder_device_metrics_get",
     target: "forwarderManagement.getCliDeviceMetrics",
     scope: "read",
     confirmation: null,
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getCliDeviceMetrics),
+  },
+  {
+    name: "forwarder_pool_routing_rules_get",
+    target: "forwarderManagement.getPoolRoutingRules",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getPoolRoutingRules),
   },
   {
     name: "forwarder_model_pools_list",
@@ -723,6 +741,43 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     descriptionNote: POOL_EXTERNAL_WAIT_COST_NOTICE,
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.createModelPool),
+  },
+  {
+    name: "forwarder_pool_routing_rules_set",
+    target: "forwarderManagement.setPoolRoutingRules",
+    scope: "write",
+    confirmation: "RUN",
+    // A `full` rule can send `:external` callers to paid external providers.
+    classification: "cost",
+    descriptionNote:
+      "Replaces the pool's whole rule list: [{metric, labels?, aggregate: 'max', op: '>'|'>='|'<'|'<=', threshold, effect: 'full'|'avoid'}]. Discover metric names with forwarder_device_metrics_get or forwarder_pool_routing_rules_get.",
+    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.setPoolRoutingRules),
+  },
+  {
+    name: "forwarder_pool_member_engine_load_set",
+    target: "forwarderManagement.setPoolMemberEngineLoad",
+    scope: "write",
+    confirmation: "RUN",
+    // Engine-load FULL can send `:external` callers to paid external providers.
+    classification: "cost",
+    descriptionNote:
+      "{poolMemberId, mode: 'auto'|'off', kvFullThreshold?: 0-1 or null}. 'off' ignores the engine's live load (endpoint.load) for that member; lease counts still apply. Read the live load with forwarder_pool_routing_rules_get.",
+    invokeProcedure: procedureInvoker(
+      (client) => client.forwarderManagement.setPoolMemberEngineLoad,
+    ),
+  },
+  {
+    name: "forwarder_device_metric_sources_set",
+    target: "forwarderManagement.setCliDeviceMetricSources",
+    scope: "write",
+    confirmation: "RUN",
+    // Defines commands that run on the person's machine.
+    classification: "external",
+    descriptionNote:
+      "Only for devices whose MCP command mode is unsupervised, and only for a personal token minted with the CLI commands option (like forwarder_cli_command_run). The CLI runs a source only with its local opt-in and after the person approves the exact command (wsmp metrics approve <name> --sha256 <hash>); a changed command needs approval again.",
+    invokeProcedure: procedureInvoker(
+      (client) => client.forwarderManagement.setCliDeviceMetricSources,
+    ),
   },
   {
     name: "forwarder_model_pool_update",
@@ -1182,8 +1237,8 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
 ];
 
 /**
- * The checked catalog: exactly 27 read tools and 52 write tools
- * (47 procedure-backed + 5 extracted cores: 2 diagnostics and 3 CLI commands).
+ * The checked catalog: exactly 29 read tools and 55 write tools
+ * (79 procedure-backed + 5 extracted cores: 2 diagnostics and 3 CLI commands).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS].map(
   buildDescriptor,

@@ -42,6 +42,9 @@
     },
     "./deletion-conflict": {
       "default": "./src/deletion-conflict.ts"
+    },
+    "./cli-agent-audit": {
+      "default": "./src/cli-agent-audit.ts"
     }
   },
   "files": [

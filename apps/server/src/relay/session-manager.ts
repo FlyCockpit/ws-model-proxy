@@ -13,9 +13,14 @@ import {
   mcpCommandModeFromDb,
   mcpCommandModeToDb,
 } from "@ws-model-proxy/api/lib/mcp-command-mode";
+import {
+  ENDPOINT_LOAD_STALE_AFTER_MS,
+  parseStoredRemoteMetricSources,
+} from "@ws-model-proxy/api/lib/metric-routing";
 import { suggestedConnectionSurface } from "@ws-model-proxy/api/lib/model-connection-type";
 import {
-  markPoolMembersForCliUnavailable,
+  disconnectCliDeviceAtGeneration,
+  markPoolMembersDueAfterCliReconnect,
   type PoolMemberFailureClass,
 } from "@ws-model-proxy/api/lib/model-pool-routing";
 import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
@@ -23,6 +28,11 @@ import type { SupervisedCommandStatus } from "@ws-model-proxy/api/lib/supervised
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { startRelayAttempt } from "../model-api/relay-executor.js";
 import { sanitizeRelayRequestHeaders } from "./headers.js";
+import {
+  createRoutingEvaluationState,
+  MetricRoutingEvaluator,
+  type RoutingEvaluationState,
+} from "./metric-routing-evaluator.js";
 import {
   listDueOwnedPoolMemberRecoveries,
   type OwnedRecoveryMember,
@@ -50,8 +60,10 @@ import {
   type RelayProtocolVersion,
   type RelayResponseBodyMetadata,
   type RelayServerControlMessage,
+  type RemoteMetricSource,
   rejectedHelloFacts,
   relayProtocolAtLeast,
+  remoteMetricSourcesSchema,
   type TerminalHandshakeIdentity,
   type TerminalSealedMetadata,
 } from "./protocol.js";
@@ -324,6 +336,10 @@ export const ENDPOINT_LOAD_MIN_INTERVAL_MS = 1_000;
 /** Distinct endpoint/model load keys kept per session. */
 export const ENDPOINT_LOAD_MAX_KEYS = 1_000;
 
+function addCapped(total: number, delta: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, total + delta);
+}
+
 type LiveEndpointLoadEntry = LiveEndpointLoad & { receivedAtMs: number };
 
 type SessionState = {
@@ -332,8 +348,16 @@ type SessionState = {
   connectedAt: Date;
   lastHeartbeatAt: Date;
   cliDeviceId: string | null;
+  /**
+   * The device's connection generation this session was accepted under
+   * (from its registration). A disconnect write presents it and is refused
+   * once the device has accepted a later connection.
+   */
+  connectionGeneration: number | null;
   cli: { slug: string } | null;
   registered: boolean;
+  /** Serialises `metrics.sources.set` sends: each re-reads the device after the previous one was sent. */
+  remoteSourcesQueue: Promise<void>;
   inventoryConfirmed: boolean;
   endpointTargeting: boolean;
   protocolVersion: RelayProtocolVersion | null;
@@ -366,6 +390,8 @@ type SessionState = {
   nodeMetricsPersistedAtMs: number | null;
   endpointLoad: Map<string, LiveEndpointLoadEntry>;
   malformedTelemetryLoggedAtMs: number | null;
+  /** Metric routing rule evaluation for this device (S-B part 2). */
+  routingEvaluation: RoutingEvaluationState | null;
 };
 
 export type ActiveRelayResponseHandlers = {
@@ -536,6 +562,14 @@ function closeWithProtocolError(socket: RelaySocket, message: string) {
 export class RelaySessionManager {
   private sessionsBySocket = new Map<RelaySocket, SessionState>();
   private sessionsByCliDeviceId = new Map<string, SessionState>();
+  /**
+   * Highest connection generation this process has installed or settled per
+   * device. Hello results can complete out of order, so an older-committed
+   * hello may resume after a newer one was detached and settled while no owner
+   * was installed; this remembers that the newer generation exists so the
+   * older one is not installed over it. Bounded (oldest entries evicted).
+   */
+  private latestGenerationByCliDeviceId = new Map<string, number>();
   private activeRelayRequests = new Map<string, ActiveRelayRequest>();
   /**
    * Shutdown drain flag, shared by the relay and the browser terminal hub.
@@ -557,6 +591,7 @@ export class RelaySessionManager {
    * step) and CLI sockets by the close calls above.
    */
   private relayDrain = false;
+  private readonly routingEvaluator = new MetricRoutingEvaluator();
   private readonly poolMemberRecovery = new PoolMemberRecoveryScheduler({
     getOwnedCliDeviceIds: () => this.getActiveCliDeviceIds(),
     listDueMembers: listDueOwnedPoolMemberRecoveries,
@@ -599,8 +634,10 @@ export class RelaySessionManager {
       connectedAt: now,
       lastHeartbeatAt: now,
       cliDeviceId: null,
+      connectionGeneration: null,
       cli: null,
       registered: false,
+      remoteSourcesQueue: Promise.resolve(),
       inventoryConfirmed: false,
       endpointTargeting: false,
       protocolVersion: null,
@@ -623,6 +660,7 @@ export class RelaySessionManager {
       nodeMetricsPersistedAtMs: null,
       endpointLoad: new Map(),
       malformedTelemetryLoggedAtMs: null,
+      routingEvaluation: null,
     });
     return true;
   }
@@ -676,10 +714,33 @@ export class RelaySessionManager {
           // revoked / device deleted). The registration committed CONNECTED
           // for a session that no longer exists: do not route to it, and put
           // the device status back unless another live session owns it.
-          await this.settleDetachedRegistration(registration.cliDeviceId, now);
+          await this.settleDetachedRegistration(
+            registration.cliDeviceId,
+            now,
+            registration.connectionGeneration,
+          );
           return;
         }
+        const installed = this.sessionsByCliDeviceId.get(registration.cliDeviceId);
+        const knownGeneration = Math.max(
+          installed && installed !== session ? (installed.connectionGeneration ?? 0) : 0,
+          this.latestGenerationByCliDeviceId.get(registration.cliDeviceId) ?? 0,
+        );
+        if (knownGeneration > registration.connectionGeneration) {
+          // Hello results can complete out of order: a later-committed hello
+          // already owns the device. This older one is superseded; it must
+          // not replace the newer owner (whose durable fence is higher, so its
+          // own disconnect would then be refused with no session serving the
+          // device). No await between this check and the install below.
+          this.sessionsBySocket.delete(socket);
+          clearTimeout(session.unauthenticatedTimer);
+          if (session.routingEvaluation) this.routingEvaluator.cancel(session.routingEvaluation);
+          socket.close(1000, "replaced");
+          return;
+        }
+        this.noteConnectionGeneration(registration.cliDeviceId, registration.connectionGeneration);
         session.cliDeviceId = registration.cliDeviceId;
+        session.connectionGeneration = registration.connectionGeneration;
         session.cli = { slug: message.cli.slug };
         session.registered = true;
         session.inventoryConfirmed = true;
@@ -694,9 +755,21 @@ export class RelaySessionManager {
         session.terminalViewers = interactive.terminalViewers;
         session.terminalIdentity = interactive.terminalIdentity;
         session.lastHeartbeatAt = now;
+        if (session.routingEvaluation) this.routingEvaluator.cancel(session.routingEvaluation);
+        session.routingEvaluation = createRoutingEvaluationState(
+          session.identity.userId,
+          registration.cliDeviceId,
+        );
         clearTimeout(session.unauthenticatedTimer);
         this.reconcileInteractiveGrants(session);
         this.replaceDuplicateSession(session);
+        // Members opened only by this device's disconnect are probed now, not
+        // after the disconnect cooldown. Best effort: on failure the normal
+        // scheduled retry still recovers them.
+        await markPoolMembersDueAfterCliReconnect({
+          cliDeviceId: registration.cliDeviceId,
+          now: new Date(),
+        }).catch(() => 0);
         this.poolMemberRecovery.wake();
         socket.send(
           encodeRelayServerControlMessage({
@@ -707,6 +780,7 @@ export class RelaySessionManager {
             desiredCapabilities: registration.desiredCapabilities,
           }),
         );
+        await this.sendRemoteMetricSources(session);
       } catch (error) {
         // Already detached and closed by whoever detached it.
         if (this.sessionsBySocket.get(socket) !== session) return;
@@ -797,11 +871,18 @@ export class RelaySessionManager {
 
     if (message.type === "heartbeat") {
       session.lastHeartbeatAt = now;
-      await prisma.cliDevice.update({
-        where: { id: session.cliDeviceId },
-        data: { status: "CONNECTED", lastHeartbeatAt: now },
-        select: { id: true },
-      });
+      // Same durable fence as the disconnect: a heartbeat only refreshes the
+      // row while it still describes THIS session's connection (its
+      // generation, and not already disconnected/stale). A heartbeat whose
+      // dispatch was delayed past its own detach, or past a successor's
+      // registration, matches nothing instead of resurrecting CONNECTED.
+      // Fail closed: a session with no claimed generation writes nothing.
+      const generation = session.connectionGeneration;
+      if (generation !== null && Number.isInteger(generation) && generation >= 1)
+        await prisma.cliDevice.updateMany({
+          where: { id: session.cliDeviceId, connectionGeneration: generation, status: "CONNECTED" },
+          data: { lastHeartbeatAt: now },
+        });
       socket.send(
         encodeRelayServerControlMessage({
           type: "heartbeat.pong",
@@ -954,6 +1035,9 @@ export class RelaySessionManager {
   /** Stops background recovery in controlled shutdowns and unit tests. */
   dispose() {
     this.poolMemberRecovery.stop();
+    for (const session of this.sessionsBySocket.values()) {
+      if (session.routingEvaluation) this.routingEvaluator.cancel(session.routingEvaluation);
+    }
   }
 
   private async removeSessionWithStatus(
@@ -992,17 +1076,32 @@ export class RelaySessionManager {
     if (!session) return null;
     this.teardownInteractiveWork(session);
     clearTimeout(session.unauthenticatedTimer);
+    if (session.routingEvaluation) this.routingEvaluator.cancel(session.routingEvaluation);
     this.sessionsBySocket.delete(socket);
     this.failActiveRequestsForSession(session);
     const cliDeviceId = session.cliDeviceId;
     if (!cliDeviceId || this.sessionsByCliDeviceId.get(cliDeviceId) !== session) return null;
     this.sessionsByCliDeviceId.delete(cliDeviceId);
-    return () => this.writeDeviceDisconnected(cliDeviceId, { now, cliStatus, failureClass });
+    const connectionGeneration = session.connectionGeneration;
+    return () =>
+      this.writeDeviceDisconnected(cliDeviceId, {
+        now,
+        cliStatus,
+        failureClass,
+        connectionGeneration,
+      });
   }
 
   /**
    * Persists that no session serves this device. `updateMany` because the
    * device may have been deleted (its sessions are closed right after).
+   *
+   * Durable-ownership fence: both writes carry `connectionGeneration`, the
+   * generation the detached session was accepted under. A hello that commits
+   * after the detach increments it and makes every write below match nothing,
+   * so a stale close can never overwrite the status or pool-member health of a
+   * live successor — including a successor on another replica, which this
+   * process cannot see in `sessionsByCliDeviceId`.
    */
   private async writeDeviceDisconnected(
     cliDeviceId: string,
@@ -1010,18 +1109,32 @@ export class RelaySessionManager {
       now,
       cliStatus,
       failureClass,
+      connectionGeneration,
     }: {
       now: Date;
       cliStatus: "DISCONNECTED" | "STALE";
       failureClass: Extract<PoolMemberFailureClass, "WEBSOCKET_DISCONNECTED" | "STALE_SESSION">;
+      connectionGeneration: number | null;
     },
   ) {
-    await prisma.cliDevice.updateMany({
-      where: { id: cliDeviceId },
-      data: { status: cliStatus, lastDisconnectedAt: now },
+    // Never pass `undefined` to a Prisma filter: it would drop the key and
+    // remove the fence. Fail closed on anything but a real generation, so a
+    // session that never registered (or a registration that did not report
+    // one) writes nothing instead of an unfenced disconnect.
+    if (
+      connectionGeneration === null ||
+      !Number.isInteger(connectionGeneration) ||
+      connectionGeneration < 1
+    )
+      return;
+    const applied = await disconnectCliDeviceAtGeneration({
+      cliDeviceId,
+      generation: connectionGeneration,
+      cliStatus,
+      failureClass,
+      now,
     });
-    await markPoolMembersForCliUnavailable({ cliDeviceId, failureClass, now });
-    this.poolMemberRecovery.wake();
+    if (applied) this.poolMemberRecovery.wake();
   }
 
   /**
@@ -1029,13 +1142,48 @@ export class RelaySessionManager {
    * detached. The session never entered routing; undo the connected status
    * unless another live session now owns the device (its own registration
    * wrote CONNECTED and routing points at it).
+   *
+   * The write is fenced by the registration's own generation: any successor —
+   * in this process or another replica — has incremented the stored generation
+   * and this write matches no row (the row is left as the successor wrote it).
+   *
+   * In-memory fast path: a live owner here was accepted under an OLDER
+   * generation than this registration (generations follow commit order, owners
+   * follow hello-processing order), so this commit superseded the owner's
+   * fence. The owner adopts the higher generation; otherwise its own later
+   * disconnect would match no row and the device would stay CONNECTED with no
+   * session. Adoption never lowers a generation, and a later hello (any
+   * replica) still increments past it.
    */
-  private async settleDetachedRegistration(cliDeviceId: string, now: Date) {
-    if (this.sessionsByCliDeviceId.has(cliDeviceId)) return;
+  private noteConnectionGeneration(cliDeviceId: string, generation: number) {
+    const known = this.latestGenerationByCliDeviceId.get(cliDeviceId) ?? 0;
+    if (generation <= known) return;
+    // Re-insert so eviction (oldest first) tracks recency.
+    this.latestGenerationByCliDeviceId.delete(cliDeviceId);
+    this.latestGenerationByCliDeviceId.set(cliDeviceId, generation);
+    if (this.latestGenerationByCliDeviceId.size > 4096) {
+      const oldest = this.latestGenerationByCliDeviceId.keys().next().value;
+      if (oldest !== undefined) this.latestGenerationByCliDeviceId.delete(oldest);
+    }
+  }
+
+  private async settleDetachedRegistration(
+    cliDeviceId: string,
+    now: Date,
+    connectionGeneration: number,
+  ) {
+    this.noteConnectionGeneration(cliDeviceId, connectionGeneration);
+    const owner = this.sessionsByCliDeviceId.get(cliDeviceId);
+    if (owner) {
+      if ((owner.connectionGeneration ?? 0) < connectionGeneration)
+        owner.connectionGeneration = connectionGeneration;
+      return;
+    }
     await this.writeDeviceDisconnected(cliDeviceId, {
       now,
       cliStatus: "DISCONNECTED",
       failureClass: "WEBSOCKET_DISCONNECTED",
+      connectionGeneration,
     });
   }
 
@@ -1165,14 +1313,21 @@ export class RelaySessionManager {
   }
 
   async onCliFeatureGrantsChanged(cliDeviceId: string) {
-    const device = await prisma.cliDevice.findUnique({
-      where: { id: cliDeviceId },
-      select: { allowHumanTerminal: true, mcpCommandMode: true },
-    });
-    this.applyFeatureGrants(cliDeviceId, {
-      allowHumanTerminal: device?.allowHumanTerminal === true,
-      mcpCommandMode: device ? mcpCommandModeFromDb(device.mcpCommandMode) : "off",
-    });
+    try {
+      const device = await prisma.cliDevice.findUnique({
+        where: { id: cliDeviceId },
+        select: { allowHumanTerminal: true, mcpCommandMode: true },
+      });
+      this.applyFeatureGrants(cliDeviceId, {
+        allowHumanTerminal: device?.allowHumanTerminal === true,
+        mcpCommandMode: device ? mcpCommandModeFromDb(device.mcpCommandMode) : "off",
+      });
+    } finally {
+      // Leaving `unsupervised` withdraws remote metric sources at once, even
+      // when the grant read above failed: the push re-reads the committed
+      // mode itself and fails closed (an empty list) on any error.
+      await this.onRemoteMetricSourcesChanged(cliDeviceId);
+    }
   }
 
   /**
@@ -1331,14 +1486,32 @@ export class RelaySessionManager {
       const { type: _type, ...load } = message;
       const key = `${load.endpointSlug}\u0000${load.modelSlug ?? ""}`;
       const previous = session.endpointLoad.get(key);
-      if (previous && nowMs - previous.receivedAtMs < ENDPOINT_LOAD_MIN_INTERVAL_MS) return;
+      const hitsDelta = load.prefixCacheHitsDelta ?? 0;
+      const queriesDelta = load.prefixCacheQueriesDelta ?? 0;
+      if (previous && nowMs - previous.receivedAtMs < ENDPOINT_LOAD_MIN_INTERVAL_MS) {
+        // The reading is dropped but its counter deltas are not.
+        previous.prefixCacheHitsTotal = addCapped(previous.prefixCacheHitsTotal, hitsDelta);
+        previous.prefixCacheQueriesTotal = addCapped(
+          previous.prefixCacheQueriesTotal,
+          queriesDelta,
+        );
+        return;
+      }
       if (!previous && session.endpointLoad.size >= ENDPOINT_LOAD_MAX_KEYS) return;
+      // "Sustained" waiting counts consecutive accepted frames. A gap longer
+      // than the staleness window restarts the count (fail open).
+      const continuous = previous && nowMs - previous.receivedAtMs <= ENDPOINT_LOAD_STALE_AFTER_MS;
+      const waitingStreak = load.waiting > 0 ? (continuous ? previous.waitingStreak : 0) + 1 : 0;
       session.endpointLoad.set(key, {
         ...load,
         modelSlug: load.modelSlug ?? null,
+        waitingStreak,
+        prefixCacheHitsTotal: addCapped(previous?.prefixCacheHitsTotal ?? 0, hitsDelta),
+        prefixCacheQueriesTotal: addCapped(previous?.prefixCacheQueriesTotal ?? 0, queriesDelta),
         receivedAt: now,
         receivedAtMs: nowMs,
       });
+      this.scheduleRoutingEvaluation(session);
       return;
     }
     if (message.type === "node.info") {
@@ -1362,6 +1535,7 @@ export class RelaySessionManager {
     session.nodeMetricsAcceptedAtMs = nowMs;
     const { type: _type, ...sample } = message;
     session.nodeMetrics = { sample, receivedAt: now };
+    this.scheduleRoutingEvaluation(session);
     if (
       session.nodeMetricsPersistedAtMs !== null &&
       nowMs - session.nodeMetricsPersistedAtMs < NODE_METRICS_PERSIST_INTERVAL_MS
@@ -1382,6 +1556,106 @@ export class RelaySessionManager {
         ],
       },
     );
+  }
+
+  private scheduleRoutingEvaluation(session: SessionState) {
+    const state = session.routingEvaluation;
+    if (!state) return;
+    this.routingEvaluator.schedule(state, () => ({
+      nodeMetrics: session.nodeMetrics,
+      endpointLoad: [...session.endpointLoad.values()],
+    }));
+  }
+
+  /**
+   * Send the device's remotely defined metric sources (`metrics.sources.set`)
+   * to its live session: after `hello.ok`, and whenever the definitions or the
+   * device's MCP command mode change. Only an `unsupervised` device gets its
+   * definitions; any other mode gets an empty list, which stops them. The CLI
+   * still needs its local opt-in and a hash approval of each command.
+   */
+  private sendRemoteMetricSources(session: SessionState): Promise<boolean> {
+    // One send at a time per session, each reading the device only when its
+    // turn comes: the last send always reflects the newest committed mode
+    // and definitions, so an older read can never overtake a withdrawal.
+    const turn = session.remoteSourcesQueue.then(() => this.sendRemoteMetricSourcesNow(session));
+    session.remoteSourcesQueue = turn.then(() => undefined);
+    return turn;
+  }
+
+  /**
+   * Never rejects (it logs and returns), so the queue never stalls. Fails
+   * closed: whatever goes wrong before the device's grant and definitions
+   * are known (read error, missing or foreign device, invalid stored list),
+   * the CLI is sent an EMPTY list, which stops every remote source; only a
+   * successful read of an `unsupervised` device sends definitions. Returns
+   * true only when the intended list was sent.
+   */
+  private async sendRemoteMetricSourcesNow(session: SessionState): Promise<boolean> {
+    const cliDeviceId = session.cliDeviceId;
+    if (!cliDeviceId) return false;
+    let sources: RemoteMetricSource[] = [];
+    let intended = false;
+    try {
+      const device = await prisma.cliDevice.findUnique({
+        where: { id: cliDeviceId },
+        select: { userId: true, mcpCommandMode: true, remoteMetricSources: true },
+      });
+      if (device && device.userId === session.identity.userId) {
+        // The outbound list is validated against the relay 2.7 wire schema
+        // (strict entries, at most NODE_METRIC_SOURCES_MAX). Anything that
+        // fails is withheld: the CLI gets an empty list, never a malformed
+        // or oversized frame.
+        const wire = remoteMetricSourcesSchema.safeParse(
+          device.mcpCommandMode === "UNSUPERVISED"
+            ? parseStoredRemoteMetricSources(device.remoteMetricSources)
+            : [],
+        );
+        if (wire.success) {
+          sources = wire.data;
+          intended = true;
+        } else {
+          console.error(
+            "[relay] stored remote metric sources failed the wire schema; sending none",
+          );
+        }
+      }
+    } catch (error) {
+      console.error(
+        "[relay] reading remote metric sources failed; withdrawing them",
+        error instanceof Error ? error.name : typeof error,
+      );
+    }
+    if (this.sessionsByCliDeviceId.get(cliDeviceId) !== session) return false;
+    if (session.socket.readyState !== WS_READY_STATE_OPEN) return false;
+    try {
+      session.socket.send(
+        encodeRelayServerControlMessage({
+          type: "metrics.sources.set",
+          id: `sources-${randomBytes(8).toString("hex")}`,
+          sources,
+        }),
+      );
+      return intended;
+    } catch (error) {
+      console.error(
+        "[relay] sending remote metric sources failed",
+        error instanceof Error ? error.name : typeof error,
+      );
+      return false;
+    }
+  }
+
+  /** A pool's metric routing rules were replaced: clear its stored verdicts. */
+  async onPoolRoutingRulesChanged(poolId: string): Promise<void> {
+    await this.routingEvaluator.clearPool(poolId);
+  }
+
+  /** The dashboard or MCP changed a device's remote metric sources. */
+  async onRemoteMetricSourcesChanged(cliDeviceId: string) {
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    if (!session?.registered) return false;
+    return await this.sendRemoteMetricSources(session);
   }
 
   private async writeTelemetry(
@@ -2110,6 +2384,9 @@ export class RelaySessionManager {
       const owners = new Set<string>([newSession.identity.userId]);
       for (const terminal of existing.terminalsById.values()) owners.add(terminal.userId);
       this.teardownInteractiveWork(existing);
+      // A replaced session must publish no more verdicts: its pending run
+      // would start later than the successor's fence and win with an older reading.
+      if (existing.routingEvaluation) this.routingEvaluator.cancel(existing.routingEvaluation);
       this.failActiveRequestsForSession(existing);
       existing.socket.close(1000, "replaced");
       this.sessionsBySocket.delete(existing.socket);
@@ -2932,7 +3209,7 @@ export class RelaySessionManager {
     return false;
   }
 
-  private async probeOwnedPoolMember(member: OwnedRecoveryMember): Promise<boolean> {
+  private async probeOwnedPoolMember(member: OwnedRecoveryMember): Promise<boolean | "superseded"> {
     const surface = suggestedConnectionSurface({
       capabilities: member.capabilities as OpenAiCompatibleCapabilities | null,
     });
@@ -2970,6 +3247,15 @@ export class RelaySessionManager {
             };
     const headers = new Headers({ "content-type": "application/json" });
     if (surface === "ANTHROPIC_MESSAGES") headers.set("anthropic-version", "2023-06-01");
+    // The probe is only evidence about the connection it was dispatched on. If
+    // that session is replaced (a reconnect took over the device id) or lost
+    // while it runs, its `disconnected` failure belongs to the old connection,
+    // not the member, and must not be recorded against the successor.
+    const dispatchedOn = this.sessionsByCliDeviceId.get(member.cliDeviceId);
+    // Nothing to probe through (the owner detached after the scheduler's check):
+    // a probe that could not be sent proves nothing about the member.
+    if (!dispatchedOn) return "superseded";
+    const superseded = () => this.sessionsByCliDeviceId.get(member.cliDeviceId) !== dispatchedOn;
     const attempt = startRelayAttempt({
       manager: this,
       cliDeviceId: member.cliDeviceId,
@@ -2987,9 +3273,10 @@ export class RelaySessionManager {
       // semantics are transport health, not a provider-specific text contract.
       await started.body.pipeTo(new WritableStream<Uint8Array>({ write() {} }));
       const terminal = await attempt.terminal;
+      if (superseded()) return "superseded";
       return started.status >= 200 && started.status < 300 && terminal.ok;
     } catch {
-      return false;
+      return superseded() ? "superseded" : false;
     }
   }
 }

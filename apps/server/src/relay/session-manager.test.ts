@@ -98,6 +98,24 @@ const identity: CliWebsocketIdentity = {
 
 const now = new Date("2026-01-01T00:00:00.000Z");
 
+/** Holds the next registration transaction until `release()`. */
+function holdNextRegistration() {
+  let release: (() => void) | undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let reportStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    reportStarted = resolve;
+  });
+  db.$transaction.mockImplementationOnce(async (callback: (tx: typeof db) => unknown) => {
+    reportStarted?.();
+    await gate;
+    return callback(db);
+  });
+  return { started, release: () => release?.() };
+}
+
 function capabilities26(features?: {
   humanTerminal?: boolean;
   mcpCommandMode?: "off" | "supervised" | "unsupervised";
@@ -185,6 +203,7 @@ function seedRegistrationMocks() {
     id: "cli-device-id",
     userId: "user-id",
     slug: "desktop",
+    connectionGeneration: 1,
   });
   db.cliToken.update.mockResolvedValue({ id: "token-id" });
   db.cliDevice.update.mockResolvedValue({
@@ -385,7 +404,7 @@ describe("revoked credentials", () => {
     expect(current.closes).toEqual([]);
     expect(manager.getActiveCliDeviceIds()).toEqual([]);
     expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
-      where: { id: "cli-device-id" },
+      where: { id: "cli-device-id", connectionGeneration: 1 },
       data: { status: "DISCONNECTED", lastDisconnectedAt: revokedAt },
     });
     manager.dispose();
@@ -424,7 +443,7 @@ describe("revoked credentials", () => {
     expect(otherUser.closes).toEqual([]);
     expect(manager.getActiveCliDeviceIds()).toEqual([]);
     expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
-      where: { id: "cli-device-id" },
+      where: { id: "cli-device-id", connectionGeneration: 1 },
       data: { status: "DISCONNECTED", lastDisconnectedAt: deletedAt },
     });
     manager.dispose();
@@ -470,24 +489,6 @@ describe("revoked credentials", () => {
     manager.dispose();
   });
 
-  /** Holds the next registration transaction until `release()`. */
-  function holdNextRegistration() {
-    let release: (() => void) | undefined;
-    const gate = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    let reportStarted: (() => void) | undefined;
-    const started = new Promise<void>((resolve) => {
-      reportStarted = resolve;
-    });
-    db.$transaction.mockImplementationOnce(async (callback: (tx: typeof db) => unknown) => {
-      reportStarted?.();
-      await gate;
-      return callback(db);
-    });
-    return { started, release: () => release?.() };
-  }
-
   const disconnectedWrites = () =>
     db.cliDevice.updateMany.mock.calls.filter(
       ([args]) => (args as { data?: { status?: string } }).data?.status === "DISCONNECTED",
@@ -510,11 +511,12 @@ describe("revoked credentials", () => {
 
     expect(manager.getActiveCliDeviceIds()).toEqual([]);
     expect(socket.sends.some((send) => String(send).includes('"hello.ok"'))).toBe(false);
-    // Registration wrote CONNECTED for a session that no longer exists: undone.
+    // Registration wrote CONNECTED for a session that no longer exists: undone,
+    // under the generation that registration itself accepted.
     expect(disconnectedWrites()).toEqual([
       [
         {
-          where: { id: "cli-device-id" },
+          where: { id: "cli-device-id", connectionGeneration: 1 },
           data: { status: "DISCONNECTED", lastDisconnectedAt: now },
         },
       ],
@@ -565,6 +567,354 @@ describe("revoked credentials", () => {
     expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
     expect(current.closes).toEqual([]);
     expect(disconnectedWrites()).toEqual([]);
+    manager.dispose();
+  });
+
+  describe("device generation follows commit order, owners follow hello order", () => {
+    /** A stateful CliDevice row: upsert bumps the generation, updateMany applies only on a match. */
+    function modelDeviceRow() {
+      const row = { generation: 0, status: "CONNECTED" };
+      db.cliDevice.upsert.mockImplementation(async () => {
+        row.generation += 1;
+        row.status = "CONNECTED";
+        return {
+          id: "cli-device-id",
+          userId: "user-id",
+          slug: "desktop",
+          connectionGeneration: row.generation,
+        };
+      });
+      db.cliDevice.updateMany.mockImplementation(async (arg) => {
+        const { where, data } = arg as {
+          where: { connectionGeneration?: number };
+          data: { status?: string };
+        };
+        if (
+          where.connectionGeneration !== undefined &&
+          where.connectionGeneration !== row.generation
+        )
+          return { count: 0 };
+        if (data.status) row.status = data.status;
+        return { count: 1 };
+      });
+      return row;
+    }
+
+    // Each row: which hello ends up detached, and whether it commits before
+    // or after the live owner's hello. Every row leaves the row CONNECTED
+    // with a stale owner fence on the old code; the owner's own later
+    // disconnect must still be recorded.
+    it.each([
+      {
+        name: "a detached hello commits above a live owner that predates it",
+        run: async (m: InstanceType<typeof RelaySessionManager>, owner: FakeSocket) => {
+          const detached = new FakeSocket();
+          m.acceptAuthenticatedSocket({ socket: detached, identity, now });
+          const held = holdNextRegistration();
+          const hello = m.handleTextFrame(detached, helloFrame(), now);
+          await held.started;
+          await m.removeSession(detached, now);
+          held.release();
+          await hello;
+          return owner;
+        },
+        ownerFirst: true,
+      },
+      {
+        name: "a detached hello commits after the owner's hello took over",
+        run: async (m: InstanceType<typeof RelaySessionManager>) => {
+          const detached = new FakeSocket();
+          m.acceptAuthenticatedSocket({ socket: detached, identity: deviceIdentity("old"), now });
+          const held = holdNextRegistration();
+          const hello = m.handleTextFrame(detached, helloFrame(), now);
+          await held.started;
+          await m.removeSession(detached, now);
+          const current = new FakeSocket();
+          m.acceptAuthenticatedSocket({ socket: current, identity: deviceIdentity("new"), now });
+          await m.handleTextFrame(current, helloFrame(), now);
+          held.release();
+          await hello;
+          return current;
+        },
+        ownerFirst: false,
+      },
+    ])("records the owner's disconnect when $name", async ({ run, ownerFirst }) => {
+      const row = modelDeviceRow();
+      const manager = new RelaySessionManager();
+      const first = new FakeSocket();
+      if (ownerFirst) {
+        manager.acceptAuthenticatedSocket({ socket: first, identity, now });
+        await manager.handleTextFrame(first, helloFrame(), now);
+      }
+      const owner = await run(manager, first);
+      expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
+      // The detached registration committed above the owner's accepted generation.
+      expect(row.generation).toBe(2);
+
+      const closedAt = new Date(now.getTime() + 2_000);
+      await manager.removeSession(owner, closedAt);
+
+      expect(manager.getActiveCliDeviceIds()).toEqual([]);
+      expect(row.status).toBe("DISCONNECTED");
+      expect(db.cliDevice.updateMany).toHaveBeenLastCalledWith({
+        where: { id: "cli-device-id", connectionGeneration: 2 },
+        data: { status: "DISCONNECTED", lastDisconnectedAt: closedAt },
+      });
+      manager.dispose();
+    });
+  });
+
+  it("does not let an older hello result replace a newer committed owner", async () => {
+    // Hello results complete out of order: generation 2 commits but its
+    // continuation is delayed; generation 3 commits and installs. The older
+    // result must not close the newer socket or take ownership, or the newer
+    // owner's disconnect (fenced at 3) would be the one refused later.
+    const row = { generation: 0, status: "CONNECTED" };
+    db.cliDevice.upsert.mockImplementation(async () => {
+      row.generation += 1;
+      return {
+        id: "cli-device-id",
+        userId: "user-id",
+        slug: "desktop",
+        connectionGeneration: row.generation,
+      };
+    });
+    db.cliDevice.updateMany.mockImplementation(async (arg) => {
+      const { where, data } = arg as {
+        where: { connectionGeneration?: number };
+        data: { status?: string };
+      };
+      if (where.connectionGeneration !== undefined && where.connectionGeneration !== row.generation)
+        return { count: 0 };
+      if (data.status) row.status = data.status;
+      return { count: 1 };
+    });
+    const manager = new RelaySessionManager();
+    const older = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: older, identity: deviceIdentity("old"), now });
+    let releaseOlder: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      releaseOlder = resolve;
+    });
+    db.$transaction.mockImplementationOnce(async (callback: (tx: typeof db) => unknown) => {
+      const committed = await callback(db);
+      await gate; // committed at generation 1, result returned late
+      return committed;
+    });
+    const olderHello = manager.handleTextFrame(older, helloFrame(), now);
+    await vi.waitFor(() => expect(row.generation).toBe(1));
+
+    const newer = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: newer, identity: deviceIdentity("new"), now });
+    await manager.handleTextFrame(newer, helloFrame(), now);
+    expect(row.generation).toBe(2);
+    releaseOlder();
+    await olderHello;
+
+    expect(newer.closes).toEqual([]);
+    expect(older.closes).toEqual([{ code: 1000, reason: "replaced" }]);
+    expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
+    expect(older.sends.some((frame) => String(frame).includes("hello.ok"))).toBe(false);
+
+    await manager.removeSession(newer, new Date(now.getTime() + 1_000));
+    expect(row.status).toBe("DISCONNECTED");
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
+    manager.dispose();
+  });
+
+  it("does not attribute a recovery probe's disconnect to the member when a reconnect replaced its session", async () => {
+    const manager = new RelaySessionManager();
+    const probe = (
+      manager as unknown as {
+        probeOwnedPoolMember(member: unknown): Promise<boolean | "superseded">;
+      }
+    ).probeOwnedPoolMember.bind(manager);
+    const member = {
+      id: "member-1",
+      cliDeviceId: "cli-device-id",
+      endpointSlug: "local-openai",
+      upstreamModelId: "model-a",
+      userId: "user-id",
+      capabilities: {
+        version: 1,
+        protocol: "openai-compatible",
+        chatCompletions: { supported: true },
+      },
+    };
+    const first = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: first, identity: deviceIdentity("a"), now });
+    await manager.handleTextFrame(first, helloFrame(), now);
+
+    const probing = probe(member);
+    // The CLI reconnects before the server saw the old close: the replacement
+    // fails the probe's request with `disconnected` and maps the device to the
+    // new session.
+    const second = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: second, identity: deviceIdentity("b"), now });
+    await manager.handleTextFrame(second, helloFrame(), now);
+    expect(first.closes).toEqual([{ code: 1000, reason: "replaced" }]);
+
+    await expect(probing).resolves.toBe("superseded");
+    manager.dispose();
+  });
+
+  it("does not attribute a probe's disconnect after its headers arrived when a reconnect replaced it", async () => {
+    const manager = new RelaySessionManager();
+    const probe = (
+      manager as unknown as {
+        probeOwnedPoolMember(member: unknown): Promise<boolean | "superseded">;
+      }
+    ).probeOwnedPoolMember.bind(manager);
+    const member = {
+      id: "member-1",
+      cliDeviceId: "cli-device-id",
+      endpointSlug: "local-openai",
+      upstreamModelId: "model-a",
+      userId: "user-id",
+      capabilities: {
+        version: 1,
+        protocol: "openai-compatible",
+        chatCompletions: { supported: true },
+      },
+    };
+    const first = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: first, identity: deviceIdentity("a"), now });
+    await manager.handleTextFrame(first, helloFrame(), now);
+
+    const probing = probe(member);
+    await vi.waitFor(() =>
+      expect(
+        first.sends.some((frame) => typeof frame === "string" && frame.includes("relay.request")),
+      ).toBe(true),
+    );
+    const request = first.sends
+      .filter((frame): frame is string => typeof frame === "string")
+      .map((frame) => JSON.parse(frame) as { type: string; requestId?: string })
+      .find((frame) => frame.type === "relay.request");
+    await manager.handleTextFrame(
+      first,
+      JSON.stringify({
+        type: "relay.response.headers",
+        requestId: request?.requestId,
+        status: 200,
+        headers: {},
+      }),
+      now,
+    );
+    const second = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: second, identity: deviceIdentity("b"), now });
+    await manager.handleTextFrame(second, helloFrame(), now);
+
+    await expect(probing).resolves.toBe("superseded");
+    manager.dispose();
+  });
+
+  it("does not probe when the owning session is gone at dispatch", async () => {
+    const manager = new RelaySessionManager();
+    const probe = (
+      manager as unknown as {
+        probeOwnedPoolMember(member: unknown): Promise<boolean | "superseded">;
+      }
+    ).probeOwnedPoolMember.bind(manager);
+    await expect(
+      probe({
+        id: "member-1",
+        cliDeviceId: "no-such-device",
+        endpointSlug: "local-openai",
+        upstreamModelId: "model-a",
+        userId: "user-id",
+        capabilities: {
+          version: 1,
+          protocol: "openai-compatible",
+          chatCompletions: { supported: true },
+        },
+      }),
+    ).resolves.toBe("superseded");
+    manager.dispose();
+  });
+
+  it("does not install an older hello over a newer generation that was detached and settled first", async () => {
+    // A commits generation 1 but its result is delayed. B commits generation 2
+    // and its socket closes mid-registration, so B settles (no owner installed
+    // yet) and records the device DISCONNECTED at generation 2. When A resumes
+    // it must not become the owner: its heartbeats (fenced at generation 1)
+    // would be refused forever while the row says DISCONNECTED.
+    const row = { generation: 0, status: "CONNECTED" };
+    db.cliDevice.upsert.mockImplementation(async () => {
+      row.generation += 1;
+      row.status = "CONNECTED";
+      return {
+        id: "cli-device-id",
+        userId: "user-id",
+        slug: "desktop",
+        connectionGeneration: row.generation,
+      };
+    });
+    db.cliDevice.updateMany.mockImplementation(async (arg) => {
+      const { where, data } = arg as {
+        where: { connectionGeneration?: number };
+        data: { status?: string };
+      };
+      if (where.connectionGeneration !== undefined && where.connectionGeneration !== row.generation)
+        return { count: 0 };
+      if (data.status) row.status = data.status;
+      return { count: 1 };
+    });
+    const manager = new RelaySessionManager();
+    const a = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: a, identity: deviceIdentity("a"), now });
+    let releaseA: () => void = () => {};
+    const gateA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    db.$transaction.mockImplementationOnce(async (callback: (tx: typeof db) => unknown) => {
+      const committed = await callback(db);
+      await gateA;
+      return committed;
+    });
+    const helloA = manager.handleTextFrame(a, helloFrame(), now);
+    await vi.waitFor(() => expect(row.generation).toBe(1));
+
+    const b = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: b, identity: deviceIdentity("b"), now });
+    const heldB = holdNextRegistration();
+    const helloB = manager.handleTextFrame(b, helloFrame(), now);
+    await heldB.started;
+    await manager.removeSession(b, now);
+    heldB.release();
+    await helloB;
+    expect(row).toEqual({ generation: 2, status: "DISCONNECTED" });
+
+    releaseA();
+    await helloA;
+    expect(a.closes).toEqual([{ code: 1000, reason: "replaced" }]);
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
+    expect(a.sends.some((frame) => String(frame).includes("hello.ok"))).toBe(false);
+    manager.dispose();
+  });
+
+  it("refuses a heartbeat write whose session generation was superseded", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    await manager.handleTextFrame(socket, helloFrame(), now);
+    // The stored row moved to generation 2 (successor) or is no longer
+    // CONNECTED: the fenced heartbeat matches nothing and cannot resurrect it.
+    db.cliDevice.updateMany.mockImplementation(async (arg) => {
+      const where = (arg as { where: { connectionGeneration?: number; status?: string } }).where;
+      return { count: where.connectionGeneration === 2 && where.status === "CONNECTED" ? 1 : 0 };
+    });
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "heartbeat", id: "hb" }),
+      new Date(now.getTime() + 1_000),
+    );
+    expect(db.cliDevice.updateMany).toHaveBeenLastCalledWith({
+      where: { id: "cli-device-id", connectionGeneration: 1, status: "CONNECTED" },
+      data: { lastHeartbeatAt: new Date(now.getTime() + 1_000) },
+    });
+    // Still answers the CLI, so a fenced write never turns into a fatal error.
+    expect(JSON.parse(String(socket.sends.at(-1))).type).toBe("heartbeat.pong");
     manager.dispose();
   });
 
@@ -846,10 +1196,10 @@ describe("RelaySessionManager", () => {
       heartbeatAt,
     );
 
-    expect(db.cliDevice.update).toHaveBeenCalledWith({
-      where: { id: "cli-device-id" },
-      data: { status: "CONNECTED", lastHeartbeatAt: heartbeatAt },
-      select: { id: true },
+    // Fenced by this session's connection generation and a still-CONNECTED row.
+    expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
+      where: { id: "cli-device-id", connectionGeneration: 1, status: "CONNECTED" },
+      data: { lastHeartbeatAt: heartbeatAt },
     });
     expect(JSON.parse(String(socket.sends.at(-1)))).toEqual({
       type: "heartbeat.pong",
@@ -868,19 +1218,26 @@ describe("RelaySessionManager", () => {
     await manager.removeSession(socket, closedAt);
 
     expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
-      where: { id: "cli-device-id" },
+      where: { id: "cli-device-id", connectionGeneration: 1 },
       data: { status: "DISCONNECTED", lastDisconnectedAt: closedAt },
     });
     expect(db.poolMember.findMany).toHaveBeenLastCalledWith({
       where: {
+        NOT: expect.objectContaining({ healthStatus: { in: ["UNHEALTHY", "DEGRADED"] } }),
         OR: [
           {
             executionTargetId: { not: null },
-            ExecutionTarget: { DiscoveredModel: { Endpoint: { cliDeviceId: "cli-device-id" } } },
+            ExecutionTarget: {
+              DiscoveredModel: {
+                Endpoint: { cliDeviceId: "cli-device-id", CliDevice: { connectionGeneration: 1 } },
+              },
+            },
           },
           {
             executionTargetId: null,
-            DiscoveredModel: { Endpoint: { cliDeviceId: "cli-device-id" } },
+            DiscoveredModel: {
+              Endpoint: { cliDeviceId: "cli-device-id", CliDevice: { connectionGeneration: 1 } },
+            },
           },
         ],
       },
@@ -888,7 +1245,10 @@ describe("RelaySessionManager", () => {
       select: { id: true },
     });
     expect(db.poolMember.updateMany).toHaveBeenLastCalledWith({
-      where: { id: "pool-member-id" },
+      where: {
+        id: "pool-member-id",
+        NOT: expect.objectContaining({ healthStatus: { in: ["UNHEALTHY", "DEGRADED"] } }),
+      },
       data: {
         healthStatus: "UNHEALTHY",
         lastFailureClass: "WEBSOCKET_DISCONNECTED",
@@ -899,6 +1259,263 @@ describe("RelaySessionManager", () => {
       },
     });
     expect(manager.getActiveCliDeviceIds()).toEqual([]);
+  });
+
+  it("makes disconnect-opened pool members due on a reconnect hello", async () => {
+    const manager = new RelaySessionManager();
+    const first = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: first, identity, now });
+    await manager.handleTextFrame(first, helloFrame(), now);
+    await manager.removeSession(first, new Date(now.getTime() + 1_000));
+
+    db.poolMember.updateMany.mockClear();
+    const second = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: second, identity, now });
+    await manager.handleTextFrame(second, helloFrame(), now);
+
+    const dueCall = db.poolMember.updateMany.mock.calls.find(
+      ([arg]) => arg?.data && "nextRetryAt" in arg.data && arg.where.healthStatus === "UNHEALTHY",
+    );
+    expect(dueCall?.[0]).toMatchObject({
+      where: {
+        healthStatus: "UNHEALTHY",
+        lastFailureClass: { in: ["WEBSOCKET_DISCONNECTED", "STALE_SESSION"] },
+        nextRetryAt: { gt: expect.any(Date) },
+      },
+      data: { nextRetryAt: expect.any(Date) },
+    });
+    // Only the due time moves: a real failure state is never cleared here.
+    expect(Object.keys(dueCall?.[0].data)).toEqual(["nextRetryAt"]);
+    expect(JSON.parse(String(second.sends[0])).type).toBe("hello.ok");
+  });
+
+  it("refuses a stale disconnect write after a successor hello claimed the device", async () => {
+    const manager = new RelaySessionManager();
+    const stale = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: stale, identity, now });
+    await manager.handleTextFrame(stale, helloFrame(), now);
+
+    // Simulate the stored device row having generation 2 by the time a
+    // generation-1 (stale) write applies; an unfenced write matches (count 1),
+    // which is what makes this test fail without the fence.
+    db.cliDevice.updateMany.mockImplementation(async (arg) => ({
+      count:
+        (arg as { where: { connectionGeneration?: number } }).where.connectionGeneration ===
+          undefined ||
+        (arg as { where: { connectionGeneration?: number } }).where.connectionGeneration === 2
+          ? 1
+          : 0,
+    }));
+
+    // Gate the successor's registration transaction so the old close lands
+    // while that registration is in flight — the widest window of the race (a
+    // serializable transaction with up to three retries). At this point the
+    // old session still owns sessionsByCliDeviceId, so detachSession's
+    // ownership check passes and the disconnect chain is issued; a check
+    // against that map would not catch the stale close.
+    const held = holdNextRegistration();
+    const successor = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: successor, identity, now });
+    const hello = manager.handleTextFrame(successor, helloFrame(), now);
+    await held.started;
+
+    // The old socket's close arrives mid-registration. detachSession sees the
+    // (stale) session as the device's owner and issues the disconnect chain.
+    const disconnectAt = new Date(now.getTime() + 5_000);
+    await manager.removeSession(stale, disconnectAt);
+
+    held.release();
+    await hello;
+    expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
+    expect(JSON.parse(String(successor.sends[0])).type).toBe("hello.ok");
+
+    // The write is scoped to the generation the stale session held...
+    expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
+      where: { id: "cli-device-id", connectionGeneration: 1 },
+      data: { status: "DISCONNECTED", lastDisconnectedAt: disconnectAt },
+    });
+    // ...matched no row, and never ran the member write that would have
+    // re-imposed the 60 s circuit-open over the hello's due-write.
+    expect(db.poolMember.updateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ healthStatus: "UNHEALTHY" }),
+      }),
+    );
+    manager.dispose();
+  });
+
+  it("keeps a disconnect only for a generation that has no successor", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    await manager.handleTextFrame(socket, helloFrame(), now);
+    db.poolMember.updateMany.mockClear();
+
+    // No successor: the stored generation still equals the detached session's,
+    // so the disconnect write applies (the fence must not swallow genuine
+    // disconnects).
+    const closedAt = new Date(now.getTime() + 1_000);
+    await manager.removeSession(socket, closedAt);
+
+    expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
+      where: { id: "cli-device-id", connectionGeneration: 1 },
+      data: { status: "DISCONNECTED", lastDisconnectedAt: closedAt },
+    });
+    expect(db.poolMember.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          OR: expect.arrayContaining([
+            expect.objectContaining({
+              DiscoveredModel: expect.objectContaining({
+                Endpoint: expect.objectContaining({
+                  CliDevice: { connectionGeneration: 1 },
+                }),
+              }),
+            }),
+          ]),
+        }),
+      }),
+    );
+    expect(db.poolMember.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ id: "pool-member-id" }) }),
+    );
+    manager.dispose();
+  });
+
+  it("writes nothing for a session that never claimed a generation (fail closed)", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    db.cliDevice.upsert.mockResolvedValueOnce({
+      id: "cli-device-id",
+      userId: "user-id",
+      slug: "desktop",
+    });
+    await manager.handleTextFrame(socket, helloFrame(), now);
+    db.cliDevice.updateMany.mockClear();
+    db.poolMember.updateMany.mockClear();
+
+    // A registration that reported no generation must not degrade the write
+    // into an unfenced one (`undefined` would drop the filter key in Prisma),
+    // so it writes nothing and the normal heartbeat path restores presence.
+    await manager.removeSession(socket, new Date(now.getTime() + 1_000));
+
+    expect(db.cliDevice.updateMany).not.toHaveBeenCalled();
+    expect(db.poolMember.updateMany).not.toHaveBeenCalled();
+    expect(manager.getActiveCliDeviceIds()).toEqual([]);
+    manager.dispose();
+  });
+
+  it("makes a disconnected device's members routable through a real reconnect hello", async () => {
+    // AC #113 end to end over the manager + the routing decision (not wall
+    // clock): disconnect -> the members cool for the full cooldown -> a
+    // reconnect hello -> the member is due and reads as a routable HALF_OPEN
+    // candidate for that device. Runs on the real clock because the hello's
+    // due-write stamps `new Date()` (session-manager.ts:686), exactly as in
+    // production.
+    const { selectPoolRouteSequence } = await import("@ws-model-proxy/api/lib/model-pool-routing");
+    const { PoolMemberRecoveryScheduler } = await import("./pool-member-recovery.js");
+    const wake = vi.spyOn(PoolMemberRecoveryScheduler.prototype, "wake");
+    const manager = new RelaySessionManager();
+    const first = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: first, identity, now });
+    await manager.handleTextFrame(first, helloFrame(), now);
+
+    const members = [
+      {
+        id: "member-1",
+        poolId: "pool-1",
+        discoveredModelId: "model-1",
+        weight: 1,
+        healthStatus: "HEALTHY" as "HEALTHY" | "UNHEALTHY",
+        routingStatus: "ACTIVE" as const,
+        lastFailureClass: null,
+        consecutiveRetryableFailures: 0,
+        lastFailureAt: null,
+        nextRetryAt: null as Date | null,
+        halfOpenTrialStartedAt: null,
+        // A directly-configured member: selectPoolRouteSequence falls back to
+        // DiscoveredModel when there is no execution target.
+        ExecutionTarget: undefined,
+        DiscoveredModel: {
+          published: true,
+          upstreamModelId: "llama",
+          Endpoint: {
+            id: "endpoint-1",
+            slug: "local",
+            published: true,
+            cliDeviceId: "cli-device-id",
+            status: "ONLINE",
+            CliDevice: { status: "CONNECTED" as string },
+          },
+        },
+      },
+    ];
+    db.poolMember.findMany.mockImplementation(async () => members);
+    // The disconnect and the due-write transition the same in-memory rows the
+    // way their SQL does.
+    db.poolMember.updateMany.mockImplementation(
+      async (arg: { data: { healthStatus?: string; nextRetryAt?: Date } }) => {
+        if (arg.data.healthStatus === "UNHEALTHY") {
+          members[0]!.healthStatus = "UNHEALTHY";
+          members[0]!.nextRetryAt = arg.data.nextRetryAt ?? new Date();
+          return { count: 1 };
+        }
+        if (arg.data.nextRetryAt !== undefined) {
+          members[0]!.nextRetryAt = arg.data.nextRetryAt;
+          return { count: 1 };
+        }
+        return { count: 0 };
+      },
+    );
+    const select = () =>
+      selectPoolRouteSequence({
+        poolId: "pool-1",
+        activeCliDeviceIds: manager.getActiveCliDeviceIds(),
+        now: new Date(),
+      });
+
+    const startedAt = Date.now();
+    await manager.removeSession(first, new Date());
+    expect(members[0]!.healthStatus).toBe("UNHEALTHY");
+    // Cooling: the disconnect opened the member for the full 60 s cooldown.
+    expect(members[0]!.nextRetryAt!.getTime()).toBeGreaterThanOrEqual(startedAt + 60_000);
+    expect((await select()).ok).toBe(false);
+
+    const second = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: second, identity, now });
+    await manager.handleTextFrame(second, helloFrame(), now);
+
+    // The hello's due-write pulled the cooldown to now; the same member is now
+    // a routable HALF_OPEN candidate.
+    expect(members[0]!.nextRetryAt!.getTime()).toBeLessThanOrEqual(Date.now());
+    await expect(select()).resolves.toMatchObject({
+      ok: true,
+      candidates: [{ poolMemberId: "member-1", healthStatus: "HALF_OPEN" }],
+    });
+    // The recovery scheduler was woken so the probe runs without waiting for
+    // the disconnect cooldown (issue #113's "probed at once").
+    expect(wake).toHaveBeenCalled();
+    wake.mockRestore();
+    manager.dispose();
+  });
+
+  it("still accepts a hello when the reconnect health update fails", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    db.poolMember.updateMany.mockImplementation(
+      async (arg: { where: { healthStatus?: string } }) => {
+        if (arg.where.healthStatus === "UNHEALTHY") throw new Error("db down");
+        return { count: 0 };
+      },
+    );
+    try {
+      await manager.handleTextFrame(socket, helloFrame(), now);
+    } finally {
+      db.poolMember.updateMany.mockReset();
+    }
+    expect(JSON.parse(String(socket.sends[0])).type).toBe("hello.ok");
   });
 
   it("marks stale sessions and their pool members unavailable", async () => {
@@ -912,19 +1529,26 @@ describe("RelaySessionManager", () => {
 
     expect(socket.closes).toEqual([{ code: 1001, reason: "stale" }]);
     expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
-      where: { id: "cli-device-id" },
+      where: { id: "cli-device-id", connectionGeneration: 1 },
       data: { status: "STALE", lastDisconnectedAt: staleAt },
     });
     expect(db.poolMember.findMany).toHaveBeenLastCalledWith({
       where: {
+        NOT: expect.objectContaining({ healthStatus: { in: ["UNHEALTHY", "DEGRADED"] } }),
         OR: [
           {
             executionTargetId: { not: null },
-            ExecutionTarget: { DiscoveredModel: { Endpoint: { cliDeviceId: "cli-device-id" } } },
+            ExecutionTarget: {
+              DiscoveredModel: {
+                Endpoint: { cliDeviceId: "cli-device-id", CliDevice: { connectionGeneration: 1 } },
+              },
+            },
           },
           {
             executionTargetId: null,
-            DiscoveredModel: { Endpoint: { cliDeviceId: "cli-device-id" } },
+            DiscoveredModel: {
+              Endpoint: { cliDeviceId: "cli-device-id", CliDevice: { connectionGeneration: 1 } },
+            },
           },
         ],
       },
@@ -932,7 +1556,10 @@ describe("RelaySessionManager", () => {
       select: { id: true },
     });
     expect(db.poolMember.updateMany).toHaveBeenLastCalledWith({
-      where: { id: "pool-member-id" },
+      where: {
+        id: "pool-member-id",
+        NOT: expect.objectContaining({ healthStatus: { in: ["UNHEALTHY", "DEGRADED"] } }),
+      },
       data: {
         healthStatus: "UNHEALTHY",
         lastFailureClass: "STALE_SESSION",
@@ -1365,6 +1992,7 @@ describe("relay terminal and exec sessions", () => {
       slug: "desktop",
       allowHumanTerminal: true,
       mcpCommandMode: "UNSUPERVISED",
+      connectionGeneration: 1,
     });
   });
 
@@ -1733,6 +2361,7 @@ describe("relay terminal and exec sessions", () => {
       slug: "desktop",
       allowHumanTerminal: true,
       mcpCommandMode: "UNSUPERVISED",
+      connectionGeneration: 1,
     });
     const again = new FakeSocket();
     await register(manager, again);
@@ -1776,6 +2405,7 @@ describe("relay terminal and exec sessions", () => {
     await manager.removeSession(survivor, now);
     expect(db.cliDevice.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
+        where: expect.objectContaining({ id: "cli-device-id", connectionGeneration: 1 }),
         data: expect.objectContaining({ status: "DISCONNECTED" }),
       }),
     );
@@ -1844,6 +2474,7 @@ describe("relay protocol 2.5 terminal viewers", () => {
       slug: "desktop",
       allowHumanTerminal: true,
       mcpCommandMode: "UNSUPERVISED",
+      connectionGeneration: 1,
     });
     events = [];
     const { registerTerminalBridge } = await import("./session-manager.js");
@@ -2402,6 +3033,64 @@ describe("relay 2.7 telemetry", () => {
     manager.dispose();
   });
 
+  const waitingLoad = (waiting: number, extra: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      type: "endpoint.load",
+      endpointSlug: "vllm",
+      running: 4,
+      waiting,
+      source: "vllm-metrics",
+      ts: "2026-01-01T00:00:00.000Z",
+      ...extra,
+    });
+  const liveLoad = (manager: InstanceType<typeof RelaySessionManager>) =>
+    manager.getLiveNodeTelemetry(["cli-device-id"]).get("cli-device-id")?.endpointLoad[0];
+
+  it("counts consecutive accepted waiting frames; zero or a gap resets the streak (S-D)", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, waitingLoad(2), now);
+    expect(liveLoad(manager)?.waitingStreak).toBe(1);
+    // A frame dropped by the 1 s limiter does not count.
+    await manager.handleTextFrame(socket, waitingLoad(2), at(500));
+    expect(liveLoad(manager)?.waitingStreak).toBe(1);
+    await manager.handleTextFrame(socket, waitingLoad(1), at(3_000));
+    expect(liveLoad(manager)?.waitingStreak).toBe(2);
+    await manager.handleTextFrame(socket, waitingLoad(3), at(6_000));
+    expect(liveLoad(manager)?.waitingStreak).toBe(3);
+    await manager.handleTextFrame(socket, waitingLoad(0), at(9_000));
+    expect(liveLoad(manager)?.waitingStreak).toBe(0);
+    await manager.handleTextFrame(socket, waitingLoad(2), at(12_000));
+    expect(liveLoad(manager)?.waitingStreak).toBe(1);
+    // A gap longer than the staleness window restarts the count (fail open).
+    await manager.handleTextFrame(socket, waitingLoad(2), at(12_000 + 16_000));
+    expect(liveLoad(manager)?.waitingStreak).toBe(1);
+    manager.dispose();
+  });
+
+  it("accumulates prefix cache deltas per key, including those of rate-limited frames (S-D)", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(
+      socket,
+      waitingLoad(0, { prefixCacheHitsDelta: 10, prefixCacheQueriesDelta: 40 }),
+      now,
+    );
+    await manager.handleTextFrame(
+      socket,
+      waitingLoad(0, { prefixCacheHitsDelta: 5, prefixCacheQueriesDelta: 5 }),
+      at(200),
+    );
+    await manager.handleTextFrame(
+      socket,
+      waitingLoad(0, { prefixCacheHitsDelta: 1, prefixCacheQueriesDelta: 2 }),
+      at(3_000),
+    );
+    expect(liveLoad(manager)).toMatchObject({
+      prefixCacheHitsTotal: 16,
+      prefixCacheQueriesTotal: 47,
+    });
+    manager.dispose();
+  });
+
   it("bounds the endpoint load keys a session keeps", async () => {
     const { ENDPOINT_LOAD_MAX_KEYS } = await import("./session-manager.js");
     const { manager, socket } = await registered();
@@ -2464,6 +3153,358 @@ describe("relay 2.7 telemetry", () => {
       },
     ]);
     manager.dispose();
+  });
+
+  const fansSource = {
+    name: "fans",
+    command: "sensors -j",
+    intervalSecs: 10,
+    timeoutSecs: 5,
+    format: "json",
+  };
+  function sourceFrames(socket: FakeSocket) {
+    return socket.sends
+      .map((send) => JSON.parse(String(send)) as { type: string; sources?: unknown[] })
+      .filter((frame) => frame.type === "metrics.sources.set");
+  }
+
+  it("sends remote metric sources after hello.ok only while the device is unsupervised", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const unsupervised = await registered();
+    expect(JSON.parse(String(unsupervised.socket.sends[0]))).toMatchObject({ type: "hello.ok" });
+    expect(sourceFrames(unsupervised.socket)).toEqual([
+      expect.objectContaining({ type: "metrics.sources.set", sources: [fansSource] }),
+    ]);
+    unsupervised.manager.dispose();
+
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "SUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const supervised = await registered();
+    expect(sourceFrames(supervised.socket)).toEqual([
+      expect.objectContaining({ type: "metrics.sources.set", sources: [] }),
+    ]);
+    supervised.manager.dispose();
+  });
+
+  it("orders remote source sends: a withdrawal is never overtaken by an older read", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "SUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const { manager, socket } = await registered();
+    socket.sends.length = 0;
+    // The first read is slow and sees the old (unsupervised) state; the
+    // mode is then lowered and a second send is requested.
+    const readsBefore = findUnique.mock.calls.length;
+    let release: (value: unknown) => void = () => undefined;
+    findUnique.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    const first = manager.onRemoteMetricSourcesChanged("cli-device-id");
+    // The first send's read is in flight before the mode changes.
+    await vi.waitFor(() => expect(findUnique).toHaveBeenCalledTimes(1 + readsBefore));
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "SUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const second = manager.onRemoteMetricSourcesChanged("cli-device-id");
+    release({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    await Promise.all([first, second]);
+    const frames = sourceFrames(socket).map((frame) => frame.sources);
+    expect(frames.at(-1)).toEqual([]);
+    manager.dispose();
+  });
+
+  it("fails closed: a failed device read withdraws the sources and reports no delivery", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const { manager, socket } = await registered();
+    expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[fansSource]]);
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    for (const failure of [
+      () => findUnique.mockRejectedValueOnce(new Error("db down")),
+      () => findUnique.mockResolvedValueOnce(null),
+      () =>
+        findUnique.mockResolvedValueOnce({
+          userId: "someone-else",
+          mcpCommandMode: "UNSUPERVISED",
+          remoteMetricSources: [fansSource],
+        }),
+    ]) {
+      socket.sends.length = 0;
+      failure();
+      await expect(manager.onRemoteMetricSourcesChanged("cli-device-id")).resolves.toBe(false);
+      expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[]]);
+    }
+    consoleError.mockRestore();
+    // A healthy read afterwards delivers again.
+    socket.sends.length = 0;
+    await expect(manager.onRemoteMetricSourcesChanged("cli-device-id")).resolves.toBe(true);
+    expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[fansSource]]);
+    manager.dispose();
+  });
+
+  it("clears a pool's verdicts through the H module when its rules change", async () => {
+    const deep = prisma as unknown as {
+      poolMemberRoutingVerdict: { deleteMany: MockInstance };
+    };
+    deep.poolMemberRoutingVerdict.deleteMany.mockResolvedValue({ count: 1 });
+    const manager = new RelaySessionManager();
+    await manager.onPoolRoutingRulesChanged("pool-1");
+    expect(deep.poolMemberRoutingVerdict.deleteMany).toHaveBeenCalledWith({
+      where: { poolId: "pool-1", verdict: { not: "NONE" } },
+    });
+    manager.dispose();
+  });
+
+  it("withdraws the sources on a mode downgrade even when the grant re-read fails", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const { manager, socket } = await registered();
+    socket.sends.length = 0;
+    // The downgrade is committed; the hook's own grant read fails, the
+    // push's read (a later call) sees the committed OFF mode.
+    findUnique.mockRejectedValueOnce(new Error("db down"));
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "OFF",
+      remoteMetricSources: [fansSource],
+    });
+    await expect(manager.onCliFeatureGrantsChanged("cli-device-id")).rejects.toThrow("db down");
+    expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[]]);
+    manager.dispose();
+  });
+
+  it("never sends an oversized remote source list: the CLI gets an empty one", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: Array.from({ length: 51 }, (_, index) => ({
+        ...fansSource,
+        name: `source-${index}`,
+      })),
+    });
+    const { manager, socket } = await registered();
+    expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[]]);
+    manager.dispose();
+  });
+
+  it("withdraws remote metric sources when the MCP command mode is lowered", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      allowHumanTerminal: false,
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [fansSource],
+    });
+    const { manager, socket } = await registered();
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      allowHumanTerminal: false,
+      mcpCommandMode: "OFF",
+      remoteMetricSources: [fansSource],
+    });
+    await manager.onCliFeatureGrantsChanged("cli-device-id");
+    expect(sourceFrames(socket).map((frame) => frame.sources)).toEqual([[fansSource], []]);
+    // Changing the definitions pushes them to the live session.
+    expect(await manager.onRemoteMetricSourcesChanged("cli-device-id")).toBe(true);
+    expect(await manager.onRemoteMetricSourcesChanged("other-device")).toBe(false);
+    manager.dispose();
+  });
+
+  it("evaluates pool routing rules on node.metrics and writes the member verdict", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const deep = prisma as unknown as {
+        poolMember: { findMany: MockInstance };
+        modelPool: { findMany: MockInstance };
+        poolMemberRoutingVerdict: { updateMany: MockInstance; create: MockInstance };
+      };
+      const routingRules = [
+        { metric: "node.cpu.usage_percent", op: ">", threshold: 10, effect: "full" },
+      ];
+      deep.modelPool.findMany.mockResolvedValue([{ id: "pool-1", routingRules }]);
+      deep.poolMember.findMany.mockResolvedValue([
+        {
+          id: "member-1",
+          poolId: "pool-1",
+          ModelPool: {
+            routingRules,
+          },
+          DiscoveredModel: null,
+          ExecutionTarget: { DiscoveredModel: { slug: null, Endpoint: { slug: "example" } } },
+        },
+      ]);
+      deep.poolMemberRoutingVerdict.updateMany.mockResolvedValue({ count: 0 });
+      deep.poolMemberRoutingVerdict.create.mockResolvedValue({});
+      const { manager, socket } = await registered();
+      await manager.handleTextFrame(socket, metrics("2026-01-01T00:00:00.000Z"), now);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deep.poolMemberRoutingVerdict.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          poolMemberId: "member-1",
+          verdict: "FULL",
+          cliDeviceId: "cli-device-id",
+          userId: "user-id",
+        }),
+      });
+      manager.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("evaluates pool routing on an endpoint.load frame and writes the engine-load verdict (S-D)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const deep = prisma as unknown as {
+        poolMember: { findMany: MockInstance };
+        modelPool: { findMany: MockInstance };
+        poolMemberRoutingVerdict: { updateMany: MockInstance; create: MockInstance };
+      };
+      deep.modelPool.findMany.mockResolvedValue([]);
+      deep.poolMember.findMany.mockResolvedValue([
+        {
+          id: "member-1",
+          poolId: "pool-1",
+          engineLoadMode: "AUTO",
+          kvFullThreshold: null,
+          ModelPool: { routingRules: [] },
+          DiscoveredModel: null,
+          ExecutionTarget: {
+            InferenceCapacity: { engineKind: "VLLM", engineSlots: null },
+            DiscoveredModel: { slug: null, Endpoint: { slug: "vllm" } },
+          },
+        },
+      ]);
+      deep.poolMemberRoutingVerdict.updateMany.mockResolvedValue({ count: 0 });
+      deep.poolMemberRoutingVerdict.create.mockResolvedValue({});
+      const { manager, socket } = await registered();
+      // The first accepted waiting frame is streak 1: below the sustained
+      // threshold, the evaluation publishes only the successor NONE fence.
+      await manager.handleTextFrame(socket, waitingLoad(2), now);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deep.poolMemberRoutingVerdict.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ verdict: "NONE", engineState: "clear" }),
+      });
+      // A second accepted frame within the staleness window makes streak 2.
+      vi.setSystemTime(at(3_000));
+      await manager.handleTextFrame(socket, waitingLoad(2), at(3_000));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deep.poolMemberRoutingVerdict.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          poolMemberId: "member-1",
+          verdict: "FULL",
+          engineState: "full_waiting",
+          cliDeviceId: "cli-device-id",
+          userId: "user-id",
+        }),
+      });
+      manager.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not schedule an evaluation for an endpoint.load frame the limiter drops (S-D)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const deep = prisma as unknown as {
+        poolMember: { findMany: MockInstance };
+        modelPool: { findMany: MockInstance };
+      };
+      deep.poolMember.findMany.mockResolvedValue([]);
+      deep.modelPool.findMany.mockResolvedValue([]);
+      // The recovery scheduler also reads poolMember on its own timer; the
+      // routing evaluation is the only reader filtering on `tier`.
+      const routingRuns = () =>
+        deep.poolMember.findMany.mock.calls.filter(
+          (call) => (call[0] as { where?: { tier?: string } }).where?.tier === "PRIMARY",
+        ).length;
+      const { manager, socket } = await registered();
+      await manager.handleTextFrame(socket, waitingLoad(2), now);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(routingRuns()).toBe(1);
+      // Inside the 1 s limiter the frame is dropped: no evaluation now and no
+      // trailing one either, so advancing past the window changes nothing.
+      await manager.handleTextFrame(socket, waitingLoad(2), at(500));
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(routingRuns()).toBe(1);
+      manager.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a replaced session runs no pending evaluation after its successor's hello (S-D)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const deep = prisma as unknown as {
+        poolMember: { findMany: MockInstance };
+        modelPool: { findMany: MockInstance };
+      };
+      deep.poolMember.findMany.mockResolvedValue([]);
+      deep.modelPool.findMany.mockResolvedValue([]);
+      const routingRuns = () =>
+        deep.poolMember.findMany.mock.calls.filter(
+          (call) => (call[0] as { where?: { tier?: string } }).where?.tier === "PRIMARY",
+        ).length;
+      const { manager, socket } = await registered();
+      await manager.handleTextFrame(socket, waitingLoad(2), now);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(routingRuns()).toBe(1);
+      // A second frame inside the 1 s window leaves a trailing run pending.
+      vi.setSystemTime(at(1_100));
+      await manager.handleTextFrame(socket, waitingLoad(2), at(1_100));
+      // The CLI reconnects before the old socket closed: the old session is
+      // replaced and its pending run must never publish over the successor.
+      const successor = new FakeSocket();
+      manager.acceptAuthenticatedSocket({ socket: successor, identity, now: at(1_100) });
+      await manager.handleTextFrame(successor, helloFrame(), at(1_100));
+      expect(socket.closes).toEqual([{ code: 1000, reason: "replaced" }]);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(routingRuns()).toBe(1);
+      manager.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("requires registration before telemetry", async () => {

@@ -88,7 +88,31 @@ export const HISTORY_DRAIN_EDGES = {
   provider_budget_reservation: { delete: [], internal: [] },
   provider_budget_settlement: { delete: [], internal: ["reservationId"] },
   provider_usage_ledger: { delete: [], internal: ["reservationId"] },
+  // An expiring cache of the relay's rule evaluator (metric routing verdicts):
+  // never drained. Its rows carry only rule states and an expiry (at most 90 s for
+  // built-in metrics, up to three source intervals for a custom one); the
+  // retention sweep (usage-retention.ts) deletes every row expired more than
+  // an hour ago, including those of a deleted user's pools, and readers
+  // ignore expired rows.
+  pool_member_routing_verdict: { delete: [], internal: [] },
 } as const satisfies Record<string, { delete: readonly DrainEdge[]; internal: readonly string[] }>;
+
+/**
+ * History tables that carry a user id as a PLAIN column (no foreign key): the
+ * cascade never reaches them, so a whole-user delete drains them by this
+ * column in bounded batches (`drainParentDeletionHistory`) and the residual
+ * count ignores them (they are not part of the locked cascade). The catalog
+ * test requires every table with a `userId`-like column and no foreign key to
+ * be listed here or in `PLAIN_USER_ID_EXEMPT` there, so a new plain-id table
+ * cannot ship unclassified. A row the drain skipped (locked) or one written
+ * after the drain (a queued audit write, another replica) is taken by the
+ * deleted-user purge (`purgeDeletedUserHistory`, driven by the
+ * `deleted_user_purge` queue entry the delete writes), which also counts these
+ * tables as remaining; the 90-day retention sweep is the last bound.
+ */
+export const USER_PLAIN_ID_HISTORY_TABLES = {
+  cli_agent_action_event: { userColumn: "userId" },
+} as const satisfies Record<string, { userColumn: string }>;
 
 /**
  * Drain budget exceeded, or a drain batch hit its own timeout; completion

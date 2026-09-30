@@ -53,6 +53,40 @@ describe("relay maintenance", () => {
     expect(deps.terminalHub.recheckSessions).not.toHaveBeenCalled();
   });
 
+  it("stop flushes the agent audit queue after the running sweeps settle, and logs a failed flush by class", async () => {
+    const order: string[] = [];
+    const deps = {
+      ...fakes(),
+      stopCliAgentAudit: vi.fn(async () => {
+        order.push("audit");
+      }),
+    };
+    let release!: () => void;
+    deps.terminalHub.recheckSessions.mockImplementation(
+      () =>
+        new Promise<undefined>((resolve) => {
+          release = () => {
+            order.push("sweep");
+            resolve(undefined);
+          };
+        }),
+    );
+    const stop = startRelayMaintenance(deps);
+    await vi.advanceTimersByTimeAsync(TERMINAL_SESSION_RECHECK_INTERVAL_MS);
+    const stopping = stop();
+    await Promise.resolve();
+    expect(deps.stopCliAgentAudit).not.toHaveBeenCalled();
+    release();
+    await stopping;
+    expect(order).toEqual(["sweep", "audit"]);
+
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    deps.stopCliAgentAudit.mockRejectedValue(new TypeError("secret detail"));
+    await startRelayMaintenance(deps)();
+    expect(errors).toHaveBeenCalledWith("[server] agent audit flush failed", "TypeError");
+    expect(JSON.stringify(errors.mock.calls)).not.toContain("secret detail");
+  });
+
   it("a failing sweep is logged by class and does not stop the others", async () => {
     const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const deps = fakes();

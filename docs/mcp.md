@@ -22,6 +22,61 @@ every capacity in `capacity_records_list`. Neither ever contains prompt text:
 the CLI reads only slot ids, context sizes and busy flags from llama.cpp
 `/slots`.
 
+`forwarder_device_metrics_get` also lists `series`: every metric a pool routing
+rule can name on that device (built-in `node.*` series such as
+`node.cpu.usage_percent`, `node.memory.used_percent` or
+`node.gpu.temperature_c{gpu="0"}`, and the CLI's custom series), with its
+labels, latest value and whether it is stale. It also returns the remote metric
+source definitions the server holds (`remoteMetricSources`, each with the
+`commandSha256` the CLI pins) next to the CLI's own view of every source in
+`nodeMetrics.sources` (`active`, `pending_approval`, `refused`, ...).
+
+Metric routing rules (S-B part 2):
+
+- `forwarder_pool_routing_rules_get` (`{ poolId }`) returns the pool's rules,
+  each primary member's current verdict (`full`, `avoid` or none), its state
+  (`active`, `stale`, `unevaluated`), a per-rule `triggered` / `clear` /
+  `stale` state, the member's `endpoint.*` load series (`endpoint.running`,
+  `endpoint.waiting`, `endpoint.kv_usage`, ...) and the series of each member's
+  device. Each member also carries `engineLoad` (S-D): its override `mode`
+  (`auto` / `off`), the engine kind and slots, the live reading (`running`,
+  `waiting`, `kvUsage`, `slotsBusy`, `deferred`, age, `stale`, prefix cache
+  totals) and the verdict state (`full_waiting`, `full_kv`, `full_slots`,
+  `full_deferred`, `clear`, `stale`, `none`, `off`).
+- `forwarder_pool_member_engine_load_set` (`{ poolMemberId, mode: "auto" |
+  "off", kvFullThreshold?, confirm: "RUN" }`) turns "use engine load" off for
+  a member or overrides its vLLM/SGLang KV threshold (default 0.95). Engine
+  load only adds FULL (lease counts stay authoritative), a stale reading is
+  ignored, and when every candidate is FULL a plain-name request is admitted by
+  leases alone. Classified `cost` like the rules.
+- `forwarder_pool_routing_rules_set` (`{ poolId, rules, confirm: "RUN" }`)
+  replaces the whole list (at most 16). A rule is a flat record
+  `{ metric, labels?, aggregate: "max", op: ">" | ">=" | "<" | "<=",
+  threshold, effect: "full" | "avoid" }`; there is no expression language.
+  Label keys and values use the metric-name charset, and `__proto__` is not
+  accepted as a label key (the rule is rejected, never widened).
+  `full` makes the member FULL: the request queues, goes to another member, or
+  (for `:external` callers only) goes external after `externalAfterWaitMs`.
+  `avoid` ranks the member last among free members and never makes it
+  ineligible. A stale or missing metric makes its rule inert, and when every
+  candidate is metric-FULL a plain-name request is admitted by leases alone
+  (fail open), so metrics never make a pool sit idle. It is confirmed and
+  classified `cost` because a `full` rule can send `:external` traffic to paid
+  providers.
+- `forwarder_device_metric_sources_set` (`{ cliDeviceId, sources, confirm:
+  "RUN" }`) replaces a device's remotely defined metric sources
+  (`{ name, command, intervalSecs >= 5, timeoutSecs, format: "number" | "json"
+  | "prometheus" }`). The server accepts it only while the device's MCP command
+  mode is `unsupervised`, only for a personal token minted with the CLI
+  commands option (`allowCliCommands`; OAuth clients and other tokens neither
+  see nor can call it), and sends an empty list to the CLI whenever the mode
+  is anything else. The CLI refuses remote sources unless its local
+  `allowRemoteMetricSources` opt-in is on, and runs a command only after the
+  person approves that exact command string on the machine
+  (`wsmp metrics approve <name> --sha256 <hash>`, the hash of the command they
+  read); a changed command stops until it is approved
+  again. stderr and command output never leave the CLI; only parsed numbers do.
+
 ## Setup
 
 Required environment:
@@ -491,6 +546,40 @@ starts an immediate sweep that will remove artifacts already past eligibility
   scans). Unrelated email/OTP verification records are never swept.
 - Automatic CIMD-client deletion and JWKS key deletion are deliberately
   deferred pending a separately reviewed policy.
+
+## Agent audit log
+
+Every command an MCP agent runs on a CLI device (`forwarder_cli_command_run`,
+`forwarder_cli_supervised_command_start`), including refused ones, is recorded
+in `cli_agent_action_event` (file operations join it with the file tools). The
+log is **metadata only**: who (user, device, token), what (kind, and for a
+command a keyed HMAC-SHA256 of the command text plus its program name — never
+the command text itself), when, and how it ended (`completed`, `refused`, `failed`,
+`cancelled`, `declined`, `expired`, `unknown`, with a stable reason such as
+`exit:1` or `limit`). The reason is a stable machine code: a CLI rejection frame
+(`exec.rejected`, `supervised.rejected`) whose reason is not a known code is
+stored as `rejected`, so CLI-supplied text never reaches the column. File
+content, diffs and command output are never stored, and the command's arguments
+are never stored: the server reduces the command text to its program (the
+first word, only when it is a bare name of letters, digits, `.`, `_` and `-` that
+`sh` and `cmd /C`, which the CLI uses on Windows without `sh`, both read as the
+command word: a leading `NAME=value`, a quoted word, a path, a redirection, a
+flag, a `+` or a built-in followed by `.` all store `?`, as does a command cut
+for length) and hashes the whole text (the first 16384 characters of an oversized, refused command). The digest is
+HMAC-SHA256 under a key derived from the server auth secret via HKDF-SHA256
+(fixed info `wsmp-cli-agent-audit-v1`), so a copy of the table alone cannot be
+used to check a guessed command; when the key cannot be derived the hash is
+stored as `hmac-sha256:unavailable` and still leaks nothing. Writing an
+event never blocks or fails the operation (a bounded in-process queue, dropped
+and counted when the database cannot keep up). Rows are deleted after **90
+days** by the hourly retention sweep, and with the user on account deletion
+(the deletion drain removes them; a row recorded or skipped after that drain,
+such as the cancellation of a command still running when the account is
+deleted, is removed by the deleted-user purge within its grace period, and the
+hourly retention sweep deletes any event whose user no longer exists).
+The owner reads them under `Dashboard → CLIs → Agent activity` and through
+`forwarder_cli_activity_list` (read scope; visible only to a personal token
+minted with CLI commands, like the other CLI tools).
 
 ## Rate limits (process-local)
 

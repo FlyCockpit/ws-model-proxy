@@ -16,7 +16,7 @@ import {
  * limit, reservation borrowing), then one weighted deficit round robin pick.
  * After each grant the in-memory state advances (active counts, per-owner and
  * per-scope counts, the winner's request leaves the queue, DRR state) and the
- * next step is planned. The store then persists every grant in a few batched
+ * next step is planned. The store then persists every grant in bounded batched
  * statements. Acquire (offer mode) and release/reclaim (fill mode) both go
  * through this function, so the two cannot disagree about who is served.
  */
@@ -89,9 +89,16 @@ export type GrantPlan = {
 
 type Entry = { waiter: PlannerWaiter; candidate: SchedulerCandidate };
 
-/** Waiter passes the deadline filter of one admission pass at `now`. */
-function inWindow(
-  waiter: PlannerWaiter,
+/**
+ * Waiter passes the deadline filter of one admission pass at `now`. The one
+ * definition: the planner and the metric-FULL fail-open sibling check
+ * (postgres-store) both use it, so "live candidate" means the same thing.
+ */
+export function inWindow(
+  waiter: Pick<
+    PlannerWaiter,
+    "waiterId" | "admissionRequestId" | "deadlineAt" | "requestDeadlineAt"
+  >,
   now: Date,
   creatingRequestId: string | undefined,
   lastChance: ReadonlySet<string>,
@@ -116,8 +123,12 @@ export function planGrants(
 ): GrantPlan {
   const lastChance = new Set(options.lastChanceWaiterIds ?? []);
   // Sorted once; the DRR scheduler's own sort then sees presorted input.
-  let entries: Entry[] = snapshot.waiters
-    .filter((waiter) => inWindow(waiter, now, options.creatingRequestId, lastChance))
+  const entries: Entry[] = snapshot.waiters
+    .filter(
+      (waiter) =>
+        inWindow(waiter, now, options.creatingRequestId, lastChance) &&
+        (!waiter.notBefore || waiter.notBefore <= now),
+    )
     .map((waiter) => ({
       waiter,
       candidate: {
@@ -138,15 +149,56 @@ export function planGrants(
   const reservations = snapshot.reservationsByOwner;
   let scheduler = snapshot.scheduler;
   const grants: PlannedGrant[] = [];
-  const grantable = (entry: Entry) => !entry.waiter.notBefore || entry.waiter.notBefore <= now;
   const ownerActive = (owner: string) => activeByOwner.get(owner) ?? 0;
   const scopeHasRoom = (waiter: PlannerWaiter) =>
     waiter.memberLimit === null ||
     waiter.memberLimit === undefined ||
     (scopeActive.get(waiter.scopeKey) ?? 0) < waiter.memberLimit;
 
-  // Every grant removes at least one waiter from the queue, so the queue size
-  // plus one final "nothing more" pass bounds the work; there is no constant.
+  type Queue = { entries: Entry[]; head: number; next: number[] };
+  const classes = new Map<number, Queue>();
+  const ownerQueues = new Map<string, Queue>();
+  const takenRequests = new Set<string>();
+  const remaining = new Map<string, number>();
+  let reservedRemainingTotal = 0;
+  for (const [owner, reserved] of reservations) {
+    const slots = Math.max(0, reserved - ownerActive(owner));
+    if (slots > 0) remaining.set(owner, slots);
+    reservedRemainingTotal += slots;
+  }
+  for (const entry of entries) {
+    const priority = entry.waiter.priority;
+    let queue = classes.get(priority);
+    if (!queue) {
+      queue = { entries: [], head: 0, next: [] };
+      classes.set(priority, queue);
+    }
+    queue.entries.push(entry);
+    queue.next.push(queue.entries.length);
+    const owner = entry.waiter.ownerKey;
+    if (!remaining.has(owner)) continue;
+    let ownerQueue = ownerQueues.get(owner);
+    if (!ownerQueue) {
+      ownerQueue = { entries: [], head: 0, next: [] };
+      ownerQueues.set(owner, ownerQueue);
+    }
+    ownerQueue.entries.push(entry);
+    ownerQueue.next.push(ownerQueue.entries.length);
+  }
+  for (const queue of ownerQueues.values())
+    queue.entries.sort((a, b) => b.waiter.priority - a.waiter.priority);
+  const dead = (entry: Entry) =>
+    takenRequests.has(entry.waiter.admissionRequestId) || !scopeHasRoom(entry.waiter);
+  const pruneHead = (queue: Queue) => {
+    while (queue.head < queue.entries.length && dead(queue.entries[queue.head]!))
+      queue.head = queue.next[queue.head]!;
+  };
+
+  // Sort/index once: O(W log W). Each step examines at most 32 class heads
+  // and owners with unmet reservations; permanent skips amortize to O(W).
+  // Borrow-blocked entries are temporary and may be scanned again per grant:
+  // adversarial borrowing can still cost the number of such skips per step.
+  // Every grant removes a request, so queue size bounds the number of steps.
   const maxSteps = snapshot.waiters.length + 1;
   const maxGrants = options.maxGrants ?? Number.POSITIVE_INFINITY;
   let stoppedBy: GrantPlan["stoppedBy"] = "progress";
@@ -164,34 +216,28 @@ export function planGrants(
       break;
     }
 
-    // Aggregates of this step (each O(W) once, then O(1) per waiter).
-    let reservedRemainingTotal = 0;
-    const remaining = (owner: string) =>
-      Math.max(0, (reservations.get(owner) ?? 0) - ownerActive(owner));
-    for (const owner of reservations.keys()) reservedRemainingTotal += remaining(owner);
-    // Best priority of a grantable waiter whose owner still has unmet
-    // reservation and whose scope has room ("queued reservation owner needs a
-    // slot"), for the best owner and the best among all other owners.
+    // Only reservation owners can block a borrower. Their highest live
+    // priority suffices, including when the borrower is itself an owner.
     let needy: { priority: number; owner: string; otherPriority: number } | null | undefined;
     const needyFor = (ownerKey: string): number => {
       if (needy === undefined) {
-        const byOwner = new Map<string, number>();
-        for (const entry of entries) {
-          if (!grantable(entry)) continue;
-          const owner = entry.waiter.ownerKey;
-          if ((reservations.get(owner) ?? 0) <= ownerActive(owner)) continue;
-          if (!scopeHasRoom(entry.waiter)) continue;
-          byOwner.set(owner, Math.max(byOwner.get(owner) ?? -1, entry.waiter.priority));
+        let best = -1;
+        let bestOwner = "";
+        let other = -1;
+        for (const owner of remaining.keys()) {
+          const queue = ownerQueues.get(owner);
+          if (!queue) continue;
+          pruneHead(queue);
+          const entry = queue.entries[queue.head];
+          if (!entry) continue;
+          const priority = entry.waiter.priority;
+          if (priority > best) {
+            other = best;
+            best = priority;
+            bestOwner = owner;
+          } else other = Math.max(other, priority);
         }
-        let best: [string, number] | undefined;
-        for (const pair of byOwner) if (!best || pair[1] > best[1]) best = pair;
-        if (!best) needy = null;
-        else {
-          let other = -1;
-          for (const [owner, priority] of byOwner)
-            if (owner !== best[0]) other = Math.max(other, priority);
-          needy = { priority: best[1], owner: best[0], otherPriority: other };
-        }
+        needy = best === -1 ? null : { priority: best, owner: bestOwner, otherPriority: other };
       }
       if (needy === null) return -1;
       return needy.owner === ownerKey ? needy.otherPriority : needy.priority;
@@ -199,23 +245,47 @@ export function planGrants(
 
     const eligible: Entry[] = [];
     const borrowedByWaiter = new Map<string, boolean>();
-    for (const entry of entries) {
-      const waiter = entry.waiter;
-      if (!grantable(entry)) continue;
-      if (!scopeHasRoom(waiter)) continue;
-      const reservedForOthers = Math.min(
-        limit ?? Number.MAX_SAFE_INTEGER,
-        reservedRemainingTotal - remaining(waiter.ownerKey),
-      );
-      const borrowed =
-        limit !== null &&
-        remaining(waiter.ownerKey) === 0 &&
-        reservedForOthers > 0 &&
-        limit - active <= reservedForOthers;
-      if (borrowed && needyFor(waiter.ownerKey) > waiter.priority) continue;
-      if (borrowed && waiter.borrowPolicy === "NEVER") continue;
-      eligible.push(entry);
-      borrowedByWaiter.set(waiter.waiterId, borrowed);
+    for (const queue of classes.values()) {
+      pruneHead(queue);
+      let previous: number | undefined;
+      for (let index = queue.head; index < queue.entries.length; ) {
+        const entry = queue.entries[index]!;
+        const next = queue.next[index]!;
+        if (dead(entry)) {
+          // Unlink even behind a temporary borrow blocker, so permanent
+          // skips stay amortized instead of being revisited on every grant.
+          if (previous === undefined) queue.head = next;
+          else queue.next[previous] = next;
+          index = next;
+          continue;
+        }
+        const waiter = entry.waiter;
+        const ownerRemaining = remaining.get(waiter.ownerKey) ?? 0;
+        const reservedForOthers = Math.min(
+          limit ?? Number.MAX_SAFE_INTEGER,
+          reservedRemainingTotal - ownerRemaining,
+        );
+        const borrowed =
+          limit !== null &&
+          ownerRemaining === 0 &&
+          reservedForOthers > 0 &&
+          limit - active <= reservedForOthers;
+        if (
+          borrowed &&
+          (needyFor(waiter.ownerKey) > waiter.priority || waiter.borrowPolicy === "NEVER")
+        ) {
+          // Retain temporary blockers for a later step; only dead entries
+          // can be unlinked from a class's FIFO list.
+          previous = index;
+          index = next;
+          continue;
+        }
+        eligible.push(entry);
+        borrowedByWaiter.set(waiter.waiterId, borrowed);
+        // DRR only selects queue[0] of a class; later candidates cannot
+        // affect either its winner or its deficit reset for empty classes.
+        break;
+      }
     }
     if (!eligible.length) {
       stoppedBy = "none";
@@ -243,14 +313,19 @@ export function planGrants(
     });
     // Apply the grant to the in-memory state.
     active++;
-    activeByOwner.set(winner.waiter.ownerKey, ownerActive(winner.waiter.ownerKey) + 1);
+    const owner = winner.waiter.ownerKey;
+    activeByOwner.set(owner, ownerActive(owner) + 1);
+    const slots = remaining.get(owner) ?? 0;
+    if (slots > 0) {
+      reservedRemainingTotal--;
+      if (slots === 1) remaining.delete(owner);
+      else remaining.set(owner, slots - 1);
+    }
     for (const key of winner.waiter.leaseScopeKeys)
       if (scopeActive.has(key)) scopeActive.set(key, (scopeActive.get(key) ?? 0) + 1);
     // The request is ADMITTED and its other waiters on this capacity are
     // cancelled (sibling_lost): it leaves the queue.
-    entries = entries.filter(
-      (entry) => entry.waiter.admissionRequestId !== winner.waiter.admissionRequestId,
-    );
+    takenRequests.add(winner.waiter.admissionRequestId);
     if (options.requestId !== undefined && winner.waiter.admissionRequestId === options.requestId) {
       stoppedBy = "requested";
       break;

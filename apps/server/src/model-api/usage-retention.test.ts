@@ -23,9 +23,13 @@ vi.mock("@ws-model-proxy/db/hot-path-sweeps", () => sweeps);
 const {
   ABANDONED_PENDING_AFTER_MS,
   compactMinuteRollups,
+  deleteExpiredCliAgentActions,
+  deleteOrphanCliAgentActions,
   deleteExpiredHourRollups,
   deleteExpiredRelayRequests,
+  deleteExpiredRoutingVerdicts,
   hourIncrementsFromMinuteRows,
+  ROUTING_VERDICT_RETENTION_MS,
   reapAbandonedPendingRequests,
   runUsageRetention,
   startUsageRetention,
@@ -110,12 +114,51 @@ describe("usage retention", () => {
       relayRequestsDeleted: 0,
       minuteRowsCompacted: 0,
       hourRowsDeleted: 0,
+      agentActionsDeleted: 0,
       admissionHistoryPruned: 0,
       deletedUserRowsPurged: 0,
       orphanCapacityRuntimeDeleted: 0,
       expiredStickinessDeleted: 0,
+      routingVerdictsDeleted: 0,
     });
     expect(tx.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it("runs the agent audit step in every sweep and reports its count", async () => {
+    const { prisma, tx } = fakePrisma();
+    prisma.$queryRaw.mockImplementation(async (strings: TemplateStringsArray) =>
+      strings.join("").includes("clock_timestamp") ? [{ now: NOW }] : [],
+    );
+    prisma.$executeRaw.mockImplementation(async (strings: TemplateStringsArray) =>
+      strings.join("?").includes("cli_agent_action_event") ? 4 : 0,
+    );
+    tx.$queryRaw.mockResolvedValue([]);
+    await expect(
+      runUsageRetention({ prisma: prisma as never, retentionDays: 14, batch: 100 }),
+    ).resolves.toMatchObject({ agentActionsDeleted: 8 }); // 4 expired + 4 orphaned
+  });
+
+  it("deletes orphaned audit events (no such user) in SKIP LOCKED batches, fence-checked", async () => {
+    const { prisma } = fakePrisma();
+    const statements: string[] = [];
+    let round = 0;
+    prisma.$executeRaw.mockImplementation(async (strings: TemplateStringsArray) => {
+      statements.push(strings.join("?"));
+      round += 1;
+      return round === 1 ? 2 : 1;
+    });
+    await expect(deleteOrphanCliAgentActions({ prisma: prisma as never, batch: 2 })).resolves.toBe(
+      3,
+    );
+    expect(statements).toHaveLength(2);
+    expect(statements[0]).toContain('NOT EXISTS (SELECT 1 FROM "user" u WHERE u.id = e."userId")');
+    expect(statements[0]).toContain("FOR UPDATE OF e SKIP LOCKED");
+    armDbShutdownFence();
+    statements.length = 0;
+    await expect(deleteOrphanCliAgentActions({ prisma: prisma as never, batch: 2 })).resolves.toBe(
+      0,
+    );
+    expect(statements).toEqual([]);
   });
 
   it("runs the hot-path history sweeps after the rollup retention and reports their counts", async () => {
@@ -349,6 +392,24 @@ describe("usage retention", () => {
     expect(cutoff).toEqual(new Date(NOW.getTime() - 395 * DAY_MS));
   });
 
+  it("deletes routing verdicts that expired over an hour ago in SKIP LOCKED batches", async () => {
+    const { prisma } = fakePrisma();
+    prisma.$executeRaw.mockResolvedValueOnce(2).mockResolvedValueOnce(1);
+    await expect(
+      deleteExpiredRoutingVerdicts({ prisma: prisma as never, now: NOW, batch: 2 }),
+    ).resolves.toBe(3);
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(2);
+    const [strings, cutoff, batch] = prisma.$executeRaw.mock.calls[0] as [
+      TemplateStringsArray,
+      Date,
+      number,
+    ];
+    expect(strings.join("?")).toContain("DELETE FROM pool_member_routing_verdict");
+    expect(strings.join("?")).toContain("FOR UPDATE SKIP LOCKED");
+    expect(cutoff).toEqual(new Date(NOW.getTime() - ROUTING_VERDICT_RETENTION_MS));
+    expect(batch).toBe(2);
+  });
+
   it("moves minute rows older than 30 days into additive hourly upserts in one transaction", async () => {
     const { prisma, tx } = fakePrisma();
     tx.$queryRaw.mockResolvedValueOnce([
@@ -429,12 +490,43 @@ describe("usage retention", () => {
     expect(tx.$executeRaw).toHaveBeenCalledTimes(1);
   });
 
+  it("deletes agent audit events past 90 days in SKIP LOCKED batches and stops at the fence", async () => {
+    const { prisma } = fakePrisma();
+    const statements: Array<{ sql: string; values: unknown[] }> = [];
+    let round = 0;
+    prisma.$executeRaw.mockImplementation(
+      async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        statements.push({ sql: strings.join("?"), values });
+        round += 1;
+        return round === 1 ? 2 : 1;
+      },
+    );
+    await expect(
+      deleteExpiredCliAgentActions({ prisma: prisma as never, now: NOW, batch: 2 }),
+    ).resolves.toBe(3);
+    expect(statements).toHaveLength(2);
+    const [first] = statements;
+    expect(first?.sql).toContain("DELETE FROM cli_agent_action_event");
+    expect(first?.sql).toContain("FOR UPDATE SKIP LOCKED");
+    expect(first?.values[0]).toEqual(new Date(NOW.getTime() - 90 * 24 * 60 * 60 * 1000));
+    expect(first?.values[1]).toBe(2);
+
+    armDbShutdownFence();
+    statements.length = 0;
+    await expect(
+      deleteExpiredCliAgentActions({ prisma: prisma as never, now: NOW, batch: 2 }),
+    ).resolves.toBe(0);
+    expect(statements).toEqual([]);
+  });
+
   it("schedules one guarded run and stops cleanly", async () => {
     const run = vi.fn().mockResolvedValue({
       abandonedReaped: 0,
       relayRequestsDeleted: 0,
       minuteRowsCompacted: 0,
       hourRowsDeleted: 0,
+      agentActionsDeleted: 0,
+      routingVerdictsDeleted: 0,
     });
     const stop = startUsageRetention({ retentionDays: 14, intervalMs: 60_000, run });
     expect(startUsageRetention({ retentionDays: 14, run })).toBe(stop);

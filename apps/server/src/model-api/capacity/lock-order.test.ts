@@ -148,6 +148,8 @@ const HOT_PATH_WRITERS: Record<string, string> = {
   "apps/server/src/model-api/usage-rollup.ts": "H: relay finalization and rollups",
   "apps/server/src/model-api/relay-telemetry-recovery.ts": "H/S: relay crash repair",
   "apps/server/src/model-api/usage-retention.ts": "S: relay and rollup retention",
+  "apps/server/src/relay/metric-routing-evaluator.ts":
+    "H: metric routing verdicts (the per-device rule evaluator; single-statement writes)",
   "packages/db/src/capacity-lock-order.ts": "S: the SKIP LOCKED relay delete helper",
   "packages/db/src/parent-deletion.ts": "S: the user-deletion history drain",
   "packages/db/src/hot-path-sweeps.ts": "S: purge, retention, orphan sweeps; H: affinity clear",
@@ -170,6 +172,8 @@ const HOT_PATH_WRITERS: Record<string, string> = {
  * per statement or in the provider account -> model order.
  */
 const GRAPH_WRITERS: Record<string, string> = {
+  "packages/api/src/routers/metric-routing.ts":
+    "M: pool routing rules and member engine-load override (one owner-scoped row update of non-key columns each)",
   "apps/server/src/relay/registration.ts": "M: relay registration",
   "apps/server/src/relay/session-manager.ts": "H status: device connection state",
   "apps/server/src/model-api/provider-attempt-runtime.ts":

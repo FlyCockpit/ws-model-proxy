@@ -1,0 +1,379 @@
+/**
+ * Metric-driven pool routing rules and remote metric sources (S-B part 2).
+ * Mounted under `forwarderManagement` (see forwarder-management.ts).
+ */
+import { createHash } from "node:crypto";
+import { ORPCError } from "@orpc/server";
+import prisma from "@ws-model-proxy/db";
+import { z } from "zod";
+import type { LiveNodeTelemetrySnapshot } from "../context";
+import { protectedProcedure } from "../index";
+import {
+  DEFAULT_KV_FULL_THRESHOLD,
+  effectiveKvFullThreshold,
+  engineHasLoadSignal,
+  engineKindFromDb,
+  evaluateEngineLoad,
+} from "../lib/engine-load";
+import {
+  describeSeries,
+  ENDPOINT_LOAD_STALE_AFTER_MS,
+  type EndpointLoadSample,
+  endpointLoadSeries,
+  type MetricSeries,
+  nodeMetricSeries,
+  parseNodeMetricsSample,
+  parseStoredRemoteMetricSources,
+  parseStoredRoutingRules,
+  pickEndpointLoad,
+  type RemoteMetricSourceDefinition,
+  remoteMetricSourceDefinitionsSchema,
+  routingRulesSchema,
+} from "../lib/metric-routing";
+
+const idSchema = z.string().min(1);
+
+function commandSha256(command: string): string {
+  return createHash("sha256").update(command, "utf8").digest("hex");
+}
+
+/** Server-stored remote definitions, with the hash the CLI pins on approval. */
+export function serializeRemoteMetricSources(value: unknown) {
+  return parseStoredRemoteMetricSources(value).map((source: RemoteMetricSourceDefinition) => ({
+    ...source,
+    commandSha256: commandSha256(source.command),
+  }));
+}
+
+/** Built-in and custom series of a device's freshest (or stored) `node.metrics`. */
+export function deviceMetricSeries(
+  nodeMetrics: unknown,
+  receivedAt: Date | null,
+  now: Date,
+): MetricSeries[] {
+  const sample = parseNodeMetricsSample(nodeMetrics);
+  if (!sample || !receivedAt) return [];
+  return nodeMetricSeries(sample, receivedAt, now);
+}
+
+function liveEndpointLoad(live: LiveNodeTelemetrySnapshot | null): EndpointLoadSample[] {
+  return (live?.endpointLoad ?? []).map((load) => ({
+    endpointSlug: load.endpointSlug,
+    modelSlug: load.modelSlug,
+    running: load.running,
+    waiting: load.waiting,
+    kvUsage: load.kvUsage,
+    slotsBusy: load.slotsBusy,
+    deferred: load.deferred,
+    waitingStreak: load.waitingStreak,
+    prefixCacheHitsTotal: load.prefixCacheHitsTotal,
+    prefixCacheQueriesTotal: load.prefixCacheQueriesTotal,
+    receivedAt: load.receivedAt,
+  }));
+}
+
+const verdictFromDb = { NONE: "none", AVOID: "avoid", FULL: "full" } as const;
+
+const memberModelSelect = {
+  slug: true,
+  upstreamModelId: true,
+  Endpoint: {
+    select: {
+      slug: true,
+      cliDeviceId: true,
+      CliDevice: { select: { slug: true, name: true, reportedHostname: true } },
+    },
+  },
+} as const;
+
+export const metricRoutingProcedures = {
+  /**
+   * A pool's routing rules, each primary member's current verdict (with a
+   * per-rule `triggered` / `clear` / `stale` state), and the metrics its
+   * members' devices report, for discovery.
+   */
+  getPoolRoutingRules: protectedProcedure
+    .input(z.object({ poolId: idSchema }))
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      const pool = await prisma.modelPool.findFirst({
+        where: { id: input.poolId, userId },
+        select: {
+          id: true,
+          slug: true,
+          routingRules: true,
+          PoolMembers: {
+            where: { tier: "PRIMARY" },
+            orderBy: { createdAt: "asc" },
+            select: {
+              id: true,
+              engineLoadMode: true,
+              kvFullThreshold: true,
+              DiscoveredModel: { select: memberModelSelect },
+              ExecutionTarget: {
+                select: {
+                  InferenceCapacity: { select: { engineKind: true, engineSlots: true } },
+                  DiscoveredModel: { select: memberModelSelect },
+                },
+              },
+            },
+          },
+        },
+      });
+      if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+      const rules = parseStoredRoutingRules(pool.routingRules);
+      const members = pool.PoolMembers.flatMap((member) => {
+        const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
+        return model
+          ? [
+              {
+                id: member.id,
+                model,
+                engineLoadMode: member.engineLoadMode,
+                kvFullThreshold: member.kvFullThreshold,
+                capacity: member.ExecutionTarget?.InferenceCapacity ?? null,
+              },
+            ]
+          : [];
+      });
+      // Clears retain NONE rows as successor fences. Their ruleStates and
+      // engineState remain historical snapshots until the member is rewritten;
+      // the expiry check below and live engine evaluation still apply.
+      const verdicts = await prisma.poolMemberRoutingVerdict.findMany({
+        where: { poolId: pool.id, poolMemberId: { in: members.map((member) => member.id) } },
+      });
+      const verdictByMember = new Map(verdicts.map((row) => [row.poolMemberId, row]));
+      const deviceIds = [...new Set(members.map((member) => member.model.Endpoint.cliDeviceId))];
+      const live = context.services?.getLiveNodeTelemetry?.(deviceIds);
+      const stored = deviceIds.length
+        ? await prisma.cliDevice.findMany({
+            where: { id: { in: deviceIds }, userId },
+            select: { id: true, nodeMetrics: true, nodeMetricsAt: true },
+          })
+        : [];
+      const storedById = new Map(stored.map((row) => [row.id, row]));
+      const now = new Date();
+      const devices = deviceIds.map((cliDeviceId) => {
+        const snapshot = live?.get(cliDeviceId) ?? null;
+        const device = members.find((member) => member.model.Endpoint.cliDeviceId === cliDeviceId)
+          ?.model.Endpoint.CliDevice;
+        const row = storedById.get(cliDeviceId);
+        const series = snapshot?.nodeMetrics
+          ? deviceMetricSeries(snapshot.nodeMetrics, snapshot.nodeMetricsReceivedAt, now)
+          : deviceMetricSeries(row?.nodeMetrics ?? null, row?.nodeMetricsAt ?? null, now);
+        return {
+          cliDeviceId,
+          label: device?.name ?? device?.reportedHostname ?? device?.slug ?? cliDeviceId,
+          live: snapshot !== null,
+          series: describeSeries(series),
+        };
+      });
+      return {
+        poolId: pool.id,
+        poolSlug: pool.slug,
+        rules,
+        members: members.map((member) => {
+          const verdict = verdictByMember.get(member.id);
+          const expired = !verdict || verdict.expiresAt <= now;
+          const ruleStates = Array.isArray(verdict?.ruleStates)
+            ? verdict.ruleStates.filter((state): state is string => typeof state === "string")
+            : [];
+          const snapshot = live?.get(member.model.Endpoint.cliDeviceId) ?? null;
+          const memberRef = {
+            endpointSlug: member.model.Endpoint.slug,
+            modelSlug: member.model.slug ?? null,
+          };
+          const reading = pickEndpointLoad(liveEndpointLoad(snapshot), memberRef);
+          const engineKind = engineKindFromDb(member.capacity?.engineKind);
+          const engineVerdict = evaluateEngineLoad(
+            {
+              engineKind,
+              engineSlots: member.capacity?.engineSlots ?? null,
+              mode: member.engineLoadMode === "OFF" ? "OFF" : "AUTO",
+              kvFullThreshold: member.kvFullThreshold,
+            },
+            reading ? { ...reading, waitingStreak: reading.waitingStreak ?? 0 } : null,
+            now,
+          );
+          return {
+            poolMemberId: member.id,
+            upstreamModelId: member.model.upstreamModelId,
+            endpointSlug: member.model.Endpoint.slug,
+            cliDeviceId: member.model.Endpoint.cliDeviceId,
+            verdict: verdict && !expired ? verdictFromDb[verdict.verdict] : null,
+            /**
+             * `active`: a fresh verdict holds; `stale`: the last verdict
+             * expired (its metrics went stale, the rule is ignored);
+             * `unevaluated`: no verdict yet.
+             */
+            state: !verdict ? "unevaluated" : expired ? "stale" : "active",
+            ruleStates: verdict ? ruleStates : [],
+            evaluatedAt: verdict?.evaluatedAt ?? null,
+            expiresAt: verdict?.expiresAt ?? null,
+            /**
+             * Live engine load (S-D). `state` is this process's own reading;
+             * `snapshotState` is what the shared verdict row last recorded.
+             * `mode` off ignores engine load for the member.
+             */
+            engineLoad: {
+              mode: member.engineLoadMode === "OFF" ? ("off" as const) : ("auto" as const),
+              kvFullThreshold: member.kvFullThreshold,
+              effectiveKvFullThreshold: effectiveKvFullThreshold(member.kvFullThreshold),
+              engineKind,
+              engineSlots: member.capacity?.engineSlots ?? null,
+              hasSignal: engineHasLoadSignal(engineKind),
+              state: engineVerdict.state,
+              full: engineVerdict.full,
+              snapshotState: verdict && !expired ? verdict.engineState : null,
+              live: reading
+                ? {
+                    running: reading.running,
+                    waiting: reading.waiting,
+                    kvUsage: reading.kvUsage ?? null,
+                    slotsBusy: reading.slotsBusy ?? null,
+                    deferred: reading.deferred ?? null,
+                    waitingStreak: reading.waitingStreak ?? 0,
+                    ageSeconds: Math.round((now.getTime() - reading.receivedAt.getTime()) / 1000),
+                    stale:
+                      now.getTime() - reading.receivedAt.getTime() > ENDPOINT_LOAD_STALE_AFTER_MS,
+                    prefixCacheHits: reading.prefixCacheHitsTotal ?? 0,
+                    prefixCacheQueries: reading.prefixCacheQueriesTotal ?? 0,
+                  }
+                : null,
+            },
+            endpointSeries: describeSeries(
+              endpointLoadSeries(
+                liveEndpointLoad(snapshot),
+                {
+                  endpointSlug: member.model.Endpoint.slug,
+                  modelSlug: member.model.slug ?? null,
+                },
+                now,
+              ),
+            ),
+          };
+        }),
+        devices,
+      };
+    }),
+
+  /**
+   * Replace a pool's routing rules. `full` makes a member FULL (the request
+   * queues, goes to another member, or goes external for `:external`
+   * callers); `avoid` ranks it last. Stale or missing metrics are ignored.
+   * The pool's stored gating (FULL and AVOID) verdicts are cleared so the new rules apply at the
+   * device's next metrics frame.
+   */
+  setPoolRoutingRules: protectedProcedure
+    .input(z.object({ poolId: idSchema, rules: routingRulesSchema }))
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      // One graph statement (a non-key JSON column). The stored gating verdicts are
+      // H-class rows: they are cleared afterwards by the relay (H module),
+      // never by this M writer.
+      const updated = await prisma.modelPool.updateMany({
+        where: { id: input.poolId, userId },
+        data: { routingRules: input.rules },
+      });
+      if (updated.count === 0) {
+        throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+      }
+      await context.services?.onPoolRoutingRulesChanged?.(input.poolId);
+      return { poolId: input.poolId, rules: input.rules };
+    }),
+
+  /**
+   * Per-member live engine load override (S-D). `auto` lets the engine's live
+   * load (`endpoint.load`) mark the member FULL; `off` ignores it. The optional
+   * `kvFullThreshold` (0-1) overrides the 0.95 default for vLLM/SGLang; null
+   * clears it. The relay (H) clears the pool's stored gating verdicts (NONE fences stay). A changed
+   * override invalidates this member's cache in every process, so it is
+   * re-published at the device's next evaluation. Unchanged siblings follow
+   * the regular refresh budget when their session is on another process.
+   */
+  setPoolMemberEngineLoad: protectedProcedure
+    .input(
+      z.object({
+        poolMemberId: idSchema,
+        mode: z.enum(["auto", "off"]),
+        kvFullThreshold: z.number().gt(0).max(1).nullable().optional(),
+      }),
+    )
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      // One graph statement (non-key columns): no capacity lock is held or
+      // taken. The stored gating verdicts are H-class rows: the relay clears them
+      // afterwards (`onPoolRoutingRulesChanged`), never this M writer.
+      const updated = await prisma.poolMember.updateMany({
+        where: { id: input.poolMemberId, ModelPool: { userId } },
+        data: {
+          engineLoadMode: input.mode === "off" ? "OFF" : "AUTO",
+          ...(input.kvFullThreshold !== undefined
+            ? { kvFullThreshold: input.kvFullThreshold }
+            : {}),
+        },
+      });
+      if (updated.count === 0) {
+        throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
+      }
+      const member = await prisma.poolMember.findFirst({
+        where: { id: input.poolMemberId, ModelPool: { userId } },
+        select: { id: true, poolId: true, engineLoadMode: true, kvFullThreshold: true },
+      });
+      if (member) await context.services?.onPoolRoutingRulesChanged?.(member.poolId);
+      return {
+        poolMemberId: input.poolMemberId,
+        mode: member?.engineLoadMode === "OFF" ? ("off" as const) : ("auto" as const),
+        kvFullThreshold: member?.kvFullThreshold ?? null,
+        defaultKvFullThreshold: DEFAULT_KV_FULL_THRESHOLD,
+      };
+    }),
+
+  /**
+   * Replace a device's remotely defined metric sources. Allowed only while
+   * the device's MCP command mode is `unsupervised`. The CLI still refuses
+   * them without its local opt-in (`allowRemoteMetricSources`) and runs each
+   * command only after a local, hash-pinned approval (`wsmp metrics approve`);
+   * a changed command needs approval again.
+   */
+  setCliDeviceMetricSources: protectedProcedure
+    .input(z.object({ cliDeviceId: idSchema, sources: remoteMetricSourceDefinitionsSchema }))
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      const device = await prisma.cliDevice.findUnique({
+        where: { id: input.cliDeviceId },
+        select: { id: true, userId: true, mcpCommandMode: true },
+      });
+      if (!device || device.userId !== userId) {
+        throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+      }
+      if (device.mcpCommandMode !== "UNSUPERVISED") {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Remote metric sources need this device's MCP command mode to be unsupervised.",
+        });
+      }
+      // Re-checked in the write: a concurrent downgrade of the mode wins.
+      const updated = await prisma.cliDevice.updateMany({
+        where: { id: device.id, userId, mcpCommandMode: "UNSUPERVISED" },
+        data: { remoteMetricSources: input.sources, remoteMetricSourcesAt: new Date() },
+      });
+      if (updated.count === 0) {
+        throw new ORPCError("CONFLICT", {
+          message: "This device's MCP command mode changed; remote metric sources were not saved.",
+        });
+      }
+      const delivered =
+        (await context.services?.onRemoteMetricSourcesChanged?.(device.id)) ?? false;
+      return {
+        cliDeviceId: device.id,
+        sources: serializeRemoteMetricSources(input.sources),
+        /**
+         * False when the CLI is offline here (it gets them at its next hello)
+         * or the push could not read the device and sent a withdrawal (an
+         * empty list, fail closed): save again to retry.
+         */
+        delivered,
+        note: "The CLI runs a remote source only with its local opt-in (allowRemoteMetricSources) and after `wsmp metrics approve <name> --sha256 <hash>` (the hash of the command the person read); it reports each source's state in node.metrics.",
+      };
+    }),
+};

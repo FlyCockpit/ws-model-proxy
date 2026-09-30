@@ -89,12 +89,81 @@
       "cleared": "CLI name cleared",
       "saveFailed": "Couldn't rename this CLI. Try again."
     },
+    "activity": {
+      "title": "Agent activity",
+      "show": "Show agent activity for {{name}}",
+      "hide": "Hide agent activity for {{name}}",
+      "description": "What MCP agents did on this CLI, newest first, kept for 90 days. Only metadata is recorded: file contents and command output are never stored.",
+      "empty": "No agent activity has been recorded for this CLI.",
+      "loadFailed": "Couldn't load agent activity.",
+      "loadMore": "Load more",
+      "loadingMore": "Loading…",
+      "listLabel": "Agent activity on {{name}}",
+      "reason": "Reason: {{value}}",
+      "bytes": "{{value}} bytes",
+      "commandHash": "Command hash {{value}}",
+      "program": "Program: {{value}}",
+      "kinds": {
+        "command": "Command",
+        "supervised_command": "Supervised command",
+        "file_read": "Read file",
+        "file_stat": "File info",
+        "file_list": "List folder",
+        "file_search": "Search files",
+        "file_edit": "Edit file",
+        "file_write": "Write file",
+        "file_rename": "Rename",
+        "file_mkdir": "Create folder",
+        "file_delete": "Delete",
+        "supervised_file_write": "Supervised file write"
+      },
+      "outcomes": {
+        "completed": "Completed",
+        "refused": "Refused",
+        "failed": "Failed",
+        "cancelled": "Cancelled",
+        "declined": "Declined",
+        "expired": "Expired",
+        "unknown": "Unknown"
+      }
+    },
     "serverUpgradeRequired": "Server upgrade required: CLI protocol {{protocol}} is newer than this server supports",
     "serverUpgradeRequiredDetail": "wsmp {{version}} was refused on {{value}} because it is newer than this server. Ask the server administrator to upgrade the server, or install an older wsmp on this machine.",
     "upgradeRequired": "CLI upgrade required (protocol {{protocol}})",
     "upgradeRequiredDetail": "wsmp {{version}} was refused on {{value}}. Upgrade wsmp on this machine and restart it.",
     "upgradeUnknownProtocol": "unknown",
-    "upgradeUnknownVersion": "(unknown version)"
+    "upgradeUnknownVersion": "(unknown version)",
+    "metricSources": {
+      "title": "Metric sources",
+      "loadFailed": "Could not load this device's metric sources.",
+      "empty": "No metric sources.",
+      "origins": {
+        "local": "Local",
+        "remote": "Remote"
+      },
+      "states": {
+        "active": "Active",
+        "pending_approval": "Pending approval",
+        "refused": "Refused",
+        "unsupported": "Unsupported",
+        "disabled": "Disabled",
+        "failing": "Failing"
+      },
+      "errors": {
+        "spawn": "could not start",
+        "timeout": "timed out",
+        "exit_status": "exited with an error",
+        "output_too_large": "output too large",
+        "parse": "output not numeric"
+      },
+      "interval": "every {{seconds}} s",
+      "pendingHint": "Read its command with `wsmp metrics list` on the machine, then approve it with `wsmp metrics approve {{name}} --sha256 <hash>` using the hash shown there.",
+      "refusedHint": "The CLI refuses remote sources unless `allowRemoteMetricSources` is on locally.",
+      "notReported": "Defined on the server; the CLI has not reported it yet.",
+      "remoteNotAllowed": "Remote sources are sent to the CLI only while its MCP command mode is unsupervised.",
+      "valuesTitle": "Latest values",
+      "stale": "stale"
+    }
   },
   "chatTest": {
     "announcements": {
@@ -884,6 +953,46 @@
     "transformerMaxAssets": "Max attachments per request",
     "updated": "Pool updated",
     "weight": "Weight",
+    "metricRules": {
+      "title": "Metric routing rules",
+      "description": "Mark a member FULL or avoid it using its device's metrics. FULL members get no new requests (they queue, go to another member, or go external for :external callers). Avoided members are used last. A stale or missing metric is ignored, and when every member is FULL requests are still served.",
+      "hint": "Each rule compares the highest value of one metric (optionally filtered by labels) with a threshold.",
+      "empty": "No rules. Routing uses capacity only.",
+      "ruleLegend": "Rule {{number}}",
+      "metric": "Metric",
+      "labels": "Labels (optional)",
+      "op": "Compare",
+      "threshold": "Threshold",
+      "effect": "Effect",
+      "effects": {
+        "full": "Mark FULL",
+        "avoid": "Avoid"
+      },
+      "add": "Add rule",
+      "remove": "Remove rule {{number}}",
+      "save": "Save rules",
+      "saved": "Routing rules saved.",
+      "saveFailed": "Could not save the routing rules.",
+      "loadFailed": "Could not load the routing rules.",
+      "metricInvalid": "Use 1-64 letters, digits, or _ . : -",
+      "labelsInvalid": "Use key=value pairs separated by commas (letters, digits, _ . : -).",
+      "thresholdInvalid": "Enter a number.",
+      "membersTitle": "Members",
+      "badges": {
+        "full": "Metric FULL",
+        "avoid": "Avoided",
+        "clear": "Rules clear",
+        "stale": "Metric stale",
+        "unevaluated": "Not evaluated yet",
+        "rulesStale_one": "{{count}} rule ignored (stale metric)",
+        "rulesStale_other": "{{count}} rules ignored (stale metrics)"
+      },
+      "seriesTitle": "Available metrics",
+      "seriesHint": "Metrics the members' devices report now. endpoint.* metrics (running, waiting, kv_usage, slots_busy) use each member's own endpoint.",
+      "offline": "offline (stored snapshot)",
+      "noSeries": "No metrics reported yet.",
+      "staleValue": "stale"
+    },
     "grantRouting": {
       "edit": "Routing",
       "editFor": "Routing settings for {{email}}",
@@ -900,6 +1009,33 @@
       "summary": "Protected share: {{protection}} · Queue priority: {{priority}}",
       "saved": "Routing settings saved.",
       "failed": "Could not save the routing settings."
+    },
+    "engineLoad": {
+      "title": "Live engine load",
+      "description": "Engines that report load (llama.cpp, vLLM, SGLang) can mark a member FULL from what they see right now, including traffic that bypasses the proxy. It only adds to FULL: capacity counts stay authoritative, a stale reading is ignored, and when every member is FULL requests are still served.",
+      "use": "Use engine load",
+      "saved": "Engine load setting saved",
+      "saveFailed": "Could not save the engine load setting.",
+      "badges": {
+        "off": "Engine load ignored",
+        "noSignal": "No engine signal",
+        "stale": "Load stale",
+        "clear": "Engine has room"
+      },
+      "states": {
+        "full_waiting": "Engine FULL: requests waiting",
+        "full_kv": "Engine FULL: KV cache nearly full",
+        "full_slots": "Engine FULL: all slots busy",
+        "full_deferred": "Engine FULL: requests deferred"
+      },
+      "running_one": "{{count}} running",
+      "running_other": "{{count}} running",
+      "waiting_one": "{{count}} waiting",
+      "waiting_other": "{{count}} waiting",
+      "kv": "KV {{value}}",
+      "slots": "{{busy}}/{{total}} slots",
+      "prefixHit": "prefix hits {{value}}",
+      "noReading": "No reading from the engine yet."
     }
   },
   "relay": {

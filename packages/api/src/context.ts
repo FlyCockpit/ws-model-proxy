@@ -44,6 +44,11 @@ export type LiveEndpointLoad = {
   prefixCacheHitsDelta?: number;
   prefixCacheQueriesDelta?: number;
   source: "llama.cpp-slots" | "llama.cpp-metrics" | "vllm-metrics" | "sglang-metrics";
+  /** Consecutive accepted frames with `waiting > 0`; a gap or `waiting == 0` resets it. */
+  waitingStreak: number;
+  /** Prefix cache deltas summed over this session's frames (for the dashboard). */
+  prefixCacheHitsTotal: number;
+  prefixCacheQueriesTotal: number;
   /** The CLI's sample time. */
   ts: string;
   receivedAt: Date;
@@ -74,6 +79,19 @@ export type ContextServices = {
   signal?: AbortSignal;
   /** Close terminals or cancel CLI commands after a dashboard grant change. */
   onCliFeatureGrantsChanged?: (cliDeviceId: string) => void | Promise<void>;
+  /**
+   * Push a device's remote metric sources to its live relay session. Resolves
+   * true when a session in this process received them.
+   */
+  onRemoteMetricSourcesChanged?: (cliDeviceId: string) => boolean | Promise<boolean>;
+  /**
+   * A pool's metric routing rules or one of its members' engine-load override
+   * were replaced (committed). The relay clears
+   * the pool's stored verdicts: they are hot-path (H) rows, which a management
+   * (M) writer must not write, so the clearing runs in the H module after
+   * the rules commit.
+   */
+  onPoolRoutingRulesChanged?: (poolId: string) => Promise<void>;
   /**
    * Close live relay sessions authenticated by credentials that were just
    * revoked (re-login, CLI token revoke). Called after the revoking write

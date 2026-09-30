@@ -18,8 +18,8 @@ overrides:
   picomatch@>=4 <4.0.4: ">=4.0.4" # CVE-2026-33671 (ReDoS via extglob)
   defu@<6.1.5: ">=6.1.5" # CVE-2026-35209 (prototype pollution)
   fast-uri@<3.1.2: ">=3.1.2" # CVE-2026-6321 / CVE-2026-6322 (path traversal)
-  "brace-expansion@>=2 <2.1.4": 2.1.4 # denial-of-service fixes
-  "brace-expansion@>=5 <5.0.9": 5.0.9 # denial-of-service fixes
+  "brace-expansion@>=2 <2.1.7": 2.1.7 # denial-of-service fixes (incl. CVE-2026-102276 / CVE-2026-102278)
+  "brace-expansion@>=5 <5.0.12": 5.0.12 # denial-of-service fixes (incl. CVE-2026-102276 / CVE-2026-102278)
   # 4.1.2 is still inside GHSA-5jgf-p345-68v8 / GHSA-f65p-4m7j-42xc /
   # GHSA-fph4-wmhf-6fwf / GHSA-jqff-g426-hqxp (<4.1.3). 4.1.4 is the newest
   # 4.1 release that clears the 7-day minimumReleaseAge gate; 4.2.0 is younger.
@@ -38,7 +38,7 @@ overrides:
   "mysql2@<3.22.0": 3.24.4
   "prisma@7.10.0>mysql2": 3.24.4
   "better-auth@1.7.4>mysql2": 3.24.4
-  "undici@>=7 <7.29.0": 7.29.0 # CVE-2026-13697
+  "undici@>=7 <7.29.1": 7.29.1 # CVE-2026-13697; GHSA-rfgv-xxqx-mfg5 (DoS) / GHSA-w293-vg96-wgc3 (TLS validation bypass)
   # CVE-2026-44635 (JSON-path injection) is patched in 0.28.17. Pinned EXACT
   # (not just `>=0.28.17`) to dedupe to a single installed copy: better-auth
   # 1.7.3 declares kysely as a DEPENDENCY (`^0.28.17 || ^0.29.0`, no kysely

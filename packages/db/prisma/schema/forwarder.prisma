@@ -324,6 +324,12 @@ model CliDevice {
   lastDisconnectedAt           DateTime?
   lastHeartbeatAt              DateTime?
   connectionCount              Int                   @default(0)
+  /// Monotonic fence for connection generations: incremented by every accepted
+  /// hello (relay registration) and never by a disconnect. A disconnect write
+  /// carries the generation it saw when its session was detached and is refused
+  /// when the device has since accepted a later connection, so a stale close
+  /// cannot overwrite the status and pool-member health of a live successor.
+  connectionGeneration         Int                   @default(0)
   inventorySeq                 Int                   @default(0)
   inventoryDigest              String?
   inventoryAcknowledgedAt      DateTime?
@@ -360,6 +366,11 @@ model CliDevice {
   rejectedRelayProtocolVersion String?
   rejectedCliVersion           String?
   relayRejectedAt              DateTime?
+  /// Remotely defined custom metric sources (`metrics.sources.set`), set over
+  /// MCP only while `mcpCommandMode` is UNSUPERVISED. The CLI still needs its
+  /// local opt-in and a hash approval of each command before one runs.
+  remoteMetricSources          Json?
+  remoteMetricSourcesAt        DateTime?
   User                         User                  @relation("CliDeviceOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   CliTokens                    CliToken[]
   CliDeviceCredentials         CliDeviceCredential[]
@@ -1041,6 +1052,11 @@ model ModelPool {
   /// each user still picks their own model. Null = no consent: clearing it
   /// withdraws BYOK for this pool.
   externalEquivalentModel         String?
+  /// Metric-driven routing rules (S-B part 2): a zod-validated array of
+  /// `{metric, labels?, aggregate, op, threshold, effect}`
+  /// (packages/api/src/lib/metric-routing.ts). `full` makes a member FULL,
+  /// `avoid` ranks it last. Stale or missing metrics are ignored.
+  routingRules                    Json                          @default("[]")
   User                            User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   TransformerDiscoveredModel      DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   PoolMembers                     PoolMember[]
@@ -1121,6 +1137,12 @@ model PoolMember {
   nextRetryAt                  DateTime?
   halfOpenTrialStartedAt       DateTime?
   lastRoutedAt                 DateTime?
+  /// S-D: AUTO lets live engine load (`endpoint.load`) mark this member FULL
+  /// (per the capacity's engine kind); OFF ignores engine load for it.
+  engineLoadMode               EngineLoadMode          @default(AUTO)
+  /// KV usage fraction (0-1] at which a vLLM/SGLang member counts as FULL.
+  /// Null = the default (0.95).
+  kvFullThreshold              Float?
   ModelPool                    ModelPool               @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   DiscoveredModel              DiscoveredModel?        @relation(fields: [discoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTarget              ExecutionTarget?        @relation(fields: [executionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
@@ -1239,6 +1261,10 @@ model AdmissionRequest {
   state                   AdmissionRequestState @default(WAITING)
   terminalAt              DateTime?
   terminalReason          String?
+  /// False only while an `:external` caller with an external plan waits its
+  /// shortened local phase: metric-FULL members then stay ineligible even
+  /// when every candidate is metric-FULL, so the request goes external.
+  metricFailOpen          Boolean               @default(true)
   Waiters                 CapacityWaiter[]
   Lease                   CapacityLease?
   RelayRequest            RelayRequest?         @relation(fields: [relayRequestId], references: [id], onDelete: SetNull, onUpdate: Cascade)
@@ -1253,6 +1279,48 @@ model AdmissionRequest {
   @@index([poolId])
   @@index([directExecutionTargetId])
   @@map("admission_request")
+}
+
+/// Metric routing verdict of relay 2.7 `node.metrics` / `endpoint.load` against
+/// the member's pool rules (S-B part 2). H-class (DL-1): no foreign keys to or
+/// from graph tables, so writing it adds no lock-order edge; admission reads
+/// it with a plain, non-locking SELECT. Rows of removed members are never
+/// read again; the retention sweep deletes rows that expired long ago.
+model PoolMemberRoutingVerdict {
+  poolMemberId String               @id
+  userId       String
+  poolId       String
+  cliDeviceId  String
+  verdict      MetricRoutingVerdict
+  /// Per rule (by index): `triggered`, `clear` or `stale`.
+  ruleStates   Json
+  /// S-D live engine load reading behind the verdict: `off`, `none` (no
+  /// engine signal), `stale`, `clear`, `full_waiting`, `full_kv`,
+  /// `full_slots` or `full_deferred`. FULL from load is folded into `verdict`.
+  engineState  String               @default("none")
+  evaluatedAt  DateTime
+  /// The evaluation state that wrote this row. Together with `evaluatedAt` it
+  /// orders writers: a write replaces a row only when it is strictly newer or
+  /// is the same publisher's, so a cancelled session's delayed write can never
+  /// overwrite its successor (even within the same millisecond).
+  publisherId  String               @default("")
+  /// The verdict is ignored from here on (its triggering metric went stale).
+  expiresAt    DateTime
+
+  @@index([poolId])
+  @@index([expiresAt])
+  @@map("pool_member_routing_verdict")
+}
+
+enum EngineLoadMode {
+  AUTO
+  OFF
+}
+
+enum MetricRoutingVerdict {
+  NONE
+  AVOID
+  FULL
 }
 
 model CapacityWaiter {

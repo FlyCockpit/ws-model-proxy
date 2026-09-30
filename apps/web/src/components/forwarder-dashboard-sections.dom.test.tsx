@@ -10,6 +10,7 @@ const state = vi.hoisted(() => ({
   nextReject: null as { name: string; error: unknown } | null,
   cliDevices: [] as Array<Record<string, unknown>>,
   capabilityImpact: [] as Array<{ id: string; slug: string; surface: string }>,
+  activityInputs: [] as Array<{ cliDeviceId: string } | undefined>,
 }));
 
 vi.mock("react-i18next", () => ({
@@ -23,6 +24,11 @@ vi.mock("react-i18next", () => ({
 
 vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
   toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
+}));
+
+// Covered by cli-device-metric-sources.dom.test.tsx.
+vi.mock("@/components/cli-device-metric-sources", () => ({
+  CliDeviceMetricSources: () => null,
 }));
 
 vi.mock("@/utils/orpc", () => {
@@ -58,6 +64,24 @@ vi.mock("@/utils/orpc", () => {
   return {
     orpc: {
       appConfig: query("appConfig", { capacityEnabled: false }),
+      // The Agent activity section reads only once a device's section is opened.
+      cliAgentActivity: {
+        list: {
+          infiniteOptions: (options: {
+            initialPageParam: string | undefined;
+            getNextPageParam: (page: { nextCursor: string | null }) => string | undefined;
+            input?: (cursor: string | undefined) => { cliDeviceId: string };
+          }) => ({
+            queryKey: ["cliAgentActivity"],
+            queryFn: async (context?: { pageParam?: string }) => {
+              state.activityInputs.push(options.input?.(context?.pageParam));
+              return { events: [], nextCursor: null };
+            },
+            initialPageParam: options.initialPageParam,
+            getNextPageParam: options.getNextPageParam,
+          }),
+        },
+      },
       forwarderManagement: {
         key: () => ["forwarderManagement"],
         listCliDevices: {
@@ -277,6 +301,7 @@ afterEach(() => {
   state.nextReject = null;
   state.cliDevices = [];
   state.capabilityImpact = [];
+  state.activityInputs = [];
   vi.mocked(toast.success).mockClear();
   vi.mocked(toast.error).mockClear();
   vi.mocked(toast.warning).mockClear();
@@ -1018,6 +1043,35 @@ describe("CliEndpointsModelsSection device names", () => {
     expect(screen.getByText("desk")).toBeTruthy();
     // SectionHeader is the page h1 now that the shared dashboard header is gone.
     expect(screen.getAllByRole("heading", { level: 1 })).toHaveLength(1);
+  });
+
+  it("renders one agent activity section per device", async () => {
+    state.cliDevices = [
+      cliDeviceWithModel,
+      {
+        ...cliDeviceWithModel,
+        id: "cli-2",
+        slug: "tower",
+        name: "Work laptop",
+        displayName: "Work laptop",
+        endpoints: [],
+      },
+    ];
+    mountDevices();
+
+    // The CliAgentActivity section (AC 7): one collapsed toggle per device,
+    // labelled by that device, with its content hidden until opened.
+    const show = (name: string) => `clis.activity.show|${JSON.stringify({ name })}`;
+    expect(screen.getByRole("button", { name: show("desk-01.local") })).toBeTruthy();
+    expect(screen.getByRole("button", { name: show("Work laptop") })).toBeTruthy();
+    expect(screen.getAllByText("clis.activity.title")).toHaveLength(2);
+
+    // Opening a device's section queries that device by its id, not its slug:
+    // the audit list is keyed by cliDeviceId, so a slug would silently show
+    // another (nonexistent) device's empty log.
+    fireEvent.click(screen.getByRole("button", { name: show("Work laptop") }));
+    await waitFor(() => expect(state.activityInputs.length).toBeGreaterThan(0));
+    expect(state.activityInputs.every((input) => input?.cliDeviceId === "cli-2")).toBe(true);
   });
 
   it("finds a device by display name, hostname, or slug", () => {

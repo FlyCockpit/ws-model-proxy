@@ -38,6 +38,11 @@ import {
   deleteCliDeviceAndCredentials,
 } from "../lib/cli-credential-access";
 import {
+  cliHeartbeatIsStale,
+  cliHeartbeatStaleAt,
+  effectiveEndpointStatus,
+} from "../lib/cli-presence";
+import {
   type ContextWindowSeedDependent,
   declaredContextWindow,
   isContextWindowSeedAdmissible,
@@ -66,6 +71,7 @@ import {
   getConfiguredMediaAttachmentMaxBytes,
   resolveAttachmentLimit,
 } from "../lib/media-attachment-limits";
+import { describeSeries } from "../lib/metric-routing";
 import { parseModelApiSurface } from "../lib/model-api-surface";
 import {
   listVisibleModelTargetsForUser,
@@ -113,8 +119,11 @@ import {
 } from "../lib/surface-capabilities";
 import { visibleModelAttachmentModalities } from "../lib/visible-model-modalities";
 import { visibleModelReasoning } from "../lib/visible-model-reasoning";
-
-const CLI_HEARTBEAT_STALE_AFTER_MS = 60_000;
+import {
+  deviceMetricSeries,
+  metricRoutingProcedures,
+  serializeRemoteMetricSources,
+} from "./metric-routing";
 
 let guardedSetupTestFailure: (() => void) | undefined;
 
@@ -710,9 +719,7 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
           }
         : null,
   });
-  const staleAt = row.lastHeartbeatAt
-    ? new Date(row.lastHeartbeatAt.getTime() + CLI_HEARTBEAT_STALE_AFTER_MS)
-    : null;
+  const staleAt = cliHeartbeatStaleAt(row.lastHeartbeatAt);
   return {
     id: row.id,
     createdAt: row.createdAt,
@@ -726,7 +733,7 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
     lastDisconnectedAt: row.lastDisconnectedAt,
     lastHeartbeatAt: row.lastHeartbeatAt,
     staleAt,
-    isStale: Boolean(staleAt && staleAt <= now),
+    isStale: cliHeartbeatIsStale(row.lastHeartbeatAt, now),
     connectionCount: row.connectionCount,
     inventorySeq: row.inventorySeq,
     inventoryDigest: row.inventoryDigest,
@@ -790,7 +797,8 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
       slug: endpoint.slug,
       label: endpoint.label,
       kind: endpoint.kind,
-      status: endpoint.status,
+      status: effectiveEndpointStatus(endpoint.status, row, now),
+      reportedStatus: endpoint.status,
       defaultCapabilities: endpoint.defaultCapabilities,
       capabilityMetadata: endpoint.capabilityMetadata,
       probeSuggestions: endpoint.probeSuggestions,
@@ -1534,6 +1542,7 @@ const poolSelect = {
 } satisfies Prisma.ModelPoolSelect;
 
 export const forwarderManagementRouter = {
+  ...metricRoutingProcedures,
   listGuardedOverflowCandidates: protectedProcedure.handler(async ({ context }) => {
     const now = new Date();
     const rows = await prisma.providerModel.findMany({
@@ -2406,6 +2415,9 @@ export const forwarderManagementRouter = {
           nodeInfoAt: true,
           nodeMetrics: true,
           nodeMetricsAt: true,
+          mcpCommandMode: true,
+          remoteMetricSources: true,
+          remoteMetricSourcesAt: true,
         },
       });
       if (!row || row.userId !== context.session.user.id) {
@@ -2413,7 +2425,25 @@ export const forwarderManagementRouter = {
       }
       const live = context.services?.getLiveNodeTelemetry?.([row.id]).get(row.id) ?? null;
       const liveMetrics = live?.nodeMetrics ? live : null;
+      const now = new Date();
+      const series = liveMetrics
+        ? deviceMetricSeries(liveMetrics.nodeMetrics, liveMetrics.nodeMetricsReceivedAt, now)
+        : deviceMetricSeries(row.nodeMetrics ?? null, row.nodeMetricsAt ?? null, now);
       return {
+        /**
+         * Every metric a routing rule can name on this device right now:
+         * `node.*` built-ins and custom series (endpoint `endpoint.*` series
+         * are per member: see `getPoolRoutingRules`).
+         */
+        series: describeSeries(series),
+        /**
+         * Remote metric source definitions the server holds (sent to the CLI
+         * only while the device is `unsupervised`); `nodeMetrics.sources`
+         * has the CLI's own view of each (active, pending approval, refused).
+         */
+        remoteMetricSources: serializeRemoteMetricSources(row.remoteMetricSources),
+        remoteMetricSourcesAt: row.remoteMetricSourcesAt ?? null,
+        remoteMetricSourcesAllowed: row.mcpCommandMode === "UNSUPERVISED",
         cliDeviceId: row.id,
         slug: row.slug,
         live: live !== null,
