@@ -3,6 +3,7 @@ import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   judgeCliAgentAdmission,
+  openCliAgentAdmissionCountForTests,
   readCliAgentAdmission,
   revokeOpenCliAgentAdmissions,
 } from "./cli-agent-admission.js";
@@ -981,6 +982,34 @@ describe("cli file ops", () => {
         ok: false,
         error: "token_inactive",
       });
+      expect(openCliAgentAdmissionCountForTests()).toBe(0);
+    });
+
+    it("leaves no admission open after a judged run, an abort during the read, or a failed read", async () => {
+      const socket = await connect();
+      const judged = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+      await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+      await judged;
+      expect(openCliAgentAdmissionCountForTests()).toBe(0);
+
+      const controller = new AbortController();
+      const aborted = runFileOp({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+        op: "read",
+        args: readArgs,
+        signal: controller.signal,
+      });
+      controller.abort();
+      await expect(aborted).resolves.toEqual({ ok: false, code: "cancelled" });
+      expect(openCliAgentAdmissionCountForTests()).toBe(0);
+
+      db.cliDevice.findUnique.mockRejectedValueOnce(new Error("db down"));
+      await expect(
+        runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: readArgs }),
+      ).rejects.toThrow();
+      expect(openCliAgentAdmissionCountForTests()).toBe(0);
     });
 
     it("does not mark another token's open admission", async () => {

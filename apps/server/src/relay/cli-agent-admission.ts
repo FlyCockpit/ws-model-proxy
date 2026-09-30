@@ -93,6 +93,11 @@ export function revokeOpenCliAgentAdmissions(tokenId: string): void {
   }
 }
 
+/** Test only: admissions still open (a leak check). */
+export function openCliAgentAdmissionCountForTests(): number {
+  return openAdmissions.size;
+}
+
 /** Test isolation. */
 export function resetCliAgentAdmissionsForTests(): void {
   openAdmissions.clear();

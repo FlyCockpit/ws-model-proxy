@@ -2298,18 +2298,25 @@ describe("CLI file tools", () => {
   });
 
   it("audits missing confirmation and oversized input through the real SDK transport (#104)", async () => {
-    const cases: Array<[string, Record<string, unknown>]> = [
-      ["forwarder_cli_file_delete", { cliDeviceId: "cli-1", path: "~/a" }],
-      ["forwarder_cli_file_delete", { cliDeviceId: "cli-1", path: "~/a", confirm: "NOPE" }],
-      ["forwarder_cli_file_read", { cliDeviceId: "cli-1", path: "~/a", pad: "x".repeat(70_000) }],
+    const confirmed: Array<[string, Record<string, unknown>]> = [
+      ["forwarder_cli_file_write", { path: "~/n", content: "x" }],
+      ["forwarder_cli_file_edit", { path: "~/a", oldString: "a", newString: "b" }],
+      ["forwarder_cli_file_rename", { from: "~/a", to: "~/b" }],
+      ["forwarder_cli_file_delete", { path: "~/a" }],
     ];
-    for (const [name, args] of cases) {
+    const cases: Array<[string, Record<string, unknown>, boolean]> = [];
+    for (const [name, args] of confirmed) {
+      cases.push([name, args, true]);
+      cases.push([name, { ...args, confirm: "NOPE" }, true]);
+    }
+    cases.push(["forwarder_cli_file_read", { path: "~/a", pad: "x".repeat(70_000) }, false]);
+    for (const [name, args, stable] of cases) {
       fileRuntime.auditRefusedFileInput.mockClear();
       const authInfo = buildAuthInfo(["mcp:write"]);
       bindRequest(authInfo, "req-sdk-c", PAT_WITH_CLI);
-      const { body } = await callTool(authInfo, name, args);
-      const failed = body.result?.isError === true || body.error !== undefined;
-      expect(failed).toBe(true);
+      const { body } = await callTool(authInfo, name, { cliDeviceId: "cli-1", ...args });
+      expect(body.result?.isError === true || body.error !== undefined).toBe(true);
+      if (stable) expect(body.result?.structuredContent?.error?.code).toBe("CONFIRMATION_REQUIRED");
       expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledTimes(1);
     }
     expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
