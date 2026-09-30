@@ -558,23 +558,20 @@ integration("deletion commit points under concurrency", () => {
     const { observer } = required();
     const staged = Promise.withResolvers<void>();
     const gate = Promise.withResolvers<void>();
-    const tx = observer
-      .$transaction(
-        async (client) => {
-          await client.$executeRawUnsafe(
-            `INSERT INTO relay_request (id, "userId", status, "requestedModelPoolId")
+    const tx = observer.$transaction(
+      async (client) => {
+        await client.$executeRawUnsafe(
+          `INSERT INTO relay_request (id, "userId", status, "requestedModelPoolId")
              SELECT '${g.suffix}-late-' || n, '${g.user.id}', 'FAILED', '${g.pool.id}'
                FROM generate_series(1, ${LATE_PRODUCER_ROWS}) n`,
-          );
-          staged.resolve();
-          await gate.promise;
-        },
-        { timeout: 60_000, maxWait: 60_000 },
-      )
-      .catch((error: unknown) => {
-        staged.reject(error);
-        throw error;
-      });
+        );
+        staged.resolve();
+        await gate.promise;
+      },
+      { timeout: 60_000, maxWait: 60_000 },
+    );
+    // A staging failure reaches the test through `staged`; commitLate rethrows a commit failure.
+    tx.catch(staged.reject);
     await staged.promise;
     return async () => {
       gate.resolve();
