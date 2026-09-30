@@ -29,6 +29,7 @@ vi.mock("./cli-agent-audit.js", () => ({ recordCliAgentAction: audit.record }));
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { relaySessionManager } = await import("./session-manager.js");
 const {
+  auditRefusedFileInput,
   cancelFileOpsForToken,
   FILE_MUTATIONS_PER_MINUTE_PER_USER,
   FILE_OP_DEADLINE_MS,
@@ -295,9 +296,9 @@ describe("cli file ops", () => {
     resetFileOpsForTests();
   });
 
-  it("reports a mutation's io_error or too_large rejection as an unknown outcome, a read's as definitive", async () => {
+  it("reports a mutation's io_error rejection as an unknown outcome, a read's as definitive; too_large stays definitive", async () => {
     const socket = await connect();
-    for (const reason of ["io_error", "too_large"]) {
+    for (const reason of ["io_error"]) {
       const write = start(socket, "edit", editArgs);
       await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
       await answer(
@@ -315,7 +316,15 @@ describe("cli file ops", () => {
       await expect(read).resolves.toEqual({ ok: false, code: reason });
       socket.sends.length = 0;
     }
-    // Other CLI refusals of a mutation stay definitive.
+    // Other CLI refusals of a mutation stay definitive (too_large is a pre-commit size refusal).
+    const tooLarge = start(socket, "write", { path: "~/big" }, { body: new Uint8Array(1) });
+    await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+    await answer(
+      socket,
+      JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason: "too_large" }),
+    );
+    await expect(tooLarge).resolves.toEqual({ ok: false, code: "too_large" });
+    socket.sends.length = 0;
     const conflict = start(socket, "edit", editArgs);
     await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
     await answer(
@@ -463,6 +472,30 @@ describe("cli file ops", () => {
       await expect(outcome).resolves.toEqual({ ok: false, code: "token_inactive" });
       expect(socket.frames("file.op")).toEqual([]);
     });
+  });
+
+  it("passes the library's replaced/gone conflict words through as a definitive conflict", async () => {
+    const socket = await connect();
+    for (const word of ["replaced", "gone"]) {
+      const outcome = start(socket, "edit", editArgs);
+      await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+      await answer(
+        socket,
+        JSON.stringify({
+          type: "file.rejected",
+          opId: lastOpId(socket),
+          reason: "conflict",
+          detail: { currentEtag: word },
+        }),
+      );
+      await expect(outcome).resolves.toEqual({
+        ok: false,
+        code: "conflict",
+        detail: { currentEtag: word },
+      });
+      expect(socket.closes).toEqual([]);
+      socket.sends.length = 0;
+    }
   });
 
   describe("audit (#104 part B)", () => {
@@ -636,13 +669,13 @@ describe("cli file ops", () => {
       expect(events()[1]).toMatchObject({ outcome: "cancelled", reason: "offline" });
     });
 
-    it("records a mutation's unknown outcome after a too_large rejection, and CLI mode refusals as refused", async () => {
+    it("records a mutation's unknown outcome after an io_error rejection, and CLI mode refusals as refused", async () => {
       const socket = await connect();
       const big = start(socket, "edit", editArgs);
       await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
       await answer(
         socket,
-        JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason: "too_large" }),
+        JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason: "io_error" }),
       );
       await big;
       const root = start(socket, "read", readArgs);
@@ -655,13 +688,48 @@ describe("cli file ops", () => {
       expect(events()[0]).toMatchObject({
         kind: "file_edit",
         outcome: "unknown",
-        reason: "too_large",
+        reason: "io_error",
       });
       expect(events()[1]).toMatchObject({
         kind: "file_read",
         outcome: "refused",
         reason: "unsupported",
       });
+    });
+
+    it("writes a metadata-only refusal row for an input the MCP layer refused", () => {
+      auditRefusedFileInput({
+        userId: "user-id",
+        tokenId: "token",
+        cliDeviceId: "attacker-chosen-device",
+        op: "write",
+        args: { path: "~/n.txt", expectedEtag: "h:AAAAAAAAAAAAAAAAAAAAAA" },
+      });
+      expect(events()).toHaveLength(1);
+      expect(events()[0]).toMatchObject({
+        kind: "file_write",
+        path: "~/n.txt",
+        etagBefore: "h:AAAAAAAAAAAAAAAAAAAAAA",
+        outcome: "refused",
+        reason: "invalid_input",
+        cliDeviceId: "unknown",
+      });
+    });
+
+    it("records the CLI's own supervised_only refusal as refused and its cancelled as cancelled", async () => {
+      const socket = await connect();
+      for (const reason of ["supervised_only", "cancelled"]) {
+        const outcome = start(socket, "read", readArgs);
+        await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+        await answer(
+          socket,
+          JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason }),
+        );
+        await outcome;
+        socket.sends.length = 0;
+      }
+      expect(events()[0]).toMatchObject({ outcome: "refused", reason: "supervised_only" });
+      expect(events()[1]).toMatchObject({ outcome: "cancelled", reason: "cancelled" });
     });
 
     it("records an aborted op exactly once, with the CLI's final answer", async () => {

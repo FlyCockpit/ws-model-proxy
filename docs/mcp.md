@@ -162,8 +162,10 @@ with `ifExists: "replace"`, to `rename` with `overwrite`, and to `delete`. Line-
 and replaces require it. A stale etag returns `error.code` `conflict` with `currentEtag`:
 re-read and retry. `read` with `ifNoneMatch` answers `{unchanged: true, etag}`. Etags reset
 when the wsmp daemon restarts, which costs one extra `conflict`. A write-class call that
-fails with `timeout` or `offline` carries `error.outcome: "unknown"`: call
-`forwarder_cli_file_stat` with `hash: true` and compare the etag before retrying.
+fails with `timeout`, `offline` or `io_error` carries `error.outcome: "unknown"`: call
+`forwarder_cli_file_stat` with `hash: true` and compare the etag before retrying. A retry
+that carries `expectedEtag` is safe (a stale etag returns `conflict`); an exact-match edit
+without `expectedEtag` is not idempotent, so check with `file_stat` first.
 
 **Limits.** 120 file operations per minute per user, of which at most 30 change files;
 4 in flight per CLI and 16 per user. Over a limit the error is `limit` with `retryAfterMs`.

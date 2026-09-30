@@ -182,12 +182,26 @@ fn valid_op_id(id: &str) -> bool {
 
 /// The keys `fileRejectDetailSchema` (server) accepts, with their shapes.
 /// Anything else a `FileError` carries is dropped.
+/// The library's etag shape: `h:` (strong) or `w:` (weak) plus 22 base64url characters.
+fn is_etag(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 24
+        && matches!(bytes[0], b'h' | b'w')
+        && bytes[1] == b':'
+        && bytes[2..]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
 pub fn filter_detail(detail: &Value) -> Option<Value> {
     let object = detail.as_object()?;
     let mut out = Map::new();
     for (key, value) in object {
         let keep = match key.as_str() {
-            "currentEtag" | "etag" => value.as_str().is_some_and(|s| (1..=64).contains(&s.len())),
+            "currentEtag" => value
+                .as_str()
+                .is_some_and(|s| is_etag(s) || matches!(s, "replaced" | "gone")),
+            "etag" => value.as_str().is_some_and(is_etag),
             "sniff" => value.as_str().is_some_and(|s| s.len() <= 32),
             "size" | "edit" | "nearestLine" | "line" | "found" | "retryAfterMs" => {
                 value.as_u64().is_some()

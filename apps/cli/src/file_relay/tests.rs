@@ -260,9 +260,27 @@ fn file_errors_become_file_rejected_with_only_the_documented_detail() {
     assert!(file.exists());
 
     assert_eq!(
-        filter_detail(&json!({ "currentEtag": "h:x", "secret": "leak", "lines": [1, 2] })),
-        Some(json!({ "currentEtag": "h:x", "lines": [1, 2] }))
+        filter_detail(
+            &json!({ "currentEtag": "h:AAAAAAAAAAAAAAAAAAAAAA", "secret": "leak", "lines": [1, 2] })
+        ),
+        Some(json!({ "currentEtag": "h:AAAAAAAAAAAAAAAAAAAAAA", "lines": [1, 2] }))
     );
+    // Only etag-shaped text, or the library's `replaced`/`gone`, is a currentEtag.
+    for word in ["replaced", "gone"] {
+        assert_eq!(
+            filter_detail(&json!({ "currentEtag": word })),
+            Some(json!({ "currentEtag": word }))
+        );
+    }
+    for bad in [
+        "h:x",
+        "wsmp_cli_secretsecretsecretsecret",
+        "x:AAAAAAAAAAAAAAAAAAAAAA",
+        "",
+    ] {
+        assert_eq!(filter_detail(&json!({ "currentEtag": bad })), None, "{bad}");
+    }
+    assert_eq!(filter_detail(&json!({ "etag": "gone" })), None);
     assert_eq!(filter_detail(&json!({ "lines": [1, 2, 3, 4, 5, 6] })), None);
     assert_eq!(filter_detail(&json!({ "sniff": 5 })), None);
     assert_eq!(filter_detail(&json!("x")), None);

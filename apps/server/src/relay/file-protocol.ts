@@ -421,7 +421,8 @@ export type FileResultFrame = z.infer<typeof fileResultFrameSchema>;
 /** Small strict detail object of a rejection (the union of the P1 error details). */
 export const fileRejectDetailSchema = z
   .object({
-    currentEtag: reportedEtagSchema.optional(),
+    // The library reports the words `replaced` / `gone` when the file was swapped or removed mid-edit.
+    currentEtag: z.union([reportedEtagSchema, z.enum(["replaced", "gone"])]).optional(),
     etag: reportedEtagSchema.optional(),
     size: uintSchema.optional(),
     sniff: z.string().max(32).optional(),

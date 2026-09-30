@@ -254,9 +254,15 @@ function auditOutcomeOf(
   if (outcome.ok) return { outcome: "completed", reason: null };
   if (outcome.outcome === "unknown") return { outcome: "unknown", reason: outcome.code };
   if (!audit.registered) return { outcome: "refused", reason: outcome.code };
-  // The CLI's own refusals (root, load): nothing ran.
-  if (outcome.code === "unsupported" || outcome.code === "limit") {
-    return { outcome: "refused", reason: outcome.code };
+  if (CLI_ANSWERED.has(outcome)) {
+    // The CLI answered: its mode/root/load refusals ran nothing, its own
+    // `cancelled` is a cancellation, everything else (including its own
+    // timeout) is a failure of the op.
+    if (REFUSED_BY_CLI_CODES.has(outcome.code)) return { outcome: "refused", reason: outcome.code };
+    return {
+      outcome: outcome.code === "cancelled" ? "cancelled" : "failed",
+      reason: outcome.code,
+    };
   }
   return {
     outcome: CANCELLED_CODES.has(outcome.code) ? "cancelled" : "failed",
@@ -333,6 +339,22 @@ function serverFailure(record: FileOpRecord, code: FileOpErrorCode): FileOpFailu
   return { ok: false, code, ...(record.mutating ? { outcome: "unknown" as const } : {}) };
 }
 
+/** Failures the CLI itself answered with (rather than the server ending the op), for the audit. */
+const CLI_ANSWERED = new WeakSet<object>();
+
+/** The CLI's own mode/root/load refusals: nothing ran. */
+const REFUSED_BY_CLI_CODES: ReadonlySet<string> = new Set([
+  "unsupported",
+  "limit",
+  "supervised_only",
+  "feature_disabled",
+]);
+
+function cliAnswered<T extends FileOpFailure>(failure: T): T {
+  CLI_ANSWERED.add(failure);
+  return failure;
+}
+
 function rejectionFailure(
   reason: FileRejectReason,
   detail: FileRejectDetail | undefined,
@@ -343,11 +365,11 @@ function rejectionFailure(
   // directory sync, a post-rename check) and the CLI cannot send a result that
   // is too big. For a mutation those two say nothing about whether the change
   // was made, so the outcome is unknown and the agent must file_stat first.
-  if (mutating && (reason === "io_error" || reason === "too_large")) {
-    return { ok: false, code: reason, outcome: "unknown" };
+  if (mutating && reason === "io_error") {
+    return cliAnswered({ ok: false, code: reason, outcome: "unknown" });
   }
-  if (reason === "bad_frame") return { ok: false, code: "io_error" };
-  return { ok: false, code: reason, ...(detail ? { detail } : {}) };
+  if (reason === "bad_frame") return cliAnswered({ ok: false, code: "io_error" });
+  return cliAnswered({ ok: false, code: reason, ...(detail ? { detail } : {}) });
 }
 
 const utf8 = new TextDecoder("utf-8", { fatal: true });

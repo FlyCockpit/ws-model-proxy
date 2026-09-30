@@ -405,7 +405,7 @@ export const FILE_ETAG_NOTICE =
   "Every result that touches a file carries etag. Pass it as expectedEtag to edit, write (ifExists replace), rename (overwrite) and delete; a stale etag returns error.code conflict with currentEtag. Line-range edits and replace require expectedEtag. Etags reset when the wsmp daemon restarts: after offline, re-read or file_stat before editing.";
 
 export const FILE_UNKNOWN_OUTCOME_NOTICE =
-  'If a write-class call fails with timeout, offline or io_error (error.outcome "unknown"), the change may or may not have been made: call forwarder_cli_file_stat with hash true and compare the etag before retrying. A retry that carries expectedEtag is safe (a stale etag returns conflict); an exact-match edit without expectedEtag is NOT idempotent, so check with file_stat first. The same applies to a write-class io_error or too_large (error.outcome "unknown").';
+  'If a write-class call fails with timeout, offline or io_error (error.outcome "unknown"), the change may or may not have been made: call forwarder_cli_file_stat with hash true and compare the etag before retrying. A retry that carries expectedEtag is safe (a stale etag returns conflict); an exact-match edit without expectedEtag is NOT idempotent, so check with file_stat first.';
 
 export const FILE_LIMITS_NOTICE =
   "Limits: 120 file operations per minute per user (30 changing ones), 4 at once per CLI and 16 per user; over the limit returns error.code limit with retryAfterMs. Operations are never queued and time out after 30 seconds.";
