@@ -215,7 +215,7 @@ Enable `wsmp config set-file-read on` and choose explicit directories with
 files (read-only)” on the dashboard. Suggested roots `~/models`, `~/deploy`,
 `~/.config/llama-swap`, `~/.local/state/wsmp/logs` are help text only and never
 applied automatically. Roots must be absolute existing directories after `~`
-expansion, UTF-8, distinct, other than `/`, at most 32, and at most 64 KiB serialized in total (control characters count as escapes); a larger set is refused when saved or loaded. `clear-file-roots` clears them.
+expansion, UTF-8, distinct, other than `/`, at most 32, and at most 64 KiB serialized in total (escapes count as their serialized form); a larger set is refused when saved or loaded. `clear-file-roots` clears them.
 Restart applies both switches. A broken root reports roots unavailable and
 retains a denying confinement policy, with no whole-filesystem fallback.
 When roots are set, every operation, including rename destinations and list/search,

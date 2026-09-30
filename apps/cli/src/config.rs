@@ -2471,6 +2471,7 @@ mod tests {
     /// The roots set is bounded in aggregate (serialized, control characters
     /// counting as escapes) wherever roots are accepted, so the supervised
     /// confirm child can always receive it; realistic sets stay accepted.
+    #[cfg(unix)]
     #[test]
     fn file_roots_have_an_aggregate_serialized_bound() {
         // Realistic: the maximum count of ordinary 200-byte roots fits.
@@ -2501,5 +2502,44 @@ mod tests {
             serde_json::from_value::<Probe>(raw).is_err(),
             "config deserialization must refuse the set"
         );
+    }
+
+    /// The bound must keep the serialized roots set deliverable through the
+    /// confirm child's one environment variable (`NAME=value\0` under the Linux
+    /// 131072-byte per-string exec limit), and sit exactly where it is documented.
+    #[cfg(unix)]
+    #[test]
+    fn file_roots_bound_fits_the_child_transport_and_is_exact() {
+        assert_eq!(MAX_FILE_ROOTS_SERIALIZED_BYTES, 64 * 1024);
+        let name_and_nul = "WSMP_SUPERVISED_FILE_ROOTS=".len() + 1;
+        // The snapshot adds only a small fixed envelope around the roots.
+        assert!(MAX_FILE_ROOTS_SERIALIZED_BYTES + 1024 + name_and_nul < 131_072);
+        // Exactly at the bound passes, one byte over fails. Each root counts its
+        // JSON text plus one separator byte.
+        let filler = |len: usize| PathBuf::from(format!("/{}", "a".repeat(len - 1)));
+        let root_len = 3 * 1024; // JSON text: path plus two quotes
+        let per_root = root_len + 1;
+        let full = MAX_FILE_ROOTS_SERIALIZED_BYTES / per_root;
+        let mut roots: Vec<PathBuf> = (0..full)
+            .map(|n| {
+                let mut path = filler(root_len - 2).into_os_string();
+                path.push(format!("{n:04}"));
+                PathBuf::from(path)
+            })
+            .collect();
+        let used: usize = roots
+            .iter()
+            .map(|root| serde_json::to_string(root).unwrap().len() + 1)
+            .sum();
+        let slack = MAX_FILE_ROOTS_SERIALIZED_BYTES - used;
+        roots.push(PathBuf::from(format!("/{}", "b".repeat(slack - 4))));
+        let total: usize = roots
+            .iter()
+            .map(|root| serde_json::to_string(root).unwrap().len() + 1)
+            .sum();
+        assert_eq!(total, MAX_FILE_ROOTS_SERIALIZED_BYTES);
+        validate_file_root_shape(&roots).expect("exactly at the bound");
+        roots.last_mut().unwrap().push("c");
+        assert!(validate_file_root_shape(&roots).is_err(), "one byte over");
     }
 }
