@@ -1,3 +1,4 @@
+import { notifyUserBanned } from "@ws-model-proxy/auth/user-ban-listeners";
 import {
   notifyUserDeleted,
   notifyUserDeletionMarked,
@@ -10,6 +11,7 @@ vi.mock("./relay/cli-commands.js", () => ({
   waitCliCommand: vi.fn(),
   snapshotCliCommand: vi.fn(),
   cancelCommandsForToken: vi.fn(),
+  cancelCommandsForUser: vi.fn(),
   startSupervisedCommand: vi.fn(),
   snapshotSupervisedCommand: vi.fn(),
   listPendingSupervised: vi.fn(() => []),
@@ -18,6 +20,7 @@ vi.mock("./relay/cli-commands.js", () => ({
 vi.mock("./relay/cli-file-ops.js", () => ({
   runFileOp: vi.fn(),
   cancelFileOpsForToken: vi.fn(),
+  cancelFileOpsForUser: vi.fn(),
   sweepExpiredFileOps: vi.fn(),
   auditRefusedFileInput: vi.fn(),
 }));
@@ -97,6 +100,8 @@ const { admitBrowserConnection, terminalBrowserHub } = await import(
   "./relay/terminal-websocket.js"
 );
 const { relaySessionManager } = await import("./relay/session-manager.js");
+const { cancelCommandsForUser } = await import("./relay/cli-commands.js");
+const { cancelFileOpsForUser } = await import("./relay/cli-file-ops.js");
 
 const db = prisma as unknown as { session: { findUnique: MockInstance } };
 
@@ -210,5 +215,31 @@ describe("app deletion listeners reach browser terminal sockets", () => {
     await notifyUserDeleted("admin-id");
     expect(impersonation.closes).toEqual([{ code: 4401, reason: "user_deletion_pending" }]);
     expect(targetOwn.closes).toEqual([]);
+  });
+});
+
+describe("app ban listener cancels the user's in-flight relay work (#159)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.mocked(cancelCommandsForUser).mockReset();
+    vi.mocked(cancelFileOpsForUser).mockReset();
+  });
+
+  it("a ban notification cancels commands and file ops for that user, without closing sockets", async () => {
+    const closeRelay = vi.spyOn(relaySessionManager, "closeSessionsForUser");
+    await notifyUserBanned("user-id");
+    expect(cancelCommandsForUser).toHaveBeenCalledExactlyOnceWith("user-id");
+    expect(cancelFileOpsForUser).toHaveBeenCalledExactlyOnceWith("user-id");
+    expect(closeRelay).not.toHaveBeenCalled();
+  });
+
+  it("still cancels file ops when the command sweep throws, and contains the failure", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.mocked(cancelCommandsForUser).mockImplementationOnce(() => {
+      throw new TypeError("boom");
+    });
+    await expect(notifyUserBanned("user-id")).resolves.toBeUndefined();
+    expect(cancelFileOpsForUser).toHaveBeenCalledWith("user-id");
+    expect(errors).toHaveBeenCalledWith("[auth] user banned listener failed", "TypeError");
   });
 });

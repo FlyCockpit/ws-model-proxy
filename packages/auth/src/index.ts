@@ -25,9 +25,11 @@ import {
   DISABLED_DEVICE_AUTHORIZATION_PATHS,
   requireCliDeviceLoginScope,
 } from "./cli-device-login-scope";
+import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
 import { resolveSignupLocale } from "./signup-locale";
 import { getSignupAccessState, resolveBootstrapAdminIdentity } from "./signup-policy";
+import { notifyUserBanned } from "./user-ban-listeners";
 import { resolveUserCreatePolicy, toUserCreatePolicyInput } from "./user-create-policy";
 import {
   mapSessionRefusalToForbidden,
@@ -385,6 +387,28 @@ export const auth = betterAuth({
               role: policy.role,
             },
           };
+        },
+      },
+      update: {
+        // A user row that now carries an ACTIVE ban (`/admin/ban-user`, or an
+        // `/admin/update-user` that sets `banned`) ends the user's in-flight
+        // relay work. Better Auth runs `after` once the update's transaction
+        // committed. Any later update of a still-banned user notifies again;
+        // the cancel is idempotent. An unban or an expired ban notifies nothing.
+        after: async (user) => {
+          if (!user) return;
+          const row = user as { id: string; banned?: unknown; banExpires?: unknown };
+          if (
+            isUserBanned(
+              {
+                banned: row.banned === true,
+                banExpires: row.banExpires instanceof Date ? row.banExpires : null,
+              },
+              new Date(),
+            )
+          ) {
+            await notifyUserBanned(row.id);
+          }
         },
       },
       delete: {

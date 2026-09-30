@@ -80,14 +80,20 @@ function ownerAllowsCliEffects(owner: CliOwnerState | null): boolean {
  *   synchronously. Before the start's synchronous step the device has no
  *   live session (the start returns `offline`); after it, the registered
  *   record is ended with the session.
+ * A ban is ordered the same way, without closing the socket: committed before
+ * the owner read, the verdict refuses; committed after it, `notifyUserBanned`
+ * runs the per-user sweep (`revokeOpenCliAgentAdmissionsForUser`), which marks
+ * the open admission (the start refuses) or, once the record exists, ends it
+ * (`cancelCommandsForUser`, `cancelFileOpsForUser`).
  * In memory, single process: the relay sockets and the sweeps live here.
  */
-type Admission = { tokenId: string; revoked: boolean; grantChangeSeq: number };
+type Admission = { tokenId: string; userId: string; revoked: boolean; grantChangeSeq: number };
 const openAdmissions = new Set<Admission>();
 
-function openAdmission(tokenId: string, cliDeviceId: string): Admission {
+function openAdmission(tokenId: string, userId: string, cliDeviceId: string): Admission {
   const admission = {
     tokenId,
+    userId,
     revoked: false,
     grantChangeSeq: relaySessionManager.featureGrantChangeSeq(cliDeviceId),
   };
@@ -99,6 +105,18 @@ function openAdmission(tokenId: string, cliDeviceId: string): Admission {
 export function revokeOpenCliAgentAdmissions(tokenId: string): void {
   for (const admission of openAdmissions) {
     if (admission.tokenId === tokenId) admission.revoked = true;
+  }
+}
+
+/**
+ * Mark every admission still reading for `userId` (a ban): its request refuses.
+ * The per-user twin of {@link revokeOpenCliAgentAdmissions}, with the same
+ * ordering argument (see `Admission`): a ban committed before the owner read is
+ * seen by the verdict, one committed later is swept here, or ends the record.
+ */
+export function revokeOpenCliAgentAdmissionsForUser(userId: string): void {
+  for (const admission of openAdmissions) {
+    if (admission.userId === userId) admission.revoked = true;
   }
 }
 
@@ -186,7 +204,7 @@ export type CliAgentAdmissionReads = {
 export async function readCliAgentAdmission(
   input: CliAgentAdmissionInput,
 ): Promise<CliAgentAdmissionReads> {
-  const admission = openAdmission(input.tokenId, input.cliDeviceId);
+  const admission = openAdmission(input.tokenId, input.userId, input.cliDeviceId);
   let device: AdmissionDevice | null;
   let token: LiveCliToken | null;
   let owner: CliOwnerState | null;

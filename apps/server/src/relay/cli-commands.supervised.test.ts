@@ -4,6 +4,7 @@ import {
   mcpCommandModeFromDb,
   mcpCommandRefusals,
 } from "@ws-model-proxy/api/lib/mcp-command-mode";
+import { notifyUserBanned, onUserBanned } from "@ws-model-proxy/auth/user-ban-listeners";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as cliAgentAdmission from "./cli-agent-admission.js";
@@ -13,6 +14,7 @@ import {
   parseRelayBinaryFrame,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
 } from "./protocol.js";
+import { cancelRelayWorkForBannedUser } from "./user-ban.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -1155,6 +1157,97 @@ describe("supervised commands", () => {
     });
   });
 
+  describe("ban fence (#159)", () => {
+    let unsubscribe: () => void;
+    beforeEach(() => {
+      // The same subscription apps/server/src/app.ts makes.
+      unsubscribe = onUserBanned(cancelRelayWorkForBannedUser);
+    });
+    afterEach(() => unsubscribe());
+
+    it("a ban ends every waiting, running and unreleased request of the user, through any token", async () => {
+      const socket = await connect();
+      // Output waiting for review first: it counts toward no live limit.
+      const awaitingReview = await spawnedAndAccepted(socket, { tokenId: "token-c" });
+      await say(socket, {
+        type: "supervised.done",
+        commandId: awaitingReview.commandId,
+        exitCode: 0,
+        review: true,
+      });
+      expect(snapshot(awaitingReview.commandId, "token-c")?.status).toBe("awaiting_output_review");
+      const live = await spawnedAndAccepted(socket, { tokenId: "token-d" });
+      expect(snapshot(live.commandId, "token-d")?.status).toBe("running");
+      const waiting = await started({ tokenId: "token-a" });
+      await say(socket, { type: "term.spawned", ...waiting });
+      expect(snapshot(waiting.commandId, "token-a")?.status).toBe("awaiting_user");
+      socket.sends.length = 0;
+
+      await notifyUserBanned("user-id");
+
+      expect(snapshot(waiting.commandId, "token-a")).toMatchObject({
+        status: "cancelled",
+        rejectionReason: "user_banned",
+      });
+      expect(snapshot(live.commandId, "token-d")).toMatchObject({
+        status: "cancelled",
+        rejectionReason: "user_banned",
+      });
+      // The unreleased output is withheld for good, never handed to the agent.
+      expect(snapshot(awaitingReview.commandId, "token-c")).toMatchObject({
+        status: "exited",
+        output: { mode: "redacted" },
+        shared: null,
+      });
+      // The CLI is told to close every terminal; nothing else keeps running.
+      expect(
+        sent(socket, "supervised.cancel")
+          .map((message) => message.commandId)
+          .sort(),
+      ).toEqual([waiting.commandId, live.commandId, awaitingReview.commandId].sort());
+      expect(listPendingSupervised("user-id")).toEqual([]);
+    });
+
+    it("leaves another user's requests alone and accepts new ones after", async () => {
+      const socket = await connect();
+      const mine = await started({ tokenId: "token-a" });
+      await say(socket, { type: "term.spawned", ...mine });
+      await notifyUserBanned("someone-else");
+      expect(snapshot(mine.commandId, "token-a")?.status).toBe("awaiting_user");
+      // Only the banned user's own requests end; a later start (the mocks say unbanned) is admitted.
+      await notifyUserBanned("user-id");
+      expect(snapshot(mine.commandId, "token-a")?.status).toBe("cancelled");
+      await expect(start()).resolves.toMatchObject({ ok: true });
+    });
+
+    it("refuses a start whose admission is still reading when the ban lands", async () => {
+      const socket = await connect();
+      let release: () => void = () => {};
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let entered: () => void = () => {};
+      const reached = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const owner = db.user.findUnique.getMockImplementation();
+      db.user.findUnique.mockImplementation(
+        async (args: { select?: { deletionRequestedAt?: boolean } }) => {
+          if (!args.select?.deletionRequestedAt) return owner?.(args);
+          entered();
+          await gate;
+          return { banned: false, banExpires: null, deletionRequestedAt: null };
+        },
+      );
+      const pending = start();
+      await reached;
+      await notifyUserBanned("user-id");
+      release();
+      await expect(pending).resolves.toEqual({ ok: false, error: "token_inactive" });
+      expect(socket.sends).toEqual([]);
+    });
+  });
+
   describe("policy", () => {
     it("closes agent terminals when the mode goes off, keeps them in supervised mode", async () => {
       const socket = await connect("desktop", { mode: "unsupervised", grant: "UNSUPERVISED" });
@@ -1631,6 +1724,7 @@ describe("supervised commands", () => {
         [
           "disconnect",
           "revoke",
+          "ban",
           "grant",
           "stop-unanswered",
           "confirm-ttl",
@@ -1656,6 +1750,7 @@ describe("supervised commands", () => {
         // No term.spawned acknowledgement either: dispatch itself is enough.
         if (event === "disconnect") await relaySessionManager.removeSession(socket);
         if (event === "revoke") cancelCommandsForToken("token-a");
+        if (event === "ban") cancelRelayWorkForBannedUser("user-id");
         if (event === "grant")
           relaySessionManager.applyFeatureGrants("desktop", {
             allowHumanTerminal: false,
@@ -1675,7 +1770,7 @@ describe("supervised commands", () => {
             ? "offline"
             : event === "grant"
               ? "grant_disabled"
-              : ["revoke", "token-expiry"].includes(event)
+              : ["revoke", "ban", "token-expiry"].includes(event)
                 ? "token_inactive"
                 : event === "confirm-ttl"
                   ? "timeout"
@@ -2608,35 +2703,39 @@ describe("supervised commands", () => {
       expect(db.cliDevice.findUnique).toHaveBeenCalledTimes(1);
     });
 
-    it.each(["revoke", "grant"] as const)("refuses %s during file admission", async (cause) => {
-      const socket = await connect();
-      const enteredOwner = Promise.withResolvers<void>();
-      let release!: (row: unknown) => void;
-      db.user.findUnique.mockImplementationOnce(
-        () =>
-          new Promise((resolve) => {
-            release = resolve;
-            enteredOwner.resolve();
-          }),
-      );
-      const pending = fileStart();
-      await enteredOwner.promise;
-      if (cause === "revoke") cancelCommandsForToken("token-a");
-      else {
-        grants.desktop = "OFF";
-        relaySessionManager.applyFeatureGrants("desktop", {
-          allowHumanTerminal: false,
-          mcpCommandMode: "off",
-          mcpFileRead: false,
+    it.each(["revoke", "ban", "grant"] as const)(
+      "refuses %s during file admission",
+      async (cause) => {
+        const socket = await connect();
+        const enteredOwner = Promise.withResolvers<void>();
+        let release!: (row: unknown) => void;
+        db.user.findUnique.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              release = resolve;
+              enteredOwner.resolve();
+            }),
+        );
+        const pending = fileStart();
+        await enteredOwner.promise;
+        if (cause === "revoke") cancelCommandsForToken("token-a");
+        else if (cause === "ban") cancelRelayWorkForBannedUser("user-id");
+        else {
+          grants.desktop = "OFF";
+          relaySessionManager.applyFeatureGrants("desktop", {
+            allowHumanTerminal: false,
+            mcpCommandMode: "off",
+            mcpFileRead: false,
+          });
+        }
+        release({ banned: false });
+        await expect(pending).resolves.toMatchObject({
+          ok: false,
+          code: cause === "grant" ? "grant_disabled" : "token_inactive",
         });
-      }
-      release({ banned: false });
-      await expect(pending).resolves.toMatchObject({
-        ok: false,
-        code: cause === "revoke" ? "token_inactive" : "grant_disabled",
-      });
-      expect(socket.sends).toEqual([]);
-    });
+        expect(socket.sends).toEqual([]);
+      },
+    );
 
     it.each(["ban", "deletion"] as const)(
       "reads an owner %s after the slow device read for supervised admission",
@@ -2691,6 +2790,8 @@ describe("supervised commands", () => {
       "grant",
       "accepted-revoke",
       "accepted-grant",
+      "ban",
+      "accepted-ban",
     ] as const)("settles %s with only the justified uncertainty", async (event) => {
       vi.useFakeTimers();
       const socket = await connect();
@@ -2720,6 +2821,7 @@ describe("supervised commands", () => {
       }
       if (event.includes("disconnect")) await relaySessionManager.removeSession(socket);
       if (event.endsWith("revoke")) cancelCommandsForToken("token-a");
+      if (event.endsWith("ban")) cancelRelayWorkForBannedUser("user-id");
       if (event.endsWith("grant"))
         relaySessionManager.applyFeatureGrants("desktop", {
           allowHumanTerminal: false,
@@ -2736,6 +2838,9 @@ describe("supervised commands", () => {
         grant: "grant_disabled",
         "accepted-revoke": "token_inactive",
         "accepted-grant": "grant_disabled",
+        // A banned user's tokens are dead: same code as a revoked token.
+        ban: "token_inactive",
+        "accepted-ban": "token_inactive",
       };
       expect(snapshot(commandId)?.fileError).toEqual({
         code: codes[event],

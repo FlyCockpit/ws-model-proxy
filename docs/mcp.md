@@ -341,6 +341,18 @@ under the other spelling between the check and the rename can lose that entry.
 server before the `wsmp` CLI: a server that predates it treats the CLI's rejection frame
 as malformed and drops the relay session (the retained files stay on disk).
 
+**Revocation and bans.** Revoking or narrowing a personal token, revoking a CLI
+credential or device, and deleting a user end that principal's in-flight file operations and
+commands (`token_inactive` or `offline`; a write-class call carries `error.outcome: "unknown"`).
+Banning a user (the dashboard archive action, the admin ban, or an admin update that sets the
+ban) does the same for every token the user holds and refuses calls still being admitted; the
+CLI's relay connection stays up. Everything ends on the server at once, including supervised
+commands and supervised file requests still waiting for a person's confirmation or already applying (a file request ends `token_inactive`/`offline`-style with `outcome: "unknown"` once dispatched, per the outcome contract): a call waiting for a headless command returns
+`cancelled`, and the CLI's late output and exit are dropped and never reported as a success. The
+CLI is asked to stop the process, and the command keeps its execution slot only until the CLI
+answers or 15 seconds pass. The cancel runs in the server process that performed the ban: another
+replica ends the work at its deadline and refuses the user's next call.
+
 **Limits.** Supervised writes share command limits: one awaiting per CLI, two awaiting
 per user, and two live per CLI. Headless limits are 120 file operations per minute per user, of which at most 30 change files;
 4 in flight per CLI and 16 per user. Headless limits return `limit` with `retryAfterMs`;
@@ -355,8 +367,8 @@ frame. The 1 MB `/mcp` request-body cap that every call shares is the
 real ceiling on the encoded form, so a base64 write arrives at roughly 768 KiB (786,432 bytes)
 decoded or less (it encodes to 4/3 of that); larger bodies cannot be written with the
 current tools. Admission and headless errors are in-band `isError` results;
-completed supervised failures appear in the polled `result.error`. Both use a stable
-`error.code`: the command codes
+completed supervised failures appear in the polled `result.error`. Both use a
+stable `error.code`: the command codes
 (`not_found`, `grant_disabled`, `offline`, `feature_disabled`, `supervised_only`,
 `unsupported`, `limit`, `token_inactive`, `upgrade_required`), `invalid_input`, and the
 file codes (`path_denied`, `secret_file`, `not_a_file`, `not_a_dir`, `binary_file`,
