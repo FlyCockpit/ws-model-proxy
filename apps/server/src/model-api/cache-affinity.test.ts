@@ -18,8 +18,9 @@ const db = vi.hoisted(() => ({
   $executeRaw: vi.fn(),
 }));
 
-vi.mock("@ws-model-proxy/db", async (importOriginal) => {
-  const { Prisma } = await importOriginal<typeof import("@ws-model-proxy/db")>();
+vi.mock("@ws-model-proxy/db", async () => {
+  // Keep real SQL builders without constructing a client or validating runtime env.
+  const { Prisma } = await import("../../../../packages/db/prisma/generated/client");
   return { default: db, Prisma };
 });
 vi.mock("@ws-model-proxy/env/server", () => ({

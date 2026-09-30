@@ -720,12 +720,65 @@ integration("warm-session protection with real PostgreSQL", () => {
     hint?: boolean;
     target?: number;
     binding?: string;
+    ttlSeconds?: number;
+    samples?: { age: number; tokens: number }[];
   };
   const cases: {
     name: string;
     turns: Turn[];
+    windowSeconds?: number;
     expected: { target: number; ageMs: number; tokens: number }[];
   }[] = [
+    {
+      name: "sample window rejects an older in-TTL size after a sub-floor refresh",
+      turns: [{ age: 10, tokens: 3000, ttlSeconds: 3600, samples: [{ age: 301, tokens: 20_000 }] }],
+      expected: [],
+    },
+    {
+      name: "sample window includes its exact boundary after a sub-floor refresh",
+      turns: [{ age: 10, tokens: 3000, ttlSeconds: 3600, samples: [{ age: 300, tokens: 20_000 }] }],
+      expected: [{ target: 0, ageMs: 10_000, tokens: 20_000 }],
+    },
+    {
+      name: "sample TTL rejects expired size even with a longer protection window",
+      windowSeconds: 7200,
+      turns: [
+        { age: 10, tokens: 3000, ttlSeconds: 3600, samples: [{ age: 3601, tokens: 20_000 }] },
+      ],
+      expected: [],
+    },
+    {
+      name: "sample TTL rejects its exact expiry boundary",
+      windowSeconds: 7200,
+      turns: [
+        { age: 10, tokens: 3000, ttlSeconds: 3600, samples: [{ age: 3600, tokens: 20_000 }] },
+      ],
+      expected: [],
+    },
+    {
+      name: "sample TTL preserves live size with a longer protection window",
+      windowSeconds: 7200,
+      turns: [
+        { age: 10, tokens: 3000, ttlSeconds: 3600, samples: [{ age: 3599, tokens: 20_000 }] },
+      ],
+      expected: [{ target: 0, ageMs: 10_000, tokens: 20_000 }],
+    },
+    {
+      name: "conflicting sample sizes at one instant choose MAX regardless of array order",
+      turns: [
+        {
+          age: 10,
+          tokens: 3000,
+          ttlSeconds: 3600,
+          samples: [
+            { age: 20, tokens: 9000 },
+            { age: 20, tokens: 20_000 },
+            { age: 30, tokens: 90_000 },
+          ],
+        },
+      ],
+      expected: [{ target: 0, ageMs: 10_000, tokens: 20_000 }],
+    },
     {
       name: "nested snapshots choose newest size, independent of insertion order",
       turns: [
@@ -802,7 +855,7 @@ integration("warm-session protection with real PostgreSQL", () => {
   ];
   // Same-instant MAX, expiry and legacy cases preserve existing semantics;
   // ownership, scoping and sub-floor cases regress the first-pass reader.
-  it.each(cases)("$name", async ({ turns, expected }) => {
+  it.each(cases)("$name", async ({ turns, expected, windowSeconds = 300 }) => {
     if (!databaseUrl) return;
     const owner = await user("table");
     try {
@@ -848,14 +901,23 @@ integration("warm-session protection with real PostgreSQL", () => {
           prefixDepth: turn.hint ? 1 : 0,
           createdAt: new Date(now.getTime() - 3_600_000),
           lastUsedAt: new Date(now.getTime() - turn.age * 1000),
-          expiresAt: new Date(now.getTime() + (turn.expired ? -1000 : 60_000)),
+          expiresAt: new Date(
+            now.getTime() +
+              (turn.expired
+                ? -1000
+                : turn.ttlSeconds === undefined
+                  ? 60_000
+                  : (turn.ttlSeconds - turn.age) * 1000),
+          ),
           estimatedTokens: turn.tokens,
+          sessionTokenTimes: turn.samples?.map(({ age }) => new Date(now.getTime() - age * 1000)),
+          sessionTokenEstimates: turn.samples?.map(({ tokens }) => tokens),
         })),
       });
       const result = await warm.loadWarmSessions({
         ownerId: owner.id,
         capacityIds: targets.map((t) => t.capacityId),
-        policy: { windowSeconds: 300, minTokens: 8192 },
+        policy: { windowSeconds, minTokens: 8192 },
         now,
       });
       const actual = targets.flatMap((t, target) =>

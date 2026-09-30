@@ -1,7 +1,6 @@
 // Fixture writes need no owner fences (the graph-write fence triggers accept
 // this client); production code under test uses its own clients.
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
-import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -18,12 +17,14 @@ if (!databaseUrl)
 integration("cache affinity PostgreSQL concurrency and retention", () => {
   const db = databaseUrl ? createFixturePrismaClient(databaseUrl) : undefined;
   let service: typeof import("./cache-affinity.js");
+  let hmacDigestForForwarderPurpose: typeof import("@ws-model-proxy/db/forwarder-security").hmacDigestForForwarderPurpose;
 
   beforeAll(async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
     process.env.BETTER_AUTH_SECRET ??= "cache-affinity-integration-secret-32-bytes";
     process.env.BETTER_AUTH_URL ??= "http://localhost:3000";
+    ({ hmacDigestForForwarderPurpose } = await import("@ws-model-proxy/db/forwarder-security"));
     service = await import("./cache-affinity.js");
   });
 
@@ -1247,6 +1248,104 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
       now: later,
     });
     expect(paramsChanged.matchedSessionIds).toEqual(ranked.matchedSessionIds);
+  });
+
+  // The intervening sub-floor turn keeps the snapshot live while its older
+  // size crosses TTL. Assert storage AND the reader with window > TTL, so
+  // neither layer can hide a missing expiry guard in the other.
+  it.each([
+    {
+      name: "live older size survives",
+      age: 3599,
+      latest: 3000,
+      keepOlder: true,
+      warmTokens: 20_000,
+    },
+    {
+      name: "exact TTL boundary is pruned",
+      age: 3600,
+      latest: 3000,
+      keepOlder: false,
+      warmTokens: null,
+    },
+    {
+      name: "expired older size is pruned",
+      age: 3601,
+      latest: 3000,
+      keepOlder: false,
+      warmTokens: null,
+    },
+    {
+      name: "missing estimate still prunes expiry",
+      age: 3601,
+      latest: undefined,
+      keepOlder: false,
+      warmTokens: null,
+    },
+    {
+      name: "new larger size dominates live older size",
+      age: 3599,
+      latest: 24_000,
+      keepOlder: false,
+      warmTokens: 24_000,
+    },
+  ])("size-sample writer TTL: $name", async ({ age, latest, keepOlder, warmTokens }) => {
+    if (!db) return;
+    const row = await fixture();
+    const now = new Date("2026-09-29T12:00:00Z");
+    const first = new Date(now.getTime() - age * 1000);
+    const middle = new Date(now.getTime() - 10_000);
+    const base = {
+      ownerId: row.tenant.id,
+      resourceOwnerId: row.owner.id,
+      poolId: row.pool.id,
+      policy: { ...policy, ttlSeconds: 3600, maxRecords: 100 },
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      payload: chat([userTurn("size evidence")], { conversation: "sample-ttl" }),
+      target: row.target(0),
+    };
+    await service.rememberAffinity({
+      ...base,
+      requestId: "first",
+      estimatedTokens: 20_000,
+      now: first,
+    });
+    await service.rememberAffinity({
+      ...base,
+      requestId: "refresh",
+      estimatedTokens: 3000,
+      now: middle,
+    });
+    const before = await db.cacheAffinityRecord.findFirstOrThrow({
+      where: { poolId: row.pool.id, prefixDigest: null },
+    });
+    expect(before.sessionTokenTimes).toEqual([first, middle]);
+    await service.rememberAffinity({ ...base, requestId: "latest", estimatedTokens: latest, now });
+    const after = await db.cacheAffinityRecord.findFirstOrThrow({
+      where: { poolId: row.pool.id, prefixDigest: null },
+    });
+    expect(after.sessionId).toBe(before.sessionId);
+    expect(after.sessionTokenTimes).toEqual([
+      ...(keepOlder ? [first] : []),
+      ...(latest === undefined ? [middle] : [now]),
+    ]);
+    expect(after.sessionTokenEstimates).toEqual([
+      ...(keepOlder ? [20_000] : []),
+      ...(latest === undefined ? [3000] : [latest]),
+    ]);
+    const warm = await import("./warm-protection.js");
+    const sessions =
+      (
+        await warm.loadWarmSessions({
+          ownerId: row.owner.id,
+          capacityIds: [row.target(0).capacityId],
+          policy: { windowSeconds: 7200, minTokens: 8192 },
+          now,
+        })
+      ).get(row.target(0).capacityId) ?? [];
+    expect(sessions).toEqual(
+      warmTokens === null ? [] : [expect.objectContaining({ ageMs: 0, tokens: warmTokens })],
+    );
   });
 
   it("instruction-only refreshes cannot create warmth or refresh another session", async () => {

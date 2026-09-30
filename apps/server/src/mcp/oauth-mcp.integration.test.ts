@@ -3893,7 +3893,7 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
   // -------------------------------------------------------------------------
 
   it("row 16 — duplicate account-key preflight: exit 0 clean, exit 1 seeded (spawned against the disposable DB)", async () => {
-    const repoRoot = resolve(import.meta.dirname!, "../../..");
+    const repoRoot = resolve(import.meta.dirname!, "../../../..");
     // SCOPE NOTE (R117 finding 6): this test MUTATES the schema (drops the
     // account unique index) on whatever database the suite runs against.
     // The default `pnpm test:pg` path provisions a THROWAWAY container; the

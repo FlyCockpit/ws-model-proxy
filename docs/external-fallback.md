@@ -123,7 +123,7 @@ The request goes external only after local routing could not serve it:
   while a cold local member is free. Pre-commit retry rounds keep the original
   external deadline instead of waiting another `externalAfterWaitMs` each;
 - no local member is free for a new conversation because the members with an
-  idle slot hold protected warm sessions (including your own) (see
+  idle slot hold protected warm sessions, including your own (see
   [Warm-session protection](#warm-session-protection)). A pool is saturated
   for a request when no member is free for it, and "protected" counts as not
   free: a new `:external` conversation may go external at once while a local
