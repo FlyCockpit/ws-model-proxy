@@ -258,8 +258,8 @@ describe("cache affinity", () => {
         payload: { ...base.payload, conversation },
       });
       expect(material.clientSessionId).toBeUndefined();
-      expect(material.rootDigest).toBe(affinityPrefixDigests(base).rootDigest);
-      expect(material.nodes).toEqual(affinityPrefixDigests(base).nodes);
+      expect(material.rootDigest).not.toBe(affinityPrefixDigests(base).rootDigest);
+      expect(material.nodes).not.toEqual(affinityPrefixDigests(base).nodes);
     },
   );
 
@@ -557,7 +557,9 @@ describe("cache affinity", () => {
         ),
       ).toBe(parent!.sessionId);
       expect(await rememberAffinity(request)).toBeNull();
-      expect(db.cacheAffinityRecord.upsert).not.toHaveBeenCalled();
+      expect(
+        db.cacheAffinityRecord.upsert.mock.calls.map(([input]) => input.create.prefixDigest),
+      ).toEqual(material.instructionDigests);
       const nodeInserts = db.$executeRaw.mock.calls.filter(([query]) =>
         (query.strings ?? query).join("").includes("INSERT INTO cache_affinity_node"),
       );
@@ -1424,6 +1426,282 @@ describe("cache affinity", () => {
     const conversations = conversationWrites().map(({ data }) => data.conversationDigest);
     expect(new Set(conversations).size).toBe(4);
   });
+
+  it.each(["openai-chat", "anthropic-messages", "openai-responses"])(
+    "R1 over-cap routing unit %s",
+    async (surface) => {
+      const content = Array.from({ length: 80 }, (_, i) => ({
+        role: i % 2 ? "assistant" : "user",
+        content: `turn ${i}`,
+      }));
+      const huge = {
+        role: "user",
+        content: [
+          {
+            type: "image_url",
+            image_url: { url: `data:image/png;base64,${"A".repeat(2 * 1024 * 1024)}` },
+          },
+        ],
+      };
+      const request =
+        surface === "openai-responses"
+          ? { instructions: "rules", input: [...content, huge] }
+          : surface === "anthropic-messages"
+            ? { system: "rules", messages: [...content, huge] }
+            : { messages: [{ role: "system", content: "rules" }, ...content, huge] };
+      const material = affinityPrefixDigests(digestArgs("runtime", request, surface));
+      expect(material.identifiable).toBe(false);
+      expect(material.nodes).toEqual([]);
+      expect(material.routingNodes).toHaveLength(64);
+      expect(material.routingNodes[0]?.depth).toBe(17);
+      expect(material.routingNodes.at(-1)?.depth).toBe(80);
+      expect(material.instructionDigests).toHaveLength(1);
+      db.$queryRaw.mockClear();
+      expect(
+        await resolveAffinitySession(
+          db,
+          { userId: "owner", tenantUserId: "owner", poolId: "pool", executionTargetId: "target" },
+          material,
+          new Date(),
+        ),
+      ).toBeNull();
+      expect(db.$queryRaw).not.toHaveBeenCalled();
+      expect(
+        await rememberAffinity({
+          ...digestArgs("runtime", request, surface),
+          target: target("target", "runtime"),
+          policy,
+          estimatedTokens: 20000,
+        }),
+      ).toBeNull();
+      expect(conversationWrites()).toEqual([]);
+    },
+  );
+
+  it.each([false, true])("R1 missing-parent delta routing unit client=%s", async (client) => {
+    const request = {
+      instructions: "rules",
+      input: [
+        { role: "user", content: "delta" },
+        { role: "assistant", content: "output" },
+      ],
+      previous_response_id: "missing",
+      ...(client ? { conversation: "client" } : {}),
+    };
+    const material = affinityPrefixDigests(digestArgs("runtime", request, "openai-responses"));
+    expect(material.missingParent).toBe(true);
+    expect(material.nodes).toEqual([]);
+    expect(material.routingNodes).toEqual([]);
+    expect(material.digests).toEqual([]);
+    expect(material.instructionDigests).toHaveLength(1);
+    await rememberAffinity({
+      ...digestArgs("runtime", request, "openai-responses"),
+      target: target("target", "runtime"),
+      policy,
+    });
+    expect(
+      db.cacheAffinityRecord.upsert.mock.calls.map(([input]) => input.create.prefixDigest),
+    ).toEqual(material.instructionDigests);
+    expect(conversationWrites()).toHaveLength(client ? 1 : 0);
+  });
+
+  it.each([
+    { name: "ownerId", change: { ownerId: "different-owner" } },
+    { name: "resourceOwnerId", change: { resourceOwnerId: "different-resource-owner" } },
+    { name: "securityScope", change: { securityScope: "different-token" } },
+    { name: "accessGrantId", change: { accessGrantId: "different-grant" } },
+    { name: "poolId", change: { poolId: "different-pool" } },
+    { name: "runtimeIdentity", change: { runtimeIdentity: "different-runtime" } },
+    { name: "surface", change: { surface: "anthropic-messages" } },
+  ])("R1 client identity scope $name", ({ change }) => {
+    const args = {
+      ...digestArgs("runtime", {
+        conversation: "same-id",
+        messages: [{ role: "user", content: "starter" }],
+      }),
+      securityScope: "token",
+      accessGrantId: "grant",
+    };
+    const original = affinityPrefixDigests(args);
+    const changed = affinityPrefixDigests({ ...args, ...change });
+    expect(original.clientSessionId).toBeDefined();
+    expect(changed.clientSessionId).toBeDefined();
+    expect(changed.clientSessionId).not.toBe(original.clientSessionId);
+  });
+
+  const r1HeaderCases = ["openai-chat", "anthropic-messages", "openai-responses"].flatMap(
+    (surface) =>
+      [
+        "x-conversation-id",
+        "session_id",
+        "session-id",
+        "x-session-id",
+        "x-claude-code-session-id",
+      ].map((header) => ({ surface, header })),
+  );
+  it.each(r1HeaderCases)("R1 header carrier unit $surface $header", async ({ surface, header }) => {
+    const content = [
+      { role: "user", content: "start" },
+      { role: "assistant", content: "reply" },
+    ];
+    const payload = surface === "openai-responses" ? { input: content } : { messages: content };
+    const args = {
+      ...digestArgs("runtime", payload, surface),
+      headers: new Headers({ [header.toUpperCase()]: " stable-client " }),
+    };
+    const one = affinityPrefixDigests({
+      ...args,
+      payload: {
+        ...payload,
+        metadata: { user_id: "user-A_session_11111111-2222-4333-8444-555555555555" },
+      },
+    });
+    const two = affinityPrefixDigests({
+      ...args,
+      payload: {
+        ...payload,
+        metadata: { user_id: "user-B_session_11111111-2222-4333-8444-555555555555" },
+      },
+    });
+    expect(extractClientConversationId(args.headers, payload, surface)).toBe("stable-client");
+    expect(two.rootDigest).not.toBe(one.rootDigest);
+    expect(two.clientSessionId).toBe(one.clientSessionId);
+    expect(
+      await resolveAffinitySession(
+        db,
+        { userId: "owner", tenantUserId: "owner", poolId: "pool", executionTargetId: "target" },
+        two,
+        new Date(),
+      ),
+    ).toBe(one.clientSessionId);
+    expect(db.$queryRaw).not.toHaveBeenCalled();
+  });
+
+  const r1CarrierCases = ["openai-chat", "anthropic-messages", "openai-responses"].flatMap(
+    (surface) => [
+      ...["conversation", "conversation_id"].flatMap((key) => [
+        {
+          surface,
+          name: `${key} valid`,
+          before: { [key]: "client" },
+          after: { [key]: " client " },
+          free: true,
+          client: true,
+        },
+        {
+          surface,
+          name: `${key} object`,
+          before: { [key]: { id: "client", note: "A" } },
+          after: { [key]: { id: "client", note: "B" } },
+          free: true,
+          client: true,
+        },
+        {
+          surface,
+          name: `${key} invalid`,
+          before: { [key]: "bad key A" },
+          after: { [key]: "bad key B" },
+          free: false,
+          client: false,
+        },
+      ]),
+      {
+        surface,
+        name: "prompt_cache_key valid or inactive",
+        before: { prompt_cache_key: "client" },
+        after: { prompt_cache_key: " client " },
+        free: surface !== "anthropic-messages",
+        client: surface !== "anthropic-messages",
+      },
+      {
+        surface,
+        name: "prompt_cache_key invalid",
+        before: { prompt_cache_key: "bad key A" },
+        after: { prompt_cache_key: "bad key B" },
+        free: false,
+        client: false,
+      },
+      {
+        surface,
+        name: "ordinary metadata.user_id",
+        before: { metadata: { user_id: "user-A" } },
+        after: { metadata: { user_id: "user-B" } },
+        free: false,
+        client: false,
+      },
+      {
+        surface,
+        name: "metadata session token valid or inactive",
+        before: { metadata: { user_id: "user-A_session_11111111-2222-4333-8444-555555555555" } },
+        after: { metadata: { user_id: "user-B_session_11111111-2222-4333-8444-555555555555" } },
+        free: surface === "anthropic-messages",
+        client: surface === "anthropic-messages",
+      },
+      {
+        surface,
+        name: "other metadata fields",
+        before: {
+          metadata: { user_id: "user_session_11111111-2222-4333-8444-555555555555", extra: "A" },
+        },
+        after: {
+          metadata: { user_id: "user_session_11111111-2222-4333-8444-555555555555", extra: "B" },
+        },
+        free: false,
+        client: surface === "anthropic-messages",
+      },
+      ...["conversation_id", "prompt_cache_key", "metadata"].map((key) => ({
+        surface,
+        name: `${key} losing carrier`,
+        before: {
+          conversation: "winner",
+          [key]:
+            key === "metadata"
+              ? { user_id: "user-A_session_11111111-2222-4333-8444-555555555555" }
+              : "A",
+        },
+        after: {
+          conversation: "winner",
+          [key]:
+            key === "metadata"
+              ? { user_id: "user-B_session_11111111-2222-4333-8444-555555555555" }
+              : "B",
+        },
+        free: false,
+        client: true,
+      })),
+    ],
+  );
+  it.each(r1CarrierCases)(
+    "R1 carrier unit $surface $name",
+    async ({ surface, before, after, free, client }) => {
+      const content = [
+        { role: "user", content: "start" },
+        { role: "assistant", content: "reply" },
+        { role: "user", content: "next" },
+      ];
+      const request = surface === "openai-responses" ? { input: content } : { messages: content };
+      const one = affinityPrefixDigests(digestArgs("runtime", { ...request, ...before }, surface));
+      const two = affinityPrefixDigests(digestArgs("runtime", { ...request, ...after }, surface));
+      expect(two.rootDigest === one.rootDigest).toBe(free);
+      expect(one.clientSessionId !== undefined).toBe(client);
+      if (client) {
+        expect(two.clientSessionId).toBe(one.clientSessionId);
+        const changedRoot = affinityPrefixDigests(
+          digestArgs("runtime", { ...request, ...after, unknown_extension: "changed" }, surface),
+        );
+        expect(changedRoot.rootDigest).not.toBe(one.rootDigest);
+        expect(
+          await resolveAffinitySession(
+            db,
+            { userId: "owner", tenantUserId: "owner", poolId: "pool", executionTargetId: "target" },
+            changedRoot,
+            new Date(),
+          ),
+        ).toBe(one.clientSessionId);
+        expect(db.$queryRaw).not.toHaveBeenCalled();
+      }
+    },
+  );
 
   // Owner decision AC-21/49: deliberately independent of the production list.
   const approvedSamplingParams = [

@@ -83,6 +83,16 @@ function unitMarksContinuation(value: unknown): boolean {
   return item.content.some((block) => typeMarksContinuation(normalizedType(object(block)?.type)));
 }
 
+/** Leading assistant/tool units are starter context, not conversation evidence. */
+function hasContinuationEvidence(units: JsonValue[]): boolean {
+  let sawUser = false;
+  for (const unit of units) {
+    if (sawUser && unitMarksContinuation(unit)) return true;
+    if (objectRole(unit) === "user") sawUser = true;
+  }
+  return false;
+}
+
 function pushJson(units: JsonValue[], value: unknown) {
   const json = asJson(value);
   if (json !== undefined) units.push(json);
@@ -100,11 +110,9 @@ function extractChat(payload: Record<string, unknown>): AffinityLayers {
   const instructionUnits: JsonValue[] = [];
   const conversationUnits: JsonValue[] = [];
   const consumedKeys: string[] = [];
-  let isContinuation = false;
   if (Array.isArray(payload.messages)) {
     consumedKeys.push("messages");
     for (const item of payload.messages) {
-      if (unitMarksContinuation(item)) isContinuation = true;
       if (INSTRUCTION_ROLES.has(objectRole(item) ?? "")) pushJson(instructionUnits, item);
       else pushJson(conversationUnits, item);
     }
@@ -115,14 +123,19 @@ function extractChat(payload: Record<string, unknown>): AffinityLayers {
     functions === undefined ? extracted.tools : { tools: extracted.tools ?? null, functions };
   if (extracted.consumed) consumedKeys.push("tools");
   if (functions !== undefined) consumedKeys.push("functions");
-  return { instructionUnits, conversationUnits, tools, consumedKeys, isContinuation };
+  return {
+    instructionUnits,
+    conversationUnits,
+    tools,
+    consumedKeys,
+    isContinuation: hasContinuationEvidence(conversationUnits),
+  };
 }
 
 function extractAnthropic(payload: Record<string, unknown>): AffinityLayers {
   const instructionUnits: JsonValue[] = [];
   const conversationUnits: JsonValue[] = [];
   const consumedKeys: string[] = [];
-  let isContinuation = false;
   if (payload.system !== undefined) {
     consumedKeys.push("system");
     pushJson(instructionUnits, payload.system);
@@ -130,20 +143,24 @@ function extractAnthropic(payload: Record<string, unknown>): AffinityLayers {
   if (Array.isArray(payload.messages)) {
     consumedKeys.push("messages");
     for (const item of payload.messages) {
-      if (unitMarksContinuation(item)) isContinuation = true;
       pushJson(conversationUnits, item);
     }
   }
   const { tools, consumed } = extractTools(payload);
   if (consumed) consumedKeys.push("tools");
-  return { instructionUnits, conversationUnits, tools, consumedKeys, isContinuation };
+  return {
+    instructionUnits,
+    conversationUnits,
+    tools,
+    consumedKeys,
+    isContinuation: hasContinuationEvidence(conversationUnits),
+  };
 }
 
 function extractResponses(payload: Record<string, unknown>): AffinityLayers {
   const instructionUnits: JsonValue[] = [];
   const conversationUnits: JsonValue[] = [];
   const consumedKeys: string[] = [];
-  let isContinuation = false;
   if (payload.instructions !== undefined) {
     consumedKeys.push("instructions");
     pushJson(instructionUnits, payload.instructions);
@@ -156,14 +173,19 @@ function extractResponses(payload: Record<string, unknown>): AffinityLayers {
   } else if (Array.isArray(input)) {
     consumedKeys.push("input");
     for (const item of input) {
-      if (unitMarksContinuation(item)) isContinuation = true;
       if (INSTRUCTION_ROLES.has(objectRole(item) ?? "")) pushJson(instructionUnits, item);
       else pushJson(conversationUnits, item);
     }
   }
   const { tools, consumed } = extractTools(payload);
   if (consumed) consumedKeys.push("tools");
-  return { instructionUnits, conversationUnits, tools, consumedKeys, isContinuation };
+  return {
+    instructionUnits,
+    conversationUnits,
+    tools,
+    consumedKeys,
+    isContinuation: hasContinuationEvidence(conversationUnits),
+  };
 }
 
 /**

@@ -39,6 +39,63 @@ describe("extractAffinityLayers", () => {
     expect(extractorSource).not.toMatch(/parseAnthropicMessagesRequest/);
   });
 
+  it.each(
+    ["openai-chat", "anthropic-messages", "openai-responses"].flatMap((surface) => [
+      {
+        surface,
+        name: "greeting starter",
+        units: [
+          { role: "assistant", content: "welcome" },
+          { role: "user", content: "X" },
+        ],
+        continuation: false,
+      },
+      {
+        surface,
+        name: "greeting then follow-up",
+        units: [
+          { role: "assistant", content: "welcome" },
+          { role: "user", content: "X" },
+          { role: "assistant", content: "reply" },
+          { role: "user", content: "next" },
+        ],
+        continuation: true,
+      },
+      {
+        surface,
+        name: "leading tool context",
+        units: [
+          { role: "tool", content: "context" },
+          { role: "user", content: "X" },
+        ],
+        continuation: false,
+      },
+      {
+        surface,
+        name: "no user",
+        units: [{ role: "assistant", content: "context" }],
+        continuation: false,
+      },
+      {
+        surface,
+        name: "few-shot documented limit",
+        units: [
+          { role: "user", content: "example" },
+          { role: "assistant", content: "label" },
+          { role: "user", content: "query" },
+        ],
+        continuation: true,
+      },
+    ]),
+  )("R1 continuation $surface $name", ({ surface, units, continuation }) => {
+    const layers = extractAffinityLayers(
+      surface,
+      surface === "openai-responses" ? { input: units } : { messages: units },
+    );
+    expect(layers.conversationUnits).toEqual(units);
+    expect(layers.isContinuation).toBe(continuation);
+  });
+
   it("splits Chat {system, user} into instruction and conversation units without continuation", () => {
     const layers = extractAffinityLayers("openai-chat", {
       messages: [
@@ -196,17 +253,24 @@ describe("extractAffinityLayers", () => {
     ).toBe(true);
     expect(
       extractAffinityLayers("openai-chat", {
-        messages: [{ role: "tool", tool_call_id: "c1", content: "ok" }],
-      }).isContinuation,
-    ).toBe(true);
-    expect(
-      extractAffinityLayers("openai-chat", {
-        messages: [{ role: "function", name: "lookup", content: "{}" }],
+        messages: [
+          { role: "user", content: "U" },
+          { role: "tool", tool_call_id: "c1", content: "ok" },
+        ],
       }).isContinuation,
     ).toBe(true);
     expect(
       extractAffinityLayers("openai-chat", {
         messages: [
+          { role: "user", content: "U" },
+          { role: "function", name: "lookup", content: "{}" },
+        ],
+      }).isContinuation,
+    ).toBe(true);
+    expect(
+      extractAffinityLayers("openai-chat", {
+        messages: [
+          { role: "user", content: "U" },
           { role: "assistant", content: null, function_call: { name: "lookup", arguments: "{}" } },
         ],
       }).isContinuation,
@@ -288,19 +352,26 @@ describe("extractAffinityLayers", () => {
   it("marks Anthropic user tool_result and tool_use content as continuation", () => {
     expect(
       extractAffinityLayers("anthropic-messages", {
-        messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t1" }] }],
+        messages: [
+          { role: "user", content: "U" },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "t1" }] },
+        ],
       }).isContinuation,
     ).toBe(true);
     expect(
       extractAffinityLayers("anthropic-messages", {
         messages: [
+          { role: "user", content: "U" },
           { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "lookup" }] },
         ],
       }).isContinuation,
     ).toBe(true);
     expect(
       extractAffinityLayers("anthropic-messages", {
-        messages: [{ role: "user", content: [{ type: "Tool_Result", tool_use_id: "t1" }] }],
+        messages: [
+          { role: "user", content: "U" },
+          { role: "user", content: [{ type: "Tool_Result", tool_use_id: "t1" }] },
+        ],
       }).isContinuation,
     ).toBe(true);
   });
@@ -347,7 +418,10 @@ describe("extractAffinityLayers", () => {
     ]) {
       expect(
         extractAffinityLayers("openai-responses", {
-          input: [{ type, id: "x" }],
+          input: [
+            { role: "user", content: "U" },
+            { type, id: "x" },
+          ],
         }).isContinuation,
         type,
       ).toBe(true);
@@ -358,6 +432,7 @@ describe("extractAffinityLayers", () => {
     expect(
       extractAffinityLayers("openai-responses", {
         input: [
+          { role: "user", content: "U" },
           { type: "message", role: "assistant", content: [{ type: "output_text", text: "A" }] },
         ],
       }).isContinuation,

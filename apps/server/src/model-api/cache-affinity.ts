@@ -134,21 +134,16 @@ export const FREE_SAMPLING_PARAMS = [
   "n",
   "best_of",
 ] as const;
-const PARAMETER_EXCLUSIONS = new Set([
-  "model",
-  "stream",
-  "conversation",
-  "conversation_id",
-  "prompt_cache_key",
-  ...FREE_SAMPLING_PARAMS,
-]);
+const PARAMETER_EXCLUSIONS = new Set(["model", "stream", ...FREE_SAMPLING_PARAMS]);
 
-/** Request-only carriers, in owner-approved priority order. Invalid values are ignored. */
-export function extractClientConversationId(
+type ClientConversationCarrier = { id: string; key?: string };
+
+/** Select once: only the winning valid body carrier is free of root binding. */
+function selectClientConversationCarrier(
   headers: Headers | undefined,
   payload: Record<string, unknown>,
   surface: string,
-): string | undefined {
+): ClientConversationCarrier | undefined {
   const validate = (value: unknown) => {
     if (typeof value !== "string") return undefined;
     const id = value.trim();
@@ -162,19 +157,23 @@ export function extractClientConversationId(
         : value,
     );
   const canonicalSurface = canonicalizeAffinitySurface(surface);
-  const candidates = [
-    conversationId(payload.conversation),
-    conversationId(payload.conversation_id),
-    canonicalSurface === "openai-chat" || canonicalSurface === "openai-responses"
-      ? validate(payload.prompt_cache_key)
-      : undefined,
+  const candidates: { id: string | undefined; key?: string }[] = [
+    { id: conversationId(payload.conversation), key: "conversation" },
+    { id: conversationId(payload.conversation_id), key: "conversation_id" },
+    {
+      id:
+        canonicalSurface === "openai-chat" || canonicalSurface === "openai-responses"
+          ? validate(payload.prompt_cache_key)
+          : undefined,
+      key: "prompt_cache_key",
+    },
     ...[
       "x-conversation-id",
       "session_id",
       "session-id",
       "x-session-id",
       "x-claude-code-session-id",
-    ].map((name) => validate(headers?.get(name))),
+    ].map((name) => ({ id: validate(headers?.get(name)) })),
   ];
   if (canonicalSurface === "anthropic-messages") {
     const metadata = payload.metadata;
@@ -184,14 +183,25 @@ export function extractClientConversationId(
         : undefined;
     if (typeof userId === "string") {
       // Only Claude Code's embedded session token, never an account-wide user id.
-      candidates.push(
-        userId.match(
+      candidates.push({
+        id: userId.match(
           /_session_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=$|[^A-Za-z0-9-])/i,
         )?.[1],
-      );
+        key: "metadata.user_id",
+      });
     }
   }
-  return candidates.find((id) => id !== undefined);
+  const winner = candidates.find((candidate) => candidate.id !== undefined);
+  return winner?.id === undefined ? undefined : { id: winner.id, key: winner.key };
+}
+
+/** Request-only carriers, in owner-approved priority order. Invalid values fall through. */
+export function extractClientConversationId(
+  headers: Headers | undefined,
+  payload: Record<string, unknown>,
+  surface: string,
+): string | undefined {
+  return selectClientConversationCarrier(headers, payload, surface)?.id;
 }
 
 function sessionFootprintDigest(bindingDigest: string, sessionId: string) {
@@ -225,7 +235,10 @@ export type AffinityMaterial = {
   rootDigest: string;
   instructionDigests: string[];
   digests: string[];
+  /** Complete-chain nodes only: the resolver must never see a truncated chain. */
   nodes: { digest: string; depth: number }[];
+  /** Routing-only tail, also retained for histories over the identity byte budget. */
+  routingNodes: { digest: string; depth: number }[];
   conversationDigest: string | null;
   hasExplicitConversation: boolean;
   isContinuation: boolean;
@@ -264,13 +277,15 @@ export function affinityPrefixDigests({
 }): AffinityMaterial {
   const canonicalSurface = canonicalizeAffinitySurface(surface);
   const layers = extractAffinityLayers(canonicalSurface, payload);
+  const carrier = selectClientConversationCarrier(headers, payload, surface);
   const excluded = new Set([...layers.consumedKeys, ...PARAMETER_EXCLUSIONS]);
+  if (carrier?.key && carrier.key !== "metadata.user_id") excluded.add(carrier.key);
   // Unknown semantics bind by default. Only the owner-approved sampling list is free.
   const parameters = Object.fromEntries(
     Object.entries(payload).flatMap(([key, raw]) => {
       if (excluded.has(key)) return [];
       const metadata =
-        canonicalSurface === "anthropic-messages" &&
+        carrier?.key === "metadata.user_id" &&
         key === "metadata" &&
         raw &&
         typeof raw === "object" &&
@@ -294,7 +309,7 @@ export function affinityPrefixDigests({
       runtimeIdentity,
     })}`,
   );
-  const clientId = extractClientConversationId(headers, payload, surface);
+  const clientId = carrier?.id;
   const clientSessionId =
     clientId === undefined
       ? undefined
@@ -345,10 +360,12 @@ export function affinityPrefixDigests({
   // An unbound native delta is not full history. Do not publish it as a
   // starter that a later stateless request could mistakenly take as a tip.
   if (missingParent) identifiable = false;
+  const routingNodes = missingParent ? [] : [...nodes];
   if (!identifiable) nodes.length = 0;
   else if (boundSessionId && parent && nodes.length === 0) {
     // An empty native delta still refreshes the committed parent tip and size.
     nodes.push({ digest: parent.tipDigest, depth: parent.tipDepth });
+    routingNodes.push({ digest: parent.tipDigest, depth: parent.tipDepth });
   }
   const textCap =
     layers.tools !== undefined ? MAX_INSTRUCTION_PREFIXES - 1 : MAX_INSTRUCTION_PREFIXES;
@@ -356,18 +373,17 @@ export function affinityPrefixDigests({
     layers.tools !== undefined
       ? [...layers.instructionUnits.slice(0, textCap), layers.tools]
       : layers.instructionUnits.slice(0, textCap);
-  const instructionDigests = identifiable
-    ? cumulativePrefixDigests(instructionUnits, (index, cumulative) =>
-        hmacValue(`instruction-layer-v5:${bindingDigest}:prefix:${index}:${cumulative}`),
-      )
-    : [];
+  const instructionDigests = cumulativePrefixDigests(instructionUnits, (index, cumulative) =>
+    hmacValue(`instruction-layer-v5:${bindingDigest}:prefix:${index}:${cumulative}`),
+  );
   const conversation = asJson(payload.conversation ?? payload.conversation_id);
   return {
     bindingDigest,
     rootDigest,
     instructionDigests,
     nodes,
-    digests: nodes.map(({ digest }) => digest),
+    routingNodes,
+    digests: routingNodes.map(({ digest }) => digest),
     canonicalBytes,
     identifiable,
     isContinuation: layers.isContinuation || boundSessionId !== undefined,
@@ -434,7 +450,7 @@ export function affinityRetentionSql(scope: IdentityScope, maxRecords: number): 
 /**
  * ONE identity enforcement point: rank predicts; remember rereads after its sole
  * cacheAffinity fence. Equality-seek in index order, LIMIT 1 / 2, never a history
- * population scan. User-only starters stay fresh: a new starter is indistinguishable
+ * population scan. User-only and leading-greeting starters stay fresh: a new starter is indistinguishable
  * from truncation to that starter. Fail closed in this residual case; truncations
  * retaining conversation evidence can link. Root/instruction-only warmth never links.
  */
@@ -642,7 +658,7 @@ export async function rankAffinityTargets({
     targets.map(async (target, originalIndex) => {
       const material = materialByIdentity.get(target.targetIdentity)!;
       const conversationDepthByDigest = new Map(
-        material.nodes.map(({ digest, depth }) => [digest, depth]),
+        material.routingNodes.map(({ digest, depth }) => [digest, depth]),
       );
       const instructionDepthByDigest = new Map(
         material.instructionDigests.map((digest, index) => [digest, index + 1]),
@@ -793,6 +809,16 @@ export async function rankAffinityTargets({
   };
 }
 
+export function isAffinityTargetWarm(
+  decision: Pick<AffinityDecision, "prefixDepths" | "conversationMatches">,
+  executionTargetId: string,
+): boolean {
+  return (
+    (decision.prefixDepths[executionTargetId] ?? 0) > 0 ||
+    decision.conversationMatches[executionTargetId] === true
+  );
+}
+
 export async function rememberAffinity({
   ownerId,
   resourceOwnerId,
@@ -848,9 +874,8 @@ export async function rememberAffinity({
     headers,
   });
   if (
-    material.identifiable &&
     material.instructionDigests.length === 0 &&
-    material.nodes.length === 0 &&
+    material.routingNodes.length === 0 &&
     !material.conversationDigest &&
     !material.clientSessionId
   )
@@ -912,15 +937,19 @@ export async function rememberAffinity({
     // branch. The fence was acquired before all reads; no graph locks or effects.
     const existingNodes = material.identifiable
       ? await tx.cacheAffinityNode.findMany({
-          where: { ...scope, rootDigest: material.rootDigest, sessionId },
-          select: { nodeDigest: true, depth: true },
+          where: { ...scope, sessionId },
+          select: { nodeDigest: true, depth: true, rootDigest: true },
         })
       : [];
     const combined =
       material.boundSessionId !== undefined
         ? [
             ...existingNodes
-              .filter((node) => node.depth <= (material.parentTipDepth ?? 0))
+              .filter(
+                (node) =>
+                  node.rootDigest === material.rootDigest &&
+                  node.depth <= (material.parentTipDepth ?? 0),
+              )
               .map(({ nodeDigest, depth }) => ({ digest: nodeDigest, depth })),
             ...material.nodes,
           ]
@@ -959,12 +988,17 @@ export async function rememberAffinity({
         ON CONFLICT ("userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest", "nodeDigest", "sessionId")
         DO UPDATE SET "isTip" = EXCLUDED."isTip", "expiresAt" = EXCLUDED."expiresAt"`);
     }
-    if (material.boundSessionId)
+    // Read the discarded node digests under the same fence before pruning hints.
+    // Instruction hints have no node row, so omitted instructions remain matchable.
+    const discardedDigests = existingNodes
+      .filter((node) => !retainedDigests.includes(node.nodeDigest))
+      .map((node) => node.nodeDigest);
+    if (discardedDigests.length)
       await tx.cacheAffinityRecord.deleteMany({
         where: {
           ...scope,
           sessionId,
-          prefixDigest: { notIn: [...retainedDigests, ...material.instructionDigests] },
+          prefixDigest: { in: discardedDigests },
         },
       });
     const upsertPrefix = async (prefixDigest: string, prefixDepth: number) => {
@@ -1007,7 +1041,7 @@ export async function rememberAffinity({
     };
     const prefixes = [
       ...material.instructionDigests.map((digest, index) => ({ digest, depth: index + 1 })),
-      ...material.nodes,
+      ...material.routingNodes,
     ];
     // Small requests avoid bulk serialization; large histories use one statement,
     // never 64 sequential upserts while holding the owner/pool fence.
@@ -1047,7 +1081,8 @@ export async function rememberAffinity({
           "engineCacheConfirmed" = COALESCE(${engineCacheConfirmed ?? null}::boolean, cache_affinity_record."engineCacheConfirmed")`;
     };
     // Independent footprint prevents shared routing hints from erasing a sibling.
-    await upsertConversation(sessionFootprintDigest(material.bindingDigest, sessionId));
+    if (material.identifiable || material.clientSessionId)
+      await upsertConversation(sessionFootprintDigest(material.bindingDigest, sessionId));
     if (material.conversationDigest) await upsertConversation(material.conversationDigest);
     // Normal writes add <=74 hints. A lowered cap or legacy backlog drains
     // across completions instead of extending one fenced transaction.

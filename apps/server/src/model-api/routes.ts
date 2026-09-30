@@ -54,6 +54,7 @@ import {
   type AffinitySessionBinding,
   affinityPrefixDigests,
   buildAffinityTargetIdentity,
+  isAffinityTargetWarm,
   rankAffinityTargets,
   rememberAffinity,
   resolveAffinitySession,
@@ -5820,10 +5821,7 @@ async function relayPool({
     const decision = affinityDecision;
     const affineMember = (poolMemberId: string) => {
       const executionTargetId = memberById.get(poolMemberId)?.ExecutionTarget?.id;
-      return executionTargetId
-        ? (decision.prefixDepths[executionTargetId] ?? 0) > 0 ||
-            decision.conversationMatches[executionTargetId] === true
-        : false;
+      return executionTargetId ? isAffinityTargetWarm(decision, executionTargetId) : false;
     };
     try {
       const verdicts = await assessWarmProtection({

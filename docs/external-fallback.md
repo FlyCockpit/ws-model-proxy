@@ -239,8 +239,11 @@ Without one, continuity uses the last 64 digest-chain nodes, deepest first: a
 live tip wins by earliest expiry then session id; otherwise a sole ancestor
 owner permits edits/truncations. Ambiguous ancestors start a fresh session.
 Instructions, tools, semantic and unknown parameters bind the root; only the
-16 approved sampling parameters are free. Root/instruction warmth alone never
-links sessions.
+16 approved sampling parameters are free (alongside model/stream and consumed
+content). A body carrier is excluded only when it wins validation and supplies
+the client id; invalid, inactive and losing carriers bind like unknown parameters.
+For a winning Anthropic metadata token, only `metadata.user_id` is excluded;
+other metadata fields still bind. Root/instruction warmth alone never links sessions.
 
 The first valid carrier wins: body `conversation`, then `conversation_id`
 (string or object with string `id`), then OpenAI `prompt_cache_key`; headers
@@ -259,7 +262,7 @@ Carrier research (2026-09-30; behavior can vary by client version):
 | Carrier | Evidence and confidence |
 | --- | --- |
 | `conversation` / `conversation_id` (string or `id` object) | High confidence in this project's existing request support and tests; no assertion that Codex/OpenCode sends these by default. |
-| `prompt_cache_key` | High: [Codex source](https://github.com/openai/codex/blob/main/codex-rs/core/src/client.rs) uses the session id, with overrides/internal-parent variants; [OpenCode provider options](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/provider/transform.ts) set `promptCacheKey` from the session, subject to provider configuration. The AI SDK maps it to `prompt_cache_key` on [Chat](https://github.com/vercel/ai/blob/main/packages/openai/src/chat/openai-chat-language-model.ts) and [Responses](https://github.com/vercel/ai/blob/main/packages/openai/src/responses/openai-responses-language-model.ts). |
+| `prompt_cache_key` | Authoritative on Chat/Responses within the authenticated tenant scope. A constant per-user/feature key merges those conversations into one session and affects only that tenant’s advisory protection; tenants cannot reach another tenant’s sessions. High: [Codex source](https://github.com/openai/codex/blob/main/codex-rs/core/src/client.rs) uses the session id, with overrides/internal-parent variants; [OpenCode provider options](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/provider/transform.ts) set `promptCacheKey` from the session, subject to provider configuration. The AI SDK maps it to `prompt_cache_key` on [Chat](https://github.com/vercel/ai/blob/main/packages/openai/src/chat/openai-chat-language-model.ts) and [Responses](https://github.com/vercel/ai/blob/main/packages/openai/src/responses/openai-responses-language-model.ts). |
 | `x-conversation-id` | Generic carrier for custom clients; low confidence that the named clients send it by default. No local producer found. |
 | `session_id` | Alternate spelling; medium confidence in older/client-plugin behavior, not confirmed as current Codex's spelling. |
 | `session-id` | High: current [Codex header builder](https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/requests/headers.rs) sends this spelling. |
@@ -267,22 +270,37 @@ Carrier research (2026-09-30; behavior can vary by client version):
 | `x-claude-code-session-id` | High: the official [Claude Code changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) records its addition in v2.1.86. |
 | Anthropic `_session_<uuid>` in `metadata.user_id` | Medium for historical behavior: a [Claude Code issue's bundled-code report](https://github.com/anthropics/claude-code/issues/15782) shows this format. No claim that all current versions use it; the header is preferred. |
 
-**Limits without client ids:** user-only starters always start fresh, including
-truncation to a starter. In all six causal arrival orders of A1, B1, A2, B2
-(A1 before A2; B1 before B2), identical user-only A1/B1 create two sessions.
-Distinct A2/B2 advance separate tips, sometimes exchanging starter labels;
-identical A2/B2 merge at the deepest tip. Edits at shared ancestors can also
-split/join siblings. Distinct client ids keep the two conversations separate.
+Any valid constant id has the same authoritative behavior as `prompt_cache_key`:
+set ids per conversation to keep that tenant's conversations separate.
+
+**Limits without client ids:** continuation evidence requires assistant/tool
+output after the first user unit. Leading assistant greetings are starter context.
+User-only and greeting+user starters always start fresh, including truncation to
+such a starter. In all six causal arrival orders of A1, B1, A2, B2 (A1 before A2;
+B1 before B2), identical user-only starters create two sessions, and distinct
+assistant replies in A2/B2 advance separate tips (starter labels may exchange).
+Greeting+distinct-user starters and their distinct later histories also stay
+separate, sequentially and concurrently, on Chat, Messages and Responses.
+Byte-identical later histories merge at the deepest tip. Shared-starter edits
+can split/join siblings. Few-shot openers `[user(example), assistant(label),
+user(query)]` already contain continuation evidence: different queries can merge
+permanently as indistinguishable edits of that shared example. Tests pin this
+residual limit. Distinct client ids keep these conversations separate.
 
 Native Responses appends input deltas to the committed parent chain; stateless
 full history containing the same create+delta units can match those retained
 nodes when it contains continuation evidence (assistant/tool output). A
 user-only history stays fresh under the starter rule. A missing/expired parent
 publishes no delta-only nodes, including with a client id; that id can still
-identify the session footprint. Histories over 2 MB publish no nodes or lineage.
+identify the session footprint. Histories over 2 MB publish no nodes or lineage,
+but retain instruction routing hints and the last 64 under-cap chain hints.
+These hints never enter identity resolution. Without a client id, unidentifiable
+requests write no per-session footprint; routing hints share one fresh id per
+completion, so overwritten hints do not create phantom protected sessions.
 
-Retention keeps at most 64 nodes and one tip per session, plus a separate
-session footprint. Bound turns refresh the committed token estimate with a
+Retention keeps at most 64 nodes and one tip per identifiable session, plus a
+separate session footprint. Pruning removes hints for discarded conversation
+nodes and preserves instruction hints when bound deltas omit instructions. Bound turns refresh the committed token estimate with a
 delta estimate computed before dispatch (empty deltas carry size forward).
 EOF awaits the affinity commit before saving Responses warm lineage. Persistence
 uses `maxWait=2000ms`, `timeout=2500ms`, and `lock_timeout=1000ms`; errors save the

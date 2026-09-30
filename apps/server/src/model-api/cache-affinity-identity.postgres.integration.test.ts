@@ -1,7 +1,7 @@
 // Fixture writes need no owner fences (the graph-write fence triggers accept
 // this client); production code under test uses its own clients.
 import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
@@ -19,6 +19,16 @@ integration("cache-prefix identity #160", () => {
   let service: typeof import("./cache-affinity.js");
   let producer: typeof import("@ws-model-proxy/db").default;
 
+  const fixtureOwnerIds = new Set<string>();
+  const testOwnerIds = new Set<string>();
+  afterEach(async () => {
+    if (!db || testOwnerIds.size === 0) return;
+    const where = { userId: { in: [...testOwnerIds] } };
+    await db.cacheAffinityNode.deleteMany({ where });
+    await db.cacheAffinityRecord.deleteMany({ where });
+    testOwnerIds.clear();
+  });
+
   beforeAll(async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
@@ -30,8 +40,16 @@ integration("cache-prefix identity #160", () => {
   });
 
   afterAll(async () => {
-    await producer?.$disconnect();
-    await db?.$disconnect();
+    try {
+      if (db && fixtureOwnerIds.size) {
+        const where = { userId: { in: [...fixtureOwnerIds] } };
+        await db.cacheAffinityNode.deleteMany({ where });
+        await db.cacheAffinityRecord.deleteMany({ where });
+      }
+    } finally {
+      await producer?.$disconnect();
+      await db?.$disconnect();
+    }
   });
 
   async function fixture() {
@@ -40,6 +58,8 @@ integration("cache-prefix identity #160", () => {
     const owner = await db.user.create({
       data: { name: "Affinity owner", email: `affinity-owner-${suffix}@example.test` },
     });
+    fixtureOwnerIds.add(owner.id);
+    testOwnerIds.add(owner.id);
     const tenant = await db.user.create({
       data: { name: "Affinity tenant", email: `affinity-tenant-${suffix}@example.test` },
     });
@@ -193,15 +213,33 @@ integration("cache-prefix identity #160", () => {
           withId,
           identicalNext,
           concurrent,
+          kind: "documented limit",
+          greeting: false,
+          surface: "openai-chat",
         })),
       ),
     ),
   );
-  it.each(documentedCases)(
-    "documented limit: $label ids=$withId identical next=$identicalNext concurrent=$concurrent",
-    async ({ order, withId, identicalNext, concurrent }) => {
+  const greetingCases = ["openai-chat", "anthropic-messages", "openai-responses"].flatMap(
+    (surface) =>
+      orders.flatMap((order) =>
+        [false, true].map((concurrent) => ({
+          order,
+          label: order.join(","),
+          withId: false,
+          identicalNext: false,
+          concurrent,
+          kind: "R1 greeting",
+          greeting: true,
+          surface,
+        })),
+      ),
+  );
+  it.each([...documentedCases, ...greetingCases])(
+    "interleaving $kind $surface: $label ids=$withId identical next=$identicalNext concurrent=$concurrent",
+    async ({ order, withId, identicalNext, concurrent, greeting, surface }) => {
       if (!db) return;
-      const args = argsFor(await fixture());
+      const args = { ...argsFor(await fixture()), surface };
       const results: Record<string, string> = {};
       const writes = new Map<
         string,
@@ -210,16 +248,22 @@ integration("cache-prefix identity #160", () => {
       const run = async (label: string) => {
         // Sequential runs await each commit below. Concurrent runs queue all four
         // writes at the real fence in the specified causal arrival order.
+        const starter = greeting
+          ? [a("welcome"), u(`starter ${label[0]}`)]
+          : [u("same first message")];
         const messages = label.endsWith("1")
-          ? [u("same first message")]
+          ? starter
           : [
-              u("same first message"),
+              ...starter,
               a(identicalNext ? "same reply" : `reply ${label[0]}`),
               u(identicalNext ? "same next" : `next ${label[0]}`),
             ];
         const request = {
           ...args,
-          payload: { messages, ...(withId ? { conversation_id: label[0] } : {}) },
+          payload: {
+            ...(surface === "openai-responses" ? { input: messages } : { messages }),
+            ...(withId ? { conversation_id: label[0] } : {}),
+          },
         };
         // Simultaneous ranking is advisory; each completion resolves inside the fence.
         await service.rankAffinityTargets({
@@ -292,7 +336,7 @@ integration("cache-prefix identity #160", () => {
       expect(new Set(Object.values(results)).size).toBe(2);
       if (withId || !identicalNext) expect(results.X2).not.toBe(results.Y2);
       else expect(results.X2).toBe(results.Y2); // both take the deepest identical tip, all six orders
-      if (withId) {
+      if (withId || greeting) {
         expect(results.X1).toBe(results.X2);
         expect(results.Y1).toBe(results.Y2);
       }
@@ -528,6 +572,78 @@ integration("cache-prefix identity #160", () => {
     const rows = await db.cacheAffinityRecord.findMany({ where: { poolId: args.poolId } });
     expect(rows.every((row) => row.sessionId === parent!.sessionId)).toBe(true);
   });
+
+  it.each(["omitted", "same", "changed"] as const)(
+    "R1 bound instruction hints %s",
+    async (mode) => {
+      if (!db) return;
+      const args = { ...argsFor(await fixture()), surface: "openai-responses" };
+      const createPayload = { instructions: "rules", input: "create" };
+      const createMaterial = service.affinityPrefixDigests({
+        ...args,
+        payload: createPayload,
+        runtimeIdentity: args.target.targetIdentity,
+      });
+      let parent = await service.rememberAffinity({ ...args, payload: createPayload });
+      const originalSession = parent!.sessionId;
+      const originalRoot = parent!.rootDigest;
+      const count = mode === "changed" ? 1 : 80;
+      for (let turn = 1; turn <= count; turn++) {
+        const payload = {
+          input: `delta ${turn}`,
+          previous_response_id: `parent-${turn}`,
+          ...(mode === "omitted" ? {} : { instructions: mode === "same" ? "rules" : "new rules" }),
+        };
+        const next = await service.rememberAffinity({ ...args, payload, sessionBinding: parent! });
+        if (mode === "changed") {
+          expect(next).toBeNull();
+          expect(await db.cacheAffinityNode.count({ where: { poolId: args.poolId } })).toBe(1);
+          const deltaMaterial = service.affinityPrefixDigests({
+            ...args,
+            payload,
+            sessionBinding: parent!,
+            runtimeIdentity: args.target.targetIdentity,
+          });
+          expect(deltaMaterial.rootDigest).not.toBe(originalRoot);
+          expect(deltaMaterial.routingNodes).toEqual([]);
+        } else {
+          expect(next!.sessionId).toBe(originalSession);
+          expect(next!.rootDigest).toBe(originalRoot);
+          parent = next;
+        }
+        expect(
+          await db.cacheAffinityRecord.count({
+            where: { poolId: args.poolId, prefixDigest: createMaterial.instructionDigests[0] },
+          }),
+        ).toBe(1);
+      }
+      const rows = await db.cacheAffinityRecord.findMany({ where: { poolId: args.poolId } });
+      if (mode === "changed")
+        expect(rows).toHaveLength(4); // old instruction/node/footprint plus new instruction
+      else {
+        expect(await db.cacheAffinityNode.count({ where: { poolId: args.poolId } })).toBe(64);
+        expect(rows).toHaveLength(66); // 64 matchable chain hints, instruction and footprint
+        const nodes = await db.cacheAffinityNode.findMany({ where: { poolId: args.poolId } });
+        expect(
+          rows
+            .filter(
+              (row) =>
+                row.prefixDigest !== null &&
+                row.prefixDigest !== createMaterial.instructionDigests[0],
+            )
+            .map((row) => row.prefixDigest)
+            .sort(),
+        ).toEqual(nodes.map((node) => node.nodeDigest).sort());
+      }
+      const ranked = await service.rankAffinityTargets({
+        ...args,
+        payload: { instructions: "rules", input: "different starter" },
+        targets: [args.target],
+        scoreSingleTarget: true,
+      });
+      expect(ranked.instructionDepths?.[args.target.executionTargetId]).toBe(1);
+    },
+  );
 
   it("C2-4/C2-5 bound turns retain committed size in every warm window and only matchable tail rows", async () => {
     if (!db) return;
@@ -787,6 +903,23 @@ integration("cache-prefix identity #160", () => {
     expect(shortened!.sessionId).not.toBe(two!.sessionId);
   });
 
+  it.each(["openai-chat", "anthropic-messages", "openai-responses"])(
+    "R1 documented limit few-shot edits merge on %s",
+    async (surface) => {
+      const args = { ...argsFor(await fixture()), surface };
+      const results: string[] = [];
+      for (const query of ["X", "Y", "X next", "Y next"]) {
+        const units = [u("example"), a("label"), u(query)];
+        const result = await service.rememberAffinity({
+          ...args,
+          payload: surface === "openai-responses" ? { input: units } : { messages: units },
+        });
+        results.push(result!.sessionId);
+      }
+      expect(new Set(results).size).toBe(1);
+    },
+  );
+
   const protocols = ["openai-chat", "anthropic-messages", "openai-responses"] as const;
   function payloadFor(surface: (typeof protocols)[number], extra: Record<string, unknown> = {}) {
     return surface === "openai-responses"
@@ -795,6 +928,187 @@ integration("cache-prefix identity #160", () => {
         ? { system: "rules", messages: baseHistory, tools: [], ...extra }
         : { messages: [{ role: "system", content: "rules" }, ...baseHistory], tools: [], ...extra };
   }
+  const r1HeaderCases = protocols.flatMap((surface) =>
+    [
+      "x-conversation-id",
+      "session_id",
+      "session-id",
+      "x-session-id",
+      "x-claude-code-session-id",
+    ].map((header) => ({ surface, header })),
+  );
+  it.each(r1HeaderCases)("R1 header carrier PG $surface $header", async ({ surface, header }) => {
+    const args = {
+      ...argsFor(await fixture()),
+      surface,
+      headers: new Headers({ [header.toUpperCase()]: " stable-client " }),
+    };
+    const before = payloadFor(surface, {
+      metadata: { user_id: "user-A_session_11111111-2222-4333-8444-555555555555" },
+    });
+    const after = payloadFor(surface, {
+      metadata: { user_id: "user-B_session_11111111-2222-4333-8444-555555555555" },
+      unknown_extension: "changed",
+    });
+    const first = await service.rememberAffinity({ ...args, payload: before });
+    const expected = service.affinityPrefixDigests({
+      ...args,
+      headers: undefined,
+      payload: payloadFor(surface, { conversation: "stable-client" }),
+      runtimeIdentity: args.target.targetIdentity,
+    });
+    expect(first!.sessionId).toBe(expected.clientSessionId);
+    const ranked = await service.rankAffinityTargets({
+      ...args,
+      payload: after,
+      targets: [args.target],
+      scoreSingleTarget: true,
+    });
+    expect(ranked.matchedSessionIds?.[args.target.executionTargetId]).toBe(first!.sessionId);
+    const next = await service.rememberAffinity({ ...args, payload: after });
+    expect(next!.sessionId).toBe(first!.sessionId);
+    expect(next!.rootDigest).not.toBe(first!.rootDigest);
+    const material = service.affinityPrefixDigests({
+      ...args,
+      payload: after,
+      runtimeIdentity: args.target.targetIdentity,
+    });
+    expect(material.clientSessionId).toBe(first!.sessionId);
+  });
+
+  const r1CarrierCases = protocols.flatMap((surface) => [
+    ...["conversation", "conversation_id"].flatMap((key) => [
+      {
+        surface,
+        name: `${key} valid`,
+        before: { [key]: "client" },
+        after: { [key]: " client " },
+        free: true,
+        client: true,
+      },
+      {
+        surface,
+        name: `${key} object`,
+        before: { [key]: { id: "client", note: "A" } },
+        after: { [key]: { id: "client", note: "B" } },
+        free: true,
+        client: true,
+      },
+      {
+        surface,
+        name: `${key} invalid`,
+        before: { [key]: "bad key A" },
+        after: { [key]: "bad key B" },
+        free: false,
+        client: false,
+      },
+    ]),
+    {
+      surface,
+      name: "prompt_cache_key valid or inactive",
+      before: { prompt_cache_key: "client" },
+      after: { prompt_cache_key: " client " },
+      free: surface !== "anthropic-messages",
+      client: surface !== "anthropic-messages",
+    },
+    {
+      surface,
+      name: "prompt_cache_key invalid",
+      before: { prompt_cache_key: "bad key A" },
+      after: { prompt_cache_key: "bad key B" },
+      free: false,
+      client: false,
+    },
+    {
+      surface,
+      name: "ordinary metadata.user_id",
+      before: { metadata: { user_id: "user-A" } },
+      after: { metadata: { user_id: "user-B" } },
+      free: false,
+      client: false,
+    },
+    {
+      surface,
+      name: "metadata session token valid or inactive",
+      before: { metadata: { user_id: "user-A_session_11111111-2222-4333-8444-555555555555" } },
+      after: { metadata: { user_id: "user-B_session_11111111-2222-4333-8444-555555555555" } },
+      free: surface === "anthropic-messages",
+      client: surface === "anthropic-messages",
+    },
+    {
+      surface,
+      name: "other metadata fields",
+      before: {
+        metadata: { user_id: "user_session_11111111-2222-4333-8444-555555555555", extra: "A" },
+      },
+      after: {
+        metadata: { user_id: "user_session_11111111-2222-4333-8444-555555555555", extra: "B" },
+      },
+      free: false,
+      client: surface === "anthropic-messages",
+    },
+    ...["conversation_id", "prompt_cache_key", "metadata"].map((key) => ({
+      surface,
+      name: `${key} losing carrier`,
+      before: {
+        conversation: "winner",
+        [key]:
+          key === "metadata"
+            ? { user_id: "user-A_session_11111111-2222-4333-8444-555555555555" }
+            : "A",
+      },
+      after: {
+        conversation: "winner",
+        [key]:
+          key === "metadata"
+            ? { user_id: "user-B_session_11111111-2222-4333-8444-555555555555" }
+            : "B",
+      },
+      free: false,
+      client: true,
+    })),
+  ]);
+  it.each(r1CarrierCases)(
+    "R1 carrier PG $surface $name",
+    async ({ surface, before, after, free, client }) => {
+      if (!db) return;
+      const args = { ...argsFor(await fixture()), surface };
+      const firstPayload = payloadFor(surface, before);
+      const nextPayload = payloadFor(surface, after);
+      const one = service.affinityPrefixDigests({
+        ...args,
+        payload: firstPayload,
+        runtimeIdentity: args.target.targetIdentity,
+      });
+      const two = service.affinityPrefixDigests({
+        ...args,
+        payload: nextPayload,
+        runtimeIdentity: args.target.targetIdentity,
+      });
+      expect(two.rootDigest === one.rootDigest).toBe(free);
+      const first = await service.rememberAffinity({ ...args, payload: firstPayload });
+      const ranked = await service.rankAffinityTargets({
+        ...args,
+        payload: nextPayload,
+        targets: [args.target],
+        scoreSingleTarget: true,
+      });
+      expect(ranked.matchedSessionIds?.[args.target.executionTargetId] === first!.sessionId).toBe(
+        client || free,
+      );
+      const next = await service.rememberAffinity({ ...args, payload: nextPayload });
+      expect(next!.sessionId === first!.sessionId).toBe(client || free);
+      if (client) {
+        const changed = await service.rememberAffinity({
+          ...args,
+          payload: { ...nextPayload, unknown_extension: "changed" },
+        });
+        expect(changed!.rootDigest).not.toBe(first!.rootDigest);
+        expect(changed!.sessionId).toBe(first!.sessionId);
+      }
+    },
+  );
+
   it.each(protocols)(
     "%s: sampling free; instructions/tools/semantic and unknown params bind",
     async (surface) => {
@@ -944,6 +1258,118 @@ integration("cache-prefix identity #160", () => {
         sessionBinding: parent!,
       }),
     ).toBeNull();
+  });
+
+  it.each(["openai-chat", "anthropic-messages", "openai-responses"])(
+    "R1 over-cap vision routing and protection PG %s",
+    async (surface) => {
+      if (!db) return;
+      const args = { ...argsFor(await fixture()), surface };
+      const content = Array.from({ length: 80 }, (_, i) =>
+        i % 2 ? a(`turn ${i}`) : u(`turn ${i}`),
+      );
+      const image = {
+        role: "user",
+        content: [
+          {
+            type: "image_url",
+            image_url: { url: `data:image/png;base64,${"A".repeat(2 * 1024 * 1024)}` },
+          },
+        ],
+      };
+      const requestFor = (turn: number) => {
+        const units = [
+          ...content,
+          image,
+          ...Array.from({ length: turn }, (_, i) => [a(`answer ${i}`), u(`next ${i}`)]).flat(),
+        ];
+        return surface === "openai-responses"
+          ? { instructions: "rules", input: units }
+          : surface === "anthropic-messages"
+            ? { system: "rules", messages: units }
+            : { messages: [{ role: "system", content: "rules" }, ...units] };
+      };
+      const hintSessions = new Set<string>();
+      for (let turn = 0; turn < 3; turn++) {
+        const now = new Date(args.now.getTime() + turn);
+        const payload = requestFor(turn);
+        expect(
+          await service.rememberAffinity({ ...args, now, payload, estimatedTokens: 20000 }),
+        ).toBeNull();
+        expect(await db.cacheAffinityNode.count({ where: { poolId: args.poolId } })).toBe(0);
+        const rows = await db.cacheAffinityRecord.findMany({ where: { poolId: args.poolId } });
+        expect(rows).toHaveLength(65);
+        expect(rows.every((row) => row.prefixDigest !== null)).toBe(true);
+        expect(new Set(rows.map((row) => row.sessionId)).size).toBe(1);
+        hintSessions.add(rows[0]!.sessionId);
+        const ranked = await service.rankAffinityTargets({
+          ...args,
+          now,
+          payload: requestFor(turn + 1),
+          targets: [args.target],
+          scoreSingleTarget: true,
+        });
+        expect(ranked.prefixDepths[args.target.executionTargetId]).toBe(80);
+        expect(ranked.instructionDepths?.[args.target.executionTargetId]).toBe(1);
+        expect(ranked.matchedSessionIds).toEqual({});
+        const affine = service.isAffinityTargetWarm(ranked, args.target.executionTargetId);
+        expect(affine).toBe(true);
+        const sessions =
+          (
+            await warm.loadWarmSessions({
+              ownerId: args.resourceOwnerId,
+              capacityIds: [args.target.capacityId],
+              policy: { windowSeconds: 300, minTokens: 8192 },
+              now,
+            })
+          ).get(args.target.capacityId) ?? [];
+        expect(sessions).toHaveLength(1);
+        expect(sessions[0]?.tokens).toBe(20000);
+        const load = { slots: 1, active: 0, kvBudgetTokens: null };
+        expect(
+          warm.memberProtectionVerdict({
+            load,
+            protectedSessions: sessions,
+            requestTokens: 20000,
+            affine: false,
+          }).state,
+        ).toBe("PROTECTED");
+        expect(
+          warm.memberProtectionVerdict({
+            load,
+            protectedSessions: sessions,
+            requestTokens: 20000,
+            affine,
+          }).state,
+        ).toBe("FREE");
+      }
+      expect(hintSessions.size).toBe(3);
+    },
+  );
+
+  it.each([false, true])("R1 missing-parent delta routing PG client=%s", async (client) => {
+    if (!db) return;
+    const args = { ...argsFor(await fixture()), surface: "openai-responses" };
+    const payload = {
+      instructions: "rules",
+      input: [u("delta"), a("output")],
+      previous_response_id: "missing",
+      ...(client ? { conversation: "client" } : {}),
+    };
+    const material = service.affinityPrefixDigests({
+      ...args,
+      payload,
+      runtimeIdentity: args.target.targetIdentity,
+    });
+    expect(material.missingParent).toBe(true);
+    expect(material.instructionDigests).toHaveLength(1);
+    expect(await service.rememberAffinity({ ...args, payload })).toBeNull();
+    expect(await db.cacheAffinityNode.count({ where: { poolId: args.poolId } })).toBe(0);
+    const rows = await db.cacheAffinityRecord.findMany({ where: { poolId: args.poolId } });
+    expect(rows.filter((row) => row.prefixDigest !== null).map((row) => row.prefixDigest)).toEqual(
+      material.instructionDigests,
+    );
+    expect(rows).toHaveLength(client ? 2 : 1);
   });
 
   it("retains the true tip beyond 64 units; over cap is fresh without nodes or throwing", async () => {
@@ -1538,7 +1964,11 @@ integration("cache-prefix identity #160", () => {
     },
     180000,
   );
-  it("AC-08/16/61 100k/10k index-work ratio stays constant for REAL probes and writes", () => {
+  it("R1 scale cleanup and AC-08/16/61 100k/10k index-work ratio stays constant for REAL probes and writes", async () => {
+    if (!db) return;
+    const where = { userId: { in: [...fixtureOwnerIds] } };
+    expect(await db.cacheAffinityNode.count({ where })).toBe(0);
+    expect(await db.cacheAffinityRecord.count({ where })).toBe(0);
     expect(scaleMeasurements.map(({ count }) => count)).toEqual([10000, 100000]);
     for (const kind of ["probe", "write"] as const) {
       for (const counter of ["read", "fetch"] as const) {

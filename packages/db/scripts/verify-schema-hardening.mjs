@@ -36,6 +36,7 @@ const requiredFragments = [
   "cache_affinity_record_shape_check",
   "cache_affinity_node_shape_check",
   "cache_affinity_node_owner",
+  "enforce_cache_affinity_node_immutable",
   'ALTER COLUMN "sessionId" SET NOT NULL',
   "cache_affinity_conversation_unique",
   "enforce_cache_affinity_identity_immutable",
@@ -430,6 +431,70 @@ async function expectConstraintFailure(statement, expectedCode = "23514") {
   }
   throw new Error("Expected PostgreSQL constraint failure");
 }
+
+// R1 node behavioral cases: shared verbatim with the inverse-check runner.
+async function verifyAffinityNodeHardening() {
+  const shapeCases = [
+    { name: "zero-depth", depth: "0" },
+    { name: "negative-depth", depth: "-1" },
+    { name: "short-root", root: "repeat('r', 31)" },
+    { name: "long-root", root: "repeat('r', 129)" },
+    { name: "short-node", node: "repeat('n', 31)" },
+    { name: "long-node", node: "repeat('n', 129)" },
+    { name: "empty-session", session: "''" },
+    { name: "long-session", session: "repeat('s', 129)" },
+    // Nodes have no creation timestamp: expired timestamps are legitimate sweep
+    // inputs. A missing expiry violates the existing NOT NULL contract instead.
+    { name: "missing-expiry", expiry: "NULL", code: "23502" },
+  ];
+  for (const row of shapeCases) {
+    await expectConstraintFailure(
+      `
+      INSERT INTO cache_affinity_node
+        (id, "userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest",
+         "nodeDigest", depth, "sessionId", "isTip", "expiresAt")
+      SELECT 'affinity-node-${row.name}', 'owner-a', 'owner-b', 'pool-a', id,
+        ${row.root ?? "repeat('r', 43)"}, ${row.node ?? "repeat('n', 43)"},
+        ${row.depth ?? "1"}, ${row.session ?? `'session-${row.name}'`}, false,
+        ${row.expiry ?? "NOW() + interval '1 hour'"}
+        FROM execution_target WHERE "discoveredModelId" = 'model-a'
+    `,
+      row.code ?? "23514",
+    );
+  }
+  await client.query(`
+    INSERT INTO cache_affinity_node
+      (id, "userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest",
+       "nodeDigest", depth, "sessionId", "isTip", "expiresAt")
+    SELECT 'affinity-node-valid', 'owner-a', 'owner-b', 'pool-a', id,
+      repeat('r', 43), repeat('n', 43), 1, 'node-session', false,
+      NOW() + interval '1 hour' FROM execution_target WHERE "discoveredModelId" = 'model-a'
+  `);
+  const identityCases = [
+    ['"userId"', "'owner-b'"],
+    ['"tenantUserId"', "'owner-a'"],
+    ['"poolId"', "'other-pool'"],
+    ['"executionTargetId"', "'other-target'"],
+    ['"rootDigest"', "repeat('x', 43)"],
+    ['"nodeDigest"', "repeat('x', 43)"],
+    ["depth", "2"],
+    ['"sessionId"', "'changed-session'"],
+  ];
+  for (const [column, value] of identityCases) {
+    await expectConstraintFailure(`
+      UPDATE cache_affinity_node SET ${column} = ${value}
+       WHERE id = 'affinity-node-valid'
+    `);
+  }
+  // Mutable warmth columns remain refreshable under the immutability trigger.
+  await client.query(`UPDATE cache_affinity_node
+    SET "isTip" = true, "expiresAt" = NOW() + interval '2 hours'
+    WHERE id = 'affinity-node-valid'`);
+  process.stdout.write(
+    "Affinity node hardening: 9 shape/expiry and 8 identity negatives passed.\n",
+  );
+}
+// End R1 node behavioral cases.
 
 const schemaUrl = new URL(baseUrl);
 schemaUrl.searchParams.set("options", `-c search_path=${schema}`);
@@ -1263,6 +1328,7 @@ try {
       repeat('t', 32), 5, repeat('d', 43), repeat('q', 43), NULL, 1, 'test-session'
       FROM execution_target WHERE "discoveredModelId" = 'model-a'
   `);
+  await verifyAffinityNodeHardening();
   await expectConstraintFailure(
     `
     INSERT INTO pool_member
