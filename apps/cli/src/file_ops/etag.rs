@@ -50,7 +50,12 @@ impl EtagKey {
     /// same bytes, such as a guess an agent writes next to a masked value, gets a
     /// different etag, so an etag never confirms a guess of a masked value.
     pub fn strong(&self, stat: &super::resolve::Stat, bytes: &[u8]) -> String {
-        let identity = format!("{}:{}:", stat.dev, stat.ino);
+        // device, inode and modification time: a recycled inode number (delete, then
+        // create a candidate) is a different file with a different mtime
+        let identity = format!(
+            "{}:{}:{}:{}:",
+            stat.dev, stat.ino, stat.mtime_secs, stat.mtime_nanos
+        );
         let mac = hmac_sha256(&self.0, &[b"strong:", identity.as_bytes(), bytes]);
         format!("h:{}", &URL_SAFE_NO_PAD.encode(mac)[..ETAG_CHARS])
     }
