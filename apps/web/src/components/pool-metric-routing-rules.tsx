@@ -13,6 +13,7 @@ import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
 import { InlineRetry } from "@/components/inline-retry";
+import { PoolEngineLoad } from "@/components/pool-engine-load";
 import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
@@ -125,6 +126,7 @@ export function PoolMetricRoutingRules({ poolId }: { poolId: string }) {
           ]),
         ].sort()}
       />
+      <PoolEngineLoad members={view.data.members} />
       <MemberVerdicts view={view.data} />
       <DeviceSeries view={view.data} />
     </section>

@@ -38,7 +38,17 @@ Metric routing rules (S-B part 2):
   (`active`, `stale`, `unevaluated`), a per-rule `triggered` / `clear` /
   `stale` state, the member's `endpoint.*` load series (`endpoint.running`,
   `endpoint.waiting`, `endpoint.kv_usage`, ...) and the series of each member's
-  device.
+  device. Each member also carries `engineLoad` (S-D): its override `mode`
+  (`auto` / `off`), the engine kind and slots, the live reading (`running`,
+  `waiting`, `kvUsage`, `slotsBusy`, `deferred`, age, `stale`, prefix cache
+  totals) and the verdict state (`full_waiting`, `full_kv`, `full_slots`,
+  `full_deferred`, `clear`, `stale`, `none`, `off`).
+- `forwarder_pool_member_engine_load_set` (`{ poolMemberId, mode: "auto" |
+  "off", kvFullThreshold?, confirm: "RUN" }`) turns "use engine load" off for
+  a member or overrides its vLLM/SGLang KV threshold (default 0.95). Engine
+  load only adds FULL (lease counts stay authoritative), a stale reading is
+  ignored, and when every candidate is FULL a plain-name request is admitted by
+  leases alone. Classified `cost` like the rules.
 - `forwarder_pool_routing_rules_set` (`{ poolId, rules, confirm: "RUN" }`)
   replaces the whole list (at most 16). A rule is a flat record
   `{ metric, labels?, aggregate: "max", op: ">" | ">=" | "<" | "<=",

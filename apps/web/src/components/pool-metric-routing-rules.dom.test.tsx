@@ -32,6 +32,15 @@ vi.mock("@/utils/orpc", () => ({
           initialData: state.view,
         }),
       },
+      setPoolMemberEngineLoad: {
+        mutationOptions: (options?: Record<string, unknown>) => ({
+          mutationFn: async (variables: unknown) => {
+            state.mutationCalls.push(variables);
+            return variables;
+          },
+          ...options,
+        }),
+      },
       setPoolRoutingRules: {
         mutationOptions: (options?: Record<string, unknown>) => ({
           mutationFn: async (variables: unknown) => {
@@ -55,6 +64,22 @@ function mount(children: ReactNode) {
       {children}
     </QueryClientProvider>,
   );
+}
+
+function engineLoad(overrides: Record<string, unknown> = {}) {
+  return {
+    mode: "auto",
+    kvFullThreshold: null,
+    effectiveKvFullThreshold: 0.95,
+    engineKind: "VLLM",
+    engineSlots: null,
+    hasSignal: true,
+    state: "clear",
+    full: false,
+    snapshotState: null,
+    live: null,
+    ...overrides,
+  };
 }
 
 function view(overrides: Record<string, unknown> = {}) {
@@ -83,6 +108,22 @@ function view(overrides: Record<string, unknown> = {}) {
         evaluatedAt: null,
         expiresAt: null,
         endpointSeries: [{ name: "endpoint.running", labels: {}, value: 2, stale: false }],
+        engineLoad: engineLoad({
+          state: "full_waiting",
+          full: true,
+          live: {
+            running: 3,
+            waiting: 2,
+            kvUsage: 0.91,
+            slotsBusy: null,
+            deferred: null,
+            waitingStreak: 2,
+            ageSeconds: 1,
+            stale: false,
+            prefixCacheHits: 30,
+            prefixCacheQueries: 60,
+          },
+        }),
       },
       {
         poolMemberId: "m2",
@@ -95,6 +136,7 @@ function view(overrides: Record<string, unknown> = {}) {
         evaluatedAt: null,
         expiresAt: null,
         endpointSeries: [],
+        engineLoad: engineLoad({ state: "stale" }),
       },
     ],
     devices: [
@@ -186,6 +228,38 @@ describe("PoolMetricRoutingRules", () => {
     expect(screen.getByText("dashboard:pools.metricRules.empty")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.metricRules.save" }));
     await waitFor(() => expect(state.mutationCalls).toEqual([{ poolId: "pool-1", rules: [] }]));
+  });
+});
+
+describe("PoolEngineLoad (S-D)", () => {
+  it("shows live load, the FULL and stale badges, and the override toggle", async () => {
+    state.view = view();
+    mount(<PoolMetricRoutingRules poolId="pool-1" />);
+    expect(screen.getByText("dashboard:pools.engineLoad.states.full_waiting")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.engineLoad.badges.stale")).toBeTruthy();
+    const line = screen.getByText(/engineLoad\.running:3/);
+    expect(line.textContent).toContain("engineLoad.waiting:2");
+    expect(line.textContent).toContain("engineLoad.kv");
+    const toggles = screen.getAllByRole("switch");
+    expect(toggles).toHaveLength(2);
+    // The first member uses engine load (auto): turning it off saves mode off.
+    fireEvent.click(toggles[0]!);
+    await waitFor(() => expect(state.mutationCalls).toEqual([{ poolMemberId: "m1", mode: "off" }]));
+  });
+
+  it("labels an off override and an engine without a signal", () => {
+    const base = view();
+    const members = base.members.map((member, index) => ({
+      ...member,
+      engineLoad: engineLoad(
+        index === 0 ? { mode: "off" } : { hasSignal: false, engineKind: "OLLAMA", state: "none" },
+      ),
+    }));
+    state.view = { ...base, members };
+    mount(<PoolMetricRoutingRules poolId="pool-1" />);
+    expect(screen.getByText("dashboard:pools.engineLoad.badges.off")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.engineLoad.badges.noSignal")).toBeTruthy();
+    expect(screen.queryByText(/states\.full_/)).toBeNull();
   });
 });
 

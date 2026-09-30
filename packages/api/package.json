@@ -62,6 +62,9 @@
     "./lib/engine-facts": {
       "default": "./src/lib/engine-facts.ts"
     },
+    "./lib/engine-load": {
+      "default": "./src/lib/engine-load.ts"
+    },
     "./lib/metric-routing": {
       "default": "./src/lib/metric-routing.ts"
     },

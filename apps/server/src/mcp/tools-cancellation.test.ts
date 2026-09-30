@@ -96,6 +96,17 @@ const fencedClient = dbModule.default as unknown as {
   modelApiToken: { update: (args: unknown) => Promise<unknown> };
 };
 
+/**
+ * The lease writes are one `INSERT INTO capacity_lease ... unnest(...)` per
+ * batch of ADMISSION_ROW_BATCH_SIZE rows (Prisma's `createMany` is gone from
+ * this path). A tagged-template call records the SQL fragments as its first
+ * argument; `slice(1)` is the bind parameters in template order.
+ */
+const leaseInserts = (tx: { $executeRaw: { mock: { calls: unknown[][] } } }) =>
+  tx.$executeRaw.mock.calls.filter((call) =>
+    (call[0] as TemplateStringsArray).join("?").includes("INSERT INTO capacity_lease"),
+  );
+
 const USER: import("./context").McpSessionUser = {
   id: "user-1",
   name: "Test",
@@ -854,7 +865,6 @@ describe("G2n pass 4 — durable cleanup authority (the R67/R68 renewal probes, 
       capacityLease: {
         updateMany: vi.fn(async () => ({ count: 1 })),
         findMany: vi.fn(async () => []),
-        createMany: vi.fn(async () => ({ count: 1 })),
       },
       inferenceCapacity: {
         findUnique: vi.fn(async () => ({ userId: "user-1", hardConcurrencyLimit: null })),
@@ -900,9 +910,9 @@ describe("G2n pass 4 — durable cleanup authority (the R67/R68 renewal probes, 
     ).resolves.toBe(true);
     // The durable release transitions executed...
     expect(tx.capacityLease.updateMany).toHaveBeenCalledTimes(1);
-    // ...but NO new lease was created and NO waiter was admitted during
+    // ...but NO new lease was written and NO waiter was admitted during
     // teardown (the queued waiter stays WAITING for the next boot).
-    expect(tx.capacityLease.createMany).not.toHaveBeenCalled();
+    expect(leaseInserts(tx)).toHaveLength(0);
     expect(tx.admissionRequest.updateMany).not.toHaveBeenCalledWith(
       expect.objectContaining({ data: { state: "ADMITTED" } }),
     );
@@ -937,31 +947,48 @@ describe("G2n pass 5 — shutdown arming DURING a fill stops the next admission 
     /** Requests from this index on are no longer WAITING when the write phase re-reads them. */
     staleFrom?: number;
   }) {
+    const waiterRows = Array.from({ length: options.waiters ?? 1 }, (_, index) => ({
+      id: `waiter-${index}`,
+      userId: "user-1",
+      admissionRequestId: `next-request-${index}`,
+      executionTargetId: "target-1",
+      poolMemberId: null,
+      effectiveConcurrencyLimit: null,
+      effectivePriority: options.priority ?? 0,
+      candidateOrder: 0,
+      notBefore: null,
+      deadlineAt: null,
+      AdmissionRequest: {
+        requestId: "req-next",
+        attemptId: "attempt-next",
+        enqueueSequence: 1n,
+        deadlineAt: null,
+      },
+    }));
     const tx = {
       $queryRaw: vi.fn(async () => [{ now: new Date() }]),
-      $executeRaw: vi.fn(async () => 0),
+      // The lease INSERT ... SELECT is a raw statement; a fence arming inside
+      // it is a batch that already started and must not be undone.
+      $executeRaw: vi.fn(async (strings: TemplateStringsArray) => {
+        if (
+          (strings as unknown as string[]).join("?").includes("INSERT INTO capacity_lease") &&
+          options.arm === "write"
+        )
+          armDbShutdownFence();
+        return 0;
+      }),
       capacityWaiter: {
-        findMany: vi.fn(async (args: { include?: unknown }) =>
-          args.include
-            ? Array.from({ length: options.waiters ?? 1 }, (_, index) => ({
-                id: `waiter-${index}`,
-                userId: "user-1",
-                admissionRequestId: `next-request-${index}`,
-                executionTargetId: "target-1",
-                poolMemberId: null,
-                effectiveConcurrencyLimit: null,
-                effectivePriority: options.priority ?? 0,
-                candidateOrder: 0,
-                notBefore: null,
-                deadlineAt: null,
-                AdmissionRequest: {
-                  requestId: "req-next",
-                  attemptId: "attempt-next",
-                  enqueueSequence: 1n,
-                  deadlineAt: null,
-                },
-              }))
-            : [],
+        findMany: vi.fn(
+          async (args: { include?: unknown; distinct?: unknown; select?: { id?: unknown } }) => {
+            // The concurrency-scope fence lookup is a distinct-select read.
+            if (args.distinct) return [];
+            // The snapshot hydrates in two phases: an id-only read first, then
+            // include batches over those ids. Both shapes must be modelled so a
+            // broken id read (returning no rows) is not silently tolerated.
+            if (args.include) return waiterRows;
+            if (args.select?.id) return waiterRows.map((row) => ({ id: row.id }));
+            return [];
+          },
         ),
         updateMany: vi.fn(async () => ({ count: 1 })),
         update: vi.fn(async () => ({})),
@@ -969,11 +996,6 @@ describe("G2n pass 5 — shutdown arming DURING a fill stops the next admission 
       capacityLease: {
         updateMany: vi.fn(async () => ({ count: 1 })),
         findMany: vi.fn(async () => []),
-        createMany: vi.fn(async () => {
-          // The batch already started: a fence arming inside it must not undo it.
-          if (options.arm === "write") armDbShutdownFence();
-          return { count: options.waiters ?? 1 };
-        }),
       },
       inferenceCapacity: {
         findUnique: vi.fn(async () => {
@@ -1044,7 +1066,7 @@ describe("G2n pass 5 — shutdown arming DURING a fill stops the next admission 
     expect(tx.capacityLease.updateMany).toHaveBeenCalledTimes(1);
     // ...but the mid-fill fence arming stopped the admission BEFORE its
     // durable transitions: no lease, no WAITING→ADMITTED, no waiter flip.
-    expect(tx.capacityLease.createMany).not.toHaveBeenCalled();
+    expect(leaseInserts(tx)).toHaveLength(0);
     expect(tx.admissionRequest.updateMany).not.toHaveBeenCalledWith(
       expect.objectContaining({ data: { state: "ADMITTED" } }),
     );
@@ -1066,10 +1088,20 @@ describe("G2n pass 5 — shutdown arming DURING a fill stops the next admission 
     const store = new PostgresCapacityAdmissionStore();
     await expect(releaseLease(store)).resolves.toBe(true);
     expect(tx.capacityLease.updateMany).toHaveBeenCalledTimes(1);
-    expect(tx.capacityLease.createMany).toHaveBeenCalledTimes(1);
-    expect(tx.capacityLease.createMany).toHaveBeenCalledWith({
-      data: expect.arrayContaining([expect.objectContaining({ attemptId: "attempt-next" })]),
-    });
+    // The whole plan is one INSERT ... SELECT over unnested arrays; the fence
+    // arming inside that statement is a batch that already started.
+    const inserts = leaseInserts(tx);
+    expect(inserts).toHaveLength(1);
+    const params = inserts[0]!.slice(1);
+    // Scalars first (now, updatedAt, expiresAt), then one array per unnested
+    // column: userId, admissionRequestId, requestId, attemptId, ... tokens.
+    expect(params[4]).toEqual(["next-request-0", "next-request-1", "next-request-2"]);
+    expect(params[6]).toEqual(["attempt-next", "attempt-next", "attempt-next"]);
+    // Tokens are one consecutive sequence in grant order across the batch.
+    const tokens = params[14] as bigint[];
+    expect(tokens).toHaveLength(3);
+    expect(tokens[1]).toBe(tokens[0]! + 1n);
+    expect(tokens[2]).toBe(tokens[1]! + 1n);
     expect(tx.capacityRuntime.update).toHaveBeenCalledTimes(1);
     // Scheduler state of the LAST grant (class 3 spent 3 of its quantum 4), and one
     // fencing-counter increment for the whole batch.
@@ -1122,13 +1154,12 @@ describe("G2n pass 5 — shutdown arming DURING a fill stops the next admission 
     );
     const store = new PostgresCapacityAdmissionStore();
     await expect(releaseLease(store)).resolves.toBe(true);
-    const first = (
-      tx.capacityLease.createMany.mock.calls as unknown as Array<
-        [{ data: Array<{ admissionRequestId: string }> }]
-      >
-    )[0]?.[0];
-    // Only the prefix before the stale winner is persisted...
-    expect(first?.data.map((row) => row.admissionRequestId)).toEqual(["next-request-0"]);
+    const inserts = leaseInserts(tx);
+    // Only the prefix before the stale winner is persisted, once per re-plan
+    // round; the first round writes the single prefix grant.
+    expect(inserts.length).toBeGreaterThan(0);
+    const params = inserts[0]!.slice(1);
+    expect(params[4]).toEqual(["next-request-0"]);
     // ...and the pass re-read the snapshot to re-plan (bounded by the queue size).
     const snapshotReads = (
       tx.capacityWaiter.findMany.mock.calls as unknown as Array<[{ include?: unknown }]>
@@ -1147,13 +1178,8 @@ describe("G2n pass 5 — shutdown arming DURING a fill stops the next admission 
     );
     const store = new PostgresCapacityAdmissionStore();
     await expect(releaseLease(store)).resolves.toBe(true);
-    const first = (
-      tx.capacityLease.createMany.mock.calls as unknown as Array<
-        [{ data: Array<{ admissionRequestId: string }> }]
-      >
-    )[0]?.[0];
     // Nothing is persisted when the FIRST winner is stale...
-    expect(first).toBeUndefined();
+    expect(leaseInserts(tx)).toHaveLength(0);
     // ...and the pass re-read the snapshot to re-plan (bounded by the queue size).
     const snapshotReads = (
       tx.capacityWaiter.findMany.mock.calls as unknown as Array<[{ include?: unknown }]>
