@@ -197,6 +197,14 @@ type CommandRecord = TrackedCliCommand & {
   rejectionReason: string | null;
   deadlineTimer: ReturnType<typeof setTimeout> | null;
   graceTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * The server ended the record (authority gone) but the CLI has not yet
+   * acknowledged the `exec.cancel`, so the remote process may still exist: the
+   * record keeps its per-CLI and per-user slot until the CLI's `exec.done` /
+   * `exec.rejected`, the session's loss, or {@link SERVER_COMMAND_GRACE_MS}.
+   * Nothing caller-visible depends on it (see {@link endExecFromServer}).
+   */
+  slotHeld: boolean;
   waiters: Set<(snapshot: CliCommandSnapshot) => void>;
 };
 
@@ -302,8 +310,20 @@ function finish(
   if (fields.signal !== undefined) record.signal = fields.signal;
   if (fields.timedOut !== undefined) record.timedOut = fields.timedOut;
   auditHeadlessCommand(record, status);
-  relaySessionManager.forgetCommand(record.cliDeviceId, record.commandId);
+  // A server-ended record stays routable until the CLI answers, so its late
+  // `exec.done` frees the held slot (and is otherwise dropped: `finish` only
+  // acts on a running record).
+  if (!record.slotHeld) relaySessionManager.forgetCommand(record.cliDeviceId, record.commandId);
   notify(record);
+}
+
+/** The CLI answered (or the grace ran out): the held slot is free and the record leaves the session. */
+function releaseHeldSlot(record: CommandRecord) {
+  if (!record.slotHeld) return;
+  record.slotHeld = false;
+  if (record.graceTimer) clearTimeout(record.graceTimer);
+  record.graceTimer = null;
+  relaySessionManager.forgetCommand(record.cliDeviceId, record.commandId);
 }
 
 function auditHeadlessCommand(
@@ -326,7 +346,7 @@ function auditHeadlessCommand(
           ? (record.rejectionReason ?? "rejected")
           : record.timedOut
             ? "timed_out"
-            : null,
+            : record.rejectionReason,
     startedAt: new Date(record.startedAt),
     finishedAt: new Date(record.finishedAt ?? Date.now()),
   });
@@ -336,7 +356,7 @@ function runningCounts(userId: string, cliDeviceId: string): { user: number; cli
   let user = 0;
   let cli = 0;
   for (const command of commandsById.values()) {
-    if (command.status !== "running" || command.userId !== userId) continue;
+    if ((command.status !== "running" && !command.slotHeld) || command.userId !== userId) continue;
     user += 1;
     if (command.cliDeviceId === cliDeviceId) cli += 1;
   }
@@ -422,6 +442,7 @@ async function admitCliCommand(
     rejectionReason: null,
     deadlineTimer: null,
     graceTimer: null,
+    slotHeld: false,
     waiters: new Set(),
     markCancelled() {},
     markStarted() {},
@@ -429,14 +450,22 @@ async function admitCliCommand(
     markDone() {},
     appendOutput() {},
   };
-  record.markCancelled = () => finish(record, "cancelled", {});
+  record.markCancelled = () => {
+    finish(record, "cancelled", {});
+    releaseHeldSlot(record);
+  };
   record.markRejected = (reason: string) => {
     // The wire accepts any string here: store a known code or the fallback,
-    // never CLI-supplied text (see `cliAgentWireReason`).
-    record.rejectionReason = cliAgentWireReason(reason);
+    // never CLI-supplied text (see `cliAgentWireReason`). A record the server
+    // already ended keeps the reason it was ended for.
+    if (record.status === "running") record.rejectionReason = cliAgentWireReason(reason);
     finish(record, "rejected", {});
+    releaseHeldSlot(record);
   };
-  record.markDone = (result) => finish(record, "exited", result);
+  record.markDone = (result) => {
+    finish(record, "exited", result);
+    releaseHeldSlot(record);
+  };
   record.markStarted = () => {
     if (record.status !== "running") return;
   };
@@ -526,11 +555,37 @@ function inCancelScope(record: { tokenId: string; userId: string }, scope: Cance
   return "tokenId" in scope ? record.tokenId === scope.tokenId : record.userId === scope.userId;
 }
 
+/**
+ * The ONE way the server ends a running headless command because its authority
+ * went away (token revoked, narrowed or expired; user banned): ask the CLI to
+ * stop, then settle the record as cancelled right here. Sending `exec.cancel`
+ * alone left the record running, so a waiting MCP call still returned later
+ * output and exit as a success, audited as completed. After this the record is
+ * terminal for every caller-visible purpose: waiters wake, output and the CLI's
+ * late `exec.done` are dropped, and the audit says cancelled. Only the
+ * execution slot stays held (`slotHeld`) until the CLI acknowledges or the grace
+ * runs out, because the remote process may still exist. The server deadline
+ * keeps its own grace (`armServerDeadline`): there the CLI's real exit is wanted.
+ */
+function endExecFromServer(
+  record: CommandRecord,
+  reason: "token_revoked" | "user_banned" | "token_expired",
+) {
+  if (record.status !== "running") return;
+  relaySessionManager.dispatchExecCancel(record.cliDeviceId, record.commandId);
+  record.rejectionReason = reason;
+  record.slotHeld = true;
+  finish(record, "cancelled", {});
+  const grace = setTimeout(() => releaseHeldSlot(record), SERVER_COMMAND_GRACE_MS);
+  grace.unref?.();
+  record.graceTimer = grace;
+}
+
 /** The ONE sweep behind the token and user cancels: running exec and active supervised requests. */
 function cancelCommandsIn(scope: CancelScope, reason: "token_revoked" | "user_banned") {
   for (const command of [...commandsById.values()]) {
     if (!inCancelScope(command, scope) || command.status !== "running") continue;
-    relaySessionManager.dispatchExecCancel(command.cliDeviceId, command.commandId);
+    endExecFromServer(command, reason);
   }
   for (const record of [...supervisedById.values()]) {
     if (!inCancelScope(record, scope) || !isActiveSupervised(record.status)) continue;
@@ -568,7 +623,7 @@ export function sweepExpiredTokenCommands(now = Date.now()): number {
   for (const command of [...commandsById.values()]) {
     if (command.status !== "running") continue;
     if (command.expiresAt === null || command.expiresAt > now) continue;
-    relaySessionManager.dispatchExecCancel(command.cliDeviceId, command.commandId);
+    endExecFromServer(command, "token_expired");
     swept += 1;
   }
   for (const [commandId, command] of [...commandsById]) {

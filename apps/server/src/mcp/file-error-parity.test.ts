@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
+import type { FileOpErrorCode } from "../relay/cli-file-ops.js";
 import { FILE_ERROR_CODES, FILE_WIRE_REASONS } from "../relay/file-protocol.js";
 
 /**
@@ -45,12 +46,27 @@ function snakeCase(variant: string): string {
 }
 
 const enumBody = blockAfter(RUST_ERROR, "pub enum ErrorCode", "{", "\n}");
-const variants = [...enumBody.matchAll(/^\s*([A-Z][A-Za-z0-9]*),\s*$/gm)].map((match) => match[1]);
+/**
+ * Fail closed: every line of the enum body must be blank, a comment, an
+ * attribute or a plain unit variant. A variant this parser does not understand
+ * (`Phantom(u8),`, a struct variant, an explicit discriminant) fails here instead
+ * of being skipped, which would let a Rust-only code pass the comparison.
+ */
+const UNIT_VARIANT = /^\s*([A-Z][A-Za-z0-9]*),\s*$/;
+const unparsedEnumLines = enumBody
+  .split("\n")
+  .filter((line) => line.trim() !== "" && !/^\s*(\/\/|#\[)/.test(line) && !UNIT_VARIANT.test(line));
+const variants = enumBody
+  .split("\n")
+  .map((line) => UNIT_VARIANT.exec(line)?.[1])
+  .filter((variant): variant is string => variant !== undefined);
 const asStrBody = blockAfter(RUST_ERROR, "pub fn as_str(self)", "match self {", "\n        }");
 const arms = [...asStrBody.matchAll(/Self::([A-Za-z0-9]+)\s*=>\s*"([^"]+)"/g)].map((match) => ({
   variant: match[1],
   code: match[2],
 }));
+/** Every `Self::` token of `as_str` must be one of the parsed arms (no payload or `_` arm skipped). */
+const armTokens = (asStrBody.match(/Self::/g) ?? []).length;
 
 /** The string literals of a Rust `const NAME: [&str; N] = [ ... ];`. */
 function rustStrArray(name: string): { declared: number; values: string[] } {
@@ -66,7 +82,10 @@ function rustStrArray(name: string): { declared: number; values: string[] } {
 const sorted = (values: readonly string[]) => [...values].sort();
 
 describe("file error-code parity between the Rust CLI and the TypeScript server", () => {
-  it("parses a plausible Rust enum (the parser itself is not vacuous)", () => {
+  it("parses a plausible Rust enum (the parser itself is not vacuous) and understands every line of it", () => {
+    expect(unparsedEnumLines).toEqual([]);
+    expect(armTokens).toBe(arms.length);
+    expect(asStrBody).not.toMatch(/\b_\s*=>/);
     expect(variants.length).toBeGreaterThanOrEqual(20);
     expect(arms.length).toBe(variants.length);
     expect(variants).toContain("UncertainOutcome");
@@ -122,9 +141,26 @@ describe("file error-code parity between the Rust CLI and the TypeScript server"
     }
   });
 
-  it("docs/mcp.md documents every file error code and wire refusal it lists as error.code", () => {
-    for (const code of [...FILE_ERROR_CODES, ...FILE_WIRE_REASONS]) {
-      expect(MCP_DOC.includes(`\`${code}\``), `docs/mcp.md is missing \`${code}\``).toBe(true);
-    }
+  it("the error.code list in docs/mcp.md is exactly the codes the server can return (both directions)", () => {
+    const start = MCP_DOC.indexOf("stable `error.code`:");
+    const end = MCP_DOC.indexOf("The CLI re-checks its own startup mode", start);
+    expect(start, "docs/mcp.md error.code list anchor").toBeGreaterThan(-1);
+    expect(end, "docs/mcp.md error.code list end anchor").toBeGreaterThan(start);
+    const documented = new Set(
+      [...MCP_DOC.slice(start, end).matchAll(/`([a-z_]+)`/g)].map((match) => match[1] as string),
+    );
+    // Codes only the server produces (admission refusals); the type keeps this list honest.
+    const serverOnly = [
+      "offline",
+      "token_inactive",
+      "upgrade_required",
+    ] as const satisfies readonly FileOpErrorCode[];
+    // `bad_frame` settles as `io_error` and never reaches the agent as its own code.
+    const returnable = new Set<string>([
+      ...FILE_ERROR_CODES,
+      ...FILE_WIRE_REASONS.filter((reason) => reason !== "bad_frame"),
+      ...serverOnly,
+    ]);
+    expect(sorted([...documented])).toEqual(sorted([...returnable]));
   });
 });

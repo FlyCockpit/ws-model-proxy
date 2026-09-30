@@ -10,7 +10,10 @@ import { cancelFileOpsForUser } from "./cli-file-ops.js";
  * owner's ban state.
  *
  * Synchronous, so the work has ended before `notifyUserBanned`
- * (`@ws-model-proxy/auth/user-ban-listeners`) returns to the ban path. The
+ * (`@ws-model-proxy/auth/user-ban-listeners`) returns to the ban path: file ops,
+ * supervised requests and headless commands are settled on the server at once
+ * (a headless command is also asked to stop and keeps only its execution slot
+ * until the CLI answers; see `endExecFromServer` in `./cli-commands.ts`). The
  * file-op sweep runs even if the command sweep throws. Subscribed once in
  * `./app.ts`.
  */

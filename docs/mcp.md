@@ -259,12 +259,15 @@ as malformed and drops the relay session (the retained files stay on disk).
 
 **Revocation and bans.** Revoking or narrowing a personal token, revoking a CLI
 credential or device, and deleting a user end that principal's in-flight file operations and
-commands at once (`token_inactive` or `offline`; a write-class call carries
-`error.outcome: "unknown"`). Banning a user (the dashboard archive action, or the admin ban
-or an admin update that sets the ban) does the same for every token the user holds, including
-commands still waiting for a person's confirmation, and refuses calls still being admitted;
-the CLI's relay connection stays up. The cancel runs in the server process that performed the
-ban: another replica ends the work at its deadline and refuses the user's next call.
+commands (`token_inactive` or `offline`; a write-class call carries `error.outcome: "unknown"`).
+Banning a user (the dashboard archive action, the admin ban, or an admin update that sets the
+ban) does the same for every token the user holds and refuses calls still being admitted; the
+CLI's relay connection stays up. Everything ends on the server at once, including supervised
+requests still waiting for a person's confirmation: a call waiting for a headless command returns
+`cancelled`, and the CLI's late output and exit are dropped and never reported as a success. The
+CLI is asked to stop the process, and the command keeps its execution slot only until the CLI
+answers or 15 seconds pass. The cancel runs in the server process that performed the ban: another
+replica ends the work at its deadline and refuses the user's next call.
 
 **Limits.** 120 file operations per minute per user, of which at most 30 change files;
 4 in flight per CLI and 16 per user. Over a limit the error is `limit` with `retryAfterMs`.
