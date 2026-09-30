@@ -248,6 +248,25 @@ function auditArgsOf(input: unknown): Record<string, unknown> {
   return out;
 }
 
+/**
+ * Audit a call refused before the core ran (SDK validation, missing confirm).
+ * Only a PAT can reach a file tool; anything else is not recorded.
+ */
+export function auditFileInputRefusal(
+  op: FileOp,
+  input: unknown,
+  who: { userId: string; credential: McpRequestCredential },
+): void {
+  if (who.credential.kind !== "pat") return;
+  auditRefusedFileInput({
+    userId: who.userId,
+    tokenId: who.credential.tokenId,
+    cliDeviceId: "",
+    op,
+    args: auditArgsOf(input),
+  });
+}
+
 /** Run one tool's op and return the settled success (`{op, result}`), or throw `McpCliFileError`. */
 export async function runForwarderCliFileTool(
   op: FileOp,
@@ -414,7 +433,7 @@ export const FILE_ETAG_NOTICE =
   "Pass expectedEtag to edit, write (ifExists replace), rename (overwrite) and delete. Line-range edits, replace and rename overwrite require it. Stale etags return conflict; supervised errors contain only code, without currentEtag or file content. Supervised edit/write results omit diff and hunks. The CLI rechecks the pre-image before applying. Etags reset when the wsmp daemon restarts: with a read grant, re-read or file_stat before editing.";
 
 export const FILE_UNKNOWN_OUTCOME_NOTICE =
-  'An error.outcome "unknown", including timeout, offline or io_error, means the change may have been made. A supervised timeout/offline or CLI io_error is unknown only after supervised.accepted; before that it is definitively not applied. Ask the person to inspect the file, or use forwarder_cli_file_stat with hash true and a read grant to compare the etag, before retrying. A retry that carries expectedEtag is safe (a stale etag returns conflict); an exact-match edit without expectedEtag is NOT idempotent.';
+  'If a write-class call fails with error.outcome "unknown" (any code: timeout, offline, cancelled, token_inactive, a mode change, io_error, not_found on rename/delete, or conflict when the file was swapped during the change), the change may or may not have been made. For supervised requests EVERY non-success after supervised.accepted is unknown: CLI errors carry only code, so even a pre-commit conflict cannot be distinguished. Before acceptance failures are definitively not applied. Ask the person to inspect the file, or use forwarder_cli_file_stat with hash true and a read grant to compare the etag before retrying. A retry that carries expectedEtag is safe (a stale etag returns conflict; a headless currentEtag is an etag or the word gone); an exact-match edit without expectedEtag is NOT idempotent, so check first.';
 
 export const FILE_LIMITS_NOTICE =
   "Limits: 120 file operations per minute per user (30 changing ones), 4 at once per CLI and 16 per user; over the limit returns error.code limit with retryAfterMs. Headless operations are never queued and time out after 30 seconds. Supervised writes share command limits (1 awaiting per CLI, 2 per user, 2 live per CLI), wait up to 15 minutes for approval, then time out 30 seconds after acceptance.";

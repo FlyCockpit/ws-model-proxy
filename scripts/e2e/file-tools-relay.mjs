@@ -604,7 +604,7 @@ try {
         await assert.rejects(readFile(targetPath), { code: "ENOENT" });
       } else {
         assert.equal(done.error.code, "conflict");
-        assert.equal(done.error.outcome, undefined);
+        assert.equal(done.error.outcome, "unknown");
         assert.equal(await readFile(targetPath, "utf8"), "changed-after-preview\n");
       }
     } finally {

@@ -46,6 +46,12 @@ export interface McpInputOverlay {
    * 1 MiB of content). The raw request body stays capped by the /mcp body cap.
    */
   maxInputBytes?: number;
+  /**
+   * Extracted-core tools whose core validates its own strict input: `coreShape`
+   * is advertised (JSON Schema) but NOT enforced by the SDK validator, so a bad
+   * field reaches the core, which audits the refusal and names the field.
+   */
+  shapeIsAdvisory?: boolean;
 }
 
 export interface McpInputSchemaSpec extends McpInputOverlay {
@@ -97,14 +103,18 @@ function withInputSizeBound<T extends z.ZodType>(schema: T, maxBytes?: number) {
  * only. Every other argument is left for the oRPC procedure to validate.
  */
 function buildValidator(spec: McpInputSchemaSpec): z.ZodType {
-  const shape: { -readonly [K in string]: z.core.$ZodType } = { ...spec.coreShape };
+  const shape: { -readonly [K in string]: z.core.$ZodType } =
+    spec.shapeIsAdvisory === true ? {} : { ...spec.coreShape };
   for (const [field, message] of Object.entries(spec.emptyArrayInputs ?? {})) {
     shape[field] = z.array(z.unknown()).max(0, message).optional();
   }
   for (const [field, message] of Object.entries(spec.forbiddenInputs ?? {})) {
     shape[field] = z.never(message).optional();
   }
-  if (spec.confirmation !== null) shape.confirm = z.literal(spec.confirmation);
+  // An advisory-shape tool checks its confirmation in the wrapper (which audits the refusal).
+  if (spec.confirmation !== null && spec.shapeIsAdvisory !== true) {
+    shape.confirm = z.literal(spec.confirmation);
+  }
   return withInputSizeBound(z.looseObject(shape), spec.maxInputBytes);
 }
 

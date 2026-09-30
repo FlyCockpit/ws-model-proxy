@@ -45,6 +45,7 @@ import {
   runForwarderCliSupervisedCommandStart,
 } from "./cli-command-tools.js";
 import {
+  auditFileInputRefusal,
   FILE_TOOL_NOTES,
   FILE_TOOLS,
   type FileToolName,
@@ -129,6 +130,16 @@ export interface McpToolDescriptor {
    */
   descriptionNote?: string;
   /**
+   * Called when a call to this tool is refused before its core runs (the SDK
+   * validator rejected the input, or the confirmation literal is missing), so
+   * the refusal can be audited. Metadata only: it receives the raw input and
+   * the verified user and credential, never a device it could trust.
+   */
+  auditInputRefusal?: (
+    input: unknown,
+    who: { userId: string; credential: McpRequestCredential },
+  ) => void;
+  /**
    * Deliver the core's result even if the admission signal aborts. CLI
    * command run uses this: abort ends the wait, not the command, and the
    * result must still carry `commandId`.
@@ -153,6 +164,7 @@ export function buildDescriptor(spec: McpToolSpec): McpToolDescriptor {
     isoDateFields,
     coreShape,
     maxInputBytes,
+    shapeIsAdvisory,
     ...descriptor
   } = spec;
   if (isoDateFields !== undefined && descriptor.inputAdapter !== undefined) {
@@ -169,6 +181,7 @@ export function buildDescriptor(spec: McpToolSpec): McpToolDescriptor {
       isoDateFields,
       coreShape,
       maxInputBytes,
+      shapeIsAdvisory,
     }),
   };
 }
@@ -448,6 +461,9 @@ function fileToolSpec(name: FileToolName): McpToolSpec {
       : {}),
     descriptionNote: FILE_TOOL_NOTES[name],
     coreShape: fileToolCoreShape(name),
+    // The core enforces the strict shape: refusals are audited and name the field.
+    shapeIsAdvisory: true,
+    auditInputRefusal: (input, who) => auditFileInputRefusal(op, input, who),
     ...(op === "write" ? { maxInputBytes: FILE_WRITE_INPUT_MAX_BYTES } : {}),
     invokeCore: (input, deps) => runForwarderCliFileTool(op, input, deps),
     outputProjector: projectFileToolOutput,
@@ -1309,7 +1325,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     scope: "write",
     confirmation: null,
     classification: "pure",
-    descriptionNote: `Poll commands or supervised file requests by commandId. Files return file:{op,result} or error:{code,message,outcome?}; no diff/hunks or file error detail is returned. timeout/offline or CLI io_error carries outcome unknown only after acceptance. ${CLI_COMMAND_OUTPUT_NOTICE}`,
+    descriptionNote: `Poll commands or supervised file requests by commandId. Files return file:{op,result} or error:{code,message,outcome?}; no diff/hunks or file error detail is returned. Every non-success after acceptance carries outcome unknown, including any CLI fileError code (conflict, not_found, io_error, cancelled or timeout), token inactivity and mode changes; before acceptance errors are definitive. ${CLI_COMMAND_OUTPUT_NOTICE}`,
     coreShape: { commandId: z.string(), progress: z.boolean().optional() },
     inputAdapter: adaptCliCommandResultInput,
     invokeCore: (input, deps) => runForwarderCliCommandResult(input, deps),

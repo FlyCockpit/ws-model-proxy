@@ -209,7 +209,7 @@
       "fileTools": "Herramientas de archivos: lectura {{read}}, escritura {{write}}. Siguen el modo de comandos MCP.",
       "fileToolAccess": {
         "headless": "se ejecutan sin supervisión",
-        "supervised": "requieren a una persona",
+        "supervised": "aún no disponible (requiere a una persona)",
         "off": "desactivadas"
       },
       "fileToolsAsRoot": "Este CLI permite que las herramientas de archivos MCP se ejecuten como root (allowFileToolsAsRoot está activado). Un agente podría leer o cambiar cualquier archivo de esta máquina. Desactívalo con wsmp config set-file-tools-as-root off.",

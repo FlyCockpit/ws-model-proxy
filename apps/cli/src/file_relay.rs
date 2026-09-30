@@ -420,7 +420,7 @@ fn encode_result(op_id: &str, op: &str, value: Value) -> Option<Vec<FileFrame>> 
 }
 
 /// THE settle point: every op, however it ends (result, error, refusal, bad
-/// frame, cancel, panic), is logged and turned into its wire frames here. The
+/// frame, cancel), is logged and turned into its wire frames here. The
 /// info log line carries the op, its path(s) and the outcome code, never file
 /// content and never an error message.
 ///
@@ -650,6 +650,9 @@ impl FileRelay {
         let job_summary = summary.clone();
         let job = move || -> FileResult<()> {
             let outcome =
+                // Only effective in unwinding builds (tests, dev); release builds
+                // use `panic=abort`, where a panic ends the process and the server
+                // reports the lost session's mutations as unknown.
                 std::panic::catch_unwind(AssertUnwindSafe(|| ops.execute(&job_op, args, &cancel)))
                     .unwrap_or_else(|_| {
                         Err(FileError::new(

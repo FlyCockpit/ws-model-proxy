@@ -8,6 +8,8 @@ import {
 } from "@ws-model-proxy/config/cli-agent-audit";
 import {
   type CliAgentAdmissionRejection,
+  type CliAgentAdmissionVerdict,
+  closeCliAgentAdmission,
   judgeCliAgentAdmission,
   readCliAgentAdmission,
   revokeOpenCliAgentAdmissions,
@@ -393,13 +395,22 @@ function rejectionFailure(
   reason: FileRejectReason,
   detail: FileRejectDetail | undefined,
   mutating: boolean,
+  ambiguousNotFound: boolean,
 ): FileOpFailure {
   // The CLI's own refusals are definitive (nothing was committed), with one
   // exception: after its commit point the file library can still fail (a
   // directory sync, a post-rename check) and the CLI cannot send a result that
   // is too big. For a mutation those two say nothing about whether the change
   // was made, so the outcome is unknown and the agent must file_stat first.
-  if (mutating && reason === "io_error") {
+  // Ops whose cleanup runs after the commit can also fail with `not_found`
+  // (the source vanished): for rename and delete that code is ambiguous.
+  // A `replaced` conflict on a mutation can also follow a committed exchange
+  // whose undo failed, so it is not definitive either.
+  const replacedConflict = reason === "conflict" && detail?.currentEtag === "replaced";
+  if (
+    mutating &&
+    (reason === "io_error" || replacedConflict || (ambiguousNotFound && reason === "not_found"))
+  ) {
     return cliAnswered({ ok: false, code: reason, outcome: "unknown" });
   }
   if (reason === "bad_frame") return cliAnswered({ ok: false, code: "io_error" });
@@ -476,7 +487,15 @@ function newRecord(input: {
       finishResult(record, frame, text);
     },
     markRejected(reason, detail) {
-      settle(record, rejectionFailure(reason, detail, record.mutating));
+      settle(
+        record,
+        rejectionFailure(
+          reason,
+          detail,
+          record.mutating,
+          record.op === "rename" || record.op === "delete",
+        ),
+      );
     },
     markMalformed() {
       settle(record, serverFailure(record, "io_error"));
@@ -534,30 +553,41 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
   if (input.signal?.aborted) return { ok: false, code: "cancelled" };
 
   const reads = await readCliAgentAdmission(input);
-  // Identify supervised writes even when admission refuses (token, owner,
-  // grant, live mode). Unverified devices never supply an audit kind or id.
-  if (mutating && reads.device?.userId === input.userId) {
-    const live = relaySessionManager.getLiveCliFeatures([input.cliDeviceId]).get(input.cliDeviceId);
-    if (
-      fileToolAccess(mcpCommandModeFromDb(reads.device.mcpCommandMode), "write") === "supervised" ||
-      fileToolAccess(live?.mcpCommandMode, "write") === "supervised"
-    )
-      audit.kind = "supervised_file_write";
+  let supervised = false;
+  let verdict: CliAgentAdmissionVerdict;
+  let admissionOpen = true;
+  try {
+    // Identify supervised writes even when admission refuses. Unverified
+    // devices never supply an audit kind or id.
+    if (mutating && reads.device?.userId === input.userId) {
+      const live = relaySessionManager
+        .getLiveCliFeatures([input.cliDeviceId])
+        .get(input.cliDeviceId);
+      supervised =
+        fileToolAccess(mcpCommandModeFromDb(reads.device.mcpCommandMode), "write") ===
+          "supervised" || fileToolAccess(live?.mcpCommandMode, "write") === "supervised";
+      if (supervised) audit.kind = "supervised_file_write";
+    }
+    // An abort before registration applies nothing; once a supervised id exists
+    // its caller preserves it. Never start new work for an aborted request.
+    if (input.signal?.aborted) return { ok: false, code: "cancelled" };
+    // Judge exactly once, for the selected capability. The judge owns closing
+    // from here; every earlier return or exception closes in finally.
+    admissionOpen = false;
+    verdict = judgeCliAgentAdmission(
+      reads,
+      supervised ? "supervised" : mutating ? "file_write" : "file_read",
+      supervised ? { fileWrite: true } : undefined,
+    );
+  } finally {
+    if (admissionOpen) closeCliAgentAdmission(reads);
   }
-  // An abort before registration applies nothing; once a supervised id exists
-  // its caller preserves it and no abort cancels the person's pending request.
-  // The caller may have gone while the admission read: never start new work for
-  // a request that is already aborted (a cancel after the dispatch could lose a
-  // race with a fast mutation).
-  if (input.signal?.aborted) return { ok: false, code: "cancelled" };
-  const verdict = judgeCliAgentAdmission(reads, mutating ? "file_write" : "file_read");
   // From the verdict to the dispatch nothing awaits (see `Admission`).
   // The verdict resolved the device to one of the caller's own unless it said
   // the device is unknown or the token/owner is out (checked before ownership).
   audit.deviceVerified =
     verdict.ok || (verdict.error !== "not_found" && verdict.error !== "token_inactive");
-  const supervised = mutating && !verdict.ok && verdict.error === "supervised_only";
-  if (!verdict.ok && !supervised) {
+  if (!verdict.ok) {
     return {
       ok: false,
       code: verdict.error,
@@ -596,8 +626,8 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
   }
 
   if (supervised) {
-    // Same strict frame/input path as headless; reuse admission reads so no
-    // await can interleave a revoke between the verdict and registration.
+    // Same strict frame/input path as headless; reuse the supervised verdict
+    // so no await can interleave a revoke before registration.
     const fileOp = fileSpawnSpecSchema.safeParse({ op: frame.op, args: frame.args });
     if (!fileOp.success) return invalid();
     audit.supervisedOwned = true;
@@ -612,7 +642,7 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
         ...(input.onSupervisedStart ? { onStarted: input.onSupervisedStart } : {}),
         ...(input.body !== undefined ? { body: input.body } : {}),
       },
-      reads,
+      verdict,
     );
     if (!started.ok)
       return {

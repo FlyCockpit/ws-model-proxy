@@ -2222,7 +2222,7 @@ describe("CLI file tools", () => {
     expect(edit?.description).toContain("io_error");
     expect(edit?.description).toContain("NOT idempotent");
     const commandResult = tools.find((tool) => tool.name === "forwarder_cli_command_result");
-    expect(commandResult?.description).toContain("CLI io_error");
+    expect(commandResult?.description).toContain("Every non-success after acceptance");
     expect(edit?.description).toContain('confirm: "RUN"');
     // G3: the 64 KiB request-fit rule is stated on the tools whose advertised
     // maxima can exceed it (stat's 50 paths, list/search patterns), and the
@@ -2296,6 +2296,80 @@ describe("CLI file tools", () => {
     // The boolean secretFile flag survives the generic key redactor.
     expect(payload?.secretFile).toBe(true);
     expect(resultText(result)).toContain("⟦redacted:12⟧");
+  });
+
+  it("audits and names fields for shape errors even through the real SDK transport", async () => {
+    const bad: Array<Record<string, unknown>> = [
+      { path: 42 },
+      { path: "~/a", maxLines: 5000 },
+      { path: "~/a", nested: { edits: 1 } },
+    ];
+    for (const extra of bad) {
+      fileRuntime.auditRefusedFileInput.mockClear();
+      const authInfo = buildAuthInfo(["mcp:write"]);
+      bindRequest(authInfo, "req-sdk", PAT_WITH_CLI);
+      const { body } = await callTool(authInfo, "forwarder_cli_file_read", {
+        cliDeviceId: "cli-1",
+        ...extra,
+      });
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.structuredContent?.error?.code).toBe("invalid_input");
+      expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledTimes(1);
+    }
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["forwarder_cli_file_write", "write", { path: 42, content: "private body", confirm: "RUN" }],
+    [
+      "forwarder_cli_file_edit",
+      "edit",
+      { path: "~/a", edits: [{ oldText: 42, newText: "private edit" }], confirm: "RUN" },
+    ],
+    ["forwarder_cli_file_rename", "rename", { from: 42, to: "~/b", confirm: "RUN" }],
+    ["forwarder_cli_dir_create", "mkdir", { path: "~/a", parents: "yes", confirm: "RUN" }],
+    ["forwarder_cli_file_delete", "delete", { path: 42, confirm: "DELETE" }],
+  ] as const)(
+    "audits a %s shape refusal once before any supervised start",
+    async (name, op, args) => {
+      const authInfo = buildAuthInfo(["mcp:write"]);
+      bindRequest(authInfo, "req-sdk-file-refusal", PAT_WITH_CLI);
+      const { body } = await callTool(authInfo, name, { cliDeviceId: "cli-1", ...args });
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.structuredContent?.error?.code).toBe("invalid_input");
+      expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledOnce();
+      expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledWith(
+        expect.objectContaining({ op, cliDeviceId: "" }),
+      );
+      expect(JSON.stringify(fileRuntime.auditRefusedFileInput.mock.calls)).not.toContain("private");
+      expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+    },
+  );
+
+  it("audits missing confirmation and oversized input through the real SDK transport (#104)", async () => {
+    const confirmed: Array<[string, Record<string, unknown>]> = [
+      ["forwarder_cli_file_write", { path: "~/n", content: "x" }],
+      ["forwarder_cli_file_edit", { path: "~/a", oldString: "a", newString: "b" }],
+      ["forwarder_cli_file_rename", { from: "~/a", to: "~/b" }],
+      ["forwarder_cli_file_delete", { path: "~/a" }],
+      ["forwarder_cli_dir_create", { path: "~/a" }],
+    ];
+    const cases: Array<[string, Record<string, unknown>, boolean]> = [];
+    for (const [name, args] of confirmed) {
+      cases.push([name, args, true]);
+      cases.push([name, { ...args, confirm: "NOPE" }, true]);
+    }
+    cases.push(["forwarder_cli_file_read", { path: "~/a", pad: "x".repeat(70_000) }, false]);
+    for (const [name, args, stable] of cases) {
+      fileRuntime.auditRefusedFileInput.mockClear();
+      const authInfo = buildAuthInfo(["mcp:write"]);
+      bindRequest(authInfo, "req-sdk-c", PAT_WITH_CLI);
+      const { body } = await callTool(authInfo, name, { cliDeviceId: "cli-1", ...args });
+      expect(body.result?.isError === true || body.error !== undefined).toBe(true);
+      if (stable) expect(body.result?.structuredContent?.error?.code).toBe("CONFIRMATION_REQUIRED");
+      expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledTimes(1);
+    }
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
   });
 
   it("names the failing fields of an invalid input without echoing values (#117)", async () => {
@@ -2775,6 +2849,28 @@ describe("CLI file tools", () => {
       });
     },
   );
+
+  it.each([
+    "conflict",
+    "not_found",
+    "cancelled",
+    "token_inactive",
+    "grant_disabled",
+    "feature_disabled",
+  ] as const)("preserves the unknown outcome of an accepted supervised %s", async (code) => {
+    cliRuntime.snapshotSupervisedCommand.mockReturnValueOnce({
+      kind: "supervised",
+      requestKind: "file",
+      commandId: "file-1",
+      status: "rejected",
+      started: true,
+      waitDeadline: null,
+      file: null,
+      fileError: { code, outcome: "unknown" },
+    });
+    const result = await call("forwarder_cli_command_result", { commandId: "file-1" });
+    expect(structured(result).result?.error).toMatchObject({ code, outcome: "unknown" });
+  });
 
   it.each(["success", "declined", "timeout"] as const)(
     "polls file %s through command_result with a bounded documented projection",

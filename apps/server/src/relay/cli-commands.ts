@@ -18,7 +18,10 @@ import {
   cleanText,
   TerminalByteState,
 } from "@ws-model-proxy/config/cli-command-output";
-import type { CliAgentAdmissionReads, CliAgentAdmissionRejection } from "./cli-agent-admission.js";
+import type {
+  CliAgentAdmissionRejection,
+  CliCommandAdmissionVerdict,
+} from "./cli-agent-admission.js";
 import {
   judgeCliAgentAdmission,
   readCliAgentAdmission,
@@ -711,7 +714,6 @@ function finishSupervised(
   fields: {
     rejectionReason?: string;
     fileError?: SupervisedFileFailure;
-    definitive?: boolean;
   } = {},
 ) {
   if (!isActiveSupervised(record.status)) return;
@@ -739,7 +741,7 @@ function finishSupervised(
                   : "cancelled");
     record.fileError = {
       code,
-      ...(!fields.definitive && record.acceptedAt !== null ? { outcome: "unknown" as const } : {}),
+      ...(record.acceptedAt !== null ? { outcome: "unknown" as const } : {}),
     };
   }
   auditSupervisedCommand(record, status);
@@ -920,9 +922,9 @@ function goneReason(cause: SupervisedTerminalGoneCause): string {
 function trackerFor(record: SupervisedRecord): TrackedSupervisedCommand {
   // File settle table (CLI answers never carry detail):
   // - before accepted: fileError is definitive; success is forbidden;
-  // - after accepted: io_error may follow commit, so its outcome is unknown;
-  // - other CLI fileErrors are definitive, including conflict/cancelled/timeout;
-  // - server termination after accepted is unknown;
+  // - after accepted: every non-success is unknown (apply may have committed);
+  // - fileError has only a code, so even a pre-commit conflict is indistinguishable;
+  // - server termination follows the same acceptance rule;
   // - expired credentials never deliver a file answer, even before the timer runs.
   return {
     commandId: record.commandId,
@@ -945,7 +947,6 @@ function trackerFor(record: SupervisedRecord): TrackedSupervisedCommand {
         ...(record.requestKind === "file"
           ? { fileError: { code: supervisedFileRejectionCode(reason) } }
           : {}),
-        definitive: true,
       });
     },
     onAccepted() {
@@ -1009,7 +1010,6 @@ function trackerFor(record: SupervisedRecord): TrackedSupervisedCommand {
         if (result.fileError) {
           finishSupervised(record, "rejected", {
             fileError: result.fileError,
-            definitive: record.acceptedAt === null || result.fileError.code !== "io_error",
           });
         } else if (result.fileResult && record.status === "running") {
           record.fileResult = result.fileResult;
@@ -1154,7 +1154,7 @@ export async function startSupervisedCommand(
 
 export async function startSupervisedRequest(
   input: StartSupervisedRequestInput,
-  admissionReads?: CliAgentAdmissionReads,
+  admissionVerdict?: Extract<CliCommandAdmissionVerdict, { ok: true }>,
 ): Promise<SupervisedStartResult> {
   const startedAt = new Date();
   const kind = input.kind === "file" ? "supervised_file_write" : "supervised_command";
@@ -1170,7 +1170,7 @@ export async function startSupervisedRequest(
         }
       : undefined;
   try {
-    const result = await admitSupervisedRequest(input, admissionReads, lifecycle);
+    const result = await admitSupervisedRequest(input, admissionVerdict, lifecycle);
     if (!result.ok) auditRefusal(kind, input, startedAt, "refused", result.error, file);
     return result;
   } catch (error) {
@@ -1182,7 +1182,6 @@ export async function startSupervisedRequest(
         ...(record.requestKind === "file"
           ? { fileError: { code: "io_error" as const } }
           : { rejectionReason: "internal_error" }),
-        definitive: record.acceptedAt === null,
       });
       relaySessionManager.cancelSupervised(record.cliDeviceId, record.commandId, "closed");
     } else {
@@ -1194,15 +1193,19 @@ export async function startSupervisedRequest(
 
 async function admitSupervisedRequest(
   input: StartSupervisedRequestInput,
-  admissionReads: CliAgentAdmissionReads | undefined,
+  admissionVerdict: Extract<CliCommandAdmissionVerdict, { ok: true }> | undefined,
   lifecycle: { record: SupervisedRecord | null },
 ): Promise<SupervisedStartResult> {
   // From the verdict to the dispatch nothing awaits (see `Admission`).
-  const verdict = judgeCliAgentAdmission(
-    admissionReads ?? (await readCliAgentAdmission(input)),
-    "supervised",
-    input.kind === "file" ? { fileWrite: true } : undefined,
-  );
+  // A routed file request already judged the supervised capability. Reuse its
+  // verdict without a second read or judge; registration is still synchronous.
+  const verdict =
+    admissionVerdict ??
+    judgeCliAgentAdmission(
+      await readCliAgentAdmission(input),
+      "supervised",
+      input.kind === "file" ? { fileWrite: true } : undefined,
+    );
   if (!verdict.ok) return verdict;
   const { token } = verdict;
   if (input.kind === "file" && input.fileOp.op === "edit" && input.fileOp.args.dryRun === true) {

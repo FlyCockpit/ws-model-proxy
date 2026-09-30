@@ -2,6 +2,12 @@ import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credentia
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  judgeCliAgentAdmission,
+  openCliAgentAdmissionCountForTests,
+  readCliAgentAdmission,
+  revokeOpenCliAgentAdmissions,
+} from "./cli-agent-admission.js";
+import {
   encodeRelayBinaryFrame,
   parseRelayBinaryFrame,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
@@ -474,7 +480,31 @@ describe("cli file ops", () => {
     });
   });
 
-  it("passes the library's replaced/gone conflict words through as a definitive conflict", async () => {
+  it("treats not_found on rename and delete as an unknown outcome (cleanup runs after the commit), but not on edit or read", async () => {
+    const socket = await connect();
+    const cases: Array<[Parameters<typeof runFileOp>[0]["op"], unknown, boolean]> = [
+      ["rename", { from: "~/a", to: "~/b" }, true],
+      ["delete", { path: "~/a" }, true],
+      ["edit", editArgs, false],
+      ["read", readArgs, false],
+    ];
+    for (const [op, args, unknown] of cases) {
+      const outcome = start(socket, op, args);
+      await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+      await answer(
+        socket,
+        JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason: "not_found" }),
+      );
+      await expect(outcome).resolves.toEqual({
+        ok: false,
+        code: "not_found",
+        ...(unknown ? { outcome: "unknown" } : {}),
+      });
+      socket.sends.length = 0;
+    }
+  });
+
+  it("passes `gone` through as a definitive conflict and treats `replaced` as an unknown outcome", async () => {
     const socket = await connect();
     for (const word of ["replaced", "gone"]) {
       const outcome = start(socket, "edit", editArgs);
@@ -491,7 +521,7 @@ describe("cli file ops", () => {
       await expect(outcome).resolves.toEqual({
         ok: false,
         code: "conflict",
-        detail: { currentEtag: word },
+        ...(word === "replaced" ? { outcome: "unknown" } : { detail: { currentEtag: word } }),
       });
       expect(socket.closes).toEqual([]);
       socket.sends.length = 0;
@@ -696,6 +726,22 @@ describe("cli file ops", () => {
         outcome: "refused",
         reason: "unsupported",
       });
+    });
+
+    it("audits a CLI feature_disabled answer as refused and a CLI timeout as failed", async () => {
+      const socket = await connect();
+      for (const reason of ["feature_disabled", "timeout"]) {
+        const outcome = start(socket, "read", readArgs);
+        await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+        await answer(
+          socket,
+          JSON.stringify({ type: "file.rejected", opId: lastOpId(socket), reason }),
+        );
+        await outcome;
+        socket.sends.length = 0;
+      }
+      expect(events()[0]).toMatchObject({ outcome: "refused", reason: "feature_disabled" });
+      expect(events()[1]).toMatchObject({ outcome: "failed", reason: "timeout" });
     });
 
     it("writes a metadata-only refusal row for an input the MCP layer refused", () => {
@@ -926,6 +972,48 @@ describe("cli file ops", () => {
       release({ banned: false, banExpires: null, deletionRequestedAt: null });
       await expect(started).resolves.toEqual({ ok: false, code: "token_inactive" });
       expect(socket.frames("file.op")).toEqual([]);
+    });
+
+    it("keeps the admission open until the verdict, so a revoke between the read and the verdict refuses", async () => {
+      await connect();
+      const reads = await readCliAgentAdmission({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+      });
+      // The caller resumes in a later microtask: a revoke landing now must count.
+      revokeOpenCliAgentAdmissions("token");
+      expect(judgeCliAgentAdmission(reads, "file_write")).toEqual({
+        ok: false,
+        error: "token_inactive",
+      });
+      expect(openCliAgentAdmissionCountForTests()).toBe(0);
+    });
+
+    it("leaves no admission open after a judged run, an abort during the read, or a failed read", async () => {
+      const socket = await connect();
+      const judged = start(socket, "read", readArgs);
+      await waitFor(() => expect(socket.frames("file.op").length).toBeGreaterThan(0));
+      await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+      await judged;
+      expect(openCliAgentAdmissionCountForTests()).toBe(0);
+
+      const controller = new AbortController();
+      const aborted = runFileOp({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+        op: "read",
+        args: readArgs,
+        signal: controller.signal,
+      });
+      controller.abort();
+      await expect(aborted).resolves.toEqual({ ok: false, code: "cancelled" });
+      expect(openCliAgentAdmissionCountForTests()).toBe(0);
+
+      db.cliDevice.findUnique.mockRejectedValueOnce(new Error("db down"));
+      await expect(
+        runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: readArgs }),
+      ).rejects.toThrow();
+      expect(openCliAgentAdmissionCountForTests()).toBe(0);
     });
 
     it("does not mark another token's open admission", async () => {

@@ -139,7 +139,9 @@ line capped at 8 KiB. The CLI computes and masks that diff from the real file on
 the server cannot supply or forge it. Secret-class paths remain read-only and are
 refused `secret_file`. Path policy is checked before display and again at apply, and
 the daemon rechecks the etag: a file changed between display and approval returns
-`conflict` and nothing is written. Supervised `edit.dryRun:true` returns `invalid_input`.
+`conflict` and nothing is written for that mismatch. Since this apply-time error
+arrives after acceptance with only a code, the server still reports an unknown outcome.
+Supervised `edit.dryRun:true` returns `invalid_input`.
 No headless read grant is implied by supervised approval.
 
 Poll `forwarder_cli_command_result` with the returned id. It reports the shared
@@ -154,17 +156,22 @@ Confirm waits expire after 15 minutes, using the same stop grace as commands.
 After `supervised.accepted`, apply has a 30-second deadline; on expiry the server
 sends unconditional `supervised.cancel` and reports `timeout` with `outcome:"unknown"`.
 Session loss reports `offline`; its outcome is unknown only after acceptance.
-A CLI `io_error` after acceptance also has an unknown outcome: a mutation can
-commit before a directory sync or post-commit check fails. Before acceptance,
-timeout/offline and CLI errors are definitively not applied. The daemon honors
-cancellation only before the atomic commit point. Ask the person to inspect the file
+Every non-success after acceptance has `outcome:"unknown"`, including CLI
+`conflict`, `not_found`, `io_error`, `cancelled` and `timeout`, token inactivity and
+mode changes. The CLI sends only the error code, so the server cannot distinguish
+an apply-time pinned-etag mismatch before commit from an ambiguous failure after
+commit. Before acceptance, timeout/offline and CLI errors are definitively not applied.
+The daemon honors cancellation only before the atomic commit point. Ask the person to inspect the file
 before retrying an unknown result; use file_stat only if a read grant permits it.
 The earliest expiry carried by the token row or the admitted credential ends a
 supervised file request immediately, with `token_inactive`; after acceptance its
 outcome is unknown. Results arriving at or after that expiry are not delivered.
 `listCliDevices` reports
-`fileTools: {read, write}` (`headless`, `supervised` or `off`) and `allowFileToolsAsRoot`, so
-an agent can see what works without trial calls. The CLI refuses every file tool as
+`fileTools: {read, write}` (`headless`, `supervised` or `off`) and `allowFileToolsAsRoot`.
+That summary is the mode permission only: a Windows CLI, or a root CLI without
+`allowFileToolsAsRoot`, still refuses every operation as `unsupported`.
+`supervised` writes need a person's keypress; an opt-in read grant is a later phase.
+The CLI refuses every file tool as
 `unsupported` when it runs as root unless `wsmp config set-file-tools-as-root on`.
 The CLI re-checks its own mode on every operation; a server request never overrides it.
 The protected set (wsmp's named state files `device-auth.json`, `terminal-identity.json`,
@@ -193,15 +200,18 @@ additionally removes `wsmp_` credential substrings from every returned string.
 **ETag workflow.** Read a file, then pass its `etag` as `expectedEtag` to `edit`, to `write`
 with `ifExists: "replace"`, to `rename` with `overwrite`, and to `delete`. Line-range edits
 and replaces require it. A headless stale-etag failure returns `error.code` `conflict`
-with `currentEtag`: re-read and retry. Supervised failures report only the code after
-the person's keypress. A headless `currentEtag` can also be `replaced` or `gone`
-when a file is swapped or removed mid-operation; these are conflict details,
-not error codes. `read` with `ifNoneMatch` answers `{unchanged: true, etag}`. Etags reset
-when the wsmp daemon restarts, which costs one extra `conflict`. A headless write-class call that
-fails with `timeout`, `offline` or CLI `io_error` carries `error.outcome: "unknown"`: call
-`forwarder_cli_file_stat` with `hash: true` and compare the etag before retrying.
-For a supervised unknown outcome, ask the person to inspect the file, or use
-`file_stat` only with a read grant. A retry
+with `currentEtag` (an etag, or the word `gone` when the file was removed): re-read
+and retry. Supervised failures report only the code after the person's keypress.
+`read` with `ifNoneMatch` answers `{unchanged: true, etag}`. Etags reset when the wsmp
+daemon restarts, which costs one extra `conflict`. A write-class call that fails with
+`error.outcome: "unknown"` may have changed the file, with any code: `timeout`,
+`offline`, `cancelled`, `token_inactive`, a mode change, `io_error`, `not_found` on
+rename/delete, or `conflict` when a file was swapped during the change. Headless
+`replaced` conflicts are unknown and omit `currentEtag`. For supervised requests,
+every non-success after acceptance is unknown, even a `conflict` caused by the
+pinned pre-image changing before commit, because the error frame has only a code.
+Ask the person to inspect the file, or call `forwarder_cli_file_stat` with `hash: true`
+and a read grant to compare the etag before retrying. A retry
 that carries `expectedEtag` is safe (a stale etag returns `conflict`); an exact-match edit
 without `expectedEtag` is not idempotent, so check with `file_stat` first.
 
