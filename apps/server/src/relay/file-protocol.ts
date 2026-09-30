@@ -63,6 +63,7 @@ export const FILE_ERROR_CODES = [
   "binary_file",
   "too_large",
   "conflict",
+  "uncertain_outcome",
   "match_count",
   "no_match",
   "redacted_span",
@@ -341,6 +342,15 @@ export const searchResultSchema = z
   })
   .strict();
 
+/** Absolute Unix recovery paths; bounded even when the parent is near PATH_MAX. */
+const recoveryPathSchema = z
+  .string()
+  .min(1)
+  .max(8192)
+  .startsWith("/")
+  .refine((s) => !s.includes("\0"));
+const recoveryPathsSchema = z.array(recoveryPathSchema).max(4);
+
 export const editResultSchema = z
   .object({
     etag: reportedEtagSchema,
@@ -354,6 +364,7 @@ export const editResultSchema = z
       .max(10_000)
       .optional(),
     resolvedPath: shortText.optional(),
+    recovered: recoveryPathsSchema.optional(),
   })
   .strict();
 
@@ -366,10 +377,13 @@ export const writeResultSchema = z
     removed: uintSchema.optional(),
     diff: boundedText().optional(),
     resolvedPath: shortText.optional(),
+    recovered: recoveryPathsSchema.optional(),
   })
   .strict();
 
-export const renameResultSchema = z.object({ etag: reportedEtagSchema.nullable() }).strict();
+export const renameResultSchema = z
+  .object({ etag: reportedEtagSchema.nullable(), recovered: recoveryPathsSchema.optional() })
+  .strict();
 export const mkdirResultSchema = z.object({ created: z.boolean() }).strict();
 export const deleteResultSchema = z
   .object({ deleted: z.boolean(), type: z.enum(["file", "dir", "symlink", "other"]) })
@@ -453,8 +467,24 @@ export const fileRejectDetailSchema = z
     found: uintSchema.optional(),
     lines: z.array(uintSchema).max(5).optional(),
     retryAfterMs: uintSchema.optional(),
+    recovery: recoveryPathSchema.optional(),
+    kept: recoveryPathsSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((detail, ctx) => {
+    if (detail.recovery !== undefined || detail.kept !== undefined) {
+      if (
+        detail.recovery === undefined ||
+        detail.kept === undefined ||
+        Object.keys(detail).some((key) => key !== "recovery" && key !== "kept")
+      ) {
+        ctx.addIssue({
+          code: "custom",
+          message: "Recovery detail requires only recovery and kept.",
+        });
+      }
+    }
+  });
 export type FileRejectDetail = z.infer<typeof fileRejectDetailSchema>;
 
 export const fileRejectedFrameSchema = z
@@ -464,7 +494,19 @@ export const fileRejectedFrameSchema = z
     reason: fileRejectReasonSchema,
     detail: fileRejectDetailSchema.optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((frame, ctx) => {
+    if (
+      frame.reason === "uncertain_outcome" &&
+      (frame.detail?.recovery === undefined || frame.detail.kept === undefined)
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message: "uncertain_outcome requires recovery detail.",
+        path: ["detail"],
+      });
+    }
+  });
 
 // Binary frame metadata.
 export const fileBodyMetadataSchema = z.object({ type: z.literal("file.body"), opId }).strict();
@@ -484,10 +526,20 @@ export type FileSpawnSpec = z.infer<typeof fileSpawnSpecSchema>;
 /** No read grant is implied by approval: file content stays on the CLI screen. */
 export const supervisedFileResultSchema = z.discriminatedUnion("op", [
   z
-    .object({ op: z.literal("edit"), result: editResultSchema.omit({ diff: true, hunks: true }) })
+    .object({
+      op: z.literal("edit"),
+      result: editResultSchema.omit({ diff: true, hunks: true, recovered: true }),
+    })
     .strict(),
-  z.object({ op: z.literal("write"), result: writeResultSchema.omit({ diff: true }) }).strict(),
-  z.object({ op: z.literal("rename"), result: renameResultSchema }).strict(),
+  z
+    .object({
+      op: z.literal("write"),
+      result: writeResultSchema.omit({ diff: true, recovered: true }),
+    })
+    .strict(),
+  z
+    .object({ op: z.literal("rename"), result: renameResultSchema.omit({ recovered: true }) })
+    .strict(),
   z.object({ op: z.literal("mkdir"), result: mkdirResultSchema }).strict(),
   z.object({ op: z.literal("delete"), result: deleteResultSchema }).strict(),
 ]);

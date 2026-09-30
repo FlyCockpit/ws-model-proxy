@@ -177,6 +177,7 @@ export const FILE_ERROR_MESSAGES: Readonly<Record<ToolErrorCode, string>> = {
   setuid: "Refused: the file is setuid or setgid",
   special_file: "Refused: not a regular file or directory",
   io_error: "The file operation failed",
+  uncertain_outcome: "The file outcome is uncertain; inspect recovery",
   timeout: "The file operation timed out",
   cancelled: "The file operation was cancelled",
   declined: "The person declined the file operation; nothing was applied",
@@ -372,9 +373,19 @@ const PROJECT_FIELDS: Readonly<Record<FileOp, readonly string[]>> = {
   stat: ["entries"],
   list: ["entries", "count", "more", "resolvedPath"],
   search: ["matches", "files", "count", "scannedFiles", "more"],
-  edit: ["etag", "previousEtag", "added", "removed", "applied", "diff", "hunks", "resolvedPath"],
-  write: ["etag", "size", "created", "added", "removed", "diff", "resolvedPath"],
-  rename: ["etag"],
+  edit: [
+    "etag",
+    "previousEtag",
+    "added",
+    "removed",
+    "applied",
+    "diff",
+    "hunks",
+    "resolvedPath",
+    "recovered",
+  ],
+  write: ["etag", "size", "created", "added", "removed", "diff", "resolvedPath", "recovered"],
+  rename: ["etag", "recovered"],
   mkdir: ["created"],
   delete: ["deleted", "type"],
 };
@@ -443,7 +454,7 @@ export const FILE_ETAG_NOTICE =
   "Pass expectedEtag to edit, write (ifExists replace), rename (overwrite) and delete. Line-range edits, replace and rename overwrite require it. Stale etags return conflict; supervised errors contain only code, without currentEtag or file content. Supervised edit/write results omit diff and hunks. The CLI rechecks the pre-image before applying. Etags reset when the wsmp daemon restarts: with a read grant, re-read or file_stat before editing.";
 
 export const FILE_UNKNOWN_OUTCOME_NOTICE =
-  'If a write-class call fails with error.outcome "unknown" (any code: timeout, offline, cancelled, token_inactive, a mode change, io_error, not_found on rename/delete, or conflict when the file was swapped during the change), the change may or may not have been made. For supervised requests EVERY non-success after supervised.accepted is unknown: CLI errors carry only code, so even a pre-commit conflict cannot be distinguished. Server termination after term.spawn dispatch is unknown; started is true if the server received acceptance and null otherwise, since acceptance and apply may be in flight. Undispatched admission/spawn-send failures and authoritative CLI decline/rejection/blocked done before acceptance remain definitive. Finished file results and their audit outcome are immutable to late frames. Ask the person to inspect the file, or use forwarder_cli_file_stat with hash true and a read grant to compare the etag before retrying. A retry that carries expectedEtag is safe (a stale etag returns conflict; a headless currentEtag is an etag or the word gone); an exact-match edit without expectedEtag is NOT idempotent, so check first.';
+  'If a write-class call fails with error.outcome "unknown" (any code: timeout, offline, cancelled, token_inactive, a mode change, io_error, uncertain_outcome, not_found on rename/delete, or conflict when the file was swapped during the change), the change may or may not have been made. For supervised requests EVERY non-success after supervised.accepted is unknown: CLI errors carry only code, so even a pre-commit conflict cannot be distinguished. Server termination after term.spawn dispatch is unknown; started is true if the server received acceptance and null otherwise, since acceptance and apply may be in flight. Undispatched admission/spawn-send failures and authoritative CLI decline/rejection/blocked done before acceptance remain definitive. Finished file results and their audit outcome are immutable to late frames. Ask the person to inspect the file, or use forwarder_cli_file_stat with hash true and a read grant to compare the etag before retrying. A retry that carries expectedEtag is safe (a stale etag returns conflict; a headless currentEtag is an etag or the word gone); an exact-match edit without expectedEtag is NOT idempotent, so check first. Headless uncertain_outcome includes recovery and kept absolute paths, and successful edit/write/rename results may include recovered paths. For supervised operations recovery paths stay in the daemon warning log for the person; the agent gets only the error code or a result without recovered paths. Inspect and recover retained objects with a shell before retrying. Recovery uses at most one .wsmp-recover-<10 alnum> directory beside the target and two objects per operation. File tools can read but never mutate recovery paths; retained objects are never automatically deleted.';
 
 export const FILE_LIMITS_NOTICE =
   "Limits: 120 file operations per minute per user (30 changing ones), 4 at once per CLI and 16 per user; over the limit returns error.code limit with retryAfterMs. Headless operations are never queued and time out after 30 seconds. Supervised writes share command limits (1 awaiting per CLI, 2 per user, 2 live per CLI), wait up to 15 minutes for approval, then time out 30 seconds after acceptance.";

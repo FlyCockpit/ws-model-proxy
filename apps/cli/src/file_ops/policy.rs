@@ -206,6 +206,11 @@ impl Policy {
                 "this tree holds special files and is not accessible",
             ));
         }
+        if access != Access::Read && is_recovery_path(full) {
+            return Err(FileError::denied(
+                "file recovery locations are read-only; use the shell for recovery",
+            ));
+        }
         if access != Access::Read && is_staging_name(full) {
             return Err(FileError::denied(
                 "temporary files of the file tools are not accessible",
@@ -332,6 +337,18 @@ impl Policy {
     pub fn hidden_from_walk(&self, full: &Path) -> bool {
         self.check_path(Access::Read, full).is_err()
     }
+}
+
+/// Match EVERY component with the same normalization as staging names, including
+/// case folding and trailing dots/spaces. Reads and recursive discovery stay allowed.
+fn is_recovery_path(path: &Path) -> bool {
+    super::redact::fold(&path.to_string_lossy())
+        .split('/')
+        .any(|name| {
+            name.strip_prefix(".wsmp-recover-").is_some_and(|suffix| {
+                suffix.len() == 10 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
+            })
+        })
 }
 
 /// A name that `atomic::replace` stages a replacement under
@@ -516,8 +533,6 @@ mod tests {
         }
     }
 
-    /// A relative selector whose parents do not exist yet still gets an absolute
-    /// alias (the operation paths are absolute).
     /// The pre-display (lexical) check must not match physical aliases that were
     /// resolved from disk: a physical spelling of a protected path is judged on
     /// the blocked screen (`check_path`), the configured spelling stays immediate.
@@ -554,6 +569,8 @@ mod tests {
         assert!(policy.check_path(Access::Remove, &physical_dir).is_err());
     }
 
+    /// A relative selector whose parents do not exist yet still gets an absolute
+    /// alias (the operation paths are absolute).
     #[test]
     fn relative_missing_protected_path_gets_an_absolute_alias() {
         let rel = PathBuf::from("wsmp-nonexistent-state-dir/deeper/device-auth.json");

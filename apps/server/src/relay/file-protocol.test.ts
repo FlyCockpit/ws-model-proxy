@@ -6,6 +6,8 @@ import {
   FILE_WIRE_REASONS,
   fileCancelFrameSchema,
   fileOpFrameSchema,
+  fileOpResultSchema,
+  fileRejectDetailSchema,
   fileRejectedFrameSchema,
   fileSpawnSpecSchema,
   supervisedFileRejectReasonSchema,
@@ -207,12 +209,16 @@ describe("relay 2.8 file frames: CLI to server", () => {
       "feature_disabled",
     ]);
     for (const reason of [...FILE_ERROR_CODES, ...FILE_WIRE_REASONS]) {
-      expect(
-        parseRelayClientControlFrame(
-          JSON.stringify({ type: "file.rejected", opId: OP_ID, reason }),
-        ),
-        reason,
-      ).toEqual({ type: "file.rejected", opId: OP_ID, reason });
+      // `uncertain_outcome` is only valid with its recovery facts (pinned below)
+      const detail =
+        reason === "uncertain_outcome"
+          ? {
+              recovery: "/w/.wsmp-recover-a1b2c3d4e5",
+              kept: ["/w/.wsmp-recover-a1b2c3d4e5/slot-1"],
+            }
+          : undefined;
+      const frame = { type: "file.rejected", opId: OP_ID, reason, ...(detail ? { detail } : {}) };
+      expect(parseRelayClientControlFrame(JSON.stringify(frame)), reason).toEqual(frame);
     }
     for (const reason of ["explode", "grantDisabled", "feature_disabled ", "GRANT_DISABLED"]) {
       expect(
@@ -444,6 +450,16 @@ describe("relay 2.8 supervised-file strict schema", () => {
           ...done,
           fileResult: { ...fileResult, result: { ...fileResult.result, extra: "forged" } },
         },
+        {
+          ...done,
+          fileResult: {
+            ...fileResult,
+            result: {
+              ...fileResult.result,
+              recovered: ["/workspace/.wsmp-recover-a1b2c3d4e5/slot-1"],
+            },
+          },
+        },
         { ...done, review: true },
         { ...done, exitCode: 0 },
         { ...done, signal: "TERM" },
@@ -521,10 +537,53 @@ describe("supervised file pre-display rejection contract", () => {
     "setuid",
     "timeout",
     "cancelled",
+    "uncertain_outcome",
     "future_internal_error",
   ])("rejects %s without widening the schema", (code) => {
     expect(supervisedFileRejectReasonSchema.safeParse(code).success).toBe(false);
   });
+});
+
+describe("file compensation recovery contract", () => {
+  const recovery = "/workspace/.wsmp-recover-a1b2c3d4e5";
+  const detail = { recovery, kept: [`${recovery}/slot-1`] };
+
+  it("accepts uncertain_outcome with bounded, absolute recovery facts", () => {
+    const frame = { type: "file.rejected", opId: OP_ID, reason: "uncertain_outcome", detail };
+    expect(fileRejectedFrameSchema.parse(frame)).toEqual(frame);
+    expect(parseRelayClientControlFrame(JSON.stringify(frame))).toEqual(frame);
+    for (const bad of [
+      { ...detail, extra: true },
+      { ...detail, recovery: "relative" },
+      { ...detail, recovery: `/${"x".repeat(8192)}` },
+      { ...detail, kept: ["relative"] },
+      { ...detail, kept: ["/x\0y"] },
+      { ...detail, kept: Array(5).fill("/x") },
+      { recovery },
+      { kept: [] },
+    ])
+      expect(fileRejectDetailSchema.safeParse(bad).success).toBe(false);
+    expect(fileRejectedFrameSchema.safeParse({ ...frame, detail: undefined }).success).toBe(false);
+  });
+
+  it.each(["edit", "write", "rename"])(
+    "accepts recovered on %s and rejects unbounded/relative paths",
+    (op) => {
+      const frame = vector(`file-result-${op}`) as { result: Record<string, unknown> };
+      const result = { ...frame.result, recovered: detail.kept };
+      expect(fileOpResultSchema.parse({ op, result })).toEqual({ op, result });
+      for (const recovered of [
+        ["relative"],
+        ["/x\0y"],
+        Array(5).fill("/x"),
+        [`/${"x".repeat(8192)}`],
+      ]) {
+        expect(fileOpResultSchema.safeParse({ op, result: { ...result, recovered } }).success).toBe(
+          false,
+        );
+      }
+    },
+  );
 });
 
 describe("file permission frame inputs", () => {

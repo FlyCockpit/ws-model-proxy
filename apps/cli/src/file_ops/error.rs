@@ -20,6 +20,7 @@ pub enum ErrorCode {
     BinaryFile,
     TooLarge,
     Conflict,
+    UncertainOutcome,
     MatchCount,
     NoMatch,
     RedactedSpan,
@@ -47,6 +48,7 @@ impl ErrorCode {
             Self::BinaryFile => "binary_file",
             Self::TooLarge => "too_large",
             Self::Conflict => "conflict",
+            Self::UncertainOutcome => "uncertain_outcome",
             Self::MatchCount => "match_count",
             Self::NoMatch => "no_match",
             Self::RedactedSpan => "redacted_span",
@@ -174,6 +176,7 @@ mod tests {
             ErrorCode::BinaryFile,
             ErrorCode::TooLarge,
             ErrorCode::Conflict,
+            ErrorCode::UncertainOutcome,
             ErrorCode::MatchCount,
             ErrorCode::NoMatch,
             ErrorCode::RedactedSpan,
@@ -191,6 +194,15 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), code.as_str());
         }
+    }
+
+    #[test]
+    fn uncertain_outcome_spelling_is_pinned() {
+        assert_eq!(ErrorCode::UncertainOutcome.as_str(), "uncertain_outcome");
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::UncertainOutcome).unwrap(),
+            "\"uncertain_outcome\""
+        );
     }
 
     #[test]

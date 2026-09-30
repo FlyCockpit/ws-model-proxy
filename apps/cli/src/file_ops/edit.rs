@@ -62,6 +62,8 @@ pub struct EditArgs {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EditResult {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recovered: Vec<String>,
     /// The new etag (the previous one for a dry run or an unchanged file).
     pub etag: String,
     pub previous_etag: String,
@@ -341,6 +343,7 @@ fn edit_validated(
                 diff,
                 hunks,
                 resolved_path: echo,
+                recovered: Vec::new(),
             },
             updated.as_str().len(),
         ));
@@ -356,18 +359,20 @@ fn edit_validated(
                 diff,
                 hunks,
                 resolved_path: echo,
+                recovered: Vec::new(),
             },
             updated.as_str().len(),
         ));
     }
 
     cancel.check()?;
-    let new_stat = match pin {
+    let (new_stat, recovered) = match pin {
         Some(pin) => atomic::replace_supervised(
             ops,
             &resolved.dir,
             &resolved.name,
-            &mut file,
+            &resolved.dir_path,
+            file,
             &stat,
             &previous_etag,
             updated_text.as_bytes(),
@@ -378,7 +383,8 @@ fn edit_validated(
             ops,
             &resolved.dir,
             &resolved.name,
-            &mut file,
+            &resolved.dir_path,
+            file,
             &stat,
             &previous_etag,
             updated_text.as_bytes(),
@@ -395,6 +401,7 @@ fn edit_validated(
             diff,
             hunks,
             resolved_path: echo,
+            recovered,
         },
         updated.as_str().len(),
     ))

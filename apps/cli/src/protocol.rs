@@ -102,6 +102,7 @@ pub enum FileErrorCode {
     BinaryFile,
     TooLarge,
     Conflict,
+    UncertainOutcome,
     MatchCount,
     NoMatch,
     RedactedSpan,
@@ -129,6 +130,7 @@ impl FileErrorCode {
             Self::BinaryFile => "binary_file",
             Self::TooLarge => "too_large",
             Self::Conflict => "conflict",
+            Self::UncertainOutcome => "uncertain_outcome",
             Self::MatchCount => "match_count",
             Self::NoMatch => "no_match",
             Self::RedactedSpan => "redacted_span",
@@ -156,6 +158,7 @@ impl FileErrorCode {
             "binary_file" => Self::BinaryFile,
             "too_large" => Self::TooLarge,
             "conflict" => Self::Conflict,
+            "uncertain_outcome" => Self::UncertainOutcome,
             "match_count" => Self::MatchCount,
             "no_match" => Self::NoMatch,
             "redacted_span" => Self::RedactedSpan,
@@ -188,6 +191,7 @@ impl From<crate::file_ops::ErrorCode> for FileErrorCode {
             Source::BinaryFile => Self::BinaryFile,
             Source::TooLarge => Self::TooLarge,
             Source::Conflict => Self::Conflict,
+            Source::UncertainOutcome => Self::UncertainOutcome,
             Source::MatchCount => Self::MatchCount,
             Source::NoMatch => Self::NoMatch,
             Source::RedactedSpan => Self::RedactedSpan,
@@ -241,11 +245,12 @@ impl SupervisedFileOutcome {
         };
         // The only wire-enforcement point for the supervised no-read rule.
         // A future library result must not leak a diff through this frame.
-        if matches!(op, FileMutationOp::Edit | FileMutationOp::Write)
-            && let Some(object) = result.as_object_mut()
-        {
-            object.remove("diff");
-            object.remove("hunks");
+        if let Some(object) = result.as_object_mut() {
+            object.remove("recovered");
+            if matches!(op, FileMutationOp::Edit | FileMutationOp::Write) {
+                object.remove("diff");
+                object.remove("hunks");
+            }
         }
         Self::Result {
             file_result: FileOpResult { op, result },
@@ -3761,16 +3766,32 @@ mod relay_28_vectors {
             assert_eq!(encoded(&message), frame, "{name}");
         }
 
-        let frame = vector("file-supervised-done-error");
-        let message = ClientControlMessage::SupervisedDone {
-            command_id: str_field(&frame, "commandId"),
-            exit_code: None,
-            signal: None,
-            review: false,
-            output_bytes: None,
-            file: SupervisedFileOutcome::error(FileErrorCode::Conflict),
-        };
-        assert_eq!(encoded(&message), frame);
+        for (name, code) in [
+            ("file-supervised-done-error", FileErrorCode::Conflict),
+            (
+                "file-supervised-done-uncertain",
+                FileErrorCode::UncertainOutcome,
+            ),
+        ] {
+            let frame = vector(name);
+            let message = ClientControlMessage::SupervisedDone {
+                command_id: str_field(&frame, "commandId"),
+                exit_code: None,
+                signal: None,
+                review: false,
+                output_bytes: None,
+                file: SupervisedFileOutcome::error(code),
+            };
+            assert_eq!(encoded(&message), frame);
+            assert_eq!(FileErrorCode::from_wire_code(code.as_str()), Some(code));
+            #[cfg(unix)]
+            if code == FileErrorCode::UncertainOutcome {
+                assert_eq!(
+                    FileErrorCode::from(crate::file_ops::ErrorCode::UncertainOutcome),
+                    code
+                );
+            }
+        }
 
         let frame = vector("file-supervised-done-neither");
         let message = ClientControlMessage::SupervisedDone {
@@ -3801,10 +3822,13 @@ mod relay_28_vectors {
     }
 
     #[test]
-    fn supervised_file_result_never_serializes_diff_or_hunks() {
-        for op in ["edit", "write"] {
-            let payload =
-                serde_json::json!({"etag":"h:fixture", "diff":"must stay local", "hunks":[[1, 3]]});
+    fn supervised_file_result_never_serializes_diff_hunks_or_recovery_paths() {
+        for op in ["edit", "write", "rename"] {
+            let mut payload = serde_json::json!({"etag":"h:fixture", "recovered":["/workspace/.wsmp-recover-a1b2c3d4e5/slot-1"]});
+            if op != "rename" {
+                payload["diff"] = Value::String("must stay local".to_owned());
+                payload["hunks"] = serde_json::json!([[1, 3]]);
+            }
             let file = SupervisedFileOutcome::result(op.to_owned(), payload);
             let encoded = serde_json::to_value(file).expect("serialize outcome");
             assert_eq!(encoded["fileResult"]["op"], op);

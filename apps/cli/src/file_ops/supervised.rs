@@ -1301,3 +1301,39 @@ pub fn preview_supervised_child(
     );
     ops.preview_supervised(op, args, body, preview_key, &Cancel::new())
 }
+
+#[cfg(test)]
+mod argument_size_tests {
+    use super::*;
+
+    #[test]
+    fn child_args_accept_exact_cap_and_refuse_one_more_byte() {
+        // Empty string JSON is two bytes; exercise serialized size, not characters.
+        for (bytes, allowed) in [
+            (MAX_CHILD_ARGS_BYTES, true),
+            (MAX_CHILD_ARGS_BYTES + 1, false),
+        ] {
+            let args = Value::String("x".repeat(bytes - 2));
+            assert_eq!(serde_json::to_vec(&args).unwrap().len(), bytes);
+            let result = check_args_size(&args);
+            if allowed {
+                result.expect("the exact cap is allowed");
+            } else {
+                assert_eq!(result.unwrap_err().code, ErrorCode::TooLarge);
+            }
+        }
+    }
+
+    #[test]
+    fn child_args_cap_reserves_linux_exec_name_equals_and_terminator() {
+        assert_eq!(MAX_CHILD_ARGS_BYTES, 128 * 1024 - 256);
+        assert!(include_str!("../sessions/supervised_pty.rs").contains(
+            "pub(crate) const SUPERVISED_ENV_FILE_ARGS: &str = \"WSMP_SUPERVISED_FILE_ARGS\";"
+        ));
+        let full_string = "WSMP_SUPERVISED_FILE_ARGS".len() + 1 + MAX_CHILD_ARGS_BYTES + 1;
+        assert!(
+            full_string < 131_072,
+            "exec string occupies {full_string} bytes"
+        );
+    }
+}

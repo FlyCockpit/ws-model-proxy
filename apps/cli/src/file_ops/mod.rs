@@ -28,7 +28,6 @@ pub(crate) mod diff;
 pub mod edit;
 pub mod error;
 pub mod etag;
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod exchange;
 pub(crate) mod fmt;
 pub(crate) mod glob;
@@ -37,6 +36,7 @@ pub mod mutate;
 pub mod policy;
 pub mod pool;
 pub mod read;
+mod recovery;
 pub mod redact;
 pub(crate) mod resolve;
 pub mod search;
@@ -107,6 +107,14 @@ pub enum Step {
     EtagRechecked,
     SupervisedSnapshotRead,
     SupervisedPreviewRead,
+    Vacated,
+    Exchanged,
+    Captured,
+    Restored,
+    Disposing,
+    Created,
+    Linked,
+    Moved,
     Renamed,
     BeforeDirSync,
     DirSynced,
