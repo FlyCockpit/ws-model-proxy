@@ -26,6 +26,8 @@ pub(crate) mod diff;
 pub mod edit;
 pub mod error;
 pub mod etag;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod exchange;
 pub(crate) mod fmt;
 pub(crate) mod glob;
 pub mod list;

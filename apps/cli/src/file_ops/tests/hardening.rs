@@ -128,8 +128,8 @@ fn rename_without_overwrite_never_replaces_a_destination_created_after_the_check
     assert_eq!(fx.get("src.txt"), "mine");
 }
 
-// Linux only: elsewhere an overwrite has no atomic exchange here (documented residual).
-#[cfg(target_os = "linux")]
+// Linux and macOS use atomic exchange to preserve an unchecked destination.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn rename_overwrite_never_replaces_a_destination_swapped_after_the_etag_check() {
     let root = Arc::new(std::sync::Mutex::new(std::path::PathBuf::new()));
@@ -1332,8 +1332,8 @@ fn another_tool_call_cannot_replace_a_staged_file() {
 
 // ---- an atomic replace never overwrites a successor inserted after the last check -----
 
-// Linux only: elsewhere the commit is a plain rename (documented residual in `commit_stage`).
-#[cfg(target_os = "linux")]
+// Linux and macOS use atomic exchange to restore a successor and clean up the stage.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_successor_inserted_before_the_commit_is_preserved_and_the_edit_conflicts() {
     let root = Arc::new(std::sync::Mutex::new(std::path::PathBuf::new()));
@@ -1429,5 +1429,123 @@ fn staging_names_are_refused_under_every_folded_spelling() {
             &fx.cancel,
         );
         assert_eq!(code(r), ErrorCode::PathDenied, "{staged:?}");
+    }
+}
+
+// ---- the callers of the exchange treat each errno class as documented ---------------
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod exchange_callers {
+    use super::*;
+    use crate::file_ops::exchange::INJECTED;
+    use nix::errno::Errno;
+
+    fn inject(errno: Errno) {
+        INJECTED.with(|slot| slot.set(Some(errno)));
+    }
+
+    fn edit(fx: &Fx) -> FileResult<super::super::super::edit::EditResult> {
+        fx.ops.edit(
+            &args(json!({ "path": fx.p("doc.txt"), "edits": [{ "oldText": "original", "newText": "edited" }] })),
+            &fx.cancel,
+        )
+    }
+
+    fn overwrite(fx: &Fx) -> FileResult<super::super::super::mutate::RenameResult> {
+        fx.put("src.txt", "mine");
+        fx.put("dst.txt", "old");
+        let etag = fx.etag("dst.txt");
+        rename(
+            fx,
+            json!({ "from": fx.p("src.txt"), "to": fx.p("dst.txt"), "overwrite": true, "expectedEtag": etag }),
+        )
+    }
+
+    #[test]
+    fn a_replace_falls_back_to_the_checked_rename_only_for_unsupported_errors() {
+        for errno in [Errno::EINVAL, Errno::ENOSYS] {
+            let fx = Fx::new();
+            fx.put("doc.txt", "original\n");
+            inject(errno);
+            edit(&fx).unwrap_or_else(|e| panic!("{errno}: {e:?}"));
+            assert_eq!(fx.get("doc.txt"), "edited\n", "{errno}");
+            assert!(fx.leftovers("").is_empty(), "{errno}");
+        }
+        for errno in [Errno::EPERM, Errno::EXDEV, Errno::EIO] {
+            let fx = Fx::new();
+            fx.put("doc.txt", "original\n");
+            inject(errno);
+            assert!(
+                edit(&fx).is_err(),
+                "{errno} must not fall back to a plain rename"
+            );
+            assert_eq!(fx.get("doc.txt"), "original\n", "{errno}");
+            assert!(fx.leftovers("").is_empty(), "{errno}");
+        }
+    }
+
+    #[test]
+    fn a_replace_reports_a_file_deleted_before_the_commit_as_gone() {
+        let fx = Fx::new();
+        fx.put("doc.txt", "original\n");
+        inject(Errno::ENOENT);
+        let error = edit(&fx).expect_err("the exchange found nothing to replace");
+        assert_eq!(error.code, ErrorCode::Conflict);
+        assert!(fx.leftovers("").is_empty());
+    }
+
+    #[test]
+    fn an_overwrite_onto_another_name_of_the_same_file_refuses_and_keeps_it() {
+        let fx = Fx::new();
+        fx.put("src.txt", "mine");
+        std::fs::hard_link(fx.root.join("src.txt"), fx.root.join("dst.txt")).unwrap();
+        let etag = fx.etag("dst.txt");
+        let r = rename(
+            &fx,
+            json!({ "from": fx.p("src.txt"), "to": fx.p("dst.txt"), "overwrite": true, "expectedEtag": etag }),
+        );
+        assert_eq!(code(r), ErrorCode::InvalidInput);
+        assert_eq!(fx.get("src.txt"), "mine");
+        assert_eq!(fx.get("dst.txt"), "mine");
+    }
+
+    // A case-only overwrite rename on a case-insensitive volume (macOS default)
+    // names the same file twice: it is refused and the file stays.
+    #[test]
+    fn a_case_only_overwrite_rename_never_deletes_the_file() {
+        let fx = Fx::new();
+        fx.put("Foo.txt", "mine");
+        if !fx.root.join("foo.txt").exists() {
+            // case-sensitive volume: two distinct names, nothing to check (macOS
+            // runners use the case-insensitive default, so there this must not skip)
+            #[cfg(target_os = "macos")]
+            panic!("the macOS test volume is expected to be case-insensitive");
+            #[cfg(not(target_os = "macos"))]
+            return;
+        }
+        let etag = fx.etag("Foo.txt");
+        let r = rename(
+            &fx,
+            json!({ "from": fx.p("Foo.txt"), "to": fx.p("foo.txt"), "overwrite": true, "expectedEtag": etag }),
+        );
+        assert_eq!(code(r), ErrorCode::InvalidInput);
+        assert_eq!(fx.get("foo.txt"), "mine");
+    }
+
+    #[test]
+    fn an_overwrite_maps_unsupported_errors_to_unsupported_and_others_to_their_own_error() {
+        for errno in [Errno::EINVAL, Errno::ENOSYS] {
+            let fx = Fx::new();
+            inject(errno);
+            assert_eq!(code(overwrite(&fx)), ErrorCode::Unsupported, "{errno}");
+            assert_eq!(fx.get("dst.txt"), "old", "{errno}");
+            assert_eq!(fx.get("src.txt"), "mine", "{errno}");
+        }
+        for errno in [Errno::EPERM, Errno::EXDEV, Errno::EIO] {
+            let fx = Fx::new();
+            inject(errno);
+            assert_eq!(code(overwrite(&fx)), ErrorCode::IoError, "{errno}");
+            assert_eq!(fx.get("dst.txt"), "old", "{errno}");
+        }
     }
 }
