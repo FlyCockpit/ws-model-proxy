@@ -813,15 +813,17 @@ impl LineMasker {
             self.long_run = true;
         }
         // 3. register what this line opened or closed
-        match opened {
-            Construct::None => {}
-            Construct::UntilBlank => self.until_blank = Some(at),
-            Construct::Block { line_indent } => {
-                self.blocks.retain(|block| block.indent != line_indent);
-                self.blocks.push(OpenBlock {
-                    indent: line_indent,
-                    opener: at,
-                });
+        for construct in opened {
+            match construct {
+                Construct::None => {}
+                Construct::UntilBlank => self.until_blank = Some(at),
+                Construct::Block { line_indent } => {
+                    self.blocks.retain(|block| block.indent != line_indent);
+                    self.blocks.push(OpenBlock {
+                        indent: line_indent,
+                        opener: at,
+                    });
+                }
             }
         }
         // PEM content stays opaque even when its body happens to contain a name.
@@ -846,9 +848,10 @@ impl LineMasker {
     }
 
     /// The class and generic rules over `line` (ranges relative to `line`).
-    fn scan_body(&mut self, line: &str) -> (Vec<LineMask>, Construct) {
+    fn scan_body(&mut self, line: &str) -> (Vec<LineMask>, Vec<Construct>) {
         let mut masks: Vec<LineMask> = Vec::new();
-        let mut construct = Construct::None;
+        // every recognizer that fires contributes its opener: none replaces another
+        let mut constructs: Vec<Construct> = Vec::new();
         let mut generic = true;
         match self.class {
             FileClass::SshPrivateKey => {
@@ -876,16 +879,20 @@ impl LineMasker {
                     generic = true;
                 } else if let Some(m) = DOTENV_ASSIGN.find(line) {
                     masks.extend(tail_mask(line, m.end()));
-                    construct = construct_for_tail(
+                    constructs.push(construct_for_tail(
                         &line[m.end()..],
                         false,
                         indent_of(line),
                         quote_left_open(line),
-                    );
+                    ));
                 } else {
                     masks.push((0..line.len(), token_bare()));
-                    construct =
-                        construct_for_tail(line, false, indent_of(line), quote_left_open(line));
+                    constructs.push(construct_for_tail(
+                        line,
+                        false,
+                        indent_of(line),
+                        quote_left_open(line),
+                    ));
                 }
             }
         }
@@ -894,14 +901,14 @@ impl LineMasker {
                 && let Some((range, opened)) = continuation_value(line)
             {
                 masks.extend(tail_mask(line, range.start));
-                construct = opened;
+                constructs.push(opened);
             }
             if let Some(name) = first_secret_name(line) {
-                construct = construct_after_name(line, name.end);
-                if construct == Construct::None && self.pending_token_line {
+                constructs.push(construct_after_name(line, name.end));
+                if self.pending_token_line {
                     // this is also the value's line after a token line (`value: | # API_KEY
-                    // is injected`): its own multi-line opener must not be lost to the token
-                    construct = value_line_construct(line);
+                    // is injected`): its own multi-line opener is kept next to the token's
+                    constructs.push(value_line_construct(line));
                 }
                 // the marker never copies text of the line (a word that looks like a
                 // secret name can itself be the secret value: `--password admin_password`)
@@ -910,14 +917,14 @@ impl LineMasker {
             } else {
                 if let Some((start, opened)) = first_flag(line) {
                     masks.extend(tail_mask(line, start));
-                    construct = opened;
+                    constructs.push(opened);
                 }
                 if self.pending_token_line && !line.trim().is_empty() {
                     masks = vec![(0..line.len(), format!("{MASK_OPEN} line{MASK_CLOSE}"))];
                     // the line after a token line is the value's line (`value: |` after
                     // `name: API_KEY`): a multi-line value that it opens goes on to a
                     // structural end (blank line, dedent), like a value on the token line
-                    construct = value_line_construct(line);
+                    constructs.push(value_line_construct(line));
                 }
                 self.pending_token_line = false;
             }
@@ -925,7 +932,7 @@ impl LineMasker {
             self.pending_token_line = false;
         }
         self.pending_flag_value = line.contains('-') && FLAG_AT_END.is_match(line);
-        (masks, construct)
+        (masks, constructs)
     }
 
     /// `line` with its secrets replaced; borrowed when nothing was masked.
@@ -1221,6 +1228,29 @@ mod tests {
         )
         .text;
         assert!(!dotenv.contains("admin_password"), "{dotenv:?}");
+    }
+
+    /// Every recognizer that fires on a line contributes its opener (none replaces
+    /// another): a value header whose comment holds an apostrophe AND a token word,
+    /// and a flag's block-scalar item with a token comment.
+    #[test]
+    fn openers_from_several_recognizers_on_one_line_are_all_kept() {
+        for (sample, input, hidden) in [
+            (
+                "apostrophe comment with a token word, blank line inside the block",
+                "env:\n  - name: API_KEY\n    value: | # the API_KEY's value\n      line-one\n\n      probe-line-two\nnext: 1\n",
+                "probe-line-two",
+            ),
+            (
+                "flag block item with a token comment",
+                "args:\n  - --api-key\n  - >- # API_KEY from vault\n    line-one\n    probe-line-two\nnext: 1\n",
+                "probe-line-two",
+            ),
+        ] {
+            let view = mask(FileClass::Plain, input).text;
+            assert!(!view.contains(hidden), "{sample}: {view:?}");
+            assert!(view.contains("next: 1"), "{sample}: {view:?}");
+        }
     }
 
     #[test]
