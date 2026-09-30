@@ -76,6 +76,8 @@ pub struct FileRuntime {
     /// pool joins its workers, which a worker cannot do to itself).
     ops: Arc<FileOps>,
     pool: FilePool,
+    #[cfg(test)]
+    apply_submissions: std::sync::atomic::AtomicUsize,
 }
 
 impl FileRuntime {
@@ -83,6 +85,8 @@ impl FileRuntime {
         Self {
             ops: Arc::new(ops),
             pool: FilePool::new(),
+            #[cfg(test)]
+            apply_submissions: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -91,7 +95,15 @@ impl FileRuntime {
         Self {
             ops: Arc::new(ops),
             pool,
+            #[cfg(test)]
+            apply_submissions: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_submissions(&self) -> usize {
+        self.apply_submissions
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn policy(&self) -> &Policy {
@@ -143,6 +155,9 @@ impl FileRuntime {
     where
         F: FnOnce(FileResult<Value>) + Send + 'static,
     {
+        #[cfg(test)]
+        self.apply_submissions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let ops = Arc::clone(&self.ops);
         let job = move || -> FileResult<()> {
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {

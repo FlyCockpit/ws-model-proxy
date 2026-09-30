@@ -238,3 +238,62 @@ fn mismatched_preview_token_becomes_blocked_before_diff_is_drawn() {
     child.child.wait().expect("mismatch child exits");
     assert_eq!(std::fs::read(&target).expect("read target"), b"old\n");
 }
+
+#[test]
+fn gap_real_child_decline_keys_apply_nothing_for_all_five_operations() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for op in ["edit", "write", "rename", "mkdir", "delete"] {
+        for key in [b'q', 3, 4] {
+            let dir = tempfile::tempdir().unwrap();
+            let source = dir.path().join("source");
+            let destination = dir.path().join("destination");
+            std::fs::write(&source, b"old\n").unwrap();
+            let (args, body) = match op {
+                "edit" => (
+                    json!({"path":source,"edits":[{"oldText":"old","newText":"new"}]}),
+                    None,
+                ),
+                "write" => (json!({"path":destination}), Some(b"new\n".to_vec())),
+                "rename" => (json!({"from":source,"to":destination}), None),
+                "mkdir" => (json!({"path":destination,"parents":false}), None),
+                _ => (json!({"path":source}), None),
+            };
+            let input = prepare(dir.path(), op, args, body.clone());
+            assert_eq!(input.blocked, None, "{op}");
+            let body_dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(body_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let body_path = body.map(|bytes| {
+                let path = body_dir.path().join("body");
+                std::fs::write(&path, bytes).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                path
+            });
+            let mut child = PtyChild::spawn(&input, body_path.as_deref());
+            assert!(child.wait_for(&PtyChild::marker("ready")), "{op} key={key}");
+            child.send(&[key]);
+            assert!(child.wait_for(b"Declined."), "{op} key={key}");
+            child.child.wait().expect("declined child exits");
+            assert!(
+                !child
+                    .seen
+                    .windows(PtyChild::marker("accepted").len())
+                    .any(|part| part == PtyChild::marker("accepted")),
+                "{op} key={key}"
+            );
+            assert_eq!(std::fs::read(&source).unwrap(), b"old\n");
+            assert!(!destination.exists(), "{op} key={key}");
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                1,
+                "temporary file leaked"
+            );
+            assert_eq!(
+                std::fs::read_dir(body_dir.path()).unwrap().count(),
+                0,
+                "private body leaked"
+            );
+        }
+    }
+}

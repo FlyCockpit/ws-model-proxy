@@ -12,7 +12,7 @@ use super::read::{current_etag, load_all};
 use super::redact::{self, MASK_OPEN};
 use super::resolve::{Kind, ResolveOpts, resolve};
 use super::text;
-use super::{Cancel, FileOps, check_reason};
+use super::{Cancel, FileOps, Step, check_reason};
 
 /// One MCP request body / relay chunk.
 pub const MAX_WRITE_BYTES: usize = 1024 * 1024;
@@ -202,7 +202,9 @@ fn write_resolved(
     let full = resolved.full_path();
     let _lock = ops.lock_path(full.clone(), cancel)?;
     if let Some(pin) = pin {
+        ops.step(Step::SupervisedBeforePin)?;
         pin.verify(ops, resolved, Access::Write)?;
+        ops.step(Step::SupervisedPinVerified)?;
     }
     let echo = resolved.echo(&args.path);
     let existing = resolved.lstat()?;
@@ -214,6 +216,10 @@ fn write_resolved(
                 ErrorCode::NotFound,
                 "nothing to replace: the file does not exist",
             ));
+        }
+        ops.step(Step::EtagRechecked)?;
+        if let Some(pin) = pin {
+            pin.verify(ops, resolved, Access::Write)?;
         }
         cancel.check()?;
         atomic::create_new(
@@ -247,10 +253,13 @@ fn write_resolved(
             "path is not a regular file",
         ));
     }
-    let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
-    if let Some(pin) = pin {
-        pin.verify_opened(&stat)?;
+    if pin.is_some() {
+        ops.step(Step::SupervisedBeforeOpen)?;
     }
+    let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
+    // The atomic recheck binds this fd to the named object, and verify_at
+    // binds that object to the preview. No early return can report success
+    // before those checks on the replace path.
     let previous_etag = current_etag(ops, &mut file, &stat)?;
     if args.expected_etag.as_deref() != Some(previous_etag.as_str()) {
         return Err(FileError::conflict(&previous_etag));

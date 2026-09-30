@@ -26,6 +26,6 @@ mod unix;
 pub(crate) use unix::{ConfirmAction, ConfirmOutcome, interact};
 #[cfg(all(unix, test))]
 pub(crate) use unix::{
-    Key, KeyReader, RawMode, TokenMatcher, UNKNOWN_SIZE, Wake, confirm_raw_mode,
+    Key, KeyReader, RawMode, TokenMatcher, UNKNOWN_SIZE, Wake, confirm_raw_mode, panic_tests_lock,
     restore_terminal_on_panic, scrolled, wait_for_input_or_resize,
 };

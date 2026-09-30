@@ -173,6 +173,16 @@ mod tracked {
     #[must_use = "the cleanup is unregistered when this guard drops"]
     pub struct ExitCleanup(u64);
 
+    #[cfg(all(test, unix))]
+    impl ExitCleanup {
+        pub(crate) fn run_registered(&self) {
+            let cleanups = CLEANUPS.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(cleanup) = cleanups.get(&self.0) {
+                cleanup();
+            }
+        }
+    }
+
     impl Drop for ExitCleanup {
         fn drop(&mut self) {
             CLEANUPS

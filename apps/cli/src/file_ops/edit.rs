@@ -20,7 +20,7 @@ use super::read::{binary_error, load_all};
 use super::redact::{self, MASK_OPEN, MaskedView};
 use super::resolve::{ResolveOpts, resolve};
 use super::text::{self, Eol};
-use super::{Cancel, FileOps, check_reason};
+use super::{Cancel, FileOps, Step, check_reason};
 
 pub const MAX_EDITS: usize = 20;
 /// Edits load the whole file, so the result is capped (config and script files).
@@ -184,11 +184,18 @@ fn edit_validated(
     let full = resolved.full_path();
     let _lock = ops.lock_path(full.clone(), cancel)?;
     if let Some(pin) = pin {
+        ops.step(Step::SupervisedBeforePin)?;
         pin.verify(ops, &resolved, Access::Write)?;
+        ops.step(Step::SupervisedPinVerified)?;
+    }
+    if pin.is_some() {
+        ops.step(Step::SupervisedBeforeOpen)?;
     }
     let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
     if let Some(pin) = pin {
+        ops.step(Step::SupervisedOpened)?;
         pin.verify_opened(&stat)?;
+        ops.step(Step::SupervisedOpenedVerified)?;
     }
 
     let original = load_all(&mut file, &stat, MAX_EDIT_FILE_BYTES)?;
@@ -289,6 +296,9 @@ fn edit_validated(
     let echo = resolved.echo(&args.path);
 
     if updated == original {
+        if let Some(pin) = pin {
+            pin.verify(ops, &resolved, Access::Write)?;
+        }
         return Ok(EditResult {
             etag: previous_etag.clone(),
             previous_etag,

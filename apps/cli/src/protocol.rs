@@ -3713,6 +3713,25 @@ mod relay_28_vectors {
     }
 
     #[test]
+    fn gap_file_spawn_rejects_forged_display_fields_at_wire_boundary() {
+        for field in ["diff", "preview", "etag"] {
+            for location in ["spawn", "fileOp"] {
+                let mut frame = vector("file-term-spawn");
+                let target = if location == "spawn" {
+                    &mut frame
+                } else {
+                    &mut frame["fileOp"]
+                };
+                target[field] = Value::String("FORGED DISPLAY".to_owned());
+                assert!(
+                    parse_server_control(&frame.to_string()).is_err(),
+                    "{location}.{field}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn supervised_file_spawn_union_rejects_unknown_and_bad_body_shapes() {
         let good = parse_server_control(&vector("file-term-spawn").to_string()).expect("spawn");
         let ServerControlMessage::TermSpawn(spawn) = good else {

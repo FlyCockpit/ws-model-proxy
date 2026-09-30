@@ -1279,6 +1279,13 @@ struct PrivateBody {
 #[cfg(unix)]
 impl PrivateBody {
     fn create(bytes: &[u8]) -> std::io::Result<Self> {
+        Self::create_with(bytes, |_| Ok(()))
+    }
+
+    fn create_with(
+        bytes: &[u8],
+        before_open: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> std::io::Result<Self> {
         let nonce = terminal_crypto::random_nonce().map_err(std::io::Error::other)?;
         let name = nonce
             .iter()
@@ -1298,6 +1305,7 @@ impl PrivateBody {
             }),
         };
         let result: std::io::Result<()> = (|| {
+            before_open(&body.path)?;
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -1859,6 +1867,8 @@ impl TerminalBytesDispatch {
 }
 
 pub(crate) struct TerminalRegistry {
+    #[cfg(all(test, unix))]
+    file_child_env: Vec<(String, String)>,
     sessions: BTreeMap<String, TerminalSession>,
     pending: BTreeMap<PendingKey, PendingTerminal>,
     #[cfg(unix)]
@@ -1917,6 +1927,8 @@ impl TerminalRegistry {
             shell: None,
             #[cfg(unix)]
             supervised_program: None,
+            #[cfg(all(test, unix))]
+            file_child_env: Vec::new(),
             confirm_ttl: SUPERVISED_CONFIRM_TTL,
             review_ttl: SUPERVISED_REVIEW_TTL,
             #[cfg(unix)]
@@ -2501,6 +2513,10 @@ impl TerminalRegistry {
                 SUPERVISED_ENV_FILE_BLOCKED.to_string(),
                 code.as_str().to_string(),
             ));
+        }
+        #[cfg(test)]
+        {
+            self.file_child_env.clone_from(&env);
         }
         let (cols, rows) = (80, 24);
         let pty = match spawn_pty(
@@ -8666,4 +8682,6 @@ exit 0
         ));
         let _ = terminals.kill_all();
     }
+    #[cfg(unix)]
+    include!("sessions/file_gap_tests.rs");
 }

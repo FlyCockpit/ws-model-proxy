@@ -846,3 +846,214 @@ fn a_swapped_input_symlink_cannot_redirect_the_prepared_edit() {
     assert_eq!(fx.get("approved.txt"), "before\n");
     assert_eq!(fx.get("other.txt"), "before\n");
 }
+
+#[test]
+fn gap_required_agent_etags_are_not_synthesized_from_preview() {
+    let fx = Fx::new();
+    fx.put("source", "old\n");
+    fx.put("destination", "destination\n");
+    let cases = [
+        (
+            "edit",
+            json!({"path":fx.p("source"), "edits":[{"startLine":1,"endLine":1,"newText":"new"}]}),
+            None,
+        ),
+        (
+            "write",
+            json!({"path":fx.p("source"), "ifExists":"replace"}),
+            Some(b"new\n".to_vec()),
+        ),
+        (
+            "rename",
+            json!({"from":fx.p("source"), "to":fx.p("destination"), "overwrite":true}),
+            None,
+        ),
+    ];
+    for (op, args, body) in cases {
+        assert_eq!(
+            code(
+                fx.ops
+                    .prepare_supervised(op, args, body, &key(), &fx.cancel)
+            ),
+            ErrorCode::InvalidInput,
+            "{op}"
+        );
+        assert_eq!(fx.get("source"), "old\n");
+        assert_eq!(fx.get("destination"), "destination\n");
+        assert!(fx.leftovers("").is_empty());
+    }
+}
+
+#[test]
+fn gap_exact_edit_without_agent_etag_is_pinned_to_displayed_bytes() {
+    for raced in [false, true] {
+        let fx = Fx::new();
+        fx.put("source", "old\ncontext\n");
+        let prepared = prepare(
+            &fx,
+            "edit",
+            json!({"path":fx.p("source"), "edits":[{"oldText":"old","newText":"new"}]}),
+            None,
+        );
+        assert_eq!(prepared.child_input().blocked, None);
+        if raced {
+            // The match still exists: rerunning an unpinned exact edit would succeed.
+            fx.put("source", "old\nraced context\n");
+            assert_eq!(
+                code(fx.ops.execute_supervised(prepared, &fx.cancel)),
+                ErrorCode::Conflict
+            );
+            assert_eq!(fx.get("source"), "old\nraced context\n");
+        } else {
+            fx.ops
+                .execute_supervised(prepared, &fx.cancel)
+                .expect("apply without agent etag");
+            assert_eq!(fx.get("source"), "new\ncontext\n");
+        }
+        assert!(fx.leftovers("").is_empty());
+    }
+}
+
+#[test]
+fn gap_apply_rechecks_hardlinks_and_owner_for_every_existing_file_operand() {
+    for op in [
+        "edit",
+        "write",
+        "delete",
+        "rename-source",
+        "rename-destination",
+    ] {
+        for refusal in [ErrorCode::HardLinked, ErrorCode::OwnerMismatch] {
+            let fx = Fx::new();
+            fx.put("source", "old\n");
+            fx.put("destination", "destination\n");
+            let (operation, args, body) = match op {
+                "edit" => (
+                    "edit",
+                    json!({"path":fx.p("source"),"edits":[{"oldText":"old","newText":"new"}]}),
+                    None,
+                ),
+                "write" => (
+                    "write",
+                    json!({"path":fx.p("source"),"ifExists":"replace","expectedEtag":fx.etag("source")}),
+                    Some(b"new\n".to_vec()),
+                ),
+                "delete" => ("delete", json!({"path":fx.p("source")}), None),
+                _ => (
+                    "rename",
+                    json!({"from":fx.p("source"),"to":fx.p("destination"),"overwrite":true,"expectedEtag":fx.etag("destination")}),
+                    None,
+                ),
+            };
+            let prepared = prepare(&fx, operation, args.clone(), body.clone());
+            assert_eq!(prepared.child_input().blocked, None, "{op}");
+            let affected = if op == "rename-destination" {
+                "destination"
+            } else {
+                "source"
+            };
+            let denied_ops;
+            let apply_ops = if refusal == ErrorCode::HardLinked {
+                // Keep the pinned inode/content; only the link count changes after preview.
+                // A separate identity-swap refusal cannot hide a missing hard-link guard.
+                std::fs::hard_link(fx.root.join(affected), fx.root.join("alias")).unwrap();
+                &fx.ops
+            } else {
+                // Effective-uid seam models a foreign owner without chown privileges.
+                denied_ops = FileOps::new(
+                    Policy::new(vec![], vec![], true)
+                        .with_euid(super::real_uid().saturating_add(1)),
+                    EtagKey::from_bytes([7; 32]),
+                );
+                &denied_ops
+            };
+            assert_eq!(
+                code(apply_ops.execute_supervised(prepared, &fx.cancel)),
+                refusal,
+                "{op} {refusal:?}"
+            );
+            assert_eq!(fx.get("source"), "old\n", "{op}");
+            assert_eq!(fx.get("destination"), "destination\n", "{op}");
+            if refusal == ErrorCode::HardLinked {
+                assert_eq!(fx.get("alias"), fx.get(affected));
+            }
+            assert!(fx.leftovers("").is_empty());
+            // The same state is also blocked on a fresh preview. Apply is
+            // asserted first so a preview-only guard cannot satisfy this test.
+            let blocked = apply_ops
+                .prepare_supervised(operation, args, body, &key(), &fx.cancel)
+                .expect("state refusal is displayed");
+            assert_eq!(blocked.child_input().blocked, Some(refusal), "{op}");
+        }
+    }
+}
+
+#[test]
+fn gap_apply_refuses_replacement_with_hardlinked_inode_after_preview() {
+    for op in ["edit", "write", "delete", "rename"] {
+        let fx = Fx::new();
+        fx.put("source", "old\n");
+        fx.put("destination", "destination\n");
+        let (args, body) = match op {
+            "edit" => (
+                json!({"path":fx.p("source"),"edits":[{"oldText":"old","newText":"new"}]}),
+                None,
+            ),
+            "write" => (
+                json!({"path":fx.p("source"),"ifExists":"replace","expectedEtag":fx.etag("source")}),
+                Some(b"new\n".to_vec()),
+            ),
+            "delete" => (json!({"path":fx.p("source")}), None),
+            _ => (
+                json!({"from":fx.p("source"),"to":fx.p("destination"),"overwrite":true,"expectedEtag":fx.etag("destination")}),
+                None,
+            ),
+        };
+        let prepared = prepare(&fx, op, args, body);
+        assert_eq!(prepared.child_input().blocked, None);
+        let affected = if op == "rename" {
+            "destination"
+        } else {
+            "source"
+        };
+        fx.put("replacement", fx.get(affected));
+        std::fs::remove_file(fx.root.join(affected)).unwrap();
+        std::fs::hard_link(fx.root.join("replacement"), fx.root.join(affected)).unwrap();
+        let error = code(fx.ops.execute_supervised(prepared, &fx.cancel));
+        assert!(
+            matches!(error, ErrorCode::Conflict | ErrorCode::HardLinked),
+            "{op}: {error:?}"
+        );
+        assert_eq!(fx.get("source"), "old\n");
+        assert_eq!(fx.get("destination"), "destination\n");
+        assert_eq!(fx.get("replacement"), fx.get(affected));
+        assert!(fx.leftovers("").is_empty());
+    }
+}
+
+mod guard_matrix;
+
+#[test]
+fn supervised_dry_run_is_invalid_before_disk_and_in_both_entry_points() {
+    let fx = Fx::new();
+    for path in [fx.p("absent"), fx.p("present")] {
+        fx.put("present", "old\n");
+        let raw = json!({"path":path,"dryRun":true,"edits":[{"oldText":"old","newText":"new"}]});
+        assert_eq!(
+            code(
+                fx.ops
+                    .prepare_supervised("edit", raw.clone(), None, &key(), &fx.cancel)
+            ),
+            ErrorCode::InvalidInput
+        );
+        assert_eq!(
+            code(
+                fx.ops
+                    .preview_supervised("edit", raw, None, &key(), &fx.cancel)
+            ),
+            ErrorCode::InvalidInput
+        );
+        assert_eq!(fx.get("present"), "old\n");
+        assert!(!fx.root.join("absent").exists());
+    }
+}

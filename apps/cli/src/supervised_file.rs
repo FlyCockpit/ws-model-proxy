@@ -5,6 +5,9 @@ use anyhow::Result;
 #[cfg(unix)]
 mod unix;
 
+#[cfg(all(test, unix))]
+pub(crate) use unix::screen_from_registry_env;
+
 #[cfg(unix)]
 pub fn run() -> Result<()> {
     unix::run()

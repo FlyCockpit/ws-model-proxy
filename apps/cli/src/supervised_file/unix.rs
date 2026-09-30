@@ -134,6 +134,10 @@ fn error_code(value: &str) -> Option<ErrorCode> {
 /// Open a registry-created body without following names, validate its
 /// ownership/mode/type/link/size, unlink that exact name, then read it.
 pub(crate) fn read_private_body(path: &Path) -> Result<Vec<u8>> {
+    read_private_body_with(path, || Ok(()))
+}
+
+fn read_private_body_with(path: &Path, after_stat: impl FnOnce() -> Result<()>) -> Result<Vec<u8>> {
     if !path.is_absolute() {
         anyhow::bail!("supervised write body path is not absolute")
     }
@@ -181,6 +185,7 @@ pub(crate) fn read_private_body(path: &Path) -> Result<Vec<u8>> {
     if stat.st_size < 0 || stat.st_size as u64 > MAX_BODY_BYTES {
         anyhow::bail!("supervised write body is larger than 1 MiB")
     }
+    after_stat()?;
     let named = fstatat(parent_fd.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW)
         .context("rechecking supervised write body name")?;
     if !same_object(&stat, &named) {
@@ -411,7 +416,11 @@ fn layout(
 }
 
 fn preview(input: &ChildInput) -> Result<Display> {
-    if nix::unistd::geteuid().is_root() && !input.allow_root {
+    preview_with_euid(input, nix::unistd::geteuid().as_raw())
+}
+
+fn preview_with_euid(input: &ChildInput, euid: u32) -> Result<Display> {
+    if euid == 0 && !input.allow_root {
         anyhow::bail!("supervised file preview is disabled while running as root")
     }
     let preview = match preview_supervised_child(
@@ -507,9 +516,162 @@ pub(super) fn run() -> Result<()> {
     show(&display, &input.requester, &reason, &input.marker)
 }
 
+/// Render exactly the environment passed to the real child, without changing
+/// process-global environment or requiring a second binary in library tests.
+#[cfg(test)]
+pub(crate) fn screen_from_registry_env(env: &[(String, String)]) -> Result<String> {
+    let get = |name: &str| {
+        env.iter()
+            .rev()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    };
+    let required = |name: &str| get(name).ok_or_else(|| anyhow::anyhow!("missing {name}"));
+    let input = ChildInput {
+        op: required(SUPERVISED_ENV_FILE_OP)?.to_owned(),
+        args: serde_json::from_str(required(SUPERVISED_ENV_FILE_ARGS)?)?,
+        body: get(SUPERVISED_ENV_FILE_BODY)
+            .map(|path| read_private_body(Path::new(path)))
+            .transpose()?,
+        key: EtagKey::from_bytes(lower_hex::<32>(
+            "key",
+            required(SUPERVISED_ENV_FILE_ETAG_KEY)?,
+        )?),
+        preimage: required(SUPERVISED_ENV_FILE_PREIMAGE)?.to_owned(),
+        requester: required(SUPERVISED_ENV_REQUESTER)?.to_owned(),
+        marker: required(SUPERVISED_ENV_MARKER)?.to_owned(),
+        allow_root: required(SUPERVISED_ENV_FILE_ALLOW_ROOT)? == "1",
+        blocked: get(SUPERVISED_ENV_FILE_BLOCKED)
+            .map(|code| error_code(code).expect("registry code")),
+    };
+    Ok(layout(
+        &preview(&input)?,
+        &input.requester,
+        reason(&input.args)?,
+        160,
+        60,
+        0,
+    )
+    .rows
+    .join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supervised_body_boundaries_and_races() {
+        use std::os::unix::fs::PermissionsExt;
+        for case in ["max", "over", "grows", "swapped", "parent-mode"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(
+                dir.path(),
+                std::fs::Permissions::from_mode(if case == "parent-mode" { 0o755 } else { 0o700 }),
+            )
+            .unwrap();
+            let path = dir.path().join("body");
+            let size = MAX_BODY_BYTES as usize + usize::from(case == "over");
+            std::fs::write(&path, vec![b'x'; size]).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let result = read_private_body_with(&path, || {
+                if case == "grows" {
+                    use std::io::Write;
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)?
+                        .write_all(b"x")?;
+                } else if case == "swapped" {
+                    std::fs::rename(&path, dir.path().join("opened-original"))?;
+                    std::fs::write(&path, b"replacement")?;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+                }
+                Ok(())
+            });
+            if case == "max" {
+                assert_eq!(result.unwrap(), vec![b'x'; size]);
+                assert!(!path.exists());
+                continue;
+            }
+            let error = match result {
+                Ok(body) => panic!("unsafe body was accepted ({} bytes)", body.len()),
+                Err(error) => error.to_string(),
+            };
+            match case {
+                "over" => {
+                    assert!(error.contains("is larger"));
+                    assert!(path.exists(), "refuse before unlink");
+                }
+                "grows" => {
+                    assert!(error.contains("grew larger"));
+                    assert!(!path.exists());
+                }
+                "swapped" => {
+                    assert!(error.contains("changed before"));
+                    assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+                    assert_eq!(
+                        std::fs::read(dir.path().join("opened-original"))
+                            .unwrap()
+                            .len(),
+                        size
+                    );
+                }
+                _ => {
+                    assert!(error.contains("directory is not private"));
+                    assert!(path.exists());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn supervised_child_root_gate_is_a_refusal_before_preview() {
+        let input = ChildInput {
+            op: "mkdir".to_owned(),
+            args: serde_json::json!({"path":"/missing-test-path"}),
+            body: None,
+            key: EtagKey::from_bytes([19; 32]),
+            preimage: "unused".to_owned(),
+            requester: "agent".to_owned(),
+            marker: "00".repeat(16),
+            allow_root: false,
+            blocked: None,
+        };
+        assert!(
+            preview_with_euid(&input, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("disabled while running as root")
+        );
+        assert!(preview_with_euid(&input, 1000).is_ok());
+        assert!(
+            preview_with_euid(
+                &ChildInput {
+                    allow_root: true,
+                    ..input
+                },
+                0
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn supervised_blocked_code_uses_the_same_escape_path_as_other_fields() {
+        let display = Display::Blocked {
+            code: "conflict\x1b]7717;accepted\x07\u{202e}\rspoof".to_owned(),
+            operation: "edit".to_owned(),
+            paths: vec!["/tmp/example".to_owned()],
+        };
+        let text = layout(&display, "agent", "", 200, 40, 0).rows.join("\n");
+        assert!(
+            text.contains("Error code: conflict\\u{1b}]7717;accepted\\u{7}\\u{202e}\\u{d}spoof"),
+            "{text}"
+        );
+        for control in ['\x1b', '\x07', '\r', '\u{202e}'] {
+            assert!(!text.contains(control));
+        }
+    }
 
     fn allowed(diff: Vec<String>) -> Display {
         Display::Allowed {

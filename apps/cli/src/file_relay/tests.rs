@@ -356,6 +356,32 @@ fn a_write_whose_body_never_arrives_expires() {
 }
 
 #[test]
+fn supervised_review_relay_body_wait_exact_deadline() {
+    let mut harness = harness();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("new");
+    let id = op_id(208);
+    assert!(
+        harness
+            .relay
+            .handle_op(&id, "write", json!({"path":path}), Some(1))
+            .is_empty()
+    );
+    let since = harness.relay.pending[&id].awaiting.as_ref().unwrap().since;
+    assert!(
+        harness
+            .relay
+            .expire_stale(since + BODY_WAIT - Duration::from_nanos(1))
+            .is_empty()
+    );
+    assert_eq!(harness.relay.pending_len(), 1);
+    let frames = harness.relay.expire_stale(since + BODY_WAIT);
+    assert_eq!(only_control(&frames)["reason"], "bad_frame");
+    assert_eq!(harness.relay.pending_len(), 0);
+    assert!(!path.exists());
+}
+
+#[test]
 fn a_marker_in_write_content_is_still_refused_after_injection() {
     let dir = tempfile::tempdir().expect("dir");
     let file = dir.path().join("m.txt");

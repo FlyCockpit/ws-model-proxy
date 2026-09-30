@@ -381,3 +381,90 @@ pub(crate) fn interact(
     drop(stdout);
     Ok(ConfirmOutcome::Accepted)
 }
+
+// Panic hooks are process-global; both confirm children share this test lock.
+#[cfg(test)]
+pub(crate) fn panic_tests_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nix::sys::termios::{LocalFlags, Termios, tcgetattr};
+
+    fn assert_restored(before: &Termios, after: &Termios) {
+        assert_eq!(before.input_flags, after.input_flags);
+        assert_eq!(before.output_flags, after.output_flags);
+        assert_eq!(before.control_flags, after.control_flags);
+        assert_eq!(before.control_chars, after.control_chars);
+        // BSD may set the kernel-state bit PENDIN on return to canonical mode.
+        assert_eq!(
+            before.local_flags.difference(LocalFlags::PENDIN),
+            after.local_flags.difference(LocalFlags::PENDIN)
+        );
+    }
+
+    #[test]
+    fn gap_file_raw_guard_restores_on_early_return() {
+        let pty = nix::pty::openpty(None, None).expect("pty");
+        let before = tcgetattr(&pty.slave).expect("original settings");
+        let early = || -> Result<()> {
+            let guard = RawMode::enter(&pty.slave, confirm_raw_mode)?;
+            assert!(
+                !tcgetattr(guard.fd())?
+                    .local_flags
+                    .contains(LocalFlags::ICANON)
+            );
+            anyhow::bail!("file confirm input closed")
+        };
+        assert!(early().is_err());
+        assert_restored(&before, &tcgetattr(&pty.slave).expect("restored settings"));
+    }
+
+    #[test]
+    fn gap_file_raw_guard_restores_on_unwinding() {
+        let _serial = panic_tests_lock();
+        let pty = nix::pty::openpty(None, None).expect("pty");
+        let before = tcgetattr(&pty.slave).expect("original settings");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let guard = RawMode::enter(&pty.slave, confirm_raw_mode).expect("raw");
+            assert!(
+                !tcgetattr(guard.fd())
+                    .unwrap()
+                    .local_flags
+                    .contains(LocalFlags::ICANON)
+            );
+            panic!("file confirm unwinds");
+        }));
+        assert!(result.is_err());
+        assert_restored(&before, &tcgetattr(&pty.slave).expect("restored settings"));
+    }
+
+    #[test]
+    fn gap_file_panic_hook_restores_without_destructor() {
+        let _serial = panic_tests_lock();
+        let pty = nix::pty::openpty(None, None).expect("pty");
+        let before = tcgetattr(&pty.slave).expect("original settings");
+        let guard = RawMode::enter(&pty.slave, confirm_raw_mode).expect("raw");
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        restore_terminal_on_panic(pty.slave.try_clone().unwrap(), guard.original().clone());
+        std::mem::forget(guard);
+        assert!(
+            !tcgetattr(&pty.slave)
+                .unwrap()
+                .local_flags
+                .contains(LocalFlags::ICANON)
+        );
+        let result = std::panic::catch_unwind(|| panic!("file confirm abort simulation"));
+        std::panic::set_hook(previous);
+        assert!(result.is_err());
+        assert_restored(
+            &before,
+            &tcgetattr(&pty.slave).expect("hook restored settings"),
+        );
+    }
+}

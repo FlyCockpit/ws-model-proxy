@@ -94,14 +94,8 @@ mod tests {
             .local_flags
     }
 
-    /// The two tests that panic on purpose: the panic hook one installs is
-    /// process-global, so a sibling's panic must not run it mid-test.
-    static PANIC_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn panic_tests_lock() -> std::sync::MutexGuard<'static, ()> {
-        PANIC_TESTS
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::supervised_screen::panic_tests_lock()
     }
 
     #[test]

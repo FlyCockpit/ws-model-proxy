@@ -88,6 +88,15 @@ impl Cancel {
 /// re-check, whose only purpose there is to give the same seam.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
+    SupervisedBeforePin,
+    SupervisedPinVerified,
+    SupervisedBeforeOpen,
+    SupervisedOpened,
+    SupervisedOpenedVerified,
+    PinBeforeOpen,
+    PinOpened,
+    BeforeIdentity,
+    IdentityChecked,
     TempCreated,
     TempWritten,
     TempSynced,

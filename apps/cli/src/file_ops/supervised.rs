@@ -101,16 +101,14 @@ impl PinnedPath {
         resolved: &Resolved,
         access: Access,
     ) -> FileResult<()> {
-        if let Some((path, expected, target)) = &self.route_leaf {
-            let metadata =
-                std::fs::symlink_metadata(path).map_err(|_| FileError::conflict("path changed"))?;
-            let current_target =
-                std::fs::read_link(path).map_err(|_| FileError::conflict("path changed"))?;
-            if !Stat::from_metadata(&metadata).same_object(expected) || &current_target != target {
-                return Err(FileError::conflict("path changed"));
-            }
-        }
-        if resolved.full_path() != self.physical {
+        // The ancestor pin binds the parent; bind the leaf name separately.
+        // An inode moved within that parent and reached through a new symlink
+        // must not turn the approved physical path into another path.
+        if self
+            .physical
+            .file_name()
+            .is_some_and(|name| name != resolved.name)
+        {
             return Err(FileError::conflict("path changed"));
         }
         match (&self.object, resolved.lstat()?) {
@@ -119,7 +117,10 @@ impl PinnedPath {
                 if let Some(etag) = &expected.etag {
                     let current = match now.kind() {
                         Kind::File => {
+                            ops.step(Step::PinBeforeOpen)?;
                             let (mut file, opened) = resolved.open_regular(&ops.policy, access)?;
+                            ops.step(Step::PinOpened)?;
+                            atomic::check_replaceable(ops, &opened)?;
                             if !opened.same_object(&expected.stat) {
                                 return Err(FileError::conflict("replaced"));
                             }
@@ -134,6 +135,40 @@ impl PinnedPath {
                 }
                 Ok(())
             }
+            _ => Err(FileError::conflict("replaced")),
+        }?;
+        if let Some((path, expected, target)) = &self.route_leaf {
+            let metadata =
+                std::fs::symlink_metadata(path).map_err(|_| FileError::conflict("path changed"))?;
+            let current_target =
+                std::fs::read_link(path).map_err(|_| FileError::conflict("path changed"))?;
+            if !Stat::from_metadata(&metadata).same_object(expected) || &current_target != target {
+                return Err(FileError::conflict("path changed"));
+            }
+        }
+        // Re-resolve the pinned physical ancestor after every observable race
+        // seam. A held directory fd alone remains usable after its name moves.
+        resolve(
+            &path_text(&self.physical)?,
+            &ResolveOpts {
+                follow_last: false,
+                make_parents: None,
+                policy: &ops.policy,
+                access,
+                preview_missing: true,
+                pin: Some(&ResolvePin {
+                    path: self.ancestor.path.clone(),
+                    stat: self.ancestor.stat,
+                    missing_paths: Vec::new(),
+                }),
+                cancel: None,
+            },
+        )?;
+        // PinOpened is the last hook in this verifier. Check the name again:
+        // the fd can still hold the approved bytes after its name was swapped.
+        match (&self.object, resolved.lstat()?) {
+            (None, None) => Ok(()),
+            (Some(expected), Some(now)) if expected.stat.same_object(&now) => Ok(()),
             _ => Err(FileError::conflict("replaced")),
         }
     }
@@ -280,6 +315,7 @@ fn snapshot(
                         return Err(FileError::conflict("replaced"));
                     }
                     stat = opened;
+                    atomic::check_replaceable(ops, &stat)?;
                     if stat.size <= super::etag::STRONG_ETAG_MAX_BYTES {
                         let bytes = load_all(&mut file, &stat, super::etag::STRONG_ETAG_MAX_BYTES)?;
                         ops.step(Step::SupervisedSnapshotRead)?;
@@ -497,11 +533,7 @@ fn require_agent_etag(agent: Option<&str>, current: Option<&str>) -> FileResult<
 
 fn build_edit(ops: &FileOps, raw: Value, key: &EtagKey, cancel: &Cancel) -> FileResult<Built> {
     let mut args: EditArgs = parse(raw)?;
-    if args.dry_run == Some(true) {
-        return Err(FileError::invalid(
-            "dryRun is not allowed for supervised edits",
-        ));
-    }
+    // Entry points already ran static_validate before any disk access.
     edit::validate_args(&args)?;
     let agent_etag = args.expected_etag.clone();
     let (pin, fingerprint) = snapshot(ops, &args.path, Access::Write, true, key)?;
@@ -673,11 +705,7 @@ fn material(
     match op {
         "edit" if body.is_none() => {
             let mut args: EditArgs = parse(raw)?;
-            if args.dry_run == Some(true) {
-                return Err(FileError::invalid(
-                    "dryRun is not allowed for supervised edits",
-                ));
-            }
+            // Entry points already ran static_validate before any disk access.
             edit::validate_args(&args)?;
             let (pin, fingerprint) = snapshot(ops, &args.path, Access::Write, true, key)?;
             args.path = path_text(&pin.physical)?;

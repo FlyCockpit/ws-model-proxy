@@ -218,10 +218,14 @@ fn rename_impl(
     let _lock_a = ops.lock_path(first, cancel)?;
     let _lock_b = ops.lock_path(second, cancel)?;
     if let Some(pin) = from_pin {
+        ops.step(Step::SupervisedBeforePin)?;
         pin.verify(ops, &from, Access::Remove)?;
+        ops.step(Step::SupervisedPinVerified)?;
     }
     if let Some(pin) = to_pin {
+        ops.step(Step::SupervisedBeforePin)?;
         pin.verify(ops, &to, Access::Write)?;
+        ops.step(Step::SupervisedPinVerified)?;
     }
 
     let src = from
@@ -233,7 +237,9 @@ fn rename_impl(
             "special files are not moved",
         ));
     }
+    ops.step(Step::BeforeIdentity)?;
     ops.policy.check_identity(Access::Remove, &src)?;
+    ops.step(Step::IdentityChecked)?;
     let src_etag = object_etag(ops, &from, &src)?;
     if !overwrite && let Some(expected) = &args.expected_etag {
         match &src_etag {
@@ -263,7 +269,9 @@ fn rename_impl(
                 "the destination is a directory or special file and is not overwritten",
             ));
         }
+        ops.step(Step::BeforeIdentity)?;
         ops.policy.check_identity(Access::Write, dst)?;
+        ops.step(Step::IdentityChecked)?;
         let current = object_etag(ops, &to, dst)?.unwrap_or_default();
         if args.expected_etag.as_deref() != Some(current.as_str()) {
             return Err(FileError::conflict(&current));
@@ -592,10 +600,17 @@ fn mkdir_resolved(
     }
     let _lock = ops.lock_path(resolved.full_path(), cancel)?;
     if let Some(pin) = pin {
+        ops.step(Step::SupervisedBeforePin)?;
         pin.verify(ops, resolved, Access::Write)?;
+        ops.step(Step::SupervisedPinVerified)?;
     }
     match resolved.lstat()? {
-        Some(st) if st.kind() == Kind::Dir => return Ok(MkdirResult { created: false }),
+        Some(st) if st.kind() == Kind::Dir => {
+            if let Some(pin) = pin {
+                pin.verify(ops, resolved, Access::Write)?;
+            }
+            return Ok(MkdirResult { created: false });
+        }
         Some(_) => {
             return Err(FileError::new(
                 ErrorCode::Exists,
@@ -603,6 +618,10 @@ fn mkdir_resolved(
             ));
         }
         None => {}
+    }
+    ops.step(Step::EtagRechecked)?;
+    if let Some(pin) = pin {
+        pin.verify(ops, resolved, Access::Write)?;
     }
     cancel.check()?;
     match mkdirat(
@@ -657,7 +676,9 @@ fn delete_impl(
     }
     let _lock = ops.lock_path(resolved.full_path(), cancel)?;
     if let Some(pin) = pin {
+        ops.step(Step::SupervisedBeforePin)?;
         pin.verify(ops, &resolved, Access::Remove)?;
+        ops.step(Step::SupervisedPinVerified)?;
     }
     let st = resolved
         .lstat()?
