@@ -155,9 +155,9 @@ use supervised_pty::{MarkerEvent, Piece};
 pub(crate) use supervised_pty::{
     SUPERVISED_ENV_COMMAND, SUPERVISED_ENV_FILE_ALLOW_ROOT, SUPERVISED_ENV_FILE_ARGS,
     SUPERVISED_ENV_FILE_BLOCKED, SUPERVISED_ENV_FILE_BODY, SUPERVISED_ENV_FILE_ETAG_KEY,
-    SUPERVISED_ENV_FILE_OP, SUPERVISED_ENV_FILE_PREIMAGE, SUPERVISED_ENV_MARKER,
-    SUPERVISED_ENV_NAMES, SUPERVISED_ENV_REASON, SUPERVISED_ENV_REQUESTER, SUPERVISED_ENV_SHARE,
-    supervised_marker,
+    SUPERVISED_ENV_FILE_OP, SUPERVISED_ENV_FILE_PREIMAGE, SUPERVISED_ENV_FILE_ROOTS,
+    SUPERVISED_ENV_MARKER, SUPERVISED_ENV_NAMES, SUPERVISED_ENV_REASON, SUPERVISED_ENV_REQUESTER,
+    SUPERVISED_ENV_SHARE, supervised_marker,
 };
 
 pub(crate) enum OutboundFrame {
@@ -1941,6 +1941,7 @@ const SUPERVISED_FILE_REJECT_REASONS: &[&str] = &[
     "secret_file",
     "too_large",
     "redacted_span",
+    "special_file",
 ];
 
 /// The only file rejection reason mapping. Internal failures and unexpected
@@ -2493,8 +2494,12 @@ impl TerminalRegistry {
         let child_blocked: Option<crate::protocol::FileErrorCode> =
             prepared.child_input().blocked.map(Into::into);
         let args = match serde_json::to_string(&child_args) {
-            Ok(args) if args.len() <= 128 * 1024 => args,
-            _ => return vec![supervised_file_rejected(command_id, "too_large")],
+            Ok(args) => args,
+            Err(_) => return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)],
+        };
+        let roots = match serde_json::to_string(&prepared.child_input().roots) {
+            Ok(roots) => roots,
+            Err(_) => return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)],
         };
         let body_file = match pending.body.as_deref() {
             Some(body) => match PrivateBody::create(body) {
@@ -2548,6 +2553,7 @@ impl TerminalRegistry {
         env.extend([
             (SUPERVISED_ENV_FILE_OP.to_string(), child_op.clone()),
             (SUPERVISED_ENV_FILE_ARGS.to_string(), args),
+            (SUPERVISED_ENV_FILE_ROOTS.to_string(), roots),
             (
                 SUPERVISED_ENV_FILE_ETAG_KEY.to_string(),
                 pending.preview_key_hex.clone(),
@@ -8810,6 +8816,119 @@ exit 0
     }
 
     /// 2.8: a supervised file op is in the schema but never runs before P5.
+    #[cfg(unix)]
+    #[test]
+    fn supervised_file_root_and_size_boundaries_reach_registry_screen_without_results() {
+        for state in ["alias", "outside", "escape", "removed", "long"] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().canonicalize().unwrap();
+            let root = base.join("root");
+            let outside = base.join("outside");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(root.join("source"), b"old\n").unwrap();
+            std::fs::write(outside.join("source"), b"old\n").unwrap();
+            std::os::unix::fs::symlink(&root, base.join("alias")).unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+            let roots = if state == "long" {
+                Vec::new()
+            } else {
+                vec![root.clone()]
+            };
+            let ops = crate::file_ops::FileOps::new(
+                crate::file_ops::Policy::from_environment(roots, true),
+                crate::file_ops::EtagKey::random(),
+            );
+            if state == "removed" {
+                std::fs::remove_dir_all(&root).unwrap();
+            }
+            let target = match state {
+                "alias" => base.join("alias/source"),
+                "outside" => outside.join("source"),
+                "escape" => root.join("escape/source"),
+                "long" => {
+                    let suffix = (0..15)
+                        .map(|_| "a".repeat(240))
+                        .collect::<Vec<_>>()
+                        .join("/");
+                    for i in 0..39 {
+                        std::os::unix::fs::symlink(
+                            format!("link{}/{suffix}", i + 1),
+                            root.join(format!("link{i}")),
+                        )
+                        .unwrap();
+                    }
+                    root.join("link0/target")
+                }
+                _ => root.join("source"),
+            };
+            let expected = if state == "alias" {
+                None
+            } else if state == "long" {
+                Some("too_large")
+            } else {
+                Some("path_denied")
+            };
+            let (tx, rx) = channel();
+            let mut terminals = supervised_registry(tx, &fake_file_confirm(expected));
+            terminals.set_file_runtime(Arc::new(crate::file_relay::FileRuntime::new(ops)));
+            let startup = supervised_startup(McpCommandMode::Supervised, false);
+            let request = file_spawn_request(
+                "edit",
+                serde_json::json!({"path":target,"edits":[{"oldText":"old","newText":"new"}]}),
+                None,
+            );
+            let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &request);
+            pump_file_until(
+                &mut terminals,
+                &rx,
+                &startup,
+                &mut frames,
+                |terminals, frames| {
+                    phase(terminals) == Some(SupervisedPhase::Confirm)
+                        || supervised_rejection_reason(frames).is_some()
+                },
+            );
+            assert_eq!(outcome_kinds(&frames), vec!["spawned"], "{state}");
+            let screen =
+                crate::supervised_file::screen_from_registry_env(&terminals.file_child_env)
+                    .unwrap();
+            match expected {
+                Some(code) => assert!(
+                    screen.contains(&format!("Error code: {code}")),
+                    "{state}: {screen}"
+                ),
+                None => assert!(screen.contains("Unified diff"), "{state}: {screen}"),
+            }
+            assert_eq!(std::fs::read(outside.join("source")).unwrap(), b"old\n");
+            if state != "removed" {
+                assert_eq!(std::fs::read(root.join("source")).unwrap(), b"old\n");
+            }
+            let mut viewer = TestViewer::new(117);
+            frames.extend(attach_viewer(&mut terminals, &startup, &mut viewer));
+            let label = viewer.id.clone();
+            frames.extend(send(
+                &mut terminals,
+                &mut viewer,
+                &label,
+                &TermPlaintextV2::Data(b"q\r".to_vec()),
+            ));
+            pump_file_until(&mut terminals, &rx, &startup, &mut frames, has_exit);
+            if let Some(code) = expected {
+                let done = controls(&frames)
+                    .into_iter()
+                    .find(|message| matches!(message, ClientControlMessage::SupervisedDone { .. }))
+                    .expect("blocked done after dismissal");
+                assert_eq!(
+                    serde_json::to_value(done).unwrap()["fileError"]["code"],
+                    code
+                );
+            }
+            assert!(!outcome_kinds(&frames).contains(&"accepted"));
+            assert_eq!(std::fs::read(outside.join("source")).unwrap(), b"old\n");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn supervised_file_spawn_without_a_runtime_is_unsupported() {

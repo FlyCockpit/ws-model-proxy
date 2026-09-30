@@ -77,7 +77,7 @@ where
 
 /// Validate disk shape without requiring existence: disappeared roots must
 /// still reach the confined, unusable startup policy rather than disappear.
-fn validate_file_root_shape(roots: &[PathBuf]) -> Result<()> {
+pub(crate) fn validate_file_root_shape(roots: &[PathBuf]) -> Result<()> {
     anyhow::ensure!(
         roots.len() <= MAX_FILE_ROOTS,
         "at most {MAX_FILE_ROOTS} file roots are allowed"

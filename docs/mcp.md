@@ -176,8 +176,18 @@ supervised statuses, plus `file:{op,result}` on success or `error:{code,message,
 Edit/write results omit `diff` and `hunks`; file errors have no path, current etag or
 other detail. State-dependent refusals (including `not_found`, `exists`, `conflict`,
 `hard_linked` and `owner_mismatch`) appear on a cannot-apply screen and reach the
-agent only after a person dismisses it. Path-string/input refusals may arrive before
-display. Decline returns code `declined`, definitively applying nothing.
+agent only after a person dismisses it. This includes outside-root paths, escaping
+symlinks and unavailable roots (`path_denied`), and disk-derived normalized arguments
+above the 128 KiB child-input cap (`too_large`). The cap on the original request is
+checked before disk access; an oversized normalized input uses a minimal blocked
+input with the original paths. The child uses the daemon’s strict startup root
+snapshot, including deny-all for unusable configured roots. Roots are judged on
+resolved physical paths before display and again at apply; aliases resolving inside
+a root are allowed. Apply-time policy stays authoritative.
+Path-string/input refusals may arrive before display: `invalid_input`, `secret_file`,
+protected/staging names (`path_denied`), special-tree text (`special_file`), declared
+input/body size, `limit` and `disabled`. Root confinement is never a pre-display
+text refusal. Decline returns code `declined`, definitively applying nothing.
 
 Confirm waits expire after 15 minutes, using the same stop grace as commands.
 After `supervised.accepted`, apply has a 30-second deadline; on expiry the server

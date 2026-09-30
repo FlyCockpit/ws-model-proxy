@@ -17,11 +17,14 @@ use nix::sys::stat::{Mode, SFlag, fstat, fstatat};
 use nix::unistd::{UnlinkatFlags, unlinkat};
 use serde_json::Value;
 
-use crate::file_ops::{ErrorCode, EtagKey, SupervisedPreview, preview_supervised_child};
+use crate::file_ops::{
+    ErrorCode, EtagKey, RootSnapshot, SupervisedPreview, preview_supervised_child,
+};
 use crate::sessions::{
     SUPERVISED_ENV_FILE_ALLOW_ROOT, SUPERVISED_ENV_FILE_ARGS, SUPERVISED_ENV_FILE_BLOCKED,
     SUPERVISED_ENV_FILE_BODY, SUPERVISED_ENV_FILE_ETAG_KEY, SUPERVISED_ENV_FILE_OP,
-    SUPERVISED_ENV_FILE_PREIMAGE, SUPERVISED_ENV_MARKER, SUPERVISED_ENV_REQUESTER,
+    SUPERVISED_ENV_FILE_PREIMAGE, SUPERVISED_ENV_FILE_ROOTS, SUPERVISED_ENV_MARKER,
+    SUPERVISED_ENV_REQUESTER,
 };
 use crate::supervised_run::{field, wrap_words};
 use crate::supervised_screen::{ConfirmAction, ConfirmOutcome, Screen, interact};
@@ -42,6 +45,7 @@ struct ChildInput {
     marker: String,
     allow_root: bool,
     blocked: Option<ErrorCode>,
+    roots: RootSnapshot,
 }
 
 #[derive(Debug)]
@@ -216,6 +220,8 @@ fn load() -> Result<ChildInput> {
     }
     let raw_args = required_env(SUPERVISED_ENV_FILE_ARGS)?;
     let args: Value = serde_json::from_str(&raw_args).context("parsing supervised file args")?;
+    let roots = serde_json::from_str(&required_env(SUPERVISED_ENV_FILE_ROOTS)?)
+        .context("parsing supervised file roots snapshot")?;
     if !args.is_object() {
         anyhow::bail!("`{SUPERVISED_ENV_FILE_ARGS}` must be a JSON object")
     }
@@ -259,6 +265,7 @@ fn load() -> Result<ChildInput> {
         marker,
         allow_root,
         blocked,
+        roots,
     })
 }
 
@@ -429,6 +436,7 @@ fn preview_with_euid(input: &ChildInput, euid: u32) -> Result<Display> {
         input.body.as_deref(),
         &input.key,
         input.allow_root,
+        input.roots.clone(),
     ) {
         Ok(preview) => preview,
         Err(error) => {
@@ -530,6 +538,7 @@ pub(crate) fn screen_from_registry_env(env: &[(String, String)]) -> Result<Strin
     let input = ChildInput {
         op: required(SUPERVISED_ENV_FILE_OP)?.to_owned(),
         args: serde_json::from_str(required(SUPERVISED_ENV_FILE_ARGS)?)?,
+        roots: serde_json::from_str(required(SUPERVISED_ENV_FILE_ROOTS)?)?,
         body: get(SUPERVISED_ENV_FILE_BODY)
             .map(|path| read_private_body(Path::new(path)))
             .transpose()?,
@@ -627,6 +636,7 @@ mod tests {
     #[test]
     fn supervised_child_root_gate_is_a_refusal_before_preview() {
         let input = ChildInput {
+            roots: crate::file_ops::Policy::from_environment(Vec::new(), false).root_snapshot(),
             op: "mkdir".to_owned(),
             args: serde_json::json!({"path":"/missing-test-path"}),
             body: None,

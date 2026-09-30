@@ -488,6 +488,10 @@ describe("relay 2.8 supervised-file strict schema", () => {
 });
 
 describe("supervised file pre-display rejection contract", () => {
+  it("admits special_file for request-text special-tree refusals", () => {
+    expect(supervisedFileRejectReasonSchema.parse("special_file")).toBe("special_file");
+  });
+
   it("matches the CLI's closed list exactly", () => {
     const rust = readFileSync(new URL("../../../cli/src/sessions.rs", import.meta.url), "utf8");
     const table = rust.match(
@@ -515,7 +519,6 @@ describe("supervised file pre-display rejection contract", () => {
     "hard_linked",
     "owner_mismatch",
     "setuid",
-    "special_file",
     "timeout",
     "cancelled",
     "future_internal_error",

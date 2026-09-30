@@ -46,6 +46,14 @@ ifExists, overwrite and byte counts. Diffs exceeding
 the 8 KiB display cap are blocked with too_large after dismissal. A supervised directory
 rename without replacement is refused with unsupported on macOS. Poll \`forwarder_cli_command_result\` for
 \`file:{op,result}\` or \`error:{code,message,outcome?}\`. Approval implies no read grant.
+Physical root confinement (path_denied), including outside-root text, escaping links
+and unavailable roots, and normalized argument growth above 128 KiB (too_large)
+are blocked screens whose codes reach the agent only after dismissal. Aliases
+resolving inside roots are allowed. The child uses the daemon startup root snapshot;
+apply rechecks authoritative policy. Pre-display refusals depend only on request
+text/input policy (invalid_input, secret_file, protected/staging names, special trees,
+declared sizes), process/mode and capacity checks. The full read grant admits reads
+in supervised/off modes and never writes; off refuses writes.
 Server termination after dispatch without authoritative CLI settlement is unknown
 with started:true when the server received acceptance and started:null otherwise. CLI decline/rejection
 and blocked done before acceptance, and undispatched failures remain definitive.

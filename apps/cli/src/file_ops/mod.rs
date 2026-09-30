@@ -48,7 +48,7 @@ pub mod write;
 
 pub use error::{ErrorCode, FileError, FileResult};
 pub use etag::EtagKey;
-pub use policy::Policy;
+pub use policy::{Policy, RootSnapshot};
 pub use supervised::{
     AllowedPreview, PreparedSupervised, SupervisedChildInput, SupervisedPreview,
     preview_supervised_child,

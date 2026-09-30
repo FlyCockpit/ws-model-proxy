@@ -508,4 +508,5 @@ export const supervisedFileRejectReasonSchema = z.enum([
   "secret_file",
   "too_large",
   "redacted_span",
+  "special_file",
 ]);

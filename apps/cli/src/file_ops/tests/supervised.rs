@@ -1229,7 +1229,7 @@ fn physical_path_policy_errors_are_blocked_for_every_supervised_operand() {
 /// not run before a person's keypress: a path whose disk state trips it (a file
 /// where a parent is expected, a symlink out of the roots) is refused only on
 /// the cannot-apply screen, exactly like a path whose parent is absent or a
-/// directory. Lexically outside paths still fail before any screen.
+/// directory. Roots are checked only on physical paths, after display.
 #[test]
 fn configured_roots_do_not_reveal_disk_state_before_the_keypress() {
     let outside = tempfile::tempdir().unwrap();
@@ -1252,19 +1252,41 @@ fn configured_roots_do_not_reveal_disk_state_before_the_keypress() {
             ("rename", json!({"from":target,"to":fx.p("dest")}), None),
             ("rename", json!({"from":fx.p("file"),"to":target}), None),
         ] {
-            let outcome = fx
+            let prepared = fx
                 .ops
-                .prepare_supervised(op, args, body, &key(), &fx.cancel);
-            assert!(
-                outcome.is_ok(),
-                "{op} {parent}: a disk-dependent refusal arrived before the keypress: {:?}",
-                outcome.err().map(|error| error.code)
+                .prepare_supervised(op, args, body.clone(), &key(), &fx.cancel)
+                .expect("disk-dependent refusal waits for dismissal");
+            let expected = match (parent, op) {
+                ("file", _) => Some(ErrorCode::NotADir),
+                ("link", _) => Some(ErrorCode::PathDenied),
+                ("dir", "write" | "mkdir") | ("missing", "mkdir") => None,
+                ("dir", "rename") if prepared.child_input().args["from"] == fx.p("file") => None,
+                _ => Some(ErrorCode::NotFound),
+            };
+            assert_eq!(prepared.child_input().blocked, expected, "{op} {parent}");
+            let child = crate::file_ops::preview_supervised_child(
+                op,
+                prepared.child_input().args.clone(),
+                body.as_deref(),
+                &key(),
+                true,
+                prepared.child_input().roots.clone(),
+            )
+            .expect("child preview");
+            assert_eq!(
+                child.preview_etag(),
+                prepared.child_input().preview_etag,
+                "{op} {parent}"
             );
+            match child {
+                SupervisedPreview::Allowed(_) => assert_eq!(expected, None),
+                SupervisedPreview::Blocked { code, .. } => assert_eq!(Some(code), expected),
+            }
         }
     }
-    // Outside the configured roots is a path-text refusal and stays immediate.
+    // Outside-root text is displayed too: confinement depends on physical paths.
     let outside_target = outside_dir.join("x").to_string_lossy().into_owned();
-    let refused = fx
+    let prepared = fx
         .ops
         .prepare_supervised(
             "write",
@@ -1273,7 +1295,303 @@ fn configured_roots_do_not_reveal_disk_state_before_the_keypress() {
             &key(),
             &fx.cancel,
         )
-        .err()
-        .map(|error| error.code);
-    assert_eq!(refused, Some(ErrorCode::PathDenied));
+        .expect("outside roots waits for dismissal");
+    assert_eq!(prepared.child_input().blocked, Some(ErrorCode::PathDenied));
+}
+
+#[test]
+fn configured_root_aliases_allow_every_operation_and_apply() {
+    for spelling in ["alias", "real"] {
+        for op in [
+            "edit",
+            "write",
+            "delete",
+            "mkdir",
+            "rename-from",
+            "rename-to",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().canonicalize().unwrap();
+            let real = base.join("real");
+            let alias = base.join("alias");
+            std::fs::create_dir(&real).unwrap();
+            std::os::unix::fs::symlink(&real, &alias).unwrap();
+            let ops = FileOps::new(
+                Policy::from_environment(vec![alias], true),
+                EtagKey::from_bytes([7; 32]),
+            );
+            let root = base.join(spelling);
+            std::fs::write(real.join("source"), b"old\n").unwrap();
+            let (operation, args, body) = match op {
+                "edit" => (
+                    "edit",
+                    json!({"path":root.join("source"),"edits":[{"oldText":"old","newText":"new"}]}),
+                    None,
+                ),
+                "write" => (
+                    "write",
+                    json!({"path":root.join("target")}),
+                    Some(b"new\n".to_vec()),
+                ),
+                "delete" => ("delete", json!({"path":root.join("source")}), None),
+                "mkdir" => ("mkdir", json!({"path":root.join("target")}), None),
+                "rename-from" => (
+                    "rename",
+                    json!({"from":root.join("source"),"to":real.join("target")}),
+                    None,
+                ),
+                "rename-to" => (
+                    "rename",
+                    json!({"from":real.join("source"),"to":root.join("target")}),
+                    None,
+                ),
+                _ => unreachable!(),
+            };
+            let prepared = ops
+                .prepare_supervised(operation, args, body.clone(), &key(), &Cancel::new())
+                .unwrap();
+            let input = prepared.child_input();
+            assert_eq!(input.blocked, None, "{spelling} {op}");
+            let child = crate::file_ops::preview_supervised_child(
+                operation,
+                input.args.clone(),
+                body.as_deref(),
+                &key(),
+                true,
+                input.roots.clone(),
+            )
+            .unwrap();
+            assert!(
+                matches!(child, SupervisedPreview::Allowed(_)),
+                "{spelling} {op}: {child:?}"
+            );
+            assert_eq!(child.preview_etag(), input.preview_etag, "{spelling} {op}");
+            // Preparation and independent preview never change the target.
+            assert_eq!(std::fs::read(real.join("source")).unwrap(), b"old\n");
+            assert!(!real.join("target").exists());
+            ops.execute_supervised(prepared, &Cancel::new()).unwrap();
+            match op {
+                "edit" => assert_eq!(std::fs::read(real.join("source")).unwrap(), b"new\n"),
+                "write" => assert_eq!(std::fs::read(real.join("target")).unwrap(), b"new\n"),
+                "delete" => assert!(!real.join("source").exists()),
+                "mkdir" => assert!(real.join("target").is_dir()),
+                _ => {
+                    assert!(!real.join("source").exists());
+                    assert_eq!(std::fs::read(real.join("target")).unwrap(), b"old\n");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn configured_roots_block_physical_escapes_with_child_parity() {
+    for state in ["outside", "escape", "removed"] {
+        for op in [
+            "edit",
+            "write",
+            "delete",
+            "mkdir",
+            "rename-from",
+            "rename-to",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().canonicalize().unwrap();
+            let root = base.join("root");
+            let outside = base.join("outside");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("source"), b"old\n").unwrap();
+            std::fs::write(root.join("source"), b"old\n").unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+            let ops = FileOps::new(
+                Policy::from_environment(vec![root.clone()], true),
+                EtagKey::from_bytes([7; 32]),
+            );
+            if state == "removed" {
+                std::fs::remove_dir_all(&root).unwrap();
+            }
+            let path = match state {
+                "outside" => outside.clone(),
+                "escape" => root.join("escape"),
+                _ => root.clone(),
+            };
+            let (operation, args, body) = match op {
+                "edit" => (
+                    "edit",
+                    json!({"path":path.join("source"),"edits":[{"oldText":"old","newText":"new"}]}),
+                    None,
+                ),
+                "write" => (
+                    "write",
+                    json!({"path":path.join("target")}),
+                    Some(b"new\n".to_vec()),
+                ),
+                "delete" => ("delete", json!({"path":path.join("source")}), None),
+                "mkdir" => ("mkdir", json!({"path":path.join("target")}), None),
+                "rename-from" => (
+                    "rename",
+                    json!({"from":path.join("source"),"to":root.join("target")}),
+                    None,
+                ),
+                "rename-to" => (
+                    "rename",
+                    json!({"from":root.join("source"),"to":path.join("target")}),
+                    None,
+                ),
+                _ => unreachable!(),
+            };
+            let prepared = ops
+                .prepare_supervised(operation, args, body.clone(), &key(), &Cancel::new())
+                .unwrap();
+            let input = prepared.child_input();
+            let expected = Some(ErrorCode::PathDenied);
+            assert_eq!(input.blocked, expected, "{state} {op}");
+            let child = crate::file_ops::preview_supervised_child(
+                operation,
+                input.args.clone(),
+                body.as_deref(),
+                &key(),
+                true,
+                input.roots.clone(),
+            )
+            .unwrap();
+            assert_eq!(child.preview_etag(), input.preview_etag, "{state} {op}");
+            match child {
+                SupervisedPreview::Blocked { code, .. } => {
+                    assert_eq!(Some(code), expected, "{state} {op}")
+                }
+                SupervisedPreview::Allowed(_) => assert_eq!(expected, None),
+            }
+            if expected.is_some() {
+                assert!(ops.execute_supervised(prepared, &Cancel::new()).is_err());
+            }
+            assert_eq!(std::fs::read(outside.join("source")).unwrap(), b"old\n");
+            assert!(!outside.join("target").exists());
+        }
+    }
+}
+
+#[test]
+fn child_argument_caps_separate_request_size_from_disk_growth() {
+    let fx = Fx::new();
+    let suffix = (0..15)
+        .map(|_| "a".repeat(240))
+        .collect::<Vec<_>>()
+        .join("/");
+    // Relative symlink splicing grows a short request past 128 KiB without
+    // requiring a filesystem path of that length to exist.
+    for i in 0..39 {
+        std::os::unix::fs::symlink(
+            format!("link{}/{suffix}", i + 1),
+            fx.root.join(format!("link{i}")),
+        )
+        .unwrap();
+    }
+    for op in ["edit", "write", "delete", "mkdir", "rename-to"] {
+        fx.put("source", "old\n");
+        let path = fx.p("link0/target");
+        let (operation, args, body) = match op {
+            "edit" => (
+                "edit",
+                json!({"path":path,"edits":[{"oldText":"old","newText":"new"}]}),
+                None,
+            ),
+            "write" => ("write", json!({"path":path}), Some(b"new\n".to_vec())),
+            "delete" => ("delete", json!({"path":path}), None),
+            "mkdir" => ("mkdir", json!({"path":path}), None),
+            _ => ("rename", json!({"from":fx.p("source"),"to":path}), None),
+        };
+        let prepared = fx
+            .ops
+            .prepare_supervised(operation, args.clone(), body.clone(), &key(), &fx.cancel)
+            .unwrap();
+        let input = prepared.child_input();
+        assert_eq!(input.blocked, Some(ErrorCode::TooLarge), "{op}");
+        assert_eq!(input.args, args, "minimal blocked input keeps server paths");
+        assert!(serde_json::to_vec(&input.args).unwrap().len() < 128 * 1024);
+        let child = crate::file_ops::preview_supervised_child(
+            operation,
+            input.args.clone(),
+            body.as_deref(),
+            &key(),
+            true,
+            input.roots.clone(),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                child,
+                SupervisedPreview::Blocked {
+                    code: ErrorCode::TooLarge,
+                    ..
+                }
+            ),
+            "{op}: {child:?}"
+        );
+        assert_eq!(child.preview_etag(), input.preview_etag);
+        assert_eq!(
+            code(fx.ops.execute_supervised(prepared, &fx.cancel)),
+            ErrorCode::Conflict
+        );
+        assert_eq!(fx.get("source"), "old\n");
+    }
+    let huge = json!({"path":fx.p("target"),"unknown":"x".repeat(128*1024)});
+    assert_eq!(
+        code(
+            fx.ops
+                .prepare_supervised("edit", huge, None, &key(), &fx.cancel)
+        ),
+        ErrorCode::TooLarge
+    );
+}
+
+#[test]
+fn text_only_refusals_stay_immediate_for_every_operand() {
+    let fx = Fx::with_policy(|root| {
+        Policy::new(
+            vec![root.to_owned()],
+            vec![super::super::policy::Protected {
+                path: root.join("protected"),
+                subtree: false,
+                deny: super::super::policy::Deny::ReadWrite,
+            }],
+            true,
+        )
+    });
+    for (path, expected) in [
+        (fx.p(".env"), ErrorCode::SecretFile),
+        (fx.p("protected"), ErrorCode::PathDenied),
+        ("/proc/unused".to_owned(), ErrorCode::SpecialFile),
+    ] {
+        for op in [
+            "edit",
+            "write",
+            "delete",
+            "mkdir",
+            "rename-from",
+            "rename-to",
+        ] {
+            let (operation, args, body) = match op {
+                "edit" => (
+                    "edit",
+                    json!({"path":path,"edits":[{"oldText":"a","newText":"b"}]}),
+                    None,
+                ),
+                "write" => ("write", json!({"path":path}), Some(b"new\n".to_vec())),
+                "delete" => ("delete", json!({"path":path}), None),
+                "mkdir" => ("mkdir", json!({"path":path}), None),
+                "rename-from" => ("rename", json!({"from":path,"to":fx.p("target")}), None),
+                _ => ("rename", json!({"from":fx.p("source"),"to":path}), None),
+            };
+            assert_eq!(
+                code(
+                    fx.ops
+                        .prepare_supervised(operation, args, body, &key(), &fx.cancel)
+                ),
+                expected,
+                "{op} {path}"
+            );
+        }
+    }
 }

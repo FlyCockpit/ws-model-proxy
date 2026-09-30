@@ -69,6 +69,7 @@ pub struct SupervisedChildInput {
     pub op: String,
     pub args: Value,
     pub preview_etag: String,
+    pub roots: super::RootSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked: Option<ErrorCode>,
 }
@@ -406,7 +407,25 @@ struct Material {
     fingerprints: Vec<Vec<u8>>,
 }
 
+const MAX_CHILD_ARGS_BYTES: usize = 128 * 1024;
+
+fn check_args_size(args: &Value) -> FileResult<()> {
+    if serde_json::to_vec(args)
+        .map_err(|error| FileError::invalid(format!("argument encoding: {error}")))?
+        .len()
+        > MAX_CHILD_ARGS_BYTES
+    {
+        return Err(FileError::new(
+            ErrorCode::TooLarge,
+            "supervised arguments exceed 128 KiB",
+        ));
+    }
+    Ok(())
+}
+
 fn static_validate(op: &str, raw: Value, body: Option<&[u8]>) -> FileResult<()> {
+    // Only server-supplied bytes may cause an immediate size refusal.
+    check_args_size(&raw)?;
     match op {
         "edit" if body.is_none() => {
             let args: EditArgs = parse(raw)?;
@@ -481,12 +500,7 @@ fn precheck_paths(ops: &FileOps, op: &str, raw: Value) -> FileResult<()> {
         let path = super::resolve::expand(&path)?;
         // Physical resolution and inode policy belong on the blocked screen.
         // Only lexical path refusals can precede the person's dismissal key.
-        match ops.policy.check_path_lexical(access, &path) {
-            Err(error) if matches!(error.code, ErrorCode::PathDenied | ErrorCode::SecretFile) => {
-                return Err(error);
-            }
-            _ => {}
-        }
+        ops.policy.check_path_lexical(access, &path)?;
     }
     Ok(())
 }
@@ -734,6 +748,21 @@ fn request_etag(pin: &PinnedPath) -> Option<String> {
     pin.object
         .as_ref()
         .and_then(|object| object.request_etag.clone())
+}
+
+fn bounded_material(
+    ops: &FileOps,
+    op: &str,
+    raw: Value,
+    body: Option<&[u8]>,
+    key: &EtagKey,
+    cancel: &Cancel,
+) -> FileResult<Material> {
+    let material = material(ops, op, raw, body, key, cancel)?;
+    // Physical path growth is disk state. Both daemon and child turn this
+    // into the same minimal blocked input, never a pre-display rejection.
+    check_args_size(&material.args)?;
+    Ok(material)
 }
 
 fn material(
@@ -1061,27 +1090,28 @@ impl FileOps {
     ) -> FileResult<PreparedSupervised> {
         static_validate(op, args.clone(), body.as_deref())?;
         precheck_paths(self, op, args.clone())?;
-        let material = match material(self, op, args.clone(), body.as_deref(), preview_key, cancel)
-        {
-            Ok(material) => material,
-            Err(error) => {
-                let material = fallback_material(op, args)?;
-                let preview_etag = token(
-                    preview_key,
-                    op,
-                    &material.args,
-                    body.as_deref(),
-                    &material.fingerprints,
-                )?;
-                let child = SupervisedChildInput {
-                    op: op.to_string(),
-                    args: material.args,
-                    preview_etag,
-                    blocked: Some(error.code),
-                };
-                return Ok(PreparedSupervised { child, apply: None });
-            }
-        };
+        let material =
+            match bounded_material(self, op, args.clone(), body.as_deref(), preview_key, cancel) {
+                Ok(material) => material,
+                Err(error) => {
+                    let material = fallback_material(op, args)?;
+                    let preview_etag = token(
+                        preview_key,
+                        op,
+                        &material.args,
+                        body.as_deref(),
+                        &material.fingerprints,
+                    )?;
+                    let child = SupervisedChildInput {
+                        roots: self.policy.root_snapshot(),
+                        op: op.to_string(),
+                        args: material.args,
+                        preview_etag,
+                        blocked: Some(error.code),
+                    };
+                    return Ok(PreparedSupervised { child, apply: None });
+                }
+            };
         match build(self, op, args, body.as_deref(), preview_key, cancel) {
             Ok(built) => {
                 if built.fingerprints != material.fingerprints {
@@ -1093,6 +1123,7 @@ impl FileOps {
                         &material.fingerprints,
                     )?;
                     let child = SupervisedChildInput {
+                        roots: self.policy.root_snapshot(),
                         op: op.to_string(),
                         args: material.args,
                         preview_etag,
@@ -1108,6 +1139,7 @@ impl FileOps {
                     &material.fingerprints,
                 )?;
                 let child = SupervisedChildInput {
+                    roots: self.policy.root_snapshot(),
                     op: op.to_string(),
                     args: material.args,
                     preview_etag,
@@ -1127,6 +1159,7 @@ impl FileOps {
                     &material.fingerprints,
                 )?;
                 let child = SupervisedChildInput {
+                    roots: self.policy.root_snapshot(),
                     op: op.to_string(),
                     args: material.args,
                     preview_etag,
@@ -1151,25 +1184,26 @@ impl FileOps {
         preview_ops.set_rename_atomic_capability(self.rename_atomic_capability());
         static_validate(op, args.clone(), body)?;
         precheck_paths(&preview_ops, op, args.clone())?;
-        let material = match material(&preview_ops, op, args.clone(), body, preview_key, cancel) {
-            Ok(material) => material,
-            Err(error) => {
-                let material = fallback_material(op, args)?;
-                let preview_etag = token(
-                    preview_key,
-                    op,
-                    &material.args,
-                    body,
-                    &material.fingerprints,
-                )?;
-                return Ok(SupervisedPreview::Blocked {
-                    code: error.code,
-                    operation: op.to_string(),
-                    paths: material.paths.into_iter().map(|(_, path)| path).collect(),
-                    preview_etag,
-                });
-            }
-        };
+        let material =
+            match bounded_material(&preview_ops, op, args.clone(), body, preview_key, cancel) {
+                Ok(material) => material,
+                Err(error) => {
+                    let material = fallback_material(op, args)?;
+                    let preview_etag = token(
+                        preview_key,
+                        op,
+                        &material.args,
+                        body,
+                        &material.fingerprints,
+                    )?;
+                    return Ok(SupervisedPreview::Blocked {
+                        code: error.code,
+                        operation: op.to_string(),
+                        paths: material.paths.into_iter().map(|(_, path)| path).collect(),
+                        preview_etag,
+                    });
+                }
+            };
         match build(&preview_ops, op, args, body, preview_key, cancel) {
             Ok(built) => {
                 if built.fingerprints != material.fingerprints {
@@ -1257,9 +1291,10 @@ pub fn preview_supervised_child(
     body: Option<&[u8]>,
     preview_key: &EtagKey,
     allow_root: bool,
+    roots: super::RootSnapshot,
 ) -> FileResult<SupervisedPreview> {
     let ops = FileOps::new(
-        super::Policy::from_environment(Vec::new(), allow_root),
+        super::Policy::from_root_snapshot(roots, allow_root),
         preview_key.clone(),
     );
     ops.preview_supervised(op, args, body, preview_key, &Cancel::new())

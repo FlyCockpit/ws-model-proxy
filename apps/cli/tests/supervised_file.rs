@@ -41,6 +41,10 @@ impl PtyChild {
         );
         builder.env("WSMP_SUPERVISED_FILE_ETAG_KEY", "07".repeat(32));
         builder.env("WSMP_SUPERVISED_FILE_PREIMAGE", &input.preview_etag);
+        builder.env(
+            "WSMP_SUPERVISED_FILE_ROOTS",
+            serde_json::to_string(&input.roots).expect("roots snapshot"),
+        );
         builder.env("WSMP_SUPERVISED_FILE_ALLOW_ROOT", "1");
         if let Some(code) = input.blocked {
             builder.env("WSMP_SUPERVISED_FILE_BLOCKED", code.as_str());
@@ -420,4 +424,168 @@ fn etag(root: &Path, target: &Path) -> String {
     .expect("stat entry")
     .etag
     .expect("strong etag")
+}
+
+#[test]
+fn real_child_configured_root_table_waits_for_keypress_with_matching_codes() {
+    use std::os::unix::fs::PermissionsExt;
+    for state in ["alias", "real", "outside", "escape", "removed", "long"] {
+        for op in [
+            "edit",
+            "write",
+            "delete",
+            "mkdir",
+            "rename-from",
+            "rename-to",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = canonical_root(&dir);
+            let root = base.join("root");
+            let outside = base.join("outside");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(root.join("source"), b"old\n").unwrap();
+            std::fs::write(outside.join("source"), b"outside private context\n").unwrap();
+            std::os::unix::fs::symlink(&root, base.join("alias")).unwrap();
+            std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
+            let ops = FileOps::new(
+                Policy::from_environment(
+                    if state == "long" {
+                        Vec::new()
+                    } else {
+                        vec![root.clone()]
+                    },
+                    true,
+                ),
+                EtagKey::from_bytes([9; 32]),
+            );
+            if state == "removed" {
+                std::fs::remove_dir_all(&root).unwrap();
+            }
+            if state == "long" {
+                let suffix = (0..15)
+                    .map(|_| "a".repeat(240))
+                    .collect::<Vec<_>>()
+                    .join("/");
+                for i in 0..39 {
+                    std::os::unix::fs::symlink(
+                        format!("link{}/{suffix}", i + 1),
+                        root.join(format!("link{i}")),
+                    )
+                    .unwrap();
+                }
+            }
+            let path = match state {
+                "alias" => base.join("alias"),
+                "outside" => outside.clone(),
+                "escape" => root.join("escape"),
+                "long" => root.join("link0"),
+                _ => root.clone(),
+            };
+            let (operation, args, body) = match op {
+                "edit" => (
+                    "edit",
+                    json!({"path":path.join("source"),"edits":[{"oldText":"old","newText":"new"}]}),
+                    None,
+                ),
+                "write" => (
+                    "write",
+                    json!({"path":path.join("target")}),
+                    Some(b"new\n".to_vec()),
+                ),
+                "delete" => ("delete", json!({"path":path.join("source")}), None),
+                "mkdir" => ("mkdir", json!({"path":path.join("target")}), None),
+                "rename-from" => (
+                    "rename",
+                    json!({"from":path.join("source"),"to":root.join("target")}),
+                    None,
+                ),
+                _ => (
+                    "rename",
+                    json!({"from":root.join("source"),"to":path.join("target")}),
+                    None,
+                ),
+            };
+            let prepared = ops
+                .prepare_supervised(
+                    operation,
+                    args,
+                    body.clone(),
+                    &EtagKey::from_bytes(PREVIEW_KEY),
+                    &Cancel::new(),
+                )
+                .unwrap();
+            let body_dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(body_dir.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let body_file = body.as_ref().map(|bytes| {
+                let path = body_dir.path().join("body");
+                std::fs::write(&path, bytes).unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                path
+            });
+            let mut child = PtyChild::spawn(prepared.child_input(), body_file.as_deref());
+            assert!(
+                child.wait_for(&PtyChild::marker("ready")),
+                "{state} {op}: {}",
+                String::from_utf8_lossy(&child.seen)
+            );
+            assert!(
+                !child
+                    .seen
+                    .windows(PtyChild::marker("accepted").len())
+                    .any(|w| w == PtyChild::marker("accepted"))
+            );
+            assert!(!root.join("target").exists());
+            assert!(!outside.join("target").exists());
+            assert_eq!(
+                std::fs::read(outside.join("source")).unwrap(),
+                b"outside private context\n"
+            );
+            if matches!(state, "alias" | "real") {
+                assert_eq!(prepared.child_input().blocked, None);
+                assert!(!String::from_utf8_lossy(&child.seen).contains("Error code:"));
+                child.send(b"q");
+                assert!(child.wait_for(b"Declined."), "{state} {op}");
+                assert_eq!(std::fs::read(root.join("source")).unwrap(), b"old\n");
+            } else {
+                let code = if state == "long" {
+                    wsmp::file_ops::ErrorCode::TooLarge
+                } else {
+                    wsmp::file_ops::ErrorCode::PathDenied
+                };
+                assert_eq!(prepared.child_input().blocked, Some(code));
+                let code = code.as_str();
+                let text = String::from_utf8_lossy(&child.seen);
+                assert!(
+                    text.contains(&format!("Error code: {code}")),
+                    "{state} {op}: {text}"
+                );
+                assert!(!text.contains("outside private context"));
+                assert!(
+                    !child
+                        .seen
+                        .windows(PtyChild::marker(&format!("blocked;{code}")).len())
+                        .any(|w| w == PtyChild::marker(&format!("blocked;{code}")))
+                );
+                child.send(b"\r");
+                assert!(
+                    child.wait_for(&PtyChild::marker(&format!("blocked;{code}"))),
+                    "{state} {op}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn real_child_missing_root_snapshot_has_no_unrestricted_default() {
+    let mut cmd = assert_cmd::Command::cargo_bin("wsmp").unwrap();
+    cmd.args(["terminal", "supervised-file"])
+        .env("WSMP_SUPERVISED_FILE_OP", "mkdir")
+        .env("WSMP_SUPERVISED_FILE_ARGS", r#"{"path":"/tmp/unused"}"#)
+        .env_remove("WSMP_SUPERVISED_FILE_ROOTS");
+    let output = cmd.output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("WSMP_SUPERVISED_FILE_ROOTS"));
 }
