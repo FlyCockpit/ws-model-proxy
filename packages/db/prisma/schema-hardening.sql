@@ -26,7 +26,7 @@ LOCK TABLE "user", cli_device, endpoint, discovered_model, execution_target, mod
   provider_usage_ledger, provider_pricing_version, provider_budget_settlement,
   provider_audit_event, public_provider_attempt_event, relay_execution_attempt,
   relay_execution_event, usage_rollup_minute, usage_rollup_hour,
-  cache_affinity_record, session IN ACCESS EXCLUSIVE MODE NOWAIT;
+  cache_affinity_record, cache_affinity_node, session IN ACCESS EXCLUSIVE MODE NOWAIT;
 
 -- Deploy writer (class D): the backfills below rewrite graph rows while every
 -- table is locked exclusively, so no fence can be contended. The graph-write
@@ -141,18 +141,20 @@ ALTER TABLE model_pool ADD CONSTRAINT model_pool_affinity_policy_check CHECK (
   AND "affinityLoadPenaltyWeight" BETWEEN 0 AND 10000
 );
 
--- Affinity is disposable prediction state. Version 3 separates stable explicit
--- conversation identity from exact cache-prefix bindings. Older predictions
--- cannot be safely reinterpreted and are discarded.
+-- Affinity is disposable prediction state. Greenfield v5 uses cache-prefix
+-- continuity and required session identities; older predictions are discarded.
 DELETE FROM cache_affinity_record
- WHERE "digestVersion" < 3 OR "tenantUserId" IS NULL;
+ WHERE "digestVersion" < 5 OR "tenantUserId" IS NULL;
 ALTER TABLE cache_affinity_record ALTER COLUMN "tenantUserId" SET NOT NULL;
 ALTER TABLE cache_affinity_record ADD COLUMN IF NOT EXISTS "bindingDigest" TEXT;
 DELETE FROM cache_affinity_record WHERE "bindingDigest" IS NULL; -- policy: bounded-delete
 ALTER TABLE cache_affinity_record ALTER COLUMN "bindingDigest" SET NOT NULL;
 ALTER TABLE cache_affinity_record ALTER COLUMN "prefixDigest" DROP NOT NULL;
 ALTER TABLE cache_affinity_record ALTER COLUMN "conversationDigest" DROP NOT NULL;
-ALTER TABLE cache_affinity_record ALTER COLUMN "digestVersion" SET DEFAULT 4;
+ALTER TABLE cache_affinity_record ADD COLUMN IF NOT EXISTS "sessionId" TEXT;
+DELETE FROM cache_affinity_record WHERE "sessionId" IS NULL; -- policy: bounded-delete
+ALTER TABLE cache_affinity_record ALTER COLUMN "sessionId" SET NOT NULL;
+ALTER TABLE cache_affinity_record ALTER COLUMN "digestVersion" SET DEFAULT 5;
 
 CREATE UNIQUE INDEX IF NOT EXISTS cache_affinity_conversation_unique
   ON cache_affinity_record
@@ -161,8 +163,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS cache_affinity_conversation_unique
 
 ALTER TABLE cache_affinity_record DROP CONSTRAINT IF EXISTS cache_affinity_record_shape_check;
 ALTER TABLE cache_affinity_record ADD CONSTRAINT cache_affinity_record_shape_check CHECK (
-  "digestVersion" >= 3
-  AND "prefixDepth" >= 0 AND "prefixDepth" <= 64
+  "digestVersion" >= 5
+  AND "prefixDepth" >= 0
   AND ("estimatedTokens" IS NULL OR "estimatedTokens" >= 0)
   AND "expiresAt" > "createdAt"
   AND length("bindingDigest") BETWEEN 32 AND 128
@@ -172,6 +174,7 @@ ALTER TABLE cache_affinity_record ADD CONSTRAINT cache_affinity_record_shape_che
     OR ("prefixDigest" IS NULL AND "prefixDepth" = 0
         AND "conversationDigest" IS NOT NULL
         AND length("conversationDigest") BETWEEN 32 AND 128))
+  AND length("sessionId") BETWEEN 1 AND 128
   AND length("targetIdentity") BETWEEN 1 AND 2048
 );
 
@@ -227,6 +230,32 @@ DROP TRIGGER IF EXISTS cache_affinity_owner ON cache_affinity_record;
 CREATE TRIGGER cache_affinity_owner
 BEFORE INSERT ON cache_affinity_record
 FOR EACH ROW EXECUTE FUNCTION enforce_cache_affinity_owner();
+
+-- Digest-only class H state; indexed probes are ordered without a population sort.
+ALTER TABLE cache_affinity_node DROP CONSTRAINT IF EXISTS cache_affinity_node_shape_check;
+ALTER TABLE cache_affinity_node ADD CONSTRAINT cache_affinity_node_shape_check CHECK (
+  depth > 0 AND length("rootDigest") BETWEEN 32 AND 128
+  AND length("nodeDigest") BETWEEN 32 AND 128
+  AND length("sessionId") BETWEEN 1 AND 128
+);
+DROP TRIGGER IF EXISTS cache_affinity_node_owner ON cache_affinity_node;
+CREATE TRIGGER cache_affinity_node_owner BEFORE INSERT ON cache_affinity_node
+FOR EACH ROW EXECUTE FUNCTION enforce_cache_affinity_owner();
+CREATE OR REPLACE FUNCTION enforce_cache_affinity_node_immutable()
+RETURNS trigger LANGUAGE plpgsql AS $cache_affinity_node_immutable$
+BEGIN
+  IF (NEW."userId", NEW."tenantUserId", NEW."poolId", NEW."executionTargetId",
+      NEW."rootDigest", NEW."nodeDigest", NEW.depth, NEW."sessionId") IS DISTINCT FROM
+     (OLD."userId", OLD."tenantUserId", OLD."poolId", OLD."executionTargetId",
+      OLD."rootDigest", OLD."nodeDigest", OLD.depth, OLD."sessionId") THEN
+    RAISE EXCEPTION 'cache affinity node identity is immutable' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$cache_affinity_node_immutable$;
+DROP TRIGGER IF EXISTS cache_affinity_node_immutable ON cache_affinity_node;
+CREATE TRIGGER cache_affinity_node_immutable BEFORE UPDATE ON cache_affinity_node
+FOR EACH ROW EXECUTE FUNCTION enforce_cache_affinity_node_immutable();
 
 ALTER TABLE pool_member DROP CONSTRAINT IF EXISTS pool_member_capacity_policy_check;
 ALTER TABLE pool_member ADD CONSTRAINT pool_member_capacity_policy_check CHECK (

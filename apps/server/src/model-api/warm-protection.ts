@@ -393,8 +393,7 @@ type WarmSessionRow = {
 /**
  * Reads the warm set of the given member KV pools with one bounded,
  * non-locking query (indexed by `[executionTargetId, lastUsedAt]`). A session
- * is the set of records that carry one `sessionId` (a row without one is its
- * own session): its age is its newest record's, its size the largest
+ * is the set of records that carry one required `sessionId`: its age is its newest record's, its size the largest
  * `estimatedTokens` among the records of that newest instant (every record of
  * a request carries the whole prompt estimate). Records from every pool of
  * the owner count, since they share the physical KV pool; each session's
@@ -424,7 +423,8 @@ export async function loadWarmSessions({
   const since = new Date(now.getTime() - policy.windowSeconds * 1000);
   const rows = await prisma.$queryRaw<WarmSessionRow[]>(Prisma.sql`
     WITH candidate AS (
-      SELECT r.id, COALESCE(r."sessionId", r.id) AS "sessionKey",
+      -- sessionId is required; there is no legacy id fallback.
+      SELECT r.id, r."sessionId" AS "sessionKey",
              r."tenantUserId", r."poolId", r."userId", r."lastUsedAt",
              r."estimatedTokens", r."executionTargetId", t."inferenceCapacityId" AS "capacityId"
         FROM cache_affinity_record r

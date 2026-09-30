@@ -156,6 +156,10 @@ integration("warm-session protection with real PostgreSQL", () => {
               selectedDiscoveredModelId: model.id,
               warmSessionId: binding!.sessionId,
               warmBindingDigest: binding!.bindingDigest,
+              warmRootDigest: binding!.rootDigest,
+              warmTipDigest: binding!.tipDigest,
+              warmTipDepth: binding!.tipDepth,
+              warmCanonicalBytes: binding!.canonicalBytes,
               expiresAt: new Date(now.getTime() + 60_000),
             },
           });
@@ -167,6 +171,10 @@ integration("warm-session protection with real PostgreSQL", () => {
           const sessionBinding = {
             sessionId: stored.warmSessionId!,
             bindingDigest: stored.warmBindingDigest!,
+            rootDigest: stored.warmRootDigest!,
+            tipDigest: stored.warmTipDigest!,
+            tipDepth: stored.warmTipDepth!,
+            canonicalBytes: stored.warmCanonicalBytes!,
           };
           const payload = { input: `new input ${index}`, previous_response_id: `resp_${index}` };
           const material = affinity.affinityPrefixDigests({
@@ -180,7 +188,10 @@ integration("warm-session protection with real PostgreSQL", () => {
           );
           expect(sessionId).toBe(binding!.sessionId);
           const refreshed = await affinity.rememberAffinity({ ...args, payload, sessionBinding });
-          expect(refreshed).toEqual(binding);
+          expect(refreshed).toMatchObject({
+            sessionId: binding!.sessionId,
+            rootDigest: binding!.rootDigest,
+          });
           const id = crypto.randomUUID();
           const request = await db.admissionRequest.create({
             data: {
@@ -412,6 +423,7 @@ integration("warm-session protection with real PostgreSQL", () => {
       });
       // Realistic retention: 10 000 older records on the same targets.
       const bulk = Array.from({ length: 10_000 }, (_, index) => ({
+        sessionId: `bulk-session-${index}`,
         userId: owner.id,
         tenantUserId: index % 2 ? grantee.id : owner.id,
         poolId: pool.id,
@@ -751,7 +763,7 @@ integration("warm-session protection with real PostgreSQL", () => {
       const ago = (seconds: number) => new Date(now.getTime() - seconds * 1000);
       let sequence = 0;
       const record = (input: {
-        sessionId: string | null;
+        sessionId: string;
         lastUsedAt: Date;
         tokens: number;
         targetId?: string;
@@ -792,9 +804,9 @@ integration("warm-session protection with real PostgreSQL", () => {
           // larger prefix is still what the engine holds.
           record({ sessionId: "shrunk", lastUsedAt: ago(90), tokens: 20_000 }),
           record({ sessionId: "shrunk", lastUsedAt: ago(10), tokens: 3_000 }),
-          // Rows from before session ids existed are one session each.
-          record({ sessionId: null, lastUsedAt: ago(40), tokens: 9_000 }),
-          record({ sessionId: null, lastUsedAt: ago(40), tokens: 9_500 }),
+          // Two required session ids at the same instant remain separate.
+          record({ sessionId: crypto.randomUUID(), lastUsedAt: ago(40), tokens: 9_000 }),
+          record({ sessionId: crypto.randomUUID(), lastUsedAt: ago(40), tokens: 9_500 }),
           // Served by an active lease, by an ended one, by an expired one, by
           // a lease of ANOTHER member, and not served at all.
           record({ sessionId: "busy", lastUsedAt: ago(30), tokens: 15_000 }),
@@ -910,7 +922,7 @@ integration("warm-session protection with real PostgreSQL", () => {
         { age: 34, tokens: 19_000, inFlight: false },
         // Named by A's lease but living on a sibling target of the capacity.
         { age: 36, tokens: 13_000, inFlight: false },
-        // Rows from before session ids existed: one session each.
+        // Distinct committed session ids: one session each.
         { age: 40, tokens: 9_000, inFlight: false },
         { age: 40, tokens: 9_500, inFlight: false },
         // "shrunk": the older, larger turn stays its size.

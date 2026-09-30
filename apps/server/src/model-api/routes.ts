@@ -56,7 +56,7 @@ import {
   buildAffinityTargetIdentity,
   rankAffinityTargets,
   rememberAffinity,
-  scopedAffinitySessionId,
+  resolveAffinitySession,
 } from "./cache-affinity.js";
 import {
   type CacheHolderPlan,
@@ -2886,6 +2886,11 @@ async function writeResponseStickiness({
       selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
       warmSessionId: targetModelPoolId ? (sessionBinding?.sessionId ?? null) : null,
       warmBindingDigest: targetModelPoolId ? (sessionBinding?.bindingDigest ?? null) : null,
+      warmRootDigest: targetModelPoolId ? (sessionBinding?.rootDigest ?? null) : null,
+      warmTipDigest: targetModelPoolId ? (sessionBinding?.tipDigest ?? null) : null,
+      warmTipDepth: targetModelPoolId ? (sessionBinding?.tipDepth ?? null) : null,
+      warmCanonicalBytes: targetModelPoolId ? (sessionBinding?.canonicalBytes ?? null) : null,
+      warmEstimatedTokens: targetModelPoolId ? (sessionBinding?.estimatedTokens ?? null) : null,
       expiresAt,
     },
     update: {
@@ -2899,6 +2904,11 @@ async function writeResponseStickiness({
       selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
       warmSessionId: targetModelPoolId ? (sessionBinding?.sessionId ?? null) : null,
       warmBindingDigest: targetModelPoolId ? (sessionBinding?.bindingDigest ?? null) : null,
+      warmRootDigest: targetModelPoolId ? (sessionBinding?.rootDigest ?? null) : null,
+      warmTipDigest: targetModelPoolId ? (sessionBinding?.tipDigest ?? null) : null,
+      warmTipDepth: targetModelPoolId ? (sessionBinding?.tipDepth ?? null) : null,
+      warmCanonicalBytes: targetModelPoolId ? (sessionBinding?.canonicalBytes ?? null) : null,
+      warmEstimatedTokens: targetModelPoolId ? (sessionBinding?.estimatedTokens ?? null) : null,
       expiresAt,
     },
     select: { id: true },
@@ -3182,6 +3192,11 @@ async function resolveStickyRoute({
       routingVersion: true,
       warmSessionId: true,
       warmBindingDigest: true,
+      warmRootDigest: true,
+      warmTipDigest: true,
+      warmTipDepth: true,
+      warmCanonicalBytes: true,
+      warmEstimatedTokens: true,
       modelApiTokenId: true,
       targetDiscoveredModelId: true,
       targetModelPoolId: true,
@@ -3364,8 +3379,21 @@ async function resolveStickyRoute({
       visibleTarget,
       selectedDiscoveredModelId,
       sessionBinding:
-        record.warmSessionId && record.warmBindingDigest
-          ? { sessionId: record.warmSessionId, bindingDigest: record.warmBindingDigest }
+        record.warmSessionId &&
+        record.warmBindingDigest &&
+        record.warmRootDigest &&
+        record.warmTipDigest &&
+        record.warmTipDepth !== null &&
+        record.warmCanonicalBytes !== null
+          ? {
+              sessionId: record.warmSessionId,
+              bindingDigest: record.warmBindingDigest,
+              rootDigest: record.warmRootDigest,
+              tipDigest: record.warmTipDigest,
+              tipDepth: record.warmTipDepth,
+              canonicalBytes: record.warmCanonicalBytes,
+              estimatedTokens: record.warmEstimatedTokens ?? undefined,
+            }
           : undefined,
     };
   }
@@ -4374,6 +4402,7 @@ async function relayPool({
       requiredFeatures,
       path: operation.path,
       headers: built.headers,
+      affinityHeaders: request.headers,
       body: built.body,
       signal: request.signal,
       releaseLocalCapacity: releaseProviderCapacity,
@@ -5730,6 +5759,7 @@ async function relayPool({
           policy: affinityPolicy,
           surface: requestedSurface,
           payload: affinityPayload,
+          headers: request.headers,
           targets: affinityTargets,
           // S-C: even one member must know whether this is a continuation
           // (only protection needs it: a pool without it pays no extra reads).
@@ -6688,6 +6718,7 @@ async function relayPool({
                   policy: affinityPolicy,
                   surface: requestedSurface,
                   payload: affinityPayload,
+                  headers: request.headers,
                   target: servedAffinityTarget,
                   engineCacheConfirmed: engineCacheConfirmedFromUsageFacts(
                     usageFactsFromRelayTerminal(upstreamTerminal),
@@ -7076,13 +7107,42 @@ async function relaySelectedModelNoFailover({
           accessGrantId: poolAccess?.accessGrantId,
           surface: "OPENAI_RESPONSES",
           payload: operation.contextInput!,
+          headers: request.headers,
+          sessionBinding: operation.sessionBinding,
           runtimeIdentity: boundAffinityTarget.targetIdentity,
         })
       : null;
   const boundSessionId =
-    boundMaterial && selectedPoolMember?.ModelPool?.affinityEnabled
-      ? scopedAffinitySessionId(operation.sessionBinding, boundMaterial.bindingDigest)
-      : undefined;
+    selectedPoolMember?.ModelPool?.affinityEnabled &&
+    boundMaterial &&
+    boundAffinityTarget &&
+    requestedModelPoolId
+      ? await resolveAffinitySession(
+          prisma,
+          {
+            userId: selected.userId,
+            tenantUserId: requester.userId,
+            poolId: requestedModelPoolId,
+            executionTargetId: boundAffinityTarget.executionTargetId,
+          },
+          boundMaterial,
+          new Date(),
+        ).catch((error) => {
+          metadataUpdateError(error);
+          return null;
+        })
+      : null;
+  // Estimate native delta input before provider I/O. EOF only awaits the
+  // bounded affinity transaction, and never repeats serialization/tokenization.
+  const estimatedDeltaTokens =
+    boundMaterial?.boundSessionId && operation.contextInput?.input !== undefined
+      ? (
+          await countSerializedRequestContext({
+            input: { input: operation.contextInput.input },
+            signal: request.signal,
+          })
+        ).tokens
+      : 0;
   let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
   if (capacityRuntime) {
     const identity = selectedPoolMember?.ExecutionTarget ?? selected.ExecutionTarget;
@@ -7281,9 +7341,11 @@ async function relaySelectedModelNoFailover({
                 policy: affinityPolicyForMember(selectedPoolMember),
                 surface: "OPENAI_RESPONSES",
                 payload: operation.contextInput,
+                headers: request.headers,
                 target: boundAffinityTarget,
                 sessionBinding: boundSessionId ? operation.sessionBinding : undefined,
                 estimatedTokens: operation.contextCount?.tokens,
+                estimatedDeltaTokens,
                 engineCacheConfirmed: engineCacheConfirmedFromUsageFacts(
                   usageFactsFromRelayTerminal(terminal),
                 ),
@@ -8598,6 +8660,7 @@ async function relayBoundProviderResponse(input: {
     method: input.method,
     path: input.path,
     headers: input.headers,
+    affinityHeaders: input.request.headers,
     body: input.body,
     signal: input.request.signal,
     liability: conservativeProviderLiability({ estimatedInputTokens, requestedOutputTokens }),

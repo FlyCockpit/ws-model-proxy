@@ -1140,15 +1140,26 @@ integration("DL-1 writer classes and fences on PostgreSQL", () => {
             `INSERT INTO cache_affinity_record
                (id, "createdAt", "lastUsedAt", "expiresAt", "userId", "tenantUserId", "poolId",
                 "executionTargetId", "targetIdentity", "digestVersion", "bindingDigest", "prefixDigest",
-                "conversationDigest", "prefixDepth")
+                "conversationDigest", "prefixDepth", "sessionId")
              VALUES ('${label}-${suffix}', now(), now(), now() + interval '1 hour', '${user.id}',
-               '${user.id}', '${poolId}', '${targetId}', repeat('t', 32), 3, repeat('d', 43),
-               repeat('${label.length % 10}', 43), NULL, 1)`,
+               '${user.id}', '${poolId}', '${targetId}', repeat('t', 32), 5, repeat('d', 43),
+               repeat('${label.length % 10}', 43), NULL, 1, '${label}-${suffix}')`,
           ),
         );
       expect(await insert("foreign-pool", foreignPool.id, own.target.id)).toContain("23514");
       expect(await insert("foreign-target", ownPool.id, foreign.target.id)).toContain("23514");
       expect(await insert("gone-pool", `gone-${suffix}`, own.target.id)).toBe("ok");
+      const insertNode = (label: string, poolId: string, targetId: string) =>
+        attempt(
+          (tx) =>
+            tx.$executeRaw`INSERT INTO cache_affinity_node
+          (id, "userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest", "nodeDigest", depth, "sessionId", "isTip", "expiresAt")
+          VALUES (${`node-${label}-${suffix}`}, ${user.id}, ${user.id}, ${poolId}, ${targetId},
+            ${"r".repeat(43)}, ${"n".repeat(43)}, 1, ${`session-${label}-${suffix}`}, true, ${new Date(Date.now() + 60000)})`,
+        );
+      expect(await insertNode("foreign-pool", foreignPool.id, own.target.id)).toContain("23514");
+      expect(await insertNode("foreign-target", ownPool.id, foreign.target.id)).toContain("23514");
+      expect(await insertNode("gone-pool", `gone-${suffix}`, own.target.id)).toBe("ok");
     });
   });
 });

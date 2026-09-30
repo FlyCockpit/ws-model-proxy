@@ -586,6 +586,24 @@ export async function drainParentDeletionHistory(
       ),
     );
 
+  const affinityNodeDelete = edgeFilters(
+    "a",
+    HISTORY_DRAIN_EDGES.cache_affinity_node.delete,
+    parents,
+  );
+  if (affinityNodeDelete.length > 0)
+    await drainLoop(report, "cache_affinity_node.delete", budget, size, () =>
+      inBatch(
+        (tx) => tx.$executeRaw`
+        DELETE FROM cache_affinity_node
+         WHERE id IN (
+           SELECT a.id FROM cache_affinity_node a
+            WHERE ${Prisma.join(affinityNodeDelete, " OR ")}
+            LIMIT ${size.limit}
+              FOR UPDATE SKIP LOCKED)`,
+      ),
+    );
+
   // The user's terminal admission requests, with their waiters and lease
   // (H-internal ON DELETE CASCADE). The DELETE cascades into every waiter of
   // the request, and a waiter another transaction holds would make it wait.

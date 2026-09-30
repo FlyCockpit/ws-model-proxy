@@ -34,9 +34,12 @@ const requiredFragments = [
   "relay_execution_attempt_transition",
   "historical-split",
   "cache_affinity_record_shape_check",
+  "cache_affinity_node_shape_check",
+  "cache_affinity_node_owner",
+  'ALTER COLUMN "sessionId" SET NOT NULL',
   "cache_affinity_conversation_unique",
   "enforce_cache_affinity_identity_immutable",
-  'DELETE FROM cache_affinity_record\n WHERE "digestVersion" < 3',
+  'DELETE FROM cache_affinity_record\n WHERE "digestVersion" < 5',
   'ALTER COLUMN "tenantUserId" SET NOT NULL',
   'ALTER COLUMN "bindingDigest" SET NOT NULL',
   "pool_member_capacity_policy_check",
@@ -1202,16 +1205,16 @@ try {
     INSERT INTO cache_affinity_record
       (id, "createdAt", "lastUsedAt", "expiresAt", "userId", "tenantUserId", "poolId",
        "executionTargetId", "targetIdentity", "digestVersion", "bindingDigest", "prefixDigest",
-       "conversationDigest", "prefixDepth")
+       "conversationDigest", "prefixDepth", "sessionId")
     SELECT 'affinity-a', NOW(), NOW(), NOW() + interval '1 hour', 'owner-a', 'owner-b',
-      'pool-a', id, repeat('t', 32), 3, repeat('d', 43), repeat('p', 43), NULL, 1
+      'pool-a', id, repeat('t', 32), 5, repeat('d', 43), repeat('p', 43), NULL, 1, 'affinity-a-session'
       FROM execution_target WHERE "discoveredModelId" = 'model-a';
     INSERT INTO cache_affinity_record
       (id, "createdAt", "lastUsedAt", "expiresAt", "userId", "tenantUserId", "poolId",
        "executionTargetId", "targetIdentity", "digestVersion", "bindingDigest", "prefixDigest",
-       "conversationDigest", "prefixDepth")
+       "conversationDigest", "prefixDepth", "sessionId")
     SELECT 'affinity-b', NOW(), NOW(), NOW() + interval '1 hour', 'owner-a', 'owner-b',
-      'pool-a', id, repeat('t', 32), 3, repeat('d', 43), NULL, repeat('b', 43), 0
+      'pool-a', id, repeat('t', 32), 5, repeat('d', 43), NULL, repeat('b', 43), 0, 'affinity-b-session'
       FROM execution_target WHERE "discoveredModelId" = 'model-a';
   `);
   const conversationRows = await client.query(`
@@ -1226,10 +1229,10 @@ try {
     INSERT INTO cache_affinity_record
       (id, "createdAt", "lastUsedAt", "expiresAt", "userId", "tenantUserId", "poolId",
        "executionTargetId", "targetIdentity", "digestVersion", "bindingDigest", "prefixDigest",
-       "conversationDigest", "prefixDepth")
+       "conversationDigest", "prefixDepth", "sessionId")
     SELECT 'affinity-conversation-duplicate', NOW(), NOW(), NOW() + interval '1 hour',
-      'owner-a', 'owner-b', 'pool-a', id, repeat('t', 32), 3, repeat('d', 43), NULL,
-      repeat('b', 43), 0
+      'owner-a', 'owner-b', 'pool-a', id, repeat('t', 32), 5, repeat('d', 43), NULL,
+      repeat('b', 43), 0, 'duplicate-session'
       FROM execution_target WHERE "discoveredModelId" = 'model-a'
   `,
     "23505",
@@ -1243,9 +1246,9 @@ try {
     INSERT INTO cache_affinity_record
       (id, "createdAt", "lastUsedAt", "expiresAt", "userId", "tenantUserId", "poolId",
        "executionTargetId", "targetIdentity", "digestVersion", "bindingDigest", "prefixDigest",
-       "conversationDigest", "prefixDepth")
+       "conversationDigest", "prefixDepth", "sessionId")
     SELECT 'affinity-cross-owner', NOW(), NOW(), NOW() + interval '1 hour', 'owner-b',
-      'owner-b', 'pool-a', id, repeat('t', 32), 3, repeat('d', 43), repeat('q', 43), NULL, 1
+      'owner-b', 'pool-a', id, repeat('t', 32), 5, repeat('d', 43), repeat('q', 43), NULL, 1, 'test-session'
       FROM execution_target WHERE "discoveredModelId" = 'model-a'
   `,
     // DL-1 (d): the cache_affinity_owner trigger, not a foreign key.
@@ -1255,9 +1258,9 @@ try {
     INSERT INTO cache_affinity_record
       (id, "createdAt", "lastUsedAt", "expiresAt", "userId", "tenantUserId", "poolId",
        "executionTargetId", "targetIdentity", "digestVersion", "bindingDigest", "prefixDigest",
-       "conversationDigest", "prefixDepth")
+       "conversationDigest", "prefixDepth", "sessionId")
     SELECT 'affinity-expired', NOW(), NOW(), NOW(), 'owner-a', 'owner-a', 'pool-a', id,
-      repeat('t', 32), 3, repeat('d', 43), repeat('q', 43), NULL, 1
+      repeat('t', 32), 5, repeat('d', 43), repeat('q', 43), NULL, 1, 'test-session'
       FROM execution_target WHERE "discoveredModelId" = 'model-a'
   `);
   await expectConstraintFailure(
@@ -1951,7 +1954,19 @@ try {
   const ownerRow = await client.query(`SELECT id FROM "user" ORDER BY id LIMIT 1`);
   const ownerId = ownerRow.rows[0]?.id;
   if (!ownerId) throw new Error("Hardening fixture has no user row");
+  await client.query(`
+    INSERT INTO cache_affinity_record
+      (id, "createdAt", "lastUsedAt", "expiresAt", "userId", "tenantUserId", "poolId",
+       "executionTargetId", "targetIdentity", "digestVersion", "bindingDigest", "prefixDigest",
+       "prefixDepth", "sessionId")
+      SELECT 'affinity-null-session', "createdAt", "lastUsedAt", "expiresAt", "userId", "tenantUserId", "poolId",
+        "executionTargetId", "targetIdentity", "digestVersion", "bindingDigest", repeat('s', 43), 1, 'legacy-session'
+      FROM cache_affinity_record WHERE id = 'affinity-a'`);
   await client.query(`ALTER TABLE cache_affinity_record DISABLE TRIGGER USER`);
+  await client.query(`ALTER TABLE cache_affinity_record ALTER COLUMN "sessionId" DROP NOT NULL`);
+  await client.query(
+    `UPDATE cache_affinity_record SET "sessionId" = NULL WHERE id = 'affinity-null-session'`,
+  );
   await client.query(`ALTER TABLE cache_affinity_record ALTER COLUMN "tenantUserId" DROP NOT NULL`);
   await client.query(
     `ALTER TABLE cache_affinity_record ALTER COLUMN "bindingDigest" DROP NOT NULL`,
@@ -1978,16 +1993,16 @@ try {
   if (!safeFailed) throw new Error("Safe pre-push NULL cleanup did not refuse legacy rows");
   const beforeDangerous = await client.query(`
     SELECT count(*)::int AS count FROM cache_affinity_record
-     WHERE id IN ('affinity-a', 'affinity-b')
-       AND ("tenantUserId" IS NULL OR "bindingDigest" IS NULL)
+     WHERE id IN ('affinity-a', 'affinity-b', 'affinity-null-session')
+       AND ("tenantUserId" IS NULL OR "bindingDigest" IS NULL OR "sessionId" IS NULL)
   `);
-  if (beforeDangerous.rows[0].count !== 2)
+  if (beforeDangerous.rows[0].count !== 3)
     throw new Error("Safe mode must not delete incompatible affinity rows");
   await runPrePushNullCleanup(client, { dangerous: true });
   const affinityLeft = await client.query(`
     SELECT count(*)::int AS count FROM cache_affinity_record
-     WHERE id IN ('affinity-a', 'affinity-b')
-       AND ("tenantUserId" IS NULL OR "bindingDigest" IS NULL)
+     WHERE id IN ('affinity-a', 'affinity-b', 'affinity-null-session')
+       AND ("tenantUserId" IS NULL OR "bindingDigest" IS NULL OR "sessionId" IS NULL)
   `);
   const credentialLeft = await client.query(
     `SELECT count(*)::int AS count FROM cli_device_credential WHERE id = $1`,

@@ -234,19 +234,67 @@ capacity is shared between the people whose sessions are warm
 - `FIXED_PERCENT`: each user may keep `protectionFixedPercent` % of the slots.
 - `FIRST_COME`: no per-user cap.
 
-A session is identified by the session id its routing records carry
-(`cache_affinity_record.sessionId`). A request stamps every record it writes
-with the session it continues (an explicit conversation's own record, else the
-deepest cumulative prefix its history still shares with an earlier turn) or with
-a fresh id, so its newest turn sets its age and size. An active lease is tied to its session through the
-admission request (`admission_request.warmSessionIds`, the sessions the request
-continues on its candidate members; a lease serves only the sessions of its own
-execution target). Rows written before session ids existed are one session each.
-Known limits, handled in #160: an implicit conversation (no conversation id) that
-edits or shortens its history, or changes tools, instructions or request
-parameters between turns, can leave the earlier turn counted as a second session
-until the window ends; and two implicit conversations that open with the same
-message can be counted as one session. The records of
+A valid client conversation id is authoritative, even when instructions change.
+Without one, continuity uses the last 64 digest-chain nodes, deepest first: a
+live tip wins by earliest expiry then session id; otherwise a sole ancestor
+owner permits edits/truncations. Ambiguous ancestors start a fresh session.
+Instructions, tools, semantic and unknown parameters bind the root; only the
+16 approved sampling parameters are free. Root/instruction warmth alone never
+links sessions.
+
+The first valid carrier wins: body `conversation`, then `conversation_id`
+(string or object with string `id`), then OpenAI `prompt_cache_key`; headers
+`x-conversation-id`, `session_id`, `session-id`, `x-session-id`, then
+`x-claude-code-session-id`; finally Anthropic `metadata.user_id` containing
+`_session_<uuid>` (only the UUID). Header names ignore case. Ids are trimmed
+strings of 1–256 characters from `[A-Za-z0-9._:/@=+-]`; invalid carriers fall
+through without errors. Only the original authenticated request supplies ids.
+They are HMACed with requester tenant, resource owner, token scope, grant,
+pool, target/runtime and surface, so the same string cannot cross those
+boundaries. Raw ids are never stored. Session headers are read separately from
+the upstream header allowlist, including external fallback.
+
+Carrier research (2026-09-30; behavior can vary by client version):
+
+| Carrier | Evidence and confidence |
+| --- | --- |
+| `conversation` / `conversation_id` (string or `id` object) | High confidence in this project's existing request support and tests; no assertion that Codex/OpenCode sends these by default. |
+| `prompt_cache_key` | High: [Codex source](https://github.com/openai/codex/blob/main/codex-rs/core/src/client.rs) uses the session id, with overrides/internal-parent variants; [OpenCode provider options](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/provider/transform.ts) set `promptCacheKey` from the session, subject to provider configuration. The AI SDK maps it to `prompt_cache_key` on [Chat](https://github.com/vercel/ai/blob/main/packages/openai/src/chat/openai-chat-language-model.ts) and [Responses](https://github.com/vercel/ai/blob/main/packages/openai/src/responses/openai-responses-language-model.ts). |
+| `x-conversation-id` | Generic carrier for custom clients; low confidence that the named clients send it by default. No local producer found. |
+| `session_id` | Alternate spelling; medium confidence in older/client-plugin behavior, not confirmed as current Codex's spelling. |
+| `session-id` | High: current [Codex header builder](https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/requests/headers.rs) sends this spelling. |
+| `x-session-id` | High: [OpenCode request preparation](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/session/llm/request.ts) and [session runner](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/runner/llm.ts) send `X-Session-Id`; provider/version settings can differ. |
+| `x-claude-code-session-id` | High: the official [Claude Code changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) records its addition in v2.1.86. |
+| Anthropic `_session_<uuid>` in `metadata.user_id` | Medium for historical behavior: a [Claude Code issue's bundled-code report](https://github.com/anthropics/claude-code/issues/15782) shows this format. No claim that all current versions use it; the header is preferred. |
+
+**Limits without client ids:** user-only starters always start fresh, including
+truncation to a starter. In all six causal arrival orders of A1, B1, A2, B2
+(A1 before A2; B1 before B2), identical user-only A1/B1 create two sessions.
+Distinct A2/B2 advance separate tips, sometimes exchanging starter labels;
+identical A2/B2 merge at the deepest tip. Edits at shared ancestors can also
+split/join siblings. Distinct client ids keep the two conversations separate.
+
+Native Responses appends input deltas to the committed parent chain; stateless
+full history containing the same create+delta units can match those retained
+nodes when it contains continuation evidence (assistant/tool output). A
+user-only history stays fresh under the starter rule. A missing/expired parent
+publishes no delta-only nodes, including with a client id; that id can still
+identify the session footprint. Histories over 2 MB publish no nodes or lineage.
+
+Retention keeps at most 64 nodes and one tip per session, plus a separate
+session footprint. Bound turns refresh the committed token estimate with a
+delta estimate computed before dispatch (empty deltas carry size forward).
+EOF awaits the affinity commit before saving Responses warm lineage. Persistence
+uses `maxWait=2000ms`, `timeout=2500ms`, and `lock_timeout=1000ms`; errors save the
+Responses binding without a warm link. Resolution uses at most 64 indexed
+LIMIT 1/2 probes. Expiry cleanup takes at most 200 rows per table per completion;
+the background sweeper drains the rest. Retention eviction also takes 200 rows
+per completion, so reducing a cap converges over subsequent writes. Normal
+writes add fewer than that batch. Pool clear and deleted-user drains remove both
+tables; v5 discards older/null-session rows. Active leases name committed session
+ids in `admission_request.warmSessionIds`.
+
+The records of
 every pool of the owner on the member count; each session's override comes from
 its own pool (grant, or the owner's percent), each distinct override is its own
 budget (the share mode, window and minimum size are the requesting pool's), and one user's total never exceeds their largest share. `UNPROTECTED`

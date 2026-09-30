@@ -101,10 +101,10 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     loadPenaltyWeight: 100,
   };
 
-  it("keeps a conversation on its target across changed turn fields without leaking across tenant, token, or runtime", async () => {
+  it("starts a new root while the authoritative client id retains routing without leaking across tenant, token, or runtime", async () => {
     if (!db) return;
     const row = await fixture();
-    await service.rememberAffinity({
+    const first = await service.rememberAffinity({
       ownerId: row.tenant.id,
       resourceOwnerId: row.owner.id,
       poolId: row.pool.id,
@@ -131,7 +131,7 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
       },
     });
     expect(created.length).toBeGreaterThan(0);
-    expect(created.every((record) => record.digestVersion === 4)).toBe(true);
+    expect(created.every((record) => record.digestVersion === 5)).toBe(true);
     expect(
       created
         .filter((record) => record.prefixDigest !== null)
@@ -155,8 +155,22 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
       payload: changedTurn,
       targets: [row.target(1), row.target(0)],
     });
+    // A client id is authoritative across root changes. It keeps the session
+    // footprint/routing bonus, but never claims conversation-prefix cache reuse.
     expect(ranked.orderedTargetIds[0]).toBe(row.target(0).executionTargetId);
     expect(ranked.conversationMatches[row.target(0).executionTargetId]).toBe(true);
+    expect(ranked.matchedSessionIds?.[row.target(0).executionTargetId]).toBe(first!.sessionId);
+    const changedMaterial = service.affinityPrefixDigests({
+      ownerId: row.tenant.id,
+      resourceOwnerId: row.owner.id,
+      poolId: row.pool.id,
+      securityScope: "token-a",
+      accessGrantId: "grant-a",
+      surface: "OPENAI_RESPONSES",
+      payload: changedTurn,
+      runtimeIdentity: row.target(0).targetIdentity,
+    });
+    expect(changedMaterial.rootDigest).not.toBe(first!.rootDigest);
     expect(ranked.prefixDepths[row.target(0).executionTargetId]).toBe(0);
 
     for (const isolation of [
@@ -275,16 +289,23 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     // a tenant's records never join another tenant's.
     const explicit = (temperature: number, text: string) => ({
       conversation: "conv-1",
-      input: text,
+      input: [
+        { role: "user", content: "one" },
+        { role: "assistant", content: text },
+      ],
       temperature,
     });
     const responses = { surface: "OPENAI_RESPONSES" };
-    await remember(explicit(0.1, "one"), 8, 0, responses);
+    const explicitFirst = await remember(explicit(0.1, "one"), 8, 0, responses);
     const afterFirst = await sessions();
     await remember(explicit(0.9, "one and two"), 9, 0, responses);
     expect((await sessions()).size).toBe(afterFirst.size);
     const conversationRecords = await db.cacheAffinityRecord.findMany({
-      where: { tenantUserId: row.tenant.id, poolId: row.pool.id, prefixDigest: null },
+      where: {
+        tenantUserId: row.tenant.id,
+        poolId: row.pool.id,
+        sessionId: explicitFirst!.sessionId,
+      },
       select: { sessionId: true },
     });
     expect(new Set(conversationRecords.map((record) => record.sessionId)).size).toBe(1);
@@ -307,7 +328,7 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     ).toBe(false);
   });
 
-  it("persists one bounded conversation-only record under concurrent refreshes", async () => {
+  it("persists exactly one session footprint and one conversation hint under concurrent refreshes", async () => {
     if (!db) return;
     const row = await fixture();
     const args = {
@@ -330,9 +351,14 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
         digestVersion: true,
       },
     });
-    expect(records).toHaveLength(1);
-    expect(records[0]).toMatchObject({ prefixDigest: null, prefixDepth: 0, digestVersion: 4 });
-    expect(records[0]?.conversationDigest).toHaveLength(43);
+    // Root-only client requests have no prefix rows: one independent footprint
+    // plus one conversation hint. maxRecords is a ceiling, not a target size.
+    expect(records).toHaveLength(2);
+    for (const record of records) {
+      expect(record).toMatchObject({ prefixDigest: null, prefixDepth: 0, digestVersion: 5 });
+      expect(record.conversationDigest).toHaveLength(43);
+    }
+    expect(new Set(records.map((record) => record.conversationDigest)).size).toBe(2);
   });
 
   it("serializes concurrent remembers and enforces a bound independently per target and tenant", async () => {
@@ -364,7 +390,7 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     });
     expect(grouped.find((entry) => entry.tenantUserId === row.tenant.id)?._count._all).toBe(3);
     expect(grouped.filter((entry) => entry.tenantUserId === row.tenant.id)).toHaveLength(2);
-    expect(grouped.find((entry) => entry.tenantUserId === row.otherTenant.id)?._count._all).toBe(2);
+    expect(grouped.find((entry) => entry.tenantUserId === row.otherTenant.id)?._count._all).toBe(3);
   });
 
   it("makes cleanup idempotent and safe against a concurrent refresh", async () => {
@@ -389,7 +415,7 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
       await db.cacheAffinityRecord.count({
         where: { tenantUserId: row.tenant.id, poolId: row.pool.id, expiresAt: { gt: new Date() } },
       }),
-    ).toBe(1);
+    ).toBe(2);
     let swept = 1;
     for (let attempt = 0; attempt < 100 && swept > 0; attempt += 1) {
       swept = await service.sweepExpiredAffinity({ now: new Date(), limit: 10 });

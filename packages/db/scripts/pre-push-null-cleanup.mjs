@@ -4,7 +4,7 @@
  * mode (--accept-data-loss) deletes them.
  *
  * Authority per check:
- * - `cache_affinity_record."tenantUserId"` / `"bindingDigest"`: the same
+ * - `cache_affinity_record."tenantUserId"` / `"bindingDigest"` / `"sessionId"`: the same
  *   predicates schema-hardening.sql deletes after the push (its
  *   `"tenantUserId" IS NULL` and `"bindingDigest" IS NULL` DELETEs); running
  *   them first only moves that deletion ahead of the push.
@@ -18,6 +18,11 @@
  * no dependency beyond the file itself.
  */
 const CHECKS = [
+  {
+    table: "cache_affinity_record",
+    column: "sessionId",
+    dangerousDelete: `DELETE FROM cache_affinity_record WHERE "sessionId" IS NULL`,
+  },
   {
     table: "cache_affinity_record",
     column: "tenantUserId",

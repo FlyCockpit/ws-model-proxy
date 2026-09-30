@@ -109,8 +109,12 @@ function extractChat(payload: Record<string, unknown>): AffinityLayers {
       else pushJson(conversationUnits, item);
     }
   }
-  const { tools, consumed } = extractTools(payload);
-  if (consumed) consumedKeys.push("tools");
+  const extracted = extractTools(payload);
+  const functions = asJson(payload.functions);
+  const tools =
+    functions === undefined ? extracted.tools : { tools: extracted.tools ?? null, functions };
+  if (extracted.consumed) consumedKeys.push("tools");
+  if (functions !== undefined) consumedKeys.push("functions");
   return { instructionUnits, conversationUnits, tools, consumedKeys, isContinuation };
 }
 
@@ -144,6 +148,7 @@ function extractResponses(payload: Record<string, unknown>): AffinityLayers {
     consumedKeys.push("instructions");
     pushJson(instructionUnits, payload.instructions);
   }
+  if (payload.previous_response_id !== undefined) consumedKeys.push("previous_response_id");
   const input = payload.input;
   if (typeof input === "string") {
     consumedKeys.push("input");

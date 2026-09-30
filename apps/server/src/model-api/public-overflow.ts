@@ -187,6 +187,8 @@ export interface PublicOverflowRequest {
   requiredFeatures: readonly string[];
   path: string;
   headers: Headers;
+  /** Original authenticated request headers; kept separate from upstream allowlists. */
+  affinityHeaders?: Headers;
   body: Uint8Array;
   signal: AbortSignal;
   liability: ProviderLiability;
@@ -2496,8 +2498,12 @@ export async function rankPublicOverflowTargets(input: {
     accessGrantId: input.request.affinityAccessGrantId,
     policy: input.policy,
     surface: input.request.requestedSurface,
+    headers: input.request.affinityHeaders ?? input.request.headers,
     payload,
     targets: affinityTargets,
+    // Dispatch may already be pinned by capacity admission. Still resolve
+    // identity so rank and the eventual write agree on client carriers.
+    scoreSingleTarget: true,
   });
   const byId = new Map(input.targets.map((target) => [target.executionTargetId, target]));
   return {
@@ -3779,6 +3785,7 @@ export async function dispatchPublicOverflow(
                   policy: listed.affinityPolicy,
                   surface: request.requestedSurface,
                   payload: parsed as Record<string, unknown>,
+                  headers: request.affinityHeaders ?? request.headers,
                   target: target.affinityTarget,
                   engineCacheConfirmed: engineCacheConfirmedFromUsage(settledUsage),
                   estimatedTokens:

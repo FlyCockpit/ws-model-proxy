@@ -360,6 +360,102 @@ function dispatchPoolFixture(
   };
 }
 
+it.each([
+  { carrier: "conversation", body: true, invalid: false },
+  { carrier: "conversation_id", body: true, invalid: false },
+  { carrier: "prompt_cache_key", body: true, invalid: false },
+  { carrier: "session-id", body: false, invalid: false },
+  { carrier: "conversation", body: true, invalid: true },
+  { carrier: "session-id", body: false, invalid: true },
+])(
+  "U3 pinned provider rank resolves $carrier invalid=$invalid with tenant isolation",
+  async ({ carrier, body, invalid }) => {
+    const pool = dispatchPoolFixture();
+    Object.assign(pool, {
+      affinityEnabled: true,
+      affinityTtlSeconds: 600,
+      affinityMaxRecords: 100,
+      affinityPrefixWeight: 100,
+      affinityConversationWeight: 150,
+      affinityConfirmedCacheWeight: 250,
+      affinityLoadPenaltyWeight: 100,
+    });
+    db.modelPool.findFirst.mockResolvedValue(pool);
+    db.providerAttempt.groupBy.mockResolvedValue([]);
+    db.providerPricingVersion.findFirst.mockResolvedValue(null);
+    db.cacheAffinityRecord.findMany.mockResolvedValue([]);
+    db.capacityLease.groupBy.mockResolvedValue([]);
+    db.capacityWaiter.groupBy.mockResolvedValue([]);
+    const listed = await listPublicOverflowTargets("owner", "pool");
+    expect(listed.targets).toHaveLength(1);
+    const value = invalid ? "bad#id" : "client";
+    const payload = {
+      model: "pool",
+      messages: [{ role: "user", content: "starter" }],
+      ...(body ? { [carrier]: value } : {}),
+    };
+    const request = {
+      userId: "owner",
+      poolId: "pool",
+      requestId: "carrier-rank",
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY" as const,
+      ...ownerConsentFields(),
+      requestedProtocol: "openai" as const,
+      requestedSurface: "openai-chat" as const,
+      stream: false,
+      requiredFeatures: [],
+      path: "/v1/chat/completions",
+      headers: new Headers(),
+      signal: new AbortController().signal,
+      liability: { accountingVersion: "provider-billable-v1" as const },
+      releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+      adaptationEnabled: false,
+      retrySafe: false,
+      affinityTenantUserId: "tenant",
+      affinitySecurityScope: "token",
+      affinityAccessGrantId: "grant",
+      affinityHeaders: new Headers(body ? {} : { [carrier]: value }),
+      body: new TextEncoder().encode(JSON.stringify(payload)),
+    };
+    const ranked = await rankPublicOverflowTargets({
+      request,
+      policy: listed.affinityPolicy,
+      targets: listed.targets,
+    });
+    const target = ranked.targets[0]!;
+    const { affinityPrefixDigests } = await import("./cache-affinity.js");
+    const material = affinityPrefixDigests({
+      ownerId: "tenant",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      accessGrantId: "grant",
+      surface: "openai-chat",
+      payload,
+      headers: request.affinityHeaders,
+      runtimeIdentity: target.affinityTarget!.targetIdentity,
+    });
+    expect(ranked.decision?.matchedSessionIds?.[target.executionTargetId]).toBe(
+      material.clientSessionId,
+    );
+    expect(material.clientSessionId === undefined).toBe(invalid);
+    if (!invalid)
+      expect(
+        affinityPrefixDigests({
+          ownerId: "other-tenant",
+          resourceOwnerId: "owner",
+          poolId: "pool",
+          securityScope: "token",
+          accessGrantId: "grant",
+          surface: "openai-chat",
+          payload,
+          headers: request.affinityHeaders,
+          runtimeIdentity: target.affinityTarget!.targetIdentity,
+        }).clientSessionId,
+      ).not.toBe(material.clientSessionId);
+  },
+);
+
 it("excludes protocol-mismatched legacy inventories before egress", async () => {
   const fixture = dispatchPoolFixture();
   const model = fixture.PoolMembers[0]!.ExecutionTarget.ProviderModel;
@@ -1601,6 +1697,7 @@ describe("public overflow terminal response dispatch", () => {
       requiredFeatures: [],
       path: "/v1/chat/completions",
       headers: new Headers(),
+      affinityHeaders: new Headers({ "x-session-id": "ranking-client" }),
       body: new TextEncoder().encode('{"model":"pool","messages":[{"role":"user","content":"x"}]}'),
       signal: new AbortController().signal,
       liability: { accountingVersion: "provider-billable-v1" },
@@ -1621,6 +1718,21 @@ describe("public overflow terminal response dispatch", () => {
     ]);
     expect(ranked.targets[0]?.affinity?.reason).toContain("publicPenalty:100");
     expect(ranked.targets[1]?.affinity?.reason).toContain("active:1");
+
+    const { affinityPrefixDigests } = await import("./cache-affinity.js");
+    for (const target of ranked.targets) {
+      expect(ranked.decision?.matchedSessionIds?.[target.executionTargetId]).toBe(
+        affinityPrefixDigests({
+          ownerId: "owner",
+          resourceOwnerId: "owner",
+          poolId: "pool",
+          surface: "openai-chat",
+          payload: { model: "pool", messages: [{ role: "user", content: "x" }] },
+          headers: request.affinityHeaders,
+          runtimeIdentity: target.affinityTarget!.targetIdentity,
+        }).clientSessionId,
+      );
+    }
 
     db.providerAttempt.groupBy.mockResolvedValue([]);
     db.providerPricingVersion.findFirst
@@ -2314,6 +2426,7 @@ describe("public overflow terminal response dispatch", () => {
         requiredFeatures: [],
         path: "/v1/chat/completions",
         headers: new Headers({ "content-type": "application/json" }),
+        affinityHeaders: new Headers({ "session-id": "overflow-client" }),
         body: new TextEncoder().encode(
           '{"model":"pool","messages":[{"role":"user","content":"affinity evidence"}]}',
         ),
@@ -2332,6 +2445,7 @@ describe("public overflow terminal response dispatch", () => {
       // The affinity write is best-effort and errors are swallowed, so the
       // spy must witness the call itself rather than its downstream effects.
       await vi.waitFor(() => expect(rememberAffinity).toHaveBeenCalledTimes(1));
+      expect(rememberAffinity.mock.calls[0]?.[0].headers.get("session-id")).toBe("overflow-client");
       expect(rememberAffinity.mock.calls[0]?.[0]).toMatchObject({
         engineCacheConfirmed: fixture.engineCacheConfirmed,
       });
