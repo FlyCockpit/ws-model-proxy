@@ -1567,10 +1567,14 @@ describe("supervised commands", () => {
       ["banned-owner", "refused", "token_inactive"],
       ["revoked-token", "cancelled", "token_inactive"],
       ["accepted-revoked-token", "unknown", "token_inactive"],
+      ["expired-token", "cancelled", "token_inactive"],
+      ["accepted-expired-token", "unknown", "token_inactive"],
     ] as const)(
       "audits supervised file %s exactly once as %s with metadata only",
       async (event, outcome, code) => {
         vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+        vi.setSystemTime(now);
+        const tokenExpiry = new Date(now.getTime() + 1000);
         const socket = await connect("desktop", {
           terminalSupported: event !== "admission-refusal",
           grant: event === "admission-grant" ? "OFF" : "SUPERVISED",
@@ -1581,10 +1585,13 @@ describe("supervised commands", () => {
           socket.sends.length = 0;
         }
         if (event === "inactive-token") db.mcpPersonalToken.findFirst.mockResolvedValueOnce(null);
+        if (event.endsWith("expired-token"))
+          db.mcpPersonalToken.findFirst.mockResolvedValueOnce(liveToken("Agent", tokenExpiry));
         if (event === "banned-owner") db.user.findUnique.mockResolvedValueOnce({ banned: true });
         const dispatch = vi.spyOn(relaySessionManager, "dispatchSupervisedSpawn");
         const body = encode("AUDIT BODY TEXT");
         const starting = fileStart({
+          expiresAt: event.endsWith("expired-token") ? tokenExpiry : null,
           args: {
             path: "~/audit.txt",
             reason: "AUDIT REQUEST REASON",
@@ -1652,6 +1659,24 @@ describe("supervised commands", () => {
             case "revoked-token":
             case "accepted-revoked-token":
               cancelCommandsForToken("token-a");
+              break;
+            case "expired-token":
+            case "accepted-expired-token":
+              expect(sweepExpiredTokenCommands(tokenExpiry.getTime() - 1)).toBe(0);
+              expect(snapshot(started.commandId)?.status).toBe(
+                event === "expired-token" ? "awaiting_user" : "running",
+              );
+              await vi.advanceTimersByTimeAsync(1000);
+              expect(sweepExpiredTokenCommands(tokenExpiry.getTime())).toBe(1);
+              expect(sweepExpiredTokenCommands(tokenExpiry.getTime())).toBe(0);
+              expect(snapshot(started.commandId)).toMatchObject({
+                status: "cancelled",
+                rejectionReason: "token_expired",
+                fileError: {
+                  code: "token_inactive",
+                  ...(event === "accepted-expired-token" ? { outcome: "unknown" } : {}),
+                },
+              });
               break;
             default:
               throw new Error(`unexpected successful admission: ${event}`);
@@ -1794,6 +1819,57 @@ describe("supervised commands", () => {
         expect(JSON.stringify(audit.mock.calls)).not.toContain("AUDIT");
       },
     );
+
+    it.each([
+      ["OFF", "supervised", "2.8", true, "grant_disabled"],
+      ["SUPERVISED", "off", "2.8", true, "feature_disabled"],
+      ["SUPERVISED", "supervised", "2.7", true, "offline"],
+      ["SUPERVISED", "supervised", "2.8", false, "offline"],
+    ] as const)(
+      "direct file admission refuses grant %s / live %s / protocol %s / fileOps %s as %s",
+      async (grant, mode, protocolVersion, fileOps, error) => {
+        const socket = await connect("desktop", { grant, mode });
+        const live = relaySessionManager.getLiveCliFeatures(["desktop"]).get("desktop");
+        if (!live) throw new Error("missing live features");
+        // Current hello validation refuses 2.7 / missing fileOps already.
+        // Inject the live snapshot to exercise admission's own guards.
+        const features = vi
+          .spyOn(relaySessionManager, "getLiveCliFeatures")
+          .mockReturnValue(new Map([["desktop", { ...live, protocolVersion, fileOps }]]));
+        const dispatch = vi.spyOn(relaySessionManager, "dispatchSupervisedSpawn");
+        try {
+          await expect(
+            startSupervisedRequest({
+              kind: "file",
+              userId: "user-id",
+              tokenId: "token-a",
+              expiresAt: null,
+              cliDeviceId: "desktop",
+              fileOp: { op: "mkdir", args: { path: "~/source" } },
+            }),
+          ).resolves.toEqual({ ok: false, error });
+          expect(dispatch).not.toHaveBeenCalled();
+          expect(socket.sends).toEqual([]);
+          expect(listPendingSupervised("user-id")).toEqual([]);
+        } finally {
+          dispatch.mockRestore();
+          features.mockRestore();
+        }
+      },
+    );
+
+    it.each([
+      ["OFF", "supervised", "grant_disabled"],
+      ["OFF", "unsupervised", "grant_disabled"],
+      ["OFF", "off", "grant_disabled"],
+      ["SUPERVISED", "off", "feature_disabled"],
+      ["UNSUPERVISED", "off", "feature_disabled"],
+    ] as const)("runFileOp refuses write grant %s / live %s as %s", async (grant, mode, code) => {
+      const socket = await connect("desktop", { grant, mode });
+      await expect(fileStart()).resolves.toMatchObject({ ok: false, code });
+      expect(socket.sends).toEqual([]);
+      expect(listPendingSupervised("user-id")).toEqual([]);
+    });
 
     it.each([
       ["SUPERVISED", "supervised"],
@@ -1986,6 +2062,49 @@ describe("supervised commands", () => {
         expect(relaySessionManager.hasTerminal(tracker.terminalId)).toBe(false);
       },
     );
+
+    it("cancels a partial file dispatch when the body send throws and registers nothing", async () => {
+      const socket = await connect();
+      const dispatch = vi.spyOn(relaySessionManager, "dispatchSupervisedSpawn");
+      const request = await fileStarted();
+      const args = dispatch.mock.calls[0];
+      dispatch.mockRestore();
+      if (!args) throw new Error("missing spawn");
+      await say(socket, {
+        type: "supervised.rejected",
+        commandId: request.commandId,
+        reason: "limit",
+      });
+      socket.sends.length = 0;
+      const tracker = {
+        ...args[0],
+        commandId: Buffer.alloc(16, 17).toString("base64url"),
+        terminalId: Buffer.alloc(16, 18).toString("base64url"),
+        onAccepted: vi.fn(),
+      };
+      const send = socket.send.bind(socket);
+      const throwingSend = vi.spyOn(socket, "send").mockImplementation((frame) => {
+        if (typeof frame !== "string") throw new Error("body send failed");
+        send(frame);
+      });
+      try {
+        expect(relaySessionManager.dispatchSupervisedSpawn(tracker, args[1], args[2])).toBe(false);
+        expect(throwingSend.mock.calls).toHaveLength(3);
+        expect(socket.json()).toEqual([
+          expect.objectContaining({ type: "term.spawn", commandId: tracker.commandId }),
+          { type: "supervised.cancel", commandId: tracker.commandId },
+        ]);
+        expect(relaySessionManager.hasTerminal(tracker.terminalId)).toBe(false);
+        expect(relaySessionManager.listTerminalsForUser("user-id")).toEqual([]);
+        expect(
+          relaySessionManager.requestSupervisedStop("desktop", tracker.commandId, "decline"),
+        ).toBe(false);
+        await say(socket, { type: "supervised.accepted", commandId: tracker.commandId });
+        expect(tracker.onAccepted).not.toHaveBeenCalled();
+      } finally {
+        throwingSend.mockRestore();
+      }
+    });
 
     it("enforces the total live cap across accepted commands and files", async () => {
       const socket = await connect();
@@ -2198,10 +2317,10 @@ describe("supervised commands", () => {
       }
       if (event === "accepted-timeout") {
         await vi.advanceTimersByTimeAsync(FILE_OP_DEADLINE_MS);
-        expect(sent(socket, "supervised.cancel")[0]).toEqual({
-          type: "supervised.cancel",
-          commandId,
-        });
+        expect(sent(socket, "supervised.cancel")).toEqual([
+          { type: "supervised.cancel", commandId },
+        ]);
+        expect(sent(socket, "supervised.cancel")[0]).not.toHaveProperty("reason");
       }
       if (event.includes("disconnect")) await relaySessionManager.removeSession(socket);
       if (event === "revoke") cancelCommandsForToken("token-a");

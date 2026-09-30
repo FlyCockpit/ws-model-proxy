@@ -99,6 +99,7 @@ const {
 } = await import("./tools");
 const { MCP_TOOL_MANIFEST } = await import("./tool-manifest");
 const { bindMcpToolDispatch } = await import("./tool-dispatch");
+const { projectFileToolOutput } = await import("./cli-file-tools");
 const { createMcpContext } = await import("./context");
 const { default: prisma } = await import("@ws-model-proxy/db");
 type McpToolDescriptor = (typeof MCP_TOOL_MANIFEST)[number];
@@ -2665,6 +2666,59 @@ describe("CLI file tools", () => {
     );
     expect(structured(result).error?.code).toBe("REQUEST_ABORTED");
   });
+
+  it.each(["commandId", "terminalId", "next"] as const)(
+    "scrubs credential substrings from supervised start field %s",
+    (field) => {
+      const credential = `wsmp_mcp_${crypto.randomUUID().replaceAll("-", "")}`;
+      const start = {
+        commandId: "file-1",
+        terminalId: "terminal-1",
+        kind: "supervised",
+        status: "awaiting_user",
+        waitingUntil: "2026-01-01T00:15:00.000Z",
+        next: "Poll forwarder_cli_command_result",
+        [field]: `before (${credential}) after`,
+      };
+      expect(projectFileToolOutput(start)).toEqual({
+        ...start,
+        [field]: "before ([redacted]) after",
+      });
+    },
+  );
+
+  it.each([
+    ["conflict", "The file changed since it was read; re-read it and retry with the new etag"],
+    ["declined", "The person declined the file operation; nothing was applied"],
+    ["timeout", "The file operation timed out"],
+    ["offline", "The CLI is offline or does not support file tools"],
+    [
+      "secret_file",
+      "Secret files are read-only masked views: edit, write, rename, delete and mkdir are refused on them and on their directories",
+    ],
+  ] as const)(
+    "polls supervised file error %s with its exact documented message",
+    async (code, message) => {
+      const unknown = code === "timeout" || code === "offline";
+      cliRuntime.snapshotSupervisedCommand.mockReturnValueOnce({
+        kind: "supervised",
+        requestKind: "file",
+        commandId: "file-1",
+        status: code === "declined" ? "declined" : unknown ? "cancelled" : "rejected",
+        started: unknown,
+        waitDeadline: null,
+        file: null,
+        fileError: { code, ...(unknown ? { outcome: "unknown" } : {}) },
+      });
+      const result = await call("forwarder_cli_command_result", { commandId: "file-1" });
+      expect(result.isError).toBeUndefined();
+      expect(structured(result).result?.error).toEqual({
+        code,
+        message,
+        ...(unknown ? { outcome: "unknown" } : {}),
+      });
+    },
+  );
 
   it.each(["success", "declined", "timeout"] as const)(
     "polls file %s through command_result with a bounded documented projection",

@@ -50,12 +50,14 @@ export const CLI_AGENT_ACTION_OUTCOMES = [
 export type CliAgentActionOutcome = (typeof CLI_AGENT_ACTION_OUTCOMES)[number];
 
 /**
- * The reason codes a conforming CLI may send in an `exec.rejected` or
- * `supervised.rejected` frame (the `REASON_*` constants in
- * apps/cli/src/sessions.rs). The wire schema accepts any 1..64-character
- * string, so the relay maps every other value to
- * {@link CLI_AGENT_REJECTION_FALLBACK}: `reason` is a stable machine code,
- * never free text, and CLI-supplied text must not reach the audit column.
+ * General rejection codes normalized for command audit metadata, matching
+ * the `REASON_*` constants in apps/cli/src/sessions.rs (including
+ * `invalid_input` and `bad_frame`). Supervised files also send file-policy
+ * codes such as `path_denied`, `secret_file`, `too_large` and `redacted_span`;
+ * the server validates and retains those separately as file error codes.
+ * This normalizer maps values outside this list to
+ * {@link CLI_AGENT_REJECTION_FALLBACK}, keeping command audit reasons stable
+ * machine codes rather than CLI-supplied text.
  */
 export const CLI_AGENT_WIRE_REASONS = [
   "disabled",

@@ -125,6 +125,7 @@ export async function openTerminalTestClient({ WebSocket, serverUrl, cookie, ter
     await waitFor(() => keys !== undefined);
     return {
       waitForScreen: (predicate) => waitFor(() => predicate(screen)),
+      snapshot: () => ({ screen: screen.slice(-4000), messages: messages.map((m) => m.type) }),
       async keypress(text) {
         sequence += 1n;
         const sealed = await terminalCrypto.sealTerminalBytesV2({

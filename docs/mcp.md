@@ -78,7 +78,8 @@ Nine PAT-only tools read and change files on a CLI device (a node): `forwarder_c
 All take `cliDeviceId`. The CLI runs the operations itself, fd-based and symlink-safe;
 it does not compose shell commands. Every result that touches a file carries an
 `etag`, results are bounded windows, and write-class calls take an optional `reason`
-(500 characters) that goes to the CLI log.
+(500 characters) that goes to the CLI log and is shown on the CLI confirm screen
+on a supervised node.
 
 **Who may call.** Like the CLI command tools, the file tools are visible and callable
 only for a personal access token minted with `allowCliCommands` and `mcp:write`. OAuth

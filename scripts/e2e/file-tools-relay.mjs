@@ -156,6 +156,9 @@ try {
       BETTER_AUTH_SECRET: betterAuthSecret,
       BETTER_AUTH_URL: serverUrl,
       SIGNUP_ENABLED: "false",
+      // The supervised scenarios poll `forwarder_cli_command_result`; the default
+      // 120 requests a minute per IP would throttle a test that runs on one address.
+      RATE_LIMIT_MCP_POINTS: "100000",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -538,9 +541,11 @@ try {
       const reply = await tool("forwarder_cli_command_result", { commandId });
       assert(!reply.isError, "file result polling failed");
       if (reply.result.file || reply.result.error) return reply.result;
-      await sleep(50);
+      await sleep(200);
     }
-    throw new Error("supervised file request did not settle");
+    throw new Error(
+      `supervised file request did not settle\nrelay log tail:\n${relayLog.slice(-3000)}\nserver log tail:\n${serverLog.slice(-3000)}`,
+    );
   };
   for (const decision of ["accept", "decline", "stale"]) {
     const targetPath = join(work, `supervised-${decision}.txt`);
@@ -580,8 +585,14 @@ try {
       assert.equal(waiting.result.status, "awaiting_user");
       assert.equal(waiting.result.file, undefined);
       if (decision === "stale") await writeFile(targetPath, "changed-after-preview\n");
+      // The child flushes type-ahead for 300 ms after drawing, and the daemon
+      // forwards no key before its `ready` marker: wait like a person would.
+      await sleep(1_000);
       await terminal.keypress(decision === "decline" ? "q" : "\r");
-      const done = await pollFile(request.result.commandId);
+      const done = await pollFile(request.result.commandId).catch((error) => {
+        error.message += `\nterminal snapshot: ${JSON.stringify(terminal.snapshot())}`;
+        throw error;
+      });
       if (decision === "accept") {
         assert.equal(done.file.op, "write");
         assert.equal(done.file.result.created, true);

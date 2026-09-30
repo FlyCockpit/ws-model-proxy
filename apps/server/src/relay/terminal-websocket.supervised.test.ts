@@ -37,7 +37,12 @@ vi.mock("../rate-limit.js", () => ({
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { relaySessionManager } = await import("./session-manager.js");
 const { terminalBrowserHub } = await import("./terminal-websocket.js");
-const { resetCliCommandsForTests, startSupervisedCommand } = await import("./cli-commands.js");
+const {
+  resetCliCommandsForTests,
+  snapshotSupervisedCommand,
+  startSupervisedCommand,
+  startSupervisedRequest,
+} = await import("./cli-commands.js");
 
 const db = prisma as unknown as {
   $transaction: MockInstance;
@@ -315,6 +320,69 @@ describe("terminal list pushes for supervised requests", () => {
     const toCli = (type: string) => cli.json().filter((message) => message.type === type);
     const toBrowser = (socket: FakeSocket, type: string) =>
       socket.json().filter((message) => message.type === type);
+
+    it("declines a file through the browser route and tracker without storing a file result", async () => {
+      const dispatch = vi.spyOn(relaySessionManager, "dispatchSupervisedSpawn");
+      const request = await startSupervisedRequest({
+        kind: "file",
+        userId: "user-id",
+        tokenId: "token-a",
+        expiresAt: null,
+        cliDeviceId: "desktop",
+        fileOp: { op: "mkdir", args: { path: "~/reviewed-directory" } },
+      });
+      const tracker = dispatch.mock.calls[0]?.[0];
+      dispatch.mockRestore();
+      if (!request.ok || !tracker) throw new Error("expected file start");
+      const requestDecline = vi.spyOn(tracker, "requestDecline");
+      const snapshot = () => snapshotSupervisedCommand(request.commandId, "user-id", "token-a");
+      try {
+        await cliSays({
+          type: "term.spawned",
+          terminalId: request.terminalId,
+          commandId: request.commandId,
+        });
+        const tab = browser();
+        await terminalBrowserHub.handleText(
+          tab,
+          JSON.stringify({ type: "decline", terminalId: request.terminalId }),
+        );
+        expect(requestDecline).toHaveBeenCalledTimes(1);
+        expect(requestDecline).toHaveReturnedWith("requested");
+        expect(toCli("supervised.cancel")).toEqual([
+          { type: "supervised.cancel", commandId: request.commandId, reason: "decline" },
+        ]);
+        expect(snapshot()).toMatchObject({ status: "awaiting_user", file: null, fileError: null });
+        await cliSays({ type: "supervised.declined", commandId: request.commandId });
+        const declined = snapshot();
+        expect(declined).toMatchObject({
+          requestKind: "file",
+          status: "declined",
+          started: false,
+          file: null,
+          fileError: { code: "declined" },
+        });
+        expect(declined?.fileError).toEqual({ code: "declined" });
+        // Late reports cannot turn a decline into an applied operation, even
+        // if delivered directly to the tracker after wire validation.
+        await cliSays({
+          type: "supervised.done",
+          commandId: request.commandId,
+          review: false,
+          fileResult: { op: "mkdir", result: { created: true } },
+        });
+        tracker.onAccepted();
+        tracker.onDone({ review: false, fileResult: { op: "mkdir", result: { created: true } } });
+        expect(snapshot()).toEqual(declined);
+        await cliSays({ type: "term.exit", terminalId: request.terminalId });
+        expect(snapshot()).toEqual(declined);
+        expect(toBrowser(tab, "exit")).toEqual([
+          { type: "exit", terminalId: request.terminalId, supervisedStatus: "declined" },
+        ]);
+      } finally {
+        requestDecline.mockRestore();
+      }
+    });
 
     it("never kills a command whose Enter the server already took (CLI first)", async () => {
       const request = await spawnedRequest();
