@@ -734,6 +734,7 @@ export class RelaySessionManager {
           // device). No await between this check and the install below.
           this.sessionsBySocket.delete(socket);
           clearTimeout(session.unauthenticatedTimer);
+          if (session.routingEvaluation) this.routingEvaluator.cancel(session.routingEvaluation);
           socket.close(1000, "replaced");
           return;
         }
@@ -2383,6 +2384,9 @@ export class RelaySessionManager {
       const owners = new Set<string>([newSession.identity.userId]);
       for (const terminal of existing.terminalsById.values()) owners.add(terminal.userId);
       this.teardownInteractiveWork(existing);
+      // A replaced session must publish no more verdicts: its pending run
+      // would start later than the successor's fence and win with an older reading.
+      if (existing.routingEvaluation) this.routingEvaluator.cancel(existing.routingEvaluation);
       this.failActiveRequestsForSession(existing);
       existing.socket.close(1000, "replaced");
       this.sessionsBySocket.delete(existing.socket);

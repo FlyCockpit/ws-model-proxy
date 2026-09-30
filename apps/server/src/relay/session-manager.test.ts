@@ -3472,6 +3472,41 @@ describe("relay 2.7 telemetry", () => {
     }
   });
 
+  it("a replaced session runs no pending evaluation after its successor's hello (S-D)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const deep = prisma as unknown as {
+        poolMember: { findMany: MockInstance };
+        modelPool: { findMany: MockInstance };
+      };
+      deep.poolMember.findMany.mockResolvedValue([]);
+      deep.modelPool.findMany.mockResolvedValue([]);
+      const routingRuns = () =>
+        deep.poolMember.findMany.mock.calls.filter(
+          (call) => (call[0] as { where?: { tier?: string } }).where?.tier === "PRIMARY",
+        ).length;
+      const { manager, socket } = await registered();
+      await manager.handleTextFrame(socket, waitingLoad(2), now);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(routingRuns()).toBe(1);
+      // A second frame inside the 1 s window leaves a trailing run pending.
+      vi.setSystemTime(at(1_100));
+      await manager.handleTextFrame(socket, waitingLoad(2), at(1_100));
+      // The CLI reconnects before the old socket closed: the old session is
+      // replaced and its pending run must never publish over the successor.
+      const successor = new FakeSocket();
+      manager.acceptAuthenticatedSocket({ socket: successor, identity, now: at(1_100) });
+      await manager.handleTextFrame(successor, helloFrame(), at(1_100));
+      expect(socket.closes).toEqual([{ code: 1000, reason: "replaced" }]);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(routingRuns()).toBe(1);
+      manager.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("requires registration before telemetry", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
