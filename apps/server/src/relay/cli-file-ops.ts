@@ -662,7 +662,6 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
       next: "Ask the user to open Terminals in the dashboard and answer the CLI file request; then poll forwarder_cli_command_result with commandId.",
     };
   }
-  if (!verdict.ok) return invalid();
   const counts = pendingCounts(input.userId, input.cliDeviceId);
   if (counts.cli >= FILE_OPS_PER_CLI || counts.user >= FILE_OPS_PER_USER) {
     return { ok: false, code: "limit", retryAfterMs: CONCURRENCY_RETRY_AFTER_MS };
