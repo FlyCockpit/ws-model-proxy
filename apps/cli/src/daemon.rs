@@ -4156,8 +4156,12 @@ mod tests {
             let _ = std::io::Read::read(&mut stream, &mut request).expect("read relay request");
             accepted_tx.send(()).expect("signal accepted request");
             // Hold the header wait open until the client goes away (EOF or reset): a
-            // cancellation that does not drop the connection leaves this thread, and the
-            // request, waiting, so the bound below trips instead of a fixed sleep racing it.
+            // cancellation that does not drop the connection leaves the request waiting,
+            // so the 10 s bound below trips instead of a fixed sleep racing it. The read
+            // timeout keeps this thread from hanging the test if the socket is never closed.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("set upstream read timeout");
             while std::io::Read::read(&mut stream, &mut request).is_ok_and(|read| read > 0) {}
         });
         let (tx, rx) = mpsc::sync_channel(RELAY_WORKER_OUTBOUND_CAPACITY);
@@ -4180,7 +4184,12 @@ mod tests {
                 tokio::time::timeout(
                     Duration::from_secs(10),
                     execute_upstream(
-                        local_upstream_spec(format!("http://{address}")),
+                        // A long request timeout so only cancellation (or the hang
+                        // bound above) can end the wait, not the request's own clock.
+                        UpstreamRequestSpec {
+                            timeout_ms: 60_000,
+                            ..local_upstream_spec(format!("http://{address}"))
+                        },
                         None,
                         &tx,
                         cancellation_rx,

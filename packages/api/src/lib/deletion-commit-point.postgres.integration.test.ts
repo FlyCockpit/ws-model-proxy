@@ -543,11 +543,44 @@ integration("deletion commit points under concurrency", () => {
    * Rows committed while the delete waits for the owner fence. The delete's own
    * fence wait is bounded by CAPACITY_ORDERED_LOCK_TIMEOUT_MS (2 s, by design: it
    * rolls back and answers CONFLICT), and that clock keeps running while the test
-   * inserts these rows. 5,000 rows made the insert alone outlast the bound on a
-   * starved host, so the delete was refused for the test's own slowness. This many
-   * rows still spans more than one 1,000-row sweep batch and commits in milliseconds.
+   * works. So the rows are inserted in an open transaction BEFORE the delete
+   * starts (nothing in it takes a lock the delete needs) and only the O(1) COMMIT
+   * happens inside the wait window: ordering, not a race against the clock. This
+   * many rows still spans more than one 1,000-row sweep batch.
    */
   const LATE_PRODUCER_ROWS = 1_200;
+
+  async function stageLateProducers(g: {
+    suffix: string;
+    user: { id: string };
+    pool: { id: string };
+  }) {
+    const { observer } = required();
+    const staged = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    const tx = observer
+      .$transaction(
+        async (client) => {
+          await client.$executeRawUnsafe(
+            `INSERT INTO relay_request (id, "userId", status, "requestedModelPoolId")
+             SELECT '${g.suffix}-late-' || n, '${g.user.id}', 'FAILED', '${g.pool.id}'
+               FROM generate_series(1, ${LATE_PRODUCER_ROWS}) n`,
+          );
+          staged.resolve();
+          await gate.promise;
+        },
+        { timeout: 60_000, maxWait: 60_000 },
+      )
+      .catch((error: unknown) => {
+        staged.reject(error);
+        throw error;
+      });
+    await staged.promise;
+    return async () => {
+      gate.resolve();
+      await tx;
+    };
+  }
 
   // DL-1 (d): the final parent delete touches no hot-path row (no foreign key
   // crosses the boundary), so producers committing while it waits for its
@@ -555,9 +588,10 @@ integration("deletion commit points under concurrency", () => {
   // as orphaned history; the purge queue removes a deleted user's terminal
   // rows after the grace period.
   it("user delete: producers committed while it waits for the owner fence stay as orphans for the purge", async () => {
-    const { prisma, deletion, observer } = required();
+    const { prisma, deletion } = required();
     const sweeps = await import("@ws-model-proxy/db/hot-path-sweeps");
     const g = await graph("late-producers-user");
+    const commitLate = await stageLateProducers(g);
     const mark = await deletion.requestUserDeletion(prisma, g.user.id);
     const release = await holdOwnerFence(g.user.id);
     const completing = deletion.completeUserDeletion(prisma, g.user.id, mark!.generation).then(
@@ -565,12 +599,8 @@ integration("deletion commit points under concurrency", () => {
       (error: unknown) => ({ error }),
     );
     await waitForLockWait("%wsmp_acquire_fences%", "advisory");
+    await commitLate();
     const late = LATE_PRODUCER_ROWS;
-    await observer.$executeRawUnsafe(
-      `INSERT INTO relay_request (id, "userId", status, "requestedModelPoolId")
-       SELECT '${g.suffix}-late-' || n, '${g.user.id}', 'FAILED', '${g.pool.id}'
-         FROM generate_series(1, ${late}) n`,
-    );
     await release();
     expect(await completing).toEqual({ value: true });
     expect(await prisma.user.count({ where: { id: g.user.id } })).toBe(0);
@@ -583,8 +613,9 @@ integration("deletion commit points under concurrency", () => {
   }, 60_000);
 
   it("pool delete: producers committed while it waits for the owner fence do not refuse it", async () => {
-    const { prisma, forwarder, observer } = required();
+    const { prisma, forwarder } = required();
     const g = await graph("late-producers-pool");
+    const commitLate = await stageLateProducers(g);
     const release = await holdOwnerFence(g.user.id);
     const client = createRouterClient(forwarder.forwarderManagementRouter, {
       context: sessionFor(g.user),
@@ -594,12 +625,8 @@ integration("deletion commit points under concurrency", () => {
       (error: unknown) => ({ error }),
     );
     await waitForLockWait("%wsmp_acquire_fences%", "advisory");
+    await commitLate();
     const late = LATE_PRODUCER_ROWS;
-    await observer.$executeRawUnsafe(
-      `INSERT INTO relay_request (id, "userId", status, "requestedModelPoolId")
-       SELECT '${g.suffix}-late-' || n, '${g.user.id}', 'FAILED', '${g.pool.id}'
-         FROM generate_series(1, ${late}) n`,
-    );
     await release();
     const outcome = await deleting;
     expect("error" in outcome ? String(outcome.error) : "deleted").toBe("deleted");
