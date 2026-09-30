@@ -1516,7 +1516,13 @@ mod exchange_callers {
         let fx = Fx::new();
         fx.put("Foo.txt", "mine");
         if !fx.root.join("foo.txt").exists() {
-            return; // case-sensitive volume: two distinct names, nothing to check
+            // case-sensitive volume: two distinct names, nothing to check (macOS
+            // runners use the case-insensitive default, so there this must not skip)
+            assert!(
+                !cfg!(target_os = "macos"),
+                "the macOS test volume is expected to be case-insensitive"
+            );
+            return;
         }
         let etag = fx.etag("Foo.txt");
         let r = rename(
