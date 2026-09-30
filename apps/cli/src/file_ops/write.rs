@@ -240,7 +240,7 @@ fn write_resolved(
         &resolved.dir,
         &resolved.name,
         &resolved.dir_path,
-        &mut file,
+        file,
         &stat,
         &previous_etag,
         content,

@@ -223,14 +223,20 @@ NOREPLACE, capture uses plain rename into a private slot checked absent, and a
 squatter arriving between the check and rename can be overwritten. These are the
 only deleting windows in recovery compensation. (b) undo briefly vacates public
 names, and a concurrent create makes restoration fail EEXIST, retaining displaced
-data with `uncertain_outcome`; the newest captured external write is restored to
-its public name while an older displaced object stays in recovery. Unsupported
+data with `uncertain_outcome`; for edit, write and overwrite rename the newest captured
+external write is restored to its public name while an older displaced object stays in
+recovery (plain rename verification and exclusive-create cleanup instead keep a
+foreign object in recovery and report it). Unsupported
 NOREPLACE restore uses EEXIST-safe linkat followed by held-fd-proven private-slot
 unlink; directories and unsupported links stay in recovery with `uncertain_outcome`.
 (b2) overwrite rename's SOURCE name is vacant from its initial capture until the
 operation ends. A concurrent create remains there on success; if it prevents a
 restore, it is kept and reported with `uncertain_outcome`. (c) exchange-less
-filesystems retain the cross-directory plain-rename replace race; overwrite rename
+filesystems (for example NFS, WSL2 `/mnt/c`, FAT, most FUSE) retain the pre-existing
+plain-rename replace race: a save by another process that lands after the final
+etag re-check and before the rename is overwritten (this replaces, it does not
+retain; it is the same behavior as before recovery existed, and is the one window
+where a replace cannot keep a concurrent write); overwrite rename
 restores its source and returns `unsupported` (or `uncertain_outcome` if restoration
 cannot settle). (d) a crash leaves `.wsmp-recover-*`, including a partial replace
 temp, or both links; (e) unheld objects are never deleted and remain reported in recovery. Public

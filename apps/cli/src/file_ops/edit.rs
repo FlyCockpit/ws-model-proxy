@@ -301,7 +301,7 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
         &resolved.dir,
         &resolved.name,
         &resolved.dir_path,
-        &mut file,
+        file,
         &stat,
         &previous_etag,
         &updated,

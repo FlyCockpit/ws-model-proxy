@@ -27,8 +27,9 @@
 //! (b2) overwrite rename's source is vacant between its initial capture and the
 //! operation's end. A concurrent create stays at source on success; when it
 //! blocks a restore, it is kept and reported with uncertain_outcome.
-//! (c) exchange-less filesystems retain the cross-directory plain-rename replace
-//! race; overwrite rename restores the vacated source and returns Unsupported.
+//! (c) exchange-less filesystems retain the pre-existing cross-directory plain-rename
+//! replace race (a save landing after the final re-check is overwritten: the one
+//! window where a replace cannot keep a concurrent write); overwrite rename restores the vacated source and returns Unsupported.
 //! (d) a crash leaves `.wsmp-recover-*` (including a partial replace tmp) or both links.
 //! (e) unheld objects are never deleted; they remain reported in recovery.
 
@@ -148,6 +149,14 @@ pub(super) struct RecoveryDir {
     kept: Vec<PathBuf>,
     unsettled: bool,
     finished: bool,
+    last_errno: Option<Errno>,
+}
+
+/// State to return to when a capture provably changed nothing.
+pub(super) struct Checkpoint {
+    used: usize,
+    kept: usize,
+    unsettled: bool,
 }
 
 impl RecoveryDir {
@@ -194,6 +203,7 @@ impl RecoveryDir {
                 kept: Vec::new(),
                 unsettled: false,
                 finished: false,
+                last_errno: None,
             });
         }
     }
@@ -348,7 +358,8 @@ impl RecoveryDir {
                 self.remember(self.path.join(&slot.name));
                 Some(slot)
             }
-            Err(_) => {
+            Err(errno) => {
+                self.last_errno = Some(errno);
                 self.unsettled = true;
                 self.remember(from_path.to_path_buf());
                 // A competing entry at the private slot caused EEXIST: keep and
@@ -365,6 +376,54 @@ impl RecoveryDir {
                 None
             }
         }
+    }
+
+    pub(super) fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            used: self.used,
+            kept: self.kept.len(),
+            unsettled: self.unsettled,
+        }
+    }
+
+    /// The capture that just failed moved nothing when its errno says the rename
+    /// was refused before it ran (a failed rename is atomic): forget it and hand
+    /// back the errno so the caller can report an ordinary error with nothing to
+    /// recover. Anything else (EIO and timeouts may follow a rename that took
+    /// effect, an occupied private slot, the two-object cap) stays unsettled.
+    pub(super) fn abort_capture(&mut self, mark: Checkpoint) -> Option<Errno> {
+        let errno = self.last_errno.take()?;
+        if !matches!(
+            errno,
+            Errno::ENOENT
+                | Errno::EXDEV
+                | Errno::EACCES
+                | Errno::EPERM
+                | Errno::EROFS
+                | Errno::ENOTDIR
+                | Errno::EISDIR
+                | Errno::ENOSPC
+                | Errno::EDQUOT
+                | Errno::ELOOP
+                | Errno::ENAMETOOLONG
+                | Errno::EBUSY
+        ) {
+            return None;
+        }
+        self.used = mark.used;
+        self.kept.truncate(mark.kept);
+        self.unsettled = mark.unsettled;
+        Some(errno)
+    }
+
+    /// Keep a slot's object where it is and report it (its origin is unproven).
+    pub(super) fn keep(&mut self, slot: &Slot) {
+        self.unsettled = true;
+        self.remember(self.path.join(&slot.name));
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.path
     }
 
     pub(super) fn record_public(&mut self, dir: &OwnedFd, name: &OsStr, path: &Path) {

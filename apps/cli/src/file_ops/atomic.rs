@@ -122,7 +122,8 @@ impl Drop for TempGuard<'_> {
     }
 }
 
-/// Replace `name` in `dir` with `content`. `orig` is the open original and
+/// Replace `name` in `dir` with `content`. `orig` is the open original (consumed:
+/// it is closed before the recovery directory is removed) and
 /// `orig_etag` the etag of the bytes the new content was derived from.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn replace(
@@ -130,7 +131,7 @@ pub(crate) fn replace(
     dir: &OwnedFd,
     name: &OsStr,
     dir_path: &Path,
-    orig: &mut File,
+    mut orig: File,
     orig_stat: &Stat,
     orig_etag: &str,
     content: &[u8],
@@ -143,13 +144,17 @@ pub(crate) fn replace(
         dir,
         name,
         dir_path,
-        orig,
+        &mut orig,
         orig_stat,
         orig_etag,
         content,
         cancel,
         &mut recovery,
     );
+    // Every held fd is closed before the recovery directory is removed (an NFS
+    // client silly-renames an unlinked-but-open file into it, so rmdir would fail).
+    // replace_inner's own handles (temp, original dup) ended with its return.
+    drop(orig);
     let recovered = recovery.finish();
     match result {
         Ok(stat) => Ok((stat, recovered)),
@@ -206,7 +211,6 @@ fn replace_inner(
         commit_stage(ops, recovery, &mut tmp, &original, &identity, &mut armed)?;
         armed = false;
         let _ = ops.step(Step::Renamed);
-        recovery.finish();
         fsync(dir.as_fd()).map_err(FileError::errno)?;
         let _ = ops.step(Step::DirSynced);
         Ok(new_stat)
@@ -262,7 +266,6 @@ fn commit_stage(
                         let _ = ops.step(Step::Restored);
                     }
                 }
-                recovery.finish();
                 return if recovery.settled() {
                     Err(FileError::conflict("replaced"))
                 } else {

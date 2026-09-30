@@ -217,7 +217,7 @@ pub(crate) fn rename(
     cancel.check()?;
     // Test seam: the last point at which the world can change before the commit.
     ops.step(Step::EtagRechecked)?;
-    let recovered = commit_rename(ops, &from, &to, overwrite, &src, dst.as_ref())?;
+    let recovered = commit_rename(ops, &from, &to, overwrite, src, dst)?;
     Ok(RenameResult {
         etag: src_etag,
         recovered,
@@ -514,10 +514,10 @@ fn commit_rename(
     from: &Resolved,
     to: &Resolved,
     overwrite: bool,
-    src: &Held,
-    dst: Option<&Held>,
+    src: Held,
+    dst: Option<Held>,
 ) -> FileResult<Vec<String>> {
-    if overwrite && let Some(dst) = dst {
+    if overwrite && let Some(dst) = &dst {
         let from_dir = Stat::from_raw(&fstat(from.dir.as_fd()).map_err(FileError::errno)?);
         let to_dir = Stat::from_raw(&fstat(to.dir.as_fd()).map_err(FileError::errno)?);
         match same_object_rename(
@@ -542,8 +542,8 @@ fn commit_rename(
         }
     }
     let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path)?;
-    let result = match (overwrite, dst) {
-        (true, Some(dst)) => exchange_over(ops, &mut recovery, from, to, src, dst),
+    let result = match (overwrite, dst.as_ref()) {
+        (true, Some(dst)) => exchange_over(ops, &mut recovery, from, to, &src, dst),
         _ => {
             // Track the actual candidate after the final hook as well as the
             // checked source. This snapshot is never authority to unlink a
@@ -556,8 +556,8 @@ fn commit_rename(
                 Ok(Some(candidate)) => {
                     let origin = Origin::new(&from.dir, &from.name, &from.full_path())
                         .map_err(FileError::errno)?;
-                    move_no_replace(ops, &mut recovery, from, to, src).and_then(|()| {
-                        verify_moved(ops, &mut recovery, to, src, &candidate, origin)
+                    move_no_replace(ops, &mut recovery, from, to, &src).and_then(|()| {
+                        verify_moved(ops, &mut recovery, to, &src, &candidate, origin)
                     })
                 }
                 Ok(None) => Err(FileError::conflict("gone")),
@@ -565,6 +565,11 @@ fn commit_rename(
             }
         }
     };
+    // Close every held fd before the recovery directory is removed: a network
+    // filesystem (NFS) silly-renames an unlinked-but-open file into the directory
+    // and rmdir would fail until the last descriptor is closed.
+    drop(src);
+    drop(dst);
     let recovered = recovery.finish();
     match result {
         Ok(()) => Ok(recovered),
@@ -595,7 +600,6 @@ fn verify_moved(
                     && recovery.restore(ops, &slot)
                 {
                     let _ = ops.step(Step::Restored);
-                    recovery.finish();
                     if recovery.settled() {
                         return Err(FileError::conflict("replaced"));
                     }
@@ -684,7 +688,6 @@ fn move_no_replace(
         let _ = ops.step(Step::Captured);
         recovery.dispose(ops, &y, src);
     }
-    recovery.finish();
     if recovery.settled() {
         Err(FileError::conflict("replaced"))
     } else {
@@ -740,15 +743,25 @@ fn exchange_over(
 ) -> FileResult<()> {
     // Capture before exchanging: the public source is never used as a staging
     // slot for the destination. Its vacancy is the documented window (b2).
+    // Crash window: between this capture and the exchange the source exists only
+    // inside the recovery directory, so say where (daemon log) before moving it.
+    tracing::info!(
+        recovery = %recovery.path().display(),
+        "overwrite rename: the source is held in the recovery directory until the exchange completes"
+    );
+    let mark = recovery.checkpoint();
     let Some(mut x) = recovery.capture(&from.dir, &from.name, &from.full_path()) else {
-        return Err(recovery.uncertain());
+        // A refused rename moved nothing: an ordinary error, nothing to recover.
+        return Err(match recovery.abort_capture(mark) {
+            Some(errno) => overwrite_exchange_error(errno),
+            None => recovery.uncertain(),
+        });
     };
     let _ = ops.step(Step::Captured);
     if !recovery.holds(&x, src) {
         if recovery.restore(ops, &x) {
             let _ = ops.step(Step::Restored);
         }
-        recovery.finish();
         return if recovery.settled() {
             Err(FileError::conflict("replaced"))
         } else {
@@ -760,8 +773,14 @@ fn exchange_over(
     let source_origin = match destination.and_then(|origin| recovery.exchange(&mut x, origin)) {
         Ok(origin) => origin,
         Err(errno) => {
-            if recovery.restore(ops, &x) {
-                let _ = ops.step(Step::Restored);
+            // An exchange that reported an error may still have taken effect: only
+            // a slot that still holds the checked source goes back to its name.
+            if recovery.holds(&x, src) {
+                if recovery.restore(ops, &x) {
+                    let _ = ops.step(Step::Restored);
+                }
+            } else {
+                recovery.keep(&x);
             }
             // No plain overwrite fallback. The outer wrapper reports uncertainty
             // if a concurrent source create or restore failure kept the source.
@@ -792,7 +811,6 @@ fn exchange_over(
             let _ = ops.step(Step::Restored);
         }
     }
-    recovery.finish();
     if recovery.settled() {
         Err(FileError::conflict("replaced"))
     } else {

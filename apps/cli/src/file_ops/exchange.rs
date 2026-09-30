@@ -30,9 +30,25 @@ thread_local! {
     };
 }
 
+// Test seam: runs just before the recovery directory's rmdir, so a test can
+// observe which descriptors are still open at that moment.
+#[cfg(test)]
+thread_local! {
+    pub(super) static RMDIR_PROBE: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub(super) fn fault(primitive: Primitive) -> Result<(), Errno> {
     #[cfg(not(test))]
     let _ = primitive;
+    #[cfg(test)]
+    if primitive == Primitive::Rmdir {
+        RMDIR_PROBE.with(|probe| {
+            if let Some(probe) = probe.borrow().as_ref() {
+                probe();
+            }
+        });
+    }
     #[cfg(test)]
     return FAULTS.with(|state| {
         let mut state = state.borrow_mut();
@@ -66,6 +82,7 @@ impl FaultScope {
 impl Drop for FaultScope {
     fn drop(&mut self) {
         FAULTS.with(|state| *state.borrow_mut() = (Vec::new(), Vec::new()));
+        RMDIR_PROBE.with(|probe| *probe.borrow_mut() = None);
     }
 }
 

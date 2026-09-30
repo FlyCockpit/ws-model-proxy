@@ -347,10 +347,12 @@ fn compensation_c1a1_successor_at_public_name_before_private_unlink_is_untouched
                 successor(&destination, "concurrent update");
             }
             if step == Step::Exchanged {
+                // the public name a racer can really reach: the rename source, or the
+                // published replacement (replace has no public staging name)
                 *observed.lock().unwrap() = if matches!(op, Op::Rename) {
                     root.join("src.txt")
                 } else {
-                    root.join(".doc.txt.wsmp-racer00000")
+                    root.join("doc.txt")
                 };
             }
             if step == Step::Disposing {
@@ -359,16 +361,20 @@ fn compensation_c1a1_successor_at_public_name_before_private_unlink_is_untouched
             Ok(())
         });
         if undo {
-            assert_eq!(op.run(&fx, &etag).unwrap_err().code, ErrorCode::Conflict);
-            assert_eq!(fx.get(op.destination()), "concurrent update");
+            // the racer takes the vacated public name while the undo disposes our
+            // temp: the no-replace restore of the older successor then finds the
+            // name taken, so it stays in recovery and the outcome is uncertain
+            let kept = uncertain(&op.run(&fx, &etag).unwrap_err());
+            assert!(contains_bytes(&kept, "concurrent update"));
+            assert_eq!(fx.get(op.destination()), "successor only copy");
         } else {
             op.run(&fx, &etag).unwrap();
+            assert!(recovery_dirs(&fx.root).is_empty());
         }
         assert_eq!(
             std::fs::read_to_string(&*public.lock().unwrap()).unwrap(),
             "successor only copy"
         );
-        assert!(recovery_dirs(&fx.root).is_empty());
     }
 }
 
@@ -1340,7 +1346,7 @@ fn compensation_tmpfs_replace_and_edit_exchange_across_recovery_directory() {
         &dir,
         "doc.txt".as_ref(),
         &fx.root,
-        &mut original,
+        original,
         &stat,
         &etag,
         b"edited",
@@ -1404,4 +1410,98 @@ fn compensation_no_flags_exchange_less_rename_restores_source_with_one_link() {
         1
     );
     clean(&fx);
+}
+
+/// NFS silly-renames an unlinked-but-open file into its directory, so the
+/// recovery directory's rmdir fails while any descriptor on a disposed object is
+/// still open. Every operation must close its held fds before the rmdir.
+#[cfg(target_os = "linux")]
+#[test]
+fn compensation_closes_held_descriptors_before_removing_the_recovery_directory() {
+    use std::sync::{Arc, Mutex};
+
+    use crate::file_ops::exchange::RMDIR_PROBE;
+
+    /// Descriptors of this process that point under `root` (a disposed file
+    /// still open shows as `<path> (deleted)`).
+    fn open_under(root: &Path) -> Vec<String> {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+            .map(|target| target.to_string_lossy().into_owned())
+            .filter(|target| target.starts_with(root.to_string_lossy().as_ref()))
+            // the directory descriptors the operation itself uses stay open
+            .filter(|target| !target.ends_with(".wsmp-recover") && !Path::new(target).is_dir())
+            .collect()
+    }
+
+    for op in [Op::Replace, Op::Write, Op::Rename] {
+        let fx = Fx::new();
+        let etag = op.prepare(&fx);
+        let seen = Arc::new(Mutex::new(None));
+        let (root, sink) = (fx.root.clone(), seen.clone());
+        let _scope = FaultScope::new(&[]);
+        RMDIR_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move || {
+                *sink.lock().unwrap() = Some(open_under(&root));
+            }));
+        });
+        op.run(&fx, &etag).unwrap();
+        let open = seen.lock().unwrap().clone().expect("the rmdir ran");
+        assert!(open.is_empty(), "{op:?}: still open at rmdir: {open:?}");
+    }
+}
+
+/// A refused vacate moved nothing: an ordinary error (as before recovery existed),
+/// the source and destination untouched, no recovery directory left behind.
+/// EIO may follow an effective rename, so it stays uncertain.
+#[test]
+fn compensation_failed_vacate_is_a_plain_settled_error() {
+    for (errno, code) in [
+        (Errno::ENOENT, ErrorCode::NotFound),
+        (Errno::EXDEV, ErrorCode::IoError),
+        (Errno::EACCES, ErrorCode::IoError),
+        (Errno::ENOSPC, ErrorCode::IoError),
+    ] {
+        let fx = Fx::new();
+        let etag = Op::Rename.prepare(&fx);
+        let _faults = FaultScope::new(&[(Primitive::Capture, 1, errno)]);
+        let error = Op::Rename.run(&fx, &etag).unwrap_err();
+        assert_eq!(error.code, code, "{errno}: {error:?}");
+        assert_eq!(fx.get("src.txt"), "mine", "{errno}");
+        assert_eq!(fx.get("dst.txt"), "original", "{errno}");
+        assert!(recovery_dirs(&fx.root).is_empty(), "{errno}");
+    }
+    let fx = Fx::new();
+    let etag = Op::Rename.prepare(&fx);
+    let _faults = FaultScope::new(&[(Primitive::Capture, 1, Errno::EIO)]);
+    let error = Op::Rename.run(&fx, &etag).unwrap_err();
+    assert_eq!(error.code, ErrorCode::UncertainOutcome, "{error:?}");
+}
+
+/// An exchange that reports an error may still have taken effect: the slot goes
+/// back to the source name only while it still holds the checked source.
+#[test]
+fn compensation_exchange_error_never_restores_an_unproven_slot_to_the_source() {
+    let fx = Fx::new();
+    let etag = Op::Rename.prepare(&fx);
+    let root = fx.root.clone();
+    let fx = fx.with_hook(move |step| {
+        if step == Step::Vacated {
+            // the slot no longer holds the source (as if the exchange had completed)
+            let slot = recovery_dirs(&root).pop().unwrap().join("slot-1");
+            std::fs::remove_file(&slot).unwrap();
+            std::fs::write(&slot, "destination object").unwrap();
+        }
+        Ok(())
+    });
+    let _faults = FaultScope::new(&[(Primitive::Exchange, 1, Errno::EIO)]);
+    let error = Op::Rename.run(&fx, &etag).unwrap_err();
+    let kept = uncertain(&error);
+    assert!(contains_bytes(&kept, "destination object"));
+    assert!(
+        !fx.root.join("src.txt").exists(),
+        "nothing moved to the source name"
+    );
+    assert_eq!(fx.get("dst.txt"), "original");
 }
