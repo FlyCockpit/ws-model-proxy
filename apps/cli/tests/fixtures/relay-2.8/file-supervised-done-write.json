@@ -1,0 +1,13 @@
+{
+  "type": "supervised.done",
+  "commandId": "AAECAwQFBgcICQoLDA0ODw",
+  "review": false,
+  "fileResult": {
+    "op": "write",
+    "result": {
+      "etag": "h:aaa",
+      "size": 4,
+      "created": true
+    }
+  }
+}

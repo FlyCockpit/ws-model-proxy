@@ -22,6 +22,7 @@
 //! that holds, and "did the command start" has a single answer.
 
 use crate::display_escape::escape_for_display;
+pub use crate::supervised_screen::Screen;
 
 #[cfg(unix)]
 mod unix;
@@ -51,14 +52,20 @@ fn cell_width(ch: char) -> usize {
     if (' '..='~').contains(&ch) { 1 } else { 2 }
 }
 
-fn text_width(text: &str) -> usize {
+pub(crate) fn text_width(text: &str) -> usize {
     text.chars().map(cell_width).sum()
 }
 
 /// Hard-wraps `text` (no line breaks) to rows of at most `width` columns.
 /// Every character stays in order, so the rows joined are the text; the
 /// first row starts with `first`, the rest with `rest`.
-fn wrap_exact(rows: &mut Vec<String>, first: &str, rest: &str, text: &str, width: usize) {
+pub(crate) fn wrap_exact(
+    rows: &mut Vec<String>,
+    first: &str,
+    rest: &str,
+    text: &str,
+    width: usize,
+) {
     let mut row = first.to_string();
     let mut used = text_width(first);
     let mut has_content = false;
@@ -76,7 +83,7 @@ fn wrap_exact(rows: &mut Vec<String>, first: &str, rest: &str, text: &str, width
 }
 
 /// Word-wraps the screen's own prose to rows of at most `width` columns.
-fn wrap_words(rows: &mut Vec<String>, text: &str, width: usize) {
+pub(crate) fn wrap_words(rows: &mut Vec<String>, text: &str, width: usize) {
     let mut row = String::new();
     let mut used = 0;
     for word in text.split(' ') {
@@ -110,7 +117,7 @@ fn wrap_words(rows: &mut Vec<String>, text: &str, width: usize) {
 
 /// A labelled field of untrusted text: escaped, each of its lines ending in
 /// `↵` except the last, every row after the first indented.
-fn field(rows: &mut Vec<String>, label: &str, text: &str, width: usize) {
+pub(crate) fn field(rows: &mut Vec<String>, label: &str, text: &str, width: usize) {
     let escaped = escape_for_display(text);
     let lines = escaped.split('\n').collect::<Vec<_>>();
     // A label that leaves no room on its row gets rows of its own.
@@ -188,26 +195,6 @@ fn body_rows(request: &Request<'_>, width: usize) -> Vec<String> {
         width,
     );
     rows
-}
-
-/// One frame of the confirm screen.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Screen {
-    /// Exactly what is drawn, top to bottom; never more rows than the PTY.
-    pub rows: Vec<String>,
-    /// The first body row shown.
-    pub offset: usize,
-    /// How far the body can scroll; zero when all of it is shown.
-    pub max_offset: usize,
-    /// Body rows shown at once.
-    pub height: usize,
-}
-
-impl Screen {
-    /// The frame as terminal output: clear, then each row at its place.
-    pub fn paint(&self) -> String {
-        format!("\x1b[H\x1b[2J{}", self.rows.join("\r\n"))
-    }
 }
 
 fn footer_rows(

@@ -6,7 +6,11 @@ import {
 } from "@ws-model-proxy/api/lib/mcp-command-mode";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { encodeRelayBinaryFrame, RELAY_REQUEST_BODY_WINDOW_CHUNKS } from "./protocol.js";
+import {
+  encodeRelayBinaryFrame,
+  parseRelayBinaryFrame,
+  RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+} from "./protocol.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
@@ -27,6 +31,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 
 vi.mock("./cli-agent-audit.js", () => ({ recordCliAgentAction: vi.fn() }));
 
+const { runFileOp, resetFileOpsForTests, FILE_OP_DEADLINE_MS } = await import("./cli-file-ops.js");
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { recordCliAgentAction } = await import("./cli-agent-audit.js");
 const audit = recordCliAgentAction as unknown as MockInstance;
@@ -38,6 +43,7 @@ const {
   snapshotSupervisedCommand,
   startCliCommand,
   startSupervisedCommand,
+  startSupervisedRequest,
   submitSupervisedOutput,
   sweepExpiredTokenCommands,
   SUPERVISED_CONFIRM_TTL_MS,
@@ -225,6 +231,7 @@ const encode = (text: string) => new TextEncoder().encode(text);
 describe("supervised commands", () => {
   beforeEach(() => {
     resetCliCommandsForTests();
+    resetFileOpsForTests();
     vi.clearAllMocks();
     grants = {};
     sockets = [];
@@ -283,6 +290,7 @@ describe("supervised commands", () => {
     vi.useRealTimers();
     for (const socket of sockets) await relaySessionManager.removeSession(socket, now);
     resetCliCommandsForTests();
+    resetFileOpsForTests();
   });
 
   describe("start checks", () => {
@@ -325,6 +333,7 @@ describe("supervised commands", () => {
           row += 1;
           const slug = `parity-${row}`;
           resetCliCommandsForTests();
+          resetFileOpsForTests();
           if (live) {
             await connect(slug, {
               grant,
@@ -1343,6 +1352,26 @@ describe("supervised commands", () => {
       return audit.mock.calls.map(([event]) => event as Record<string, unknown>);
     }
 
+    it.each([
+      ["bad_command", "bad_command"],
+      ["invalid_input", "invalid_input"],
+      ["AUDIT REJECTION TEXT", "rejected"],
+      [" bad_command", "rejected"],
+      ["BAD_COMMAND", "rejected"],
+    ])("audits supervised command rejection %s as a machine code", async (reason, code) => {
+      const socket = await connect();
+      const request = await started();
+      await say(socket, { type: "supervised.rejected", commandId: request.commandId, reason });
+      expect(events()).toHaveLength(1);
+      expect(events()[0]).toMatchObject({
+        kind: "supervised_command",
+        outcome: "refused",
+        reason: code,
+      });
+      expect(snapshot(request.commandId)?.rejectionReason).toBe(code);
+      expect(JSON.stringify(events())).not.toContain("AUDIT REJECTION TEXT");
+    });
+
     it("records one supervised_command event per terminal outcome, without command output", async () => {
       const socket = await connect();
       // exited (with shared output)
@@ -1494,6 +1523,874 @@ describe("supervised commands", () => {
         ["refused", "not_found"],
         ["refused", "invalid_command"],
       ]);
+    });
+  });
+
+  describe("supervised file requests", () => {
+    async function fileStart(extra: Partial<Parameters<typeof runFileOp>[0]> = {}) {
+      return runFileOp({
+        userId: "user-id",
+        tokenId: "token-a",
+        expiresAt: null,
+        cliDeviceId: "desktop",
+        op: "write",
+        args: { path: "~/notes.txt", reason: "review this change" },
+        body: encode("new\n"),
+        ...extra,
+      });
+    }
+    async function fileStarted(extra: Partial<Parameters<typeof runFileOp>[0]> = {}) {
+      const result = await fileStart(extra);
+      if (!result.ok || !("commandId" in result)) throw new Error("expected file start");
+      return result;
+    }
+    const edit = { path: "~/a", edits: [{ oldText: "a", newText: "b" }] };
+    const result = { op: "write", result: { etag: "h:aaa", size: 4, created: true } };
+
+    it.each([
+      ["done-result", "completed", "completed"],
+      ["done-error", "failed", "conflict"],
+      ["dismissed-error", "failed", "conflict"],
+      ["declined", "declined", "declined"],
+      ["expired", "expired", "timeout"],
+      ["accepted-timeout", "unknown", "timeout"],
+      ["accepted-offline", "unknown", "offline"],
+      ["offline", "cancelled", "offline"],
+      ["spawn-rejected", "refused", "path_denied"],
+      ["admission-refusal", "refused", "unsupported"],
+      ["admission-grant", "refused", "grant_disabled"],
+      ["admission-mode", "refused", "feature_disabled"],
+      ["admission-limit", "refused", "limit"],
+      ["admission-revoked", "refused", "token_inactive"],
+      ["invalid-input", "refused", "invalid_input"],
+      ["inactive-token", "refused", "token_inactive"],
+      ["banned-owner", "refused", "token_inactive"],
+      ["revoked-token", "cancelled", "token_inactive"],
+      ["accepted-revoked-token", "unknown", "token_inactive"],
+    ] as const)(
+      "audits supervised file %s exactly once as %s with metadata only",
+      async (event, outcome, code) => {
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+        const socket = await connect("desktop", {
+          terminalSupported: event !== "admission-refusal",
+          grant: event === "admission-grant" ? "OFF" : "SUPERVISED",
+          mode: event === "admission-mode" ? "off" : "supervised",
+        });
+        if (event === "admission-limit") {
+          await start();
+          socket.sends.length = 0;
+        }
+        if (event === "inactive-token") db.mcpPersonalToken.findFirst.mockResolvedValueOnce(null);
+        if (event === "banned-owner") db.user.findUnique.mockResolvedValueOnce({ banned: true });
+        const dispatch = vi.spyOn(relaySessionManager, "dispatchSupervisedSpawn");
+        const body = encode("AUDIT BODY TEXT");
+        const starting = fileStart({
+          args: {
+            path: "~/audit.txt",
+            reason: "AUDIT REQUEST REASON",
+            expectedEtag: "h:before",
+            ...(event === "invalid-input" ? { extra: "AUDIT EXTRA TEXT" } : {}),
+          },
+          body,
+        });
+        if (event === "admission-revoked") cancelCommandsForToken("token-a");
+        const started = await starting;
+        const tracker = dispatch.mock.calls[0]?.[0];
+        dispatch.mockRestore();
+        const events = () => audit.mock.calls.map(([row]) => row as Record<string, unknown>);
+        if (started.ok && "commandId" in started) {
+          expect(events()).toEqual([]);
+          await say(socket, {
+            type: "term.spawned",
+            commandId: started.commandId,
+            terminalId: started.terminalId,
+          });
+          if (event === "done-result" || event === "done-error" || event.startsWith("accepted-")) {
+            await say(socket, { type: "supervised.accepted", commandId: started.commandId });
+            expect(events()).toEqual([]);
+          }
+          switch (event) {
+            case "done-result":
+              await say(socket, {
+                type: "supervised.done",
+                commandId: started.commandId,
+                review: false,
+                fileResult: { ...result, result: { ...result.result, size: body.byteLength } },
+              });
+              break;
+            case "done-error":
+            case "dismissed-error":
+              await say(socket, {
+                type: "supervised.done",
+                commandId: started.commandId,
+                review: false,
+                fileError: { code: "conflict" },
+              });
+              break;
+            case "expired":
+              await vi.advanceTimersByTimeAsync(SUPERVISED_CONFIRM_TTL_MS);
+              expect(events()).toEqual([]);
+              await say(socket, { type: "supervised.declined", commandId: started.commandId });
+              break;
+            case "declined":
+              await say(socket, { type: "supervised.declined", commandId: started.commandId });
+              break;
+            case "accepted-timeout":
+              await vi.advanceTimersByTimeAsync(FILE_OP_DEADLINE_MS);
+              break;
+            case "accepted-offline":
+            case "offline":
+              await relaySessionManager.removeSession(socket);
+              break;
+            case "spawn-rejected":
+              await say(socket, {
+                type: "supervised.rejected",
+                commandId: started.commandId,
+                reason: "path_denied",
+              });
+              break;
+            case "revoked-token":
+            case "accepted-revoked-token":
+              cancelCommandsForToken("token-a");
+              break;
+            default:
+              throw new Error(`unexpected successful admission: ${event}`);
+          }
+          expect(snapshot(started.commandId)?.fileError?.outcome).toBe(
+            outcome === "unknown" ? "unknown" : undefined,
+          );
+          // Redelivered terminal reports and later revoke/teardown all converge
+          // at finishSupervised; none may write a second audit event.
+          tracker?.onDone({ review: false, fileError: { code: "conflict" } });
+          tracker?.onDeclined();
+          tracker?.onRejected("spawn_failed");
+          tracker?.onTerminalGone("exit");
+          cancelCommandsForToken("token-a");
+        } else {
+          expect(started).toMatchObject({ ok: false, code });
+          expect(socket.sends).toEqual([]);
+        }
+        expect(events()).toHaveLength(1);
+        expect(events()[0]).toEqual({
+          userId: "user-id",
+          cliDeviceId:
+            event === "inactive-token" || event === "banned-owner" || event === "admission-revoked"
+              ? "unknown"
+              : "desktop",
+          mcpTokenId: "token-a",
+          kind: "supervised_file_write",
+          path: "~/audit.txt",
+          etagBefore: "h:before",
+          ...(started.ok ? { etagAfter: event === "done-result" ? "h:aaa" : null } : {}),
+          bytes: body.byteLength,
+          outcome,
+          reason: `write:${code}`,
+          startedAt: expect.any(Date),
+          finishedAt: expect.any(Date),
+        });
+        const serialized = JSON.stringify(events());
+        for (const text of [
+          "AUDIT BODY TEXT",
+          "AUDIT REQUEST REASON",
+          "AUDIT EXTRA TEXT",
+          "content",
+          "diff",
+          "hunks",
+          "fileOp",
+          '"kind":"file_write"',
+        ])
+          expect(serialized).not.toContain(text);
+      },
+    );
+
+    it.each(["edit", "rename", "mkdir", "delete"] as const)(
+      "audits supervised %s with its requested path and op, never edit text or rename destination",
+      async (op) => {
+        const socket = await connect();
+        const args =
+          op === "edit"
+            ? {
+                path: "~/source",
+                edits: [{ oldText: "AUDIT OLD TEXT", newText: "AUDIT NEW TEXT" }],
+              }
+            : op === "rename"
+              ? { from: "~/source", to: "~/AUDIT DESTINATION" }
+              : { path: "~/source" };
+        const request = await fileStarted({ op, args, body: undefined });
+        await say(socket, { type: "supervised.declined", commandId: request.commandId });
+        expect(audit).toHaveBeenCalledTimes(1);
+        expect(audit.mock.calls[0]?.[0]).toMatchObject({
+          kind: "supervised_file_write",
+          path: "~/source",
+          reason: `${op}:declined`,
+          outcome: "declined",
+          bytes: null,
+        });
+        expect(JSON.stringify(audit.mock.calls)).not.toContain("AUDIT");
+      },
+    );
+
+    it.each([
+      [false, "failed"],
+      [true, "unknown"],
+    ] as const)(
+      "settles callback failure once after registration (accepted=%s)",
+      async (accepted, outcome) => {
+        vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+        await connect();
+        const dispatch = vi.spyOn(relaySessionManager, "dispatchSupervisedSpawn");
+        await expect(
+          fileStart({
+            onSupervisedStart: () => {
+              if (accepted) dispatch.mock.calls[0]?.[0].onAccepted();
+              throw new Error("AUDIT CALLBACK TEXT");
+            },
+          }),
+        ).rejects.toThrow("AUDIT CALLBACK TEXT");
+        const tracker = dispatch.mock.calls[0]?.[0];
+        dispatch.mockRestore();
+        expect(listPendingSupervised("user-id")).toEqual([]);
+        expect(relaySessionManager.listTerminalsForUser("user-id")).toEqual([]);
+        tracker?.onTerminalGone("exit");
+        cancelCommandsForToken("token-a");
+        await vi.advanceTimersByTimeAsync(SUPERVISED_CONFIRM_TTL_MS + SUPERVISED_STOP_GRACE_MS);
+        expect(audit).toHaveBeenCalledTimes(1);
+        expect(audit.mock.calls[0]?.[0]).toMatchObject({
+          kind: "supervised_file_write",
+          path: "~/notes.txt",
+          outcome,
+          reason: "write:io_error",
+          cliDeviceId: "desktop",
+        });
+        expect(JSON.stringify(audit.mock.calls)).not.toContain("AUDIT CALLBACK TEXT");
+      },
+    );
+
+    it.each(["missing", "foreign", "inactive", "throws"] as const)(
+      "masks the device in a direct supervised file admission refusal: %s",
+      async (admission) => {
+        await connect();
+        if (admission === "inactive") db.mcpPersonalToken.findFirst.mockResolvedValueOnce(null);
+        if (admission === "throws")
+          db.cliDevice.findUnique.mockRejectedValueOnce(new Error("AUDIT INTERNAL TEXT"));
+        const request = startSupervisedRequest({
+          kind: "file",
+          userId: "user-id",
+          tokenId: "token-a",
+          expiresAt: null,
+          cliDeviceId: admission === "missing" || admission === "foreign" ? admission : "desktop",
+          fileOp: { op: "mkdir", args: { path: "~/source", reason: "AUDIT REQUEST REASON" } },
+        });
+        if (admission === "throws") await expect(request).rejects.toThrow("AUDIT INTERNAL TEXT");
+        else await expect(request).resolves.toMatchObject({ ok: false });
+        expect(audit).toHaveBeenCalledTimes(1);
+        expect(audit.mock.calls[0]?.[0]).toMatchObject({
+          kind: "supervised_file_write",
+          path: "~/source",
+          cliDeviceId: "unknown",
+          outcome: admission === "throws" ? "failed" : "refused",
+          reason: `mkdir:${admission === "throws" ? "internal_error" : admission === "inactive" ? "token_inactive" : "not_found"}`,
+        });
+        expect(JSON.stringify(audit.mock.calls)).not.toContain("AUDIT");
+      },
+    );
+
+    it.each([
+      ["SUPERVISED", "supervised"],
+      ["SUPERVISED", "unsupervised"],
+      ["UNSUPERVISED", "supervised"],
+    ] as const)(
+      "routes grant %s / live %s to a supervised spawn and one following body",
+      async (grant, mode) => {
+        const socket = await connect("desktop", { grant, mode });
+        const request = await fileStarted();
+        expect(socket.sends).toHaveLength(2);
+        expect(JSON.parse(String(socket.sends[0]))).toMatchObject({
+          type: "term.spawn",
+          kind: "file",
+          commandId: request.commandId,
+          fileOp: { op: "write", args: { path: "~/notes.txt" } },
+          bodyBytes: 4,
+          shareOutput: false,
+        });
+        const body = parseRelayBinaryFrame(socket.sends[1] as ArrayBuffer);
+        expect(body.metadata).toEqual({ type: "file.body", opId: request.commandId });
+        expect(body.body).toEqual(encode("new\n"));
+        expect(socket.json().some((frame) => frame.type === "file.op")).toBe(false);
+        await say(socket, {
+          type: "term.spawned",
+          commandId: request.commandId,
+          terminalId: request.terminalId,
+        });
+        expect(listPendingSupervised("user-id")[0]).toMatchObject({
+          command: expect.stringContaining("File write"),
+          shareOutput: false,
+        });
+        await say(socket, { type: "supervised.accepted", commandId: request.commandId });
+        await say(socket, {
+          type: "supervised.done",
+          commandId: request.commandId,
+          review: false,
+          fileResult: result,
+        });
+        expect(snapshot(request.commandId)).toMatchObject({
+          status: "exited",
+          requestKind: "file",
+          file: result,
+          fileError: null,
+        });
+      },
+    );
+
+    it.each([
+      ["read", { path: "~/a" }, undefined],
+      ["edit", { ...edit, dryRun: true }, undefined],
+      ["write", { path: "~/a", content: "x" }, encode("x")],
+      ["write", { path: "~/a" }, undefined],
+      ["write", { path: "~/a" }, new Uint8Array(1024 * 1024 + 1)],
+      ["mkdir", { path: "~/a", extra: true }, undefined],
+    ] as const)(
+      "refuses read/dryRun/malformed or oversized %s without a spawn",
+      async (op, args, body) => {
+        const socket = await connect();
+        await expect(fileStart({ op, args, body })).resolves.toMatchObject({
+          ok: false,
+          code: op === "read" ? "supervised_only" : "invalid_input",
+        });
+        expect(socket.sends).toEqual([]);
+      },
+    );
+
+    it.each(["edit", "rename", "mkdir", "delete"] as const)(
+      "starts %s with no binary body",
+      async (op) => {
+        const socket = await connect();
+        const args =
+          op === "edit" ? edit : op === "rename" ? { from: "~/a", to: "~/b" } : { path: "~/a" };
+        await fileStarted({ op, args, body: undefined });
+        expect(socket.sends).toHaveLength(1);
+        expect(socket.json()[0]).toMatchObject({ kind: "file", fileOp: { op, args } });
+        expect(socket.json()[0]).not.toHaveProperty("bodyBytes");
+      },
+    );
+
+    it.each(["protocol", "fileOps"] as const)(
+      "uses the supervised file capability guard for %s",
+      async (missing) => {
+        await connect();
+        const live = relaySessionManager.getLiveCliFeatures(["desktop"]).get("desktop");
+        if (!live) throw new Error("missing live features");
+        const spy = vi.spyOn(relaySessionManager, "getLiveCliFeatures").mockReturnValue(
+          new Map([
+            [
+              "desktop",
+              {
+                ...live,
+                ...(missing === "protocol"
+                  ? { protocolVersion: "2.7" as const }
+                  : { fileOps: false }),
+              },
+            ],
+          ]),
+        );
+        await expect(fileStart()).resolves.toMatchObject({ ok: false, code: "offline" });
+        spy.mockRestore();
+      },
+    );
+
+    it.each([
+      { kind: "file", fileOp: { op: "write", args: { path: "~/a" } }, bodyBytes: 1 },
+      { kind: "file", fileOp: { op: "mkdir", args: { path: "~/a" } }, bodyBytes: 1 },
+      { kind: "command", fileOp: { op: "write", args: { path: "~/a" } }, bodyBytes: 4 },
+      {
+        kind: "file",
+        fileOp: { op: "write", args: { path: "~/a" } },
+        bodyBytes: 4,
+        shareOutput: true,
+      },
+      { kind: "file", fileOp: { op: "mkdir", args: { path: "~/a", injected: "forged" } } },
+    ])("registers nothing when spawn encoding/body agreement fails (%j)", async (extra) => {
+      const socket = await connect();
+      const spy = vi.spyOn(relaySessionManager, "dispatchSupervisedSpawn");
+      await fileStarted();
+      const args = spy.mock.calls[0];
+      if (!args) throw new Error("no spawn");
+      spy.mockRestore();
+      const cancel = sent(socket, "term.spawn")[0];
+      if (!cancel) throw new Error("no initial spawn");
+      await say(socket, {
+        type: "supervised.rejected",
+        commandId: cancel.commandId,
+        reason: "limit",
+      });
+      socket.sends.length = 0;
+      const tracker = {
+        ...args[0],
+        commandId: Buffer.alloc(16, 12).toString("base64url"),
+        terminalId: Buffer.alloc(16, 13).toString("base64url"),
+      };
+      try {
+        relaySessionManager.dispatchSupervisedSpawn(
+          tracker,
+          { ...args[1], ...extra } as Parameters<
+            typeof relaySessionManager.dispatchSupervisedSpawn
+          >[1],
+          encode("new\n"),
+        );
+      } catch {
+        /* encoding must precede registration */
+      }
+      expect(socket.sends).toEqual([]);
+      expect(relaySessionManager.hasTerminal(tracker.terminalId)).toBe(false);
+    });
+
+    it.each(["tracker-kind", "tracker-op", "missing-body", "short-body", "nonwrite-body"] as const)(
+      "rejects inconsistent internal dispatch %s before registration",
+      async (mismatch) => {
+        const socket = await connect();
+        const spy = vi.spyOn(relaySessionManager, "dispatchSupervisedSpawn");
+        const request = await fileStarted();
+        const args = spy.mock.calls[0];
+        if (!args) throw new Error("missing spawn");
+        spy.mockRestore();
+        await say(socket, {
+          type: "supervised.rejected",
+          commandId: request.commandId,
+          reason: "limit",
+        });
+        socket.sends.length = 0;
+        const tracker = {
+          ...args[0],
+          commandId: Buffer.alloc(16, 15).toString("base64url"),
+          terminalId: Buffer.alloc(16, 16).toString("base64url"),
+          ...(mismatch === "tracker-kind" ? { kind: "command" as const } : {}),
+          ...(mismatch === "tracker-op" ? { fileOp: "edit" as const } : {}),
+          ...(mismatch === "nonwrite-body" ? { fileOp: "mkdir" as const } : {}),
+        };
+        const spawn =
+          mismatch === "nonwrite-body"
+            ? {
+                ...args[1],
+                fileOp: { op: "mkdir" as const, args: { path: "~/a" } },
+                bodyBytes: undefined,
+              }
+            : args[1];
+        const body =
+          mismatch === "missing-body"
+            ? undefined
+            : mismatch === "short-body"
+              ? encode("x")
+              : encode("new\n");
+        expect(relaySessionManager.dispatchSupervisedSpawn(tracker, spawn, body)).toBe(false);
+        expect(socket.sends).toEqual([]);
+        expect(relaySessionManager.hasTerminal(tracker.terminalId)).toBe(false);
+      },
+    );
+
+    it("enforces the total live cap across accepted commands and files", async () => {
+      const socket = await connect();
+      await spawnedAndAccepted(socket);
+      const file = await fileStarted();
+      await say(socket, { type: "supervised.accepted", commandId: file.commandId });
+      await expect(fileStart()).resolves.toMatchObject({ ok: false, code: "limit" });
+    });
+
+    it("arms file expiry from acceptance, clears it on completion, and settles once", async () => {
+      vi.useFakeTimers();
+      const socket = await connect();
+      const request = await fileStarted();
+      await vi.advanceTimersByTimeAsync(SUPERVISED_CONFIRM_TTL_MS - 1000);
+      await say(socket, { type: "supervised.accepted", commandId: request.commandId });
+      await vi.advanceTimersByTimeAsync(FILE_OP_DEADLINE_MS - 1);
+      expect(snapshot(request.commandId)?.status).toBe("running");
+      await say(socket, {
+        type: "supervised.done",
+        commandId: request.commandId,
+        review: false,
+        fileResult: result,
+      });
+      await say(socket, {
+        type: "supervised.done",
+        commandId: request.commandId,
+        review: false,
+        fileError: { code: "conflict" },
+      });
+      await vi.advanceTimersByTimeAsync(FILE_OP_DEADLINE_MS + SUPERVISED_CONFIRM_TTL_MS);
+      expect(snapshot(request.commandId)).toMatchObject({
+        status: "exited",
+        file: result,
+        fileError: null,
+      });
+      expect(sent(socket, "supervised.cancel")).toEqual([]);
+    });
+
+    it.each(["missing", "foreign"])(
+      "binds file admission to owned device %s",
+      async (cliDeviceId) => {
+        const socket = await connect();
+        await expect(fileStart({ cliDeviceId })).resolves.toMatchObject({
+          ok: false,
+          code: "not_found",
+        });
+        expect(socket.sends).toEqual([]);
+      },
+    );
+
+    it.each(["expiry", "scope", "flag", "owner-deleting"])(
+      "refuses inactive file requester (%s)",
+      async (cause) => {
+        const socket = await connect();
+        if (cause === "owner-deleting")
+          db.user.findUnique.mockResolvedValue({ deletionRequestedAt: new Date() });
+        else
+          db.mcpPersonalToken.findFirst.mockResolvedValue({
+            ...liveToken(),
+            ...(cause === "expiry"
+              ? { expiresAt: new Date(Date.now() - 1) }
+              : cause === "scope"
+                ? { scopes: ["mcp:read"] }
+                : { allowCliCommands: false }),
+          });
+        await expect(fileStart()).resolves.toMatchObject({ ok: false, code: "token_inactive" });
+        expect(socket.sends).toEqual([]);
+      },
+    );
+
+    it.each(["grant", "live", "banned", "token", "offline"] as const)(
+      "refuses a file on %s admission",
+      async (cause) => {
+        const socket =
+          cause === "offline"
+            ? null
+            : await connect("desktop", {
+                grant: cause === "grant" ? "OFF" : "SUPERVISED",
+                mode: cause === "live" ? "off" : "supervised",
+              });
+        if (cause === "banned")
+          db.user.findUnique.mockResolvedValue({ banned: true, banExpires: null });
+        if (cause === "token") db.mcpPersonalToken.findFirst.mockResolvedValue(null);
+        const expected = {
+          grant: "grant_disabled",
+          live: "feature_disabled",
+          banned: "token_inactive",
+          token: "token_inactive",
+          offline: "grant_disabled",
+        };
+        if (cause === "offline") grants.desktop = "SUPERVISED";
+        await expect(fileStart()).resolves.toMatchObject({
+          ok: false,
+          code: cause === "offline" ? "offline" : expected[cause],
+        });
+        expect(socket?.sends ?? []).toEqual([]);
+      },
+    );
+
+    it.each(["before", "after"] as const)(
+      "file abort %s registration applies the id-delivery rule",
+      async (moment) => {
+        const socket = await connect();
+        const controller = new AbortController();
+        let release!: (row: unknown) => void;
+        db.user.findUnique.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              release = resolve;
+            }),
+        );
+        const pending = fileStart({
+          signal: controller.signal,
+          onSupervisedStart: () => controller.abort(),
+        });
+        if (moment === "before") controller.abort();
+        release({ banned: false });
+        const request = await pending;
+        if (moment === "before") {
+          expect(request).toEqual({ ok: false, code: "cancelled" });
+          expect(socket.sends).toEqual([]);
+        } else {
+          expect(request).toMatchObject({ ok: true, kind: "supervised" });
+          expect(controller.signal.aborted).toBe(true);
+          expect(sent(socket, "supervised.cancel")).toEqual([]);
+          if (!request.ok || !("commandId" in request)) throw new Error("missing file id");
+          expect(snapshot(request.commandId)?.status).toBe("awaiting_user");
+        }
+      },
+    );
+
+    it("uses one combined admission snapshot to select supervised dispatch", async () => {
+      await connect();
+      db.mcpPersonalToken.findFirst.mockClear();
+      db.user.findUnique.mockClear();
+      db.cliDevice.findUnique.mockClear();
+      await fileStarted();
+      // A second read inserts an asynchronous admission boundary between the
+      // selected file mode and registration. The shared dispatcher reuses it.
+      expect(db.mcpPersonalToken.findFirst).toHaveBeenCalledTimes(1);
+      expect(db.user.findUnique).toHaveBeenCalledTimes(1);
+      expect(db.cliDevice.findUnique).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["revoke", "grant"] as const)("refuses %s during file admission", async (cause) => {
+      const socket = await connect();
+      let release!: (row: unknown) => void;
+      db.user.findUnique.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            release = resolve;
+          }),
+      );
+      const pending = fileStart();
+      if (cause === "revoke") cancelCommandsForToken("token-a");
+      else {
+        grants.desktop = "OFF";
+        relaySessionManager.applyFeatureGrants("desktop", {
+          allowHumanTerminal: false,
+          mcpCommandMode: "off",
+        });
+      }
+      release({ banned: false });
+      await expect(pending).resolves.toMatchObject({
+        ok: false,
+        code: cause === "revoke" ? "token_inactive" : "grant_disabled",
+      });
+      expect(socket.sends).toEqual([]);
+    });
+
+    it.each(["cli", "user"] as const)("shares the %s pending cap with commands", async (limit) => {
+      await connect();
+      if (limit === "cli") await started();
+      else {
+        await connect("laptop");
+        await connect("third");
+        await started({ cliDeviceId: "laptop" });
+        await started({ cliDeviceId: "third" });
+      }
+      await expect(fileStart()).resolves.toMatchObject({ ok: false, code: "limit" });
+    });
+
+    it.each([
+      "decline",
+      "expiry",
+      "disconnect",
+      "accepted-timeout",
+      "accepted-disconnect",
+      "revoke",
+      "grant",
+    ] as const)("settles %s with only the justified uncertainty", async (event) => {
+      vi.useFakeTimers();
+      const socket = await connect();
+      const request = await fileStarted();
+      const commandId = request.commandId;
+      await say(socket, { type: "term.spawned", commandId, terminalId: request.terminalId });
+      if (event.startsWith("accepted"))
+        await say(socket, { type: "supervised.accepted", commandId });
+      if (event === "decline") {
+        expect(
+          relaySessionManager.declineTerminalFromBrowser(request.terminalId, "user-id", "tab"),
+        ).toBe("requested");
+        expect(sent(socket, "supervised.cancel")[0]).toMatchObject({ reason: "decline" });
+        await say(socket, { type: "supervised.declined", commandId });
+      }
+      if (event === "expiry") {
+        await vi.advanceTimersByTimeAsync(SUPERVISED_CONFIRM_TTL_MS);
+        expect(sent(socket, "supervised.cancel")[0]).toMatchObject({ reason: "expire" });
+        await vi.advanceTimersByTimeAsync(SUPERVISED_STOP_GRACE_MS);
+      }
+      if (event === "accepted-timeout") {
+        await vi.advanceTimersByTimeAsync(FILE_OP_DEADLINE_MS);
+        expect(sent(socket, "supervised.cancel")[0]).toEqual({
+          type: "supervised.cancel",
+          commandId,
+        });
+      }
+      if (event.includes("disconnect")) await relaySessionManager.removeSession(socket);
+      if (event === "revoke") cancelCommandsForToken("token-a");
+      if (event === "grant")
+        relaySessionManager.applyFeatureGrants("desktop", {
+          allowHumanTerminal: false,
+          mcpCommandMode: "off",
+        });
+      const codes = {
+        decline: "declined",
+        expiry: "timeout",
+        disconnect: "offline",
+        "accepted-timeout": "timeout",
+        "accepted-disconnect": "offline",
+        revoke: "token_inactive",
+        grant: "grant_disabled",
+      };
+      expect(snapshot(commandId)?.fileError).toEqual({
+        code: codes[event],
+        ...(event.startsWith("accepted") ? { outcome: "unknown" } : {}),
+      });
+      expect(socket.json().some((frame) => frame.type === "go")).toBe(false);
+    });
+
+    it("returns a state-dependent error only on done, without acceptance or details", async () => {
+      const socket = await connect();
+      const request = await fileStarted();
+      expect(snapshot(request.commandId)?.fileError).toBeNull();
+      await say(socket, {
+        type: "supervised.done",
+        commandId: request.commandId,
+        review: false,
+        fileError: { code: "conflict" },
+      });
+      expect(snapshot(request.commandId)).toMatchObject({
+        status: "rejected",
+        started: false,
+        fileError: { code: "conflict" },
+      });
+      await say(socket, { type: "supervised.accepted", commandId: request.commandId });
+      expect(snapshot(request.commandId)?.fileError).toEqual({ code: "conflict" });
+    });
+
+    it.each([
+      "command-with-file",
+      "file-with-command",
+      "wrong-op",
+      "both",
+      "diff",
+      "extra-error",
+    ] as const)("isolates %s as a protocol violation", async (shape) => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const socket = await connect();
+      const request = shape === "command-with-file" ? await started() : await fileStarted();
+      await say(socket, { type: "supervised.accepted", commandId: request.commandId });
+      const fields =
+        shape === "file-with-command"
+          ? {}
+          : shape === "both"
+            ? { fileResult: result, fileError: { code: "conflict" } }
+            : shape === "extra-error"
+              ? { fileError: { code: "conflict", detail: "forged" } }
+              : shape === "wrong-op"
+                ? { fileResult: { op: "mkdir", result: { created: true } } }
+                : shape === "diff"
+                  ? { fileResult: { ...result, result: { ...result.result, diff: "forged" } } }
+                  : { fileResult: result };
+      await say(socket, {
+        type: "supervised.done",
+        commandId: request.commandId,
+        review: false,
+        ...fields,
+      });
+      expect(snapshot(request.commandId)?.status).toBe("cancelled");
+      expect(sent(socket, "term.close")).toHaveLength(1);
+      expect(socket.closes).toEqual([]);
+    });
+
+    it.each([
+      ["disabled", "feature_disabled"],
+      ["bad_command", "invalid_input"],
+      ["invalid_input", "invalid_input"],
+      ["bad_frame", "io_error"],
+      ["already_open", "limit"],
+      ["spawn_failed", "io_error"],
+      ["unsupported", "unsupported"],
+      ["path_denied", "path_denied"],
+      ["secret_file", "secret_file"],
+      ["too_large", "too_large"],
+      ["redacted_span", "redacted_span"],
+    ])("maps pre-display refusal %s to %s", async (reason, code) => {
+      const socket = await connect();
+      const request = await fileStarted();
+      await say(socket, { type: "supervised.rejected", commandId: request.commandId, reason });
+      expect(snapshot(request.commandId)?.fileError).toEqual({ code });
+    });
+
+    it.each(["conflict", "not_found", "exists", "owner_mismatch", "forged"])(
+      "rejects state disclosure %s before keypress",
+      async (reason) => {
+        vi.spyOn(console, "error").mockImplementation(() => {});
+        const socket = await connect();
+        const request = await fileStarted();
+        await say(socket, { type: "supervised.rejected", commandId: request.commandId, reason });
+        expect(snapshot(request.commandId)?.fileError).toEqual({ code: "cancelled" });
+        expect(sent(socket, "term.close")).toHaveLength(1);
+      },
+    );
+
+    it("updates a server timeout to unknown when acceptance was still in transit", async () => {
+      vi.useFakeTimers();
+      const socket = await connect();
+      const request = await fileStarted();
+      await vi.advanceTimersByTimeAsync(SUPERVISED_CONFIRM_TTL_MS + SUPERVISED_STOP_GRACE_MS);
+      expect(snapshot(request.commandId)).toMatchObject({
+        started: false,
+        fileError: { code: "timeout" },
+      });
+      await say(socket, { type: "supervised.accepted", commandId: request.commandId });
+      expect(snapshot(request.commandId)).toMatchObject({
+        started: true,
+        fileError: { code: "timeout", outcome: "unknown" },
+      });
+    });
+
+    it.each(["conflict", "io_error", "cancelled"])(
+      "CLI post-accept %s is definitive",
+      async (code) => {
+        const socket = await connect();
+        const request = await fileStarted();
+        await say(socket, { type: "supervised.accepted", commandId: request.commandId });
+        await say(socket, {
+          type: "supervised.done",
+          commandId: request.commandId,
+          review: false,
+          fileError: { code },
+        });
+        expect(snapshot(request.commandId)).toMatchObject({
+          status: "rejected",
+          started: true,
+          fileError: { code },
+          waitDeadline: null,
+        });
+        expect(snapshot(request.commandId)?.fileError).not.toHaveProperty("outcome");
+      },
+    );
+
+    it("refuses a successful file result before acceptance", async () => {
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const socket = await connect();
+      const request = await fileStarted();
+      await say(socket, {
+        type: "supervised.done",
+        commandId: request.commandId,
+        review: false,
+        fileResult: result,
+      });
+      expect(snapshot(request.commandId)).toMatchObject({
+        status: "cancelled",
+        started: false,
+        file: null,
+      });
+      expect(sent(socket, "term.close")).toHaveLength(1);
+    });
+
+    it.each([1, 2])("cleans tracking when send %s throws", async (sendIndex) => {
+      const socket = await connect();
+      const dispatch = vi.spyOn(relaySessionManager, "dispatchSupervisedSpawn");
+      const original = socket.send.bind(socket);
+      let count = 0;
+      const spy = vi.spyOn(socket, "send").mockImplementation((data) => {
+        count += 1;
+        if (count === sendIndex) throw new Error("send failed");
+        original(data);
+      });
+      await expect(fileStart()).resolves.toMatchObject({ ok: false, code: "offline" });
+      expect(listPendingSupervised("user-id")).toEqual([]);
+      expect(relaySessionManager.listTerminalsForUser("user-id")).toEqual([]);
+      const tracker = dispatch.mock.calls[0]?.[0];
+      if (!tracker) throw new Error("missing dispatch tracker");
+      expect(relaySessionManager.hasTerminal(tracker.terminalId)).toBe(false);
+      const sessions = Reflect.get(relaySessionManager, "sessionsByCliDeviceId") as Map<
+        string,
+        { supervisedById: Map<string, unknown> }
+      >;
+      expect(sessions.get("desktop")?.supervisedById.size).toBe(0);
+      dispatch.mockRestore();
+      spy.mockRestore();
+      await expect(fileStart()).resolves.toMatchObject({ ok: true, kind: "supervised" });
     });
   });
 });

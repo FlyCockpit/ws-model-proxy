@@ -19,7 +19,7 @@ pub const MAX_WRITE_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_CREATE_MODE: u32 = 0o644;
 pub const DEFAULT_PARENT_MODE: u32 = 0o755;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Encoding {
     #[default]
     #[serde(rename = "utf-8")]
@@ -28,7 +28,7 @@ pub enum Encoding {
     Base64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum IfExists {
     #[default]
@@ -36,7 +36,7 @@ pub enum IfExists {
     Replace,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WriteArgs {
     pub path: String,
@@ -84,7 +84,7 @@ pub(crate) fn parse_mode(mode: &str) -> FileResult<u32> {
     Ok(value)
 }
 
-fn decode_content(args: &WriteArgs) -> FileResult<Vec<u8>> {
+pub(crate) fn decode_content(args: &WriteArgs) -> FileResult<Vec<u8>> {
     let bytes = match args.encoding.unwrap_or_default() {
         Encoding::Utf8 => args.content.clone().into_bytes(),
         Encoding::Base64 => STANDARD
@@ -110,6 +110,21 @@ fn decode_content(args: &WriteArgs) -> FileResult<Vec<u8>> {
 }
 
 pub(crate) fn write(ops: &FileOps, args: &WriteArgs, cancel: &Cancel) -> FileResult<WriteResult> {
+    let (content, mode, if_exists) = validate_args(args)?;
+    write_validated(ops, args, &content, mode, if_exists, None, cancel)
+}
+
+pub(crate) fn write_supervised(
+    ops: &FileOps,
+    args: &WriteArgs,
+    pin: &super::supervised::PinnedPath,
+    cancel: &Cancel,
+) -> FileResult<WriteResult> {
+    let (content, mode, if_exists) = validate_args(args)?;
+    write_validated(ops, args, &content, mode, if_exists, Some(pin), cancel)
+}
+
+pub(crate) fn validate_args(args: &WriteArgs) -> FileResult<(Vec<u8>, Option<u32>, IfExists)> {
     check_reason(&args.reason)?;
     let content = decode_content(args)?;
     let if_exists = args.if_exists.unwrap_or_default();
@@ -129,6 +144,18 @@ pub(crate) fn write(ops: &FileOps, args: &WriteArgs, cancel: &Cancel) -> FileRes
         ));
     }
 
+    Ok((content, mode, if_exists))
+}
+
+fn write_validated(
+    ops: &FileOps,
+    args: &WriteArgs,
+    content: &[u8],
+    mode: Option<u32>,
+    if_exists: IfExists,
+    pin: Option<&super::supervised::PinnedPath>,
+    cancel: &Cancel,
+) -> FileResult<WriteResult> {
     let mut resolved = resolve(
         &args.path,
         &ResolveOpts {
@@ -139,9 +166,20 @@ pub(crate) fn write(ops: &FileOps, args: &WriteArgs, cancel: &Cancel) -> FileRes
                 .then_some(DEFAULT_PARENT_MODE),
             policy: &ops.policy,
             access: Access::Write,
+            preview_missing: false,
+            pin: pin.map(|pin| &pin.ancestor),
+            cancel: Some(cancel),
         },
     )?;
-    let outcome = write_resolved(ops, args, &content, mode, &mut resolved, if_exists, cancel);
+    let outcome = write_resolved(
+        ops,
+        args,
+        content,
+        (mode, if_exists),
+        &mut resolved,
+        pin,
+        cancel,
+    );
     if outcome.is_err() {
         resolved.rollback_created();
     }
@@ -152,16 +190,20 @@ fn write_resolved(
     ops: &FileOps,
     args: &WriteArgs,
     content: &[u8],
-    mode: Option<u32>,
+    create: (Option<u32>, IfExists),
     resolved: &mut super::resolve::Resolved,
-    if_exists: IfExists,
+    pin: Option<&super::supervised::PinnedPath>,
     cancel: &Cancel,
 ) -> FileResult<WriteResult> {
+    let (mode, if_exists) = create;
     if resolved.is_self() {
         return Err(FileError::invalid("path names a directory"));
     }
     let full = resolved.full_path();
     let _lock = ops.lock_path(full.clone(), cancel)?;
+    if let Some(pin) = pin {
+        pin.verify(ops, resolved, Access::Write)?;
+    }
     let echo = resolved.echo(&args.path);
     let existing = resolved.lstat()?;
     let etag = ops.key.strong(content);
@@ -206,6 +248,9 @@ fn write_resolved(
         ));
     }
     let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
+    if let Some(pin) = pin {
+        pin.verify_opened(&stat)?;
+    }
     let previous_etag = current_etag(ops, &mut file, &stat)?;
     if args.expected_etag.as_deref() != Some(previous_etag.as_str()) {
         return Err(FileError::conflict(&previous_etag));
@@ -230,16 +275,29 @@ fn write_resolved(
     }
     atomic::check_replaceable(ops, &stat)?;
     cancel.check()?;
-    atomic::replace(
-        ops,
-        &resolved.dir,
-        &resolved.name,
-        &mut file,
-        &stat,
-        &previous_etag,
-        content,
-        cancel,
-    )?;
+    match pin {
+        Some(pin) => atomic::replace_supervised(
+            ops,
+            &resolved.dir,
+            &resolved.name,
+            &mut file,
+            &stat,
+            &previous_etag,
+            content,
+            pin,
+            cancel,
+        )?,
+        None => atomic::replace(
+            ops,
+            &resolved.dir,
+            &resolved.name,
+            &mut file,
+            &stat,
+            &previous_etag,
+            content,
+            cancel,
+        )?,
+    }
 
     let mut result = WriteResult {
         etag,

@@ -375,6 +375,9 @@ fn resolve_rolls_back_created_parents() {
             make_parents: Some(0o755),
             policy: &policy,
             access: Access::Write,
+            preview_missing: false,
+            pin: None,
+            cancel: None,
         },
     )
     .unwrap();

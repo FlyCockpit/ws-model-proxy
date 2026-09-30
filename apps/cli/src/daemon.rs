@@ -848,15 +848,13 @@ fn run_relay_session(
     // relay keeps only the ops it has pending. Dropping it cancels them all.
     #[cfg(unix)]
     let mut files = {
+        let runtime = crate::file_relay::shared_runtime(startup.allow_file_tools_as_root());
+        terminals.set_file_runtime(Arc::clone(&runtime));
         let tx = worker_tx.clone();
         let sink: crate::file_relay::FileSink = Arc::new(move |op_id, frames| {
             let _ = tx.send(FromWorker::FileFrames { op_id, frames });
         });
-        crate::file_relay::FileRelay::new(
-            crate::file_relay::shared_runtime(startup.allow_file_tools_as_root()),
-            startup.mcp_command_mode(),
-            sink,
-        )
+        crate::file_relay::FileRelay::new(runtime, startup.mcp_command_mode(), sink)
     };
 
     let hello = ClientControlMessage::Hello {
@@ -906,6 +904,7 @@ fn run_relay_session(
             &mut socket,
             config,
             &worker_rx,
+            startup,
             &mut workers,
             &mut recent_finished,
             #[cfg(unix)]
@@ -923,7 +922,9 @@ fn run_relay_session(
             break Err(error);
         }
         let now = Instant::now();
-        if let Err(error) = send_outbound_frames(&mut socket, terminals.poll(now)) {
+        if let Err(error) =
+            send_outbound_frames(&mut socket, terminals.poll_with_startup(startup, now))
+        {
             break Err(error);
         }
         if let Err(error) = send_outbound_frames(&mut socket, execs.poll(now)) {
@@ -1040,8 +1041,8 @@ fn run_relay_session(
             Ok(Message::Binary(bytes)) => handle_binary(
                 &mut socket,
                 &bytes,
-                &mut workers,
-                &mut recent_finished,
+                startup,
+                (&mut workers, &mut recent_finished),
                 &mut terminals,
                 &mut execs,
                 #[cfg(unix)]
@@ -1157,6 +1158,7 @@ fn drain_worker_output<S>(
     socket: &mut tungstenite::WebSocket<S>,
     _config: &mut Config,
     worker_rx: &Receiver<FromWorker>,
+    startup: &TerminalStartup,
     workers: &mut BTreeMap<String, WorkerHandle>,
     recent_finished: &mut RecentlyFinished,
     #[cfg(unix)] terminals: &mut TerminalRegistry,
@@ -1169,6 +1171,8 @@ fn drain_worker_output<S>(
 where
     S: std::io::Read + std::io::Write,
 {
+    #[cfg(not(unix))]
+    let _ = startup;
     loop {
         match worker_rx.try_recv() {
             Ok(FromWorker::Send { request_id, frame }) => {
@@ -1195,7 +1199,9 @@ where
             }
             #[cfg(unix)]
             Ok(FromWorker::TerminalBytes { terminal_id, bytes }) => {
-                send_outbound_frames(socket, terminals.on_bytes(&terminal_id, &bytes))?;
+                terminals
+                    .on_bytes_with_startup(startup, &terminal_id, &bytes)
+                    .transmit(terminals, |frames| send_outbound_frames(socket, frames))?;
             }
             #[cfg(unix)]
             Ok(FromWorker::TerminalEof { terminal_id }) => {
@@ -1230,6 +1236,28 @@ where
                 if files.complete(&op_id) {
                     send_file_frames(socket, frames)?;
                 }
+            }
+            #[cfg(unix)]
+            Ok(FromWorker::SupervisedFilePrepared {
+                command_id,
+                generation,
+                outcome,
+            }) => {
+                send_outbound_frames(
+                    socket,
+                    terminals.on_file_prepared(startup, _config, &command_id, generation, *outcome),
+                )?;
+            }
+            #[cfg(unix)]
+            Ok(FromWorker::SupervisedFileApplied {
+                command_id,
+                generation,
+                outcome,
+            }) => {
+                send_outbound_frames(
+                    socket,
+                    terminals.on_file_applied(&command_id, generation, outcome),
+                )?;
             }
             #[cfg(unix)]
             Ok(FromWorker::InventoryPrepared { candidate }) => {
@@ -2087,19 +2115,19 @@ where
             // which logs that command's one outcome line.
             send_outbound_frames(socket, execs.reject_malformed(&command_id))
         }
-        FrameFault::RejectSupervised { command_id } => {
+        FrameFault::RejectSupervised { command_id, reason } => {
             tracing::warn!(
                 command_id,
                 "refusing a malformed supervised command request"
             );
             // The request never reaches `TerminalRegistry`, so this is that
             // command's one outcome line.
-            crate::sessions::log_command_rejected("supervised", &command_id, "bad_command");
+            crate::sessions::log_command_rejected("supervised", &command_id, reason);
             send_control(
                 socket,
                 &ClientControlMessage::SupervisedRejected {
                     command_id,
-                    reason: "bad_command".to_string(),
+                    reason: reason.to_string(),
                 },
                 "sending a supervised command rejection",
             )
@@ -2129,8 +2157,8 @@ where
 fn handle_binary<S>(
     socket: &mut tungstenite::WebSocket<S>,
     bytes: &[u8],
-    workers: &mut BTreeMap<String, WorkerHandle>,
-    recent_finished: &mut RecentlyFinished,
+    startup: &TerminalStartup,
+    request_state: (&mut BTreeMap<String, WorkerHandle>, &mut RecentlyFinished),
     terminals: &mut TerminalRegistry,
     execs: &mut ExecRegistry,
     #[cfg(unix)] files: &mut crate::file_relay::FileRelay,
@@ -2138,6 +2166,9 @@ fn handle_binary<S>(
 where
     S: std::io::Read + std::io::Write,
 {
+    #[cfg(not(unix))]
+    let _ = startup;
+    let (workers, recent_finished) = request_state;
     let (metadata, body) = match binary_frame_fault(bytes) {
         Ok(parsed) => parsed,
         Err(fault) => {
@@ -2188,7 +2219,10 @@ where
             }
             RelayBinaryFrameMetadata::FileBody { op_id } => {
                 #[cfg(unix)]
-                send_file_frames(socket, files.handle_body(&op_id, body))?;
+                match terminals.handle_supervised_body(startup, &op_id, body) {
+                    Ok(frames) => send_outbound_frames(socket, frames)?,
+                    Err(body) => send_file_frames(socket, files.handle_body(&op_id, body))?,
+                }
                 #[cfg(not(unix))]
                 let _ = (&op_id, &body);
                 Ok(())

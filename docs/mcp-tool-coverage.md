@@ -166,6 +166,15 @@ fails the suite when a leaf is unclassified.
 | `users.setRole` | — (excluded) | — | — | — | — | — | Admin-only account management. |
 | `users.unarchive` | — (excluded) | — | — | — | — | — | Admin-only account management. |
 
+## Supervised CLI file writes
+
+The five file mutation tools return a supervised request id when the node's effective
+mode is supervised. A person's keypress on the CLI-drawn screen is required; the CLI
+computes the masked diff from disk. Poll `forwarder_cli_command_result` for
+`file:{op,result}` or `error:{code,message,outcome?}`. Approval implies no read grant.
+Only a supervised start id is delivered despite MCP abort; headless file results keep
+the abort fence. See [CLI file tools](mcp.md#cli-file-tools-relay-protocol-28).
+
 ## Human-only procedures (Phase 7)
 
 The `mcpGrants` router (`packages/api/src/routers/mcp-grants.ts`) and the

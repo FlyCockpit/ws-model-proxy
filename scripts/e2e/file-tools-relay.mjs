@@ -6,8 +6,9 @@ import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { openTerminalTestClient } from "./terminal-client.mjs";
 
-// End-to-end check of the MCP node file tools (relay 2.8, #103): a real server,
+// End-to-end check of MCP node file tools (relay 2.8, #103/#106): a real server,
 // a real wsmp relay CLI, a Postgres database and an MCP personal access token.
 //
 //   WSMP_E2E_DATABASE_URL=postgres://… node scripts/e2e/file-tools-relay.mjs
@@ -181,24 +182,28 @@ try {
     }),
     { mode: 0o600 },
   );
-  relay = spawn(cliBinary, ["connect"], {
-    cwd: root,
-    detached: process.platform !== "win32",
-    env: {
-      ...childBaseEnv,
-      WSMP_CONFIG: configPath,
-      WSMP_STATE_DIR: stateDir,
-      WSMP_E2E_CLI_TOKEN: cliCredential.secret,
-    },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
   let relayLog = "";
-  for (const stream of [relay.stdout, relay.stderr]) {
-    stream.setEncoding("utf8");
-    stream.on("data", (chunk) => {
-      relayLog += chunk;
+  const launchRelay = () => {
+    const child = spawn(cliBinary, ["connect"], {
+      cwd: root,
+      detached: process.platform !== "win32",
+      env: {
+        ...childBaseEnv,
+        WSMP_CONFIG: configPath,
+        WSMP_STATE_DIR: stateDir,
+        WSMP_E2E_CLI_TOKEN: cliCredential.secret,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
     });
-  }
+    for (const stream of [child.stdout, child.stderr]) {
+      stream.setEncoding("utf8");
+      stream.on("data", (chunk) => {
+        relayLog += chunk;
+      });
+    }
+    return child;
+  };
+  relay = launchRelay();
 
   // ---- MCP over HTTP with the PAT -----------------------------------------
   let requestId = 0;
@@ -483,6 +488,119 @@ try {
     assert(!haystack.includes("alpha"), "file content leaked into a log");
   }
   assert.match(relayLog, /file/i, "the CLI did not log the file operations");
+
+  // ---- supervised writes: real E2E terminal keypresses ---------------------
+  const sessionId = randomUUID();
+  const sessionToken = randomBytes(32).toString("base64url");
+  await db.query(
+    `INSERT INTO session (id, "createdAt", "updatedAt", "expiresAt", token, "userId")
+     VALUES ($1, now(), now(), now() + interval '1 hour', $2, $3)`,
+    [sessionId, sessionToken, userId],
+  );
+  const signature = createHmac("sha256", betterAuthSecret).update(sessionToken).digest("base64");
+  const cookie = `better-auth.session_token=${encodeURIComponent(`${sessionToken}.${signature}`)}`;
+  const restartMode = async (mode) => {
+    await waitForExit(relay, "relay mode switch");
+    const config = JSON.parse(await readFile(configPath, "utf8"));
+    await writeFile(configPath, JSON.stringify({ ...config, mcpCommandMode: mode }), {
+      mode: 0o600,
+    });
+    await db.query(`UPDATE cli_device SET "mcpCommandMode" = $1::"McpCommandMode" WHERE id = $2`, [
+      mode.toUpperCase(),
+      deviceId,
+    ]);
+    relay = launchRelay();
+    const deadline = Date.now() + 40_000;
+    while (Date.now() < deadline) {
+      if (relay.exitCode !== null) throw new Error("relay exited during mode switch");
+      const row = await db.query(
+        `SELECT status, "reportedMcpCommandMode" FROM cli_device WHERE id = $1`,
+        [deviceId],
+      );
+      if (
+        row.rows[0]?.status === "CONNECTED" &&
+        row.rows[0]?.reportedMcpCommandMode === mode.toUpperCase()
+      )
+        return;
+      await sleep(100);
+    }
+    throw new Error("relay mode switch timed out");
+  };
+  await restartMode("supervised");
+  const supervisedDevices = await tool("forwarder_cli_devices_list", {});
+  assert.equal(
+    supervisedDevices.result.find((entry) => entry.id === deviceId)?.fileTools.write,
+    "supervised",
+  );
+  const pollFile = async (commandId) => {
+    const deadline = Date.now() + 35_000;
+    while (Date.now() < deadline) {
+      const reply = await tool("forwarder_cli_command_result", { commandId });
+      assert(!reply.isError, "file result polling failed");
+      if (reply.result.file || reply.result.error) return reply.result;
+      await sleep(50);
+    }
+    throw new Error("supervised file request did not settle");
+  };
+  for (const decision of ["accept", "decline", "stale"]) {
+    const targetPath = join(work, `supervised-${decision}.txt`);
+    if (decision === "stale") await writeFile(targetPath, "before-preview\n");
+    const request = await tool(
+      decision === "stale" ? "forwarder_cli_file_edit" : "forwarder_cli_file_write",
+      {
+        cliDeviceId: deviceId,
+        path: targetPath,
+        confirm: "RUN",
+        reason: "e2e supervised file screen",
+        ...(decision === "stale"
+          ? { edits: [{ oldText: "before-preview", newText: "approved-change" }] }
+          : { content: "approved-change\n" }),
+      },
+    );
+    assert(!request.isError, `supervised start failed: ${request.error?.code}`);
+    assert.equal(request.result.status, "awaiting_user");
+    assert(request.result.commandId);
+    const terminal = await openTerminalTestClient({
+      WebSocket,
+      serverUrl,
+      cookie,
+      terminalId: request.result.terminalId,
+    });
+    try {
+      await terminal.waitForScreen(
+        (screen) =>
+          screen.includes(targetPath) &&
+          /Enter/.test(screen) &&
+          (decision !== "stale" || screen.includes("before-preview")),
+      );
+      // Screen contents came from the child and never passed through MCP.
+      const waiting = await tool("forwarder_cli_command_result", {
+        commandId: request.result.commandId,
+      });
+      assert.equal(waiting.result.status, "awaiting_user");
+      assert.equal(waiting.result.file, undefined);
+      if (decision === "stale") await writeFile(targetPath, "changed-after-preview\n");
+      await terminal.keypress(decision === "decline" ? "q" : "\r");
+      const done = await pollFile(request.result.commandId);
+      if (decision === "accept") {
+        assert.equal(done.file.op, "write");
+        assert.equal(done.file.result.created, true);
+        assert.equal(done.file.result.diff, undefined);
+        assert.equal(await readFile(targetPath, "utf8"), "approved-change\n");
+      } else if (decision === "decline") {
+        assert.equal(done.error.code, "declined");
+        assert.equal(done.error.outcome, undefined);
+        await assert.rejects(readFile(targetPath), { code: "ENOENT" });
+      } else {
+        assert.equal(done.error.code, "conflict");
+        assert.equal(done.error.outcome, undefined);
+        assert.equal(await readFile(targetPath, "utf8"), "changed-after-preview\n");
+      }
+    } finally {
+      await terminal.close();
+    }
+  }
+  await restartMode("unsupervised");
 
   // ---- offline mid-op: freeze the CLI, start a change, kill the CLI -----------
   const target = join(work, "midop.txt");

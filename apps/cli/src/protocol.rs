@@ -74,8 +74,195 @@ fn local_relay_protocol_version() -> (u32, u32) {
 /// A supervised file op's result (`supervised.done.fileResult`), 2.8.
 #[derive(Debug, Clone, Serialize)]
 pub struct FileOpResult {
-    pub op: String,
+    pub op: FileMutationOp,
     pub result: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FileMutationOp {
+    Edit,
+    Write,
+    Rename,
+    Mkdir,
+    Delete,
+}
+
+/// Stable code carried by `supervised.done.fileError`. The wire deliberately
+/// has no message/detail field: file paths and contents must not escape through
+/// an error produced after the person accepted a file operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileErrorCode {
+    PathDenied,
+    SecretFile,
+    NotFound,
+    NotAFile,
+    NotADir,
+    BinaryFile,
+    TooLarge,
+    Conflict,
+    MatchCount,
+    NoMatch,
+    RedactedSpan,
+    Exists,
+    HardLinked,
+    OwnerMismatch,
+    Setuid,
+    SpecialFile,
+    IoError,
+    Timeout,
+    InvalidInput,
+    Unsupported,
+    Cancelled,
+    Limit,
+}
+
+impl FileErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PathDenied => "path_denied",
+            Self::SecretFile => "secret_file",
+            Self::NotFound => "not_found",
+            Self::NotAFile => "not_a_file",
+            Self::NotADir => "not_a_dir",
+            Self::BinaryFile => "binary_file",
+            Self::TooLarge => "too_large",
+            Self::Conflict => "conflict",
+            Self::MatchCount => "match_count",
+            Self::NoMatch => "no_match",
+            Self::RedactedSpan => "redacted_span",
+            Self::Exists => "exists",
+            Self::HardLinked => "hard_linked",
+            Self::OwnerMismatch => "owner_mismatch",
+            Self::Setuid => "setuid",
+            Self::SpecialFile => "special_file",
+            Self::IoError => "io_error",
+            Self::Timeout => "timeout",
+            Self::InvalidInput => "invalid_input",
+            Self::Unsupported => "unsupported",
+            Self::Cancelled => "cancelled",
+            Self::Limit => "limit",
+        }
+    }
+
+    pub fn from_wire_code(code: &str) -> Option<Self> {
+        Some(match code {
+            "path_denied" => Self::PathDenied,
+            "secret_file" => Self::SecretFile,
+            "not_found" => Self::NotFound,
+            "not_a_file" => Self::NotAFile,
+            "not_a_dir" => Self::NotADir,
+            "binary_file" => Self::BinaryFile,
+            "too_large" => Self::TooLarge,
+            "conflict" => Self::Conflict,
+            "match_count" => Self::MatchCount,
+            "no_match" => Self::NoMatch,
+            "redacted_span" => Self::RedactedSpan,
+            "exists" => Self::Exists,
+            "hard_linked" => Self::HardLinked,
+            "owner_mismatch" => Self::OwnerMismatch,
+            "setuid" => Self::Setuid,
+            "special_file" => Self::SpecialFile,
+            "io_error" => Self::IoError,
+            "timeout" => Self::Timeout,
+            "invalid_input" => Self::InvalidInput,
+            "unsupported" => Self::Unsupported,
+            "cancelled" => Self::Cancelled,
+            "limit" => Self::Limit,
+            _ => return None,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl From<crate::file_ops::ErrorCode> for FileErrorCode {
+    fn from(code: crate::file_ops::ErrorCode) -> Self {
+        use crate::file_ops::ErrorCode as Source;
+        match code {
+            Source::PathDenied => Self::PathDenied,
+            Source::SecretFile => Self::SecretFile,
+            Source::NotFound => Self::NotFound,
+            Source::NotAFile => Self::NotAFile,
+            Source::NotADir => Self::NotADir,
+            Source::BinaryFile => Self::BinaryFile,
+            Source::TooLarge => Self::TooLarge,
+            Source::Conflict => Self::Conflict,
+            Source::MatchCount => Self::MatchCount,
+            Source::NoMatch => Self::NoMatch,
+            Source::RedactedSpan => Self::RedactedSpan,
+            Source::Exists => Self::Exists,
+            Source::HardLinked => Self::HardLinked,
+            Source::OwnerMismatch => Self::OwnerMismatch,
+            Source::Setuid => Self::Setuid,
+            Source::SpecialFile => Self::SpecialFile,
+            Source::IoError => Self::IoError,
+            Source::Timeout => Self::Timeout,
+            Source::InvalidInput => Self::InvalidInput,
+            Source::Unsupported => Self::Unsupported,
+            Source::Cancelled => Self::Cancelled,
+            Source::Limit => Self::Limit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileOpError {
+    pub code: FileErrorCode,
+}
+
+/// The file-specific portion of `supervised.done`. This is a type-level union:
+/// a frame may carry one result, one code-only error, or neither (commands),
+/// but it can never carry both file arms.
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum SupervisedFileOutcome {
+    Result {
+        #[serde(rename = "fileResult")]
+        file_result: FileOpResult,
+    },
+    Error {
+        #[serde(rename = "fileError")]
+        file_error: FileOpError,
+    },
+    None {},
+}
+
+impl SupervisedFileOutcome {
+    pub fn result(op: String, mut result: Value) -> Self {
+        let op = match op.as_str() {
+            "edit" => FileMutationOp::Edit,
+            "write" => FileMutationOp::Write,
+            "rename" => FileMutationOp::Rename,
+            "mkdir" => FileMutationOp::Mkdir,
+            "delete" => FileMutationOp::Delete,
+            _ => return Self::error(FileErrorCode::InvalidInput),
+        };
+        // The only wire-enforcement point for the supervised no-read rule.
+        // A future library result must not leak a diff through this frame.
+        if matches!(op, FileMutationOp::Edit | FileMutationOp::Write)
+            && let Some(object) = result.as_object_mut()
+        {
+            object.remove("diff");
+            object.remove("hunks");
+        }
+        Self::Result {
+            file_result: FileOpResult { op, result },
+        }
+    }
+
+    pub fn error(code: FileErrorCode) -> Self {
+        Self::Error {
+            file_error: FileOpError { code },
+        }
+    }
+}
+
+impl Default for SupervisedFileOutcome {
+    fn default() -> Self {
+        Self::None {}
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -217,10 +404,10 @@ pub enum ClientControlMessage {
         review: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         output_bytes: Option<u64>,
-        /// 2.8: the result of a supervised file op (`term.spawn` `kind:"file"`).
-        /// Answered `unsupported` until P5, so never set today.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        file_result: Option<FileOpResult>,
+        /// 2.8: exactly one result/error arm for a supervised file op, or
+        /// neither for a supervised command.
+        #[serde(flatten)]
+        file: SupervisedFileOutcome,
     },
     #[serde(rename = "exec.started")]
     ExecStarted { command_id: String },
@@ -988,17 +1175,51 @@ pub struct SupervisedSpawn {
     pub reason: Option<String>,
     pub requester: String,
     pub share_output: bool,
-    /// 2.8: `Some("file")` for a supervised file op (answered `unsupported`
-    /// until P5); `None`/`Some("command")` for a command.
+    /// 2.8: `Some("file")` for a supervised file op;
+    /// `None`/`Some("command")` for a command.
     pub kind: Option<String>,
     pub file_op: Option<FileSpawnOp>,
     pub body_bytes: Option<usize>,
 }
 
 impl SupervisedSpawn {
-    /// True for a supervised file op, which this CLI does not run yet.
+    /// True for a supervised file op.
     pub fn is_file(&self) -> bool {
         self.kind.as_deref() == Some("file") || self.file_op.is_some()
+    }
+
+    /// Enforce the `term.spawn` command/file union before anything reaches a
+    /// PTY. Strict per-operation argument decoding remains at the FileOps
+    /// preparation boundary, where path and state errors can be classified.
+    pub fn file_shape_is_valid(&self) -> bool {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        if self.kind.as_deref() != Some("file")
+            || self.share_output
+            || self.cwd.is_some()
+            || self.command.len() > 4096
+            || self.command_id.len() != 22
+            || URL_SAFE_NO_PAD
+                .decode(&self.command_id)
+                .map(|decoded| decoded.len() != 16)
+                .unwrap_or(true)
+        {
+            return false;
+        }
+        let Some(file_op) = self.file_op.as_ref() else {
+            return false;
+        };
+        let Some(args) = file_op.args.as_object() else {
+            return false;
+        };
+        match (file_op.op.as_str(), self.body_bytes) {
+            ("write", Some(bytes)) if bytes <= RELAY_BINARY_CHUNK_MAX_BYTES => {
+                !args.contains_key("content") && !args.contains_key("encoding")
+            }
+            ("edit" | "rename" | "mkdir" | "delete", None) => true,
+            _ => false,
+        }
     }
 }
 
@@ -1459,6 +1680,27 @@ pub fn parse_server_control(text: &str) -> Result<ServerControlMessage> {
             type_name: type_name.to_string(),
         });
     }
+    if type_name == "term.spawn" {
+        let allowed = [
+            "type",
+            "terminalId",
+            "commandId",
+            "command",
+            "cwd",
+            "reason",
+            "requester",
+            "shareOutput",
+            "kind",
+            "fileOp",
+            "bodyBytes",
+        ];
+        let object = value
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("term.spawn is not an object"))?;
+        if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+            anyhow::bail!("term.spawn carries an unknown field");
+        }
+    }
     let known: KnownServerControlMessage =
         serde_json::from_value(value).context("parsing relay server control frame")?;
     if let KnownServerControlMessage::MetricsSourcesSet { sources, .. } = &known {
@@ -1784,6 +2026,7 @@ pub enum FrameFault {
     /// A malformed `term.spawn` that names a command: refuse it, spawn nothing.
     RejectSupervised {
         command_id: String,
+        reason: &'static str,
     },
     /// A malformed `exec.start` that names a command: refuse it, run nothing
     /// (a command already running under that id is left alone).
@@ -1971,7 +2214,12 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
     if type_name == "term.spawn"
         && let Some(command_id) = string_field(value, "commandId")
     {
-        return FrameFault::RejectSupervised { command_id };
+        let file = value.get("kind").and_then(Value::as_str) == Some("file")
+            || value.get("fileOp").is_some();
+        return FrameFault::RejectSupervised {
+            command_id,
+            reason: if file { "bad_frame" } else { "bad_command" },
+        };
     }
     if type_name.starts_with("supervised.") {
         return match string_field(value, "commandId") {
@@ -2336,7 +2584,8 @@ mod tests {
         assert_eq!(
             control_frame_fault(spawn),
             FrameFault::RejectSupervised {
-                command_id: "c".to_string()
+                command_id: "c".to_string(),
+                reason: "bad_command",
             }
         );
         assert_eq!(
@@ -2550,7 +2799,7 @@ mod tests {
                 signal: None,
                 review: false,
                 output_bytes: Some(12),
-                file_result: None,
+                file: SupervisedFileOutcome::default(),
             })
             .expect("done"),
             r#"{"type":"supervised.done","commandId":"c","exitCode":0,"review":false,"outputBytes":12}"#
@@ -2562,7 +2811,7 @@ mod tests {
                 signal: Some("9".to_string()),
                 review: true,
                 output_bytes: None,
-                file_result: None,
+                file: SupervisedFileOutcome::default(),
             })
             .expect("done review"),
             r#"{"type":"supervised.done","commandId":"c","signal":"9","review":true}"#
@@ -2589,7 +2838,8 @@ mod tests {
         assert_eq!(
             control_frame_fault(r#"{"type":"term.spawn","terminalId":"t","commandId":"c"}"#),
             FrameFault::RejectSupervised {
-                command_id: "c".to_string()
+                command_id: "c".to_string(),
+                reason: "bad_command",
             }
         );
         assert_eq!(
@@ -3385,20 +3635,114 @@ mod relay_28_vectors {
     }
 
     #[test]
-    fn supervised_done_carries_a_file_result_only_when_set() {
-        let frame = vector("file-supervised-done");
+    fn supervised_file_vectors_encode_result_error_neither_accept_and_reject() {
+        for name in [
+            "file-supervised-done",
+            "file-supervised-done-edit",
+            "file-supervised-done-write",
+            "file-supervised-done-rename",
+            "file-supervised-done-delete",
+        ] {
+            let frame = vector(name);
+            let message = ClientControlMessage::SupervisedDone {
+                command_id: str_field(&frame, "commandId"),
+                exit_code: None,
+                signal: None,
+                review: false,
+                output_bytes: None,
+                file: SupervisedFileOutcome::result(
+                    str_field(&frame["fileResult"], "op"),
+                    frame["fileResult"]["result"].clone(),
+                ),
+            };
+            assert_eq!(encoded(&message), frame, "{name}");
+        }
+
+        let frame = vector("file-supervised-done-error");
         let message = ClientControlMessage::SupervisedDone {
             command_id: str_field(&frame, "commandId"),
             exit_code: None,
             signal: None,
             review: false,
             output_bytes: None,
-            file_result: Some(FileOpResult {
-                op: str_field(&frame["fileResult"], "op"),
-                result: frame["fileResult"]["result"].clone(),
-            }),
+            file: SupervisedFileOutcome::error(FileErrorCode::Conflict),
         };
         assert_eq!(encoded(&message), frame);
+
+        let frame = vector("file-supervised-done-neither");
+        let message = ClientControlMessage::SupervisedDone {
+            command_id: str_field(&frame, "commandId"),
+            exit_code: Some(0),
+            signal: None,
+            review: false,
+            output_bytes: None,
+            file: SupervisedFileOutcome::default(),
+        };
+        assert_eq!(encoded(&message), frame);
+
+        let frame = vector("file-supervised-accepted");
+        assert_eq!(
+            encoded(&ClientControlMessage::SupervisedAccepted {
+                command_id: str_field(&frame, "commandId"),
+            }),
+            frame
+        );
+        let frame = vector("file-supervised-rejected");
+        assert_eq!(
+            encoded(&ClientControlMessage::SupervisedRejected {
+                command_id: str_field(&frame, "commandId"),
+                reason: str_field(&frame, "reason"),
+            }),
+            frame
+        );
+    }
+
+    #[test]
+    fn supervised_file_result_never_serializes_diff_or_hunks() {
+        for op in ["edit", "write"] {
+            let payload =
+                serde_json::json!({"etag":"h:fixture", "diff":"must stay local", "hunks":[[1, 3]]});
+            let file = SupervisedFileOutcome::result(op.to_owned(), payload);
+            let encoded = serde_json::to_value(file).expect("serialize outcome");
+            assert_eq!(encoded["fileResult"]["op"], op);
+            assert_eq!(
+                encoded["fileResult"]["result"],
+                serde_json::json!({"etag":"h:fixture"})
+            );
+        }
+    }
+
+    #[test]
+    fn supervised_file_spawn_union_rejects_unknown_and_bad_body_shapes() {
+        let good = parse_server_control(&vector("file-term-spawn").to_string()).expect("spawn");
+        let ServerControlMessage::TermSpawn(spawn) = good else {
+            panic!("not a spawn");
+        };
+        assert!(spawn.file_shape_is_valid());
+
+        let base = vector("file-term-spawn");
+        let mut cases = Vec::new();
+        let mut unknown = base.clone();
+        unknown["fileOp"]["diff"] = Value::String("forged".to_string());
+        cases.push(unknown);
+        let mut fake_op = base.clone();
+        fake_op["fileOp"]["op"] = Value::String("read".to_string());
+        cases.push(fake_op);
+        let mut body_on_edit = base.clone();
+        body_on_edit["bodyBytes"] = Value::from(1);
+        cases.push(body_on_edit);
+        let mut share = base;
+        share["shareOutput"] = Value::Bool(true);
+        cases.push(share);
+        for case in cases {
+            match parse_server_control(&case.to_string()) {
+                Err(_) => {}
+                Ok(ServerControlMessage::TermSpawn(spawn)) => {
+                    assert!(!spawn.file_shape_is_valid(), "{case}")
+                }
+                Ok(other) => panic!("unexpected message: {other:?}"),
+            }
+        }
     }
 
     #[test]

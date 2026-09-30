@@ -338,6 +338,7 @@ describe("cli file ops", () => {
         bytes: body.byteLength,
         outcome: "completed",
       });
+      expect(events().map((event) => event.kind)).toEqual(["file_write"]);
       const wire = JSON.stringify(events());
       expect(wire).not.toContain("PRIVATE");
     });
@@ -525,7 +526,10 @@ describe("cli file ops", () => {
             );
             await expect(outcome).resolves.toMatchObject({ ok: true, op });
           } else {
-            await expect(outcome).resolves.toEqual({ ok: false, code: expected });
+            await expect(outcome).resolves.toEqual({
+              ok: false,
+              code: op === "edit" && expected === "supervised_only" ? "unsupported" : expected,
+            });
             expect(socket.frames("file.op")).toEqual([]);
           }
         });
@@ -1207,9 +1211,7 @@ describe("cli file ops", () => {
 
     it("runs settle EXACTLY once per record (no double-fire after a terminal outcome)", async () => {
       // `record.resolve` and the map deletes are idempotent, so the once-only
-      // guard is observed by COUNTERS: the #132 audit hook (the TODO in
-      // settle) is the next thing that depends on it, and a re-delivered
-      // frame or a session sweep can reach the same record again. Drive two
+      // guard protects both the audit event and tracking cleanup. Drive two
       // terminal answers at one tracked record and count settle's effects.
       const socket = await connect();
       const outcome = runFileOp({

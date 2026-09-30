@@ -18,7 +18,67 @@ use super::stat::kind_name;
 use super::write::{DEFAULT_PARENT_MODE, parse_mode};
 use super::{Cancel, FileOps, Step, check_reason};
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum RenameAtomicCapability {
+    HardLinksOnly = 0,
+    Kernel = 1,
+    #[cfg(test)]
+    Unavailable = 2,
+}
+
+impl RenameAtomicCapability {
+    #[cfg(test)]
+    pub(crate) fn from_u8(value: u8) -> Self {
+        match value {
+            value if value == Self::Kernel as u8 => Self::Kernel,
+            value if value == Self::Unavailable as u8 => Self::Unavailable,
+            _ => Self::HardLinksOnly,
+        }
+    }
+}
+
+pub(crate) const fn platform_rename_capability() -> RenameAtomicCapability {
+    if cfg!(target_os = "linux") {
+        RenameAtomicCapability::Kernel
+    } else {
+        RenameAtomicCapability::HardLinksOnly
+    }
+}
+
+pub(crate) fn check_supervised_rename_capability(
+    capability: RenameAtomicCapability,
+    source_kind: Kind,
+    overwrite: bool,
+    destination_exists: bool,
+) -> FileResult<()> {
+    match capability {
+        RenameAtomicCapability::Kernel => return Ok(()),
+        #[cfg(test)]
+        RenameAtomicCapability::Unavailable => {
+            return Err(FileError::new(
+                ErrorCode::Unsupported,
+                "this filesystem has no safe atomic rename primitive",
+            ));
+        }
+        RenameAtomicCapability::HardLinksOnly => {}
+    }
+    if overwrite && destination_exists {
+        return Err(FileError::new(
+            ErrorCode::Unsupported,
+            "this platform cannot replace a destination atomically",
+        ));
+    }
+    if source_kind == Kind::Dir {
+        return Err(FileError::new(
+            ErrorCode::Unsupported,
+            "this platform has no atomic no-replace rename for directories",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RenameArgs {
     pub from: String,
@@ -37,7 +97,7 @@ pub struct RenameResult {
     pub etag: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MkdirArgs {
     pub path: String,
@@ -51,7 +111,7 @@ pub struct MkdirResult {
     pub created: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DeleteArgs {
     pub path: String,
@@ -66,11 +126,13 @@ pub struct DeleteResult {
     pub kind: &'static str,
 }
 
-fn resolve_for(
+fn resolve_for_pin(
     ops: &FileOps,
     path: &str,
     access: Access,
     follow_last: bool,
+    pin: Option<&super::supervised::PinnedPath>,
+    cancel: Option<&Cancel>,
 ) -> FileResult<Resolved> {
     resolve(
         path,
@@ -79,6 +141,9 @@ fn resolve_for(
             make_parents: None,
             policy: &ops.policy,
             access,
+            preview_missing: false,
+            pin: pin.map(|pin| &pin.ancestor),
+            cancel,
         },
     )
 }
@@ -103,6 +168,27 @@ pub(crate) fn rename(
     args: &RenameArgs,
     cancel: &Cancel,
 ) -> FileResult<RenameResult> {
+    rename_impl(ops, args, None, None, cancel)
+}
+
+pub(crate) fn rename_supervised(
+    ops: &FileOps,
+    args: &RenameArgs,
+    from_pin: &super::supervised::PinnedPath,
+    to_pin: &super::supervised::PinnedPath,
+    cancel: &Cancel,
+) -> FileResult<RenameResult> {
+    rename_impl(ops, args, Some(from_pin), Some(to_pin), cancel)
+}
+
+fn rename_impl(
+    ops: &FileOps,
+    args: &RenameArgs,
+    from_pin: Option<&super::supervised::PinnedPath>,
+    to_pin: Option<&super::supervised::PinnedPath>,
+    cancel: &Cancel,
+) -> FileResult<RenameResult> {
+    let supervised = from_pin.is_some() && to_pin.is_some();
     check_reason(&args.reason)?;
     let overwrite = args.overwrite.unwrap_or(false);
     if overwrite && args.expected_etag.is_none() {
@@ -110,8 +196,8 @@ pub(crate) fn rename(
             "expectedEtag (of the destination) is required for overwrite",
         ));
     }
-    let from = resolve_for(ops, &args.from, Access::Remove, false)?;
-    let to = resolve_for(ops, &args.to, Access::Write, false)?;
+    let from = resolve_for_pin(ops, &args.from, Access::Remove, false, from_pin, None)?;
+    let to = resolve_for_pin(ops, &args.to, Access::Write, false, to_pin, None)?;
     if from.is_self() || to.is_self() {
         return Err(FileError::invalid(
             "cannot rename a directory reference such as `/` or `..`",
@@ -131,6 +217,12 @@ pub(crate) fn rename(
     };
     let _lock_a = ops.lock_path(first, cancel)?;
     let _lock_b = ops.lock_path(second, cancel)?;
+    if let Some(pin) = from_pin {
+        pin.verify(ops, &from, Access::Remove)?;
+    }
+    if let Some(pin) = to_pin {
+        pin.verify(ops, &to, Access::Write)?;
+    }
 
     let src = from
         .lstat()?
@@ -178,10 +270,33 @@ pub(crate) fn rename(
         }
     }
 
-    cancel.check()?;
+    if supervised {
+        check_supervised_rename_capability(
+            ops.rename_atomic_capability(),
+            src.kind(),
+            overwrite,
+            dst.is_some(),
+        )?;
+    }
+
     // Test seam: the last point at which the world can change before the commit.
     ops.step(Step::EtagRechecked)?;
-    commit_rename(&from, &to, overwrite, &src, dst.as_ref())?;
+    if let Some(pin) = from_pin {
+        pin.verify(ops, &from, Access::Remove)?;
+    }
+    if let Some(pin) = to_pin {
+        pin.verify(ops, &to, Access::Write)?;
+    }
+    cancel.check()?;
+    commit_rename(
+        &from,
+        &to,
+        overwrite,
+        &src,
+        dst.as_ref(),
+        supervised,
+        ops.rename_atomic_capability(),
+    )?;
     Ok(RenameResult { etag: src_etag })
 }
 
@@ -195,8 +310,9 @@ pub(crate) fn rename(
 ///   destination is at the source name and is removed only when it is the object
 ///   whose etag was checked; otherwise the exchange is undone.
 ///
-/// Residual (documented in the plan): on non-Linux systems overwrite and
-/// directory moves have no atomic primitive here and rely on the checks above.
+/// Headless compatibility: on non-Linux systems overwrite and directory moves
+/// retain the pre-existing ordinary-rename fallback. Supervised callers are
+/// rejected before reaching that fallback.
 /// Crash states: between the exchange and the unlink the old destination is
 /// under the source name; after `linkat` and before the unlink both names exist.
 /// Neither loses data. The undo moves the object now at the destination back only
@@ -207,23 +323,31 @@ fn commit_rename(
     overwrite: bool,
     src: &Stat,
     dst: Option<&Stat>,
+    supervised: bool,
+    capability: RenameAtomicCapability,
 ) -> FileResult<()> {
     match (overwrite, dst) {
-        (true, Some(dst)) => exchange_over(from, to, src, dst),
+        (true, Some(dst)) => exchange_over(from, to, src, dst, supervised),
         _ => {
-            move_no_replace(from, to, src)?;
-            verify_moved(from, to, src)
+            move_no_replace(from, to, src, supervised, capability)?;
+            verify_moved(from, to, src, supervised, capability)
         }
     }
 }
 
 /// After a move: the destination name must hold the source object.
-fn verify_moved(from: &Resolved, to: &Resolved, src: &Stat) -> FileResult<()> {
+fn verify_moved(
+    from: &Resolved,
+    to: &Resolved,
+    src: &Stat,
+    supervised: bool,
+    capability: RenameAtomicCapability,
+) -> FileResult<()> {
     match to.lstat()? {
         Some(now) if now.same_object(src) => Ok(()),
         _ => {
             // Another object was moved. Put it back when nothing took its place.
-            let _ = move_no_replace(to, from, src);
+            let _ = move_no_replace(to, from, src, supervised, capability);
             Err(FileError::conflict("replaced"))
         }
     }
@@ -237,10 +361,39 @@ fn unsupported_atomic() -> FileError {
     )
 }
 
+/// The single boundary for compatibility paths that must use ordinary
+/// `renameat`. Supervised operations may never cross it because `renameat`
+/// can replace a destination that appeared after the last check.
+fn portable_renameat_fallback(
+    from: &Resolved,
+    to: &Resolved,
+    supervised: bool,
+    unsupported: &'static str,
+) -> FileResult<()> {
+    if supervised {
+        return Err(FileError::new(ErrorCode::Unsupported, unsupported));
+    }
+    renameat(
+        from.dir.as_fd(),
+        from.name.as_os_str(),
+        to.dir.as_fd(),
+        to.name.as_os_str(),
+    )
+    .map_err(FileError::errno)
+}
+
 /// Rename without replacing an existing destination, atomically.
-fn move_no_replace(from: &Resolved, to: &Resolved, src: &Stat) -> FileResult<()> {
+fn move_no_replace(
+    from: &Resolved,
+    to: &Resolved,
+    src: &Stat,
+    supervised: bool,
+    capability: RenameAtomicCapability,
+) -> FileResult<()> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = capability;
     #[cfg(target_os = "linux")]
-    {
+    if capability == RenameAtomicCapability::Kernel {
         use nix::fcntl::{RenameFlags, renameat2};
         match renameat2(
             from.dir.as_fd(),
@@ -260,13 +413,12 @@ fn move_no_replace(from: &Resolved, to: &Resolved, src: &Stat) -> FileResult<()>
         return Err(unsupported_atomic());
         // Non-Linux: no atomic primitive for directories; existence was checked.
         #[cfg(not(target_os = "linux"))]
-        return renameat(
-            from.dir.as_fd(),
-            from.name.as_os_str(),
-            to.dir.as_fd(),
-            to.name.as_os_str(),
-        )
-        .map_err(FileError::errno);
+        return portable_renameat_fallback(
+            from,
+            to,
+            supervised,
+            "this filesystem has no atomic no-replace rename for directories",
+        );
     }
     // link + unlink: `linkat` fails with EEXIST instead of replacing.
     match linkat(
@@ -281,13 +433,12 @@ fn move_no_replace(from: &Resolved, to: &Resolved, src: &Stat) -> FileResult<()>
         // A filesystem without hard links (FAT, some network shares): the
         // existence check above is all that guards the destination there.
         Err(Errno::EPERM | Errno::ENOTSUP | Errno::EMLINK) => {
-            return renameat(
-                from.dir.as_fd(),
-                from.name.as_os_str(),
-                to.dir.as_fd(),
-                to.name.as_os_str(),
-            )
-            .map_err(FileError::errno);
+            return portable_renameat_fallback(
+                from,
+                to,
+                supervised,
+                "this filesystem has no safe atomic rename fallback",
+            );
         }
         Err(errno) => return Err(FileError::errno(errno)),
     }
@@ -315,7 +466,13 @@ fn exists_error() -> FileError {
 }
 
 #[cfg(target_os = "linux")]
-fn exchange_over(from: &Resolved, to: &Resolved, src: &Stat, dst: &Stat) -> FileResult<()> {
+fn exchange_over(
+    from: &Resolved,
+    to: &Resolved,
+    src: &Stat,
+    dst: &Stat,
+    _supervised: bool,
+) -> FileResult<()> {
     use nix::fcntl::{RenameFlags, renameat2};
     let swap = || {
         renameat2(
@@ -352,14 +509,19 @@ fn exchange_over(from: &Resolved, to: &Resolved, src: &Stat, dst: &Stat) -> File
 }
 
 #[cfg(not(target_os = "linux"))]
-fn exchange_over(from: &Resolved, to: &Resolved, src: &Stat, _dst: &Stat) -> FileResult<()> {
-    renameat(
-        from.dir.as_fd(),
-        from.name.as_os_str(),
-        to.dir.as_fd(),
-        to.name.as_os_str(),
-    )
-    .map_err(FileError::errno)?;
+fn exchange_over(
+    from: &Resolved,
+    to: &Resolved,
+    src: &Stat,
+    _dst: &Stat,
+    supervised: bool,
+) -> FileResult<()> {
+    portable_renameat_fallback(
+        from,
+        to,
+        supervised,
+        "this platform cannot replace a destination atomically",
+    )?;
     verify_moved_after(to, src)
 }
 
@@ -372,6 +534,24 @@ fn verify_moved_after(to: &Resolved, src: &Stat) -> FileResult<()> {
 }
 
 pub(crate) fn mkdir(ops: &FileOps, args: &MkdirArgs, cancel: &Cancel) -> FileResult<MkdirResult> {
+    mkdir_impl(ops, args, None, cancel)
+}
+
+pub(crate) fn mkdir_supervised(
+    ops: &FileOps,
+    args: &MkdirArgs,
+    pin: &super::supervised::PinnedPath,
+    cancel: &Cancel,
+) -> FileResult<MkdirResult> {
+    mkdir_impl(ops, args, Some(pin), cancel)
+}
+
+fn mkdir_impl(
+    ops: &FileOps,
+    args: &MkdirArgs,
+    pin: Option<&super::supervised::PinnedPath>,
+    cancel: &Cancel,
+) -> FileResult<MkdirResult> {
     check_reason(&args.reason)?;
     let mode = args
         .mode
@@ -386,9 +566,12 @@ pub(crate) fn mkdir(ops: &FileOps, args: &MkdirArgs, cancel: &Cancel) -> FileRes
             make_parents: args.parents.unwrap_or(true).then_some(mode),
             policy: &ops.policy,
             access: Access::Write,
+            preview_missing: false,
+            pin: pin.map(|pin| &pin.ancestor),
+            cancel: Some(cancel),
         },
     )?;
-    let outcome = mkdir_resolved(ops, &mut resolved, mode, cancel);
+    let outcome = mkdir_resolved(ops, &mut resolved, mode, pin, cancel);
     if outcome.is_err() {
         resolved.rollback_created();
     }
@@ -399,6 +582,7 @@ fn mkdir_resolved(
     ops: &FileOps,
     resolved: &mut Resolved,
     mode: u32,
+    pin: Option<&super::supervised::PinnedPath>,
     cancel: &Cancel,
 ) -> FileResult<MkdirResult> {
     if resolved.is_self() {
@@ -407,6 +591,9 @@ fn mkdir_resolved(
         });
     }
     let _lock = ops.lock_path(resolved.full_path(), cancel)?;
+    if let Some(pin) = pin {
+        pin.verify(ops, resolved, Access::Write)?;
+    }
     match resolved.lstat()? {
         Some(st) if st.kind() == Kind::Dir => return Ok(MkdirResult { created: false }),
         Some(_) => {
@@ -443,14 +630,35 @@ pub(crate) fn delete(
     args: &DeleteArgs,
     cancel: &Cancel,
 ) -> FileResult<DeleteResult> {
+    delete_impl(ops, args, None, cancel)
+}
+
+pub(crate) fn delete_supervised(
+    ops: &FileOps,
+    args: &DeleteArgs,
+    pin: &super::supervised::PinnedPath,
+    cancel: &Cancel,
+) -> FileResult<DeleteResult> {
+    delete_impl(ops, args, Some(pin), cancel)
+}
+
+fn delete_impl(
+    ops: &FileOps,
+    args: &DeleteArgs,
+    pin: Option<&super::supervised::PinnedPath>,
+    cancel: &Cancel,
+) -> FileResult<DeleteResult> {
     check_reason(&args.reason)?;
-    let resolved = resolve_for(ops, &args.path, Access::Remove, false)?;
+    let resolved = resolve_for_pin(ops, &args.path, Access::Remove, false, pin, None)?;
     if resolved.is_self() {
         return Err(FileError::invalid(
             "cannot delete a directory reference such as `/` or `..`",
         ));
     }
     let _lock = ops.lock_path(resolved.full_path(), cancel)?;
+    if let Some(pin) = pin {
+        pin.verify(ops, &resolved, Access::Remove)?;
+    }
     let st = resolved
         .lstat()?
         .ok_or_else(|| FileError::new(ErrorCode::NotFound, "no such file or directory"))?;
@@ -472,9 +680,12 @@ pub(crate) fn delete(
             None => return Err(FileError::invalid("directories have no etag")),
         }
     }
-    cancel.check()?;
     // Observable seam for the pre-unlink re-check (race tests swap the name here).
     ops.step(Step::EtagRechecked)?;
+    if let Some(pin) = pin {
+        pin.verify(ops, &resolved, Access::Remove)?;
+    }
+    cancel.check()?;
     // The name must still be the object we inspected.
     match resolved.lstat()? {
         Some(now) if now.same_object(&st) => {}
@@ -485,4 +696,120 @@ pub(crate) fn delete(
         deleted: true,
         kind: kind_name(st.kind()),
     })
+}
+
+#[cfg(test)]
+mod portable_fallback_tests {
+    use super::*;
+    use std::path::Path;
+
+    use super::super::policy::Policy;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Case {
+        Directory,
+        DestinationAppeared,
+        DestinationSwapped,
+    }
+
+    fn resolved(path: &Path, policy: &Policy, access: Access) -> Resolved {
+        resolve(
+            path.to_str().expect("utf-8 test path"),
+            &ResolveOpts {
+                follow_last: false,
+                make_parents: None,
+                policy,
+                access,
+                preview_missing: false,
+                pin: None,
+                cancel: None,
+            },
+        )
+        .expect("resolve test path")
+    }
+
+    fn run(case: Case, supervised: bool) {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonical root");
+        let policy = Policy::new(vec![root.clone()], vec![], true);
+        let source = root.join("source");
+        let destination = root.join("destination");
+
+        match case {
+            Case::Directory => std::fs::create_dir(&source).expect("source directory"),
+            Case::DestinationAppeared | Case::DestinationSwapped => {
+                std::fs::write(&source, b"source").expect("source file")
+            }
+        }
+        if matches!(case, Case::DestinationSwapped) {
+            std::fs::write(&destination, b"old destination").expect("old destination");
+        }
+
+        let from = resolved(&source, &policy, Access::Remove);
+        let to = resolved(&destination, &policy, Access::Write);
+        match case {
+            Case::DestinationAppeared => {
+                std::fs::write(&destination, b"appeared destination").expect("appeared destination")
+            }
+            Case::DestinationSwapped => {
+                std::fs::rename(&destination, root.join("displaced"))
+                    .expect("displace destination");
+                std::fs::write(&destination, b"swapped destination").expect("swapped destination");
+            }
+            Case::Directory => {}
+        }
+
+        let result = portable_renameat_fallback(
+            &from,
+            &to,
+            supervised,
+            "test fallback is unsafe for supervised use",
+        );
+        if supervised {
+            assert_eq!(
+                result.expect_err("must reject").code,
+                ErrorCode::Unsupported
+            );
+            assert!(source.exists(), "{case:?}: source changed");
+            match case {
+                Case::Directory => assert!(!destination.exists()),
+                Case::DestinationAppeared => {
+                    assert_eq!(
+                        std::fs::read(&destination).unwrap(),
+                        b"appeared destination"
+                    )
+                }
+                Case::DestinationSwapped => {
+                    assert_eq!(std::fs::read(&destination).unwrap(), b"swapped destination")
+                }
+            }
+        } else {
+            result.expect("headless compatibility rename");
+            assert!(!source.exists(), "{case:?}: source was not moved");
+            match case {
+                Case::Directory => assert!(destination.is_dir()),
+                Case::DestinationAppeared | Case::DestinationSwapped => {
+                    assert_eq!(std::fs::read(&destination).unwrap(), b"source")
+                }
+            }
+        }
+        if matches!(case, Case::DestinationSwapped) {
+            assert_eq!(
+                std::fs::read(root.join("displaced")).unwrap(),
+                b"old destination"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_renameat_fallback_rejects_supervised_and_preserves_headless_behavior() {
+        for case in [
+            Case::Directory,
+            Case::DestinationAppeared,
+            Case::DestinationSwapped,
+        ] {
+            run(case, true);
+            run(case, false);
+        }
+    }
 }

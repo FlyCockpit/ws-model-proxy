@@ -37,6 +37,9 @@ enum Sub {
     /// command. The relay daemon runs it inside the command's terminal.
     #[command(hide = true)]
     SupervisedRun,
+    /// Internal: independently preview an agent-requested supervised file change.
+    #[command(hide = true)]
+    SupervisedFile,
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -48,12 +51,15 @@ enum Approvals {
 }
 
 pub fn run(args: &Args) -> Result<()> {
-    if matches!(args.command, Sub::SupervisedRun) {
-        return crate::supervised_run::run();
+    match &args.command {
+        Sub::SupervisedRun => return crate::supervised_run::run(),
+        Sub::SupervisedFile => return crate::supervised_file::run(),
+        _ => {}
     }
     let state_dir = crate::paths::state_dir()?;
     match &args.command {
         Sub::SupervisedRun => {}
+        Sub::SupervisedFile => {}
         Sub::Approve { code } => {
             let code = approvals::approve(&state_dir, code)?;
             if args.json {

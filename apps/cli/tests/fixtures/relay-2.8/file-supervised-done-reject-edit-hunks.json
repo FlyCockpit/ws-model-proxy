@@ -1,0 +1,16 @@
+{
+  "type": "supervised.done",
+  "commandId": "AAECAwQFBgcICQoLDA0ODw",
+  "review": false,
+  "fileResult": {
+    "op": "edit",
+    "result": {
+      "etag": "h:aaa",
+      "previousEtag": "h:bbb",
+      "added": 1,
+      "removed": 1,
+      "applied": true,
+      "hunks": [[1, 1]]
+    }
+  }
+}

@@ -219,14 +219,17 @@ function liveFeatures(cliDeviceId: string) {
 export function judgeCliAgentAdmission(
   reads: CliAgentAdmissionReads,
   capability: "headless_exec" | "supervised",
+  options?: { fileWrite: true },
 ): CliCommandAdmissionVerdict;
 export function judgeCliAgentAdmission(
   reads: CliAgentAdmissionReads,
   capability: CliAgentCapability,
+  options?: { fileWrite: true },
 ): CliAgentAdmissionVerdict;
 export function judgeCliAgentAdmission(
   reads: CliAgentAdmissionReads,
   capability: CliAgentCapability,
+  options?: { fileWrite: true },
 ): CliAgentAdmissionVerdict {
   const { input, admission, device, token, owner } = reads;
   if (!admitted(admission, token, input.expiresAt)) return { ok: false, error: "token_inactive" };
@@ -277,12 +280,22 @@ export function judgeCliAgentAdmission(
     return { ok: true, token, device, live };
   }
 
-  if (!allowsSupervisedCommands(grant)) return { ok: false, error: "grant_disabled" };
+  // The supervised capability is shared by commands and file writes. File
+  // writes take their mode verdict from the single file-access matrix.
+  const permitsSupervised = options?.fileWrite
+    ? (mode: typeof grant) => fileToolAccess(mode, "write") !== "off"
+    : allowsSupervisedCommands;
+  if (!permitsSupervised(grant)) return { ok: false, error: "grant_disabled" };
   const live = liveFeatures(input.cliDeviceId);
-  if (!live || !relayProtocolAtLeast(live.protocolVersion, "2.6") || !live.supervisedCommands) {
+  if (
+    !live ||
+    !relayProtocolAtLeast(live.protocolVersion, options?.fileWrite ? "2.8" : "2.6") ||
+    !live.supervisedCommands ||
+    (options?.fileWrite && !live.fileOps)
+  ) {
     return { ok: false, error: "offline" };
   }
-  if (!allowsSupervisedCommands(live.mcpCommandMode)) {
+  if (!permitsSupervised(live.mcpCommandMode)) {
     return { ok: false, error: "feature_disabled" };
   }
   if (!live.terminalSupported) return { ok: false, error: "unsupported" };

@@ -2130,7 +2130,16 @@ describe("CLI file tools", () => {
         `${name} ${descriptor.scope} ${descriptor.confirmation} ${descriptor.classification}`,
       ).toBe(`${name} ${scope} ${confirmation} ${classification}`);
       expect(descriptor.target).toMatch(/^core:forwarderCliFile/);
-      expect(descriptor.deliverDespiteAbort).not.toBe(true);
+      if (scope === "read") expect(descriptor.deliverDespiteAbort).not.toBe(true);
+      else {
+        expect(descriptor.deliverDespiteAbort).toBe(true);
+        expect(descriptor.deliverDespiteAbortWhen?.({ kind: "supervised", commandId: "id" })).toBe(
+          true,
+        );
+        expect(descriptor.deliverDespiteAbortWhen?.({ ok: true, op: "write", result: {} })).toBe(
+          false,
+        );
+      }
     }
   });
 
@@ -2577,6 +2586,133 @@ describe("CLI file tools", () => {
     expect(result.isError).toBe(true);
     expect(structured(result).error?.code).toBe("REQUEST_ABORTED");
   });
+
+  it.each([true, false])(
+    "delivers an aborted write only for a supervised start (%s)",
+    async (supervised) => {
+      const controller = new AbortController();
+      fileRuntime.runFileOp.mockImplementationOnce(
+        async (input: { onSupervisedStart?: () => void }) => {
+          input.onSupervisedStart?.();
+          controller.abort();
+          return supervised
+            ? {
+                ok: true,
+                kind: "supervised",
+                commandId: "file-1",
+                terminalId: "term-1",
+                status: "awaiting_user",
+                waitingUntil: "2026-01-01T00:15:00Z",
+                next: "poll",
+              }
+            : { ok: true, op: "write", result: { etag: "h:aaa", size: 1, created: true } };
+        },
+      );
+      const result = await call(
+        "forwarder_cli_file_write",
+        { cliDeviceId: "cli-1", path: "~/a", content: "x", confirm: "RUN" },
+        { signal: controller.signal },
+      );
+      if (supervised)
+        expect(structured(result).result).toMatchObject({
+          commandId: "file-1",
+          status: "awaiting_user",
+          next: "poll",
+        });
+      else expect(structured(result).error?.code).toBe("REQUEST_ABORTED");
+    },
+  );
+
+  it("aborts promptly before file registration even while admission is pending", async () => {
+    const controller = new AbortController();
+    let release!: (result: unknown) => void;
+    let entered!: () => void;
+    const reached = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    fileRuntime.runFileOp.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+          entered();
+        }),
+    );
+    const pending = call(
+      "forwarder_cli_file_write",
+      { cliDeviceId: "cli-1", path: "~/a", content: "x", confirm: "RUN" },
+      { signal: controller.signal },
+    );
+    await reached;
+    controller.abort();
+    const result = await pending;
+    expect(structured(result).error?.code).toBe("REQUEST_ABORTED");
+    release({ ok: false, code: "cancelled" });
+  });
+
+  it("preserves abort semantics when a headless file core refuses after abort", async () => {
+    const controller = new AbortController();
+    fileRuntime.runFileOp.mockImplementationOnce(
+      async (input: { onSupervisedStart?: () => void }) => {
+        input.onSupervisedStart?.();
+        controller.abort();
+        return { ok: false, code: "cancelled", outcome: "unknown" };
+      },
+    );
+    const result = await call(
+      "forwarder_cli_file_write",
+      { cliDeviceId: "cli-1", path: "~/a", content: "x", confirm: "RUN" },
+      { signal: controller.signal },
+    );
+    expect(structured(result).error?.code).toBe("REQUEST_ABORTED");
+  });
+
+  it.each(["success", "declined", "timeout"] as const)(
+    "polls file %s through command_result with a bounded documented projection",
+    async (outcome) => {
+      // Ephemeral credential, generated rather than stored as a secret fixture.
+      const credential = `wsmp_mcp_${crypto.randomUUID().replaceAll("-", "")}`;
+      cliRuntime.snapshotSupervisedCommand.mockReturnValueOnce({
+        kind: "supervised",
+        requestKind: "file",
+        commandId: "file-1",
+        status: outcome === "success" ? "exited" : "cancelled",
+        started: outcome !== "declined",
+        waitDeadline: null,
+        file:
+          outcome === "success"
+            ? {
+                op: "write",
+                result: {
+                  etag: "h:aaa",
+                  size: 1,
+                  created: true,
+                  resolvedPath: `/tmp/${credential}`,
+                  extra: "forged",
+                },
+              }
+            : null,
+        fileError:
+          outcome === "success"
+            ? null
+            : { code: outcome, ...(outcome === "timeout" ? { outcome: "unknown" } : {}) },
+      });
+      const result = await call("forwarder_cli_command_result", { commandId: "file-1" });
+      const projected = structured(result).result;
+      if (outcome === "success") {
+        expect(projected?.file).toMatchObject({
+          op: "write",
+          result: { etag: "h:aaa", size: 1, created: true },
+        });
+        expect(JSON.stringify(projected)).not.toContain(credential);
+        expect(JSON.stringify(projected)).not.toContain("forged");
+      } else
+        expect(projected?.error).toMatchObject({
+          code: outcome,
+          message: expect.any(String),
+          ...(outcome === "timeout" ? { outcome: "unknown" } : {}),
+        });
+    },
+  );
 
   it("accepts a base64 write at the 1 MiB decoded cap through the advertised schema (G2)", async () => {
     // The base64 text of a 1 MiB body is ~1.4 MiB, so the schema's

@@ -4,6 +4,7 @@ import {
   type FileOpOutcome,
   type FileOpSuccess,
   runFileOp,
+  type SupervisedFileStart,
 } from "../relay/cli-file-ops.js";
 import { FILE_BODY_MAX_BYTES, type FileOp, fileToolArgShapes } from "../relay/file-protocol.js";
 import { isWellFormedText } from "../relay/wire-text.js";
@@ -143,7 +144,7 @@ export function adaptFileToolInput(op: FileOp, input: unknown): AdaptedFileInput
 type ToolErrorCode = FileOpFailure["code"];
 
 /** Short fixed messages. They never carry a path, file content, or CLI text. */
-const FILE_ERROR_MESSAGES: Readonly<Record<ToolErrorCode, string>> = {
+export const FILE_ERROR_MESSAGES: Readonly<Record<ToolErrorCode, string>> = {
   not_found: "No such file or directory",
   grant_disabled: "File tools are disabled for this device (its MCP command mode is off)",
   offline: "The CLI is offline or does not support file tools",
@@ -176,6 +177,7 @@ const FILE_ERROR_MESSAGES: Readonly<Record<ToolErrorCode, string>> = {
   io_error: "The file operation failed",
   timeout: "The file operation timed out",
   cancelled: "The file operation was cancelled",
+  declined: "The person declined the file operation; nothing was applied",
 };
 
 /** A file tool failure: a stable `code`, a short message, and small structured facts. */
@@ -211,6 +213,7 @@ export class McpCliFileError extends Error {
 // Cores
 
 type FileToolDeps = {
+  claimDeliverDespiteAbort?: () => void;
   userId: string;
   signal?: AbortSignal;
   credential: McpRequestCredential;
@@ -237,7 +240,7 @@ export async function runForwarderCliFileTool(
   op: FileOp,
   input: unknown,
   deps: FileToolDeps,
-): Promise<FileOpSuccess> {
+): Promise<FileOpSuccess | SupervisedFileStart> {
   const pat = requireFilePat(deps.credential);
   // The SDK validator is the loose generated one (#117): the strict per-op
   // shape is enforced here, and its issues reach the agent as named fields.
@@ -259,6 +262,7 @@ export async function runForwarderCliFileTool(
     args: adapted.args,
     ...(adapted.body ? { body: adapted.body } : {}),
     ...(deps.signal ? { signal: deps.signal } : {}),
+    ...(deps.claimDeliverDespiteAbort ? { onSupervisedStart: deps.claimDeliverDespiteAbort } : {}),
   });
   if (!outcome.ok) return fail(outcome);
   return outcome;
@@ -341,6 +345,11 @@ function scrub(value: unknown): unknown {
  */
 export function projectFileToolOutput(output: unknown): unknown {
   const record = isRecord(output) ? output : {};
+  if (record.kind === "supervised") {
+    return scrub(
+      pick(record, ["commandId", "terminalId", "kind", "status", "waitingUntil", "next"]),
+    );
+  }
   const op = record.op;
   const result = isRecord(record.result) ? record.result : {};
   if (typeof op !== "string" || !Object.hasOwn(PROJECT_FIELDS, op)) return {};
@@ -370,16 +379,16 @@ export const FILE_MASKING_NOTICE =
   "Masking is narrow: only SSH private keys, environment-variable secrets (dotenv and env files, and secret-named KEY=value assignments) and the Hugging Face token file and --api-key/--hf-token flag values are masked, shown as ⟦redacted:N⟧. Anything else in a file is returned as is. On an unsupervised node masking is NOT a security boundary (an agent that can run commands can cat .env); it keeps those secrets out of transcripts on the normal path. Secret-class files are READ-ONLY masked views: every write, edit, rename, delete or mkdir that touches one (or its directory) is refused with error.code secret_file, on every operating system and whatever the letter case; change such a file with a command, not with these tools. Only the wsmp_ credential substrings are additionally removed by the server.";
 
 export const FILE_ACCESS_NOTICE =
-  "Runs headless only on a CLI whose MCP command mode is unsupervised (the lowest of the dashboard grant and the CLI config); a supervised or off node refuses. Paths are absolute or ~/…, at most 4096 bytes; the CLI refuses its own state and config files.";
+  "On an unsupervised CLI, reads and writes run headless. On a supervised CLI, writes return a commandId: a person must press Enter on the CLI-drawn screen showing the operation, resolved physical path, reason and masked diff computed from disk. Poll forwarder_cli_command_result; no read grant is implied. State-dependent failures reach the agent only after a person dismisses the screen. Supervised dryRun is refused. Off refuses grant_disabled. Mode is the lowest of the dashboard grant and CLI config. Paths are absolute or ~/…, at most 4096 bytes; the CLI refuses its own state and config files.";
 
 export const FILE_ETAG_NOTICE =
-  "Every result that touches a file carries etag. Pass it as expectedEtag to edit, write (ifExists replace), rename (overwrite) and delete; a stale etag returns error.code conflict with currentEtag. Line-range edits and replace require expectedEtag. Etags reset when the wsmp daemon restarts: after offline, re-read or file_stat before editing.";
+  "Pass expectedEtag to edit, write (ifExists replace), rename (overwrite) and delete. Line-range edits, replace and rename overwrite require it. Stale etags return conflict; supervised errors contain only code, without currentEtag or file content. Supervised edit/write results omit diff and hunks. The CLI rechecks the pre-image before applying. Etags reset when the wsmp daemon restarts: with a read grant, re-read or file_stat before editing.";
 
 export const FILE_UNKNOWN_OUTCOME_NOTICE =
-  'If a write-class call fails with timeout or offline (error.outcome "unknown"), the change may or may not have been made: call forwarder_cli_file_stat with hash true and compare the etag before retrying. Retries carry expectedEtag, so a repeated write is safe.';
+  'An error.outcome "unknown" means the change may have been made. A supervised timeout/offline is unknown only after supervised.accepted; before that it is definitively not applied. Ask the person to inspect the file, or use forwarder_cli_file_stat with a read grant, before retrying.';
 
 export const FILE_LIMITS_NOTICE =
-  "Limits: 120 file operations per minute per user (30 changing ones), 4 at once per CLI and 16 per user; over the limit returns error.code limit with retryAfterMs. Operations are never queued and time out after 30 seconds.";
+  "Limits: 120 file operations per minute per user (30 changing ones), 4 at once per CLI and 16 per user; over the limit returns error.code limit with retryAfterMs. Headless operations are never queued and time out after 30 seconds. Supervised writes share command limits (1 awaiting per CLI, 2 per user, 2 live per CLI), wait up to 15 minutes for approval, then time out 30 seconds after acceptance.";
 
 export const FILE_FRAME_NOTICE =
   "Every file tool request must fit one 64 KiB relay frame and the 1 MB /mcp request body cap, so a request with many long paths, a large search pattern or large edit text may have to be split or shortened.";

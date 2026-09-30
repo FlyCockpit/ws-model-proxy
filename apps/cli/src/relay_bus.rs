@@ -59,4 +59,20 @@ pub(crate) enum FromWorker {
         op_id: String,
         frames: Vec<crate::file_relay::FileFrame>,
     },
+    /// Preparation of a supervised file request completed on the shared file
+    /// pool. `generation` prevents a cancelled/recycled command id from
+    /// receiving a stale snapshot.
+    #[cfg(unix)]
+    SupervisedFilePrepared {
+        command_id: String,
+        generation: u64,
+        outcome: Box<crate::file_ops::FileResult<crate::file_ops::PreparedSupervised>>,
+    },
+    /// The sole daemon-owned application job settled on the shared file pool.
+    #[cfg(unix)]
+    SupervisedFileApplied {
+        command_id: String,
+        generation: u64,
+        outcome: crate::file_ops::FileResult<serde_json::Value>,
+    },
 }

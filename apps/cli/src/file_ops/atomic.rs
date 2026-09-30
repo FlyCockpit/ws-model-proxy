@@ -109,6 +109,48 @@ pub fn replace(
     content: &[u8],
     cancel: &Cancel,
 ) -> FileResult<()> {
+    replace_impl(
+        ops, dir, name, orig, orig_stat, orig_etag, content, None, cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn replace_supervised(
+    ops: &FileOps,
+    dir: &OwnedFd,
+    name: &OsStr,
+    orig: &mut File,
+    orig_stat: &Stat,
+    orig_etag: &str,
+    content: &[u8],
+    pin: &super::supervised::PinnedPath,
+    cancel: &Cancel,
+) -> FileResult<()> {
+    replace_impl(
+        ops,
+        dir,
+        name,
+        orig,
+        orig_stat,
+        orig_etag,
+        content,
+        Some(pin),
+        cancel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn replace_impl(
+    ops: &FileOps,
+    dir: &OwnedFd,
+    name: &OsStr,
+    orig: &mut File,
+    orig_stat: &Stat,
+    orig_etag: &str,
+    content: &[u8],
+    pin: Option<&super::supervised::PinnedPath>,
+    cancel: &Cancel,
+) -> FileResult<()> {
     check_replaceable(ops, orig_stat)?;
     let tmp = temp_name(name);
     let fd = openat(
@@ -143,6 +185,9 @@ pub fn replace(
 
     recheck(ops, dir, name, orig, orig_stat, orig_etag)?;
     ops.step(Step::EtagRechecked)?;
+    if let Some(pin) = pin {
+        pin.verify_at(ops, dir, name, super::policy::Access::Write)?;
+    }
     cancel.check()?;
 
     renameat(dir.as_fd(), guard.name.as_os_str(), dir.as_fd(), name).map_err(FileError::errno)?;

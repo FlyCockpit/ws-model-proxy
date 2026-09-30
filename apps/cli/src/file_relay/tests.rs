@@ -596,3 +596,50 @@ fn summaries_show_paths_but_never_content() {
     assert_eq!((write.op.as_str(), write.target.as_str()), ("write", "/w"));
     assert_eq!(summarize("bogus", &json!({})).op, "unknown");
 }
+
+#[test]
+fn supervised_runtime_delivers_io_error_when_apply_panics() {
+    let dir = tempfile::tempdir().expect("dir");
+    let file = dir.path().join("file.txt");
+    std::fs::write(&file, "before\n").expect("fixture");
+    let policy = Policy::from_environment(Vec::new(), true).with_euid(1000);
+    let (boundary_tx, boundary_rx) = std::sync::mpsc::sync_channel(1);
+    let ops =
+        FileOps::new(policy, EtagKey::from_bytes([7; 32])).with_step_hook(Arc::new(move |step| {
+            if step == Step::TempCreated {
+                let _ = boundary_tx.send(crate::file_ops::pool::worker_panic_is_contained());
+                panic!("injected worker panic");
+            }
+            Ok(())
+        }));
+    let runtime = FileRuntime::new(ops);
+    let cancel = Cancel::new();
+    let prepared = runtime
+        .ops()
+        .prepare_supervised(
+            "edit",
+            json!({"path":path_str(&file), "edits":[{"oldText":"before", "newText":"after"}]}),
+            None,
+            &EtagKey::from_bytes([19; 32]),
+            &cancel,
+        )
+        .expect("prepare");
+    let (tx, rx) = channel();
+    runtime
+        .apply_supervised(prepared, cancel, move |outcome| {
+            tx.send(outcome).expect("callback receiver");
+        })
+        .expect("enqueue");
+    let error = rx
+        .recv_timeout(WAIT)
+        .expect("callback after panic")
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::IoError);
+    assert!(
+        boundary_rx
+            .recv_timeout(WAIT)
+            .expect("panic boundary status")
+    );
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "before\n");
+    assert!(!crate::file_ops::pool::worker_panic_is_contained());
+}

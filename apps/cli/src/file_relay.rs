@@ -11,7 +11,7 @@
 //!
 //! Admission ([`admit`]) is a pure function re-checked on every op: the CLI's
 //! own `mcpCommandMode` (`off` -> `feature_disabled`, `supervised` ->
-//! `supervised_only`; the P5 confirm path and the P4 read grant are later) and
+//! `supervised_only`; supervised writes use the terminal confirmation path) and
 //! the root refusal (`unsupported` at euid 0 unless `allowFileToolsAsRoot`).
 //! The server's admission is a separate, independent check.
 //!
@@ -35,7 +35,9 @@ use serde_json::{Map, Value};
 use crate::config::McpCommandMode;
 use crate::display_escape::escape_for_display;
 use crate::file_ops::pool::{FilePool, MAX_IN_FLIGHT};
-use crate::file_ops::{Cancel, ErrorCode, EtagKey, FileError, FileOps, FileResult, Policy};
+use crate::file_ops::{
+    Cancel, ErrorCode, EtagKey, FileError, FileOps, FileResult, Policy, PreparedSupervised,
+};
 use crate::protocol::{
     ClientControlMessage, RELAY_BINARY_CHUNK_MAX_BYTES, RELAY_JSON_CONTROL_MAX_BYTES,
     RelayBinaryFrameMetadata,
@@ -94,6 +96,68 @@ impl FileRuntime {
 
     pub fn policy(&self) -> &Policy {
         self.ops.policy()
+    }
+
+    pub fn ops(&self) -> Arc<FileOps> {
+        Arc::clone(&self.ops)
+    }
+
+    /// Queue non-mutating preparation. The callback is invoked exactly once;
+    /// a worker panic is converted to `io_error` before the callback boundary.
+    pub fn prepare_supervised<F>(
+        &self,
+        op: String,
+        args: Value,
+        body: Option<Vec<u8>>,
+        preview_key: EtagKey,
+        cancel: Cancel,
+        done: F,
+    ) -> FileResult<()>
+    where
+        F: FnOnce(FileResult<PreparedSupervised>) + Send + 'static,
+    {
+        let ops = Arc::clone(&self.ops);
+        let job = move || -> FileResult<()> {
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                ops.prepare_supervised(&op, args, body, &preview_key, &cancel)
+            }))
+            .unwrap_or_else(|_| {
+                Err(FileError::new(
+                    ErrorCode::IoError,
+                    "file preparation panicked",
+                ))
+            });
+            done(outcome);
+            Ok(())
+        };
+        self.pool.submit(job, MAX_IN_FLIGHT).map(|_| ())
+    }
+
+    /// Queue the one daemon-side application of an immutable prepared request.
+    pub fn apply_supervised<F>(
+        &self,
+        prepared: PreparedSupervised,
+        cancel: Cancel,
+        done: F,
+    ) -> FileResult<()>
+    where
+        F: FnOnce(FileResult<Value>) + Send + 'static,
+    {
+        let ops = Arc::clone(&self.ops);
+        let job = move || -> FileResult<()> {
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                ops.execute_supervised(prepared, &cancel)
+            }))
+            .unwrap_or_else(|_| {
+                Err(FileError::new(
+                    ErrorCode::IoError,
+                    "file operation panicked",
+                ))
+            });
+            done(outcome);
+            Ok(())
+        };
+        self.pool.submit(job, MAX_IN_FLIGHT).map(|_| ())
     }
 }
 
@@ -312,6 +376,12 @@ fn frames_for(op_id: &str, op: &str, outcome: FileResult<Value>) -> (Vec<FileFra
 /// `apps/server/src/relay/cli-file-ops.ts`.
 pub fn settle(op_id: &str, summary: &OpSummary, outcome: FileResult<Value>) -> Vec<FileFrame> {
     let (frames, outcome_code) = frames_for(op_id, &summary.op, outcome);
+    log_outcome(summary, &outcome_code);
+    frames
+}
+
+/// Shared metadata-only outcome logging for headless and supervised file ops.
+pub(crate) fn log_outcome(summary: &OpSummary, outcome_code: &str) {
     tracing::info!(
         op = %summary.op,
         target = %summary.target,
@@ -319,7 +389,6 @@ pub fn settle(op_id: &str, summary: &OpSummary, outcome: FileResult<Value>) -> V
         reason = summary.reason.as_deref(),
         "file op"
     );
-    frames
 }
 
 struct AwaitingBody {

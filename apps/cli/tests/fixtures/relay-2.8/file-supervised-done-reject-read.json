@@ -1,0 +1,12 @@
+{
+  "type": "supervised.done",
+  "commandId": "AAECAwQFBgcICQoLDA0ODw",
+  "review": false,
+  "fileResult": {
+    "op": "read",
+    "result": {
+      "unchanged": true,
+      "etag": "h:aaa"
+    }
+  }
+}

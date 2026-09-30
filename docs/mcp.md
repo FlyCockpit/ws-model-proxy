@@ -90,11 +90,37 @@ dashboard grant, the CLI's own `wsmp config set-mcp-commands` mode, and the live
 | Effective mode | read, stat, list, search | edit, write, rename, mkdir, delete |
 | --- | --- | --- |
 | `unsupervised` | headless | headless |
-| `supervised` | refused `supervised_only` | refused `supervised_only` |
+| `supervised` | refused `supervised_only` (read grant not implemented here) | CLI keypress required |
 | `off` | refused (`grant_disabled` or `feature_disabled`) | refused (same) |
 
-A supervised confirm screen for writes and an opt-in read-only grant are later phases;
-until then a supervised node refuses file tools. `listCliDevices` reports
+Supervised writes return `{commandId, kind:"supervised", status:"awaiting_user", waitingUntil, next}`.
+A person opens the pending request in the dashboard Terminals screen and presses Enter
+on the CLI-drawn screen to apply it, or `q` to decline. Pending list and browser Decline
+use the same mechanism as supervised commands. `confirm: "RUN"` / `"DELETE"` expresses
+the agent's intent; it does not replace the person's keypress. The screen shows the
+operation, resolved physical path, optional reason, and a unified diff with one context
+line capped at 8 KiB. The CLI computes and masks that diff from the real file on disk;
+the server cannot supply or forge it. Secret-class paths remain read-only and are
+refused `secret_file`. Path policy is checked before display and again at apply, and
+the daemon rechecks the etag: a file changed between display and approval returns
+`conflict` and nothing is written. Supervised `edit.dryRun:true` returns `invalid_input`.
+No headless read grant is implied by supervised approval.
+
+Poll `forwarder_cli_command_result` with the returned id. It reports the shared
+supervised statuses, plus `file:{op,result}` on success or `error:{code,message,outcome?}`.
+Edit/write results omit `diff` and `hunks`; file errors have no path, current etag or
+other detail. State-dependent refusals (including `not_found`, `exists`, `conflict`,
+`hard_linked` and `owner_mismatch`) appear on a cannot-apply screen and reach the
+agent only after a person dismisses it. Path-string/input refusals may arrive before
+display. Decline returns code `declined`, definitively applying nothing.
+
+Confirm waits expire after 15 minutes, using the same stop grace as commands.
+After `supervised.accepted`, apply has a 30-second deadline; on expiry the server
+sends unconditional `supervised.cancel` and reports `timeout` with `outcome:"unknown"`.
+Session loss reports `offline`; its outcome is unknown only after acceptance.
+Before acceptance, timeout/offline is definitively not applied. The daemon honors
+cancellation only before the atomic commit point. Ask the person to inspect the file
+before retrying an unknown result; use file_stat only if a read grant permits it. `listCliDevices` reports
 `fileTools: {read, write}` (`headless`, `supervised` or `off`) and `allowFileToolsAsRoot`, so
 an agent can see what works without trial calls. The CLI refuses every file tool as
 `unsupported` when it runs as root unless `wsmp config set-file-tools-as-root on`.
@@ -116,30 +142,35 @@ case-insensitively on every OS); use a command to change such a file. The server
 
 **ETag workflow.** Read a file, then pass its `etag` as `expectedEtag` to `edit`, to `write`
 with `ifExists: "replace"`, to `rename` with `overwrite`, and to `delete`. Line-range edits
-and replaces require it. A stale etag returns `error.code` `conflict` with `currentEtag`:
-re-read and retry. `read` with `ifNoneMatch` answers `{unchanged: true, etag}`. Etags reset
-when the wsmp daemon restarts, which costs one extra `conflict`. A write-class call that
+and replaces require it. A headless stale-etag failure returns `error.code` `conflict`
+with `currentEtag`: re-read and retry. Supervised failures report only the code after
+the person's keypress. `read` with `ifNoneMatch` answers `{unchanged: true, etag}`. Etags reset
+when the wsmp daemon restarts, which costs one extra `conflict`. A headless write-class call that
 fails with `timeout` or `offline` carries `error.outcome: "unknown"`: call
 `forwarder_cli_file_stat` with `hash: true` and compare the etag before retrying.
 
-**Limits.** 120 file operations per minute per user, of which at most 30 change files;
-4 in flight per CLI and 16 per user. Over a limit the error is `limit` with `retryAfterMs`.
-Operations are never queued and time out after 30 seconds (search and hashing have shorter
-CLI budgets); an MCP abort sends `file.cancel`, honored before a mutation's rename. Read
+**Limits.** Supervised writes share command limits: one awaiting per CLI, two awaiting
+per user, and two live per CLI. Headless limits are 120 file operations per minute per user, of which at most 30 change files;
+4 in flight per CLI and 16 per user. Headless limits return `limit` with `retryAfterMs`;
+supervised admission limits return `limit`. Operations are never queued. Headless
+operations time out after 30 seconds (search and hashing have shorter CLI budgets);
+an MCP abort sends `file.cancel`, honored before a mutation's rename. Once a supervised
+request is registered, an MCP abort preserves its id and the person's pending decision. Read
 windows are held to 96 KiB by the 256 KiB tool output cap (`too_large` asks for a narrower
 request; escape-dense text needs a smaller `maxBytes`), write content is at most 1 MiB
 DECODED, and the whole request of stat, list, search and edit must fit one 64 KiB relay
 frame. The 1 MB `/mcp` request-body cap that every call shares is the
 real ceiling on the encoded form, so a base64 write arrives at roughly 768 KiB (786,432 bytes)
 decoded or less (it encodes to 4/3 of that); larger bodies cannot be written with the
-current tools. Errors are
-in-band `isError` results with a stable `error.code`: the command codes
+current tools. Admission and headless errors are in-band `isError` results;
+completed supervised failures appear in the polled `result.error`. Both use a stable
+`error.code`: the command codes
 (`not_found`, `grant_disabled`, `offline`, `feature_disabled`, `supervised_only`,
 `unsupported`, `limit`, `token_inactive`, `upgrade_required`), `invalid_input`, and the
 file codes (`path_denied`, `secret_file`, `not_a_file`, `not_a_dir`, `binary_file`,
 `too_large`, `conflict`, `match_count`, `no_match`, `redacted_span`, `exists`,
 `hard_linked`, `owner_mismatch`, `setuid`, `special_file`, `io_error`, `timeout`,
-`cancelled`). A CLI that speaks an older relay protocol returns `upgrade_required`
+`cancelled`, `declined`). A CLI that speaks an older relay protocol returns `upgrade_required`
 ("this CLI speaks relay <v>; upgrade wsmp").
 
 ## Setup
@@ -616,7 +647,17 @@ starts an immediate sweep that will remove artifacts already past eligibility
 
 Every command an MCP agent runs on a CLI device (`forwarder_cli_command_run`,
 `forwarder_cli_supervised_command_start`), including refused ones, is recorded
-in `cli_agent_action_event` (file operations join it with the file tools). The
+in `cli_agent_action_event`, along with file operations. Supervised edit, write,
+rename, mkdir and delete requests each record exactly one `supervised_file_write`
+event, including admission refusals; they do not also record a headless file
+event. Its path is the requested path (the source for rename), its reason is
+`<op>:<code>` (`write:completed`, `edit:conflict`, etc.), and available etags and
+write byte counts are metadata. Accepted writes whose apply deadline or session
+loss leaves the result uncertain record `unknown`; a reported file error records
+`failed`, a spawn/admission rejection `refused`, and a CLI-acknowledged confirm
+expiry or decline records `expired` or `declined`. Before acceptance, revocation,
+policy changes and session loss record `cancelled`. Headless file operations retain their per-tool
+`file_*` kinds. Unverified device ids are stored as `unknown`. The
 log is **metadata only**: who (user, device, token), what (kind, and for a
 command a keyed HMAC-SHA256 of the command text plus its program name — never
 the command text itself), when, and how it ended (`completed`, `refused`, `failed`,

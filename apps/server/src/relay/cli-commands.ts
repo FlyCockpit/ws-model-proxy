@@ -18,6 +18,7 @@ import {
   cleanText,
   TerminalByteState,
 } from "@ws-model-proxy/config/cli-command-output";
+import type { CliAgentAdmissionReads, CliAgentAdmissionRejection } from "./cli-agent-admission.js";
 import {
   judgeCliAgentAdmission,
   readCliAgentAdmission,
@@ -26,6 +27,12 @@ import {
 } from "./cli-agent-admission.js";
 import { recordCliAgentAction } from "./cli-agent-audit.js";
 import { commandAuditDigest } from "./command-audit-digest.js";
+import {
+  FILE_ERROR_CODES,
+  FILE_OP_DEADLINE_MS,
+  type FileSpawnSpec,
+  type SupervisedFileResult,
+} from "./file-protocol.js";
 import {
   relaySessionManager,
   type SupervisedTerminalGoneCause,
@@ -85,23 +92,32 @@ const UNVERIFIED_DEVICE_REFUSALS: ReadonlySet<string> = new Set([
   "internal_error",
 ]);
 
-function auditRefusal(
-  kind: Extract<CliAgentActionKind, "command" | "supervised_command">,
-  input: { userId: string; tokenId: string; cliDeviceId: string; command: string },
+export function auditRefusal(
+  kind: Extract<CliAgentActionKind, "command" | "supervised_command" | "supervised_file_write">,
+  input: { userId: string; tokenId: string; cliDeviceId: string; command?: string },
   startedAt: Date,
   outcome: Extract<CliAgentActionOutcome, "refused" | "failed">,
   reason: string,
+  file?: {
+    op: FileSpawnSpec["op"];
+    path: string;
+    etagBefore: string | null;
+    bytes: number | null;
+    deviceVerified?: boolean;
+  },
 ): void {
   recordCliAgentAction({
     userId: input.userId,
-    cliDeviceId: UNVERIFIED_DEVICE_REFUSALS.has(reason)
-      ? CLI_AGENT_ACTION_UNKNOWN_DEVICE
-      : input.cliDeviceId,
+    cliDeviceId:
+      (file?.deviceVerified ?? !UNVERIFIED_DEVICE_REFUSALS.has(reason))
+        ? input.cliDeviceId
+        : CLI_AGENT_ACTION_UNKNOWN_DEVICE,
     mcpTokenId: input.tokenId,
     kind,
-    path: auditPathOf(input.command),
+    path: file?.path ?? auditPathOf(input.command),
+    ...(file ? { etagBefore: file.etagBefore, bytes: file.bytes } : {}),
     outcome,
-    reason,
+    reason: file ? `${file.op}:${reason}` : reason,
     startedAt,
     finishedAt: new Date(),
   });
@@ -564,15 +580,25 @@ export function sweepExpiredTokenCommands(now = Date.now()): number {
 // like exec: a server restart or CLI reconnect ends them (`cancelled`).
 // ---------------------------------------------------------------------------
 
+export type SupervisedFileFailure = {
+  code: CliAgentAdmissionRejection | (typeof FILE_ERROR_CODES)[number] | "declined";
+  outcome?: "unknown";
+};
+
 type SupervisedRecord = {
+  requestKind: "command" | "file";
+  fileOp: FileSpawnSpec | null;
+  fileResult: SupervisedFileResult | null;
+  fileError: SupervisedFileFailure | null;
   commandId: string;
   terminalId: string;
   cliDeviceId: string;
   userId: string;
   tokenId: string;
   command: string;
-  /** Audit `path` (command hash plus program), computed once at start. */
+  /** Requested file path, or command hash plus program; computed once at start. */
   auditPath: string;
+  auditBytes: number | null;
   cwd: string | null;
   reason: string | null;
   requester: string;
@@ -612,6 +638,9 @@ type SupervisedRecord = {
 };
 
 export type SupervisedCommandSnapshot = {
+  requestKind: "command" | "file";
+  file: SupervisedFileResult | null;
+  fileError: SupervisedFileFailure | null;
   kind: "supervised";
   commandId: string;
   userId: string;
@@ -657,16 +686,51 @@ function armWait(record: SupervisedRecord, ttlMs: number, onExpire: () => void) 
   record.waitTimer = timer;
 }
 
+function supervisedFileRejectionCode(reason: string | null): SupervisedFileFailure["code"] {
+  if (FILE_ERROR_CODES.some((code) => code === reason))
+    return reason as (typeof FILE_ERROR_CODES)[number];
+  if (reason === "disabled") return "feature_disabled";
+  if (reason === "bad_command") return "invalid_input";
+  if (reason === "already_open") return "limit";
+  return "io_error";
+}
+
 function finishSupervised(
   record: SupervisedRecord,
   status: Exclude<SupervisedCommandStatus, "awaiting_user" | "running" | "awaiting_output_review">,
-  fields: { rejectionReason?: string } = {},
+  fields: {
+    rejectionReason?: string;
+    fileError?: SupervisedFileFailure;
+    definitive?: boolean;
+  } = {},
 ) {
   if (!isActiveSupervised(record.status)) return;
   clearWaitTimer(record);
   record.status = status;
   record.finishedAt = Date.now();
   if (fields.rejectionReason !== undefined) record.rejectionReason = fields.rejectionReason;
+  if (record.requestKind === "file" && !record.fileResult) {
+    const code =
+      fields.fileError?.code ??
+      (status === "expired" || record.stopRequested === "expire"
+        ? "timeout"
+        : status === "declined"
+          ? "declined"
+          : record.rejectionReason === "cli_disconnected"
+            ? "offline"
+            : record.rejectionReason === "token_revoked" ||
+                record.rejectionReason === "token_expired"
+              ? "token_inactive"
+              : record.rejectionReason === "policy_disabled"
+                ? "grant_disabled"
+                : status === "rejected"
+                  ? supervisedFileRejectionCode(record.rejectionReason)
+                  : "cancelled");
+    record.fileError = {
+      code,
+      ...(!fields.definitive && record.acceptedAt !== null ? { outcome: "unknown" as const } : {}),
+    };
+  }
   auditSupervisedCommand(record, status);
   relaySessionManager.notifyTerminalListChanged(record.userId);
 }
@@ -676,24 +740,41 @@ function auditSupervisedCommand(
   status: Exclude<SupervisedCommandStatus, "awaiting_user" | "running" | "awaiting_output_review">,
 ): void {
   const outcome: CliAgentActionOutcome =
-    status === "exited"
-      ? "completed"
-      : status === "rejected"
-        ? "refused"
-        : status === "declined"
-          ? "declined"
-          : status === "expired"
-            ? "expired"
-            : "cancelled";
+    record.fileError?.outcome === "unknown"
+      ? "unknown"
+      : status === "exited"
+        ? "completed"
+        : status === "rejected"
+          ? record.rejectionReason === "internal_error" ||
+            (record.requestKind === "file" && record.rejectionReason === null)
+            ? "failed"
+            : "refused"
+          : status === "declined"
+            ? "declined"
+            : status === "expired"
+              ? "expired"
+              : "cancelled";
   recordCliAgentAction({
     userId: record.userId,
     cliDeviceId: record.cliDeviceId,
     mcpTokenId: record.tokenId,
-    kind: "supervised_command",
+    kind: record.requestKind === "file" ? "supervised_file_write" : "supervised_command",
     path: record.auditPath,
+    ...(record.fileOp
+      ? {
+          etagBefore:
+            "expectedEtag" in record.fileOp.args ? (record.fileOp.args.expectedEtag ?? null) : null,
+          etagAfter:
+            record.fileResult && "etag" in record.fileResult.result
+              ? record.fileResult.result.etag
+              : null,
+          bytes: record.auditBytes,
+        }
+      : {}),
     outcome,
-    reason:
-      status === "exited"
+    reason: record.fileOp
+      ? `${record.fileOp.op}:${record.fileError?.code ?? "completed"}`
+      : status === "exited"
         ? exitReason(record)
         : (record.rejectionReason ?? (record.acceptedAt === null ? "not_started" : null)),
     startedAt: new Date(record.createdAt),
@@ -766,7 +847,17 @@ function requestSupervisedStop(record: SupervisedRecord, why: "expire" | "declin
 }
 
 function startedOf(record: SupervisedRecord): boolean | null {
-  if (record.acceptedAt !== null || record.status === "exited") return true;
+  if (
+    record.requestKind === "file" &&
+    record.acceptedAt === null &&
+    !isActiveSupervised(record.status)
+  )
+    return false;
+  if (
+    record.acceptedAt !== null ||
+    (record.requestKind === "command" && record.status === "exited")
+  )
+    return true;
   if (
     record.status === "declined" ||
     record.status === "expired" ||
@@ -808,6 +899,8 @@ function trackerFor(record: SupervisedRecord): TrackedSupervisedCommand {
     terminalId: record.terminalId,
     cliDeviceId: record.cliDeviceId,
     userId: record.userId,
+    kind: record.requestKind,
+    ...(record.fileOp ? { fileOp: record.fileOp.op } : {}),
     listing: () => listingOf(record),
     onSpawned() {
       if (record.status !== "awaiting_user" || record.spawnedAt !== null) return;
@@ -819,6 +912,10 @@ function trackerFor(record: SupervisedRecord): TrackedSupervisedCommand {
       // never CLI-supplied text (see `cliAgentWireReason`).
       finishSupervised(record, "rejected", {
         rejectionReason: cliAgentWireReason(reason.slice(0, 64)),
+        ...(record.requestKind === "file"
+          ? { fileError: { code: supervisedFileRejectionCode(reason) } }
+          : {}),
+        definitive: true,
       });
     },
     onAccepted() {
@@ -828,6 +925,13 @@ function trackerFor(record: SupervisedRecord): TrackedSupervisedCommand {
       clearWaitTimer(record);
       record.status = "running";
       record.acceptedAt = Date.now();
+      if (record.requestKind === "file") {
+        armWait(record, FILE_OP_DEADLINE_MS, () => {
+          if (record.status !== "running") return;
+          finishSupervised(record, "cancelled", { fileError: { code: "timeout" } });
+          relaySessionManager.cancelSupervised(record.cliDeviceId, record.commandId, "closed");
+        });
+      }
     },
     onDeclined() {
       if (record.status !== "awaiting_user") return;
@@ -849,6 +953,7 @@ function trackerFor(record: SupervisedRecord): TrackedSupervisedCommand {
       if (isActiveSupervised(record.status)) return;
       if (report === "accepted") {
         if (record.acceptedAt === null) record.acceptedAt = Date.now();
+        if (record.fileError) record.fileError = { ...record.fileError, outcome: "unknown" };
       } else {
         record.cliSettled = true;
       }
@@ -866,6 +971,17 @@ function trackerFor(record: SupervisedRecord): TrackedSupervisedCommand {
       }
     },
     onDone(result) {
+      if (record.requestKind === "file") {
+        if (record.status !== "running" && record.status !== "awaiting_user") return;
+        record.cliSettled = true;
+        if (result.fileError) {
+          finishSupervised(record, "rejected", { fileError: result.fileError, definitive: true });
+        } else if (result.fileResult && record.status === "running") {
+          record.fileResult = result.fileResult;
+          finishSupervised(record, "exited");
+        }
+        return;
+      }
       if (record.status !== "running") return;
       if (result.exitCode !== undefined) record.exitCode = result.exitCode;
       if (result.signal !== undefined) record.signal = result.signal;
@@ -970,42 +1086,93 @@ export function requesterLabel(tokenName: string): string {
  * and its mode, limits, input), then the CLI is asked to spawn the confirm
  * terminal. Nothing runs until a person presses Enter on that screen.
  */
-type StartSupervisedCommandInput = {
+type SupervisedRequestIdentity = {
   userId: string;
   tokenId: string;
   expiresAt: Date | null;
   cliDeviceId: string;
-  command: string;
-  cwd?: string;
-  reason?: string;
-  shareOutput: boolean;
 };
-
-type StartSupervisedCommandResult =
+export type StartSupervisedRequestInput = SupervisedRequestIdentity &
+  (
+    | { kind: "command"; command: string; cwd?: string; reason?: string; shareOutput: boolean }
+    | { kind: "file"; fileOp: FileSpawnSpec; body?: Uint8Array; onStarted?: () => void }
+  );
+export type SupervisedStartResult =
   | { ok: true; commandId: string; terminalId: string; expiresAt: string }
-  | { ok: false; error: CliCommandRejection };
+  | { ok: false; error: CliCommandRejection | "invalid_input" };
 
 export async function startSupervisedCommand(
-  input: StartSupervisedCommandInput,
-): Promise<StartSupervisedCommandResult> {
+  input: SupervisedRequestIdentity & {
+    command: string;
+    cwd?: string;
+    reason?: string;
+    shareOutput: boolean;
+  },
+) {
+  const result = await startSupervisedRequest({ ...input, kind: "command" });
+  if (result.ok) return result;
+  return {
+    ok: false as const,
+    error: result.error === "invalid_input" ? ("invalid_command" as const) : result.error,
+  };
+}
+
+export async function startSupervisedRequest(
+  input: StartSupervisedRequestInput,
+  admissionReads?: CliAgentAdmissionReads,
+): Promise<SupervisedStartResult> {
   const startedAt = new Date();
+  const kind = input.kind === "file" ? "supervised_file_write" : "supervised_command";
+  const lifecycle: { record: SupervisedRecord | null } = { record: null };
+  const file =
+    input.kind === "file"
+      ? {
+          op: input.fileOp.op,
+          path: input.fileOp.op === "rename" ? input.fileOp.args.from : input.fileOp.args.path,
+          etagBefore:
+            "expectedEtag" in input.fileOp.args ? (input.fileOp.args.expectedEtag ?? null) : null,
+          bytes: input.fileOp.op === "write" ? (input.body?.byteLength ?? null) : null,
+        }
+      : undefined;
   try {
-    const result = await admitSupervisedCommand(input);
-    if (!result.ok) auditRefusal("supervised_command", input, startedAt, "refused", result.error);
+    const result = await admitSupervisedRequest(input, admissionReads, lifecycle);
+    if (!result.ok) auditRefusal(kind, input, startedAt, "refused", result.error, file);
     return result;
   } catch (error) {
-    auditRefusal("supervised_command", input, startedAt, "failed", "internal_error");
+    if (lifecycle.record) {
+      // Registration already transferred audit ownership. A delivery callback
+      // failure must end that lifecycle, rather than also audit an admission.
+      const record = lifecycle.record;
+      finishSupervised(record, "rejected", {
+        ...(record.requestKind === "file"
+          ? { fileError: { code: "io_error" as const } }
+          : { rejectionReason: "internal_error" }),
+        definitive: record.acceptedAt === null,
+      });
+      relaySessionManager.cancelSupervised(record.cliDeviceId, record.commandId, "closed");
+    } else {
+      auditRefusal(kind, input, startedAt, "failed", "internal_error", file);
+    }
     throw error;
   }
 }
 
-async function admitSupervisedCommand(
-  input: StartSupervisedCommandInput,
-): Promise<StartSupervisedCommandResult> {
+async function admitSupervisedRequest(
+  input: StartSupervisedRequestInput,
+  admissionReads: CliAgentAdmissionReads | undefined,
+  lifecycle: { record: SupervisedRecord | null },
+): Promise<SupervisedStartResult> {
   // From the verdict to the dispatch nothing awaits (see `Admission`).
-  const verdict = judgeCliAgentAdmission(await readCliAgentAdmission(input), "supervised");
+  const verdict = judgeCliAgentAdmission(
+    admissionReads ?? (await readCliAgentAdmission(input)),
+    "supervised",
+    input.kind === "file" ? { fileWrite: true } : undefined,
+  );
   if (!verdict.ok) return verdict;
   const { token } = verdict;
+  if (input.kind === "file" && input.fileOp.op === "edit" && input.fileOp.args.dryRun === true) {
+    return { ok: false, error: "invalid_input" };
+  }
 
   const counts = supervisedCounts(input.userId, input.cliDeviceId);
   if (
@@ -1016,9 +1183,13 @@ async function admitSupervisedCommand(
     return { ok: false, error: "limit" };
   }
 
-  const cwd = input.cwd;
-  if (!validCommandInput(input.command, cwd)) return { ok: false, error: "invalid_command" };
-  const reason = input.reason?.trim();
+  const cwd = input.kind === "command" ? input.cwd : undefined;
+  const command =
+    input.kind === "command"
+      ? input.command
+      : `File ${input.fileOp.op}: ${truncateCharacters(input.fileOp.op === "rename" ? `${input.fileOp.args.from} → ${input.fileOp.args.to}` : input.fileOp.args.path, 800)}`;
+  if (!validCommandInput(command, cwd)) return { ok: false, error: "invalid_command" };
+  const reason = (input.kind === "command" ? input.reason : input.fileOp.args.reason)?.trim();
   if (
     reason !== undefined &&
     (!isWellFormedText(reason) ||
@@ -1036,12 +1207,25 @@ async function admitSupervisedCommand(
     cliDeviceId: input.cliDeviceId,
     userId: input.userId,
     tokenId: input.tokenId,
-    command: input.command,
-    auditPath: auditPathOf(input.command),
+    requestKind: input.kind,
+    fileOp: input.kind === "file" ? input.fileOp : null,
+    fileResult: null,
+    fileError: null,
+    command,
+    auditPath:
+      input.kind === "file"
+        ? input.fileOp.op === "rename"
+          ? input.fileOp.args.from
+          : input.fileOp.args.path
+        : auditPathOf(input.command),
+    auditBytes:
+      input.kind === "file" && input.fileOp.op === "write"
+        ? (input.body?.byteLength ?? null)
+        : null,
     cwd: cwd ?? null,
     reason: reason ? reason : null,
     requester,
-    shareOutput: input.shareOutput,
+    shareOutput: input.kind === "command" && input.shareOutput,
     status: "awaiting_user",
     createdAt: now,
     spawnedAt: null,
@@ -1062,24 +1246,43 @@ async function admitSupervisedCommand(
     stopRequested: null,
     cliSettled: false,
   };
-  const sent = relaySessionManager.dispatchSupervisedSpawn(trackerFor(record), {
-    command: record.command,
-    ...(record.cwd !== null ? { cwd: record.cwd } : {}),
-    ...(record.reason !== null ? { reason: record.reason } : {}),
-    requester: record.requester,
-    shareOutput: record.shareOutput,
-  });
+  let sent: boolean;
+  try {
+    sent = relaySessionManager.dispatchSupervisedSpawn(
+      trackerFor(record),
+      {
+        command: record.command,
+        ...(record.cwd !== null ? { cwd: record.cwd } : {}),
+        ...(record.reason !== null ? { reason: record.reason } : {}),
+        requester: record.requester,
+        shareOutput: record.shareOutput,
+        ...(input.kind === "file"
+          ? {
+              kind: "file" as const,
+              fileOp: input.fileOp,
+              ...(input.fileOp.op === "write" ? { bodyBytes: input.body?.byteLength } : {}),
+            }
+          : {}),
+      },
+      input.kind === "file" ? input.body : undefined,
+    );
+  } catch {
+    return { ok: false, error: input.kind === "file" ? "invalid_input" : "invalid_command" };
+  }
   if (!sent) {
     const refusal = relaySessionManager.commandModeRefusal(input.cliDeviceId, "supervised");
     return { ok: false, error: refusal ?? "offline" };
   }
   supervisedById.set(record.commandId, record);
+  lifecycle.record = record;
   armWait(record, SUPERVISED_CONFIRM_TTL_MS, () => {
     if (record.status !== "awaiting_user") return;
     if (requestSupervisedStop(record, "expire")) return;
     // No live session to ask: its terminal is already gone with it.
     finishSupervised(record, "expired");
   });
+  // Synchronous with registration: the MCP abort race must now preserve this id.
+  if (input.kind === "file") input.onStarted?.();
   return {
     ok: true,
     commandId: record.commandId,
@@ -1092,6 +1295,9 @@ function supervisedSnapshotOf(record: SupervisedRecord): SupervisedCommandSnapsh
   const exited = record.status === "exited" && record.outputMode !== null;
   return {
     kind: "supervised",
+    requestKind: record.requestKind,
+    file: record.fileResult,
+    fileError: record.fileError,
     commandId: record.commandId,
     userId: record.userId,
     tokenId: record.tokenId,

@@ -65,6 +65,7 @@ export const CLI_AGENT_WIRE_REASONS = [
   "approval_required",
   "bad_signature",
   "bad_command",
+  "invalid_input",
   "bad_cwd",
   "not_found",
   "already_open",

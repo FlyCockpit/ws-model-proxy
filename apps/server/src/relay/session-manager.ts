@@ -35,7 +35,10 @@ import {
   type FileRejectDetail,
   type FileRejectReason,
   type FileResultFrame,
+  type FileSpawnSpec,
   isMutatingFileOp,
+  type SupervisedFileResult,
+  supervisedFileRejectReasonSchema,
 } from "./file-protocol.js";
 import { sanitizeRelayRequestHeaders } from "./headers.js";
 import {
@@ -195,6 +198,8 @@ export type SupervisedTerminalGoneCause =
  * record's current status.
  */
 export type TrackedSupervisedCommand = {
+  kind?: "command" | "file";
+  fileOp?: FileSpawnSpec["op"];
   commandId: string;
   terminalId: string;
   cliDeviceId: string;
@@ -209,6 +214,8 @@ export type TrackedSupervisedCommand = {
     signal?: string;
     review: boolean;
     outputBytes?: number;
+    fileResult?: SupervisedFileResult;
+    fileError?: { code: import("./file-protocol.js").FileErrorCode };
   }): void;
   onOutput(part: "head" | "tail", body: Uint8Array): void;
   onTerminalGone(cause: SupervisedTerminalGoneCause): void;
@@ -2084,11 +2091,21 @@ export class RelaySessionManager {
       reason?: string;
       requester: string;
       shareOutput: boolean;
+      kind?: "command" | "file";
+      fileOp?: FileSpawnSpec;
+      bodyBytes?: number;
     },
+    body?: Uint8Array,
   ): boolean {
     if (this.relayDrain) return false;
     const session = this.sessionsByCliDeviceId.get(command.cliDeviceId);
     if (!session || !this.canRunSupervised(session)) return false;
+    if (spawn.kind === "file" && !this.canSignalFile(session)) return false;
+    if ((command.kind ?? "command") !== (spawn.kind ?? "command")) return false;
+    if (spawn.kind === "file" && command.fileOp !== spawn.fileOp?.op) return false;
+    if (spawn.fileOp?.op === "write") {
+      if (body === undefined || body.byteLength !== spawn.bodyBytes) return false;
+    } else if (body !== undefined) return false;
     if (this.hasTerminal(command.terminalId) || session.supervisedById.has(command.commandId)) {
       return false;
     }
@@ -2103,7 +2120,14 @@ export class RelaySessionManager {
       ...(spawn.reason !== undefined ? { reason: spawn.reason } : {}),
       requester: spawn.requester,
       shareOutput: spawn.shareOutput,
+      ...(spawn.kind !== undefined ? { kind: spawn.kind } : {}),
+      ...(spawn.fileOp !== undefined ? { fileOp: spawn.fileOp } : {}),
+      ...(spawn.bodyBytes !== undefined ? { bodyBytes: spawn.bodyBytes } : {}),
     });
+    const bodyFrame =
+      body !== undefined
+        ? encodeRelayBinaryFrame({ type: "file.body", opId: command.commandId }, body)
+        : null;
     const terminal: TerminalRecord = {
       terminalId: command.terminalId,
       userId: command.userId,
@@ -2121,7 +2145,21 @@ export class RelaySessionManager {
     };
     session.terminalsById.set(terminal.terminalId, terminal);
     session.supervisedById.set(command.commandId, command);
-    session.socket.send(frame);
+    try {
+      session.socket.send(frame);
+      if (bodyFrame !== null) session.socket.send(bodyFrame);
+    } catch {
+      // A partial send may have spawned a waiting child; it must be ended.
+      // No keypress/application can come from this failed dispatch.
+      try {
+        this.sendControl(session, { type: "supervised.cancel", commandId: command.commandId });
+      } catch {
+        /* socket unavailable */
+      }
+      session.supervisedById.delete(command.commandId);
+      session.terminalsById.delete(terminal.terminalId);
+      return false;
+    }
     return true;
   }
 
@@ -3239,6 +3277,18 @@ export class RelaySessionManager {
       return;
     }
     const terminal = session.terminalsById.get(supervised.terminalId);
+    if (message.type === "supervised.done") {
+      const fileDone = message.fileResult !== undefined || message.fileError !== undefined;
+      if (
+        fileDone !== (supervised.kind === "file") ||
+        (message.fileResult &&
+          (message.fileResult.op !== supervised.fileOp ||
+            supervised.listing().status === "awaiting_user"))
+      ) {
+        this.isolateMalformedInteractiveFrame(session, JSON.stringify(message));
+        return;
+      }
+    }
     if (message.type === "term.spawned") {
       if (message.terminalId !== supervised.terminalId || !terminal) return;
       if (terminal.phase === "open") return;
@@ -3248,6 +3298,13 @@ export class RelaySessionManager {
       return;
     }
     if (message.type === "supervised.rejected") {
+      if (
+        supervised.kind === "file" &&
+        !supervisedFileRejectReasonSchema.safeParse(message.reason).success
+      ) {
+        this.isolateMalformedInteractiveFrame(session, JSON.stringify(message));
+        return;
+      }
       // Nothing was spawned, so no term.exit follows.
       session.supervisedById.delete(supervised.commandId);
       supervised.onRejected(message.reason);
@@ -3291,6 +3348,8 @@ export class RelaySessionManager {
         ...(message.signal !== undefined ? { signal: message.signal } : {}),
         review: message.review,
         ...(message.outputBytes !== undefined ? { outputBytes: message.outputBytes } : {}),
+        ...(message.fileResult !== undefined ? { fileResult: message.fileResult } : {}),
+        ...(message.fileError !== undefined ? { fileError: message.fileError } : {}),
       });
     }
     this.notifyTerminalListChanged(supervised.userId);

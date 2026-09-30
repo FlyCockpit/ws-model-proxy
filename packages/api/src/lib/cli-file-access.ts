@@ -12,8 +12,8 @@ import type { McpCommandModeName } from "./mcp-command-mode";
  *
  * - `headless`: the op runs without a person.
  * - `supervised`: it needs a person's keypress on the CLI. Writes get that
- *   confirm screen in a later phase (P5) and reads need the read-only grant
- *   (P4); until then both are refused `supervised_only`.
+ *   CLI-drawn confirm screen (P5). Reads need the read-only grant (P4);
+ *   until that grant is implemented they are refused `supervised_only`.
  * - `off`: refused.
  *
  * Later phases edit their own rows: P4 the `read` row of `off`/`supervised`

@@ -18,11 +18,18 @@ fn main() {
     let cli = Cli::parse();
     tls::install_crypto_provider();
     logging::init(cli.log_format, cli.verbose, cli.quiet);
-    // The release profile aborts on panic (no unwinding, no `main` epilogue):
-    // end every metric-source run first, then let the previous hook report.
+    // End metric-source runs before reporting a panic, including builds that
+    // override the normal unwind strategy with abort (no `main` epilogue).
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        wsmp::bounded_run::kill_all_active_for_panic();
+        #[cfg(unix)]
+        let contained_file_panic =
+            cfg!(panic = "unwind") && wsmp::file_ops::pool::worker_panic_is_contained();
+        #[cfg(not(unix))]
+        let contained_file_panic = false;
+        if !contained_file_panic {
+            wsmp::bounded_run::kill_all_active_for_panic();
+        }
         previous_hook(info);
     }));
 

@@ -30,14 +30,14 @@ pub const MAX_NEW_TEXT_BYTES: usize = 1024 * 1024;
 /// Most matches one `oldText` may replace (bounds planning memory and time).
 pub const MAX_MATCHES_PER_EDIT: usize = 100_000;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ExpectedMatches {
     Count(u32),
     All(String),
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EditOp {
     pub old_text: Option<String>,
@@ -47,7 +47,7 @@ pub struct EditOp {
     pub end_line: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EditArgs {
     pub path: String,
@@ -107,6 +107,21 @@ impl SizeBudget {
 }
 
 pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditResult> {
+    validate_args(args)?;
+    edit_validated(ops, args, None, cancel)
+}
+
+pub(crate) fn edit_supervised(
+    ops: &FileOps,
+    args: &EditArgs,
+    pin: &super::supervised::PinnedPath,
+    cancel: &Cancel,
+) -> FileResult<EditResult> {
+    validate_args(args)?;
+    edit_validated(ops, args, Some(pin), cancel)
+}
+
+pub(crate) fn validate_args(args: &EditArgs) -> FileResult<()> {
     check_reason(&args.reason)?;
     if args.edits.is_empty() || args.edits.len() > MAX_EDITS {
         return Err(FileError::invalid(format!(
@@ -143,7 +158,15 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
             "expectedEtag is required for line-range edits",
         ));
     }
+    Ok(())
+}
 
+fn edit_validated(
+    ops: &FileOps,
+    args: &EditArgs,
+    pin: Option<&super::supervised::PinnedPath>,
+    cancel: &Cancel,
+) -> FileResult<EditResult> {
     let resolved = resolve(
         &args.path,
         &ResolveOpts {
@@ -151,13 +174,22 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
             make_parents: None,
             policy: &ops.policy,
             access: Access::Write,
+            preview_missing: false,
+            pin: pin.map(|pin| &pin.ancestor),
+            cancel: None,
         },
     )?;
     // Lock first (as `write` does): a queued edit then opens the file after the
     // one ahead of it committed, instead of failing its re-check on a stale inode.
     let full = resolved.full_path();
     let _lock = ops.lock_path(full.clone(), cancel)?;
+    if let Some(pin) = pin {
+        pin.verify(ops, &resolved, Access::Write)?;
+    }
     let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
+    if let Some(pin) = pin {
+        pin.verify_opened(&stat)?;
+    }
 
     let original = load_all(&mut file, &stat, MAX_EDIT_FILE_BYTES)?;
     let previous_etag = ops.key.strong(&original);
@@ -282,16 +314,29 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
     }
 
     cancel.check()?;
-    atomic::replace(
-        ops,
-        &resolved.dir,
-        &resolved.name,
-        &mut file,
-        &stat,
-        &previous_etag,
-        &updated,
-        cancel,
-    )?;
+    match pin {
+        Some(pin) => atomic::replace_supervised(
+            ops,
+            &resolved.dir,
+            &resolved.name,
+            &mut file,
+            &stat,
+            &previous_etag,
+            &updated,
+            pin,
+            cancel,
+        )?,
+        None => atomic::replace(
+            ops,
+            &resolved.dir,
+            &resolved.name,
+            &mut file,
+            &stat,
+            &previous_etag,
+            &updated,
+            cancel,
+        )?,
+    }
     Ok(EditResult {
         etag: ops.key.strong(&updated),
         previous_etag,

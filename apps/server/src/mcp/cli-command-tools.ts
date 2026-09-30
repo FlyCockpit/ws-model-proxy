@@ -11,6 +11,7 @@ import {
   presentCliCommand,
   presentSupervisedCommand,
 } from "./cli-command-output.js";
+import { FILE_ERROR_MESSAGES, projectFileToolOutput } from "./cli-file-tools.js";
 import type { McpRequestCredential } from "./cli-tool-access.js";
 
 type CliCommandDeps = {
@@ -20,11 +21,10 @@ type CliCommandDeps = {
 };
 
 /**
- * Shown on both CLI command tools. Only the wsmp_ credential substrings
- * are removed; other secrets in command output are NOT redacted.
+ * Shown on CLI command tools: the CLI's narrow masking and server credential scrub.
  */
 export const CLI_COMMAND_OUTPUT_NOTICE =
-  "Other secrets in command output are NOT redacted. Only substrings matching wsmp_model_, wsmp_cli_, wsmp_device_, or wsmp_mcp_ followed by credential characters are removed.";
+  "The CLI masks SSH private keys, environment-variable secrets, Hugging Face token files and --api-key/--hf-token flag values in supervised and unsupervised command output. Other secrets in command output are NOT redacted. The server additionally removes substrings matching wsmp_model_, wsmp_cli_, wsmp_device_, or wsmp_mcp_ followed by credential characters.";
 
 /**
  * Three switches gate a CLI command (docs/cli-command-switches.md): 1 the
@@ -250,7 +250,31 @@ export async function runForwarderCliCommandResult(
   const pat = requireCliPat(deps.credential);
   const adapted = adaptCliCommandResultInput(input);
   const supervised = snapshotSupervisedCommand(adapted.commandId, deps.userId, pat.tokenId);
-  if (supervised !== null) return presentSupervisedCommand(supervised);
+  if (supervised !== null) {
+    if (supervised.requestKind === "file") {
+      return {
+        commandId: supervised.commandId,
+        kind: "supervised",
+        status: supervised.status,
+        started: supervised.started,
+        ...(supervised.waitDeadline !== null
+          ? { waitingUntil: new Date(supervised.waitDeadline).toISOString() }
+          : {}),
+        ...(supervised.file
+          ? { file: { op: supervised.file.op, result: projectFileToolOutput(supervised.file) } }
+          : {}),
+        ...(supervised.fileError
+          ? {
+              error: {
+                ...supervised.fileError,
+                message: FILE_ERROR_MESSAGES[supervised.fileError.code],
+              },
+            }
+          : {}),
+      };
+    }
+    return presentSupervisedCommand(supervised);
+  }
   const raw = await snapshotCliCommand(adapted.commandId, deps.userId, pat.tokenId);
   if (raw == null) throw new McpCliCommandRejectedError("not_found");
   const parsed = parseCliCommandSnapshot(raw, adapted.commandId);
