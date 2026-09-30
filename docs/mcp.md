@@ -229,7 +229,8 @@ mkdir/rmdir pair per file/symlink delete. Any recovery mkdir failure, including
 ENOSPC, EDQUOT or EMLINK, fails closed with `io_error` and leaves the file unchanged;
 free space with the shell. On macOS, a mode-000 file that cannot be held refuses
 with EACCES (`io_error`) before capture, with its public name unchanged. Linux's
-O_PATH hold is unaffected. Directories are never captured for delete: a held
+O_PATH hold is unaffected. On Unix targets other than Linux and macOS a symlink cannot
+be held, so deleting one there refuses the same way (`io_error`, nothing changed). Directories are never captured for delete: a held
 identity recheck is followed by rmdir by name. The kernel can remove only an
 empty directory, so this cannot destroy a concurrent save; at worst it removes
 a racer's empty directory. Non-empty directories are refused, and delete never

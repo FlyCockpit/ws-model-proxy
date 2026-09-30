@@ -16,7 +16,8 @@
 //! racer's saved contents cannot be removed. A file/symlink delete fails closed on
 //! ANY recovery mkdir failure (including ENOSPC/EDQUOT/EMLINK); free space using the
 //! shell. macOS mode-000 files may lack an openable Held and refuse EACCES before
-//! capture; Linux O_PATH is unaffected.
+//! capture; Linux O_PATH is unaffected. On Unix targets other than Linux and macOS a
+//! symlink cannot be held, so a symlink delete there refuses the same way.
 //!
 //! The vacant-name interval is a bounded number of syscalls, not a time promise:
 //! scheduler/network delays or a crash can extend it. Readers see ENOENT. Publication

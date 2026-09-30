@@ -470,6 +470,12 @@ fn exchangeless_replace_keeps_original_when_racer_creates_vacated_name() {
                 1,
                 "never capture the public racer"
             );
+            assert_eq!(
+                count(&FaultScope::calls(), Primitive::Restore)
+                    + count(&FaultScope::calls(), Primitive::RestoreLink),
+                0,
+                "a blocked name is not retried as a restore: the original is kept as is"
+            );
             no_public_temp(&fx);
         }
     }
