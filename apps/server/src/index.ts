@@ -21,6 +21,7 @@ import { startProviderBudgetRepair } from "./model-api/provider-budget-runtime.j
 import { startRelayTelemetryRecovery } from "./model-api/relay-telemetry-recovery.js";
 import { startUsageRetention } from "./model-api/usage-retention.js";
 import { warnMissingProviderCredentialKeyring } from "./provider-keyring-startup.js";
+import { flushCliAgentAudit, stopCliAgentAuditWriter } from "./relay/cli-agent-audit.js";
 import { sweepExpiredTokenCommands } from "./relay/cli-commands.js";
 import { RELAY_SUBPROTOCOL, RELAY_WS_MAX_PAYLOAD_BYTES } from "./relay/protocol.js";
 import { relaySessionManager } from "./relay/session-manager.js";
@@ -187,6 +188,7 @@ const stopRelayMaintenance = startRelayMaintenance({
   relaySessions: relaySessionManager,
   sweepExpiredTokenCommands,
   terminalHub: terminalBrowserHub,
+  stopCliAgentAudit: stopCliAgentAuditWriter,
 });
 
 // ---------------------------------------------------------------------------
@@ -212,6 +214,7 @@ installServerShutdown({
   stopUserDeletionSweep,
   userDeletionSweepClient,
   relaySessions: relaySessionManager,
+  flushAgentAudit: flushCliAgentAudit,
   terminalHub: terminalBrowserHub,
   server,
   capacityLifecycle,

@@ -35,6 +35,7 @@ fails the suite when a leaf is unclassified.
 | `capacityManagement.updateDirectPolicy` | `capacity_direct_policy_update` | write | — | pure | — | — | — |
 | `capacityManagement.updateMemberPolicy` | `capacity_member_policy_update` | write | — | pure | — | — | — |
 | `capacityManagement.updatePoolPolicy` | `capacity_pool_policy_update` | write | — | pure | — | — | — |
+| `cliAgentActivity.list` | `forwarder_cli_activity_list` | read | — | pure | — | — | — |
 | `cliCredentials.approveDeviceLogin` | — (excluded) | — | — | — | — | — | Human-only browser approval of a `wsmp login`: an agent must never grant a CLI credential. |
 | `cliCredentials.createToken` | — (excluded) | — | — | — | — | — | Returns the one-time raw token secret. |
 | `cliCredentials.deviceLoginRequest` | — (excluded) | — | — | — | — | — | Browser device-login approval page read; not an MCP surface. |
@@ -75,6 +76,7 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.setCliDeviceFeatureGrants` | — (excluded) | — | — | — | — | — | human-only device grant |
 | `forwarderManagement.setCliDeviceMetricSources` | `forwarder_device_metric_sources_set` | write | RUN | external | — | — | — |
 | `forwarderManagement.setDiscoveredModelCapabilityProfile` | `forwarder_model_capability_profile_set` | write | — | pure | — | — | — |
+| `forwarderManagement.setPoolMemberEngineLoad` | `forwarder_pool_member_engine_load_set` | write | RUN | cost | — | — | — |
 | `forwarderManagement.setPoolRoutingRules` | `forwarder_pool_routing_rules_set` | write | RUN | cost | — | — | — |
 | `forwarderManagement.updateDiscoveredModelAttachmentLimit` | `forwarder_model_attachment_limit_update` | write | — | pure | — | — | — |
 | `forwarderManagement.updateDiscoveredModelCapabilities` | `forwarder_model_capabilities_update` | write | — | pure | — | — | — |

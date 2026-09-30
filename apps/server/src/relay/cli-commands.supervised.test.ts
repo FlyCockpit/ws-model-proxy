@@ -21,10 +21,15 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES: 0,
     MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
     MODEL_API_TRANSCRIPTION_STALE_SPOOL_MS: 24 * 60 * 60 * 1000,
+    BETTER_AUTH_SECRET: "test-better-auth-secret-value-32chars!",
   },
 }));
 
+vi.mock("./cli-agent-audit.js", () => ({ recordCliAgentAction: vi.fn() }));
+
 const { default: prisma } = await import("@ws-model-proxy/db");
+const { recordCliAgentAction } = await import("./cli-agent-audit.js");
+const audit = recordCliAgentAction as unknown as MockInstance;
 const { relaySessionManager, registerTerminalBridge } = await import("./session-manager.js");
 const {
   cancelCommandsForToken,
@@ -1107,6 +1112,24 @@ describe("supervised commands", () => {
       });
       await expect(start()).resolves.toMatchObject({ ok: true });
     });
+
+    it("maps an unknown CLI-side rejection reason to the fallback", async () => {
+      const socket = await connect();
+      // `reason` is a stable machine code, never free text: the wire accepts
+      // any string, so a nonconforming CLI's free text must not
+      // reach the stored rejection reason.
+      const request = await started();
+      await say(socket, {
+        type: "supervised.rejected",
+        commandId: request.commandId,
+        reason: "unknown-code-9f3a",
+      });
+      expect(snapshot(request.commandId)).toMatchObject({
+        status: "rejected",
+        rejectionReason: "rejected",
+      });
+      expect(JSON.stringify(snapshot(request.commandId))).not.toContain("unknown-code-9f3a");
+    });
   });
 
   describe("policy", () => {
@@ -1309,6 +1332,165 @@ describe("supervised commands", () => {
           browserNonce: Buffer.alloc(16, 4).toString("base64url"),
         }),
       ).toEqual({ ok: false, error: "not_found" });
+    });
+  });
+
+  describe("agent audit events", () => {
+    function events() {
+      return audit.mock.calls.map(([event]) => event as Record<string, unknown>);
+    }
+
+    it("records one supervised_command event per terminal outcome, without command output", async () => {
+      const socket = await connect();
+      // exited (with shared output)
+      const ran = await spawnedAndAccepted(socket, { command: "make TOKEN_KEY=hunter2hunter2" });
+      output(socket, ran.commandId, "head", encode("OUTPUT-SENTINEL-1"));
+      await say(socket, {
+        type: "supervised.done",
+        commandId: ran.commandId,
+        exitCode: 2,
+        review: false,
+      });
+      await say(socket, { type: "term.exit", terminalId: ran.terminalId, exitCode: 2 });
+      // declined
+      const declined = await started();
+      await say(socket, { type: "term.spawned", ...declined });
+      await say(socket, { type: "supervised.declined", commandId: declined.commandId });
+      await say(socket, { type: "term.exit", terminalId: declined.terminalId });
+      // revoked while waiting
+      await started();
+      cancelCommandsForToken("token-a");
+
+      expect(events().map((event) => [event.kind, event.outcome, event.reason])).toEqual([
+        ["supervised_command", "completed", "exit:2"],
+        ["supervised_command", "declined", "not_started"],
+        ["supervised_command", "cancelled", "token_revoked"],
+      ]);
+      expect(events()[0]).toMatchObject({
+        userId: "user-id",
+        cliDeviceId: "desktop",
+        mcpTokenId: "token-a",
+      });
+      expect(String(events()[0]?.path)).toMatch(/^hmac-sha256:[0-9a-f]{64} make$/);
+      const serialized = JSON.stringify(events());
+      expect(serialized).not.toContain("hunter2");
+      expect(serialized).not.toContain("TOKEN_KEY");
+      expect(serialized).not.toContain("OUTPUT-SENTINEL-1");
+      // The agent's stated reason is free text: it is not stored.
+      expect(serialized).not.toContain("sudo password");
+    });
+
+    it("stores ? as the program of an oversized refused command, never a cut path component", async () => {
+      await connect();
+      db.cliDevice.findUnique.mockResolvedValueOnce(null);
+      const command = `${"/".repeat(16_384 - "AUDIT_DIRECTORY".length)}AUDIT_DIRECTORY/git ARG`;
+      await start({ command });
+      expect(String(events()[0]?.path)).toMatch(/^hmac-sha256:[0-9a-f]{64} \?$/);
+      expect(JSON.stringify(events())).not.toContain("AUDIT_DIRECTORY");
+    });
+
+    it("stores an unknown device for a token_inactive refusal raised before the ownership check", async () => {
+      await connect();
+      await start({ expiresAt: new Date(Date.now() - 1), cliDeviceId: "NAME=AUDIT_MARKER" });
+      expect(events()).toHaveLength(1);
+      expect(events()[0]).toMatchObject({ reason: "token_inactive", cliDeviceId: "unknown" });
+      expect(JSON.stringify(events())).not.toContain("AUDIT_MARKER");
+    });
+
+    it("stores an unknown device, never the request's text, when the device is not verified", async () => {
+      await connect();
+      db.cliDevice.findUnique.mockResolvedValueOnce(null);
+      await start({ cliDeviceId: "NAME=AUDIT_MARKER" });
+      expect(events()).toHaveLength(1);
+      expect(events()[0]).toMatchObject({ reason: "not_found", cliDeviceId: "unknown" });
+      expect(JSON.stringify(events())).not.toContain("AUDIT_MARKER");
+    });
+
+    it("records a failed internal_error once and rethrows when admission throws", async () => {
+      await connect();
+      const boom = new TypeError("admission read failed");
+      db.cliDevice.findUnique.mockRejectedValueOnce(boom);
+      await expect(start()).rejects.toBe(boom);
+      expect(events().map((event) => [event.kind, event.outcome, event.reason])).toEqual([
+        ["supervised_command", "failed", "internal_error"],
+      ]);
+      expect(events()[0]).toMatchObject({
+        userId: "user-id",
+        cliDeviceId: "unknown",
+        mcpTokenId: "token-a",
+      });
+    });
+
+    it("records a signalled supervised.done as signal:<name>", async () => {
+      const socket = await connect();
+      const request = await spawnedAndAccepted(socket);
+      await say(socket, {
+        type: "supervised.done",
+        commandId: request.commandId,
+        signal: "SIGKILL",
+        review: false,
+      });
+      await say(socket, { type: "term.exit", terminalId: request.terminalId, signal: "SIGKILL" });
+      expect(events().map((event) => [event.outcome, event.reason])).toEqual([
+        ["completed", "signal:SIGKILL"],
+      ]);
+    });
+
+    it("stores an unknown supervised.done signal as signal:unknown", async () => {
+      const socket = await connect();
+      const request = await spawnedAndAccepted(socket);
+      await say(socket, {
+        type: "supervised.done",
+        commandId: request.commandId,
+        signal: "AUDIT_MARKER",
+        review: false,
+      });
+      await say(socket, {
+        type: "term.exit",
+        terminalId: request.terminalId,
+        signal: "AUDIT_MARKER",
+      });
+      expect(events().map((event) => [event.outcome, event.reason])).toEqual([
+        ["completed", "signal:unknown"],
+      ]);
+      expect(JSON.stringify(events())).not.toContain("AUDIT_MARKER");
+    });
+
+    it("never stores raw command text: a secret-bearing argument row holds only the program", async () => {
+      const socket = await connect();
+      const request = await spawnedAndAccepted(socket, {
+        command: "curl -H 'Authorization: Bearer sk-secret-9' https://x",
+      });
+      await say(socket, { type: "supervised.done", commandId: request.commandId, review: false });
+      await say(socket, { type: "term.exit", terminalId: request.terminalId, exitCode: 0 });
+      const serialized = JSON.stringify(events());
+      for (const leak of ["sk-secret-9", "https://x", "Authorization", "Bearer"])
+        expect(serialized, `row leaks ${leak}`).not.toContain(leak);
+      expect(String(events()[0]?.path)).toMatch(/^hmac-sha256:[0-9a-f]{64} curl$/);
+    });
+
+    it("records an unanswered confirm as expired, and each refusal", async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      const socket = await connect();
+      const request = await started();
+      await say(socket, { type: "term.spawned", ...request });
+      await vi.advanceTimersByTimeAsync(SUPERVISED_CONFIRM_TTL_MS);
+      expect(events()).toEqual([]);
+      await say(socket, { type: "supervised.declined", commandId: request.commandId });
+      await say(socket, { type: "term.exit", terminalId: request.terminalId });
+      expect(events().map((event) => [event.outcome, event.reason])).toEqual([
+        ["expired", "not_started"],
+      ]);
+      await start({ cliDeviceId: "missing" });
+      await start({ command: "\0" });
+      expect(
+        events()
+          .slice(1)
+          .map((event) => [event.outcome, event.reason]),
+      ).toEqual([
+        ["refused", "not_found"],
+        ["refused", "invalid_command"],
+      ]);
     });
   });
 });

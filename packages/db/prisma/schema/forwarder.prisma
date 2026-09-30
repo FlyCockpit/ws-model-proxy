@@ -1146,6 +1146,12 @@ model PoolMember {
   nextRetryAt                  DateTime?
   halfOpenTrialStartedAt       DateTime?
   lastRoutedAt                 DateTime?
+  /// S-D: AUTO lets live engine load (`endpoint.load`) mark this member FULL
+  /// (per the capacity's engine kind); OFF ignores engine load for it.
+  engineLoadMode               EngineLoadMode          @default(AUTO)
+  /// KV usage fraction (0-1] at which a vLLM/SGLang member counts as FULL.
+  /// Null = the default (0.95).
+  kvFullThreshold              Float?
   ModelPool                    ModelPool               @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   DiscoveredModel              DiscoveredModel?        @relation(fields: [discoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTarget              ExecutionTarget?        @relation(fields: [executionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
@@ -1297,6 +1303,10 @@ model PoolMemberRoutingVerdict {
   verdict      MetricRoutingVerdict
   /// Per rule (by index): `triggered`, `clear` or `stale`.
   ruleStates   Json
+  /// S-D live engine load reading behind the verdict: `off`, `none` (no
+  /// engine signal), `stale`, `clear`, `full_waiting`, `full_kv`,
+  /// `full_slots` or `full_deferred`. FULL from load is folded into `verdict`.
+  engineState  String               @default("none")
   evaluatedAt  DateTime
   /// The evaluation state that wrote this row. Together with `evaluatedAt` it
   /// orders writers: a write replaces a row only when it is strictly newer or
@@ -1309,6 +1319,11 @@ model PoolMemberRoutingVerdict {
   @@index([poolId])
   @@index([expiresAt])
   @@map("pool_member_routing_verdict")
+}
+
+enum EngineLoadMode {
+  AUTO
+  OFF
 }
 
 enum MetricRoutingVerdict {
