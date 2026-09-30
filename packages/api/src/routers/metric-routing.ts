@@ -9,7 +9,15 @@ import { z } from "zod";
 import type { LiveNodeTelemetrySnapshot } from "../context";
 import { protectedProcedure } from "../index";
 import {
+  DEFAULT_KV_FULL_THRESHOLD,
+  effectiveKvFullThreshold,
+  engineHasLoadSignal,
+  engineKindFromDb,
+  evaluateEngineLoad,
+} from "../lib/engine-load";
+import {
   describeSeries,
+  ENDPOINT_LOAD_STALE_AFTER_MS,
   type EndpointLoadSample,
   endpointLoadSeries,
   type MetricSeries,
@@ -17,6 +25,7 @@ import {
   parseNodeMetricsSample,
   parseStoredRemoteMetricSources,
   parseStoredRoutingRules,
+  pickEndpointLoad,
   type RemoteMetricSourceDefinition,
   remoteMetricSourceDefinitionsSchema,
   routingRulesSchema,
@@ -56,6 +65,9 @@ function liveEndpointLoad(live: LiveNodeTelemetrySnapshot | null): EndpointLoadS
     kvUsage: load.kvUsage,
     slotsBusy: load.slotsBusy,
     deferred: load.deferred,
+    waitingStreak: load.waitingStreak,
+    prefixCacheHitsTotal: load.prefixCacheHitsTotal,
+    prefixCacheQueriesTotal: load.prefixCacheQueriesTotal,
     receivedAt: load.receivedAt,
   }));
 }
@@ -95,8 +107,15 @@ export const metricRoutingProcedures = {
             orderBy: { createdAt: "asc" },
             select: {
               id: true,
+              engineLoadMode: true,
+              kvFullThreshold: true,
               DiscoveredModel: { select: memberModelSelect },
-              ExecutionTarget: { select: { DiscoveredModel: { select: memberModelSelect } } },
+              ExecutionTarget: {
+                select: {
+                  InferenceCapacity: { select: { engineKind: true, engineSlots: true } },
+                  DiscoveredModel: { select: memberModelSelect },
+                },
+              },
             },
           },
         },
@@ -105,8 +124,21 @@ export const metricRoutingProcedures = {
       const rules = parseStoredRoutingRules(pool.routingRules);
       const members = pool.PoolMembers.flatMap((member) => {
         const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
-        return model ? [{ id: member.id, model }] : [];
+        return model
+          ? [
+              {
+                id: member.id,
+                model,
+                engineLoadMode: member.engineLoadMode,
+                kvFullThreshold: member.kvFullThreshold,
+                capacity: member.ExecutionTarget?.InferenceCapacity ?? null,
+              },
+            ]
+          : [];
       });
+      // Clears retain NONE rows as successor fences. Their ruleStates and
+      // engineState remain historical snapshots until the member is rewritten;
+      // the expiry check below and live engine evaluation still apply.
       const verdicts = await prisma.poolMemberRoutingVerdict.findMany({
         where: { poolId: pool.id, poolMemberId: { in: members.map((member) => member.id) } },
       });
@@ -147,6 +179,22 @@ export const metricRoutingProcedures = {
             ? verdict.ruleStates.filter((state): state is string => typeof state === "string")
             : [];
           const snapshot = live?.get(member.model.Endpoint.cliDeviceId) ?? null;
+          const memberRef = {
+            endpointSlug: member.model.Endpoint.slug,
+            modelSlug: member.model.slug ?? null,
+          };
+          const reading = pickEndpointLoad(liveEndpointLoad(snapshot), memberRef);
+          const engineKind = engineKindFromDb(member.capacity?.engineKind);
+          const engineVerdict = evaluateEngineLoad(
+            {
+              engineKind,
+              engineSlots: member.capacity?.engineSlots ?? null,
+              mode: member.engineLoadMode === "OFF" ? "OFF" : "AUTO",
+              kvFullThreshold: member.kvFullThreshold,
+            },
+            reading ? { ...reading, waitingStreak: reading.waitingStreak ?? 0 } : null,
+            now,
+          );
           return {
             poolMemberId: member.id,
             upstreamModelId: member.model.upstreamModelId,
@@ -162,6 +210,37 @@ export const metricRoutingProcedures = {
             ruleStates: verdict ? ruleStates : [],
             evaluatedAt: verdict?.evaluatedAt ?? null,
             expiresAt: verdict?.expiresAt ?? null,
+            /**
+             * Live engine load (S-D). `state` is this process's own reading;
+             * `snapshotState` is what the shared verdict row last recorded.
+             * `mode` off ignores engine load for the member.
+             */
+            engineLoad: {
+              mode: member.engineLoadMode === "OFF" ? ("off" as const) : ("auto" as const),
+              kvFullThreshold: member.kvFullThreshold,
+              effectiveKvFullThreshold: effectiveKvFullThreshold(member.kvFullThreshold),
+              engineKind,
+              engineSlots: member.capacity?.engineSlots ?? null,
+              hasSignal: engineHasLoadSignal(engineKind),
+              state: engineVerdict.state,
+              full: engineVerdict.full,
+              snapshotState: verdict && !expired ? verdict.engineState : null,
+              live: reading
+                ? {
+                    running: reading.running,
+                    waiting: reading.waiting,
+                    kvUsage: reading.kvUsage ?? null,
+                    slotsBusy: reading.slotsBusy ?? null,
+                    deferred: reading.deferred ?? null,
+                    waitingStreak: reading.waitingStreak ?? 0,
+                    ageSeconds: Math.round((now.getTime() - reading.receivedAt.getTime()) / 1000),
+                    stale:
+                      now.getTime() - reading.receivedAt.getTime() > ENDPOINT_LOAD_STALE_AFTER_MS,
+                    prefixCacheHits: reading.prefixCacheHitsTotal ?? 0,
+                    prefixCacheQueries: reading.prefixCacheQueriesTotal ?? 0,
+                  }
+                : null,
+            },
             endpointSeries: describeSeries(
               endpointLoadSeries(
                 liveEndpointLoad(snapshot),
@@ -182,14 +261,14 @@ export const metricRoutingProcedures = {
    * Replace a pool's routing rules. `full` makes a member FULL (the request
    * queues, goes to another member, or goes external for `:external`
    * callers); `avoid` ranks it last. Stale or missing metrics are ignored.
-   * The pool's stored verdicts are cleared so the new rules apply at the
+   * The pool's stored gating (FULL and AVOID) verdicts are cleared so the new rules apply at the
    * device's next metrics frame.
    */
   setPoolRoutingRules: protectedProcedure
     .input(z.object({ poolId: idSchema, rules: routingRulesSchema }))
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
-      // One graph statement (a non-key JSON column). The stored verdicts are
+      // One graph statement (a non-key JSON column). The stored gating verdicts are
       // H-class rows: they are cleared afterwards by the relay (H module),
       // never by this M writer.
       const updated = await prisma.modelPool.updateMany({
@@ -201,6 +280,53 @@ export const metricRoutingProcedures = {
       }
       await context.services?.onPoolRoutingRulesChanged?.(input.poolId);
       return { poolId: input.poolId, rules: input.rules };
+    }),
+
+  /**
+   * Per-member live engine load override (S-D). `auto` lets the engine's live
+   * load (`endpoint.load`) mark the member FULL; `off` ignores it. The optional
+   * `kvFullThreshold` (0-1) overrides the 0.95 default for vLLM/SGLang; null
+   * clears it. The relay (H) clears the pool's stored gating verdicts (NONE fences stay). A changed
+   * override invalidates this member's cache in every process, so it is
+   * re-published at the device's next evaluation. Unchanged siblings follow
+   * the regular refresh budget when their session is on another process.
+   */
+  setPoolMemberEngineLoad: protectedProcedure
+    .input(
+      z.object({
+        poolMemberId: idSchema,
+        mode: z.enum(["auto", "off"]),
+        kvFullThreshold: z.number().gt(0).max(1).nullable().optional(),
+      }),
+    )
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      // One graph statement (non-key columns): no capacity lock is held or
+      // taken. The stored gating verdicts are H-class rows: the relay clears them
+      // afterwards (`onPoolRoutingRulesChanged`), never this M writer.
+      const updated = await prisma.poolMember.updateMany({
+        where: { id: input.poolMemberId, ModelPool: { userId } },
+        data: {
+          engineLoadMode: input.mode === "off" ? "OFF" : "AUTO",
+          ...(input.kvFullThreshold !== undefined
+            ? { kvFullThreshold: input.kvFullThreshold }
+            : {}),
+        },
+      });
+      if (updated.count === 0) {
+        throw new ORPCError("NOT_FOUND", { message: "Pool member not found." });
+      }
+      const member = await prisma.poolMember.findFirst({
+        where: { id: input.poolMemberId, ModelPool: { userId } },
+        select: { id: true, poolId: true, engineLoadMode: true, kvFullThreshold: true },
+      });
+      if (member) await context.services?.onPoolRoutingRulesChanged?.(member.poolId);
+      return {
+        poolMemberId: input.poolMemberId,
+        mode: member?.engineLoadMode === "OFF" ? ("off" as const) : ("auto" as const),
+        kvFullThreshold: member?.kvFullThreshold ?? null,
+        defaultKvFullThreshold: DEFAULT_KV_FULL_THRESHOLD,
+      };
     }),
 
   /**

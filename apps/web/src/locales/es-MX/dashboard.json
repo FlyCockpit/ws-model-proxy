@@ -1009,6 +1009,33 @@
       "summary": "Parte protegida: {{protection}} · Prioridad en la cola: {{priority}}",
       "saved": "Ajustes de enrutamiento guardados.",
       "failed": "No se pudieron guardar los ajustes de enrutamiento."
+    },
+    "engineLoad": {
+      "title": "Carga en vivo del motor",
+      "description": "Los motores que reportan carga (llama.cpp, vLLM, SGLang) pueden marcar un miembro como LLENO según lo que ven ahora, incluido el tráfico que no pasa por el proxy. Solo suma a LLENO: los conteos de capacidad siguen mandando, una lectura vencida se ignora y, cuando todos los miembros están LLENOS, las solicitudes se siguen atendiendo.",
+      "use": "Usar carga del motor",
+      "saved": "Configuración de carga del motor guardada",
+      "saveFailed": "No se pudo guardar la configuración de carga del motor.",
+      "badges": {
+        "off": "Carga del motor ignorada",
+        "noSignal": "Sin señal del motor",
+        "stale": "Carga vencida",
+        "clear": "El motor tiene espacio"
+      },
+      "states": {
+        "full_waiting": "Motor LLENO: solicitudes en espera",
+        "full_kv": "Motor LLENO: caché KV casi llena",
+        "full_slots": "Motor LLENO: todos los slots ocupados",
+        "full_deferred": "Motor LLENO: solicitudes diferidas"
+      },
+      "running_one": "{{count}} en ejecución",
+      "running_other": "{{count}} en ejecución",
+      "waiting_one": "{{count}} en espera",
+      "waiting_other": "{{count}} en espera",
+      "kv": "KV {{value}}",
+      "slots": "{{busy}}/{{total}} slots",
+      "prefixHit": "aciertos de prefijo {{value}}",
+      "noReading": "Aún no hay lectura del motor."
     }
   },
   "providers": {

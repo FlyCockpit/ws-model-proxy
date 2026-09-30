@@ -3033,6 +3033,64 @@ describe("relay 2.7 telemetry", () => {
     manager.dispose();
   });
 
+  const waitingLoad = (waiting: number, extra: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      type: "endpoint.load",
+      endpointSlug: "vllm",
+      running: 4,
+      waiting,
+      source: "vllm-metrics",
+      ts: "2026-01-01T00:00:00.000Z",
+      ...extra,
+    });
+  const liveLoad = (manager: InstanceType<typeof RelaySessionManager>) =>
+    manager.getLiveNodeTelemetry(["cli-device-id"]).get("cli-device-id")?.endpointLoad[0];
+
+  it("counts consecutive accepted waiting frames; zero or a gap resets the streak (S-D)", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, waitingLoad(2), now);
+    expect(liveLoad(manager)?.waitingStreak).toBe(1);
+    // A frame dropped by the 1 s limiter does not count.
+    await manager.handleTextFrame(socket, waitingLoad(2), at(500));
+    expect(liveLoad(manager)?.waitingStreak).toBe(1);
+    await manager.handleTextFrame(socket, waitingLoad(1), at(3_000));
+    expect(liveLoad(manager)?.waitingStreak).toBe(2);
+    await manager.handleTextFrame(socket, waitingLoad(3), at(6_000));
+    expect(liveLoad(manager)?.waitingStreak).toBe(3);
+    await manager.handleTextFrame(socket, waitingLoad(0), at(9_000));
+    expect(liveLoad(manager)?.waitingStreak).toBe(0);
+    await manager.handleTextFrame(socket, waitingLoad(2), at(12_000));
+    expect(liveLoad(manager)?.waitingStreak).toBe(1);
+    // A gap longer than the staleness window restarts the count (fail open).
+    await manager.handleTextFrame(socket, waitingLoad(2), at(12_000 + 16_000));
+    expect(liveLoad(manager)?.waitingStreak).toBe(1);
+    manager.dispose();
+  });
+
+  it("accumulates prefix cache deltas per key, including those of rate-limited frames (S-D)", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(
+      socket,
+      waitingLoad(0, { prefixCacheHitsDelta: 10, prefixCacheQueriesDelta: 40 }),
+      now,
+    );
+    await manager.handleTextFrame(
+      socket,
+      waitingLoad(0, { prefixCacheHitsDelta: 5, prefixCacheQueriesDelta: 5 }),
+      at(200),
+    );
+    await manager.handleTextFrame(
+      socket,
+      waitingLoad(0, { prefixCacheHitsDelta: 1, prefixCacheQueriesDelta: 2 }),
+      at(3_000),
+    );
+    expect(liveLoad(manager)).toMatchObject({
+      prefixCacheHitsTotal: 16,
+      prefixCacheQueriesTotal: 47,
+    });
+    manager.dispose();
+  });
+
   it("bounds the endpoint load keys a session keeps", async () => {
     const { ENDPOINT_LOAD_MAX_KEYS } = await import("./session-manager.js");
     const { manager, socket } = await registered();
@@ -3219,7 +3277,7 @@ describe("relay 2.7 telemetry", () => {
     const manager = new RelaySessionManager();
     await manager.onPoolRoutingRulesChanged("pool-1");
     expect(deep.poolMemberRoutingVerdict.deleteMany).toHaveBeenCalledWith({
-      where: { poolId: "pool-1" },
+      where: { poolId: "pool-1", verdict: { not: "NONE" } },
     });
     manager.dispose();
   });
@@ -3324,6 +3382,125 @@ describe("relay 2.7 telemetry", () => {
           userId: "user-id",
         }),
       });
+      manager.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("evaluates pool routing on an endpoint.load frame and writes the engine-load verdict (S-D)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const deep = prisma as unknown as {
+        poolMember: { findMany: MockInstance };
+        modelPool: { findMany: MockInstance };
+        poolMemberRoutingVerdict: { updateMany: MockInstance; create: MockInstance };
+      };
+      deep.modelPool.findMany.mockResolvedValue([]);
+      deep.poolMember.findMany.mockResolvedValue([
+        {
+          id: "member-1",
+          poolId: "pool-1",
+          engineLoadMode: "AUTO",
+          kvFullThreshold: null,
+          ModelPool: { routingRules: [] },
+          DiscoveredModel: null,
+          ExecutionTarget: {
+            InferenceCapacity: { engineKind: "VLLM", engineSlots: null },
+            DiscoveredModel: { slug: null, Endpoint: { slug: "vllm" } },
+          },
+        },
+      ]);
+      deep.poolMemberRoutingVerdict.updateMany.mockResolvedValue({ count: 0 });
+      deep.poolMemberRoutingVerdict.create.mockResolvedValue({});
+      const { manager, socket } = await registered();
+      // The first accepted waiting frame is streak 1: below the sustained
+      // threshold, the evaluation publishes only the successor NONE fence.
+      await manager.handleTextFrame(socket, waitingLoad(2), now);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deep.poolMemberRoutingVerdict.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({ verdict: "NONE", engineState: "clear" }),
+      });
+      // A second accepted frame within the staleness window makes streak 2.
+      vi.setSystemTime(at(3_000));
+      await manager.handleTextFrame(socket, waitingLoad(2), at(3_000));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(deep.poolMemberRoutingVerdict.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          poolMemberId: "member-1",
+          verdict: "FULL",
+          engineState: "full_waiting",
+          cliDeviceId: "cli-device-id",
+          userId: "user-id",
+        }),
+      });
+      manager.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not schedule an evaluation for an endpoint.load frame the limiter drops (S-D)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const deep = prisma as unknown as {
+        poolMember: { findMany: MockInstance };
+        modelPool: { findMany: MockInstance };
+      };
+      deep.poolMember.findMany.mockResolvedValue([]);
+      deep.modelPool.findMany.mockResolvedValue([]);
+      // The recovery scheduler also reads poolMember on its own timer; the
+      // routing evaluation is the only reader filtering on `tier`.
+      const routingRuns = () =>
+        deep.poolMember.findMany.mock.calls.filter(
+          (call) => (call[0] as { where?: { tier?: string } }).where?.tier === "PRIMARY",
+        ).length;
+      const { manager, socket } = await registered();
+      await manager.handleTextFrame(socket, waitingLoad(2), now);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(routingRuns()).toBe(1);
+      // Inside the 1 s limiter the frame is dropped: no evaluation now and no
+      // trailing one either, so advancing past the window changes nothing.
+      await manager.handleTextFrame(socket, waitingLoad(2), at(500));
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(routingRuns()).toBe(1);
+      manager.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a replaced session runs no pending evaluation after its successor's hello (S-D)", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      const deep = prisma as unknown as {
+        poolMember: { findMany: MockInstance };
+        modelPool: { findMany: MockInstance };
+      };
+      deep.poolMember.findMany.mockResolvedValue([]);
+      deep.modelPool.findMany.mockResolvedValue([]);
+      const routingRuns = () =>
+        deep.poolMember.findMany.mock.calls.filter(
+          (call) => (call[0] as { where?: { tier?: string } }).where?.tier === "PRIMARY",
+        ).length;
+      const { manager, socket } = await registered();
+      await manager.handleTextFrame(socket, waitingLoad(2), now);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(routingRuns()).toBe(1);
+      // A second frame inside the 1 s window leaves a trailing run pending.
+      vi.setSystemTime(at(1_100));
+      await manager.handleTextFrame(socket, waitingLoad(2), at(1_100));
+      // The CLI reconnects before the old socket closed: the old session is
+      // replaced and its pending run must never publish over the successor.
+      const successor = new FakeSocket();
+      manager.acceptAuthenticatedSocket({ socket: successor, identity, now: at(1_100) });
+      await manager.handleTextFrame(successor, helloFrame(), at(1_100));
+      expect(socket.closes).toEqual([{ code: 1000, reason: "replaced" }]);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(routingRuns()).toBe(1);
       manager.dispose();
     } finally {
       vi.useRealTimers();
