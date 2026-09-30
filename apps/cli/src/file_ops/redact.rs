@@ -497,6 +497,18 @@ fn value_line_construct(line: &str) -> Construct {
     }
 }
 
+/// A block-scalar header (`key: |`, `key: >- # note`) whose secret-name token sits
+/// in its trailing comment: the header itself opens the block, whatever the line
+/// above held. Narrow on purpose: a `- name: Use API_KEY` step header opens nothing.
+fn header_block_before(line: &str, name_start: usize) -> Option<Construct> {
+    let colon = line.find(':').filter(|c| *c < name_start)?;
+    (key_like(&line[..colon]) && BLOCK_SCALAR.is_match(line[colon + 1..].trim())).then(|| {
+        Construct::Block {
+            line_indent: indent_of(line),
+        }
+    })
+}
+
 /// Whether `before` (the text before a colon) is a YAML/JSON-style key: an optional
 /// list dash, then an identifier-like word, possibly quoted.
 fn key_like(before: &str) -> bool {
@@ -905,6 +917,7 @@ impl LineMasker {
             }
             if let Some(name) = first_secret_name(line) {
                 constructs.push(construct_after_name(line, name.end));
+                constructs.extend(header_block_before(line, name.start));
                 if self.pending_token_line {
                     // this is also the value's line after a token line (`value: | # API_KEY
                     // is injected`): its own multi-line opener is kept next to the token's
@@ -1245,6 +1258,16 @@ mod tests {
                 "password flag, literal block item with a token comment",
                 "args:\n  - --password\n  - | # DB_PASSWORD comes from deployment\n    line-one\n    probe-line-two\nnext: 1\n",
                 "probe-line-two",
+            ),
+            (
+                "block header whose token is only in its trailing comment",
+                "stringData:\n  pgpass: | # holds the DB_PASSWORD\n    line-one\n    probe-line-two\nnext: 1\n",
+                "probe-line-two",
+            ),
+            (
+                "actions env header with a token comment",
+                "env:\n  NPMRC: | # auth for NPM_TOKEN\n    line-one\n    probe-line-two\n\n    probe-after-blank\nnext: 1\n",
+                "probe-after-blank",
             ),
             (
                 "flag block item with a token comment",
