@@ -826,10 +826,12 @@ event, including admission refusals; they do not also record a headless file
 event. Its path is the requested path (the source for rename), its reason is
 `<op>:<code>` (`write:completed`, `edit:conflict`, etc.), and available etags and
 write byte counts are metadata. Accepted writes whose apply deadline or session
-loss leaves the result uncertain record `unknown`; a reported file error records
-`failed`, a spawn/admission rejection `refused`, and a CLI-acknowledged confirm
-expiry or decline records `expired` or `declined`. Before acceptance, revocation,
-policy changes and session loss record `cancelled`. Headless file operations retain their per-tool
+loss leaves the result uncertain record `unknown`, and so does any dispatched
+request the server ends (revocation, policy change, session loss, confirm expiry)
+before the CLI has authoritatively settled it. A file error the CLI reports before
+acceptance records `failed`, a spawn/admission rejection `refused`, and a
+CLI-acknowledged confirm expiry or decline records `expired` or `declined`;
+requests never dispatched to the CLI record `cancelled` or `refused`. Headless file operations retain their per-tool
 `file_*` kinds and use `<code>` for their reason. Both reason shapes are returned
 by `forwarder_cli_activity_list`. Unverified device ids are stored as `unknown`. The
 log is **metadata only**: who (user, device, token), what (kind, and for a

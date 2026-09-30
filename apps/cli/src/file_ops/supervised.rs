@@ -481,7 +481,7 @@ fn precheck_paths(ops: &FileOps, op: &str, raw: Value) -> FileResult<()> {
         let path = super::resolve::expand(&path)?;
         // Physical resolution and inode policy belong on the blocked screen.
         // Only lexical path refusals can precede the person's dismissal key.
-        match ops.policy.check_path(access, &path) {
+        match ops.policy.check_path_lexical(access, &path) {
             Err(error) if matches!(error.code, ErrorCode::PathDenied | ErrorCode::SecretFile) => {
                 return Err(error);
             }

@@ -324,7 +324,8 @@ describe("cli file ops", () => {
                 ? null
                 : mode === "supervised"
                   ? // A supervised write never rides a headless file.op: the tool layer starts a
-                    // supervised terminal request instead (P5), so the headless runner refuses it.
+                    // supervised terminal request instead (P5). This fake CLI reports no terminal
+                    // support, so that route answers `unsupported`.
                     op === "edit"
                     ? "unsupported"
                     : "supervised_only"

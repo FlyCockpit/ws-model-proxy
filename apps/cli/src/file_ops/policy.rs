@@ -110,8 +110,23 @@ impl Policy {
         Ok(())
     }
 
-    /// Decide on the physical path `full`.
+    /// Decide on the physical path `full`: the lexical policy plus, on Linux
+    /// with configured roots, the kernel root guard (which reads the disk).
     pub fn check_path(&self, access: Access, full: &Path) -> FileResult<()> {
+        self.check_path_with(access, full, true)
+    }
+
+    /// The path-text part of [`Self::check_path`] only: it never touches the
+    /// filesystem, so its verdict depends on the request alone. The supervised
+    /// pre-display refusal uses this so an agent learns nothing about the disk
+    /// (a file where a parent is expected, a symlink out of the roots, an
+    /// unavailable root) before a person has pressed a key; the kernel guard
+    /// runs at physical resolution and again at apply.
+    pub(crate) fn check_path_lexical(&self, access: Access, full: &Path) -> FileResult<()> {
+        self.check_path_with(access, full, false)
+    }
+
+    fn check_path_with(&self, access: Access, full: &Path, kernel_guard: bool) -> FileResult<()> {
         if full.to_str().is_none() {
             return Err(FileError::invalid("path is not valid UTF-8"));
         }
@@ -137,7 +152,9 @@ impl Policy {
                 "path is outside the configured file roots",
             ));
         }
-        self.check_beneath(full)?;
+        if kernel_guard {
+            self.check_beneath(full)?;
+        }
         for entry in &self.protected {
             let inside = full == entry.path || (entry.subtree && full.starts_with(&entry.path));
             let blocked = match entry.deny {

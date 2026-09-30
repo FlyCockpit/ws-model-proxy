@@ -1108,7 +1108,7 @@ pub(crate) fn mask_with_lookback(class: FileClass, text: &str, lookback: usize) 
     let mut out = String::with_capacity(text.len());
     let mut spans = Vec::new();
     let mut offset = 0;
-    for raw in super::text::lf_lines(text) {
+    for raw in text.split_inclusive('\n') {
         let body_len = raw.trim_end_matches(['\n', '\r']).len();
         let (line, ending) = raw.split_at(body_len);
         let mut cursor = 0;

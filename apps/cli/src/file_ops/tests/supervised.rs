@@ -1224,3 +1224,56 @@ fn physical_path_policy_errors_are_blocked_for_every_supervised_operand() {
         assert_eq!(fx.get(&format!("{directory}/private")), "private fixture\n");
     }
 }
+
+/// With file roots configured, the kernel root guard reads the disk. It must
+/// not run before a person's keypress: a path whose disk state trips it (a file
+/// where a parent is expected, a symlink out of the roots) is refused only on
+/// the cannot-apply screen, exactly like a path whose parent is absent or a
+/// directory. Lexically outside paths still fail before any screen.
+#[test]
+fn configured_roots_do_not_reveal_disk_state_before_the_keypress() {
+    let outside = tempfile::tempdir().unwrap();
+    let outside_dir = std::fs::canonicalize(outside.path()).unwrap();
+    let fx = Fx::with_policy(|root| Policy::new(vec![root.to_path_buf()], vec![], true));
+    fx.put("file", "plain\n");
+    std::fs::create_dir(fx.root.join("dir")).unwrap();
+    std::os::unix::fs::symlink(&outside_dir, fx.root.join("link")).unwrap();
+    for parent in ["file", "link", "dir", "missing"] {
+        let target = fx.p(&format!("{parent}/x"));
+        for (op, args, body) in [
+            (
+                "edit",
+                json!({"path":target,"edits":[{"oldText":"a","newText":"b"}]}),
+                None,
+            ),
+            ("write", json!({"path":target}), Some(b"new\n".to_vec())),
+            ("delete", json!({"path":target}), None),
+            ("mkdir", json!({"path":target}), None),
+            ("rename", json!({"from":target,"to":fx.p("dest")}), None),
+            ("rename", json!({"from":fx.p("file"),"to":target}), None),
+        ] {
+            let outcome = fx
+                .ops
+                .prepare_supervised(op, args, body, &key(), &fx.cancel);
+            assert!(
+                outcome.is_ok(),
+                "{op} {parent}: a disk-dependent refusal arrived before the keypress: {:?}",
+                outcome.err().map(|error| error.code)
+            );
+        }
+    }
+    // Outside the configured roots is a path-text refusal and stays immediate.
+    let outside_target = outside_dir.join("x").to_string_lossy().into_owned();
+    let refused = fx
+        .ops
+        .prepare_supervised(
+            "write",
+            json!({"path":outside_target}),
+            Some(b"new\n".to_vec()),
+            &key(),
+            &fx.cancel,
+        )
+        .err()
+        .map(|error| error.code);
+    assert_eq!(refused, Some(ErrorCode::PathDenied));
+}
