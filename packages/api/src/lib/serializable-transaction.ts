@@ -17,12 +17,37 @@ function stringProperty(value: unknown, property: string): string | undefined {
   return typeof propertyValue === "string" ? propertyValue : undefined;
 }
 
+function objectProperty(value: unknown, property: string): unknown {
+  return value && typeof value === "object" ? Reflect.get(value, property) : undefined;
+}
+
+/** A SERIALIZABLE snapshot may predate the owner fence's wait and label allocation. */
+function isCapacityLabelCollision(error: unknown): boolean {
+  const meta = objectProperty(error, "meta");
+  const cause =
+    objectProperty(objectProperty(meta, "driverAdapterError"), "cause") ??
+    objectProperty(error, "cause");
+  const code = stringProperty(error, "code");
+  const sqlState = code === "P2010" ? stringProperty(meta, "code") : code;
+  if (code !== "P2002" && sqlState !== "23505" && stringProperty(cause, "originalCode") !== "23505")
+    return false;
+  const index = "inference_capacity_userId_label_key";
+  return (
+    stringProperty(error, "constraint") === index ||
+    stringProperty(meta, "target") === index ||
+    stringProperty(objectProperty(cause, "constraint"), "index") === index
+  );
+}
+
 /**
  * Prisma wraps database errors raised by raw queries in P2010 and preserves
  * the PostgreSQL SQLSTATE in `meta.code`. Normal Prisma serialization errors
  * expose P2034 directly, while some drivers expose the SQLSTATE directly.
+ * The capacity-label index is classified separately; only automatic creators
+ * opt into retrying that unique conflict.
  */
 export function retryableSerializableTransactionCode(error: unknown): string | undefined {
+  if (isCapacityLabelCollision(error)) return "23505";
   const code = stringProperty(error, "code");
   const directCause =
     error && typeof error === "object" && "cause" in error
@@ -49,14 +74,18 @@ export function retryableSerializableTransactionCode(error: unknown): string | u
 
 export async function runSerializableTransaction<T>(
   work: (tx: Prisma.TransactionClient) => Promise<T>,
+  options: { maxWait?: number; timeout?: number; retryCapacityLabels?: boolean } = {},
 ): Promise<T> {
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
       return await prisma.$transaction(work, {
         isolationLevel: "Serializable",
+        ...(options.maxWait !== undefined ? { maxWait: options.maxWait } : {}),
+        ...(options.timeout !== undefined ? { timeout: options.timeout } : {}),
       });
     } catch (error) {
-      if (!retryableSerializableTransactionCode(error)) throw error;
+      const code = retryableSerializableTransactionCode(error);
+      if (!code || (code === "23505" && !options.retryCapacityLabels)) throw error;
       if (attempt === 4) break;
       await new Promise((resolve) => setTimeout(resolve, 5 * (attempt + 1)));
     }
@@ -64,6 +93,14 @@ export async function runSerializableTransaction<T>(
   throw new ORPCError("CONFLICT", {
     message: "Configuration changed concurrently. Retry the request.",
   });
+}
+
+/** Automatic creators only: explicit owner label conflicts keep their usual error. */
+export function runSerializableCapacityCreationTransaction<T>(
+  work: (tx: Prisma.TransactionClient) => Promise<T>,
+  options: { maxWait?: number; timeout?: number } = {},
+): Promise<T> {
+  return runSerializableTransaction(work, { ...options, retryCapacityLabels: true });
 }
 
 /**

@@ -114,6 +114,7 @@ import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
 import { refusedRelayProtocolReason, relayProtocolAtLeast } from "../lib/relay-protocol-version";
 import {
   runCapacityDeleteTransaction,
+  runSerializableCapacityCreationTransaction,
   runSerializableTransaction,
 } from "../lib/serializable-transaction";
 import {
@@ -1785,7 +1786,7 @@ export const forwarderManagementRouter = {
         taken: "SLUG_TAKEN",
       });
       const now = new Date();
-      return runSerializableTransaction(async (tx) => {
+      return runSerializableCapacityCreationTransaction(async (tx) => {
         // Writer class M: the owner fence first (@ws-model-proxy/db/capacity-lock-order).
         await fenceOwners(tx, [userId]);
         const localModels = await tx.discoveredModel.findMany({
@@ -3152,7 +3153,7 @@ export const forwarderManagementRouter = {
           endpointCapabilityMetadata: model.Endpoint?.capabilityMetadata ?? null,
         }),
       );
-      return runSerializableTransaction(async (tx) => {
+      return runSerializableCapacityCreationTransaction(async (tx) => {
         const userId = context.session.user.id;
         // Writer class M (@ws-model-proxy/db/capacity-lock-order): the owner
         // fence; then, planned with reads only, the capacity-policy fences of
@@ -3348,7 +3349,7 @@ export const forwarderManagementRouter = {
             "Provider models can only be external fallback (PUBLIC_OVERFLOW) members; plain pool names never leave the deployment.",
         });
       const userId = context.session.user.id;
-      const attached = await runSerializableTransaction(async (tx) => {
+      const attached = await runSerializableCapacityCreationTransaction(async (tx) => {
         // Writer class M (@ws-model-proxy/db/capacity-lock-order): the owner
         // fence; then, planned with reads only, the target identity fence and
         // the policy/capacity fences of the rows it may change; then the pool

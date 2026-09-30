@@ -376,6 +376,73 @@ integration("engine process capacity lifecycle", () => {
     },
   );
 
+  it("retries a SERIALIZABLE automatic creator whose long model label collides after an owner wait", async () => {
+    const { user } = await setup();
+    const { runSerializableCapacityCreationTransaction } = await import(
+      "@ws-model-proxy/api/lib/serializable-transaction"
+    );
+    const ownerHeld = Promise.withResolvers<void>();
+    const secondSnapshot = Promise.withResolvers<void>();
+    const longId = "L".repeat(150);
+    let secondAttempts = 0;
+    const creationFailures: unknown[] = [];
+    // This is the same allocator used inside the discovered/provider target triggers.
+    // Isolate its label index from unrelated graph predicates that can instead raise 40001.
+    const create = (tx: Prisma.TransactionClient, key: string) =>
+      tx.inferenceCapacity.create({
+        data: {
+          userId: user.id,
+          label: `${longId} (${key})`,
+          runtimeModel: longId,
+          runtimeIdentityKey: `execution-target:${key}`,
+          hardConcurrencyLimitSource: "AUTO",
+        },
+      });
+    // Registration is READ COMMITTED. Racing it against a SERIALIZABLE creator
+    // forces the label violation rather than a generic SSI dependency abort.
+    const first = modules.db.$transaction(async (tx) => {
+      await acquireFences(tx, [fences.owner(user.id)]);
+      const model = await create(tx, "first");
+      ownerHeld.resolve();
+      await secondSnapshot.promise;
+      return model;
+    });
+    await ownerHeld.promise;
+    const second = runSerializableCapacityCreationTransaction(async (tx) => {
+      secondAttempts++;
+      // Materialize the snapshot before waiting on the first creator's owner fence.
+      await tx.$queryRaw`SELECT 1`;
+      secondSnapshot.resolve();
+      await acquireFences(tx, [fences.owner(user.id)]);
+      try {
+        return await create(tx, "second");
+      } catch (error) {
+        creationFailures.push(error);
+        throw error;
+      }
+    });
+    const outcomes = await Promise.allSettled([first, second]);
+    expect(outcomes.map((outcome) => outcome.status)).toEqual(["fulfilled", "fulfilled"]);
+    expect(secondAttempts).toBe(2);
+    expect(creationFailures).toMatchObject([
+      {
+        code: "P2002",
+        meta: {
+          driverAdapterError: {
+            cause: {
+              constraint: { index: "inference_capacity_userId_label_key" },
+            },
+          },
+        },
+      },
+    ]);
+    const created = await fixture.inferenceCapacity.findMany({ where: { userId: user.id } });
+    expect(created.map((capacity) => capacity.label).sort()).toEqual(
+      ["L".repeat(116) + " (2)", "L".repeat(120)].sort(),
+    );
+    expect(new Set(created.map((capacity) => capacity.id)).size).toBe(2);
+  });
+
   it("registers a 120-character suffix-equals-preferred model with exactly one occupied label", async () => {
     const { user, register, targets } = await setup();
     const preferred = "M".repeat(116) + " (2)";
@@ -643,14 +710,25 @@ integration("engine process capacity lifecycle", () => {
 
   // OWNER/context/aggregate rows discriminate the reviewed implementation;
   // unknown context and UNLIMITED rows are controls for established semantics.
-  it.each(["detach", "auto"] as const)(
-    "recovers legacy owner assignment audit before deployment backfill: %s",
-    async (choice) => {
+  it.each([
+    { choice: "detach", ownerChange: true },
+    { choice: "auto", ownerChange: true },
+    { choice: "same-auto", ownerChange: false },
+    { choice: "priority-only", ownerChange: false },
+    { choice: "missing-before", ownerChange: false },
+  ])(
+    "recovers only proven legacy FK changes before deployment backfill: $choice",
+    async ({ choice, ownerChange }) => {
       const { user, register, targets } = await setup();
       await register("generic");
       const [a, b] = await targets();
       if (!a?.inferenceCapacityId || !b?.inferenceCapacityId) throw new Error("missing targets");
-      const chosen = choice === "detach" ? null : b.inferenceCapacityId;
+      const chosen =
+        choice === "detach"
+          ? null
+          : choice === "auto" || choice === "missing-before"
+            ? b.inferenceCapacityId
+            : a.inferenceCapacityId;
       // Simulate adding the new column to old rows: AUTO default, but the
       // pre-existing owner audit contains the durable assignment intent.
       await fixture.executionTarget.update({
@@ -664,7 +742,11 @@ integration("engine process capacity lifecycle", () => {
           action: "UPDATE_POLICY",
           resourceType: "EXECUTION_TARGET",
           resourceId: a.id,
-          after: { inferenceCapacityId: chosen },
+          ...(choice === "missing-before"
+            ? {}
+            : { before: { inferenceCapacityId: a.inferenceCapacityId } }),
+          after:
+            choice === "priority-only" ? { directPriority: 20 } : { inferenceCapacityId: chosen },
         },
       });
       await fixture.executionTarget.update({
@@ -679,7 +761,7 @@ integration("engine process capacity lifecycle", () => {
       const recovered = await targets();
       expect(recovered[0]).toMatchObject({
         inferenceCapacityId: chosen,
-        capacityAssignmentSource: "OWNER",
+        capacityAssignmentSource: ownerChange ? "OWNER" : "AUTO",
       });
       expect(recovered[1]).toMatchObject({
         inferenceCapacityId: b.inferenceCapacityId,
@@ -687,10 +769,10 @@ integration("engine process capacity lifecycle", () => {
       });
       expect(recovered[1]?.InferenceCapacity?.hardConcurrencyLimitSource).toBe("AUTO");
       await register();
-      expect((await targets())[0]).toMatchObject({
-        inferenceCapacityId: chosen,
-        capacityAssignmentSource: "OWNER",
-      });
+      const retried = await targets();
+      expect(retried[0]?.capacityAssignmentSource).toBe(ownerChange ? "OWNER" : "AUTO");
+      if (ownerChange) expect(retried[0]?.inferenceCapacityId).toBe(chosen);
+      else expect(retried[0]?.inferenceCapacityId).toBe(retried[1]?.inferenceCapacityId);
     },
   );
 
@@ -726,23 +808,65 @@ integration("engine process capacity lifecycle", () => {
     }
   });
 
-  it.each(["chosen-auto", "same-auto", "detach"] as const)(
+  it.each(["same-auto", "priority-only", "web-shaped"] as const)(
+    "policy-only edits retain AUTO assignment through merge/split retries: %s",
+    async (shape) => {
+      const { register, targets, owner } = await setup();
+      await register("generic");
+      const [a] = await targets();
+      if (!a?.inferenceCapacityId) throw new Error("missing target");
+      await owner.capacityManagement.updateDirectPolicy({
+        executionTargetId: a.id,
+        ...(shape === "priority-only" ? {} : { inferenceCapacityId: a.inferenceCapacityId }),
+        directPriority: 20,
+        ...(shape === "web-shaped"
+          ? {
+              directConcurrencyLimit: null,
+              directReservedSlots: 0,
+              directWaitBudgetMs: 30_000,
+              directContextCeiling: null,
+              directContextMargin: 0,
+              directBorrowPolicy: "WHEN_IDLE" as const,
+            }
+          : {}),
+      });
+      expect((await targets())[0]?.capacityAssignmentSource).toBe("AUTO");
+      for (const aliases of [["a", "b"], undefined, ["a", "b"]]) {
+        await register(aliases ? "vllm" : "generic", aliases, ["a", "b"], null);
+        const [nextA, nextB] = await targets();
+        expect(nextA?.capacityAssignmentSource).toBe("AUTO");
+        expect(nextA?.directPriority).toBe(20);
+        expect(nextA?.inferenceCapacityId === nextB?.inferenceCapacityId).toBe(
+          aliases !== undefined,
+        );
+        expect(nextA?.InferenceCapacity?.hardConcurrencyLimitSource).toBe("AUTO");
+      }
+    },
+  );
+
+  it.each(["chosen-auto", "detach"] as const)(
     "preserves durable owner target assignment: %s",
     async (choice) => {
       const { user, register, targets, owner } = await setup();
       await register("generic");
       const [a, b] = await targets();
       if (!a?.inferenceCapacityId || !b?.inferenceCapacityId) throw new Error("missing targets");
-      const chosen =
-        choice === "detach"
-          ? null
-          : choice === "same-auto"
-            ? a.inferenceCapacityId
-            : b.inferenceCapacityId;
+      const chosen = choice === "detach" ? null : b.inferenceCapacityId;
       await owner.capacityManagement.updateDirectPolicy({
         executionTargetId: a.id,
         inferenceCapacityId: chosen,
       });
+      // Equal-value saves preserve existing OWNER provenance too.
+      await owner.capacityManagement.updateDirectPolicy({
+        executionTargetId: a.id,
+        inferenceCapacityId: chosen,
+        directPriority: 20,
+      });
+      if (chosen)
+        expect(
+          (await fixture.inferenceCapacity.findUniqueOrThrow({ where: { id: chosen } }))
+            .hardConcurrencyLimitSource,
+        ).toBe("AUTO");
       for (const aliases of [["a", "b"], undefined, ["a", "b"]]) {
         await register("vllm", aliases, ["a", "b"], null);
         expect((await targets())[0]).toMatchObject({
@@ -770,7 +894,7 @@ integration("engine process capacity lifecycle", () => {
     },
   );
 
-  it.each(["same-FK owner", "owner move", "parent delete"] as const)(
+  it.each(["same-FK policy", "owner move", "parent delete"] as const)(
     "refreshes aggregate at sibling membership writer: %s",
     async (writer) => {
       const { user, register, targets, owner } = await setup();
@@ -782,7 +906,7 @@ integration("engine process capacity lifecycle", () => {
         await owner.forwarderManagement.removeDiscoveredModelMetadata({ id: c.discoveredModelId });
       else {
         const chosen =
-          writer === "same-FK owner"
+          writer === "same-FK policy"
             ? sharedId
             : (
                 await fixture.inferenceCapacity.create({
@@ -801,17 +925,17 @@ integration("engine process capacity lifecycle", () => {
         });
         expect((await targets())[2]).toMatchObject({
           inferenceCapacityId: chosen,
-          capacityAssignmentSource: "OWNER",
+          capacityAssignmentSource: writer === "same-FK policy" ? "AUTO" : "OWNER",
         });
       }
       expect(
         (await fixture.inferenceCapacity.findUniqueOrThrow({ where: { id: sharedId } }))
           .hardConcurrencyLimit,
-      ).toBe(2);
-      if (writer === "same-FK owner") {
+      ).toBe(writer === "same-FK policy" ? 3 : 2);
+      if (writer === "same-FK policy") {
         await register("vllm", ["a", "b", "c", "d"], ["a", "b", "c", "d"], null);
-        expect((await targets())[2]?.capacityAssignmentSource).toBe("OWNER");
-        expect((await targets())[0]?.InferenceCapacity?.hardConcurrencyLimit).toBe(3);
+        expect((await targets())[2]?.capacityAssignmentSource).toBe("AUTO");
+        expect((await targets())[0]?.InferenceCapacity?.hardConcurrencyLimit).toBe(4);
       }
     },
   );
@@ -1078,6 +1202,98 @@ integration("engine process capacity lifecycle", () => {
           await fixture.inferenceCapacity.findUnique({ where: { id: privateCapacity.id } }),
         ).toBeNull();
       }
+    },
+  );
+
+  it.each(
+    [
+      { kind: "unrelated AUTO lease", involved: false, userCapacity: false, waiter: false },
+      { kind: "unrelated shared USER lease", involved: false, userCapacity: true, waiter: false },
+      { kind: "involved live lease", involved: true, userCapacity: false, waiter: false },
+      { kind: "involved WAITING waiter", involved: true, userCapacity: false, waiter: true },
+    ].flatMap((row) => ["join", "split"].map((direction) => ({ ...row, direction }))),
+  )(
+    "preflights only planned capacities: $direction / $kind",
+    async ({ direction, involved, userCapacity, waiter }) => {
+      const { user, register, targets, owner } = await setup();
+      await register(direction === "split" ? "vllm" : "generic", ["a", "b"], ["a", "b", "c"], 1);
+      const [a, b, c] = await targets();
+      if (!a?.inferenceCapacityId || !b?.inferenceCapacityId || !c?.inferenceCapacityId)
+        throw new Error("targets missing");
+      let busyTarget = involved ? a : c;
+      if (userCapacity) {
+        const sharedUser = await owner.capacityManagement.create({
+          label: "owner shared",
+          runtimeIdentityKey: "owner:shared",
+          runtimeModel: "c",
+          hardConcurrencyLimit: 1,
+          physicalMaxContext: null,
+          countStrategy: "CONSERVATIVE_ESTIMATE",
+        });
+        await owner.capacityManagement.updateDirectPolicy({
+          executionTargetId: c.id,
+          inferenceCapacityId: sharedUser.id,
+        });
+        // The owner budget can be shared with another endpoint; it is not a move source/destination.
+        await register("generic", undefined, ["d"], null, "independent");
+        const d = (await targets()).find(
+          (target) => target.DiscoveredModel?.upstreamModelId === "d",
+        )!;
+        await owner.capacityManagement.updateDirectPolicy({
+          executionTargetId: d.id,
+          inferenceCapacityId: sharedUser.id,
+        });
+        busyTarget = (await targets())[2]!;
+      }
+      const capacityId = busyTarget.inferenceCapacityId!;
+      const store = new modules.store.PostgresCapacityAdmissionStore(modules.db, "preflight");
+      const attempt = (suffix: string) => ({
+        requestId: `${user.id}-${suffix}`,
+        attemptId: `${user.id}-${suffix}`,
+        ownerId: user.id,
+        sourceKind: "DIRECT" as const,
+        basePriority: 16,
+        connectionOwner: "test",
+        deadlineAt: new Date("2030-01-01T00:00:00Z"),
+        candidates: [{ capacityId, executionTargetId: busyTarget.id, candidateOrder: 0 }],
+      });
+      const live = await store.acquire(attempt("live"));
+      if (live.state !== "ADMITTED") throw new Error("lease missing");
+      if (waiter) {
+        expect((await store.acquire(attempt("waiting"))).state).toBe("WAITING");
+        // Keep the waiter independently live after terminalizing the fixture lease.
+        await fixture.capacityLease.update({
+          where: { id: live.lease.leaseId },
+          data: { state: "RELEASED", releasedAt: new Date() },
+        });
+      }
+      const inventory = () =>
+        register(direction === "join" ? "vllm" : "generic", ["a", "b"], ["a", "b", "c"], 1);
+      await inventory();
+      let current = await targets();
+      expect(current[0]?.inferenceCapacityId === current[1]?.inferenceCapacityId).toBe(
+        involved ? direction === "split" : direction === "join",
+      );
+      expect(current[2]?.inferenceCapacityId).toBe(
+        c.inferenceCapacityId === capacityId || userCapacity ? capacityId : c.inferenceCapacityId,
+      );
+      if (involved) {
+        // A separate endpoint's independent group must still merge while this group defers.
+        await register("vllm", ["x", "y"], ["x", "y"], null, "independent");
+        const independent = (await targets()).filter((target) =>
+          ["x", "y"].includes(target.DiscoveredModel?.upstreamModelId ?? ""),
+        );
+        expect(independent[0]?.inferenceCapacityId).toBe(independent[1]?.inferenceCapacityId);
+        await inventory();
+        expect((await targets())[0]?.inferenceCapacityId).toBe(a.inferenceCapacityId);
+      }
+      if (waiter) await store.cancelAttempt(`${user.id}-waiting`);
+      else expect(await store.release(live.lease)).toBe(true);
+      await inventory();
+      current = await targets();
+      expect(current[0]?.inferenceCapacityId === current[1]?.inferenceCapacityId).toBe(
+        direction === "join",
+      );
     },
   );
 

@@ -280,8 +280,9 @@ export async function repointTargetCapacity(
 
 /**
  * One automatic transition coordinator. Caller fenced ALL existing attached
- * targets/capacities before its first graph write. Preflight the entire batch:
- * an idle sibling must not open a second process budget while another is live.
+ * targets/capacities before its first graph write. Preflight each connected move
+ * group: an idle sibling must not open a second budget while its process is live.
+ * Unrelated endpoint capacities and other endpoints do not gate these moves.
  */
 export async function applyEngineProcessCapacityPlan(
   tx: Prisma.TransactionClient,
@@ -325,9 +326,7 @@ export async function applyEngineProcessCapacityPlan(
     });
   const assignments = new Map<string, string>();
   const destinations = new Map<string, string>();
-  const capacityIds = new Set(
-    targets.flatMap((target) => (target.inferenceCapacityId ? [target.inferenceCapacityId] : [])),
-  );
+  const capacityIds = new Set<string>();
   if (sharedId) capacityIds.add(sharedId);
   for (const target of targets) {
     if (!target.discoveredModelId || (!group.has(target.id) && !split.has(target.id))) continue;
@@ -343,6 +342,7 @@ export async function applyEngineProcessCapacityPlan(
             fillExistingLimit: false,
           });
     capacityIds.add(destinationId);
+    if (target.inferenceCapacityId) capacityIds.add(target.inferenceCapacityId);
     destinations.set(target.id, destinationId);
   }
   const capacities = await tx.inferenceCapacity.findMany({
@@ -387,45 +387,74 @@ export async function applyEngineProcessCapacityPlan(
     (target) =>
       destinations.has(target.id) && destinations.get(target.id) !== target.inferenceCapacityId,
   );
-  const safe =
-    moves.every((target) => {
-      const destination = byId.get(destinations.get(target.id)!);
-      return (
-        target.capacityAssignmentSource === "AUTO" &&
-        isAutoManagedCapacity(target.InferenceCapacity) &&
-        destination !== undefined &&
-        isAutoManagedCapacity(destination) &&
-        destination.hardConcurrencyLimit !== null &&
-        policiesFit(target, destination)
-      );
-    }) &&
-    (moves.length === 0 || (await capacitiesIdle(tx, [...capacityIds])));
-  if (safe) {
-    // Growth must precede the guarded repoint so its independent validation
-    // sees the same admissible limit; all checks ran before any graph change.
-    const effectiveShared = sharedId ? byId.get(sharedId) : undefined;
-    if (
-      shared &&
-      effectiveShared &&
-      effectiveShared.hardConcurrencyLimit !== shared.hardConcurrencyLimit
-    ) {
-      await tx.inferenceCapacity.updateMany({
-        where: { id: shared.id, userId: input.userId, hardConcurrencyLimitSource: "AUTO" },
-        data: { hardConcurrencyLimit: effectiveShared.hardConcurrencyLimit },
-      });
+  // Components share a source or destination capacity. A busy component is
+  // deferred atomically; independent components still progress under the same fences.
+  const remaining = new Set(moves);
+  const moveGroups: Array<{ targets: MoveTarget[]; capacityIds: Set<string> }> = [];
+  while (remaining.size) {
+    const first = remaining.values().next().value!;
+    const component = { targets: [first], capacityIds: new Set([destinations.get(first.id)!]) };
+    if (first.inferenceCapacityId) component.capacityIds.add(first.inferenceCapacityId);
+    remaining.delete(first);
+    for (let added = true; added; ) {
+      added = false;
+      for (const target of remaining) {
+        const destination = destinations.get(target.id)!;
+        if (
+          !component.capacityIds.has(destination) &&
+          !(target.inferenceCapacityId && component.capacityIds.has(target.inferenceCapacityId))
+        )
+          continue;
+        component.targets.push(target);
+        component.capacityIds.add(destination);
+        if (target.inferenceCapacityId) component.capacityIds.add(target.inferenceCapacityId);
+        remaining.delete(target);
+        added = true;
+      }
     }
-    for (const target of moves) {
-      const toCapacityId = destinations.get(target.id)!;
-      const moved = await repointTargetCapacity(tx, {
-        userId: input.userId,
-        targetId: target.id,
-        fromCapacityId: target.inferenceCapacityId,
-        toCapacityId,
-      });
-      // Owner and H fences exclude all state changes since preflight. A guard
-      // failure is an invariant violation: rollback the ENTIRE registration.
-      if (moved !== 1) throw new Error("Automatic capacity preflight changed under fences.");
-      assignments.set(target.id, toCapacityId);
+    moveGroups.push(component);
+  }
+  for (const component of moveGroups) {
+    const safe =
+      component.targets.every((target) => {
+        const destination = byId.get(destinations.get(target.id)!);
+        return (
+          target.capacityAssignmentSource === "AUTO" &&
+          isAutoManagedCapacity(target.InferenceCapacity) &&
+          destination !== undefined &&
+          isAutoManagedCapacity(destination) &&
+          destination.hardConcurrencyLimit !== null &&
+          policiesFit(target, destination)
+        );
+      }) && (await capacitiesIdle(tx, [...component.capacityIds]));
+    if (safe) {
+      // Growth must precede the guarded repoint so its independent validation
+      // sees the same admissible limit; all checks ran before any graph change.
+      const effectiveShared = sharedId ? byId.get(sharedId) : undefined;
+      if (
+        shared &&
+        component.capacityIds.has(shared.id) &&
+        effectiveShared &&
+        effectiveShared.hardConcurrencyLimit !== shared.hardConcurrencyLimit
+      ) {
+        await tx.inferenceCapacity.updateMany({
+          where: { id: shared.id, userId: input.userId, hardConcurrencyLimitSource: "AUTO" },
+          data: { hardConcurrencyLimit: effectiveShared.hardConcurrencyLimit },
+        });
+      }
+      for (const target of component.targets) {
+        const toCapacityId = destinations.get(target.id)!;
+        const moved = await repointTargetCapacity(tx, {
+          userId: input.userId,
+          targetId: target.id,
+          fromCapacityId: target.inferenceCapacityId,
+          toCapacityId,
+        });
+        // Owner and H fences exclude all state changes since preflight. A guard
+        // failure is an invariant violation: rollback the ENTIRE registration.
+        if (moved !== 1) throw new Error("Automatic capacity preflight changed under fences.");
+        assignments.set(target.id, toCapacityId);
+      }
     }
   }
   // Repair identical retries and skipped moves from actual membership.

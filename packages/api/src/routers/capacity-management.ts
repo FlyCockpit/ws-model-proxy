@@ -436,16 +436,18 @@ export const capacityManagementRouter = {
           select: { id: true, userId: true, inferenceCapacityId: true },
         });
         if (!candidate || candidate.userId !== userId) return notFound();
-        const changedCapacityIds =
-          input.inferenceCapacityId !== undefined
-            ? [
-                ...new Set(
-                  [candidate.inferenceCapacityId, input.inferenceCapacityId].filter(
-                    (id): id is string => typeof id === "string",
-                  ),
+        const capacityChanged =
+          input.inferenceCapacityId !== undefined &&
+          input.inferenceCapacityId !== candidate.inferenceCapacityId;
+        const changedCapacityIds = capacityChanged
+          ? [
+              ...new Set(
+                [candidate.inferenceCapacityId, input.inferenceCapacityId].filter(
+                  (id): id is string => typeof id === "string",
                 ),
-              ]
-            : [];
+              ),
+            ]
+          : [];
         const dependents =
           changedCapacityIds.length > 0
             ? await tx.executionTarget.findMany({
@@ -548,14 +550,16 @@ export const capacityManagementRouter = {
             memberMargin: member.capacityContextMargin,
           });
         }
-        const { executionTargetId, ...data } = input;
+        const { executionTargetId, inferenceCapacityId, ...policyData } = input;
+        const data = {
+          ...policyData,
+          ...(capacityChanged ? { inferenceCapacityId } : {}),
+        };
         const updated = await tx.executionTarget.update({
           where: { id: executionTargetId },
           data: {
             ...data,
-            ...(input.inferenceCapacityId !== undefined
-              ? { capacityAssignmentSource: "OWNER" }
-              : {}),
+            ...(capacityChanged ? { capacityAssignmentSource: "OWNER" } : {}),
           },
         });
         await refreshSharedAutoCapacities(tx, userId, changedCapacityIds);

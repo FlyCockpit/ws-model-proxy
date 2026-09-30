@@ -848,18 +848,120 @@ function mountMemberEditor(capacityAvailability: "enabled" | "disabled") {
 }
 
 describe("PoolMemberForm capacity save gate", () => {
-  it("updates the member policy and attachment when capacity is enabled", async () => {
+  it("updates the member policy without an untouched attachment when capacity is enabled", async () => {
     mountMemberEditor("enabled");
 
     fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
 
     await waitFor(() =>
-      expect(state.mutationCalls).toEqual([
-        "updatePoolMember",
-        "updateMemberPolicy",
-        "updateDirectPolicy",
-      ]),
+      expect(state.mutationCalls).toEqual(["updatePoolMember", "updateMemberPolicy"]),
     );
+  });
+
+  it.each([
+    { mode: "create", current: "auto", choice: undefined, expected: undefined },
+    { mode: "create", current: null, choice: undefined, expected: undefined },
+    { mode: "create", current: "auto", choice: "", expected: null },
+    { mode: "create", current: "auto", choice: "other", expected: "other" },
+    { mode: "edit", current: "auto", choice: undefined, expected: undefined },
+    { mode: "edit", current: "auto", choice: "auto", expected: undefined },
+    { mode: "edit", current: "auto", choice: "", expected: null },
+    { mode: "edit", current: null, choice: "other", expected: "other" },
+  ] as const)(
+    "capacity selection follows actual owner changes: %#",
+    async ({ mode, current, choice, expected }) => {
+      const directModels = [
+        {
+          id: "model-1",
+          canonicalModelId: "first",
+          executionTarget: { inferenceCapacityId: current },
+        },
+        {
+          id: "model-2",
+          canonicalModelId: "second",
+          executionTarget: { inferenceCapacityId: "other" },
+        },
+      ] as unknown as Parameters<typeof PoolMemberForm>[0]["directModels"];
+      const capacities = [
+        { id: "auto", label: "Automatic", hardConcurrencyLimit: 1 },
+        { id: "other", label: "Other", hardConcurrencyLimit: 1 },
+      ] as Parameters<typeof PoolMemberForm>[0]["capacities"];
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <PoolMemberForm
+            mode={mode}
+            poolId="pool"
+            member={{ ...localMember, inferenceCapacityId: current }}
+            directModels={directModels}
+            capacities={capacities}
+            capacityAvailability="enabled"
+            onSuccess={() => undefined}
+          />
+        </QueryClientProvider>,
+      );
+      const select = screen.getByLabelText(
+        "dashboard:pools.capacity.attachment",
+      ) as HTMLSelectElement;
+      expect(select.value).toBe(current ?? "");
+      if (choice !== undefined) fireEvent.change(select, { target: { value: choice } });
+      fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+      await waitFor(() => expect(toast.success).toHaveBeenCalled());
+      const attachment = state.mutationPayloads.filter(
+        (call) => call.name === "updateDirectPolicy",
+      );
+      expect(attachment).toEqual(
+        expected === undefined
+          ? []
+          : [
+              {
+                name: "updateDirectPolicy",
+                input: { executionTargetId: "target-1", inferenceCapacityId: expected },
+              },
+            ],
+      );
+    },
+  );
+
+  it("resets the capacity choice to each selected create target's current capacity", async () => {
+    const directModels = [
+      {
+        id: "model-1",
+        canonicalModelId: "first",
+        executionTarget: { inferenceCapacityId: "auto" },
+      },
+      {
+        id: "model-2",
+        canonicalModelId: "second",
+        executionTarget: { inferenceCapacityId: "other" },
+      },
+    ] as unknown as Parameters<typeof PoolMemberForm>[0]["directModels"];
+    const capacities = [
+      { id: "auto", label: "Automatic", hardConcurrencyLimit: 1 },
+      { id: "other", label: "Other", hardConcurrencyLimit: 1 },
+    ] as Parameters<typeof PoolMemberForm>[0]["capacities"];
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <PoolMemberForm
+          mode="create"
+          poolId="pool"
+          directModels={directModels}
+          capacities={capacities}
+          capacityAvailability="enabled"
+          onSuccess={() => undefined}
+        />
+      </QueryClientProvider>,
+    );
+    const select = screen.getByLabelText(
+      "dashboard:pools.capacity.attachment",
+    ) as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "" } });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.directModel"), {
+      target: { value: "model-2" },
+    });
+    expect(select.value).toBe("other");
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() => expect(toast.success).toHaveBeenCalled());
+    expect(state.mutationCalls).toEqual(["addPoolMember", "updateMemberPolicy"]);
   });
 
   it("does not run capacity mutations when capacity is disabled", async () => {

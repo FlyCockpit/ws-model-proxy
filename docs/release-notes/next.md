@@ -13,9 +13,15 @@ Full behaviour reference: [`docs/external-fallback.md`](../external-fallback.md)
 
 Slot-sharing llama.cpp, vLLM and SGLang processes now share a capacity when the
 CLI reports multiple served aliases. Owner assignments and explicit detach choices
-are durable per target, including assignments to existing AUTO capacities. Removed
-aliases split once idle; a move batch with ACTIVE leases or WAITING waiters is skipped
-and retried on inventory. Direct and effective pool concurrency/context policies must
+are durable per target when the capacity FK actually changes, including changes to
+existing AUTO capacities. Saving the same capacity or only a policy keeps the target's
+provenance. Untouched pool-member attachment fields preserve the target's current
+capacity; deployment recovers only audited before/after FK changes. Removed aliases
+split once idle. Only a connected move group's source and destination capacities gate
+its ACTIVE lease / WAITING waiter preflight; unrelated capacities and independent
+endpoint groups keep progressing. A busy involved group retries on each later
+inventory (CLI reconnect or operator reload), and may remain deferred until idle.
+Direct and effective pool concurrency/context policies must
 fit every destination. Shared AUTO limits follow engine slots, otherwise the current
 automatic member sum; inadmissible lowerings retain the existing limit. Parent deletes
 refresh surviving shared aggregates and remove empty AUTO discovery rows atomically.
@@ -23,6 +29,8 @@ Startup repairs idle orphans in bounded batches and skips contended owners for r
 Shared AUTO limits with unknown values wait for a complete inventory aggregate.
 Owner-created empty rows remain. Automatic labels choose the lowest free numeric
 suffix even when a 120-character preferred label already ends in that suffix.
+SERIALIZABLE automatic creators retry collisions on the capacity label unique index
+with a fresh transaction after an owner-fence wait; other unique conflicts still surface.
 Apply the schema and hardening before starting the new server; this adds target
 assignment provenance and automatic concurrency seed columns.
 

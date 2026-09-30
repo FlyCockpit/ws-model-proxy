@@ -11,6 +11,7 @@ const {
   sweepOrphanAutoCapacities,
   repointTargetCapacity,
   ensureEngineProcessCapacity,
+  applyEngineProcessCapacityPlan,
 } = await import("./engine-process-capacity");
 
 import type { EngineKindName, WireEngineFacts } from "./engine-facts";
@@ -249,6 +250,137 @@ describe("lifecycle transaction seams", () => {
       ).toBe(0);
     },
   );
+  it.each([
+    { name: "unrelated AUTO lease", busy: "unrelated", source: "AUTO", waiter: false, moved: true },
+    {
+      name: "unrelated USER shared lease",
+      busy: "unrelated",
+      source: "OWNER",
+      waiter: false,
+      moved: true,
+    },
+    {
+      name: "involved source lease",
+      busy: "a-private",
+      source: "AUTO",
+      waiter: false,
+      moved: false,
+    },
+    {
+      name: "involved destination lease",
+      busy: "shared",
+      source: "AUTO",
+      waiter: false,
+      moved: false,
+    },
+    {
+      name: "involved source waiter",
+      busy: "a-private",
+      source: "AUTO",
+      waiter: true,
+      moved: false,
+    },
+    {
+      name: "live unchanged sibling on destination",
+      busy: "shared",
+      source: "AUTO",
+      waiter: false,
+      moved: false,
+      same: true,
+    },
+  ])("coordinator idle boundary: $name", async ({ busy, source, waiter, moved, same }) => {
+    const capacity = (id: string, key: string, provenance = "AUTO") => ({
+      id,
+      userId: "u",
+      runtimeIdentityKey: key,
+      hardConcurrencyLimitSource: provenance,
+      hardConcurrencyLimit: 2,
+      physicalMaxContext: null,
+      engineSlots: null,
+    });
+    const capacities = [
+      capacity("a-private", "execution-target:a"),
+      capacity("b-private", "execution-target:b"),
+      capacity("shared", "engine-process:ep"),
+      capacity(
+        "unrelated",
+        source === "OWNER" ? "owner:shared" : "execution-target:c",
+        source === "OWNER" ? "USER" : "AUTO",
+      ),
+    ];
+    const targets = ["a", "b", "c"].map((id, i) => ({
+      id,
+      userId: "u",
+      discoveredModelId: `dm-${id}`,
+      DiscoveredModel: { upstreamModelId: id },
+      inferenceCapacityId: same && id === "a" ? "shared" : capacities[i === 2 ? 3 : i]!.id,
+      InferenceCapacity: same && id === "a" ? capacities[2]! : capacities[i === 2 ? 3 : i]!,
+      capacityAssignmentSource: id === "c" ? source : "AUTO",
+      capacityAutoConcurrencyLimit: 1,
+      directConcurrencyLimit: null,
+      directReservedSlots: 0,
+      directContextCeiling: null,
+      directContextMargin: 0,
+      PoolMembers: [],
+    }));
+    vi.mocked(prisma.executionTarget.findMany).mockImplementation(
+      async (args) =>
+        (args?.where?.inferenceCapacityId
+          ? targets.filter((t) => t.inferenceCapacityId === args.where!.inferenceCapacityId)
+          : targets) as unknown as Awaited<ReturnType<typeof prisma.executionTarget.findMany>>,
+    );
+    vi.mocked(prisma.executionTarget.findUnique).mockImplementation(
+      async (args) =>
+        targets.find((t) => t.id === args.where.id) as unknown as Awaited<
+          ReturnType<typeof prisma.executionTarget.findUnique>
+        >,
+    );
+    vi.mocked(prisma.executionTarget.updateMany).mockResolvedValue({ count: 1 });
+    vi.mocked(prisma.inferenceCapacity.findUnique).mockImplementation(
+      async (args) =>
+        (args.where.id ? capacities.find((c) => c.id === args.where.id) : capacities[2]) as Awaited<
+          ReturnType<typeof prisma.inferenceCapacity.findUnique>
+        >,
+    );
+    vi.mocked(prisma.inferenceCapacity.findMany).mockResolvedValue(
+      capacities as Awaited<ReturnType<typeof prisma.inferenceCapacity.findMany>>,
+    );
+    vi.mocked(prisma.inferenceCapacity.upsert).mockResolvedValue(
+      capacities[2]! as Awaited<ReturnType<typeof prisma.inferenceCapacity.upsert>>,
+    );
+    const liveFor = (args: { where?: { capacityId?: unknown } } | undefined) => {
+      const filter = args?.where?.capacityId as { in?: string[] } | undefined;
+      return filter?.in?.includes(busy) ? { id: "live" } : null;
+    };
+    vi.mocked(prisma.capacityLease.findFirst).mockImplementation(
+      async (args) =>
+        (waiter ? null : liveFor(args)) as Awaited<
+          ReturnType<typeof prisma.capacityLease.findFirst>
+        >,
+    );
+    vi.mocked(prisma.capacityWaiter.findFirst).mockImplementation(
+      async (args) =>
+        (waiter ? liveFor(args) : null) as Awaited<
+          ReturnType<typeof prisma.capacityWaiter.findFirst>
+        >,
+    );
+    const result = await applyEngineProcessCapacityPlan(prisma, {
+      userId: "u",
+      endpointId: "ep",
+      endpointSlug: "engine",
+      inventoryModelIds: ["a", "b", "c"],
+      engineFacts: {
+        engine: { value: "vllm", source: "probe" },
+        servedModelAliases: { value: ["a", "b"], source: "probe" },
+      },
+    });
+    expect([...result.assignments.keys()]).toEqual(moved ? ["a", "b"] : []);
+    for (const call of vi.mocked(prisma.capacityLease.findFirst).mock.calls)
+      expect(call[0]?.where?.capacityId).not.toEqual(
+        expect.objectContaining({ in: expect.arrayContaining(["unrelated"]) }),
+      );
+  });
+
   it("seeds shared limits without mutating existing rows before preflight", async () => {
     vi.mocked(prisma.inferenceCapacity.upsert).mockResolvedValue({ id: "shared" } as Awaited<
       ReturnType<typeof prisma.inferenceCapacity.upsert>
@@ -322,6 +454,44 @@ describe("lifecycle transaction seams", () => {
       expect.objectContaining({ where: expect.objectContaining({ id: { gt: "c" } }), take: 1 }),
     );
   });
+
+  it.each(["live", "contended"])(
+    "advances past the last scanned retained %s row, never the first or last deleted",
+    async (retention) => {
+      const rows = ["01", "02", "03", "04"].map((id) => ({ id, userId: "u" }));
+      const pages = [rows.slice(0, 2), rows.slice(2), []];
+      vi.mocked(prisma.inferenceCapacity.findMany).mockImplementation(async (args) => {
+        if (args?.take)
+          return pages.shift()! as Awaited<ReturnType<typeof prisma.inferenceCapacity.findMany>>;
+        return rows.filter((row) =>
+          (args?.where?.id as { in?: string[] } | undefined)?.in?.includes(row.id),
+        ) as Awaited<ReturnType<typeof prisma.inferenceCapacity.findMany>>;
+      });
+      vi.mocked(prisma.$transaction).mockImplementation(async (work) => {
+        if (typeof work !== "function") throw new Error("Expected interactive transaction");
+        return work(prisma);
+      });
+      vi.mocked(prisma.$queryRaw).mockResolvedValue([{ acquired: retention === "live" }]);
+      let deletedPage = false;
+      vi.mocked(prisma.$executeRaw).mockImplementation(async (query) => {
+        const sql = "sql" in query ? query.sql : query.join("");
+        if (!sql.includes("DELETE FROM inference_capacity")) return 0;
+        const count = deletedPage ? 0 : 1;
+        deletedPage = true;
+        return count;
+      });
+      expect(await sweepOrphanAutoCapacities({ batchSize: 2 })).toBe(retention === "live" ? 1 : 0);
+      const scans = vi
+        .mocked(prisma.inferenceCapacity.findMany)
+        .mock.calls.filter((call) => call[0]?.take);
+      expect(scans.map((call) => call[0]?.where?.id)).toEqual([
+        undefined,
+        { gt: "02" },
+        { gt: "04" },
+      ]);
+      expect(scans).toHaveLength(3);
+    },
+  );
 
   it("pins the default sweep batch and rejects unbounded or non-progressing batches", async () => {
     vi.mocked(prisma.inferenceCapacity.findMany).mockResolvedValue([]);
