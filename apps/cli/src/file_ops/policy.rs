@@ -218,40 +218,38 @@ fn physical(path: &Path) -> PathBuf {
     } else {
         path
     };
-    let mut rest: Vec<std::path::Component> = Vec::new();
-    let mut base = path;
-    loop {
-        if let Ok(real) = std::fs::canonicalize(base) {
-            let mut out = real;
-            // the unresolved suffix is applied lexically: a `..` removes the missing
-            // name before it (or, with none left, the real directory's parent)
-            let mut pending: Vec<std::path::Component> = Vec::new();
-            let mut collapsed = false;
-            for component in rest.iter().rev() {
-                match component {
-                    std::path::Component::ParentDir => {
-                        collapsed = true;
-                        if pending.pop().is_none() {
-                            out.pop();
-                        }
-                    }
-                    std::path::Component::CurDir => {}
-                    other => pending.push(*other),
+    // Components are applied in order, the way the OS walks them: an existing
+    // component is resolved physically (symlinks included) before the component
+    // after it is looked at, and a missing name is only cancelled by a following
+    // `..` once no existing symlink stands in between.
+    let mut cur = PathBuf::new();
+    let mut missing: Vec<&std::ffi::OsStr> = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if missing.pop().is_none() {
+                    cur.pop();
                 }
             }
-            out.extend(pending.iter().map(|c| c.as_os_str()));
-            // the collapsed path can now run through a symlink: resolve it again (it
-            // holds no `..`, so this ends)
-            return if collapsed { physical(&out) } else { out };
-        }
-        match (base.parent(), base.components().next_back()) {
-            (Some(parent), Some(last)) => {
-                rest.push(last);
-                base = parent;
+            std::path::Component::Normal(name) if missing.is_empty() => {
+                let next = cur.join(name);
+                match std::fs::canonicalize(&next) {
+                    Ok(real) => cur = real,
+                    Err(_) => missing.push(name),
+                }
             }
-            _ => return path.to_path_buf(),
+            std::path::Component::Normal(name) => missing.push(name),
+            root => {
+                cur.push(root.as_os_str());
+                if let Ok(real) = std::fs::canonicalize(&cur) {
+                    cur = real;
+                }
+            }
         }
     }
+    cur.extend(missing);
+    cur
 }
 
 /// Every protected entry under both its configured and its physical name.
@@ -343,6 +341,21 @@ mod tests {
         std::os::unix::fs::symlink(root.join("real/sub"), root.join("link")).unwrap();
         let configured = root.join("missing/../link/f");
         assert_eq!(physical(&configured), root.join("real/sub/f"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_then_parent_after_a_missing_ancestor_follows_the_os() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("real/sub")).unwrap();
+        std::os::unix::fs::symlink(root.join("real/sub"), root.join("link")).unwrap();
+        // ghost/.. cancels; then link -> real/sub, and `..` leaves it for `real`
+        let configured = root.join("ghost/../link/../state/device-auth.json");
+        assert_eq!(
+            physical(&configured),
+            root.join("real/state/device-auth.json")
+        );
     }
 
     #[test]
