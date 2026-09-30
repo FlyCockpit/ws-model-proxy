@@ -1,4 +1,5 @@
 import { serve } from "@hono/node-server";
+import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
 import { Hono } from "hono";
 import { PostgresCapacityAdmissionStore } from "./postgres-store.js";
@@ -107,28 +108,36 @@ try {
     write({ reclaimed: await store.reclaimExpired(new Date(), command.limit) });
   } else if (command.operation === "schedule") {
     const winner = await db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${command.capacityId}, 0))`;
+      await acquireFences(tx, [fences.capacity(command.capacityId)]);
       const capacity = await tx.inferenceCapacity.findUniqueOrThrow({
         where: { id: command.capacityId },
+        select: { userId: true },
+      });
+      await tx.$executeRaw`
+        INSERT INTO capacity_runtime ("capacityId", "userId")
+        VALUES (${command.capacityId}, ${capacity.userId})
+        ON CONFLICT ("capacityId") DO NOTHING`;
+      const runtime = await tx.capacityRuntime.findUniqueOrThrow({
+        where: { capacityId: command.capacityId },
       });
       const deficits =
-        Array.isArray(capacity.schedulerDeficits) &&
-        capacity.schedulerDeficits.length === PRIORITY_CLASS_COUNT
-          ? capacity.schedulerDeficits.map((value) => (typeof value === "number" ? value : 0))
+        Array.isArray(runtime.schedulerDeficits) &&
+        runtime.schedulerDeficits.length === PRIORITY_CLASS_COUNT
+          ? runtime.schedulerDeficits.map((value) => (typeof value === "number" ? value : 0))
           : Array(PRIORITY_CLASS_COUNT).fill(0);
       const decision = scheduleWeightedDeficitRoundRobin({
         state: {
-          cursor: capacity.schedulerCursor,
+          cursor: runtime.schedulerCursor,
           deficits,
-          version: capacity.schedulerVersion,
+          version: runtime.schedulerVersion,
         },
         candidates: command.candidates.map((candidate) => ({
           ...candidate,
           enqueueSequence: BigInt(candidate.enqueueSequence),
         })),
       });
-      await tx.inferenceCapacity.update({
-        where: { id: command.capacityId },
+      await tx.capacityRuntime.update({
+        where: { capacityId: command.capacityId },
         data: {
           schedulerCursor: decision.state.cursor,
           schedulerDeficits: decision.state.deficits,

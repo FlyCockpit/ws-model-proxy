@@ -169,7 +169,10 @@ export function isHardLimitRefreshAdmissible(
  * Writes engine facts to a capacity and, while its hard limit is still
  * AUTO-sourced, refreshes that limit from the reported slots. A USER limit
  * (including USER null = unlimited) is never touched. The caller holds the
- * capacity's L5 policy lock and the L2 locks of every target on it.
+ * `06:capacity-policy:<target>` fence of every target on the capacity and the
+ * `08:capacity:<capacity>` fence of the capacity itself
+ * (`fences.capacityPolicy` / `fences.capacity`,
+ * packages/db/src/capacity-lock-order.ts).
  */
 export async function applyEngineFactsToCapacity(
   tx: Prisma.TransactionClient,

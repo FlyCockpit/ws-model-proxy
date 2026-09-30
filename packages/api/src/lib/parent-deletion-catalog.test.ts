@@ -1,20 +1,23 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { HOT_PATH_TABLES } from "@ws-model-proxy/db/capacity-lock-order";
 import {
   type DeletedParentTable,
   HISTORY_DRAIN_EDGES,
   OWNER_RETAINED_HISTORY_TABLES,
-  PARENT_DELETE_TRIGGER_WORK,
   RETAINED_HISTORY_EDGES,
   resolveDeletedParents,
+  USER_PLAIN_ID_HISTORY_TABLES,
 } from "@ws-model-proxy/db/parent-deletion";
 import { describe, expect, it } from "vitest";
 
-// DL1-TXBOUND class check: the parent-deletion contract (which history tables
-// are drained through which foreign keys before an ordered delete, and which
-// RESTRICT edges its preflight covers) must match the Prisma schema. A new
-// foreign key into the user's graph fails here until it is classified, so the
-// locked cascade cannot silently grow a traffic-proportional table again.
+// The parent-deletion contract against the Prisma schema (DL-1 design (d),
+// #78): a delete cascades only into graph and bounded auxiliary tables (no
+// hot-path table has a foreign key into the graph), every hot-path table is
+// in the user-history contract with real columns, and the preflight covers
+// every RESTRICT edge. A new foreign key into the user's graph fails here
+// until it is classified, so the delete cannot silently grow a
+// traffic-proportional cascade again.
 
 type Action = "Cascade" | "SetNull" | "Restrict" | "NoAction" | "SetDefault";
 type Edge = { child: string; column: string; parent: string; action: Action };
@@ -91,7 +94,6 @@ const GRAPH_TABLES: Record<string, string> = {
   oauth_refresh_token: "OAuth tokens (retention cleanup)",
   mcp_grant: "per client grant",
   mcp_personal_token: "personal tokens",
-  dashboard_notice: "notices",
   cli_device: "configuration",
   cli_device_credential: "configuration",
   cli_token: "configuration",
@@ -110,13 +112,89 @@ const GRAPH_TABLES: Record<string, string> = {
   provider_credential: "configuration",
   provider_budget_policy: "configuration",
   provider_budget_rule: "configuration",
-  cache_affinity_record: "bounded per pool (affinityMaxRecords) and swept",
   capacity_audit_event: "one row per owner policy edit, not per request",
   media_asset: "uploads, deleted at expiry by the media cleanup",
 };
 
 /** Tables whose rows make the delete fail; the preflight refuses first. */
-const RETAINED_TABLES = new Set<string>(["capacity_lease", ...OWNER_RETAINED_HISTORY_TABLES]);
+const RETAINED_TABLES = new Set<string>(OWNER_RETAINED_HISTORY_TABLES);
+const hot = new Set<string>(HOT_PATH_TABLES);
+
+/**
+ * DELETE triggers on tables a user delete reaches, and the work each adds:
+ * none of them writes rows.
+ */
+const REACHED_DELETE_TRIGGERS: Record<string, string> = {
+  "z_graph_write_fence:user":
+    "graph-write fence check (plain reads); the user delete holds the owner fences",
+  "provider_audit_event_immutable:provider_audit_event":
+    "retained history the preflight refuses; never fires on a delete that proceeds",
+  "provider_budget_rule_immutable:provider_budget_rule":
+    "raises 55000 on any DELETE, a permanent refusal (isPermanentParentDeletionFailure)",
+};
+
+/**
+ * Tables with an owner `userId` column that is NOT a foreign key: the cascade
+ * never reaches them, so each must be drained (USER_PLAIN_ID_HISTORY_TABLES)
+ * or listed here with the reason a user delete may leave the rows.
+ */
+const PLAIN_USER_ID_EXEMPT: Record<string, string> = {};
+
+/** Tables with a plain `userId` column (owner) and no relation on it. */
+function plainUserIdTables(): Array<{ table: string; column: string }> {
+  const found: Array<{ table: string; column: string }> = [];
+  for (const file of readdirSync(schemaDir).filter((name) => name.endsWith(".prisma"))) {
+    const source = readFileSync(join(schemaDir, file), "utf8");
+    for (const match of source.matchAll(/^model (\w+) \{([\s\S]*?)^\}/gm)) {
+      const [, name = "", body = ""] = match;
+      const table = /@@map\("([^"]+)"\)/.exec(body)?.[1] ?? name;
+      const related = new Set<string>();
+      for (const line of body.split("\n")) {
+        const fields = /fields:\s*\[([^\]]*)\]/.exec(line)?.[1];
+        for (const field of (fields ?? "").split(",")) related.add(field.trim());
+      }
+      for (const line of body.split("\n")) {
+        const [column = "", type = ""] = line.trim().split(/\s+/);
+        if (column === "userId" && type.startsWith("String") && !related.has(column))
+          found.push({ table, column });
+      }
+    }
+  }
+  return found;
+}
+
+describe("plain user-id tables", () => {
+  it("classifies every table with a user id column that has no foreign key", () => {
+    const unclassified = plainUserIdTables().filter(
+      ({ table }) =>
+        !(table in USER_PLAIN_ID_HISTORY_TABLES) &&
+        !(table in PLAIN_USER_ID_EXEMPT) &&
+        // Hot-path history is drained by HISTORY_DRAIN_EDGES and the
+        // `deleted_user_purge` sweeper (#78); the queue table itself is
+        // hot-path bookkeeping keyed by the deleted user.
+        !hot.has(table) &&
+        table !== "deleted_user_purge",
+    );
+    expect(unclassified).toEqual([]);
+  });
+
+  it("drains cli_agent_action_event by its userId column", () => {
+    expect(USER_PLAIN_ID_HISTORY_TABLES.cli_agent_action_event.userColumn).toBe("userId");
+    expect(plainUserIdTables()).toContainEqual({
+      table: "cli_agent_action_event",
+      column: "userId",
+    });
+  });
+
+  it("has no stale classification", () => {
+    const actual = new Set(plainUserIdTables().map(({ table }) => table));
+    for (const table of [
+      ...Object.keys(USER_PLAIN_ID_HISTORY_TABLES),
+      ...Object.keys(PLAIN_USER_ID_EXEMPT),
+    ])
+      expect(actual.has(table), table).toBe(true);
+  });
+});
 
 describe("parent-deletion contract against the Prisma schema", () => {
   it("classifies every table a user delete cascades into or rewrites", () => {
@@ -134,22 +212,36 @@ describe("parent-deletion contract against the Prisma schema", () => {
       expect(tables.has(table), table).toBe(true);
   });
 
-  it("drains every foreign key from a history table into the deleted graph, with its action", () => {
+  it("keeps every hot-path table out of the delete's cascade and in the user-history contract", () => {
+    // No foreign key crosses between a hot-path table and any other table
+    // (in either direction), so no delete reaches one.
+    const crossing = edges
+      .filter((edge) => hot.has(edge.child) !== hot.has(edge.parent))
+      .map((edge) => `${edge.child}.${edge.column} -> ${edge.parent}`);
+    expect(crossing).toEqual([]);
+    expect([...reach].filter((table) => hot.has(table))).toEqual([]);
+    // The history contract names exactly the hot-path tables.
+    expect(Object.keys(HISTORY_DRAIN_EDGES).sort()).toEqual([...hot].sort());
+    const models = readdirSync(schemaDir)
+      .filter((name) => name.endsWith(".prisma"))
+      .map((name) => readFileSync(join(schemaDir, name), "utf8"))
+      .join("\n");
     for (const [table, spec] of Object.entries(HISTORY_DRAIN_EDGES)) {
-      const actual = edges
-        .filter((edge) => edge.child === table)
-        .map((edge) => `${edge.column}->${edge.parent}:${edge.action}`)
-        .sort();
-      const declared = [
-        ...spec.cascade.map(([column, parent]) => `${column}->${parent}:Cascade`),
-        ...spec.setNull.map(([column, parent]) => `${column}->${parent}:SetNull`),
-      ];
+      const body = [...models.matchAll(/^model (\w+) \{([\s\S]*?)^\}/gm)].find(
+        (match) => (/@@map\("([^"]+)"\)/.exec(match[2] ?? "")?.[1] ?? match[1]) === table,
+      )?.[2];
+      expect(body, table).toBeDefined();
+      // Every user column the purge deletes by exists on the table.
+      for (const [column] of spec.delete)
+        expect(new RegExp(`^\\s+${column}\\s`, "m").test(body ?? ""), `${table}.${column}`).toBe(
+          true,
+        );
+      // Internal keys are foreign keys to another hot-path table.
       const internal = new Set<string>(spec.internal);
-      const external = actual.filter((entry) => !internal.has(entry.split("->")[0] ?? ""));
-      expect(external, table).toEqual(declared.sort());
-      // Internal edges point at another drained history table.
-      for (const edge of edges.filter((e) => e.child === table && internal.has(e.column)))
-        expect(history.has(edge.parent), `${table}.${edge.column}`).toBe(true);
+      for (const edge of edges.filter((e) => e.child === table))
+        expect(internal.has(edge.column) && hot.has(edge.parent), `${table}.${edge.column}`).toBe(
+          true,
+        );
     }
   });
 
@@ -293,22 +385,12 @@ describe("parent-deletion contract against the Prisma schema", () => {
         table: match[4] ?? "",
       }));
     // The parser sees the known one (a control for the pattern itself).
-    expect(deleteTriggers.map((trigger) => trigger.id)).toContain("usage_rollup_detach_requester");
-    const onReachedTables = deleteTriggers.filter((trigger) => touched.has(trigger.table));
-    const declared = PARENT_DELETE_TRIGGER_WORK.map((entry) => ({
-      id: entry.id,
-      timing: entry.timing,
-      table: entry.parentTable,
-    }));
-    const byId = (a: { id: string }, b: { id: string }) => a.id.localeCompare(b.id);
-    expect(onReachedTables.sort(byId)).toEqual([...declared].sort(byId));
-    // DELETE triggers elsewhere sit on retained history the preflight refuses
-    // (RESTRICT) or on tables the delete never reaches.
-    for (const trigger of deleteTriggers.filter((t) => !touched.has(t.table)))
-      expect(
-        RETAINED_TABLES.has(trigger.table) || !reach.has(trigger.table),
-        `${trigger.id} on ${trigger.table}`,
-      ).toBe(true);
+    expect(deleteTriggers.map((trigger) => trigger.id)).toContain("z_graph_write_fence");
+    const onReachedTables = deleteTriggers
+      .filter((trigger) => touched.has(trigger.table))
+      .map((trigger) => `${trigger.id}:${trigger.table}`)
+      .sort();
+    expect(onReachedTables).toEqual(Object.keys(REACHED_DELETE_TRIGGERS).sort());
   });
 
   it("covers every RESTRICT edge into the deleted graph with the preflight", () => {
@@ -326,7 +408,6 @@ describe("parent-deletion contract against the Prisma schema", () => {
       const table = edge.split(".")[0] ?? "";
       if (coverage === "owner-history" && edge !== "provider_credential.replacedById")
         expect(OWNER_RETAINED_HISTORY_TABLES, edge).toContain(table);
-      if (coverage === "lease") expect(table).toBe("capacity_lease");
     }
   });
 });

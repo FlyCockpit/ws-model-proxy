@@ -5,11 +5,17 @@ import {
   mcpCommandModeFromDb,
 } from "@ws-model-proxy/api/lib/mcp-command-mode";
 import {
+  CLI_AGENT_ACTION_UNKNOWN_DEVICE,
+  type CliAgentActionKind,
+  type CliAgentActionOutcome,
+} from "@ws-model-proxy/config/cli-agent-audit";
+import {
   type CliAgentAdmissionRejection,
   judgeCliAgentAdmission,
   readCliAgentAdmission,
   revokeOpenCliAgentAdmissions,
 } from "./cli-agent-admission.js";
+import { recordCliAgentAction } from "./cli-agent-audit.js";
 import {
   FILE_BODY_MAX_BYTES,
   type FileErrorCode,
@@ -81,6 +87,7 @@ export type FileOpSuccess = {
 export type FileOpOutcome = FileOpSuccess | FileOpFailure;
 
 type FileOpRecord = TrackedFileOp & {
+  audit: FileAudit;
   userId: string;
   tokenId: string;
   mutating: boolean;
@@ -150,6 +157,131 @@ function pendingCounts(userId: string, cliDeviceId: string): { user: number; cli
 }
 
 // ---------------------------------------------------------------------------
+// Audit (#104 part B). Metadata only: the kind, the requested path, the etag
+// the caller expected and the etag or size the result carries, the byte count
+// of a write, the outcome and a stable reason code. Never content, diffs or
+// masked text. Every op that reaches `runFileOp` is recorded exactly once:
+// refusals before dispatch by `runFileOp` itself, dispatched ops by `settle`.
+
+const FILE_AUDIT_KINDS: Readonly<Record<FileOp, CliAgentActionKind>> = {
+  read: "file_read",
+  stat: "file_stat",
+  list: "file_list",
+  search: "file_search",
+  edit: "file_edit",
+  write: "file_write",
+  rename: "file_rename",
+  mkdir: "file_mkdir",
+  delete: "file_delete",
+};
+
+type FileAudit = {
+  userId: string;
+  tokenId: string;
+  cliDeviceId: string;
+  kind: CliAgentActionKind;
+  path: string;
+  etagBefore: string | null;
+  bytes: number | null;
+  startedAt: Date;
+  /**
+   * The admission verdict resolved `cliDeviceId` to one of the caller's own
+   * devices. Before that the id is caller-supplied text, so the row stores
+   * {@link CLI_AGENT_ACTION_UNKNOWN_DEVICE} instead (as the command audit does).
+   */
+  deviceVerified: boolean;
+  /** The op was registered: `settle` records it. */
+  registered: boolean;
+  recorded: boolean;
+};
+
+function stringField(source: unknown, key: string): string | null {
+  if (source === null || typeof source !== "object") return null;
+  const value: unknown = Reflect.get(source, key);
+  return typeof value === "string" ? value : null;
+}
+
+/** The path an event names: `path`, `root`, the first of `paths`, or a rename's `from`. */
+function auditPathOf(args: unknown): string {
+  const direct =
+    stringField(args, "path") ?? stringField(args, "root") ?? stringField(args, "from");
+  if (direct !== null) return direct;
+  if (args !== null && typeof args === "object") {
+    const paths: unknown = Reflect.get(args, "paths");
+    if (Array.isArray(paths) && typeof paths[0] === "string") return paths[0];
+  }
+  return "";
+}
+
+function newFileAudit(input: RunFileOpInput): FileAudit {
+  return {
+    userId: input.userId,
+    tokenId: input.tokenId,
+    cliDeviceId: input.cliDeviceId,
+    kind: FILE_AUDIT_KINDS[input.op],
+    path: auditPathOf(input.args),
+    etagBefore: stringField(input.args, "expectedEtag"),
+    bytes: input.op === "write" && input.body ? input.body.byteLength : null,
+    startedAt: new Date(),
+    deviceVerified: false,
+    registered: false,
+    recorded: false,
+  };
+}
+
+/** Codes of an op that started or was refused by the server's own state, not by the file. */
+const CANCELLED_CODES: ReadonlySet<string> = new Set([
+  "cancelled",
+  "timeout",
+  "offline",
+  "token_inactive",
+  "grant_disabled",
+  "feature_disabled",
+  "supervised_only",
+]);
+
+function auditOutcomeOf(
+  audit: FileAudit,
+  outcome: FileOpOutcome,
+): { outcome: CliAgentActionOutcome; reason: string | null } {
+  if (outcome.ok) return { outcome: "completed", reason: null };
+  if (outcome.outcome === "unknown") return { outcome: "unknown", reason: outcome.code };
+  if (!audit.registered) return { outcome: "refused", reason: outcome.code };
+  return {
+    outcome: CANCELLED_CODES.has(outcome.code) ? "cancelled" : "failed",
+    reason: outcome.code,
+  };
+}
+
+/** The ONE call site of `recordCliAgentAction` for file ops. Never throws. */
+function recordFileAudit(audit: FileAudit, outcome: FileOpOutcome): void {
+  if (audit.recorded) return;
+  audit.recorded = true;
+  const { outcome: auditOutcome, reason } = auditOutcomeOf(audit, outcome);
+  let etagAfter: string | null = null;
+  let bytes = audit.bytes;
+  if (outcome.ok) {
+    etagAfter = stringField(outcome.result, "etag");
+    const size: unknown = Reflect.get(outcome.result, "size");
+    if (bytes === null && audit.kind === "file_write" && typeof size === "number") bytes = size;
+  }
+  recordCliAgentAction({
+    userId: audit.userId,
+    cliDeviceId: audit.deviceVerified ? audit.cliDeviceId : CLI_AGENT_ACTION_UNKNOWN_DEVICE,
+    mcpTokenId: audit.tokenId,
+    kind: audit.kind,
+    path: audit.path,
+    etagBefore: audit.etagBefore,
+    etagAfter,
+    bytes,
+    outcome: auditOutcome,
+    reason,
+    startedAt: audit.startedAt,
+    finishedAt: new Date(),
+  });
+}
+
+// ---------------------------------------------------------------------------
 // The single settle point. Every path that ends an op (result, rejection,
 // timeout, session loss, revoke, malformed answer) goes through here exactly
 // once.
@@ -161,12 +293,7 @@ function settle(record: FileOpRecord, outcome: FileOpOutcome): void {
   record.deadlineTimer = null;
   pendingById.delete(record.opId);
   relaySessionManager.forgetFileOp(record.cliDeviceId, record.opId);
-  // TODO(#132): record the audit event here, the ONE place a file op ends.
-  // Call `recordCliAgentAction` (from PR #132, not merged yet) with: userId,
-  // cliDeviceId, tokenId, kind file_read|file_write by `record.mutating`, the
-  // op and PATH from the request (never content or diffs), the outcome
-  // (`outcome.ok`, `outcome.code`, `outcome.outcome === "unknown"`), and the
-  // elapsed time from `record.startedAt`. Do not add another call site.
+  recordFileAudit(record.audit, outcome);
   record.resolve(outcome);
 }
 
@@ -199,6 +326,7 @@ function finishResult(record: FileOpRecord, frame: FileResultFrame, spilled: str
 }
 
 function newRecord(input: {
+  audit: FileAudit;
   opId: string;
   userId: string;
   tokenId: string;
@@ -208,6 +336,7 @@ function newRecord(input: {
   resolve: (outcome: FileOpOutcome) => void;
 }): FileOpRecord {
   const record: FileOpRecord = {
+    audit: input.audit,
     opId: input.opId,
     cliDeviceId: input.cliDeviceId,
     op: input.op,
@@ -285,6 +414,21 @@ function invalid(): FileOpFailure {
  * dispatch).
  */
 export async function runFileOp(input: RunFileOpInput): Promise<FileOpOutcome> {
+  const audit = newFileAudit(input);
+  let outcome: FileOpOutcome;
+  try {
+    outcome = await runFileOpChecked(input, audit);
+  } catch (error) {
+    recordFileAudit(audit, { ok: false, code: "io_error" });
+    throw error;
+  }
+  // Refused before dispatch: no record exists, so record it here. A registered
+  // op is recorded by `settle` (possibly after this caller already got its answer).
+  if (!audit.registered) recordFileAudit(audit, outcome);
+  return outcome;
+}
+
+async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promise<FileOpOutcome> {
   const mutating = isMutatingFileOp(input.op);
   const opClass: FileOpClass = mutating ? "write" : "read";
   if (input.signal?.aborted) return { ok: false, code: "cancelled" };
@@ -294,6 +438,10 @@ export async function runFileOp(input: RunFileOpInput): Promise<FileOpOutcome> {
     mutating ? "file_write" : "file_read",
   );
   // From the verdict to the dispatch nothing awaits (see `Admission`).
+  // The verdict resolved the device to one of the caller's own unless it said
+  // the device is unknown or the token/owner is out (checked before ownership).
+  audit.deviceVerified =
+    verdict.ok || (verdict.error !== "not_found" && verdict.error !== "token_inactive");
   if (!verdict.ok) {
     return {
       ok: false,
@@ -349,6 +497,7 @@ export async function runFileOp(input: RunFileOpInput): Promise<FileOpOutcome> {
 
   return await new Promise<FileOpOutcome>((resolve) => {
     const record = newRecord({
+      audit,
       opId,
       userId: input.userId,
       tokenId: input.tokenId,
@@ -358,6 +507,7 @@ export async function runFileOp(input: RunFileOpInput): Promise<FileOpOutcome> {
       resolve,
     });
     pendingById.set(opId, record);
+    audit.registered = true;
     let dispatched = false;
     try {
       dispatched = relaySessionManager.dispatchFileOp(record, frame, input.body);
@@ -371,6 +521,7 @@ export async function runFileOp(input: RunFileOpInput): Promise<FileOpOutcome> {
       // outcome.
       pendingById.delete(opId);
       record.settled = true;
+      audit.registered = false;
       relaySessionManager.forgetFileOp(record.cliDeviceId, opId);
       const refusal = relaySessionManager.fileOpModeRefusal(input.cliDeviceId, opClass);
       resolve({ ok: false, code: refusal ?? "offline" });

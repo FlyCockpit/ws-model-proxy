@@ -668,11 +668,12 @@ export async function lockExternalSendConsent(
  * No user-row lock: every statement after this read (the credential re-read,
  * the `lastUsedAt` write on a row this transaction already holds FOR UPDATE,
  * and commit) is non-blocking, and none of them writes a row the ban or
- * deletion-mark writers read. A mark or ban that commits after this read is
- * therefore serializable after the claim, exactly the outcome a FOR SHARE
- * lock would force (the writer waiting for this commit), without adding the
- * `user` row to the E0 lock order. A mark that commits before this read is
- * seen (a later READ COMMITTED statement).
+ * deletion-mark writers read. A mark or ban that commits after this read
+ * cannot affect the claim's decision (the send was already decided under the
+ * earlier state); its commit may land before or after the claim commits.
+ * That is the send-level outcome a FOR SHARE lock would force, without
+ * adding the `user` row to the E0 lock order. A mark that commits before this
+ * read is seen (a later READ COMMITTED statement).
  */
 export async function recheckExternalSendRequesterValidity(
   tx: RequesterValidityClient,

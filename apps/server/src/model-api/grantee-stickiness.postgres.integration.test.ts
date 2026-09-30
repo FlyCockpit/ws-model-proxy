@@ -1,5 +1,7 @@
 import type { VisibleModelPoolTarget } from "@ws-model-proxy/api/lib/model-api-token-access";
-import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
+// Fixture writes need no owner fences (the graph-write fence triggers accept
+// this client); production code under test uses its own clients.
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { describe, expect, it, vi } from "vitest";
 import type { ActiveRelayResponseHandlers } from "../relay/session-manager.js";
 import type { StoreCapacityAdmissionRuntime } from "./capacity/runtime.js";
@@ -30,7 +32,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
   it("binds grantee follow-ups to the served member through the exact grant, and attributes a request whose pool was deleted in flight to the owner", async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const suffix = crypto.randomUUID();
     let runtime: StoreCapacityAdmissionRuntime | undefined;
     const user = (label: string) =>
@@ -331,7 +333,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       runtime = capacityRuntime;
       const { reconcileStaleLocalRelayTelemetry } = await import("./relay-telemetry-recovery.js");
       const { prepareParentDeletion } = await import("@ws-model-proxy/db/parent-deletion");
-      const { lockCapacityGraphForDelete, runCapacityOrderedTransaction } = await import(
+      const { fenceParentDelete, runCapacityOrderedTransaction } = await import(
         "@ws-model-proxy/db/capacity-lock-order"
       );
 
@@ -435,9 +437,11 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
         ).toBe(index + 3);
       }
 
-      // 3. Revoking the grant removes every binding it created. A follow-up
-      //    resolved before the revoke and admitted after it is refused at the
-      //    send boundary, without reaching a member.
+      // 3. Revoking the grant leaves its bindings as hot-path history naming
+      //    the revoked grant (DL-1 (d): no foreign key, no cascade). A
+      //    follow-up resolved before the revoke and admitted after it is
+      //    refused at the send boundary (exact-grant re-check), without
+      //    reaching a member.
       const acquire = capacityRuntime.acquire.bind(capacityRuntime);
       vi.spyOn(capacityRuntime, "acquire").mockImplementationOnce(async (attempt, signal) => {
         const admitted = await acquire(attempt, signal);
@@ -454,7 +458,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       expect(sent).not.toHaveBeenCalled();
       expect(
         await db.responseStickinessRecord.count({
-          where: { userId: grantee.id, targetModelPoolId: pool.id },
+          where: { userId: grantee.id, targetModelPoolId: pool.id, poolGrantId: { not: grant.id } },
         }),
       ).toBe(0);
       const replacement = await db.poolGrant.create({
@@ -462,13 +466,14 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       });
       visiblePool.accessGrantId = replacement.id;
       const revoked = await responses({ previous_response_id: "resp_grantee_3", input: "x" });
-      expect(revoked.status).toBe(404);
+      // access_denied: the binding survives its revoked grant as history and
+      // is no longer reachable through the replacement grant.
+      expect(revoked.status).toBe(401);
       await revoked.text();
       expect(sent).not.toHaveBeenCalled();
 
-      // 4. P3C-2: a grantee request in flight when its pool is deleted. A
-      //    pool with capacity lease history cannot be deleted (it is retained
-      //    history), so this runs on a pool without admission history.
+      // 4. P3C-2: a grantee request in flight when its pool is deleted (a
+      //    fresh pool; under DL-1 (d) lease history would not block it either).
       const inflightPool = await db.modelPool.create({
         data: { userId: owner.id, name: "Inflight", slug: `inflight-${suffix}` },
       });
@@ -565,25 +570,27 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
         (await db.relayRequest.findUniqueOrThrow({ where: { id: ownKey.id } })).resourceOwnerUserId,
       ).toBe(owner.id);
 
-      // The production delete path: drain (terminal rows only), then the
-      // ordered final delete whose SET NULL cascade detaches the PENDING rows.
-      await prepareParentDeletion(db, { userId: owner.id, poolIds: [inflightPool.id] });
+      // The production delete path (DL-1 (d)): nothing to drain for a pool,
+      // and the final delete touches no hot-path row. The in-flight request
+      // keeps its (now dangling) pool and selection ids and its owner.
+      expect(
+        await prepareParentDeletion(db, { userId: owner.id, poolIds: [inflightPool.id] }),
+      ).toEqual({});
       await runCapacityOrderedTransaction(db, async (tx) => {
-        await lockCapacityGraphForDelete(tx, { userId: owner.id, poolIds: [inflightPool.id] });
+        await fenceParentDelete(tx, { userId: owner.id, poolIds: [inflightPool.id] });
         await tx.modelPool.delete({ where: { id: inflightPool.id } });
       });
       expect(
         await db.relayRequest.findUniqueOrThrow({ where: { id: inflight.relayRequestId } }),
       ).toMatchObject({
-        requestedModelPoolId: null,
+        requestedModelPoolId: inflightPool.id,
         resourceOwnerUserId: owner.id,
-        selectedExecutionTargetId: null,
-        selectedPoolMemberId: null,
+        selectedExecutionTargetId: pending.selectedExecutionTargetId,
+        selectedPoolMemberId: pending.selectedPoolMemberId,
         status: "PENDING",
       });
 
-      // The late finalizer re-writes the owner's selection; it must commit
-      // its status and counters (without persisting that selection).
+      // The late finalizer commits its status and counters on the orphaned row.
       const warn = vi.spyOn(console, "warn");
       finishResponse(inflight.attemptId, JSON.stringify({ model: "member-model" }));
       await inflightResponse.text();
@@ -592,24 +599,20 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
           await db.relayRequest.findUniqueOrThrow({ where: { id: inflight.relayRequestId } }),
         ).toMatchObject({
           status: "SUCCEEDED",
-          requestedModelPoolId: null,
+          requestedModelPoolId: inflightPool.id,
           resourceOwnerUserId: owner.id,
-          selectedExecutionTargetId: null,
-          selectedDiscoveredModelId: null,
-          selectedPoolMemberId: null,
         }),
       );
       expect(warn).not.toHaveBeenCalledWith("[model-api] relay metadata update failed");
       warn.mockRestore();
-      // Once terminal, the orphaned grantee row accepts no selection: neither
-      // the pool owner's target nor a third party's.
-      for (const target of [memberA.target.id, foreign.target.id])
-        await expect(
-          db.relayRequest.update({
-            where: { id: inflight.relayRequestId },
-            data: { selectedExecutionTargetId: target },
-          }),
-        ).rejects.toThrow(/relay request selection must match its owner and discovered model/);
+      // The orphaned grantee row still accepts no third party's target: the
+      // durable resource owner stands in for the deleted pool's owner.
+      await expect(
+        db.relayRequest.update({
+          where: { id: inflight.relayRequestId },
+          data: { selectedExecutionTargetId: foreign.target.id },
+        }),
+      ).rejects.toThrow(/relay request selection must match its owner and discovered model/);
 
       // A PENDING orphan still rejects a third party's target.
       await expect(
@@ -622,7 +625,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       await reconcileStaleLocalRelayTelemetry();
       expect(await db.relayRequest.findUniqueOrThrow({ where: { id: orphan.id } })).toMatchObject({
         status: "FAILED",
-        requestedModelPoolId: null,
+        requestedModelPoolId: inflightPool.id,
         resourceOwnerUserId: owner.id,
       });
       await db.$transaction(async (tx) => {
@@ -653,9 +656,11 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       // Responses traffic before the delete also belongs to the owner.
       // The follow-up refused at the send boundary is a failure on the owner.
       expect(byOwner(owner.id)).toMatchObject({ successes: 4, errors: 2 });
-      expect(
-        rollups.find((row) => row.ownerUserId === owner.id && row.poolId === "")?.successes,
-      ).toBe(1);
+      // DL-1 (d): the requests keep the deleted pool's id, so every owner row
+      // (before and after the delete) is keyed by it; none falls back to "".
+      expect(rollups.filter((row) => row.ownerUserId === owner.id && row.poolId === "")).toEqual(
+        [],
+      );
       // Own-key: the requester.
       expect(byOwner(grantee.id)).toEqual({ requests: 1, successes: 1, errors: 0 });
 
@@ -675,8 +680,9 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
         },
       });
       await db.user.delete({ where: { id: lateOwner.id } });
+      // DL-1 (d): nothing cascades into the request; it keeps both ids.
       expect(await db.relayRequest.findUniqueOrThrow({ where: { id: late.id } })).toMatchObject({
-        requestedModelPoolId: null,
+        requestedModelPoolId: latePool.id,
         resourceOwnerUserId: lateOwner.id,
       });
       await db.$transaction(async (tx) => {
@@ -712,7 +718,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
 
   it("deletes a pool owner's account while a grantee binding and an in-flight grantee request remain", async () => {
     if (!databaseUrl) return;
-    const db = createPrismaClient(databaseUrl);
+    const db = createFixturePrismaClient(databaseUrl);
     const suffix = crypto.randomUUID();
     const user = (label: string) =>
       db.user.create({ data: { name: label, email: `${label}-${suffix}@example.test` } });
@@ -722,9 +728,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       const { requestUserDeletion, prepareParentDeletion } = await import(
         "@ws-model-proxy/db/parent-deletion"
       );
-      const { deleteUserInCapacityLockOrder } = await import(
-        "@ws-model-proxy/db/capacity-lock-order"
-      );
+      const { deleteUserUnderOwnerFences } = await import("@ws-model-proxy/db/capacity-lock-order");
       const pool = await db.modelPool.create({
         data: { userId: owner.id, name: "Doomed", slug: `doomed-${suffix}` },
       });
@@ -774,7 +778,9 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       expect(inflight.resourceOwnerUserId).toBe(owner.id);
 
       // The production whole-account deletion: mark, drain, final delete. A
-      // grantee binding committed after the drain reaches the final cascade.
+      // grantee binding committed after the drain is hot-path history (DL-1
+      // (d)): the final delete does not reach it; it stays behind naming the
+      // deleted grant and pool, never served again, until it expires.
       const mark = await requestUserDeletion(db, owner.id);
       if (!mark) throw new Error("deletion mark was not taken");
       await prepareParentDeletion(
@@ -793,12 +799,20 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
           expiresAt: new Date(Date.now() + 60_000),
         },
       });
-      expect(await deleteUserInCapacityLockOrder(db, owner.id, mark.generation)).toBe(true);
+      expect(await deleteUserUnderOwnerFences(db, owner.id, mark.generation)).toBe(true);
       expect(await db.user.count({ where: { id: owner.id } })).toBe(0);
-      expect(await db.responseStickinessRecord.count({ where: { userId: grantee.id } })).toBe(0);
+      expect(await db.poolGrant.count({ where: { id: grant.id } })).toBe(0);
+      expect(
+        await db.responseStickinessRecord.findMany({
+          where: { userId: grantee.id },
+          select: { poolGrantId: true, targetModelPoolId: true },
+        }),
+      ).toEqual([{ poolGrantId: grant.id, targetModelPoolId: pool.id }]);
 
-      // The late finalizer re-writes the owner's (now deleted) selection: it is
-      // dropped, and the status commits with the durable owner kept.
+      // The late finalizer re-writes the owner's (now deleted) selection: the
+      // status commits with the durable owner kept. The ids stay as dangling
+      // history (no live parent to check them against); readers show a
+      // deleted owner's identities to nobody else.
       await db.relayRequest.update({
         where: { id: inflight.id },
         data: {
@@ -812,11 +826,8 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       expect(await db.relayRequest.findUniqueOrThrow({ where: { id: inflight.id } })).toMatchObject(
         {
           status: "SUCCEEDED",
-          requestedModelPoolId: null,
+          requestedModelPoolId: pool.id,
           resourceOwnerUserId: owner.id,
-          selectedDiscoveredModelId: null,
-          selectedExecutionTargetId: null,
-          selectedPoolMemberId: null,
         },
       );
     } finally {

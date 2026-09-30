@@ -66,6 +66,13 @@ export type ServerShutdownDeps = {
   stopUserDeletionSweep: StopUserDeletionSweep;
   userDeletionSweepClient: StatementBoundedPrismaClient;
   relaySessions: ShutdownRelaySessions;
+  /**
+   * Flushes the agent audit queue. Runs right after the relay sessions close
+   * (their cancellations are audited) and before the database fence arms, so
+   * those events are written; it never rejects and shares the relay-close
+   * deadline.
+   */
+  flushAgentAudit: () => Promise<void>;
   terminalHub: { closeAll(): void };
   server: ShutdownHttpServer;
   capacityLifecycle?: {
@@ -137,6 +144,7 @@ export function installServerShutdown(deps: ServerShutdownDeps): ServerShutdown 
       },
       closeRelaySessions: async () => {
         await relaySessions.closeRelaySessions();
+        await deps.flushAgentAudit();
       },
       // Admission stops first (relay drain flag makes terminal and CLI
       // upgrades return 503; server.close stops new connections), then the

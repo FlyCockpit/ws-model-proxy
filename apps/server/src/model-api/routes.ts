@@ -145,6 +145,7 @@ import {
   transformerSupportedModalities,
   wrapTransformEnvelope,
 } from "./media-transform.js";
+import { applyMetricRoutingVerdicts } from "./metric-routing-order.js";
 import {
   multimodalFlagsFromCapabilities,
   openAiModelListExtensions,
@@ -230,6 +231,12 @@ import {
   transcriptionRequestProfileFromParts,
 } from "./transcription-request.js";
 import { type RelayRequestSourceValue, transitionRelayRequestTerminal } from "./usage-rollup.js";
+import {
+  assessWarmProtection,
+  protectionRouting,
+  type WarmProtectionPolicy,
+  warmProtectionSource,
+} from "./warm-protection.js";
 
 type ModelApiRouteDependencies = {
   manager?: Pick<
@@ -709,6 +716,8 @@ const inferenceCapacityRelaySelect = {
   templateVersion: true,
   engine: true,
   cacheNamespace: true,
+  engineKind: true,
+  kvBudgetTokens: true,
 } satisfies Prisma.InferenceCapacitySelect;
 
 const relayEndpointSelect = {
@@ -781,6 +790,11 @@ const poolMemberRelaySelect = {
       capacityWaitBudgetMs: true,
       externalAfterWaitMs: true,
       cacheHolderWaitMs: true,
+      protectionEnabled: true,
+      protectionWindowSeconds: true,
+      protectMinTokens: true,
+      protectionShare: true,
+      protectionFixedPercent: true,
       affinityEnabled: true,
       affinityTtlSeconds: true,
       affinityMaxRecords: true,
@@ -970,6 +984,19 @@ function poolAdmissionCandidate(
     candidateOrder,
     deadlineAt: new Date(requestDeadlineMs),
     waitBudgetMs: localAdmissionWaitBudget(effectiveMemberWaitBudget(member), externalAfterWaitMs),
+  };
+}
+
+function warmProtectionPolicyForMember(
+  member: PoolMemberRelayRow | undefined,
+): WarmProtectionPolicy {
+  const pool = member?.ModelPool;
+  return {
+    enabled: pool?.protectionEnabled ?? false,
+    windowSeconds: pool?.protectionWindowSeconds ?? 300,
+    minTokens: pool?.protectMinTokens ?? 8192,
+    share: pool?.protectionShare ?? "EQUAL_SHARE",
+    fixedPercent: pool?.protectionFixedPercent ?? null,
   };
 }
 
@@ -3131,7 +3158,7 @@ async function resolveStickyRoute({
   };
 }): Promise<StickyRoute | Response> {
   const routingKeyDigest = responseStickinessDigest({ requester, responseId });
-  const record = await prisma.responseStickinessRecord.findUnique({
+  const stored = await prisma.responseStickinessRecord.findUnique({
     where: {
       userId_routingKeyDigest: {
         userId: requester.userId,
@@ -3155,14 +3182,39 @@ async function resolveStickyRoute({
       upstreamResponseIdDigest: true,
       fallbackRoute: true,
       poolGrantId: true,
-      PoolGrant: {
-        select: { id: true, poolId: true, ownerUserId: true, granteeUserId: true },
-      },
-      TargetExecutionTarget: { select: { discoveredModelId: true } },
-      SelectedExecutionTarget: { select: { discoveredModelId: true } },
+      targetExecutionTargetId: true,
       expiresAt: true,
     },
   });
+  // Stickiness is hot-path history (@ws-model-proxy/db/capacity-lock-order):
+  // it names its grant and targets by plain id, with no foreign key. A
+  // deleted grant or target simply is not found, which fails closed below
+  // exactly as its former ON DELETE CASCADE did.
+  const [PoolGrant, TargetExecutionTarget, SelectedExecutionTarget] = stored
+    ? await Promise.all([
+        stored.poolGrantId
+          ? prisma.poolGrant.findUnique({
+              where: { id: stored.poolGrantId },
+              select: { id: true, poolId: true, ownerUserId: true, granteeUserId: true },
+            })
+          : null,
+        stored.targetExecutionTargetId
+          ? prisma.executionTarget.findUnique({
+              where: { id: stored.targetExecutionTargetId },
+              select: { discoveredModelId: true },
+            })
+          : null,
+        stored.selectedExecutionTargetId
+          ? prisma.executionTarget.findUnique({
+              where: { id: stored.selectedExecutionTargetId },
+              select: { discoveredModelId: true },
+            })
+          : null,
+      ])
+    : [null, null, null];
+  const record = stored
+    ? { ...stored, PoolGrant, TargetExecutionTarget, SelectedExecutionTarget }
+    : null;
 
   if ((record?.routingVersion ?? 1) >= 3) {
     const validRequester =
@@ -4479,6 +4531,8 @@ async function relayPool({
             sourceKind: ownKey ? "DIRECT" : "POOL",
             poolId: ownKey ? undefined : target.id,
             basePriority: 16,
+            // S-C: a grantee's queue priority applies to every pool waiter.
+            accessGrantId: ownKey ? undefined : target.accessGrantId,
             connectionOwner: "model-api-provider",
             deadlineAt: new Date(relayDeadlineMs),
             candidates: remaining.map((providerTarget, candidateOrder) => ({
@@ -5588,10 +5642,16 @@ async function relayPool({
           sourceKind: "POOL",
           poolId: target.id,
           basePriority: 16,
+          // S-C: the grant's queue priority (if set) replaces the pool/member
+          // priority for this grantee's waiters; the store reads it.
+          accessGrantId: target.accessGrantId,
           connectionOwner: "model-api",
           deadlineAt: new Date(relayDeadlineMs),
           candidates,
           ...(schedule ? { schedule } : {}),
+          // The shortened local phase of an `:external` caller with an external
+          // plan must not fail open on metric-FULL members: it goes external.
+          metricFailOpen: !(externalAfterWaitMs !== null && localWaitMode === "shortened"),
         },
         signal: request.signal,
       });
@@ -5624,6 +5684,7 @@ async function relayPool({
         confirmedCacheWeight: 250,
         loadPenaltyWeight: 100,
       };
+  const protectionPolicy = warmProtectionPolicyForMember(eligibleMembers[0]);
   if (requestedSurface && affinityPayload && affinityPolicy.enabled) {
     const affinityTargets = routeCandidates.flatMap((candidate) => {
       const member = memberById.get(candidate.poolMemberId);
@@ -5649,6 +5710,9 @@ async function relayPool({
           surface: requestedSurface,
           payload: affinityPayload,
           targets: affinityTargets,
+          // S-C: even one member must know whether this is a continuation
+          // (only protection needs it: a pool without it pays no extra reads).
+          scoreSingleTarget: Boolean(capacityRuntime) && protectionPolicy.enabled,
         });
         const affinityOrder = new Map(
           affinityDecision.orderedTargetIds.map((executionTargetId, index) => [
@@ -5679,6 +5743,87 @@ async function relayPool({
       }
     }
   }
+  // Metric routing rules (S-B part 2), after compatibility and affinity:
+  // metric-FULL members are dropped (all kept when every one is FULL; then
+  // admission fails open, except an `:external` caller's shortened local
+  // phase), and `avoid` members rank last. Grant time re-checks FULL.
+  const metricOrder = await applyMetricRoutingVerdicts(routeCandidates);
+  routeCandidates = metricOrder.candidates;
+  if (metricOrder.allFull) {
+    console.warn("[model-api] every pool candidate is metric-FULL", {
+      poolId: target.id,
+      relayRequestId,
+    });
+  }
+  // Saturation S-C: warm-session protection (redirect-only). A new session
+  // avoids members whose idle capacity holds other conversations' protected warm
+  // sessions: they route last, and with an external plan they are left out
+  // of the first local admission (or, when nothing else can serve, the
+  // request goes external first). It needs the affinity decision to tell a
+  // continuation (never redirected) from a new session, so without one
+  // nothing changes. Like affinity, it is an optimization only.
+  let protectionInitialCandidates: typeof routeCandidates | null = null;
+  let protectionExternalFirst = false;
+  if (capacityRuntime && affinityDecision && protectionPolicy.enabled) {
+    const decision = affinityDecision;
+    const affineMember = (poolMemberId: string) => {
+      const executionTargetId = memberById.get(poolMemberId)?.ExecutionTarget?.id;
+      return executionTargetId
+        ? (decision.prefixDepths[executionTargetId] ?? 0) > 0 ||
+            decision.conversationMatches[executionTargetId] === true
+        : false;
+    };
+    try {
+      const verdicts = await assessWarmProtection({
+        ownerId: target.ownerUserId,
+        policy: protectionPolicy,
+        members: routeCandidates.flatMap(({ poolMemberId }) => {
+          const member = memberById.get(poolMemberId);
+          const capacity = member?.ExecutionTarget?.InferenceCapacity;
+          if (!member || !capacity) return [];
+          return [
+            {
+              poolMemberId,
+              capacityId: capacity.id,
+              slots: capacity.hardConcurrencyLimit,
+              // Token mode uses the engine KV budget (protocol 2.7) when the
+              // engine reports one; llama.cpp stays slot-based with a
+              // smaller window (assessWarmProtection).
+              kvBudgetTokens: capacity.kvBudgetTokens,
+              engineKind: capacity.engineKind,
+              affine: affineMember(poolMemberId),
+              requestTokens:
+                (nativeCounts.get(poolMemberId) ?? operation.contextCount)?.tokens ?? 0,
+            },
+          ];
+        }),
+        source: warmProtectionSource,
+      });
+      const routing = protectionRouting({
+        candidates: routeCandidates.map(({ poolMemberId }) => ({
+          poolMemberId,
+          affine: affineMember(poolMemberId),
+        })),
+        verdicts,
+        externalPlan: externalAfterWaitMs !== null,
+      });
+      const candidateById = new Map(
+        routeCandidates.map((candidate) => [candidate.poolMemberId, candidate] as const),
+      );
+      const resolve = (ids: readonly string[]) =>
+        ids.flatMap((id) => {
+          const candidate = candidateById.get(id);
+          return candidate ? [candidate] : [];
+        });
+      routeCandidates = resolve(routing.order);
+      protectionInitialCandidates =
+        routing.initial.length === routing.order.length ? null : resolve(routing.initial);
+      protectionExternalFirst = routing.externalFirst;
+    } catch {
+      protectionInitialCandidates = null;
+      protectionExternalFirst = false;
+    }
+  }
   let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
   let selectedRouteCandidates = routeCandidates;
   const applyMemberContextCount = async (poolMemberId: string) => {
@@ -5703,9 +5848,31 @@ async function relayPool({
       cacheHolderPlan = null;
     }
   }
+  if (capacityRuntime && protectionExternalFirst) {
+    // S-C decision step 4: only PROTECTED (or PROTECTED + FULL) members and a
+    // live external plan: go external now. When the attempt does not
+    // dispatch, protection never blocks: admit over every member (PROTECTED
+    // last, oldest/cheapest first) with the full local budget, since the one
+    // external phase of this request is used up.
+    const overflow = await tryPublicOverflow("LOCAL_SATURATED_PROTECTED", async () => undefined);
+    if (overflow.kind === "response") return overflow.response;
+    // A cancel or a lost access (#76) ends the request; never resume locally.
+    const terminal = terminalExternalFailure(overflow);
+    if (terminal) {
+      await operation.dispose?.();
+      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: terminal });
+      return operationFailureResponse(operation, terminal);
+    }
+    localWaitMode = "full";
+  }
   if (capacityRuntime) {
     localWaitAnchorMs = performance.now();
-    const admissionCandidates = admissionCandidatesForRoutes(routeCandidates);
+    // S-C: with an external plan, PROTECTED members sit out the first
+    // admission; every later round (resume after the external phase,
+    // pre-commit retries) may use them.
+    const admissionCandidates = admissionCandidatesForRoutes(
+      protectionInitialCandidates ?? routeCandidates,
+    );
     if (admissionCandidates.some((candidate) => candidate === null)) {
       await operation.dispose?.();
       await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "unsupported_capability" });
@@ -6858,6 +7025,7 @@ async function relaySelectedModelNoFailover({
           sourceKind: requestedModelPoolId ? "POOL" : "DIRECT",
           poolId: requestedModelPoolId,
           basePriority: 16,
+          accessGrantId: requestedModelPoolId ? poolAccess?.accessGrantId : undefined,
           connectionOwner: "model-api",
           deadlineAt: new Date(startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS),
           candidates: [
@@ -7830,6 +7998,7 @@ function operationTreatsExternalAsBase(
 
 function externalFallbackReasonHeader(reason: PublicOverflowReason): string {
   if (reason === "LOCAL_WAIT_EXPIRED") return "local_wait_expired";
+  if (reason === "LOCAL_SATURATED_PROTECTED") return "local_saturated_protected";
   if (reason === "NO_COMPATIBLE_HEALTHY_PRIMARY") return "no_local_member";
   if (reason === "LOCAL_CONTEXT_CEILING") return "local_context_ceiling";
   return "local_failure";
@@ -8405,6 +8574,7 @@ async function relayBoundProviderResponse(input: {
         sourceKind: ownKey ? "DIRECT" : "POOL",
         poolId: ownKey ? undefined : input.stickyRoute.visibleTarget.id,
         basePriority: 16,
+        accessGrantId: ownKey ? undefined : input.stickyRoute.visibleTarget.accessGrantId,
         connectionOwner: "model-api-provider-stickiness",
         deadlineAt: new Date(boundStartedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS),
         candidates: [

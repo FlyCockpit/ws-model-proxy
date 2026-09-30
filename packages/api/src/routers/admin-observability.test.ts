@@ -17,6 +17,13 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 
 const { default: prisma } = await import("@ws-model-proxy/db");
 
+const relations = prisma as unknown as {
+  user: { findMany: MockInstance };
+  modelApiToken: { findMany: MockInstance };
+  discoveredModel: { findMany: MockInstance };
+  modelPool: { findMany: MockInstance };
+};
+
 const db = prisma as unknown as {
   appSetting: {
     findUnique: MockInstance;
@@ -246,6 +253,188 @@ describe("adminObservabilityRouter", () => {
     expect(serialized).not.toContain("endpoint-secret");
   });
 
+  it("derives endpoint status from device presence and filters by the derived status", async () => {
+    const row = (id: string, deviceStatus: string, heartbeatAgoMs: number) => ({
+      id,
+      createdAt: new Date("2026-01-01T00:00:00.000Z"),
+      updatedAt: new Date("2026-01-01T00:01:00.000Z"),
+      slug: id,
+      label: id,
+      kind: "OPENAI_COMPATIBLE",
+      status: "ONLINE",
+      defaultCapabilities: [],
+      capabilityMetadata: null,
+      probeSuggestions: null,
+      lastSeenAt: null,
+      lastHealthCheckAt: null,
+      statusChangedAt: null,
+      failureReasonCode: null,
+      User: owner(),
+      CliDevice: {
+        id: `${id}-cli`,
+        slug: `${id}-cli`,
+        name: null,
+        reportedHostname: "host",
+        status: deviceStatus,
+        lastHeartbeatAt: new Date(Date.now() - heartbeatAgoMs),
+      },
+      _count: { DiscoveredModels: 0 },
+    });
+    db.endpoint.count.mockResolvedValue(3);
+    db.endpoint.findMany.mockResolvedValue([
+      row("live", "CONNECTED", 1_000),
+      row("gone", "DISCONNECTED", 1_000),
+      row("stale", "CONNECTED", 5 * 60_000),
+    ]);
+
+    const result = await client().listEndpoints({ status: "OFFLINE" });
+
+    expect(result.items.map((item) => [item.slug, item.status, item.healthState])).toEqual([
+      ["live", "ONLINE", "HEALTHY"],
+      ["gone", "OFFLINE", "ATTENTION"],
+      ["stale", "OFFLINE", "ATTENTION"],
+    ]);
+    expect(result.items[1]).toMatchObject({ reportedStatus: "ONLINE" });
+    const where = db.endpoint.findMany.mock.calls.at(-1)?.[0]?.where;
+    expect(where.OR).toEqual(
+      expect.arrayContaining([
+        { status: "OFFLINE" },
+        expect.objectContaining({ CliDevice: expect.anything() }),
+      ]),
+    );
+  });
+
+  it("marks models of a disconnected CLI UNAVAILABLE with an OFFLINE endpoint status", async () => {
+    db.discoveredModel.count.mockResolvedValue(1);
+    db.discoveredModel.findMany.mockResolvedValue([
+      {
+        id: "model-id",
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        updatedAt: new Date("2026-01-01T00:01:00.000Z"),
+        slug: null,
+        upstreamModelId: "llama",
+        encodedModelId: "x",
+        capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+        capabilityOverrides: [],
+        capabilityOverrideMetadata: null,
+        probeSuggestions: null,
+        lastSeenAt: null,
+        User: owner(),
+        Endpoint: {
+          id: "endpoint-id",
+          slug: "local",
+          label: "Local",
+          status: "ONLINE",
+          defaultCapabilities: [],
+          capabilityMetadata: null,
+          CliDevice: {
+            id: "cli-id",
+            slug: "desk",
+            name: null,
+            reportedHostname: "host",
+            status: "DISCONNECTED",
+            lastHeartbeatAt: new Date(Date.now() - 1_000),
+          },
+        },
+        _count: { PoolMembers: 0 },
+      },
+    ]);
+
+    const result = await client().listModels();
+
+    expect(result.items[0]).toMatchObject({
+      healthState: "UNAVAILABLE",
+      endpoint: { status: "OFFLINE" },
+    });
+  });
+
+  it("derives a pool member's endpoint status from its device presence", async () => {
+    // serializePool projects each member's endpoint status with the shared
+    // derived helper. Without that projection (reverting to the stored
+    // `Endpoint.status`) an offline device's member would read ONLINE.
+    db.modelPool.count.mockResolvedValue(1);
+    db.modelPool.findMany.mockResolvedValue([
+      {
+        id: "pool-id",
+        createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        updatedAt: new Date("2026-01-01T00:01:00.000Z"),
+        slug: "general",
+        name: "General",
+        description: null,
+        User: owner(),
+        PoolMembers: [
+          {
+            id: "member-offline",
+            createdAt: new Date("2026-01-01T00:00:00.000Z"),
+            updatedAt: new Date("2026-01-01T00:01:00.000Z"),
+            discoveredModelId: null,
+            weight: 1,
+            healthStatus: "HEALTHY",
+            routingStatus: "ACTIVE",
+            lastFailureClass: null,
+            consecutiveRetryableFailures: 0,
+            lastFailureAt: null,
+            nextRetryAt: null,
+            halfOpenTrialStartedAt: null,
+            lastRoutedAt: null,
+            DiscoveredModel: null,
+            ExecutionTarget: {
+              kind: "DISCOVERED_MODEL",
+              DiscoveredModel: {
+                id: "model-offline",
+                upstreamModelId: "llama",
+                User: { slug: "owner" },
+                Endpoint: {
+                  id: "endpoint-offline",
+                  slug: "local",
+                  label: "Local",
+                  status: "ONLINE",
+                  CliDevice: {
+                    id: "cli-offline",
+                    slug: "desk",
+                    name: null,
+                    reportedHostname: "desk-01.local",
+                    status: "DISCONNECTED",
+                    lastHeartbeatAt: new Date(Date.now() - 1_000),
+                  },
+                },
+              },
+            },
+          },
+        ],
+        _count: { PoolGrants: 0, ModelApiTokenAllowlistEntries: 0 },
+      },
+    ]);
+
+    const result = await client().listPools();
+
+    expect(result.items[0]?.members[0]?.model).toMatchObject({
+      endpointStatus: "OFFLINE",
+      cliDeviceStatus: "DISCONNECTED",
+    });
+  });
+
+  it("filters listModels by the derived endpoint status, not the stored column", async () => {
+    db.discoveredModel.count.mockResolvedValue(0);
+    db.discoveredModel.findMany.mockResolvedValue([]);
+
+    await client().listModels({ endpointStatus: "OFFLINE" });
+
+    // The filter must reach endpoint.status through the device relation; a
+    // revert to a raw `{ Endpoint: { is: { status: "OFFLINE" } } }` would drop
+    // the device clauses (the device decides reachability).
+    const where = db.discoveredModel.findMany.mock.calls.at(-1)?.[0]?.where;
+    expect(where.Endpoint).toMatchObject({
+      is: expect.objectContaining({ OR: expect.any(Array) }),
+    });
+    expect(where.Endpoint.is.OR).toEqual(
+      expect.arrayContaining([
+        { status: "OFFLINE" },
+        expect.objectContaining({ CliDevice: expect.anything() }),
+      ]),
+    );
+  });
+
   it("returns effective model capability summaries and applies capability filters", async () => {
     db.discoveredModel.count.mockResolvedValue(1);
     db.discoveredModel.findMany.mockResolvedValue([
@@ -430,28 +619,32 @@ describe("adminObservabilityRouter", () => {
         providerResponseId: "resp_secret_provider_id",
         routingKeyDigest: "sticky-secret-digest",
         imageBytes: "data:image/png;base64,secret",
-        User: owner(),
-        ModelApiToken: {
-          id: "token-id",
-          name: "Production key",
-          lookupPrefix: "wsmp_model_abcd",
-          secretDigest: "token-secret-digest",
-        },
-        RequestedDiscoveredModel: {
-          id: "model-id",
-          upstreamModelId: "llama",
-          User: { slug: "owner" },
-          Endpoint: { slug: "local", CliDevice: { slug: "desk" } },
-        },
-        RequestedModelPool: null,
-        SelectedDiscoveredModel: {
-          id: "model-id",
-          upstreamModelId: "llama",
-          User: { slug: "owner" },
-          Endpoint: { slug: "local", CliDevice: { slug: "desk" } },
-        },
+        // Hot-path rows carry plain ids (DL-1); relations load by id.
+        userId: owner().id,
+        requestedDiscoveredModelId: "model-id",
+        selectedDiscoveredModelId: "model-id",
+        requestedModelPoolId: null,
       },
     ]);
+
+    relations.user.findMany.mockResolvedValue([owner()]);
+    relations.modelApiToken.findMany.mockResolvedValue([
+      {
+        id: "token-id",
+        name: "Production key",
+        lookupPrefix: "wsmp_model_abcd",
+        secretDigest: "token-secret-digest",
+      },
+    ]);
+    relations.discoveredModel.findMany.mockResolvedValue([
+      {
+        id: "model-id",
+        upstreamModelId: "llama",
+        User: { slug: "owner" },
+        Endpoint: { slug: "local", CliDevice: { slug: "desk" } },
+      },
+    ]);
+    relations.modelPool.findMany.mockResolvedValue([]);
 
     const createdAfter = new Date("2026-01-01T00:00:00.000Z");
     const result = await client().listRelayMetadataSummaries({

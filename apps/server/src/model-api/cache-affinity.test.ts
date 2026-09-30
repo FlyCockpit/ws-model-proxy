@@ -11,8 +11,10 @@ const db = vi.hoisted(() => ({
   },
   capacityLease: { groupBy: vi.fn() },
   capacityWaiter: { groupBy: vi.fn() },
+  modelPool: { findFirst: vi.fn() },
   $transaction: vi.fn(),
   $queryRaw: vi.fn(),
+  $executeRaw: vi.fn(),
 }));
 
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
@@ -114,7 +116,8 @@ describe("cache affinity", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     db.$transaction.mockImplementation((callback) => callback(db));
-    db.$queryRaw.mockResolvedValue([{ id: "pool" }]);
+    db.$queryRaw.mockResolvedValue([{ acquired: true }]);
+    db.modelPool.findFirst.mockResolvedValue({ id: "pool" });
     db.cacheAffinityRecord.findMany.mockResolvedValue([]);
     db.cacheAffinityRecord.findFirst.mockResolvedValue(null);
     db.cacheAffinityRecord.deleteMany.mockResolvedValue({ count: 0 });
@@ -532,6 +535,109 @@ describe("cache affinity", () => {
         }),
       }),
     );
+  });
+
+  it("stamps every record of one call with the same lastUsedAt (S-C session grouping)", async () => {
+    const now = new Date("2026-08-25T12:00:00.000Z");
+    await rememberAffinity({
+      ownerId: "grantee",
+      resourceOwnerId: "pool-owner",
+      poolId: "pool",
+      policy,
+      surface: "OPENAI_RESPONSES",
+      payload: { conversation: "c", input: [{ role: "user", content: "hi" }] },
+      target: target("target", "runtime"),
+      estimatedTokens: 12_000,
+      now,
+    });
+    const stamps = [
+      ...db.cacheAffinityRecord.upsert.mock.calls.flatMap(([input]) => [
+        input.create.lastUsedAt,
+        input.update.lastUsedAt,
+      ]),
+      ...db.cacheAffinityRecord.create.mock.calls.map(([input]) => input.data.lastUsedAt),
+    ];
+    expect(stamps.length).toBeGreaterThan(2);
+    expect(new Set(stamps.map((stamp: Date | undefined) => stamp?.getTime()))).toEqual(
+      new Set([now.getTime()]),
+    );
+  });
+
+  it("refreshes existing records with the call's lastUsedAt (S-C session grouping)", async () => {
+    // The common continuation refreshes records instead of creating them, so
+    // the per-material `update` path must stamp `lastUsedAt` like the create
+    // paths do; otherwise the session ages out of the protection window while
+    // it is still in use (warm-protection.ts groups by `lastUsedAt`).
+    const now = new Date("2026-08-25T12:00:00.000Z");
+    db.cacheAffinityRecord.findFirst.mockResolvedValue({ id: "existing-conversation-record" });
+    await rememberAffinity({
+      ownerId: "grantee",
+      resourceOwnerId: "pool-owner",
+      poolId: "pool",
+      policy,
+      surface: "OPENAI_RESPONSES",
+      payload: { conversation: "c", input: [{ role: "user", content: "hi" }] },
+      target: target("target", "runtime"),
+      estimatedTokens: 12_000,
+      now,
+    });
+    // The conversation record exists: this call must refresh it, not recreate it.
+    expect(db.cacheAffinityRecord.create).not.toHaveBeenCalled();
+    expect(db.cacheAffinityRecord.update).toHaveBeenCalled();
+    const stamps = [
+      ...db.cacheAffinityRecord.upsert.mock.calls.flatMap(([input]) => [
+        input.create.lastUsedAt,
+        input.update.lastUsedAt,
+      ]),
+      ...db.cacheAffinityRecord.update.mock.calls.map(([input]) => input.data.lastUsedAt),
+    ];
+    expect(stamps.length).toBeGreaterThan(0);
+    expect(new Set(stamps.map((stamp: Date | undefined) => stamp?.getTime()))).toEqual(
+      new Set([now.getTime()]),
+    );
+  });
+
+  it("scores a single target so protection can tell a continuation from a new session", async () => {
+    const only = target("target-a", "runtime-a");
+    const continuation = {
+      ...payload,
+      messages: [...payload.messages, { role: "assistant", content: "secret answer" }],
+    };
+    const material = affinityPrefixDigests({
+      ownerId: "tenant",
+      resourceOwnerId: "pool-owner",
+      poolId: "pool",
+      securityScope: "token",
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      payload: continuation,
+      runtimeIdentity: only.targetIdentity,
+    });
+    db.cacheAffinityRecord.findMany.mockResolvedValue(
+      material.digests.map((prefixDigest, index) => ({
+        executionTargetId: only.executionTargetId,
+        targetIdentity: only.targetIdentity,
+        bindingDigest: material.bindingDigest,
+        prefixDigest,
+        conversationDigest: null,
+        prefixDepth: index + 1,
+        digestVersion: 4,
+        engineCacheConfirmed: false,
+        estimatedTokens: 9_000,
+      })),
+    );
+    const ranked = await rankAffinityTargets({
+      ownerId: "tenant",
+      resourceOwnerId: "pool-owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      payload: continuation,
+      targets: [only],
+      scoreSingleTarget: true,
+    });
+    expect(material.isContinuation).toBe(true);
+    expect(ranked.prefixDepths["target-a"]).toBeGreaterThan(0);
   });
 
   it("persists digests only, refreshes TTL, and enforces the row bound", async () => {
@@ -1517,13 +1623,65 @@ describe("cache affinity", () => {
   });
 
   it("sweeps expired rows in bounded batches", async () => {
-    db.cacheAffinityRecord.findMany.mockResolvedValue([{ id: "a" }, { id: "b" }]);
-    db.cacheAffinityRecord.deleteMany.mockResolvedValue({ count: 2 });
+    // Writer class S: one DELETE that takes its rows with SKIP LOCKED.
+    db.$executeRaw.mockResolvedValue(2);
     const now = new Date("2026-08-25T12:00:00.000Z");
     await expect(sweepExpiredAffinity({ now, limit: 2 })).resolves.toBe(2);
-    expect(db.cacheAffinityRecord.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({ take: 2, where: { expiresAt: { lte: now } } }),
+    expect(db.$executeRaw).toHaveBeenCalledTimes(1);
+    const [strings, ...values] = db.$executeRaw.mock.calls[0] as [
+      TemplateStringsArray,
+      ...unknown[],
+    ];
+    const sql = strings.join("?");
+    expect(sql).toContain("DELETE FROM cache_affinity_record");
+    expect(sql).toContain('"expiresAt" <= ?');
+    expect(sql).toContain("FOR UPDATE SKIP LOCKED");
+    expect(values).toEqual([now, 2]);
+    expect(db.cacheAffinityRecord.deleteMany).not.toHaveBeenCalled();
+
+    db.$executeRaw.mockClear();
+    await sweepExpiredAffinity({ now, limit: 1_000_000 });
+    expect((db.$executeRaw.mock.calls[0] as unknown[]).at(-1)).toBe(10_000);
+  });
+
+  it("fences the owner's pool before reading it and writes nothing for a missing pool", async () => {
+    const rememberArgs = {
+      ownerId: "owner",
+      resourceOwnerId: "resource-owner",
+      poolId: "pool",
+      policy,
+      surface: "openai-chat",
+      payload,
+      target: target("target", "runtime"),
+    };
+    await rememberAffinity(rememberArgs);
+    // The cache-affinity fence is the transaction's first statement; the pool
+    // is read afterwards without a row lock.
+    const [strings, fenceNames] = db.$queryRaw.mock.calls[0] as [TemplateStringsArray, string[]];
+    expect(strings.join("?")).toContain("wsmp_acquire_fences");
+    expect(fenceNames).toEqual(["09:cache-affinity:resource-owner:pool"]);
+    for (const call of db.$queryRaw.mock.calls) {
+      expect((call[0] as TemplateStringsArray).join("?")).not.toMatch(/FOR (NO KEY )?UPDATE/);
+    }
+    expect(db.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
+      db.modelPool.findFirst.mock.invocationCallOrder[0] ?? Number.NaN,
     );
+    expect(db.modelPool.findFirst).toHaveBeenCalledWith({
+      where: { id: "pool", userId: "resource-owner" },
+      select: { id: true },
+    });
+    expect(db.cacheAffinityRecord.upsert).toHaveBeenCalled();
+
+    vi.clearAllMocks();
+    db.$transaction.mockImplementation((callback) => callback(db));
+    db.$queryRaw.mockResolvedValue([{ acquired: true }]);
+    db.modelPool.findFirst.mockResolvedValue(null);
+    await rememberAffinity(rememberArgs);
+    expect(db.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(db.cacheAffinityRecord.deleteMany).not.toHaveBeenCalled();
+    expect(db.cacheAffinityRecord.upsert).not.toHaveBeenCalled();
+    expect(db.cacheAffinityRecord.create).not.toHaveBeenCalled();
+    expect(db.cacheAffinityRecord.update).not.toHaveBeenCalled();
   });
 
   it("merges engine cache confirmation with latest-evidence semantics", async () => {

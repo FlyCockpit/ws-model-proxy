@@ -296,6 +296,22 @@ export type EndpointInventory = z.infer<typeof endpointInventorySchema>;
 /** Custom metric names, label keys and label values (S-B part 2). */
 export const METRIC_NAME_PATTERN = /^[A-Za-z0-9_.:-]{1,64}$/;
 const metricNameSchema = z.string().regex(METRIC_NAME_PATTERN);
+/**
+ * A label key becomes an object key, and `__proto__` matches the pattern but
+ * zod's record drops it silently (before any key schema runs). Reject it
+ * up front, on the input, as the CLI does (`is_label_key`), so both sides
+ * agree on what a series is.
+ */
+export const RESERVED_LABEL_KEYS = ["__proto__"] as const;
+const labelsSchema = z
+  .custom<Record<string, string>>(
+    (value) =>
+      typeof value === "object" &&
+      value !== null &&
+      !RESERVED_LABEL_KEYS.some((key) => Object.hasOwn(value, key)),
+    { message: "A label key is reserved." },
+  )
+  .pipe(z.record(metricNameSchema, metricNameSchema));
 export const NODE_METRICS_CUSTOM_MAX = 50;
 export const NODE_METRIC_SOURCES_MAX = 50;
 const MIB_MAX = 1_000_000_000;
@@ -401,8 +417,7 @@ const customMetricSchema = z
   .object({
     source: metricNameSchema,
     name: metricNameSchema,
-    labels: z
-      .record(metricNameSchema, metricNameSchema)
+    labels: labelsSchema
       .refine((labels) => Object.keys(labels).length <= 16, {
         message: "At most 16 labels per series.",
       })
@@ -502,18 +517,32 @@ const endpointLoadSchema = z
   .strict();
 export type EndpointLoadMessage = z.infer<typeof endpointLoadSchema>;
 
+/** Blank as the CLI's `str::trim().is_empty()` sees it (Unicode White_Space; not JS `trim()`). */
+const BLANK_COMMAND = /^\p{White_Space}*$/u;
+
 /** Server to CLI (2.7): a remotely defined custom metric source (S-B part 2). */
 export const remoteMetricSourceSchema = z
   .object({
     name: metricNameSchema,
-    command: z.string().min(1).max(4096),
+    // One definition of a runnable command on every side (the CLI's
+    // `validate_command`): non-blank, at most 4096 BYTES, no NUL.
+    command: z
+      .string()
+      .min(1)
+      .max(4096)
+      .refine(
+        (command) =>
+          !BLANK_COMMAND.test(command) &&
+          !command.includes("\u0000") &&
+          new TextEncoder().encode(command).length <= 4096,
+        { message: "command must be non-blank, at most 4096 bytes and contain no NUL" },
+      ),
     intervalSecs: z.number().int().min(5).max(86_400),
     timeoutSecs: z.number().int().min(1).max(300),
     format: z.enum(["number", "json", "prometheus"]),
   })
   .strict();
 export type RemoteMetricSource = z.infer<typeof remoteMetricSourceSchema>;
-
 /** The `metrics.sources.set` payload, bounded like the CLI-side storage. */
 export const remoteMetricSourcesSchema = z
   .array(remoteMetricSourceSchema)
@@ -955,6 +984,17 @@ export function parseRelaySubprotocolHeader(header: string | undefined): {
  * message is not well-formed Unicode: the CLI cannot read such a frame.
  */
 export function encodeRelayServerControlMessage(message: RelayServerControlMessage): string {
+  // The one enforcement point for the only outbound message whose payload is
+  // built from stored, user-authored data: a source list that fails the wire
+  // schema is never framed (callers send an empty list instead).
+  if (
+    message.type === "metrics.sources.set" &&
+    !remoteMetricSourcesSchema.safeParse(message.sources).success
+  ) {
+    throw new RelayProtocolError(
+      "metrics.sources.set carries a source list that fails the wire schema.",
+    );
+  }
   return stringifyWellFormed(message);
 }
 

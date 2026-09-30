@@ -1,5 +1,6 @@
 import { createRouterClient } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { Context } from "../context";
 
@@ -9,9 +10,9 @@ import type { Context } from "../context";
 // or a held row lock, and lets the other side commit in the gap:
 //  - a session INSERT against the deletion mark, in both orders;
 //  - an admin unban write landing after the mark, then an abandon;
-//  - producers committing after the pre-lock residual count, while the
-//    ordered delete waits for its locks (user and pool deletes);
-//  - the cost and index use of the in-transaction residual recount.
+//  - producers committing while a parent delete waits for its owner fence
+//    (user and pool deletes; DL-1 (d) leaves their rows as orphans);
+//  - the index behind the user drain's relay keyset.
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
@@ -76,7 +77,6 @@ integration("deletion commit points under concurrency", () => {
     | {
         prisma: Db;
         deletion: typeof import("@ws-model-proxy/db/parent-deletion");
-        residual: typeof import("@ws-model-proxy/db/parent-deletion-residual");
         order: typeof import("@ws-model-proxy/db/capacity-lock-order");
         forwarder: typeof import("../routers/forwarder-management");
         auth: typeof import("@ws-model-proxy/auth");
@@ -89,19 +89,17 @@ integration("deletion commit points under concurrency", () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
     process.env.NODE_ENV = "test";
-    const [db, deletion, residual, order, forwarder, auth, factory] = await Promise.all([
+    const [, deletion, order, forwarder, auth, factory] = await Promise.all([
       import("@ws-model-proxy/db"),
       import("@ws-model-proxy/db/parent-deletion"),
-      import("@ws-model-proxy/db/parent-deletion-residual"),
       import("@ws-model-proxy/db/capacity-lock-order"),
       import("../routers/forwarder-management"),
       import("@ws-model-proxy/auth"),
       import("@ws-model-proxy/db/client-factory"),
     ]);
     modules = {
-      prisma: db.default,
+      prisma: createFixturePrismaClient(databaseUrl!),
       deletion,
-      residual,
       order,
       forwarder,
       auth,
@@ -514,74 +512,63 @@ integration("deletion commit points under concurrency", () => {
     return { suffix, user, device, endpoint, model, pool };
   }
 
-  it("user delete: producers committed after the pre-lock count leave it pending (r2 residual race)", async () => {
-    const { prisma, deletion, blocker, observer } = required();
-    const g = await graph("residual-race-user");
-    const mark = await deletion.requestUserDeletion(prisma, g.user.id);
+  /** Holds the owner fence of `userId` in a blocker transaction until released. */
+  async function holdOwnerFence(userId: string) {
+    const { blocker, order } = required();
     const held = gate();
     const release = gate();
-    // Hold L0 (the device row) so the ordered delete waits after its count.
     const holding = blocker.$transaction(
       async (tx) => {
-        await tx.$queryRaw`SELECT id FROM cli_device WHERE id = ${g.device.id} FOR UPDATE`;
+        await order.acquireFences(tx, [order.fences.owner(userId)]);
         held.open();
         await release.promise;
       },
       { timeout: 60_000 },
     );
     await held.promise;
+    return async () => {
+      release.open();
+      await holding;
+    };
+  }
+
+  // DL-1 (d): the final parent delete touches no hot-path row (no foreign key
+  // crosses the boundary), so producers committing while it waits for its
+  // owner fence no longer need a residual recount or refusal. Their rows stay
+  // as orphaned history; the purge queue removes a deleted user's terminal
+  // rows after the grace period.
+  it("user delete: producers committed while it waits for the owner fence stay as orphans for the purge", async () => {
+    const { prisma, deletion, observer } = required();
+    const sweeps = await import("@ws-model-proxy/db/hot-path-sweeps");
+    const g = await graph("late-producers-user");
+    const mark = await deletion.requestUserDeletion(prisma, g.user.id);
+    const release = await holdOwnerFence(g.user.id);
     const completing = deletion.completeUserDeletion(prisma, g.user.id, mark!.generation).then(
       (value) => ({ value }),
       (error: unknown) => ({ error }),
     );
-    await waitForLockWait("%cli_device%");
-    const parents = await deletion.resolveDeletedParents(prisma, {
-      userId: g.user.id,
-      wholeUser: true,
-    });
-    expect(await deletion.countFinalPhaseResidualRows(prisma, parents)).toBe(0);
-    const late = deletion.PARENT_DELETION_MAX_FINAL_PHASE_RESIDUAL_ROWS + 1;
+    await waitForLockWait("%wsmp_acquire_fences%", "advisory");
+    const late = 5_000;
     await observer.$executeRawUnsafe(
-      `INSERT INTO relay_request (id, "userId", status)
-       SELECT '${g.suffix}-late-' || n, '${g.user.id}', 'PENDING'
+      `INSERT INTO relay_request (id, "userId", status, "requestedModelPoolId")
+       SELECT '${g.suffix}-late-' || n, '${g.user.id}', 'FAILED', '${g.pool.id}'
          FROM generate_series(1, ${late}) n`,
     );
-    release.open();
-    await holding;
-    const outcome = await completing;
-    expect("error" in outcome && outcome.error).toBeInstanceOf(
-      deletion.ParentDeletionDrainPendingError,
-    );
-    // Nothing deleted; the marker (and generation) stays for the sweeper.
-    expect(await prisma.user.count({ where: { id: g.user.id } })).toBe(1);
+    await release();
+    expect(await completing).toEqual({ value: true });
+    expect(await prisma.user.count({ where: { id: g.user.id } })).toBe(0);
+    expect(await prisma.modelPool.count({ where: { id: g.pool.id } })).toBe(0);
     expect(await prisma.relayRequest.count({ where: { userId: g.user.id } })).toBe(late);
-    expect(await prisma.cliDevice.count({ where: { id: g.device.id } })).toBe(1);
-    expect(
-      (await prisma.user.findUniqueOrThrow({ where: { id: g.user.id } })).deletionGeneration,
-    ).toBe(mark!.generation);
-    // The durable entry point reports pending, not an abandon.
-    await expect(deletion.deleteUserDurably(prisma, g.user.id)).resolves.toBe("pending");
-    expect(
-      (await prisma.user.findUniqueOrThrow({ where: { id: g.user.id } })).deletionGeneration,
-    ).toBe(mark!.generation);
+    // Within the grace period the purge removes rows but keeps the entry.
+    await sweeps.purgeDeletedUserHistory(prisma, g.user.id);
+    expect(await prisma.relayRequest.count({ where: { userId: g.user.id } })).toBe(0);
+    expect(await prisma.deletedUserPurge.count({ where: { userId: g.user.id } })).toBe(1);
   }, 60_000);
 
-  it("pool delete: producers committed after the pre-lock count answer CONFLICT, nothing deleted", async () => {
-    const { prisma, forwarder, blocker, observer } = required();
-    const g = await graph("residual-race-pool");
-    const held = gate();
-    const release = gate();
-    // FOR NO KEY UPDATE on the pool: the ordered delete's L1 waits on it, a
-    // producer's FOR KEY SHARE (relay insert naming the pool) does not.
-    const holding = blocker.$transaction(
-      async (tx) => {
-        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${g.pool.id} FOR NO KEY UPDATE`;
-        held.open();
-        await release.promise;
-      },
-      { timeout: 60_000 },
-    );
-    await held.promise;
+  it("pool delete: producers committed while it waits for the owner fence do not refuse it", async () => {
+    const { prisma, forwarder, observer } = required();
+    const g = await graph("late-producers-pool");
+    const release = await holdOwnerFence(g.user.id);
     const client = createRouterClient(forwarder.forwarderManagementRouter, {
       context: sessionFor(g.user),
     });
@@ -589,75 +576,53 @@ integration("deletion commit points under concurrency", () => {
       (value) => ({ value }),
       (error: unknown) => ({ error }),
     );
-    await waitForLockWait("%model_pool%");
-    const late = 20_001;
+    await waitForLockWait("%wsmp_acquire_fences%", "advisory");
+    const late = 5_000;
     await observer.$executeRawUnsafe(
       `INSERT INTO relay_request (id, "userId", status, "requestedModelPoolId")
-       SELECT '${g.suffix}-late-' || n, '${g.user.id}', 'PENDING', '${g.pool.id}'
+       SELECT '${g.suffix}-late-' || n, '${g.user.id}', 'FAILED', '${g.pool.id}'
          FROM generate_series(1, ${late}) n`,
     );
-    release.open();
-    await holding;
+    await release();
     const outcome = await deleting;
-    expect("error" in outcome && outcome.error).toMatchObject({ code: "CONFLICT" });
-    expect(await prisma.modelPool.count({ where: { id: g.pool.id } })).toBe(1);
+    expect("error" in outcome ? String(outcome.error) : "deleted").toBe("deleted");
+    expect(await prisma.modelPool.count({ where: { id: g.pool.id } })).toBe(0);
+    // The requests keep naming the deleted pool (a dangling id, no FK). They
+    // are terminal so later suites' abandoned-request reaper has no backlog.
     expect(await prisma.relayRequest.count({ where: { requestedModelPoolId: g.pool.id } })).toBe(
       late,
     );
   }, 60_000);
 
-  it("the in-transaction recount stays cheap at the cap and filters on indexed columns", async () => {
-    const { prisma, residual, order } = required();
-    // Every column the recount filters on leads some index.
-    const columns = new Set<string>();
-    for (const [table, edges] of Object.entries(residual.HISTORY_DRAIN_EDGES))
-      for (const [column] of [...edges.cascade, ...edges.setNull])
-        columns.add(`${table}.${column}`);
-    columns.add("capacity_waiter.admissionRequestId");
-    columns.add("admission_request.relayRequestId");
-    columns.add("usage_rollup_minute.requesterUserId");
-    columns.add("usage_rollup_hour.requesterUserId");
-    const leading = await prisma.$queryRaw<Array<{ entry: string }>>`
-      SELECT c.relname || '.' || a.attname AS entry
-        FROM pg_index i
-        JOIN pg_class c ON c.oid = i.indrelid
-        JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = current_schema()
-        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = i.indkey[0]`;
-    const indexed = new Set(leading.map((row) => row.entry));
-    expect([...columns].filter((column) => !indexed.has(column)).sort()).toEqual([]);
-
-    // At the cap (20 000 live rows over several edges) the recount under the
-    // ordered delete's locks passes, well inside the 15 s transaction cap.
-    const g = await graph("recount-cost");
-    const cap = residual.PARENT_DELETION_MAX_FINAL_PHASE_RESIDUAL_ROWS;
+  it("the user drain's relay keyset uses the (userId, createdAt, id) index without a sort", async () => {
+    const { prisma } = required();
+    const g = await graph("drain-keyset-index");
     await prisma.$executeRawUnsafe(
-      `INSERT INTO relay_request (id, "userId", status, "requestedModelPoolId")
-       SELECT '${g.suffix}-live-' || n, '${g.user.id}', 'PENDING',
-              CASE WHEN n % 2 = 0 THEN '${g.pool.id}' END
-         FROM generate_series(1, ${cap / 2}) n`,
+      `INSERT INTO relay_request (id, "userId", status, "createdAt")
+       SELECT '${g.suffix}-k-' || n, '${g.user.id}', 'SUCCEEDED',
+              timestamp '2026-01-01' + (n / 3) * interval '1 second'
+         FROM generate_series(1, 3000) n`,
     );
-    await prisma.$executeRawUnsafe(
-      `INSERT INTO response_stickiness_record (id, "userId", "routingKeyDigest")
-       SELECT '${g.suffix}-s-' || n, '${g.user.id}', '${g.suffix}-d-' || n
-         FROM generate_series(1, ${cap / 4}) n`,
-    );
-    const scope = { userId: g.user.id, wholeUser: true } as const;
-    const parents = await residual.resolveDeletedParents(prisma, scope);
-    // relay rows (userId edge, counted once per matching edge) + stickiness.
-    expect(await residual.countFinalPhaseResidualRows(prisma, parents)).toBeGreaterThanOrEqual(
-      (cap * 3) / 4,
-    );
-    const started = Date.now();
-    await order.runCapacityOrderedTransaction(prisma, async (tx) => {
-      await residual.assertFinalPhaseResidualWithinBound(tx, scope, cap);
+    await prisma.$executeRawUnsafe("ANALYZE relay_request");
+    const plan = await prisma.$transaction(async (tx) => {
+      // Proves the index serves the keyset order; the planner may still pick
+      // a sequential scan for a tiny table, which is not what is under test.
+      await tx.$executeRawUnsafe("SET LOCAL enable_seqscan = off");
+      await tx.$executeRawUnsafe("SET LOCAL enable_bitmapscan = off");
+      const rows = await tx.$queryRawUnsafe<Array<{ "QUERY PLAN": unknown }>>(
+        `EXPLAIN (FORMAT JSON)
+         SELECT id, "createdAt" FROM relay_request
+          WHERE "userId" = $1 AND status IN ('SUCCEEDED', 'FAILED', 'CANCELED')
+            AND ("createdAt", id) > ($2::timestamp, $3)
+          ORDER BY "createdAt", id
+          LIMIT 500`,
+        g.user.id,
+        new Date("2026-01-01T00:05:00.000Z"),
+        `${g.suffix}-k-900`,
+      );
+      return JSON.stringify(rows[0]?.["QUERY PLAN"]);
     });
-    const elapsed = Date.now() - started;
-    process.stdout.write(`[commit-point] in-transaction recount at the cap: ${elapsed} ms\n`);
-    // One row over the cap is refused.
-    await expect(
-      order.runCapacityOrderedTransaction(prisma, (tx) =>
-        residual.assertFinalPhaseResidualWithinBound(tx, scope, 100),
-      ),
-    ).rejects.toBeInstanceOf(residual.ParentDeletionDrainPendingError);
+    expect(plan).toContain('"Index Name":"relay_request_userId_createdAt_id_idx"');
+    expect(plan).not.toMatch(/"Node Type":"(Incremental )?Sort"/);
   }, 60_000);
 });

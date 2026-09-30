@@ -38,7 +38,14 @@ export type AdmissionAttempt = {
   ownerId: string;
   sourceKind: "DIRECT" | "POOL";
   poolId?: string;
+  /** Recorded on the request; the scheduler uses each waiter's effective priority. */
   basePriority: number;
+  /**
+   * The pool grant the requester was resolved under (grantees only). Its
+   * `queuePriority` (S-C), when set, replaces the pool/member capacity
+   * priority for every candidate of this attempt; null inherits it.
+   */
+  accessGrantId?: string | null;
   connectionOwner: string;
   deadlineAt: Date;
   candidates: readonly AdmissionCandidate[];
@@ -56,6 +63,12 @@ export type AdmissionAttempt = {
    * another request/owner) is ignored: the schedule then starts now.
    */
   schedule?: { anchorAttemptId: string; spillDelayMs: number };
+  /**
+   * Metric routing: when every candidate is metric-FULL, ignore metric FULL
+   * and admit by leases only (default true). False only for an `:external`
+   * caller's shortened local phase, which then goes external instead.
+   */
+  metricFailOpen?: boolean;
 };
 
 export type CapacityLeaseHandle = {

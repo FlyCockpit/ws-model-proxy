@@ -3,8 +3,12 @@ import { directModelId, poolModelId } from "@ws-model-proxy/config/forwarder-ide
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { z } from "zod";
 import { adminProcedure } from "../index";
-
-const CLI_HEARTBEAT_STALE_AFTER_MS = 60_000;
+import {
+  cliHeartbeatIsStale,
+  cliHeartbeatStaleAt,
+  effectiveEndpointStatus,
+  endpointEffectiveStatusWhere,
+} from "../lib/cli-presence";
 
 const cliStatusSchema = z.enum(["DISCONNECTED", "CONNECTED", "STALE", "REVOKED"]);
 const endpointStatusSchema = z.enum(["UNKNOWN", "ONLINE", "DEGRADED", "OFFLINE"]);
@@ -49,6 +53,19 @@ type DiscoveredModelRow = Prisma.DiscoveredModelGetPayload<{
 }>;
 type ModelPoolRow = Prisma.ModelPoolGetPayload<{ select: typeof modelPoolSelect }>;
 type RelayRequestRow = Prisma.RelayRequestGetPayload<{ select: typeof relayRequestSelect }>;
+type RelayPoolRow = Prisma.ModelPoolGetPayload<{ select: typeof relayPoolSelect }>;
+type RelayTokenRow = Prisma.ModelApiTokenGetPayload<{ select: typeof relayTokenSelect }>;
+/**
+ * The graph rows a relay row names by plain id (relay_request is hot-path
+ * history with no foreign key, @ws-model-proxy/db/capacity-lock-order),
+ * loaded per page. A deleted row is simply absent.
+ */
+type RelayRelations = {
+  users: Map<string, OwnerRow>;
+  tokens: Map<string, RelayTokenRow>;
+  models: Map<string, RelayModelRow>;
+  pools: Map<string, RelayPoolRow>;
+};
 type RelayModelRow = Prisma.DiscoveredModelGetPayload<{ select: typeof relayModelSelect }>;
 
 type ModelCapabilityValue =
@@ -115,6 +132,19 @@ function ownerWhere(ownerQuery: string | undefined) {
     : {};
 }
 
+/**
+ * The owner filter for relay rows, which name their owner by plain id (no
+ * relation): the matching users' ids.
+ */
+async function relayOwnerWhere(ownerQuery: string | undefined) {
+  if (!ownerQuery) return {};
+  const users = await prisma.user.findMany({
+    where: ownerWhere(ownerQuery).User?.is ?? {},
+    select: { id: true },
+  });
+  return { userId: { in: users.map((user) => user.id) } };
+}
+
 function createdAtWhere(input: { createdAfter?: Date; createdBefore?: Date }) {
   return input.createdAfter || input.createdBefore
     ? {
@@ -126,15 +156,8 @@ function createdAtWhere(input: { createdAfter?: Date; createdBefore?: Date }) {
     : {};
 }
 
-function staleAt(lastHeartbeatAt: Date | null) {
-  return lastHeartbeatAt
-    ? new Date(lastHeartbeatAt.getTime() + CLI_HEARTBEAT_STALE_AFTER_MS)
-    : null;
-}
-
 function isStale(lastHeartbeatAt: Date | null, now: Date) {
-  const nextStaleAt = staleAt(lastHeartbeatAt);
-  return Boolean(nextStaleAt && nextStaleAt <= now);
+  return cliHeartbeatIsStale(lastHeartbeatAt, now);
 }
 
 function owner(row: OwnerRow) {
@@ -169,7 +192,7 @@ function effectiveCapabilities(
 }
 
 function serializeCli(row: CliDeviceRow, now: Date) {
-  const nextStaleAt = staleAt(row.lastHeartbeatAt);
+  const nextStaleAt = cliHeartbeatStaleAt(row.lastHeartbeatAt);
   return {
     id: row.id,
     createdAt: row.createdAt,
@@ -184,7 +207,7 @@ function serializeCli(row: CliDeviceRow, now: Date) {
     lastDisconnectedAt: row.lastDisconnectedAt,
     lastHeartbeatAt: row.lastHeartbeatAt,
     staleAt: nextStaleAt,
-    isStale: Boolean(nextStaleAt && nextStaleAt <= now),
+    isStale: isStale(row.lastHeartbeatAt, now),
     connectionCount: row.connectionCount,
     endpointCount: row._count.Endpoints,
     cliTokenCount: row._count.CliTokens,
@@ -209,7 +232,8 @@ function serializeEndpoint(row: EndpointRow, now: Date) {
     slug: row.slug,
     label: row.label,
     kind: String(row.kind),
-    status: String(row.status),
+    status: effectiveEndpointStatus(row.status, row.CliDevice, now),
+    reportedStatus: String(row.status),
     defaultCapabilities: row.defaultCapabilities,
     capabilityMetadata: row.capabilityMetadata,
     probeSuggestions: row.probeSuggestions,
@@ -219,7 +243,7 @@ function serializeEndpoint(row: EndpointRow, now: Date) {
     failureReasonCode: row.failureReasonCode,
     discoveredModelCount: row._count.DiscoveredModels,
     healthState:
-      row.status === "ONLINE" && !isStale(row.CliDevice.lastHeartbeatAt, now)
+      effectiveEndpointStatus(row.status, row.CliDevice, now) === "ONLINE"
         ? "HEALTHY"
         : "ATTENTION",
   };
@@ -236,7 +260,7 @@ function serializeModel(row: DiscoveredModelRow, now: Date) {
       id: row.Endpoint.id,
       slug: row.Endpoint.slug,
       label: row.Endpoint.label,
-      status: String(row.Endpoint.status),
+      status: effectiveEndpointStatus(row.Endpoint.status, row.Endpoint.CliDevice, now),
     },
     cliDevice: {
       id: row.Endpoint.CliDevice.id,
@@ -262,7 +286,7 @@ function serializeModel(row: DiscoveredModelRow, now: Date) {
     lastSeenAt: row.lastSeenAt,
     poolMemberCount: row._count.PoolMembers,
     healthState:
-      row.Endpoint.status === "ONLINE" && !isStale(row.Endpoint.CliDevice.lastHeartbeatAt, now)
+      effectiveEndpointStatus(row.Endpoint.status, row.Endpoint.CliDevice, now) === "ONLINE"
         ? "AVAILABLE"
         : "UNAVAILABLE",
   };
@@ -323,7 +347,11 @@ function serializePool(row: ModelPoolRow, now: Date) {
               endpointId: model.Endpoint.id,
               endpointSlug: model.Endpoint.slug,
               endpointLabel: model.Endpoint.label,
-              endpointStatus: String(model.Endpoint.status),
+              endpointStatus: effectiveEndpointStatus(
+                model.Endpoint.status,
+                model.Endpoint.CliDevice,
+                now,
+              ),
               cliDeviceId: model.Endpoint.CliDevice.id,
               cliDeviceSlug: model.Endpoint.CliDevice.slug,
               cliDeviceDisplayName: cliDeviceDisplayName(model.Endpoint.CliDevice),
@@ -336,17 +364,58 @@ function serializePool(row: ModelPoolRow, now: Date) {
   };
 }
 
-function serializeRelay(row: RelayRequestRow) {
+async function loadRelayRelations(rows: readonly RelayRequestRow[]): Promise<RelayRelations> {
+  const ids = (values: Array<string | null>) => [
+    ...new Set(values.filter((value): value is string => value !== null)),
+  ];
+  const [users, tokens, models, pools] = await Promise.all([
+    prisma.user.findMany({
+      where: { id: { in: ids(rows.map((row) => row.userId)) } },
+      select: ownerSelect,
+    }),
+    prisma.modelApiToken.findMany({
+      where: { id: { in: ids(rows.map((row) => row.modelApiTokenId)) } },
+      select: relayTokenSelect,
+    }),
+    prisma.discoveredModel.findMany({
+      where: {
+        id: {
+          in: ids(
+            rows.flatMap((row) => [row.requestedDiscoveredModelId, row.selectedDiscoveredModelId]),
+          ),
+        },
+      },
+      select: relayModelSelect,
+    }),
+    prisma.modelPool.findMany({
+      where: { id: { in: ids(rows.map((row) => row.requestedModelPoolId)) } },
+      select: relayPoolSelect,
+    }),
+  ]);
+  return {
+    users: new Map(users.map((user) => [user.id, user])),
+    tokens: new Map(tokens.map((token) => [token.id, token])),
+    models: new Map(models.map((model) => [model.id, model])),
+    pools: new Map(pools.map((pool) => [pool.id, pool])),
+  };
+}
+
+function serializeRelay(row: RelayRequestRow, relations: RelayRelations) {
+  const user = relations.users.get(row.userId);
+  const token = row.modelApiTokenId ? relations.tokens.get(row.modelApiTokenId) : undefined;
+  const pool = row.requestedModelPoolId ? relations.pools.get(row.requestedModelPoolId) : undefined;
+  const model = (id: string | null) => (id ? (relations.models.get(id) ?? null) : null);
   return {
     id: row.id,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
-    owner: owner(row.User),
-    modelApiToken: row.ModelApiToken
+    // A deleted owner's history keeps its id until the purge sweeper takes it.
+    owner: user ? owner(user) : { id: row.userId, email: "", name: "", slug: "" },
+    modelApiToken: token
       ? {
-          id: row.ModelApiToken.id,
-          name: row.ModelApiToken.name,
-          lookupPrefix: row.ModelApiToken.lookupPrefix,
+          id: token.id,
+          name: token.name,
+          lookupPrefix: token.lookupPrefix,
         }
       : row.modelApiTokenLookupPrefix
         ? {
@@ -355,19 +424,19 @@ function serializeRelay(row: RelayRequestRow) {
             lookupPrefix: row.modelApiTokenLookupPrefix,
           }
         : null,
-    requestedModel: relayModel(row.RequestedDiscoveredModel),
-    requestedPool: row.RequestedModelPool
+    requestedModel: relayModel(model(row.requestedDiscoveredModelId)),
+    requestedPool: pool
       ? {
-          id: row.RequestedModelPool.id,
-          name: row.RequestedModelPool.name,
-          slug: row.RequestedModelPool.slug,
+          id: pool.id,
+          name: pool.name,
+          slug: pool.slug,
           canonicalModelId: poolModelId({
-            userSlug: row.RequestedModelPool.User.slug,
-            poolSlug: row.RequestedModelPool.slug,
+            userSlug: pool.User.slug,
+            poolSlug: pool.slug,
           }),
         }
       : null,
-    selectedModel: relayModel(row.SelectedDiscoveredModel),
+    selectedModel: relayModel(model(row.selectedDiscoveredModelId)),
     status: String(row.status),
     startedAt: row.startedAt,
     completedAt: row.completedAt,
@@ -577,19 +646,24 @@ const relayRequestSelect = {
   localAttemptId: true,
   firstClientByteAt: true,
   streamCommitted: true,
-  User: { select: ownerSelect },
-  ModelApiToken: { select: { id: true, name: true, lookupPrefix: true } },
-  RequestedDiscoveredModel: { select: relayModelSelect },
-  RequestedModelPool: {
-    select: {
-      id: true,
-      slug: true,
-      name: true,
-      User: { select: { slug: true } },
-    },
-  },
-  SelectedDiscoveredModel: { select: relayModelSelect },
+  userId: true,
+  requestedDiscoveredModelId: true,
+  selectedDiscoveredModelId: true,
+  requestedModelPoolId: true,
 } satisfies Prisma.RelayRequestSelect;
+
+const relayTokenSelect = {
+  id: true,
+  name: true,
+  lookupPrefix: true,
+} satisfies Prisma.ModelApiTokenSelect;
+
+const relayPoolSelect = {
+  id: true,
+  slug: true,
+  name: true,
+  User: { select: { slug: true } },
+} satisfies Prisma.ModelPoolSelect;
 
 export const adminObservabilityRouter = {
   listCliDevices: adminProcedure
@@ -640,9 +714,10 @@ export const adminObservabilityRouter = {
     .handler(async ({ input }) => {
       const page = input?.page ?? 1;
       const pageSize = input?.pageSize ?? 25;
-      const where = {
+      const now = new Date();
+      const where: Prisma.EndpointWhereInput = {
         ...ownerWhere(input?.ownerQuery),
-        ...(input?.status ? { status: input.status } : {}),
+        ...(input?.status ? endpointEffectiveStatusWhere(input.status, now) : {}),
       };
       const [total, rows] = await Promise.all([
         prisma.endpoint.count({ where }),
@@ -653,7 +728,6 @@ export const adminObservabilityRouter = {
           select: endpointSelect,
         }),
       ]);
-      const now = new Date();
       return paginatedResult({
         items: rows.map((row) => serializeEndpoint(row, now)),
         total,
@@ -694,7 +768,9 @@ export const adminObservabilityRouter = {
           : {};
       const where = {
         ...ownerWhere(input?.ownerQuery),
-        ...(input?.endpointStatus ? { Endpoint: { is: { status: input.endpointStatus } } } : {}),
+        ...(input?.endpointStatus
+          ? { Endpoint: { is: endpointEffectiveStatusWhere(input.endpointStatus, new Date()) } }
+          : {}),
         ...capabilityWhere,
       };
       const [total, rows] = await Promise.all([
@@ -767,7 +843,7 @@ export const adminObservabilityRouter = {
       const page = input?.page ?? 1;
       const pageSize = input?.pageSize ?? 25;
       const where = {
-        ...ownerWhere(input?.ownerQuery),
+        ...(await relayOwnerWhere(input?.ownerQuery)),
         ...createdAtWhere({
           createdAfter: input?.createdAfter,
           createdBefore: input?.createdBefore,
@@ -808,7 +884,10 @@ export const adminObservabilityRouter = {
 
       return {
         ...paginatedResult({
-          items: rows.map(serializeRelay),
+          items: await (async () => {
+            const relations = await loadRelayRelations(rows);
+            return rows.map((row) => serializeRelay(row, relations));
+          })(),
           total,
           page,
           pageSize,

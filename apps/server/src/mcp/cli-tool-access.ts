@@ -30,6 +30,11 @@ const CLI_TOOL_CAPABILITIES: ReadonlyMap<string, CliToolCapability> = new Map([
   ["forwarder_cli_command_run", "command"],
   ["forwarder_cli_supervised_command_start", "command"],
   ["forwarder_cli_command_result", "command"],
+  // Read-only audit log of what agents did on CLI devices: same visibility rule.
+  ["forwarder_cli_activity_list", "command"],
+  // Defines commands that run on the person's machine (custom metric sources),
+  // so it needs the same per-credential opt-in as the tools above.
+  ["forwarder_device_metric_sources_set", "command"],
   ["forwarder_cli_file_read", "file_read"],
   ["forwarder_cli_file_stat", "file_read"],
   ["forwarder_cli_dir_list", "file_read"],

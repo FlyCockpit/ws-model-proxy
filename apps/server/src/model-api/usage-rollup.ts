@@ -42,10 +42,6 @@ export const relayRollupSelect = {
   usageKnown: true,
   // Durable resource owner (database-derived at insert; survives pool deletion).
   resourceOwnerUserId: true,
-  // Legacy resource owners, for rows written before resourceOwnerUserId existed.
-  RequestedModelPool: { select: { userId: true } },
-  SelectedExecutionTarget: { select: { userId: true } },
-  RequestedExecutionTarget: { select: { userId: true } },
 } satisfies Prisma.RelayRequestSelect;
 
 export type RelayRollupRow = Prisma.RelayRequestGetPayload<{ select: typeof relayRollupSelect }>;
@@ -58,17 +54,18 @@ export type RelayRequestSourceValue = RelayRollupRow["source"];
  *    Otherwise the RESOURCE owner - the requested pool's owner for pool
  *    traffic, else the execution target's owner for direct traffic, else
  *    (nothing resolved) the requester. Owners see every requester's traffic
- *    on what they own. FK to user, ON DELETE CASCADE: deleting the owner
- *    removes the history of their resources. The owner comes from the
- *    request's durable `resourceOwnerUserId`, which is not a foreign key; an
- *    increment whose owner no longer exists is skipped (rollupUpsertSql), as
- *    the owner's deletion would have removed it.
+ *    on what they own. Rollups are hot-path history with no foreign key
+ *    (@ws-model-proxy/db/capacity-lock-order): deleting the owner removes the
+ *    history of their resources through the user-deletion drain and the
+ *    history purge sweeper. The owner comes from the request's durable
+ *    `resourceOwnerUserId`; an increment whose owner no longer exists is
+ *    skipped (rollupUpsertSql), as the owner's deletion would have removed it.
  *  - `requesterUserId`: the RelayRequest owner (API token / chat-test /
- *    MCP user). Not a foreign key: when the requester is deleted, a database
- *    trigger merges their rows into the '' sentinel requester, so owners keep
- *    the traffic in their history (schema-hardening.sql,
- *    usage_rollup_detach_requester). Grantees read only rows where they are
- *    the requester of a pool they do not own.
+ *    MCP user). When the requester is deleted, their rows are merged into the
+ *    '' sentinel requester, so owners keep the traffic in their history (the
+ *    user-deletion drain and the purge sweeper,
+ *    @ws-model-proxy/db/usage-rollup-requester-drain). Grantees read only rows
+ *    where they are the requester of a pool they do not own.
  */
 export type UsageRollupKey = {
   bucketStart: Date;
@@ -169,22 +166,12 @@ export function rollupIncrementForRequest(
 
 /**
  * See UsageRollupKey: own-key requester, else the durable resource owner the
- * database recorded at insert (the pool owner even after the pool is deleted),
- * else (legacy rows) the live pool/target owner or the requester.
+ * database recorded at insert (the pool owner even after the pool is deleted;
+ * schema-hardening.sql derives it for every row), else the requester.
  */
 export function resourceOwnerUserId(row: RelayRollupRow): string {
   if (row.fallbackRoute === "own-key") return row.userId;
-  if (row.resourceOwnerUserId) return row.resourceOwnerUserId;
-  if (row.requestedModelPoolId && row.RequestedModelPool) return row.RequestedModelPool.userId;
-  if (!row.requestedModelPoolId) {
-    const target = row.selectedExecutionTargetId
-      ? row.SelectedExecutionTarget
-      : row.requestedExecutionTargetId
-        ? row.RequestedExecutionTarget
-        : null;
-    if (target) return target.userId;
-  }
-  return row.userId;
+  return row.resourceOwnerUserId ?? row.userId;
 }
 
 export function rollupKeyString(key: UsageRollupKey): string {

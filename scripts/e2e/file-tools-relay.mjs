@@ -75,7 +75,7 @@ try {
 
   // Seed: a user, an UNSUPERVISED CLI device with a token bound to it, and a PAT
   // minted with mcp:write and CLI commands (the file tools' credential rule).
-  db = new pg.Pool({ connectionString: databaseUrl, max: 1 });
+  db = new pg.Pool({ connectionString: databaseUrl, max: 1, options: "-c wsmp.fences=,*," });
   const deviceId = randomUUID();
   const cliTokenId = randomUUID();
   const patId = randomUUID();

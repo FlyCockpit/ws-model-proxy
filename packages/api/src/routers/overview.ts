@@ -27,6 +27,7 @@ import { poolOwnerActive } from "@ws-model-proxy/db/user-deletion-access";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
+import { cliDeviceIsOnline, effectiveEndpointStatus } from "../lib/cli-presence";
 import {
   effectiveProviderEgress,
   externalFallbackMemberWhere,
@@ -47,7 +48,6 @@ import {
   sumAccumulators,
 } from "../lib/overview-metrics";
 
-const CLI_HEARTBEAT_STALE_AFTER_MS = 60_000;
 const HEALTH_LIST_LIMIT = 20;
 
 const metricsInput = z.object({
@@ -544,12 +544,17 @@ export const overviewRouter = {
       }),
       prisma.modelApiToken.count({ where: { userId } }),
     ]);
-    const online = (cli: (typeof clis)[number]) =>
-      cli.status === "CONNECTED" &&
-      cli.lastHeartbeatAt !== null &&
-      cli.lastHeartbeatAt.getTime() + CLI_HEARTBEAT_STALE_AFTER_MS > now.getTime();
+    const online = (cli: (typeof clis)[number]) => cliDeviceIsOnline(cli, now);
     const offlineClis = clis.filter((cli) => !online(cli));
-    const unhealthyEndpoints = endpoints.filter((endpoint) => endpoint.status !== "ONLINE");
+    const clisById = new Map(clis.map((cli) => [cli.id, cli] as const));
+    // A published endpoint of an offline (or revoked/unknown) CLI is OFFLINE.
+    const endpointStatus = (endpoint: (typeof endpoints)[number]) => {
+      const cli = clisById.get(endpoint.cliDeviceId);
+      return cli ? effectiveEndpointStatus(endpoint.status, cli, now) : "OFFLINE";
+    };
+    const unhealthyEndpoints = endpoints.filter(
+      (endpoint) => endpointStatus(endpoint) !== "ONLINE",
+    );
     const memberRow = (member: (typeof members)[number]) => ({
       id: member.id,
       poolId: member.poolId,
@@ -579,7 +584,7 @@ export const overviewRouter = {
         unhealthy: unhealthyEndpoints.slice(0, HEALTH_LIST_LIMIT).map((endpoint) => ({
           id: endpoint.id,
           label: endpoint.label,
-          status: endpoint.status,
+          status: endpointStatus(endpoint),
           cliDeviceId: endpoint.cliDeviceId,
         })),
       },

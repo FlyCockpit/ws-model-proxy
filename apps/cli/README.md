@@ -63,6 +63,10 @@ wsmp service status                 # inspect the installed user service
 wsmp service env-sync               # copy required env vars into the private service env file
 wsmp terminal fingerprint           # print this CLI's terminal identity fingerprint
 wsmp config set-mcp-commands supervised  # agents may request commands you confirm (off|supervised|unsupervised)
+wsmp metrics list                   # custom metric sources and their state
+wsmp metrics test gpu_fan           # run one source now and print what it reports
+wsmp metrics approve gpu_fan --sha256 <hash>  # approve the exact command you reviewed (hash from `metrics list`)
+wsmp config set-remote-metric-sources on  # accept remotely defined sources (each still needs approval)
 wsmp completions zsh                # shell completions
 ```
 
@@ -96,7 +100,34 @@ After registration a sampling thread sends, never blocking the relay:
 - `node.metrics` every 20 seconds: CPU use and load averages, `MemAvailable` and swap from `/proc/meminfo`, free space on `/`, per-GPU VRAM, utilization, temperature, power and SM clock, and per-interface byte counters (lifetime totals since boot, reported at most as 9007199254740991, the largest integer JSON numbers carry without loss);
 - `endpoint.load` every 2 seconds when it changes (and every 5 seconds regardless) for llama.cpp (`/slots`, and `/metrics` when started with `--metrics`), vLLM and SGLang (`/metrics`): running and waiting requests, KV use and prefix-cache deltas.
 
-Each endpoint is scraped on its own schedule, 2 seconds after its previous scrape finished, with at most 16 scrapes in flight, so a slow endpoint never delays another endpoint's load or the node metrics. Linux reads `/proc` and `/sys`; other platforms send what they can. `nvidia-smi` runs with a 5-second timeout and its stderr is discarded, and any helper it leaves behind is killed with its process group; HTTP scrapes time out after 2 seconds, and a body over its size limit after decompression is refused. Every reading is held to the server's limits before it is sent (for example CPU use at most 100%, over-long GPU text cut); an out-of-range reading is left out rather than sent. From llama.cpp `/slots` wsmp keeps only each slot's id, `n_ctx` and `is_processing`: prompt text and generated text in that response are never kept or sent. Remotely defined metric sources (`metrics.sources.set`) are not supported yet; wsmp reports each as `unsupported` and runs nothing.
+Each endpoint is scraped on its own schedule, 2 seconds after its previous scrape finished, with at most 16 scrapes in flight, so a slow endpoint never delays another endpoint's load or the node metrics. Linux reads `/proc` and `/sys`; other platforms send what they can. `nvidia-smi` runs with a 5-second timeout (the run is over within about a second of it even if `nvidia-smi` is hung in the driver) and its stderr is discarded, and any helper it leaves behind is killed with its process group; HTTP scrapes time out after 2 seconds, and a body over its size limit after decompression is refused. Every reading is held to the server's limits before it is sent (for example CPU use at most 100%, over-long GPU text cut); an out-of-range reading is left out rather than sent. From llama.cpp `/slots` wsmp keeps only each slot's id, `n_ctx` and `is_processing`: prompt text and generated text in that response are never kept or sent. Custom metric sources (below) add their own series to `node.metrics`.
+
+### Custom metric sources
+
+A metric source is a command that wsmp runs every `intervalSecs` seconds; its numbers go to the server in `node.metrics` (`custom`), where pool routing rules can use them. Local sources live in the config file:
+
+```json
+{
+  "metrics": {
+    "sources": {
+      "gpu_fan": { "command": "nvidia-smi --query-gpu=fan.speed --format=csv,noheader,nounits | head -1", "intervalSecs": 10, "timeoutSecs": 5, "format": "number" },
+      "queue": { "command": "curl -s http://127.0.0.1:9000/stats", "format": "json" },
+      "exporter": { "command": "curl -s http://127.0.0.1:9100/metrics", "format": "prometheus" }
+    }
+  }
+}
+```
+
+Formats: `number` (one number; the series is named after the source), `json` (an object of `name: number`) and `prometheus` (text exposition, `name{label="value"} 1.5`, comments and timestamps allowed). Only finite numbers are sent. Series names, label keys and label values must match `[A-Za-z0-9_.:-]{1,64}`, with at most 16 labels, and `__proto__` is not accepted as a label key; anything else is dropped, as are names starting with `node.` or `endpoint.` (reserved for built-in metrics). At most 50 series per device are sent. Defaults: `intervalSecs` 10 (5 to 86400), `timeoutSecs` 5 (1 to 300), `format` `number`; a source outside these bounds is reported `disabled` and never runs. Config changes apply within a few seconds without a restart.
+
+Every run is bounded: the command runs with `sh -c` in its own process group, with stdin closed and a scrubbed environment; stdout is capped at 64 KiB (more is reported `output_too_large` and nothing is sent); after the timeout the whole process group is killed (on Windows the process tree, via `taskkill /T`) and so is the command itself even if it left the group, and the run is over within about a second of the timeout even if the command does not die (one stuck in the kernel is left to a background reaper; while 8 such processes are still stuck, or 64 runs are in flight or stuck, new runs are refused). A helper that left the group and keeps the output pipe open cannot be killed with the group; it leaks nothing in wsmp (no thread, no descriptor) but keeps running until it exits. When wsmp exits, every run in flight is killed with its process group. `SIGKILL` of wsmp itself cannot be caught and can leave a command running until it exits by itself (nothing enforces its timeout once wsmp is gone). A panic in a release build kills the runs in flight first (panic hook). stderr is discarded: it is never read, logged or uploaded, and neither is the command's output. Only the parsed numbers, the source names, a state and an error code (`spawn`, `timeout`, `exit_status`, `output_too_large`, `parse`) leave the machine, plus the SHA-256 of each command. Commands run as the OS user that runs wsmp. `wsmp metrics list` shows every source and its state; `wsmp metrics test <name>` runs one now with the same limits and prints what it would report.
+
+Remote sources are defined over MCP or the API (the dashboard lists them), only for a device whose MCP command mode is `unsupervised` on the server. This CLI still refuses them unless both hold:
+
+1. the local opt-in: `wsmp config set-remote-metric-sources on` (off by default; only settable on this machine; restart wsmp to apply);
+2. a local approval of the exact command: `wsmp metrics approve <name> --sha256 <hash>`, where `<hash>` is the SHA-256 `wsmp metrics list` shows for the command you read. The approval pins that hash in the config and is refused if the stored command is no longer the one you reviewed (the flag is required for that reason). When the server changes the command string, the source stops running and shows `pending_approval` until you approve the new one. `wsmp metrics revoke <name>` removes an approval.
+
+Received definitions are stored in `remote-metric-sources.json` in the state directory so `wsmp metrics list` can show them. A local source with the same name wins; the remote one is `refused`.
 
 ### Browser terminal viewers
 

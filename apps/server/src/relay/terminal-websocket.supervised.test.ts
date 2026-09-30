@@ -53,6 +53,7 @@ const db = prisma as unknown as {
   discoveredModel: { findMany: MockInstance };
   executionTarget: { findMany: MockInstance };
   inferenceCapacity: { findMany: MockInstance };
+  poolMember: { findMany: MockInstance };
   mcpPersonalToken: { findFirst: MockInstance };
 };
 
@@ -196,6 +197,7 @@ describe("terminal list pushes for supervised requests", () => {
     db.discoveredModel.findMany.mockResolvedValue([]);
     db.executionTarget.findMany.mockResolvedValue([]);
     db.inferenceCapacity.findMany.mockResolvedValue([]);
+    db.poolMember.findMany.mockResolvedValue([]);
     cli = new FakeSocket();
     relaySessionManager.acceptAuthenticatedSocket({ socket: cli, identity, now });
     await relaySessionManager.handleTextFrame(cli, hello(), now);

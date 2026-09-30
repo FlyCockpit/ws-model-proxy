@@ -3,6 +3,7 @@ import { RPCLink } from "@orpc/client/fetch";
 import { createRouterClient } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/fetch";
 import type { Session } from "@ws-model-proxy/auth";
+import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { Context } from "../context";
 
@@ -24,11 +25,11 @@ integration("guarded pool setup with real PostgreSQL", () => {
     process.env.DATABASE_URL = databaseUrl;
     process.env.NODE_ENV = "test";
     process.env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = "true";
-    const [db, router] = await Promise.all([
+    const [, router] = await Promise.all([
       import("@ws-model-proxy/db"),
       import("./forwarder-management"),
     ]);
-    modules = { prisma: db.default, router };
+    modules = { prisma: createFixturePrismaClient(databaseUrl!), router };
   });
 
   afterAll(async () => {
