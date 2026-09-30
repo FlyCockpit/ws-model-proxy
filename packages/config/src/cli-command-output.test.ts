@@ -273,7 +273,8 @@ describe("appendRollingTail", () => {
   // (C3b-1/C4-1/C5-1 found shapes 10-40x slower than plain text).
   it("does the same work per byte for every output shape", () => {
     const shape = (prefix: string, unit: number[]) => {
-      const body = new Uint8Array(1 << 20);
+      // 64 KiB is plenty: the check counts reads, and a Proxy trap per byte is slow.
+      const body = new Uint8Array(1 << 16);
       for (let at = 0; at < body.length; at += 1) body[at] = unit[at % unit.length] ?? 0;
       return { prefix: bytes(prefix), body };
     };
