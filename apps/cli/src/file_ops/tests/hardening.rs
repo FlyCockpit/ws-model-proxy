@@ -240,7 +240,7 @@ fn tokens_without_assignment_syntax_are_masked_by_read_search_and_edit() {
     );
     let read = fx.read("cfg.txt").text;
     assert!(!read.contains("hunter2") && !read.contains("following-value"));
-    assert!(read.contains("⟦redacted line: apiKey⟧") && read.contains("visible"));
+    assert!(read.contains("⟦redacted line⟧") && read.contains("visible"));
     let searched = fx
         .ops
         .search(

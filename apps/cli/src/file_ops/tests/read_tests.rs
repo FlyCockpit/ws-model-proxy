@@ -266,7 +266,7 @@ fn a_plain_credentials_file_uses_case_insensitive_token_masking() {
     assert_eq!(r.redactions, 1);
     assert!(r.text.contains("[default]") && r.text.contains("EXAMPLEKEYIDVALUE"));
     assert!(!r.text.contains("examplesecretvalue"), "{}", r.text);
-    assert!(r.text.contains("⟦redacted line: aws_secret_access_key⟧"));
+    assert!(r.text.contains("⟦redacted line⟧"));
     // Reads and the edit view agree on the protected source range.
     let view = super::super::redact::mask(
         super::super::redact::FileClass::Plain,

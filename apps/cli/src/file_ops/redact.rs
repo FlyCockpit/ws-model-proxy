@@ -1,7 +1,7 @@
 //! Bounded secret masking for accidental disclosure (`design-r3.md`).
 //!
 //! In ordinary files, a case-insensitive secret-name word masks its WHOLE line
-//! as `⟦redacted line: NAME⟧`, and the following non-blank line as
+//! as `⟦redacted line⟧`, and the following non-blank line as
 //! `⟦redacted line⟧`. Words are maximal `[A-Za-z0-9_-]+` runs that do not start
 //! with `-`: they end in `_TOKEN`, `_KEY`, `_SECRET`, `_PASSWORD`, `apikey`,
 //! `api-key`, `api_key`, `hf-token` or `hf_token`, or equal `PASSWORD`.
@@ -482,6 +482,21 @@ fn construct_after_name(line: &str, end: usize) -> Construct {
     construct_for_tail(tail, colon, indent_of(line), quote_left_open(line))
 }
 
+/// The multi-line value the line after a token line opens (`value: |`, `value: >-`,
+/// an open quote, a trailing backslash): a `key:` whose key is identifier-like
+/// opens a YAML block; any other colon (`for x in y:`) is code, not a header.
+fn value_line_construct(line: &str) -> Construct {
+    match line.find(':') {
+        Some(colon) if key_like(&line[..colon]) => construct_for_tail(
+            &line[colon + 1..],
+            true,
+            indent_of(line),
+            quote_left_open(line),
+        ),
+        _ => construct_for_tail(line, false, indent_of(line), quote_left_open(line)),
+    }
+}
+
 /// Whether `before` (the text before a colon) is a YAML/JSON-style key: an optional
 /// list dash, then an identifier-like word, possibly quoted.
 fn key_like(before: &str) -> bool {
@@ -883,10 +898,14 @@ impl LineMasker {
             }
             if let Some(name) = first_secret_name(line) {
                 construct = construct_after_name(line, name.end);
-                masks = vec![(
-                    0..line.len(),
-                    format!("{MASK_OPEN} line: {}{MASK_CLOSE}", &line[name]),
-                )];
+                if construct == Construct::None && self.pending_token_line {
+                    // this is also the value's line after a token line (`value: | # API_KEY
+                    // is injected`): its own multi-line opener must not be lost to the token
+                    construct = value_line_construct(line);
+                }
+                // the marker never copies text of the line (a word that looks like a
+                // secret name can itself be the secret value: `--password admin_password`)
+                masks = vec![(0..line.len(), format!("{MASK_OPEN} line{MASK_CLOSE}"))];
                 self.pending_token_line = true;
             } else {
                 if let Some((start, opened)) = first_flag(line) {
@@ -898,19 +917,7 @@ impl LineMasker {
                     // the line after a token line is the value's line (`value: |` after
                     // `name: API_KEY`): a multi-line value that it opens goes on to a
                     // structural end (blank line, dedent), like a value on the token line
-                    // a `key:` whose key is identifier-like opens a YAML block; any other
-                    // colon (`for x in y:`, `def main():`) is code, not a value header
-                    construct = match line.find(':') {
-                        Some(colon) if key_like(&line[..colon]) => construct_for_tail(
-                            &line[colon + 1..],
-                            true,
-                            indent_of(line),
-                            quote_left_open(line),
-                        ),
-                        _ => {
-                            construct_for_tail(line, false, indent_of(line), quote_left_open(line))
-                        }
-                    };
+                    construct = value_line_construct(line);
                 }
                 self.pending_token_line = false;
             }
@@ -1095,7 +1102,7 @@ mod tests {
             assert!(!view.spans.is_empty(), "{sample}");
             if class == FileClass::Plain {
                 assert!(
-                    view.text.contains("⟦redacted line:"),
+                    view.text.contains("⟦redacted line⟧"),
                     "{sample}: {:?}",
                     view.text
                 );
@@ -1172,6 +1179,50 @@ mod tests {
         );
     }
 
+    /// A comment on the value header that itself holds a secret-name word must not
+    /// suppress the header's block, and a value that is itself a secret-name word is
+    /// never copied into the marker.
+    #[test]
+    fn token_words_in_headers_and_values_do_not_break_masking_or_echo_the_value() {
+        for (input, hidden) in [
+            (
+                "- name: API_KEY\n  value: | # API_KEY is injected by deployment\n    line-one\n    line-two\nnext: 1\n",
+                &["line-one", "line-two"][..],
+            ),
+            (
+                "- name: DB_PASSWORD\n  value: >- # loaded from DATABASE_PASSWORD\n    line-one\n    line-two\nnext: 1\n",
+                &["line-one", "line-two"][..],
+            ),
+            (
+                "run --password admin_password --verbose\n",
+                &["admin_password"][..],
+            ),
+            (
+                "run --password\nadmin_password\nnext\n",
+                &["admin_password"][..],
+            ),
+            (
+                "- name: DB_PASSWORD\n  value: admin_password\nnext: 1\n",
+                &["admin_password"][..],
+            ),
+        ] {
+            let view = mask(FileClass::Plain, input).text;
+            for value in hidden {
+                assert!(!view.contains(value), "{input:?} -> {view:?}");
+            }
+            assert!(
+                view.contains("next") || input.contains("admin_password"),
+                "{view:?}"
+            );
+        }
+        let dotenv = mask(
+            FileClass::Dotenv,
+            "A=\"first\n# admin_password\nlast\"\nB=x\n",
+        )
+        .text;
+        assert!(!dotenv.contains("admin_password"), "{dotenv:?}");
+    }
+
     #[test]
     fn token_words_mask_whole_lines_and_exactly_one_following_nonblank_line() {
         for name in [
@@ -1192,7 +1243,7 @@ mod tests {
             let view = mask(FileClass::Plain, &text);
             assert_eq!(
                 view.text,
-                format!("⟦redacted line: {name}⟧\r\n⟦redacted line⟧\r\nvisible\r\n")
+                format!("⟦redacted line⟧\r\n⟦redacted line⟧\r\nvisible\r\n")
             );
             assert_eq!(view.spans.len(), 2);
             assert_eq!(
@@ -1207,16 +1258,16 @@ mod tests {
             let text = format!("API_KEY anything\n{blank}\nvisible\n");
             assert_eq!(
                 masked(FileClass::Plain, &text),
-                format!("⟦redacted line: API_KEY⟧\n{blank}\nvisible\n")
+                format!("⟦redacted line⟧\n{blank}\nvisible\n")
             );
         }
         assert_eq!(
             masked(FileClass::Plain, "x API_KEY\ny HF_TOKEN\nz\nvisible\n"),
-            "⟦redacted line: API_KEY⟧\n⟦redacted line: HF_TOKEN⟧\n⟦redacted line⟧\nvisible\n"
+            "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\nvisible\n"
         );
         assert_eq!(
             masked(FileClass::Plain, "é API_KEY=é\n"),
-            "⟦redacted line: API_KEY⟧\n"
+            "⟦redacted line⟧\n"
         );
     }
 
@@ -1262,7 +1313,7 @@ mod tests {
             (
                 FileClass::Dotenv,
                 "# apiKey=value-one\n# next\n# shown\n",
-                "⟦redacted line: apiKey⟧\n⟦redacted line⟧\n# shown\n",
+                "⟦redacted line⟧\n⟦redacted line⟧\n# shown\n",
             ),
             (
                 FileClass::Dotenv,
@@ -1543,10 +1594,7 @@ mod tests {
     fn span_mapping_round_trips_positions() {
         let text = "a=1\nB_TOKEN=hunter22\nz=9\n\nend\n";
         let view = mask(FileClass::Plain, text);
-        assert_eq!(
-            view.text,
-            "a=1\n⟦redacted line: B_TOKEN⟧\n⟦redacted line⟧\n\nend\n"
-        );
+        assert_eq!(view.text, "a=1\n⟦redacted line⟧\n⟦redacted line⟧\n\nend\n");
         assert_eq!(view.redactions(), 2);
         let z_view = view.text.find("end").unwrap();
         let z_orig = text.find("end").unwrap();
@@ -1641,7 +1689,7 @@ mod tests {
         let text = "a:\n  TLS_KEY: |\n    line1\n\n    line2\n  other: shown\nb: shown\n";
         assert_eq!(
             masked(FileClass::Plain, text),
-            "a:\n⟦redacted line: TLS_KEY⟧\n⟦redacted line⟧\n\n\u{27E6}redacted\u{27E7}\n  other: shown\nb: shown\n"
+            "a:\n⟦redacted line⟧\n⟦redacted line⟧\n\n\u{27E6}redacted\u{27E7}\n  other: shown\nb: shown\n"
         );
     }
 
@@ -1652,7 +1700,7 @@ mod tests {
                 FileClass::Plain,
                 "run: echo \"HF_TOKEN=$X\" >> $GITHUB_ENV\nnext: 1\nvisible: yes\n"
             ),
-            "⟦redacted line: HF_TOKEN⟧\n⟦redacted line⟧\nvisible: yes\n"
+            "⟦redacted line⟧\n⟦redacted line⟧\nvisible: yes\n"
         );
         // A name/value reference occupies only the one line covered by the rule.
         assert_eq!(
@@ -1660,7 +1708,7 @@ mod tests {
                 FileClass::Plain,
                 "  name: API_KEY\n  valueFrom: {secretKeyRef: {name: service, key: credential}}\nvisible: yes\n"
             ),
-            "⟦redacted line: API_KEY⟧\n⟦redacted line⟧\nvisible: yes\n"
+            "⟦redacted line⟧\n⟦redacted line⟧\nvisible: yes\n"
         );
     }
 
@@ -1672,21 +1720,21 @@ mod tests {
         // a deeper sibling of a list item is over-masked, never leaked)
         assert_eq!(
             masked(Plain, "\"K_TOKEN\": |\n one\n\n two\nvisible: 1\n"),
-            "⟦redacted line: K_TOKEN⟧\n⟦redacted line⟧\n\n\u{27E6}redacted\u{27E7}\nvisible: 1\n"
+            "⟦redacted line⟧\n⟦redacted line⟧\n\n\u{27E6}redacted\u{27E7}\nvisible: 1\n"
         );
         assert_eq!(
             masked(Plain, "- K_KEY: >-\n    body\n  sibling: 1\ntop: 1\n"),
-            "⟦redacted line: K_KEY⟧\n⟦redacted line⟧\n\u{27E6}redacted\u{27E7}\ntop: 1\n"
+            "⟦redacted line⟧\n⟦redacted line⟧\n\u{27E6}redacted\u{27E7}\ntop: 1\n"
         );
         // every other multi-line form ends at the first blank line, not at a quote
         assert_eq!(
             masked(Plain, "K_TOKEN=\"a\nb\" tail\nc\n\nvisible\n"),
-            "⟦redacted line: K_TOKEN⟧\n⟦redacted line⟧\n\u{27E6}redacted\u{27E7}\n\nvisible\n"
+            "⟦redacted line⟧\n⟦redacted line⟧\n\u{27E6}redacted\u{27E7}\n\nvisible\n"
         );
         // a region that never reaches a blank line is masked to its end
         assert_eq!(
             masked(Plain, "K_TOKEN=\"a\nb\nc\n"),
-            "⟦redacted line: K_TOKEN⟧\n⟦redacted line⟧\n\u{27E6}redacted\u{27E7}\n"
+            "⟦redacted line⟧\n⟦redacted line⟧\n\u{27E6}redacted\u{27E7}\n"
         );
     }
 
@@ -1796,7 +1844,7 @@ mod tests {
                         && !text.starts_with("A_TOKENB")
                         && !text.starts_with("a_tokenb");
                     if text.starts_with('_') {
-                        assert!(view.text.starts_with("⟦redacted line: "));
+                        assert!(view.text.starts_with("⟦redacted line⟧"));
                     } else if !has_name {
                         assert_eq!(view.text, *text);
                     }
@@ -1832,10 +1880,7 @@ mod tests {
     fn a_line_masker_masks_a_multi_line_value_until_a_blank_line_for_every_class() {
         for class in [FileClass::Plain, FileClass::PemKey] {
             let mut masker = LineMasker::new(class);
-            assert_eq!(
-                masker.mask_line("K_TOKEN=\"one"),
-                "⟦redacted line: K_TOKEN⟧"
-            );
+            assert_eq!(masker.mask_line("K_TOKEN=\"one"), "⟦redacted line⟧");
             assert!(masker.in_continuation());
             assert_eq!(masker.mask_line("two"), "⟦redacted line⟧");
             // a closing quote does not end masking; only the blank line does

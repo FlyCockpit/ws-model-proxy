@@ -384,10 +384,23 @@ fn masked_spans_cannot_be_targeted_and_cannot_be_probed() {
     );
     let etag = fx.etag("run.conf");
     // touching the secret value is refused ...
-    for old in ["⟦redacted line: HF_TOKEN⟧", "HF_TOKEN", "⟦redacted line⟧"] {
-        let code = edit_err(&fx, "run.conf", json!([{ "oldText": old, "newText": "x" }])).code;
-        assert!(matches!(code, ErrorCode::RedactedSpan), "{old}: {code:?}");
-    }
+    let refused = edit_err(
+        &fx,
+        "run.conf",
+        json!([{ "oldText": "⟦redacted line⟧", "newText": "x", "expectedMatches": "all" }]),
+    )
+    .code;
+    assert!(matches!(refused, ErrorCode::RedactedSpan), "{refused:?}");
+    // the marker does not echo the name: the token is not in the view at all
+    assert_eq!(
+        edit_err(
+            &fx,
+            "run.conf",
+            json!([{ "oldText": "HF_TOKEN", "newText": "x" }])
+        )
+        .code,
+        ErrorCode::NoMatch
+    );
     // ... but the match is on the MASKED view, so guessing the secret finds nothing:
     // no oracle for the real value.
     for guess in ["hunter2", "HF_TOKEN=hunter2secret", "secret"] {
@@ -455,31 +468,22 @@ fn masked_spans_cannot_be_targeted_and_cannot_be_probed() {
 
 #[test]
 fn an_edit_that_changes_the_masking_context_cannot_unmask_a_value() {
-    // The diagnostic includes the token name inside the span: renaming it is
-    // refused, as are insertions that would expose surviving masked bytes.
-    // Both actual edits and dry runs enforce the same invariant.
+    // Editing a marker is refused, as are insertions that would expose surviving
+    // masked bytes. Both actual edits and dry runs enforce the same invariant.
     let fx = Fx::new();
     fx.put(
         "cfg.yaml",
         "API_KEY: plainsecret-value\nnext: masked\nother: 1\n",
     );
     fx.put("multi.txt", "X_TOKEN=\"line1\nline2-multisecret\"\ntail\n");
-    let cases: [(&str, serde_json::Value); 4] = [
+    let cases: [(&str, serde_json::Value); 2] = [
         (
             "cfg.yaml",
-            json!([{ "oldText": "API_KEY", "newText": "API_KEX" }]),
-        ),
-        (
-            "cfg.yaml",
-            json!([{ "oldText": "API_KEY", "newText": "API KEY" }]),
+            json!([{ "oldText": "⟦redacted line⟧", "newText": "x", "expectedMatches": "all" }]),
         ),
         (
             "multi.txt",
-            json!([{ "oldText": "X_TOKEN", "newText": "X_TOKEX" }]),
-        ),
-        (
-            "multi.txt",
-            json!([{ "oldText": "X_TOKEN", "newText": "X TOKEN" }]),
+            json!([{ "oldText": "⟦redacted line⟧", "newText": "x", "expectedMatches": "all" }]),
         ),
     ];
     for (file, edits) in cases {
@@ -504,17 +508,6 @@ fn an_edit_that_changes_the_masking_context_cannot_unmask_a_value() {
         fx.get("cfg.yaml"),
         "API_KEY: plainsecret-value\nnext: masked\nother: 1\n"
     );
-    // one masked value is unmasked while the others stay masked: still refused
-    fx.put(
-        "three.conf",
-        "A_KEY=one-secret\nB_KEY=two-secret\nC_KEY=three-secret\n",
-    );
-    let r = fx.ops.edit(
-        &args(json!({ "path": fx.p("three.conf"), "dryRun": true,
-            "edits": [{ "oldText": "B_KEY", "newText": "B KEY" }] })),
-        &fx.cancel,
-    );
-    assert_eq!(code(r), ErrorCode::RedactedSpan);
     // an edit elsewhere in the file is fine
     edit(
         &fx,
