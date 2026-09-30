@@ -430,6 +430,9 @@ fn etag(root: &Path, target: &Path) -> String {
 fn real_child_configured_root_table_waits_for_keypress_with_matching_codes() {
     use std::os::unix::fs::PermissionsExt;
     for state in ["alias", "real", "outside", "escape", "removed", "long"] {
+        if state == "long" && !cfg!(target_os = "linux") {
+            continue;
+        }
         for op in [
             "edit",
             "write",

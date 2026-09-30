@@ -49,6 +49,9 @@ pub struct Policy {
     roots_required: bool,
     roots_usable: bool,
     protected: Vec<Protected>,
+    /// The protected entries under their configured names only (no physical
+    /// aliases resolved from disk): the lexical, pre-display check uses these.
+    protected_logical: Vec<Protected>,
     euid: u32,
     allow_root: bool,
 }
@@ -108,6 +111,7 @@ impl Policy {
             roots,
             roots_required,
             roots_usable,
+            protected_logical: protected.clone(),
             protected: with_physical_aliases(protected),
             euid: nix::unistd::geteuid().as_raw(),
             allow_root,
@@ -169,7 +173,7 @@ impl Policy {
     /// Decide on the physical path `full`: the lexical policy plus, on Linux
     /// with configured roots, the kernel root guard (which reads the disk).
     pub fn check_path(&self, access: Access, full: &Path) -> FileResult<()> {
-        self.check_path_lexical(access, full)?;
+        self.check_text(access, full, &self.protected)?;
         if !self.within_roots(full) {
             return Err(FileError::denied(
                 "path is outside the configured file roots",
@@ -185,6 +189,14 @@ impl Policy {
     /// unavailable root) before a person has pressed a key. Root confinement
     /// compares resolved paths and runs only at physical resolution and apply.
     pub(crate) fn check_path_lexical(&self, access: Access, full: &Path) -> FileResult<()> {
+        // Physical aliases of the protected set come from disk at startup:
+        // matching them before a keypress would let an agent probe where wsmp's
+        // directories live, so only the configured names count here.
+        self.check_text(access, full, &self.protected_logical)
+    }
+
+    /// The path-text policy against one protected list.
+    fn check_text(&self, access: Access, full: &Path, protected: &[Protected]) -> FileResult<()> {
         if full.to_str().is_none() {
             return Err(FileError::invalid("path is not valid UTF-8"));
         }
@@ -205,7 +217,7 @@ impl Policy {
                 "secret files and their directories are read-only through the file tools",
             ));
         }
-        for entry in &self.protected {
+        for entry in protected {
             let inside = full == entry.path || (entry.subtree && full.starts_with(&entry.path));
             let blocked = match entry.deny {
                 Deny::ReadWrite => true,
@@ -506,6 +518,42 @@ mod tests {
 
     /// A relative selector whose parents do not exist yet still gets an absolute
     /// alias (the operation paths are absolute).
+    /// The pre-display (lexical) check must not match physical aliases that were
+    /// resolved from disk: a physical spelling of a protected path is judged on
+    /// the blocked screen (`check_path`), the configured spelling stays immediate.
+    #[test]
+    fn lexical_check_ignores_disk_derived_protected_aliases() {
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        std::fs::create_dir_all(base.join("real/state")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("home")).unwrap();
+        let policy = Policy::new(
+            vec![],
+            vec![entry(
+                base.join("home/state/device-auth.json").to_str().unwrap(),
+                false,
+                Deny::ReadWrite,
+            )],
+            true,
+        );
+        let logical = base.join("home/state/device-auth.json");
+        let physical_file = base.join("real/state/device-auth.json");
+        let physical_dir = base.join("real/state");
+        assert!(policy.check_path_lexical(Access::Write, &logical).is_err());
+        assert!(
+            policy
+                .check_path_lexical(Access::Write, &physical_file)
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check_path_lexical(Access::Remove, &physical_dir)
+                .is_ok()
+        );
+        assert!(policy.check_path(Access::Write, &physical_file).is_err());
+        assert!(policy.check_path(Access::Remove, &physical_dir).is_err());
+    }
+
     #[test]
     fn relative_missing_protected_path_gets_an_absolute_alias() {
         let rel = PathBuf::from("wsmp-nonexistent-state-dir/deeper/device-auth.json");

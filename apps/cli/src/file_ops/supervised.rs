@@ -407,7 +407,9 @@ struct Material {
     fingerprints: Vec<Vec<u8>>,
 }
 
-const MAX_CHILD_ARGS_BYTES: usize = 128 * 1024;
+/// Below the 128 KiB per-variable exec limit (`NAME=value\0` counts in full on
+/// Linux), so an accepted argument set always starts the confirm child.
+const MAX_CHILD_ARGS_BYTES: usize = 128 * 1024 - 256;
 
 fn check_args_size(args: &Value) -> FileResult<()> {
     if serde_json::to_vec(args)

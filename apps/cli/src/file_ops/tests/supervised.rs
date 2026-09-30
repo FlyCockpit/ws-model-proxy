@@ -1472,6 +1472,9 @@ fn configured_roots_block_physical_escapes_with_child_parity() {
     }
 }
 
+// macOS caps symlink targets at 1023 bytes and follows at most 32 links, so the
+// disk-derived growth fallback is unreachable there (and cannot be built).
+#[cfg(target_os = "linux")]
 #[test]
 fn child_argument_caps_separate_request_size_from_disk_growth() {
     let fx = Fx::new();

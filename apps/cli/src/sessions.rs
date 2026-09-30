@@ -8815,11 +8815,14 @@ exit 0
         assert_eq!(outcome_kinds(&frames), vec!["spawned"]);
     }
 
-    /// 2.8: a supervised file op is in the schema but never runs before P5.
+    /// Roots, symlinked root spellings and oversized disk-derived arguments reach the registry screen (a blocked screen, never a pre-display rejection).
     #[cfg(unix)]
     #[test]
     fn supervised_file_root_and_size_boundaries_reach_registry_screen_without_results() {
         for state in ["alias", "outside", "escape", "removed", "long"] {
+            if state == "long" && !cfg!(target_os = "linux") {
+                continue;
+            }
             let dir = tempfile::tempdir().unwrap();
             let base = dir.path().canonicalize().unwrap();
             let root = base.join("root");
