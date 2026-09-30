@@ -347,9 +347,10 @@ function serverFailure(record: FileOpRecord, code: FileOpErrorCode): FileOpFailu
 /** Failures the CLI itself answered with (rather than the server ending the op), for the audit. */
 const CLI_ANSWERED = new WeakSet<object>();
 
-/** The CLI's own mode/root/load refusals: nothing ran. */
+/** The CLI's own mode/root/load and filesystem safety refusals: nothing changed. */
 const REFUSED_BY_CLI_CODES: ReadonlySet<string> = new Set([
   "unsupported",
+  "unsafe_filesystem",
   "limit",
   "supervised_only",
   "grant_disabled",

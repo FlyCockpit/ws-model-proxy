@@ -12,10 +12,10 @@
 //!    held fd. On mismatch, capture the destination and undo to recorded origins:
 //!    dispose our proven temp and restore the displaced object, or restore the
 //!    newest external write and keep the older object with uncertain_outcome;
-//! 7. if exchange is unsupported, plain cross-directory rename `R/tmp -> name`
-//!    retains the documented replace race. The parent directory is fsynced after
-//!    the commit and R is removed last (an unreported empty R after a power loss is
-//!    harmless);
+//! 7. if exchange is unsupported, first probe NOREPLACE/link at an absent private
+//!    name; capture and prove the original, then publish into its vacant name using
+//!    only the selected no-overwrite primitive. If neither works, nothing public
+//!    changes. Fsync the parent after commit; remove R last;
 //! 8. precommit failure disposes the already-private temp by its held fd,
 //!    without capturing any public name. A crash leaves a discoverable R/tmp.
 //!
@@ -28,11 +28,15 @@
 //! vacant during undo, so concurrent creates prevent NOREPLACE restoration;
 //! (b2) overwrite rename's source is vacant from capture through operation end,
 //! and a concurrent create is kept and reported when it blocks restoration;
-//! (c) exchange-less replace's cross-directory plain-rename race (window exact
-//! in `recovery`); (d) crash
-//! residue in `.wsmp-recover-*` (including replace's partial tmp) or both links;
-//! (e) unheld objects are never deleted. See `recovery` for restore fallbacks,
-//! manual recovery and bounds.
+//! (d) crash residue in R (original plus partial tmp/renamed probe and public name
+//! vacant, or captured delete) or both links; (e) unheld objects are never deleted;
+//! (f) another process's open NFS fd can leave .nfs residue; our own fds close before
+//! unlink; (g) link publication exposes T briefly before its private alias unlink.
+//! Failed alias cleanup leaves nlink 2 and hard_linked refusal until manual cleanup.
+//! The vacant interval is bounded by syscalls, never by elapsed time; publication
+//! depends on the filesystem's actual NOREPLACE/link atomicity. See `recovery` for
+//! platform facts, in-place-write loss, restore fallbacks and separate case-only
+//! rename, exclusive-create, rollback_created and exchange-less overwrite refusals.
 //!
 //! Refused up front: files owned by another uid (a non-root rename would change
 //! the owner), hard-linked files (the rename would break the link), and
@@ -111,7 +115,7 @@ impl TempGuard<'_> {
             return false;
         };
         let _ = ops.step(Step::Captured);
-        self.recovery.dispose(ops, &slot, &self.identity)
+        self.recovery.dispose(ops, &slot, &mut self.identity)
     }
 }
 
@@ -126,7 +130,7 @@ impl Drop for TempGuard<'_> {
 }
 
 /// Replace `name` in `dir` with `content`. `orig` is the open original (consumed:
-/// it is closed before the recovery directory is removed) and
+/// it is closed before any private disposal unlink) and
 /// `orig_etag` the etag of the bytes the new content was derived from.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn replace(
@@ -134,7 +138,7 @@ pub(crate) fn replace(
     dir: &OwnedFd,
     name: &OsStr,
     dir_path: &Path,
-    mut orig: File,
+    orig: File,
     orig_stat: &Stat,
     orig_etag: &str,
     content: &[u8],
@@ -147,17 +151,14 @@ pub(crate) fn replace(
         dir,
         name,
         dir_path,
-        &mut orig,
+        orig,
         orig_stat,
         orig_etag,
         content,
         cancel,
         &mut recovery,
     );
-    // Every held fd is closed before the recovery directory is removed (an NFS
-    // client silly-renames an unlinked-but-open file into it, so rmdir would fail).
-    // replace_inner's own handles (temp, original dup) ended with its return.
-    drop(orig);
+    // replace_inner closes staging/read files before any final unlink.
     let recovered = recovery.finish();
     match result {
         Ok(stat) => Ok((stat, recovered)),
@@ -176,23 +177,23 @@ fn replace_inner(
     dir: &OwnedFd,
     name: &OsStr,
     dir_path: &Path,
-    orig: &mut File,
+    mut orig: File,
     orig_stat: &Stat,
     orig_etag: &str,
     content: &[u8],
     cancel: &Cancel,
     recovery: &mut RecoveryDir,
 ) -> FileResult<Stat> {
-    let original = Held::from_file(orig)?;
+    let mut original = Held::from_file(&orig)?;
     let (mut tmp, mut tmp_file) = recovery.create_temp(dir, name, &dir_path.join(name))?;
     // A failed fd proof retains the already-private temp; it is never captured
     // through a public staging name.
-    let identity = match Held::from_file(&tmp_file) {
+    let mut identity = match Held::from_file(&tmp_file) {
         Ok(held) => held,
         Err(_) => return Err(recovery.uncertain()),
     };
     let mut armed = true;
-    let result = (|| -> FileResult<Stat> {
+    let prepared = (|| -> FileResult<Stat> {
         ops.step(Step::TempCreated)?;
         tmp_file.write_all(content)?;
         ops.step(Step::TempWritten)?;
@@ -208,17 +209,32 @@ fn replace_inner(
         fchmod(tmp_file.as_fd(), perm_mode(orig_stat.mode & 0o7777)).map_err(FileError::errno)?;
         ops.step(Step::Chmodded)?;
         let new_stat = Stat::from_metadata(&tmp_file.metadata()?);
-        recheck(ops, dir, name, orig, orig_stat, orig_etag, cancel)?;
+        recheck(ops, dir, name, &mut orig, orig_stat, orig_etag, cancel)?;
         ops.step(Step::EtagRechecked)?;
         cancel.check()?;
-        commit_stage(ops, recovery, &mut tmp, &original, &identity, &mut armed)?;
+        Ok(new_stat)
+    })();
+    // The Held proofs are now the only descriptors on these inodes. Their
+    // disposal releases the last fd BEFORE unlink, avoiding NFS silly-renames.
+    drop(orig);
+    drop(tmp_file);
+    let result = prepared.and_then(|new_stat| {
+        commit_stage(
+            ops,
+            recovery,
+            &mut tmp,
+            &mut original,
+            &mut identity,
+            &mut armed,
+            cancel,
+        )?;
         armed = false;
         let _ = ops.step(Step::Renamed);
         fsync(dir.as_fd()).map_err(FileError::errno)?;
         let _ = ops.step(Step::DirSynced);
         Ok(new_stat)
-    })();
-    if armed && !recovery.dispose(ops, &tmp, &identity) {
+    });
+    if armed && !recovery.dispose(ops, &tmp, &mut identity) {
         Err(recovery.uncertain())
     } else {
         result
@@ -228,16 +244,16 @@ fn replace_inner(
 /// Exchange the private temp with its recorded destination. X can only have
 /// come from that destination; no public staging name can admit a foreign origin.
 /// Undo restores each captured object to its recorded origin, newest write first.
+#[allow(clippy::too_many_arguments)]
 fn commit_stage(
     ops: &FileOps,
     recovery: &mut RecoveryDir,
     tmp: &mut Slot,
-    original: &Held,
-    identity: &Held,
+    original: &mut Held,
+    identity: &mut Held,
     armed: &mut bool,
+    cancel: &Cancel,
 ) -> FileResult<()> {
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let _ = (ops, original, identity, armed);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         match recovery.exchange_temp(tmp) {
@@ -250,6 +266,7 @@ fn commit_stage(
                     recovery.dispose(ops, tmp, original);
                     return Ok(());
                 }
+                original.release(); // no longer needed; undo may link this inode
                 let y = recovery.capture_origin(tmp);
                 if y.is_some() {
                     let _ = ops.step(Step::Captured);
@@ -265,6 +282,9 @@ fn commit_stage(
                     if let Some(y) = y {
                         recovery.dispose(ops, &y, identity);
                     }
+                    // No further disposal uses T's proof. Restore opens its own
+                    // proof, and may unlink an alias of T from this private slot.
+                    identity.release();
                     if recovery.restore(ops, tmp) {
                         let _ = ops.step(Step::Restored);
                     }
@@ -280,7 +300,9 @@ fn commit_stage(
             Err(errno) => return Err(FileError::errno(errno)),
         }
     }
-    recovery.commit_temp(tmp).map_err(FileError::errno)
+    // The fallback owns T before probing. No outer exit may dispose it again.
+    *armed = false;
+    recovery.publish_without_exchange(ops, tmp, original, identity, cancel)
 }
 
 /// The name must still point at the file we read, and that file must still
@@ -366,6 +388,7 @@ pub(crate) fn create_new(
         if finish.is_ok() {
             guard.armed = false;
         }
+        drop(file); // only the Held proof may remain at the cleanup unlink
         if !guard.cleanup(ops) {
             return Err(guard.recovery.uncertain());
         }

@@ -79,8 +79,8 @@ impl Cancel {
 
 /// Observable steps of the atomic replace, in order. A hook may fail a step
 /// (test fault injection) or change the world between steps (race tests).
-/// `EtagRechecked` is also emitted by `delete` just before its own pre-unlink
-/// re-check, whose only purpose there is to give the same seam.
+/// `Vacating` is the last seam before capturing a public name into recovery.
+/// After capture, cancellation finishes or compensates; it cannot abandon a move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     TempCreated,
@@ -89,6 +89,7 @@ pub enum Step {
     Chowned,
     Chmodded,
     EtagRechecked,
+    Vacating,
     Vacated,
     Exchanged,
     Captured,

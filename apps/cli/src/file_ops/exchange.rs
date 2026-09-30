@@ -6,65 +6,102 @@ use std::os::fd::AsFd;
 use nix::errno::Errno;
 
 /// Faults are thread-local, indexed by the Nth call of each primitive. Production
-/// calls are no-ops. A test scope resets counts and faults on entry and exit.
+/// calls execute only the syscall. A test scope resets counts and faults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Primitive {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Exchange,
+    ProbeNoReplace,
+    ProbeLink,
+    Publish,
+    PublishLink,
     Capture,
     Restore,
     RestoreLink,
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Move,
+    MoveLink,
+    Hold,
+    Identity,
+    Mkdir,
     Unlink,
     Rmdir,
 }
 
 #[cfg(test)]
-type FaultState = (Vec<(Primitive, usize, Errno)>, Vec<Primitive>);
+#[derive(Clone, Copy)]
+enum FaultMode {
+    Before,
+    AfterEffect,
+}
+
+#[cfg(test)]
+type FaultState = (Vec<(Primitive, usize, Errno, FaultMode)>, Vec<Primitive>);
 
 #[cfg(test)]
 thread_local! {
     static FAULTS: std::cell::RefCell<FaultState> = const {
         std::cell::RefCell::new((Vec::new(), Vec::new()))
     };
-}
-
-// Test seam: runs just before the recovery directory's rmdir, so a test can
-// observe which descriptors are still open at that moment.
-#[cfg(test)]
-thread_local! {
+    // Observe descriptor ownership at the actual unlink/rmdir boundary.
     pub(super) static RMDIR_PROBE: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+    pub(super) static UNLINK_PROBE: std::cell::RefCell<Option<Box<dyn Fn()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
-pub(super) fn fault(primitive: Primitive) -> Result<(), Errno> {
+/// Register one call and return an optional error to inject AFTER a successful
+/// syscall. Keeping this separate from the syscall avoids counting it twice.
+fn begin(primitive: Primitive) -> Result<Option<Errno>, Errno> {
     #[cfg(not(test))]
     let _ = primitive;
     #[cfg(test)]
-    if primitive == Primitive::Rmdir {
-        RMDIR_PROBE.with(|probe| {
-            if let Some(probe) = probe.borrow().as_ref() {
-                probe();
-            }
-        });
-    }
-    #[cfg(test)]
-    return FAULTS.with(|state| {
-        let mut state = state.borrow_mut();
-        state.1.push(primitive);
-        let nth = state.1.iter().filter(|p| **p == primitive).count();
-        match state
-            .0
-            .iter()
-            .find(|(p, n, _)| *p == primitive && *n == nth)
-        {
-            Some((_, _, errno)) => Err(*errno),
-            None => Ok(()),
+    {
+        match primitive {
+            Primitive::Rmdir => RMDIR_PROBE.with(|probe| {
+                if let Some(probe) = probe.borrow().as_ref() {
+                    probe();
+                }
+            }),
+            Primitive::Unlink => UNLINK_PROBE.with(|probe| {
+                if let Some(probe) = probe.borrow().as_ref() {
+                    probe();
+                }
+            }),
+            _ => {}
         }
-    });
+        FAULTS.with(|state| {
+            let mut state = state.borrow_mut();
+            state.1.push(primitive);
+            let nth = state.1.iter().filter(|p| **p == primitive).count();
+            match state
+                .0
+                .iter()
+                .find(|(p, n, _, _)| *p == primitive && *n == nth)
+            {
+                Some((_, _, errno, FaultMode::Before)) => Err(*errno),
+                Some((_, _, errno, FaultMode::AfterEffect)) => Ok(Some(*errno)),
+                None => Ok(None),
+            }
+        })
+    }
     #[cfg(not(test))]
-    Ok(())
+    Ok(None)
+}
+
+pub(super) fn fault(primitive: Primitive) -> Result<(), Errno> {
+    begin(primitive).map(|_| ())
+}
+
+pub(super) fn run<T>(
+    primitive: Primitive,
+    syscall: impl FnOnce() -> Result<T, Errno>,
+) -> Result<T, Errno> {
+    let after = begin(primitive)?;
+    let result = syscall()?;
+    match after {
+        Some(errno) => Err(errno),
+        None => Ok(result),
+    }
 }
 
 #[cfg(test)]
@@ -73,8 +110,32 @@ pub(super) struct FaultScope;
 #[cfg(test)]
 impl FaultScope {
     pub(super) fn new(faults: &[(Primitive, usize, Errno)]) -> Self {
-        FAULTS.with(|state| *state.borrow_mut() = (faults.to_vec(), Vec::new()));
+        Self::with_after_effects(faults, &[])
+    }
+
+    pub(super) fn with_after_effects(
+        before: &[(Primitive, usize, Errno)],
+        after: &[(Primitive, usize, Errno)],
+    ) -> Self {
+        let faults = before
+            .iter()
+            .map(|&(p, n, e)| (p, n, e, FaultMode::Before))
+            .chain(
+                after
+                    .iter()
+                    .map(|&(p, n, e)| (p, n, e, FaultMode::AfterEffect)),
+            )
+            .collect();
+        FAULTS.with(|state| *state.borrow_mut() = (faults, Vec::new()));
         Self
+    }
+
+    pub(super) fn after_effect(faults: &[(Primitive, usize, Errno)]) -> Self {
+        Self::with_after_effects(&[], faults)
+    }
+
+    pub(super) fn calls() -> Vec<Primitive> {
+        FAULTS.with(|state| state.borrow().1.clone())
     }
 }
 
@@ -83,6 +144,7 @@ impl Drop for FaultScope {
     fn drop(&mut self) {
         FAULTS.with(|state| *state.borrow_mut() = (Vec::new(), Vec::new()));
         RMDIR_PROBE.with(|probe| *probe.borrow_mut() = None);
+        UNLINK_PROBE.with(|probe| *probe.borrow_mut() = None);
     }
 }
 
@@ -93,18 +155,19 @@ pub(super) fn exchange(
     dir_to: impl AsFd,
     to: &OsStr,
 ) -> Result<(), Errno> {
-    fault(Primitive::Exchange)?;
-    #[cfg(target_os = "linux")]
-    {
-        use nix::fcntl::{RenameFlags, renameat2};
-        renameat2(dir_from, from, dir_to, to, RenameFlags::RENAME_EXCHANGE)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use rustix::fs::{RenameFlags, renameat_with};
-        renameat_with(dir_from, from, dir_to, to, RenameFlags::EXCHANGE)
-            .map_err(|errno| Errno::from_raw(errno.raw_os_error()))
-    }
+    run(Primitive::Exchange, || {
+        #[cfg(target_os = "linux")]
+        {
+            use nix::fcntl::{RenameFlags, renameat2};
+            renameat2(dir_from, from, dir_to, to, RenameFlags::RENAME_EXCHANGE)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use rustix::fs::{RenameFlags, renameat_with};
+            renameat_with(dir_from, from, dir_to, to, RenameFlags::EXCHANGE)
+                .map_err(|errno| Errno::from_raw(errno.raw_os_error()))
+        }
+    })
 }
 
 /// NOREPLACE primitive; callers own the capture/restore fallback policy.
@@ -115,47 +178,52 @@ pub(super) fn no_replace(
     to: &OsStr,
     primitive: Primitive,
 ) -> Result<(), Errno> {
-    fault(primitive)?;
-    #[cfg(target_os = "linux")]
-    {
-        use nix::fcntl::{RenameFlags, renameat2};
-        renameat2(dir_from, from, dir_to, to, RenameFlags::RENAME_NOREPLACE)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        use rustix::fs::{RenameFlags, renameat_with};
-        renameat_with(dir_from, from, dir_to, to, RenameFlags::NOREPLACE)
-            .map_err(|errno| Errno::from_raw(errno.raw_os_error()))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = (dir_from, from, dir_to, to);
-        Err(Errno::ENOSYS)
-    }
+    run(primitive, || {
+        #[cfg(target_os = "linux")]
+        {
+            use nix::fcntl::{RenameFlags, renameat2};
+            renameat2(dir_from, from, dir_to, to, RenameFlags::RENAME_NOREPLACE)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use rustix::fs::{RenameFlags, renameat_with};
+            renameat_with(dir_from, from, dir_to, to, RenameFlags::NOREPLACE)
+                .map_err(|errno| Errno::from_raw(errno.raw_os_error()))
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = (dir_from, from, dir_to, to);
+            Err(Errno::ENOSYS)
+        }
+    })
 }
 
-/// Only these errors permit the caller's unsupported-exchange policy.
+/// Linux ENOTSUP aliases EOPNOTSUPP; macOS uses ENOTSUP for unsupported SWAP
+/// (its distinct EOPNOTSUPP stays an ordinary error).
 pub(super) fn is_unsupported(errno: Errno) -> bool {
-    matches!(errno, Errno::EINVAL | Errno::ENOSYS)
-        || (cfg!(target_os = "macos") && errno == Errno::ENOTSUP)
+    matches!(errno, Errno::EINVAL | Errno::ENOSYS | Errno::ENOTSUP)
+}
+
+/// Only capability errors from link permit a definitive unsafe-fs refusal.
+/// EMLINK, space/quota errors and access errors describe this attempt instead.
+pub(super) fn is_link_unsupported(errno: Errno) -> bool {
+    is_unsupported(errno) || matches!(errno, Errno::EPERM | Errno::EOPNOTSUPP)
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
 
-    /// The set of errors that mean "this filesystem has no exchange". Every other
-    /// error must stay an error: a silent fallback would be a plain overwrite.
     #[test]
     fn only_exchange_less_errors_are_unsupported() {
-        for errno in [Errno::EINVAL, Errno::ENOSYS] {
+        for errno in [Errno::EINVAL, Errno::ENOSYS, Errno::ENOTSUP] {
             assert!(is_unsupported(errno), "{errno}");
         }
-        assert_eq!(
-            is_unsupported(Errno::ENOTSUP),
-            cfg!(target_os = "macos"),
-            "ENOTSUP is the macOS swap-unsupported errno"
-        );
+        assert_eq!(is_unsupported(Errno::EOPNOTSUPP), cfg!(target_os = "linux"));
+        #[cfg(target_os = "linux")]
+        assert_eq!(Errno::ENOTSUP, Errno::EOPNOTSUPP);
+        #[cfg(target_os = "macos")]
+        assert_ne!(Errno::ENOTSUP, Errno::EOPNOTSUPP);
         for errno in [
             Errno::ENOENT,
             Errno::EPERM,
@@ -164,8 +232,46 @@ mod tests {
             Errno::EIO,
             Errno::EBUSY,
             Errno::EISDIR,
+            Errno::EMLINK,
         ] {
             assert!(!is_unsupported(errno), "{errno}");
+        }
+    }
+
+    #[test]
+    fn after_effect_runs_once_before_reporting_the_fault() {
+        let _scope = FaultScope::after_effect(&[(Primitive::Publish, 1, Errno::EIO)]);
+        let ran = std::cell::Cell::new(0);
+        let result = run(Primitive::Publish, || {
+            ran.set(ran.get() + 1);
+            Ok(())
+        });
+        assert_eq!(result, Err(Errno::EIO));
+        assert_eq!(ran.get(), 1);
+        assert_eq!(FaultScope::calls(), [Primitive::Publish]);
+    }
+
+    #[test]
+    fn link_capability_errors_do_not_include_attempt_failures() {
+        for errno in [
+            Errno::EINVAL,
+            Errno::ENOSYS,
+            Errno::ENOTSUP,
+            Errno::EOPNOTSUPP,
+            Errno::EPERM,
+        ] {
+            assert!(is_link_unsupported(errno), "{errno}");
+        }
+        for errno in [
+            Errno::EMLINK,
+            Errno::ENOSPC,
+            Errno::EDQUOT,
+            Errno::EROFS,
+            Errno::EACCES,
+            Errno::EIO,
+            Errno::EXDEV,
+        ] {
+            assert!(!is_link_unsupported(errno), "{errno}");
         }
     }
 }
