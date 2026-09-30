@@ -1096,13 +1096,16 @@ model CacheAffinityRecord {
   /// Warm-session link. One durable depth-zero snapshot per session and target.
   /// Shared hints never establish ownership; null legacy rows stand for their id.
   sessionId                  String?
-  /// Latest parameter-free cumulative history HMACs (at most 64); empty on hints.
+  /// Latest cumulative history HMACs bound to instructions/tools, free of sampling
+  /// parameters (at most 64); empty on hints.
   /// PostgreSQL scalar lists are nullable; defaults make existing rows harmless.
   historyDigests             String[]   @default([])
   /// Caller conversation HMAC; null for implicit sessions and shared hints.
   explicitConversationDigest String?
   /// Last successful relay request HMAC; repeating that completion is a no-op.
   writeDigest                String?
+  /// Up to 64 completion HMACs retain replay identity across successor turns.
+  completedWriteDigests      String[]   @default([])
   /// At most 64 undominated size samples within TTL, so a sub-floor turn can
   /// refresh age without losing an older eligible size. Empty on shared hints.
   sessionTokenEstimates      Int[]      @default([])
@@ -1115,6 +1118,7 @@ model CacheAffinityRecord {
   @@index([tenantUserId, poolId, prefixDigest, expiresAt])
   @@index([tenantUserId, poolId, conversationDigest, expiresAt])
   @@index([historyDigests], type: Gin)
+  @@index([completedWriteDigests], type: Gin)
   @@index([tenantUserId, poolId, explicitConversationDigest, expiresAt])
   @@index([tenantUserId, poolId, writeDigest, expiresAt])
   @@index([tenantUserId, poolId, executionTargetId, prefixDepth, lastUsedAt(sort: Desc), id(sort: Desc)])
@@ -1272,8 +1276,9 @@ model AdmissionRequest {
   /// pool/member capacity priority applies. No foreign key: a grant revoke
   /// must never write admission rows (capacity lock order).
   priorityGrantId         String?
-  /// Warm sessions (`cache_affinity_record.sessionId`, any candidate target)
-  /// this request continues. With its lease it says which protected session an
+  /// Warm sessions (`cache_affinity_record.sessionId`, current candidate targets)
+  /// this request continues. Only the lease's execution target is considered
+  /// when deciding which protected session an
   /// active lease is serving right now (S-C slot mode). Advisory routing state:
   /// no foreign key, never read by admission.
   warmSessionIds          String[]              @default([])
@@ -1510,6 +1515,9 @@ model ResponseStickinessRecord {
   updatedAt                 DateTime  @default(now()) @updatedAt
   userId                    String
   modelApiTokenId           String?
+  /// Scoped session returned by the successful cache-affinity writer, local creates only.
+  warmSessionId             String?
+  warmBindingDigest         String?
   routingKeyDigest          String
   /// Version 2+ rows are bound to immutable ExecutionTarget identities and
   /// must never fall back to legacy discovered-model columns after deletion.

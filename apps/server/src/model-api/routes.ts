@@ -51,9 +51,12 @@ import {
 import {
   type AffinityDecision,
   type AffinityPolicy,
+  type AffinitySessionBinding,
+  affinityPrefixDigests,
   buildAffinityTargetIdentity,
   rankAffinityTargets,
   rememberAffinity,
+  scopedAffinitySessionId,
 } from "./cache-affinity.js";
 import {
   type CacheHolderPlan,
@@ -313,6 +316,8 @@ type RelayOperation = {
   appendTerminalUsage?: boolean;
   buildRequest: RelayRequestBuilder;
   responseStickiness?: ResponseStickinessCapture;
+  /** Internal local Responses binding, never copied from the caller payload. */
+  sessionBinding?: AffinitySessionBinding;
   anthropicIngress?: AnthropicIngress;
   dispose?: () => Promise<void>;
   contextCount?: ContextCountTelemetry;
@@ -687,6 +692,7 @@ type StickyRoute =
       target: "MODEL_POOL";
       visibleTarget: VisibleModelPoolTarget;
       selectedDiscoveredModelId: string;
+      sessionBinding?: AffinitySessionBinding;
     }
   | {
       target: "PROVIDER";
@@ -2836,9 +2842,11 @@ async function writeResponseStickiness({
   targetModelPoolId,
   poolGrantId,
   selectedDiscoveredModelId,
+  sessionBinding,
 }: ResponseStickinessCapture & {
   responseId: string;
   selectedDiscoveredModelId: string;
+  sessionBinding?: AffinitySessionBinding | null;
 }) {
   const routingKeyDigest = responseStickinessDigest({ requester, responseId });
   const expiresAt = new Date(Date.now() + RESPONSES_STICKINESS_TTL_MS);
@@ -2876,6 +2884,8 @@ async function writeResponseStickiness({
       poolGrantId: boundGrantId,
       selectedDiscoveredModelId,
       selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
+      warmSessionId: targetModelPoolId ? (sessionBinding?.sessionId ?? null) : null,
+      warmBindingDigest: targetModelPoolId ? (sessionBinding?.bindingDigest ?? null) : null,
       expiresAt,
     },
     update: {
@@ -2887,6 +2897,8 @@ async function writeResponseStickiness({
       poolGrantId: boundGrantId,
       selectedDiscoveredModelId,
       selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
+      warmSessionId: targetModelPoolId ? (sessionBinding?.sessionId ?? null) : null,
+      warmBindingDigest: targetModelPoolId ? (sessionBinding?.bindingDigest ?? null) : null,
       expiresAt,
     },
     select: { id: true },
@@ -3168,6 +3180,8 @@ async function resolveStickyRoute({
     select: {
       userId: true,
       routingVersion: true,
+      warmSessionId: true,
+      warmBindingDigest: true,
       modelApiTokenId: true,
       targetDiscoveredModelId: true,
       targetModelPoolId: true,
@@ -3349,6 +3363,10 @@ async function resolveStickyRoute({
       target: "MODEL_POOL",
       visibleTarget,
       selectedDiscoveredModelId,
+      sessionBinding:
+        record.warmSessionId && record.warmBindingDigest
+          ? { sessionId: record.warmSessionId, bindingDigest: record.warmBindingDigest }
+          : undefined,
     };
   }
 
@@ -5647,7 +5665,10 @@ async function relayPool({
           accessGrantId: target.accessGrantId,
           // S-C: the warm sessions this request continues, so its lease can
           // be told apart from an idle slot holding a protected session.
-          warmSessionIds: Object.values(affinityDecision?.matchedSessionIds ?? {}),
+          warmSessionIds: candidates.flatMap(({ executionTargetId }) => {
+            const sessionId = affinityDecision?.matchedSessionIds?.[executionTargetId];
+            return sessionId ? [sessionId] : [];
+          }),
           connectionOwner: "model-api",
           deadlineAt: new Date(relayDeadlineMs),
           candidates,
@@ -5764,7 +5785,8 @@ async function relayPool({
   // slot, not an idle one): such members route last, and with an external plan
   // they are left out of the first local admission (or, when nothing else can
   // serve, the request goes external first). It needs the affinity decision to tell a
-  // continuation (never redirected) from a new session, so without one
+  // cache-affine continuation from a new session. Session identity alone
+  // excludes that session from protection without granting affinity, so without one
   // nothing changes. Like affinity, it is an optimization only.
   let protectionInitialCandidates: typeof routeCandidates | null = null;
   let protectionExternalFirst = false;
@@ -5789,6 +5811,8 @@ async function relayPool({
             {
               poolMemberId,
               capacityId: capacity.id,
+              executionTargetId: member.ExecutionTarget?.id,
+              matchedSessionId: decision.matchedSessionIds?.[member.ExecutionTarget?.id ?? ""],
               slots: capacity.hardConcurrencyLimit,
               // Token mode uses the engine KV budget (protocol 2.7) when the
               // engine reports one; llama.cpp stays slot-based with a
@@ -6648,19 +6672,56 @@ async function relayPool({
         },
       );
       const stickiness = operation.responseStickiness;
-      // The client sees EOF only once this response's binding is durable.
+      const servedAffinityTarget = requestedSurface
+        ? affinityTargetForMember(
+            member,
+            requestedSurface,
+            executionByMember.get(member.id),
+            candidate.healthStatus,
+          )
+        : null;
+      let affinityWrite: Promise<AffinitySessionBinding | null> | undefined;
+      const persistAffinity = () =>
+        (affinityWrite ??= attemptOutcome
+          .then(({ terminal, upstreamTerminal }) =>
+            terminal.ok && requestedSurface && affinityPayload && servedAffinityTarget
+              ? rememberAffinity({
+                  ownerId: requester.userId,
+                  resourceOwnerId: member.DiscoveredModel.userId,
+                  poolId: target.id,
+                  securityScope: requester.limitKey,
+                  accessGrantId: target.accessGrantId,
+                  policy: affinityPolicy,
+                  surface: requestedSurface,
+                  payload: affinityPayload,
+                  requestId: relayRequestId,
+                  target: servedAffinityTarget,
+                  engineCacheConfirmed: engineCacheConfirmedFromUsageFacts(
+                    usageFactsFromRelayTerminal(upstreamTerminal),
+                  ),
+                  estimatedTokens: operation.contextCount?.tokens,
+                })
+              : null,
+          )
+          .catch((error) => {
+            metadataUpdateError(error);
+            return null;
+          }));
+      // Cache identity is durable before the binding reaches the client's EOF.
+      // Both EOF and finalization await this single successful cache write.
       const persistBinding = localStickinessPersister({
         terminal: attemptOutcome.then(({ terminal }) => terminal),
         capture: responseIdCapture,
         streaming: operation.stream,
         write: stickiness
-          ? (responseId) =>
+          ? async (responseId) =>
               writeResponseStickiness({
                 ...stickiness,
                 responseId,
                 targetModelPoolId: target.id,
                 poolGrantId: target.accessGrantId,
                 selectedDiscoveredModelId: member.discoveredModelId,
+                sessionBinding: await persistAffinity(),
               })
           : null,
       });
@@ -6710,10 +6771,9 @@ async function relayPool({
           // THIS attempt's response (per-attempt, so retries cannot
           // contaminate each other's evidence); the prefix keeps early usage
           // events (Anthropic message_start) on streams beyond the tail window.
-          // Parsed once: the same facts feed the request's usage columns and
-          // rollup (via updateRelayMetadata) and the engine-cache evidence.
+          // These facts feed the request's usage columns and rollup;
+          // persistence also derives cache evidence from the same terminal.
           const usage = usageFactsFromRelayTerminal(upstreamTerminal);
-          const engineCacheConfirmed = engineCacheConfirmedFromUsageFacts(usage);
           const affinityTarget = requestedSurface
             ? affinityTargetForMember(
                 member,
@@ -6778,22 +6838,7 @@ async function relayPool({
               },
             }).catch(metadataUpdateError),
             persistBinding ? persistBinding().catch(stickinessWriteError) : Promise.resolve(),
-            terminal.ok && requestedSurface && affinityPayload && affinityTarget
-              ? rememberAffinity({
-                  ownerId: requester.userId,
-                  resourceOwnerId: member.DiscoveredModel.userId,
-                  poolId: target.id,
-                  securityScope: requester.limitKey,
-                  accessGrantId: target.accessGrantId,
-                  policy: affinityPolicy,
-                  surface: requestedSurface,
-                  payload: affinityPayload,
-                  requestId: relayRequestId,
-                  target: affinityTarget,
-                  engineCacheConfirmed,
-                  estimatedTokens: operation.contextCount?.tokens,
-                })
-              : Promise.resolve(),
+            persistAffinity(),
           ]);
           reportCleanupFailures(terminalWrites);
         })
@@ -7010,6 +7055,40 @@ async function relaySelectedModelNoFailover({
     await failRelayMetadata({ relayRequestId, startedAt, failure: "not_found" });
     return operationFailureResponse(operation, "not_found");
   }
+  const boundAffinityTarget =
+    requestedModelPoolId &&
+    selectedPoolMember?.ModelPool?.affinityEnabled &&
+    operation.capability === "responses.create" &&
+    operation.contextInput
+      ? affinityTargetForMember(
+          selectedPoolMember,
+          "openai-responses",
+          executionPathForPoolMember(
+            effectivePoolMemberCapabilities(selectedPoolMember),
+            // Capability authorization above checks the stateful follow-up.
+            // Identity names the native create path that populated this KV.
+            { ...operation, additionalCapabilities: undefined },
+            null,
+          ),
+        )
+      : null;
+  const boundMaterial =
+    boundAffinityTarget && requestedModelPoolId
+      ? affinityPrefixDigests({
+          ownerId: requester.userId,
+          resourceOwnerId: selected.userId,
+          poolId: requestedModelPoolId,
+          securityScope: requester.limitKey,
+          accessGrantId: poolAccess?.accessGrantId,
+          surface: "OPENAI_RESPONSES",
+          payload: operation.contextInput!,
+          runtimeIdentity: boundAffinityTarget.targetIdentity,
+        })
+      : null;
+  const boundSessionId =
+    boundMaterial && selectedPoolMember?.ModelPool?.affinityEnabled
+      ? scopedAffinitySessionId(operation.sessionBinding, boundMaterial.bindingDigest)
+      : undefined;
   let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
   if (capacityRuntime) {
     const identity = selectedPoolMember?.ExecutionTarget ?? selected.ExecutionTarget;
@@ -7031,6 +7110,7 @@ async function relaySelectedModelNoFailover({
           poolId: requestedModelPoolId,
           basePriority: 16,
           accessGrantId: requestedModelPoolId ? poolAccess?.accessGrantId : undefined,
+          warmSessionIds: boundSessionId ? [boundSessionId] : [],
           connectionOwner: "model-api",
           deadlineAt: new Date(startedAt.getTime() + MODEL_API_RELAY_TIMEOUT_MS),
           candidates: [
@@ -7189,17 +7269,50 @@ async function relaySelectedModelNoFailover({
   try {
     const started = await attempt.started;
     const stickiness = operation.responseStickiness;
-    // The client sees EOF only once this response's binding is durable.
+    let affinityWrite: Promise<AffinitySessionBinding | null> | undefined;
+    const persistAffinity = () =>
+      (affinityWrite ??= attempt.terminal
+        .then((terminal) =>
+          terminal.ok &&
+          boundAffinityTarget &&
+          requestedModelPoolId &&
+          selectedPoolMember &&
+          operation.contextInput
+            ? rememberAffinity({
+                ownerId: requester.userId,
+                resourceOwnerId: selected.userId,
+                poolId: requestedModelPoolId,
+                securityScope: requester.limitKey,
+                accessGrantId: poolAccess?.accessGrantId,
+                policy: affinityPolicyForMember(selectedPoolMember),
+                surface: "OPENAI_RESPONSES",
+                payload: operation.contextInput,
+                target: boundAffinityTarget,
+                sessionBinding: boundSessionId ? operation.sessionBinding : undefined,
+                requestId: relayRequestId,
+                estimatedTokens: operation.contextCount?.tokens,
+                engineCacheConfirmed: engineCacheConfirmedFromUsageFacts(
+                  usageFactsFromRelayTerminal(terminal),
+                ),
+              })
+            : null,
+        )
+        .catch((error) => {
+          metadataUpdateError(error);
+          return null;
+        }));
+    // Cache identity precedes the durable next-response binding; one write shared with finalization.
     const persistBinding = localStickinessPersister({
       terminal: attempt.terminal.catch(() => rejectedRelayTerminal()),
       capture: responseIdCapture,
       streaming: operation.stream,
       write: stickiness
-        ? (responseId) =>
+        ? async (responseId) =>
             writeResponseStickiness({
               ...stickiness,
               responseId,
               selectedDiscoveredModelId: selected.id,
+              sessionBinding: await persistAffinity(),
             })
         : null,
     });
@@ -7253,6 +7366,7 @@ async function relaySelectedModelNoFailover({
             userId: requester.userId,
           }).catch(metadataUpdateError),
           persistBinding ? persistBinding().catch(stickinessWriteError) : Promise.resolve(),
+          persistAffinity(),
         ]);
       })
       .catch(metadataUpdateError);
@@ -9052,6 +9166,8 @@ export async function responsesCreateHandler({
       ...operation,
       stream: prepared.stream,
       buildRequest: prepared.buildRequest,
+      contextInput: prepared.payload ?? undefined,
+      sessionBinding: stickyRoute.target === "MODEL_POOL" ? stickyRoute.sessionBinding : undefined,
       responseStickiness: {
         requester,
         targetDiscoveredModelId:

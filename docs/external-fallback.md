@@ -237,12 +237,14 @@ capacity is shared between the people whose sessions are warm
 A session is identified by the session id on its single durable snapshot per
 target (`cache_affinity_record.sessionId`). The row's immutable conversation key
 is a domain-separated HMAC of that session id; each successful turn updates the
-row in place, storing only the last completion-write digest. Shared prefix and
+row in place, storing the last completion-write digest and up to 64 scoped
+completion HMACs so a replay stays idempotent across successor turns. Shared prefix and
 instruction routing hints can be refreshed by another conversation, so they do
 not establish session ownership or warmth. An explicit conversation id joins
 only its own session, even when all history, parameters, tools and instructions
 change. Without an explicit id, continuations use the deepest shared cumulative
-history digest (independent of parameters, tools and instructions), with exact
+history digest (independent of sampling parameters, but bound to the full
+instruction and tool layer), with exact
 cache prefixes supporting legacy rows. Each snapshot stores at most 64
 cumulative history HMACs from the latest history in a PostgreSQL scalar list.
 Lookups use GIN indexed overlap (`&&`) one digest at a time, deepest first,
@@ -250,39 +252,68 @@ plus indexed explicit conversation digests and exact prefixes, without parsing
 JSON. History probes run separately from hints, with a materialized GIN candidate
 query and transaction-local sequential-scan avoidance so sparse array statistics
 and the two-row limit cannot turn a rare digest lookup into a history scan. They
-stop at the first matching depth. Two rows at that depth prove
-ambiguity because each session has only one snapshot; at most 64 probes return
+stop at the first matching depth. Within that depth, snapshots whose entire
+stored history is contained in the request precede histories that diverge after
+the shared prefix, before the two-row limit applies. A unique contained snapshot
+wins an equal-depth tie with edited histories; two contained snapshots remain
+ambiguous. With no contained history, a unique deepest edited/shortened snapshot
+can link. A stronger exact cache prefix owned by a different session vetoes a
+weaker history match; a retained prefix of that same session stays valid after
+edits or shortening. At most 64 probes return
 at most two snapshots per target, even for widely shared histories. Long
 histories also batch hint upserts into one SQL statement. Edited and shortened
 histories still link when they share a prefix with the latest snapshot. Prefixes
 unique to an older, replaced history are discarded: they cannot link a later
 implicit request, which safely starts a new session if no current match exists.
 Explicit ids keep linking even after all history is replaced. Multiple sessions
-matching at the deepest depth are ambiguous and start a fresh session; recency
-never resolves that ambiguity. A history with no remaining shared prefix also
-starts a fresh session. Identical first messages without explicit ids remain
-separate sessions; a continuation cannot distinguish them until it carries a
-uniquely matching deeper prefix. The last relay request id is stored as an HMAC;
-repeating that completion write is a no-op.
+in the preferred match class start a fresh session; recency never decides.
+A history with no remaining shared prefix also starts a fresh session.
+Fresh identical first messages without explicit ids remain separate sessions.
+A later continuation can select a unique contained starter over a divergent
+history, but two contained starters cannot be distinguished and may leave an
+extra warm snapshot. An edit of an older conversation can also be indistinguishable
+from a continuation of the contained starter. An imported transcript with the
+same instruction/tool layer and only a shared first message is likewise
+indistinguishable from an edit and can join a unique existing snapshot.
+Explicit conversation ids avoid these ambiguities. Changing instructions or tools without an explicit id starts
+a separate identity; only sampling parameter changes are required to link.
+Retained completion HMACs make repeated completion writes no-ops, including old
+clocks, until affinity evidence expires or more than 64 newer writes displace
+the digest. Earlier history digests without instruction/tool binding cease to
+link implicitly and expire with affinity TTL.
 
 The newest durable turn sets session age; size is the largest estimate at the
 newest eligible turn. At most 64 timestamped size estimates within affinity TTL
 are retained on the row. A newer equal or larger estimate replaces older samples
 it covers, so repeated identical sub-floor turns do not evict the eligible size.
 The remaining bounded samples let a turn below the size floor refresh age while
-retaining an older eligible size within the protection window. Older samples
+retaining an older eligible size within the protection window. A missing latest
+estimate is null, so it cannot re-date an expired size. Older samples
 beyond that bound are discarded along with replaced history; underestimating
 warmth is preferable to unbounded per-request storage. The same conversation
 served on a different target has a separate identity there. An active lease is
 tied to its session through the admission request
 (`admission_request.warmSessionIds`, the sessions the request continues on any
-candidate member). Rows written before session ids existed are one session each.
+candidate member). Only the lease's execution target can mark a session in
+flight, even when several targets share a capacity. Before the verdict, the
+request's matched session on that target is excluded from its protected set
+after share caps. Identity alone does not grant cache affinity or cache-holder
+waits, and other conversations of the requester still count.
+Successful native Responses creates also store the session key and its scope
+HMAC in their durable response binding, after the successful cache write and
+before client EOF. A bound generative follow-up reuses that key only with the
+same tenant, token/grant, pool, target and runtime, using the existing binding
+read. Metadata-only GET/DELETE/cancel/compact operations never mark it in flight.
+Bindings without these additive fields have no warm-session link. Bound
+successful creates refresh the same snapshot under the cache-affinity fence.
+Rows written before session ids existed are one session each.
 Identity evidence expires with affinity TTL and is limited by
 `affinityMaxRecords` (default 10,000 per tenant/pool/target). Ordered eviction
 keeps depth-zero session snapshots before all routing hints, then keeps the
 newest hints, preferring shorter prefixes at equal recency. Hints cannot evict a
 session; once live sessions alone exceed the budget, older sessions are evicted.
-Snapshot count grows with sessions, never requests. The records of every pool of
+Snapshot count tracks resolved sessions; ambiguous implicit histories can split
+into more than one snapshot, as described above. The records of every pool of
 the owner on the member count; each session's override comes from
 its own pool (grant, or the owner's percent), each distinct override is its own
 budget (the share mode, window and minimum size are the requesting pool's), and one user's total never exceeds their largest share. `UNPROTECTED`

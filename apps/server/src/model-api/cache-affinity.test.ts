@@ -35,6 +35,7 @@ import {
   rankAffinityTargets,
   rememberAffinity,
   type SessionIdentityRecord,
+  scopedAffinitySessionId,
   sweepExpiredAffinity,
 } from "./cache-affinity.js";
 
@@ -621,19 +622,21 @@ describe("cache affinity", () => {
   });
 
   it.each([
-    { name: "temperature", changed: { ...payload, temperature: 0.9 } },
-    { name: "tools", changed: { ...payload, tools: [{ name: "other" }] } },
+    { name: "temperature", changed: { ...payload, temperature: 0.9 }, links: true },
+    { name: "tools", changed: { ...payload, tools: [{ name: "other" }] }, links: false },
     {
       name: "system prompt",
+      links: false,
       changed: {
         ...payload,
         messages: [{ role: "system", content: "new rules" }, payload.messages[1]],
       },
     },
-  ])("history identity excludes $name while exact cache binding includes it", ({ changed }) => {
+  ])("history identity applies instruction/tool scope for $name", ({ changed, links }) => {
     const before = affinityPrefixDigests(digestArgs("runtime", payload));
     const after = affinityPrefixDigests(digestArgs("runtime", changed));
-    expect(after.historyDigests).toEqual(before.historyDigests);
+    if (links) expect(after.historyDigests).toEqual(before.historyDigests);
+    else expect(after.historyDigests).not.toEqual(before.historyDigests);
     expect(after.digests).not.toEqual(before.digests);
     for (const scope of [
       { ownerId: "other" },
@@ -650,6 +653,119 @@ describe("cache affinity", () => {
     }
   });
 
+  it.each([
+    {
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      alias: "openai-chat",
+      before: {
+        messages: [
+          { role: "system", content: "rules" },
+          { role: "developer", content: "format" },
+          { role: "user", content: "same" },
+        ],
+      },
+      changed: {
+        messages: [
+          { role: "system", content: "rules" },
+          { role: "developer", content: "changed" },
+          { role: "user", content: "same" },
+        ],
+      },
+    },
+    {
+      surface: "OPENAI_RESPONSES",
+      alias: "openai-responses",
+      before: {
+        instructions: "rules",
+        input: [{ role: "user", content: "same" }],
+      },
+      changed: { instructions: "changed", input: [{ role: "user", content: "same" }] },
+    },
+    {
+      surface: "ANTHROPIC_MESSAGES",
+      alias: "anthropic-messages",
+      before: {
+        system: [{ type: "text", text: "rules" }],
+        messages: [{ role: "user", content: "same" }],
+      },
+      changed: {
+        system: [{ type: "text", text: "changed" }],
+        messages: [{ role: "user", content: "same" }],
+      },
+    },
+  ])(
+    "history instruction/tool binding covers $surface and its alias",
+    ({ surface, alias, before, changed }) => {
+      const tools = [
+        {
+          name: "lookup",
+          input_schema: { type: "object", properties: { term: { type: "string" } } },
+        },
+      ];
+      const digest = (body: Record<string, unknown>, native = surface) =>
+        affinityPrefixDigests(digestArgs("runtime", body, native)).historyDigests;
+      const baseline = digest({ ...before, tools });
+      expect(digest({ ...before, tools }, alias)).toEqual(baseline);
+      expect(digest({ ...before, tools, temperature: 0.9, top_p: 0.7 })).toEqual(baseline);
+      expect(digest({ ...changed, tools })).not.toEqual(baseline);
+      expect(
+        digest({
+          ...before,
+          tools: [
+            {
+              name: "lookup",
+              input_schema: { type: "object", properties: { term: { type: "number" } } },
+            },
+          ],
+        }),
+      ).not.toEqual(baseline);
+    },
+  );
+
+  it.each([undefined, 3000, 12_000])(
+    "snapshot stores latest size %s without copying an old clock",
+    async (estimatedTokens) => {
+      db.cacheAffinityRecord.findFirst.mockResolvedValue({
+        id: "existing",
+        lastUsedAt: new Date("2026-01-01"),
+        sessionTokenTimes: [],
+        sessionTokenEstimates: [],
+      });
+      await rememberAffinity({
+        ownerId: "tenant",
+        resourceOwnerId: "owner",
+        poolId: "pool",
+        policy,
+        surface: "OPENAI_RESPONSES",
+        payload: { conversation: "same", input: "first" },
+        target: target("target", "runtime"),
+        estimatedTokens,
+      });
+      expect(db.cacheAffinityRecord.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ estimatedTokens: estimatedTokens ?? null }),
+        }),
+      );
+    },
+  );
+
+  it.each([
+    { name: "missing binding", binding: undefined, expected: undefined },
+    { name: "null binding", binding: null, expected: undefined },
+    {
+      name: "exact scope",
+      binding: { sessionId: "session", bindingDigest: "scope" },
+      expected: "session",
+    },
+    {
+      name: "different scope",
+      binding: { sessionId: "session", bindingDigest: "other" },
+      expected: undefined,
+    },
+  ])("trusted Responses scope: $name", ({ binding, expected }) => {
+    expect(scopedAffinitySessionId(binding, "scope")).toBe(expected);
+  });
+
   describe("warm-session identity (S-C)", () => {
     const at = (seconds: number) => new Date(Date.UTC(2026, 7, 25, 12, 0, 0) - seconds * 1000);
     const record = (
@@ -664,7 +780,15 @@ describe("cache affinity", () => {
       conversationDigest: shape.conversationDigest ?? null,
       explicitConversationDigest: sessionId ? (shape.conversationDigest ?? null) : null,
       historyDigests: sessionId
-        ? (shape.history ?? (shape.prefixDigest ? [shape.prefixDigest] : []))
+        ? (shape.history ??
+          (shape.prefixDigest && /^d[1-9][0-9]*$/.test(shape.prefixDigest)
+            ? Array.from(
+                { length: Number(shape.prefixDigest.slice(1)) },
+                (_, index) => `d${index + 1}`,
+              )
+            : shape.prefixDigest
+              ? [shape.prefixDigest]
+              : []))
         : [],
       lastUsedAt,
     });
@@ -682,6 +806,57 @@ describe("cache affinity", () => {
       request: ReturnType<typeof request>;
       expected: string | null;
     }[] = [
+      {
+        name: "contained starter wins over equal-depth divergent history",
+        records: [
+          record("x", "X", { history: ["d1", "x2", "x3"] }),
+          record("y", "Y", { history: ["d1"] }),
+        ],
+        request: request(),
+        expected: "Y",
+      },
+      {
+        name: "multiple contained starters stay ambiguous without recency guessing",
+        records: [
+          record("x", "X", { history: ["d1"] }, at(100)),
+          record("y", "Y", { history: ["d1"] }, at(1)),
+        ],
+        request: request(),
+        expected: null,
+      },
+      {
+        name: "deeper divergent history wins over shallower contained starter",
+        records: [
+          record("x", "X", { history: ["d1", "d2", "x3"] }),
+          record("y", "Y", { history: ["d1"] }),
+        ],
+        request: request(),
+        expected: "X",
+      },
+      {
+        name: "a weaker unique history cannot override stronger exact cache evidence",
+        records: [
+          record("x", "X", { history: ["d1", "x2"] }),
+          { id: "hint", sessionId: "another", prefixDigest: "d3", conversationDigest: null },
+        ],
+        request: request(),
+        expected: null,
+      },
+      {
+        name: "unscoped instruction history cannot link even with a contained user message",
+        records: [record("x", "X", { history: ["other-instructions-d1"] })],
+        request: request(),
+        expected: null,
+      },
+      {
+        name: "empty or absent snapshot history fails closed",
+        records: [
+          record("empty", "empty", { history: [] }),
+          { id: "missing", sessionId: "missing", prefixDigest: null, conversationDigest: null },
+        ],
+        request: request(),
+        expected: null,
+      },
       {
         name: "unseen explicit id cannot steal a matching implicit session",
         records: [
@@ -779,6 +954,61 @@ describe("cache affinity", () => {
         name: "a fresh request cannot link even identical parameter-free history",
         records: [record("a", "A", { history: ["h1"] })],
         request: request({ isContinuation: false, historyDigests: ["h1"] }),
+        expected: null,
+      },
+      {
+        name: "trusted Responses binding joins its snapshot without transcript history",
+        records: [record("a", "A", { conversationDigest: "explicit", history: ["old"] })],
+        request: request({ boundSessionId: "A", isContinuation: false, historyDigests: ["new"] }),
+        expected: "A",
+      },
+      {
+        name: "unknown trusted session binding fails closed without borrowing a prefix",
+        records: [record("a", "A", { history: ["d1", "d2", "d3"] })],
+        request: request({ boundSessionId: "unknown" }),
+        expected: null,
+      },
+      {
+        name: "bound replay preserves explicit origin ownership when payload omits the id",
+        records: [
+          {
+            ...record("a", "A", { conversationDigest: "explicit" }),
+            completedWriteDigests: ["write"],
+          },
+        ],
+        request: request({ boundSessionId: "A", writeDigest: "write", isContinuation: false }),
+        expected: "A",
+      },
+      {
+        name: "older completion retry survives a successor write digest",
+        records: [
+          {
+            ...record("a", "A", { history: ["d1", "d2", "d3"] }),
+            writeDigest: "successor",
+            completedWriteDigests: ["first", "successor"],
+          },
+        ],
+        request: request({ writeDigest: "first", isContinuation: false, historyDigests: ["d1"] }),
+        expected: "A",
+      },
+      {
+        name: "retained write ids cannot cross explicit conversations",
+        records: [
+          {
+            ...record("a", "A", { conversationDigest: "explicit-a" }),
+            completedWriteDigests: ["first"],
+          },
+        ],
+        request: request({ writeDigest: "first", conversationDigest: "explicit-b" }),
+        expected: null,
+      },
+      {
+        name: "retained completion alias fails closed across two snapshots",
+        records: ["A", "B"].map((id) => ({
+          ...record(id, id, { history: ["d1"] }),
+          completedWriteDigests: ["first"],
+        })),
+        request: request({ writeDigest: "first", isContinuation: false }),
         expected: null,
       },
       {

@@ -342,7 +342,12 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     messages: [{ role: "system", content: "rules" }, ...messages],
     ...extra,
   });
-  const changedTurns: { name: string; payload: Record<string, unknown>; explicit?: boolean }[] = [
+  const changedTurns: {
+    name: string;
+    payload: Record<string, unknown>;
+    explicit?: boolean;
+    links?: boolean;
+  }[] = [
     {
       name: "edit an earlier user turn",
       payload: chat([...history.slice(0, 2), userTurn("edited"), ...history.slice(3)]),
@@ -354,13 +359,15 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
         temperature: 0.9,
       }),
     },
-    { name: "change tools", payload: chat(history, { tools: [{ name: "new" }] }) },
+    { name: "change tools", payload: chat(history, { tools: [{ name: "new" }] }), links: false },
     {
       name: "change system prompt",
+      links: false,
       payload: { messages: [{ role: "system", content: "new rules" }, ...history] },
     },
     {
       name: "edit and shorten while changing params and tools",
+      links: false,
       payload: chat([userTurn("first"), assistantTurn("edited")], {
         temperature: 0.9,
         tools: [{ name: "new" }],
@@ -378,8 +385,9 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     },
   ];
   it.each(changedTurns)(
-    "links routing and remember across $name",
-    async ({ payload, explicit }) => {
+    // Owner decision: only sampling changes need implicit linking; instruction/tool changes split.
+    "resolves routing and remember across $name",
+    async ({ payload, explicit, links = true }) => {
       if (!db) return;
       const row = await fixture();
       const now = new Date("2026-09-29T12:00:00Z");
@@ -412,7 +420,9 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
         scoreSingleTarget: true,
         now: later,
       });
-      expect(ranked.matchedSessionIds).toEqual({ [row.target(0).executionTargetId]: sessionId });
+      expect(ranked.matchedSessionIds).toEqual(
+        links ? { [row.target(0).executionTargetId]: sessionId } : {},
+      );
       const remember = () =>
         service.rememberAffinity({
           ...base,
@@ -426,18 +436,23 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
       const after = await db.cacheAffinityRecord.findMany({
         where: { poolId: row.pool.id, prefixDigest: null },
       });
-      expect(new Set(after.map((r) => r.sessionId))).toEqual(new Set([sessionId]));
+      expect(new Set(after.map((r) => r.sessionId)).size).toBe(links ? 1 : 2);
+      expect(after.some((r) => r.sessionId === sessionId)).toBe(true);
       const warm = await import("./warm-protection.js");
-      expect(
-        (
-          await warm.loadWarmSessions({
-            ownerId: row.owner.id,
-            capacityIds: [row.target(0).capacityId],
-            policy: { windowSeconds: 300, minTokens: 8192 },
-            now: later,
-          })
-        ).get(row.target(0).capacityId),
-      ).toEqual([expect.objectContaining({ userId: row.tenant.id, ageMs: 0, tokens: 12_000 })]);
+      const sessions = (
+        await warm.loadWarmSessions({
+          ownerId: row.owner.id,
+          capacityIds: [row.target(0).capacityId],
+          policy: { windowSeconds: 300, minTokens: 8192 },
+          now: later,
+        })
+      ).get(row.target(0).capacityId);
+      expect(sessions).toHaveLength(links ? 1 : 2);
+      expect(sessions).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ userId: row.tenant.id, ageMs: 0, tokens: 12_000 }),
+        ]),
+      );
       // The same history on a different target is a distinct session even when
       // both execution targets point at the same capacity/KV pool.
       await service.rememberAffinity({ ...base, payload, target: row.target(1), now: later });
@@ -614,7 +629,8 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
       userTurn("edited tail"),
     ]);
     await service.rememberAffinity({ ...base, payload: edited, now: later });
-    const next = chat([...edited.messages, assistantTurn("answer"), userTurn("next")], {
+    // chat adds the instruction layer; retain only the conversation here.
+    const next = chat([...edited.messages.slice(1), assistantTurn("answer"), userTurn("next")], {
       temperature: 0.9,
     });
     const rank = await service.rankAffinityTargets({
@@ -765,7 +781,11 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     await service.rememberAffinity({ ...base, payload, now: new Date(now.getTime() + 1000) });
     expect(
       (await read()).every(
-        (record) => record.engineCacheConfirmed && record.estimatedTokens === 20_000,
+        (record) =>
+          record.engineCacheConfirmed &&
+          (record.prefixDigest !== null
+            ? record.estimatedTokens === 20_000
+            : record.estimatedTokens === null),
       ),
     ).toBe(true);
     const latest = new Date(now.getTime() + 2000);
@@ -951,14 +971,14 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
         SELECT column_name, is_nullable FROM information_schema.columns
          WHERE table_name = 'cache_affinity_record'
            AND column_name IN ('historyDigests', 'explicitConversationDigest', 'writeDigest',
-                               'sessionTokenEstimates', 'sessionTokenTimes')
+                               'sessionTokenEstimates', 'sessionTokenTimes', 'completedWriteDigests')
       `;
-      expect(columns).toHaveLength(5);
+      expect(columns).toHaveLength(6);
       expect(columns.every((column) => column.is_nullable === "YES")).toBe(true);
 
       const payload = chat(
         [...payloads[0]!.messages.slice(1, 35), userTurn("edited latest tail")],
-        { temperature: 0.9, tools: [{ name: "changed-tool" }] },
+        { temperature: 0.9 },
       );
       const later = new Date(now.getTime() + 3000);
       fetchedRows.mockClear();
@@ -1034,7 +1054,7 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
         where: { poolId: row.pool.id, prefixDigest: null },
         data: { historyDigests: commonMaterial.historyDigests },
       });
-      const ambiguous = chat([...common.messages, userTurn("continuation")]);
+      const ambiguous = chat([...common.messages.slice(1), userTurn("continuation")]);
       rankSpy.mockClear();
       fetchedRows.mockClear();
       fetchedRawRows.mockClear();

@@ -86,11 +86,14 @@ export type WarmProtectionPolicy = {
  * One warm session on a member KV pool: the footprint of the latest request
  * of one conversation on one execution target. A session is identified by
  * `cache_affinity_record.sessionId`: every request stamps its records with the
- * session it continues (matched conversation, or the deepest prefix an edited
- * or shortened history still shares) or with a fresh id, so the session keeps
+ * session it continues (explicit conversation, or deepest scoped history with
+ * contained histories preferred at equal depth) or with a fresh id, so the session keeps
  * one identity across turns and its latest turn sets its age and size.
  */
 export type WarmSession = {
+  /** Scoped durable identity; absent on sources without identity evidence. */
+  sessionId?: string;
+  executionTargetId?: string;
   userId: string;
   /** Milliseconds since the session was last used. */
   ageMs: number;
@@ -383,6 +386,8 @@ export interface WarmProtectionSource {
 
 type WarmSessionRow = {
   capacityId: string;
+  sessionId: string;
+  executionTargetId: string;
   userId: string;
   lastUsedAt: Date;
   tokens: number;
@@ -468,7 +473,7 @@ export async function loadWarmSessions({
       -- use MAX via the ordering. Scope keys prevent aliased ids crossing pools.
       SELECT DISTINCT ON (c."sessionKey", c."capacityId", c."tenantUserId", c."poolId",
                           c."executionTargetId", c."bindingDigest", c."targetIdentity")
-             c."sessionKey", c."capacityId", c."tenantUserId", c."poolId", c."userId",
+             c."sessionKey", c."capacityId", c."tenantUserId", c."poolId", c."userId", c."executionTargetId",
              c."newestUsedAt" AS "lastUsedAt", c."estimatedTokens" AS tokens
         FROM dated c
        WHERE c."estimatedTokens" >= ${policy.minTokens}
@@ -478,7 +483,7 @@ export async function loadWarmSessions({
     ),
     served AS (
       -- Sessions an active lease of the same member is serving right now.
-      SELECT DISTINCT l."capacityId", served_session AS "sessionKey"
+      SELECT DISTINCT l."capacityId", l."executionTargetId", served_session AS "sessionKey"
         FROM capacity_lease l
         JOIN admission_request a ON a.id = l."admissionRequestId"
         CROSS JOIN LATERAL unnest(a."warmSessionIds") AS served_session
@@ -487,10 +492,12 @@ export async function loadWarmSessions({
          AND l."expiresAt" > ${now}
     ),
     scoped AS (
-      SELECT s."capacityId", s."tenantUserId" AS "userId", s."lastUsedAt",
+      SELECT s."capacityId", s."sessionKey" AS "sessionId", s."executionTargetId",
+             s."tenantUserId" AS "userId", s."lastUsedAt",
              s.tokens::int AS tokens,
              EXISTS (SELECT 1 FROM served v
                       WHERE v."capacityId" = s."capacityId"
+                        AND v."executionTargetId" = s."executionTargetId"
                         AND v."sessionKey" = s."sessionKey") AS "inFlight",
              CASE WHEN s."tenantUserId" = s."userId"
                   THEN p."ownerProtectionPercent"
@@ -511,7 +518,7 @@ export async function loadWarmSessions({
        -- not use up the read bound either.
        WHERE "overridePercent" IS DISTINCT FROM 0
     )
-    SELECT "capacityId", "userId", "lastUsedAt", tokens, "overridePercent", "inFlight"
+    SELECT "capacityId", "sessionId", "executionTargetId", "userId", "lastUsedAt", tokens, "overridePercent", "inFlight"
       FROM ranked
      WHERE "rank" <= ${limitPerUser}
      ORDER BY "lastUsedAt" DESC
@@ -519,6 +526,8 @@ export async function loadWarmSessions({
   for (const row of rows) {
     const list = sessions.get(row.capacityId) ?? [];
     list.push({
+      sessionId: row.sessionId,
+      executionTargetId: row.executionTargetId,
       userId: row.userId,
       ageMs: Math.max(0, now.getTime() - row.lastUsedAt.getTime()),
       tokens: Number(row.tokens),
@@ -552,6 +561,9 @@ export const warmProtectionSource: WarmProtectionSource = {
 export type ProtectionMemberInput = {
   poolMemberId: string;
   capacityId: string;
+  executionTargetId?: string;
+  /** Session identity alone does not grant affinity or cache-holder waits. */
+  matchedSessionId?: string;
   /** Concurrency cap of the member's KV pool (`hardConcurrencyLimit`). */
   slots: number | null;
   /**
@@ -601,7 +613,15 @@ export async function assessWarmProtection({
       member.poolMemberId,
       memberProtectionVerdict({
         load,
-        protectedSessions,
+        // Apply equity caps first, then exclude only the session this request
+        // continues on this target. Other own conversations remain protected.
+        protectedSessions: protectedSessions.filter(
+          (session) =>
+            member.matchedSessionId === undefined ||
+            member.executionTargetId === undefined ||
+            session.sessionId !== member.matchedSessionId ||
+            session.executionTargetId !== member.executionTargetId,
+        ),
         requestTokens: member.requestTokens,
         affine: member.affine,
       }),
