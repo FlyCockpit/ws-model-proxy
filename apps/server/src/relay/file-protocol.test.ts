@@ -208,12 +208,16 @@ describe("relay 2.8 file frames: CLI to server", () => {
       "feature_disabled",
     ]);
     for (const reason of [...FILE_ERROR_CODES, ...FILE_WIRE_REASONS]) {
-      expect(
-        parseRelayClientControlFrame(
-          JSON.stringify({ type: "file.rejected", opId: OP_ID, reason }),
-        ),
-        reason,
-      ).toEqual({ type: "file.rejected", opId: OP_ID, reason });
+      // `uncertain_outcome` is only valid with its recovery facts (pinned below)
+      const detail =
+        reason === "uncertain_outcome"
+          ? {
+              recovery: "/w/.wsmp-recover-a1b2c3d4e5",
+              kept: ["/w/.wsmp-recover-a1b2c3d4e5/slot-1"],
+            }
+          : undefined;
+      const frame = { type: "file.rejected", opId: OP_ID, reason, ...(detail ? { detail } : {}) };
+      expect(parseRelayClientControlFrame(JSON.stringify(frame)), reason).toEqual(frame);
     }
     for (const reason of ["explode", "grantDisabled", "feature_disabled ", "GRANT_DISABLED"]) {
       expect(
