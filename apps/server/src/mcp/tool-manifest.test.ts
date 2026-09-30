@@ -44,6 +44,7 @@ const PLAN_READ_TOOLS: readonly string[] = [
   "app_config_get",
   "forwarder_guarded_candidates_list",
   "forwarder_cli_devices_list",
+  "forwarder_cli_activity_list",
   "forwarder_device_metrics_get",
   "forwarder_pool_routing_rules_get",
   "forwarder_model_pools_list",
@@ -162,6 +163,7 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   app_config_get: "appConfig",
   forwarder_guarded_candidates_list: "forwarderManagement.listGuardedOverflowCandidates",
   forwarder_cli_devices_list: "forwarderManagement.listCliDevices",
+  forwarder_cli_activity_list: "cliAgentActivity.list",
   forwarder_device_metrics_get: "forwarderManagement.getCliDeviceMetrics",
   forwarder_pool_routing_rules_get: "forwarderManagement.getPoolRoutingRules",
   forwarder_pool_routing_rules_set: "forwarderManagement.setPoolRoutingRules",
@@ -270,13 +272,13 @@ beforeEach(() => {
 });
 
 describe("MCP tool manifest — exact catalog", () => {
-  it("contains exactly 28 read + 54 write names (no extras, no missing, no duplicates)", () => {
+  it("contains exactly 29 read + 54 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);
     expect([...names].sort()).toEqual([...PLAN_READ_TOOLS, ...PLAN_WRITE_TOOLS].sort());
-    expect(PLAN_READ_TOOLS).toHaveLength(28);
+    expect(PLAN_READ_TOOLS).toHaveLength(29);
     expect(PLAN_WRITE_TOOLS).toHaveLength(54);
-    expect(MCP_TOOL_MANIFEST).toHaveLength(82);
+    expect(MCP_TOOL_MANIFEST).toHaveLength(83);
   });
 
   it("the CLI device list explains effectiveMode and which switch limits it", () => {
@@ -474,9 +476,9 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
         `${tool.name}: ${PLAN_TARGETS[tool.name]}`,
       );
     }
-    // 82 catalog entries − 5 extracted cores = 77 procedure dispatches.
-    expect(dispatched).toBe(77);
-    expect(invoked).toHaveLength(77);
+    // 83 catalog entries − 5 extracted cores = 78 procedure dispatches.
+    expect(dispatched).toBe(78);
+    expect(invoked).toHaveLength(78);
 
     // Human-only proof: ZERO mcpGrants access (property or invocation)
     // across every dispatch.

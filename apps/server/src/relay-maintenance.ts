@@ -7,6 +7,10 @@
  * - every 60 s: expired token-scoped CLI commands (`sweepExpiredTokenCommands`);
  * - every 60 s: browser terminal session rechecks (`recheckSessions`).
  *
+ * - on stop: the agent audit queue is flushed (`stopCliAgentAuditWriter`), so
+ *   events recorded so far reach the database before the relay sessions close
+ *   and the database fence arms; later events flush without the batching delay.
+ *
  * Each tick logs a failure by error class only (L19) and never throws, so one
  * failing sweep does not stop the others. Returns one stop for all timers: it
  * clears them synchronously, then resolves once every sweep already running
@@ -27,6 +31,8 @@ export type RelayMaintenanceDeps = {
   };
   sweepExpiredTokenCommands: () => void;
   terminalHub: { recheckSessions(): Promise<unknown> };
+  /** Flushes the agent audit queue at stop (see ./relay/cli-agent-audit.ts). */
+  stopCliAgentAudit?: () => Promise<void>;
 };
 
 function errorClass(error: unknown): string {
@@ -83,5 +89,12 @@ export function startRelayMaintenance(deps: RelayMaintenanceDeps): () => Promise
   return async () => {
     for (const timer of timers) clearInterval(timer);
     await Promise.all([...inFlight]);
+    if (deps.stopCliAgentAudit !== undefined) {
+      try {
+        await deps.stopCliAgentAudit();
+      } catch (error) {
+        console.error("[server] agent audit flush failed", errorClass(error));
+      }
+    }
   };
 }

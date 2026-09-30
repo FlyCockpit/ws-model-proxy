@@ -40,6 +40,7 @@ import { useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
+import { CliAgentActivity } from "@/components/cli-agent-activity";
 import { CliDeviceFeatureSwitches } from "@/components/cli-device-feature-switches";
 import { CliDeviceMetricSources } from "@/components/cli-device-metric-sources";
 import { CliDeviceRename } from "@/components/cli-device-rename";
@@ -832,6 +833,7 @@ export function CliEndpointsModelsSection() {
                 device={device}
               />
 
+              <CliAgentActivity cliDeviceId={device.id} deviceName={device.displayName} />
               <CliDeviceMetricSources cliDeviceId={device.id} />
 
               <div className="divide-y">
