@@ -2302,25 +2302,87 @@ describe("CLI file tools", () => {
       ["forwarder_cli_file_write", { path: "~/n", content: "x" }],
       ["forwarder_cli_file_edit", { path: "~/a", oldString: "a", newString: "b" }],
       ["forwarder_cli_file_rename", { from: "~/a", to: "~/b" }],
+      ["forwarder_cli_dir_create", { path: "~/n" }],
       ["forwarder_cli_file_delete", { path: "~/a" }],
     ];
-    const cases: Array<[string, Record<string, unknown>, boolean]> = [];
+    const cases: Array<[string, Record<string, unknown>, string]> = [];
     for (const [name, args] of confirmed) {
-      cases.push([name, args, true]);
-      cases.push([name, { ...args, confirm: "NOPE" }, true]);
+      cases.push([name, args, "CONFIRMATION_REQUIRED"]);
+      cases.push([name, { ...args, confirm: "NOPE" }, "CONFIRMATION_REQUIRED"]);
     }
-    cases.push(["forwarder_cli_file_read", { path: "~/a", pad: "x".repeat(70_000) }, false]);
-    for (const [name, args, stable] of cases) {
+    cases.push([
+      "forwarder_cli_file_read",
+      { path: "~/a", pad: "x".repeat(70_000) },
+      "invalid_input",
+    ]);
+    for (const [name, args, code] of cases) {
       fileRuntime.auditRefusedFileInput.mockClear();
       const authInfo = buildAuthInfo(["mcp:write"]);
       bindRequest(authInfo, "req-sdk-c", PAT_WITH_CLI);
       const { body } = await callTool(authInfo, name, { cliDeviceId: "cli-1", ...args });
-      expect(body.result?.isError === true || body.error !== undefined).toBe(true);
-      if (stable) expect(body.result?.structuredContent?.error?.code).toBe("CONFIRMATION_REQUIRED");
+      expect(body.error).toBeUndefined();
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.structuredContent?.error?.code).toBe(code);
       expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledTimes(1);
+      expect(fileRuntime.auditRefusedFileInput.mock.calls[0]?.[0]).toMatchObject({
+        cliDeviceId: "",
+        userId: USER.id,
+        tokenId: "token-pat-1",
+      });
     }
     expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
   });
+
+  it("audits deeply nested invalid JSON without echoing values through the SDK", async () => {
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo, "req-sdk-deep", PAT_WITH_CLI);
+    const request = toolCallRequest(1, "forwarder_cli_file_read");
+    // Send the nested value as raw JSON, without pre-processing it through
+    // the test client's serializer. The request stays under the size bound.
+    const nested = `${'{"x":'.repeat(10_000)}"SECRET-DEEP-VALUE"${"}".repeat(10_000)}`;
+    const rawArgs = `{"cliDeviceId":"cli-1","path":"~/a","extra":${nested}}`;
+    const body = (await request.text()).replace('"arguments":{}', `"arguments":${rawArgs}`);
+    const response = await createMcpTransport().fetch(
+      new Request(request.url, { method: request.method, headers: request.headers, body }),
+      { authInfo },
+    );
+    const result = (await response.json()) as Awaited<ReturnType<typeof callTool>>["body"];
+    expect(result.error).toBeUndefined();
+    expect(result.result?.isError).toBe(true);
+    expect(result.result?.structuredContent?.error?.code).toBe("invalid_input");
+    expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledTimes(1);
+    expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+    expect(JSON.stringify(result)).not.toMatch(/SECRET-DEEP-VALUE|stack|RangeError/);
+  });
+
+  it.each(["sync", "async"])(
+    "audits a %s validator exception without SDK message echo",
+    async (mode) => {
+      const validate = vi
+        .spyOn(requireDescriptor("forwarder_cli_file_read").inputSchema["~standard"], "validate")
+        .mockImplementationOnce(() => {
+          const error = new Error("SECRET-VALIDATOR-VALUE");
+          if (mode === "async") return Promise.reject(error);
+          throw error;
+        });
+      try {
+        const authInfo = buildAuthInfo(["mcp:write"]);
+        bindRequest(authInfo, "req-sdk-validator", PAT_WITH_CLI);
+        const { body } = await callTool(authInfo, "forwarder_cli_file_read", {
+          cliDeviceId: "cli-1",
+          path: "~/a",
+        });
+        expect(body.error).toBeUndefined();
+        expect(body.result?.isError).toBe(true);
+        expect(body.result?.structuredContent?.error?.code).toBe("invalid_input");
+        expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledTimes(1);
+        expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+        expect(JSON.stringify(body)).not.toContain("SECRET-VALIDATOR-VALUE");
+      } finally {
+        validate.mockRestore();
+      }
+    },
+  );
 
   it("names the failing fields of an invalid input without echoing values (#117)", async () => {
     const cases: Array<[Record<string, unknown>, RegExp, string]> = [
