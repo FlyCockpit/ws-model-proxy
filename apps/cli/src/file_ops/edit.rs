@@ -62,6 +62,8 @@ pub struct EditArgs {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EditResult {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recovered: Vec<String>,
     /// The new etag (the previous one for a dry run or an unchanged file).
     pub etag: String,
     pub previous_etag: String,
@@ -276,6 +278,7 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
             diff,
             hunks,
             resolved_path: echo,
+            recovered: Vec::new(),
         });
     }
     if args.dry_run.unwrap_or(false) {
@@ -288,14 +291,16 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
             diff,
             hunks,
             resolved_path: echo,
+            recovered: Vec::new(),
         });
     }
 
     cancel.check()?;
-    let new_stat = atomic::replace(
+    let (new_stat, recovered) = atomic::replace(
         ops,
         &resolved.dir,
         &resolved.name,
+        &resolved.dir_path,
         &mut file,
         &stat,
         &previous_etag,
@@ -311,6 +316,7 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
         diff,
         hunks,
         resolved_path: echo,
+        recovered,
     })
 }
 

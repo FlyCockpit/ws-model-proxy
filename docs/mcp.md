@@ -165,10 +165,32 @@ and replaces require it. A stale etag returns `error.code` `conflict` with `curr
 (an etag, or the word `gone` when the file was removed): re-read and retry. `read` with `ifNoneMatch` answers `{unchanged: true, etag}`. Etags reset
 when the wsmp daemon restarts, which costs one extra `conflict`. A write-class call that
 fails with `error.outcome: "unknown"` (any code: `timeout`, `offline`, `cancelled`,
-`token_inactive`, a mode change, `io_error`, `not_found` on rename and delete, or `conflict` when the file was swapped during the change): call
+`token_inactive`, a mode change, `io_error`, `uncertain_outcome`, `not_found` on rename and delete, or `conflict` when the file was swapped during the change): call
 `forwarder_cli_file_stat` with `hash: true` and compare the etag before retrying. A retry
 that carries `expectedEtag` is safe (a stale etag returns `conflict`); an exact-match edit
 without `expectedEtag` is not idempotent, so check with `file_stat` first.
+
+**Manual file recovery.** Atomic replace and overwrite rename on Linux/macOS capture
+compensation objects into one mode-0700 `.wsmp-recover-<10 alnum>` directory beside
+the destination, with at most two objects per operation. An unsettled compensation
+returns `uncertain_outcome` with `error.outcome: "unknown"`, `recovery` (an absolute
+directory path) and `kept` (up to four absolute paths, including public names when
+capture failed). Successful edit/write/rename results may include `recovered` paths
+if only cleanup failed. Every retained location is also in the daemon warning log.
+Inspect those paths using a shell, compare file contents, and restore them manually
+without overwriting newer files before retrying. Find crash leftovers by listing
+`.wsmp-recover-*` and staging names beside the target. File tools permit reads and
+listing, but refuse writes, deletes, renames and creates inside recovery directories.
+Recovered objects are never automatically deleted; no startup recovery sweep runs.
+
+POSIX does not exclude other same-user processes. The exact remaining windows are:
+(a) a process that discovers the unpredictable private recovery name and replaces
+a slot between its identity check and final unlink can lose that replacement (the
+only deleting window); (b) undo briefly vacates public names, and a concurrent create
+makes restoration fail EEXIST, retaining displaced data with `uncertain_outcome`;
+(c) exchange-less filesystems retain the plain-rename replace race (overwrite rename
+is refused); (d) a crash between steps leaves recovery/staging names without deleting
+data. Public compensation names are never unlinked on an earlier stat's authority.
 
 **Limits.** 120 file operations per minute per user, of which at most 30 change files;
 4 in flight per CLI and 16 per user. Over a limit the error is `limit` with `retryAfterMs`.
@@ -185,7 +207,7 @@ in-band `isError` results with a stable `error.code`: the command codes
 (`not_found`, `grant_disabled`, `offline`, `feature_disabled`, `supervised_only`,
 `unsupported`, `limit`, `token_inactive`, `upgrade_required`), `invalid_input`, and the
 file codes (`path_denied`, `secret_file`, `not_a_file`, `not_a_dir`, `binary_file`,
-`too_large`, `conflict`, `match_count`, `no_match`, `redacted_span`, `exists`,
+`too_large`, `conflict`, `uncertain_outcome`, `match_count`, `no_match`, `redacted_span`, `exists`,
 `hard_linked`, `owner_mismatch`, `setuid`, `special_file`, `io_error`, `timeout`,
 `cancelled`). A CLI that speaks an older relay protocol returns `upgrade_required`
 ("this CLI speaks relay <v>; upgrade wsmp").

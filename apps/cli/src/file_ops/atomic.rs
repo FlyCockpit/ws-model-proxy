@@ -10,7 +10,14 @@
 //! 5. honor cancellation (the last point where it is honored);
 //! 6. exchange tmp with name where supported and remove the checked original,
 //!    otherwise `renameat(dirfd, tmp, dirfd, name)`; then `fsync(dirfd)`;
-//! 7. on any failure before the rename, `unlinkat` the temp file.
+//! 7. on failure, capture the temp into recovery and dispose only its identity.
+//!
+//! Recovery and exact POSIX residual windows: (a) a same-user writer discovering
+//! the private random directory can replace a slot between its identity check
+//! and unlink (the only deleting window); (b) a concurrent create during the
+//! vacant-name undo window keeps the displaced object in recovery; (c) plain
+//! rename on exchange-less filesystems retains its precommit race; (d) crashes
+//! leave recovery/staging names. See `recovery` for manual recovery and bounds.
 //!
 //! Refused up front: files owned by another uid (a non-root rename would change
 //! the owner), hard-linked files (the rename would break the link), and
@@ -25,17 +32,19 @@ use std::fs::File;
 use std::io::Write;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
+use std::path::Path;
 
 use nix::errno::Errno;
 use nix::fcntl::{AtFlags, OFlag, openat, renameat};
 use nix::sys::stat::{Mode, fchmod, fstatat, mode_t};
-use nix::unistd::{Gid, Uid, UnlinkatFlags, fchown, fsync, unlinkat};
+use nix::unistd::{Gid, Uid, fchown, fsync};
 use rand::distr::{Alphanumeric, SampleString};
 
 use super::error::{ErrorCode, FileError, FileResult};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::exchange::{exchange, is_unsupported};
 use super::read::current_etag;
+use super::recovery::RecoveryDir;
 use super::resolve::Stat;
 use super::text::floor_boundary;
 use super::{Cancel, FileOps, Step};
@@ -76,18 +85,33 @@ pub(crate) fn check_replaceable(ops: &FileOps, stat: &Stat) -> FileResult<()> {
 
 struct TempGuard<'a> {
     dir: &'a OwnedFd,
+    path: std::path::PathBuf,
     name: OsString,
+    identity: Stat,
+    recovery: &'a mut RecoveryDir,
     armed: bool,
+}
+
+impl TempGuard<'_> {
+    fn cleanup(&mut self, ops: &FileOps) -> bool {
+        if !self.armed {
+            return true;
+        }
+        self.armed = false;
+        let Some(slot) = self.recovery.capture(self.dir, &self.name, &self.path) else {
+            return false;
+        };
+        let _ = ops.step(Step::Captured);
+        self.recovery.dispose(ops, &slot, &self.identity)
+    }
 }
 
 impl Drop for TempGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let _ = unlinkat(
-                self.dir.as_fd(),
-                self.name.as_os_str(),
-                UnlinkatFlags::NoRemoveDir,
-            );
+            // Unwind safety net only captures; it never unlinks a public name.
+            self.armed = false;
+            let _ = self.recovery.capture(self.dir, &self.name, &self.path);
         }
     }
 }
@@ -106,13 +130,52 @@ pub(crate) fn replace(
     ops: &FileOps,
     dir: &OwnedFd,
     name: &OsStr,
+    dir_path: &Path,
     orig: &mut File,
     orig_stat: &Stat,
     orig_etag: &str,
     content: &[u8],
     cancel: &Cancel,
-) -> FileResult<Stat> {
+) -> FileResult<(Stat, Vec<String>)> {
     check_replaceable(ops, orig_stat)?;
+    let mut recovery = RecoveryDir::new(dir, dir_path)?;
+    let result = replace_inner(
+        ops,
+        dir,
+        name,
+        dir_path,
+        orig,
+        orig_stat,
+        orig_etag,
+        content,
+        cancel,
+        &mut recovery,
+    );
+    let recovered = recovery.finish();
+    match result {
+        Ok(stat) => Ok((stat, recovered)),
+        Err(error) if error.code == ErrorCode::UncertainOutcome || !recovery.settled() => {
+            Err(recovery.uncertain())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// All exits after opening the temp flow through cleanup; the outer wrapper
+/// finishes the recovery directory and lets uncertainty override an earlier error.
+#[allow(clippy::too_many_arguments)]
+fn replace_inner(
+    ops: &FileOps,
+    dir: &OwnedFd,
+    name: &OsStr,
+    dir_path: &Path,
+    orig: &mut File,
+    orig_stat: &Stat,
+    orig_etag: &str,
+    content: &[u8],
+    cancel: &Cancel,
+    recovery: &mut RecoveryDir,
+) -> FileResult<Stat> {
     let tmp = temp_name(name);
     let fd = openat(
         dir.as_fd(),
@@ -121,106 +184,128 @@ pub(crate) fn replace(
         perm_mode(0o600),
     )
     .map_err(FileError::errno)?;
+    let mut tmp_file = File::from(fd);
+    // fstat is on the held fd, never a sampled public pathname. If it fails,
+    // capture without disposal: there is no proven identity to authorize unlink.
+    let identity = match nix::sys::stat::fstat(tmp_file.as_fd()) {
+        Ok(raw) => Stat::from_raw(&raw),
+        Err(_) => {
+            let _ = recovery.capture(dir, &tmp, &dir_path.join(&tmp));
+            return Err(recovery.uncertain());
+        }
+    };
     let mut guard = TempGuard {
         dir,
+        path: dir_path.join(&tmp),
         name: tmp,
+        identity,
+        recovery,
         armed: true,
     };
-    let mut tmp_file = File::from(fd);
-    ops.step(Step::TempCreated)?;
-
-    tmp_file.write_all(content)?;
-    ops.step(Step::TempWritten)?;
-    tmp_file.sync_all()?;
-    ops.step(Step::TempSynced)?;
-
-    fchown(
-        tmp_file.as_fd(),
-        Some(Uid::from_raw(orig_stat.uid)),
-        Some(Gid::from_raw(orig_stat.gid)),
-    )
-    .map_err(FileError::errno)?;
-    ops.step(Step::Chowned)?;
-    fchmod(tmp_file.as_fd(), perm_mode(orig_stat.mode & 0o7777)).map_err(FileError::errno)?;
-    ops.step(Step::Chmodded)?;
-    // the identity the replacement will have once renamed (etags are bound to it)
-    let new_stat = Stat::from_metadata(&tmp_file.metadata()?);
-
-    recheck(ops, dir, name, orig, orig_stat, orig_etag, cancel)?;
-    ops.step(Step::EtagRechecked)?;
-    cancel.check()?;
-
-    commit_stage(
-        dir,
-        guard.name.as_os_str(),
-        name,
-        orig_stat,
-        &new_stat,
-        &mut guard.armed,
-    )?;
-    guard.armed = false;
-    // Committed: hook errors below cannot undo the rename.
-    let _ = ops.step(Step::Renamed);
-    fsync(dir.as_fd()).map_err(FileError::errno)?;
-    let _ = ops.step(Step::DirSynced);
-    Ok(new_stat)
+    let result = (|| -> FileResult<Stat> {
+        ops.step(Step::TempCreated)?;
+        tmp_file.write_all(content)?;
+        ops.step(Step::TempWritten)?;
+        tmp_file.sync_all()?;
+        ops.step(Step::TempSynced)?;
+        fchown(
+            tmp_file.as_fd(),
+            Some(Uid::from_raw(orig_stat.uid)),
+            Some(Gid::from_raw(orig_stat.gid)),
+        )
+        .map_err(FileError::errno)?;
+        ops.step(Step::Chowned)?;
+        fchmod(tmp_file.as_fd(), perm_mode(orig_stat.mode & 0o7777)).map_err(FileError::errno)?;
+        ops.step(Step::Chmodded)?;
+        let new_stat = Stat::from_metadata(&tmp_file.metadata()?);
+        recheck(ops, dir, name, orig, orig_stat, orig_etag, cancel)?;
+        ops.step(Step::EtagRechecked)?;
+        cancel.check()?;
+        commit_stage(ops, &mut guard, name, dir_path, orig_stat, &new_stat)?;
+        guard.armed = false;
+        let _ = ops.step(Step::Renamed);
+        fsync(dir.as_fd()).map_err(FileError::errno)?;
+        let _ = ops.step(Step::DirSynced);
+        Ok(new_stat)
+    })();
+    if !guard.cleanup(ops) {
+        Err(guard.recovery.uncertain())
+    } else {
+        result
+    }
 }
 
-/// Put the staged file at `name`, replacing only the object that was checked.
-///
-/// Linux and macOS: atomic exchange, then the staged name holds what was at `name`;
-/// if that is not the original object (a successor slipped in after the final
-/// re-check) the exchange is undone and the caller gets a conflict, so an
-/// unapproved successor is never overwritten. After an exchange the guard is
-/// disarmed: the staged name is unlinked here, and only when it still holds the
-/// object we put there (a double race must not delete a third object). Crash
-/// states: between the exchange and the unlink the old file is under the staging
-/// name (no data is lost). On other platforms and filesystems without exchange,
-/// a plain rename is used and a race remains after the final re-check. Known
-/// residual, tracked in #165: a same-user external writer racing the undo swap or
-/// the cleanup unlink after the exchange can displace or delete its own successor,
-/// and a failed undo is reported as an ordinary conflict.
+/// Exchange first, then capture the displaced object; NEVER unlink or swap back
+/// a public name using an earlier stat. Undo captures both objects and restores
+/// using NOREPLACE. Unproven objects are retained, with an uncertain outcome.
 fn commit_stage(
-    dir: &OwnedFd,
-    stage: &OsStr,
+    ops: &FileOps,
+    guard: &mut TempGuard<'_>,
     name: &OsStr,
+    dir_path: &Path,
     orig_stat: &Stat,
     staged_stat: &Stat,
-    armed: &mut bool,
 ) -> FileResult<()> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    let _ = (orig_stat, staged_stat, &armed);
+    let _ = (ops, dir_path, orig_stat, staged_stat);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        let swap = || exchange(dir.as_fd(), stage, dir.as_fd(), name);
-        let holds = |expected: &Stat| {
-            fstatat(dir.as_fd(), stage, AtFlags::AT_SYMLINK_NOFOLLOW)
-                .is_ok_and(|held| Stat::from_raw(&held).same_object(expected))
-        };
-        match swap() {
+        match exchange(
+            guard.dir.as_fd(),
+            guard.name.as_os_str(),
+            guard.dir.as_fd(),
+            name,
+        ) {
             Ok(()) => {
-                // the guard must not unlink a name that now holds someone else's file
-                *armed = false;
-                if holds(orig_stat) {
-                    // the original: it is replaced, drop it (already committed: a
-                    // failed cleanup is not a failed edit)
-                    let _ = unlinkat(dir.as_fd(), stage, UnlinkatFlags::NoRemoveDir);
+                guard.armed = false;
+                let _ = ops.step(Step::Exchanged);
+                let Some(x) = guard.recovery.capture(guard.dir, &guard.name, &guard.path) else {
+                    guard
+                        .recovery
+                        .record_public(guard.dir, name, &dir_path.join(name));
+                    return Err(guard.recovery.uncertain());
+                };
+                let _ = ops.step(Step::Captured);
+                if guard.recovery.holds(&x, orig_stat) {
+                    // Committed: retention is a successful edit with recovered paths.
+                    guard.recovery.dispose(ops, &x, orig_stat);
                     return Ok(());
                 }
-                // a successor: restore it, and drop our staged file only when the
-                // stage name holds it again
-                let _ = swap();
-                if holds(staged_stat) {
-                    let _ = unlinkat(dir.as_fd(), stage, UnlinkatFlags::NoRemoveDir);
+                let y = guard
+                    .recovery
+                    .capture(guard.dir, name, &dir_path.join(name));
+                if y.is_some() {
+                    let _ = ops.step(Step::Captured);
                 }
-                return Err(FileError::conflict("replaced"));
+                if guard
+                    .recovery
+                    .restore(&x, guard.dir, name, &dir_path.join(name))
+                {
+                    let _ = ops.step(Step::Restored);
+                }
+                if let Some(y) = y {
+                    guard.recovery.dispose(ops, &y, staged_stat);
+                }
+                guard.recovery.finish();
+                return if guard.recovery.settled() {
+                    Err(FileError::conflict("replaced"))
+                } else {
+                    Err(guard.recovery.uncertain())
+                };
             }
             Err(Errno::ENOENT) => return Err(FileError::conflict("gone")),
             Err(errno) if is_unsupported(errno) => {}
             Err(errno) => return Err(FileError::errno(errno)),
         }
     }
-    renameat(dir.as_fd(), stage, dir.as_fd(), name).map_err(FileError::errno)
+    // The unchanged exchange-less plain-rename race is documented above.
+    renameat(
+        guard.dir.as_fd(),
+        guard.name.as_os_str(),
+        guard.dir.as_fd(),
+        name,
+    )
+    .map_err(FileError::errno)
 }
 
 /// The name must still point at the file we read, and that file must still
@@ -261,30 +346,60 @@ fn read_from_start(
     current_etag(ops, file, stat, cancel)
 }
 
-/// Create `name` exclusively with `mode` (after umask) and `content`. The new
-/// file is removed again if any later step fails.
+/// Exclusive create. A failed write captures the name and only disposes the
+/// identity of the held created fd; a squatter is retained with uncertainty.
 pub(crate) fn create_new(
+    ops: &FileOps,
     dir: &OwnedFd,
+    dir_path: &Path,
     name: &OsStr,
     content: &[u8],
     mode: u32,
-) -> FileResult<Stat> {
-    let fd = openat(
-        dir.as_fd(),
-        name,
-        OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_WRONLY | OFlag::O_CLOEXEC,
-        perm_mode(mode & 0o777),
-    )
-    .map_err(FileError::errno)?;
-    let mut file = File::from(fd);
-    let finish = (|| -> FileResult<Stat> {
-        file.write_all(content)?;
-        file.sync_all()?;
-        fsync(dir.as_fd()).map_err(FileError::errno)?;
-        Ok(Stat::from_metadata(&file.metadata()?))
+) -> FileResult<(Stat, Vec<String>)> {
+    let mut recovery = RecoveryDir::new(dir, dir_path)?;
+    let result = (|| -> FileResult<Stat> {
+        let fd = openat(
+            dir.as_fd(),
+            name,
+            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+            perm_mode(mode & 0o777),
+        )
+        .map_err(FileError::errno)?;
+        let mut file = File::from(fd);
+        let identity = match nix::sys::stat::fstat(file.as_fd()) {
+            Ok(raw) => Stat::from_raw(&raw),
+            Err(_) => {
+                let _ = recovery.capture(dir, name, &dir_path.join(name));
+                return Err(recovery.uncertain());
+            }
+        };
+        let mut guard = TempGuard {
+            dir,
+            name: name.to_os_string(),
+            path: dir_path.join(name),
+            identity,
+            recovery: &mut recovery,
+            armed: true,
+        };
+        let finish = (|| -> FileResult<Stat> {
+            ops.step(Step::Created)?;
+            file.write_all(content)?;
+            file.sync_all()?;
+            fsync(dir.as_fd()).map_err(FileError::errno)?;
+            Ok(Stat::from_metadata(&file.metadata()?))
+        })();
+        if finish.is_ok() {
+            guard.armed = false;
+        }
+        if !guard.cleanup(ops) {
+            return Err(guard.recovery.uncertain());
+        }
+        finish
     })();
-    if finish.is_err() {
-        let _ = unlinkat(dir.as_fd(), name, UnlinkatFlags::NoRemoveDir);
+    let recovered = recovery.finish();
+    match result {
+        Ok(stat) => Ok((stat, recovered)),
+        Err(_) if !recovery.settled() => Err(recovery.uncertain()),
+        Err(error) => Err(error),
     }
-    finish
 }

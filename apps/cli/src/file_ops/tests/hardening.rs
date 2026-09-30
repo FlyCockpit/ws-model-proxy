@@ -1437,11 +1437,11 @@ fn staging_names_are_refused_under_every_folded_spelling() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod exchange_callers {
     use super::*;
-    use crate::file_ops::exchange::INJECTED;
+    use crate::file_ops::exchange::{FaultScope, Primitive};
     use nix::errno::Errno;
 
-    fn inject(errno: Errno) {
-        INJECTED.with(|slot| slot.set(Some(errno)));
+    fn inject(errno: Errno) -> FaultScope {
+        FaultScope::new(&[(Primitive::Exchange, 1, errno)])
     }
 
     fn edit(fx: &Fx) -> FileResult<super::super::super::edit::EditResult> {
@@ -1466,7 +1466,7 @@ mod exchange_callers {
         for errno in [Errno::EINVAL, Errno::ENOSYS] {
             let fx = Fx::new();
             fx.put("doc.txt", "original\n");
-            inject(errno);
+            let _faults = inject(errno);
             edit(&fx).unwrap_or_else(|e| panic!("{errno}: {e:?}"));
             assert_eq!(fx.get("doc.txt"), "edited\n", "{errno}");
             assert!(fx.leftovers("").is_empty(), "{errno}");
@@ -1474,7 +1474,7 @@ mod exchange_callers {
         for errno in [Errno::EPERM, Errno::EXDEV, Errno::EIO] {
             let fx = Fx::new();
             fx.put("doc.txt", "original\n");
-            inject(errno);
+            let _faults = inject(errno);
             assert!(
                 edit(&fx).is_err(),
                 "{errno} must not fall back to a plain rename"
@@ -1488,7 +1488,7 @@ mod exchange_callers {
     fn a_replace_reports_a_file_deleted_before_the_commit_as_gone() {
         let fx = Fx::new();
         fx.put("doc.txt", "original\n");
-        inject(Errno::ENOENT);
+        let _faults = inject(Errno::ENOENT);
         let error = edit(&fx).expect_err("the exchange found nothing to replace");
         assert_eq!(error.code, ErrorCode::Conflict);
         assert!(fx.leftovers("").is_empty());
@@ -1509,43 +1509,150 @@ mod exchange_callers {
         assert_eq!(fx.get("dst.txt"), "mine");
     }
 
-    // A case-only overwrite rename on a case-insensitive volume (macOS default)
-    // names the same file twice: it is refused and the file stays.
-    #[test]
-    fn a_case_only_overwrite_rename_never_deletes_the_file() {
-        let fx = Fx::new();
-        fx.put("Foo.txt", "mine");
-        if !fx.root.join("foo.txt").exists() {
-            // case-sensitive volume: two distinct names, nothing to check (macOS
-            // runners use the case-insensitive default, so there this must not skip)
-            #[cfg(target_os = "macos")]
-            panic!("the macOS test volume is expected to be case-insensitive");
-            #[cfg(not(target_os = "macos"))]
-            return;
-        }
-        let etag = fx.etag("Foo.txt");
-        let r = rename(
-            &fx,
-            json!({ "from": fx.p("Foo.txt"), "to": fx.p("foo.txt"), "overwrite": true, "expectedEtag": etag }),
-        );
-        assert_eq!(code(r), ErrorCode::InvalidInput);
-        assert_eq!(fx.get("foo.txt"), "mine");
-    }
-
     #[test]
     fn an_overwrite_maps_unsupported_errors_to_unsupported_and_others_to_their_own_error() {
         for errno in [Errno::EINVAL, Errno::ENOSYS] {
             let fx = Fx::new();
-            inject(errno);
+            let _faults = inject(errno);
             assert_eq!(code(overwrite(&fx)), ErrorCode::Unsupported, "{errno}");
             assert_eq!(fx.get("dst.txt"), "old", "{errno}");
             assert_eq!(fx.get("src.txt"), "mine", "{errno}");
         }
         for errno in [Errno::EPERM, Errno::EXDEV, Errno::EIO] {
             let fx = Fx::new();
-            inject(errno);
+            let _faults = inject(errno);
             assert_eq!(code(overwrite(&fx)), ErrorCode::IoError, "{errno}");
             assert_eq!(fx.get("dst.txt"), "old", "{errno}");
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rename_overwrite_refuses_case_differing_hard_link_alias() {
+    use crate::file_ops::resolve::Stat;
+
+    let fx = Fx::new();
+    fx.put("a", "keep these bytes\n");
+    std::fs::hard_link(fx.root.join("a"), fx.root.join("A")).unwrap();
+    let before = Stat::from_metadata(&std::fs::symlink_metadata(fx.root.join("a")).unwrap());
+    assert_eq!(before.nlink, 2);
+    let etag = fx.etag("A");
+    // Destination ETag validation still precedes the same-object decision.
+    assert_eq!(
+        code(rename(
+            &fx,
+            json!({ "from": fx.p("a"), "to": fx.p("A"), "overwrite": true, "expectedEtag": "h:stale" }),
+        )),
+        ErrorCode::Conflict,
+    );
+    let error = rename(
+        &fx,
+        json!({ "from": fx.p("a"), "to": fx.p("A"), "overwrite": true, "expectedEtag": etag }),
+    )
+    .expect_err("two hard links must not be treated as a single-entry alias");
+    assert_eq!(error.code, ErrorCode::InvalidInput);
+    assert_eq!(error.message, "source and destination are the same file");
+    assert_eq!(fx.get("a"), "keep these bytes\n");
+    assert_eq!(fx.get("A"), "keep these bytes\n");
+    for name in ["a", "A"] {
+        let after = Stat::from_metadata(&std::fs::symlink_metadata(fx.root.join(name)).unwrap());
+        assert!(after.same_object(&before));
+        assert_eq!(after.nlink, 2);
+    }
+    let mut names: Vec<_> = std::fs::read_dir(&fx.root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["A", "a"]);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn rename_overwrite_case_only_alias_changes_spelling_on_case_insensitive_volume() {
+    use crate::file_ops::exchange::{FaultScope, Primitive};
+    use crate::file_ops::resolve::Stat;
+    use nix::errno::Errno;
+
+    let fx = Fx::new();
+    fx.put("Probe", "probe");
+    match std::fs::symlink_metadata(fx.root.join("probe")) {
+        Ok(alias) => {
+            let probe =
+                Stat::from_metadata(&std::fs::symlink_metadata(fx.root.join("Probe")).unwrap());
+            assert!(probe.same_object(&Stat::from_metadata(&alias)));
+            assert_eq!(probe.nlink, 1);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            writeln!(
+                std::io::stderr(),
+                "skipping case-only rename: temp directory volume is case-sensitive"
+            )
+            .expect("print skip reason");
+            return;
+        }
+        Err(error) => panic!("case-insensitivity probe failed: {error}"),
+    }
+    std::fs::remove_file(fx.root.join("Probe")).unwrap();
+    fx.put("Foo.txt", "keep these bytes\n");
+    let before = Stat::from_metadata(&std::fs::symlink_metadata(fx.root.join("Foo.txt")).unwrap());
+    let etag = fx.etag("foo.txt");
+    assert_eq!(
+        code(rename(
+            &fx,
+            json!({ "from": fx.p("Foo.txt"), "to": fx.p("foo.txt") })
+        )),
+        ErrorCode::Exists,
+    );
+    assert_eq!(
+        code(rename(
+            &fx,
+            json!({ "from": fx.p("Foo.txt"), "to": fx.p("foo.txt"), "overwrite": true, "expectedEtag": "h:stale" }),
+        )),
+        ErrorCode::Conflict,
+    );
+    // A recovery allocation would try Rmdir at finish, retaining a path under
+    // this fault. Case-only rename must neither allocate it nor use exchange.
+    let _faults = FaultScope::new(&[
+        (Primitive::Exchange, 1, Errno::EIO),
+        (Primitive::Capture, 1, Errno::EIO),
+        (Primitive::Rmdir, 1, Errno::EIO),
+    ]);
+    let result = rename(
+        &fx,
+        json!({ "from": fx.p("Foo.txt"), "to": fx.p("foo.txt"), "overwrite": true, "expectedEtag": etag }),
+    )
+    .expect("case-only overwrite must update the stored spelling");
+    assert_eq!(result.etag.as_deref(), Some(etag.as_str()));
+    assert!(result.recovered.is_empty());
+    assert_eq!(fx.get("foo.txt"), "keep these bytes\n");
+    let after = Stat::from_metadata(&std::fs::symlink_metadata(fx.root.join("foo.txt")).unwrap());
+    assert!(after.same_object(&before));
+    assert_eq!(after.nlink, 1);
+    let names: Vec<_> = std::fs::read_dir(&fx.root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["foo.txt"]);
+
+    std::fs::hard_link(fx.root.join("foo.txt"), fx.root.join("alias.txt")).unwrap();
+    // nlink > 1 refuses even the two case spellings of the original entry.
+    for to in ["alias.txt", "FOO.txt"] {
+        let error = rename(
+            &fx,
+            json!({ "from": fx.p("foo.txt"), "to": fx.p(to), "overwrite": true, "expectedEtag": fx.etag(to) }),
+        )
+        .expect_err("hard-link aliases remain refused on a case-insensitive volume");
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        assert_eq!(error.message, "source and destination are the same file");
+        assert_eq!(fx.get("foo.txt"), "keep these bytes\n");
+        assert_eq!(fx.get("alias.txt"), "keep these bytes\n");
+    }
+    let mut names: Vec<_> = std::fs::read_dir(&fx.root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["alias.txt", "foo.txt"]);
 }

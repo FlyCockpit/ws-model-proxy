@@ -287,6 +287,39 @@ fn file_errors_become_file_rejected_with_only_the_documented_detail() {
 }
 
 #[test]
+fn uncertain_outcome_recovery_facts_survive_the_detail_filter_as_a_pair() {
+    let facts = json!({ "recovery": "/w/.wsmp-recover-AAAAAAAAAA", "kept": ["/w/.wsmp-recover-AAAAAAAAAA/slot-1"] });
+    assert_eq!(filter_detail(&facts), Some(facts.clone()));
+    // the whole wire path: the error's detail reaches the rejected frame
+    let error = ErrorCode::UncertainOutcome;
+    let (frames, code) = frames_for(
+        "op",
+        "edit",
+        Err(FileError::new(error, "uncertain").with_detail(facts.clone())),
+    );
+    assert_eq!(code, "uncertain_outcome");
+    let frame = only_control(&frames);
+    assert_eq!(frame["reason"], "uncertain_outcome");
+    assert_eq!(frame["detail"], facts);
+    // the server accepts the facts only together and only as bounded absolute paths
+    assert_eq!(filter_detail(&json!({ "recovery": "/w/r" })), None);
+    assert_eq!(filter_detail(&json!({ "kept": ["/w/r/slot-1"] })), None);
+    assert_eq!(
+        filter_detail(&json!({ "recovery": "relative", "kept": ["/w/r/slot-1"] })),
+        None
+    );
+    assert_eq!(
+        filter_detail(&json!({ "recovery": "/w/r", "kept": ["/a", "/b", "/c", "/d", "/e"] })),
+        None
+    );
+    let long = format!("/{}", "a".repeat(8192));
+    assert_eq!(
+        filter_detail(&json!({ "recovery": long, "kept": ["/w/r/slot-1"] })),
+        None
+    );
+}
+
+#[test]
 fn a_write_waits_for_its_body_then_runs_with_base64_content() {
     let dir = tempfile::tempdir().expect("dir");
     let file = dir.path().join("w.bin");

@@ -231,7 +231,10 @@ impl Resolved {
         Ok((file, stat))
     }
 
-    /// Undo directories created by `makeParents` (newest first).
+    /// Undo directories created by `makeParents` (newest first). This is only
+    /// rmdir-if-empty, not file compensation: the kernel refuses files, symlinks
+    /// and nonempty successors, so no file contents can be removed here. An
+    /// externally replaced empty directory can still be removed.
     pub fn rollback_created(&mut self) {
         while let Some(created) = self.created.pop() {
             let _ = unlinkat(

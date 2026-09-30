@@ -1,20 +1,22 @@
 //! `forwarder_cli_file_rename`, `forwarder_cli_dir_create`,
 //! `forwarder_cli_file_delete`: the small mutating tools.
 
+use std::ffi::OsStr;
 use std::os::fd::AsFd;
 
 use nix::errno::Errno;
 use nix::fcntl::{AtFlags, renameat};
-use nix::sys::stat::mkdirat;
+use nix::sys::stat::{fstat, mkdirat};
 use nix::unistd::{UnlinkatFlags, linkat, unlinkat};
 use serde::{Deserialize, Serialize};
 
 use super::atomic::perm_mode;
 use super::error::{ErrorCode, FileError, FileResult};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-use super::exchange::{exchange, is_unsupported};
+use super::exchange::{Primitive, exchange, is_unsupported, no_replace};
 use super::policy::Access;
 use super::read::current_etag;
+use super::recovery::RecoveryDir;
 use super::resolve::{Kind, ResolveOpts, Resolved, Stat, resolve};
 use super::stat::kind_name;
 use super::write::{DEFAULT_PARENT_MODE, parse_mode};
@@ -35,6 +37,8 @@ pub struct RenameArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RenameResult {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recovered: Vec<String>,
     /// Etag of the moved file (none for directories).
     pub etag: Option<String>,
 }
@@ -179,16 +183,6 @@ pub(crate) fn rename(
                 "the destination is a directory or special file and is not overwritten",
             ));
         }
-        // Two names for one object (a hard link, or a case-insensitive / normalizing
-        // volume where both names resolve to the same entry): an exchange would swap
-        // the name with itself and the unlink of the source name would then delete
-        // the only entry. Nothing is replaced, so refuse (plain rename is no option:
-        // it reopens the race the exchange closes).
-        if dst.same_object(&src) {
-            return Err(FileError::invalid(
-                "source and destination are the same file",
-            ));
-        }
         ops.policy.check_identity(Access::Write, dst)?;
         let current = object_etag(ops, &to, dst, cancel)?.unwrap_or_default();
         if args.expected_etag.as_deref() != Some(current.as_str()) {
@@ -199,88 +193,405 @@ pub(crate) fn rename(
     cancel.check()?;
     // Test seam: the last point at which the world can change before the commit.
     ops.step(Step::EtagRechecked)?;
-    commit_rename(&from, &to, overwrite, &src, dst.as_ref())?;
-    Ok(RenameResult { etag: src_etag })
+    let recovered = commit_rename(ops, &from, &to, overwrite, &src, dst.as_ref())?;
+    Ok(RenameResult {
+        etag: src_etag,
+        recovered,
+    })
 }
 
-/// Commit the rename and verify that the objects that moved are the ones that
-/// were checked. `dst` is the destination object that `expectedEtag` covered
-/// (`None` when nothing was at the destination).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SameObjectRename {
+    Refuse,
+    CaseOnlyRename,
+    NotSameObject,
+}
+
+/// Classify an overwrite after destination policy and ETag checks. Directory
+/// identities come from fstat of the held parent fds, not folded path strings.
+/// A regular file with one link, differing folded-equivalent names and one
+/// parent object is a single entry viewed under two spellings. Plain renameat
+/// changes its spelling atomically; exchange/compensation would act on itself.
+/// Every other same-object pair is refused, including true hard-link aliases.
 ///
-/// * No overwrite (or an empty destination): an atomic no-replace rename, so a
-///   destination that appeared after the check is never replaced.
-/// * Overwrite of a checked destination (Linux and macOS): atomic exchange, then
-///   the old destination is at the source name and is removed only when it is
-///   the object whose etag was checked; otherwise the exchange is undone.
-///   Filesystems without exchange support refuse overwrite as unsupported.
+/// Use the repo's path-classification fold (`redact::fold`): Unicode lower case
+/// plus expansions (e.g. Straße == STRASSE), also trimming trailing dots/spaces.
+/// Thus those normalization aliases qualify only with the same single-entry
+/// identity checks. Non-UTF-8 names fail closed rather than using a lossy fold.
 ///
-/// Residual: overwrite on platforms other than Linux/macOS and directory moves
-/// on non-Linux systems rely on the checks above, leaving a race before commit.
-/// Crash states: between the exchange and the unlink the old destination is
-/// under the source name; after `linkat` and before the unlink both names exist.
-/// Neither loses data. The undo moves back whatever object the move actually put
-/// at the destination (a same-user cross-process successor in that window is the
-/// accepted residual, together with a failed undo and a cleanup unlink that races
-/// a successor: tracked in #165).
+/// Exact residual: plain rename replaces whatever occupies the destination name.
+/// A racing external writer can turn the alias into a distinct entry after this
+/// check and before rename, and that entry can be lost. This needs a volume where
+/// the alias is one entry plus a same-user racer creating a second entry under
+/// the other spelling inside the microsecond check-to-rename window. The checks
+/// are snapshots, not POSIX exclusion against external processes.
+fn same_object_rename(
+    src: &Stat,
+    dst: &Stat,
+    from_dir: &Stat,
+    from_name: &OsStr,
+    to_dir: &Stat,
+    to_name: &OsStr,
+) -> SameObjectRename {
+    if !dst.same_object(src) {
+        return SameObjectRename::NotSameObject;
+    }
+    if src.kind() == Kind::File
+        && dst.kind() == Kind::File
+        && src.nlink == 1
+        && from_dir.same_object(to_dir)
+        && from_name != to_name
+        && matches!((from_name.to_str(), to_name.to_str()), (Some(from), Some(to))
+            if super::redact::fold(from) == super::redact::fold(to))
+    {
+        SameObjectRename::CaseOnlyRename
+    } else {
+        SameObjectRename::Refuse
+    }
+}
+
+#[cfg(test)]
+mod same_object_rename_tests {
+    use super::*;
+
+    #[test]
+    fn same_object_rename_decision_table() {
+        let src = Stat {
+            // Stat uses portable u32 mode bits; nix's mode_t is u16 on macOS.
+            mode: 0o100_600,
+            uid: 1000,
+            gid: 1000,
+            nlink: 1,
+            size: 4,
+            dev: 1,
+            ino: 10,
+            mtime_secs: 0,
+            mtime_nanos: 0,
+        };
+        let dir = Stat {
+            mode: 0o040_700,
+            ino: 20,
+            ..src
+        };
+        #[derive(Clone, Copy)]
+        struct Case {
+            label: &'static str,
+            src: Stat,
+            dst: Stat,
+            from_dir: Stat,
+            to_dir: Stat,
+            from: &'static str,
+            to: &'static str,
+            expected: SameObjectRename,
+        }
+        let base = Case {
+            label: "one entry, two case spellings",
+            src,
+            dst: src,
+            from_dir: dir,
+            to_dir: dir,
+            from: "Foo.txt",
+            to: "foo.txt",
+            expected: SameObjectRename::CaseOnlyRename,
+        };
+        for case in [
+            base,
+            Case {
+                label: "nlink 2 with identical spelling",
+                src: Stat { nlink: 2, ..src },
+                dst: Stat { nlink: 2, ..src },
+                to: "Foo.txt",
+                expected: SameObjectRename::Refuse,
+                ..base
+            },
+            Case {
+                label: "same-case hard links with distinct names",
+                src: Stat { nlink: 2, ..src },
+                dst: Stat { nlink: 2, ..src },
+                from: "a",
+                to: "b",
+                expected: SameObjectRename::Refuse,
+                ..base
+            },
+            Case {
+                label: "case-differing hard links on a case-sensitive volume",
+                src: Stat { nlink: 2, ..src },
+                dst: Stat { nlink: 2, ..src },
+                expected: SameObjectRename::Refuse,
+                ..base
+            },
+            Case {
+                label: "different parent inodes, even if paths fold equally",
+                to_dir: Stat { ino: 21, ..dir },
+                expected: SameObjectRename::Refuse,
+                ..base
+            },
+            Case {
+                label: "different parent devices with the same inode number",
+                to_dir: Stat { dev: 2, ..dir },
+                expected: SameObjectRename::Refuse,
+                ..base
+            },
+            Case {
+                label: "byte-identical names are not a spelling change",
+                to: "Foo.txt",
+                expected: SameObjectRename::Refuse,
+                ..base
+            },
+            Case {
+                label: "different names that are not fold-equivalent",
+                to: "bar.txt",
+                expected: SameObjectRename::Refuse,
+                ..base
+            },
+            Case {
+                label: "repo fold expands sharp s to ss",
+                from: "Straße",
+                to: "STRASSE",
+                ..base
+            },
+            Case {
+                label: "repo fold expands long s and ligatures",
+                from: "ſtraﬃc",
+                to: "STRAFFIC",
+                ..base
+            },
+            Case {
+                label: "repo fold lowercases the Kelvin sign",
+                from: "K.txt",
+                to: "k.txt",
+                ..base
+            },
+            Case {
+                label: "repo fold trims trailing dots",
+                from: "Foo.txt.",
+                ..base
+            },
+            Case {
+                label: "repo fold trims trailing spaces",
+                from: "Foo.txt ",
+                ..base
+            },
+            Case {
+                label: "repo fold preserves leading spaces",
+                from: " Foo.txt",
+                expected: SameObjectRename::Refuse,
+                ..base
+            },
+            Case {
+                label: "repo fold does not equate different Unicode normalization",
+                from: "é.txt",
+                to: "e\u{301}.txt",
+                expected: SameObjectRename::Refuse,
+                ..base
+            },
+            Case {
+                label: "different file inode",
+                dst: Stat { ino: 11, ..src },
+                expected: SameObjectRename::NotSameObject,
+                ..base
+            },
+            Case {
+                label: "different file device with the same inode number",
+                dst: Stat { dev: 2, ..src },
+                expected: SameObjectRename::NotSameObject,
+                ..base
+            },
+            Case {
+                label: "directory aliases never qualify",
+                src: dir,
+                dst: dir,
+                expected: SameObjectRename::Refuse,
+                ..base
+            },
+            Case {
+                label: "symlink aliases never qualify",
+                src: Stat {
+                    mode: 0o120_777,
+                    ..src
+                },
+                dst: Stat {
+                    mode: 0o120_777,
+                    ..src
+                },
+                expected: SameObjectRename::Refuse,
+                ..base
+            },
+            Case {
+                label: "special file aliases never qualify",
+                src: Stat {
+                    mode: 0o010_600,
+                    ..src
+                },
+                dst: Stat {
+                    mode: 0o010_600,
+                    ..src
+                },
+                expected: SameObjectRename::Refuse,
+                ..base
+            },
+        ] {
+            assert_eq!(
+                same_object_rename(
+                    &case.src,
+                    &case.dst,
+                    &case.from_dir,
+                    OsStr::new(case.from),
+                    &case.to_dir,
+                    OsStr::new(case.to),
+                ),
+                case.expected,
+                "{}",
+                case.label,
+            );
+        }
+        // Lossy conversion could equate distinct invalid byte spellings.
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            same_object_rename(
+                &src,
+                &src,
+                &dir,
+                OsStr::from_bytes(b"F\xff"),
+                &dir,
+                OsStr::from_bytes(b"f\xfe"),
+            ),
+            SameObjectRename::Refuse,
+        );
+    }
+}
+
+/// Sole overwrite gate for rename: classify same-object pairs before allocating
+/// recovery. Case-only aliases use plain renameat with no recovery directory;
+/// other commits allocate one private recovery directory before mutation. Public
+/// names are never unlinked or blindly swapped during compensation.
+///
+/// Exact residual windows: (a) a same-user process discovering the random private
+/// directory can replace a slot between its identity check and final unlink;
+/// (b) public names are briefly vacant during undo, so concurrent creates keep
+/// displaced objects in recovery with uncertain_outcome; (c) exchange-less
+/// plain-rename replace retains its race (overwrite rename is refused); (d) a
+/// crash leaves recovery/staging names (or both links during link fallback).
+/// Other Unix no-replace fallbacks retain their precommit existence-check race.
+/// See `recovery` for bounds and manual recovery; no automatic sweep runs.
+/// Case-only rename has the separate check-to-rename residual in
+/// `same_object_rename`; it neither replaces a checked object nor compensates.
 fn commit_rename(
+    ops: &FileOps,
     from: &Resolved,
     to: &Resolved,
     overwrite: bool,
     src: &Stat,
     dst: Option<&Stat>,
+) -> FileResult<Vec<String>> {
+    if overwrite && let Some(dst) = dst {
+        let from_dir = Stat::from_raw(&fstat(from.dir.as_fd()).map_err(FileError::errno)?);
+        let to_dir = Stat::from_raw(&fstat(to.dir.as_fd()).map_err(FileError::errno)?);
+        match same_object_rename(src, dst, &from_dir, &from.name, &to_dir, &to.name) {
+            SameObjectRename::Refuse => {
+                return Err(FileError::invalid(
+                    "source and destination are the same file",
+                ));
+            }
+            SameObjectRename::CaseOnlyRename => {
+                renameat(
+                    from.dir.as_fd(),
+                    from.name.as_os_str(),
+                    to.dir.as_fd(),
+                    to.name.as_os_str(),
+                )
+                .map_err(FileError::errno)?;
+                return Ok(Vec::new());
+            }
+            SameObjectRename::NotSameObject => {}
+        }
+    }
+    let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path)?;
+    let result = match (overwrite, dst) {
+        (true, Some(dst)) => exchange_over(ops, &mut recovery, from, to, src, dst),
+        _ => {
+            // Track the actual candidate after the final hook as well as the
+            // checked source. This snapshot is never authority to unlink a
+            // public name; it only permits NOREPLACE restoration from recovery.
+            let candidate = from.lstat();
+            match candidate {
+                Ok(Some(candidate)) => move_no_replace(ops, &mut recovery, from, to, src)
+                    .and_then(|()| verify_moved(ops, &mut recovery, from, to, src, &candidate)),
+                Ok(None) => Err(FileError::conflict("gone")),
+                Err(error) => Err(error),
+            }
+        }
+    };
+    let recovered = recovery.finish();
+    match result {
+        Ok(()) => Ok(recovered),
+        Err(error) if error.code == ErrorCode::UncertainOutcome || !recovery.settled() => {
+            Err(recovery.uncertain())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Capture a post-move mismatch. Restore only the candidate identity observed
+/// before the move, using NOREPLACE; newer destination successors stay in recovery.
+fn verify_moved(
+    ops: &FileOps,
+    recovery: &mut RecoveryDir,
+    from: &Resolved,
+    to: &Resolved,
+    src: &Stat,
+    candidate: &Stat,
 ) -> FileResult<()> {
-    match (overwrite, dst) {
-        (true, Some(dst)) => exchange_over(from, to, src, dst),
+    let _ = ops.step(Step::Moved);
+    match to.lstat() {
+        Ok(Some(now)) if now.same_object(src) => Ok(()),
         _ => {
-            move_no_replace(from, to, src)?;
-            verify_moved(from, to, src)
+            if let Some(slot) = recovery.capture(&to.dir, &to.name, &to.full_path()) {
+                let _ = ops.step(Step::Captured);
+                if recovery.holds(&slot, candidate)
+                    && recovery.restore(&slot, &from.dir, &from.name, &from.full_path())
+                {
+                    let _ = ops.step(Step::Restored);
+                    recovery.finish();
+                    if recovery.settled() {
+                        return Err(FileError::conflict("replaced"));
+                    }
+                }
+            }
+            Err(recovery.uncertain())
         }
     }
 }
 
-/// After a move: the destination name must hold the source object.
-fn verify_moved(from: &Resolved, to: &Resolved, src: &Stat) -> FileResult<()> {
-    match to.lstat()? {
-        Some(now) if now.same_object(src) => Ok(()),
-        _ => {
-            // Another object was moved. Put it back when nothing took its place.
-            let _ = move_no_replace(to, from, src);
-            Err(FileError::conflict("replaced"))
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn unsupported_atomic() -> FileError {
-    FileError::new(
-        ErrorCode::Unsupported,
-        "this filesystem has no atomic no-replace rename for directories",
-    )
-}
-
-/// Rename without replacing an existing destination, atomically.
-fn move_no_replace(from: &Resolved, to: &Resolved, src: &Stat) -> FileResult<()> {
-    #[cfg(target_os = "linux")]
-    {
-        use nix::fcntl::{RenameFlags, renameat2};
-        match renameat2(
-            from.dir.as_fd(),
-            from.name.as_os_str(),
-            to.dir.as_fd(),
-            to.name.as_os_str(),
-            RenameFlags::RENAME_NOREPLACE,
-        ) {
-            Ok(()) => return Ok(()),
-            Err(Errno::EEXIST) => return Err(exists_error()),
-            Err(Errno::EINVAL | Errno::ENOSYS) => {}
-            Err(errno) => return Err(FileError::errno(errno)),
-        }
+/// Rename without replacing an existing destination. The link fallback also
+/// captures its source before disposal, and captures its destination on undo.
+fn move_no_replace(
+    ops: &FileOps,
+    recovery: &mut RecoveryDir,
+    from: &Resolved,
+    to: &Resolved,
+    src: &Stat,
+) -> FileResult<()> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    match no_replace(
+        from.dir.as_fd(),
+        from.name.as_os_str(),
+        to.dir.as_fd(),
+        to.name.as_os_str(),
+        Primitive::Move,
+    ) {
+        Ok(()) => return Ok(()),
+        Err(Errno::EEXIST) => return Err(exists_error()),
+        Err(errno) if is_unsupported(errno) => {}
+        Err(errno) => return Err(FileError::errno(errno)),
     }
     if src.kind() == Kind::Dir {
-        #[cfg(target_os = "linux")]
-        return Err(unsupported_atomic());
-        // Non-Linux: no atomic primitive for directories; existence was checked.
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        return Err(FileError::new(
+            ErrorCode::Unsupported,
+            "this filesystem has no atomic no-replace rename for directories",
+        ));
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         return renameat(
             from.dir.as_fd(),
             from.name.as_os_str(),
@@ -289,7 +600,6 @@ fn move_no_replace(from: &Resolved, to: &Resolved, src: &Stat) -> FileResult<()>
         )
         .map_err(FileError::errno);
     }
-    // link + unlink: `linkat` fails with EEXIST instead of replacing.
     match linkat(
         from.dir.as_fd(),
         from.name.as_os_str(),
@@ -299,8 +609,6 @@ fn move_no_replace(from: &Resolved, to: &Resolved, src: &Stat) -> FileResult<()>
     ) {
         Ok(()) => {}
         Err(Errno::EEXIST) => return Err(exists_error()),
-        // A filesystem without hard links (FAT, some network shares): the
-        // existence check above is all that guards the destination there.
         Err(Errno::EPERM | Errno::ENOTSUP | Errno::EMLINK) => {
             return renameat(
                 from.dir.as_fd(),
@@ -312,22 +620,30 @@ fn move_no_replace(from: &Resolved, to: &Resolved, src: &Stat) -> FileResult<()>
         }
         Err(errno) => return Err(FileError::errno(errno)),
     }
-    match from.lstat()? {
-        Some(now) if now.same_object(src) => unlinkat(
-            from.dir.as_fd(),
-            from.name.as_os_str(),
-            UnlinkatFlags::NoRemoveDir,
-        )
-        .map_err(FileError::errno),
-        _ => {
-            // The source name changed hands: undo our new link, keep theirs.
-            let _ = unlinkat(
-                to.dir.as_fd(),
-                to.name.as_os_str(),
-                UnlinkatFlags::NoRemoveDir,
-            );
-            Err(FileError::conflict("replaced"))
-        }
+    let _ = ops.step(Step::Linked);
+    let Some(x) = recovery.capture(&from.dir, &from.name, &from.full_path()) else {
+        recovery.record_public(&to.dir, &to.name, &to.full_path());
+        return Err(recovery.uncertain());
+    };
+    let _ = ops.step(Step::Captured);
+    if recovery.holds(&x, src) && matches!(to.lstat(), Ok(Some(now)) if now.same_object(src)) {
+        recovery.dispose(ops, &x, src);
+        return Ok(());
+    }
+    // Keep the actual source under its original name if still vacant. Remove
+    // the new link only when the captured object proves it is our source.
+    if recovery.restore(&x, &from.dir, &from.name, &from.full_path()) {
+        let _ = ops.step(Step::Restored);
+    }
+    if let Some(y) = recovery.capture(&to.dir, &to.name, &to.full_path()) {
+        let _ = ops.step(Step::Captured);
+        recovery.dispose(ops, &y, src);
+    }
+    recovery.finish();
+    if recovery.settled() {
+        Err(FileError::conflict("replaced"))
+    } else {
+        Err(recovery.uncertain())
     }
 }
 
@@ -369,52 +685,61 @@ mod exchange_error_tests {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn exchange_over(from: &Resolved, to: &Resolved, src: &Stat, dst: &Stat) -> FileResult<()> {
-    let swap = || {
-        exchange(
-            from.dir.as_fd(),
-            from.name.as_os_str(),
-            to.dir.as_fd(),
-            to.name.as_os_str(),
-        )
+fn exchange_over(
+    ops: &FileOps,
+    recovery: &mut RecoveryDir,
+    from: &Resolved,
+    to: &Resolved,
+    src: &Stat,
+    dst: &Stat,
+) -> FileResult<()> {
+    exchange(from.dir.as_fd(), &from.name, to.dir.as_fd(), &to.name)
+        .map_err(overwrite_exchange_error)?;
+    let _ = ops.step(Step::Exchanged);
+    let Some(x) = recovery.capture(&from.dir, &from.name, &from.full_path()) else {
+        recovery.record_public(&to.dir, &to.name, &to.full_path());
+        return Err(recovery.uncertain());
     };
-    match swap() {
-        Ok(()) => {}
-        Err(errno) => return Err(overwrite_exchange_error(errno)),
+    let _ = ops.step(Step::Captured);
+    let moved_ok = matches!(to.lstat(), Ok(Some(now)) if now.same_object(src));
+    if recovery.holds(&x, dst) && moved_ok {
+        recovery.dispose(ops, &x, dst);
+        return Ok(());
     }
-    let moved_ok = matches!(to.lstat(), Ok(Some(ref now)) if now.same_object(src));
-    let old_ok = matches!(from.lstat(), Ok(Some(ref now)) if now.same_object(dst));
-    if !(moved_ok && old_ok) {
-        // A different object was in play: exchange back, refuse.
-        let _ = swap();
-        return Err(FileError::conflict("replaced"));
+    let y = recovery.capture(&to.dir, &to.name, &to.full_path());
+    if y.is_some() {
+        let _ = ops.step(Step::Captured);
     }
-    unlinkat(
-        from.dir.as_fd(),
-        from.name.as_os_str(),
-        UnlinkatFlags::NoRemoveDir,
-    )
-    .map_err(FileError::errno)
+    if recovery.restore(&x, &to.dir, &to.name, &to.full_path()) {
+        let _ = ops.step(Step::Restored);
+    }
+    if let Some(y) = y
+        && recovery.holds(&y, src)
+        && recovery.restore(&y, &from.dir, &from.name, &from.full_path())
+    {
+        let _ = ops.step(Step::Restored);
+    }
+    recovery.finish();
+    if recovery.settled() {
+        Err(FileError::conflict("replaced"))
+    } else {
+        Err(recovery.uncertain())
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn exchange_over(from: &Resolved, to: &Resolved, src: &Stat, _dst: &Stat) -> FileResult<()> {
-    renameat(
-        from.dir.as_fd(),
-        from.name.as_os_str(),
-        to.dir.as_fd(),
-        to.name.as_os_str(),
-    )
-    .map_err(FileError::errno)?;
-    verify_moved_after(to, src)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn verify_moved_after(to: &Resolved, src: &Stat) -> FileResult<()> {
-    match to.lstat()? {
-        Some(now) if now.same_object(src) => Ok(()),
-        _ => Err(FileError::conflict("replaced")),
-    }
+fn exchange_over(
+    _ops: &FileOps,
+    _recovery: &mut RecoveryDir,
+    _from: &Resolved,
+    _to: &Resolved,
+    _src: &Stat,
+    _dst: &Stat,
+) -> FileResult<()> {
+    Err(FileError::new(
+        ErrorCode::Unsupported,
+        "this platform cannot replace a destination atomically",
+    ))
 }
 
 pub(crate) fn mkdir(ops: &FileOps, args: &MkdirArgs, cancel: &Cancel) -> FileResult<MkdirResult> {

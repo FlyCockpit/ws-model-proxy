@@ -5,23 +5,77 @@ use std::os::fd::AsFd;
 
 use nix::errno::Errno;
 
-// Test seam: make the next exchange on THIS thread fail with an errno, so the
-// callers' handling of each errno class is exercised on any platform.
-#[cfg(test)]
-thread_local! {
-    pub(super) static INJECTED: std::cell::Cell<Option<Errno>> = const { std::cell::Cell::new(None) };
+/// Faults are thread-local, indexed by the Nth call of each primitive. Production
+/// calls are no-ops. A test scope resets counts and faults on entry and exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Primitive {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Exchange,
+    Capture,
+    Restore,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    Move,
+    Unlink,
+    Rmdir,
 }
 
+#[cfg(test)]
+type FaultState = (Vec<(Primitive, usize, Errno)>, Vec<Primitive>);
+
+#[cfg(test)]
+thread_local! {
+    static FAULTS: std::cell::RefCell<FaultState> = const {
+        std::cell::RefCell::new((Vec::new(), Vec::new()))
+    };
+}
+
+pub(super) fn fault(primitive: Primitive) -> Result<(), Errno> {
+    #[cfg(not(test))]
+    let _ = primitive;
+    #[cfg(test)]
+    return FAULTS.with(|state| {
+        let mut state = state.borrow_mut();
+        state.1.push(primitive);
+        let nth = state.1.iter().filter(|p| **p == primitive).count();
+        match state
+            .0
+            .iter()
+            .find(|(p, n, _)| *p == primitive && *n == nth)
+        {
+            Some((_, _, errno)) => Err(*errno),
+            None => Ok(()),
+        }
+    });
+    #[cfg(not(test))]
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) struct FaultScope;
+
+#[cfg(test)]
+impl FaultScope {
+    pub(super) fn new(faults: &[(Primitive, usize, Errno)]) -> Self {
+        FAULTS.with(|state| *state.borrow_mut() = (faults.to_vec(), Vec::new()));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for FaultScope {
+    fn drop(&mut self) {
+        FAULTS.with(|state| *state.borrow_mut() = (Vec::new(), Vec::new()));
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn exchange(
     dir_from: impl AsFd,
     from: &OsStr,
     dir_to: impl AsFd,
     to: &OsStr,
 ) -> Result<(), Errno> {
-    #[cfg(test)]
-    if let Some(errno) = INJECTED.with(std::cell::Cell::take) {
-        return Err(errno);
-    }
+    fault(Primitive::Exchange)?;
     #[cfg(target_os = "linux")]
     {
         use nix::fcntl::{RenameFlags, renameat2};
@@ -35,13 +89,41 @@ pub(super) fn exchange(
     }
 }
 
+/// Never fall back to a replacing rename for compensation.
+pub(super) fn no_replace(
+    dir_from: impl AsFd,
+    from: &OsStr,
+    dir_to: impl AsFd,
+    to: &OsStr,
+    primitive: Primitive,
+) -> Result<(), Errno> {
+    fault(primitive)?;
+    #[cfg(target_os = "linux")]
+    {
+        use nix::fcntl::{RenameFlags, renameat2};
+        renameat2(dir_from, from, dir_to, to, RenameFlags::RENAME_NOREPLACE)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use rustix::fs::{RenameFlags, renameat_with};
+        renameat_with(dir_from, from, dir_to, to, RenameFlags::NOREPLACE)
+            .map_err(|errno| Errno::from_raw(errno.raw_os_error()))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (dir_from, from, dir_to, to);
+        Err(Errno::ENOSYS)
+    }
+}
+
 /// Only these errors permit the caller's unsupported-exchange policy.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn is_unsupported(errno: Errno) -> bool {
     matches!(errno, Errno::EINVAL | Errno::ENOSYS)
         || (cfg!(target_os = "macos") && errno == Errno::ENOTSUP)
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
 

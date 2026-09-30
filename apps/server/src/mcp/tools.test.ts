@@ -2442,6 +2442,64 @@ describe("CLI file tools", () => {
     expect(structured(result).error?.code).toBe("conflict");
   });
 
+  it("reports uncertain recovery with a fixed message and scrubs every path", async () => {
+    fileRuntime.runFileOp.mockResolvedValueOnce({
+      ok: false,
+      code: "uncertain_outcome",
+      outcome: "unknown",
+      detail: {
+        recovery: "/workspace/.wsmp-recover-a1b2c3d4e5",
+        kept: ["/workspace/wsmp_cli_abcdef0123456789xyz/slot-1"],
+      },
+    });
+    const result = await call("forwarder_cli_file_edit", {
+      cliDeviceId: "cli-1",
+      path: "~/a",
+      edits: [{ oldText: "a", newText: "b" }],
+      confirm: "RUN",
+    });
+    expect(result.isError).toBe(true);
+    expect(structured(result).error).toMatchObject({
+      code: "uncertain_outcome",
+      outcome: "unknown",
+      recovery: "/workspace/.wsmp-recover-a1b2c3d4e5",
+    });
+    expect(resultText(result)).toContain("The file outcome is uncertain; inspect recovery");
+    expect(JSON.stringify(result)).not.toMatch(/wsmp_cli_[A-Za-z0-9]{6,}/);
+    expect(structured(result).error?.kept).toHaveLength(1);
+  });
+
+  it("passes recovered paths through edit, write and rename success projections", async () => {
+    const recovered = ["/workspace/.wsmp-recover-a1b2c3d4e5/slot-1"];
+    const etag = "h:AAAAAAAAAAAAAAAAAAAAAA";
+    const cases = [
+      [
+        "edit",
+        "forwarder_cli_file_edit",
+        { path: "~/a", edits: [{ oldText: "a", newText: "b" }], confirm: "RUN" },
+        { etag, previousEtag: etag, added: 1, removed: 1, applied: true, recovered },
+      ],
+      [
+        "write",
+        "forwarder_cli_file_write",
+        { path: "~/a", content: "b", confirm: "RUN" },
+        { etag, size: 1, created: true, recovered },
+      ],
+      [
+        "rename",
+        "forwarder_cli_file_rename",
+        { from: "~/a", to: "~/b", confirm: "RUN" },
+        { etag, recovered },
+      ],
+    ] as const;
+    for (const [op, tool, args, result] of cases) {
+      fileRuntime.runFileOp.mockResolvedValueOnce({ ok: true, op, result });
+      const response = await call(tool, { cliDeviceId: "cli-1", ...args });
+      expect(response.isError).not.toBe(true);
+      expect(structured(response).result?.recovered).toEqual(recovered);
+    }
+  });
+
   it("keeps unchanged:true in the ifNoneMatch answer", async () => {
     fileRuntime.runFileOp.mockResolvedValue({
       ok: true,
