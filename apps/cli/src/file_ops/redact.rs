@@ -617,6 +617,209 @@ fn pem_events(line: &str) -> Vec<(bool, &str)> {
     events
 }
 
+/// Bounded carry for one overlong terminal-cleaned line. Piece boundaries are
+/// never interpreted as blank lines, dedents, or quote boundaries. This uses
+/// the same recognizers as `LineMasker`; only recovery is conservative.
+#[derive(Default)]
+pub(crate) struct SameLineCarry {
+    pem_tail: String,
+    pem_open: std::collections::BTreeMap<String, usize>,
+    state_cost: usize,
+    live_input: usize,
+    word_tail: String,
+    word_len: usize,
+    dash_word: bool,
+    saw_name: bool,
+    saw_flag: bool,
+    flag_delimiter: Option<String>,
+    quote: Option<char>,
+    escaped: bool,
+    last: Option<char>,
+    unrepresentable: bool,
+}
+
+impl SameLineCarry {
+    // Labels have no bound in files. Streaming output fails closed when a
+    // marker cannot fit this bounded overlap, rather than dropping its opener.
+    pub(crate) const OVERLAP: usize = 1024;
+
+    pub(crate) fn feed(&mut self, piece: &str, input_bytes: usize, state_limit: usize) {
+        if self.unrepresentable {
+            return;
+        }
+        for ch in piece.chars() {
+            if let Some(mut candidate) = self.flag_delimiter.take() {
+                candidate.push(ch);
+                self.saw_flag |= FLAG.is_match(&candidate);
+            }
+            if !ch.is_whitespace() {
+                self.last = Some(ch);
+            }
+            if self.escaped {
+                self.escaped = false;
+            } else if ch == '\\' {
+                self.escaped = true;
+            } else {
+                match self.quote {
+                    Some(quote) if quote == ch => self.quote = None,
+                    None if matches!(ch, '\'' | '"') => self.quote = Some(ch),
+                    _ => {}
+                }
+            }
+            if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') {
+                if self.word_len == 0 {
+                    self.dash_word = ch == '-';
+                }
+                self.word_len = self.word_len.saturating_add(1);
+                self.word_tail.push(ch);
+                if self.word_tail.len() > 64 {
+                    self.word_tail.remove(0);
+                }
+            } else {
+                self.finish_word(Some(ch));
+            }
+        }
+        self.pem_tail.push_str(piece);
+        loop {
+            let Some(start) = self.pem_tail.find("-----") else {
+                let mut cut = self.pem_tail.len().saturating_sub(4);
+                while !self.pem_tail.is_char_boundary(cut) {
+                    cut += 1;
+                }
+                self.pem_tail.drain(..cut);
+                break;
+            };
+            self.pem_tail.drain(..start);
+            let rest = &self.pem_tail[5..];
+            let prefix = if rest.starts_with("BEGIN ") {
+                Some(11)
+            } else if rest.starts_with("END ") {
+                Some(9)
+            } else if "BEGIN ".starts_with(rest) || "END ".starts_with(rest) {
+                break;
+            } else {
+                None
+            };
+            let Some(label_at) = prefix else {
+                self.pem_tail.drain(..5);
+                continue;
+            };
+            let Some(end) = self.pem_tail[label_at..].find("-----") else {
+                if self.pem_tail.len() > Self::OVERLAP {
+                    self.unrepresentable = true;
+                    self.pem_tail.clear();
+                }
+                break;
+            };
+            let close_at = label_at + end;
+            // Keep the closing dashes: they may introduce the adjacent marker.
+            let marker_end = close_at + 5;
+            if marker_end > Self::OVERLAP {
+                self.unrepresentable = true;
+                self.pem_tail.clear();
+                break;
+            }
+            for (begin, label) in pem_events(&self.pem_tail[..marker_end]) {
+                if begin {
+                    let count = self.pem_open.entry(label.to_owned()).or_default();
+                    *count += 1;
+                    // Charge complete opener input, including its terminator.
+                    self.state_cost = self.state_cost.saturating_add(label.len() + 17);
+                } else if let Some(count) = self.pem_open.get_mut(label) {
+                    *count -= 1;
+                    self.state_cost = self.state_cost.saturating_sub(label.len() + 17);
+                    if *count == 0 {
+                        self.pem_open.remove(label);
+                    }
+                }
+            }
+            self.pem_tail.drain(..close_at);
+            if self.state_cost > state_limit {
+                self.unrepresentable = true;
+                self.pem_open.clear();
+                break;
+            }
+        }
+        if !self.pem_open.is_empty() || ((self.saw_name || self.saw_flag) && self.quote.is_some()) {
+            self.live_input = self.live_input.saturating_add(input_bytes);
+        } else {
+            self.live_input = 0;
+        }
+        if self.live_input > state_limit {
+            self.unrepresentable = true;
+            self.pem_open.clear();
+        }
+    }
+
+    fn finish_word(&mut self, delimiter: Option<char>) {
+        if self.word_len == 0 {
+            return;
+        }
+        if self.dash_word {
+            if let Some(delimiter) = delimiter {
+                let candidate = format!("{}{delimiter}", self.word_tail);
+                self.saw_flag |= FLAG.is_match(&candidate);
+                // FLAG also accepts escaped n/r/t or quote-comma delimiters.
+                // Carry their unfinished first character across piece cuts.
+                if matches!(delimiter, '\\' | '\'' | '"') {
+                    self.flag_delimiter = Some(candidate);
+                }
+            }
+        } else {
+            // Retain a public prefix on truncated words: bare PASSWORD is only
+            // a name when it was the complete word, whereas suffixes still match.
+            let candidate = if self.word_len > self.word_tail.len() {
+                format!("x{}", self.word_tail)
+            } else {
+                self.word_tail.clone()
+            };
+            self.saw_name |= first_secret_name(&candidate).is_some();
+        }
+        self.word_tail.clear();
+        self.word_len = 0;
+    }
+
+    pub(crate) fn recover(mut self, masker: &mut LineMasker) -> Option<usize> {
+        self.finish_word(None);
+        if self.unrepresentable {
+            return None;
+        }
+        let cost = self.state_cost.max(self.live_input);
+        for (label, count) in std::mem::take(&mut self.pem_open) {
+            let opener = format!("-----BEGIN {label}-----");
+            for _ in 0..count {
+                let _ = masker.scan(&opener);
+            }
+        }
+        if (self.saw_name || self.saw_flag) && (self.quote.is_some() || self.last == Some('\\')) {
+            let _ = masker.scan("X_TOKEN=\"");
+        }
+        Some(cost)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pem_tail_len(&self) -> usize {
+        self.pem_tail.len()
+    }
+
+    pub(crate) fn unrepresentable(&self) -> bool {
+        self.unrepresentable
+    }
+}
+
+impl Drop for SameLineCarry {
+    fn drop(&mut self) {
+        if let Some(candidate) = self.flag_delimiter.take() {
+            let mut bytes = candidate.into_bytes();
+            bytes.fill(0);
+        }
+        for text in [&mut self.pem_tail, &mut self.word_tail] {
+            let mut bytes = std::mem::take(text).into_bytes();
+            bytes.fill(0);
+        }
+    }
+}
+
 fn indent_of(line: &str) -> usize {
     line.len() - line.trim_start().len()
 }
@@ -717,6 +920,12 @@ impl LineMasker {
     /// the following lines are masked until it ends.
     pub fn in_continuation(&self) -> bool {
         self.until_blank.is_some() || !self.blocks.is_empty() || !self.pem_open.is_empty()
+    }
+
+    /// Content constructs cannot be explained by a synthetic column-0 recovery
+    /// token. They must survive another overlong-line transition as real state.
+    pub(crate) fn has_content_continuation(&self) -> bool {
+        self.until_blank.is_some() || !self.pem_open.is_empty()
     }
 
     /// Advance the state over a line that is not valid UTF-8 (context before a

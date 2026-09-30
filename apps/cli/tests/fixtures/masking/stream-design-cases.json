@@ -1,0 +1,266 @@
+[
+  {
+    "name": "long-pem-unbroken",
+    "input": "-----BEGIN RSA PRIVATE KEY-----\nbody-one107\nbody-two107\nbody-three107\n-----END RSA PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "hidden": ["body-two107", "body-three107"]
+  },
+  {
+    "name": "long-quote-unbroken",
+    "input": " APP_TOKEN=\"start\nquote-one107\nquote-two107\nquote-three107\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nvisible\n",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "hidden": ["quote-two107", "quote-three107"]
+  },
+  {
+    "name": "long-backslash-unbroken",
+    "input": " run --api-key \\\ncont-one107\ncont-two107\ncont-three107\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nvisible\n",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "hidden": ["cont-two107", "cont-three107"]
+  },
+  {
+    "name": "long-pem-word",
+    "input": "-----BEGIN RSA PRIVATE KEY-----\nbody-one107\nbody-two107\nbody-three107\n-----END RSA PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "prefix": "word ",
+    "prefixRepeat": 29,
+    "hidden": ["body-two107", "body-three107"]
+  },
+  {
+    "name": "long-quote-word",
+    "input": " APP_TOKEN=\"start\nquote-one107\nquote-two107\nquote-three107\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nvisible\n",
+    "prefix": "word ",
+    "prefixRepeat": 29,
+    "hidden": ["quote-two107", "quote-three107"]
+  },
+  {
+    "name": "long-backslash-word",
+    "input": " run --api-key \\\ncont-one107\ncont-two107\ncont-three107\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n\nvisible\n",
+    "prefix": "word ",
+    "prefixRepeat": 29,
+    "hidden": ["cont-two107", "cont-three107"]
+  },
+  {
+    "name": "pem-crossing-piece",
+    "input": "-----BEGIN RSA PRIVATE KEY-----\nbody-one107\nbody-two107\n-----END RSA PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "prefix": "z",
+    "prefixRepeat": 123,
+    "hidden": ["body-two107"]
+  },
+  {
+    "name": "pem-duplicate",
+    "input": "-----BEGIN RSA PRIVATE KEY----- -----BEGIN RSA PRIVATE KEY-----\nbody-one107\n-----END RSA PRIVATE KEY-----\nbody-two107\n-----END RSA PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "hidden": ["body-two107"]
+  },
+  {
+    "name": "pem-mismatched-nested",
+    "input": "-----BEGIN RSA PRIVATE KEY----- -----BEGIN EC PRIVATE KEY-----\nbody-one107\n-----END DSA PRIVATE KEY-----\n-----END RSA PRIVATE KEY-----\nbody-two107\n-----END EC PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "hidden": ["body-two107"]
+  },
+  {
+    "name": "pem-adjacent",
+    "input": "-----BEGIN RSA PRIVATE KEY-----END RSA PRIVATE KEY-----BEGIN EC PRIVATE KEY-----\nbody-one107\nbody-two107\n-----END EC PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "hidden": ["body-two107"]
+  },
+  {
+    "name": "long-malformed-open-quote",
+    "input": " APP_TOKEN=\"start\\\"still\nquote-one107\nquote-two107\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "hidden": ["quote-two107"]
+  },
+  {
+    "name": "long-pem-crlf-eof",
+    "input": "-----BEGIN RSA PRIVATE KEY-----\r\nbody-one107\r\nbody-two107",
+    "expected": "⟦redacted line⟧\r\n⟦redacted⟧\r\n⟦redacted⟧",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "hidden": ["body-two107"]
+  },
+  {
+    "name": "oversized-pem-label",
+    "input": "-----BEGIN aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa PRIVATE KEY-----\nfirst\nsecond\nthird\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "hidden": []
+  },
+  {
+    "name": "colored-name",
+    "input": "DB_\u001b[0m\u001b[1m\u001b[31mPASSWORD\u001b[0m=namebody107\r\nnext\nvisible\n",
+    "expected": "⟦redacted line⟧\r\n⟦redacted line⟧\nvisible\n",
+    "prefix": "",
+    "prefixRepeat": 0,
+    "hidden": ["namebody107"]
+  },
+  {
+    "name": "colored-flag",
+    "input": "run --api-\u001b[31mkey\u001b[0m flagbody107\nvisible\n",
+    "expected": "run --api-key ⟦redacted:11⟧\nvisible\n",
+    "prefix": "",
+    "prefixRepeat": 0,
+    "hidden": ["flagbody107"]
+  },
+  {
+    "name": "colored-pem",
+    "input": "-----BEGIN RSA PRI\u001b[31mVATE KEY\u001b[0m-----\nbody-one107\nbody-two107\n-----END RSA PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "prefix": "",
+    "prefixRepeat": 0,
+    "hidden": ["body-two107"]
+  },
+  {
+    "name": "git-grep-cr",
+    "input": "\rcompose.yml: DB_\u001b[31mPASSWORD\u001b[0m=gitbody107\r\nnext\r\nvisible\r\n",
+    "expected": "⟦redacted line⟧\r\n⟦redacted line⟧\r\nvisible\r\n",
+    "prefix": "",
+    "prefixRepeat": 0,
+    "hidden": ["gitbody107"]
+  },
+  {
+    "name": "clean-indent",
+    "input": "\u001b[31m   APP_SECRET\u001b[0m:\n    first107\n    second107\n   visible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n   visible\n",
+    "prefix": "",
+    "prefixRepeat": 0,
+    "hidden": ["second107"]
+  },
+  {
+    "name": "cross-line-osc",
+    "input": "DB_\u001b]hidden\r\n\u0007PASSWORD=joinedbody107\nnext\nvisible\n",
+    "expected": "⟦redacted line⟧\r\n⟦redacted line⟧\n⟦redacted line⟧\nvisible\n",
+    "prefix": "",
+    "prefixRepeat": 0,
+    "hidden": ["joinedbody107"]
+  },
+  {
+    "name": "cross-line-apc",
+    "input": "DB_\u001b_hidden\r\n\u001b\\PASSWORD=joinedbody107\nnext\nvisible\n",
+    "expected": "⟦redacted line⟧\r\n⟦redacted line⟧\n⟦redacted line⟧\nvisible\n",
+    "prefix": "",
+    "prefixRepeat": 0,
+    "hidden": ["joinedbody107"]
+  },
+  {
+    "name": "cross-line-dcs",
+    "input": "DB_\u001bPqhidden\r\n\u001b\\PASSWORD=joinedbody107\nnext\nvisible\n",
+    "expected": "⟦redacted line⟧\r\n⟦redacted line⟧\n⟦redacted line⟧\nvisible\n",
+    "prefix": "",
+    "prefixRepeat": 0,
+    "hidden": ["joinedbody107"]
+  },
+  {
+    "name": "cross-line-c1-osc",
+    "input": "DB_hidden\r\nPASSWORD=joinedbody107\nnext\nvisible\n",
+    "expected": "⟦redacted line⟧\r\n⟦redacted line⟧\n⟦redacted line⟧\nvisible\n",
+    "prefix": "",
+    "prefixRepeat": 0,
+    "hidden": ["joinedbody107"]
+  },
+  {
+    "name": "cancelled-sequence",
+    "input": "DB_PASS\u001b[31\u0018WORD=cancelbody107\nnext\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\nvisible\n",
+    "prefix": "",
+    "prefixRepeat": 0,
+    "hidden": ["cancelbody107"]
+  },
+  {
+    "name": "malformed-csi",
+    "input": "DB_PASS\u001b[31 WORD=malformedbody107\nnext\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\nvisible\n",
+    "prefix": "",
+    "prefixRepeat": 0,
+    "hidden": ["malformedbody107"]
+  },
+  {
+    "name": "long-colored-pem",
+    "input": "-----BEGIN RSA PRI\u001b[31mVATE KEY\u001b[0m-----\nbody-one107\nbody-two107\n-----END RSA PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "hidden": ["body-two107"]
+  },
+  {
+    "name": "overlong-terminal-string",
+    "input": "DB_PASS\u001b]hhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhhh\n\u0007WORD=hiddenbody107\nfirst\nsecond\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\nsecond\nvisible\n",
+    "prefix": "",
+    "prefixRepeat": 0,
+    "hidden": ["hiddenbody107"]
+  },
+  {
+    "name": "carried-pem-before-second-overlong",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "input": "-----BEGIN RSA PRIVATE KEY-----\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\nbody-one107\nbody-two107\n-----END RSA PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n",
+    "hidden": ["body-two107"]
+  },
+  {
+    "name": "pem-end-before-begin",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "input": "-----END RSA PRIVATE KEY-----BEGIN RSA PRIVATE KEY-----\nbody-one107\nbody-two107\n-----END RSA PRIVATE KEY-----\nafter\n",
+    "expected": "⟦redacted line⟧\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
+    "hidden": ["body-two107"]
+  },
+  {
+    "name": "colored-flag-hf-alias",
+    "prefix": "",
+    "prefixRepeat": 0,
+    "input": "run --hf-\u001b[31mtoken\u001b[0m aliasbody107\nvisible\n",
+    "expected": "run --hf-token ⟦redacted:12⟧\nvisible\n",
+    "hidden": ["aliasbody107"]
+  },
+  {
+    "name": "long-escaped-flag-delimiter",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "input": " run --api-key\\n\"start\ncont-one107\ncont-two107\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
+    "hidden": ["cont-two107"]
+  },
+  {
+    "name": "long-quoted-comma-flag-delimiter",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "input": " run '--api-key', \"start\ncont-one107\ncont-two107\n\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\nvisible\n",
+    "hidden": ["cont-two107"]
+  },
+  {
+    "name": "bom-flag",
+    "input": "﻿--api-key flag-value-one-107 --port 80\n--max-tokens 4096\n",
+    "expected": "--api-key ⟦redacted:28⟧\n--max-tokens 4096\n",
+    "prefix": "",
+    "prefixRepeat": 0,
+    "hidden": ["flag-value-one-107"]
+  },
+  {
+    "name": "long-dash-prefixed-flag",
+    "input": " ---api-key \"open\nnext\nvisible\n",
+    "expected": "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n",
+    "prefix": "z",
+    "prefixRepeat": 140,
+    "hidden": []
+  }
+]

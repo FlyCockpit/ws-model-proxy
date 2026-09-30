@@ -313,6 +313,13 @@ describe("MCP tool manifest — exact catalog", () => {
       const description = MCP_TOOL_MANIFEST.find((entry) => entry.name === name)?.descriptionNote;
       for (const phrase of [
         "secret-name tokens",
+        "scans the terminal-cleaned view",
+        "retain openers across piece boundaries",
+        "openers found on that line carry into recovery",
+        "quote/backslash runs continue to a blank line",
+        "unmasked lines keep their raw bytes",
+        "Terminal parser state carries across lines",
+        "The server cleanText still runs afterwards",
         "following non-blank line",
         "private key blocks",
         "--api-key/--hf-token",
@@ -321,8 +328,9 @@ describe("MCP tool manifest — exact catalog", () => {
         "not a security boundary",
         "A line over 64 KiB is masked whole",
         "inside a live multi-line secret run",
-        "the next non-blank line and subsequent lines indented deeper than column 0 are masked and normal scanning resumes",
-        "Two accepted residuals fail closed through EOF",
+        "The next non-blank line and subsequent lines indented deeper than column 0 are masked and normal scanning resumes",
+        "Opaque fallbacks stay closed through EOF",
+        "a PEM marker exceeding the 1 KiB recovery overlap",
         "more than 1 MiB of live masking-state input",
         "an over-long line inside such a run",
       ]) {

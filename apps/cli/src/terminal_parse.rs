@@ -139,6 +139,7 @@ fn next_state(state: u8, code: u32) -> u8 {
 #[derive(Debug, Clone, Copy)]
 pub struct TerminalByteState {
     state: u8,
+    decoded_any: bool,
     needed: u8,
     seen: u8,
     code_point: u32,
@@ -150,6 +151,7 @@ impl Default for TerminalByteState {
     fn default() -> Self {
         Self {
             state: GROUND,
+            decoded_any: false,
             needed: 0,
             seen: 0,
             code_point: 0,
@@ -167,9 +169,45 @@ impl TerminalByteState {
 
     /// Feeds one byte (WHATWG UTF-8 decoding, U+FFFD for invalid input).
     pub fn feed(&mut self, byte: u8) {
+        self.decode(byte, &mut |_| {});
+    }
+
+    /// Appends exactly the text retained by the server's terminal/control filter.
+    /// State, including partial UTF-8, survives both pieces and physical LFs.
+    pub fn feed_clean(&mut self, byte: u8, out: &mut String) {
+        self.decode(byte, &mut |ch| out.push(ch));
+    }
+
+    /// WHATWG decoding emits a replacement for an incomplete final character.
+    pub fn finish_clean(&mut self, out: &mut String) {
+        if self.needed != 0 {
+            self.reset();
+            self.code(0xfffd, &mut |ch| out.push(ch));
+        }
+    }
+
+    fn code(&mut self, code: u32, emit: &mut impl FnMut(char)) {
+        // TextDecoder removes a BOM only at the start of its UTF-8 stream.
+        // A leading BOM must not hide a column-0 secret flag from the scanner.
+        let first = !self.decoded_any;
+        self.decoded_any = true;
+        if first && code == 0xfeff {
+            return;
+        }
+        let printable = (0x20..=0x7e).contains(&code) || code >= 0xa0;
+        if ((self.state == GROUND && printable)
+            || (self.state <= CSI_IGNORE && matches!(code, 0x09 | 0x0a | 0x0d)))
+            && let Some(ch) = char::from_u32(code)
+        {
+            emit(ch);
+        }
+        self.state = next_state(self.state, code);
+    }
+
+    fn decode(&mut self, byte: u8, emit: &mut impl FnMut(char)) {
         if self.needed == 0 {
             match byte {
-                0x00..=0x7f => self.state = next_state(self.state, u32::from(byte)),
+                0x00..=0x7f => self.code(u32::from(byte), emit),
                 0xc2..=0xdf => self.start(1, byte & 0x1f),
                 0xe0..=0xef => {
                     if byte == 0xe0 {
@@ -189,16 +227,14 @@ impl TerminalByteState {
                     }
                     self.start(3, byte & 0x07);
                 }
-                _ => self.state = next_state(self.state, 0xfffd),
+                _ => self.code(0xfffd, emit),
             }
             return;
         }
         if byte < self.lower || byte > self.upper {
-            // The partial character is invalid: it decodes to U+FFFD, and this
-            // byte starts over.
             self.reset();
-            self.state = next_state(self.state, 0xfffd);
-            self.feed(byte);
+            self.code(0xfffd, emit);
+            self.decode(byte, emit);
             return;
         }
         self.lower = 0x80;
@@ -208,7 +244,7 @@ impl TerminalByteState {
         if self.seen == self.needed {
             let code_point = self.code_point;
             self.reset();
-            self.state = next_state(self.state, code_point);
+            self.code(code_point, emit);
         }
     }
 

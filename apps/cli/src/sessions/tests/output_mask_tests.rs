@@ -151,7 +151,7 @@ fn exec_recovers_after_a_long_line_without_hiding_later_results() {
 fn real_exec_pipe_output_uses_the_masker_on_both_streams() {
     let (tx, rx) = channel();
     let mut execs = ExecRegistry::new(tx, Duration::from_secs(20));
-    let command = include_str!("../../../tests/fixtures/masking/stream-exec.sh");
+    let command = include_str!("../../../tests/fixtures/masking/stream-exec-colored.sh");
     let mut frames = execs.start(
         &enabled_startup(false),
         &Config::default(),
@@ -344,7 +344,7 @@ fn supervised_viewer_stays_raw_and_shared_partial_line_flushes_at_completion() {
     let joined = attach_viewer(&mut terminals, &startup, &mut viewer);
     let mut seen = viewer.receive(MULTI_TERMINAL, &joined);
     accept(&mut terminals, &rx, &mut frames, &mut viewer);
-    let input = include_str!("../../../tests/fixtures/masking/stream-session.txt");
+    let input = include_str!("../../../tests/fixtures/masking/stream-session-colored.txt");
     for byte in input.as_bytes() {
         frames.extend(terminals.on_bytes(MULTI_TERMINAL, &[*byte]));
     }

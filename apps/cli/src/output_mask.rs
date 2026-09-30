@@ -2,48 +2,44 @@
 //!
 //! Every server-visible exec stream and supervised shared/review capture uses
 //! [`StreamMasker`]. The encrypted PTY viewer still receives the original bytes.
-//! Normal physical lines use the file tools' restartable [`LineMasker`] exactly:
-//! private-key PEM blocks, whole secret-name token lines and their continuation,
-//! and secret-flag value tails. Naming a Hugging Face token file in the command
-//! selects [`FileClass::HfToken`] for all its output. No disk access or additional
-//! scanner, including vendor-prefix scanning, is performed.
+//! Detection uses the terminal/control-filtered view and unchanged file-tool
+//! [`LineMasker`] rules. Bounded unmasked output passes through byte for byte;
+//! ordinary masked lines emit cleaned text with their exact trailing CR/LF.
+//! Terminal state and UTF-8 decoding survive chunks and physical lines. An LF
+//! inside an unfinished terminal sequence is held with the preceding text until
+//! a ground-state LF, so hidden newlines cannot join an unscanned secret name.
+//! A masked group spanning physical lines is opaque with physical CR/LF kept;
+//! this also prevents a raw control opener losing its masked-away terminator.
+//! Naming a Hugging Face token file selects [`FileClass::HfToken`]. No disk
+//! access, vendor-prefix credential scanner, or additional naming rules run.
 //!
-//! Latency is bounded in BYTES: a line waits for LF, EOF/completion, or
-//! [`MAX_HELD_BYTES`] plus one input byte, whichever comes first. There is no
-//! wall-clock deadline while a process is silent. EOF and teardown flush/discard
-//! all held bytes. Each normal line is scanned once; overlong lines are scanned
-//! in bounded pieces cut at whitespace (an unbroken piece uses the cap).
-//! A secret-name token could occur AFTER an arbitrary public prefix. Therefore
-//! an overlong line emits only `⟦redacted line⟧`, with no prefix or token tail.
-//! When an opener is still live as the line crosses the cap (an open private-key
-//! block, quote/backslash run or indentation run), the rest of that stream is
-//! opaque through EOF like the [`MAX_STATE_INPUT_BYTES`] fallback: the state a
-//! fresh scanner would lose is exactly what masks the lines that follow, so
-//! recovering there would emit them. The check reads the state of the previous
-//! complete line, because the overlong line's own bytes are not scanned yet.
-//! With no live opener, at its terminating LF a fresh scanner is primed through
-//! [`LineMasker::scan`] as a column-0 secret-name token line: the next non-blank
-//! line is masked whole, and subsequent lines indented deeper than column 0 stay
-//! masked. Blank lines do not consume that next-line protection. Normal scanning
-//! then resumes. CR/LF bytes are copied even while the overlong line is opaque.
-//! Open-state input is also capped by [`MAX_STATE_INPUT_BYTES`]; exceeding it
-//! frees scanner state and makes every remaining nonempty line opaque through
-//! EOF, preserving CR/LF. This accepted residual bounds live PEM/indentation
-//! state; unlike an overlong line, this fallback never recovers. Opaque scanner
-//! state is reset after each piece/line, so PEM stacks cannot grow.
-//! Invalid UTF-8 passes through when scanning its lossy view finds no mask;
-//! otherwise the masked lossy view is emitted. LF/CRLF terminators are preserved.
+//! Latency is bounded in bytes: hold at most [`MAX_HELD_BYTES`] until a
+//! ground-state LF, EOF, or the next byte. Overlong lines/groups emit only opaque
+//! markers and CR/LF; no prefix or token tail leaves the CLI. Their cleaned pieces
+//! retain same-line quote/name/flag state and a 1 KiB PEM-marker overlap. Exact
+//! private-key labels and duplicate counts prime recovery via synthetic BEGINs;
+//! open quotes/backslashes prime UntilBlank. A column-0 token also masks the next
+//! nonblank line and deeper indentation; blank lines keep that recovery guard.
+//! A PEM marker larger than the overlap, or a live-state input budget larger
+//! than [`MAX_STATE_INPUT_BYTES`], makes the remaining stream opaque through EOF.
+//! An opener live BEFORE crossing the hold cap also keeps that accepted opaque
+//! policy. Opaque mode frees scanner/carry state and keeps terminal state current.
+//! EOF seals and flushes once; cancellation wipes/discards retained raw/cleaned
+//! bytes. Invalid UTF-8 stays raw when unmasked and is lossy when masked.
+//!
 //! Capture totals and `output_bytes` count these masked bytes, before head/tail
 //! retention. Plain command output never uses the dotenv `KEY=⟦redacted:N⟧` view.
 
 #[cfg(unix)]
-use crate::file_ops::redact::{FileClass, LineMasker};
+use crate::file_ops::redact::{FileClass, LineMasker, SameLineCarry};
 #[cfg(not(unix))]
 #[allow(dead_code)]
 #[path = "file_ops/redact.rs"]
 mod redact;
 #[cfg(not(unix))]
-use redact::{FileClass, LineMasker};
+use redact::{FileClass, LineMasker, SameLineCarry};
+
+use crate::terminal_parse::TerminalByteState;
 
 /// Maximum raw tail retained per stream (LF is handled separately).
 pub const MAX_HELD_BYTES: usize = 64 * 1024;
@@ -67,11 +63,15 @@ enum Mode {
 pub struct StreamMasker {
     masker: LineMasker,
     pending: Vec<u8>,
+    cleaned: String,
+    terminal: TerminalByteState,
+    carry: SameLineCarry,
     mode: Mode,
     opaque_line: bool,
     recovery_pending: bool,
     finished: bool,
     state_input_bytes: usize,
+    hold_limit: usize,
 }
 
 impl StreamMasker {
@@ -87,48 +87,37 @@ impl StreamMasker {
         Self {
             masker: LineMasker::new(class),
             pending: Vec::new(),
+            cleaned: String::new(),
+            terminal: TerminalByteState::default(),
+            carry: SameLineCarry::default(),
             mode: Mode::Scanning,
             opaque_line: false,
             recovery_pending: false,
             finished: false,
             state_input_bytes: 0,
+            hold_limit: MAX_HELD_BYTES,
         }
     }
 
-    /// Raw bytes held for the next line or bounded piece.
+    /// Raw bytes held for the next bounded terminal group or piece.
     pub fn held(&self) -> usize {
         self.pending.len()
     }
 
     /// Feed raw output; only the returned bytes may enter the shared copy.
-    pub fn push(&mut self, mut bytes: &[u8]) -> Vec<u8> {
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         if self.finished {
             return out;
         }
-        while !bytes.is_empty() {
-            if bytes[0] == b'\n' {
-                self.emit_line(&mut out);
-                out.push(b'\n');
-                if self.mode == Mode::OverlongLine {
-                    self.mode = Mode::Scanning;
-                    self.prime_recovery();
-                }
-                bytes = &bytes[1..];
-                continue;
-            }
-            if self.pending.len() == MAX_HELD_BYTES {
+        for &byte in bytes {
+            // A ground-state LF terminates an exact-cap group without overflow.
+            if self.pending.len() == self.hold_limit
+                && !(byte == b'\n' && self.terminal.at_boundary())
+            {
                 if self.mode == Mode::Scanning {
-                    // The scanner state describes the previous complete line(s).
-                    // Dropping a live opener here would leave the column-0 lines
-                    // that follow it — a PEM body, an open-quote run, a block —
-                    // to be emitted raw at the terminating LF, so fail closed to
-                    // EOF instead. An overlong line with no live opener recovers.
-                    // `recovery_pending` is the only state that masks without an
-                    // opener: the synthetic column-0 lookahead primed after an
-                    // earlier recoverable overlong line, so a second overlong
-                    // line still recovers.
-                    let live_opener = self.masker.in_continuation() && !self.recovery_pending;
+                    let live_opener = self.masker.has_content_continuation()
+                        || (self.masker.in_continuation() && !self.recovery_pending);
                     self.mode = if live_opener {
                         Mode::OpaqueStream
                     } else {
@@ -139,68 +128,101 @@ impl StreamMasker {
                 }
                 self.scan_piece();
             }
-            let room = MAX_HELD_BYTES - self.pending.len();
-            let window = &bytes[..bytes.len().min(room)];
-            let end = window
-                .iter()
-                .position(|b| *b == b'\n')
-                .unwrap_or(window.len());
-            let body = &window[..end];
-            if self.mode != Mode::Scanning {
-                Self::emit_opaque(&mut self.opaque_line, body, &mut out);
+            self.terminal.feed_clean(byte, &mut self.cleaned);
+            if byte == b'\n' && self.terminal.at_boundary() {
+                // Keep hidden physical LFs in the group until the terminal is
+                // ground. Otherwise OSC/APC/DCS can join a name across lines,
+                // or raw opening bytes can outlive a masked-away terminator.
+                self.cleaned.pop();
+                self.emit_group(&mut out);
+                out.push(byte);
+                self.opaque_line = false;
+                if self.mode == Mode::OverlongLine {
+                    self.mode = Mode::Scanning;
+                    self.reset_scanner();
+                    let carry = std::mem::take(&mut self.carry);
+                    if let Some(cost) = carry.recover(&mut self.masker) {
+                        self.prime_recovery();
+                        self.state_input_bytes = cost;
+                    } else {
+                        self.make_opaque();
+                    }
+                }
+            } else {
+                if self.mode != Mode::Scanning {
+                    Self::emit_opaque(&mut self.opaque_line, &[byte], &mut out);
+                }
+                self.pending.push(byte);
             }
-            self.pending.extend_from_slice(body);
-            bytes = &bytes[end..];
         }
         out
     }
 
-    /// Flush a partial last line at EOF/completion. Idempotent; seals the stream.
+    /// Flush a partial last group at EOF/completion. Idempotent; seals the stream.
     pub fn finish(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         if !self.finished {
+            self.terminal.finish_clean(&mut self.cleaned);
             if !self.pending.is_empty() {
-                self.emit_line(&mut out);
+                self.emit_group(&mut out);
             }
             self.reset_scanner();
+            self.carry = SameLineCarry::default();
             self.finished = true;
         }
         out
     }
 
-    fn emit_line(&mut self, out: &mut Vec<u8>) {
+    fn emit_group(&mut self, out: &mut Vec<u8>) {
         if self.mode != Mode::Scanning {
-            // Pieces already emitted their opaque marker/CR bytes.
-            self.masker.advance_bytes(&self.pending);
-            self.reset_scanner();
-            self.pending.fill(0);
-            self.pending.clear();
-            self.opaque_line = false;
+            self.scan_piece();
             return;
         }
-        let body_end = self
-            .pending
-            .iter()
-            .rposition(|b| *b != b'\r')
-            .map_or(0, |i| i + 1);
-        let (body, ending) = self.pending.split_at(body_end);
-        let text = String::from_utf8_lossy(body);
-        let blank = text.trim().is_empty();
-        let (masked, count) = self.masker.mask_line_counted(&text);
-        if count == 0 {
-            out.extend_from_slice(body);
+        let mut rendered = String::new();
+        let mut any_mask = false;
+        // A terminal group may contain executable LF inside an unfinished CSI,
+        // as well as hidden LF inside a control string. Scan visible lines only.
+        let lines: Vec<&str> = if self.cleaned.is_empty() {
+            vec![""]
         } else {
-            out.extend_from_slice(masked.as_bytes());
-        }
-        out.extend_from_slice(ending);
-        if self.recovery_pending {
-            if blank {
-                // The file scanner consumes its pending token on a blank line.
-                // Keep the recovery guard until the next non-blank line instead.
-                self.prime_recovery();
-            } else {
-                self.recovery_pending = false;
+            self.cleaned.split_inclusive('\n').collect()
+        };
+        for raw in lines {
+            let line = raw.trim_end_matches(['\r', '\n']);
+            let (masked, count) = self.masker.mask_line_counted(line);
+            any_mask |= count != 0;
+            rendered.push_str(&masked);
+            rendered.push_str(&raw[line.len()..]);
+            if self.recovery_pending {
+                if line.trim().is_empty() {
+                    let _ = self.masker.scan("X_TOKEN");
+                } else {
+                    self.recovery_pending = false;
+                }
             }
+        }
+        if !any_mask {
+            out.extend_from_slice(&self.pending);
+        } else if self.pending.contains(&b'\n') {
+            // Mapping a mask over an LF hidden by OSC/DCS would reintroduce a
+            // printable join. Conservatively mask the whole terminal group,
+            // preserving every physical CR/LF byte in its original order.
+            Self::emit_opaque(&mut self.opaque_line, &self.pending, out);
+        } else {
+            out.extend_from_slice(rendered.as_bytes());
+            // Trailing physical CRs hidden by a control sequence still frame
+            // the line; they survive even though the cleaned view omitted them.
+            let raw_crs = self
+                .pending
+                .iter()
+                .rev()
+                .take_while(|b| **b == b'\r')
+                .count();
+            let rendered_crs = rendered.bytes().rev().take_while(|b| *b == b'\r').count();
+            out.extend(std::iter::repeat_n(
+                b'\r',
+                raw_crs.saturating_sub(rendered_crs),
+            ));
         }
         if self.masker.in_continuation() {
             self.state_input_bytes = self
@@ -212,20 +234,29 @@ impl StreamMasker {
         } else {
             self.state_input_bytes = 0;
         }
-        self.pending.fill(0);
-        self.pending.clear();
+        self.clear_piece();
     }
 
     fn scan_piece(&mut self) {
-        let cut = self
-            .pending
-            .iter()
-            .rposition(u8::is_ascii_whitespace)
-            .map_or(self.pending.len(), |i| i + 1);
-        self.masker.advance_bytes(&self.pending[..cut]);
-        self.reset_scanner();
-        self.pending[..cut].fill(0);
-        self.pending.drain(..cut);
+        if self.mode == Mode::OverlongLine {
+            self.carry
+                .feed(&self.cleaned, self.pending.len(), MAX_STATE_INPUT_BYTES);
+            if self.carry.unrepresentable() {
+                self.make_opaque();
+            }
+        }
+        self.clear_piece();
+    }
+
+    fn clear_piece(&mut self) {
+        self.pending.fill(0);
+        self.pending.clear();
+        // Cleaned content is sensitive too. String::clear alone would leave it
+        // in the allocation. Moving to bytes permits wiping without unsafe.
+        let mut bytes = std::mem::take(&mut self.cleaned).into_bytes();
+        bytes.fill(0);
+        bytes.clear();
+        self.cleaned = String::from_utf8(bytes).unwrap_or_default();
     }
 
     fn reset_scanner(&mut self) {
@@ -235,7 +266,6 @@ impl StreamMasker {
     }
 
     fn prime_recovery(&mut self) {
-        // Use the real token rule to set both pending-token and indent-0 state.
         let _ = self.masker.scan("X_TOKEN");
         self.recovery_pending = true;
     }
@@ -243,12 +273,16 @@ impl StreamMasker {
     fn make_opaque(&mut self) {
         self.mode = Mode::OpaqueStream;
         self.reset_scanner();
+        self.carry = SameLineCarry::default();
     }
 
     fn emit_opaque(started: &mut bool, bytes: &[u8], out: &mut Vec<u8>) {
         for byte in bytes {
-            if *byte == b'\r' {
+            if matches!(*byte, b'\r' | b'\n') {
                 out.push(*byte);
+                if *byte == b'\n' {
+                    *started = false;
+                }
             } else if !*started {
                 out.extend_from_slice(LINE_MARKER);
                 *started = true;
@@ -259,8 +293,7 @@ impl StreamMasker {
 
 impl Drop for StreamMasker {
     fn drop(&mut self) {
-        // A cancelled/disconnected session discards its unshared tail now.
-        self.pending.fill(0);
+        self.clear_piece();
     }
 }
 
@@ -345,6 +378,118 @@ mod tests {
                 "{} bytewise",
                 case.name
             );
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct DesignCase {
+        name: String,
+        input: String,
+        expected: String,
+        #[serde(default)]
+        prefix: String,
+        #[serde(default)]
+        prefix_repeat: usize,
+        #[serde(default)]
+        hidden: Vec<String>,
+    }
+
+    const DESIGN_HOLD_BYTES: usize = 128;
+
+    fn design_run(chunks: &[&[u8]], hidden: &[String]) -> Vec<u8> {
+        let mut masker = StreamMasker::new("show");
+        // Exhaustive splits use the SAME algorithm with a smaller byte cap.
+        // A separate production-boundary check pins the public default.
+        masker.hold_limit = DESIGN_HOLD_BYTES;
+        let mut output = Vec::new();
+        for chunk in chunks {
+            output.extend(masker.push(chunk));
+            assert!(masker.held() <= DESIGN_HOLD_BYTES);
+            assert!(masker.cleaned.len() <= 3 * DESIGN_HOLD_BYTES);
+            assert!(masker.carry.pem_tail_len() <= SameLineCarry::OVERLAP);
+            assert!(masker.state_input_bytes <= MAX_STATE_INPUT_BYTES);
+            for value in hidden {
+                assert!(!String::from_utf8_lossy(&output).contains(value));
+            }
+        }
+        output.extend(masker.finish());
+        assert!(masker.finish().is_empty());
+        assert!(masker.push(b"late\n").is_empty());
+        assert_eq!(masker.held(), 0);
+        output
+    }
+
+    fn design_table(fixture: &str) {
+        let cases: Vec<DesignCase> = serde_json::from_str(fixture).expect("design cases");
+        for case in cases {
+            let input = format!("{}{}", case.prefix.repeat(case.prefix_repeat), case.input);
+            let bytes = input.as_bytes();
+            for at in 0..=bytes.len() {
+                assert_eq!(
+                    design_run(&[&bytes[..at], &bytes[at..]], &case.hidden),
+                    case.expected.as_bytes(),
+                    "{} split {at}",
+                    case.name
+                );
+            }
+            assert_eq!(
+                design_run(&bytes.chunks(1).collect::<Vec<_>>(), &case.hidden),
+                case.expected.as_bytes(),
+                "{} bytewise",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn design_adversarial_table_every_byte_split_and_bytewise() {
+        design_table(include_str!(
+            "../tests/fixtures/masking/stream-design-cases.json"
+        ));
+    }
+
+    #[test]
+    fn design_inverse_table_preserves_raw_bytes_and_recovers() {
+        design_table(include_str!(
+            "../tests/fixtures/masking/stream-design-controls.json"
+        ));
+    }
+
+    #[test]
+    fn design_openers_cross_the_production_cap_with_the_same_recovery() {
+        let cases: Vec<DesignCase> = serde_json::from_str(include_str!(
+            "../tests/fixtures/masking/stream-design-cases.json"
+        ))
+        .expect("design cases");
+        for mut case in cases.into_iter().filter(|case| {
+            [
+                "long-pem-unbroken",
+                "long-quote-unbroken",
+                "long-backslash-unbroken",
+                "long-pem-word",
+                "long-quote-word",
+                "long-backslash-word",
+                "pem-crossing-piece",
+                "long-colored-pem",
+            ]
+            .contains(&case.name.as_str())
+        }) {
+            case.prefix_repeat += (MAX_HELD_BYTES - DESIGN_HOLD_BYTES) / case.prefix.len();
+            let input = format!("{}{}", case.prefix.repeat(case.prefix_repeat), case.input);
+            let bytes = input.as_bytes();
+            for chunks in [
+                vec![bytes],
+                bytes.chunks(4096).collect(),
+                bytes.chunks(1).collect(),
+            ] {
+                assert_eq!(
+                    run("show", &chunks, &case.hidden),
+                    case.expected.as_bytes(),
+                    "{} production cap",
+                    case.name
+                );
+            }
         }
     }
 
@@ -782,9 +927,54 @@ mod tests {
     }
 
     #[test]
+    fn recovered_same_line_openers_keep_their_live_input_budget() {
+        let pem = cases()
+            .into_iter()
+            .find(|case| case.name == "missing-pem-end")
+            .expect("PEM fixture");
+        let opener = pem.input.split_inclusive('\n').next().expect("opener");
+        let count = MAX_STATE_INPUT_BYTES / opener.len() - 1;
+        let line = format!("{}\n", opener.trim_end().repeat(count));
+        let mut masker = StreamMasker::new("show");
+        let _ = masker.push(line.as_bytes());
+        assert_eq!(masker.mode, Mode::Scanning);
+        assert!(masker.state_input_bytes >= count * opener.len());
+        // A recovered stack near the cap has only its original budget left.
+        for _ in 0..3 {
+            let _ = masker.push(opener.as_bytes());
+        }
+        assert_eq!(masker.mode, Mode::OpaqueStream);
+        assert_eq!(
+            masker.push(b"public\n"),
+            LINE_MARKER
+                .iter()
+                .copied()
+                .chain(*b"\n")
+                .collect::<Vec<_>>()
+        );
+        assert!(masker.finish().is_empty());
+    }
+
+    #[test]
     fn the_documented_bounds_are_pinned() {
         assert_eq!(MAX_HELD_BYTES, 64 * 1024);
         assert_eq!(MAX_STATE_INPUT_BYTES, 1024 * 1024);
+        let mut masker = StreamMasker::new("show");
+        assert_eq!(masker.hold_limit, MAX_HELD_BYTES);
+        let exact = vec![b'p'; MAX_HELD_BYTES];
+        assert!(masker.push(&exact).is_empty());
+        assert_eq!(masker.held(), MAX_HELD_BYTES);
+        assert_eq!(masker.push(b"p"), LINE_MARKER);
+        assert_eq!(masker.held(), 1);
+        assert_eq!(
+            masker.push(b"\r\nnext\nvisible\n"),
+            b"\r\n"
+                .iter()
+                .copied()
+                .chain(LINE_MARKER.iter().copied())
+                .chain(*b"\nvisible\n")
+                .collect::<Vec<_>>()
+        );
     }
 
     /// The live-state counter measures the CURRENT run, not the stream: a run
