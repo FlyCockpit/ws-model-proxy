@@ -1518,10 +1518,9 @@ mod exchange_callers {
         if !fx.root.join("foo.txt").exists() {
             // case-sensitive volume: two distinct names, nothing to check (macOS
             // runners use the case-insensitive default, so there this must not skip)
-            assert!(
-                !cfg!(target_os = "macos"),
-                "the macOS test volume is expected to be case-insensitive"
-            );
+            #[cfg(target_os = "macos")]
+            panic!("the macOS test volume is expected to be case-insensitive");
+            #[cfg(not(target_os = "macos"))]
             return;
         }
         let etag = fx.etag("Foo.txt");
