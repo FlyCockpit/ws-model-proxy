@@ -166,7 +166,7 @@ export async function readCliAgentAdmission(
   let token: LiveCliToken | null;
   let owner: CliOwnerState | null;
   try {
-    [device, token, owner] = await Promise.all([
+    [device, token] = await Promise.all([
       prisma.cliDevice.findUnique({
         where: { id: input.cliDeviceId },
         select: {
@@ -177,8 +177,12 @@ export async function readCliAgentAdmission(
         },
       }),
       liveCliToken(input.tokenId, input.userId),
-      readCliOwner(input.userId),
     ]);
+    // The owner is read LAST: a ban or deletion committed before this read is
+    // seen by the verdict, and the window between this read and the dispatch is
+    // one synchronous step (a stale owner snapshot taken before the slower
+    // device read would extend it).
+    owner = await readCliOwner(input.userId);
   } finally {
     openAdmissions.delete(admission);
   }

@@ -281,6 +281,25 @@ describe("relay 2.8 file frames: CLI to server", () => {
     expect(() => parseRelayClientControlFrame(JSON.stringify(noId))).toThrow();
   });
 
+  it("accepts only library-shaped etags in results and rejection details", () => {
+    const base = clone(vector("file-result-edit")) as { result: Record<string, unknown> };
+    for (const bad of [
+      "h:short",
+      "x:AAAAAAAAAAAAAAAAAAAAAA",
+      "wsmp_cli_secretsecretsecretsecret",
+      "h:AAAAAAAAAAAAAAAAAAAAA!",
+    ]) {
+      const frame = clone(base);
+      frame.result.etag = bad;
+      expect(() => parseRelayClientControlFrame(JSON.stringify(frame)), bad).toThrow();
+      const rejected = { ...clone(vector("file-rejected-conflict")), detail: { currentEtag: bad } };
+      expect(() => parseRelayClientControlFrame(JSON.stringify(rejected)), bad).toThrow();
+    }
+    const weak = clone(base);
+    weak.result.etag = "w:AAAAAAAAAAAAAAAAAAAAAA";
+    expect(() => parseRelayClientControlFrame(JSON.stringify(weak))).not.toThrow();
+  });
+
   it("frames file.data metadata", () => {
     const metadata = vector("file-data-metadata") as { type: "file.data"; opId: string };
     const frame = encodeRelayBinaryFrame(metadata, new Uint8Array(70_000));

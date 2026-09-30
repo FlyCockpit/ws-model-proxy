@@ -195,11 +195,16 @@ export class McpCliFileError extends Error {
     this.name = "McpCliFileError";
     this.validation = validation;
     this.code = failure.code;
-    const extra: Record<string, unknown> = { ...(failure.detail ?? {}) };
+    // Everything the CLI sent (detail values) is untrusted text: the same
+    // credential-substring removal as a result, and only small facts.
+    const extra: Record<string, unknown> = scrub({ ...(failure.detail ?? {}) }) as Record<
+      string,
+      unknown
+    >;
     if (failure.retryAfterMs !== undefined) extra.retryAfterMs = failure.retryAfterMs;
     if (failure.outcome !== undefined) extra.outcome = failure.outcome;
     if (failure.rejectedProtocolVersion !== undefined) {
-      extra.relayProtocolVersion = failure.rejectedProtocolVersion;
+      extra.relayProtocolVersion = scrub(failure.rejectedProtocolVersion);
     }
     this.extra = extra;
   }

@@ -358,6 +358,11 @@ function finishResult(record: FileOpRecord, frame: FileResultFrame, spilled: str
     settle(record, serverFailure(record, "io_error"));
     return;
   }
+  // An answer that lands after the credential expired is not delivered.
+  if (record.tokenExpiresAt !== null && Date.now() >= record.tokenExpiresAt) {
+    settle(record, serverFailure(record, "token_inactive"));
+    return;
+  }
   const result = { ...frame.result };
   if (frame.dataField !== undefined && spilled !== null) result[frame.dataField] = spilled;
   settle(record, { ok: true, op: record.op, result: result as FileOpResult["result"] });
@@ -471,10 +476,12 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
   const opClass: FileOpClass = mutating ? "write" : "read";
   if (input.signal?.aborted) return { ok: false, code: "cancelled" };
 
-  const verdict = judgeCliAgentAdmission(
-    await readCliAgentAdmission(input),
-    mutating ? "file_write" : "file_read",
-  );
+  const reads = await readCliAgentAdmission(input);
+  // The caller may have gone while the admission read: never start new work for
+  // a request that is already aborted (a cancel after the dispatch could lose a
+  // race with a fast mutation).
+  if (input.signal?.aborted) return { ok: false, code: "cancelled" };
+  const verdict = judgeCliAgentAdmission(reads, mutating ? "file_write" : "file_read");
   // From the verdict to the dispatch nothing awaits (see `Admission`).
   // The verdict resolved the device to one of the caller's own unless it said
   // the device is unknown or the token/owner is out (checked before ownership).
@@ -534,7 +541,14 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
       tokenId: input.tokenId,
       cliDeviceId: input.cliDeviceId,
       op: input.op,
-      tokenExpiresAt: verdict.token.expiresAt ? verdict.token.expiresAt.getTime() : null,
+      // The earliest expiry the credential carries (its row and the one it was admitted with).
+      tokenExpiresAt: [verdict.token.expiresAt, input.expiresAt]
+        .filter((date): date is Date => date !== null)
+        .reduce<number | null>(
+          (earliest, date) =>
+            earliest === null ? date.getTime() : Math.min(earliest, date.getTime()),
+          null,
+        ),
       resolve,
     });
     pendingById.set(opId, record);
@@ -559,10 +573,18 @@ async function runFileOpChecked(input: RunFileOpInput, audit: FileAudit): Promis
       resolve({ ok: false, code: refusal ?? "offline" });
       return;
     }
-    record.deadlineTimer = setTimeout(() => {
-      relaySessionManager.dispatchFileCancel(record.cliDeviceId, record.opId);
-      settle(record, serverFailure(record, "timeout"));
-    }, FILE_OP_DEADLINE_MS);
+    // The op ends at its deadline, or at the credential's expiry if that is
+    // sooner: an expiring token keeps no authority until the minute sweep.
+    const untilExpiry =
+      record.tokenExpiresAt === null ? Infinity : record.tokenExpiresAt - Date.now();
+    const expiresFirst = untilExpiry < FILE_OP_DEADLINE_MS;
+    record.deadlineTimer = setTimeout(
+      () => {
+        relaySessionManager.dispatchFileCancel(record.cliDeviceId, record.opId);
+        settle(record, serverFailure(record, expiresFirst ? "token_inactive" : "timeout"));
+      },
+      expiresFirst ? Math.max(0, untilExpiry) : FILE_OP_DEADLINE_MS,
+    );
     record.deadlineTimer.unref?.();
     const onAbort = () => {
       if (record.settled) return;

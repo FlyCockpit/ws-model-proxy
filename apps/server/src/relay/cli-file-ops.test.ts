@@ -352,6 +352,119 @@ describe("cli file ops", () => {
     }
   });
 
+  describe("credential lifetime and abort during admission", () => {
+    it("ends an in-flight op at the token's expiry, not at the minute sweep", async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+      const socket = await connect();
+      const expiresAt = new Date(Date.now() + 5_000);
+      db.mcpPersonalToken.findFirst.mockResolvedValue(liveToken(expiresAt));
+      const outcome = runFileOp({
+        ...OP_TOKEN,
+        expiresAt,
+        cliDeviceId: "desktop",
+        op: "delete",
+        args: { path: "~/a" },
+      });
+      await flush();
+      const opId = lastOpId(socket);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await expect(outcome).resolves.toEqual({
+        ok: false,
+        code: "token_inactive",
+        outcome: "unknown",
+      });
+      expect(socket.frames("file.cancel")).toEqual([{ type: "file.cancel", opId }]);
+    });
+
+    it("does not deliver an answer that lands after the token expired", async () => {
+      const socket = await connect();
+      const expiresAt = new Date(Date.now() + 60_000);
+      db.mcpPersonalToken.findFirst.mockResolvedValue(liveToken(expiresAt));
+      const outcome = runFileOp({
+        ...OP_TOKEN,
+        expiresAt,
+        cliDeviceId: "desktop",
+        op: "read",
+        args: readArgs,
+      });
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      vi.spyOn(Date, "now").mockReturnValue(expiresAt.getTime() + 1);
+      await answer(socket, resultFor(lastOpId(socket), "read", readResult));
+      await expect(outcome).resolves.toEqual({ ok: false, code: "token_inactive" });
+    });
+
+    it("never dispatches an op whose request was aborted during admission", async () => {
+      const socket = await connect();
+      const controller = new AbortController();
+      let release!: (row: unknown) => void;
+      let entered!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      db.user.findUnique.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release = resolve;
+            entered();
+          }),
+      );
+      const outcome = runFileOp({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+        op: "delete",
+        args: { path: "~/a" },
+        signal: controller.signal,
+      });
+      await reached;
+      controller.abort();
+      release({ banned: false, banExpires: null, deletionRequestedAt: null });
+      await expect(outcome).resolves.toEqual({ ok: false, code: "cancelled" });
+      expect(socket.sends).toEqual([]);
+    });
+
+    it("sees a ban that lands while the device is being read (the owner is read last)", async () => {
+      const socket = await connect();
+      let releaseDevice!: (row: unknown) => void;
+      let deviceEntered!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        deviceEntered = resolve;
+      });
+      db.cliDevice.findUnique.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            releaseDevice = resolve;
+            deviceEntered();
+          }),
+      );
+      db.user.findUnique.mockResolvedValue({
+        banned: false,
+        banExpires: null,
+        deletionRequestedAt: null,
+      });
+      const outcome = runFileOp({
+        ...OP_TOKEN,
+        cliDeviceId: "desktop",
+        op: "delete",
+        args: { path: "~/a" },
+      });
+      await reached;
+      // The ban commits while the device read is still pending.
+      db.user.findUnique.mockResolvedValue({
+        banned: true,
+        banExpires: null,
+        deletionRequestedAt: null,
+      });
+      releaseDevice({
+        id: "desktop",
+        userId: "user-id",
+        mcpCommandMode: "UNSUPERVISED",
+        rejectedRelayProtocolVersion: null,
+      });
+      await expect(outcome).resolves.toEqual({ ok: false, code: "token_inactive" });
+      expect(socket.frames("file.op")).toEqual([]);
+    });
+  });
+
   describe("audit (#104 part B)", () => {
     const events = () => audit.record.mock.calls.map(([event]) => event as Record<string, unknown>);
 

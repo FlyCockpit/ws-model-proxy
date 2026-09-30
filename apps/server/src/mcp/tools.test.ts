@@ -2317,6 +2317,23 @@ describe("CLI file tools", () => {
     );
   });
 
+  it("scrubs credential substrings from a CLI-supplied error detail", async () => {
+    fileRuntime.runFileOp.mockResolvedValueOnce({
+      ok: false,
+      code: "conflict",
+      detail: { currentEtag: "h:wsmp_cli_abcdef0123456789xyz" },
+    });
+    const result = await call("forwarder_cli_file_edit", {
+      cliDeviceId: "cli-1",
+      path: "~/a",
+      edits: [{ oldText: "a", newText: "b" }],
+      confirm: "RUN",
+    });
+    expect(result.isError).toBe(true);
+    expect(JSON.stringify(result)).not.toMatch(/wsmp_cli_[A-Za-z0-9]{6,}/);
+    expect(structured(result).error?.code).toBe("conflict");
+  });
+
   it("keeps unchanged:true in the ifNoneMatch answer", async () => {
     fileRuntime.runFileOp.mockResolvedValue({
       ok: true,
