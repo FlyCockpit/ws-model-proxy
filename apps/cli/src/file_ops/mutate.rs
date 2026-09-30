@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use super::atomic::perm_mode;
 use super::error::{ErrorCode, FileError, FileResult};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use super::exchange::{exchange, is_unsupported};
 use super::policy::Access;
 use super::read::current_etag;
 use super::resolve::{Kind, ResolveOpts, Resolved, Stat, resolve};
@@ -23,6 +25,10 @@ use super::{Cancel, FileOps, Step, check_reason};
 pub(crate) enum RenameAtomicCapability {
     HardLinksOnly = 0,
     Kernel = 1,
+    /// macOS: atomic exchange replaces a checked destination, regular files move
+    /// without replacing through link + unlink, and directories have no atomic
+    /// no-replace primitive (refused for supervised requests).
+    LinksAndExchange = 3,
     #[cfg(test)]
     Unavailable = 2,
 }
@@ -32,6 +38,7 @@ impl RenameAtomicCapability {
     pub(crate) fn from_u8(value: u8) -> Self {
         match value {
             value if value == Self::Kernel as u8 => Self::Kernel,
+            value if value == Self::LinksAndExchange as u8 => Self::LinksAndExchange,
             value if value == Self::Unavailable as u8 => Self::Unavailable,
             _ => Self::HardLinksOnly,
         }
@@ -41,9 +48,19 @@ impl RenameAtomicCapability {
 pub(crate) const fn platform_rename_capability() -> RenameAtomicCapability {
     if cfg!(target_os = "linux") {
         RenameAtomicCapability::Kernel
+    } else if cfg!(target_os = "macos") {
+        RenameAtomicCapability::LinksAndExchange
     } else {
         RenameAtomicCapability::HardLinksOnly
     }
+}
+
+/// Whether a supervised rename may replace a checked destination atomically.
+pub(crate) const fn supervised_overwrite_supported(capability: RenameAtomicCapability) -> bool {
+    matches!(
+        capability,
+        RenameAtomicCapability::Kernel | RenameAtomicCapability::LinksAndExchange
+    )
 }
 
 pub(crate) fn check_supervised_rename_capability(
@@ -61,9 +78,9 @@ pub(crate) fn check_supervised_rename_capability(
                 "this filesystem has no safe atomic rename primitive",
             ));
         }
-        RenameAtomicCapability::HardLinksOnly => {}
+        RenameAtomicCapability::LinksAndExchange | RenameAtomicCapability::HardLinksOnly => {}
     }
-    if overwrite && destination_exists {
+    if overwrite && destination_exists && !supervised_overwrite_supported(capability) {
         return Err(FileError::new(
             ErrorCode::Unsupported,
             "this platform cannot replace a destination atomically",
@@ -283,6 +300,16 @@ fn rename_impl(
             ));
         }
         ops.step(Step::BeforeIdentity)?;
+        // Two names for one object (a hard link, or a case-insensitive / normalizing
+        // volume where both names resolve to the same entry): an exchange would swap
+        // the name with itself and the unlink of the source name would then delete
+        // the only entry. Nothing is replaced, so refuse (plain rename is no option:
+        // it reopens the race the exchange closes).
+        if dst.same_object(&src) {
+            return Err(FileError::invalid(
+                "source and destination are the same file",
+            ));
+        }
         ops.policy.check_identity(Access::Write, dst)?;
         ops.step(Step::IdentityChecked)?;
         let current = object_etag(ops, &to, dst, cancel)?.unwrap_or_default();
@@ -329,18 +356,21 @@ fn rename_impl(
 ///
 /// * No overwrite (or an empty destination): an atomic no-replace rename, so a
 ///   destination that appeared after the check is never replaced.
-/// * Overwrite of a checked destination (Linux): `RENAME_EXCHANGE`, then the old
-///   destination is at the source name and is removed only when it is the object
-///   whose etag was checked; otherwise the exchange is undone.
+/// * Overwrite of a checked destination (Linux and macOS): atomic exchange, then
+///   the old destination is at the source name and is removed only when it is
+///   the object whose etag was checked; otherwise the exchange is undone.
+///   Filesystems without exchange support refuse overwrite as unsupported.
 ///
-/// Headless compatibility: on non-Linux systems overwrite and directory moves
-/// retain the pre-existing ordinary-rename fallback. Supervised callers are
-/// rejected before reaching that fallback.
+/// Headless compatibility: overwrite on platforms other than Linux/macOS and
+/// directory moves on non-Linux systems retain the ordinary-rename fallback and
+/// rely on the checks above, leaving a race before commit. Supervised callers
+/// are rejected before reaching that fallback.
 /// Crash states: between the exchange and the unlink the old destination is
 /// under the source name; after `linkat` and before the unlink both names exist.
 /// Neither loses data. The undo moves back whatever object the move actually put
 /// at the destination (a same-user cross-process successor in that window is the
-/// accepted residual).
+/// accepted residual, together with a failed undo and a cleanup unlink that races
+/// a successor: tracked in #165).
 fn commit_rename(
     from: &Resolved,
     to: &Resolved,
@@ -491,7 +521,40 @@ fn exists_error() -> FileError {
     FileError::new(ErrorCode::Exists, "the destination already exists")
 }
 
-#[cfg(target_os = "linux")]
+/// An overwrite has no non-atomic fallback: a filesystem without exchange refuses
+/// it as unsupported and every other errno is its own error.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn overwrite_exchange_error(errno: Errno) -> FileError {
+    if is_unsupported(errno) {
+        FileError::new(
+            ErrorCode::Unsupported,
+            "this filesystem cannot replace a destination atomically",
+        )
+    } else {
+        FileError::errno(errno)
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod exchange_error_tests {
+    use super::*;
+
+    #[test]
+    fn overwrite_refuses_an_exchange_less_filesystem_as_unsupported_only() {
+        for errno in [Errno::EINVAL, Errno::ENOSYS] {
+            assert_eq!(overwrite_exchange_error(errno).code, ErrorCode::Unsupported);
+        }
+        for errno in [Errno::EPERM, Errno::EXDEV, Errno::EACCES, Errno::EIO] {
+            assert_ne!(
+                overwrite_exchange_error(errno).code,
+                ErrorCode::Unsupported,
+                "{errno}"
+            );
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn exchange_over(
     from: &Resolved,
     to: &Resolved,
@@ -499,25 +562,17 @@ fn exchange_over(
     dst: &Stat,
     _supervised: bool,
 ) -> FileResult<()> {
-    use nix::fcntl::{RenameFlags, renameat2};
     let swap = || {
-        renameat2(
+        exchange(
             from.dir.as_fd(),
             from.name.as_os_str(),
             to.dir.as_fd(),
             to.name.as_os_str(),
-            RenameFlags::RENAME_EXCHANGE,
         )
     };
     match swap() {
         Ok(()) => {}
-        Err(Errno::EINVAL | Errno::ENOSYS) => {
-            return Err(FileError::new(
-                ErrorCode::Unsupported,
-                "this filesystem cannot replace a destination atomically",
-            ));
-        }
-        Err(errno) => return Err(FileError::errno(errno)),
+        Err(errno) => return Err(overwrite_exchange_error(errno)),
     }
     let moved_ok = matches!(to.lstat(), Ok(Some(ref now)) if now.same_object(src));
     let old_ok = matches!(from.lstat(), Ok(Some(ref now)) if now.same_object(dst));
@@ -534,7 +589,7 @@ fn exchange_over(
     .map_err(|_| FileError::mutation_uncertain())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn exchange_over(
     from: &Resolved,
     to: &Resolved,
@@ -551,7 +606,7 @@ fn exchange_over(
     verify_moved_after(to, src)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn verify_moved_after(to: &Resolved, src: &Stat) -> FileResult<()> {
     match to.lstat().map_err(|_| FileError::mutation_uncertain())? {
         Some(now) if now.same_object(src) => Ok(()),

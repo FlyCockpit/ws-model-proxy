@@ -152,8 +152,9 @@ the daemon rechecks the etag: a file changed between display and approval return
 `conflict` and nothing is written for that mismatch. Since this apply-time error
 arrives after acceptance with only a code, the server still reports an unknown outcome.
 Supervised `edit.dryRun:true` returns `invalid_input`. On macOS, supervised rename
-with overwrite of an existing destination (or a directory no-replace move) is
-refused `unsupported`: no unsafe rename fallback is used. Regular-file no-replace
+of a directory without replacement is refused `unsupported` (overwrite uses atomic
+exchange). On platforms with neither Linux renameat2 nor macOS exchange, overwrite
+is refused `unsupported` too: no unsafe rename fallback is used. Regular-file no-replace
 moves remain available when the filesystem supports hard links.
 No headless read grant is implied by supervised approval.
 

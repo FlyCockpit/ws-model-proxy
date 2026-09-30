@@ -1358,6 +1358,65 @@ mod tests {
         assert!(view.contains("    c"), "{view:?}");
     }
 
+    /// Tabs and spaces cannot be ordered against each other, so a run opened with
+    /// one kind stays open across lines indented with the other kind (fail closed)
+    /// and ends only at column 0. Every row hides its probe line only because an
+    /// OLDER block is preserved (or a mixed-kind line keeps the block open): a
+    /// block replaced by a later token line of the same width but another kind,
+    /// or a mixed comparison that ordered by byte width, would show it.
+    #[test]
+    fn mixed_tab_space_indentation_keeps_every_older_block_open() {
+        for (sample, input, hidden) in [
+            (
+                // block B (2 tabs) shares its width with block A (2 spaces) but not its
+                // kind: A must survive B, and only A keeps the tab-only probe masked
+                "older space block survives an equal-width tab block",
+                "  a_key:\n    a1\n\t\tb_key: 1\n\t\t\tb1\n\tprobe-c\nnext: 1\n",
+                "probe-c",
+            ),
+            (
+                // the mirror image: only the older tab block keeps a space-only probe open
+                "older tab block survives an equal-width space block",
+                "\t\ta_key:\n\t\t\ta1\n  b_key: 1\n    b1\n probe-c\nnext: 1\n",
+                "probe-c",
+            ),
+            (
+                // the probe is shallower than both blocks by byte width
+                "shallower mixed probe stays open under both blocks",
+                "    a_key:\n        a1\n\t\t\t\tb_key: 1\n\t\t\t\t\tb1\n\tprobe-c\nnext: 1\n",
+                "probe-c",
+            ),
+            (
+                // C15b-5: the probe's indentation is a strict PREFIX of the block's mixed
+                // indentation, so it is really shallower; the ordering is not decided
+                // from prefixes and the run over-masks (documented fail-closed limit)
+                "strict-prefix probe of a mixed-indent block over-masks",
+                "\t    x_key: 1\n\t      a\n\tprobe-b\nnext: 1\n",
+                "probe-b",
+            ),
+            (
+                "strict-prefix probe of a mixed-indent block, spaces first",
+                "    \tx_key: 1\n    \t  a\n    probe-b\nnext: 1\n",
+                "probe-b",
+            ),
+        ] {
+            let view = mask(FileClass::Plain, input).text;
+            assert!(!view.contains(hidden), "{sample}: {view:?}");
+            assert!(view.contains("next: 1"), "{sample}: {view:?}");
+        }
+        // control: a same-kind probe at or below the block's indentation ends the run
+        for (sample, input) in [
+            ("tabs only", "\t\ta_key:\n\t\t\ta1\n\tpublic-c\nnext: 1\n"),
+            (
+                "spaces only",
+                "    a_key:\n        a1\n  public-c\nnext: 1\n",
+            ),
+        ] {
+            let view = mask(FileClass::Plain, input).text;
+            assert!(view.contains("public-c"), "{sample}: {view:?}");
+        }
+    }
+
     #[test]
     fn token_words_mask_whole_lines_and_exactly_one_following_nonblank_line() {
         for name in [

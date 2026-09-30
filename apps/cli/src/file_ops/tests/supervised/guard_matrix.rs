@@ -133,7 +133,7 @@ fn run(row: Row) {
     };
     let prepared = prepare(&fx, op, args, body);
     if row.operand == "rename-overwrite"
-        && fx.ops.rename_atomic_capability() != RenameAtomicCapability::Kernel
+        && !supervised_overwrite_supported(fx.ops.rename_atomic_capability())
     {
         assert_eq!(
             prepared.child_input().blocked,

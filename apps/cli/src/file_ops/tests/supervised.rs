@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use super::super::supervised::SupervisedPreview;
 use super::super::{Cancel, ErrorCode, EtagKey, FileOps, Policy, Step};
 use super::{Fx, code};
-use crate::file_ops::mutate::RenameAtomicCapability;
+use crate::file_ops::mutate::{RenameAtomicCapability, supervised_overwrite_supported};
 
 fn key() -> EtagKey {
     EtagKey::from_bytes([19; 32])
@@ -955,7 +955,7 @@ fn gap_apply_rechecks_hardlinks_and_owner_for_every_existing_file_operand() {
             };
             let prepared = prepare(&fx, operation, args.clone(), body.clone());
             if op == "rename-destination"
-                && fx.ops.rename_atomic_capability() != RenameAtomicCapability::Kernel
+                && !supervised_overwrite_supported(fx.ops.rename_atomic_capability())
             {
                 assert_eq!(prepared.child_input().blocked, Some(ErrorCode::Unsupported));
                 assert_eq!(fx.get("source"), "old\n");

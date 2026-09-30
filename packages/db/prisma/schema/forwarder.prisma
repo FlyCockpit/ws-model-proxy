@@ -1039,8 +1039,9 @@ model ModelPool {
   /// spill-over delay); 1..30000 = fixed milliseconds.
   cacheHolderWaitMs               Int?
   /// Warm-session protection (saturation S-C): a new session is routed away
-  /// from a member whose idle capacity holds other conversations' recently used,
-  /// large prompt caches when another member (or, for `:external`, an
+  /// from a member whose idle capacity holds protected warm sessions' (including
+  /// the requester's own) recently used, large prompt caches when another
+  /// member (or, for `:external`, an
   /// external route) can take it. Redirect-only: it never blocks or queues.
   protectionEnabled               Boolean                       @default(true)
   /// A session is protected only when used within this many seconds.
@@ -1103,6 +1104,11 @@ model CacheAffinityRecord {
   bindingDigest        String
   prefixDigest         String?
   conversationDigest   String?
+  /// Warm-session identity (S-C): every record one request writes carries the
+  /// session it continued (matched conversation or deepest prefix record on
+  /// the same target) or a fresh id. Null on rows from before it existed: the
+  /// row's own id stands in. Not part of the record's identity or uniqueness.
+  sessionId            String?
   prefixDepth          Int
   estimatedTokens      Int?
   engineCacheConfirmed Boolean  @default(false)
@@ -1264,6 +1270,11 @@ model AdmissionRequest {
   /// pool/member capacity priority applies. No foreign key: a grant revoke
   /// must never write admission rows (capacity lock order).
   priorityGrantId         String?
+  /// Warm sessions (`cache_affinity_record.sessionId`, any candidate target)
+  /// this request continues. With its lease it says which protected session an
+  /// active lease is serving right now (S-C slot mode). Advisory routing state:
+  /// no foreign key, never read by admission.
+  warmSessionIds          String[]              @default([])
   enqueueSequence         BigInt
   enqueuedAt              DateTime              @default(now())
   deadlineAt              DateTime?
@@ -1497,6 +1508,9 @@ model ResponseStickinessRecord {
   updatedAt                 DateTime  @default(now()) @updatedAt
   userId                    String
   modelApiTokenId           String?
+  /// Scoped warm-session identity from successful local pool Responses creates only.
+  warmSessionId             String?
+  warmBindingDigest         String?
   routingKeyDigest          String
   /// Version 2+ rows are bound to immutable ExecutionTarget identities and
   /// must never fall back to legacy discovered-model columns after deletion.

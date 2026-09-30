@@ -3,9 +3,9 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 /**
  * Saturation S-C: warm-session protection (redirect-only).
  *
- * A new session should not evict another user's recently used, expensive
- * prompt cache when another member (or, for `:external`, an external route)
- * can take it. No inference engine reports the age of individual KV entries,
+ * A new session should not evict a protected warm session's recently used,
+ * expensive prompt cache (the requester's own conversations' included) when
+ * another member (or, for `:external`, an external route) can take it. No inference engine reports the age of individual KV entries,
  * so "warm" is estimated from the proxy's own routing records
  * (`CacheAffinityRecord`): counts, digests and timestamps only, never prompt
  * content. Traffic that bypasses the proxy is invisible, which is accepted.
@@ -84,8 +84,11 @@ export type WarmProtectionPolicy = {
 
 /**
  * One warm session on a member KV pool: the footprint of the latest request
- * of one conversation on one execution target (every record one
- * `rememberAffinity` call writes shares its `lastUsedAt`).
+ * of one conversation on one execution target. A session is identified by
+ * `cache_affinity_record.sessionId`: every request stamps its records with the
+ * session it continues (matched conversation, or the deepest prefix an edited
+ * or shortened history still shares) or with a fresh id, so the session keeps
+ * one identity across turns and its latest turn sets its age and size.
  */
 export type WarmSession = {
   userId: string;
@@ -95,6 +98,11 @@ export type WarmSession = {
   tokens: number;
   /** Owner or grant override: null = pool share mode, 0 = unprotected, 1..100 = percent. */
   overridePercent: number | null;
+  /**
+   * An active lease of this member is serving a request that continues this
+   * session right now: it occupies a busy slot, not an idle one.
+   */
+  inFlight: boolean;
 };
 
 export type CapacityLoad = {
@@ -112,6 +120,8 @@ export type ProtectionVerdict = {
   state: MemberProtectionState;
   /** Protected sessions on the member's KV pool (after the equity caps). */
   protectedSessions: number;
+  /** Of those, the ones no active lease is serving (`idleProtectedSessions`). */
+  idleProtectedSessions: number;
   /** W_protected: sum of the protected sessions' tokens. */
   protectedTokens: number;
   /** Age of the most recently used protected session; null when none. */
@@ -212,12 +222,27 @@ export function protectedWarmSessions(
 }
 
 /**
+ * The protected sessions that hold an IDLE slot: a session whose next turn is
+ * running right now is served by an active lease, which already counts in the
+ * member's active leases `a`, so it does not also fill one of the C - a idle
+ * slots. This is the ONE count slot mode compares with the idle slots (the
+ * verdict's only use of it); it is not `p >= C` or `p - a`, because leases
+ * that serve new or unprotected sessions are not warm sessions at all.
+ */
+export function idleProtectedSessions(
+  protectedSessions: readonly WarmSession[],
+): readonly WarmSession[] {
+  return protectedSessions.filter((session) => !session.inFlight);
+}
+
+/**
  * State of one member for this request:
  * - FULL: a >= C;
  * - PROTECTED (only without an affinity hit on this member): not full, but
  *   admitting would displace protected sessions. Token mode (K known):
- *   W_protected + r > K x (1 - headroom). Slot mode: every idle slot (C - a)
- *   holds a protected session (distinct protected sessions, capped at C);
+ *   W_protected + r > K x (1 - headroom) (in-flight sessions' KV is still in
+ *   the pool, so they count). Slot mode: every idle slot (C - a) holds a
+ *   protected session that no active lease is serving (`idleProtectedSessions`);
  * - FREE: otherwise, including an unknown C and K (nothing to reason about).
  */
 export function memberProtectionVerdict({
@@ -235,9 +260,11 @@ export function memberProtectionVerdict({
   const newestProtectedAgeMs = protectedSessions.length
     ? Math.min(...protectedSessions.map(({ ageMs }) => ageMs))
     : null;
+  const idleProtected = idleProtectedSessions(protectedSessions).length;
   const verdict = (state: MemberProtectionState): ProtectionVerdict => ({
     state,
     protectedSessions: protectedSessions.length,
+    idleProtectedSessions: idleProtected,
     protectedTokens,
     newestProtectedAgeMs,
   });
@@ -253,7 +280,7 @@ export function memberProtectionVerdict({
     );
   if (load.slots !== null && load.slots > 0) {
     const idle = load.slots - load.active;
-    return verdict(Math.min(protectedSessions.length, load.slots) >= idle ? "PROTECTED" : "FREE");
+    return verdict(idleProtected >= idle ? "PROTECTED" : "FREE");
   }
   return verdict("FREE");
 }
@@ -360,17 +387,20 @@ type WarmSessionRow = {
   lastUsedAt: Date;
   tokens: number;
   overridePercent: number | null;
+  inFlight: boolean;
 };
 
 /**
  * Reads the warm set of the given member KV pools with one bounded,
  * non-locking query (indexed by `[executionTargetId, lastUsedAt]`). A session
- * is the set of records one request wrote on one target: they share tenant,
- * pool, target, binding and `lastUsedAt`. Its size is the largest
- * `estimatedTokens` among them (every record carries the whole prompt
- * estimate). Records from every pool of the owner count, since they share the
- * physical KV pool; each session's override comes from its own pool (the
- * tenant's grant, or the pool's owner percent when the tenant is the owner).
+ * is the set of records that carry one `sessionId` (a row without one is its
+ * own session): its age is its newest record's, its size the largest
+ * `estimatedTokens` among the records of that newest instant (every record of
+ * a request carries the whole prompt estimate). Records from every pool of
+ * the owner count, since they share the physical KV pool; each session's
+ * override comes from its own pool (the tenant's grant, or the pool's owner
+ * percent when the tenant is the owner). A session is `inFlight` when an
+ * active lease of the same member holds a request that continues it.
  *
  * Affinity records are written and expired on the application clock
  * (`lastUsedAt`, `expiresAt`), so the window is evaluated on the same clock.
@@ -394,7 +424,9 @@ export async function loadWarmSessions({
   const since = new Date(now.getTime() - policy.windowSeconds * 1000);
   const rows = await prisma.$queryRaw<WarmSessionRow[]>(Prisma.sql`
     WITH candidate AS (
-      SELECT r.*, t."inferenceCapacityId" AS "capacityId"
+      SELECT r.id, COALESCE(r."sessionId", r.id) AS "sessionKey",
+             r."tenantUserId", r."poolId", r."userId", r."lastUsedAt",
+             r."estimatedTokens", r."executionTargetId", t."inferenceCapacityId" AS "capacityId"
         FROM cache_affinity_record r
         JOIN execution_target t ON t.id = r."executionTargetId"
        WHERE r."userId" = ${ownerId}
@@ -402,40 +434,40 @@ export async function loadWarmSessions({
          AND t."inferenceCapacityId" IN (${Prisma.join([...capacityIds])})
          AND r."lastUsedAt" >= ${since}
          AND r."expiresAt" > ${now}
-         -- Prefix records below the floor never change a session's size or
-         -- eligibility (their group's MAX is what counts), so they are dropped
-         -- here to keep the scan cheap. Conversation records stay: a sub-floor or
-         -- estimate-less conversation record still covers its instant's group.
-         AND (r."prefixDigest" IS NULL OR r."estimatedTokens" >= ${policy.minTokens})
+         -- Sub-floor records never make a session eligible on their own, so
+         -- they are dropped here to keep the scan cheap. (A session whose
+         -- latest turn shrank below the floor keeps its older, larger turn as
+         -- its size: the engine still holds that longer prefix.)
+         AND r."estimatedTokens" >= ${policy.minTokens}
     ),
     session AS (
-      -- An explicit conversation is one session: its (single, refreshed)
-      -- conversation record, whatever else shares its timestamp.
-      SELECT c."capacityId", c."tenantUserId", c."poolId", c."userId",
+      -- One session per session id: its latest turn (the newest instant of
+      -- its records; the largest estimate among that instant's records, since
+      -- every record of a request carries the whole prompt estimate).
+      SELECT DISTINCT ON (c."sessionKey")
+             c."sessionKey", c."capacityId", c."executionTargetId", c."tenantUserId", c."poolId", c."userId",
              c."lastUsedAt", c."estimatedTokens" AS tokens
         FROM candidate c
-       WHERE c."conversationDigest" IS NOT NULL AND c."prefixDigest" IS NULL
-      UNION ALL
-      -- Prefix-only traffic: the prefix records one request wrote share
-      -- tenant, pool, target, binding and lastUsedAt. A group that a
-      -- conversation record of the same instant already covers is not repeated.
-      SELECT c."capacityId", c."tenantUserId", c."poolId", c."userId",
-             c."lastUsedAt", MAX(c."estimatedTokens") AS tokens
-        FROM candidate c
-       WHERE c."prefixDigest" IS NOT NULL
-         AND NOT EXISTS (
-           SELECT 1 FROM candidate v
-            WHERE v."conversationDigest" IS NOT NULL AND v."prefixDigest" IS NULL
-              AND v."tenantUserId" = c."tenantUserId" AND v."poolId" = c."poolId"
-              AND v."executionTargetId" = c."executionTargetId"
-              AND v."bindingDigest" = c."bindingDigest"
-              AND v."lastUsedAt" = c."lastUsedAt")
-       GROUP BY c."capacityId", c."tenantUserId", c."userId", c."poolId",
-                c."executionTargetId", c."bindingDigest", c."lastUsedAt"
+       ORDER BY c."sessionKey", c."lastUsedAt" DESC, c."estimatedTokens" DESC
+    ),
+    served AS (
+      -- Sessions an active lease of the same capacity AND execution target is
+      -- serving right now (targets sharing a capacity keep separate sessions).
+      SELECT DISTINCT l."capacityId", l."executionTargetId", served_session AS "sessionKey"
+        FROM capacity_lease l
+        JOIN admission_request a ON a.id = l."admissionRequestId"
+        CROSS JOIN LATERAL unnest(a."warmSessionIds") AS served_session
+       WHERE l."capacityId" IN (${Prisma.join([...capacityIds])})
+         AND l.state = 'ACTIVE'
+         AND l."expiresAt" > ${now}
     ),
     scoped AS (
       SELECT s."capacityId", s."tenantUserId" AS "userId", s."lastUsedAt",
              s.tokens::int AS tokens,
+             EXISTS (SELECT 1 FROM served v
+                      WHERE v."capacityId" = s."capacityId"
+                        AND v."executionTargetId" = s."executionTargetId"
+                        AND v."sessionKey" = s."sessionKey") AS "inFlight",
              CASE WHEN s."tenantUserId" = s."userId"
                   THEN p."ownerProtectionPercent"
                   ELSE g."protectionOverridePercent" END AS "overridePercent"
@@ -455,7 +487,7 @@ export async function loadWarmSessions({
        -- not use up the read bound either.
        WHERE "overridePercent" IS DISTINCT FROM 0
     )
-    SELECT "capacityId", "userId", "lastUsedAt", tokens, "overridePercent"
+    SELECT "capacityId", "userId", "lastUsedAt", tokens, "overridePercent", "inFlight"
       FROM ranked
      WHERE "rank" <= ${limitPerUser}
      ORDER BY "lastUsedAt" DESC
@@ -467,6 +499,7 @@ export async function loadWarmSessions({
       ageMs: Math.max(0, now.getTime() - row.lastUsedAt.getTime()),
       tokens: Number(row.tokens),
       overridePercent: row.overridePercent === null ? null : Number(row.overridePercent),
+      inFlight: row.inFlight,
     });
     sessions.set(row.capacityId, list);
   }

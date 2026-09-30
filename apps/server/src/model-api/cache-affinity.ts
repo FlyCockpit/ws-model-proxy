@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import prisma from "@ws-model-proxy/db";
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
@@ -52,7 +53,80 @@ export type AffinityDecision = {
    * only; used to size the cache-holder wait (saturation S-A).
    */
   prefixTokens?: Record<string, number>;
+  /**
+   * The warm session this request continues, per target (S-C): see
+   * `continuedSessionKey`. Absent = a new session on that target.
+   */
+  matchedSessionIds?: Record<string, string>;
 };
+
+/** Durable internal Responses binding; the digest binds caller, pool, grant and runtime. */
+export type AffinitySessionBinding = { sessionId: string; bindingDigest: string };
+
+export function scopedAffinitySessionId(
+  binding: AffinitySessionBinding | null | undefined,
+  bindingDigest: string,
+): string | undefined {
+  return binding?.sessionId && binding.bindingDigest === bindingDigest
+    ? binding.sessionId
+    : undefined;
+}
+
+/** A stored record as far as session identity is concerned. */
+export type SessionIdentityRecord = {
+  id: string;
+  sessionId: string | null;
+  prefixDigest: string | null;
+  conversationDigest: string | null;
+  lastUsedAt?: Date;
+};
+
+/**
+ * The ONE place that decides which existing warm session a request continues
+ * (routing reads it to link a lease to its session, and `rememberAffinity` to
+ * stamp the records it writes). `records` are the target's stored records that
+ * share the request's binding. Order of authority:
+ * 1. the explicit conversation's own record (a caller-supplied conversation id
+ *    is the session, whatever the history or the request parameters do);
+ * 2. only for a continuation, the deepest cumulative-prefix record the
+ *    request's history still contains (an edited or shortened history still
+ *    shares its earlier prefix); most recently used among equal depths.
+ * Instruction-layer records are not conversation evidence and never link.
+ * Returns the record's `sessionId`, or its own id for rows from before
+ * session ids existed; null = a new session.
+ */
+export function continuedSessionKey(
+  records: readonly SessionIdentityRecord[],
+  request: {
+    conversationDigest: string | null;
+    isContinuation: boolean;
+    /** Cumulative prefix digests of the request's conversation, depth = index + 1. */
+    digests: readonly string[];
+  },
+): string | null {
+  const key = (record: SessionIdentityRecord) => record.sessionId ?? record.id;
+  const newest = (left: SessionIdentityRecord, right: SessionIdentityRecord) =>
+    (right.lastUsedAt?.getTime() ?? 0) - (left.lastUsedAt?.getTime() ?? 0);
+  if (request.conversationDigest) {
+    const own = records
+      .filter(
+        (record) =>
+          record.prefixDigest === null && record.conversationDigest === request.conversationDigest,
+      )
+      .sort(newest)[0];
+    if (own) return key(own);
+  }
+  if (!request.isContinuation) return null;
+  const depthByDigest = new Map(request.digests.map((digest, index) => [digest, index + 1]));
+  let best: { depth: number; record: SessionIdentityRecord } | null = null;
+  for (const record of records) {
+    const depth = record.prefixDigest ? (depthByDigest.get(record.prefixDigest) ?? 0) : 0;
+    if (depth === 0) continue;
+    if (!best || depth > best.depth || (depth === best.depth && newest(best.record, record) > 0))
+      best = { depth, record };
+  }
+  return best ? key(best.record) : null;
+}
 
 export function buildAffinityTargetIdentity(parts: {
   executionTargetId: string;
@@ -242,6 +316,7 @@ export async function rankAffinityTargets({
     conversationMatches: {},
     reasons: {},
     matchedPrefixDepth: 0,
+    matchedSessionIds: {},
   };
   // With `scoreSingleTarget`, a single target is still scored: warm-session
   // protection (S-C) needs to know whether this request continues a session
@@ -304,6 +379,9 @@ export async function rankAffinityTargets({
         ],
       },
       select: {
+        id: true,
+        sessionId: true,
+        lastUsedAt: true,
         executionTargetId: true,
         targetIdentity: true,
         bindingDigest: true,
@@ -392,6 +470,11 @@ export async function rankAffinityTargets({
         ? compatible.find((record) => record.conversationDigest === material.conversationDigest)
         : undefined);
     const prefixTokens = matchedRecord?.estimatedTokens ?? undefined;
+    const sessionId = continuedSessionKey(compatible, {
+      conversationDigest: material.hasExplicitConversation ? material.conversationDigest : null,
+      isContinuation: material.isContinuation,
+      digests: material.digests,
+    });
     const active = target.activeLoad ?? activeByCapacity.get(target.capacityId) ?? 0;
     const waiting = target.waitingLoad ?? waitingByCapacity.get(target.capacityId) ?? 0;
     const normalizedLoad = target.hardConcurrencyLimit
@@ -417,6 +500,7 @@ export async function rankAffinityTargets({
       waiting,
       isContinuation: material.isContinuation,
       prefixTokens,
+      sessionId,
     };
   });
   scored.sort(
@@ -462,6 +546,11 @@ export async function rankAffinityTargets({
         prefixTokens === undefined ? [] : [[target.executionTargetId, prefixTokens]],
       ),
     ),
+    matchedSessionIds: Object.fromEntries(
+      scored.flatMap(({ target, sessionId }) =>
+        sessionId === null ? [] : [[target.executionTargetId, sessionId]],
+      ),
+    ),
   };
 }
 
@@ -477,6 +566,7 @@ export async function rememberAffinity({
   target,
   estimatedTokens,
   engineCacheConfirmed,
+  sessionBinding,
   now = new Date(),
 }: {
   ownerId: string;
@@ -496,9 +586,11 @@ export async function rememberAffinity({
    * usage) leaves any previously stored value untouched.
    */
   engineCacheConfirmed?: boolean;
+  /** Internal native Responses continuation, read only from the durable sticky row. */
+  sessionBinding?: AffinitySessionBinding;
   now?: Date;
-}): Promise<void> {
-  if (!policy.enabled) return;
+}): Promise<AffinitySessionBinding | null> {
+  if (!policy.enabled) return null;
   const material = affinityPrefixDigests({
     ownerId,
     resourceOwnerId,
@@ -514,13 +606,15 @@ export async function rememberAffinity({
     material.digests.length === 0 &&
     !material.conversationDigest
   ) {
-    return;
+    return null;
   }
+  const boundSessionId = scopedAffinitySessionId(sessionBinding, material.bindingDigest);
   const expiresAt = new Date(now.getTime() + policy.ttlSeconds * 1000);
   // Every record this call writes (created or refreshed) carries the same
-  // `lastUsedAt`: warm-session protection (S-C, ./warm-protection.ts) groups
-  // them into one session by it, and sizes the session by `estimatedTokens`.
-  await prisma.$transaction(async (tx) => {
+  // `lastUsedAt` and `sessionId`: warm-session protection (S-C,
+  // ./warm-protection.ts) groups records into one session by the id, dates it
+  // by its newest record and sizes it by that instant's `estimatedTokens`.
+  return prisma.$transaction(async (tx) => {
     // Serialize retention enforcement per owner/pool so concurrent successful
     // requests cannot race past the configured bound: the cache-affinity
     // fence, taken before any row (writer class H,
@@ -532,7 +626,7 @@ export async function rememberAffinity({
       where: { id: poolId, userId: resourceOwnerId },
       select: { id: true },
     });
-    if (!pool) return;
+    if (!pool) return null;
     await tx.cacheAffinityRecord.deleteMany({
       where: {
         userId: resourceOwnerId,
@@ -541,6 +635,44 @@ export async function rememberAffinity({
         expiresAt: { lte: now },
       },
     });
+    // The session this request continues (or a new one), read under the pool
+    // fence so concurrent writers of one conversation agree on it. A scoped
+    // native binding also identifies continuations carrying only the new input.
+    const sessionId =
+      boundSessionId ??
+      continuedSessionKey(
+        await tx.cacheAffinityRecord.findMany({
+          where: {
+            userId: resourceOwnerId,
+            tenantUserId: ownerId,
+            poolId,
+            executionTargetId: target.executionTargetId,
+            targetIdentity: target.targetIdentity,
+            bindingDigest: material.bindingDigest,
+            digestVersion: DIGEST_VERSION,
+            expiresAt: { gt: now },
+            OR: [
+              ...(material.digests.length ? [{ prefixDigest: { in: material.digests } }] : []),
+              ...(material.conversationDigest
+                ? [{ conversationDigest: material.conversationDigest }]
+                : []),
+            ],
+          },
+          select: {
+            id: true,
+            sessionId: true,
+            prefixDigest: true,
+            conversationDigest: true,
+            lastUsedAt: true,
+          },
+        }),
+        {
+          conversationDigest: material.conversationDigest,
+          isContinuation: material.isContinuation,
+          digests: material.digests,
+        },
+      ) ??
+      randomUUID();
     const upsertPrefix = async (prefixDigest: string, prefixDepth: number) => {
       await tx.cacheAffinityRecord.upsert({
         where: {
@@ -562,6 +694,7 @@ export async function rememberAffinity({
           bindingDigest: material.bindingDigest,
           prefixDigest,
           conversationDigest: null,
+          sessionId,
           prefixDepth,
           digestVersion: DIGEST_VERSION,
           estimatedTokens,
@@ -572,6 +705,7 @@ export async function rememberAffinity({
         update: {
           lastUsedAt: now,
           expiresAt,
+          sessionId,
           estimatedTokens,
           ...(engineCacheConfirmed === undefined ? {} : { engineCacheConfirmed }),
         },
@@ -603,6 +737,7 @@ export async function rememberAffinity({
           data: {
             lastUsedAt: now,
             expiresAt,
+            sessionId,
             estimatedTokens,
             ...(engineCacheConfirmed === undefined ? {} : { engineCacheConfirmed }),
           },
@@ -612,6 +747,7 @@ export async function rememberAffinity({
           data: {
             userId: resourceOwnerId,
             ...identity,
+            sessionId,
             prefixDepth: 0,
             digestVersion: DIGEST_VERSION,
             estimatedTokens,
@@ -638,6 +774,7 @@ export async function rememberAffinity({
         where: { id: { in: overflow.map(({ id }) => id) } },
       });
     }
+    return { sessionId, bindingDigest: material.bindingDigest };
   });
 }
 

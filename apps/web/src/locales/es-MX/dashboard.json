@@ -538,7 +538,7 @@
     },
     "protection": {
       "title": "Proteger conversaciones activas",
-      "description": "Una conversación nueva evita un miembro cuya capacidad libre todavía guarda cachés de prompt recientes y grandes de otras conversaciones cuando otro miembro (o, con :external, un proveedor externo) puede atenderla. La protección solo redirige: nunca hace esperar una solicitud, y una continuación siempre vuelve a su miembro con caché.",
+      "description": "Una conversación nueva evita un miembro cuya capacidad libre todavía guarda cachés de prompt recientes y grandes de sesiones calientes protegidas (incluidas las tuyas) cuando otro miembro (o, con :external, un proveedor externo) puede atenderla. La protección solo redirige: nunca hace esperar una solicitud, y una continuación siempre vuelve a su miembro con caché.",
       "enabled": "Proteger conversaciones activas",
       "windowSeconds": "Ventana de protección (segundos)",
       "minTokens": "Tamaño mínimo de la conversación (tokens)",
