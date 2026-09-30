@@ -15,11 +15,17 @@
 //! in bounded pieces cut at whitespace (an unbroken piece uses the cap).
 //! A secret-name token could occur AFTER an arbitrary public prefix. Therefore
 //! an overlong line emits only `⟦redacted line⟧`, with no prefix or token tail.
-//! At its terminating LF, a fresh scanner is primed through [`LineMasker::scan`]
-//! as a column-0 secret-name token line: the next non-blank line is masked whole,
-//! and subsequent lines indented deeper than column 0 stay masked. Blank lines
-//! do not consume that next-line protection. Normal scanning then resumes.
-//! CR/LF bytes are copied even while the overlong line is opaque.
+//! When an opener is still live as the line crosses the cap (an open private-key
+//! block, quote/backslash run or indentation run), the rest of that stream is
+//! opaque through EOF like the [`MAX_STATE_INPUT_BYTES`] fallback: the state a
+//! fresh scanner would lose is exactly what masks the lines that follow, so
+//! recovering there would emit them. The check reads the state of the previous
+//! complete line, because the overlong line's own bytes are not scanned yet.
+//! With no live opener, at its terminating LF a fresh scanner is primed through
+//! [`LineMasker::scan`] as a column-0 secret-name token line: the next non-blank
+//! line is masked whole, and subsequent lines indented deeper than column 0 stay
+//! masked. Blank lines do not consume that next-line protection. Normal scanning
+//! then resumes. CR/LF bytes are copied even while the overlong line is opaque.
 //! Open-state input is also capped by [`MAX_STATE_INPUT_BYTES`]; exceeding it
 //! frees scanner state and makes every remaining nonempty line opaque through
 //! EOF, preserving CR/LF. This accepted residual bounds live PEM/indentation
@@ -49,7 +55,11 @@ const LINE_MARKER: &[u8] = "⟦redacted line⟧".as_bytes();
 #[derive(Debug, PartialEq, Eq)]
 enum Mode {
     Scanning,
+    /// The overlong line and the next non-blank line are masked; scanning
+    /// resumes. Used only when no multi-line opener was live at the transition.
     OverlongLine,
+    /// Every remaining nonempty line is opaque through EOF (the 1 MiB state
+    /// fallback, and an overlong line inside a live opener).
     OpaqueStream,
 }
 
@@ -109,7 +119,21 @@ impl StreamMasker {
             }
             if self.pending.len() == MAX_HELD_BYTES {
                 if self.mode == Mode::Scanning {
-                    self.mode = Mode::OverlongLine;
+                    // The scanner state describes the previous complete line(s).
+                    // Dropping a live opener here would leave the column-0 lines
+                    // that follow it — a PEM body, an open-quote run, a block —
+                    // to be emitted raw at the terminating LF, so fail closed to
+                    // EOF instead. An overlong line with no live opener recovers.
+                    // `recovery_pending` is the only state that masks without an
+                    // opener: the synthetic column-0 lookahead primed after an
+                    // earlier recoverable overlong line, so a second overlong
+                    // line still recovers.
+                    let live_opener = self.masker.in_continuation() && !self.recovery_pending;
+                    self.mode = if live_opener {
+                        Mode::OpaqueStream
+                    } else {
+                        Mode::OverlongLine
+                    };
                     self.reset_scanner();
                     Self::emit_opaque(&mut self.opaque_line, &self.pending, &mut out);
                 }
@@ -498,6 +522,72 @@ mod tests {
         assert!(masker.finish().is_empty());
     }
 
+    /// Asserts `run` reproduces `expected` for every split of `input` near a
+    /// line start, an LF, a piece cut (line start + cap) or the end, for a
+    /// bytewise feed inside those windows, and for a 4 KiB chunked feed. Also
+    /// injects every `hidden` secret into the check. Interior offsets of a long
+    /// opaque run add nothing, so they are fed in 4 KiB chunks. (All offsets of
+    /// a 3 MiB input x a handful of rows took minutes.)
+    fn assert_split_invariant(
+        command: &str,
+        name: &str,
+        input: &str,
+        expected: &str,
+        hidden: &[String],
+    ) {
+        let bytes = input.as_bytes();
+        assert_eq!(
+            run(command, &[bytes], hidden),
+            expected.as_bytes(),
+            "{name}"
+        );
+        let len = bytes.len();
+        let mut interesting = vec![0, len];
+        let mut line_start = 0;
+        for (at, byte) in bytes.iter().enumerate() {
+            if *byte == b'\n' {
+                interesting.push(at);
+                interesting.push(at + 1);
+                interesting.push(line_start + MAX_HELD_BYTES);
+                line_start = at + 1;
+            }
+        }
+        interesting.push(line_start + MAX_HELD_BYTES);
+        let mut near = vec![false; len + 1];
+        for centre in interesting {
+            let (from, to) = (centre.saturating_sub(6), (centre + 6).min(len));
+            near.iter_mut()
+                .take(to + 1)
+                .skip(from)
+                .for_each(|flag| *flag = true);
+        }
+        for at in (0..=len).filter(|at| near[*at]) {
+            assert_eq!(
+                run(command, &[&bytes[..at], &bytes[at..]], hidden),
+                expected.as_bytes(),
+                "{name} split {at}"
+            );
+        }
+        let mut chunks: Vec<&[u8]> = Vec::new();
+        let mut at = 0;
+        while at < len {
+            let step = if near[at] { 1 } else { 4096.min(len - at) };
+            let end = (at + step).min(len);
+            // never run a big chunk into a near window
+            let end = (at + 1..=end)
+                .find(|e| near[*e] && *e > at + 1)
+                .map_or(end, |e| e - 1)
+                .max(at + 1);
+            chunks.push(&bytes[at..end]);
+            at = end;
+        }
+        assert_eq!(
+            run(command, &chunks, hidden),
+            expected.as_bytes(),
+            "{name} chunked"
+        );
+    }
+
     #[test]
     fn overlong_line_recovery_is_invariant_at_every_split_and_bytewise() {
         let long = "z".repeat(MAX_HELD_BYTES + 1);
@@ -541,61 +631,74 @@ mod tests {
                 "⟦redacted line⟧".to_string(),
             ),
         ] {
-            let bytes = input.as_bytes();
-            assert_eq!(
-                run("show", &[bytes], &pem.hidden),
-                expected.as_bytes(),
-                "{name}"
-            );
             // Interior offsets of a long opaque run add nothing, so test every
             // split within 6 bytes of a line start, an LF, a piece cut (line
             // start + cap) and the end; feed bytewise in those windows and in
-            // 4 KiB chunks elsewhere. (All 65k offsets x 6 rows took minutes.)
-            let len = bytes.len();
-            let mut interesting = vec![0, len];
-            let mut line_start = 0;
-            for (at, byte) in bytes.iter().enumerate() {
-                if *byte == b'\n' {
-                    interesting.push(at);
-                    interesting.push(at + 1);
-                    interesting.push(line_start + MAX_HELD_BYTES);
-                    line_start = at + 1;
-                }
-            }
-            interesting.push(line_start + MAX_HELD_BYTES);
-            let mut near = vec![false; len + 1];
-            for centre in interesting {
-                let (from, to) = (centre.saturating_sub(6), (centre + 6).min(len));
-                near.iter_mut()
-                    .take(to + 1)
-                    .skip(from)
-                    .for_each(|flag| *flag = true);
-            }
-            for at in (0..=len).filter(|at| near[*at]) {
-                assert_eq!(
-                    run("show", &[&bytes[..at], &bytes[at..]], &pem.hidden),
-                    expected.as_bytes(),
-                    "{name} split {at}"
-                );
-            }
-            let mut chunks: Vec<&[u8]> = Vec::new();
-            let mut at = 0;
-            while at < len {
-                let step = if near[at] { 1 } else { 4096.min(len - at) };
-                let end = (at + step).min(len);
-                // never run a big chunk into a near window
-                let end = (at + 1..=end)
-                    .find(|e| near[*e] && *e > at + 1)
-                    .map_or(end, |e| e - 1)
-                    .max(at + 1);
-                chunks.push(&bytes[at..end]);
-                at = end;
-            }
-            assert_eq!(
-                run("show", &chunks, &pem.hidden),
-                expected.as_bytes(),
-                "{name} chunked"
-            );
+            // 4 KiB chunks elsewhere.
+            assert_split_invariant("show", name, &input, &expected, &pem.hidden);
+        }
+    }
+
+    /// Every row here starts with a live multi-line opener, crosses the hold cap
+    /// on a line inside it, and then prints column-0 body lines that the opener
+    /// would still mask. The cap transition must not drop that opener: the
+    /// stream goes opaque through EOF. The last row has no live opener and must
+    /// still recover at the terminating LF, and the row after it pins that the
+    /// fail-closed transition does not leak a later same-stream secret either.
+    #[test]
+    fn an_overlong_line_inside_a_live_opener_makes_the_rest_of_the_stream_opaque() {
+        let long = "z".repeat(MAX_HELD_BYTES + 1);
+        let overlong_blank = format!("\n{}", " ".repeat(MAX_HELD_BYTES + 1));
+        // The private-key markers live in the owner-approved fixture directory,
+        // the only place fake secret-shaped text is allowed (see policy-checks).
+        let begin = include_str!("../tests/fixtures/masking/stream-overlong.txt");
+        let begin = begin.trim_end();
+        let end = "-----END PRIVATE KEY-----";
+        for (name, input, expected) in [
+            (
+                "PEM body",
+                format!("{begin}\n{long}\nb64bodysecret107-three\n{end}\nvisible\n"),
+                "⟦redacted⟧\n⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n"
+                    .to_string(),
+            ),
+            (
+                "open quote run",
+                format!("APP_TOKEN\nquote-open \"{long}\nquoterunsecret107-three\n\nvisible\n"),
+                "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n\n⟦redacted line⟧\n"
+                    .to_string(),
+            ),
+            (
+                // The line that crosses the cap is blanks-only but indented, so
+                // it is part of the run: opaque through EOF with the blank left
+                // as it was (its bytes are not secret).
+                "indentation block, blank line inside",
+                format!("APP_SECRET:\n{overlong_blank}\nindentblocksecret107-three\nvisible\n"),
+                "⟦redacted line⟧\n\n⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n"
+                    .to_string(),
+            ),
+            (
+                "indentation block, dedent to column 0",
+                format!("APP_SECRET:\n{long}\nindentblocksecret107-three\nvisible\n"),
+                "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n".to_string(),
+            ),
+            (
+                "no live opener still recovers",
+                format!("{long}\nnext\n  continuation\nvisible\n"),
+                "⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\nvisible\n".to_string(),
+            ),
+            (
+                "opaque to EOF hides a later PEM too",
+                format!("{begin}\n{long}\nlatepemsecret107-three\n{end}\n"),
+                "⟦redacted⟧\n⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted line⟧\n".to_string(),
+            ),
+        ] {
+            let hidden = [
+                "b64bodysecret107-three".to_string(),
+                "quoterunsecret107-three".to_string(),
+                "indentblocksecret107-three".to_string(),
+                "latepemsecret107-three".to_string(),
+            ];
+            assert_split_invariant("show", name, &input, &expected, &hidden);
         }
     }
 
@@ -682,6 +785,36 @@ mod tests {
     fn the_documented_bounds_are_pinned() {
         assert_eq!(MAX_HELD_BYTES, 64 * 1024);
         assert_eq!(MAX_STATE_INPUT_BYTES, 1024 * 1024);
+    }
+
+    /// The live-state counter measures the CURRENT run, not the stream: a run
+    /// that closes before the cap must reset it. Many separate short runs feed
+    /// more than `MAX_STATE_INPUT_BYTES` in total; the stream must stay
+    /// recoverable (each row is a fresh counter reset), not opaque.
+    #[test]
+    fn closing_a_continuation_resets_the_live_state_counter() {
+        let mut input = String::new();
+        let mut expected = String::new();
+        let runs = MAX_STATE_INPUT_BYTES / 32 + 1;
+        for _ in 0..runs {
+            input.push_str("APP_SECRET:\n  first-secret-107\n  second-secret-107\n\npublic\n");
+            expected.push_str("⟦redacted line⟧\n⟦redacted line⟧\n⟦redacted⟧\n\npublic\n");
+        }
+        assert!(input.len() > MAX_STATE_INPUT_BYTES);
+        // A live tail is what the recovery marker covers; the point here is that
+        // the counter stayed below the cap (the mode never becomes opaque).
+        input.push_str("result: 42\n");
+        expected.push_str("result: 42\n");
+        let mut masker = StreamMasker::new("show");
+        let mut output = Vec::new();
+        let bytes = input.as_bytes();
+        for chunk in bytes.chunks(997) {
+            output.extend(masker.push(chunk));
+            assert!(masker.state_input_bytes <= MAX_STATE_INPUT_BYTES);
+            assert_ne!(masker.mode, Mode::OpaqueStream, "counter never reset");
+        }
+        output.extend(masker.finish());
+        assert_eq!(output, expected.as_bytes());
     }
 
     #[test]

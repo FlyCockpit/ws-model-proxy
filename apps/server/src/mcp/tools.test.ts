@@ -1430,9 +1430,12 @@ describe("CLI command tools", () => {
         "dotenv view",
         "NOT masked",
         "not a security boundary",
-        "A line over 64 KiB is masked whole, along with the next non-blank line",
-        "subsequent lines indented deeper than column 0; normal scanning then resumes",
-        "more than 1 MiB of live masking-state input makes the remaining stream fail closed through EOF",
+        "A line over 64 KiB is masked whole",
+        "inside a live multi-line secret run",
+        "the next non-blank line and subsequent lines indented deeper than column 0 are masked and normal scanning resumes",
+        "Two accepted residuals fail closed through EOF",
+        "more than 1 MiB of live masking-state input",
+        "an over-long line inside such a run",
       ]) {
         expect(tool?.description).toContain(phrase);
       }

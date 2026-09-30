@@ -335,14 +335,19 @@ continue until a blank line. Printed dotenv-style token lines are masked whole;
 Each normal line is scanned once, held until LF or EOF/completion, with at most
 64 KiB held per stream and no filesystem access. An overlong line is scanned
 in bounded pieces at whitespace and masked whole, never emitting a prefix or
-unbroken token tail. At its terminating LF, the scanner resets and treats that
-line as a column-0 secret-name token line: the next non-blank line is masked
-whole, then subsequent lines indented deeper than column 0 stay masked until
-normal scanning resumes. Blank lines do not consume the next-line protection;
-PEM and other opener detection still run on protected lines. CR/LF bytes are
-preserved. Accepted residual: more than 1 MiB of input contributing live masking
-state makes every remaining nonempty line opaque through EOF, bounding
-PEM/indentation state without recovery. The latency bound is in bytes; a silent
+unbroken token tail. When the overlong line begins inside a live multi-line
+secret run — an open private-key PEM block, an open quote or backslash
+continuation, an indentation run — that run's remaining output is opaque through
+EOF, like the 1 MiB case, because the state a fresh scanner would drop is what
+masks the lines that follow. Otherwise, at its terminating LF the scanner resets
+and treats that line as a column-0 secret-name token line: the next non-blank
+line is masked whole, then subsequent lines indented deeper than column 0 stay
+masked until normal scanning resumes. Blank lines do not consume the next-line
+protection; PEM and other opener detection still run on protected lines. CR/LF
+bytes are preserved. Two accepted residuals stay opaque through EOF: more than
+1 MiB of input contributing live masking state bounds PEM/indentation state, and
+an over-long line inside a live run fails closed instead of dropping the opener.
+The latency bound is in bytes; a silent
 process has no wall-clock flush deadline. Invalid UTF-8 passes through when its
 lossy scan finds no mask. EOF flushes partial output; teardown flushes exec tails or
 discards unshared capture. Masking precedes the 8 KiB head / 40 KiB tail cuts,

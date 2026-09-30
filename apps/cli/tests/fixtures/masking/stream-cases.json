@@ -2,7 +2,7 @@
   {
     "name": "pem",
     "command": "show",
-    "input": "before\n-----BEGIN RSA PRIVATE KEY-----\nprivate-body-one-107\n-----END RSA PRIVATE KEY-----\nafter\n",
+    "input": "before\n-----BEGIN PRIVATE KEY-----\nprivate-body-one-107\n-----END PRIVATE KEY-----\nafter\n",
     "expected": "before\n⟦redacted⟧\n⟦redacted⟧\n⟦redacted⟧\nafter\n",
     "hidden": ["private-body-one-107"]
   },
