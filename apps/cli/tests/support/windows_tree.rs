@@ -32,7 +32,7 @@ stdio = {}
 if mode == 'detach':
     flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
     stdio = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-elif mode == 'success':
+elif mode in ('success', 'eof'):
     stdio = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 elif mode == 'breakaway':
     flags = subprocess.CREATE_BREAKAWAY_FROM_JOB
@@ -44,7 +44,13 @@ except OSError as e:
     pathlib.Path(marker).write_text('denied')
 else:
     pathlib.Path(marker).write_text(str(p.pid))
-if mode not in ('success', 'root-exit'):
+if mode == 'eof':
+    while not pathlib.Path(root).with_suffix('.eof').exists():
+        time.sleep(0.005)
+    os.close(1)
+    while not pathlib.Path(root).with_suffix('.exit').exists():
+        time.sleep(0.005)
+elif mode not in ('success', 'root-exit'):
     time.sleep(60)
 "#,
         )

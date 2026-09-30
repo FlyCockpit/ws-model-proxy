@@ -23,6 +23,7 @@ use process_wrap::tokio::{
 
 const LOCK_GRACE: Duration = Duration::from_millis(200);
 const POLL: Duration = Duration::from_millis(5);
+const REAPER_POLL_MAX: Duration = Duration::from_millis(250);
 
 pub(crate) fn lock_until<T>(lock: &Mutex<T>, until: Instant) -> io::Result<MutexGuard<'_, T>> {
     loop {
@@ -54,6 +55,18 @@ impl JobTree {
         self.pid
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_pid(mut self, pid: u32) -> Self {
+        self.pid = pid;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_job_lock(&self, while_locked: impl FnOnce()) {
+        let _guard = lock_until(&self.child, Instant::now()).expect("test job lock");
+        while_locked();
+    }
+
     /// The shared job-terminate path. Never use wrapper.kill()/wait(): those
     /// wait for the whole job and could block a timeout or shutdown forever.
     pub(crate) fn terminate_until(&self, until: Instant) -> io::Result<()> {
@@ -69,6 +82,9 @@ pub(crate) struct Child {
     job: JobTree,
     pub(crate) stdout: Option<ChildStdout>,
     pub(crate) stderr: Option<ChildStderr>,
+    // Set before attempting the kill; a cleanup owner must retry even when
+    // the root already exited. Root exit says nothing about descendants.
+    terminate_pending: bool,
     #[cfg(test)]
     terminate_on_drop: bool,
 }
@@ -88,17 +104,43 @@ impl Child {
         lock_until(&self.job.child, Instant::now())?.try_wait()
     }
 
-    /// Only the background reaper calls this, after job termination. It keeps
-    /// the run's Budget permit alive, without pinning the shutdown lock.
-    pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
+    /// Bounded termination enforcement for finish. Failure leaves durable
+    /// intent on the child, which moves with it to the cleanup owner.
+    pub(crate) fn ensure_terminated(&mut self, until: Instant) -> bool {
+        self.terminate_pending = true;
         loop {
+            if self.job.terminate_until(until).is_ok() {
+                self.terminate_pending = false;
+                return true;
+            }
+            let remaining = until.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            thread::sleep(remaining.min(POLL));
+        }
+    }
+
+    /// Only the background reaper calls this. It retains the registration
+    /// and Budget permit until any pending termination is issued and the
+    /// root is reaped, without pinning a registry or job lock across sleep.
+    pub(crate) fn wait(&mut self) -> io::Result<ExitStatus> {
+        let mut poll = POLL;
+        loop {
+            if self.terminate_pending && !self.ensure_terminated(Instant::now()) {
+                // Keep kill retries responsive; backoff is for an already
+                // terminated root stuck in kernel I/O, not a pending kill.
+                thread::sleep(POLL);
+                continue;
+            }
             match self.try_wait() {
                 Ok(Some(status)) => return Ok(status),
                 Ok(None) => {}
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error),
             }
-            thread::sleep(POLL);
+            thread::sleep(poll);
+            poll = (poll * 2).min(REAPER_POLL_MAX);
         }
     }
 
@@ -167,6 +209,7 @@ fn spawn_with(
         },
         stdout,
         stderr,
+        terminate_pending: false,
         #[cfg(test)]
         terminate_on_drop: true,
     })
@@ -178,6 +221,109 @@ mod tests {
     use crate::windows_test_tree::{Tree, assert_dead, process_exists};
     use process_wrap::tokio::CommandWrapper;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[derive(Debug)]
+    struct DelayedExit {
+        inner: Box<dyn TokioChildWrapper>,
+        remaining: usize,
+        polls: Arc<Mutex<Vec<Instant>>>,
+    }
+
+    impl TokioChildWrapper for DelayedExit {
+        fn inner(&self) -> &dyn TokioChildWrapper {
+            self.inner.as_ref()
+        }
+        fn inner_mut(&mut self) -> &mut dyn TokioChildWrapper {
+            self.inner.as_mut()
+        }
+        fn into_inner(self: Box<Self>) -> Box<dyn TokioChildWrapper> {
+            self.inner
+        }
+        fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+            lock_until(&self.polls, Instant::now())
+                .expect("poll log")
+                .push(Instant::now());
+            if self.remaining > 0 {
+                self.remaining -= 1;
+                Ok(None)
+            } else {
+                self.inner.try_wait()
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct DelayExit {
+        remaining: usize,
+        polls: Arc<Mutex<Vec<Instant>>>,
+    }
+
+    impl CommandWrapper for DelayExit {
+        fn wrap_child(
+            &mut self,
+            inner: Box<dyn TokioChildWrapper>,
+            _: &TokioCommandWrap,
+        ) -> io::Result<Box<dyn TokioChildWrapper>> {
+            Ok(Box::new(DelayedExit {
+                inner,
+                remaining: self.remaining,
+                polls: Arc::clone(&self.polls),
+            }))
+        }
+    }
+
+    #[test]
+    fn reaper_poll_backoff_is_bounded_and_releases_the_job_lock() {
+        // Immediate exit preserves normal cleanup. Growth/cap rows fail with
+        // the old fixed 5 ms loop; expected intervals describe the wakeup
+        // budget, measured through the actual Child::wait production loop.
+        for intervals in [
+            &[][..],
+            &[5, 10, 20, 40][..],
+            &[5, 10, 20, 40, 80, 160, 250, 250][..],
+        ] {
+            let polls = Arc::new(Mutex::new(Vec::new()));
+            let mut command = Command::new("cmd");
+            command.args(["/C", "exit 0"]);
+            let mut child = spawn_with(command, |command| {
+                command.wrap(DelayExit {
+                    remaining: intervals.len(),
+                    polls: Arc::clone(&polls),
+                });
+            })
+            .expect("delayed status job");
+            assert!(
+                !child.terminate_pending,
+                "a new child must not request termination"
+            );
+            thread::sleep(Duration::from_millis(100));
+            let job = child.job();
+            let waiter = thread::spawn(move || child.wait().expect("reaper exit"));
+            let until = Instant::now() + Duration::from_secs(5);
+            while !waiter.is_finished() {
+                assert!(Instant::now() < until, "reaper unbounded");
+                drop(
+                    lock_until(&job.child, Instant::now() + Duration::from_millis(100))
+                        .expect("job lock released between polls"),
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(waiter.join().expect("reaper thread").success());
+            let polls = lock_until(&polls, Instant::now()).expect("poll log");
+            assert!(polls.len() > intervals.len());
+            for (pair, millis) in polls.windows(2).zip(intervals) {
+                let elapsed = pair[1].duration_since(pair[0]);
+                assert!(
+                    elapsed >= Duration::from_millis(*millis),
+                    "poll interval {millis}: {elapsed:?}"
+                );
+                assert!(
+                    elapsed < REAPER_POLL_MAX + Duration::from_millis(250),
+                    "backoff exceeded cap: {elapsed:?}"
+                );
+            }
+        }
+    }
 
     /// Force JobObject's assignment setup to fail after the suspended spawn.
     /// This terminal wrapper deliberately exposes no native process handle.
