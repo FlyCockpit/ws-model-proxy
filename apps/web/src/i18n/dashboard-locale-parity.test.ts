@@ -182,6 +182,11 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
       "unsupervisedConfirm.cancel",
       "unsupervisedConfirm.confirm",
       "approvalRecommended",
+      "fileTools",
+      "fileToolAccess.headless",
+      "fileToolAccess.supervised",
+      "fileToolAccess.off",
+      "fileToolsAsRoot",
     ].sort();
     expect(keyTree(enDashboard.terminals).sort()).toEqual(terminalKeys);
     expect(keyTree(esDashboard.terminals).sort()).toEqual(terminalKeys);

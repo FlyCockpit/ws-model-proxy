@@ -162,6 +162,38 @@ describe("redactSecrets — key-fragment matrix", () => {
     expect(JSON.stringify(toJsonSafe(output))).not.toContain("CLASS_CIPHERTEXT_SENTINEL");
   });
 
+  it("keeps the boolean secretFile flag and redacts any NON-boolean value under it (M29)", () => {
+    // `secretFile` matches the `secret` fragment, so only a boolean may
+    // survive the redactor: a string or object under that key would otherwise
+    // carry a secret value into the transcript.
+    expect(
+      redactSecrets({
+        secretFile: true,
+        other: "keep",
+      }),
+    ).toEqual({ secretFile: true, other: "keep" });
+    expect(
+      redactSecrets({
+        secretFile: false,
+      }),
+    ).toEqual({ secretFile: false });
+    for (const value of [
+      "M29-SENTINEL-STRING",
+      { nested: "M29-SENTINEL" },
+      ["M29-SENTINEL"],
+      0,
+      null,
+      undefined,
+    ]) {
+      const output = redactSecrets({ secretFile: value, other: "keep" }) as Record<string, unknown>;
+      expect(output.secretFile).toBe(MCP_REDACTED_VALUE);
+      expect(output.other).toBe("keep");
+    }
+    // A different spelling of the key is not the flag, so it stays redacted.
+    expect(redactSecrets({ secret_file: true })).toEqual({ secret_file: MCP_REDACTED_VALUE });
+    expect(redactSecrets({ SECRETFILE: true })).toEqual({ SECRETFILE: true });
+  });
+
   it("never throws on hostile shapes", () => {
     expect(() => redactSecrets(undefined)).not.toThrow();
     expect(redactSecrets(undefined)).toBeUndefined();

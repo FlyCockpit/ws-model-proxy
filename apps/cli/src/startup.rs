@@ -19,6 +19,7 @@ pub struct TerminalStartup {
     allow_human_terminal: bool,
     mcp_command_mode: McpCommandMode,
     require_terminal_approval: bool,
+    allow_file_tools_as_root: bool,
     allow_remote_metric_sources: bool,
 }
 
@@ -52,6 +53,7 @@ impl TerminalStartup {
             allow_human_terminal: config.allow_human_terminal,
             mcp_command_mode: config.mcp_command_mode,
             require_terminal_approval: config.require_terminal_approval,
+            allow_file_tools_as_root: config.allow_file_tools_as_root,
             allow_remote_metric_sources: config.allow_remote_metric_sources,
         }
     }
@@ -81,6 +83,11 @@ impl TerminalStartup {
         self.require_terminal_approval
     }
 
+    /// `allowFileToolsAsRoot` as it was when the relay started.
+    pub fn allow_file_tools_as_root(&self) -> bool {
+        self.allow_file_tools_as_root
+    }
+
     /// The local remote-metric-source opt-in, fixed for the daemon's lifetime.
     pub fn allow_remote_metric_sources(&self) -> bool {
         self.allow_remote_metric_sources
@@ -101,6 +108,7 @@ impl TerminalStartup {
             allow_human_terminal: self.allow_human_terminal,
             mcp_command_mode: self.mcp_command_mode,
             require_terminal_approval: self.require_terminal_approval,
+            allow_file_tools_as_root: self.allow_file_tools_as_root,
             allow_remote_metric_sources: self.allow_remote_metric_sources,
             terminal_public_key_b64url: self.key.public_b64url().to_string(),
             terminal_identity,
@@ -127,6 +135,7 @@ mod tests {
             allow_human_terminal: true,
             mcp_command_mode: McpCommandMode::Unsupervised,
             require_terminal_approval: true,
+            allow_file_tools_as_root: true,
             allow_remote_metric_sources: true,
             ..Config::default()
         };
@@ -135,6 +144,7 @@ mod tests {
         config.allow_human_terminal = false;
         config.mcp_command_mode = McpCommandMode::Off;
         config.require_terminal_approval = false;
+        config.allow_file_tools_as_root = false;
         config.allow_remote_metric_sources = false;
         let capabilities = hello_capabilities(&startup, &config, "desk-01");
         assert!(capabilities.features.human_terminal);
@@ -161,7 +171,11 @@ mod tests {
         assert_eq!(capabilities.terminal_public_key, public_key);
         assert!(capabilities.terminal);
         assert!(capabilities.exec);
-        assert_eq!(capabilities.protocol_version, "2.7");
+        assert_eq!(capabilities.protocol_version, "2.8");
+        assert!(capabilities.file_ops);
+        assert!(!capabilities.features.mcp_file_read);
+        assert!(!capabilities.features.file_roots_configured);
+        assert!(capabilities.features.allow_file_tools_as_root);
         assert!(capabilities.terminal_viewers);
         assert!(capabilities.supervised_commands);
     }

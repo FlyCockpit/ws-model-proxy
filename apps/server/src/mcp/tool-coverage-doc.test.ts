@@ -40,6 +40,12 @@ vi.mock("../relay/cli-commands.js", () => ({
   waitCliCommand: vi.fn(),
   snapshotCliCommand: vi.fn(),
 }));
+vi.mock("../relay/cli-file-ops.js", () => ({
+  runFileOp: vi.fn(),
+  cancelFileOpsForToken: vi.fn(),
+  sweepExpiredFileOps: vi.fn(),
+  auditRefusedFileInput: vi.fn(),
+}));
 
 const DOC_URL = new URL("../../../../docs/mcp-tool-coverage.md", import.meta.url);
 

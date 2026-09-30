@@ -60,8 +60,18 @@ message (the CLI recognizes both the `Malformed relay protocol message.` of
 pre-2.6 servers and a 2.6 server's "This server requires wsmp ... (relay
 protocol 2.6)" reply, while a genuine future-server "upgrade wsmp" reply stays
 as the CLI's own upgrade error). Release notes for the first wsmp that speaks
-2.7 must say that the server and every CLI need upgrading together. Protocol
-2.8 goes to the MCP node file tools (#103) and 2.9 to model deployments.
+2.7 must say that the server and every CLI need upgrading together.
+
+Relay protocol 2.8 (the MCP node file tools, #103) replaces 2.7 the same way:
+a 2.7 wsmp connecting to a 2.8 server is refused with "This server requires a
+newer wsmp (relay protocol 2.8). Upgrade wsmp and restart it." and its device
+card shows "CLI upgrade required (protocol 2.7)". 2.8 defines every file frame
+at once (`file.op`, `file.cancel`, `file.body`, `file.result`, `file.rejected`,
+`file.data`, and the supervised-file `term.spawn` variant) so the fleet upgrades
+only once; a wsmp answers `unsupported` for the parts a later phase implements.
+Do not cut a wsmp release until the whole file-tools series (P2 to P5) has
+landed, and word that release note as a joint server and CLI upgrade to 2.8.
+Model deployments take 2.9.
 
 ## One-time setup
 

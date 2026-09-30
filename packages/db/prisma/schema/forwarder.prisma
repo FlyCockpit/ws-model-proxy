@@ -355,6 +355,8 @@ model CliDevice {
   reportedMcpCommandMode       McpCommandMode?
   reportedTerminalApproval     Boolean?
   reportedTerminalSupported    Boolean?
+  /// Relay 2.8: the CLI's `allowFileToolsAsRoot` config from its hello (null until a 2.8 hello).
+  reportedAllowFileToolsAsRoot Boolean?
   /// The machine's hostname from the latest hello. Null when not reported.
   reportedHostname             String?
   featuresReportedAt           DateTime?

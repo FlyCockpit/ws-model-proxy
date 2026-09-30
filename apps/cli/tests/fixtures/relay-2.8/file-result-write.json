@@ -1,0 +1,14 @@
+{
+  "type": "file.result",
+  "opId": "AAECAwQFBgcICQoLDA0ODw",
+  "op": "write",
+  "result": {
+    "etag": "h:AAAAAAAAAAAAAAAAAAAAAA",
+    "size": 812,
+    "created": true,
+    "added": 3,
+    "removed": 1,
+    "diff": "@@ -1 +1 @@\n-a\n+b\n",
+    "resolvedPath": "/home/u/deploy/run.sh"
+  }
+}

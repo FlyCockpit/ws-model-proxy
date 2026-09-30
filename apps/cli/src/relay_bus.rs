@@ -52,4 +52,11 @@ pub(crate) enum FromWorker {
     /// 2.7 `node.info` / `node.metrics` / `endpoint.load` text from the
     /// telemetry thread. Sent only after registration; never request-scoped.
     Telemetry(String),
+    /// 2.8: a node file op settled on a pool worker. The loop sends the frames
+    /// only while the session still has the op pending.
+    #[cfg(unix)]
+    FileFrames {
+        op_id: String,
+        frames: Vec<crate::file_relay::FileFrame>,
+    },
 }

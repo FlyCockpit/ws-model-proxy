@@ -27,7 +27,7 @@
  */
 
 import type { AuthInfo } from "@modelcontextprotocol/server";
-import type { McpRequestCredential } from "./cli-command-access";
+import type { McpRequestCredential } from "./cli-tool-access";
 import type { McpContext } from "./context";
 
 /** Everything a tool wrapper needs to execute on behalf of one verified request. */

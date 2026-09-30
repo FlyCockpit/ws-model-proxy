@@ -32,7 +32,7 @@ import type { StandardSchemaWithJSON } from "@modelcontextprotocol/server";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { z } from "zod";
 import { runChatCompletionDiagnostic, runPoolMemberTest } from "../model-api/diagnostics.js";
-import type { McpRequestCredential } from "./cli-command-access.js";
+import { FILE_BODY_MAX_BYTES } from "../relay/file-protocol.js";
 import {
   adaptCliCommandResultInput,
   adaptCliCommandRunInput,
@@ -44,6 +44,16 @@ import {
   runForwarderCliCommandResult,
   runForwarderCliSupervisedCommandStart,
 } from "./cli-command-tools.js";
+import {
+  auditFileInputRefusal,
+  FILE_TOOL_NOTES,
+  FILE_TOOLS,
+  type FileToolName,
+  fileToolCoreShape,
+  projectFileToolOutput,
+  runForwarderCliFileTool,
+} from "./cli-file-tools.js";
+import type { McpRequestCredential } from "./cli-tool-access.js";
 import {
   buildInputSchema,
   MCP_TOOL_INPUT_MAX_BYTES,
@@ -118,6 +128,17 @@ export interface McpToolDescriptor {
    */
   descriptionNote?: string;
   /**
+   * Called when a call to this tool is refused before its core runs (the input
+   * validator rejected the input, or the confirmation literal is missing), so
+   * the refusal can be audited. Metadata only: it receives the raw input and
+   * the verified user and credential, never a device it could trust.
+   * These tools validate in the wrapper so every refusal has a stable code.
+   */
+  auditInputRefusal?: (
+    input: unknown,
+    who: { userId: string; credential: McpRequestCredential },
+  ) => void;
+  /**
    * Deliver the core's result even if the admission signal aborts. CLI
    * command run uses this: abort ends the wait, not the command, and the
    * result must still carry `commandId`.
@@ -134,7 +155,15 @@ export type McpToolSpec = Omit<McpToolDescriptor, "inputSchema"> & McpInputOverl
 
 /** Turn one spec into its descriptor with the generated `inputSchema`. */
 export function buildDescriptor(spec: McpToolSpec): McpToolDescriptor {
-  const { forbiddenInputs, emptyArrayInputs, isoDateFields, coreShape, ...descriptor } = spec;
+  const {
+    forbiddenInputs,
+    emptyArrayInputs,
+    isoDateFields,
+    coreShape,
+    maxInputBytes,
+    shapeIsAdvisory,
+    ...descriptor
+  } = spec;
   if (isoDateFields !== undefined && descriptor.inputAdapter !== undefined) {
     throw new Error(`MCP tool ${spec.name}: isoDateFields and inputAdapter are exclusive`);
   }
@@ -148,6 +177,8 @@ export function buildDescriptor(spec: McpToolSpec): McpToolDescriptor {
       emptyArrayInputs,
       isoDateFields,
       coreShape,
+      maxInputBytes,
+      shapeIsAdvisory,
     }),
   };
 }
@@ -264,6 +295,20 @@ export function isoDateFieldsAdapter(fields: readonly string[]): (input: unknown
 export { MCP_TOOL_INPUT_MAX_BYTES };
 
 /**
+ * `forwarder_cli_file_write` advertises `content` at most
+ * {@link FILE_BODY_MAX_BYTES} DECODED. Base64 encodes 3 bytes into 4
+ * characters, so a 1 MiB body arrives as ~1.4 MiB of JSON text: its first-stage
+ * input bound is sized for the ENCODED form (4/3 of the cap plus headroom for
+ * the other fields); the decoded body stays capped at {@link FILE_BODY_MAX_BYTES}
+ * in `adaptFileToolInput`. The raw HTTP body is separately capped at 1 MiB by
+ * `mcpBodyCap` (`apps/server/src/mcp-rate-limit.ts`), so this bound is budget,
+ * not framing.
+ */
+const FILE_WRITE_FIELD_HEADROOM_BYTES = 64 * 1024;
+const FILE_WRITE_INPUT_MAX_BYTES =
+  Math.ceil((FILE_BODY_MAX_BYTES * 4) / 3) + FILE_WRITE_FIELD_HEADROOM_BYTES;
+
+/**
  * The owner's external-fallback switches (`fallbackEnabled`,
  * `fallbackForGrantees`) change who pays for external provider use, so MCP
  * changes them ONLY through `forwarder_pool_fallback_update`, whose
@@ -378,6 +423,36 @@ const PROVIDER_EGRESS_FEATURE = "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED";
 // The checked catalog — every entry's name/target pair is pinned against the
 // checked read/write catalog by tool-manifest.test.ts.
 // ---------------------------------------------------------------------------
+
+/**
+ * One node file tool (relay 2.8, #103) as an authored spec; `buildDescriptor`
+ * generates its `inputSchema` (#117) from `coreShape`. Read-class tools are
+ * scope `read`, pure, unconfirmed; write-class tools are scope `write`,
+ * external, `RUN` (`DELETE` for delete). All nine are extracted cores that go
+ * through the one file-op relay path; visibility is the PAT-only
+ * `cliToolAllowed` predicate.
+ */
+function fileToolSpec(name: FileToolName): McpToolSpec {
+  const entry = FILE_TOOLS.find((tool) => tool.name === name);
+  if (!entry) throw new Error(`unknown file tool ${name}`);
+  const { op } = entry;
+  const readClass = op === "read" || op === "stat" || op === "list" || op === "search";
+  return {
+    name,
+    target: entry.target,
+    scope: readClass ? "read" : "write",
+    confirmation: readClass ? null : op === "delete" ? "DELETE" : "RUN",
+    classification: readClass ? "pure" : op === "delete" ? "destructive" : "external",
+    descriptionNote: FILE_TOOL_NOTES[name],
+    coreShape: fileToolCoreShape(name),
+    // The core enforces the strict shape: refusals are audited and name the field.
+    shapeIsAdvisory: true,
+    auditInputRefusal: (input, who) => auditFileInputRefusal(op, input, who),
+    ...(op === "write" ? { maxInputBytes: FILE_WRITE_INPUT_MAX_BYTES } : {}),
+    invokeCore: (input, deps) => runForwarderCliFileTool(op, input, deps),
+    outputProjector: projectFileToolOutput,
+  };
+}
 
 const READ_TOOLS: readonly McpToolSpec[] = [
   {
@@ -639,6 +714,11 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.overview.health),
   },
+  // --- node file tools, read class (relay 2.8; PAT-only) ---
+  fileToolSpec("forwarder_cli_file_read"),
+  fileToolSpec("forwarder_cli_file_stat"),
+  fileToolSpec("forwarder_cli_dir_list"),
+  fileToolSpec("forwarder_cli_file_search"),
 ];
 
 /**
@@ -1234,11 +1314,18 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     inputAdapter: adaptCliCommandResultInput,
     invokeCore: (input, deps) => runForwarderCliCommandResult(input, deps),
   },
+  // --- node file tools, write class (relay 2.8; PAT-only) ---
+  fileToolSpec("forwarder_cli_file_edit"),
+  fileToolSpec("forwarder_cli_file_write"),
+  fileToolSpec("forwarder_cli_file_rename"),
+  fileToolSpec("forwarder_cli_dir_create"),
+  fileToolSpec("forwarder_cli_file_delete"),
 ];
 
 /**
- * The checked catalog: exactly 29 read tools and 55 write tools
- * (79 procedure-backed + 5 extracted cores: 2 diagnostics and 3 CLI commands).
+ * The checked catalog: exactly 33 read tools and 60 write tools
+ * (79 procedure-backed + 14 extracted cores: 2 diagnostics, 3 CLI commands
+ * and 9 node file tools (4 read, 5 write)).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS].map(
   buildDescriptor,

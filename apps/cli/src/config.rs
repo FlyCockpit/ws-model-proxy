@@ -173,6 +173,10 @@ pub struct Config {
     /// Require a locally approved browser identity before opening a terminal.
     #[serde(default, skip_serializing_if = "is_false")]
     pub require_terminal_approval: bool,
+    /// Run the MCP node file tools even when the daemon is root (euid 0). Read
+    /// once when the relay starts; off by default.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_file_tools_as_root: bool,
     /// Accept remotely defined metric sources (`metrics.sources.set`). Only
     /// settable locally; read once when the relay starts. Each remote source
     /// still needs `wsmp metrics approve` of its exact command.
@@ -241,6 +245,7 @@ struct ConfigWire {
     mcp_command_mode: Option<McpCommandMode>,
     allow_mcp_commands: Option<bool>,
     require_terminal_approval: bool,
+    allow_file_tools_as_root: bool,
     allow_remote_metric_sources: bool,
     metrics: MetricsConfig,
 }
@@ -259,6 +264,7 @@ impl Default for ConfigWire {
             mcp_command_mode: None,
             allow_mcp_commands: None,
             require_terminal_approval: false,
+            allow_file_tools_as_root: false,
             allow_remote_metric_sources: false,
             metrics: MetricsConfig::default(),
         }
@@ -283,6 +289,7 @@ impl From<ConfigWire> for Config {
             allow_human_terminal: wire.allow_human_terminal,
             mcp_command_mode,
             require_terminal_approval: wire.require_terminal_approval,
+            allow_file_tools_as_root: wire.allow_file_tools_as_root,
             allow_remote_metric_sources: wire.allow_remote_metric_sources,
             metrics: wire.metrics,
         }
@@ -301,6 +308,7 @@ impl Default for Config {
             allow_human_terminal: false,
             mcp_command_mode: McpCommandMode::Off,
             require_terminal_approval: false,
+            allow_file_tools_as_root: false,
             allow_remote_metric_sources: false,
             metrics: MetricsConfig::default(),
         }
