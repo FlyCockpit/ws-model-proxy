@@ -144,6 +144,7 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
         ));
     }
 
+    let _namespace = ops.namespace_shared(cancel)?;
     let resolved = resolve(
         &args.path,
         &ResolveOpts {
@@ -159,8 +160,8 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
     let _lock = ops.lock_path(full.clone(), cancel)?;
     let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
 
-    let original = load_all(&mut file, &stat, MAX_EDIT_FILE_BYTES)?;
-    let previous_etag = ops.key.strong(&original);
+    let original = load_all(&mut file, &stat, MAX_EDIT_FILE_BYTES, cancel)?;
+    let previous_etag = ops.key.strong(&stat, &original);
     if let Some(expected) = &args.expected_etag
         && *expected != previous_etag
     {
@@ -183,6 +184,9 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
     for (index, op) in args.edits.iter().enumerate() {
         new_texts.push(translate_eol(&op.new_text, crlf));
         let new_text = &new_texts[index];
+        if new_text.len() > MAX_NEW_TEXT_BYTES {
+            return Err(FileError::invalid("newText is longer than 1 MiB"));
+        }
         match (&op.old_text, op.start_line, op.end_line) {
             (Some(old), _, _) => {
                 plan_exact(
@@ -242,6 +246,12 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
     // An edit that touches no masked value can still change that context, so no
     // masked byte of the original may show up unmasked in the result or in its
     // diff, `dryRun` included.
+    if after_view.long_construct {
+        return Err(FileError::new(
+            ErrorCode::RedactedSpan,
+            "the file contains, or the edit would create, a masked multi-line value longer than the read lookback (1 MiB); a read could not mask it",
+        ));
+    }
     if !masked_bytes_stay_masked(&view, &planned, &new_texts, &after_view) {
         return Err(FileError::new(
             ErrorCode::RedactedSpan,
@@ -282,7 +292,7 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
     }
 
     cancel.check()?;
-    atomic::replace(
+    let new_stat = atomic::replace(
         ops,
         &resolved.dir,
         &resolved.name,
@@ -293,7 +303,7 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
         cancel,
     )?;
     Ok(EditResult {
-        etag: ops.key.strong(&updated),
+        etag: ops.key.strong(&new_stat, &updated),
         previous_etag,
         added: summary.added,
         removed: summary.removed,

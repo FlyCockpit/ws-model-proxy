@@ -39,7 +39,10 @@ import {
   providerProtocolForType,
 } from "../lib/provider-protocol";
 import { isOpenRouterProviderType, normalizeProviderType } from "../lib/provider-type";
-import { runSerializableTransaction } from "../lib/serializable-transaction";
+import {
+  runSerializableCapacityCreationTransaction,
+  runSerializableTransaction,
+} from "../lib/serializable-transaction";
 
 const id = z.string().min(1);
 const missing = () => new ORPCError("NOT_FOUND", { message: "Not found" });
@@ -755,7 +758,7 @@ export const providerManagementRouter = {
   createModel: protectedProcedure.input(modelInput).handler(async ({ input, context }) => {
     enabled();
     const userId = context.session.user.id;
-    return prisma.$transaction(async (tx) => {
+    return runSerializableCapacityCreationTransaction(async (tx) => {
       await fenceOwners(tx, [userId]);
       await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
       const account = await tx.providerAccount.findFirst({

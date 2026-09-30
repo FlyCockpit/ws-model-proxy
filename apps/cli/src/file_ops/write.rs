@@ -111,6 +111,7 @@ fn decode_content(args: &WriteArgs) -> FileResult<Vec<u8>> {
 
 pub(crate) fn write(ops: &FileOps, args: &WriteArgs, cancel: &Cancel) -> FileResult<WriteResult> {
     check_reason(&args.reason)?;
+    let _namespace = ops.namespace_shared(cancel)?;
     let content = decode_content(args)?;
     let if_exists = args.if_exists.unwrap_or_default();
     let mode = args.mode.as_deref().map(parse_mode).transpose()?;
@@ -164,7 +165,6 @@ fn write_resolved(
     let _lock = ops.lock_path(full.clone(), cancel)?;
     let echo = resolved.echo(&args.path);
     let existing = resolved.lstat()?;
-    let etag = ops.key.strong(content);
 
     let Some(existing) = existing else {
         if if_exists == IfExists::Replace {
@@ -174,7 +174,7 @@ fn write_resolved(
             ));
         }
         cancel.check()?;
-        atomic::create_new(
+        let created = atomic::create_new(
             &resolved.dir,
             &resolved.name,
             content,
@@ -182,7 +182,7 @@ fn write_resolved(
         )?;
         resolved.created.clear(); // committed: parents stay
         return Ok(WriteResult {
-            etag,
+            etag: ops.key.strong(&created, content),
             size: content.len() as u64,
             created: true,
             added: None,
@@ -206,7 +206,7 @@ fn write_resolved(
         ));
     }
     let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
-    let previous_etag = current_etag(ops, &mut file, &stat)?;
+    let previous_etag = current_etag(ops, &mut file, &stat, cancel)?;
     if args.expected_etag.as_deref() != Some(previous_etag.as_str()) {
         return Err(FileError::conflict(&previous_etag));
     }
@@ -218,7 +218,7 @@ fn write_resolved(
     if stat.size <= super::etag::STRONG_ETAG_MAX_BYTES {
         use std::io::Seek;
         file.rewind()?;
-        let bytes = load_all(&mut file, &stat, super::etag::STRONG_ETAG_MAX_BYTES)?;
+        let bytes = load_all(&mut file, &stat, super::etag::STRONG_ETAG_MAX_BYTES, cancel)?;
         if text::sniff_binary(&bytes).is_none()
             && let Ok(text) = String::from_utf8(bytes)
         {
@@ -230,7 +230,7 @@ fn write_resolved(
     }
     atomic::check_replaceable(ops, &stat)?;
     cancel.check()?;
-    atomic::replace(
+    let new_stat = atomic::replace(
         ops,
         &resolved.dir,
         &resolved.name,
@@ -242,7 +242,7 @@ fn write_resolved(
     )?;
 
     let mut result = WriteResult {
-        etag,
+        etag: ops.key.strong(&new_stat, content),
         size: content.len() as u64,
         created: false,
         added: None,

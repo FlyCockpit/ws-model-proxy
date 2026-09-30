@@ -18,7 +18,10 @@ import {
   mcpCommandModeFromDb,
   mcpCommandModeToDb,
 } from "@ws-model-proxy/api/lib/mcp-command-mode";
-import { parseStoredRemoteMetricSources } from "@ws-model-proxy/api/lib/metric-routing";
+import {
+  ENDPOINT_LOAD_STALE_AFTER_MS,
+  parseStoredRemoteMetricSources,
+} from "@ws-model-proxy/api/lib/metric-routing";
 import { suggestedConnectionSurface } from "@ws-model-proxy/api/lib/model-connection-type";
 import {
   disconnectCliDeviceAtGeneration,
@@ -367,6 +370,10 @@ const TELEMETRY_FRAME_TYPES: ReadonlySet<string> = new Set([
 export const ENDPOINT_LOAD_MIN_INTERVAL_MS = 1_000;
 /** Distinct endpoint/model load keys kept per session. */
 export const ENDPOINT_LOAD_MAX_KEYS = 1_000;
+
+function addCapped(total: number, delta: number): number {
+  return Math.min(Number.MAX_SAFE_INTEGER, total + delta);
+}
 
 type LiveEndpointLoadEntry = LiveEndpointLoad & { receivedAtMs: number };
 
@@ -769,6 +776,7 @@ export class RelaySessionManager {
           // device). No await between this check and the install below.
           this.sessionsBySocket.delete(socket);
           clearTimeout(session.unauthenticatedTimer);
+          if (session.routingEvaluation) this.routingEvaluator.cancel(session.routingEvaluation);
           socket.close(1000, "replaced");
           return;
         }
@@ -1537,11 +1545,28 @@ export class RelaySessionManager {
       const { type: _type, ...load } = message;
       const key = `${load.endpointSlug}\u0000${load.modelSlug ?? ""}`;
       const previous = session.endpointLoad.get(key);
-      if (previous && nowMs - previous.receivedAtMs < ENDPOINT_LOAD_MIN_INTERVAL_MS) return;
+      const hitsDelta = load.prefixCacheHitsDelta ?? 0;
+      const queriesDelta = load.prefixCacheQueriesDelta ?? 0;
+      if (previous && nowMs - previous.receivedAtMs < ENDPOINT_LOAD_MIN_INTERVAL_MS) {
+        // The reading is dropped but its counter deltas are not.
+        previous.prefixCacheHitsTotal = addCapped(previous.prefixCacheHitsTotal, hitsDelta);
+        previous.prefixCacheQueriesTotal = addCapped(
+          previous.prefixCacheQueriesTotal,
+          queriesDelta,
+        );
+        return;
+      }
       if (!previous && session.endpointLoad.size >= ENDPOINT_LOAD_MAX_KEYS) return;
+      // "Sustained" waiting counts consecutive accepted frames. A gap longer
+      // than the staleness window restarts the count (fail open).
+      const continuous = previous && nowMs - previous.receivedAtMs <= ENDPOINT_LOAD_STALE_AFTER_MS;
+      const waitingStreak = load.waiting > 0 ? (continuous ? previous.waitingStreak : 0) + 1 : 0;
       session.endpointLoad.set(key, {
         ...load,
         modelSlug: load.modelSlug ?? null,
+        waitingStreak,
+        prefixCacheHitsTotal: addCapped(previous?.prefixCacheHitsTotal ?? 0, hitsDelta),
+        prefixCacheQueriesTotal: addCapped(previous?.prefixCacheQueriesTotal ?? 0, queriesDelta),
         receivedAt: now,
         receivedAtMs: nowMs,
       });
@@ -2475,6 +2500,9 @@ export class RelaySessionManager {
       const owners = new Set<string>([newSession.identity.userId]);
       for (const terminal of existing.terminalsById.values()) owners.add(terminal.userId);
       this.teardownInteractiveWork(existing);
+      // A replaced session must publish no more verdicts: its pending run
+      // would start later than the successor's fence and win with an older reading.
+      if (existing.routingEvaluation) this.routingEvaluator.cancel(existing.routingEvaluation);
       this.failActiveRequestsForSession(existing);
       existing.socket.close(1000, "replaced");
       this.sessionsBySocket.delete(existing.socket);

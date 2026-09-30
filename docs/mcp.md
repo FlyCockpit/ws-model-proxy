@@ -23,6 +23,31 @@ every capacity in `capacity_records_list`. Neither ever contains prompt text:
 the CLI reads only slot ids, context sizes and busy flags from llama.cpp
 `/slots`.
 
+Discovery shares one capacity for a llama.cpp, vLLM, or SGLang endpoint only
+when the CLI proves that at least two inventory model ids are aliases served
+by that process. Ollama, LM Studio, and llama.cpp router mode retain separate
+capacities. Model-swapping front ends are excluded only through engine detection
+and router-role proof. Owner assignments are recorded per target only when the
+capacity FK changes, including a real detach to null or a move to an existing AUTO
+capacity. Equal-FK and policy-only inputs preserve provenance; an untouched web
+attachment field preserves the target's current capacity. USER limits remain owner
+controlled. Removed aliases split on a later idle inventory. Discovery defers each
+connected move group while its source or destination capacities have ACTIVE leases
+or WAITING waiters. Unrelated capacities and independent endpoint groups do not block
+it. Every later inventory retries deferred groups; the CLI sends inventory on reconnect
+or operator reload, so an involved busy capacity can defer moves until an idle inventory.
+Existing handles keep their original capacity.
+Every join and split must fit direct and effective pool concurrency and context policies.
+Shared AUTO limits follow engine slots, otherwise the sum of current automatic member
+limits; incompatible lowerings wait for a policy change and the next inventory.
+Startup leaves unknown shared AUTO limits for that complete inventory aggregate.
+Empty AUTO discovery capacities are removed with model, endpoint, and device
+deletes, and an idempotent startup sweep repairs existing idle orphans. The sweep skips
+contended owners and capacities for the next registration or startup.
+Owner-created empty capacities remain visible in `capacity_records_list`.
+Automatic capacity labels get a numeric suffix when an owner's existing label
+collides; repeated discovery preserves the capacity identity and its label.
+
 `forwarder_device_metrics_get` also lists `series`: every metric a pool routing
 rule can name on that device (built-in `node.*` series such as
 `node.cpu.usage_percent`, `node.memory.used_percent` or
@@ -39,7 +64,17 @@ Metric routing rules (S-B part 2):
   (`active`, `stale`, `unevaluated`), a per-rule `triggered` / `clear` /
   `stale` state, the member's `endpoint.*` load series (`endpoint.running`,
   `endpoint.waiting`, `endpoint.kv_usage`, ...) and the series of each member's
-  device.
+  device. Each member also carries `engineLoad` (S-D): its override `mode`
+  (`auto` / `off`), the engine kind and slots, the live reading (`running`,
+  `waiting`, `kvUsage`, `slotsBusy`, `deferred`, age, `stale`, prefix cache
+  totals) and the verdict state (`full_waiting`, `full_kv`, `full_slots`,
+  `full_deferred`, `clear`, `stale`, `none`, `off`).
+- `forwarder_pool_member_engine_load_set` (`{ poolMemberId, mode: "auto" |
+  "off", kvFullThreshold?, confirm: "RUN" }`) turns "use engine load" off for
+  a member or overrides its vLLM/SGLang KV threshold (default 0.95). Engine
+  load only adds FULL (lease counts stay authoritative), a stale reading is
+  ignored, and when every candidate is FULL a plain-name request is admitted by
+  leases alone. Classified `cost` like the rules.
 - `forwarder_pool_routing_rules_set` (`{ poolId, rules, confirm: "RUN" }`)
   replaces the whole list (at most 16). A rule is a flat record
   `{ metric, labels?, aggregate: "max", op: ">" | ">=" | "<" | "<=",
@@ -102,17 +137,23 @@ The CLI re-checks its own mode on every operation; a server request never overri
 The protected set (the wsmp state directory, `service.env`, `config.json` for writes,
 `/proc`, `/sys`, `/dev` and other special files) is refused as `path_denied`.
 
-**Masking boundary.** Only three things are masked in what the CLI returns: SSH private
-keys; environment-variable secrets (dotenv and env files such as `.env`, `*.env`, `.envrc`
-and `service.env`, plus secret-named `KEY=value` assignments in any file), shown as
-`KEY=⟦redacted:N⟧`; and the Hugging Face token file plus `--api-key` and `--hf-token`
-flag values. Masking happens before windowing, edits cannot target a masked span, and the
-etag is keyed. **On an `unsupervised` node masking is not a security boundary**: an agent
-with command access can `cat .env`. It keeps those secrets out of transcripts on the
-normal path. Secret-class files are read-only masked views: every write, edit, rename,
-delete or mkdir that touches one, or its directory, is refused as `secret_file` (compared
-case-insensitively on every OS); use a command to change such a file. The server never logs or stores file content, and it additionally removes
-`wsmp_` credential substrings from every returned string.
+**Masking boundary.** The CLI masks, before anything is windowed: (1) in dotenv and env
+files (`.env`, `*.env`, `.envrc`, `service.env`) every value, shown as `KEY=⟦redacted:N⟧`
+(other lines that are not blanks, comments or a simple `KEY=` are masked whole); (2) in
+any other file, every line containing a secret-name word (ending in `_TOKEN`, `_KEY`,
+`_SECRET`, `_PASSWORD`, `apikey`, `api-key`, `hf-token`, or equal to `PASSWORD`), the
+following non-blank line, and every line indented deeper than it, each shown as
+`⟦redacted line⟧`, plus the value of `--api-key` / `--hf-token` style flags; (3) private
+key blocks (PEM BEGIN to the matching END) and SSH private key files; (4) the Hugging Face
+token files. There is no vendor-prefix scanner. A construct that opens further back than
+the bounded lookback of a windowed read is a documented residual. Edits cannot target a
+masked span, and the etag is keyed. **On an `unsupervised` node masking is not a security
+boundary**: an agent with command access can `cat .env`. It keeps those secrets out of
+transcripts on the normal path. Secret-class files (dotenv, key and token files, and their
+directories) are read-only masked views: every write, edit, rename, delete or mkdir that
+touches one is refused as `secret_file` (compared case-insensitively on every OS); use a
+command to change such a file. The server never logs or stores file content, and it
+additionally removes `wsmp_` credential substrings from every returned string.
 
 **ETag workflow.** Read a file, then pass its `etag` as `expectedEtag` to `edit`, to `write`
 with `ifExists: "replace"`, to `rename` with `overwrite`, and to `delete`. Line-range edits
@@ -625,12 +666,14 @@ the command text itself), when, and how it ended (`completed`, `refused`, `faile
 (`exec.rejected`, `supervised.rejected`) whose reason is not a known code is
 stored as `rejected`, so CLI-supplied text never reaches the column. File
 content, diffs and command output are never stored, and the command's arguments
-are never stored: the server reduces the command text to its program (the
-first word, only when it is a bare name of letters, digits, `.`, `_` and `-` that
-`sh` and `cmd /C`, which the CLI uses on Windows without `sh`, both read as the
-command word: a leading `NAME=value`, a quoted word, a path, a redirection, a
-flag, a `+` or a built-in followed by `.` all store `?`, as does a command cut
-for length) and hashes the whole text (the first 16384 characters of an oversized, refused command). The digest is
+are never stored: the server reduces the command text to its program name: it skips leading plain
+`NAME=value` assignments (never stored), removes one layer of quotes, takes the
+basename of a path and lowercases it, and stores the result only when it is in a
+fixed, code-reviewed allowlist of common program names
+(`CLI_AGENT_PROGRAM_ALLOWLIST` in `packages/config/src/cli-agent-audit.ts`), else `?`
+(an unknown program, a non-plain assignment value, a flag, a redirection or a
+command cut for length; a wrapper such as `sudo` or `env` is stored by its own
+name), so only allowlisted strings ever reach the row; the server also hashes the whole text (the first 16384 characters of an oversized, refused command). The digest is
 HMAC-SHA256 under a key derived from the server auth secret via HKDF-SHA256
 (fixed info `wsmp-cli-agent-audit-v1`), so a copy of the table alone cannot be
 used to check a guessed command; when the key cannot be derived the hash is

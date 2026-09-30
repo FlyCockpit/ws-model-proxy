@@ -214,9 +214,11 @@ pub fn detect_with(
             .collect(),
         ..DetectedEngine::default()
     };
+    let llama_router = std::cell::Cell::new(true);
     let try_llama = |detected: &mut DetectedEngine| {
         let props = fetch("props", JSON_BODY_LIMIT).and_then(|body| parse_llama_props(&body));
         props.map(|props| {
+            llama_router.set(props.router);
             detected.kind = Some(EngineKind::LlamaCpp);
             detected.slots = props.total_slots;
             detected.ctx_per_slot = props.n_ctx;
@@ -285,18 +287,27 @@ pub fn detect_with(
         }
     }
     let kind = declared.or(detected.kind);
-    if matches!(kind, Some(EngineKind::Vllm | EngineKind::Sglang)) && models.len() > 1 {
+    if (matches!(kind, Some(EngineKind::Vllm | EngineKind::Sglang))
+        || (kind == Some(EngineKind::LlamaCpp) && !llama_router.get()))
+        && models.len() > 1
+    {
+        let mut seen = std::collections::HashSet::new();
         detected.served_model_aliases = models
             .iter()
-            .take(SERVED_ALIAS_LIMIT)
             .map(|(id, _)| id.clone())
+            .filter(|id| !id.trim().is_empty() && seen.insert(id.clone()))
+            .take(SERVED_ALIAS_LIMIT)
             .collect();
+        if detected.served_model_aliases.len() < 2 {
+            detected.served_model_aliases.clear();
+        }
     }
     detected
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LlamaProps {
+    pub router: bool,
     pub total_slots: Option<u32>,
     pub n_ctx: Option<u64>,
 }
@@ -312,15 +323,21 @@ pub fn parse_llama_props(body: &str) -> Option<LlamaProps> {
     #[derive(Deserialize)]
     struct Props {
         #[serde(default)]
+        role: Option<String>,
+        #[serde(default)]
         total_slots: Option<u32>,
         #[serde(default)]
         default_generation_settings: Option<Settings>,
     }
     let props: Props = serde_json::from_str(body).ok()?;
-    if props.total_slots.is_none() && props.default_generation_settings.is_none() {
+    if props.role.as_deref() != Some("router")
+        && props.total_slots.is_none()
+        && props.default_generation_settings.is_none()
+    {
         return None;
     }
     Some(LlamaProps {
+        router: props.role.as_deref() == Some("router"),
         total_slots: props
             .total_slots
             .filter(|value| (1..=10_000).contains(value)),
@@ -735,6 +752,68 @@ mod tests {
         assert_eq!(detected.max_model_len, Some(32768));
         assert_eq!(detected.kv_tokens, None);
         assert!(detected.served_model_aliases.is_empty());
+    }
+
+    #[test]
+    fn alias_proof_table() {
+        let two = vec![("a".to_string(), None), ("b".to_string(), None)];
+        for (kind, props, models, expected) in [
+            (
+                EngineKind::LlamaCpp,
+                LLAMA_PROPS,
+                two.clone(),
+                vec!["a", "b"],
+            ),
+            (
+                EngineKind::LlamaCpp,
+                r#"{"role":"router","total_slots":4}"#,
+                two.clone(),
+                vec![],
+            ),
+            (
+                EngineKind::LlamaCpp,
+                r#"{"role":"router"}"#,
+                two.clone(),
+                vec![],
+            ),
+            (EngineKind::LlamaCpp, "malformed", two.clone(), vec![]),
+            (
+                EngineKind::LlamaCpp,
+                LLAMA_PROPS,
+                vec![("a".to_string(), None)],
+                vec![],
+            ),
+            (
+                EngineKind::LlamaCpp,
+                LLAMA_PROPS,
+                vec![("a".to_string(), None), ("a".to_string(), None)],
+                vec![],
+            ),
+            (
+                EngineKind::LlamaCpp,
+                LLAMA_PROPS,
+                vec![
+                    ("a".to_string(), None),
+                    ("a".to_string(), None),
+                    ("b".to_string(), None),
+                ],
+                vec!["a", "b"],
+            ),
+            (EngineKind::Ollama, LLAMA_PROPS, two.clone(), vec![]),
+            (EngineKind::LmStudio, LLAMA_PROPS, two.clone(), vec![]),
+            (EngineKind::Generic, LLAMA_PROPS, two, vec![]),
+        ] {
+            let detected = detect_with(Some(kind), &models, |_, _| Some(props.to_string()));
+            assert_eq!(detected.served_model_aliases, expected, "{kind:?} {props}");
+        }
+        let models = (0..70)
+            .flat_map(|i| [(format!("m{i}"), None), (format!("m{i}"), None)])
+            .collect::<Vec<_>>();
+        let detected = detect_with(None, &models, fixture_fetch(&[("props", LLAMA_PROPS)]));
+        assert_eq!(
+            detected.served_model_aliases,
+            (0..64).map(|i| format!("m{i}")).collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -8,7 +8,7 @@
 use std::ffi::OsString;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStringExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use nix::dir::Dir;
 use nix::fcntl::{AtFlags, OFlag, openat};
@@ -28,6 +28,7 @@ pub struct Entry<'a> {
     pub parent: &'a OwnedFd,
     pub full: &'a Path,
     /// Depth below the root: direct children are 1.
+    #[allow(dead_code)]
     pub depth: usize,
 }
 
@@ -155,8 +156,4 @@ fn read_names(dir: &OwnedFd) -> FileResult<Vec<OsString>> {
         names.push(OsString::from_vec(name.to_vec()));
     }
     Ok(names)
-}
-
-pub fn dir_join(path: &Path, name: &str) -> PathBuf {
-    path.join(name)
 }

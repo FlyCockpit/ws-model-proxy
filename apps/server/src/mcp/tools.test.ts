@@ -2196,7 +2196,7 @@ describe("CLI file tools", () => {
     const edit = tools.find((tool) => tool.name === "forwarder_cli_file_edit");
     expect(read?.description).toContain("NOT a security boundary");
     expect(read?.description).toContain("⟦redacted:N⟧");
-    expect(read?.description).toContain("SSH private keys");
+    expect(read?.description).toContain("private-key blocks");
     expect(read?.description).toContain("ifNoneMatch");
     expect(edit?.description).toContain("expectedEtag");
     expect(edit?.description).toContain("forwarder_cli_file_stat");

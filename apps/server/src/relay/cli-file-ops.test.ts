@@ -44,11 +44,17 @@ const { resetCliAgentAdmissionsForTests } = await import("./cli-agent-admission.
 const db = prisma as unknown as {
   $transaction: MockInstance;
   user: { findUnique: MockInstance };
-  cliDevice: { upsert: MockInstance; update: MockInstance; findUnique: MockInstance };
+  cliDevice: {
+    upsert: MockInstance;
+    update: MockInstance;
+    updateMany: MockInstance;
+    findUnique: MockInstance;
+  };
   cliToken: { updateMany: MockInstance; findUnique: MockInstance };
-  endpoint: { findUnique: MockInstance };
+  endpoint: { findUnique: MockInstance; findMany: MockInstance };
   discoveredModel: { findMany: MockInstance };
-  executionTarget: { findMany: MockInstance };
+  poolMember: { findMany: MockInstance; updateMany: MockInstance };
+  executionTarget: { findMany: MockInstance; findUnique: MockInstance };
   inferenceCapacity: { findMany: MockInstance };
   mcpPersonalToken: { findFirst: MockInstance };
 };
@@ -258,6 +264,7 @@ describe("cli file ops", () => {
       slug: args.create.slug,
       allowHumanTerminal: false,
       mcpCommandMode: "UNSUPERVISED",
+      connectionGeneration: 1,
       inventorySeq: 0,
       inventoryDigest: null,
       inventoryAcknowledgedAt: null,
@@ -268,11 +275,16 @@ describe("cli file ops", () => {
       inventoryAcknowledgedAt: now,
       id: "desktop",
     });
+    db.cliDevice.updateMany.mockResolvedValue({ count: 1 });
     db.cliDevice.findUnique.mockImplementation(deviceRow("UNSUPERVISED"));
     db.mcpPersonalToken.findFirst.mockResolvedValue(liveToken());
     db.endpoint.findUnique.mockResolvedValue(null);
+    db.endpoint.findMany.mockResolvedValue([]);
     db.discoveredModel.findMany.mockResolvedValue([]);
     db.executionTarget.findMany.mockResolvedValue([]);
+    db.executionTarget.findUnique.mockResolvedValue(null);
+    db.poolMember.findMany.mockResolvedValue([]);
+    db.poolMember.updateMany.mockResolvedValue({ count: 0 });
     db.inferenceCapacity.findMany.mockResolvedValue([]);
   });
 

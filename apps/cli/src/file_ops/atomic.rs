@@ -48,7 +48,7 @@ pub(crate) fn perm_mode(bits: u32) -> Mode {
 }
 
 /// Refuse files an atomic replace would damage.
-pub fn check_replaceable(ops: &FileOps, stat: &Stat) -> FileResult<()> {
+pub(crate) fn check_replaceable(ops: &FileOps, stat: &Stat) -> FileResult<()> {
     let euid = ops.policy.euid();
     if stat.uid != euid && euid != 0 {
         return Err(FileError::new(
@@ -99,7 +99,7 @@ fn temp_name(name: &OsStr) -> OsString {
 /// Replace `name` in `dir` with `content`. `orig` is the open original and
 /// `orig_etag` the etag of the bytes the new content was derived from.
 #[allow(clippy::too_many_arguments)]
-pub fn replace(
+pub(crate) fn replace(
     ops: &FileOps,
     dir: &OwnedFd,
     name: &OsStr,
@@ -108,7 +108,7 @@ pub fn replace(
     orig_etag: &str,
     content: &[u8],
     cancel: &Cancel,
-) -> FileResult<()> {
+) -> FileResult<Stat> {
     check_replaceable(ops, orig_stat)?;
     let tmp = temp_name(name);
     let fd = openat(
@@ -140,18 +140,90 @@ pub fn replace(
     ops.step(Step::Chowned)?;
     fchmod(tmp_file.as_fd(), perm_mode(orig_stat.mode & 0o7777)).map_err(FileError::errno)?;
     ops.step(Step::Chmodded)?;
+    // the identity the replacement will have once renamed (etags are bound to it)
+    let new_stat = Stat::from_metadata(&tmp_file.metadata()?);
 
-    recheck(ops, dir, name, orig, orig_stat, orig_etag)?;
+    recheck(ops, dir, name, orig, orig_stat, orig_etag, cancel)?;
     ops.step(Step::EtagRechecked)?;
     cancel.check()?;
 
-    renameat(dir.as_fd(), guard.name.as_os_str(), dir.as_fd(), name).map_err(FileError::errno)?;
+    commit_stage(
+        dir,
+        guard.name.as_os_str(),
+        name,
+        orig_stat,
+        &new_stat,
+        &mut guard.armed,
+    )?;
     guard.armed = false;
     // Committed: hook errors below cannot undo the rename.
     let _ = ops.step(Step::Renamed);
     fsync(dir.as_fd()).map_err(FileError::errno)?;
     let _ = ops.step(Step::DirSynced);
-    Ok(())
+    Ok(new_stat)
+}
+
+/// Put the staged file at `name`, replacing only the object that was checked.
+///
+/// Linux: `RENAME_EXCHANGE`, then the staged name holds whatever was at `name`;
+/// if that is not the original object (a successor slipped in after the final
+/// re-check) the exchange is undone and the caller gets a conflict, so an
+/// unapproved successor is never overwritten. After an exchange the guard is
+/// disarmed: the staged name is unlinked here, and only when it still holds the
+/// object we put there (a double race must not delete a third object). Crash
+/// states: between the exchange and the unlink the old file is under the staging
+/// name (no data is lost). Elsewhere (and on filesystems without exchange) a plain
+/// rename is used and the re-check is the only guard: a documented residual.
+fn commit_stage(
+    dir: &OwnedFd,
+    stage: &OsStr,
+    name: &OsStr,
+    orig_stat: &Stat,
+    staged_stat: &Stat,
+    armed: &mut bool,
+) -> FileResult<()> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = (orig_stat, staged_stat, &armed);
+    #[cfg(target_os = "linux")]
+    {
+        use nix::fcntl::{RenameFlags, renameat2};
+        let swap = || {
+            renameat2(
+                dir.as_fd(),
+                stage,
+                dir.as_fd(),
+                name,
+                RenameFlags::RENAME_EXCHANGE,
+            )
+        };
+        let holds = |expected: &Stat| {
+            fstatat(dir.as_fd(), stage, AtFlags::AT_SYMLINK_NOFOLLOW)
+                .is_ok_and(|held| Stat::from_raw(&held).same_object(expected))
+        };
+        match swap() {
+            Ok(()) => {
+                // the guard must not unlink a name that now holds someone else's file
+                *armed = false;
+                if holds(orig_stat) {
+                    // the original: it is replaced, drop it (already committed: a
+                    // failed cleanup is not a failed edit)
+                    let _ = unlinkat(dir.as_fd(), stage, UnlinkatFlags::NoRemoveDir);
+                    return Ok(());
+                }
+                // a successor: restore it, and drop our staged file only when the
+                // stage name holds it again
+                let _ = swap();
+                if holds(staged_stat) {
+                    let _ = unlinkat(dir.as_fd(), stage, UnlinkatFlags::NoRemoveDir);
+                }
+                return Err(FileError::conflict("replaced"));
+            }
+            Err(Errno::ENOENT) => return Err(FileError::conflict("gone")),
+            Err(Errno::EINVAL | Errno::ENOSYS) => {}
+            Err(errno) => return Err(FileError::errno(errno)),
+        }
+    }
+    renameat(dir.as_fd(), stage, dir.as_fd(), name).map_err(FileError::errno)
 }
 
 /// The name must still point at the file we read, and that file must still
@@ -163,6 +235,7 @@ fn recheck(
     orig: &mut File,
     orig_stat: &Stat,
     orig_etag: &str,
+    cancel: &Cancel,
 ) -> FileResult<()> {
     let named =
         fstatat(dir.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(|errno| match errno {
@@ -173,22 +246,32 @@ fn recheck(
         return Err(FileError::conflict("replaced"));
     }
     let now = Stat::from_metadata(&orig.metadata()?);
-    let current = read_from_start(ops, orig, &now)?;
+    let current = read_from_start(ops, orig, &now, cancel)?;
     if current != orig_etag {
         return Err(FileError::conflict(&current));
     }
     Ok(())
 }
 
-fn read_from_start(ops: &FileOps, file: &mut File, stat: &Stat) -> FileResult<String> {
+fn read_from_start(
+    ops: &FileOps,
+    file: &mut File,
+    stat: &Stat,
+    cancel: &Cancel,
+) -> FileResult<String> {
     use std::io::Seek;
     file.rewind()?;
-    current_etag(ops, file, stat)
+    current_etag(ops, file, stat, cancel)
 }
 
 /// Create `name` exclusively with `mode` (after umask) and `content`. The new
 /// file is removed again if any later step fails.
-pub fn create_new(dir: &OwnedFd, name: &OsStr, content: &[u8], mode: u32) -> FileResult<()> {
+pub(crate) fn create_new(
+    dir: &OwnedFd,
+    name: &OsStr,
+    content: &[u8],
+    mode: u32,
+) -> FileResult<Stat> {
     let fd = openat(
         dir.as_fd(),
         name,
@@ -197,11 +280,11 @@ pub fn create_new(dir: &OwnedFd, name: &OsStr, content: &[u8], mode: u32) -> Fil
     )
     .map_err(FileError::errno)?;
     let mut file = File::from(fd);
-    let finish = (|| -> FileResult<()> {
+    let finish = (|| -> FileResult<Stat> {
         file.write_all(content)?;
         file.sync_all()?;
         fsync(dir.as_fd()).map_err(FileError::errno)?;
-        Ok(())
+        Ok(Stat::from_metadata(&file.metadata()?))
     })();
     if finish.is_err() {
         let _ = unlinkat(dir.as_fd(), name, UnlinkatFlags::NoRemoveDir);

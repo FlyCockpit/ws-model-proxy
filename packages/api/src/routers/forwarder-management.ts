@@ -58,6 +58,10 @@ import {
   effectiveProviderEgress,
   grantPoolAccessServerMessages,
 } from "../lib/effective-provider-egress";
+import {
+  deleteOrphanAutoCapacities,
+  refreshSharedAutoCapacities,
+} from "../lib/engine-process-capacity";
 import type { GuardedPoolCreateFailureReason } from "../lib/guarded-pool-create-reasons";
 import {
   lowestMcpCommandMode,
@@ -111,6 +115,7 @@ import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
 import { refusedRelayProtocolReason, relayProtocolAtLeast } from "../lib/relay-protocol-version";
 import {
   runCapacityDeleteTransaction,
+  runSerializableCapacityCreationTransaction,
   runSerializableTransaction,
 } from "../lib/serializable-transaction";
 import {
@@ -1339,7 +1344,7 @@ async function removeOwnedRow({
   // it (no stale target plan). Request and admission history keeps the
   // deleted ids; the capacity sweeper terminalizes live orphans.
   return runCapacityDeleteTransaction(async (tx) => {
-    await fenceParentDelete(
+    const orphanCapacityIds = await fenceParentDelete(
       tx,
       kind === "endpoint" ? { userId, endpointIds: [id] } : { userId, discoveredModelIds: [id] },
     );
@@ -1360,6 +1365,8 @@ async function removeOwnedRow({
         throw deletionConflict("not_stale", "Endpoint is not stale.");
       }
       await tx.endpoint.delete({ where: { id } });
+      await refreshSharedAutoCapacities(tx, userId, orphanCapacityIds);
+      await deleteOrphanAutoCapacities(tx, userId, orphanCapacityIds, { idleOnly: false });
       return { deleted: true };
     }
 
@@ -1379,6 +1386,8 @@ async function removeOwnedRow({
       throw deletionConflict("not_stale", "Discovered model is not stale.");
     }
     await tx.discoveredModel.delete({ where: { id } });
+    await refreshSharedAutoCapacities(tx, userId, orphanCapacityIds);
+    await deleteOrphanAutoCapacities(tx, userId, orphanCapacityIds, { idleOnly: false });
     return { deleted: true };
   });
 }
@@ -1790,7 +1799,7 @@ export const forwarderManagementRouter = {
         taken: "SLUG_TAKEN",
       });
       const now = new Date();
-      return runSerializableTransaction(async (tx) => {
+      return runSerializableCapacityCreationTransaction(async (tx) => {
         // Writer class M: the owner fence first (@ws-model-proxy/db/capacity-lock-order).
         await fenceOwners(tx, [userId]);
         const localModels = await tx.discoveredModel.findMany({
@@ -2258,9 +2267,9 @@ export const forwarderManagementRouter = {
           const target = providerTargetByModelId.get(provider.id);
           if (!target) throw new ORPCError("PRECONDITION_FAILED");
           if (!target.inferenceCapacityId)
-            await tx.executionTarget.update({
-              where: { id: target.id },
-              data: { inferenceCapacityId: capacity.id },
+            await tx.executionTarget.updateMany({
+              where: { id: target.id, inferenceCapacityId: null, capacityAssignmentSource: "AUTO" },
+              data: { inferenceCapacityId: capacity.id, capacityAssignmentSource: "OWNER" },
             });
           await tx.poolMember.create({
             data: {
@@ -3157,7 +3166,7 @@ export const forwarderManagementRouter = {
           endpointCapabilityMetadata: model.Endpoint?.capabilityMetadata ?? null,
         }),
       );
-      return runSerializableTransaction(async (tx) => {
+      return runSerializableCapacityCreationTransaction(async (tx) => {
         const userId = context.session.user.id;
         // Writer class M (@ws-model-proxy/db/capacity-lock-order): the owner
         // fence; then, planned with reads only, the capacity-policy fences of
@@ -3245,12 +3254,13 @@ export const forwarderManagementRouter = {
             executionTargetId: target.id,
             reportedConcurrency: null,
           });
-          await linkExecutionTargetCapacity(tx, {
+          const linked = await linkExecutionTargetCapacity(tx, {
             executionTargetId: target.id,
             userId,
             inferenceCapacityId,
           });
-          target.inferenceCapacityId = inferenceCapacityId;
+          if (linked) target.inferenceCapacityId = inferenceCapacityId;
+          else inferenceCapacityId = null;
         }
         const seedCandidates = new Map(
           declaredContext != null && inferenceCapacityId
@@ -3352,7 +3362,7 @@ export const forwarderManagementRouter = {
             "Provider models can only be external fallback (PUBLIC_OVERFLOW) members; plain pool names never leave the deployment.",
         });
       const userId = context.session.user.id;
-      const attached = await runSerializableTransaction(async (tx) => {
+      const attached = await runSerializableCapacityCreationTransaction(async (tx) => {
         // Writer class M (@ws-model-proxy/db/capacity-lock-order): the owner
         // fence; then, planned with reads only, the target identity fence and
         // the policy/capacity fences of the rows it may change; then the pool
@@ -3518,9 +3528,9 @@ export const forwarderManagementRouter = {
           select: { id: true },
         });
         if (!existingTarget?.inferenceCapacityId)
-          await tx.executionTarget.update({
-            where: { id: target.id },
-            data: { inferenceCapacityId: capacity.id },
+          await tx.executionTarget.updateMany({
+            where: { id: target.id, capacityAssignmentSource: "AUTO" },
+            data: { inferenceCapacityId: capacity.id, capacityAssignmentSource: "OWNER" },
           });
         const [reloadedProviderModel, reloadedPool, reloadedCapacity] = await Promise.all([
           tx.providerModel.findFirst({
