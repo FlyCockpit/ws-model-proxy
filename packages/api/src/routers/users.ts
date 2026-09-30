@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { ORPCError } from "@orpc/server";
 import { auth } from "@ws-model-proxy/auth";
 import { SIGNUP_DISABLED_CODE } from "@ws-model-proxy/auth/signup-policy";
+import { notifyUserBanned } from "@ws-model-proxy/auth/user-ban-listeners";
 import {
   notifyUserDeleted,
   notifyUserDeletionMarked,
@@ -285,6 +286,9 @@ export const usersRouter = {
         }),
         prisma.session.deleteMany({ where: { userId: input.userId } }),
       ]);
+      // Post-commit: end the user's in-flight relay file ops and commands
+      // (#159). A listener failure is logged, never thrown: the ban stands.
+      await notifyUserBanned(input.userId);
       return { success: true };
     }),
 

@@ -11,6 +11,7 @@ import type { Session } from "@ws-model-proxy/auth";
 import { auth as defaultAuth } from "@ws-model-proxy/auth";
 import { armAuthDbShutdownFence } from "@ws-model-proxy/auth/auth-db-shutdown-fence";
 import { isForceTwoFactorRequired } from "@ws-model-proxy/auth/force-two-factor-policy";
+import { onUserBanned } from "@ws-model-proxy/auth/user-ban-listeners";
 import { onUserDeleted, onUserDeletionMarked } from "@ws-model-proxy/auth/user-deletion-listeners";
 import { THEME_INIT_SCRIPT } from "@ws-model-proxy/config/theme-init";
 import prismaDefault from "@ws-model-proxy/db";
@@ -110,6 +111,7 @@ import {
   terminalBrowserHub,
   terminalUpgradeHandler,
 } from "./relay/terminal-websocket.js";
+import { cancelRelayWorkForBannedUser } from "./relay/user-ban.js";
 import { createRelayWebsocketMiddleware, relayUpgradeHandler } from "./relay/websocket.js";
 import {
   authRouteLogPath,
@@ -230,6 +232,9 @@ const closeRelaySessionsForDeletedUser = async (userId: string): Promise<void> =
 };
 onUserDeleted(closeRelaySessionsForDeletedUser);
 onUserDeletionMarked(closeRelaySessionsForDeletedUser);
+
+// A ban ends the user's in-flight relay file ops and commands (#159; ./relay/user-ban.ts).
+onUserBanned(cancelRelayWorkForBannedUser);
 
 function cliContextServices() {
   return {

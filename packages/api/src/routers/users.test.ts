@@ -1,6 +1,7 @@
 import { createRouterClient, ORPCError } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
 import { invalidateForceTwoFactorPolicyCache } from "@ws-model-proxy/auth/force-two-factor-policy";
+import { onUserBanned } from "@ws-model-proxy/auth/user-ban-listeners";
 import { onUserDeleted } from "@ws-model-proxy/auth/user-deletion-listeners";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -401,6 +402,54 @@ describe("usersRouter", () => {
 
       expect(res).toEqual({ success: true });
       expect(db.$transaction).toHaveBeenCalledOnce();
+    });
+
+    it("notifies the ban listeners after the ban committed, and never for a failed or refused archive (#159)", async () => {
+      const order: string[] = [];
+      const unsubscribe = onUserBanned((userId) => {
+        order.push(`notified:${userId}`);
+      });
+      try {
+        db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
+        db.$transaction.mockImplementation(async () => {
+          order.push("committed");
+          return [];
+        });
+        const client = createRouterClient(usersRouter, { context: buildContext() });
+        await client.archive({ userId: "other-user-id" });
+        expect(order).toEqual(["committed", "notified:other-user-id"]);
+
+        // The transaction fails: no ban happened, so nothing is cancelled.
+        order.length = 0;
+        db.$transaction.mockRejectedValueOnce(new Error("db down"));
+        await expect(client.archive({ userId: "other-user-id" })).rejects.toThrow();
+        // Refused (self-archive) and unknown users: no ban, no notification.
+        await expect(client.archive({ userId: "admin-user-id" })).rejects.toBeDefined();
+        db.user.findUnique.mockResolvedValueOnce(null);
+        await expect(client.archive({ userId: "missing-user-id" })).rejects.toBeDefined();
+        expect(order).toEqual([]);
+      } finally {
+        unsubscribe();
+      }
+    });
+
+    it("still reports success when a ban listener fails (the ban stands)", async () => {
+      const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const unsubscribe = onUserBanned(() => {
+        throw new TypeError("boom");
+      });
+      try {
+        db.user.findUnique.mockResolvedValue({ id: "other-user-id" });
+        db.$transaction.mockResolvedValue([]);
+        const client = createRouterClient(usersRouter, { context: buildContext() });
+        await expect(client.archive({ userId: "other-user-id" })).resolves.toEqual({
+          success: true,
+        });
+        expect(error).toHaveBeenCalledWith("[auth] user banned listener failed", "TypeError");
+      } finally {
+        unsubscribe();
+        error.mockRestore();
+      }
     });
 
     it("blocks self-archive", async () => {
