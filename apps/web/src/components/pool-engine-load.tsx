@@ -96,13 +96,37 @@ function EngineLoadRow({ member }: { member: MemberView }) {
           />
         </div>
       </div>
+      {load.loadSource === "custom" && load.mode === "auto" ? (
+        <div className="flex min-h-11 items-center gap-2">
+          <Label htmlFor={`${inputId}-custom`} className="min-h-11 cursor-pointer text-sm">
+            {t("dashboard:pools.engineLoad.enforceCustom")}
+          </Label>
+          <Switch
+            id={`${inputId}-custom`}
+            checked={load.customMode === "enforce"}
+            disabled={save.isPending}
+            onCheckedChange={(checked) =>
+              save.mutate({
+                poolMemberId: member.poolMemberId,
+                mode: "auto",
+                customMode: checked ? "enforce" : "observe",
+              })
+            }
+          />
+        </div>
+      ) : null}
       <div className="flex flex-wrap items-center gap-2">
+        {load.loadSource === "custom" ? (
+          <Pill tone="muted">{t("dashboard:pools.engineLoad.badges.custom")}</Pill>
+        ) : null}
         {load.mode === "off" ? (
           <Pill tone="muted">{t("dashboard:pools.engineLoad.badges.off")}</Pill>
         ) : !load.hasSignal ? (
           <Pill tone="muted">{t("dashboard:pools.engineLoad.badges.noSignal")}</Pill>
         ) : load.state === "stale" ? (
           <Pill tone="warn">{t("dashboard:pools.engineLoad.badges.stale")}</Pill>
+        ) : load.full && load.enforced === false ? (
+          <Pill tone="warn">{t("dashboard:pools.engineLoad.observeOnly")}</Pill>
         ) : load.full ? (
           <Pill tone="warn">{t(`dashboard:pools.engineLoad.states.${load.state}`)}</Pill>
         ) : (
@@ -111,8 +135,9 @@ function EngineLoadRow({ member }: { member: MemberView }) {
         {load.live ? (
           <span className="text-xs tabular-nums text-muted-foreground">
             {t("dashboard:pools.engineLoad.running", { count: load.live.running })}
-            {" · "}
-            {t("dashboard:pools.engineLoad.waiting", { count: load.live.waiting })}
+            {typeof load.live.waiting === "number"
+              ? ` · ${t("dashboard:pools.engineLoad.waiting", { count: load.live.waiting })}`
+              : ""}
             {load.live.kvUsage !== null
               ? ` · ${t("dashboard:pools.engineLoad.kv", { value: percent(load.live.kvUsage) })}`
               : ""}

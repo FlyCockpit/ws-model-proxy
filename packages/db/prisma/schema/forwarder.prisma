@@ -1210,6 +1210,9 @@ model PoolMember {
   /// S-D: AUTO lets live engine load (`endpoint.load`) mark this member FULL
   /// (per the capacity's engine kind); OFF ignores engine load for it.
   engineLoadMode               EngineLoadMode          @default(AUTO)
+  /// Custom adapter FULL starts observe-only. ENFORCE lets it gate admission.
+  /// `engineLoadMode = OFF` still wins over this.
+  customEngineLoadMode         CustomEngineLoadMode    @default(OBSERVE)
   /// KV usage fraction (0-1] at which a vLLM/SGLang member counts as FULL.
   /// Null = the default (0.95).
   kvFullThreshold              Float?
@@ -1268,6 +1271,10 @@ model InferenceCapacity {
   maxModelLenSource          EngineFactSource?
   engineFactsSource          EngineFactsSource?
   engineFactsAt              DateTime?
+  /// CUSTOM when a per-endpoint adapter supplies load; otherwise inferred from kind.
+  engineLoadSource           EngineLoadSource?
+  /// Adapter signal names that can drive FULL (`waiting`, `kvUsage`, …).
+  engineLoadSignals          String[]              @default([])
   User                       User                  @relation("InferenceCapacityOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTargets           ExecutionTarget[]
 
@@ -1413,6 +1420,16 @@ model CapacityKvEviction {
 enum EngineLoadMode {
   AUTO
   OFF
+}
+
+enum CustomEngineLoadMode {
+  OBSERVE
+  ENFORCE
+}
+
+enum EngineLoadSource {
+  BUILTIN
+  CUSTOM
 }
 
 enum MetricRoutingVerdict {

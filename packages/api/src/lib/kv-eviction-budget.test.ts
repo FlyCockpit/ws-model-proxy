@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   applyKvEvictionObservations,
@@ -154,5 +155,11 @@ describe("relative eviction budget", () => {
     expect(
       effectiveKvBudgetTokens(100_000, row, new Date(now.getTime() + KV_EVICTION_RECOVERY_MS)),
     ).toBe(100_000);
+  });
+  it("never takes occupancy or live kvUsage as eviction evidence", () => {
+    const source = readFileSync(new URL("./kv-eviction-budget.ts", import.meta.url), "utf8");
+    expect(source).not.toMatch(/kvOccupancy|occupancy|kvUsage/);
+    // Evidence is corroborating session ids only; occupancy is display-only.
+    expect(applyKvEvictionObservations(null, ["a", "b"], now).cutFraction).toBeCloseTo(0.05, 12);
   });
 });

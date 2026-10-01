@@ -291,6 +291,55 @@ describe("PoolEngineLoad (S-D)", () => {
     await waitFor(() => expect(state.mutationCalls).toEqual([{ poolMemberId: "m1", mode: "off" }]));
   });
 
+  it("shows observe-only for unenforced custom FULL and the enforce toggle", async () => {
+    const base = view();
+    state.view = {
+      ...base,
+      members: [
+        {
+          ...base.members[0]!,
+          engineLoad: engineLoad({
+            loadSource: "custom",
+            customMode: "observe",
+            full: true,
+            enforced: false,
+            state: "full_kv",
+            live: {
+              running: 1,
+              kvUsage: 1,
+              kvOccupancy: 1,
+              slotsBusy: null,
+              deferred: null,
+              waitingStreak: 0,
+              ageSeconds: 1,
+              stale: false,
+              prefixCacheHits: 0,
+              prefixCacheQueries: 0,
+            },
+          }),
+        },
+      ],
+    };
+    mount(<PoolMetricRoutingRules poolId="pool-1" />);
+    expect(screen.getByText("dashboard:pools.engineLoad.observeOnly")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.engineLoad.badges.custom")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.engineLoad.enforceCustom")).toBeTruthy();
+    expect(screen.queryByText("dashboard:pools.engineLoad.states.full_kv")).toBeNull();
+    const toggles = screen.getAllByRole("switch");
+    expect(toggles).toHaveLength(2);
+    fireEvent.click(toggles[1]!);
+    await waitFor(() =>
+      expect(state.mutationCalls).toEqual([
+        { poolMemberId: "m1", mode: "auto", customMode: "enforce" },
+      ]),
+    );
+    for (const bundle of [enDashboard, esDashboard]) {
+      expect(bundle.pools.engineLoad.observeOnly.length).toBeGreaterThan(0);
+      expect(bundle.pools.engineLoad.enforceCustom.length).toBeGreaterThan(0);
+      expect(bundle.pools.engineLoad.badges.custom.length).toBeGreaterThan(0);
+    }
+  });
+
   it("labels an off override and an engine without a signal", () => {
     const base = view();
     const members = base.members.map((member, index) => ({

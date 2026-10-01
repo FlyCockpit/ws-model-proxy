@@ -15,7 +15,10 @@
  * | Engine              | FULL when (fresh reading)                              |
  * | llama.cpp           | slotsBusy >= slots, or deferred > 0                     |
  * | vLLM / SGLang       | waiting > 0 for >= 2 consecutive frames, or KV >= 0.95   |
- * | Ollama / LM Studio / generic | no engine signal                                |
+ * | custom adapter      | same checks, only when that signal is present            |
+ * | Ollama / LM Studio / generic | no built-in signal                      |
+ *
+ * `kvOccupancy` is display-only and never marks FULL.
  */
 import { ENDPOINT_LOAD_STALE_AFTER_MS } from "./metric-routing";
 
@@ -35,6 +38,8 @@ export const ENGINE_KINDS = [
 export type EngineKind = (typeof ENGINE_KINDS)[number];
 
 export type EngineLoadMode = "AUTO" | "OFF";
+export type CustomEngineLoadMode = "OBSERVE" | "ENFORCE";
+export type EngineLoadSource = "builtin" | "custom";
 
 export type EngineLoadState =
   | "off"
@@ -57,6 +62,9 @@ export const ENGINE_LOAD_STATES: readonly EngineLoadState[] = [
   "full_deferred",
 ];
 
+/** Signals a custom adapter can use to mark FULL. Occupancy is not one of them. */
+export const CUSTOM_FULL_SIGNALS = ["waiting", "kvUsage", "slotsBusy", "deferred"] as const;
+
 /** The engine facts and per-member override a verdict depends on. */
 export type EngineLoadFacts = {
   engineKind: EngineKind | null;
@@ -65,6 +73,12 @@ export type EngineLoadFacts = {
   mode: EngineLoadMode;
   /** Per-member override; null = {@link DEFAULT_KV_FULL_THRESHOLD}. */
   kvFullThreshold: number | null;
+  /** `custom` when an adapter replaces the built-in scrape. */
+  loadSource?: EngineLoadSource | null;
+  /** Adapter-declared signals. Occupancy never FULL. */
+  signals?: readonly string[];
+  /** Custom FULL starts OBSERVE-only; OFF still wins. */
+  customMode?: CustomEngineLoadMode;
 };
 
 /** One endpoint/model reading as the relay session keeps it. */
@@ -72,8 +86,11 @@ export type EngineLoadReading = {
   running: number;
   waiting?: number;
   kvUsage?: number | undefined;
+  /** Display only. Never FULL, never KV-eviction evidence. */
+  kvOccupancy?: number | undefined;
   slotsBusy?: number | undefined;
   deferred?: number | undefined;
+  source?: string;
   /** Consecutive accepted frames (fresh, no gap) with `waiting > 0`. */
   waitingStreak: number;
   receivedAt: Date;
@@ -83,14 +100,31 @@ export type EngineLoadVerdict = {
   state: EngineLoadState;
   full: boolean;
   /**
+   * Whether admission should treat `full` as gating. Observe-only custom FULL
+   * is reported (`full: true`) with `enforced: false`.
+   */
+  enforced: boolean;
+  /**
    * While `full`, when the verdict stops being trustworthy (the reading goes
    * stale). Null otherwise.
    */
   expiresAt: Date | null;
 };
 
-/** True when the engine kind emits a signal this module can act on. */
-export function engineHasLoadSignal(kind: EngineKind | null): boolean {
+function isCustomLoad(facts: EngineLoadFacts, reading: EngineLoadReading | null): boolean {
+  return facts.loadSource === "custom" || reading?.source === "custom";
+}
+
+/** True when the engine kind or a custom adapter emits a FULL-capable signal. */
+export function engineHasLoadSignal(
+  kind: EngineKind | null,
+  options?: Pick<EngineLoadFacts, "loadSource" | "signals">,
+): boolean {
+  if (options?.loadSource === "custom") {
+    return (options.signals ?? []).some((signal) =>
+      (CUSTOM_FULL_SIGNALS as readonly string[]).includes(signal),
+    );
+  }
   return kind === "LLAMA_CPP" || kind === "VLLM" || kind === "SGLANG";
 }
 
@@ -101,22 +135,59 @@ export function effectiveKvFullThreshold(value: number | null | undefined): numb
     : DEFAULT_KV_FULL_THRESHOLD;
 }
 
+function idleVerdict(state: EngineLoadState, expiresAt: Date | null = null): EngineLoadVerdict {
+  return { state, full: false, enforced: false, expiresAt };
+}
+
 export function evaluateEngineLoad(
   facts: EngineLoadFacts,
   reading: EngineLoadReading | null,
   now: Date,
 ): EngineLoadVerdict {
-  if (facts.mode === "OFF") return { state: "off", full: false, expiresAt: null };
-  if (!engineHasLoadSignal(facts.engineKind)) {
-    return { state: "none", full: false, expiresAt: null };
+  if (facts.mode === "OFF") return idleVerdict("off");
+  const custom = isCustomLoad(facts, reading);
+  if (
+    !engineHasLoadSignal(
+      facts.engineKind,
+      custom ? { loadSource: "custom", signals: facts.signals } : undefined,
+    )
+  ) {
+    return idleVerdict("none");
   }
-  if (!reading) return { state: "stale", full: false, expiresAt: null };
+  if (!reading) return idleVerdict("stale");
   const ageMs = Math.max(0, now.getTime() - reading.receivedAt.getTime());
   if (ageMs > ENDPOINT_LOAD_STALE_AFTER_MS) {
-    return { state: "stale", full: false, expiresAt: null };
+    return idleVerdict("stale");
   }
   const expiresAt = new Date(reading.receivedAt.getTime() + ENDPOINT_LOAD_STALE_AFTER_MS);
-  const full = (state: EngineLoadState): EngineLoadVerdict => ({ state, full: true, expiresAt });
+  const enforced = !custom || facts.customMode === "ENFORCE";
+  const full = (state: EngineLoadState): EngineLoadVerdict => ({
+    state,
+    full: true,
+    enforced,
+    expiresAt,
+  });
+  if (custom) {
+    if (
+      facts.engineSlots !== null &&
+      facts.engineSlots > 0 &&
+      reading.slotsBusy !== undefined &&
+      reading.slotsBusy >= facts.engineSlots
+    ) {
+      return full("full_slots");
+    }
+    if (reading.deferred !== undefined && reading.deferred > 0) return full("full_deferred");
+    if ((reading.waiting ?? 0) > 0 && reading.waitingStreak >= WAITING_SUSTAINED_FRAMES) {
+      return full("full_waiting");
+    }
+    if (
+      reading.kvUsage !== undefined &&
+      reading.kvUsage >= effectiveKvFullThreshold(facts.kvFullThreshold)
+    ) {
+      return full("full_kv");
+    }
+    return { state: "clear", full: false, enforced: false, expiresAt: null };
+  }
   if (facts.engineKind === "LLAMA_CPP") {
     if (
       facts.engineSlots !== null &&
@@ -127,7 +198,7 @@ export function evaluateEngineLoad(
       return full("full_slots");
     }
     if (reading.deferred !== undefined && reading.deferred > 0) return full("full_deferred");
-    return { state: "clear", full: false, expiresAt: null };
+    return { state: "clear", full: false, enforced: false, expiresAt: null };
   }
   // vLLM / SGLang.
   if ((reading.waiting ?? 0) > 0 && reading.waitingStreak >= WAITING_SUSTAINED_FRAMES) {
@@ -139,7 +210,7 @@ export function evaluateEngineLoad(
   ) {
     return full("full_kv");
   }
-  return { state: "clear", full: false, expiresAt: null };
+  return { state: "clear", full: false, enforced: false, expiresAt: null };
 }
 
 export function engineKindFromDb(value: string | null | undefined): EngineKind | null {

@@ -68,8 +68,10 @@ function liveEndpointLoad(live: LiveNodeTelemetrySnapshot | null): EndpointLoadS
     running: load.running,
     waiting: load.waiting,
     kvUsage: load.kvUsage,
+    kvOccupancy: load.kvOccupancy,
     slotsBusy: load.slotsBusy,
     deferred: load.deferred,
+    source: load.source,
     waitingStreak: load.waitingStreak,
     prefixCacheHitsTotal: load.prefixCacheHitsTotal,
     prefixCacheQueriesTotal: load.prefixCacheQueriesTotal,
@@ -114,12 +116,20 @@ export const metricRoutingProcedures = {
             select: {
               id: true,
               engineLoadMode: true,
+              customEngineLoadMode: true,
               kvFullThreshold: true,
               DiscoveredModel: { select: memberModelSelect },
               ExecutionTarget: {
                 select: {
                   InferenceCapacity: {
-                    select: { id: true, engineKind: true, engineSlots: true, kvBudgetTokens: true },
+                    select: {
+                      id: true,
+                      engineKind: true,
+                      engineSlots: true,
+                      kvBudgetTokens: true,
+                      engineLoadSource: true,
+                      engineLoadSignals: true,
+                    },
                   },
                   DiscoveredModel: { select: memberModelSelect },
                 },
@@ -138,6 +148,7 @@ export const metricRoutingProcedures = {
                 id: member.id,
                 model,
                 engineLoadMode: member.engineLoadMode,
+                customEngineLoadMode: member.customEngineLoadMode,
                 kvFullThreshold: member.kvFullThreshold,
                 capacity: member.ExecutionTarget?.InferenceCapacity ?? null,
               },
@@ -205,12 +216,19 @@ export const metricRoutingProcedures = {
           };
           const reading = pickEndpointLoad(liveEndpointLoad(snapshot), memberRef);
           const engineKind = engineKindFromDb(member.capacity?.engineKind);
+          const loadSource =
+            member.capacity?.engineLoadSource === "CUSTOM" || reading?.source === "custom"
+              ? ("custom" as const)
+              : ("builtin" as const);
           const engineVerdict = evaluateEngineLoad(
             {
               engineKind,
               engineSlots: member.capacity?.engineSlots ?? null,
               mode: member.engineLoadMode === "OFF" ? "OFF" : "AUTO",
               kvFullThreshold: member.kvFullThreshold,
+              loadSource,
+              signals: member.capacity?.engineLoadSignals ?? [],
+              customMode: member.customEngineLoadMode === "ENFORCE" ? "ENFORCE" : "OBSERVE",
             },
             reading ? { ...reading, waitingStreak: reading.waitingStreak ?? 0 } : null,
             now,
@@ -262,19 +280,30 @@ export const metricRoutingProcedures = {
                 active: protectionEnabled && effectiveTokens !== null && cutFraction > 0,
               },
               mode: member.engineLoadMode === "OFF" ? ("off" as const) : ("auto" as const),
+              customMode:
+                member.customEngineLoadMode === "ENFORCE"
+                  ? ("enforce" as const)
+                  : ("observe" as const),
               kvFullThreshold: member.kvFullThreshold,
               effectiveKvFullThreshold: effectiveKvFullThreshold(member.kvFullThreshold),
               engineKind,
               engineSlots: member.capacity?.engineSlots ?? null,
-              hasSignal: engineHasLoadSignal(engineKind),
+              loadSource,
+              signals: member.capacity?.engineLoadSignals ?? [],
+              hasSignal: engineHasLoadSignal(engineKind, {
+                loadSource,
+                signals: member.capacity?.engineLoadSignals ?? [],
+              }),
               state: engineVerdict.state,
               full: engineVerdict.full,
+              enforced: engineVerdict.enforced,
               snapshotState: verdict && !expired ? verdict.engineState : null,
               live: reading
                 ? {
                     running: reading.running,
                     waiting: reading.waiting,
                     kvUsage: reading.kvUsage ?? null,
+                    kvOccupancy: reading.kvOccupancy ?? null,
                     slotsBusy: reading.slotsBusy ?? null,
                     deferred: reading.deferred ?? null,
                     waitingStreak: reading.waitingStreak ?? 0,
@@ -341,6 +370,7 @@ export const metricRoutingProcedures = {
       z.object({
         poolMemberId: idSchema,
         mode: z.enum(["auto", "off"]),
+        customMode: z.enum(["observe", "enforce"]).optional(),
         kvFullThreshold: z.number().gt(0).max(1).nullable().optional(),
       }),
     )
@@ -353,6 +383,9 @@ export const metricRoutingProcedures = {
         where: { id: input.poolMemberId, ModelPool: { userId } },
         data: {
           engineLoadMode: input.mode === "off" ? "OFF" : "AUTO",
+          ...(input.customMode !== undefined
+            ? { customEngineLoadMode: input.customMode === "enforce" ? "ENFORCE" : "OBSERVE" }
+            : {}),
           ...(input.kvFullThreshold !== undefined
             ? { kvFullThreshold: input.kvFullThreshold }
             : {}),
@@ -363,12 +396,20 @@ export const metricRoutingProcedures = {
       }
       const member = await prisma.poolMember.findFirst({
         where: { id: input.poolMemberId, ModelPool: { userId } },
-        select: { id: true, poolId: true, engineLoadMode: true, kvFullThreshold: true },
+        select: {
+          id: true,
+          poolId: true,
+          engineLoadMode: true,
+          customEngineLoadMode: true,
+          kvFullThreshold: true,
+        },
       });
       if (member) await context.services?.onPoolRoutingRulesChanged?.(member.poolId);
       return {
         poolMemberId: input.poolMemberId,
         mode: member?.engineLoadMode === "OFF" ? ("off" as const) : ("auto" as const),
+        customMode:
+          member?.customEngineLoadMode === "ENFORCE" ? ("enforce" as const) : ("observe" as const),
         kvFullThreshold: member?.kvFullThreshold ?? null,
         defaultKvFullThreshold: DEFAULT_KV_FULL_THRESHOLD,
       };

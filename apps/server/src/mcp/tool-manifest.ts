@@ -520,7 +520,7 @@ const READ_TOOLS: readonly McpToolSpec[] = [
   {
     name: "forwarder_pool_routing_rules_get",
     descriptionNote:
-      "Read pool rules, member live engine load, and engineLoad.kvBudget (reported/effective tokens, eviction cut, floor, observation/expiry times and active state).",
+      "Read pool rules, member live engine load, and engineLoad.kvBudget (reported/effective tokens, eviction cut, floor, observation/expiry times and active state). engineLoad also reports customMode (observe/enforce), loadSource, signals, enforced, and live.kvOccupancy (display only; never FULL or eviction evidence). Custom FULL starts observe-only.",
     target: "forwarderManagement.getPoolRoutingRules",
     scope: "read",
     confirmation: null,
@@ -870,7 +870,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     // Engine-load FULL can send `:external` callers to paid external providers.
     classification: "cost",
     descriptionNote:
-      "{poolMemberId, mode: 'auto'|'off', kvFullThreshold?: 0-1 or null}. 'off' ignores the engine's live load (endpoint.load) for that member; lease counts still apply. Read the live load with forwarder_pool_routing_rules_get.",
+      "{poolMemberId, mode: 'auto'|'off', customMode?: 'observe'|'enforce', kvFullThreshold?: 0-1 or null}. 'off' ignores the engine's live load (endpoint.load) for that member; lease counts still apply. customMode observe reports would-be FULL without gating admission; enforce lets custom FULL gate. Custom FULL starts observe-only. Read the live load with forwarder_pool_routing_rules_get.",
     invokeProcedure: procedureInvoker(
       (client) => client.forwarderManagement.setPoolMemberEngineLoad,
     ),

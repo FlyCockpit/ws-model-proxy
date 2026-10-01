@@ -65,18 +65,23 @@ Metric routing rules (S-B part 2):
   `stale` state, the member's `endpoint.*` load series (`endpoint.running`,
   `endpoint.waiting`, `endpoint.kv_usage`, ...) and the series of each member's
   device. Each member also carries `engineLoad` (S-D): its override `mode`
-  (`auto` / `off`), the engine kind and slots, the live reading (`running`,
-  `waiting`, `kvUsage`, `slotsBusy`, `deferred`, age, `stale`, prefix cache
-  totals) and the verdict state (`full_waiting`, `full_kv`, `full_slots`,
-  `full_deferred`, `clear`, `stale`, `none`, `off`). `engineLoad.kvBudget`
-  includes `reportedTokens`, `effectiveTokens`, `cutFraction` (0–0.5),
-  `floorFraction` (0.5), `lastObservedAt`, `expiresAt`, and `active`.
-  Prefix-eviction feedback temporarily lowers token-mode warm-protection budgets;
-  slot mode (including llama.cpp) has null effective tokens and is inactive.
-  Failed feedback reads fall back to the reported budget.
+  (`auto` / `off`), `customMode` (`observe` / `enforce`; custom FULL starts
+  observe-only), `loadSource`, `signals`, `enforced`, the engine kind and slots,
+  the live reading (`running`, `waiting`, `kvUsage`, `kvOccupancy`, `slotsBusy`,
+  `deferred`, age, `stale`, prefix cache totals) and the verdict state
+  (`full_waiting`, `full_kv`, `full_slots`, `full_deferred`, `clear`, `stale`,
+  `none`, `off`). `kvOccupancy` is display only: it never marks FULL and is not
+  eviction evidence. `engineLoad.kvBudget` includes `reportedTokens`,
+  `effectiveTokens`, `cutFraction` (0–0.5), `floorFraction` (0.5),
+  `lastObservedAt`, `expiresAt`, and `active`. Prefix-eviction feedback
+  temporarily lowers token-mode warm-protection budgets; slot mode (including
+  llama.cpp) has null effective tokens and is inactive. Failed feedback reads
+  fall back to the reported budget. `endpoint.kv_occupancy` is also available as
+  an explicit routing-rule series.
 - `forwarder_pool_member_engine_load_set` (`{ poolMemberId, mode: "auto" |
-  "off", kvFullThreshold?, confirm: "RUN" }`) turns "use engine load" off for
-  a member or overrides its vLLM/SGLang KV threshold (default 0.95). Engine
+  "off", customMode?: "observe" | "enforce", kvFullThreshold?, confirm: "RUN" }`)
+  turns "use engine load" off for a member, sets whether custom FULL gates
+  admission, or overrides its vLLM/SGLang KV threshold (default 0.95). Engine
   load only adds FULL (lease counts stay authoritative), a stale reading is
   ignored, and when every candidate is FULL a plain-name request is admitted by
   leases alone. Classified `cost` like the rules.

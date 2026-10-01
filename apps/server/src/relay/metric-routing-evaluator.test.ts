@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@ws-model-proxy/db", () => ({ default: {} }));
 
 import {
+  combineWithEngineLoad,
   createRoutingEvaluationState,
   MetricRoutingEvaluator,
   ROUTING_EVALUATION_MIN_INTERVAL_MS,
@@ -19,11 +20,17 @@ function member(
   id: string;
   poolId: string;
   engineLoadMode: "AUTO" | "OFF";
+  customEngineLoadMode: "OBSERVE" | "ENFORCE";
   kvFullThreshold: number | null;
   ModelPool: { routingRules: unknown };
   DiscoveredModel: null;
   ExecutionTarget: {
-    InferenceCapacity: { engineKind: string; engineSlots: number | null } | null;
+    InferenceCapacity: {
+      engineKind: string;
+      engineSlots: number | null;
+      engineLoadSource: "BUILTIN" | "CUSTOM" | null;
+      engineLoadSignals: string[];
+    } | null;
     DiscoveredModel: { slug: string | null; Endpoint: { slug: string } };
   };
 } {
@@ -31,6 +38,7 @@ function member(
     id,
     poolId: `pool-of-${id}`,
     engineLoadMode: "AUTO",
+    customEngineLoadMode: "OBSERVE",
     kvFullThreshold: null,
     ModelPool: { routingRules: rules },
     DiscoveredModel: null,
@@ -55,7 +63,12 @@ function engineMember(
     ...extra,
     ExecutionTarget: {
       ...base.ExecutionTarget,
-      InferenceCapacity: { engineKind, engineSlots },
+      InferenceCapacity: {
+        engineKind,
+        engineSlots,
+        engineLoadSource: extra.ExecutionTarget?.InferenceCapacity?.engineLoadSource ?? null,
+        engineLoadSignals: extra.ExecutionTarget?.InferenceCapacity?.engineLoadSignals ?? [],
+      },
     },
   };
 }
@@ -66,8 +79,10 @@ function load(
     waiting: number;
     waitingStreak: number;
     kvUsage: number;
+    kvOccupancy: number;
     slotsBusy: number;
     deferred: number;
+    source: string;
     receivedAt: Date;
   }> = {},
 ) {
@@ -409,6 +424,96 @@ describe("MetricRoutingEvaluator engine load (S-D)", () => {
       ["FULL", "full_waiting"],
       ["NONE", "stale"],
     ]);
+  });
+
+  it("observe-only custom FULL is reported and does not write a gating FULL", async () => {
+    const h = harness([
+      engineMember("m1", "GENERIC", {
+        customEngineLoadMode: "OBSERVE",
+        ExecutionTarget: {
+          InferenceCapacity: {
+            engineKind: "GENERIC",
+            engineSlots: null,
+            engineLoadSource: "CUSTOM",
+            engineLoadSignals: ["kvUsage"],
+          },
+        } as never,
+      }),
+    ]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    await h.evaluator.evaluate(state, {
+      nodeMetrics: null,
+      endpointLoad: [load({ kvUsage: 1, kvOccupancy: 1, source: "custom" })],
+    });
+    expect(writes(h)[0]).toMatchObject({ verdict: "NONE", engineState: "full_kv" });
+  });
+
+  it("enforced custom FULL writes a gating FULL", async () => {
+    const h = harness([
+      engineMember("m1", "GENERIC", {
+        customEngineLoadMode: "ENFORCE",
+        ExecutionTarget: {
+          InferenceCapacity: {
+            engineKind: "GENERIC",
+            engineSlots: null,
+            engineLoadSource: "CUSTOM",
+            engineLoadSignals: ["kvUsage"],
+          },
+        } as never,
+      }),
+    ]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    await h.evaluator.evaluate(state, {
+      nodeMetrics: null,
+      endpointLoad: [load({ kvUsage: 1, source: "custom" })],
+    });
+    expect(writes(h)[0]).toMatchObject({ verdict: "FULL", engineState: "full_kv" });
+  });
+
+  it("custom occupancy never writes FULL even when enforced", async () => {
+    const h = harness([
+      engineMember("m1", "GENERIC", {
+        customEngineLoadMode: "ENFORCE",
+        ExecutionTarget: {
+          InferenceCapacity: {
+            engineKind: "GENERIC",
+            engineSlots: null,
+            engineLoadSource: "CUSTOM",
+            engineLoadSignals: ["running", "kvOccupancy"],
+          },
+        } as never,
+      }),
+    ]);
+    const state = createRoutingEvaluationState("user-1", "device-1");
+    await h.evaluator.evaluate(state, {
+      nodeMetrics: null,
+      endpointLoad: [load({ kvOccupancy: 1, source: "custom" })],
+    });
+    expect(writes(h)[0]).toMatchObject({ verdict: "NONE", engineState: "none" });
+  });
+});
+
+describe("combineWithEngineLoad", () => {
+  const none = { verdict: "none" as const, ruleStates: [], expiresAt: T0 };
+  const expires = new Date(T0.getTime() + 15_000);
+
+  it("ORs FULL only when the engine verdict is enforced", () => {
+    expect(
+      combineWithEngineLoad(none, {
+        state: "full_kv",
+        full: true,
+        enforced: false,
+        expiresAt: expires,
+      }),
+    ).toEqual(none);
+    expect(
+      combineWithEngineLoad(none, {
+        state: "full_kv",
+        full: true,
+        enforced: true,
+        expiresAt: expires,
+      }),
+    ).toEqual({ verdict: "full", ruleStates: [], expiresAt: expires });
   });
 });
 

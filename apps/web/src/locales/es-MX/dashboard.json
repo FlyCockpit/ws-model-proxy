@@ -1049,13 +1049,16 @@
       "kvBudgetLowered": "Presupuesto KV reducido",
       "kvBudgetEvictions": "Presupuesto KV reducido a {{effective}} de {{reported}} tokens (se detectaron expulsiones de caché)",
       "use": "Usar carga del motor",
+      "enforceCustom": "Aplicar FULL personalizado",
+      "observeOnly": "estaría LLENO (solo observación)",
       "saved": "Configuración de carga del motor guardada",
       "saveFailed": "No se pudo guardar la configuración de carga del motor.",
       "badges": {
         "off": "Carga del motor ignorada",
         "noSignal": "Sin señal del motor",
         "stale": "Carga vencida",
-        "clear": "El motor tiene espacio"
+        "clear": "El motor tiene espacio",
+        "custom": "Personalizado"
       },
       "states": {
         "full_waiting": "Motor LLENO: solicitudes en espera",

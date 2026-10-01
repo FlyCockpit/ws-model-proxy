@@ -314,6 +314,8 @@ describe("MCP tool manifest — exact catalog", () => {
       (entry) => entry.name === "forwarder_pool_routing_rules_get",
     );
     expect(descriptor?.descriptionNote).toContain("engineLoad.kvBudget");
+    expect(descriptor?.descriptionNote).toContain("customMode");
+    expect(descriptor?.descriptionNote).toContain("kvOccupancy");
     expect(descriptor?.outputProjector).toBeUndefined();
     const kvBudget = {
       reportedTokens: 100_000,

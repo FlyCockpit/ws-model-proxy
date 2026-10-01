@@ -33,7 +33,14 @@ export type WireEngineFacts = {
   maxModelLen?: WireFact<number>;
   hostPromptCacheMiB?: WireFact<number>;
   servedModelAliases?: WireFact<string[]>;
+  loadAdapter?: {
+    value: { input: "route" | "command"; signals: string[] };
+    source: "config";
+  };
 };
+
+/** Prisma `EngineLoadSource` values. */
+export type EngineLoadSource = "BUILTIN" | "CUSTOM";
 
 /** The facts an inference capacity stores (Int columns cap the numbers). */
 export type StoredEngineFacts = {
@@ -45,6 +52,8 @@ export type StoredEngineFacts = {
   maxModelLen: number | null;
   maxModelLenSource: EngineFactSource | null;
   engineFactsSource: EngineFactsSource;
+  engineLoadSource: EngineLoadSource | null;
+  engineLoadSignals: string[];
 };
 
 const INT_COLUMN_MAX = 2 ** 31 - 1;
@@ -126,17 +135,24 @@ export function storedEngineFacts(facts: WireEngineFacts | undefined): StoredEng
       .filter((fact) => fact !== undefined)
       .map((fact) => fact.source),
   );
-  if (sources.size === 0) return null;
+  if (sources.size === 0 && !facts.loadAdapter) return null;
+  const signals = facts.loadAdapter?.value.signals.filter((signal) => signal.length > 0) ?? [];
   return {
     ...stored,
     engineFactsSource:
-      sources.size > 1
-        ? "MIXED"
-        : sources.has("config")
+      sources.size === 0
+        ? facts.loadAdapter
           ? "CONFIG"
-          : sources.has("custom")
-            ? "CUSTOM"
-            : "PROBE",
+          : "PROBE"
+        : sources.size > 1
+          ? "MIXED"
+          : sources.has("config")
+            ? "CONFIG"
+            : sources.has("custom")
+              ? "CUSTOM"
+              : "PROBE",
+    engineLoadSource: facts.loadAdapter ? "CUSTOM" : null,
+    engineLoadSignals: signals,
   };
 }
 
@@ -149,7 +165,10 @@ export function sameStoredEngineFacts(left: StoredEngineFacts, right: StoredEngi
     left.kvBudgetTokensSource === right.kvBudgetTokensSource &&
     left.maxModelLen === right.maxModelLen &&
     left.maxModelLenSource === right.maxModelLenSource &&
-    left.engineFactsSource === right.engineFactsSource
+    left.engineFactsSource === right.engineFactsSource &&
+    left.engineLoadSource === right.engineLoadSource &&
+    left.engineLoadSignals.length === right.engineLoadSignals.length &&
+    left.engineLoadSignals.every((signal, index) => signal === right.engineLoadSignals[index])
   );
 }
 
@@ -257,6 +276,7 @@ export type EnginePreset = {
 
 export type EnginePresetOptions = {
   kvBudgetTokens?: number | null;
+  loadSource?: EngineLoadSource | null;
 };
 
 export function enginePreset(
@@ -285,13 +305,17 @@ export function enginePreset(
         return { preset: "generic", fullWhen: "active_at_user_cap", protectionUnit: "slots" };
     }
   })();
+  const withLoad =
+    options?.loadSource === "CUSTOM" && preset.fullWhen !== "user_cap_or_engine_load"
+      ? { ...preset, fullWhen: "user_cap_or_engine_load" as const }
+      : preset;
   if (
     kind !== "LLAMA_CPP" &&
     options?.kvBudgetTokens != null &&
     Number.isInteger(options.kvBudgetTokens) &&
     options.kvBudgetTokens > 0
   ) {
-    return { ...preset, protectionUnit: "tokens" };
+    return { ...withLoad, protectionUnit: "tokens" };
   }
-  return preset;
+  return withLoad;
 }

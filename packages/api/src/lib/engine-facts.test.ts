@@ -41,6 +41,8 @@ describe("engine facts", () => {
       maxModelLen: null,
       maxModelLenSource: null,
       engineFactsSource: "MIXED",
+      engineLoadSource: null,
+      engineLoadSignals: [],
     });
     expect(
       storedEngineFacts({
@@ -158,5 +160,26 @@ describe("engine facts", () => {
     expect(enginePreset("OLLAMA", { kvBudgetTokens: 32_768 }).protectionUnit).toBe("tokens");
     expect(enginePreset("GENERIC").protectionUnit).toBe("slots");
     expect(enginePreset("LLAMA_CPP", { kvBudgetTokens: 262_144 }).protectionUnit).toBe("slots");
+  });
+
+  it("stores custom loadAdapter as CUSTOM load source", () => {
+    expect(
+      storedEngineFacts({
+        loadAdapter: {
+          value: { input: "route", signals: ["running", "kvUsage"] },
+          source: "config",
+        },
+      }),
+    ).toMatchObject({
+      engineLoadSource: "CUSTOM",
+      engineLoadSignals: ["running", "kvUsage"],
+      engineFactsSource: "CONFIG",
+    });
+  });
+
+  it("shows engine load on a generic preset when an adapter supplies FULL", () => {
+    expect(enginePreset("GENERIC", { loadSource: "CUSTOM" }).fullWhen).toBe(
+      "user_cap_or_engine_load",
+    );
   });
 });
