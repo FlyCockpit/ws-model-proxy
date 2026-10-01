@@ -1754,9 +1754,31 @@ describe("model API routes", () => {
         expected: 1,
         throws: true,
       },
+      {
+        // Age is judged at dispatch: a long stream must not age the prefix out.
+        name: "long stream finishing after the window",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: true,
+        expected: 1,
+        ageMs: 299_000,
+        advanceMs: 600_000,
+      },
+      {
+        name: "prefix already outside the window at dispatch",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: true,
+        expected: 0,
+        ageMs: 301_000,
+      },
     ])(
       "KV feedback finalization: $name",
-      async ({ cache, prompt, tokens, affinityMatch, ok, expected, throws }) => {
+      async ({ cache, prompt, tokens, affinityMatch, ok, expected, throws, ageMs, advanceMs }) => {
         vi.useFakeTimers({ toFake: ["Date"] });
         vi.setSystemTime(new Date("2026-09-30T12:00:00Z"));
         db.poolMember.findMany.mockResolvedValue(
@@ -1766,7 +1788,13 @@ describe("model API routes", () => {
         affinity.rank.mockResolvedValue({
           ...decision(affinityMatch),
           prefixEvidence: affinityMatch
-            ? { "member-a-target": { tokens, lastUsedAt: Date.now(), confirmed: true } }
+            ? {
+                "member-a-target": {
+                  tokens,
+                  lastUsedAt: Date.now() - (ageMs ?? 0),
+                  confirmed: true,
+                },
+              }
             : {},
         });
         kvFeedback.observe.mockReset();
@@ -1790,6 +1818,7 @@ describe("model API routes", () => {
             },
           }),
         );
+        if (advanceMs) vi.setSystemTime(Date.now() + advanceMs);
         manager.complete(sent.requestId);
         const result = await response;
         await result.text();

@@ -831,26 +831,76 @@ describe("effective KV assessment", () => {
     });
     expect(result.get("a")).toMatchObject({ state, effectiveKvBudgetTokens: effective });
   });
-  it.each([
-    { cut: 0, count: 2 },
-    { cut: 0.5, count: 1 },
-  ])("equity fits uses effective K (cut=$cut)", async ({ cut, count }) => {
-    const result = await assessWarmProtection({
+  const CUTS = [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5] as const;
+  const assessAt = (
+    cut: number,
+    sharePolicy: Partial<ReturnType<typeof policy>>,
+    sessions: ReturnType<typeof session>[],
+    requestTokens: number,
+  ) =>
+    assessWarmProtection({
       ownerId: "owner",
-      policy: policy({ share: "FIXED_PERCENT", fixedPercent: 50 }),
-      members: [member],
+      policy: policy(sharePolicy),
+      members: [{ ...member, requestTokens }],
       now,
       source: {
         load: async () => ({
           activeByCapacity: new Map(),
-          sessionsByCapacity: new Map([
-            ["cap-a", [session("alice", 10, 20_000), session("alice", 20, 20_000)]],
-          ]),
+          sessionsByCapacity: new Map([["cap-a", sessions]]),
           kvEvictionByCapacity: new Map([["cap-a", { cutFraction: cut, observedAt: now }]]),
         }),
       },
-    });
-    expect(result.get("a")?.protectedSessions).toBe(count);
+    }).then((verdicts) => verdicts.get("a")!);
+  // Eviction evidence may only make a member PROTECTED sooner. Shares (who is
+  // protected) stay on the reported K; only the threshold uses the effective K.
+  it.each([
+    {
+      name: "equity cap, FIXED_PERCENT 50%",
+      share: { share: "FIXED_PERCENT" as const, fixedPercent: 50 },
+      sessions: [session("alice", 10, 20_000), session("alice", 20, 20_000)],
+      request: 25_000,
+      protectedSessions: 2,
+    },
+    {
+      name: "EQUAL_SHARE, one user (review O1b-1)",
+      share: { share: "EQUAL_SHARE" as const },
+      sessions: [session("alice", 10, 50_000), session("alice", 20, 40_000)],
+      request: 5_000,
+      protectedSessions: 2,
+    },
+    {
+      name: "EQUAL_SHARE, two users",
+      share: { share: "EQUAL_SHARE" as const },
+      sessions: [
+        session("alice", 10, 30_000),
+        session("alice", 20, 20_000),
+        session("bob", 15, 30_000),
+      ],
+      request: 5_000,
+      protectedSessions: 3,
+    },
+    {
+      name: "FIRST_COME",
+      share: { share: "FIRST_COME" as const },
+      sessions: [session("alice", 10, 50_000), session("bob", 20, 40_000)],
+      request: 5_000,
+      protectedSessions: 2,
+    },
+  ])("monotone in the cut: $name", async ({ share, sessions, request, protectedSessions }) => {
+    const verdicts = [];
+    for (const cut of CUTS) verdicts.push(await assessAt(cut, share, sessions, request));
+    // The protected set never depends on the cut.
+    for (const verdict of verdicts) {
+      expect(verdict.protectedSessions).toBe(protectedSessions);
+      expect(verdict.protectedTokens).toBe(verdicts[0]?.protectedTokens);
+    }
+    // PROTECTED at a higher K stays PROTECTED at every lower K.
+    const states = verdicts.map(({ state }) => state);
+    const firstProtected = states.indexOf("PROTECTED");
+    if (firstProtected >= 0)
+      expect(states.slice(firstProtected).every((state) => state === "PROTECTED")).toBe(true);
+    // And the threshold really moves: the request flips at the 50% cut at the latest.
+    expect(states.at(-1)).toBe("PROTECTED");
   });
   it.each(["failed", "expired", "active"])("production feedback read: %s", async (kind) => {
     readDb.capacityLease.groupBy.mockResolvedValue([]);

@@ -118,8 +118,18 @@ export type CapacityLoad = {
   slots: number | null;
   /** Active leases a. */
   active: number;
-  /** KV budget K in tokens; null = unknown, which selects slot mode. */
+  /**
+   * The REPORTED KV budget K in tokens; null = unknown, which selects slot
+   * mode. It is the base of the equity shares: which sessions are protected
+   * must not shrink when eviction evidence arrives.
+   */
   kvBudgetTokens: number | null;
+  /**
+   * The effective budget (eviction feedback, #164), at most K: used ONLY by the
+   * PROTECTED threshold. A lower value can only make a member PROTECTED sooner
+   * (monotone); absent = K.
+   */
+  effectiveKvBudgetTokens?: number | null;
 };
 
 export type MemberProtectionState = "FULL" | "PROTECTED" | "FREE";
@@ -270,9 +280,18 @@ export function memberProtectionVerdict({
     ? Math.min(...protectedSessions.map(({ ageMs }) => ageMs))
     : null;
   const idleProtected = idleProtectedSessions(protectedSessions).length;
+  // Never above K, never non-positive: a malformed effective value cannot
+  // widen (or zero) the threshold.
+  const effective = load.effectiveKvBudgetTokens;
+  const effectiveBudget =
+    load.kvBudgetTokens !== null && load.kvBudgetTokens > 0
+      ? typeof effective === "number" && Number.isFinite(effective) && effective > 0
+        ? Math.min(load.kvBudgetTokens, effective)
+        : load.kvBudgetTokens
+      : null;
   const verdict = (state: MemberProtectionState): ProtectionVerdict => ({
     state,
-    effectiveKvBudgetTokens: load.kvBudgetTokens,
+    effectiveKvBudgetTokens: effectiveBudget,
     protectedSessions: protectedSessions.length,
     idleProtectedSessions: idleProtected,
     protectedTokens,
@@ -281,10 +300,9 @@ export function memberProtectionVerdict({
   if (load.slots !== null && load.active >= load.slots) return verdict("FULL");
   // A continuation (affinity hit) is never redirected by protection.
   if (affine || protectedSessions.length === 0) return verdict("FREE");
-  if (load.kvBudgetTokens !== null && load.kvBudgetTokens > 0)
+  if (effectiveBudget !== null)
     return verdict(
-      protectedTokens + Math.max(0, requestTokens) >
-        load.kvBudgetTokens * (1 - PROTECTION_KV_HEADROOM)
+      protectedTokens + Math.max(0, requestTokens) > effectiveBudget * (1 - PROTECTION_KV_HEADROOM)
         ? "PROTECTED"
         : "FREE",
     );
@@ -581,12 +599,15 @@ export async function assessWarmProtection({
     const load: CapacityLoad = {
       slots: member.slots,
       active: snapshot.activeByCapacity.get(member.capacityId) ?? 0,
-      kvBudgetTokens: effectiveKvBudgetTokens(
-        protectionKvBudgetTokens(member.engineKind, member.kvBudgetTokens),
-        snapshot.kvEvictionByCapacity.get(member.capacityId),
-        now,
-      ),
+      kvBudgetTokens: protectionKvBudgetTokens(member.engineKind, member.kvBudgetTokens),
     };
+    // Eviction feedback lowers ONLY the PROTECTED threshold; the equity shares
+    // stay on the reported K (a lower K never un-protects a session).
+    load.effectiveKvBudgetTokens = effectiveKvBudgetTokens(
+      load.kvBudgetTokens,
+      snapshot.kvEvictionByCapacity.get(member.capacityId),
+      now,
+    );
     const protectedSessions = protectedWarmSessions(
       snapshot.sessionsByCapacity.get(member.capacityId) ?? [],
       load,

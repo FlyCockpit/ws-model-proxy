@@ -1,9 +1,11 @@
 /**
- * Relative KV eviction feedback. A lower K redirects NEW sessions, reducing
- * evictions until evidence stops and the cut recovers linearly. A 50% cap bounds
- * over-reaction; slow (30 minute) recovery and small (5%) steps prevent flapping.
- * No gain depends on the previous effective K: observations count sessions, so
- * the loop cannot run away. Hits leave state untouched and simply allow decay.
+ * Relative KV eviction feedback. The effective K is used ONLY by the PROTECTED
+ * threshold (the equity shares stay on the reported K), so a lower K can only
+ * make a member PROTECTED sooner and redirect NEW sessions, which reduces
+ * evictions until evidence stops and the cut recovers linearly. The 50% cap
+ * bounds over-reaction (a burst can reach it); slow (30 minute) recovery and
+ * small (5%) steps damp flapping. No gain depends on the previous effective K,
+ * so the loop cannot run away. Hits leave state untouched and let it decay.
  *
  * Endpoint prefix-cache counters are cumulative, include bypass traffic, and
  * cannot be attributed to a matched prefix; they are deliberately not evidence.

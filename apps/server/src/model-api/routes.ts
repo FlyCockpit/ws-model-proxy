@@ -6374,6 +6374,9 @@ async function relayPool({
     }
     attemptCount += 1;
     let attempt: ReturnType<typeof startRelayAttempt> | null = null;
+    // When this attempt was handed to the relay: warm-prefix age for eviction
+    // evidence is judged here, not at request arrival or after a long stream.
+    let attemptDispatchedAt = new Date();
     const localExecution: LocalExecutionTelemetry = {
       selectedExecutionTargetId: member.ExecutionTarget?.id,
       selectedPoolMemberId: member.id,
@@ -6415,6 +6418,7 @@ async function relayPool({
         accessGrantId: target.accessGrantId,
         poolMemberId: member.id,
       });
+      attemptDispatchedAt = new Date();
       attempt = startRelayAttempt({
         requestId: localExecution.localAttemptId,
         manager,
@@ -6900,9 +6904,7 @@ async function relayPool({
                 ok: terminal.ok,
                 usage,
                 evidence: affinityDecision?.prefixEvidence?.[affinityTarget.executionTargetId],
-                // The record's age is judged when the request was ranked, not
-                // after a long generation finished.
-                now: startedAt,
+                now: attemptDispatchedAt,
               })
             )
               // The same owner id the protection read filters by.

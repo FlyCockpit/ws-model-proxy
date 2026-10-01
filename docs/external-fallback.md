@@ -219,9 +219,18 @@ Each observation cuts 5% of the **reported** K (`KV_EVICTION_STEP = 0.05`), with
 at most 10 observations per flush and a 50% maximum cut (`KV_EVICTION_MAX_CUT`).
 The integer effective budget stays between `ceil(0.5 * K)` and K. Cuts recover
 linearly at `0.5 / 1_800_000` per millisecond: a full cut recovers in exactly
-30 minutes (`KV_EVICTION_RECOVERY_MS`). Hits write nothing. Lower K redirects
-new sessions, reducing evictions until evidence stops; small steps, the cap and
-slow recovery bound over-reaction and flapping. No gain depends on effective K.
+30 minutes (`KV_EVICTION_RECOVERY_MS`). Hits write nothing. Only the PROTECTED
+threshold (`W_protected + r > K_eff x 0.9`) uses the effective budget; the equity
+shares, and so which sessions are protected, stay on the reported K, so evidence
+can only make a member PROTECTED sooner (monotone), never release a protected
+session. A lower threshold redirects new sessions, which reduces evictions until
+evidence stops. The 50% cap, not the 10-per-flush clamp, bounds the cut: a burst
+of confirmed misses (for example after an engine restart that flushed every
+cache) can reach the cap within seconds, and the cut then recovers over 30
+minutes. Evidence counts requests, so a session whose misses are small but
+non-zero can count more than once, and a single-member pool (nowhere to
+redirect) can hold the cut at the cap while it stays overloaded. All of this
+stays in the fail-safe direction: protection never blocks a request.
 Reported-budget changes automatically scale the relative cut. Slot mode,
 including llama.cpp, is unaffected. Budgets must be positive int32 counts;
 malformed budgets select slot mode, and corrupt stored cuts are clamped.
