@@ -205,7 +205,7 @@ Alias cleanup vetoes the unlink on a believable link count below 2 (statx FORCE_
 (g) also applies to rename. Crash residue includes captured source/destination and
 private preflight dummies, logged before capture, without intent/replay. Rust tests
 cover Linux/macOS injected capability, ownership, race, cancellation and reply-loss
-tables; the strict real-mount test checks all six declared primitive/inode classes. CI
+tables; the strict real-mount test checks six declared primitive/inode classes (plus a constant-link-count and a cached-attribute class). CI
 runs it on real FUSE mounts in the `exchangeless-fs` job (`apps/cli/scripts/test-exchangeless-fs.sh`,
 no installs; a failed mount fails the job).
 

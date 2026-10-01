@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run the file tools' real-filesystem tests on FUSE mounts that lack atomic
 # exchange (issue #172). It builds the test-only passthrough daemon in
-# tests/support/exchangeless, mounts it as an unprivileged user in six classes, runs
+# tests/support/exchangeless, mounts it as an unprivileged user in eight classes (six primitive/inode classes, one with constant link counts, one with attribute caching), runs
 # the env-gated Rust test on each mount, and always unmounts.
 #
 #   scripts/test-exchangeless-fs.sh test  [class...]   mount, check, run the Rust test

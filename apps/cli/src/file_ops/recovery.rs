@@ -692,6 +692,13 @@ impl RecoveryDir {
             Ok(value) => value,
             Err(error) => {
                 if error.code != ErrorCode::UncertainOutcome {
+                    if matches!(published, Published::UserSource { .. })
+                        && let Some(held) = original.as_mut()
+                    {
+                        // The destination's proof may be a second name of the source's own
+                        // object (noino alias pair): close it before the restore unlink (F3).
+                        held.release();
+                    }
                     self.abort_published(ops, tmp, identity, &published); // D1 site 1
                 }
                 return Err(error);

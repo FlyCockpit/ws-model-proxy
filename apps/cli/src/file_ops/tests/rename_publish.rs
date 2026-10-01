@@ -1705,6 +1705,96 @@ fn rename_true_alias_pair_with_a_post_publication_save_keeps_the_object() {
     }
 }
 
+/// C4A-1: the publisher's prepare-error exit (here an injected EMFILE) must close the
+/// destination's proof before the restore unlinks the source's private alias: with a
+/// true S/D alias pair both descriptors are on the object being unlinked (F3).
+#[test]
+fn rename_prepare_error_exit_closes_the_destination_proof_before_the_restore_unlink() {
+    use crate::file_ops::policy::Access;
+    use crate::file_ops::recovery::{Held, RecoveryDir};
+    use crate::file_ops::resolve::{ResolveOpts, resolve};
+    let fx = Fx::new();
+    object_put_pair(&fx);
+    let resolve_name = |name: &str| {
+        resolve(
+            &fx.p(name),
+            &ResolveOpts {
+                follow_last: false,
+                make_parents: None,
+                policy: &fx.ops.policy,
+                access: Access::Remove,
+                preview_missing: false,
+                pin: None,
+                cancel: None,
+            },
+        )
+        .unwrap()
+    };
+    let from = resolve_name("src");
+    let to = resolve_name("dst");
+    let mut src = Held::open(&from.dir, &from.name, from.lstat().unwrap().unwrap()).unwrap();
+    let mut dst = Held::open(&to.dir, &to.name, to.lstat().unwrap().unwrap()).unwrap();
+    let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path).unwrap();
+    let mut faults = Shape::Link.faults(true);
+    faults.push((Primitive::PublishPrepare, 1, Errno::EMFILE));
+    let _scope = FaultScope::new(&faults);
+    let method = recovery
+        .preflight_move(&fx.ops, &from, &to, &src, Some(&dst))
+        .unwrap();
+    #[cfg(target_os = "linux")]
+    let checks = {
+        use crate::file_ops::exchange::UNLINK_PROBE;
+        use std::os::unix::fs::MetadataExt;
+        let root = fx.root.clone();
+        let seen = Arc::new(Mutex::new(0usize));
+        let counted = Arc::clone(&seen);
+        UNLINK_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move || {
+                let Ok(meta) = std::fs::symlink_metadata(recovery_dirs(&root)[0].join("slot-1"))
+                else {
+                    return;
+                };
+                for fd in std::fs::read_dir("/proc/self/fd").unwrap() {
+                    if let Ok(held) = std::fs::metadata(fd.unwrap().path()) {
+                        assert_ne!(
+                            (held.dev(), held.ino()),
+                            (meta.dev(), meta.ino()),
+                            "a descriptor stays open on the object whose private name is unlinked"
+                        );
+                    }
+                }
+                *counted.lock().unwrap() += 1;
+            }));
+        });
+        seen
+    };
+    let error = recovery
+        .commit_move(
+            &fx.ops,
+            &from,
+            &to,
+            &mut src,
+            Some(&mut dst),
+            method,
+            &fx.cancel,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::IoError);
+    #[cfg(target_os = "linux")]
+    assert!(
+        *checks.lock().unwrap() >= 1,
+        "the restore unlink must have run"
+    );
+    assert!(recovery.finish().is_empty());
+    assert_eq!(fx.get("src"), SOURCE);
+    assert_eq!(fx.get("dst"), SOURCE);
+}
+
+fn object_put_pair(fx: &Fx) {
+    fx.put("src", SOURCE);
+    std::fs::hard_link(fx.root.join("src"), fx.root.join("dst")).unwrap();
+}
+
 #[test]
 fn rename_true_alias_pair_closes_both_private_proofs_before_committed_unlinks() {
     use crate::file_ops::policy::Access;
