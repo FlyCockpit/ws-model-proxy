@@ -184,15 +184,16 @@ fn rename_clean_shapes_kinds_supervision_and_third_links() {
         let etag = setup(&fx, Object::File, overwrite);
         std::fs::hard_link(fx.root.join("src"), fx.root.join("third")).unwrap();
         let _scope = FaultScope::new(&Shape::Link.faults(overwrite));
-        assert!(
-            rename_run(&fx, overwrite, etag.as_deref(), false)
-                .unwrap()
-                .get("recovered")
-                .is_none()
-        );
+        let value = rename_run(&fx, overwrite, etag.as_deref(), false).unwrap();
+        // Off Linux the link count may be cached, so an overwrite rename keeps the
+        // alias of a source that had another name (see `dispose_link_move`).
+        let keeps_alias = overwrite && !cfg!(target_os = "linux");
+        assert_eq!(value.get("recovered").is_some(), keeps_alias, "{value}");
         assert_eq!(fx.get("third"), SOURCE);
         assert_eq!(fx.get("dst"), SOURCE);
-        clean(&fx);
+        if !keeps_alias {
+            clean(&fx);
+        }
     }
 }
 
@@ -1679,7 +1680,12 @@ fn rename_true_alias_pair_with_a_post_publication_save_keeps_the_object() {
                     "{object:?}: the displaced object's bytes must stay reported: {recovered:?}"
                 );
             } else {
-                assert!(recovered.is_empty(), "{object:?}: {recovered:?}");
+                // Off Linux a source that had another name keeps its alias (cached count).
+                assert_eq!(
+                    recovered.is_empty(),
+                    cfg!(target_os = "linux"),
+                    "{object:?}: {recovered:?}"
+                );
                 assert_eq!(object.bytes(&fx.root.join("dst")).as_deref(), Some(SOURCE));
             }
         }
@@ -1754,10 +1760,15 @@ fn rename_true_alias_pair_closes_both_private_proofs_before_committed_unlinks() 
             }
             assert!(!src.is_held());
             assert!(!dst.is_held());
-            assert!(recovery.finish().is_empty());
+            // The alias pair is the case a cached count cannot tell apart: off Linux the
+            // link rung keeps the source alias (reported); Linux proves it and cleans.
+            let keeps_alias = matches!(shape, Shape::Link) && !cfg!(target_os = "linux");
+            assert_eq!(recovery.finish().is_empty(), !keeps_alias);
             assert_eq!(object.bytes(&fx.root.join("dst")).as_deref(), Some(SOURCE));
             assert!(std::fs::symlink_metadata(fx.root.join("src")).is_err());
-            clean(&fx);
+            if !keeps_alias {
+                clean(&fx);
+            }
         }
     }
 }
