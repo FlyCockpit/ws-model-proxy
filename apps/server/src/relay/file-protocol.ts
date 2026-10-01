@@ -76,6 +76,7 @@ export const FILE_ERROR_CODES = [
   "timeout",
   "invalid_input",
   "unsupported",
+  "unsafe_filesystem",
   "cancelled",
   "limit",
 ] as const;
@@ -386,7 +387,11 @@ export const renameResultSchema = z
   .strict();
 export const mkdirResultSchema = z.object({ created: z.boolean() }).strict();
 export const deleteResultSchema = z
-  .object({ deleted: z.boolean(), type: z.enum(["file", "dir", "symlink", "other"]) })
+  .object({
+    deleted: z.boolean(),
+    type: z.enum(["file", "dir", "symlink", "other"]),
+    recovered: recoveryPathsSchema.optional(),
+  })
   .strict();
 
 /** The text field of each op's result that may travel as `file.data`. */
@@ -541,7 +546,9 @@ export const supervisedFileResultSchema = z.discriminatedUnion("op", [
     .object({ op: z.literal("rename"), result: renameResultSchema.omit({ recovered: true }) })
     .strict(),
   z.object({ op: z.literal("mkdir"), result: mkdirResultSchema }).strict(),
-  z.object({ op: z.literal("delete"), result: deleteResultSchema }).strict(),
+  z
+    .object({ op: z.literal("delete"), result: deleteResultSchema.omit({ recovered: true }) })
+    .strict(),
 ]);
 export type SupervisedFileResult = z.infer<typeof supervisedFileResultSchema>;
 export const supervisedFileErrorSchema = z.object({ code: z.enum(FILE_ERROR_CODES) }).strict();

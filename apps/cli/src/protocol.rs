@@ -103,6 +103,7 @@ pub enum FileErrorCode {
     TooLarge,
     Conflict,
     UncertainOutcome,
+    UnsafeFilesystem,
     MatchCount,
     NoMatch,
     RedactedSpan,
@@ -131,6 +132,7 @@ impl FileErrorCode {
             Self::TooLarge => "too_large",
             Self::Conflict => "conflict",
             Self::UncertainOutcome => "uncertain_outcome",
+            Self::UnsafeFilesystem => "unsafe_filesystem",
             Self::MatchCount => "match_count",
             Self::NoMatch => "no_match",
             Self::RedactedSpan => "redacted_span",
@@ -159,6 +161,7 @@ impl FileErrorCode {
             "too_large" => Self::TooLarge,
             "conflict" => Self::Conflict,
             "uncertain_outcome" => Self::UncertainOutcome,
+            "unsafe_filesystem" => Self::UnsafeFilesystem,
             "match_count" => Self::MatchCount,
             "no_match" => Self::NoMatch,
             "redacted_span" => Self::RedactedSpan,
@@ -192,6 +195,7 @@ impl From<crate::file_ops::ErrorCode> for FileErrorCode {
             Source::TooLarge => Self::TooLarge,
             Source::Conflict => Self::Conflict,
             Source::UncertainOutcome => Self::UncertainOutcome,
+            Source::UnsafeFilesystem => Self::UnsafeFilesystem,
             Source::MatchCount => Self::MatchCount,
             Source::NoMatch => Self::NoMatch,
             Source::RedactedSpan => Self::RedactedSpan,
@@ -3769,6 +3773,10 @@ mod relay_28_vectors {
         for (name, code) in [
             ("file-supervised-done-error", FileErrorCode::Conflict),
             (
+                "file-supervised-done-unsafe",
+                FileErrorCode::UnsafeFilesystem,
+            ),
+            (
                 "file-supervised-done-uncertain",
                 FileErrorCode::UncertainOutcome,
             ),
@@ -3785,11 +3793,16 @@ mod relay_28_vectors {
             assert_eq!(encoded(&message), frame);
             assert_eq!(FileErrorCode::from_wire_code(code.as_str()), Some(code));
             #[cfg(unix)]
-            if code == FileErrorCode::UncertainOutcome {
-                assert_eq!(
+            match code {
+                FileErrorCode::UncertainOutcome => assert_eq!(
                     FileErrorCode::from(crate::file_ops::ErrorCode::UncertainOutcome),
                     code
-                );
+                ),
+                FileErrorCode::UnsafeFilesystem => assert_eq!(
+                    FileErrorCode::from(crate::file_ops::ErrorCode::UnsafeFilesystem),
+                    code
+                ),
+                _ => {}
             }
         }
 

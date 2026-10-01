@@ -222,6 +222,15 @@ describe("relay 2.8 file frames: CLI to server", () => {
     }
   });
 
+  it("accepts the definitive filesystem safety refusal without recovery detail", () => {
+    expect(FILE_ERROR_CODES).toContain("unsafe_filesystem");
+    const frame = { type: "file.rejected", opId: OP_ID, reason: "unsafe_filesystem" };
+    expect(parseRelayClientControlFrame(JSON.stringify(frame))).toEqual(frame);
+    for (const reason of ["UnsafeFilesystem", "unsafeFilesystem", "unsafe_filesystem "]) {
+      expect(fileRejectedFrameSchema.safeParse({ ...frame, reason }).success).toBe(false);
+    }
+  });
+
   it("rejects extra and missing fields in every file.result", () => {
     for (const op of RESULT_OPS) {
       const frame = vector(`file-result-${op}`) as { result: Record<string, unknown> };
@@ -532,6 +541,7 @@ describe("supervised file pre-display rejection contract", () => {
     "timeout",
     "cancelled",
     "uncertain_outcome",
+    "unsafe_filesystem",
     "future_internal_error",
   ])("rejects %s without widening the schema", (code) => {
     expect(supervisedFileRejectReasonSchema.safeParse(code).success).toBe(false);
@@ -560,12 +570,22 @@ describe("file compensation recovery contract", () => {
     expect(fileRejectedFrameSchema.safeParse({ ...frame, detail: undefined }).success).toBe(false);
   });
 
-  it.each(["edit", "write", "rename"])(
+  it.each(["edit", "write", "rename", "delete"])(
     "accepts recovered on %s and rejects unbounded/relative paths",
     (op) => {
       const frame = vector(`file-result-${op}`) as { result: Record<string, unknown> };
       const result = { ...frame.result, recovered: detail.kept };
       expect(fileOpResultSchema.parse({ op, result })).toEqual({ op, result });
+      expect(
+        parseRelayClientControlFrame(
+          JSON.stringify({ type: "file.result", opId: OP_ID, op, result }),
+        ),
+      ).toEqual({ type: "file.result", opId: OP_ID, op, result });
+      for (const recovered of [[], Array(4).fill("/x"), [`/${"x".repeat(8191)}`]]) {
+        expect(fileOpResultSchema.safeParse({ op, result: { ...result, recovered } }).success).toBe(
+          true,
+        );
+      }
       for (const recovered of [
         ["relative"],
         ["/x\0y"],

@@ -1462,8 +1462,8 @@ mod exchange_callers {
     }
 
     #[test]
-    fn a_replace_falls_back_to_the_checked_rename_only_for_unsupported_errors() {
-        for errno in [Errno::EINVAL, Errno::ENOSYS] {
+    fn a_replace_uses_safe_publication_only_for_unsupported_errors() {
+        for errno in [Errno::EINVAL, Errno::ENOSYS, Errno::ENOTSUP] {
             let fx = Fx::new();
             fx.put("doc.txt", "original\n");
             let _faults = inject(errno);
@@ -1510,11 +1510,11 @@ mod exchange_callers {
     }
 
     #[test]
-    fn an_overwrite_maps_unsupported_errors_to_unsupported_and_others_to_their_own_error() {
-        for errno in [Errno::EINVAL, Errno::ENOSYS] {
+    fn an_overwrite_maps_unsupported_errors_to_unsafe_filesystem_and_others_to_their_own_error() {
+        for errno in [Errno::EINVAL, Errno::ENOSYS, Errno::ENOTSUP] {
             let fx = Fx::new();
             let _faults = inject(errno);
-            assert_eq!(code(overwrite(&fx)), ErrorCode::Unsupported, "{errno}");
+            assert_eq!(code(overwrite(&fx)), ErrorCode::UnsafeFilesystem, "{errno}");
             assert_eq!(fx.get("dst.txt"), "old", "{errno}");
             assert_eq!(fx.get("src.txt"), "mine", "{errno}");
         }

@@ -141,6 +141,14 @@ fn clean(fx: &Fx) {
 fn compensation_fault_table_is_off_by_default_nth_and_thread_local() {
     for primitive in [
         Primitive::Exchange,
+        Primitive::ProbeNoReplace,
+        Primitive::ProbeLink,
+        Primitive::Publish,
+        Primitive::PublishLink,
+        Primitive::Mkdir,
+        Primitive::Hold,
+        Primitive::Identity,
+        Primitive::MoveLink,
         Primitive::Capture,
         Primitive::Restore,
         Primitive::RestoreLink,
@@ -467,28 +475,13 @@ fn compensation_capture_falls_back_only_for_unsupported_errors() {
                 Ok(())
             });
             let _scope = FaultScope::new(&[(Primitive::Capture, 1, errno)]);
-            if errno != Errno::ENOTSUP || cfg!(target_os = "macos") {
-                if matches!(op, Op::Replace) {
-                    assert_eq!(op.run(&fx, &etag).unwrap_err().code, ErrorCode::Conflict);
-                    assert_eq!(fx.get(op.destination()), "unchecked destination");
-                } else {
-                    assert!(op.run(&fx, &etag).unwrap().get("recovered").is_none());
-                }
-                clean(&fx);
+            if matches!(op, Op::Replace) {
+                assert_eq!(op.run(&fx, &etag).unwrap_err().code, ErrorCode::Conflict);
+                assert_eq!(fx.get(op.destination()), "unchecked destination");
             } else {
-                let kept = uncertain(&op.run(&fx, &etag).unwrap_err());
-                let mut locations = kept;
-                locations.push(fx.root.join(op.destination()));
-                locations.push(fx.root.join("src.txt"));
-                assert!(contains_bytes(
-                    &locations,
-                    if matches!(op, Op::Rename) {
-                        "mine"
-                    } else {
-                        "unchecked destination"
-                    }
-                ));
+                assert!(op.run(&fx, &etag).unwrap().get("recovered").is_none());
             }
+            clean(&fx);
         }
     }
 }
@@ -1208,7 +1201,7 @@ fn compensation_exchange_error_restores_vacated_source_without_plain_overwrite()
                 assert_eq!(
                     error.code,
                     if crate::file_ops::exchange::is_unsupported(errno) {
-                        ErrorCode::Unsupported
+                        ErrorCode::UnsafeFilesystem
                     } else {
                         ErrorCode::IoError
                     },
@@ -1398,7 +1391,7 @@ fn compensation_no_flags_exchange_less_rename_restores_source_with_one_link() {
     ]);
     assert_eq!(
         Op::Rename.run(&fx, &etag).unwrap_err().code,
-        ErrorCode::Unsupported
+        ErrorCode::UnsafeFilesystem
     );
     assert_eq!(fx.get("src.txt"), "mine");
     assert_eq!(fx.get("dst.txt"), "original");
@@ -1632,5 +1625,108 @@ fn supervised_recovery_shares_private_staging_compensation_and_person_log() {
                 assert!(!log.contains(content), "log contains file content: {log}");
             }
         }
+    }
+}
+
+#[test]
+fn supervised_delete_capture_preserves_successors_and_logs_recovery_only_to_person() {
+    let _capture = crate::logging::test_capture_lock();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(ThreadLog)
+        .with_ansi(false)
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    for state in ["clean", "cleanup", "successor", "swapped", "cancel"] {
+        let fx = Fx::new();
+        fx.put("doc.txt", "original");
+        let path = fx.root.join("doc.txt");
+        let cancel = fx.cancel.clone();
+        let fx = fx.with_hook(move |step| {
+            if step == Step::Vacating {
+                if state == "cancel" {
+                    cancel.cancel();
+                }
+                if state == "swapped" {
+                    successor(&path, "newest external writer");
+                }
+            }
+            if step == Step::Vacated {
+                cancel.cancel(); // capture already committed: must finish safely
+                if state == "successor" {
+                    std::fs::write(&path, "newest external writer").unwrap();
+                }
+            }
+            Ok(())
+        });
+        let prepared = fx
+            .ops
+            .prepare_supervised(
+                "delete",
+                json!({"path":fx.p("doc.txt"),"expectedEtag":fx.etag("doc.txt")}),
+                None,
+                &crate::file_ops::EtagKey::from_bytes([19; 32]),
+                &fx.cancel,
+            )
+            .unwrap();
+        assert!(prepared.child_input().blocked.is_none());
+        LOG.with(|log| log.borrow_mut().clear());
+        let faults = if state == "cleanup" {
+            vec![(Primitive::Unlink, 1, Errno::EIO)]
+        } else {
+            vec![]
+        };
+        let _scope = FaultScope::new(&faults);
+        let result = fx.ops.execute_supervised(prepared, &fx.cancel);
+        if matches!(state, "cancel" | "swapped") {
+            assert_eq!(
+                result.unwrap_err().code,
+                if state == "cancel" {
+                    ErrorCode::Cancelled
+                } else {
+                    ErrorCode::Conflict
+                }
+            );
+            assert_eq!(
+                fx.get("doc.txt"),
+                if state == "cancel" {
+                    "original"
+                } else {
+                    "newest external writer"
+                }
+            );
+            assert!(!FaultScope::calls().contains(&Primitive::Unlink));
+            assert!(recovery_dirs(&fx.root).is_empty());
+            continue;
+        }
+        let result = result.unwrap();
+        assert_eq!(result["deleted"], true);
+        assert_eq!(result["type"], "file");
+        if state == "successor" {
+            assert_eq!(fx.get("doc.txt"), "newest external writer");
+        } else {
+            assert!(!fx.root.join("doc.txt").exists());
+        }
+        let kept = result.get("recovered").map(paths).unwrap_or_default();
+        assert_eq!(kept.is_empty(), state != "cleanup");
+        let log = LOG.with(|log| String::from_utf8(log.borrow().clone()).unwrap());
+        assert_eq!(
+            log.contains("file recovery retained"),
+            state == "cleanup",
+            "{log}"
+        );
+        for path in kept {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+            assert!(log.contains(path.to_str().unwrap()), "{log}");
+        }
+        assert!(!log.contains("newest external writer"));
+        let wire = serde_json::to_value(crate::protocol::SupervisedFileOutcome::result(
+            "delete".to_owned(),
+            result,
+        ))
+        .unwrap();
+        assert_eq!(
+            wire,
+            json!({"fileResult":{"op":"delete","result":{"deleted":true,"type":"file"}}})
+        );
     }
 }

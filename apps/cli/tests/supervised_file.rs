@@ -198,24 +198,35 @@ fn blocked_real_child_allows_every_dismiss_key_and_never_accepts() {
         json!({"path": missing, "reason": "remove stale file"}),
         None,
     );
-    let code = input.blocked.expect("state refusal");
-    for key in [b"\r".as_slice(), b"q", b"\x03", b"\x04"] {
-        let mut child = PtyChild::spawn(&input, None);
-        assert!(
-            child.wait_for(&PtyChild::marker("ready")),
-            "{}",
-            String::from_utf8_lossy(&child.seen)
-        );
-        child.send(key);
-        assert!(child.wait_for(&PtyChild::marker(&format!("blocked;{}", code.as_str()))));
-        let accepted = PtyChild::marker("accepted");
-        assert!(
-            !child
-                .seen
-                .windows(accepted.len())
-                .any(|window| window == accepted)
-        );
-        child.child.wait().expect("blocked child exits");
+    let original = input.blocked.expect("state refusal");
+    for code in [original, wsmp::file_ops::ErrorCode::UnsafeFilesystem] {
+        let mut input = input.clone();
+        input.blocked = Some(code);
+        for key in [b"\r".as_slice(), b"q", b"\x03", b"\x04"] {
+            let mut child = PtyChild::spawn(&input, None);
+            assert!(
+                child.wait_for(&PtyChild::marker("ready")),
+                "{}",
+                String::from_utf8_lossy(&child.seen)
+            );
+            let blocked = PtyChild::marker(&format!("blocked;{}", code.as_str()));
+            assert!(
+                !child
+                    .seen
+                    .windows(blocked.len())
+                    .any(|window| window == blocked)
+            );
+            child.send(key);
+            assert!(child.wait_for(&PtyChild::marker(&format!("blocked;{}", code.as_str()))));
+            let accepted = PtyChild::marker("accepted");
+            assert!(
+                !child
+                    .seen
+                    .windows(accepted.len())
+                    .any(|window| window == accepted)
+            );
+            child.child.wait().expect("blocked child exits");
+        }
     }
     assert!(!missing.exists());
 }

@@ -686,6 +686,130 @@ fn file_errors_become_file_rejected_with_only_the_documented_detail() {
 }
 
 #[test]
+fn unsafe_filesystem_is_serialized_as_a_file_rejected_without_cli_text() {
+    let (frames, code) = frames_for(
+        "op",
+        "rename",
+        Err(FileError::new(
+            ErrorCode::UnsafeFilesystem,
+            "private CLI diagnostic",
+        )),
+    );
+    assert_eq!(code, "unsafe_filesystem");
+    assert_eq!(
+        only_control(&frames),
+        json!({ "type": "file.rejected", "opId": "op", "reason": "unsafe_filesystem" })
+    );
+}
+
+#[test]
+fn delete_recovered_is_optional_and_survives_result_frame_encoding() {
+    for recovered in [
+        Vec::new(),
+        vec!["/workspace/.wsmp-recover-a1b2c3d4e5".to_string()],
+    ] {
+        let value = serde_json::to_value(crate::file_ops::mutate::DeleteResult {
+            deleted: true,
+            kind: "file",
+            recovered: recovered.clone(),
+        })
+        .expect("delete result");
+        if recovered.is_empty() {
+            assert_eq!(value, json!({ "deleted": true, "type": "file" }));
+        } else {
+            assert_eq!(value["recovered"], json!(recovered));
+        }
+        let (frames, code) = frames_for("op", "delete", Ok(value.clone()));
+        assert_eq!(code, "ok");
+        assert_eq!(
+            only_control(&frames),
+            json!({ "type": "file.result", "opId": "op", "op": "delete", "result": value })
+        );
+    }
+}
+
+#[test]
+fn a_delete_result_carries_retained_recovery_after_real_dispatch() {
+    for kind in ["file", "symlink"] {
+        for retain in [false, true] {
+            let dir = tempfile::tempdir().expect("dir");
+            let file = dir.path().join("delete-me");
+            let target = dir.path().join("keep-target");
+            std::fs::write(&target, "target bytes").expect("target");
+            if kind == "file" {
+                std::fs::write(&file, "delete bytes").expect("file");
+            } else {
+                std::os::unix::fs::symlink(&target, &file).expect("symlink");
+            }
+            let parent = dir.path().to_path_buf();
+            let euid = nix::unistd::geteuid().as_raw();
+            let policy = Policy::from_environment(Vec::new(), euid == 0).with_euid(euid);
+            let ops =
+                FileOps::new(policy, EtagKey::random()).with_step_hook(Arc::new(move |step| {
+                    if retain && step == Step::Vacated {
+                        let recovery = std::fs::read_dir(&parent)
+                            .expect("parent entries")
+                            .map(|entry| entry.expect("entry").path())
+                            .find(|path| {
+                                path.file_name().is_some_and(|name| {
+                                    name.to_string_lossy().starts_with(".wsmp-recover-")
+                                })
+                            })
+                            .expect("recovery directory");
+                        std::fs::write(recovery.join("retained-object"), "retained bytes")
+                            .expect("retain cleanup object");
+                    }
+                    Ok(())
+                }));
+            let mut harness = harness_with(
+                Arc::new(FileRuntime::new(ops)),
+                McpCommandMode::Unsupervised,
+            );
+            assert!(
+                harness
+                    .relay
+                    .handle_op(
+                        &op_id(30),
+                        "delete",
+                        json!({ "path": path_str(&file) }),
+                        None,
+                        FilePermission {
+                            mode: McpCommandMode::Unsupervised,
+                            read_grant: false,
+                        },
+                    )
+                    .is_empty()
+            );
+            let (id, frames, current) = harness.settled();
+            assert_eq!(id, op_id(30));
+            assert!(current);
+            let frame = only_control(&frames);
+            assert_eq!(frame["type"], "file.result");
+            assert_eq!(frame["op"], "delete");
+            assert_eq!(frame["result"]["deleted"], true);
+            assert_eq!(frame["result"]["type"], kind);
+            assert!(std::fs::symlink_metadata(&file).is_err());
+            assert_eq!(
+                std::fs::read_to_string(&target).expect("target"),
+                "target bytes"
+            );
+            if retain {
+                let recovered = frame["result"]["recovered"].as_array().expect("recovered");
+                assert_eq!(recovered.len(), 1);
+                let recovery = std::path::Path::new(recovered[0].as_str().expect("absolute path"));
+                assert!(recovery.is_absolute());
+                assert_eq!(
+                    std::fs::read_to_string(recovery.join("retained-object")).expect("retained"),
+                    "retained bytes"
+                );
+            } else {
+                assert!(frame["result"].get("recovered").is_none());
+            }
+        }
+    }
+}
+
+#[test]
 fn uncertain_outcome_recovery_facts_survive_the_detail_filter_as_a_pair() {
     let facts = json!({ "recovery": "/w/.wsmp-recover-AAAAAAAAAA", "kept": ["/w/.wsmp-recover-AAAAAAAAAA/slot-1"] });
     assert_eq!(filter_detail(&facts), Some(facts.clone()));

@@ -117,6 +117,7 @@ fn error_code(value: &str) -> Option<ErrorCode> {
         "binary_file" => ErrorCode::BinaryFile,
         "too_large" => ErrorCode::TooLarge,
         "conflict" => ErrorCode::Conflict,
+        "unsafe_filesystem" => ErrorCode::UnsafeFilesystem,
         "match_count" => ErrorCode::MatchCount,
         "no_match" => ErrorCode::NoMatch,
         "redacted_span" => ErrorCode::RedactedSpan,

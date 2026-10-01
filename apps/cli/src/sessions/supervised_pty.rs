@@ -170,6 +170,8 @@ impl MarkerScanner {
                 Some(value) if value.starts_with("blocked;") => {
                     // `uncertain_outcome` is an apply-time verdict only the daemon
                     // produces after acceptance; the confirm child never has it.
+                    // `unsafe_filesystem` may be a preview-time capability refusal,
+                    // so its blocked verdict is allowed after the dismiss key.
                     FileErrorCode::from_wire_code(&value["blocked;".len()..])
                         .filter(|code| !matches!(code, FileErrorCode::UncertainOutcome))
                         .map(MarkerEvent::Blocked)
@@ -289,12 +291,18 @@ mod tests {
     #[test]
     fn marker_scanner_accepts_one_valid_blocked_code_and_rejects_arbitrary_kinds() {
         let marker = "00112233445566778899aabbccddeeff";
-        let mut blocked = MarkerScanner::new(marker);
-        let mut stream = supervised_marker("ready", marker);
-        stream.extend(supervised_marker("blocked;conflict", marker));
-        let pieces = blocked.feed(&stream);
-        assert!(pieces.contains(&Piece::Event(MarkerEvent::Ready)));
-        assert!(pieces.contains(&Piece::Event(MarkerEvent::Blocked(FileErrorCode::Conflict))));
+        // A preview-time capability refusal is valid after screen dismissal.
+        for code in [FileErrorCode::Conflict, FileErrorCode::UnsafeFilesystem] {
+            let mut blocked = MarkerScanner::new(marker);
+            let mut stream = supervised_marker("ready", marker);
+            stream.extend(supervised_marker(
+                &format!("blocked;{}", code.as_str()),
+                marker,
+            ));
+            let pieces = blocked.feed(&stream);
+            assert!(pieces.contains(&Piece::Event(MarkerEvent::Ready)));
+            assert!(pieces.contains(&Piece::Event(MarkerEvent::Blocked(code))));
+        }
 
         // An apply-time verdict the confirm child never produces is malformed there.
         for kind in [

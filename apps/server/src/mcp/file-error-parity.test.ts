@@ -26,6 +26,10 @@ const RUST_ERROR = readFileSync(
   "utf8",
 );
 const RUST_RELAY = readFileSync(new URL("../../../cli/src/file_relay.rs", import.meta.url), "utf8");
+const RUST_PROTOCOL = readFileSync(
+  new URL("../../../cli/src/protocol.rs", import.meta.url),
+  "utf8",
+);
 const MCP_DOC = readFileSync(new URL("../../../../docs/mcp.md", import.meta.url), "utf8");
 
 /** The text between the first `open` after `anchor` and its matching `close`. */
@@ -89,6 +93,7 @@ describe("file error-code parity between the Rust CLI and the TypeScript server"
     expect(variants.length).toBeGreaterThanOrEqual(20);
     expect(arms.length).toBe(variants.length);
     expect(variants).toContain("UncertainOutcome");
+    expect(variants).toContain("UnsafeFilesystem");
     expect(RUST_ERROR).toMatch(/#\[serde\(rename_all = "snake_case"\)\]\s*pub enum ErrorCode/);
   });
 
@@ -104,6 +109,24 @@ describe("file error-code parity between the Rust CLI and the TypeScript server"
     expect(new Set(rust).size).toBe(rust.length);
     expect(new Set(FILE_ERROR_CODES).size).toBe(FILE_ERROR_CODES.length);
     expect(sorted(FILE_ERROR_CODES)).toEqual(sorted(rust as string[]));
+  });
+
+  it("the supervised CLI code set and its spellings match every headless code", () => {
+    const body = blockAfter(RUST_PROTOCOL, "pub enum FileErrorCode", "{", "\n}");
+    const supervisedVariants = body
+      .split("\n")
+      .map((line) => UNIT_VARIANT.exec(line)?.[1])
+      .filter((variant): variant is string => variant !== undefined);
+    expect(sorted(supervisedVariants)).toEqual(sorted(variants));
+    const impl = blockAfter(RUST_PROTOCOL, "impl FileErrorCode", "{", "\n}");
+    const spellings = [...impl.matchAll(/Self::([A-Za-z0-9]+)\s*=>\s*"([^"]+)"/g)].map(
+      (match) => match[2] ?? "",
+    );
+    const parsed = [...impl.matchAll(/"([^"]+)"\s*=>\s*Self::[A-Za-z0-9]+/g)].map(
+      (match) => match[1] ?? "",
+    );
+    expect(sorted(spellings)).toEqual(sorted(FILE_ERROR_CODES));
+    expect(sorted(parsed)).toEqual(sorted(FILE_ERROR_CODES));
   });
 
   it("FILE_WIRE_REASONS is exactly the CLI dispatcher's wire refusal set", () => {

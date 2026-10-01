@@ -74,7 +74,11 @@ const WRITE_RESULTS: Readonly<Record<string, Record<string, unknown>>> = {
   write: { etag: "h:AAAAAAAAAAAAAAAAAAAAAA", size: 5, created: true },
   rename: { etag: null },
   mkdir: { created: true },
-  delete: { deleted: true, type: "file" },
+  delete: {
+    deleted: true,
+    type: "file",
+    recovered: ["/workspace/.wsmp-recover-a1b2c3d4e5"],
+  },
 };
 
 const READ_OPS: Array<[string, string, Record<string, unknown>]> = [
@@ -152,7 +156,7 @@ describe("requireFilePat op classification", () => {
       { cliDeviceId: "cli-1", ...WRITE_ARGS[op] },
       deps(WRITE_PAT),
     );
-    expect(outcome).toMatchObject({ ok: true, op });
+    expect(outcome).toEqual({ ok: true, op, result: WRITE_RESULTS[op] });
     expect(fileRuntime.runFileOp).toHaveBeenCalledOnce();
   });
 

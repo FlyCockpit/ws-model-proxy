@@ -1,0 +1,12 @@
+{
+  "type": "supervised.done",
+  "commandId": "AAECAwQFBgcICQoLDA0ODw",
+  "review": false,
+  "fileError": {
+    "code": "unsafe_filesystem",
+    "detail": {
+      "recovery": "/workspace/.wsmp-recover-a1b2c3d4e5",
+      "kept": ["/workspace/.wsmp-recover-a1b2c3d4e5/slot-1"]
+    }
+  }
+}
