@@ -1,3 +1,14 @@
+/**
+ * Eviction evidence is one SQL snapshot proving the resolved session owns a
+ * live tip in this request chain and reading the footprint stored on that node.
+ * Only identifiable tip writes set that footprint; overflow-only hint refreshes
+ * cannot change it. The matching hint supplies recency and cache confirmation.
+ * Routing hints and identity resolution remain independent. Evidence describes
+ * the ranking snapshot; later unrelated writers cannot invalidate that claim.
+ * Client identity remains authoritative, with no extra query on the write path.
+ * Implicit identical tips can lose one observation when the resolver chooses
+ * an earlier-expiring session than the last shared-hint writer, failing closed.
+ */
 import { randomUUID } from "node:crypto";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
@@ -67,6 +78,8 @@ export type AffinityDecision = {
    * `resolveAffinitySession`. Absent = a new session on that target.
    */
   matchedSessionIds?: Record<string, string>;
+  /** Tip-node footprint proven in one ranking snapshot; not proof of residency. */
+  prefixEvidence?: Record<string, { tokens: number; lastUsedAt: number; confirmed: boolean }>;
 };
 
 /** Durable server-side Responses lineage. Never accepted from request JSON. */
@@ -128,6 +141,9 @@ export const FREE_SAMPLING_PARAMS = [
   "repetition_penalty",
   "logit_bias",
   "stop",
+  // Anthropic's name for the same stop list. Changing it does not change
+  // what a model has cached, so it must not split a conversation (owner, 2026-10-01).
+  "stop_sequences",
   "max_tokens",
   "max_completion_tokens",
   "max_output_tokens",
@@ -637,7 +653,8 @@ export function affinityRetentionSql(scope: IdentityScope, maxRecords: number): 
  * ONE identity enforcement point: rank predicts; remember rereads after its sole
  * cacheAffinity fence. Equality-seek in index order, LIMIT 1 / 2, never a history
  * population scan. User-only and leading-greeting starters stay fresh: a new starter is indistinguishable
- * from truncation to that starter. Fail closed in this residual case; truncations
+ * from truncation to that starter, including when exactly one live conversation starts with that
+ * opening. Fail closed in this residual case (owner, 2026-10-01); truncations
  * retaining conversation evidence can link. Root/instruction-only warmth never links.
  */
 export async function resolveAffinitySession(
@@ -698,6 +715,57 @@ export function affinityIdentityProbeSql(
      ORDER BY p.depth DESC LIMIT 1`;
 }
 
+/**
+ * One snapshot of tip ownership and its structurally proven footprint: tokens
+ * live on the tip node, written only by an identifiable request. Hint-only
+ * refreshes can update recency and confirmation without changing that footprint.
+ * Legacy nodes without an estimate provide no evidence.
+ * Full unique-key equalities bound index work to this request's <=64 nodes,
+ * independent of other sessions.
+ * Lateral OFFSET 0 keeps the per-node unique-key lookups correlated instead
+ * of letting the planner start from all of a session's historical hint rows.
+ * Shared hints stamped by another session prove nothing about this session.
+ * Exported so PostgreSQL diagnostics explain the exact production statement.
+ */
+export function affinityPrefixEvidenceSql(
+  scope: IdentityScope,
+  targetIdentity: string,
+  material: AffinityMaterial,
+  sessionId: string,
+  now: Date,
+): Prisma.Sql {
+  return Prisma.sql`
+    SELECT n."estimatedTokens", r."lastUsedAt", r."engineCacheConfirmed"
+      FROM jsonb_to_recordset(${JSON.stringify(material.nodes)}::jsonb) AS p(digest text, depth int)
+      JOIN LATERAL (
+        SELECT n."isTip", n."expiresAt", n."estimatedTokens" FROM cache_affinity_node n
+         WHERE n."userId" = ${scope.userId}
+           AND n."tenantUserId" = ${scope.tenantUserId}
+           AND n."poolId" = ${scope.poolId}
+           AND n."executionTargetId" = ${scope.executionTargetId}
+           AND n."rootDigest" = ${material.rootDigest}
+           AND n."nodeDigest" = p.digest
+           AND n."sessionId" = ${sessionId}
+        OFFSET 0
+      ) n ON n."isTip" AND n."expiresAt" > ${now}::timestamp
+             AND n."estimatedTokens" IS NOT NULL
+      JOIN LATERAL (
+        SELECT r."lastUsedAt", r."engineCacheConfirmed",
+               r."sessionId", r."digestVersion", r."expiresAt"
+          FROM cache_affinity_record r
+         WHERE r."tenantUserId" = ${scope.tenantUserId}
+           AND r."poolId" = ${scope.poolId}
+           AND r."executionTargetId" = ${scope.executionTargetId}
+           AND r."targetIdentity" = ${targetIdentity}
+           AND r."bindingDigest" = ${material.bindingDigest}
+           AND r."prefixDigest" = p.digest
+        OFFSET 0
+      ) r ON r."sessionId" = ${sessionId}
+             AND r."digestVersion" = ${DIGEST_VERSION}
+             AND r."expiresAt" > ${now}::timestamp
+     ORDER BY p.depth DESC LIMIT 1`;
+}
+
 export async function rankAffinityTargets({
   ownerId,
   resourceOwnerId,
@@ -709,9 +777,11 @@ export async function rankAffinityTargets({
   payload,
   targets,
   scoreSingleTarget = false,
+  collectPrefixEvidence = false,
   sessionBinding,
   headers,
   now = new Date(),
+  db = prisma,
 }: {
   ownerId: string;
   resourceOwnerId: string;
@@ -724,9 +794,16 @@ export async function rankAffinityTargets({
   targets: AffinityTarget[];
   /** Score one target too (local pool routing with warm-session protection). */
   scoreSingleTarget?: boolean;
+  /** Read the live-tip footprint snapshot only for enabled eviction feedback. */
+  collectPrefixEvidence?: boolean;
   sessionBinding?: AffinitySessionBinding;
   headers?: Headers;
   now?: Date;
+  /** Read-only injection for real-query interleavings; writers use their own client. */
+  db?: Pick<
+    typeof prisma,
+    "cacheAffinityRecord" | "capacityLease" | "capacityWaiter" | "$queryRaw" | "cacheAffinityNode"
+  >;
 }): Promise<AffinityDecision> {
   const unchanged = {
     orderedTargetIds: targets.map(({ executionTargetId }) => executionTargetId),
@@ -794,7 +871,7 @@ export async function rankAffinityTargets({
   }
 
   const [records, activeLoads, waitingLoads] = await Promise.all([
-    prisma.cacheAffinityRecord.findMany({
+    db.cacheAffinityRecord.findMany({
       where: {
         userId: resourceOwnerId,
         tenantUserId: ownerId,
@@ -822,7 +899,7 @@ export async function rankAffinityTargets({
         estimatedTokens: true,
       },
     }),
-    prisma.capacityLease.groupBy({
+    db.capacityLease.groupBy({
       by: ["capacityId"],
       where: {
         capacityId: { in: targets.map(({ capacityId }) => capacityId) },
@@ -831,7 +908,7 @@ export async function rankAffinityTargets({
       },
       _count: { _all: true },
     }),
-    prisma.capacityWaiter.groupBy({
+    db.capacityWaiter.groupBy({
       by: ["capacityId"],
       where: {
         capacityId: { in: targets.map(({ capacityId }) => capacityId) },
@@ -908,17 +985,36 @@ export async function rankAffinityTargets({
             )
           : undefined);
       const prefixTokens = matchedRecord?.estimatedTokens ?? undefined;
-      const sessionId = await resolveAffinitySession(
-        prisma,
-        {
-          userId: resourceOwnerId,
-          tenantUserId: ownerId,
-          poolId,
-          executionTargetId: target.executionTargetId,
-        },
-        material,
-        now,
-      );
+      const scope = {
+        userId: resourceOwnerId,
+        tenantUserId: ownerId,
+        poolId,
+        executionTargetId: target.executionTargetId,
+      };
+      const sessionId = await resolveAffinitySession(db, scope, material, now);
+      let prefixEvidence: NonNullable<AffinityDecision["prefixEvidence"]>[string] | undefined;
+      if (
+        collectPrefixEvidence &&
+        sessionId !== null &&
+        material.identifiable &&
+        material.nodes.length > 0 &&
+        !material.missingParent &&
+        material.isContinuation
+      ) {
+        try {
+          const [row] = await db.$queryRaw<
+            { estimatedTokens: number; lastUsedAt: Date; engineCacheConfirmed: boolean }[]
+          >(affinityPrefixEvidenceSql(scope, target.targetIdentity, material, sessionId, now));
+          if (row)
+            prefixEvidence = {
+              tokens: row.estimatedTokens,
+              lastUsedAt: row.lastUsedAt.getTime(),
+              confirmed: row.engineCacheConfirmed,
+            };
+        } catch {
+          // Disposable feedback: an unproven footprint must not change ranking.
+        }
+      }
       const active = target.activeLoad ?? activeByCapacity.get(target.capacityId) ?? 0;
       const waiting = target.waitingLoad ?? waitingByCapacity.get(target.capacityId) ?? 0;
       const normalizedLoad = target.hardConcurrencyLimit
@@ -945,6 +1041,7 @@ export async function rankAffinityTargets({
         isContinuation: material.isContinuation,
         prefixTokens,
         sessionId,
+        prefixEvidence,
       };
     }),
   );
@@ -991,6 +1088,15 @@ export async function rankAffinityTargets({
         prefixTokens === undefined ? [] : [[target.executionTargetId, prefixTokens]],
       ),
     ),
+    ...(collectPrefixEvidence
+      ? {
+          prefixEvidence: Object.fromEntries(
+            scored.flatMap(({ target, prefixEvidence }) =>
+              prefixEvidence === undefined ? [] : [[target.executionTargetId, prefixEvidence]],
+            ),
+          ),
+        }
+      : {}),
     matchedSessionIds: Object.fromEntries(
       scored.flatMap(({ target, sessionId }) =>
         sessionId === null ? [] : [[target.executionTargetId, sessionId]],
@@ -1174,24 +1280,34 @@ export async function rememberAffinity({
     }
     const tip = material.nodes.at(-1);
     if (tip) {
+      const tipEstimatedTokens =
+        estimatedTokens === undefined
+          ? null
+          : Math.max(0, Math.min(2_147_483_647, Math.trunc(estimatedTokens)));
       const oldDigests = new Set(existingNodes.map((node) => node.nodeDigest));
       const inserts = retained.filter(
         (node) => !oldDigests.has(node.digest) || node.digest === tip.digest,
       );
+      // Only this write's tip receives its whole-prompt estimate. Replays and
+      // promotions replace it even with NULL; non-tip conflicts preserve any
+      // footprint from an earlier write that made that node a tip.
       if (inserts.length)
         await tx.$executeRaw(Prisma.sql`
         INSERT INTO cache_affinity_node
           (id, "userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest",
-           "nodeDigest", depth, "sessionId", "isTip", "expiresAt") VALUES
+           "nodeDigest", depth, "sessionId", "isTip", "estimatedTokens", "expiresAt") VALUES
           ${Prisma.join(
             inserts.map(
               (node) => Prisma.sql`(${randomUUID()}, ${resourceOwnerId},
             ${ownerId}, ${poolId}, ${target.executionTargetId}, ${material.rootDigest},
-            ${node.digest}, ${node.depth}, ${sessionId}, ${node.digest === tip.digest}, ${expiresAt})`,
+            ${node.digest}, ${node.depth}, ${sessionId}, ${node.digest === tip.digest},
+            ${node.digest === tip.digest ? tipEstimatedTokens : null}, ${expiresAt})`,
             ),
           )}
         ON CONFLICT ("userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest", "nodeDigest", "sessionId")
-        DO UPDATE SET "isTip" = EXCLUDED."isTip", "expiresAt" = EXCLUDED."expiresAt"`);
+        DO UPDATE SET "isTip" = EXCLUDED."isTip", "expiresAt" = EXCLUDED."expiresAt",
+          "estimatedTokens" = CASE WHEN EXCLUDED."isTip" THEN EXCLUDED."estimatedTokens"
+            ELSE cache_affinity_node."estimatedTokens" END`);
     }
     // Read the discarded node digests under the same fence before pruning hints.
     // Instruction hints have no node row, so omitted instructions remain matchable.

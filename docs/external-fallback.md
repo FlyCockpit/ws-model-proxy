@@ -194,12 +194,98 @@ For each request, every local member that has no affinity hit for it is:
 - **protected** when it is not full but every idle slot holds a protected warm
   session (slot mode), or, when the engine reports its KV budget (vLLM, SGLang:
   protocol 2.7 engine facts), when the protected tokens plus the request exceed
-  90% of that budget (token mode). In slot mode a session whose next turn is
-  running right now is served by one of the active leases, so it does not
+  90% of its effective budget (token mode). In slot mode a session whose next
+  turn is running right now is served by one of the active leases, so it does not
   also fill an idle slot: only protected sessions no active lease is serving
   count against the idle slots. In token mode every protected session counts,
   because a running session's cache is still in the pool;
 - **free** otherwise.
+
+Token-mode KV eviction feedback lowers the effective budget when a successful
+local pooled request continues a digest-proven, live-tip warm session whose
+previous matched record confirmed engine caching. Both the expected prefix and
+the actual reported prompt must be at least `protectMinTokens`; the record must
+be within that engine's protection window. A reported cache read of at most 5%
+of the expected prefix is an eviction observation. The first observation on a
+capacity that is not already cut only arms feedback from that session; a second
+observation from a different session lowers K. Later observations from the same
+session are ignored, including after a live cut, so one conversation's template
+rewrites cannot walk K down. Two independent sessions still cut. Pending
+corroboration lasts until `expiresAt` (30 minutes from the arming write). An
+expired row is a new first miss, matching readers that already ignore expiry.
+Chat templates that rewrite earlier turns (Qwen3 and DeepSeek-R1 strip reasoning;
+gpt-oss drops earlier analysis channels) can look like a miss on a long confirmed
+session when the user sends a follow-up. Follow-ups from that same session do not
+cut. A miss from a second session still can.
+Unknown cache fields, hits,
+partial hits above 5%, short prefixes, client-id-only matches, instruction hints,
+matches to ancestors that are not live tips and unranked targets produce no
+observation. A client id with a digest-proven live stored tip of that same session
+does count: evidence comes from one SQL statement proving that the resolved
+session owns a live tip in the request chain and reading the whole-prompt estimate
+stored on that tip node. Only an identifiable write of that tip can set its
+estimate, including a replay, truncation or bound Responses lineage write. The
+matching live hint proves the same session and current digest version and
+supplies recency and cache confirmation in the same snapshot.
+Byte/unit-overflow requests can refresh routing hints and an authoritative
+client's warm footprint without changing its retained tip or the tip's estimate,
+even when both writes use the same timestamp. Such a refresh can update evidence
+recency and confirmation, but cannot lend its larger footprint to the retained
+tip. A refresh that changes the hint's session still yields no evidence. Legacy
+nodes with no estimate yield no evidence. The nullable integer node
+column is added by safe schema push without deleting existing data.
+A concurrent truncation therefore exposes both the new tip and its rewritten
+footprint, or neither. Client ids pin the evidence owner even when other sessions
+have identical tips. For implicit sessions, identical tips are indistinguishable:
+the resolver picks the earliest-expiring tip. If another session last stamped
+the shared hint, that turn yields no evidence, failing closed. At most one
+observation is lost per tied session; its own identifiable write restamps the
+hints and restores evidence. No other session's footprint is accepted. These
+checks apply **as of the ranking snapshot** and do not establish engine residency
+at dispatch or response time; a later unrelated writer does not affect that snapshot.
+The bound Responses `previous_response_id` path is excluded: it has neither a ranked
+decision nor the matched record's age. Endpoint prefix-cache counters are also
+excluded: they are cumulative, include bypass traffic and cannot be attributed
+to a matched prefix. Unconfirmed records cannot count; remembering a zero-read
+miss removes confirmation from that prefix.
+
+After a second distinct session corroborates, each further miss from a new
+session cuts 5% of the **reported** K (`KV_EVICTION_STEP = 0.05`), with at most
+10 distinct sessions per flush and a 50% maximum cut (`KV_EVICTION_MAX_CUT`).
+The integer effective budget stays between `ceil(0.5 * K)` and K. Cuts recover
+linearly at `0.5 / 1_800_000` per millisecond: a full cut recovers in exactly
+30 minutes (`KV_EVICTION_RECOVERY_MS`). Hits write nothing. Only the PROTECTED
+threshold (`W_protected + r > K_eff x 0.9`) uses the effective budget; the equity
+shares, and so which sessions are protected, stay on the reported K, so evidence
+can only make a member PROTECTED sooner (monotone), never release a protected
+session. A lower threshold redirects new sessions, which reduces evictions until
+evidence stops. The 50% cap, not the 10-per-flush clamp, bounds the cut: a burst
+of confirmed misses (for example after an engine restart that flushed every
+cache) can reach the cap within seconds, and the cut then recovers over 30
+minutes. Distinct sessions whose misses are small but non-zero can each cut
+once, and a single-member pool (nowhere to redirect) can hold the cut at the
+cap while it stays overloaded. All of this
+stays in the fail-safe direction: protection never blocks a request.
+Reported-budget changes automatically scale the relative cut. Slot mode,
+including llama.cpp, is unaffected. Budgets must be positive int32 counts;
+malformed budgets select slot mode, and corrupt stored cuts are clamped.
+
+Feedback is buffered without request-path I/O and flushed at most once per second
+per capacity per process, with one trailing timer. At most 1024 capacities are
+pending; observations for new keys beyond that bound are dropped. Failed flushes
+are dropped and logged at most once per minute; feedback never affects response
+finalization. The owner-guarded atomic SQL upsert combines concurrent process
+writers without graph/capacity locks or transactions. Application time is passed
+explicitly; negative elapsed time is clamped to zero and observation/expiry times
+use `GREATEST`, bounding clock skew. A write against an expired row is a new
+first miss, so the pending window is the 30-minute expiry rather than hourly
+cleanup. Rows are an expiring class-H cache without
+foreign keys, never drained during parent deletion. Readers ignore expired rows
+and fall back to reported K if the read fails; retention deletes rows expired
+more than an hour ago. Shutdown clears timers and the DB fence prevents writes.
+The dashboard warns when the KV budget is lowered. The MCP pool-rules read
+shows reported/effective budgets, current cut/floor and observation/expiry times. This adds one table only;
+there is no destructive schema change.
 
 llama.cpp is always slot mode, and its sessions are protected for half the
 pool's window: it restores evicted slot prompts from host RAM, so evicting
@@ -238,13 +324,17 @@ A valid client conversation id is authoritative, even when instructions change.
 Without one, continuity uses the last 64 digest-chain nodes, deepest first: a
 live tip wins by earliest expiry then session id; otherwise a sole ancestor
 owner permits edits/truncations. Ambiguous ancestors start a fresh session.
-Leading instructions (system/developer units before the first conversation unit,
-the Anthropic `system` field, Responses `instructions`), tools, semantic and
-unknown parameters bind the root; a later system/developer message keeps its
-position in the history and behaves like any other edit. Only the
-16 approved sampling parameters are free (alongside model/stream and consumed
-content). A body carrier is excluded only when it wins validation and supplies
-the client id; invalid, inactive and losing carriers bind like unknown parameters.
+A request cut back to only its opening message looks the same as a new
+conversation with that opening, so it stays fresh even when exactly one live
+conversation starts that way. Leading instructions (system/developer units
+before the first conversation unit, the Anthropic `system` field, Responses
+`instructions`), tools, semantic and unknown parameters bind the root; a later
+system/developer message keeps its position in the history and behaves like
+any other edit. Only the 17 approved sampling parameters are free (alongside
+model/stream and consumed content). Anthropic `stop_sequences` is free, the
+same as OpenAI `stop`: a stop list does not change the cached prefix. A body
+carrier is excluded only when it wins validation and supplies the client id;
+invalid, inactive and losing carriers bind like unknown parameters.
 For a winning Anthropic metadata token, only `metadata.user_id` is excluded;
 other metadata fields still bind. Root/instruction warmth alone never links sessions.
 

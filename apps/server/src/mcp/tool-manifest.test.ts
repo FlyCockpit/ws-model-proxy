@@ -1,4 +1,7 @@
+import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { redactSecrets } from "./redaction";
+import { toJsonSafe } from "./serialization";
 
 /**
  * Manifest completeness contract (Phase 5): the catalog contains
@@ -304,6 +307,35 @@ beforeEach(() => {
 });
 
 describe("MCP tool manifest — exact catalog", () => {
+  it("pool-rules read advertises effective KV budgets and preserves them", () => {
+    const descriptor = MCP_TOOL_MANIFEST.find(
+      (entry) => entry.name === "forwarder_pool_routing_rules_get",
+    );
+    expect(descriptor?.descriptionNote).toContain("engineLoad.kvBudget");
+    expect(descriptor?.outputProjector).toBeUndefined();
+    const kvBudget = {
+      reportedTokens: 100_000,
+      effectiveTokens: 50_000,
+      cutFraction: 0.5,
+      floorFraction: 0.5,
+      lastObservedAt: new Date("2030-01-01T00:00:00Z"),
+      expiresAt: new Date("2030-01-01T00:30:00Z"),
+      active: true,
+    };
+    expect(toJsonSafe(redactSecrets({ engineLoad: { kvBudget } }))).toEqual({
+      engineLoad: {
+        kvBudget: {
+          ...kvBudget,
+          lastObservedAt: kvBudget.lastObservedAt.toISOString(),
+          expiresAt: kvBudget.expiresAt.toISOString(),
+        },
+      },
+    });
+    const mcpDoc = readFileSync(new URL("../../../../docs/mcp.md", import.meta.url), "utf8");
+    expect(mcpDoc).toContain("effectiveTokens");
+    expect(mcpDoc).toContain("floorFraction");
+  });
+
   it("all command catalog entries disclose CLI masking and its limits", () => {
     for (const name of [
       "forwarder_cli_command_run",

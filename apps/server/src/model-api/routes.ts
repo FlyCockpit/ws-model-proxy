@@ -107,6 +107,7 @@ import {
   SERVED_MODEL_HEADER,
   withResponseHeaders,
 } from "./external-route.js";
+import { observeKvEviction, qualifiesAsEvictionEvidence } from "./kv-eviction-feedback.js";
 import {
   MODEL_API_MAX_REQUEST_BODY_BYTES,
   MODEL_API_RELAY_TIMEOUT_MS,
@@ -743,6 +744,7 @@ const poolDiscoveredModelRelaySelect = {
   id: true,
   userId: true,
   published: true,
+  slug: true,
   upstreamModelId: true,
   capabilityOverrideMode: true,
   capabilityOverrideMetadata: true,
@@ -835,6 +837,7 @@ const poolMemberRelaySelect = {
 type PoolMemberRelayQueryRow = Prisma.PoolMemberGetPayload<{
   select: typeof poolMemberRelaySelect;
 }>;
+
 type PoolMemberRelayRow = Omit<PoolMemberRelayQueryRow, "discoveredModelId" | "DiscoveredModel"> & {
   /** Normalized after the query from the modern execution target or the legacy relation. */
   discoveredModelId: string;
@@ -5834,6 +5837,7 @@ async function relayPool({
           // S-C: even one member must know whether this is a continuation
           // (only protection needs it: a pool without it pays no extra reads).
           scoreSingleTarget: Boolean(capacityRuntime) && protectionPolicy.enabled,
+          collectPrefixEvidence: Boolean(capacityRuntime) && protectionPolicy.enabled,
         });
         const affinityOrder = new Map(
           affinityDecision.orderedTargetIds.map((executionTargetId, index) => [
@@ -6373,6 +6377,9 @@ async function relayPool({
     }
     attemptCount += 1;
     let attempt: ReturnType<typeof startRelayAttempt> | null = null;
+    // When this attempt was handed to the relay: warm-prefix age for eviction
+    // evidence is judged here, not at request arrival or after a long stream.
+    let attemptDispatchedAt = new Date();
     const localExecution: LocalExecutionTelemetry = {
       selectedExecutionTargetId: member.ExecutionTarget?.id,
       selectedPoolMemberId: member.id,
@@ -6414,6 +6421,7 @@ async function relayPool({
         accessGrantId: target.accessGrantId,
         poolMemberId: member.id,
       });
+      attemptDispatchedAt = new Date();
       attempt = startRelayAttempt({
         requestId: localExecution.localAttemptId,
         manager,
@@ -6885,6 +6893,32 @@ async function relayPool({
           const selectedAffinityReason = affinityTarget
             ? (affinityDecision?.reasons[affinityTarget.executionTargetId] ?? "no_match")
             : "identity_unavailable";
+          // Feedback is an optimization after the response is determined. Never
+          // await its flush or let it interfere with other finalization writes.
+          try {
+            const capacity = member.ExecutionTarget?.InferenceCapacity;
+            const sessionId = affinityTarget
+              ? affinityDecision?.matchedSessionIds?.[affinityTarget.executionTargetId]
+              : undefined;
+            if (
+              affinityTarget &&
+              capacity &&
+              sessionId &&
+              qualifiesAsEvictionEvidence({
+                policy: protectionPolicy,
+                engineKind: capacity.engineKind,
+                kvBudgetTokens: capacity.kvBudgetTokens,
+                ok: terminal.ok,
+                usage,
+                evidence: affinityDecision?.prefixEvidence?.[affinityTarget.executionTargetId],
+                now: attemptDispatchedAt,
+              })
+            )
+              // The same owner id the protection read filters by.
+              observeKvEviction(capacity.id, target.ownerUserId, sessionId);
+          } catch {
+            /* Disposable feedback never changes the response. */
+          }
           const terminalWrites = await Promise.allSettled([
             terminal.ok
               ? markPoolMemberRelaySuccess(candidate.poolMemberId, {
@@ -7395,6 +7429,8 @@ async function relaySelectedModelNoFailover({
     const started = await attempt.started;
     const stickiness = operation.responseStickiness;
     let affinityWrite: Promise<AffinitySessionBinding | null> | undefined;
+    // Bound Responses continuations are not eviction evidence: this path has
+    // neither a ranked affinity decision nor a matched record's age/footprint.
     const persistAffinity = () =>
       (affinityWrite ??= attempt.terminal
         .then((terminal) =>

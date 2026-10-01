@@ -1139,6 +1139,8 @@ model CacheAffinityNode {
   depth             Int
   sessionId         String
   isTip             Boolean
+  /// Whole-prompt footprint from the identifiable write that made this node a tip; NULL means no proven estimate.
+  estimatedTokens   Int?
   expiresAt         DateTime
 
   @@unique([userId, tenantUserId, poolId, executionTargetId, rootDigest, nodeDigest, sessionId], map: "cache_affinity_node_owner_unique")
@@ -1361,6 +1363,23 @@ model PoolMemberRoutingVerdict {
   @@index([poolId])
   @@index([expiresAt])
   @@map("pool_member_routing_verdict")
+}
+
+/// Disposable class-H cache: no FK, no deletion drain. Readers ignore expiry;
+/// retention removes rows expired more than an hour ago, including orphans.
+/// `lastSessionId` is the session that last armed or cut; same-session misses
+/// are ignored until the row expires or fully recovers.
+model CapacityKvEviction {
+  capacityId    String   @id
+  userId        String
+  cutFraction   Float
+  observedAt    DateTime
+  expiresAt     DateTime
+  lastSessionId String
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("capacity_kv_eviction")
 }
 
 enum EngineLoadMode {

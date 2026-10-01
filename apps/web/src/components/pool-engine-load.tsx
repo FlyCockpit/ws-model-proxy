@@ -37,7 +37,7 @@ function percent(value: number): string {
 /**
  * Per-member live engine load (S-D): running/waiting/KV %, a stale badge and
  * the "use engine load" override. Engine load only adds FULL; lease counts
- * stay authoritative.
+ * stay authoritative. Active prefix-eviction cuts explain the effective KV budget.
  */
 export function PoolEngineLoad({ members }: { members: MemberView[] }) {
   const { t } = useTranslation(["dashboard"]);
@@ -128,6 +128,17 @@ function EngineLoadRow({ member }: { member: MemberView }) {
             {t("dashboard:pools.engineLoad.noReading")}
           </span>
         )}
+        {load.kvBudget.active ? (
+          <>
+            <Pill tone="warn">{t("dashboard:pools.engineLoad.kvBudgetLowered")}</Pill>
+            <span className="text-xs text-muted-foreground">
+              {t("dashboard:pools.engineLoad.kvBudgetEvictions", {
+                effective: load.kvBudget.effectiveTokens?.toLocaleString(),
+                reported: load.kvBudget.reportedTokens?.toLocaleString(),
+              })}
+            </span>
+          </>
+        ) : null}
       </div>
     </li>
   );

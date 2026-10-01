@@ -34,7 +34,12 @@ const requiredFragments = [
   "relay_execution_attempt_transition",
   "historical-split",
   "cache_affinity_record_shape_check",
+  "capacity_kv_eviction_shape_check",
+  '"cutFraction" >= 0 AND "cutFraction" <= 1',
+  'length("capacityId") BETWEEN 1 AND 128',
+  '"expiresAt" >= "observedAt"',
   "cache_affinity_node_shape_check",
+  'AND length("sessionId") BETWEEN 1 AND 128\n  AND ("estimatedTokens" IS NULL OR "estimatedTokens" >= 0)',
   "cache_affinity_node_owner",
   "enforce_cache_affinity_node_immutable",
   'ALTER COLUMN "sessionId" SET NOT NULL',
@@ -435,6 +440,7 @@ async function expectConstraintFailure(statement, expectedCode = "23514") {
 // R1 node behavioral cases: shared verbatim with the inverse-check runner.
 async function verifyAffinityNodeHardening() {
   const shapeCases = [
+    { name: "negative-estimate", estimate: "-1" },
     { name: "zero-depth", depth: "0" },
     { name: "negative-depth", depth: "-1" },
     { name: "short-root", root: "repeat('r', 31)" },
@@ -452,10 +458,11 @@ async function verifyAffinityNodeHardening() {
       `
       INSERT INTO cache_affinity_node
         (id, "userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest",
-         "nodeDigest", depth, "sessionId", "isTip", "expiresAt")
+         "nodeDigest", depth, "sessionId", "isTip", "estimatedTokens", "expiresAt")
       SELECT 'affinity-node-${row.name}', 'owner-a', 'owner-b', 'pool-a', id,
         ${row.root ?? "repeat('r', 43)"}, ${row.node ?? "repeat('n', 43)"},
         ${row.depth ?? "1"}, ${row.session ?? `'session-${row.name}'`}, false,
+        ${row.estimate ?? "NULL"},
         ${row.expiry ?? "NOW() + interval '1 hour'"}
         FROM execution_target WHERE "discoveredModelId" = 'model-a'
     `,
@@ -486,14 +493,85 @@ async function verifyAffinityNodeHardening() {
        WHERE id = 'affinity-node-valid'
     `);
   }
-  // Mutable warmth columns remain refreshable under the immutability trigger.
+  await expectConstraintFailure(`UPDATE cache_affinity_node
+    SET "estimatedTokens" = -1 WHERE id = 'affinity-node-valid'`);
+  // Mutable warmth/provenance columns remain refreshable under the identity trigger.
   await client.query(`UPDATE cache_affinity_node
-    SET "isTip" = true, "expiresAt" = NOW() + interval '2 hours'
+    SET "isTip" = true, "estimatedTokens" = 12000, "expiresAt" = NOW() + interval '2 hours'
     WHERE id = 'affinity-node-valid'`);
+  for (const estimate of [0, 2147483647, null]) {
+    await client.query(
+      `UPDATE cache_affinity_node SET "estimatedTokens" = $1
+      WHERE id = 'affinity-node-valid'`,
+      [estimate],
+    );
+    const { rows } = await client.query(`SELECT "estimatedTokens" FROM cache_affinity_node
+      WHERE id = 'affinity-node-valid'`);
+    if (rows[0].estimatedTokens !== estimate)
+      throw new Error("Node footprint must remain mutable, including NULL");
+  }
   process.stdout.write(
-    "Affinity node hardening: 9 shape/expiry and 8 identity negatives passed.\n",
+    "Affinity node hardening: 11 shape/expiry/estimate and 8 identity negatives passed.\n",
   );
 }
+async function verifyKvEvictionHardening() {
+  const cases = [
+    { capacity: "''", cut: "0.1", expires: "NOW() + interval '1 hour'", session: "'session-a'" },
+    {
+      capacity: "repeat('c', 129)",
+      cut: "0.1",
+      expires: "NOW() + interval '1 hour'",
+      session: "'session-a'",
+    },
+    {
+      capacity: "'negative-cut'",
+      cut: "-0.01",
+      expires: "NOW() + interval '1 hour'",
+      session: "'session-a'",
+    },
+    {
+      capacity: "'oversized-cut'",
+      cut: "1.01",
+      expires: "NOW() + interval '1 hour'",
+      session: "'session-a'",
+    },
+    {
+      capacity: "'nan-cut'",
+      cut: "'NaN'::double precision",
+      expires: "NOW() + interval '1 hour'",
+      session: "'session-a'",
+    },
+    {
+      capacity: "'invalid-expiry'",
+      cut: "0.1",
+      expires: "NOW() - interval '1 second'",
+      session: "'session-a'",
+    },
+    {
+      capacity: "'empty-session'",
+      cut: "0.1",
+      expires: "NOW() + interval '1 hour'",
+      session: "''",
+    },
+    {
+      capacity: "'long-session'",
+      cut: "0.1",
+      expires: "NOW() + interval '1 hour'",
+      session: "repeat('s', 129)",
+    },
+  ];
+  for (const row of cases)
+    await expectConstraintFailure(`
+    INSERT INTO capacity_kv_eviction ("capacityId", "userId", "cutFraction", "observedAt", "expiresAt", "lastSessionId")
+    VALUES (${row.capacity}, 'owner-a', ${row.cut}, NOW(), ${row.expires}, ${row.session})`);
+  await client.query(`INSERT INTO capacity_kv_eviction
+    ("capacityId", "userId", "cutFraction", "observedAt", "expiresAt", "lastSessionId")
+    VALUES ('orphan-capacity', 'absent-owner', 0.5, NOW(), NOW(), 'session-a')`);
+  process.stdout.write(
+    "KV eviction hardening: 8 shape negatives and FK-free orphan insert passed.\n",
+  );
+}
+
 // End R1 node behavioral cases.
 
 const schemaUrl = new URL(baseUrl);
@@ -1329,6 +1407,7 @@ try {
       FROM execution_target WHERE "discoveredModelId" = 'model-a'
   `);
   await verifyAffinityNodeHardening();
+  await verifyKvEvictionHardening();
   await expectConstraintFailure(
     `
     INSERT INTO pool_member

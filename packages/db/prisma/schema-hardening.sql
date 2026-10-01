@@ -26,7 +26,7 @@ LOCK TABLE "user", cli_device, endpoint, discovered_model, execution_target, mod
   provider_usage_ledger, provider_pricing_version, provider_budget_settlement,
   provider_audit_event, public_provider_attempt_event, relay_execution_attempt,
   relay_execution_event, usage_rollup_minute, usage_rollup_hour,
-  cache_affinity_record, cache_affinity_node, session IN ACCESS EXCLUSIVE MODE NOWAIT;
+  cache_affinity_record, cache_affinity_node, capacity_kv_eviction, session IN ACCESS EXCLUSIVE MODE NOWAIT;
 
 -- Deploy writer (class D): the backfills below rewrite graph rows while every
 -- table is locked exclusively, so no fence can be contended. The graph-write
@@ -231,12 +231,22 @@ CREATE TRIGGER cache_affinity_owner
 BEFORE INSERT ON cache_affinity_record
 FOR EACH ROW EXECUTE FUNCTION enforce_cache_affinity_owner();
 
+-- Disposable class H feedback; no graph locks or foreign keys.
+ALTER TABLE capacity_kv_eviction DROP CONSTRAINT IF EXISTS capacity_kv_eviction_shape_check;
+ALTER TABLE capacity_kv_eviction ADD CONSTRAINT capacity_kv_eviction_shape_check CHECK (
+  "cutFraction" >= 0 AND "cutFraction" <= 1
+  AND length("capacityId") BETWEEN 1 AND 128
+  AND length("lastSessionId") BETWEEN 1 AND 128
+  AND "expiresAt" >= "observedAt"
+);
+
 -- Digest-only class H state; indexed probes are ordered without a population sort.
 ALTER TABLE cache_affinity_node DROP CONSTRAINT IF EXISTS cache_affinity_node_shape_check;
 ALTER TABLE cache_affinity_node ADD CONSTRAINT cache_affinity_node_shape_check CHECK (
   depth > 0 AND length("rootDigest") BETWEEN 32 AND 128
   AND length("nodeDigest") BETWEEN 32 AND 128
   AND length("sessionId") BETWEEN 1 AND 128
+  AND ("estimatedTokens" IS NULL OR "estimatedTokens" >= 0)
 );
 DROP TRIGGER IF EXISTS cache_affinity_node_owner ON cache_affinity_node;
 CREATE TRIGGER cache_affinity_node_owner BEFORE INSERT ON cache_affinity_node

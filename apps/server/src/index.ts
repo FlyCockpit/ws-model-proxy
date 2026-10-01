@@ -13,6 +13,7 @@ import { startOauthCleanup } from "./mcp/oauth-cleanup.js";
 import { startMediaCleanup } from "./media/cleanup.js";
 import { startCacheAffinityCleanup } from "./model-api/cache-affinity-runtime.js";
 import { closeDiagnosticsCapacityRuntime } from "./model-api/diagnostics.js";
+import { stopKvEvictionFeedback } from "./model-api/kv-eviction-feedback.js";
 import {
   providerAttemptExpiryEnabled,
   startProviderAttemptExpiry,
@@ -214,6 +215,7 @@ installServerShutdown({
     stopOauthCleanup,
     stopSessionCleanup,
     stopUsageRetention,
+    stopKvEvictionFeedback,
     stopRelayMaintenance,
   ],
   stopUserDeletionSweep,

@@ -225,6 +225,99 @@ describe("cache affinity", () => {
     db.capacityWaiter.groupBy.mockResolvedValue([]);
   });
 
+  it.each([
+    { name: "default off", expected: 0 },
+    { name: "explicit off", collect: false, expected: 0 },
+    { name: "enabled", collect: true, expected: 2 },
+    { name: "no resolved session", collect: true, expected: 0, noSession: true },
+    { name: "one resolved target", collect: true, expected: 1, oneTarget: true },
+    { name: "statement error", collect: true, expected: 2, error: true },
+    { name: "no proof row", collect: true, expected: 2, noRow: true },
+  ])("prefix evidence collection: $name", async (row) => {
+    const requestPayload = {
+      ...payload,
+      messages: [
+        ...payload.messages,
+        { role: "assistant", content: "reply" },
+        { role: "user", content: "next" },
+      ],
+    };
+    const now = new Date("2026-08-25T12:00:00Z");
+    const evidence = { estimatedTokens: 12_000, lastUsedAt: now, engineCacheConfirmed: false };
+    db.$queryRaw.mockImplementation(async (query) => {
+      if (query.sql.includes('n."estimatedTokens"')) {
+        if ("error" in row) throw new Error("evidence unavailable");
+        return "noRow" in row ? [] : [evidence];
+      }
+      return "noSession" in row || ("oneTarget" in row && query.values.includes("target-b"))
+        ? []
+        : [{ sessionId: "test-session" }];
+    });
+    const args = {
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: requestPayload,
+      targets: [target("target-a", "runtime-a"), target("target-b", "runtime-b")],
+      now,
+    };
+    const result = await rankAffinityTargets({
+      ...args,
+      collectPrefixEvidence: "collect" in row ? row.collect : undefined,
+    });
+    const proofQueries = db.$queryRaw.mock.calls.filter(([query]) =>
+      query.sql.includes('n."estimatedTokens"'),
+    );
+    expect(proofQueries).toHaveLength(row.expected);
+    if (!("collect" in row) || !row.collect) expect(result.prefixEvidence).toBeUndefined();
+    else
+      expect(result.prefixEvidence).toEqual(
+        row.expected && !("error" in row) && !("noRow" in row)
+          ? Object.fromEntries(
+              args.targets
+                .filter((t) => result.matchedSessionIds?.[t.executionTargetId])
+                .map((t) => [
+                  t.executionTargetId,
+                  { tokens: 12_000, lastUsedAt: now.getTime(), confirmed: false },
+                ]),
+            )
+          : {},
+      );
+    // Read failures and absent evidence leave ranking and resolved identity intact.
+    const withoutEvidence = await rankAffinityTargets(args);
+    const { prefixEvidence: _evidence, ...ranking } = result;
+    expect(ranking).toEqual(withoutEvidence);
+  });
+
+  it.each(["body", "header"] as const)(
+    "client %s identity needs no query when evidence is off",
+    async (carrier) => {
+      const requestPayload = {
+        ...payload,
+        ...(carrier === "body" ? { conversation_id: "client" } : {}),
+      };
+      const headers = carrier === "header" ? new Headers({ "x-session-id": "client" }) : undefined;
+      const result = await rankAffinityTargets({
+        ownerId: "owner",
+        resourceOwnerId: "owner",
+        poolId: "pool",
+        securityScope: "token",
+        policy,
+        surface: "openai-chat",
+        payload: requestPayload,
+        headers,
+        targets: [target("target-a", "runtime-a")],
+        scoreSingleTarget: true,
+      });
+      expect(result.prefixEvidence).toBeUndefined();
+      expect(result.matchedSessionIds?.["target-a"]).toBeTruthy();
+      expect(db.$queryRaw).not.toHaveBeenCalled();
+    },
+  );
+
   const clientUuid = "11111111-2222-4333-8444-555555555555";
   const carriers: { body: Record<string, unknown>; header?: string; surface?: string }[] = [
     { body: { conversation: "session" } },
@@ -515,6 +608,41 @@ describe("cache affinity", () => {
           target: target("target", "runtime"),
         }),
       ).toBeNull();
+    },
+  );
+
+  it.each([
+    { estimate: undefined, expected: null },
+    { estimate: -3.9, expected: 0 },
+    { estimate: 12_000.9, expected: 12_000 },
+    { estimate: 3_000_000_000, expected: 2_147_483_647 },
+  ])(
+    "tip node estimate clamps $estimate to $expected and leaves ancestors NULL",
+    async ({ estimate, expected }) => {
+      await rememberAffinity({
+        ...digestArgs("runtime", {
+          ...payload,
+          messages: [
+            ...payload.messages,
+            { role: "assistant", content: "reply" },
+            { role: "user", content: "next" },
+          ],
+        }),
+        policy,
+        target: target("target", "runtime"),
+        estimatedTokens: estimate,
+      });
+      const writes = db.$executeRaw.mock.calls.filter(([query]) =>
+        query.sql?.includes("INSERT INTO cache_affinity_node"),
+      );
+      expect(writes).toHaveLength(1);
+      const values = writes[0]![0].values;
+      const rows = Array.from({ length: values.length / 12 }, (_, i) =>
+        values.slice(i * 12, (i + 1) * 12),
+      );
+      expect(rows.length).toBeGreaterThan(1);
+      expect(rows.filter((row) => row[9] === true)).toHaveLength(1);
+      for (const row of rows) expect(row[10]).toBe(row[9] ? expected : null);
     },
   );
 
@@ -1830,6 +1958,7 @@ describe("cache affinity", () => {
     "repetition_penalty",
     "logit_bias",
     "stop",
+    "stop_sequences",
     "max_tokens",
     "max_completion_tokens",
     "max_output_tokens",

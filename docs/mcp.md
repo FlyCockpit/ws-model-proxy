@@ -68,7 +68,12 @@ Metric routing rules (S-B part 2):
   (`auto` / `off`), the engine kind and slots, the live reading (`running`,
   `waiting`, `kvUsage`, `slotsBusy`, `deferred`, age, `stale`, prefix cache
   totals) and the verdict state (`full_waiting`, `full_kv`, `full_slots`,
-  `full_deferred`, `clear`, `stale`, `none`, `off`).
+  `full_deferred`, `clear`, `stale`, `none`, `off`). `engineLoad.kvBudget`
+  includes `reportedTokens`, `effectiveTokens`, `cutFraction` (0–0.5),
+  `floorFraction` (0.5), `lastObservedAt`, `expiresAt`, and `active`.
+  Prefix-eviction feedback temporarily lowers token-mode warm-protection budgets;
+  slot mode (including llama.cpp) has null effective tokens and is inactive.
+  Failed feedback reads fall back to the reported budget.
 - `forwarder_pool_member_engine_load_set` (`{ poolMemberId, mode: "auto" |
   "off", kvFullThreshold?, confirm: "RUN" }`) turns "use engine load" off for
   a member or overrides its vLLM/SGLang KV threshold (default 0.95). Engine

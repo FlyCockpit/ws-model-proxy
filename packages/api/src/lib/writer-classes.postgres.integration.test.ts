@@ -152,6 +152,20 @@ integration("DL-1 writer classes and fences on PostgreSQL", () => {
       ).toBe(true);
     });
 
+    it("classifies KV feedback as an expiring H cache without keys or deletion drain", async () => {
+      const m = required();
+      const residual = await import("@ws-model-proxy/db/parent-deletion-residual");
+      expect(m.order.HOT_PATH_TABLES).toContain("capacity_kv_eviction");
+      expect(residual.HISTORY_DRAIN_EDGES.capacity_kv_eviction).toEqual({
+        delete: [],
+        internal: [],
+      });
+      const rows = await strict.$queryRaw<Array<{ count: bigint }>>`
+        SELECT count(*) FROM pg_constraint WHERE contype = 'f'
+          AND (conrelid = 'capacity_kv_eviction'::regclass OR confrelid = 'capacity_kv_eviction'::regclass)`;
+      expect(Number(rows[0]?.count)).toBe(0);
+    });
+
     it("guards every graph table with its fence triggers", async () => {
       const m = required();
       const rows = await strict.$queryRaw<Array<{ relation: string; name: string }>>`

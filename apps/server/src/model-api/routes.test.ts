@@ -57,6 +57,11 @@ const affinity = vi.hoisted(() => ({
   remember: vi.fn(),
   material: vi.fn(),
 }));
+const kvFeedback = vi.hoisted(() => ({ observe: vi.fn() }));
+vi.mock("./kv-eviction-feedback.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./kv-eviction-feedback.js")>()),
+  observeKvEviction: kvFeedback.observe,
+}));
 const publicOverflow = vi.hoisted(() => ({
   dispatch: vi.fn(),
   list: vi.fn(),
@@ -1568,6 +1573,7 @@ describe("model API routes", () => {
     const kvPools = (states: Record<string, "FREE" | "FULL" | "PROTECTED">, ageSeconds = {}) => {
       const ages = ageSeconds as Record<string, number>;
       warmProtection.load.mockResolvedValue({
+        kvEvictionByCapacity: new Map(),
         activeByCapacity: new Map(
           Object.entries(states).map(([member, state]) => [
             `member-${member}-capacity`,
@@ -1593,9 +1599,10 @@ describe("model API routes", () => {
       });
     };
     /** Admits `grants[call]` (a member id) on that acquire call, else EXPIRED. */
-    const scripted = (grants: Array<string | null>) => {
+    const scripted = (grants: Array<string | null>, admissionAdvanceMs = 0) => {
       let call = 0;
       const acquire = vi.fn(async (attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0]) => {
+        if (admissionAdvanceMs) vi.setSystemTime(Date.now() + admissionAdvanceMs);
         const grant = grants[call++] ?? null;
         const candidate = attempt.candidates.find(({ poolMemberId }) => poolMemberId === grant);
         if (!candidate) return { state: "EXPIRED" as const };
@@ -1678,9 +1685,197 @@ describe("model API routes", () => {
       affinity.rank.mockResolvedValue(decision());
     });
     afterEach(() => {
+      vi.useRealTimers();
       warmProtection.load.mockReset();
       externalConsent.poolIds = [];
     });
+
+    it.each([
+      {
+        name: "miss",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: true,
+        expected: 1,
+      },
+      {
+        name: "hit",
+        cache: 20_000,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: true,
+        expected: 0,
+      },
+      {
+        name: "unknown usage",
+        cache: null,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: true,
+        expected: 0,
+      },
+      {
+        name: "non affinity",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: false,
+        ok: true,
+        expected: 0,
+      },
+      {
+        name: "short",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 1000,
+        affinityMatch: true,
+        ok: true,
+        expected: 0,
+      },
+      {
+        name: "failed terminal",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: false,
+        expected: 0,
+      },
+      {
+        name: "throwing recorder",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: true,
+        expected: 1,
+        throws: true,
+      },
+      {
+        // Age is judged at dispatch: a long stream must not age the prefix out.
+        name: "long stream finishing after the window",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: true,
+        expected: 1,
+        ageMs: 299_000,
+        advanceMs: 600_000,
+      },
+      {
+        name: "admission ages a prefix past the window before dispatch",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: true,
+        expected: 0,
+        ageMs: 299_000,
+        admissionAdvanceMs: 2000,
+      },
+      {
+        name: "prefix already outside the window at dispatch",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: true,
+        expected: 0,
+        ageMs: 301_000,
+      },
+      {
+        name: "missing session id",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: true,
+        expected: 0,
+        omitSession: true,
+      },
+    ])(
+      "KV feedback finalization: $name",
+      async ({
+        cache,
+        prompt,
+        tokens,
+        affinityMatch,
+        ok,
+        expected,
+        throws,
+        ageMs,
+        advanceMs,
+        admissionAdvanceMs,
+        omitSession,
+      }) => {
+        vi.useFakeTimers({ toFake: ["Date"] });
+        vi.setSystemTime(new Date("2026-09-30T12:00:00Z"));
+        db.poolMember.findMany.mockResolvedValue(
+          members(1, { engineKind: "VLLM", kvBudgetTokens: 100_000 }),
+        );
+        kvPools({ a: "FREE" });
+        affinity.rank.mockResolvedValue({
+          ...decision(affinityMatch),
+          matchedSessionIds:
+            affinityMatch && !omitSession ? { "member-a-target": "session-a" } : {},
+          prefixEvidence: affinityMatch
+            ? {
+                "member-a-target": {
+                  tokens,
+                  lastUsedAt: Date.now() - (ageMs ?? 0),
+                  confirmed: true,
+                },
+              }
+            : {},
+        });
+        kvFeedback.observe.mockReset();
+        if (throws)
+          kvFeedback.observe.mockImplementationOnce(() => {
+            throw new Error("disposable");
+          });
+        const { runtime } = scripted(["member-a"], admissionAdvanceMs);
+        const { manager, response } = request(runtime, poolTarget.modelId);
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        const sent = requireSent(manager);
+        manager.headers(sent.requestId, ok ? 200 : 400, { "content-type": "application/json" });
+        manager.body(
+          sent.requestId,
+          JSON.stringify({
+            id: "ok",
+            usage: {
+              prompt_tokens: prompt,
+              completion_tokens: 1,
+              ...(cache === null ? {} : { prompt_tokens_details: { cached_tokens: cache } }),
+            },
+          }),
+        );
+        if (advanceMs) vi.setSystemTime(Date.now() + advanceMs);
+        manager.complete(sent.requestId);
+        const result = await response;
+        await result.text();
+        expect(result.status).toBe(ok ? 200 : 400);
+        await vi.waitFor(() =>
+          expect(db.relayRequest.update).toHaveBeenCalledWith(
+            expect.objectContaining({
+              data: expect.objectContaining({ status: ok ? "SUCCEEDED" : "FAILED" }),
+            }),
+          ),
+        );
+        expect(kvFeedback.observe).toHaveBeenCalledTimes(expected);
+        if (expected)
+          expect(kvFeedback.observe).toHaveBeenCalledWith(
+            "member-a-capacity",
+            poolTarget.ownerUserId,
+            "session-a",
+          );
+        if (ok) expect(affinity.remember).toHaveBeenCalled();
+      },
+    );
 
     it("a new session avoids a member whose idle capacity is all protected when another is FREE", async () => {
       db.poolMember.findMany.mockResolvedValue(members());
@@ -1767,6 +1962,7 @@ describe("model API routes", () => {
       ["only PROTECTED members", { a: "PROTECTED", b: "PROTECTED" }],
       ["PROTECTED and FULL members", { a: "PROTECTED", b: "FULL" }],
     ] as const)(":external with a plan and %s goes external now", async (_label, states) => {
+      kvFeedback.observe.mockReset();
       const provider = useExternalPlan();
       publicOverflow.dispatch.mockResolvedValue(externalDispatchResult(provider));
       db.poolMember.findMany.mockResolvedValue(members());
@@ -1785,6 +1981,8 @@ describe("model API routes", () => {
       // No local wait first: protection is part of saturation (S1).
       expect(acquire).toHaveBeenCalledTimes(1);
       expect(rounds(acquire)).toEqual([]);
+      await served.text();
+      expect(kvFeedback.observe).not.toHaveBeenCalled();
     });
 
     it("without a plan it admits on the oldest protected member, never queueing behind FULL", async () => {
@@ -1887,6 +2085,7 @@ describe("model API routes", () => {
       });
       const load = (sessions: ReturnType<typeof session>[]) =>
         warmProtection.load.mockResolvedValue({
+          kvEvictionByCapacity: new Map(),
           activeByCapacity: new Map([["member-a-capacity", 2]]),
           sessionsByCapacity: new Map([["member-a-capacity", sessions]]),
         });
@@ -1998,7 +2197,7 @@ describe("model API routes", () => {
 
       expect(response.status).toBe(200);
       expect(affinity.rank).toHaveBeenCalledWith(
-        expect.objectContaining({ scoreSingleTarget: true }),
+        expect.objectContaining({ scoreSingleTarget: true, collectPrefixEvidence: true }),
       );
     });
 
@@ -2015,7 +2214,24 @@ describe("model API routes", () => {
 
       expect(response.status).toBe(200);
       expect(affinity.rank).toHaveBeenCalledWith(
-        expect.objectContaining({ scoreSingleTarget: false }),
+        expect.objectContaining({ scoreSingleTarget: false, collectPrefixEvidence: false }),
+      );
+    });
+
+    it("evidence collection is off without a capacity runtime", async () => {
+      db.poolMember.findMany.mockResolvedValue(members());
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+      const response = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      expect((await response).status).toBe(200);
+      expect(affinity.rank).toHaveBeenCalledWith(
+        expect.objectContaining({ scoreSingleTarget: false, collectPrefixEvidence: false }),
       );
     });
 
@@ -14530,6 +14746,7 @@ describe("model API routes", () => {
       } else {
         expect(affinity.rank).toHaveBeenCalledTimes(1);
         const rankArgs = affinity.rank.mock.calls[0]![0];
+        if (row.path === "overflow") expect(rankArgs.collectPrefixEvidence ?? false).toBe(false);
         const ranked = await affinity.rank.mock.results[0]!.value;
         const rankMaterial = actual.affinityPrefixDigests({
           ...rankArgs,
