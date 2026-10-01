@@ -551,7 +551,8 @@ impl RecoveryDir {
         dst: Option<&Held>,
     ) -> FileResult<Option<PublishMethod>> {
         let (mut first, mut one) = self.dummy("preflight-1", to)?;
-        let mut second = None;
+        #[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(unused_mut))]
+        let mut second: Option<(Slot, Held)> = None;
         let result = (|| {
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             if dst.is_some() {

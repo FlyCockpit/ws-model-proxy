@@ -1209,6 +1209,59 @@ fn rename_failed_destination_capture_releases_source_before_restore_alias_unlink
     }
 }
 
+/// A racer replaces the destination with a hard link to the captured source, so
+/// the captured "destination" is the source's own inode. The source proof must be
+/// closed before the restore unlinks that private slot (F3 on a noino alias pair).
+#[test]
+fn rename_destination_mismatch_closes_source_proof_before_restore_unlink() {
+    let fx = Fx::new();
+    let etag = setup(&fx, Object::File, true);
+    #[cfg(target_os = "linux")]
+    let root = fx.root.clone();
+    let racer_root = fx.root.clone();
+    let fx = fx.with_hook(move |step| {
+        if step == Step::DestinationVacating {
+            let private = recovery_dirs(&racer_root)[0].join("slot-1");
+            let public = racer_root.join("dst");
+            std::fs::remove_file(&public).unwrap();
+            std::fs::hard_link(private, public).unwrap();
+            #[cfg(target_os = "linux")]
+            {
+                use crate::file_ops::exchange::UNLINK_PROBE;
+                use std::os::unix::fs::MetadataExt;
+                let root = root.clone();
+                UNLINK_PROBE.with(|probe| {
+                    *probe.borrow_mut() = Some(Box::new(move || {
+                        let Ok(meta) =
+                            std::fs::symlink_metadata(recovery_dirs(&root)[0].join("slot-2"))
+                        else {
+                            return;
+                        };
+                        for fd in std::fs::read_dir("/proc/self/fd").unwrap() {
+                            if let Ok(held) = std::fs::metadata(fd.unwrap().path()) {
+                                assert_ne!(
+                                    (held.dev(), held.ino()),
+                                    (meta.dev(), meta.ino()),
+                                    "no operation-owned descriptor may stay open on the object being unlinked"
+                                );
+                            }
+                        }
+                    }));
+                });
+            }
+        }
+        Ok(())
+    });
+    let _scope = FaultScope::new(&Shape::Link.faults(true));
+    let result = rename_run(&fx, true, etag.as_deref(), false);
+    let error = result.unwrap_err();
+    // Nothing is lost: the source bytes are back at their origin or reported.
+    assert!(
+        fx.root.join("src").exists() || has_bytes(&error_inventory(&fx, &error), SOURCE),
+        "{error:?}"
+    );
+}
+
 #[test]
 fn rename_shared_case_alias_origin_is_restored_as_gone() {
     use crate::file_ops::policy::Access;
