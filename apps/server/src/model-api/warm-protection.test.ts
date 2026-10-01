@@ -13,6 +13,7 @@ vi.mock("@ws-model-proxy/db", async () => ({
 const {
   LLAMA_CPP_WINDOW_FACTOR,
   assessWarmProtection,
+  loadWarmSessions,
   memberProtectionVerdict,
   protectedWarmSessions,
   protectionKvBudgetTokens,
@@ -954,5 +955,20 @@ describe("effective KV assessment", () => {
     expect(readDb.capacityKvEviction.findMany).toHaveBeenLastCalledWith({
       where: { capacityId: { in: ["cap-a"] }, userId: "owner", expiresAt: { gt: now } },
     });
+  });
+});
+
+describe("warm session footprint SQL", () => {
+  it("sizes sessions from reported tokens when present and applies minTokens to that footprint", async () => {
+    readDb.$queryRaw.mockResolvedValue([]);
+    await loadWarmSessions({
+      ownerId: "owner",
+      capacityIds: ["cap-a"],
+      policy: { windowSeconds: 300, minTokens: 8192 },
+    });
+    const query = readDb.$queryRaw.mock.calls[0]?.[0] as { strings?: string[]; sql?: string };
+    const sql = query.sql ?? query.strings?.join(" ") ?? "";
+    expect(sql).toContain('COALESCE(r."reportedTokens", r."estimatedTokens")');
+    expect(sql).toMatch(/COALESCE\(r\."reportedTokens", r\."estimatedTokens"\) >=/u);
   });
 });

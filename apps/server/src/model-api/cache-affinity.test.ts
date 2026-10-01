@@ -172,11 +172,12 @@ function conversationWrites() {
           prefixDepth: 0,
           digestVersion: values[9],
           estimatedTokens: values[10],
-          engineCacheConfirmed: values[11],
-          lastUsedAt: values[12] as Date,
-          expiresAt: values[13] as Date,
+          reportedTokens: values[11],
+          engineCacheConfirmed: values[12],
+          lastUsedAt: values[13] as Date,
+          expiresAt: values[14] as Date,
         },
-        engineEvidence: values[14],
+        engineEvidence: values[15],
       },
     ];
   });
@@ -243,7 +244,7 @@ describe("cache affinity", () => {
       ],
     };
     const now = new Date("2026-08-25T12:00:00Z");
-    const evidence = { estimatedTokens: 12_000, lastUsedAt: now, engineCacheConfirmed: false };
+    const evidence = { tokens: 12_000, lastUsedAt: now, engineCacheConfirmed: false };
     db.$queryRaw.mockImplementation(async (query) => {
       if (query.sql.includes('n."estimatedTokens"')) {
         if ("error" in row) throw new Error("evidence unavailable");
@@ -637,14 +638,41 @@ describe("cache affinity", () => {
       );
       expect(writes).toHaveLength(1);
       const values = writes[0]![0].values;
-      const rows = Array.from({ length: values.length / 12 }, (_, i) =>
-        values.slice(i * 12, (i + 1) * 12),
+      const rows = Array.from({ length: values.length / 13 }, (_, i) =>
+        values.slice(i * 13, (i + 1) * 13),
       );
       expect(rows.length).toBeGreaterThan(1);
       expect(rows.filter((row) => row[9] === true)).toHaveLength(1);
-      for (const row of rows) expect(row[10]).toBe(row[9] ? expected : null);
+      for (const row of rows) {
+        expect(row[10]).toBe(row[9] ? expected : null);
+        expect(row[11]).toBeNull();
+      }
     },
   );
+
+  it("tip node reported tokens COALESCE on conflict and clamp on insert", async () => {
+    await rememberAffinity({
+      ...digestArgs("runtime", payload),
+      policy,
+      target: target("target", "runtime"),
+      estimatedTokens: 18_000,
+      reportedTokens: 12_000.9,
+    });
+    const writes = db.$executeRaw.mock.calls.filter(([query]) =>
+      query.sql?.includes("INSERT INTO cache_affinity_node"),
+    );
+    expect(writes).toHaveLength(1);
+    expect(writes[0]![0].sql).toContain(
+      'COALESCE(EXCLUDED."reportedTokens", cache_affinity_node."reportedTokens")',
+    );
+    const values = writes[0]![0].values;
+    const rows = Array.from({ length: values.length / 13 }, (_, i) =>
+      values.slice(i * 13, (i + 1) * 13),
+    );
+    const tip = rows.find((row) => row[9] === true);
+    expect(tip?.[10]).toBe(18_000);
+    expect(tip?.[11]).toBe(12_000);
+  });
 
   it("bound native delta uses the caller estimate and carries the parent size for empty input", async () => {
     const args = {
@@ -652,7 +680,11 @@ describe("cache affinity", () => {
       policy,
       target: target("native", "runtime"),
     };
-    const parent = await rememberAffinity({ ...args, estimatedTokens: 20000 });
+    const parent = await rememberAffinity({
+      ...args,
+      estimatedTokens: 20000,
+      reportedTokens: 15000,
+    });
     const next = await rememberAffinity({
       ...args,
       payload: { input: "delta", previous_response_id: "response", conversation: "client" },
@@ -660,6 +692,7 @@ describe("cache affinity", () => {
       estimatedDeltaTokens: 10,
     });
     expect(next!.estimatedTokens).toBe(20010);
+    expect(next!.reportedTokens).toBe(15010);
     const empty = await rememberAffinity({
       ...args,
       payload: { previous_response_id: "next-response", conversation: "client" },
@@ -3000,6 +3033,29 @@ describe("cache affinity", () => {
     for (const [input] of db.cacheAffinityRecord.upsert.mock.calls) {
       expect(input.create.engineCacheConfirmed).toBe(false);
       expect(input.update).not.toHaveProperty("engineCacheConfirmed");
+    }
+  });
+
+  it("writes reported tokens with COALESCE and leaves them on a later estimate-only refresh", async () => {
+    const rememberArgs = {
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      policy,
+      surface: "openai-chat",
+      payload,
+      target: target("target", "runtime"),
+    };
+    await rememberAffinity({ ...rememberArgs, reportedTokens: 12_000, estimatedTokens: 18_000 });
+    for (const [input] of db.cacheAffinityRecord.upsert.mock.calls) {
+      expect(input.create.reportedTokens).toBe(12_000);
+      expect(input.update.reportedTokens).toBe(12_000);
+    }
+    db.cacheAffinityRecord.upsert.mockClear();
+    await rememberAffinity({ ...rememberArgs, estimatedTokens: 18_000 });
+    for (const [input] of db.cacheAffinityRecord.upsert.mock.calls) {
+      expect(input.create.reportedTokens).toBeNull();
+      expect(input.update).not.toHaveProperty("reportedTokens");
     }
   });
 

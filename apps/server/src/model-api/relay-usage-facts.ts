@@ -103,6 +103,14 @@ function parsedSampleUsage(sample: ResponseUsageSample): RawProviderUsage | unde
  * Parses the retained response windows; falls back to the CLI-normalized
  * usage when the body carried no recognizable usage. Never throws.
  */
+/** Prompt + completion for affinity footprints; absent when neither is known. */
+export function reportedAffinityTokens(
+  facts: Pick<RelayUsageFacts, "promptTokens" | "completionTokens">,
+): number | undefined {
+  if (facts.promptTokens === null && facts.completionTokens === null) return undefined;
+  return sum(facts.promptTokens, facts.completionTokens) ?? undefined;
+}
+
 export function usageFactsFromRelayTerminal(terminal: {
   usageSample?: ResponseUsageSample | null;
   usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number } | null;

@@ -1112,6 +1112,8 @@ model CacheAffinityRecord {
   sessionId            String
   prefixDepth          Int
   estimatedTokens      Int?
+  /// Engine-reported prompt + completion tokens when known.
+  reportedTokens       Int?
   engineCacheConfirmed Boolean  @default(false)
 
   @@unique([tenantUserId, poolId, executionTargetId, targetIdentity, bindingDigest, prefixDigest])
@@ -1141,6 +1143,8 @@ model CacheAffinityNode {
   isTip             Boolean
   /// Whole-prompt footprint from the identifiable write that made this node a tip; NULL means no proven estimate.
   estimatedTokens   Int?
+  /// Engine-reported prompt + completion when the tip write observed usage.
+  reportedTokens    Int?
   expiresAt         DateTime
 
   @@unique([userId, tenantUserId, poolId, executionTargetId, rootDigest, nodeDigest, sessionId], map: "cache_affinity_node_owner_unique")

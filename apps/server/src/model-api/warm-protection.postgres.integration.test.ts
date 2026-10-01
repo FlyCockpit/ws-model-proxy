@@ -285,6 +285,97 @@ integration("warm-session protection with real PostgreSQL", () => {
     60_000,
   );
 
+  it("sizes warm sessions from reported tokens and applies minTokens to that footprint", async () => {
+    if (!databaseUrl) return;
+    const suffix = crypto.randomUUID();
+    const owner = await user("reported-footprint");
+    try {
+      const device = await db.cliDevice.create({
+        data: { userId: owner.id, slug: `device-${suffix}` },
+      });
+      const endpoint = await db.endpoint.create({
+        data: { userId: owner.id, cliDeviceId: device.id, slug: `endpoint-${suffix}`, label: "W" },
+      });
+      const pool = await db.modelPool.create({
+        data: { userId: owner.id, slug: `pool-${suffix}`, name: "Warm pool" },
+      });
+      const capacity = await db.inferenceCapacity.create({
+        data: {
+          userId: owner.id,
+          label: `cap-${suffix}`,
+          runtimeIdentityKey: `cap-${suffix}`,
+          runtimeModel: "warm-proof",
+          hardConcurrencyLimit: 2,
+        },
+      });
+      const model = await db.discoveredModel.create({
+        data: {
+          userId: owner.id,
+          endpointId: endpoint.id,
+          upstreamModelId: "model",
+          encodedModelId: `model-${suffix}`,
+        },
+      });
+      const target = await db.executionTarget.update({
+        where: { discoveredModelId: model.id },
+        data: { inferenceCapacityId: capacity.id },
+      });
+      const now = new Date();
+      const future = new Date(now.getTime() + 3_600_000);
+      const ago = (seconds: number) => new Date(now.getTime() - seconds * 1000);
+      await db.cacheAffinityRecord.createMany({
+        data: [
+          {
+            sessionId: "reported-beats-estimate",
+            userId: owner.id,
+            tenantUserId: owner.id,
+            poolId: pool.id,
+            executionTargetId: target.id,
+            targetIdentity: "identity",
+            bindingDigest: "b".repeat(64),
+            prefixDigest: `prefix-a-${suffix}`.padEnd(40, "0"),
+            prefixDepth: 1,
+            estimatedTokens: 18_000,
+            reportedTokens: 12_000,
+            lastUsedAt: ago(10),
+            createdAt: ago(20),
+            expiresAt: future,
+          },
+          {
+            sessionId: "reported-below-floor",
+            userId: owner.id,
+            tenantUserId: owner.id,
+            poolId: pool.id,
+            executionTargetId: target.id,
+            targetIdentity: "identity",
+            bindingDigest: "c".repeat(64),
+            prefixDigest: `prefix-b-${suffix}`.padEnd(40, "0"),
+            prefixDepth: 1,
+            estimatedTokens: 20_000,
+            reportedTokens: 7_000,
+            lastUsedAt: ago(5),
+            createdAt: ago(20),
+            expiresAt: future,
+          },
+        ],
+      });
+      const sessions = await warm.loadWarmSessions({
+        ownerId: owner.id,
+        capacityIds: [capacity.id],
+        policy: { windowSeconds: 300, minTokens: 8192 },
+        now,
+      });
+      expect(
+        (sessions.get(capacity.id) ?? []).map(({ tokens, ageMs }) => ({
+          tokens,
+          ageSeconds: ageMs / 1000,
+        })),
+      ).toEqual([{ tokens: 12_000, ageSeconds: 10 }]);
+    } finally {
+      await db.user.deleteMany({ where: { id: owner.id } });
+    }
+  }, 60_000);
+
   it("groups a session's records by session id and reads overrides, in bounded time", async () => {
     if (!databaseUrl) return;
     const suffix = crypto.randomUUID();

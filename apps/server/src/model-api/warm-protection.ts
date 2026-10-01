@@ -424,8 +424,8 @@ type WarmSessionRow = {
  * Reads the warm set of the given member KV pools with one bounded,
  * non-locking query (indexed by `[executionTargetId, lastUsedAt]`). A session
  * is the set of records that carry one required `sessionId`: its age is its newest record's, its size the largest
- * `estimatedTokens` among the records of that newest instant (every record of
- * a request carries the whole prompt estimate). Records from every pool of
+ * `COALESCE(reportedTokens, estimatedTokens)` among the records of that newest instant (every record of
+ * a request carries the whole prompt footprint). Records from every pool of
  * the owner count, since they share the physical KV pool; each session's
  * override comes from its own pool (the tenant's grant, or the pool's owner
  * percent when the tenant is the owner). A session is `inFlight` when an
@@ -456,7 +456,8 @@ export async function loadWarmSessions({
       -- sessionId is required; there is no legacy id fallback.
       SELECT r.id, r."sessionId" AS "sessionKey",
              r."tenantUserId", r."poolId", r."userId", r."lastUsedAt",
-             r."estimatedTokens", r."executionTargetId", t."inferenceCapacityId" AS "capacityId"
+             COALESCE(r."reportedTokens", r."estimatedTokens") AS "footprintTokens",
+             r."executionTargetId", t."inferenceCapacityId" AS "capacityId"
         FROM cache_affinity_record r
         JOIN execution_target t ON t.id = r."executionTargetId"
        WHERE r."userId" = ${ownerId}
@@ -468,17 +469,17 @@ export async function loadWarmSessions({
          -- they are dropped here to keep the scan cheap. (A session whose
          -- latest turn shrank below the floor keeps its older, larger turn as
          -- its size: the engine still holds that longer prefix.)
-         AND r."estimatedTokens" >= ${policy.minTokens}
+         AND COALESCE(r."reportedTokens", r."estimatedTokens") >= ${policy.minTokens}
     ),
     session AS (
       -- One session per session id: its latest turn (the newest instant of
-      -- its records; the largest estimate among that instant's records, since
-      -- every record of a request carries the whole prompt estimate).
+      -- its records; the largest footprint among that instant's records, since
+      -- every record of a request carries the whole prompt size).
       SELECT DISTINCT ON (c."sessionKey")
              c."sessionKey", c."capacityId", c."executionTargetId", c."tenantUserId", c."poolId", c."userId",
-             c."lastUsedAt", c."estimatedTokens" AS tokens
+             c."lastUsedAt", c."footprintTokens" AS tokens
         FROM candidate c
-       ORDER BY c."sessionKey", c."lastUsedAt" DESC, c."estimatedTokens" DESC
+       ORDER BY c."sessionKey", c."lastUsedAt" DESC, c."footprintTokens" DESC
     ),
     served AS (
       -- Sessions an active lease of the same capacity AND execution target is

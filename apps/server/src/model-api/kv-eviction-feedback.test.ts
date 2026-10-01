@@ -126,6 +126,24 @@ describe("eviction evidence", () => {
   ])("$name", ({ patch, expected }) =>
     expect(qualifiesAsEvictionEvidence({ ...valid, ...patch })).toBe(expected),
   );
+
+  it("a 12k reported prefix with an 18k estimate and 700 cached tokens is not evidence", () => {
+    const usage = { promptTokens: 12_000, cacheReadTokens: 700 };
+    expect(
+      qualifiesAsEvictionEvidence({
+        ...valid,
+        usage,
+        evidence: { ...valid.evidence!, tokens: 12_000 },
+      }),
+    ).toBe(false);
+    expect(
+      qualifiesAsEvictionEvidence({
+        ...valid,
+        usage,
+        evidence: { ...valid.evidence!, tokens: 18_000 },
+      }),
+    ).toBe(true);
+  });
 });
 
 function fakeDb() {

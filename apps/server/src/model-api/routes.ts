@@ -225,6 +225,7 @@ import {
 import {
   engineCacheConfirmedFromUsageFacts,
   type RelayUsageFacts,
+  reportedAffinityTokens,
   usageFactsFromProviderUsage,
   usageFactsFromRelayTerminal,
 } from "./relay-usage-facts.js";
@@ -6786,26 +6787,26 @@ async function relayPool({
       let affinityWrite: Promise<AffinitySessionBinding | null> | undefined;
       const persistAffinity = () =>
         (affinityWrite ??= attemptOutcome
-          .then(({ terminal, upstreamTerminal }) =>
-            terminal.ok && requestedSurface && affinityPayload && servedAffinityTarget
-              ? rememberAffinity({
-                  ownerId: requester.userId,
-                  resourceOwnerId: member.DiscoveredModel.userId,
-                  poolId: target.id,
-                  securityScope: requester.limitKey,
-                  accessGrantId: target.accessGrantId,
-                  policy: affinityPolicy,
-                  surface: requestedSurface,
-                  payload: affinityPayload,
-                  headers: request.headers,
-                  target: servedAffinityTarget,
-                  engineCacheConfirmed: engineCacheConfirmedFromUsageFacts(
-                    usageFactsFromRelayTerminal(upstreamTerminal),
-                  ),
-                  estimatedTokens: operation.contextCount?.tokens,
-                })
-              : null,
-          )
+          .then(({ terminal, upstreamTerminal }) => {
+            if (!terminal.ok || !requestedSurface || !affinityPayload || !servedAffinityTarget)
+              return null;
+            const usageFacts = usageFactsFromRelayTerminal(upstreamTerminal);
+            return rememberAffinity({
+              ownerId: requester.userId,
+              resourceOwnerId: member.DiscoveredModel.userId,
+              poolId: target.id,
+              securityScope: requester.limitKey,
+              accessGrantId: target.accessGrantId,
+              policy: affinityPolicy,
+              surface: requestedSurface,
+              payload: affinityPayload,
+              headers: request.headers,
+              target: servedAffinityTarget,
+              engineCacheConfirmed: engineCacheConfirmedFromUsageFacts(usageFacts),
+              estimatedTokens: operation.contextCount?.tokens,
+              reportedTokens: reportedAffinityTokens(usageFacts),
+            });
+          })
           .catch((error) => {
             metadataUpdateError(error);
             return null;
@@ -7437,32 +7438,34 @@ async function relaySelectedModelNoFailover({
     // neither a ranked affinity decision nor a matched record's age/footprint.
     const persistAffinity = () =>
       (affinityWrite ??= attempt.terminal
-        .then((terminal) =>
-          terminal.ok &&
-          boundAffinityTarget &&
-          requestedModelPoolId &&
-          selectedPoolMember &&
-          operation.contextInput
-            ? rememberAffinity({
-                ownerId: requester.userId,
-                resourceOwnerId: selected.userId,
-                poolId: requestedModelPoolId,
-                securityScope: requester.limitKey,
-                accessGrantId: poolAccess?.accessGrantId,
-                policy: affinityPolicyForMember(selectedPoolMember),
-                surface: "OPENAI_RESPONSES",
-                payload: operation.contextInput,
-                headers: request.headers,
-                target: boundAffinityTarget,
-                sessionBinding: boundSessionId ? operation.sessionBinding : undefined,
-                estimatedTokens: operation.contextCount?.tokens,
-                estimatedDeltaTokens,
-                engineCacheConfirmed: engineCacheConfirmedFromUsageFacts(
-                  usageFactsFromRelayTerminal(terminal),
-                ),
-              })
-            : null,
-        )
+        .then((terminal) => {
+          if (
+            !terminal.ok ||
+            !boundAffinityTarget ||
+            !requestedModelPoolId ||
+            !selectedPoolMember ||
+            !operation.contextInput
+          )
+            return null;
+          const usageFacts = usageFactsFromRelayTerminal(terminal);
+          return rememberAffinity({
+            ownerId: requester.userId,
+            resourceOwnerId: selected.userId,
+            poolId: requestedModelPoolId,
+            securityScope: requester.limitKey,
+            accessGrantId: poolAccess?.accessGrantId,
+            policy: affinityPolicyForMember(selectedPoolMember),
+            surface: "OPENAI_RESPONSES",
+            payload: operation.contextInput,
+            headers: request.headers,
+            target: boundAffinityTarget,
+            sessionBinding: boundSessionId ? operation.sessionBinding : undefined,
+            estimatedTokens: operation.contextCount?.tokens,
+            estimatedDeltaTokens,
+            reportedTokens: reportedAffinityTokens(usageFacts),
+            engineCacheConfirmed: engineCacheConfirmedFromUsageFacts(usageFacts),
+          });
+        })
         .catch((error) => {
           metadataUpdateError(error);
           return null;
