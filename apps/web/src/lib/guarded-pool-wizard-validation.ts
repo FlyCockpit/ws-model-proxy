@@ -9,6 +9,7 @@ import {
 } from "@ws-model-proxy/api/lib/surface-capabilities";
 import { validateForwarderPoolSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import { z } from "zod";
+import { capacityCountStrategies } from "./capacity-forms";
 
 /**
  * Discovered/local model view for capability resolution. Carries exactly the
@@ -399,12 +400,7 @@ export function buildGuardedPoolWizardSchema(input: GuardedPoolWizardSchemaInput
       providerTier: z.enum(["PRIMARY", "PUBLIC_OVERFLOW"]),
       providerConcurrencyLimit: z.number().int().min(1).max(10_000),
       dailySpendLimit: z.string(),
-      physicalCountStrategy: z.enum([
-        "TOKENIZER",
-        "TEMPLATE_AWARE",
-        "ENGINE_REPORTED",
-        "CONSERVATIVE_ESTIMATE",
-      ]),
+      physicalCountStrategy: z.enum(capacityCountStrategies),
       contextMargin: z.number().int().min(0).max(10_000_000),
       borrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]),
       protocolAdaptationEnabled: z.boolean(),

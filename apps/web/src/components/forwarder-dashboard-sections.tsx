@@ -56,6 +56,7 @@ import {
   directPolicyIsValid,
   directPolicyPayload,
   type FiniteLimitMode,
+  formCountStrategy,
   memberPolicyPayload,
   newCapacityDefaults,
 } from "@/lib/capacity-forms";
@@ -1371,11 +1372,7 @@ export function CapacitySetupForm({
         : newCapacityDefaults.physicalMaxContextMode,
       physicalMaxContext: capacity?.physicalMaxContext ?? newCapacityDefaults.physicalMaxContext,
       imageTokenAllowance: capacity?.imageTokenAllowance ?? newCapacityDefaults.imageTokenAllowance,
-      countStrategy: (capacity?.countStrategy ?? newCapacityDefaults.countStrategy) as
-        | "CONSERVATIVE_ESTIMATE"
-        | "ENGINE_REPORTED"
-        | "TOKENIZER"
-        | "TEMPLATE_AWARE",
+      countStrategy: formCountStrategy(capacity?.countStrategy),
       runtimeRevision: capacity?.runtimeRevision ?? "",
       tokenizer: capacity?.tokenizer ?? "",
       template: capacity?.template ?? "",
@@ -1496,23 +1493,20 @@ export function CapacitySetupForm({
                   <option value="CONSERVATIVE_ESTIMATE">
                     {t("dashboard:pools.capacity.strategies.estimate")}
                   </option>
+                  <option value="CALIBRATED_ESTIMATE">
+                    {t("dashboard:pools.capacity.strategies.calibrated")}
+                  </option>
                   <option value="ENGINE_REPORTED">
                     {t("dashboard:pools.capacity.strategies.engine")}
-                  </option>
-                  <option value="TOKENIZER">
-                    {t("dashboard:pools.capacity.strategies.tokenizer")}
-                  </option>
-                  <option value="TEMPLATE_AWARE">
-                    {t("dashboard:pools.capacity.strategies.template")}
                   </option>
                 </select>
                 {field.state.value === "ENGINE_REPORTED" ? (
                   <p className="text-xs text-muted-foreground">
                     {t("dashboard:pools.capacity.strategies.engineRequirement")}
                   </p>
-                ) : field.state.value === "TOKENIZER" || field.state.value === "TEMPLATE_AWARE" ? (
+                ) : field.state.value === "CALIBRATED_ESTIMATE" ? (
                   <p className="text-xs text-muted-foreground">
-                    {t("dashboard:pools.capacity.strategies.registeredRequirement")}
+                    {t("dashboard:pools.capacity.strategies.calibratedRequirement")}
                   </p>
                 ) : null}
               </div>

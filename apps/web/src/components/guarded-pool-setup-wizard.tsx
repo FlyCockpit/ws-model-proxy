@@ -221,8 +221,7 @@ export function GuardedPoolSetupWizard({
       providerConcurrencyLimit: 1,
       dailySpendLimit: "10.00",
       physicalCountStrategy: "CONSERVATIVE_ESTIMATE" as
-        | "TOKENIZER"
-        | "TEMPLATE_AWARE"
+        | "CALIBRATED_ESTIMATE"
         | "ENGINE_REPORTED"
         | "CONSERVATIVE_ESTIMATE",
       contextMargin: 0,
@@ -672,16 +671,13 @@ export function GuardedPoolSetupWizard({
                             field.handleChange(event.target.value as typeof field.state.value)
                           }
                         >
-                          {[
-                            "CONSERVATIVE_ESTIMATE",
-                            "TOKENIZER",
-                            "TEMPLATE_AWARE",
-                            "ENGINE_REPORTED",
-                          ].map((strategy) => (
-                            <option key={strategy} value={strategy}>
-                              {t(`dashboard:pools.wizard.enums.${strategy}`)}
-                            </option>
-                          ))}
+                          {["CONSERVATIVE_ESTIMATE", "CALIBRATED_ESTIMATE", "ENGINE_REPORTED"].map(
+                            (strategy) => (
+                              <option key={strategy} value={strategy}>
+                                {t(`dashboard:pools.wizard.enums.${strategy}`)}
+                              </option>
+                            ),
+                          )}
                         </select>
                         <p className="text-xs text-muted-foreground">
                           {t("dashboard:pools.wizard.fields.physicalCountStrategyHint")}

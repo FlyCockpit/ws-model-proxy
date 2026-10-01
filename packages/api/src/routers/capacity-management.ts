@@ -42,6 +42,7 @@ const countStrategy = z.enum([
   "TEMPLATE_AWARE",
   "ENGINE_REPORTED",
   "CONSERVATIVE_ESTIMATE",
+  "CALIBRATED_ESTIMATE",
 ]);
 
 function notFound(): never {

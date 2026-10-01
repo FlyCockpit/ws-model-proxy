@@ -622,11 +622,13 @@
       },
       "strategies": {
         "estimate": "Conservative estimate",
+        "calibrated": "Calibrated estimate",
         "engine": "Use engine-reported count when available",
-        "tokenizer": "Use a matching registered tokenizer",
-        "template": "Use a matching registered tokenizer and template",
-        "engineRequirement": "Requires count-token support on the selected target. WSMP uses a conservative estimate when that support is unavailable.",
-        "registeredRequirement": "Requires a registered counter matching this runtime identity. WSMP uses a conservative estimate when no match is available."
+        "tokenizer": "Calibrated estimate",
+        "template": "Calibrated estimate",
+        "engineRequirement": "Requires Anthropic Messages or Responses count_tokens on the selected target. Chat Completions fall back to the estimate. WSMP uses a conservative estimate when that support is unavailable.",
+        "calibratedRequirement": "Learns a per-capacity ratio from engine-reported prompt tokens on text-only requests, then uses the 95th percentile for context checks.",
+        "registeredRequirement": "Learns a per-capacity ratio from engine-reported prompt tokens on text-only requests, then uses the 95th percentile for context checks."
       },
       "engineFacts": {
         "engine": "Engine: {{engine}}",
@@ -791,7 +793,7 @@
         "reservedSlots": "Reserved slots on the shared runtime",
         "reservedSlotsHint": "Reserves this many slots of the shared physical runtime for this pool. Other pools may use them only when idle, only under their borrowing policy, and never while a higher-priority queued request of this pool needs the slot. Cannot exceed this pool's ceiling.",
         "physicalCountStrategy": "Physical token count strategy",
-        "physicalCountStrategyHint": "How the runtime counts request tokens before the context-ceiling check. The default, conservative estimate, deliberately overcounts (serialized UTF-8 bytes ÷ 3 with a 1.2 safety factor) instead of trusting tokenizer or engine counts; the other strategies use the configured tokenizer, a template-aware counter, or the engine's reported count.",
+        "physicalCountStrategyHint": "How the runtime counts request tokens before the context-ceiling check. The default, conservative estimate, overcounts text (serialized UTF-8 bytes ÷ 3 with a 1.2 safety factor) and sizes images from headers. Calibrated estimate learns from engine-reported prompt tokens. Engine-reported count covers Anthropic Messages and Responses count_tokens only.",
         "contextMargin": "Pool context safety margin (defaults to 0)",
         "contextMarginHint": "Headroom reserved below the ceiling: admission requires counted tokens plus this margin to fit the ceiling and the physical maximum. Must stay below the ceiling.",
         "memberContextInheritHint": "Inherits the optional pool ceiling; no member ceiling is set.",
@@ -832,8 +834,9 @@
         "spendMonth": "Spend / UTC month"
       },
       "enums": {
-        "TOKENIZER": "Tokenizer count",
-        "TEMPLATE_AWARE": "Template-aware count",
+        "TOKENIZER": "Calibrated estimate",
+        "TEMPLATE_AWARE": "Calibrated estimate",
+        "CALIBRATED_ESTIMATE": "Calibrated estimate",
         "ENGINE_REPORTED": "Engine-reported count",
         "CONSERVATIVE_ESTIMATE": "Conservative estimate",
         "NEVER": "Never borrow",

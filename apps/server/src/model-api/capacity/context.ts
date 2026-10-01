@@ -4,6 +4,7 @@ export type ContextCountMethod =
   | "NATIVE"
   | "TOKENIZER_TEMPLATE"
   | "TOKEN_ESTIMATE"
+  | "CALIBRATED_ESTIMATE"
   | "CHAR_ESTIMATE";
 export type ContextCount = { tokens: number; method: ContextCountMethod; exact: boolean };
 export type ContextCountTelemetry = ContextCount & {
@@ -56,7 +57,7 @@ export async function countSerializedRequestContext({
     ...result,
     confidence: result.exact
       ? "EXACT"
-      : result.method === "TOKENIZER_TEMPLATE"
+      : result.method === "TOKENIZER_TEMPLATE" || result.method === "CALIBRATED_ESTIMATE"
         ? "HIGH"
         : result.method === "TOKEN_ESTIMATE"
           ? "CONSERVATIVE"
@@ -118,6 +119,23 @@ export async function countContext({
     tokens: Math.ceil((serializedChars / 4) * safetyMargin),
     method: "CHAR_ESTIMATE",
     exact: false,
+  };
+}
+
+export function withCalibratedContextCount(
+  count: ContextCountTelemetry,
+  tokens: number,
+): ContextCountTelemetry {
+  const validated = validateCount({
+    tokens,
+    method: "CALIBRATED_ESTIMATE",
+    exact: false,
+  });
+  return {
+    ...count,
+    ...validated,
+    confidence: "HIGH",
+    safetyMargin: 1,
   };
 }
 

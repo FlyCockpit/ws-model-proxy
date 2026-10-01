@@ -2,10 +2,22 @@ import { z } from "zod";
 
 export const capacityCountStrategies = [
   "CONSERVATIVE_ESTIMATE",
+  "CALIBRATED_ESTIMATE",
   "ENGINE_REPORTED",
-  "TOKENIZER",
-  "TEMPLATE_AWARE",
 ] as const;
+
+export function formCountStrategy(
+  strategy: string | null | undefined,
+): (typeof capacityCountStrategies)[number] {
+  if (strategy === "ENGINE_REPORTED") return "ENGINE_REPORTED";
+  if (
+    strategy === "CALIBRATED_ESTIMATE" ||
+    strategy === "TOKENIZER" ||
+    strategy === "TEMPLATE_AWARE"
+  )
+    return "CALIBRATED_ESTIMATE";
+  return "CONSERVATIVE_ESTIMATE";
+}
 
 export const finiteLimitModes = ["LIMITED", "UNLIMITED"] as const;
 export const inheritedLimitModes = ["INHERIT", "LIMITED"] as const;

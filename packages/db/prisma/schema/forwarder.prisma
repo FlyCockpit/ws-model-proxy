@@ -228,6 +228,7 @@ enum CapacityCountStrategy {
   TEMPLATE_AWARE
   ENGINE_REPORTED
   CONSERVATIVE_ESTIMATE
+  CALIBRATED_ESTIMATE
 }
 
 /// How warm-session protection splits one member's KV pool between users
