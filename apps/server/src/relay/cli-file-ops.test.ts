@@ -1105,6 +1105,26 @@ describe("cli file ops", () => {
     await expect(conflict).resolves.toEqual({ ok: false, code: "no_match" });
   });
 
+  it("settles delete results with and without retained recovery paths", async () => {
+    const socket = await connect();
+    for (const result of [
+      { deleted: true, type: "file" },
+      {
+        deleted: true,
+        type: "symlink",
+        recovered: ["/workspace/.wsmp-recover-a1b2c3d4e5"],
+      },
+    ]) {
+      socket.sends.length = 0;
+      const outcome = start(socket, "delete", { path: "~/a" });
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await answer(socket, resultFor(lastOpId(socket), "delete", result));
+      await expect(outcome).resolves.toEqual({ ok: true, op: "delete", result });
+      expect(socket.frames("file.cancel")).toEqual([]);
+      expect(socket.closes).toEqual([]);
+    }
+  });
+
   it("keeps uncertain_outcome recovery facts and marks mutations unknown", async () => {
     const socket = await connect();
     const detail = {
@@ -1534,6 +1554,40 @@ describe("cli file ops", () => {
       }
       expect(events()[0]).toMatchObject({ outcome: "refused", reason: "feature_disabled" });
       expect(events()[1]).toMatchObject({ outcome: "failed", reason: "timeout" });
+    });
+
+    it.each([
+      ["edit", editArgs],
+      [
+        "write",
+        {
+          path: "~/a",
+          ifExists: "replace",
+          expectedEtag: "h:AAAAAAAAAAAAAAAAAAAAAA",
+        },
+      ],
+      ["rename", { from: "~/a", to: "~/b" }],
+    ] as const)("audits %s unsafe_filesystem as a definitive CLI refusal", async (op, args) => {
+      const socket = await connect();
+      const outcome = start(socket, op, args, op === "write" ? { body: new Uint8Array([98]) } : {});
+      await waitFor(() => expect(socket.frames("file.op")).toHaveLength(1));
+      await answer(
+        socket,
+        JSON.stringify({
+          type: "file.rejected",
+          opId: lastOpId(socket),
+          reason: "unsafe_filesystem",
+        }),
+      );
+      await expect(outcome).resolves.toEqual({ ok: false, code: "unsafe_filesystem" });
+      expect(events()).toHaveLength(1);
+      expect(events()[0]).toMatchObject({
+        kind: `file_${op}`,
+        outcome: "refused",
+        reason: "unsafe_filesystem",
+      });
+      expect(socket.frames("file.cancel")).toEqual([]);
+      expect(socket.closes).toEqual([]);
     });
 
     it("writes a metadata-only refusal row for an input the MCP layer refused", () => {
@@ -2048,6 +2102,7 @@ describe("cli file ops", () => {
       ["supervised_only", "supervised_only"],
       ["limit", "limit"],
       ["unsupported", "unsupported"],
+      ["unsafe_filesystem", "unsafe_filesystem"],
       ["not_found", "not_found"],
       ["bad_frame", "io_error"],
     ])(
@@ -2070,6 +2125,7 @@ describe("cli file ops", () => {
       ["grant_disabled", "grant_disabled"],
       ["feature_disabled", "feature_disabled"],
       ["supervised_only", "supervised_only"],
+      ["unsafe_filesystem", "unsafe_filesystem"],
     ])("settles a mutation refused with %s as %s, never as unknown", async (reason, code) => {
       const socket = await connect();
       const outcome = start(socket, "edit", editArgs);

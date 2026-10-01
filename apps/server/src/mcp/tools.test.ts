@@ -2301,6 +2301,14 @@ describe("CLI file tools", () => {
     expect(edit?.description).toContain("expectedEtag");
     expect(edit?.description).toContain("forwarder_cli_file_stat");
     expect(edit?.description).toContain('confirm: "RUN"');
+    const remove = tools.find((tool) => tool.name === "forwarder_cli_file_delete");
+    expect(remove?.description).toContain(
+      "Successful edit/write/rename/delete results may include recovered",
+    );
+    expect(remove?.description).toContain("mkdir/rmdir pair");
+    expect(remove?.description).toContain("free space with the shell");
+    expect(remove?.description).toContain("rmdir by name");
+    expect(edit?.description).toContain("hard_linked until manual cleanup");
     // G3: the 64 KiB request-fit rule is stated on the tools whose advertised
     // maxima can exceed it (stat's 50 paths, list/search patterns), and the
     // read note names the escape-dense too_large case.
@@ -2568,7 +2576,29 @@ describe("CLI file tools", () => {
     expect(structured(result).error?.kept).toHaveLength(1);
   });
 
-  it("passes recovered paths through edit, write and rename success projections", async () => {
+  it("reports unsafe_filesystem as a definitive refusal with the generic fixed message", async () => {
+    fileRuntime.runFileOp.mockResolvedValueOnce({
+      ok: false,
+      code: "unsafe_filesystem",
+      message: "PRIVATE CLI MESSAGE",
+    });
+    const result = await call("forwarder_cli_file_rename", {
+      cliDeviceId: "cli-1",
+      from: "~/a",
+      to: "~/b",
+      confirm: "RUN",
+    });
+    expect(result.isError).toBe(true);
+    expect(structured(result).error).toEqual({
+      code: "unsafe_filesystem",
+    });
+    expect(resultText(result)).toContain(
+      "This filesystem lacks the atomic primitives to change this path without risking a concurrent save; nothing was changed",
+    );
+    expect(JSON.stringify(result)).not.toContain("PRIVATE CLI MESSAGE");
+  });
+
+  it("passes recovered paths through edit, write, rename and delete success projections", async () => {
     const recovered = ["/workspace/.wsmp-recover-a1b2c3d4e5/slot-1"];
     const etag = "h:AAAAAAAAAAAAAAAAAAAAAA";
     const cases = [
@@ -2589,6 +2619,12 @@ describe("CLI file tools", () => {
         "forwarder_cli_file_rename",
         { from: "~/a", to: "~/b", confirm: "RUN" },
         { etag, recovered },
+      ],
+      [
+        "delete",
+        "forwarder_cli_file_delete",
+        { path: "~/a", confirm: "DELETE" },
+        { deleted: true, type: "file", recovered },
       ],
     ] as const;
     for (const [op, tool, args, result] of cases) {

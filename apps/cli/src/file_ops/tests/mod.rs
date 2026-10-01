@@ -14,6 +14,8 @@ use super::{Cancel, ErrorCode, EtagKey, FileOps, FileResult, Policy, Step};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod compensation;
 mod edit_write;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod exchangeless;
 mod hardening;
 mod misc;
 mod read_grant;

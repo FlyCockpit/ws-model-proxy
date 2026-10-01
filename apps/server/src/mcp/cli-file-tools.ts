@@ -154,6 +154,8 @@ const FILE_ERROR_MESSAGES: Readonly<Record<ToolErrorCode, string>> = {
     "This device requires supervision; headless reads need the read-only grant with roots, or use cat via a supervised command",
   unsupported:
     "The CLI cannot run this file operation (it refuses file tools as root unless allowFileToolsAsRoot is set)",
+  unsafe_filesystem:
+    "This filesystem lacks the atomic primitives to change this path without risking a concurrent save; nothing was changed",
   limit: "Too many file operations; retry after retryAfterMs",
   token_inactive:
     "This MCP token was revoked, has expired, or no longer grants this file capability",
@@ -383,7 +385,7 @@ const PROJECT_FIELDS: Readonly<Record<FileOp, readonly string[]>> = {
   write: ["etag", "size", "created", "added", "removed", "diff", "resolvedPath", "recovered"],
   rename: ["etag", "recovered"],
   mkdir: ["created"],
-  delete: ["deleted", "type"],
+  delete: ["deleted", "type", "recovered"],
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -445,7 +447,7 @@ export const FILE_ETAG_NOTICE =
   "Every result that touches a file carries etag. Pass it as expectedEtag to edit, write (ifExists replace), rename (overwrite) and delete; a stale etag returns error.code conflict with currentEtag. Line-range edits and replace require expectedEtag. Etags reset when the wsmp daemon restarts: after offline, re-read or file_stat before editing.";
 
 export const FILE_UNKNOWN_OUTCOME_NOTICE =
-  'If a write-class call fails with error.outcome "unknown" (any code: timeout, offline, cancelled, token_inactive, a mode change, io_error, uncertain_outcome, not_found on rename/delete, or conflict meaning the file was swapped during the change), the change may or may not have been made: call forwarder_cli_file_stat with hash true and compare the etag before retrying. A retry that carries expectedEtag is safe (a stale etag returns conflict; the currentEtag of a conflict is an etag or the word gone); an exact-match edit without expectedEtag is NOT idempotent, so check with file_stat first. An uncertain_outcome includes recovery and kept absolute paths: use the shell to inspect and recover them before retrying. Successful edit/write/rename results may include recovered paths for retained cleanup objects. Recovery uses at most one .wsmp-recover-<10 alnum> directory beside the target and two objects per operation. File tools can read but never mutate recovery paths; recovery is manual and retained objects are never automatically deleted.';
+  'If a write-class call fails with error.outcome "unknown" (any code: timeout, offline, cancelled, token_inactive, a mode change, io_error, uncertain_outcome, not_found on rename/delete, or conflict meaning the file was swapped during the change), the change may or may not have been made: call forwarder_cli_file_stat with hash true and compare the etag before retrying. A retry that carries expectedEtag is safe (a stale etag returns conflict; the currentEtag of a conflict is an etag or the word gone); an exact-match edit without expectedEtag is NOT idempotent, so check with file_stat first. An uncertain_outcome includes recovery and kept absolute paths: use the shell to inspect and recover them before retrying. Successful edit/write/rename/delete results may include recovered paths for retained cleanup objects. After link publication, a retained temp alias leaves two hard links and later edit/replace calls refuse hard_linked until manual cleanup. Recovery uses at most one .wsmp-recover-<10 alnum> directory beside the target and two objects per operation. File tools can read but never mutate recovery paths; recovery is manual and retained objects are never automatically deleted. An unsafe_filesystem refusal is definitive: nothing was changed.';
 
 export const FILE_LIMITS_NOTICE =
   "Limits: 120 file operations per minute per user (30 changing ones), 4 at once per CLI and 16 per user; over the limit returns error.code limit with retryAfterMs. Operations are never queued and time out after 30 seconds.";
@@ -462,5 +464,5 @@ export const FILE_TOOL_NOTES: Readonly<Record<FileToolName, string>> = {
   forwarder_cli_file_write: `Creates a file, or replaces it with ifExists replace plus expectedEtag. content is utf-8 text or base64 (encoding), at most 1 MiB decoded; a base64 request encodes to more, and every /mcp request body is capped at 1 MB, so base64 content above roughly 768 KiB (786,432 bytes decoded) cannot be sent in one call. Content containing the mask token ⟦redacted is refused, and a secret-class path (dotenv or key file, or its directory) can never be created or replaced (secret_file). Optional reason (500 characters) goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
   forwarder_cli_file_rename: `Renames within one filesystem; overwrite requires expectedEtag of the destination. Refused with secret_file on secret-class files and their directories (read-only masked views). Optional reason goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
   forwarder_cli_dir_create: `Creates a directory (parents true creates missing parents). Refused with secret_file on secret-class files and their directories (read-only masked views). Optional reason goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
-  forwarder_cli_file_delete: `Deletes a file, a symlink (never its target) or an empty directory; there is no recursive delete. Refused with secret_file on secret-class files and their directories (read-only masked views). Optional reason goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
+  forwarder_cli_file_delete: `Deletes a file, a symlink (never its target) or an empty directory; there is no recursive delete. Files and symlinks are first captured in recovery and checked against the held identity; a concurrent create at the vacant name survives. This needs one recovery mkdir/rmdir pair: if mkdir fails (including ENOSPC, EDQUOT or EMLINK), deletion fails closed with io_error; free space with the shell. On macOS and other Unix a file the CLI user cannot open read-only (for example mode 000 or 0200) refuses with its open errno (io_error) before capture. Directories use rmdir by name, which can only remove an empty directory. Refused with secret_file on secret-class files and their directories (read-only masked views). Optional reason goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
 };

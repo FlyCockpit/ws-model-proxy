@@ -141,6 +141,14 @@ fn clean(fx: &Fx) {
 fn compensation_fault_table_is_off_by_default_nth_and_thread_local() {
     for primitive in [
         Primitive::Exchange,
+        Primitive::ProbeNoReplace,
+        Primitive::ProbeLink,
+        Primitive::Publish,
+        Primitive::PublishLink,
+        Primitive::Mkdir,
+        Primitive::Hold,
+        Primitive::Identity,
+        Primitive::MoveLink,
         Primitive::Capture,
         Primitive::Restore,
         Primitive::RestoreLink,
@@ -467,28 +475,13 @@ fn compensation_capture_falls_back_only_for_unsupported_errors() {
                 Ok(())
             });
             let _scope = FaultScope::new(&[(Primitive::Capture, 1, errno)]);
-            if errno != Errno::ENOTSUP || cfg!(target_os = "macos") {
-                if matches!(op, Op::Replace) {
-                    assert_eq!(op.run(&fx, &etag).unwrap_err().code, ErrorCode::Conflict);
-                    assert_eq!(fx.get(op.destination()), "unchecked destination");
-                } else {
-                    assert!(op.run(&fx, &etag).unwrap().get("recovered").is_none());
-                }
-                clean(&fx);
+            if matches!(op, Op::Replace) {
+                assert_eq!(op.run(&fx, &etag).unwrap_err().code, ErrorCode::Conflict);
+                assert_eq!(fx.get(op.destination()), "unchecked destination");
             } else {
-                let kept = uncertain(&op.run(&fx, &etag).unwrap_err());
-                let mut locations = kept;
-                locations.push(fx.root.join(op.destination()));
-                locations.push(fx.root.join("src.txt"));
-                assert!(contains_bytes(
-                    &locations,
-                    if matches!(op, Op::Rename) {
-                        "mine"
-                    } else {
-                        "unchecked destination"
-                    }
-                ));
+                assert!(op.run(&fx, &etag).unwrap().get("recovered").is_none());
             }
+            clean(&fx);
         }
     }
 }
@@ -1211,7 +1204,7 @@ fn compensation_exchange_error_restores_vacated_source_without_plain_overwrite()
                 assert_eq!(
                     error.code,
                     if crate::file_ops::exchange::is_unsupported(errno) {
-                        ErrorCode::Unsupported
+                        ErrorCode::UnsafeFilesystem
                     } else {
                         ErrorCode::IoError
                     },
@@ -1401,7 +1394,7 @@ fn compensation_no_flags_exchange_less_rename_restores_source_with_one_link() {
     ]);
     assert_eq!(
         Op::Rename.run(&fx, &etag).unwrap_err().code,
-        ErrorCode::Unsupported
+        ErrorCode::UnsafeFilesystem
     );
     assert_eq!(fx.get("src.txt"), "mine");
     assert_eq!(fx.get("dst.txt"), "original");

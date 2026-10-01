@@ -33,6 +33,7 @@ pub enum ErrorCode {
     Timeout,
     InvalidInput,
     Unsupported,
+    UnsafeFilesystem,
     Cancelled,
     Limit,
 }
@@ -61,6 +62,7 @@ impl ErrorCode {
             Self::Timeout => "timeout",
             Self::InvalidInput => "invalid_input",
             Self::Unsupported => "unsupported",
+            Self::UnsafeFilesystem => "unsafe_filesystem",
             Self::Cancelled => "cancelled",
             Self::Limit => "limit",
         }
@@ -129,6 +131,13 @@ impl FileError {
         }
     }
 
+    pub fn unsafe_filesystem() -> Self {
+        Self::new(
+            ErrorCode::UnsafeFilesystem,
+            "this filesystem lacks the atomic primitives to change this path without risking a concurrent save; nothing was changed",
+        )
+    }
+
     pub fn cancelled() -> Self {
         Self::new(ErrorCode::Cancelled, "the operation was cancelled")
     }
@@ -182,6 +191,7 @@ mod tests {
             ErrorCode::Timeout,
             ErrorCode::InvalidInput,
             ErrorCode::Unsupported,
+            ErrorCode::UnsafeFilesystem,
             ErrorCode::Cancelled,
             ErrorCode::Limit,
         ] {
@@ -195,6 +205,19 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ErrorCode::UncertainOutcome).unwrap(),
             "\"uncertain_outcome\""
+        );
+    }
+
+    #[test]
+    fn unsafe_filesystem_spelling_and_message_are_pinned() {
+        assert_eq!(ErrorCode::UnsafeFilesystem.as_str(), "unsafe_filesystem");
+        assert_eq!(
+            serde_json::to_string(&ErrorCode::UnsafeFilesystem).unwrap(),
+            "\"unsafe_filesystem\""
+        );
+        assert_eq!(
+            FileError::unsafe_filesystem().message,
+            "this filesystem lacks the atomic primitives to change this path without risking a concurrent save; nothing was changed"
         );
     }
 

@@ -75,6 +75,7 @@ export const FILE_ERROR_CODES = [
   "timeout",
   "invalid_input",
   "unsupported",
+  "unsafe_filesystem",
   "cancelled",
   "limit",
 ] as const;
@@ -385,7 +386,11 @@ export const renameResultSchema = z
   .strict();
 export const mkdirResultSchema = z.object({ created: z.boolean() }).strict();
 export const deleteResultSchema = z
-  .object({ deleted: z.boolean(), type: z.enum(["file", "dir", "symlink", "other"]) })
+  .object({
+    deleted: z.boolean(),
+    type: z.enum(["file", "dir", "symlink", "other"]),
+    recovered: recoveryPathsSchema.optional(),
+  })
   .strict();
 
 /** The text field of each op's result that may travel as `file.data`. */
