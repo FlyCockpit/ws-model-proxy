@@ -238,7 +238,10 @@ A valid client conversation id is authoritative, even when instructions change.
 Without one, continuity uses the last 64 digest-chain nodes, deepest first: a
 live tip wins by earliest expiry then session id; otherwise a sole ancestor
 owner permits edits/truncations. Ambiguous ancestors start a fresh session.
-Instructions, tools, semantic and unknown parameters bind the root; only the
+Leading instructions (system/developer units before the first conversation unit,
+the Anthropic `system` field, Responses `instructions`), tools, semantic and
+unknown parameters bind the root; a later system/developer message keeps its
+position in the history and behaves like any other edit. Only the
 16 approved sampling parameters are free (alongside model/stream and consumed
 content). A body carrier is excluded only when it wins validation and supplies
 the client id; invalid, inactive and losing carriers bind like unknown parameters.
