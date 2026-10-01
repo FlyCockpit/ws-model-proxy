@@ -646,6 +646,24 @@ it("R3 converter charges mostly-key bytes at the exact 2 MiB boundary", () => {
   expect(asJson({ [`${key}k`]: 0 })).toBeUndefined();
 });
 
+it.each([2, 8192, 100000])(
+  "R5 converter charges commas for %i small keys at cap and cap+1",
+  (count) => {
+    const cap = 2 * 1024 * 1024;
+    const atCap = {
+      ...Object.fromEntries(Array.from({ length: count }, (_, i) => [`k${i}`, 0])),
+      padding: "",
+    };
+    atCap.padding = "x".repeat(cap - Buffer.byteLength(JSON.stringify(atCap)));
+    const overCap = { ...atCap, padding: `${atCap.padding}x` };
+    expect(Buffer.byteLength(JSON.stringify(atCap))).toBe(cap);
+    expect(Buffer.byteLength(JSON.stringify(overCap))).toBe(cap + 1);
+    expect(asJson(atCap)).toBeDefined();
+    // Keep mutation failures small even for the 100k-key object.
+    expect(asJson(overCap) === undefined).toBe(true);
+  },
+);
+
 it("R4 pins the literal affinity depth 128", () => {
   expect(MAX_CANONICAL_DEPTH).toBe(128);
   expect(asJson(JSON.parse(nestedWire(128, "object")))).toBeDefined();

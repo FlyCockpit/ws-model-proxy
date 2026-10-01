@@ -1362,9 +1362,11 @@ export async function rememberAffinity({
     // scan an entire expired backlog to discover there are no more live rows.
     const overflow = overflowCandidates.filter((row) => row.expiresAt > now);
     if (overflow.length) {
-      await tx.cacheAffinityRecord.deleteMany({
-        where: { id: { in: overflow.map(({ id }) => id) } },
-      });
+      // A known 200-id IN list can choose a heap scan after VACUUM/reuse
+      // changes its cost. The bounded initplan keeps this a primary-key walk,
+      // just like the expiry batches above, without disabling sequential scans.
+      await tx.$executeRaw`DELETE FROM cache_affinity_record
+        WHERE id = ANY(ARRAY(SELECT unnest(${overflow.map(({ id }) => id)}::text[])))`;
     }
     // Evict nodes with their footprint, even if old routing hints remain.
     // Otherwise a later hint overwrite could strand an unbounded orphan session.
@@ -1382,13 +1384,13 @@ export async function rememberAffinity({
       DELETE FROM cache_affinity_node n
       WHERE n."userId" = ${resourceOwnerId} AND n."tenantUserId" = ${ownerId}
         AND n."poolId" = ${poolId} AND n."executionTargetId" = ${target.executionTargetId}
-        AND n."sessionId" IN (${Prisma.join([...lostFootprints])})`);
+        AND n."sessionId" = ANY(ARRAY(SELECT unnest(${[...lostFootprints]}::text[])))`);
     if (orphanCandidates.length)
       await tx.$executeRaw(Prisma.sql`
       DELETE FROM cache_affinity_node n
       WHERE n."userId" = ${resourceOwnerId} AND n."tenantUserId" = ${ownerId}
         AND n."poolId" = ${poolId} AND n."executionTargetId" = ${target.executionTargetId}
-        AND n."sessionId" IN (${Prisma.join(orphanCandidates)})
+        AND n."sessionId" = ANY(ARRAY(SELECT unnest(${orphanCandidates}::text[])))
         AND NOT EXISTS (
           SELECT 1 FROM cache_affinity_record r WHERE r."userId" = n."userId"
             AND r."tenantUserId" = n."tenantUserId" AND r."poolId" = n."poolId"

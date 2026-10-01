@@ -448,6 +448,45 @@ describe("cache affinity", () => {
     },
   );
 
+  it.each([2, 8192, 100000])(
+    "R5 identity with %i small object keys is identifiable at cap and refused at cap+1",
+    (count) => {
+      const cap = 2 * 1024 * 1024;
+      const extension = {
+        ...Object.fromEntries(Array.from({ length: count }, (_, i) => [`k${i}`, 0])),
+        padding: "",
+      };
+      const payload = { extension, input: "U" };
+      const initial = affinityPrefixDigests(digestArgs("runtime", payload, "openai-responses"));
+      const bytes =
+        Buffer.byteLength(
+          JSON.stringify({
+            bindingDigest: "x".repeat(43),
+            instructions: [],
+            parameters: { extension },
+            tools: null,
+          }),
+        ) + Buffer.byteLength(JSON.stringify(payload.input));
+      expect(initial.canonicalBytes).toBe(bytes);
+      extension.padding = "x".repeat(cap - bytes);
+      const atCap = affinityPrefixDigests(digestArgs("runtime", payload, "openai-responses"));
+      expect(atCap.canonicalBytes).toBe(cap);
+      expect(atCap.identifiable).toBe(true);
+      expect(atCap.nodes).toHaveLength(1);
+      const overCap = affinityPrefixDigests(
+        digestArgs(
+          "runtime",
+          { extension: { ...extension, padding: `${extension.padding}x` }, input: "U" },
+          "openai-responses",
+        ),
+      );
+      expect(overCap.canonicalBytes).toBe(cap + 1);
+      expect(overCap.identifiable).toBe(false);
+      expect(overCap.nodes).toEqual([]);
+      expect(overCap.parentTipDigest).toBeUndefined();
+    },
+  );
+
   it.each([true, false])(
     "15.11 evicting the current footprint suppresses binding: client=%s",
     async (client) => {
@@ -1313,9 +1352,11 @@ describe("cache affinity", () => {
       )!;
       expect(query.values.slice(-2)).toEqual([200, maxRecords]);
       expect(query.strings.join("")).toContain('"lastUsedAt" DESC, id DESC');
-      expect(db.cacheAffinityRecord.deleteMany).toHaveBeenCalledExactlyOnceWith({
-        where: { id: { in: ["live"] } },
+      const deletes = db.$executeRaw.mock.calls.filter(([sql]) => {
+        const text = (sql.strings ?? sql).join("");
+        return text.includes("DELETE FROM cache_affinity_record") && text.includes("SELECT unnest");
       });
+      expect(deletes.map(([, ids]) => ids)).toEqual([["live"]]);
     },
   );
 
@@ -1340,9 +1381,11 @@ describe("cache affinity", () => {
     expect(serializedWrites).not.toContain("lookup");
     expect(serializedWrites).toContain("grantee");
     expect(serializedWrites).toContain("pool-owner");
-    expect(db.cacheAffinityRecord.deleteMany).toHaveBeenCalledWith({
-      where: { id: { in: ["old"] } },
+    const deletes = db.$executeRaw.mock.calls.filter(([sql]) => {
+      const text = (sql.strings ?? sql).join("");
+      return text.includes("DELETE FROM cache_affinity_record") && text.includes("SELECT unnest");
     });
+    expect(deletes.map(([, ids]) => ids)).toEqual([["old"]]);
   });
 
   it("persists instruction prefixes for system-only Chat and writes digestVersion 5 on create only", async () => {
@@ -1494,11 +1537,12 @@ describe("cache affinity", () => {
     },
   );
 
-  it.each(
-    ["openai-chat", "anthropic-messages", "openai-responses"].flatMap((surface) =>
+  it.each([
+    ...["openai-chat", "anthropic-messages", "openai-responses"].flatMap((surface) =>
       ["parameter", "tools", "instructions"].map((layer) => ({ surface, layer })),
     ),
-  )(
+    { surface: "openai-chat", layer: "functions" },
+  ])(
     "R3 oversized root $layer degrades only bounded hints on $surface",
     async ({ surface, layer }) => {
       const huge = "x".repeat(2 * 1024 * 1024 + 1);
@@ -1515,6 +1559,9 @@ describe("cache affinity", () => {
             : { messages: [{ role: "system", content: instructions }, ...units] }),
         ...(layer === "parameter" ? { extension: { [huge]: 0 } } : {}),
         ...(layer === "tools" ? { tools: [{ schema: huge }] } : {}),
+        ...(layer === "functions"
+          ? { functions: [{ name: "legacy", parameters: { schema: huge } }] }
+          : {}),
       };
       const args = {
         ...digestArgs("runtime", request, surface),

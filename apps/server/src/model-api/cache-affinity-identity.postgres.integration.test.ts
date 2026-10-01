@@ -381,6 +381,136 @@ integration("cache-prefix identity #160", () => {
     );
   });
 
+  it.each(["empty", "replayed"] as const)(
+    "R5 bound %s delta re-stamps the existing tip through ON CONFLICT PG",
+    async (kind) => {
+      if (!db) return;
+      const args = { ...argsFor(await fixture()), surface: "openai-responses" };
+      const parent = await service.rememberAffinity({
+        ...args,
+        payload: { input: [u("create"), a("reply")] },
+      });
+      expect(parent).not.toBeNull();
+      const payload = {
+        input: kind === "empty" ? [] : [u("delta")],
+        previous_response_id: "parent",
+      };
+      const committed = await service.rememberAffinity({
+        ...args,
+        payload,
+        sessionBinding: parent!,
+      });
+      expect(committed).not.toBeNull();
+      const where = { poolId: args.poolId, sessionId: committed!.sessionId };
+      const committedTips = await db.cacheAffinityNode.findMany({
+        where: { ...where, isTip: true },
+      });
+      expect(committedTips.map((node) => node.nodeDigest)).toEqual([committed!.tipDigest]);
+      const originalTip = committedTips[0]!;
+      for (let replay = 1; replay <= 3; replay++) {
+        const now = new Date(args.now.getTime() + replay * 1000);
+        const refreshed = await service.rememberAffinity({
+          ...args,
+          now,
+          payload,
+          sessionBinding: parent!,
+        });
+        expect(refreshed).toMatchObject({
+          sessionId: committed!.sessionId,
+          tipDigest: committed!.tipDigest,
+          tipDepth: committed!.tipDepth,
+        });
+        const nodes = await db.cacheAffinityNode.findMany({ where });
+        expect(nodes).toHaveLength(kind === "empty" ? 2 : 3);
+        expect(nodes.filter((node) => node.isTip)).toEqual([
+          expect.objectContaining({
+            id: originalTip.id,
+            nodeDigest: committed!.tipDigest,
+            depth: committed!.tipDepth,
+          }),
+        ]);
+        expect(
+          nodes.every(
+            (node) => node.expiresAt.getTime() === now.getTime() + policy.ttlSeconds * 1000,
+          ),
+        ).toBe(true);
+      }
+    },
+  );
+
+  it.each(
+    (["existing", "parent"] as const).flatMap((read) =>
+      (["chain", "ancestor"] as const).map((expired) => ({ read, expired })),
+    ),
+  )(
+    "R5 expired $expired rows on $read node read cannot prove or resurrect ancestry PG",
+    async ({ read, expired }) => {
+      if (!db) return;
+      const args = { ...argsFor(await fixture()), surface: "openai-responses" };
+      const parent = await service.rememberAffinity({
+        ...args,
+        payload: { input: [u("create"), a("reply")], conversation: "parent-client" },
+      });
+      expect(parent).not.toBeNull();
+      const parentWhere = { poolId: args.poolId, sessionId: parent!.sessionId };
+      const oldNodes = await db.cacheAffinityNode.findMany({
+        where: parentWhere,
+        orderBy: { depth: "asc" },
+      });
+      expect(oldNodes).toHaveLength(2);
+      const expiredDigests =
+        expired === "chain" ? oldNodes.map((node) => node.nodeDigest) : [oldNodes[0]!.nodeDigest];
+      await db.cacheAffinityNode.updateMany({
+        where: { ...parentWhere, nodeDigest: { in: expiredDigests } },
+        data: { expiresAt: new Date(args.now.getTime() - 1) },
+      });
+      // The writer sweeps only 200 rows. An older backlog ensures the tested
+      // expired rows survive that sweep and reach the two ancestry reads.
+      await db.$executeRaw`INSERT INTO cache_affinity_node
+        (id, "userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest", "nodeDigest", depth, "sessionId", "isTip", "expiresAt")
+        SELECT 'expiry-gap-' || ${args.poolId} || i, ${args.resourceOwnerId}, ${args.ownerId}, ${args.poolId}, ${args.target.executionTargetId},
+          md5('backlog-root'), md5('backlog-' || i), 1, 'backlog-' || i, true, ${new Date(args.now.getTime() - 2000)}
+        FROM generate_series(1, 200) i`;
+      const payload = {
+        input: [u("delta")],
+        previous_response_id: "parent",
+        conversation: read === "existing" ? "parent-client" : "fresh-client",
+      };
+      const material = service.affinityPrefixDigests({
+        ...args,
+        payload,
+        sessionBinding: parent!,
+        runtimeIdentity: args.target.targetIdentity,
+      });
+      expect(material.parentTipDigest).toBe(parent!.tipDigest);
+      const next = await service.rememberAffinity({ ...args, payload, sessionBinding: parent! });
+      expect(next).not.toBeNull();
+      expect(next!.sessionId === parent!.sessionId).toBe(read === "existing");
+      const nodes = await db.cacheAffinityNode.findMany({
+        where: { poolId: args.poolId, sessionId: next!.sessionId },
+        orderBy: { depth: "asc" },
+      });
+      const expectedDigests =
+        expired === "chain" ? material.digests : [parent!.tipDigest, ...material.digests];
+      expect(nodes.map((node) => node.nodeDigest)).toEqual(expectedDigests);
+      expect(nodes.some((node) => expiredDigests.includes(node.nodeDigest))).toBe(false);
+      expect(nodes.filter((node) => node.isTip).map((node) => node.nodeDigest)).toEqual([
+        next!.tipDigest,
+      ]);
+      expect(nodes.every((node) => node.expiresAt > args.now)).toBe(true);
+      if (read === "parent") {
+        // The source rows remain expired; the durable binding does not renew them.
+        const remaining = await db.cacheAffinityNode.findMany({ where: parentWhere });
+        expect(remaining).toHaveLength(2);
+        expect(
+          remaining
+            .filter((node) => expiredDigests.includes(node.nodeDigest))
+            .every((node) => node.expiresAt <= args.now),
+        ).toBe(true);
+      }
+    },
+  );
+
   it.each(
     [false, true].flatMap((olderSameSession) =>
       [false, true].map((repeatRoot) => ({ olderSameSession, repeatRoot })),
@@ -2298,32 +2428,48 @@ integration("cache-prefix identity #160", () => {
   }
   const scaleMeasurements: {
     count: number;
+    backgroundCount: number;
     probe: { read: number; fetch: number };
     write: { read: number; fetch: number };
   }[] = [];
-  it.each([10000, 100000])(
-    "AC-08/16/61 %i sessions sharing u1: REAL resolution and writer use bounded index work",
-    async (count) => {
-      if (!db) return;
-      const args = argsFor(await fixture());
-      const payload = { messages: baseHistory };
-      const material = service.affinityPrefixDigests({
-        ...args,
-        runtimeIdentity: args.target.targetIdentity,
-        payload,
-      });
-      await db.$executeRaw`INSERT INTO cache_affinity_node
+  async function seedScale(count: number) {
+    if (!db) throw new Error("database unavailable");
+    const args = argsFor(await fixture());
+    const payload = { messages: baseHistory };
+    const material = service.affinityPrefixDigests({
+      ...args,
+      runtimeIdentity: args.target.targetIdentity,
+      payload,
+    });
+    // Avoid the accidental id/heap correlation of a fresh ordered INSERT.
+    // Reused heaps need not have that correlation; exercise the expensive
+    // point-lookup cost on fresh databases too, without forcing planner flags.
+    await db.$executeRaw`INSERT INTO cache_affinity_node
         (id, "userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest", "nodeDigest", depth, "sessionId", "isTip", "expiresAt")
         SELECT 'scale-' || ${args.poolId} || i, ${args.resourceOwnerId}, ${args.ownerId}, ${args.poolId}, ${args.target.executionTargetId},
           ${material.rootDigest}, ${material.nodes[0]!.digest}, 1, 'scale-' || ${args.poolId} || i, false, ${new Date(args.now.getTime() + 60000)}
-        FROM generate_series(1, ${count}) i`;
-      // Real per-session footprints exercise retention too, not an emulated INSERT.
-      await db.$executeRaw`INSERT INTO cache_affinity_record
+        FROM generate_series(1, ${count}) i ORDER BY md5(i::text)`;
+    // Real per-session footprints exercise retention too, not an emulated INSERT.
+    await db.$executeRaw`INSERT INTO cache_affinity_record
         (id, "userId", "tenantUserId", "poolId", "executionTargetId", "targetIdentity", "bindingDigest", "conversationDigest", "sessionId", "prefixDepth", "expiresAt", "lastUsedAt")
         SELECT 'scale-' || ${args.poolId} || i, ${args.resourceOwnerId}, ${args.ownerId}, ${args.poolId}, ${args.target.executionTargetId},
           ${args.target.targetIdentity}, ${material.bindingDigest}, md5('footprint-' || i), 'scale-' || ${args.poolId} || i, 0,
           ${new Date(args.now.getTime() + 60000)}, ${args.now}
-        FROM generate_series(1, ${count}) i`;
+        FROM generate_series(1, ${count}) i ORDER BY md5(i::text)`;
+    return { args, payload, material };
+  }
+  it.each(
+    [10000, 100000].flatMap((count) =>
+      [0, 10000].map((backgroundCount) => ({ count, backgroundCount })),
+    ),
+  )(
+    "AC-08/16/61 $count sessions sharing u1: REAL resolution and writer use bounded index work with $backgroundCount other-owner rows",
+    async ({ count, backgroundCount }) => {
+      if (!db) return;
+      const { args, payload, material } = await seedScale(count);
+      // Keep the original single-owner cases, and also prove that statistics
+      // spanning another owner do not turn the scoped operation into a scan.
+      if (backgroundCount) await seedScale(backgroundCount);
       // Equalize visibility/dead tuples as well as statistics: idx_tup_fetch
       // otherwise varies with autovacuum timing rather than population size.
       await db.$executeRawUnsafe("VACUUM ANALYZE cache_affinity_node");
@@ -2350,9 +2496,9 @@ integration("cache-prefix identity #160", () => {
       expect(execution.read).toBeGreaterThanOrEqual(0);
       expect(execution.fetch).toBeGreaterThanOrEqual(0);
       const write = await measure(() => service.rememberAffinity({ ...args, payload }));
-      scaleMeasurements.push({ count, probe: execution, write });
+      scaleMeasurements.push({ count, backgroundCount, probe: execution, write });
       process.stdout.write(
-        `${JSON.stringify({ count, probe: { read: probe.read, fetch: probe.fetch }, planning: { read: planning.read, fetch: planning.fetch }, execution, write: { read: write.read, fetch: write.fetch } })}\n`,
+        `${JSON.stringify({ count, backgroundCount, probe: { read: probe.read, fetch: probe.fetch }, planning: { read: planning.read, fetch: planning.fetch }, execution, write: { read: write.read, fetch: write.fetch } })}\n`,
       );
       expect(probe.result).toBeNull();
       expect(probe.read).toBeGreaterThan(0);
@@ -2375,12 +2521,27 @@ integration("cache-prefix identity #160", () => {
     const where = { userId: { in: [...fixtureOwnerIds] } };
     expect(await db.cacheAffinityNode.count({ where })).toBe(0);
     expect(await db.cacheAffinityRecord.count({ where })).toBe(0);
-    expect(scaleMeasurements.map(({ count }) => count)).toEqual([10000, 100000]);
-    for (const kind of ["probe", "write"] as const) {
-      for (const counter of ["read", "fetch"] as const) {
-        const small = scaleMeasurements[0]![kind][counter];
-        const large = scaleMeasurements[1]![kind][counter];
-        expect(large / Math.max(1, small), `${kind}.${counter} 100k/10k`).toBeLessThanOrEqual(2);
+    expect(scaleMeasurements.map(({ count, backgroundCount }) => [count, backgroundCount])).toEqual(
+      [
+        [10000, 0],
+        [10000, 10000],
+        [100000, 0],
+        [100000, 10000],
+      ],
+    );
+    for (const backgroundCount of [0, 10000]) {
+      const measurements = scaleMeasurements.filter(
+        (row) => row.backgroundCount === backgroundCount,
+      );
+      for (const kind of ["probe", "write"] as const) {
+        for (const counter of ["read", "fetch"] as const) {
+          const small = measurements[0]![kind][counter];
+          const large = measurements[1]![kind][counter];
+          expect(
+            large / Math.max(1, small),
+            `${kind}.${counter} 100k/10k, other-owner=${backgroundCount}`,
+          ).toBeLessThanOrEqual(2);
+        }
       }
     }
   });
