@@ -250,7 +250,12 @@ RENAME_SWAP. Overwrite rename on a filesystem without exchange restores its
 captured source and returns `unsafe_filesystem` (or `uncertain_outcome` if
 restoration cannot settle); a vacate-both publish design is future work.
 Plain rename likewise refuses with `unsafe_filesystem` when it cannot avoid
-overwriting an existing destination.
+overwriting an existing destination. Private recovery objects are proven by
+a proof opened on their own name; reconciling an ambiguous publish error compares
+the published name with the temp, which needs stable inode numbers across names, so
+on a mount without them (some FUSE filesystems, for example sshfs) such an error is
+reported as `uncertain_outcome` with the recovery paths. Allocating the recovery
+directory fails closed with `io_error` (EEXIST) after 16 name collisions.
 
 POSIX does not exclude other same-user processes. Every disposal compares the
 private slot with a live held fd, which pins the inode during identity proof;
