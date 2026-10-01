@@ -2898,7 +2898,10 @@ export async function dispatchPublicOverflow(
       }).catch(() => undefined);
       continue;
     }
-    const renderedInputTokens = conservativeSerializedInputTokens(upstream.body.byteLength);
+    // Prefer the request's local estimate when present. Byte-per-token is
+    // only the fallback when that count is missing.
+    const renderedInputTokens =
+      request.estimatedInputTokens ?? conservativeSerializedInputTokens(upstream.body.byteLength);
     const renderedLiability = liabilityFromPricing({
       estimatedInputTokens: renderedInputTokens,
       requestedOutputTokens,

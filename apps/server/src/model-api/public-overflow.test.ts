@@ -1281,6 +1281,60 @@ describe("public overflow compatibility", () => {
     expect(() => conservativeSerializedInputTokens(-1)).toThrow(/non-negative/u);
   });
 
+  it("admits a 200 KB English body on a 128k target using the request estimate", () => {
+    const bodyBytes = 200_000;
+    const requestEstimate = BigInt(Math.ceil((bodyBytes / 3) * 1.2));
+    const byteEstimate = conservativeSerializedInputTokens(bodyBytes);
+    expect(byteEstimate).toBeGreaterThan(128_000n);
+    expect(requestEstimate + 4_096n).toBeLessThanOrEqual(128_000n);
+    const liability = conservativeProviderLiability({
+      estimatedInputTokens: requestEstimate,
+      requestedOutputTokens: 4_096n,
+    });
+    expect(liability.tokens).toBeGreaterThanOrEqual(requestEstimate);
+    expect(
+      publicTargetCompatibility(
+        {
+          contextWindow: 128_000,
+          maxOutputTokens: 4_096,
+          protocol: "openai",
+          nativeProtocols: ["openai"],
+          nativeSurfaces: ["openai-chat"],
+          supportsStreaming: true,
+          supportedFeatures: [],
+        },
+        {
+          ...request,
+          requestedOutputTokens: 4_096n,
+          estimatedInputTokens: requestEstimate,
+          liability,
+        },
+      ),
+    ).toBe("COMPATIBLE");
+    expect(
+      publicTargetCompatibility(
+        {
+          contextWindow: 128_000,
+          maxOutputTokens: 4_096,
+          protocol: "openai",
+          nativeProtocols: ["openai"],
+          nativeSurfaces: ["openai-chat"],
+          supportsStreaming: true,
+          supportedFeatures: [],
+        },
+        {
+          ...request,
+          requestedOutputTokens: 4_096n,
+          estimatedInputTokens: byteEstimate,
+          liability: conservativeProviderLiability({
+            estimatedInputTokens: byteEstimate,
+            requestedOutputTokens: 4_096n,
+          }),
+        },
+      ),
+    ).toBe("CONTEXT_EXCEEDED");
+  });
+
   it("merges split Anthropic usage without erasing earlier billable categories", () => {
     const encode = (value: string) => new TextEncoder().encode(value);
     expect(
