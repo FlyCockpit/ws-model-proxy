@@ -1,3 +1,5 @@
+import { estimatePayloadTokens } from "./payload-estimate.js";
+
 export type ContextCountMethod =
   | "NATIVE"
   | "TOKENIZER_TEMPLATE"
@@ -19,25 +21,25 @@ export async function countSerializedRequestContext({
   counters = [],
   safetyMargin = 1.2,
   useTokenEstimate = true,
+  imageTokenAllowance,
   signal,
 }: {
   input: unknown;
   counters?: readonly ContextCounter[];
   safetyMargin?: number;
   useTokenEstimate?: boolean;
+  imageTokenAllowance?: number | null;
   signal?: AbortSignal;
 }): Promise<ContextCountTelemetry> {
   if (signal?.aborted) throw signal.reason;
   const serialized = JSON.stringify(input);
   if (serialized === undefined) throw new TypeError("Context input must be JSON serializable.");
+  const payloadEstimate = estimatePayloadTokens(input, { safetyMargin, imageTokenAllowance });
   const estimateCounter: ContextCounter = {
     async count() {
       if (!useTokenEstimate) return null;
-      // Deliberately conservative for mixed text/JSON/tool schemas. This is
-      // never exact and exists below native/template counters in the hierarchy.
-      const utf8Bytes = new TextEncoder().encode(serialized).byteLength;
       return {
-        tokens: Math.ceil((utf8Bytes / 3) * safetyMargin),
+        tokens: payloadEstimate.tokens,
         method: "TOKEN_ESTIMATE",
         exact: false,
       };

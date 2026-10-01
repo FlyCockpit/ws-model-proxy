@@ -1370,6 +1370,7 @@ export function CapacitySetupForm({
           : "LIMITED"
         : newCapacityDefaults.physicalMaxContextMode,
       physicalMaxContext: capacity?.physicalMaxContext ?? newCapacityDefaults.physicalMaxContext,
+      imageTokenAllowance: capacity?.imageTokenAllowance ?? newCapacityDefaults.imageTokenAllowance,
       countStrategy: (capacity?.countStrategy ?? newCapacityDefaults.countStrategy) as
         | "CONSERVATIVE_ESTIMATE"
         | "ENGINE_REPORTED"
@@ -1514,6 +1515,31 @@ export function CapacitySetupForm({
                     {t("dashboard:pools.capacity.strategies.registeredRequirement")}
                   </p>
                 ) : null}
+              </div>
+            )}
+          </form.Field>
+          <form.Field name="imageTokenAllowance">
+            {(field) => (
+              <div className="space-y-2 sm:col-span-2">
+                <Label htmlFor="capacity-imageTokenAllowance">
+                  {t("dashboard:pools.capacity.fields.imageTokenAllowance")}
+                </Label>
+                <Input
+                  id="capacity-imageTokenAllowance"
+                  className="min-h-11"
+                  type="number"
+                  min={1}
+                  inputMode="numeric"
+                  value={field.state.value ?? ""}
+                  onBlur={field.handleBlur}
+                  onChange={(event) => {
+                    const raw = event.target.value;
+                    field.handleChange(raw === "" ? null : Number(raw));
+                  }}
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t("dashboard:pools.capacity.fields.imageTokenAllowanceHint")}
+                </p>
               </div>
             )}
           </form.Field>

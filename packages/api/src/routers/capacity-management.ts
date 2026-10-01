@@ -121,6 +121,7 @@ const capacityFields = {
   cacheNamespace: z.string().trim().max(500).nullable().optional(),
   hardConcurrencyLimit: optionalLimit,
   physicalMaxContext: optionalLimit,
+  imageTokenAllowance: optionalLimit.optional(),
   countStrategy,
 };
 

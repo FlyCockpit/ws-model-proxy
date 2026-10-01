@@ -39,6 +39,7 @@ import {
   rememberAffinity,
 } from "./cache-affinity.js";
 import { capacityLeaseLostSignal } from "./capacity/lease-loss.js";
+import { estimatePayloadTokens } from "./capacity/payload-estimate.js";
 import { type ExternalEgressConsent, isIssuedExternalConsent } from "./external-route.js";
 import {
   applyOpenRouterDataCollection,
@@ -2898,12 +2899,11 @@ export async function dispatchPublicOverflow(
       }).catch(() => undefined);
       continue;
     }
-    // Prefer the request's local estimate when present. Byte-per-token is
-    // only the fallback when that count is missing.
+    const byteEstimate = conservativeSerializedInputTokens(upstream.body.byteLength);
     const renderedInputTokens =
-      request.estimatedInputTokens ?? conservativeSerializedInputTokens(upstream.body.byteLength);
+      payloadAwareInputTokens(upstream.body) ?? request.estimatedInputTokens ?? byteEstimate;
     const renderedLiability = liabilityFromPricing({
-      estimatedInputTokens: renderedInputTokens,
+      estimatedInputTokens: byteEstimate,
       requestedOutputTokens,
       pricing,
     });
@@ -3974,6 +3974,19 @@ export function conservativeSerializedInputTokens(serializedBytes: number): bigi
     throw new TypeError("serializedBytes must be a non-negative safe integer");
   const bytes = BigInt(serializedBytes);
   return (bytes * 11n + 9n) / 10n + 64n;
+}
+
+/** Context-fit estimate for a rendered JSON body. Byte-per-token stays on the
+ * budget hold, which is settled from real usage. */
+export function payloadAwareInputTokens(serializedBody: Uint8Array): bigint | undefined {
+  try {
+    const parsed: unknown = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(serializedBody),
+    );
+    return BigInt(estimatePayloadTokens(parsed).tokens);
+  } catch {
+    return undefined;
+  }
 }
 
 export type { RawProviderUsage };

@@ -1146,6 +1146,56 @@ describe("model API routes", () => {
     expect(publicOverflow.dispatch).not.toHaveBeenCalled();
   });
 
+  it("admits a Chat Test image on a 32k pool member", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "vision-member",
+        discoveredModelId: "vision-model",
+        upstreamModelId: "vision-upstream",
+        cliDeviceId: "cli-vision",
+        physicalMaxContext: 32_768,
+        countStrategy: "CONSERVATIVE_ESTIMATE",
+      }),
+    ]);
+    const header = Buffer.alloc(24);
+    header.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+    header[11] = 13;
+    header.write("IHDR", 12);
+    header.writeUInt32BE(64, 16);
+    header.writeUInt32BE(64, 20);
+    const binary = Buffer.alloc(Math.ceil((400_000 * 3) / 4));
+    header.copy(binary);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-vision"];
+    const responsePromise = appWith(manager).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "describe this" },
+              {
+                type: "image_url",
+                image_url: { url: `data:image/png;base64,${binary.toString("base64")}` },
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+  });
+
   describe("S-A: wait for the cache holder", () => {
     const affineMembers = (options: { cacheHolderWaitMs?: number | null } = {}) => [
       poolMemberRow({

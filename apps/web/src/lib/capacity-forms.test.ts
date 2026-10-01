@@ -52,7 +52,17 @@ describe("capacity form", () => {
       runtimeModel: "model",
       runtimeIdentityKey: "key",
       tokenizer: null,
+      imageTokenAllowance: null,
     });
+    expect(
+      capacityMutationPayload({
+        ...newCapacityDefaults,
+        label: "GPU",
+        runtimeModel: "model",
+        runtimeIdentityKey: "key",
+        imageTokenAllowance: 2048,
+      }),
+    ).toMatchObject({ imageTokenAllowance: 2048 });
   });
 
   it("persists explicit unlimited physical limits without coercing fallback values", () => {

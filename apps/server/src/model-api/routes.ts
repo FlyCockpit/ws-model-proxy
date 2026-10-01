@@ -210,6 +210,7 @@ import {
   type PublicOverflowRequest,
   type PublicOverflowSkipReason,
   type PublicProviderTarget,
+  payloadAwareInputTokens,
   publicTargetCompatibility,
   resolvePublicProviderExecution,
 } from "./public-overflow.js";
@@ -537,6 +538,7 @@ async function nativeContextCount({
       input: operation.contextInput,
       counters: useRegistry && registeredCounter ? [registeredCounter] : [],
       useTokenEstimate: true,
+      imageTokenAllowance: capacity?.imageTokenAllowance,
       signal: request.signal,
     });
   };
@@ -716,6 +718,7 @@ const inferenceCapacityRelaySelect = {
   id: true,
   hardConcurrencyLimit: true,
   physicalMaxContext: true,
+  imageTokenAllowance: true,
   countStrategy: true,
   runtimeIdentityKey: true,
   runtimeModel: true,
@@ -4371,7 +4374,8 @@ async function relayPool({
     const estimatedInputTokens =
       operation.contextCount?.tokens !== undefined
         ? BigInt(operation.contextCount.tokens)
-        : conservativeSerializedInputTokens(publicRequestBytes);
+        : (payloadAwareInputTokens(built.body) ??
+          conservativeSerializedInputTokens(publicRequestBytes));
     const canonical = operation.adaptation
       ? (() => {
           try {
@@ -8747,7 +8751,8 @@ async function relayBoundProviderResponse(input: {
       : 0n;
   const estimatedInputTokens = input.contextInput
     ? input.contextCount?.tokens === undefined
-      ? conservativeSerializedInputTokens(input.body.byteLength)
+      ? (payloadAwareInputTokens(input.body) ??
+        conservativeSerializedInputTokens(input.body.byteLength))
       : BigInt(input.contextCount.tokens)
     : 0n;
   const ownKey = input.stickyRoute.route === "own-key";

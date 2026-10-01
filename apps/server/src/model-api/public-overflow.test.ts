@@ -29,6 +29,7 @@ import {
   joinProviderPath,
   matchesExactResponsesBinding,
   parseProviderUsage,
+  payloadAwareInputTokens,
   providerHealthOutcome,
   publicTargetCompatibility,
   resolvePublicProviderExecution,
@@ -1333,6 +1334,59 @@ describe("public overflow compatibility", () => {
         },
       ),
     ).toBe("CONTEXT_EXCEEDED");
+  });
+
+  it("admits an image request on a 128k provider using the payload estimate", () => {
+    const header = Buffer.alloc(24);
+    header.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+    header[11] = 13;
+    header.write("IHDR", 12);
+    header.writeUInt32BE(64, 16);
+    header.writeUInt32BE(64, 20);
+    const binary = Buffer.alloc(300_000);
+    header.copy(binary);
+    const payload = {
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image_url",
+              image_url: { url: `data:image/png;base64,${binary.toString("base64")}` },
+            },
+          ],
+        },
+      ],
+    };
+    const body = new TextEncoder().encode(JSON.stringify(payload));
+    const estimate = payloadAwareInputTokens(body);
+    expect(estimate).toBeDefined();
+    expect(conservativeSerializedInputTokens(body.byteLength)).toBeGreaterThan(128_000n);
+    expect(estimate! + 4_096n).toBeLessThanOrEqual(128_000n);
+    const liability = conservativeProviderLiability({
+      estimatedInputTokens: conservativeSerializedInputTokens(body.byteLength),
+      requestedOutputTokens: 4_096n,
+    });
+    expect(liability.tokens).toBeGreaterThanOrEqual(estimate!);
+    expect(
+      publicTargetCompatibility(
+        {
+          contextWindow: 128_000,
+          maxOutputTokens: 4_096,
+          protocol: "openai",
+          nativeProtocols: ["openai"],
+          nativeSurfaces: ["openai-chat"],
+          supportsStreaming: true,
+          supportedFeatures: [],
+        },
+        {
+          ...request,
+          requestedOutputTokens: 4_096n,
+          estimatedInputTokens: estimate,
+          liability,
+        },
+      ),
+    ).toBe("COMPATIBLE");
   });
 
   it("merges split Anthropic usage without erasing earlier billable categories", () => {

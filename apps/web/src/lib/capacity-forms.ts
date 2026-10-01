@@ -21,6 +21,7 @@ export const capacityFormSchema = z.object({
   hardConcurrencyLimit: z.number().int().min(1).max(10_000),
   physicalMaxContextMode: z.enum(finiteLimitModes),
   physicalMaxContext: z.number().int().min(1).max(100_000_000),
+  imageTokenAllowance: z.number().int().min(1).max(10_000_000).nullable(),
   countStrategy: z.enum(capacityCountStrategies),
   runtimeRevision: z.string().trim().max(500),
   tokenizer: z.string().trim().max(500),
@@ -37,6 +38,7 @@ export const newCapacityDefaults: CapacityFormValue = {
   hardConcurrencyLimit: 1,
   physicalMaxContextMode: "LIMITED",
   physicalMaxContext: 32_768,
+  imageTokenAllowance: null,
   countStrategy: "CONSERVATIVE_ESTIMATE",
   runtimeRevision: "",
   tokenizer: "",
@@ -52,6 +54,7 @@ export function capacityMutationPayload(value: CapacityFormValue) {
       value.hardConcurrencyMode === "LIMITED" ? value.hardConcurrencyLimit : null,
     physicalMaxContext:
       value.physicalMaxContextMode === "LIMITED" ? value.physicalMaxContext : null,
+    imageTokenAllowance: value.imageTokenAllowance,
     countStrategy: value.countStrategy,
     runtimeRevision: value.runtimeRevision.trim() || null,
     tokenizer: value.tokenizer.trim() || null,

@@ -84,6 +84,7 @@ ALTER TABLE inference_capacity DROP CONSTRAINT IF EXISTS inference_capacity_limi
 ALTER TABLE inference_capacity ADD CONSTRAINT inference_capacity_limits_check CHECK (
   ("hardConcurrencyLimit" IS NULL OR "hardConcurrencyLimit" > 0)
   AND ("physicalMaxContext" IS NULL OR "physicalMaxContext" > 0)
+  AND ("imageTokenAllowance" IS NULL OR "imageTokenAllowance" > 0)
 );
 
 ALTER TABLE capacity_runtime DROP CONSTRAINT IF EXISTS capacity_runtime_scheduler_check;

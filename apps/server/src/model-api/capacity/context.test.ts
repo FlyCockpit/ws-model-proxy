@@ -1,6 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
 import { contextFitsLimits, countContext, countSerializedRequestContext } from "./context.js";
 
+function largePngDataUrl(width: number, height: number, base64Chars: number): string {
+  const header = Buffer.alloc(24);
+  header.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+  header[11] = 13;
+  header.write("IHDR", 12);
+  header.writeUInt32BE(width, 16);
+  header.writeUInt32BE(height, 20);
+  const binary = Buffer.alloc(Math.ceil((base64Chars * 3) / 4));
+  header.copy(binary);
+  return `data:image/png;base64,${binary.toString("base64")}`;
+}
+
 describe("context counting hierarchy", () => {
   it("uses the first available counter", async () => {
     const unavailable = { count: vi.fn().mockResolvedValue(null) };
@@ -108,5 +120,32 @@ describe("context counting hierarchy", () => {
         contextMargin: 10,
       }),
     ).toBe(false);
+  });
+
+  it("admits a 400 KB base64 image on a 32k member", async () => {
+    const input = {
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "describe" },
+            {
+              type: "image_url",
+              image_url: { url: largePngDataUrl(64, 64, 400_000) },
+            },
+          ],
+        },
+      ],
+    };
+    const count = await countSerializedRequestContext({ input });
+    const rawBytes = new TextEncoder().encode(JSON.stringify(input)).byteLength;
+    expect(Math.ceil((rawBytes / 3) * 1.2)).toBeGreaterThan(32_768);
+    expect(count.tokens).toBeLessThanOrEqual(32_768);
+    expect(
+      contextFitsLimits({
+        count,
+        physicalMaxContext: 32_768,
+      }),
+    ).toBe(true);
   });
 });

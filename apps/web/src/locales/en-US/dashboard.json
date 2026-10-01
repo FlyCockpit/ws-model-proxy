@@ -607,6 +607,8 @@
         "directConcurrencyLimit": "Direct concurrency ceiling",
         "capacityConcurrencyLimit": "Member concurrency ceiling",
         "physicalMaxContext": "Maximum context tokens",
+        "imageTokenAllowance": "Image token allowance (optional)",
+        "imageTokenAllowanceHint": "Used when image size cannot be read from the file header, and as a cap on the header-based count. Default 4096.",
         "countStrategy": "Context counting",
         "runtimeRevision": "Runtime revision (optional)",
         "tokenizer": "Tokenizer (optional)",

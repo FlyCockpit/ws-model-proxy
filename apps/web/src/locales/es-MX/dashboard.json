@@ -607,6 +607,8 @@
         "directConcurrencyLimit": "Límite de concurrencia directa",
         "capacityConcurrencyLimit": "Límite de concurrencia del miembro",
         "physicalMaxContext": "Máximo de tokens de contexto",
+        "imageTokenAllowance": "Asignación de tokens de imagen (opcional)",
+        "imageTokenAllowanceHint": "Se usa cuando no se puede leer el tamaño de la imagen en el encabezado del archivo, y como tope del conteo por encabezado. El valor predeterminado es 4096.",
         "countStrategy": "Conteo de contexto",
         "runtimeRevision": "Revisión del runtime (opcional)",
         "tokenizer": "Tokenizador (opcional)",

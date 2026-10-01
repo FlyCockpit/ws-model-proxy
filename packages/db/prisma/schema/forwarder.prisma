@@ -1219,6 +1219,8 @@ model InferenceCapacity {
   /// null = unlimited) are only changed through user-facing writes.
   hardConcurrencyLimitSource CapacityLimitSource   @default(AUTO)
   physicalMaxContext         Int?
+  /// Per-image token cap when the header has no size; also caps the header formula.
+  imageTokenAllowance        Int?
   countStrategy              CapacityCountStrategy @default(CONSERVATIVE_ESTIMATE)
   /// Stable, application-computed fingerprint for the physical runtime tuple.
   runtimeIdentityKey         String
