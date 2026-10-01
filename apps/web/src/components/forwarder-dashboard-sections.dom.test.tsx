@@ -30,6 +30,9 @@ vi.mock("@ws-model-proxy/ui/components/sileo", () => ({
 vi.mock("@/components/cli-device-metric-sources", () => ({
   CliDeviceMetricSources: () => null,
 }));
+vi.mock("@/components/cli-device-engine-adapters", () => ({
+  CliDeviceEngineAdapters: () => null,
+}));
 
 vi.mock("@/utils/orpc", () => {
   const query = (key: string, data: unknown) => ({

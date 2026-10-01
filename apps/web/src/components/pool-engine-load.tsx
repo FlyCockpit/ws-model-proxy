@@ -1,12 +1,19 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
+import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { Switch } from "@ws-model-proxy/ui/components/switch";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
+import {
+  ENGINE_LOAD_SPARKLINE_HEIGHT_PX,
+  EngineLoadSparkline,
+  type EngineLoadSparklinePoint,
+} from "@/components/engine-load-sparkline";
+import { InlineRetry } from "@/components/inline-retry";
 import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
@@ -14,10 +21,22 @@ type RoutingRulesView = Awaited<
   ReturnType<AppRouterClient["forwarderManagement"]["getPoolRoutingRules"]>
 >;
 type MemberView = RoutingRulesView["members"][number];
+type HistoryView = Awaited<
+  ReturnType<AppRouterClient["forwarderManagement"]["getEngineLoadHistory"]>
+>;
 
-function Pill({ children, tone }: { children: ReactNode; tone: "warn" | "muted" }) {
+function Pill({
+  children,
+  tone,
+  testId,
+}: {
+  children: ReactNode;
+  tone: "warn" | "muted";
+  testId?: string;
+}) {
   return (
     <span
+      data-testid={testId}
       className={cn(
         "inline-flex min-h-6 items-center border px-2 text-xs font-medium",
         tone === "warn"
@@ -34,16 +53,34 @@ function percent(value: number): string {
   return `${Math.round(value * 100)}%`;
 }
 
+function provenanceKey(
+  load: MemberView["engineLoad"],
+  seriesSource: string | null | undefined,
+): string {
+  if (load.loadSource === "custom" || seriesSource === "custom") return "custom";
+  if (seriesSource === "llama.cpp-slots" || load.engineKind === "LLAMA_CPP")
+    return "builtinLlamaSlots";
+  if (seriesSource === "llama.cpp-metrics") return "builtinLlamaMetrics";
+  if (seriesSource === "sglang-metrics" || load.engineKind === "SGLANG") return "builtinSglang";
+  return "builtinVllm";
+}
+
 /**
- * Per-member live engine load (S-D): running/waiting/KV %, a stale badge and
- * the "use engine load" override. Engine load only adds FULL; lease counts
- * stay authoritative. Active prefix-eviction cuts explain the effective KV budget.
+ * Per-member live engine load (S-D): running/waiting/KV %, a sparkline of the
+ * last 30 minutes, a stale badge and the "use engine load" override.
  */
-export function PoolEngineLoad({ members }: { members: MemberView[] }) {
+export function PoolEngineLoad({ poolId, members }: { poolId: string; members: MemberView[] }) {
   const { t } = useTranslation(["dashboard"]);
+  const history = useQuery({
+    ...orpc.forwarderManagement.getEngineLoadHistory.queryOptions({ input: { poolId } }),
+    refetchInterval: historyRefetchInterval,
+  });
   if (members.length === 0) return null;
+  const byMember = new Map(
+    (history.data?.members ?? []).map((entry) => [entry.poolMemberId, entry]),
+  );
   return (
-    <section className="space-y-2" aria-labelledby="pool-engine-load-title">
+    <section className="min-w-0 space-y-2" aria-labelledby="pool-engine-load-title">
       <div>
         <h4 id="pool-engine-load-title" className="text-sm font-semibold">
           {t("dashboard:pools.engineLoad.title")}
@@ -52,16 +89,35 @@ export function PoolEngineLoad({ members }: { members: MemberView[] }) {
           {t("dashboard:pools.engineLoad.description")}
         </p>
       </div>
-      <ul className="space-y-2">
+      {history.isError ? (
+        <InlineRetry
+          message={t("dashboard:pools.engineLoad.loadFailed")}
+          onRetry={() => void history.refetch()}
+        />
+      ) : null}
+      <ul className="min-w-0 space-y-2">
         {members.map((member) => (
-          <EngineLoadRow key={member.poolMemberId} member={member} />
+          <EngineLoadRow
+            key={member.poolMemberId}
+            member={member}
+            history={byMember.get(member.poolMemberId) ?? null}
+            historyPending={history.isPending}
+          />
         ))}
       </ul>
     </section>
   );
 }
 
-function EngineLoadRow({ member }: { member: MemberView }) {
+function EngineLoadRow({
+  member,
+  history,
+  historyPending,
+}: {
+  member: MemberView;
+  history: HistoryView["members"][number] | null;
+  historyPending: boolean;
+}) {
   const { t } = useTranslation(["dashboard"]);
   const queryClient = useQueryClient();
   const save = useMutation({
@@ -78,6 +134,9 @@ function EngineLoadRow({ member }: { member: MemberView }) {
   });
   const load = member.engineLoad;
   const inputId = `engine-load-${member.poolMemberId}`;
+  const latestSource = [...(history?.series ?? [])].reverse().find((point) => !point.gap)?.source;
+  const series = toSparklinePoints(history?.series ?? []);
+  const hasChart = series.some((point) => !point.gap);
   return (
     <li className="min-w-0 space-y-2 border p-3">
       <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
@@ -115,7 +174,10 @@ function EngineLoadRow({ member }: { member: MemberView }) {
           />
         </div>
       ) : null}
-      <div className="flex flex-wrap items-center gap-2">
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
+        <Pill tone="muted" testId="engine-load-provenance">
+          {t(`dashboard:pools.engineLoad.provenance.${provenanceKey(load, latestSource)}`)}
+        </Pill>
         {load.loadSource === "custom" ? (
           <Pill tone="muted">{t("dashboard:pools.engineLoad.badges.custom")}</Pill>
         ) : null}
@@ -125,6 +187,8 @@ function EngineLoadRow({ member }: { member: MemberView }) {
           <Pill tone="muted">{t("dashboard:pools.engineLoad.badges.noSignal")}</Pill>
         ) : load.state === "stale" ? (
           <Pill tone="warn">{t("dashboard:pools.engineLoad.badges.stale")}</Pill>
+        ) : !load.live ? (
+          <Pill tone="muted">{t("dashboard:pools.engineLoad.badges.noReading")}</Pill>
         ) : load.full && load.enforced === false ? (
           <Pill tone="warn">{t("dashboard:pools.engineLoad.observeOnly")}</Pill>
         ) : load.full ? (
@@ -165,6 +229,92 @@ function EngineLoadRow({ member }: { member: MemberView }) {
           </>
         ) : null}
       </div>
+      {historyPending ? (
+        <Skeleton
+          className="w-full"
+          style={{ height: ENGINE_LOAD_SPARKLINE_HEIGHT_PX }}
+          data-testid="engine-load-sparkline-skeleton"
+          aria-busy="true"
+        />
+      ) : hasChart ? (
+        <EngineLoadSparkline
+          series={series}
+          threshold={history?.effectiveKvFullThreshold ?? load.effectiveKvFullThreshold}
+          caption={t("dashboard:pools.engineLoad.sparklineCaption")}
+          labels={sparklineLabels(t)}
+        />
+      ) : null}
     </li>
+  );
+}
+
+function sparklineLabels(t: ReturnType<typeof useTranslation>["t"]) {
+  return {
+    running: t("dashboard:pools.engineLoad.legendRunning"),
+    waiting: t("dashboard:pools.engineLoad.legendWaiting"),
+    kvUsage: t("dashboard:pools.engineLoad.legendKv"),
+    kvOccupancy: t("dashboard:pools.engineLoad.legendOccupancy"),
+    threshold: t("dashboard:pools.engineLoad.legendThreshold"),
+  };
+}
+
+function toSparklinePoints(
+  series: HistoryView["members"][number]["series"],
+): EngineLoadSparklinePoint[] {
+  return series.map((point) => ({
+    start: point.start,
+    running: point.running,
+    waiting: point.waiting,
+    kvUsage: point.kvUsage,
+    kvOccupancy: point.kvOccupancy,
+    gap: point.gap,
+  }));
+}
+
+function historyRefetchInterval(): number | false {
+  return typeof document !== "undefined" && document.visibilityState === "visible" ? 10_000 : false;
+}
+
+/**
+ * Compact 30-minute engine-load chart on a capacity card when exactly one
+ * endpoint feeds that capacity.
+ */
+export function CapacityEngineLoadChart({ capacityId }: { capacityId: string }) {
+  const { t } = useTranslation(["dashboard"]);
+  const history = useQuery({
+    ...orpc.forwarderManagement.getEngineLoadHistory.queryOptions({ input: { capacityId } }),
+    refetchInterval: historyRefetchInterval,
+  });
+  const member = history.data?.members[0];
+  const series = toSparklinePoints(member?.series ?? []);
+  const hasChart = series.some((point) => !point.gap);
+  if (history.isPending) {
+    return (
+      <Skeleton
+        className="mt-2 w-full"
+        style={{ height: ENGINE_LOAD_SPARKLINE_HEIGHT_PX }}
+        data-testid="engine-load-sparkline-skeleton"
+        aria-busy="true"
+      />
+    );
+  }
+  if (history.isError) {
+    return (
+      <InlineRetry
+        message={t("dashboard:pools.engineLoad.loadFailed")}
+        onRetry={() => void history.refetch()}
+      />
+    );
+  }
+  if (!member || !hasChart) return null;
+  return (
+    <div className="mt-2 min-w-0" data-testid="capacity-engine-load-chart">
+      <EngineLoadSparkline
+        series={series}
+        threshold={member.effectiveKvFullThreshold}
+        caption={t("dashboard:pools.engineLoad.sparklineCaption")}
+        labels={sparklineLabels(t)}
+      />
+    </div>
   );
 }

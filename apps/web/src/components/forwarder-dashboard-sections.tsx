@@ -41,6 +41,7 @@ import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
 import { CliAgentActivity } from "@/components/cli-agent-activity";
+import { CliDeviceEngineAdapters } from "@/components/cli-device-engine-adapters";
 import { CliDeviceFeatureSwitches } from "@/components/cli-device-feature-switches";
 import { CliDeviceMetricSources } from "@/components/cli-device-metric-sources";
 import { CliDeviceRename } from "@/components/cli-device-rename";
@@ -837,6 +838,7 @@ export function CliEndpointsModelsSection() {
 
               <CliAgentActivity cliDeviceId={device.id} deviceName={device.displayName} />
               <CliDeviceMetricSources cliDeviceId={device.id} />
+              <CliDeviceEngineAdapters cliDeviceId={device.id} />
 
               <div className="divide-y">
                 {device.endpoints.length === 0 ? (

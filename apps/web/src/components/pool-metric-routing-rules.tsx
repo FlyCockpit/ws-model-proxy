@@ -126,7 +126,7 @@ export function PoolMetricRoutingRules({ poolId }: { poolId: string }) {
           ]),
         ].sort()}
       />
-      <PoolEngineLoad members={view.data.members} />
+      <PoolEngineLoad poolId={poolId} members={view.data.members} />
       <MemberVerdicts view={view.data} />
       <DeviceSeries view={view.data} />
     </section>

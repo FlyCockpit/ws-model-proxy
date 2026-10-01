@@ -10,6 +10,10 @@ import esDashboard from "../locales/es-MX/dashboard.json";
 const state = vi.hoisted(() => ({
   view: null as Record<string, unknown> | null,
   mutationCalls: [] as unknown[],
+  history: { members: [] as unknown[] } as { members: unknown[] },
+  historyPending: false,
+  historyError: false,
+  historyInputs: [] as unknown[],
 }));
 
 vi.mock("react-i18next", () => ({
@@ -51,6 +55,20 @@ vi.mock("@/utils/orpc", () => ({
           },
           ...options,
         }),
+      },
+      getEngineLoadHistory: {
+        queryOptions: ({ input }: { input: unknown }) => {
+          state.historyInputs.push(input);
+          return {
+            queryKey: ["engineLoadHistory", input],
+            queryFn: async () => {
+              if (state.historyError) throw new Error("boom");
+              if (state.historyPending) return new Promise<unknown>(() => {});
+              return state.history;
+            },
+            retry: false,
+          };
+        },
       },
     },
   },
@@ -175,6 +193,10 @@ afterEach(() => {
   cleanup();
   state.view = null;
   state.mutationCalls = [];
+  state.history = { members: [] };
+  state.historyPending = false;
+  state.historyError = false;
+  state.historyInputs = [];
 });
 
 describe("PoolMetricRoutingRules", () => {
@@ -353,6 +375,116 @@ describe("PoolEngineLoad (S-D)", () => {
     expect(screen.getByText("dashboard:pools.engineLoad.badges.off")).toBeTruthy();
     expect(screen.getByText("dashboard:pools.engineLoad.badges.noSignal")).toBeTruthy();
     expect(screen.queryByText(/states\.full_/)).toBeNull();
+  });
+
+  it("shows a layout-matching sparkline skeleton while history loads", async () => {
+    state.view = view();
+    state.historyPending = true;
+    mount(<PoolMetricRoutingRules poolId="pool-1" />);
+    expect(await screen.findAllByTestId("engine-load-sparkline-skeleton")).toHaveLength(2);
+    expect(screen.queryByTestId("engine-load-sparkline")).toBeNull();
+  });
+
+  it("renders the sparkline, threshold, and provenance pill from history", async () => {
+    state.view = view();
+    state.history = {
+      members: [
+        {
+          poolMemberId: "m1",
+          capacityId: "cap-1",
+          endpointSlug: "gpu",
+          modelSlug: "qwen",
+          cliDeviceId: "d1",
+          source: "builtin",
+          signals: [],
+          effectiveKvFullThreshold: 0.9,
+          kvBudgetTokens: 100_000,
+          series: [
+            {
+              start: "2026-09-30T12:00:00.000Z",
+              running: 2,
+              waiting: 1,
+              kvUsage: 0.4,
+              kvOccupancy: 0.5,
+              slotsBusy: null,
+              prefixCacheHits: 0,
+              prefixCacheQueries: 0,
+              source: "vllm-metrics",
+              gap: false,
+            },
+            {
+              start: "2026-09-30T12:00:10.000Z",
+              running: null,
+              waiting: null,
+              kvUsage: null,
+              kvOccupancy: null,
+              slotsBusy: null,
+              prefixCacheHits: 0,
+              prefixCacheQueries: 0,
+              source: null,
+              gap: true,
+            },
+          ],
+        },
+      ],
+    };
+    mount(<PoolMetricRoutingRules poolId="pool-1" />);
+    const chart = await screen.findByTestId("engine-load-sparkline");
+    expect(chart.getAttribute("data-threshold")).toBe("0.9");
+    expect(chart.className).toContain("min-w-0");
+    expect(chart.className).toContain("overflow-x-hidden");
+    expect(
+      screen.getAllByText("dashboard:pools.engineLoad.provenance.builtinVllm").length,
+    ).toBeGreaterThan(0);
+    expect(state.historyInputs[0]).toEqual({ poolId: "pool-1" });
+    for (const bundle of [enDashboard, esDashboard]) {
+      expect(bundle.pools.engineLoad.sparklineCaption.length).toBeGreaterThan(0);
+      expect(bundle.pools.engineLoad.legendOccupancy.length).toBeGreaterThan(0);
+      expect(bundle.pools.engineLoad.provenance.custom.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("labels a custom source and a member with no live reading", async () => {
+    const base = view();
+    state.view = {
+      ...base,
+      members: [
+        {
+          ...base.members[0]!,
+          engineLoad: engineLoad({
+            loadSource: "custom",
+            customMode: "observe",
+            hasSignal: true,
+            live: null,
+          }),
+        },
+      ],
+    };
+    state.history = {
+      members: [
+        {
+          poolMemberId: "m1",
+          source: "custom",
+          effectiveKvFullThreshold: 0.95,
+          series: [
+            {
+              start: "2026-09-30T12:00:00.000Z",
+              running: 1,
+              waiting: null,
+              kvUsage: 0.2,
+              kvOccupancy: 0.9,
+              gap: false,
+              source: "custom",
+            },
+          ],
+        },
+      ],
+    };
+    mount(<PoolMetricRoutingRules poolId="pool-1" />);
+    expect(await screen.findByTestId("engine-load-sparkline")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.engineLoad.provenance.custom")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.engineLoad.badges.noReading")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.engineLoad.noReading")).toBeTruthy();
   });
 });
 

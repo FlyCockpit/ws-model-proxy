@@ -181,6 +181,31 @@
       "remoteNotAllowed": "Remote sources are sent to the CLI only while its MCP command mode is unsupervised.",
       "valuesTitle": "Latest values",
       "stale": "stale"
+    },
+    "engineAdapters": {
+      "title": "Engine adapters",
+      "loadFailed": "Could not load this device's engine adapters.",
+      "empty": "No engine adapters.",
+      "hint": "Configure with `wsmp endpoints adapter`. Status never includes command text or raw output.",
+      "inputs": {
+        "route": "Route",
+        "command": "Command"
+      },
+      "states": {
+        "active": "Active",
+        "failing": "Failing",
+        "disabled": "Disabled"
+      },
+      "errors": {
+        "spawn": "could not start",
+        "timeout": "timed out",
+        "exit_status": "exited with an error",
+        "output_too_large": "output too large",
+        "parse": "could not parse",
+        "http": "HTTP error",
+        "out_of_range": "value out of range",
+        "unmapped": "unmapped metric"
+      }
     }
   },
   "chatTest": {
@@ -1053,12 +1078,27 @@
       "observeOnly": "would be FULL (observe only)",
       "saved": "Engine load setting saved",
       "saveFailed": "Could not save the engine load setting.",
+      "loadFailed": "Couldn't load engine-load history.",
+      "sparklineCaption": "Engine load over the last 30 minutes: running and waiting requests, KV usage, occupancy, and the FULL threshold.",
+      "legendRunning": "Running",
+      "legendWaiting": "Waiting",
+      "legendKv": "KV usage",
+      "legendOccupancy": "KV occupancy",
+      "legendThreshold": "FULL threshold",
+      "provenance": {
+        "custom": "Custom adapter",
+        "builtinLlamaSlots": "Built-in · llama.cpp slots",
+        "builtinLlamaMetrics": "Built-in · llama.cpp /metrics",
+        "builtinSglang": "Built-in · SGLang /metrics",
+        "builtinVllm": "Built-in · vLLM /metrics"
+      },
       "badges": {
         "off": "Engine load ignored",
         "noSignal": "No engine signal",
         "stale": "Load stale",
         "clear": "Engine has room",
-        "custom": "Custom"
+        "custom": "Custom",
+        "noReading": "No reading"
       },
       "states": {
         "full_waiting": "Engine FULL: requests waiting",

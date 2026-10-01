@@ -21,6 +21,7 @@ const state = vi.hoisted(() => ({
   mutationCalls: [] as Array<{ name: string; variables: unknown }>,
   fallbackAudits: [] as Array<Record<string, unknown>>,
   auditQueryInputs: [] as unknown[],
+  engineLoadHistory: { members: [] as unknown[] },
 }));
 
 vi.mock("react-i18next", () => ({
@@ -147,6 +148,12 @@ vi.mock("@/utils/orpc", () => {
       forwarderManagement: {
         listModelPools: query("pools", () => state.pools),
         listCliDevices: query("devices", () => []),
+        getEngineLoadHistory: {
+          queryOptions: ({ input }: { input: unknown }) => ({
+            queryKey: ["engineLoadHistory", input],
+            queryFn: async () => state.engineLoadHistory ?? { members: [] },
+          }),
+        },
         key: () => ["forwarderManagement"],
         deleteModelPool: mutation("deleteModelPool"),
         updateModelPool: mutation("updateModelPool"),
@@ -217,6 +224,7 @@ afterEach(() => {
   state.mutationCalls = [];
   state.fallbackAudits = [];
   state.auditQueryInputs = [];
+  state.engineLoadHistory = { members: [] };
   vi.mocked(toast.error).mockClear();
 });
 
@@ -1047,6 +1055,73 @@ describe("delete conflicts on pool pages", () => {
     expect(
       screen.getByText(/dashboard:pools\.capacity\.engineFacts\.factSources\.CONFIG/),
     ).toBeTruthy();
+  });
+
+  it("shows a compact engine-load chart when exactly one endpoint feeds the capacity", async () => {
+    state.capacities = [
+      {
+        id: "capacity-1",
+        label: "GPU box",
+        runtimeModel: "example",
+        hardConcurrencyLimit: 1,
+        engineKind: "VLLM",
+        engineSlots: null,
+        engineSlotsSource: null,
+        kvBudgetTokens: 262144,
+        kvBudgetTokensSource: "CONFIG",
+        maxModelLen: null,
+        maxModelLenSource: null,
+        engineFactsSource: "CONFIG",
+        engineFactsAt: new Date("2026-09-28T10:00:00.000Z"),
+        enginePreset: {
+          preset: "vllm",
+          fullWhen: "active_at_user_cap_or_engine_load",
+          protectionUnit: "tokens",
+        },
+        _count: { CapacityLeases: 0, ExecutionTargets: 1 },
+      },
+      {
+        id: "capacity-2",
+        label: "Shared",
+        runtimeModel: "example",
+        hardConcurrencyLimit: 2,
+        ...NO_ENGINE_FACTS,
+        _count: { CapacityLeases: 0, ExecutionTargets: 2 },
+      },
+    ];
+    state.engineLoadHistory = {
+      members: [
+        {
+          poolMemberId: null,
+          capacityId: "capacity-1",
+          endpointSlug: "gpu",
+          modelSlug: "qwen",
+          cliDeviceId: "d1",
+          source: "builtin",
+          signals: [],
+          effectiveKvFullThreshold: 0.95,
+          kvBudgetTokens: 262144,
+          series: [
+            {
+              start: "2026-09-30T12:00:00.000Z",
+              running: 2,
+              waiting: 0,
+              kvUsage: 0.4,
+              kvOccupancy: 0.6,
+              slotsBusy: null,
+              prefixCacheHits: 0,
+              prefixCacheQueries: 0,
+              source: "vllm-metrics",
+              gap: false,
+            },
+          ],
+        },
+      ],
+    };
+    mountWithAppToasts(<InferenceCapacityPage />);
+    expect(await screen.findByTestId("capacity-engine-load-chart")).toBeTruthy();
+    expect(screen.getByTestId("engine-load-sparkline").getAttribute("data-threshold")).toBe("0.95");
+    expect(screen.getAllByTestId("engine-load-sparkline")).toHaveLength(1);
   });
 
   it("shows facts for a capacity whose only stored fact is maxModelLen", async () => {
