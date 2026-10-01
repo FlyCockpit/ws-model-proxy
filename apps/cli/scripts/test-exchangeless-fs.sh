@@ -101,7 +101,7 @@ command -v python3 >/dev/null || { fail "python3 is not installed"; prereq=1; }
 [[ -x $fusermount ]] || { fail "$fusermount is not executable"; prereq=1; }
 [[ -u $fusermount ]] || { fail "$fusermount is not setuid, unprivileged mounts are impossible"; prereq=1; }
 [[ -c /dev/fuse && -r /dev/fuse && -w /dev/fuse ]] || { fail "/dev/fuse is not a readable and writable character device"; prereq=1; }
-ldconfig -p 2>/dev/null | grep -q 'libfuse3\.so\.3 ' || { fail "libfuse3.so.3 is not installed"; prereq=1; }
+ldconfig -p 2>/dev/null | grep 'libfuse3\.so\.3 ' >/dev/null || { fail "libfuse3.so.3 is not installed"; prereq=1; }
 (cd "$vendor" && sha256sum --quiet -c SHA256SUMS) || { fail "vendored libfuse headers differ from SHA256SUMS"; prereq=1; }
 [[ $prereq -eq 0 ]] || exit 1
 
@@ -198,6 +198,10 @@ run_class() {
   esac
   [[ $class == *-noino ]] && flags+=(PROBE_NO_INO=1)
   mkdir -p "$dir/backing" "$dir/mnt" || return 1
+  # The none classes cannot create links through the mount. Seed an alias pair
+  # in backing storage so the Rust test can verify their declared inode mode.
+  printf 'inode-mode fixture\n' >"$dir/backing/inode-probe-a" || return 1
+  ln "$dir/backing/inode-probe-a" "$dir/backing/inode-probe-b" || return 1
   MOUNT_DIR[$class]=$dir/mnt
   env PATH=/usr/bin:/bin:"$PATH" PROBE_BACKING="$dir/backing" "${flags[@]}" \
     "$daemon" -f -s "$dir/mnt" >"$dir/daemon.log" 2>&1 &

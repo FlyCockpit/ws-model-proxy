@@ -165,8 +165,8 @@ the daemon rechecks the etag: a file changed between display and approval return
 `conflict` and nothing is written for that mismatch. Since this apply-time error
 arrives after acceptance with only a code, the server still reports an unknown outcome.
 Supervised `edit.dryRun:true` returns `invalid_input`. On macOS, supervised rename
-of a directory without replacement is refused `unsupported` (overwrite uses atomic
-exchange). On platforms with neither Linux renameat2 nor macOS exchange, overwrite
+of a directory without replacement is refused `unsupported` (file/symlink overwrite
+uses exchange or safe fail-if-exists publication). On platforms with neither Linux renameat2 nor macOS exchange, overwrite
 is refused `unsupported` too: no unsafe rename fallback is used. Regular-file no-replace
 moves remain available when the filesystem supports hard links.
 Supervised approval implies no read grant.
@@ -272,9 +272,10 @@ that carries `expectedEtag` is safe (a stale etag returns `conflict`); an exact-
 without `expectedEtag` is not idempotent, so check with `file_stat` first.
 
 **Manual file recovery.** Atomic replace, exclusive create, plain rename,
-overwrite rename and file/symlink delete use recovery (overwrite requires Linux/macOS). They capture
+overwrite rename and file/symlink delete use recovery when needed. They capture
 compensation objects into one mode-0700 `.wsmp-recover-<10 alnum>` directory beside
-the destination, with at most two objects per operation. Replace creates its temp
+the destination, with at most two captured data objects per operation, plus private
+capability probes and preflight dummies. Replace creates its temp
 inside this directory and first tries an atomic exchange with the destination;
 no public staging name exists. If exchange is unavailable, private probes choose
 no-replace rename or hard-link publication before any public name is changed.
@@ -285,14 +286,18 @@ concurrent create at the vacant name survives; the original stays in recovery
 and the tool returns `uncertain_outcome`. If no safe publish primitive works,
 `unsafe_filesystem` is a definitive headless refusal: nothing was changed. A
 supervised error after acceptance remains unknown under the code-only outcome
-contract, including `unsafe_filesystem`. Overwrite rename first captures and verifies the
-source, then exchanges that private slot with the destination. Every captured
+contract, including `unsafe_filesystem`. Overwrite rename first preflights privately,
+then captures and verifies the source. It exchanges that slot with the destination
+when supported; otherwise it captures/proves the destination too and publishes the
+source with no-replace rename or a non-following hard link. Unpublished user sources
+are never disposed: they return only to the source name or stay named in recovery. Every captured
 object has a recorded origin; undo restores only to that origin, using identity
 proof to return a moved source to its original source name. An unsettled
 headless compensation returns `uncertain_outcome` with `error.outcome: "unknown"`,
 `recovery` (an absolute directory path) and `kept` (up to four absolute paths,
 including public names when capture failed). Successful headless edit/write/rename/delete
-results may include `recovered` paths if only cleanup failed. Supervised operations
+results may include `recovered` paths if cleanup failed or an exposed source alias
+became its object's last name before cleanup. Supervised operations
 use the same recovery and compensation primitives, with pin verification and
 cancellation honored only before commit. Their error frame carries
 only a closed error `code` (including `uncertain_outcome` and `unsafe_filesystem`);
@@ -326,26 +331,35 @@ empty directory, so this cannot destroy a concurrent save; at worst it removes
 a racer's empty directory. Non-empty directories are refused, and delete never
 recurses.
 
-**Exchange-less filesystems.** The fallback replace leaves the public name
+**Exchange-less filesystems.** Fallback replace and overwrite rename leave the destination name
 vacant between capture and safe publication. The window contains a bounded
 number of syscalls, with no time bound: scheduling, network delays or a crash
 can extend it. Readers see ENOENT, and concurrent creates survive. Publishing
 is only as atomic as the filesystem's no-replace rename or link primitive;
 the CLI cannot verify a daemon's emulation. Capability detection is per
-operation and errno-driven, with probes at absent private names. NFS and 9p
+operation and errno-driven, with probes at absent private names. Rename link
+probes use the actual source and destination objects before capture, since link
+permissions and link-count limits depend on the object. NFS and 9p
 reject rename flags but usually support links. exFAT and CIFS support
 no-replace rename only; exFAT has no hard links. Linux vfat supports both
 exchange and no-replace rename. macOS HFS+ supports RENAME_EXCL but not
-RENAME_SWAP. Overwrite rename on a filesystem without exchange restores its
-captured source and returns `unsafe_filesystem` (or `uncertain_outcome` if
-restoration cannot settle); a vacate-both publish design is future work.
-Plain rename likewise refuses with `unsafe_filesystem` when it cannot avoid
-overwriting an existing destination. Private recovery objects are proven by
-a proof opened on their own name; reconciling an ambiguous publish error compares
-the published name with the temp, which needs stable inode numbers across names, so
-on a mount without them (some FUSE filesystems, for example sshfs) such an error is
-reported as `uncertain_outcome` with the recovery paths. Allocating the recovery
-directory fails closed with `io_error` (EEXIST) after 16 name collisions.
+RENAME_SWAP. Overwrite rename works on no-replace-capable and link-only mounts:
+source and destination are captured and proven, then source is published into the
+vacant destination. On mounts with neither primitive, `unsafe_filesystem` refuses
+before moving anything; the unchanged public snapshot has no recovery residue.
+Plain file/symlink rename uses direct no-replace where supported (including
+supervised macOS files), otherwise vacate-first link publication. Directories move
+only with no-replace, never overwrite even an empty directory, and a directory
+moved into its resolved physical subtree refuses `invalid_input` before allocating R.
+Private aliases are proven at their own names, including mounts where hard-link
+names present different inode numbers. A successful link syscall commits; a rename
+link error with ambiguous effect keeps/restores source and keeps destination, with
+`uncertain_outcome`. Only a no-replace rename transfers a dentry for held-fd/name
+reply reconciliation. After link rename the returned etag uses the published name
+only when its bytes/mtime bind to the admitted source etag; a later save or failed
+bounded read yields null. Clean publication removes the private alias and R;
+failed cleanup reports `recovered`. Allocating R fails closed with `io_error`
+(EEXIST) after 16 name collisions.
 
 POSIX does not exclude other same-user processes. Every disposal compares the
 private slot with a live held fd, which pins the inode during identity proof;
@@ -369,13 +383,17 @@ recovery (plain rename verification and exclusive-create cleanup instead keep a
 foreign object in recovery and report it). Unsupported
 NOREPLACE restore uses EEXIST-safe linkat followed by held-fd-proven private-slot
 unlink; directories and unsupported links stay in recovery with `uncertain_outcome`.
-(b2) overwrite rename's SOURCE name is vacant from its initial capture until the
+(b2) recovery rename's SOURCE name is vacant from its initial capture until the
 operation ends. A concurrent create remains there on success; if it prevents a
 restore, it is kept and reported with `uncertain_outcome`. Independently of the
 filesystem, an in-place write into the inspected inode after the etag read can
 be lost on replace or delete: the etag proves content only up to that read.
 (d) a crash leaves `.wsmp-recover-*`, including a partial replace temp or
-`probe`, or both links. A crash during exchange-less replace can leave the
+`probe`, preflight dummies, or both links. A rename crash can leave source and
+destination in R with both public names vacant. The daemon logs R and both paths
+before the first capture; no durable intent file or replay runs. On stable-inode
+NFS, plain rename has this source-in-R crash shape only on link-only mounts;
+no-replace-capable mounts retain direct rename. A crash during exchange-less replace can leave the
 original and temp in recovery with the public name vacant; a delete crash can
 leave the captured file or symlink in recovery with its public name vacant.
 (e) unheld objects are never deleted and remain reported in recovery;
@@ -384,9 +402,12 @@ recovery directory after its unlink, so the directory is retained and listed in 
 the link probe's alias unlink keeps the temp's own descriptor open (it pins the inode against
 number reuse), so a client that silly-renames per vnode (macOS/BSD NFS) may briefly keep a
 `.nfs*` alias there until that descriptor closes, retained and reported the same way.
-(g) after a hard-link publish, a process can open and write the public temp,
+(g) after replace or rename hard-link publication, a process can open and write the
+public temp/source,
 then another save can replace that name before the private alias is unlinked;
-the alias unlink can then discard those writes to the now-orphaned inode.
+a fresh held-fd link count below 2 retains the last alias and reports it. A third
+save after that final observation but before unlink can still orphan the inode
+and discard the writes; the check narrows this residual without excluding writers.
 If alias cleanup fails instead, the published file has two hard links (nlink 2)
 and edit/replace refuses `hard_linked` until manual cleanup of the reported alias.
 Public file and symlink compensation names are never unlinked on an earlier
@@ -409,6 +430,12 @@ directory, one hard link, names equal after case folding), which is done by a pl
 atomic rename that replaces nothing; the supervised confirm screen labels it `overwrite: false (case-only rename ...)` for the same reason. A real hard-link alias (link count above 1) is
 still refused. The one residual window: a same-user process that creates a second entry
 under the other spelling between the check and the rename can lose that entry.
+On a case-insensitive mount without stable inode numbers, two spellings may fail
+same-object admission and proceed to vacate-both: capturing source also vacates
+destination, so destination capture returns `conflict("gone")` and source is
+restored to its source name. A true hard-link alias pair hidden by noino can instead
+complete vacate-both without losing its data; stable-inode alias pairs still refuse.
+
 
 **Version skew.** `uncertain_outcome` and `unsafe_filesystem` are new file error
 codes of relay 2.8. Upgrade the server before the `wsmp` CLI: a server that

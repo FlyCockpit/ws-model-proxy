@@ -11,6 +11,10 @@ use nix::errno::Errno;
 pub(super) enum Primitive {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Exchange,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    ProbeExchange,
+    ProbeCreate,
+    PublishPrepare,
     ProbeNoReplace,
     ProbeLink,
     Publish,
@@ -19,7 +23,6 @@ pub(super) enum Primitive {
     Restore,
     RestoreLink,
     Move,
-    MoveLink,
     Hold,
     Identity,
     Mkdir,
@@ -155,7 +158,18 @@ pub(super) fn exchange(
     dir_to: impl AsFd,
     to: &OsStr,
 ) -> Result<(), Errno> {
-    run(Primitive::Exchange, || {
+    exchange_with(dir_from, from, dir_to, to, Primitive::Exchange)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn exchange_with(
+    dir_from: impl AsFd,
+    from: &OsStr,
+    dir_to: impl AsFd,
+    to: &OsStr,
+    primitive: Primitive,
+) -> Result<(), Errno> {
+    run(primitive, || {
         #[cfg(target_os = "linux")]
         {
             use nix::fcntl::{RenameFlags, renameat2};

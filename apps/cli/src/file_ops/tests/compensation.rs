@@ -141,6 +141,9 @@ fn clean(fx: &Fx) {
 fn compensation_fault_table_is_off_by_default_nth_and_thread_local() {
     for primitive in [
         Primitive::Exchange,
+        Primitive::ProbeExchange,
+        Primitive::ProbeCreate,
+        Primitive::PublishPrepare,
         Primitive::ProbeNoReplace,
         Primitive::ProbeLink,
         Primitive::Publish,
@@ -148,7 +151,6 @@ fn compensation_fault_table_is_off_by_default_nth_and_thread_local() {
         Primitive::Mkdir,
         Primitive::Hold,
         Primitive::Identity,
-        Primitive::MoveLink,
         Primitive::Capture,
         Primitive::Restore,
         Primitive::RestoreLink,
@@ -304,7 +306,9 @@ fn compensation_c1b1_unlink_then_recreate_before_private_dispose_survives() {
         let etag = op.prepare(&fx);
         let root = fx.root.clone();
         let fx = fx.with_hook(move |step| {
-            if step == Step::Disposing {
+            if step == Step::Disposing
+                && (!matches!(op, Op::Rename) || !root.join("src.txt").exists())
+            {
                 let dir = recovery_dirs(&root).pop().unwrap();
                 let private = std::fs::read_dir(dir)
                     .unwrap()
@@ -363,7 +367,9 @@ fn compensation_c1a1_successor_at_public_name_before_private_unlink_is_untouched
                     root.join("doc.txt")
                 };
             }
-            if step == Step::Disposing {
+            if step == Step::Disposing
+                && (!matches!(op, Op::Rename) || !root.join("src.txt").exists())
+            {
                 successor(&observed.lock().unwrap(), "successor only copy");
             }
             Ok(())
@@ -491,6 +497,7 @@ fn compensation_capture_falls_back_only_for_unsupported_errors() {
 fn no_flags() -> FaultScope {
     FaultScope::new(&[
         (Primitive::Move, 1, Errno::EINVAL),
+        (Primitive::ProbeNoReplace, 1, Errno::EINVAL),
         (Primitive::Capture, 1, Errno::EINVAL),
         (Primitive::Capture, 2, Errno::EINVAL),
         (Primitive::Restore, 1, Errno::EINVAL),
@@ -580,7 +587,7 @@ fn compensation_no_flags_undo_conflict_settles_without_extra_links() {
     fx.put("src.txt", "mine");
     let source = fx.root.join("src.txt");
     let fx = fx.with_hook(move |step| {
-        if step == Step::Linked {
+        if step == Step::Vacating {
             successor(&source, "source successor");
         }
         Ok(())
@@ -609,31 +616,27 @@ fn compensation_no_flags_successor_races_keep_every_external_object() {
         let source = fx.root.join("src.txt");
         let target = fx.root.join("dst.txt");
         let fx = fx.with_hook(move |step| {
-            if step == Step::Linked {
+            if step == Step::Renamed {
                 successor(&source, "source successor");
                 successor(&target, "destination successor");
             }
-            if collide && step == Step::Captured && !source.exists() {
-                std::fs::write(&source, "created during vacant undo").unwrap();
+            if collide && step == Step::Vacated {
+                std::fs::write(&source, "created during vacancy").unwrap();
             }
             Ok(())
         });
         let _scope = no_flags();
-        let kept = uncertain(
-            &fx.ops
-                .rename(
-                    &args(json!({"from": fx.p("src.txt"), "to": fx.p("dst.txt")})),
-                    &fx.cancel,
-                )
-                .unwrap_err(),
-        );
-        assert!(contains_bytes(&kept, "destination successor"));
-        if collide {
-            assert_eq!(fx.get("src.txt"), "created during vacant undo");
-            assert!(contains_bytes(&kept, "source successor"));
-        } else {
-            assert_eq!(fx.get("src.txt"), "source successor");
-        }
+        let result = fx
+            .ops
+            .rename(
+                &args(json!({"from":fx.p("src.txt"),"to":fx.p("dst.txt")})),
+                &fx.cancel,
+            )
+            .unwrap();
+        let recovered: Vec<_> = result.recovered.iter().map(PathBuf::from).collect();
+        assert!(contains_bytes(&recovered, "mine"));
+        assert_eq!(fx.get("src.txt"), "source successor");
+        assert_eq!(fx.get("dst.txt"), "destination successor");
     }
 }
 
@@ -731,7 +734,15 @@ fn compensation_success_with_unlink_or_rmdir_retention_reports_recovered_for_all
         for primitive in [Primitive::Unlink, Primitive::Rmdir] {
             let fx = Fx::new();
             let etag = op.prepare(&fx);
-            let _scope = FaultScope::new(&[(primitive, 1, Errno::EIO)]);
+            let _scope = FaultScope::new(&[(
+                primitive,
+                if matches!(op, Op::Rename) && primitive == Primitive::Unlink {
+                    3
+                } else {
+                    1
+                },
+                Errno::EIO,
+            )]);
             let result = op.run(&fx, &etag).unwrap();
             let recovered = paths(&result["recovered"]);
             assert!(!recovered.is_empty());
@@ -760,7 +771,9 @@ fn compensation_private_slot_mismatch_is_kept_even_after_successful_commit() {
         let etag = op.prepare(&fx);
         let root = fx.root.clone();
         let fx = fx.with_hook(move |step| {
-            if step == Step::Disposing {
+            if step == Step::Disposing
+                && (!matches!(op, Op::Rename) || !root.join("src.txt").exists())
+            {
                 let dir = recovery_dirs(&root).pop().unwrap();
                 let slot = std::fs::read_dir(dir)
                     .unwrap()
@@ -852,33 +865,47 @@ fn compensation_recovery_policy_protects_every_folded_component_and_all_mutation
 
 #[test]
 fn compensation_link_fallback_cleanup_and_verify_moved_keep_successors() {
-    for phase in [Step::Linked, Step::Moved] {
+    for phase in [Step::Renamed, Step::Moved] {
         let fx = Fx::new();
         fx.put("src.txt", "mine");
         let source = fx.root.join("src.txt");
         let target = fx.root.join("dst.txt");
         let fx = fx.with_hook(move |step| {
             if step == phase {
-                if phase == Step::Linked {
+                if phase == Step::Renamed {
                     successor(&source, "source successor");
                 }
                 successor(&target, "destination successor");
             }
             Ok(())
         });
-        let _scope = FaultScope::new(if phase == Step::Linked {
-            &[(Primitive::Move, 1, Errno::EINVAL)]
+        let _scope = FaultScope::new(if phase == Step::Renamed {
+            &[
+                (Primitive::Move, 1, Errno::EINVAL),
+                (Primitive::ProbeNoReplace, 1, Errno::EINVAL),
+            ]
         } else {
             &[]
         });
         let result = fx.ops.rename(
-            &args(json!({"from": fx.p("src.txt"), "to": fx.p("dst.txt")})),
+            &args(json!({"from":fx.p("src.txt"),"to":fx.p("dst.txt")})),
             &fx.cancel,
         );
-        let kept = uncertain(&result.unwrap_err());
-        assert!(contains_bytes(&kept, "destination successor"));
-        if phase == Step::Linked {
+        if phase == Step::Renamed {
+            let recovered: Vec<_> = result
+                .unwrap()
+                .recovered
+                .iter()
+                .map(PathBuf::from)
+                .collect();
+            assert!(contains_bytes(&recovered, "mine"));
             assert_eq!(fx.get("src.txt"), "source successor");
+            assert_eq!(fx.get("dst.txt"), "destination successor");
+        } else {
+            assert!(contains_bytes(
+                &uncertain(&result.unwrap_err()),
+                "destination successor"
+            ));
         }
     }
 }
@@ -1004,7 +1031,7 @@ fn compensation_link_fallback_checks_both_captured_source_and_link_destination()
         let source = fx.root.join("src.txt");
         let target = fx.root.join("dst.txt");
         let fx = fx.with_hook(move |step| {
-            if step == Step::Linked {
+            if step == Step::Renamed {
                 successor(
                     if change_source { &source } else { &target },
                     "successor only copy",
@@ -1012,23 +1039,31 @@ fn compensation_link_fallback_checks_both_captured_source_and_link_destination()
             }
             Ok(())
         });
-        let _scope = FaultScope::new(&[(Primitive::Move, 1, Errno::EINVAL)]);
-        let error = fx
+        let _scope = FaultScope::new(&[
+            (Primitive::Move, 1, Errno::EINVAL),
+            (Primitive::ProbeNoReplace, 1, Errno::EINVAL),
+        ]);
+        let result = fx
             .ops
             .rename(
-                &args(json!({"from": fx.p("src.txt"), "to": fx.p("dst.txt")})),
+                &args(json!({"from":fx.p("src.txt"),"to":fx.p("dst.txt")})),
                 &fx.cancel,
             )
-            .unwrap_err();
+            .unwrap();
         if change_source {
-            assert_eq!(error.code, ErrorCode::Conflict);
             assert_eq!(fx.get("src.txt"), "successor only copy");
-            assert!(!fx.root.join("dst.txt").exists());
+            assert_eq!(fx.get("dst.txt"), "mine");
             clean(&fx);
         } else {
-            let kept = uncertain(&error);
-            assert!(contains_bytes(&kept, "successor only copy"));
-            assert_eq!(fx.get("src.txt"), "mine");
+            assert!(contains_bytes(
+                &result
+                    .recovered
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>(),
+                "mine"
+            ));
+            assert_eq!(fx.get("dst.txt"), "successor only copy");
         }
     }
 }
@@ -1147,7 +1182,15 @@ fn compensation_retention_is_logged_with_the_recovery_paths() {
             } else {
                 Primitive::Unlink
             };
-            let _scope = FaultScope::new(&[(primitive, 1, Errno::EIO)]);
+            let _scope = FaultScope::new(&[(
+                primitive,
+                if matches!(op, Op::Rename) && primitive == Primitive::Unlink {
+                    3
+                } else {
+                    1
+                },
+                Errno::EIO,
+            )]);
             let result = op.run(&fx, &etag);
             let kept = if retained_by_error {
                 uncertain(&result.unwrap_err())
@@ -1448,7 +1491,7 @@ fn compensation_closes_held_descriptors_before_removing_the_recovery_directory()
 #[test]
 fn compensation_failed_vacate_is_a_plain_settled_error() {
     for (errno, code) in [
-        (Errno::ENOENT, ErrorCode::NotFound),
+        (Errno::ENOENT, ErrorCode::Conflict),
         (Errno::EXDEV, ErrorCode::IoError),
         (Errno::EACCES, ErrorCode::IoError),
         (Errno::ENOSPC, ErrorCode::IoError),
@@ -1568,7 +1611,11 @@ fn supervised_recovery_shares_private_staging_compensation_and_person_log() {
             assert_eq!(prepared.child_input().blocked, None, "{op:?}: {state}");
             LOG.with(|log| log.borrow_mut().clear());
             let faults = match state {
-                "cleanup" => vec![(Primitive::Unlink, 1, Errno::EIO)],
+                "cleanup" => vec![(
+                    Primitive::Unlink,
+                    if matches!(op, Op::Rename) { 3 } else { 1 },
+                    Errno::EIO,
+                )],
                 "uncertain" => vec![(
                     Primitive::Capture,
                     if matches!(op, Op::Rename) { 2 } else { 1 },

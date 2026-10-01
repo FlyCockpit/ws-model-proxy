@@ -27,8 +27,12 @@
 //! Linux vfat has exchange and NOREPLACE; exFAT has NOREPLACE without links; NFS/9p
 //! commonly lack rename flags but permit links. macOS HFS+ has EXCL without SWAP;
 //! SMB can lack links. Other Unix uses the no-replace/link ladder and fails closed.
-//! Overwrite rename on exchange-less targets restores source then refuses; there
-//! is no private preflight and no plain public overwrite fallback.
+//! Overwrite rename preflights privately before capture: exchange or NR dummies,
+//! then link probes on the actual S/D objects. Without a usable method nothing
+//! public moves. Exchange-less rename vacates/proves S and D, then publishes S
+//! fail-if-exists; plain link rename vacates/proves S first. Direct NR plain
+//! rename (including supervised macOS files) needs no R. Directories use NR only,
+//! never overwrite, and resolved own-subtree requests refuse invalid_input.
 //!
 //! Unsettled operations return uncertain_outcome; successful operations can report
 //! recovered paths, including delete. Find `.wsmp-recover-*` beside the target;
@@ -48,25 +52,30 @@
 //! (b) undo briefly vacates public names; a concurrent create blocks NOREPLACE/link
 //! restoration and leaves displaced data reported in recovery. Link restore cannot
 //! restore directories; unsupported links also stay in recovery with uncertainty.
-//! (b2) overwrite rename's source is vacant from capture through operation end.
+//! (b2) recovery rename's source is vacant from capture through operation end;
+//! exchange-less overwrite also vacates destination before publication.
 //! (d) a crash leaves the original and T (possibly partial tmp or renamed probe) in
 //! R with a vacant public name, a deleted file in R with its name vacant, or both
-//! published and private links. Empty unreported R after power loss is harmless.
+//! published and private links. Rename can leave S/D in R and both public names
+//! vacant; preflight dummies can also survive a crash. R/s/d are logged before
+//! the first capture; no durable intent or automatic replay is maintained.
+//! Empty unreported R after power loss is harmless.
 //! (e) unheld objects are retained; they are never deleted by a snapshot.
 //! (f) on NFS another process holding the file open can leave a `.nfs*` entry in R;
 //! our own descriptors close before unlink (except T's pinned proof at the link
 //! probe's alias unlink: clients that silly-rename per vnode, macOS/BSD NFS, may keep a
 //! `.nfs*` alias until it closes). Retained R is reported for manual cleanup.
-//! (g) link publication briefly exposes T before its private alias unlink. Someone
+//! (g) replace/rename link publication briefly exposes T/S before alias unlink. Someone
 //! can open/write public T, then a third save can replace that name before unlink,
-//! orphaning that exposed inode. A failed alias unlink retains nlink 2: later replace
+//! orphaning that exposed inode. Fresh nlink < 2 keeps the last alias, narrowing
+//! this to a race after that observation. Failed alias cleanup can retain nlink 2: later replace
 //! refuses hard_linked until the reported alias is manually removed. Independently,
 //! an in-place write to the original after its etag read remains lost on every fs.
 //!
 //! Separate residuals unchanged here: case-only rename's alias check-to-rename race;
 //! exclusive create's public O_EXCL-then-write; rollback_created; per-mount privacy
-//! of R and existing reporting bounds. Exchange-less overwrite rename remains a
-//! refusal, distinct from replacement's safe vacate-first publication.
+//! of R and existing reporting bounds. A link error after effect cannot prove
+//! commit across alias names on noino; rename keeps/restores S and keeps D.
 
 use std::ffi::{OsStr, OsString};
 use std::os::fd::{AsFd, OwnedFd};
@@ -81,7 +90,7 @@ use serde_json::json;
 
 use super::error::{ErrorCode, FileError, FileResult};
 use super::exchange::{Primitive, fault, is_link_unsupported, is_unsupported, no_replace, run};
-use super::resolve::{Kind, Stat};
+use super::resolve::{Kind, Resolved, Stat};
 use super::{Cancel, FileOps, Step};
 
 /// Longest path list carried in a result or error detail (server schema bound).
@@ -214,9 +223,20 @@ impl Held {
 }
 
 #[derive(Clone, Copy)]
-enum PublishMethod {
+pub(super) enum PublishMethod {
     NoReplace,
     Link,
+}
+
+/// The unpublished object has exactly one owner. Generated temps are disposable;
+/// a user's source always returns to its recorded origin or stays reported in R.
+pub(super) enum Published<'a> {
+    Temp,
+    UserSource {
+        origin: &'a Resolved,
+        target: &'a Resolved,
+        method: PublishMethod,
+    },
 }
 
 pub(super) struct RecoveryDir {
@@ -369,13 +389,22 @@ impl RecoveryDir {
         }
     }
 
-    /// Probes use absent private names and do not consume a capture slot. A
-    /// successful NOREPLACE probe MOVES T, so update both its name and reporting.
+    /// One absent-name ladder, shared by replacement and rename preflight.
     fn probe_publish(
         &mut self,
         ops: &FileOps,
         slot: &mut Slot,
         identity: &mut Held,
+    ) -> FileResult<PublishMethod> {
+        self.probe_publish_with(ops, slot, identity, None)
+    }
+
+    fn probe_publish_with(
+        &mut self,
+        ops: &FileOps,
+        slot: &mut Slot,
+        identity: &mut Held,
+        actual: Option<(&Resolved, &Held)>,
     ) -> FileResult<PublishMethod> {
         let probe = OsString::from("probe");
         match no_replace(
@@ -391,10 +420,7 @@ impl RecoveryDir {
             }
             Err(errno) if is_unsupported(errno) => {}
             Err(errno) => {
-                // An ambiguous reply may follow an effective private rename: when
-                // the probe name now holds T and the old name is gone, follow it so
-                // the reported path (and the later disposal) names what exists.
-                let moved = matches!(
+                if matches!(
                     fstatat(
                         self.dir.as_fd(),
                         slot.name.as_os_str(),
@@ -406,196 +432,534 @@ impl RecoveryDir {
                     probe.as_os_str(),
                     AtFlags::AT_SYMLINK_NOFOLLOW,
                 )
-                .is_ok();
-                if moved {
+                .is_ok()
+                {
                     self.adopt_name(slot, probe);
                 }
                 return Err(FileError::errno(errno));
             }
         }
-        // Lineage: before anything is linked, `tmp` must still be the object this
-        // operation created and wrote (a same-name proof against T's own live fd).
-        // The NOREPLACE probe gets the same protection from its later holds().
-        if !self.holds(slot, identity) {
-            self.keep(slot);
-            return Err(self.uncertain());
+        if let Some((source, held)) = actual {
+            self.probe_link(ops, &source.dir, &source.name, &source.full_path(), held)?;
+        } else {
+            let private_dir = dup(self.dir.as_fd()).map_err(FileError::errno)?;
+            self.probe_link(ops, &private_dir, &slot.name, &slot.origin.path, identity)?;
         }
-        run(Primitive::ProbeLink, || {
+        Ok(PublishMethod::Link)
+    }
+
+    /// Link capability depends on the actual object (protected_hardlinks,
+    /// symlink restrictions and link-count limits), never just on a dummy file.
+    fn probe_link(
+        &mut self,
+        ops: &FileOps,
+        dir: &OwnedFd,
+        name: &OsStr,
+        path: &Path,
+        identity: &Held,
+    ) -> FileResult<()> {
+        if !self.holds_name(dir, name, identity) {
+            return Err(FileError::conflict("replaced"));
+        }
+        let alias = Slot {
+            name: OsString::from("probe"),
+            origin: Origin::new(dir, name, path).map_err(FileError::errno)?,
+        };
+        let linked = run(Primitive::ProbeLink, || {
             linkat(
+                dir.as_fd(),
+                name,
                 self.dir.as_fd(),
-                slot.name.as_os_str(),
-                self.dir.as_fd(),
-                probe.as_os_str(),
+                alias.name.as_os_str(),
                 AtFlags::empty(),
             )
-        })
-        .map_err(|errno| {
-            if is_link_unsupported(errno) {
+        });
+        if let Err(errno) = linked {
+            // A failed reply can leave an alias. Keep it, with the source still
+            // pinned; never infer its ownership from another link's inode.
+            if fstatat(
+                self.dir.as_fd(),
+                alias.name.as_os_str(),
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            )
+            .is_ok()
+            {
+                self.keep(&alias);
+                return Err(self.uncertain());
+            }
+            return Err(if is_link_unsupported(errno) {
                 FileError::unsafe_filesystem()
             } else {
                 FileError::errno(errno)
-            }
-        })?;
-        let alias = Slot {
-            name: probe,
-            origin: Origin::new(&slot.origin.dir, &slot.origin.name, &slot.origin.path)
-                .map_err(FileError::errno)?,
-        };
+            });
+        }
         self.remember(self.path.join(&alias.name));
-        // Both names remain private. Names of one inode need not report one inode
-        // number (FUSE without stable inodes, for example sshfs), so the alias is
-        // proven by a proof opened on ITS name, never by comparing across names. T's
-        // own proof stays open through the alias unlink: it pins T's inode, so no
-        // other object can take T's number, and `tmp` (same name, same inode number
-        // before and after) is then re-checked against it. On Linux the unlinked dentry
-        // is the alias's, so the NFS client has nothing to silly-rename; clients that
-        // decide per vnode (macOS/BSD NFS) may keep a `.nfs*` alias in R until T's
-        // proof closes, retained and reported like (f).
-        let alias_stat = fstatat(
+        let seam_error = ops.step(Step::LinkProbed).err();
+        let raw = fstatat(
             self.dir.as_fd(),
             alias.name.as_os_str(),
             AtFlags::AT_SYMLINK_NOFOLLOW,
         )
         .map_err(FileError::errno)?;
-        let mut alias_held = Held::open(&self.dir, &alias.name, Stat::from_raw(&alias_stat))?;
-        if !self.dispose(ops, &alias, &mut alias_held) {
+        let mut held = Held::open(&self.dir, &alias.name, Stat::from_raw(&raw))?;
+        // The original proof pins its inode through alias disposal (the accepted
+        // per-vnode NFS exception). The alias is proven at its OWN name on noino.
+        if !self.dispose_alias(ops, &alias, &mut held) {
             return Err(self.uncertain());
         }
-        if !self.holds(slot, identity) {
-            // `tmp` is no longer the object this operation created.
-            self.keep(slot);
-            return Err(self.uncertain());
+        if !self.holds_name(dir, name, identity) {
+            return Err(FileError::conflict("replaced"));
         }
-        Ok(PublishMethod::Link)
+        if let Some(error) = seam_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
-    fn publish_slot(&self, slot: &Slot, method: PublishMethod) -> Result<(), Errno> {
+    fn dummy(&mut self, name: &str, target: &Resolved) -> FileResult<(Slot, Held)> {
+        let slot = Slot {
+            name: OsString::from(name),
+            origin: Origin::new(&target.dir, &target.name, &target.full_path())
+                .map_err(FileError::errno)?,
+        };
+        let fd = run(Primitive::ProbeCreate, || {
+            openat(
+                self.dir.as_fd(),
+                slot.name.as_os_str(),
+                OFlag::O_CREAT
+                    | OFlag::O_EXCL
+                    | OFlag::O_NOFOLLOW
+                    | OFlag::O_RDWR
+                    | OFlag::O_CLOEXEC,
+                Mode::S_IRUSR | Mode::S_IWUSR,
+            )
+        })
+        .map_err(FileError::errno)?;
+        self.remember(self.path.join(&slot.name));
+        let held = Held::from_file(&std::fs::File::from(fd))?;
+        Ok((slot, held)) // dummies never consume the two user-data slots
+    }
+
+    /// Before any public effect: exchange/NR use private dummies; link probes
+    /// use S and (for overwrite) D, which must both be link-restorable.
+    pub(super) fn preflight_move(
+        &mut self,
+        ops: &FileOps,
+        from: &Resolved,
+        to: &Resolved,
+        src: &Held,
+        dst: Option<&Held>,
+    ) -> FileResult<Option<PublishMethod>> {
+        let (mut first, mut one) = self.dummy("preflight-1", to)?;
+        let mut second = None;
+        let result = (|| {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if dst.is_some() {
+                second = Some(self.dummy("preflight-2", to)?);
+                if let Some((slot, held)) = second.as_mut() {
+                    match super::exchange::exchange_with(
+                        self.dir.as_fd(),
+                        &first.name,
+                        self.dir.as_fd(),
+                        &slot.name,
+                        Primitive::ProbeExchange,
+                    ) {
+                        Ok(()) => {
+                            std::mem::swap(&mut one, held);
+                            return Ok(None);
+                        }
+                        Err(errno) if is_unsupported(errno) => {}
+                        Err(errno) => return Err(FileError::errno(errno)),
+                    }
+                }
+            }
+            let method = self.probe_publish_with(ops, &mut first, &mut one, Some((from, src)))?;
+            if matches!(method, PublishMethod::Link)
+                && let Some(dst) = dst
+            {
+                self.probe_link(ops, &to.dir, &to.name, &to.full_path(), dst)?;
+            }
+            Ok(Some(method))
+        })();
+        self.dispose(ops, &first, &mut one);
+        if let Some((slot, mut held)) = second {
+            self.dispose(ops, &slot, &mut held);
+        }
+        if !self.settled() {
+            return Err(self.uncertain());
+        }
+        result
+    }
+
+    fn publish_slot(
+        &self,
+        slot: &Slot,
+        target: &Origin,
+        method: PublishMethod,
+    ) -> Result<(), Errno> {
         match method {
             PublishMethod::NoReplace => no_replace(
                 self.dir.as_fd(),
                 &slot.name,
-                slot.origin.dir.as_fd(),
-                &slot.origin.name,
+                target.dir.as_fd(),
+                &target.name,
                 Primitive::Publish,
             ),
             PublishMethod::Link => run(Primitive::PublishLink, || {
                 linkat(
                     self.dir.as_fd(),
                     slot.name.as_os_str(),
-                    slot.origin.dir.as_fd(),
-                    slot.origin.name.as_os_str(),
+                    target.dir.as_fd(),
+                    target.name.as_os_str(),
                     AtFlags::empty(),
                 )
             }),
         }
     }
 
-    /// Sole exchange-less commit owner. After the private capability probe,
-    /// capture and verify the inspected public object, then publish only with
-    /// a primitive that refuses an occupied name. No plain public rename.
+    /// Exactly one ownership policy for every non-commit exit. Source origin
+    /// never changes to the publication target. Failed restoration only keeps.
+    fn abort_published(
+        &mut self,
+        ops: &FileOps,
+        slot: &Slot,
+        held: &mut Held,
+        published: &Published<'_>,
+    ) {
+        match published {
+            Published::Temp => {
+                self.dispose(ops, slot, held);
+            }
+            Published::UserSource { origin, .. } => {
+                debug_assert_eq!(slot.origin.path, origin.full_path());
+                held.release(); // unconditional, even after failed observation
+                if self.restore(ops, slot) {
+                    let _ = ops.step(Step::Restored);
+                }
+            }
+        }
+    }
+
+    /// Shared exchange-less publisher: replace owns disposable T; rename owns
+    /// non-disposable S already captured by commit_move. No duplicated ladder.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn publish_without_exchange(
         &mut self,
         ops: &FileOps,
         tmp: &mut Slot,
-        original: &mut Held,
+        mut original: Option<&mut Held>,
         identity: &mut Held,
         cancel: &Cancel,
+        published: Published<'_>,
     ) -> FileResult<bool> {
-        let before_capture = (|| {
-            let method = self.probe_publish(ops, tmp, identity)?;
-            if !self.holds(tmp, identity) {
-                self.keep(tmp);
-                return Err(self.uncertain());
-            }
-            ops.step(Step::Vacating)?;
-            cancel.check()?; // last cancellation point; nothing public moved yet
-            Ok(method)
+        let prepared = (|| {
+            fault(Primitive::PublishPrepare).map_err(FileError::errno)?;
+            let (target, method) = match &published {
+                Published::Temp => {
+                    let method = self.probe_publish(ops, tmp, identity)?;
+                    if !self.holds(tmp, identity) {
+                        self.keep(tmp);
+                        return Err(self.uncertain());
+                    }
+                    ops.step(Step::Vacating)?;
+                    cancel.check()?;
+                    (
+                        Origin::new(&tmp.origin.dir, &tmp.origin.name, &tmp.origin.path),
+                        method,
+                    )
+                }
+                Published::UserSource { target, method, .. } => (
+                    Origin::new(&target.dir, &target.name, &target.full_path()),
+                    *method,
+                ),
+            };
+            Ok((target.map_err(FileError::errno)?, method))
         })();
-        let method = match before_capture {
-            Ok(method) => method,
+        let (target, method) = match prepared {
+            Ok(value) => value,
             Err(error) => {
-                // Alias cleanup failure must retain both private names. No
-                // second disposal owns T after this owner has become uncertain.
                 if error.code != ErrorCode::UncertainOutcome {
-                    self.dispose(ops, tmp, identity);
+                    self.abort_published(ops, tmp, identity, &published); // D1 site 1
                 }
                 return Err(error);
             }
         };
-        let mark = self.checkpoint();
-        let captured = self.capture(&tmp.origin.dir, &tmp.origin.name, &tmp.origin.path);
-        let Some(captured) = captured else {
-            let errno = self.abort_capture(mark);
-            self.dispose(ops, tmp, identity);
-            return Err(match errno {
-                Some(Errno::ENOENT) => FileError::conflict("gone"),
-                Some(errno) => FileError::errno(errno),
-                None => self.uncertain(),
-            });
-        };
-        if !self.holds(&captured, original) {
-            original.release();
-            if self.restore(ops, &captured) {
-                let _ = ops.step(Step::Restored);
+        let captured = if original.is_some() {
+            if matches!(published, Published::UserSource { .. }) {
+                let _ = ops.step(Step::DestinationVacating);
             }
-            self.dispose(ops, tmp, identity);
-            return if self.settled() {
-                Err(FileError::conflict("replaced"))
-            } else {
-                Err(self.uncertain())
+            let mark = self.checkpoint();
+            let Some(slot) = self.capture(&target.dir, &target.name, &target.path) else {
+                let errno = self.abort_capture(mark);
+                if let Some(held) = original.as_mut() {
+                    held.release();
+                }
+                self.abort_published(ops, tmp, identity, &published); // D1 site 2
+                return Err(match errno {
+                    Some(Errno::ENOENT) => FileError::conflict("gone"),
+                    Some(errno) => FileError::errno(errno),
+                    None => self.uncertain(),
+                });
             };
+            if let Some(held) = original.as_mut()
+                && !self.holds(&slot, held)
+            {
+                held.release();
+                // Both proofs close before restore opens an own-name alias proof:
+                // noino can hide a real S/D hard-link pair.
+                if matches!(published, Published::UserSource { .. }) {
+                    identity.release();
+                }
+                if self.restore(ops, &slot) {
+                    let _ = ops.step(Step::Restored);
+                }
+                self.abort_published(ops, tmp, identity, &published); // D1 site 3
+                return Err(if self.settled() {
+                    FileError::conflict("replaced")
+                } else {
+                    self.uncertain()
+                });
+            }
+            Some(slot)
+        } else {
+            None
+        };
+        let _ = ops.step(if matches!(published, Published::Temp) {
+            Step::Vacated
+        } else {
+            Step::DestinationVacated
+        });
+        let _ = ops.step(Step::Publishing);
+        if !self.holds(tmp, identity) {
+            if let Some(held) = original.as_mut() {
+                held.release();
+            }
+            if matches!(published, Published::UserSource { .. }) {
+                identity.release();
+            }
+            if let Some(slot) = &captured {
+                self.restore(ops, slot);
+            }
+            self.abort_published(ops, tmp, identity, &published);
+            return Err(if self.settled() {
+                FileError::conflict("replaced")
+            } else {
+                self.uncertain()
+            });
         }
-        // The vacant-name seam follows the original's identity proof. A hook
-        // cannot cancel or abandon an object that was already captured.
-        let _ = ops.step(Step::Vacated);
-        let published = self.publish_slot(tmp, method);
-        // NFS may report an error after the publish took effect. Reconcile ANY
-        // error against the live held identity before deciding to compensate.
-        let committed = published.is_ok()
-            || fstatat(
-                tmp.origin.dir.as_fd(),
-                tmp.origin.name.as_os_str(),
-                AtFlags::AT_SYMLINK_NOFOLLOW,
-            )
-            .is_ok_and(|raw| Stat::from_raw(&raw).same_object(&identity.stat));
+        let result = self.publish_slot(tmp, &target, method);
+        // Rename link errors have no cross-name proof on noino; only a transferred
+        // NR dentry can reconcile a lost reply. Replacement retains its protocol.
+        let committed = result.is_ok()
+            || (matches!(method, PublishMethod::NoReplace) || matches!(published, Published::Temp))
+                && self.holds_name(&target.dir, &target.name, identity);
         if committed {
+            if matches!(published, Published::UserSource { .. }) {
+                let _ = ops.step(Step::Renamed);
+                if matches!(method, PublishMethod::Link) {
+                    let _ = ops.step(Step::Linked);
+                }
+            }
+            // Release D even when it aliases S under another presented inode.
+            // Its disposal opens no replacement proof: release S before D unlink.
             match method {
                 PublishMethod::NoReplace => {
                     self.kept.retain(|p| *p != self.path.join(&tmp.name));
                     identity.release();
                 }
                 PublishMethod::Link => {
-                    self.dispose(ops, tmp, identity);
+                    if matches!(published, Published::UserSource { .. })
+                        && let (Some(slot), Some(held)) = (&captured, original.as_mut())
+                    {
+                        self.dispose_link_move(ops, tmp, identity, slot, held);
+                        return Ok(true);
+                    }
+                    self.dispose_alias(ops, tmp, identity);
+                    identity.release();
                 }
             }
-            self.dispose(ops, &captured, original);
+            if let (Some(slot), Some(held)) = (&captured, original) {
+                self.dispose(ops, slot, held);
+            }
             return Ok(matches!(method, PublishMethod::Link));
         }
-        // Not committed: the original is preserved. An EEXIST racer must stay
-        // untouched; do not capture it to finish this operation.
-        if published == Err(Errno::EEXIST) {
-            self.keep(&captured);
-            original.release();
-            self.dispose(ops, tmp, identity);
+        if result == Err(Errno::EEXIST)
+            || (matches!(published, Published::UserSource { .. })
+                && matches!(method, PublishMethod::Link)
+                && !matches!(
+                    fstatat(
+                        target.dir.as_fd(),
+                        target.name.as_os_str(),
+                        AtFlags::AT_SYMLINK_NOFOLLOW
+                    ),
+                    Err(Errno::ENOENT)
+                ))
+        {
+            if let Some(slot) = &captured {
+                self.keep(slot);
+            }
+            if let Some(held) = original {
+                held.release();
+            }
+            self.abort_published(ops, tmp, identity, &published); // D1 site 4
+            if captured.is_none() && self.settled() && result == Err(Errno::EEXIST) {
+                return Err(FileError::errno(Errno::EEXIST));
+            }
             return Err(self.uncertain());
         }
-        original.release(); // close before a restore's possible link-alias unlink
-        if self.restore(ops, &captured) {
+        if let Some(held) = original {
+            held.release();
+        }
+        if matches!(published, Published::UserSource { .. }) {
+            identity.release();
+        }
+        if let Some(slot) = &captured
+            && self.restore(ops, slot)
+        {
             let _ = ops.step(Step::Restored);
         }
-        self.dispose(ops, tmp, identity);
-        let errno = match published {
-            Err(errno) => errno,
-            Ok(()) => return Ok(matches!(method, PublishMethod::Link)),
+        // Temp still needs its creation proof for disposal. It was released above
+        // only on user-source compensation, where no deletion is authorized.
+        self.abort_published(ops, tmp, identity, &published); // D1 site 5
+        let errno = result.err().unwrap_or(Errno::EIO);
+        Err(
+            if match method {
+                PublishMethod::NoReplace => is_unsupported(errno),
+                PublishMethod::Link => is_link_unsupported(errno),
+            } {
+                FileError::unsafe_filesystem()
+            } else {
+                FileError::errno(errno)
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn commit_move(
+        &mut self,
+        ops: &FileOps,
+        from: &Resolved,
+        to: &Resolved,
+        src: &mut Held,
+        dst: Option<&mut Held>,
+        method: Option<PublishMethod>,
+        cancel: &Cancel,
+    ) -> FileResult<bool> {
+        ops.step(Step::Vacating)?;
+        cancel.check()?; // last cancellation point, BEFORE S capture
+        tracing::info!(recovery = %self.path().display(), source = %from.full_path().display(),
+            destination = %to.full_path().display(), "rename capture; manual recovery after a crash");
+        let mark = self.checkpoint();
+        let Some(mut slot) = self.capture(&from.dir, &from.name, &from.full_path()) else {
+            return Err(match self.abort_capture(mark) {
+                Some(Errno::ENOENT) => FileError::conflict("gone"),
+                Some(errno) => FileError::errno(errno),
+                None => self.uncertain(),
+            });
         };
-        let unsupported = match method {
-            PublishMethod::NoReplace => is_unsupported(errno),
-            PublishMethod::Link => is_link_unsupported(errno),
+        let _ = ops.step(Step::Captured);
+        if !self.holds(&slot, src) {
+            src.release();
+            if let Some(dst) = dst {
+                dst.release();
+            }
+            if self.restore(ops, &slot) {
+                let _ = ops.step(Step::Restored);
+            }
+            return Err(if self.settled() {
+                FileError::conflict("replaced")
+            } else {
+                self.uncertain()
+            });
+        }
+        let _ = ops.step(Step::Vacated);
+        if let Some(method) = method {
+            return self.publish_without_exchange(
+                ops,
+                &mut slot,
+                dst,
+                src,
+                cancel,
+                Published::UserSource {
+                    origin: from,
+                    target: to,
+                    method,
+                },
+            );
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(dst) = dst {
+            return self
+                .exchange_move(ops, &mut slot, to, src, dst)
+                .map(|()| false);
+        }
+        self.keep(&slot);
+        Err(self.uncertain())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn exchange_move(
+        &mut self,
+        ops: &FileOps,
+        slot: &mut Slot,
+        to: &Resolved,
+        src: &mut Held,
+        dst: &mut Held,
+    ) -> FileResult<()> {
+        let origin = Origin::new(&to.dir, &to.name, &to.full_path());
+        let source_origin = match origin.and_then(|origin| self.exchange(slot, origin)) {
+            Ok(origin) => origin,
+            Err(errno) => {
+                if self.holds(slot, src) {
+                    src.release();
+                    dst.release();
+                    if self.restore(ops, slot) {
+                        let _ = ops.step(Step::Restored);
+                    }
+                } else {
+                    self.keep(slot);
+                }
+                return Err(if is_unsupported(errno) {
+                    FileError::unsafe_filesystem()
+                } else {
+                    FileError::errno(errno)
+                });
+            }
         };
-        Err(if unsupported {
-            FileError::unsafe_filesystem()
+        let _ = ops.step(Step::Exchanged);
+        let _ = ops.step(Step::Captured);
+        if self.holds(slot, dst) {
+            src.release(); // S and D may alias on noino
+            self.dispose(ops, slot, dst);
+            return Ok(());
+        }
+        dst.release();
+        if let Some(mut candidate) = self.capture(&to.dir, &to.name, &to.full_path()) {
+            let _ = ops.step(Step::Captured);
+            if self.holds(&candidate, src) {
+                // Reclaim while the proof is LIVE, then close it unconditionally.
+                if self.reclaim_origin(&mut candidate, src, source_origin) {
+                    src.release();
+                    if self.restore(ops, slot) {
+                        let _ = ops.step(Step::Restored);
+                    }
+                    if self.restore(ops, &candidate) {
+                        let _ = ops.step(Step::Restored);
+                    }
+                } else {
+                    self.keep(&candidate);
+                }
+            } else {
+                src.release();
+                if self.restore(ops, &candidate) {
+                    let _ = ops.step(Step::Restored);
+                }
+            }
+        }
+        Err(if self.settled() {
+            FileError::conflict("replaced")
         } else {
-            FileError::errno(errno)
+            self.uncertain()
         })
     }
 
@@ -678,7 +1042,9 @@ impl RecoveryDir {
             Err(errno) => {
                 self.last_errno = Some(errno);
                 self.unsettled = true;
-                self.remember(from_path.to_path_buf());
+                // An after-effect reply may leave the public origin vacant.
+                // Report only names that still exist, alongside the actual slot.
+                self.record_public(from_dir, from_name, from_path);
                 // A competing entry at the private slot caused EEXIST: keep and
                 // report it too. A slot observed occupied is never replaced.
                 if fstatat(
@@ -750,15 +1116,15 @@ impl RecoveryDir {
     }
 
     pub(super) fn holds(&self, slot: &Slot, held: &Held) -> bool {
+        self.holds_name(&self.dir, &slot.name, held)
+    }
+
+    fn holds_name(&self, dir: &OwnedFd, name: &OsStr, held: &Held) -> bool {
         let Some(expected) = held.identity() else {
             return false;
         };
-        fstatat(
-            self.dir.as_fd(),
-            slot.name.as_os_str(),
-            AtFlags::AT_SYMLINK_NOFOLLOW,
-        )
-        .is_ok_and(|raw| Stat::from_raw(&raw).same_object(&expected))
+        fstatat(dir.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW)
+            .is_ok_and(|raw| Stat::from_raw(&raw).same_object(&expected))
     }
 
     pub(super) fn matches_for_restore(&self, slot: &Slot, held: &Held) -> bool {
@@ -808,7 +1174,7 @@ impl RecoveryDir {
                     )
                 })
                 .map_err(FileError::errno)?;
-                Ok(self.dispose(ops, slot, &mut held))
+                Ok(self.dispose_alias(ops, slot, &mut held))
             })();
             if matches!(linked, Ok(true)) {
                 return true;
@@ -824,6 +1190,16 @@ impl RecoveryDir {
             }
             Err(_) => {
                 self.unsettled = true;
+                if matches!(
+                    fstatat(
+                        self.dir.as_fd(),
+                        slot.name.as_os_str(),
+                        AtFlags::AT_SYMLINK_NOFOLLOW
+                    ),
+                    Err(Errno::ENOENT)
+                ) {
+                    self.kept.retain(|p| *p != self.path.join(&slot.name));
+                }
                 self.record_public(dir, name, public_path);
                 false
             }
@@ -831,6 +1207,44 @@ impl RecoveryDir {
     }
 
     pub(super) fn dispose(&mut self, ops: &FileOps, slot: &Slot, held: &mut Held) -> bool {
+        self.dispose_inner(ops, slot, held, false)
+    }
+
+    fn dispose_alias(&mut self, ops: &FileOps, slot: &Slot, held: &mut Held) -> bool {
+        self.dispose_inner(ops, slot, held, true)
+    }
+
+    fn dispose_inner(&mut self, ops: &FileOps, slot: &Slot, held: &mut Held, alias: bool) -> bool {
+        let proven = self.prepare_dispose(ops, slot, held, alias);
+        held.release();
+        proven && self.unlink_proven(slot)
+    }
+
+    /// On noino S and D can be hard links with different presented inode numbers.
+    /// Prove both private names first, then close BOTH descriptors before either
+    /// unlink. No snapshot or reopened successor can authorize D's disposal.
+    fn dispose_link_move(
+        &mut self,
+        ops: &FileOps,
+        source: &Slot,
+        src: &mut Held,
+        destination: &Slot,
+        dst: &mut Held,
+    ) {
+        let dispose_destination = self.prepare_dispose(ops, destination, dst, false);
+        // Keep the last-alias observation next to the releases and unlink.
+        let dispose_source = self.prepare_dispose(ops, source, src, true);
+        src.release();
+        dst.release(); // H12: close the possible alias peer before source unlink
+        if dispose_source {
+            self.unlink_proven(source);
+        }
+        if dispose_destination {
+            self.unlink_proven(destination);
+        }
+    }
+
+    fn prepare_dispose(&mut self, ops: &FileOps, slot: &Slot, held: &Held, alias: bool) -> bool {
         // The seam is before the ownership check. Public-name successors must
         // already have been captured; tests must not simulate private exclusion.
         let _ = ops.step(Step::Disposing);
@@ -838,7 +1252,17 @@ impl RecoveryDir {
             self.unsettled = true;
             return false;
         }
-        held.release();
+        // An exposed alias must never be its object's last name. Fresh nlink is
+        // conservative on filesystems with unreliable counts (safe retention).
+        if alias && !held.identity().is_some_and(|stat| stat.nlink >= 2) {
+            self.unsettled = true;
+            return false;
+        }
+        true
+    }
+
+    /// The caller has proved this private name and released every possible peer.
+    fn unlink_proven(&mut self, slot: &Slot) -> bool {
         match run(Primitive::Unlink, || {
             unlinkat(
                 self.dir.as_fd(),
@@ -1356,7 +1780,9 @@ mod tests {
         let stat = Stat::from_metadata(&std::fs::symlink_metadata(&private).unwrap());
         let mut identity = Held::open(&recovery.dir, &slot.name, stat).unwrap();
         assert!(identity.is_held());
-        recovery.publish_slot(&slot, PublishMethod::Link).unwrap();
+        recovery
+            .publish_slot(&slot, &slot.origin, PublishMethod::Link)
+            .unwrap();
         let published = fx.root.join("published-link");
         let public_stat = Stat::from_metadata(&std::fs::symlink_metadata(&published).unwrap());
         assert_eq!(public_stat.kind(), Kind::Symlink);
