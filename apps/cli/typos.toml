@@ -7,6 +7,8 @@ extend-exclude = [
     "target/",
     "*.svg",
     "*.png",
+    # Vendored upstream libfuse headers (test support only), see its PROVENANCE.md.
+    "tests/support/exchangeless/vendor/",
 ]
 
 [default.extend-words]

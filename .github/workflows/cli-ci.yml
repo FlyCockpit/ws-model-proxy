@@ -46,6 +46,27 @@ jobs:
       - run: cargo test --workspace --all-targets --locked
       - run: cargo test --workspace --doc --locked
 
+  # Real exchange-less mounts for the file tools (issue #172): a FUSE passthrough daemon in
+  # six classes (NOREPLACE/link/neither, with and without stable inode numbers) runs the
+  # env-gated real-filesystem test. Nothing is installed: gcc, the distro's setuid
+  # fusermount3 and libfuse3.so.3 come with the image, and the daemon compiles against the
+  # vendored libfuse 3.14 headers (apps/cli/tests/support/exchangeless/vendor/libfuse3).
+  # Pinned to 24.04: ubuntu-latest moves to 26.04 in November 2026; re-evaluate then.
+  # The job FAILS (never skips) when it cannot mount.
+  exchangeless-fs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    if: github.event_name != 'schedule'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: apps/cli -> target
+      - run: bash scripts/test-exchangeless-fs.sh smoke
+
   fmt:
     runs-on: ubuntu-latest
     if: github.event_name != 'schedule'
