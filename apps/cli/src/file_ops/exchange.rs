@@ -220,9 +220,10 @@ pub(super) fn no_replace(
 /// directions (and, without stable inode numbers, every name has its own cached
 /// attributes), so a guard built on it can delete an object's last name or retain a
 /// clean alias every time. Linux therefore asks for `statx` with
-/// `AT_STATX_FORCE_SYNC`. Other Unix systems have no such flag: they get the plain
-/// stat, and callers must not treat it as proof (see `dispose_link_move`). An error
-/// is an error: callers keep what they were about to delete.
+/// `AT_STATX_FORCE_SYNC` (a kernel without statx falls back to the plain stat). Other
+/// Unix systems have no such flag and get the plain stat. The count is never a proof:
+/// `RecoveryDir::calibrate_counts` decides per operation whether it can veto an unlink
+/// at all, and an unreadable count under a believable mount keeps the alias.
 pub(super) fn link_count(dir: impl AsFd, name: &OsStr) -> Result<u64, Errno> {
     run(Primitive::LinkCount, || {
         #[cfg(target_os = "linux")]

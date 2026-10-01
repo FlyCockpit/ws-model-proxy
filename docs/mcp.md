@@ -410,8 +410,9 @@ and reports it (a veto, never a proof). Belief is decided per operation from the
 right after the probe link the object has two names, so a count of 1 or an unreadable count
 means counts cannot be used here (sshfs always reports 1) and the veto is off, exactly as
 for replace in #169. The count is read by name with `statx` and `AT_STATX_FORCE_SYNC` on
-Linux, so the kernel's attribute cache (FUSE, NFS, SMB) cannot make it stale; a daemon's
-own cache can, and then the veto is no better than none. A third save after the final
+Linux, so the kernel's attribute cache (FUSE, NFS, SMB) cannot make it stale (kernels
+without statx, and other Unix systems such as macOS, use a plain stat, which can be); a
+daemon's own cache can too, and then the veto is no better than none. A third save after the final
 observation but before unlink, or on a mount whose counts mean nothing, can still orphan
 the inode and discard the writes: this is the residual, narrowed where counts are real.
 If alias cleanup fails instead, the published file has two hard links (nlink 2)
