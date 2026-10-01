@@ -1648,7 +1648,10 @@ export class RelaySessionManager {
       // "Sustained" waiting counts consecutive accepted frames. A gap longer
       // than the staleness window restarts the count (fail open).
       const continuous = previous && nowMs - previous.receivedAtMs <= ENDPOINT_LOAD_STALE_AFTER_MS;
-      const waitingStreak = load.waiting > 0 ? (continuous ? previous.waitingStreak : 0) + 1 : 0;
+      const waitingStreak =
+        load.waiting != null && load.waiting > 0
+          ? (continuous ? previous.waitingStreak : 0) + 1
+          : 0;
       session.endpointLoad.set(key, {
         ...load,
         modelSlug: load.modelSlug ?? null,

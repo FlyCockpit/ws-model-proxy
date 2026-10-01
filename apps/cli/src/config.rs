@@ -448,6 +448,10 @@ pub struct EndpointConfig {
     /// `concurrencyLimit`; when set it wins over a probed K.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_tokens: Option<u64>,
+    /// Custom engine adapter. Digest-excluded; when set it replaces the
+    /// built-in load scrape for this endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_adapter: Option<crate::engine_adapter::EngineAdapterConfig>,
     /// Upstream engine. `auto` (the default) detects it at probe time; an
     /// explicit value overrides detection. llama.cpp and vLLM advertise
     /// `top_k` in the inventory only when declared explicitly.
@@ -472,6 +476,7 @@ impl Default for EndpointConfig {
             expand_media: false,
             concurrency_limit: None,
             kv_tokens: None,
+            engine_adapter: None,
             engine: EndpointEngine::Auto,
             default_capabilities: OpenAiCompatibleCapabilities::default(),
             headers: Vec::new(),
@@ -610,6 +615,10 @@ pub struct ProbeSnapshot {
     /// the inventory and never part of the inventory digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<crate::engine::DetectedEngine>,
+    /// Integer facts from the last successful adapter run. Kept across a
+    /// failing run so K does not flap to null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<crate::engine_adapter::AdapterCachedFacts>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1564,6 +1573,11 @@ impl Config {
                     endpoint.slug
                 );
             }
+            if let Some(adapter) = &endpoint.engine_adapter {
+                adapter.validate().with_context(|| {
+                    format!("validating engine adapter for endpoint `{}`", endpoint.slug)
+                })?;
+            }
             if let Some(auth) = &endpoint.auth {
                 validate_env_name(&auth.env)?;
             }
@@ -2305,6 +2319,7 @@ mod tests {
             models: Vec::new(),
             suggested_capabilities: OpenAiCompatibleCapabilities::default(),
             engine: None,
+            adapter: None,
         });
         assert!(config.validate().is_err());
 

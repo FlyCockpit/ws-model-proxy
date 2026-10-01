@@ -21,8 +21,9 @@
 //! server's tests) keep the two sides in step.
 
 use crate::protocol::{
-    ClientControlMessage, EndpointLoad, NODE_DISK_MAX, NODE_GPU_MAX, NODE_INTERFACE_ADDRESS_MAX,
-    NODE_INTERFACE_MAX, NODE_METRICS_CUSTOM_MAX, NODE_METRICS_SOURCES_MAX, NodeInfo, NodeMetrics,
+    ClientControlMessage, EndpointLoad, NODE_DISK_MAX, NODE_ENGINE_ADAPTERS_MAX, NODE_GPU_MAX,
+    NODE_INTERFACE_ADDRESS_MAX, NODE_INTERFACE_MAX, NODE_METRICS_CUSTOM_MAX,
+    NODE_METRICS_SOURCES_MAX, NodeInfo, NodeMetrics,
 };
 use crate::telemetry::{
     BYTE_COUNTER_MAX, METRIC_SOURCE_INTERVAL_MAX_SECS, METRIC_SOURCE_INTERVAL_MIN_SECS,
@@ -195,6 +196,10 @@ pub fn conform_node_metrics(metrics: &mut NodeMetrics) {
         .sources
         .retain(|source| is_metric_name(&source.name));
     metrics.sources.truncate(NODE_METRICS_SOURCES_MAX);
+    metrics
+        .engine_adapters
+        .retain(|status| (1..=63).contains(&status.endpoint_slug.len()));
+    metrics.engine_adapters.truncate(NODE_ENGINE_ADAPTERS_MAX);
     for source in &mut metrics.sources {
         source.command_sha256 = source.command_sha256.take().filter(|hash| {
             hash.len() == 64
@@ -209,20 +214,40 @@ pub fn conform_node_metrics(metrics: &mut NodeMetrics) {
 }
 
 pub fn conform_endpoint_load(load: &mut EndpointLoad) {
-    load.running = load.running.min(LOAD_COUNT_MAX);
-    load.waiting = load.waiting.min(LOAD_COUNT_MAX);
-    load.slots_busy = load.slots_busy.map(|value| value.min(LOAD_COUNT_MAX));
-    load.deferred = load.deferred.map(|value| value.min(LOAD_COUNT_MAX));
-    load.kv_usage = load
-        .kv_usage
-        .filter(|value| value.is_finite())
-        .map(|value| value.clamp(0.0, 1.0));
     load.prefix_cache_hits_delta = load
         .prefix_cache_hits_delta
         .map(|value| value.min(BYTE_COUNTER_MAX));
     load.prefix_cache_queries_delta = load
         .prefix_cache_queries_delta
         .map(|value| value.min(BYTE_COUNTER_MAX));
+    if load.source == crate::engine::LoadSource::Custom {
+        // Adapter normalize already dropped out-of-range values. Do not clamp
+        // custom fractions: clamping 95 to 1.0 would mean "always FULL".
+        if load.running > LOAD_COUNT_MAX {
+            load.running = LOAD_COUNT_MAX;
+        }
+        load.waiting = load.waiting.filter(|value| *value <= LOAD_COUNT_MAX);
+        load.slots_busy = load.slots_busy.filter(|value| *value <= LOAD_COUNT_MAX);
+        load.deferred = load.deferred.filter(|value| *value <= LOAD_COUNT_MAX);
+        load.kv_usage = load
+            .kv_usage
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value));
+        load.kv_occupancy = load
+            .kv_occupancy
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value));
+        return;
+    }
+    load.running = load.running.min(LOAD_COUNT_MAX);
+    load.waiting = load.waiting.map(|value| value.min(LOAD_COUNT_MAX));
+    load.slots_busy = load.slots_busy.map(|value| value.min(LOAD_COUNT_MAX));
+    load.deferred = load.deferred.map(|value| value.min(LOAD_COUNT_MAX));
+    load.kv_usage = load
+        .kv_usage
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, 1.0));
+    load.kv_occupancy = load
+        .kv_occupancy
+        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value));
 }
 
 /// `[A-Za-z0-9_.:@-]{1,64}` (the server's `interfaceNameSchema`).
@@ -449,6 +474,7 @@ mod tests {
                     error: None,
                 },
             ],
+            engine_adapters: Vec::new(),
         }
     }
 
@@ -457,8 +483,9 @@ mod tests {
             endpoint_slug: "vllm".to_string(),
             model_slug: None,
             running: u64::MAX,
-            waiting: LOAD_COUNT_MAX + 1,
+            waiting: Some(LOAD_COUNT_MAX + 1),
             kv_usage: Some(f64::NAN),
+            kv_occupancy: None,
             slots_busy: Some(2_000_000),
             deferred: Some(LOAD_COUNT_MAX),
             prefix_cache_hits_delta: Some(u64::MAX),
@@ -512,12 +539,30 @@ mod tests {
     }
 
     #[test]
+    fn custom_load_drops_out_of_range_fractions_instead_of_clamping() {
+        let mut load = EndpointLoad {
+            running: 3,
+            waiting: Some(LOAD_COUNT_MAX + 1),
+            kv_usage: Some(95.0),
+            kv_occupancy: Some(1.5),
+            source: LoadSource::Custom,
+            ..extreme_load()
+        };
+        conform_endpoint_load(&mut load);
+        assert_eq!(load.running, 3);
+        assert_eq!(load.waiting, None);
+        assert_eq!(load.kv_usage, None);
+        assert_eq!(load.kv_occupancy, None);
+    }
+
+    #[test]
     fn in_range_frames_pass_unchanged() {
         for message in [
             ClientControlMessage::EndpointLoad(EndpointLoad {
                 running: LOAD_COUNT_MAX,
-                waiting: 0,
+                waiting: Some(0),
                 kv_usage: Some(1.0),
+                kv_occupancy: Some(1.0),
                 slots_busy: Some(0),
                 deferred: None,
                 prefix_cache_hits_delta: Some(BYTE_COUNTER_MAX),

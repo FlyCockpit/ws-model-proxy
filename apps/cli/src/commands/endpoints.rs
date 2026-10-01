@@ -7,6 +7,9 @@ use crate::config::{
     Config, EndpointConfig, EndpointEngine, HeaderEnvRef, OpenAiCompatibleCapabilities,
     validate_env_name,
 };
+use crate::engine_adapter::{
+    AdapterFormat, AdapterInput, AdapterSample, DropReason, EngineAdapterConfig, parse_map_flag,
+};
 use crate::exit::{CodedError, ExitCode};
 use crate::output;
 use crate::probe::{ProbeReport, apply_probe_report, probe_endpoint};
@@ -39,6 +42,8 @@ enum Sub {
     KvTokens(KvTokensArgs),
     /// Declare the upstream engine. llama.cpp and vLLM advertise `top_k`.
     Engine(EngineArgs),
+    /// Configure a custom engine adapter for an endpoint.
+    Adapter(AdapterArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -133,6 +138,53 @@ struct EngineArgs {
 }
 
 #[derive(Debug, clap::Args)]
+struct AdapterArgs {
+    #[command(subcommand)]
+    command: AdapterSub,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum AdapterSub {
+    /// Set a custom engine adapter on an endpoint.
+    Set(AdapterSetArgs),
+    /// Show the adapter configured on an endpoint.
+    Show { slug: String },
+    /// Remove the adapter from an endpoint.
+    Clear { slug: String },
+    /// Run the adapter once and print normalized signals. Never prints raw output.
+    Test { slug: String },
+}
+
+#[derive(Debug, clap::Args)]
+struct AdapterSetArgs {
+    slug: String,
+    /// Relative path on the endpoint root (no scheme, host, `..`, or query).
+    #[arg(long, conflicts_with = "command")]
+    route: Option<String>,
+    /// Local command, run with the same bounds as metric sources.
+    #[arg(long)]
+    command: Option<String>,
+    /// `json` (canonical keys need no map) or `prometheus` (map required).
+    #[arg(long, value_enum)]
+    format: AdapterFormatChoice,
+    /// `signal=series[{k="v"}][*scale]`. Repeatable.
+    #[arg(long = "map")]
+    map: Vec<String>,
+    /// Sample interval in seconds (2–5). Default 2.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(2..=5))]
+    interval: Option<u32>,
+    /// Per-sample timeout in seconds (1–4). Default 2.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4))]
+    timeout: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum AdapterFormatChoice {
+    Json,
+    Prometheus,
+}
+
+#[derive(Debug, clap::Args)]
 struct ProbeArgs {
     slug: Option<String>,
     /// Apply non-secret probe suggestions to local config.
@@ -152,6 +204,7 @@ pub fn run(args: &Args) -> Result<()> {
         Sub::Concurrency(concurrency) => set_concurrency(args.json, concurrency),
         Sub::KvTokens(kv_tokens) => set_kv_tokens(args.json, kv_tokens),
         Sub::Engine(engine) => set_engine(args.json, engine),
+        Sub::Adapter(adapter) => adapter_command(args.json, adapter),
     }
 }
 
@@ -324,6 +377,243 @@ fn set_kv_tokens(json: bool, args: &KvTokensArgs) -> Result<()> {
         output::line(format!("set kv-tokens for `{}` to {tokens}", endpoint.slug))?;
     } else {
         output::line(format!("cleared kv-tokens for `{}`", endpoint.slug))?;
+    }
+    Ok(())
+}
+
+fn adapter_command(json: bool, args: &AdapterArgs) -> Result<()> {
+    match &args.command {
+        AdapterSub::Set(set) => adapter_set(json, set),
+        AdapterSub::Show { slug } => adapter_show(json, slug),
+        AdapterSub::Clear { slug } => adapter_clear(json, slug),
+        AdapterSub::Test { slug } => adapter_test(json, slug),
+    }
+}
+
+fn adapter_set(json: bool, args: &AdapterSetArgs) -> Result<()> {
+    let input = match (&args.route, &args.command) {
+        (Some(route), None) => AdapterInput::Route {
+            route: route.clone(),
+        },
+        (None, Some(command)) => AdapterInput::Command {
+            command: command.clone(),
+        },
+        _ => anyhow::bail!("adapter set requires exactly one of --route or --command"),
+    };
+    let mut map = std::collections::BTreeMap::new();
+    for raw in &args.map {
+        let (signal, selector) = parse_map_flag(raw)?;
+        map.insert(signal, selector);
+    }
+    let spec = EngineAdapterConfig {
+        input,
+        format: match args.format {
+            AdapterFormatChoice::Json => AdapterFormat::Json,
+            AdapterFormatChoice::Prometheus => AdapterFormat::Prometheus,
+        },
+        interval_secs: args.interval.unwrap_or(2),
+        timeout_secs: args.timeout.unwrap_or(2),
+        map,
+    };
+    spec.validate()?;
+    let endpoint = update_endpoint(&args.slug, |endpoint| {
+        endpoint.engine_adapter = Some(spec.clone());
+        Ok(())
+    })?;
+    if crate::engine::effective_kind(&endpoint).is_some_and(|(kind, _)| kind.has_load_source()) {
+        output::diagnostic(
+            "warning: the adapter replaces the built-in load scrape for this endpoint",
+        )?;
+    }
+    if json {
+        output::json(&endpoint)?;
+    } else {
+        output::line(format!(
+            "set adapter for `{}` ({})",
+            endpoint.slug,
+            match spec.input {
+                AdapterInput::Route { .. } => "route",
+                AdapterInput::Command { .. } => "command",
+            }
+        ))?;
+    }
+    Ok(())
+}
+
+fn adapter_show(json: bool, slug: &str) -> Result<()> {
+    let config = Config::load_required()?;
+    let endpoint = config.endpoint(slug).ok_or_else(|| {
+        anyhow::Error::msg(format!("endpoint `{slug}` not found"))
+            .context(CodedError::new(ExitCode::NotFound))
+    })?;
+    let Some(spec) = &endpoint.engine_adapter else {
+        if json {
+            output::json(&serde_json::json!({ "slug": slug, "adapter": null }))?;
+        } else {
+            output::line(format!("no adapter configured for `{slug}`"))?;
+        }
+        return Ok(());
+    };
+    if json {
+        output::json(&spec)?;
+    } else {
+        match &spec.input {
+            AdapterInput::Route { route } => {
+                output::line(format!("{slug}\troute\t{route}"))?;
+            }
+            AdapterInput::Command { command } => {
+                output::line(format!("{slug}\tcommand\t{command}"))?;
+            }
+        }
+        output::line(format!(
+            "  format {} interval {}s timeout {}s",
+            match spec.format {
+                AdapterFormat::Json => "json",
+                AdapterFormat::Prometheus => "prometheus",
+            },
+            spec.interval_secs,
+            spec.timeout_secs
+        ))?;
+        for (signal, selector) in &spec.map {
+            output::line(format!("  map {}={}", signal.as_str(), selector.series))?;
+        }
+    }
+    Ok(())
+}
+
+fn adapter_clear(json: bool, slug: &str) -> Result<()> {
+    let endpoint = update_endpoint(slug, |endpoint| {
+        endpoint.engine_adapter = None;
+        if let Some(probe) = endpoint.last_probe.as_mut() {
+            probe.adapter = None;
+        }
+        Ok(())
+    })?;
+    if json {
+        output::json(&endpoint)?;
+    } else {
+        output::line(format!("cleared adapter for `{slug}`"))?;
+    }
+    Ok(())
+}
+
+fn adapter_test(json: bool, slug: &str) -> Result<()> {
+    let config = Config::load_required()?;
+    let endpoint = config.endpoint(slug).cloned().ok_or_else(|| {
+        anyhow::Error::msg(format!("endpoint `{slug}` not found"))
+            .context(CodedError::new(ExitCode::NotFound))
+    })?;
+    let Some(spec) = &endpoint.engine_adapter else {
+        anyhow::bail!("no adapter configured for `{slug}`");
+    };
+    spec.validate()?;
+    let sample = crate::engine_adapter::sample(&endpoint, spec, None);
+    print_adapter_test(json, slug, sample)
+}
+
+fn print_adapter_test(
+    json: bool,
+    slug: &str,
+    sample: Result<AdapterSample, crate::engine_adapter::AdapterError>,
+) -> Result<()> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TestOutput {
+        slug: String,
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        running: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        waiting: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kv_usage: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        kv_occupancy: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        slots_busy: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        deferred: Option<u64>,
+        dropped: Vec<DroppedRow>,
+        missing: Vec<&'static str>,
+    }
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct DroppedRow {
+        signal: &'static str,
+        reason: &'static str,
+    }
+    let output_value = match sample {
+        Ok(sample) => {
+            let reading = sample.reading.as_ref();
+            TestOutput {
+                slug: slug.to_string(),
+                ok: reading.is_some(),
+                error: sample.error.map(|error| error.as_str()),
+                running: reading.map(|reading| reading.running),
+                waiting: reading.and_then(|reading| reading.waiting),
+                kv_usage: reading.and_then(|reading| reading.kv_usage),
+                kv_occupancy: reading.and_then(|reading| reading.kv_occupancy),
+                slots_busy: reading.and_then(|reading| reading.slots_busy),
+                deferred: reading.and_then(|reading| reading.deferred),
+                dropped: sample
+                    .dropped
+                    .iter()
+                    .map(|row| DroppedRow {
+                        signal: row.signal.as_str(),
+                        reason: match row.reason {
+                            DropReason::Unmapped => "unmapped",
+                            DropReason::OutOfRange => "out_of_range",
+                        },
+                    })
+                    .collect(),
+                missing: sample
+                    .missing
+                    .iter()
+                    .map(|signal| signal.as_str())
+                    .collect(),
+            }
+        }
+        Err(error) => TestOutput {
+            slug: slug.to_string(),
+            ok: false,
+            error: Some(error.as_str()),
+            running: None,
+            waiting: None,
+            kv_usage: None,
+            kv_occupancy: None,
+            slots_busy: None,
+            deferred: None,
+            dropped: Vec::new(),
+            missing: Vec::new(),
+        },
+    };
+    if json {
+        output::json(&output_value)?;
+    } else if output_value.ok {
+        let mut parts = vec![format!("running={}", output_value.running.unwrap_or(0))];
+        if let Some(waiting) = output_value.waiting {
+            parts.push(format!("waiting={waiting}"));
+        }
+        if let Some(kv) = output_value.kv_usage {
+            parts.push(format!("kvUsage={kv}"));
+        }
+        if let Some(kv) = output_value.kv_occupancy {
+            parts.push(format!("kvOccupancy={kv}"));
+        }
+        output::line(format!("{slug}\t{}", parts.join(" ")))?;
+        for row in &output_value.dropped {
+            output::line(format!("  dropped {} ({})", row.signal, row.reason))?;
+        }
+    } else {
+        output::line(format!(
+            "{slug}\tfailing\t{}",
+            output_value.error.unwrap_or("unknown")
+        ))?;
+        for row in &output_value.dropped {
+            output::line(format!("  dropped {} ({})", row.signal, row.reason))?;
+        }
     }
     Ok(())
 }

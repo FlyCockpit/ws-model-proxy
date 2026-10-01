@@ -639,6 +639,7 @@ fn same_desired_config(left: &Config, right: &Config) -> bool {
         for endpoint in &mut config.endpoints {
             if let Some(probe) = endpoint.last_probe.as_mut() {
                 probe.engine = None;
+                probe.adapter = None;
             }
         }
         config
@@ -660,7 +661,8 @@ fn config_with_fresh_engine_facts(active: &Config) -> (Config, Vec<EndpointInven
         .enumerate()
         .filter(|(_, endpoint)| {
             endpoint.enabled
-                && endpoint.engine != crate::config::EndpointEngine::Generic
+                && (endpoint.engine != crate::config::EndpointEngine::Generic
+                    || endpoint.engine_adapter.is_some())
                 && endpoint
                     .last_probe
                     .as_ref()
@@ -704,11 +706,15 @@ fn config_with_fresh_engine_facts(active: &Config) -> (Config, Vec<EndpointInven
         });
         for (index, engine) in detected {
             // A failed re-detection keeps the facts the last probe found.
-            if !re_detection_replaces_stored(&engine) {
-                continue;
-            }
-            if let Some(probe) = refreshed.endpoints[index].last_probe.as_mut() {
+            if re_detection_replaces_stored(&engine)
+                && let Some(probe) = refreshed.endpoints[index].last_probe.as_mut()
+            {
                 probe.engine = Some(engine);
+            }
+            if let Some(facts) = crate::engine_adapter::probe_facts(&refreshed.endpoints[index])
+                && let Some(probe) = refreshed.endpoints[index].last_probe.as_mut()
+            {
+                probe.adapter = Some(facts);
             }
         }
     }
@@ -3070,6 +3076,7 @@ fn inventory_from_config(config: &mut Config) -> Vec<EndpointInventory> {
                             model_suggestions: Vec::new(),
                             error: Some("endpoint probe worker panicked".to_string()),
                             engine: None,
+                            adapter: None,
                         }
                     }
                 })
@@ -3172,6 +3179,7 @@ mod tests {
                 models: vec!["model-a".to_string()],
                 suggested_capabilities: crate::config::OpenAiCompatibleCapabilities::default(),
                 engine: None,
+                adapter: None,
             }),
             ..Default::default()
         });
@@ -3881,6 +3889,7 @@ mod tests {
                 models: vec!["m".to_string()],
                 suggested_capabilities: crate::config::OpenAiCompatibleCapabilities::default(),
                 engine: None,
+                adapter: None,
             }),
             ..crate::config::EndpointConfig::default()
         });
@@ -3895,7 +3904,10 @@ mod tests {
         assert_eq!(advertised, Some(crate::engine::EngineKind::LlamaCpp));
         let targets = crate::telemetry::load_targets(&config.endpoints);
         assert_eq!(targets.len(), 1, "the sampler scrapes the detected engine");
-        assert_eq!(targets[0].1, crate::engine::EngineKind::LlamaCpp);
+        assert_eq!(
+            targets[0].1,
+            crate::engine_adapter::LoadPlan::BuiltIn(crate::engine::EngineKind::LlamaCpp)
+        );
         // The refreshed facts do not make the snapshot a different desired
         // inventory, so the next reconnect still takes the fast path.
         assert!(same_desired_config(&config, &active));

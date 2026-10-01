@@ -18,11 +18,11 @@ export type EngineKindName = (typeof ENGINE_KIND_NAMES)[number];
 /** Prisma `EngineKind` values. */
 export type EngineKind = "GENERIC" | "LLAMA_CPP" | "VLLM" | "SGLANG" | "OLLAMA" | "LM_STUDIO";
 /** Prisma `EngineFactsSource` values. */
-export type EngineFactsSource = "PROBE" | "CONFIG" | "MIXED";
+export type EngineFactsSource = "PROBE" | "CONFIG" | "MIXED" | "CUSTOM";
 /** Prisma `EngineFactSource` values (per-fact provenance). */
 export type EngineFactSource = "PROBE" | "CONFIG" | "CUSTOM";
 
-type WireFact<T> = { value: T; source: "probe" | "config" };
+type WireFact<T> = { value: T; source: "probe" | "config" | "custom" };
 
 /** The relay 2.7 `engineFacts` object (validated by the relay's strict schema). */
 export type WireEngineFacts = {
@@ -87,7 +87,9 @@ function storedInt(fact: WireFact<number> | undefined): number | null {
 }
 
 function storedFactSource(source: WireFact<unknown>["source"]): EngineFactSource {
-  return source === "config" ? "CONFIG" : "PROBE";
+  if (source === "config") return "CONFIG";
+  if (source === "custom") return "CUSTOM";
+  return "PROBE";
 }
 
 function storedIntWithSource(fact: WireFact<number> | undefined): {
@@ -127,7 +129,14 @@ export function storedEngineFacts(facts: WireEngineFacts | undefined): StoredEng
   if (sources.size === 0) return null;
   return {
     ...stored,
-    engineFactsSource: sources.size > 1 ? "MIXED" : sources.has("config") ? "CONFIG" : "PROBE",
+    engineFactsSource:
+      sources.size > 1
+        ? "MIXED"
+        : sources.has("config")
+          ? "CONFIG"
+          : sources.has("custom")
+            ? "CUSTOM"
+            : "PROBE",
   };
 }
 

@@ -45,13 +45,14 @@ export type LiveEndpointLoad = {
   endpointSlug: string;
   modelSlug: string | null;
   running: number;
-  waiting: number;
+  waiting?: number;
   kvUsage?: number;
+  kvOccupancy?: number;
   slotsBusy?: number;
   deferred?: number;
   prefixCacheHitsDelta?: number;
   prefixCacheQueriesDelta?: number;
-  source: "llama.cpp-slots" | "llama.cpp-metrics" | "vllm-metrics" | "sglang-metrics";
+  source: "llama.cpp-slots" | "llama.cpp-metrics" | "vllm-metrics" | "sglang-metrics" | "custom";
   /** Consecutive accepted frames with `waiting > 0`; a gap or `waiting == 0` resets it. */
   waitingStreak: number;
   /** Prefix cache deltas summed over this session's frames (for the dashboard). */

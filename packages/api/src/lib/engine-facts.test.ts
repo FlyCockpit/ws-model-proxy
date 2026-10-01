@@ -54,6 +54,11 @@ describe("engine facts", () => {
       engineSlotsSource: "CONFIG",
       engineFactsSource: "CONFIG",
     });
+    expect(storedEngineFacts({ kvTokens: { value: 262_144, source: "custom" } })).toMatchObject({
+      kvBudgetTokens: 262_144,
+      kvBudgetTokensSource: "CUSTOM",
+      engineFactsSource: "CUSTOM",
+    });
     expect(
       storedEngineFacts({
         engine: { value: "generic", source: "config" },

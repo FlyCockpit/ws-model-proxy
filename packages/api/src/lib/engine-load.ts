@@ -70,7 +70,7 @@ export type EngineLoadFacts = {
 /** One endpoint/model reading as the relay session keeps it. */
 export type EngineLoadReading = {
   running: number;
-  waiting: number;
+  waiting?: number;
   kvUsage?: number | undefined;
   slotsBusy?: number | undefined;
   deferred?: number | undefined;
@@ -130,7 +130,7 @@ export function evaluateEngineLoad(
     return { state: "clear", full: false, expiresAt: null };
   }
   // vLLM / SGLang.
-  if (reading.waiting > 0 && reading.waitingStreak >= WAITING_SUSTAINED_FRAMES) {
+  if ((reading.waiting ?? 0) > 0 && reading.waitingStreak >= WAITING_SUSTAINED_FRAMES) {
     return full("full_waiting");
   }
   if (

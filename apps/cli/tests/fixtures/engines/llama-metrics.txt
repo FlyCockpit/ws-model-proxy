@@ -7,3 +7,6 @@ llamacpp:requests_processing 1
 # HELP llamacpp:requests_deferred Number of requests deferred.
 # TYPE llamacpp:requests_deferred gauge
 llamacpp:requests_deferred 2
+# HELP llamacpp:kv_cache_usage_ratio KV-cache usage. 1 means the cache is full.
+# TYPE llamacpp:kv_cache_usage_ratio gauge
+llamacpp:kv_cache_usage_ratio 0.35

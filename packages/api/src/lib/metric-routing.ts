@@ -323,8 +323,9 @@ export type EndpointLoadSample = {
   endpointSlug: string;
   modelSlug: string | null;
   running: number;
-  waiting: number;
+  waiting?: number;
   kvUsage?: number;
+  kvOccupancy?: number;
   slotsBusy?: number;
   deferred?: number;
   /** Consecutive accepted frames with `waiting > 0` (S-D; 0 when unknown). */

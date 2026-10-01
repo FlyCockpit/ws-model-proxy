@@ -1,0 +1,133 @@
+{
+  "type": "hello",
+  "id": "hello-1",
+  "protocolVersion": "2.9",
+  "cli": {
+    "slug": "desk",
+    "hostname": "desk-01.local",
+    "version": "0.4.0",
+    "capabilities": {
+      "protocolVersion": "2.9",
+      "inventoryAck": true,
+      "inventoryReplace": true,
+      "endpointTargeting": true,
+      "binaryFrames": true,
+      "cancellation": true,
+      "maxBinaryChunkBytes": 1048576,
+      "requestBodyStreaming": true,
+      "requestBodyWindowChunks": 16,
+      "sharedTokenizerTps": true,
+      "standardizedMetrics": true,
+      "terminal": true,
+      "exec": true,
+      "features": {
+        "humanTerminal": false,
+        "mcpCommandMode": "off",
+        "terminalApproval": false,
+        "terminalSupported": true,
+        "remoteMetricSources": false,
+        "mcpFileRead": false,
+        "fileRootsConfigured": false,
+        "allowFileToolsAsRoot": false
+      },
+      "terminalPublicKey": "BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A",
+      "terminalViewers": true,
+      "supervisedCommands": true,
+      "nodeTelemetry": true,
+      "fileOps": true
+    }
+  },
+  "endpoints": [
+    {
+      "slug": "vllm",
+      "label": "vLLM",
+      "kind": "openai-compatible",
+      "status": "online",
+      "defaultCapabilities": {
+        "version": 1,
+        "protocol": "openai-compatible",
+        "models": {
+          "list": true
+        },
+        "chatCompletions": {
+          "supported": true,
+          "streaming": true
+        }
+      },
+      "models": [
+        {
+          "slug": "llama",
+          "upstreamModelId": "meta/llama",
+          "capabilityOverrideMode": "inherit",
+          "concurrencyLimit": 8,
+          "engineFacts": {
+            "maxModelLen": {
+              "value": 131072,
+              "source": "probe"
+            }
+          }
+        }
+      ],
+      "engineFacts": {
+        "engine": {
+          "value": "vllm",
+          "source": "probe"
+        },
+        "slots": {
+          "value": 8,
+          "source": "config"
+        },
+        "kvTokens": {
+          "value": 32768,
+          "source": "probe"
+        },
+        "servedModelAliases": {
+          "value": ["meta/llama", "llama-alias"],
+          "source": "probe"
+        }
+      }
+    },
+    {
+      "slug": "llama",
+      "label": "llama.cpp",
+      "kind": "openai-compatible",
+      "status": "online",
+      "defaultCapabilities": {
+        "version": 1,
+        "protocol": "openai-compatible",
+        "models": {
+          "list": true
+        },
+        "chatCompletions": {
+          "supported": true,
+          "streaming": true
+        }
+      },
+      "models": [
+        {
+          "slug": "qwen",
+          "upstreamModelId": "qwen",
+          "capabilityOverrideMode": "inherit"
+        }
+      ],
+      "engineFacts": {
+        "engine": {
+          "value": "llama.cpp",
+          "source": "config"
+        },
+        "slots": {
+          "value": 4,
+          "source": "probe"
+        },
+        "ctxPerSlot": {
+          "value": 32768,
+          "source": "probe"
+        },
+        "maxModelLen": {
+          "value": 32768,
+          "source": "probe"
+        }
+      }
+    }
+  ]
+}

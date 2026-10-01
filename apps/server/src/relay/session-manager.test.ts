@@ -2280,24 +2280,24 @@ describe("relay terminal and exec sessions", () => {
       })(),
     ],
     [
-      "a 2.9 hello (a CLI newer than this server)",
+      "a 2.10 hello (a CLI newer than this server)",
       (() => {
         const frame = JSON.parse(helloCli()) as {
           protocolVersion: string;
           cli: { capabilities: Record<string, unknown> };
         };
-        frame.protocolVersion = "2.9";
-        frame.cli.capabilities.protocolVersion = "2.9";
+        frame.protocolVersion = "2.10";
+        frame.cli.capabilities.protocolVersion = "2.10";
         return JSON.stringify(frame);
       })(),
     ],
     [
       // The top-level version alone must trip the gate: the capability echo is
       // still 2.8, so the capability comparison would not refuse this frame.
-      "a 2.9 hello whose capability echo still says 2.8",
+      "a 2.10 hello whose capability echo still says 2.8",
       (() => {
         const frame = JSON.parse(helloCli()) as { protocolVersion: string };
-        frame.protocolVersion = "2.9";
+        frame.protocolVersion = "2.10";
         return JSON.stringify(frame);
       })(),
     ],
@@ -2403,9 +2403,9 @@ describe("relay terminal and exec sessions", () => {
       protocolVersion: string;
       cli: { version?: string; capabilities: Record<string, unknown> };
     };
-    frame.protocolVersion = "2.9";
+    frame.protocolVersion = "2.10";
     frame.cli.version = "0.9.0-rc.1+build.5";
-    frame.cli.capabilities.protocolVersion = "2.9";
+    frame.cli.capabilities.protocolVersion = "2.10";
     manager.acceptAuthenticatedSocket({
       socket,
       identity: { ...identity, kind: "deviceCredential", cliDeviceId: "bound-device" },
@@ -2423,7 +2423,7 @@ describe("relay terminal and exec sessions", () => {
     expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
       where: { id: "bound-device", userId: "user-id" },
       data: {
-        rejectedRelayProtocolVersion: "2.9",
+        rejectedRelayProtocolVersion: "2.10",
         rejectedCliVersion: "0.9.0-rc.1+build.5",
         relayRejectedAt: now,
       },
@@ -2439,6 +2439,23 @@ describe("relay terminal and exec sessions", () => {
     const socket = new FakeSocket();
     await register(manager, socket);
     expect(JSON.parse(String(socket.sends[0]))).toMatchObject({ type: "hello.ok" });
+    expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
+  });
+
+  it("registers a valid 2.9 hello", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    const frame = JSON.parse(helloCli()) as {
+      protocolVersion: string;
+      cli: { capabilities: Record<string, unknown> };
+    };
+    frame.protocolVersion = "2.9";
+    frame.cli.capabilities.protocolVersion = "2.9";
+    await register(manager, socket, JSON.stringify(frame));
+    expect(JSON.parse(String(socket.sends[0]))).toMatchObject({
+      type: "hello.ok",
+      protocolVersion: "2.9",
+    });
     expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
   });
 
@@ -3211,6 +3228,31 @@ describe("relay 2.7 telemetry", () => {
     // A gap longer than the staleness window restarts the count (fail open).
     await manager.handleTextFrame(socket, waitingLoad(2), at(12_000 + 16_000));
     expect(liveLoad(manager)?.waitingStreak).toBe(1);
+    manager.dispose();
+  });
+
+  it("accepts a custom load frame without waiting and does not grow the streak", async () => {
+    const { manager, socket } = await registered();
+    const custom = (extra: Record<string, unknown> = {}) =>
+      JSON.stringify({
+        type: "endpoint.load",
+        endpointSlug: "generic",
+        running: 3,
+        kvOccupancy: 0.7,
+        source: "custom",
+        ts: "2026-01-01T00:00:00.000Z",
+        ...extra,
+      });
+    await manager.handleTextFrame(socket, custom(), now);
+    expect(liveLoad(manager)).toMatchObject({
+      source: "custom",
+      running: 3,
+      kvOccupancy: 0.7,
+      waitingStreak: 0,
+    });
+    expect(liveLoad(manager)?.waiting).toBeUndefined();
+    await manager.handleTextFrame(socket, custom({ running: 4 }), at(3_000));
+    expect(liveLoad(manager)?.waitingStreak).toBe(0);
     manager.dispose();
   });
 

@@ -775,6 +775,143 @@ fn endpoints_kv_tokens_round_trip_json_and_llama_cpp_warning() {
 }
 
 #[test]
+fn endpoints_adapter_set_show_clear_round_trip_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args([
+            "endpoints",
+            "add",
+            "--slug",
+            "local",
+            "--label",
+            "Local",
+            "--base-url",
+            "http://127.0.0.1:8080/v1",
+            "--engine",
+            "generic",
+        ])
+        .assert()
+        .success();
+
+    let mut set = cli(&config, &state);
+    set.args([
+        "endpoints",
+        "--json",
+        "adapter",
+        "set",
+        "local",
+        "--route",
+        "stats",
+        "--format",
+        "json",
+        "--interval",
+        "3",
+        "--timeout",
+        "2",
+    ]);
+    let value = json_stdout(set);
+    assert_eq!(value["engineAdapter"]["format"], "json");
+    assert_eq!(value["engineAdapter"]["intervalSecs"], 3);
+    assert_eq!(value["engineAdapter"]["input"]["route"], "stats");
+
+    let mut show = cli(&config, &state);
+    show.args(["endpoints", "--json", "adapter", "show", "local"]);
+    let shown = json_stdout(show);
+    assert_eq!(shown["input"]["route"], "stats");
+    assert_eq!(shown["format"], "json");
+
+    cli(&config, &state)
+        .args([
+            "endpoints",
+            "adapter",
+            "set",
+            "local",
+            "--route",
+            "http://127.0.0.1/metrics",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("adapter route is invalid"));
+
+    cli(&config, &state)
+        .args(["endpoints", "adapter", "clear", "local"])
+        .assert()
+        .success();
+    let mut list = cli(&config, &state);
+    list.args(["endpoints", "--json", "list"]);
+    assert!(
+        json_stdout(list)["endpoints"][0]
+            .get("engineAdapter")
+            .is_none()
+    );
+
+    cli(&config, &state)
+        .args(["endpoints", "adapter", "show", "missing"])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains("endpoint `missing` not found"));
+}
+
+#[cfg(unix)]
+#[test]
+fn endpoints_adapter_test_never_prints_raw_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args([
+            "endpoints",
+            "add",
+            "--slug",
+            "local",
+            "--label",
+            "Local",
+            "--base-url",
+            "http://127.0.0.1:8080/v1",
+            "--engine",
+            "generic",
+        ])
+        .assert()
+        .success();
+    cli(&config, &state)
+        .args([
+            "endpoints",
+            "adapter",
+            "set",
+            "local",
+            "--command",
+            r#"printf '{"running":3,"kvUsage":0.4}\n'; echo ADAPTER-SECRET >&2"#,
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success();
+
+    let mut test = cli(&config, &state);
+    test.args(["endpoints", "--json", "adapter", "test", "local"]);
+    let output = test.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid JSON");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["running"], 3);
+    assert_eq!(value["kvUsage"], 0.4);
+    assert!(
+        !stdout.contains("ADAPTER-SECRET") && !stderr.contains("ADAPTER-SECRET"),
+        "adapter test never prints raw command output: {stdout} {stderr}"
+    );
+    assert!(
+        !value.to_string().contains("printf"),
+        "command text stays off the wire"
+    );
+}
+
+#[test]
 fn endpoints_remove_unknown_slug_exits_3_not_found() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");

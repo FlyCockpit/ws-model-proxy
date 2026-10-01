@@ -284,6 +284,7 @@ enum EngineFactsSource {
   PROBE
   CONFIG
   MIXED
+  CUSTOM
 }
 
 /// Provenance of one stored engine fact (slots, K, maxModelLen).

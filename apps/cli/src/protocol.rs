@@ -11,7 +11,7 @@ use crate::config::{
 };
 pub use crate::terminal_identity::TerminalIdentityProof;
 
-pub const RELAY_PROTOCOL_VERSION: &str = "2.8";
+pub const RELAY_PROTOCOL_VERSION: &str = "2.9";
 pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v2";
 pub const RELAY_JSON_CONTROL_MAX_BYTES: usize = 64 * 1024;
 pub const RELAY_BINARY_CHUNK_MAX_BYTES: usize = 1024 * 1024;
@@ -28,6 +28,7 @@ pub const OLDER_SERVER_HELLO_REJECTION: &str = "Malformed relay protocol message
 /// server's strict 2.7 schemas (`apps/server/src/relay/protocol.ts`).
 pub const NODE_METRICS_CUSTOM_MAX: usize = 50;
 pub const NODE_METRICS_SOURCES_MAX: usize = 50;
+pub const NODE_ENGINE_ADAPTERS_MAX: usize = 64;
 pub const NODE_GPU_MAX: usize = 32;
 pub const NODE_INTERFACE_MAX: usize = 32;
 pub const NODE_INTERFACE_ADDRESS_MAX: usize = 16;
@@ -675,6 +676,7 @@ pub struct DiscoveredModelInventory {
 pub enum FactSource {
     Probe,
     Config,
+    Custom,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -695,6 +697,13 @@ impl<T> EngineFact<T> {
         Self {
             value,
             source: FactSource::Config,
+        }
+    }
+
+    pub fn custom(value: T) -> Self {
+        Self {
+            value,
+            source: FactSource::Custom,
         }
     }
 }
@@ -721,6 +730,17 @@ pub struct EngineFacts {
     /// Model ids one engine process serves.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub served_model_aliases: Option<EngineFact<Vec<String>>>,
+    /// 2.9: a custom engine adapter is configured on this endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_adapter: Option<EngineFact<LoadAdapterValue>>,
+}
+
+/// 2.9 `engineFacts.loadAdapter.value`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadAdapterValue {
+    pub input: crate::engine_adapter::AdapterInputKind,
+    pub signals: Vec<crate::engine_adapter::AdapterSignal>,
 }
 
 impl EngineFacts {
@@ -843,6 +863,9 @@ pub struct NodeMetrics {
     /// Status of each configured or remotely defined metric source.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<MetricSourceStatus>,
+    /// 2.9: per-endpoint custom engine adapter status. No command text.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub engine_adapters: Vec<crate::engine_adapter::EngineAdapterStatus>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -978,9 +1001,12 @@ pub struct EndpointLoad {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_slug: Option<String>,
     pub running: u64,
-    pub waiting: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_usage: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_occupancy: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slots_busy: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1472,16 +1498,42 @@ pub fn endpoint_engine_facts(endpoint: &EndpointConfig) -> Option<EngineFacts> {
     let configured_kv = endpoint
         .kv_tokens
         .filter(|tokens| (1..=ENGINE_TOKEN_COUNT_MAX).contains(tokens));
+    let adapter = endpoint
+        .last_probe
+        .as_ref()
+        .and_then(|probe| probe.adapter.as_ref());
+    let adapter_slots = adapter
+        .and_then(|facts| facts.slots)
+        .filter(|slots| (1..=10_000).contains(slots));
+    let adapter_kv = adapter
+        .and_then(|facts| facts.kv_tokens)
+        .filter(|tokens| (1..=ENGINE_TOKEN_COUNT_MAX).contains(tokens));
+    let load_adapter = endpoint.engine_adapter.as_ref().map(|spec| {
+        EngineFact::config(LoadAdapterValue {
+            input: spec.input_kind(),
+            signals: spec.signals(),
+        })
+    });
     let facts = EngineFacts {
         engine,
         slots: configured_slots
             .map(EngineFact::config)
+            .or_else(|| adapter_slots.map(EngineFact::custom))
             .or_else(|| probed_slots.map(EngineFact::probe)),
-        ctx_per_slot: token_fact(detected.and_then(|engine| engine.ctx_per_slot)),
+        ctx_per_slot: adapter
+            .and_then(|facts| facts.ctx_per_slot)
+            .filter(|value| (1..=ENGINE_TOKEN_COUNT_MAX).contains(value))
+            .map(EngineFact::custom)
+            .or_else(|| token_fact(detected.and_then(|engine| engine.ctx_per_slot))),
         kv_tokens: configured_kv
             .map(EngineFact::config)
+            .or_else(|| adapter_kv.map(EngineFact::custom))
             .or_else(|| token_fact(detected.and_then(|engine| engine.kv_tokens))),
-        max_model_len: token_fact(detected.and_then(|engine| engine.max_model_len)),
+        max_model_len: adapter
+            .and_then(|facts| facts.max_model_len)
+            .filter(|value| (1..=ENGINE_TOKEN_COUNT_MAX).contains(value))
+            .map(EngineFact::custom)
+            .or_else(|| token_fact(detected.and_then(|engine| engine.max_model_len))),
         host_prompt_cache_mib: None,
         served_model_aliases: detected
             .map(|engine| {
@@ -1500,6 +1552,7 @@ pub fn endpoint_engine_facts(endpoint: &EndpointConfig) -> Option<EngineFacts> {
             })
             .filter(|aliases| !aliases.is_empty())
             .map(EngineFact::probe),
+        load_adapter,
     };
     (!facts.is_empty()).then_some(facts)
 }
@@ -2455,7 +2508,7 @@ mod tests {
 
         let encoded = encode_control(&message).expect("encode");
 
-        assert!(encoded.contains(r#""protocolVersion":"2.8""#));
+        assert!(encoded.contains(r#""protocolVersion":"2.9""#));
         assert!(encoded.contains(r#""nodeTelemetry":true"#));
         assert!(encoded.contains(r#""fileOps":true"#));
         assert!(encoded.contains(r#""mcpFileRead":false"#));
@@ -3084,6 +3137,7 @@ mod relay_27_vectors {
             models: models.iter().map(|id| (*id).to_string()).collect(),
             suggested_capabilities: OpenAiCompatibleCapabilities::default(),
             engine: Some(engine),
+            adapter: None,
         })
     }
 
@@ -3191,7 +3245,7 @@ mod relay_27_vectors {
         };
         assert_eq!(
             encoded(&hello),
-            vector(include_str!("../tests/fixtures/relay-2.8/hello.json"))
+            vector(include_str!("../tests/fixtures/relay-2.9/hello.json"))
         );
     }
 
@@ -3287,6 +3341,69 @@ mod relay_27_vectors {
         endpoint.kv_tokens = None;
         let facts = endpoint_engine_facts(&endpoint).expect("facts");
         assert_eq!(facts.kv_tokens, Some(EngineFact::probe(1_000)));
+    }
+
+    #[test]
+    fn adapter_facts_sit_between_config_and_probe() {
+        use crate::engine_adapter::{
+            AdapterCachedFacts, AdapterFormat, AdapterInput, AdapterSignal, EngineAdapterConfig,
+            SignalSelector,
+        };
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            AdapterSignal::Running,
+            SignalSelector {
+                series: "running".to_string(),
+                labels: Default::default(),
+                aggregate: None,
+                scale: None,
+            },
+        );
+        let mut endpoint = EndpointConfig {
+            slug: "generic".to_string(),
+            engine: crate::config::EndpointEngine::Generic,
+            engine_adapter: Some(EngineAdapterConfig {
+                input: AdapterInput::Route {
+                    route: "stats".to_string(),
+                },
+                format: AdapterFormat::Json,
+                interval_secs: 2,
+                timeout_secs: 2,
+                map,
+            }),
+            last_probe: Some(ProbeSnapshot {
+                status: ProbeStatus::Online,
+                models: Vec::new(),
+                suggested_capabilities: OpenAiCompatibleCapabilities::default(),
+                engine: Some(DetectedEngine {
+                    kind: Some(EngineKind::Generic),
+                    slots: Some(1),
+                    kv_tokens: Some(1_000),
+                    max_model_len: Some(2_048),
+                    ..DetectedEngine::default()
+                }),
+                adapter: Some(AdapterCachedFacts {
+                    slots: Some(8),
+                    kv_tokens: Some(262_144),
+                    max_model_len: Some(8_192),
+                    ctx_per_slot: None,
+                }),
+            }),
+            ..EndpointConfig::default()
+        };
+        let facts = endpoint_engine_facts(&endpoint).expect("facts");
+        assert_eq!(facts.slots, Some(EngineFact::custom(8)));
+        assert_eq!(facts.kv_tokens, Some(EngineFact::custom(262_144)));
+        assert_eq!(facts.max_model_len, Some(EngineFact::custom(8_192)));
+        assert_eq!(
+            facts.load_adapter.as_ref().map(|fact| fact.source),
+            Some(FactSource::Config)
+        );
+        endpoint.kv_tokens = Some(4096);
+        endpoint.concurrency_limit = Some(4);
+        let facts = endpoint_engine_facts(&endpoint).expect("facts");
+        assert_eq!(facts.slots, Some(EngineFact::config(4)));
+        assert_eq!(facts.kv_tokens, Some(EngineFact::config(4096)));
     }
 
     #[test]
@@ -3412,6 +3529,7 @@ mod relay_27_vectors {
                     error: Some(MetricSourceError::Timeout),
                 },
             ],
+            engine_adapters: Vec::new(),
         };
         assert_eq!(
             encoded(&ClientControlMessage::NodeMetrics(metrics)),
@@ -3427,8 +3545,9 @@ mod relay_27_vectors {
             endpoint_slug: "vllm".to_string(),
             model_slug: None,
             running: 3,
-            waiting: 2,
+            waiting: Some(2),
             kv_usage: Some(0.42),
+            kv_occupancy: None,
             slots_busy: None,
             deferred: None,
             prefix_cache_hits_delta: Some(50),
@@ -3440,6 +3559,30 @@ mod relay_27_vectors {
             encoded(&ClientControlMessage::EndpointLoad(load)),
             vector(include_str!(
                 "../tests/fixtures/relay-2.7/endpoint-load.json"
+            ))
+        );
+    }
+
+    #[test]
+    fn custom_endpoint_load_matches_the_shared_vector() {
+        let load = EndpointLoad {
+            endpoint_slug: "generic".to_string(),
+            model_slug: None,
+            running: 3,
+            waiting: None,
+            kv_usage: Some(0.4),
+            kv_occupancy: Some(0.7),
+            slots_busy: Some(3),
+            deferred: None,
+            prefix_cache_hits_delta: None,
+            prefix_cache_queries_delta: None,
+            source: LoadSource::Custom,
+            ts: "2026-09-28T12:00:01.000Z".to_string(),
+        };
+        assert_eq!(
+            encoded(&ClientControlMessage::EndpointLoad(load)),
+            vector(include_str!(
+                "../tests/fixtures/relay-2.9/endpoint-load-custom.json"
             ))
         );
     }

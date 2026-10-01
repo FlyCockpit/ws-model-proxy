@@ -25,6 +25,9 @@ pub struct ProbeReport {
     /// Engine detection result (online probes only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine: Option<crate::engine::DetectedEngine>,
+    /// Integer facts from a configured adapter (online probes only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<crate::engine_adapter::AdapterCachedFacts>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,6 +126,7 @@ pub fn probe_endpoint(endpoint: &EndpointConfig) -> ProbeReport {
             model_suggestions: Vec::new(),
             error: Some(error.to_string()),
             engine: None,
+            adapter: None,
         },
     }
 }
@@ -181,6 +185,7 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
         .map(|row| (row.id.clone(), row.max_model_len))
         .collect::<Vec<_>>();
     let engine = crate::engine::detect_engine(endpoint, &model_limits);
+    let adapter = crate::engine_adapter::probe_facts(endpoint);
     Ok(ProbeReport {
         endpoint_slug: endpoint.slug.clone(),
         status: ProbeStatus::Online,
@@ -189,6 +194,7 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
         model_suggestions,
         error: None,
         engine: Some(engine),
+        adapter,
     })
 }
 
@@ -197,17 +203,23 @@ pub fn apply_probe_report(config: &mut Config, report: &ProbeReport, replace: bo
         anyhow::bail!("endpoint `{}` no longer exists", report.endpoint_slug);
     };
     // An offline probe keeps the engine facts the last online probe found,
-    // so a restarting upstream does not flap its facts.
+    // so a restarting upstream does not flap its facts. Adapter facts are
+    // kept the same way when this run produced none.
     let previous_engine = endpoint
         .last_probe
         .as_ref()
         .and_then(|probe| probe.engine.clone());
+    let previous_adapter = endpoint
+        .last_probe
+        .as_ref()
+        .and_then(|probe| probe.adapter.clone());
     if report.status == ProbeStatus::Online {
         endpoint.last_probe = Some(ProbeSnapshot {
             status: ProbeStatus::Online,
             models: report.discovered_model_ids.clone(),
             suggested_capabilities: endpoint.default_capabilities.clone(),
             engine: report.engine.clone(),
+            adapter: report.adapter.clone().or(previous_adapter),
         });
         let discovered: std::collections::HashSet<&str> = report
             .discovered_model_ids
@@ -254,6 +266,7 @@ pub fn apply_probe_report(config: &mut Config, report: &ProbeReport, replace: bo
             models: Vec::new(),
             suggested_capabilities: endpoint.default_capabilities.clone(),
             engine: previous_engine,
+            adapter: previous_adapter,
         });
     }
     Ok(())
@@ -674,6 +687,7 @@ mod tests {
                 model_suggestions: vec![],
                 error: None,
                 engine: None,
+                adapter: None,
             },
             false,
         )
@@ -731,6 +745,7 @@ mod tests {
                 }],
                 error: None,
                 engine: None,
+                adapter: None,
             },
             true,
         )
