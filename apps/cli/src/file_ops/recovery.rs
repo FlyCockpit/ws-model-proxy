@@ -54,7 +54,9 @@
 //! published and private links. Empty unreported R after power loss is harmless.
 //! (e) unheld objects are retained; they are never deleted by a snapshot.
 //! (f) on NFS another process holding the file open can leave a `.nfs*` entry in R;
-//! our own descriptors close before unlink. Retained R is reported for manual cleanup.
+//! our own descriptors close before unlink (except T's pinned proof at the link
+//! probe's alias unlink: clients that silly-rename per vnode, macOS/BSD NFS, may keep a
+//! `.nfs*` alias until it closes). Retained R is reported for manual cleanup.
 //! (g) link publication briefly exposes T before its private alias unlink. Someone
 //! can open/write public T, then a third save can replace that name before unlink,
 //! orphaning that exposed inode. A failed alias unlink retains nlink 2: later replace
@@ -445,8 +447,10 @@ impl RecoveryDir {
         // proven by a proof opened on ITS name, never by comparing across names. T's
         // own proof stays open through the alias unlink: it pins T's inode, so no
         // other object can take T's number, and `tmp` (same name, same inode number
-        // before and after) is then re-checked against it. The unlinked dentry is the
-        // alias's, so an NFS client has nothing to silly-rename.
+        // before and after) is then re-checked against it. On Linux the unlinked dentry
+        // is the alias's, so the NFS client has nothing to silly-rename; clients that
+        // decide per vnode (macOS/BSD NFS) may keep a `.nfs*` alias in R until T's
+        // proof closes, retained and reported like (f).
         let alias_stat = fstatat(
             self.dir.as_fd(),
             alias.name.as_os_str(),

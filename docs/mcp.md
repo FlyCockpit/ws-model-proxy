@@ -290,7 +290,10 @@ original and temp in recovery with the public name vacant; a delete crash can
 leave the captured file or symlink in recovery with its public name vacant.
 (e) unheld objects are never deleted and remain reported in recovery;
 (f) on NFS a file that another process still holds open keeps a `.nfs*` entry in the
-recovery directory after its unlink, so the directory is retained and listed in `recovered`.
+recovery directory after its unlink, so the directory is retained and listed in `recovered`;
+the link probe's alias unlink keeps the temp's own descriptor open (it pins the inode against
+number reuse), so a client that silly-renames per vnode (macOS/BSD NFS) may briefly keep a
+`.nfs*` alias there until that descriptor closes, retained and reported the same way.
 (g) after a hard-link publish, a process can open and write the public temp,
 then another save can replace that name before the private alias is unlinked;
 the alias unlink can then discard those writes to the now-orphaned inode.
