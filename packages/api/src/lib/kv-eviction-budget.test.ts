@@ -96,6 +96,33 @@ describe("relative eviction budget", () => {
     expect(recovered.cutFraction).toBe(0);
     expect(applyKvEvictionObservations(recovered, 1, now).cutFraction).toBeCloseTo(0.05, 12);
   });
+  it("an expired pending row is a new first miss", () => {
+    const expired = {
+      cutFraction: 0,
+      observedAt: new Date(now.getTime() - KV_EVICTION_RECOVERY_MS),
+      expiresAt: now,
+    };
+    const rearmed = applyKvEvictionObservations(expired, 1, now);
+    expect(rearmed.cutFraction).toBe(0);
+    expect(rearmed.observedAt.getTime()).toBe(now.getTime());
+    expect(applyKvEvictionObservations(expired, 2, now).cutFraction).toBeCloseTo(0.05, 12);
+  });
+  it("an expired cut does not keep stacking", () => {
+    const expired = {
+      cutFraction: 0.25,
+      observedAt: new Date(now.getTime() - 60_000),
+      expiresAt: now,
+    };
+    expect(applyKvEvictionObservations(expired, 1, now).cutFraction).toBe(0);
+  });
+  it("a still-unexpired pending row corroborates", () => {
+    const pending = {
+      cutFraction: 0,
+      observedAt: now,
+      expiresAt: new Date(now.getTime() + KV_EVICTION_RECOVERY_MS),
+    };
+    expect(applyKvEvictionObservations(pending, 1, now).cutFraction).toBeCloseTo(0.05, 12);
+  });
   it("repeated events lower K to the floor, then recover exactly", () => {
     let row: ReturnType<typeof applyKvEvictionObservations> | null = null;
     for (let i = 1; i <= 100; i++) {

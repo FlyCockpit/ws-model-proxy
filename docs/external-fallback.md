@@ -206,13 +206,19 @@ local pooled request continues a digest-proven, live-tip warm session whose
 previous matched record confirmed engine caching. Both the expected prefix and
 the actual reported prompt must be at least `protectMinTokens`; the record must
 be within that engine's protection window. A reported cache read of at most 5%
-of the expected prefix is an eviction observation. The first observation on a
-capacity that is not already cut only arms feedback; a second observation
-lowers K. Chat templates that rewrite earlier turns (Qwen3 and DeepSeek-R1
-strip reasoning; gpt-oss drops earlier analysis channels) can look like a miss
-on a long confirmed session when the user sends a follow-up. One such follow-up
-does not cut. Two independent misses still can, including two follow-ups on
-those templates. Unknown cache fields, hits,
+of the expected prefix is an eviction observation. A miss also requires a fresh
+relay `endpoint.load` reading whose `kvUsage` is at least the member's KV-full
+threshold (default 0.95). Real prefix evictions happen under memory pressure;
+missing, stale (older than 15 s), or lower usage produces no observation. The
+first observation on a capacity that is not already cut only arms feedback; a
+second observation lowers K. Pending corroboration lasts until `expiresAt` (30
+minutes from the arming write). An expired row is a new first miss, matching
+readers that already ignore expiry. Chat templates that rewrite earlier turns
+(Qwen3 and DeepSeek-R1 strip reasoning; gpt-oss drops earlier analysis channels)
+can look like a miss on a long confirmed session when the user sends a follow-up.
+One such follow-up does not cut. Two independent misses still can, including two
+follow-ups on those templates, when the engine is also under KV pressure.
+Unknown cache fields, hits,
 partial hits above 5%, short prefixes, client-id-only matches, instruction hints,
 matches to ancestors that are not live tips and unranked targets produce no
 observation. A client id with a digest-proven live stored tip of that same session
@@ -272,7 +278,9 @@ are dropped and logged at most once per minute; feedback never affects response
 finalization. The owner-guarded atomic SQL upsert combines concurrent process
 writers without graph/capacity locks or transactions. Application time is passed
 explicitly; negative elapsed time is clamped to zero and observation/expiry times
-use `GREATEST`, bounding clock skew. Rows are an expiring class-H cache without
+use `GREATEST`, bounding clock skew. A write against an expired row is a new
+first miss, so the pending window is the 30-minute expiry rather than hourly
+cleanup. Rows are an expiring class-H cache without
 foreign keys, never drained during parent deletion. Readers ignore expired rows
 and fall back to reported K if the read fails; retention deletes rows expired
 more than an hour ago. Shutdown clears timers and the DB fence prevents writes.

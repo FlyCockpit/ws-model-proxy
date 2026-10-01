@@ -16,6 +16,7 @@
  * the SQL specification. Pending capacities are capped at 1024: new keys beyond
  * that bound are dropped, as are failed flushes (no unbounded retries).
  */
+import { effectiveKvFullThreshold } from "@ws-model-proxy/api/lib/engine-load";
 import {
   boundedKvEvictionCount,
   KV_EVICTION_DECAY_PER_MS,
@@ -24,6 +25,7 @@ import {
   KV_EVICTION_RECOVERY_MS,
   KV_EVICTION_STEP,
 } from "@ws-model-proxy/api/lib/kv-eviction-budget";
+import { ENDPOINT_LOAD_STALE_AFTER_MS } from "@ws-model-proxy/api/lib/metric-routing";
 import prisma from "@ws-model-proxy/db";
 import { isDbShutdownFenceArmed } from "@ws-model-proxy/db/shutdown-fence";
 import type { AffinityDecision } from "./cache-affinity.js";
@@ -38,7 +40,28 @@ export const EVICTION_MISS_FRACTION = 0.05;
 export const KV_EVICTION_FLUSH_MIN_INTERVAL_MS = 1000;
 export const MAX_PENDING_CAPACITIES = 1024;
 
-/** The sole enforcement point for all six evidence rules. Unknown is not a miss. */
+/**
+ * True when a fresh `endpoint.load` reading shows KV usage at or above the
+ * member's FULL threshold (default 0.95). Real prefix evictions happen under
+ * memory pressure. Missing, stale, or lower usage is not a miss.
+ */
+export function recentKvPressure(
+  reading: { kvUsage?: number; receivedAt: Date } | null | undefined,
+  threshold: number | null | undefined,
+  now: Date,
+): boolean {
+  if (!reading) return false;
+  const received = reading.receivedAt.getTime();
+  if (!Number.isFinite(received)) return false;
+  const ageMs = Math.max(0, now.getTime() - received);
+  if (!Number.isFinite(ageMs) || ageMs > ENDPOINT_LOAD_STALE_AFTER_MS) return false;
+  const usage = reading.kvUsage;
+  return (
+    usage !== undefined && Number.isFinite(usage) && usage >= effectiveKvFullThreshold(threshold)
+  );
+}
+
+/** The sole enforcement point for the evidence rules. Unknown is not a miss. */
 export function qualifiesAsEvictionEvidence({
   policy,
   engineKind,
@@ -46,6 +69,7 @@ export function qualifiesAsEvictionEvidence({
   ok,
   usage,
   evidence,
+  kvPressure,
   now,
 }: {
   policy: WarmProtectionPolicy;
@@ -54,6 +78,7 @@ export function qualifiesAsEvictionEvidence({
   ok: boolean;
   usage: { cacheReadTokens: number | null; promptTokens: number | null };
   evidence: NonNullable<AffinityDecision["prefixEvidence"]>[string] | undefined;
+  kvPressure: boolean;
   now: Date;
 }): boolean {
   return (
@@ -73,7 +98,8 @@ export function qualifiesAsEvictionEvidence({
     Math.max(0, now.getTime() - evidence.lastUsedAt) <=
       protectionWindowSecondsFor(policy.windowSeconds, engineKind) * 1000 &&
     evidence.confirmed === true &&
-    usage.cacheReadTokens <= EVICTION_MISS_FRACTION * evidence.tokens
+    usage.cacheReadTokens <= EVICTION_MISS_FRACTION * evidence.tokens &&
+    kvPressure
   );
 }
 
@@ -107,6 +133,8 @@ export async function recordKvEvictionObservations(
     ON CONFLICT ("capacityId") DO UPDATE SET
       "cutFraction" = LEAST(${KV_EVICTION_MAX_CUT}::double precision,
         CASE
+          WHEN existing."expiresAt" <= ${now}::timestamp
+            THEN GREATEST(0::double precision, (${boundedCount} - 1) * ${KV_EVICTION_STEP}::double precision)
           WHEN GREATEST(0::double precision,
                 LEAST(${KV_EVICTION_MAX_CUT}::double precision, GREATEST(0::double precision, existing."cutFraction"))
                 - ${KV_EVICTION_DECAY_PER_MS}::double precision * GREATEST(0::double precision,

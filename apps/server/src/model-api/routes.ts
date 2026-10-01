@@ -2,6 +2,7 @@ import {
   getConfiguredMediaAttachmentMaxBytes,
   resolveAttachmentLimit,
 } from "@ws-model-proxy/api/lib/media-attachment-limits";
+import { pickEndpointLoad } from "@ws-model-proxy/api/lib/metric-routing";
 import {
   authenticateModelApiTokenSecret,
   listVisibleModelTargetsForUser,
@@ -107,7 +108,11 @@ import {
   SERVED_MODEL_HEADER,
   withResponseHeaders,
 } from "./external-route.js";
-import { observeKvEviction, qualifiesAsEvictionEvidence } from "./kv-eviction-feedback.js";
+import {
+  observeKvEviction,
+  qualifiesAsEvictionEvidence,
+  recentKvPressure,
+} from "./kv-eviction-feedback.js";
 import {
   MODEL_API_MAX_REQUEST_BODY_BYTES,
   MODEL_API_RELAY_TIMEOUT_MS,
@@ -744,6 +749,7 @@ const poolDiscoveredModelRelaySelect = {
   id: true,
   userId: true,
   published: true,
+  slug: true,
   upstreamModelId: true,
   capabilityOverrideMode: true,
   capabilityOverrideMetadata: true,
@@ -788,6 +794,7 @@ const poolMemberRelaySelect = {
   id: true,
   poolId: true,
   discoveredModelId: true,
+  kvFullThreshold: true,
   capacityContextCeiling: true,
   capacityContextCeilingMode: true,
   capacityContextMargin: true,
@@ -836,6 +843,21 @@ const poolMemberRelaySelect = {
 type PoolMemberRelayQueryRow = Prisma.PoolMemberGetPayload<{
   select: typeof poolMemberRelaySelect;
 }>;
+
+function poolMemberKvPressure(member: PoolMemberRelayQueryRow, now: Date): boolean {
+  const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
+  const endpoint = model?.Endpoint;
+  if (!model || !endpoint) return false;
+  const loads =
+    relaySessionManager.getLiveNodeTelemetry([endpoint.cliDeviceId]).get(endpoint.cliDeviceId)
+      ?.endpointLoad ?? [];
+  return recentKvPressure(
+    pickEndpointLoad(loads, { endpointSlug: endpoint.slug, modelSlug: model.slug ?? null }),
+    member.kvFullThreshold,
+    now,
+  );
+}
+
 type PoolMemberRelayRow = Omit<PoolMemberRelayQueryRow, "discoveredModelId" | "DiscoveredModel"> & {
   /** Normalized after the query from the modern execution target or the legacy relation. */
   discoveredModelId: string;
@@ -6905,6 +6927,7 @@ async function relayPool({
                 ok: terminal.ok,
                 usage,
                 evidence: affinityDecision?.prefixEvidence?.[affinityTarget.executionTargetId],
+                kvPressure: poolMemberKvPressure(member, new Date()),
                 now: attemptDispatchedAt,
               })
             )

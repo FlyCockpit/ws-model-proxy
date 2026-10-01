@@ -488,6 +488,7 @@ integration("cache-prefix identity #160", () => {
           ok: true,
           usage: { promptTokens: 12_000, cacheReadTokens: kind === "truncate" ? 1000 : 10_000 },
           evidence: ranked.prefixEvidence?.[args.target.executionTargetId],
+          kvPressure: true,
           now: args.now,
         }),
       ).toBe(false);
@@ -874,6 +875,7 @@ integration("cache-prefix identity #160", () => {
           ok: true,
           usage: { promptTokens: 14_000, cacheReadTokens: 1000 },
           evidence: ranked.prefixEvidence?.[args.target.executionTargetId],
+          kvPressure: true,
           now: new Date(args.now.getTime() + 2000),
         }),
       ).toBe(false);

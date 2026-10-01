@@ -3,12 +3,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 vi.mock("@ws-model-proxy/db", () => ({ default: {} }));
 vi.mock("@ws-model-proxy/db/shutdown-fence", () => ({ isDbShutdownFenceArmed: () => false }));
 
+import { ENDPOINT_LOAD_STALE_AFTER_MS } from "@ws-model-proxy/api/lib/metric-routing";
 import {
   createKvEvictionFeedback,
   EVICTION_MISS_FRACTION,
   KV_EVICTION_FLUSH_MIN_INTERVAL_MS,
   MAX_PENDING_CAPACITIES,
   qualifiesAsEvictionEvidence,
+  recentKvPressure,
   recordKvEvictionObservations,
 } from "./kv-eviction-feedback.js";
 
@@ -26,6 +28,7 @@ const valid: Parameters<typeof qualifiesAsEvictionEvidence>[0] = {
   ok: true,
   usage: { promptTokens: 9000, cacheReadTokens: 0 },
   evidence: { tokens: 8000, lastUsedAt: now.getTime(), confirmed: true },
+  kvPressure: true,
   now,
 };
 
@@ -118,8 +121,70 @@ describe("eviction evidence", () => {
       patch: { usage: { ...valid.usage, cacheReadTokens: Number.NaN } },
       expected: false,
     },
+    { name: "no kv pressure", patch: { kvPressure: false }, expected: false },
   ])("$name", ({ patch, expected }) =>
     expect(qualifiesAsEvictionEvidence({ ...valid, ...patch })).toBe(expected),
+  );
+});
+
+describe("recent KV pressure", () => {
+  const fresh = { kvUsage: 0.95, receivedAt: now };
+  it.each([
+    { name: "missing reading", reading: null, threshold: null, expected: false },
+    { name: "default threshold", reading: fresh, threshold: null, expected: true },
+    {
+      name: "just below default",
+      reading: { kvUsage: 0.949, receivedAt: now },
+      threshold: null,
+      expected: false,
+    },
+    {
+      name: "member override",
+      reading: { kvUsage: 0.8, receivedAt: now },
+      threshold: 0.8,
+      expected: true,
+    },
+    {
+      name: "below override",
+      reading: { kvUsage: 0.79, receivedAt: now },
+      threshold: 0.8,
+      expected: false,
+    },
+    {
+      name: "stale",
+      reading: {
+        kvUsage: 1,
+        receivedAt: new Date(now.getTime() - ENDPOINT_LOAD_STALE_AFTER_MS - 1),
+      },
+      threshold: null,
+      expected: false,
+    },
+    {
+      name: "age boundary",
+      reading: { kvUsage: 1, receivedAt: new Date(now.getTime() - ENDPOINT_LOAD_STALE_AFTER_MS) },
+      threshold: null,
+      expected: true,
+    },
+    {
+      name: "missing kvUsage",
+      reading: { receivedAt: now },
+      threshold: null,
+      expected: false,
+    },
+    {
+      name: "NaN kvUsage",
+      reading: { kvUsage: Number.NaN, receivedAt: now },
+      threshold: null,
+      expected: false,
+    },
+    {
+      name: "future reading",
+      reading: { kvUsage: 0.95, receivedAt: new Date(now.getTime() + 1000) },
+      threshold: null,
+      expected: true,
+    },
+  ])("$name", ({ reading, threshold, expected }) =>
+    expect(recentKvPressure(reading, threshold, now)).toBe(expected),
   );
 });
 

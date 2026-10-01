@@ -1330,6 +1330,56 @@ integration("warm-session protection with real PostgreSQL", () => {
       60_000,
     );
 
+    it("an expired pending row is a new first miss", async () => {
+      const capacityId = id();
+      const expiredAt = new Date(now.getTime() - 1000);
+      await db.capacityKvEviction.create({
+        data: {
+          capacityId,
+          userId: "kv-owner",
+          cutFraction: 0,
+          observedAt: new Date(expiredAt.getTime() - KV_EVICTION_RECOVERY_MS),
+          expiresAt: expiredAt,
+        },
+      });
+      await feedback.recordKvEvictionObservations(
+        { capacityId, ownerId: "kv-owner", count: 1, now },
+        writers[0],
+      );
+      const actual = await row(capacityId);
+      const expected = applyKvEvictionObservations(
+        {
+          cutFraction: 0,
+          observedAt: new Date(expiredAt.getTime() - KV_EVICTION_RECOVERY_MS),
+          expiresAt: expiredAt,
+        },
+        1,
+        now,
+      );
+      expect(actual.cutFraction).toBe(expected.cutFraction);
+      expect(actual.observedAt).toEqual(expected.observedAt);
+      expect(actual.expiresAt).toEqual(new Date(now.getTime() + KV_EVICTION_RECOVERY_MS));
+    });
+
+    it("an expired cut re-arms instead of stacking", async () => {
+      const capacityId = id();
+      const expiredAt = new Date(now.getTime() - 1000);
+      await db.capacityKvEviction.create({
+        data: {
+          capacityId,
+          userId: "kv-owner",
+          cutFraction: 0.25,
+          observedAt: new Date(now.getTime() - 60_000),
+          expiresAt: expiredAt,
+        },
+      });
+      await feedback.recordKvEvictionObservations(
+        { capacityId, ownerId: "kv-owner", count: 1, now },
+        writers[0],
+      );
+      expect((await row(capacityId)).cutFraction).toBe(0);
+    });
+
     it("older application clocks do not decay or move timestamps backward", async () => {
       const capacityId = id();
       await feedback.recordKvEvictionObservations(
