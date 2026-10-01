@@ -1,5 +1,10 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("@ws-model-proxy/db", () => ({ default: {}, Prisma: {} }));
+vi.mock("@ws-model-proxy/env/server", () => ({ env: {} }));
+
+import { buildCanonicalRequest } from "./cache-affinity.js";
 import {
   canonicalKeys,
   canonicalShapes,
@@ -9,11 +14,25 @@ import {
   asJson,
   budgetedStableJson,
   canonicalizeAffinitySurface,
-  extractAffinityLayers,
   type JsonValue,
+  extractAffinityLayers as legacyAffinityLayers,
   MAX_CANONICAL_DEPTH,
   stableJson,
 } from "./cache-affinity-layers.js";
+
+// Layer-shape assertions retain the legacy reference; continuation decisions
+// always exercise the canonical request used by production routing.
+function extractAffinityLayers(
+  surface: string | null | undefined,
+  payload: Record<string, unknown>,
+) {
+  const layers = legacyAffinityLayers(surface, payload);
+  return {
+    ...layers,
+    isContinuation:
+      buildCanonicalRequest({ surface: surface ?? "", payload })?.isContinuation ?? false,
+  };
+}
 
 const extractorSource = readFileSync(
   new URL("./cache-affinity-layers.ts", import.meta.url),
@@ -50,6 +69,23 @@ describe("extractAffinityLayers", () => {
 
   it.each(
     ["openai-chat", "anthropic-messages", "openai-responses"].flatMap((surface) => [
+      ...["tool_use", "tool_result"].flatMap((type) => [
+        {
+          surface,
+          name: `content-only ${type}`,
+          units: [
+            { role: "user", content: "U" },
+            { role: "user", content: [{ type, id: "call" }] },
+          ],
+          continuation: true,
+        },
+        {
+          surface,
+          name: `leading content-only ${type}`,
+          units: [{ role: "user", content: [{ type, id: "call" }] }],
+          continuation: false,
+        },
+      ]),
       {
         surface,
         name: "greeting starter",

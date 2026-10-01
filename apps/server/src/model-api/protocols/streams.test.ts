@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
 import { nestedWire } from "../cache-affinity-canonical.test-fixtures.js";
 import type { CanonicalEvent } from "./canonical.js";
+import { isRequestDepthError } from "./errors.js";
 import {
   CanonicalStreamParser,
   CanonicalStreamRenderer,
@@ -300,5 +301,46 @@ it.each([20, 256, 257, 10_000])("R4 stream tool JSON validation depth %s", (dept
   });
   const finish = () => renderer.push({ type: "item_complete", index: 0 });
   if (depth <= 256) expect(finish).not.toThrow();
-  else expect(finish).toThrow("request JSON nesting exceeds 256 levels");
+  else expect(finish).toThrow("provider response JSON nesting exceeds 256 levels");
 });
+
+it.each(["openai-chat", "openai-responses", "anthropic-messages"] as const)(
+  "R6 streamed data depth bound on %s",
+  (surface) => {
+    const base =
+      surface === "openai-chat"
+        ? { id: "m", object: "chat.completion.chunk", created: 0, model: "m", choices: [] }
+        : surface === "openai-responses"
+          ? { type: "response.created", sequence_number: 0, response: responseStart("m") }
+          : {
+              type: "message_start",
+              message: {
+                id: "m",
+                type: "message",
+                role: "assistant",
+                model: "m",
+                content: [],
+                stop_reason: null,
+                stop_sequence: null,
+                usage: { input_tokens: 1, output_tokens: 0 },
+              },
+            };
+    for (const depth of [256, 257]) {
+      const parser = new CanonicalStreamParser(surface);
+      const wire = `data: ${JSON.stringify({ ...base, extension: JSON.parse(nestedWire(depth - 1, "object")) })}\n\n`;
+      if (depth === 256) expect(() => parser.push(bytes(wire))).not.toThrow();
+      else {
+        try {
+          parser.push(bytes(wire));
+          expect.fail("deep SSE data must be rejected");
+        } catch (error) {
+          expect(error).toMatchObject({
+            code: "response_json_depth_exceeded",
+            parameter: "stream.data",
+          });
+          expect(isRequestDepthError(error)).toBe(false);
+        }
+      }
+    }
+  },
+);

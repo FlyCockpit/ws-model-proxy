@@ -2880,14 +2880,265 @@ describe("model API routes", () => {
   });
 
   it.each(
+    [false, true].flatMap((external) =>
+      [
+        "nonstream-arguments",
+        "nonstream-body",
+        "sse-data",
+        "sse-arguments",
+        "sse-after-output",
+      ].map((mode) => ({ external, mode })),
+    ),
+  )(
+    "R6 provider response depth external=$external $mode settles upstream failure",
+    async ({ external, mode }) => {
+      const stream = mode.startsWith("sse");
+      const inventory = {
+        version: 3 as const,
+        protocol: "openai-compatible" as const,
+        surfaces: {
+          openaiChatCompletions: {
+            source: "declared" as const,
+            confidence: "exact" as const,
+            supported: true,
+            streaming: true,
+            tools: true,
+          },
+        },
+      };
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [
+          { ...(external ? externalPoolTarget : poolTarget), protocolAdaptationEnabled: true },
+        ],
+      });
+      db.poolMember.findUnique.mockResolvedValueOnce({
+        healthStatus: "HEALTHY",
+        lastFailureClass: null,
+        consecutiveRetryableFailures: 0,
+        lastFailureAt: null,
+        nextRetryAt: null,
+        halfOpenTrialStartedAt: null,
+      });
+      db.poolMember.updateMany.mockResolvedValueOnce({ count: 1 });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-chat"];
+      const runtime = admittingCapacityRuntime();
+      vi.mocked(runtime.hold).mockImplementation((response, lease, signal) =>
+        holdCapacityLeaseForResponse({
+          response,
+          lease,
+          signal,
+          store: { heartbeat: async () => true, release: runtime.release },
+        }),
+      );
+      const deep = nestedWire(257, "object");
+      const reply = {
+        id: "reply",
+        object: "chat.completion",
+        model: "m",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: "call",
+                  type: "function",
+                  function: { name: "lookup", arguments: mode === "nonstream-body" ? "{}" : deep },
+                },
+              ],
+            },
+            finish_reason: "tool_calls",
+          },
+        ],
+        usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+        ...(mode === "nonstream-body" ? { extension: JSON.parse(deep) } : {}),
+      };
+      const chunk = (choices: unknown[], extension?: unknown) =>
+        `data: ${JSON.stringify({ id: "reply", object: "chat.completion.chunk", created: 0, model: "m", choices, ...(extension === undefined ? {} : { extension }) })}\n\n`;
+      const deepData = chunk([], JSON.parse(deep));
+      const frames =
+        mode === "sse-arguments"
+          ? [
+              chunk([
+                {
+                  index: 0,
+                  delta: {
+                    role: "assistant",
+                    tool_calls: [
+                      {
+                        index: 0,
+                        id: "call",
+                        type: "function",
+                        function: { name: "lookup", arguments: "" },
+                      },
+                    ],
+                  },
+                  finish_reason: null,
+                },
+              ]),
+              chunk([
+                {
+                  index: 0,
+                  delta: { tool_calls: [{ index: 0, function: { arguments: deep } }] },
+                  finish_reason: null,
+                },
+              ]),
+              chunk([{ index: 0, delta: {}, finish_reason: "tool_calls" }]),
+              "data: [DONE]\n\n",
+            ]
+          : mode === "sse-after-output"
+            ? [
+                chunk([
+                  { index: 0, delta: { role: "assistant", content: "hello" }, finish_reason: null },
+                ]),
+                deepData,
+                chunk([{ index: 0, delta: {}, finish_reason: "stop" }]),
+                "data: [DONE]\n\n",
+              ]
+            : [deepData];
+      // Return the claimed row so the real rollup writer runs in the terminal transaction.
+      db.$executeRaw.mockResolvedValue(1);
+      db.relayRequest.update.mockImplementation(
+        async (args: { where: { status?: string }; data: Record<string, unknown> }) =>
+          args.where.status === "PENDING"
+            ? {
+                id: "relay-request-id",
+                userId: token.userId,
+                source: "API_TOKEN",
+                status: args.data.status,
+                startedAt: new Date("2026-08-26T00:00:00Z"),
+                completedAt: args.data.completedAt,
+                durationMs: args.data.durationMs,
+                firstClientByteAt: null,
+                requestedModelPoolId: poolTarget.id,
+                selectedPoolMemberId: "chat-member",
+                requestedExecutionTargetId: null,
+                selectedExecutionTargetId: "chat-member-target",
+                attemptCount: 1,
+                promptTokens: args.data.promptTokens ?? null,
+                completionTokens: args.data.completionTokens ?? null,
+                cacheReadTokens: args.data.cacheReadTokens ?? null,
+                cacheWriteTokens: args.data.cacheWriteTokens ?? null,
+                usageKnown: args.data.usageKnown ?? false,
+              }
+            : { id: "relay-request-id" },
+      );
+      if (external) {
+        externalConsent.poolIds = [externalPoolTarget.id];
+        db.poolMember.findMany.mockResolvedValue([]);
+        const provider: PublicProviderTarget = {
+          ...externalProviderTarget("chat-member"),
+          supportedFeatures: ["tools"],
+          capabilityInventory: inventory,
+        };
+        publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+        publicOverflow.dispatch.mockResolvedValue({
+          ...externalDispatchResult(provider, reply),
+          ...(stream
+            ? {
+                response: new Response(
+                  new ReadableStream<Uint8Array>({
+                    start(controller) {
+                      for (const frame of frames)
+                        controller.enqueue(new TextEncoder().encode(frame));
+                      controller.close();
+                    },
+                  }),
+                  { headers: { "content-type": "text/event-stream" } },
+                ),
+              }
+            : {}),
+        });
+      } else
+        db.poolMember.findMany.mockResolvedValue([
+          poolMemberRow({
+            id: "chat-member",
+            discoveredModelId: "chat-model",
+            upstreamModelId: "m",
+            cliDeviceId: "cli-chat",
+            capabilityOverrideMetadata: inventory,
+          }),
+        ]);
+      const pending = appWith(manager, runtime).request("/messages", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: external ? EXTERNAL_MODEL_ID : poolTarget.modelId,
+          max_tokens: 8,
+          stream,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      });
+      if (!external) {
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        const sent = requireSent(manager);
+        if (stream) {
+          manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
+          for (const frame of frames) manager.body(sent.requestId, frame);
+          manager.complete(sent.requestId);
+        } else await completeJsonRelay({ manager, requestId: sent.requestId, body: reply });
+      }
+      const response = await pending;
+      const text = await response.text();
+      const afterOutput = mode === "sse-arguments" || mode === "sse-after-output";
+      expect(response.status).toBe(afterOutput ? 200 : 502);
+      expect(text).toContain(afterOutput ? "event: error" : '"type":"api_error"');
+      expect(text).not.toContain("request JSON nesting exceeds");
+      await vi.waitFor(() =>
+        expect(db.relayRequest.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { id: "relay-request-id", status: "PENDING" },
+            data: expect.objectContaining({
+              status: "FAILED",
+              errorClass: "protocol_error",
+              ...(external
+                ? { promptTokens: 20, completionTokens: 3, usageKnown: true, responseBytes: 17n }
+                : {}),
+            }),
+          }),
+        ),
+      );
+      const claims = db.relayRequest.update.mock.calls.filter(
+        ([args]) => args.where.status === "PENDING",
+      );
+      expect(claims).toHaveLength(1);
+      const rollups = db.$executeRaw.mock.calls.filter(([sql]) =>
+        String(sql.sql ?? "").includes("usage_rollup_minute"),
+      );
+      expect(rollups).toHaveLength(1);
+      expect(db.poolMember.updateMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ id: "chat-member" }),
+          data: expect.objectContaining({
+            lastFailureClass: "TRANSPORT",
+            consecutiveRetryableFailures: 1,
+          }),
+        }),
+      );
+      expect(runtime.release).toHaveBeenCalled();
+      if (!external) expect(manager.cancelled.length + manager.completed.length).toBeGreaterThan(0);
+    },
+  );
+
+  it.each(
     ["openai-chat", "openai-responses"].flatMap((surface) =>
       [false, true].flatMap((external) =>
-        [20, 256, 257, 10_000].map((depth) => ({ surface, external, depth })),
+        [20, 256, 257, 10_000]
+          .map((depth) => ({ surface, external, depth, stream: false }))
+          .concat([257, 10_000].map((depth) => ({ surface, external, depth, stream: true }))),
       ),
     ),
   )(
-    "R4 embedded arguments $surface external=$external depth=$depth refuse before admission/health",
-    async ({ surface, external, depth }) => {
+    "R4 embedded arguments $surface external=$external stream=$stream depth=$depth refuse before admission/health",
+    async ({ surface, external, depth, stream }) => {
       mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
         directModels: [],
         modelPools: [
@@ -2903,6 +3154,7 @@ describe("model API routes", () => {
             confidence: "exact" as const,
             supported: true,
             tools: true,
+            streaming: true,
             protocolVersion: "2023-06-01",
           },
         },
@@ -2954,11 +3206,14 @@ describe("model API routes", () => {
           }),
         ]);
       }
-      const body = embeddedArgumentsRequest(
-        surface,
-        nestedWire(depth, "object"),
-        external ? EXTERNAL_MODEL_ID : poolTarget.modelId,
-      );
+      const body = {
+        ...embeddedArgumentsRequest(
+          surface,
+          nestedWire(depth, "object"),
+          external ? EXTERNAL_MODEL_ID : poolTarget.modelId,
+        ),
+        stream,
+      };
       const pending = appWith(manager, runtime).request(
         surface === "openai-chat" ? "/chat/completions" : "/responses",
         {

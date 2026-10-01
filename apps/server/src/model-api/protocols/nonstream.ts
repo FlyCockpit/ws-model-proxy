@@ -6,7 +6,13 @@ import type {
   ProtocolResponseMetadata,
   ProtocolSurface,
 } from "./canonical.js";
-import { AdapterError, invalid, parseEmbeddedJson, unsupported } from "./errors.js";
+import {
+  AdapterError,
+  assertResponseJsonDepth,
+  invalid,
+  parseResponseEmbeddedJson,
+  unsupported,
+} from "./errors.js";
 import {
   acceptChatChoiceExtras,
   acceptChatEnvelopeExtras,
@@ -32,6 +38,7 @@ export function parseProtocolResponse({
   const metadata = responseMetadata(status, headers, surface);
   if (status < 200 || status >= 300)
     return { ok: false, metadata, error: parseError(surface, body, metadata) };
+  assertResponseJsonDepth(body, "response.body");
   return {
     ok: true,
     metadata,
@@ -377,7 +384,7 @@ function parseAnthropicSuccess(value: unknown): CanonicalResponse {
 
 function completeArguments(value: unknown, parameter: string): string {
   const raw = string(value, parameter);
-  object(parseEmbeddedJson(raw, parameter), parameter);
+  object(parseResponseEmbeddedJson(raw, parameter), parameter);
   return raw;
 }
 
@@ -578,7 +585,7 @@ function renderAnthropic(response: CanonicalResponse) {
               id: item.id,
               name: item.name,
               input: object(
-                parseEmbeddedJson(item.arguments, `tool_call[${item.id}].arguments`),
+                parseResponseEmbeddedJson(item.arguments, `tool_call[${item.id}].arguments`),
                 `tool_call[${item.id}].arguments`,
               ),
             }

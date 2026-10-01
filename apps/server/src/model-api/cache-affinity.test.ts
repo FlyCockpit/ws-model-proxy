@@ -1354,7 +1354,10 @@ describe("cache affinity", () => {
       expect(query.strings.join("")).toContain('"lastUsedAt" DESC, id DESC');
       const deletes = db.$executeRaw.mock.calls.filter(([sql]) => {
         const text = (sql.strings ?? sql).join("");
-        return text.includes("DELETE FROM cache_affinity_record") && text.includes("SELECT unnest");
+        return (
+          text.includes(["DELETE FROM", "cache_affinity_record"].join(" ")) &&
+          text.includes("SELECT unnest")
+        );
       });
       expect(deletes.map(([, ids]) => ids)).toEqual([["live"]]);
     },
@@ -1383,7 +1386,10 @@ describe("cache affinity", () => {
     expect(serializedWrites).toContain("pool-owner");
     const deletes = db.$executeRaw.mock.calls.filter(([sql]) => {
       const text = (sql.strings ?? sql).join("");
-      return text.includes("DELETE FROM cache_affinity_record") && text.includes("SELECT unnest");
+      return (
+        text.includes(["DELETE FROM", "cache_affinity_record"].join(" ")) &&
+        text.includes("SELECT unnest")
+      );
     });
     expect(deletes.map(([, ids]) => ids)).toEqual([["old"]]);
   });
@@ -3138,6 +3144,39 @@ it.each([false, true])(
     expect(conversationWrites()).toHaveLength(client ? 1 : 0);
   },
 );
+
+it("R6 oversized new instructions refuse a bound Responses continuation", () => {
+  const args = digestArgs("runtime", { input: "parent" }, "openai-responses");
+  const parent = affinityPrefixDigests(args);
+  const sessionBinding = {
+    sessionId: "parent-session",
+    bindingDigest: parent.bindingDigest,
+    rootDigest: parent.rootDigest,
+    tipDigest: parent.nodes.at(-1)!.digest,
+    tipDepth: 1,
+    canonicalBytes: parent.canonicalBytes,
+  };
+  const followup = {
+    ...args,
+    sessionBinding,
+    payload: { previous_response_id: "parent", input: "delta" },
+  };
+  expect(affinityPrefixDigests(followup).boundSessionId).toBe("parent-session");
+  const changed = {
+    ...followup,
+    payload: { ...followup.payload, instructions: "x".repeat(2 * 1024 * 1024 + 1) },
+  };
+  expect(buildCanonicalRequest(changed)?.hasRootFields).toBe(true);
+  const material = affinityPrefixDigests(changed);
+  expect(material.rootDigest).toBe("");
+  expect(material.routingNodes).toEqual([]);
+  expect(material.isContinuation).toBe(false);
+  expect(material.missingParent).toBe(true);
+  expect(material.boundSessionId).toBeUndefined();
+  expect(material.parentTipDigest).toBeUndefined();
+  expect(material.identifiable).toBe(false);
+  expect(material.nodes).toEqual([]);
+});
 
 it("R2 wire __proto__ in legacy Chat function schemas binds the root", () => {
   const request = (value: number) =>

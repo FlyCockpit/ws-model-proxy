@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 import { nestedWire } from "../cache-affinity-canonical.test-fixtures.js";
+import { isRequestDepthError } from "./errors.js";
 import {
   parseAnthropicMessagesRequest,
   parseOpenAiChatRequest,
@@ -698,7 +699,14 @@ it.each([20, 256, 257, 10_000])("R4 nonstream argument expansion depth %s", (dep
     expect(() => JSON.stringify(render())).not.toThrow();
     expect(parse).not.toThrow();
   } else {
-    expect(render).toThrow("request JSON nesting exceeds 256 levels");
-    expect(parse).toThrow("request JSON nesting exceeds 256 levels");
+    for (const adapt of [render, parse]) {
+      try {
+        adapt();
+        expect.fail("deep response arguments must be rejected");
+      } catch (error) {
+        expect(error).toMatchObject({ code: "response_json_depth_exceeded" });
+        expect(isRequestDepthError(error)).toBe(false);
+      }
+    }
   }
 });

@@ -1,4 +1,8 @@
-import { REQUEST_JSON_DEPTH_ERROR, requestJsonDepthExceeded } from "../request-json-depth.js";
+import {
+  MAX_REQUEST_JSON_DEPTH,
+  REQUEST_JSON_DEPTH_ERROR,
+  requestJsonDepthExceeded,
+} from "../request-json-depth.js";
 import type { ProtocolSurface } from "./canonical.js";
 
 export class AdapterError extends Error {
@@ -23,6 +27,35 @@ export function parseEmbeddedJson(value: string, parameter: string): unknown {
   if (requestJsonDepthExceeded(parsed))
     throw new AdapterError("request_json_depth_exceeded", REQUEST_JSON_DEPTH_ERROR, parameter);
   return parsed;
+}
+
+/** Provider JSON uses the same serializer bound, with an upstream error contract. */
+export function assertResponseJsonDepth(value: unknown, parameter: string): void {
+  if (requestJsonDepthExceeded(value))
+    throw new AdapterError(
+      "response_json_depth_exceeded",
+      `provider response JSON nesting exceeds ${MAX_REQUEST_JSON_DEPTH} levels`,
+      parameter,
+    );
+}
+
+export function parseResponseEmbeddedJson(value: string, parameter: string): unknown {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new AdapterError(
+      "invalid_response",
+      "Provider tool arguments must be a complete JSON object.",
+      parameter,
+    );
+  }
+  assertResponseJsonDepth(parsed, parameter);
+  return parsed;
+}
+
+export function isResponseDepthError(error: unknown): error is AdapterError {
+  return error instanceof AdapterError && error.code === "response_json_depth_exceeded";
 }
 
 export function isRequestDepthError(error: unknown): error is AdapterError {

@@ -4740,6 +4740,9 @@ async function relayPool({
     // non-lease-loss hand-off error ends the request), so a lease-loss failover
     // never leaves a loser attempt's finalizer racing the winning attempt's.
     let externalFinalizationScheduled = false;
+    let externalProtocolFailure = false;
+    let externalAdaptationCompletion: Promise<"ok" | "protocol_error" | "cancelled"> =
+      Promise.resolve("ok");
     const scheduleExternalFinalization = (
       committedResult: Extract<
         Awaited<ReturnType<typeof dispatchPublicOverflow>>,
@@ -4750,9 +4753,20 @@ async function relayPool({
       externalFinalizationScheduled = true;
       void committedResult.terminal
         .then(async (terminal) => {
+          const adaptationOutcome = await externalAdaptationCompletion;
+          externalProtocolFailure ||=
+            adaptationOutcome === "protocol_error" &&
+            !request.signal.aborted &&
+            !capacityLeaseLostSignal(providerCapacityLease?.signal);
           releaseCallerLease();
           const completedAt = new Date();
           const usage = usageFactsFromProviderUsage(terminal.usage);
+          if (externalProtocolFailure && !committedResult.target.ownKey)
+            await recordPoolMemberRelayFailure({
+              poolMemberId: committedResult.target.poolMemberId,
+              trialStartedAt: null,
+              failure: "protocol_error",
+            }).catch(metadataUpdateError);
           await Promise.allSettled([
             prisma.$transaction((tx) =>
               transitionRelayRequestTerminal(
@@ -4760,25 +4774,28 @@ async function relayPool({
                 relayRequestId,
                 {
                   selectedExecutionTargetId: committedResult.target.executionTargetId,
-                  status: terminal.ok
-                    ? "SUCCEEDED"
-                    : request.signal.aborted
-                      ? "CANCELED"
-                      : "FAILED",
+                  status:
+                    terminal.ok && !externalProtocolFailure
+                      ? "SUCCEEDED"
+                      : request.signal.aborted
+                        ? "CANCELED"
+                        : "FAILED",
                   completedAt,
                   durationMs: Math.max(0, completedAt.getTime() - startedAt.getTime()),
-                  httpStatusCode: committedResult.response.status,
+                  httpStatusCode: externalProtocolFailure ? 502 : committedResult.response.status,
                   upstreamStatusCode: committedResult.response.status,
                   requestBytes: BigInt(publicRequestBytes),
                   responseBytes: BigInt(terminal.responseBytes),
                   attemptCount: committedResult.attemptCount,
-                  errorClass: terminal.ok
-                    ? null
-                    : request.signal.aborted
-                      ? "cancelled"
-                      : capacityLeaseLostSignal(providerCapacityLease?.signal)
-                        ? "capacity_lease_lost"
-                        : "unknown",
+                  errorClass: externalProtocolFailure
+                    ? "protocol_error"
+                    : terminal.ok
+                      ? null
+                      : request.signal.aborted
+                        ? "cancelled"
+                        : capacityLeaseLostSignal(providerCapacityLease?.signal)
+                          ? "capacity_lease_lost"
+                          : "unknown",
                   promptTokens: usage.promptTokens,
                   completionTokens: usage.completionTokens,
                   totalTokens: usage.totalTokens,
@@ -4854,7 +4871,7 @@ async function relayPool({
         // from the hand-off refusal below.
         return await commitExternalResponse();
       } catch (error) {
-        if (isRequestDepthError(error)) {
+        if (!heldByCaller && isRequestDepthError(error)) {
           releaseCallerLease();
           await settleRelayCleanup([() => releaseProviderCapacity(), () => operation.dispose?.()]);
           await failPoolRelayMetadata({
@@ -4927,7 +4944,14 @@ async function relayPool({
           }
           // A non-lease-loss hand-off error ends the request with this attempt
           // as its outcome; let its terminal transition claim the row.
+          if (
+            error instanceof AdapterError &&
+            error.code !== "cancelled" &&
+            !request.signal.aborted
+          )
+            externalProtocolFailure = true;
           if (committed) scheduleExternalFinalization(committed);
+          if (externalProtocolFailure) return operationFailureResponse(operation, "protocol_error");
           throw error;
         }
         // Nothing was dispatched and the error ends the request: release the
@@ -5160,34 +5184,38 @@ async function relayPool({
             new Response(null, { status: committedResult.response.status, headers }),
           );
         }
-        return await commitAwareResponse(
-          new Response(
-            adaptedResponseBody({
-              body: committedResult.response.body,
-              source,
-              target: operation.adaptation.requestedSurface,
-              stream: true,
-              status: committedResult.response.status,
-              headers: committedResult.response.headers,
-              signal: request.signal,
-              logContext: adapterLogContext,
-              request: canonical ?? undefined,
-              // Headers are already committed and a provider stream cannot be
-              // retried elsewhere, so a rejected upstream event (for example a
-              // deviating trailing usage chunk) must still end the client
-              // stream with the target protocol's terminal error event.
-              onProtocolError: () => undefined,
-              recoverBeforeOutput: true,
-            }),
-            {
-              status: committedResult.response.status,
-              headers: {
-                "content-type": "text/event-stream; charset=utf-8",
-                "x-wsmp-adapter-version": "1.0.0",
-                "x-wsmp-adapter-limitations": adapterLimitations,
-              },
+        let protocolFailureObserved = false;
+        const primed = await primeReadableStream(
+          adaptedResponseBody({
+            body: committedResult.response.body,
+            source,
+            target: operation.adaptation.requestedSurface,
+            stream: true,
+            status: committedResult.response.status,
+            headers: committedResult.response.headers,
+            signal: request.signal,
+            logContext: adapterLogContext,
+            request: canonical ?? undefined,
+            // Prime before hand-off so an invalid first event can return 502.
+            // After output, end with the target protocol's terminal error event.
+            onProtocolError: () => {
+              protocolFailureObserved = true;
             },
-          ),
+          }),
+          operation.adaptation.requestedSurface,
+        );
+        externalAdaptationCompletion = primed.completion.then((outcome) =>
+          protocolFailureObserved && outcome === "ok" ? "protocol_error" : outcome,
+        );
+        return await commitAwareResponse(
+          new Response(primed.body, {
+            status: committedResult.response.status,
+            headers: {
+              "content-type": "text/event-stream; charset=utf-8",
+              "x-wsmp-adapter-version": "1.0.0",
+              "x-wsmp-adapter-limitations": adapterLimitations,
+            },
+          }),
         );
       }
       await throwIfExternalLeaseLost(committedResult.response.body);

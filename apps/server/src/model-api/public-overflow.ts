@@ -47,9 +47,11 @@ import {
   openRouterDataCollectionPolicy,
 } from "./openrouter-privacy.js";
 import { ADAPTER_VERSION } from "./protocols/canonical.js";
-import { isRequestDepthError } from "./protocols/errors.js";
+import { isRequestDepthError, isResponseDepthError } from "./protocols/errors.js";
 import type { ProtocolSurface } from "./protocols/index.js";
+import { parseProtocolResponse } from "./protocols/nonstream.js";
 import { SseDecoder, type SseRecord } from "./protocols/sse.js";
+import { CanonicalStreamParser } from "./protocols/streams.js";
 import {
   allocateProviderFence,
   claimProviderHealthTrial,
@@ -3373,6 +3375,21 @@ export async function dispatchPublicOverflow(
       let clientCancelled = false;
       let protocolTerminal = false;
       let protocolFailed = false;
+      // Observe the serializer depth bound before durable attempt settlement.
+      // Routes still own adaptation and client-facing protocol errors.
+      const adaptedSurface = nativeSurface !== request.requestedSurface ? nativeSurface : undefined;
+      let depthParser =
+        adaptedSurface && request.stream ? new CanonicalStreamParser(adaptedSurface) : undefined;
+      const observeAdaptedDepth = (chunk?: Uint8Array) => {
+        if (!depthParser) return;
+        try {
+          if (chunk) depthParser.push(chunk);
+          else depthParser.finish();
+        } catch (error) {
+          if (isResponseDepthError(error)) protocolFailed = true;
+          depthParser = undefined;
+        }
+      };
       let deliveredProtocolTerminal = false;
       let accountingIncomplete = request.stream;
       const terminalDecoder = request.stream ? new SseDecoder() : undefined;
@@ -3406,6 +3423,17 @@ export async function dispatchPublicOverflow(
                 nonstreamEnvelope = parsed as Record<string, unknown>;
             } catch {
               nonstreamEnvelope = undefined;
+            }
+          }
+          if (adaptedSurface && !request.stream && nonstreamEnvelope) {
+            try {
+              parseProtocolResponse({
+                surface: adaptedSurface,
+                body: nonstreamEnvelope,
+                status,
+              });
+            } catch (error) {
+              if (isResponseDepthError(error)) protocolFailed = true;
             }
           }
           const streamTerminal = !request.stream || protocolTerminal;
@@ -3620,6 +3648,7 @@ export async function dispatchPublicOverflow(
                 return;
               }
               if (chunk.done) {
+                observeAdaptedDepth();
                 reachedEof = true;
                 if (terminalDecoder) {
                   const records = terminalDecoder.finish();
@@ -3656,6 +3685,7 @@ export async function dispatchPublicOverflow(
               }
               if (heldTerminalChunk) postTerminalBytes += chunk.value.byteLength;
               responseBytes += chunk.value.byteLength;
+              observeAdaptedDepth(chunk.value);
               if (!request.stream && !nonstreamOverflow) {
                 if (nonstreamBytes + chunk.value.byteLength <= 8 * 1024 * 1024) {
                   nonstreamChunks.push(chunk.value);
@@ -3722,7 +3752,10 @@ export async function dispatchPublicOverflow(
           }
         },
         async cancel(reason) {
-          clientCancelled = true;
+          // A rejecting response adapter cancels its source too. That is an
+          // upstream failure, while a caller cancellation keeps its own outcome.
+          clientCancelled = !isResponseDepthError(reason);
+          if (!clientCancelled) protocolFailed = true;
           await teardownProviderBody(response, reader, reason);
           await reconcile(false).catch(() => resolveTerminal({ ok: false, responseBytes }));
         },
