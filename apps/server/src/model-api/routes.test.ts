@@ -288,9 +288,69 @@ class FakeRelayManager {
   cancelled: CancelRelayRequestArgs[] = [];
   completed: string[] = [];
   handlers = new Map<string, ActiveRelayResponseHandlers>();
+  liveByDevice = new Map<
+    string,
+    {
+      nodeMetrics: null;
+      nodeMetricsReceivedAt: null;
+      endpointLoad: Array<{
+        endpointSlug: string;
+        modelSlug: string | null;
+        running: number;
+        waiting: number;
+        kvUsage?: number;
+        waitingStreak: number;
+        prefixCacheHitsTotal: number;
+        prefixCacheQueriesTotal: number;
+        source: "vllm-metrics";
+        ts: string;
+        receivedAt: Date;
+      }>;
+    }
+  >();
 
   getActiveCliDeviceIds() {
     return this.activeCliDeviceIds;
+  }
+
+  getLiveNodeTelemetry(cliDeviceIds: readonly string[]) {
+    const snapshots = new Map<
+      string,
+      NonNullable<ReturnType<FakeRelayManager["liveByDevice"]["get"]>>
+    >();
+    for (const id of cliDeviceIds) {
+      snapshots.set(
+        id,
+        this.liveByDevice.get(id) ?? {
+          nodeMetrics: null,
+          nodeMetricsReceivedAt: null,
+          endpointLoad: [],
+        },
+      );
+    }
+    return snapshots;
+  }
+
+  setKvUsage(cliDeviceId: string, endpointSlug: string, kvUsage: number, receivedAt = new Date()) {
+    this.liveByDevice.set(cliDeviceId, {
+      nodeMetrics: null,
+      nodeMetricsReceivedAt: null,
+      endpointLoad: [
+        {
+          endpointSlug,
+          modelSlug: null,
+          running: 1,
+          waiting: 0,
+          kvUsage,
+          waitingStreak: 0,
+          prefixCacheHitsTotal: 0,
+          prefixCacheQueriesTotal: 0,
+          source: "vllm-metrics",
+          ts: receivedAt.toISOString(),
+          receivedAt,
+        },
+      ],
+    });
   }
 
   registerRelayResponseHandlers({
@@ -1788,6 +1848,26 @@ describe("model API routes", () => {
         expected: 0,
         ageMs: 301_000,
       },
+      {
+        name: "low kv usage",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: true,
+        expected: 0,
+        kvUsage: 0.1,
+      },
+      {
+        name: "no kv reading",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: true,
+        expected: 0,
+        kvUsage: null,
+      },
     ])(
       "KV feedback finalization: $name",
       async ({
@@ -1801,6 +1881,7 @@ describe("model API routes", () => {
         ageMs,
         advanceMs,
         admissionAdvanceMs,
+        kvUsage,
       }) => {
         vi.useFakeTimers({ toFake: ["Date"] });
         vi.setSystemTime(new Date("2026-09-30T12:00:00Z"));
@@ -1842,6 +1923,7 @@ describe("model API routes", () => {
           }),
         );
         if (advanceMs) vi.setSystemTime(Date.now() + advanceMs);
+        if (kvUsage !== null) manager.setKvUsage("cli-a", "member-a-endpoint", kvUsage ?? 0.95);
         manager.complete(sent.requestId);
         const result = await response;
         await result.text();

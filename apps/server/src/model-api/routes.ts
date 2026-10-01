@@ -258,7 +258,8 @@ type ModelApiRouteDependencies = {
     | "sendRelayRequest"
     | "cancelRelayRequest"
     | "completeRelayRequest"
-  >;
+  > &
+    Partial<Pick<RelaySessionManager, "getLiveNodeTelemetry">>;
   concurrencyLimiter?: ModelApiConcurrencyLimiter;
   capacityRuntime?: CapacityAdmissionRuntime;
 };
@@ -844,12 +845,16 @@ type PoolMemberRelayQueryRow = Prisma.PoolMemberGetPayload<{
   select: typeof poolMemberRelaySelect;
 }>;
 
-function poolMemberKvPressure(member: PoolMemberRelayQueryRow, now: Date): boolean {
+function poolMemberKvPressure(
+  member: PoolMemberRelayQueryRow,
+  manager: NonNullable<ModelApiRouteDependencies["manager"]>,
+  now: Date,
+): boolean {
   const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
   const endpoint = model?.Endpoint;
   if (!model || !endpoint) return false;
   const loads =
-    relaySessionManager.getLiveNodeTelemetry([endpoint.cliDeviceId]).get(endpoint.cliDeviceId)
+    manager.getLiveNodeTelemetry?.([endpoint.cliDeviceId])?.get(endpoint.cliDeviceId)
       ?.endpointLoad ?? [];
   return recentKvPressure(
     pickEndpointLoad(loads, { endpointSlug: endpoint.slug, modelSlug: model.slug ?? null }),
@@ -6927,7 +6932,7 @@ async function relayPool({
                 ok: terminal.ok,
                 usage,
                 evidence: affinityDecision?.prefixEvidence?.[affinityTarget.executionTargetId],
-                kvPressure: poolMemberKvPressure(member, new Date()),
+                kvPressure: poolMemberKvPressure(member, manager, new Date()),
                 now: attemptDispatchedAt,
               })
             )
