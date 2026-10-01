@@ -412,6 +412,7 @@ export function buildGuardedPoolWizardSchema(input: GuardedPoolWizardSchemaInput
       affinityConversationWeight: z.number().int().min(0).max(10_000),
       affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000),
       affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000),
+      affinityResidencyWeight: z.number().int().min(0).max(10_000),
       providerConcurrencyMode: z.enum(["LIMITED", "UNLIMITED"]),
       tokenAttemptMode: z.enum(["LIMITED", "UNLIMITED"]),
       tokenAttemptLimit: z.string(),

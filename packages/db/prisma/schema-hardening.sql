@@ -140,6 +140,7 @@ ALTER TABLE model_pool ADD CONSTRAINT model_pool_affinity_policy_check CHECK (
   AND "affinityConversationWeight" BETWEEN 0 AND 10000
   AND "affinityConfirmedCacheWeight" BETWEEN 0 AND 10000
   AND "affinityLoadPenaltyWeight" BETWEEN 0 AND 10000
+  AND "affinityResidencyWeight" BETWEEN 0 AND 10000
 );
 
 -- Affinity is disposable prediction state. Greenfield v5 uses cache-prefix

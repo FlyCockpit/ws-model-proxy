@@ -264,6 +264,7 @@ const editablePool = {
     conversationWeight: 150,
     confirmedCacheWeight: 150,
     loadPenaltyWeight: 100,
+    residencyWeight: 100,
   },
 };
 
@@ -621,6 +622,18 @@ describe("PoolForm affinity defaults", () => {
 
     await waitFor(() => expect(state.mutationCalls).toEqual(["createModelPool"]));
     expect(state.mutationPayloads[0]?.input).toMatchObject({ affinityEnabled: false });
+  });
+
+  it("renders and submits the new-conversation residency weight", async () => {
+    mount(true, { mode: "edit", sections: ["routing"] });
+    const field = screen.getByLabelText(
+      "dashboard:pools.affinity.fields.affinityResidencyWeight",
+    ) as HTMLInputElement;
+    expect(field.value).toBe("100");
+    fireEvent.change(field, { target: { value: "250" } });
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({ affinityResidencyWeight: 250 });
   });
 
   it("saves the cache-holder wait as automatic (null) or a fixed value (0 = off)", async () => {

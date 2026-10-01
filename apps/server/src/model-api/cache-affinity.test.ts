@@ -39,6 +39,7 @@ const db = vi.hoisted(() => ({
   $transaction: vi.fn(),
   $queryRaw: vi.fn(),
   $executeRaw: vi.fn(),
+  capacityKvEviction: { findMany: vi.fn() },
 }));
 
 vi.mock("@ws-model-proxy/db", async () => ({
@@ -54,13 +55,19 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 
 import {
   AFFINITY_EXPIRY_BATCH,
+  AFFINITY_RESIDENCY_QUERY_LIMIT,
   AFFINITY_TRANSACTION_LIMITS,
   type AffinityTarget,
   affinityPrefixDigests,
+  affinityResidencySql,
   buildAffinityTargetIdentity,
   buildCanonicalRequest,
+  canonicalByteLength,
   extractClientConversationId,
   FREE_SAMPLING_PARAMS,
+  instructionTokens,
+  prefixBytesAtDepth,
+  prefixTokensAtDepth,
   rankAffinityTargets,
   rememberAffinity,
   resolveAffinitySession,
@@ -150,6 +157,17 @@ const affinityRow = ({
   engineCacheConfirmed,
 });
 
+function querySql(query: { strings?: TemplateStringsArray; sql?: string } | string): string {
+  if (typeof query === "string") return query;
+  if (typeof query.sql === "string") return query.sql;
+  return [...(query.strings ?? [])].join("");
+}
+
+function isResidencyQuery(query: { strings?: TemplateStringsArray; sql?: string } | string) {
+  const sql = querySql(query);
+  return sql.includes("inferenceCapacityId") && sql.includes('"prefixDigest" IS NULL');
+}
+
 // Decode only the SQL write seam; PostgreSQL tests verify actual conflict updates.
 function conversationWrites() {
   return db.$executeRaw.mock.calls.flatMap(([query, ...values]) => {
@@ -186,15 +204,13 @@ function conversationWrites() {
 function mockRetentionRows(
   rows: { id: string; sessionId: string; prefixDigest: string | null; expiresAt: Date }[],
 ) {
-  db.$queryRaw.mockImplementation((query) =>
-    Promise.resolve(
-      (query.strings ?? query).join("").includes("FROM cache_affinity_record")
-        ? rows
-        : (query.strings ?? query).join("").includes("cache_affinity_node")
-          ? []
-          : [{ acquired: true }],
-    ),
-  );
+  db.$queryRaw.mockImplementation((query) => {
+    const sql = querySql(query);
+    if (isResidencyQuery(query)) return Promise.resolve([]);
+    if (sql.includes("FROM cache_affinity_record")) return Promise.resolve(rows);
+    if (sql.includes("cache_affinity_node")) return Promise.resolve([]);
+    return Promise.resolve([{ acquired: true }]);
+  });
 }
 
 const cap8 = (affinityTarget: ReturnType<typeof target>) => ({
@@ -208,11 +224,12 @@ describe("cache affinity", () => {
     db.$transaction.mockImplementation((callback) => callback(db));
     db.$queryRaw.mockImplementation((query) =>
       Promise.resolve(
-        (query.strings ?? query).join("").includes("cache_affinity_node")
+        querySql(query).includes("cache_affinity_node") || isResidencyQuery(query)
           ? []
           : [{ acquired: true }],
       ),
     );
+    db.capacityKvEviction.findMany.mockResolvedValue([]);
     db.cacheAffinityNode.findMany.mockResolvedValue([]);
     db.cacheAffinityNode.findFirst.mockResolvedValue(null);
     db.cacheAffinityNode.deleteMany.mockResolvedValue({ count: 0 });
@@ -315,7 +332,11 @@ describe("cache affinity", () => {
       });
       expect(result.prefixEvidence).toBeUndefined();
       expect(result.matchedSessionIds?.["target-a"]).toBeTruthy();
-      expect(db.$queryRaw).not.toHaveBeenCalled();
+      expect(
+        db.$queryRaw.mock.calls.filter(([query]) =>
+          querySql(query).includes("cache_affinity_node"),
+        ),
+      ).toHaveLength(0);
     },
   );
 
@@ -1069,9 +1090,9 @@ describe("cache affinity", () => {
       },
       targets: [target("target-b", "runtime-b"), selected],
     });
-    expect(ranked.orderedTargetIds[0]).toBe("target-b");
     expect(ranked.conversationMatches[selected.executionTargetId]).toBe(false);
     expect(ranked.prefixDepths[selected.executionTargetId]).toBe(0);
+    expect(ranked.scores["target-a"]).toBe(ranked.scores["target-b"]);
   });
 
   it("invalidates identity across native surface, adapter, endpoint, and every runtime projection", () => {
@@ -1413,9 +1434,11 @@ describe("cache affinity", () => {
     it("rank and writer use the same resolver, writer after its fence", async () => {
       db.$queryRaw.mockImplementation((query) =>
         Promise.resolve(
-          (query.strings ?? query).join("").includes("cache_affinity_node")
+          querySql(query).includes("cache_affinity_node")
             ? [{ sessionId: "kept" }]
-            : [{ acquired: true }],
+            : isResidencyQuery(query)
+              ? []
+              : [{ acquired: true }],
         ),
       );
       const selected = target("target", "runtime");
@@ -2753,7 +2776,8 @@ describe("cache affinity", () => {
       targets: [idle, warm],
     });
     expect(result.instructionDepths?.["target-a"]).toBe(0);
-    expect(result.orderedTargetIds[0]).toBe("target-b");
+    expect(result.instructionDepths?.["target-b"]).toBe(0);
+    expect(result.orderedTargetIds[0]).toBe("target-a");
   });
 
   it("queries instruction prefix HMACs even when the conversation digest list is empty", async () => {
@@ -3093,11 +3117,12 @@ describe("cache affinity", () => {
     db.$transaction.mockImplementation((callback) => callback(db));
     db.$queryRaw.mockImplementation((query) =>
       Promise.resolve(
-        (query.strings ?? query).join("").includes("cache_affinity_node")
+        querySql(query).includes("cache_affinity_node") || isResidencyQuery(query)
           ? []
           : [{ acquired: true }],
       ),
     );
+    db.capacityKvEviction.findMany.mockResolvedValue([]);
     db.cacheAffinityNode.findMany.mockResolvedValue([]);
     db.cacheAffinityNode.findFirst.mockResolvedValue(null);
     db.cacheAffinityNode.deleteMany.mockResolvedValue({ count: 0 });
@@ -3238,6 +3263,420 @@ describe("cache affinity", () => {
     expect(result.scores["target-b"]).toBe(200);
     expect(result.reasons["target-a"]).toContain("confirmed:true");
     expect(result.reasons["target-b"]).toContain("confirmed:false");
+  });
+
+  it("estimates prefix tokens as the byte share of the request through that depth", () => {
+    const canonical = buildCanonicalRequest(
+      digestArgs("runtime", {
+        messages: [
+          { role: "system", content: "S" },
+          { role: "user", content: "hello" },
+          { role: "assistant", content: "hi" },
+          { role: "user", content: "next" },
+        ],
+      }),
+    )!;
+    const total = canonicalByteLength(canonical);
+    expect(total).toBeGreaterThan(canonical.rootBytes);
+    expect(instructionTokens(canonical, 1_000)).toBe(prefixTokensAtDepth(canonical, 0, 1_000));
+    expect(prefixTokensAtDepth(canonical, 0, 1_000)).toBe(
+      Math.round((1_000 * prefixBytesAtDepth(canonical, 0)) / total),
+    );
+    expect(prefixTokensAtDepth(canonical, 2, 1_000)).toBe(
+      Math.round((1_000 * prefixBytesAtDepth(canonical, 2)) / total),
+    );
+    expect(prefixTokensAtDepth(canonical, canonical.conversationUnits.length, 1_000)).toBe(1_000);
+    expect(prefixTokensAtDepth(canonical, 0, 0)).toBe(0);
+    expect(prefixTokensAtDepth(canonical, 2, Number.NaN)).toBe(0);
+  });
+
+  it("spreads sequential first turns with the same system prompt across three members", async () => {
+    const members = (["a", "b", "c"] as const).map((id) => ({
+      ...cap8(target(`target-${id}`, `runtime-${id}`, `capacity-${id}`)),
+      kvBudgetTokens: 100_000,
+      requestTokens: 10_000,
+      weight: 1,
+    }));
+    const system = { role: "system" as const, content: "shared instructions" };
+    const footprints: { capacityId: string; sessionId: string; tokens: number }[] = [];
+    const place = async (user: string) => {
+      db.cacheAffinityRecord.findMany.mockResolvedValue([]);
+      db.$queryRaw.mockImplementation((query) =>
+        Promise.resolve(
+          isResidencyQuery(query)
+            ? footprints
+            : querySql(query).includes("cache_affinity_node")
+              ? []
+              : [{ acquired: true }],
+        ),
+      );
+      const request = { messages: [system, { role: "user" as const, content: user }] };
+      const ranked = await rankAffinityTargets({
+        ownerId: "owner",
+        resourceOwnerId: "owner",
+        poolId: "pool",
+        securityScope: "token",
+        policy,
+        surface: "openai-chat",
+        payload: request,
+        targets: members,
+      });
+      const winner = members.find(
+        (member) => member.executionTargetId === ranked.orderedTargetIds[0],
+      )!;
+      const binding = await rememberAffinity({
+        ...digestArgs(winner.targetIdentity, request),
+        policy,
+        target: winner,
+        estimatedTokens: 10_000,
+      });
+      footprints.push({
+        capacityId: winner.capacityId,
+        sessionId: binding?.sessionId ?? `session-${footprints.length}`,
+        tokens: 10_000,
+      });
+      return ranked.orderedTargetIds[0];
+    };
+    expect(await place("one")).toBe("target-a");
+    expect(await place("two")).toBe("target-b");
+    expect(await place("three")).toBe("target-c");
+    expect(affinityResidencySql("owner", ["capacity-a"], new Date()).strings.join("")).toContain(
+      "ROW_NUMBER()",
+    );
+    expect(AFFINITY_RESIDENCY_QUERY_LIMIT).toBe(2_000);
+  });
+
+  it("places about twice as many first turns on a member with twice the weight", async () => {
+    const heavy = {
+      ...cap8(target("target-a", "runtime-a", "capacity-a")),
+      kvBudgetTokens: 100_000,
+      requestTokens: 10_000,
+      weight: 2,
+    };
+    const light = {
+      ...cap8(target("target-b", "runtime-b", "capacity-b")),
+      kvBudgetTokens: 100_000,
+      requestTokens: 10_000,
+      weight: 1,
+    };
+    const footprints: { capacityId: string; sessionId: string; tokens: number }[] = [];
+    const counts = { "target-a": 0, "target-b": 0 };
+    for (let index = 0; index < 12; index += 1) {
+      db.cacheAffinityRecord.findMany.mockResolvedValue([]);
+      db.$queryRaw.mockImplementation((query) =>
+        Promise.resolve(isResidencyQuery(query) ? footprints : []),
+      );
+      const request = {
+        messages: [
+          { role: "system", content: "shared instructions" },
+          { role: "user", content: `turn ${index}` },
+        ],
+      };
+      const ranked = await rankAffinityTargets({
+        ownerId: "owner",
+        resourceOwnerId: "owner",
+        poolId: "pool",
+        securityScope: "token",
+        policy,
+        surface: "openai-chat",
+        payload: request,
+        targets: [heavy, light],
+      });
+      const winnerId = ranked.orderedTargetIds[0]!;
+      counts[winnerId as "target-a" | "target-b"] += 1;
+      const winner = winnerId === "target-a" ? heavy : light;
+      footprints.push({
+        capacityId: winner.capacityId,
+        sessionId: `session-${index}`,
+        tokens: 10_000,
+      });
+    }
+    expect(counts["target-a"]).toBe(8);
+    expect(counts["target-b"]).toBe(4);
+  });
+
+  it("prefers an instruction-warm member only when that still leaves the lowest projected fill", async () => {
+    const warm = {
+      ...cap8(target("target-a", "runtime-a", "capacity-a")),
+      kvBudgetTokens: 100_000,
+      requestTokens: 20_000,
+    };
+    const idle = {
+      ...cap8(target("target-b", "runtime-b", "capacity-b")),
+      kvBudgetTokens: 100_000,
+      requestTokens: 20_000,
+    };
+    const rankPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "B" },
+      ],
+    };
+    const ranked = affinityPrefixDigests(digestArgs(warm.targetIdentity, rankPayload));
+    const canonical = buildCanonicalRequest(digestArgs(warm.targetIdentity, rankPayload))!;
+    expect(instructionTokens(canonical, 20_000)).toBeGreaterThan(0);
+    db.cacheAffinityRecord.findMany.mockResolvedValue([
+      affinityRow({
+        target: warm,
+        material: ranked,
+        prefixDigest: ranked.instructionDigests[0],
+        prefixDepth: 1,
+      }),
+    ]);
+    const empty = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [idle, warm],
+    });
+    expect(empty.orderedTargetIds[0]).toBe("target-a");
+    expect(empty.instructionDepths?.["target-a"]).toBeGreaterThanOrEqual(1);
+
+    db.$queryRaw.mockImplementation((query) =>
+      Promise.resolve(
+        isResidencyQuery(query)
+          ? [{ capacityId: "capacity-a", sessionId: "resident", tokens: 80_000 }]
+          : [],
+      ),
+    );
+    const packed = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [idle, warm],
+    });
+    expect(packed.orderedTargetIds[0]).toBe("target-b");
+    expect(packed.instructionDepths?.["target-a"]).toBeGreaterThanOrEqual(1);
+  });
+
+  it("does not consult residency when scoring a continuation", async () => {
+    const warm = {
+      ...cap8(target("target-a", "runtime-a", "capacity-a")),
+      kvBudgetTokens: 100_000,
+      requestTokens: 8_000,
+    };
+    const idle = {
+      ...cap8(target("target-b", "runtime-b", "capacity-b")),
+      kvBudgetTokens: 100_000,
+      requestTokens: 8_000,
+    };
+    const rankPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "U" },
+        { role: "assistant", content: "A" },
+        { role: "user", content: "next" },
+      ],
+    };
+    const seeded = affinityPrefixDigests(
+      digestArgs(warm.targetIdentity, {
+        messages: rankPayload.messages.slice(0, 3),
+      }),
+    );
+    const ranked = affinityPrefixDigests(digestArgs(warm.targetIdentity, rankPayload));
+    db.cacheAffinityRecord.findMany.mockResolvedValue(
+      seeded.digests.map((prefixDigest, index) =>
+        affinityRow({
+          target: warm,
+          material: ranked,
+          prefixDigest,
+          prefixDepth: index + 1,
+        }),
+      ),
+    );
+    db.$queryRaw.mockImplementation((query) =>
+      Promise.resolve(
+        isResidencyQuery(query)
+          ? [{ capacityId: "capacity-a", sessionId: "resident", tokens: 90_000 }]
+          : [],
+      ),
+    );
+    const result = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [idle, warm],
+    });
+    expect(result.orderedTargetIds[0]).toBe("target-a");
+    expect(result.prefixDepths["target-a"]).toBe(2);
+    expect(db.$queryRaw.mock.calls.filter(([query]) => isResidencyQuery(query))).toHaveLength(0);
+  });
+
+  it("uses slot mode and the unknown-capacity fallback for new conversations", async () => {
+    const occupied = {
+      ...target("target-a", "runtime-a", "capacity-a"),
+      hardConcurrencyLimit: 2,
+      slots: 2,
+      kvBudgetTokens: null,
+      requestTokens: 1_000,
+    };
+    const free = {
+      ...target("target-b", "runtime-b", "capacity-b"),
+      hardConcurrencyLimit: 2,
+      slots: 2,
+      kvBudgetTokens: null,
+      requestTokens: 1_000,
+    };
+    const rankPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "B" },
+      ],
+    };
+    const ranked = affinityPrefixDigests(digestArgs(occupied.targetIdentity, rankPayload));
+    db.cacheAffinityRecord.findMany.mockResolvedValue([
+      affinityRow({
+        target: occupied,
+        material: ranked,
+        prefixDigest: ranked.instructionDigests[0],
+        prefixDepth: 1,
+      }),
+    ]);
+    db.$queryRaw.mockImplementation((query) =>
+      Promise.resolve(
+        isResidencyQuery(query)
+          ? [{ capacityId: "capacity-a", sessionId: "resident", tokens: 50_000 }]
+          : [],
+      ),
+    );
+    const slotted = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [occupied, free],
+    });
+    expect(slotted.orderedTargetIds[0]).toBe("target-b");
+    expect(slotted.instructionDepths?.["target-a"]).toBeGreaterThanOrEqual(1);
+
+    const unknownOccupied = {
+      ...target("target-a", "runtime-a", "capacity-a"),
+      hardConcurrencyLimit: null,
+      slots: null,
+      kvBudgetTokens: null,
+      requestTokens: 1_000,
+    };
+    const unknownFree = {
+      ...target("target-b", "runtime-b", "capacity-b"),
+      hardConcurrencyLimit: null,
+      slots: null,
+      kvBudgetTokens: null,
+      requestTokens: 1_000,
+    };
+    db.$queryRaw.mockImplementation((query) =>
+      Promise.resolve(
+        isResidencyQuery(query)
+          ? [
+              { capacityId: "capacity-a", sessionId: "s1", tokens: 1 },
+              { capacityId: "capacity-a", sessionId: "s2", tokens: 1 },
+            ]
+          : [],
+      ),
+    );
+    const unknown = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [unknownOccupied, unknownFree],
+    });
+    expect(unknown.orderedTargetIds[0]).toBe("target-b");
+  });
+
+  it("records matchFraction from the byte-share prefix of an affine continuation", async () => {
+    const warm = {
+      ...cap8(target("target-a", "runtime-a", "capacity-a")),
+      requestTokens: 1_000,
+    };
+    const idle = cap8(target("target-b", "runtime-b", "capacity-b"));
+    const rankPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "U" },
+        { role: "assistant", content: "A" },
+        { role: "user", content: "next" },
+      ],
+    };
+    const canonical = buildCanonicalRequest(digestArgs(warm.targetIdentity, rankPayload))!;
+    const seeded = affinityPrefixDigests(
+      digestArgs(warm.targetIdentity, { messages: rankPayload.messages.slice(0, 3) }),
+    );
+    const ranked = affinityPrefixDigests(digestArgs(warm.targetIdentity, rankPayload));
+    db.cacheAffinityRecord.findMany.mockResolvedValue(
+      seeded.digests.map((prefixDigest, index) =>
+        affinityRow({
+          target: warm,
+          material: ranked,
+          prefixDigest,
+          prefixDepth: index + 1,
+        }),
+      ),
+    );
+    const result = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [idle, warm],
+    });
+    const matched = prefixTokensAtDepth(canonical, 2, 1_000);
+    expect(result.matchedPrefixTokens?.["target-a"]).toBe(matched);
+    expect(result.reasons["target-a"]).toContain(
+      `matchFraction:${Number((matched / 1_000).toFixed(4))}`,
+    );
+  });
+
+  it("treats weight 0 as infinite residency cost", async () => {
+    const zero = {
+      ...cap8(target("target-a", "runtime-a", "capacity-a")),
+      kvBudgetTokens: 100_000,
+      requestTokens: 10_000,
+      weight: 0,
+    };
+    const other = {
+      ...cap8(target("target-b", "runtime-b", "capacity-b")),
+      kvBudgetTokens: 100_000,
+      requestTokens: 10_000,
+      weight: 1,
+    };
+    const result = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: {
+        messages: [
+          { role: "system", content: "S" },
+          { role: "user", content: "B" },
+        ],
+      },
+      targets: [zero, other],
+    });
+    expect(result.orderedTargetIds[0]).toBe("target-b");
+    expect(result.scores["target-a"]).toBeLessThan(result.scores["target-b"]!);
   });
 });
 

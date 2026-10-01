@@ -242,6 +242,7 @@ function poolRow(overrides: Record<string, unknown> = {}) {
     transformerVideo: false,
     transformerCacheMode: "OFF",
     TransformerDiscoveredModel: null,
+    affinityResidencyWeight: 100,
     // Schema defaults of the fallback columns (forwarder.prisma).
     fallbackEnabled: false,
     fallbackForGrantees: false,
@@ -563,6 +564,7 @@ describe("forwarderManagementRouter", () => {
           affinityConversationWeight: 150,
           affinityConfirmedCacheWeight: 250,
           affinityLoadPenaltyWeight: 100,
+          affinityResidencyWeight: 100,
         }),
       }),
     );
@@ -2053,6 +2055,7 @@ describe("forwarderManagementRouter", () => {
           affinityConversationWeight: 150,
           affinityConfirmedCacheWeight: 250,
           affinityLoadPenaltyWeight: 100,
+          affinityResidencyWeight: 100,
         }),
       }),
     );
@@ -2214,6 +2217,19 @@ describe("forwarderManagementRouter", () => {
     await client().updateModelPool({ id: "pool-id", name: "Renamed" });
     const rename = db.modelPool.update.mock.calls.at(-1)?.[0] as { data: Record<string, unknown> };
     expect(rename.data).not.toHaveProperty("cacheHolderWaitMs");
+  });
+
+  it("stores the new-conversation residency weight", async () => {
+    db.modelPool.findUnique.mockResolvedValue(poolRow({ userId: "user-id" }));
+    db.modelPool.update.mockResolvedValue(poolRow({ affinityResidencyWeight: 250 }));
+    await expect(
+      client().updateModelPool({ id: "pool-id", affinityResidencyWeight: 250 }),
+    ).resolves.toMatchObject({ affinity: { residencyWeight: 250 } });
+    const update = db.modelPool.update.mock.calls.at(-1)?.[0] as { data: Record<string, unknown> };
+    expect(update.data).toMatchObject({ affinityResidencyWeight: 250 });
+    await expect(
+      client().updateModelPool({ id: "pool-id", affinityResidencyWeight: 10_001 }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
   });
 
   it("stores warm-session protection settings and keeps the share mode consistent", async () => {

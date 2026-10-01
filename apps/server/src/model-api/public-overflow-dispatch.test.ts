@@ -1750,10 +1750,12 @@ describe("public overflow terminal response dispatch", () => {
       targets: listed.targets,
     });
     expect(mixedCurrency.targets.map((target) => target.executionTargetId)).toEqual([
-      "target-expensive",
       "target-cheap",
+      "target-expensive",
     ]);
-    expect(mixedCurrency.targets[0]?.affinity?.reason).toContain("costPenalty:0");
+    expect(
+      mixedCurrency.targets.every((target) => target.affinity?.reason?.includes("costPenalty:0")),
+    ).toBe(true);
 
     const incomplete = { ...schedule(1), pricing: { ratesPerMillion: { input: 1 } } };
     db.providerPricingVersion.findFirst
@@ -1765,10 +1767,14 @@ describe("public overflow terminal response dispatch", () => {
       targets: listed.targets,
     });
     expect(incompletePricing.targets.map((target) => target.executionTargetId)).toEqual([
-      "target-expensive",
       "target-cheap",
+      "target-expensive",
     ]);
-    expect(incompletePricing.targets[0]?.affinity?.reason).toContain("costPenalty:0");
+    expect(
+      incompletePricing.targets.every((target) =>
+        target.affinity?.reason?.includes("costPenalty:0"),
+      ),
+    ).toBe(true);
   });
 
   it("fails open to configured provider order when affinity ranking is unavailable", async () => {

@@ -1014,6 +1014,7 @@ export async function listPublicOverflowTargets(
       affinityConversationWeight: true,
       affinityConfirmedCacheWeight: true,
       affinityLoadPenaltyWeight: true,
+      affinityResidencyWeight: true,
       capacityWaitBudgetMs: true,
       User: { select: { banned: true, banExpires: true, deletionRequestedAt: true } },
       PoolMembers: {
@@ -1049,6 +1050,7 @@ export async function listPublicOverflowTargets(
     conversationWeight: 150,
     confirmedCacheWeight: 250,
     loadPenaltyWeight: 100,
+    residencyWeight: 100,
   };
   if (!pool)
     return {
@@ -1189,6 +1191,7 @@ export async function listPublicOverflowTargets(
       conversationWeight: pool.affinityConversationWeight,
       confirmedCacheWeight: pool.affinityConfirmedCacheWeight,
       loadPenaltyWeight: pool.affinityLoadPenaltyWeight,
+      residencyWeight: pool.affinityResidencyWeight,
     },
     targets: listed.flatMap((item) => (item.coolingDown ? [] : [item.target])),
     coolingDown: listed.flatMap((item) => (item.coolingDown ? [item.target] : [])),
@@ -2636,6 +2639,10 @@ export async function buildProviderAffinityTargets(input: {
       hardConcurrencyLimit: target.concurrencyLimit ?? null,
       activeLoad: loadByModel.get(target.providerModelId) ?? 0,
       waitingLoad: 0,
+      weight: 1,
+      requestTokens: Number(input.request.estimatedInputTokens ?? 0) || 0,
+      kvBudgetTokens: null,
+      slots: target.concurrencyLimit ?? null,
       healthPenalty: providerHealthPenalty(target.healthStatus),
       publicEgressPenalty: 100,
       costPenalty: comparableCurrency ? providerCostPenalty(liability) : 0,

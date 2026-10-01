@@ -27,6 +27,7 @@ const requiredFragments = [
   "execution_target_capacity_policy_check",
   "model_pool_capacity_policy_check",
   "model_pool_affinity_policy_check",
+  'AND "affinityResidencyWeight" BETWEEN 0 AND 10000',
   "relay_request_execution_telemetry_check",
   "relay_execution_event_shape_check",
   "relay_execution_event_immutable",
