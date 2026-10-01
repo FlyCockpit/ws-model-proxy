@@ -66,6 +66,9 @@ jobs:
         with:
           workspaces: apps/cli -> target
       - run: bash scripts/test-exchangeless-fs.sh test
+      # A cancelled job may leave a mount behind; this unmounts only FUSE mounts under RUNNER_TEMP.
+      - if: always()
+        run: bash scripts/test-exchangeless-fs.sh cleanup
 
   fmt:
     runs-on: ubuntu-latest

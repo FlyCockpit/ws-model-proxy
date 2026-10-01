@@ -6,6 +6,7 @@
 #
 #   scripts/test-exchangeless-fs.sh test  [class...]   mount, check, run the Rust test
 #   scripts/test-exchangeless-fs.sh smoke [class...]   mount and check only (no cargo)
+#   scripts/test-exchangeless-fs.sh cleanup            unmount leftovers of an aborted run (idempotent)
 #
 # Classes (all refuse RENAME_EXCHANGE):
 #   nr          NOREPLACE rename and link() work
@@ -33,7 +34,19 @@ fusermount=/usr/bin/fusermount3
 mount_timeout=10
 test_timeout=${WSMP_EXCHANGELESS_TEST_TIMEOUT:-180}
 
-case $MODE in test | smoke) ;; *) echo "usage: $0 test|smoke [class...]" >&2; exit 2 ;; esac
+case $MODE in test | smoke | cleanup) ;; *) echo "usage: $0 test|smoke|cleanup [class...]" >&2; exit 2 ;; esac
+
+if [[ $MODE == cleanup ]]; then
+  # Idempotent last resort for a cancelled job: unmount FUSE mounts that an aborted run left under
+  # this runner's temp directory. It touches nothing else and never signals a process.
+  base=${RUNNER_TEMP:-${TMPDIR:-/tmp}}/exchangeless-fs.
+  status=0
+  while read -r mnt; do
+    echo "cleanup: unmounting $mnt"
+    "$fusermount" -u "$mnt" 2>/dev/null || "$fusermount" -uz "$mnt" 2>/dev/null || { echo "cleanup: could not unmount $mnt" >&2; status=1; }
+  done < <(awk -v base="$base" '{ for (i = 1; i <= NF; i++) if ($i == "-") { if (index($5, base) == 1 && $(i + 1) ~ /^fuse/) print $5; break } }' /proc/self/mountinfo)
+  exit $status
+fi
 for class in "${CLASSES[@]}"; do
   ok=0
   for known in "${ALL_CLASSES[@]}"; do [[ $class == "$known" ]] && ok=1; done
@@ -43,6 +56,7 @@ done
 fail() { echo "FAIL: $*" >&2; }
 work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/exchangeless-fs.XXXXXX") || exit 2
 declare -A DAEMON_PID=() MOUNT_DIR=()
+TEST_PID=
 failed=0
 cleanup_failed=0
 
@@ -83,7 +97,20 @@ unmount_class() { # idempotent; only touches what this run mounted
   fi
 }
 
+stop_test() { # the active test supervisor (`timeout`, its own process group) and its children
+  [[ -n $TEST_PID ]] || return 0
+  if kill -0 "$TEST_PID" 2>/dev/null; then
+    kill -TERM "$TEST_PID" 2>/dev/null
+    local tries=0
+    while kill -0 "$TEST_PID" 2>/dev/null && [[ $tries -lt 50 ]]; do sleep 0.1; tries=$((tries + 1)); done
+    if kill -0 "$TEST_PID" 2>/dev/null; then kill -KILL -- "-$TEST_PID" 2>/dev/null; kill -KILL "$TEST_PID" 2>/dev/null; fi
+  fi
+  wait "$TEST_PID" 2>/dev/null
+  TEST_PID=
+}
+
 cleanup() {
+  stop_test
   local class
   for class in "${!MOUNT_DIR[@]}"; do unmount_class "$class"; done
   # Remove the work dir only when nothing of ours is still mounted under it.
@@ -218,9 +245,14 @@ run_class() {
   check_capabilities "$class" "$dir/mnt" || { fail "$class: capability check"; return 1; }
   [[ $MODE == test ]] || return 0
   local out="$dir/test.out"
+  # Background plus `wait`: a signal to this script interrupts `wait` at once and the trap runs
+  # (a foreground command would defer it), so a cancelled job stops the test before it unmounts.
   WSMP_EXCHANGELESS_REQUIRED=1 WSMP_EXCHANGELESS_CLASS=$class WSMP_EXCHANGELESS_DIR=$dir/mnt \
-    timeout -k 10 "$test_timeout" "$test_binary" --exact "$test_name" --nocapture --test-threads=1 >"$out" 2>&1
+    timeout -k 10 "$test_timeout" "$test_binary" --exact "$test_name" --nocapture --test-threads=1 >"$out" 2>&1 &
+  TEST_PID=$!
+  wait "$TEST_PID"
   local status=$?
+  TEST_PID=
   cat "$out"
   [[ $status -eq 0 ]] || { fail "$class: the test exited with status $status"; return 1; }
   grep -q '^test result: ok\. 1 passed' "$out" || { fail "$class: the test did not report exactly one pass"; return 1; }

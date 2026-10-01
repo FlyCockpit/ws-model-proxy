@@ -1448,6 +1448,103 @@ fn rename_each_link_alias_disposal_keeps_a_last_name() {
     }
 }
 
+/// C1A-1: S and D are two names of one object (a true alias pair, admitted on mounts
+/// without stable inodes). After the publish a writer writes through the public name
+/// and a third save replaces it. The two private names are then the object's only
+/// names: the batch cleanup must not delete both.
+#[test]
+fn rename_true_alias_pair_with_a_post_publication_save_keeps_the_object() {
+    use crate::file_ops::policy::Access;
+    use crate::file_ops::recovery::{Held, RecoveryDir};
+    use crate::file_ops::resolve::{ResolveOpts, resolve};
+    use std::os::fd::AsFd;
+    for object in OBJECTS {
+        for save in [false, true] {
+            let fx = Fx::new();
+            let root = fx.root.clone();
+            let fx = fx.with_hook(move |step| {
+                if save && step == Step::Renamed {
+                    let public = root.join("dst");
+                    if matches!(object, Object::File) {
+                        use std::io::Write;
+                        let mut writer = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&public)
+                            .unwrap();
+                        writer.write_all(b"+WRITER").unwrap();
+                    }
+                    object.save(&public, RACER);
+                }
+                Ok(())
+            });
+            object.put(&fx, "src", SOURCE);
+            let resolve_name = |name: &str| {
+                resolve(
+                    &fx.p(name),
+                    &ResolveOpts {
+                        follow_last: false,
+                        make_parents: None,
+                        policy: &fx.ops.policy,
+                        access: Access::Remove,
+                        preview_missing: false,
+                        pin: None,
+                        cancel: None,
+                    },
+                )
+                .unwrap()
+            };
+            let from = resolve_name("src");
+            nix::unistd::linkat(
+                from.dir.as_fd(),
+                from.name.as_os_str(),
+                from.dir.as_fd(),
+                "dst",
+                nix::fcntl::AtFlags::empty(),
+            )
+            .unwrap();
+            let to = resolve_name("dst");
+            let mut src =
+                Held::open(&from.dir, &from.name, from.lstat().unwrap().unwrap()).unwrap();
+            let mut dst = Held::open(&to.dir, &to.name, to.lstat().unwrap().unwrap()).unwrap();
+            let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path).unwrap();
+            let _scope = FaultScope::new(&Shape::Link.faults(true));
+            let method = recovery
+                .preflight_move(&fx.ops, &from, &to, &src, Some(&dst))
+                .unwrap();
+            recovery
+                .commit_move(
+                    &fx.ops,
+                    &from,
+                    &to,
+                    &mut src,
+                    Some(&mut dst),
+                    method,
+                    &fx.cancel,
+                )
+                .unwrap();
+            let recovered: Vec<PathBuf> =
+                recovery.finish().into_iter().map(PathBuf::from).collect();
+            if save {
+                // The object the writer wrote to lost its public name: it must stay.
+                let expected = if matches!(object, Object::File) {
+                    format!("{SOURCE}+WRITER")
+                } else {
+                    SOURCE.to_owned()
+                };
+                assert!(
+                    recovered
+                        .iter()
+                        .any(|path| object.bytes(path).as_deref() == Some(expected.as_str())),
+                    "{object:?}: the displaced object's bytes must stay reported: {recovered:?}"
+                );
+            } else {
+                assert!(recovered.is_empty(), "{object:?}: {recovered:?}");
+                assert_eq!(object.bytes(&fx.root.join("dst")).as_deref(), Some(SOURCE));
+            }
+        }
+    }
+}
+
 #[test]
 fn rename_true_alias_pair_closes_both_private_proofs_before_committed_unlinks() {
     use crate::file_ops::policy::Access;
@@ -1495,7 +1592,7 @@ fn rename_true_alias_pair_closes_both_private_proofs_before_committed_unlinks() 
                 .unwrap();
             #[cfg(target_os = "linux")]
             let checks = if matches!(shape, Shape::Link) {
-                Some(watch_private_unlinks(&fx, &["slot-1", "slot-2"]))
+                Some(watch_private_unlinks(&fx, &["slot-2", "slot-1"]))
             } else {
                 None
             };

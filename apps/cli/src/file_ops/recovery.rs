@@ -1224,6 +1224,12 @@ impl RecoveryDir {
     /// On noino S and D can be hard links with different presented inode numbers.
     /// Prove both private names first, then close BOTH descriptors before either
     /// unlink. No snapshot or reopened successor can authorize D's disposal.
+    ///
+    /// D goes first, and S's link count is read AFTER it: when D is a second name of
+    /// S's own object, the count before D's unlink still included the name this
+    /// batch deletes, so a public name already replaced by a racer would leave S's
+    /// alias looking like it has a surviving link and both private names would go
+    /// (C1A-1). The count is read by name (no descriptor stays open on the object).
     fn dispose_link_move(
         &mut self,
         ops: &FileOps,
@@ -1233,15 +1239,26 @@ impl RecoveryDir {
         dst: &mut Held,
     ) {
         let dispose_destination = self.prepare_dispose(ops, destination, dst, false);
-        // Keep the last-alias observation next to the releases and unlink.
-        let dispose_source = self.prepare_dispose(ops, source, src, true);
+        let dispose_source = self.prepare_dispose(ops, source, src, false);
         src.release();
-        dst.release(); // H12: close the possible alias peer before source unlink
-        if dispose_source {
-            self.unlink_proven(source);
-        }
+        dst.release(); // H12: close the possible alias peer before any unlink
         if dispose_destination {
             self.unlink_proven(destination);
+        }
+        if dispose_source {
+            let survives = fstatat(
+                self.dir.as_fd(),
+                source.name.as_os_str(),
+                AtFlags::AT_SYMLINK_NOFOLLOW,
+            )
+            .is_ok_and(|raw| Stat::from_raw(&raw).nlink >= 2);
+            if survives {
+                self.unlink_proven(source);
+            } else {
+                // The public name is gone (or the count is unknown): this alias
+                // may be the object's last name. Keep and report it.
+                self.unsettled = true;
+            }
         }
     }
 
