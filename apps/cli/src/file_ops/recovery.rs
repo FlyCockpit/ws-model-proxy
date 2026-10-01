@@ -38,10 +38,11 @@
 //! Remaining POSIX windows (no cross-process exclusion is claimed):
 //! (a) a same-user process guessing a private slot can replace it between the held
 //! proof, close and final unlinkat and lose the successor. Closing adds one syscall.
-//! The link probe proves each private name only by a proof opened on that name, so
-//! the same actor can also swap `probe` between its link and that proof. `tmp` must
-//! still be the object this operation created before the link and again at the
-//! re-hold (same device and inode as T's own fd); a swap is kept and reported.
+//! The link probe proves the alias only by a proof opened on that name, so the same
+//! actor can also swap `probe` between its link and that proof. `tmp` must still be
+//! the object this operation created before the link and again after the alias
+//! unlink, compared with T's own fd, which stays open throughout (it pins T's inode
+//! number against reuse); a swap is kept and reported, never published.
 //! (a2) when NOREPLACE is absent, capture plain-renames into a private slot checked
 //! absent; a squatter between that check and rename can be overwritten.
 //! (b) undo briefly vacates public names; a concurrent create blocks NOREPLACE/link
@@ -440,10 +441,12 @@ impl RecoveryDir {
         };
         self.remember(self.path.join(&alias.name));
         // Both names remain private. Names of one inode need not report one inode
-        // number (FUSE without stable inodes, for example sshfs), so each private
-        // name is proven by a proof opened on THAT name, never by comparing across
-        // names. T's own proof closes before the alias unlink (no own descriptor on
-        // the inode at an unlink), then the surviving name is re-held.
+        // number (FUSE without stable inodes, for example sshfs), so the alias is
+        // proven by a proof opened on ITS name, never by comparing across names. T's
+        // own proof stays open through the alias unlink: it pins T's inode, so no
+        // other object can take T's number, and `tmp` (same name, same inode number
+        // before and after) is then re-checked against it. The unlinked dentry is the
+        // alias's, so an NFS client has nothing to silly-rename.
         let alias_stat = fstatat(
             self.dir.as_fd(),
             alias.name.as_os_str(),
@@ -451,26 +454,13 @@ impl RecoveryDir {
         )
         .map_err(FileError::errno)?;
         let mut alias_held = Held::open(&self.dir, &alias.name, Stat::from_raw(&alias_stat))?;
-        // T's own identity (device and inode, taken from its creating fd) is the
-        // lineage the re-hold must match: this inode stays linked under `tmp`
-        // throughout, so no other object can reuse its number.
-        let lineage = identity.stat;
-        identity.release();
         if !self.dispose(ops, &alias, &mut alias_held) {
             return Err(self.uncertain());
         }
-        match Held::open(&self.dir, &slot.name, lineage) {
-            Ok(held) => *identity = held,
-            Err(_) => {
-                // `tmp` is no longer the object this operation created.
-                self.keep(slot);
-                return Err(self.uncertain());
-            }
-        }
-        if !identity.is_held() {
-            return Err(FileError::errno(
-                identity.open_error().unwrap_or(Errno::EACCES),
-            ));
+        if !self.holds(slot, identity) {
+            // `tmp` is no longer the object this operation created.
+            self.keep(slot);
+            return Err(self.uncertain());
         }
         Ok(PublishMethod::Link)
     }
@@ -1247,7 +1237,7 @@ mod tests {
     }
 
     #[test]
-    fn private_link_probe_reopens_proof_and_alias_failure_retains_both_names_once() {
+    fn private_link_probe_proves_the_alias_by_its_own_name_and_keeps_t_pinned() {
         for fail_unlink in [false, true] {
             let fx = Fx::new();
             let parent = root(&fx);
@@ -1269,14 +1259,18 @@ mod tests {
             let _faults = FaultScope::new(&faults);
             let result = recovery.probe_publish(&fx.ops, &mut tmp, &mut identity);
             assert_eq!(recovery.used, 1);
-            // Each private name is proven by a proof opened on that name: the
-            // alias, then the surviving tmp (a cross-name proof opens only once).
+            // One proof opened on the alias's own name; T's creation proof is never
+            // re-opened (a re-hold by path would lose T's lineage).
             assert_eq!(
                 FaultScope::calls()
                     .iter()
                     .filter(|p| **p == Primitive::Hold)
                     .count(),
-                if fail_unlink { 1 } else { 2 }
+                1
+            );
+            assert!(
+                identity.is_held(),
+                "T stays pinned through the alias unlink"
             );
             assert_eq!(fx.get("destination"), "original");
             assert_eq!(
@@ -1288,7 +1282,6 @@ mod tests {
             );
             if fail_unlink {
                 assert_eq!(result.err().unwrap().code, ErrorCode::UncertainOutcome);
-                assert!(!identity.is_held(), "closed BEFORE even a refused unlink");
                 assert_eq!(
                     recovery.kept,
                     [recovery.path.join("tmp"), recovery.path.join("probe")]
@@ -1297,7 +1290,6 @@ mod tests {
                 assert!(!recovery.settled());
             } else {
                 assert!(matches!(result.unwrap(), PublishMethod::Link));
-                assert!(identity.is_held(), "surviving tmp has a new held proof");
                 assert_eq!(recovery.kept, [recovery.path.join("tmp")]);
                 assert!(!recovery.path.join("probe").exists());
                 assert!(recovery.dispose(&fx.ops, &tmp, &mut identity));
@@ -1307,7 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn private_link_probe_missing_reheld_proof_returns_eacces() {
+    fn private_link_probe_with_an_unheld_alias_retains_both_names_uncertain() {
         let fx = Fx::new();
         let parent = root(&fx);
         let destination = fx.put("destination", "original");
@@ -1319,33 +1311,26 @@ mod tests {
         drop(file);
         let _scope = FaultScope::new(&[
             (Primitive::ProbeNoReplace, 1, Errno::EINVAL),
-            (Primitive::Hold, 2, Errno::EACCES),
+            (Primitive::Hold, 1, Errno::EACCES),
         ]);
         let error = recovery
             .probe_publish(&fx.ops, &mut tmp, &mut identity)
             .err()
             .unwrap();
-        assert_eq!(error.code, ErrorCode::IoError);
-        assert_eq!(error.message, "EACCES");
-        assert!(!identity.is_held());
+        // No proof of the alias: it is never unlinked, both private names stay.
+        assert_eq!(error.code, ErrorCode::UncertainOutcome);
         assert_eq!(fx.get("destination"), "original");
-        assert!(!recovery.path.join("probe").exists());
+        assert!(recovery.path.join("probe").exists());
         assert!(recovery.path.join("tmp").exists());
         assert_eq!(
             FaultScope::calls()
                 .iter()
-                .filter(|p| **p == Primitive::Capture)
+                .filter(|p| **p == Primitive::Unlink)
                 .count(),
             0
         );
-        // Restore a real proof for explicit cleanup after checking the contract.
-        identity = Held::open(&recovery.dir, &tmp.name, identity.stat).unwrap();
-        assert!(recovery.dispose(&fx.ops, &tmp, &mut identity));
-        assert!(recovery.finish().is_empty());
     }
 
-    /// The publication helper is shared by the regular-file temp flow. A real
-    /// symlink slot makes accidentally following its source discriminating.
     #[test]
     fn link_publication_keeps_symlink_identity_without_following_its_target() {
         let fx = Fx::new();

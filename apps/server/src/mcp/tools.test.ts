@@ -2593,7 +2593,7 @@ describe("CLI file tools", () => {
       code: "unsafe_filesystem",
     });
     expect(resultText(result)).toContain(
-      "this filesystem lacks the atomic primitives to change this path without risking a concurrent save; nothing was changed",
+      "This filesystem lacks the atomic primitives to change this path without risking a concurrent save; nothing was changed",
     );
     expect(JSON.stringify(result)).not.toContain("PRIVATE CLI MESSAGE");
   });

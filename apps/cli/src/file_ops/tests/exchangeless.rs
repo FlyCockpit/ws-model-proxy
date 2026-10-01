@@ -1229,7 +1229,14 @@ fn exchangeless_final_unlink_has_no_descriptor_on_disposed_inode() {
                     let nth = *checked.lock().unwrap() + 1;
                     // Link order: private probe alias, published T alias,
                     // captured original. Other Held objects may still be live.
-                    let disposed_id = if !delete_op && matches!(method, PublishMethod::Link) && nth <= 2 {
+                    // The probe alias unlink (nth 1) deliberately keeps T's own proof
+                    // open: it pins T's inode against number reuse, and the unlinked
+                    // dentry is the alias's, not the one T's proof was opened on.
+                    if !delete_op && matches!(method, PublishMethod::Link) && nth == 1 {
+                        *checked.lock().unwrap() += 1;
+                        return;
+                    }
+                    let disposed_id = if !delete_op && matches!(method, PublishMethod::Link) && nth == 2 {
                         let dirs = recovery_dirs(&root);
                         let temp = std::fs::metadata(dirs[0].join("tmp")).unwrap();
                         (temp.dev(), temp.ino())
@@ -1280,6 +1287,11 @@ fn exchangeless_restore_link_unlink_has_no_descriptor_on_disposed_inode() {
         UNLINK_PROBE.with(|probe| {
             *probe.borrow_mut() = Some(Box::new(move || {
                 let nth = *checked.lock().unwrap() + 1;
+                if matches!(method, PublishMethod::Link) && nth == 1 {
+                    // Probe alias unlink: T's own proof stays open by design.
+                    *checked.lock().unwrap() += 1;
+                    return;
+                }
                 let restore_unlink = match method { PublishMethod::NoReplace => 1, PublishMethod::Link => 2 };
                 let disposed_id = if nth == restore_unlink { original_id } else {
                     let dirs = recovery_dirs(&root);

@@ -155,7 +155,7 @@ const FILE_ERROR_MESSAGES: Readonly<Record<ToolErrorCode, string>> = {
   unsupported:
     "The CLI cannot run this file operation (it refuses file tools as root unless allowFileToolsAsRoot is set)",
   unsafe_filesystem:
-    "this filesystem lacks the atomic primitives to change this path without risking a concurrent save; nothing was changed",
+    "This filesystem lacks the atomic primitives to change this path without risking a concurrent save; nothing was changed",
   limit: "Too many file operations; retry after retryAfterMs",
   token_inactive:
     "This MCP token was revoked, has expired, or no longer grants this file capability",
