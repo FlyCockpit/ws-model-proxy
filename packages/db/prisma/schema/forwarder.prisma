@@ -1139,6 +1139,8 @@ model CacheAffinityNode {
   depth             Int
   sessionId         String
   isTip             Boolean
+  /// Whole-prompt footprint from the identifiable write that made this node a tip; NULL means no proven estimate.
+  estimatedTokens   Int?
   expiresAt         DateTime
 
   @@unique([userId, tenantUserId, poolId, executionTargetId, rootDigest, nodeDigest, sessionId], map: "cache_affinity_node_owner_unique")

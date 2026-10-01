@@ -1,8 +1,12 @@
 /**
  * Prefix-attributed eviction feedback, never endpoint cumulative counters (they
  * include bypass traffic). Only a ranked, digest-proven LIVE TIP continuation
- * has a footprint proven as of one ranking SQL snapshot: live-tip ownership
- * and that same digest/session hint's size, age and confirmation are read together.
+ * has a structurally proven footprint in one ranking SQL snapshot: live-tip
+ * ownership and the node's own size are read with the same digest/session hint's
+ * age and confirmation. Only identifiable tip writes set the node's size;
+ * overflow-only hint refreshes cannot change it. Implicit
+ * identical tips may lose one observation when the resolver's session differs
+ * from the last hint writer; that session's identifiable write restores evidence.
  * Later unrelated writes do not change that snapshot claim. Client-id-only
  * matches and bound Responses parents are not a source.
  *

@@ -245,7 +245,7 @@ describe("cache affinity", () => {
     const now = new Date("2026-08-25T12:00:00Z");
     const evidence = { estimatedTokens: 12_000, lastUsedAt: now, engineCacheConfirmed: false };
     db.$queryRaw.mockImplementation(async (query) => {
-      if (query.sql.includes('r."estimatedTokens"')) {
+      if (query.sql.includes('n."estimatedTokens"')) {
         if ("error" in row) throw new Error("evidence unavailable");
         return "noRow" in row ? [] : [evidence];
       }
@@ -269,7 +269,7 @@ describe("cache affinity", () => {
       collectPrefixEvidence: "collect" in row ? row.collect : undefined,
     });
     const proofQueries = db.$queryRaw.mock.calls.filter(([query]) =>
-      query.sql.includes('r."estimatedTokens"'),
+      query.sql.includes('n."estimatedTokens"'),
     );
     expect(proofQueries).toHaveLength(row.expected);
     if (!("collect" in row) || !row.collect) expect(result.prefixEvidence).toBeUndefined();
@@ -608,6 +608,41 @@ describe("cache affinity", () => {
           target: target("target", "runtime"),
         }),
       ).toBeNull();
+    },
+  );
+
+  it.each([
+    { estimate: undefined, expected: null },
+    { estimate: -3.9, expected: 0 },
+    { estimate: 12_000.9, expected: 12_000 },
+    { estimate: 3_000_000_000, expected: 2_147_483_647 },
+  ])(
+    "tip node estimate clamps $estimate to $expected and leaves ancestors NULL",
+    async ({ estimate, expected }) => {
+      await rememberAffinity({
+        ...digestArgs("runtime", {
+          ...payload,
+          messages: [
+            ...payload.messages,
+            { role: "assistant", content: "reply" },
+            { role: "user", content: "next" },
+          ],
+        }),
+        policy,
+        target: target("target", "runtime"),
+        estimatedTokens: estimate,
+      });
+      const writes = db.$executeRaw.mock.calls.filter(([query]) =>
+        query.sql?.includes("INSERT INTO cache_affinity_node"),
+      );
+      expect(writes).toHaveLength(1);
+      const values = writes[0]![0].values;
+      const rows = Array.from({ length: values.length / 12 }, (_, i) =>
+        values.slice(i * 12, (i + 1) * 12),
+      );
+      expect(rows.length).toBeGreaterThan(1);
+      expect(rows.filter((row) => row[9] === true)).toHaveLength(1);
+      for (const row of rows) expect(row[10]).toBe(row[9] ? expected : null);
     },
   );
 
@@ -1923,6 +1958,7 @@ describe("cache affinity", () => {
     "repetition_penalty",
     "logit_bias",
     "stop",
+    "stop_sequences",
     "max_tokens",
     "max_completion_tokens",
     "max_output_tokens",

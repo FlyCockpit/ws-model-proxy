@@ -1,9 +1,13 @@
 /**
  * Eviction evidence is one SQL snapshot proving the resolved session owns a
- * live tip in this request chain and reading that tip's matching hint footprint.
+ * live tip in this request chain and reading the footprint stored on that node.
+ * Only identifiable tip writes set that footprint; overflow-only hint refreshes
+ * cannot change it. The matching hint supplies recency and cache confirmation.
  * Routing hints and identity resolution remain independent. Evidence describes
  * the ranking snapshot; later unrelated writers cannot invalidate that claim.
  * Client identity remains authoritative, with no extra query on the write path.
+ * Implicit identical tips can lose one observation when the resolver chooses
+ * an earlier-expiring session than the last shared-hint writer, failing closed.
  */
 import { randomUUID } from "node:crypto";
 import prisma, { Prisma } from "@ws-model-proxy/db";
@@ -74,7 +78,7 @@ export type AffinityDecision = {
    * `resolveAffinitySession`. Absent = a new session on that target.
    */
   matchedSessionIds?: Record<string, string>;
-  /** Tip footprint estimate proven in one ranking snapshot; not proof of residency. */
+  /** Tip-node footprint proven in one ranking snapshot; not proof of residency. */
   prefixEvidence?: Record<string, { tokens: number; lastUsedAt: number; confirmed: boolean }>;
 };
 
@@ -137,6 +141,9 @@ export const FREE_SAMPLING_PARAMS = [
   "repetition_penalty",
   "logit_bias",
   "stop",
+  // Anthropic's name for the same stop list. Changing it does not change
+  // what a model has cached, so it must not split a conversation (owner, 2026-10-01).
+  "stop_sequences",
   "max_tokens",
   "max_completion_tokens",
   "max_output_tokens",
@@ -646,7 +653,8 @@ export function affinityRetentionSql(scope: IdentityScope, maxRecords: number): 
  * ONE identity enforcement point: rank predicts; remember rereads after its sole
  * cacheAffinity fence. Equality-seek in index order, LIMIT 1 / 2, never a history
  * population scan. User-only and leading-greeting starters stay fresh: a new starter is indistinguishable
- * from truncation to that starter. Fail closed in this residual case; truncations
+ * from truncation to that starter, including when exactly one live conversation starts with that
+ * opening. Fail closed in this residual case (owner, 2026-10-01); truncations
  * retaining conversation evidence can link. Root/instruction-only warmth never links.
  */
 export async function resolveAffinitySession(
@@ -708,8 +716,12 @@ export function affinityIdentityProbeSql(
 }
 
 /**
- * One snapshot of tip ownership and its footprint. Full unique-key equalities
- * bound index work to this request's <=64 nodes, independent of other sessions.
+ * One snapshot of tip ownership and its structurally proven footprint: tokens
+ * live on the tip node, written only by an identifiable request. Hint-only
+ * refreshes can update recency and confirmation without changing that footprint.
+ * Legacy nodes without an estimate provide no evidence.
+ * Full unique-key equalities bound index work to this request's <=64 nodes,
+ * independent of other sessions.
  * Lateral OFFSET 0 keeps the per-node unique-key lookups correlated instead
  * of letting the planner start from all of a session's historical hint rows.
  * Shared hints stamped by another session prove nothing about this session.
@@ -723,10 +735,10 @@ export function affinityPrefixEvidenceSql(
   now: Date,
 ): Prisma.Sql {
   return Prisma.sql`
-    SELECT r."estimatedTokens", r."lastUsedAt", r."engineCacheConfirmed"
+    SELECT n."estimatedTokens", r."lastUsedAt", r."engineCacheConfirmed"
       FROM jsonb_to_recordset(${JSON.stringify(material.nodes)}::jsonb) AS p(digest text, depth int)
       JOIN LATERAL (
-        SELECT n."isTip", n."expiresAt" FROM cache_affinity_node n
+        SELECT n."isTip", n."expiresAt", n."estimatedTokens" FROM cache_affinity_node n
          WHERE n."userId" = ${scope.userId}
            AND n."tenantUserId" = ${scope.tenantUserId}
            AND n."poolId" = ${scope.poolId}
@@ -736,8 +748,9 @@ export function affinityPrefixEvidenceSql(
            AND n."sessionId" = ${sessionId}
         OFFSET 0
       ) n ON n."isTip" AND n."expiresAt" > ${now}::timestamp
+             AND n."estimatedTokens" IS NOT NULL
       JOIN LATERAL (
-        SELECT r."estimatedTokens", r."lastUsedAt", r."engineCacheConfirmed",
+        SELECT r."lastUsedAt", r."engineCacheConfirmed",
                r."sessionId", r."digestVersion", r."expiresAt"
           FROM cache_affinity_record r
          WHERE r."tenantUserId" = ${scope.tenantUserId}
@@ -750,7 +763,6 @@ export function affinityPrefixEvidenceSql(
       ) r ON r."sessionId" = ${sessionId}
              AND r."digestVersion" = ${DIGEST_VERSION}
              AND r."expiresAt" > ${now}::timestamp
-             AND r."estimatedTokens" IS NOT NULL
      ORDER BY p.depth DESC LIMIT 1`;
 }
 
@@ -1268,24 +1280,34 @@ export async function rememberAffinity({
     }
     const tip = material.nodes.at(-1);
     if (tip) {
+      const tipEstimatedTokens =
+        estimatedTokens === undefined
+          ? null
+          : Math.max(0, Math.min(2_147_483_647, Math.trunc(estimatedTokens)));
       const oldDigests = new Set(existingNodes.map((node) => node.nodeDigest));
       const inserts = retained.filter(
         (node) => !oldDigests.has(node.digest) || node.digest === tip.digest,
       );
+      // Only this write's tip receives its whole-prompt estimate. Replays and
+      // promotions replace it even with NULL; non-tip conflicts preserve any
+      // footprint from an earlier write that made that node a tip.
       if (inserts.length)
         await tx.$executeRaw(Prisma.sql`
         INSERT INTO cache_affinity_node
           (id, "userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest",
-           "nodeDigest", depth, "sessionId", "isTip", "expiresAt") VALUES
+           "nodeDigest", depth, "sessionId", "isTip", "estimatedTokens", "expiresAt") VALUES
           ${Prisma.join(
             inserts.map(
               (node) => Prisma.sql`(${randomUUID()}, ${resourceOwnerId},
             ${ownerId}, ${poolId}, ${target.executionTargetId}, ${material.rootDigest},
-            ${node.digest}, ${node.depth}, ${sessionId}, ${node.digest === tip.digest}, ${expiresAt})`,
+            ${node.digest}, ${node.depth}, ${sessionId}, ${node.digest === tip.digest},
+            ${node.digest === tip.digest ? tipEstimatedTokens : null}, ${expiresAt})`,
             ),
           )}
         ON CONFLICT ("userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest", "nodeDigest", "sessionId")
-        DO UPDATE SET "isTip" = EXCLUDED."isTip", "expiresAt" = EXCLUDED."expiresAt"`);
+        DO UPDATE SET "isTip" = EXCLUDED."isTip", "expiresAt" = EXCLUDED."expiresAt",
+          "estimatedTokens" = CASE WHEN EXCLUDED."isTip" THEN EXCLUDED."estimatedTokens"
+            ELSE cache_affinity_node."estimatedTokens" END`);
     }
     // Read the discarded node digests under the same fence before pruning hints.
     // Instruction hints have no node row, so omitted instructions remain matchable.

@@ -260,7 +260,8 @@ integration("cache-prefix identity #160", () => {
       expected: false,
       deeperHint: true,
     },
-    { name: "unknown size", expected: false, unknown: true },
+    { name: "legacy node without estimate", expected: false, unknown: true },
+    { name: "hint without estimate", expected: true, unknownHint: true },
     { name: "expired node", expected: false, expiredNode: true },
     { name: "expired hint", expected: false, expiredHint: true },
     { name: "different digest version", expected: false, oldVersion: true },
@@ -322,6 +323,8 @@ integration("cache-prefix identity #160", () => {
         data: { sessionId: "other-hint-owner" },
       });
     if ("unknown" in row)
+      await db.cacheAffinityNode.updateMany({ where: scope, data: { estimatedTokens: null } });
+    if ("unknownHint" in row)
       await db.cacheAffinityRecord.updateMany({ where: scope, data: { estimatedTokens: null } });
     if ("expiredNode" in row)
       await db.cacheAffinityNode.updateMany({ where: scope, data: { expiresAt: args.now } });
@@ -458,6 +461,10 @@ integration("cache-prefix identity #160", () => {
         collectPrefixEvidence: true,
       });
       expect(interleaved).toBe(true);
+      const currentTip = await db!.cacheAffinityNode.findFirstOrThrow({
+        where: { ...scopeFor(args), sessionId: stored!.sessionId, isTip: true },
+      });
+      expect(currentTip.estimatedTokens).toBe(kind === "truncate" ? 10_000 : 100_000);
       expect(ranked.matchedSessionIds?.[args.target.executionTargetId]).toBe(stored!.sessionId);
       expect(ranked.prefixEvidence).toEqual({
         [args.target.executionTargetId]: {
@@ -600,6 +607,10 @@ integration("cache-prefix identity #160", () => {
       db: rankDb,
     });
     expect(interleaved).toBe(true);
+    const currentTip = await db!.cacheAffinityNode.findFirstOrThrow({
+      where: { ...scopeFor(args), sessionId: stored!.sessionId, isTip: true },
+    });
+    expect(currentTip.estimatedTokens).toBe(kind === "ancestor truncate" ? 10_000 : 25_000);
     expect(ranked.prefixEvidence?.[args.target.executionTargetId]).toEqual({
       tokens: kind === "ancestor truncate" ? 10_000 : 25_000,
       lastUsedAt: args.now.getTime() + 1,
@@ -736,6 +747,370 @@ integration("cache-prefix identity #160", () => {
     },
   );
 
+  it.each(
+    ["openai-chat", "anthropic-messages", "openai-responses"].flatMap((surface) =>
+      ["body", "header", "implicit"].flatMap((carrier) =>
+        ["bytes", "units"].map((kind) => ({ surface, carrier, kind })),
+      ),
+    ),
+  )(
+    "C3a footprint provenance: $surface $carrier $kind overflow preserves the retained tip footprint",
+    async ({ surface, carrier, kind }) => {
+      if (!db) throw new Error("database unavailable");
+      const args = { ...argsFor(await fixture()), surface };
+      const headers =
+        carrier === "header" ? new Headers({ "x-session-id": "overflow-client" }) : undefined;
+      const body = carrier === "body" ? { conversation_id: "overflow-client" } : {};
+      const history =
+        kind === "bytes"
+          ? baseHistory
+          : Array.from({ length: 4096 }, (_, i) => (i % 2 ? a(`reply ${i}`) : u(`question ${i}`)));
+      const payloadFor = (messages: typeof baseHistory) => ({
+        ...body,
+        ...(surface === "openai-responses" ? { input: messages } : { messages }),
+      });
+      const materialFor = (payload: Record<string, unknown>) =>
+        service.affinityPrefixDigests({
+          ...args,
+          headers,
+          payload,
+          runtimeIdentity: args.target.targetIdentity,
+        });
+      const rank = (payload: Record<string, unknown>, elapsed: number) =>
+        service.rankAffinityTargets({
+          ...args,
+          headers,
+          payload,
+          now: new Date(args.now.getTime() + elapsed),
+          targets: [args.target],
+          scoreSingleTarget: true,
+          collectPrefixEvidence: true,
+        });
+      const original = await service.rememberAffinity({
+        ...args,
+        headers,
+        payload: payloadFor(history),
+        estimatedTokens: 12_000,
+        engineCacheConfirmed: true,
+      });
+      expect(original).not.toBeNull();
+      const scope = { ...scopeFor(args), sessionId: original!.sessionId };
+      const oldTip = await db.cacheAffinityNode.findFirstOrThrow({
+        where: { ...scope, isTip: true },
+      });
+      const ordinary = payloadFor(
+        kind === "bytes" ? [...history, a("normal reply"), u("normal next")] : history,
+      );
+      expect(materialFor(ordinary).identifiable).toBe(true);
+      expect((await rank(ordinary, 500)).prefixEvidence?.[args.target.executionTargetId]).toEqual({
+        tokens: 12_000,
+        lastUsedAt: args.now.getTime(),
+        confirmed: true,
+      });
+      const overflow = payloadFor(
+        kind === "bytes"
+          ? [...history, a("answer"), u("x".repeat(2 * 1024 * 1024))]
+          : [...history, u("one extra unit")],
+      );
+      const refused = materialFor(overflow);
+      expect(refused.identifiable).toBe(false);
+      expect(refused.nodes).toHaveLength(0);
+      expect(refused.routingNodes.some((node) => node.digest === original!.tipDigest)).toBe(true);
+      expect(
+        await service.rememberAffinity({
+          ...args,
+          headers,
+          payload: overflow,
+          now: new Date(args.now.getTime() + 1000),
+          estimatedTokens: 100_000,
+          engineCacheConfirmed: true,
+        }),
+      ).toBeNull();
+      const retained = await db.cacheAffinityNode.findFirstOrThrow({
+        where: { ...scope, isTip: true },
+      });
+      expect(retained.nodeDigest).toBe(original!.tipDigest);
+      expect(retained.expiresAt).toEqual(oldTip.expiresAt);
+      expect(retained.estimatedTokens).toBe(12_000);
+      const hint = await db.cacheAffinityRecord.findFirstOrThrow({
+        where: { ...scopeFor(args), prefixDigest: original!.tipDigest },
+      });
+      expect(hint.estimatedTokens).toBe(100_000);
+      expect(hint.expiresAt.getTime()).toBe(oldTip.expiresAt.getTime() + 1000);
+      if (carrier !== "implicit") {
+        // Client footprint and useful routing hints survive the identity refusal.
+        expect(hint.sessionId).toBe(original!.sessionId);
+        const footprint = await db.cacheAffinityRecord.findFirstOrThrow({
+          where: { ...scope, prefixDigest: null, expiresAt: hint.expiresAt },
+        });
+        expect(footprint.estimatedTokens).toBe(100_000);
+      }
+      const ranked = await rank(ordinary, 2000);
+      expect(ranked.matchedSessionIds?.[args.target.executionTargetId]).toBe(original!.sessionId);
+      expect(ranked.prefixTokens?.[args.target.executionTargetId]).toBe(100_000);
+      expect(ranked.prefixEvidence).toEqual(
+        carrier === "implicit"
+          ? {} // Overflow without a client id assigns a new hint owner: fail closed.
+          : {
+              [args.target.executionTargetId]: {
+                tokens: 12_000,
+                lastUsedAt: args.now.getTime() + 1000,
+                confirmed: true,
+              },
+            },
+      );
+      const { qualifiesAsEvictionEvidence } = await import("./kv-eviction-feedback.js");
+      expect(
+        qualifiesAsEvictionEvidence({
+          policy: {
+            enabled: true,
+            windowSeconds: 300,
+            minTokens: 8192,
+            share: "EQUAL_SHARE",
+            fixedPercent: null,
+          },
+          engineKind: "VLLM",
+          kvBudgetTokens: 100_000,
+          ok: true,
+          usage: { promptTokens: 14_000, cacheReadTokens: 1000 },
+          evidence: ranked.prefixEvidence?.[args.target.executionTargetId],
+          now: new Date(args.now.getTime() + 2000),
+        }),
+      ).toBe(false);
+      // A complete write restores provenance, including a replay at the unit cap.
+      const restoredAt = new Date(args.now.getTime() + 3000);
+      const restored = await service.rememberAffinity({
+        ...args,
+        headers,
+        payload: ordinary,
+        now: restoredAt,
+        estimatedTokens: 14_000,
+        engineCacheConfirmed: true,
+      });
+      expect(restored!.sessionId).toBe(original!.sessionId);
+      expect((await rank(ordinary, 4000)).prefixEvidence?.[args.target.executionTargetId]).toEqual({
+        tokens: 14_000,
+        lastUsedAt: restoredAt.getTime(),
+        confirmed: true,
+      });
+      // Truncating to a smaller identifiable tip must use its new whole-prompt size.
+      const smallerAt = new Date(args.now.getTime() + 5000);
+      // Implicit ancestry must remain within the retained 64-node tail.
+      const smallerHistory = kind === "units" ? history.slice(0, -1) : history.slice(0, 2);
+      const smaller = await service.rememberAffinity({
+        ...args,
+        headers,
+        payload: payloadFor(smallerHistory),
+        now: smallerAt,
+        estimatedTokens: 9000,
+        engineCacheConfirmed: true,
+      });
+      expect(smaller!.sessionId).toBe(original!.sessionId);
+      expect(
+        (
+          await rank(
+            payloadFor(kind === "units" ? history : [...smallerHistory, u("after truncation")]),
+            6000,
+          )
+        ).prefixEvidence?.[args.target.executionTargetId],
+      ).toEqual({ tokens: 9000, lastUsedAt: smallerAt.getTime(), confirmed: true });
+    },
+    // Several complete canonicalizations and fenced writes at the 4096-unit cap.
+    20_000,
+  );
+
+  it.each(["body", "header", "implicit rank"] as const)(
+    "v4 same-Date overflow collision: %s reads only the tip footprint",
+    async (carrier) => {
+      if (!db) throw new Error("database unavailable");
+      const args = argsFor(await fixture());
+      const headers =
+        carrier === "header" ? new Headers({ "x-session-id": "collision" }) : undefined;
+      const body = carrier === "header" ? {} : { conversation_id: "collision" };
+      const base = { ...body, messages: baseHistory };
+      const stored = await service.rememberAffinity({
+        ...args,
+        headers,
+        payload: base,
+        estimatedTokens: 12_000,
+        engineCacheConfirmed: true,
+      });
+      const tipBefore = await db.cacheAffinityNode.findFirstOrThrow({
+        where: { ...scopeFor(args), sessionId: stored!.sessionId, isTip: true },
+      });
+      const overflow = {
+        ...body,
+        messages: [...baseHistory, a("reply"), u("x".repeat(2 * 1024 * 1024))],
+      };
+      expect(
+        service.affinityPrefixDigests({
+          ...args,
+          headers,
+          payload: overflow,
+          runtimeIdentity: args.target.targetIdentity,
+        }).identifiable,
+      ).toBe(false);
+      // Deliberately reuse the exact Date instance: expiry equality is no proof.
+      await service.rememberAffinity({
+        ...args,
+        headers,
+        payload: overflow,
+        estimatedTokens: 100_000,
+        engineCacheConfirmed: true,
+      });
+      const hint = await db.cacheAffinityRecord.findFirstOrThrow({
+        where: { ...scopeFor(args), prefixDigest: stored!.tipDigest },
+      });
+      expect(hint.expiresAt).toEqual(tipBefore.expiresAt);
+      expect(hint.estimatedTokens).toBe(100_000);
+      expect(await db.cacheAffinityNode.findUniqueOrThrow({ where: { id: tipBefore.id } })).toEqual(
+        tipBefore,
+      );
+      const ranked = await service.rankAffinityTargets({
+        ...args,
+        headers: carrier === "implicit rank" ? undefined : headers,
+        payload: {
+          ...(carrier === "implicit rank" ? {} : body),
+          messages: [...baseHistory, a("ordinary reply"), u("ordinary next")],
+        },
+        targets: [args.target],
+        scoreSingleTarget: true,
+        collectPrefixEvidence: true,
+      });
+      expect(ranked.matchedSessionIds?.[args.target.executionTargetId]).toBe(stored!.sessionId);
+      expect(ranked.prefixEvidence?.[args.target.executionTargetId]).toEqual({
+        tokens: 12_000,
+        lastUsedAt: args.now.getTime(),
+        confirmed: true,
+      });
+    },
+  );
+
+  it("v4 tip-only estimates: replay replaces or clears provenance and promotion sets its own size", async () => {
+    if (!db) throw new Error("database unavailable");
+    const args = argsFor(await fixture());
+    const payload = { conversation_id: "estimate-replay", messages: baseHistory };
+    const stored = await service.rememberAffinity({
+      ...args,
+      payload,
+      estimatedTokens: 12_000,
+      engineCacheConfirmed: true,
+    });
+    const where = { ...scopeFor(args), sessionId: stored!.sessionId };
+    let nodes = await db.cacheAffinityNode.findMany({ where });
+    expect(nodes.filter((node) => !node.isTip).every((node) => node.estimatedTokens === null)).toBe(
+      true,
+    );
+    const originalTip = nodes.find((node) => node.isTip)!;
+    const rank = () =>
+      service.rankAffinityTargets({
+        ...args,
+        payload: { ...payload, messages: [...baseHistory, a("reply two"), u("fourth")] },
+        targets: [args.target],
+        scoreSingleTarget: true,
+        collectPrefixEvidence: true,
+      });
+    for (const estimate of [18_000, undefined, 0, 10_000]) {
+      await service.rememberAffinity({ ...args, payload, estimatedTokens: estimate });
+      nodes = await db.cacheAffinityNode.findMany({ where });
+      expect(nodes.find((node) => node.isTip)).toMatchObject({
+        id: originalTip.id,
+        estimatedTokens: estimate ?? null,
+      });
+      expect(
+        nodes.filter((node) => !node.isTip).every((node) => node.estimatedTokens === null),
+      ).toBe(true);
+      if (estimate === undefined) expect((await rank()).prefixEvidence).toEqual({});
+      else
+        expect((await rank()).prefixEvidence?.[args.target.executionTargetId]?.tokens).toBe(
+          estimate,
+        );
+    }
+    const advanced = { ...payload, messages: [...baseHistory, a("reply two"), u("fourth")] };
+    await service.rememberAffinity({ ...args, payload: advanced, estimatedTokens: 20_000 });
+    nodes = await db.cacheAffinityNode.findMany({ where });
+    expect(nodes.find((node) => node.isTip)?.estimatedTokens).toBe(20_000);
+    const oldBranch = await service.rankAffinityTargets({
+      ...args,
+      payload: { ...payload, messages: [...baseHistory, a("edited reply"), u("edited fourth")] },
+      targets: [args.target],
+      scoreSingleTarget: true,
+      collectPrefixEvidence: true,
+    });
+    // The old tip still has its own estimate, but is now only an ancestor.
+    expect(oldBranch.matchedSessionIds?.[args.target.executionTargetId]).toBe(stored!.sessionId);
+    expect(oldBranch.prefixEvidence).toEqual({});
+    expect(nodes.find((node) => node.id === originalTip.id)).toMatchObject({
+      isTip: false,
+      estimatedTokens: 10_000,
+    });
+    expect(
+      nodes
+        .filter((node) => node.id !== originalTip.id && !node.isTip)
+        .every((node) => node.estimatedTokens === null),
+    ).toBe(true);
+    await service.rememberAffinity({ ...args, payload, estimatedTokens: 9000 });
+    expect(
+      await db.cacheAffinityNode.findUniqueOrThrow({ where: { id: originalTip.id } }),
+    ).toMatchObject({
+      isTip: true,
+      estimatedTokens: 9000,
+    });
+  });
+
+  it("O3b implicit identical tips lose one observation then recover after their own write", async () => {
+    const args = argsFor(await fixture());
+    const first = await service.rememberAffinity({
+      ...args,
+      payload: { messages: baseHistory.slice(0, 1) },
+      estimatedTokens: 12_000,
+      engineCacheConfirmed: true,
+    });
+    const second = await service.rememberAffinity({
+      ...args,
+      payload: { messages: baseHistory.slice(0, 1) },
+      now: new Date(args.now.getTime() + 1000),
+      estimatedTokens: 15_000,
+      engineCacheConfirmed: true,
+    });
+    expect(second!.sessionId).not.toBe(first!.sessionId);
+    expect(second!.tipDigest).toBe(first!.tipDigest);
+    const payload = { messages: [...baseHistory, a("second reply"), u("third")] };
+    const ranked = await service.rankAffinityTargets({
+      ...args,
+      payload,
+      now: new Date(args.now.getTime() + 2000),
+      targets: [args.target],
+      scoreSingleTarget: true,
+      collectPrefixEvidence: true,
+    });
+    expect(ranked.matchedSessionIds?.[args.target.executionTargetId]).toBe(first!.sessionId);
+    expect(ranked.prefixEvidence).toEqual({});
+    const writtenAt = new Date(args.now.getTime() + 3000);
+    const ownWrite = await service.rememberAffinity({
+      ...args,
+      payload,
+      now: writtenAt,
+      estimatedTokens: 13_000,
+      engineCacheConfirmed: true,
+    });
+    expect(ownWrite!.sessionId).toBe(first!.sessionId);
+    const recovered = await service.rankAffinityTargets({
+      ...args,
+      payload: { messages: [...payload.messages, a("third reply"), u("fourth")] },
+      now: new Date(args.now.getTime() + 4000),
+      targets: [args.target],
+      scoreSingleTarget: true,
+      collectPrefixEvidence: true,
+    });
+    expect(recovered.matchedSessionIds?.[args.target.executionTargetId]).toBe(first!.sessionId);
+    expect(recovered.prefixEvidence?.[args.target.executionTargetId]).toEqual({
+      tokens: 13_000,
+      lastUsedAt: writtenAt.getTime(),
+      confirmed: true,
+    });
+  });
+
   it("C2a maximum-tail client rank uses population-independent point lookups", async () => {
     if (!db) throw new Error("database unavailable");
     const { Prisma } = await import("@ws-model-proxy/db");
@@ -766,16 +1141,93 @@ integration("cache-prefix identity #160", () => {
       "Shared Read Blocks"?: number;
       "Actual Rows"?: number;
       "Actual Loops"?: number;
+      "Rows Removed by Filter"?: number;
+      "Rows Removed by Index Recheck"?: number;
+      "Relation Name"?: string;
       Plans?: Plan[];
     };
     const flatten = (plan: Plan): Plan[] => [plan, ...(plan.Plans ?? []).flatMap(flatten)];
-    const work: number[] = [];
-    const scanPlans: Plan[][] = [];
-    for (const count of [1000, 20_000]) {
-      const first = count === 1000 ? 1 : 1001;
-      // Competing tips and ancestors across the entire request tail; records
-      // span the same scope/digests with other bindings, so even the narrower
-      // non-unique record index faces the competitor population.
+    const work = new Map<string, number[]>();
+    let previous = 0;
+    // The record unique key is a Prisma unique index (not a constraint).
+    const [recordIndex] = await db.$queryRaw<{ name: string }[]>`
+      SELECT c.relname AS name FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indexrelid
+      WHERE i.indrelid = 'cache_affinity_record'::regclass AND i.indisunique
+        AND pg_get_indexdef(i.indexrelid) LIKE '%"prefixDigest"%'`;
+    if (!recordIndex) throw new Error("record unique index unavailable");
+    const indexIdentifier = Prisma.raw(`"${recordIndex.name.replaceAll('"', '""')}"`);
+    const assertPlan = (plan: Plan, count: number, variant: string) => {
+      const scans = flatten(plan).filter((node) => node["Node Type"].includes("Scan"));
+      const affinityScans = scans.filter((node) =>
+        ["cache_affinity_node", "cache_affinity_record"].includes(node["Relation Name"] ?? ""),
+      );
+      const visited = affinityScans.reduce(
+        (total, scan) =>
+          total +
+          ((scan["Actual Rows"] ?? 0) +
+            (scan["Rows Removed by Filter"] ?? 0) +
+            (scan["Rows Removed by Index Recheck"] ?? 0)) *
+            (scan["Actual Loops"] ?? 0),
+        0,
+      );
+      const buffers = (plan["Shared Hit Blocks"] ?? 0) + (plan["Shared Read Blocks"] ?? 0);
+      // Include rejected entries, not only output rows. Keep routine logs small,
+      // but capture the full plan if CI chooses a path that violates a bound.
+      process.stdout.write(
+        `${JSON.stringify({
+          evidenceWork: {
+            count,
+            variant,
+            buffers,
+            visited,
+            scans: affinityScans.map((scan) => ({
+              index: scan["Index Name"],
+              condition: scan["Index Cond"],
+              rows: scan["Actual Rows"],
+              loops: scan["Actual Loops"],
+              filtered: scan["Rows Removed by Filter"] ?? 0,
+              rechecked: scan["Rows Removed by Index Recheck"] ?? 0,
+            })),
+          },
+        })}\n`,
+      );
+      try {
+        expect(affinityScans).toHaveLength(2);
+        for (const scan of affinityScans) {
+          expect(scan["Index Cond"]).toBeDefined();
+          if (scan["Relation Name"] === "cache_affinity_node") {
+            expect(scan["Index Name"]).toBe("cache_affinity_node_owner_unique");
+            for (const key of [
+              "userId",
+              "tenantUserId",
+              "poolId",
+              "executionTargetId",
+              "rootDigest",
+              "nodeDigest",
+              "sessionId",
+            ])
+              expect(scan["Index Cond"]).toContain(key);
+            expect(scan["Index Cond"]).not.toMatch(/[<>]/);
+          }
+        }
+        for (const scan of scans) expect(scan["Index Cond"] ?? "").not.toMatch(/ROW\s*\(/i);
+        expect(visited).toBeLessThanOrEqual(64 * 4);
+        expect(buffers).toBeLessThan(1000);
+      } catch (error) {
+        process.stdout.write(`${JSON.stringify({ evidencePlan: { count, variant, plan } })}\n`);
+        throw error;
+      }
+      const measurements = work.get(variant) ?? [];
+      measurements.push(buffers);
+      work.set(variant, measurements);
+    };
+    for (const count of [1000, 20_000, 100_000]) {
+      const first = previous + 1;
+      previous = count;
+      // Nodes can share starters across sessions. Record digests include the
+      // binding HMAC, so different bindings must have distinct prefix digests;
+      // reusing request digests would invent an impossible competitor range.
       await db.$executeRaw`INSERT INTO cache_affinity_node
         (id, "userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest", "nodeDigest", depth, "sessionId", "isTip", "expiresAt")
         SELECT 'work-' || ${args.poolId} || i, ${args.resourceOwnerId}, ${args.ownerId}, ${args.poolId}, ${args.target.executionTargetId}, ${material.rootDigest},
@@ -784,7 +1236,7 @@ integration("cache-prefix identity #160", () => {
       await db.$executeRaw`INSERT INTO cache_affinity_record
         (id, "userId", "tenantUserId", "poolId", "executionTargetId", "targetIdentity", "bindingDigest", "prefixDigest", "sessionId", "prefixDepth", "expiresAt", "lastUsedAt")
         SELECT 'work-' || ${args.poolId} || i, ${args.resourceOwnerId}, ${args.ownerId}, ${args.poolId}, ${args.target.executionTargetId}, ${args.target.targetIdentity}, md5('other-binding-' || i),
-          (${JSON.stringify(material.nodes)}::jsonb -> ((i % 64)::int) ->> 'digest'), 'work-' || ${args.poolId} || i, (i % 64)::int + 1, ${expiry}, ${args.now}
+          md5('other-prefix-' || i), 'work-' || ${args.poolId} || i, (i % 64)::int + 1, ${expiry}, ${args.now}
         FROM generate_series(${first}::int, ${count}::int) i ORDER BY md5(i::text)`;
       await db.$executeRawUnsafe("VACUUM ANALYZE cache_affinity_node");
       await db.$executeRawUnsafe("VACUUM ANALYZE cache_affinity_record");
@@ -811,43 +1263,34 @@ integration("cache-prefix identity #160", () => {
       });
       expect(ranked.prefixEvidence?.[args.target.executionTargetId]?.tokens).toBe(12_000);
       expect(queries).toHaveLength(1); // Client identity retains its zero-query shortcut.
-      const [explain] = await producer.$queryRaw<{ "QUERY PLAN": { Plan: Plan }[] }[]>(
-        Prisma.sql`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${queries[0]!}`,
-      );
-      const plan = explain!["QUERY PLAN"][0]!.Plan;
-      const scans = flatten(plan).filter(
-        (node) => node["Node Type"].includes("Scan") && node["Index Name"],
-      );
-      scanPlans.push(scans);
-      const buffers = (plan["Shared Hit Blocks"] ?? 0) + (plan["Shared Read Blocks"] ?? 0);
-      work.push(buffers);
-      expect(buffers).toBeLessThan(1000);
-      process.stdout.write(
-        `${JSON.stringify({ evidenceWork: { count, buffers, indexes: scans.map((scan) => scan["Index Name"]) } })}\n`,
-      );
+      const explainSql = Prisma.sql`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${queries[0]!}`;
+      const [explain] = await producer.$queryRaw<{ "QUERY PLAN": { Plan: Plan }[] }[]>(explainSql);
+      assertPlan(explain!["QUERY PLAN"][0]!.Plan, count, "record unique index present");
+      // Reproduce CI's alternate record path without planner flags. DDL and
+      // EXPLAIN use one fixture transaction; the deliberate throw restores the
+      // index on rollback, even when a bound assertion fails.
+      const rollback = new Error("rollback record-index variant");
+      await expect(
+        db.$transaction(
+          async (tx) => {
+            await tx.$executeRaw(Prisma.sql`DROP INDEX ${indexIdentifier}`);
+            const [alternate] =
+              await tx.$queryRaw<{ "QUERY PLAN": { Plan: Plan }[] }[]>(explainSql);
+            const plan = alternate!["QUERY PLAN"][0]!.Plan;
+            expect(flatten(plan).some((scan) => scan["Index Name"] === recordIndex.name)).toBe(
+              false,
+            );
+            assertPlan(plan, count, "without record unique index");
+            throw rollback;
+          },
+          { timeout: 15_000 },
+        ),
+      ).rejects.toBe(rollback);
     }
-    expect(work[1]! / Math.max(1, work[0]!)).toBeLessThanOrEqual(2);
-    for (const scans of scanPlans) {
-      expect(scans.length).toBeGreaterThanOrEqual(2);
-      for (const scan of scans) {
-        expect(scan["Index Cond"]).not.toMatch(/ROW\(|[<>]/);
-        if (scan["Index Name"]?.startsWith("cache_affinity_node"))
-          expect(scan["Index Cond"]).toContain("sessionId");
-        else
-          for (const key of [
-            "tenantUserId",
-            "poolId",
-            "executionTargetId",
-            "targetIdentity",
-            "bindingDigest",
-            "prefixDigest",
-          ])
-            expect(scan["Index Cond"]).toContain(key);
-        expect((scan["Actual Rows"] ?? 0) * (scan["Actual Loops"] ?? 0)).toBeLessThanOrEqual(64);
-      }
-      expect(scans.some((scan) => scan["Index Name"] === "cache_affinity_node_owner_unique")).toBe(
-        true,
-      );
+    for (const measurements of work.values()) {
+      expect(measurements).toHaveLength(3);
+      for (const buffers of measurements.slice(1))
+        expect(buffers / Math.max(1, measurements[0]!)).toBeLessThanOrEqual(4);
     }
   }, 60_000);
 
@@ -1033,6 +1476,7 @@ integration("cache-prefix identity #160", () => {
     const initial = await service.rememberAffinity({
       ...args,
       payload: { conversation: "client", instructions: "root A", input: baseHistory },
+      estimatedTokens: 12_000,
     });
     const oldNodes = await db.cacheAffinityNode.findMany({
       where: { sessionId: initial!.sessionId },
@@ -1040,6 +1484,7 @@ integration("cache-prefix identity #160", () => {
     const changed = await service.rememberAffinity({
       ...args,
       payload: { conversation: "client", instructions: "root B", input: baseHistory },
+      estimatedTokens: 24_000,
     });
     expect(changed!.sessionId).toBe(initial!.sessionId);
     expect(changed!.rootDigest).not.toBe(initial!.rootDigest);
@@ -1061,6 +1506,7 @@ integration("cache-prefix identity #160", () => {
     const follow = await service.rememberAffinity({
       ...args,
       sessionBinding: initial!,
+      estimatedDeltaTokens: 100,
       payload: {
         previous_response_id: "original-response",
         conversation: "client",
@@ -1073,10 +1519,15 @@ integration("cache-prefix identity #160", () => {
     const nodes = await db.cacheAffinityNode.findMany({ where: { sessionId: follow!.sessionId } });
     expect(nodes).toHaveLength(1);
     expect(nodes.every((node) => node.rootDigest === follow!.rootDigest)).toBe(true);
-    expect(nodes[0]).toMatchObject({ nodeDigest: follow!.tipDigest, isTip: true });
+    expect(nodes[0]).toMatchObject({
+      nodeDigest: follow!.tipDigest,
+      isTip: true,
+      estimatedTokens: 12_100,
+    });
     const next = await service.rememberAffinity({
       ...args,
       sessionBinding: follow!,
+      estimatedDeltaTokens: 200,
       payload: {
         previous_response_id: "next-response",
         conversation: "client",
@@ -1085,6 +1536,7 @@ integration("cache-prefix identity #160", () => {
     });
     const retained = await db.cacheAffinityNode.findMany({ where: { sessionId: next!.sessionId } });
     expect(retained).toHaveLength(2);
+    expect(retained.find((node) => node.isTip)?.estimatedTokens).toBe(12_300);
     expect(retained.every((node) => node.rootDigest === next!.rootDigest)).toBe(true);
     expect(retained.some((node) => node.nodeDigest === follow!.tipDigest && !node.isTip)).toBe(
       true,
@@ -1099,6 +1551,7 @@ integration("cache-prefix identity #160", () => {
       const parent = await service.rememberAffinity({
         ...args,
         payload: { input: [u("create"), a("reply")] },
+        estimatedTokens: 12_000,
       });
       expect(parent).not.toBeNull();
       const payload = {
@@ -1109,6 +1562,7 @@ integration("cache-prefix identity #160", () => {
         ...args,
         payload,
         sessionBinding: parent!,
+        estimatedDeltaTokens: kind === "empty" ? 0 : 100,
       });
       expect(committed).not.toBeNull();
       const where = { poolId: args.poolId, sessionId: committed!.sessionId };
@@ -1117,6 +1571,7 @@ integration("cache-prefix identity #160", () => {
       });
       expect(committedTips.map((node) => node.nodeDigest)).toEqual([committed!.tipDigest]);
       const originalTip = committedTips[0]!;
+      expect(originalTip.estimatedTokens).toBe(kind === "empty" ? 12_000 : 12_100);
       for (let replay = 1; replay <= 3; replay++) {
         const now = new Date(args.now.getTime() + replay * 1000);
         const refreshed = await service.rememberAffinity({
@@ -1124,6 +1579,7 @@ integration("cache-prefix identity #160", () => {
           now,
           payload,
           sessionBinding: parent!,
+          estimatedDeltaTokens: kind === "empty" ? 0 : replay * 1000,
         });
         expect(refreshed).toMatchObject({
           sessionId: committed!.sessionId,
@@ -1137,6 +1593,7 @@ integration("cache-prefix identity #160", () => {
             id: originalTip.id,
             nodeDigest: committed!.tipDigest,
             depth: committed!.tipDepth,
+            estimatedTokens: kind === "empty" ? 12_000 : 12_000 + replay * 1000,
           }),
         ]);
         expect(
@@ -2039,6 +2496,10 @@ integration("cache-prefix identity #160", () => {
       });
       expect(next!.sessionId).toBe(parent!.sessionId);
       expect(next!.estimatedTokens).toBe(20000 + turn * 10);
+      const tip = await db.cacheAffinityNode.findFirstOrThrow({
+        where: { poolId: args.poolId, sessionId: next!.sessionId, isTip: true },
+      });
+      expect(tip.estimatedTokens).toBe(next!.estimatedTokens);
       const sessions =
         (
           await warm.loadWarmSessions({
@@ -2489,6 +2950,7 @@ integration("cache-prefix identity #160", () => {
         "repetition_penalty",
         "logit_bias",
         "stop",
+        "stop_sequences",
         "max_tokens",
         "max_completion_tokens",
         "max_output_tokens",
@@ -2496,7 +2958,12 @@ integration("cache-prefix identity #160", () => {
         "best_of",
       ]) {
         const payload = payloadFor(surface, {
-          [key]: key === "stop" ? ["END"] : key === "logit_bias" ? { "1": 1 } : 0.7,
+          [key]:
+            key === "stop" || key === "stop_sequences"
+              ? ["END"]
+              : key === "logit_bias"
+                ? { "1": 1 }
+                : 0.7,
         });
         expect((await service.rememberAffinity({ ...args, payload }))!.sessionId, key).toBe(
           original!.sessionId,

@@ -245,6 +245,7 @@ ALTER TABLE cache_affinity_node ADD CONSTRAINT cache_affinity_node_shape_check C
   depth > 0 AND length("rootDigest") BETWEEN 32 AND 128
   AND length("nodeDigest") BETWEEN 32 AND 128
   AND length("sessionId") BETWEEN 1 AND 128
+  AND ("estimatedTokens" IS NULL OR "estimatedTokens" >= 0)
 );
 DROP TRIGGER IF EXISTS cache_affinity_node_owner ON cache_affinity_node;
 CREATE TRIGGER cache_affinity_node_owner BEFORE INSERT ON cache_affinity_node

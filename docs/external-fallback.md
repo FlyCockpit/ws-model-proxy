@@ -210,13 +210,28 @@ of the expected prefix is an eviction observation. Unknown cache fields, hits,
 partial hits above 5%, short prefixes, client-id-only matches, instruction hints,
 matches to ancestors that are not live tips and unranked targets produce no
 observation. A client id with a digest-proven live stored tip of that same session
-does count: evidence comes from one SQL statement proving that the resolved session owns a
-live tip in the request chain and reading that same digest/session hint's size,
-age and confirmation in the same snapshot. A concurrent truncation therefore
-exposes both the new tip and its rewritten footprint, or neither. Identical tips
-owned by other sessions do not choose the evidence owner. This proves the
-footprint **as of the ranking snapshot**, not engine residency at dispatch or
-response time; a later unrelated writer does not affect that claim.
+does count: evidence comes from one SQL statement proving that the resolved
+session owns a live tip in the request chain and reading the whole-prompt estimate
+stored on that tip node. Only an identifiable write of that tip can set its
+estimate, including a replay, truncation or bound Responses lineage write. The
+matching live hint proves the same session and current digest version and
+supplies recency and cache confirmation in the same snapshot.
+Byte/unit-overflow requests can refresh routing hints and an authoritative
+client's warm footprint without changing its retained tip or the tip's estimate,
+even when both writes use the same timestamp. Such a refresh can update evidence
+recency and confirmation, but cannot lend its larger footprint to the retained
+tip. A refresh that changes the hint's session still yields no evidence. Legacy
+nodes with no estimate yield no evidence. The nullable integer node
+column is added by safe schema push without deleting existing data.
+A concurrent truncation therefore exposes both the new tip and its rewritten
+footprint, or neither. Client ids pin the evidence owner even when other sessions
+have identical tips. For implicit sessions, identical tips are indistinguishable:
+the resolver picks the earliest-expiring tip. If another session last stamped
+the shared hint, that turn yields no evidence, failing closed. At most one
+observation is lost per tied session; its own identifiable write restamps the
+hints and restores evidence. No other session's footprint is accepted. These
+checks apply **as of the ranking snapshot** and do not establish engine residency
+at dispatch or response time; a later unrelated writer does not affect that snapshot.
 The bound Responses `previous_response_id` path is excluded: it has neither a ranked
 decision nor the matched record's age. Endpoint prefix-cache counters are also
 excluded: they are cumulative, include bypass traffic and cannot be attributed
@@ -295,13 +310,17 @@ A valid client conversation id is authoritative, even when instructions change.
 Without one, continuity uses the last 64 digest-chain nodes, deepest first: a
 live tip wins by earliest expiry then session id; otherwise a sole ancestor
 owner permits edits/truncations. Ambiguous ancestors start a fresh session.
-Leading instructions (system/developer units before the first conversation unit,
-the Anthropic `system` field, Responses `instructions`), tools, semantic and
-unknown parameters bind the root; a later system/developer message keeps its
-position in the history and behaves like any other edit. Only the
-16 approved sampling parameters are free (alongside model/stream and consumed
-content). A body carrier is excluded only when it wins validation and supplies
-the client id; invalid, inactive and losing carriers bind like unknown parameters.
+A request cut back to only its opening message looks the same as a new
+conversation with that opening, so it stays fresh even when exactly one live
+conversation starts that way. Leading instructions (system/developer units
+before the first conversation unit, the Anthropic `system` field, Responses
+`instructions`), tools, semantic and unknown parameters bind the root; a later
+system/developer message keeps its position in the history and behaves like
+any other edit. Only the 17 approved sampling parameters are free (alongside
+model/stream and consumed content). Anthropic `stop_sequences` is free, the
+same as OpenAI `stop`: a stop list does not change the cached prefix. A body
+carrier is excluded only when it wins validation and supplies the client id;
+invalid, inactive and losing carriers bind like unknown parameters.
 For a winning Anthropic metadata token, only `metadata.user_id` is excluded;
 other metadata fields still bind. Root/instruction warmth alone never links sessions.
 
