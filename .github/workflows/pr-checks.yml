@@ -394,6 +394,9 @@ jobs:
       - name: Prove cache affinity concurrency and retention
         run: pnpm --filter server exec vitest run src/model-api/cache-affinity.integration.test.ts
 
+      - name: Prove cache affinity identity chain, isolation and index bounds
+        run: pnpm --filter server exec vitest run --no-file-parallelism src/model-api/cache-affinity-identity.postgres.integration.test.ts
+
   postgres-api:
     # Split from prisma-validate so the slowest PostgreSQL suite runs in parallel.
     name: PostgreSQL API integration

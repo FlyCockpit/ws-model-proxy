@@ -1,5 +1,7 @@
 import { readdirSync, readFileSync } from "node:fs";
+import type { IncomingMessage } from "node:http";
 import { createRequire } from "node:module";
+import { Readable } from "node:stream";
 import type {
   ModelApiTokenIdentity,
   VisibleDirectModelTarget,
@@ -21,6 +23,7 @@ import type {
   AdmissionCandidate,
   CapacityAdmissionStore,
 } from "./capacity/types.js";
+import { mockRequesterValidityQuery } from "./external-consent.test-helper.js";
 import officialAnthropicFixture from "./fixtures/anthropic-2023-06-01.json";
 import { MODEL_API_RELAY_TIMEOUT_MS } from "./limits.js";
 import responsesConformanceFixture from "./protocols/fixtures/generated-conformance/openai-responses-sse.json";
@@ -37,9 +40,22 @@ vi.mock("@ws-model-proxy/env/shared", () => ({
   env: { DATABASE_URL: "postgresql://routes-test", NODE_ENV: "test" },
 }));
 
+import {
+  canonicalLocations,
+  canonicalShapes,
+  depthPayloadWire,
+  depthRows,
+  embeddedArgumentsRequest,
+  nestedWire,
+  numericOverflowPayload,
+  numericOverflowRows,
+} from "./cache-affinity-canonical.test-fixtures.js";
+import { MAX_CANONICAL_DEPTH } from "./cache-affinity-layers.js";
+
 const affinity = vi.hoisted(() => ({
   rank: vi.fn(),
   remember: vi.fn(),
+  material: vi.fn(),
 }));
 const publicOverflow = vi.hoisted(() => ({
   dispatch: vi.fn(),
@@ -64,8 +80,10 @@ vi.mock("./public-overflow.js", async (importOriginal) => {
 });
 vi.mock("./cache-affinity.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./cache-affinity.js")>();
+  affinity.material.mockImplementation(actual.affinityPrefixDigests);
   return {
     ...actual,
+    affinityPrefixDigests: affinity.material,
     rankAffinityTargets: affinity.rank,
     rememberAffinity: affinity.remember,
   };
@@ -100,15 +118,19 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES: 0,
     MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
     WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
+    WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS: `v1:${Buffer.alloc(32, 7).toString("base64")}`,
   },
 }));
 
 // The token's external-provider consent (allowExternal / includeExternal).
 // Private only unless a test lists pool ids here.
 const externalConsent = vi.hoisted(() => ({ poolIds: [] as string[] }));
-vi.mock("@ws-model-proxy/api/lib/model-api-token-access", () => {
+vi.mock("@ws-model-proxy/api/lib/model-api-token-access", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@ws-model-proxy/api/lib/model-api-token-access")>();
   const listVisibleModelTargetsForToken = vi.fn();
   return {
+    ...actual,
     authenticateModelApiTokenSecret: vi.fn(),
     listVisibleModelTargetsForUser: vi.fn(),
     listVisibleModelTargetsForToken,
@@ -147,6 +169,16 @@ type SendRelayRequestArgs = Parameters<RelaySessionManager["sendRelayRequest"]>[
 type CancelRelayRequestArgs = Parameters<RelaySessionManager["cancelRelayRequest"]>[0];
 
 const db = prisma as unknown as {
+  cacheAffinityNode: { findFirst: MockInstance };
+  cacheAffinityRecord: { findMany: MockInstance };
+  capacityLease: { groupBy: MockInstance };
+  capacityWaiter: { groupBy: MockInstance };
+  modelApiToken: { findUnique: MockInstance };
+  providerAttempt: { groupBy: MockInstance };
+  providerPricingVersion: { findFirst: MockInstance };
+  providerModel: { findFirst: MockInstance };
+  providerAccount: { findFirst: MockInstance };
+  providerCredential: { findFirst: MockInstance; update: MockInstance };
   $transaction: MockInstance;
   $queryRaw: MockInstance;
   $executeRaw: MockInstance;
@@ -158,6 +190,7 @@ const db = prisma as unknown as {
   };
   poolMember: {
     findMany: MockInstance;
+    findFirst: MockInstance;
     findUnique: MockInstance;
     update: MockInstance;
     updateMany: MockInstance;
@@ -384,7 +417,7 @@ const externalPoolTarget: VisibleModelPoolTarget = {
 const EXTERNAL_MODEL_ID = `${externalPoolTarget.modelId}:external`;
 
 function listedExternalTargets(
-  targets: ReturnType<typeof externalProviderTarget>[],
+  targets: PublicProviderTarget[],
   overrides: { enabled?: boolean; fallbackForGrantees?: boolean; ownerActive?: boolean } = {},
 ) {
   return {
@@ -910,6 +943,128 @@ describe("model API routes", () => {
         costPenalty: 0,
       })),
     );
+  });
+
+  it.each(
+    [
+      "/chat/completions",
+      "/messages",
+      "/messages/count_tokens",
+      "/responses",
+      "/responses/count_tokens",
+      "/embeddings",
+      "/audio/speech",
+    ].flatMap((path) =>
+      canonicalShapes.flatMap((shape) =>
+        [256, 257, 10_000].map((depth) => ({ path, shape, depth })),
+      ),
+    ),
+  )("R3 request acceptance $path $shape depth $depth", async ({ path, shape, depth }) => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({ countStrategy: "CONSERVATIVE_ESTIMATE" }),
+    );
+    if (path.startsWith("/messages")) {
+      db.discoveredModel.findUnique.mockResolvedValue(
+        directRow({
+          countStrategy: "CONSERVATIVE_ESTIMATE",
+          capabilityOverrideMetadata: {
+            version: 3,
+            protocol: "openai-compatible",
+            surfaces: {
+              anthropicMessages: {
+                source: "declared",
+                confidence: "exact",
+                supported: true,
+                streaming: true,
+                countTokens: true,
+                protocolVersion: "2023-06-01",
+              },
+            },
+          },
+        }),
+      );
+    }
+    const manager = new FakeRelayManager();
+    const runtime = admittingCapacityRuntime();
+    const wire = `{"model":${JSON.stringify(directTarget.modelId)},"messages":[{"role":"user","content":"U"}],"input":"U","extension":${nestedWire(depth - 1, shape)}}`;
+    const pending = appWith(manager, runtime).request(path, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01",
+      },
+      body: wire,
+    });
+    if (depth > 256) {
+      const response = await pending;
+      expect(response.status).toBe(400);
+      const body = await response.json();
+      expect(body).toMatchObject({
+        error: {
+          type: "invalid_request_error",
+          message: "request JSON nesting exceeds 256 levels",
+        },
+      });
+      if (path.startsWith("/messages")) expect(body).toMatchObject({ type: "error" });
+      else expect(body).toMatchObject({ error: { code: "request_json_too_deep" } });
+      expect(manager.sent).toEqual([]);
+      expect(runtime.acquire).not.toHaveBeenCalled();
+      expect(affinity.material).not.toHaveBeenCalled();
+      expect(affinity.rank).not.toHaveBeenCalled();
+      expect(affinity.remember).not.toHaveBeenCalled();
+      expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+      expect(db.relayRequest.create).not.toHaveBeenCalled();
+      expect(mockedTokenAccess.listVisibleModelTargetsForToken).not.toHaveBeenCalled();
+      return;
+    }
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const forwarded = JSON.parse(firstBodyChunkText(requireSent(manager)));
+    expect(forwarded.extension).toEqual(JSON.parse(nestedWire(depth - 1, shape)));
+    const actual =
+      await vi.importActual<typeof import("./cache-affinity.js")>("./cache-affinity.js");
+    const material = actual.affinityPrefixDigests({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      surface: path.startsWith("/messages")
+        ? "anthropic-messages"
+        : path.startsWith("/responses")
+          ? "openai-responses"
+          : "openai-chat",
+      payload: forwarded,
+      runtimeIdentity: "runtime",
+    });
+    expect(material.identifiable).toBe(false);
+    expect(material.routingNodes).toEqual([]);
+    await completeJsonRelay({
+      manager,
+      requestId: requireSent(manager).requestId,
+      body:
+        path === "/responses"
+          ? {
+              id: "resp_depth",
+              object: "response",
+              status: "completed",
+              output: [],
+              usage: { input_tokens: 1, output_tokens: 0, total_tokens: 1 },
+            }
+          : path === "/messages"
+            ? {
+                id: "msg_depth",
+                type: "message",
+                role: "assistant",
+                content: [{ type: "text", text: "ok" }],
+                model: "model",
+                stop_reason: "end_turn",
+                stop_sequence: null,
+                usage: { input_tokens: 1, output_tokens: 1 },
+              }
+            : { choices: [], input_tokens: 1 },
+    });
+    const response = await pending;
+    expect(response.status).toBe(200);
+    await response.text();
   });
 
   it("applies affinity only after pool compatibility and persists it after success", async () => {
@@ -1479,18 +1634,26 @@ describe("model API routes", () => {
             waitBudgetMs: candidate.waitBudgetMs,
           })),
         );
-    const request = (runtime: CapacityAdmissionRuntime, model: string) => {
+    const request = (runtime: CapacityAdmissionRuntime, model: string, conversation?: string) => {
       const manager = new FakeRelayManager();
       manager.activeCliDeviceIds = ["cli-a", "cli-b", "cli-c"];
       const response = appWith(manager, runtime).request("/chat/completions", {
         method: "POST",
-        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+          ...(conversation ? { "x-conversation-id": conversation } : {}),
+        },
         body: requestBody(model),
       });
       return { manager, response };
     };
-    const serveLocal = async (runtime: CapacityAdmissionRuntime, model: string) => {
-      const { manager, response } = request(runtime, model);
+    const serveLocal = async (
+      runtime: CapacityAdmissionRuntime,
+      model: string,
+      conversation?: string,
+    ) => {
+      const { manager, response } = request(runtime, model, conversation);
       await vi.waitFor(() => expect(manager.sent).toHaveLength(1), { timeout: 5_000 });
       await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
       return { manager, response: await response };
@@ -1756,7 +1919,10 @@ describe("model API routes", () => {
         matchedSessionIds: { "member-a-target": "session-a" },
       });
       const continued = scripted(["member-a"]);
-      await serveLocal(continued.runtime, poolTarget.modelId);
+      await serveLocal(continued.runtime, poolTarget.modelId, "rank-client");
+      expect(affinity.rank.mock.calls.at(-1)?.[0].headers.get("x-conversation-id")).toBe(
+        "rank-client",
+      );
       expect(continued.acquire.mock.calls[0]?.[0].warmSessionIds).toEqual(["session-a"]);
 
       affinity.rank.mockResolvedValue(decision());
@@ -2712,6 +2878,547 @@ describe("model API routes", () => {
       error: { code: "unsupported_capability" },
     });
   });
+
+  it.each(
+    [false, true].flatMap((external) =>
+      [
+        "nonstream-arguments",
+        "nonstream-invalid-arguments",
+        "nonstream-body",
+        "sse-data",
+        "sse-arguments",
+        "sse-after-output",
+      ].map((mode) => ({ external, mode })),
+    ),
+  )(
+    "R7 provider response protocol external=$external $mode settles upstream failure and member health",
+    async ({ external, mode }) => {
+      const stream = mode.startsWith("sse");
+      const inventory = {
+        version: 3 as const,
+        protocol: "openai-compatible" as const,
+        surfaces: {
+          openaiChatCompletions: {
+            source: "declared" as const,
+            confidence: "exact" as const,
+            supported: true,
+            streaming: true,
+            tools: true,
+          },
+        },
+      };
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [
+          { ...(external ? externalPoolTarget : poolTarget), protocolAdaptationEnabled: true },
+        ],
+      });
+      db.poolMember.findUnique.mockResolvedValue({
+        healthStatus: "HEALTHY",
+        lastFailureClass: null,
+        consecutiveRetryableFailures: 0,
+        lastFailureAt: null,
+        nextRetryAt: null,
+        halfOpenTrialStartedAt: null,
+      });
+      db.poolMember.updateMany.mockResolvedValue({ count: 1 });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-chat"];
+      const runtime = admittingCapacityRuntime();
+      vi.mocked(runtime.hold).mockImplementation((response, lease, signal) =>
+        holdCapacityLeaseForResponse({
+          response,
+          lease,
+          signal,
+          store: { heartbeat: async () => true, release: runtime.release },
+        }),
+      );
+      const deep = nestedWire(257, "object");
+      const reply = {
+        id: "reply",
+        object: "chat.completion",
+        model: "m",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: "call",
+                  type: "function",
+                  function: {
+                    name: "lookup",
+                    arguments:
+                      mode === "nonstream-body"
+                        ? "{}"
+                        : mode === "nonstream-invalid-arguments"
+                          ? "{invalid"
+                          : deep,
+                  },
+                },
+              ],
+            },
+            finish_reason: "tool_calls",
+          },
+        ],
+        usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+        ...(mode === "nonstream-body" ? { extension: JSON.parse(deep) } : {}),
+      };
+      const chunk = (choices: unknown[], extension?: unknown) =>
+        `data: ${JSON.stringify({ id: "reply", object: "chat.completion.chunk", created: 0, model: "m", choices, ...(extension === undefined ? {} : { extension }) })}\n\n`;
+      const deepData = chunk([], JSON.parse(deep));
+      const frames =
+        mode === "sse-arguments"
+          ? [
+              chunk([
+                {
+                  index: 0,
+                  delta: {
+                    role: "assistant",
+                    tool_calls: [
+                      {
+                        index: 0,
+                        id: "call",
+                        type: "function",
+                        function: { name: "lookup", arguments: "" },
+                      },
+                    ],
+                  },
+                  finish_reason: null,
+                },
+              ]),
+              chunk([
+                {
+                  index: 0,
+                  delta: { tool_calls: [{ index: 0, function: { arguments: deep } }] },
+                  finish_reason: null,
+                },
+              ]),
+              chunk([{ index: 0, delta: {}, finish_reason: "tool_calls" }]),
+              "data: [DONE]\n\n",
+            ]
+          : mode === "sse-after-output"
+            ? [
+                chunk([
+                  { index: 0, delta: { role: "assistant", content: "hello" }, finish_reason: null },
+                ]),
+                deepData,
+                chunk([{ index: 0, delta: {}, finish_reason: "stop" }]),
+                "data: [DONE]\n\n",
+              ]
+            : [deepData];
+      // Return the claimed row so the real rollup writer runs in the terminal transaction.
+      db.$executeRaw.mockResolvedValue(1);
+      db.relayRequest.update.mockImplementation(
+        async (args: { where: { status?: string }; data: Record<string, unknown> }) =>
+          args.where.status === "PENDING"
+            ? {
+                id: "relay-request-id",
+                userId: token.userId,
+                source: "API_TOKEN",
+                status: args.data.status,
+                startedAt: new Date("2026-08-26T00:00:00Z"),
+                completedAt: args.data.completedAt,
+                durationMs: args.data.durationMs,
+                firstClientByteAt: null,
+                requestedModelPoolId: poolTarget.id,
+                selectedPoolMemberId: "chat-member",
+                requestedExecutionTargetId: null,
+                selectedExecutionTargetId: "chat-member-target",
+                attemptCount: 1,
+                promptTokens: args.data.promptTokens ?? null,
+                completionTokens: args.data.completionTokens ?? null,
+                cacheReadTokens: args.data.cacheReadTokens ?? null,
+                cacheWriteTokens: args.data.cacheWriteTokens ?? null,
+                usageKnown: args.data.usageKnown ?? false,
+              }
+            : { id: "relay-request-id" },
+      );
+      if (external) {
+        externalConsent.poolIds = [externalPoolTarget.id];
+        db.poolMember.findMany.mockResolvedValue([]);
+        const provider: PublicProviderTarget = {
+          ...externalProviderTarget("chat-member"),
+          supportedFeatures: ["tools"],
+          capabilityInventory: inventory,
+        };
+        publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+        publicOverflow.dispatch.mockResolvedValue({
+          ...externalDispatchResult(provider, reply),
+          ...(stream
+            ? {
+                response: new Response(
+                  new ReadableStream<Uint8Array>({
+                    start(controller) {
+                      for (const frame of frames)
+                        controller.enqueue(new TextEncoder().encode(frame));
+                      controller.close();
+                    },
+                  }),
+                  { headers: { "content-type": "text/event-stream" } },
+                ),
+              }
+            : {}),
+        });
+      } else
+        db.poolMember.findMany.mockResolvedValue([
+          poolMemberRow({
+            id: "chat-member",
+            discoveredModelId: "chat-model",
+            upstreamModelId: "m",
+            cliDeviceId: "cli-chat",
+            capabilityOverrideMetadata: inventory,
+          }),
+        ]);
+      const pending = appWith(manager, runtime).request("/messages", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: external ? EXTERNAL_MODEL_ID : poolTarget.modelId,
+          max_tokens: 8,
+          stream,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      });
+      if (!external) {
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        const sent = requireSent(manager);
+        if (stream) {
+          manager.headers(sent.requestId, 200, { "content-type": "text/event-stream" });
+          for (const frame of frames) manager.body(sent.requestId, frame);
+          manager.complete(sent.requestId);
+        } else await completeJsonRelay({ manager, requestId: sent.requestId, body: reply });
+      }
+      const response = await pending;
+      const text = await response.text();
+      const afterOutput = mode === "sse-arguments" || mode === "sse-after-output";
+      expect(response.status).toBe(afterOutput ? 200 : 502);
+      expect(text).toContain(afterOutput ? "event: error" : '"type":"api_error"');
+      expect(text).not.toContain("request JSON nesting exceeds");
+      await vi.waitFor(() =>
+        expect(db.relayRequest.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { id: "relay-request-id", status: "PENDING" },
+            data: expect.objectContaining({
+              status: "FAILED",
+              errorClass: "protocol_error",
+              ...(external
+                ? { promptTokens: 20, completionTokens: 3, usageKnown: true, responseBytes: 17n }
+                : {}),
+            }),
+          }),
+        ),
+      );
+      const claims = db.relayRequest.update.mock.calls.filter(
+        ([args]) => args.where.status === "PENDING",
+      );
+      expect(claims).toHaveLength(1);
+      const rollups = db.$executeRaw.mock.calls.filter(([sql]) =>
+        String(sql.sql ?? "").includes("usage_rollup_minute"),
+      );
+      expect(rollups).toHaveLength(1);
+      if (external) {
+        expect(db.poolMember.findUnique).not.toHaveBeenCalled();
+        expect(db.poolMember.updateMany).not.toHaveBeenCalled();
+      } else
+        expect(db.poolMember.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: expect.objectContaining({ id: "chat-member" }),
+            data: expect.objectContaining({
+              lastFailureClass: "TRANSPORT",
+              consecutiveRetryableFailures: 1,
+            }),
+          }),
+        );
+      expect(runtime.release).toHaveBeenCalled();
+      if (!external) expect(manager.cancelled.length + manager.completed.length).toBeGreaterThan(0);
+    },
+  );
+
+  it.each(
+    ["openai-chat", "openai-responses"].flatMap((surface) =>
+      [false, true].flatMap((external) =>
+        [20, 256, 257, 10_000]
+          .map((depth) => ({ surface, external, depth, stream: false }))
+          .concat([257, 10_000].map((depth) => ({ surface, external, depth, stream: true }))),
+      ),
+    ),
+  )(
+    "R4 embedded arguments $surface external=$external stream=$stream depth=$depth refuse before admission/health",
+    async ({ surface, external, depth, stream }) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [
+          { ...(external ? externalPoolTarget : poolTarget), protocolAdaptationEnabled: true },
+        ],
+      });
+      const inventory = {
+        version: 3 as const,
+        protocol: "anthropic-compatible" as const,
+        surfaces: {
+          anthropicMessages: {
+            source: "declared" as const,
+            confidence: "exact" as const,
+            supported: true,
+            tools: true,
+            streaming: true,
+            protocolVersion: "2023-06-01",
+          },
+        },
+      };
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-anthropic"];
+      const runtime = admittingCapacityRuntime();
+      if (external) {
+        externalConsent.poolIds = [externalPoolTarget.id];
+        db.poolMember.findMany.mockResolvedValue([]);
+        const provider: PublicProviderTarget = {
+          ...externalProviderTarget(),
+          protocol: "anthropic",
+          nativeProtocols: ["anthropic"],
+          nativeSurfaces: ["anthropic-messages"],
+          supportedFeatures: ["tools"],
+          capabilityInventory: inventory,
+        };
+        publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+        if (depth <= 256)
+          publicOverflow.dispatch.mockImplementationOnce(async (request) => {
+            const rendered = await request.renderForTarget(provider, "anthropic-messages");
+            const forwarded = JSON.parse(new TextDecoder().decode(rendered.body));
+            expect(forwarded.messages[1].content[0].input).toEqual(
+              JSON.parse(nestedWire(depth, "object")),
+            );
+            return {
+              ...externalDispatchResult(provider, {
+                id: "msg",
+                type: "message",
+                role: "assistant",
+                model: "m",
+                content: [{ type: "text", text: "ok" }],
+                stop_reason: "end_turn",
+                stop_sequence: null,
+                usage: { input_tokens: 1, output_tokens: 1 },
+              }),
+              nativeSurface: "anthropic-messages",
+            };
+          });
+      } else {
+        db.poolMember.findMany.mockResolvedValue([
+          poolMemberRow({
+            id: "anthropic-member",
+            discoveredModelId: "anthropic-model",
+            upstreamModelId: "m",
+            cliDeviceId: "cli-anthropic",
+            capabilityOverrideMetadata: inventory,
+          }),
+        ]);
+      }
+      const body = {
+        ...embeddedArgumentsRequest(
+          surface,
+          nestedWire(depth, "object"),
+          external ? EXTERNAL_MODEL_ID : poolTarget.modelId,
+        ),
+        stream,
+      };
+      const pending = appWith(manager, runtime).request(
+        surface === "openai-chat" ? "/chat/completions" : "/responses",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: JSON.stringify(body),
+        },
+      );
+      if (depth <= 256 && !external) {
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        const sent = requireSent(manager);
+        const forwarded = JSON.parse(await relayBodyText(sent));
+        expect(forwarded.messages[1].content[0].input).toEqual(
+          JSON.parse(nestedWire(depth, "object")),
+        );
+        await completeJsonRelay({
+          manager,
+          requestId: sent.requestId,
+          body: {
+            id: "msg",
+            type: "message",
+            role: "assistant",
+            model: "m",
+            content: [{ type: "text", text: "ok" }],
+            stop_reason: "end_turn",
+            stop_sequence: null,
+            usage: { input_tokens: 1, output_tokens: 1 },
+          },
+        });
+      }
+      const response = await pending;
+      expect(response.status).toBe(depth <= 256 ? 200 : 400);
+      if (depth > 256) {
+        expect(await response.json()).toMatchObject({
+          error: { message: "request JSON nesting exceeds 256 levels" },
+        });
+        expect(manager.sent).toEqual([]);
+        expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+        expect(runtime.acquire).not.toHaveBeenCalled();
+        expect(db.relayRequest.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({
+              status: "FAILED",
+              errorClass: "unsupported_capability",
+            }),
+          }),
+        );
+        expect(db.poolMember.update).not.toHaveBeenCalled();
+        expect(db.poolMember.updateMany).not.toHaveBeenCalled();
+      } else await response.text();
+    },
+  );
+
+  it.each(["openai-chat", "openai-responses"] as const)(
+    "R4 native %s passes deep argument strings with an adapted alternative",
+    async (surface) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [{ ...poolTarget, protocolAdaptationEnabled: true }],
+      });
+      const key = surface === "openai-chat" ? "openaiChatCompletions" : "openaiResponses";
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "native",
+          discoveredModelId: "native-model",
+          upstreamModelId: "m",
+          cliDeviceId: "cli-native",
+          capabilityOverrideMetadata: {
+            version: 3,
+            protocol: "openai-compatible",
+            surfaces: {
+              [key]: { source: "declared", confidence: "exact", supported: true, tools: true },
+            },
+          },
+        }),
+        poolMemberRow({
+          id: "adapted",
+          discoveredModelId: "adapted-model",
+          upstreamModelId: "m",
+          cliDeviceId: "cli-adapted",
+          capabilityOverrideMetadata: {
+            version: 3,
+            protocol: "anthropic-compatible",
+            surfaces: {
+              anthropicMessages: {
+                source: "declared",
+                confidence: "exact",
+                supported: true,
+                tools: true,
+                protocolVersion: "2023-06-01",
+              },
+            },
+          },
+        }),
+      ]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-native", "cli-adapted"];
+      const argumentsText = nestedWire(10_000, "object");
+      const request = embeddedArgumentsRequest(surface, argumentsText, poolTarget.modelId);
+      const pending = appWith(manager).request(
+        surface === "openai-chat" ? "/chat/completions" : "/responses",
+        {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: JSON.stringify(request),
+        },
+      );
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      expect(sent.endpointSlug).toBe("native-endpoint");
+      const body = JSON.parse(await relayBodyText(sent));
+      expect(
+        surface === "openai-chat"
+          ? body.messages[1].tool_calls[0].function.arguments
+          : body.input[1].arguments,
+      ).toBe(argumentsText);
+      await completeJsonRelay({ manager, requestId: sent.requestId });
+      const response = await pending;
+      expect(response.status).toBe(200);
+      await response.text();
+    },
+  );
+
+  it.each(numericOverflowRows)(
+    "R4 native wire numeric overflow $surface $shape forwards null",
+    async ({ surface, shape }) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      const surfaceKey =
+        surface === "openai-chat"
+          ? "openaiChatCompletions"
+          : surface === "openai-responses"
+            ? "openaiResponses"
+            : "anthropicMessages";
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "native",
+          discoveredModelId: "model",
+          upstreamModelId: "m",
+          cliDeviceId: "cli-native",
+          capabilityOverrideMetadata: {
+            version: 3,
+            protocol: "openai-compatible",
+            surfaces: {
+              [surfaceKey]: {
+                supported: true,
+                source: "declared",
+                confidence: "exact",
+                protocolVersion: "2023-06-01",
+              },
+            },
+          },
+        }),
+      ]);
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-native"];
+      const parsed = numericOverflowPayload(surface, shape, "1e400");
+      parsed.model = poolTarget.modelId;
+      // Preserve the genuine wire token: JSON.stringify alone would normalize it first.
+      const wire = JSON.stringify(parsed)
+        .replace('"vendor_extension":null', '"vendor_extension":1e400')
+        .replace('"field":null', '"field":1e400')
+        .replace('"vendor_extension":[null]', '"vendor_extension":[1e400]');
+      const pending = appWith(manager).request(
+        surface === "openai-chat"
+          ? "/chat/completions"
+          : surface === "openai-responses"
+            ? "/responses"
+            : "/messages",
+        {
+          method: "POST",
+          headers: {
+            authorization: "Bearer wsmp_model_test",
+            "content-type": "application/json",
+            "anthropic-version": "2023-06-01",
+          },
+          body: wire,
+        },
+      );
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      const forwarded = JSON.parse(await relayBodyText(sent));
+      expect(forwarded.vendor_extension).toEqual(
+        numericOverflowPayload(surface, shape, "null").vendor_extension,
+      );
+      await completeJsonRelay({ manager, requestId: sent.requestId });
+      expect((await pending).status).toBe(200);
+      await (await pending).text();
+    },
+  );
 
   it("surfaces developer authority loss when Chat adapts through Anthropic", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
@@ -5893,7 +6600,7 @@ describe("model API routes", () => {
   });
 
   function externalDispatchResult(
-    target: ReturnType<typeof externalProviderTarget>,
+    target: PublicProviderTarget,
     body: unknown = { id: "external", model: target.upstreamModelId },
   ) {
     return {
@@ -13398,15 +14105,460 @@ describe("model API routes", () => {
     expect(capacityRuntime.hold).toHaveBeenCalledTimes(1);
   });
 
+  const identityCarriers = [
+    { name: "conversation", body: "conversation" },
+    { name: "conversation.id", body: "conversation", object: true },
+    { name: "conversation_id", body: "conversation_id" },
+    { name: "conversation_id.id", body: "conversation_id", object: true },
+    { name: "prompt_cache_key", body: "prompt_cache_key" },
+    ...[
+      "x-conversation-id",
+      "session_id",
+      "session-id",
+      "x-session-id",
+      "x-claude-code-session-id",
+    ].map((header) => ({ name: header, header })),
+  ];
+  it.each([
+    ...identityCarriers.flatMap((carrier) =>
+      [false, true].flatMap((invalid) =>
+        ["local", "overflow", "bound Responses"].map((path) => ({
+          ...carrier,
+          invalid,
+          path,
+          sameParent: false,
+          canonical: undefined as (typeof depthRows)[number] | undefined,
+          materialError: false,
+        })),
+      ),
+    ),
+    ...identityCarriers
+      .filter((carrier) => "body" in carrier)
+      .map((carrier) => ({
+        ...carrier,
+        invalid: true,
+        path: "bound Responses",
+        sameParent: true,
+        canonical: undefined as (typeof depthRows)[number] | undefined,
+        materialError: false,
+      })),
+    ...[
+      ...depthRows,
+      ...canonicalLocations.flatMap((location) =>
+        canonicalShapes.flatMap((shape) => [256, 257].map((depth) => ({ location, shape, depth }))),
+      ),
+    ].map((canonical) => ({
+      name: `R2 ${canonical.location} ${canonical.shape} depth ${canonical.depth}`,
+      invalid: true,
+      path: "bound Responses",
+      sameParent: false,
+      canonical,
+      materialError: false,
+    })),
+    {
+      name: "R2 material construction error",
+      invalid: true,
+      path: "bound Responses",
+      sameParent: false,
+      canonical: undefined,
+      materialError: true,
+    },
+  ])(
+    "U3 $path $name invalid=$invalid sameParent=$sameParent reaches identity rank and remember",
+    async (row) => {
+      const actual =
+        await vi.importActual<typeof import("./cache-affinity.js")>("./cache-affinity.js");
+      const materialFor = (args: Parameters<typeof actual.rememberAffinity>[0]) =>
+        actual.affinityPrefixDigests({ ...args, runtimeIdentity: args.target.targetIdentity });
+      const written: Array<{
+        args: Parameters<typeof actual.rememberAffinity>[0];
+        sessionId: string | null;
+      }> = [];
+      affinity.remember.mockImplementation(
+        async (args: Parameters<typeof actual.rememberAffinity>[0]) => {
+          const material = materialFor(args);
+          const sessionId = material.identifiable
+            ? (material.clientSessionId ?? material.boundSessionId ?? "native-warm")
+            : null;
+          written.push({ args, sessionId });
+          if (!sessionId) return null;
+          return {
+            sessionId,
+            bindingDigest: material.bindingDigest,
+            rootDigest: material.rootDigest,
+            tipDigest: material.nodes.at(-1)?.digest ?? "",
+            tipDepth: material.nodes.at(-1)?.depth ?? 0,
+            canonicalBytes: material.canonicalBytes,
+            estimatedTokens: 20000,
+          };
+        },
+      );
+      affinity.rank.mockImplementation(actual.rankAffinityTargets);
+      db.cacheAffinityRecord.findMany.mockResolvedValue([]);
+      db.capacityLease.groupBy.mockResolvedValue([]);
+      db.capacityWaiter.groupBy.mockResolvedValue([]);
+      db.cacheAffinityNode.findFirst.mockResolvedValue({ sessionId: "native-warm" });
+      db.$queryRaw.mockImplementation((query) =>
+        Promise.resolve(
+          (query.strings ?? query).join("").includes("cache_affinity_node")
+            ? []
+            : [{ now: new Date() }],
+        ),
+      );
+      const value = row.invalid ? "bad#id" : "route-client";
+      const headers = new Headers({
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
+      });
+      if (row.canonical && row.canonical.depth > MAX_CANONICAL_DEPTH)
+        headers.set("x-session-id", "route-client");
+      if ("header" in row && row.header) headers.set(row.header, value);
+      const carrier =
+        "body" in row && row.body
+          ? { [row.body]: "object" in row && row.object ? { id: value } : value }
+          : {};
+      const toolsCapabilities =
+        row.canonical?.location === "tools"
+          ? {
+              version: 3,
+              protocol: "openai-compatible",
+              surfaces: {
+                openaiResponses: {
+                  source: "declared",
+                  confidence: "exact",
+                  supported: true,
+                  streaming: true,
+                  tools: true,
+                  parallelTools: true,
+                  responsesLifecycle: { statefulFollowUps: true },
+                },
+              },
+            }
+          : null;
+      const members = ["a", "b"].map((name) =>
+        poolMemberRow({
+          id: `member-${name}`,
+          discoveredModelId: `model-${name}`,
+          upstreamModelId: `upstream-${name}`,
+          cliDeviceId: `cli-${name}`,
+          affinityEnabled: true,
+          capabilityOverrideMetadata: toolsCapabilities,
+        }),
+      );
+      db.poolMember.findMany.mockResolvedValue(members);
+      db.discoveredModel.findUnique.mockResolvedValue(
+        directRow({
+          id: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          capabilityOverrideMetadata: toolsCapabilities,
+        }),
+      );
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+      const runtime = admittingCapacityRuntime();
+      const app = appWith(manager, runtime);
+      const isBound = row.path === "bound Responses";
+      if (isBound) {
+        const initial = app.request("/responses", {
+          method: "POST",
+          headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+          body: JSON.stringify({
+            model: poolTarget.modelId,
+            input: "create",
+            ...(row.sameParent ? carrier : {}),
+            ...(row.canonical?.depth === MAX_CANONICAL_DEPTH
+              ? JSON.parse(
+                  depthPayloadWire(
+                    row.canonical.location,
+                    row.canonical.depth,
+                    row.canonical.shape,
+                  ),
+                )
+              : {}),
+          }),
+        });
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        await completeJsonRelay({
+          manager,
+          requestId: requireSent(manager).requestId,
+          body: { id: "resp_carrier", object: "response" },
+        });
+        await (await initial).text();
+        mockStickyRecord({
+          ...db.responseStickinessRecord.upsert.mock.calls[0]![0].create,
+          SelectedExecutionTarget: { discoveredModelId: "model-a" },
+        });
+        affinity.rank.mockClear();
+        affinity.remember.mockClear();
+        written.length = 0;
+        vi.mocked(runtime.acquire).mockClear();
+        if (row.materialError)
+          affinity.material.mockImplementationOnce(() => {
+            throw new Error("canonicalization unavailable");
+          });
+      }
+      if (row.path === "overflow") {
+        mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+          directModels: [],
+          modelPools: [externalPoolTarget],
+        });
+        externalConsent.poolIds = [externalPoolTarget.id];
+        db.poolMember.findMany.mockResolvedValue([]);
+        const publicModule =
+          await vi.importActual<typeof import("./public-overflow.js")>("./public-overflow.js");
+        publicOverflow.dispatch.mockImplementation(publicModule.dispatchPublicOverflow);
+        publicOverflow.list.mockImplementation(publicModule.listPublicOverflowTargets);
+        const providers = ["a", "b"].map((name) => {
+          const target = externalProviderTarget(`overflow-${name}`);
+          return {
+            id: target.poolMemberId,
+            publicOrder: 0,
+            ExecutionTarget: {
+              id: target.executionTargetId,
+              inferenceCapacityId: target.inferenceCapacityId,
+              ProviderModel: {
+                id: target.providerModelId,
+                userId: "user-id",
+                upstreamModelId: target.upstreamModelId,
+                contextWindow: target.contextWindow,
+                maxOutputTokens: target.maxOutputTokens,
+                nativeCapabilities: {
+                  protocols: ["openai"],
+                  surfaces: ["openai-chat"],
+                  streaming: true,
+                  features: [],
+                },
+                healthStatus: "HEALTHY",
+                enabled: true,
+                deletedAt: null,
+                ProviderAccount: {
+                  id: target.providerAccountId,
+                  userId: "user-id",
+                  providerType: "openai",
+                  baseUrl: target.baseUrl,
+                  authType: "BEARER",
+                  healthStatus: "HEALTHY",
+                  enabled: true,
+                  deletedAt: null,
+                  CurrentCredential: {
+                    ...target.credential,
+                    algorithm: "AES-256-GCM",
+                    status: "ACTIVE",
+                  },
+                },
+              },
+            },
+          };
+        });
+        const pool = {
+          id: "pool-id",
+          userId: "user-id",
+          fallbackEnabled: true,
+          fallbackForGrantees: false,
+          User: ACTIVE_POOL_OWNER,
+          PoolMembers: providers,
+          affinityEnabled: true,
+          affinityTtlSeconds: 600,
+          affinityMaxRecords: 100,
+          affinityPrefixWeight: 100,
+          affinityConversationWeight: 150,
+          affinityConfirmedCacheWeight: 250,
+          affinityLoadPenaltyWeight: 100,
+        };
+        db.modelPool.findFirst.mockResolvedValue(pool);
+        db.modelApiToken.findUnique.mockResolvedValue({
+          userId: "user-id",
+          scopeMode: "ALL_VISIBLE",
+          allowExternal: true,
+          revokedAt: null,
+          expiresAt: null,
+        });
+        db.providerAttempt.groupBy.mockResolvedValue([]);
+        db.providerPricingVersion.findFirst.mockResolvedValue(null);
+        db.providerModel.findFirst.mockResolvedValue(providers[0]!.ExecutionTarget.ProviderModel);
+        db.providerAccount.findFirst.mockResolvedValue({
+          providerType: "openai",
+          allowDataCollection: false,
+        });
+        db.providerCredential.findFirst.mockResolvedValue(
+          providers[0]!.ExecutionTarget.ProviderModel.ProviderAccount.CurrentCredential,
+        );
+        db.providerCredential.update.mockResolvedValue({ id: "credential" });
+        const delegates = {
+          modelApiToken: {
+            findUnique: async () => ({
+              userId: "user-id",
+              scopeMode: "ALL_VISIBLE",
+              allowExternal: true,
+            }),
+          },
+          user: { findUnique: async () => ACTIVE_POOL_OWNER },
+        };
+        db.$queryRaw.mockImplementation((strings: TemplateStringsArray, ...values: unknown[]) =>
+          strings.join("").includes('AS "requesterValid"')
+            ? mockRequesterValidityQuery(strings, values, delegates)
+            : Promise.resolve([{ now: new Date() }]),
+        );
+        db.poolMember.findFirst.mockResolvedValue(providers[0]);
+        const budget = await import("./provider-budget.js");
+        vi.spyOn(budget, "admitProviderBudget").mockResolvedValue({
+          admitted: true,
+          providerAttemptId: "anchor",
+          reservationIds: ["reservation"],
+        });
+        vi.spyOn(budget, "reconcileProviderBudget").mockResolvedValue(undefined);
+        const attempts = await import("./provider-attempt-runtime.js");
+        vi.spyOn(attempts, "allocateProviderFence").mockResolvedValue(1n);
+        vi.spyOn(attempts, "claimProviderHealthTrial").mockResolvedValue("READY");
+        vi.spyOn(attempts, "recordProviderAttemptEvent").mockResolvedValue(undefined);
+        vi.spyOn(attempts, "recordProviderOutcome").mockResolvedValue(true);
+        vi.spyOn(attempts, "heartbeatProviderAttempt").mockResolvedValue(true);
+        const credentials = await import("@ws-model-proxy/api/lib/provider-credential-crypto");
+        vi.spyOn(credentials, "decryptProviderCredential").mockReturnValue("test-key");
+        const upstream = Object.assign(
+          Readable.from([
+            Buffer.from(
+              JSON.stringify({ choices: [], usage: { prompt_tokens: 5, completion_tokens: 1 } }),
+            ),
+          ]),
+          { statusCode: 200, headers: { "content-type": "application/json" }, complete: true },
+        );
+        vi.spyOn(
+          await import("@ws-model-proxy/api/lib/provider-egress"),
+          "providerHttpsRequest",
+        ).mockResolvedValue(upstream as unknown as IncomingMessage);
+      }
+      const payload = isBound
+        ? {
+            model: poolTarget.modelId,
+            previous_response_id: "resp_carrier",
+            input: "delta",
+            ...carrier,
+          }
+        : {
+            model: row.path === "overflow" ? EXTERNAL_MODEL_ID : poolTarget.modelId,
+            messages: [{ role: "user", content: "starter" }],
+            ...carrier,
+          };
+      const pending = app.request(isBound ? "/responses" : "/chat/completions", {
+        method: "POST",
+        headers,
+        body: row.canonical
+          ? `${depthPayloadWire(row.canonical.location, row.canonical.depth, row.canonical.shape).slice(0, -1)},"model":${JSON.stringify(poolTarget.modelId)},"previous_response_id":"resp_carrier"}`
+          : JSON.stringify(payload),
+      });
+      if (row.canonical && row.canonical.depth > 256) {
+        const response = await pending;
+        expect(response.status).toBe(400);
+        expect(await response.json()).toMatchObject({
+          error: {
+            type: "invalid_request_error",
+            code: "request_json_too_deep",
+            message: "request JSON nesting exceeds 256 levels",
+          },
+        });
+        expect(manager.sent).toHaveLength(1);
+        expect(affinity.rank).not.toHaveBeenCalled();
+        expect(affinity.remember).not.toHaveBeenCalled();
+        expect(runtime.acquire).not.toHaveBeenCalled();
+        return;
+      }
+      if (row.path !== "overflow") {
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(isBound ? 2 : 1));
+        await completeJsonRelay({
+          manager,
+          requestId: requireSent(manager, isBound ? 1 : 0).requestId,
+          body: isBound ? { id: "resp_carrier_next", object: "response" } : { choices: [] },
+        });
+      }
+      const response = await pending;
+      const responseText = await response.text();
+      const dispatchResult =
+        row.path === "overflow" ? await publicOverflow.dispatch.mock.results[0]?.value : undefined;
+      expect(response.status, `${responseText}; dispatch=${dispatchResult?.reason}`).toBe(200);
+      await vi.waitFor(() => expect(affinity.remember).toHaveBeenCalledTimes(1));
+      const write = written[0]!;
+      const material = materialFor(write.args);
+      const reference = materialFor({
+        ...write.args,
+        headers: new Headers(),
+        payload: { ...write.args.payload, conversation: "route-client" },
+      });
+      expect(material.clientSessionId).toBe(row.invalid ? undefined : reference.clientSessionId);
+      if (!row.invalid) {
+        expect(write.sessionId).toBe(reference.clientSessionId);
+        expect(materialFor({ ...write.args, ownerId: "other-tenant" }).clientSessionId).not.toBe(
+          write.sessionId,
+        );
+      }
+      if (isBound) {
+        expect(affinity.rank).not.toHaveBeenCalled();
+        const losesIdentity =
+          (row.invalid && "body" in row && !row.sameParent) ||
+          (row.canonical !== undefined && row.canonical.depth > MAX_CANONICAL_DEPTH) ||
+          row.materialError;
+        expect(vi.mocked(runtime.acquire).mock.calls[0]![0].warmSessionIds).toEqual(
+          losesIdentity ? [] : [row.invalid ? "native-warm" : reference.clientSessionId],
+        );
+        if (losesIdentity) {
+          expect(material.nodes).toEqual([]);
+          expect(write.sessionId).toBeNull();
+          const successor = db.responseStickinessRecord.upsert.mock.calls.at(-1)![0].create;
+          expect(successor.warmSessionId).toBeNull();
+          expect(successor.warmTipDigest).toBeNull();
+        }
+        if (row.sameParent) {
+          expect(material.boundSessionId).toBe("native-warm");
+          expect(material.nodes.at(-1)?.depth).toBe(2);
+        }
+        if (row.canonical) {
+          expect(material.identifiable).toBe(row.canonical.depth === MAX_CANONICAL_DEPTH);
+          if (row.canonical.depth > MAX_CANONICAL_DEPTH) {
+            expect(material.instructionDigests).toEqual([]);
+            expect(material.routingNodes).toEqual([]);
+            expect(material.digests).toEqual([]);
+            expect(material.clientSessionId).toBeUndefined();
+            expect(material.boundSessionId).toBeUndefined();
+            expect(material.parentTipDigest).toBeUndefined();
+            expect(material.parentTipDepth).toBeUndefined();
+          }
+          expect(response.status).toBe(200);
+          const upstream = JSON.parse(firstBodyChunkText(requireSent(manager, 1)));
+          expect(upstream.model).toBe("upstream-a");
+        }
+      } else {
+        expect(affinity.rank).toHaveBeenCalledTimes(1);
+        const rankArgs = affinity.rank.mock.calls[0]![0];
+        const ranked = await affinity.rank.mock.results[0]!.value;
+        const rankMaterial = actual.affinityPrefixDigests({
+          ...rankArgs,
+          runtimeIdentity: write.args.target.targetIdentity,
+        });
+        expect(rankMaterial.clientSessionId).toBe(material.clientSessionId);
+        expect(ranked.matchedSessionIds?.[write.args.target.executionTargetId]).toBe(
+          row.invalid ? undefined : reference.clientSessionId,
+        );
+      }
+    },
+  );
+
   describe("C1a-2 native Responses warm-session binding", () => {
     it.each([
       { name: "create continuation", path: "/responses", method: "POST", linked: true },
       {
-        name: "forged body ignored",
+        name: "forged body cannot override lineage and unknown fields bind a new root",
         path: "/responses",
         method: "POST",
-        linked: true,
+        linked: false,
         forged: true,
+      },
+      {
+        name: "expired parent node",
+        path: "/responses",
+        method: "POST",
+        linked: false,
+        change: "expired-node",
       },
       { name: "retrieve", path: "/responses/resp_local", method: "GET", linked: false },
       { name: "delete", path: "/responses/resp_local", method: "DELETE", linked: false },
@@ -13461,12 +14613,47 @@ describe("model API routes", () => {
         linked: false,
         change: "partial",
       },
+      ...["warmTipDigest", "warmRootDigest", "warmCanonicalBytes"].map((column) => ({
+        name: `R.6-R.8 missing ${column} never builds a binding`,
+        path: "/responses",
+        method: "POST",
+        linked: false,
+        change: column,
+      })),
       {
         name: "disabled affinity",
         path: "/responses",
         method: "POST",
         linked: false,
         change: "disabled",
+      },
+      {
+        name: "disabled affinity with authoritative client id",
+        path: "/responses",
+        method: "POST",
+        linked: false,
+        change: "disabled-client",
+      },
+      {
+        name: "identity DB error logs once and fails closed",
+        path: "/responses",
+        method: "POST",
+        linked: false,
+        change: "db-error",
+      },
+      {
+        name: "C2-6 large delta 128 KiB is estimated before dispatch",
+        path: "/responses",
+        method: "POST",
+        linked: true,
+        bytes: 128 * 1024,
+      },
+      {
+        name: "C2-6 large delta 512 KiB is estimated before dispatch",
+        path: "/responses",
+        method: "POST",
+        linked: true,
+        bytes: 512 * 1024,
       },
       {
         name: "failed terminal",
@@ -13482,7 +14669,15 @@ describe("model API routes", () => {
         linked: true,
         terminal: "cancel",
       },
-    ])("$name", async ({ path, method, linked, forged, change, terminal }) => {
+      {
+        name: "authoritative conflicting client header",
+        path: "/responses",
+        method: "POST",
+        linked: true,
+        change: "client-id",
+      },
+    ])("$name", async ({ path, method, linked, forged, change, terminal, bytes }) => {
+      db.cacheAffinityNode.findFirst.mockResolvedValue({ sessionId: "native-warm" });
       const { affinityPrefixDigests } = await import("./cache-affinity.js");
       const member = poolMemberRow({
         id: "member-a",
@@ -13503,8 +14698,14 @@ describe("model API routes", () => {
         args: Parameters<typeof import("./cache-affinity.js").rememberAffinity>[0],
       ) => affinityPrefixDigests({ ...args, runtimeIdentity: args.target.targetIdentity });
       affinity.remember.mockImplementation(async (args) => ({
-        sessionId: args.sessionBinding?.sessionId ?? "native-warm",
+        sessionId:
+          materialFor(args).clientSessionId ?? args.sessionBinding?.sessionId ?? "native-warm",
         bindingDigest: materialFor(args).bindingDigest,
+        rootDigest: materialFor(args).rootDigest,
+        tipDigest: materialFor(args).nodes.at(-1)?.digest ?? "",
+        tipDepth: materialFor(args).nodes.at(-1)?.depth ?? 0,
+        canonicalBytes: materialFor(args).canonicalBytes,
+        estimatedTokens: args.estimatedTokens ?? 20000,
       }));
       const manager = new FakeRelayManager();
       manager.activeCliDeviceIds = ["cli-a"];
@@ -13553,7 +14754,17 @@ describe("model API routes", () => {
         stored.warmBindingDigest = null;
       }
       if (change === "partial") stored.warmBindingDigest = null;
-      if (change === "disabled") member.ModelPool.affinityEnabled = false;
+      if (change === "warmTipDigest" || change === "warmRootDigest") stored[change] = null;
+      if (change === "warmCanonicalBytes") stored.warmCanonicalBytes = null;
+      if (change === "expired-node") db.cacheAffinityNode.findFirst.mockResolvedValue(null);
+      if (change === "disabled" || change === "disabled-client")
+        member.ModelPool.affinityEnabled = false;
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      if (change === "db-error")
+        db.cacheAffinityNode.findFirst.mockRejectedValueOnce(new Error("identity DB unavailable"));
+      db.cacheAffinityNode.findFirst.mockClear();
+      const contextModule = await import("./capacity/context.js");
+      const counted = vi.spyOn(contextModule, "countSerializedRequestContext");
       mockStickyRecord({
         ...stored,
         SelectedExecutionTarget: { discoveredModelId: "model-a" },
@@ -13561,17 +14772,26 @@ describe("model API routes", () => {
       affinity.remember.mockClear();
       db.responseStickinessRecord.upsert.mockClear();
       vi.mocked(runtime.acquire).mockClear();
+      const followHeaders =
+        change === "client-id" || change === "disabled-client"
+          ? { ...headers, session_id: "authoritative-override" }
+          : headers;
+      const expectedSessionId =
+        change === "client-id"
+          ? materialFor({ ...args, headers: new Headers(followHeaders) }).clientSessionId!
+          : "native-warm";
+      affinity.material.mockClear();
       const abort = new AbortController();
       const follow = app.request(path, {
         method,
-        headers,
+        headers: followHeaders,
         signal: abort.signal,
         ...(method === "POST"
           ? {
               body: JSON.stringify({
                 model: poolTarget.modelId,
                 previous_response_id: "resp_local",
-                input: "next only",
+                input: bytes ? "d".repeat(bytes) : "next only",
                 ...(forged
                   ? {
                       sessionBinding: {
@@ -13587,11 +14807,31 @@ describe("model API routes", () => {
           : {}),
       });
       await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+      if (bytes) {
+        expect(counted).toHaveBeenCalledTimes(1);
+        expect(counted.mock.invocationCallOrder[0]).toBeLessThan(
+          vi.mocked(runtime.acquire).mock.invocationCallOrder[0]!,
+        );
+        // Any serialization/tokenizer call after provider dispatch now fails.
+        counted.mockRejectedValue(new Error("tokenization at EOF is forbidden"));
+      }
+      if (
+        change === "warmTipDigest" ||
+        change === "warmRootDigest" ||
+        change === "warmCanonicalBytes"
+      )
+        expect(affinity.material.mock.calls[0]?.[0].sessionBinding).toBeUndefined();
+      if (change === "disabled-client")
+        expect(db.cacheAffinityNode.findFirst).not.toHaveBeenCalled();
+      if (change === "db-error") {
+        expect(warn).toHaveBeenCalledExactlyOnceWith("[model-api] relay metadata update failed");
+        expect(db.cacheAffinityNode.findFirst).toHaveBeenCalledTimes(1);
+      }
       // Inspect the admission while this continuation is still active.
       const admission = vi.mocked(runtime.acquire).mock.calls[0]?.[0];
       try {
         expect(admission).toMatchObject({
-          warmSessionIds: linked ? ["native-warm"] : [],
+          warmSessionIds: linked ? [expectedSessionId] : [],
           candidates: [expect.objectContaining({ executionTargetId: "member-a-target" })],
         });
       } finally {
@@ -13616,19 +14856,43 @@ describe("model API routes", () => {
           );
         }
       }
-      if (terminal || method !== "POST" || path !== "/responses" || change === "disabled") {
+      if (
+        terminal ||
+        method !== "POST" ||
+        path !== "/responses" ||
+        change === "disabled" ||
+        change === "disabled-client"
+      ) {
         expect(affinity.remember).not.toHaveBeenCalled();
       } else {
         expect(affinity.remember).toHaveBeenCalledTimes(1);
+        expect(affinity.remember.mock.calls[0]?.[0].headers.get("session_id")).toBe(
+          change === "client-id" ? "authoritative-override" : null,
+        );
         expect(affinity.remember.mock.calls[0]?.[0].sessionBinding).toEqual(
           linked
-            ? { sessionId: "native-warm", bindingDigest: stored.warmBindingDigest }
+            ? {
+                sessionId: "native-warm",
+                bindingDigest: stored.warmBindingDigest,
+                rootDigest: stored.warmRootDigest,
+                tipDigest: stored.warmTipDigest,
+                tipDepth: stored.warmTipDepth,
+                canonicalBytes: stored.warmCanonicalBytes,
+                estimatedTokens: stored.warmEstimatedTokens,
+              }
             : undefined,
         );
         expect(db.responseStickinessRecord.upsert.mock.calls[0]?.[0].create.warmSessionId).toBe(
-          "native-warm",
+          expectedSessionId,
         );
       }
+      if (bytes) {
+        expect(affinity.remember.mock.calls[0]?.[0].estimatedDeltaTokens).toBeGreaterThan(
+          bytes / 3,
+        );
+        expect(counted).toHaveBeenCalledTimes(1);
+      }
+      if (change === "db-error") expect(warn).toHaveBeenCalledTimes(1);
       if (terminal) expect(db.responseStickinessRecord.upsert).not.toHaveBeenCalled();
     });
 
@@ -13653,7 +14917,11 @@ describe("model API routes", () => {
       manager.activeCliDeviceIds = ["cli-a"];
       const pending = appWith(manager).request("/responses", {
         method: "POST",
-        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+          "x-session-id": "client-at-eof",
+        },
         body: JSON.stringify({ model: poolTarget.modelId, input: "first" }),
       });
       await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
@@ -13674,9 +14942,53 @@ describe("model API routes", () => {
         await reading;
       }
       expect(affinity.remember).toHaveBeenCalledTimes(1);
+      expect(affinity.remember.mock.calls[0]?.[0].headers.get("x-session-id")).toBe(
+        "client-at-eof",
+      );
       expect(db.responseStickinessRecord.upsert.mock.calls[0]?.[0].create.warmSessionId).toBe(
         "native-warm",
       );
+    });
+    it("C2-6 writer timeout releases EOF and stores the Responses binding without warm lineage", async () => {
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "member-a",
+          discoveredModelId: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          affinityEnabled: true,
+        }),
+      ]);
+      affinity.remember.mockRejectedValueOnce(new Error("cache-affinity lock_timeout"));
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const pending = appWith(manager).request("/responses", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+          "session-id": "timed-out-client",
+        },
+        body: JSON.stringify({ model: poolTarget.modelId, input: "first" }),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+      manager.body(
+        sent.requestId,
+        JSON.stringify({ id: "resp_after_timeout", object: "response" }),
+      );
+      manager.complete(sent.requestId);
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect(await response.text()).toContain("resp_after_timeout");
+      expect(db.responseStickinessRecord.upsert.mock.calls[0]?.[0].create).toMatchObject({
+        warmSessionId: null,
+        warmBindingDigest: null,
+        warmRootDigest: null,
+        warmTipDigest: null,
+        warmEstimatedTokens: null,
+      });
     });
   });
 

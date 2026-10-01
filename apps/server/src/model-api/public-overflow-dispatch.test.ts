@@ -8,8 +8,14 @@ import {
 } from "node:http";
 import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { embeddedArgumentsRequest, nestedWire } from "./cache-affinity-canonical.test-fixtures.js";
 import { CapacityLeaseLostError } from "./capacity/lease-loss.js";
 import { mockRequesterValidityQuery } from "./external-consent.test-helper.js";
+import {
+  createProtocolAdaptationTransform,
+  parseCanonicalRequest,
+  renderCanonicalRequest,
+} from "./protocols/adaptation.js";
 
 const providerHttpsRequest = vi.hoisted(() => vi.fn());
 const recordProviderOutcome = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
@@ -359,6 +365,102 @@ function dispatchPoolFixture(
     ],
   };
 }
+
+it.each([
+  { carrier: "conversation", body: true, invalid: false },
+  { carrier: "conversation_id", body: true, invalid: false },
+  { carrier: "prompt_cache_key", body: true, invalid: false },
+  { carrier: "session-id", body: false, invalid: false },
+  { carrier: "conversation", body: true, invalid: true },
+  { carrier: "session-id", body: false, invalid: true },
+])(
+  "U3 pinned provider rank resolves $carrier invalid=$invalid with tenant isolation",
+  async ({ carrier, body, invalid }) => {
+    const pool = dispatchPoolFixture();
+    Object.assign(pool, {
+      affinityEnabled: true,
+      affinityTtlSeconds: 600,
+      affinityMaxRecords: 100,
+      affinityPrefixWeight: 100,
+      affinityConversationWeight: 150,
+      affinityConfirmedCacheWeight: 250,
+      affinityLoadPenaltyWeight: 100,
+    });
+    db.modelPool.findFirst.mockResolvedValue(pool);
+    db.providerAttempt.groupBy.mockResolvedValue([]);
+    db.providerPricingVersion.findFirst.mockResolvedValue(null);
+    db.cacheAffinityRecord.findMany.mockResolvedValue([]);
+    db.capacityLease.groupBy.mockResolvedValue([]);
+    db.capacityWaiter.groupBy.mockResolvedValue([]);
+    const listed = await listPublicOverflowTargets("owner", "pool");
+    expect(listed.targets).toHaveLength(1);
+    const value = invalid ? "bad#id" : "client";
+    const payload = {
+      model: "pool",
+      messages: [{ role: "user", content: "starter" }],
+      ...(body ? { [carrier]: value } : {}),
+    };
+    const request = {
+      userId: "owner",
+      poolId: "pool",
+      requestId: "carrier-rank",
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY" as const,
+      ...ownerConsentFields(),
+      requestedProtocol: "openai" as const,
+      requestedSurface: "openai-chat" as const,
+      stream: false,
+      requiredFeatures: [],
+      path: "/v1/chat/completions",
+      headers: new Headers(),
+      signal: new AbortController().signal,
+      liability: { accountingVersion: "provider-billable-v1" as const },
+      releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+      adaptationEnabled: false,
+      retrySafe: false,
+      affinityTenantUserId: "tenant",
+      affinitySecurityScope: "token",
+      affinityAccessGrantId: "grant",
+      affinityHeaders: new Headers(body ? {} : { [carrier]: value }),
+      body: new TextEncoder().encode(JSON.stringify(payload)),
+    };
+    const ranked = await rankPublicOverflowTargets({
+      request,
+      policy: listed.affinityPolicy,
+      targets: listed.targets,
+    });
+    const target = ranked.targets[0]!;
+    const { affinityPrefixDigests } = await import("./cache-affinity.js");
+    const material = affinityPrefixDigests({
+      ownerId: "tenant",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      accessGrantId: "grant",
+      surface: "openai-chat",
+      payload,
+      headers: request.affinityHeaders,
+      runtimeIdentity: target.affinityTarget!.targetIdentity,
+    });
+    expect(ranked.decision?.matchedSessionIds?.[target.executionTargetId]).toBe(
+      material.clientSessionId,
+    );
+    expect(material.clientSessionId === undefined).toBe(invalid);
+    if (!invalid)
+      expect(
+        affinityPrefixDigests({
+          ownerId: "other-tenant",
+          resourceOwnerId: "owner",
+          poolId: "pool",
+          securityScope: "token",
+          accessGrantId: "grant",
+          surface: "openai-chat",
+          payload,
+          headers: request.affinityHeaders,
+          runtimeIdentity: target.affinityTarget!.targetIdentity,
+        }).clientSessionId,
+      ).not.toBe(material.clientSessionId);
+  },
+);
 
 it("excludes protocol-mismatched legacy inventories before egress", async () => {
   const fixture = dispatchPoolFixture();
@@ -1601,6 +1703,7 @@ describe("public overflow terminal response dispatch", () => {
       requiredFeatures: [],
       path: "/v1/chat/completions",
       headers: new Headers(),
+      affinityHeaders: new Headers({ "x-session-id": "ranking-client" }),
       body: new TextEncoder().encode('{"model":"pool","messages":[{"role":"user","content":"x"}]}'),
       signal: new AbortController().signal,
       liability: { accountingVersion: "provider-billable-v1" },
@@ -1621,6 +1724,21 @@ describe("public overflow terminal response dispatch", () => {
     ]);
     expect(ranked.targets[0]?.affinity?.reason).toContain("publicPenalty:100");
     expect(ranked.targets[1]?.affinity?.reason).toContain("active:1");
+
+    const { affinityPrefixDigests } = await import("./cache-affinity.js");
+    for (const target of ranked.targets) {
+      expect(ranked.decision?.matchedSessionIds?.[target.executionTargetId]).toBe(
+        affinityPrefixDigests({
+          ownerId: "owner",
+          resourceOwnerId: "owner",
+          poolId: "pool",
+          surface: "openai-chat",
+          payload: { model: "pool", messages: [{ role: "user", content: "x" }] },
+          headers: request.affinityHeaders,
+          runtimeIdentity: target.affinityTarget!.targetIdentity,
+        }).clientSessionId,
+      );
+    }
 
     db.providerAttempt.groupBy.mockResolvedValue([]);
     db.providerPricingVersion.findFirst
@@ -2314,6 +2432,7 @@ describe("public overflow terminal response dispatch", () => {
         requiredFeatures: [],
         path: "/v1/chat/completions",
         headers: new Headers({ "content-type": "application/json" }),
+        affinityHeaders: new Headers({ "session-id": "overflow-client" }),
         body: new TextEncoder().encode(
           '{"model":"pool","messages":[{"role":"user","content":"affinity evidence"}]}',
         ),
@@ -2332,6 +2451,7 @@ describe("public overflow terminal response dispatch", () => {
       // The affinity write is best-effort and errors are swallowed, so the
       // spy must witness the call itself rather than its downstream effects.
       await vi.waitFor(() => expect(rememberAffinity).toHaveBeenCalledTimes(1));
+      expect(rememberAffinity.mock.calls[0]?.[0].headers.get("session-id")).toBe("overflow-client");
       expect(rememberAffinity.mock.calls[0]?.[0]).toMatchObject({
         engineCacheConfirmed: fixture.engineCacheConfirmed,
       });
@@ -5781,3 +5901,239 @@ describe("OpenRouter data_collection privacy (D9)", () => {
 function claimPrivacyAccount() {
   return { providerType: "openai", allowDataCollection: false };
 }
+
+it.each(["openai-chat", "openai-responses"] as const)(
+  "R4 public dispatcher propagates %s embedded-depth refusal before budget/send/health",
+  async (surface) => {
+    vi.clearAllMocks();
+    db.modelPool.findFirst.mockResolvedValue(
+      dispatchPoolFixture("anthropic", "anthropic-messages", "anthropic"),
+    );
+    const payload = embeddedArgumentsRequest(surface, nestedWire(257, "object"));
+    const canonical = parseCanonicalRequest(surface, payload);
+    const request = {
+      userId: "owner",
+      poolId: "pool",
+      requestId: "depth-refusal",
+      reason: "NO_COMPATIBLE_HEALTHY_PRIMARY" as const,
+      ...ownerConsentFields(),
+      requestedProtocol: "openai" as const,
+      requestedSurface: surface,
+      stream: false,
+      requiredFeatures: [],
+      path: "/v1/chat/completions",
+      headers: new Headers(),
+      body: new TextEncoder().encode(JSON.stringify(payload)),
+      signal: new AbortController().signal,
+      liability: { accountingVersion: "provider-billable-v1" },
+      releaseLocalCapacity: vi.fn(),
+      adaptationEnabled: true,
+      retrySafe: false,
+      renderForTarget: async () => ({
+        protocol: "anthropic" as const,
+        path: "/v1/messages",
+        headers: new Headers(),
+        body: new TextEncoder().encode(
+          JSON.stringify(
+            renderCanonicalRequest({
+              request: canonical,
+              target: "anthropic-messages",
+              model: "m",
+            }),
+          ),
+        ),
+      }),
+    };
+    await expect(dispatchPublicOverflow(request)).rejects.toMatchObject({
+      code: "request_json_depth_exceeded",
+      message: "request JSON nesting exceeds 256 levels",
+    });
+    expect(admitProviderBudget).not.toHaveBeenCalled();
+    expect(providerHttpsRequest).not.toHaveBeenCalled();
+    expect(recordProviderOutcome).not.toHaveBeenCalled();
+  },
+);
+
+it.each(
+  ["nonstream", "sse-data", "sse-arguments", "sse-adapter-cancel"].flatMap((mode) =>
+    (mode === "sse-adapter-cancel" ? [257] : [20, 257]).map((depth) => ({ mode, depth })),
+  ),
+)("R6 adapted provider settlement $mode depth=$depth", async ({ mode, depth }) => {
+  vi.clearAllMocks();
+  const stream = mode !== "nonstream";
+  db.modelPool.findFirst.mockResolvedValue(dispatchPoolFixture());
+  const tx = {
+    ...consentDelegates(),
+    $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+      mockRequesterValidityQuery(strings, values, consentDelegates()),
+    ),
+    providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
+    providerCredential: {
+      findFirst: vi
+        .fn()
+        .mockResolvedValue(
+          dispatchPoolFixture().PoolMembers[0]!.ExecutionTarget.ProviderModel.ProviderAccount
+            .CurrentCredential,
+        ),
+      update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+    },
+  };
+  db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+    callback(tx),
+  );
+  const argumentsText = nestedWire(depth, "object");
+  const reply = {
+    id: "reply",
+    object: "chat.completion",
+    model: "m",
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: "call",
+              type: "function",
+              function: { name: "lookup", arguments: argumentsText },
+            },
+          ],
+        },
+        finish_reason: "tool_calls",
+      },
+    ],
+    usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+  };
+  const chunk = (choices: unknown[], extension?: unknown) =>
+    Buffer.from(
+      `data: ${JSON.stringify({ id: "reply", object: "chat.completion.chunk", created: 0, model: "m", choices, ...(extension === undefined ? {} : { extension }) })}\n\n`,
+    );
+  const chunks = !stream
+    ? [Buffer.from(JSON.stringify(reply))]
+    : mode === "sse-data" || mode === "sse-adapter-cancel"
+      ? [
+          chunk([], JSON.parse(argumentsText)),
+          chunk([{ index: 0, delta: {}, finish_reason: "stop" }]),
+          Buffer.from(
+            'data: {"id":"reply","object":"chat.completion.chunk","created":0,"model":"m","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}\n\n',
+          ),
+          Buffer.from("data: [DONE]\n\n"),
+        ]
+      : [
+          chunk([
+            {
+              index: 0,
+              delta: {
+                role: "assistant",
+                tool_calls: [
+                  {
+                    index: 0,
+                    id: "call",
+                    type: "function",
+                    function: { name: "lookup", arguments: "" },
+                  },
+                ],
+              },
+              finish_reason: null,
+            },
+          ]),
+          chunk([
+            {
+              index: 0,
+              delta: { tool_calls: [{ index: 0, function: { arguments: argumentsText } }] },
+              finish_reason: null,
+            },
+          ]),
+          chunk([{ index: 0, delta: {}, finish_reason: "tool_calls" }]),
+          Buffer.from("data: [DONE]\n\n"),
+        ];
+  let initialSent = false;
+  const upstream =
+    mode === "sse-adapter-cancel"
+      ? new Readable({
+          read() {
+            if (!initialSent) {
+              initialSent = true;
+              this.push(chunks[0]);
+            }
+          },
+        })
+      : Readable.from(chunks);
+  providerHttpsRequest.mockResolvedValueOnce(
+    Object.assign(upstream, {
+      statusCode: 200,
+      headers: { "content-type": stream ? "text/event-stream" : "application/json" },
+      complete: mode !== "sse-adapter-cancel",
+    }),
+  );
+  const result = await dispatchPublicOverflow({
+    userId: "owner",
+    poolId: "pool",
+    requestId: "response-depth",
+    reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+    ...ownerConsentFields(),
+    requestedProtocol: "anthropic",
+    requestedSurface: "anthropic-messages",
+    stream,
+    requiredFeatures: [],
+    path: "/v1/messages",
+    headers: new Headers(),
+    body: new TextEncoder().encode('{"model":"pool"}'),
+    signal: new AbortController().signal,
+    liability: { accountingVersion: "provider-billable-v1" },
+    releaseLocalCapacity: vi.fn(),
+    adaptationEnabled: true,
+    retrySafe: false,
+    renderForTarget: async () => ({
+      protocol: "openai",
+      path: "/v1/chat/completions",
+      headers: new Headers(),
+      body: new TextEncoder().encode(
+        JSON.stringify({ model: "m", messages: [{ role: "user", content: "hello" }], stream }),
+      ),
+    }),
+  });
+  if (!result.dispatched) throw new Error(`expected dispatch: ${result.reason}`);
+  if (mode === "sse-adapter-cancel") {
+    const adapted = result.response.body!.pipeThrough(
+      createProtocolAdaptationTransform({
+        source: "openai-chat",
+        target: "anthropic-messages",
+        request: parseCanonicalRequest("anthropic-messages", {
+          model: "m",
+          max_tokens: 8,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      }),
+    );
+    if (depth <= 256) await new Response(adapted).text();
+    else
+      await expect(new Response(adapted).text()).rejects.toMatchObject({
+        code: "response_json_depth_exceeded",
+      });
+  } else await result.response.text();
+  expect(await result.terminal).toMatchObject({ ok: depth <= 256 });
+  expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+  expect(reconcileProviderBudget).toHaveBeenCalledWith(
+    expect.objectContaining({
+      reason: depth <= 256 ? "COMPLETED" : "FAILED",
+      ...(!stream
+        ? {
+            observationComplete: true,
+            usage: expect.objectContaining({ inputTokens: 5n, outputTokens: 3n }),
+          }
+        : {}),
+    }),
+  );
+  expect(recordProviderOutcome).toHaveBeenCalledWith(
+    expect.objectContaining({ success: depth <= 256 }),
+  );
+  expect(recordProviderAttemptEvent).toHaveBeenCalledWith(
+    expect.objectContaining({
+      eventType: "TERMINAL",
+      terminalState: depth <= 256 ? "COMPLETED" : "FAILED",
+    }),
+  );
+  expect(heartbeatProviderAttempt).not.toHaveBeenCalled();
+});

@@ -234,19 +234,155 @@ capacity is shared between the people whose sessions are warm
 - `FIXED_PERCENT`: each user may keep `protectionFixedPercent` % of the slots.
 - `FIRST_COME`: no per-user cap.
 
-A session is identified by the session id its routing records carry
-(`cache_affinity_record.sessionId`). A request stamps every record it writes
-with the session it continues (an explicit conversation's own record, else the
-deepest cumulative prefix its history still shares with an earlier turn) or with
-a fresh id, so its newest turn sets its age and size. An active lease is tied to its session through the
-admission request (`admission_request.warmSessionIds`, the sessions the request
-continues on its candidate members; a lease serves only the sessions of its own
-execution target). Rows written before session ids existed are one session each.
-Known limits, handled in #160: an implicit conversation (no conversation id) that
-edits or shortens its history, or changes tools, instructions or request
-parameters between turns, can leave the earlier turn counted as a second session
-until the window ends; and two implicit conversations that open with the same
-message can be counted as one session. The records of
+A valid client conversation id is authoritative, even when instructions change.
+Without one, continuity uses the last 64 digest-chain nodes, deepest first: a
+live tip wins by earliest expiry then session id; otherwise a sole ancestor
+owner permits edits/truncations. Ambiguous ancestors start a fresh session.
+Leading instructions (system/developer units before the first conversation unit,
+the Anthropic `system` field, Responses `instructions`), tools, semantic and
+unknown parameters bind the root; a later system/developer message keeps its
+position in the history and behaves like any other edit. Only the
+16 approved sampling parameters are free (alongside model/stream and consumed
+content). A body carrier is excluded only when it wins validation and supplies
+the client id; invalid, inactive and losing carriers bind like unknown parameters.
+For a winning Anthropic metadata token, only `metadata.user_id` is excluded;
+other metadata fields still bind. Root/instruction warmth alone never links sessions.
+
+The first valid carrier wins: body `conversation`, then `conversation_id`
+(string or object with string `id`), then OpenAI `prompt_cache_key`; headers
+`x-conversation-id`, `session_id`, `session-id`, `x-session-id`, then
+`x-claude-code-session-id`; finally Anthropic `metadata.user_id` containing
+`_session_<uuid>` (only the UUID). Header names ignore case. Ids are trimmed
+strings of 1–256 characters from `[A-Za-z0-9._:/@=+-]`; invalid carriers fall
+through without errors. Only the original authenticated request supplies ids.
+They are HMACed with requester tenant, resource owner, token scope, grant,
+pool, target/runtime and surface, so the same string cannot cross those
+boundaries. Raw ids are never stored. Session headers are read separately from
+the upstream header allowlist, including external fallback.
+
+Carrier research (2026-09-30; behavior can vary by client version):
+
+| Carrier | Evidence and confidence |
+| --- | --- |
+| `conversation` / `conversation_id` (string or `id` object) | High confidence in this project's existing request support and tests; no assertion that Codex/OpenCode sends these by default. |
+| `prompt_cache_key` | Authoritative on Chat/Responses within the authenticated tenant scope. A constant per-user/feature key merges those conversations into one session and affects only that tenant’s advisory protection; tenants cannot reach another tenant’s sessions. High: [Codex source](https://github.com/openai/codex/blob/main/codex-rs/core/src/client.rs) uses the session id, with overrides/internal-parent variants; [OpenCode provider options](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/provider/transform.ts) set `promptCacheKey` from the session, subject to provider configuration. The AI SDK maps it to `prompt_cache_key` on [Chat](https://github.com/vercel/ai/blob/main/packages/openai/src/chat/openai-chat-language-model.ts) and [Responses](https://github.com/vercel/ai/blob/main/packages/openai/src/responses/openai-responses-language-model.ts). |
+| `x-conversation-id` | Generic carrier for custom clients; low confidence that the named clients send it by default. No local producer found. |
+| `session_id` | Alternate spelling; medium confidence in older/client-plugin behavior, not confirmed as current Codex's spelling. |
+| `session-id` | High: current [Codex header builder](https://github.com/openai/codex/blob/main/codex-rs/codex-api/src/requests/headers.rs) sends this spelling. |
+| `x-session-id` | High: [OpenCode request preparation](https://github.com/anomalyco/opencode/blob/dev/packages/opencode/src/session/llm/request.ts) and [session runner](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/session/runner/llm.ts) send `X-Session-Id`; provider/version settings can differ. |
+| `x-claude-code-session-id` | High: the official [Claude Code changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md) records its addition in v2.1.86. |
+| Anthropic `_session_<uuid>` in `metadata.user_id` | Medium for historical behavior: a [Claude Code issue's bundled-code report](https://github.com/anthropics/claude-code/issues/15782) shows this format. No claim that all current versions use it; the header is preferred. |
+
+Any valid constant id has the same authoritative behavior as `prompt_cache_key`:
+set ids per conversation to keep that tenant's conversations separate.
+
+**Limits without client ids:** continuation evidence requires assistant/tool
+output after the first user unit. Leading assistant greetings are starter context.
+User-only and greeting+user starters always start fresh, including truncation to
+such a starter. In all six causal arrival orders of A1, B1, A2, B2 (A1 before A2;
+B1 before B2), identical user-only starters create two sessions, and distinct
+assistant replies in A2/B2 advance separate tips (starter labels may exchange).
+Greeting+distinct-user starters and their distinct later histories also stay
+separate, sequentially and concurrently, on Chat, Messages and Responses.
+Byte-identical later histories merge at the deepest tip. Shared-starter edits
+can split/join siblings. Few-shot openers `[user(example), assistant(label),
+user(query)]` already contain continuation evidence: different queries can merge
+permanently as indistinguishable edits of that shared example. Tests pin this
+residual limit. Distinct client ids keep these conversations separate.
+
+Native Responses appends input deltas to the committed parent chain; stateless
+full history containing the same create+delta units can match those retained
+nodes when it contains continuation evidence (assistant/tool output). A
+user-only history stays fresh under the starter rule. A missing/expired parent
+publishes no delta-only nodes, including with a client id; that id can still
+identify the session footprint. Canonicalization preserves every own JSON key,
+including `__proto__`. Affinity's advisory depth limit is 128 (request root at
+depth 0; each object property or array entry adds one level). Exceeding that
+limit or a converter/HMAC/work-budget error makes the whole request unidentifiable:
+no nodes, hints, client session footprint or Responses lineage.
+
+Ranking builds canonical request material once and reuses it across targets;
+only binding and HMAC work depends on the target. A shared **16,777,216 visited-node
+budget (8 × 2 MiB)** bounds validation, extraction and incremental serialization.
+Work-budget exhaustion makes the whole advisory request unidentifiable. Arrays
+are visited by index without copying or sorting keys; object keys are collected
+only while their minimum encoded byte cost fits. Strings are escaped in chunks
+of at most 4096 code units, preserving surrogate pairs. Conversation processing
+also stops after **4096 units** with the same identity-refusal behavior as byte
+overflow. These bounds prevent many tiny values from monopolizing the process.
+Ordinary requests retain the same canonical bytes and v5 digests.
+
+Non-finite numbers accepted by JSON parsing, such as `1e400` and `-1e400`, bind
+as `null`, matching native `JSON.stringify` forwarding. This applies to scalar
+values, object members and array elements in parameters, tools, instructions
+and messages; no member, array property or conversation unit is silently dropped.
+
+The 2 MiB canonical identity limit is separate: bytes are counted for the
+instruction/tools/parameters root and then each conversation unit. Size-only
+overflow refuses identity and lineage, while retaining safe instruction hints
+and the last 64 nodes of the under-cap chain prefix as routing hints. An oversized
+root cannot produce conversation routing hints; an oversized unit stops the
+chain, and later units cannot restart it. Large supported vision histories can
+therefore remain warm. A valid authoritative client id still refreshes its one
+session footprint; without an id only shared hints are refreshed, with no new
+per-turn footprint. Routing hints never establish resolver identity.
+
+Model API JSON acceptance has a separate **256-level request nesting limit**,
+measured iteratively with parallel container/depth stacks immediately after JSON
+parsing, before model lookup, counting, affinity ranking or dispatch. Depth 257 and above return HTTP 400 with
+a protocol-appropriate invalid-request error: `request JSON nesting exceeds 256
+levels`. Depth 129 through 256 is served with affinity advisory identity off,
+including bound Responses follow-ups. Realistic tool/JSON schemas are far below
+256, which also stays safely below Node 24's recursive serializer limit.
+
+Adapters enforce the same literal **256-level** bound when request rendering
+decodes embedded tool argument JSON strings into objects. Each decoded argument
+has a fresh depth-0 boundary: depth 256 is supported, and 257 or greater fails
+with `request JSON nesting exceeds 256 levels`. Local and external request render
+preflight returns the requested protocol's HTTP 400 before member admission or
+dispatch, without recording a member health failure.
+
+Provider responses have a separate **256-level** limit covering whole nonstream
+JSON bodies, SSE stream `data` JSON, and embedded tool arguments decoded during
+response adaptation. Overflow is an upstream failure:
+`response_json_depth_exceeded` / `provider response JSON nesting exceeds 256 levels`.
+It returns HTTP 502 before any output, or a terminal protocol error event after
+output; the relay finishes `FAILED` with `protocol_error`. Native argument strings
+passed through without decoding retain their existing behavior.
+
+The shared parser covers `/chat/completions`, `/messages`,
+`/messages/count_tokens`, `/responses` (create and bound input follow-ups),
+`/responses/count_tokens`, `/embeddings` and `/audio/speech`, including local,
+public-overflow and authenticated Chat Test paths. MCP tool arguments use the
+same guard before their first size serialization, and the chat diagnostic core
+checks again before creating its synthetic model API request. Multipart audio
+routes do not parse JSON bodies. Responses retrieve/delete/cancel/input-items/
+compact use empty relay bodies. Other JSON reads in routing, public overflow,
+privacy, diagnostics and protocol adapters inspect already accepted internal
+requests, upstream responses/SSE, or embedded tool argument strings; they are
+not separate HTTP JSON acceptance paths.
+
+Retention keeps at most 64 nodes and one tip per identifiable session, plus a
+separate session footprint. Bound writes retain only the selected server parent's
+same-root tail, up to its bound tip depth, after proving that tip is still on the parent's current
+chain. A client-id override copies and re-stamps that proven tail, discarding
+its own unrelated old nodes/hints. Instruction hints carry a type namespace so
+routing-only hints without node rows cannot be inherited as instructions. A stale
+binding after a stateless rewrite
+cannot retain unproven ancestors. Pruning preserves omitted instruction hints
+from the proven chain. Bound turns refresh the committed token estimate with a
+delta estimate computed before dispatch (empty deltas carry size forward).
+EOF awaits the affinity commit before saving Responses warm lineage. Persistence
+uses `maxWait=2000ms`, `timeout=2500ms`, and `lock_timeout=1000ms`; errors save the
+Responses binding without a warm link. Resolution uses at most 64 indexed
+LIMIT 1/2 probes. Expiry cleanup takes at most 200 rows per table per completion;
+the background sweeper drains the rest. Retention eviction also takes 200 rows
+per completion, so reducing a cap converges over subsequent writes. Normal
+writes add fewer than that batch. Pool clear and deleted-user drains remove both
+tables; v5 discards older/null-session rows. Active leases name committed session
+ids in `admission_request.warmSessionIds`.
+
+The records of
 every pool of the owner on the member count; each session's override comes from
 its own pool (grant, or the owner's percent), each distinct override is its own
 budget (the share mode, window and minimum size are the requesting pool's), and one user's total never exceeds their largest share. `UNPROTECTED`

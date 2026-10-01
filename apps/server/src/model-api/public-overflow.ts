@@ -47,8 +47,11 @@ import {
   openRouterDataCollectionPolicy,
 } from "./openrouter-privacy.js";
 import { ADAPTER_VERSION } from "./protocols/canonical.js";
+import { isRequestDepthError, isResponseDepthError } from "./protocols/errors.js";
 import type { ProtocolSurface } from "./protocols/index.js";
+import { parseProtocolResponse } from "./protocols/nonstream.js";
 import { SseDecoder, type SseRecord } from "./protocols/sse.js";
+import { CanonicalStreamParser } from "./protocols/streams.js";
 import {
   allocateProviderFence,
   claimProviderHealthTrial,
@@ -187,6 +190,8 @@ export interface PublicOverflowRequest {
   requiredFeatures: readonly string[];
   path: string;
   headers: Headers;
+  /** Original authenticated request headers; kept separate from upstream allowlists. */
+  affinityHeaders?: Headers;
   body: Uint8Array;
   signal: AbortSignal;
   liability: ProviderLiability;
@@ -2496,8 +2501,12 @@ export async function rankPublicOverflowTargets(input: {
     accessGrantId: input.request.affinityAccessGrantId,
     policy: input.policy,
     surface: input.request.requestedSurface,
+    headers: input.request.affinityHeaders ?? input.request.headers,
     payload,
     targets: affinityTargets,
+    // Dispatch may already be pinned by capacity admission. Still resolve
+    // identity so rank and the eventual write agree on client carriers.
+    scoreSingleTarget: true,
   });
   const byId = new Map(input.targets.map((target) => [target.executionTargetId, target]));
   return {
@@ -2580,7 +2589,7 @@ export async function buildProviderAffinityTargets(input: {
         upstreamModelId: `${target.providerModelId}:${target.upstreamModelId}`,
         runtimeIdentityKey: target.providerAccountId,
         runtimeModel: target.upstreamModelId,
-        runtimeRevision: target.providerVersion,
+        runtimeRevision: target.providerVersion ?? null,
         tokenizer: null,
         tokenizerVersion: null,
         template: null,
@@ -2847,7 +2856,8 @@ export async function dispatchPublicOverflow(
         ...upstream,
         body: applyOpenRouterDataCollection(upstream.body, target.dataCollectionPolicy),
       };
-    } catch {
+    } catch (error) {
+      if (isRequestDepthError(error)) throw error;
       await recordProviderAttemptEvent({
         userId: request.userId,
         providerAccountId: target.providerAccountId,
@@ -3365,6 +3375,21 @@ export async function dispatchPublicOverflow(
       let clientCancelled = false;
       let protocolTerminal = false;
       let protocolFailed = false;
+      // Observe the serializer depth bound before durable attempt settlement.
+      // Routes still own adaptation and client-facing protocol errors.
+      const adaptedSurface = nativeSurface !== request.requestedSurface ? nativeSurface : undefined;
+      let depthParser =
+        adaptedSurface && request.stream ? new CanonicalStreamParser(adaptedSurface) : undefined;
+      const observeAdaptedDepth = (chunk?: Uint8Array) => {
+        if (!depthParser) return;
+        try {
+          if (chunk) depthParser.push(chunk);
+          else depthParser.finish();
+        } catch (error) {
+          if (isResponseDepthError(error)) protocolFailed = true;
+          depthParser = undefined;
+        }
+      };
       let deliveredProtocolTerminal = false;
       let accountingIncomplete = request.stream;
       const terminalDecoder = request.stream ? new SseDecoder() : undefined;
@@ -3398,6 +3423,17 @@ export async function dispatchPublicOverflow(
                 nonstreamEnvelope = parsed as Record<string, unknown>;
             } catch {
               nonstreamEnvelope = undefined;
+            }
+          }
+          if (adaptedSurface && !request.stream && nonstreamEnvelope) {
+            try {
+              parseProtocolResponse({
+                surface: adaptedSurface,
+                body: nonstreamEnvelope,
+                status,
+              });
+            } catch (error) {
+              if (isResponseDepthError(error)) protocolFailed = true;
             }
           }
           const streamTerminal = !request.stream || protocolTerminal;
@@ -3612,6 +3648,7 @@ export async function dispatchPublicOverflow(
                 return;
               }
               if (chunk.done) {
+                observeAdaptedDepth();
                 reachedEof = true;
                 if (terminalDecoder) {
                   const records = terminalDecoder.finish();
@@ -3648,6 +3685,7 @@ export async function dispatchPublicOverflow(
               }
               if (heldTerminalChunk) postTerminalBytes += chunk.value.byteLength;
               responseBytes += chunk.value.byteLength;
+              observeAdaptedDepth(chunk.value);
               if (!request.stream && !nonstreamOverflow) {
                 if (nonstreamBytes + chunk.value.byteLength <= 8 * 1024 * 1024) {
                   nonstreamChunks.push(chunk.value);
@@ -3714,7 +3752,10 @@ export async function dispatchPublicOverflow(
           }
         },
         async cancel(reason) {
-          clientCancelled = true;
+          // A rejecting response adapter cancels its source too. That is an
+          // upstream failure, while a caller cancellation keeps its own outcome.
+          clientCancelled = !isResponseDepthError(reason);
+          if (!clientCancelled) protocolFailed = true;
           await teardownProviderBody(response, reader, reason);
           await reconcile(false).catch(() => resolveTerminal({ ok: false, responseBytes }));
         },
@@ -3779,6 +3820,7 @@ export async function dispatchPublicOverflow(
                   policy: listed.affinityPolicy,
                   surface: request.requestedSurface,
                   payload: parsed as Record<string, unknown>,
+                  headers: request.affinityHeaders ?? request.headers,
                   target: target.affinityTarget,
                   engineCacheConfirmed: engineCacheConfirmedFromUsage(settledUsage),
                   estimatedTokens:

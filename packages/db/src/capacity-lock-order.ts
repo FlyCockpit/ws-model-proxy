@@ -80,7 +80,7 @@
  *   06 capacity-policy:<target>             policy writers (M) and admission (H)
  *   07 concurrency:<scope>:<id>             admission-internal
  *   08 capacity:<capacity>                  admission (H), capacity policy writers (M)
- *   09 cache-affinity:<owner>:<pool>        cache affinity retention
+ *   09 cache-affinity:<owner>:<pool>        cache affinity identity + record/node retention
  *
  * Enforcement (structural, not an inventory):
  *
@@ -342,6 +342,7 @@ export const HOT_PATH_TABLES = [
   "capacity_lease",
   "capacity_runtime",
   "cache_affinity_record",
+  "cache_affinity_node",
   "relay_request",
   "relay_execution_event",
   "relay_execution_attempt",

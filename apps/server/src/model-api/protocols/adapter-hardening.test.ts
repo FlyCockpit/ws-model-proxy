@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
+import { embeddedArgumentsRequest, nestedWire } from "../cache-affinity-canonical.test-fixtures.js";
 import openRouterFixture from "../fixtures/openrouter-usage.json";
 import {
   adaptNonstreamResponse,
@@ -10,6 +11,7 @@ import {
   executionTargetAcceptsTopK,
   executionTargetSupportsStreamUsage,
   parseAnthropicMessagesRequest,
+  parseCanonicalRequest,
   parseOpenAiChatRequest,
   type ReasoningRenderControl,
   renderAnthropicMessagesRequest,
@@ -1131,3 +1133,23 @@ describe("adapter follow-ups (#77)", () => {
     expect(render(false)).not.toHaveProperty("stream_options");
   });
 });
+
+it.each(["openai-chat", "openai-responses"] as const)(
+  "R4 %s embedded expansion depth bound and native string control",
+  (surface) => {
+    for (const depth of [20, 256, 257, 10_000]) {
+      const argumentsText = nestedWire(depth, "object");
+      const request = parseCanonicalRequest(
+        surface,
+        embeddedArgumentsRequest(surface, argumentsText),
+      );
+      const render = () => renderAnthropicMessagesRequest(request, "upstream");
+      if (depth <= 256) expect(() => JSON.stringify(render())).not.toThrow();
+      else expect(render).toThrow("request JSON nesting exceeds 256 levels");
+      // Same surface rendering keeps the string without decoding it.
+      expect(
+        JSON.stringify(renderCanonicalRequest({ request, target: surface, model: "m" })),
+      ).toContain(JSON.stringify(argumentsText).slice(1, -1));
+    }
+  },
+);

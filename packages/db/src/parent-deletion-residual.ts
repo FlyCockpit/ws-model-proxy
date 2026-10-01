@@ -78,6 +78,13 @@ export const HISTORY_DRAIN_EDGES = {
     ],
     internal: [],
   },
+  cache_affinity_node: {
+    delete: [
+      ["userId", "user"],
+      ["tenantUserId", "user"],
+    ],
+    internal: [],
+  },
   response_stickiness_record: { delete: [["userId", "user"]], internal: [] },
   usage_rollup_minute: { delete: [["ownerUserId", "user"]], internal: [] },
   usage_rollup_hour: { delete: [["ownerUserId", "user"]], internal: [] },

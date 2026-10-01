@@ -21,4 +21,14 @@ describe("cache affinity cleanup lifecycle", () => {
     await vi.advanceTimersByTimeAsync(200);
     expect(sweep).toHaveBeenCalledTimes(3);
   });
+
+  it.each([1000, 1500, 2000])(
+    "keeps draining when a batch removes %i rows (records plus nodes)",
+    async (removed) => {
+      const sweep = vi.fn().mockResolvedValueOnce(removed).mockResolvedValue(0);
+      const stop = startCacheAffinityCleanup({ intervalMs: 60_000, sweep });
+      await vi.waitFor(() => expect(sweep).toHaveBeenCalledTimes(2));
+      stop();
+    },
+  );
 });

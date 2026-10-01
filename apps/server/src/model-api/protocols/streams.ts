@@ -1,5 +1,11 @@
 import type { CanonicalEvent, CanonicalUsage, ProtocolSurface } from "./canonical.js";
-import { AdapterError, unsupported } from "./errors.js";
+import {
+  AdapterError,
+  assertResponseJsonDepth,
+  isResponseDepthError,
+  parseResponseEmbeddedJson,
+  unsupported,
+} from "./errors.js";
 import { anthropicInputUsage, renderProtocolError } from "./nonstream.js";
 import {
   acceptChatChoiceExtras,
@@ -142,6 +148,7 @@ export class CanonicalStreamParser {
     let value: Record<string, unknown>;
     try {
       value = object(JSON.parse(record.data), "stream.data");
+      assertResponseJsonDepth(value, "stream.data");
     } catch (error) {
       if (error instanceof AdapterError) throw error;
       throw new AdapterError("invalid_stream_json", "SSE data was not valid JSON.");
@@ -1269,8 +1276,12 @@ function validIndex(index: number) {
 
 function validateToolJson(value: string, index: number) {
   try {
-    object(JSON.parse(value), `tool_call[${index}].arguments`);
-  } catch {
+    object(
+      parseResponseEmbeddedJson(value, `tool_call[${index}].arguments`),
+      `tool_call[${index}].arguments`,
+    );
+  } catch (error) {
+    if (isResponseDepthError(error)) throw error;
     throw new AdapterError(
       "incomplete_tool_arguments",
       `Tool arguments for item ${index} were not a complete JSON object.`,

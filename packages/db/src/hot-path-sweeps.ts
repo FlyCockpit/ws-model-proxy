@@ -201,11 +201,12 @@ export async function purgeDeletedUserHistory(
     () => deleteOwnedBatch(db, "response_stickiness_record", "id", "userId", userId, batch),
     batch,
   );
-  for (const column of ["userId", "tenantUserId"])
-    processed += await sweepLoop(
-      () => deleteOwnedBatch(db, "cache_affinity_record", "id", column, userId, batch),
-      batch,
-    );
+  for (const table of ["cache_affinity_record", "cache_affinity_node"])
+    for (const column of ["userId", "tenantUserId"])
+      processed += await sweepLoop(
+        () => deleteOwnedBatch(db, table, "id", column, userId, batch),
+        batch,
+      );
   processed += await sweepLoop(
     () => deleteOwnedBatch(db, "capacity_runtime", "capacityId", "userId", userId, batch),
     batch,
@@ -270,6 +271,8 @@ export async function purgeDeletedUserHistory(
         OR EXISTS (SELECT 1 FROM admission_request WHERE "userId" = ${userId})
         OR EXISTS (SELECT 1 FROM response_stickiness_record WHERE "userId" = ${userId})
         OR EXISTS (SELECT 1 FROM cache_affinity_record
+                    WHERE "userId" = ${userId} OR "tenantUserId" = ${userId})
+        OR EXISTS (SELECT 1 FROM cache_affinity_node
                     WHERE "userId" = ${userId} OR "tenantUserId" = ${userId})
         OR EXISTS (SELECT 1 FROM usage_rollup_minute
                     WHERE "ownerUserId" = ${userId} OR "requesterUserId" = ${userId})
@@ -361,6 +364,7 @@ export async function clearCacheAffinityRecords(
     const result = await tx.cacheAffinityRecord.deleteMany({
       where: { userId: ownerUserId, poolId },
     });
-    return result.count;
+    const nodes = await tx.cacheAffinityNode.deleteMany({ where: { userId: ownerUserId, poolId } });
+    return result.count + nodes.count;
   });
 }

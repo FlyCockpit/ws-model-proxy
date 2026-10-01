@@ -54,9 +54,10 @@ import {
   type AffinitySessionBinding,
   affinityPrefixDigests,
   buildAffinityTargetIdentity,
+  isAffinityTargetWarm,
   rankAffinityTargets,
   rememberAffinity,
-  scopedAffinitySessionId,
+  resolveAffinitySession,
 } from "./cache-affinity.js";
 import {
   type CacheHolderPlan,
@@ -183,6 +184,7 @@ import {
   createProtocolAdaptationTransform,
   executionTargetAcceptsTopK,
   executionTargetSupportsStreamUsage,
+  isRequestDepthError,
   type ProtocolSurface,
   parseCanonicalRequest,
   reasoningControlForSurface,
@@ -226,6 +228,7 @@ import {
 } from "./relay-usage-facts.js";
 import { type RelayBodySource } from "./request-body-source.js";
 import { profileSurfaceRequest } from "./request-feature-profiler.js";
+import { REQUEST_JSON_DEPTH_ERROR, requestJsonDepthExceeded } from "./request-json-depth.js";
 import {
   isBasicTranscriptionRequest,
   TranscriptionRequestError,
@@ -1111,35 +1114,23 @@ function isJsonObject(value: unknown): value is JsonObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function parseRequestPayload(body: Uint8Array): JsonObject | Response {
+function parseRequestPayload(body: Uint8Array, anthropic = false): JsonObject | Response {
+  const invalid = (message: string, code = "invalid_json") =>
+    anthropic
+      ? anthropicErrorResponse(400, message)
+      : new Response(
+          JSON.stringify(openAiErrorBody({ message, type: "invalid_request_error", code })),
+          { status: 400, headers: { "content-type": "application/json; charset=utf-8" } },
+        );
   let parsed: unknown;
   try {
     parsed = JSON.parse(new TextDecoder().decode(body));
   } catch {
-    return new Response(
-      JSON.stringify(
-        openAiErrorBody({
-          message: "Request body must be valid JSON.",
-          type: "invalid_request_error",
-          code: "invalid_json",
-        }),
-      ),
-      { status: 400, headers: { "content-type": "application/json; charset=utf-8" } },
-    );
+    return invalid("Request body must be valid JSON.");
   }
-
-  if (!isJsonObject(parsed)) {
-    return new Response(
-      JSON.stringify(
-        openAiErrorBody({
-          message: "Request body must be a JSON object.",
-          type: "invalid_request_error",
-          code: "invalid_json",
-        }),
-      ),
-      { status: 400, headers: { "content-type": "application/json; charset=utf-8" } },
-    );
-  }
+  if (!isJsonObject(parsed)) return invalid("Request body must be a JSON object.");
+  if (requestJsonDepthExceeded(parsed))
+    return invalid(REQUEST_JSON_DEPTH_ERROR, "request_json_too_deep");
   return parsed;
 }
 
@@ -1866,6 +1857,20 @@ function targetStreamTerminal(target: ProtocolSurface, chunk: Uint8Array): boole
   if (target === "openai-responses")
     return /event: (?:response\.(?:completed|incomplete|failed)|error)\r?\n/.test(text);
   return /event: (?:message_stop|error)\r?\n/.test(text);
+}
+
+function adapterRequestErrorResponse(surface: ProtocolSurface, error: AdapterError): Response {
+  const canonicalError = {
+    code: "invalid_request_error",
+    message: error.message,
+    parameter: error.parameter,
+    upstreamStatus: 400,
+  };
+  const metadata = renderProtocolErrorMetadata(surface, canonicalError);
+  return new Response(JSON.stringify(renderProtocolError(surface, canonicalError)), {
+    status: metadata.status,
+    headers: metadata.headers,
+  });
 }
 
 function renderForExecutionTarget({
@@ -2886,6 +2891,11 @@ async function writeResponseStickiness({
       selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
       warmSessionId: targetModelPoolId ? (sessionBinding?.sessionId ?? null) : null,
       warmBindingDigest: targetModelPoolId ? (sessionBinding?.bindingDigest ?? null) : null,
+      warmRootDigest: targetModelPoolId ? (sessionBinding?.rootDigest ?? null) : null,
+      warmTipDigest: targetModelPoolId ? (sessionBinding?.tipDigest ?? null) : null,
+      warmTipDepth: targetModelPoolId ? (sessionBinding?.tipDepth ?? null) : null,
+      warmCanonicalBytes: targetModelPoolId ? (sessionBinding?.canonicalBytes ?? null) : null,
+      warmEstimatedTokens: targetModelPoolId ? (sessionBinding?.estimatedTokens ?? null) : null,
       expiresAt,
     },
     update: {
@@ -2899,6 +2909,11 @@ async function writeResponseStickiness({
       selectedExecutionTargetId: selectedExecutionTarget?.id ?? null,
       warmSessionId: targetModelPoolId ? (sessionBinding?.sessionId ?? null) : null,
       warmBindingDigest: targetModelPoolId ? (sessionBinding?.bindingDigest ?? null) : null,
+      warmRootDigest: targetModelPoolId ? (sessionBinding?.rootDigest ?? null) : null,
+      warmTipDigest: targetModelPoolId ? (sessionBinding?.tipDigest ?? null) : null,
+      warmTipDepth: targetModelPoolId ? (sessionBinding?.tipDepth ?? null) : null,
+      warmCanonicalBytes: targetModelPoolId ? (sessionBinding?.canonicalBytes ?? null) : null,
+      warmEstimatedTokens: targetModelPoolId ? (sessionBinding?.estimatedTokens ?? null) : null,
       expiresAt,
     },
     select: { id: true },
@@ -3182,6 +3197,11 @@ async function resolveStickyRoute({
       routingVersion: true,
       warmSessionId: true,
       warmBindingDigest: true,
+      warmRootDigest: true,
+      warmTipDigest: true,
+      warmTipDepth: true,
+      warmCanonicalBytes: true,
+      warmEstimatedTokens: true,
       modelApiTokenId: true,
       targetDiscoveredModelId: true,
       targetModelPoolId: true,
@@ -3364,8 +3384,21 @@ async function resolveStickyRoute({
       visibleTarget,
       selectedDiscoveredModelId,
       sessionBinding:
-        record.warmSessionId && record.warmBindingDigest
-          ? { sessionId: record.warmSessionId, bindingDigest: record.warmBindingDigest }
+        record.warmSessionId &&
+        record.warmBindingDigest &&
+        record.warmRootDigest &&
+        record.warmTipDigest &&
+        record.warmTipDepth !== null &&
+        record.warmCanonicalBytes !== null
+          ? {
+              sessionId: record.warmSessionId,
+              bindingDigest: record.warmBindingDigest,
+              rootDigest: record.warmRootDigest,
+              tipDigest: record.warmTipDigest,
+              tipDepth: record.warmTipDepth,
+              canonicalBytes: record.warmCanonicalBytes,
+              estimatedTokens: record.warmEstimatedTokens ?? undefined,
+            }
           : undefined,
     };
   }
@@ -4374,6 +4407,7 @@ async function relayPool({
       requiredFeatures,
       path: operation.path,
       headers: built.headers,
+      affinityHeaders: request.headers,
       body: built.body,
       signal: request.signal,
       releaseLocalCapacity: releaseProviderCapacity,
@@ -4493,7 +4527,29 @@ async function relayPool({
       // Compatible members whose capacity lease was already lost in this
       // request's precommit window; the same physical member is never
       // re-admitted during this tier traversal.
-      const compatibleAll = compatibleTargets(listed.targets);
+      let providerDepthError: AdapterError | undefined;
+      const compatibleAll = compatibleTargets(listed.targets).filter((providerTarget) => {
+        const nativeSurface = providerTarget.resolvedExecution?.nativeSurface;
+        if (!canonical || !nativeSurface || nativeSurface === requestedSurface) return true;
+        try {
+          renderForExecutionTarget({
+            request: canonical,
+            target: nativeSurface,
+            model: providerTarget.upstreamModelId,
+            allowLossyDeveloperRoleCollapse: providerTarget.ownKey
+              ? false
+              : operation.adaptation?.allowLossyDeveloperRoleCollapse,
+            capabilities: providerTarget.capabilityInventory,
+          });
+        } catch (error) {
+          if (isRequestDepthError(error)) {
+            providerDepthError = error;
+            return false;
+          }
+        }
+        return true;
+      });
+      if (providerDepthError && compatibleAll.length === 0) throw providerDepthError;
       const compatible = orderChatTestProviderTargets(
         compatibleAll.filter(
           (providerTarget) => !lostExternalExecutionTargetIds.has(providerTarget.executionTargetId),
@@ -4684,6 +4740,9 @@ async function relayPool({
     // non-lease-loss hand-off error ends the request), so a lease-loss failover
     // never leaves a loser attempt's finalizer racing the winning attempt's.
     let externalFinalizationScheduled = false;
+    let externalProtocolFailure = false;
+    let externalAdaptationCompletion: Promise<"ok" | "protocol_error" | "cancelled"> =
+      Promise.resolve("ok");
     const scheduleExternalFinalization = (
       committedResult: Extract<
         Awaited<ReturnType<typeof dispatchPublicOverflow>>,
@@ -4694,6 +4753,11 @@ async function relayPool({
       externalFinalizationScheduled = true;
       void committedResult.terminal
         .then(async (terminal) => {
+          const adaptationOutcome = await externalAdaptationCompletion;
+          externalProtocolFailure ||=
+            adaptationOutcome === "protocol_error" &&
+            !request.signal.aborted &&
+            !capacityLeaseLostSignal(providerCapacityLease?.signal);
           releaseCallerLease();
           const completedAt = new Date();
           const usage = usageFactsFromProviderUsage(terminal.usage);
@@ -4704,25 +4768,28 @@ async function relayPool({
                 relayRequestId,
                 {
                   selectedExecutionTargetId: committedResult.target.executionTargetId,
-                  status: terminal.ok
-                    ? "SUCCEEDED"
-                    : request.signal.aborted
-                      ? "CANCELED"
-                      : "FAILED",
+                  status:
+                    terminal.ok && !externalProtocolFailure
+                      ? "SUCCEEDED"
+                      : request.signal.aborted
+                        ? "CANCELED"
+                        : "FAILED",
                   completedAt,
                   durationMs: Math.max(0, completedAt.getTime() - startedAt.getTime()),
-                  httpStatusCode: committedResult.response.status,
+                  httpStatusCode: externalProtocolFailure ? 502 : committedResult.response.status,
                   upstreamStatusCode: committedResult.response.status,
                   requestBytes: BigInt(publicRequestBytes),
                   responseBytes: BigInt(terminal.responseBytes),
                   attemptCount: committedResult.attemptCount,
-                  errorClass: terminal.ok
-                    ? null
-                    : request.signal.aborted
-                      ? "cancelled"
-                      : capacityLeaseLostSignal(providerCapacityLease?.signal)
-                        ? "capacity_lease_lost"
-                        : "unknown",
+                  errorClass: externalProtocolFailure
+                    ? "protocol_error"
+                    : terminal.ok
+                      ? null
+                      : request.signal.aborted
+                        ? "cancelled"
+                        : capacityLeaseLostSignal(providerCapacityLease?.signal)
+                          ? "capacity_lease_lost"
+                          : "unknown",
                   promptTokens: usage.promptTokens,
                   completionTokens: usage.completionTokens,
                   totalTokens: usage.totalTokens,
@@ -4798,6 +4865,16 @@ async function relayPool({
         // from the hand-off refusal below.
         return await commitExternalResponse();
       } catch (error) {
+        if (!heldByCaller && isRequestDepthError(error)) {
+          releaseCallerLease();
+          await settleRelayCleanup([() => releaseProviderCapacity(), () => operation.dispose?.()]);
+          await failPoolRelayMetadata({
+            relayRequestId,
+            startedAt,
+            failure: "unsupported_capability",
+          }).catch(metadataUpdateError);
+          return adapterRequestErrorResponse(requestedSurface, error);
+        }
         const leaseLost = precommitLeaseLost(error, providerCapacityLease?.signal, request.signal);
         // A lost lease abandons a provider body that never reached the client:
         // settle its attempt (a no-op when already read, cancelled or locked).
@@ -4861,7 +4938,14 @@ async function relayPool({
           }
           // A non-lease-loss hand-off error ends the request with this attempt
           // as its outcome; let its terminal transition claim the row.
+          if (
+            error instanceof AdapterError &&
+            error.code !== "cancelled" &&
+            !request.signal.aborted
+          )
+            externalProtocolFailure = true;
           if (committed) scheduleExternalFinalization(committed);
+          if (externalProtocolFailure) return operationFailureResponse(operation, "protocol_error");
           throw error;
         }
         // Nothing was dispatched and the error ends the request: release the
@@ -5094,34 +5178,38 @@ async function relayPool({
             new Response(null, { status: committedResult.response.status, headers }),
           );
         }
-        return await commitAwareResponse(
-          new Response(
-            adaptedResponseBody({
-              body: committedResult.response.body,
-              source,
-              target: operation.adaptation.requestedSurface,
-              stream: true,
-              status: committedResult.response.status,
-              headers: committedResult.response.headers,
-              signal: request.signal,
-              logContext: adapterLogContext,
-              request: canonical ?? undefined,
-              // Headers are already committed and a provider stream cannot be
-              // retried elsewhere, so a rejected upstream event (for example a
-              // deviating trailing usage chunk) must still end the client
-              // stream with the target protocol's terminal error event.
-              onProtocolError: () => undefined,
-              recoverBeforeOutput: true,
-            }),
-            {
-              status: committedResult.response.status,
-              headers: {
-                "content-type": "text/event-stream; charset=utf-8",
-                "x-wsmp-adapter-version": "1.0.0",
-                "x-wsmp-adapter-limitations": adapterLimitations,
-              },
+        let protocolFailureObserved = false;
+        const primed = await primeReadableStream(
+          adaptedResponseBody({
+            body: committedResult.response.body,
+            source,
+            target: operation.adaptation.requestedSurface,
+            stream: true,
+            status: committedResult.response.status,
+            headers: committedResult.response.headers,
+            signal: request.signal,
+            logContext: adapterLogContext,
+            request: canonical ?? undefined,
+            // Prime before hand-off so an invalid first event can return 502.
+            // After output, end with the target protocol's terminal error event.
+            onProtocolError: () => {
+              protocolFailureObserved = true;
             },
-          ),
+          }),
+          operation.adaptation.requestedSurface,
+        );
+        externalAdaptationCompletion = primed.completion.then((outcome) =>
+          protocolFailureObserved && outcome === "ok" ? "protocol_error" : outcome,
+        );
+        return await commitAwareResponse(
+          new Response(primed.body, {
+            status: committedResult.response.status,
+            headers: {
+              "content-type": "text/event-stream; charset=utf-8",
+              "x-wsmp-adapter-version": "1.0.0",
+              "x-wsmp-adapter-limitations": adapterLimitations,
+            },
+          }),
         );
       }
       await throwIfExternalLeaseLost(committedResult.response.body);
@@ -5366,6 +5454,7 @@ async function relayPool({
       ),
     ]),
   );
+  let adaptationDepthError: AdapterError | undefined;
   const protocolCandidates = contextEligibleMembers.filter((member) => {
     const execution = executionByMember.get(member.id);
     if (!execution)
@@ -5386,10 +5475,20 @@ async function relayPool({
         capabilities: effectivePoolMemberCapabilities(member),
       });
       return true;
-    } catch {
+    } catch (error) {
+      if (isRequestDepthError(error)) adaptationDepthError = error;
       return false;
     }
   });
+  if (adaptationDepthError && operation.adaptation && protocolCandidates.length === 0) {
+    await operation.dispose?.();
+    await failPoolRelayMetadata({
+      relayRequestId,
+      startedAt,
+      failure: "unsupported_capability",
+    }).catch(metadataUpdateError);
+    return adapterRequestErrorResponse(operation.adaptation.requestedSurface, adaptationDepthError);
+  }
   const nativeProtocolCandidates = protocolCandidates.filter(
     (member) => executionByMember.get(member.id)?.mode === "native",
   );
@@ -5730,6 +5829,7 @@ async function relayPool({
           policy: affinityPolicy,
           surface: requestedSurface,
           payload: affinityPayload,
+          headers: request.headers,
           targets: affinityTargets,
           // S-C: even one member must know whether this is a continuation
           // (only protection needs it: a pool without it pays no extra reads).
@@ -5790,10 +5890,7 @@ async function relayPool({
     const decision = affinityDecision;
     const affineMember = (poolMemberId: string) => {
       const executionTargetId = memberById.get(poolMemberId)?.ExecutionTarget?.id;
-      return executionTargetId
-        ? (decision.prefixDepths[executionTargetId] ?? 0) > 0 ||
-            decision.conversationMatches[executionTargetId] === true
-        : false;
+      return executionTargetId ? isAffinityTargetWarm(decision, executionTargetId) : false;
     };
     try {
       const verdicts = await assessWarmProtection({
@@ -6688,6 +6785,7 @@ async function relayPool({
                   policy: affinityPolicy,
                   surface: requestedSurface,
                   payload: affinityPayload,
+                  headers: request.headers,
                   target: servedAffinityTarget,
                   engineCacheConfirmed: engineCacheConfirmedFromUsageFacts(
                     usageFactsFromRelayTerminal(upstreamTerminal),
@@ -7066,23 +7164,56 @@ async function relaySelectedModelNoFailover({
           ),
         )
       : null;
-  const boundMaterial =
-    boundAffinityTarget && requestedModelPoolId
-      ? affinityPrefixDigests({
-          ownerId: requester.userId,
-          resourceOwnerId: selected.userId,
-          poolId: requestedModelPoolId,
-          securityScope: requester.limitKey,
-          accessGrantId: poolAccess?.accessGrantId,
-          surface: "OPENAI_RESPONSES",
-          payload: operation.contextInput!,
-          runtimeIdentity: boundAffinityTarget.targetIdentity,
+  let boundMaterial: ReturnType<typeof affinityPrefixDigests> | null = null;
+  if (boundAffinityTarget && requestedModelPoolId) {
+    try {
+      boundMaterial = affinityPrefixDigests({
+        ownerId: requester.userId,
+        resourceOwnerId: selected.userId,
+        poolId: requestedModelPoolId,
+        securityScope: requester.limitKey,
+        accessGrantId: poolAccess?.accessGrantId,
+        surface: "OPENAI_RESPONSES",
+        payload: operation.contextInput!,
+        headers: request.headers,
+        sessionBinding: operation.sessionBinding,
+        runtimeIdentity: boundAffinityTarget.targetIdentity,
+      });
+    } catch (error) {
+      metadataUpdateError(error);
+    }
+  }
+  const boundSessionId =
+    selectedPoolMember?.ModelPool?.affinityEnabled &&
+    boundMaterial &&
+    boundAffinityTarget &&
+    requestedModelPoolId
+      ? await resolveAffinitySession(
+          prisma,
+          {
+            userId: selected.userId,
+            tenantUserId: requester.userId,
+            poolId: requestedModelPoolId,
+            executionTargetId: boundAffinityTarget.executionTargetId,
+          },
+          boundMaterial,
+          new Date(),
+        ).catch((error) => {
+          metadataUpdateError(error);
+          return null;
         })
       : null;
-  const boundSessionId =
-    boundMaterial && selectedPoolMember?.ModelPool?.affinityEnabled
-      ? scopedAffinitySessionId(operation.sessionBinding, boundMaterial.bindingDigest)
-      : undefined;
+  // Estimate native delta input before provider I/O. EOF only awaits the
+  // bounded affinity transaction, and never repeats serialization/tokenization.
+  const estimatedDeltaTokens =
+    boundMaterial?.boundSessionId && operation.contextInput?.input !== undefined
+      ? (
+          await countSerializedRequestContext({
+            input: { input: operation.contextInput.input },
+            signal: request.signal,
+          })
+        ).tokens
+      : 0;
   let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
   if (capacityRuntime) {
     const identity = selectedPoolMember?.ExecutionTarget ?? selected.ExecutionTarget;
@@ -7281,9 +7412,11 @@ async function relaySelectedModelNoFailover({
                 policy: affinityPolicyForMember(selectedPoolMember),
                 surface: "OPENAI_RESPONSES",
                 payload: operation.contextInput,
+                headers: request.headers,
                 target: boundAffinityTarget,
                 sessionBinding: boundSessionId ? operation.sessionBinding : undefined,
                 estimatedTokens: operation.contextCount?.tokens,
+                estimatedDeltaTokens,
                 engineCacheConfirmed: engineCacheConfirmedFromUsageFacts(
                   usageFactsFromRelayTerminal(terminal),
                 ),
@@ -8598,6 +8731,7 @@ async function relayBoundProviderResponse(input: {
     method: input.method,
     path: input.path,
     headers: input.headers,
+    affinityHeaders: input.request.headers,
     body: input.body,
     signal: input.request.signal,
     liability: conservativeProviderLiability({ estimatedInputTokens, requestedOutputTokens }),
@@ -9320,14 +9454,8 @@ async function prepareAnthropicModeledRequest(
       "request_too_large",
     );
   }
-  let payload: JsonObject;
-  try {
-    const parsed: unknown = JSON.parse(new TextDecoder().decode(body));
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("object");
-    payload = parsed as JsonObject;
-  } catch {
-    return anthropicErrorResponse(400, "Request body must be a JSON object.");
-  }
+  const payload = parseRequestPayload(body, true);
+  if (payload instanceof Response) return payload;
   if (typeof payload.model !== "string" || payload.model.trim().length === 0) {
     return anthropicErrorResponse(400, "model is required and must be a non-empty string.");
   }

@@ -1102,16 +1102,14 @@ model CacheAffinityRecord {
   poolId               String
   executionTargetId    String
   targetIdentity       String
-  digestVersion        Int      @default(4)
+  digestVersion        Int      @default(5)
   /// Stable execution/security binding, separate from request content and conversation identity.
   bindingDigest        String
   prefixDigest         String?
   conversationDigest   String?
-  /// Warm-session identity (S-C): every record one request writes carries the
-  /// session it continued (matched conversation or deepest prefix record on
-  /// the same target) or a fresh id. Null on rows from before it existed: the
-  /// row's own id stands in. Not part of the record's identity or uniqueness.
-  sessionId            String?
+  /// Required committed warm-session identity; shared routing hints may move
+  /// between sessions, while a per-session footprint preserves each owner.
+  sessionId            String
   prefixDepth          Int
   estimatedTokens      Int?
   engineCacheConfirmed Boolean  @default(false)
@@ -1123,7 +1121,35 @@ model CacheAffinityRecord {
   @@index([executionTargetId, expiresAt])
   // Warm-session protection (S-C): recent sessions per member KV pool.
   @@index([executionTargetId, lastUsedAt])
+  @@index([sessionId])
+  @@index([userId, tenantUserId, poolId, executionTargetId, lastUsedAt, id])
+  @@index([userId, tenantUserId, poolId, expiresAt, id], map: "cache_affinity_record_expiry_batch")
   @@map("cache_affinity_record")
+}
+
+/// Class H digest-only continuity. No foreign keys to graph or history tables.
+model CacheAffinityNode {
+  id                String   @id @default(cuid(2))
+  userId            String
+  tenantUserId      String
+  poolId            String
+  executionTargetId String
+  rootDigest        String
+  nodeDigest        String
+  depth             Int
+  sessionId         String
+  isTip             Boolean
+  expiresAt         DateTime
+
+  @@unique([userId, tenantUserId, poolId, executionTargetId, rootDigest, nodeDigest, sessionId], map: "cache_affinity_node_owner_unique")
+  @@index([userId, tenantUserId, poolId, executionTargetId, rootDigest, nodeDigest, isTip, expiresAt, sessionId], map: "cache_affinity_node_probe")
+  @@index([sessionId])
+  @@index([expiresAt, id])
+  @@index([userId, poolId, expiresAt])
+  @@index([tenantUserId])
+  @@index([userId, tenantUserId, poolId, expiresAt, id], map: "cache_affinity_node_expiry_batch")
+  @@index([userId, tenantUserId, poolId, executionTargetId, sessionId], map: "cache_affinity_node_session_owner")
+  @@map("cache_affinity_node")
 }
 
 model PoolMember {
@@ -1514,6 +1540,12 @@ model ResponseStickinessRecord {
   /// Scoped warm-session identity from successful local pool Responses creates only.
   warmSessionId             String?
   warmBindingDigest         String?
+  warmRootDigest            String?
+  warmTipDigest             String?
+  warmTipDepth              Int?
+  warmCanonicalBytes        Int?
+  /// Committed full prompt size, carried forward by native delta turns.
+  warmEstimatedTokens       Int?
   routingKeyDigest          String
   /// Version 2+ rows are bound to immutable ExecutionTarget identities and
   /// must never fall back to legacy discovered-model columns after deletion.

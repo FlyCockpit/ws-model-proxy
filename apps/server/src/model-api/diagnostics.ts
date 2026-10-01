@@ -1,3 +1,4 @@
+import { REQUEST_JSON_DEPTH_ERROR, requestJsonDepthExceeded } from "./request-json-depth.js";
 /**
  * Extracted diagnostic cores (Phase 5 — "Extracted diagnostic cores").
  *
@@ -472,6 +473,8 @@ async function chatCompletionDiagnostic({
       outcome: "invalid-request",
       reason: "model variants such as :external are not available to MCP diagnostics",
     };
+  if (requestJsonDepthExceeded(body))
+    return { outcome: "invalid-request", reason: REQUEST_JSON_DEPTH_ERROR };
   const request = new Request("http://diagnostic.internal/v1/chat/completions", {
     method: "POST",
     headers: { "content-type": "application/json" },

@@ -118,6 +118,7 @@ const db = prisma as unknown as {
   };
   $queryRaw: MockInstance;
   capacityAuditEvent: { create: MockInstance };
+  cacheAffinityNode: { count: MockInstance; deleteMany: MockInstance };
   cacheAffinityRecord: {
     count: MockInstance;
     groupBy: MockInstance;
@@ -4250,6 +4251,8 @@ describe("forwarderManagementRouter", () => {
 
   it("reports and clears cache affinity only after verifying pool ownership", async () => {
     db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+    db.cacheAffinityNode.count.mockResolvedValue(3);
+    db.cacheAffinityNode.deleteMany.mockResolvedValue({ count: 3 });
     db.cacheAffinityRecord.count.mockResolvedValueOnce(7).mockResolvedValueOnce(2);
     db.cacheAffinityRecord.groupBy.mockResolvedValue([
       {
@@ -4265,7 +4268,8 @@ describe("forwarderManagementRouter", () => {
 
     expect(stats.activeRecords).toBe(7);
     expect(stats.confirmedRecords).toBe(2);
-    expect(cleared).toEqual({ deleted: 7 });
+    expect(stats.activeNodes).toBe(3);
+    expect(cleared).toEqual({ deleted: 10 });
     expect(db.cacheAffinityRecord.deleteMany).toHaveBeenCalledWith({
       where: { userId: "user-id", poolId: "pool-id" },
     });

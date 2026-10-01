@@ -2665,7 +2665,7 @@ export const forwarderManagementRouter = {
     .handler(async ({ input, context }) => {
       await ownedPool(input.poolId, context.session.user.id);
       const now = new Date();
-      const [activeRecords, confirmedRecords, targetGroups] = await Promise.all([
+      const [activeRecords, confirmedRecords, targetGroups, activeNodes] = await Promise.all([
         prisma.cacheAffinityRecord.count({
           where: { userId: context.session.user.id, poolId: input.poolId, expiresAt: { gt: now } },
         }),
@@ -2683,9 +2683,13 @@ export const forwarderManagementRouter = {
           _count: { _all: true },
           _max: { lastUsedAt: true, expiresAt: true },
         }),
+        prisma.cacheAffinityNode.count({
+          where: { userId: context.session.user.id, poolId: input.poolId, expiresAt: { gt: now } },
+        }),
       ]);
       return {
         activeRecords,
+        activeNodes,
         confirmedRecords,
         targets: targetGroups.map((group) => ({
           executionTargetId: group.executionTargetId,

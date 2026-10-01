@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
+import { nestedWire } from "../model-api/cache-affinity-canonical.test-fixtures.js";
 
 /**
  * Drift and overlay contract for the generated MCP input schemas (#117).
@@ -515,4 +516,15 @@ describe("manifest size stays within MCP client limits", () => {
   it("the argument size bound is unchanged", () => {
     expect(MCP_TOOL_INPUT_MAX_BYTES).toBe(64 * 1024);
   });
+});
+
+it.each([256, 257, 10_000])("R3 MCP diagnostic argument acceptance depth %s", async (depth) => {
+  const tool = MCP_TOOL_MANIFEST.find((item) => item.name === "forwarder_chat_completion_test")!;
+  const input = JSON.parse(
+    `{"model":"model","messages":[],"confirm":"RUN","extension":${nestedWire(depth - 1, "object")}}`,
+  );
+  const result = await tool.inputSchema["~standard"].validate(input);
+  expect(result.issues === undefined).toBe(depth === 256);
+  if (result.issues)
+    expect(result.issues).toMatchObject([{ message: "request JSON nesting exceeds 256 levels" }]);
 });

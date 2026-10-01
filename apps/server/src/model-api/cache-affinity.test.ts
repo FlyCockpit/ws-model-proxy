@@ -1,6 +1,30 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  canonicalKeys,
+  canonicalLocations,
+  canonicalPayloadWire,
+  canonicalShapes,
+  depthPayloadWire,
+  depthRows,
+  instructionPlacementRows,
+  numericOverflowPayload,
+  numericOverflowRows,
+  orderedHistoryPayload,
+} from "./cache-affinity-canonical.test-fixtures.js";
+import {
+  extractAffinityLayers,
+  type JsonValue,
+  MAX_CANONICAL_DEPTH,
+} from "./cache-affinity-layers.js";
+
 const db = vi.hoisted(() => ({
+  cacheAffinityNode: {
+    findFirst: vi.fn(),
+    findMany: vi.fn(),
+    deleteMany: vi.fn(),
+    updateMany: vi.fn(),
+  },
   cacheAffinityRecord: {
     findMany: vi.fn(),
     findFirst: vi.fn(),
@@ -17,18 +41,29 @@ const db = vi.hoisted(() => ({
   $executeRaw: vi.fn(),
 }));
 
-vi.mock("@ws-model-proxy/db", () => ({ default: db }));
+vi.mock("@ws-model-proxy/db", async () => ({
+  Prisma: (await import("../../../../packages/db/prisma/generated/client")).Prisma,
+  default: db,
+}));
+const contextEstimator = vi.hoisted(() => vi.fn());
+vi.mock("./capacity/context.js", () => ({ countSerializedRequestContext: contextEstimator }));
+
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: { BETTER_AUTH_SECRET: "test-better-auth-secret-at-least-32-bytes" },
 }));
 
 import {
+  AFFINITY_EXPIRY_BATCH,
+  AFFINITY_TRANSACTION_LIMITS,
   type AffinityTarget,
   affinityPrefixDigests,
   buildAffinityTargetIdentity,
-  continuedSessionKey,
+  buildCanonicalRequest,
+  extractClientConversationId,
+  FREE_SAMPLING_PARAMS,
   rankAffinityTargets,
   rememberAffinity,
+  resolveAffinitySession,
   sweepExpiredAffinity,
 } from "./cache-affinity.js";
 
@@ -87,9 +122,9 @@ const affinityRow = ({
   prefixDigest = null as string | null,
   prefixDepth = 0,
   conversationDigest = null as string | null,
-  digestVersion = 4,
+  digestVersion = 5,
   engineCacheConfirmed = false,
-  sessionId = null as string | null,
+  sessionId = "test-session",
   lastUsedAt = new Date("2026-08-25T11:59:00.000Z"),
 }: {
   target: ReturnType<typeof target>;
@@ -99,7 +134,7 @@ const affinityRow = ({
   conversationDigest?: string | null;
   digestVersion?: number;
   engineCacheConfirmed?: boolean;
-  sessionId?: string | null;
+  sessionId?: string;
   lastUsedAt?: Date;
 }) => ({
   id: `record-${prefixDigest ?? conversationDigest}`,
@@ -115,6 +150,52 @@ const affinityRow = ({
   engineCacheConfirmed,
 });
 
+// Decode only the SQL write seam; PostgreSQL tests verify actual conflict updates.
+function conversationWrites() {
+  return db.$executeRaw.mock.calls.flatMap(([query, ...values]) => {
+    const sql = (query.strings ?? query).join("");
+    if (!sql.includes('WHERE "conversationDigest" IS NOT NULL AND "prefixDigest" IS NULL'))
+      return [];
+    return [
+      {
+        sql,
+        data: {
+          userId: values[1],
+          tenantUserId: values[2],
+          poolId: values[3],
+          executionTargetId: values[4],
+          targetIdentity: values[5],
+          bindingDigest: values[6],
+          prefixDigest: null,
+          conversationDigest: values[7],
+          sessionId: values[8],
+          prefixDepth: 0,
+          digestVersion: values[9],
+          estimatedTokens: values[10],
+          engineCacheConfirmed: values[11],
+          lastUsedAt: values[12] as Date,
+          expiresAt: values[13] as Date,
+        },
+        engineEvidence: values[14],
+      },
+    ];
+  });
+}
+
+function mockRetentionRows(
+  rows: { id: string; sessionId: string; prefixDigest: string | null; expiresAt: Date }[],
+) {
+  db.$queryRaw.mockImplementation((query) =>
+    Promise.resolve(
+      (query.strings ?? query).join("").includes("FROM cache_affinity_record")
+        ? rows
+        : (query.strings ?? query).join("").includes("cache_affinity_node")
+          ? []
+          : [{ acquired: true }],
+    ),
+  );
+}
+
 const cap8 = (affinityTarget: ReturnType<typeof target>) => ({
   ...affinityTarget,
   hardConcurrencyLimit: 8,
@@ -124,7 +205,17 @@ describe("cache affinity", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     db.$transaction.mockImplementation((callback) => callback(db));
-    db.$queryRaw.mockResolvedValue([{ acquired: true }]);
+    db.$queryRaw.mockImplementation((query) =>
+      Promise.resolve(
+        (query.strings ?? query).join("").includes("cache_affinity_node")
+          ? []
+          : [{ acquired: true }],
+      ),
+    );
+    db.cacheAffinityNode.findMany.mockResolvedValue([]);
+    db.cacheAffinityNode.findFirst.mockResolvedValue(null);
+    db.cacheAffinityNode.deleteMany.mockResolvedValue({ count: 0 });
+    db.cacheAffinityNode.updateMany.mockResolvedValue({ count: 0 });
     db.modelPool.findFirst.mockResolvedValue({ id: "pool" });
     db.cacheAffinityRecord.findMany.mockResolvedValue([]);
     db.cacheAffinityRecord.findFirst.mockResolvedValue(null);
@@ -134,19 +225,456 @@ describe("cache affinity", () => {
     db.capacityWaiter.groupBy.mockResolvedValue([]);
   });
 
+  const clientUuid = "11111111-2222-4333-8444-555555555555";
+  const carriers: { body: Record<string, unknown>; header?: string; surface?: string }[] = [
+    { body: { conversation: "session" } },
+    { body: { conversation: { id: "session" } } },
+    { body: { conversation_id: "session" } },
+    { body: { conversation_id: { id: "session" } } },
+    { body: { prompt_cache_key: "session" } },
+    ...[
+      "x-conversation-id",
+      "session_id",
+      "session-id",
+      "x-session-id",
+      "x-claude-code-session-id",
+    ].map((header) => ({ body: {}, header })),
+  ];
+  it.each(carriers)(
+    "client carrier %# is normalized to one identity",
+    ({ body, header, surface }) => {
+      const headers = header ? new Headers({ [header]: "  session  " }) : undefined;
+      expect(extractClientConversationId(headers, body, surface ?? "OPENAI_RESPONSES")).toBe(
+        "session",
+      );
+      const args = digestArgs("runtime", { input: "same", ...body }, "OPENAI_RESPONSES");
+      expect(affinityPrefixDigests({ ...args, headers }).clientSessionId).toBe(
+        affinityPrefixDigests({ ...args, payload: { input: "same", conversation: "session" } })
+          .clientSessionId,
+      );
+      expect(affinityPrefixDigests({ ...args, headers }).rootDigest).toBe(
+        affinityPrefixDigests({ ...args, payload: { input: "same" } }).rootDigest,
+      );
+    },
+  );
+
+  it.each(["", "   ", "x".repeat(257), "bad space", "bad#id", 17, null, [], {}, { nope: "x" }])(
+    "ignores malformed client id %# and falls through to the next valid carrier",
+    (conversation) => {
+      expect(
+        extractClientConversationId(undefined, { conversation }, "openai-chat"),
+      ).toBeUndefined();
+      expect(
+        extractClientConversationId(
+          new Headers({ "session-id": "valid" }),
+          { conversation },
+          "openai-chat",
+        ),
+      ).toBe("valid");
+      const base = digestArgs("runtime", { messages: [{ role: "user", content: "hello" }] });
+      const material = affinityPrefixDigests({
+        ...base,
+        payload: { ...base.payload, conversation },
+      });
+      expect(material.clientSessionId).toBeUndefined();
+      expect(material.rootDigest).not.toBe(affinityPrefixDigests(base).rootDigest);
+      expect(material.nodes).not.toEqual(affinityPrefixDigests(base).nodes);
+    },
+  );
+
+  it("accepts the charset and 256-character bound after trimming", () => {
+    expect(
+      extractClientConversationId(undefined, { conversation: "  AZaz09._:/@=+-  " }, "openai-chat"),
+    ).toBe("AZaz09._:/@=+-");
+    expect(
+      extractClientConversationId(undefined, { conversation: "x".repeat(256) }, "openai-chat"),
+    ).toHaveLength(256);
+  });
+
+  const precedence = [
+    "conversation",
+    "conversation_id",
+    "prompt_cache_key",
+    "x-conversation-id",
+    "session_id",
+    "session-id",
+    "x-session-id",
+    "x-claude-code-session-id",
+  ];
+  it.each(precedence.map((name, i) => [name, i] as const))(
+    "first valid carrier wins: %s",
+    (_, i) => {
+      const body = Object.fromEntries(
+        precedence.slice(0, 3).map((name, j) => [name, j < i ? "bad id" : name]),
+      );
+      const headers = new Headers(
+        Object.fromEntries(
+          precedence.slice(3).map((name, j) => [name, j + 3 < i ? "bad id" : name]),
+        ),
+      );
+      expect(extractClientConversationId(headers, body, "openai-chat")).toBe(precedence[i]);
+    },
+  );
+
+  it("Anthropic metadata accepts only an embedded session UUID, after all other carriers", () => {
+    const metadata = { user_id: `user_account_session_${clientUuid}` };
+    expect(extractClientConversationId(undefined, { metadata }, "ANTHROPIC_MESSAGES")).toBe(
+      clientUuid,
+    );
+    expect(
+      extractClientConversationId(
+        new Headers({ "x-session-id": "header" }),
+        { metadata },
+        "anthropic-messages",
+      ),
+    ).toBe("header");
+    for (const user_id of [
+      "account",
+      clientUuid,
+      `user_session_${clientUuid}suffix`,
+      "user_session_not-a-uuid",
+      { id: clientUuid },
+    ]) {
+      expect(
+        extractClientConversationId(undefined, { metadata: { user_id } }, "anthropic-messages"),
+      ).toBeUndefined();
+    }
+    expect(
+      extractClientConversationId(undefined, { metadata }, "openai-responses"),
+    ).toBeUndefined();
+    expect(
+      extractClientConversationId(undefined, { prompt_cache_key: "key" }, "anthropic-messages"),
+    ).toBeUndefined();
+  });
+
+  it("client id overrides native lineage and never probes nodes; transaction waits are bounded", async () => {
+    const servedTarget = target("native", "runtime");
+    const args = {
+      ...digestArgs("runtime", { input: "start", conversation: "client" }, "openai-responses"),
+      policy,
+      target: servedTarget,
+      estimatedTokens: 20000,
+    };
+    const parent = await rememberAffinity(args);
+    const continued = await rememberAffinity({
+      ...args,
+      payload: { input: "delta", previous_response_id: "response", conversation: "other-client" },
+      sessionBinding: parent!,
+      estimatedTokens: undefined,
+      estimatedDeltaTokens: 100,
+    });
+    expect(continued?.sessionId).not.toBe(parent?.sessionId);
+    expect(continued?.estimatedTokens).toBe(20100);
+    expect(db.cacheAffinityNode.findFirst).not.toHaveBeenCalled();
+    expect(db.$transaction).toHaveBeenLastCalledWith(
+      expect.any(Function),
+      AFFINITY_TRANSACTION_LIMITS,
+    );
+    expect(JSON.stringify(db.$executeRaw.mock.calls)).toContain("lock_timeout");
+  });
+
+  it("15.4 pins the transaction options actually passed to the writer", async () => {
+    await rememberAffinity({
+      ...digestArgs("runtime", payload),
+      policy,
+      target: target("target", "runtime"),
+    });
+    expect(AFFINITY_TRANSACTION_LIMITS).toEqual({ maxWait: 2000, timeout: 2500 });
+    expect(db.$transaction.mock.calls[0]?.[1]).toEqual({ maxWait: 2000, timeout: 2500 });
+  });
+
+  it.each(["openai-chat", "anthropic-messages", "openai-responses"])(
+    "14.5 %s starter matching a stored tip scores zero conversation prefix depth",
+    async (surface) => {
+      const request =
+        surface === "openai-responses"
+          ? { input: "starter" }
+          : { messages: [{ role: "user", content: "starter" }] };
+      const material = affinityPrefixDigests(digestArgs("runtime", request, surface));
+      const served = target("target", "runtime");
+      db.cacheAffinityRecord.findMany.mockResolvedValue([
+        affinityRow({
+          target: served,
+          material,
+          prefixDigest: material.digests[0]!,
+          prefixDepth: 1,
+        }),
+      ]);
+      const rank = await rankAffinityTargets({
+        ...digestArgs("runtime", request, surface),
+        policy,
+        targets: [served],
+        scoreSingleTarget: true,
+      });
+      expect(material.isContinuation).toBe(false);
+      expect(rank.prefixDepths.target).toBe(0);
+      expect(rank.matchedSessionIds).toEqual({});
+    },
+  );
+
+  it.each([undefined, null, 42, { id: "parent" }])(
+    "13.6 non-string previous_response_id %j never honors a server binding",
+    (previous_response_id) => {
+      const first = affinityPrefixDigests(
+        digestArgs("runtime", { input: "create" }, "openai-responses"),
+      );
+      const binding = {
+        sessionId: "server-session",
+        bindingDigest: first.bindingDigest,
+        rootDigest: first.rootDigest,
+        tipDigest: first.nodes[0]!.digest,
+        tipDepth: 1,
+        canonicalBytes: first.canonicalBytes,
+      };
+      const next = affinityPrefixDigests({
+        ...digestArgs("runtime", { input: "delta", previous_response_id }, "openai-responses"),
+        sessionBinding: binding,
+      });
+      expect(next.boundSessionId).toBeUndefined();
+      expect(next.parentTipDigest).toBeUndefined();
+      expect(next.nodes[0]!.depth).toBe(1);
+    },
+  );
+
+  it.each(["root", "unit"].flatMap((kind) => [0, 1].map((extra) => ({ kind, extra }))))(
+    "12.2/12.4 $kind canonical bytes cap + $extra is exact",
+    ({ kind, extra }) => {
+      const base = kind === "root" ? { instructions: "x", input: [] } : { input: "x" };
+      const first = affinityPrefixDigests(digestArgs("runtime", base, "openai-responses"));
+      const text = "x".repeat(2 * 1024 * 1024 - first.canonicalBytes + 1 + extra);
+      const request = kind === "root" ? { instructions: text, input: [] } : { input: text };
+      const material = affinityPrefixDigests(digestArgs("runtime", request, "openai-responses"));
+      expect(material.canonicalBytes).toBe(2 * 1024 * 1024 + extra);
+      expect(material.identifiable).toBe(extra === 0);
+      expect(material.nodes.length).toBe(extra || kind === "root" ? 0 : 1);
+    },
+  );
+
+  it.each([2, 8192, 100000])(
+    "R5 identity with %i small object keys is identifiable at cap and refused at cap+1",
+    (count) => {
+      const cap = 2 * 1024 * 1024;
+      const extension = {
+        ...Object.fromEntries(Array.from({ length: count }, (_, i) => [`k${i}`, 0])),
+        padding: "",
+      };
+      const payload = { extension, input: "U" };
+      const initial = affinityPrefixDigests(digestArgs("runtime", payload, "openai-responses"));
+      const bytes =
+        Buffer.byteLength(
+          JSON.stringify({
+            bindingDigest: "x".repeat(43),
+            instructions: [],
+            parameters: { extension },
+            tools: null,
+          }),
+        ) + Buffer.byteLength(JSON.stringify(payload.input));
+      expect(initial.canonicalBytes).toBe(bytes);
+      extension.padding = "x".repeat(cap - bytes);
+      const atCap = affinityPrefixDigests(digestArgs("runtime", payload, "openai-responses"));
+      expect(atCap.canonicalBytes).toBe(cap);
+      expect(atCap.identifiable).toBe(true);
+      expect(atCap.nodes).toHaveLength(1);
+      const overCap = affinityPrefixDigests(
+        digestArgs(
+          "runtime",
+          { extension: { ...extension, padding: `${extension.padding}x` }, input: "U" },
+          "openai-responses",
+        ),
+      );
+      expect(overCap.canonicalBytes).toBe(cap + 1);
+      expect(overCap.identifiable).toBe(false);
+      expect(overCap.nodes).toEqual([]);
+      expect(overCap.parentTipDigest).toBeUndefined();
+    },
+  );
+
+  it.each([true, false])(
+    "15.11 evicting the current footprint suppresses binding: client=%s",
+    async (client) => {
+      const request = { input: "starter", ...(client ? { conversation: "client" } : {}) };
+      db.$queryRaw.mockImplementation((query) => {
+        const sql = (query.strings ?? query).join("");
+        if (sql.includes("FROM cache_affinity_record")) {
+          const footprint = conversationWrites()[0]!.data;
+          return Promise.resolve([
+            {
+              id: "evicted-current",
+              sessionId: footprint.sessionId,
+              prefixDigest: null,
+              expiresAt: new Date("2100-01-01"),
+            },
+          ]);
+        }
+        return Promise.resolve([{ acquired: true }]);
+      });
+      expect(
+        await rememberAffinity({
+          ...digestArgs("runtime", request, "openai-responses"),
+          policy: { ...policy, maxRecords: 1 },
+          target: target("target", "runtime"),
+        }),
+      ).toBeNull();
+    },
+  );
+
+  it("bound native delta uses the caller estimate and carries the parent size for empty input", async () => {
+    const args = {
+      ...digestArgs("runtime", { input: "start", conversation: "client" }, "openai-responses"),
+      policy,
+      target: target("native", "runtime"),
+    };
+    const parent = await rememberAffinity({ ...args, estimatedTokens: 20000 });
+    const next = await rememberAffinity({
+      ...args,
+      payload: { input: "delta", previous_response_id: "response", conversation: "client" },
+      sessionBinding: parent!,
+      estimatedDeltaTokens: 10,
+    });
+    expect(next!.estimatedTokens).toBe(20010);
+    const empty = await rememberAffinity({
+      ...args,
+      payload: { previous_response_id: "next-response", conversation: "client" },
+      sessionBinding: next!,
+    });
+    expect(empty!.estimatedTokens).toBe(next!.estimatedTokens);
+    expect(empty!.tipDigest).toBe(next!.tipDigest);
+  });
+
+  it.each([128 * 1024, 512 * 1024])(
+    "C2-6 completion never tokenizes a %i-byte bound delta",
+    async (size) => {
+      const args = {
+        ...digestArgs("runtime", { input: "create", conversation: "client" }, "openai-responses"),
+        policy,
+        target: target("native", "runtime"),
+      };
+      const parent = await rememberAffinity({ ...args, estimatedTokens: 20000 });
+      contextEstimator.mockImplementation(() => {
+        throw new Error("EOF estimator must not run");
+      });
+      const start = performance.now();
+      const next = await rememberAffinity({
+        ...args,
+        payload: {
+          input: "d".repeat(size),
+          conversation: "client",
+          previous_response_id: "parent",
+        },
+        sessionBinding: parent!,
+      });
+      expect(next?.estimatedTokens).toBe(20000);
+      expect(contextEstimator).not.toHaveBeenCalled();
+      expect(performance.now() - start).toBeLessThan(AFFINITY_TRANSACTION_LIMITS.timeout);
+    },
+  );
+
+  it.each(["missing", "expired", "wrong scope", "changed root"])(
+    "AC-75 client id with %s Responses parent publishes no delta nodes",
+    async (state) => {
+      const args = {
+        ...digestArgs("runtime", { input: "create", conversation: "client" }, "openai-responses"),
+        policy,
+        target: target("native", "runtime"),
+      };
+      const parent = await rememberAffinity(args);
+      vi.clearAllMocks();
+      const request = {
+        ...args,
+        payload: {
+          input: "delta",
+          conversation: "client",
+          previous_response_id: "parent",
+          ...(state === "changed root" ? { instructions: "new" } : {}),
+        },
+        sessionBinding:
+          state === "wrong scope"
+            ? { ...parent!, bindingDigest: "other" }
+            : state === "changed root"
+              ? parent!
+              : undefined,
+      };
+      const material = affinityPrefixDigests({
+        ...request,
+        runtimeIdentity: args.target.targetIdentity,
+      });
+      expect(material.missingParent).toBe(true);
+      expect(material.identifiable).toBe(false);
+      expect(material.nodes).toEqual([]);
+      expect(
+        await resolveAffinitySession(
+          db,
+          {
+            userId: "owner",
+            tenantUserId: "owner",
+            poolId: "pool",
+            executionTargetId: "native",
+          },
+          material,
+          new Date(),
+        ),
+      ).toBe(parent!.sessionId);
+      expect(await rememberAffinity(request)).toBeNull();
+      expect(
+        db.cacheAffinityRecord.upsert.mock.calls.map(([input]) => input.create.prefixDigest),
+      ).toEqual(material.instructionDigests);
+      const nodeInserts = db.$executeRaw.mock.calls.filter(([query]) =>
+        (query.strings ?? query).join("").includes("INSERT INTO cache_affinity_node"),
+      );
+      expect(nodeInserts).toEqual([]);
+      expect(db.cacheAffinityNode.deleteMany).not.toHaveBeenCalled();
+      expect(db.cacheAffinityNode.updateMany).not.toHaveBeenCalled();
+      expect(conversationWrites()).toContainEqual(
+        expect.objectContaining({
+          data: expect.objectContaining({ sessionId: parent!.sessionId }),
+        }),
+      );
+    },
+  );
+
+  it.each(["cache_affinity_record", "cache_affinity_node"])(
+    "completion expiry cleanup for %s is an indexed batch",
+    async (table) => {
+      await rememberAffinity({
+        ...digestArgs("runtime", payload),
+        policy,
+        target: target("target", "runtime"),
+      });
+      const calls = db.$executeRaw.mock.calls.filter(([query]) =>
+        (query.strings ?? query).join("").includes(`DELETE FROM ${table} WHERE id = ANY(ARRAY(`),
+      );
+      expect(calls).toHaveLength(1);
+      const [query, ...values] = calls[0]!;
+      expect(query.join("")).toContain(
+        'ORDER BY "userId", "tenantUserId", "poolId", "expiresAt" LIMIT',
+      );
+      expect(values.at(-1)).toBe(AFFINITY_EXPIRY_BATCH);
+      expect(AFFINITY_EXPIRY_BATCH).toBe(200);
+    },
+  );
+
   it.each(["bound", "mismatched", "default", "forged", "disabled", "deleted pool"] as const)(
     "C1a-2 writer binding: %s",
     async (state) => {
       const servedTarget = target("native", "native-runtime");
       const args = {
-        ...digestArgs(servedTarget.targetIdentity, { input: "next only" }, "OPENAI_RESPONSES"),
+        ...digestArgs(
+          servedTarget.targetIdentity,
+          { input: "next only", previous_response_id: "parent" },
+          "OPENAI_RESPONSES",
+        ),
         policy: { ...policy, enabled: state !== "disabled" },
         target: servedTarget,
       };
       const bindingDigest = affinityPrefixDigests(args).bindingDigest;
+      db.cacheAffinityNode.findFirst.mockResolvedValue({ sessionId: "durable-session" });
       const sessionBinding =
         state === "bound" || state === "mismatched"
           ? {
+              rootDigest: affinityPrefixDigests(args).rootDigest,
+              tipDigest: "p".repeat(43),
+              tipDepth: 1,
+              canonicalBytes: 100,
               sessionId: "durable-session",
               bindingDigest: state === "bound" ? bindingDigest : "wrong-scope",
             }
@@ -171,18 +699,33 @@ describe("cache affinity", () => {
         expect(db.cacheAffinityRecord.upsert).not.toHaveBeenCalled();
         return;
       }
-      expect(binding).toEqual({ sessionId: expect.any(String), bindingDigest });
+      if (state !== "bound") {
+        expect(binding).toBeNull();
+        expect(db.cacheAffinityRecord.upsert).not.toHaveBeenCalled();
+        return;
+      }
+      expect(binding).toMatchObject({ sessionId: expect.any(String), bindingDigest });
       if (state === "bound") expect(binding?.sessionId).toBe("durable-session");
       else {
         expect(binding?.sessionId).not.toBe("durable-session");
         expect(binding?.sessionId).not.toBe("forged-session");
       }
-      expect(db.cacheAffinityRecord.upsert).toHaveBeenCalledWith(
-        expect.objectContaining({
-          create: expect.objectContaining({ sessionId: binding?.sessionId }),
-          update: expect.objectContaining({ sessionId: binding?.sessionId }),
-        }),
-      );
+      if (state === "bound")
+        expect(db.cacheAffinityRecord.upsert).toHaveBeenCalledWith(
+          expect.objectContaining({
+            create: expect.objectContaining({ sessionId: binding?.sessionId }),
+            update: expect.objectContaining({ sessionId: binding?.sessionId }),
+          }),
+        );
+      else {
+        expect(db.cacheAffinityRecord.upsert).not.toHaveBeenCalled();
+        expect(binding!.tipDigest).toBe("");
+        expect(conversationWrites()).toContainEqual(
+          expect.objectContaining({
+            data: expect.objectContaining({ sessionId: binding!.sessionId }),
+          }),
+        );
+      }
     },
   );
 
@@ -218,7 +761,7 @@ describe("cache affinity", () => {
       digest({ payload: turns }),
     );
     expect(digest({ payload: { ...payload, tools: [] } })).not.toBe(baseline);
-    expect(digest({ payload: { ...payload, temperature: 0.3 } })).not.toBe(baseline);
+    expect(digest({ payload: { ...payload, temperature: 0.3 } })).toBe(baseline);
     expect(digest({ payload: { ...payload, vendor_extension: { mode: "different" } } })).not.toBe(
       baseline,
     );
@@ -248,7 +791,7 @@ describe("cache affinity", () => {
     expect(first.digests[0]).not.toContain("private input");
   });
 
-  it("keeps explicit conversation identity stable across turns while exact prefixes change", () => {
+  it("binds explicit conversation routing hints to the root", () => {
     const digest = (requestPayload: Record<string, unknown>) =>
       affinityPrefixDigests({
         ownerId: "tenant",
@@ -274,7 +817,7 @@ describe("cache affinity", () => {
       tools: [{ name: "second-tool" }],
       temperature: 0.9,
     });
-    expect(second.conversationDigest).toBe(first.conversationDigest);
+    expect(second.conversationDigest).not.toBe(first.conversationDigest);
     expect(second.bindingDigest).toBe(first.bindingDigest);
     expect(second.digests).not.toEqual(first.digests);
     expect(first.conversationDigest).not.toContain("conversation-secret");
@@ -314,17 +857,19 @@ describe("cache affinity", () => {
       target: target("target", "runtime"),
     });
     expect(db.cacheAffinityRecord.upsert).not.toHaveBeenCalled();
-    expect(db.cacheAffinityRecord.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        prefixDigest: null,
-        prefixDepth: 0,
-        digestVersion: 4,
-        conversationDigest: expect.any(String),
+    expect(conversationWrites()).toContainEqual(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          prefixDigest: null,
+          prefixDepth: 0,
+          digestVersion: 5,
+          conversationDigest: expect.any(String),
+        }),
       }),
-    });
+    );
   });
 
-  it("ranks a prior explicit conversation after content and sampling fields change", async () => {
+  it("does not rank explicit conversation hints across changed instructions/tools", async () => {
     const selected = target("target-a", "runtime-a");
     const prior = affinityPrefixDigests({
       ownerId: "tenant",
@@ -343,7 +888,7 @@ describe("cache affinity", () => {
         prefixDigest: null,
         conversationDigest: prior.conversationDigest,
         prefixDepth: 0,
-        digestVersion: 4,
+        digestVersion: 5,
         engineCacheConfirmed: false,
       },
     ]);
@@ -363,8 +908,8 @@ describe("cache affinity", () => {
       },
       targets: [target("target-b", "runtime-b"), selected],
     });
-    expect(ranked.orderedTargetIds[0]).toBe(selected.executionTargetId);
-    expect(ranked.conversationMatches[selected.executionTargetId]).toBe(true);
+    expect(ranked.orderedTargetIds[0]).toBe("target-b");
+    expect(ranked.conversationMatches[selected.executionTargetId]).toBe(false);
     expect(ranked.prefixDepths[selected.executionTargetId]).toBe(0);
   });
 
@@ -470,7 +1015,7 @@ describe("cache affinity", () => {
         prefixDigest: a.digests[0],
         conversationDigest: null,
         prefixDepth: 1,
-        digestVersion: 4,
+        digestVersion: 5,
         engineCacheConfirmed: false,
       },
       {
@@ -480,7 +1025,7 @@ describe("cache affinity", () => {
         prefixDigest: b.digests[1],
         conversationDigest: null,
         prefixDepth: 2,
-        digestVersion: 4,
+        digestVersion: 5,
         engineCacheConfirmed: false,
       },
     ]);
@@ -535,7 +1080,7 @@ describe("cache affinity", () => {
       prefixDigest,
       conversationDigest: null,
       prefixDepth,
-      digestVersion: 4,
+      digestVersion: 5,
       engineCacheConfirmed: false,
       estimatedTokens,
     });
@@ -615,7 +1160,7 @@ describe("cache affinity", () => {
         input.create.lastUsedAt,
         input.update.lastUsedAt,
       ]),
-      ...db.cacheAffinityRecord.create.mock.calls.map(([input]) => input.data.lastUsedAt),
+      ...conversationWrites().map(({ data }) => data.lastUsedAt),
     ];
     expect(stamps.length).toBeGreaterThan(2);
     expect(new Set(stamps.map((stamp: Date | undefined) => stamp?.getTime()))).toEqual(
@@ -641,15 +1186,15 @@ describe("cache affinity", () => {
       estimatedTokens: 12_000,
       now,
     });
-    // The conversation record exists: this call must refresh it, not recreate it.
-    expect(db.cacheAffinityRecord.create).not.toHaveBeenCalled();
-    expect(db.cacheAffinityRecord.update).toHaveBeenCalled();
+    expect(db.cacheAffinityRecord.findFirst).not.toHaveBeenCalled();
+    for (const { sql } of conversationWrites())
+      expect(sql).toContain('DO UPDATE SET "lastUsedAt" = EXCLUDED."lastUsedAt"');
     const stamps = [
       ...db.cacheAffinityRecord.upsert.mock.calls.flatMap(([input]) => [
         input.create.lastUsedAt,
         input.update.lastUsedAt,
       ]),
-      ...db.cacheAffinityRecord.update.mock.calls.map(([input]) => input.data.lastUsedAt),
+      ...conversationWrites().map(({ data }) => data.lastUsedAt),
     ];
     expect(stamps.length).toBeGreaterThan(0);
     expect(new Set(stamps.map((stamp: Date | undefined) => stamp?.getTime()))).toEqual(
@@ -657,253 +1202,83 @@ describe("cache affinity", () => {
     );
   });
 
-  describe("warm-session identity (S-C)", () => {
-    const at = (seconds: number) => new Date(Date.UTC(2026, 7, 25, 12, 0, 0) - seconds * 1000);
-    const record = (
-      id: string,
-      sessionId: string | null,
-      shape: { prefixDigest?: string; conversationDigest?: string },
-      lastUsedAt = at(10),
-    ) => ({
-      id,
-      sessionId,
-      prefixDigest: shape.prefixDigest ?? null,
-      conversationDigest: shape.conversationDigest ?? null,
-      lastUsedAt,
-    });
-    const request = (overrides: Partial<Parameters<typeof continuedSessionKey>[1]> = {}) => ({
-      conversationDigest: null,
-      isContinuation: true,
-      digests: ["d1", "d2", "d3"],
-      ...overrides,
-    });
-    // Each row names which session a request joins (null = starts a new one).
-    const cases: {
-      name: string;
-      records: ReturnType<typeof record>[];
-      request: ReturnType<typeof request>;
-      expected: string | null;
-    }[] = [
-      { name: "no records: a new session", records: [], request: request(), expected: null },
-      {
-        name: "the deepest prefix the history still contains",
-        records: [
-          record("r1", "S1", { prefixDigest: "d1" }),
-          record("r2", "S2", { prefixDigest: "d2" }),
-        ],
-        request: request(),
-        expected: "S2",
-      },
-      {
-        name: "an edited history keeps its shared earlier prefix",
-        records: [
-          record("r1", "S1", { prefixDigest: "d1" }),
-          record("old", "S1", { prefixDigest: "old-tail" }),
-        ],
-        request: request({ digests: ["d1", "edited2"] }),
-        expected: "S1",
-      },
-      {
-        name: "a shortened history matches the prefix it still holds",
-        records: [
-          record("r1", "S1", { prefixDigest: "d1" }),
-          record("r3", "S1", { prefixDigest: "d3" }),
-          record("r5", "S1", { prefixDigest: "d5" }),
-        ],
-        request: request({ digests: ["d1", "d2", "d3"] }),
-        expected: "S1",
-      },
-      {
-        name: "equal depth: the most recently used session",
-        records: [
-          record("a", "S-old", { prefixDigest: "d2" }, at(100)),
-          record("b", "S-new", { prefixDigest: "d2" }, at(5)),
-        ],
-        request: request(),
-        expected: "S-new",
-      },
-      {
-        name: "the explicit conversation's record beats a deeper prefix",
-        records: [
-          record("c", "S-conv", { conversationDigest: "conv" }),
-          record("p", "S-prefix", { prefixDigest: "d3" }),
-        ],
-        request: request({ conversationDigest: "conv" }),
-        expected: "S-conv",
-      },
-      {
-        name: "an explicit conversation is the session even for a non-continuation",
-        records: [record("c", "S-conv", { conversationDigest: "conv" })],
-        request: request({ conversationDigest: "conv", isContinuation: false }),
-        expected: "S-conv",
-      },
-      {
-        name: "another conversation's record never links",
-        records: [record("c", "S-other", { conversationDigest: "other" })],
-        request: request({ conversationDigest: "conv", isContinuation: false }),
-        expected: null,
-      },
-      {
-        name: "a fresh (non-continuation) request never links by prefix",
-        records: [record("r1", "S1", { prefixDigest: "d1" })],
-        request: request({ isContinuation: false }),
-        expected: null,
-      },
-      {
-        name: "instruction-only overlap is not conversation evidence",
-        records: [record("i", "S-instr", { prefixDigest: "instruction-1" })],
-        request: request(),
-        expected: null,
-      },
-      {
-        name: "a row from before session ids stands for itself by its own id",
-        records: [record("legacy-row", null, { prefixDigest: "d2" })],
-        request: request(),
-        expected: "legacy-row",
-      },
-    ];
-    it.each(cases)("$name", ({ records, request: input, expected }) => {
-      expect(continuedSessionKey(records, input)).toBe(expected);
-    });
-
-    const writeInputs = {
-      ownerId: "tenant",
-      resourceOwnerId: "pool-owner",
+  describe("warm-session identity (#160)", () => {
+    const now = new Date("2026-09-30T12:00:00Z");
+    const scope = {
+      userId: "owner",
+      tenantUserId: "owner",
       poolId: "pool",
-      securityScope: "token",
-      policy,
-      surface: "OPENAI_CHAT_COMPLETIONS",
-      target: target("target", "runtime"),
-      estimatedTokens: 12_000,
+      executionTargetId: "target",
     };
-    const turn = (messages: unknown[]) => ({
-      messages: [{ role: "system", content: "rules" }, ...messages],
+    const material = affinityPrefixDigests(
+      digestArgs("runtime", {
+        messages: [
+          { role: "user", content: "hello" },
+          { role: "assistant", content: "hi" },
+        ],
+      }),
+    );
+    it.each([
+      { name: "none", replies: [[]], expected: null },
+      { name: "tip", replies: [[{ sessionId: "tip" }]], expected: "tip" },
+      { name: "sole ancestor", replies: [[{ sessionId: "sole" }]], expected: "sole" },
+      {
+        name: "ambiguous deepest ancestor never falls back",
+        replies: [[{ sessionId: null }]],
+        expected: null,
+      },
+    ])("$name", async ({ replies, expected }) => {
+      db.$queryRaw.mockReset();
+      for (const reply of replies) db.$queryRaw.mockResolvedValueOnce(reply);
+      expect(await resolveAffinitySession(db, scope, material, now)).toBe(expected);
+      for (const [query, ...values] of db.$queryRaw.mock.calls) {
+        expect((query.strings ?? query).join("")).toContain('"expiresAt", "sessionId"\n    LIMIT');
+        expect(query.values ?? values).toContain(2);
+        expect((query.values ?? values).length).toBeGreaterThan(0);
+      }
     });
-    const stampedSessions = () => [
-      ...db.cacheAffinityRecord.upsert.mock.calls.flatMap(([input]) => [
-        input.create.sessionId,
-        input.update.sessionId,
-      ]),
-      ...db.cacheAffinityRecord.create.mock.calls.map(([input]) => input.data.sessionId),
-      ...db.cacheAffinityRecord.update.mock.calls.map(([input]) => input.data.sessionId),
-    ];
-
-    it("a new conversation gets one fresh session id on every record it writes", async () => {
-      await rememberAffinity({
-        ...writeInputs,
-        payload: turn([{ role: "user", content: "hello" }]),
-      });
-      const stamped = new Set(stampedSessions());
-      expect(stamped.size).toBe(1);
-      expect([...stamped][0]).toMatch(/^[0-9a-f-]{36}$/);
+    it.each(["root-only", "over cap", "missing parent"])("%s never probes", async (state) => {
+      const input = {
+        ...material,
+        ...(state === "root-only"
+          ? { nodes: [] }
+          : state === "over cap"
+            ? { identifiable: false }
+            : { missingParent: true }),
+      };
+      expect(await resolveAffinitySession(db, scope, input, now)).toBeNull();
+      expect(db.$queryRaw).not.toHaveBeenCalled();
     });
-
-    it("a continuation stamps the session of the prefix an edited history still shares", async () => {
-      const first = [{ role: "user", content: "hello" }];
-      const second = [
-        ...first,
-        { role: "assistant", content: "hi" },
-        { role: "user", content: "and now" },
-      ];
-      const material = (messages: unknown[]) =>
-        affinityPrefixDigests({
-          ownerId: "tenant",
-          resourceOwnerId: "pool-owner",
-          poolId: "pool",
-          securityScope: "token",
-          surface: "OPENAI_CHAT_COMPLETIONS",
-          payload: turn(messages),
-          runtimeIdentity: "runtime",
-        });
-      const previous = material(first);
-      db.cacheAffinityRecord.findMany.mockResolvedValue([
-        {
-          id: "r1",
-          sessionId: "S-prev",
-          prefixDigest: previous.digests[0],
-          conversationDigest: null,
-          lastUsedAt: new Date("2026-08-25T11:59:00.000Z"),
-        },
-      ]);
-      await rememberAffinity({ ...writeInputs, payload: turn(second) });
-      expect(new Set(stampedSessions())).toEqual(new Set(["S-prev"]));
-      // The lookup is bound to this owner, tenant, pool, target and binding.
-      expect(db.cacheAffinityRecord.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: expect.objectContaining({
-            userId: "pool-owner",
-            tenantUserId: "tenant",
-            poolId: "pool",
-            executionTargetId: "target",
-            targetIdentity: "runtime",
-            bindingDigest: material(second).bindingDigest,
-          }),
-        }),
+    it("rank and writer use the same resolver, writer after its fence", async () => {
+      db.$queryRaw.mockImplementation((query) =>
+        Promise.resolve(
+          (query.strings ?? query).join("").includes("cache_affinity_node")
+            ? [{ sessionId: "kept" }]
+            : [{ acquired: true }],
+        ),
       );
-    });
-
-    it("an explicit conversation keeps its session when the parameters change", async () => {
-      const explicit = (temperature: number) => ({
-        conversation: "conv-1",
-        input: "hello",
-        temperature,
-      });
-      const before = affinityPrefixDigests({
-        ownerId: "tenant",
-        resourceOwnerId: "pool-owner",
-        poolId: "pool",
-        securityScope: "token",
-        surface: "OPENAI_RESPONSES",
-        payload: explicit(0.1),
-        runtimeIdentity: "runtime",
-      });
-      db.cacheAffinityRecord.findMany.mockResolvedValue([
-        {
-          id: "c1",
-          sessionId: "S-conv",
-          prefixDigest: null,
-          conversationDigest: before.conversationDigest,
-          lastUsedAt: new Date("2026-08-25T11:59:00.000Z"),
-        },
-      ]);
-      await rememberAffinity({
-        ...writeInputs,
-        surface: "OPENAI_RESPONSES",
-        payload: explicit(0.9),
-      });
-      expect(new Set(stampedSessions())).toEqual(new Set(["S-conv"]));
-    });
-
-    it("ranking reports the session a request continues, per target", async () => {
-      const selected = target("target-a", "runtime-a");
-      const prior = affinityPrefixDigests({
-        ownerId: "tenant",
-        resourceOwnerId: "pool-owner",
-        poolId: "pool",
-        securityScope: "token",
-        surface: "OPENAI_RESPONSES",
-        payload: { conversation: "conversation", input: "first" },
-        runtimeIdentity: selected.targetIdentity,
-      });
-      db.cacheAffinityRecord.findMany.mockResolvedValue([
-        affinityRow({
-          target: selected,
-          material: prior,
-          conversationDigest: prior.conversationDigest,
-          sessionId: "S-conv",
+      const selected = target("target", "runtime");
+      const args = {
+        ...digestArgs("runtime", {
+          messages: [
+            { role: "user", content: "hello" },
+            { role: "assistant", content: "hi" },
+          ],
         }),
-      ]);
-      const decision = await rankAffinityTargets({
-        ownerId: "tenant",
-        resourceOwnerId: "pool-owner",
-        poolId: "pool",
-        securityScope: "token",
         policy,
-        surface: "OPENAI_RESPONSES",
-        payload: { conversation: "conversation", input: "second" },
-        targets: [target("target-b", "runtime-b"), selected],
-      });
-      expect(decision.matchedSessionIds).toEqual({ "target-a": "S-conv" });
+      };
+      expect(
+        (await rankAffinityTargets({ ...args, targets: [selected], scoreSingleTarget: true }))
+          .matchedSessionIds,
+      ).toEqual({ target: "kept" });
+      db.$queryRaw.mockClear();
+      const binding = await rememberAffinity({ ...args, target: selected });
+      expect(binding!.sessionId).toBe("kept");
+      const firstQuery = db.$queryRaw.mock.calls[0]![0];
+      expect((firstQuery.strings ?? firstQuery).join("")).toContain("wsmp_acquire_fences");
+      expect(
+        new Set(db.cacheAffinityRecord.upsert.mock.calls.map(([input]) => input.create.sessionId)),
+      ).toEqual(new Set(["kept"]));
     });
   });
 
@@ -930,7 +1305,7 @@ describe("cache affinity", () => {
         prefixDigest,
         conversationDigest: null,
         prefixDepth: index + 1,
-        digestVersion: 4,
+        digestVersion: 5,
         engineCacheConfirmed: false,
         estimatedTokens: 9_000,
       })),
@@ -950,8 +1325,50 @@ describe("cache affinity", () => {
     expect(ranked.prefixDepths["target-a"]).toBeGreaterThan(0);
   });
 
+  it.each([1000, 10000])(
+    "retention reads a fixed batch after cap %i and leaves expired candidates to the sweeper",
+    async (maxRecords) => {
+      const now = new Date("2030-01-01T00:00:00Z");
+      mockRetentionRows([
+        {
+          id: "expired",
+          sessionId: "expired",
+          prefixDigest: null,
+          expiresAt: new Date(now.getTime() - 1),
+        },
+        {
+          id: "live",
+          sessionId: "live",
+          prefixDigest: null,
+          expiresAt: new Date(now.getTime() + 1),
+        },
+      ]);
+      await rememberAffinity({
+        ...digestArgs("runtime", payload),
+        target: target("target", "runtime"),
+        policy: { ...policy, maxRecords },
+        now,
+      });
+      const [query] = db.$queryRaw.mock.calls.find(([sql]) =>
+        (sql.strings ?? sql).join("").includes("FROM cache_affinity_record"),
+      )!;
+      expect(query.values.slice(-2)).toEqual([200, maxRecords]);
+      expect(query.strings.join("")).toContain('"lastUsedAt" DESC, id DESC');
+      const deletes = db.$executeRaw.mock.calls.filter(([sql]) => {
+        const text = (sql.strings ?? sql).join("");
+        return (
+          text.includes(["DELETE FROM", "cache_affinity_record"].join(" ")) &&
+          text.includes("SELECT unnest")
+        );
+      });
+      expect(deletes.map(([, ids]) => ids)).toEqual([["live"]]);
+    },
+  );
+
   it("persists digests only, refreshes TTL, and enforces the row bound", async () => {
-    db.cacheAffinityRecord.findMany.mockResolvedValue([{ id: "old" }]);
+    mockRetentionRows([
+      { id: "old", sessionId: "old", prefixDigest: null, expiresAt: new Date("2030-01-01") },
+    ]);
     const now = new Date("2026-08-25T12:00:00.000Z");
     await rememberAffinity({
       ownerId: "grantee",
@@ -969,12 +1386,17 @@ describe("cache affinity", () => {
     expect(serializedWrites).not.toContain("lookup");
     expect(serializedWrites).toContain("grantee");
     expect(serializedWrites).toContain("pool-owner");
-    expect(db.cacheAffinityRecord.deleteMany).toHaveBeenCalledWith({
-      where: { id: { in: ["old"] } },
+    const deletes = db.$executeRaw.mock.calls.filter(([sql]) => {
+      const text = (sql.strings ?? sql).join("");
+      return (
+        text.includes(["DELETE FROM", "cache_affinity_record"].join(" ")) &&
+        text.includes("SELECT unnest")
+      );
     });
+    expect(deletes.map(([, ids]) => ids)).toEqual([["old"]]);
   });
 
-  it("persists instruction prefixes for system-only Chat and writes digestVersion 4 on create only", async () => {
+  it("persists instruction prefixes for system-only Chat and writes digestVersion 5 on create only", async () => {
     await rememberAffinity({
       ownerId: "owner",
       resourceOwnerId: "owner",
@@ -989,7 +1411,7 @@ describe("cache affinity", () => {
     const updates = db.cacheAffinityRecord.upsert.mock.calls.map(([input]) => input.update);
     expect(creates.length).toBeGreaterThan(0);
     for (const create of creates) {
-      expect(create.digestVersion).toBe(4);
+      expect(create.digestVersion).toBe(5);
       expect(create.prefixDigest).toEqual(expect.any(String));
       expect(create.conversationDigest).toBeNull();
       expect(create.prefixDepth).toBeGreaterThan(0);
@@ -1003,7 +1425,7 @@ describe("cache affinity", () => {
     );
   });
 
-  it("writes digestVersion 4 on conversation-prefix and session creates and omits it on updates", async () => {
+  it("writes digestVersion 5 on conversation-prefix and session creates and omits it on updates", async () => {
     const requestPayload = {
       conversation: "conversation-secret",
       input: "turn one",
@@ -1022,23 +1444,18 @@ describe("cache affinity", () => {
     const prefixUpdates = db.cacheAffinityRecord.upsert.mock.calls.map(([input]) => input.update);
     expect(prefixCreates.length).toBeGreaterThan(1);
     for (const create of prefixCreates) {
-      expect(create.digestVersion).toBe(4);
+      expect(create.digestVersion).toBe(5);
     }
     for (const update of prefixUpdates) {
       expect(update).not.toHaveProperty("digestVersion");
     }
-    expect(db.cacheAffinityRecord.create.mock.calls[0]?.[0].data.digestVersion).toBe(4);
+    expect(conversationWrites()[0]?.data.digestVersion).toBe(5);
     expect(JSON.stringify(db.cacheAffinityRecord.upsert.mock.calls)).not.toContain(
       "secret instructions",
     );
-    expect(JSON.stringify(db.cacheAffinityRecord.create.mock.calls)).not.toContain(
-      "conversation-secret",
-    );
+    expect(JSON.stringify(conversationWrites())).not.toContain("conversation-secret");
 
-    db.cacheAffinityRecord.findFirst.mockResolvedValue({ id: "existing-session" });
-    db.cacheAffinityRecord.upsert.mockClear();
-    db.cacheAffinityRecord.create.mockClear();
-    db.cacheAffinityRecord.update.mockClear();
+    db.$executeRaw.mockClear();
     await rememberAffinity({
       ownerId: "owner",
       resourceOwnerId: "owner",
@@ -1048,14 +1465,11 @@ describe("cache affinity", () => {
       payload: requestPayload,
       target: target("target", "runtime"),
     });
-    expect(db.cacheAffinityRecord.create).not.toHaveBeenCalled();
-    expect(db.cacheAffinityRecord.update).toHaveBeenCalledWith({
-      where: { id: "existing-session" },
-      data: expect.not.objectContaining({ digestVersion: expect.anything() }),
-    });
-    expect(db.cacheAffinityRecord.update.mock.calls[0]?.[0].data).not.toHaveProperty(
-      "digestVersion",
-    );
+    expect(conversationWrites()).toHaveLength(2);
+    for (const { sql } of conversationWrites()) {
+      expect(sql.split("DO UPDATE SET")[1]).not.toContain('"digestVersion"');
+      expect(sql).toContain('"digestVersion"');
+    }
   });
 
   it("deduplicates the exact prefix while storing distinct conversation identities", async () => {
@@ -1076,11 +1490,431 @@ describe("cache affinity", () => {
           .prefixDigest,
     );
     expect(new Set(uniqueInputs).size).toBe(1);
-    expect(db.cacheAffinityRecord.create).toHaveBeenCalledTimes(2);
-    const conversations = db.cacheAffinityRecord.create.mock.calls.map(
-      ([input]) => input.data.conversationDigest,
+    expect(conversationWrites()).toHaveLength(4);
+    const conversations = conversationWrites().map(({ data }) => data.conversationDigest);
+    expect(new Set(conversations).size).toBe(4);
+  });
+
+  it.each(["openai-chat", "anthropic-messages", "openai-responses"])(
+    "R1 over-cap routing unit %s",
+    async (surface) => {
+      const content = Array.from({ length: 80 }, (_, i) => ({
+        role: i % 2 ? "assistant" : "user",
+        content: `turn ${i}`,
+      }));
+      const huge = {
+        role: "user",
+        content: [
+          {
+            type: "image_url",
+            image_url: { url: `data:image/png;base64,${"A".repeat(2 * 1024 * 1024)}` },
+          },
+        ],
+      };
+      const request =
+        surface === "openai-responses"
+          ? { instructions: "rules", input: [...content, huge] }
+          : surface === "anthropic-messages"
+            ? { system: "rules", messages: [...content, huge] }
+            : { messages: [{ role: "system", content: "rules" }, ...content, huge] };
+      const material = affinityPrefixDigests(digestArgs("runtime", request, surface));
+      expect(material.identifiable).toBe(false);
+      expect(material.nodes).toEqual([]);
+      expect(material.routingNodes).toHaveLength(64);
+      expect(material.routingNodes.at(-1)?.depth).toBe(80);
+      expect(material.instructionDigests).toHaveLength(1);
+      db.$queryRaw.mockClear();
+      expect(
+        await resolveAffinitySession(
+          db,
+          { userId: "owner", tenantUserId: "owner", poolId: "pool", executionTargetId: "target" },
+          material,
+          new Date(),
+        ),
+      ).toBeNull();
+      expect(db.$queryRaw).not.toHaveBeenCalled();
+      expect(
+        await rememberAffinity({
+          ...digestArgs("runtime", request, surface),
+          target: target("target", "runtime"),
+          policy,
+          estimatedTokens: 20000,
+        }),
+      ).toBeNull();
+      expect(conversationWrites()).toEqual([]);
+    },
+  );
+
+  it.each([
+    ...["openai-chat", "anthropic-messages", "openai-responses"].flatMap((surface) =>
+      ["parameter", "tools", "instructions"].map((layer) => ({ surface, layer })),
+    ),
+    { surface: "openai-chat", layer: "functions" },
+  ])(
+    "R3 oversized root $layer degrades only bounded hints on $surface",
+    async ({ surface, layer }) => {
+      const huge = "x".repeat(2 * 1024 * 1024 + 1);
+      const units = [
+        { role: "user", content: "U" },
+        { role: "assistant", content: "A" },
+      ];
+      const instructions = layer === "instructions" ? huge : "safe rules";
+      const request = {
+        ...(surface === "openai-responses"
+          ? { instructions, input: units }
+          : surface === "anthropic-messages"
+            ? { system: instructions, messages: units }
+            : { messages: [{ role: "system", content: instructions }, ...units] }),
+        ...(layer === "parameter" ? { extension: { [huge]: 0 } } : {}),
+        ...(layer === "tools" ? { tools: [{ schema: huge }] } : {}),
+        ...(layer === "functions"
+          ? { functions: [{ name: "legacy", parameters: { schema: huge } }] }
+          : {}),
+      };
+      const args = {
+        ...digestArgs("runtime", request, surface),
+        headers: new Headers({ "session-id": "client" }),
+      };
+      const material = affinityPrefixDigests(args);
+      expect(material.identifiable).toBe(false);
+      expect(material.nodes).toEqual([]);
+      expect(material.routingNodes).toEqual([]);
+      expect(material.instructionDigests).toHaveLength(layer === "instructions" ? 0 : 1);
+      expect(material.clientSessionId).toBeDefined();
+      expect(material.boundSessionId).toBeUndefined();
+      expect(material.rootDigest).toBe("");
+      db.$executeRaw.mockClear();
+      expect(
+        await rememberAffinity({ ...args, policy, target: target("target", "runtime") }),
+      ).toBeNull();
+      expect(conversationWrites()).toHaveLength(1);
+      expect(conversationWrites()[0]!.data.sessionId).toBe(material.clientSessionId);
+    },
+  );
+
+  it.each([false, true])("R1 missing-parent delta routing unit client=%s", async (client) => {
+    const request = {
+      instructions: "rules",
+      input: [
+        { role: "user", content: "delta" },
+        { role: "assistant", content: "output" },
+      ],
+      previous_response_id: "missing",
+      ...(client ? { conversation: "client" } : {}),
+    };
+    const material = affinityPrefixDigests(digestArgs("runtime", request, "openai-responses"));
+    expect(material.missingParent).toBe(true);
+    expect(material.nodes).toEqual([]);
+    expect(material.routingNodes).toEqual([]);
+    expect(material.digests).toEqual([]);
+    expect(material.instructionDigests).toHaveLength(1);
+    await rememberAffinity({
+      ...digestArgs("runtime", request, "openai-responses"),
+      target: target("target", "runtime"),
+      policy,
+    });
+    expect(
+      db.cacheAffinityRecord.upsert.mock.calls.map(([input]) => input.create.prefixDigest),
+    ).toEqual(material.instructionDigests);
+    expect(conversationWrites()).toHaveLength(client ? 1 : 0);
+  });
+
+  it.each([
+    { name: "ownerId", change: { ownerId: "different-owner" } },
+    { name: "resourceOwnerId", change: { resourceOwnerId: "different-resource-owner" } },
+    { name: "securityScope", change: { securityScope: "different-token" } },
+    { name: "accessGrantId", change: { accessGrantId: "different-grant" } },
+    { name: "poolId", change: { poolId: "different-pool" } },
+    { name: "runtimeIdentity", change: { runtimeIdentity: "different-runtime" } },
+    { name: "surface", change: { surface: "anthropic-messages" } },
+  ])("R1 client identity scope $name", ({ change }) => {
+    const args = {
+      ...digestArgs("runtime", {
+        conversation: "same-id",
+        messages: [{ role: "user", content: "starter" }],
+      }),
+      securityScope: "token",
+      accessGrantId: "grant",
+    };
+    const original = affinityPrefixDigests(args);
+    const changed = affinityPrefixDigests({ ...args, ...change });
+    expect(original.clientSessionId).toBeDefined();
+    expect(changed.clientSessionId).toBeDefined();
+    expect(changed.clientSessionId).not.toBe(original.clientSessionId);
+  });
+
+  const r1HeaderCases = ["openai-chat", "anthropic-messages", "openai-responses"].flatMap(
+    (surface) =>
+      [
+        "x-conversation-id",
+        "session_id",
+        "session-id",
+        "x-session-id",
+        "x-claude-code-session-id",
+      ].map((header) => ({ surface, header })),
+  );
+  it.each(r1HeaderCases)("R1 header carrier unit $surface $header", async ({ surface, header }) => {
+    const content = [
+      { role: "user", content: "start" },
+      { role: "assistant", content: "reply" },
+    ];
+    const payload = surface === "openai-responses" ? { input: content } : { messages: content };
+    const args = {
+      ...digestArgs("runtime", payload, surface),
+      headers: new Headers({ [header.toUpperCase()]: " stable-client " }),
+    };
+    const one = affinityPrefixDigests({
+      ...args,
+      payload: {
+        ...payload,
+        metadata: { user_id: "user-A_session_11111111-2222-4333-8444-555555555555" },
+      },
+    });
+    const two = affinityPrefixDigests({
+      ...args,
+      payload: {
+        ...payload,
+        metadata: { user_id: "user-B_session_11111111-2222-4333-8444-555555555555" },
+      },
+    });
+    expect(extractClientConversationId(args.headers, payload, surface)).toBe("stable-client");
+    expect(two.rootDigest).not.toBe(one.rootDigest);
+    expect(two.clientSessionId).toBe(one.clientSessionId);
+    expect(
+      await resolveAffinitySession(
+        db,
+        { userId: "owner", tenantUserId: "owner", poolId: "pool", executionTargetId: "target" },
+        two,
+        new Date(),
+      ),
+    ).toBe(one.clientSessionId);
+    expect(db.$queryRaw).not.toHaveBeenCalled();
+  });
+
+  const r1CarrierCases = ["openai-chat", "anthropic-messages", "openai-responses"].flatMap(
+    (surface) => [
+      ...["conversation", "conversation_id"].flatMap((key) => [
+        {
+          surface,
+          name: `${key} valid`,
+          before: { [key]: "client" },
+          after: { [key]: " client " },
+          free: true,
+          client: true,
+        },
+        {
+          surface,
+          name: `${key} object`,
+          before: { [key]: { id: "client", note: "A" } },
+          after: { [key]: { id: "client", note: "B" } },
+          free: true,
+          client: true,
+        },
+        {
+          surface,
+          name: `${key} invalid`,
+          before: { [key]: "bad key A" },
+          after: { [key]: "bad key B" },
+          free: false,
+          client: false,
+        },
+      ]),
+      {
+        surface,
+        name: "prompt_cache_key valid or inactive",
+        before: { prompt_cache_key: "client" },
+        after: { prompt_cache_key: " client " },
+        free: surface !== "anthropic-messages",
+        client: surface !== "anthropic-messages",
+      },
+      {
+        surface,
+        name: "prompt_cache_key invalid",
+        before: { prompt_cache_key: "bad key A" },
+        after: { prompt_cache_key: "bad key B" },
+        free: false,
+        client: false,
+      },
+      {
+        surface,
+        name: "ordinary metadata.user_id",
+        before: { metadata: { user_id: "user-A" } },
+        after: { metadata: { user_id: "user-B" } },
+        free: false,
+        client: false,
+      },
+      {
+        surface,
+        name: "metadata session token valid or inactive",
+        before: { metadata: { user_id: "user-A_session_11111111-2222-4333-8444-555555555555" } },
+        after: { metadata: { user_id: "user-B_session_11111111-2222-4333-8444-555555555555" } },
+        free: surface === "anthropic-messages",
+        client: surface === "anthropic-messages",
+      },
+      {
+        surface,
+        name: "other metadata fields",
+        before: {
+          metadata: { user_id: "user_session_11111111-2222-4333-8444-555555555555", extra: "A" },
+        },
+        after: {
+          metadata: { user_id: "user_session_11111111-2222-4333-8444-555555555555", extra: "B" },
+        },
+        free: false,
+        client: surface === "anthropic-messages",
+      },
+      ...["conversation_id", "prompt_cache_key", "metadata"].map((key) => ({
+        surface,
+        name: `${key} losing carrier`,
+        before: {
+          conversation: "winner",
+          [key]:
+            key === "metadata"
+              ? { user_id: "user-A_session_11111111-2222-4333-8444-555555555555" }
+              : "A",
+        },
+        after: {
+          conversation: "winner",
+          [key]:
+            key === "metadata"
+              ? { user_id: "user-B_session_11111111-2222-4333-8444-555555555555" }
+              : "B",
+        },
+        free: false,
+        client: true,
+      })),
+    ],
+  );
+  it.each(r1CarrierCases)(
+    "R1 carrier unit $surface $name",
+    async ({ surface, before, after, free, client }) => {
+      const content = [
+        { role: "user", content: "start" },
+        { role: "assistant", content: "reply" },
+        { role: "user", content: "next" },
+      ];
+      const request = surface === "openai-responses" ? { input: content } : { messages: content };
+      const one = affinityPrefixDigests(digestArgs("runtime", { ...request, ...before }, surface));
+      const two = affinityPrefixDigests(digestArgs("runtime", { ...request, ...after }, surface));
+      expect(two.rootDigest === one.rootDigest).toBe(free);
+      expect(one.clientSessionId !== undefined).toBe(client);
+      if (client) {
+        expect(two.clientSessionId).toBe(one.clientSessionId);
+        const changedRoot = affinityPrefixDigests(
+          digestArgs("runtime", { ...request, ...after, unknown_extension: "changed" }, surface),
+        );
+        expect(changedRoot.rootDigest).not.toBe(one.rootDigest);
+        expect(
+          await resolveAffinitySession(
+            db,
+            { userId: "owner", tenantUserId: "owner", poolId: "pool", executionTargetId: "target" },
+            changedRoot,
+            new Date(),
+          ),
+        ).toBe(one.clientSessionId);
+        expect(db.$queryRaw).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  // Owner decision AC-21/49: deliberately independent of the production list.
+  const approvedSamplingParams = [
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "typical_p",
+    "seed",
+    "frequency_penalty",
+    "presence_penalty",
+    "repetition_penalty",
+    "logit_bias",
+    "stop",
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "n",
+    "best_of",
+  ];
+  it("AC-21/49 pins the exact owner-approved free sampling list", () => {
+    expect([...FREE_SAMPLING_PARAMS].sort()).toEqual([...approvedSamplingParams].sort());
+  });
+  it.each(
+    ["openai-chat", "anthropic-messages", "openai-responses"].flatMap((surface) => [
+      ...approvedSamplingParams.map((key) => ({ surface, key, value: 0.9, free: true })),
+      { surface, key: "response_format", value: { type: "json_object" }, free: false },
+      { surface, key: "tool_choice", value: "required", free: false },
+      { surface, key: "unknown_extension", value: 1, free: false },
+    ]),
+  )("AC-21/49 $surface $key free=$free", ({ surface, key, value, free }) => {
+    const content = [
+      { role: "user", content: "start" },
+      { role: "assistant", content: "reply" },
+    ];
+    const request = surface === "openai-responses" ? { input: content } : { messages: content };
+    const base = affinityPrefixDigests(digestArgs("runtime", request, surface));
+    const changed = affinityPrefixDigests(
+      digestArgs("runtime", { ...request, [key]: value }, surface),
     );
-    expect(new Set(conversations).size).toBe(2);
+    expect(changed.rootDigest === base.rootDigest).toBe(free);
+    expect(changed.digests).toEqual(free ? base.digests : expect.not.arrayContaining(base.digests));
+  });
+
+  it.each(["openai-chat", "anthropic-messages", "openai-responses"])(
+    "%s: approved sampling and full root semantics",
+    (surface) => {
+      const content = [
+        { role: "user", content: "start" },
+        { role: "assistant", content: "reply" },
+      ];
+      const request =
+        surface === "openai-chat"
+          ? { messages: [{ role: "system", content: "rules" }, ...content], tools: [] }
+          : surface === "anthropic-messages"
+            ? { system: "rules", messages: content, tools: [] }
+            : { instructions: "rules", input: content, tools: [] };
+      const base = affinityPrefixDigests(digestArgs("runtime", request, surface));
+      for (const key of approvedSamplingParams) {
+        const changed = affinityPrefixDigests(
+          digestArgs("runtime", { ...request, [key]: 0.9 }, surface),
+        );
+        expect(changed.rootDigest, key).toBe(base.rootDigest);
+        expect(changed.digests, key).toEqual(base.digests);
+      }
+      for (const change of [
+        { tools: [{ name: "new" }] },
+        { response_format: { type: "json_object" } },
+        { text: { format: { type: "json_object" } } },
+        { tool_choice: "required" },
+        { parallel_tool_calls: false },
+        { reasoning: { effort: "high" } },
+        { thinking: { type: "enabled" } },
+        { extension: 1 },
+      ]) {
+        const changed = affinityPrefixDigests(
+          digestArgs("runtime", { ...request, ...change }, surface),
+        );
+        expect(changed.rootDigest).not.toBe(base.rootDigest);
+        expect(changed.digests).not.toEqual(base.digests);
+      }
+    },
+  );
+
+  it("hashes beyond the first 64 units and retains the true tip", () => {
+    const messages = Array.from({ length: 100 }, (_, i) => ({
+      role: i % 2 ? "assistant" : "user",
+      content: String(i),
+    }));
+    const full = affinityPrefixDigests(digestArgs("runtime", { messages }));
+    const altered = affinityPrefixDigests(
+      digestArgs("runtime", {
+        messages: [...messages.slice(0, 99), { role: "assistant", content: "different" }],
+      }),
+    );
+    expect(full.nodes).toHaveLength(64);
+    expect(full.nodes[0]!.depth).toBe(37);
+    expect(full.nodes.at(-1)!.depth).toBe(100);
+    expect(full.nodes.at(-1)!.digest).not.toBe(altered.nodes.at(-1)!.digest);
   });
 
   it("canonicalizes telemetry surfaces onto production ProtocolSurface HMACs", () => {
@@ -1273,7 +2107,8 @@ describe("cache affinity", () => {
       });
     }).not.toThrow();
     expect(result?.instructionDigests).toEqual([]);
-    expect(result?.digests).toHaveLength(1);
+    expect(result?.digests).toHaveLength(0);
+    expect(result?.identifiable).toBe(false);
   });
 
   it("keeps stray unconsumed fields in parameters so conversation prefixes do not collide", () => {
@@ -1623,7 +2458,7 @@ describe("cache affinity", () => {
       targets: [idle, warm],
     });
     const query = db.cacheAffinityRecord.findMany.mock.calls.at(-1)?.[0];
-    expect(query?.where.digestVersion).toBe(4);
+    expect(query?.where.digestVersion).toBe(5);
     expect(query?.select.digestVersion).toBe(true);
 
     db.cacheAffinityRecord.findMany.mockResolvedValue([
@@ -1936,8 +2771,8 @@ describe("cache affinity", () => {
     // Writer class S: one DELETE that takes its rows with SKIP LOCKED.
     db.$executeRaw.mockResolvedValue(2);
     const now = new Date("2026-08-25T12:00:00.000Z");
-    await expect(sweepExpiredAffinity({ now, limit: 2 })).resolves.toBe(2);
-    expect(db.$executeRaw).toHaveBeenCalledTimes(1);
+    await expect(sweepExpiredAffinity({ now, limit: 2 })).resolves.toBe(4);
+    expect(db.$executeRaw).toHaveBeenCalledTimes(2);
     const [strings, ...values] = db.$executeRaw.mock.calls[0] as [
       TemplateStringsArray,
       ...unknown[],
@@ -1965,13 +2800,13 @@ describe("cache affinity", () => {
       target: target("target", "runtime"),
     };
     await rememberAffinity(rememberArgs);
-    // The cache-affinity fence is the transaction's first statement; the pool
+    // After setting lock_timeout, the cache-affinity fence precedes every data statement; the pool
     // is read afterwards without a row lock.
     const [strings, fenceNames] = db.$queryRaw.mock.calls[0] as [TemplateStringsArray, string[]];
     expect(strings.join("?")).toContain("wsmp_acquire_fences");
     expect(fenceNames).toEqual(["09:cache-affinity:resource-owner:pool"]);
     for (const call of db.$queryRaw.mock.calls) {
-      expect((call[0] as TemplateStringsArray).join("?")).not.toMatch(/FOR (NO KEY )?UPDATE/);
+      expect((call[0].strings ?? call[0]).join("?")).not.toMatch(/FOR (NO KEY )?UPDATE/);
     }
     expect(db.$queryRaw.mock.invocationCallOrder[0]).toBeLessThan(
       db.modelPool.findFirst.mock.invocationCallOrder[0] ?? Number.NaN,
@@ -1984,7 +2819,17 @@ describe("cache affinity", () => {
 
     vi.clearAllMocks();
     db.$transaction.mockImplementation((callback) => callback(db));
-    db.$queryRaw.mockResolvedValue([{ acquired: true }]);
+    db.$queryRaw.mockImplementation((query) =>
+      Promise.resolve(
+        (query.strings ?? query).join("").includes("cache_affinity_node")
+          ? []
+          : [{ acquired: true }],
+      ),
+    );
+    db.cacheAffinityNode.findMany.mockResolvedValue([]);
+    db.cacheAffinityNode.findFirst.mockResolvedValue(null);
+    db.cacheAffinityNode.deleteMany.mockResolvedValue({ count: 0 });
+    db.cacheAffinityNode.updateMany.mockResolvedValue({ count: 0 });
     db.modelPool.findFirst.mockResolvedValue(null);
     await rememberAffinity(rememberArgs);
     expect(db.$queryRaw).toHaveBeenCalledTimes(1);
@@ -2040,29 +2885,15 @@ describe("cache affinity", () => {
       target: target("target", "runtime"),
     };
 
-    // Create path: unreported evidence defaults the stored flag to false.
     await rememberAffinity(conversationArgs);
-    expect(db.cacheAffinityRecord.create.mock.calls[0]?.[0].data.engineCacheConfirmed).toBe(false);
-
-    // Update path: unreported evidence leaves the stored flag untouched.
-    db.cacheAffinityRecord.findFirst.mockResolvedValue({ id: "existing-session" });
-    db.cacheAffinityRecord.update.mockClear();
-    await rememberAffinity(conversationArgs);
-    expect(db.cacheAffinityRecord.update.mock.calls[0]?.[0].data).not.toHaveProperty(
-      "engineCacheConfirmed",
-    );
-
-    // Update path: reported evidence (either polarity) overwrites the flag.
-    db.cacheAffinityRecord.update.mockClear();
-    await rememberAffinity({ ...conversationArgs, engineCacheConfirmed: true });
-    expect(db.cacheAffinityRecord.update.mock.calls[0]?.[0].data.engineCacheConfirmed).toBe(true);
-
-    // Update path: a reported zero must carry an explicit false — a
-    // conditional-spread regression that only forwards truthy values would
-    // drop the key and leave a stale confirmation behind.
-    db.cacheAffinityRecord.update.mockClear();
-    await rememberAffinity({ ...conversationArgs, engineCacheConfirmed: false });
-    expect(db.cacheAffinityRecord.update.mock.calls[0]?.[0].data.engineCacheConfirmed).toBe(false);
+    expect(conversationWrites()[0]?.data.engineCacheConfirmed).toBe(false);
+    expect(conversationWrites()[0]?.engineEvidence).toBeNull();
+    for (const evidence of [undefined, true, false]) {
+      db.$executeRaw.mockClear();
+      await rememberAffinity({ ...conversationArgs, engineCacheConfirmed: evidence });
+      expect(conversationWrites()[0]?.engineEvidence).toBe(evidence ?? null);
+      expect(conversationWrites()[0]?.sql).toContain('"engineCacheConfirmed" = COALESCE(');
+    }
   });
 
   it("prefers an engine-confirmed continuation over an equal-depth unconfirmed one", async () => {
@@ -2114,3 +2945,785 @@ describe("cache affinity", () => {
     expect(result.reasons["target-b"]).toContain("confirmed:false");
   });
 });
+
+describe("R2 adversarial identity material", () => {
+  it.each(
+    ["openai-chat", "anthropic-messages", "openai-responses"].flatMap((surface) =>
+      canonicalLocations.flatMap((location) =>
+        canonicalShapes.flatMap((shape) =>
+          canonicalKeys.map((key) => ({ surface, location, shape, key })),
+        ),
+      ),
+    ),
+  )(
+    "wire $surface $key changes $location $shape identity without losing any key",
+    ({ surface, location, shape, key }) => {
+      const request = (value: string) => {
+        const leaf = `{${JSON.stringify(key)}:{"const":${JSON.stringify(value)}},"__proto__":{"const":${JSON.stringify(value)}}}`;
+        const wire =
+          shape === "array" ? `[${leaf}]` : shape === "mixed" ? `{"nested":[${leaf}]}` : leaf;
+        return JSON.parse(canonicalPayloadWire(location, wire, surface));
+      };
+      const one = affinityPrefixDigests(digestArgs("runtime", request("one"), surface));
+      const two = affinityPrefixDigests(digestArgs("runtime", request("two"), surface));
+      expect(one.identifiable).toBe(true);
+      expect(two.identifiable).toBe(true);
+      if (location === "messages") expect(two.nodes).not.toEqual(one.nodes);
+      else {
+        expect(two.rootDigest).not.toBe(one.rootDigest);
+        expect(two.nodes).not.toEqual(one.nodes);
+      }
+      const protoOnly = (value: string) => {
+        const leaf = `{${JSON.stringify(key)}:{"const":"one"},"__proto__":{"const":${JSON.stringify(value)}}}`;
+        const wire =
+          shape === "array" ? `[${leaf}]` : shape === "mixed" ? `{"nested":[${leaf}]}` : leaf;
+        return affinityPrefixDigests(
+          digestArgs("runtime", JSON.parse(canonicalPayloadWire(location, wire, surface)), surface),
+        );
+      };
+      expect(protoOnly("one").nodes).not.toEqual(protoOnly("two").nodes);
+      // Independently change the selected key while holding __proto__ constant.
+      const selectedOnly = JSON.parse(
+        canonicalPayloadWire(
+          location,
+          `{${JSON.stringify(key)}:{"const":"two"}${key === "__proto__" ? "" : ',"__proto__":{"const":"one"}'}}`,
+          surface,
+        ),
+      );
+      const selectedBefore = JSON.parse(
+        canonicalPayloadWire(
+          location,
+          `{${JSON.stringify(key)}:{"const":"one"}${key === "__proto__" ? "" : ',"__proto__":{"const":"one"}'}}`,
+          surface,
+        ),
+      );
+      expect(affinityPrefixDigests(digestArgs("runtime", selectedOnly, surface)).nodes).not.toEqual(
+        affinityPrefixDigests(digestArgs("runtime", selectedBefore, surface)).nodes,
+      );
+    },
+  );
+
+  it.each(depthRows)(
+    "$location $shape depth $depth is atomic across rank, resolver and writer",
+    async ({ location, shape, depth }) => {
+      const request = JSON.parse(depthPayloadWire(location, depth, shape));
+      const args = digestArgs("runtime", request, "openai-responses");
+      const material = affinityPrefixDigests(args);
+      expect(material.identifiable).toBe(depth === MAX_CANONICAL_DEPTH);
+      if (depth === MAX_CANONICAL_DEPTH) {
+        expect(material.nodes.length).toBeGreaterThan(0);
+        return;
+      }
+      const withCarrier = { ...args, payload: { ...request, conversation: "must-not-link" } };
+      const unsafe = affinityPrefixDigests(withCarrier);
+      expect(unsafe).toMatchObject({
+        nodes: [],
+        routingNodes: [],
+        digests: [],
+        instructionDigests: [],
+        conversationDigest: null,
+        identifiable: false,
+      });
+      expect(unsafe.clientSessionId).toBeUndefined();
+      expect(unsafe.boundSessionId).toBeUndefined();
+      expect(unsafe.parentTipDigest).toBeUndefined();
+      expect(unsafe.parentTipDepth).toBeUndefined();
+      db.$transaction.mockClear();
+      expect(
+        await rememberAffinity({ ...withCarrier, target: target("target", "runtime"), policy }),
+      ).toBeNull();
+      expect(db.$transaction).not.toHaveBeenCalled();
+      expect(
+        await resolveAffinitySession(
+          db,
+          { userId: "owner", tenantUserId: "owner", poolId: "pool", executionTargetId: "target" },
+          unsafe,
+          new Date(),
+        ),
+      ).toBeNull();
+      const ranked = await rankAffinityTargets({
+        ...withCarrier,
+        policy,
+        targets: [target("target", "runtime")],
+        scoreSingleTarget: true,
+      });
+      expect(ranked.matchedSessionIds).toEqual({});
+      expect(ranked.prefixDepths.target ?? 0).toBe(0);
+      expect(ranked.instructionDepths?.target ?? 0).toBe(0);
+    },
+  );
+
+  it("realistic depth-20 schema preserves odd keys, key order and duplicate last-wins", () => {
+    const schema =
+      '{"type":"object","properties":{"__proto__":{"const":1},"constructor":{"type":"string"}},"additionalProperties":false}';
+    let deep = schema;
+    for (let level = 0; level < 7; level++)
+      deep = `{"type":"object","properties":{"child":${deep}},"required":["child"],"additionalProperties":false}`;
+    const first = affinityPrefixDigests(
+      digestArgs("runtime", JSON.parse(canonicalPayloadWire("tools", deep)), "openai-responses"),
+    );
+    const reordered = deep.replace(
+      '"type":"object","properties"',
+      '"additionalProperties":false,"type":"object","properties"',
+    );
+    const second = affinityPrefixDigests(
+      digestArgs(
+        "runtime",
+        JSON.parse(canonicalPayloadWire("tools", reordered)),
+        "openai-responses",
+      ),
+    );
+    expect(first.identifiable).toBe(true);
+    expect(second.rootDigest).toBe(first.rootDigest);
+    const changed = deep.replace('"const":1', '"const":1,"const":2');
+    expect(
+      affinityPrefixDigests(
+        digestArgs(
+          "runtime",
+          JSON.parse(canonicalPayloadWire("tools", changed)),
+          "openai-responses",
+        ),
+      ).rootDigest,
+    ).not.toBe(first.rootDigest);
+  });
+
+  it("canonicalization failures cannot escape affinityPrefixDigests or leave partial identity", () => {
+    const throwing = {
+      messages: [{ role: "user", content: "U" }],
+      get tools(): unknown {
+        throw new Error("getter failure");
+      },
+    };
+    expect(() => affinityPrefixDigests(digestArgs("runtime", throwing))).not.toThrow();
+    expect(affinityPrefixDigests(digestArgs("runtime", throwing))).toMatchObject({
+      identifiable: false,
+      nodes: [],
+      instructionDigests: [],
+      routingNodes: [],
+    });
+  });
+});
+
+it.each([false, true])(
+  "R3 bound cumulative 2 MiB cap retains routing/client footprint without lineage client=%s",
+  async (client) => {
+    const args = digestArgs("runtime", { input: "parent" }, "openai-responses");
+    const first = affinityPrefixDigests(args);
+    const sessionBinding = {
+      sessionId: "parent",
+      bindingDigest: first.bindingDigest,
+      rootDigest: first.rootDigest,
+      tipDigest: first.nodes.at(-1)!.digest,
+      tipDepth: 1,
+      canonicalBytes: 2 * 1024 * 1024,
+    };
+    const request = {
+      ...args,
+      sessionBinding,
+      payload: {
+        previous_response_id: "parent",
+        input: "delta",
+        ...(client ? { conversation: "client" } : {}),
+      },
+    };
+    const material = affinityPrefixDigests(request);
+    expect(material).toMatchObject({
+      identifiable: false,
+      nodes: [],
+      instructionDigests: [],
+      conversationDigest: null,
+    });
+    expect(material.routingNodes).toEqual([{ digest: sessionBinding.tipDigest, depth: 1 }]);
+    expect(Boolean(material.clientSessionId)).toBe(client);
+    expect(material.boundSessionId).toBeUndefined();
+    expect(material.parentTipDigest).toBeUndefined();
+    expect(material.parentTipDepth).toBeUndefined();
+    db.$transaction.mockClear();
+    expect(
+      await rememberAffinity({ ...request, policy, target: target("target", "runtime") }),
+    ).toBeNull();
+    expect(db.$transaction).toHaveBeenCalledTimes(1);
+    expect(conversationWrites()).toHaveLength(client ? 1 : 0);
+  },
+);
+
+it("R6 oversized new instructions refuse a bound Responses continuation", () => {
+  const args = digestArgs("runtime", { input: "parent" }, "openai-responses");
+  const parent = affinityPrefixDigests(args);
+  const sessionBinding = {
+    sessionId: "parent-session",
+    bindingDigest: parent.bindingDigest,
+    rootDigest: parent.rootDigest,
+    tipDigest: parent.nodes.at(-1)!.digest,
+    tipDepth: 1,
+    canonicalBytes: parent.canonicalBytes,
+  };
+  const followup = {
+    ...args,
+    sessionBinding,
+    payload: { previous_response_id: "parent", input: "delta" },
+  };
+  expect(affinityPrefixDigests(followup).boundSessionId).toBe("parent-session");
+  const changed = {
+    ...followup,
+    payload: { ...followup.payload, instructions: "x".repeat(2 * 1024 * 1024 + 1) },
+  };
+  expect(buildCanonicalRequest(changed)?.hasRootFields).toBe(true);
+  const material = affinityPrefixDigests(changed);
+  expect(material.rootDigest).toBe("");
+  expect(material.routingNodes).toEqual([]);
+  expect(material.isContinuation).toBe(false);
+  expect(material.missingParent).toBe(true);
+  expect(material.boundSessionId).toBeUndefined();
+  expect(material.parentTipDigest).toBeUndefined();
+  expect(material.identifiable).toBe(false);
+  expect(material.nodes).toEqual([]);
+});
+
+it("R2 wire __proto__ in legacy Chat function schemas binds the root", () => {
+  const request = (value: number) =>
+    JSON.parse(
+      `{"messages":[{"role":"user","content":"U"},{"role":"assistant","content":"A"}],"functions":[{"name":"lookup","parameters":{"properties":{"__proto__":{"const":${value}}}}}]}`,
+    );
+  const one = affinityPrefixDigests(digestArgs("runtime", request(1)));
+  const two = affinityPrefixDigests(digestArgs("runtime", request(2)));
+  expect(one.identifiable).toBe(true);
+  expect(two.rootDigest).not.toBe(one.rootDigest);
+  expect(two.nodes).not.toEqual(one.nodes);
+});
+
+it("R3 affinityPrefixDigests catches HMAC failures after successful conversion", async () => {
+  const security = await import("@ws-model-proxy/db/forwarder-security");
+  const hmac = vi.spyOn(security, "hmacDigestForForwarderPurpose").mockImplementation(() => {
+    throw new Error("HMAC unavailable");
+  });
+  try {
+    expect(() => affinityPrefixDigests(digestArgs("runtime", payload))).not.toThrow();
+    expect(affinityPrefixDigests(digestArgs("runtime", payload))).toMatchObject({
+      identifiable: false,
+      nodes: [],
+      routingNodes: [],
+      instructionDigests: [],
+      bindingDigest: "",
+    });
+    expect(hmac).toHaveBeenCalled();
+  } finally {
+    hmac.mockRestore();
+  }
+});
+
+it.each(numericOverflowRows)(
+  "R4 numeric overflow $surface $shape binds forwarded null",
+  ({ surface, shape }) => {
+    const absent = affinityPrefixDigests(
+      digestArgs("runtime", numericOverflowPayload(surface, shape, undefined), surface),
+    );
+    const nil = affinityPrefixDigests(
+      digestArgs("runtime", numericOverflowPayload(surface, shape, "null"), surface),
+    );
+    const finite = affinityPrefixDigests(
+      digestArgs("runtime", numericOverflowPayload(surface, shape, "1e300"), surface),
+    );
+    expect(nil.rootDigest).not.toBe(absent.rootDigest);
+    expect(finite.rootDigest).not.toBe(nil.rootDigest);
+    for (const value of ["1e400", "-1e400"]) {
+      const wireParsed = numericOverflowPayload(surface, shape, value);
+      const original = affinityPrefixDigests(digestArgs("runtime", wireParsed, surface));
+      const forwarded = affinityPrefixDigests(
+        digestArgs("runtime", JSON.parse(JSON.stringify(wireParsed)), surface),
+      );
+      expect(original.identifiable).toBe(true);
+      expect(original.rootDigest).toBe(nil.rootDigest);
+      expect(original.nodes).toEqual(nil.nodes);
+      expect(forwarded).toEqual(original);
+    }
+  },
+);
+
+it("R4 bounds wide/deep canonical work and ranks 3 targets within 2 seconds", async () => {
+  db.cacheAffinityRecord.findMany.mockResolvedValue([]);
+  db.capacityLease.groupBy.mockResolvedValue([]);
+  db.capacityWaiter.groupBy.mockResolvedValue([]);
+  const wide = {
+    conversation: "client",
+    messages: [
+      { role: "system", content: "rules" },
+      { role: "user", content: "U" },
+      { role: "assistant", content: "A" },
+      { role: "user", content: new Array(4_000_000).fill(0) },
+    ],
+  };
+  const work = { steps: 0 };
+  const ownKeys = Object.keys;
+  const keys = vi.spyOn(Object, "keys").mockImplementation((entry) => {
+    if (Array.isArray(entry) && entry.length >= 4_000_000)
+      throw new Error("wide arrays must be indexed");
+    return ownKeys(entry);
+  });
+  let canonical: ReturnType<typeof buildCanonicalRequest>;
+  try {
+    canonical = buildCanonicalRequest(digestArgs("runtime", wide), work);
+  } finally {
+    keys.mockRestore();
+  }
+  expect(canonical).not.toBeNull();
+  expect(canonical!.conversationUnits).toHaveLength(2);
+  expect(canonical!.conversationOverflow).toBe(true);
+  expect(work.steps).toBeLessThanOrEqual(8 * 2 * 1024 * 1024);
+  expect(work.steps).toBeGreaterThan(4_000_000);
+  const material = affinityPrefixDigests(digestArgs("runtime", wide));
+  expect(material).toMatchObject({ identifiable: false, nodes: [] });
+  expect(material.routingNodes).toHaveLength(2);
+  expect(material.instructionDigests).toHaveLength(1);
+  expect(material.clientSessionId).toBeDefined();
+  const deepWork = { steps: 0 };
+  expect(
+    buildCanonicalRequest(
+      digestArgs(
+        "runtime",
+        JSON.parse(depthPayloadWire("tools", 128, "mixed")),
+        "openai-responses",
+      ),
+      deepWork,
+    ),
+  ).not.toBeNull();
+  expect(deepWork.steps).toBeLessThanOrEqual(8 * 2 * 1024 * 1024);
+  const rootWork = { steps: 0 };
+  const root = buildCanonicalRequest(
+    digestArgs("runtime", {
+      messages: wide.messages.slice(0, 3),
+      conversation: "client",
+      vendor_extension: wide.messages[3]!.content,
+    }),
+    rootWork,
+  );
+  expect(root).not.toBeNull();
+  expect(root!.rootBytes).toBe(2 * 1024 * 1024 + 1);
+  expect(root!.conversationUnits).toEqual([]);
+  expect(rootWork.steps).toBeLessThanOrEqual(8 * 2 * 1024 * 1024);
+  let reads = 0;
+  Object.defineProperty(wide, "vendor_extension", {
+    enumerable: true,
+    get() {
+      reads++;
+      return "bind";
+    },
+  });
+  const start = performance.now();
+  await rankAffinityTargets({
+    ...digestArgs("runtime", wide),
+    policy,
+    targets: [target("a", "a"), target("b", "b"), target("c", "c")],
+  });
+  const elapsed = performance.now() - start;
+  console.info(
+    `R4 canonical smoke: ${work.steps} steps; rank(4M,3) ${Math.round(elapsed)} ms; payload reads ${reads}`,
+  );
+  expect(reads).toBe(2); // validation and root capture, independent of target count
+  expect(elapsed).toBeLessThan(2000);
+}, 10_000);
+
+it("R4 unit-count work refusal retains the safe prefix without identifying a truncated chain", () => {
+  const request = {
+    conversation: "client",
+    messages: Array.from({ length: 4097 }, (_, i) => ({
+      role: i % 2 ? "assistant" : "user",
+      content: "x",
+    })),
+  };
+  const refused = affinityPrefixDigests(digestArgs("runtime", request));
+  expect(refused.identifiable).toBe(false);
+  expect(refused.nodes).toEqual([]);
+  expect(refused.routingNodes).toHaveLength(64);
+  expect(refused.routingNodes.at(-1)?.depth).toBe(4096);
+  expect(refused.clientSessionId).toBeDefined();
+  expect(
+    affinityPrefixDigests(
+      digestArgs("runtime", { ...request, messages: request.messages.slice(0, 4096) }),
+    ).identifiable,
+  ).toBe(true);
+});
+
+it("R4 ordinary request roots and nodes retain the previous v5 digest bytes", async () => {
+  const { hmacDigestForForwarderPurpose } = await import("@ws-model-proxy/db/forwarder-security");
+  const previous = (value: JsonValue): string => {
+    if (value === null || typeof value !== "object") return JSON.stringify(value);
+    if (Array.isArray(value)) return `[${value.map(previous).join(",")}]`;
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${previous(value[key]!)}`)
+      .join(",")}}`;
+  };
+  const hash = (value: string) =>
+    hmacDigestForForwarderPurpose({ purpose: "cacheAffinity", value });
+  for (const surface of ["openai-chat", "anthropic-messages", "openai-responses"]) {
+    for (let seed = 0; seed < 40; seed++) {
+      const extension: JsonValue = {
+        "01": [seed, true, null, "☃😀"],
+        nested: { [canonicalKeys[seed % canonicalKeys.length]!]: seed / 7 },
+      };
+      const units = [
+        { role: "user", content: "U" },
+        { role: "assistant", content: `A${seed}` },
+      ];
+      const request = {
+        ...(surface === "openai-responses"
+          ? { input: units, instructions: "rules" }
+          : surface === "anthropic-messages"
+            ? { messages: units, system: "rules" }
+            : { messages: [{ role: "system", content: "rules" }, ...units] }),
+        tools: [{ name: "lookup", parameters: extension }],
+        vendor_extension: extension,
+      };
+      const args = digestArgs("runtime", request, surface);
+      const material = affinityPrefixDigests(args);
+      const layers = extractAffinityLayers(surface, request);
+      const bindingDigest = hash(
+        `affinity-binding-v5:${previous({ v: 5, ownerId: "owner", resourceOwnerId: "owner", poolId: "pool", securityScope: "token", accessGrantId: null, surface, runtimeIdentity: "runtime" })}`,
+      );
+      expect(material.bindingDigest).toBe(bindingDigest);
+      const root = hash(
+        `affinity-root-v5:${previous({ bindingDigest, instructions: layers.instructionUnits, tools: layers.tools ?? null, parameters: { vendor_extension: extension } })}`,
+      );
+      expect(material.rootDigest).toBe(root);
+      let tip = root;
+      const nodes = layers.conversationUnits.map((unit, index) => {
+        tip = hash(`affinity-node-v5:${tip}:${previous(unit)}`);
+        return { digest: tip, depth: index + 1 };
+      });
+      expect(material.nodes).toEqual(nodes);
+    }
+  }
+});
+
+it.each(["parameter", "tools", "instructions", "messages"] as const)(
+  "R4 wire non-finite %s never drops root fields or conversation units",
+  (location) => {
+    for (const surface of ["openai-chat", "anthropic-messages", "openai-responses"]) {
+      for (const value of ["1e400", "-1e400", '{"field":1e400}', "[1e400]"]) {
+        const request = JSON.parse(canonicalPayloadWire(location, value, surface));
+        const material = affinityPrefixDigests(digestArgs("runtime", request, surface));
+        expect(material.identifiable).toBe(true);
+        expect(material).toEqual(
+          affinityPrefixDigests(
+            digestArgs("runtime", JSON.parse(JSON.stringify(request)), surface),
+          ),
+        );
+        expect(material.nodes).toHaveLength(2);
+      }
+    }
+  },
+);
+
+it("R4 work exhaustion is atomic and the injected counter never exceeds its literal cap", () => {
+  const work = { steps: 8 * 2 * 1024 * 1024 - 1 };
+  expect(
+    buildCanonicalRequest(
+      digestArgs("runtime", { messages: [{ role: "user", content: "U" }], conversation: "client" }),
+      work,
+    ),
+  ).toBeNull();
+  expect(work.steps).toBe(8 * 2 * 1024 * 1024);
+  expect(
+    buildCanonicalRequest(digestArgs("runtime", { messages: [{ role: "user", content: "U" }] }), {
+      steps: 0,
+    }),
+  ).not.toBeNull();
+});
+
+it.each(instructionPlacementRows)(
+  "R7 production placement $surface $role separates leading and relocated histories",
+  ({ surface, role }) => {
+    const instruction = { role, content: "S" };
+    const user = { role: "user", content: "U" };
+    const suffix = [
+      { role: "assistant", content: "A" },
+      { role: "user", content: "V" },
+    ];
+    const material = (units: unknown[]) =>
+      affinityPrefixDigests(digestArgs("runtime", orderedHistoryPayload(surface, units), surface));
+    const a1 = material([instruction, user]);
+    const b1 = material([user, instruction]);
+    const a2 = material([instruction, user, ...suffix]);
+    const b2 = material([user, instruction, ...suffix]);
+    expect(a1.identifiable && b1.identifiable && a2.identifiable && b2.identifiable).toBe(true);
+    expect(a1.rootDigest).not.toBe(b1.rootDigest);
+    expect(a2.rootDigest).toBe(a1.rootDigest);
+    expect(b2.rootDigest).toBe(b1.rootDigest);
+    expect(a2.nodes.at(-1)?.digest).not.toBe(b2.nodes.at(-1)?.digest);
+    expect(a1.nodes).toHaveLength(1);
+    expect(b1.nodes).toHaveLength(2);
+    expect(a2.nodes.slice(0, 1)).toEqual(a1.nodes);
+    expect(b2.nodes.slice(0, 2)).toEqual(b1.nodes);
+    expect(a1.isContinuation).toBe(false);
+    expect(b1.isContinuation).toBe(false);
+    expect(a2.isContinuation).toBe(true);
+    expect(b2.isContinuation).toBe(true);
+    expect(a2.instructionDigests).toHaveLength(1);
+    expect(a2.instructionDigests).toEqual(a1.instructionDigests);
+    expect(b1.instructionDigests).toEqual([]);
+    expect(b2.instructionDigests).toEqual([]);
+    expect(b2.rootDigest).toBe(material([user, ...suffix]).rootDigest);
+  },
+);
+
+it.each(instructionPlacementRows)(
+  "R7 production late edit $surface $role preserves root hints and prefix before the edit",
+  ({ surface, role }) => {
+    const prefix = [
+      { role, content: "leading" },
+      { role: "user", content: "U" },
+      { role: "assistant", content: "A" },
+    ];
+    const material = (text: string) =>
+      affinityPrefixDigests(
+        digestArgs(
+          "runtime",
+          orderedHistoryPayload(surface, [
+            ...prefix,
+            { role, content: text },
+            { role: "user", content: "V" },
+          ]),
+          surface,
+        ),
+      );
+    const first = material("late");
+    const edit = material("edited late");
+    expect(first.rootDigest).toBe(edit.rootDigest);
+    expect(first.instructionDigests).toEqual(edit.instructionDigests);
+    expect(first.nodes).toHaveLength(4);
+    expect(first.nodes.slice(0, 2)).toEqual(edit.nodes.slice(0, 2));
+    expect(first.nodes.slice(2)).not.toEqual(edit.nodes.slice(2));
+    const leadingEdit = affinityPrefixDigests(
+      digestArgs(
+        "runtime",
+        orderedHistoryPayload(surface, [
+          { role, content: "edited leading" },
+          ...prefix.slice(1),
+          { role, content: "late" },
+          { role: "user", content: "V" },
+        ]),
+        surface,
+      ),
+    );
+    expect(leadingEdit.rootDigest).not.toBe(first.rootDigest);
+    expect(leadingEdit.instructionDigests).not.toEqual(first.instructionDigests);
+    expect(leadingEdit.nodes[0]).not.toEqual(first.nodes[0]);
+  },
+);
+
+it.each(instructionPlacementRows)(
+  "R7 continuation split $surface $role keeps late output evidence after the first user",
+  ({ surface, role }) => {
+    for (const type of ["tool_use", "tool_result"]) {
+      const instruction = { role, content: [{ type, id: "call" }] };
+      for (const units of [
+        [instruction, { role: "user", content: "U" }],
+        [{ role: "assistant", content: "greeting" }, instruction, { role: "user", content: "U" }],
+        [{ role: "user", content: "U" }, instruction],
+      ]) {
+        const request = orderedHistoryPayload(surface, units);
+        const expected = units[0]?.role === "user";
+        expect(buildCanonicalRequest({ surface, payload: request })?.isContinuation).toBe(expected);
+        expect(extractAffinityLayers(surface, request).isContinuation).toBe(expected);
+      }
+    }
+  },
+);
+
+it.each([
+  {
+    surface: "openai-chat",
+    request: {
+      model: "alias",
+      stream: false,
+      temperature: 0.2,
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "lookup",
+            parameters: {
+              type: "object",
+            },
+          },
+        },
+      ],
+      vendor_extension: {
+        stable: true,
+      },
+      messages: [
+        {
+          role: "system",
+          content: "S",
+        },
+        {
+          role: "developer",
+          content: "D",
+        },
+        {
+          role: "user",
+          content: "U",
+        },
+        {
+          role: "assistant",
+          content: "A",
+        },
+        {
+          role: "user",
+          content: "V",
+        },
+      ],
+    },
+    rootDigest: "g3AgU67fsnUp02hkzf5U4zHC2BN034RLlW9299aij_w",
+    nodes: [
+      {
+        digest: "WlvFWf2vi9FySNq5H6HqvIWF13oUXLFApp5b8Op0GyA",
+        depth: 1,
+      },
+      {
+        digest: "6jp7Fef4p_URXkegSigsd-wTjiGp6jqTePKpZRD0LyE",
+        depth: 2,
+      },
+      {
+        digest: "Wr3sYG2GmjZLE33Ye5PYfCzPy_Y8b2RBKGOk4JMPEyo",
+        depth: 3,
+      },
+    ],
+    instructionDigests: [
+      "instruction-v5:BRsSf2Cp53X44mAmqlyFn9IcUzWWsnTDp9_hXq5dweA",
+      "instruction-v5:Oq7UsVtdg2V0aCEzIJ7xBdkxFOoi9ny4jgyObhSWfns",
+      "instruction-v5:-dtT_Nz_DpeKXWEP5J4ohtJwiC3SxVFsIDqAkcGjRHE",
+    ],
+  },
+  {
+    surface: "openai-responses",
+    request: {
+      model: "alias",
+      stream: false,
+      temperature: 0.2,
+      tools: [
+        {
+          type: "function",
+          name: "lookup",
+          parameters: {
+            type: "object",
+          },
+        },
+      ],
+      vendor_extension: {
+        stable: true,
+      },
+      instructions: "top",
+      input: [
+        {
+          role: "system",
+          content: "S",
+        },
+        {
+          role: "developer",
+          content: "D",
+        },
+        {
+          role: "user",
+          content: "U",
+        },
+        {
+          role: "assistant",
+          content: "A",
+        },
+        {
+          role: "user",
+          content: "V",
+        },
+      ],
+    },
+    rootDigest: "QgvvQRR1ZmNDQmTNdKClM-UDIztvXNCcW7wjUBAyR1A",
+    nodes: [
+      {
+        digest: "nZc_pk25cKhGsC5bVZnwVz4ktqbIci1Ygbi097PYDg0",
+        depth: 1,
+      },
+      {
+        digest: "q1IR1Ai2laay5ii6otXoybq5YXXrfoLeVurJ-6z5jZA",
+        depth: 2,
+      },
+      {
+        digest: "cc1zCNVHFXuvtNUELEgLn4yGRhrHLSJr1Z8r6FKdkeo",
+        depth: 3,
+      },
+    ],
+    instructionDigests: [
+      "instruction-v5:k1g1kEmr2B6nLsvI47rKLcjpx7MAus1yKEf5ch6MznQ",
+      "instruction-v5:vl2HH12OiYEjhLZSi5ynajEy-9ygEgpZ4AtAtHPlA0o",
+      "instruction-v5:ol7uQpz-WTKxrAH6ws8tfAL_YRmI4-ZCrGoZfCWzq5o",
+      "instruction-v5:qjmSUfNQO_jfdefvgutLy9IqSjgLO1iVAxpN7gHbOLw",
+    ],
+  },
+  {
+    surface: "anthropic-messages",
+    request: {
+      model: "alias",
+      stream: false,
+      temperature: 0.2,
+      tools: [
+        {
+          name: "lookup",
+          input_schema: {
+            type: "object",
+          },
+        },
+      ],
+      vendor_extension: {
+        stable: true,
+      },
+      system: [
+        {
+          type: "text",
+          text: "S",
+        },
+      ],
+      messages: [
+        {
+          role: "user",
+          content: "U",
+        },
+        {
+          role: "assistant",
+          content: "A",
+        },
+        {
+          role: "user",
+          content: "V",
+        },
+      ],
+    },
+    rootDigest: "qPrVvbCK40E-RRskLw1IJw6wRQ0BN8JMA9m5UZwNIDs",
+    nodes: [
+      {
+        digest: "VVuMYkSXcPomPOXy7sNM4nn8l0WbuoM9z3n72yiSOmw",
+        depth: 1,
+      },
+      {
+        digest: "KoeRFAneXhf5aNPPjOaS0PVB-Ph121ZeypLLlu56MR8",
+        depth: 2,
+      },
+      {
+        digest: "NrYJLEB7AxvepojaYDIFY20jvPOOe5kd0AnqlQ_0QKo",
+        depth: 3,
+      },
+    ],
+    instructionDigests: [
+      "instruction-v5:FL987faZpOp3sx4KrjuOm6f8NptSOli13w0XQpkha-k",
+      "instruction-v5:hFMNZxu436AXEXzUQP4_WCJW0-wfl6O30fIsrgk5Pa0",
+    ],
+  },
+])(
+  "R7 golden leading instructions $surface retain HEAD root nodes and routing hints",
+  ({ surface, request, rootDigest, nodes, instructionDigests }) => {
+    const material = affinityPrefixDigests(digestArgs("runtime", request, surface));
+    expect(material.rootDigest).toBe(rootDigest);
+    expect(material.nodes).toEqual(nodes);
+    expect(material.instructionDigests).toEqual(instructionDigests);
+  },
+);

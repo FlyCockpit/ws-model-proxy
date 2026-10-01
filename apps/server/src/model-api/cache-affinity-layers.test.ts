@@ -1,10 +1,40 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+vi.mock("@ws-model-proxy/db", () => ({ default: {}, Prisma: {} }));
+vi.mock("@ws-model-proxy/env/server", () => ({ env: {} }));
+
+import { buildCanonicalRequest } from "./cache-affinity.js";
+import {
+  canonicalKeys,
+  canonicalShapes,
+  instructionPlacementRows,
+  nestedWire,
+  orderedHistoryPayload,
+} from "./cache-affinity-canonical.test-fixtures.js";
 import {
   asJson,
+  budgetedStableJson,
   canonicalizeAffinitySurface,
-  extractAffinityLayers,
+  type JsonValue,
+  extractAffinityLayers as legacyAffinityLayers,
+  MAX_CANONICAL_DEPTH,
+  stableJson,
 } from "./cache-affinity-layers.js";
+
+// Layer-shape assertions retain the legacy reference; continuation decisions
+// always exercise the canonical request used by production routing.
+function extractAffinityLayers(
+  surface: string | null | undefined,
+  payload: Record<string, unknown>,
+) {
+  const layers = legacyAffinityLayers(surface, payload);
+  return {
+    ...layers,
+    isContinuation:
+      buildCanonicalRequest({ surface: surface ?? "", payload })?.isContinuation ?? false,
+  };
+}
 
 const extractorSource = readFileSync(
   new URL("./cache-affinity-layers.ts", import.meta.url),
@@ -37,6 +67,80 @@ describe("extractAffinityLayers", () => {
     expect(extractorSource).not.toMatch(/parseOpenAiChatRequest/);
     expect(extractorSource).not.toMatch(/parseOpenAiResponsesRequest/);
     expect(extractorSource).not.toMatch(/parseAnthropicMessagesRequest/);
+  });
+
+  it.each(
+    ["openai-chat", "anthropic-messages", "openai-responses"].flatMap((surface) => [
+      ...["tool_use", "tool_result"].flatMap((type) => [
+        {
+          surface,
+          name: `content-only ${type}`,
+          units: [
+            { role: "user", content: "U" },
+            { role: "user", content: [{ type, id: "call" }] },
+          ],
+          continuation: true,
+        },
+        {
+          surface,
+          name: `leading content-only ${type}`,
+          units: [{ role: "user", content: [{ type, id: "call" }] }],
+          continuation: false,
+        },
+      ]),
+      {
+        surface,
+        name: "greeting starter",
+        units: [
+          { role: "assistant", content: "welcome" },
+          { role: "user", content: "X" },
+        ],
+        continuation: false,
+      },
+      {
+        surface,
+        name: "greeting then follow-up",
+        units: [
+          { role: "assistant", content: "welcome" },
+          { role: "user", content: "X" },
+          { role: "assistant", content: "reply" },
+          { role: "user", content: "next" },
+        ],
+        continuation: true,
+      },
+      {
+        surface,
+        name: "leading tool context",
+        units: [
+          { role: "tool", content: "context" },
+          { role: "user", content: "X" },
+        ],
+        continuation: false,
+      },
+      {
+        surface,
+        name: "no user",
+        units: [{ role: "assistant", content: "context" }],
+        continuation: false,
+      },
+      {
+        surface,
+        name: "few-shot documented limit",
+        units: [
+          { role: "user", content: "example" },
+          { role: "assistant", content: "label" },
+          { role: "user", content: "query" },
+        ],
+        continuation: true,
+      },
+    ]),
+  )("R1 continuation $surface $name", ({ surface, units, continuation }) => {
+    const layers = extractAffinityLayers(
+      surface,
+      surface === "openai-responses" ? { input: units } : { messages: units },
+    );
+    expect(layers.conversationUnits).toEqual(units);
+    expect(layers.isContinuation).toBe(continuation);
   });
 
   it("splits Chat {system, user} into instruction and conversation units without continuation", () => {
@@ -135,7 +239,7 @@ describe("extractAffinityLayers", () => {
     expect(layers.isContinuation).toBe(true);
   });
 
-  it("lifts interleaved Chat system and developer messages into the instruction layer", () => {
+  it("keeps interleaved Chat instruction roles at their conversation positions", () => {
     const layers = extractAffinityLayers("openai-chat", {
       messages: [
         { role: "system", content: "S1" },
@@ -144,16 +248,40 @@ describe("extractAffinityLayers", () => {
         { role: "user", content: "U2" },
       ],
     });
-    expect(layers.instructionUnits).toEqual([
-      { role: "system", content: "S1" },
-      { role: "developer", content: "D" },
-    ]);
+    expect(layers.instructionUnits).toEqual([{ role: "system", content: "S1" }]);
     expect(layers.conversationUnits).toEqual([
       { role: "user", content: "U1" },
+      { role: "developer", content: "D" },
       { role: "user", content: "U2" },
     ]);
     expect(layers.isContinuation).toBe(false);
   });
+
+  it.each(instructionPlacementRows)(
+    "R7 layer split $surface $role stops at the first non-instruction unit",
+    ({ surface, role }) => {
+      const leading = { role, content: "leading" };
+      const late = { role, content: "late" };
+      for (const first of [
+        { role: "user", content: "U" },
+        { role: "assistant", content: "greeting" },
+        { role: "tool", content: "context" },
+        { type: "reasoning", summary: [] },
+        "scalar context",
+      ]) {
+        const units = [leading, first, late];
+        const request = orderedHistoryPayload(surface, units);
+        const legacy = legacyAffinityLayers(surface, request);
+        expect(legacy.instructionUnits).toEqual([leading]);
+        expect(legacy.conversationUnits).toEqual([first, late]);
+        const canonical = buildCanonicalRequest({ surface, payload: request });
+        expect(canonical?.instructions.map((text) => JSON.parse(text))).toEqual([leading]);
+        expect(canonical?.conversationUnits.map((text) => JSON.parse(text))).toEqual([first, late]);
+        expect(canonical?.isContinuation).toBe(false);
+        expect(legacy.isContinuation).toBe(false);
+      }
+    },
+  );
 
   it("never reads Chat prompt or input as conversation units", () => {
     const layers = extractAffinityLayers("openai-chat", {
@@ -196,17 +324,24 @@ describe("extractAffinityLayers", () => {
     ).toBe(true);
     expect(
       extractAffinityLayers("openai-chat", {
-        messages: [{ role: "tool", tool_call_id: "c1", content: "ok" }],
-      }).isContinuation,
-    ).toBe(true);
-    expect(
-      extractAffinityLayers("openai-chat", {
-        messages: [{ role: "function", name: "lookup", content: "{}" }],
+        messages: [
+          { role: "user", content: "U" },
+          { role: "tool", tool_call_id: "c1", content: "ok" },
+        ],
       }).isContinuation,
     ).toBe(true);
     expect(
       extractAffinityLayers("openai-chat", {
         messages: [
+          { role: "user", content: "U" },
+          { role: "function", name: "lookup", content: "{}" },
+        ],
+      }).isContinuation,
+    ).toBe(true);
+    expect(
+      extractAffinityLayers("openai-chat", {
+        messages: [
+          { role: "user", content: "U" },
           { role: "assistant", content: null, function_call: { name: "lookup", arguments: "{}" } },
         ],
       }).isContinuation,
@@ -288,19 +423,26 @@ describe("extractAffinityLayers", () => {
   it("marks Anthropic user tool_result and tool_use content as continuation", () => {
     expect(
       extractAffinityLayers("anthropic-messages", {
-        messages: [{ role: "user", content: [{ type: "tool_result", tool_use_id: "t1" }] }],
+        messages: [
+          { role: "user", content: "U" },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "t1" }] },
+        ],
       }).isContinuation,
     ).toBe(true);
     expect(
       extractAffinityLayers("anthropic-messages", {
         messages: [
+          { role: "user", content: "U" },
           { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "lookup" }] },
         ],
       }).isContinuation,
     ).toBe(true);
     expect(
       extractAffinityLayers("anthropic-messages", {
-        messages: [{ role: "user", content: [{ type: "Tool_Result", tool_use_id: "t1" }] }],
+        messages: [
+          { role: "user", content: "U" },
+          { role: "user", content: [{ type: "Tool_Result", tool_use_id: "t1" }] },
+        ],
       }).isContinuation,
     ).toBe(true);
   });
@@ -347,7 +489,10 @@ describe("extractAffinityLayers", () => {
     ]) {
       expect(
         extractAffinityLayers("openai-responses", {
-          input: [{ type, id: "x" }],
+          input: [
+            { role: "user", content: "U" },
+            { type, id: "x" },
+          ],
         }).isContinuation,
         type,
       ).toBe(true);
@@ -358,6 +503,7 @@ describe("extractAffinityLayers", () => {
     expect(
       extractAffinityLayers("openai-responses", {
         input: [
+          { role: "user", content: "U" },
           { type: "message", role: "assistant", content: [{ type: "output_text", text: "A" }] },
         ],
       }).isContinuation,
@@ -502,3 +648,131 @@ describe("extractAffinityLayers", () => {
     ).not.toContain("tools");
   });
 });
+
+describe("R2 canonical JSON contract", () => {
+  it.each(canonicalKeys.flatMap((key) => canonicalShapes.map((shape) => ({ key, shape }))))(
+    "preserves own $key in $shape wire JSON",
+    ({ key, shape }) => {
+      const leaf = `{${JSON.stringify(key)}:{"const":"one"},"__proto__":{"const":"one"}}`;
+      const wire =
+        shape === "array" ? `[${leaf}]` : shape === "mixed" ? `{"nested":[${leaf}]}` : leaf;
+      const parsed = JSON.parse(wire);
+      const converted = asJson(parsed)!;
+      const text = stableJson(converted);
+      expect(JSON.parse(text)).toEqual(parsed);
+      expect(text).toContain('"__proto__":{"const":"one"}');
+      expect(text).toContain(`${JSON.stringify(key)}:{"const":"one"}`);
+    },
+  );
+
+  it("own key ordering is stable and duplicate wire keys are last-wins", () => {
+    const one = asJson(JSON.parse('{"__proto__":{"const":1},"0":0,"":2,"constructor":3}'))!;
+    const two = asJson(
+      JSON.parse('{"constructor":3,"":2,"0":0,"__proto__":{"const":0},"__proto__":{"const":1}}'),
+    )!;
+    expect(stableJson(one)).toBe(stableJson(two));
+    expect(
+      Object.getOwnPropertyDescriptor(JSON.parse(stableJson(two)), "__proto__")?.value,
+    ).toEqual({ const: 1 });
+    expect(stableJson(two)).not.toBe(
+      stableJson(asJson(JSON.parse('{"constructor":3,"":2,"0":0,"__proto__":{"const":0}}'))!),
+    );
+  });
+
+  it.each(canonicalShapes)(
+    "bounds $0 recursion before descending and rejects the whole value",
+    (shape) => {
+      expect(asJson(JSON.parse(nestedWire(MAX_CANONICAL_DEPTH, shape)))).toBeDefined();
+      for (const depth of [MAX_CANONICAL_DEPTH + 1, 10_000]) {
+        const parsed = JSON.parse(nestedWire(depth, shape));
+        expect(() => asJson(parsed)).not.toThrow();
+        expect(asJson(parsed)).toBeUndefined();
+      }
+    },
+  );
+});
+
+it("R2 converter enforces the exact 2 MiB size boundary atomically", () => {
+  const atBound = "x".repeat(2 * 1024 * 1024 - 2);
+  expect(asJson(atBound)).toBe(atBound);
+  expect(asJson(`${atBound}x`)).toBeUndefined();
+  expect(asJson({ first: "safe", last: atBound })).toBeUndefined();
+});
+
+it("R3 converter charges mostly-key bytes at the exact 2 MiB boundary", () => {
+  // {"<key>":0}: six bytes of punctuation/value, all other bytes are the key.
+  const key = "k".repeat(2 * 1024 * 1024 - 6);
+  const atBound = { [key]: 0 };
+  expect(Buffer.byteLength(JSON.stringify(atBound))).toBe(2 * 1024 * 1024);
+  expect(asJson(atBound)).toBeDefined();
+  expect(asJson({ [`${key}k`]: 0 })).toBeUndefined();
+});
+
+it.each([2, 8192, 100000])(
+  "R5 converter charges commas for %i small keys at cap and cap+1",
+  (count) => {
+    const cap = 2 * 1024 * 1024;
+    const atCap = {
+      ...Object.fromEntries(Array.from({ length: count }, (_, i) => [`k${i}`, 0])),
+      padding: "",
+    };
+    atCap.padding = "x".repeat(cap - Buffer.byteLength(JSON.stringify(atCap)));
+    const overCap = { ...atCap, padding: `${atCap.padding}x` };
+    expect(Buffer.byteLength(JSON.stringify(atCap))).toBe(cap);
+    expect(Buffer.byteLength(JSON.stringify(overCap))).toBe(cap + 1);
+    expect(asJson(atCap)).toBeDefined();
+    // Keep mutation failures small even for the 100k-key object.
+    expect(asJson(overCap) === undefined).toBe(true);
+  },
+);
+
+it("R4 pins the literal affinity depth 128", () => {
+  expect(MAX_CANONICAL_DEPTH).toBe(128);
+  expect(asJson(JSON.parse(nestedWire(128, "object")))).toBeDefined();
+  expect(asJson(JSON.parse(nestedWire(129, "object")))).toBeUndefined();
+});
+
+it("R4 preserves the previous serializer bytes on seeded random JSON and escaping boundaries", () => {
+  const previous = (value: JsonValue): string => {
+    if (value === null || typeof value !== "object") return JSON.stringify(value);
+    if (Array.isArray(value)) return `[${value.map(previous).join(",")}]`;
+    return `{${Object.keys(value)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${previous(value[key]!)}`)
+      .join(",")}}`;
+  };
+  let seed = 160;
+  const random = () => {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    return seed / 2 ** 32;
+  };
+  const value = (depth: number): JsonValue => {
+    const kind = Math.floor(random() * (depth ? 6 : 4));
+    if (kind === 0) return null;
+    if (kind === 1) return random() < 0.5;
+    if (kind === 2) return (random() - 0.5) * 1e12;
+    if (kind === 3) return canonicalKeys[Math.floor(random() * canonicalKeys.length)]!;
+    const entries = Array.from({ length: Math.floor(random() * 8) }, () => value(depth - 1));
+    return kind === 4
+      ? entries
+      : Object.fromEntries(entries.map((entry, i) => [canonicalKeys[i]!, entry]));
+  };
+  for (let i = 0; i < 300; i++) {
+    const entry = value(5);
+    expect(budgetedStableJson(entry)).toBe(previous(entry));
+    expect(stableJson(asJson(entry)!)).toBe(previous(entry));
+  }
+  for (const suffix of ["😀", "\ud800", "\udc00", '"\\\n']) {
+    const text = `${"x".repeat(4095)}${suffix}${"y".repeat(8192)}`;
+    expect(budgetedStableJson({ [text]: text })).toBe(previous({ [text]: text }));
+  }
+});
+
+it.each(["1e400", "-1e400"])(
+  "R4 converts wire overflow %s to null without dropping members or arrays",
+  (value) => {
+    const parsed = JSON.parse(`{"scalar":${value},"object":{"field":${value}},"array":[${value}]}`);
+    expect(asJson(parsed)).toEqual({ scalar: null, object: { field: null }, array: [null] });
+    expect(JSON.parse(stableJson(asJson(parsed)!))).toEqual(JSON.parse(JSON.stringify(parsed)));
+  },
+);
