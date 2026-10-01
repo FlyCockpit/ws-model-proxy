@@ -753,6 +753,11 @@ fn commit_rename(
                     return finish_move(&mut recovery, result.map(|()| false));
                 }
                 Err(Errno::EEXIST) => return Err(exists_error()),
+                Err(errno) if src.stat.kind() == Kind::Dir && errno == Errno::EINVAL => {
+                    return Err(FileError::invalid(
+                        "cannot move a directory into its own subtree",
+                    ));
+                }
                 Err(errno) if is_unsupported(errno) => {}
                 Err(errno) => return Err(FileError::errno(errno)),
             }
