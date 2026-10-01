@@ -444,6 +444,10 @@ pub struct EndpointConfig {
     /// server fallback of 1. An existing non-null capacity is left unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_limit: Option<u32>,
+    /// Declared total KV capacity in tokens. Digest-excluded like
+    /// `concurrencyLimit`; when set it wins over a probed K.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_tokens: Option<u64>,
     /// Upstream engine. `auto` (the default) detects it at probe time; an
     /// explicit value overrides detection. llama.cpp and vLLM advertise
     /// `top_k` in the inventory only when declared explicitly.
@@ -467,6 +471,7 @@ impl Default for EndpointConfig {
             enabled: true,
             expand_media: false,
             concurrency_limit: None,
+            kv_tokens: None,
             engine: EndpointEngine::Auto,
             default_capabilities: OpenAiCompatibleCapabilities::default(),
             headers: Vec::new(),
@@ -1548,6 +1553,14 @@ impl Config {
             {
                 anyhow::bail!(
                     "endpoint `{}` concurrency limit must be an integer from 1 to 10000",
+                    endpoint.slug
+                );
+            }
+            if let Some(tokens) = endpoint.kv_tokens
+                && !(1..=1_000_000_000_000).contains(&tokens)
+            {
+                anyhow::bail!(
+                    "endpoint `{}` kvTokens must be an integer from 1 to 1000000000000",
                     endpoint.slug
                 );
             }

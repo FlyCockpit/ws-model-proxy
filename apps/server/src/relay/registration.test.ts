@@ -1346,8 +1346,11 @@ describe("capability override origin", () => {
       data: {
         engineKind: "LLAMA_CPP",
         engineSlots: 8,
+        engineSlotsSource: "PROBE",
         kvBudgetTokens: null,
+        kvBudgetTokensSource: null,
         maxModelLen: 32768,
+        maxModelLenSource: "PROBE",
         engineFactsSource: "PROBE",
         engineFactsAt: now,
       },

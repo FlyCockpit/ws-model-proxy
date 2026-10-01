@@ -286,6 +286,13 @@ enum EngineFactsSource {
   MIXED
 }
 
+/// Provenance of one stored engine fact (slots, K, maxModelLen).
+enum EngineFactSource {
+  PROBE
+  CONFIG
+  CUSTOM
+}
+
 enum AdmissionSourceKind {
   DIRECT
   POOL
@@ -1253,7 +1260,11 @@ model InferenceCapacity {
   engineSlots                Int?
   /// Total KV capacity in tokens (vLLM, SGLang).
   kvBudgetTokens             Int?
+  /// Provenance of `engineSlots` / `kvBudgetTokens` / `maxModelLen`.
+  engineSlotsSource          EngineFactSource?
+  kvBudgetTokensSource       EngineFactSource?
   maxModelLen                Int?
+  maxModelLenSource          EngineFactSource?
   engineFactsSource          EngineFactsSource?
   engineFactsAt              DateTime?
   User                       User                  @relation("InferenceCapacityOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)

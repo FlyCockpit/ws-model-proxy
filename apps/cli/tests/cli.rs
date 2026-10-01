@@ -723,6 +723,58 @@ fn endpoints_concurrency_and_engine_round_trip() {
 }
 
 #[test]
+fn endpoints_kv_tokens_round_trip_json_and_llama_cpp_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args([
+            "endpoints",
+            "add",
+            "--slug",
+            "local",
+            "--label",
+            "Local",
+            "--base-url",
+            "http://127.0.0.1:8080/v1",
+            "--engine",
+            "generic",
+        ])
+        .assert()
+        .success();
+
+    let mut set = cli(&config, &state);
+    set.args(["endpoints", "--json", "kv-tokens", "local", "262144"]);
+    let value = json_stdout(set);
+    assert_eq!(value["kvTokens"], 262144);
+
+    cli(&config, &state)
+        .args(["endpoints", "kv-tokens", "local", "--clear"])
+        .assert()
+        .success();
+    let mut list = cli(&config, &state);
+    list.args(["endpoints", "--json", "list"]);
+    assert!(json_stdout(list)["endpoints"][0].get("kvTokens").is_none());
+
+    cli(&config, &state)
+        .args(["endpoints", "engine", "local", "llama.cpp"])
+        .assert()
+        .success();
+    cli(&config, &state)
+        .args(["endpoints", "kv-tokens", "local", "4096"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("llama.cpp stays slot-based"));
+
+    cli(&config, &state)
+        .args(["endpoints", "kv-tokens", "missing", "2"])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains("endpoint `missing` not found"));
+}
+
+#[test]
 fn endpoints_remove_unknown_slug_exits_3_not_found() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");

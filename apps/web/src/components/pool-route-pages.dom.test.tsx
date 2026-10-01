@@ -887,8 +887,11 @@ describe("dedicated pool pages", () => {
 const NO_ENGINE_FACTS = {
   engineKind: null,
   engineSlots: null,
+  engineSlotsSource: null,
   kvBudgetTokens: null,
+  kvBudgetTokensSource: null,
   maxModelLen: null,
+  maxModelLenSource: null,
   engineFactsSource: null,
   engineFactsAt: null,
   enginePreset: { preset: "generic", fullWhen: "active_at_user_cap", protectionUnit: "slots" },
@@ -984,8 +987,11 @@ describe("delete conflicts on pool pages", () => {
         hardConcurrencyLimit: 4,
         engineKind: "LLAMA_CPP",
         engineSlots: 4,
+        engineSlotsSource: "PROBE",
         kvBudgetTokens: null,
+        kvBudgetTokensSource: null,
         maxModelLen: 32768,
+        maxModelLenSource: "PROBE",
         engineFactsSource: "PROBE",
         engineFactsAt: new Date("2026-09-28T10:00:00.000Z"),
         enginePreset: { preset: "llama.cpp", fullWhen: "active_at_slots", protectionUnit: "slots" },
@@ -1007,6 +1013,40 @@ describe("delete conflicts on pool pages", () => {
     expect(screen.getByText(/dashboard:pools\.capacity\.engineFacts\.sources\.PROBE/)).toBeTruthy();
     // Only the capacity with facts shows them.
     expect(screen.getAllByText(/dashboard:pools\.capacity\.engineFacts\.preset/)).toHaveLength(1);
+  });
+
+  it("shows per-fact provenance for a declared KV budget", async () => {
+    state.capacities = [
+      {
+        id: "capacity-1",
+        label: "GPU box",
+        runtimeModel: "example",
+        hardConcurrencyLimit: 1,
+        engineKind: "GENERIC",
+        engineSlots: null,
+        engineSlotsSource: null,
+        kvBudgetTokens: 262144,
+        kvBudgetTokensSource: "CONFIG",
+        maxModelLen: null,
+        maxModelLenSource: null,
+        engineFactsSource: "CONFIG",
+        engineFactsAt: new Date("2026-09-28T10:00:00.000Z"),
+        enginePreset: {
+          preset: "generic",
+          fullWhen: "active_at_user_cap",
+          protectionUnit: "tokens",
+        },
+        _count: { CapacityLeases: 0 },
+      },
+    ];
+    mountWithAppToasts(<InferenceCapacityPage />);
+
+    expect(
+      await screen.findByText(/dashboard:pools\.capacity\.engineFacts\.kvBudget/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/dashboard:pools\.capacity\.engineFacts\.factSources\.CONFIG/),
+    ).toBeTruthy();
   });
 
   it("shows facts for a capacity whose only stored fact is maxModelLen", async () => {

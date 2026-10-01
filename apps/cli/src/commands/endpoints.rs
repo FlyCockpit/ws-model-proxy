@@ -34,6 +34,9 @@ enum Sub {
     Probe(ProbeArgs),
     /// Set or clear the concurrency sent for every model on an endpoint.
     Concurrency(ConcurrencyArgs),
+    /// Set or clear the declared KV capacity in tokens for an endpoint.
+    #[command(name = "kv-tokens")]
+    KvTokens(KvTokensArgs),
     /// Declare the upstream engine. llama.cpp and vLLM advertise `top_k`.
     Engine(EngineArgs),
 }
@@ -109,6 +112,20 @@ struct ConcurrencyArgs {
 }
 
 #[derive(Debug, clap::Args)]
+struct KvTokensArgs {
+    slug: String,
+    /// Total KV capacity in tokens (1 to 1e12).
+    #[arg(
+        value_parser = clap::value_parser!(u64).range(1..=1_000_000_000_000),
+        required_unless_present = "clear"
+    )]
+    tokens: Option<u64>,
+    /// Omit the declared KV size so the server uses the probed value.
+    #[arg(long, conflicts_with = "tokens")]
+    clear: bool,
+}
+
+#[derive(Debug, clap::Args)]
 struct EngineArgs {
     slug: String,
     #[arg(value_enum)]
@@ -133,6 +150,7 @@ pub fn run(args: &Args) -> Result<()> {
         Sub::List => list_endpoints(args.json),
         Sub::Probe(probe) => probe_endpoints(args.json, probe),
         Sub::Concurrency(concurrency) => set_concurrency(args.json, concurrency),
+        Sub::KvTokens(kv_tokens) => set_kv_tokens(args.json, kv_tokens),
         Sub::Engine(engine) => set_engine(args.json, engine),
     }
 }
@@ -282,6 +300,30 @@ fn set_concurrency(json: bool, args: &ConcurrencyArgs) -> Result<()> {
         ))?;
     } else {
         output::line(format!("cleared concurrency for `{}`", endpoint.slug))?;
+    }
+    Ok(())
+}
+
+fn set_kv_tokens(json: bool, args: &KvTokensArgs) -> Result<()> {
+    let tokens = if args.clear { None } else { args.tokens };
+    let endpoint = update_endpoint(&args.slug, |endpoint| {
+        endpoint.kv_tokens = tokens;
+        Ok(())
+    })?;
+    if tokens.is_some()
+        && crate::engine::effective_kind(&endpoint)
+            .is_some_and(|(kind, _)| kind == crate::engine::EngineKind::LlamaCpp)
+    {
+        output::diagnostic(
+            "warning: llama.cpp stays slot-based; a declared KV size is stored but does not switch protection to token mode",
+        )?;
+    }
+    if json {
+        output::json(&endpoint)?;
+    } else if let Some(tokens) = tokens {
+        output::line(format!("set kv-tokens for `{}` to {tokens}", endpoint.slug))?;
+    } else {
+        output::line(format!("cleared kv-tokens for `{}`", endpoint.slug))?;
     }
     Ok(())
 }

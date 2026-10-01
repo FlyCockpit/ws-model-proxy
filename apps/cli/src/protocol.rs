@@ -1469,13 +1469,18 @@ pub fn endpoint_engine_facts(endpoint: &EndpointConfig) -> Option<EngineFacts> {
     let configured_slots = endpoint
         .concurrency_limit
         .filter(|limit| (1..=10_000).contains(limit));
+    let configured_kv = endpoint
+        .kv_tokens
+        .filter(|tokens| (1..=ENGINE_TOKEN_COUNT_MAX).contains(tokens));
     let facts = EngineFacts {
         engine,
         slots: configured_slots
             .map(EngineFact::config)
             .or_else(|| probed_slots.map(EngineFact::probe)),
         ctx_per_slot: token_fact(detected.and_then(|engine| engine.ctx_per_slot)),
-        kv_tokens: token_fact(detected.and_then(|engine| engine.kv_tokens)),
+        kv_tokens: configured_kv
+            .map(EngineFact::config)
+            .or_else(|| token_fact(detected.and_then(|engine| engine.kv_tokens))),
         max_model_len: token_fact(detected.and_then(|engine| engine.max_model_len)),
         host_prompt_cache_mib: None,
         served_model_aliases: detected
@@ -3203,6 +3208,7 @@ mod relay_27_vectors {
         };
         let without = inventory_digest(&[endpoint_inventory(&endpoint, EndpointStatus::Online)]);
         endpoint.concurrency_limit = Some(3);
+        endpoint.kv_tokens = Some(262_144);
         endpoint.last_probe = probed(
             DetectedEngine {
                 kind: Some(EngineKind::Vllm),
@@ -3259,6 +3265,28 @@ mod relay_27_vectors {
         endpoint.concurrency_limit = None;
         let facts = endpoint_engine_facts(&endpoint).expect("facts");
         assert_eq!(facts.slots, Some(EngineFact::probe(8)));
+    }
+
+    #[test]
+    fn a_configured_kv_tokens_wins_over_probed() {
+        let mut endpoint = EndpointConfig {
+            slug: "generic".to_string(),
+            kv_tokens: Some(262_144),
+            last_probe: probed(
+                DetectedEngine {
+                    kind: Some(EngineKind::Vllm),
+                    kv_tokens: Some(1_000),
+                    ..DetectedEngine::default()
+                },
+                &[],
+            ),
+            ..EndpointConfig::default()
+        };
+        let facts = endpoint_engine_facts(&endpoint).expect("facts");
+        assert_eq!(facts.kv_tokens, Some(EngineFact::config(262_144)));
+        endpoint.kv_tokens = None;
+        let facts = endpoint_engine_facts(&endpoint).expect("facts");
+        assert_eq!(facts.kv_tokens, Some(EngineFact::probe(1_000)));
     }
 
     #[test]

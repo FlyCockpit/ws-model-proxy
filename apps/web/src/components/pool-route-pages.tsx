@@ -1309,6 +1309,8 @@ function CapacityEngineFacts({ capacity }: { capacity: PoolDetailCapacity }) {
   ) {
     return null;
   }
+  const withProvenance = (text: string, source: PoolDetailCapacity["engineSlotsSource"]) =>
+    source ? `${text} · ${t(`dashboard:pools.capacity.engineFacts.factSources.${source}`)}` : text;
   const facts = [
     capacity.engineKind
       ? t("dashboard:pools.capacity.engineFacts.engine", {
@@ -1316,17 +1318,26 @@ function CapacityEngineFacts({ capacity }: { capacity: PoolDetailCapacity }) {
         })
       : null,
     capacity.engineSlots !== null
-      ? t("dashboard:pools.capacity.engineFacts.slots", { count: capacity.engineSlots })
+      ? withProvenance(
+          t("dashboard:pools.capacity.engineFacts.slots", { count: capacity.engineSlots }),
+          capacity.engineSlotsSource,
+        )
       : null,
     capacity.kvBudgetTokens !== null
-      ? t("dashboard:pools.capacity.engineFacts.kvBudget", {
-          value: capacity.kvBudgetTokens.toLocaleString(),
-        })
+      ? withProvenance(
+          t("dashboard:pools.capacity.engineFacts.kvBudget", {
+            value: capacity.kvBudgetTokens.toLocaleString(),
+          }),
+          capacity.kvBudgetTokensSource,
+        )
       : null,
     capacity.maxModelLen !== null
-      ? t("dashboard:pools.capacity.engineFacts.maxModelLen", {
-          value: capacity.maxModelLen.toLocaleString(),
-        })
+      ? withProvenance(
+          t("dashboard:pools.capacity.engineFacts.maxModelLen", {
+            value: capacity.maxModelLen.toLocaleString(),
+          }),
+          capacity.maxModelLenSource,
+        )
       : null,
   ].filter((fact): fact is string => fact !== null);
   return (

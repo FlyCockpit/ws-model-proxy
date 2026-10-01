@@ -19,6 +19,8 @@ export type EngineKindName = (typeof ENGINE_KIND_NAMES)[number];
 export type EngineKind = "GENERIC" | "LLAMA_CPP" | "VLLM" | "SGLANG" | "OLLAMA" | "LM_STUDIO";
 /** Prisma `EngineFactsSource` values. */
 export type EngineFactsSource = "PROBE" | "CONFIG" | "MIXED";
+/** Prisma `EngineFactSource` values (per-fact provenance). */
+export type EngineFactSource = "PROBE" | "CONFIG" | "CUSTOM";
 
 type WireFact<T> = { value: T; source: "probe" | "config" };
 
@@ -37,8 +39,11 @@ export type WireEngineFacts = {
 export type StoredEngineFacts = {
   engineKind: EngineKind | null;
   engineSlots: number | null;
+  engineSlotsSource: EngineFactSource | null;
   kvBudgetTokens: number | null;
+  kvBudgetTokensSource: EngineFactSource | null;
   maxModelLen: number | null;
+  maxModelLenSource: EngineFactSource | null;
   engineFactsSource: EngineFactsSource;
 };
 
@@ -81,6 +86,19 @@ function storedInt(fact: WireFact<number> | undefined): number | null {
   return Math.min(fact.value, INT_COLUMN_MAX);
 }
 
+function storedFactSource(source: WireFact<unknown>["source"]): EngineFactSource {
+  return source === "config" ? "CONFIG" : "PROBE";
+}
+
+function storedIntWithSource(fact: WireFact<number> | undefined): {
+  value: number | null;
+  source: EngineFactSource | null;
+} {
+  const value = storedInt(fact);
+  if (value === null || !fact) return { value: null, source: null };
+  return { value, source: storedFactSource(fact.source) };
+}
+
 /**
  * The capacity columns for one model's facts, or null when the CLI reported
  * none that a capacity stores. servedModelAliases is process identity proof
@@ -89,11 +107,17 @@ function storedInt(fact: WireFact<number> | undefined): number | null {
  */
 export function storedEngineFacts(facts: WireEngineFacts | undefined): StoredEngineFacts | null {
   if (!facts) return null;
+  const slots = storedIntWithSource(facts.slots);
+  const kv = storedIntWithSource(facts.kvTokens);
+  const maxModelLen = storedIntWithSource(facts.maxModelLen);
   const stored = {
     engineKind: facts.engine ? engineKindToDb(facts.engine.value) : null,
-    engineSlots: storedInt(facts.slots),
-    kvBudgetTokens: storedInt(facts.kvTokens),
-    maxModelLen: storedInt(facts.maxModelLen),
+    engineSlots: slots.value,
+    engineSlotsSource: slots.source,
+    kvBudgetTokens: kv.value,
+    kvBudgetTokensSource: kv.source,
+    maxModelLen: maxModelLen.value,
+    maxModelLenSource: maxModelLen.source,
   };
   const sources = new Set(
     [facts.engine, facts.slots, facts.kvTokens, facts.maxModelLen]
@@ -111,8 +135,11 @@ export function sameStoredEngineFacts(left: StoredEngineFacts, right: StoredEngi
   return (
     left.engineKind === right.engineKind &&
     left.engineSlots === right.engineSlots &&
+    left.engineSlotsSource === right.engineSlotsSource &&
     left.kvBudgetTokens === right.kvBudgetTokens &&
+    left.kvBudgetTokensSource === right.kvBudgetTokensSource &&
     left.maxModelLen === right.maxModelLen &&
+    left.maxModelLenSource === right.maxModelLenSource &&
     left.engineFactsSource === right.engineFactsSource
   );
 }
@@ -219,25 +246,43 @@ export type EnginePreset = {
   protectionUnit: "slots" | "tokens";
 };
 
-export function enginePreset(kind: EngineKind | null | undefined): EnginePreset {
-  switch (kind) {
-    case "LLAMA_CPP":
-      return { preset: "llama.cpp", fullWhen: "active_at_slots", protectionUnit: "slots" };
-    case "VLLM":
-    case "SGLANG":
-      return {
-        preset: "vllm-sglang",
-        fullWhen: "user_cap_or_engine_load",
-        protectionUnit: "tokens",
-      };
-    case "OLLAMA":
-    case "LM_STUDIO":
-      return {
-        preset: "ollama-lm-studio",
-        fullWhen: "active_at_user_parallel",
-        protectionUnit: "slots",
-      };
-    default:
-      return { preset: "generic", fullWhen: "active_at_user_cap", protectionUnit: "slots" };
+export type EnginePresetOptions = {
+  kvBudgetTokens?: number | null;
+};
+
+export function enginePreset(
+  kind: EngineKind | null | undefined,
+  options?: EnginePresetOptions,
+): EnginePreset {
+  const preset = ((): EnginePreset => {
+    switch (kind) {
+      case "LLAMA_CPP":
+        return { preset: "llama.cpp", fullWhen: "active_at_slots", protectionUnit: "slots" };
+      case "VLLM":
+      case "SGLANG":
+        return {
+          preset: "vllm-sglang",
+          fullWhen: "user_cap_or_engine_load",
+          protectionUnit: "tokens",
+        };
+      case "OLLAMA":
+      case "LM_STUDIO":
+        return {
+          preset: "ollama-lm-studio",
+          fullWhen: "active_at_user_parallel",
+          protectionUnit: "slots",
+        };
+      default:
+        return { preset: "generic", fullWhen: "active_at_user_cap", protectionUnit: "slots" };
+    }
+  })();
+  if (
+    kind !== "LLAMA_CPP" &&
+    options?.kvBudgetTokens != null &&
+    Number.isInteger(options.kvBudgetTokens) &&
+    options.kvBudgetTokens > 0
+  ) {
+    return { ...preset, protectionUnit: "tokens" };
   }
+  return preset;
 }

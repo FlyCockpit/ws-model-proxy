@@ -656,6 +656,11 @@
           "PROBE": "detectado por la CLI",
           "CONFIG": "desde la configuración de la CLI",
           "MIXED": "detectado y configurado"
+        },
+        "factSources": {
+          "PROBE": "detectado",
+          "CONFIG": "declarado en la configuración de la CLI",
+          "CUSTOM": "adaptador personalizado"
         }
       }
     },
