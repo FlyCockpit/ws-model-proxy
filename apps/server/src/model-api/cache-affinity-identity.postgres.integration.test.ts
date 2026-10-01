@@ -2054,6 +2054,55 @@ integration("cache-prefix identity #160", () => {
     ).toBeGreaterThan(0);
   });
 
+  it("first write of a client-id fork stores shared prefix fields; a non-fork stores null", async () => {
+    if (!db) return;
+    const args = argsFor(await fixture());
+    const original = await service.rememberAffinity({
+      ...args,
+      payload: { messages: baseHistory },
+      estimatedTokens: 80_000,
+    });
+    expect(original).not.toBeNull();
+    const originalFootprints = await db.cacheAffinityRecord.findMany({
+      where: { sessionId: original!.sessionId, poolId: args.poolId, prefixDigest: null },
+      select: { sharedWithSessionId: true, sharedPrefixTokens: true },
+    });
+    expect(originalFootprints.length).toBeGreaterThan(0);
+    expect(
+      originalFootprints.every(
+        (row) => row.sharedWithSessionId == null && row.sharedPrefixTokens == null,
+      ),
+    ).toBe(true);
+
+    const forkPayload = { conversation_id: "fork-share", messages: baseHistory };
+    const fork = await service.rememberAffinity({
+      ...args,
+      payload: forkPayload,
+      estimatedTokens: 80_000,
+    });
+    expect(fork).not.toBeNull();
+    expect(fork!.sessionId).not.toBe(original!.sessionId);
+    const canonical = service.buildCanonicalRequest({
+      surface: args.surface,
+      payload: forkPayload,
+    })!;
+    const material = service.affinityPrefixDigests({
+      ...args,
+      payload: forkPayload,
+      runtimeIdentity: args.target.targetIdentity,
+    });
+    const expected = service.prefixTokensAtDepth(canonical, material.nodes.at(-1)!.depth, 80_000);
+    const forkFootprints = await db.cacheAffinityRecord.findMany({
+      where: { sessionId: fork!.sessionId, poolId: args.poolId, prefixDigest: null },
+      select: { sharedWithSessionId: true, sharedPrefixTokens: true },
+    });
+    expect(forkFootprints.length).toBeGreaterThan(0);
+    expect(forkFootprints.every((row) => row.sharedWithSessionId === original!.sessionId)).toBe(
+      true,
+    );
+    expect(forkFootprints.every((row) => row.sharedPrefixTokens === expected)).toBe(true);
+  });
+
   it("a fork without an id can switch branches repeatedly and stays one session", async () => {
     if (!db) return;
     const args = argsFor(await fixture());

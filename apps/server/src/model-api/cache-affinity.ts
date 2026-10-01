@@ -783,6 +783,46 @@ export function affinityIdentityProbeSql(
 }
 
 /**
+ * Deepest node of this request that another live session on the same target
+ * and root owns. One bounded equality seek per node, like the identity probe.
+ * First write of a session only; the footprint stores the hit once.
+ */
+export function affinitySharedPrefixProbeSql(
+  scope: IdentityScope,
+  material: AffinityMaterial,
+  sessionId: string,
+  now: Date,
+): Prisma.Sql {
+  return Prisma.sql`
+    SELECT COALESCE(tips."sessionId", others."sessionId") AS "sessionId", p.depth
+      FROM jsonb_to_recordset(${JSON.stringify(material.nodes)}::jsonb) AS p(digest text, depth int)
+      LEFT JOIN LATERAL (
+        ${affinityNodeProbeSql(
+          scope,
+          material.rootDigest,
+          Prisma.sql`p.digest`,
+          true,
+          now,
+          1,
+          Prisma.sql`"sessionId" <> ${sessionId} AND`,
+        )}
+      ) tips ON true
+      LEFT JOIN LATERAL (
+        ${affinityNodeProbeSql(
+          scope,
+          material.rootDigest,
+          Prisma.sql`p.digest`,
+          false,
+          now,
+          1,
+          Prisma.sql`tips."sessionId" IS NULL AND "sessionId" <> ${sessionId} AND`,
+        )}
+      ) others ON true
+     WHERE tips."sessionId" IS NOT NULL OR others."sessionId" IS NOT NULL
+     ORDER BY p.depth DESC LIMIT 1`;
+}
+
+/**
  * One snapshot of tip ownership and its structurally proven footprint: tokens
  * live on the tip node, written only by an identifiable request. Hint-only
  * refreshes can update recency and confirmation without changing that footprint.
@@ -857,10 +897,13 @@ export function affinityResidencySql(
   limitPerCapacity = AFFINITY_RESIDENCY_QUERY_LIMIT,
 ): Prisma.Sql {
   return Prisma.sql`
-    SELECT ranked."capacityId", ranked."sessionId", ranked.tokens
+    SELECT ranked."capacityId", ranked."sessionId", ranked.tokens,
+           ranked."sharedWithSessionId", ranked."sharedPrefixTokens"
       FROM (
         SELECT r."sessionId",
                r."estimatedTokens" AS tokens,
+               r."sharedWithSessionId",
+               r."sharedPrefixTokens",
                t."inferenceCapacityId" AS "capacityId",
                ROW_NUMBER() OVER (
                  PARTITION BY t."inferenceCapacityId"
@@ -877,13 +920,30 @@ export function affinityResidencySql(
      WHERE ranked.rn <= ${limitPerCapacity}`;
 }
 
+function billedResidentTokens(
+  row: AffinityResidencyRow,
+  residentSessionIds: ReadonlySet<string>,
+): number {
+  const raw = Math.max(0, Number(row.tokens) || 0);
+  const shared = Number(row.sharedPrefixTokens);
+  const sharer = row.sharedWithSessionId;
+  if (!Number.isFinite(shared) || !sharer || !residentSessionIds.has(sharer)) return raw;
+  return Math.max(0, raw - shared);
+}
+
 function residencyByCapacity(rows: readonly AffinityResidencyRow[]) {
-  const byCapacity = new Map<string, { tokens: number; sessions: number }>();
+  const grouped = new Map<string, AffinityResidencyRow[]>();
   for (const row of rows) {
-    const current = byCapacity.get(row.capacityId) ?? { tokens: 0, sessions: 0 };
-    current.sessions += 1;
-    current.tokens += Math.max(0, row.tokens ?? 0);
-    byCapacity.set(row.capacityId, current);
+    const list = grouped.get(row.capacityId) ?? [];
+    list.push(row);
+    grouped.set(row.capacityId, list);
+  }
+  const byCapacity = new Map<string, { tokens: number; sessions: number }>();
+  for (const [capacityId, list] of grouped) {
+    const residentSessionIds = new Set(list.map((row) => row.sessionId));
+    let tokens = 0;
+    for (const row of list) tokens += billedResidentTokens(row, residentSessionIds);
+    byCapacity.set(capacityId, { tokens, sessions: list.length });
   }
   return byCapacity;
 }
@@ -1425,7 +1485,7 @@ export async function rememberAffinity({
   now?: Date;
 }): Promise<AffinitySessionBinding | null> {
   if (!policy.enabled) return null;
-  const material = affinityPrefixDigests({
+  const requestArgs = {
     ownerId,
     resourceOwnerId,
     poolId,
@@ -1436,7 +1496,9 @@ export async function rememberAffinity({
     runtimeIdentity: target.targetIdentity,
     sessionBinding,
     headers,
-  });
+  };
+  const canonical = buildCanonicalRequest(requestArgs);
+  const material = materialFromCanonical(requestArgs, canonical);
   if (
     material.instructionDigests.length === 0 &&
     material.routingNodes.length === 0 &&
@@ -1512,6 +1574,21 @@ export async function rememberAffinity({
           select: { nodeDigest: true, depth: true, rootDigest: true },
         })
       : [];
+    let sharedWithSessionId: string | null = null;
+    let sharedPrefixTokens: number | null = null;
+    if (material.identifiable && existingNodes.length === 0 && material.nodes.length > 0) {
+      const shared = await tx.$queryRaw<{ sessionId: string; depth: number }[]>(
+        affinitySharedPrefixProbeSql(scope, material, sessionId, now),
+      );
+      const hit = shared[0];
+      const depth = Number(hit?.depth);
+      if (hit?.sessionId && hit.sessionId !== sessionId && Number.isFinite(depth)) {
+        sharedWithSessionId = hit.sessionId;
+        sharedPrefixTokens = canonical
+          ? prefixTokensAtDepth(canonical, depth, estimatedTokens ?? 0)
+          : 0;
+      }
+    }
     const parentNodes = material.boundSessionId
       ? material.boundSessionId === sessionId
         ? existingNodes
@@ -1729,11 +1806,13 @@ export async function rememberAffinity({
       await tx.$executeRaw`INSERT INTO cache_affinity_record
         (id, "userId", "tenantUserId", "poolId", "executionTargetId", "targetIdentity",
          "bindingDigest", "prefixDigest", "conversationDigest", "sessionId", "prefixDepth",
-         "digestVersion", "estimatedTokens", "reportedTokens", "engineCacheConfirmed", "lastUsedAt", "expiresAt")
+         "digestVersion", "estimatedTokens", "reportedTokens", "engineCacheConfirmed", "lastUsedAt", "expiresAt",
+         "sharedWithSessionId", "sharedPrefixTokens")
         VALUES (${randomUUID()}, ${resourceOwnerId}, ${ownerId}, ${poolId},
           ${target.executionTargetId}, ${target.targetIdentity}, ${material.bindingDigest},
           NULL, ${conversationDigest}, ${sessionId}, 0, ${DIGEST_VERSION},
-          ${estimatedTokens ?? null}, ${storedReportedTokens}, ${engineCacheConfirmed ?? false}, ${now}, ${expiresAt})
+          ${estimatedTokens ?? null}, ${storedReportedTokens}, ${engineCacheConfirmed ?? false}, ${now}, ${expiresAt},
+          ${sharedWithSessionId}, ${sharedPrefixTokens})
         ON CONFLICT ("tenantUserId", "poolId", "executionTargetId", "targetIdentity", "bindingDigest", "conversationDigest")
         WHERE "conversationDigest" IS NOT NULL AND "prefixDigest" IS NULL
         DO UPDATE SET "lastUsedAt" = EXCLUDED."lastUsedAt", "expiresAt" = EXCLUDED."expiresAt",

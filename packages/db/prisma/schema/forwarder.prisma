@@ -1120,6 +1120,11 @@ model CacheAffinityRecord {
   /// Engine-reported prompt + completion tokens when known.
   reportedTokens       Int?
   engineCacheConfirmed Boolean  @default(false)
+  /// Other live session on this target that owned the first-write prefix.
+  /// Written once on insert; later edits do not refresh it.
+  sharedWithSessionId  String?
+  /// Token estimate of that shared prefix. NULL when sharedWithSessionId is NULL.
+  sharedPrefixTokens   Int?
 
   @@unique([tenantUserId, poolId, executionTargetId, targetIdentity, bindingDigest, prefixDigest])
   @@index([tenantUserId, poolId, prefixDigest, expiresAt])

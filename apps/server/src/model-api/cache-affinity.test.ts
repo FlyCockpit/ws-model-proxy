@@ -60,6 +60,7 @@ import {
   type AffinityTarget,
   affinityPrefixDigests,
   affinityResidencySql,
+  affinitySharedPrefixProbeSql,
   buildAffinityTargetIdentity,
   buildCanonicalRequest,
   canonicalByteLength,
@@ -168,6 +169,10 @@ function isResidencyQuery(query: { strings?: TemplateStringsArray; sql?: string 
   return sql.includes("inferenceCapacityId") && sql.includes('"prefixDigest" IS NULL');
 }
 
+function isShareProbe(query: { strings?: TemplateStringsArray; sql?: string } | string) {
+  return querySql(query).includes('"sessionId" <>');
+}
+
 // Decode only the SQL write seam; PostgreSQL tests verify actual conflict updates.
 function conversationWrites() {
   return db.$executeRaw.mock.calls.flatMap(([query, ...values]) => {
@@ -194,8 +199,10 @@ function conversationWrites() {
           engineCacheConfirmed: values[12],
           lastUsedAt: values[13] as Date,
           expiresAt: values[14] as Date,
+          sharedWithSessionId: values[15] ?? null,
+          sharedPrefixTokens: values[16] ?? null,
         },
-        engineEvidence: values[15],
+        engineEvidence: values[17],
       },
     ];
   });
@@ -1935,6 +1942,78 @@ describe("cache affinity", () => {
     expect(forkA.digests).toEqual(original.digests);
     expect(forkB.digests).toEqual(original.digests);
     expect(anonymous.digests[0]).toBe(original.digests[0]);
+  });
+
+  it("first write of a client-id fork stores shared prefix fields; a non-fork stores null", async () => {
+    const served = target("target", "runtime");
+    const originalPayload = { conversation_id: "orig", messages: forkHistory };
+    const originalMaterial = affinityPrefixDigests(digestArgs("runtime", originalPayload));
+    await rememberAffinity({
+      ...digestArgs("runtime", originalPayload),
+      policy,
+      target: served,
+      estimatedTokens: 80_000,
+    });
+    expect(conversationWrites().length).toBeGreaterThan(0);
+    expect(conversationWrites().every(({ data }) => data.sharedWithSessionId == null)).toBe(true);
+    expect(conversationWrites().every(({ data }) => data.sharedPrefixTokens == null)).toBe(true);
+
+    const forkPayload = { conversation_id: "fork", messages: forkHistory };
+    const forkArgs = digestArgs("runtime", forkPayload);
+    const forkMaterial = affinityPrefixDigests(forkArgs);
+    const canonical = buildCanonicalRequest(forkArgs)!;
+    const depth = forkMaterial.nodes.at(-1)!.depth;
+    db.$executeRaw.mockClear();
+    db.$queryRaw.mockImplementation((query) => {
+      if (isShareProbe(query))
+        return Promise.resolve([{ sessionId: originalMaterial.clientSessionId, depth }]);
+      if (querySql(query).includes("cache_affinity_node") || isResidencyQuery(query))
+        return Promise.resolve([]);
+      return Promise.resolve([{ acquired: true }]);
+    });
+    await rememberAffinity({
+      ...forkArgs,
+      policy,
+      target: served,
+      estimatedTokens: 80_000,
+    });
+    const expected = prefixTokensAtDepth(canonical, depth, 80_000);
+    expect(expected).toBeGreaterThan(0);
+    expect(conversationWrites().length).toBeGreaterThan(0);
+    for (const { data, sql } of conversationWrites()) {
+      expect(data.sharedWithSessionId).toBe(originalMaterial.clientSessionId);
+      expect(data.sharedPrefixTokens).toBe(expected);
+      expect(sql.split("DO UPDATE SET")[1]).not.toContain("sharedWithSessionId");
+      expect(sql.split("DO UPDATE SET")[1]).not.toContain("sharedPrefixTokens");
+    }
+
+    db.$executeRaw.mockClear();
+    db.$queryRaw.mockClear();
+    db.cacheAffinityNode.findMany.mockResolvedValue([
+      { nodeDigest: forkMaterial.nodes[0]!.digest, depth: 1, rootDigest: forkMaterial.rootDigest },
+    ]);
+    db.$queryRaw.mockImplementation((query) =>
+      Promise.resolve(
+        querySql(query).includes("cache_affinity_node") || isResidencyQuery(query)
+          ? []
+          : [{ acquired: true }],
+      ),
+    );
+    await rememberAffinity({
+      ...forkArgs,
+      policy,
+      target: served,
+      estimatedTokens: 80_000,
+    });
+    expect(db.$queryRaw.mock.calls.filter(([query]) => isShareProbe(query))).toHaveLength(0);
+    expect(
+      affinitySharedPrefixProbeSql(
+        { userId: "owner", tenantUserId: "owner", poolId: "pool", executionTargetId: "target" },
+        forkMaterial,
+        forkMaterial.clientSessionId!,
+        new Date(),
+      ).strings.join(""),
+    ).toContain('"sessionId" <>');
   });
 
   const r1HeaderCases = ["openai-chat", "anthropic-messages", "openai-responses"].flatMap(
@@ -3677,6 +3756,101 @@ describe("cache affinity", () => {
     });
     expect(result.orderedTargetIds[0]).toBe("target-b");
     expect(result.scores["target-a"]).toBeLessThan(result.scores["target-b"]!);
+  });
+
+  it("residency subtracts a shared prefix when the sharer is resident on the same capacity", async () => {
+    const packed = {
+      ...cap8(target("target-a", "runtime-a", "capacity-a")),
+      kvBudgetTokens: 200_000,
+      requestTokens: 10_000,
+    };
+    const lighter = {
+      ...cap8(target("target-b", "runtime-b", "capacity-b")),
+      kvBudgetTokens: 200_000,
+      requestTokens: 10_000,
+    };
+    const rankPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "new" },
+      ],
+    };
+    db.$queryRaw.mockImplementation((query) =>
+      Promise.resolve(
+        isResidencyQuery(query)
+          ? [
+              { capacityId: "capacity-a", sessionId: "parent", tokens: 80_000 },
+              {
+                capacityId: "capacity-a",
+                sessionId: "fork",
+                tokens: 80_000,
+                sharedWithSessionId: "parent",
+                sharedPrefixTokens: 80_000,
+              },
+              { capacityId: "capacity-b", sessionId: "other", tokens: 80_000 },
+            ]
+          : [],
+      ),
+    );
+    const subtracted = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [packed, lighter],
+    });
+    expect(subtracted.orderedTargetIds[0]).toBe("target-a");
+    expect(affinityResidencySql("owner", ["capacity-a"], new Date()).strings.join("")).toContain(
+      "sharedPrefixTokens",
+    );
+  });
+
+  it("residency counts a fork in full when its sharer is not resident", async () => {
+    const forked = {
+      ...cap8(target("target-a", "runtime-a", "capacity-a")),
+      kvBudgetTokens: 200_000,
+      requestTokens: 10_000,
+    };
+    const small = {
+      ...cap8(target("target-b", "runtime-b", "capacity-b")),
+      kvBudgetTokens: 200_000,
+      requestTokens: 10_000,
+    };
+    db.$queryRaw.mockImplementation((query) =>
+      Promise.resolve(
+        isResidencyQuery(query)
+          ? [
+              {
+                capacityId: "capacity-a",
+                sessionId: "fork",
+                tokens: 80_000,
+                sharedWithSessionId: "missing",
+                sharedPrefixTokens: 80_000,
+              },
+              { capacityId: "capacity-b", sessionId: "other", tokens: 10_000 },
+            ]
+          : [],
+      ),
+    );
+    const ranked = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: {
+        messages: [
+          { role: "system", content: "S" },
+          { role: "user", content: "new" },
+        ],
+      },
+      targets: [forked, small],
+    });
+    expect(ranked.orderedTargetIds[0]).toBe("target-b");
   });
 });
 

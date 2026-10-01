@@ -35,6 +35,7 @@ const requiredFragments = [
   "relay_execution_attempt_transition",
   "historical-split",
   "cache_affinity_record_shape_check",
+  '("sharedPrefixTokens" IS NULL OR "sharedPrefixTokens" >= 0)',
   "capacity_kv_eviction_shape_check",
   '"cutFraction" >= 0 AND "cutFraction" <= 1',
   'length("capacityId") BETWEEN 1 AND 128',

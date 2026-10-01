@@ -181,6 +181,14 @@ conversation away from a protected member.
 Only tenant-scoped HMAC digests, session ids, and integer token estimates are
 stored. Prompt text is never persisted.
 
+A client-id fork stores `sharedWithSessionId` and `sharedPrefixTokens` on its
+first footprint write when another live session on the same target already owns
+that prefix. Warm protection and new-conversation residency then count the
+shared history once when the sharer is still an eligible session on the same
+capacity. Chains subtract only against the direct sharer. If the sharer later
+drops out of the protected set because of a share cap, the child is slightly
+undercounted.
+
 ### Waiting for the cache holder
 
 Cache-aware routing predicts which member still holds a request's prompt
@@ -218,6 +226,11 @@ bypasses WSMP is not seen.
 
 A session is protected when it was used within the pool's protection window
 (default 5 minutes) and is at least the minimum size (default 8192 tokens).
+Eligibility uses that raw size; the tokens charged against a user's share and
+the member's protected total subtract `sharedPrefixTokens` when the direct
+sharer is also eligible on the same capacity, so a fork does not count the
+shared history twice. If the sharer later loses protection to a share cap, the
+child is slightly undercounted.
 For each request, every local member that has no affinity hit for it is:
 
 - **full** when all its slots are busy;
