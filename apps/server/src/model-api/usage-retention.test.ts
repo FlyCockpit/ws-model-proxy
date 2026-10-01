@@ -28,6 +28,8 @@ const {
   deleteExpiredHourRollups,
   deleteExpiredRelayRequests,
   deleteExpiredRoutingVerdicts,
+  deleteExpiredKvEvictions,
+  KV_EVICTION_RETENTION_MS,
   hourIncrementsFromMinuteRows,
   ROUTING_VERDICT_RETENTION_MS,
   reapAbandonedPendingRequests,
@@ -120,6 +122,7 @@ describe("usage retention", () => {
       orphanCapacityRuntimeDeleted: 0,
       expiredStickinessDeleted: 0,
       routingVerdictsDeleted: 0,
+      kvEvictionsDeleted: 0,
     });
     expect(tx.$executeRaw).not.toHaveBeenCalled();
   });
@@ -410,6 +413,25 @@ describe("usage retention", () => {
     expect(batch).toBe(2);
   });
 
+  it("sweeps KV feedback only after one hour, in bounded SKIP LOCKED batches", async () => {
+    const { prisma } = fakePrisma();
+    prisma.$executeRaw.mockResolvedValueOnce(2).mockResolvedValueOnce(1);
+    expect(await deleteExpiredKvEvictions({ prisma: prisma as never, now: NOW, batch: 2 })).toBe(3);
+    const [strings, cutoff, batch] = prisma.$executeRaw.mock.calls[0] as [
+      TemplateStringsArray,
+      Date,
+      number,
+    ];
+    expect(strings.join("?")).toContain("DELETE FROM capacity_kv_eviction");
+    expect(strings.join("?")).toContain("FOR UPDATE SKIP LOCKED");
+    expect(cutoff).toEqual(new Date(NOW.getTime() - KV_EVICTION_RETENTION_MS));
+    expect(batch).toBe(2);
+    armDbShutdownFence();
+    prisma.$executeRaw.mockClear();
+    expect(await deleteExpiredKvEvictions({ prisma: prisma as never, now: NOW })).toBe(0);
+    expect(prisma.$executeRaw).not.toHaveBeenCalled();
+  });
+
   it("moves minute rows older than 30 days into additive hourly upserts in one transaction", async () => {
     const { prisma, tx } = fakePrisma();
     tx.$queryRaw.mockResolvedValueOnce([
@@ -527,6 +549,7 @@ describe("usage retention", () => {
       hourRowsDeleted: 0,
       agentActionsDeleted: 0,
       routingVerdictsDeleted: 0,
+      kvEvictionsDeleted: 0,
     });
     const stop = startUsageRetention({ retentionDays: 14, intervalMs: 60_000, run });
     expect(startUsageRetention({ retentionDays: 14, run })).toBe(stop);

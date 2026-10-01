@@ -4,6 +4,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import enDashboard from "../locales/en-US/dashboard.json";
+import esDashboard from "../locales/es-MX/dashboard.json";
 
 const state = vi.hoisted(() => ({
   view: null as Record<string, unknown> | null,
@@ -77,6 +79,15 @@ function engineLoad(overrides: Record<string, unknown> = {}) {
     state: "clear",
     full: false,
     snapshotState: null,
+    kvBudget: {
+      reportedTokens: 100_000,
+      effectiveTokens: 100_000,
+      cutFraction: 0,
+      floorFraction: 0.5,
+      lastObservedAt: null,
+      expiresAt: null,
+      active: false,
+    },
     live: null,
     ...overrides,
   };
@@ -232,6 +243,39 @@ describe("PoolMetricRoutingRules", () => {
 });
 
 describe("PoolEngineLoad (S-D)", () => {
+  it.each([true, false])("shows the eviction warning only when active=%s", (active) => {
+    const base = view();
+    state.view = {
+      ...base,
+      members: base.members.map((member) => ({
+        ...member,
+        engineLoad: engineLoad({
+          kvBudget: {
+            reportedTokens: 100_000,
+            effectiveTokens: 50_000,
+            cutFraction: 0.5,
+            floorFraction: 0.5,
+            lastObservedAt: null,
+            expiresAt: null,
+            active,
+          },
+        }),
+      })),
+    };
+    mount(<PoolMetricRoutingRules poolId="pool-1" />);
+    expect(screen.queryAllByText("dashboard:pools.engineLoad.kvBudgetLowered")).toHaveLength(
+      active ? 2 : 0,
+    );
+    expect(screen.queryAllByText("dashboard:pools.engineLoad.kvBudgetEvictions")).toHaveLength(
+      active ? 2 : 0,
+    );
+    for (const bundle of [enDashboard, esDashboard]) {
+      expect(bundle.pools.engineLoad.kvBudgetLowered.length).toBeGreaterThan(0);
+      expect(bundle.pools.engineLoad.kvBudgetEvictions).toContain("{{effective}}");
+      expect(bundle.pools.engineLoad.kvBudgetEvictions).toContain("{{reported}}");
+    }
+  });
+
   it("shows live load, the FULL and stale badges, and the override toggle", async () => {
     state.view = view();
     mount(<PoolMetricRoutingRules poolId="pool-1" />);

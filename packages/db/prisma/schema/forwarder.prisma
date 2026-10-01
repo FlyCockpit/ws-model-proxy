@@ -1363,6 +1363,20 @@ model PoolMemberRoutingVerdict {
   @@map("pool_member_routing_verdict")
 }
 
+/// Disposable class-H cache: no FK, no deletion drain. Readers ignore expiry;
+/// retention removes rows expired more than an hour ago, including orphans.
+model CapacityKvEviction {
+  capacityId  String   @id
+  userId      String
+  cutFraction Float
+  observedAt  DateTime
+  expiresAt   DateTime
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("capacity_kv_eviction")
+}
+
 enum EngineLoadMode {
   AUTO
   OFF

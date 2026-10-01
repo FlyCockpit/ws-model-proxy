@@ -1,3 +1,7 @@
+import {
+  effectiveKvBudgetTokens,
+  type KvEvictionState,
+} from "@ws-model-proxy/api/lib/kv-eviction-budget";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 
 /**
@@ -56,7 +60,11 @@ export function protectionKvBudgetTokens(
   kvBudgetTokens: number | null | undefined,
 ): number | null {
   if (engineKind === "LLAMA_CPP") return null;
-  return kvBudgetTokens !== null && kvBudgetTokens !== undefined && kvBudgetTokens > 0
+  return kvBudgetTokens !== null &&
+    kvBudgetTokens !== undefined &&
+    Number.isInteger(kvBudgetTokens) &&
+    kvBudgetTokens > 0 &&
+    kvBudgetTokens <= 2_147_483_647
     ? kvBudgetTokens
     : null;
 }
@@ -118,6 +126,7 @@ export type MemberProtectionState = "FULL" | "PROTECTED" | "FREE";
 
 export type ProtectionVerdict = {
   state: MemberProtectionState;
+  effectiveKvBudgetTokens: number | null;
   /** Protected sessions on the member's KV pool (after the equity caps). */
   protectedSessions: number;
   /** Of those, the ones no active lease is serving (`idleProtectedSessions`). */
@@ -263,6 +272,7 @@ export function memberProtectionVerdict({
   const idleProtected = idleProtectedSessions(protectedSessions).length;
   const verdict = (state: MemberProtectionState): ProtectionVerdict => ({
     state,
+    effectiveKvBudgetTokens: load.kvBudgetTokens,
     protectedSessions: protectedSessions.length,
     idleProtectedSessions: idleProtected,
     protectedTokens,
@@ -369,6 +379,7 @@ export function protectionRouting({
 
 /** Inputs read from the database for one request. */
 export type WarmProtectionSnapshot = {
+  kvEvictionByCapacity: ReadonlyMap<string, KvEvictionState>;
   activeByCapacity: ReadonlyMap<string, number>;
   sessionsByCapacity: ReadonlyMap<string, readonly WarmSession[]>;
 };
@@ -378,6 +389,7 @@ export interface WarmProtectionSource {
     ownerId: string;
     capacityIds: readonly string[];
     policy: WarmProtectionPolicy;
+    now?: Date;
   }): Promise<WarmProtectionSnapshot>;
 }
 
@@ -508,19 +520,24 @@ export async function loadWarmSessions({
 
 /** Production source: active leases and warm sessions, plain reads only. */
 export const warmProtectionSource: WarmProtectionSource = {
-  async load({ ownerId, capacityIds, policy }) {
-    const now = new Date();
-    const [active, sessionsByCapacity] = await Promise.all([
+  async load({ ownerId, capacityIds, policy, now = new Date() }) {
+    const [active, sessionsByCapacity, kvEvictions] = await Promise.all([
       prisma.capacityLease.groupBy({
         by: ["capacityId"],
         where: { capacityId: { in: [...capacityIds] }, state: "ACTIVE", expiresAt: { gt: now } },
         _count: { _all: true },
       }),
       loadWarmSessions({ ownerId, capacityIds, policy, now }),
+      prisma.capacityKvEviction
+        .findMany({
+          where: { capacityId: { in: [...capacityIds] }, userId: ownerId, expiresAt: { gt: now } },
+        })
+        .catch(() => []),
     ]);
     return {
       activeByCapacity: new Map(active.map((row) => [row.capacityId, row._count._all])),
       sessionsByCapacity,
+      kvEvictionByCapacity: new Map(kvEvictions.map((row) => [row.capacityId, row])),
     };
   },
 };
@@ -548,21 +565,27 @@ export async function assessWarmProtection({
   policy,
   members,
   source,
+  now = new Date(),
 }: {
   ownerId: string;
   policy: WarmProtectionPolicy;
   members: readonly ProtectionMemberInput[];
   source: WarmProtectionSource;
+  now?: Date;
 }): Promise<Map<string, ProtectionVerdict>> {
   const verdicts = new Map<string, ProtectionVerdict>();
   if (!policy.enabled || members.length === 0) return verdicts;
   const capacityIds = [...new Set(members.map(({ capacityId }) => capacityId))];
-  const snapshot = await source.load({ ownerId, capacityIds, policy });
+  const snapshot = await source.load({ ownerId, capacityIds, policy, now });
   for (const member of members) {
     const load: CapacityLoad = {
       slots: member.slots,
       active: snapshot.activeByCapacity.get(member.capacityId) ?? 0,
-      kvBudgetTokens: protectionKvBudgetTokens(member.engineKind, member.kvBudgetTokens),
+      kvBudgetTokens: effectiveKvBudgetTokens(
+        protectionKvBudgetTokens(member.engineKind, member.kvBudgetTokens),
+        snapshot.kvEvictionByCapacity.get(member.capacityId),
+        now,
+      ),
     };
     const protectedSessions = protectedWarmSessions(
       snapshot.sessionsByCapacity.get(member.capacityId) ?? [],

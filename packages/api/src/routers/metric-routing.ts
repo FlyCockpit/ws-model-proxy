@@ -16,6 +16,11 @@ import {
   evaluateEngineLoad,
 } from "../lib/engine-load";
 import {
+  effectiveKvBudgetTokens,
+  effectiveKvCut,
+  KV_EVICTION_FLOOR_FRACTION,
+} from "../lib/kv-eviction-budget";
+import {
   describeSeries,
   ENDPOINT_LOAD_STALE_AFTER_MS,
   type EndpointLoadSample,
@@ -112,7 +117,9 @@ export const metricRoutingProcedures = {
               DiscoveredModel: { select: memberModelSelect },
               ExecutionTarget: {
                 select: {
-                  InferenceCapacity: { select: { engineKind: true, engineSlots: true } },
+                  InferenceCapacity: {
+                    select: { id: true, engineKind: true, engineSlots: true, kvBudgetTokens: true },
+                  },
                   DiscoveredModel: { select: memberModelSelect },
                 },
               },
@@ -139,6 +146,19 @@ export const metricRoutingProcedures = {
       // Clears retain NONE rows as successor fences. Their ruleStates and
       // engineState remain historical snapshots until the member is rewritten;
       // the expiry check below and live engine evaluation still apply.
+      const now = new Date();
+      const kvEvictions = await prisma.capacityKvEviction
+        .findMany({
+          where: {
+            capacityId: {
+              in: [...new Set(members.flatMap(({ capacity }) => (capacity ? [capacity.id] : [])))],
+            },
+            userId,
+            expiresAt: { gt: now },
+          },
+        })
+        .catch(() => []);
+      const kvEvictionByCapacity = new Map(kvEvictions.map((row) => [row.capacityId, row]));
       const verdicts = await prisma.poolMemberRoutingVerdict.findMany({
         where: { poolId: pool.id, poolMemberId: { in: members.map((member) => member.id) } },
       });
@@ -152,7 +172,6 @@ export const metricRoutingProcedures = {
           })
         : [];
       const storedById = new Map(stored.map((row) => [row.id, row]));
-      const now = new Date();
       const devices = deviceIds.map((cliDeviceId) => {
         const snapshot = live?.get(cliDeviceId) ?? null;
         const device = members.find((member) => member.model.Endpoint.cliDeviceId === cliDeviceId)
@@ -195,6 +214,16 @@ export const metricRoutingProcedures = {
             reading ? { ...reading, waitingStreak: reading.waitingStreak ?? 0 } : null,
             now,
           );
+          const kvState = member.capacity
+            ? kvEvictionByCapacity.get(member.capacity.id)
+            : undefined;
+          const reportedTokens = member.capacity?.kvBudgetTokens ?? null;
+          const effectiveTokens = effectiveKvBudgetTokens(
+            member.capacity?.engineKind === "LLAMA_CPP" ? null : reportedTokens,
+            kvState,
+            now,
+          );
+          const cutFraction = effectiveTokens === null ? 0 : effectiveKvCut(kvState, now);
           return {
             poolMemberId: member.id,
             upstreamModelId: member.model.upstreamModelId,
@@ -216,6 +245,15 @@ export const metricRoutingProcedures = {
              * `mode` off ignores engine load for the member.
              */
             engineLoad: {
+              kvBudget: {
+                reportedTokens,
+                effectiveTokens,
+                cutFraction,
+                floorFraction: KV_EVICTION_FLOOR_FRACTION,
+                lastObservedAt: kvState?.observedAt ?? null,
+                expiresAt: kvState?.expiresAt ?? null,
+                active: effectiveTokens !== null && cutFraction > 0,
+              },
               mode: member.engineLoadMode === "OFF" ? ("off" as const) : ("auto" as const),
               kvFullThreshold: member.kvFullThreshold,
               effectiveKvFullThreshold: effectiveKvFullThreshold(member.kvFullThreshold),

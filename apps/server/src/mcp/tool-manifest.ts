@@ -519,6 +519,8 @@ const READ_TOOLS: readonly McpToolSpec[] = [
   },
   {
     name: "forwarder_pool_routing_rules_get",
+    descriptionNote:
+      "Read pool rules, member live engine load, and engineLoad.kvBudget (reported/effective tokens, eviction cut, floor, observation/expiry times and active state).",
     target: "forwarderManagement.getPoolRoutingRules",
     scope: "read",
     confirmation: null,

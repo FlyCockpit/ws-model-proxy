@@ -102,6 +102,9 @@ export const HISTORY_DRAIN_EDGES = {
   // an hour ago, including those of a deleted user's pools, and readers
   // ignore expired rows.
   pool_member_routing_verdict: { delete: [], internal: [] },
+  // Expiring KV feedback cache, never drained, just like routing verdicts:
+  // owner-scoped readers ignore expiry; retention sweeps orphan rows after 1 h.
+  capacity_kv_eviction: { delete: [], internal: [] },
 } as const satisfies Record<string, { delete: readonly DrainEdge[]; internal: readonly string[] }>;
 
 /**

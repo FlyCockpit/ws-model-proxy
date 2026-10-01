@@ -152,6 +152,106 @@ integration("cache-prefix identity #160", () => {
     target: row.target(0),
     now: new Date("2030-01-01T00:00:00Z"),
   });
+  it("KV prefix evidence requires a live-tip continuation and carries the matched record facts", async () => {
+    const f = await fixture();
+    const now = new Date("2030-01-01T12:00:00Z");
+    const args = {
+      ownerId: f.tenant.id,
+      resourceOwnerId: f.owner.id,
+      poolId: f.pool.id,
+      securityScope: "kv-test",
+      policy: {
+        enabled: true,
+        ttlSeconds: 600,
+        maxRecords: 100,
+        prefixWeight: 100,
+        conversationWeight: 150,
+        confirmedCacheWeight: 250,
+        loadPenaltyWeight: 100,
+      },
+      surface: "openai-chat",
+      target: f.target(0),
+      now,
+    };
+    const base = {
+      model: "alias",
+      messages: [
+        { role: "system", content: "instructions" },
+        { role: "user", content: "start" },
+        { role: "assistant", content: "answer" },
+        { role: "user", content: "second" },
+      ],
+    };
+    const stored = await service.rememberAffinity({
+      ...args,
+      payload: base,
+      estimatedTokens: 12_000,
+      engineCacheConfirmed: true,
+    });
+    const continued = {
+      ...base,
+      messages: [
+        ...base.messages,
+        { role: "assistant", content: "reply" },
+        { role: "user", content: "third" },
+      ],
+    };
+    const rank = (payload: Record<string, unknown>) =>
+      service.rankAffinityTargets({
+        ...args,
+        payload,
+        targets: [args.target],
+        scoreSingleTarget: true,
+        now: new Date(now.getTime() + 1000),
+      });
+    const result = await rank(continued);
+    expect(result.prefixEvidence).toEqual({
+      [args.target.executionTargetId]: {
+        tokens: 12_000,
+        lastUsedAt: now.getTime(),
+        confirmed: true,
+      },
+    });
+    const material = service.affinityPrefixDigests({
+      ...args,
+      payload: continued,
+      runtimeIdentity: args.target.targetIdentity,
+    });
+    const scope = {
+      userId: f.owner.id,
+      tenantUserId: f.tenant.id,
+      poolId: f.pool.id,
+      executionTargetId: args.target.executionTargetId,
+    };
+    expect(await service.resolveAffinitySessionDetail(producer, scope, material, now)).toEqual({
+      sessionId: stored!.sessionId,
+      viaTip: true,
+    });
+    expect(await service.resolveAffinitySession(producer, scope, material, now)).toBe(
+      stored!.sessionId,
+    );
+    expect(
+      (
+        await rank({
+          ...base,
+          messages: [...base.messages.slice(0, -1), { role: "user", content: "edited second" }],
+        })
+      ).prefixEvidence,
+    ).toEqual({});
+    expect((await rank({ ...base, messages: base.messages.slice(0, 2) })).prefixEvidence).toEqual(
+      {},
+    );
+    await service.rememberAffinity({
+      ...args,
+      payload: base,
+      estimatedTokens: 12_000,
+      engineCacheConfirmed: false,
+    });
+    expect((await rank(continued)).prefixEvidence?.[args.target.executionTargetId]?.confirmed).toBe(
+      false,
+    );
+  });
+
   it.each(numericOverflowRows)(
     "R4 PG numeric overflow $surface $shape uses forwarded null identity",
     async ({ surface, shape }) => {
@@ -2632,7 +2732,8 @@ integration("cache-prefix identity #160", () => {
       };
       const { Prisma } = await import("@ws-model-proxy/db");
       // PostgreSQL may inspect index endpoints while planning. Measure that
-      // fixed overhead independently using the SAME production query text;
+      // fixed overhead independently using the SAME production query text
+      // (including viaTip; the string wrapper still uses the identical probe);
       // retain a total-read bound and compare executor work at both sizes.
       const planning = await measure(() =>
         producer.$queryRaw(

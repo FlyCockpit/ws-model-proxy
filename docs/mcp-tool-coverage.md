@@ -264,3 +264,7 @@ No tool result can carry a secret value WMP holds (provider API keys,
 encrypted credential material, token secrets or hashes, device-flow and 2FA
 backup codes), in any encoding: pinned for every tool by
 `apps/server/src/mcp/secret-output.test.ts`. Pinned by `apps/server/src/mcp/tool-manifest.test.ts`.
+
+`forwarder_pool_routing_rules_get` exposes member `engineLoad.kvBudget`: reported
+and effective tokens, relative eviction cut/floor, observation/expiry times and
+active state. It passes the procedure result through without an output filter.

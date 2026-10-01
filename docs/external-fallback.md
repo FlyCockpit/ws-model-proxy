@@ -194,12 +194,52 @@ For each request, every local member that has no affinity hit for it is:
 - **protected** when it is not full but every idle slot holds a protected warm
   session (slot mode), or, when the engine reports its KV budget (vLLM, SGLang:
   protocol 2.7 engine facts), when the protected tokens plus the request exceed
-  90% of that budget (token mode). In slot mode a session whose next turn is
-  running right now is served by one of the active leases, so it does not
+  90% of its effective budget (token mode). In slot mode a session whose next
+  turn is running right now is served by one of the active leases, so it does not
   also fill an idle slot: only protected sessions no active lease is serving
   count against the idle slots. In token mode every protected session counts,
   because a running session's cache is still in the pool;
 - **free** otherwise.
+
+Token-mode KV eviction feedback lowers the effective budget when a successful
+local pooled request continues a digest-proven, live-tip warm session whose
+previous matched record confirmed engine caching. Both the expected prefix and
+the actual reported prompt must be at least `protectMinTokens`; the record must
+be within that engine's protection window. A reported cache read of at most 5%
+of the expected prefix is an eviction observation. Unknown cache fields, hits,
+partial hits above 5%, short prefixes, client-id-only matches, instruction hints,
+ancestor edits/truncations and unranked targets produce no observation. The bound
+Responses `previous_response_id` path is excluded: it has neither a ranked
+decision nor the matched record's age. Endpoint prefix-cache counters are also
+excluded: they are cumulative, include bypass traffic and cannot be attributed
+to a matched prefix. Unconfirmed records cannot count; remembering a zero-read
+miss removes confirmation from that prefix.
+
+Each observation cuts 5% of the **reported** K (`KV_EVICTION_STEP = 0.05`), with
+at most 10 observations per flush and a 50% maximum cut (`KV_EVICTION_MAX_CUT`).
+The integer effective budget stays between `ceil(0.5 * K)` and K. Cuts recover
+linearly at `0.5 / 1_800_000` per millisecond: a full cut recovers in exactly
+30 minutes (`KV_EVICTION_RECOVERY_MS`). Hits write nothing. Lower K redirects
+new sessions, reducing evictions until evidence stops; small steps, the cap and
+slow recovery bound over-reaction and flapping. No gain depends on effective K.
+Reported-budget changes automatically scale the relative cut. Slot mode,
+including llama.cpp, is unaffected. Budgets must be positive int32 counts;
+malformed budgets select slot mode, and corrupt stored cuts are clamped.
+
+Feedback is buffered without request-path I/O and flushed at most once per second
+per capacity per process, with one trailing timer. At most 1024 capacities are
+pending; observations for new keys beyond that bound are dropped. Failed flushes
+are dropped and logged at most once per minute; feedback never affects response
+finalization. The owner-guarded atomic SQL upsert combines concurrent process
+writers without graph/capacity locks or transactions. Application time is passed
+explicitly; negative elapsed time is clamped to zero and observation/expiry times
+use `GREATEST`, bounding clock skew. Rows are an expiring class-H cache without
+foreign keys, never drained during parent deletion. Readers ignore expired rows
+and fall back to reported K if the read fails; retention deletes rows expired
+more than an hour ago. Shutdown clears timers and the DB fence prevents writes.
+The dashboard warns when the KV budget is lowered. The MCP pool-rules read
+shows reported/effective budgets, current cut/floor and observation/expiry times. This adds one table only;
+there is no destructive schema change.
 
 llama.cpp is always slot mode, and its sessions are protected for half the
 pool's window: it restores evicted slot prompts from host RAM, so evicting

@@ -67,6 +67,8 @@ export type AffinityDecision = {
    * `resolveAffinitySession`. Absent = a new session on that target.
    */
   matchedSessionIds?: Record<string, string>;
+  /** Known cached footprint ONLY for a digest-proven live-tip continuation. */
+  prefixEvidence?: Record<string, { tokens: number; lastUsedAt: number; confirmed: boolean }>;
 };
 
 /** Durable server-side Responses lineage. Never accepted from request JSON. */
@@ -646,14 +648,23 @@ export async function resolveAffinitySession(
   material: AffinityMaterial,
   now: Date,
 ): Promise<string | null> {
-  if (material.clientSessionId) return material.clientSessionId;
+  return (await resolveAffinitySessionDetail(db, scope, material, now)).sessionId;
+}
+
+export async function resolveAffinitySessionDetail(
+  db: IdentityDb,
+  scope: IdentityScope,
+  material: AffinityMaterial,
+  now: Date,
+): Promise<{ sessionId: string | null; viaTip: boolean }> {
+  if (material.clientSessionId) return { sessionId: material.clientSessionId, viaTip: false };
   if (
     !material.identifiable ||
     material.nodes.length === 0 ||
     material.missingParent ||
     !material.isContinuation
   )
-    return null;
+    return { sessionId: null, viaTip: false };
   if (material.boundSessionId) {
     const parent = await db.cacheAffinityNode.findFirst({
       where: {
@@ -665,14 +676,14 @@ export async function resolveAffinitySession(
       },
       select: { sessionId: true },
     });
-    return parent?.sessionId ?? null;
+    return { sessionId: parent?.sessionId ?? null, viaTip: false };
   }
   // Same deepest-node, tips-first, sole-ancestor rule, in one bounded round trip.
   // Each lateral probe remains an equality seek in index order with LIMIT 1/2.
-  const matches = await db.$queryRaw<{ sessionId: string | null }[]>(
+  const matches = await db.$queryRaw<{ sessionId: string | null; viaTip: boolean }[]>(
     affinityIdentityProbeSql(scope, material, now),
   );
-  return matches[0]?.sessionId ?? null;
+  return { sessionId: matches[0]?.sessionId ?? null, viaTip: matches[0]?.viaTip === true };
 }
 
 /** Shared query text: diagnostics must explain the same query the resolver executes. */
@@ -684,7 +695,8 @@ export function affinityIdentityProbeSql(
   return Prisma.sql`
     SELECT CASE WHEN tips."sessionId" IS NOT NULL THEN tips."sessionId"
                 WHEN cardinality(ancestors.sessions) = 1 THEN ancestors.sessions[1]
-                ELSE NULL END AS "sessionId"
+                ELSE NULL END AS "sessionId",
+           (tips."sessionId" IS NOT NULL) AS "viaTip"
       FROM jsonb_to_recordset(${JSON.stringify(material.nodes)}::jsonb) AS p(digest text, depth int)
       LEFT JOIN LATERAL (
         ${affinityNodeProbeSql(scope, material.rootDigest, Prisma.sql`p.digest`, true, now, 1)}
@@ -908,7 +920,7 @@ export async function rankAffinityTargets({
             )
           : undefined);
       const prefixTokens = matchedRecord?.estimatedTokens ?? undefined;
-      const sessionId = await resolveAffinitySession(
+      const sessionDetail = await resolveAffinitySessionDetail(
         prisma,
         {
           userId: resourceOwnerId,
@@ -919,6 +931,18 @@ export async function rankAffinityTargets({
         material,
         now,
       );
+      // A whole-prompt estimate only measures the expected prefix on an exact
+      // stored-tip continuation; ancestors, client ids and bound parents do not.
+      const prefixEvidence =
+        sessionDetail.viaTip &&
+        matchedPrefixRecord?.estimatedTokens != null &&
+        matchedPrefixRecord.sessionId === sessionDetail.sessionId
+          ? {
+              tokens: matchedPrefixRecord.estimatedTokens,
+              lastUsedAt: matchedPrefixRecord.lastUsedAt.getTime(),
+              confirmed: matchedPrefixRecord.engineCacheConfirmed,
+            }
+          : undefined;
       const active = target.activeLoad ?? activeByCapacity.get(target.capacityId) ?? 0;
       const waiting = target.waitingLoad ?? waitingByCapacity.get(target.capacityId) ?? 0;
       const normalizedLoad = target.hardConcurrencyLimit
@@ -944,7 +968,8 @@ export async function rankAffinityTargets({
         waiting,
         isContinuation: material.isContinuation,
         prefixTokens,
-        sessionId,
+        sessionId: sessionDetail.sessionId,
+        prefixEvidence,
       };
     }),
   );
@@ -989,6 +1014,11 @@ export async function rankAffinityTargets({
     prefixTokens: Object.fromEntries(
       scored.flatMap(({ target, prefixTokens }) =>
         prefixTokens === undefined ? [] : [[target.executionTargetId, prefixTokens]],
+      ),
+    ),
+    prefixEvidence: Object.fromEntries(
+      scored.flatMap(({ target, prefixEvidence }) =>
+        prefixEvidence === undefined ? [] : [[target.executionTargetId, prefixEvidence]],
       ),
     ),
     matchedSessionIds: Object.fromEntries(

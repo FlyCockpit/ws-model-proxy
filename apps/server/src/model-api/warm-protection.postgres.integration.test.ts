@@ -1,3 +1,9 @@
+import {
+  applyKvEvictionObservations,
+  effectiveKvBudgetTokens,
+  KV_EVICTION_RECOVERY_MS,
+} from "@ws-model-proxy/api/lib/kv-eviction-budget";
+import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
 import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -518,6 +524,7 @@ integration("warm-session protection with real PostgreSQL", () => {
         ],
         source: {
           load: async (input) => ({
+            kvEvictionByCapacity: new Map(),
             activeByCapacity: new Map([[capacityA.id, 1]]),
             sessionsByCapacity: await warm.loadWarmSessions({ ...input, now }),
           }),
@@ -935,4 +942,285 @@ integration("warm-session protection with real PostgreSQL", () => {
       await db.user.deleteMany({ where: { id: owner.id } });
     }
   }, 60_000);
+  describe("KV eviction feedback on PostgreSQL", () => {
+    const now = new Date("2026-09-30T12:00:00Z");
+    const ownedCapacityIds = new Set<string>();
+    let feedback: typeof import("./kv-eviction-feedback.js");
+    let retention: typeof import("./usage-retention.js");
+    let writers: ReturnType<typeof createPrismaClient>[];
+    beforeAll(async () => {
+      feedback = await import("./kv-eviction-feedback.js");
+      retention = await import("./usage-retention.js");
+      if (!databaseUrl) throw new Error("database unavailable");
+      writers = Array.from({ length: 4 }, () => createPrismaClient(databaseUrl));
+    });
+    afterAll(async () => {
+      await db.capacityKvEviction.deleteMany({
+        where: { capacityId: { in: [...ownedCapacityIds] } },
+      });
+      await Promise.all(writers?.map((writer) => writer.$disconnect()) ?? []);
+      await (await import("@ws-model-proxy/db")).default.$disconnect();
+    });
+    function id() {
+      const value = crypto.randomUUID();
+      ownedCapacityIds.add(value);
+      return value;
+    }
+    const row = (capacityId: string) =>
+      db.capacityKvEviction.findUniqueOrThrow({ where: { capacityId } });
+
+    it("a lower K flips FREE to PROTECTED, then exact recovery restores FREE with the same warm set", async () => {
+      const owner = await user("eviction");
+      const capacityId = id();
+      const suffix = crypto.randomUUID();
+      try {
+        const capacity = await db.inferenceCapacity.create({
+          data: {
+            id: capacityId,
+            userId: owner.id,
+            label: `kv-${suffix}`,
+            runtimeIdentityKey: `kv-${suffix}`,
+            runtimeModel: "qwen",
+            engineKind: "VLLM",
+            kvBudgetTokens: 100_000,
+            hardConcurrencyLimit: 4,
+          },
+        });
+        const device = await db.cliDevice.create({
+          data: { userId: owner.id, slug: `kv-${suffix}` },
+        });
+        const endpoint = await db.endpoint.create({
+          data: { userId: owner.id, cliDeviceId: device.id, slug: `kv-${suffix}`, label: "KV" },
+        });
+        const model = await db.discoveredModel.create({
+          data: {
+            userId: owner.id,
+            endpointId: endpoint.id,
+            upstreamModelId: "qwen",
+            encodedModelId: `kv-${suffix}`,
+          },
+        });
+        const target = await db.executionTarget.update({
+          where: { discoveredModelId: model.id },
+          data: { inferenceCapacityId: capacity.id },
+        });
+        const pool = await db.modelPool.create({
+          data: { userId: owner.id, slug: `kv-${suffix}`, name: "KV" },
+        });
+        await db.cacheAffinityRecord.create({
+          data: {
+            userId: owner.id,
+            tenantUserId: owner.id,
+            poolId: pool.id,
+            executionTargetId: target.id,
+            sessionId: suffix,
+            createdAt: new Date(now.getTime() - 1000),
+            targetIdentity: "identity",
+            bindingDigest: "b".repeat(64),
+            prefixDigest: "p".repeat(64),
+            prefixDepth: 1,
+            estimatedTokens: 30_000,
+            engineCacheConfirmed: true,
+            lastUsedAt: now,
+            expiresAt: new Date(now.getTime() + 7_200_000),
+          },
+        });
+        const policy = {
+          enabled: true,
+          windowSeconds: 3600,
+          minTokens: 8192,
+          share: "FIRST_COME" as const,
+          fixedPercent: null,
+        };
+        const assess = async (at: Date) =>
+          (
+            await warm.assessWarmProtection({
+              ownerId: owner.id,
+              policy,
+              now: at,
+              members: [
+                {
+                  poolMemberId: "m",
+                  capacityId,
+                  slots: 4,
+                  kvBudgetTokens: 100_000,
+                  engineKind: "VLLM",
+                  affine: false,
+                  requestTokens: 25_000,
+                },
+              ],
+              source: warm.warmProtectionSource,
+            })
+          ).get("m");
+        expect(await assess(now)).toMatchObject({
+          state: "FREE",
+          protectedTokens: 30_000,
+          effectiveKvBudgetTokens: 100_000,
+        });
+        for (let i = 0; i < 10; i++)
+          await feedback.recordKvEvictionObservations(
+            { capacityId, ownerId: owner.id, count: 1, now },
+            writers[0],
+          );
+        expect(await assess(now)).toMatchObject({
+          state: "PROTECTED",
+          protectedTokens: 30_000,
+          effectiveKvBudgetTokens: 50_000,
+        });
+        // Keep the row live beyond full recovery to prove read-time linear decay.
+        await db.capacityKvEviction.update({
+          where: { capacityId },
+          data: { expiresAt: new Date(now.getTime() + 2 * KV_EVICTION_RECOVERY_MS) },
+        });
+        expect(await assess(new Date(now.getTime() + KV_EVICTION_RECOVERY_MS))).toMatchObject({
+          state: "FREE",
+          protectedTokens: 30_000,
+          effectiveKvBudgetTokens: 100_000,
+        });
+      } finally {
+        await db.cacheAffinityRecord.deleteMany({ where: { userId: owner.id } });
+        await db.user.deleteMany({ where: { id: owner.id } });
+      }
+    });
+
+    it.each([
+      { cut: null, count: 1, dt: 0 },
+      { cut: 0.1, count: 0, dt: 1000 },
+      { cut: 0.1, count: -1, dt: 1000 },
+      { cut: 0.05, count: 1, dt: 0 },
+      { cut: 0.5, count: 1, dt: 900_000 },
+      { cut: 0.5, count: 1, dt: 1_800_000 },
+      { cut: 0.1, count: 1, dt: -1000 },
+      { cut: 0.1, count: 100, dt: 0 },
+      { cut: 0.9, count: 1, dt: 900_000 },
+      { cut: 0.3, count: 3, dt: 1001 },
+    ])("SQL equals pure state (cut=$cut count=$count dt=$dt)", async ({ cut, count, dt }) => {
+      const capacityId = id();
+      const state =
+        cut === null ? null : { cutFraction: cut, observedAt: new Date(now.getTime() - dt) };
+      const expiresAt = new Date(now.getTime() + 3_600_000);
+      if (state)
+        await db.capacityKvEviction.create({
+          data: { capacityId, userId: "kv-owner", ...state, expiresAt },
+        });
+      await feedback.recordKvEvictionObservations(
+        { capacityId, ownerId: "kv-owner", count, now },
+        writers[0],
+      );
+      const actual = await row(capacityId);
+      const expected = applyKvEvictionObservations(state, count, now);
+      expect(actual.cutFraction).toBe(expected.cutFraction);
+      expect(actual.observedAt).toEqual(expected.observedAt);
+      expect(actual.expiresAt).toEqual(
+        state ? expiresAt : new Date(now.getTime() + KV_EVICTION_RECOVERY_MS),
+      );
+      expect(effectiveKvBudgetTokens(100_001, actual, now)).toBe(
+        effectiveKvBudgetTokens(100_001, expected, now),
+      );
+    });
+
+    it.each([6, 32])(
+      "%s concurrent upserts from independent clients commute and cap in one row",
+      async (count) => {
+        const capacityId = id();
+        await Promise.all(
+          Array.from({ length: count }, (_, i) =>
+            feedback.recordKvEvictionObservations(
+              { capacityId, ownerId: "kv-owner", count: 1, now },
+              writers[i % writers.length],
+            ),
+          ),
+        );
+        const rows = await db.capacityKvEviction.findMany({ where: { capacityId } });
+        expect(rows).toHaveLength(1);
+        let expected = applyKvEvictionObservations(null, 0, now);
+        for (let i = 0; i < count; i++) expected = applyKvEvictionObservations(expected, 1, now);
+        expect(rows[0]?.cutFraction).toBe(expected.cutFraction);
+      },
+    );
+
+    it("owner mismatch cannot modify a row", async () => {
+      const capacityId = id();
+      await feedback.recordKvEvictionObservations(
+        { capacityId, ownerId: "kv-owner", count: 1, now },
+        writers[0],
+      );
+      const before = await row(capacityId);
+      await feedback.recordKvEvictionObservations(
+        { capacityId, ownerId: "other-owner", count: 10, now: new Date(now.getTime() + 1000) },
+        writers[1],
+      );
+      expect(await row(capacityId)).toEqual(before);
+    });
+
+    it("load ignores expired and other-owner rows", async () => {
+      const expired = id();
+      const other = id();
+      const active = id();
+      for (const capacityId of [expired, other, active])
+        await db.capacityKvEviction.create({
+          data: {
+            capacityId,
+            userId: capacityId === other ? "other-owner" : "kv-owner",
+            cutFraction: 0.5,
+            observedAt: new Date(now.getTime() - 2000),
+            expiresAt: new Date(now.getTime() + (capacityId === expired ? 0 : 1000)),
+          },
+        });
+      const snapshot = await warm.warmProtectionSource.load({
+        ownerId: "kv-owner",
+        capacityIds: [expired, other, active],
+        policy: {
+          enabled: true,
+          windowSeconds: 300,
+          minTokens: 8192,
+          share: "FIRST_COME",
+          fixedPercent: null,
+        },
+        now,
+      });
+      expect([...snapshot.kvEvictionByCapacity.keys()]).toEqual([active]);
+    });
+
+    it("retention deletes only rows expired more than one hour ago", async () => {
+      const old = id();
+      const boundary = id();
+      const newer = id();
+      for (const [capacityId, age] of [
+        [old, 3_600_001],
+        [boundary, 3_600_000],
+        [newer, 1000],
+      ] as const)
+        await db.capacityKvEviction.create({
+          data: {
+            capacityId,
+            userId: "kv-owner",
+            cutFraction: 0.5,
+            observedAt: new Date(now.getTime() - age - 1000),
+            expiresAt: new Date(now.getTime() - age),
+          },
+        });
+      await retention.deleteExpiredKvEvictions({ prisma: writers[0], now, batch: 1 });
+      expect(await db.capacityKvEviction.findUnique({ where: { capacityId: old } })).toBeNull();
+      expect((await row(boundary)).capacityId).toBe(boundary);
+      expect((await row(newer)).capacityId).toBe(newer);
+    });
+
+    it("older application clocks do not decay or move timestamps backward", async () => {
+      const capacityId = id();
+      await feedback.recordKvEvictionObservations(
+        { capacityId, ownerId: "kv-owner", count: 2, now },
+        writers[0],
+      );
+      const initial = await row(capacityId);
+      await feedback.recordKvEvictionObservations(
+        { capacityId, ownerId: "kv-owner", count: 1, now: new Date(now.getTime() - 60_000) },
+        writers[1],
+      );
+      const actual = await row(capacityId);
+      expect(actual.cutFraction).toBeCloseTo(0.15, 12);
+      expect(actual.observedAt).toEqual(now);
+      expect(actual.expiresAt).toEqual(initial.expiresAt);
+    });
+  });
 });

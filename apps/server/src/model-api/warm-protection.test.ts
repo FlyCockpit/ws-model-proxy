@@ -1,6 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
 
-vi.mock("@ws-model-proxy/db", () => ({ default: {}, Prisma: {} }));
+const readDb = vi.hoisted(() => ({
+  capacityKvEviction: { findMany: vi.fn() },
+  capacityLease: { groupBy: vi.fn() },
+  $queryRaw: vi.fn(),
+}));
+vi.mock("@ws-model-proxy/db", async () => ({
+  default: readDb,
+  Prisma: (await import("../../../../packages/db/prisma/generated/client")).Prisma,
+}));
 
 const {
   LLAMA_CPP_WINDOW_FACTOR,
@@ -10,6 +18,7 @@ const {
   protectionKvBudgetTokens,
   protectionRouting,
   protectionWindowSecondsFor,
+  warmProtectionSource,
 } = await import("./warm-protection.js");
 type ProtectionEngineKind = import("./warm-protection.js").ProtectionEngineKind;
 type WarmSession = import("./warm-protection.js").WarmSession;
@@ -414,6 +423,7 @@ describe("S-C decision procedure", () => {
     protectedTokens = 0,
   ): ProtectionVerdict => ({
     state,
+    effectiveKvBudgetTokens: null,
     protectedSessions: state === "PROTECTED" ? 1 : 0,
     idleProtectedSessions: state === "PROTECTED" ? 1 : 0,
     protectedTokens,
@@ -546,6 +556,7 @@ describe("S-C decision procedure", () => {
 describe("S-C assessment", () => {
   it("combines active leases and the warm set per member KV pool", async () => {
     const load = vi.fn(async () => ({
+      kvEvictionByCapacity: new Map(),
       activeByCapacity: new Map([["cap-a", 0]]),
       sessionsByCapacity: new Map([["cap-a", [session("alice", 10)]]]),
     }));
@@ -584,6 +595,7 @@ describe("S-C assessment", () => {
       ownerId: "owner",
       capacityIds: ["cap-a", "cap-b"],
       policy: policy(),
+      now: expect.any(Date),
     });
     expect(verdicts.get("a")?.state).toBe("PROTECTED");
     expect(verdicts.get("a-continuation")?.state).toBe("FREE");
@@ -673,6 +685,7 @@ describe("S-C engine facts (token mode and the llama.cpp window)", () => {
       // Three active leases: the one idle slot holds the warm session (slot mode: PROTECTED).
       source: {
         load: async () => ({
+          kvEvictionByCapacity: new Map(),
           activeByCapacity: new Map([["cap-a", 3]]),
           sessionsByCapacity: new Map([["cap-a", [session("alice", ageSeconds, tokens)]]]),
         }),
@@ -719,6 +732,7 @@ describe("S-C engine facts (token mode and the llama.cpp window)", () => {
 
   it("asks the source for the pool's full window, not the shortened one", async () => {
     const load = vi.fn(async () => ({
+      kvEvictionByCapacity: new Map(),
       activeByCapacity: new Map<string, number>(),
       sessionsByCapacity: new Map<string, readonly WarmSession[]>(),
     }));
@@ -750,5 +764,128 @@ describe("S-C engine facts (token mode and the llama.cpp window)", () => {
     expect(load).toHaveBeenCalledWith(
       expect.objectContaining({ policy: expect.objectContaining({ windowSeconds: 300 }) }),
     );
+  });
+});
+
+describe("effective KV assessment", () => {
+  const now = new Date("2026-09-30T12:00:00Z");
+  const member = {
+    poolMemberId: "a",
+    capacityId: "cap-a",
+    slots: 4,
+    engineKind: "VLLM" as const,
+    kvBudgetTokens: 100_000,
+    requestTokens: 25_000,
+    affine: false,
+  };
+  it.each([
+    {
+      name: "reported",
+      cut: 0,
+      engineKind: "VLLM" as const,
+      reported: 100_000,
+      effective: 100_000,
+      state: "FREE",
+    },
+    {
+      name: "lowered",
+      cut: 0.5,
+      engineKind: "VLLM" as const,
+      reported: 100_000,
+      effective: 50_000,
+      state: "PROTECTED",
+    },
+    {
+      name: "slot",
+      cut: 0.5,
+      engineKind: "VLLM" as const,
+      reported: null,
+      effective: null,
+      state: "FREE",
+    },
+    {
+      name: "llama",
+      cut: 0.5,
+      engineKind: "LLAMA_CPP" as const,
+      reported: 100_000,
+      effective: null,
+      state: "FREE",
+    },
+  ])("$name", async ({ cut, engineKind, reported, effective, state }) => {
+    const result = await assessWarmProtection({
+      ownerId: "owner",
+      policy: policy({ share: "FIRST_COME" }),
+      members: [{ ...member, engineKind, kvBudgetTokens: reported }],
+      now,
+      source: {
+        load: async () => ({
+          activeByCapacity: new Map(),
+          sessionsByCapacity: new Map([["cap-a", [session("alice", 10, 30_000)]]]),
+          kvEvictionByCapacity: new Map([["cap-a", { cutFraction: cut, observedAt: now }]]),
+        }),
+      },
+    });
+    expect(result.get("a")).toMatchObject({ state, effectiveKvBudgetTokens: effective });
+  });
+  it.each([
+    { cut: 0, count: 2 },
+    { cut: 0.5, count: 1 },
+  ])("equity fits uses effective K (cut=$cut)", async ({ cut, count }) => {
+    const result = await assessWarmProtection({
+      ownerId: "owner",
+      policy: policy({ share: "FIXED_PERCENT", fixedPercent: 50 }),
+      members: [member],
+      now,
+      source: {
+        load: async () => ({
+          activeByCapacity: new Map(),
+          sessionsByCapacity: new Map([
+            ["cap-a", [session("alice", 10, 20_000), session("alice", 20, 20_000)]],
+          ]),
+          kvEvictionByCapacity: new Map([["cap-a", { cutFraction: cut, observedAt: now }]]),
+        }),
+      },
+    });
+    expect(result.get("a")?.protectedSessions).toBe(count);
+  });
+  it.each(["failed", "expired", "active"])("production feedback read: %s", async (kind) => {
+    readDb.capacityLease.groupBy.mockResolvedValue([]);
+    readDb.$queryRaw.mockResolvedValue([
+      {
+        capacityId: "cap-a",
+        userId: "alice",
+        lastUsedAt: now,
+        tokens: 30_000,
+        overridePercent: null,
+        inFlight: false,
+      },
+    ]);
+    if (kind === "failed")
+      readDb.capacityKvEviction.findMany.mockRejectedValueOnce(new Error("offline"));
+    else
+      readDb.capacityKvEviction.findMany.mockImplementationOnce(async ({ where }) => {
+        const row = {
+          capacityId: "cap-a",
+          userId: "owner",
+          cutFraction: 0.5,
+          observedAt: now,
+          expiresAt: new Date(now.getTime() + (kind === "expired" ? -1 : 1000)),
+        };
+        return row.expiresAt > where.expiresAt.gt ? [row] : [];
+      });
+    const result = await assessWarmProtection({
+      ownerId: "owner",
+      policy: policy({ share: "FIRST_COME" }),
+      members: [member],
+      source: warmProtectionSource,
+      now,
+    });
+    expect(result.get("a")).toMatchObject({
+      state: kind === "active" ? "PROTECTED" : "FREE",
+      effectiveKvBudgetTokens: kind === "active" ? 50_000 : 100_000,
+    });
+    expect(readDb.capacityKvEviction.findMany).toHaveBeenLastCalledWith({
+      where: { capacityId: { in: ["cap-a"] }, userId: "owner", expiresAt: { gt: now } },
+    });
   });
 });

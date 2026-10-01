@@ -57,6 +57,11 @@ const affinity = vi.hoisted(() => ({
   remember: vi.fn(),
   material: vi.fn(),
 }));
+const kvFeedback = vi.hoisted(() => ({ observe: vi.fn() }));
+vi.mock("./kv-eviction-feedback.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./kv-eviction-feedback.js")>()),
+  observeKvEviction: kvFeedback.observe,
+}));
 const publicOverflow = vi.hoisted(() => ({
   dispatch: vi.fn(),
   list: vi.fn(),
@@ -1568,6 +1573,7 @@ describe("model API routes", () => {
     const kvPools = (states: Record<string, "FREE" | "FULL" | "PROTECTED">, ageSeconds = {}) => {
       const ages = ageSeconds as Record<string, number>;
       warmProtection.load.mockResolvedValue({
+        kvEvictionByCapacity: new Map(),
         activeByCapacity: new Map(
           Object.entries(states).map(([member, state]) => [
             `member-${member}-capacity`,
@@ -1678,9 +1684,132 @@ describe("model API routes", () => {
       affinity.rank.mockResolvedValue(decision());
     });
     afterEach(() => {
+      vi.useRealTimers();
       warmProtection.load.mockReset();
       externalConsent.poolIds = [];
     });
+
+    it.each([
+      {
+        name: "miss",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: true,
+        expected: 1,
+      },
+      {
+        name: "hit",
+        cache: 20_000,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: true,
+        expected: 0,
+      },
+      {
+        name: "unknown usage",
+        cache: null,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: true,
+        expected: 0,
+      },
+      {
+        name: "non affinity",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: false,
+        ok: true,
+        expected: 0,
+      },
+      {
+        name: "short",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 1000,
+        affinityMatch: true,
+        ok: true,
+        expected: 0,
+      },
+      {
+        name: "failed terminal",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: false,
+        expected: 0,
+      },
+      {
+        name: "throwing recorder",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: true,
+        expected: 1,
+        throws: true,
+      },
+    ])(
+      "KV feedback finalization: $name",
+      async ({ cache, prompt, tokens, affinityMatch, ok, expected, throws }) => {
+        vi.useFakeTimers({ toFake: ["Date"] });
+        vi.setSystemTime(new Date("2026-09-30T12:00:00Z"));
+        db.poolMember.findMany.mockResolvedValue(
+          members(1, { engineKind: "VLLM", kvBudgetTokens: 100_000 }),
+        );
+        kvPools({ a: "FREE" });
+        affinity.rank.mockResolvedValue({
+          ...decision(affinityMatch),
+          prefixEvidence: affinityMatch
+            ? { "member-a-target": { tokens, lastUsedAt: Date.now(), confirmed: true } }
+            : {},
+        });
+        kvFeedback.observe.mockReset();
+        if (throws)
+          kvFeedback.observe.mockImplementationOnce(() => {
+            throw new Error("disposable");
+          });
+        const { runtime } = scripted(["member-a"]);
+        const { manager, response } = request(runtime, poolTarget.modelId);
+        await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+        const sent = requireSent(manager);
+        manager.headers(sent.requestId, ok ? 200 : 400, { "content-type": "application/json" });
+        manager.body(
+          sent.requestId,
+          JSON.stringify({
+            id: "ok",
+            usage: {
+              prompt_tokens: prompt,
+              completion_tokens: 1,
+              ...(cache === null ? {} : { prompt_tokens_details: { cached_tokens: cache } }),
+            },
+          }),
+        );
+        manager.complete(sent.requestId);
+        const result = await response;
+        await result.text();
+        expect(result.status).toBe(ok ? 200 : 400);
+        await vi.waitFor(() =>
+          expect(db.relayRequest.update).toHaveBeenCalledWith(
+            expect.objectContaining({
+              data: expect.objectContaining({ status: ok ? "SUCCEEDED" : "FAILED" }),
+            }),
+          ),
+        );
+        expect(kvFeedback.observe).toHaveBeenCalledTimes(expected);
+        if (expected)
+          expect(kvFeedback.observe).toHaveBeenCalledWith(
+            "member-a-capacity",
+            poolTarget.ownerUserId,
+          );
+        if (ok) expect(affinity.remember).toHaveBeenCalled();
+      },
+    );
 
     it("a new session avoids a member whose idle capacity is all protected when another is FREE", async () => {
       db.poolMember.findMany.mockResolvedValue(members());
@@ -1767,6 +1896,7 @@ describe("model API routes", () => {
       ["only PROTECTED members", { a: "PROTECTED", b: "PROTECTED" }],
       ["PROTECTED and FULL members", { a: "PROTECTED", b: "FULL" }],
     ] as const)(":external with a plan and %s goes external now", async (_label, states) => {
+      kvFeedback.observe.mockReset();
       const provider = useExternalPlan();
       publicOverflow.dispatch.mockResolvedValue(externalDispatchResult(provider));
       db.poolMember.findMany.mockResolvedValue(members());
@@ -1785,6 +1915,8 @@ describe("model API routes", () => {
       // No local wait first: protection is part of saturation (S1).
       expect(acquire).toHaveBeenCalledTimes(1);
       expect(rounds(acquire)).toEqual([]);
+      await served.text();
+      expect(kvFeedback.observe).not.toHaveBeenCalled();
     });
 
     it("without a plan it admits on the oldest protected member, never queueing behind FULL", async () => {
@@ -1887,6 +2019,7 @@ describe("model API routes", () => {
       });
       const load = (sessions: ReturnType<typeof session>[]) =>
         warmProtection.load.mockResolvedValue({
+          kvEvictionByCapacity: new Map(),
           activeByCapacity: new Map([["member-a-capacity", 2]]),
           sessionsByCapacity: new Map([["member-a-capacity", sessions]]),
         });

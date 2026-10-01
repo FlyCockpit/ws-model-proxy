@@ -107,6 +107,7 @@ import {
   SERVED_MODEL_HEADER,
   withResponseHeaders,
 } from "./external-route.js";
+import { observeKvEviction, qualifiesAsEvictionEvidence } from "./kv-eviction-feedback.js";
 import {
   MODEL_API_MAX_REQUEST_BODY_BYTES,
   MODEL_API_RELAY_TIMEOUT_MS,
@@ -6885,6 +6886,30 @@ async function relayPool({
           const selectedAffinityReason = affinityTarget
             ? (affinityDecision?.reasons[affinityTarget.executionTargetId] ?? "no_match")
             : "identity_unavailable";
+          // Feedback is an optimization after the response is determined. Never
+          // await its flush or let it interfere with other finalization writes.
+          try {
+            const capacity = member.ExecutionTarget?.InferenceCapacity;
+            if (
+              affinityTarget &&
+              capacity &&
+              qualifiesAsEvictionEvidence({
+                policy: protectionPolicy,
+                engineKind: capacity.engineKind,
+                kvBudgetTokens: capacity.kvBudgetTokens,
+                ok: terminal.ok,
+                usage,
+                evidence: affinityDecision?.prefixEvidence?.[affinityTarget.executionTargetId],
+                // The record's age is judged when the request was ranked, not
+                // after a long generation finished.
+                now: startedAt,
+              })
+            )
+              // The same owner id the protection read filters by.
+              observeKvEviction(capacity.id, target.ownerUserId);
+          } catch {
+            /* Disposable feedback never changes the response. */
+          }
           const terminalWrites = await Promise.allSettled([
             terminal.ok
               ? markPoolMemberRelaySuccess(candidate.poolMemberId, {
@@ -7395,6 +7420,8 @@ async function relaySelectedModelNoFailover({
     const started = await attempt.started;
     const stickiness = operation.responseStickiness;
     let affinityWrite: Promise<AffinitySessionBinding | null> | undefined;
+    // Bound Responses continuations are not eviction evidence: this path has
+    // neither a ranked affinity decision nor a matched record's age/footprint.
     const persistAffinity = () =>
       (affinityWrite ??= attempt.terminal
         .then((terminal) =>

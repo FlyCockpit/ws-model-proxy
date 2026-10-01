@@ -6033,6 +6033,7 @@ it("omits a shared pool entirely after its grant is revoked", async () => {
 describe("metric routing procedures (S-B part 2)", () => {
   const deep = prisma as unknown as {
     modelPool: { findFirst: MockInstance; updateMany: MockInstance };
+    capacityKvEviction: { findMany: MockInstance };
     poolMemberRoutingVerdict: { findMany: MockInstance; deleteMany: MockInstance };
     cliDevice: { findUnique: MockInstance; findMany: MockInstance; updateMany: MockInstance };
   };
@@ -6046,6 +6047,7 @@ describe("metric routing procedures (S-B part 2)", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    deep.capacityKvEviction.findMany.mockResolvedValue([]);
   });
 
   function client(services?: Record<string, unknown>) {
@@ -6053,6 +6055,125 @@ describe("metric routing procedures (S-B part 2)", () => {
       context: { ...buildContext(), ...(services ? { services } : {}) },
     });
   }
+
+  it.each([
+    {
+      name: "active",
+      cut: 0.5,
+      engineKind: "VLLM",
+      reported: 100_000,
+      effective: 50_000,
+      active: true,
+    },
+    {
+      name: "no row",
+      cut: null,
+      engineKind: "VLLM",
+      reported: 100_000,
+      effective: 100_000,
+      active: false,
+    },
+    {
+      name: "recovered",
+      cut: 0,
+      engineKind: "VLLM",
+      reported: 100_000,
+      effective: 100_000,
+      active: false,
+    },
+    {
+      name: "llama slot",
+      cut: 0.5,
+      engineKind: "LLAMA_CPP",
+      reported: 100_000,
+      effective: null,
+      active: false,
+    },
+    {
+      name: "unknown budget slot",
+      cut: 0.5,
+      engineKind: "VLLM",
+      reported: null,
+      effective: null,
+      active: false,
+    },
+    {
+      name: "read failure",
+      cut: null,
+      engineKind: "VLLM",
+      reported: 100_000,
+      effective: 100_000,
+      active: false,
+      fail: true,
+    },
+  ])(
+    "KV budget visibility: $name",
+    async ({ cut, engineKind, reported, effective, active, fail }) => {
+      vi.useFakeTimers();
+      const now = new Date("2026-09-30T12:00:00Z");
+      vi.setSystemTime(now);
+      try {
+        deep.modelPool.findFirst.mockResolvedValue({
+          id: "pool-1",
+          slug: "coder",
+          routingRules: [],
+          PoolMembers: [
+            {
+              id: "m1",
+              engineLoadMode: "AUTO",
+              kvFullThreshold: null,
+              ExecutionTarget: {
+                InferenceCapacity: {
+                  id: "cap-1",
+                  engineKind,
+                  engineSlots: 4,
+                  kvBudgetTokens: reported,
+                },
+                DiscoveredModel: {
+                  slug: "qwen",
+                  upstreamModelId: "qwen",
+                  Endpoint: { slug: "gpu", cliDeviceId: "cli-1", CliDevice: { name: "GPU" } },
+                },
+              },
+            },
+          ],
+        });
+        deep.poolMemberRoutingVerdict.findMany.mockResolvedValue([]);
+        deep.cliDevice.findMany.mockResolvedValue([]);
+        const expiresAt = new Date(now.getTime() + 1_800_000);
+        if (fail) deep.capacityKvEviction.findMany.mockRejectedValueOnce(new Error("offline"));
+        else
+          deep.capacityKvEviction.findMany.mockResolvedValue(
+            cut === null
+              ? []
+              : [
+                  {
+                    capacityId: "cap-1",
+                    userId: "user-id",
+                    cutFraction: cut,
+                    observedAt: now,
+                    expiresAt,
+                  },
+                ],
+          );
+        const result = await client().getPoolRoutingRules({ poolId: "pool-1" });
+        expect(result.members[0]?.engineLoad.kvBudget).toEqual({
+          reportedTokens: reported,
+          effectiveTokens: effective,
+          cutFraction: active ? cut : 0,
+          floorFraction: 0.5,
+          lastObservedAt: cut === null ? null : now,
+          expiresAt: cut === null ? null : expiresAt,
+          active,
+        });
+        expect(deep.capacityKvEviction.findMany).toHaveBeenCalledWith({
+          where: { capacityId: { in: ["cap-1"] }, userId: "user-id", expiresAt: { gt: now } },
+        });
+      } finally {
+        vi.useRealTimers();
+      }
+    },
+  );
 
   it("replaces a pool's rules, scoped to the owner, and asks the relay to clear its verdicts (M never writes an H table)", async () => {
     deep.modelPool.updateMany.mockResolvedValue({ count: 1 });

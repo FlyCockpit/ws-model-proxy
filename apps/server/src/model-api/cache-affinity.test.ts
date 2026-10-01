@@ -225,6 +225,77 @@ describe("cache affinity", () => {
     db.capacityWaiter.groupBy.mockResolvedValue([]);
   });
 
+  it.each([
+    { name: "live tip", viaTip: true, confirmed: true, expected: true },
+    { name: "unconfirmed live tip", viaTip: true, confirmed: false, expected: true },
+    { name: "ancestor edit", viaTip: false, confirmed: true, expected: false },
+    { name: "client id only", viaTip: true, confirmed: true, expected: false, clientId: true },
+    {
+      name: "instruction only",
+      viaTip: true,
+      confirmed: true,
+      expected: false,
+      instructions: true,
+    },
+    { name: "unknown size", viaTip: true, confirmed: true, expected: false, unknown: true },
+    {
+      // The matched prefix hint was last stamped by another session, so its
+      // size is not the resolved session's footprint.
+      name: "record stamped by another session",
+      viaTip: true,
+      confirmed: true,
+      expected: false,
+      otherSession: true,
+    },
+  ])(
+    "prefix evidence: $name",
+    async ({ viaTip, confirmed, expected, clientId, instructions, unknown, otherSession }) => {
+      const now = new Date("2026-08-25T12:00:00Z");
+      const requestPayload = {
+        ...payload,
+        ...(clientId ? { conversation_id: "11111111-2222-4333-8444-555555555555" } : {}),
+        messages: [
+          ...payload.messages,
+          { role: "assistant", content: "answer" },
+          { role: "user", content: "next" },
+        ],
+      };
+      const material = affinityPrefixDigests(digestArgs("runtime-a", requestPayload));
+      const record = {
+        ...affinityRow({
+          target: target("target-a", "runtime-a"),
+          material,
+          prefixDigest: instructions ? material.instructionDigests[0] : material.digests[1],
+          prefixDepth: 2,
+          engineCacheConfirmed: confirmed,
+          lastUsedAt: new Date(now.getTime() - 42_000),
+        }),
+        estimatedTokens: unknown ? null : 12_000,
+      };
+      db.cacheAffinityRecord.findMany.mockResolvedValue([record]);
+      db.$queryRaw.mockResolvedValue([
+        { sessionId: otherSession ? "resolved-other-session" : record.sessionId, viaTip },
+      ]);
+      const result = await rankAffinityTargets({
+        ownerId: "owner",
+        resourceOwnerId: "owner",
+        poolId: "pool",
+        securityScope: "token",
+        policy,
+        surface: "openai-chat",
+        payload: requestPayload,
+        targets: [target("target-a", "runtime-a")],
+        scoreSingleTarget: true,
+        now,
+      });
+      expect(result.prefixEvidence).toEqual(
+        expected
+          ? { "target-a": { tokens: 12_000, lastUsedAt: record.lastUsedAt.getTime(), confirmed } }
+          : {},
+      );
+    },
+  );
+
   const clientUuid = "11111111-2222-4333-8444-555555555555";
   const carriers: { body: Record<string, unknown>; header?: string; surface?: string }[] = [
     { body: { conversation: "session" } },

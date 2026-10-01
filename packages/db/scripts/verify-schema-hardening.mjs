@@ -34,6 +34,10 @@ const requiredFragments = [
   "relay_execution_attempt_transition",
   "historical-split",
   "cache_affinity_record_shape_check",
+  "capacity_kv_eviction_shape_check",
+  '"cutFraction" >= 0 AND "cutFraction" <= 1',
+  'length("capacityId") BETWEEN 1 AND 128',
+  '"expiresAt" >= "observedAt"',
   "cache_affinity_node_shape_check",
   "cache_affinity_node_owner",
   "enforce_cache_affinity_node_immutable",
@@ -494,6 +498,27 @@ async function verifyAffinityNodeHardening() {
     "Affinity node hardening: 9 shape/expiry and 8 identity negatives passed.\n",
   );
 }
+async function verifyKvEvictionHardening() {
+  const cases = [
+    { capacity: "''", cut: "0.1", expires: "NOW() + interval '1 hour'" },
+    { capacity: "repeat('c', 129)", cut: "0.1", expires: "NOW() + interval '1 hour'" },
+    { capacity: "'negative-cut'", cut: "-0.01", expires: "NOW() + interval '1 hour'" },
+    { capacity: "'oversized-cut'", cut: "1.01", expires: "NOW() + interval '1 hour'" },
+    { capacity: "'nan-cut'", cut: "'NaN'::double precision", expires: "NOW() + interval '1 hour'" },
+    { capacity: "'invalid-expiry'", cut: "0.1", expires: "NOW() - interval '1 second'" },
+  ];
+  for (const row of cases)
+    await expectConstraintFailure(`
+    INSERT INTO capacity_kv_eviction ("capacityId", "userId", "cutFraction", "observedAt", "expiresAt")
+    VALUES (${row.capacity}, 'owner-a', ${row.cut}, NOW(), ${row.expires})`);
+  await client.query(`INSERT INTO capacity_kv_eviction
+    ("capacityId", "userId", "cutFraction", "observedAt", "expiresAt")
+    VALUES ('orphan-capacity', 'absent-owner', 0.5, NOW(), NOW())`);
+  process.stdout.write(
+    "KV eviction hardening: 6 shape negatives and FK-free orphan insert passed.\n",
+  );
+}
+
 // End R1 node behavioral cases.
 
 const schemaUrl = new URL(baseUrl);
@@ -1329,6 +1354,7 @@ try {
       FROM execution_target WHERE "discoveredModelId" = 'model-a'
   `);
   await verifyAffinityNodeHardening();
+  await verifyKvEvictionHardening();
   await expectConstraintFailure(
     `
     INSERT INTO pool_member
