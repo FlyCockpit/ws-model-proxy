@@ -80,6 +80,9 @@ use super::{Cancel, FileOps, Step};
 /// Longest path list carried in a result or error detail (server schema bound).
 const MAX_REPORTED: usize = 4;
 
+/// Attempts at an unused `.wsmp-recover-*` name before failing closed with EEXIST.
+const MAX_NAME_ATTEMPTS: usize = 16;
+
 /// Recorded before a move, so undo cannot choose a new public target.
 pub(super) struct Origin {
     dir: OwnedFd,
@@ -231,7 +234,12 @@ pub(super) struct Checkpoint {
 impl RecoveryDir {
     pub(super) fn new(parent: &OwnedFd, parent_path: &Path) -> FileResult<Self> {
         let parent = dup(parent.as_fd()).map_err(FileError::errno)?;
+        // A random 10-character name never collides on a correct filesystem. Bound
+        // the retries so a filesystem that answers EEXIST to every mkdir fails
+        // closed (nothing changed) instead of spinning under the namespace lock.
+        let mut attempts = 0;
         loop {
+            attempts += 1;
             let name = OsString::from(format!(
                 ".wsmp-recover-{}",
                 Alphanumeric.sample_string(&mut rand::rng(), 10)
@@ -239,7 +247,7 @@ impl RecoveryDir {
             match run(Primitive::Mkdir, || {
                 mkdirat(parent.as_fd(), name.as_os_str(), Mode::S_IRWXU)
             }) {
-                Err(Errno::EEXIST) => continue,
+                Err(Errno::EEXIST) if attempts < MAX_NAME_ATTEMPTS => continue,
                 Err(errno) => return Err(FileError::errno(errno)),
                 Ok(()) => {}
             }
@@ -1315,5 +1323,30 @@ mod tests {
         assert!(recovery.finish().is_empty());
         assert!(published.is_symlink());
         assert_eq!(fx.get("target"), "target bytes must remain");
+    }
+
+    #[test]
+    fn recovery_name_allocation_is_bounded_and_fails_closed() {
+        let fx = Fx::new();
+        let parent = root(&fx);
+        // Every mkdir answers EEXIST: the call must stop after the bound.
+        let faults: Vec<_> = (1..=MAX_NAME_ATTEMPTS + 8)
+            .map(|nth| (Primitive::Mkdir, nth, Errno::EEXIST))
+            .collect();
+        let _faults = FaultScope::new(&faults);
+        let error = RecoveryDir::new(&parent, &fx.root).err().unwrap();
+        assert_eq!(error.code, ErrorCode::Exists);
+        assert_eq!(
+            FaultScope::calls()
+                .iter()
+                .filter(|p| **p == Primitive::Mkdir)
+                .count(),
+            MAX_NAME_ATTEMPTS
+        );
+        assert_eq!(std::fs::read_dir(&fx.root).unwrap().count(), 0);
+        // One collision below the bound still succeeds.
+        let _faults = FaultScope::new(&[(Primitive::Mkdir, 1, Errno::EEXIST)]);
+        let mut recovery = RecoveryDir::new(&parent, &fx.root).unwrap();
+        assert!(recovery.finish().is_empty());
     }
 }

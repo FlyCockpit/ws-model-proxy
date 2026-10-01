@@ -609,10 +609,11 @@ fn verify_moved(
             if let Some(mut slot) = recovery.capture(&to.dir, &to.name, &to.full_path()) {
                 let _ = ops.step(Step::Captured);
                 if recovery.reclaim_origin(&mut slot, candidate, origin) {
+                    // Nothing after this uses either proof, and restore may unlink
+                    // a private alias of this inode: close both unconditionally
+                    // (a failed observation must not leave one open).
                     candidate.release();
-                    if recovery.holds(&slot, src) {
-                        src.release();
-                    }
+                    src.release();
                     if !recovery.restore(ops, &slot) {
                         return Err(recovery.uncertain());
                     }
@@ -1081,6 +1082,58 @@ mod descriptor_tests {
         assert_eq!(fx.get("source"), "checked source");
         assert!(!fx.root.join("destination").exists());
         assert!(recovery.finish().is_empty());
+    }
+
+    #[test]
+    fn verify_moved_second_observation_failure_never_unlinks_with_a_proof_open() {
+        let fx = Fx::new();
+        let path = fx.put("source", "checked source");
+        let from = resolve_for(&fx.ops, &fx.p("source"), Access::Remove, false).unwrap();
+        let stat = from.lstat().unwrap().unwrap();
+        let mut src = Held::open(&from.dir, &from.name, stat).unwrap();
+        let mut candidate = Held::open(&from.dir, &from.name, stat).unwrap();
+        let origin = Origin::new(&from.dir, &from.name, &path).unwrap();
+        std::fs::rename(path, fx.root.join("destination")).unwrap();
+        let to = resolve_for(&fx.ops, &fx.p("destination"), Access::Write, false).unwrap();
+        let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path).unwrap();
+        let _scope = FaultScope::new(&[
+            (Primitive::Identity, 1, Errno::EIO),
+            // The third observation is the restore's own disposal proof: its
+            // failure keeps the alias (uncertain). A release that depended on a
+            // successful observation would unlink with src still open.
+            (Primitive::Identity, 3, Errno::EIO),
+            (Primitive::Restore, 1, Errno::EINVAL),
+        ]);
+        let checks = Arc::new(Mutex::new(0usize));
+        let checked = Arc::clone(&checks);
+        let inode = (stat.dev, stat.ino);
+        UNLINK_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move || {
+                for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+                    if let Ok(metadata) = std::fs::metadata(entry.unwrap().path()) {
+                        assert_ne!(
+                            (metadata.dev(), metadata.ino()),
+                            inode,
+                            "source/candidate proof pins the restore alias"
+                        );
+                    }
+                }
+                *checked.lock().unwrap() += 1;
+            }));
+        });
+        let error = verify_moved(
+            &fx.ops,
+            &mut recovery,
+            &to,
+            &mut src,
+            &mut candidate,
+            origin,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::UncertainOutcome);
+        assert_eq!(*checks.lock().unwrap(), 0, "no unlink may happen");
+        assert!(!fx.root.join("destination").exists());
+        assert!(!recovery.finish().is_empty(), "the object stays reported");
     }
 
     #[test]
