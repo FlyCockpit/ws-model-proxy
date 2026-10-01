@@ -38,6 +38,9 @@
 //! Remaining POSIX windows (no cross-process exclusion is claimed):
 //! (a) a same-user process guessing a private slot can replace it between the held
 //! proof, close and final unlinkat and lose the successor. Closing adds one syscall.
+//! The link probe proves each private name only by a proof opened on that name, so
+//! the same actor can also swap `probe` between its link and that proof, or `tmp`
+//! between the alias unlink and its re-hold (its object would then be published).
 //! (a2) when NOREPLACE is absent, capture plain-renames into a private slot checked
 //! absent; a squatter between that check and rename can be overwritten.
 //! (b) undo briefly vacates public names; a concurrent create blocks NOREPLACE/link
@@ -350,6 +353,18 @@ impl RecoveryDir {
         self.capture(&origin.dir, &origin.name, &origin.path)
     }
 
+    /// Follow a private object that moved to a new name inside R: the slot and the
+    /// reported (kept) path change together.
+    fn adopt_name(&mut self, slot: &mut Slot, name: OsString) {
+        let old = self.path.join(&slot.name);
+        slot.name = name;
+        for path in &mut self.kept {
+            if *path == old {
+                *path = self.path.join(&slot.name);
+            }
+        }
+    }
+
     /// Probes use absent private names and do not consume a capture slot. A
     /// successful NOREPLACE probe MOVES T, so update both its name and reporting.
     fn probe_publish(
@@ -367,17 +382,32 @@ impl RecoveryDir {
             Primitive::ProbeNoReplace,
         ) {
             Ok(()) => {
-                let old = self.path.join(&slot.name);
-                slot.name = probe;
-                for path in &mut self.kept {
-                    if *path == old {
-                        *path = self.path.join(&slot.name);
-                    }
-                }
+                self.adopt_name(slot, probe);
                 return Ok(PublishMethod::NoReplace);
             }
             Err(errno) if is_unsupported(errno) => {}
-            Err(errno) => return Err(FileError::errno(errno)),
+            Err(errno) => {
+                // An ambiguous reply may follow an effective private rename: when
+                // the probe name now holds T and the old name is gone, follow it so
+                // the reported path (and the later disposal) names what exists.
+                let moved = matches!(
+                    fstatat(
+                        self.dir.as_fd(),
+                        slot.name.as_os_str(),
+                        AtFlags::AT_SYMLINK_NOFOLLOW
+                    ),
+                    Err(Errno::ENOENT)
+                ) && fstatat(
+                    self.dir.as_fd(),
+                    probe.as_os_str(),
+                    AtFlags::AT_SYMLINK_NOFOLLOW,
+                )
+                .is_ok();
+                if moved {
+                    self.adopt_name(slot, probe);
+                }
+                return Err(FileError::errno(errno));
+            }
         }
         run(Primitive::ProbeLink, || {
             linkat(

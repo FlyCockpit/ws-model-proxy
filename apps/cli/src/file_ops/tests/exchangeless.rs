@@ -1537,6 +1537,27 @@ fn exchangeless_real_filesystem_optional_e2e() {
 }
 
 #[test]
+fn exchangeless_noreplace_probe_error_after_effect_reports_existing_paths() {
+    // The private probe rename took effect but its reply failed: the temp now has
+    // another name. It must be disposed (not left behind under a stale reported
+    // path), and the public original stays untouched.
+    for op in REPLACE_OPS {
+        let fx = Fx::new();
+        let etag = prepare(&fx);
+        let before_doc = fx.get("doc");
+        let _scope = FaultScope::with_after_effects(
+            &[(Primitive::Exchange, 1, Errno::EINVAL)],
+            &[(Primitive::ProbeNoReplace, 1, Errno::EIO)],
+        );
+        let error = op.run(&fx, &etag).unwrap_err();
+        assert_eq!(error.code, ErrorCode::IoError, "{op:?}: {error:?}");
+        assert_eq!(fx.get("doc"), before_doc);
+        assert_eq!(count(&FaultScope::calls(), Primitive::Capture), 0);
+        clean(&fx);
+    }
+}
+
+#[test]
 fn exchangeless_noreplace_probe_errors_stop_before_link_or_capture() {
     let mut checked = 0;
     for op in REPLACE_OPS {
