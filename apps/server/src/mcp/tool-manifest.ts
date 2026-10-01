@@ -899,6 +899,30 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     ),
   },
   {
+    name: "forwarder_device_engine_adapters_set",
+    target: "forwarderManagement.setCliDeviceEngineAdapters",
+    scope: "write",
+    confirmation: "RUN",
+    classification: "external",
+    descriptionNote:
+      "Only for devices whose MCP command mode is unsupervised, and only for a personal token minted with the CLI commands option. Replaces the device's remote engine adapters. The CLI runs one only with its separate local opt-in (allowRemoteEngineAdapters; metric-source opt-in is not enough) and after the person approves the canonical spec (wsmp endpoints adapter approve <slug> --sha256 <hash>); a changed spec needs approval again. Custom FULL starts observe-only.",
+    invokeProcedure: procedureInvoker(
+      (client) => client.forwarderManagement.setCliDeviceEngineAdapters,
+    ),
+  },
+  {
+    name: "forwarder_device_engine_adapters_clear",
+    target: "forwarderManagement.clearCliDeviceEngineAdapters",
+    scope: "write",
+    confirmation: "RUN",
+    classification: "external",
+    descriptionNote:
+      "Clears remotely defined engine adapters for an unsupervised device. Same credential and mode gate as forwarder_device_engine_adapters_set.",
+    invokeProcedure: procedureInvoker(
+      (client) => client.forwarderManagement.clearCliDeviceEngineAdapters,
+    ),
+  },
+  {
     name: "forwarder_model_pool_update",
     target: "forwarderManagement.updateModelPool",
     scope: "write",

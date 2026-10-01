@@ -120,6 +120,7 @@ import {
 } from "../lib/pool-recommended-surface";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
 import { refusedRelayProtocolReason, relayProtocolAtLeast } from "../lib/relay-protocol-version";
+import { serializeRemoteEngineAdapters } from "../lib/remote-engine-adapters";
 import {
   runCapacityDeleteTransaction,
   runSerializableCapacityCreationTransaction,
@@ -2561,6 +2562,8 @@ export const forwarderManagementRouter = {
           mcpCommandMode: true,
           remoteMetricSources: true,
           remoteMetricSourcesAt: true,
+          remoteEngineAdapters: true,
+          remoteEngineAdaptersAt: true,
         },
       });
       if (!row || row.userId !== context.session.user.id) {
@@ -2587,6 +2590,9 @@ export const forwarderManagementRouter = {
         remoteMetricSources: serializeRemoteMetricSources(row.remoteMetricSources),
         remoteMetricSourcesAt: row.remoteMetricSourcesAt ?? null,
         remoteMetricSourcesAllowed: row.mcpCommandMode === "UNSUPERVISED",
+        remoteEngineAdapters: serializeRemoteEngineAdapters(row.remoteEngineAdapters),
+        remoteEngineAdaptersAt: row.remoteEngineAdaptersAt ?? null,
+        remoteEngineAdaptersAllowed: row.mcpCommandMode === "UNSUPERVISED",
         cliDeviceId: row.id,
         slug: row.slug,
         live: live !== null,

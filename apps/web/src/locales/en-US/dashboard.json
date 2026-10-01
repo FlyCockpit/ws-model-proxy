@@ -194,8 +194,12 @@
       "states": {
         "active": "Active",
         "failing": "Failing",
-        "disabled": "Disabled"
+        "disabled": "Disabled",
+        "pending_approval": "Pending approval",
+        "refused": "Refused"
       },
+      "pendingHint": "Review the spec with `wsmp endpoints adapter show {{slug}}` on the machine and approve it with `wsmp endpoints adapter approve {{slug}} --sha256 <hash>`, using the hash shown there.",
+      "refusedHint": "The CLI refuses remote adapters unless `allowRemoteEngineAdapters` is on locally. Metric-source opt-in does not allow adapters.",
       "errors": {
         "spawn": "could not start",
         "timeout": "timed out",

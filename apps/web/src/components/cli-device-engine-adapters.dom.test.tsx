@@ -77,6 +77,7 @@ describe("CliDeviceEngineAdapters", () => {
     expect(screen.getByText("dashboard:clis.engineAdapters.inputs.command")).toBeTruthy();
     expect(screen.getByText("dashboard:clis.engineAdapters.states.active")).toBeTruthy();
     expect(screen.getByText("dashboard:clis.engineAdapters.states.failing")).toBeTruthy();
+    expect(screen.queryByText("dashboard:clis.engineAdapters.states.pending_approval")).toBeNull();
     expect(screen.getByText("dashboard:clis.engineAdapters.errors.out_of_range")).toBeTruthy();
     expect(screen.queryByText("curl http://127.0.0.1/secret")).toBeNull();
     expect(screen.queryByText("raw adapter stdout")).toBeNull();
@@ -86,7 +87,29 @@ describe("CliDeviceEngineAdapters", () => {
       expect(bundle.clis.engineAdapters.hint).toContain("wsmp endpoints adapter");
       expect(bundle.clis.engineAdapters.errors.out_of_range.length).toBeGreaterThan(0);
       expect(bundle.clis.engineAdapters.errors.unmapped.length).toBeGreaterThan(0);
+      expect(bundle.clis.engineAdapters.states.pending_approval.length).toBeGreaterThan(0);
+      expect(bundle.clis.engineAdapters.states.refused.length).toBeGreaterThan(0);
+      expect(bundle.clis.engineAdapters.pendingHint).toContain("wsmp endpoints adapter approve");
+      expect(bundle.clis.engineAdapters.refusedHint).toContain("allowRemoteEngineAdapters");
     }
+  });
+
+  it("shows pending_approval and refused without command text", async () => {
+    state.data = {
+      nodeMetrics: {
+        engineAdapters: [
+          { endpointSlug: "gpu", input: "command", state: "pending_approval" },
+          { endpointSlug: "other", input: "route", state: "refused" },
+        ],
+      },
+    };
+    mount();
+    fireEvent.click(screen.getByText("dashboard:clis.engineAdapters.title"));
+    await waitFor(() => expect(screen.getByText("gpu")).toBeTruthy());
+    expect(screen.getByText("dashboard:clis.engineAdapters.states.pending_approval")).toBeTruthy();
+    expect(screen.getByText("dashboard:clis.engineAdapters.states.refused")).toBeTruthy();
+    expect(screen.getByText("dashboard:clis.engineAdapters.pendingHint")).toBeTruthy();
+    expect(screen.getByText("dashboard:clis.engineAdapters.refusedHint")).toBeTruthy();
   });
 
   it("shows an empty state", async () => {

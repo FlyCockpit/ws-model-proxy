@@ -64,6 +64,7 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.addProviderPoolMember` | `forwarder_provider_member_add` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.cacheAffinityStats` | `forwarder_affinity_stats_get` | read | — | pure | — | — | — |
 | `forwarderManagement.clearCacheAffinity` | `forwarder_affinity_clear` | write | DELETE | destructive | — | — | — |
+| `forwarderManagement.clearCliDeviceEngineAdapters` | `forwarder_device_engine_adapters_clear` | write | RUN | external | — | — | — |
 | `forwarderManagement.createGuardedModelPool` | `forwarder_guarded_pool_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.createModelPool` | `forwarder_model_pool_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.deleteModelPool` | `forwarder_model_pool_delete` | write | DELETE | destructive | — | — | — |
@@ -84,6 +85,7 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.renameCliDevice` | `forwarder_cli_device_rename` | write | — | pure | — | — | — |
 | `forwarderManagement.reorderProviderPoolMember` | `forwarder_provider_member_reorder` | write | — | pure | — | — | — |
 | `forwarderManagement.revokePoolAccessByEmail` | `forwarder_pool_grant_revoke` | write | DELETE | destructive | — | — | — |
+| `forwarderManagement.setCliDeviceEngineAdapters` | `forwarder_device_engine_adapters_set` | write | RUN | external | — | — | — |
 | `forwarderManagement.setCliDeviceFeatureGrants` | — (excluded) | — | — | — | — | — | Human-only device grants including read-only file consent; requires the CLI read switch and configured roots reports. |
 | `forwarderManagement.setCliDeviceMetricSources` | `forwarder_device_metric_sources_set` | write | RUN | external | — | — | — |
 | `forwarderManagement.setDiscoveredModelCapabilityProfile` | `forwarder_model_capability_profile_set` | write | — | pure | — | — | — |

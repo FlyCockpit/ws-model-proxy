@@ -26,6 +26,7 @@
         "terminalApproval": false,
         "terminalSupported": true,
         "remoteMetricSources": false,
+        "remoteEngineAdapters": false,
         "mcpFileRead": false,
         "fileRootsConfigured": false,
         "allowFileToolsAsRoot": false

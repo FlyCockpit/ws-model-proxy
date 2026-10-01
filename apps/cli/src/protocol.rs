@@ -529,6 +529,8 @@ pub struct TerminalFeatureSnapshot {
     pub file_roots_configured: bool,
     /// The local `allowRemoteMetricSources` opt-in, read at startup.
     pub allow_remote_metric_sources: bool,
+    /// The local `allowRemoteEngineAdapters` opt-in, read at startup.
+    pub allow_remote_engine_adapters: bool,
     /// 65-byte uncompressed SEC1, base64url without padding.
     pub terminal_public_key_b64url: String,
     /// The persistent identity key and its signature over the ECDH key above.
@@ -546,6 +548,8 @@ pub struct CliReportedFeatures {
     /// 2.7: whether this CLI accepts remotely defined metric sources
     /// (`metrics.sources.set`): the local `allowRemoteMetricSources` opt-in.
     pub remote_metric_sources: bool,
+    /// 2.9: whether this CLI accepts remotely defined engine adapters.
+    pub remote_engine_adapters: bool,
     /// 2.8: the CLI's read-only file grant. From the startup config.
     pub mcp_file_read: bool,
     /// 2.8: `fileRoots` are configured. All configured roots were usable at startup.
@@ -607,6 +611,7 @@ impl CliCapabilities {
                 terminal_approval: snapshot.require_terminal_approval,
                 terminal_supported: cfg!(unix),
                 remote_metric_sources: snapshot.allow_remote_metric_sources,
+                remote_engine_adapters: snapshot.allow_remote_engine_adapters,
                 mcp_file_read: snapshot.mcp_file_read,
                 file_roots_configured: snapshot.file_roots_configured,
                 allow_file_tools_as_root: snapshot.allow_file_tools_as_root,
@@ -1032,6 +1037,36 @@ pub struct RemoteMetricSource {
     pub format: MetricSourceFormat,
 }
 
+/// 2.9 `engine.adapters.set` (server to CLI): remotely defined engine adapters.
+/// They run only with the local opt-in (`allowRemoteEngineAdapters`) and a
+/// local hash approval of the canonical spec (`wsmp endpoints adapter approve`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteEngineAdapter {
+    pub endpoint_slug: String,
+    pub input: crate::engine_adapter::AdapterInput,
+    pub format: crate::engine_adapter::AdapterFormat,
+    pub interval_secs: u32,
+    pub timeout_secs: u32,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub map: std::collections::BTreeMap<
+        crate::engine_adapter::AdapterSignal,
+        crate::engine_adapter::SignalSelector,
+    >,
+}
+
+impl RemoteEngineAdapter {
+    pub fn to_config(&self) -> crate::engine_adapter::EngineAdapterConfig {
+        crate::engine_adapter::EngineAdapterConfig {
+            input: self.input.clone(),
+            format: self.format,
+            interval_secs: self.interval_secs,
+            timeout_secs: self.timeout_secs,
+            map: self.map.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MetricSourceFormat {
@@ -1181,6 +1216,11 @@ enum KnownServerControlMessage {
     MetricsSourcesSet {
         id: String,
         sources: Vec<RemoteMetricSource>,
+    },
+    #[serde(rename = "engine.adapters.set")]
+    EngineAdaptersSet {
+        id: String,
+        adapters: Vec<RemoteEngineAdapter>,
     },
     #[serde(rename = "file.op")]
     FileOp {
@@ -1351,6 +1391,11 @@ pub enum ServerControlMessage {
     MetricsSourcesSet {
         id: String,
         sources: Vec<RemoteMetricSource>,
+    },
+    /// 2.9: remotely defined engine adapters (replaces the previous list).
+    EngineAdaptersSet {
+        id: String,
+        adapters: Vec<RemoteEngineAdapter>,
     },
     /// 2.8: run one node file op (`args` is validated by `FileOps::execute`).
     FileOp {
@@ -1779,6 +1824,9 @@ pub fn parse_server_control(text: &str) -> Result<ServerControlMessage> {
     if let KnownServerControlMessage::MetricsSourcesSet { sources, .. } = &known {
         validate_remote_metric_sources(sources)?;
     }
+    if let KnownServerControlMessage::EngineAdaptersSet { adapters, .. } = &known {
+        validate_remote_engine_adapters(adapters)?;
+    }
     Ok(known.into())
 }
 
@@ -1806,6 +1854,22 @@ pub fn validate_remote_metric_sources(sources: &[RemoteMetricSource]) -> Result<
     Ok(())
 }
 
+pub fn validate_remote_engine_adapters(adapters: &[RemoteEngineAdapter]) -> Result<()> {
+    if adapters.len() > NODE_ENGINE_ADAPTERS_MAX {
+        anyhow::bail!("engine.adapters.set lists more than {NODE_ENGINE_ADAPTERS_MAX} adapters");
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for adapter in adapters {
+        if !seen.insert(adapter.endpoint_slug.as_str())
+            || crate::slug::validate_slug(&adapter.endpoint_slug).is_err()
+            || adapter.to_config().validate().is_err()
+        {
+            anyhow::bail!("engine.adapters.set carries an adapter outside the 2.9 contract");
+        }
+    }
+    Ok(())
+}
+
 fn known_server_frame(type_name: &str) -> bool {
     matches!(
         type_name,
@@ -1826,6 +1890,7 @@ fn known_server_frame(type_name: &str) -> bool {
             | "term.spawn"
             | "supervised.cancel"
             | "metrics.sources.set"
+            | "engine.adapters.set"
             | "file.op"
             | "file.cancel"
     )
@@ -1979,6 +2044,9 @@ impl From<KnownServerControlMessage> for ServerControlMessage {
             }
             KnownServerControlMessage::MetricsSourcesSet { id, sources } => {
                 Self::MetricsSourcesSet { id, sources }
+            }
+            KnownServerControlMessage::EngineAdaptersSet { id, adapters } => {
+                Self::EngineAdaptersSet { id, adapters }
             }
             KnownServerControlMessage::FileOp {
                 op_id,
@@ -2275,7 +2343,7 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
     }
     // 2.7 telemetry control is advisory: a malformed definition list is
     // dropped and the relay keeps running.
-    if type_name == "metrics.sources.set" {
+    if type_name == "metrics.sources.set" || type_name == "engine.adapters.set" {
         return FrameFault::Ignore;
     }
     // 2.8 file frames: a bad `file.op` is refused by name; any other bad
@@ -2461,6 +2529,7 @@ mod tests {
                 mcp_file_read: false,
                 file_roots_configured: false,
                 allow_remote_metric_sources: false,
+                allow_remote_engine_adapters: false,
                 terminal_public_key_b64url: "AQID".to_string(),
                 terminal_identity: None,
             }),
@@ -2487,6 +2556,7 @@ mod tests {
                     mcp_file_read: false,
                     file_roots_configured: false,
                     allow_remote_metric_sources: false,
+                    allow_remote_engine_adapters: false,
                     terminal_public_key_b64url: "AQID".to_string(),
                     terminal_identity: Some(TerminalIdentityProof {
                         public_key: "BAQE".to_string(),
@@ -2756,7 +2826,7 @@ mod tests {
     #[test]
     fn an_older_server_rejection_says_to_upgrade_the_server() {
         let message = hello_rejection_message(OLDER_SERVER_HELLO_REJECTION);
-        assert!(message.contains("rejected relay protocol 2.8"), "{message}");
+        assert!(message.contains("rejected relay protocol 2.9"), "{message}");
         assert!(
             message.contains("upgrade the WS Model Proxy server"),
             "{message}"
@@ -3228,6 +3298,7 @@ mod relay_27_vectors {
             mcp_file_read: false,
             file_roots_configured: false,
             allow_remote_metric_sources: false,
+            allow_remote_engine_adapters: false,
             terminal_public_key_b64url: "BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A".to_string(),
             terminal_identity: None,
         });

@@ -112,6 +112,19 @@ Metric routing rules (S-B part 2):
   (`wsmp metrics approve <name> --sha256 <hash>`, the hash of the command they
   read); a changed command stops until it is approved
   again. stderr and command output never leave the CLI; only parsed numbers do.
+- `forwarder_device_engine_adapters_set` (`{ cliDeviceId, adapters, confirm:
+  "RUN" }`) replaces a device's remotely defined engine adapters
+  (`{ endpointSlug, input: { route } | { command }, format: "json" |
+  "prometheus", intervalSecs 2..5, timeoutSecs 1..4, map? }`). Same
+  unsupervised-mode and CLI-commands credential gate as metric sources. The
+  CLI refuses remote adapters unless its separate local
+  `allowRemoteEngineAdapters` opt-in is on (metric-source opt-in is not
+  enough), and runs a spec only after the person approves that exact
+  canonical JSON on the machine (`wsmp endpoints adapter approve <slug>
+  --sha256 <hash>`); a changed spec stops until it is approved again. Custom
+  FULL starts observe-only. Occupancy is display only.
+- `forwarder_device_engine_adapters_clear` (`{ cliDeviceId, confirm: "RUN" }`)
+  clears those remote adapters and sends an empty list to the live CLI.
 
 `forwarder_engine_load_history_get` (`{ poolId } | { capacityId }`) returns the
 30-minute live engine-load history (10 s buckets) for a pool or capacity the

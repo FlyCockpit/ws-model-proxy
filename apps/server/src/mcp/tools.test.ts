@@ -231,6 +231,8 @@ const CLI_COMMAND_TOOL_NAMES = new Set<string>([
   "forwarder_cli_command_result",
   "forwarder_cli_activity_list",
   "forwarder_device_metric_sources_set",
+  "forwarder_device_engine_adapters_set",
+  "forwarder_device_engine_adapters_clear",
   ...CLI_FILE_TOOL_NAMES,
 ]);
 
@@ -1406,11 +1408,15 @@ describe("CLI command tools", () => {
     expect(flagged).toContain("forwarder_cli_command_result");
     expect(flagged).toContain("forwarder_cli_activity_list");
     expect(flagged).toContain("forwarder_device_metric_sources_set");
+    expect(flagged).toContain("forwarder_device_engine_adapters_set");
+    expect(flagged).toContain("forwarder_device_engine_adapters_clear");
     for (const hidden of [
       await listedNames(OAUTH_CREDENTIAL, ["mcp:write"]),
       await listedNames(PAT_WITHOUT_CLI, ["mcp:write"]),
     ]) {
       expect(hidden).not.toContain("forwarder_device_metric_sources_set");
+      expect(hidden).not.toContain("forwarder_device_engine_adapters_set");
+      expect(hidden).not.toContain("forwarder_device_engine_adapters_clear");
     }
   });
 
@@ -1532,6 +1538,22 @@ describe("CLI command tools", () => {
       expect(resultText(result)).toBe("Tool forwarder_device_metric_sources_set not found");
     }
     expect(client.forwarderManagement.setCliDeviceMetricSources).not.toHaveBeenCalled();
+  });
+
+  it("defining a device's engine adapters needs the command credential", async () => {
+    const setAdapters = requireDescriptor("forwarder_device_engine_adapters_set");
+    const client = { forwarderManagement: { setCliDeviceEngineAdapters: vi.fn() } };
+    for (const credential of [OAUTH_CREDENTIAL, PAT_WITHOUT_CLI]) {
+      const result = await runManifestTool(setAdapters, {
+        dispatch: cliDispatch(credential),
+        scopes: ["mcp:write"],
+        client: client as never,
+        args: { cliDeviceId: "cli-1", adapters: [], confirm: "RUN" },
+      });
+      expect(result.isError).toBe(true);
+      expect(resultText(result)).toBe("Tool forwarder_device_engine_adapters_set not found");
+    }
+    expect(client.forwarderManagement.setCliDeviceEngineAdapters).not.toHaveBeenCalled();
   });
 
   it("an unregistered call on the transport is the SDK not-found error", async () => {

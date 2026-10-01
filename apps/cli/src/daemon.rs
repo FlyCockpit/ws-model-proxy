@@ -1011,6 +1011,7 @@ fn run_relay_session(
                         crate::metric_sources::RunnerSettings::from_environment(
                             startup.allow_remote_metric_sources(),
                         ),
+                        startup.allow_remote_engine_adapters(),
                     ));
                 }
             }
@@ -1979,6 +1980,27 @@ where
             }
             if let Some(telemetry) = telemetry {
                 telemetry.set_remote_sources(sources);
+            }
+        }
+        ServerControlMessage::EngineAdaptersSet { id, adapters } => {
+            // Stored even without the opt-in so `wsmp endpoints adapter show`
+            // and `approve` can show them. A remote adapter runs only with
+            // `allowRemoteEngineAdapters` and a local approval of its
+            // canonical spec; states go out in `node.metrics.engineAdapters`.
+            tracing::info!(
+                id,
+                adapters = adapters.len(),
+                opt_in = startup.allow_remote_engine_adapters(),
+                "received remote engine adapter definitions"
+            );
+            if let Err(error) = crate::engine_adapter::save_remote_adapters(&adapters) {
+                tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "storing remote engine adapters failed; they apply to this session only"
+                );
+            }
+            if let Some(telemetry) = telemetry {
+                telemetry.set_remote_adapters(adapters);
             }
         }
     }

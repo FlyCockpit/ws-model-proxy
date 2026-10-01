@@ -343,8 +343,12 @@
       "states": {
         "active": "Activo",
         "failing": "Con fallas",
-        "disabled": "Desactivado"
+        "disabled": "Desactivado",
+        "pending_approval": "Pendiente de aprobación",
+        "refused": "Rechazado"
       },
+      "pendingHint": "Revisa la especificación con `wsmp endpoints adapter show {{slug}}` en la máquina y apruébala con `wsmp endpoints adapter approve {{slug}} --sha256 <hash>`, usando el hash que aparece ahí.",
+      "refusedHint": "La CLI rechaza adaptadores remotos salvo que `allowRemoteEngineAdapters` esté activado localmente. El opt-in de fuentes de métricas no permite adaptadores.",
       "errors": {
         "spawn": "no se pudo iniciar",
         "timeout": "tiempo agotado",

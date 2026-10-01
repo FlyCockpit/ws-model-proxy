@@ -857,6 +857,120 @@ fn endpoints_adapter_set_show_clear_round_trip_json() {
         .stderr(predicate::str::contains("endpoint `missing` not found"));
 }
 
+#[test]
+fn remote_engine_adapters_need_separate_opt_in_and_hash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({
+            "version": 1,
+            "allowRemoteMetricSources": true
+        }),
+    );
+    cli(&config, &state)
+        .args([
+            "endpoints",
+            "add",
+            "--slug",
+            "gpu",
+            "--label",
+            "GPU",
+            "--base-url",
+            "http://127.0.0.1:8080/v1",
+            "--engine",
+            "generic",
+        ])
+        .assert()
+        .success();
+    write_remote_adapters(
+        &state,
+        json!([{
+            "endpointSlug": "gpu",
+            "input": { "command": "echo 1" },
+            "format": "json",
+            "intervalSecs": 2,
+            "timeoutSecs": 2
+        }]),
+    );
+
+    let shown = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["endpoints", "--json", "adapter", "show", "gpu"]);
+        cmd
+    });
+    assert_eq!(shown["origin"], "remote");
+    assert_eq!(
+        shown["state"], "refused",
+        "metric-source opt-in does not allow adapters"
+    );
+    assert_eq!(shown["allowRemoteEngineAdapters"], false);
+    let hash = shown["specSha256"].as_str().expect("hash").to_string();
+    assert_eq!(hash.len(), 64);
+
+    cli(&config, &state)
+        .args(["config", "set-remote-engine-adapters", "on"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Restart wsmp to apply."));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["allowRemoteEngineAdapters"], true);
+    assert_eq!(cfg["allowRemoteMetricSources"], true);
+
+    let shown = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["endpoints", "--json", "adapter", "show", "gpu"]);
+        cmd
+    });
+    assert_eq!(shown["state"], "pending_approval");
+
+    cli(&config, &state)
+        .args(["endpoints", "adapter", "approve", "gpu"])
+        .assert()
+        .failure();
+    cli(&config, &state)
+        .args([
+            "endpoints",
+            "adapter",
+            "approve",
+            "gpu",
+            "--sha256",
+            "deadbeef",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(&hash));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(cfg.get("approvedRemoteAdapters").is_none());
+
+    cli(&config, &state)
+        .args(["endpoints", "adapter", "approve", "gpu", "--sha256", &hash])
+        .assert()
+        .success();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["approvedRemoteAdapters"]["gpu"], hash);
+
+    let shown = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["endpoints", "--json", "adapter", "show", "gpu"]);
+        cmd
+    });
+    assert_eq!(shown["state"], "active");
+    assert!(!shown.to_string().contains("engineAdapters"));
+
+    cli(&config, &state)
+        .args(["endpoints", "adapter", "revoke", "gpu"])
+        .assert()
+        .success();
+    cli(&config, &state)
+        .args(["config", "set-remote-engine-adapters", "off"])
+        .assert()
+        .success();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(cfg.get("allowRemoteEngineAdapters").is_none());
+}
+
 #[cfg(unix)]
 #[test]
 fn endpoints_adapter_test_never_prints_raw_output() {
@@ -2463,6 +2577,15 @@ fn write_remote_sources(state: &Path, sources: Value) {
         serde_json::to_vec_pretty(&json!({ "sources": sources })).expect("json"),
     )
     .expect("write remote sources");
+}
+
+fn write_remote_adapters(state: &Path, adapters: Value) {
+    fs::create_dir_all(state).expect("state dir");
+    fs::write(
+        state.join("remote-engine-adapters.json"),
+        serde_json::to_vec_pretty(&json!({ "adapters": adapters })).expect("json"),
+    )
+    .expect("write remote adapters");
 }
 
 #[test]

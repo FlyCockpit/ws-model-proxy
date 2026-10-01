@@ -23,13 +23,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::EndpointConfig;
 use crate::engine::LoadReading;
-use crate::engine_adapter::{EngineAdapterStatus, LoadPlan};
+use crate::engine_adapter::{
+    EngineAdapterStatus, LoadPlan, RemoteAdapterEligibility, remote_adapter_eligibility,
+    status_for_eligibility,
+};
 use crate::metric_sources::{Runner, RunnerSettings};
 use crate::protocol::{
     ClientControlMessage, EndpointLoad, ExecutionMechanism, NODE_ENGINE_ADAPTERS_MAX, NODE_GPU_MAX,
     NODE_INTERFACE_MAX, NODE_METRICS_SOURCES_MAX, NodeCpu, NodeCpuMetrics, NodeDiskMetrics,
     NodeGpuInfo, NodeGpuMetrics, NodeInfo, NodeInterfaceInfo, NodeInterfaceMetrics, NodeKind,
-    NodeMemoryMetrics, NodeMetrics, NodeOs, RemoteMetricSource, encode_control,
+    NodeMemoryMetrics, NodeMetrics, NodeOs, RemoteEngineAdapter, RemoteMetricSource,
+    encode_control,
 };
 use crate::relay_bus::FromWorker;
 
@@ -66,6 +70,10 @@ struct Shared {
     endpoints_generation: u64,
     /// A `metrics.sources.set` list the thread has not applied yet.
     remote_sources: Option<Vec<RemoteMetricSource>>,
+    /// Applied remote engine adapters for this session.
+    remote_adapters: Vec<RemoteEngineAdapter>,
+    allow_remote_engine_adapters: bool,
+    approved_remote_adapters: BTreeMap<String, String>,
     /// Latest adapter statuses, keyed by endpoint slug. No command text.
     adapter_statuses: BTreeMap<String, EngineAdapterStatus>,
 }
@@ -76,10 +84,16 @@ impl Telemetry {
         tx: SyncSender<FromWorker>,
         endpoints: &[EndpointConfig],
         sources: RunnerSettings,
+        allow_remote_engine_adapters: bool,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        let approved_remote_adapters = crate::config::Config::load()
+            .map(|config| config.approved_remote_adapters)
+            .unwrap_or_default();
         let shared = Arc::new(Mutex::new(Shared {
             endpoints: endpoints.to_vec(),
+            allow_remote_engine_adapters,
+            approved_remote_adapters,
             ..Shared::default()
         }));
         let thread_stop = Arc::clone(&stop);
@@ -110,6 +124,18 @@ impl Telemetry {
     pub fn set_remote_sources(&self, sources: Vec<RemoteMetricSource>) {
         if let Ok(mut shared) = self.shared.lock() {
             shared.remote_sources = Some(bounded_remote_sources(&sources));
+        }
+    }
+
+    /// `engine.adapters.set`: replace the remote definitions. They run only
+    /// with the separate local opt-in and an approval of each canonical spec.
+    pub fn set_remote_adapters(&self, adapters: Vec<RemoteEngineAdapter>) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.remote_adapters = adapters
+                .into_iter()
+                .take(NODE_ENGINE_ADAPTERS_MAX)
+                .collect();
+            shared.endpoints_generation = shared.endpoints_generation.wrapping_add(1);
         }
     }
 }
@@ -277,23 +303,87 @@ fn sample_plan(agent: &ureq::Agent, endpoint: &EndpointConfig, plan: &LoadPlan) 
 
 /// Endpoints with a scrapeable engine or a custom adapter.
 pub fn load_targets(endpoints: &[EndpointConfig]) -> Vec<(EndpointConfig, LoadPlan)> {
-    endpoints
-        .iter()
-        .filter(|endpoint| endpoint.enabled)
-        .filter_map(|endpoint| {
-            if let Some(spec) = endpoint.engine_adapter.clone() {
-                if spec.validate().is_err() {
-                    return None;
-                }
-                warn_adapter_replaces_builtin(endpoint);
-                return Some((endpoint.clone(), LoadPlan::Adapter(spec)));
+    load_targets_with_remote(endpoints, &[], false, &BTreeMap::new()).0
+}
+
+pub fn load_targets_with_remote(
+    endpoints: &[EndpointConfig],
+    remote: &[RemoteEngineAdapter],
+    allow_remote: bool,
+    approved: &BTreeMap<String, String>,
+) -> (Vec<(EndpointConfig, LoadPlan)>, Vec<EngineAdapterStatus>) {
+    let mut targets = Vec::new();
+    let mut statuses = Vec::new();
+    let mut handled = std::collections::BTreeSet::new();
+    for endpoint in endpoints.iter().filter(|endpoint| endpoint.enabled) {
+        if let Some(spec) = endpoint.engine_adapter.clone() {
+            handled.insert(endpoint.slug.as_str());
+            if spec.validate().is_err() {
+                continue;
             }
-            crate::engine::effective_kind(endpoint)
-                .map(|(kind, _)| kind)
-                .filter(|kind| kind.has_load_source())
-                .map(|kind| (endpoint.clone(), LoadPlan::BuiltIn(kind)))
-        })
-        .collect()
+            warn_adapter_replaces_builtin(endpoint);
+            targets.push((endpoint.clone(), LoadPlan::Adapter(spec)));
+            continue;
+        }
+        if let Some(adapter) = remote
+            .iter()
+            .find(|adapter| adapter.endpoint_slug == endpoint.slug)
+        {
+            handled.insert(adapter.endpoint_slug.as_str());
+            let spec = adapter.to_config();
+            let eligibility = remote_adapter_eligibility(
+                &spec,
+                &adapter.endpoint_slug,
+                allow_remote,
+                false,
+                approved.get(&adapter.endpoint_slug).map(String::as_str),
+            );
+            if eligibility == RemoteAdapterEligibility::Run {
+                warn_adapter_replaces_builtin(endpoint);
+                targets.push((endpoint.clone(), LoadPlan::Adapter(spec)));
+                continue;
+            }
+            statuses.push(status_for_eligibility(
+                &adapter.endpoint_slug,
+                &spec,
+                eligibility,
+            ));
+        }
+        if let Some(kind) = crate::engine::effective_kind(endpoint)
+            .map(|(kind, _)| kind)
+            .filter(|kind| kind.has_load_source())
+        {
+            targets.push((endpoint.clone(), LoadPlan::BuiltIn(kind)));
+        }
+    }
+    for adapter in remote {
+        if !handled.insert(adapter.endpoint_slug.as_str()) {
+            continue;
+        }
+        let spec = adapter.to_config();
+        let local = endpoints
+            .iter()
+            .find(|endpoint| endpoint.slug == adapter.endpoint_slug);
+        if local.is_some_and(|endpoint| endpoint.engine_adapter.is_some()) {
+            continue;
+        }
+        statuses.push(status_for_eligibility(
+            &adapter.endpoint_slug,
+            &spec,
+            if local.is_some_and(|endpoint| endpoint.enabled) {
+                remote_adapter_eligibility(
+                    &spec,
+                    &adapter.endpoint_slug,
+                    allow_remote,
+                    false,
+                    approved.get(&adapter.endpoint_slug).map(String::as_str),
+                )
+            } else {
+                RemoteAdapterEligibility::Refused
+            },
+        ));
+    }
+    (targets, statuses)
 }
 
 fn warn_adapter_replaces_builtin(endpoint: &EndpointConfig) {
@@ -363,7 +453,18 @@ where
     let mut seen_generation = None;
     let mut in_flight = 0_usize;
     let mut next_epoch = 0_u64;
+    let mut next_approval_check = Instant::now();
     while !stop.load(Ordering::SeqCst) {
+        if Instant::now() >= next_approval_check {
+            next_approval_check = Instant::now() + Duration::from_secs(3);
+            if let Ok(config) = crate::config::Config::load()
+                && let Ok(mut shared) = shared.lock()
+                && shared.approved_remote_adapters != config.approved_remote_adapters
+            {
+                shared.approved_remote_adapters = config.approved_remote_adapters.clone();
+                shared.endpoints_generation = shared.endpoints_generation.wrapping_add(1);
+            }
+        }
         let (generation, endpoints) = match shared.lock() {
             Ok(shared) if seen_generation != Some(shared.endpoints_generation) => {
                 (shared.endpoints_generation, Some(shared.endpoints.clone()))
@@ -373,12 +474,35 @@ where
         };
         if let Some(endpoints) = endpoints {
             seen_generation = Some(generation);
-            let targets = load_targets(&endpoints);
+            let (allow_remote, remote, approved) = match shared.lock() {
+                Ok(shared) => (
+                    shared.allow_remote_engine_adapters,
+                    shared.remote_adapters.clone(),
+                    shared.approved_remote_adapters.clone(),
+                ),
+                Err(_) => return,
+            };
+            let (targets, remote_statuses) =
+                load_targets_with_remote(&endpoints, &remote, allow_remote, &approved);
             schedules.retain(|slug, _| targets.iter().any(|(endpoint, _)| endpoint.slug == *slug));
             if let Ok(mut shared) = shared.lock() {
+                let live: std::collections::BTreeSet<_> = targets
+                    .iter()
+                    .map(|(endpoint, _)| endpoint.slug.clone())
+                    .chain(
+                        remote_statuses
+                            .iter()
+                            .map(|status| status.endpoint_slug.clone()),
+                    )
+                    .collect();
                 shared
                     .adapter_statuses
-                    .retain(|slug, _| targets.iter().any(|(endpoint, _)| endpoint.slug == *slug));
+                    .retain(|slug, _| live.contains(slug));
+                for status in remote_statuses {
+                    shared
+                        .adapter_statuses
+                        .insert(status.endpoint_slug.clone(), status);
+                }
             }
             for target in targets {
                 let slug = target.0.slug.clone();
@@ -1566,5 +1690,74 @@ mod tests {
         assert!(load_targets(&[vllm]).is_empty());
         adapter.enabled = false;
         assert!(load_targets(&[adapter]).is_empty());
+    }
+
+    fn remote_json_adapter(slug: &str, command: &str) -> RemoteEngineAdapter {
+        RemoteEngineAdapter {
+            endpoint_slug: slug.to_string(),
+            input: crate::engine_adapter::AdapterInput::Command {
+                command: command.to_string(),
+            },
+            format: crate::engine_adapter::AdapterFormat::Json,
+            interval_secs: 2,
+            timeout_secs: 2,
+            map: Default::default(),
+        }
+    }
+
+    #[test]
+    fn remote_adapter_runs_only_with_opt_in_and_matching_hash() {
+        let endpoint = EndpointConfig {
+            slug: "gpu".to_string(),
+            engine: crate::config::EndpointEngine::Vllm,
+            ..EndpointConfig::default()
+        };
+        let remote = remote_json_adapter("gpu", "echo 1");
+        let spec = remote.to_config();
+        let hash = crate::engine_adapter::spec_sha256("gpu", &spec);
+        let mut approved = BTreeMap::new();
+        approved.insert("gpu".to_string(), hash.clone());
+        let endpoints = [endpoint];
+        let remotes = [remote];
+
+        let (targets, statuses) = load_targets_with_remote(&endpoints, &remotes, false, &approved);
+        assert!(
+            matches!(targets[0].1, LoadPlan::BuiltIn(EngineKind::Vllm)),
+            "metric-source opt-in is a different flag; without adapter opt-in the built-in scrape stays"
+        );
+        assert_eq!(
+            statuses[0].state,
+            crate::engine_adapter::AdapterState::Refused
+        );
+
+        let (targets, statuses) =
+            load_targets_with_remote(&endpoints, &remotes, true, &BTreeMap::new());
+        assert!(matches!(targets[0].1, LoadPlan::BuiltIn(EngineKind::Vllm)));
+        assert_eq!(
+            statuses[0].state,
+            crate::engine_adapter::AdapterState::PendingApproval
+        );
+
+        let mut wrong = BTreeMap::new();
+        wrong.insert("gpu".to_string(), "ab".repeat(32));
+        let (targets, statuses) = load_targets_with_remote(&endpoints, &remotes, true, &wrong);
+        assert!(matches!(targets[0].1, LoadPlan::BuiltIn(EngineKind::Vllm)));
+        assert_eq!(
+            statuses[0].state,
+            crate::engine_adapter::AdapterState::PendingApproval
+        );
+
+        let (targets, statuses) = load_targets_with_remote(&endpoints, &remotes, true, &approved);
+        assert!(matches!(targets[0].1, LoadPlan::Adapter(_)));
+        assert!(statuses.is_empty());
+
+        let mut local = endpoints[0].clone();
+        local.engine_adapter = Some(spec);
+        let (targets, statuses) = load_targets_with_remote(&[local], &remotes, true, &approved);
+        assert!(matches!(targets[0].1, LoadPlan::Adapter(_)));
+        assert!(
+            statuses.is_empty(),
+            "a local adapter shadows the remote definition"
+        );
     }
 }

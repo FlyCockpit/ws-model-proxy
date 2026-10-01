@@ -94,6 +94,11 @@ export type ContextServices = {
    */
   onRemoteMetricSourcesChanged?: (cliDeviceId: string) => boolean | Promise<boolean>;
   /**
+   * Push a device's remote engine adapters to its live relay session. Resolves
+   * true when a session in this process received them.
+   */
+  onRemoteEngineAdaptersChanged?: (cliDeviceId: string) => boolean | Promise<boolean>;
+  /**
    * A pool's metric routing rules or one of its members' engine-load override
    * were replaced (committed). The relay clears
    * the pool's stored verdicts: they are hot-path (H) rows, which a management

@@ -1352,6 +1352,8 @@ describe("capability override origin", () => {
         maxModelLen: 32768,
         maxModelLenSource: "PROBE",
         engineFactsSource: "PROBE",
+        engineLoadSource: null,
+        engineLoadSignals: [],
         engineFactsAt: now,
       },
     });

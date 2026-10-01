@@ -248,6 +248,8 @@ function cliContextServices() {
       relaySessionManager.onCliFeatureGrantsChanged(cliDeviceId),
     onRemoteMetricSourcesChanged: (cliDeviceId: string) =>
       relaySessionManager.onRemoteMetricSourcesChanged(cliDeviceId),
+    onRemoteEngineAdaptersChanged: (cliDeviceId: string) =>
+      relaySessionManager.onRemoteEngineAdaptersChanged(cliDeviceId),
     onPoolRoutingRulesChanged: (poolId: string) =>
       relaySessionManager.onPoolRoutingRulesChanged(poolId),
     onCliCredentialsRevoked: (revoked: {

@@ -67,6 +67,7 @@ wsmp metrics list                   # custom metric sources and their state
 wsmp metrics test gpu_fan           # run one source now and print what it reports
 wsmp metrics approve gpu_fan --sha256 <hash>  # approve the exact command you reviewed (hash from `metrics list`)
 wsmp config set-remote-metric-sources on  # accept remotely defined sources (each still needs approval)
+wsmp config set-remote-engine-adapters on  # accept remotely defined engine adapters (separate opt-in; each still needs approval)
 wsmp completions zsh                # shell completions
 ```
 
@@ -128,6 +129,13 @@ A per-endpoint adapter turns a JSON object or Prometheus text into the same engi
 | `prefixCacheHitsTotal`, `prefixCacheQueriesTotal` | load | cumulative **tokens**, monotonic | Prefix-cache counters. The CLI turns them into deltas. | Display (hit rate) |
 
 Declare the real KV capacity, not a guess on the high side. Custom FULL does not gate admission until the pool member is set to enforce it.
+
+Remote adapters are defined over MCP or the API, only for a device whose MCP command mode is `unsupervised` on the server. This CLI still refuses them unless both hold:
+
+1. the local opt-in: `wsmp config set-remote-engine-adapters on` (off by default; only settable on this machine; restart wsmp to apply). Metric-source opt-in does not allow adapters.
+2. a local approval of the canonical spec: `wsmp endpoints adapter approve <slug> --sha256 <hash>`, where `<hash>` is the SHA-256 `wsmp endpoints adapter show` prints for the spec you read. A changed spec shows `pending_approval` until you approve the new one. `wsmp endpoints adapter revoke <slug>` removes an approval.
+
+Received definitions are stored in `remote-engine-adapters.json` in the state directory. A local adapter on the same endpoint wins; the remote one is `refused`. Adapter status in `node.metrics.engineAdapters` never includes command text, raw output, or the hash.
 
 ### Custom metric sources
 

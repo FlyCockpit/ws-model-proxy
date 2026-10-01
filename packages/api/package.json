@@ -71,6 +71,9 @@
     "./lib/metric-routing": {
       "default": "./src/lib/metric-routing.ts"
     },
+    "./lib/remote-engine-adapters": {
+      "default": "./src/lib/remote-engine-adapters.ts"
+    },
     "./lib/reasoning-contract": {
       "default": "./src/lib/reasoning-contract.ts"
     },

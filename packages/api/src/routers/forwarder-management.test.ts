@@ -6721,6 +6721,64 @@ describe("metric routing procedures (S-B part 2)", () => {
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
   });
 
+  it("stores remote engine adapters only while the device is unsupervised and pushes them", async () => {
+    const adapter = {
+      endpointSlug: "gpu",
+      input: { command: "echo 1" },
+      format: "json" as const,
+      intervalSecs: 2,
+      timeoutSecs: 2,
+    };
+    deep.cliDevice.findUnique.mockResolvedValue({
+      id: "cli-id",
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+    });
+    deep.cliDevice.updateMany.mockResolvedValue({ count: 1 });
+    const pushed: string[] = [];
+    const result = await client({
+      onRemoteEngineAdaptersChanged: async (id: string) => {
+        pushed.push(id);
+        return true;
+      },
+    }).setCliDeviceEngineAdapters({ cliDeviceId: "cli-id", adapters: [adapter] });
+    expect(deep.cliDevice.updateMany).toHaveBeenCalledWith({
+      where: { id: "cli-id", userId: "user-id", mcpCommandMode: "UNSUPERVISED" },
+      data: { remoteEngineAdapters: [adapter], remoteEngineAdaptersAt: expect.any(Date) },
+    });
+    expect(pushed).toEqual(["cli-id"]);
+    expect(result.delivered).toBe(true);
+    expect(result.adapters[0]?.specSha256).toMatch(/^[0-9a-f]{64}$/);
+
+    for (const mode of ["OFF", "SUPERVISED"]) {
+      vi.clearAllMocks();
+      deep.cliDevice.findUnique.mockResolvedValue({
+        id: "cli-id",
+        userId: "user-id",
+        mcpCommandMode: mode,
+      });
+      await expect(
+        client().setCliDeviceEngineAdapters({ cliDeviceId: "cli-id", adapters: [adapter] }),
+      ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+      expect(deep.cliDevice.updateMany).not.toHaveBeenCalled();
+    }
+
+    vi.clearAllMocks();
+    deep.cliDevice.findUnique.mockResolvedValue({
+      id: "cli-id",
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+    });
+    deep.cliDevice.updateMany.mockResolvedValue({ count: 1 });
+    await client({
+      onRemoteEngineAdaptersChanged: async () => true,
+    }).clearCliDeviceEngineAdapters({ cliDeviceId: "cli-id" });
+    expect(deep.cliDevice.updateMany).toHaveBeenCalledWith({
+      where: { id: "cli-id", userId: "user-id", mcpCommandMode: "UNSUPERVISED" },
+      data: { remoteEngineAdapters: [], remoteEngineAdaptersAt: expect.any(Date) },
+    });
+  });
+
   it("returns engine-load history for an owned pool and NOT_FOUND for a foreign one", async () => {
     deep.modelPool.findFirst.mockResolvedValue({
       PoolMembers: [

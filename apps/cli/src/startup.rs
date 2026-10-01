@@ -24,6 +24,7 @@ pub struct TerminalStartup {
     file_roots: Vec<std::path::PathBuf>,
     file_roots_configured: bool,
     allow_remote_metric_sources: bool,
+    allow_remote_engine_adapters: bool,
 }
 
 impl TerminalStartup {
@@ -61,6 +62,7 @@ impl TerminalStartup {
             file_roots: config.file_roots.clone(),
             file_roots_configured: crate::config::file_roots_usable(&config.file_roots),
             allow_remote_metric_sources: config.allow_remote_metric_sources,
+            allow_remote_engine_adapters: config.allow_remote_engine_adapters,
         }
     }
 
@@ -105,6 +107,10 @@ impl TerminalStartup {
         self.allow_remote_metric_sources
     }
 
+    pub fn allow_remote_engine_adapters(&self) -> bool {
+        self.allow_remote_engine_adapters
+    }
+
     /// `cli_slug` is the slug this hello reports; the identity signs it with
     /// the ECDH key.
     pub fn capabilities(&self, cli_slug: &str) -> CliCapabilities {
@@ -124,6 +130,7 @@ impl TerminalStartup {
             mcp_file_read: self.mcp_file_read,
             file_roots_configured: self.file_roots_configured,
             allow_remote_metric_sources: self.allow_remote_metric_sources,
+            allow_remote_engine_adapters: self.allow_remote_engine_adapters,
             terminal_public_key_b64url: self.key.public_b64url().to_string(),
             terminal_identity,
         })
@@ -154,6 +161,7 @@ mod tests {
             require_terminal_approval: true,
             allow_file_tools_as_root: true,
             allow_remote_metric_sources: true,
+            allow_remote_engine_adapters: true,
             ..Config::default()
         };
         let startup = TerminalStartup::capture(&config).expect("startup");
@@ -165,11 +173,16 @@ mod tests {
         config.mcp_file_read = false;
         config.file_roots.clear();
         config.allow_remote_metric_sources = false;
+        config.allow_remote_engine_adapters = false;
         let capabilities = hello_capabilities(&startup, &config, "desk-01");
         assert!(capabilities.features.human_terminal);
         assert!(
             capabilities.features.remote_metric_sources,
             "the opt-in is read once at startup"
+        );
+        assert!(
+            capabilities.features.remote_engine_adapters,
+            "adapter opt-in is read once at startup"
         );
         assert!(
             !TerminalStartup::from_key(

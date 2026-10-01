@@ -3133,6 +3133,26 @@ describe("relay 2.7 telemetry", () => {
     return { manager, socket };
   }
 
+  function helloFrame29() {
+    const frame = JSON.parse(helloFrame()) as {
+      protocolVersion: string;
+      cli: { capabilities: { protocolVersion: string } };
+    };
+    frame.protocolVersion = "2.9";
+    frame.cli.capabilities.protocolVersion = "2.9";
+    return JSON.stringify(frame);
+  }
+
+  async function registered29() {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    await manager.handleTextFrame(socket, helloFrame29(), now);
+    db.cliDevice.updateMany.mockClear();
+    db.cliDevice.update.mockClear();
+    return { manager, socket };
+  }
+
   function telemetryWrites() {
     return db.cliDevice.updateMany.mock.calls
       .map((call) => call[0] as { where: { id: string }; data: Record<string, unknown> })
@@ -3531,6 +3551,88 @@ describe("relay 2.7 telemetry", () => {
     // Changing the definitions pushes them to the live session.
     expect(await manager.onRemoteMetricSourcesChanged("cli-device-id")).toBe(true);
     expect(await manager.onRemoteMetricSourcesChanged("other-device")).toBe(false);
+    manager.dispose();
+  });
+
+  const gpuAdapter = {
+    endpointSlug: "gpu",
+    input: { command: "echo 1" },
+    format: "json",
+    intervalSecs: 2,
+    timeoutSecs: 2,
+  };
+  function adapterFrames(socket: FakeSocket) {
+    return socket.sends
+      .map((send) => JSON.parse(String(send)) as { type: string; adapters?: unknown[] })
+      .filter((frame) => frame.type === "engine.adapters.set");
+  }
+
+  it("does not send engine.adapters.set on a 2.8 session", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [fansSource],
+      remoteEngineAdapters: [gpuAdapter],
+    });
+    const { manager, socket } = await registered();
+    expect(adapterFrames(socket)).toEqual([]);
+    expect(await manager.onRemoteEngineAdaptersChanged("cli-device-id")).toBe(false);
+    expect(adapterFrames(socket)).toEqual([]);
+    manager.dispose();
+  });
+
+  it("sends remote engine adapters after hello.ok only on 2.9 unsupervised sessions", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [],
+      remoteEngineAdapters: [gpuAdapter],
+    });
+    const unsupervised = await registered29();
+    expect(JSON.parse(String(unsupervised.socket.sends[0]))).toMatchObject({ type: "hello.ok" });
+    expect(adapterFrames(unsupervised.socket)).toEqual([
+      expect.objectContaining({ type: "engine.adapters.set", adapters: [gpuAdapter] }),
+    ]);
+    unsupervised.manager.dispose();
+
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "SUPERVISED",
+      remoteMetricSources: [],
+      remoteEngineAdapters: [gpuAdapter],
+    });
+    const supervised = await registered29();
+    expect(adapterFrames(supervised.socket)).toEqual([
+      expect.objectContaining({ type: "engine.adapters.set", adapters: [] }),
+    ]);
+    supervised.manager.dispose();
+  });
+
+  it("withdraws remote engine adapters with an empty list", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [],
+      remoteEngineAdapters: [gpuAdapter],
+    });
+    const { manager, socket } = await registered29();
+    socket.sends.length = 0;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "OFF",
+      remoteMetricSources: [],
+      remoteEngineAdapters: [gpuAdapter],
+    });
+    await expect(manager.onRemoteEngineAdaptersChanged("cli-device-id")).resolves.toBe(true);
+    expect(adapterFrames(socket)).toEqual([
+      expect.objectContaining({ type: "engine.adapters.set", adapters: [] }),
+    ]);
     manager.dispose();
   });
 

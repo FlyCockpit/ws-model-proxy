@@ -285,6 +285,14 @@ pub struct Config {
     /// still needs `wsmp metrics approve` of its exact command.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_remote_metric_sources: bool,
+    /// Accept remotely defined engine adapters (`engine.adapters.set`). Separate
+    /// from metric-source opt-in; read once when the relay starts. Each remote
+    /// adapter still needs `wsmp endpoints adapter approve` of its canonical spec.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_remote_engine_adapters: bool,
+    /// Remote adapter endpoint slug -> SHA-256 (hex) of the approved canonical spec.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub approved_remote_adapters: std::collections::BTreeMap<String, String>,
     /// Custom metric sources and remote-source approvals.
     #[serde(default, skip_serializing_if = "MetricsConfig::is_empty")]
     pub metrics: MetricsConfig,
@@ -353,6 +361,8 @@ struct ConfigWire {
     #[serde(deserialize_with = "deserialize_file_roots")]
     file_roots: Vec<PathBuf>,
     allow_remote_metric_sources: bool,
+    allow_remote_engine_adapters: bool,
+    approved_remote_adapters: std::collections::BTreeMap<String, String>,
     metrics: MetricsConfig,
 }
 
@@ -374,6 +384,8 @@ impl Default for ConfigWire {
             mcp_file_read: false,
             file_roots: Vec::new(),
             allow_remote_metric_sources: false,
+            allow_remote_engine_adapters: false,
+            approved_remote_adapters: std::collections::BTreeMap::new(),
             metrics: MetricsConfig::default(),
         }
     }
@@ -401,6 +413,8 @@ impl From<ConfigWire> for Config {
             mcp_file_read: wire.mcp_file_read,
             file_roots: wire.file_roots,
             allow_remote_metric_sources: wire.allow_remote_metric_sources,
+            allow_remote_engine_adapters: wire.allow_remote_engine_adapters,
+            approved_remote_adapters: wire.approved_remote_adapters,
             metrics: wire.metrics,
         }
     }
@@ -422,6 +436,8 @@ impl Default for Config {
             mcp_file_read: false,
             file_roots: Vec::new(),
             allow_remote_metric_sources: false,
+            allow_remote_engine_adapters: false,
+            approved_remote_adapters: std::collections::BTreeMap::new(),
             metrics: MetricsConfig::default(),
         }
     }

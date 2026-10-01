@@ -59,6 +59,11 @@ enum Sub {
     /// still needs `wsmp metrics approve`. Takes effect the next time wsmp
     /// starts.
     SetRemoteMetricSources { state: Switch },
+    /// Accept engine adapters defined remotely (dashboard or MCP). Separate
+    /// from metric-source opt-in. Each one still needs
+    /// `wsmp endpoints adapter approve`. Takes effect the next time wsmp
+    /// starts.
+    SetRemoteEngineAdapters { state: Switch },
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -231,6 +236,16 @@ pub fn run(args: &Args) -> Result<()> {
                 state.enabled(),
                 |cfg| {
                     cfg.allow_remote_metric_sources = state.enabled();
+                },
+            )?;
+        }
+        Sub::SetRemoteEngineAdapters { state } => {
+            set_flag(
+                args.json,
+                "allowRemoteEngineAdapters",
+                state.enabled(),
+                |cfg| {
+                    cfg.allow_remote_engine_adapters = state.enabled();
                 },
             )?;
         }

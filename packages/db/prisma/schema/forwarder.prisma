@@ -390,6 +390,12 @@ model CliDevice {
   /// local opt-in and a hash approval of each command before one runs.
   remoteMetricSources          Json?
   remoteMetricSourcesAt        DateTime?
+  /// Remotely defined engine adapters (`engine.adapters.set`), set over MCP
+  /// only while `mcpCommandMode` is UNSUPERVISED. A separate local opt-in
+  /// (`allowRemoteEngineAdapters`) and SHA-256 approval of the canonical spec
+  /// are required before one runs. Metric-source opt-in does not allow these.
+  remoteEngineAdapters         Json?
+  remoteEngineAdaptersAt       DateTime?
   User                         User                  @relation("CliDeviceOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   CliTokens                    CliToken[]
   CliDeviceCredentials         CliDeviceCredential[]

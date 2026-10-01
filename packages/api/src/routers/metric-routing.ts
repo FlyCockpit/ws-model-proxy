@@ -35,6 +35,10 @@ import {
   remoteMetricSourceDefinitionsSchema,
   routingRulesSchema,
 } from "../lib/metric-routing";
+import {
+  remoteEngineAdapterDefinitionsSchema,
+  serializeRemoteEngineAdapters,
+} from "../lib/remote-engine-adapters";
 
 const idSchema = z.string().min(1);
 
@@ -592,5 +596,82 @@ export const metricRoutingProcedures = {
         delivered,
         note: "The CLI runs a remote source only with its local opt-in (allowRemoteMetricSources) and after `wsmp metrics approve <name> --sha256 <hash>` (the hash of the command the person read); it reports each source's state in node.metrics.",
       };
+    }),
+
+  /**
+   * Replace a device's remotely defined engine adapters. Allowed only while
+   * the device's MCP command mode is `unsupervised`. The CLI still refuses
+   * them without its separate local opt-in (`allowRemoteEngineAdapters`) and
+   * runs each spec only after a local, hash-pinned approval; a changed spec
+   * needs approval again. Metric-source opt-in does not allow adapters.
+   */
+  setCliDeviceEngineAdapters: protectedProcedure
+    .input(z.object({ cliDeviceId: idSchema, adapters: remoteEngineAdapterDefinitionsSchema }))
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      const device = await prisma.cliDevice.findUnique({
+        where: { id: input.cliDeviceId },
+        select: { id: true, userId: true, mcpCommandMode: true },
+      });
+      if (!device || device.userId !== userId) {
+        throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+      }
+      if (device.mcpCommandMode !== "UNSUPERVISED") {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Remote engine adapters need this device's MCP command mode to be unsupervised.",
+        });
+      }
+      const updated = await prisma.cliDevice.updateMany({
+        where: { id: device.id, userId, mcpCommandMode: "UNSUPERVISED" },
+        data: { remoteEngineAdapters: input.adapters, remoteEngineAdaptersAt: new Date() },
+      });
+      if (updated.count === 0) {
+        throw new ORPCError("CONFLICT", {
+          message: "This device's MCP command mode changed; remote engine adapters were not saved.",
+        });
+      }
+      const delivered =
+        (await context.services?.onRemoteEngineAdaptersChanged?.(device.id)) ?? false;
+      return {
+        cliDeviceId: device.id,
+        adapters: serializeRemoteEngineAdapters(input.adapters),
+        delivered,
+        note: "The CLI runs a remote adapter only with its local opt-in (allowRemoteEngineAdapters) and after `wsmp endpoints adapter approve <slug> --sha256 <hash>` (the hash of the canonical spec the person read); it reports each adapter's state in node.metrics.engineAdapters. Metric-source opt-in does not allow adapters.",
+      };
+    }),
+
+  /**
+   * Clear a device's remotely defined engine adapters (same unsupervised
+   * gate as set). Sends an empty list to the live CLI.
+   */
+  clearCliDeviceEngineAdapters: protectedProcedure
+    .input(z.object({ cliDeviceId: idSchema }))
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      const device = await prisma.cliDevice.findUnique({
+        where: { id: input.cliDeviceId },
+        select: { id: true, userId: true, mcpCommandMode: true },
+      });
+      if (!device || device.userId !== userId) {
+        throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+      }
+      if (device.mcpCommandMode !== "UNSUPERVISED") {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Remote engine adapters need this device's MCP command mode to be unsupervised.",
+        });
+      }
+      const updated = await prisma.cliDevice.updateMany({
+        where: { id: device.id, userId, mcpCommandMode: "UNSUPERVISED" },
+        data: { remoteEngineAdapters: [], remoteEngineAdaptersAt: new Date() },
+      });
+      if (updated.count === 0) {
+        throw new ORPCError("CONFLICT", {
+          message:
+            "This device's MCP command mode changed; remote engine adapters were not cleared.",
+        });
+      }
+      const delivered =
+        (await context.services?.onRemoteEngineAdaptersChanged?.(device.id)) ?? false;
+      return { cliDeviceId: device.id, adapters: [], delivered };
     }),
 };

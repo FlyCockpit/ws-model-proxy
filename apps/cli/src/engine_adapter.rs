@@ -6,16 +6,18 @@
 //! output, stderr, route bodies, or label values.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::bounded_run::RunError;
 use crate::config::EndpointConfig;
 use crate::engine::{LoadReading, LoadSource, PromSample, parse_prometheus};
-use crate::metric_sources::OUTPUT_LIMIT;
+use crate::metric_sources::{OUTPUT_LIMIT, sha256_hex};
+use crate::protocol::RemoteEngineAdapter;
 use crate::telemetry_bounds::LOAD_COUNT_MAX;
 
 pub const ADAPTER_INTERVAL_MIN_SECS: u32 = 2;
@@ -262,11 +264,13 @@ impl AdapterError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum AdapterState {
     Active,
     Failing,
     Disabled,
+    PendingApproval,
+    Refused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -684,6 +688,173 @@ pub fn probe_facts(endpoint: &EndpointConfig) -> Option<AdapterCachedFacts> {
     }
 }
 
+/// Remote definitions, in the state directory.
+pub const REMOTE_ADAPTERS_FILE: &str = "remote-engine-adapters.json";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAdaptersFile {
+    pub adapters: Vec<RemoteEngineAdapter>,
+}
+
+pub fn remote_adapters_path() -> Result<PathBuf> {
+    Ok(crate::paths::state_dir()?.join(REMOTE_ADAPTERS_FILE))
+}
+
+pub fn load_remote_adapters_from(path: &Path) -> Result<Vec<RemoteEngineAdapter>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(serde_json::from_str::<RemoteAdaptersFile>(&text)
+            .with_context(|| format!("parsing `{}`", path.display()))?
+            .adapters),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error).with_context(|| format!("reading `{}`", path.display())),
+    }
+}
+
+pub fn load_remote_adapters() -> Result<Vec<RemoteEngineAdapter>> {
+    load_remote_adapters_from(&remote_adapters_path()?)
+}
+
+pub fn save_remote_adapters_to(path: &Path, adapters: &[RemoteEngineAdapter]) -> Result<()> {
+    let dir = path
+        .parent()
+        .context("remote engine adapters path has no parent directory")?;
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating state directory `{}`", dir.display()))?;
+    let text = serde_json::to_string_pretty(&RemoteAdaptersFile {
+        adapters: adapters.to_vec(),
+    })
+    .context("serializing remote engine adapters")?;
+    let mut file = tempfile::NamedTempFile::new_in(dir)
+        .with_context(|| format!("creating a temporary file in `{}`", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .context("setting private permissions on remote engine adapters")?;
+    }
+    std::io::Write::write_all(&mut file, text.as_bytes())
+        .context("writing remote engine adapters")?;
+    file.as_file()
+        .sync_all()
+        .context("syncing remote engine adapters")?;
+    file.persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("replacing `{}`", path.display()))?;
+    Ok(())
+}
+
+pub fn save_remote_adapters(adapters: &[RemoteEngineAdapter]) -> Result<()> {
+    save_remote_adapters_to(&remote_adapters_path()?, adapters)
+}
+
+fn json_stringify_number(n: &serde_json::Number) -> String {
+    if let Some(i) = n.as_i64() {
+        return i.to_string();
+    }
+    if let Some(u) = n.as_u64() {
+        return u.to_string();
+    }
+    let raw = serde_json::to_string(&serde_json::Value::Number(n.clone())).expect("number");
+    if let Some(stripped) = raw.strip_suffix(".0") {
+        stripped.to_string()
+    } else {
+        raw
+    }
+}
+
+fn canonical_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let inner = keys
+                .iter()
+                .map(|key| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).expect("object key"),
+                        canonical_value(&map[key])
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{inner}}}")
+        }
+        serde_json::Value::Array(items) => {
+            let inner = items
+                .iter()
+                .map(canonical_value)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{inner}]")
+        }
+        serde_json::Value::Number(n) => json_stringify_number(n),
+        other => serde_json::to_string(other).expect("json atom"),
+    }
+}
+
+/// Compact JSON with sorted keys; SHA-256 of this is the approval pin.
+pub fn canonical_spec_json(endpoint_slug: &str, spec: &EngineAdapterConfig) -> String {
+    let value = serde_json::json!({
+        "endpointSlug": endpoint_slug,
+        "format": spec.format,
+        "input": spec.input,
+        "intervalSecs": spec.interval_secs,
+        "map": spec.map,
+        "timeoutSecs": spec.timeout_secs,
+    });
+    canonical_value(&value)
+}
+
+pub fn spec_sha256(endpoint_slug: &str, spec: &EngineAdapterConfig) -> String {
+    sha256_hex(canonical_spec_json(endpoint_slug, spec).as_bytes())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteAdapterEligibility {
+    Run,
+    PendingApproval,
+    Refused,
+}
+
+/// Local adapters shadow remotes. Metric-source opt-in is a different flag.
+pub fn remote_adapter_eligibility(
+    spec: &EngineAdapterConfig,
+    endpoint_slug: &str,
+    allow_remote: bool,
+    local_has_adapter: bool,
+    approved_hash: Option<&str>,
+) -> RemoteAdapterEligibility {
+    if !allow_remote || local_has_adapter || spec.validate().is_err() {
+        return RemoteAdapterEligibility::Refused;
+    }
+    let hash = spec_sha256(endpoint_slug, spec);
+    if approved_hash.is_some_and(|stored| stored.eq_ignore_ascii_case(&hash)) {
+        RemoteAdapterEligibility::Run
+    } else {
+        RemoteAdapterEligibility::PendingApproval
+    }
+}
+
+pub fn status_for_eligibility(
+    endpoint_slug: &str,
+    spec: &EngineAdapterConfig,
+    eligibility: RemoteAdapterEligibility,
+) -> EngineAdapterStatus {
+    EngineAdapterStatus {
+        endpoint_slug: endpoint_slug.to_string(),
+        input: spec.input_kind(),
+        state: match eligibility {
+            RemoteAdapterEligibility::Run => AdapterState::Active,
+            RemoteAdapterEligibility::PendingApproval => AdapterState::PendingApproval,
+            RemoteAdapterEligibility::Refused => AdapterState::Refused,
+        },
+        error: None,
+    }
+}
+
 pub fn status_for(
     endpoint_slug: &str,
     spec: &EngineAdapterConfig,
@@ -888,5 +1059,70 @@ hits{model=\"b\"} 5
             Some(AdapterError::Timeout)
         );
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    fn command_spec() -> EngineAdapterConfig {
+        EngineAdapterConfig {
+            input: AdapterInput::Command {
+                command: "echo 1".to_string(),
+            },
+            format: AdapterFormat::Json,
+            interval_secs: 2,
+            timeout_secs: 2,
+            map: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn canonical_spec_json_matches_the_server_vector() {
+        assert_eq!(
+            canonical_spec_json("gpu", &command_spec()),
+            r#"{"endpointSlug":"gpu","format":"json","input":{"command":"echo 1"},"intervalSecs":2,"map":{},"timeoutSecs":2}"#
+        );
+        let mut map = BTreeMap::new();
+        map.insert(AdapterSignal::Running, selector("my_running", Some(1.0)));
+        let mapped = EngineAdapterConfig {
+            input: AdapterInput::Route {
+                route: "metrics".to_string(),
+            },
+            format: AdapterFormat::Prometheus,
+            interval_secs: 2,
+            timeout_secs: 2,
+            map,
+        };
+        assert_eq!(
+            canonical_spec_json("gpu", &mapped),
+            r#"{"endpointSlug":"gpu","format":"prometheus","input":{"route":"metrics"},"intervalSecs":2,"map":{"running":{"scale":1,"series":"my_running"}},"timeoutSecs":2}"#
+        );
+        assert_ne!(
+            spec_sha256("gpu", &command_spec()),
+            spec_sha256("gpu", &mapped)
+        );
+    }
+
+    #[test]
+    fn remote_eligibility_needs_opt_in_and_a_matching_hash() {
+        let spec = command_spec();
+        let hash = spec_sha256("gpu", &spec);
+        assert_eq!(
+            remote_adapter_eligibility(&spec, "gpu", false, false, Some(&hash)),
+            RemoteAdapterEligibility::Refused
+        );
+        assert_eq!(
+            remote_adapter_eligibility(&spec, "gpu", true, false, None),
+            RemoteAdapterEligibility::PendingApproval
+        );
+        assert_eq!(
+            remote_adapter_eligibility(&spec, "gpu", true, false, Some("deadbeef")),
+            RemoteAdapterEligibility::PendingApproval
+        );
+        assert_eq!(
+            remote_adapter_eligibility(&spec, "gpu", true, false, Some(&hash)),
+            RemoteAdapterEligibility::Run
+        );
+        assert_eq!(
+            remote_adapter_eligibility(&spec, "gpu", true, true, Some(&hash)),
+            RemoteAdapterEligibility::Refused
+        );
     }
 }

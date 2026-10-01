@@ -1,14 +1,17 @@
 //! `wsmp endpoints` commands.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::config::{
     Config, EndpointConfig, EndpointEngine, HeaderEnvRef, OpenAiCompatibleCapabilities,
     validate_env_name,
 };
+use crate::display_escape::escape_for_display;
 use crate::engine_adapter::{
-    AdapterFormat, AdapterInput, AdapterSample, DropReason, EngineAdapterConfig, parse_map_flag,
+    AdapterFormat, AdapterInput, AdapterSample, DropReason, EngineAdapterConfig,
+    RemoteAdapterEligibility, load_remote_adapters, parse_map_flag, remote_adapter_eligibility,
+    spec_sha256,
 };
 use crate::exit::{CodedError, ExitCode};
 use crate::output;
@@ -153,6 +156,18 @@ enum AdapterSub {
     Clear { slug: String },
     /// Run the adapter once and print normalized signals. Never prints raw output.
     Test { slug: String },
+    /// Approve a remote adapter's canonical spec. A changed spec needs a new
+    /// approval.
+    Approve {
+        slug: String,
+        /// The SHA-256 of the canonical spec you reviewed (shown by
+        /// `wsmp endpoints adapter show`). Required: the approval is bound
+        /// to the spec you read.
+        #[arg(long)]
+        sha256: String,
+    },
+    /// Remove the approval of a remote adapter; it stops running.
+    Revoke { slug: String },
 }
 
 #[derive(Debug, clap::Args)]
@@ -387,6 +402,8 @@ fn adapter_command(json: bool, args: &AdapterArgs) -> Result<()> {
         AdapterSub::Show { slug } => adapter_show(json, slug),
         AdapterSub::Clear { slug } => adapter_clear(json, slug),
         AdapterSub::Test { slug } => adapter_test(json, slug),
+        AdapterSub::Approve { slug, sha256 } => adapter_approve(json, slug, sha256),
+        AdapterSub::Revoke { slug } => adapter_revoke(json, slug),
     }
 }
 
@@ -440,13 +457,49 @@ fn adapter_set(json: bool, args: &AdapterSetArgs) -> Result<()> {
     Ok(())
 }
 
+fn adapter_eligibility_str(eligibility: RemoteAdapterEligibility) -> &'static str {
+    match eligibility {
+        RemoteAdapterEligibility::Run => "active",
+        RemoteAdapterEligibility::PendingApproval => "pending_approval",
+        RemoteAdapterEligibility::Refused => "refused",
+    }
+}
+
 fn adapter_show(json: bool, slug: &str) -> Result<()> {
     let config = Config::load_required()?;
     let endpoint = config.endpoint(slug).ok_or_else(|| {
         anyhow::Error::msg(format!("endpoint `{slug}` not found"))
             .context(CodedError::new(ExitCode::NotFound))
     })?;
-    let Some(spec) = &endpoint.engine_adapter else {
+    if let Some(spec) = &endpoint.engine_adapter {
+        if json {
+            output::json(&spec)?;
+        } else {
+            match &spec.input {
+                AdapterInput::Route { route } => {
+                    output::line(format!("{slug}\troute\t{route}"))?;
+                }
+                AdapterInput::Command { command } => {
+                    output::line(format!("{slug}\tcommand\t{command}"))?;
+                }
+            }
+            output::line(format!(
+                "  format {} interval {}s timeout {}s",
+                match spec.format {
+                    AdapterFormat::Json => "json",
+                    AdapterFormat::Prometheus => "prometheus",
+                },
+                spec.interval_secs,
+                spec.timeout_secs
+            ))?;
+            for (signal, selector) in &spec.map {
+                output::line(format!("  map {}={}", signal.as_str(), selector.series))?;
+            }
+        }
+        return Ok(());
+    }
+    let remote = load_remote_adapters().unwrap_or_default();
+    let Some(adapter) = remote.iter().find(|adapter| adapter.endpoint_slug == slug) else {
         if json {
             output::json(&serde_json::json!({ "slug": slug, "adapter": null }))?;
         } else {
@@ -454,31 +507,109 @@ fn adapter_show(json: bool, slug: &str) -> Result<()> {
         }
         return Ok(());
     };
+    let spec = adapter.to_config();
+    let spec_sha256 = spec_sha256(slug, &spec);
+    let eligibility = remote_adapter_eligibility(
+        &spec,
+        slug,
+        config.allow_remote_engine_adapters,
+        false,
+        config
+            .approved_remote_adapters
+            .get(slug)
+            .map(String::as_str),
+    );
+    let state = adapter_eligibility_str(eligibility);
     if json {
-        output::json(&spec)?;
-    } else {
-        match &spec.input {
-            AdapterInput::Route { route } => {
-                output::line(format!("{slug}\troute\t{route}"))?;
-            }
-            AdapterInput::Command { command } => {
-                output::line(format!("{slug}\tcommand\t{command}"))?;
-            }
+        return output::json(&serde_json::json!({
+            "slug": slug,
+            "origin": "remote",
+            "state": state,
+            "specSha256": spec_sha256,
+            "allowRemoteEngineAdapters": config.allow_remote_engine_adapters,
+            "adapter": spec,
+        }));
+    }
+    output::line(format!("{slug} (remote, {state})"))?;
+    match &spec.input {
+        AdapterInput::Route { route } => {
+            output::line(format!("  route: {}", escape_for_display(route)))?;
         }
-        output::line(format!(
-            "  format {} interval {}s timeout {}s",
-            match spec.format {
-                AdapterFormat::Json => "json",
-                AdapterFormat::Prometheus => "prometheus",
-            },
-            spec.interval_secs,
-            spec.timeout_secs
-        ))?;
-        for (signal, selector) in &spec.map {
-            output::line(format!("  map {}={}", signal.as_str(), selector.series))?;
+        AdapterInput::Command { command } => {
+            output::line(format!("  command: {}", escape_for_display(command)))?;
         }
     }
+    output::line(format!(
+        "  format {} interval {}s timeout {}s",
+        match spec.format {
+            AdapterFormat::Json => "json",
+            AdapterFormat::Prometheus => "prometheus",
+        },
+        spec.interval_secs,
+        spec.timeout_secs
+    ))?;
+    output::line(format!("  sha256:  {spec_sha256}"))?;
+    if !config.allow_remote_engine_adapters {
+        output::line(
+            "Remote adapters are refused: `wsmp config set-remote-engine-adapters on` opts in (restart wsmp to apply). Metric-source opt-in does not allow adapters.",
+        )?;
+    }
     Ok(())
+}
+
+fn adapter_approve(json: bool, slug: &str, expected: &str) -> Result<()> {
+    let remote = load_remote_adapters()?;
+    let Some(adapter) = remote.iter().find(|adapter| adapter.endpoint_slug == slug) else {
+        bail!(
+            "no remote engine adapter for `{}` has been received",
+            escape_for_display(slug)
+        );
+    };
+    let spec = adapter.to_config();
+    let hash = spec_sha256(slug, &spec);
+    if !expected.trim().eq_ignore_ascii_case(&hash) {
+        bail!(
+            "the spec of `{}` changed: its SHA-256 is {hash}, not {}",
+            slug,
+            escape_for_display(expected.trim())
+        );
+    }
+    let opted_in = Config::update(false, |cfg| {
+        cfg.approved_remote_adapters
+            .insert(slug.to_string(), hash.clone());
+        Ok(cfg.allow_remote_engine_adapters)
+    })
+    .context("storing the approval")?;
+    if json {
+        return output::json(&serde_json::json!({
+            "slug": slug,
+            "specSha256": hash,
+            "allowRemoteEngineAdapters": opted_in,
+        }));
+    }
+    output::line(format!(
+        "approved `{slug}` (sha256 {hash}); it runs as your OS user"
+    ))?;
+    if !opted_in {
+        output::line(
+            "Remote adapters are still refused until `wsmp config set-remote-engine-adapters on` (restart wsmp to apply). Metric-source opt-in does not allow adapters.",
+        )?;
+    }
+    Ok(())
+}
+
+fn adapter_revoke(json: bool, slug: &str) -> Result<()> {
+    let removed = Config::update(false, |cfg| {
+        Ok(cfg.approved_remote_adapters.remove(slug).is_some())
+    })?;
+    if json {
+        return output::json(&serde_json::json!({ "slug": slug, "revoked": removed }));
+    }
+    if removed {
+        output::line(format!("revoked the approval of `{slug}`"))
+    } else {
+        output::line(format!("`{slug}` was not approved"))
+    }
 }
 
 fn adapter_clear(json: bool, slug: &str) -> Result<()> {

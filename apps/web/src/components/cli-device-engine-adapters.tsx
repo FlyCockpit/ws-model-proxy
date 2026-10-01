@@ -14,7 +14,7 @@ type AdapterStatus = {
   error?: string;
 };
 
-const STATES = new Set(["active", "failing", "disabled"]);
+const STATES = new Set(["active", "failing", "disabled", "pending_approval", "refused"]);
 const ERRORS = new Set([
   "spawn",
   "timeout",
@@ -105,6 +105,18 @@ export function CliDeviceEngineAdapters({ cliDeviceId }: { cliDeviceId: string }
                     </span>
                   ) : null}
                 </p>
+                {adapter.state === "pending_approval" ? (
+                  <p className="mt-1 text-muted-foreground">
+                    {t("dashboard:clis.engineAdapters.pendingHint", {
+                      slug: adapter.endpointSlug,
+                    })}
+                  </p>
+                ) : null}
+                {adapter.state === "refused" ? (
+                  <p className="mt-1 text-muted-foreground">
+                    {t("dashboard:clis.engineAdapters.refusedHint")}
+                  </p>
+                ) : null}
               </li>
             ))}
           </ul>
