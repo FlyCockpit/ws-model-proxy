@@ -1333,7 +1333,7 @@ integration("warm-session protection with real PostgreSQL", () => {
     it("older application clocks do not decay or move timestamps backward", async () => {
       const capacityId = id();
       await feedback.recordKvEvictionObservations(
-        { capacityId, ownerId: "kv-owner", count: 2, now },
+        { capacityId, ownerId: "kv-owner", count: 3, now },
         writers[0],
       );
       const initial = await row(capacityId);
