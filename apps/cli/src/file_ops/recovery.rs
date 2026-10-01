@@ -39,8 +39,9 @@
 //! (a) a same-user process guessing a private slot can replace it between the held
 //! proof, close and final unlinkat and lose the successor. Closing adds one syscall.
 //! The link probe proves each private name only by a proof opened on that name, so
-//! the same actor can also swap `probe` between its link and that proof, or `tmp`
-//! between the alias unlink and its re-hold (its object would then be published).
+//! the same actor can also swap `probe` between its link and that proof. `tmp` must
+//! still be the object this operation created before the link and again at the
+//! re-hold (same device and inode as T's own fd); a swap is kept and reported.
 //! (a2) when NOREPLACE is absent, capture plain-renames into a private slot checked
 //! absent; a squatter between that check and rename can be overwritten.
 //! (b) undo briefly vacates public names; a concurrent create blocks NOREPLACE/link
@@ -409,6 +410,13 @@ impl RecoveryDir {
                 return Err(FileError::errno(errno));
             }
         }
+        // Lineage: before anything is linked, `tmp` must still be the object this
+        // operation created and wrote (a same-name proof against T's own live fd).
+        // The NOREPLACE probe gets the same protection from its later holds().
+        if !self.holds(slot, identity) {
+            self.keep(slot);
+            return Err(self.uncertain());
+        }
         run(Primitive::ProbeLink, || {
             linkat(
                 self.dir.as_fd(),
@@ -443,17 +451,22 @@ impl RecoveryDir {
         )
         .map_err(FileError::errno)?;
         let mut alias_held = Held::open(&self.dir, &alias.name, Stat::from_raw(&alias_stat))?;
+        // T's own identity (device and inode, taken from its creating fd) is the
+        // lineage the re-hold must match: this inode stays linked under `tmp`
+        // throughout, so no other object can reuse its number.
+        let lineage = identity.stat;
         identity.release();
         if !self.dispose(ops, &alias, &mut alias_held) {
             return Err(self.uncertain());
         }
-        let tmp_stat = fstatat(
-            self.dir.as_fd(),
-            slot.name.as_os_str(),
-            AtFlags::AT_SYMLINK_NOFOLLOW,
-        )
-        .map_err(FileError::errno)?;
-        *identity = Held::open(&self.dir, &slot.name, Stat::from_raw(&tmp_stat))?;
+        match Held::open(&self.dir, &slot.name, lineage) {
+            Ok(held) => *identity = held,
+            Err(_) => {
+                // `tmp` is no longer the object this operation created.
+                self.keep(slot);
+                return Err(self.uncertain());
+            }
+        }
         if !identity.is_held() {
             return Err(FileError::errno(
                 identity.open_error().unwrap_or(Errno::EACCES),

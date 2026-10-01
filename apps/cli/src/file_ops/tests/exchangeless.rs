@@ -1601,7 +1601,10 @@ fn exchangeless_noreplace_probe_errors_stop_before_link_or_capture() {
 
 #[test]
 fn exchangeless_private_temp_successor_is_refused_before_public_capture() {
-    for op in REPLACE_OPS {
+    for (op, method) in REPLACE_OPS
+        .into_iter()
+        .flat_map(|op| METHODS.map(|method| (op, method)))
+    {
         let fx = Fx::new();
         let etag = prepare(&fx);
         let public_before = std::fs::symlink_metadata(fx.root.join("doc")).unwrap();
@@ -1615,7 +1618,7 @@ fn exchangeless_private_temp_successor_is_refused_before_public_capture() {
             }
             Ok(())
         });
-        let _scope = FaultScope::new(&PublishMethod::NoReplace.faults());
+        let _scope = FaultScope::new(&method.faults());
         let error = op.run(&fx, &etag).unwrap_err();
         let retained = kept(&error);
         assert_eq!(fx.get("doc"), ORIGINAL);
@@ -1627,7 +1630,7 @@ fn exchangeless_private_temp_successor_is_refused_before_public_capture() {
         );
         assert!(has_bytes(&retained, RACER));
         assert_eq!(count(&FaultScope::calls(), Primitive::Capture), 0);
-        assert_eq!(count(&FaultScope::calls(), Primitive::Publish), 0);
+        assert_eq!(count(&FaultScope::calls(), method.primitive()), 0);
     }
 }
 

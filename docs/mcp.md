@@ -266,7 +266,8 @@ exact remaining windows are: (a) a same-user process that guessed the unpredicta
 private directory can rename a new object onto a slot between the held-fd fstat
 comparison, descriptor close and final unlinkat and lose that replacement (the link
 probe also proves each private name only by a proof opened on that name, so the same
-actor can swap the probe alias or the temp between those steps); (a2) on filesystems without
+actor can swap the probe alias between its link and that proof; the temp is checked to
+still be the object the operation created before the link and at its re-hold); (a2) on filesystems without
 NOREPLACE, capture uses plain rename into a private slot checked absent, and a
 squatter arriving between the check and rename can be overwritten. These are the
 private-slot deleting windows in recovery compensation. (b) undo briefly vacates public
