@@ -1083,6 +1083,65 @@ fn rename_weak_and_symlink_etag_binding_inverse() {
     }
 }
 
+/// D3 for symlinks: a racer replaces the published name with a symlink of the same
+/// length and mtime but another target. Size and mtime alone would accept it; only
+/// the target comparison rejects it (O1B-1).
+#[test]
+fn rename_symlink_etag_requires_the_same_target() {
+    use crate::file_ops::mutate::{RenameArgs, RenameResult};
+    use nix::sys::stat::{UtimensatFlags, utimensat};
+    use nix::sys::time::TimeSpec;
+    use std::os::unix::fs::MetadataExt;
+    for racer_target in [None, Some("x".repeat(SOURCE.len()))] {
+        let fx = Fx::new();
+        Object::Symlink.put(&fx, "src", SOURCE);
+        let source_tag = Object::Symlink.tag(&fx, "src");
+        let meta = std::fs::symlink_metadata(fx.root.join("src")).unwrap();
+        let mtime = TimeSpec::new(meta.mtime(), meta.mtime_nsec());
+        let root = fx.root.clone();
+        let racer = racer_target.clone();
+        let fx = fx.with_hook(move |step| {
+            if step == Step::Renamed
+                && let Some(target) = &racer
+            {
+                let public = root.join("dst");
+                std::fs::remove_file(&public).unwrap();
+                std::os::unix::fs::symlink(target, &public).unwrap();
+                utimensat(
+                    nix::fcntl::AT_FDCWD,
+                    &public,
+                    &mtime,
+                    &mtime,
+                    UtimensatFlags::NoFollowSymlink,
+                )
+                .unwrap();
+            }
+            Ok(())
+        });
+        let _scope = FaultScope::new(&Shape::Link.faults(false));
+        let result: RenameResult = fx
+            .ops
+            .rename(
+                &args::<RenameArgs>(json!({
+                    "from":fx.p("src"),"to":fx.p("dst"),"expectedEtag":source_tag
+                })),
+                &fx.cancel,
+            )
+            .unwrap();
+        if racer_target.is_some() {
+            assert_eq!(
+                result.etag, None,
+                "a different target must not yield an etag"
+            );
+        } else {
+            assert_eq!(
+                result.etag.as_deref(),
+                Some(Object::Symlink.tag(&fx, "dst").as_str())
+            );
+        }
+    }
+}
+
 #[test]
 fn rename_cross_parent_clean_and_both_origin_collision_table() {
     for object in OBJECTS {

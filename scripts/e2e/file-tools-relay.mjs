@@ -6,6 +6,7 @@ import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { waitForExit } from "../lib/wait-for-exit.mjs";
 import { openTerminalTestClient } from "./terminal-client.mjs";
 
 // End-to-end check of MCP node file tools (relay 2.8, #103/#106): a real server,
@@ -39,7 +40,6 @@ const userId = randomUUID();
 let db;
 let server;
 let relay;
-let waitForExit;
 
 const sleep = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
 
@@ -120,29 +120,6 @@ try {
       process.env[key] ? [[key, process.env[key]]] : [],
     ),
   );
-  waitForExit = async (child, label) => {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    const signal = (name) => {
-      try {
-        if (child.pid && process.platform !== "win32") process.kill(-child.pid, name);
-        else child.kill(name);
-      } catch (error) {
-        if (error?.code !== "ESRCH") throw error;
-      }
-    };
-    const exited = new Promise((resolveExit) => {
-      if (child.exitCode !== null) resolveExit();
-      else child.once("exit", resolveExit);
-    });
-    signal("SIGCONT");
-    signal("SIGTERM");
-    const graceful = await Promise.race([exited.then(() => true), sleep(3_000).then(() => false)]);
-    if (!graceful) {
-      signal("SIGKILL");
-      await exited;
-    }
-    assert(child.signalCode || child.exitCode !== null, `${label} did not exit`);
-  };
 
   server = spawn(process.execPath, [serverEntry], {
     cwd: root,

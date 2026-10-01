@@ -6,6 +6,7 @@ import { createServer } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { waitForExit } from "../lib/wait-for-exit.mjs";
 
 // `pg` is an existing @ws-model-proxy/db dependency. Resolve it from that
 // workspace without adding a duplicate root dependency solely for this test.
@@ -29,7 +30,6 @@ let db;
 let server;
 let upstream;
 let relay;
-let waitForExit;
 const userId = randomUUID();
 try {
   const cliBinary = resolve(process.env.WSMP_E2E_CLI_BINARY || "apps/cli/target/debug/wsmp");
@@ -143,32 +143,6 @@ try {
       process.env[key] ? [[key, process.env[key]]] : [],
     ),
   );
-  waitForExit = async (child, label) => {
-    if (child.exitCode !== null || child.signalCode !== null) return;
-    const signal = (name) => {
-      try {
-        if (child.pid && process.platform !== "win32") process.kill(-child.pid, name);
-        else child.kill(name);
-      } catch (error) {
-        if (error?.code !== "ESRCH") throw error;
-      }
-    };
-    const exited = new Promise((resolveExit) => {
-      if (child.exitCode !== null || child.signalCode !== null) resolveExit();
-      else child.once("exit", resolveExit);
-    });
-    signal("SIGCONT");
-    signal("SIGTERM");
-    const graceful = await Promise.race([
-      exited.then(() => true),
-      new Promise((resolveWait) => setTimeout(() => resolveWait(false), 3_000)),
-    ]);
-    if (!graceful) {
-      signal("SIGKILL");
-      await exited;
-    }
-    assert(child.signalCode || child.exitCode !== null, `${label} did not exit`);
-  };
 
   server = spawn(process.execPath, [serverEntry], {
     cwd: root,
