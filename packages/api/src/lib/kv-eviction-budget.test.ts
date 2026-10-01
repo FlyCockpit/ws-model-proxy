@@ -63,70 +63,91 @@ describe("relative eviction budget", () => {
     expect(cut).toBeLessThanOrEqual(0.5);
   });
   it.each([
-    { cut: 0, count: 1, dt: 0, expected: 0.05 },
-    { cut: 0.05, count: 1, dt: 0, expected: 0.1 },
-    { cut: 0.1, count: 1, dt: 0, expected: 0.15 },
-    { cut: 0.1, count: 0, dt: 0, expected: 0.1 },
-    { cut: 0.1, count: -5, dt: 0, expected: 0.1 },
-    { cut: 0, count: 11, dt: 0, expected: 0.5 },
-    { cut: 0, count: 100, dt: 0, expected: 0.5 },
-    { cut: 0.5, count: 10, dt: 0, expected: 0.5 },
-    { cut: 0.5, count: 1, dt: 900_000, expected: 0.3 },
-    { cut: 0.5, count: 1, dt: 1_800_000, expected: 0 },
-    { cut: 0.1, count: 1, dt: -1000, expected: 0.15 },
-  ])("decay/add $cut $count $dt", ({ cut, count, dt, expected }) => {
+    { cut: 0, n: 1, dt: 0, expected: 0.05 },
+    { cut: 0.05, n: 1, dt: 0, expected: 0.1 },
+    { cut: 0.1, n: 1, dt: 0, expected: 0.15 },
+    { cut: 0.1, n: 0, dt: 0, expected: 0.1 },
+    { cut: 0, n: 11, dt: 0, expected: 0.5 },
+    { cut: 0, n: 100, dt: 0, expected: 0.5 },
+    { cut: 0.5, n: 10, dt: 0, expected: 0.5 },
+    { cut: 0.5, n: 1, dt: 900_000, expected: 0.3 },
+    { cut: 0.5, n: 1, dt: 1_800_000, expected: 0 },
+    { cut: 0.1, n: 1, dt: -1000, expected: 0.15 },
+  ])("decay/add $cut $n $dt", ({ cut, n, dt, expected }) => {
     const initial = state(cut, dt);
-    const next = applyKvEvictionObservations(initial, count, now);
+    const next = applyKvEvictionObservations(
+      initial,
+      Array.from({ length: n }, (_, i) => `s${i}`),
+      now,
+    );
     expect(next.cutFraction).toBeCloseTo(expected, 12);
-    expect(next.observedAt.getTime()).toBe(Math.max(initial.observedAt.getTime(), now.getTime()));
+    expect(next.observedAt.getTime()).toBe(
+      n === 0
+        ? initial.observedAt.getTime()
+        : Math.max(initial.observedAt.getTime(), now.getTime()),
+    );
   });
-  it("a lone miss only arms; a second miss cuts", () => {
-    const armed = applyKvEvictionObservations(null, 1, now);
+  it("a lone miss only arms; a second miss from another session cuts", () => {
+    const armed = applyKvEvictionObservations(null, ["a"], now);
     expect(armed.cutFraction).toBe(0);
+    expect(armed.lastSessionId).toBe("a");
     expect(effectiveKvBudgetTokens(100_000, armed, now)).toBe(100_000);
-    const cut = applyKvEvictionObservations(armed, 1, now);
+    expect(applyKvEvictionObservations(armed, ["a"], now).cutFraction).toBe(0);
+    const cut = applyKvEvictionObservations(armed, ["b"], now);
     expect(cut.cutFraction).toBeCloseTo(0.05, 12);
+    expect(cut.lastSessionId).toBe("b");
     expect(effectiveKvBudgetTokens(100_000, cut, now)).toBe(95_000);
+    expect(applyKvEvictionObservations(cut, ["b"], now).cutFraction).toBeCloseTo(0.05, 12);
   });
-  it("two misses in one flush corroborate immediately", () => {
-    expect(applyKvEvictionObservations(null, 2, now).cutFraction).toBeCloseTo(0.05, 12);
+  it("two distinct sessions in one flush corroborate immediately", () => {
+    expect(applyKvEvictionObservations(null, ["a", "b"], now).cutFraction).toBeCloseTo(0.05, 12);
+    expect(applyKvEvictionObservations(null, ["a", "a"], now).cutFraction).toBe(0);
+  });
+  it("empty or oversized session ids leave state unchanged", () => {
+    const armed = applyKvEvictionObservations(null, ["a"], now);
+    expect(applyKvEvictionObservations(armed, ["", "x".repeat(129)], now)).toEqual(armed);
   });
   it("a recovered capacity must corroborate again", () => {
-    const recovered = applyKvEvictionObservations(state(0.5, 1_800_000), 1, now);
+    const recovered = applyKvEvictionObservations(state(0.5, 1_800_000), ["a"], now);
     expect(recovered.cutFraction).toBe(0);
-    expect(applyKvEvictionObservations(recovered, 1, now).cutFraction).toBeCloseTo(0.05, 12);
+    expect(applyKvEvictionObservations(recovered, ["a"], now).cutFraction).toBe(0);
+    expect(applyKvEvictionObservations(recovered, ["b"], now).cutFraction).toBeCloseTo(0.05, 12);
   });
   it("an expired pending row is a new first miss", () => {
     const expired = {
       cutFraction: 0,
       observedAt: new Date(now.getTime() - KV_EVICTION_RECOVERY_MS),
       expiresAt: now,
+      lastSessionId: "a",
     };
-    const rearmed = applyKvEvictionObservations(expired, 1, now);
+    const rearmed = applyKvEvictionObservations(expired, ["a"], now);
     expect(rearmed.cutFraction).toBe(0);
     expect(rearmed.observedAt.getTime()).toBe(now.getTime());
-    expect(applyKvEvictionObservations(expired, 2, now).cutFraction).toBeCloseTo(0.05, 12);
+    expect(applyKvEvictionObservations(expired, ["a", "b"], now).cutFraction).toBeCloseTo(0.05, 12);
   });
   it("an expired cut does not keep stacking", () => {
     const expired = {
       cutFraction: 0.25,
       observedAt: new Date(now.getTime() - 60_000),
       expiresAt: now,
+      lastSessionId: "a",
     };
-    expect(applyKvEvictionObservations(expired, 1, now).cutFraction).toBe(0);
+    expect(applyKvEvictionObservations(expired, ["b"], now).cutFraction).toBe(0);
   });
-  it("a still-unexpired pending row corroborates", () => {
+  it("a still-unexpired pending row corroborates from a different session", () => {
     const pending = {
       cutFraction: 0,
       observedAt: now,
       expiresAt: new Date(now.getTime() + KV_EVICTION_RECOVERY_MS),
+      lastSessionId: "a",
     };
-    expect(applyKvEvictionObservations(pending, 1, now).cutFraction).toBeCloseTo(0.05, 12);
+    expect(applyKvEvictionObservations(pending, ["a"], now).cutFraction).toBe(0);
+    expect(applyKvEvictionObservations(pending, ["b"], now).cutFraction).toBeCloseTo(0.05, 12);
   });
-  it("repeated events lower K to the floor, then recover exactly", () => {
+  it("repeated distinct sessions lower K to the floor, then recover exactly", () => {
     let row: ReturnType<typeof applyKvEvictionObservations> | null = null;
     for (let i = 1; i <= 100; i++) {
-      row = applyKvEvictionObservations(row, 1, now);
+      row = applyKvEvictionObservations(row, [`s${i}`], now);
       expect(effectiveKvBudgetTokens(100_000, row, now)).toBeGreaterThanOrEqual(50_000);
       expect(row.cutFraction).toBeCloseTo(Math.min(0.5, Math.max(0, i - 1) * 0.05), 12);
     }

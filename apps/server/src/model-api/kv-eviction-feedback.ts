@@ -16,17 +16,15 @@
  * the SQL specification. Pending capacities are capped at 1024: new keys beyond
  * that bound are dropped, as are failed flushes (no unbounded retries).
  */
-import { effectiveKvFullThreshold } from "@ws-model-proxy/api/lib/engine-load";
 import {
-  boundedKvEvictionCount,
+  boundedKvEvictionSessions,
   KV_EVICTION_DECAY_PER_MS,
   KV_EVICTION_MAX_CUT,
   KV_EVICTION_MAX_OBSERVATIONS_PER_FLUSH,
   KV_EVICTION_RECOVERY_MS,
   KV_EVICTION_STEP,
 } from "@ws-model-proxy/api/lib/kv-eviction-budget";
-import { ENDPOINT_LOAD_STALE_AFTER_MS } from "@ws-model-proxy/api/lib/metric-routing";
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
 import { isDbShutdownFenceArmed } from "@ws-model-proxy/db/shutdown-fence";
 import type { AffinityDecision } from "./cache-affinity.js";
 import {
@@ -40,27 +38,6 @@ export const EVICTION_MISS_FRACTION = 0.05;
 export const KV_EVICTION_FLUSH_MIN_INTERVAL_MS = 1000;
 export const MAX_PENDING_CAPACITIES = 1024;
 
-/**
- * True when a fresh `endpoint.load` reading shows KV usage at or above the
- * member's FULL threshold (default 0.95). Real prefix evictions happen under
- * memory pressure. Missing, stale, or lower usage is not a miss.
- */
-export function recentKvPressure(
-  reading: { kvUsage?: number; receivedAt: Date } | null | undefined,
-  threshold: number | null | undefined,
-  now: Date,
-): boolean {
-  if (!reading) return false;
-  const received = reading.receivedAt.getTime();
-  if (!Number.isFinite(received)) return false;
-  const ageMs = Math.max(0, now.getTime() - received);
-  if (!Number.isFinite(ageMs) || ageMs > ENDPOINT_LOAD_STALE_AFTER_MS) return false;
-  const usage = reading.kvUsage;
-  return (
-    usage !== undefined && Number.isFinite(usage) && usage >= effectiveKvFullThreshold(threshold)
-  );
-}
-
 /** The sole enforcement point for the evidence rules. Unknown is not a miss. */
 export function qualifiesAsEvictionEvidence({
   policy,
@@ -69,7 +46,6 @@ export function qualifiesAsEvictionEvidence({
   ok,
   usage,
   evidence,
-  kvPressure,
   now,
 }: {
   policy: WarmProtectionPolicy;
@@ -78,7 +54,6 @@ export function qualifiesAsEvictionEvidence({
   ok: boolean;
   usage: { cacheReadTokens: number | null; promptTokens: number | null };
   evidence: NonNullable<AffinityDecision["prefixEvidence"]>[string] | undefined;
-  kvPressure: boolean;
   now: Date;
 }): boolean {
   return (
@@ -98,66 +73,91 @@ export function qualifiesAsEvictionEvidence({
     Math.max(0, now.getTime() - evidence.lastUsedAt) <=
       protectionWindowSecondsFor(policy.windowSeconds, engineKind) * 1000 &&
     evidence.confirmed === true &&
-    usage.cacheReadTokens <= EVICTION_MISS_FRACTION * evidence.tokens &&
-    kvPressure
+    usage.cacheReadTokens <= EVICTION_MISS_FRACTION * evidence.tokens
   );
 }
 
 export type KvEvictionObservation = {
   capacityId: string;
   ownerId: string;
-  count: number;
+  sessionIds: readonly string[];
   now: Date;
 };
 
 export async function recordKvEvictionObservations(
-  { capacityId, ownerId, count, now }: KvEvictionObservation,
+  { capacityId, ownerId, sessionIds, now }: KvEvictionObservation,
   db: Pick<typeof prisma, "$executeRaw"> = prisma,
 ): Promise<void> {
-  const boundedCount = boundedKvEvictionCount(count);
-  // Invalid ids/time cannot create a row. No I/O past shutdown.
+  const sessions = boundedKvEvictionSessions(sessionIds);
   if (
     isDbShutdownFenceArmed() ||
     !capacityId ||
     capacityId.length > 128 ||
     !ownerId ||
-    !Number.isFinite(now.getTime())
+    !Number.isFinite(now.getTime()) ||
+    sessions.length === 0
   )
     return;
+  for (const sessionId of sessions) {
+    if (isDbShutdownFenceArmed()) return;
+    await upsertKvEvictionSession({ capacityId, ownerId, sessionId, now }, db);
+  }
+}
+
+async function upsertKvEvictionSession(
+  {
+    capacityId,
+    ownerId,
+    sessionId,
+    now,
+  }: {
+    capacityId: string;
+    ownerId: string;
+    sessionId: string;
+    now: Date;
+  },
+  db: Pick<typeof prisma, "$executeRaw">,
+): Promise<void> {
   const expiresAt = new Date(now.getTime() + KV_EVICTION_RECOVERY_MS);
-  const insertCut = Math.max(0, boundedCount - 1) * KV_EVICTION_STEP;
+  const liveCutSql = Prisma.sql`GREATEST(0::double precision,
+                LEAST(${KV_EVICTION_MAX_CUT}::double precision, GREATEST(0::double precision, existing."cutFraction"))
+                - ${KV_EVICTION_DECAY_PER_MS}::double precision * GREATEST(0::double precision,
+                  EXTRACT(EPOCH FROM (${now}::timestamp - existing."observedAt"))::double precision * 1000))`;
+  const elapsedSql = Prisma.sql`EXTRACT(EPOCH FROM (${now}::timestamp - existing."observedAt"))::double precision * 1000`;
   await db.$executeRaw`
     INSERT INTO capacity_kv_eviction AS existing
-      ("capacityId", "userId", "cutFraction", "observedAt", "expiresAt")
-    VALUES (${capacityId}, ${ownerId}, ${insertCut}, ${now}, ${expiresAt})
+      ("capacityId", "userId", "cutFraction", "observedAt", "expiresAt", "lastSessionId")
+    VALUES (${capacityId}, ${ownerId}, 0, ${now}, ${expiresAt}, ${sessionId})
     ON CONFLICT ("capacityId") DO UPDATE SET
       "cutFraction" = LEAST(${KV_EVICTION_MAX_CUT}::double precision,
         CASE
-          WHEN existing."expiresAt" <= ${now}::timestamp
-            THEN GREATEST(0::double precision, (${boundedCount} - 1) * ${KV_EVICTION_STEP}::double precision)
-          WHEN GREATEST(0::double precision,
-                LEAST(${KV_EVICTION_MAX_CUT}::double precision, GREATEST(0::double precision, existing."cutFraction"))
-                - ${KV_EVICTION_DECAY_PER_MS}::double precision * GREATEST(0::double precision,
-                  EXTRACT(EPOCH FROM (${now}::timestamp - existing."observedAt"))::double precision * 1000)) > 0
-            AND EXTRACT(EPOCH FROM (${now}::timestamp - existing."observedAt"))::double precision * 1000
-                < ${KV_EVICTION_RECOVERY_MS}::double precision
-            THEN GREATEST(0::double precision,
-                  LEAST(${KV_EVICTION_MAX_CUT}::double precision, GREATEST(0::double precision, existing."cutFraction"))
-                  - ${KV_EVICTION_DECAY_PER_MS}::double precision * GREATEST(0::double precision,
-                    EXTRACT(EPOCH FROM (${now}::timestamp - existing."observedAt"))::double precision * 1000))
-                 + ${boundedCount * KV_EVICTION_STEP}::double precision
-          WHEN existing."cutFraction" > 0
-            THEN GREATEST(0::double precision, (${boundedCount} - 1) * ${KV_EVICTION_STEP}::double precision)
-          ELSE ${boundedCount * KV_EVICTION_STEP}::double precision
+          WHEN existing."expiresAt" <= ${now}::timestamp THEN 0::double precision
+          WHEN ${liveCutSql} > 0
+            AND ${elapsedSql} < ${KV_EVICTION_RECOVERY_MS}::double precision
+            THEN ${liveCutSql} + ${KV_EVICTION_STEP}::double precision
+          WHEN existing."cutFraction" > 0 THEN 0::double precision
+          ELSE ${KV_EVICTION_STEP}::double precision
         END),
+      "lastSessionId" = EXCLUDED."lastSessionId",
       "observedAt" = GREATEST(existing."observedAt", ${now}),
       "expiresAt" = GREATEST(existing."expiresAt", ${expiresAt})
-    WHERE existing."userId" = EXCLUDED."userId"`;
+    WHERE existing."userId" = EXCLUDED."userId"
+      AND NOT (
+        existing."expiresAt" > ${now}::timestamp
+        AND existing."lastSessionId" IS NOT DISTINCT FROM EXCLUDED."lastSessionId"
+        AND (
+          GREATEST(0::double precision, existing."cutFraction") = 0
+          OR (
+            ${liveCutSql} > 0
+            AND ${elapsedSql} < ${KV_EVICTION_RECOVERY_MS}::double precision
+          )
+        )
+      )`;
 }
 
 type Pending = {
   ownerId: string;
-  count: number;
+  sessionIds: string[];
   lastFlush: number;
   timer?: ReturnType<typeof setTimeout>;
   writing: boolean;
@@ -196,7 +196,7 @@ export function createKvEvictionFeedback({
           schedule(capacityId, entry);
           return;
         }
-        if (entry.count === 0) {
+        if (entry.sessionIds.length === 0) {
           pending.delete(capacityId);
           return;
         }
@@ -214,15 +214,20 @@ export function createKvEvictionFeedback({
       return;
     }
     const now = clock();
-    const count = entry.count;
-    entry.count = 0;
+    const sessionIds = entry.sessionIds;
+    entry.sessionIds = [];
     entry.lastFlush = now;
     entry.writing = true;
     // Promise boundary also absorbs a synchronously throwing injected writer.
     void Promise.resolve()
       .then(() => {
         if (!stopped && !shutdown())
-          return write({ capacityId, ownerId: entry.ownerId, count, now: new Date(now) });
+          return write({
+            capacityId,
+            ownerId: entry.ownerId,
+            sessionIds,
+            now: new Date(now),
+          });
       })
       .catch(() => {
         const failedAt = clock();
@@ -240,21 +245,33 @@ export function createKvEvictionFeedback({
       });
     schedule(capacityId, entry);
   };
-  const observe = (capacityId: string, ownerId: string) => {
+  const observe = (capacityId: string, ownerId: string, sessionId: string) => {
     try {
       if (stopped || shutdown()) {
         stop();
         return;
       }
-      if (!capacityId || capacityId.length > 128 || !ownerId) return;
+      if (
+        !capacityId ||
+        capacityId.length > 128 ||
+        !ownerId ||
+        !sessionId ||
+        sessionId.length > 128
+      )
+        return;
       let entry = pending.get(capacityId);
       if (!entry) {
         if (pending.size >= MAX_PENDING_CAPACITIES) return;
-        entry = { ownerId, count: 0, lastFlush: Number.NEGATIVE_INFINITY, writing: false };
+        entry = { ownerId, sessionIds: [], lastFlush: Number.NEGATIVE_INFINITY, writing: false };
         pending.set(capacityId, entry);
       }
       if (entry.ownerId !== ownerId) return;
-      entry.count = Math.min(KV_EVICTION_MAX_OBSERVATIONS_PER_FLUSH, entry.count + 1);
+      if (
+        !entry.sessionIds.includes(sessionId) &&
+        entry.sessionIds.length < KV_EVICTION_MAX_OBSERVATIONS_PER_FLUSH
+      )
+        entry.sessionIds.push(sessionId);
+      if (entry.sessionIds.length === 0) return;
       if (!entry.writing && clock() - entry.lastFlush >= KV_EVICTION_FLUSH_MIN_INTERVAL_MS) {
         clearTimeout(entry.timer);
         entry.timer = undefined;

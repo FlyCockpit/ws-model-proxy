@@ -206,18 +206,17 @@ local pooled request continues a digest-proven, live-tip warm session whose
 previous matched record confirmed engine caching. Both the expected prefix and
 the actual reported prompt must be at least `protectMinTokens`; the record must
 be within that engine's protection window. A reported cache read of at most 5%
-of the expected prefix is an eviction observation. A miss also requires a fresh
-relay `endpoint.load` reading whose `kvUsage` is at least the member's KV-full
-threshold (default 0.95). Real prefix evictions happen under memory pressure;
-missing, stale (older than 15 s), or lower usage produces no observation. The
-first observation on a capacity that is not already cut only arms feedback; a
-second observation lowers K. Pending corroboration lasts until `expiresAt` (30
-minutes from the arming write). An expired row is a new first miss, matching
-readers that already ignore expiry. Chat templates that rewrite earlier turns
-(Qwen3 and DeepSeek-R1 strip reasoning; gpt-oss drops earlier analysis channels)
-can look like a miss on a long confirmed session when the user sends a follow-up.
-One such follow-up does not cut. Two independent misses still can, including two
-follow-ups on those templates, when the engine is also under KV pressure.
+of the expected prefix is an eviction observation. The first observation on a
+capacity that is not already cut only arms feedback from that session; a second
+observation from a different session lowers K. Later observations from the same
+session are ignored, including after a live cut, so one conversation's template
+rewrites cannot walk K down. Two independent sessions still cut. Pending
+corroboration lasts until `expiresAt` (30 minutes from the arming write). An
+expired row is a new first miss, matching readers that already ignore expiry.
+Chat templates that rewrite earlier turns (Qwen3 and DeepSeek-R1 strip reasoning;
+gpt-oss drops earlier analysis channels) can look like a miss on a long confirmed
+session when the user sends a follow-up. Follow-ups from that same session do not
+cut. A miss from a second session still can.
 Unknown cache fields, hits,
 partial hits above 5%, short prefixes, client-id-only matches, instruction hints,
 matches to ancestors that are not live tips and unranked targets produce no
@@ -250,9 +249,9 @@ excluded: they are cumulative, include bypass traffic and cannot be attributed
 to a matched prefix. Unconfirmed records cannot count; remembering a zero-read
 miss removes confirmation from that prefix.
 
-After the first miss has armed the capacity, each further observation cuts 5%
-of the **reported** K (`KV_EVICTION_STEP = 0.05`), with
-at most 10 observations per flush and a 50% maximum cut (`KV_EVICTION_MAX_CUT`).
+After a second distinct session corroborates, each further miss from a new
+session cuts 5% of the **reported** K (`KV_EVICTION_STEP = 0.05`), with at most
+10 distinct sessions per flush and a 50% maximum cut (`KV_EVICTION_MAX_CUT`).
 The integer effective budget stays between `ceil(0.5 * K)` and K. Cuts recover
 linearly at `0.5 / 1_800_000` per millisecond: a full cut recovers in exactly
 30 minutes (`KV_EVICTION_RECOVERY_MS`). Hits write nothing. Only the PROTECTED
@@ -263,9 +262,9 @@ session. A lower threshold redirects new sessions, which reduces evictions until
 evidence stops. The 50% cap, not the 10-per-flush clamp, bounds the cut: a burst
 of confirmed misses (for example after an engine restart that flushed every
 cache) can reach the cap within seconds, and the cut then recovers over 30
-minutes. Evidence counts requests, so a session whose misses are small but
-non-zero can count more than once, and a single-member pool (nowhere to
-redirect) can hold the cut at the cap while it stays overloaded. All of this
+minutes. Distinct sessions whose misses are small but non-zero can each cut
+once, and a single-member pool (nowhere to redirect) can hold the cut at the
+cap while it stays overloaded. All of this
 stays in the fail-safe direction: protection never blocks a request.
 Reported-budget changes automatically scale the relative cut. Slot mode,
 including llama.cpp, is unaffected. Budgets must be positive int32 counts;

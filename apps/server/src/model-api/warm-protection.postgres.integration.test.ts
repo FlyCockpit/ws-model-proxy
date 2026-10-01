@@ -1072,7 +1072,7 @@ integration("warm-session protection with real PostgreSQL", () => {
         });
         for (let i = 0; i < 11; i++)
           await feedback.recordKvEvictionObservations(
-            { capacityId, ownerId: owner.id, count: 1, now },
+            { capacityId, ownerId: owner.id, sessionIds: [`s${i}`], now },
             writers[0],
           );
         expect(await assess(now)).toMatchObject({
@@ -1097,34 +1097,42 @@ integration("warm-session protection with real PostgreSQL", () => {
     });
 
     it.each([
-      { cut: null, count: 1, dt: 0 },
-      { cut: 0, count: 1, dt: 0 },
-      { cut: 0.1, count: 0, dt: 1000 },
-      { cut: 0.1, count: -1, dt: 1000 },
-      { cut: 0.05, count: 1, dt: 0 },
-      { cut: 0.5, count: 1, dt: 900_000 },
-      { cut: 0.5, count: 1, dt: 1_800_000 },
-      { cut: 0.1, count: 1, dt: -1000 },
-      { cut: 0.1, count: 100, dt: 0 },
-      { cut: 0.9, count: 1, dt: 900_000 },
-      { cut: 0.3, count: 3, dt: 1001 },
-    ])("SQL equals pure state (cut=$cut count=$count dt=$dt)", async ({ cut, count, dt }) => {
+      { cut: null, n: 1, dt: 0 },
+      { cut: 0, n: 1, dt: 0 },
+      { cut: 0.1, n: 0, dt: 1000 },
+      { cut: 0.05, n: 1, dt: 0 },
+      { cut: 0.5, n: 1, dt: 900_000 },
+      { cut: 0.5, n: 1, dt: 1_800_000 },
+      { cut: 0.1, n: 1, dt: -1000 },
+      { cut: 0.1, n: 100, dt: 0 },
+      { cut: 0.9, n: 1, dt: 900_000 },
+      { cut: 0.3, n: 3, dt: 1001 },
+    ])("SQL equals pure state (cut=$cut n=$n dt=$dt)", async ({ cut, n, dt }) => {
       const capacityId = id();
+      const sessionIds = Array.from({ length: n }, (_, i) => `s${i}`);
       const state =
-        cut === null ? null : { cutFraction: cut, observedAt: new Date(now.getTime() - dt) };
+        cut === null
+          ? null
+          : {
+              cutFraction: cut,
+              observedAt: new Date(now.getTime() - dt),
+              lastSessionId: "seed",
+            };
       const expiresAt = new Date(now.getTime() + 3_600_000);
       if (state)
         await db.capacityKvEviction.create({
           data: { capacityId, userId: "kv-owner", ...state, expiresAt },
         });
       await feedback.recordKvEvictionObservations(
-        { capacityId, ownerId: "kv-owner", count, now },
+        { capacityId, ownerId: "kv-owner", sessionIds, now },
         writers[0],
       );
+      if (cut === null && sessionIds.length === 0) return;
       const actual = await row(capacityId);
-      const expected = applyKvEvictionObservations(state, count, now);
+      const expected = applyKvEvictionObservations(state, sessionIds, now);
       expect(actual.cutFraction).toBe(expected.cutFraction);
       expect(actual.observedAt).toEqual(expected.observedAt);
+      expect(actual.lastSessionId).toBe(expected.lastSessionId ?? "seed");
       expect(actual.expiresAt).toEqual(
         state ? expiresAt : new Date(now.getTime() + KV_EVICTION_RECOVERY_MS),
       );
@@ -1140,15 +1148,16 @@ integration("warm-session protection with real PostgreSQL", () => {
         await Promise.all(
           Array.from({ length: count }, (_, i) =>
             feedback.recordKvEvictionObservations(
-              { capacityId, ownerId: "kv-owner", count: 1, now },
+              { capacityId, ownerId: "kv-owner", sessionIds: [`s${i}`], now },
               writers[i % writers.length],
             ),
           ),
         );
         const rows = await db.capacityKvEviction.findMany({ where: { capacityId } });
         expect(rows).toHaveLength(1);
-        let expected = applyKvEvictionObservations(null, 1, now);
-        for (let i = 1; i < count; i++) expected = applyKvEvictionObservations(expected, 1, now);
+        let expected = applyKvEvictionObservations(null, ["s0"], now);
+        for (let i = 1; i < count; i++)
+          expected = applyKvEvictionObservations(expected, [`s${i}`], now);
         expect(rows[0]?.cutFraction).toBe(expected.cutFraction);
       },
     );
@@ -1156,12 +1165,17 @@ integration("warm-session protection with real PostgreSQL", () => {
     it("owner mismatch cannot modify a row", async () => {
       const capacityId = id();
       await feedback.recordKvEvictionObservations(
-        { capacityId, ownerId: "kv-owner", count: 1, now },
+        { capacityId, ownerId: "kv-owner", sessionIds: ["s"], now },
         writers[0],
       );
       const before = await row(capacityId);
       await feedback.recordKvEvictionObservations(
-        { capacityId, ownerId: "other-owner", count: 10, now: new Date(now.getTime() + 1000) },
+        {
+          capacityId,
+          ownerId: "other-owner",
+          sessionIds: Array.from({ length: 10 }, (_, i) => `x${i}`),
+          now: new Date(now.getTime() + 1000),
+        },
         writers[1],
       );
       expect(await row(capacityId)).toEqual(before);
@@ -1179,6 +1193,7 @@ integration("warm-session protection with real PostgreSQL", () => {
             cutFraction: 0.5,
             observedAt: new Date(now.getTime() - 2000),
             expiresAt: new Date(now.getTime() + (capacityId === expired ? 0 : 1000)),
+            lastSessionId: "seed",
           },
         });
       const snapshot = await warm.warmProtectionSource.load({
@@ -1212,6 +1227,7 @@ integration("warm-session protection with real PostgreSQL", () => {
             cutFraction: 0.5,
             observedAt: new Date(now.getTime() - age - 1000),
             expiresAt: new Date(now.getTime() - age),
+            lastSessionId: "seed",
           },
         });
       await retention.deleteExpiredKvEvictions({ prisma: writers[0], now, batch: 1 });
@@ -1238,6 +1254,7 @@ integration("warm-session protection with real PostgreSQL", () => {
               cutFraction: 0.1,
               observedAt,
               expiresAt: expired,
+              lastSessionId: "seed",
             }))
             .concat([
               {
@@ -1246,6 +1263,7 @@ integration("warm-session protection with real PostgreSQL", () => {
                 cutFraction: 0.1,
                 observedAt,
                 expiresAt: new Date(now.getTime() + 1000),
+                lastSessionId: "seed",
               },
               {
                 capacityId: boundary,
@@ -1253,6 +1271,7 @@ integration("warm-session protection with real PostgreSQL", () => {
                 cutFraction: 0.1,
                 observedAt,
                 expiresAt: cutoff,
+                lastSessionId: "seed",
               },
             ]),
         });
@@ -1340,10 +1359,11 @@ integration("warm-session protection with real PostgreSQL", () => {
           cutFraction: 0,
           observedAt: new Date(expiredAt.getTime() - KV_EVICTION_RECOVERY_MS),
           expiresAt: expiredAt,
+          lastSessionId: "a",
         },
       });
       await feedback.recordKvEvictionObservations(
-        { capacityId, ownerId: "kv-owner", count: 1, now },
+        { capacityId, ownerId: "kv-owner", sessionIds: ["a"], now },
         writers[0],
       );
       const actual = await row(capacityId);
@@ -1352,8 +1372,9 @@ integration("warm-session protection with real PostgreSQL", () => {
           cutFraction: 0,
           observedAt: new Date(expiredAt.getTime() - KV_EVICTION_RECOVERY_MS),
           expiresAt: expiredAt,
+          lastSessionId: "a",
         },
-        1,
+        ["a"],
         now,
       );
       expect(actual.cutFraction).toBe(expected.cutFraction);
@@ -1371,10 +1392,11 @@ integration("warm-session protection with real PostgreSQL", () => {
           cutFraction: 0.25,
           observedAt: new Date(now.getTime() - 60_000),
           expiresAt: expiredAt,
+          lastSessionId: "a",
         },
       });
       await feedback.recordKvEvictionObservations(
-        { capacityId, ownerId: "kv-owner", count: 1, now },
+        { capacityId, ownerId: "kv-owner", sessionIds: ["b"], now },
         writers[0],
       );
       expect((await row(capacityId)).cutFraction).toBe(0);
@@ -1383,12 +1405,17 @@ integration("warm-session protection with real PostgreSQL", () => {
     it("older application clocks do not decay or move timestamps backward", async () => {
       const capacityId = id();
       await feedback.recordKvEvictionObservations(
-        { capacityId, ownerId: "kv-owner", count: 3, now },
+        { capacityId, ownerId: "kv-owner", sessionIds: ["a", "b", "c"], now },
         writers[0],
       );
       const initial = await row(capacityId);
       await feedback.recordKvEvictionObservations(
-        { capacityId, ownerId: "kv-owner", count: 1, now: new Date(now.getTime() - 60_000) },
+        {
+          capacityId,
+          ownerId: "kv-owner",
+          sessionIds: ["d"],
+          now: new Date(now.getTime() - 60_000),
+        },
         writers[1],
       );
       const actual = await row(capacityId);

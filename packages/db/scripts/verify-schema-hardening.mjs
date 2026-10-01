@@ -516,22 +516,59 @@ async function verifyAffinityNodeHardening() {
 }
 async function verifyKvEvictionHardening() {
   const cases = [
-    { capacity: "''", cut: "0.1", expires: "NOW() + interval '1 hour'" },
-    { capacity: "repeat('c', 129)", cut: "0.1", expires: "NOW() + interval '1 hour'" },
-    { capacity: "'negative-cut'", cut: "-0.01", expires: "NOW() + interval '1 hour'" },
-    { capacity: "'oversized-cut'", cut: "1.01", expires: "NOW() + interval '1 hour'" },
-    { capacity: "'nan-cut'", cut: "'NaN'::double precision", expires: "NOW() + interval '1 hour'" },
-    { capacity: "'invalid-expiry'", cut: "0.1", expires: "NOW() - interval '1 second'" },
+    { capacity: "''", cut: "0.1", expires: "NOW() + interval '1 hour'", session: "'session-a'" },
+    {
+      capacity: "repeat('c', 129)",
+      cut: "0.1",
+      expires: "NOW() + interval '1 hour'",
+      session: "'session-a'",
+    },
+    {
+      capacity: "'negative-cut'",
+      cut: "-0.01",
+      expires: "NOW() + interval '1 hour'",
+      session: "'session-a'",
+    },
+    {
+      capacity: "'oversized-cut'",
+      cut: "1.01",
+      expires: "NOW() + interval '1 hour'",
+      session: "'session-a'",
+    },
+    {
+      capacity: "'nan-cut'",
+      cut: "'NaN'::double precision",
+      expires: "NOW() + interval '1 hour'",
+      session: "'session-a'",
+    },
+    {
+      capacity: "'invalid-expiry'",
+      cut: "0.1",
+      expires: "NOW() - interval '1 second'",
+      session: "'session-a'",
+    },
+    {
+      capacity: "'empty-session'",
+      cut: "0.1",
+      expires: "NOW() + interval '1 hour'",
+      session: "''",
+    },
+    {
+      capacity: "'long-session'",
+      cut: "0.1",
+      expires: "NOW() + interval '1 hour'",
+      session: "repeat('s', 129)",
+    },
   ];
   for (const row of cases)
     await expectConstraintFailure(`
-    INSERT INTO capacity_kv_eviction ("capacityId", "userId", "cutFraction", "observedAt", "expiresAt")
-    VALUES (${row.capacity}, 'owner-a', ${row.cut}, NOW(), ${row.expires})`);
+    INSERT INTO capacity_kv_eviction ("capacityId", "userId", "cutFraction", "observedAt", "expiresAt", "lastSessionId")
+    VALUES (${row.capacity}, 'owner-a', ${row.cut}, NOW(), ${row.expires}, ${row.session})`);
   await client.query(`INSERT INTO capacity_kv_eviction
-    ("capacityId", "userId", "cutFraction", "observedAt", "expiresAt")
-    VALUES ('orphan-capacity', 'absent-owner', 0.5, NOW(), NOW())`);
+    ("capacityId", "userId", "cutFraction", "observedAt", "expiresAt", "lastSessionId")
+    VALUES ('orphan-capacity', 'absent-owner', 0.5, NOW(), NOW(), 'session-a')`);
   process.stdout.write(
-    "KV eviction hardening: 6 shape negatives and FK-free orphan insert passed.\n",
+    "KV eviction hardening: 8 shape negatives and FK-free orphan insert passed.\n",
   );
 }
 
