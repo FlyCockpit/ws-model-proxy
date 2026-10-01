@@ -343,8 +343,8 @@ export function CliDeviceFeatureSwitches({
       {features.fileTools ? (
         <p className="text-xs text-muted-foreground">
           {t("dashboard:clis.features.fileTools", {
-            read: t(`dashboard:clis.features.fileToolAccess.${features.fileTools.read}`),
-            write: t(`dashboard:clis.features.fileToolAccess.${features.fileTools.write}`),
+            read: t(`dashboard:clis.features.fileToolAccess.read.${features.fileTools.read}`),
+            write: t(`dashboard:clis.features.fileToolAccess.write.${features.fileTools.write}`),
           })}
         </p>
       ) : null}

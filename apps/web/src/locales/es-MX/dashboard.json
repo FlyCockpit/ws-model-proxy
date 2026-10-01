@@ -208,9 +208,16 @@
       "approvalRecommended": "Recomendado: exige aprobación del navegador en este CLI. Sin ella, el CLI acepta cualquier navegador que admita el servidor de WS Model Proxy, así que \"nada se ejecuta sin que presiones una tecla\" y \"la salida sin revisar nunca llega al servidor\" solo se cumplen mientras el servidor sea honesto: un servidor comprometido, o cualquiera con una sesión iniciada en esta cuenta, podría abrir una solicitud, presionar Enter y leer su salida. Con aprobación, solo pueden hacerlo los navegadores que aprobaste en este CLI, siempre que el código del panel que carga tu navegador sea legítimo (lo sirve el mismo servidor, que no tiene las claves de la terminal, pero un servidor comprometido podría servir código alterado). Ejecuta en el CLI:",
       "fileTools": "Herramientas de archivos: lectura {{read}}, escritura {{write}}. Siguen el modo de comandos MCP.",
       "fileToolAccess": {
-        "headless": "se ejecutan sin supervisión",
-        "supervised": "aún no disponible (requiere a una persona)",
-        "off": "desactivadas"
+        "read": {
+          "headless": "se ejecutan sin supervisión",
+          "supervised": "requiere el permiso de lectura",
+          "off": "desactivadas"
+        },
+        "write": {
+          "headless": "se ejecutan sin supervisión",
+          "supervised": "requiere que una persona confirme en el CLI",
+          "off": "desactivadas"
+        }
       },
       "fileToolsAsRoot": "Este CLI permite que las herramientas de archivos MCP se ejecuten como root (allowFileToolsAsRoot está activado). Un agente podría leer o cambiar cualquier archivo de esta máquina. Desactívalo con wsmp config set-file-tools-as-root off.",
       "effective": "Lo que los agentes pueden ejecutar ahora",
@@ -1616,7 +1623,7 @@
     "badge_other": "{{count}} solicitudes de agente en espera",
     "noticeTitle_one": "Un agente está esperándote",
     "noticeTitle_other": "{{count}} solicitudes de agentes te están esperando",
-    "noticeBody": "{{requester}} pidió ejecutar un comando en uno de tus CLI. Nada se ejecuta hasta que presiones Enter en la pantalla de confirmación del CLI.",
+    "noticeBody": "{{requester}} pidió ejecutar un comando o cambiar un archivo en uno de tus CLI. Nada ocurre hasta que presiones Enter en la pantalla de confirmación del CLI.",
     "open": "Abrir terminales",
     "title": "Solicitud de agente",
     "tabLabel": "Solicitud de agente · {{cli}}",

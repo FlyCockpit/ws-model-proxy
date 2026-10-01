@@ -1,7 +1,7 @@
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { RELAY_REQUEST_BODY_WINDOW_CHUNKS } from "./protocol.js";
+import { encodeRelayBinaryFrame, RELAY_REQUEST_BODY_WINDOW_CHUNKS } from "./protocol.js";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
@@ -37,7 +37,12 @@ vi.mock("../rate-limit.js", () => ({
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { relaySessionManager } = await import("./session-manager.js");
 const { terminalBrowserHub } = await import("./terminal-websocket.js");
-const { resetCliCommandsForTests, startSupervisedCommand } = await import("./cli-commands.js");
+const {
+  resetCliCommandsForTests,
+  snapshotSupervisedCommand,
+  startSupervisedCommand,
+  startSupervisedRequest,
+} = await import("./cli-commands.js");
 
 const db = prisma as unknown as {
   $transaction: MockInstance;
@@ -96,7 +101,7 @@ function uncompressedKey(): string {
   return bytes.toString("base64url");
 }
 
-function hello() {
+function hello(terminalApproval = false) {
   return JSON.stringify({
     type: "hello",
     id: "hello-desktop",
@@ -122,7 +127,7 @@ function hello() {
         features: {
           humanTerminal: false,
           mcpCommandMode: "supervised",
-          terminalApproval: false,
+          terminalApproval,
           terminalSupported: true,
           remoteMetricSources: false,
           mcpFileRead: false,
@@ -283,6 +288,119 @@ describe("terminal list pushes for supervised requests", () => {
     expect(stranger.sends).toEqual([]);
   });
 
+  it("keeps supervised file viewers pending until each attach approval succeeds", async () => {
+    // Reconnect with the attach-approval feature enabled, retaining no human grant.
+    await relaySessionManager.removeSession(cli, now);
+    cli = new FakeSocket();
+    relaySessionManager.acceptAuthenticatedSocket({ socket: cli, identity, now });
+    await relaySessionManager.handleTextFrame(cli, hello(true), now);
+    const request = await startSupervisedRequest({
+      kind: "file",
+      userId: "user-id",
+      tokenId: "token-a",
+      expiresAt: null,
+      cliDeviceId: "desktop",
+      fileOp: { op: "mkdir", args: { path: "~/reviewed-directory" } },
+    });
+    if (!request.ok) throw new Error("expected file start");
+    const cliSays = (message: Record<string, unknown>) =>
+      relaySessionManager.handleTextFrame(cli, JSON.stringify(message), now);
+    await cliSays({
+      type: "term.spawned",
+      terminalId: request.terminalId,
+      commandId: request.commandId,
+    });
+    const approved = new FakeSocket();
+    const refused = new FakeSocket();
+    for (const [index, tab] of [approved, refused].entries()) {
+      terminalBrowserHub.accept({ socket: tab, userId: "user-id", sessionId: `approval-${index}` });
+      await terminalBrowserHub.handleText(
+        tab,
+        JSON.stringify({
+          type: "attach",
+          terminalId: request.terminalId,
+          publicKey: uncompressedKey(),
+          nonce: "AAECAwQFBgcICQoLDA0ODw",
+        }),
+      );
+    }
+    const attaches = cli.json().filter((message) => message.type === "term.attach");
+    expect(attaches).toHaveLength(2);
+    expect(approved.json().some((message) => message.type === "attached")).toBe(false);
+    expect(refused.json().some((message) => message.type === "attached")).toBe(false);
+    const broadcast = (seq: number) =>
+      relaySessionManager.handleBinaryFrame(
+        cli,
+        encodeRelayBinaryFrame(
+          { type: "term.sealed", terminalId: request.terminalId, seq, epoch: 1 },
+          new Uint8Array([1, 2, 3]),
+        ),
+      );
+    broadcast(1);
+    expect(approved.sends.filter((send) => typeof send !== "string")).toHaveLength(0);
+    expect(refused.sends.filter((send) => typeof send !== "string")).toHaveLength(0);
+    for (const attach of attaches) {
+      await cliSays({
+        type: "term.pending",
+        terminalId: request.terminalId,
+        viewerId: attach.viewerId,
+        cliNonce: "AAECAwQFBgcICQoLDA0ODw",
+        approvalCode: "ABCDEFGH",
+      });
+    }
+    expect(approved.json().filter((message) => message.type === "pending")).toHaveLength(1);
+    expect(refused.json().filter((message) => message.type === "pending")).toHaveLength(1);
+    await terminalBrowserHub.handleText(
+      approved,
+      JSON.stringify({
+        type: "auth",
+        terminalId: request.terminalId,
+        signature: "c2lnbmF0dXJl",
+      }),
+    );
+    expect(cli.json().filter((message) => message.type === "term.auth")).toEqual([
+      {
+        type: "term.auth",
+        terminalId: request.terminalId,
+        viewerId: attaches[0]?.viewerId,
+        signature: "c2lnbmF0dXJl",
+      },
+    ]);
+    await cliSays({
+      type: "term.attached",
+      terminalId: request.terminalId,
+      viewerId: attaches[0]?.viewerId,
+      cliNonce: "AAECAwQFBgcICQoLDA0ODw",
+    });
+    await cliSays({
+      type: "term.rejected",
+      terminalId: request.terminalId,
+      viewerId: attaches[1]?.viewerId,
+      reason: "approval_required",
+    });
+    expect(approved.json().filter((message) => message.type === "attached")).toHaveLength(1);
+    expect(approved.json().some((message) => message.type === "rejected")).toBe(false);
+    expect(refused.json().filter((message) => message.type === "rejected")).toEqual([
+      {
+        type: "rejected",
+        terminalId: request.terminalId,
+        reason: "approval_required",
+      },
+    ]);
+    expect(refused.json().some((message) => message.type === "attached")).toBe(false);
+    broadcast(2);
+    expect(approved.sends.filter((send) => typeof send !== "string")).toHaveLength(1);
+    expect(refused.sends.filter((send) => typeof send !== "string")).toHaveLength(0);
+    expect(snapshotSupervisedCommand(request.commandId, "user-id", "token-a")).toMatchObject({
+      requestKind: "file",
+      status: "awaiting_user",
+      started: null,
+      file: null,
+      fileError: null,
+    });
+    expect(cli.json().some((message) => message.type === "supervised.accepted")).toBe(false);
+  });
+
   describe("Decline from the browser", () => {
     async function spawnedRequest() {
       const started = await startSupervisedCommand({
@@ -316,6 +434,69 @@ describe("terminal list pushes for supervised requests", () => {
     const toCli = (type: string) => cli.json().filter((message) => message.type === type);
     const toBrowser = (socket: FakeSocket, type: string) =>
       socket.json().filter((message) => message.type === type);
+
+    it("declines a file through the browser route and tracker without storing a file result", async () => {
+      const dispatch = vi.spyOn(relaySessionManager, "dispatchSupervisedSpawn");
+      const request = await startSupervisedRequest({
+        kind: "file",
+        userId: "user-id",
+        tokenId: "token-a",
+        expiresAt: null,
+        cliDeviceId: "desktop",
+        fileOp: { op: "mkdir", args: { path: "~/reviewed-directory" } },
+      });
+      const tracker = dispatch.mock.calls[0]?.[0];
+      dispatch.mockRestore();
+      if (!request.ok || !tracker) throw new Error("expected file start");
+      const requestDecline = vi.spyOn(tracker, "requestDecline");
+      const snapshot = () => snapshotSupervisedCommand(request.commandId, "user-id", "token-a");
+      try {
+        await cliSays({
+          type: "term.spawned",
+          terminalId: request.terminalId,
+          commandId: request.commandId,
+        });
+        const tab = browser();
+        await terminalBrowserHub.handleText(
+          tab,
+          JSON.stringify({ type: "decline", terminalId: request.terminalId }),
+        );
+        expect(requestDecline).toHaveBeenCalledTimes(1);
+        expect(requestDecline).toHaveReturnedWith("requested");
+        expect(toCli("supervised.cancel")).toEqual([
+          { type: "supervised.cancel", commandId: request.commandId, reason: "decline" },
+        ]);
+        expect(snapshot()).toMatchObject({ status: "awaiting_user", file: null, fileError: null });
+        await cliSays({ type: "supervised.declined", commandId: request.commandId });
+        const declined = snapshot();
+        expect(declined).toMatchObject({
+          requestKind: "file",
+          status: "declined",
+          started: false,
+          file: null,
+          fileError: { code: "declined" },
+        });
+        expect(declined?.fileError).toEqual({ code: "declined" });
+        // Late reports cannot turn a decline into an applied operation, even
+        // if delivered directly to the tracker after wire validation.
+        await cliSays({
+          type: "supervised.done",
+          commandId: request.commandId,
+          review: false,
+          fileResult: { op: "mkdir", result: { created: true } },
+        });
+        tracker.onAccepted();
+        tracker.onDone({ review: false, fileResult: { op: "mkdir", result: { created: true } } });
+        expect(snapshot()).toEqual(declined);
+        await cliSays({ type: "term.exit", terminalId: request.terminalId });
+        expect(snapshot()).toEqual(declined);
+        expect(toBrowser(tab, "exit")).toEqual([
+          { type: "exit", terminalId: request.terminalId, supervisedStatus: "declined" },
+        ]);
+      } finally {
+        requestDecline.mockRestore();
+      }
+    });
 
     it("never kills a command whose Enter the server already took (CLI first)", async () => {
       const request = await spawnedRequest();

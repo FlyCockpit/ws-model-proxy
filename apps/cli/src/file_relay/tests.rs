@@ -942,6 +942,41 @@ fn a_write_whose_body_never_arrives_expires() {
 }
 
 #[test]
+fn supervised_review_relay_body_wait_exact_deadline() {
+    let mut harness = harness();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("new");
+    let id = op_id(208);
+    assert!(
+        harness
+            .relay
+            .handle_op(
+                &id,
+                "write",
+                json!({"path":path}),
+                Some(1),
+                FilePermission {
+                    mode: McpCommandMode::Unsupervised,
+                    read_grant: false
+                }
+            )
+            .is_empty()
+    );
+    let since = harness.relay.pending[&id].awaiting.as_ref().unwrap().since;
+    assert!(
+        harness
+            .relay
+            .expire_stale(since + BODY_WAIT - Duration::from_nanos(1))
+            .is_empty()
+    );
+    assert_eq!(harness.relay.pending_len(), 1);
+    let frames = harness.relay.expire_stale(since + BODY_WAIT);
+    assert_eq!(only_control(&frames)["reason"], "bad_frame");
+    assert_eq!(harness.relay.pending_len(), 0);
+    assert!(!path.exists());
+}
+
+#[test]
 fn a_marker_in_write_content_is_still_refused_after_injection() {
     let dir = tempfile::tempdir().expect("dir");
     let file = dir.path().join("m.txt");
@@ -1168,6 +1203,7 @@ fn dropping_the_session_cancels_every_pending_op() {
 
 #[test]
 fn every_op_is_logged_once_by_the_settle_point_without_content() {
+    let _capture = crate::logging::test_capture_lock();
     use std::io::Write;
     use std::sync::Mutex as StdMutex;
 
@@ -1233,6 +1269,60 @@ fn summaries_show_paths_but_never_content() {
     let write = summarize("write", &json!({ "path": "/w", "reason": "r" }));
     assert_eq!((write.op.as_str(), write.target.as_str()), ("write", "/w"));
     assert_eq!(summarize("bogus", &json!({})).op, "unknown");
+}
+
+#[test]
+fn supervised_runtime_delivers_io_error_when_apply_panics() {
+    let dir = tempfile::tempdir().expect("dir");
+    let file = dir.path().join("file.txt");
+    std::fs::write(&file, "before\n").expect("fixture");
+    use std::os::unix::fs::MetadataExt;
+    let policy = Policy::from_environment(Vec::new(), true)
+        .with_euid(std::fs::metadata(&file).expect("fixture owner").uid());
+    let (boundary_tx, boundary_rx) = std::sync::mpsc::sync_channel(1);
+    let ops =
+        FileOps::new(policy, EtagKey::from_bytes([7; 32])).with_step_hook(Arc::new(move |step| {
+            if step == Step::TempCreated {
+                let _ = boundary_tx.send(crate::file_ops::pool::worker_panic_is_contained());
+                panic!("injected worker panic");
+            }
+            Ok(())
+        }));
+    let runtime = FileRuntime::new(ops);
+    let cancel = Cancel::new();
+    let prepared = runtime
+        .ops()
+        .prepare_supervised(
+            "edit",
+            json!({"path":path_str(&file), "edits":[{"oldText":"before", "newText":"after"}]}),
+            None,
+            &EtagKey::from_bytes([19; 32]),
+            &cancel,
+        )
+        .expect("prepare");
+    assert_eq!(
+        prepared.child_input().blocked,
+        None,
+        "panic seam must be reachable"
+    );
+    let (tx, rx) = channel();
+    runtime
+        .apply_supervised(prepared, cancel, move |outcome| {
+            tx.send(outcome).expect("callback receiver");
+        })
+        .expect("enqueue");
+    let error = rx
+        .recv_timeout(WAIT)
+        .expect("callback after panic")
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::IoError);
+    assert!(
+        boundary_rx
+            .recv_timeout(WAIT)
+            .expect("panic boundary status")
+    );
+    assert_eq!(std::fs::read_to_string(file).unwrap(), "before\n");
+    assert!(!crate::file_ops::pool::worker_panic_is_contained());
 }
 
 #[test]

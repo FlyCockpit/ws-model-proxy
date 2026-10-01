@@ -5,6 +5,7 @@
 //! `spawn_supervised` refuses with `unsupported`, so none of this is built.
 
 use super::{Capture, terminal_crypto};
+use crate::protocol::FileErrorCode;
 
 /// Env names the daemon sets for `wsmp terminal supervised-run`. The child
 /// removes them before it execs the command.
@@ -13,12 +14,28 @@ pub(crate) const SUPERVISED_ENV_REASON: &str = "WSMP_SUPERVISED_REASON";
 pub(crate) const SUPERVISED_ENV_REQUESTER: &str = "WSMP_SUPERVISED_REQUESTER";
 pub(crate) const SUPERVISED_ENV_SHARE: &str = "WSMP_SUPERVISED_SHARE";
 pub(crate) const SUPERVISED_ENV_MARKER: &str = "WSMP_SUPERVISED_MARKER";
-pub(crate) const SUPERVISED_ENV_NAMES: [&str; 5] = [
+pub(crate) const SUPERVISED_ENV_FILE_OP: &str = "WSMP_SUPERVISED_FILE_OP";
+pub(crate) const SUPERVISED_ENV_FILE_ARGS: &str = "WSMP_SUPERVISED_FILE_ARGS";
+pub(crate) const SUPERVISED_ENV_FILE_BODY: &str = "WSMP_SUPERVISED_FILE_BODY";
+pub(crate) const SUPERVISED_ENV_FILE_ETAG_KEY: &str = "WSMP_SUPERVISED_FILE_ETAG_KEY";
+pub(crate) const SUPERVISED_ENV_FILE_PREIMAGE: &str = "WSMP_SUPERVISED_FILE_PREIMAGE";
+pub(crate) const SUPERVISED_ENV_FILE_BLOCKED: &str = "WSMP_SUPERVISED_FILE_BLOCKED";
+pub(crate) const SUPERVISED_ENV_FILE_ALLOW_ROOT: &str = "WSMP_SUPERVISED_FILE_ALLOW_ROOT";
+pub(crate) const SUPERVISED_ENV_FILE_ROOTS: &str = "WSMP_SUPERVISED_FILE_ROOTS";
+pub(crate) const SUPERVISED_ENV_NAMES: [&str; 13] = [
     SUPERVISED_ENV_COMMAND,
     SUPERVISED_ENV_REASON,
     SUPERVISED_ENV_REQUESTER,
     SUPERVISED_ENV_SHARE,
     SUPERVISED_ENV_MARKER,
+    SUPERVISED_ENV_FILE_OP,
+    SUPERVISED_ENV_FILE_ARGS,
+    SUPERVISED_ENV_FILE_BODY,
+    SUPERVISED_ENV_FILE_ETAG_KEY,
+    SUPERVISED_ENV_FILE_PREIMAGE,
+    SUPERVISED_ENV_FILE_BLOCKED,
+    SUPERVISED_ENV_FILE_ALLOW_ROOT,
+    SUPERVISED_ENV_FILE_ROOTS,
 ];
 
 /// The in-band signal between the confirm child and the daemon: an OSC
@@ -36,6 +53,8 @@ pub(crate) fn supervised_marker(kind: &str, marker: &str) -> Vec<u8> {
 pub(super) enum MarkerEvent {
     Ready,
     Accepted,
+    Blocked(FileErrorCode),
+    Invalid,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -45,12 +64,13 @@ pub(super) enum Piece {
 }
 
 /// Finds the confirm child's markers in PTY output, including markers split
-/// across reads, and removes them from what viewers see. Only `ready` and
-/// then `accepted` are honored, each once; afterwards the output passes
+/// across reads, and removes them from what viewers see. The accepted grammar
+/// is ready -> (accepted | blocked;<FileErrorCode>), authenticated by the
+/// per-request marker. Each decision is honored once; later output passes
 /// through untouched, so a command printing a marker changes nothing.
 pub(super) struct MarkerScanner {
-    ready: Vec<u8>,
-    accepted: Vec<u8>,
+    prefix: Vec<u8>,
+    marker: Vec<u8>,
     /// Output that may be the start of a marker, held until it is decided.
     pending: Vec<u8>,
     ready_seen: bool,
@@ -78,8 +98,8 @@ fn marker_prefix_suffix(bytes: &[u8], marker: &[u8]) -> usize {
 impl MarkerScanner {
     pub(super) fn new(marker: &str) -> Self {
         Self {
-            ready: supervised_marker("ready", marker),
-            accepted: supervised_marker("accepted", marker),
+            prefix: b"\x1b]7717;wsmp-supervised;".to_vec(),
+            marker: marker.as_bytes().to_vec(),
             pending: Vec::new(),
             ready_seen: false,
             done: false,
@@ -106,16 +126,8 @@ impl MarkerScanner {
                 }
                 return pieces;
             }
-            let ready = find_subslice(rest, &self.ready).map(|at| (at, MarkerEvent::Ready));
-            let accepted =
-                find_subslice(rest, &self.accepted).map(|at| (at, MarkerEvent::Accepted));
-            let next = match (ready, accepted) {
-                (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
-                (left, right) => left.or(right),
-            };
-            let Some((at, event)) = next else {
-                let keep = marker_prefix_suffix(rest, &self.ready)
-                    .max(marker_prefix_suffix(rest, &self.accepted));
+            let Some(at) = find_subslice(rest, &self.prefix) else {
+                let keep = marker_prefix_suffix(rest, &self.prefix);
                 let emit = rest.len() - keep;
                 if emit > 0 {
                     pieces.push(Piece::Bytes(rest[..emit].to_vec()));
@@ -126,9 +138,46 @@ impl MarkerScanner {
             if at > 0 {
                 pieces.push(Piece::Bytes(rest[..at].to_vec()));
             }
-            let length = match event {
-                MarkerEvent::Ready => self.ready.len(),
-                MarkerEvent::Accepted => self.accepted.len(),
+            let marker_start = at + self.prefix.len();
+            let Some(end) = rest[marker_start..].iter().position(|byte| *byte == 0x07) else {
+                // Marker kinds are tiny. Do not let arbitrary PTY output hold
+                // an unbounded buffer merely because it begins like an OSC.
+                if rest.len().saturating_sub(at) > 256 {
+                    pieces.push(Piece::Bytes(rest[at..at + 1].to_vec()));
+                    start += at + 1;
+                    continue;
+                }
+                self.pending = rest[at..].to_vec();
+                return pieces;
+            };
+            let end = marker_start + end;
+            let payload = &rest[marker_start..end];
+            let Some(separator) = payload.iter().rposition(|byte| *byte == b';') else {
+                pieces.push(Piece::Bytes(rest[at..=end].to_vec()));
+                start += end + 1;
+                continue;
+            };
+            if payload[separator + 1..] != self.marker {
+                // A marker for another request is ordinary display output.
+                pieces.push(Piece::Bytes(rest[at..=end].to_vec()));
+                start += end + 1;
+                continue;
+            }
+            let kind = std::str::from_utf8(&payload[..separator]).ok();
+            let event = match kind {
+                Some("ready") => MarkerEvent::Ready,
+                Some("accepted") => MarkerEvent::Accepted,
+                Some(value) if value.starts_with("blocked;") => {
+                    // `uncertain_outcome` is an apply-time verdict only the daemon
+                    // produces after acceptance; the confirm child never has it.
+                    // `unsafe_filesystem` may be a preview-time capability refusal,
+                    // so its blocked verdict is allowed after the dismiss key.
+                    FileErrorCode::from_wire_code(&value["blocked;".len()..])
+                        .filter(|code| !matches!(code, FileErrorCode::UncertainOutcome))
+                        .map(MarkerEvent::Blocked)
+                        .unwrap_or(MarkerEvent::Invalid)
+                }
+                _ => MarkerEvent::Invalid,
             };
             match event {
                 MarkerEvent::Ready if !self.ready_seen => {
@@ -139,10 +188,18 @@ impl MarkerScanner {
                     self.done = true;
                     pieces.push(Piece::Event(MarkerEvent::Accepted));
                 }
+                MarkerEvent::Blocked(code) if self.ready_seen => {
+                    self.done = true;
+                    pieces.push(Piece::Event(MarkerEvent::Blocked(code)));
+                }
+                MarkerEvent::Invalid => {
+                    self.done = true;
+                    pieces.push(Piece::Event(MarkerEvent::Invalid));
+                }
                 // A repeated `ready`, or `accepted` before `ready`: stripped, ignored.
                 _ => {}
             }
-            start += at + length;
+            start += end + 1;
         }
     }
 }
@@ -229,6 +286,42 @@ mod tests {
         // Another marker's bytes do not count.
         let mut other = MarkerScanner::new("ffffffffffffffffffffffffffffffff");
         assert_eq!(other.feed(&ready), vec![Piece::Bytes(ready.clone())]);
+    }
+
+    #[test]
+    fn marker_scanner_accepts_one_valid_blocked_code_and_rejects_arbitrary_kinds() {
+        let marker = "00112233445566778899aabbccddeeff";
+        // A preview-time capability refusal is valid after screen dismissal.
+        for code in [FileErrorCode::Conflict, FileErrorCode::UnsafeFilesystem] {
+            let mut blocked = MarkerScanner::new(marker);
+            let mut stream = supervised_marker("ready", marker);
+            stream.extend(supervised_marker(
+                &format!("blocked;{}", code.as_str()),
+                marker,
+            ));
+            let pieces = blocked.feed(&stream);
+            assert!(pieces.contains(&Piece::Event(MarkerEvent::Ready)));
+            assert!(pieces.contains(&Piece::Event(MarkerEvent::Blocked(code))));
+        }
+
+        // An apply-time verdict the confirm child never produces is malformed there.
+        for kind in [
+            "blocked;made_up",
+            "blocked;conflict;extra",
+            "blocked;uncertain_outcome",
+            "surprise",
+        ] {
+            let mut scanner = MarkerScanner::new(marker);
+            let mut stream = supervised_marker("ready", marker);
+            stream.extend(supervised_marker(kind, marker));
+            let pieces = scanner.feed(&stream);
+            assert!(
+                pieces.contains(&Piece::Event(MarkerEvent::Invalid)),
+                "{kind}"
+            );
+            assert!(pieces.iter().all(|piece| !matches!(piece, Piece::Bytes(bytes) if
+                bytes.windows(b"wsmp-supervised".len()).any(|window| window == b"wsmp-supervised"))));
+        }
     }
 
     #[test]

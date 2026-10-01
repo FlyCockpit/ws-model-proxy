@@ -68,3 +68,30 @@ fn default_directive(verbose: u8, quiet: bool) -> String {
     }
     .to_string()
 }
+
+// Keep an INFO-enabled dispatch alive for the entire test process. Otherwise a
+// bare registry test can cache Never for a callsite while another thread uses a
+// scoped capture subscriber. Only capture tests serialize; PTY/worker tests do not.
+#[cfg(test)]
+pub(crate) fn init_test_subscriber() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_writer(std::io::sink)
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        )
+        .expect("test subscriber");
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn test_capture_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    init_test_subscriber();
+    guard
+}

@@ -32,7 +32,36 @@ Every \`appRouter\` leaf is either an MCP tool target or an explicit
 exclusion (invariant 12); the completeness check walks the real router and
 fails the suite when a leaf is unclassified.`;
 
-const FOOTER = `## Human-only procedures (Phase 7)
+const FOOTER = `## Supervised CLI file writes
+
+The five file mutation tools return a supervised request id when the node's effective
+mode is supervised. A person's keypress on the CLI-drawn screen is required; the CLI
+computes a complete diff from disk with byte provenance. Disk-derived removed/context
+lines are masked; an added line carrying any masked disk byte (including whole-line
+and continuation masks) blocks with redacted_span after dismissal. Pure requester
+additions stay visible with controls escaped. Diff and mask use LF-only lines; a
+lone CR stays escaped content, and unmappable line counts block with redacted_span.
+Details discloses creation mode, all preserved permission bits, parent creation,
+ifExists, overwrite and byte counts. Diffs exceeding
+the 8 KiB display cap are blocked with too_large after dismissal. A supervised directory
+rename without replacement is refused with unsupported on macOS. Poll \`forwarder_cli_command_result\` for
+\`file:{op,result}\` or \`error:{code,message,outcome?}\`. Approval implies no read grant.
+Physical root confinement (path_denied), including outside-root text, escaping links
+and unavailable roots, and normalized argument growth above 128 KiB (too_large)
+are blocked screens whose codes reach the agent only after dismissal. Aliases
+resolving inside roots are allowed. The child uses the daemon startup root snapshot;
+apply rechecks authoritative policy. Pre-display refusals depend only on request
+text/input policy (invalid_input, secret_file, protected/staging names, special trees,
+declared sizes), process/mode and capacity checks. The full read grant admits reads
+in supervised/off modes and never writes; off refuses writes.
+Server termination after dispatch without authoritative CLI settlement is unknown
+with started:true when the server received acceptance and started:null otherwise. CLI decline/rejection
+and blocked done before acceptance, and undispatched failures remain definitive.
+Finished file answers and their single audit event do not change on late reports.
+Only a supervised start id is delivered despite MCP abort; headless file results keep
+the abort fence. See [CLI file tools](mcp.md#cli-file-tools-relay-protocol-28).
+
+## Human-only procedures (Phase 7)
 
 The \`mcpGrants\` router (\`packages/api/src/routers/mcp-grants.ts\`) and the
 \`mcpTokens\` router (\`packages/api/src/routers/mcp-tokens.ts\`) are

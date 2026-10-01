@@ -626,7 +626,7 @@ fn ssh_key_files_cannot_be_edited_at_all() {
 // ---- atomic replace -------------------------------------------------------
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-const ORDER: [Step; 11] = [
+const ORDER: [Step; 12] = [
     Step::TempCreated,
     Step::TempWritten,
     Step::TempSynced,
@@ -637,11 +637,12 @@ const ORDER: [Step; 11] = [
     Step::Captured,
     Step::Disposing,
     Step::Renamed,
+    Step::BeforeDirSync,
     Step::DirSynced,
 ];
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-const ORDER: [Step; 8] = [
+const ORDER: [Step; 9] = [
     Step::TempCreated,
     Step::TempWritten,
     Step::TempSynced,
@@ -649,6 +650,7 @@ const ORDER: [Step; 8] = [
     Step::Chmodded,
     Step::EtagRechecked,
     Step::Renamed,
+    Step::BeforeDirSync,
     Step::DirSynced,
 ];
 

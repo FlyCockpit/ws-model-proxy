@@ -1100,10 +1100,9 @@ thread_local! {
     static LOG: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Routes the process-wide test subscriber's output to the CALLING thread's buffer, so
-/// parallel tests never see each other's lines (a scoped `with_default` subscriber
-/// is unreliable here: other threads hit these callsites first with none installed,
-/// and tracing caches that "disabled" interest).
+/// Routes the scoped capture subscriber to the calling thread's buffer. The shared
+/// logging helper keeps an INFO-enabled global subscriber installed, so parallel
+/// calls cannot cache disabled interest before this scoped subscriber is entered.
 struct ThreadLog;
 impl std::io::Write for ThreadLog {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -1125,14 +1124,12 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLog {
 /// the cleanup failed) and on the uncertain-outcome path.
 #[test]
 fn compensation_retention_is_logged_with_the_recovery_paths() {
-    static INSTALL: std::sync::Once = std::sync::Once::new();
-    INSTALL.call_once(|| {
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(ThreadLog)
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::set_global_default(subscriber).expect("no other test installs one");
-    });
+    let _capture = crate::logging::test_capture_lock();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(ThreadLog)
+        .with_ansi(false)
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
     for op in OPS {
         for retained_by_error in [false, true] {
             let fx = Fx::new();
@@ -1497,4 +1494,239 @@ fn compensation_exchange_error_never_restores_an_unproven_slot_to_the_source() {
         "nothing moved to the source name"
     );
     assert_eq!(fx.get("dst.txt"), "original");
+}
+
+#[test]
+fn supervised_recovery_shares_private_staging_compensation_and_person_log() {
+    let _capture = crate::logging::test_capture_lock();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(ThreadLog)
+        .with_ansi(false)
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    for op in [Op::Replace, Op::Write, Op::Rename] {
+        for state in ["clean", "cleanup", "uncertain"] {
+            let fx = Fx::new();
+            let etag = op.prepare(&fx);
+            let destination = fx.root.join(op.destination());
+            let root = fx.root.clone();
+            let cancel = fx.cancel.clone();
+            let fx =
+                fx.with_hook(move |step| {
+                    if step == Step::TempCreated {
+                        assert!(private_temp(&root).is_file());
+                        assert!(public_stages(&root).is_empty());
+                    }
+                    if step == Step::Exchanged {
+                        // A late cancellation cannot change the committed outcome.
+                        cancel.cancel();
+                        if state == "uncertain" {
+                            let displaced = recovery_dirs(&root).pop().unwrap().join(
+                                if matches!(op, Op::Rename) {
+                                    "slot-1"
+                                } else {
+                                    "tmp"
+                                },
+                            );
+                            std::fs::rename(&displaced, root.join("prior-destination")).unwrap();
+                            std::fs::write(&displaced, "unchecked displaced writer").unwrap();
+                            successor(&destination, "newest external writer");
+                        }
+                    }
+                    Ok(())
+                });
+            let (name, args, body) = match op {
+                Op::Replace => (
+                    "edit",
+                    json!({"path":fx.p("doc.txt"), "expectedEtag":etag,
+                    "edits":[{"oldText":"original", "newText":"edited"}]}),
+                    None,
+                ),
+                Op::Write => (
+                    "write",
+                    json!({"path":fx.p("doc.txt"), "expectedEtag":etag,
+                    "ifExists":"replace"}),
+                    Some(b"edited".to_vec()),
+                ),
+                Op::Rename => (
+                    "rename",
+                    json!({"from":fx.p("src.txt"), "to":fx.p("dst.txt"),
+                    "overwrite":true, "expectedEtag":etag}),
+                    None,
+                ),
+            };
+            let prepared = fx
+                .ops
+                .prepare_supervised(
+                    name,
+                    args,
+                    body,
+                    &crate::file_ops::EtagKey::from_bytes([19; 32]),
+                    &fx.cancel,
+                )
+                .unwrap();
+            assert_eq!(prepared.child_input().blocked, None, "{op:?}: {state}");
+            LOG.with(|log| log.borrow_mut().clear());
+            let faults = match state {
+                "cleanup" => vec![(Primitive::Unlink, 1, Errno::EIO)],
+                "uncertain" => vec![(
+                    Primitive::Capture,
+                    if matches!(op, Op::Rename) { 2 } else { 1 },
+                    Errno::EIO,
+                )],
+                _ => vec![],
+            };
+            let _scope = FaultScope::new(&faults);
+            let result = fx.ops.execute_supervised(prepared, &fx.cancel);
+            let kept = if state == "uncertain" {
+                let error = result.unwrap_err();
+                let kept = uncertain(&error);
+                let wire = serde_json::to_value(crate::protocol::SupervisedFileOutcome::error(
+                    error.code.into(),
+                ))
+                .unwrap();
+                assert_eq!(wire, json!({"fileError":{"code":"uncertain_outcome"}}));
+                assert_eq!(fx.get(op.destination()), "newest external writer");
+                assert_eq!(fx.get("prior-destination"), "original");
+                kept
+            } else {
+                let result = result.unwrap();
+                let kept = result.get("recovered").map(paths).unwrap_or_default();
+                assert_eq!(kept.is_empty(), state == "clean");
+                let wire = serde_json::to_value(crate::protocol::SupervisedFileOutcome::result(
+                    name.to_owned(),
+                    result,
+                ))
+                .unwrap();
+                assert!(wire["fileResult"]["result"].get("recovered").is_none());
+                assert_eq!(
+                    fx.get(op.destination()),
+                    if matches!(op, Op::Rename) {
+                        "mine"
+                    } else {
+                        "edited"
+                    }
+                );
+                kept
+            };
+            let log = LOG.with(|log| String::from_utf8(log.borrow().clone()).unwrap());
+            assert_eq!(
+                log.contains("file recovery retained"),
+                state != "clean",
+                "{log}"
+            );
+            for path in kept {
+                assert!(
+                    log.contains(path.to_str().unwrap()),
+                    "person must receive {path:?}: {log}"
+                );
+            }
+            for content in ["original", "edited", "mine", "newest external writer"] {
+                assert!(!log.contains(content), "log contains file content: {log}");
+            }
+        }
+    }
+}
+
+#[test]
+fn supervised_delete_capture_preserves_successors_and_logs_recovery_only_to_person() {
+    let _capture = crate::logging::test_capture_lock();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(ThreadLog)
+        .with_ansi(false)
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    for state in ["clean", "cleanup", "successor", "swapped", "cancel"] {
+        let fx = Fx::new();
+        fx.put("doc.txt", "original");
+        let path = fx.root.join("doc.txt");
+        let cancel = fx.cancel.clone();
+        let fx = fx.with_hook(move |step| {
+            if step == Step::Vacating {
+                if state == "cancel" {
+                    cancel.cancel();
+                }
+                if state == "swapped" {
+                    successor(&path, "newest external writer");
+                }
+            }
+            if step == Step::Vacated {
+                cancel.cancel(); // capture already committed: must finish safely
+                if state == "successor" {
+                    std::fs::write(&path, "newest external writer").unwrap();
+                }
+            }
+            Ok(())
+        });
+        let prepared = fx
+            .ops
+            .prepare_supervised(
+                "delete",
+                json!({"path":fx.p("doc.txt"),"expectedEtag":fx.etag("doc.txt")}),
+                None,
+                &crate::file_ops::EtagKey::from_bytes([19; 32]),
+                &fx.cancel,
+            )
+            .unwrap();
+        assert!(prepared.child_input().blocked.is_none());
+        LOG.with(|log| log.borrow_mut().clear());
+        let faults = if state == "cleanup" {
+            vec![(Primitive::Unlink, 1, Errno::EIO)]
+        } else {
+            vec![]
+        };
+        let _scope = FaultScope::new(&faults);
+        let result = fx.ops.execute_supervised(prepared, &fx.cancel);
+        if matches!(state, "cancel" | "swapped") {
+            assert_eq!(
+                result.unwrap_err().code,
+                if state == "cancel" {
+                    ErrorCode::Cancelled
+                } else {
+                    ErrorCode::Conflict
+                }
+            );
+            assert_eq!(
+                fx.get("doc.txt"),
+                if state == "cancel" {
+                    "original"
+                } else {
+                    "newest external writer"
+                }
+            );
+            assert!(!FaultScope::calls().contains(&Primitive::Unlink));
+            assert!(recovery_dirs(&fx.root).is_empty());
+            continue;
+        }
+        let result = result.unwrap();
+        assert_eq!(result["deleted"], true);
+        assert_eq!(result["type"], "file");
+        if state == "successor" {
+            assert_eq!(fx.get("doc.txt"), "newest external writer");
+        } else {
+            assert!(!fx.root.join("doc.txt").exists());
+        }
+        let kept = result.get("recovered").map(paths).unwrap_or_default();
+        assert_eq!(kept.is_empty(), state != "cleanup");
+        let log = LOG.with(|log| String::from_utf8(log.borrow().clone()).unwrap());
+        assert_eq!(
+            log.contains("file recovery retained"),
+            state == "cleanup",
+            "{log}"
+        );
+        for path in kept {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+            assert!(log.contains(path.to_str().unwrap()), "{log}");
+        }
+        assert!(!log.contains("newest external writer"));
+        let wire = serde_json::to_value(crate::protocol::SupervisedFileOutcome::result(
+            "delete".to_owned(),
+            result,
+        ))
+        .unwrap();
+        assert_eq!(
+            wire,
+            json!({"fileResult":{"op":"delete","result":{"deleted":true,"type":"file"}}})
+        );
+    }
 }

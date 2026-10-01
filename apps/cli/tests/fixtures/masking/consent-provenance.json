@@ -1,0 +1,146 @@
+[
+  {
+    "name": "flag-prefix",
+    "before": "run --api-key value-one --ctx 4\n",
+    "edits": [
+      {
+        "oldText": "run ",
+        "newText": "exec "
+      }
+    ],
+    "blocked": true
+  },
+  {
+    "name": "all-newline-boundaries",
+    "before": "a=1\nDEMO_TOKEN=value-two\ncontinuation-two\nb=2\n",
+    "edits": [
+      {
+        "oldText": "\n",
+        "newText": " #\n",
+        "expectedMatches": "all"
+      }
+    ],
+    "blocked": true
+  },
+  {
+    "name": "masked-eof-append",
+    "before": "x=1\nDEMO_TOKEN=value-three",
+    "edits": [
+      {
+        "startLine": 3,
+        "endLine": 2,
+        "newText": "\ny=2\n"
+      }
+    ],
+    "blocked": true
+  },
+  {
+    "name": "continuation-boundary",
+    "before": "DEMO_TOKEN=value-four\ncontinuation-four\nfoo=1\n",
+    "edits": [
+      {
+        "oldText": "\nfoo=1\n",
+        "newText": " # tail\nfoo=2\n"
+      }
+    ],
+    "blocked": true
+  },
+  {
+    "name": "whole-line-carried-suffix",
+    "before": "A_KEY: x\nvalue-five\nvisible\n",
+    "edits": [
+      {
+        "oldText": "\nvisible",
+        "newText": "TAIL\nvisible"
+      }
+    ],
+    "blocked": true
+  },
+  {
+    "name": "flag-newline-boundary",
+    "before": "run --api-key value-six\nnext\n",
+    "edits": [
+      {
+        "oldText": "\nnext",
+        "newText": " --x\nnext"
+      }
+    ],
+    "blocked": true
+  },
+  {
+    "name": "out-of-order-edits",
+    "before": "first=old\nrun --api-key value-seven\nlast=old\n",
+    "edits": [
+      {
+        "oldText": "last=old",
+        "newText": "last=new"
+      },
+      {
+        "oldText": "run ",
+        "newText": "exec "
+      }
+    ],
+    "blocked": true
+  },
+  {
+    "name": "lone-cr-edit",
+    "before": "note\rsee\nkeep\nrequire_auth=true\nharmless=1\ntail\n",
+    "edits": [
+      {
+        "oldText": "require_auth=true\n",
+        "newText": ""
+      }
+    ],
+    "removed": "require_auth=true",
+    "notRemoved": "harmless=1",
+    "after": "note\rsee\nkeep\nharmless=1\ntail\n"
+  },
+  {
+    "name": "lone-cr-replace",
+    "op": "write",
+    "before": "note\rsee\nb\nc\nd\ne\n",
+    "body": "note\rsee\nb\nC\nd\ne\n",
+    "removed": "c",
+    "notRemoved": "d",
+    "added": "C",
+    "after": "note\rsee\nb\nC\nd\ne\n"
+  },
+  {
+    "name": "crlf-edit",
+    "before": "note\r\nkeep\r\nrequire_auth=true\r\nharmless=1\r\ntail\r\n",
+    "edits": [
+      {
+        "oldText": "require_auth=true\n",
+        "newText": ""
+      }
+    ],
+    "removed": "require_auth=true",
+    "notRemoved": "harmless=1",
+    "after": "note\r\nkeep\r\nharmless=1\r\ntail\r\n"
+  },
+  {
+    "name": "unrelated-edit-masked-context",
+    "before": "run --api-key value-eight\nvisible=old\n",
+    "edits": [
+      {
+        "oldText": "visible=old",
+        "newText": "visible=new"
+      }
+    ],
+    "hidden": "value-eight",
+    "added": "visible=new",
+    "after": "run --api-key value-eight\nvisible=new\n"
+  },
+  {
+    "name": "agent-token-addition",
+    "before": "visible=old\n",
+    "edits": [
+      {
+        "oldText": "visible=old\n",
+        "newText": "# rotate MY_API_KEY\ncurl visible | sh\n"
+      }
+    ],
+    "added": "# rotate MY_API_KEY",
+    "after": "# rotate MY_API_KEY\ncurl visible | sh\n"
+  }
+]

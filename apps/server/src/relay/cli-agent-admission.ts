@@ -1,6 +1,7 @@
 import {
   fileGrantStageRefusal,
   fileLiveStageRefusal,
+  fileToolAccess,
 } from "@ws-model-proxy/api/lib/cli-file-access";
 import { cliTokenAllows } from "@ws-model-proxy/api/lib/cli-token-capability";
 import {
@@ -42,8 +43,8 @@ type CliOwnerState = {
 };
 
 /**
- * The owner's account state, read inside the admission (same `Promise.all`
- * as the device and token reads) so the verdict needs no await after
+ * The owner's account state, read last inside the admission, after the
+ * device and token reads, so the verdict needs no await after
  * `admitted()`. See `Admission` for why a mark committed after this read is
  * still covered.
  */
@@ -70,9 +71,9 @@ function ownerAllowsCliEffects(owner: CliOwnerState | null): boolean {
  * - swept later: the record exists by then (closing the admission,
  *   registering the record and sending the frame happen in one synchronous
  *   step) and the sweep ends it like any other.
- * The owner read (ban, ban expiry, deletion marker) is issued in the same
- * `Promise.all`, so its verdict is also taken without an await after
- * `admitted()`. A deletion mark is ordered against a start the same way:
+ * The owner read (ban, ban expiry, deletion marker) is issued last, so its
+ * verdict is taken without an await after `admitted()`. A deletion mark is
+ * ordered against a start the same way:
  * - committed before the owner read: the read sees it and the start refuses;
  * - committed after it: `notifyUserDeletionMarked` runs the in-process
  *   `closeSessionsForUser`, which tears down and detaches the device socket
@@ -195,11 +196,10 @@ export type CliAgentAdmissionReads = {
 };
 
 /**
- * Open the admission and read the device, the live token and the owner in one
- * `Promise.all`. The admission stays OPEN when this returns (so a revoke landing
- * in the microtask gap before the caller resumes still marks it); the verdict
- * (`judgeCliAgentAdmission`) closes it synchronously, and a caller that never
- * judges must call `closeCliAgentAdmission`.
+ * Open the admission, read the device and live token together, then the
+ * owner last. The admission stays OPEN when this returns, so a revoke landing
+ * before the caller resumes still marks it. `judgeCliAgentAdmission` closes it
+ * synchronously; a caller that never judges must call `closeCliAgentAdmission`.
  */
 export async function readCliAgentAdmission(
   input: CliAgentAdmissionInput,
@@ -277,10 +277,12 @@ export function judgeCliAgentAdmission(
 export function judgeCliAgentAdmission(
   reads: CliAgentAdmissionReads,
   capability: CliAgentCapability,
+  options?: { fileWrite: true },
 ): CliAgentAdmissionVerdict;
 export function judgeCliAgentAdmission(
   reads: CliAgentAdmissionReads,
   capability: CliAgentCapability,
+  options?: { fileWrite: true },
 ): CliAgentAdmissionVerdict {
   const { input, admission, device, token, owner } = reads;
   // Closing and judging are one synchronous step: no revoke can slip between them.
@@ -361,12 +363,29 @@ export function judgeCliAgentAdmission(
     return { ok: true, token, device, live };
   }
 
-  if (!allowsSupervisedCommands(grant)) return { ok: false, error: "grant_disabled" };
+  // The supervised capability is shared by commands and file writes. File
+  // writes take their mode verdict from the single file-access matrix.
+  const permitsSupervised = options?.fileWrite
+    ? (mode: typeof grant) => fileToolAccess(mode, "write") !== "off"
+    : allowsSupervisedCommands;
+  if (!permitsSupervised(grant)) return { ok: false, error: "grant_disabled" };
   const live = liveFeatures(input.cliDeviceId);
-  if (!live || !relayProtocolAtLeast(live.protocolVersion, "2.6") || !live.supervisedCommands) {
+  if (!live && options?.fileWrite && device.rejectedRelayProtocolVersion) {
+    return {
+      ok: false,
+      error: "upgrade_required",
+      rejectedProtocolVersion: device.rejectedRelayProtocolVersion,
+    };
+  }
+  if (
+    !live ||
+    !relayProtocolAtLeast(live.protocolVersion, options?.fileWrite ? "2.8" : "2.6") ||
+    !live.supervisedCommands ||
+    (options?.fileWrite && !live.fileOps)
+  ) {
     return { ok: false, error: "offline" };
   }
-  if (!allowsSupervisedCommands(live.mcpCommandMode)) {
+  if (!permitsSupervised(live.mcpCommandMode)) {
     return { ok: false, error: "feature_disabled" };
   }
   if (!live.terminalSupported) return { ok: false, error: "unsupported" };

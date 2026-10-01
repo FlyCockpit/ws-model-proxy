@@ -175,6 +175,9 @@ pub(crate) fn read(ops: &FileOps, args: &ReadArgs, cancel: &Cancel) -> FileResul
             make_parents: None,
             policy: &ops.policy,
             access: Access::Read,
+            preview_missing: false,
+            pin: None,
+            cancel: None,
         },
     )?;
     let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Read)?;

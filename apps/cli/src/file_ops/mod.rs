@@ -15,6 +15,8 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -39,13 +41,18 @@ pub mod redact;
 pub(crate) mod resolve;
 pub mod search;
 pub mod stat;
+pub mod supervised;
 pub(crate) mod text;
 pub(crate) mod walk;
 pub mod write;
 
 pub use error::{ErrorCode, FileError, FileResult};
 pub use etag::EtagKey;
-pub use policy::Policy;
+pub use policy::{Policy, RootSnapshot};
+pub use supervised::{
+    AllowedPreview, PreparedSupervised, SupervisedChildInput, SupervisedPreview,
+    preview_supervised_child,
+};
 
 #[cfg(test)]
 mod tests;
@@ -83,12 +90,23 @@ impl Cancel {
 /// After capture, cancellation finishes or compensates; it cannot abandon a move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
+    SupervisedBeforePin,
+    SupervisedPinVerified,
+    SupervisedBeforeOpen,
+    SupervisedOpened,
+    SupervisedOpenedVerified,
+    PinBeforeOpen,
+    PinOpened,
+    BeforeIdentity,
+    IdentityChecked,
     TempCreated,
     TempWritten,
     TempSynced,
     Chowned,
     Chmodded,
     EtagRechecked,
+    SupervisedSnapshotRead,
+    SupervisedPreviewRead,
     Vacating,
     Vacated,
     Exchanged,
@@ -99,6 +117,7 @@ pub enum Step {
     Linked,
     Moved,
     Renamed,
+    BeforeDirSync,
     DirSynced,
 }
 
@@ -272,6 +291,8 @@ pub struct FileOps {
     pub(crate) limits: Limits,
     pub(crate) hook: Option<StepHook>,
     locks: PathLocks,
+    #[cfg(test)]
+    rename_atomic_capability: AtomicU8,
     namespace: Namespace,
 }
 
@@ -283,6 +304,8 @@ impl FileOps {
             limits: Limits::default(),
             hook: None,
             locks: PathLocks::default(),
+            #[cfg(test)]
+            rename_atomic_capability: AtomicU8::new(mutate::platform_rename_capability() as u8),
             namespace: Namespace::default(),
         }
     }
@@ -308,6 +331,21 @@ impl FileOps {
             Some(hook) => hook(step),
             None => Ok(()),
         }
+    }
+
+    pub(crate) fn rename_atomic_capability(&self) -> mutate::RenameAtomicCapability {
+        #[cfg(test)]
+        return mutate::RenameAtomicCapability::from_u8(
+            self.rename_atomic_capability.load(Ordering::Relaxed),
+        );
+        #[cfg(not(test))]
+        mutate::platform_rename_capability()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_rename_atomic_capability(&self, capability: mutate::RenameAtomicCapability) {
+        self.rename_atomic_capability
+            .store(capability as u8, Ordering::Relaxed);
     }
 
     /// Shared namespace guard for a file mutation (see [`Namespace`]).

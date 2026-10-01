@@ -376,7 +376,8 @@ export async function runManifestTool(
   //    copy `Error.message` verbatim into tool output.
   const deliverDespiteAbort = descriptor.deliverDespiteAbort === true;
   try {
-    if (!deliverDespiteAbort && signal?.aborted) throw new McpToolAbortedError();
+    if ((!deliverDespiteAbort || descriptor.deliverDespiteAbortWhen) && signal?.aborted)
+      throw new McpToolAbortedError();
     const adaptedInput = descriptor.inputAdapter
       ? descriptor.inputAdapter(stripConfirmation(argsRecord))
       : stripConfirmation(argsRecord);
@@ -391,22 +392,35 @@ export async function runManifestTool(
     // single operation may still complete — atomic semantics). Normal HTTP
     // traffic runs outside the fence context and is unaffected.
     //
-    // deliverDespiteAbort (CLI command run) does not race: the signal is
-    // passed into the wait, an abort ends that wait, and the result — which
-    // always carries commandId — is still delivered.
+    // Commands preserve their id on abort. File writes race normally until
+    // the synchronous supervised registration claims id delivery; headless
+    // calls and admission reads retain their prompt abort semantics.
     let output: unknown;
     const invokeCore = descriptor.invokeCore;
     const invokeProcedure = descriptor.invokeProcedure;
     if (invokeCore !== undefined) {
+      let claimed = false;
+      const selectiveDelivery = descriptor.deliverDespiteAbortWhen !== undefined;
       const invoke = () =>
         runWithDbAbortFence(signal, () =>
           invokeCore(adaptedInput, {
             userId: dispatch.orpcContext.session.user.id,
             signal,
             credential,
+            ...(selectiveDelivery
+              ? {
+                  claimDeliverDespiteAbort: () => {
+                    claimed = true;
+                  },
+                }
+              : {}),
           }),
         );
-      output = deliverDespiteAbort ? await invoke() : await raceAbort(invoke(), signal);
+      output = selectiveDelivery
+        ? await raceAbort(invoke(), signal, () => claimed)
+        : deliverDespiteAbort
+          ? await invoke()
+          : await raceAbort(invoke(), signal);
     } else if (invokeProcedure !== undefined && client !== undefined) {
       output = await raceAbort(
         runWithDbAbortFence(signal, () => invokeProcedure(client, adaptedInput)),
@@ -420,16 +434,18 @@ export async function runManifestTool(
       });
       return internalToolError(requestId);
     }
-    // Post-await fence (G1): never START the output pipeline after abort.
-    // Skipped for deliverDespiteAbort — the abort is what ended the wait.
-    if (!deliverDespiteAbort && signal?.aborted) throw new McpToolAbortedError();
+    // Supervised file starts must deliver their id. Headless file results
+    // retain the abort fence, even though the core was awaited to learn its kind.
+    const deliverOutputDespiteAbort =
+      deliverDespiteAbort && (descriptor.deliverDespiteAbortWhen?.(output) ?? true);
+    if (!deliverOutputDespiteAbort && signal?.aborted) throw new McpToolAbortedError();
 
     // Project → redact → serialize → cap (G5: the FINAL serialized result —
     // text + structuredContent combined — is what must stay within the
     // advertised cap; the payload pre-check below is only the fast fail for
     // grossly oversized payloads).
     const projected = descriptor.outputProjector ? descriptor.outputProjector(output) : output;
-    if (!deliverDespiteAbort && signal?.aborted) throw new McpToolAbortedError();
+    if (!deliverOutputDespiteAbort && signal?.aborted) throw new McpToolAbortedError();
     const safe = toJsonSafe(redactSecrets(projected));
     const serialized = serializeBounded(safe);
     if (serialized === null) {
@@ -455,7 +471,10 @@ export async function runManifestTool(
     }
     return result;
   } catch (error) {
-    if (error instanceof McpToolAbortedError) {
+    if (
+      error instanceof McpToolAbortedError ||
+      (descriptor.deliverDespiteAbortWhen !== undefined && signal?.aborted)
+    ) {
       mcpSanitizedLog("tool call aborted", { toolName: descriptor.name, requestId });
       return toolError("Request cancelled.", { error: { code: "REQUEST_ABORTED" } });
     }
@@ -514,14 +533,20 @@ class McpToolAbortedError extends Error {
  * the diagnostic cores. A no-op catch keeps a losing-but-rejecting
  * continuation from surfacing as an unhandled rejection.
  */
-async function raceAbort<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+async function raceAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+  preserve: () => boolean = () => false,
+): Promise<T> {
   if (signal === undefined) return promise;
-  if (signal.aborted) throw new McpToolAbortedError();
   void promise.catch(() => undefined);
+  if (signal.aborted && !preserve()) throw new McpToolAbortedError();
   return await Promise.race([
     promise,
     new Promise<never>((_, reject) => {
-      const rejectAborted = () => reject(new McpToolAbortedError());
+      const rejectAborted = () => {
+        if (!preserve()) reject(new McpToolAbortedError());
+      };
       if (signal.aborted) {
         rejectAborted();
         return;

@@ -1934,3 +1934,122 @@ fn exchangeless_exclusive_create_error_closes_file_before_cleanup() {
     assert!(!fx.root.join("created").exists());
     clean(&fx);
 }
+
+#[test]
+fn supervised_exchangeless_replace_uses_safe_publication_and_cancel_boundary() {
+    for op in ["edit", "write"] {
+        for method in [
+            Some(PublishMethod::NoReplace),
+            Some(PublishMethod::Link),
+            None,
+        ] {
+            for state in ["clean", "racer", "cancel"] {
+                let fx = Fx::new();
+                let etag = prepare(&fx);
+                let path = fx.root.join("doc");
+                let cancel = fx.cancel.clone();
+                let fx = fx.with_hook(move |step| {
+                    if step == Step::Vacating && state == "cancel" {
+                        cancel.cancel();
+                    }
+                    if step == Step::Vacated {
+                        // Cancellation after capture cannot abandon compensation.
+                        cancel.cancel();
+                        if state == "racer" {
+                            std::fs::write(&path, RACER).unwrap();
+                        }
+                    }
+                    Ok(())
+                });
+                let args = if op == "edit" {
+                    json!({"path":fx.p("doc"),"expectedEtag":etag,
+                        "edits":[{"oldText":ORIGINAL,"newText":EDITED}]})
+                } else {
+                    json!({"path":fx.p("doc"),"expectedEtag":etag,"ifExists":"replace"})
+                };
+                let prepared = fx
+                    .ops
+                    .prepare_supervised(
+                        op,
+                        args,
+                        (op == "write").then(|| EDITED.as_bytes().to_vec()),
+                        &crate::file_ops::EtagKey::from_bytes([19; 32]),
+                        &fx.cancel,
+                    )
+                    .unwrap();
+                assert!(prepared.child_input().blocked.is_none());
+                let before = snapshot(&fx.root);
+                let mut faults = method.unwrap_or(PublishMethod::Link).faults();
+                if method.is_none() {
+                    faults.push((Primitive::ProbeLink, 1, Errno::EPERM));
+                }
+                let _scope = FaultScope::new(&faults);
+                let result = fx.ops.execute_supervised(prepared, &fx.cancel);
+                if method.is_none() {
+                    assert_eq!(result.unwrap_err().code, ErrorCode::UnsafeFilesystem);
+                    assert_eq!(snapshot(&fx.root), before);
+                    assert!(!fx.steps.lock().unwrap().contains(&Step::Vacated));
+                    assert_eq!(count(&FaultScope::calls(), Primitive::Capture), 0);
+                } else if state == "cancel" {
+                    assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled);
+                    assert_eq!(snapshot(&fx.root), before);
+                    assert_eq!(count(&FaultScope::calls(), Primitive::Capture), 0);
+                } else if state == "racer" {
+                    let error = result.unwrap_err();
+                    assert!(has_bytes(&kept(&error), ORIGINAL));
+                    assert_eq!(fx.get("doc"), RACER);
+                    let wire = serde_json::to_value(crate::protocol::SupervisedFileOutcome::error(
+                        error.code.into(),
+                    ))
+                    .unwrap();
+                    assert_eq!(wire, json!({"fileError":{"code":"uncertain_outcome"}}));
+                } else {
+                    assert!(result.unwrap().get("recovered").is_none());
+                    assert_eq!(fx.get("doc"), EDITED);
+                    assert_eq!(count(&FaultScope::calls(), Primitive::Capture), 1);
+                    clean(&fx);
+                }
+            }
+        }
+    }
+    for overwrite in [false, true] {
+        let fx = Fx::new();
+        fx.put("source", ORIGINAL);
+        let etag = if overwrite {
+            fx.put("destination", RACER);
+            Some(fx.etag("destination"))
+        } else {
+            None
+        };
+        let prepared = fx
+            .ops
+            .prepare_supervised(
+                "rename",
+                json!({"from":fx.p("source"),"to":fx.p("destination"),
+                "overwrite":overwrite,"expectedEtag":etag}),
+                None,
+                &crate::file_ops::EtagKey::from_bytes([19; 32]),
+                &fx.cancel,
+            )
+            .unwrap();
+        assert!(prepared.child_input().blocked.is_none());
+        let before = snapshot(&fx.root);
+        let faults = if overwrite {
+            vec![(Primitive::Exchange, 1, Errno::EINVAL)]
+        } else {
+            vec![
+                (Primitive::Move, 1, Errno::EINVAL),
+                (Primitive::MoveLink, 1, Errno::EPERM),
+            ]
+        };
+        let _scope = FaultScope::new(&faults);
+        assert_eq!(
+            fx.ops
+                .execute_supervised(prepared, &fx.cancel)
+                .unwrap_err()
+                .code,
+            ErrorCode::UnsafeFilesystem
+        );
+        assert_eq!(snapshot(&fx.root), before);
+    }
+}

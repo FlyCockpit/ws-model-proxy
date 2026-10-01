@@ -11,6 +11,7 @@ import {
   presentCliCommand,
   presentSupervisedCommand,
 } from "./cli-command-output.js";
+import { FILE_ERROR_MESSAGES, projectFileToolOutput } from "./cli-file-tools.js";
 import type { McpRequestCredential } from "./cli-tool-access.js";
 
 type CliCommandDeps = {
@@ -21,6 +22,21 @@ type CliCommandDeps = {
 
 // All command-tool descriptions share the CLI's masking and server scrubbing notice.
 export { CLI_COMMAND_OUTPUT_NOTICE } from "@ws-model-proxy/config/cli-command-output";
+
+// A supervised agent has no read grant and receives no recovery paths: those go
+// to the person's daemon log (headless results carry them instead).
+const SUPERVISED_UNCERTAIN_OUTCOME_MESSAGE =
+  "The file outcome is uncertain; ask the person to check the wsmp daemon log for recovery locations";
+
+// Supervised results differ from headless wording: a supervised request that
+// failed after the person approved it reports outcome unknown, and supervised
+// `limit` errors carry no retryAfterMs.
+const SUPERVISED_MESSAGE_OVERRIDES: Partial<Record<string, string>> = {
+  uncertain_outcome: SUPERVISED_UNCERTAIN_OUTCOME_MESSAGE,
+  unsafe_filesystem:
+    "This filesystem lacks the atomic primitives to change this path without risking a concurrent save; ask the person to check the file",
+  limit: "Too many file operations; wait for an active request to finish or retry later",
+};
 
 /**
  * Three switches gate a CLI command (docs/cli-command-switches.md): 1 the
@@ -50,7 +66,7 @@ const CLI_REJECTION_MESSAGES = {
 
 /** Shown on `forwarder_cli_activity_list`: what the audit log holds. */
 export const CLI_AGENT_ACTIVITY_NOTICE =
-  "Lists what agents did on the caller's CLI devices (commands, supervised commands and file operations) newest first, as metadata only: kind, outcome, path (for commands a keyed HMAC-SHA256 of the command text plus the program name, never the command text itself), sizes and timestamps. File content, diffs and command output are never stored. Rows are kept for 90 days. Optional cliDeviceId, limit (1-100) and cursor (the previous nextCursor).";
+  "Lists what agents did on the caller's CLI devices (commands, supervised commands and file operations) newest first, as metadata only: kind, outcome, path (for commands a keyed HMAC-SHA256 of the command text plus the program name, never the command text itself), sizes and timestamps. Supervised file audit reasons use <op>:<code> (for example write:completed or edit:conflict); headless file reasons use <code>. File content, diffs and command output are never stored. Rows are kept for 90 days. Optional cliDeviceId, limit (1-100) and cursor (the previous nextCursor).";
 
 /** Shown on the supervised tool: what the agent can and cannot learn. */
 export const CLI_SUPERVISED_COMMAND_NOTICE =
@@ -246,7 +262,33 @@ export async function runForwarderCliCommandResult(
   const pat = requireCliPat(deps.credential);
   const adapted = adaptCliCommandResultInput(input);
   const supervised = snapshotSupervisedCommand(adapted.commandId, deps.userId, pat.tokenId);
-  if (supervised !== null) return presentSupervisedCommand(supervised);
+  if (supervised !== null) {
+    if (supervised.requestKind === "file") {
+      return {
+        commandId: supervised.commandId,
+        kind: "supervised",
+        status: supervised.status,
+        started: supervised.started,
+        ...(supervised.waitDeadline !== null
+          ? { waitingUntil: new Date(supervised.waitDeadline).toISOString() }
+          : {}),
+        ...(supervised.file
+          ? { file: { op: supervised.file.op, result: projectFileToolOutput(supervised.file) } }
+          : {}),
+        ...(supervised.fileError
+          ? {
+              error: {
+                ...supervised.fileError,
+                message:
+                  SUPERVISED_MESSAGE_OVERRIDES[supervised.fileError.code] ??
+                  FILE_ERROR_MESSAGES[supervised.fileError.code],
+              },
+            }
+          : {}),
+      };
+    }
+    return presentSupervisedCommand(supervised);
+  }
   const raw = await snapshotCliCommand(adapted.commandId, deps.userId, pat.tokenId);
   if (raw == null) throw new McpCliCommandRejectedError("not_found");
   const parsed = parseCliCommandSnapshot(raw, adapted.commandId);

@@ -113,7 +113,8 @@ Nine PAT-only tools read and change files on a CLI device (a node): `forwarder_c
 All take `cliDeviceId`. The CLI runs the operations itself, fd-based and symlink-safe;
 it does not compose shell commands. Every result that touches a file carries an
 `etag`, results are bounded windows, and write-class calls take an optional `reason`
-(500 characters) that goes to the CLI log.
+(500 characters) that goes to the CLI log and is shown on the CLI confirm screen
+on a supervised node.
 
 **Who may call.** The four read tools accept a personal access token with either
 `allowCliCommands` + literal `mcp:write`, or `allowCliFileRead` + `mcp:read`.
@@ -136,17 +137,85 @@ device do not affect these admissions or require an extra hello policy read.
 | Effective mode | Read grant | read, stat, list, search | edit, write, rename, mkdir, delete |
 | --- | --- | --- | --- |
 | `unsupervised` | either | headless | headless |
-| `supervised` | on | headless | refused `supervised_only` |
-| `supervised` | off | refused `supervised_only` | refused `supervised_only` |
+| `supervised` | on | headless | CLI keypress required |
+| `supervised` | off | refused `supervised_only` | CLI keypress required |
 | `off` | on | headless | refused `grant_disabled` / `feature_disabled` |
 | `off` | off | refused `grant_disabled` / `feature_disabled` | refused (same) |
+
+Supervised writes return `{commandId, kind:"supervised", status:"awaiting_user", waitingUntil, next}`.
+A person opens the pending request in the dashboard Terminals screen and presses Enter
+on the CLI-drawn screen to apply it, or `q` to decline. Pending list and browser Decline
+use the same mechanism as supervised commands. `confirm: "RUN"` / `"DELETE"` expresses
+the agent's intent; it does not replace the person's keypress. The screen shows the
+operation, resolved physical path, optional reason, and a unified diff with one context
+line computed independently from the real file on disk; the server cannot supply
+or forge it. Disk-derived removed/context lines are masked. Every after-side byte
+is tracked as requester-authored or carried from disk. If an added line carries
+any masked disk byte (including a whole-line or continuation mask), the request is
+blocked with `redacted_span` after the person dismisses the cannot-apply screen.
+Pure requester-authored additions stay verbatim, with controls/invisible characters
+escaped. Diff and mask lines split only on LF: a lone CR is escaped content; CRLF
+stays one line ending. Unmappable line counts block with `redacted_span`. A diff
+whose complete escaped display exceeds 8 KiB is blocked with `too_large` after the
+person dismisses the cannot-apply screen; no hidden hunk can be approved. Details
+show byte counts, mode in octal (explicit, effective default, or all preserved permission bits), `ifExists`, parent
+creation and rename overwrite where applicable. Secret-class paths remain read-only and are
+refused `secret_file`. Path policy is checked before display and again at apply, and
+the daemon rechecks the etag: a file changed between display and approval returns
+`conflict` and nothing is written for that mismatch. Since this apply-time error
+arrives after acceptance with only a code, the server still reports an unknown outcome.
+Supervised `edit.dryRun:true` returns `invalid_input`. On macOS, supervised rename
+of a directory without replacement is refused `unsupported` (overwrite uses atomic
+exchange). On platforms with neither Linux renameat2 nor macOS exchange, overwrite
+is refused `unsupported` too: no unsafe rename fallback is used. Regular-file no-replace
+moves remain available when the filesystem supports hard links.
+Supervised approval implies no read grant.
+
+Poll `forwarder_cli_command_result` with the returned id. It reports the shared
+supervised statuses, plus `file:{op,result}` on success or `error:{code,message,outcome?}`.
+Edit/write results omit `diff` and `hunks`; file errors have no path, current etag or
+other detail. State-dependent refusals (including `not_found`, `exists`, `conflict`,
+`hard_linked` and `owner_mismatch`) appear on a cannot-apply screen and reach the
+agent only after a person dismisses it. This includes outside-root paths, escaping
+symlinks and unavailable roots (`path_denied`), and disk-derived normalized arguments
+above the 128 KiB child-input cap (`too_large`). The cap on the original request is
+checked before disk access; an oversized normalized input uses a minimal blocked
+input with the original paths. The child uses the daemon’s strict startup root
+snapshot, including deny-all for unusable configured roots. Roots are judged on
+resolved physical paths before display and again at apply; aliases resolving inside
+a root are allowed. Apply-time policy stays authoritative.
+Path-string/input refusals may arrive before display: `invalid_input`, `secret_file`,
+protected/staging names (`path_denied`), special-tree text (`special_file`), declared
+input/body size, `limit` and `disabled`. Root confinement is never a pre-display
+text refusal. Decline returns code `declined`, definitively applying nothing.
+
+Confirm waits expire after 15 minutes, using the same stop grace as commands.
+After `supervised.accepted`, apply has a 30-second deadline; on expiry the server
+sends unconditional `supervised.cancel` and reports `timeout` with `outcome:"unknown"`.
+Session loss reports `offline`. Once `term.spawn` was dispatched, server termination
+without authoritative CLI settlement carries `outcome:"unknown"`. It reports
+`started:true` if the server received acceptance, otherwise `started:null`: acceptance
+and apply may be in flight.
+This includes confirm expiry/stop grace, token revoke/expiry, and grant changes.
+The audit records unknown exactly once; late frames cannot change a finished result.
+Every non-success after acceptance has `outcome:"unknown"`, including CLI
+`conflict`, `not_found`, `io_error`, `cancelled` and `timeout`, token inactivity and
+mode changes. The CLI sends only the error code, so the server cannot distinguish
+an apply-time pinned-etag mismatch before commit from an ambiguous failure after
+commit. Undispatched admission/spawn-send failures, CLI decline/rejection and a
+blocked-screen `done{fileError}` before acceptance are definitively not applied.
+The daemon honors cancellation only before the atomic commit point. Ask the person to inspect the file
+before retrying an unknown result; use file_stat only if a read grant permits it.
+The earliest expiry carried by the token row or the admitted credential ends a
+supervised file request immediately, with `token_inactive`; after acceptance its
+outcome is unknown. Results arriving at or after that expiry are not delivered.
 
 Enable `wsmp config set-file-read on` and choose explicit directories with
 `wsmp config set-file-roots <path>…`, restart wsmp, then grant “Agents may read
 files (read-only)” on the dashboard. Suggested roots `~/models`, `~/deploy`,
 `~/.config/llama-swap`, `~/.local/state/wsmp/logs` are help text only and never
 applied automatically. Roots must be absolute existing directories after `~`
-expansion, UTF-8, distinct, and other than `/`. `clear-file-roots` clears them.
+expansion, UTF-8, distinct, other than `/`, at most 32, and at most 64 KiB serialized in total (escapes count as their serialized form); a larger set is refused when saved or loaded. `clear-file-roots` clears them.
 Restart applies both switches. A broken root reports roots unavailable and
 retains a denying confinement policy, with no whole-filesystem fallback.
 When roots are set, every operation, including rename destinations and list/search,
@@ -158,7 +227,7 @@ Without roots, unsupervised retains whole-filesystem access minus the protected 
 
 `listCliDevices` reports `fileTools: {read, write}` (`headless`, `supervised`, `off`),
 `mcpFileRead`, `reportedMcpFileRead`, `reportedFileRoots`, and `allowFileToolsAsRoot`.
-A supervised write confirm screen remains a later phase. For a supervised read
+`supervised` writes need a person's keypress. For a supervised read
 without the grant, request `cat` via a supervised command or enable the grant.
 The CLI independently checks local mode, read switch, roots and UID at every op;
 a server request never overrides local consent. Root refuses `unsupported` unless
@@ -185,12 +254,20 @@ additionally removes `wsmp_` credential substrings from every returned string.
 
 **ETag workflow.** Read a file, then pass its `etag` as `expectedEtag` to `edit`, to `write`
 with `ifExists: "replace"`, to `rename` with `overwrite`, and to `delete`. Line-range edits
-and replaces require it. A stale etag returns `error.code` `conflict` with `currentEtag`
-(an etag, or the word `gone` when the file was removed): re-read and retry. `read` with `ifNoneMatch` answers `{unchanged: true, etag}`. Etags reset
-when the wsmp daemon restarts, which costs one extra `conflict`. A write-class call that
-fails with `error.outcome: "unknown"` (any code: `timeout`, `offline`, `cancelled`,
-`token_inactive`, a mode change, `io_error`, `uncertain_outcome`, `not_found` on rename and delete, or `conflict` when the file was swapped during the change): call
-`forwarder_cli_file_stat` with `hash: true` and compare the etag before retrying. A retry
+and replaces require it. A headless stale-etag failure returns `error.code` `conflict`
+with `currentEtag` (an etag, or the word `gone` when the file was removed): re-read
+and retry. Supervised failures report only the code after the person's keypress.
+`read` with `ifNoneMatch` answers `{unchanged: true, etag}`. Etags reset when the wsmp
+daemon restarts, which costs one extra `conflict`. A write-class call that fails with
+`error.outcome: "unknown"` may have changed the file, with any code: `timeout`,
+`offline`, `cancelled`, `token_inactive`, a mode change, `io_error`,
+`uncertain_outcome`, `not_found` on rename/delete, or `conflict` when a file was swapped
+during the change. Headless
+`replaced` conflicts are unknown and omit `currentEtag`. For supervised requests,
+every non-success after acceptance is unknown, even a `conflict` caused by the
+pinned pre-image changing before commit, because the error frame has only a code.
+Ask the person to inspect the file, or call `forwarder_cli_file_stat` with `hash: true`
+and a read grant to compare the etag before retrying. A retry
 that carries `expectedEtag` is safe (a stale etag returns `conflict`); an exact-match edit
 without `expectedEtag` is not idempotent, so check with `file_stat` first.
 
@@ -206,14 +283,27 @@ the temp at the vacant name. A concurrent save captured instead of the original
 is restored without overwriting another object, or retained and reported. A
 concurrent create at the vacant name survives; the original stays in recovery
 and the tool returns `uncertain_outcome`. If no safe publish primitive works,
-`unsafe_filesystem` is a definitive refusal: nothing was changed. Overwrite rename first captures and verifies the
+`unsafe_filesystem` is a definitive headless refusal: nothing was changed. A
+supervised error after acceptance remains unknown under the code-only outcome
+contract, including `unsafe_filesystem`. Overwrite rename first captures and verifies the
 source, then exchanges that private slot with the destination. Every captured
 object has a recorded origin; undo restores only to that origin, using identity
 proof to return a moved source to its original source name. An unsettled
-compensation returns `uncertain_outcome` with `error.outcome: "unknown"`, `recovery` (an absolute
-directory path) and `kept` (up to four absolute paths, including public names when
-capture failed). Successful edit/write/rename/delete results may include `recovered` paths
-if only cleanup failed. Every retained location is also in the daemon warning log.
+headless compensation returns `uncertain_outcome` with `error.outcome: "unknown"`,
+`recovery` (an absolute directory path) and `kept` (up to four absolute paths,
+including public names when capture failed). Successful headless edit/write/rename/delete
+results may include `recovered` paths if only cleanup failed. Supervised operations
+use the same recovery and compensation primitives, with pin verification and
+cancellation honored only before commit. Their error frame carries
+only a closed error `code` (including `uncertain_outcome` and `unsafe_filesystem`);
+every non-success after acceptance still has
+`outcome: "unknown"`. Supervised success results omit `recovered`, including delete. A preview-time
+`unsafe_filesystem` refusal uses the cannot-apply screen and reaches the agent only
+after dismissal; it is never a pre-display rejection. The confirm child rejects
+`uncertain_outcome` markers because only daemon apply can produce that verdict. Every retained
+location reaches the person's daemon warning log (paths only, never content), including
+when the confirmation child has exited. The child remains display-only; approval
+creates no read grant and recovery paths never reach the agent through these results.
 Inspect those paths using a shell, compare file contents, and restore them manually
 without overwriting newer files before retrying. Find crash leftovers by listing
 `.wsmp-recover-*` beside the target (a partial replace temp or probe is inside it). File tools
@@ -332,30 +422,34 @@ commands (`token_inactive` or `offline`; a write-class call carries `error.outco
 Banning a user (the dashboard archive action, the admin ban, or an admin update that sets the
 ban) does the same for every token the user holds and refuses calls still being admitted; the
 CLI's relay connection stays up. Everything ends on the server at once, including supervised
-requests still waiting for a person's confirmation: a call waiting for a headless command returns
+commands and supervised file requests still waiting for a person's confirmation or already applying (a file request ends `token_inactive`, with `outcome: "unknown"` once dispatched per the outcome contract; if its confirm deadline had already passed and the server was waiting for the CLI to stop, it ends `timeout`): a call waiting for a headless command returns
 `cancelled`, and the CLI's late output and exit are dropped and never reported as a success. The
 CLI is asked to stop the process, and the command keeps its execution slot only until the CLI
 answers or 15 seconds pass. The cancel runs in the server process that performed the ban: another
 replica ends the work at its deadline and refuses the user's next call.
 
-**Limits.** 120 file operations per minute per user, of which at most 30 change files;
-4 in flight per CLI and 16 per user. Over a limit the error is `limit` with `retryAfterMs`.
-Operations are never queued and time out after 30 seconds (search and hashing have shorter
-CLI budgets); an MCP abort sends `file.cancel`, honored before a mutation's rename. Read
+**Limits.** Supervised writes share command limits: one awaiting per CLI, two awaiting
+per user, and two live per CLI. Headless limits are 120 file operations per minute per user, of which at most 30 change files;
+4 in flight per CLI and 16 per user. Headless limits return `limit` with `retryAfterMs`;
+supervised admission limits return `limit`. Operations are never queued. Headless
+operations time out after 30 seconds (search and hashing have shorter CLI budgets);
+an MCP abort sends `file.cancel`, honored before a mutation's rename. Once a supervised
+request is registered, an MCP abort preserves its id and the person's pending decision. Read
 windows are held to 96 KiB by the 256 KiB tool output cap (`too_large` asks for a narrower
 request; escape-dense text needs a smaller `maxBytes`), write content is at most 1 MiB
 DECODED, and the whole request of stat, list, search and edit must fit one 64 KiB relay
 frame. The 1 MB `/mcp` request-body cap that every call shares is the
 real ceiling on the encoded form, so a base64 write arrives at roughly 768 KiB (786,432 bytes)
 decoded or less (it encodes to 4/3 of that); larger bodies cannot be written with the
-current tools. Errors are
-in-band `isError` results with a stable `error.code`: the command codes
+current tools. Admission and headless errors are in-band `isError` results;
+completed supervised failures appear in the polled `result.error`. Both use a
+stable `error.code`: the command codes
 (`not_found`, `grant_disabled`, `offline`, `feature_disabled`, `supervised_only`,
 `unsupported`, `limit`, `token_inactive`, `upgrade_required`), `invalid_input`, and the
 file codes (`path_denied`, `secret_file`, `not_a_file`, `not_a_dir`, `binary_file`,
 `too_large`, `conflict`, `uncertain_outcome`, `unsafe_filesystem`, `match_count`, `no_match`, `redacted_span`, `exists`,
 `hard_linked`, `owner_mismatch`, `setuid`, `special_file`, `io_error`, `timeout`,
-`cancelled`). The CLI re-checks its own startup mode, read switch and roots on every
+`cancelled`, `declined`). The CLI re-checks its own startup mode, read switch and roots on every
 op and can refuse one itself; its `file.rejected` reason is either a file code above or
 one of `bad_frame`, `supervised_only`, `grant_disabled` (the dashboard grant is off) and
 `feature_disabled` (the CLI's `wsmp config set-mcp-commands` mode is off), and the
@@ -894,7 +988,20 @@ starts an immediate sweep that will remove artifacts already past eligibility
 
 Every command an MCP agent runs on a CLI device (`forwarder_cli_command_run`,
 `forwarder_cli_supervised_command_start`), including refused ones, is recorded
-in `cli_agent_action_event` (file operations join it with the file tools). The
+in `cli_agent_action_event`, along with file operations. Supervised edit, write,
+rename, mkdir and delete requests each record exactly one `supervised_file_write`
+event, including admission refusals; they do not also record a headless file
+event. Its path is the requested path (the source for rename), its reason is
+`<op>:<code>` (`write:completed`, `edit:conflict`, etc.), and available etags and
+write byte counts are metadata. Accepted writes whose apply deadline or session
+loss leaves the result uncertain record `unknown`, and so does any dispatched
+request the server ends (revocation, policy change, session loss, confirm expiry)
+before the CLI has authoritatively settled it. A file error the CLI reports before
+acceptance records `failed`, a spawn/admission rejection `refused`, and a
+CLI-acknowledged confirm expiry or decline records `expired` or `declined`;
+requests never dispatched to the CLI record `cancelled` or `refused`. Headless file operations retain their per-tool
+`file_*` kinds and use `<code>` for their reason. Both reason shapes are returned
+by `forwarder_cli_activity_list`. Unverified device ids are stored as `unknown`. The
 log is **metadata only**: who (user, device, token), what (kind, and for a
 command a keyed HMAC-SHA256 of the command text plus its program name — never
 the command text itself), when, and how it ended (`completed`, `refused`, `failed`,

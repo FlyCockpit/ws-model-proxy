@@ -13,17 +13,17 @@ import {
 } from "./cli-agent-audit";
 
 describe("cliAgentWireReason", () => {
-  it("accepts every reason the CLI may put on the wire, unchanged", () => {
+  it("accepts every general CLI rejection code unchanged", () => {
     for (const code of CLI_AGENT_WIRE_REASONS) {
       expect(cliAgentWireReason(code)).toBe(code);
     }
   });
 
   // The list above iterates itself, so any edit to it passes the test above.
-  // This guard derives the expected set from the Rust source, the only place
-  // that constructs these codes: a conforming CLI's reason must survive the
-  // whitelist, and the Rust constants are the ground truth for which codes
-  // exist. Mutating one side without the other fails here.
+  // This guard derives the general rejection set from the Rust constants.
+  // File-policy codes sent by supervised files are validated separately by
+  // the server's file protocol and are outside this normalizer's list.
+  // Mutating the constants or this list independently fails here.
   it("matches the CLI's REASON_* constants exactly", () => {
     const source = readFileSync(
       fileURLToPath(new URL("../../../apps/cli/src/sessions.rs", import.meta.url)),

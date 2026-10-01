@@ -101,6 +101,9 @@ fn stat_one(ops: &FileOps, path: &str, hash: bool, cancel: &Cancel) -> FileResul
         make_parents: None,
         policy: &ops.policy,
         access: Access::Read,
+        preview_missing: false,
+        pin: None,
+        cancel: None,
     };
     let resolved = resolve(path, &opts(false))?;
     if resolved.is_self() {

@@ -24,6 +24,7 @@ import { z } from "zod";
 
 export const FILE_INLINE_TEXT_MAX_BYTES = 48 * 1024;
 export const FILE_BODY_MAX_BYTES = 1024 * 1024;
+export const FILE_OP_DEADLINE_MS = 30_000;
 
 export const FILE_OPS = [
   "read",
@@ -48,7 +49,7 @@ export const MUTATING_FILE_OPS: ReadonlySet<FileOp> = new Set([
   "delete",
 ]);
 
-export function isMutatingFileOp(op: FileOp): boolean {
+export function isMutatingFileOp(op: FileOp): op is FileSpawnSpec["op"] {
   return MUTATING_FILE_OPS.has(op);
 }
 
@@ -404,7 +405,7 @@ export const FILE_DATA_FIELDS = {
 export type FileDataOp = keyof typeof FILE_DATA_FIELDS;
 export const fileDataFieldSchema = z.enum(["text", "entries", "matches", "diff"]);
 
-/** `op` + `result` as a discriminated union (also the `supervised.done.fileResult` body). */
+/** Headless `op` + `result`; supervised results use the metadata-only schema below. */
 export const fileOpResultSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("read"), result: readResultSchema }).strict(),
   z.object({ op: z.literal("stat"), result: statResultSchema }).strict(),
@@ -516,15 +517,55 @@ export const fileRejectedFrameSchema = z
 export const fileBodyMetadataSchema = z.object({ type: z.literal("file.body"), opId }).strict();
 export const fileDataMetadataSchema = z.object({ type: z.literal("file.data"), opId }).strict();
 
-/** The supervised-file `term.spawn` payload (schema only until P5). */
+/** The strict supervised-file payload: only filesystem mutations. */
 export const fileSpawnSpecSchema = z.discriminatedUnion("op", [
-  z.object({ op: z.literal("read"), args: readArgsSchema }).strict(),
-  z.object({ op: z.literal("stat"), args: statArgsSchema }).strict(),
-  z.object({ op: z.literal("list"), args: listArgsSchema }).strict(),
-  z.object({ op: z.literal("search"), args: searchArgsSchema }).strict(),
   z.object({ op: z.literal("edit"), args: editArgsSchema }).strict(),
   z.object({ op: z.literal("write"), args: writeRelayArgsSchema }).strict(),
   z.object({ op: z.literal("rename"), args: renameArgsSchema }).strict(),
   z.object({ op: z.literal("mkdir"), args: mkdirArgsSchema }).strict(),
   z.object({ op: z.literal("delete"), args: deleteArgsSchema }).strict(),
+]);
+
+export type FileSpawnSpec = z.infer<typeof fileSpawnSpecSchema>;
+
+/** No read grant is implied by approval: file content stays on the CLI screen. */
+export const supervisedFileResultSchema = z.discriminatedUnion("op", [
+  z
+    .object({
+      op: z.literal("edit"),
+      result: editResultSchema.omit({ diff: true, hunks: true, recovered: true }),
+    })
+    .strict(),
+  z
+    .object({
+      op: z.literal("write"),
+      result: writeResultSchema.omit({ diff: true, recovered: true }),
+    })
+    .strict(),
+  z
+    .object({ op: z.literal("rename"), result: renameResultSchema.omit({ recovered: true }) })
+    .strict(),
+  z.object({ op: z.literal("mkdir"), result: mkdirResultSchema }).strict(),
+  z
+    .object({ op: z.literal("delete"), result: deleteResultSchema.omit({ recovered: true }) })
+    .strict(),
+]);
+export type SupervisedFileResult = z.infer<typeof supervisedFileResultSchema>;
+export const supervisedFileErrorSchema = z.object({ code: z.enum(FILE_ERROR_CODES) }).strict();
+
+/** Only frame/path-string refusals are allowed before the person's keypress. */
+export const supervisedFileRejectReasonSchema = z.enum([
+  "disabled",
+  "unsupported",
+  "limit",
+  "already_open",
+  "spawn_failed",
+  "bad_command",
+  "bad_frame",
+  "invalid_input",
+  "path_denied",
+  "secret_file",
+  "too_large",
+  "redacted_span",
+  "special_file",
 ]);

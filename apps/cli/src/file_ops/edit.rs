@@ -20,7 +20,7 @@ use super::read::{binary_error, load_all};
 use super::redact::{self, MASK_OPEN, MaskedView};
 use super::resolve::{ResolveOpts, resolve};
 use super::text::{self, Eol};
-use super::{Cancel, FileOps, check_reason};
+use super::{Cancel, FileOps, Step, check_reason};
 
 pub const MAX_EDITS: usize = 20;
 /// Edits load the whole file, so the result is capped (config and script files).
@@ -30,14 +30,14 @@ pub const MAX_NEW_TEXT_BYTES: usize = 1024 * 1024;
 /// Most matches one `oldText` may replace (bounds planning memory and time).
 pub const MAX_MATCHES_PER_EDIT: usize = 100_000;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ExpectedMatches {
     Count(u32),
     All(String),
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EditOp {
     pub old_text: Option<String>,
@@ -47,7 +47,7 @@ pub struct EditOp {
     pub end_line: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EditArgs {
     pub path: String,
@@ -109,6 +109,40 @@ impl SizeBudget {
 }
 
 pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResult<EditResult> {
+    validate_args(args)?;
+    edit_validated(ops, args, None, cancel, DiffAudience::Mcp).map(|(result, _)| result)
+}
+
+pub(crate) fn edit_supervised(
+    ops: &FileOps,
+    args: &EditArgs,
+    pin: &super::supervised::PinnedPath,
+    cancel: &Cancel,
+) -> FileResult<EditResult> {
+    validate_args(args)?;
+    edit_validated(ops, args, Some(pin), cancel, DiffAudience::Mcp).map(|(result, _)| result)
+}
+
+#[derive(Clone, Copy)]
+enum DiffAudience {
+    Mcp,
+    Consent,
+}
+
+/// This entry point always previews; it can never commit a filesystem change.
+pub(crate) fn consent_preview(
+    ops: &FileOps,
+    args: &EditArgs,
+    cancel: &Cancel,
+) -> FileResult<(EditResult, usize)> {
+    validate_args(args)?;
+    let mut args = args.clone();
+    args.dry_run = Some(true);
+    args.return_diff = Some(true);
+    edit_validated(ops, &args, None, cancel, DiffAudience::Consent)
+}
+
+pub(crate) fn validate_args(args: &EditArgs) -> FileResult<()> {
     check_reason(&args.reason)?;
     if args.edits.is_empty() || args.edits.len() > MAX_EDITS {
         return Err(FileError::invalid(format!(
@@ -145,7 +179,16 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
             "expectedEtag is required for line-range edits",
         ));
     }
+    Ok(())
+}
 
+fn edit_validated(
+    ops: &FileOps,
+    args: &EditArgs,
+    pin: Option<&super::supervised::PinnedPath>,
+    cancel: &Cancel,
+    audience: DiffAudience,
+) -> FileResult<(EditResult, usize)> {
     let _namespace = ops.namespace_shared(cancel)?;
     let resolved = resolve(
         &args.path,
@@ -154,13 +197,29 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
             make_parents: None,
             policy: &ops.policy,
             access: Access::Write,
+            preview_missing: false,
+            pin: pin.map(|pin| &pin.ancestor),
+            cancel: Some(cancel),
         },
     )?;
     // Lock first (as `write` does): a queued edit then opens the file after the
     // one ahead of it committed, instead of failing its re-check on a stale inode.
     let full = resolved.full_path();
     let _lock = ops.lock_path(full.clone(), cancel)?;
+    if let Some(pin) = pin {
+        ops.step(Step::SupervisedBeforePin)?;
+        pin.verify(ops, &resolved, Access::Write, cancel)?;
+        ops.step(Step::SupervisedPinVerified)?;
+    }
+    if pin.is_some() {
+        ops.step(Step::SupervisedBeforeOpen)?;
+    }
     let (mut file, stat) = resolved.open_regular(&ops.policy, Access::Write)?;
+    if let Some(pin) = pin {
+        ops.step(Step::SupervisedOpened)?;
+        pin.verify_opened(&stat)?;
+        ops.step(Step::SupervisedOpenedVerified)?;
+    }
 
     let original = load_all(&mut file, &stat, MAX_EDIT_FILE_BYTES, cancel)?;
     let previous_etag = ops.key.strong(&stat, &original);
@@ -226,22 +285,21 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
     }
 
     budget.check()?;
-    let mut updated: Vec<u8> = Vec::with_capacity(original.len());
+    let mut updated = super::diff::ConsentText::new(original_text);
     let mut cursor = 0;
     for plan in &planned {
-        updated.extend_from_slice(&original[cursor..plan.orig.start]);
-        updated.extend_from_slice(new_texts[plan.edit].as_bytes());
+        updated.push_disk(cursor..plan.orig.start)?;
+        updated.push_agent(&new_texts[plan.edit]);
         cursor = plan.orig.end;
     }
-    updated.extend_from_slice(&original[cursor..]);
-    if updated.len() as u64 > MAX_EDIT_FILE_BYTES {
+    updated.push_disk(cursor..original.len())?;
+    if updated.as_str().len() as u64 > MAX_EDIT_FILE_BYTES {
         return Err(FileError::new(
             ErrorCode::TooLarge,
             "the edited file would exceed 16 MiB",
         ));
     }
-    let updated_text = std::str::from_utf8(&updated)
-        .map_err(|_| FileError::invalid("the edit would produce invalid UTF-8"))?;
+    let updated_text = updated.as_str();
 
     let after_view = redact::mask(class, updated_text);
     // Masking depends on context (the name, the assignment shape, an open quote).
@@ -260,7 +318,10 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
             "the edit would expose a redacted value; masked text cannot change context",
         ));
     }
-    let summary = diff_lines(&view.text, &after_view.text);
+    let mut summary = diff_lines(&view.text, &after_view.text);
+    if matches!(audience, DiffAudience::Consent) {
+        summary.diff = super::diff::consent_diff(&updated, class)?;
+    }
     let (diff, hunks) = if args.return_diff.unwrap_or(true) {
         (Some(summary.diff.clone()), None)
     } else {
@@ -268,56 +329,82 @@ pub(crate) fn edit(ops: &FileOps, args: &EditArgs, cancel: &Cancel) -> FileResul
     };
     let echo = resolved.echo(&args.path);
 
-    if updated == original {
-        return Ok(EditResult {
-            etag: previous_etag.clone(),
-            previous_etag,
-            added: 0,
-            removed: 0,
-            applied: false,
-            diff,
-            hunks,
-            resolved_path: echo,
-            recovered: Vec::new(),
-        });
+    if updated_text.as_bytes() == original {
+        if let Some(pin) = pin {
+            pin.verify(ops, &resolved, Access::Write, cancel)?;
+        }
+        return Ok((
+            EditResult {
+                etag: previous_etag.clone(),
+                previous_etag,
+                added: 0,
+                removed: 0,
+                applied: false,
+                diff,
+                hunks,
+                resolved_path: echo,
+                recovered: Vec::new(),
+            },
+            updated.as_str().len(),
+        ));
     }
     if args.dry_run.unwrap_or(false) {
-        return Ok(EditResult {
-            etag: previous_etag.clone(),
-            previous_etag,
-            added: summary.added,
-            removed: summary.removed,
-            applied: false,
-            diff,
-            hunks,
-            resolved_path: echo,
-            recovered: Vec::new(),
-        });
+        return Ok((
+            EditResult {
+                etag: previous_etag.clone(),
+                previous_etag,
+                added: summary.added,
+                removed: summary.removed,
+                applied: false,
+                diff,
+                hunks,
+                resolved_path: echo,
+                recovered: Vec::new(),
+            },
+            updated.as_str().len(),
+        ));
     }
 
     cancel.check()?;
-    let (new_stat, recovered) = atomic::replace(
-        ops,
-        &resolved.dir,
-        &resolved.name,
-        &resolved.dir_path,
-        file,
-        &stat,
-        &previous_etag,
-        &updated,
-        cancel,
-    )?;
-    Ok(EditResult {
-        etag: ops.key.strong(&new_stat, &updated),
-        previous_etag,
-        added: summary.added,
-        removed: summary.removed,
-        applied: true,
-        diff,
-        hunks,
-        resolved_path: echo,
-        recovered,
-    })
+    let (new_stat, recovered) = match pin {
+        Some(pin) => atomic::replace_supervised(
+            ops,
+            &resolved.dir,
+            &resolved.name,
+            &resolved.dir_path,
+            file,
+            &stat,
+            &previous_etag,
+            updated_text.as_bytes(),
+            pin,
+            cancel,
+        )?,
+        None => atomic::replace(
+            ops,
+            &resolved.dir,
+            &resolved.name,
+            &resolved.dir_path,
+            file,
+            &stat,
+            &previous_etag,
+            updated_text.as_bytes(),
+            cancel,
+        )?,
+    };
+    Ok((
+        EditResult {
+            etag: ops.key.strong(&new_stat, updated_text.as_bytes()),
+            previous_etag,
+            added: summary.added,
+            removed: summary.removed,
+            applied: true,
+            diff,
+            hunks,
+            resolved_path: echo,
+            recovered,
+        },
+        updated.as_str().len(),
+    ))
 }
 
 /// In a uniformly CRLF file, a bare `\n` in the request means `\r\n`.

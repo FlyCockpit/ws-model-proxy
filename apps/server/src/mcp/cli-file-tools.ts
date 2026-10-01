@@ -6,6 +6,7 @@ import {
   type FileOpOutcome,
   type FileOpSuccess,
   runFileOp,
+  type SupervisedFileStart,
 } from "../relay/cli-file-ops.js";
 import { FILE_BODY_MAX_BYTES, type FileOp, fileToolArgShapes } from "../relay/file-protocol.js";
 import { isWellFormedText } from "../relay/wire-text.js";
@@ -145,7 +146,7 @@ export function adaptFileToolInput(op: FileOp, input: unknown): AdaptedFileInput
 type ToolErrorCode = FileOpFailure["code"];
 
 /** Short fixed messages. They never carry a path, file content, or CLI text. */
-const FILE_ERROR_MESSAGES: Readonly<Record<ToolErrorCode, string>> = {
+export const FILE_ERROR_MESSAGES: Readonly<Record<ToolErrorCode, string>> = {
   not_found: "No such file or directory",
   grant_disabled: "File tools are disabled for this device (its MCP command mode is off)",
   offline: "The CLI is offline or does not support file tools",
@@ -181,6 +182,7 @@ const FILE_ERROR_MESSAGES: Readonly<Record<ToolErrorCode, string>> = {
   uncertain_outcome: "The file outcome is uncertain; inspect recovery",
   timeout: "The file operation timed out",
   cancelled: "The file operation was cancelled",
+  declined: "The person declined the file operation; nothing was applied",
 };
 
 /** A file tool failure: a stable `code`, a short message, and small structured facts. */
@@ -221,6 +223,7 @@ export class McpCliFileError extends Error {
 // Cores
 
 type FileToolDeps = {
+  claimDeliverDespiteAbort?: () => void;
   userId: string;
   signal?: AbortSignal;
   credential: McpRequestCredential;
@@ -282,7 +285,7 @@ export async function runForwarderCliFileTool(
   op: FileOp,
   input: unknown,
   deps: FileToolDeps,
-): Promise<FileOpSuccess> {
+): Promise<FileOpSuccess | SupervisedFileStart> {
   const pat = requireFilePat(deps.credential, op);
   // The SDK validator is the loose generated one (#117): the strict per-op
   // shape is enforced here, and its issues reach the agent as named fields.
@@ -320,6 +323,7 @@ export async function runForwarderCliFileTool(
     args: adapted.args,
     ...(adapted.body ? { body: adapted.body } : {}),
     ...(deps.signal ? { signal: deps.signal } : {}),
+    ...(deps.claimDeliverDespiteAbort ? { onSupervisedStart: deps.claimDeliverDespiteAbort } : {}),
   });
   if (!outcome.ok) return fail(outcome);
   return outcome;
@@ -412,6 +416,11 @@ function scrub(value: unknown): unknown {
  */
 export function projectFileToolOutput(output: unknown): unknown {
   const record = isRecord(output) ? output : {};
+  if (record.kind === "supervised") {
+    return scrub(
+      pick(record, ["commandId", "terminalId", "kind", "status", "waitingUntil", "next"]),
+    );
+  }
   const op = record.op;
   const result = isRecord(record.result) ? record.result : {};
   if (typeof op !== "string" || !Object.hasOwn(PROJECT_FIELDS, op)) return {};
@@ -441,16 +450,16 @@ export const FILE_MASKING_NOTICE =
   "Masking is bounded and shown in the text: dotenv values as KEY=⟦redacted:N⟧; in other files any line containing a secret-name word (…_TOKEN, …_KEY, …_SECRET, …_PASSWORD, apikey, api-key, hf-token, PASSWORD), the next non-blank line and every deeper-indented continuation as ⟦redacted line⟧; --api-key/--hf-token flag values; private-key blocks and SSH private key files; Hugging Face token files. There is no vendor-prefix scanner and a construct opened before the bounded lookback of a windowed read is a documented residual. On a read-grant-only node without exec, masking plus configured roots IS the security boundary. On an unsupervised node masking is NOT a security boundary (an agent that can run commands can cat .env); it keeps those secrets out of transcripts on the normal path. Secret-class files are READ-ONLY masked views: every write, edit, rename, delete or mkdir that touches one (or its directory) is refused with error.code secret_file, on every operating system and whatever the letter case; change such a file with a command, not with these tools. Only the wsmp_ credential substrings are additionally removed by the server.";
 
 export const FILE_ACCESS_NOTICE =
-  "File tools follow the lowest of the dashboard and CLI command modes: unsupervised admits read and write; supervised/off admit only reads with the read-only grant (dashboard mcpFileRead AND live CLI mcpFileRead AND fileRootsConfigured). Write tools remain supervised_only or grant_disabled/feature_disabled. Read tools need a PAT with allowCliCommands + mcp:write OR allowCliFileRead + mcp:read; writes require allowCliCommands + mcp:write. OAuth is denied. Configured fileRoots confine every operation including rename destinations; roots are mandatory for reads through the grant. Paths are absolute or ~/…, at most 4096 bytes; the CLI refuses its own state and config files.";
+  "File tools follow the lowest of the dashboard and CLI command modes: unsupervised admits read and write; supervised/off admit reads only with the read-only grant (dashboard mcpFileRead AND live CLI mcpFileRead AND fileRootsConfigured). On a supervised CLI, writes return a commandId: a person must press Enter on the CLI-drawn screen showing the operation, resolved physical path, reason, effect-bearing details (octal mode including all preserved permission bits, ifExists, parent creation and overwrite), and a complete diff computed from disk. Disk-derived removed/context lines are masked. Added lines carrying any masked disk byte (including whole-line or continuation masks) are blocked with redacted_span on dismissal; pure requester-authored additions are visible with controls escaped. Diff and mask lines split only on LF; a lone CR is escaped content and CRLF stays one line ending. Unmappable line counts block with redacted_span. A diff exceeding the 8 KiB display cap is blocked with too_large on dismissal. A supervised directory rename without replacement is refused with unsupported on macOS. Poll forwarder_cli_command_result; no read grant is implied. State-dependent failures reach the agent only after a person dismisses the screen, including physical root confinement (path_denied) and disk-derived normalized arguments above 128 KiB (too_large). Root aliases resolving inside the configured roots are allowed; outside-root paths get a cannot-apply screen. The child uses the daemon startup root snapshot and apply rechecks policy. Only request-text/input policy (invalid_input, secret_file, protected/staging names, special trees, declared sizes), process/mode and capacity checks can refuse before display. Supervised dryRun is refused. Off refuses writes with grant_disabled/feature_disabled. Read tools need a PAT with allowCliCommands + mcp:write OR allowCliFileRead + mcp:read; writes require allowCliCommands + mcp:write. OAuth is denied. Configured fileRoots confine every operation including rename destinations; roots are mandatory for reads through the grant. Paths are absolute or ~/…, at most 4096 bytes; the CLI refuses its own state and config files.";
 
 export const FILE_ETAG_NOTICE =
-  "Every result that touches a file carries etag. Pass it as expectedEtag to edit, write (ifExists replace), rename (overwrite) and delete; a stale etag returns error.code conflict with currentEtag. Line-range edits and replace require expectedEtag. Etags reset when the wsmp daemon restarts: after offline, re-read or file_stat before editing.";
+  "Pass expectedEtag to edit, write (ifExists replace), rename (overwrite) and delete. Line-range edits, replace and rename overwrite require it. Stale etags return conflict; supervised errors contain only code, without currentEtag or file content. Supervised edit/write results omit diff and hunks. The CLI rechecks the pre-image before applying. Etags reset when the wsmp daemon restarts: with a read grant, re-read or file_stat before editing.";
 
 export const FILE_UNKNOWN_OUTCOME_NOTICE =
-  'If a write-class call fails with error.outcome "unknown" (any code: timeout, offline, cancelled, token_inactive, a mode change, io_error, uncertain_outcome, not_found on rename/delete, or conflict meaning the file was swapped during the change), the change may or may not have been made: call forwarder_cli_file_stat with hash true and compare the etag before retrying. A retry that carries expectedEtag is safe (a stale etag returns conflict; the currentEtag of a conflict is an etag or the word gone); an exact-match edit without expectedEtag is NOT idempotent, so check with file_stat first. An uncertain_outcome includes recovery and kept absolute paths: use the shell to inspect and recover them before retrying. Successful edit/write/rename/delete results may include recovered paths for retained cleanup objects. After link publication, a retained temp alias leaves two hard links and later edit/replace calls refuse hard_linked until manual cleanup. Recovery uses at most one .wsmp-recover-<10 alnum> directory beside the target and two objects per operation. File tools can read but never mutate recovery paths; recovery is manual and retained objects are never automatically deleted. An unsafe_filesystem refusal is definitive: nothing was changed.';
+  'If a write-class call fails with error.outcome "unknown" (any code: timeout, offline, cancelled, token_inactive, a mode change, io_error, uncertain_outcome, not_found on rename/delete, or conflict when the file was swapped during the change), the change may or may not have been made. For supervised requests EVERY non-success after supervised.accepted is unknown: CLI errors carry only code, so even a pre-commit conflict cannot be distinguished. Server termination after term.spawn dispatch is unknown; started is true if the server received acceptance and null otherwise, since acceptance and apply may be in flight. Undispatched admission/spawn-send failures and authoritative CLI decline/rejection/blocked done before acceptance remain definitive. Finished file results and their audit outcome are immutable to late frames. Ask the person to inspect the file, or use forwarder_cli_file_stat with hash true and a read grant to compare the etag before retrying. A retry that carries expectedEtag is safe (a stale etag returns conflict; a headless currentEtag is an etag or the word gone); an exact-match edit without expectedEtag is NOT idempotent, so check first. Headless uncertain_outcome includes recovery and kept absolute paths, and successful headless edit/write/rename/delete results may include recovered paths for retained cleanup objects. After link publication, a retained temp alias leaves two hard links and later edit/replace calls refuse hard_linked until manual cleanup. For supervised operations recovery paths stay in the daemon warning log for the person; the agent gets only the error code or a result without recovered paths. Inspect and recover retained objects with a shell before retrying. Recovery uses at most one .wsmp-recover-<10 alnum> directory beside the target and two objects per operation. File tools can read but never mutate recovery paths; retained objects are never automatically deleted. Headless unsafe_filesystem is a definitive refusal; a supervised unsafe_filesystem error after acceptance remains unknown under the code-only outcome contract.';
 
 export const FILE_LIMITS_NOTICE =
-  "Limits: 120 file operations per minute per user (30 changing ones), 4 at once per CLI and 16 per user; over the limit returns error.code limit with retryAfterMs. Operations are never queued and time out after 30 seconds.";
+  "Limits: 120 file operations per minute per user (30 changing ones), 4 at once per CLI and 16 per user; over the limit returns error.code limit with retryAfterMs. Headless operations are never queued and time out after 30 seconds. Supervised writes share command limits (1 awaiting per CLI, 2 per user, 2 live per CLI), wait up to 15 minutes for approval, then time out 30 seconds after acceptance.";
 
 export const FILE_FRAME_NOTICE =
   "Every file tool request must fit one 64 KiB relay frame and the 1 MB /mcp request body cap, so a request with many long paths, a large search pattern or large edit text may have to be split or shortened.";
@@ -460,9 +469,9 @@ export const FILE_TOOL_NOTES: Readonly<Record<FileToolName, string>> = {
   forwarder_cli_file_stat: `Stats up to 50 paths (type, size, mtime, mode, owner; etag with hash true for files up to 64 MiB). ${FILE_FRAME_NOTICE} ${FILE_ACCESS_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE}`,
   forwarder_cli_dir_list: `Lists a directory as compact text, one entry per line (depth 1 to 4, glob, includeHidden, up to 2000 entries); more.cursor continues. Symlinked directories are not followed. ${FILE_FRAME_NOTICE} ${FILE_ACCESS_NOTICE}`,
   forwarder_cli_file_search: `Searches text files under a root (literal or regex, glob, up to 500 matches); binary, oversized and secret-class files are skipped and matches are masked. ${FILE_FRAME_NOTICE} ${FILE_ACCESS_NOTICE} ${FILE_MASKING_NOTICE}`,
-  forwarder_cli_file_edit: `Exact-string and line-range edits (1 to 20, applied to the original content, all or nothing; line ranges require expectedEtag). ${FILE_FRAME_NOTICE} use file_write for large content. Optional reason (500 characters) goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE} ${FILE_MASKING_NOTICE}`,
-  forwarder_cli_file_write: `Creates a file, or replaces it with ifExists replace plus expectedEtag. content is utf-8 text or base64 (encoding), at most 1 MiB decoded; a base64 request encodes to more, and every /mcp request body is capped at 1 MB, so base64 content above roughly 768 KiB (786,432 bytes decoded) cannot be sent in one call. Content containing the mask token ⟦redacted is refused, and a secret-class path (dotenv or key file, or its directory) can never be created or replaced (secret_file). Optional reason (500 characters) goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
-  forwarder_cli_file_rename: `Renames within one filesystem; overwrite requires expectedEtag of the destination. Refused with secret_file on secret-class files and their directories (read-only masked views). Optional reason goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
-  forwarder_cli_dir_create: `Creates a directory (parents true creates missing parents). Refused with secret_file on secret-class files and their directories (read-only masked views). Optional reason goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
-  forwarder_cli_file_delete: `Deletes a file, a symlink (never its target) or an empty directory; there is no recursive delete. Files and symlinks are first captured in recovery and checked against the held identity; a concurrent create at the vacant name survives. This needs one recovery mkdir/rmdir pair: if mkdir fails (including ENOSPC, EDQUOT or EMLINK), deletion fails closed with io_error; free space with the shell. On macOS and other Unix a file the CLI user cannot open read-only (for example mode 000 or 0200) refuses with its open errno (io_error) before capture. Directories use rmdir by name, which can only remove an empty directory. Refused with secret_file on secret-class files and their directories (read-only masked views). Optional reason goes to the CLI log. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
+  forwarder_cli_file_edit: `Exact-string and line-range edits (1 to 20, applied to the original content, all or nothing; line ranges require expectedEtag). ${FILE_FRAME_NOTICE} use file_write for large content. Optional reason (500 characters) goes to the CLI log; on a supervised node it is shown on the CLI confirm screen. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE} ${FILE_MASKING_NOTICE}`,
+  forwarder_cli_file_write: `Creates a file, or replaces it with ifExists replace plus expectedEtag. content is utf-8 text or base64 (encoding), at most 1 MiB decoded; a base64 request encodes to more, and every /mcp request body is capped at 1 MB, so base64 content above roughly 768 KiB (786,432 bytes decoded) cannot be sent in one call. Content containing the mask token ⟦redacted is refused, and a secret-class path (dotenv or key file, or its directory) can never be created or replaced (secret_file). Optional reason (500 characters) goes to the CLI log; on a supervised node it is shown on the CLI confirm screen. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
+  forwarder_cli_file_rename: `Renames within one filesystem; overwrite requires expectedEtag of the destination. Refused with secret_file on secret-class files and their directories (read-only masked views). Optional reason (500 characters) goes to the CLI log; on a supervised node it is shown on the CLI confirm screen. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
+  forwarder_cli_dir_create: `Creates a directory (parents true creates missing parents). Refused with secret_file on secret-class files and their directories (read-only masked views). Optional reason (500 characters) goes to the CLI log; on a supervised node it is shown on the CLI confirm screen. ${FILE_ACCESS_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
+  forwarder_cli_file_delete: `Deletes a file, a symlink (never its target) or an empty directory; there is no recursive delete. Files and symlinks are first captured in recovery and checked against the held identity; a concurrent create at the vacant name survives. This needs one recovery mkdir/rmdir pair: if mkdir fails (including ENOSPC, EDQUOT or EMLINK), deletion fails closed with io_error; free space with the shell. On macOS and other Unix a file the CLI user cannot open read-only (for example mode 000 or 0200) refuses with its open errno (io_error) before capture. Directories use rmdir by name, which can only remove an empty directory. Refused with secret_file on secret-class files and their directories (read-only masked views). Optional reason (500 characters) goes to the CLI log; on a supervised node it is shown on the CLI confirm screen. ${FILE_ACCESS_NOTICE} ${FILE_ETAG_NOTICE} ${FILE_UNKNOWN_OUTCOME_NOTICE} ${FILE_LIMITS_NOTICE}`,
 };

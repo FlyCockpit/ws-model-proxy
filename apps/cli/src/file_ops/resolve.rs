@@ -36,7 +36,7 @@ use std::path::PathBuf;
 
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, openat, readlinkat};
-use nix::sys::stat::{Mode, fstatat, mkdirat};
+use nix::sys::stat::{Mode, fstat, fstatat, mkdirat};
 use nix::unistd::{UnlinkatFlags, unlinkat};
 
 use super::atomic::perm_mode;
@@ -138,6 +138,18 @@ pub struct Resolved {
     pub dir_path: PathBuf,
     pub name: OsString,
     pub created: Vec<CreatedDir>,
+    /// Components after `name` that were absent during a non-mutating preview.
+    /// Normal operation resolution never returns a non-empty suffix.
+    pub missing_suffix: Vec<OsString>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvePin {
+    pub path: PathBuf,
+    pub stat: Stat,
+    /// Components that did not exist at preview. An apply may create them, but
+    /// must not silently adopt directories that appeared in the meantime.
+    pub missing_paths: Vec<PathBuf>,
 }
 
 pub struct ResolveOpts<'a> {
@@ -148,6 +160,13 @@ pub struct ResolveOpts<'a> {
     pub make_parents: Option<u32>,
     pub policy: &'a Policy,
     pub access: Access,
+    /// Preview may stop at the deepest existing ancestor and append the
+    /// missing suffix for physical policy checks without creating anything.
+    pub preview_missing: bool,
+    /// Apply-time identity of that deepest existing ancestor.
+    pub pin: Option<&'a ResolvePin>,
+    /// Checked before every parent creation.
+    pub cancel: Option<&'a super::Cancel>,
 }
 
 impl Resolved {
@@ -160,7 +179,9 @@ impl Resolved {
         if self.is_self() {
             self.dir_path.clone()
         } else {
-            self.dir_path.join(&self.name)
+            let mut path = self.dir_path.join(&self.name);
+            path.extend(&self.missing_suffix);
+            path
         }
     }
 
@@ -173,6 +194,9 @@ impl Resolved {
 
     /// `fstatat(dir, name, NOFOLLOW)`; `None` when the leaf does not exist.
     pub fn lstat(&self) -> FileResult<Option<Stat>> {
+        if !self.missing_suffix.is_empty() {
+            return Ok(None);
+        }
         match fstatat(
             self.dir.as_fd(),
             self.name.as_os_str(),
@@ -186,6 +210,9 @@ impl Resolved {
 
     /// Open the leaf as a directory (the held dir itself for `.`).
     pub fn open_dir(&self) -> FileResult<OwnedFd> {
+        if !self.missing_suffix.is_empty() {
+            return Err(FileError::new(ErrorCode::NotFound, "no such directory"));
+        }
         openat(
             self.dir.as_fd(),
             self.name.as_os_str(),
@@ -203,7 +230,7 @@ impl Resolved {
     /// Open the leaf read-only as a regular file: the fd is fstat'ed after the
     /// open and must be a regular file that is not a protected inode.
     pub fn open_regular(&self, policy: &Policy, access: Access) -> FileResult<(File, Stat)> {
-        if self.is_self() {
+        if self.is_self() || !self.missing_suffix.is_empty() {
             return Err(FileError::new(ErrorCode::NotAFile, "path is a directory"));
         }
         match self.lstat()? {
@@ -333,15 +360,32 @@ pub fn resolve(input: &str, opts: &ResolveOpts<'_>) -> FileResult<Resolved> {
     let mut hops = 0_usize;
     let mut created: Vec<CreatedDir> = Vec::new();
     let mut leaf: Option<OsString> = None;
+    let mut missing_suffix = Vec::new();
+    let mut pin_checked = false;
 
     let result = (|| -> FileResult<()> {
         while let Some(comp) = remaining.pop_front() {
+            check_pin(&cur, &names, opts.pin, &mut pin_checked)?;
             if comp == ".." {
                 cur = open_dir_at(&cur, OsStr::new("..")).map_err(FileError::errno)?;
                 names.pop();
                 continue;
             }
             let is_last = remaining.is_empty();
+            if opts.pin.is_some_and(|pin| {
+                let here = fd_path(&cur).unwrap_or_else(|| join_names(&names));
+                pin.missing_paths.contains(&here.join(&comp))
+            }) {
+                match fstatat(
+                    cur.as_fd(),
+                    comp.as_os_str(),
+                    nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW,
+                ) {
+                    Ok(_) => return Err(FileError::conflict("replaced")),
+                    Err(Errno::ENOENT) => {}
+                    Err(errno) => return Err(FileError::errno(errno)),
+                }
+            }
             if is_last {
                 match fstatat(
                     cur.as_fd(),
@@ -368,6 +412,9 @@ pub fn resolve(input: &str, opts: &ResolveOpts<'_>) -> FileResult<Resolved> {
                     splice_link(&mut cur, &comp, &mut remaining, &mut names, &mut hops)?;
                 }
                 Err(Errno::ENOENT) if opts.make_parents.is_some() => {
+                    if let Some(cancel) = opts.cancel {
+                        cancel.check()?;
+                    }
                     let mode = opts.make_parents.unwrap_or(0o755);
                     let here = fd_path(&cur).unwrap_or_else(|| join_names(&names));
                     opts.policy.check_path(Access::Write, &here.join(&comp))?;
@@ -381,6 +428,11 @@ pub fn resolve(input: &str, opts: &ResolveOpts<'_>) -> FileResult<Resolved> {
                     cur = open_dir_at(&cur, &comp).map_err(FileError::errno)?;
                     names.push(comp);
                 }
+                Err(Errno::ENOENT) if opts.preview_missing => {
+                    leaf = Some(comp);
+                    missing_suffix.extend(remaining.drain(..));
+                    break;
+                }
                 Err(errno) => return Err(FileError::errno(errno)),
             }
         }
@@ -393,8 +445,13 @@ pub fn resolve(input: &str, opts: &ResolveOpts<'_>) -> FileResult<Resolved> {
         dir_path,
         name: leaf.unwrap_or_else(|| OsString::from(".")),
         created,
+        missing_suffix,
     };
     let checked = result.and_then(|()| {
+        check_pin(&resolved.dir, &names, opts.pin, &mut pin_checked)?;
+        if opts.pin.is_some() && !pin_checked {
+            return Err(FileError::conflict("replaced"));
+        }
         if fd_path(&resolved.dir).is_none() && cfg!(target_os = "linux") {
             return Err(FileError::new(ErrorCode::NotFound, "directory was removed"));
         }
@@ -405,6 +462,28 @@ pub fn resolve(input: &str, opts: &ResolveOpts<'_>) -> FileResult<Resolved> {
         return Err(err);
     }
     Ok(resolved)
+}
+
+fn check_pin(
+    dir: &OwnedFd,
+    names: &[OsString],
+    pin: Option<&ResolvePin>,
+    checked: &mut bool,
+) -> FileResult<()> {
+    let Some(pin) = pin else { return Ok(()) };
+    if *checked {
+        return Ok(());
+    }
+    let path = fd_path(dir).unwrap_or_else(|| join_names(names));
+    if path != pin.path {
+        return Ok(());
+    }
+    let now = Stat::from_raw(&fstat(dir.as_fd()).map_err(FileError::errno)?);
+    if !now.same_object(&pin.stat) {
+        return Err(FileError::conflict("replaced"));
+    }
+    *checked = true;
+    Ok(())
 }
 
 fn splice_link(

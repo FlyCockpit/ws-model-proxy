@@ -6,10 +6,10 @@
 
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     PathDenied,
@@ -129,6 +129,13 @@ impl FileError {
             Some(raw) => Self::errno(nix::errno::Errno::from_raw(raw)),
             None => Self::new(ErrorCode::IoError, format!("{:?}", err.kind())),
         }
+    }
+
+    /// Mutations may have committed before completion or rollback failed.
+    /// Both relay paths interpret `io_error` as an unknown mutation outcome;
+    /// a definitive refusal (including `cancelled`) would invite an unsafe retry.
+    pub(crate) fn mutation_uncertain() -> Self {
+        Self::new(ErrorCode::IoError, "the mutation outcome is unknown")
     }
 
     pub fn unsafe_filesystem() -> Self {

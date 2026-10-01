@@ -7,6 +7,12 @@ use serde::Serialize;
 /// Bytes inspected for the binary sniff.
 pub const SNIFF_BYTES: usize = 8 * 1024;
 
+/// Shared line model for masking and consent: CRLF is one ending, and a lone
+/// CR stays inside the line as ordinary content to be escaped for display.
+pub(crate) fn lf_lines(text: &str) -> std::str::SplitInclusive<'_, char> {
+    text.split_inclusive('\n')
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Eol {

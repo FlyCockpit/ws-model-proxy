@@ -11,14 +11,16 @@ import {
 import { normalizeReportedHostname } from "@ws-model-proxy/config/cli-device-name";
 import { z } from "zod";
 import {
+  FILE_BODY_MAX_BYTES,
   type FileOp,
   type FileOpFrame,
   fileBodyMetadataSchema,
   fileDataMetadataSchema,
-  fileOpResultSchema,
   fileRejectedFrameSchema,
   fileResultFrameSchema,
   fileSpawnSpecSchema,
+  supervisedFileErrorSchema,
+  supervisedFileResultSchema,
 } from "./file-protocol.js";
 import { isWellFormedText, stringifyWellFormed } from "./wire-text.js";
 
@@ -736,10 +738,24 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
       review: z.boolean(),
       /** Total output bytes after Enter; present only when output frames were sent. */
       outputBytes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
-      /** 2.8: the result of a supervised file op (`term.spawn kind:"file"`); answered `unsupported` until P5. */
-      fileResult: fileOpResultSchema.optional(),
+      /** 2.8: metadata only; the CLI screen owns the diff. */
+      fileResult: supervisedFileResultSchema.optional(),
+      fileError: supervisedFileErrorSchema.optional(),
     })
-    .strict(),
+    .strict()
+    .refine(
+      (frame) => !(frame.fileResult && frame.fileError),
+      "File result and error are exclusive.",
+    )
+    .refine(
+      (frame) =>
+        !(frame.fileResult || frame.fileError) ||
+        (!frame.review &&
+          frame.exitCode === undefined &&
+          frame.signal === undefined &&
+          frame.outputBytes === undefined),
+      "File completion contains no command output.",
+    ),
   z
     .object({
       type: z.literal("exec.started"),
@@ -860,7 +876,7 @@ export type RelayServerControlMessage =
       /** Server-asserted: the requesting MCP token's name. */
       requester: string;
       shareOutput: boolean;
-      /** 2.8: `"file"` carries `fileOp` (and `bodyBytes` for a write); the CLI answers `unsupported` until P5. */
+      /** 2.8: `"file"` carries a strict mutation and out-of-band write body. */
       kind?: "command" | "file";
       fileOp?: FileSpawnSpec;
       bodyBytes?: number;
@@ -989,6 +1005,31 @@ export function parseRelaySubprotocolHeader(header: string | undefined): {
  * Throws `RelayWireTextError` (and sends nothing) when any string in the
  * message is not well-formed Unicode: the CLI cannot read such a frame.
  */
+const termSpawnEnvelope = {
+  type: z.literal("term.spawn"),
+  terminalId: base64Url16ByteSchema,
+  commandId: base64Url16ByteSchema,
+  command: z
+    .string()
+    .min(1)
+    .refine((text) => utf8Length(text) <= 4096 && !text.includes("\0")),
+  reason: z.string().max(500).optional(),
+  requester: z.string().min(1).max(200),
+};
+export const fileTermSpawnSchema = z
+  .object({
+    ...termSpawnEnvelope,
+    kind: z.literal("file"),
+    fileOp: fileSpawnSpecSchema,
+    bodyBytes: z.number().int().min(0).max(FILE_BODY_MAX_BYTES).optional(),
+    shareOutput: z.literal(false),
+  })
+  .strict()
+  .refine(
+    (frame) => (frame.fileOp.op === "write") === (frame.bodyBytes !== undefined),
+    "Only write requires bodyBytes.",
+  );
+
 export function encodeRelayServerControlMessage(message: RelayServerControlMessage): string {
   // The one enforcement point for the only outbound message whose payload is
   // built from stored, user-authored data: a source list that fails the wire
@@ -1001,7 +1042,20 @@ export function encodeRelayServerControlMessage(message: RelayServerControlMessa
       "metrics.sources.set carries a source list that fails the wire schema.",
     );
   }
-  return stringifyWellFormed(message);
+  // File spawns fail closed even if a caller bypasses the TypeScript type.
+  if (message.type === "term.spawn") {
+    if (message.kind === "file") fileTermSpawnSchema.parse(message);
+    else if (message.kind !== undefined && message.kind !== "command") {
+      throw new RelayProtocolError("Unknown supervised request kind.");
+    } else if (message.fileOp !== undefined || message.bodyBytes !== undefined) {
+      throw new RelayProtocolError("File fields require kind file.");
+    }
+  }
+  const encoded = stringifyWellFormed(message);
+  if (message.type === "term.spawn" && utf8Length(encoded) > RELAY_JSON_CONTROL_MAX_BYTES) {
+    throw new RelayProtocolError("JSON control frame exceeds 64 KiB.");
+  }
+  return encoded;
 }
 
 export function parseRelayClientControlFrame(frame: string): RelayClientControlMessage {

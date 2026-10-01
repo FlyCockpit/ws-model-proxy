@@ -11,6 +11,8 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use super::error::{ErrorCode, FileError, FileResult};
 use super::resolve::Stat;
 
@@ -47,8 +49,50 @@ pub struct Policy {
     roots_required: bool,
     roots_usable: bool,
     protected: Vec<Protected>,
+    /// The protected entries under their configured names only (no physical
+    /// aliases resolved from disk): the lexical, pre-display check uses these.
+    protected_logical: Vec<Protected>,
     euid: u32,
     allow_root: bool,
+}
+
+/// Daemon-only startup snapshot. Empty roots with `required` set deny all;
+/// the child must never canonicalize again or turn failed roots into no roots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "RootSnapshotInput")]
+pub struct RootSnapshot {
+    required: bool,
+    roots: Vec<PathBuf>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootSnapshotInput {
+    required: bool,
+    roots: Vec<PathBuf>,
+}
+
+impl TryFrom<RootSnapshotInput> for RootSnapshot {
+    type Error = anyhow::Error;
+
+    fn try_from(input: RootSnapshotInput) -> Result<Self, Self::Error> {
+        crate::config::validate_file_root_shape(&input.roots)?;
+        anyhow::ensure!(
+            input
+                .roots
+                .iter()
+                .all(|root| root.to_str().is_some_and(|text| !text.contains('\0'))),
+            "root contains NUL"
+        );
+        anyhow::ensure!(
+            input.required || input.roots.is_empty(),
+            "unconfined snapshot has roots"
+        );
+        Ok(Self {
+            required: input.required,
+            roots: input.roots,
+        })
+    }
 }
 
 /// Trees that are not regular-file storage.
@@ -67,6 +111,7 @@ impl Policy {
             roots,
             roots_required,
             roots_usable,
+            protected_logical: protected.clone(),
             protected: with_physical_aliases(protected),
             euid: nix::unistd::geteuid().as_raw(),
             allow_root,
@@ -78,6 +123,21 @@ impl Policy {
     /// readable but not writable (a write could raise the CLI's own mode).
     pub fn from_environment(roots: Vec<PathBuf>, allow_root: bool) -> Self {
         Self::new(roots, default_protected(), allow_root)
+    }
+
+    pub fn root_snapshot(&self) -> RootSnapshot {
+        RootSnapshot {
+            required: self.roots_required,
+            roots: self.roots.clone(),
+        }
+    }
+
+    pub(crate) fn from_root_snapshot(snapshot: RootSnapshot, allow_root: bool) -> Self {
+        let mut policy = Self::from_environment(Vec::new(), allow_root);
+        policy.roots_required = snapshot.required;
+        policy.roots_usable = !snapshot.roots.is_empty();
+        policy.roots = snapshot.roots;
+        policy
     }
 
     /// Test seam: pretend the daemon runs as `euid`.
@@ -110,8 +170,33 @@ impl Policy {
         Ok(())
     }
 
-    /// Decide on the physical path `full`.
+    /// Decide on the physical path `full`: the lexical policy plus, on Linux
+    /// with configured roots, the kernel root guard (which reads the disk).
     pub fn check_path(&self, access: Access, full: &Path) -> FileResult<()> {
+        self.check_text(access, full, &self.protected)?;
+        if !self.within_roots(full) {
+            return Err(FileError::denied(
+                "path is outside the configured file roots",
+            ));
+        }
+        self.check_beneath(full)
+    }
+
+    /// The path-text part of [`Self::check_path`] only: it never touches the
+    /// filesystem, so its verdict depends on the request alone. The supervised
+    /// pre-display refusal uses this so an agent learns nothing about the disk
+    /// (a file where a parent is expected, a symlink out of the roots, an
+    /// unavailable root) before a person has pressed a key. Root confinement
+    /// compares resolved paths and runs only at physical resolution and apply.
+    pub(crate) fn check_path_lexical(&self, access: Access, full: &Path) -> FileResult<()> {
+        // Physical aliases of the protected set come from disk at startup:
+        // matching them before a keypress would let an agent probe where wsmp's
+        // directories live, so only the configured names count here.
+        self.check_text(access, full, &self.protected_logical)
+    }
+
+    /// The path-text policy against one protected list.
+    fn check_text(&self, access: Access, full: &Path, protected: &[Protected]) -> FileResult<()> {
         if full.to_str().is_none() {
             return Err(FileError::invalid("path is not valid UTF-8"));
         }
@@ -137,13 +222,7 @@ impl Policy {
                 "secret files and their directories are read-only through the file tools",
             ));
         }
-        if !self.within_roots(full) {
-            return Err(FileError::denied(
-                "path is outside the configured file roots",
-            ));
-        }
-        self.check_beneath(full)?;
-        for entry in &self.protected {
+        for entry in protected {
             let inside = full == entry.path || (entry.subtree && full.starts_with(&entry.path));
             let blocked = match entry.deny {
                 Deny::ReadWrite => true,
@@ -170,46 +249,56 @@ impl Policy {
         !self.roots_required || self.roots.iter().any(|root| full.starts_with(root))
     }
 
-    /// Kernel second guard on Linux, using nix's safe openat2 wrapper.
+    /// Open the startup root without following replacements on every Unix
+    /// platform. Linux adds a kernel second guard via safe openat2.
     /// ENOSYS alone falls back to the existing physical-fd policy. Missing
     /// leaves are allowed here so creation can use the held, checked parent.
     fn check_beneath(&self, full: &Path) -> FileResult<()> {
-        #[cfg(target_os = "linux")]
         if self.roots_required {
-            use nix::fcntl::{OFlag, OpenHow, ResolveFlag, open, openat2};
+            use nix::fcntl::{OFlag, open};
             use nix::sys::stat::Mode;
             let root = self
                 .roots
                 .iter()
                 .find(|root| full.starts_with(root))
                 .ok_or_else(|| FileError::denied("path is outside the configured file roots"))?;
+            #[cfg(target_os = "linux")]
+            let access = OFlag::O_PATH;
+            #[cfg(not(target_os = "linux"))]
+            let access = OFlag::O_RDONLY;
             let fd = open(
                 root,
-                OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                access | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
                 Mode::empty(),
             )
             .map_err(|_| FileError::denied("configured file root is unavailable"))?;
-            let relative = full
-                .strip_prefix(root)
-                .map_err(|_| FileError::denied("path is outside the configured file roots"))?;
-            let relative = if relative.as_os_str().is_empty() {
-                Path::new(".")
-            } else {
-                relative
-            };
-            match openat2(
-                fd,
-                relative,
-                OpenHow::new()
-                    .flags(OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW)
-                    .resolve(ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_MAGICLINKS),
-            ) {
-                Ok(_) | Err(nix::errno::Errno::ENOSYS | nix::errno::Errno::ENOENT) => {}
-                Err(_) => return Err(FileError::denied("path failed the kernel file-root guard")),
+            #[cfg(target_os = "linux")]
+            {
+                use nix::fcntl::{OpenHow, ResolveFlag, openat2};
+                let relative = full
+                    .strip_prefix(root)
+                    .map_err(|_| FileError::denied("path is outside the configured file roots"))?;
+                let relative = if relative.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    relative
+                };
+                match openat2(
+                    fd,
+                    relative,
+                    OpenHow::new()
+                        .flags(OFlag::O_PATH | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW)
+                        .resolve(ResolveFlag::RESOLVE_BENEATH | ResolveFlag::RESOLVE_NO_MAGICLINKS),
+                ) {
+                    Ok(_) | Err(nix::errno::Errno::ENOSYS | nix::errno::Errno::ENOENT) => {}
+                    Err(_) => {
+                        return Err(FileError::denied("path failed the kernel file-root guard"));
+                    }
+                }
             }
+            #[cfg(not(target_os = "linux"))]
+            drop(fd);
         }
-        #[cfg(not(target_os = "linux"))]
-        let _ = full;
         Ok(())
     }
 
@@ -382,6 +471,56 @@ fn default_protected() -> Vec<Protected> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn root_snapshot_parser_is_strict_and_preserves_deny_all() {
+        for (raw, accepted) in [
+            (r#"{"required":false,"roots":[]}"#, true),
+            (r#"{"roots":[],"required":true}"#, true),
+            (r#" {"required":true,"roots":["/tmp/alias"]} "#, true),
+            (r#"{"required":true,"roots":["/private/tmp/real"]}"#, true),
+            (r#"{}"#, false),
+            (r#"{"roots":[]}"#, false),
+            (r#"{"required":false}"#, false),
+            (r#"{"required":false,"roots":[],"extra":0}"#, false),
+            (r#"{"required":false,"required":true,"roots":[]}"#, false),
+            (r#"{"required":true,"roots":[],"roots":[]}"#, false),
+            (r#"{"required":false,"roots":["/tmp/root"]}"#, false),
+            (
+                r#"{"required":true,"roots":["/tmp/root","/tmp/root"]}"#,
+                false,
+            ),
+            (r#"{"required":true,"roots":["relative"]}"#, false),
+            (r#"{"required":true,"roots":["/"]}"#, false),
+            (r#"{"required":true,"roots":["/tmp/../root"]}"#, false),
+            (r#"{"required":true,"roots":["/tmp/root\u0000"]}"#, false),
+            (r#"{"required":true,"roots":[["/tmp/root"]]}"#, false),
+            (r#"{"required":true,"roots":null}"#, false),
+            (r#"{"required":"true","roots":[]}"#, false),
+            (r#"{"required":false,"roots":[]}{}"#, false),
+            (r#"{"required":false,"roots":[]"#, false),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<RootSnapshot>(raw).is_ok(),
+                accepted,
+                "{raw}"
+            );
+        }
+        for (required, permitted) in [(false, true), (true, false)] {
+            let snapshot: RootSnapshot =
+                serde_json::from_str(&format!(r#"{{"required":{required},"roots":[]}}"#)).unwrap();
+            let policy = Policy::from_root_snapshot(snapshot, true);
+            assert_eq!(policy.within_roots(Path::new("/tmp/anything")), permitted);
+            assert!(!policy.roots_configured());
+        }
+        for roots in [
+            vec!["/tmp/root"; crate::config::MAX_FILE_ROOTS + 1],
+            vec![&"/".repeat(4097)],
+        ] {
+            let raw = serde_json::json!({"required":true,"roots":roots});
+            assert!(serde_json::from_value::<RootSnapshot>(raw).is_err());
+        }
+    }
+
     fn policy(roots: &[&str], protected: Vec<Protected>) -> Policy {
         Policy::new(roots.iter().map(PathBuf::from).collect(), protected, false)
     }
@@ -392,6 +531,42 @@ mod tests {
             subtree,
             deny,
         }
+    }
+
+    /// The pre-display (lexical) check must not match physical aliases that were
+    /// resolved from disk: a physical spelling of a protected path is judged on
+    /// the blocked screen (`check_path`), the configured spelling stays immediate.
+    #[test]
+    fn lexical_check_ignores_disk_derived_protected_aliases() {
+        let base = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(base.path()).unwrap();
+        std::fs::create_dir_all(base.join("real/state")).unwrap();
+        std::os::unix::fs::symlink(base.join("real"), base.join("home")).unwrap();
+        let policy = Policy::new(
+            vec![],
+            vec![entry(
+                base.join("home/state/device-auth.json").to_str().unwrap(),
+                false,
+                Deny::ReadWrite,
+            )],
+            true,
+        );
+        let logical = base.join("home/state/device-auth.json");
+        let physical_file = base.join("real/state/device-auth.json");
+        let physical_dir = base.join("real/state");
+        assert!(policy.check_path_lexical(Access::Write, &logical).is_err());
+        assert!(
+            policy
+                .check_path_lexical(Access::Write, &physical_file)
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check_path_lexical(Access::Remove, &physical_dir)
+                .is_ok()
+        );
+        assert!(policy.check_path(Access::Write, &physical_file).is_err());
+        assert!(policy.check_path(Access::Remove, &physical_dir).is_err());
     }
 
     /// A relative selector whose parents do not exist yet still gets an absolute

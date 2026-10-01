@@ -100,6 +100,7 @@ const {
 } = await import("./tools");
 const { MCP_TOOL_MANIFEST } = await import("./tool-manifest");
 const { bindMcpToolDispatch } = await import("./tool-dispatch");
+const { projectFileToolOutput } = await import("./cli-file-tools");
 const { createMcpContext } = await import("./context");
 const { default: prisma } = await import("@ws-model-proxy/db");
 type McpToolDescriptor = (typeof MCP_TOOL_MANIFEST)[number];
@@ -1424,6 +1425,14 @@ describe("CLI command tools", () => {
     );
   });
 
+  it("documents supervised and headless file audit reason shapes in the activity tool", () => {
+    const tool = requireDescriptor("forwarder_cli_activity_list");
+    expect(tool.descriptionNote).toContain("<op>:<code>");
+    expect(tool.descriptionNote).toContain("write:completed");
+    expect(tool.descriptionNote).toContain("edit:conflict");
+    expect(tool.descriptionNote).toContain("headless file reasons use <code>");
+  });
+
   it("the activity tool call fails closed as not-found for OAuth and a PAT without the flag", async () => {
     const tool = requireDescriptor("forwarder_cli_activity_list");
     for (const credential of [OAUTH_CREDENTIAL, PAT_WITHOUT_CLI]) {
@@ -2170,7 +2179,16 @@ describe("CLI file tools", () => {
         `${name} ${descriptor.scope} ${descriptor.confirmation} ${descriptor.classification}`,
       ).toBe(`${name} ${scope} ${confirmation} ${classification}`);
       expect(descriptor.target).toMatch(/^core:forwarderCliFile/);
-      expect(descriptor.deliverDespiteAbort).not.toBe(true);
+      if (scope === "read") expect(descriptor.deliverDespiteAbort).not.toBe(true);
+      else {
+        expect(descriptor.deliverDespiteAbort).toBe(true);
+        expect(descriptor.deliverDespiteAbortWhen?.({ kind: "supervised", commandId: "id" })).toBe(
+          true,
+        );
+        expect(descriptor.deliverDespiteAbortWhen?.({ ok: true, op: "write", result: {} })).toBe(
+          false,
+        );
+      }
     }
   });
 
@@ -2300,10 +2318,18 @@ describe("CLI file tools", () => {
     expect(read?.description).toContain("ifNoneMatch");
     expect(edit?.description).toContain("expectedEtag");
     expect(edit?.description).toContain("forwarder_cli_file_stat");
+    expect(edit?.description).toContain("io_error");
+    expect(edit?.description).toContain("NOT idempotent");
+    const commandResult = tools.find((tool) => tool.name === "forwarder_cli_command_result");
+    expect(commandResult?.description).toContain("Every non-success after acceptance");
     expect(edit?.description).toContain('confirm: "RUN"');
     const remove = tools.find((tool) => tool.name === "forwarder_cli_file_delete");
     expect(remove?.description).toContain(
-      "Successful edit/write/rename/delete results may include recovered",
+      "successful headless edit/write/rename/delete results may include recovered",
+    );
+    expect(remove?.description).toContain("Headless unsafe_filesystem is a definitive refusal");
+    expect(remove?.description).toContain(
+      "a supervised unsafe_filesystem error after acceptance remains unknown",
     );
     expect(remove?.description).toContain("mkdir/rmdir pair");
     expect(remove?.description).toContain("free space with the shell");
@@ -2404,6 +2430,33 @@ describe("CLI file tools", () => {
     expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["forwarder_cli_file_write", "write", { path: 42, content: "private body", confirm: "RUN" }],
+    [
+      "forwarder_cli_file_edit",
+      "edit",
+      { path: "~/a", edits: [{ oldText: 42, newText: "private edit" }], confirm: "RUN" },
+    ],
+    ["forwarder_cli_file_rename", "rename", { from: 42, to: "~/b", confirm: "RUN" }],
+    ["forwarder_cli_dir_create", "mkdir", { path: "~/a", parents: "yes", confirm: "RUN" }],
+    ["forwarder_cli_file_delete", "delete", { path: 42, confirm: "DELETE" }],
+  ] as const)(
+    "audits a %s shape refusal once before any supervised start",
+    async (name, op, args) => {
+      const authInfo = buildAuthInfo(["mcp:write"]);
+      bindRequest(authInfo, "req-sdk-file-refusal", PAT_WITH_CLI);
+      const { body } = await callTool(authInfo, name, { cliDeviceId: "cli-1", ...args });
+      expect(body.result?.isError).toBe(true);
+      expect(body.result?.structuredContent?.error?.code).toBe("invalid_input");
+      expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledOnce();
+      expect(fileRuntime.auditRefusedFileInput).toHaveBeenCalledWith(
+        expect.objectContaining({ op, cliDeviceId: "" }),
+      );
+      expect(JSON.stringify(fileRuntime.auditRefusedFileInput.mock.calls)).not.toContain("private");
+      expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
+    },
+  );
+
   it("audits missing confirmation and oversized input through the real SDK transport (#104)", async () => {
     const confirmed: Array<[string, Record<string, unknown>]> = [
       ["forwarder_cli_file_write", { path: "~/n", content: "x" }],
@@ -2411,6 +2464,7 @@ describe("CLI file tools", () => {
       ["forwarder_cli_file_rename", { from: "~/a", to: "~/b" }],
       ["forwarder_cli_dir_create", { path: "~/n" }],
       ["forwarder_cli_file_delete", { path: "~/a" }],
+      ["forwarder_cli_dir_create", { path: "~/a" }],
     ];
     const cases: Array<[string, Record<string, unknown>, string]> = [];
     for (const [name, args] of confirmed) {
@@ -2828,6 +2882,10 @@ describe("CLI file tools", () => {
         { code: "offline", outcome: "unknown" },
       ],
       [
+        { ok: false, code: "io_error", outcome: "unknown" },
+        { code: "io_error", outcome: "unknown" },
+      ],
+      [
         { ok: false, code: "upgrade_required", rejectedProtocolVersion: "2.7" },
         { code: "upgrade_required", relayProtocolVersion: "2.7" },
       ],
@@ -2917,6 +2975,223 @@ describe("CLI file tools", () => {
     expect(result.isError).toBe(true);
     expect(structured(result).error?.code).toBe("REQUEST_ABORTED");
   });
+
+  it.each([true, false])(
+    "delivers an aborted write only for a supervised start (%s)",
+    async (supervised) => {
+      const controller = new AbortController();
+      fileRuntime.runFileOp.mockImplementationOnce(
+        async (input: { onSupervisedStart?: () => void }) => {
+          input.onSupervisedStart?.();
+          controller.abort();
+          return supervised
+            ? {
+                ok: true,
+                kind: "supervised",
+                commandId: "file-1",
+                terminalId: "term-1",
+                status: "awaiting_user",
+                waitingUntil: "2026-01-01T00:15:00Z",
+                next: "poll",
+              }
+            : { ok: true, op: "write", result: { etag: "h:aaa", size: 1, created: true } };
+        },
+      );
+      const result = await call(
+        "forwarder_cli_file_write",
+        { cliDeviceId: "cli-1", path: "~/a", content: "x", confirm: "RUN" },
+        { signal: controller.signal },
+      );
+      if (supervised)
+        expect(structured(result).result).toMatchObject({
+          commandId: "file-1",
+          status: "awaiting_user",
+          next: "poll",
+        });
+      else expect(structured(result).error?.code).toBe("REQUEST_ABORTED");
+    },
+  );
+
+  it("aborts promptly before file registration even while admission is pending", async () => {
+    const controller = new AbortController();
+    let release!: (result: unknown) => void;
+    let entered!: () => void;
+    const reached = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    fileRuntime.runFileOp.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+          entered();
+        }),
+    );
+    const pending = call(
+      "forwarder_cli_file_write",
+      { cliDeviceId: "cli-1", path: "~/a", content: "x", confirm: "RUN" },
+      { signal: controller.signal },
+    );
+    await reached;
+    controller.abort();
+    const result = await pending;
+    expect(structured(result).error?.code).toBe("REQUEST_ABORTED");
+    release({ ok: false, code: "cancelled" });
+  });
+
+  it("preserves abort semantics when a headless file core refuses after abort", async () => {
+    const controller = new AbortController();
+    fileRuntime.runFileOp.mockImplementationOnce(
+      async (input: { onSupervisedStart?: () => void }) => {
+        input.onSupervisedStart?.();
+        controller.abort();
+        return { ok: false, code: "cancelled", outcome: "unknown" };
+      },
+    );
+    const result = await call(
+      "forwarder_cli_file_write",
+      { cliDeviceId: "cli-1", path: "~/a", content: "x", confirm: "RUN" },
+      { signal: controller.signal },
+    );
+    expect(structured(result).error?.code).toBe("REQUEST_ABORTED");
+  });
+
+  it.each(["commandId", "terminalId", "next"] as const)(
+    "scrubs credential substrings from supervised start field %s",
+    (field) => {
+      const credential = `wsmp_mcp_${crypto.randomUUID().replaceAll("-", "")}`;
+      const start = {
+        commandId: "file-1",
+        terminalId: "terminal-1",
+        kind: "supervised",
+        status: "awaiting_user",
+        waitingUntil: "2026-01-01T00:15:00.000Z",
+        next: "Poll forwarder_cli_command_result",
+        [field]: `before (${credential}) after`,
+      };
+      expect(projectFileToolOutput(start)).toEqual({
+        ...start,
+        [field]: "before ([redacted]) after",
+      });
+    },
+  );
+
+  it.each([
+    ["conflict", "The file changed since it was read; re-read it and retry with the new etag"],
+    ["declined", "The person declined the file operation; nothing was applied"],
+    ["timeout", "The file operation timed out"],
+    ["offline", "The CLI is offline or does not support file tools"],
+    ["io_error", "The file operation failed"],
+    [
+      "uncertain_outcome",
+      "The file outcome is uncertain; ask the person to check the wsmp daemon log for recovery locations",
+    ],
+    [
+      "unsafe_filesystem",
+      "This filesystem lacks the atomic primitives to change this path without risking a concurrent save; ask the person to check the file",
+    ],
+    ["limit", "Too many file operations; wait for an active request to finish or retry later"],
+    [
+      "secret_file",
+      "Secret files are read-only masked views: edit, write, rename, delete and mkdir are refused on them and on their directories",
+    ],
+  ] as const)(
+    "polls supervised file error %s with its exact documented message",
+    async (code, message) => {
+      const unknown =
+        code === "timeout" ||
+        code === "offline" ||
+        code === "io_error" ||
+        code === "uncertain_outcome" ||
+        code === "unsafe_filesystem";
+      cliRuntime.snapshotSupervisedCommand.mockReturnValueOnce({
+        kind: "supervised",
+        requestKind: "file",
+        commandId: "file-1",
+        status: code === "declined" ? "declined" : unknown ? "cancelled" : "rejected",
+        started: unknown,
+        waitDeadline: null,
+        file: null,
+        fileError: { code, ...(unknown ? { outcome: "unknown" } : {}) },
+      });
+      const result = await call("forwarder_cli_command_result", { commandId: "file-1" });
+      expect(result.isError).toBeUndefined();
+      expect(structured(result).result?.error).toEqual({
+        code,
+        message,
+        ...(unknown ? { outcome: "unknown" } : {}),
+      });
+    },
+  );
+
+  it.each([
+    "conflict",
+    "not_found",
+    "cancelled",
+    "token_inactive",
+    "grant_disabled",
+    "feature_disabled",
+  ] as const)("preserves the unknown outcome of an accepted supervised %s", async (code) => {
+    cliRuntime.snapshotSupervisedCommand.mockReturnValueOnce({
+      kind: "supervised",
+      requestKind: "file",
+      commandId: "file-1",
+      status: "rejected",
+      started: true,
+      waitDeadline: null,
+      file: null,
+      fileError: { code, outcome: "unknown" },
+    });
+    const result = await call("forwarder_cli_command_result", { commandId: "file-1" });
+    expect(structured(result).result?.error).toMatchObject({ code, outcome: "unknown" });
+  });
+
+  it.each(["success", "declined", "timeout"] as const)(
+    "polls file %s through command_result with a bounded documented projection",
+    async (outcome) => {
+      // Ephemeral credential, generated rather than stored as a secret fixture.
+      const credential = `wsmp_mcp_${crypto.randomUUID().replaceAll("-", "")}`;
+      cliRuntime.snapshotSupervisedCommand.mockReturnValueOnce({
+        kind: "supervised",
+        requestKind: "file",
+        commandId: "file-1",
+        status: outcome === "success" ? "exited" : "cancelled",
+        started: outcome !== "declined",
+        waitDeadline: null,
+        file:
+          outcome === "success"
+            ? {
+                op: "write",
+                result: {
+                  etag: "h:aaa",
+                  size: 1,
+                  created: true,
+                  resolvedPath: `/tmp/${credential}`,
+                  extra: "forged",
+                },
+              }
+            : null,
+        fileError:
+          outcome === "success"
+            ? null
+            : { code: outcome, ...(outcome === "timeout" ? { outcome: "unknown" } : {}) },
+      });
+      const result = await call("forwarder_cli_command_result", { commandId: "file-1" });
+      const projected = structured(result).result;
+      if (outcome === "success") {
+        expect(projected?.file).toMatchObject({
+          op: "write",
+          result: { etag: "h:aaa", size: 1, created: true },
+        });
+        expect(JSON.stringify(projected)).not.toContain(credential);
+        expect(JSON.stringify(projected)).not.toContain("forged");
+      } else
+        expect(projected?.error).toMatchObject({
+          code: outcome,
+          message: expect.any(String),
+          ...(outcome === "timeout" ? { outcome: "unknown" } : {}),
+        });
+    },
+  );
 
   it("accepts a base64 write at the 1 MiB decoded cap through the advertised schema (G2)", async () => {
     // The base64 text of a 1 MiB body is ~1.4 MiB, so the schema's

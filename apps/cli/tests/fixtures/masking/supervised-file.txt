@@ -1,0 +1,3 @@
+DEMO_TOKEN=fixture-value-not-a-real-credential
+masked-adjacent=old
+visible=old
