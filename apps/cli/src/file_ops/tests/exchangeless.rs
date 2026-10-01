@@ -538,6 +538,30 @@ fn exchangeless_replace_preserves_a_real_save_during_published_cleanup() {
 }
 
 #[test]
+fn exchangeless_link_publish_returns_the_etag_of_the_public_name() {
+    // On a mount without stable inode numbers the public name and the private
+    // temp report different inodes, and the etag binds the inode. The result
+    // must describe the PUBLIC name. Here a save of identical bytes lands after
+    // the publish (a different inode, like the public name on such a mount): the
+    // returned etag matches that name's etag only if it was taken from the name.
+    for op in REPLACE_OPS {
+        let fx = Fx::new();
+        let etag = prepare(&fx);
+        let doc = fx.root.join("doc");
+        let fx = fx.with_hook(move |step| {
+            if step == Step::DirSynced {
+                save(&doc, EDITED);
+            }
+            Ok(())
+        });
+        let _scope = FaultScope::new(&PublishMethod::Link.faults());
+        let value = op.run(&fx, &etag).unwrap();
+        assert_eq!(value["etag"], fx.etag("doc"), "{op:?}");
+        clean(&fx);
+    }
+}
+
+#[test]
 fn exchangeless_publish_error_after_effect_reconciles_by_held_identity() {
     for op in REPLACE_OPS {
         for method in METHODS {
@@ -1421,6 +1445,11 @@ fn exchangeless_real_filesystem_optional_e2e() {
                         }
                     );
                     assert!(value.get("recovered").is_none());
+                    if race.is_none() {
+                        // The returned etag must describe the public name even
+                        // where link publication gives it its own inode number.
+                        assert_eq!(value["etag"], fx.etag("doc"), "{op:?}");
+                    }
                     clean(&fx);
                 }
                 Err(error) if error.code == ErrorCode::UnsafeFilesystem => {

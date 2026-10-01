@@ -219,7 +219,7 @@ fn replace_inner(
     drop(orig);
     drop(tmp_file);
     let result = prepared.and_then(|new_stat| {
-        commit_stage(
+        let linked = commit_stage(
             ops,
             recovery,
             &mut tmp,
@@ -232,6 +232,17 @@ fn replace_inner(
         let _ = ops.step(Step::Renamed);
         fsync(dir.as_fd()).map_err(FileError::errno)?;
         let _ = ops.step(Step::DirSynced);
+        if linked {
+            // Link publication gives the public name its own directory entry. On a
+            // mount without stable inode numbers (some FUSE filesystems) that name
+            // reports a different inode than the temp the stat came from, and the
+            // etag binds the inode: describe the public name, as every later read
+            // will. A racer that replaced it meanwhile only yields an etag that
+            // matches the racer's file at best, never a stale validation.
+            return Ok(fstatat(dir.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW)
+                .map(|raw| Stat::from_raw(&raw))
+                .unwrap_or(new_stat));
+        }
         Ok(new_stat)
     });
     if armed && !recovery.dispose(ops, &tmp, &mut identity) {
@@ -253,7 +264,7 @@ fn commit_stage(
     identity: &mut Held,
     armed: &mut bool,
     cancel: &Cancel,
-) -> FileResult<()> {
+) -> FileResult<bool> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         match recovery.exchange_temp(tmp) {
@@ -264,7 +275,7 @@ fn commit_stage(
                 if recovery.holds(tmp, original) {
                     // Committed: cleanup failure is reported in recovered.
                     recovery.dispose(ops, tmp, original);
-                    return Ok(());
+                    return Ok(false);
                 }
                 original.release(); // no longer needed; undo may link this inode
                 let y = recovery.capture_origin(tmp);

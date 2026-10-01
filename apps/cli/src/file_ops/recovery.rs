@@ -248,6 +248,8 @@ impl RecoveryDir {
                 mkdirat(parent.as_fd(), name.as_os_str(), Mode::S_IRWXU)
             }) {
                 Err(Errno::EEXIST) if attempts < MAX_NAME_ATTEMPTS => continue,
+                // Exhausted: not "the path exists" (the caller's target is fine).
+                Err(Errno::EEXIST) => return Err(FileError::new(ErrorCode::IoError, "EEXIST")),
                 Err(errno) => return Err(FileError::errno(errno)),
                 Ok(()) => {}
             }
@@ -461,7 +463,7 @@ impl RecoveryDir {
         original: &mut Held,
         identity: &mut Held,
         cancel: &Cancel,
-    ) -> FileResult<()> {
+    ) -> FileResult<bool> {
         let before_capture = (|| {
             let method = self.probe_publish(ops, tmp, identity)?;
             if !self.holds(tmp, identity) {
@@ -530,7 +532,7 @@ impl RecoveryDir {
                 }
             }
             self.dispose(ops, &captured, original);
-            return Ok(());
+            return Ok(matches!(method, PublishMethod::Link));
         }
         // Not committed: the original is preserved. An EEXIST racer must stay
         // untouched; do not capture it to finish this operation.
@@ -547,7 +549,7 @@ impl RecoveryDir {
         self.dispose(ops, tmp, identity);
         let errno = match published {
             Err(errno) => errno,
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(matches!(method, PublishMethod::Link)),
         };
         let unsupported = match method {
             PublishMethod::NoReplace => is_unsupported(errno),
@@ -1224,6 +1226,15 @@ mod tests {
             let _faults = FaultScope::new(&faults);
             let result = recovery.probe_publish(&fx.ops, &mut tmp, &mut identity);
             assert_eq!(recovery.used, 1);
+            // Each private name is proven by a proof opened on that name: the
+            // alias, then the surviving tmp (a cross-name proof opens only once).
+            assert_eq!(
+                FaultScope::calls()
+                    .iter()
+                    .filter(|p| **p == Primitive::Hold)
+                    .count(),
+                if fail_unlink { 1 } else { 2 }
+            );
             assert_eq!(fx.get("destination"), "original");
             assert_eq!(
                 FaultScope::calls()
@@ -1335,7 +1346,8 @@ mod tests {
             .collect();
         let _faults = FaultScope::new(&faults);
         let error = RecoveryDir::new(&parent, &fx.root).err().unwrap();
-        assert_eq!(error.code, ErrorCode::Exists);
+        assert_eq!(error.code, ErrorCode::IoError);
+        assert_eq!(error.message, "EEXIST");
         assert_eq!(
             FaultScope::calls()
                 .iter()
