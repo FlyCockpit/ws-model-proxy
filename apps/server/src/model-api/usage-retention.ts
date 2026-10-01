@@ -224,6 +224,9 @@ type MovedMinuteRow = {
   cacheWriteTokens: bigint;
   cacheKnownRequests: number;
   cacheKnownInputTokens: bigint;
+  continuationRequests: number;
+  continuationInputTokens: bigint;
+  continuationCacheReadTokens: bigint;
   durationCount: number;
   durationSumMs: bigint;
   latencyHistogram: number[] | null;
@@ -256,6 +259,9 @@ export function hourIncrementsFromMinuteRows(
     cacheWriteTokens: BigInt(row.cacheWriteTokens),
     cacheKnownRequests: Number(row.cacheKnownRequests),
     cacheKnownInputTokens: BigInt(row.cacheKnownInputTokens),
+    continuationRequests: Number(row.continuationRequests),
+    continuationInputTokens: BigInt(row.continuationInputTokens),
+    continuationCacheReadTokens: BigInt(row.continuationCacheReadTokens),
     durationCount: Number(row.durationCount),
     durationSumMs: BigInt(row.durationSumMs),
     latencyHistogram: (row.latencyHistogram ?? []).map(Number),
@@ -293,7 +299,9 @@ export async function compactMinuteRollups({
           m."executionTargetId", m.source::text AS source, m.requests, m.successes,
           m.errors, m.cancels, m.retries, m."usageKnownRequests", m."inputTokens",
           m."outputTokens", m."cacheReadTokens", m."cacheWriteTokens",
-          m."cacheKnownRequests", m."cacheKnownInputTokens", m."durationCount",
+          m."cacheKnownRequests", m."cacheKnownInputTokens",
+          m."continuationRequests", m."continuationInputTokens",
+          m."continuationCacheReadTokens", m."durationCount",
           m."durationSumMs", m."latencyHistogram", m."ttftCount", m."ttftSumMs",
           m."ttftHistogram"`;
       if (rows.length === 0) return 0;

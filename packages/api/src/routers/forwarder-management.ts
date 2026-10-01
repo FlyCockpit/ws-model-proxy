@@ -24,6 +24,13 @@ import { z } from "zod";
 import type { LiveCliFeatureSnapshot } from "../context";
 import { protectedProcedure } from "../index";
 import {
+  CACHE_STATS_MAX_LAST_DAYS,
+  CACHE_STATS_MAX_LAST_MINUTES,
+  type CacheStatsQueryRow,
+  resolveCacheStatsWindow,
+  shapeCacheStats,
+} from "../lib/cache-stats";
+import {
   assertEffectiveConcurrencyPolicy,
   assertEffectiveContextPolicy,
   assertModelPoolCapacityPolicy,
@@ -1135,6 +1142,105 @@ async function ownedPool(poolId: string, userId: string) {
     throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
   }
   return pool;
+}
+
+async function accessiblePool(poolId: string, userId: string) {
+  const pool = await prisma.modelPool.findUnique({
+    where: { id: poolId },
+    select: { id: true, userId: true },
+  });
+  if (!pool) {
+    throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+  }
+  if (pool.userId === userId) return { pool, ownerScope: true };
+  const grant = await prisma.poolGrant.findFirst({
+    where: { poolId, granteeUserId: userId },
+    select: { id: true },
+  });
+  if (!grant) {
+    throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+  }
+  return { pool, ownerScope: false };
+}
+
+const poolCacheStatsInput = z
+  .object({
+    poolId: idSchema,
+    poolMemberId: idSchema.optional(),
+    lastMinutes: z.number().int().min(1).max(CACHE_STATS_MAX_LAST_MINUTES).optional(),
+    lastDays: z.number().int().min(1).max(CACHE_STATS_MAX_LAST_DAYS).optional(),
+    bucket: z.number().int().min(1).max(CACHE_STATS_MAX_LAST_MINUTES).optional(),
+    split: z.literal("member").optional(),
+  })
+  .superRefine((value, ctx) => {
+    if ((value.lastMinutes != null) === (value.lastDays != null)) {
+      ctx.addIssue({
+        code: "custom",
+        message: "Provide exactly one of lastMinutes or lastDays.",
+      });
+    }
+  });
+
+async function queryCacheStatsRows({
+  table,
+  poolId,
+  poolMemberId,
+  userId,
+  ownerScope,
+  start,
+  end,
+}: {
+  table: "usage_rollup_minute" | "usage_rollup_hour";
+  poolId: string;
+  poolMemberId: string | undefined;
+  userId: string;
+  ownerScope: boolean;
+  start: Date;
+  end: Date;
+}): Promise<CacheStatsQueryRow[]> {
+  const memberId = poolMemberId ?? "";
+  if (table === "usage_rollup_hour") {
+    return prisma.$queryRaw<CacheStatsQueryRow[]>`
+      SELECT r."bucketStart", r."poolMemberId",
+             SUM(r.requests)::bigint AS requests,
+             SUM(r."cacheReadTokens")::bigint AS "cacheReadTokens",
+             SUM(r."cacheKnownRequests")::bigint AS "cacheKnownRequests",
+             SUM(r."cacheKnownInputTokens")::bigint AS "cacheKnownInputTokens",
+             SUM(r."continuationRequests")::bigint AS "continuationRequests",
+             SUM(r."continuationInputTokens")::bigint AS "continuationInputTokens",
+             SUM(r."continuationCacheReadTokens")::bigint AS "continuationCacheReadTokens"
+        FROM usage_rollup_hour r
+       WHERE r."poolId" = ${poolId}
+         AND r."bucketStart" >= ${start}
+         AND r."bucketStart" < ${end}
+         AND r.source::text = 'API_TOKEN'
+         AND (
+           (${ownerScope} AND r."ownerUserId" = ${userId})
+           OR (NOT ${ownerScope} AND r."requesterUserId" = ${userId} AND r."ownerUserId" <> ${userId})
+         )
+         AND (${memberId} = '' OR r."poolMemberId" = ${memberId})
+       GROUP BY 1, 2`;
+  }
+  return prisma.$queryRaw<CacheStatsQueryRow[]>`
+    SELECT r."bucketStart", r."poolMemberId",
+           SUM(r.requests)::bigint AS requests,
+           SUM(r."cacheReadTokens")::bigint AS "cacheReadTokens",
+           SUM(r."cacheKnownRequests")::bigint AS "cacheKnownRequests",
+           SUM(r."cacheKnownInputTokens")::bigint AS "cacheKnownInputTokens",
+           SUM(r."continuationRequests")::bigint AS "continuationRequests",
+           SUM(r."continuationInputTokens")::bigint AS "continuationInputTokens",
+           SUM(r."continuationCacheReadTokens")::bigint AS "continuationCacheReadTokens"
+      FROM usage_rollup_minute r
+     WHERE r."poolId" = ${poolId}
+       AND r."bucketStart" >= ${start}
+       AND r."bucketStart" < ${end}
+       AND r.source::text = 'API_TOKEN'
+       AND (
+         (${ownerScope} AND r."ownerUserId" = ${userId})
+         OR (NOT ${ownerScope} AND r."requesterUserId" = ${userId} AND r."ownerUserId" <> ${userId})
+       )
+       AND (${memberId} = '' OR r."poolMemberId" = ${memberId})
+     GROUP BY 1, 2`;
 }
 
 async function ownedDiscoveredModel(discoveredModelId: string, userId: string) {
@@ -2664,6 +2770,60 @@ export const forwarderManagementRouter = {
     });
     return rows.map(serializePool);
   }),
+
+  poolCacheStats: protectedProcedure
+    .input(poolCacheStatsInput)
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      const { ownerScope } = await accessiblePool(input.poolId, userId);
+      if (input.poolMemberId) {
+        const member = await prisma.poolMember.findUnique({
+          where: { id: input.poolMemberId },
+          select: { id: true, poolId: true },
+        });
+        if (!member || member.poolId !== input.poolId) {
+          throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+        }
+      }
+      const window = resolveCacheStatsWindow(
+        {
+          lastMinutes: input.lastMinutes,
+          lastDays: input.lastDays,
+          bucket: input.bucket,
+        },
+        new Date(),
+      );
+      const minuteStart = window.hourUntil ?? window.start;
+      const [minuteRows, hourRows] = await Promise.all([
+        minuteStart < window.end
+          ? queryCacheStatsRows({
+              table: "usage_rollup_minute",
+              poolId: input.poolId,
+              poolMemberId: input.poolMemberId,
+              userId,
+              ownerScope,
+              start: minuteStart,
+              end: window.end,
+            })
+          : Promise.resolve([] as CacheStatsQueryRow[]),
+        window.hourUntil && window.start < window.hourUntil
+          ? queryCacheStatsRows({
+              table: "usage_rollup_hour",
+              poolId: input.poolId,
+              poolMemberId: input.poolMemberId,
+              userId,
+              ownerScope,
+              start: window.start,
+              end: window.hourUntil,
+            })
+          : Promise.resolve([] as CacheStatsQueryRow[]),
+      ]);
+      return shapeCacheStats({
+        window,
+        rows: [...hourRows, ...minuteRows],
+        split: input.split,
+      });
+    }),
 
   cacheAffinityStats: protectedProcedure
     .input(z.object({ poolId: idSchema }))

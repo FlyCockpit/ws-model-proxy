@@ -33,6 +33,7 @@ import {
   resolveCapacityAvailability,
 } from "@/components/forwarder-dashboard-sections";
 import { InlineRetry } from "@/components/inline-retry";
+import { PoolCacheStats } from "@/components/pool-cache-stats";
 import { ownerFallbackRoutes, PoolFallbackBadge } from "@/components/pool-fallback-badge";
 import { PoolMetricRoutingRules } from "@/components/pool-metric-routing-rules";
 import { ProviderOperationsSection } from "@/components/provider-operations-section";
@@ -521,6 +522,9 @@ export function PoolDetailTab({
           stickySave
           onSuccess={() => undefined}
         />
+        <div className="border-t pt-6">
+          <PoolCacheStats poolId={pool.id} />
+        </div>
         <section className="space-y-3 border-t pt-6" aria-labelledby="pool-members-title">
           <h3 id="pool-members-title" className="text-base font-semibold">
             {t("dashboard:pools.membersTitle")}

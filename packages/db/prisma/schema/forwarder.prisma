@@ -1760,35 +1760,40 @@ model RelayRequest {
 /// `@ws-model-proxy/config/usage-metrics`. Kept 30 days, then compacted into
 /// UsageRollupHour.
 model UsageRollupMinute {
-  bucketStart           DateTime
-  ownerUserId           String
+  bucketStart                 DateTime
+  ownerUserId                 String
   /// '' once the requester was deleted (merged by the drain/purge); never NULL.
-  requesterUserId       String
-  poolId                String             @default("")
-  poolMemberId          String             @default("")
-  executionTargetId     String             @default("")
-  source                RelayRequestSource
-  updatedAt             DateTime           @default(now())
-  requests              Int                @default(0)
-  successes             Int                @default(0)
-  errors                Int                @default(0)
-  cancels               Int                @default(0)
-  retries               Int                @default(0)
-  usageKnownRequests    Int                @default(0)
-  inputTokens           BigInt             @default(0)
-  outputTokens          BigInt             @default(0)
-  cacheReadTokens       BigInt             @default(0)
-  cacheWriteTokens      BigInt             @default(0)
+  requesterUserId             String
+  poolId                      String             @default("")
+  poolMemberId                String             @default("")
+  executionTargetId           String             @default("")
+  source                      RelayRequestSource
+  updatedAt                   DateTime           @default(now())
+  requests                    Int                @default(0)
+  successes                   Int                @default(0)
+  errors                      Int                @default(0)
+  cancels                     Int                @default(0)
+  retries                     Int                @default(0)
+  usageKnownRequests          Int                @default(0)
+  inputTokens                 BigInt             @default(0)
+  outputTokens                BigInt             @default(0)
+  cacheReadTokens             BigInt             @default(0)
+  cacheWriteTokens            BigInt             @default(0)
   /// Requests whose upstream reported cache usage, and their prompt tokens:
   /// the denominator of the token-weighted prompt-cache hit rate.
-  cacheKnownRequests    Int                @default(0)
-  cacheKnownInputTokens BigInt             @default(0)
-  durationCount         Int                @default(0)
-  durationSumMs         BigInt             @default(0)
-  latencyHistogram      Int[]              @default([])
-  ttftCount             Int                @default(0)
-  ttftSumMs             BigInt             @default(0)
-  ttftHistogram         Int[]              @default([])
+  cacheKnownRequests          Int                @default(0)
+  cacheKnownInputTokens       BigInt             @default(0)
+  /// Matched-affinity requests that also reported cache fields (continuation
+  /// split). Older buckets stay 0, so continuationHitRate is null until data lands.
+  continuationRequests        Int                @default(0)
+  continuationInputTokens     BigInt             @default(0)
+  continuationCacheReadTokens BigInt             @default(0)
+  durationCount               Int                @default(0)
+  durationSumMs               BigInt             @default(0)
+  latencyHistogram            Int[]              @default([])
+  ttftCount                   Int                @default(0)
+  ttftSumMs                   BigInt             @default(0)
+  ttftHistogram               Int[]              @default([])
 
   @@id([bucketStart, ownerUserId, requesterUserId, poolId, poolMemberId, executionTargetId, source])
   @@index([ownerUserId, bucketStart])
@@ -1799,33 +1804,36 @@ model UsageRollupMinute {
 /// Hourly compaction of UsageRollupMinute (same key, own-key owner semantics and counters), kept 13
 /// months. Rows are only written by the retention compaction job.
 model UsageRollupHour {
-  bucketStart           DateTime
-  ownerUserId           String
+  bucketStart                 DateTime
+  ownerUserId                 String
   /// '' once the requester was deleted (merged by the drain/purge); never NULL.
-  requesterUserId       String
-  poolId                String             @default("")
-  poolMemberId          String             @default("")
-  executionTargetId     String             @default("")
-  source                RelayRequestSource
-  updatedAt             DateTime           @default(now())
-  requests              Int                @default(0)
-  successes             Int                @default(0)
-  errors                Int                @default(0)
-  cancels               Int                @default(0)
-  retries               Int                @default(0)
-  usageKnownRequests    Int                @default(0)
-  inputTokens           BigInt             @default(0)
-  outputTokens          BigInt             @default(0)
-  cacheReadTokens       BigInt             @default(0)
-  cacheWriteTokens      BigInt             @default(0)
-  cacheKnownRequests    Int                @default(0)
-  cacheKnownInputTokens BigInt             @default(0)
-  durationCount         Int                @default(0)
-  durationSumMs         BigInt             @default(0)
-  latencyHistogram      Int[]              @default([])
-  ttftCount             Int                @default(0)
-  ttftSumMs             BigInt             @default(0)
-  ttftHistogram         Int[]              @default([])
+  requesterUserId             String
+  poolId                      String             @default("")
+  poolMemberId                String             @default("")
+  executionTargetId           String             @default("")
+  source                      RelayRequestSource
+  updatedAt                   DateTime           @default(now())
+  requests                    Int                @default(0)
+  successes                   Int                @default(0)
+  errors                      Int                @default(0)
+  cancels                     Int                @default(0)
+  retries                     Int                @default(0)
+  usageKnownRequests          Int                @default(0)
+  inputTokens                 BigInt             @default(0)
+  outputTokens                BigInt             @default(0)
+  cacheReadTokens             BigInt             @default(0)
+  cacheWriteTokens            BigInt             @default(0)
+  cacheKnownRequests          Int                @default(0)
+  cacheKnownInputTokens       BigInt             @default(0)
+  continuationRequests        Int                @default(0)
+  continuationInputTokens     BigInt             @default(0)
+  continuationCacheReadTokens BigInt             @default(0)
+  durationCount               Int                @default(0)
+  durationSumMs               BigInt             @default(0)
+  latencyHistogram            Int[]              @default([])
+  ttftCount                   Int                @default(0)
+  ttftSumMs                   BigInt             @default(0)
+  ttftHistogram               Int[]              @default([])
 
   @@id([bucketStart, ownerUserId, requesterUserId, poolId, poolMemberId, executionTargetId, source])
   @@index([ownerUserId, bucketStart])

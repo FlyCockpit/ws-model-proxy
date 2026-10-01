@@ -1066,6 +1066,26 @@
       "slots": "{{busy}}/{{total}} slots",
       "prefixHit": "aciertos de prefijo {{value}}",
       "noReading": "Aún no hay lectura del motor."
+    },
+    "cacheStats": {
+      "title": "Tasa de aciertos de caché de prompts",
+      "description": "Tasa ponderada por tokens sobre las solicitudes cuyo motor reportó uso de caché. La tasa de continuación excluye los primeros turnos, así que es la cifra de estabilidad para comparar antes y después de un cambio.",
+      "chartLabel": "Tasa de aciertos de caché de prompts en la ventana seleccionada",
+      "empty": "No se reportó uso de caché en esta ventana.",
+      "noTraffic": "No hay tráfico en esta ventana.",
+      "lowCoverage": "La tasa de aciertos se basa en pocas solicitudes (cobertura {{coverage}}).",
+      "loadFailed": "No se pudieron cargar las estadísticas de aciertos de caché.",
+      "hitRate": "Tasa de aciertos",
+      "continuationHitRate": "Tasa de aciertos en continuaciones",
+      "coverage": "Cobertura",
+      "notReported": "No reportado",
+      "stability": "Mediana {{median}} · p10 {{p10}} · σ {{stddev}}",
+      "rangeLabel": "Ventana",
+      "ranges": {
+        "1h": "1h",
+        "24h": "24h",
+        "7d": "7d"
+      }
     }
   },
   "providers": {

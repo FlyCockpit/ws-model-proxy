@@ -113,6 +113,7 @@ const db = prisma as unknown as {
     upsert: MockInstance;
     deleteMany: MockInstance;
     findMany: MockInstance;
+    findFirst: MockInstance;
     updateMany: MockInstance;
     findUniqueOrThrow: MockInstance;
   };
@@ -286,6 +287,7 @@ describe("forwarderManagementRouter", () => {
     );
     db.poolMember.count.mockResolvedValue(0);
     db.poolGrant.findMany.mockResolvedValue([]);
+    db.poolGrant.findFirst.mockResolvedValue(null);
     db.$queryRaw.mockResolvedValue([]);
     db.executionTarget.upsert.mockResolvedValue({ id: "target-id" });
     db.executionTarget.findUnique.mockResolvedValue(null);
@@ -4301,6 +4303,78 @@ describe("forwarderManagementRouter", () => {
     });
     expect(db.cacheAffinityRecord.count).not.toHaveBeenCalled();
     expect(db.cacheAffinityRecord.deleteMany).not.toHaveBeenCalled();
+  });
+
+  describe("poolCacheStats", () => {
+    function cacheRow(overrides: Record<string, unknown> = {}) {
+      return {
+        bucketStart: new Date(Date.now() - 5 * 60_000),
+        poolMemberId: "member-a",
+        requests: 10n,
+        cacheReadTokens: 40n,
+        cacheKnownRequests: 8n,
+        cacheKnownInputTokens: 80n,
+        continuationRequests: 4n,
+        continuationInputTokens: 40n,
+        continuationCacheReadTokens: 30n,
+        ...overrides,
+      };
+    }
+
+    it("lets the owner see every requester on their pool", async () => {
+      db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+      db.$queryRaw.mockResolvedValue([cacheRow()]);
+      const stats = await client().poolCacheStats({ poolId: "pool-id", lastMinutes: 60 });
+      expect(stats.hitRate).toBeCloseTo(0.5);
+      expect(stats.continuationHitRate).toBeCloseTo(0.75);
+      expect(db.poolGrant.findFirst).not.toHaveBeenCalled();
+      const dumped = JSON.stringify(db.$queryRaw.mock.calls);
+      expect(dumped).toContain("ownerUserId");
+      expect(dumped).toContain("usage_rollup_minute");
+    });
+
+    it("lets a grantee see only their own requests", async () => {
+      db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "owner-id" });
+      db.poolGrant.findFirst.mockResolvedValue({ id: "grant-id" });
+      db.$queryRaw.mockResolvedValue([cacheRow({ continuationInputTokens: 0n })]);
+      const grantee = createRouterClient(forwarderManagementRouter, {
+        context: buildContext({ user: { id: "grantee-id" } }),
+      });
+      const stats = await grantee.poolCacheStats({ poolId: "pool-id", lastMinutes: 60 });
+      expect(stats.hitRate).toBeCloseTo(0.5);
+      expect(stats.continuationHitRate).toBeNull();
+      expect(db.poolGrant.findFirst).toHaveBeenCalledWith({
+        where: { poolId: "pool-id", granteeUserId: "grantee-id" },
+        select: { id: true },
+      });
+      const dumped = JSON.stringify(db.$queryRaw.mock.calls);
+      expect(dumped).toContain("requesterUserId");
+      expect(dumped).toContain("ownerUserId");
+    });
+
+    it("returns NOT_FOUND for a foreign pool or member", async () => {
+      db.modelPool.findUnique.mockResolvedValue(null);
+      await expect(
+        client().poolCacheStats({ poolId: "missing", lastMinutes: 60 }),
+      ).rejects.toMatchObject({ code: "NOT_FOUND" });
+      expect(db.$queryRaw.mock.calls.some((call) => !isFenceCall(call))).toBe(false);
+
+      db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "other-user" });
+      db.poolGrant.findFirst.mockResolvedValue(null);
+      await expect(
+        client().poolCacheStats({ poolId: "pool-id", lastMinutes: 60 }),
+      ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+      db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+      db.poolMember.findUnique.mockResolvedValue({ id: "member-x", poolId: "other-pool" });
+      await expect(
+        client().poolCacheStats({
+          poolId: "pool-id",
+          poolMemberId: "member-x",
+          lastMinutes: 60,
+        }),
+      ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    });
   });
 
   describe("update-path recommended-surface revalidation", () => {

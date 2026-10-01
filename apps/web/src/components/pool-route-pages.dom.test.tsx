@@ -59,6 +59,10 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
   };
 });
 
+vi.mock("@/components/pool-cache-stats", () => ({
+  PoolCacheStats: () => <div>pool-cache-stats</div>,
+}));
+
 vi.mock("@/components/forwarder-dashboard-sections", () => ({
   allDirectModels: () => [],
   CapacitySetupForm: () => <div>capacity-form</div>,

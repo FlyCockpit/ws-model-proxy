@@ -80,6 +80,9 @@ function minuteRow(overrides: Record<string, unknown> = {}) {
     cacheWriteTokens: 0n,
     cacheKnownRequests: 2,
     cacheKnownInputTokens: 10n,
+    continuationRequests: 1,
+    continuationInputTokens: 5n,
+    continuationCacheReadTokens: 3n,
     durationCount: 2,
     durationSumMs: 300n,
     latencyHistogram: [0, 0, 0, 0, 0, 0, 2],
@@ -462,7 +465,14 @@ describe("usage retention", () => {
   it("re-keys minute rows to their hour without losing counters", () => {
     const [increment] = hourIncrementsFromMinuteRows([minuteRow() as never]);
     expect(increment?.bucketStart.toISOString()).toBe("2026-08-01T10:00:00.000Z");
-    expect(increment).toMatchObject({ requests: 2, inputTokens: 10n, durationSumMs: 300n });
+    expect(increment).toMatchObject({
+      requests: 2,
+      inputTokens: 10n,
+      durationSumMs: 300n,
+      continuationRequests: 1,
+      continuationInputTokens: 5n,
+      continuationCacheReadTokens: 3n,
+    });
     expect(increment?.latencyHistogram[6]).toBe(2);
   });
 

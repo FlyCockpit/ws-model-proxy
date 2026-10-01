@@ -1066,6 +1066,26 @@
       "slots": "{{busy}}/{{total}} slots",
       "prefixHit": "prefix hits {{value}}",
       "noReading": "No reading from the engine yet."
+    },
+    "cacheStats": {
+      "title": "Prompt-cache hit rate",
+      "description": "Token-weighted hit rate over requests whose engine reported cache usage. Continuation hit rate excludes first turns, so it is the stability figure to compare before and after a change.",
+      "chartLabel": "Prompt-cache hit rate over the selected window",
+      "empty": "No cache usage reported in this window.",
+      "noTraffic": "No traffic in this window.",
+      "lowCoverage": "Hit rate rests on few requests ({{coverage}} coverage).",
+      "loadFailed": "Couldn't load cache hit-rate stats.",
+      "hitRate": "Hit rate",
+      "continuationHitRate": "Continuation hit rate",
+      "coverage": "Coverage",
+      "notReported": "Not reported",
+      "stability": "Median {{median}} · p10 {{p10}} · σ {{stddev}}",
+      "rangeLabel": "Window",
+      "ranges": {
+        "1h": "1h",
+        "24h": "24h",
+        "7d": "7d"
+      }
     }
   },
   "relay": {

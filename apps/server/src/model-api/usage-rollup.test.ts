@@ -47,6 +47,7 @@ function row(overrides: Partial<RelayRollupRow> = {}): RelayRollupRow {
     cacheReadTokens: 60,
     cacheWriteTokens: null,
     usageKnown: true,
+    affinityOutcome: "PREDICTED_MATCH",
     // Derived by the database at insert (schema-hardening.sql): the pool owner.
     resourceOwnerUserId: "owner-1",
     ...overrides,
@@ -82,6 +83,9 @@ describe("rollupIncrementForRequest", () => {
       cacheReadTokens: 60n,
       cacheKnownRequests: 1,
       cacheKnownInputTokens: 100n,
+      continuationRequests: 1,
+      continuationInputTokens: 100n,
+      continuationCacheReadTokens: 60n,
       durationCount: 1,
       durationSumMs: 1250n,
       ttftCount: 1,
@@ -194,6 +198,9 @@ describe("rollupIncrementForRequest", () => {
       cacheKnownRequests: 0,
       cacheKnownInputTokens: 0n,
       cacheReadTokens: 0n,
+      continuationRequests: 0,
+      continuationInputTokens: 0n,
+      continuationCacheReadTokens: 0n,
       usageKnownRequests: 1,
     });
     expect(
@@ -201,6 +208,26 @@ describe("rollupIncrementForRequest", () => {
         row({ usageKnown: false, promptTokens: null, cacheReadTokens: null }),
       ),
     ).toMatchObject({ usageKnownRequests: 0, inputTokens: 0n, cacheKnownRequests: 0 });
+  });
+
+  it("increments continuation columns only for matched affinity with cache fields", () => {
+    expect(rollupIncrementForRequest(row({ affinityOutcome: "NO_MATCH" }))).toMatchObject({
+      cacheKnownRequests: 1,
+      continuationRequests: 0,
+      continuationInputTokens: 0n,
+      continuationCacheReadTokens: 0n,
+    });
+    expect(rollupIncrementForRequest(row({ affinityOutcome: "HOLDER_SPILLED" }))).toMatchObject({
+      continuationRequests: 0,
+    });
+    expect(rollupIncrementForRequest(row({ affinityOutcome: "HOLDER_WAITED" }))).toMatchObject({
+      continuationRequests: 1,
+      continuationInputTokens: 100n,
+      continuationCacheReadTokens: 60n,
+    });
+    expect(rollupIncrementForRequest(row({ affinityOutcome: null }))).toMatchObject({
+      continuationRequests: 0,
+    });
   });
 });
 

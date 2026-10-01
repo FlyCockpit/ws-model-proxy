@@ -92,6 +92,7 @@ integration("usage rollups with real PostgreSQL", () => {
       cacheReadTokens: 4,
       cacheWriteTokens: null,
       usageKnown: true,
+      affinityOutcome: "PREDICTED_MATCH",
       resourceOwnerUserId: null,
       ...overrides,
     };
@@ -289,6 +290,9 @@ integration("usage rollups with real PostgreSQL", () => {
         requesterUserId: owner.id,
         requests: 3,
         durationSumMs: 3200n,
+        continuationRequests: 3,
+        continuationInputTokens: 30n,
+        continuationCacheReadTokens: 12n,
       });
       expect(hour[0]!.latencyHistogram[latencyBucketIndex(100)]).toBe(2);
       expect(hour[0]!.latencyHistogram[latencyBucketIndex(3000)]).toBe(1);

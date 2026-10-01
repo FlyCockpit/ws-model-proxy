@@ -554,6 +554,16 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.cacheAffinityStats),
   },
   {
+    name: "forwarder_pool_cache_stats_get",
+    target: "forwarderManagement.poolCacheStats",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    descriptionNote:
+      "Prompt-cache hit rate for a pool (or one member) over lastMinutes or lastDays. hitRate is cacheReadTokens/cacheKnownInputTokens capped at 1, or null when nothing reported cache usage. continuationHitRate is the same ratio for matched-affinity requests (null for windows that predate those columns). coverage is cacheKnownRequests/requests. Compare continuationHitRate for equal windows before and after a change, and check coverage first. Owners see every requester on their pools; grantees see only their own. A foreign pool or member returns NOT_FOUND.",
+    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.poolCacheStats),
+  },
+  {
     name: "forwarder_models_visible_list",
     target: "forwarderManagement.visibleModels",
     scope: "read",
@@ -1342,8 +1352,8 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
 ];
 
 /**
- * The checked catalog: exactly 33 read tools and 60 write tools
- * (79 procedure-backed + 14 extracted cores: 2 diagnostics, 3 CLI commands
+ * The checked catalog: exactly 34 read tools and 60 write tools
+ * (80 procedure-backed + 14 extracted cores: 2 diagnostics, 3 CLI commands
  * and 9 node file tools (4 read, 5 write)).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS].map(

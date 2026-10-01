@@ -108,6 +108,21 @@ Metric routing rules (S-B part 2):
   read); a changed command stops until it is approved
   again. stderr and command output never leave the CLI; only parsed numbers do.
 
+`forwarder_pool_cache_stats_get` (`{ poolId, poolMemberId?, lastMinutes | lastDays,
+bucket?, split? }`) returns the prompt-cache hit rate for a pool, or one member,
+over a window ending now. `hitRate` is `cacheReadTokens / cacheKnownInputTokens`,
+capped at 1, or `null` when nothing reported cache usage (never 0 for unknown).
+`continuationHitRate` is the same ratio for requests that continued a known
+session (matched affinity); it is `null` for windows that predate those rollup
+columns. `coverage` is `cacheKnownRequests / requests` — check it first.
+Compare `continuationHitRate` for equal windows before and after a change.
+`notes` may include `low_coverage`, `window_truncated_by_retention`,
+`hour_resolution`, and `engine_reports_no_cache_fields`. Minutes read minute
+rollups; days read minute rollups up to 30 days and hour rollups beyond.
+Owners see every requester on their pools; grantees see only their own. A
+foreign pool or member returns `NOT_FOUND`. Engine prefix-cache counters stay
+on the engine-load charts and are not mixed into this tool.
+
 ## CLI file tools (relay protocol 2.8)
 
 Nine PAT-only tools read and change files on a CLI device (a node): `forwarder_cli_file_read`,

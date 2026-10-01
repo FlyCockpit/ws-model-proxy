@@ -74,6 +74,7 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.listCliDevices` | `forwarder_cli_devices_list` | read | — | pure | — | — | — |
 | `forwarderManagement.listGuardedOverflowCandidates` | `forwarder_guarded_candidates_list` | read | — | pure | — | — | — |
 | `forwarderManagement.listModelPools` | `forwarder_model_pools_list` | read | — | pure | — | — | — |
+| `forwarderManagement.poolCacheStats` | `forwarder_pool_cache_stats_get` | read | — | pure | — | — | — |
 | `forwarderManagement.previewProfileSlugChange` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
 | `forwarderManagement.removeCliDeviceMetadata` | `forwarder_cli_metadata_remove` | write | DELETE | destructive | — | — | — |
 | `forwarderManagement.removeDiscoveredModelMetadata` | `forwarder_model_metadata_remove` | write | DELETE | destructive | — | — | — |
