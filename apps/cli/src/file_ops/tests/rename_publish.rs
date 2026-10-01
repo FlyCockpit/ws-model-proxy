@@ -184,16 +184,15 @@ fn rename_clean_shapes_kinds_supervision_and_third_links() {
         let etag = setup(&fx, Object::File, overwrite);
         std::fs::hard_link(fx.root.join("src"), fx.root.join("third")).unwrap();
         let _scope = FaultScope::new(&Shape::Link.faults(overwrite));
-        let value = rename_run(&fx, overwrite, etag.as_deref(), false).unwrap();
-        // Off Linux the link count may be cached, so an overwrite rename keeps the
-        // alias of a source that had another name (see `dispose_link_move`).
-        let keeps_alias = overwrite && !cfg!(target_os = "linux");
-        assert_eq!(value.get("recovered").is_some(), keeps_alias, "{value}");
+        assert!(
+            rename_run(&fx, overwrite, etag.as_deref(), false)
+                .unwrap()
+                .get("recovered")
+                .is_none()
+        );
         assert_eq!(fx.get("third"), SOURCE);
         assert_eq!(fx.get("dst"), SOURCE);
-        if !keeps_alias {
-            clean(&fx);
-        }
+        clean(&fx);
     }
 }
 
@@ -487,6 +486,7 @@ fn assert_race(
     race: Race,
     result: FileResult<Value>,
     link: bool,
+    counts: bool,
 ) {
     let mut paths = match &result {
         Ok(value) => inventory(fx, value),
@@ -500,9 +500,11 @@ fn assert_race(
             if race == Race::AfterSave {
                 assert_eq!(object.bytes(&fx.root.join("dst")).as_deref(), Some(RACER));
             }
-            if link {
+            if link && counts {
                 assert!(object.kept(&paths, SOURCE), "D8 keeps last alias");
             } else {
+                // No link publication, or a mount whose link counts mean nothing
+                // (the guard is off there): residual (g), the alias is cleaned.
                 clean(fx);
             }
         }
@@ -640,6 +642,7 @@ fn rename_races_restore_origins_preserve_creates_and_do_not_chase_commits() {
                         race,
                         result,
                         matches!(shape, Shape::Link),
+                        true,
                     );
                 }
             }
@@ -990,7 +993,15 @@ pub(super) fn real_rename_rows(directory: &Path, class: RealClass) {
                 };
                 let _scope = FaultScope::new(&faults);
                 let result = rename_run(&fx, overwrite, etag.as_deref(), false);
-                assert_race(&fx, object, overwrite, race, result, !class.nr);
+                assert_race(
+                    &fx,
+                    object,
+                    overwrite,
+                    race,
+                    result,
+                    !class.nr,
+                    class.counts,
+                );
             }
         }
     }
@@ -1056,9 +1067,15 @@ pub(super) fn real_rename_rows(directory: &Path, class: RealClass) {
             let value = rename_run(&fx, overwrite, etag.as_deref(), false).unwrap();
             assert!(value["etag"].is_null());
             assert_eq!(fx.get("dst"), RACER);
-            assert!(result_paths(&value).iter().any(|p| {
-                std::fs::read_to_string(p).is_ok_and(|s| s.starts_with("fd-written-source"))
-            }));
+            if class.counts {
+                assert!(result_paths(&value).iter().any(|p| {
+                    std::fs::read_to_string(p).is_ok_and(|s| s.starts_with("fd-written-source"))
+                }));
+            } else {
+                // Link counts mean nothing on this mount, so the guard is off and the
+                // exposed-writer race is residual (g): the alias is cleaned, nothing kept.
+                assert!(value.get("recovered").is_none(), "{value}");
+            }
         }
     }
 }
@@ -1529,7 +1546,8 @@ fn real_gate_rejects_exchange_capable_mount_without_skip() {
             RealClass {
                 nr: true,
                 link: true,
-                noino: false
+                noino: false,
+                counts: true,
             }
         )))
         .is_err(),
@@ -1680,12 +1698,7 @@ fn rename_true_alias_pair_with_a_post_publication_save_keeps_the_object() {
                     "{object:?}: the displaced object's bytes must stay reported: {recovered:?}"
                 );
             } else {
-                // Off Linux a source that had another name keeps its alias (cached count).
-                assert_eq!(
-                    recovered.is_empty(),
-                    cfg!(target_os = "linux"),
-                    "{object:?}: {recovered:?}"
-                );
+                assert!(recovered.is_empty(), "{object:?}: {recovered:?}");
                 assert_eq!(object.bytes(&fx.root.join("dst")).as_deref(), Some(SOURCE));
             }
         }
@@ -1760,15 +1773,10 @@ fn rename_true_alias_pair_closes_both_private_proofs_before_committed_unlinks() 
             }
             assert!(!src.is_held());
             assert!(!dst.is_held());
-            // The alias pair is the case a cached count cannot tell apart: off Linux the
-            // link rung keeps the source alias (reported); Linux proves it and cleans.
-            let keeps_alias = matches!(shape, Shape::Link) && !cfg!(target_os = "linux");
-            assert_eq!(recovery.finish().is_empty(), !keeps_alias);
+            assert!(recovery.finish().is_empty());
             assert_eq!(object.bytes(&fx.root.join("dst")).as_deref(), Some(SOURCE));
             assert!(std::fs::symlink_metadata(fx.root.join("src")).is_err());
-            if !keeps_alias {
-                clean(&fx);
-            }
+            clean(&fx);
         }
     }
 }

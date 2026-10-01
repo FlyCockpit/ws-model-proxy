@@ -14,6 +14,8 @@
 #   none        NOREPLACE is EINVAL, link() is EPERM
 #   <class>-noino   the same, without stable inode numbers (two names of one object
 #                   report different st_ino)
+#   link-noino-nlink1  link-noino whose files always report st_nlink 1 (like sshfs): link counts
+#                   mean nothing; the same strict test as the six classes
 #   link-noino-cached  link-noino with libfuse's default entry/attribute caching (like NFS or SMB:
 #                   a plain stat's link count can be stale); runs its own test, only on this class
 #
@@ -23,7 +25,8 @@ set -uo pipefail
 
 SIX_CLASSES=(nr link none nr-noino link-noino none-noino)
 CACHED_CLASS=link-noino-cached
-ALL_CLASSES=("${SIX_CLASSES[@]}" "$CACHED_CLASS")
+NLINK1_CLASS=link-noino-nlink1
+ALL_CLASSES=("${SIX_CLASSES[@]}" "$NLINK1_CLASS" "$CACHED_CLASS")
 MODE=${1:-test}
 [[ $# -gt 0 ]] && shift
 CLASSES=("$@")
@@ -183,10 +186,10 @@ fi
 
 # ---- per class -----------------------------------------------------------------
 check_capabilities() { # the raw primitives must match the class, independently of the Rust test
-  python3 - "$1" "$2" <<'PY'
+  python3 - "$1" "$2" "$3" <<'PY'
 import ctypes, os, sys
-cls, mnt = sys.argv[1], sys.argv[2]
-base = cls.removesuffix("-cached").removesuffix("-noino")
+cls, mnt, backing = sys.argv[1], sys.argv[2], sys.argv[3]
+base = cls.removesuffix("-cached").removesuffix("-nlink1").removesuffix("-noino")
 libc = ctypes.CDLL(None, use_errno=True)
 def rename2(a, b, flags):
     ctypes.set_errno(0)
@@ -218,6 +221,22 @@ if linked and "-noino" in cls:
     if os.stat(src).st_ino == os.stat(os.path.join(d, "alias")).st_ino: errors.append("noino: two names of one object must report different st_ino")
 elif linked and os.stat(src).st_ino != os.stat(os.path.join(d, "alias")).st_ino:
     errors.append("stable inodes: two names of one object must report one st_ino")
+# Attribute caching must match the class: change the link count behind the mount's back and
+# stat through the mount at once. Cached classes still report the old count; uncached
+# classes report the new one; the nlink1 class always reports 1.
+if True:  # every class
+    probe = os.path.join(d, "cachechk")
+    with open(probe, "w") as f: f.write("x")
+    before = os.stat(probe).st_nlink
+    bprobe = os.path.join(backing, "cap", "cachechk")
+    os.link(bprobe, bprobe + "-b")
+    after = os.stat(probe).st_nlink
+    os.unlink(bprobe + "-b")
+    if cls.endswith("-nlink1"):
+        if before != 1 or after != 1: errors.append(f"nlink1: the count must always read 1, got {before} then {after}")
+    elif cls.endswith("-cached"):
+        if (before, after) != (1, 1): errors.append(f"cached: the mount must serve a stale link count (1 then 1), got {before} then {after}")
+    elif (before, after) != (1, 2): errors.append(f"uncached: the count must be fresh (1 then 2), got {before} then {after}")
 for name in os.listdir(d): os.unlink(os.path.join(d, name))
 os.rmdir(d)
 if errors:
@@ -229,7 +248,7 @@ PY
 run_class() {
   local class=$1 dir="$work/$1"
   local -a flags=()
-  local base=${class%-cached}; base=${base%-noino}
+  local base=${class%-cached}; base=${base%-nlink1}; base=${base%-noino}
   case $base in
     nr) ;;
     link) flags=(PROBE_NO_NOREPLACE=1) ;;
@@ -237,6 +256,7 @@ run_class() {
   esac
   [[ $class == *-noino* ]] && flags+=(PROBE_NO_INO=1)
   [[ $class == *-cached ]] && flags+=(PROBE_CACHE=1)
+  [[ $class == *-nlink1 ]] && flags+=(PROBE_NLINK_ONE=1)
   mkdir -p "$dir/backing" "$dir/mnt" || return 1
   # The none classes cannot create links through the mount. Seed an alias pair
   # in backing storage so the Rust test can verify their declared inode mode.
@@ -255,7 +275,7 @@ run_class() {
   done
   echo sentinel >"$dir/mnt/.sentinel" && [[ $(cat "$dir/mnt/.sentinel") == sentinel ]] && rm "$dir/mnt/.sentinel" \
     || { fail "$class: the mount does not read and write"; return 1; }
-  check_capabilities "$class" "$dir/mnt" || { fail "$class: capability check"; return 1; }
+  check_capabilities "$class" "$dir/mnt" "$dir/backing" || { fail "$class: capability check"; return 1; }
   [[ $MODE == test ]] || return 0
   local out="$dir/test.out"
   # Background plus `wait`: a signal to this script interrupts `wait` at once and the trap runs

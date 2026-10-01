@@ -405,12 +405,15 @@ number reuse), so a client that silly-renames per vnode (macOS/BSD NFS) may brie
 (g) after replace or rename hard-link publication, a process can open and write the
 public temp/source,
 then another save can replace that name before the private alias is unlinked;
-a link count below 2 retains the last alias and reports it. The count is read by name
-with `statx` and `AT_STATX_FORCE_SYNC` on Linux, so a filesystem's attribute cache (FUSE, NFS,
-SMB) cannot make it stale; on other Unix systems only a plain stat exists, so an overwrite rename keeps the alias of a
-source that had another name before the move. An unreadable count keeps it too. A third
-save after that final observation but before unlink can still orphan the inode
-and discard the writes; the check narrows this residual without excluding writers.
+where this mount's link counts can be believed, a count below 2 retains the last alias
+and reports it (a veto, never a proof). Belief is decided per operation from the link probe:
+right after the probe link the object has two names, so a count of 1 or an unreadable count
+means counts cannot be used here (sshfs always reports 1) and the veto is off, exactly as
+for replace in #169. The count is read by name with `statx` and `AT_STATX_FORCE_SYNC` on
+Linux, so the kernel's attribute cache (FUSE, NFS, SMB) cannot make it stale; a daemon's
+own cache can, and then the veto is no better than none. A third save after the final
+observation but before unlink, or on a mount whose counts mean nothing, can still orphan
+the inode and discard the writes: this is the residual, narrowed where counts are real.
 If alias cleanup fails instead, the published file has two hard links (nlink 2)
 and edit/replace refuses `hard_linked` until manual cleanup of the reported alias.
 Public file and symlink compensation names are never unlinked on an earlier
@@ -437,8 +440,8 @@ On a case-insensitive mount without stable inode numbers, two spellings may fail
 same-object admission and proceed to vacate-both: capturing source also vacates
 destination, so destination capture returns `conflict("gone")` and source is
 restored to its source name. A true hard-link alias pair hidden by noino can instead
-complete vacate-both without losing its data (the shared object keeps a name unless a writer
-and a third save leave only the private names, in which case one is kept and reported);
+complete vacate-both without losing its data (where link counts can be believed, the shared object keeps a name even if a writer
+and a third save leave only the private names: one is kept and reported);
 stable-inode alias pairs still refuse.
 
 

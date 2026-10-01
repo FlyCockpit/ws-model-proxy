@@ -9,6 +9,8 @@
  *   - PROBE_NO_LINK: link() is EPERM;
  *   - PROBE_NO_INO: no stable inode numbers (`use_ino` off, so two names of one
  *     object report different st_ino).
+ *   - PROBE_NLINK_ONE: every non-directory reports st_nlink 1, like sshfs, whose link
+ *     counts mean nothing.
  * Entry, attribute and negative-lookup caching is off, so every observation
  * reaches the backing directory, unless PROBE_CACHE is set: then libfuse's
  * defaults apply (one second of entry and attribute caching), like NFS or SMB
@@ -36,7 +38,7 @@
 #define RENAME_EXCHANGE_FLAG 2U
 
 static char base[PATH_MAX];
-static int reject_noreplace, reject_link, no_ino, cache;
+static int reject_noreplace, reject_link, no_ino, cache, nlink_one;
 
 /* Join the backing directory and a mount-relative path; refuse truncation. */
 static int join(char *out, const char *path)
@@ -57,7 +59,11 @@ static int op_getattr(const char *p, struct stat *s, struct fuse_file_info *f)
 {
 	(void)f;
 	WITH_PATH(a, p);
-	return lstat(a, s) ? -errno : 0;
+	if (lstat(a, s))
+		return -errno;
+	if (nlink_one && !S_ISDIR(s->st_mode))
+		s->st_nlink = 1;
+	return 0;
 }
 
 static int op_mkdir(const char *p, mode_t m)
@@ -239,6 +245,7 @@ int main(int argc, char **argv)
 	reject_link = getenv("PROBE_NO_LINK") != NULL;
 	no_ino = getenv("PROBE_NO_INO") != NULL;
 	cache = getenv("PROBE_CACHE") != NULL;
+	nlink_one = getenv("PROBE_NLINK_ONE") != NULL;
 	static const struct fuse_operations ops = {
 		.getattr = op_getattr,
 		.mkdir = op_mkdir,

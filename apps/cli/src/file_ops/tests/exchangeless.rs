@@ -1377,6 +1377,8 @@ struct RealClass {
     nr: bool,
     link: bool,
     noino: bool,
+    /// Link counts can be believed (false: the mount always reports 1, like sshfs).
+    counts: bool,
 }
 
 /// Pure test-only gate: env parsing never mutates process-global test state.
@@ -1399,31 +1401,44 @@ fn real_gate(
             nr: true,
             link: true,
             noino: false,
+            counts: true,
         },
         Some("link") => RealClass {
             nr: false,
             link: true,
             noino: false,
+            counts: true,
         },
         Some("none") => RealClass {
             nr: false,
             link: false,
             noino: false,
+            counts: true,
         },
         Some("nr-noino") => RealClass {
             nr: true,
             link: true,
             noino: true,
+            counts: true,
         },
         Some("link-noino") => RealClass {
             nr: false,
             link: true,
             noino: true,
+            counts: true,
+        },
+        // Link counts mean nothing here (always 1, like sshfs); the same strict test.
+        Some("link-noino-nlink1") => RealClass {
+            nr: false,
+            link: true,
+            noino: true,
+            counts: false,
         },
         Some("none-noino") => RealClass {
             nr: false,
             link: false,
             noino: true,
+            counts: true,
         },
         _ => panic!("unknown real filesystem CLASS"),
     };
@@ -1454,18 +1469,27 @@ fn exchangeless_real_gate_defaults_and_inverse_failures() {
             .is_err()
         );
     }
-    for (class, nr, link, noino) in [
-        ("nr", true, true, false),
-        ("link", false, true, false),
-        ("none", false, false, false),
-        ("nr-noino", true, true, true),
-        ("link-noino", false, true, true),
-        ("none-noino", false, false, true),
+    for (class, nr, link, noino, counts) in [
+        ("nr", true, true, false, true),
+        ("link", false, true, false, true),
+        ("none", false, false, false, true),
+        ("nr-noino", true, true, true, true),
+        ("link-noino", false, true, true, true),
+        ("link-noino-nlink1", false, true, true, false),
+        ("none-noino", false, false, true, true),
     ] {
         for required in [false, true] {
             assert_eq!(
                 real_gate(Some(OsStr::new("dir")), Some(OsStr::new(class)), required),
-                Some((PathBuf::from("dir"), RealClass { nr, link, noino }))
+                Some((
+                    PathBuf::from("dir"),
+                    RealClass {
+                        nr,
+                        link,
+                        noino,
+                        counts
+                    }
+                ))
             );
         }
     }
@@ -1605,6 +1629,7 @@ fn exchangeless_real_filesystem_cached_e2e() {
             nr: false,
             link: true,
             noino: true,
+            counts: true,
         },
     );
     rename_publish::real_cached_rows(&directory);

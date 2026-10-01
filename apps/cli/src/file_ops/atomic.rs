@@ -33,8 +33,8 @@
 //! vacant, captured delete, rename S/D or preflight dummies) or both links; (e) unheld objects are never deleted;
 //! (f) another process's open NFS fd can leave .nfs residue; our own fds close before
 //! unlink; (g) replace/rename link publication exposes T/S before alias unlink;
-//! a forced-sync nlink < 2 (Linux statx; elsewhere a cached count, kept unless the
-//! source had no other name) retains the last alias; a race after that check remains.
+//! where link counts can be believed (probed per operation) a count < 2 retains the
+//! last alias; where they cannot (sshfs) or after that check, the race remains.
 //! Failed alias cleanup leaves nlink 2 and hard_linked refusal until manual cleanup.
 //! The vacant interval is bounded by syscalls, never by elapsed time; publication
 //! depends on the filesystem's actual NOREPLACE/link atomicity. See `recovery` for

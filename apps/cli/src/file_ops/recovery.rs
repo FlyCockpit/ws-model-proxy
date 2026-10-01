@@ -67,8 +67,12 @@
 //! `.nfs*` alias until it closes). Retained R is reported for manual cleanup.
 //! (g) replace/rename link publication briefly exposes T/S before alias unlink. Someone
 //! can open/write public T, then a third save can replace that name before unlink,
-//! orphaning that exposed inode. Fresh nlink < 2 keeps the last alias, narrowing
-//! this to a race after that observation. Failed alias cleanup can retain nlink 2: later replace
+//! orphaning that exposed inode. On a mount whose link counts can be believed (learned
+//! per operation from the probe link, `calibrate_counts`; Linux reads them with
+//! statx FORCE_SYNC) a count < 2 vetoes the unlink and keeps the last alias, narrowing
+//! this to a race after that observation; where counts mean nothing (sshfs reports 1,
+//! a daemon cache can be stale) there is no veto and (g) stands. Best effort, never a
+//! proof. Failed alias cleanup can retain nlink 2: later replace
 //! refuses hard_linked until the reported alias is manually removed. Independently,
 //! an in-place write to the original after its etag read remains lost on every fs.
 //!
@@ -251,6 +255,10 @@ pub(super) struct RecoveryDir {
     unsettled: bool,
     finished: bool,
     last_errno: Option<Errno>,
+    /// Whether this mount's link counts can be believed, learned from this operation's own
+    /// link probe (see `calibrate_counts`). `Some(true)` is the only state that lets a count
+    /// veto an alias unlink.
+    counts_reliable: Option<bool>,
 }
 
 /// State to return to when a capture provably changed nothing.
@@ -314,6 +322,7 @@ impl RecoveryDir {
                 unsettled: false,
                 finished: false,
                 last_errno: None,
+                counts_reliable: None,
             });
         }
     }
@@ -496,6 +505,7 @@ impl RecoveryDir {
             });
         }
         self.remember(self.path.join(&alias.name));
+        self.calibrate_counts(&alias);
         let seam_error = ops.step(Step::LinkProbed).err();
         let raw = fstatat(
             self.dir.as_fd(),
@@ -1213,6 +1223,19 @@ impl RecoveryDir {
         self.dispose_inner(ops, slot, held, false)
     }
 
+    /// Right after a successful probe link the object has two names, so a believable
+    /// count reads at least 2. A count of 1 (a filesystem such as sshfs that always
+    /// reports 1) or a failed read means counts cannot be used on this mount: the guard
+    /// then stays off, as in #169's replace, rather than retaining an alias after every
+    /// rename or failing the probe. A believable but stale count is no worse than no
+    /// guard. The guard only ever VETOES an unlink; no safety claim rests on it.
+    fn calibrate_counts(&mut self, alias: &Slot) {
+        self.counts_reliable = match link_count(self.dir.as_fd(), alias.name.as_os_str()) {
+            Ok(count) => Some(count >= 2),
+            Err(_) => None,
+        };
+    }
+
     fn dispose_alias(&mut self, ops: &FileOps, slot: &Slot, held: &mut Held) -> bool {
         self.dispose_inner(ops, slot, held, true)
     }
@@ -1248,12 +1271,11 @@ impl RecoveryDir {
             self.unlink_proven(destination);
         }
         if dispose_source {
-            // Linux: a forced-sync count. Elsewhere the count may be cached, so the
-            // alias also stays unless the object had no other name before this move
-            // (an alias pair then cannot exist). Any error keeps it.
-            let survives = link_count(self.dir.as_fd(), source.name.as_os_str())
-                .is_ok_and(|count| count >= 2)
-                && (cfg!(target_os = "linux") || src.stat.nlink <= 1);
+            // The guard is a veto on a believable count only (Linux: forced-sync).
+            // An unreadable count under a believable mount keeps the alias.
+            let survives = self.counts_reliable != Some(true)
+                || link_count(self.dir.as_fd(), source.name.as_os_str())
+                    .is_ok_and(|count| count >= 2);
             if survives {
                 self.unlink_proven(source);
             } else {
@@ -1272,9 +1294,10 @@ impl RecoveryDir {
             self.unsettled = true;
             return false;
         }
-        // An exposed alias must never be its object's last name. Fresh nlink is
-        // conservative on filesystems with unreliable counts (safe retention).
+        // An exposed alias must not be its object's last name: veto the unlink on a
+        // believable count below 2 (see `calibrate_counts`; best effort, never a proof).
         if alias
+            && self.counts_reliable == Some(true)
             && !link_count(self.dir.as_fd(), slot.name.as_os_str()).is_ok_and(|count| count >= 2)
         {
             self.unsettled = true;
