@@ -7,8 +7,10 @@ import {
   canonicalPayloadWire,
   depthPayloadWire,
   depthRows,
+  instructionPlacementRows,
   numericOverflowPayload,
   numericOverflowRows,
+  orderedHistoryPayload,
 } from "./cache-affinity-canonical.test-fixtures.js";
 import { MAX_CANONICAL_DEPTH } from "./cache-affinity-layers.js";
 
@@ -655,6 +657,154 @@ integration("cache-prefix identity #160", () => {
   const orders = permutations(["X1", "Y1", "X2", "Y2"]).filter(
     (order) =>
       order.indexOf("X1") < order.indexOf("X2") && order.indexOf("Y1") < order.indexOf("Y2"),
+  );
+  it.each(
+    instructionPlacementRows.flatMap((row) => [
+      ...orders.map((order) => ({ ...row, order, schedule: order.join(",") })),
+      { ...row, order: [] as string[], schedule: "concurrent" },
+    ]),
+  )(
+    "R7 PG placement $surface $role $schedule keeps two independent sessions",
+    async ({ surface, role, order, schedule }) => {
+      if (!db) return;
+      const args = { ...argsFor(await fixture()), surface };
+      const instruction = { role, content: "S" };
+      const history = (label: string) => {
+        const starter = label.startsWith("X") ? [instruction, u("U")] : [u("U"), instruction];
+        return label.endsWith("1") ? starter : [...starter, a("A"), u("V")];
+      };
+      const results = new Map<
+        string,
+        NonNullable<Awaited<ReturnType<typeof service.rememberAffinity>>>
+      >();
+      const run = async (label: string) => {
+        const result = await service.rememberAffinity({
+          ...args,
+          payload: orderedHistoryPayload(surface, history(label)),
+        });
+        if (!result) throw new Error("missing committed instruction-placement binding");
+        results.set(label, result);
+      };
+      if (schedule === "concurrent") {
+        await Promise.all([run("X1"), run("Y1")]);
+        await Promise.all([run("X2"), run("Y2")]);
+      } else for (const label of order) await run(label);
+      const x1 = results.get("X1")!;
+      const y1 = results.get("Y1")!;
+      const x2 = results.get("X2")!;
+      const y2 = results.get("Y2")!;
+      expect(x1.sessionId).not.toBe(y1.sessionId);
+      expect(x2.sessionId).toBe(x1.sessionId);
+      expect(y2.sessionId).toBe(y1.sessionId);
+      expect(x2.rootDigest).toBe(x1.rootDigest);
+      expect(y2.rootDigest).toBe(y1.rootDigest);
+      expect(x2.rootDigest).not.toBe(y2.rootDigest);
+      expect(x2.tipDigest).not.toBe(y2.tipDigest);
+      for (const label of ["X2", "Y2"]) {
+        const request = { ...args, payload: orderedHistoryPayload(surface, history(label)) };
+        const material = service.affinityPrefixDigests({
+          ...request,
+          runtimeIdentity: args.target.targetIdentity,
+        });
+        expect(
+          await service.resolveAffinitySession(
+            producer,
+            {
+              userId: args.resourceOwnerId,
+              tenantUserId: args.ownerId,
+              poolId: args.poolId,
+              executionTargetId: args.target.executionTargetId,
+            },
+            material,
+            args.now,
+          ),
+        ).toBe(results.get(label)!.sessionId);
+        const ranked = await service.rankAffinityTargets({
+          ...request,
+          targets: [args.target],
+          scoreSingleTarget: true,
+        });
+        expect(ranked.matchedSessionIds?.[args.target.executionTargetId]).toBe(
+          results.get(label)!.sessionId,
+        );
+      }
+      expect(
+        await db.cacheAffinityRecord.groupBy({
+          by: ["sessionId"],
+          where: { poolId: args.poolId },
+        }),
+      ).toHaveLength(2);
+      expect(
+        await db.cacheAffinityNode.count({
+          where: { poolId: args.poolId, isTip: true },
+        }),
+      ).toBe(2);
+    },
+  );
+
+  it.each(instructionPlacementRows)(
+    "R7 PG edits $surface $role keep late edits and truncations but split leading changes",
+    async ({ surface, role }) => {
+      if (!db) return;
+      const args = { ...argsFor(await fixture()), surface };
+      const leading = { role, content: "leading" };
+      const prefix = [leading, u("U"), a("A")];
+      const write = (units: unknown[]) =>
+        service.rememberAffinity({
+          ...args,
+          payload: orderedHistoryPayload(surface, units),
+        });
+      const original = await write([...prefix, { role, content: "late" }, u("V"), a("reply")]);
+      const edited = await write([...prefix, { role, content: "edited late" }, u("V"), a("reply")]);
+      expect(edited!.sessionId).toBe(original!.sessionId);
+      expect(edited!.rootDigest).toBe(original!.rootDigest);
+      expect(edited!.tipDigest).not.toBe(original!.tipDigest);
+      const truncated = await write(prefix);
+      expect(truncated!.sessionId).toBe(original!.sessionId);
+      expect(truncated!.rootDigest).toBe(original!.rootDigest);
+      expect(truncated!.tipDepth).toBe(2);
+      const changed = await write([{ role, content: "changed leading" }, ...prefix.slice(1)]);
+      expect(changed!.rootDigest).not.toBe(original!.rootDigest);
+      expect(changed!.sessionId).not.toBe(original!.sessionId);
+      const ranked = await service.rankAffinityTargets({
+        ...args,
+        payload: orderedHistoryPayload(surface, [leading, u("independent starter")]),
+        targets: [args.target],
+        scoreSingleTarget: true,
+      });
+      expect(ranked.instructionDepths?.[args.target.executionTargetId]).toBe(1);
+      expect(ranked.matchedSessionIds?.[args.target.executionTargetId]).toBeUndefined();
+    },
+  );
+
+  it.each(instructionPlacementRows)(
+    "R7 PG authoritative id $surface $role survives instruction relocation",
+    async ({ surface, role }) => {
+      if (!db) return;
+      const args = { ...argsFor(await fixture()), surface };
+      const instruction = { role, content: "S" };
+      const first = await service.rememberAffinity({
+        ...args,
+        payload: {
+          ...orderedHistoryPayload(surface, [instruction, u("U")]),
+          conversation_id: "client",
+        },
+      });
+      const moved = await service.rememberAffinity({
+        ...args,
+        payload: {
+          ...orderedHistoryPayload(surface, [u("U"), instruction, a("A"), u("V")]),
+          conversation_id: "client",
+        },
+      });
+      expect(moved!.sessionId).toBe(first!.sessionId);
+      expect(moved!.rootDigest).not.toBe(first!.rootDigest);
+      expect(
+        await db.cacheAffinityNode.count({
+          where: { sessionId: first!.sessionId, isTip: true },
+        }),
+      ).toBe(1);
+    },
   );
   it.each(orders.map((order) => [order.join(","), order] as const))(
     "interleaving %s",

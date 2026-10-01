@@ -8,7 +8,9 @@ import { buildCanonicalRequest } from "./cache-affinity.js";
 import {
   canonicalKeys,
   canonicalShapes,
+  instructionPlacementRows,
   nestedWire,
+  orderedHistoryPayload,
 } from "./cache-affinity-canonical.test-fixtures.js";
 import {
   asJson,
@@ -237,7 +239,7 @@ describe("extractAffinityLayers", () => {
     expect(layers.isContinuation).toBe(true);
   });
 
-  it("lifts interleaved Chat system and developer messages into the instruction layer", () => {
+  it("keeps interleaved Chat instruction roles at their conversation positions", () => {
     const layers = extractAffinityLayers("openai-chat", {
       messages: [
         { role: "system", content: "S1" },
@@ -246,16 +248,40 @@ describe("extractAffinityLayers", () => {
         { role: "user", content: "U2" },
       ],
     });
-    expect(layers.instructionUnits).toEqual([
-      { role: "system", content: "S1" },
-      { role: "developer", content: "D" },
-    ]);
+    expect(layers.instructionUnits).toEqual([{ role: "system", content: "S1" }]);
     expect(layers.conversationUnits).toEqual([
       { role: "user", content: "U1" },
+      { role: "developer", content: "D" },
       { role: "user", content: "U2" },
     ]);
     expect(layers.isContinuation).toBe(false);
   });
+
+  it.each(instructionPlacementRows)(
+    "R7 layer split $surface $role stops at the first non-instruction unit",
+    ({ surface, role }) => {
+      const leading = { role, content: "leading" };
+      const late = { role, content: "late" };
+      for (const first of [
+        { role: "user", content: "U" },
+        { role: "assistant", content: "greeting" },
+        { role: "tool", content: "context" },
+        { type: "reasoning", summary: [] },
+        "scalar context",
+      ]) {
+        const units = [leading, first, late];
+        const request = orderedHistoryPayload(surface, units);
+        const legacy = legacyAffinityLayers(surface, request);
+        expect(legacy.instructionUnits).toEqual([leading]);
+        expect(legacy.conversationUnits).toEqual([first, late]);
+        const canonical = buildCanonicalRequest({ surface, payload: request });
+        expect(canonical?.instructions.map((text) => JSON.parse(text))).toEqual([leading]);
+        expect(canonical?.conversationUnits.map((text) => JSON.parse(text))).toEqual([first, late]);
+        expect(canonical?.isContinuation).toBe(false);
+        expect(legacy.isContinuation).toBe(false);
+      }
+    },
+  );
 
   it("never reads Chat prompt or input as conversation units", () => {
     const layers = extractAffinityLayers("openai-chat", {

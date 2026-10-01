@@ -2883,6 +2883,7 @@ describe("model API routes", () => {
     [false, true].flatMap((external) =>
       [
         "nonstream-arguments",
+        "nonstream-invalid-arguments",
         "nonstream-body",
         "sse-data",
         "sse-arguments",
@@ -2890,7 +2891,7 @@ describe("model API routes", () => {
       ].map((mode) => ({ external, mode })),
     ),
   )(
-    "R6 provider response depth external=$external $mode settles upstream failure",
+    "R7 provider response protocol external=$external $mode settles upstream failure and member health",
     async ({ external, mode }) => {
       const stream = mode.startsWith("sse");
       const inventory = {
@@ -2912,7 +2913,7 @@ describe("model API routes", () => {
           { ...(external ? externalPoolTarget : poolTarget), protocolAdaptationEnabled: true },
         ],
       });
-      db.poolMember.findUnique.mockResolvedValueOnce({
+      db.poolMember.findUnique.mockResolvedValue({
         healthStatus: "HEALTHY",
         lastFailureClass: null,
         consecutiveRetryableFailures: 0,
@@ -2920,7 +2921,7 @@ describe("model API routes", () => {
         nextRetryAt: null,
         halfOpenTrialStartedAt: null,
       });
-      db.poolMember.updateMany.mockResolvedValueOnce({ count: 1 });
+      db.poolMember.updateMany.mockResolvedValue({ count: 1 });
       const manager = new FakeRelayManager();
       manager.activeCliDeviceIds = ["cli-chat"];
       const runtime = admittingCapacityRuntime();
@@ -2947,7 +2948,15 @@ describe("model API routes", () => {
                 {
                   id: "call",
                   type: "function",
-                  function: { name: "lookup", arguments: mode === "nonstream-body" ? "{}" : deep },
+                  function: {
+                    name: "lookup",
+                    arguments:
+                      mode === "nonstream-body"
+                        ? "{}"
+                        : mode === "nonstream-invalid-arguments"
+                          ? "{invalid"
+                          : deep,
+                  },
                 },
               ],
             },
@@ -3114,15 +3123,19 @@ describe("model API routes", () => {
         String(sql.sql ?? "").includes("usage_rollup_minute"),
       );
       expect(rollups).toHaveLength(1);
-      expect(db.poolMember.updateMany).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: expect.objectContaining({ id: "chat-member" }),
-          data: expect.objectContaining({
-            lastFailureClass: "TRANSPORT",
-            consecutiveRetryableFailures: 1,
+      if (external) {
+        expect(db.poolMember.findUnique).not.toHaveBeenCalled();
+        expect(db.poolMember.updateMany).not.toHaveBeenCalled();
+      } else
+        expect(db.poolMember.updateMany).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: expect.objectContaining({ id: "chat-member" }),
+            data: expect.objectContaining({
+              lastFailureClass: "TRANSPORT",
+              consecutiveRetryableFailures: 1,
+            }),
           }),
-        }),
-      );
+        );
       expect(runtime.release).toHaveBeenCalled();
       if (!external) expect(manager.cancelled.length + manager.completed.length).toBeGreaterThan(0);
     },

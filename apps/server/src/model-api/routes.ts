@@ -4761,12 +4761,6 @@ async function relayPool({
           releaseCallerLease();
           const completedAt = new Date();
           const usage = usageFactsFromProviderUsage(terminal.usage);
-          if (externalProtocolFailure && !committedResult.target.ownKey)
-            await recordPoolMemberRelayFailure({
-              poolMemberId: committedResult.target.poolMemberId,
-              trialStartedAt: null,
-              failure: "protocol_error",
-            }).catch(metadataUpdateError);
           await Promise.allSettled([
             prisma.$transaction((tx) =>
               transitionRelayRequestTerminal(

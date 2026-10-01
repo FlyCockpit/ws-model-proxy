@@ -17,6 +17,14 @@ export const canonicalShapes = ["object", "array", "mixed"] as const;
 export const canonicalLocations = ["parameter", "tools", "instructions", "messages"] as const;
 export type CanonicalLocation = (typeof canonicalLocations)[number];
 
+export const instructionPlacementRows = ["openai-chat", "openai-responses"].flatMap((surface) =>
+  ["system", "developer", " SyStEm ", " DeVeLoPeR "].map((role) => ({ surface, role })),
+);
+
+export function orderedHistoryPayload(surface: string, units: unknown[]) {
+  return surface === "openai-responses" ? { input: units } : { messages: units };
+}
+
 // Build wire text without recursively stringifying the 10,000-level fixture.
 export function nestedWire(depth: number, shape: (typeof canonicalShapes)[number]): string {
   let wire = "0";

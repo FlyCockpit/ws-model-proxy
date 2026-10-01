@@ -7,8 +7,10 @@ import {
   canonicalShapes,
   depthPayloadWire,
   depthRows,
+  instructionPlacementRows,
   numericOverflowPayload,
   numericOverflowRows,
+  orderedHistoryPayload,
 } from "./cache-affinity-canonical.test-fixtures.js";
 import {
   extractAffinityLayers,
@@ -3428,3 +3430,300 @@ it("R4 work exhaustion is atomic and the injected counter never exceeds its lite
     }),
   ).not.toBeNull();
 });
+
+it.each(instructionPlacementRows)(
+  "R7 production placement $surface $role separates leading and relocated histories",
+  ({ surface, role }) => {
+    const instruction = { role, content: "S" };
+    const user = { role: "user", content: "U" };
+    const suffix = [
+      { role: "assistant", content: "A" },
+      { role: "user", content: "V" },
+    ];
+    const material = (units: unknown[]) =>
+      affinityPrefixDigests(digestArgs("runtime", orderedHistoryPayload(surface, units), surface));
+    const a1 = material([instruction, user]);
+    const b1 = material([user, instruction]);
+    const a2 = material([instruction, user, ...suffix]);
+    const b2 = material([user, instruction, ...suffix]);
+    expect(a1.identifiable && b1.identifiable && a2.identifiable && b2.identifiable).toBe(true);
+    expect(a1.rootDigest).not.toBe(b1.rootDigest);
+    expect(a2.rootDigest).toBe(a1.rootDigest);
+    expect(b2.rootDigest).toBe(b1.rootDigest);
+    expect(a2.nodes.at(-1)?.digest).not.toBe(b2.nodes.at(-1)?.digest);
+    expect(a1.nodes).toHaveLength(1);
+    expect(b1.nodes).toHaveLength(2);
+    expect(a2.nodes.slice(0, 1)).toEqual(a1.nodes);
+    expect(b2.nodes.slice(0, 2)).toEqual(b1.nodes);
+    expect(a1.isContinuation).toBe(false);
+    expect(b1.isContinuation).toBe(false);
+    expect(a2.isContinuation).toBe(true);
+    expect(b2.isContinuation).toBe(true);
+    expect(a2.instructionDigests).toHaveLength(1);
+    expect(a2.instructionDigests).toEqual(a1.instructionDigests);
+    expect(b1.instructionDigests).toEqual([]);
+    expect(b2.instructionDigests).toEqual([]);
+    expect(b2.rootDigest).toBe(material([user, ...suffix]).rootDigest);
+  },
+);
+
+it.each(instructionPlacementRows)(
+  "R7 production late edit $surface $role preserves root hints and prefix before the edit",
+  ({ surface, role }) => {
+    const prefix = [
+      { role, content: "leading" },
+      { role: "user", content: "U" },
+      { role: "assistant", content: "A" },
+    ];
+    const material = (text: string) =>
+      affinityPrefixDigests(
+        digestArgs(
+          "runtime",
+          orderedHistoryPayload(surface, [
+            ...prefix,
+            { role, content: text },
+            { role: "user", content: "V" },
+          ]),
+          surface,
+        ),
+      );
+    const first = material("late");
+    const edit = material("edited late");
+    expect(first.rootDigest).toBe(edit.rootDigest);
+    expect(first.instructionDigests).toEqual(edit.instructionDigests);
+    expect(first.nodes).toHaveLength(4);
+    expect(first.nodes.slice(0, 2)).toEqual(edit.nodes.slice(0, 2));
+    expect(first.nodes.slice(2)).not.toEqual(edit.nodes.slice(2));
+    const leadingEdit = affinityPrefixDigests(
+      digestArgs(
+        "runtime",
+        orderedHistoryPayload(surface, [
+          { role, content: "edited leading" },
+          ...prefix.slice(1),
+          { role, content: "late" },
+          { role: "user", content: "V" },
+        ]),
+        surface,
+      ),
+    );
+    expect(leadingEdit.rootDigest).not.toBe(first.rootDigest);
+    expect(leadingEdit.instructionDigests).not.toEqual(first.instructionDigests);
+    expect(leadingEdit.nodes[0]).not.toEqual(first.nodes[0]);
+  },
+);
+
+it.each(instructionPlacementRows)(
+  "R7 continuation split $surface $role keeps late output evidence after the first user",
+  ({ surface, role }) => {
+    for (const type of ["tool_use", "tool_result"]) {
+      const instruction = { role, content: [{ type, id: "call" }] };
+      for (const units of [
+        [instruction, { role: "user", content: "U" }],
+        [{ role: "assistant", content: "greeting" }, instruction, { role: "user", content: "U" }],
+        [{ role: "user", content: "U" }, instruction],
+      ]) {
+        const request = orderedHistoryPayload(surface, units);
+        const expected = units[0]?.role === "user";
+        expect(buildCanonicalRequest({ surface, payload: request })?.isContinuation).toBe(expected);
+        expect(extractAffinityLayers(surface, request).isContinuation).toBe(expected);
+      }
+    }
+  },
+);
+
+it.each([
+  {
+    surface: "openai-chat",
+    request: {
+      model: "alias",
+      stream: false,
+      temperature: 0.2,
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "lookup",
+            parameters: {
+              type: "object",
+            },
+          },
+        },
+      ],
+      vendor_extension: {
+        stable: true,
+      },
+      messages: [
+        {
+          role: "system",
+          content: "S",
+        },
+        {
+          role: "developer",
+          content: "D",
+        },
+        {
+          role: "user",
+          content: "U",
+        },
+        {
+          role: "assistant",
+          content: "A",
+        },
+        {
+          role: "user",
+          content: "V",
+        },
+      ],
+    },
+    rootDigest: "g3AgU67fsnUp02hkzf5U4zHC2BN034RLlW9299aij_w",
+    nodes: [
+      {
+        digest: "WlvFWf2vi9FySNq5H6HqvIWF13oUXLFApp5b8Op0GyA",
+        depth: 1,
+      },
+      {
+        digest: "6jp7Fef4p_URXkegSigsd-wTjiGp6jqTePKpZRD0LyE",
+        depth: 2,
+      },
+      {
+        digest: "Wr3sYG2GmjZLE33Ye5PYfCzPy_Y8b2RBKGOk4JMPEyo",
+        depth: 3,
+      },
+    ],
+    instructionDigests: [
+      "instruction-v5:BRsSf2Cp53X44mAmqlyFn9IcUzWWsnTDp9_hXq5dweA",
+      "instruction-v5:Oq7UsVtdg2V0aCEzIJ7xBdkxFOoi9ny4jgyObhSWfns",
+      "instruction-v5:-dtT_Nz_DpeKXWEP5J4ohtJwiC3SxVFsIDqAkcGjRHE",
+    ],
+  },
+  {
+    surface: "openai-responses",
+    request: {
+      model: "alias",
+      stream: false,
+      temperature: 0.2,
+      tools: [
+        {
+          type: "function",
+          name: "lookup",
+          parameters: {
+            type: "object",
+          },
+        },
+      ],
+      vendor_extension: {
+        stable: true,
+      },
+      instructions: "top",
+      input: [
+        {
+          role: "system",
+          content: "S",
+        },
+        {
+          role: "developer",
+          content: "D",
+        },
+        {
+          role: "user",
+          content: "U",
+        },
+        {
+          role: "assistant",
+          content: "A",
+        },
+        {
+          role: "user",
+          content: "V",
+        },
+      ],
+    },
+    rootDigest: "QgvvQRR1ZmNDQmTNdKClM-UDIztvXNCcW7wjUBAyR1A",
+    nodes: [
+      {
+        digest: "nZc_pk25cKhGsC5bVZnwVz4ktqbIci1Ygbi097PYDg0",
+        depth: 1,
+      },
+      {
+        digest: "q1IR1Ai2laay5ii6otXoybq5YXXrfoLeVurJ-6z5jZA",
+        depth: 2,
+      },
+      {
+        digest: "cc1zCNVHFXuvtNUELEgLn4yGRhrHLSJr1Z8r6FKdkeo",
+        depth: 3,
+      },
+    ],
+    instructionDigests: [
+      "instruction-v5:k1g1kEmr2B6nLsvI47rKLcjpx7MAus1yKEf5ch6MznQ",
+      "instruction-v5:vl2HH12OiYEjhLZSi5ynajEy-9ygEgpZ4AtAtHPlA0o",
+      "instruction-v5:ol7uQpz-WTKxrAH6ws8tfAL_YRmI4-ZCrGoZfCWzq5o",
+      "instruction-v5:qjmSUfNQO_jfdefvgutLy9IqSjgLO1iVAxpN7gHbOLw",
+    ],
+  },
+  {
+    surface: "anthropic-messages",
+    request: {
+      model: "alias",
+      stream: false,
+      temperature: 0.2,
+      tools: [
+        {
+          name: "lookup",
+          input_schema: {
+            type: "object",
+          },
+        },
+      ],
+      vendor_extension: {
+        stable: true,
+      },
+      system: [
+        {
+          type: "text",
+          text: "S",
+        },
+      ],
+      messages: [
+        {
+          role: "user",
+          content: "U",
+        },
+        {
+          role: "assistant",
+          content: "A",
+        },
+        {
+          role: "user",
+          content: "V",
+        },
+      ],
+    },
+    rootDigest: "qPrVvbCK40E-RRskLw1IJw6wRQ0BN8JMA9m5UZwNIDs",
+    nodes: [
+      {
+        digest: "VVuMYkSXcPomPOXy7sNM4nn8l0WbuoM9z3n72yiSOmw",
+        depth: 1,
+      },
+      {
+        digest: "KoeRFAneXhf5aNPPjOaS0PVB-Ph121ZeypLLlu56MR8",
+        depth: 2,
+      },
+      {
+        digest: "NrYJLEB7AxvepojaYDIFY20jvPOOe5kd0AnqlQ_0QKo",
+        depth: 3,
+      },
+    ],
+    instructionDigests: [
+      "instruction-v5:FL987faZpOp3sx4KrjuOm6f8NptSOli13w0XQpkha-k",
+      "instruction-v5:hFMNZxu436AXEXzUQP4_WCJW0-wfl6O30fIsrgk5Pa0",
+    ],
+  },
+])(
+  "R7 golden leading instructions $surface retain HEAD root nodes and routing hints",
+  ({ surface, request, rootDigest, nodes, instructionDigests }) => {
+    const material = affinityPrefixDigests(digestArgs("runtime", request, surface));
+    expect(material.rootDigest).toBe(rootDigest);
+    expect(material.nodes).toEqual(nodes);
+    expect(material.instructionDigests).toEqual(instructionDigests);
+  },
+);

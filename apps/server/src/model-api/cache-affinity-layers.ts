@@ -181,6 +181,23 @@ export function stableJson(value: JsonValue): string {
   return budgetedStableJson(value);
 }
 
+/** Only the leading instruction prefix can move out of the ordered wire history. */
+function* orderedUnits(
+  units: unknown[],
+  layer: "instructions" | "conversation",
+  work?: CanonicalWork,
+) {
+  let leading = true;
+  for (const unit of units) {
+    if (work) visitCanonical(work);
+    leading &&= INSTRUCTION_ROLES.has(objectRole(unit) ?? "");
+    if (layer === "instructions") {
+      if (!leading) return;
+      yield unit;
+    } else if (!leading) yield unit;
+  }
+}
+
 /** Raw iterators avoid copying or converting the conversation before budgeting it. */
 export function rawAffinityLayers(
   surface: string | null,
@@ -206,19 +223,18 @@ export function rawAffinityLayers(
   function* instructions() {
     if (!chat && payload[topInstruction] !== undefined) yield payload[topInstruction];
     if ((chat || responses) && Array.isArray(units)) {
-      for (const unit of units) {
-        visitCanonical(work);
-        if (INSTRUCTION_ROLES.has(objectRole(unit) ?? "")) yield unit;
-      }
+      yield* orderedUnits(units, "instructions", work);
     }
   }
   function* conversation() {
     if (responses && typeof units === "string") yield units;
     if (Array.isArray(units)) {
-      for (const unit of units) {
-        visitCanonical(work);
-        if ((!chat && !responses) || !INSTRUCTION_ROLES.has(objectRole(unit) ?? "")) yield unit;
-      }
+      if (chat || responses) yield* orderedUnits(units, "conversation", work);
+      else
+        for (const unit of units) {
+          visitCanonical(work);
+          yield unit;
+        }
     }
   }
   return { instructions, conversation, tools, consumedKeys };
@@ -315,10 +331,10 @@ function extractChat(payload: Record<string, unknown>): AffinityLayers {
   const consumedKeys: string[] = [];
   if (Array.isArray(payload.messages)) {
     consumedKeys.push("messages");
-    for (const item of payload.messages) {
-      if (INSTRUCTION_ROLES.has(objectRole(item) ?? "")) pushJson(instructionUnits, item);
-      else pushJson(conversationUnits, item);
-    }
+    for (const item of orderedUnits(payload.messages, "instructions"))
+      pushJson(instructionUnits, item);
+    for (const item of orderedUnits(payload.messages, "conversation"))
+      pushJson(conversationUnits, item);
   }
   const extracted = extractTools(payload);
   const functions = asJson(payload.functions, MAX_CANONICAL_BYTES);
@@ -375,10 +391,8 @@ function extractResponses(payload: Record<string, unknown>): AffinityLayers {
     pushJson(conversationUnits, input);
   } else if (Array.isArray(input)) {
     consumedKeys.push("input");
-    for (const item of input) {
-      if (INSTRUCTION_ROLES.has(objectRole(item) ?? "")) pushJson(instructionUnits, item);
-      else pushJson(conversationUnits, item);
-    }
+    for (const item of orderedUnits(input, "instructions")) pushJson(instructionUnits, item);
+    for (const item of orderedUnits(input, "conversation")) pushJson(conversationUnits, item);
   }
   const { tools, consumed } = extractTools(payload);
   if (consumed) consumedKeys.push("tools");

@@ -332,14 +332,20 @@ levels`. Depth 129 through 256 is served with affinity advisory identity off,
 including bound Responses follow-ups. Realistic tool/JSON schemas are far below
 256, which also stays safely below Node 24's recursive serializer limit.
 
-Adapters enforce the same literal **256-level** bound whenever embedded tool
-argument JSON strings are decoded into objects, including request rendering,
-nonstream responses and stream validation. Each decoded argument has a fresh
-depth-0 boundary: depth 256 is supported, and 257 or greater fails with
-`request JSON nesting exceeds 256 levels`. Local and external request render
+Adapters enforce the same literal **256-level** bound when request rendering
+decodes embedded tool argument JSON strings into objects. Each decoded argument
+has a fresh depth-0 boundary: depth 256 is supported, and 257 or greater fails
+with `request JSON nesting exceeds 256 levels`. Local and external request render
 preflight returns the requested protocol's HTTP 400 before member admission or
-dispatch, without recording a member health failure. Native argument strings
-that are passed through without decoding retain their existing behavior.
+dispatch, without recording a member health failure.
+
+Provider responses have a separate **256-level** limit covering whole nonstream
+JSON bodies, SSE stream `data` JSON, and embedded tool arguments decoded during
+response adaptation. Overflow is an upstream failure:
+`response_json_depth_exceeded` / `provider response JSON nesting exceeds 256 levels`.
+It returns HTTP 502 before any output, or a terminal protocol error event after
+output; the relay finishes `FAILED` with `protocol_error`. Native argument strings
+passed through without decoding retain their existing behavior.
 
 The shared parser covers `/chat/completions`, `/messages`,
 `/messages/count_tokens`, `/responses` (create and bound input follow-ups),
