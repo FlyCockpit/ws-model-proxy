@@ -28,6 +28,16 @@ export { CLI_COMMAND_OUTPUT_NOTICE } from "@ws-model-proxy/config/cli-command-ou
 const SUPERVISED_UNCERTAIN_OUTCOME_MESSAGE =
   "The file outcome is uncertain; ask the person to check the wsmp daemon log for recovery locations";
 
+// Supervised results differ from headless wording: a supervised request that
+// failed after the person approved it reports outcome unknown, and supervised
+// `limit` errors carry no retryAfterMs.
+const SUPERVISED_MESSAGE_OVERRIDES: Partial<Record<string, string>> = {
+  uncertain_outcome: SUPERVISED_UNCERTAIN_OUTCOME_MESSAGE,
+  unsafe_filesystem:
+    "This filesystem lacks the atomic primitives to change this path without risking a concurrent save; ask the person to check the file",
+  limit: "Too many file operations; wait for an active request to finish or retry later",
+};
+
 /**
  * Three switches gate a CLI command (docs/cli-command-switches.md): 1 the
  * token, 2 the device's dashboard grant, 3 the CLI's own
@@ -270,9 +280,8 @@ export async function runForwarderCliCommandResult(
               error: {
                 ...supervised.fileError,
                 message:
-                  supervised.fileError.code === "uncertain_outcome"
-                    ? SUPERVISED_UNCERTAIN_OUTCOME_MESSAGE
-                    : FILE_ERROR_MESSAGES[supervised.fileError.code],
+                  SUPERVISED_MESSAGE_OVERRIDES[supervised.fileError.code] ??
+                  FILE_ERROR_MESSAGES[supervised.fileError.code],
               },
             }
           : {}),

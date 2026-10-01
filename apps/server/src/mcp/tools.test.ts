@@ -3086,6 +3086,11 @@ describe("CLI file tools", () => {
       "The file outcome is uncertain; ask the person to check the wsmp daemon log for recovery locations",
     ],
     [
+      "unsafe_filesystem",
+      "This filesystem lacks the atomic primitives to change this path without risking a concurrent save; ask the person to check the file",
+    ],
+    ["limit", "Too many file operations; wait for an active request to finish or retry later"],
+    [
       "secret_file",
       "Secret files are read-only masked views: edit, write, rename, delete and mkdir are refused on them and on their directories",
     ],
@@ -3096,7 +3101,8 @@ describe("CLI file tools", () => {
         code === "timeout" ||
         code === "offline" ||
         code === "io_error" ||
-        code === "uncertain_outcome";
+        code === "uncertain_outcome" ||
+        code === "unsafe_filesystem";
       cliRuntime.snapshotSupervisedCommand.mockReturnValueOnce({
         kind: "supervised",
         requestKind: "file",
