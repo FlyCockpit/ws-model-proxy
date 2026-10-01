@@ -1581,6 +1581,35 @@ fn check_real_capabilities(directory: &Path, class: RealClass) {
     }
 }
 
+/// The cached-attribute class: strict like the six-class test, but only this one class.
+#[test]
+fn exchangeless_real_filesystem_cached_e2e() {
+    let directory = std::env::var_os("WSMP_EXCHANGELESS_DIR");
+    let class = std::env::var_os("WSMP_EXCHANGELESS_CLASS");
+    let required = std::env::var_os("WSMP_EXCHANGELESS_REQUIRED").is_some();
+    if directory.is_none() && class.is_none() && !required {
+        crate::output::diagnostic("SKIP exchangeless cached real filesystem: nothing requested")
+            .unwrap();
+        return;
+    }
+    let directory = directory.expect("the cached real filesystem needs DIR");
+    assert_eq!(
+        class.as_deref().and_then(std::ffi::OsStr::to_str),
+        Some("link-noino-cached"),
+        "the cached test runs only on the link-noino-cached class"
+    );
+    let directory = PathBuf::from(directory);
+    check_real_capabilities(
+        &directory,
+        RealClass {
+            nr: false,
+            link: true,
+            noino: true,
+        },
+    );
+    rename_publish::real_cached_rows(&directory);
+}
+
 /// Env-gated real mount evidence; the exact name is the CI runner contract.
 #[test]
 fn exchangeless_real_filesystem_optional_e2e() {

@@ -28,6 +28,7 @@ pub(super) enum Primitive {
     Mkdir,
     Unlink,
     Rmdir,
+    LinkCount,
 }
 
 #[cfg(test)]
@@ -209,6 +210,38 @@ pub(super) fn no_replace(
             let _ = (dir_from, from, dir_to, to);
             Err(Errno::ENOSYS)
         }
+    })
+}
+
+/// The link count of `name` under `dir`, read from the filesystem itself.
+///
+/// A plain stat answers from the kernel's attribute cache. FUSE (default one-second
+/// attribute timeout), NFS and SMB then report a count that is stale in BOTH
+/// directions (and, without stable inode numbers, every name has its own cached
+/// attributes), so a guard built on it can delete an object's last name or retain a
+/// clean alias every time. Linux therefore asks for `statx` with
+/// `AT_STATX_FORCE_SYNC`. Other Unix systems have no such flag: they get the plain
+/// stat, and callers must not treat it as proof (see `dispose_link_move`). An error
+/// is an error: callers keep what they were about to delete.
+pub(super) fn link_count(dir: impl AsFd, name: &OsStr) -> Result<u64, Errno> {
+    run(Primitive::LinkCount, || {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{AtFlags, StatxFlags, statx};
+            match statx(
+                &dir,
+                name,
+                AtFlags::SYMLINK_NOFOLLOW | AtFlags::STATX_FORCE_SYNC,
+                StatxFlags::NLINK,
+            ) {
+                Ok(stat) => return Ok(u64::from(stat.stx_nlink)),
+                // A kernel without statx: the cached count is all there is.
+                Err(rustix::io::Errno::NOSYS) => {}
+                Err(errno) => return Err(Errno::from_raw(errno.raw_os_error())),
+            }
+        }
+        nix::sys::stat::fstatat(dir, name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW)
+            .map(|raw| super::resolve::Stat::from_raw(&raw).nlink)
     })
 }
 

@@ -14,12 +14,16 @@
 #   none        NOREPLACE is EINVAL, link() is EPERM
 #   <class>-noino   the same, without stable inode numbers (two names of one object
 #                   report different st_ino)
+#   link-noino-cached  link-noino with libfuse's default entry/attribute caching (like NFS or SMB:
+#                   a plain stat's link count can be stale); runs its own test, only on this class
 #
 # Nothing is installed and nothing is skipped: a missing prerequisite or a failed mount
 # fails the run. No sudo: mounts go through the distro's setuid fusermount3.
 set -uo pipefail
 
-ALL_CLASSES=(nr link none nr-noino link-noino none-noino)
+SIX_CLASSES=(nr link none nr-noino link-noino none-noino)
+CACHED_CLASS=link-noino-cached
+ALL_CLASSES=("${SIX_CLASSES[@]}" "$CACHED_CLASS")
 MODE=${1:-test}
 [[ $# -gt 0 ]] && shift
 CLASSES=("$@")
@@ -30,6 +34,7 @@ cli=$(cd "$here/.." && pwd)
 support=$cli/tests/support/exchangeless
 vendor=$support/vendor/libfuse3
 test_name=file_ops::tests::exchangeless::exchangeless_real_filesystem_optional_e2e
+cached_test_name=file_ops::tests::exchangeless::exchangeless_real_filesystem_cached_e2e
 fusermount=/usr/bin/fusermount3
 mount_timeout=10
 test_timeout=${WSMP_EXCHANGELESS_TEST_TIMEOUT:-180}
@@ -39,7 +44,11 @@ case $MODE in test | smoke | cleanup) ;; *) echo "usage: $0 test|smoke|cleanup [
 if [[ $MODE == cleanup ]]; then
   # Idempotent last resort for a cancelled job: unmount FUSE mounts that an aborted run left under
   # this runner's temp directory. It touches nothing else and never signals a process.
-  base=${RUNNER_TEMP:-${TMPDIR:-/tmp}}/exchangeless-fs.
+  if [[ -z ${RUNNER_TEMP:-} ]]; then
+    echo "cleanup needs RUNNER_TEMP (the CI runner's temp directory): refusing to touch mounts elsewhere" >&2
+    exit 2
+  fi
+  base=$RUNNER_TEMP/exchangeless-fs.
   status=0
   while read -r mnt; do
     echo "cleanup: unmounting $mnt"
@@ -166,8 +175,10 @@ print(exe or "")
 PY
   )
   [[ -x $test_binary ]] || { fail "could not locate the lib test binary"; exit 1; }
-  count=$("$test_binary" --list --format terse 2>/dev/null | grep -c -x "$test_name: test")
-  [[ $count -eq 1 ]] || { fail "the test $test_name is not listed exactly once ($count)"; exit 1; }
+  for name in "$test_name" "$cached_test_name"; do
+    count=$("$test_binary" --list --format terse 2>/dev/null | grep -c -x "$name: test")
+    [[ $count -eq 1 ]] || { fail "the test $name is not listed exactly once ($count)"; exit 1; }
+  done
 fi
 
 # ---- per class -----------------------------------------------------------------
@@ -175,7 +186,7 @@ check_capabilities() { # the raw primitives must match the class, independently 
   python3 - "$1" "$2" <<'PY'
 import ctypes, os, sys
 cls, mnt = sys.argv[1], sys.argv[2]
-base = cls.removesuffix("-noino")
+base = cls.removesuffix("-cached").removesuffix("-noino")
 libc = ctypes.CDLL(None, use_errno=True)
 def rename2(a, b, flags):
     ctypes.set_errno(0)
@@ -203,7 +214,7 @@ except OSError as e:
 if base == "none":
     if linked or link_errno != 1: errors.append("link() must be EPERM")
 elif not linked: errors.append(f"link() must work, got errno {link_errno}")
-if linked and cls.endswith("-noino"):
+if linked and "-noino" in cls:
     if os.stat(src).st_ino == os.stat(os.path.join(d, "alias")).st_ino: errors.append("noino: two names of one object must report different st_ino")
 elif linked and os.stat(src).st_ino != os.stat(os.path.join(d, "alias")).st_ino:
     errors.append("stable inodes: two names of one object must report one st_ino")
@@ -218,12 +229,14 @@ PY
 run_class() {
   local class=$1 dir="$work/$1"
   local -a flags=()
-  case ${class%-noino} in
+  local base=${class%-cached}; base=${base%-noino}
+  case $base in
     nr) ;;
     link) flags=(PROBE_NO_NOREPLACE=1) ;;
     none) flags=(PROBE_NO_NOREPLACE=1 PROBE_NO_LINK=1) ;;
   esac
-  [[ $class == *-noino ]] && flags+=(PROBE_NO_INO=1)
+  [[ $class == *-noino* ]] && flags+=(PROBE_NO_INO=1)
+  [[ $class == *-cached ]] && flags+=(PROBE_CACHE=1)
   mkdir -p "$dir/backing" "$dir/mnt" || return 1
   # The none classes cannot create links through the mount. Seed an alias pair
   # in backing storage so the Rust test can verify their declared inode mode.
@@ -247,8 +260,10 @@ run_class() {
   local out="$dir/test.out"
   # Background plus `wait`: a signal to this script interrupts `wait` at once and the trap runs
   # (a foreground command would defer it), so a cancelled job stops the test before it unmounts.
+  local name=$test_name
+  [[ $class == "$CACHED_CLASS" ]] && name=$cached_test_name
   WSMP_EXCHANGELESS_REQUIRED=1 WSMP_EXCHANGELESS_CLASS=$class WSMP_EXCHANGELESS_DIR=$dir/mnt \
-    timeout -k 10 "$test_timeout" "$test_binary" --exact "$test_name" --nocapture --test-threads=1 >"$out" 2>&1 &
+    timeout -k 10 "$test_timeout" "$test_binary" --exact "$name" --nocapture --test-threads=1 >"$out" 2>&1 &
   TEST_PID=$!
   wait "$TEST_PID"
   local status=$?

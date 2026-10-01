@@ -23,8 +23,8 @@
 //! with no intent file or replay; (e) unheld objects never authorize deletion;
 //! (f) another process's NFS fd can leave .nfs residue (own fds close before unlink,
 //! except pinned source proof through probe-alias unlink on per-vnode clients);
-//! (g) replace/rename expose a link before alias cleanup: fresh nlink < 2 keeps the
-//! last alias, but a writer and third save after that check can still orphan it.
+//! (g) replace/rename expose a link before alias cleanup: a forced-sync (statx
+//! FORCE_SYNC) link count < 2 keeps the last alias, but a writer and third save after that check can still orphan it.
 //! Retained aliases can cause nlink 2/hard_linked until manual cleanup.
 //! Vacancies are bounded by syscalls, not time; filesystem atomicity is trusted.
 //! Recovery mkdir errors fail closed; unreadable macOS/other-Unix files refuse

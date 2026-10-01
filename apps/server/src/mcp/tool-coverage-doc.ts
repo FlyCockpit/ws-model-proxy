@@ -66,7 +66,7 @@ and link mounts through one recovery-owned vacate-both publisher. Neither primit
 means \`unsafe_filesystem\` with no public change. Plain link rename vacates first,
 uses own-name alias proofs and returns a source-bound etag at the published name.
 Directories require no-replace, never overwrite, and own-subtree moves are invalid_input.
-Alias cleanup checks a fresh link count and reports a last surviving alias; residual
+Alias cleanup checks a forced-sync link count (statx on Linux) and reports a last surviving alias; residual
 (g) also applies to rename. Crash residue includes captured source/destination and
 private preflight dummies, logged before capture, without intent/replay. Rust tests
 cover Linux/macOS injected capability, ownership, race, cancellation and reply-loss

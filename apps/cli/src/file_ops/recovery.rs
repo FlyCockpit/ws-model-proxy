@@ -89,7 +89,9 @@ use rand::distr::{Alphanumeric, SampleString};
 use serde_json::json;
 
 use super::error::{ErrorCode, FileError, FileResult};
-use super::exchange::{Primitive, fault, is_link_unsupported, is_unsupported, no_replace, run};
+use super::exchange::{
+    Primitive, fault, is_link_unsupported, is_unsupported, link_count, no_replace, run,
+};
 use super::resolve::{Kind, Resolved, Stat};
 use super::{Cancel, FileOps, Step};
 
@@ -1246,12 +1248,12 @@ impl RecoveryDir {
             self.unlink_proven(destination);
         }
         if dispose_source {
-            let survives = fstatat(
-                self.dir.as_fd(),
-                source.name.as_os_str(),
-                AtFlags::AT_SYMLINK_NOFOLLOW,
-            )
-            .is_ok_and(|raw| Stat::from_raw(&raw).nlink >= 2);
+            // Linux: a forced-sync count. Elsewhere the count may be cached, so the
+            // alias also stays unless the object had no other name before this move
+            // (an alias pair then cannot exist). Any error keeps it.
+            let survives = link_count(self.dir.as_fd(), source.name.as_os_str())
+                .is_ok_and(|count| count >= 2)
+                && (cfg!(target_os = "linux") || src.stat.nlink <= 1);
             if survives {
                 self.unlink_proven(source);
             } else {
@@ -1272,7 +1274,9 @@ impl RecoveryDir {
         }
         // An exposed alias must never be its object's last name. Fresh nlink is
         // conservative on filesystems with unreliable counts (safe retention).
-        if alias && !held.identity().is_some_and(|stat| stat.nlink >= 2) {
+        if alias
+            && !link_count(self.dir.as_fd(), slot.name.as_os_str()).is_ok_and(|count| count >= 2)
+        {
             self.unsettled = true;
             return false;
         }

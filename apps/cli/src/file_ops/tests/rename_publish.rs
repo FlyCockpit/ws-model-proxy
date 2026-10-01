@@ -863,6 +863,83 @@ fn rename_link_etag_rejects_a_later_save_and_exposure_keeps_last_alias() {
     }
 }
 
+/// Rows for a link-only mount WITHOUT stable inode numbers that keeps libfuse's default
+/// attribute and lookup caching (class `link-noino-cached`, like NFS or SMB with their
+/// attribute caches). A cached link count is stale in both directions, so these rows
+/// pin the forced-sync count: a clean rename leaves no residue (O2B-2) and a true
+/// alias pair whose public name was replaced after the publish keeps its object
+/// (O2B-1).
+pub(super) fn real_cached_rows(directory: &Path) {
+    use nix::fcntl::AT_FDCWD;
+    for object in OBJECTS {
+        for overwrite in [false, true] {
+            let fx = real_fixture(directory);
+            let etag = setup(&fx, object, overwrite);
+            let value = rename_run(&fx, overwrite, etag.as_deref(), false).unwrap();
+            assert!(
+                value.get("recovered").is_none(),
+                "{object:?} overwrite={overwrite}: a clean rename must leave nothing: {value}"
+            );
+            assert!(
+                recovery_dirs(&fx.root).is_empty(),
+                "{object:?}: recovery directory left behind"
+            );
+            assert_eq!(object.bytes(&fx.root.join("dst")).as_deref(), Some(SOURCE));
+        }
+        for save in [false, true] {
+            let fx = real_fixture(directory);
+            let root = fx.root.clone();
+            let fx = fx.with_hook(move |step| {
+                if save && step == Step::Renamed {
+                    let public = root.join("dst");
+                    if matches!(object, Object::File) {
+                        use std::io::Write;
+                        let mut writer = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(&public)
+                            .unwrap();
+                        writer.write_all(b"+WRITER").unwrap();
+                    }
+                    object.save(&public, RACER);
+                }
+                Ok(())
+            });
+            object.put(&fx, "src", SOURCE);
+            nix::unistd::linkat(
+                AT_FDCWD,
+                &fx.root.join("src"),
+                AT_FDCWD,
+                &fx.root.join("dst"),
+                nix::fcntl::AtFlags::empty(),
+            )
+            .unwrap();
+            let etag = object.tag(&fx, "dst");
+            let result = rename_run(&fx, true, Some(&etag), false);
+            let expected = if matches!(object, Object::File) && save {
+                format!("{SOURCE}+WRITER")
+            } else {
+                SOURCE.to_owned()
+            };
+            let reported: Vec<PathBuf> = match &result {
+                Ok(value) => inventory(&fx, value),
+                Err(error) => error_inventory(&fx, error),
+            };
+            if save {
+                assert!(
+                    reported
+                        .iter()
+                        .any(|path| object.bytes(path).as_deref() == Some(expected.as_str())),
+                    "{object:?}: the displaced object must stay reported: {result:?} {reported:?}"
+                );
+            } else {
+                let value = result.unwrap();
+                assert!(value.get("recovered").is_none(), "{object:?}: {value}");
+                assert_eq!(object.bytes(&fx.root.join("dst")).as_deref(), Some(SOURCE));
+            }
+        }
+    }
+}
+
 pub(super) fn real_rename_rows(directory: &Path, class: RealClass) {
     for object in OBJECTS {
         for overwrite in [false, true] {
@@ -1138,6 +1215,70 @@ fn rename_symlink_etag_requires_the_same_target() {
                 result.etag.as_deref(),
                 Some(Object::Symlink.tag(&fx, "dst").as_str())
             );
+        }
+    }
+}
+
+/// O2B-3: when the fresh link-count read fails, the alias is kept and reported; it
+/// is never deleted on an unknown count. Covers the single alias (plain rename) and
+/// the S/D batch (overwrite), for every count read of the operation.
+#[test]
+fn rename_failed_link_count_read_keeps_the_alias_and_reports_it() {
+    for object in OBJECTS {
+        for overwrite in [false, true] {
+            let clean = {
+                let fx = Fx::new();
+                let etag = setup(&fx, object, overwrite);
+                let _scope = FaultScope::new(&Shape::Link.faults(overwrite));
+                let value = rename_run(&fx, overwrite, etag.as_deref(), false).unwrap();
+                assert!(value.get("recovered").is_none(), "{object:?}: {value}");
+                count(&FaultScope::calls(), Primitive::LinkCount)
+            };
+            assert!(
+                clean >= 1,
+                "{object:?} overwrite={overwrite}: a count must be read"
+            );
+            for nth in 1..=clean {
+                let fx = Fx::new();
+                let etag = setup(&fx, object, overwrite);
+                let mut faults = Shape::Link.faults(overwrite);
+                faults.push((Primitive::LinkCount, nth, Errno::EIO));
+                let _scope = FaultScope::new(&faults);
+                match rename_run(&fx, overwrite, etag.as_deref(), false) {
+                    Ok(value) => {
+                        // Success: the published name holds the source; any private
+                        // alias the unknown count kept is reported, with its bytes.
+                        assert_eq!(object.bytes(&fx.root.join("dst")).as_deref(), Some(SOURCE));
+                        let paths = inventory(&fx, &value);
+                        let reported = value.get("recovered").is_some();
+                        if nth == clean {
+                            // The last read decides the published alias: unknown means kept.
+                            assert!(reported, "{object:?} overwrite={overwrite}: {value}");
+                        }
+                        if !reported {
+                            // Nothing kept: the read must not have been the deciding one.
+                            assert!(recovery_dirs(&fx.root).is_empty(), "{object:?} nth={nth}");
+                        } else {
+                            assert!(
+                                paths
+                                    .iter()
+                                    .any(|p| object.bytes(p).as_deref() == Some(SOURCE)),
+                                "{object:?} nth={nth}: {paths:?}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        assert_eq!(error.code, ErrorCode::UncertainOutcome, "{error:?}");
+                        let paths = error_inventory(&fx, &error);
+                        assert!(
+                            paths
+                                .iter()
+                                .any(|p| object.bytes(p).as_deref() == Some(SOURCE)),
+                            "{object:?} nth={nth}: {paths:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 }

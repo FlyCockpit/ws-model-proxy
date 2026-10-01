@@ -10,7 +10,9 @@
  *   - PROBE_NO_INO: no stable inode numbers (`use_ino` off, so two names of one
  *     object report different st_ino).
  * Entry, attribute and negative-lookup caching is off, so every observation
- * reaches the backing directory.
+ * reaches the backing directory, unless PROBE_CACHE is set: then libfuse's
+ * defaults apply (one second of entry and attribute caching), like NFS or SMB
+ * with attribute caches, where a plain stat's link count can be stale.
  *
  * Build (see scripts/test-exchangeless-fs.sh):
  *   gcc -std=gnu11 -D_FILE_OFFSET_BITS=64 -I vendor/libfuse3 fuse-exchangeless.c \
@@ -34,7 +36,7 @@
 #define RENAME_EXCHANGE_FLAG 2U
 
 static char base[PATH_MAX];
-static int reject_noreplace, reject_link, no_ino;
+static int reject_noreplace, reject_link, no_ino, cache;
 
 /* Join the backing directory and a mount-relative path; refuse truncation. */
 static int join(char *out, const char *path)
@@ -214,9 +216,11 @@ static void *op_init(struct fuse_conn_info *c, struct fuse_config *cfg)
 {
 	(void)c;
 	cfg->use_ino = !no_ino;
-	cfg->entry_timeout = 0;
-	cfg->attr_timeout = 0;
-	cfg->negative_timeout = 0;
+	if (!cache) {
+		cfg->entry_timeout = 0;
+		cfg->attr_timeout = 0;
+		cfg->negative_timeout = 0;
+	}
 	return NULL;
 }
 
@@ -234,6 +238,7 @@ int main(int argc, char **argv)
 	reject_noreplace = getenv("PROBE_NO_NOREPLACE") != NULL;
 	reject_link = getenv("PROBE_NO_LINK") != NULL;
 	no_ino = getenv("PROBE_NO_INO") != NULL;
+	cache = getenv("PROBE_CACHE") != NULL;
 	static const struct fuse_operations ops = {
 		.getattr = op_getattr,
 		.mkdir = op_mkdir,
