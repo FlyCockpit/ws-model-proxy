@@ -37,8 +37,8 @@ use std::ffi::OsStr;
 use std::os::fd::AsFd;
 
 use nix::errno::Errno;
-use nix::fcntl::{readlinkat, renameat};
-use nix::sys::stat::{fstat, mkdirat};
+use nix::fcntl::{OFlag, openat, readlinkat, renameat};
+use nix::sys::stat::{Mode, fstat, mkdirat};
 use nix::unistd::{UnlinkatFlags, unlinkat};
 use serde::{Deserialize, Serialize};
 
@@ -303,7 +303,9 @@ fn rename_impl(
             "special files are not moved",
         ));
     }
-    if src.kind() == Kind::Dir && to.dir_path.starts_with(from.full_path()) {
+    if src.kind() == Kind::Dir
+        && (to.dir_path.starts_with(from.full_path()) || destination_inside_source(&src, &to.dir))
+    {
         return Err(FileError::invalid(
             "cannot move a directory into its own subtree",
         ));
@@ -395,6 +397,40 @@ fn rename_impl(
         src_etag
     };
     Ok(RenameResult { etag, recovered })
+}
+
+/// True when `dest_parent` is the source directory or a descendant of it.
+/// Uses inode identity so a case-insensitive volume still refuses, even when
+/// the UTF-8 prefix check does not match.
+fn destination_inside_source(source: &Stat, dest_parent: impl AsFd) -> bool {
+    let Ok(mut fd) = dest_parent.as_fd().try_clone_to_owned() else {
+        return false;
+    };
+    for _ in 0..256 {
+        let Ok(raw) = fstat(fd.as_fd()) else {
+            return false;
+        };
+        let current = Stat::from_raw(&raw);
+        if current.same_object(source) {
+            return true;
+        }
+        let Ok(parent) = openat(
+            fd.as_fd(),
+            "..",
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) else {
+            return false;
+        };
+        let Ok(parent_raw) = fstat(parent.as_fd()) else {
+            return false;
+        };
+        if Stat::from_raw(&parent_raw).same_object(&current) {
+            return false;
+        }
+        fd = parent;
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -753,11 +789,6 @@ fn commit_rename(
                     return finish_move(&mut recovery, result.map(|()| false));
                 }
                 Err(Errno::EEXIST) => return Err(exists_error()),
-                Err(errno) if src.stat.kind() == Kind::Dir && errno == Errno::EINVAL => {
-                    return Err(FileError::invalid(
-                        "cannot move a directory into its own subtree",
-                    ));
-                }
                 Err(errno) if is_unsupported(errno) => {}
                 Err(errno) => return Err(FileError::errno(errno)),
             }

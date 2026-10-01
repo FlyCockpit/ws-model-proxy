@@ -809,7 +809,7 @@ fn rename_cleanup_failures_report_alias_and_destination_after_known_commit() {
 }
 
 #[test]
-fn rename_directory_einval_on_direct_move_is_invalid_input() {
+fn rename_directory_unsupported_nr_stays_unsafe_filesystem() {
     let fx = Fx::new();
     fx.put("tree/sub/child", SOURCE);
     let _scope = FaultScope::new(&[(Primitive::Move, 1, Errno::EINVAL)]);
@@ -817,6 +817,21 @@ fn rename_directory_einval_on_direct_move_is_invalid_input() {
         .ops
         .rename(
             &args(json!({"from":fx.p("tree"),"to":fx.p("elsewhere"),"overwrite":false})),
+            &fx.cancel,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::UnsafeFilesystem);
+}
+
+#[test]
+fn rename_directory_identity_walk_refuses_a_child() {
+    let fx = Fx::new();
+    fx.put("tree/sub/child", SOURCE);
+    let _scope = FaultScope::new(&[]);
+    let error = fx
+        .ops
+        .rename(
+            &args(json!({"from":fx.p("tree"),"to":fx.p("tree/sub/moved"),"overwrite":false})),
             &fx.cancel,
         )
         .unwrap_err();
