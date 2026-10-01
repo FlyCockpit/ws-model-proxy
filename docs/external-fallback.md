@@ -208,8 +208,11 @@ the actual reported prompt must be at least `protectMinTokens`; the record must
 be within that engine's protection window. A reported cache read of at most 5%
 of the expected prefix is an eviction observation. Unknown cache fields, hits,
 partial hits above 5%, short prefixes, client-id-only matches, instruction hints,
-ancestor edits/truncations and unranked targets produce no observation. The bound
-Responses `previous_response_id` path is excluded: it has neither a ranked
+ancestor edits/truncations and unranked targets produce no observation. A client
+id with a digest-proven live stored tip of that same session does count: the
+matched hint's digest and session must equal the tip probe's digest and owner,
+so a hint read before a concurrent truncation cannot supply the new tip's size.
+The bound Responses `previous_response_id` path is excluded: it has neither a ranked
 decision nor the matched record's age. Endpoint prefix-cache counters are also
 excluded: they are cumulative, include bypass traffic and cannot be attributed
 to a matched prefix. Unconfirmed records cannot count; remembering a zero-read

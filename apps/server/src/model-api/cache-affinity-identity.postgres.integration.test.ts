@@ -1,7 +1,8 @@
+import type { Prisma } from "@ws-model-proxy/db";
 // Fixture writes need no owner fences (the graph-write fence triggers accept
 // this client); production code under test uses its own clients.
 import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
   canonicalPayloadWire,
@@ -226,6 +227,7 @@ integration("cache-prefix identity #160", () => {
     expect(await service.resolveAffinitySessionDetail(producer, scope, material, now)).toEqual({
       sessionId: stored!.sessionId,
       viaTip: true,
+      tipDigest: stored!.tipDigest,
     });
     expect(await service.resolveAffinitySession(producer, scope, material, now)).toBe(
       stored!.sessionId,
@@ -251,6 +253,266 @@ integration("cache-prefix identity #160", () => {
       false,
     );
   });
+
+  it.each([
+    { name: "live tip", expected: true },
+    { name: "ancestor edit", expected: false, edit: true },
+    { name: "truncation", expected: false, truncate: true },
+    { name: "hint stamped by another session", expected: false, otherStamp: true },
+    { name: "hint deeper than live tip", expected: false, deeperHint: true },
+    { name: "wrong root", expected: false, wrongRoot: true },
+    ...(["body", "header"] as const).flatMap((carrier) => [
+      { name: `client ${carrier} full prefix`, carrier, expected: true },
+      { name: `client ${carrier} id only`, carrier, expected: false, noTip: true },
+      { name: `client ${carrier} other tip owner`, carrier, expected: false, otherOwner: true },
+      { name: `client ${carrier} edit`, carrier, expected: false, edit: true },
+      { name: `client ${carrier} wrong root`, carrier, expected: false, wrongRoot: true },
+    ]),
+  ])("C1a evidence identity: $name", async (row) => {
+    if (!db) throw new Error("database unavailable");
+    const args = argsFor(await fixture());
+    const carrier = "carrier" in row ? row.carrier : undefined;
+    const headers =
+      carrier === "header" ? new Headers({ "x-session-id": "evidence-client" }) : undefined;
+    const body = carrier === "body" ? { conversation_id: "evidence-client" } : {};
+    const messages = [...baseHistory, a("second reply"), u("third")];
+    const base = { ...body, messages };
+    const stored = await service.rememberAffinity({
+      ...args,
+      headers,
+      payload: base,
+      estimatedTokens: 12_000,
+      engineCacheConfirmed: true,
+    });
+    expect(stored).not.toBeNull();
+    const scope = {
+      userId: args.resourceOwnerId,
+      tenantUserId: args.ownerId,
+      poolId: args.poolId,
+      executionTargetId: args.target.executionTargetId,
+    };
+    if ("noTip" in row) await db.cacheAffinityNode.deleteMany({ where: scope });
+    if ("otherOwner" in row) {
+      // Node identity is immutable: seed a separate owner instead of changing it.
+      const nodes = await db.cacheAffinityNode.findMany({ where: scope });
+      await db.cacheAffinityNode.deleteMany({ where: scope });
+      await db.cacheAffinityNode.createMany({
+        data: nodes.map((node) => ({
+          ...node,
+          id: crypto.randomUUID(),
+          sessionId: "other-tip-owner",
+        })),
+      });
+    }
+    if ("otherStamp" in row)
+      await db.cacheAffinityRecord.updateMany({
+        where: scope,
+        data: { sessionId: "other-hint-owner" },
+      });
+    if ("deeperHint" in row) {
+      // Keep the real hint at depth 5 while moving the live tip to depth 3:
+      // same session does not make that deeper hint the current tip's record.
+      await db.cacheAffinityNode.deleteMany({ where: { ...scope, depth: { gt: 3 } } });
+      await db.cacheAffinityNode.updateMany({
+        where: { ...scope, depth: 3 },
+        data: { isTip: true },
+      });
+    }
+    const request = {
+      ...base,
+      ...("wrongRoot" in row ? { temperature: 0.8, instructions: "different root" } : {}),
+      messages:
+        "edit" in row
+          ? [...messages.slice(0, -1), u("edited third")]
+          : "truncate" in row
+            ? messages.slice(0, 3)
+            : [...messages, a("third reply"), u("fourth")],
+    };
+    const material = service.affinityPrefixDigests({
+      ...args,
+      headers,
+      payload: request,
+      runtimeIdentity: args.target.targetIdentity,
+    });
+    const detail = await service.resolveAffinitySessionDetail(producer, scope, material, args.now, {
+      probeClientTip: true,
+    });
+    const ranked = await service.rankAffinityTargets({
+      ...args,
+      headers,
+      payload: request,
+      targets: [args.target],
+      scoreSingleTarget: true,
+    });
+    expect(ranked.prefixEvidence).toEqual(
+      row.expected
+        ? {
+            [args.target.executionTargetId]: {
+              tokens: 12_000,
+              lastUsedAt: args.now.getTime(),
+              confirmed: true,
+            },
+          }
+        : {},
+    );
+    if (carrier) {
+      expect(detail.sessionId).toBe(stored!.sessionId);
+      expect(ranked.matchedSessionIds?.[args.target.executionTargetId]).toBe(stored!.sessionId);
+      expect(detail.viaTip).toBe(row.expected);
+      // Wrapper semantics remain unchanged, with zero query round trips.
+      // Spy on an adapter, not the shared proxy: restoring a captured proxy
+      // wrapper onto the client would bind later transaction queries to it.
+      const identityDb = {
+        $queryRaw: producer.$queryRaw,
+        cacheAffinityNode: producer.cacheAffinityNode,
+      };
+      const query = vi.spyOn(identityDb, "$queryRaw");
+      try {
+        expect(await service.resolveAffinitySession(identityDb, scope, material, args.now)).toBe(
+          stored!.sessionId,
+        );
+        expect(query).not.toHaveBeenCalled();
+      } finally {
+        query.mockRestore();
+      }
+    }
+  });
+
+  it.each(["truncate", "hit refresh"] as const)(
+    "C1a real fenced %s between the hint read and identity probe",
+    async (kind) => {
+      if (!db) throw new Error("database unavailable");
+      const args = argsFor(await fixture());
+      const messages = [...baseHistory, a("second reply"), u("third")];
+      const stored = await service.rememberAffinity({
+        ...args,
+        payload: { messages },
+        estimatedTokens: 100_000,
+        engineCacheConfirmed: true,
+      });
+      const request = { messages: [...messages, a("third reply"), u("fourth")] };
+      const findMany = producer.cacheAffinityRecord.findMany.bind(producer.cacheAffinityRecord);
+      let interleaved = false;
+      const read = async (input?: Prisma.CacheAffinityRecordFindManyArgs) => {
+        const records = await findMany(input);
+        // These are real PostgreSQL rows. The writer below commits through its
+        // real owner/pool fence after this snapshot and before the real probe.
+        expect(
+          records.some(
+            (record) =>
+              record.prefixDigest === stored!.tipDigest && record.estimatedTokens === 100_000,
+          ),
+        ).toBe(true);
+        const updated = await service.rememberAffinity({
+          ...args,
+          payload: { messages: kind === "truncate" ? messages.slice(0, 3) : messages },
+          estimatedTokens: kind === "truncate" ? 10_000 : 100_000,
+          engineCacheConfirmed: true,
+        });
+        expect(updated!.sessionId).toBe(stored!.sessionId);
+        interleaved = true;
+        return records;
+      };
+      // Wrap only ranking's read dependency; never mutate the shared Prisma
+      // proxy or the writer's transaction delegates.
+      const records = new Proxy(producer.cacheAffinityRecord, {
+        get(delegate, property) {
+          return property === "findMany" ? read : Reflect.get(delegate, property);
+        },
+      });
+      const rankDb = new Proxy(producer, {
+        get(client, property) {
+          return property === "cacheAffinityRecord" ? records : Reflect.get(client, property);
+        },
+      });
+      const ranked = await service.rankAffinityTargets({
+        ...args,
+        db: rankDb,
+        payload: request,
+        targets: [args.target],
+        scoreSingleTarget: true,
+      });
+      expect(interleaved).toBe(true);
+      expect(ranked.matchedSessionIds?.[args.target.executionTargetId]).toBe(stored!.sessionId);
+      expect(ranked.prefixEvidence).toEqual(
+        kind === "truncate"
+          ? {}
+          : {
+              [args.target.executionTargetId]: {
+                tokens: 100_000,
+                lastUsedAt: args.now.getTime(),
+                confirmed: true,
+              },
+            },
+      );
+      const feedback = await import("./kv-eviction-feedback.js");
+      expect(
+        feedback.qualifiesAsEvictionEvidence({
+          policy: {
+            enabled: true,
+            windowSeconds: 300,
+            minTokens: 8192,
+            share: "FIRST_COME",
+            fixedPercent: null,
+          },
+          engineKind: "VLLM",
+          kvBudgetTokens: 200_000,
+          ok: true,
+          usage: { promptTokens: 12_000, cacheReadTokens: kind === "truncate" ? 1000 : 10_000 },
+          evidence: ranked.prefixEvidence?.[args.target.executionTargetId],
+          now: args.now,
+        }),
+      ).toBe(false);
+      const liveTip = await db.cacheAffinityNode.findFirstOrThrow({
+        where: { sessionId: stored!.sessionId, isTip: true },
+      });
+      expect(liveTip.depth).toBe(kind === "truncate" ? 3 : 5);
+      const material = service.affinityPrefixDigests({
+        ...args,
+        payload: request,
+        runtimeIdentity: args.target.targetIdentity,
+      });
+      expect(
+        await service.resolveAffinitySessionDetail(producer, scopeFor(args), material, args.now),
+      ).toEqual({
+        sessionId: stored!.sessionId,
+        viaTip: true,
+        tipDigest: liveTip.nodeDigest,
+      });
+      const hint = await db.cacheAffinityRecord.findFirstOrThrow({
+        where: { ...scopeFor(args), prefixDigest: liveTip.nodeDigest },
+      });
+      expect(hint.estimatedTokens).toBe(kind === "truncate" ? 10_000 : 100_000);
+      // A subsequent real advance is still attributable to its new exact tip.
+      const advanced = await service.rememberAffinity({
+        ...args,
+        payload: request,
+        estimatedTokens: 15_000,
+        engineCacheConfirmed: true,
+      });
+      expect(advanced!.sessionId).toBe(stored!.sessionId);
+      const continued = await service.rankAffinityTargets({
+        ...args,
+        payload: { messages: [...request.messages, a("fourth reply"), u("fifth")] },
+        targets: [args.target],
+        scoreSingleTarget: true,
+      });
+      expect(continued.prefixEvidence?.[args.target.executionTargetId]).toEqual({
+        tokens: 15_000,
+        lastUsedAt: args.now.getTime(),
+        confirmed: true,
+      });
+    },
+  );
+
+  function scopeFor(args: ReturnType<typeof argsFor>) {
+    return {
+      userId: args.resourceOwnerId,
+      tenantUserId: args.ownerId,
+      poolId: args.poolId,
+      executionTargetId: args.target.executionTargetId,
+    };
+  }
 
   it.each(numericOverflowRows)(
     "R4 PG numeric overflow $surface $shape uses forwarded null identity",

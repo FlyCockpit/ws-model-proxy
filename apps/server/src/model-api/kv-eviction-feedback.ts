@@ -1,7 +1,9 @@
 /**
  * Prefix-attributed eviction feedback, never endpoint cumulative counters (they
  * include bypass traffic). Only a ranked, digest-proven LIVE TIP continuation
- * has a known cached footprint. Bound Responses parents are not a source.
+ * has a known cached footprint: hint digest and session must match the probed
+ * tip, including when a client id names that same session. Client-id-only
+ * matches and bound Responses parents are not a source.
  *
  * Disposable H-class state: one owner-guarded atomic upsert, no transaction,
  * graph write, capacity lock or fence lock. Application clock skew is bounded

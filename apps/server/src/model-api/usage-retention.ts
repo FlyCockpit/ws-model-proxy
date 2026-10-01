@@ -427,13 +427,15 @@ export async function deleteExpiredKvEvictions({
   let deleted = 0;
   for (;;) {
     if (isDbShutdownFenceArmed()) return deleted;
+    // The array is evaluated once: an IN semi-join can rescan its LIMIT and
+    // lock/delete more than one batch under a nested-loop plan.
     const count = await prisma.$executeRaw`
       DELETE FROM capacity_kv_eviction
-       WHERE "capacityId" IN (
+       WHERE "capacityId" = ANY(ARRAY(
          SELECT "capacityId" FROM capacity_kv_eviction
           WHERE "expiresAt" < ${cutoff}
           LIMIT ${batch}
-          FOR UPDATE SKIP LOCKED)`;
+          FOR UPDATE SKIP LOCKED))`;
     deleted += count;
     if (count < batch) return deleted;
   }

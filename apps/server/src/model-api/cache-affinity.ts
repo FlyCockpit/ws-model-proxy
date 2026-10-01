@@ -1,3 +1,9 @@
+/**
+ * Ranking attributes a cached footprint only when the matched hint's digest and
+ * session match one live-tip probe row. Client identity remains authoritative;
+ * a client id contributes eviction evidence only with its own digest-proven tip.
+ * Binding both facts to the tip digest rejects hints read before a truncation.
+ */
 import { randomUUID } from "node:crypto";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
@@ -614,7 +620,7 @@ export function affinityNodeProbeSql(
   limit: number,
   gate: Prisma.Sql = Prisma.empty,
 ): Prisma.Sql {
-  return Prisma.sql`SELECT "sessionId" FROM cache_affinity_node
+  return Prisma.sql`SELECT "sessionId", "nodeDigest" FROM cache_affinity_node
     WHERE ${gate}
       ("userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest", "nodeDigest", "isTip", "expiresAt")
       > (${scope.userId}, ${scope.tenantUserId}, ${scope.poolId}, ${scope.executionTargetId}, ${rootDigest}, ${digest}, ${isTip}, ${now}::timestamp)
@@ -656,16 +662,20 @@ export async function resolveAffinitySessionDetail(
   scope: IdentityScope,
   material: AffinityMaterial,
   now: Date,
-): Promise<{ sessionId: string | null; viaTip: boolean }> {
-  if (material.clientSessionId) return { sessionId: material.clientSessionId, viaTip: false };
+  options: { probeClientTip?: boolean } = {},
+): Promise<{ sessionId: string | null; viaTip: boolean; tipDigest: string | null }> {
+  const clientSessionId = material.clientSessionId;
+  const unproven = { sessionId: clientSessionId ?? null, viaTip: false, tipDigest: null };
+  // Writers retain the authoritative client-id shortcut without another read.
+  if (clientSessionId && !options.probeClientTip) return unproven;
   if (
     !material.identifiable ||
     material.nodes.length === 0 ||
     material.missingParent ||
     !material.isContinuation
   )
-    return { sessionId: null, viaTip: false };
-  if (material.boundSessionId) {
+    return unproven;
+  if (material.boundSessionId && !clientSessionId) {
     const parent = await db.cacheAffinityNode.findFirst({
       where: {
         ...scope,
@@ -676,14 +686,21 @@ export async function resolveAffinitySessionDetail(
       },
       select: { sessionId: true },
     });
-    return { sessionId: parent?.sessionId ?? null, viaTip: false };
+    return { sessionId: parent?.sessionId ?? null, viaTip: false, tipDigest: null };
   }
   // Same deepest-node, tips-first, sole-ancestor rule, in one bounded round trip.
   // Each lateral probe remains an equality seek in index order with LIMIT 1/2.
-  const matches = await db.$queryRaw<{ sessionId: string | null; viaTip: boolean }[]>(
-    affinityIdentityProbeSql(scope, material, now),
-  );
-  return { sessionId: matches[0]?.sessionId ?? null, viaTip: matches[0]?.viaTip === true };
+  const matches = await db.$queryRaw<
+    { sessionId: string | null; viaTip: boolean; tipDigest: string | null }[]
+  >(affinityIdentityProbeSql(scope, material, now));
+  const match = matches[0];
+  const viaTip =
+    match?.viaTip === true && (!clientSessionId || match.sessionId === clientSessionId);
+  return {
+    sessionId: clientSessionId ?? match?.sessionId ?? null,
+    viaTip,
+    tipDigest: match?.tipDigest ?? null,
+  };
 }
 
 /** Shared query text: diagnostics must explain the same query the resolver executes. */
@@ -696,7 +713,8 @@ export function affinityIdentityProbeSql(
     SELECT CASE WHEN tips."sessionId" IS NOT NULL THEN tips."sessionId"
                 WHEN cardinality(ancestors.sessions) = 1 THEN ancestors.sessions[1]
                 ELSE NULL END AS "sessionId",
-           (tips."sessionId" IS NOT NULL) AS "viaTip"
+           (tips."sessionId" IS NOT NULL) AS "viaTip",
+           p.digest AS "tipDigest"
       FROM jsonb_to_recordset(${JSON.stringify(material.nodes)}::jsonb) AS p(digest text, depth int)
       LEFT JOIN LATERAL (
         ${affinityNodeProbeSql(scope, material.rootDigest, Prisma.sql`p.digest`, true, now, 1)}
@@ -724,6 +742,7 @@ export async function rankAffinityTargets({
   sessionBinding,
   headers,
   now = new Date(),
+  db = prisma,
 }: {
   ownerId: string;
   resourceOwnerId: string;
@@ -739,6 +758,11 @@ export async function rankAffinityTargets({
   sessionBinding?: AffinitySessionBinding;
   headers?: Headers;
   now?: Date;
+  /** Read-only injection for real-query interleavings; writers use their own client. */
+  db?: Pick<
+    typeof prisma,
+    "cacheAffinityRecord" | "capacityLease" | "capacityWaiter" | "$queryRaw" | "cacheAffinityNode"
+  >;
 }): Promise<AffinityDecision> {
   const unchanged = {
     orderedTargetIds: targets.map(({ executionTargetId }) => executionTargetId),
@@ -806,7 +830,7 @@ export async function rankAffinityTargets({
   }
 
   const [records, activeLoads, waitingLoads] = await Promise.all([
-    prisma.cacheAffinityRecord.findMany({
+    db.cacheAffinityRecord.findMany({
       where: {
         userId: resourceOwnerId,
         tenantUserId: ownerId,
@@ -834,7 +858,7 @@ export async function rankAffinityTargets({
         estimatedTokens: true,
       },
     }),
-    prisma.capacityLease.groupBy({
+    db.capacityLease.groupBy({
       by: ["capacityId"],
       where: {
         capacityId: { in: targets.map(({ capacityId }) => capacityId) },
@@ -843,7 +867,7 @@ export async function rankAffinityTargets({
       },
       _count: { _all: true },
     }),
-    prisma.capacityWaiter.groupBy({
+    db.capacityWaiter.groupBy({
       by: ["capacityId"],
       where: {
         capacityId: { in: targets.map(({ capacityId }) => capacityId) },
@@ -921,7 +945,7 @@ export async function rankAffinityTargets({
           : undefined);
       const prefixTokens = matchedRecord?.estimatedTokens ?? undefined;
       const sessionDetail = await resolveAffinitySessionDetail(
-        prisma,
+        db,
         {
           userId: resourceOwnerId,
           tenantUserId: ownerId,
@@ -930,12 +954,15 @@ export async function rankAffinityTargets({
         },
         material,
         now,
+        { probeClientTip: true },
       );
-      // A whole-prompt estimate only measures the expected prefix on an exact
-      // stored-tip continuation; ancestors, client ids and bound parents do not.
+      // The hint must describe this exact live tip and its owner, including
+      // client-id requests. A truncation between the reads changes the digest;
+      // the earlier hint's whole-prompt size cannot describe the new tip.
       const prefixEvidence =
         sessionDetail.viaTip &&
         matchedPrefixRecord?.estimatedTokens != null &&
+        matchedPrefixRecord.prefixDigest === sessionDetail.tipDigest &&
         matchedPrefixRecord.sessionId === sessionDetail.sessionId
           ? {
               tokens: matchedPrefixRecord.estimatedTokens,

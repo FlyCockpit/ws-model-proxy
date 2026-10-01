@@ -64,6 +64,7 @@ import {
   rankAffinityTargets,
   rememberAffinity,
   resolveAffinitySession,
+  resolveAffinitySessionDetail,
   sweepExpiredAffinity,
 } from "./cache-affinity.js";
 
@@ -229,7 +230,20 @@ describe("cache affinity", () => {
     { name: "live tip", viaTip: true, confirmed: true, expected: true },
     { name: "unconfirmed live tip", viaTip: true, confirmed: false, expected: true },
     { name: "ancestor edit", viaTip: false, confirmed: true, expected: false },
-    { name: "client id only", viaTip: true, confirmed: true, expected: false, clientId: true },
+    {
+      name: "truncation changes tip digest",
+      viaTip: true,
+      confirmed: true,
+      expected: false,
+      otherDigest: true,
+    },
+    {
+      name: "wrong root has no probe row",
+      viaTip: false,
+      confirmed: true,
+      expected: false,
+      noTip: true,
+    },
     {
       name: "instruction only",
       viaTip: true,
@@ -239,62 +253,122 @@ describe("cache affinity", () => {
     },
     { name: "unknown size", viaTip: true, confirmed: true, expected: false, unknown: true },
     {
-      // The matched prefix hint was last stamped by another session, so its
-      // size is not the resolved session's footprint.
       name: "record stamped by another session",
       viaTip: true,
       confirmed: true,
       expected: false,
       otherSession: true,
     },
-  ])(
-    "prefix evidence: $name",
-    async ({ viaTip, confirmed, expected, clientId, instructions, unknown, otherSession }) => {
-      const now = new Date("2026-08-25T12:00:00Z");
-      const requestPayload = {
-        ...payload,
-        ...(clientId ? { conversation_id: "11111111-2222-4333-8444-555555555555" } : {}),
-        messages: [
-          ...payload.messages,
-          { role: "assistant", content: "answer" },
-          { role: "user", content: "next" },
-        ],
-      };
-      const material = affinityPrefixDigests(digestArgs("runtime-a", requestPayload));
-      const record = {
-        ...affinityRow({
-          target: target("target-a", "runtime-a"),
-          material,
-          prefixDigest: instructions ? material.instructionDigests[0] : material.digests[1],
-          prefixDepth: 2,
-          engineCacheConfirmed: confirmed,
-          lastUsedAt: new Date(now.getTime() - 42_000),
-        }),
-        estimatedTokens: unknown ? null : 12_000,
-      };
-      db.cacheAffinityRecord.findMany.mockResolvedValue([record]);
-      db.$queryRaw.mockResolvedValue([
-        { sessionId: otherSession ? "resolved-other-session" : record.sessionId, viaTip },
-      ]);
-      const result = await rankAffinityTargets({
-        ownerId: "owner",
-        resourceOwnerId: "owner",
+    ...(["body", "header"] as const).flatMap((carrier) => [
+      {
+        name: `client ${carrier} full prefix`,
+        carrier,
+        viaTip: true,
+        confirmed: true,
+        expected: true,
+      },
+      {
+        name: `client ${carrier} id only`,
+        carrier,
+        viaTip: false,
+        confirmed: true,
+        expected: false,
+        noTip: true,
+      },
+      {
+        name: `client ${carrier} other tip owner`,
+        carrier,
+        viaTip: true,
+        confirmed: true,
+        expected: false,
+        otherOwner: true,
+      },
+      { name: `client ${carrier} edit`, carrier, viaTip: false, confirmed: true, expected: false },
+      {
+        name: `client ${carrier} wrong root`,
+        carrier,
+        viaTip: false,
+        confirmed: true,
+        expected: false,
+        noTip: true,
+      },
+    ]),
+  ])("prefix evidence: $name", async (row) => {
+    const { viaTip, confirmed, expected } = row;
+    const carrier = "carrier" in row ? row.carrier : undefined;
+    const headers =
+      carrier === "header" ? new Headers({ "x-session-id": "evidence-client" }) : undefined;
+    const now = new Date("2026-08-25T12:00:00Z");
+    const requestPayload = {
+      ...payload,
+      ...(carrier === "body" ? { conversation_id: "evidence-client" } : {}),
+      messages: [
+        ...payload.messages,
+        { role: "assistant", content: "answer" },
+        { role: "user", content: "next" },
+      ],
+    };
+    const material = affinityPrefixDigests({ ...digestArgs("runtime-a", requestPayload), headers });
+    const record = {
+      ...affinityRow({
+        target: target("target-a", "runtime-a"),
+        material,
+        prefixDigest: "instructions" in row ? material.instructionDigests[0] : material.digests[1],
+        prefixDepth: 2,
+        sessionId: material.clientSessionId ?? "test-session",
+        engineCacheConfirmed: confirmed,
+        lastUsedAt: new Date(now.getTime() - 42_000),
+      }),
+      estimatedTokens: "unknown" in row ? null : 12_000,
+    };
+    const probe = {
+      sessionId:
+        "otherSession" in row || "otherOwner" in row ? "resolved-other-session" : record.sessionId,
+      viaTip,
+      tipDigest: "otherDigest" in row ? material.digests[0] : record.prefixDigest,
+    };
+    db.cacheAffinityRecord.findMany.mockResolvedValue([record]);
+    db.$queryRaw.mockResolvedValue("noTip" in row ? [] : [probe]);
+    const result = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: requestPayload,
+      headers,
+      targets: [target("target-a", "runtime-a")],
+      scoreSingleTarget: true,
+      now,
+    });
+    expect(result.prefixEvidence).toEqual(
+      expected
+        ? { "target-a": { tokens: 12_000, lastUsedAt: record.lastUsedAt.getTime(), confirmed } }
+        : {},
+    );
+    if (carrier) {
+      expect(result.matchedSessionIds?.["target-a"]).toBe(material.clientSessionId);
+      const scope = {
+        userId: "owner",
+        tenantUserId: "owner",
         poolId: "pool",
-        securityScope: "token",
-        policy,
-        surface: "openai-chat",
-        payload: requestPayload,
-        targets: [target("target-a", "runtime-a")],
-        scoreSingleTarget: true,
-        now,
+        executionTargetId: "target-a",
+      };
+      // Authoritative identity must not turn another session's tip into proof,
+      // even if the separate hint guard would also reject that owner.
+      expect(
+        await resolveAffinitySessionDetail(db, scope, material, now, { probeClientTip: true }),
+      ).toEqual({
+        sessionId: material.clientSessionId,
+        viaTip: viaTip && !("otherOwner" in row) && !("noTip" in row),
+        tipDigest: "noTip" in row ? null : probe.tipDigest,
       });
-      expect(result.prefixEvidence).toEqual(
-        expected
-          ? { "target-a": { tokens: 12_000, lastUsedAt: record.lastUsedAt.getTime(), confirmed } }
-          : {},
-      );
-    },
-  );
+      const reads = db.$queryRaw.mock.calls.length;
+      expect(await resolveAffinitySession(db, scope, material, now)).toBe(material.clientSessionId);
+      expect(db.$queryRaw).toHaveBeenCalledTimes(reads);
+    }
+  });
 
   const clientUuid = "11111111-2222-4333-8444-555555555555";
   const carriers: { body: Record<string, unknown>; header?: string; surface?: string }[] = [

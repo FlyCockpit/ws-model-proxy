@@ -423,6 +423,7 @@ describe("usage retention", () => {
       number,
     ];
     expect(strings.join("?")).toContain("DELETE FROM capacity_kv_eviction");
+    expect(strings.join("?")).toContain('"capacityId" = ANY(ARRAY(');
     expect(strings.join("?")).toContain("FOR UPDATE SKIP LOCKED");
     expect(cutoff).toEqual(new Date(NOW.getTime() - KV_EVICTION_RETENTION_MS));
     expect(batch).toBe(2);

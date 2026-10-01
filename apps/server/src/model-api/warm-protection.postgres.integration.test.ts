@@ -3,6 +3,7 @@ import {
   effectiveKvBudgetTokens,
   KV_EVICTION_RECOVERY_MS,
 } from "@ws-model-proxy/api/lib/kv-eviction-budget";
+import type { Prisma } from "@ws-model-proxy/db";
 import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
 import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -14,6 +15,18 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
  * wins), with the owner/grant overrides and the active-lease link, and cheap
  * at the default retention bound (10 000 records per pool).
  */
+// Wrap a real query's completion while retaining the delegate's typed promise
+// contract. These wrappers are awaited directly, never used as transaction arrays.
+function delegatePromise<T>(promise: Promise<T>): Prisma.PrismaPromise<T> {
+  return {
+    // biome-ignore lint/suspicious/noThenProperty: intentional typed promise adapter for a real query
+    then: promise.then.bind(promise),
+    catch: promise.catch.bind(promise),
+    finally: promise.finally.bind(promise),
+    [Symbol.toStringTag]: "PrismaPromise",
+  };
+}
+
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
   throw new Error(
@@ -1205,6 +1218,116 @@ integration("warm-session protection with real PostgreSQL", () => {
       expect((await row(boundary)).capacityId).toBe(boundary);
       expect((await row(newer)).capacityId).toBe(newer);
     });
+
+    it.each([false, true])(
+      "C1a retention materializes each batch once (alternate plan=%s), preserving expiry and SKIP LOCKED",
+      async (alternatePlan) => {
+        const capacityIds = Array.from({ length: 3000 }, () => id());
+        const live = id();
+        const boundary = id();
+        const locked = id();
+        const cutoff = new Date(now.getTime() - 3_600_000);
+        const expired = new Date(cutoff.getTime() - 1000);
+        const observedAt = new Date(expired.getTime() - 1000);
+        await db.capacityKvEviction.createMany({
+          data: [...capacityIds, locked]
+            .map((capacityId) => ({
+              capacityId,
+              userId: "kv-retention-owner",
+              cutFraction: 0.1,
+              observedAt,
+              expiresAt: expired,
+            }))
+            .concat([
+              {
+                capacityId: live,
+                userId: "kv-retention-owner",
+                cutFraction: 0.1,
+                observedAt,
+                expiresAt: new Date(now.getTime() + 1000),
+              },
+              {
+                capacityId: boundary,
+                userId: "kv-retention-owner",
+                cutFraction: 0.1,
+                observedAt,
+                expiresAt: cutoff,
+              },
+            ]),
+        });
+        const counts: number[] = [];
+        let releaseLock = () => {};
+        const release = new Promise<void>((resolve) => {
+          releaseLock = resolve;
+        });
+        let lockReady = () => {};
+        let lockFailed = (_error: unknown) => {};
+        const ready = new Promise<void>((resolve, reject) => {
+          lockReady = resolve;
+          lockFailed = reject;
+        });
+        const locker = writers[1]!
+          .$transaction(
+            async (tx) => {
+              await tx.$queryRaw`SELECT "capacityId" FROM capacity_kv_eviction WHERE "capacityId" = ${locked} FOR UPDATE`;
+              lockReady();
+              await release;
+            },
+            { timeout: 60_000 },
+          )
+          .catch((error: unknown) => {
+            lockFailed(error);
+            throw error;
+          });
+        try {
+          await ready;
+          await writers[0]!.$transaction(
+            async (tx) => {
+              if (alternatePlan) {
+                await tx.$executeRaw`SET LOCAL enable_hashjoin = off`;
+                await tx.$executeRaw`SET LOCAL enable_mergejoin = off`;
+                await tx.$executeRaw`SET LOCAL enable_hashagg = off`;
+                await tx.$executeRaw`SET LOCAL enable_sort = off`;
+                await tx.$executeRaw`SET LOCAL enable_material = off`;
+              }
+              const prisma = {
+                $queryRaw: tx.$queryRaw.bind(tx),
+                $transaction: writers[0]!.$transaction.bind(writers[0]),
+                $executeRaw: (query: TemplateStringsArray, ...values: unknown[]) =>
+                  delegatePromise(
+                    tx.$executeRaw(query, ...values).then((count) => {
+                      counts.push(count);
+                      return count;
+                    }),
+                  ),
+              };
+              expect(retention.USAGE_RETENTION_BATCH).toBe(1000);
+              expect(await retention.deleteExpiredKvEvictions({ prisma, now })).toBe(3000);
+              expect(counts).toEqual([1000, 1000, 1000, 0]);
+              // Inspect within the pinned session while the other session's row
+              // lock is still held. Live and boundary rows are not candidates.
+              expect(
+                await tx.capacityKvEviction.count({ where: { capacityId: { in: capacityIds } } }),
+              ).toBe(0);
+              expect(
+                await tx.capacityKvEviction.count({
+                  where: { capacityId: { in: [live, boundary, locked] } },
+                }),
+              ).toBe(3);
+            },
+            { timeout: 60_000 },
+          );
+        } finally {
+          releaseLock();
+          await locker;
+          // Do not let this test's locked expired row affect the next sweep.
+          await db.capacityKvEviction.deleteMany({
+            where: { capacityId: { in: [...capacityIds, live, boundary, locked] } },
+          });
+        }
+      },
+      60_000,
+    );
 
     it("older application clocks do not decay or move timestamps backward", async () => {
       const capacityId = id();
