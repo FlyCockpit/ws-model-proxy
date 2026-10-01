@@ -821,6 +821,12 @@ impl RecoveryDir {
             if let Some(held) = original {
                 held.release();
             }
+            // A definite collision stays a plain exists error. Any other reply
+            // can mean the link landed: name that public path and keep recovery.
+            if result != Err(Errno::EEXIST) {
+                self.record_public(&target.dir, &target.name, &target.path);
+                self.unsettled = true;
+            }
             self.abort_published(ops, tmp, identity, &published); // D1 site 4
             if captured.is_none() && self.settled() && result == Err(Errno::EEXIST) {
                 return Err(FileError::errno(Errno::EEXIST));

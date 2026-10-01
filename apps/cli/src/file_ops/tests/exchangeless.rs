@@ -1949,6 +1949,28 @@ fn watch_private_unlinks(fx: &Fx, slots: &[&str]) -> Arc<Mutex<Vec<(u64, u64)>>>
     checks
 }
 
+/// C5A-2: a failed observation of the displaced object must release T's peer
+/// descriptor before restore unlinks slot-2.
+#[cfg(target_os = "linux")]
+#[test]
+fn replace_undo_releases_peer_descriptor_before_restore_unlink() {
+    for op in REPLACE_OPS {
+        let fx = Fx::new();
+        let etag = prepare(&fx);
+        let _scope = FaultScope::new(&[
+            (Primitive::Identity, 1, Errno::EIO),
+            (Primitive::Identity, 2, Errno::ESTALE),
+            (Primitive::Restore, 1, Errno::EINVAL),
+        ]);
+        let checks = watch_private_unlinks(&fx, &["slot-2"]);
+        let error = op.run(&fx, &etag).unwrap_err();
+        assert_eq!(error.code, ErrorCode::UncertainOutcome);
+        assert_eq!(checks.lock().unwrap().len(), 1, "{op:?}");
+        assert_eq!(fx.get("doc"), EDITED);
+        assert!(has_bytes(&kept(&error), ORIGINAL));
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn exchangeless_plain_link_rename_closes_both_proofs_before_unlink() {

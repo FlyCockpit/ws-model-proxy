@@ -752,6 +752,31 @@ fn rename_reply_loss_nr_commits_link_keeps_and_restore_never_overwrites() {
     }
 }
 
+/// O5B-1: a plain link rename whose publish reply is lost must keep the recovery
+/// directory and name the destination that now holds the source.
+#[test]
+fn rename_plain_link_reply_loss_reports_the_published_name() {
+    for object in OBJECTS {
+        for errno in [Errno::EIO, Errno::ENOENT, Errno::EINVAL] {
+            let fx = Fx::new();
+            let etag = setup(&fx, object, false);
+            let _scope = FaultScope::with_after_effects(
+                &Shape::Link.faults(false),
+                &[(Shape::Link.publish(), 1, errno)],
+            );
+            let error = rename_run(&fx, false, etag.as_deref(), false).unwrap_err();
+            let paths = kept(&error);
+            assert!(
+                paths.iter().any(|path| path == &fx.root.join("dst")),
+                "{errno:?} {object:?} kept {paths:?}"
+            );
+            assert_eq!(object.bytes(&fx.root.join("src")).as_deref(), Some(SOURCE));
+            assert_eq!(object.bytes(&fx.root.join("dst")).as_deref(), Some(SOURCE));
+            assert!(object.kept(&paths, SOURCE), "{errno:?} {object:?}");
+        }
+    }
+}
+
 #[test]
 fn rename_cleanup_failures_report_alias_and_destination_after_known_commit() {
     for shape in [Shape::Nr, Shape::Link] {

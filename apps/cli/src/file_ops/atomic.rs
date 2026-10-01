@@ -344,6 +344,10 @@ fn commit_stage(
                     && !recovery.holds(y, identity)
                 {
                     // Newest foreign write wins; X remains named in recovery.
+                    // T's proof is not used to dispose y. An unsupported restore
+                    // links T publicly and unlinks slot-2, so this descriptor
+                    // must already be closed (F3).
+                    identity.release();
                     if recovery.restore(ops, y) {
                         let _ = ops.step(Step::Restored);
                     }
