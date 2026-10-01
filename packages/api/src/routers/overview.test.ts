@@ -30,6 +30,7 @@ const db = prisma as unknown as {
   poolMember: { findMany: MockInstance };
   modelApiToken: { count: MockInstance };
   poolGrant: { findMany: MockInstance };
+  engineLoadRollupMinute: { findMany: MockInstance };
   $queryRaw: MockInstance;
 };
 
@@ -310,6 +311,44 @@ describe("overviewRouter.metrics", () => {
     ]);
     expect(result.totals.current.requests).toBe(55);
     expect(result.totals.previous.requests).toBe(20);
+    expect(card.engineLoad.series).toHaveLength(96);
+    expect(card.engineLoad.series.every((point) => point.gap)).toBe(true);
+  });
+
+  it("shapes 24h engine-load series from persisted minutes and keeps occupancy display-only", async () => {
+    const members = pool().PoolMembers.map((member) => ({
+      ...member,
+      ExecutionTarget: { ...member.ExecutionTarget, inferenceCapacityId: "cap-1" },
+    }));
+    db.modelPool.findMany.mockResolvedValue([{ ...pool(), PoolMembers: members }]);
+    db.executionTarget.findMany.mockResolvedValue([]);
+    const windowStart = new Date(
+      Math.floor(Date.now() / (15 * 60_000)) * (15 * 60_000) + 15 * 60_000 - 24 * 60 * 60_000,
+    );
+    db.engineLoadRollupMinute.findMany.mockResolvedValue([
+      {
+        bucketStart: windowStart,
+        capacityId: "cap-1",
+        maxRunning: 4,
+        maxWaiting: 2,
+        maxKvUsage: 0.5,
+        maxKvOccupancy: 0.9,
+      },
+    ]);
+    const result = await client().metrics({ range: "24h" });
+    const series = result.pools[0]!.engineLoad.series;
+    expect(series.some((point) => !point.gap)).toBe(true);
+    const first = series.find((point) => !point.gap)!;
+    expect(first.running).toBe(4);
+    expect(first.kvOccupancy).toBe(0.9);
+    expect(db.engineLoadRollupMinute.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          ownerUserId: "owner-id",
+          capacityId: { in: ["cap-1"] },
+        }),
+      }),
+    );
   });
 
   it("scopes owned traffic by resource owner and shared-pool usage by requester only", async () => {

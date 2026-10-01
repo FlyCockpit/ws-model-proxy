@@ -105,6 +105,8 @@ export const HISTORY_DRAIN_EDGES = {
   // Expiring KV feedback cache, never drained, just like routing verdicts:
   // owner-scoped readers ignore expiry; retention sweeps orphan rows after 1 h.
   capacity_kv_eviction: { delete: [], internal: [] },
+  // Persisted engine-load minutes (24h/7d Overview). Occupancy is display-only.
+  engine_load_rollup_minute: { delete: [["ownerUserId", "user"]], internal: [] },
 } as const satisfies Record<string, { delete: readonly DrainEdge[]; internal: readonly string[] }>;
 
 /**

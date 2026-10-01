@@ -1607,6 +1607,12 @@
       "other": "Otros miembros",
       "unrouted": "Sin enrutar",
       "removedMember": "Miembro eliminado",
+      "engineLoadCaption": "Carga del motor de {{name}} en el intervalo seleccionado: solicitudes en ejecución y en espera, uso de KV, ocupación y el umbral FULL.",
+      "legendRunning": "En ejecución",
+      "legendWaiting": "En espera",
+      "legendKv": "Uso de KV",
+      "legendOccupancy": "Ocupación de KV",
+      "legendThreshold": "Umbral FULL",
       "columns": {
         "member": "Miembro",
         "share": "Porcentaje",

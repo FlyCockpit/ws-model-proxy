@@ -37,6 +37,8 @@ const requiredFragments = [
   "cache_affinity_record_shape_check",
   '("sharedPrefixTokens" IS NULL OR "sharedPrefixTokens" >= 0)',
   "capacity_kv_eviction_shape_check",
+  "engine_load_rollup_minute_shape_check",
+  '"maxKvOccupancy" IS NULL OR ("maxKvOccupancy" >= 0 AND "maxKvOccupancy" <= 1)',
   '"cutFraction" >= 0 AND "cutFraction" <= 1',
   'length("capacityId") BETWEEN 1 AND 128',
   '"expiresAt" >= "observedAt"',

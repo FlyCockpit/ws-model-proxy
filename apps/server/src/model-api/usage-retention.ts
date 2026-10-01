@@ -34,6 +34,9 @@
  *
  *  7. Delete capacity_kv_eviction rows expired over an hour ago (class H,
  *     never drained; owner-scoped readers ignore expired rows).
+ *  8. Delete engine_load_rollup_minute rows older than
+ *     ENGINE_LOAD_ROLLUP_MINUTE_RETENTION_DAYS (24h/7d Overview). Occupancy
+ *     is display-only in those rows.
  *
  * Multi-replica safety: every batch selects its rows with
  * `FOR UPDATE SKIP LOCKED`, so concurrent sweepers work on disjoint rows; the
@@ -50,6 +53,7 @@
 
 import { CLI_AGENT_ACTION_RETENTION_DAYS } from "@ws-model-proxy/config/cli-agent-audit";
 import {
+  ENGINE_LOAD_ROLLUP_MINUTE_RETENTION_DAYS,
   USAGE_ROLLUP_HOUR_RETENTION_DAYS,
   USAGE_ROLLUP_MINUTE_RETENTION_DAYS,
 } from "@ws-model-proxy/config/usage-metrics";
@@ -95,6 +99,7 @@ export type UsageRetentionResult = {
   agentActionsDeleted: number;
   routingVerdictsDeleted: number;
   kvEvictionsDeleted: number;
+  engineLoadMinutesDeleted: number;
   admissionHistoryPruned: number;
   deletedUserRowsPurged: number;
   orphanCapacityRuntimeDeleted: number;
@@ -449,6 +454,31 @@ export async function deleteExpiredKvEvictions({
   }
 }
 
+export async function deleteExpiredEngineLoadMinutes({
+  prisma = defaultPrisma as RetentionPrisma,
+  now,
+  batch = USAGE_RETENTION_BATCH,
+}: {
+  prisma?: RetentionPrisma;
+  now: Date;
+  batch?: number;
+}): Promise<number> {
+  const cutoff = new Date(now.getTime() - ENGINE_LOAD_ROLLUP_MINUTE_RETENTION_DAYS * DAY_MS);
+  let deleted = 0;
+  for (;;) {
+    if (isDbShutdownFenceArmed()) return deleted;
+    const count = await prisma.$executeRaw`
+      DELETE FROM engine_load_rollup_minute
+       WHERE ctid IN (
+         SELECT ctid FROM engine_load_rollup_minute
+          WHERE "bucketStart" < ${cutoff}
+          LIMIT ${batch}
+          FOR UPDATE SKIP LOCKED)`;
+    deleted += count;
+    if (count < batch) return deleted;
+  }
+}
+
 export async function runUsageRetention({
   prisma = defaultPrisma as RetentionPrisma,
   retentionDays,
@@ -481,6 +511,7 @@ export async function runUsageRetention({
     (await deleteOrphanCliAgentActions({ prisma, batch }));
   const routingVerdictsDeleted = await deleteExpiredRoutingVerdicts({ prisma, now, batch });
   const kvEvictionsDeleted = await deleteExpiredKvEvictions({ prisma, now, batch });
+  const engineLoadMinutesDeleted = await deleteExpiredEngineLoadMinutes({ prisma, now, batch });
   const admissionHistoryPruned = await pruneTerminalCapacityHistory(prisma, {
     before: new Date(now.getTime() - retentionDays * DAY_MS),
     batch: sweepBatch,
@@ -501,6 +532,7 @@ export async function runUsageRetention({
     agentActionsDeleted,
     routingVerdictsDeleted,
     kvEvictionsDeleted,
+    engineLoadMinutesDeleted,
     admissionHistoryPruned,
     deletedUserRowsPurged: purged.rows,
     orphanCapacityRuntimeDeleted,
@@ -537,10 +569,11 @@ export function startUsageRetention({
         result.orphanCapacityRuntimeDeleted +
         result.expiredStickinessDeleted +
         result.routingVerdictsDeleted +
-        result.kvEvictionsDeleted;
+        result.kvEvictionsDeleted +
+        result.engineLoadMinutesDeleted;
       if (total > 0)
         console.log(
-          `[metrics] retention: reaped ${result.abandonedReaped}, deleted ${result.relayRequestsDeleted} relay request(s), compacted ${result.minuteRowsCompacted} minute rollup(s), deleted ${result.hourRowsDeleted} hourly rollup(s), deleted ${result.agentActionsDeleted} agent audit event(s), pruned ${result.admissionHistoryPruned} admission request(s), purged ${result.deletedUserRowsPurged} deleted-user row(s), deleted ${result.orphanCapacityRuntimeDeleted} orphan capacity runtime row(s), deleted ${result.expiredStickinessDeleted} expired stickiness binding(s), deleted ${result.routingVerdictsDeleted} expired routing verdict(s), deleted ${result.kvEvictionsDeleted} expired KV feedback row(s).`,
+          `[metrics] retention: reaped ${result.abandonedReaped}, deleted ${result.relayRequestsDeleted} relay request(s), compacted ${result.minuteRowsCompacted} minute rollup(s), deleted ${result.hourRowsDeleted} hourly rollup(s), deleted ${result.agentActionsDeleted} agent audit event(s), pruned ${result.admissionHistoryPruned} admission request(s), purged ${result.deletedUserRowsPurged} deleted-user row(s), deleted ${result.orphanCapacityRuntimeDeleted} orphan capacity runtime row(s), deleted ${result.expiredStickinessDeleted} expired stickiness binding(s), deleted ${result.routingVerdictsDeleted} expired routing verdict(s), deleted ${result.kvEvictionsDeleted} expired KV feedback row(s), deleted ${result.engineLoadMinutesDeleted} engine-load minute row(s).`,
         );
     } catch (error) {
       // Prisma errors can carry SQL and parameters; log the class only.

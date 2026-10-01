@@ -33,6 +33,7 @@ import type { SupervisedCommandStatus } from "@ws-model-proxy/api/lib/supervised
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { startRelayAttempt } from "../model-api/relay-executor.js";
 import { EngineLoadHistoryStore } from "./engine-load-history.js";
+import { observeEngineLoadRollup } from "./engine-load-rollup.js";
 import {
   type FileOp,
   type FileOpFrame,
@@ -1674,6 +1675,21 @@ export class RelaySessionManager {
         prefixCacheQueriesDelta: queriesDelta,
         source: load.source,
         receivedAt: now,
+      });
+      observeEngineLoadRollup({
+        ownerUserId: session.identity.userId,
+        cliDeviceId,
+        endpointSlug: load.endpointSlug,
+        modelSlug: load.modelSlug ?? null,
+        receivedAt: now,
+        running: load.running,
+        waiting: load.waiting,
+        kvUsage: load.kvUsage,
+        kvOccupancy: load.kvOccupancy,
+        slotsBusy: load.slotsBusy,
+        prefixCacheHitsDelta: hitsDelta,
+        prefixCacheQueriesDelta: queriesDelta,
+        source: load.source,
       });
       this.scheduleRoutingEvaluation(session);
       return;

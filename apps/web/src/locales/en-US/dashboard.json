@@ -1607,6 +1607,12 @@
       "other": "Other members",
       "unrouted": "Not routed",
       "removedMember": "Removed member",
+      "engineLoadCaption": "Engine load for {{name}} over the selected window: running and waiting requests, KV usage, occupancy, and the FULL threshold.",
+      "legendRunning": "Running",
+      "legendWaiting": "Waiting",
+      "legendKv": "KV usage",
+      "legendOccupancy": "KV occupancy",
+      "legendThreshold": "FULL threshold",
       "columns": {
         "member": "Member",
         "share": "Share",

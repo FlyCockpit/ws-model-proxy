@@ -243,6 +243,27 @@ describe("OverviewPage", () => {
               stats: stats({ requests: 10, usageKnownRequests: 10, cacheHitRate: null }),
             },
           ],
+          engineLoad: {
+            effectiveKvFullThreshold: 0.95,
+            series: [
+              {
+                start: "2026-09-24T10:00:00.000Z",
+                running: 2,
+                waiting: 1,
+                kvUsage: 0.4,
+                kvOccupancy: 0.7,
+                gap: false,
+              },
+              {
+                start: "2026-09-24T10:15:00.000Z",
+                running: 3,
+                waiting: 0,
+                kvUsage: 0.5,
+                kvOccupancy: 0.8,
+                gap: false,
+              },
+            ],
+          },
         },
       ],
     });
@@ -254,6 +275,10 @@ describe("OverviewPage", () => {
     expect(within(memberB).getByText("overview.notReported")).toBeTruthy();
     expect(within(memberB).getByText("overview.pools.health.DEGRADED")).toBeTruthy();
     expect(within(card).getByText('overview.pools.chartLabel:{"name":"Coding"}')).toBeTruthy();
+    expect(within(card).getByTestId("overview-engine-load")).toBeTruthy();
+    expect(within(card).getByTestId("engine-load-sparkline").getAttribute("data-threshold")).toBe(
+      "0.95",
+    );
     expect(within(card).getByRole("link").getAttribute("href")).toBe(
       "/en-US/dashboard/pools/pool-1",
     );

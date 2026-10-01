@@ -25,7 +25,7 @@ LOCK TABLE "user", cli_device, endpoint, discovered_model, execution_target, mod
   provider_budget_policy, provider_budget_rule, provider_attempt, provider_budget_reservation,
   provider_usage_ledger, provider_pricing_version, provider_budget_settlement,
   provider_audit_event, public_provider_attempt_event, relay_execution_attempt,
-  relay_execution_event, usage_rollup_minute, usage_rollup_hour,
+  relay_execution_event, usage_rollup_minute, usage_rollup_hour, engine_load_rollup_minute,
   cache_affinity_record, cache_affinity_node, capacity_kv_eviction, session IN ACCESS EXCLUSIVE MODE NOWAIT;
 
 -- Deploy writer (class D): the backfills below rewrite graph rows while every
@@ -236,6 +236,22 @@ DROP TRIGGER IF EXISTS cache_affinity_owner ON cache_affinity_record;
 CREATE TRIGGER cache_affinity_owner
 BEFORE INSERT ON cache_affinity_record
 FOR EACH ROW EXECUTE FUNCTION enforce_cache_affinity_owner();
+
+-- Class-H engine-load minutes; occupancy is display-only (0..1).
+ALTER TABLE engine_load_rollup_minute DROP CONSTRAINT IF EXISTS engine_load_rollup_minute_shape_check;
+ALTER TABLE engine_load_rollup_minute ADD CONSTRAINT engine_load_rollup_minute_shape_check CHECK (
+  length("ownerUserId") BETWEEN 1 AND 128
+  AND length("capacityId") BETWEEN 1 AND 128
+  AND length("endpointSlug") BETWEEN 1 AND 128
+  AND length("modelSlug") BETWEEN 0 AND 128
+  AND length("cliDeviceId") BETWEEN 1 AND 128
+  AND samples >= 0 AND "maxRunning" >= 0
+  AND ("maxWaiting" IS NULL OR "maxWaiting" >= 0)
+  AND ("maxKvUsage" IS NULL OR ("maxKvUsage" >= 0 AND "maxKvUsage" <= 1))
+  AND ("maxKvOccupancy" IS NULL OR ("maxKvOccupancy" >= 0 AND "maxKvOccupancy" <= 1))
+  AND ("maxSlotsBusy" IS NULL OR "maxSlotsBusy" >= 0)
+  AND "prefixCacheHits" >= 0 AND "prefixCacheQueries" >= 0
+);
 
 -- Disposable class H feedback; no graph locks or foreign keys.
 ALTER TABLE capacity_kv_eviction DROP CONSTRAINT IF EXISTS capacity_kv_eviction_shape_check;

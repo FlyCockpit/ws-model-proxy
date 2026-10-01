@@ -1870,6 +1870,34 @@ model UsageRollupHour {
   @@map("usage_rollup_hour")
 }
 
+/// Class-H per-minute engine-load history (no FKs). Written from accepted
+/// `endpoint.load` frames. Occupancy is stored for display and never used as
+/// FULL or eviction evidence. Kept 8 days for 24h/7d Overview views.
+model EngineLoadRollupMinute {
+  bucketStart        DateTime
+  ownerUserId        String
+  capacityId         String
+  endpointSlug       String
+  /// '' when the load frame had no model slug.
+  modelSlug          String   @default("")
+  cliDeviceId        String
+  updatedAt          DateTime @default(now())
+  samples            Int      @default(0)
+  maxRunning         Int      @default(0)
+  maxWaiting         Int?
+  maxKvUsage         Float?
+  maxKvOccupancy     Float?
+  maxSlotsBusy       Int?
+  prefixCacheHits    Int      @default(0)
+  prefixCacheQueries Int      @default(0)
+  lastSource         String?
+
+  @@id([bucketStart, ownerUserId, capacityId, endpointSlug, modelSlug])
+  @@index([ownerUserId, bucketStart])
+  @@index([capacityId, bucketStart])
+  @@map("engine_load_rollup_minute")
+}
+
 /// Append-only, prompt-free facts for each local CLI relay attempt. A separate
 /// row per lifecycle transition preserves retries and crash-repair history.
 model RelayExecutionEvent {

@@ -25,6 +25,7 @@ import { warnMissingProviderCredentialKeyring } from "./provider-keyring-startup
 import { flushCliAgentAudit, stopCliAgentAuditWriter } from "./relay/cli-agent-audit.js";
 import { sweepExpiredTokenCommands } from "./relay/cli-commands.js";
 import { sweepExpiredFileOps } from "./relay/cli-file-ops.js";
+import { stopEngineLoadRollup } from "./relay/engine-load-rollup.js";
 import { RELAY_SUBPROTOCOL, RELAY_WS_MAX_PAYLOAD_BYTES } from "./relay/protocol.js";
 import { relaySessionManager } from "./relay/session-manager.js";
 import { terminalBrowserHub } from "./relay/terminal-websocket.js";
@@ -216,6 +217,7 @@ installServerShutdown({
     stopSessionCleanup,
     stopUsageRetention,
     stopKvEvictionFeedback,
+    stopEngineLoadRollup,
     stopRelayMaintenance,
   ],
   stopUserDeletionSweep,
