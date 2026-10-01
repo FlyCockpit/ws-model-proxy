@@ -144,7 +144,7 @@ try {
     ),
   );
   waitForExit = async (child, label) => {
-    if (child.exitCode !== null) return;
+    if (child.exitCode !== null || child.signalCode !== null) return;
     const signal = (name) => {
       try {
         if (child.pid && process.platform !== "win32") process.kill(-child.pid, name);
@@ -154,9 +154,10 @@ try {
       }
     };
     const exited = new Promise((resolveExit) => {
-      if (child.exitCode !== null) resolveExit();
+      if (child.exitCode !== null || child.signalCode !== null) resolveExit();
       else child.once("exit", resolveExit);
     });
+    signal("SIGCONT");
     signal("SIGTERM");
     const graceful = await Promise.race([
       exited.then(() => true),

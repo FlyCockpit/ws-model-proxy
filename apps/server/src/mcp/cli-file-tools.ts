@@ -159,7 +159,7 @@ export const FILE_ERROR_MESSAGES: Readonly<Record<ToolErrorCode, string>> = {
     "This filesystem lacks the atomic primitives to change this path without risking a concurrent save; nothing was changed",
   limit: "Too many file operations; retry after retryAfterMs",
   token_inactive:
-    "This MCP token was revoked, has expired, or no longer grants this file capability",
+    "This MCP token was revoked, has expired, or no longer grants this file capability, or its account was banned or is being deleted",
   upgrade_required: "This CLI speaks an older relay protocol; upgrade wsmp",
   invalid_input: "Invalid input for this file operation",
   path_denied: "That path is not allowed",

@@ -958,19 +958,55 @@ fn build_rename(ops: &FileOps, raw: Value, key: &EtagKey, cancel: &Cancel) -> Fi
             ("source".to_string(), args.from.clone()),
             ("destination".to_string(), args.to.clone()),
         ],
-        description: vec![
-            format!("overwrite: {overwrite}"),
-            format!(
-                "source: {} bytes; destination: {} bytes",
-                src.stat.size,
-                to.object.as_ref().map_or(0, |dst| dst.stat.size)
-            ),
-            format!("mode: {:04o} (preserved)", src.stat.mode & 0o7777),
-        ],
+        description: rename_description(
+            overwrite,
+            &src.stat,
+            to.object.as_ref().map(|dst| &dst.stat),
+            (&from.ancestor.stat, from.physical.file_name()),
+            (&to.ancestor.stat, to.physical.file_name()),
+        ),
         diff: Vec::new(),
         fingerprints: vec![from_fp, to_fp],
         apply: PreparedOp::Rename(args, from, Box::new(to)),
     })
+}
+
+/// The confirm-screen lines of a rename. On a case-insensitive volume a
+/// case-only respelling of one file names the file itself as the destination;
+/// apply renames it in place (`mutate::same_object_rename`), so the screen must
+/// not call it an overwrite: nothing else is replaced.
+fn rename_description(
+    overwrite: bool,
+    src: &Stat,
+    dst: Option<&Stat>,
+    (from_dir, from_name): (&Stat, Option<&std::ffi::OsStr>),
+    (to_dir, to_name): (&Stat, Option<&std::ffi::OsStr>),
+) -> Vec<String> {
+    let case_only = overwrite
+        && matches!(
+            (dst, from_name, to_name),
+            (Some(dst), Some(from_name), Some(to_name))
+                if super::mutate::same_object_rename(src, dst, from_dir, from_name, to_dir, to_name)
+                    == super::mutate::SameObjectRename::CaseOnlyRename
+        );
+    let mut lines = if case_only {
+        vec![
+            "overwrite: false (case-only rename: the destination is this same file, nothing is replaced)"
+                .to_string(),
+            format!("size: {} bytes", src.size),
+        ]
+    } else {
+        vec![
+            format!("overwrite: {overwrite}"),
+            format!(
+                "source: {} bytes; destination: {} bytes",
+                src.size,
+                dst.map_or(0, |dst| dst.size)
+            ),
+        ]
+    };
+    lines.push(format!("mode: {:04o} (preserved)", src.mode & 0o7777));
+    lines
 }
 
 fn build_mkdir(ops: &FileOps, raw: Value, key: &EtagKey, cancel: &Cancel) -> FileResult<Built> {
@@ -1334,6 +1370,153 @@ mod argument_size_tests {
         assert!(
             full_string < 131_072,
             "exec string occupies {full_string} bytes"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rename_description_tests {
+    use std::ffi::OsStr;
+
+    use super::*;
+
+    fn file(ino: u64, size: u64) -> Stat {
+        Stat {
+            mode: 0o100_640,
+            uid: 1000,
+            gid: 1000,
+            nlink: 1,
+            size,
+            dev: 1,
+            ino,
+            mtime_secs: 0,
+            mtime_nanos: 0,
+        }
+    }
+
+    /// label, overwrite, destination, from name, to name, expected first line
+    type Case<'a> = (&'a str, bool, Option<&'a Stat>, &'a str, &'a str, &'a str);
+
+    fn dir() -> Stat {
+        Stat {
+            mode: 0o040_700,
+            ino: 20,
+            ..file(0, 0)
+        }
+    }
+
+    fn describe(
+        overwrite: bool,
+        src: &Stat,
+        dst: Option<&Stat>,
+        from_name: &str,
+        to_name: &str,
+    ) -> Vec<String> {
+        let dir = dir();
+        rename_description(
+            overwrite,
+            src,
+            dst,
+            (&dir, Some(OsStr::new(from_name))),
+            (&dir, Some(OsStr::new(to_name))),
+        )
+    }
+
+    /// C7b-1: on a case-insensitive volume the destination of a case-only
+    /// respelling is the source itself, and apply renames it in place. The confirm
+    /// screen must not call that an overwrite; every genuine overwrite still says so.
+    #[test]
+    fn case_only_respelling_is_not_labelled_an_overwrite() {
+        let src = file(10, 4);
+        let other = file(11, 9);
+        let mut aliased_links = file(10, 4);
+        aliased_links.nlink = 2;
+        let mut other_volume = file(10, 4);
+        other_volume.dev = 2;
+        let cases: [Case<'_>; 8] = [
+            (
+                "case-only same file",
+                true,
+                Some(&src),
+                "a.txt",
+                "A.TXT",
+                "overwrite: false (case-only",
+            ),
+            (
+                "case-only but a hard-linked file is refused at apply, not relabelled",
+                true,
+                Some(&aliased_links),
+                "a.txt",
+                "A.TXT",
+                "overwrite: true",
+            ),
+            (
+                "same inode on another device is another file",
+                true,
+                Some(&other_volume),
+                "a.txt",
+                "A.TXT",
+                "overwrite: true",
+            ),
+            (
+                "same name spelling is not a respelling",
+                true,
+                Some(&src),
+                "a.txt",
+                "a.txt",
+                "overwrite: true",
+            ),
+            (
+                "different names, same inode (alias)",
+                true,
+                Some(&src),
+                "a.txt",
+                "b.txt",
+                "overwrite: true",
+            ),
+            (
+                "overwriting a different file",
+                true,
+                Some(&other),
+                "a.txt",
+                "A.TXT",
+                "overwrite: true",
+            ),
+            (
+                "no destination",
+                true,
+                None,
+                "a.txt",
+                "A.TXT",
+                "overwrite: true",
+            ),
+            (
+                "overwrite off",
+                false,
+                Some(&src),
+                "a.txt",
+                "A.TXT",
+                "overwrite: false",
+            ),
+        ];
+        for (label, overwrite, dst, from, to, expected) in cases {
+            let lines = describe(overwrite, &src, dst, from, to);
+            assert!(lines[0].starts_with(expected), "{label}: {lines:?}");
+            let case_only = expected.contains("case-only");
+            assert_eq!(
+                lines[1].starts_with("size: "),
+                case_only,
+                "{label}: {lines:?}"
+            );
+            assert_eq!(
+                lines.last().map(String::as_str),
+                Some("mode: 0640 (preserved)"),
+                "{label}"
+            );
+        }
+        assert_eq!(
+            describe(true, &src, Some(&other), "a.txt", "b.txt")[1],
+            "source: 4 bytes; destination: 9 bytes"
         );
     }
 }

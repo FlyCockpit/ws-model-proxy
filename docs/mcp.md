@@ -406,7 +406,7 @@ and file/symlink delete rules.
 file as the source (`invalid_input`), except a case-only respelling of one directory
 entry (for example `Foo.txt` to `foo.txt` on a case-insensitive macOS volume: same
 directory, one hard link, names equal after case folding), which is done by a plain
-atomic rename that replaces nothing. A real hard-link alias (link count above 1) is
+atomic rename that replaces nothing; the supervised confirm screen labels it `overwrite: false (case-only rename ...)` for the same reason. A real hard-link alias (link count above 1) is
 still refused. The one residual window: a same-user process that creates a second entry
 under the other spelling between the check and the rename can lose that entry.
 

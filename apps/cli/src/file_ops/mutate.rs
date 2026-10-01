@@ -375,7 +375,7 @@ fn rename_impl(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SameObjectRename {
+pub(super) enum SameObjectRename {
     Refuse,
     CaseOnlyRename,
     NotSameObject,
@@ -399,7 +399,7 @@ enum SameObjectRename {
 /// the alias is one entry plus a same-user racer creating a second entry under
 /// the other spelling inside the microsecond check-to-rename window. The checks
 /// are snapshots, not POSIX exclusion against external processes.
-fn same_object_rename(
+pub(super) fn same_object_rename(
     src: &Stat,
     dst: &Stat,
     from_dir: &Stat,

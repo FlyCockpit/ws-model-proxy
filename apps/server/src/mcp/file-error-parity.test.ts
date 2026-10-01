@@ -1,6 +1,5 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import type { FileOpErrorCode } from "../relay/cli-file-ops.js";
 import { FILE_ERROR_CODES, FILE_WIRE_REASONS } from "../relay/file-protocol.js";
 
 /**
@@ -28,6 +27,11 @@ const RUST_ERROR = readFileSync(
 const RUST_RELAY = readFileSync(new URL("../../../cli/src/file_relay.rs", import.meta.url), "utf8");
 const RUST_PROTOCOL = readFileSync(
   new URL("../../../cli/src/protocol.rs", import.meta.url),
+  "utf8",
+);
+const SERVER_OPS = readFileSync(new URL("../relay/cli-file-ops.ts", import.meta.url), "utf8");
+const SERVER_ADMISSION = readFileSync(
+  new URL("../relay/cli-agent-admission.ts", import.meta.url),
   "utf8",
 );
 const MCP_DOC = readFileSync(new URL("../../../../docs/mcp.md", import.meta.url), "utf8");
@@ -147,6 +151,13 @@ describe("file error-code parity between the Rust CLI and the TypeScript server"
     for (const reason of FILE_WIRE_REASONS) expect(codes.has(reason), reason).toBe(false);
   });
 
+  it("the token_inactive message names a ban, because a ban is one of its causes", () => {
+    const error = new McpCliFileError({ ok: false, code: "token_inactive" });
+    expect(error.message).toMatch(/banned/);
+    expect(error.message).toMatch(/revoked/);
+    expect(error.message).toMatch(/expired/);
+  });
+
   it("the MCP mapping has a distinct, non-empty message for every file error code", () => {
     const messages = new Map<string, string>();
     for (const code of FILE_ERROR_CODES) {
@@ -172,19 +183,25 @@ describe("file error-code parity between the Rust CLI and the TypeScript server"
     const documented = new Set(
       [...MCP_DOC.slice(start, end).matchAll(/`([a-z_]+)`/g)].map((match) => match[1] as string),
     );
-    // Codes only the server produces (admission refusals); the type keeps this list honest.
-    const serverOnly = [
-      "offline",
-      "token_inactive",
-      "upgrade_required",
-    ] as const satisfies readonly FileOpErrorCode[];
+    // Derived from the server's own types, never listed by hand: every string literal of
+    // `FileOpErrorCode` (cli-file-ops.ts) and of the `CliAgentAdmissionRejection` union it
+    // includes (cli-agent-admission.ts). `FileErrorCode` is `FILE_ERROR_CODES`.
+    const literals = (source: string, anchor: string): string[] =>
+      [...blockAfter(source, anchor, "=", ";\n").matchAll(/"([a-z_]+)"/g)].map(
+        (match) => match[1] as string,
+      );
+    const admission = literals(SERVER_ADMISSION, "export type CliAgentAdmissionRejection");
+    const opCodes = literals(SERVER_OPS, "export type FileOpErrorCode");
+    expect(admission.length, "admission union parsed").toBeGreaterThanOrEqual(8);
+    expect(opCodes.length, "FileOpErrorCode union parsed").toBeGreaterThanOrEqual(3);
+    expect(admission).toContain("token_inactive");
+    expect(opCodes).toContain("declined");
     // `bad_frame` settles as `io_error` and never reaches the agent as its own code.
     const returnable = new Set<string>([
       ...FILE_ERROR_CODES,
       ...FILE_WIRE_REASONS.filter((reason) => reason !== "bad_frame"),
-      ...serverOnly,
-      // The person declined a supervised file request (polled result only).
-      "declined",
+      ...admission,
+      ...opCodes,
     ]);
     expect(sorted([...documented])).toEqual(sorted([...returnable]));
   });
