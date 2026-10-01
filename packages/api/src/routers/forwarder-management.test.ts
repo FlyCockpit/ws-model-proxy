@@ -6106,9 +6106,18 @@ describe("metric routing procedures (S-B part 2)", () => {
       active: false,
       fail: true,
     },
+    {
+      name: "protection off hides a live cut",
+      cut: 0.5,
+      engineKind: "VLLM",
+      reported: 100_000,
+      effective: 100_000,
+      active: false,
+      protectionEnabled: false,
+    },
   ])(
     "KV budget visibility: $name",
-    async ({ cut, engineKind, reported, effective, active, fail }) => {
+    async ({ cut, engineKind, reported, effective, active, fail, protectionEnabled = true }) => {
       vi.useFakeTimers();
       const now = new Date("2026-09-30T12:00:00Z");
       vi.setSystemTime(now);
@@ -6117,6 +6126,7 @@ describe("metric routing procedures (S-B part 2)", () => {
           id: "pool-1",
           slug: "coder",
           routingRules: [],
+          protectionEnabled,
           PoolMembers: [
             {
               id: "m1",

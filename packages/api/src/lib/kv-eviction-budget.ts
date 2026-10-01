@@ -4,7 +4,11 @@
  * make a member PROTECTED sooner and redirect NEW sessions, which reduces
  * evictions until evidence stops and the cut recovers linearly. The 50% cap
  * bounds over-reaction (a burst can reach it); slow (30 minute) recovery and
- * small (5%) steps damp flapping. No gain depends on the previous effective K,
+ * small (5%) steps damp flapping. The first miss on a capacity that is not
+ * already cut only arms a pending row; a second miss lowers K. That stops a
+ * single chat-template rewrite (Qwen3, DeepSeek-R1, gpt-oss) from cutting a
+ * long confirmed session. Two independent misses still cut, including two
+ * follow-ups on those templates. No gain depends on the previous effective K,
  * so the loop cannot run away. Hits leave state untouched and let it decay.
  *
  * Endpoint prefix-cache counters are cumulative, include bypass traffic, and
@@ -50,11 +54,20 @@ export function applyKvEvictionObservations(
   now: Date,
 ): KvEvictionState {
   const previous = state?.observedAt.getTime();
+  const bounded = boundedKvEvictionCount(count);
+  const liveCut = effectiveKvCut(state, now);
+  const elapsed = state ? now.getTime() - state.observedAt.getTime() : 0;
+  // Integer recovery time, not the decayed float: 0.5 - (0.5/1.8e6)*1.8e6 is not 0.
+  const active = liveCut > 0 && !(Number.isFinite(elapsed) && elapsed >= KV_EVICTION_RECOVERY_MS);
+  // A stored cut of 0 is a pending first miss. A stored cut that has decayed
+  // to 0 is a recovered capacity and must corroborate again.
+  const nextCut = active
+    ? liveCut + bounded * KV_EVICTION_STEP
+    : state && boundedCut(state.cutFraction) === 0
+      ? bounded * KV_EVICTION_STEP
+      : Math.max(0, bounded - 1) * KV_EVICTION_STEP;
   return {
-    cutFraction: Math.min(
-      KV_EVICTION_MAX_CUT,
-      effectiveKvCut(state, now) + boundedKvEvictionCount(count) * KV_EVICTION_STEP,
-    ),
+    cutFraction: Math.min(KV_EVICTION_MAX_CUT, nextCut),
     observedAt: new Date(
       previous !== undefined && Number.isFinite(previous)
         ? Math.max(previous, now.getTime())

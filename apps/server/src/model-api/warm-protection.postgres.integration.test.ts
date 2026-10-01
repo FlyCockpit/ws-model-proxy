@@ -1070,7 +1070,7 @@ integration("warm-session protection with real PostgreSQL", () => {
           protectedTokens: 30_000,
           effectiveKvBudgetTokens: 100_000,
         });
-        for (let i = 0; i < 10; i++)
+        for (let i = 0; i < 11; i++)
           await feedback.recordKvEvictionObservations(
             { capacityId, ownerId: owner.id, count: 1, now },
             writers[0],
@@ -1098,6 +1098,7 @@ integration("warm-session protection with real PostgreSQL", () => {
 
     it.each([
       { cut: null, count: 1, dt: 0 },
+      { cut: 0, count: 1, dt: 0 },
       { cut: 0.1, count: 0, dt: 1000 },
       { cut: 0.1, count: -1, dt: 1000 },
       { cut: 0.05, count: 1, dt: 0 },
@@ -1146,8 +1147,8 @@ integration("warm-session protection with real PostgreSQL", () => {
         );
         const rows = await db.capacityKvEviction.findMany({ where: { capacityId } });
         expect(rows).toHaveLength(1);
-        let expected = applyKvEvictionObservations(null, 0, now);
-        for (let i = 0; i < count; i++) expected = applyKvEvictionObservations(expected, 1, now);
+        let expected = applyKvEvictionObservations(null, 1, now);
+        for (let i = 1; i < count; i++) expected = applyKvEvictionObservations(expected, 1, now);
         expect(rows[0]?.cutFraction).toBe(expected.cutFraction);
       },
     );

@@ -107,6 +107,7 @@ export const metricRoutingProcedures = {
           id: true,
           slug: true,
           routingRules: true,
+          protectionEnabled: true,
           PoolMembers: {
             where: { tier: "PRIMARY" },
             orderBy: { createdAt: "asc" },
@@ -218,12 +219,18 @@ export const metricRoutingProcedures = {
             ? kvEvictionByCapacity.get(member.capacity.id)
             : undefined;
           const reportedTokens = member.capacity?.kvBudgetTokens ?? null;
-          const effectiveTokens = effectiveKvBudgetTokens(
-            member.capacity?.engineKind === "LLAMA_CPP" ? null : reportedTokens,
-            kvState,
-            now,
-          );
-          const cutFraction = effectiveTokens === null ? 0 : effectiveKvCut(kvState, now);
+          const protectionEnabled = pool.protectionEnabled;
+          const effectiveTokens = protectionEnabled
+            ? effectiveKvBudgetTokens(
+                member.capacity?.engineKind === "LLAMA_CPP" ? null : reportedTokens,
+                kvState,
+                now,
+              )
+            : member.capacity?.engineKind === "LLAMA_CPP"
+              ? null
+              : reportedTokens;
+          const cutFraction =
+            !protectionEnabled || effectiveTokens === null ? 0 : effectiveKvCut(kvState, now);
           return {
             poolMemberId: member.id,
             upstreamModelId: member.model.upstreamModelId,
@@ -252,7 +259,7 @@ export const metricRoutingProcedures = {
                 floorFraction: KV_EVICTION_FLOOR_FRACTION,
                 lastObservedAt: kvState?.observedAt ?? null,
                 expiresAt: kvState?.expiresAt ?? null,
-                active: effectiveTokens !== null && cutFraction > 0,
+                active: protectionEnabled && effectiveTokens !== null && cutFraction > 0,
               },
               mode: member.engineLoadMode === "OFF" ? ("off" as const) : ("auto" as const),
               kvFullThreshold: member.kvFullThreshold,

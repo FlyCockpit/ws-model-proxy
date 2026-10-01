@@ -206,7 +206,13 @@ local pooled request continues a digest-proven, live-tip warm session whose
 previous matched record confirmed engine caching. Both the expected prefix and
 the actual reported prompt must be at least `protectMinTokens`; the record must
 be within that engine's protection window. A reported cache read of at most 5%
-of the expected prefix is an eviction observation. Unknown cache fields, hits,
+of the expected prefix is an eviction observation. The first observation on a
+capacity that is not already cut only arms feedback; a second observation
+lowers K. Chat templates that rewrite earlier turns (Qwen3 and DeepSeek-R1
+strip reasoning; gpt-oss drops earlier analysis channels) can look like a miss
+on a long confirmed session when the user sends a follow-up. One such follow-up
+does not cut. Two independent misses still can, including two follow-ups on
+those templates. Unknown cache fields, hits,
 partial hits above 5%, short prefixes, client-id-only matches, instruction hints,
 matches to ancestors that are not live tips and unranked targets produce no
 observation. A client id with a digest-proven live stored tip of that same session
@@ -238,7 +244,8 @@ excluded: they are cumulative, include bypass traffic and cannot be attributed
 to a matched prefix. Unconfirmed records cannot count; remembering a zero-read
 miss removes confirmation from that prefix.
 
-Each observation cuts 5% of the **reported** K (`KV_EVICTION_STEP = 0.05`), with
+After the first miss has armed the capacity, each further observation cuts 5%
+of the **reported** K (`KV_EVICTION_STEP = 0.05`), with
 at most 10 observations per flush and a 50% maximum cut (`KV_EVICTION_MAX_CUT`).
 The integer effective budget stays between `ceil(0.5 * K)` and K. Cuts recover
 linearly at `0.5 / 1_800_000` per millisecond: a full cut recovers in exactly

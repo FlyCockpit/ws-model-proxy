@@ -99,17 +99,29 @@ export async function recordKvEvictionObservations(
   )
     return;
   const expiresAt = new Date(now.getTime() + KV_EVICTION_RECOVERY_MS);
+  const insertCut = Math.max(0, boundedCount - 1) * KV_EVICTION_STEP;
   await db.$executeRaw`
     INSERT INTO capacity_kv_eviction AS existing
       ("capacityId", "userId", "cutFraction", "observedAt", "expiresAt")
-    VALUES (${capacityId}, ${ownerId}, ${boundedCount * KV_EVICTION_STEP}, ${now}, ${expiresAt})
+    VALUES (${capacityId}, ${ownerId}, ${insertCut}, ${now}, ${expiresAt})
     ON CONFLICT ("capacityId") DO UPDATE SET
       "cutFraction" = LEAST(${KV_EVICTION_MAX_CUT}::double precision,
-        GREATEST(0::double precision,
-          LEAST(${KV_EVICTION_MAX_CUT}::double precision, GREATEST(0::double precision, existing."cutFraction"))
-          - ${KV_EVICTION_DECAY_PER_MS}::double precision * GREATEST(0::double precision,
-            EXTRACT(EPOCH FROM (${now}::timestamp - existing."observedAt"))::double precision * 1000))
-        + ${boundedCount * KV_EVICTION_STEP}::double precision),
+        CASE
+          WHEN GREATEST(0::double precision,
+                LEAST(${KV_EVICTION_MAX_CUT}::double precision, GREATEST(0::double precision, existing."cutFraction"))
+                - ${KV_EVICTION_DECAY_PER_MS}::double precision * GREATEST(0::double precision,
+                  EXTRACT(EPOCH FROM (${now}::timestamp - existing."observedAt"))::double precision * 1000)) > 0
+            AND EXTRACT(EPOCH FROM (${now}::timestamp - existing."observedAt"))::double precision * 1000
+                < ${KV_EVICTION_RECOVERY_MS}::double precision
+            THEN GREATEST(0::double precision,
+                  LEAST(${KV_EVICTION_MAX_CUT}::double precision, GREATEST(0::double precision, existing."cutFraction"))
+                  - ${KV_EVICTION_DECAY_PER_MS}::double precision * GREATEST(0::double precision,
+                    EXTRACT(EPOCH FROM (${now}::timestamp - existing."observedAt"))::double precision * 1000))
+                 + ${boundedCount * KV_EVICTION_STEP}::double precision
+          WHEN existing."cutFraction" > 0
+            THEN GREATEST(0::double precision, (${boundedCount} - 1) * ${KV_EVICTION_STEP}::double precision)
+          ELSE ${boundedCount * KV_EVICTION_STEP}::double precision
+        END),
       "observedAt" = GREATEST(existing."observedAt", ${now}),
       "expiresAt" = GREATEST(existing."expiresAt", ${expiresAt})
     WHERE existing."userId" = EXCLUDED."userId"`;
