@@ -1804,6 +1804,116 @@ describe("cache affinity", () => {
     expect(changed.clientSessionId).not.toBe(original.clientSessionId);
   });
 
+  const forkHistory = [
+    { role: "user", content: "shared starter" },
+    { role: "assistant", content: "reply" },
+    { role: "user", content: "next" },
+  ];
+
+  it("a client-id fork is its own session and shares prefix digests with the original", async () => {
+    const original = affinityPrefixDigests(
+      digestArgs("runtime", { conversation_id: "orig", messages: forkHistory }),
+    );
+    const fork = affinityPrefixDigests(
+      digestArgs("runtime", { conversation_id: "fork", messages: forkHistory }),
+    );
+    expect(original.clientSessionId).toBeDefined();
+    expect(fork.clientSessionId).toBeDefined();
+    expect(fork.clientSessionId).not.toBe(original.clientSessionId);
+    expect(fork.rootDigest).toBe(original.rootDigest);
+    expect(fork.digests).toEqual(original.digests);
+    expect(fork.nodes).toEqual(original.nodes);
+    expect(fork.isContinuation).toBe(true);
+    expect(
+      await resolveAffinitySession(
+        db,
+        { userId: "owner", tenantUserId: "owner", poolId: "pool", executionTargetId: "target" },
+        fork,
+        new Date(),
+      ),
+    ).toBe(fork.clientSessionId);
+    expect(db.$queryRaw).not.toHaveBeenCalled();
+  });
+
+  it("a fork without an id stays one session across branch switches", async () => {
+    const original = affinityPrefixDigests(digestArgs("runtime", { messages: forkHistory }));
+    const left = affinityPrefixDigests(
+      digestArgs("runtime", {
+        messages: [...forkHistory.slice(0, 2), { role: "user", content: "left" }],
+      }),
+    );
+    const right = affinityPrefixDigests(
+      digestArgs("runtime", {
+        messages: [...forkHistory.slice(0, 2), { role: "user", content: "right" }],
+      }),
+    );
+    expect(original.clientSessionId).toBeUndefined();
+    expect(left.clientSessionId).toBeUndefined();
+    expect(right.clientSessionId).toBeUndefined();
+    expect(left.rootDigest).toBe(original.rootDigest);
+    expect(right.rootDigest).toBe(original.rootDigest);
+    expect(left.digests[0]).toBe(original.digests[0]);
+    expect(right.digests[0]).toBe(original.digests[0]);
+    expect(left.digests.at(-1)).not.toBe(right.digests.at(-1));
+    expect(left.isContinuation).toBe(true);
+    expect(right.isContinuation).toBe(true);
+  });
+
+  it("routes a client-id fork to the member holding the shared history", async () => {
+    const warm = cap8(target("target-a", "runtime-a", "capacity-a"));
+    const idle = cap8(target("target-b", "runtime-b", "capacity-b"));
+    const forkPayload = { conversation_id: "fork", messages: forkHistory };
+    const material = affinityPrefixDigests(digestArgs(warm.targetIdentity, forkPayload));
+    db.cacheAffinityRecord.findMany.mockResolvedValue(
+      material.routingNodes.map(({ digest, depth }) =>
+        affinityRow({
+          target: warm,
+          material,
+          prefixDigest: digest,
+          prefixDepth: depth,
+          sessionId: "original-session",
+        }),
+      ),
+    );
+    const ranked = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: forkPayload,
+      targets: [idle, warm],
+    });
+    expect(ranked.orderedTargetIds[0]).toBe("target-a");
+    expect(ranked.prefixDepths["target-a"]).toBeGreaterThan(0);
+    expect(ranked.matchedSessionIds?.["target-a"]).toBe(material.clientSessionId);
+    expect(ranked.matchedSessionIds?.["target-a"]).not.toBe("original-session");
+  });
+
+  it("parallel client-id forks stay distinct; anonymous branches share prefix identity", () => {
+    const original = affinityPrefixDigests(digestArgs("runtime", { messages: forkHistory }));
+    const forkA = affinityPrefixDigests(
+      digestArgs("runtime", { conversation_id: "fork-a", messages: forkHistory }),
+    );
+    const forkB = affinityPrefixDigests(
+      digestArgs("runtime", { conversation_id: "fork-b", messages: forkHistory }),
+    );
+    const anonymous = affinityPrefixDigests(
+      digestArgs("runtime", {
+        messages: [...forkHistory.slice(0, 2), { role: "user", content: "anon-edit" }],
+      }),
+    );
+    expect(original.clientSessionId).toBeUndefined();
+    expect(forkA.clientSessionId).toBeDefined();
+    expect(forkB.clientSessionId).toBeDefined();
+    expect(forkA.clientSessionId).not.toBe(forkB.clientSessionId);
+    expect(anonymous.clientSessionId).toBeUndefined();
+    expect(forkA.digests).toEqual(original.digests);
+    expect(forkB.digests).toEqual(original.digests);
+    expect(anonymous.digests[0]).toBe(original.digests[0]);
+  });
+
   const r1HeaderCases = ["openai-chat", "anthropic-messages", "openai-responses"].flatMap(
     (surface) =>
       [
