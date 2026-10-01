@@ -203,6 +203,7 @@ integration("cache-prefix identity #160", () => {
         payload,
         targets: [args.target],
         scoreSingleTarget: true,
+        collectPrefixEvidence: true,
         now: new Date(now.getTime() + 1000),
       });
     const result = await rank(continued);
@@ -224,11 +225,6 @@ integration("cache-prefix identity #160", () => {
       poolId: f.pool.id,
       executionTargetId: args.target.executionTargetId,
     };
-    expect(await service.resolveAffinitySessionDetail(producer, scope, material, now)).toEqual({
-      sessionId: stored!.sessionId,
-      viaTip: true,
-      tipDigest: stored!.tipDigest,
-    });
     expect(await service.resolveAffinitySession(producer, scope, material, now)).toBe(
       stored!.sessionId,
     );
@@ -259,7 +255,15 @@ integration("cache-prefix identity #160", () => {
     { name: "ancestor edit", expected: false, edit: true },
     { name: "truncation", expected: false, truncate: true },
     { name: "hint stamped by another session", expected: false, otherStamp: true },
-    { name: "hint deeper than live tip", expected: false, deeperHint: true },
+    {
+      name: "hint deeper than live tip without a matching tip hint",
+      expected: false,
+      deeperHint: true,
+    },
+    { name: "unknown size", expected: false, unknown: true },
+    { name: "expired node", expected: false, expiredNode: true },
+    { name: "expired hint", expected: false, expiredHint: true },
+    { name: "different digest version", expected: false, oldVersion: true },
     { name: "wrong root", expected: false, wrongRoot: true },
     ...(["body", "header"] as const).flatMap((carrier) => [
       { name: `client ${carrier} full prefix`, carrier, expected: true },
@@ -267,6 +271,13 @@ integration("cache-prefix identity #160", () => {
       { name: `client ${carrier} other tip owner`, carrier, expected: false, otherOwner: true },
       { name: `client ${carrier} edit`, carrier, expected: false, edit: true },
       { name: `client ${carrier} wrong root`, carrier, expected: false, wrongRoot: true },
+      { name: `client ${carrier} expired node`, carrier, expected: false, expiredNode: true },
+      {
+        name: `client ${carrier} starter is not a continuation`,
+        carrier,
+        expected: false,
+        starter: true,
+      },
     ]),
   ])("C1a evidence identity: $name", async (row) => {
     if (!db) throw new Error("database unavailable");
@@ -275,7 +286,8 @@ integration("cache-prefix identity #160", () => {
     const headers =
       carrier === "header" ? new Headers({ "x-session-id": "evidence-client" }) : undefined;
     const body = carrier === "body" ? { conversation_id: "evidence-client" } : {};
-    const messages = [...baseHistory, a("second reply"), u("third")];
+    const messages =
+      "starter" in row ? [baseHistory[0]!] : [...baseHistory, a("second reply"), u("third")];
     const base = { ...body, messages };
     const stored = await service.rememberAffinity({
       ...args,
@@ -309,9 +321,23 @@ integration("cache-prefix identity #160", () => {
         where: scope,
         data: { sessionId: "other-hint-owner" },
       });
+    if ("unknown" in row)
+      await db.cacheAffinityRecord.updateMany({ where: scope, data: { estimatedTokens: null } });
+    if ("expiredNode" in row)
+      await db.cacheAffinityNode.updateMany({ where: scope, data: { expiresAt: args.now } });
+    if ("expiredHint" in row)
+      await db.cacheAffinityRecord.updateMany({ where: scope, data: { expiresAt: args.now } });
+    if ("oldVersion" in row) {
+      const records = await db.cacheAffinityRecord.findMany({ where: scope });
+      await db.cacheAffinityRecord.deleteMany({ where: scope });
+      await db.cacheAffinityRecord.createMany({
+        data: records.map((record) => ({ ...record, digestVersion: 6 })),
+      });
+    }
     if ("deeperHint" in row) {
       // Keep the real hint at depth 5 while moving the live tip to depth 3:
-      // same session does not make that deeper hint the current tip's record.
+      // The routing hint cannot substitute for a missing current-tip hint.
+      await db.cacheAffinityRecord.deleteMany({ where: { ...scope, prefixDepth: { lte: 3 } } });
       await db.cacheAffinityNode.deleteMany({ where: { ...scope, depth: { gt: 3 } } });
       await db.cacheAffinityNode.updateMany({
         where: { ...scope, depth: 3 },
@@ -322,11 +348,13 @@ integration("cache-prefix identity #160", () => {
       ...base,
       ...("wrongRoot" in row ? { temperature: 0.8, instructions: "different root" } : {}),
       messages:
-        "edit" in row
-          ? [...messages.slice(0, -1), u("edited third")]
-          : "truncate" in row
-            ? messages.slice(0, 3)
-            : [...messages, a("third reply"), u("fourth")],
+        "starter" in row
+          ? messages
+          : "edit" in row
+            ? [...messages.slice(0, -1), u("edited third")]
+            : "truncate" in row
+              ? messages.slice(0, 3)
+              : [...messages, a("third reply"), u("fourth")],
     };
     const material = service.affinityPrefixDigests({
       ...args,
@@ -334,15 +362,13 @@ integration("cache-prefix identity #160", () => {
       payload: request,
       runtimeIdentity: args.target.targetIdentity,
     });
-    const detail = await service.resolveAffinitySessionDetail(producer, scope, material, args.now, {
-      probeClientTip: true,
-    });
     const ranked = await service.rankAffinityTargets({
       ...args,
       headers,
       payload: request,
       targets: [args.target],
       scoreSingleTarget: true,
+      collectPrefixEvidence: true,
     });
     expect(ranked.prefixEvidence).toEqual(
       row.expected
@@ -356,9 +382,7 @@ integration("cache-prefix identity #160", () => {
         : {},
     );
     if (carrier) {
-      expect(detail.sessionId).toBe(stored!.sessionId);
       expect(ranked.matchedSessionIds?.[args.target.executionTargetId]).toBe(stored!.sessionId);
-      expect(detail.viaTip).toBe(row.expected);
       // Wrapper semantics remain unchanged, with zero query round trips.
       // Spy on an adapter, not the shared proxy: restoring a captured proxy
       // wrapper onto the client would bind later transaction queries to it.
@@ -379,7 +403,7 @@ integration("cache-prefix identity #160", () => {
   });
 
   it.each(["truncate", "hit refresh"] as const)(
-    "C1a real fenced %s between the hint read and identity probe",
+    "C1a real fenced %s between the hint read and evidence statement",
     async (kind) => {
       if (!db) throw new Error("database unavailable");
       const args = argsFor(await fixture());
@@ -396,7 +420,7 @@ integration("cache-prefix identity #160", () => {
       const read = async (input?: Prisma.CacheAffinityRecordFindManyArgs) => {
         const records = await findMany(input);
         // These are real PostgreSQL rows. The writer below commits through its
-        // real owner/pool fence after this snapshot and before the real probe.
+        // real owner/pool fence after this snapshot and before the real evidence statement.
         expect(
           records.some(
             (record) =>
@@ -431,20 +455,17 @@ integration("cache-prefix identity #160", () => {
         payload: request,
         targets: [args.target],
         scoreSingleTarget: true,
+        collectPrefixEvidence: true,
       });
       expect(interleaved).toBe(true);
       expect(ranked.matchedSessionIds?.[args.target.executionTargetId]).toBe(stored!.sessionId);
-      expect(ranked.prefixEvidence).toEqual(
-        kind === "truncate"
-          ? {}
-          : {
-              [args.target.executionTargetId]: {
-                tokens: 100_000,
-                lastUsedAt: args.now.getTime(),
-                confirmed: true,
-              },
-            },
-      );
+      expect(ranked.prefixEvidence).toEqual({
+        [args.target.executionTargetId]: {
+          tokens: kind === "truncate" ? 10_000 : 100_000,
+          lastUsedAt: args.now.getTime(),
+          confirmed: true,
+        },
+      });
       const feedback = await import("./kv-eviction-feedback.js");
       expect(
         feedback.qualifiesAsEvictionEvidence({
@@ -473,12 +494,8 @@ integration("cache-prefix identity #160", () => {
         runtimeIdentity: args.target.targetIdentity,
       });
       expect(
-        await service.resolveAffinitySessionDetail(producer, scopeFor(args), material, args.now),
-      ).toEqual({
-        sessionId: stored!.sessionId,
-        viaTip: true,
-        tipDigest: liveTip.nodeDigest,
-      });
+        await service.resolveAffinitySession(producer, scopeFor(args), material, args.now),
+      ).toBe(stored!.sessionId);
       const hint = await db.cacheAffinityRecord.findFirstOrThrow({
         where: { ...scopeFor(args), prefixDigest: liveTip.nodeDigest },
       });
@@ -496,6 +513,7 @@ integration("cache-prefix identity #160", () => {
         payload: { messages: [...request.messages, a("fourth reply"), u("fifth")] },
         targets: [args.target],
         scoreSingleTarget: true,
+        collectPrefixEvidence: true,
       });
       expect(continued.prefixEvidence?.[args.target.executionTargetId]).toEqual({
         tokens: 15_000,
@@ -504,6 +522,334 @@ integration("cache-prefix identity #160", () => {
       });
     },
   );
+
+  it.each(
+    (["implicit", "body", "header"] as const).flatMap((carrier) =>
+      (["ancestor truncate", "hit refresh", "miss refresh", "advance"] as const).map((kind) => ({
+        carrier,
+        kind,
+      })),
+    ),
+  )("C2a snapshot interleaving: $carrier $kind", async ({ carrier, kind }) => {
+    const args = argsFor(await fixture());
+    const headers = carrier === "header" ? new Headers({ "x-session-id": "sibling" }) : undefined;
+    const body = carrier === "body" ? { conversation_id: "sibling" } : {};
+    const messages = [...baseHistory, a("second reply"), u("third")];
+    const stored = await service.rememberAffinity({
+      ...args,
+      headers,
+      payload: { ...body, messages },
+      estimatedTokens: 100_000,
+      engineCacheConfirmed: true,
+    });
+    const request = {
+      ...body,
+      messages:
+        kind === "ancestor truncate"
+          ? [...messages.slice(0, 3), a("edited second reply"), u("edited third")]
+          : [...messages, a("third reply"), u("fourth")],
+    };
+    const findMany = producer.cacheAffinityRecord.findMany.bind(producer.cacheAffinityRecord);
+    let interleaved = false;
+    const records = new Proxy(producer.cacheAffinityRecord, {
+      get(delegate, property) {
+        if (property !== "findMany") return Reflect.get(delegate, property);
+        return async (input?: Prisma.CacheAffinityRecordFindManyArgs) => {
+          const rows = await findMany(input);
+          expect(
+            rows.some(
+              (row) =>
+                row.prefixDepth === (kind === "ancestor truncate" ? 3 : 5) &&
+                row.estimatedTokens === 100_000,
+            ),
+          ).toBe(true);
+          const updated = await service.rememberAffinity({
+            ...args,
+            headers,
+            payload: {
+              ...body,
+              messages:
+                kind === "ancestor truncate"
+                  ? messages.slice(0, 3)
+                  : kind === "advance"
+                    ? request.messages
+                    : messages,
+            },
+            estimatedTokens: kind === "ancestor truncate" ? 10_000 : 25_000,
+            engineCacheConfirmed: kind !== "miss refresh",
+            now: new Date(args.now.getTime() + 1),
+          });
+          expect(updated!.sessionId).toBe(stored!.sessionId);
+          interleaved = true;
+          return rows;
+        };
+      },
+    });
+    const rankDb = new Proxy(producer, {
+      get(client, property) {
+        return property === "cacheAffinityRecord" ? records : Reflect.get(client, property);
+      },
+    });
+    const ranked = await service.rankAffinityTargets({
+      ...args,
+      headers,
+      payload: request,
+      targets: [args.target],
+      scoreSingleTarget: true,
+      collectPrefixEvidence: true,
+      db: rankDb,
+    });
+    expect(interleaved).toBe(true);
+    expect(ranked.prefixEvidence?.[args.target.executionTargetId]).toEqual({
+      tokens: kind === "ancestor truncate" ? 10_000 : 25_000,
+      lastUsedAt: args.now.getTime() + 1,
+      confirmed: kind !== "miss refresh",
+    });
+  });
+
+  it.each(["body", "header"] as const)(
+    "C2a tied identical client tips: %s proves its own hint",
+    async (carrier) => {
+      if (!db) throw new Error("database unavailable");
+      const args = argsFor(await fixture());
+      const payloadFor = (client: string) => ({
+        messages: baseHistory,
+        ...(carrier === "body" ? { conversation_id: client } : {}),
+      });
+      const headersFor = (client: string) =>
+        carrier === "header" ? new Headers({ "x-session-id": client }) : undefined;
+      const stored = [];
+      for (const client of ["a", "b"])
+        stored.push(
+          await service.rememberAffinity({
+            ...args,
+            headers: headersFor(client),
+            payload: payloadFor(client),
+            estimatedTokens: client === "a" ? 11_000 : 12_000,
+            engineCacheConfirmed: true,
+          }),
+        );
+      expect(stored[0]!.tipDigest).toBe(stored[1]!.tipDigest);
+      expect(stored[0]!.sessionId).not.toBe(stored[1]!.sessionId);
+      const tips = await db.cacheAffinityNode.findMany({
+        where: { ...scopeFor(args), isTip: true },
+        orderBy: { sessionId: "asc" },
+      });
+      expect(tips).toHaveLength(2);
+      expect(tips[0]!.expiresAt).toEqual(tips[1]!.expiresAt);
+      // Rank the owner the generic implicit tie-break would reject first; then
+      // stamp the other owner's shared hint and prove that owner's own footprint.
+      const byId = new Map(stored.map((value, index) => [value!.sessionId, ["a", "b"][index]!]));
+      for (const tip of [...tips].reverse()) {
+        const client = byId.get(tip.sessionId)!;
+        const tokens = client === "a" ? 11_000 : 12_000;
+        await service.rememberAffinity({
+          ...args,
+          headers: headersFor(client),
+          payload: payloadFor(client),
+          estimatedTokens: tokens,
+          engineCacheConfirmed: true,
+        });
+        const ranked = await service.rankAffinityTargets({
+          ...args,
+          headers: headersFor(client),
+          payload: {
+            ...payloadFor(client),
+            messages: [...baseHistory, a("reply two"), u("fourth")],
+          },
+          targets: [args.target],
+          scoreSingleTarget: true,
+          collectPrefixEvidence: true,
+        });
+        expect(ranked.matchedSessionIds?.[args.target.executionTargetId]).toBe(tip.sessionId);
+        expect(ranked.prefixEvidence?.[args.target.executionTargetId]).toEqual({
+          tokens,
+          lastUsedAt: args.now.getTime(),
+          confirmed: true,
+        });
+        const other = tips.find((row) => row.sessionId !== tip.sessionId)!;
+        const otherClient = byId.get(other.sessionId)!;
+        const otherRank = await service.rankAffinityTargets({
+          ...args,
+          headers: headersFor(otherClient),
+          payload: {
+            ...payloadFor(otherClient),
+            messages: [...baseHistory, a("reply two"), u("fourth")],
+          },
+          targets: [args.target],
+          scoreSingleTarget: true,
+          collectPrefixEvidence: true,
+        });
+        expect(otherRank.prefixEvidence).toEqual({}); // A shared hint proves only its latest owner.
+      }
+    },
+  );
+
+  it.each(["body", "header"] as const)(
+    "C2a client %s ignores another session's deeper routing hint",
+    async (carrier) => {
+      const args = argsFor(await fixture());
+      const headersFor = (client: string) =>
+        carrier === "header" ? new Headers({ "x-session-id": client }) : undefined;
+      const payloadFor = (client: string, messages: typeof baseHistory) => ({
+        messages,
+        ...(carrier === "body" ? { conversation_id: client } : {}),
+      });
+      const deeper = [...baseHistory, a("second reply"), u("third")];
+      const stored = await service.rememberAffinity({
+        ...args,
+        headers: headersFor("a"),
+        payload: payloadFor("a", baseHistory),
+        estimatedTokens: 12_000,
+        engineCacheConfirmed: true,
+      });
+      await service.rememberAffinity({
+        ...args,
+        headers: headersFor("b"),
+        payload: payloadFor("b", deeper),
+        estimatedTokens: 50_000,
+        engineCacheConfirmed: true,
+      });
+      await service.rememberAffinity({
+        ...args,
+        headers: headersFor("a"),
+        payload: payloadFor("a", baseHistory),
+        estimatedTokens: 12_000,
+        engineCacheConfirmed: true,
+      });
+      const ranked = await service.rankAffinityTargets({
+        ...args,
+        headers: headersFor("a"),
+        payload: payloadFor("a", [...deeper, a("third reply"), u("fourth")]),
+        targets: [args.target],
+        scoreSingleTarget: true,
+        collectPrefixEvidence: true,
+      });
+      expect(ranked.matchedSessionIds?.[args.target.executionTargetId]).toBe(stored!.sessionId);
+      expect(ranked.prefixDepths[args.target.executionTargetId]).toBe(5);
+      expect(ranked.prefixTokens?.[args.target.executionTargetId]).toBe(50_000);
+      expect(ranked.prefixEvidence?.[args.target.executionTargetId]).toEqual({
+        tokens: 12_000,
+        lastUsedAt: args.now.getTime(),
+        confirmed: true,
+      });
+    },
+  );
+
+  it("C2a maximum-tail client rank uses population-independent point lookups", async () => {
+    if (!db) throw new Error("database unavailable");
+    const { Prisma } = await import("@ws-model-proxy/db");
+    const args = { ...argsFor(await fixture()), policy: { ...policy, maxRecords: 100_000 } };
+    const messages = Array.from({ length: 64 }, (_, i) =>
+      i % 2 ? a(`answer ${i}`) : u(`question ${i}`),
+    );
+    const payload = { conversation_id: "maximum-tail", messages };
+    await service.rememberAffinity({
+      ...args,
+      payload,
+      estimatedTokens: 12_000,
+      engineCacheConfirmed: true,
+    });
+    const request = { ...payload, messages: [...messages, u("next")] };
+    const material = service.affinityPrefixDigests({
+      ...args,
+      payload: request,
+      runtimeIdentity: args.target.targetIdentity,
+    });
+    expect(material.nodes).toHaveLength(64);
+    const expiry = new Date(args.now.getTime() + 60_000);
+    type Plan = {
+      "Node Type": string;
+      "Index Name"?: string;
+      "Index Cond"?: string;
+      "Shared Hit Blocks"?: number;
+      "Shared Read Blocks"?: number;
+      "Actual Rows"?: number;
+      "Actual Loops"?: number;
+      Plans?: Plan[];
+    };
+    const flatten = (plan: Plan): Plan[] => [plan, ...(plan.Plans ?? []).flatMap(flatten)];
+    const work: number[] = [];
+    const scanPlans: Plan[][] = [];
+    for (const count of [1000, 20_000]) {
+      const first = count === 1000 ? 1 : 1001;
+      // Competing tips and ancestors across the entire request tail; records
+      // span the same scope/digests with other bindings, so even the narrower
+      // non-unique record index faces the competitor population.
+      await db.$executeRaw`INSERT INTO cache_affinity_node
+        (id, "userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest", "nodeDigest", depth, "sessionId", "isTip", "expiresAt")
+        SELECT 'work-' || ${args.poolId} || i, ${args.resourceOwnerId}, ${args.ownerId}, ${args.poolId}, ${args.target.executionTargetId}, ${material.rootDigest},
+          (${JSON.stringify(material.nodes)}::jsonb -> ((i % 64)::int) ->> 'digest'), (i % 64)::int + 1, 'work-' || ${args.poolId} || i, i % 2 = 0, ${expiry}
+        FROM generate_series(${first}::int, ${count}::int) i ORDER BY md5(i::text)`;
+      await db.$executeRaw`INSERT INTO cache_affinity_record
+        (id, "userId", "tenantUserId", "poolId", "executionTargetId", "targetIdentity", "bindingDigest", "prefixDigest", "sessionId", "prefixDepth", "expiresAt", "lastUsedAt")
+        SELECT 'work-' || ${args.poolId} || i, ${args.resourceOwnerId}, ${args.ownerId}, ${args.poolId}, ${args.target.executionTargetId}, ${args.target.targetIdentity}, md5('other-binding-' || i),
+          (${JSON.stringify(material.nodes)}::jsonb -> ((i % 64)::int) ->> 'digest'), 'work-' || ${args.poolId} || i, (i % 64)::int + 1, ${expiry}, ${args.now}
+        FROM generate_series(${first}::int, ${count}::int) i ORDER BY md5(i::text)`;
+      await db.$executeRawUnsafe("VACUUM ANALYZE cache_affinity_node");
+      await db.$executeRawUnsafe("VACUUM ANALYZE cache_affinity_record");
+      // Capture the statement actually issued by ranking, so a replacement
+      // with the old population-dependent probe cannot escape this check.
+      const queries: Prisma.Sql[] = [];
+      const rankDb = new Proxy(producer, {
+        get(client, property) {
+          return property === "$queryRaw"
+            ? async (query: Prisma.Sql) => {
+                queries.push(query);
+                return producer.$queryRaw(query);
+              }
+            : Reflect.get(client, property);
+        },
+      });
+      const ranked = await service.rankAffinityTargets({
+        ...args,
+        payload: request,
+        targets: [args.target],
+        scoreSingleTarget: true,
+        collectPrefixEvidence: true,
+        db: rankDb,
+      });
+      expect(ranked.prefixEvidence?.[args.target.executionTargetId]?.tokens).toBe(12_000);
+      expect(queries).toHaveLength(1); // Client identity retains its zero-query shortcut.
+      const [explain] = await producer.$queryRaw<{ "QUERY PLAN": { Plan: Plan }[] }[]>(
+        Prisma.sql`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${queries[0]!}`,
+      );
+      const plan = explain!["QUERY PLAN"][0]!.Plan;
+      const scans = flatten(plan).filter(
+        (node) => node["Node Type"].includes("Scan") && node["Index Name"],
+      );
+      scanPlans.push(scans);
+      const buffers = (plan["Shared Hit Blocks"] ?? 0) + (plan["Shared Read Blocks"] ?? 0);
+      work.push(buffers);
+      expect(buffers).toBeLessThan(1000);
+      process.stdout.write(
+        `${JSON.stringify({ evidenceWork: { count, buffers, indexes: scans.map((scan) => scan["Index Name"]) } })}\n`,
+      );
+    }
+    expect(work[1]! / Math.max(1, work[0]!)).toBeLessThanOrEqual(2);
+    for (const scans of scanPlans) {
+      expect(scans.length).toBeGreaterThanOrEqual(2);
+      for (const scan of scans) {
+        expect(scan["Index Cond"]).not.toMatch(/ROW\(|[<>]/);
+        if (scan["Index Name"]?.startsWith("cache_affinity_node"))
+          expect(scan["Index Cond"]).toContain("sessionId");
+        else
+          for (const key of [
+            "tenantUserId",
+            "poolId",
+            "executionTargetId",
+            "targetIdentity",
+            "bindingDigest",
+            "prefixDigest",
+          ])
+            expect(scan["Index Cond"]).toContain(key);
+        expect((scan["Actual Rows"] ?? 0) * (scan["Actual Loops"] ?? 0)).toBeLessThanOrEqual(64);
+      }
+      expect(scans.some((scan) => scan["Index Name"] === "cache_affinity_node_owner_unique")).toBe(
+        true,
+      );
+    }
+  }, 60_000);
 
   function scopeFor(args: ReturnType<typeof argsFor>) {
     return {
@@ -2995,7 +3341,7 @@ integration("cache-prefix identity #160", () => {
       const { Prisma } = await import("@ws-model-proxy/db");
       // PostgreSQL may inspect index endpoints while planning. Measure that
       // fixed overhead independently using the SAME production query text
-      // (including viaTip; the string wrapper still uses the identical probe);
+      // (the string resolver still uses the identical probe);
       // retain a total-read bound and compare executor work at both sizes.
       const planning = await measure(() =>
         producer.$queryRaw(

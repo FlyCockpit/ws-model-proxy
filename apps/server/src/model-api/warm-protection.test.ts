@@ -831,6 +831,19 @@ describe("effective KV assessment", () => {
     });
     expect(result.get("a")).toMatchObject({ state, effectiveKvBudgetTokens: effective });
   });
+  it.each([
+    { effective: 100_000, state: "PROTECTED" },
+    { effective: 200_000, state: "PROTECTED" },
+  ])("effective K $effective cannot widen the reported-K threshold", ({ effective, state }) => {
+    expect(
+      memberProtectionVerdict({
+        load: { slots: 4, active: 0, kvBudgetTokens: 100_000, effectiveKvBudgetTokens: effective },
+        protectedSessions: [session("alice", 10, 80_000)],
+        requestTokens: 15_000,
+        affine: false,
+      }),
+    ).toMatchObject({ state, effectiveKvBudgetTokens: 100_000 });
+  });
   const CUTS = [0, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5] as const;
   const assessAt = (
     cut: number,

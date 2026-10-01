@@ -256,6 +256,36 @@ describe("buffered recorder", () => {
     await vi.advanceTimersByTimeAsync(1000);
     expect(r.write).toHaveBeenCalledTimes(3);
   });
+  it("holds one in-flight writer for the same capacity and recovers with one bounded trailing flush", async () => {
+    const r = setup();
+    let settle: (() => void) | undefined;
+    r.write.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          settle = resolve;
+        }),
+    );
+    r.observe("a", "o");
+    await vi.advanceTimersByTimeAsync(1500);
+    for (let i = 0; i < 100; i++) r.observe("a", "o");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(r.write).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(r.write).toHaveBeenCalledTimes(1);
+    settle!();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(r.write).toHaveBeenCalledTimes(2);
+    expect(r.write).toHaveBeenLastCalledWith(
+      expect.objectContaining({ capacityId: "a", count: 10 }),
+    );
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(r.write).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(0);
+    r.observe("a", "o");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(r.write).toHaveBeenCalledTimes(3);
+    expect(r.write).toHaveBeenLastCalledWith(expect.objectContaining({ count: 1 }));
+  });
   it("delayed failures that settle together still log at most once per minute", async () => {
     const r = setup();
     const rejectWrites: Array<(error: Error) => void> = [];

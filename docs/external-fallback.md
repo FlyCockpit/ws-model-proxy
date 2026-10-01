@@ -208,10 +208,15 @@ the actual reported prompt must be at least `protectMinTokens`; the record must
 be within that engine's protection window. A reported cache read of at most 5%
 of the expected prefix is an eviction observation. Unknown cache fields, hits,
 partial hits above 5%, short prefixes, client-id-only matches, instruction hints,
-ancestor edits/truncations and unranked targets produce no observation. A client
-id with a digest-proven live stored tip of that same session does count: the
-matched hint's digest and session must equal the tip probe's digest and owner,
-so a hint read before a concurrent truncation cannot supply the new tip's size.
+matches to ancestors that are not live tips and unranked targets produce no
+observation. A client id with a digest-proven live stored tip of that same session
+does count: evidence comes from one SQL statement proving that the resolved session owns a
+live tip in the request chain and reading that same digest/session hint's size,
+age and confirmation in the same snapshot. A concurrent truncation therefore
+exposes both the new tip and its rewritten footprint, or neither. Identical tips
+owned by other sessions do not choose the evidence owner. This proves the
+footprint **as of the ranking snapshot**, not engine residency at dispatch or
+response time; a later unrelated writer does not affect that claim.
 The bound Responses `previous_response_id` path is excluded: it has neither a ranked
 decision nor the matched record's age. Endpoint prefix-cache counters are also
 excluded: they are cumulative, include bypass traffic and cannot be attributed

@@ -1599,9 +1599,10 @@ describe("model API routes", () => {
       });
     };
     /** Admits `grants[call]` (a member id) on that acquire call, else EXPIRED. */
-    const scripted = (grants: Array<string | null>) => {
+    const scripted = (grants: Array<string | null>, admissionAdvanceMs = 0) => {
       let call = 0;
       const acquire = vi.fn(async (attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0]) => {
+        if (admissionAdvanceMs) vi.setSystemTime(Date.now() + admissionAdvanceMs);
         const grant = grants[call++] ?? null;
         const candidate = attempt.candidates.find(({ poolMemberId }) => poolMemberId === grant);
         if (!candidate) return { state: "EXPIRED" as const };
@@ -1767,6 +1768,17 @@ describe("model API routes", () => {
         advanceMs: 600_000,
       },
       {
+        name: "admission ages a prefix past the window before dispatch",
+        cache: 0,
+        prompt: 20_000,
+        tokens: 20_000,
+        affinityMatch: true,
+        ok: true,
+        expected: 0,
+        ageMs: 299_000,
+        admissionAdvanceMs: 2000,
+      },
+      {
         name: "prefix already outside the window at dispatch",
         cache: 0,
         prompt: 20_000,
@@ -1778,7 +1790,18 @@ describe("model API routes", () => {
       },
     ])(
       "KV feedback finalization: $name",
-      async ({ cache, prompt, tokens, affinityMatch, ok, expected, throws, ageMs, advanceMs }) => {
+      async ({
+        cache,
+        prompt,
+        tokens,
+        affinityMatch,
+        ok,
+        expected,
+        throws,
+        ageMs,
+        advanceMs,
+        admissionAdvanceMs,
+      }) => {
         vi.useFakeTimers({ toFake: ["Date"] });
         vi.setSystemTime(new Date("2026-09-30T12:00:00Z"));
         db.poolMember.findMany.mockResolvedValue(
@@ -1802,7 +1825,7 @@ describe("model API routes", () => {
           kvFeedback.observe.mockImplementationOnce(() => {
             throw new Error("disposable");
           });
-        const { runtime } = scripted(["member-a"]);
+        const { runtime } = scripted(["member-a"], admissionAdvanceMs);
         const { manager, response } = request(runtime, poolTarget.modelId);
         await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
         const sent = requireSent(manager);
@@ -2160,7 +2183,7 @@ describe("model API routes", () => {
 
       expect(response.status).toBe(200);
       expect(affinity.rank).toHaveBeenCalledWith(
-        expect.objectContaining({ scoreSingleTarget: true }),
+        expect.objectContaining({ scoreSingleTarget: true, collectPrefixEvidence: true }),
       );
     });
 
@@ -2177,7 +2200,24 @@ describe("model API routes", () => {
 
       expect(response.status).toBe(200);
       expect(affinity.rank).toHaveBeenCalledWith(
-        expect.objectContaining({ scoreSingleTarget: false }),
+        expect.objectContaining({ scoreSingleTarget: false, collectPrefixEvidence: false }),
+      );
+    });
+
+    it("evidence collection is off without a capacity runtime", async () => {
+      db.poolMember.findMany.mockResolvedValue(members());
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a", "cli-b"];
+      const response = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      expect((await response).status).toBe(200);
+      expect(affinity.rank).toHaveBeenCalledWith(
+        expect.objectContaining({ scoreSingleTarget: false, collectPrefixEvidence: false }),
       );
     });
 
@@ -14692,6 +14732,7 @@ describe("model API routes", () => {
       } else {
         expect(affinity.rank).toHaveBeenCalledTimes(1);
         const rankArgs = affinity.rank.mock.calls[0]![0];
+        if (row.path === "overflow") expect(rankArgs.collectPrefixEvidence ?? false).toBe(false);
         const ranked = await affinity.rank.mock.results[0]!.value;
         const rankMaterial = actual.affinityPrefixDigests({
           ...rankArgs,

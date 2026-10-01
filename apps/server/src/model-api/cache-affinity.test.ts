@@ -64,7 +64,6 @@ import {
   rankAffinityTargets,
   rememberAffinity,
   resolveAffinitySession,
-  resolveAffinitySessionDetail,
   sweepExpiredAffinity,
 } from "./cache-affinity.js";
 
@@ -227,109 +226,34 @@ describe("cache affinity", () => {
   });
 
   it.each([
-    { name: "live tip", viaTip: true, confirmed: true, expected: true },
-    { name: "unconfirmed live tip", viaTip: true, confirmed: false, expected: true },
-    { name: "ancestor edit", viaTip: false, confirmed: true, expected: false },
-    {
-      name: "truncation changes tip digest",
-      viaTip: true,
-      confirmed: true,
-      expected: false,
-      otherDigest: true,
-    },
-    {
-      name: "wrong root has no probe row",
-      viaTip: false,
-      confirmed: true,
-      expected: false,
-      noTip: true,
-    },
-    {
-      name: "instruction only",
-      viaTip: true,
-      confirmed: true,
-      expected: false,
-      instructions: true,
-    },
-    { name: "unknown size", viaTip: true, confirmed: true, expected: false, unknown: true },
-    {
-      name: "record stamped by another session",
-      viaTip: true,
-      confirmed: true,
-      expected: false,
-      otherSession: true,
-    },
-    ...(["body", "header"] as const).flatMap((carrier) => [
-      {
-        name: `client ${carrier} full prefix`,
-        carrier,
-        viaTip: true,
-        confirmed: true,
-        expected: true,
-      },
-      {
-        name: `client ${carrier} id only`,
-        carrier,
-        viaTip: false,
-        confirmed: true,
-        expected: false,
-        noTip: true,
-      },
-      {
-        name: `client ${carrier} other tip owner`,
-        carrier,
-        viaTip: true,
-        confirmed: true,
-        expected: false,
-        otherOwner: true,
-      },
-      { name: `client ${carrier} edit`, carrier, viaTip: false, confirmed: true, expected: false },
-      {
-        name: `client ${carrier} wrong root`,
-        carrier,
-        viaTip: false,
-        confirmed: true,
-        expected: false,
-        noTip: true,
-      },
-    ]),
-  ])("prefix evidence: $name", async (row) => {
-    const { viaTip, confirmed, expected } = row;
-    const carrier = "carrier" in row ? row.carrier : undefined;
-    const headers =
-      carrier === "header" ? new Headers({ "x-session-id": "evidence-client" }) : undefined;
-    const now = new Date("2026-08-25T12:00:00Z");
+    { name: "default off", expected: 0 },
+    { name: "explicit off", collect: false, expected: 0 },
+    { name: "enabled", collect: true, expected: 2 },
+    { name: "no resolved session", collect: true, expected: 0, noSession: true },
+    { name: "one resolved target", collect: true, expected: 1, oneTarget: true },
+    { name: "statement error", collect: true, expected: 2, error: true },
+    { name: "no proof row", collect: true, expected: 2, noRow: true },
+  ])("prefix evidence collection: $name", async (row) => {
     const requestPayload = {
       ...payload,
-      ...(carrier === "body" ? { conversation_id: "evidence-client" } : {}),
       messages: [
         ...payload.messages,
-        { role: "assistant", content: "answer" },
+        { role: "assistant", content: "reply" },
         { role: "user", content: "next" },
       ],
     };
-    const material = affinityPrefixDigests({ ...digestArgs("runtime-a", requestPayload), headers });
-    const record = {
-      ...affinityRow({
-        target: target("target-a", "runtime-a"),
-        material,
-        prefixDigest: "instructions" in row ? material.instructionDigests[0] : material.digests[1],
-        prefixDepth: 2,
-        sessionId: material.clientSessionId ?? "test-session",
-        engineCacheConfirmed: confirmed,
-        lastUsedAt: new Date(now.getTime() - 42_000),
-      }),
-      estimatedTokens: "unknown" in row ? null : 12_000,
-    };
-    const probe = {
-      sessionId:
-        "otherSession" in row || "otherOwner" in row ? "resolved-other-session" : record.sessionId,
-      viaTip,
-      tipDigest: "otherDigest" in row ? material.digests[0] : record.prefixDigest,
-    };
-    db.cacheAffinityRecord.findMany.mockResolvedValue([record]);
-    db.$queryRaw.mockResolvedValue("noTip" in row ? [] : [probe]);
-    const result = await rankAffinityTargets({
+    const now = new Date("2026-08-25T12:00:00Z");
+    const evidence = { estimatedTokens: 12_000, lastUsedAt: now, engineCacheConfirmed: false };
+    db.$queryRaw.mockImplementation(async (query) => {
+      if (query.sql.includes('r."estimatedTokens"')) {
+        if ("error" in row) throw new Error("evidence unavailable");
+        return "noRow" in row ? [] : [evidence];
+      }
+      return "noSession" in row || ("oneTarget" in row && query.values.includes("target-b"))
+        ? []
+        : [{ sessionId: "test-session" }];
+    });
+    const args = {
       ownerId: "owner",
       resourceOwnerId: "owner",
       poolId: "pool",
@@ -337,38 +261,62 @@ describe("cache affinity", () => {
       policy,
       surface: "openai-chat",
       payload: requestPayload,
-      headers,
-      targets: [target("target-a", "runtime-a")],
-      scoreSingleTarget: true,
+      targets: [target("target-a", "runtime-a"), target("target-b", "runtime-b")],
       now,
+    };
+    const result = await rankAffinityTargets({
+      ...args,
+      collectPrefixEvidence: "collect" in row ? row.collect : undefined,
     });
-    expect(result.prefixEvidence).toEqual(
-      expected
-        ? { "target-a": { tokens: 12_000, lastUsedAt: record.lastUsedAt.getTime(), confirmed } }
-        : {},
+    const proofQueries = db.$queryRaw.mock.calls.filter(([query]) =>
+      query.sql.includes('r."estimatedTokens"'),
     );
-    if (carrier) {
-      expect(result.matchedSessionIds?.["target-a"]).toBe(material.clientSessionId);
-      const scope = {
-        userId: "owner",
-        tenantUserId: "owner",
-        poolId: "pool",
-        executionTargetId: "target-a",
-      };
-      // Authoritative identity must not turn another session's tip into proof,
-      // even if the separate hint guard would also reject that owner.
-      expect(
-        await resolveAffinitySessionDetail(db, scope, material, now, { probeClientTip: true }),
-      ).toEqual({
-        sessionId: material.clientSessionId,
-        viaTip: viaTip && !("otherOwner" in row) && !("noTip" in row),
-        tipDigest: "noTip" in row ? null : probe.tipDigest,
-      });
-      const reads = db.$queryRaw.mock.calls.length;
-      expect(await resolveAffinitySession(db, scope, material, now)).toBe(material.clientSessionId);
-      expect(db.$queryRaw).toHaveBeenCalledTimes(reads);
-    }
+    expect(proofQueries).toHaveLength(row.expected);
+    if (!("collect" in row) || !row.collect) expect(result.prefixEvidence).toBeUndefined();
+    else
+      expect(result.prefixEvidence).toEqual(
+        row.expected && !("error" in row) && !("noRow" in row)
+          ? Object.fromEntries(
+              args.targets
+                .filter((t) => result.matchedSessionIds?.[t.executionTargetId])
+                .map((t) => [
+                  t.executionTargetId,
+                  { tokens: 12_000, lastUsedAt: now.getTime(), confirmed: false },
+                ]),
+            )
+          : {},
+      );
+    // Read failures and absent evidence leave ranking and resolved identity intact.
+    const withoutEvidence = await rankAffinityTargets(args);
+    const { prefixEvidence: _evidence, ...ranking } = result;
+    expect(ranking).toEqual(withoutEvidence);
   });
+
+  it.each(["body", "header"] as const)(
+    "client %s identity needs no query when evidence is off",
+    async (carrier) => {
+      const requestPayload = {
+        ...payload,
+        ...(carrier === "body" ? { conversation_id: "client" } : {}),
+      };
+      const headers = carrier === "header" ? new Headers({ "x-session-id": "client" }) : undefined;
+      const result = await rankAffinityTargets({
+        ownerId: "owner",
+        resourceOwnerId: "owner",
+        poolId: "pool",
+        securityScope: "token",
+        policy,
+        surface: "openai-chat",
+        payload: requestPayload,
+        headers,
+        targets: [target("target-a", "runtime-a")],
+        scoreSingleTarget: true,
+      });
+      expect(result.prefixEvidence).toBeUndefined();
+      expect(result.matchedSessionIds?.["target-a"]).toBeTruthy();
+      expect(db.$queryRaw).not.toHaveBeenCalled();
+    },
+  );
 
   const clientUuid = "11111111-2222-4333-8444-555555555555";
   const carriers: { body: Record<string, unknown>; header?: string; surface?: string }[] = [
