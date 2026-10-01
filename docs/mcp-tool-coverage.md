@@ -68,6 +68,7 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.createModelPool` | `forwarder_model_pool_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.deleteModelPool` | `forwarder_model_pool_delete` | write | DELETE | destructive | — | — | — |
 | `forwarderManagement.getCliDeviceMetrics` | `forwarder_device_metrics_get` | read | — | pure | — | — | — |
+| `forwarderManagement.getEngineLoadHistory` | `forwarder_engine_load_history_get` | read | — | pure | — | — | — |
 | `forwarderManagement.getPoolRoutingRules` | `forwarder_pool_routing_rules_get` | read | — | pure | — | — | — |
 | `forwarderManagement.getProfileSlug` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
 | `forwarderManagement.grantPoolAccessByEmail` | `forwarder_pool_grant_create` | write | — | pure | — | — | — |

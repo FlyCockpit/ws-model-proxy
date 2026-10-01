@@ -32,6 +32,7 @@ import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/opena
 import type { SupervisedCommandStatus } from "@ws-model-proxy/api/lib/supervised-command-types";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { startRelayAttempt } from "../model-api/relay-executor.js";
+import { EngineLoadHistoryStore } from "./engine-load-history.js";
 import {
   type FileOp,
   type FileOpFrame,
@@ -614,6 +615,8 @@ function closeWithProtocolError(socket: RelaySocket, message: string) {
 export class RelaySessionManager {
   private sessionsBySocket = new Map<RelaySocket, SessionState>();
   private sessionsByCliDeviceId = new Map<string, SessionState>();
+  /** Manager-level so a reconnect does not wipe the 30-minute ring. */
+  private engineLoadHistory = new EngineLoadHistoryStore();
   private featureGrantsRefreshByCliDeviceId = new Map<string, Promise<void>>();
   private grantChangeSeq = 0;
   // One integer per device changed since process start. There is no device-delete
@@ -1661,6 +1664,17 @@ export class RelaySessionManager {
         receivedAt: now,
         receivedAtMs: nowMs,
       });
+      this.engineLoadHistory.record(cliDeviceId, load.endpointSlug, load.modelSlug ?? null, {
+        running: load.running,
+        waiting: load.waiting,
+        kvUsage: load.kvUsage,
+        kvOccupancy: load.kvOccupancy,
+        slotsBusy: load.slotsBusy,
+        prefixCacheHitsDelta: hitsDelta,
+        prefixCacheQueriesDelta: queriesDelta,
+        source: load.source,
+        receivedAt: now,
+      });
       this.scheduleRoutingEvaluation(session);
       return;
     }
@@ -1823,6 +1837,18 @@ export class RelaySessionManager {
         error instanceof Error ? error.name : typeof error,
       );
     }
+  }
+
+  /** 30-minute engine-load history; survives reconnect of the same process. */
+  getLiveEngineLoadHistory(
+    keys: readonly {
+      cliDeviceId: string;
+      endpointSlug: string;
+      modelSlug: string | null;
+    }[],
+    now: Date = new Date(),
+  ) {
+    return this.engineLoadHistory.snapshot(keys, now);
   }
 
   /** The freshest node metrics and endpoint load per connected CLI. */

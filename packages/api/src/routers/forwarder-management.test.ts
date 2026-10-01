@@ -5927,7 +5927,7 @@ describe("setCliDeviceFeatureGrants", () => {
       {
         ...row,
         id: "cli-newer",
-        rejectedRelayProtocolVersion: "2.9",
+        rejectedRelayProtocolVersion: "2.10",
         rejectedCliVersion: "0.9.0",
         relayRejectedAt: rejectedAt,
       },
@@ -5943,7 +5943,7 @@ describe("setCliDeviceFeatureGrants", () => {
     });
     expect(devices[1]?.upgradeRequired).toBeNull();
     expect(devices[2]?.upgradeRequired).toMatchObject({
-      protocolVersion: "2.9",
+      protocolVersion: "2.10",
       reason: "cli_too_new",
     });
   });
@@ -6123,6 +6123,7 @@ it("omits a shared pool entirely after its grant is revoked", async () => {
 describe("metric routing procedures (S-B part 2)", () => {
   const deep = prisma as unknown as {
     modelPool: { findFirst: MockInstance; updateMany: MockInstance };
+    inferenceCapacity: { findFirst: MockInstance };
     capacityKvEviction: { findMany: MockInstance };
     poolMemberRoutingVerdict: { findMany: MockInstance; deleteMany: MockInstance };
     cliDevice: { findUnique: MockInstance; findMany: MockInstance; updateMany: MockInstance };
@@ -6718,5 +6719,71 @@ describe("metric routing procedures (S-B part 2)", () => {
     await expect(
       client().setCliDeviceMetricSources({ cliDeviceId: "cli-id", sources: [source, source] }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+
+  it("returns engine-load history for an owned pool and NOT_FOUND for a foreign one", async () => {
+    deep.modelPool.findFirst.mockResolvedValue({
+      PoolMembers: [
+        {
+          id: "m1",
+          kvFullThreshold: 0.9,
+          ExecutionTarget: {
+            InferenceCapacity: {
+              id: "cap-1",
+              kvBudgetTokens: 262_144,
+              engineLoadSource: "CUSTOM",
+              engineLoadSignals: ["kvUsage"],
+            },
+            DiscoveredModel: {
+              slug: null,
+              upstreamModelId: "qwen",
+              Endpoint: { slug: "gpu", cliDeviceId: "cli-1", CliDevice: { name: "GPU" } },
+            },
+          },
+        },
+      ],
+    });
+    const series = [
+      {
+        start: new Date("2026-09-28T12:00:00.000Z"),
+        running: 4,
+        waiting: null,
+        kvUsage: 0.8,
+        kvOccupancy: 0.9,
+        slotsBusy: null,
+        prefixCacheHits: 2,
+        prefixCacheQueries: 5,
+        source: "custom",
+        gap: false,
+      },
+    ];
+    const result = await client({
+      getLiveEngineLoadHistory: () => [
+        { cliDeviceId: "cli-1", endpointSlug: "gpu", modelSlug: null, series },
+      ],
+    }).getEngineLoadHistory({ poolId: "pool-1" });
+    expect(result.members).toEqual([
+      {
+        poolMemberId: "m1",
+        capacityId: "cap-1",
+        endpointSlug: "gpu",
+        modelSlug: null,
+        cliDeviceId: "cli-1",
+        source: "custom",
+        signals: ["kvUsage"],
+        effectiveKvFullThreshold: 0.9,
+        kvBudgetTokens: 262_144,
+        series,
+      },
+    ]);
+
+    deep.modelPool.findFirst.mockResolvedValue(null);
+    await expect(client().getEngineLoadHistory({ poolId: "missing" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+    deep.inferenceCapacity.findFirst.mockResolvedValue(null);
+    await expect(client().getEngineLoadHistory({ capacityId: "cap-x" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
   });
 });

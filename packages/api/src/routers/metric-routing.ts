@@ -332,6 +332,137 @@ export const metricRoutingProcedures = {
     }),
 
   /**
+   * 30-minute live engine-load history (10 s buckets) for a pool or capacity
+   * the caller owns. A foreign id is NOT_FOUND. Occupancy is display-only.
+   */
+  getEngineLoadHistory: protectedProcedure
+    .input(z.union([z.object({ poolId: idSchema }), z.object({ capacityId: idSchema })]))
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      const now = new Date();
+      type HistoryMember = {
+        poolMemberId: string | null;
+        capacityId: string | null;
+        endpointSlug: string;
+        modelSlug: string | null;
+        cliDeviceId: string;
+        engineLoadSource: string | null;
+        engineLoadSignals: string[];
+        kvFullThreshold: number | null;
+        kvBudgetTokens: number | null;
+      };
+      let members: HistoryMember[] = [];
+      if ("poolId" in input) {
+        const pool = await prisma.modelPool.findFirst({
+          where: { id: input.poolId, userId },
+          select: {
+            PoolMembers: {
+              where: { tier: "PRIMARY" },
+              orderBy: { createdAt: "asc" },
+              select: {
+                id: true,
+                kvFullThreshold: true,
+                DiscoveredModel: { select: memberModelSelect },
+                ExecutionTarget: {
+                  select: {
+                    InferenceCapacity: {
+                      select: {
+                        id: true,
+                        kvBudgetTokens: true,
+                        engineLoadSource: true,
+                        engineLoadSignals: true,
+                      },
+                    },
+                    DiscoveredModel: { select: memberModelSelect },
+                  },
+                },
+              },
+            },
+          },
+        });
+        if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+        members = pool.PoolMembers.flatMap((member) => {
+          const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
+          if (!model) return [];
+          const capacity = member.ExecutionTarget?.InferenceCapacity ?? null;
+          return [
+            {
+              poolMemberId: member.id,
+              capacityId: capacity?.id ?? null,
+              endpointSlug: model.Endpoint.slug,
+              modelSlug: model.slug ?? null,
+              cliDeviceId: model.Endpoint.cliDeviceId,
+              engineLoadSource: capacity?.engineLoadSource ?? null,
+              engineLoadSignals: capacity?.engineLoadSignals ?? [],
+              kvFullThreshold: member.kvFullThreshold,
+              kvBudgetTokens: capacity?.kvBudgetTokens ?? null,
+            },
+          ];
+        });
+      } else {
+        const capacity = await prisma.inferenceCapacity.findFirst({
+          where: { id: input.capacityId, userId },
+          select: {
+            id: true,
+            kvBudgetTokens: true,
+            engineLoadSource: true,
+            engineLoadSignals: true,
+            ExecutionTargets: {
+              select: { DiscoveredModel: { select: memberModelSelect } },
+            },
+          },
+        });
+        if (!capacity) throw new ORPCError("NOT_FOUND", { message: "Capacity not found." });
+        members = capacity.ExecutionTargets.flatMap((target) => {
+          const model = target.DiscoveredModel;
+          if (!model) return [];
+          return [
+            {
+              poolMemberId: null,
+              capacityId: capacity.id,
+              endpointSlug: model.Endpoint.slug,
+              modelSlug: model.slug ?? null,
+              cliDeviceId: model.Endpoint.cliDeviceId,
+              engineLoadSource: capacity.engineLoadSource,
+              engineLoadSignals: capacity.engineLoadSignals,
+              kvFullThreshold: null,
+              kvBudgetTokens: capacity.kvBudgetTokens,
+            },
+          ];
+        });
+      }
+      const keys = members.map((member) => ({
+        cliDeviceId: member.cliDeviceId,
+        endpointSlug: member.endpointSlug,
+        modelSlug: member.modelSlug,
+      }));
+      const history = context.services?.getLiveEngineLoadHistory?.(keys, now) ?? [];
+      const byKey = new Map(
+        history.map((entry) => [
+          `${entry.cliDeviceId}\u0000${entry.endpointSlug}\u0000${entry.modelSlug ?? ""}`,
+          entry.series,
+        ]),
+      );
+      return {
+        members: members.map((member) => ({
+          poolMemberId: member.poolMemberId,
+          capacityId: member.capacityId,
+          endpointSlug: member.endpointSlug,
+          modelSlug: member.modelSlug,
+          cliDeviceId: member.cliDeviceId,
+          source: member.engineLoadSource === "CUSTOM" ? ("custom" as const) : ("builtin" as const),
+          signals: member.engineLoadSignals,
+          effectiveKvFullThreshold: effectiveKvFullThreshold(member.kvFullThreshold),
+          kvBudgetTokens: member.kvBudgetTokens,
+          series:
+            byKey.get(
+              `${member.cliDeviceId}\u0000${member.endpointSlug}\u0000${member.modelSlug ?? ""}`,
+            ) ?? [],
+        })),
+      };
+    }),
+
+  /**
    * Replace a pool's routing rules. `full` makes a member FULL (the request
    * queues, goes to another member, or goes external for `:external`
    * callers); `avoid` ranks it last. Stale or missing metrics are ignored.

@@ -132,6 +132,31 @@ export type ContextServices = {
   getLiveNodeTelemetry?: (
     cliDeviceIds: readonly string[],
   ) => ReadonlyMap<string, LiveNodeTelemetrySnapshot>;
+  /** 30-minute in-memory engine-load history (10 s buckets). Survives reconnect. */
+  getLiveEngineLoadHistory?: (
+    keys: readonly {
+      cliDeviceId: string;
+      endpointSlug: string;
+      modelSlug: string | null;
+    }[],
+    now?: Date,
+  ) => Array<{
+    cliDeviceId: string;
+    endpointSlug: string;
+    modelSlug: string | null;
+    series: Array<{
+      start: Date;
+      running: number | null;
+      waiting: number | null;
+      kvUsage: number | null;
+      kvOccupancy: number | null;
+      slotsBusy: number | null;
+      prefixCacheHits: number;
+      prefixCacheQueries: number;
+      source: string | null;
+      gap: boolean;
+    }>;
+  }>;
 };
 
 export async function createContext({ context, services }: CreateContextOptions) {

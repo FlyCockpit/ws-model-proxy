@@ -528,6 +528,16 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getPoolRoutingRules),
   },
   {
+    name: "forwarder_engine_load_history_get",
+    descriptionNote:
+      "30-minute live engine-load history (10 s buckets) for a pool or capacity the caller owns. Returns per-member series (max running/waiting/kvUsage/kvOccupancy/slotsBusy, summed prefix deltas, source, gap markers), signals, the effective KV FULL threshold, and reported K. kvOccupancy is display only. A foreign pool or capacity returns NOT_FOUND.",
+    target: "forwarderManagement.getEngineLoadHistory",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getEngineLoadHistory),
+  },
+  {
     name: "forwarder_model_pools_list",
     target: "forwarderManagement.listModelPools",
     scope: "read",
@@ -1352,8 +1362,8 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
 ];
 
 /**
- * The checked catalog: exactly 34 read tools and 60 write tools
- * (80 procedure-backed + 14 extracted cores: 2 diagnostics, 3 CLI commands
+ * The checked catalog: exactly 35 read tools and 60 write tools
+ * (81 procedure-backed + 14 extracted cores: 2 diagnostics, 3 CLI commands
  * and 9 node file tools (4 read, 5 write)).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS].map(

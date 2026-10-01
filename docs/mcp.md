@@ -113,6 +113,13 @@ Metric routing rules (S-B part 2):
   read); a changed command stops until it is approved
   again. stderr and command output never leave the CLI; only parsed numbers do.
 
+`forwarder_engine_load_history_get` (`{ poolId } | { capacityId }`) returns the
+30-minute live engine-load history (10 s buckets) for a pool or capacity the
+caller owns. Each member includes `series` (max `running` / `waiting` /
+`kvUsage` / `kvOccupancy` / `slotsBusy`, summed prefix deltas, `source`, and
+`gap` markers), `signals`, the effective KV FULL threshold, and reported K.
+`kvOccupancy` is display only. A foreign pool or capacity returns `NOT_FOUND`.
+
 `forwarder_pool_cache_stats_get` (`{ poolId, poolMemberId?, lastMinutes | lastDays,
 bucket?, split? }`) returns the prompt-cache hit rate for a pool, or one member,
 over a window ending now. `hitRate` is `cacheReadTokens / cacheKnownInputTokens`,

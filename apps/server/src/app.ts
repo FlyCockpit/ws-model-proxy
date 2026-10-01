@@ -5,7 +5,11 @@ import { onError } from "@orpc/server";
 import { RPCHandler } from "@orpc/server/fetch";
 import { SimpleCsrfProtectionHandlerPlugin } from "@orpc/server/plugins";
 import { ZodToJsonSchemaConverter } from "@orpc/zod/zod4";
-import { type Context as ApiContext, createContext } from "@ws-model-proxy/api/context";
+import {
+  type Context as ApiContext,
+  type ContextServices,
+  createContext,
+} from "@ws-model-proxy/api/context";
 import { appRouter } from "@ws-model-proxy/api/routers/index";
 import type { Session } from "@ws-model-proxy/auth";
 import { auth as defaultAuth } from "@ws-model-proxy/auth";
@@ -258,6 +262,10 @@ function cliContextServices() {
       relaySessionManager.getLiveCliFeatures(cliDeviceIds),
     getLiveNodeTelemetry: (cliDeviceIds: readonly string[]) =>
       relaySessionManager.getLiveNodeTelemetry(cliDeviceIds),
+    getLiveEngineLoadHistory: (
+      keys: Parameters<NonNullable<ContextServices["getLiveEngineLoadHistory"]>>[0],
+      now?: Date,
+    ) => relaySessionManager.getLiveEngineLoadHistory(keys, now),
     supervisedCommands: {
       listPending: listPendingSupervised,
       submitOutput: submitSupervisedOutput,
