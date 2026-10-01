@@ -635,6 +635,10 @@ describe("S-C engine facts (token mode and the llama.cpp window)", () => {
     ["VLLM", null, null],
     ["VLLM", 0, null],
     ["VLLM", -5, null],
+    ["VLLM", 1.5, null],
+    ["VLLM", Number.NaN, null],
+    ["VLLM", 2_147_483_647, 2_147_483_647],
+    ["VLLM", 2_147_483_648, null],
   ] as const)("%s with K=%s uses K=%s", (engineKind, reported, used) => {
     expect(protectionKvBudgetTokens(engineKind, reported)).toBe(used);
   });

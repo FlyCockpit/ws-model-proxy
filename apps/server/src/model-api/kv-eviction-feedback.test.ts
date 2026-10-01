@@ -9,6 +9,7 @@ import {
   KV_EVICTION_FLUSH_MIN_INTERVAL_MS,
   MAX_PENDING_CAPACITIES,
   qualifiesAsEvictionEvidence,
+  recordKvEvictionObservations,
 } from "./kv-eviction-feedback.js";
 
 const now = new Date("2026-09-30T12:00:00Z");
@@ -120,6 +121,37 @@ describe("eviction evidence", () => {
   ])("$name", ({ patch, expected }) =>
     expect(qualifiesAsEvictionEvidence({ ...valid, ...patch })).toBe(expected),
   );
+});
+
+function fakeDb() {
+  const $executeRaw = vi.fn(async () => 1);
+  return {
+    $executeRaw,
+    client: { $executeRaw } as unknown as NonNullable<
+      Parameters<typeof recordKvEvictionObservations>[1]
+    >,
+  };
+}
+
+describe("recordKvEvictionObservations input bounds", () => {
+  it.each([
+    { name: "empty capacity id", capacityId: "", ownerId: "o", at: now },
+    { name: "129-character capacity id", capacityId: "c".repeat(129), ownerId: "o", at: now },
+    { name: "empty owner", capacityId: "c", ownerId: "", at: now },
+    { name: "invalid time", capacityId: "c", ownerId: "o", at: new Date(Number.NaN) },
+  ])("$name writes nothing", async ({ capacityId, ownerId, at }) => {
+    const db = fakeDb();
+    await recordKvEvictionObservations({ capacityId, ownerId, count: 1, now: at }, db.client);
+    expect(db.$executeRaw).not.toHaveBeenCalled();
+  });
+  it("a 128-character capacity id is written", async () => {
+    const db = fakeDb();
+    await recordKvEvictionObservations(
+      { capacityId: "c".repeat(128), ownerId: "o", count: 1, now },
+      db.client,
+    );
+    expect(db.$executeRaw).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("buffered recorder", () => {

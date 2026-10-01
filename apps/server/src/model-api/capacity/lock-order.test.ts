@@ -145,6 +145,8 @@ const HOT_PATH_WRITERS: Record<string, string> = {
   "apps/server/src/model-api/public-overflow.ts": "H: external-provider relay status",
   "apps/server/src/model-api/provider-budget.ts": "H: provider budget admission and accounting",
   "apps/server/src/model-api/provider-attempt-runtime.ts": "H: provider attempt telemetry",
+  "apps/server/src/model-api/kv-eviction-feedback.ts":
+    "H: disposable KV eviction feedback (one owner-guarded single-statement upsert, no fence)",
   "apps/server/src/model-api/usage-rollup.ts": "H: relay finalization and rollups",
   "apps/server/src/model-api/relay-telemetry-recovery.ts": "H/S: relay crash repair",
   "apps/server/src/model-api/usage-retention.ts": "S: relay and rollup retention",
