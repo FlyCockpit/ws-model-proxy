@@ -15,9 +15,10 @@
 //! enter recovery for delete: kernel rmdir only removes empty directories, so a
 //! racer's saved contents cannot be removed. A file/symlink delete fails closed on
 //! ANY recovery mkdir failure (including ENOSPC/EDQUOT/EMLINK); free space using the
-//! shell. macOS mode-000 files may lack an openable Held and refuse EACCES before
-//! capture; Linux O_PATH is unaffected. On Unix targets other than Linux and macOS a
-//! symlink cannot be held, so a symlink delete there refuses the same way.
+//! shell. A file the CLI user cannot open read-only (for example mode 000 or 0200)
+//! has no Held on macOS and other Unix and refuses before capture with the real open
+//! errno; so does a symlink on Unix targets other than Linux and macOS (it cannot be
+//! held, EACCES). Linux O_PATH is unaffected.
 //!
 //! The vacant-name interval is a bounded number of syscalls, not a time promise:
 //! scheduler/network delays or a crash can extend it. Readers see ENOENT. Publication
@@ -106,13 +107,19 @@ pub(super) struct Slot {
 pub(super) struct Held {
     fd: Option<OwnedFd>,
     pub(super) stat: Stat,
+    /// Why the object could not be opened (none for kinds that are never opened).
+    open_error: Option<Errno>,
 }
 
 impl Held {
     pub(super) fn from_file(file: &std::fs::File) -> FileResult<Self> {
         let fd = OwnedFd::from(file.try_clone()?);
         let stat = Stat::from_raw(&fstat(fd.as_fd()).map_err(FileError::errno)?);
-        Ok(Self { fd: Some(fd), stat })
+        Ok(Self {
+            fd: Some(fd),
+            stat,
+            open_error: None,
+        })
     }
 
     pub(super) fn open(dir: &OwnedFd, name: &OsStr, stat: Stat) -> FileResult<Self> {
@@ -125,7 +132,13 @@ impl Held {
             #[cfg(target_os = "macos")]
             // nix does not name O_SYMLINK; retain the platform's flag bit.
             Kind::Symlink => OFlag::from_bits_retain(nix::libc::O_SYMLINK) | OFlag::O_RDONLY,
-            _ => return Ok(Self { fd: None, stat }),
+            _ => {
+                return Ok(Self {
+                    fd: None,
+                    stat,
+                    open_error: None,
+                });
+            }
         };
         let opened = openat(dir.as_fd(), name, flags | OFlag::O_CLOEXEC, Mode::empty());
         #[cfg(target_os = "linux")]
@@ -141,14 +154,26 @@ impl Held {
                 Err(errno)
             }
         });
-        let fd = fault(Primitive::Hold).and(opened).ok();
+        let (fd, open_error) = match fault(Primitive::Hold).and(opened) {
+            Ok(fd) => (Some(fd), None),
+            Err(errno) => (None, Some(errno)),
+        };
         if let Some(fd) = &fd {
             let opened = Stat::from_raw(&fstat(fd.as_fd()).map_err(FileError::errno)?);
             if !opened.same_object(&stat) {
                 return Err(FileError::conflict("replaced"));
             }
         }
-        Ok(Self { fd, stat })
+        Ok(Self {
+            fd,
+            stat,
+            open_error,
+        })
+    }
+
+    /// The errno of a failed open (none when the kind is never opened).
+    pub(super) fn open_error(&self) -> Option<Errno> {
+        self.open_error
     }
 
     pub(super) fn is_held(&self) -> bool {
@@ -366,14 +391,33 @@ impl RecoveryDir {
                 .map_err(FileError::errno)?,
         };
         self.remember(self.path.join(&alias.name));
-        // Both names remain private. Dispose closes the sole Held on T before
-        // unlink; reopen the surviving tmp name to prove subsequent publication.
-        if !self.dispose(ops, &alias, identity) {
+        // Both names remain private. Names of one inode need not report one inode
+        // number (FUSE without stable inodes, for example sshfs), so each private
+        // name is proven by a proof opened on THAT name, never by comparing across
+        // names. T's own proof closes before the alias unlink (no own descriptor on
+        // the inode at an unlink), then the surviving name is re-held.
+        let alias_stat = fstatat(
+            self.dir.as_fd(),
+            alias.name.as_os_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .map_err(FileError::errno)?;
+        let mut alias_held = Held::open(&self.dir, &alias.name, Stat::from_raw(&alias_stat))?;
+        identity.release();
+        if !self.dispose(ops, &alias, &mut alias_held) {
             return Err(self.uncertain());
         }
-        *identity = Held::open(&self.dir, &slot.name, identity.stat)?;
+        let tmp_stat = fstatat(
+            self.dir.as_fd(),
+            slot.name.as_os_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .map_err(FileError::errno)?;
+        *identity = Held::open(&self.dir, &slot.name, Stat::from_raw(&tmp_stat))?;
         if !identity.is_held() {
-            return Err(FileError::errno(Errno::EACCES));
+            return Err(FileError::errno(
+                identity.open_error().unwrap_or(Errno::EACCES),
+            ));
         }
         Ok(PublishMethod::Link)
     }
@@ -940,6 +984,7 @@ mod tests {
         let mut held = Held {
             fd: None,
             stat: Stat::from_metadata(&std::fs::metadata(&path).unwrap()),
+            open_error: None,
         };
         let mut recovery = RecoveryDir::new(&parent, &fx.root).unwrap();
         let slot = recovery.capture(&parent, "sample".as_ref(), &path).unwrap();
@@ -1212,7 +1257,7 @@ mod tests {
         drop(file);
         let _scope = FaultScope::new(&[
             (Primitive::ProbeNoReplace, 1, Errno::EINVAL),
-            (Primitive::Hold, 1, Errno::EACCES),
+            (Primitive::Hold, 2, Errno::EACCES),
         ]);
         let error = recovery
             .probe_publish(&fx.ops, &mut tmp, &mut identity)

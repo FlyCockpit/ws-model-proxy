@@ -988,9 +988,13 @@ fn exchangeless_delete_capture_enoent_is_conflict_gone_without_recovery() {
 #[test]
 fn exchangeless_delete_refuses_mkdir_and_unheld_failures_before_capture() {
     for kind in DELETE_KINDS {
-        for (primitive, errno) in [
-            (Primitive::Mkdir, Errno::ENOSPC),
-            (Primitive::Hold, Errno::EACCES),
+        // The refusal reports the REAL open errno; a name that vanished since the
+        // lstat is a conflict ("gone"), never a fabricated EACCES.
+        for (primitive, errno, expected) in [
+            (Primitive::Mkdir, Errno::ENOSPC, ErrorCode::IoError),
+            (Primitive::Hold, Errno::EACCES, ErrorCode::IoError),
+            (Primitive::Hold, Errno::EMFILE, ErrorCode::IoError),
+            (Primitive::Hold, Errno::ENOENT, ErrorCode::Conflict),
         ] {
             let fx = Fx::new();
             prepare_delete(&fx, kind);
@@ -998,11 +1002,12 @@ fn exchangeless_delete_refuses_mkdir_and_unheld_failures_before_capture() {
             let _scope = FaultScope::new(&[(primitive, 1, errno)]);
             let error = delete(&fx).unwrap_err();
             assert_eq!(
-                error.code,
-                ErrorCode::IoError,
-                "{kind:?}/{primitive:?}: {error:?}"
+                error.code, expected,
+                "{kind:?}/{primitive:?}/{errno:?}: {error:?}"
             );
-            assert_eq!(error.message, format!("{errno:?}"));
+            if expected == ErrorCode::IoError {
+                assert_eq!(error.message, format!("{errno:?}"));
+            }
             assert_eq!(snapshot(&fx.root), before);
             assert_eq!(count(&FaultScope::calls(), Primitive::Capture), 0);
             clean(&fx);
@@ -1332,6 +1337,8 @@ fn exchangeless_real_filesystem_optional_e2e() {
         .expect("print optional filesystem skip diagnostic");
         return;
     };
+    // Optional declared mount class (nr | link | none): per-class assertions.
+    let class = std::env::var("WSMP_EXCHANGELESS_CLASS").ok();
     fn fixture(directory: &Path) -> Fx {
         let dir = tempfile::tempdir_in(directory)
             .expect("create isolated test directory on supplied filesystem");
@@ -1400,6 +1407,11 @@ fn exchangeless_real_filesystem_optional_e2e() {
             });
             match op.run(&fx, &etag) {
                 Ok(value) => {
+                    assert_ne!(
+                        class.as_deref(),
+                        Some("none"),
+                        "a mount with neither primitive must refuse"
+                    );
                     assert_eq!(
                         fx.get("doc"),
                         if race == Some(Step::Renamed) {
@@ -1412,6 +1424,16 @@ fn exchangeless_real_filesystem_optional_e2e() {
                     clean(&fx);
                 }
                 Err(error) if error.code == ErrorCode::UnsafeFilesystem => {
+                    assert_ne!(
+                        class.as_deref(),
+                        Some("nr"),
+                        "a NOREPLACE-capable mount must publish: {error:?}"
+                    );
+                    assert_ne!(
+                        class.as_deref(),
+                        Some("link"),
+                        "a link-capable mount must publish: {error:?}"
+                    );
                     assert_eq!(snapshot(&fx.root), before);
                     clean(&fx);
                 }

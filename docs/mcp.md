@@ -227,10 +227,10 @@ the inspected object is restored without overwriting a newer name, or kept and
 reported. A concurrent create at the now-vacant name survives. This adds one
 mkdir/rmdir pair per file/symlink delete. Any recovery mkdir failure, including
 ENOSPC, EDQUOT or EMLINK, fails closed with `io_error` and leaves the file unchanged;
-free space with the shell. On macOS, a mode-000 file that cannot be held refuses
-with EACCES (`io_error`) before capture, with its public name unchanged. Linux's
-O_PATH hold is unaffected. On Unix targets other than Linux and macOS a symlink cannot
-be held, so deleting one there refuses the same way (`io_error`, nothing changed). Directories are never captured for delete: a held
+free space with the shell. On macOS and other Unix, a file the CLI user cannot open
+read-only (for example mode 000 or 0200) cannot be held and refuses before capture
+with its real open errno (`io_error`, e.g. EACCES), public name unchanged; so does a
+symlink on Unix targets other than Linux and macOS. Linux's O_PATH hold is unaffected. Directories are never captured for delete: a held
 identity recheck is followed by rmdir by name. The kernel can remove only an
 empty directory, so this cannot destroy a concurrent save; at worst it removes
 a racer's empty directory. Non-empty directories are refused, and delete never

@@ -26,8 +26,8 @@
 //! has a brief exposed alias window (failed cleanup leaves nlink 2/hard_linked).
 //! Vacancies are bounded by syscalls, not time; filesystem NOREPLACE/link atomicity
 //! is trusted. Delete needs R and fails closed on mkdir ENOSPC/EDQUOT/EMLINK or any
-//! error; free space using the shell. macOS mode-000 files may refuse EACCES before
-//! capture. See `recovery` for platform facts and manual recovery. Case-only rename,
+//! error; free space using the shell. Files the CLI user cannot open read-only
+//! (macOS and other Unix: mode 000 or 0200) refuse before capture. See `recovery` for platform facts and manual recovery. Case-only rename,
 //! exclusive-create, rollback_created and exchange-less overwrite refusal remain
 //! separate residuals; in-place writes after etag reads remain unprotected.
 
@@ -942,7 +942,14 @@ pub(crate) fn delete(
     // must fail before any public move (notably unreadable mode-000 on macOS).
     let mut held = Held::open(&resolved.dir, &resolved.name, st)?;
     if st.kind() != Kind::Dir && !held.is_held() {
-        return Err(FileError::errno(Errno::EACCES));
+        // Nothing moved. Report the real open failure; a name that vanished
+        // since the lstat is a conflict, and a kind that is never opened (a
+        // symlink on Unix other than Linux/macOS) keeps EACCES.
+        return Err(match held.open_error() {
+            Some(Errno::ENOENT) => FileError::conflict("gone"),
+            Some(errno) => FileError::errno(errno),
+            None => FileError::errno(Errno::EACCES),
+        });
     }
     if let Some(expected) = &args.expected_etag {
         match object_etag(ops, &resolved, &st, cancel)? {
