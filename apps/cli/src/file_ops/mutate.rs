@@ -1,48 +1,50 @@
 //! `forwarder_cli_file_rename`, `forwarder_cli_dir_create`,
 //! `forwarder_cli_file_delete`: the small mutating tools.
 //!
-//! Plain and overwrite rename use recovery and can return uncertain_outcome
-//! or recovered paths on success. Overwrite vacates the source into a private
-//! slot, verifies its held fd, then exchanges that slot with the destination.
-//! The exchanged-out object therefore has destination origin by construction.
-//! A proven source captured during undo returns to its recorded source origin;
-//! a newer destination writer returns to destination, keeping the older object
-//! in recovery. Exchange failure restores source; unsupported exchange returns
-//! unsafe_filesystem without a plain overwrite fallback. Plain rename uses only
-//! NOREPLACE or hard links; absent both it refuses with the same code. File/symlink
-//! delete captures into R and verifies Held before disposal; a concurrent successor
-//! is restored or reported, never unlinked. Directory delete stays by-name rmdir:
-//! the kernel emptiness check cannot destroy a racer's saved contents.
+//! Recovery owns overwrite and exchange-less plain rename in one transaction.
+//! Overwrite preflights before any public capture: exchange/NR private dummies,
+//! then link probes on the actual source and destination. Exchange-less overwrite
+//! vacates both into R, proves held identity, and publishes source fail-if-exists.
+//! Plain link rename vacates/proves source first; direct NR needs no R. Link
+//! publication uses own-name proofs, never cross-link inode equality; returned
+//! etags bind the published bytes/mtime to the admitted source. Unpublished user
+//! sources are restored only to source or kept, never disposed as generated temps.
+//! Directories never overwrite, use NR only, and own-subtree moves are invalid_input.
+//! File/symlink delete captures/proves before disposal; directory delete uses the
+//! kernel's empty-only rmdir rule. Cancellation ends before first capture.
 //!
-//! Recovery residuals: (a) a guessed private-slot replacement between held-fd
-//! proof and unlinkat; (a2) plain-rename capture fallback overwriting a squatter
-//! after the private slot was checked absent; (b) public names briefly vacant
-//! during undo; (b2) overwrite's source is vacant from capture through operation
-//! end, so a concurrent source create survives on success and is kept/reported
-//! with uncertainty if it blocks restoration; (d) crashes leave original plus T
-//! (tmp/probe) in R with a vacant name, a captured delete with its name vacant, or
-//! both links; (e) unheld objects are never deleted; (f) another process's open NFS
-//! fd can leave .nfs residue, while ours close BEFORE unlink; (g) link-published T
-//! has a brief exposed alias window (failed cleanup leaves nlink 2/hard_linked).
-//! Vacancies are bounded by syscalls, not time; filesystem NOREPLACE/link atomicity
-//! is trusted. Delete needs R and fails closed on mkdir ENOSPC/EDQUOT/EMLINK or any
-//! error; free space using the shell. Files the CLI user cannot open read-only
-//! (macOS and other Unix: mode 000 or 0200) refuse before capture. See `recovery` for platform facts and manual recovery. Case-only rename,
-//! exclusive-create, rollback_created and exchange-less overwrite refusal remain
-//! separate residuals; in-place writes after etag reads remain unprotected.
+//! Recovery residuals: (a) same-user private-slot replacement between held proof,
+//! close and unlink; (a2) absent-private-slot plain capture permits a squatter race;
+//! (b) vacant public names during undo; (b2) recovery rename's source vacant from
+//! capture to operation end, plus destination vacancy on exchange-less overwrite.
+//! Concurrent creates survive, and blocked restoration reports uncertain_outcome.
+//! (d) crashes leave S/D, partial temp/probes or preflight dummies in R, possibly
+//! with vacant names or two published/private links; R/s/d are logged before capture,
+//! with no intent file or replay; (e) unheld objects never authorize deletion;
+//! (f) another process's NFS fd can leave .nfs residue (own fds close before unlink,
+//! except pinned source proof through probe-alias unlink on per-vnode clients);
+//! (g) replace/rename expose a link before alias cleanup: on a mount with believable
+//! link counts (probed per operation) a count < 2 keeps the last alias, but a writer and
+//! third save after that check, or on a mount whose counts mean nothing, can orphan it.
+//! Retained aliases can cause nlink 2/hard_linked until manual cleanup.
+//! Vacancies are bounded by syscalls, not time; filesystem atomicity is trusted.
+//! Recovery mkdir errors fail closed; unreadable macOS/other-Unix files refuse
+//! before capture with their actual open errno. Separate residuals: case-only
+//! rename, public exclusive-create, rollback_created, R privacy/report bounds,
+//! and in-place writes after etag reads. See `recovery` for manual recovery.
 
 use std::ffi::OsStr;
 use std::os::fd::AsFd;
 
 use nix::errno::Errno;
-use nix::fcntl::{AtFlags, renameat};
-use nix::sys::stat::{fstat, mkdirat};
-use nix::unistd::{UnlinkatFlags, linkat, unlinkat};
+use nix::fcntl::{OFlag, openat, readlinkat, renameat};
+use nix::sys::stat::{Mode, fstat, mkdirat};
+use nix::unistd::{UnlinkatFlags, unlinkat};
 use serde::{Deserialize, Serialize};
 
 use super::atomic::perm_mode;
 use super::error::{ErrorCode, FileError, FileResult};
-use super::exchange::{Primitive, is_link_unsupported, is_unsupported, no_replace, run};
+use super::exchange::{Primitive, is_unsupported, no_replace};
 use super::policy::Access;
 use super::read::current_etag;
 use super::recovery::{Held, Origin, RecoveryDir};
@@ -56,9 +58,8 @@ use super::{Cancel, FileOps, Step, check_reason};
 pub(crate) enum RenameAtomicCapability {
     HardLinksOnly = 0,
     Kernel = 1,
-    /// macOS: atomic exchange replaces a checked destination, regular files move
-    /// without replacing through link + unlink, and directories have no atomic
-    /// no-replace primitive (refused for supervised requests).
+    /// macOS files try EXCL then the recovery link fallback; the existing
+    /// supervised directory gate remains refused.
     LinksAndExchange = 3,
     #[cfg(test)]
     Unavailable = 2,
@@ -302,6 +303,13 @@ fn rename_impl(
             "special files are not moved",
         ));
     }
+    if src.kind() == Kind::Dir
+        && (to.dir_path.starts_with(from.full_path()) || destination_inside_source(&src, &to.dir))
+    {
+        return Err(FileError::invalid(
+            "cannot move a directory into its own subtree",
+        ));
+    }
     let src = Held::open(&from.dir, &from.name, src)?;
     ops.step(Step::BeforeIdentity)?;
     ops.policy.check_identity(Access::Remove, &src.stat)?;
@@ -367,15 +375,66 @@ fn rename_impl(
         ops.step(Step::SupervisedPinVerified)?;
     }
     cancel.check()?;
-    let recovered = commit_rename(ops, &from, &to, overwrite, src, dst, supervised)?;
-    Ok(RenameResult {
-        etag: src_etag,
-        recovered,
-    })
+    let source_stat = src.stat;
+    let source_target = if source_stat.kind() == Kind::Symlink {
+        Some(readlinkat(from.dir.as_fd(), from.name.as_os_str()).map_err(FileError::errno)?)
+    } else {
+        None
+    };
+    let (recovered, linked) =
+        commit_rename(ops, &from, &to, overwrite, src, dst, supervised, cancel)?;
+    let etag = if linked {
+        published_etag(
+            ops,
+            &to,
+            &source_stat,
+            src_etag.as_deref(),
+            source_target.as_deref(),
+        )
+        .ok()
+        .flatten()
+    } else {
+        src_etag
+    };
+    Ok(RenameResult { etag, recovered })
+}
+
+/// True when `dest_parent` is the source directory or a descendant of it.
+/// Uses inode identity so a case-insensitive volume still refuses, even when
+/// the UTF-8 prefix check does not match.
+fn destination_inside_source(source: &Stat, dest_parent: impl AsFd) -> bool {
+    let Ok(mut fd) = dest_parent.as_fd().try_clone_to_owned() else {
+        return false;
+    };
+    for _ in 0..256 {
+        let Ok(raw) = fstat(fd.as_fd()) else {
+            return false;
+        };
+        let current = Stat::from_raw(&raw);
+        if current.same_object(source) {
+            return true;
+        }
+        let Ok(parent) = openat(
+            fd.as_fd(),
+            "..",
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) else {
+            return false;
+        };
+        let Ok(parent_raw) = fstat(parent.as_fd()) else {
+            return false;
+        };
+        if Stat::from_raw(&parent_raw).same_object(&current) {
+            return false;
+        }
+        fd = parent;
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SameObjectRename {
+pub(super) enum SameObjectRename {
     Refuse,
     CaseOnlyRename,
     NotSameObject,
@@ -399,7 +458,7 @@ enum SameObjectRename {
 /// the alias is one entry plus a same-user racer creating a second entry under
 /// the other spelling inside the microsecond check-to-rename window. The checks
 /// are snapshots, not POSIX exclusion against external processes.
-fn same_object_rename(
+pub(super) fn same_object_rename(
     src: &Stat,
     dst: &Stat,
     from_dir: &Stat,
@@ -650,11 +709,11 @@ mod same_object_rename_tests {
 
 /// Sole overwrite gate for rename: classify same-object pairs before allocating
 /// recovery. Case-only aliases use plain renameat with no recovery directory;
-/// other commits allocate one private recovery directory before mutation. Public
+/// other overwrites allocate one private recovery directory before mutation. Public
 /// names are never unlinked or blindly swapped during compensation.
 ///
-/// Plain rename also uses recovery. Both paths can return uncertain_outcome or
-/// recovered on success. The module docs and `recovery` describe the held-fd
+/// Plain rename uses recovery only for fallback or compensation. Both paths can
+/// return uncertain_outcome or recovered on success. The module docs and `recovery` describe the held-fd
 /// proof, fallback behavior and exact residual windows. Unsupported directory
 /// moves and link-less no-replace operations refuse without a public effect.
 /// Case-only rename has the separate check-to-rename residual in
@@ -668,7 +727,8 @@ fn commit_rename(
     mut src: Held,
     mut dst: Option<Held>,
     supervised: bool,
-) -> FileResult<Vec<String>> {
+    cancel: &Cancel,
+) -> FileResult<(Vec<String>, bool)> {
     if overwrite && let Some(dst) = &dst {
         let from_dir = Stat::from_raw(&fstat(from.dir.as_fd()).map_err(FileError::errno)?);
         let to_dir = Stat::from_raw(&fstat(to.dir.as_fd()).map_err(FileError::errno)?);
@@ -688,56 +748,163 @@ fn commit_rename(
                     to.name.as_os_str(),
                 )
                 .map_err(FileError::errno)?;
-                return Ok(Vec::new());
+                return Ok((Vec::new(), false));
             }
             SameObjectRename::NotSameObject => {}
         }
     }
-    let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path)?;
-    let result = match (overwrite, dst.as_mut()) {
-        (true, Some(dst)) => exchange_over(ops, &mut recovery, from, to, &mut src, dst),
-        _ => {
-            // Track the actual candidate after the final hook as well as the
-            // checked source. This snapshot is never authority to unlink a
-            // public name; it only permits NOREPLACE restoration from recovery.
-            let candidate = from.lstat().and_then(|stat| {
-                stat.map(|stat| Held::open(&from.dir, &from.name, stat))
-                    .transpose()
-            });
-            match candidate {
-                Ok(Some(mut candidate)) => {
+    // A supported direct NR move requires no private directory (notably APFS
+    // supervised files). Only HardLinksOnly deliberately skips the kernel rung.
+    let mut candidate = None;
+    if !(overwrite && dst.is_some()) {
+        if !supervised || ops.rename_atomic_capability() != RenameAtomicCapability::HardLinksOnly {
+            candidate = from
+                .lstat()?
+                .map(|stat| Held::open(&from.dir, &from.name, stat))
+                .transpose()?;
+            match no_replace(
+                from.dir.as_fd(),
+                &from.name,
+                to.dir.as_fd(),
+                &to.name,
+                Primitive::Move,
+            ) {
+                Ok(()) => {
+                    let _ = ops.step(Step::Moved);
+                    if matches!(to.lstat(), Ok(Some(now)) if src.matches_for_restore(&now)) {
+                        return Ok((Vec::new(), false));
+                    }
+                    let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path)?;
                     let origin = Origin::new(&from.dir, &from.name, &from.full_path())
                         .map_err(FileError::errno)?;
-                    move_no_replace(
-                        ops,
-                        &mut recovery,
-                        from,
-                        to,
-                        &mut src,
-                        &mut candidate,
-                        supervised,
-                    )
-                    .and_then(|()| {
-                        verify_moved(ops, &mut recovery, to, &mut src, &mut candidate, origin)
-                    })
+                    let result = match candidate.as_mut() {
+                        Some(candidate) => {
+                            verify_moved(ops, &mut recovery, to, &mut src, candidate, origin)
+                        }
+                        None => Err(recovery.uncertain()),
+                    };
+                    drop(src);
+                    drop(candidate);
+                    drop(dst);
+                    return finish_move(&mut recovery, result.map(|()| false));
                 }
-                Ok(None) => Err(FileError::conflict("gone")),
-                Err(error) => Err(error),
+                Err(Errno::EEXIST) => return Err(exists_error()),
+                Err(errno) if is_unsupported(errno) => {}
+                Err(errno) => return Err(FileError::errno(errno)),
             }
         }
-    };
-    // Close every held fd before the recovery directory is removed: a network
-    // filesystem (NFS) silly-renames an unlinked-but-open file into the directory
-    // and rmdir would fail until the last descriptor is closed.
+        if src.stat.kind() == Kind::Dir {
+            return Err(FileError::unsafe_filesystem());
+        }
+    }
+    if !src.is_held() {
+        return Err(unheld_error(&src));
+    }
+    if let Some(dst) = &dst
+        && !dst.is_held()
+    {
+        return Err(unheld_error(dst));
+    }
+    drop(candidate); // fallback owns just S/D, never a duplicate candidate proof
+    let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path)?;
+    let result = recovery
+        .preflight_move(ops, from, to, &src, dst.as_ref())
+        .and_then(|method| {
+            recovery.commit_move(ops, from, to, &mut src, dst.as_mut(), method, cancel)
+        });
     drop(src);
     drop(dst);
+    finish_move(&mut recovery, result)
+}
+
+fn unheld_error(held: &Held) -> FileError {
+    match held.open_error() {
+        Some(Errno::ENOENT) => FileError::conflict("gone"),
+        Some(errno) => FileError::errno(errno),
+        None => FileError::errno(Errno::EACCES),
+    }
+}
+
+fn finish_move(
+    recovery: &mut RecoveryDir,
+    result: FileResult<bool>,
+) -> FileResult<(Vec<String>, bool)> {
     let recovered = recovery.finish();
     match result {
-        Ok(()) => Ok(recovered),
+        Ok(linked) => Ok((recovered, linked)),
         Err(error) if error.code == ErrorCode::UncertainOutcome || !recovery.settled() => {
             Err(recovery.uncertain())
         }
         Err(error) => Err(error),
+    }
+}
+
+/// A link gives d its own presented inode. Bind its bytes/mtime to the admitted
+/// source etag before returning d's etag; a later save cannot grant edit authority.
+fn published_etag(
+    ops: &FileOps,
+    to: &Resolved,
+    src: &Stat,
+    admitted: Option<&str>,
+    target: Option<&OsStr>,
+) -> FileResult<Option<String>> {
+    let Some(now) = to.lstat()? else {
+        return Ok(None);
+    };
+    if now.kind() != src.kind() {
+        return Ok(None);
+    }
+    let same_snapshot = |stat: &Stat| {
+        stat.size == src.size
+            && stat.mtime_secs == src.mtime_secs
+            && stat.mtime_nanos == src.mtime_nanos
+    };
+    match now.kind() {
+        Kind::File => {
+            let (mut file, opened) = to.open_regular(&ops.policy, Access::Read)?;
+            if !opened.same_object(&now) {
+                return Ok(None);
+            }
+            let mut binding = opened;
+            binding.dev = src.dev;
+            binding.ino = src.ino;
+            let fresh = Cancel::new(); // committed result reads ignore late cancellation
+            let (bound, etag) = if admitted.is_some_and(|etag| etag.starts_with("h:")) {
+                let bytes = super::read::load_all(
+                    &mut file,
+                    &opened,
+                    super::etag::STRONG_ETAG_MAX_BYTES,
+                    &fresh,
+                )?;
+                (
+                    ops.key.strong(&binding, &bytes),
+                    ops.key.strong(&opened, &bytes),
+                )
+            } else {
+                if !same_snapshot(&opened) {
+                    return Ok(None);
+                }
+                (ops.key.weak_stat(&binding), ops.key.weak_stat(&opened))
+            };
+            if admitted != Some(bound.as_str()) {
+                return Ok(None);
+            }
+            Ok(Some(etag))
+        }
+        Kind::Symlink => {
+            if !same_snapshot(&now)
+                || target
+                    != Some(
+                        readlinkat(to.dir.as_fd(), to.name.as_os_str())
+                            .map_err(FileError::errno)?
+                            .as_os_str(),
+                    )
+            {
+                return Ok(None);
+            }
+            Ok(Some(ops.key.weak_stat(&now)))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -751,7 +918,6 @@ fn verify_moved(
     candidate: &mut Held,
     origin: Origin,
 ) -> FileResult<()> {
-    let _ = ops.step(Step::Moved);
     match to.lstat() {
         Ok(Some(now)) if src.matches_for_restore(&now) => Ok(()),
         _ => {
@@ -777,223 +943,8 @@ fn verify_moved(
     }
 }
 
-/// Rename without replacing an existing destination. The link fallback also
-/// captures its source before disposal, and captures its destination on undo.
-fn move_no_replace(
-    ops: &FileOps,
-    recovery: &mut RecoveryDir,
-    from: &Resolved,
-    to: &Resolved,
-    src: &mut Held,
-    candidate: &mut Held,
-    supervised: bool,
-) -> FileResult<()> {
-    if !supervised || ops.rename_atomic_capability() == RenameAtomicCapability::Kernel {
-        match no_replace(
-            from.dir.as_fd(),
-            from.name.as_os_str(),
-            to.dir.as_fd(),
-            to.name.as_os_str(),
-            Primitive::Move,
-        ) {
-            Ok(()) => return Ok(()),
-            Err(Errno::EEXIST) => return Err(exists_error()),
-            Err(errno) if is_unsupported(errno) => {}
-            Err(errno) => return Err(FileError::errno(errno)),
-        }
-    }
-    if src.stat.kind() == Kind::Dir {
-        return Err(FileError::unsafe_filesystem());
-    }
-    match run(Primitive::MoveLink, || {
-        linkat(
-            from.dir.as_fd(),
-            from.name.as_os_str(),
-            to.dir.as_fd(),
-            to.name.as_os_str(),
-            AtFlags::empty(),
-        )
-    }) {
-        Ok(()) => {}
-        Err(Errno::EEXIST) => return Err(exists_error()),
-        Err(errno) if is_link_unsupported(errno) => return Err(FileError::unsafe_filesystem()),
-        Err(errno) => return Err(FileError::errno(errno)),
-    }
-    let _ = ops.step(Step::Linked);
-    let Some(x) = recovery.capture(&from.dir, &from.name, &from.full_path()) else {
-        recovery.record_public(&to.dir, &to.name, &to.full_path());
-        return Err(recovery.uncertain());
-    };
-    let _ = ops.step(Step::Captured);
-    if recovery.matches_for_restore(&x, src)
-        && matches!(to.lstat(), Ok(Some(now)) if src.matches_for_restore(&now))
-    {
-        if candidate.stat.same_object(&src.stat) {
-            candidate.release();
-        }
-        recovery.dispose(ops, &x, src);
-        return Ok(());
-    }
-    // Keep the actual source under its original name if still vacant. Remove
-    // the new link only when the captured object proves it is our source.
-    if recovery.holds(&x, src) {
-        src.release(); // restore may dispose its private link alias
-    }
-    if recovery.holds(&x, candidate) {
-        candidate.release();
-    }
-    if recovery.restore(ops, &x) {
-        let _ = ops.step(Step::Restored);
-    }
-    if let Some(y) = recovery.capture(&to.dir, &to.name, &to.full_path()) {
-        let _ = ops.step(Step::Captured);
-        recovery.dispose(ops, &y, src);
-    }
-    if recovery.settled() {
-        Err(FileError::conflict("replaced"))
-    } else {
-        Err(recovery.uncertain())
-    }
-}
-
 fn exists_error() -> FileError {
     FileError::new(ErrorCode::Exists, "the destination already exists")
-}
-
-/// An overwrite has no non-atomic fallback: a filesystem without exchange refuses
-/// it as unsafe_filesystem and every other errno is its own error.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn overwrite_exchange_error(errno: Errno) -> FileError {
-    if is_unsupported(errno) {
-        FileError::unsafe_filesystem()
-    } else {
-        FileError::errno(errno)
-    }
-}
-
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-mod exchange_error_tests {
-    use super::*;
-
-    #[test]
-    fn overwrite_refuses_an_exchange_less_filesystem_as_unsafe_only() {
-        for errno in [Errno::EINVAL, Errno::ENOSYS, Errno::ENOTSUP] {
-            assert_eq!(
-                overwrite_exchange_error(errno).code,
-                ErrorCode::UnsafeFilesystem
-            );
-        }
-        for errno in [Errno::EPERM, Errno::EXDEV, Errno::EACCES, Errno::EIO] {
-            assert_ne!(
-                overwrite_exchange_error(errno).code,
-                ErrorCode::UnsafeFilesystem,
-                "{errno}"
-            );
-        }
-    }
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn exchange_over(
-    ops: &FileOps,
-    recovery: &mut RecoveryDir,
-    from: &Resolved,
-    to: &Resolved,
-    src: &mut Held,
-    dst: &mut Held,
-) -> FileResult<()> {
-    // Capture before exchanging: the public source is never used as a staging
-    // slot for the destination. Its vacancy is the documented window (b2).
-    // Crash window: between this capture and the exchange the source exists only
-    // inside the recovery directory, so say where (daemon log) before moving it.
-    tracing::info!(
-        recovery = %recovery.path().display(),
-        "overwrite rename: the source is held in the recovery directory until the exchange completes"
-    );
-    let mark = recovery.checkpoint();
-    let Some(mut x) = recovery.capture(&from.dir, &from.name, &from.full_path()) else {
-        // A refused rename moved nothing: an ordinary error, nothing to recover.
-        return Err(match recovery.abort_capture(mark) {
-            Some(errno) => overwrite_exchange_error(errno),
-            None => recovery.uncertain(),
-        });
-    };
-    let _ = ops.step(Step::Captured);
-    if !recovery.holds(&x, src) {
-        src.release();
-        dst.release();
-        if recovery.restore(ops, &x) {
-            let _ = ops.step(Step::Restored);
-        }
-        return if recovery.settled() {
-            Err(FileError::conflict("replaced"))
-        } else {
-            Err(recovery.uncertain())
-        };
-    }
-    let _ = ops.step(Step::Vacated);
-    let destination = Origin::new(&to.dir, &to.name, &to.full_path());
-    let source_origin = match destination.and_then(|origin| recovery.exchange(&mut x, origin)) {
-        Ok(origin) => origin,
-        Err(errno) => {
-            // An exchange that reported an error may still have taken effect: only
-            // a slot that still holds the checked source goes back to its name.
-            if recovery.holds(&x, src) {
-                src.release();
-                if recovery.restore(ops, &x) {
-                    let _ = ops.step(Step::Restored);
-                }
-            } else {
-                recovery.keep(&x);
-            }
-            // No plain overwrite fallback. The outer wrapper reports uncertainty
-            // if a concurrent source create or restore failure kept the source.
-            return Err(overwrite_exchange_error(errno));
-        }
-    };
-    let _ = ops.step(Step::Exchanged);
-    let _ = ops.step(Step::Captured);
-    if recovery.holds(&x, dst) {
-        recovery.dispose(ops, &x, dst);
-        return Ok(());
-    }
-    dst.release(); // proof failed; compensation may restore this inode
-    let y = recovery.capture(&to.dir, &to.name, &to.full_path());
-    if y.is_some() {
-        let _ = ops.step(Step::Captured);
-    }
-    if let Some(mut y) = y {
-        if recovery.holds(&y, src) {
-            // Proven S can reclaim only its recorded source origin from step 1.
-            if recovery.restore(ops, &x) {
-                let _ = ops.step(Step::Restored);
-            }
-            src.release();
-            if recovery.reclaim_origin(&mut y, src, source_origin) && recovery.restore(ops, &y) {
-                let _ = ops.step(Step::Restored);
-            }
-        } else if recovery.restore(ops, &y) {
-            // Newest writer returns to its captured destination origin; X stays.
-            let _ = ops.step(Step::Restored);
-        }
-    }
-    if recovery.settled() {
-        Err(FileError::conflict("replaced"))
-    } else {
-        Err(recovery.uncertain())
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn exchange_over(
-    _ops: &FileOps,
-    _recovery: &mut RecoveryDir,
-    _from: &Resolved,
-    _to: &Resolved,
-    _src: &mut Held,
-    _dst: &mut Held,
-) -> FileResult<()> {
-    Err(FileError::unsafe_filesystem())
 }
 
 pub(crate) fn mkdir(ops: &FileOps, args: &MkdirArgs, cancel: &Cancel) -> FileResult<MkdirResult> {

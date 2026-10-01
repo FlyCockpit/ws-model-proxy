@@ -360,4 +360,109 @@ mod tests {
         let d = diff_lines("a\nb", "a\nb\n");
         assert!(d.diff.contains("No newline at end of file"), "{}", d.diff);
     }
+
+    /// C3c-3: the provenance check is `hidden(before view) || hidden(after view)`.
+    /// Each half is pinned by a hand-built `ConsentText` that only that half
+    /// catches, independent of the edit planners (whose own guards keep carried
+    /// masked bytes masked in the after view and would otherwise hide a dead half).
+    #[test]
+    fn consent_provenance_halves_each_block_alone() {
+        use super::super::error::ErrorCode;
+        use super::super::redact::FileClass;
+        struct Row {
+            label: &'static str,
+            before: &'static str,
+            agent_prefix: &'static str,
+            disk: std::ops::Range<usize>,
+            masked_in_before: bool,
+            masked_in_after: bool,
+            blocked: bool,
+        }
+        let rows = [
+            // The carried bytes are a masked value on disk, but the surrounding
+            // key is gone in the after text, so only the BEFORE view hides them.
+            Row {
+                label: "before view only",
+                before: "--api-key value-one\n",
+                agent_prefix: "",
+                disk: 10..19,
+                masked_in_before: true,
+                masked_in_after: false,
+                blocked: true,
+            },
+            // The carried bytes are harmless on disk (`--port ...`) but the requester
+            // wraps them in a secret key: the AFTER view hides them, the disk
+            // text never held a secret. Intended over-block: either masked view.
+            Row {
+                label: "after view only",
+                before: "--port value-one\n",
+                agent_prefix: "--api-key ",
+                disk: 7..16,
+                masked_in_before: false,
+                masked_in_after: true,
+                blocked: true,
+            },
+            Row {
+                label: "both views",
+                before: "--api-key value-one\n",
+                agent_prefix: "--api-key ",
+                disk: 10..19,
+                masked_in_before: true,
+                masked_in_after: true,
+                blocked: true,
+            },
+            Row {
+                label: "neither view",
+                before: "--port value-one\n",
+                agent_prefix: "--other ",
+                disk: 7..16,
+                masked_in_before: false,
+                masked_in_after: false,
+                blocked: false,
+            },
+        ];
+        for row in rows {
+            let mut text = ConsentText::new(row.before);
+            text.push_agent(row.agent_prefix);
+            text.push_disk(row.disk.clone()).expect("range maps");
+            text.push_agent(" tail\n");
+            let before_view = super::super::redact::mask(FileClass::Plain, row.before);
+            let after_view = super::super::redact::mask(FileClass::Plain, text.as_str());
+            let hidden = |view: &super::super::redact::MaskedView,
+                          range: std::ops::Range<usize>| {
+                view.spans
+                    .iter()
+                    .any(|span| span.orig.start < range.end && range.start < span.orig.end)
+            };
+            let after_range = row.agent_prefix.len()..row.agent_prefix.len() + row.disk.len();
+            assert_eq!(
+                hidden(&before_view, row.disk.clone()),
+                row.masked_in_before,
+                "{}: fixture",
+                row.label
+            );
+            assert_eq!(
+                hidden(&after_view, after_range),
+                row.masked_in_after,
+                "{}: fixture",
+                row.label
+            );
+            let result = consent_diff(&text, FileClass::Plain);
+            if row.blocked {
+                assert_eq!(
+                    result.unwrap_err().code,
+                    ErrorCode::RedactedSpan,
+                    "{}",
+                    row.label
+                );
+            } else {
+                let screen = result.expect(row.label);
+                assert!(
+                    screen.contains("+--other value-one tail"),
+                    "{}: {screen}",
+                    row.label
+                );
+            }
+        }
+    }
 }

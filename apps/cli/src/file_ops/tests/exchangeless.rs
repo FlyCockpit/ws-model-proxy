@@ -531,8 +531,12 @@ fn exchangeless_replace_preserves_a_real_save_during_published_cleanup() {
                 "{op:?}/{method:?}: cleanup boundary did not fire"
             );
             assert_eq!(fx.get("doc"), RACER, "cleanup must use only private names");
-            assert!(value.get("recovered").is_none());
-            clean(&fx);
+            if matches!(method, PublishMethod::Link) {
+                assert!(has_bytes(&result_paths(&value), EDITED));
+            } else {
+                assert!(value.get("recovered").is_none());
+                clean(&fx);
+            }
         }
     }
 }
@@ -1163,7 +1167,8 @@ fn exchangeless_plain_rename_refuses_no_safe_primitive_without_changes() {
             let before = snapshot(&fx.root);
             let _scope = FaultScope::new(&[
                 (Primitive::Move, 1, Errno::EINVAL),
-                (Primitive::MoveLink, 1, link_errno),
+                (Primitive::ProbeNoReplace, 1, Errno::EINVAL),
+                (Primitive::ProbeLink, 1, link_errno),
             ]);
             let error = fx
                 .ops
@@ -1333,12 +1338,19 @@ fn exchangeless_restore_link_unlink_has_no_descriptor_on_disposed_inode() {
     let source_id = (source.dev(), source.ino());
     let checks = Arc::new(Mutex::new(0usize));
     let checked = Arc::clone(&checks);
+    let root = fx.root.clone();
     let _scope = FaultScope::new(&[
         (Primitive::Exchange, 1, Errno::EINVAL),
         (Primitive::Restore, 1, Errno::EINVAL),
     ]);
     UNLINK_PROBE.with(|probe| {
         *probe.borrow_mut() = Some(Box::new(move || {
+            if recovery_dirs(&root)
+                .first()
+                .is_none_or(|r| !r.join("slot-1").exists() && !r.join("slot-2").exists())
+            {
+                return;
+            }
             for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
                 let path = entry.unwrap().path();
                 if let Ok(metadata) = std::fs::metadata(&path) {
@@ -1360,64 +1372,285 @@ fn exchangeless_restore_link_unlink_has_no_descriptor_on_disposed_inode() {
     clean(&fx);
 }
 
-/// Optional real mount evidence. This never starts or requires a FUSE daemon.
-/// The caller supplies an existing mount; the variable value is never printed.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-#[test]
-fn exchangeless_real_filesystem_optional_e2e() {
-    use crate::file_ops::{EtagKey, Policy};
-    let Some(directory) = std::env::var_os("WSMP_EXCHANGELESS_DIR") else {
-        crate::output::diagnostic(
-            "SKIP exchangeless real filesystem: WSMP_EXCHANGELESS_DIR is unset",
-        )
-        .expect("print optional filesystem skip diagnostic");
-        return;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RealClass {
+    nr: bool,
+    link: bool,
+    noino: bool,
+    /// Link counts can be believed (false: the mount always reports 1, like sshfs).
+    counts: bool,
+}
+
+/// Pure test-only gate: env parsing never mutates process-global test state.
+fn real_gate(
+    dir: Option<&std::ffi::OsStr>,
+    class: Option<&std::ffi::OsStr>,
+    required: bool,
+) -> Option<(PathBuf, RealClass)> {
+    if dir.is_none() && class.is_none() && !required {
+        return None;
+    }
+    let directory = dir.expect("declared/required real filesystem needs DIR");
+    assert!(
+        !directory.is_empty(),
+        "real filesystem DIR must not be empty"
+    );
+    let class = class.expect("declared/required real filesystem needs CLASS");
+    let shape = match class.to_str() {
+        Some("nr") => RealClass {
+            nr: true,
+            link: true,
+            noino: false,
+            counts: true,
+        },
+        Some("link") => RealClass {
+            nr: false,
+            link: true,
+            noino: false,
+            counts: true,
+        },
+        Some("none") => RealClass {
+            nr: false,
+            link: false,
+            noino: false,
+            counts: true,
+        },
+        Some("nr-noino") => RealClass {
+            nr: true,
+            link: true,
+            noino: true,
+            counts: true,
+        },
+        Some("link-noino") => RealClass {
+            nr: false,
+            link: true,
+            noino: true,
+            counts: true,
+        },
+        // Link counts mean nothing here (always 1, like sshfs); the same strict test.
+        Some("link-noino-nlink1") => RealClass {
+            nr: false,
+            link: true,
+            noino: true,
+            counts: false,
+        },
+        Some("none-noino") => RealClass {
+            nr: false,
+            link: false,
+            noino: true,
+            counts: true,
+        },
+        _ => panic!("unknown real filesystem CLASS"),
     };
-    // Optional declared mount class (nr | link | none): per-class assertions.
-    let class = std::env::var("WSMP_EXCHANGELESS_CLASS").ok();
-    fn fixture(directory: &Path) -> Fx {
-        let dir = tempfile::tempdir_in(directory)
-            .expect("create isolated test directory on supplied filesystem");
-        let root = std::fs::canonicalize(dir.path()).unwrap();
-        Fx {
-            _dir: dir,
-            root,
-            ops: FileOps::new(
-                Policy::new(vec![], vec![], true),
-                EtagKey::from_bytes([7; 32]),
-            ),
-            cancel: Cancel::new(),
-            steps: Arc::new(Mutex::new(Vec::new())),
+    Some((PathBuf::from(directory), shape))
+}
+
+#[test]
+fn exchangeless_real_gate_defaults_and_inverse_failures() {
+    use std::ffi::OsStr;
+    assert_eq!(real_gate(None, None, false), None);
+    for (dir, class, required) in [
+        (None, None, true),
+        (Some("dir"), None, false),
+        (None, Some("nr"), false),
+        (Some("dir"), None, true),
+        (None, Some("nr"), true),
+        (Some("dir"), Some("bad"), false),
+        (Some("dir"), Some("nr-noino-noino"), true),
+        (Some(""), Some("nr"), true),
+        (Some("dir"), Some(""), false),
+    ] {
+        assert!(
+            std::panic::catch_unwind(|| real_gate(
+                dir.map(OsStr::new),
+                class.map(OsStr::new),
+                required
+            ))
+            .is_err()
+        );
+    }
+    for (class, nr, link, noino, counts) in [
+        ("nr", true, true, false, true),
+        ("link", false, true, false, true),
+        ("none", false, false, false, true),
+        ("nr-noino", true, true, true, true),
+        ("link-noino", false, true, true, true),
+        ("link-noino-nlink1", false, true, true, false),
+        ("none-noino", false, false, true, true),
+    ] {
+        for required in [false, true] {
+            assert_eq!(
+                real_gate(Some(OsStr::new("dir")), Some(OsStr::new(class)), required),
+                Some((
+                    PathBuf::from("dir"),
+                    RealClass {
+                        nr,
+                        link,
+                        noino,
+                        counts
+                    }
+                ))
+            );
         }
     }
-    // Pin the claimed mount class using the real raw exchange primitive before
-    // executing the behavior table. Both names are private to this test.
-    {
-        use nix::fcntl::{OFlag, open};
-        use nix::sys::stat::Mode;
-        use std::os::fd::AsFd;
-        let fx = fixture(Path::new(&directory));
-        fx.put("a", "a");
-        fx.put("b", "b");
-        let fd = open(
-            &fx.root,
-            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
-            Mode::empty(),
-        )
-        .unwrap();
-        let actual =
-            crate::file_ops::exchange::exchange(fd.as_fd(), "a".as_ref(), fd.as_fd(), "b".as_ref());
-        match actual {
-            Err(errno) if crate::file_ops::exchange::is_unsupported(errno) => {}
-            Ok(()) => {
-                crate::output::diagnostic(
-                    "SKIP exchangeless real filesystem: supplied filesystem supports exchange",
-                )
-                .expect("print optional filesystem skip diagnostic");
-                return;
-            }
-            Err(errno) => panic!("exchange capability check failed with {errno:?}"),
+}
+
+fn real_fixture(directory: &Path) -> Fx {
+    let dir = tempfile::tempdir_in(directory).expect("isolated real filesystem fixture");
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    Fx {
+        _dir: dir,
+        root,
+        ops: FileOps::new(
+            crate::file_ops::Policy::new(vec![], vec![], true),
+            crate::file_ops::EtagKey::from_bytes([7; 32]),
+        ),
+        cancel: Cancel::new(),
+        steps: Arc::new(Mutex::new(Vec::new())),
+    }
+}
+
+fn check_real_capabilities(directory: &Path, class: RealClass) {
+    use nix::fcntl::{OFlag, open};
+    use nix::sys::stat::Mode;
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::MetadataExt;
+    let fx = real_fixture(directory);
+    fx.put("a", "a");
+    fx.put("b", "b");
+    let fd = open(
+        &fx.root,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .unwrap();
+    let actual =
+        crate::file_ops::exchange::exchange(fd.as_fd(), "a".as_ref(), fd.as_fd(), "b".as_ref());
+    assert!(
+        actual.is_err_and(crate::file_ops::exchange::is_unsupported),
+        "supplied declared mount must not support exchange"
+    );
+    let nr = crate::file_ops::exchange::no_replace(
+        fd.as_fd(),
+        "a".as_ref(),
+        fd.as_fd(),
+        "absent".as_ref(),
+        Primitive::Move,
+    );
+    assert_eq!(
+        nr.is_ok(),
+        class.nr,
+        "raw absent-name NR must match declared class"
+    );
+    if !class.nr {
+        assert!(nr.is_err_and(crate::file_ops::exchange::is_unsupported));
+    }
+    let source = fx.root.join(if class.nr { "absent" } else { "a" });
+    let alias = fx.root.join("alias");
+    let linked = std::fs::hard_link(&source, &alias);
+    assert_eq!(
+        linked.is_ok(),
+        class.link,
+        "raw absent-name link must match declared class"
+    );
+    if class.link {
+        let one = std::fs::symlink_metadata(&source).unwrap();
+        let two = std::fs::symlink_metadata(&alias).unwrap();
+        assert_eq!(
+            one.ino() != two.ino(),
+            class.noino,
+            "simultaneous link-name inode mode"
+        );
+        for path in [&source, &alias] {
+            let held = std::fs::File::open(path).unwrap();
+            assert_eq!(
+                held.metadata().unwrap().ino(),
+                std::fs::symlink_metadata(path).unwrap().ino(),
+                "own-name fd proof"
+            );
         }
+    } else {
+        assert!(
+            linked
+                .as_ref()
+                .err()
+                .and_then(std::io::Error::raw_os_error)
+                .is_some_and(|raw| crate::file_ops::exchange::is_link_unsupported(
+                    Errno::from_raw(raw)
+                ))
+        );
+        // The no-link daemon cannot create this pair. The runner seeds these two
+        // hard links in its backing directory before mounting the none classes.
+        let one = directory.join("inode-probe-a");
+        let two = directory.join("inode-probe-b");
+        for path in [&one, &two] {
+            let held = std::fs::File::open(path).expect("seeded pair must be openable");
+            assert_eq!(
+                held.metadata().unwrap().ino(),
+                std::fs::symlink_metadata(path).unwrap().ino(),
+                "seeded alias own-name fd proof"
+            );
+        }
+        let one = std::fs::symlink_metadata(one).expect("none class needs seeded inode-probe-a");
+        let two = std::fs::symlink_metadata(two).expect("none class needs seeded inode-probe-b");
+        assert!(
+            one.nlink() >= 2 && two.nlink() >= 2,
+            "seeded pair must be hard links"
+        );
+        assert_eq!(
+            one.ino() != two.ino(),
+            class.noino,
+            "seeded link-name inode mode"
+        );
+    }
+}
+
+/// The cached-attribute class: strict like the six-class test, but only this one class.
+#[test]
+fn exchangeless_real_filesystem_cached_e2e() {
+    let directory = std::env::var_os("WSMP_EXCHANGELESS_DIR");
+    let class = std::env::var_os("WSMP_EXCHANGELESS_CLASS");
+    let required = std::env::var_os("WSMP_EXCHANGELESS_REQUIRED").is_some();
+    if directory.is_none() && class.is_none() && !required {
+        crate::output::diagnostic("SKIP exchangeless cached real filesystem: nothing requested")
+            .unwrap();
+        return;
+    }
+    let directory = directory.expect("the cached real filesystem needs DIR");
+    assert_eq!(
+        class.as_deref().and_then(std::ffi::OsStr::to_str),
+        Some("link-noino-cached"),
+        "the cached test runs only on the link-noino-cached class"
+    );
+    let directory = PathBuf::from(directory);
+    check_real_capabilities(
+        &directory,
+        RealClass {
+            nr: false,
+            link: true,
+            noino: true,
+            counts: true,
+        },
+    );
+    rename_publish::real_cached_rows(&directory);
+}
+
+/// Env-gated real mount evidence; the exact name is the CI runner contract.
+#[test]
+fn exchangeless_real_filesystem_optional_e2e() {
+    let directory = std::env::var_os("WSMP_EXCHANGELESS_DIR");
+    let class = std::env::var_os("WSMP_EXCHANGELESS_CLASS");
+    let required = std::env::var_os("WSMP_EXCHANGELESS_REQUIRED").is_some();
+    let Some((directory, class)) = real_gate(directory.as_deref(), class.as_deref(), required)
+    else {
+        crate::output::diagnostic("SKIP exchangeless real filesystem: no mount/class requested")
+            .unwrap();
+        return;
+    };
+    check_real_capabilities(&directory, class);
+    rename_publish::real_rename_rows(&directory, class);
+    fn fixture(directory: &Path) -> Fx {
+        real_fixture(directory)
     }
     for op in REPLACE_OPS {
         for race in [
@@ -1426,7 +1659,7 @@ fn exchangeless_real_filesystem_optional_e2e() {
             Some(Step::Vacated),
             Some(Step::Renamed),
         ] {
-            let fx = fixture(Path::new(&directory));
+            let fx = fixture(directory.as_path());
             let etag = prepare(&fx);
             let doc = fx.root.join("doc");
             let before = snapshot(&fx.root);
@@ -1443,11 +1676,7 @@ fn exchangeless_real_filesystem_optional_e2e() {
             });
             match op.run(&fx, &etag) {
                 Ok(value) => {
-                    assert_ne!(
-                        class.as_deref(),
-                        Some("none"),
-                        "a mount with neither primitive must refuse"
-                    );
+                    assert!(class.nr || class.link, "none mount must refuse");
                     assert_eq!(
                         fx.get("doc"),
                         if race == Some(Step::Renamed) {
@@ -1465,15 +1694,9 @@ fn exchangeless_real_filesystem_optional_e2e() {
                     clean(&fx);
                 }
                 Err(error) if error.code == ErrorCode::UnsafeFilesystem => {
-                    assert_ne!(
-                        class.as_deref(),
-                        Some("nr"),
-                        "a NOREPLACE-capable mount must publish: {error:?}"
-                    );
-                    assert_ne!(
-                        class.as_deref(),
-                        Some("link"),
-                        "a link-capable mount must publish: {error:?}"
+                    assert!(
+                        !class.nr && !class.link,
+                        "capable mount must publish: {error:?}"
                     );
                     assert_eq!(snapshot(&fx.root), before);
                     clean(&fx);
@@ -1494,7 +1717,7 @@ fn exchangeless_real_filesystem_optional_e2e() {
     }
     for kind in DELETE_KINDS {
         for race in [None, Some(Step::Vacating), Some(Step::Vacated)] {
-            let fx = fixture(Path::new(&directory));
+            let fx = fixture(directory.as_path());
             prepare_delete(&fx, kind);
             let doc = fx.root.join("doc");
             let fx = fx.with_hook(move |step| {
@@ -1706,7 +1929,9 @@ fn watch_private_unlinks(fx: &Fx, slots: &[&str]) -> Arc<Mutex<Vec<(u64, u64)>>>
             let dirs = recovery_dirs(&root);
             let nth = checked.lock().unwrap().len();
             let private = dirs[0].join(&slots[nth]);
-            let metadata = std::fs::symlink_metadata(&private).unwrap();
+            let Ok(metadata) = std::fs::symlink_metadata(&private) else {
+                return;
+            };
             let inode = (metadata.dev(), metadata.ino());
             for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
                 let path = entry.unwrap().path();
@@ -1724,6 +1949,28 @@ fn watch_private_unlinks(fx: &Fx, slots: &[&str]) -> Arc<Mutex<Vec<(u64, u64)>>>
     checks
 }
 
+/// C5A-2: a failed observation of the displaced object must release T's peer
+/// descriptor before restore unlinks slot-2.
+#[cfg(target_os = "linux")]
+#[test]
+fn replace_undo_releases_peer_descriptor_before_restore_unlink() {
+    for op in REPLACE_OPS {
+        let fx = Fx::new();
+        let etag = prepare(&fx);
+        let _scope = FaultScope::new(&[
+            (Primitive::Identity, 1, Errno::EIO),
+            (Primitive::Identity, 2, Errno::ESTALE),
+            (Primitive::Restore, 1, Errno::EINVAL),
+        ]);
+        let checks = watch_private_unlinks(&fx, &["slot-2"]);
+        let error = op.run(&fx, &etag).unwrap_err();
+        assert_eq!(error.code, ErrorCode::UncertainOutcome);
+        assert_eq!(checks.lock().unwrap().len(), 1, "{op:?}");
+        assert_eq!(fx.get("doc"), EDITED);
+        assert!(has_bytes(&kept(&error), ORIGINAL));
+    }
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn exchangeless_plain_link_rename_closes_both_proofs_before_unlink() {
@@ -1732,28 +1979,36 @@ fn exchangeless_plain_link_rename_closes_both_proofs_before_unlink() {
         fx.put("src", ORIGINAL);
         let dst = fx.root.join("dst");
         let fx = fx.with_hook(move |step| {
-            if racer && step == Step::Linked {
+            if racer && step == Step::Renamed {
                 save(&dst, RACER);
             }
             Ok(())
         });
         let _scope = FaultScope::new(&[
             (Primitive::Move, 1, Errno::EINVAL),
-            (Primitive::Restore, 1, Errno::EINVAL),
+            (Primitive::ProbeNoReplace, 1, Errno::EINVAL),
         ]);
         let checks = watch_private_unlinks(&fx, &["slot-1"]);
-        let result = fx.ops.rename(
-            &args(json!({"from":fx.p("src"),"to":fx.p("dst")})),
-            &fx.cancel,
-        );
-        assert_eq!(checks.lock().unwrap().len(), 1);
+        let result = fx
+            .ops
+            .rename(
+                &args(json!({"from":fx.p("src"),"to":fx.p("dst")})),
+                &fx.cancel,
+            )
+            .unwrap();
+        assert_eq!(checks.lock().unwrap().len(), usize::from(!racer));
         if racer {
-            let error = result.unwrap_err();
-            assert!(has_bytes(&kept(&error), RACER));
-            assert_eq!(fx.get("src"), ORIGINAL);
-            assert_eq!(count(&FaultScope::calls(), Primitive::RestoreLink), 1);
+            assert!(has_bytes(
+                &result
+                    .recovered
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>(),
+                ORIGINAL
+            ));
+            assert_eq!(fx.get("dst"), RACER);
         } else {
-            assert!(result.unwrap().recovered.is_empty());
+            assert!(result.recovered.is_empty());
             assert_eq!(fx.get("dst"), ORIGINAL);
             clean(&fx);
         }
@@ -1778,7 +2033,7 @@ fn exchangeless_overwrite_initial_mismatch_closes_matching_proofs_for_restore() 
         });
         let mut faults = vec![(Primitive::Restore, 1, Errno::EINVAL)];
         if !captured_destination {
-            faults.push((Primitive::Identity, 1, Errno::EIO));
+            faults.push((Primitive::Identity, 3, Errno::EIO));
         }
         let _scope = FaultScope::new(&faults);
         let checks = watch_private_unlinks(&fx, &["slot-1"]);
@@ -1823,14 +2078,21 @@ fn exchangeless_supported_overwrite_undo_releases_source_and_destination() {
         (src_meta.dev(), src_meta.ino()),
     ];
     let _scope = FaultScope::new(&[
-        (Primitive::Identity, 2, Errno::EIO),
+        (Primitive::Identity, 4, Errno::EIO),
         (Primitive::Restore, 1, Errno::EINVAL),
         (Primitive::Restore, 2, Errno::EINVAL),
     ]);
     let checks = Arc::new(Mutex::new(0usize));
     let checked = Arc::clone(&checks);
+    let root = fx.root.clone();
     UNLINK_PROBE.with(|probe| {
         *probe.borrow_mut() = Some(Box::new(move || {
+            if recovery_dirs(&root)
+                .first()
+                .is_none_or(|r| !r.join("slot-1").exists() && !r.join("slot-2").exists())
+            {
+                return;
+            }
             let nth = *checked.lock().unwrap();
             assert!(nth < ids.len());
             for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
@@ -2035,11 +2297,16 @@ fn supervised_exchangeless_replace_uses_safe_publication_and_cancel_boundary() {
         assert!(prepared.child_input().blocked.is_none());
         let before = snapshot(&fx.root);
         let faults = if overwrite {
-            vec![(Primitive::Exchange, 1, Errno::EINVAL)]
+            vec![
+                (Primitive::ProbeExchange, 1, Errno::EINVAL),
+                (Primitive::ProbeNoReplace, 1, Errno::EINVAL),
+                (Primitive::ProbeLink, 1, Errno::EPERM),
+            ]
         } else {
             vec![
                 (Primitive::Move, 1, Errno::EINVAL),
-                (Primitive::MoveLink, 1, Errno::EPERM),
+                (Primitive::ProbeNoReplace, 1, Errno::EINVAL),
+                (Primitive::ProbeLink, 1, Errno::EPERM),
             ]
         };
         let _scope = FaultScope::new(&faults);
@@ -2053,3 +2320,6 @@ fn supervised_exchangeless_replace_uses_safe_publication_and_cancel_boundary() {
         assert_eq!(snapshot(&fx.root), before);
     }
 }
+
+#[path = "rename_publish.rs"]
+mod rename_publish;

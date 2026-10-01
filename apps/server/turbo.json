@@ -8,7 +8,8 @@
         "$TURBO_ROOT$/apps/cli/src/file_ops/error.rs",
         "$TURBO_ROOT$/apps/cli/src/file_relay.rs",
         "$TURBO_ROOT$/apps/cli/tests/fixtures/relay-2.8/**",
-        "$TURBO_ROOT$/docs/mcp.md"
+        "$TURBO_ROOT$/docs/mcp.md",
+        "$TURBO_ROOT$/scripts/lib/wait-for-exit.mjs"
       ]
     }
   }

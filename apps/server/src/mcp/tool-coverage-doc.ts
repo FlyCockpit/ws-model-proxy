@@ -61,6 +61,19 @@ Finished file answers and their single audit event do not change on late reports
 Only a supervised start id is delivered despite MCP abort; headless file results keep
 the abort fence. See [CLI file tools](mcp.md#cli-file-tools-relay-protocol-28).
 
+Overwrite rename preflights before capture and supports exchange-less no-replace
+and link mounts through one recovery-owned vacate-both publisher. Neither primitive
+means \`unsafe_filesystem\` with no public change. Plain link rename vacates first,
+uses own-name alias proofs and returns a source-bound etag at the published name.
+Directories require no-replace, never overwrite, and own-subtree moves are invalid_input.
+Alias cleanup vetoes the unlink on a believable link count below 2 (statx FORCE_SYNC on Linux, calibrated per operation) and reports a last surviving alias; residual
+(g) also applies to rename. Crash residue includes captured source/destination and
+private preflight dummies, logged before capture, without intent/replay. Rust tests
+cover Linux/macOS injected capability, ownership, race, cancellation and reply-loss
+tables; the strict real-mount test checks six declared primitive/inode classes (plus a constant-link-count and a cached-attribute class). CI
+runs it on real FUSE mounts in the \`exchangeless-fs\` job (\`apps/cli/scripts/test-exchangeless-fs.sh\`,
+no installs; a failed mount fails the job).
+
 ## Human-only procedures (Phase 7)
 
 The \`mcpGrants\` router (\`packages/api/src/routers/mcp-grants.ts\`) and the

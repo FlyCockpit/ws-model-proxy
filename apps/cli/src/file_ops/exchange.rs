@@ -11,6 +11,10 @@ use nix::errno::Errno;
 pub(super) enum Primitive {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     Exchange,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    ProbeExchange,
+    ProbeCreate,
+    PublishPrepare,
     ProbeNoReplace,
     ProbeLink,
     Publish,
@@ -19,12 +23,12 @@ pub(super) enum Primitive {
     Restore,
     RestoreLink,
     Move,
-    MoveLink,
     Hold,
     Identity,
     Mkdir,
     Unlink,
     Rmdir,
+    LinkCount,
 }
 
 #[cfg(test)]
@@ -155,7 +159,18 @@ pub(super) fn exchange(
     dir_to: impl AsFd,
     to: &OsStr,
 ) -> Result<(), Errno> {
-    run(Primitive::Exchange, || {
+    exchange_with(dir_from, from, dir_to, to, Primitive::Exchange)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn exchange_with(
+    dir_from: impl AsFd,
+    from: &OsStr,
+    dir_to: impl AsFd,
+    to: &OsStr,
+    primitive: Primitive,
+) -> Result<(), Errno> {
+    run(primitive, || {
         #[cfg(target_os = "linux")]
         {
             use nix::fcntl::{RenameFlags, renameat2};
@@ -195,6 +210,39 @@ pub(super) fn no_replace(
             let _ = (dir_from, from, dir_to, to);
             Err(Errno::ENOSYS)
         }
+    })
+}
+
+/// The link count of `name` under `dir`, read from the filesystem itself.
+///
+/// A plain stat answers from the kernel's attribute cache. FUSE (default one-second
+/// attribute timeout), NFS and SMB then report a count that is stale in BOTH
+/// directions (and, without stable inode numbers, every name has its own cached
+/// attributes), so a guard built on it can delete an object's last name or retain a
+/// clean alias every time. Linux therefore asks for `statx` with
+/// `AT_STATX_FORCE_SYNC` (a kernel without statx falls back to the plain stat). Other
+/// Unix systems have no such flag and get the plain stat. The count is never a proof:
+/// `RecoveryDir::calibrate_counts` decides per operation whether it can veto an unlink
+/// at all, and an unreadable count under a believable mount keeps the alias.
+pub(super) fn link_count(dir: impl AsFd, name: &OsStr) -> Result<u64, Errno> {
+    run(Primitive::LinkCount, || {
+        #[cfg(target_os = "linux")]
+        {
+            use rustix::fs::{AtFlags, StatxFlags, statx};
+            match statx(
+                &dir,
+                name,
+                AtFlags::SYMLINK_NOFOLLOW | AtFlags::STATX_FORCE_SYNC,
+                StatxFlags::NLINK,
+            ) {
+                Ok(stat) => return Ok(u64::from(stat.stx_nlink)),
+                // A kernel without statx: the cached count is all there is.
+                Err(rustix::io::Errno::NOSYS) => {}
+                Err(errno) => return Err(Errno::from_raw(errno.raw_os_error())),
+            }
+        }
+        nix::sys::stat::fstatat(dir, name, nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW)
+            .map(|raw| super::resolve::Stat::from_raw(&raw).nlink)
     })
 }
 

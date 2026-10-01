@@ -115,10 +115,13 @@ filedescriptor = "0.8"
 # Already in the tree through clap's `wrap_help`.
 terminal_size = "0.4"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 # nix has no macOS swap wrapper and unsafe_code is forbidden here. rustix
 # safely wraps renamex_np's dirfd variant, renameatx_np, with RENAME_SWAP.
-# `fs` exposes renameat_with; `std` enables OsStr paths and std file descriptors.
+# On Linux it provides `statx` with AT_STATX_FORCE_SYNC, a link count that is not
+# read from the kernel's attribute cache (file_ops::exchange::link_count; nix has no
+# statx). rustix is already in the Linux build through tempfile and terminal_size.
+# `fs` exposes renameat_with/statx; `std` enables OsStr paths and std file descriptors.
 rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 
 [target.'cfg(windows)'.dependencies]

@@ -26,17 +26,21 @@
 //! held-fd proof and unlinkat; (a2) plain-rename capture fallback overwriting a
 //! squatter after the private slot was checked absent; (b) public names briefly
 //! vacant during undo, so concurrent creates prevent NOREPLACE restoration;
-//! (b2) overwrite rename's source is vacant from capture through operation end,
+//! (b2) recovery rename's source is vacant from capture through operation end,
+//! with destination also vacant during exchange-less overwrite publication,
 //! and a concurrent create is kept and reported when it blocks restoration;
 //! (d) crash residue in R (original plus partial tmp/renamed probe and public name
-//! vacant, or captured delete) or both links; (e) unheld objects are never deleted;
+//! vacant, captured delete, rename S/D or preflight dummies) or both links; (e) unheld objects are never deleted;
 //! (f) another process's open NFS fd can leave .nfs residue; our own fds close before
-//! unlink; (g) link publication exposes T briefly before its private alias unlink.
+//! unlink; (g) replace/rename link publication exposes T/S before alias unlink;
+//! where link counts can be believed (probed per operation) a count < 2 retains the
+//! last alias; where they cannot (sshfs) or after that check, the race remains.
 //! Failed alias cleanup leaves nlink 2 and hard_linked refusal until manual cleanup.
 //! The vacant interval is bounded by syscalls, never by elapsed time; publication
 //! depends on the filesystem's actual NOREPLACE/link atomicity. See `recovery` for
 //! platform facts, in-place-write loss, restore fallbacks and separate case-only
-//! rename, exclusive-create, rollback_created and exchange-less overwrite refusals.
+//! rename, exclusive-create and rollback_created residuals. Rename shares the
+//! safe publisher but keeps every unpublished user source; Temps stay disposable.
 //!
 //! Refused up front: files owned by another uid (a non-root rename would change
 //! the owner), hard-linked files (the rename would break the link), and
@@ -61,7 +65,7 @@ use super::error::{ErrorCode, FileError, FileResult};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use super::exchange::is_unsupported;
 use super::read::current_etag;
-use super::recovery::{Held, RecoveryDir, Slot};
+use super::recovery::{Held, Published, RecoveryDir, Slot};
 use super::resolve::Stat;
 use super::{Cancel, FileOps, Step};
 
@@ -340,6 +344,10 @@ fn commit_stage(
                     && !recovery.holds(y, identity)
                 {
                     // Newest foreign write wins; X remains named in recovery.
+                    // T's proof is not used to dispose y. An unsupported restore
+                    // links T publicly and unlinks slot-2, so this descriptor
+                    // must already be closed (F3).
+                    identity.release();
                     if recovery.restore(ops, y) {
                         let _ = ops.step(Step::Restored);
                     }
@@ -367,7 +375,7 @@ fn commit_stage(
     }
     // The fallback owns T before probing. No outer exit may dispose it again.
     *armed = false;
-    recovery.publish_without_exchange(ops, tmp, original, identity, cancel)
+    recovery.publish_without_exchange(ops, tmp, Some(original), identity, cancel, Published::Temp)
 }
 
 /// The name must still point at the file we read, and that file must still
