@@ -447,6 +447,60 @@ describe("#117 — real input schemas and named failing fields", () => {
       "Invalid input: capacityConcurrencyLimit: Effective concurrency limit exceeds physical capacity.",
     );
   });
+
+  it("forwards a guarded-pool-create reason next to data.fields", async () => {
+    const { ORPCError } = await import("@orpc/server");
+    db.modelPool.findUnique.mockRejectedValueOnce(
+      new ORPCError("BAD_REQUEST", {
+        message: "Effective concurrency limit exceeds physical capacity.",
+        data: {
+          fields: ["capacityConcurrencyLimit"],
+          reason: "CONCURRENCY_EXCEEDS_PHYSICAL",
+        },
+      }),
+    );
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_model_pool_update", {
+      id: "pool-1",
+      capacityConcurrencyLimit: 8,
+    });
+    expect(body.result?.structuredContent).toEqual({
+      error: {
+        code: "invalid_input",
+        fields: ["capacityConcurrencyLimit"],
+        message: "Effective concurrency limit exceeds physical capacity.",
+        reason: "CONCURRENCY_EXCEEDS_PHYSICAL",
+      },
+    });
+  });
+
+  it("drops an unknown reason on the data.fields path", async () => {
+    const { ORPCError } = await import("@orpc/server");
+    db.modelPool.findUnique.mockRejectedValueOnce(
+      new ORPCError("BAD_REQUEST", {
+        message: "Effective concurrency limit exceeds physical capacity.",
+        data: {
+          fields: ["capacityConcurrencyLimit"],
+          reason: "SECRET_REASON",
+        },
+      }),
+    );
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_model_pool_update", {
+      id: "pool-1",
+      capacityConcurrencyLimit: 8,
+    });
+    expect(body.result?.structuredContent).toEqual({
+      error: {
+        code: "invalid_input",
+        fields: ["capacityConcurrencyLimit"],
+        message: "Effective concurrency limit exceeds physical capacity.",
+      },
+    });
+    expect(JSON.stringify(body)).not.toContain("SECRET_REASON");
+  });
 });
 
 describe("scope enforcement", () => {

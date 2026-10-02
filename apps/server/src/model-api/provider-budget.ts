@@ -58,6 +58,7 @@ export type ProviderBudgetAdmission =
       reason:
         | "BUDGET_EXCEEDED"
         | "GRANTEE_BUDGET_EXCEEDED"
+        | "GRANTEE_CAP_UNPRICEABLE"
         | "PROVIDER_CONCURRENCY_EXCEEDED"
         | "PROTECTION_POLICY_MISSING"
         | "CURRENCY_UNAVAILABLE"
@@ -219,18 +220,20 @@ function reservationIdentityWhere(
   return { policyId: policy.id, ruleId: rule.id };
 }
 
-function grantCapDenial(
+export function grantCapDenial(
   policy: { id: string; scopeType: string },
   ruleId: string,
   reason: Exclude<ProviderBudgetAdmission, { admitted: true }>["reason"],
 ): Exclude<ProviderBudgetAdmission, { admitted: true }> {
-  if (
-    policy.scopeType === "POOL_GRANT" &&
-    (reason === "BUDGET_EXCEEDED" ||
-      reason === "CURRENCY_UNAVAILABLE" ||
-      reason === "PRICING_UNAVAILABLE")
-  )
+  if (policy.scopeType !== "POOL_GRANT") {
+    return { admitted: false, reason, policyId: policy.id, ruleId };
+  }
+  if (reason === "BUDGET_EXCEEDED") {
     return { admitted: false, reason: "GRANTEE_BUDGET_EXCEEDED", policyId: policy.id, ruleId };
+  }
+  if (reason === "CURRENCY_UNAVAILABLE" || reason === "PRICING_UNAVAILABLE") {
+    return { admitted: false, reason: "GRANTEE_CAP_UNPRICEABLE", policyId: policy.id, ruleId };
+  }
   return { admitted: false, reason, policyId: policy.id, ruleId };
 }
 

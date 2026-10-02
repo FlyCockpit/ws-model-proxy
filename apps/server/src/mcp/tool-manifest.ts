@@ -366,7 +366,7 @@ export const POOL_EXTERNAL_WAIT_COST_NOTICE =
 
 /** Cost statement for the per-token `:external` wait (issue #181). */
 export const TOKEN_EXTERNAL_WAIT_COST_NOTICE =
-  "COST: externalAfterWaitMs is how long this token's :external requests wait for local capacity before they may be sent to a paid external provider. Lower values spend more. Null uses each pool's setting. Pool externalAfterWaitMs is an owner floor: callers may only lengthen, up to the pool's local capacity wait budget. A request may also send x-wsmp-external-after-wait-ms; that override cannot go below the pool floor or past the local wait budget. Grantees cannot shorten below the pool floor. The stored value is 0..600000; each request still applies the floor and budget for that pool. MCP diagnostics cannot use :external.";
+  "COST: externalAfterWaitMs is how long this token's :external requests wait for local capacity before they may be sent to a paid external provider. Lower values spend more. Null uses each pool's setting. Pool externalAfterWaitMs is an owner floor: callers may only lengthen, up to the pool's local capacity wait budget. A request may also send x-wsmp-external-after-wait-ms; that override cannot go below the pool floor or past the local wait budget. Grantees cannot shorten below the pool floor. The stored value is 0..600000; each request still applies the floor and budget for that pool. Every change is recorded as a TOKEN_EXTERNAL_WAIT_UPDATED provider audit event. MCP diagnostics cannot use :external.";
 
 /** Cost statement for per-grantee owner-paid `:external` spend caps (#182). */
 export const POOL_GRANT_SPEND_CAP_COST_NOTICE =

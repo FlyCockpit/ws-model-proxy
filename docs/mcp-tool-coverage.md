@@ -264,8 +264,9 @@ MCP tools can never grant it:
   with no confirmation. Null uses each pool's wait. Pool `externalAfterWaitMs`
   is an owner floor: callers may only lengthen, up to the local capacity wait
   budget. A request header cannot go below the pool floor or past that budget.
-  Grantees cannot shorten below the pool floor. MCP diagnostics cannot use
-  `:external`;
+  Grantees cannot shorten below the pool floor. Every change writes a
+  `TOKEN_EXTERNAL_WAIT_UPDATED` provider audit event. MCP diagnostics cannot
+  use `:external`;
 - `providerManagement.setAllowDataCollection` (the OpenRouter
   "providers that may collect data" opt-out, decision D9) is excluded, and
   `provider_account_create` / `provider_account_update` reject

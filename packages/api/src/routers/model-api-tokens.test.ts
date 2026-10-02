@@ -50,6 +50,9 @@ const db = prisma as unknown as {
   modelApiTokenAllowlistEntry: {
     update: MockInstance;
   };
+  providerAuditEvent: {
+    create: MockInstance;
+  };
   $transaction: MockInstance;
   $queryRaw: MockInstance;
 };
@@ -680,10 +683,17 @@ describe("modelApiTokensRouter", () => {
 
   describe("updateExternalWait", () => {
     it("stores a caller wait and clears it back to the pool default", async () => {
-      db.modelApiToken.findUnique.mockResolvedValue({
+      db.modelApiToken.findUnique.mockResolvedValueOnce({
         id: "token-id",
         userId: "user-id",
         revokedAt: null,
+        externalAfterWaitMs: null,
+      });
+      db.modelApiToken.findUnique.mockResolvedValueOnce({
+        id: "token-id",
+        userId: "user-id",
+        revokedAt: null,
+        externalAfterWaitMs: 500,
       });
       db.modelApiToken.update.mockResolvedValueOnce({
         ...tokenRow("ALL_VISIBLE", false),
@@ -693,6 +703,7 @@ describe("modelApiTokensRouter", () => {
         ...tokenRow("ALL_VISIBLE", false),
         externalAfterWaitMs: null,
       });
+      db.providerAuditEvent.create.mockResolvedValue({});
       const client = createRouterClient(modelApiTokensRouter, { context: buildContext() });
 
       await expect(
@@ -704,6 +715,26 @@ describe("modelApiTokensRouter", () => {
       expect(db.modelApiToken.update.mock.calls.map(([args]) => args.data)).toEqual([
         { externalAfterWaitMs: 500 },
         { externalAfterWaitMs: null },
+      ]);
+      expect(db.providerAuditEvent.create.mock.calls.map(([args]) => args.data)).toEqual([
+        {
+          userId: "user-id",
+          action: "TOKEN_EXTERNAL_WAIT_UPDATED",
+          subjectId: "token-id",
+          metadata: {
+            source: "dashboard",
+            changes: { externalAfterWaitMs: { before: null, after: 500 } },
+          },
+        },
+        {
+          userId: "user-id",
+          action: "TOKEN_EXTERNAL_WAIT_UPDATED",
+          subjectId: "token-id",
+          metadata: {
+            source: "dashboard",
+            changes: { externalAfterWaitMs: { before: 500, after: null } },
+          },
+        },
       ]);
     });
 

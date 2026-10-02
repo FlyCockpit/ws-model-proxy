@@ -8800,7 +8800,8 @@ function externalUnavailableReason(
   if (reason === "REQUESTER_ACCESS_BLOCKED") return "REQUESTER_BLOCKED";
   if (reason === "NO_COMPATIBLE_PROVIDER") return "NO_COMPATIBLE";
   if (reason === "PROVIDER_SATURATED") return "SATURATED";
-  if (reason === "GRANTEE_BUDGET_EXCEEDED") return "GRANTEE_SPEND_CAP";
+  if (reason === "GRANTEE_BUDGET_EXCEEDED" || reason === "GRANTEE_CAP_UNPRICEABLE")
+    return "GRANTEE_SPEND_CAP";
   return "UNAVAILABLE";
 }
 
@@ -9515,7 +9516,9 @@ async function relayBoundProviderResponse(input: {
       ? "cancelled"
       : denied
         ? "access_denied"
-        : result.reason === "PROVIDER_SATURATED" || result.reason === "GRANTEE_BUDGET_EXCEEDED"
+        : result.reason === "PROVIDER_SATURATED" ||
+            result.reason === "GRANTEE_BUDGET_EXCEEDED" ||
+            result.reason === "GRANTEE_CAP_UNPRICEABLE"
           ? "rate_limited"
           : result.reason === "BOUND_TARGET_INVALID" ||
               result.reason === "REQUESTER_NOT_VISIBLE" ||
@@ -9533,7 +9536,7 @@ async function relayBoundProviderResponse(input: {
     // Restorable consent withdrawals are permission errors; a lost exact
     // grant permanently invalidates the binding, just as at arrival.
     if (denied) return externalRouteErrorResponse("responses", denied);
-    if (result.reason === "GRANTEE_BUDGET_EXCEEDED")
+    if (result.reason === "GRANTEE_BUDGET_EXCEEDED" || result.reason === "GRANTEE_CAP_UNPRICEABLE")
       return externalRouteErrorResponse("responses", {
         code: "grantee_spend_cap",
         message: GRANTEE_SPEND_CAP_MESSAGE,

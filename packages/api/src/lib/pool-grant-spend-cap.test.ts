@@ -72,5 +72,21 @@ describe("pool grant spend cap", () => {
         },
       ]),
     ).toThrow(ORPCError);
+    try {
+      assertPoolGrantSpendRules([
+        {
+          metric: "CONCURRENCY",
+          period: "PER_ATTEMPT",
+          mode: "LIMITED",
+          limitValue: "1",
+          currency: null,
+        },
+      ]);
+    } catch (error) {
+      expect(error).toBeInstanceOf(ORPCError);
+      expect((error as ORPCError<string, { fields?: string[] }>).data).toEqual({
+        fields: ["fallbackSpend"],
+      });
+    }
   });
 });

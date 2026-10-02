@@ -15035,6 +15035,7 @@ describe("model API routes", () => {
       ["PROVIDER_UNAVAILABLE", 503],
       ["BUDGET_EXCEEDED", 503],
       ["GRANTEE_BUDGET_EXCEEDED", 429],
+      ["GRANTEE_CAP_UNPRICEABLE", 429],
       ["BOUND_TARGET_INVALID", 404],
       ["REQUESTER_NOT_VISIBLE", 404],
       ["POOL_PRIVATE", 403],

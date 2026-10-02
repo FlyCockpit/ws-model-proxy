@@ -1,5 +1,29 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { budgetWindow, providerBillableTokens } from "./provider-budget-accounting.js";
+
+vi.mock("@ws-model-proxy/env/server", () => ({
+  env: {
+    BETTER_AUTH_SECRET: "test-better-auth-secret",
+    BETTER_AUTH_URL: "https://proxy.example.com",
+    WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
+    NODE_ENV: "test",
+  },
+}));
+
+vi.mock("@ws-model-proxy/env/shared", () => ({
+  env: {
+    BETTER_AUTH_SECRET: "test-better-auth-secret",
+    DATABASE_URL: "postgresql://provider-budget-test",
+    NODE_ENV: "test",
+  },
+}));
+
+vi.mock("@ws-model-proxy/db", async () => {
+  const { mockDeep } = await import("vitest-mock-extended");
+  return { default: mockDeep() };
+});
+
+const { grantCapDenial } = await import("./provider-budget.js");
 
 describe("provider budget accounting", () => {
   it("uses half-open UTC day windows across a year boundary", () => {
@@ -72,5 +96,34 @@ describe("provider budget accounting", () => {
         categoriesComplete: false,
       }),
     ).toBeUndefined();
+  });
+});
+
+describe("grantCapDenial", () => {
+  const policy = { id: "policy", scopeType: "POOL_GRANT" };
+
+  it("maps an exhausted cap to GRANTEE_BUDGET_EXCEEDED", () => {
+    expect(grantCapDenial(policy, "rule", "BUDGET_EXCEEDED")).toEqual({
+      admitted: false,
+      reason: "GRANTEE_BUDGET_EXCEEDED",
+      policyId: "policy",
+      ruleId: "rule",
+    });
+  });
+
+  it("keeps pricing and currency failures distinct from an exhausted cap", () => {
+    expect(grantCapDenial(policy, "rule", "PRICING_UNAVAILABLE").reason).toBe(
+      "GRANTEE_CAP_UNPRICEABLE",
+    );
+    expect(grantCapDenial(policy, "rule", "CURRENCY_UNAVAILABLE").reason).toBe(
+      "GRANTEE_CAP_UNPRICEABLE",
+    );
+  });
+
+  it("leaves other scopes unmapped", () => {
+    expect(
+      grantCapDenial({ id: "policy", scopeType: "PROVIDER_ACCOUNT" }, "rule", "PRICING_UNAVAILABLE")
+        .reason,
+    ).toBe("PRICING_UNAVAILABLE");
   });
 });

@@ -177,15 +177,29 @@ function baseJsonSchema(spec: McpInputSchemaSpec): JsonObject {
  * root still names the key (#200) so `properties` is not empty.
  */
 const VARIANT_PROPERTY_JSON_MAX = 400;
-const VARIANT_PROPERTY: JsonObject = {
-  description: "Accepted shape depends on the input variant. See oneOf/anyOf.",
-};
+const VARIANT_PROPERTY_DESCRIPTION =
+  "Accepted shape depends on the input variant. See oneOf/anyOf.";
+
+function jsonSchemaTypeOf(schema: unknown): string | undefined {
+  const type = objectOf(schema).type;
+  return typeof type === "string" ? type : undefined;
+}
+
+/** Stub for a large or conflicting union-branch property. Shared `type` stays. */
+function variantPropertyStub(schemas: readonly unknown[]): JsonObject {
+  const types = new Set(
+    schemas.map(jsonSchemaTypeOf).filter((type): type is string => type !== undefined),
+  );
+  return types.size === 1
+    ? { type: [...types][0]!, description: VARIANT_PROPERTY_DESCRIPTION }
+    : { description: VARIANT_PROPERTY_DESCRIPTION };
+}
 
 function variantPropertySchema(schema: unknown): unknown {
   const encoded = JSON.stringify(schema);
   return encoded !== undefined && encoded.length <= VARIANT_PROPERTY_JSON_MAX
     ? schema
-    : VARIANT_PROPERTY;
+    : variantPropertyStub([schema]);
 }
 
 /** Property names declared on a union's branches, for clients that only read root `properties`. */
@@ -202,7 +216,9 @@ function unionBranchProperties(base: JsonObject): JsonObject {
         merged[name] = compact;
         continue;
       }
-      if (JSON.stringify(merged[name]) !== JSON.stringify(compact)) merged[name] = VARIANT_PROPERTY;
+      if (JSON.stringify(merged[name]) !== JSON.stringify(compact)) {
+        merged[name] = variantPropertyStub([merged[name], compact, schema]);
+      }
     }
   }
   return merged;

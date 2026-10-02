@@ -791,6 +791,7 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
       "Lower values spend more",
       "x-wsmp-external-after-wait-ms",
       "Grantees cannot shorten",
+      "TOKEN_EXTERNAL_WAIT_UPDATED",
     ])
       expect(update.descriptionNote).toContain(phrase);
     expect(

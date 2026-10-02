@@ -8,6 +8,7 @@ import {
 import { z } from "zod";
 import { protectedProcedure } from "../index";
 import { externalAfterWaitMsSchema } from "../lib/caller-external-wait";
+import { isMcpSession } from "../lib/mcp-session";
 import {
   digestModelApiTokenSecret,
   listVisibleModelTargetsForUser,
@@ -323,7 +324,7 @@ export const modelApiTokensRouter = {
         await tx.$queryRaw`SELECT id FROM model_api_token WHERE id = ${input.id} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         const existing = await tx.modelApiToken.findUnique({
           where: { id: input.id, userId },
-          select: { id: true, userId: true, revokedAt: true },
+          select: { id: true, userId: true, revokedAt: true, externalAfterWaitMs: true },
         });
         if (!existing || existing.userId !== userId || existing.revokedAt) {
           throw new ORPCError("NOT_FOUND", { message: "Model API token not found." });
@@ -333,6 +334,24 @@ export const modelApiTokensRouter = {
           data: { externalAfterWaitMs: input.externalAfterWaitMs },
           select: tokenSelection,
         });
+        if (existing.externalAfterWaitMs !== input.externalAfterWaitMs) {
+          await tx.providerAuditEvent.create({
+            data: {
+              userId,
+              action: "TOKEN_EXTERNAL_WAIT_UPDATED",
+              subjectId: existing.id,
+              metadata: {
+                source: isMcpSession(context) ? "mcp" : "dashboard",
+                changes: {
+                  externalAfterWaitMs: {
+                    before: existing.externalAfterWaitMs,
+                    after: input.externalAfterWaitMs,
+                  },
+                },
+              },
+            },
+          });
+        }
         return serializeToken(updated);
       });
     }),

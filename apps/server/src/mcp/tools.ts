@@ -44,6 +44,7 @@ import type {
   StandardSchemaWithJSON,
 } from "@modelcontextprotocol/server";
 import { createRouterClient, ORPCError } from "@orpc/server";
+import { isGuardedPoolCreateFailureReason } from "@ws-model-proxy/api/lib/guarded-pool-create-reasons";
 import { type AppRouterClient, appRouter } from "@ws-model-proxy/api/routers/index";
 import { mcpScopesAllow } from "@ws-model-proxy/auth/mcp-config";
 import {
@@ -627,10 +628,27 @@ function validationToolError(code: string, issues: readonly McpValidationIssue[]
   });
 }
 
-function declaredFieldToolError(fields: readonly string[], message: string): ToolResult {
+function declaredFieldToolError(
+  fields: readonly string[],
+  message: string,
+  reason?: string,
+): ToolResult {
   return toolError(`Invalid input: ${fields.join(", ")}: ${message}`, {
-    error: { code: "invalid_input", fields: [...fields], message },
+    error: {
+      code: "invalid_input",
+      fields: [...fields],
+      message,
+      ...(reason === undefined ? {} : { reason }),
+    },
   });
+}
+
+/** Guarded-pool-create `data.reason` enum, or null. Any other value stays on the server. */
+function guardedPoolCreateReasonOf(error: ORPCError<string, unknown>): string | null {
+  const data: unknown = error.data;
+  if (typeof data !== "object" || data === null || !Object.hasOwn(data, "reason")) return null;
+  const reason: unknown = Reflect.get(data, "reason");
+  return isGuardedPoolCreateFailureReason(reason) ? reason : null;
 }
 
 function declaredInputKeys(descriptor: McpToolDescriptor): ReadonlySet<string> {
@@ -665,6 +683,7 @@ function mapToolError(
             return declaredFieldToolError(
               fields,
               sanitizeArgumentMessage(error.message) ?? "Invalid value",
+              guardedPoolCreateReasonOf(error) ?? undefined,
             );
           }
         }

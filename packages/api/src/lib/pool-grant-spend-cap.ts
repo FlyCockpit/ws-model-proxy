@@ -192,5 +192,6 @@ export function assertPoolGrantSpendRules(
   )
     throw new ORPCError("BAD_REQUEST", {
       message: "A grant spend cap is SPEND only (UTC_DAY or UTC_MONTH).",
+      data: { fields: ["fallbackSpend"] },
     });
 }

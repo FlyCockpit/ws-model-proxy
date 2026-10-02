@@ -126,6 +126,9 @@ enum ProviderAuditAction {
   /// A pool's external-fallback settings changed (fallbackEnabled,
   /// fallbackForGrantees, externalAfterWaitMs). subjectId is the pool id.
   POOL_FALLBACK_UPDATED
+  /// A token's `:external` wait (`externalAfterWaitMs`) changed. subjectId is
+  /// the token id. metadata.source is mcp or dashboard.
+  TOKEN_EXTERNAL_WAIT_UPDATED
 }
 
 enum ExecutionTargetKind {

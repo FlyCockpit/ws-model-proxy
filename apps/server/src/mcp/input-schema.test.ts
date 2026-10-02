@@ -263,8 +263,22 @@ describe("advertised schema equals the procedure schema plus declared overlays",
       // that name a replacement tool are matched by the tool name).
       // Union branches have no root properties. Copy small branch schemas up
       // (#200); large or conflicting ones are a stub that only names the key.
-      const variantStub = {
-        description: "Accepted shape depends on the input variant. See oneOf/anyOf.",
+      const variantStubFor = (schemas: unknown[]) => {
+        const types = new Set(
+          schemas
+            .map((schema) =>
+              schema !== null && typeof schema === "object" && !Array.isArray(schema)
+                ? (schema as Json).type
+                : undefined,
+            )
+            .filter((type): type is string => typeof type === "string"),
+        );
+        return types.size === 1
+          ? {
+              type: [...types][0],
+              description: "Accepted shape depends on the input variant. See oneOf/anyOf.",
+            }
+          : { description: "Accepted shape depends on the input variant. See oneOf/anyOf." };
       };
       const variantProps: Record<string, unknown> = {};
       for (const branch of [
@@ -274,13 +288,14 @@ describe("advertised schema equals the procedure schema plus declared overlays",
         const props = (branch.properties ?? {}) as Record<string, unknown>;
         for (const [key, schema] of Object.entries(props)) {
           const encoded = JSON.stringify(schema);
-          const compact = encoded !== undefined && encoded.length <= 400 ? schema : variantStub;
+          const compact =
+            encoded !== undefined && encoded.length <= 400 ? schema : variantStubFor([schema]);
           if (!(key in variantProps)) {
             variantProps[key] = compact;
             continue;
           }
           if (JSON.stringify(variantProps[key]) !== JSON.stringify(compact)) {
-            variantProps[key] = variantStub;
+            variantProps[key] = variantStubFor([variantProps[key], compact, schema]);
           }
         }
       }
@@ -343,6 +358,26 @@ describe("advertised schema equals the procedure schema plus declared overlays",
     }
     expect(branches.some((branch) => (branch.required as string[]).includes("id"))).toBe(true);
     expect((json.properties as Json).id).toMatchObject({ type: "string", minLength: 1 });
+  });
+
+  it("a conflicting union-branch stub keeps a shared JSON Schema type", () => {
+    const long = { type: "string", description: "x".repeat(400) };
+    const other = { type: "string", minLength: 2, description: "y".repeat(400) };
+    const merged = applyInputOverlay(
+      {
+        anyOf: [
+          { type: "object", properties: { payload: long } },
+          { type: "object", properties: { payload: other } },
+        ],
+      },
+      { target: "x.y", confirmation: null },
+    );
+    expect(merged.properties).toMatchObject({
+      payload: {
+        type: "string",
+        description: "Accepted shape depends on the input variant. See oneOf/anyOf.",
+      },
+    });
   });
 
   it("a union input lists each variant's id on root properties (#200)", () => {

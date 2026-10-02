@@ -119,6 +119,8 @@ export type PublicOverflowSkipReason =
   | "BUDGET_EXCEEDED"
   /** Owner-paid grantee spend cap for this exact grant is exhausted. */
   | "GRANTEE_BUDGET_EXCEEDED"
+  /** Grant cap cannot be priced (missing price or currency mismatch). Fail closed. */
+  | "GRANTEE_CAP_UNPRICEABLE"
   | "PROTECTION_POLICY_MISSING"
   /**
    * Transient: no provider attempt could be sent right now (fence allocation,
@@ -4008,7 +4010,9 @@ export async function dispatchPublicOverflow(
           ? "PROTECTION_POLICY_MISSING"
           : lastAdmission.reason === "GRANTEE_BUDGET_EXCEEDED"
             ? "GRANTEE_BUDGET_EXCEEDED"
-            : "BUDGET_EXCEEDED"
+            : lastAdmission.reason === "GRANTEE_CAP_UNPRICEABLE"
+              ? "GRANTEE_CAP_UNPRICEABLE"
+              : "BUDGET_EXCEEDED"
         : (lastSendFailure ?? "PROVIDER_UNAVAILABLE"),
   };
 }
