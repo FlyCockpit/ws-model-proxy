@@ -6589,9 +6589,10 @@ describe("getCliDeviceMetrics", () => {
         gpus: [{ index: 0, name: "NVIDIA GB10", uuid: "GPU-1" }],
       },
     });
+    const bucketStart = new Date(Math.floor(Date.now() / 60_000) * 60_000);
     nodeMetricsMinute.findMany.mockResolvedValue([
       {
-        bucketStart: new Date("2026-09-28T10:00:00.000Z"),
+        bucketStart,
         samples: 2,
         cpuSamples: 2,
         minCpuPercent: 10,
@@ -6616,11 +6617,16 @@ describe("getCliDeviceMetrics", () => {
     expect(result.node.suggestedLabels).toEqual(["dgx-spark", "unified-memory"]);
     expect(result.minuteHistory).toEqual([
       expect.objectContaining({
-        start: "2026-09-28T10:00:00.000Z",
+        start: bucketStart.toISOString(),
         avgCpuPercent: 15,
         avgMemoryAvailableMiB: 2000,
+        gap: false,
       }),
     ]);
+    expect(result.history24h).toHaveLength(96);
+    expect(result.history7d).toHaveLength(168);
+    expect(result.history24h.some((point) => !point.gap && point.avgCpuPercent === 15)).toBe(true);
+    expect(result.history7d.some((point) => !point.gap && point.avgCpuPercent === 15)).toBe(true);
   });
 });
 
@@ -6724,6 +6730,7 @@ describe("metric routing procedures (S-B part 2)", () => {
     inferenceCapacity: { findFirst: MockInstance };
     capacityKvEviction: { findMany: MockInstance };
     poolMemberRoutingVerdict: { findMany: MockInstance; deleteMany: MockInstance };
+    poolRoutingRule: { deleteMany: MockInstance; createMany: MockInstance };
     cliDevice: { findUnique: MockInstance; findMany: MockInstance; updateMany: MockInstance };
     nodeMetricsMinute: { findMany: MockInstance };
   };
@@ -6737,6 +6744,10 @@ describe("metric routing procedures (S-B part 2)", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) =>
+      callback(db),
+    );
+    db.$queryRaw.mockResolvedValue([]);
     deep.capacityKvEviction.findMany.mockResolvedValue([]);
     deep.nodeMetricsMinute.findMany.mockResolvedValue([]);
   });
@@ -6832,7 +6843,7 @@ describe("metric routing procedures (S-B part 2)", () => {
         deep.modelPool.findFirst.mockResolvedValue({
           id: "pool-1",
           slug: "coder",
-          routingRules: [],
+          PoolRoutingRules: [],
           protectionEnabled,
           PoolMembers: [
             {
@@ -6896,7 +6907,9 @@ describe("metric routing procedures (S-B part 2)", () => {
   );
 
   it("replaces a pool's rules, scoped to the owner, and asks the relay to clear its verdicts (M never writes an H table)", async () => {
-    deep.modelPool.updateMany.mockResolvedValue({ count: 1 });
+    deep.modelPool.findFirst.mockResolvedValue({ id: "pool-1", PoolMembers: [{ id: "m1" }] });
+    deep.poolRoutingRule.deleteMany.mockResolvedValue({ count: 0 });
+    deep.poolRoutingRule.createMany.mockResolvedValue({ count: 1 });
     const onPoolRoutingRulesChanged = vi.fn(async () => undefined);
     const rules = [
       {
@@ -6912,16 +6925,43 @@ describe("metric routing procedures (S-B part 2)", () => {
       rules: [...rules],
     });
     expect(result.rules[0]).toMatchObject({ aggregate: "max", effect: "full" });
-    expect(deep.modelPool.updateMany).toHaveBeenCalledWith({
-      where: { id: "pool-1", userId: "user-id" },
-      data: { routingRules: [expect.objectContaining({ metric: "node.gpu.temperature_c" })] },
+    expect(deep.poolRoutingRule.deleteMany).toHaveBeenCalledWith({ where: { poolId: "pool-1" } });
+    expect(deep.poolRoutingRule.createMany).toHaveBeenCalledWith({
+      data: [
+        expect.objectContaining({
+          poolId: "pool-1",
+          position: 0,
+          metric: "node.gpu.temperature_c",
+          memberId: null,
+          exclude: false,
+        }),
+      ],
     });
     expect(onPoolRoutingRulesChanged).toHaveBeenCalledWith("pool-1");
     expect(deep.poolMemberRoutingVerdict.deleteMany).not.toHaveBeenCalled();
   });
 
+  it("rejects a member-scoped rule whose id is not in the pool", async () => {
+    deep.modelPool.findFirst.mockResolvedValue({ id: "pool-1", PoolMembers: [{ id: "m1" }] });
+    await expect(
+      client().setPoolRoutingRules({
+        poolId: "pool-1",
+        rules: [{ metric: "x", op: ">", threshold: 1, effect: "avoid", memberId: "other-pool" }],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(
+      client().setPoolRoutingRules({
+        poolId: "pool-1",
+        rules: [
+          { metric: "x", op: ">", threshold: 1, effect: "avoid", excludeMemberId: "other-pool" },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(deep.poolRoutingRule.createMany).not.toHaveBeenCalled();
+  });
+
   it("rejects another user's pool and invalid rules without writing", async () => {
-    deep.modelPool.updateMany.mockResolvedValue({ count: 0 });
+    deep.modelPool.findFirst.mockResolvedValue(null);
     await expect(
       client().setPoolRoutingRules({
         poolId: "pool-1",
@@ -6929,6 +6969,7 @@ describe("metric routing procedures (S-B part 2)", () => {
       }),
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
     expect(deep.poolMemberRoutingVerdict.deleteMany).not.toHaveBeenCalled();
+    expect(deep.poolRoutingRule.createMany).not.toHaveBeenCalled();
     await expect(
       client().setPoolRoutingRules({
         poolId: "pool-1",
@@ -6951,7 +6992,7 @@ describe("metric routing procedures (S-B part 2)", () => {
     deep.modelPool.findFirst.mockResolvedValue({
       id: "pool-1",
       slug: "coder",
-      routingRules: [{ metric: "fan_rpm", op: ">", threshold: 3000, effect: "avoid" }],
+      PoolRoutingRules: [{ metric: "fan_rpm", op: ">", threshold: 3000, effect: "avoid" }],
       PoolMembers: [
         { id: "m1", DiscoveredModel: null, ExecutionTarget: { DiscoveredModel: model("a") } },
         { id: "m2", DiscoveredModel: null, ExecutionTarget: { DiscoveredModel: model("b") } },
@@ -7048,7 +7089,7 @@ describe("metric routing procedures (S-B part 2)", () => {
     deep.modelPool.findFirst.mockResolvedValue({
       id: "pool-1",
       slug: "coder",
-      routingRules: [],
+      PoolRoutingRules: [],
       PoolMembers: [
         {
           id: "m1",
@@ -7202,7 +7243,7 @@ describe("metric routing procedures (S-B part 2)", () => {
     deep.modelPool.findFirst.mockResolvedValue({
       id: "pool-1",
       slug: "coder",
-      routingRules: [],
+      PoolRoutingRules: [],
       PoolMembers: [
         {
           id: "m-observe",

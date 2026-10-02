@@ -11,6 +11,7 @@ import {
   validateForwarderSlug,
 } from "@ws-model-proxy/config/forwarder-identifiers";
 import { MEDIA_ATTACHMENT_MAX_BYTES_MAX } from "@ws-model-proxy/config/media-policy";
+import { OVERVIEW_RANGE_CONFIG } from "@ws-model-proxy/config/usage-metrics";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
   acquireFences,
@@ -99,7 +100,8 @@ import {
   nodeUsableBudgetsInputSchema,
   normalizeNodeLabels,
   parseNodeInfo,
-  shapeNodeMetricsMinute,
+  shapeNodeMetricsRange,
+  tryShapeNodeMetricsMinute,
 } from "../lib/node-inventory";
 import {
   audioOperationSupported,
@@ -111,6 +113,7 @@ import {
   transformerModalityMismatchErrors,
   transformerSupportedModalities,
 } from "../lib/openai-compatible-capabilities";
+import { overviewWindow } from "../lib/overview-metrics";
 import {
   capabilityEditImpactedPools,
   discoveredModelPoolMemberWhere,
@@ -939,22 +942,37 @@ function serializeCliDeviceNode(
   });
 }
 
-async function loadNodeMetricsMinuteHistory(input: {
+async function loadNodeMetricsHistories(input: {
   ownerUserId: string;
   cliDeviceId: string;
   now: Date;
 }) {
-  const since = new Date(input.now.getTime() - 60 * 60 * 1000);
-  const rows = await prisma.nodeMetricsMinute.findMany({
-    where: {
-      ownerUserId: input.ownerUserId,
-      cliDeviceId: input.cliDeviceId,
-      bucketStart: { gte: since },
-    },
-    orderBy: { bucketStart: "asc" },
-    take: 60,
-  });
-  return (Array.isArray(rows) ? rows : []).map(shapeNodeMetricsMinute);
+  const window7d = overviewWindow("7d", input.now);
+  const window24h = overviewWindow("24h", input.now);
+  const hourAgo = new Date(input.now.getTime() - OVERVIEW_RANGE_CONFIG["1h"].durationMs);
+  try {
+    const rows = await prisma.nodeMetricsMinute.findMany({
+      where: {
+        ownerUserId: input.ownerUserId,
+        cliDeviceId: input.cliDeviceId,
+        bucketStart: { gte: window7d.start, lt: window7d.end },
+      },
+      orderBy: { bucketStart: "asc" },
+    });
+    const list = Array.isArray(rows) ? rows : [];
+    return {
+      minuteHistory: list.flatMap((row) => {
+        const start = row.bucketStart instanceof Date ? row.bucketStart : new Date(row.bucketStart);
+        if (start.getTime() < hourAgo.getTime()) return [];
+        const point = tryShapeNodeMetricsMinute(row);
+        return point ? [point] : [];
+      }),
+      history24h: shapeNodeMetricsRange(list, window24h),
+      history7d: shapeNodeMetricsRange(list, window7d),
+    };
+  } catch {
+    return { minuteHistory: [], history24h: [], history7d: [] };
+  }
 }
 
 function serializeCliDevice(
@@ -2914,8 +2932,9 @@ export const forwarderManagementRouter = {
    * Relay 2.4 node telemetry for one CLI device: its static `node.info`, the
    * freshest `node.metrics` (live from the relay session, else the stored
    * once-a-minute snapshot), live engine load per endpoint, the node-card
-   * snapshot (labels, usable budgets, health warnings), and last-hour minute
-   * history. Read-only. Label and budget writes are dashboard-only.
+   * snapshot (labels, usable budgets, health warnings), last-hour minute
+   * history, and 24h/7d sparkline series from the 7-day minutes. Read-only.
+   * Label and budget writes are dashboard-only.
    */
   getCliDeviceMetrics: protectedProcedure
     .input(z.object({ cliDeviceId: idSchema }))
@@ -2987,11 +3006,11 @@ export const forwarderManagementRouter = {
         endpointLoad: live?.endpointLoad ?? [],
         labels: normalizeNodeLabels(row.labels ?? []),
         node: serializeCliDeviceNode(row, nodeMetrics),
-        minuteHistory: await loadNodeMetricsMinuteHistory({
+        ...(await loadNodeMetricsHistories({
           ownerUserId: row.userId,
           cliDeviceId: row.id,
           now,
-        }),
+        })),
       };
     }),
 

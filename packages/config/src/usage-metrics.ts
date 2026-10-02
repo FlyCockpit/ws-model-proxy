@@ -105,5 +105,5 @@ export const USAGE_ROLLUP_MINUTE_RETENTION_DAYS = 30;
 export const USAGE_ROLLUP_HOUR_RETENTION_DAYS = 395;
 /** Engine-load minute rollups cover Overview 24h/7d (kept 8 days). */
 export const ENGINE_LOAD_ROLLUP_MINUTE_RETENTION_DAYS = 8;
-/** Node-metrics minute rollups cover CLI node-card sparklines (kept 7 days). */
+/** Node-metrics minute rollups cover CLI node-card 1h/24h/7d sparklines (kept 7 days). */
 export const NODE_METRICS_MINUTE_RETENTION_DAYS = 7;

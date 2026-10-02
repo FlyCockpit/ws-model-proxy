@@ -192,20 +192,99 @@ function upsertSql(increment: NodeMetricsRollupIncrement): Prisma.Sql {
       "updatedAt" = now()`;
 }
 
+function incrementValues(increment: NodeMetricsRollupIncrement): Prisma.Sql {
+  return Prisma.sql`(${increment.bucketStart}, ${increment.ownerUserId}, ${increment.cliDeviceId},
+    ${increment.samples}, ${increment.cpuSamples},
+    ${increment.minCpuPercent}, ${increment.sumCpuPercent}, ${increment.maxCpuPercent},
+    ${increment.memorySamples}, ${increment.minMemoryAvailableMiB},
+    ${increment.sumMemoryAvailableMiB}, ${increment.maxMemoryAvailableMiB},
+    ${increment.minMemoryUsedPercent}, ${increment.sumMemoryUsedPercent},
+    ${increment.maxMemoryUsedPercent}, ${increment.maxGpuTemperatureC},
+    ${increment.maxGpuUtilizationPercent})`;
+}
+
+function upsertManySql(increments: readonly NodeMetricsRollupIncrement[]): Prisma.Sql {
+  return Prisma.sql`
+    INSERT INTO node_metrics_minute AS existing
+      ("bucketStart", "ownerUserId", "cliDeviceId", samples, "cpuSamples",
+       "minCpuPercent", "sumCpuPercent", "maxCpuPercent", "memorySamples",
+       "minMemoryAvailableMiB", "sumMemoryAvailableMiB", "maxMemoryAvailableMiB",
+       "minMemoryUsedPercent", "sumMemoryUsedPercent", "maxMemoryUsedPercent",
+       "maxGpuTemperatureC", "maxGpuUtilizationPercent")
+    VALUES ${Prisma.join(increments.map(incrementValues))}
+    ON CONFLICT ("bucketStart", "ownerUserId", "cliDeviceId")
+    DO UPDATE SET
+      samples = existing.samples + EXCLUDED.samples,
+      "cpuSamples" = existing."cpuSamples" + EXCLUDED."cpuSamples",
+      "minCpuPercent" = CASE
+        WHEN existing."minCpuPercent" IS NULL THEN EXCLUDED."minCpuPercent"
+        WHEN EXCLUDED."minCpuPercent" IS NULL THEN existing."minCpuPercent"
+        ELSE LEAST(existing."minCpuPercent", EXCLUDED."minCpuPercent") END,
+      "sumCpuPercent" = COALESCE(existing."sumCpuPercent", 0) + COALESCE(EXCLUDED."sumCpuPercent", 0),
+      "maxCpuPercent" = CASE
+        WHEN existing."maxCpuPercent" IS NULL THEN EXCLUDED."maxCpuPercent"
+        WHEN EXCLUDED."maxCpuPercent" IS NULL THEN existing."maxCpuPercent"
+        ELSE GREATEST(existing."maxCpuPercent", EXCLUDED."maxCpuPercent") END,
+      "memorySamples" = existing."memorySamples" + EXCLUDED."memorySamples",
+      "minMemoryAvailableMiB" = CASE
+        WHEN existing."minMemoryAvailableMiB" IS NULL THEN EXCLUDED."minMemoryAvailableMiB"
+        WHEN EXCLUDED."minMemoryAvailableMiB" IS NULL THEN existing."minMemoryAvailableMiB"
+        ELSE LEAST(existing."minMemoryAvailableMiB", EXCLUDED."minMemoryAvailableMiB") END,
+      "sumMemoryAvailableMiB" = COALESCE(existing."sumMemoryAvailableMiB", 0)
+        + COALESCE(EXCLUDED."sumMemoryAvailableMiB", 0),
+      "maxMemoryAvailableMiB" = CASE
+        WHEN existing."maxMemoryAvailableMiB" IS NULL THEN EXCLUDED."maxMemoryAvailableMiB"
+        WHEN EXCLUDED."maxMemoryAvailableMiB" IS NULL THEN existing."maxMemoryAvailableMiB"
+        ELSE GREATEST(existing."maxMemoryAvailableMiB", EXCLUDED."maxMemoryAvailableMiB") END,
+      "minMemoryUsedPercent" = CASE
+        WHEN existing."minMemoryUsedPercent" IS NULL THEN EXCLUDED."minMemoryUsedPercent"
+        WHEN EXCLUDED."minMemoryUsedPercent" IS NULL THEN existing."minMemoryUsedPercent"
+        ELSE LEAST(existing."minMemoryUsedPercent", EXCLUDED."minMemoryUsedPercent") END,
+      "sumMemoryUsedPercent" = COALESCE(existing."sumMemoryUsedPercent", 0)
+        + COALESCE(EXCLUDED."sumMemoryUsedPercent", 0),
+      "maxMemoryUsedPercent" = CASE
+        WHEN existing."maxMemoryUsedPercent" IS NULL THEN EXCLUDED."maxMemoryUsedPercent"
+        WHEN EXCLUDED."maxMemoryUsedPercent" IS NULL THEN existing."maxMemoryUsedPercent"
+        ELSE GREATEST(existing."maxMemoryUsedPercent", EXCLUDED."maxMemoryUsedPercent") END,
+      "maxGpuTemperatureC" = CASE
+        WHEN existing."maxGpuTemperatureC" IS NULL THEN EXCLUDED."maxGpuTemperatureC"
+        WHEN EXCLUDED."maxGpuTemperatureC" IS NULL THEN existing."maxGpuTemperatureC"
+        ELSE GREATEST(existing."maxGpuTemperatureC", EXCLUDED."maxGpuTemperatureC") END,
+      "maxGpuUtilizationPercent" = CASE
+        WHEN existing."maxGpuUtilizationPercent" IS NULL THEN EXCLUDED."maxGpuUtilizationPercent"
+        WHEN EXCLUDED."maxGpuUtilizationPercent" IS NULL THEN existing."maxGpuUtilizationPercent"
+        ELSE GREATEST(existing."maxGpuUtilizationPercent", EXCLUDED."maxGpuUtilizationPercent") END,
+      "updatedAt" = now()`;
+}
+
 export async function writeNodeMetricsIncrements(
   increments: readonly NodeMetricsRollupIncrement[],
-  db: Pick<typeof prisma, "$executeRaw"> = prisma,
+  db: { $executeRaw: (query: Prisma.Sql) => Promise<unknown> } = prisma,
 ): Promise<number> {
   const sorted = [...increments].sort((left, right) => {
     const a = incrementKeyString(left);
     const b = incrementKeyString(right);
     return a < b ? -1 : a > b ? 1 : 0;
   });
-  for (const increment of sorted) {
-    if (isDbShutdownFenceArmed()) return 0;
-    await db.$executeRaw(upsertSql(increment));
+  if (sorted.length === 0) return 0;
+  if (isDbShutdownFenceArmed()) return 0;
+  try {
+    await db.$executeRaw(upsertManySql(sorted));
+    return sorted.length;
+  } catch {
+    /* One overflowing or rejected row must not drop the rest of the flush. */
   }
-  return sorted.length;
+  let written = 0;
+  for (const increment of sorted) {
+    if (isDbShutdownFenceArmed()) return written;
+    try {
+      await db.$executeRaw(upsertSql(increment));
+      written += 1;
+    } catch {
+      /* Isolate L1 row failures. */
+    }
+  }
+  return written;
 }
 
 export function createNodeMetricsRollupWriter({

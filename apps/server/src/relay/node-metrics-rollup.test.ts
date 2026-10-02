@@ -2,7 +2,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@ws-model-proxy/db", () => ({
   default: {},
-  Prisma: { sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({ strings, values }) },
+  Prisma: {
+    sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({ strings, values }),
+    join: (values: unknown[]) => ({ strings: ["join"], values }),
+  },
 }));
 vi.mock("@ws-model-proxy/db/shutdown-fence", () => ({ isDbShutdownFenceArmed: () => false }));
 
@@ -13,6 +16,7 @@ import {
   NODE_METRICS_ROLLUP_MAX_PENDING,
   type NodeMetricsRollupSample,
   truncateToMinute,
+  writeNodeMetricsIncrements,
 } from "./node-metrics-rollup.js";
 
 const NOW = new Date("2026-09-30T12:00:30.000Z");
@@ -122,5 +126,43 @@ describe("node-metrics rollup writer", () => {
     release?.();
     await flushing;
     expect(writes.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("writes a batch in one statement", async () => {
+    const calls: unknown[] = [];
+    const written = await writeNodeMetricsIncrements(
+      [
+        mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "a" })),
+        mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "b" })),
+      ],
+      {
+        $executeRaw: async (sql) => {
+          calls.push(sql);
+          return 2;
+        },
+      },
+    );
+    expect(calls).toHaveLength(1);
+    expect(written).toBe(2);
+  });
+
+  it("isolates a failed increment so later rows still write", async () => {
+    const calls: unknown[] = [];
+    const written = await writeNodeMetricsIncrements(
+      [
+        mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "a" })),
+        mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "b" })),
+      ],
+      {
+        $executeRaw: async () => {
+          calls.push(true);
+          if (calls.length === 1) throw new Error("batch overflow");
+          if (calls.length === 2) throw new Error("int4 overflow");
+          return 1;
+        },
+      },
+    );
+    expect(calls).toHaveLength(3);
+    expect(written).toBe(1);
   });
 });

@@ -7,6 +7,7 @@
 
 import { z } from "zod";
 import { parseNodeMetricsSample } from "./metric-routing";
+import type { OverviewWindow } from "./overview-metrics";
 
 export const NODE_KINDS = ["unified", "discrete", "cpu"] as const;
 export type NodeKind = (typeof NODE_KINDS)[number];
@@ -625,14 +626,10 @@ export type NodeMetricsMinutePoint = {
   maxMemoryUsedPercent: number | null;
   maxGpuTemperatureC: number | null;
   maxGpuUtilizationPercent: number | null;
+  gap: boolean;
 };
 
-function avg(sum: number | null | undefined, count: number): number | null {
-  if (sum == null || count <= 0 || !Number.isFinite(sum)) return null;
-  return sum / count;
-}
-
-export function shapeNodeMetricsMinute(row: {
+export type NodeMetricsMinuteRow = {
   bucketStart: Date | string;
   samples: number;
   cpuSamples: number;
@@ -648,7 +645,14 @@ export function shapeNodeMetricsMinute(row: {
   maxMemoryUsedPercent: number | null;
   maxGpuTemperatureC: number | null;
   maxGpuUtilizationPercent: number | null;
-}): NodeMetricsMinutePoint {
+};
+
+function avg(sum: number | null | undefined, count: number): number | null {
+  if (sum == null || count <= 0 || !Number.isFinite(sum)) return null;
+  return sum / count;
+}
+
+export function shapeNodeMetricsMinute(row: NodeMetricsMinuteRow): NodeMetricsMinutePoint {
   const start = row.bucketStart instanceof Date ? row.bucketStart.toISOString() : row.bucketStart;
   return {
     start,
@@ -664,5 +668,128 @@ export function shapeNodeMetricsMinute(row: {
     maxMemoryUsedPercent: row.maxMemoryUsedPercent,
     maxGpuTemperatureC: row.maxGpuTemperatureC,
     maxGpuUtilizationPercent: row.maxGpuUtilizationPercent,
+    gap: false,
   };
+}
+
+/** Skip a malformed minute instead of failing the sparkline. */
+export function tryShapeNodeMetricsMinute(row: unknown): NodeMetricsMinutePoint | null {
+  if (!row || typeof row !== "object") return null;
+  try {
+    const point = shapeNodeMetricsMinute(row as NodeMetricsMinuteRow);
+    if (!point.start || Number.isNaN(Date.parse(point.start))) return null;
+    return point;
+  } catch {
+    return null;
+  }
+}
+
+function minOpt(current: number | null, next: number | null | undefined): number | null {
+  if (next == null || !Number.isFinite(next)) return current;
+  if (current == null) return next;
+  return Math.min(current, next);
+}
+
+function maxOpt(current: number | null, next: number | null | undefined): number | null {
+  if (next == null || !Number.isFinite(next)) return current;
+  if (current == null) return next;
+  return Math.max(current, next);
+}
+
+function addOpt(current: number | null, next: number | null | undefined): number | null {
+  if (next == null || !Number.isFinite(next)) return current;
+  return (current ?? 0) + next;
+}
+
+const emptyRangePoint = (start: string): NodeMetricsMinutePoint => ({
+  start,
+  samples: 0,
+  minCpuPercent: null,
+  avgCpuPercent: null,
+  maxCpuPercent: null,
+  minMemoryAvailableMiB: null,
+  avgMemoryAvailableMiB: null,
+  maxMemoryAvailableMiB: null,
+  minMemoryUsedPercent: null,
+  avgMemoryUsedPercent: null,
+  maxMemoryUsedPercent: null,
+  maxGpuTemperatureC: null,
+  maxGpuUtilizationPercent: null,
+  gap: true,
+});
+
+/**
+ * Bucket persisted node-metrics minutes into an Overview 1h/24h/7d window.
+ * One malformed row is skipped; missing buckets are `gap`.
+ */
+export function shapeNodeMetricsRange(
+  rows: readonly unknown[],
+  window: OverviewWindow,
+): NodeMetricsMinutePoint[] {
+  const buckets = new Map<number, NodeMetricsMinuteRow>();
+  for (const raw of rows) {
+    if (!raw || typeof raw !== "object") continue;
+    const row = raw as NodeMetricsMinuteRow;
+    try {
+      const startMs = new Date(row.bucketStart).getTime();
+      if (!Number.isFinite(startMs)) continue;
+      if (startMs < window.start.getTime() || startMs >= window.end.getTime()) continue;
+      const bucket =
+        window.start.getTime() +
+        Math.floor((startMs - window.start.getTime()) / window.bucketMs) * window.bucketMs;
+      const current = buckets.get(bucket);
+      buckets.set(bucket, {
+        bucketStart: new Date(bucket),
+        samples: (current?.samples ?? 0) + (Number.isFinite(row.samples) ? row.samples : 0),
+        cpuSamples:
+          (current?.cpuSamples ?? 0) + (Number.isFinite(row.cpuSamples) ? row.cpuSamples : 0),
+        minCpuPercent: minOpt(current?.minCpuPercent ?? null, row.minCpuPercent),
+        sumCpuPercent: addOpt(current?.sumCpuPercent ?? null, row.sumCpuPercent),
+        maxCpuPercent: maxOpt(current?.maxCpuPercent ?? null, row.maxCpuPercent),
+        memorySamples:
+          (current?.memorySamples ?? 0) +
+          (Number.isFinite(row.memorySamples) ? row.memorySamples : 0),
+        minMemoryAvailableMiB: minOpt(
+          current?.minMemoryAvailableMiB ?? null,
+          row.minMemoryAvailableMiB,
+        ),
+        sumMemoryAvailableMiB: addOpt(
+          current?.sumMemoryAvailableMiB ?? null,
+          row.sumMemoryAvailableMiB,
+        ),
+        maxMemoryAvailableMiB: maxOpt(
+          current?.maxMemoryAvailableMiB ?? null,
+          row.maxMemoryAvailableMiB,
+        ),
+        minMemoryUsedPercent: minOpt(
+          current?.minMemoryUsedPercent ?? null,
+          row.minMemoryUsedPercent,
+        ),
+        sumMemoryUsedPercent: addOpt(
+          current?.sumMemoryUsedPercent ?? null,
+          row.sumMemoryUsedPercent,
+        ),
+        maxMemoryUsedPercent: maxOpt(
+          current?.maxMemoryUsedPercent ?? null,
+          row.maxMemoryUsedPercent,
+        ),
+        maxGpuTemperatureC: maxOpt(current?.maxGpuTemperatureC ?? null, row.maxGpuTemperatureC),
+        maxGpuUtilizationPercent: maxOpt(
+          current?.maxGpuUtilizationPercent ?? null,
+          row.maxGpuUtilizationPercent,
+        ),
+      });
+    } catch {
+      /* Isolate one bad minute from the rest of the sparkline. */
+    }
+  }
+  const points: NodeMetricsMinutePoint[] = [];
+  for (let index = 0; index < window.bucketCount; index += 1) {
+    const startMs = window.start.getTime() + index * window.bucketMs;
+    const acc = buckets.get(startMs);
+    points.push(
+      acc ? shapeNodeMetricsMinute(acc) : emptyRangePoint(new Date(startMs).toISOString()),
+    );
+  }
+  return points;
 }

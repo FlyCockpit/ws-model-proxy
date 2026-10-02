@@ -15,9 +15,12 @@ import {
   parseNodeInfo,
   resolveUsableBudgets,
   shapeNodeMetricsMinute,
+  shapeNodeMetricsRange,
   suggestNodeLabels,
+  tryShapeNodeMetricsMinute,
   usableVramGbSchema,
 } from "./node-inventory";
+import { overviewWindow } from "./overview-metrics";
 
 describe("suggestNodeLabels", () => {
   it("suggests dgx-spark and unified-memory for a GB10 node", () => {
@@ -342,5 +345,63 @@ describe("shapeNodeMetricsMinute", () => {
     expect(point.avgMemoryAvailableMiB).toBe(2000);
     expect(point.avgMemoryUsedPercent).toBe(50);
     expect(point.start).toBe("2026-09-30T12:00:00.000Z");
+    expect(point.gap).toBe(false);
+  });
+});
+
+function minuteRow(start: string, cpu: number) {
+  return {
+    bucketStart: new Date(start),
+    samples: 1,
+    cpuSamples: 1,
+    minCpuPercent: cpu,
+    sumCpuPercent: cpu,
+    maxCpuPercent: cpu,
+    memorySamples: 0,
+    minMemoryAvailableMiB: null,
+    sumMemoryAvailableMiB: null,
+    maxMemoryAvailableMiB: null,
+    minMemoryUsedPercent: null,
+    sumMemoryUsedPercent: null,
+    maxMemoryUsedPercent: null,
+    maxGpuTemperatureC: null,
+    maxGpuUtilizationPercent: null,
+  };
+}
+
+describe("tryShapeNodeMetricsMinute", () => {
+  it("skips malformed minutes instead of throwing", () => {
+    expect(tryShapeNodeMetricsMinute(null)).toBeNull();
+    expect(tryShapeNodeMetricsMinute({ bucketStart: "nope" })).toBeNull();
+    expect(tryShapeNodeMetricsMinute(minuteRow("2026-10-02T12:00:00.000Z", 5))).toMatchObject({
+      avgCpuPercent: 5,
+      gap: false,
+    });
+  });
+});
+
+describe("shapeNodeMetricsRange", () => {
+  it("gap-fills 24h buckets and skips a malformed row", () => {
+    const now = new Date("2026-10-02T12:00:00.000Z");
+    const window = overviewWindow("24h", now);
+    expect(window.bucketCount).toBe(96);
+    const first = window.start.toISOString();
+    const points = shapeNodeMetricsRange(
+      [minuteRow(first, 10), { bucketStart: "not-a-date" }, null],
+      window,
+    );
+    expect(points).toHaveLength(96);
+    expect(points[0]).toMatchObject({ start: first, avgCpuPercent: 10, gap: false });
+    expect(points[1]).toMatchObject({ gap: true, samples: 0 });
+  });
+
+  it("gap-fills 7d hourly buckets from the 7-day minutes", () => {
+    const now = new Date("2026-10-02T12:00:00.000Z");
+    const window = overviewWindow("7d", now);
+    expect(window.bucketCount).toBe(168);
+    const points = shapeNodeMetricsRange([minuteRow(window.start.toISOString(), 40)], window);
+    expect(points).toHaveLength(168);
+    expect(points[0]).toMatchObject({ avgCpuPercent: 40, gap: false });
+    expect(points.filter((point) => point.gap)).toHaveLength(167);
   });
 });

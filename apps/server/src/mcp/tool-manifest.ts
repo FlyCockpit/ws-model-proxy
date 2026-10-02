@@ -537,7 +537,7 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     classification: "pure",
     descriptionNote:
-      "Read-only node telemetry for cliDeviceId: node.info, the freshest node.metrics (live or stored), endpoint.load, a node snapshot (kind, GPUs, live memory, labels, usable budgets, health warnings), last-hour minuteHistory min/avg/max gauges, and rule-addressable series. Labels and usable budgets are human-only dashboard writes; this tool never changes them. Health warnings are informational and never preflight gates.",
+      "Read-only node telemetry for cliDeviceId: node.info, the freshest node.metrics (live or stored), endpoint.load, a node snapshot (kind, GPUs, live memory, labels, usable budgets, health warnings), last-hour minuteHistory min/avg/max gauges, 24h (history24h) and 7d (history7d) sparkline series from the 7-day minutes, and rule-addressable series. Labels and usable budgets are human-only dashboard writes; this tool never changes them. Health warnings are informational and never preflight gates.",
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getCliDeviceMetrics),
   },
   {
