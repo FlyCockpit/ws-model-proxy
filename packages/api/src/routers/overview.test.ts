@@ -353,6 +353,44 @@ describe("overviewRouter.metrics", () => {
     expect(rawText(engineLoadCalls[0]!)).toContain("GROUP BY 1, 2");
   });
 
+  it("computes the KV full line over capacity-bearing members only", async () => {
+    db.modelPool.findMany.mockResolvedValue([
+      {
+        ...pool(),
+        PoolMembers: [
+          {
+            ...pool().PoolMembers[0],
+            kvFullThreshold: 0.98,
+            ExecutionTarget: { ...localTarget("target-a", "qwen-a"), inferenceCapacityId: "cap-1" },
+          },
+          {
+            id: "member-ext",
+            tier: "PUBLIC_OVERFLOW",
+            healthStatus: "HEALTHY",
+            routingStatus: "ACTIVE",
+            executionTargetId: "target-ext",
+            kvFullThreshold: null,
+            ExecutionTarget: {
+              id: "target-ext",
+              kind: "PROVIDER_MODEL",
+              inferenceCapacityId: null,
+              DiscoveredModel: null,
+              ProviderModel: {
+                displayName: "gpt-4o",
+                upstreamModelId: "gpt-4o",
+                ProviderAccount: { label: "OpenAI" },
+              },
+            },
+          },
+        ],
+      },
+    ]);
+    db.executionTarget.findMany.mockResolvedValue([]);
+    db.$queryRaw.mockResolvedValue([]);
+    const result = await client().metrics({ range: "24h" });
+    expect(result.pools[0]!.engineLoad.effectiveKvFullThreshold).toBe(0.98);
+  });
+
   it("scopes owned traffic by resource owner and shared-pool usage by requester only", async () => {
     await client().metrics({ range: "1h" });
     const calls = db.$queryRaw.mock.calls as RawCall[];

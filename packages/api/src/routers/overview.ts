@@ -246,9 +246,15 @@ export type OverviewMemberRow = {
   stats: OverviewStats;
 };
 
-function poolEngineLoadThreshold(members: readonly { kvFullThreshold: number | null }[]): number {
-  if (members.length === 0) return effectiveKvFullThreshold(null);
-  return Math.min(...members.map((member) => effectiveKvFullThreshold(member.kvFullThreshold)));
+function poolEngineLoadThreshold(
+  members: readonly {
+    kvFullThreshold: number | null;
+    ExecutionTarget: { inferenceCapacityId: string | null } | null;
+  }[],
+): number {
+  const local = members.filter((member) => member.ExecutionTarget?.inferenceCapacityId);
+  if (local.length === 0) return effectiveKvFullThreshold(null);
+  return Math.min(...local.map((member) => effectiveKvFullThreshold(member.kvFullThreshold)));
 }
 
 export const overviewRouter = {
