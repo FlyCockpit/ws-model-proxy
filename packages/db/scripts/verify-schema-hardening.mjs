@@ -19,6 +19,9 @@ const [packageJson, agentCompose, entrypoint, dangerousWrapper, applyScript] = a
 ]);
 const requiredFragments = [
   "pool_fallback_preference_grantee",
+  "pool_routing_rule_shape_check",
+  "pool routing rule member must belong to the pool",
+  "enforce_pool_routing_rule_member",
   "own-key preference requires the exact non-owner grant",
   "model_pool_recommended_surface_override_check",
   'UPDATE model_pool\n   SET "recommendedSurfaceOverride" = NULL',

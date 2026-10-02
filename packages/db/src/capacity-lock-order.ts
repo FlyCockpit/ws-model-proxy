@@ -15,7 +15,7 @@
  *   `model_pool`, `pool_member`, `pool_grant`, `model_api_token`,
  *   `model_api_token_allowlist_entry`, `provider_account`, `provider_model`,
  *   `provider_credential`, `provider_budget_policy`, `provider_budget_rule`,
- *   `provider_pricing_version`, `pool_fallback_preference`.
+ *   `provider_pricing_version`, `pool_fallback_preference`, `pool_routing_rule`.
  * - Hot path, H-private ({@link HOT_PATH_TABLES}): admission and capacity
  *   runtime state, cache affinity, relay and provider history and accounting,
  *   response stickiness, usage rollups. They reference graph rows by plain id:
@@ -371,6 +371,7 @@ export const GRAPH_TABLES = [
   "inference_capacity",
   "model_pool",
   "pool_member",
+  "pool_routing_rule",
   "pool_grant",
   "model_api_token",
   "model_api_token_allowlist_entry",

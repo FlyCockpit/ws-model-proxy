@@ -179,7 +179,7 @@ const HOT_PATH_WRITERS: Record<string, string> = {
  */
 const GRAPH_WRITERS: Record<string, string> = {
   "packages/api/src/routers/metric-routing.ts":
-    "M: pool routing rules and member engine-load override (one owner-scoped row update of non-key columns each)",
+    "M: pool routing rules (owner fence, replace table rows) and member engine-load override (one owner-scoped row update of non-key columns)",
   "apps/server/src/relay/registration.ts": "M: relay registration",
   "apps/server/src/relay/session-manager.ts": "H status: device connection state",
   "apps/server/src/model-api/provider-attempt-runtime.ts":

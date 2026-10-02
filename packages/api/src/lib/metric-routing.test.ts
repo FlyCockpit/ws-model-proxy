@@ -14,7 +14,10 @@ import {
   pickEngineLoadHistorySeries,
   type RoutingRule,
   remoteMetricSourceDefinitionsSchema,
+  routingRulesFromRows,
   routingRulesSchema,
+  scopedRoutingMemberIds,
+  toStoredRoutingRuleRows,
 } from "./metric-routing";
 
 const NOW = new Date("2026-09-28T12:00:00.000Z");
@@ -106,6 +109,38 @@ describe("routing rule schema", () => {
   it("treats an invalid stored column as no rules", () => {
     expect(parseStoredRoutingRules({ not: "an array" })).toEqual([]);
     expect(parseStoredRoutingRules(null)).toEqual([]);
+  });
+
+  it("round-trips table rows through exclude + memberId", () => {
+    const rows = toStoredRoutingRuleRows([
+      { metric: "x", op: ">", threshold: 1, effect: "full", aggregate: "max", memberId: "m1" },
+      {
+        metric: "y",
+        op: "<",
+        threshold: 2,
+        effect: "avoid",
+        aggregate: "min",
+        excludeMemberId: "m2",
+      },
+    ]);
+    expect(rows).toEqual([
+      expect.objectContaining({ position: 0, memberId: "m1", exclude: false }),
+      expect.objectContaining({ position: 1, memberId: "m2", exclude: true, metric: "y" }),
+    ]);
+    expect(routingRulesFromRows(rows)).toEqual([
+      expect.objectContaining({ metric: "x", memberId: "m1" }),
+      expect.objectContaining({ metric: "y", excludeMemberId: "m2" }),
+    ]);
+    expect(scopedRoutingMemberIds(routingRulesFromRows(rows))).toEqual(["m1", "m2"]);
+  });
+
+  it("drops invalid table rows instead of failing the list", () => {
+    expect(
+      routingRulesFromRows([
+        { metric: "ok", op: ">", threshold: 1, effect: "avoid" },
+        { metric: "bad name", op: ">", threshold: 1, effect: "full" },
+      ]),
+    ).toEqual([expect.objectContaining({ metric: "ok" })]);
   });
 
   it("accepts min/avg aggregates and a single member scope", () => {

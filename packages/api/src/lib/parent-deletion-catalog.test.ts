@@ -103,6 +103,7 @@ const GRAPH_TABLES: Record<string, string> = {
   inference_capacity: "configuration",
   model_pool: "configuration",
   pool_member: "configuration",
+  pool_routing_rule: "configuration: at most 16 rules per pool",
   pool_grant: "configuration",
   pool_fallback_preference: "configuration: at most one per exact pool grant",
   model_api_token: "configuration",

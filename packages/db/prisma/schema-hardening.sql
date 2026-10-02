@@ -18,7 +18,7 @@ BEGIN;
 -- locks is included by the backfills below; one that starts after they are
 -- released sees the installed triggers.
 LOCK TABLE "user", cli_device, endpoint, discovered_model, execution_target, model_pool,
-  model_api_token, pool_member, pool_grant, pool_fallback_preference,
+  model_api_token, pool_member, pool_routing_rule, pool_grant, pool_fallback_preference,
   model_api_token_allowlist_entry, response_stickiness_record,
   relay_request, inference_capacity, capacity_runtime, admission_request, capacity_waiter,
   capacity_lease, capacity_audit_event, provider_account, provider_model, provider_credential,
@@ -342,6 +342,41 @@ ALTER TABLE pool_member ADD CONSTRAINT pool_member_tier_shape_check CHECK (
 
 CREATE UNIQUE INDEX IF NOT EXISTS pool_member_public_order_unique
   ON pool_member ("poolId", "publicOrder") WHERE tier = 'PUBLIC_OVERFLOW';
+
+-- Member-scoped routing rules: pool and member deletes cascade. exclude
+-- without a member is invalid; a memberId must belong to this pool.
+ALTER TABLE pool_routing_rule DROP CONSTRAINT IF EXISTS pool_routing_rule_shape_check;
+ALTER TABLE pool_routing_rule ADD CONSTRAINT pool_routing_rule_shape_check CHECK (
+  position BETWEEN 0 AND 15
+  AND length(metric) BETWEEN 1 AND 64
+  AND metric ~ '^[A-Za-z0-9_.:-]{1,64}$'
+  AND aggregate IN ('max', 'min', 'avg')
+  AND op IN ('>', '>=', '<', '<=')
+  AND effect IN ('full', 'avoid')
+  AND "threshold" = "threshold"
+  AND "threshold" BETWEEN -1e308 AND 1e308
+  AND (NOT exclude OR "memberId" IS NOT NULL)
+  AND ("memberId" IS NULL OR length("memberId") BETWEEN 1 AND 128)
+  AND (labels IS NULL OR jsonb_typeof(labels) = 'object')
+);
+
+CREATE OR REPLACE FUNCTION enforce_pool_routing_rule_member()
+RETURNS trigger LANGUAGE plpgsql AS $pool_routing_rule_member$
+BEGIN
+  IF NEW."memberId" IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM pool_member WHERE id = NEW."memberId" AND "poolId" = NEW."poolId"
+  ) THEN
+    RAISE EXCEPTION 'pool routing rule member must belong to the pool'
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$pool_routing_rule_member$;
+
+DROP TRIGGER IF EXISTS pool_routing_rule_member ON pool_routing_rule;
+CREATE TRIGGER pool_routing_rule_member
+BEFORE INSERT OR UPDATE OF "poolId", "memberId" ON pool_routing_rule
+FOR EACH ROW EXECUTE FUNCTION enforce_pool_routing_rule_member();
 
 -- Fallback redesign: a pool's plain name never leaves the deployment.
 -- PRIMARY members are always local (discovered) models; provider models can
@@ -3186,6 +3221,8 @@ BEGIN
     WHEN 'user' THEN ARRAY[row_data ->> 'id']
     WHEN 'pool_member' THEN ARRAY[
       (SELECT "userId" FROM model_pool WHERE id = row_data ->> 'poolId')]
+    WHEN 'pool_routing_rule' THEN ARRAY[
+      (SELECT "userId" FROM model_pool WHERE id = row_data ->> 'poolId')]
     WHEN 'pool_grant' THEN ARRAY[row_data ->> 'ownerUserId', row_data ->> 'granteeUserId']
     WHEN 'model_api_token_allowlist_entry' THEN ARRAY[
       (SELECT "userId" FROM model_api_token WHERE id = row_data ->> 'modelApiTokenId'),
@@ -3307,6 +3344,7 @@ BEGIN
       'capacityPriority,capacityConcurrencyLimit,capacityReservedSlots,capacityBorrowPolicy,capacityWaitBudgetMs,capacityContextCeiling,capacityContextMargin'),
     ('pool_member', 'id,poolId,discoveredModelId,executionTargetId',
       'tier,capacityPriority,capacityConcurrencyMode,capacityConcurrencyLimit,capacityReservedSlots,capacityBorrowPolicy,capacityWaitBudgetMode,capacityWaitBudgetMs,capacityContextCeilingMode,capacityContextCeiling,capacityContextMargin'),
+    ('pool_routing_rule', 'id,poolId,memberId,exclude,position,metric,labels,aggregate,op,threshold,effect', ''),
     ('pool_grant', 'id,poolId,ownerUserId,granteeUserId', ''),
     ('model_api_token', 'id,userId,lookupPrefix,secretDigest', ''),
     ('model_api_token_allowlist_entry', 'id,modelApiTokenId,target,discoveredModelId,executionTargetId,modelPoolId', ''),

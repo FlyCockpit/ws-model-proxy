@@ -63,7 +63,9 @@ const labelsSchema = z
   )
   .pipe(z.record(metricNameSchema, metricNameSchema));
 
-const optionalMemberId = z.string().min(1).nullable().optional();
+/** Shared id schema for pool and member references. */
+export const idSchema = z.string().min(1);
+const optionalMemberId = idSchema.nullable().optional();
 
 export const routingRuleSchema = z
   .object({
@@ -101,6 +103,70 @@ export const routingRulesSchema = z.array(routingRuleSchema).max(ROUTING_RULES_M
 export function parseStoredRoutingRules(value: unknown): RoutingRule[] {
   const parsed = routingRulesSchema.safeParse(value);
   return parsed.success ? parsed.data : [];
+}
+
+/** One `pool_routing_rule` row as evaluation and the dashboard read it. */
+export type StoredRoutingRuleRow = {
+  position?: number;
+  metric: string;
+  labels?: unknown;
+  aggregate?: string | null;
+  op: string;
+  threshold: number;
+  effect: string;
+  memberId?: string | null;
+  exclude?: boolean;
+};
+
+function labelsFromStored(value: unknown): unknown {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) return undefined;
+  return value;
+}
+
+/** Map persisted rule rows to the evaluation schema; invalid rows are dropped. */
+export function routingRulesFromRows(rows: readonly StoredRoutingRuleRow[]): RoutingRule[] {
+  const ordered = [...rows].sort((left, right) => (left.position ?? 0) - (right.position ?? 0));
+  const parsed: RoutingRule[] = [];
+  for (const row of ordered) {
+    if (parsed.length >= ROUTING_RULES_MAX) break;
+    const rule = routingRuleSchema.safeParse({
+      metric: row.metric,
+      labels: labelsFromStored(row.labels),
+      aggregate: row.aggregate ?? "max",
+      op: row.op,
+      threshold: row.threshold,
+      effect: row.effect,
+      memberId: row.exclude ? null : (row.memberId ?? null),
+      excludeMemberId: row.exclude ? (row.memberId ?? null) : null,
+    });
+    if (rule.success) parsed.push(rule.data);
+  }
+  return parsed;
+}
+
+/** Persist API rules as table rows (`exclude` + one member FK). */
+export function toStoredRoutingRuleRows(value: unknown): StoredRoutingRuleRow[] {
+  return parseStoredRoutingRules(value).map((rule, position) => ({
+    position,
+    metric: rule.metric,
+    labels: rule.labels ?? null,
+    aggregate: rule.aggregate,
+    op: rule.op,
+    threshold: rule.threshold,
+    effect: rule.effect,
+    memberId: rule.memberId ?? rule.excludeMemberId ?? null,
+    exclude: Boolean(rule.excludeMemberId),
+  }));
+}
+
+/** Member ids a rule list names (include or exclude). */
+export function scopedRoutingMemberIds(rules: readonly RoutingRule[]): string[] {
+  const ids = new Set<string>();
+  for (const rule of rules) {
+    if (rule.memberId) ids.add(rule.memberId);
+    if (rule.excludeMemberId) ids.add(rule.excludeMemberId);
+  }
+  return [...ids];
 }
 
 /**

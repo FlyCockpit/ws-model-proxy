@@ -36,10 +36,10 @@ import {
   evaluateRoutingRules,
   type NodeMetricsSample,
   nodeMetricSeries,
-  parseStoredRoutingRules,
   pickEndpointLoad,
   type RoutingEvaluation,
   type RoutingVerdict,
+  routingRulesFromRows,
 } from "@ws-model-proxy/api/lib/metric-routing";
 import prisma from "@ws-model-proxy/db";
 
@@ -222,7 +222,24 @@ export class MetricRoutingEvaluator {
         engineLoadMode: true,
         customEngineLoadMode: true,
         kvFullThreshold: true,
-        ModelPool: { select: { routingRules: true } },
+        ModelPool: {
+          select: {
+            PoolRoutingRules: {
+              orderBy: { position: "asc" as const },
+              select: {
+                position: true,
+                metric: true,
+                labels: true,
+                aggregate: true,
+                op: true,
+                threshold: true,
+                effect: true,
+                memberId: true,
+                exclude: true,
+              },
+            },
+          },
+        },
         DiscoveredModel: { select: { slug: true, Endpoint: { select: { slug: true } } } },
         ExecutionTarget: {
           select: {
@@ -247,7 +264,7 @@ export class MetricRoutingEvaluator {
     const seen = new Set<string>();
     const published: PublishedEntry[] = [];
     for (const member of members) {
-      const rules = parseStoredRoutingRules(member.ModelPool.routingRules);
+      const rules = routingRulesFromRows(member.ModelPool.PoolRoutingRules ?? []);
       const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
       if (!model) continue;
       const memberRef = { endpointSlug: model.Endpoint.slug, modelSlug: model.slug ?? null };
@@ -387,10 +404,26 @@ export class MetricRoutingEvaluator {
     const poolIds = [...new Set(published.map((entry) => entry.poolId))];
     const pools = await this.db.modelPool.findMany({
       where: { id: { in: poolIds } },
-      select: { id: true, routingRules: true },
+      select: {
+        id: true,
+        PoolRoutingRules: {
+          orderBy: { position: "asc" },
+          select: {
+            position: true,
+            metric: true,
+            labels: true,
+            aggregate: true,
+            op: true,
+            threshold: true,
+            effect: true,
+            memberId: true,
+            exclude: true,
+          },
+        },
+      },
     });
     const current = new Map(
-      pools.map((pool) => [pool.id, rulesKey(parseStoredRoutingRules(pool.routingRules))]),
+      pools.map((pool) => [pool.id, rulesKey(routingRulesFromRows(pool.PoolRoutingRules ?? []))]),
     );
     const members = await this.db.poolMember.findMany({
       where: { id: { in: published.map((entry) => entry.memberId) } },

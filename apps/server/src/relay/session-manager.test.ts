@@ -3779,13 +3779,13 @@ describe("relay 2.7 telemetry", () => {
       const routingRules = [
         { metric: "node.cpu.usage_percent", op: ">", threshold: 10, effect: "full" },
       ];
-      deep.modelPool.findMany.mockResolvedValue([{ id: "pool-1", routingRules }]);
+      deep.modelPool.findMany.mockResolvedValue([{ id: "pool-1", PoolRoutingRules: routingRules }]);
       deep.poolMember.findMany.mockResolvedValue([
         {
           id: "member-1",
           poolId: "pool-1",
           ModelPool: {
-            routingRules,
+            PoolRoutingRules: routingRules,
           },
           DiscoveredModel: null,
           ExecutionTarget: { DiscoveredModel: { slug: null, Endpoint: { slug: "example" } } },
@@ -3826,7 +3826,7 @@ describe("relay 2.7 telemetry", () => {
           poolId: "pool-1",
           engineLoadMode: "AUTO",
           kvFullThreshold: null,
-          ModelPool: { routingRules: [] },
+          ModelPool: { PoolRoutingRules: [] },
           DiscoveredModel: null,
           ExecutionTarget: {
             InferenceCapacity: { engineKind: "VLLM", engineSlots: null },

@@ -4,7 +4,8 @@
  */
 import { createHash } from "node:crypto";
 import { ORPCError } from "@orpc/server";
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
+import { fenceOwners } from "@ws-model-proxy/db/capacity-lock-order";
 import { z } from "zod";
 import type { LiveNodeTelemetrySnapshot } from "../context";
 import { protectedProcedure } from "../index";
@@ -29,23 +30,23 @@ import {
   endpointLoadSeries,
   engineLoadHistoryKey,
   engineLoadHistoryLookupKeys,
+  idSchema,
   type MetricSeries,
   nodeMetricSeries,
   parseNodeMetricsSample,
   parseStoredRemoteMetricSources,
-  parseStoredRoutingRules,
   pickEndpointLoad,
   pickEngineLoadHistorySeries,
   type RemoteMetricSourceDefinition,
   remoteMetricSourceDefinitionsSchema,
+  routingRulesFromRows,
   routingRulesSchema,
+  scopedRoutingMemberIds,
 } from "../lib/metric-routing";
 import {
   remoteEngineAdapterDefinitionsSchema,
   serializeRemoteEngineAdapters,
 } from "../lib/remote-engine-adapters";
-
-const idSchema = z.string().min(1);
 
 function commandSha256(command: string): string {
   return createHash("sha256").update(command, "utf8").digest("hex");
@@ -117,9 +118,22 @@ export const metricRoutingProcedures = {
         select: {
           id: true,
           slug: true,
-          routingRules: true,
           protectionEnabled: true,
           evictionFeedbackEnabled: true,
+          PoolRoutingRules: {
+            orderBy: { position: "asc" },
+            select: {
+              position: true,
+              metric: true,
+              labels: true,
+              aggregate: true,
+              op: true,
+              threshold: true,
+              effect: true,
+              memberId: true,
+              exclude: true,
+            },
+          },
           PoolMembers: {
             where: { tier: "PRIMARY" },
             orderBy: { createdAt: "asc" },
@@ -150,7 +164,7 @@ export const metricRoutingProcedures = {
         },
       });
       if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
-      const rules = parseStoredRoutingRules(pool.routingRules);
+      const rules = routingRulesFromRows(pool.PoolRoutingRules);
       const members = pool.PoolMembers.flatMap((member) => {
         const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
         return model
@@ -486,16 +500,44 @@ export const metricRoutingProcedures = {
     .input(z.object({ poolId: idSchema, rules: routingRulesSchema }))
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
-      // One graph statement (a non-key JSON column). The stored gating verdicts are
-      // H-class rows: they are cleared afterwards by the relay (H module),
+      // Graph table replace under the owner fence. The stored gating verdicts
+      // are H-class rows: they are cleared afterwards by the relay (H module),
       // never by this M writer.
-      const updated = await prisma.modelPool.updateMany({
-        where: { id: input.poolId, userId },
-        data: { routingRules: input.rules },
+      await prisma.$transaction(async (tx) => {
+        await fenceOwners(tx, [userId]);
+        await tx.$queryRaw`
+          SELECT id FROM model_pool
+           WHERE id = ${input.poolId} AND "userId" = ${userId}
+           FOR NO KEY UPDATE`;
+        const pool = await tx.modelPool.findFirst({
+          where: { id: input.poolId, userId },
+          select: { id: true, PoolMembers: { select: { id: true } } },
+        });
+        if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+        const memberIds = new Set(pool.PoolMembers.map((member) => member.id));
+        const unknown = scopedRoutingMemberIds(input.rules).filter((id) => !memberIds.has(id));
+        if (unknown.length > 0) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "memberId and excludeMemberId must name members of this pool.",
+          });
+        }
+        await tx.poolRoutingRule.deleteMany({ where: { poolId: pool.id } });
+        if (input.rules.length === 0) return;
+        await tx.poolRoutingRule.createMany({
+          data: input.rules.map((rule, position) => ({
+            poolId: pool.id,
+            position,
+            metric: rule.metric,
+            labels: rule.labels ?? Prisma.JsonNull,
+            aggregate: rule.aggregate,
+            op: rule.op,
+            threshold: rule.threshold,
+            effect: rule.effect,
+            memberId: rule.memberId ?? rule.excludeMemberId ?? null,
+            exclude: Boolean(rule.excludeMemberId),
+          })),
+        });
       });
-      if (updated.count === 0) {
-        throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
-      }
       await context.services?.onPoolRoutingRulesChanged?.(input.poolId);
       return { poolId: input.poolId, rules: input.rules };
     }),
