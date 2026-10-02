@@ -475,6 +475,7 @@ mod tests {
                 },
             ],
             engine_adapters: Vec::new(),
+            abandoned_recovery: None,
         }
     }
 

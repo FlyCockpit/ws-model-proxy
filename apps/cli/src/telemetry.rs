@@ -1237,6 +1237,16 @@ fn collect_node_metrics(
             engine_adapters.truncate(NODE_ENGINE_ADAPTERS_MAX);
             engine_adapters
         },
+        abandoned_recovery: {
+            #[cfg(unix)]
+            {
+                crate::file_ops::abandoned_recovery_count()
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        },
     }
 }
 

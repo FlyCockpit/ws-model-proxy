@@ -463,24 +463,37 @@ if it prevents a restore, it is kept and reported with `uncertain_outcome`. Inde
 filesystem, an in-place write into the inspected inode after the etag read can
 be lost on replace or delete: the etag proves content only up to that read.
 (d) a crash leaves `.wsmp-recover-*`, including a partial replace temp or
-`probe`, preflight dummies, or both links. Before the first capture, exchange-less
-rename writes `INTENT` in that directory and fsyncs the file and the directory.
-It is one JSON object: `version` 1, `order` (`link-first` or `vacate-first`),
-`source`, `destination`, and `slots` mapping `slot-1` and `slot-2` to absolute paths.
-Link-first overwrite stores the destination in `slot-1` and the source in `slot-2`;
-other orders store the source in `slot-1`. Success removes `INTENT` with R. There is
-no replay. A rename crash can leave source and destination in R with both public
-names vacant (vacate-first) or only the destination vacant (link-first, before the
-link). Find R beside the destination, or in the startup log: wsmp reports each
-`.wsmp-recover-<10 alnum>` directory under a configured root and never deletes it.
-Read `INTENT`. `mv -n` a missing public path back from its slot, and do not overwrite
-a newer file. If both public names exist and the destination is a hard link of the
-source, the link may already have committed: compare, then remove only the private
-slots, `INTENT`, and the empty directory. On stable-inode NFS, plain rename uses
-link-first when rename flags are rejected; no-replace-capable mounts keep direct
-rename and do not write `INTENT`. A crash during exchange-less replace can leave the
-original and temp in recovery with the public name vacant; a delete crash can
-leave the captured file or symlink in recovery with its public name vacant.
+`probe`, preflight dummies, or both links. Before the first capture, every R-using
+op (rename, replace, delete, including exchange overwrite) writes `INTENT` in that
+directory and fsyncs the file; directory fsync `EINVAL`/`ENOTSUP` is best-effort.
+`INTENT` is a versioned JSON object (`version` 2): `op`, `phase`
+(`prepared`/`captured`/`committed`), `order` (`link-first`, `vacate-first`, or
+`exchange-first`), `source`/`destination` as `{display, bytes}` (hex path bytes next
+to a lossy display string), `slots` mapping `slot-1`/`slot-2` to `{origin, dev, ino,
+kind, size}`, plus `pid`, `host`, `createdAt`, and `cliVersion`. Link-first overwrite
+stores the destination in `slot-1` and the source in `slot-2`; exchange-first
+overwrite stores the destination in `slot-1` (swap `from <-> to` first, then capture
+D from `from`, so D is briefly visible under the source name); other orders store
+the source in `slot-1`. Success removes `INTENT` only when R is empty. There is no
+automatic replay. A rename crash can leave source and destination in R with both
+public names vacant (vacate-first), only the destination vacant (link-first, before
+the link), or D under the source name (exchange-first, after the swap). Live R
+directories are indexed in the CLI state directory (`file-recovery/`). Startup reads
+that registry (O(registered)) and never walks file roots. `wsmp recover` lists
+abandoned R dirs; `wsmp recover --apply` rolls back (`mv -n` from slots) when phase
+is prepared/captured and rolls forward (dispose leftovers) when committed;
+`--scan` walks configured roots for unregistered dirs. Find R beside the
+destination, in the registry, or in the startup log: wsmp reports each abandoned
+`.wsmp-recover-<10 alnum>` directory and never deletes it. If INTENT is absent, the
+log lists present slots; it does not say "read INTENT". `mv -n` a missing public
+path back from its slot, and do not overwrite a newer file. If both public names
+exist and the destination is a hard link of the source, the link may already have
+committed: compare, then remove only the private slots, `INTENT`, and the empty
+directory. On stable-inode NFS, plain rename uses link-first when rename flags are
+rejected; no-replace-capable mounts keep direct rename and do not write `INTENT`. A
+crash during replace can leave the original and temp in recovery with the public
+name vacant; a delete crash can leave the captured file or symlink in recovery with
+its public name vacant.
 (e) unheld objects are never deleted and remain reported in recovery;
 (f) on NFS a file that another process still holds open keeps a `.nfs*` entry in the
 recovery directory after its unlink, so the directory is retained and listed in `recovered`;

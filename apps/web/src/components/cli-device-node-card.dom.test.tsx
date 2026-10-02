@@ -107,6 +107,15 @@ describe("CliDeviceNodeCard", () => {
     expect(screen.getByText(/dashboard:clis.node.warningsHint/)).toBeTruthy();
   });
 
+  it("shows an abandoned file recovery warning", () => {
+    renderCard(
+      node({
+        warnings: [{ code: "abandoned_recovery", severity: "warning" }],
+      }),
+    );
+    expect(screen.getByText("dashboard:clis.node.warning.abandoned_recovery")).toBeTruthy();
+  });
+
   it("accepts suggested labels on the first node.info", async () => {
     const user = userEvent.setup();
     renderCard();

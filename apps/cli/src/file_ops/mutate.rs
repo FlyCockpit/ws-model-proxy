@@ -22,9 +22,12 @@
 //! the object. NR overwrite also vacates the destination.
 //! Concurrent creates survive, and blocked restoration reports uncertain_outcome.
 //! (d) crashes leave S/D, partial temp/probes or preflight dummies in R, possibly
-//! with vacant names or two published/private links; R holds an INTENT map of
-//! slots to paths, written and fsynced before the first capture, and deleted
-//! with R on success. There is no replay; (e) unheld objects never authorize deletion;
+//! with vacant names or two published/private links. Every R-using op writes a
+//! versioned INTENT (phase, per-slot identity, pid/host) before the first capture,
+//! including exchange-first overwrite (swap `from <-> to`, then capture D from
+//! `from`). Live R dirs are indexed in the CLI state directory; `wsmp recover`
+//! rolls forward or back from phase. Success deletes INTENT with an empty R.
+//! There is no automatic replay; (e) unheld objects never authorize deletion;
 //! (f) another process's NFS fd can leave .nfs residue (own fds close before unlink,
 //! except pinned source proof through probe-alias unlink on per-vnode clients);
 //! (g) replace/rename expose a link before alias cleanup: on a mount with believable
@@ -1204,6 +1207,7 @@ fn delete_impl(
     let result = (|| {
         ops.step(Step::Vacating)?;
         cancel.check()?; // last cancellation point before public capture
+        recovery.prepare_intent(super::intent::Intent::delete(&resolved.full_path()))?;
         let mark = recovery.checkpoint();
         let Some(slot) = recovery.capture(&resolved.dir, &resolved.name, &resolved.full_path())
         else {
@@ -1213,6 +1217,8 @@ fn delete_impl(
                 None => recovery.uncertain(),
             });
         };
+        let _ = recovery.record_slot_identity(&slot);
+        let _ = recovery.set_intent_phase(super::intent::IntentPhase::Captured);
         let _ = ops.step(Step::Vacated);
         if !recovery.holds(&slot, &held) {
             held.release();
@@ -1226,6 +1232,7 @@ fn delete_impl(
             };
         }
         // A proven delete is committed; failed cleanup is recoverable success.
+        let _ = recovery.set_intent_phase(super::intent::IntentPhase::Committed);
         recovery.dispose(ops, &slot, &mut held);
         Ok(())
     })();

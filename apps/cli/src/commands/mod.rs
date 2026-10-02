@@ -16,6 +16,7 @@ pub mod endpoints;
 pub mod login;
 pub mod logout;
 pub mod metrics;
+pub mod recover;
 pub mod reload;
 pub mod service;
 pub mod terminal;

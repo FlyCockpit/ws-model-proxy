@@ -881,6 +881,10 @@ pub struct NodeMetrics {
     /// 2.9: per-endpoint custom engine adapter status. No command text.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub engine_adapters: Vec<crate::engine_adapter::EngineAdapterStatus>,
+    /// Abandoned `.wsmp-recover-*` directories this CLI still has indexed.
+    /// Omitted when zero so older hello/metrics vectors stay identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub abandoned_recovery: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -3785,6 +3789,7 @@ mod relay_27_vectors {
                 },
             ],
             engine_adapters: Vec::new(),
+            abandoned_recovery: None,
         };
         assert_eq!(
             encoded(&ClientControlMessage::NodeMetrics(metrics)),

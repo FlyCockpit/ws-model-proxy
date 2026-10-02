@@ -1407,6 +1407,7 @@ fn help_lists_ready_commands() {
         .stdout(predicate::str::contains("service"))
         .stdout(predicate::str::contains("reload"))
         .stdout(predicate::str::contains("metrics"))
+        .stdout(predicate::str::contains("recover"))
         .stdout(predicate::str::contains("logout"));
 }
 

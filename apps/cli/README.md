@@ -66,6 +66,9 @@ wsmp config set-mcp-commands supervised  # agents may request commands you confi
 wsmp metrics list                   # custom metric sources and their state
 wsmp metrics test gpu_fan           # run one source now and print what it reports
 wsmp metrics approve gpu_fan --sha256 <hash>  # approve the exact command you reviewed (hash from `metrics list`)
+wsmp recover                        # list abandoned `.wsmp-recover-*` dirs from the CLI registry
+wsmp recover --apply                # restore or dispose from INTENT (roll back or forward)
+wsmp recover --scan                 # also walk configured file roots (can hang on a dead NFS mount)
 wsmp config set-remote-metric-sources on  # accept remotely defined sources (each still needs approval)
 wsmp config set-remote-engine-adapters on  # accept remotely defined engine adapters (separate opt-in; each still needs approval)
 wsmp completions zsh                # shell completions

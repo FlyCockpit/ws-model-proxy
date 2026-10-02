@@ -22,7 +22,7 @@ import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { Pencil, Tags, Thermometer, X } from "lucide-react";
+import { FolderX, Pencil, Tags, Thermometer, X } from "lucide-react";
 import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
@@ -232,6 +232,9 @@ export function CliDeviceNodeCard({
               >
                 {warning.code === "thermal" ? (
                   <Thermometer className="size-3.5" aria-hidden />
+                ) : null}
+                {warning.code === "abandoned_recovery" ? (
+                  <FolderX className="size-3.5" aria-hidden />
                 ) : null}
                 {t(`dashboard:clis.node.warning.${warning.code}`)}
               </li>

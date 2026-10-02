@@ -313,7 +313,8 @@
         "driver_skew": "Las versiones de driver de GPU difieren",
         "mtu": "El MTU de la NIC de fabric no es 9000",
         "disk": "Queda poco espacio en disco",
-        "missing_model_path": "Falta una ruta de modelo o está vacía"
+        "missing_model_path": "Falta una ruta de modelo o está vacía",
+        "abandoned_recovery": "Recuperación de archivos abandonada (ejecute wsmp recover)"
       },
       "vram": "{{used}} / {{total}} GB de VRAM",
       "vramTotal": "{{total}} GB de VRAM",

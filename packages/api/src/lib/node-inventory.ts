@@ -450,6 +450,7 @@ export const NODE_HEALTH_WARNING_CODES = [
   "mtu",
   "disk",
   "missing_model_path",
+  "abandoned_recovery",
 ] as const;
 export type NodeHealthWarningCode = (typeof NODE_HEALTH_WARNING_CODES)[number];
 
@@ -527,6 +528,14 @@ export function nodeHealthWarnings(
     )
   ) {
     warnings.push({ code: "missing_model_path", severity: "warning" });
+  }
+
+  if (
+    typeof sample?.abandonedRecovery === "number" &&
+    Number.isFinite(sample.abandonedRecovery) &&
+    sample.abandonedRecovery > 0
+  ) {
+    warnings.push({ code: "abandoned_recovery", severity: "warning" });
   }
 
   return warnings;

@@ -89,4 +89,7 @@ pub enum Command {
 
     /// List, test and approve custom metric sources.
     Metrics(crate::commands::metrics::Args),
+
+    /// List or apply crash-safe file recovery from abandoned `.wsmp-recover-*` directories.
+    Recover(crate::commands::recover::Args),
 }

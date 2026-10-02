@@ -280,6 +280,14 @@ describe("nodeHealthWarnings", () => {
     ]);
   });
 
+  it("flags abandoned file recovery from node.metrics", () => {
+    expect(
+      nodeHealthWarnings({ nodeKind: "cpu" }, { abandonedRecovery: 1 }).map(
+        (warning) => warning.code,
+      ),
+    ).toEqual(["abandoned_recovery"]);
+  });
+
   it("does not flag a healthy unified node", () => {
     expect(
       nodeHealthWarnings(

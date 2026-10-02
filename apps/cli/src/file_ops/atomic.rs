@@ -267,6 +267,7 @@ fn replace_inner(
             ops.step(Step::SupervisedPinVerified)?;
         }
         cancel.check()?;
+        recovery.prepare_intent(super::intent::Intent::replace(&dir_path.join(name)))?;
         Ok(new_stat)
     })();
     // The Held proofs are now the only descriptors on these inodes. Their
@@ -328,6 +329,8 @@ fn commit_stage(
         match recovery.exchange_temp(tmp) {
             Ok(()) => {
                 *armed = false;
+                let _ = recovery.set_intent_phase(super::intent::IntentPhase::Committed);
+                let _ = recovery.record_slot_identity(tmp);
                 let _ = ops.step(Step::Exchanged);
                 let _ = ops.step(Step::Captured);
                 if recovery.holds(tmp, original) {
@@ -337,7 +340,8 @@ fn commit_stage(
                 }
                 original.release(); // no longer needed; undo may link this inode
                 let y = recovery.capture_origin(tmp);
-                if y.is_some() {
+                if let Some(slot) = &y {
+                    let _ = recovery.record_slot_identity(slot);
                     let _ = ops.step(Step::Captured);
                 }
                 if let Some(y) = &y

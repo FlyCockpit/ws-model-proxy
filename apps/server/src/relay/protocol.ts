@@ -551,6 +551,8 @@ const nodeMetricsSchema = z
       )
       .max(NODE_ENGINE_ADAPTERS_MAX)
       .optional(),
+    /** Abandoned `.wsmp-recover-*` directories indexed by this CLI. Omitted when zero. */
+    abandonedRecovery: z.number().int().min(0).max(10_000).optional(),
   })
   .strict();
 export type NodeMetricsMessage = z.infer<typeof nodeMetricsSchema>;

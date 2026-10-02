@@ -448,7 +448,7 @@ pub fn connect_foreground() -> Result<()> {
     let mut control = ControlServer::bind()?;
     let startup = TerminalStartup::capture(&config)?;
     #[cfg(unix)]
-    crate::file_ops::report_abandoned_recovery(startup.file_roots());
+    crate::file_ops::report_abandoned_recovery();
     let mut last_inventory_revision = None;
     // The mtime accompanies the last server-acknowledged local snapshot. It
     // prevents an edit-and-revert from being treated as an unchanged desired

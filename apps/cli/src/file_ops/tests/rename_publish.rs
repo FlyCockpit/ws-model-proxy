@@ -435,9 +435,12 @@ const RACES: [Race; 10] = [
     Race::PrivateSource,
     Race::DestinationDirectory,
 ];
-fn race_hook(fx: Fx, object: Object, overwrite: bool, race: Race) -> Fx {
+fn race_hook(fx: Fx, object: Object, overwrite: bool, race: Race, destabilize: bool) -> Fx {
     let root = fx.root.clone();
     fx.with_hook(move |step| {
+        if destabilize && step == Step::LinkProbed && !root.join("probe-decoy").exists() {
+            swap_probe_inode(&root);
+        }
         let src = root.join("src");
         let dst = root.join("dst");
         match (step, race) {
@@ -659,42 +662,47 @@ fn rename_races_restore_origins_preserve_creates_and_do_not_chase_commits() {
     for object in OBJECTS {
         for shape in [Shape::Nr, Shape::Link] {
             for overwrite in [false, true] {
-                for race in RACES {
-                    if !overwrite
-                        && matches!(
-                            race,
-                            Race::DestinationSave
-                                | Race::DestinationGone
-                                | Race::DestinationDirectory
-                        )
-                    {
+                for destabilize in [false, true] {
+                    if destabilize && !matches!(shape, Shape::Link) {
                         continue;
                     }
-                    let fx = Fx::new();
-                    let etag = setup(&fx, object, overwrite);
-                    // Force plain NR through the recovery publisher for race coverage;
-                    // direct NR verification retains its existing tests.
-                    let mut faults = shape.faults(overwrite);
-                    if !overwrite && matches!(shape, Shape::Nr) {
-                        // ENOSYS still means "flags unavailable" when the private
-                        // NR probe works. EINVAL in that case is a rejected name.
-                        faults.push((Primitive::Move, 1, Errno::ENOSYS));
+                    for race in RACES {
+                        if !overwrite
+                            && matches!(
+                                race,
+                                Race::DestinationSave
+                                    | Race::DestinationGone
+                                    | Race::DestinationDirectory
+                            )
+                        {
+                            continue;
+                        }
+                        let fx = Fx::new();
+                        let etag = setup(&fx, object, overwrite);
+                        // Force plain NR through the recovery publisher for race coverage;
+                        // direct NR verification retains its existing tests.
+                        let mut faults = shape.faults(overwrite);
+                        if !overwrite && matches!(shape, Shape::Nr) {
+                            // ENOSYS still means "flags unavailable" when the private
+                            // NR probe works. EINVAL in that case is a rejected name.
+                            faults.push((Primitive::Move, 1, Errno::ENOSYS));
+                        }
+                        let fx = race_hook(fx, object, overwrite, race, destabilize);
+                        let _scope = FaultScope::new(&faults);
+                        let result = rename_run(&fx, overwrite, etag.as_deref(), false);
+                        assert_race(
+                            &fx,
+                            object,
+                            overwrite,
+                            race,
+                            result,
+                            RaceLink {
+                                link: matches!(shape, Shape::Link),
+                                link_first: matches!(shape, Shape::Link) && !destabilize,
+                                counts: true,
+                            },
+                        );
                     }
-                    let fx = race_hook(fx, object, overwrite, race);
-                    let _scope = FaultScope::new(&faults);
-                    let result = rename_run(&fx, overwrite, etag.as_deref(), false);
-                    assert_race(
-                        &fx,
-                        object,
-                        overwrite,
-                        race,
-                        result,
-                        RaceLink {
-                            link: matches!(shape, Shape::Link),
-                            link_first: matches!(shape, Shape::Link),
-                            counts: true,
-                        },
-                    );
                 }
             }
         }
@@ -705,52 +713,71 @@ fn rename_races_restore_origins_preserve_creates_and_do_not_chase_commits() {
 fn rename_cancel_and_hook_errors_at_every_transaction_seam() {
     for shape in [Shape::Nr, Shape::Link] {
         for overwrite in [false, true] {
-            for seam in [
-                Step::LinkProbed,
-                Step::Vacating,
-                Step::Captured,
-                Step::Vacated,
-                Step::DestinationVacating,
-                Step::DestinationVacated,
-                Step::Publishing,
-                Step::Renamed,
-                Step::Disposing,
-            ] {
-                if (!overwrite && seam == Step::DestinationVacating)
-                    || (seam == Step::LinkProbed && !matches!(shape, Shape::Link))
-                {
+            for destabilize in [false, true] {
+                if destabilize && !matches!(shape, Shape::Link) {
                     continue;
                 }
-                for hook_error in [false, true] {
-                    let fx = Fx::new();
-                    let etag = setup(&fx, Object::File, overwrite);
-                    let before = snapshot(&fx.root);
-                    let cancel = fx.cancel.clone();
-                    let root = fx.root.clone();
-                    let fx = fx.with_hook(move |step| {
-                        // Ignore preflight dummy/probe disposal for post-capture rows.
-                        if step == seam && (seam != Step::Disposing || !root.join("src").exists()) {
-                            if hook_error {
-                                return Err(FileError::cancelled());
+                for seam in [
+                    Step::LinkProbed,
+                    Step::Vacating,
+                    Step::Captured,
+                    Step::Vacated,
+                    Step::DestinationVacating,
+                    Step::DestinationVacated,
+                    Step::Publishing,
+                    Step::Linked,
+                    Step::Renamed,
+                    Step::Disposing,
+                ] {
+                    if (!overwrite && seam == Step::DestinationVacating)
+                        || (seam == Step::LinkProbed && !matches!(shape, Shape::Link))
+                        || (seam == Step::Linked && !matches!(shape, Shape::Link))
+                        || (destabilize && matches!(seam, Step::LinkProbed | Step::Vacating))
+                    {
+                        continue;
+                    }
+                    for hook_error in [false, true] {
+                        let fx = Fx::new();
+                        let etag = setup(&fx, Object::File, overwrite);
+                        let before = snapshot(&fx.root);
+                        let cancel = fx.cancel.clone();
+                        let root = fx.root.clone();
+                        let fx = fx.with_hook(move |step| {
+                            if destabilize
+                                && step == Step::LinkProbed
+                                && !root.join("probe-decoy").exists()
+                            {
+                                swap_probe_inode(&root);
                             }
-                            cancel.cancel();
+                            // Ignore preflight dummy/probe disposal for post-capture rows.
+                            if step == seam
+                                && (seam != Step::Disposing || !root.join("src").exists())
+                            {
+                                if hook_error {
+                                    return Err(FileError::cancelled());
+                                }
+                                cancel.cancel();
+                            }
+                            Ok(())
+                        });
+                        let mut faults = shape.faults(overwrite);
+                        if !overwrite && matches!(shape, Shape::Nr) {
+                            faults.push((Primitive::Move, 1, Errno::ENOSYS));
                         }
-                        Ok(())
-                    });
-                    let mut faults = shape.faults(overwrite);
-                    if !overwrite && matches!(shape, Shape::Nr) {
-                        faults.push((Primitive::Move, 1, Errno::ENOSYS));
+                        let _scope = FaultScope::new(&faults);
+                        let result = rename_run(&fx, overwrite, etag.as_deref(), false);
+                        if matches!(seam, Step::Vacating | Step::LinkProbed) {
+                            assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled);
+                            assert_eq!(snapshot(&fx.root), before);
+                        } else {
+                            assert!(
+                                result.unwrap().get("recovered").is_none(),
+                                "{shape:?}/{overwrite}/{destabilize}/{seam:?}/{hook_error}"
+                            );
+                            assert_eq!(fx.get("dst"), SOURCE);
+                        }
+                        clean(&fx);
                     }
-                    let _scope = FaultScope::new(&faults);
-                    let result = rename_run(&fx, overwrite, etag.as_deref(), false);
-                    if matches!(seam, Step::Vacating | Step::LinkProbed) {
-                        assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled);
-                        assert_eq!(snapshot(&fx.root), before);
-                    } else {
-                        assert!(result.unwrap().get("recovered").is_none());
-                        assert_eq!(fx.get("dst"), SOURCE);
-                    }
-                    clean(&fx);
                 }
             }
         }
@@ -1114,7 +1141,7 @@ pub(super) fn real_rename_rows(directory: &Path, class: RealClass) {
                 }
                 let fx = real_fixture(directory);
                 let etag = setup(&fx, object, overwrite);
-                let fx = race_hook(fx, object, overwrite, race);
+                let fx = race_hook(fx, object, overwrite, race, false);
                 let faults = if !overwrite && class.nr {
                     vec![(Primitive::Move, 1, Errno::ENOSYS)]
                 } else {
@@ -2130,17 +2157,94 @@ fn rename_intent_remains_when_destination_capture_fails_before_publish() {
     let intent: Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("INTENT")).unwrap()).unwrap();
     assert_eq!(intent["order"], "link-first");
-    assert_eq!(intent["version"], 1);
-    assert_eq!(intent["source"], fx.p("src"));
-    assert_eq!(intent["destination"], fx.p("dst"));
-    assert_eq!(intent["slots"]["slot-1"], fx.p("dst"));
-    assert_eq!(intent["slots"]["slot-2"], fx.p("src"));
+    assert_eq!(intent["version"], 2);
+    assert_eq!(intent["phase"], "prepared");
+    assert_eq!(intent["op"], "rename");
+    assert_eq!(intent["source"]["display"], fx.p("src"));
+    assert_eq!(intent["destination"]["display"], fx.p("dst"));
+    assert_eq!(intent["slots"]["slot-1"]["origin"]["display"], fx.p("dst"));
+    assert_eq!(intent["slots"]["slot-2"]["origin"]["display"], fx.p("src"));
+    assert!(intent["slots"]["slot-1"]["dev"].is_number());
+    assert!(intent["slots"]["slot-1"]["ino"].is_number());
+    assert!(intent["pid"].is_number());
+    assert!(intent["host"].is_string());
+    assert!(intent["createdAt"].is_string());
+    assert!(intent["cliVersion"].is_string());
     assert_eq!(
         std::fs::read_to_string(dir.join("slot-1")).unwrap(),
         DESTINATION
     );
     assert!(!dir.join("slot-2").exists());
     assert!(dir.join("INTENT").is_file());
+}
+
+#[test]
+fn rename_link_first_source_capture_failure_after_publish_keeps_commit() {
+    for overwrite in [false, true] {
+        let fx = Fx::new();
+        let etag = setup(&fx, Object::File, overwrite);
+        let mut faults = Shape::Link.faults(overwrite);
+        let capture_nth = if overwrite { 2 } else { 1 };
+        faults.retain(|(primitive, nth, _)| {
+            !(*primitive == Primitive::Capture && *nth == capture_nth)
+        });
+        faults.push((Primitive::Capture, capture_nth, Errno::EIO));
+        let _scope = FaultScope::new(&faults);
+        let error = rename_run(&fx, overwrite, etag.as_deref(), false).unwrap_err();
+        assert_eq!(
+            error.code,
+            ErrorCode::UncertainOutcome,
+            "{overwrite} {error:?}"
+        );
+        assert_eq!(fx.get("dst"), SOURCE);
+        assert_eq!(fx.get("src"), SOURCE);
+        let dir = recovery_dirs(&fx.root)
+            .into_iter()
+            .next()
+            .expect("recovery");
+        let intent: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("INTENT")).unwrap()).unwrap();
+        assert_eq!(intent["phase"], "committed", "{intent}");
+        assert_eq!(intent["order"], "link-first");
+        assert!(fx.steps.lock().unwrap().contains(&Step::Linked));
+        if overwrite {
+            assert_eq!(
+                std::fs::read_to_string(dir.join("slot-1")).unwrap(),
+                DESTINATION
+            );
+        }
+    }
+}
+
+#[test]
+fn rename_exchange_first_writes_versioned_intent() {
+    let fx = Fx::new();
+    let etag = setup(&fx, Object::File, true);
+    let root = fx.root.clone();
+    let seen = Arc::new(Mutex::new(None));
+    let record = Arc::clone(&seen);
+    let fx = fx.with_hook(move |step| {
+        if step == Step::Exchanged {
+            let dir = recovery_dirs(&root).into_iter().next().expect("recovery");
+            let intent: Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("INTENT")).unwrap())
+                    .unwrap();
+            *record.lock().unwrap() = Some(intent);
+        }
+        Ok(())
+    });
+    let value = rename_run(&fx, true, etag.as_deref(), false).unwrap();
+    assert!(value.get("recovered").is_none(), "{value}");
+    let intent = seen.lock().unwrap().clone().expect("INTENT at exchange");
+    assert_eq!(intent["version"], 2);
+    assert_eq!(intent["op"], "rename");
+    assert_eq!(intent["order"], "exchange-first");
+    assert_eq!(intent["phase"], "committed");
+    assert_eq!(intent["source"]["display"], fx.p("src"));
+    assert_eq!(intent["destination"]["display"], fx.p("dst"));
+    assert_eq!(intent["slots"]["slot-1"]["origin"]["display"], fx.p("dst"));
+    assert!(intent["slots"].get("slot-2").is_none());
+    clean(&fx);
 }
 
 #[test]

@@ -164,7 +164,8 @@
         "driver_skew": "GPU driver versions differ",
         "mtu": "Fabric NIC MTU is not 9000",
         "disk": "Disk space is low",
-        "missing_model_path": "A model path is missing or empty"
+        "missing_model_path": "A model path is missing or empty",
+        "abandoned_recovery": "Abandoned file recovery (run wsmp recover)"
       },
       "vram": "{{used}} / {{total}} GB VRAM",
       "vramTotal": "{{total}} GB VRAM",

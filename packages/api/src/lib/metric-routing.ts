@@ -286,6 +286,7 @@ export const nodeMetricsSampleSchema = z.object({
       }),
     )
     .optional(),
+  abandonedRecovery: z.number().int().nonnegative().optional(),
 });
 export type NodeMetricsSample = z.infer<typeof nodeMetricsSampleSchema>;
 
