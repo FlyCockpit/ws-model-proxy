@@ -74,6 +74,8 @@ export type AffinityTarget = {
   slots?: number | null;
   lastRoutedAt?: Date | null;
   engineKind?: "GENERIC" | "LLAMA_CPP" | "VLLM" | "SGLANG" | "OLLAMA" | "LM_STUDIO" | null;
+  /** Per-capacity image cap passed into the once-per-request unit estimator. */
+  imageTokenAllowance?: number | null;
 };
 
 export type AffinityDecision = {
@@ -323,6 +325,7 @@ type AffinityRequestArgs = {
   runtimeIdentity: string;
   sessionBinding?: AffinitySessionBinding;
   headers?: Headers;
+  imageTokenAllowance?: number | null;
 };
 
 export type CanonicalRequest = {
@@ -338,11 +341,22 @@ export type CanonicalRequest = {
   isContinuation: boolean;
   conversation: string | undefined;
   previousResponse: boolean;
+  /**
+   * Payload-aware token prefix sums computed once per request.
+   * Index 0 is the root (instructions + tools); index `d` is root plus
+   * conversation units `1..d`.
+   */
+  unitTokenPrefixSums: number[];
 };
 
 /** Once per request; all request-derived traversal shares an 8 * 2 MiB node cap. */
 export function buildCanonicalRequest(
-  { surface, payload, headers }: Pick<AffinityRequestArgs, "surface" | "payload" | "headers">,
+  {
+    surface,
+    payload,
+    headers,
+    imageTokenAllowance,
+  }: Pick<AffinityRequestArgs, "surface" | "payload" | "headers" | "imageTokenAllowance">,
   work: CanonicalWork = { steps: 0 },
 ): CanonicalRequest | null {
   try {
@@ -480,6 +494,12 @@ export function buildCanonicalRequest(
       forwardedValue(payload.conversation) ?? forwardedValue(payload.conversation_id);
     const conversation =
       conversationValue === undefined ? undefined : encode(conversationValue, MAX_CANONICAL_BYTES);
+    const unitTokenPrefixSums = computeUnitTokenPrefixSums(
+      instructions,
+      tools,
+      conversationUnits,
+      imageTokenAllowance,
+    );
     return {
       surface: canonicalSurface,
       carrier,
@@ -495,6 +515,7 @@ export function buildCanonicalRequest(
       conversation,
       previousResponse:
         canonicalSurface === "openai-responses" && typeof payload.previous_response_id === "string",
+      unitTokenPrefixSums,
     };
   } catch {
     return null;
@@ -518,25 +539,39 @@ export function canonicalByteLength(canonical: CanonicalRequest): number {
   );
 }
 
-function encodedPayloadTokens(encoded: string): number {
+function encodedPayloadTokens(encoded: string, imageTokenAllowance?: number | null): number {
   try {
-    const tokens = estimatePayloadTokens(JSON.parse(encoded) as unknown).tokens;
+    const tokens = estimatePayloadTokens(JSON.parse(encoded) as unknown, {
+      imageTokenAllowance,
+    }).tokens;
     return Number.isFinite(tokens) && tokens > 0 ? tokens : 0;
   } catch {
     return 0;
   }
 }
 
+function computeUnitTokenPrefixSums(
+  instructions: string[],
+  tools: string | undefined,
+  conversationUnits: string[],
+  imageTokenAllowance?: number | null,
+): number[] {
+  let tokens = 0;
+  for (const instruction of instructions)
+    tokens += encodedPayloadTokens(instruction, imageTokenAllowance);
+  if (tools) tokens += encodedPayloadTokens(tools, imageTokenAllowance);
+  const sums = [tokens];
+  for (const unit of conversationUnits) {
+    tokens += encodedPayloadTokens(unit, imageTokenAllowance);
+    sums.push(tokens);
+  }
+  return sums;
+}
+
 /** Payload-aware tokens of the root plus conversation units `1..depth`. */
 export function prefixPayloadTokensAtDepth(canonical: CanonicalRequest, depth: number): number {
-  let tokens = 0;
-  for (const instruction of canonical.instructions) tokens += encodedPayloadTokens(instruction);
-  if (canonical.tools) tokens += encodedPayloadTokens(canonical.tools);
   const limit = Math.max(0, Math.min(Math.trunc(depth), canonical.conversationUnits.length));
-  for (let index = 0; index < limit; index += 1) {
-    tokens += encodedPayloadTokens(canonical.conversationUnits[index]!);
-  }
-  return tokens;
+  return canonical.unitTokenPrefixSums[limit] ?? 0;
 }
 
 /**
@@ -1067,7 +1102,10 @@ export async function rankAffinityTargets({
   // on it (an affinity hit is never redirected), even with nothing to reorder.
   if (!policy.enabled || targets.length < (scoreSingleTarget ? 1 : 2)) return unchanged;
 
-  const canonical = buildCanonicalRequest({ surface, payload, headers });
+  const imageTokenAllowance = targets.find(
+    (target) => target.imageTokenAllowance != null,
+  )?.imageTokenAllowance;
+  const canonical = buildCanonicalRequest({ surface, payload, headers, imageTokenAllowance });
   const materialByIdentity = new Map(
     targets.map((target) => [
       target.targetIdentity,
@@ -1543,7 +1581,10 @@ export async function rememberAffinity({
     sessionBinding,
     headers,
   };
-  const canonical = buildCanonicalRequest(requestArgs);
+  const canonical = buildCanonicalRequest({
+    ...requestArgs,
+    imageTokenAllowance: target.imageTokenAllowance,
+  });
   const material = materialFromCanonical(requestArgs, canonical);
   if (
     material.instructionDigests.length === 0 &&

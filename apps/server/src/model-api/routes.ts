@@ -1205,6 +1205,7 @@ function affinityTargetForMember(
     healthPenalty,
     publicEgressPenalty: 0,
     costPenalty: 0,
+    imageTokenAllowance: capacity.imageTokenAllowance,
   };
 }
 

@@ -3419,6 +3419,47 @@ describe("cache affinity", () => {
     );
   });
 
+  it("caps oversized images with imageTokenAllowance in the once-per-request prefix sums", () => {
+    const png = new Uint8Array(24);
+    png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+    png[11] = 13;
+    png.set([0x49, 0x48, 0x44, 0x52], 12);
+    new DataView(png.buffer).setUint32(16, 1024);
+    new DataView(png.buffer).setUint32(20, 1024);
+    const imageUrl = `data:image/png;base64,${Buffer.from(png).toString("base64")}`;
+    const payload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "hi" },
+        {
+          role: "user",
+          content: [{ type: "image_url", image_url: { url: imageUrl } }],
+        },
+      ],
+    };
+    const uncapped = buildCanonicalRequest(digestArgs("runtime", payload))!;
+    const capped = buildCanonicalRequest({
+      ...digestArgs("runtime", payload),
+      imageTokenAllowance: 100,
+    })!;
+    expect(capped.unitTokenPrefixSums).toHaveLength(capped.conversationUnits.length + 1);
+    expect(prefixPayloadTokensAtDepth(capped, 0)).toBe(capped.unitTokenPrefixSums[0]);
+    const uncappedFull = prefixPayloadTokensAtDepth(uncapped, uncapped.conversationUnits.length);
+    const cappedFull = prefixPayloadTokensAtDepth(capped, capped.conversationUnits.length);
+    expect(cappedFull).toBeLessThan(uncappedFull);
+    const lastUncapped = uncapped.conversationUnits.length;
+    const lastCapped = capped.conversationUnits.length;
+    const uncappedImage =
+      prefixPayloadTokensAtDepth(uncapped, lastUncapped) -
+      prefixPayloadTokensAtDepth(uncapped, lastUncapped - 1);
+    const cappedImage =
+      prefixPayloadTokensAtDepth(capped, lastCapped) -
+      prefixPayloadTokensAtDepth(capped, lastCapped - 1);
+    expect(cappedImage).toBeLessThan(uncappedImage);
+    expect(cappedImage).toBeLessThanOrEqual(uncappedImage - 1000);
+  });
+
   it("spreads sequential first turns with the same system prompt across three members", async () => {
     const members = (["a", "b", "c"] as const).map((id) => ({
       ...cap8(target(`target-${id}`, `runtime-${id}`, `capacity-${id}`)),
@@ -4325,6 +4366,43 @@ it("R4 bounds wide/deep canonical work and ranks 3 targets within 2 seconds", as
   );
   expect(reads).toBe(2); // validation and root capture, independent of target count
   expect(elapsed).toBeLessThan(2000);
+}, 10_000);
+
+it("precomputed unit tokens rank 8 targets on a 2 MiB canonical within 2 seconds", async () => {
+  db.cacheAffinityRecord.findMany.mockResolvedValue([]);
+  db.capacityLease.groupBy.mockResolvedValue([]);
+  db.capacityWaiter.groupBy.mockResolvedValue([]);
+  const chunk = "x".repeat(32_768);
+  const payload = {
+    conversation: "client",
+    messages: [
+      { role: "system", content: "rules" },
+      ...Array.from({ length: 60 }, (_, index) => ({
+        role: index % 2 ? "assistant" : "user",
+        content: chunk,
+      })),
+    ],
+  };
+  const canonical = buildCanonicalRequest(digestArgs("runtime", payload));
+  expect(canonical).not.toBeNull();
+  expect(canonicalByteLength(canonical!)).toBeGreaterThan(1_000_000);
+  expect(canonical!.unitTokenPrefixSums).toHaveLength(canonical!.conversationUnits.length + 1);
+  for (let depth = 0; depth <= canonical!.conversationUnits.length; depth += 1) {
+    expect(prefixPayloadTokensAtDepth(canonical!, depth)).toBe(
+      canonical!.unitTokenPrefixSums[depth],
+    );
+  }
+  const targets = Array.from({ length: 8 }, (_, index) => {
+    const id = `t${index}`;
+    return target(id, id);
+  });
+  const start = performance.now();
+  await rankAffinityTargets({
+    ...digestArgs("runtime", payload),
+    policy,
+    targets,
+  });
+  expect(performance.now() - start).toBeLessThan(2000);
 }, 10_000);
 
 it("R4 unit-count work refusal retains the safe prefix without identifying a truncated chain", () => {
