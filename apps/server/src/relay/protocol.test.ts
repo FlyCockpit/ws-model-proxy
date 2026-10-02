@@ -548,6 +548,38 @@ describe("relay protocol 2.4 minimum", () => {
     ).toThrow();
   });
 
+  it("encodes a count-first relay.request", () => {
+    expect(
+      JSON.parse(
+        encodeRelayServerControlMessage({
+          type: "relay.request",
+          requestId: "request-1",
+          family: "chat.completions",
+          method: "POST",
+          path: "/v1/chat/completions",
+          headers: {},
+          timeoutMs: 30_000,
+          endpointSlug: "local",
+          expectBody: true,
+          countFirst: true,
+          countCeiling: 8192,
+        }),
+      ),
+    ).toEqual({
+      type: "relay.request",
+      requestId: "request-1",
+      family: "chat.completions",
+      method: "POST",
+      path: "/v1/chat/completions",
+      headers: {},
+      timeoutMs: 30_000,
+      endpointSlug: "local",
+      expectBody: true,
+      countFirst: true,
+      countCeiling: 8192,
+    });
+  });
+
   it("encodes a context.count server frame", () => {
     expect(
       JSON.parse(

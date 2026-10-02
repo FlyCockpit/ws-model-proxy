@@ -462,6 +462,9 @@ type SessionState = {
 export type ActiveRelayResponseHandlers = {
   /** Called only after request-body bytes have been accepted by the relay socket. */
   onRequestBodySent?(byteLength: number): void;
+  /** Count-first Chat: the CLI reports tokenize before headers or a too-large error. */
+  onCountResult?(message: CountContextResultMessage): void;
+  onCountError?(message: CountContextErrorMessage): void;
   onHeaders(message: Extract<RelayClientControlMessage, { type: "relay.response.headers" }>): void;
   onBody(chunk: Uint8Array, metadata: RelayResponseBodyMetadata): void;
   onComplete(message: Extract<RelayClientControlMessage, { type: "relay.complete" }>): void;
@@ -1079,12 +1082,12 @@ export class RelaySessionManager {
     }
 
     if (message.type === "relay.response.headers") {
-      this.activeRelayRequests.get(message.requestId)?.onHeaders(message);
+      this.ownedRelayRequest(session, message.requestId)?.onHeaders(message);
       return;
     }
 
     if (message.type === "relay.complete") {
-      const activeRequest = this.takeActiveRelayRequest(message.requestId);
+      const activeRequest = this.takeOwnedRelayRequest(session, message.requestId);
       if (!activeRequest) return;
       activeRequest.onComplete(message);
       this.considerDrainClose(activeRequest.cliDeviceId);
@@ -1092,7 +1095,7 @@ export class RelaySessionManager {
     }
 
     if (message.type === "relay.error") {
-      const activeRequest = this.takeActiveRelayRequest(message.requestId);
+      const activeRequest = this.takeOwnedRelayRequest(session, message.requestId);
       if (!activeRequest) return;
       activeRequest.onError(message);
       this.considerDrainClose(activeRequest.cliDeviceId);
@@ -1100,7 +1103,7 @@ export class RelaySessionManager {
     }
 
     if (message.type === "relay.cancelled") {
-      const activeRequest = this.takeActiveRelayRequest(message.requestId);
+      const activeRequest = this.takeOwnedRelayRequest(session, message.requestId);
       if (!activeRequest) return;
       activeRequest.onCancelled(message);
       this.considerDrainClose(activeRequest.cliDeviceId);
@@ -1108,18 +1111,24 @@ export class RelaySessionManager {
     }
 
     if (message.type === "context.count.result") {
-      const active = this.takeActiveCountContextRequest(message.requestId);
-      if (!active) return;
-      active.onResult(message);
-      this.considerDrainClose(active.cliDeviceId);
+      const active = this.takeOwnedCountContextRequest(session, message.requestId);
+      if (active) {
+        active.onResult(message);
+        this.considerDrainClose(active.cliDeviceId);
+        return;
+      }
+      this.ownedRelayRequest(session, message.requestId)?.onCountResult?.(message);
       return;
     }
 
     if (message.type === "context.count.error") {
-      const active = this.takeActiveCountContextRequest(message.requestId);
-      if (!active) return;
-      active.onError(message);
-      this.considerDrainClose(active.cliDeviceId);
+      const active = this.takeOwnedCountContextRequest(session, message.requestId);
+      if (active) {
+        active.onError(message);
+        this.considerDrainClose(active.cliDeviceId);
+        return;
+      }
+      this.ownedRelayRequest(session, message.requestId)?.onCountError?.(message);
       return;
     }
 
@@ -1167,9 +1176,10 @@ export class RelaySessionManager {
       if (!session) return;
       const parsed = parseRelayBinaryFrame(frame);
       if (parsed.metadata.type === "relay.response.body") {
-        this.activeRelayRequests
-          .get(parsed.metadata.requestId)
-          ?.onBody(parsed.body, parsed.metadata);
+        this.ownedRelayRequest(session, parsed.metadata.requestId)?.onBody(
+          parsed.body,
+          parsed.metadata,
+        );
         return;
       }
       if (parsed.metadata.type === "term.sealed") {
@@ -1507,6 +1517,35 @@ export class RelaySessionManager {
   private takeActiveCountContextRequest(requestId: string): ActiveCountContextRequest | undefined {
     const active = this.activeCountContextRequests.get(requestId);
     if (!active) return undefined;
+    this.activeCountContextRequests.delete(requestId);
+    return active;
+  }
+
+  private ownedRelayRequest(
+    session: SessionState,
+    requestId: string,
+  ): ActiveRelayRequest | undefined {
+    const active = this.activeRelayRequests.get(requestId);
+    if (!active || active.cliDeviceId !== session.cliDeviceId) return undefined;
+    return active;
+  }
+
+  private takeOwnedRelayRequest(
+    session: SessionState,
+    requestId: string,
+  ): ActiveRelayRequest | undefined {
+    const active = this.ownedRelayRequest(session, requestId);
+    if (!active) return undefined;
+    this.activeRelayRequests.delete(requestId);
+    return active;
+  }
+
+  private takeOwnedCountContextRequest(
+    session: SessionState,
+    requestId: string,
+  ): ActiveCountContextRequest | undefined {
+    const active = this.activeCountContextRequests.get(requestId);
+    if (!active || active.cliDeviceId !== session.cliDeviceId) return undefined;
     this.activeCountContextRequests.delete(requestId);
     return active;
   }
@@ -2708,6 +2747,8 @@ export class RelaySessionManager {
     bodyChunks = [],
     bodySource,
     timeoutMs,
+    countFirst = false,
+    countCeiling,
   }: {
     cliDeviceId: string;
     endpointSlug: string;
@@ -2726,6 +2767,8 @@ export class RelaySessionManager {
     bodyChunks?: Uint8Array[];
     bodySource?: { size: number; open(): AsyncIterable<Uint8Array> };
     timeoutMs: number;
+    countFirst?: boolean;
+    countCeiling?: number;
   }) {
     if (this.relayDrain) throw new Error("CLI session is disconnected.");
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
@@ -2744,6 +2787,12 @@ export class RelaySessionManager {
       timeoutMs,
       endpointSlug,
       expectBody: (bodySource?.size ?? 0) > 0 || bodyChunks.length > 0,
+      ...(countFirst
+        ? {
+            countFirst: true as const,
+            ...(countCeiling != null ? { countCeiling } : {}),
+          }
+        : {}),
     };
     session.socket.send(encodeRelayServerControlMessage(control));
 
@@ -3916,6 +3965,34 @@ export class RelaySessionManager {
         console.error("[relay] malformed telemetry frame dropped", type);
       }
       return true;
+    }
+    if (type === "context.count.result" || type === "context.count.error") {
+      const requestId = typeof record.requestId === "string" ? record.requestId : null;
+      if (!requestId) return false;
+      const count = this.takeOwnedCountContextRequest(session, requestId);
+      if (count) {
+        count.onError({
+          type: "context.count.error",
+          requestId,
+          failure: "protocol_error",
+          message: "Malformed context.count frame.",
+        });
+        console.error("[relay] malformed context.count frame");
+        this.considerDrainClose(count.cliDeviceId);
+        return true;
+      }
+      const relay = this.ownedRelayRequest(session, requestId);
+      if (relay) {
+        relay.onCountError?.({
+          type: "context.count.error",
+          requestId,
+          failure: "protocol_error",
+          message: "Malformed context.count frame.",
+        });
+        console.error("[relay] malformed context.count frame");
+        return true;
+      }
+      return false;
     }
     return false;
   }

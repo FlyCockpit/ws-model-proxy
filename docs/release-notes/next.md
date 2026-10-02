@@ -166,9 +166,13 @@ caller waits the full local budget. MCP:
   `machine_mismatch` when the bound key does not match.
 - **Native Chat Completions counting is per endpoint.** The CLI probe writes
   `engineFacts.countContext` onto the inference capacity (`engineCountContext`,
-  additive, `APPLY_SCHEMA=safe`). Near-ceiling Chat Completions skip the extra
-  body hop when the method is missing or `unsupported` (Ollama, SGLang, generic,
-  failed probes).
+  additive, `APPLY_SCHEMA=safe`). Near-ceiling Chat Completions skip native
+  count when the method is missing or `unsupported` (Ollama, SGLang, generic,
+  failed probes). When a method exists, the same `relay.request` carries
+  `countFirst` and `countCeiling`: the CLI tokenizes, then either forwards the
+  body once or returns structured `request_too_large`. Estimates never reject.
+- **Reconnect keeps the probed count method** when the engine kind is unchanged.
+  Tokenize counts above `1e12` are refused instead of closing the relay session.
 - **Engine-load history survives a reconnect.** Disconnect no longer wipes the
   30-minute rings. New keys at the 2000-ring (or 64-per-device) cap are refused
   while existing live rings stay; rings older than the window are pruned.

@@ -427,6 +427,24 @@ class FakeRelayManager {
     this.countContextHandlers.delete(requestId);
     handler?.onError({ type: "context.count.error", requestId, failure });
   }
+
+  completeCountOnRelay(
+    requestId: string,
+    tokens: number,
+    method:
+      | "vllm_tokenize"
+      | "tgi_chat_tokenize"
+      | "llama_apply_template"
+      | "llama_input_tokens"
+      | "adapter_count" = "vllm_tokenize",
+  ) {
+    this.handlers.get(requestId)?.onCountResult?.({
+      type: "context.count.result",
+      requestId,
+      tokens,
+      method,
+    });
+  }
 }
 
 const token: ModelApiTokenIdentity = {
@@ -13154,14 +13172,14 @@ describe("model API routes", () => {
         body: requestBody(),
       },
     );
-    await vi.waitFor(() => expect(manager.sentCountContext).toHaveLength(1));
-    expect(manager.sent).toHaveLength(0);
-    const count = manager.sentCountContext[0]!;
-    expect(count.endpointSlug).toBe("endpoint-default");
-    expect(count.model).toBe("gpt-4o-mini");
-    manager.completeCountContext(count.requestId, 29);
     await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
-    await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+    expect(manager.sentCountContext).toHaveLength(0);
+    const inference = requireSent(manager);
+    expect(inference.endpointSlug).toBe("endpoint-default");
+    expect(inference.countFirst).toBe(true);
+    expect(inference.countCeiling).toBe(45);
+    manager.completeCountOnRelay(inference.requestId, 29);
+    await completeJsonRelay({ manager, requestId: inference.requestId });
     const response = await responsePromise;
     expect(response.status).toBe(200);
     expect(db.relayRequest.update).toHaveBeenCalledWith(
@@ -13196,7 +13214,7 @@ describe("model API routes", () => {
     expect(response.status).toBe(200);
   });
 
-  it("falls back to the estimate when Chat Completions count_context times out", async () => {
+  it("falls back to the estimate when Chat Completions count-first does not report a count", async () => {
     db.discoveredModel.findUnique.mockResolvedValue(
       directRow({ physicalMaxContext: 45, countStrategy: "ENGINE_REPORTED" }),
     );
@@ -13210,9 +13228,9 @@ describe("model API routes", () => {
         body: requestBody(),
       },
     );
-    await vi.waitFor(() => expect(manager.sentCountContext).toHaveLength(1));
-    manager.errorCountContext(manager.sentCountContext[0]!.requestId, "timeout");
     await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    expect(manager.sent[0]?.countFirst).toBe(true);
+    expect(manager.sentCountContext).toHaveLength(0);
     await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
     const response = await responsePromise;
     expect(response.status).toBe(200);
@@ -13262,17 +13280,17 @@ describe("model API routes", () => {
         body: requestBody(poolTarget.modelId),
       },
     );
-    await vi.waitFor(() => expect(manager.sentCountContext).toHaveLength(1));
-    expect(manager.sentCountContext[0]?.cliDeviceId).toBe("cli-a");
-    manager.completeCountContext(manager.sentCountContext[0]!.requestId, 29);
     await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
-    expect(manager.sentCountContext).toHaveLength(1);
+    expect(manager.sent[0]?.cliDeviceId).toBe("cli-a");
+    expect(manager.sent[0]?.countFirst).toBe(true);
+    expect(manager.sentCountContext).toHaveLength(0);
+    manager.completeCountOnRelay(manager.sent[0]!.requestId, 29);
     await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
     const response = await responsePromise;
     expect(response.status).toBe(200);
   });
 
-  it("triggers Chat Completions count_context from the configured ceiling", async () => {
+  it("triggers Chat Completions count-first from the configured ceiling", async () => {
     db.discoveredModel.findUnique.mockResolvedValue(
       directRow({
         physicalMaxContext: 1_000_000,
@@ -13290,9 +13308,11 @@ describe("model API routes", () => {
         body: requestBody(),
       },
     );
-    await vi.waitFor(() => expect(manager.sentCountContext).toHaveLength(1));
-    manager.completeCountContext(manager.sentCountContext[0]!.requestId, 29);
     await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    expect(manager.sent[0]?.countFirst).toBe(true);
+    expect(manager.sent[0]?.countCeiling).toBe(45);
+    expect(manager.sentCountContext).toHaveLength(0);
+    manager.completeCountOnRelay(manager.sent[0]!.requestId, 29);
     await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
     const response = await responsePromise;
     expect(response.status).toBe(200);
@@ -17830,7 +17850,7 @@ describe("local send gate (static)", () => {
       // Every media-transformer hop (owner-owned transformer model).
       maybeApplyPoolMediaTransformer: { gated: true, sends: 1, counts: 0 },
       // Gated when counting for a pool member (pool.ownerUserId).
-      nativeContextCount: { gated: true, sends: 2, counts: 0, conditions: ["pool"] },
+      nativeContextCount: { gated: true, sends: 1, counts: 0, conditions: ["pool"] },
       // The requester's own direct models; a banned requester cannot authenticate.
       relayDirect: { gated: false, sends: 1, counts: 1 },
     };

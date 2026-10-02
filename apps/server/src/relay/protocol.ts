@@ -1025,6 +1025,14 @@ export type RelayServerControlMessage =
       // this request (true when the request carries a body). When false the CLI
       // forwards the request to upstream immediately with an empty body.
       expectBody: boolean;
+      /**
+       * Near-ceiling Chat Completions: the CLI tokenizes this body first, then
+       * either forwards it upstream or returns `relay.error` `request_too_large`.
+       * The body crosses the websocket once. Omit or false for every other family.
+       */
+      countFirst?: boolean;
+      /** Inclusive token ceiling the CLI uses when `countFirst` is true. */
+      countCeiling?: number;
     }
   | { type: "relay.cancel"; requestId: string; reason: RelayFailure }
   | {

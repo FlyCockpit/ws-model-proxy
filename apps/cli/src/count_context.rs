@@ -20,6 +20,8 @@ use crate::engine::{self, EngineKind, read_decoded_body};
 const TOKENIZE_BODY_LIMIT: u64 = 8 * 1024 * 1024;
 /// Probe and live count share this bound so a huge chat body cannot pin the CLI.
 pub const COUNT_CONTEXT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+/// Same ceiling as the server `context.count.result` / `countCeiling` schemas.
+pub const TOKEN_COUNT_MAX: u64 = 1_000_000_000_000;
 
 const LLAMA_INPUT_TOKEN_ROUTES: [&str; 2] = [
     "v1/chat/completions/input_tokens",
@@ -427,6 +429,12 @@ fn parse_required_count(
 }
 
 fn accept_count(tokens: u64, messages: &Value) -> std::result::Result<u64, CountContextError> {
+    if tokens > TOKEN_COUNT_MAX {
+        return Err(CountContextError::new(
+            CountContextErrorKind::Unsupported,
+            "tokenize returned a count above the protocol limit",
+        ));
+    }
     let empty = messages.as_array().is_none_or(|rows| rows.is_empty());
     if tokens == 0 && !empty {
         return Err(CountContextError::new(
@@ -462,11 +470,16 @@ fn count_from_value(value: &Value) -> Option<u64> {
 
 fn as_count(value: Option<&Value>) -> Option<u64> {
     let value = value?;
-    if let Some(count) = value.as_u64() {
-        return Some(count);
-    }
-    let count = value.as_i64()?;
-    (count >= 0).then_some(count as u64)
+    let count = if let Some(count) = value.as_u64() {
+        count
+    } else {
+        let count = value.as_i64()?;
+        if count < 0 {
+            return None;
+        }
+        count as u64
+    };
+    (count <= TOKEN_COUNT_MAX).then_some(count)
 }
 
 fn tokens_len(value: Option<&Value>) -> Option<u64> {
@@ -682,6 +695,12 @@ mod tests {
         assert!(accept_count(0, &messages).is_err());
         assert_eq!(accept_count(3, &messages).unwrap(), 3);
         assert_eq!(accept_count(0, &json!([])).unwrap(), 0);
+        assert!(accept_count(TOKEN_COUNT_MAX + 1, &messages).is_err());
+        assert_eq!(
+            as_count(Some(&json!(TOKEN_COUNT_MAX))),
+            Some(TOKEN_COUNT_MAX)
+        );
+        assert_eq!(as_count(Some(&json!(TOKEN_COUNT_MAX + 1))), None);
     }
 
     #[test]

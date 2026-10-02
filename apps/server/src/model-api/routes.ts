@@ -234,11 +234,7 @@ import {
   publicTargetCompatibility,
   resolvePublicProviderExecution,
 } from "./public-overflow.js";
-import {
-  type RelayAttemptTerminal,
-  startCountContextAttempt,
-  startRelayAttempt,
-} from "./relay-executor.js";
+import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
 import { classifyEngineContextOverflow, shouldRetryRelayOperation } from "./relay-retry-policy.js";
 import {
   LOCAL_RELAY_ATTEMPT_TTL_MS,
@@ -597,10 +593,75 @@ function responseBodyForOperation({
 
 const NATIVE_CONTEXT_COUNT_MAX_BYTES = 64 * 1024;
 const ENGINE_COUNT_NEAR_CEILING_RATIO = 0.85;
-const NATIVE_COUNT_TIMEOUT_MS = 5_000;
 
 function isNearContextCeiling(tokens: number, ceiling: number): boolean {
   return tokens >= Math.ceil(ceiling * ENGINE_COUNT_NEAR_CEILING_RATIO);
+}
+
+function chatCountFirstRelayFields({
+  family,
+  contextCount,
+  contextInput,
+  engineCountContext,
+  physicalMaxContext,
+  effectiveContextCeiling,
+  manager,
+  cliDeviceId,
+  relayRequestId,
+  operation,
+}: {
+  family: RelayOperation["family"];
+  contextCount: ContextCountTelemetry | undefined;
+  contextInput: RelayOperation["contextInput"];
+  engineCountContext: Parameters<typeof engineCountContextSupportsNative>[0];
+  physicalMaxContext: number | null | undefined;
+  effectiveContextCeiling: number | null | undefined;
+  manager: NonNullable<ModelApiRouteDependencies["manager"]>;
+  cliDeviceId: string;
+  relayRequestId: string;
+  operation: RelayOperation;
+}): {
+  countFirst?: true;
+  countCeiling?: number;
+  onCountResult?: (message: {
+    tokens: number;
+    method:
+      | "vllm_tokenize"
+      | "tgi_chat_tokenize"
+      | "llama_apply_template"
+      | "llama_input_tokens"
+      | "adapter_count";
+  }) => void;
+} {
+  if (family !== "chat.completions") return {};
+  if (!engineCountContextSupportsNative(engineCountContext)) return {};
+  if (!manager.supportsCountContext(cliDeviceId)) return {};
+  const ceiling = effectiveContextCeilingTokens(physicalMaxContext, effectiveContextCeiling);
+  if (
+    ceiling == null ||
+    !Number.isSafeInteger(ceiling) ||
+    ceiling <= 0 ||
+    !contextCount ||
+    !isNearContextCeiling(contextCount.tokens, ceiling)
+  ) {
+    return {};
+  }
+  return {
+    countFirst: true,
+    countCeiling: ceiling,
+    onCountResult(message) {
+      const exactCount: ContextCountTelemetry = {
+        tokens: message.tokens,
+        method: "NATIVE",
+        exact: true,
+        confidence: "EXACT",
+        safetyMargin: 1,
+        serializedChars: JSON.stringify(contextInput ?? {}).length,
+      };
+      operation.contextCount = exactCount;
+      void updateContextCountMetadata(relayRequestId, exactCount);
+    },
+  };
 }
 
 async function readBoundedJson(
@@ -637,7 +698,7 @@ async function nativeContextCount({
   relayRequestId,
   requester,
   pool,
-  effectiveContextCeiling,
+  effectiveContextCeiling: _effectiveContextCeiling,
 }: {
   request: Request;
   selected: ContextCountModelRow;
@@ -712,120 +773,7 @@ async function nativeContextCount({
       : operation.family === "messages"
         ? ("messages.countTokens" as const)
         : null;
-  if (!countCapability) {
-    const estimate = await countWithConfiguredCounter();
-    if (operation.family !== "chat.completions") return estimate;
-    const ceiling = effectiveContextCeilingTokens(
-      capacity?.physicalMaxContext,
-      effectiveContextCeiling,
-    );
-    if (
-      ceiling == null ||
-      !Number.isSafeInteger(ceiling) ||
-      ceiling <= 0 ||
-      !isNearContextCeiling(estimate.tokens, ceiling)
-    ) {
-      return estimate;
-    }
-    if (!engineCountContextSupportsNative(capacity?.engineCountContext)) return estimate;
-    if (!manager.supportsCountContext(selected.Endpoint.cliDeviceId)) return estimate;
-    let chatBuilt: BuiltRelayRequest | undefined;
-    let chatAttempt: ReturnType<typeof startCountContextAttempt> | undefined;
-    const chatExecution: LocalExecutionTelemetry = {
-      attemptKind: "CONTEXT_COUNT",
-      selectedExecutionTargetId: selected.ExecutionTarget?.id,
-      selectedPoolMemberId: pool?.memberId,
-      selectedPoolMemberTier: pool?.tier,
-      nativeSurface: telemetrySurfaceForOperation(operation),
-      requestedSurface: telemetrySurfaceForOperation(operation),
-      adapterMode: "NATIVE",
-      localAttemptId: crypto.randomUUID(),
-      poolId: pool?.id,
-      contextCount: operation.contextCount,
-    };
-    try {
-      chatBuilt = await operation.buildRequest(selected.upstreamModelId);
-      if (!(chatBuilt.body instanceof Uint8Array)) return estimate;
-      await startLocalExecutionTelemetry(relayRequestId, requester.userId, chatExecution);
-      if (pool)
-        await assertLocalSendAllowed({
-          poolId: pool.id,
-          ownerUserId: pool.ownerUserId,
-          requesterUserId: requester.userId,
-          accessGrantId: pool.accessGrantId,
-          poolMemberId: pool.tier === "PRIMARY" ? pool.memberId : null,
-        });
-      chatAttempt = startCountContextAttempt({
-        requestId: chatExecution.localAttemptId,
-        manager,
-        cliDeviceId: selected.Endpoint.cliDeviceId,
-        endpointSlug: selected.Endpoint.slug,
-        model: selected.upstreamModelId,
-        body: chatBuilt.body,
-        timeoutMs: NATIVE_COUNT_TIMEOUT_MS,
-        abortSignal: request.signal,
-      });
-      const outcome = await chatAttempt.result;
-      if (!outcome.ok) {
-        await recordLocalTerminal(relayRequestId, requester.userId, chatExecution, {
-          ok: false,
-          failure: outcome.failure,
-          httpStatusCode: outcome.failure === "timeout" ? 504 : null,
-          upstreamStatusCode: null,
-          usage: null,
-          metrics: null,
-          responseBytes: 0,
-          requestBytes: 0,
-        });
-        return estimate;
-      }
-      const exactCount = {
-        tokens: outcome.tokens,
-        method: "NATIVE" as const,
-        exact: true as const,
-        confidence: "EXACT" as const,
-        safetyMargin: 1,
-        serializedChars: JSON.stringify(operation.contextInput).length,
-      };
-      await recordLocalTerminal(
-        relayRequestId,
-        requester.userId,
-        { ...chatExecution, contextCount: exactCount },
-        {
-          ok: true,
-          failure: null,
-          httpStatusCode: 200,
-          upstreamStatusCode: null,
-          usage: null,
-          metrics: null,
-          responseBytes: 0,
-          requestBytes: 0,
-        },
-      );
-      return exactCount;
-    } catch (error) {
-      chatAttempt?.cancel(request.signal.aborted ? "cancelled" : "protocol_error");
-      if (chatAttempt) {
-        await chatAttempt.result.catch(() => undefined);
-        await recordLocalTerminal(
-          relayRequestId,
-          requester.userId,
-          chatExecution,
-          rejectedRelayTerminal(),
-        ).catch(metadataUpdateError);
-      } else if (error instanceof LocalSendRefused) {
-        await recordLocalTerminal(
-          relayRequestId,
-          requester.userId,
-          chatExecution,
-          rejectedRelayTerminal(),
-        ).catch(metadataUpdateError);
-      }
-      if (request.signal.aborted) throw request.signal.reason;
-      if (error instanceof LocalSendRefused && error.denial !== "MEMBER_UNAVAILABLE") throw error;
-      return estimate;
-    }
-  }
+  if (!countCapability) return countWithConfiguredCounter();
   const countOperation: RelayOperation = {
     family: operation.family,
     method: "POST",
@@ -4349,6 +4297,18 @@ async function relayDirect({
       onResponseBodyChunk: responseIdCapture
         ? (chunk) => responseIdCapture.push(chunk, operation.stream)
         : undefined,
+      ...chatCountFirstRelayFields({
+        family: operation.family,
+        contextCount: operation.contextCount,
+        contextInput: operation.contextInput,
+        engineCountContext: selected.ExecutionTarget?.InferenceCapacity?.engineCountContext,
+        physicalMaxContext: selected.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+        effectiveContextCeiling: selected.ExecutionTarget?.directContextCeiling,
+        manager,
+        cliDeviceId: selected.Endpoint.cliDeviceId,
+        relayRequestId,
+        operation,
+      }),
     });
   } catch {
     attempt?.cancel("unknown");
@@ -4533,6 +4493,23 @@ async function relayDirect({
       localExecution,
       userId: requester.userId,
     });
+    if (terminal.failure === "request_too_large" && operation.contextCount?.exact) {
+      const identity = selected.ExecutionTarget;
+      return contextExceededResponse(
+        operation,
+        "Request context exceeds the configured execution capacity ceiling.",
+        {
+          estimatedInputTokens: operation.contextCount.tokens,
+          estimateMethod: operation.contextCount.method,
+          contextMarginTokens: identity?.directContextMargin ?? 0,
+          effectiveContextCeilingTokens:
+            effectiveContextCeilingTokens(
+              identity?.InferenceCapacity?.physicalMaxContext,
+              identity?.directContextCeiling,
+            ) ?? 1,
+        },
+      );
+    }
     return operationFailureResponse(operation, terminal.failure ?? "unknown");
   }
 }
@@ -6890,6 +6867,18 @@ async function relayPool({
         onResponseBodyChunk: (chunk) => {
           responseIdCapture?.push(chunk, operation.stream);
         },
+        ...chatCountFirstRelayFields({
+          family: adaptedSource ? nativeRouteForSurface(adaptedSource).family : operation.family,
+          contextCount: operation.contextCount,
+          contextInput: operation.contextInput,
+          engineCountContext: member.ExecutionTarget?.InferenceCapacity?.engineCountContext,
+          physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+          effectiveContextCeiling: configuredContextCeilingForMember(member),
+          manager,
+          cliDeviceId: candidate.cliDeviceId,
+          relayRequestId,
+          operation,
+        }),
       });
     } catch (error) {
       attempt?.cancel("unknown");
@@ -7521,6 +7510,37 @@ async function relayPool({
         leaseLostNow,
       );
       const failure = terminal.failure ?? "unknown";
+      if (failure === "request_too_large" && operation.contextCount?.exact) {
+        await settleRelayCleanup([
+          () => cliLease.release(),
+          () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
+          () => globalLease?.release(),
+          () =>
+            capacityLease?.state === "ADMITTED"
+              ? capacityRuntime?.release(capacityLease.lease)
+              : undefined,
+          () => operation.dispose?.(),
+        ]);
+        await failPoolRelayMetadata({
+          relayRequestId,
+          startedAt,
+          failure: "request_too_large",
+        });
+        return contextExceededResponse(
+          operation,
+          "Request context exceeds the configured execution capacity ceiling.",
+          {
+            estimatedInputTokens: operation.contextCount.tokens,
+            estimateMethod: operation.contextCount.method,
+            contextMarginTokens: contextMarginForMember(member),
+            effectiveContextCeilingTokens:
+              effectiveContextCeilingTokens(
+                member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+                configuredContextCeilingForMember(member),
+              ) ?? 1,
+          },
+        );
+      }
       const operationRetryable = shouldRetryRelayOperation(operation, "precommit_transport");
       const memberRetryable =
         isPoolRelayFailureClass(failure) && isRetryablePoolMemberRelayFailure(failure);
@@ -7939,6 +7959,18 @@ async function relaySelectedModelNoFailover({
       onResponseBodyChunk: responseIdCapture
         ? (chunk) => responseIdCapture.push(chunk, operation.stream)
         : undefined,
+      ...chatCountFirstRelayFields({
+        family: operation.family,
+        contextCount: operation.contextCount,
+        contextInput: operation.contextInput,
+        engineCountContext: selected.ExecutionTarget?.InferenceCapacity?.engineCountContext,
+        physicalMaxContext: selected.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+        effectiveContextCeiling: selected.ExecutionTarget?.directContextCeiling,
+        manager,
+        cliDeviceId: selected.Endpoint.cliDeviceId,
+        relayRequestId,
+        operation,
+      }),
     });
   } catch (error) {
     const failure: RelayFailure = error instanceof LocalSendRefused ? error.failure : "unknown";
@@ -8149,6 +8181,23 @@ async function relaySelectedModelNoFailover({
       localExecution,
       userId: requester.userId,
     });
+    if (terminal.failure === "request_too_large" && operation.contextCount?.exact) {
+      const identity = selected.ExecutionTarget;
+      return contextExceededResponse(
+        operation,
+        "Request context exceeds the configured execution capacity ceiling.",
+        {
+          estimatedInputTokens: operation.contextCount.tokens,
+          estimateMethod: operation.contextCount.method,
+          contextMarginTokens: identity?.directContextMargin ?? 0,
+          effectiveContextCeilingTokens:
+            effectiveContextCeilingTokens(
+              identity?.InferenceCapacity?.physicalMaxContext,
+              identity?.directContextCeiling,
+            ) ?? 1,
+        },
+      );
+    }
     return operationFailureResponse(operation, terminal.failure ?? "unknown");
   }
 }

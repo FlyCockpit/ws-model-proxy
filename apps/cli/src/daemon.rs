@@ -1794,9 +1794,7 @@ where
                 tracing::warn!(id, "late inventory rejection resolved uncertain publish");
             }
         }
-        ServerControlMessage::ProtocolError {
-            message, code, ..
-        } => {
+        ServerControlMessage::ProtocolError { message, code, .. } => {
             let text = if *registered {
                 format!("relay protocol error: {message}")
             } else {
@@ -1834,6 +1832,8 @@ where
             timeout_ms,
             endpoint_slug,
             expect_body,
+            count_first,
+            count_ceiling,
             ..
         } => {
             start_relay_request(
@@ -1849,6 +1849,8 @@ where
                 timeout_ms,
                 endpoint_slug,
                 expect_body,
+                count_first,
+                count_ceiling,
             )?;
         }
         ServerControlMessage::Unknown { type_name } => {
@@ -2075,6 +2077,8 @@ fn start_relay_request<S>(
     timeout_ms: u64,
     endpoint_slug: String,
     expect_body: bool,
+    count_first: bool,
+    count_ceiling: Option<u64>,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
@@ -2134,6 +2138,37 @@ where
             &config.media_trusted_origins,
         ),
     };
+
+    if count_first && expect_body {
+        let (method, adapter_count_route) = endpoint_count_plan(config, endpoint);
+        let (cancellation, cancellation_rx) = CancellationHandle::new();
+        let thread_tx = worker_tx.clone();
+        let thread_cancellation = cancellation.clone();
+        let (body_tx, body_rx) = mpsc::sync_channel::<BodyChunk>(REQUEST_BODY_INGRESS_CAPACITY);
+        let endpoint = endpoint.clone();
+        let handle = thread::spawn(move || {
+            run_count_first_worker(
+                spec,
+                endpoint,
+                method,
+                adapter_count_route,
+                count_ceiling,
+                body_rx,
+                thread_tx,
+                thread_cancellation,
+                cancellation_rx,
+            );
+        });
+        workers.insert(
+            request_id,
+            WorkerHandle {
+                body_tx: Some(body_tx),
+                cancellation,
+                join: handle,
+            },
+        );
+        return Ok(());
+    }
 
     let (cancellation, cancellation_rx) = CancellationHandle::new();
     let thread_tx = worker_tx.clone();
@@ -2220,20 +2255,7 @@ where
         return Ok(());
     };
 
-    let method = endpoint
-        .last_probe
-        .as_ref()
-        .and_then(|probe| probe.engine.as_ref())
-        .and_then(|engine| engine.count_context)
-        .and_then(crate::count_context::CountContextFact::method);
-    let remote = crate::engine_adapter::load_remote_adapters().unwrap_or_default();
-    let adapter_count_route = crate::engine_adapter::effective_engine_adapter(
-        &endpoint,
-        &remote,
-        config.allow_remote_engine_adapters,
-        &config.approved_remote_adapters,
-    )
-    .and_then(|spec| spec.count_route);
+    let (method, adapter_count_route) = endpoint_count_plan(config, &endpoint);
     if method.is_none() {
         recent_finished.record(&request_id);
         send_control(
@@ -2342,7 +2364,7 @@ fn run_count_context_worker(
             Ok(outcome) => Some(ClientControlMessage::CountContextResult {
                 request_id: request_id.clone(),
                 tokens: outcome.tokens,
-                method: outcome.method.as_str().to_string(),
+                method: outcome.method,
             }),
             Err(error) => Some(ClientControlMessage::CountContextError {
                 request_id: request_id.clone(),
@@ -2592,6 +2614,156 @@ where
             Ok(())
         }
     }
+}
+
+const COUNT_FIRST_TIMEOUT_MS: u64 = 5_000;
+
+fn count_first_exceeds_ceiling(tokens: u64, ceiling: Option<u64>) -> bool {
+    ceiling.is_some_and(|max| tokens > max)
+}
+
+fn endpoint_count_plan(
+    config: &Config,
+    endpoint: &crate::config::EndpointConfig,
+) -> (
+    Option<crate::count_context::CountContextMethod>,
+    Option<String>,
+) {
+    let method = endpoint
+        .last_probe
+        .as_ref()
+        .and_then(|probe| probe.engine.as_ref())
+        .and_then(|engine| engine.count_context)
+        .and_then(crate::count_context::CountContextFact::method);
+    let remote = crate::engine_adapter::load_remote_adapters().unwrap_or_default();
+    let adapter_count_route = crate::engine_adapter::effective_engine_adapter(
+        endpoint,
+        &remote,
+        config.allow_remote_engine_adapters,
+        &config.approved_remote_adapters,
+    )
+    .and_then(|spec| spec.count_route);
+    (method, adapter_count_route)
+}
+
+fn run_count_first_worker(
+    spec: UpstreamRequestSpec,
+    endpoint: crate::config::EndpointConfig,
+    method: Option<crate::count_context::CountContextMethod>,
+    adapter_count_route: Option<String>,
+    count_ceiling: Option<u64>,
+    body_rx: Receiver<BodyChunk>,
+    tx: SyncSender<FromWorker>,
+    cancellation: CancellationHandle,
+    cancellation_rx: watch::Receiver<bool>,
+) {
+    let request_id = spec.request_id.clone();
+    let proceed = (|| {
+        let bytes = match collect_request_body(
+            &body_rx,
+            &tx,
+            &request_id,
+            crate::count_context::COUNT_CONTEXT_MAX_BODY_BYTES,
+        ) {
+            Ok(bytes) => bytes,
+            Err(CollectError::Aborted) => return None,
+            Err(CollectError::TooLarge) => {
+                let _ = worker_send_control(
+                    &tx,
+                    &ClientControlMessage::RelayError {
+                        request_id: request_id.clone(),
+                        failure: RelayFailure::RequestTooLarge,
+                        message: Some("request body exceeds its size limit".to_string()),
+                        upstream_status_code: None,
+                    },
+                );
+                return None;
+            }
+        };
+        if cancellation.cancelled.load(Ordering::SeqCst) {
+            return None;
+        }
+        let Some(method) = method else {
+            return Some(bytes);
+        };
+        let body = match crate::count_context::parse_count_context_body(&bytes) {
+            Ok(body) => body,
+            Err(error) => {
+                let _ = worker_send_control(
+                    &tx,
+                    &ClientControlMessage::CountContextError {
+                        request_id: request_id.clone(),
+                        failure: error.kind.relay_failure(),
+                        message: Some(error.message),
+                    },
+                );
+                return Some(bytes);
+            }
+        };
+        let model = body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let timeout = Duration::from_millis(COUNT_FIRST_TIMEOUT_MS.min(spec.timeout_ms).max(1));
+        match crate::count_context::count_chat(
+            &endpoint,
+            &model,
+            &body,
+            Some(method),
+            adapter_count_route.as_deref(),
+            timeout,
+        ) {
+            Ok(outcome) => {
+                let _ = worker_send_control(
+                    &tx,
+                    &ClientControlMessage::CountContextResult {
+                        request_id: request_id.clone(),
+                        tokens: outcome.tokens,
+                        method: outcome.method,
+                    },
+                );
+                if count_first_exceeds_ceiling(outcome.tokens, count_ceiling) {
+                    let _ = worker_send_control(
+                        &tx,
+                        &ClientControlMessage::RelayError {
+                            request_id: request_id.clone(),
+                            failure: RelayFailure::RequestTooLarge,
+                            message: Some("prompt exceeds the context ceiling".to_string()),
+                            upstream_status_code: None,
+                        },
+                    );
+                    return None;
+                }
+            }
+            Err(error) => {
+                let _ = worker_send_control(
+                    &tx,
+                    &ClientControlMessage::CountContextError {
+                        request_id: request_id.clone(),
+                        failure: error.kind.relay_failure(),
+                        message: Some(error.message),
+                    },
+                );
+            }
+        }
+        Some(bytes)
+    })();
+    if cancellation.cancelled.load(Ordering::SeqCst) {
+        let _ = tx.send(FromWorker::Finished(request_id));
+        return;
+    }
+    let Some(bytes) = proceed else {
+        let _ = tx.send(FromWorker::Finished(request_id));
+        return;
+    };
+    let (body_tx, body_rx) = mpsc::sync_channel(1);
+    let _ = body_tx.send(BodyChunk {
+        data: bytes,
+        last: true,
+    });
+    drop(body_tx);
+    run_upstream_worker(spec, Some(body_rx), tx, cancellation, cancellation_rx);
 }
 
 /// Run one upstream request on a worker thread: stream the request body (if any)
@@ -3266,9 +3438,7 @@ where
     Ok(())
 }
 
-fn wait_for_hello_challenge<S>(
-    socket: &mut tungstenite::WebSocket<S>,
-) -> RelaySessionResult<String>
+fn wait_for_hello_challenge<S>(socket: &mut tungstenite::WebSocket<S>) -> RelaySessionResult<String>
 where
     S: std::io::Read + std::io::Write,
 {
@@ -3951,6 +4121,8 @@ mod tests {
             1_000,
             "local".to_string(),
             false,
+            false,
+            None,
         );
         assert!(result.is_ok(), "start_relay_request should not error");
 
@@ -3987,6 +4159,8 @@ mod tests {
             1_000,
             "local".to_string(),
             false,
+            false,
+            None,
         );
         assert!(result.is_ok(), "start_relay_request should not error");
 
@@ -4166,6 +4340,13 @@ mod tests {
             ..crate::engine::DetectedEngine::default()
         };
         assert!(re_detection_replaces_stored(&re_detected));
+    }
+
+    #[test]
+    fn count_first_exceeds_ceiling_is_exclusive() {
+        assert!(!count_first_exceeds_ceiling(8, None));
+        assert!(!count_first_exceeds_ceiling(8, Some(8)));
+        assert!(count_first_exceeds_ceiling(9, Some(8)));
     }
 
     #[test]

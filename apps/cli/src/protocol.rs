@@ -479,7 +479,7 @@ pub enum ClientControlMessage {
     CountContextResult {
         request_id: String,
         tokens: u64,
-        method: String,
+        method: crate::count_context::CountContextMethod,
     },
     /// 2.4: Chat Completions engine tokenize failed.
     #[serde(rename = "context.count.error")]
@@ -1156,6 +1156,10 @@ enum KnownServerControlMessage {
         timeout_ms: u64,
         endpoint_slug: String,
         expect_body: bool,
+        #[serde(default)]
+        count_first: bool,
+        #[serde(default)]
+        count_ceiling: Option<u64>,
     },
     #[serde(rename = "relay.cancel")]
     RelayCancel {
@@ -1370,6 +1374,8 @@ pub enum ServerControlMessage {
         timeout_ms: u64,
         endpoint_slug: String,
         expect_body: bool,
+        count_first: bool,
+        count_ceiling: Option<u64>,
     },
     RelayCancel {
         request_id: String,
@@ -2009,6 +2015,8 @@ impl From<KnownServerControlMessage> for ServerControlMessage {
                 timeout_ms,
                 endpoint_slug,
                 expect_body,
+                count_first,
+                count_ceiling,
             } => Self::RelayRequest {
                 request_id,
                 family,
@@ -2018,6 +2026,8 @@ impl From<KnownServerControlMessage> for ServerControlMessage {
                 timeout_ms,
                 endpoint_slug,
                 expect_body,
+                count_first,
+                count_ceiling,
             },
             KnownServerControlMessage::RelayCancel { request_id, reason } => {
                 Self::RelayCancel { request_id, reason }
@@ -2630,7 +2640,9 @@ mod tests {
         };
         let encoded = serde_json::to_string(&inventory).expect("encode");
         assert!(!encoded.contains("hostname"));
-        assert!(encoded.contains(&format!(r#""identityPublicKey":"{TEST_IDENTITY_PUBLIC_KEY}""#)));
+        assert!(encoded.contains(&format!(
+            r#""identityPublicKey":"{TEST_IDENTITY_PUBLIC_KEY}""#
+        )));
         assert!(!encoded.contains("machineId"));
         assert!(!encoded.contains("label"));
     }
@@ -2686,8 +2698,12 @@ mod tests {
         assert!(encoded.contains(r#""remoteMetricSources":false"#));
         assert!(!encoded.contains(r#""supervisedCommands""#));
         assert!(encoded.contains(r#""hostname":"desk-01.local""#));
-        assert!(encoded.contains(&format!(r#""identityPublicKey":"{TEST_IDENTITY_PUBLIC_KEY}""#)));
-        assert!(encoded.contains(&format!(r#""identitySignature":"{TEST_IDENTITY_SIGNATURE}""#)));
+        assert!(encoded.contains(&format!(
+            r#""identityPublicKey":"{TEST_IDENTITY_PUBLIC_KEY}""#
+        )));
+        assert!(encoded.contains(&format!(
+            r#""identitySignature":"{TEST_IDENTITY_SIGNATURE}""#
+        )));
         assert!(!encoded.contains("machineId"));
         assert!(!encoded.contains(r#""label":"Desktop""#));
         assert!(!encoded.contains(r#""terminalViewers""#));
@@ -2752,6 +2768,22 @@ mod tests {
             other => panic!("unexpected message: {other:?}"),
         }
 
+        let count_first = parse_server_control(
+            r#"{"type":"relay.request","requestId":"request-2","family":"chat.completions","method":"POST","path":"/v1/chat/completions","headers":{},"timeoutMs":30000,"endpointSlug":"local","expectBody":true,"countFirst":true,"countCeiling":8192}"#,
+        )
+        .expect("parse count-first relay.request");
+        match count_first {
+            ServerControlMessage::RelayRequest {
+                count_first,
+                count_ceiling,
+                ..
+            } => {
+                assert!(count_first);
+                assert_eq!(count_ceiling, Some(8192));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
         let count_context = parse_server_control(
             r#"{"type":"context.count","requestId":"r1","endpointSlug":"local","model":"m","timeoutMs":5000,"expectBody":true}"#,
         )
@@ -2776,7 +2808,7 @@ mod tests {
         let count_result = encode_control(&ClientControlMessage::CountContextResult {
             request_id: "r1".to_string(),
             tokens: 12,
-            method: "vllm_tokenize".to_string(),
+            method: crate::count_context::CountContextMethod::VllmTokenize,
         })
         .expect("encode context.count.result");
         assert!(count_result.contains(r#""type":"context.count.result""#));
