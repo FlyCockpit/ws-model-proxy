@@ -41,8 +41,8 @@ import {
   coarseCapabilitiesFromOpenAi,
   resolveEffectiveCapabilityMetadata,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import { DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE } from "@ws-model-proxy/config/cli-identity-key";
 import { directModelId, validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
-import { DEVICE_CREDENTIAL_MACHINE_MISMATCH_MESSAGE } from "@ws-model-proxy/config/login-machine-id";
 import prisma from "@ws-model-proxy/db";
 import { acquireFences, fenceOwners, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
@@ -157,7 +157,7 @@ export async function persistRelayRegistration({
   endpointTargeting,
   connection = false,
   reported,
-  machineId,
+  identityPublicKey,
   now = new Date(),
 }: {
   identity: CliWebsocketIdentity;
@@ -167,11 +167,11 @@ export async function persistRelayRegistration({
   endpointTargeting: boolean;
   connection?: boolean;
   /**
-   * Hello only: the login machine id the CLI presented. Required for a device
-   * credential hello (omitting it is a mismatch). Inventory updates omit it;
-   * that socket was already admitted.
+   * Hello only: the CLI identity public key the hello presented. Required for
+   * a device-credential hello (omitting it is a mismatch). Inventory updates
+   * omit it; that socket was already admitted.
    */
-  machineId?: string;
+  identityPublicKey?: string;
   /** Hello only. inventory.update must omit this so reported columns stay put. */
   reported?: ReportedRelayFeatures;
   now?: Date;
@@ -389,22 +389,20 @@ export async function persistRelayRegistration({
           // After the device upsert, which holds the device row lock that a
           // re-login's revoking transaction and a device delete also take. A
           // device credential only ever registers as its minted device; an
-          // unbound CLI token is bound here. Any refusal rolls back the
-          // upsert, including a device row it just created — a mismatched
-          // machine id therefore does not take the device from the session
-          // that already holds it.
-          // Hello of a device credential always checks the login machine id.
-          // An omitted id is not a match. Inventory updates and CLI tokens skip
-          // it (null): tokens are not machine-bound, and an inventory update
-          // runs on a socket hello already admitted.
-          const presentedMachineId =
-            connection && identity.kind === "deviceCredential" ? (machineId ?? "") : null;
+          // unbound CLI token is bound here (device + identity key). Any
+          // refusal rolls back the upsert, including a device row it just
+          // created — a mismatched identity key therefore does not take the
+          // device from the session that already holds it.
+          // Hello always presents the identity key. An omitted key is not a
+          // match for a device credential. Inventory updates pass null: that
+          // socket was already admitted.
+          const presentedIdentityPublicKey = connection ? (identityPublicKey ?? "") : null;
           const credentialCheck = await checkCliCredentialForDevice(
             tx,
             identity,
             cliDevice.id,
             now,
-            presentedMachineId,
+            presentedIdentityPublicKey,
           );
           if (credentialCheck === "revoked") {
             throw new RelayRegistrationError("Credential was revoked.", "access_denied");
@@ -417,7 +415,7 @@ export async function persistRelayRegistration({
           }
           if (credentialCheck === "machineMismatch") {
             throw new RelayRegistrationError(
-              DEVICE_CREDENTIAL_MACHINE_MISMATCH_MESSAGE,
+              DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE,
               "machine_mismatch",
             );
           }

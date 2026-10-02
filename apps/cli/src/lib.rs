@@ -26,7 +26,6 @@ pub mod hostname;
 #[cfg(windows)]
 mod job_tree;
 pub mod logging;
-pub mod machine_id;
 pub mod media;
 pub mod metric_sources;
 pub mod output;

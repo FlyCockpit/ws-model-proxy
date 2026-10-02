@@ -137,7 +137,7 @@ import {
   providerModelSurfaceCapabilities,
 } from "../lib/pool-recommended-surface";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
-import { refusedRelayProtocolReason, relayProtocolAtLeast } from "../lib/relay-protocol-version";
+import { refusedRelayProtocolReason } from "../lib/relay-protocol-version";
 import { serializeRemoteEngineAdapters } from "../lib/remote-engine-adapters";
 import {
   runCapacityDeleteTransaction,
@@ -807,16 +807,12 @@ function effectiveCapabilities(endpoint: EndpointRow, model: DiscoveredModelRow)
 }
 
 function liveTerminalFeature(snapshot: LiveCliFeatureSnapshot | null): boolean {
-  return (
-    relayProtocolAtLeast(snapshot?.protocolVersion, "2.4") &&
-    snapshot?.humanTerminal === true &&
-    snapshot.terminalSupported === true
-  );
+  return snapshot?.humanTerminal === true && snapshot.terminalSupported === true;
 }
 
-/** The CLI's live MCP command mode; `off` while it is offline or older than 2.4. */
+/** The CLI's live MCP command mode; `off` while it is offline. */
 function liveCommandMode(snapshot: LiveCliFeatureSnapshot | null): McpCommandModeName {
-  if (!snapshot || !relayProtocolAtLeast(snapshot.protocolVersion, "2.4")) return "off";
+  if (!snapshot) return "off";
   return snapshot.mcpCommandMode;
 }
 
@@ -846,11 +842,11 @@ function serializeCliDeviceFeatures(
   const terminalSupported = row.reportedTerminalSupported ?? null;
   const commandsGrant = mcpCommandModeFromDb(row.mcpCommandMode);
   const commandsDeviceMode = mcpCommandModeFromDb(row.reportedMcpCommandMode ?? null);
-  const commandsLive = live !== null && relayProtocolAtLeast(live.protocolVersion, "2.4");
+  const commandsLive = live !== null;
   const commandsEffective = lowestMcpCommandMode(commandsGrant, liveCommandMode(live));
   // Node file tools follow the same effective mode through the one file
-  // matrix; a CLI that is offline or older than 2.4 runs none.
-  const fileToolsLive = live !== null && relayProtocolAtLeast(live.protocolVersion, "2.4");
+  // matrix; a CLI that is offline runs none.
+  const fileToolsLive = live !== null;
   const refusals = mcpCommandRefusals({
     grant: commandsGrant,
     live:

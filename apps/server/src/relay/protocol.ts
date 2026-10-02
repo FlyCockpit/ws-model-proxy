@@ -6,11 +6,11 @@ import {
   RELAY_MIN_PROTOCOL_VERSION,
   RELAY_PROTOCOL_VERSIONS,
   type RelayProtocolVersion,
+  refusedRelayProtocolReason,
   relayProtocolAtLeast,
 } from "@ws-model-proxy/api/lib/relay-protocol-version";
 import { adapterRouteIsValid } from "@ws-model-proxy/api/lib/remote-engine-adapters";
 import { normalizeReportedHostname } from "@ws-model-proxy/config/cli-device-name";
-import { normalizeLoginMachineId } from "@ws-model-proxy/config/login-machine-id";
 import { z } from "zod";
 import {
   FILE_BODY_MAX_BYTES,
@@ -30,6 +30,7 @@ export {
   RELAY_MIN_PROTOCOL_VERSION,
   RELAY_PROTOCOL_VERSIONS,
   type RelayProtocolVersion,
+  refusedRelayProtocolReason,
   relayProtocolAtLeast,
 };
 
@@ -42,7 +43,18 @@ type FileSpawnSpec = z.infer<typeof fileSpawnSpecSchema>;
  * version: the first release that speaks 2.4 is cut separately.
  */
 export const RELAY_UPGRADE_REQUIRED_MESSAGE = `This server requires a newer wsmp (relay protocol ${RELAY_MIN_PROTOCOL_VERSION}). Upgrade wsmp and restart it.`;
+export const RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE =
+  "This wsmp speaks a newer relay protocol than the server. Upgrade WS Model Proxy and restart the CLI.";
 export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v2";
+
+export const RELAY_PROTOCOL_ERROR_CODES = [
+  "upgrade_cli",
+  "upgrade_server",
+  "machine_mismatch",
+  "access_denied",
+  "malformed",
+] as const;
+export type RelayProtocolErrorCode = (typeof RELAY_PROTOCOL_ERROR_CODES)[number];
 
 const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
 export const RELAY_BINARY_CHUNK_MAX_BYTES = 1024 * 1024;
@@ -119,9 +131,10 @@ export const p256SignatureSchema = z
   });
 
 /**
- * 2.5: the CLI's long-lived identity key and its signature over
+ * The CLI's long-lived identity key and its signature over
  * `lp16("wsmp-term-cli-id-v1") ‖ lp16(cliSlug) ‖ terminalPublicKey`. The relay
- * does not verify it; browsers do, and pin the key per CLI device.
+ * does not verify this ECDH proof; browsers do, and pin the key per CLI device.
+ * Hello also signs a server nonce with the same key (`cli.identitySignature`).
  */
 export const cliTerminalIdentitySchema = z
   .object({
@@ -145,70 +158,35 @@ const terminalIdentitySchema = z
 
 const mcpCommandModeSchema = z.enum(["off", "supervised", "unsupervised"]);
 
-const v28FeatureSchema = z
+const cliFeatureSchema = z
   .object({
     humanTerminal: z.boolean(),
     /** The CLI's own MCP command policy (`wsmp config set-mcp-commands`). */
     mcpCommandMode: mcpCommandModeSchema,
     terminalApproval: z.boolean(),
     terminalSupported: z.boolean(),
-    /**
-     * 2.7: the CLI accepts remotely defined metric sources
-     * (`metrics.sources.set`): its local opt-in is on. False until S-B part 2.
-     */
+    /** The CLI accepts remotely defined metric sources (`metrics.sources.set`). */
     remoteMetricSources: z.boolean(),
-    /**
-     * 2.9: the CLI accepts remotely defined engine adapters
-     * (`engine.adapters.set`): its local `allowRemoteEngineAdapters` opt-in
-     * is on. Optional so older hellos still parse.
-     */
-    remoteEngineAdapters: z.boolean().optional(),
-    /**
-     * 2.8: the CLI's read-only file grant (`wsmp config set-file-read`), read
-     * from the CLI's own startup switch and reported on every hello.
-     */
+    /** The CLI accepts remotely defined engine adapters (`engine.adapters.set`). */
+    remoteEngineAdapters: z.boolean(),
+    /** The CLI's read-only file grant (`wsmp config set-file-read`). */
     mcpFileRead: z.boolean(),
-    /** 2.8: the CLI has `fileRoots` configured (mandatory for the read grant). */
+    /** The CLI has `fileRoots` configured (mandatory for the read grant). */
     fileRootsConfigured: z.boolean(),
-    /** 2.8: `wsmp config set-file-tools-as-root on` (default off). */
+    /** `wsmp config set-file-tools-as-root on` (default off). */
     allowFileToolsAsRoot: z.boolean(),
   })
   .strict();
 
 /**
- * 2.6: multi-viewer terminals (server-minted viewer ids, broadcast output),
- * CLI identity proof, and supervised terminals (`term.spawn`). 2.7: node
- * telemetry. 2.8: node file tools.
+ * Hello capabilities: only fields that vary per CLI. Protocol 2.4 always
+ * implements inventory, binary frames, terminals, exec, node telemetry,
+ * file ops, and context.count.
  */
-const v28CliCapabilitiesSchema = z
+const cliCapabilitiesSchema = z
   .object({
-    protocolVersion: z.enum(["2.4"]),
-    inventoryAck: z.literal(true),
-    inventoryReplace: z.literal(true),
-    endpointTargeting: z.literal(true),
-    binaryFrames: z.literal(true),
-    cancellation: z.literal(true),
-    maxBinaryChunkBytes: z.literal(RELAY_BINARY_CHUNK_MAX_BYTES),
-    requestBodyStreaming: z.literal(true),
-    requestBodyWindowChunks: z.literal(RELAY_REQUEST_BODY_WINDOW_CHUNKS),
-    sharedTokenizerTps: z.literal(true),
-    standardizedMetrics: z.literal(true),
-    terminal: z.literal(true),
-    exec: z.literal(true),
-    features: v28FeatureSchema,
+    features: cliFeatureSchema,
     terminalPublicKey: uncompressedP256PublicKeySchema,
-    terminalViewers: z.literal(true),
-    supervisedCommands: z.literal(true),
-    /** 2.7: the CLI sends `node.info`, `node.metrics` and `endpoint.load`. */
-    nodeTelemetry: z.literal(true),
-    /** 2.8: the CLI runs `file.op` (answers `unsupported` for ops it has not implemented). */
-    fileOps: z.literal(true),
-    /**
-     * 2.4: the CLI runs `count_context` (Chat Completions engine tokenize).
-     * Optional so a 2.4 hello without the flag still parses; the server
-     * preflights ENGINE_REPORTED Chat as "CLI upgrade required" when absent.
-     */
-    countContext: z.literal(true).optional(),
     /** Absent when the CLI could not load its identity; browsers then refuse it. */
     terminalIdentity: cliTerminalIdentitySchema.optional(),
   })
@@ -740,35 +718,24 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
           // (`hostnamectl`); not what a device credential is bound to.
           // Normalized rather than rejected so an odd hostname never blocks hello.
           hostname: z.string().max(1024).nullish().transform(normalizeReportedHostname),
-          // Login-time machine id. Required on 2.4. The server refuses a device
-          // credential whose stored id differs. Not optional: a hello without
-          // it is a schema error, not a legacy registration.
-          machineId: z
-            .string()
-            .trim()
-            .min(1)
-            .max(80)
-            .transform((value, ctx) => {
-              const normalized = normalizeLoginMachineId(value);
-              if (!normalized) {
-                ctx.addIssue({
-                  code: "custom",
-                  message: "machineId must be a machine-id or UUID.",
-                });
-                return z.NEVER;
-              }
-              return normalized;
-            }),
           version: z.string().trim().max(80).optional(),
-          capabilities: v28CliCapabilitiesSchema,
+          // Persistent P-256 identity public key. Login and CLI-token TOFU bind
+          // to this key; hello must prove possession with `identitySignature`.
+          identityPublicKey: uncompressedP256PublicKeySchema,
+          // Signature over the server nonce from `hello.challenge`.
+          identitySignature: p256SignatureSchema,
+          capabilities: cliCapabilitiesSchema,
         })
-        .strict(),
+        .strict()
+        .refine(
+          (cli) =>
+            cli.capabilities.terminalIdentity === undefined ||
+            cli.capabilities.terminalIdentity.publicKey === cli.identityPublicKey,
+          { message: "terminalIdentity.publicKey must match identityPublicKey." },
+        ),
       endpoints: z.array(endpointInventorySchema).max(100).default([]),
     })
-    .strict()
-    .refine((message) => message.protocolVersion === message.cli.capabilities.protocolVersion, {
-      message: "Relay protocol version must match CLI capabilities.",
-    }),
+    .strict(),
   z
     .object({
       type: z.literal("inventory.update"),
@@ -836,7 +803,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
-      type: z.literal("count_context.result"),
+      type: z.literal("context.count.result"),
       requestId: requestIdSchema,
       tokens: z.number().int().min(0).max(TOKEN_COUNT_MAX),
       method: z.enum([
@@ -850,7 +817,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
-      type: z.literal("count_context.error"),
+      type: z.literal("context.count.error"),
       requestId: requestIdSchema,
       failure: relayFailureSchema,
       message: z.string().max(1000).optional(),
@@ -909,7 +876,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
       /** The CLI's input queue for this viewer was full. Sent once per run of drops. */
       type: z.literal("term.input_dropped"),
       terminalId: base64Url16ByteSchema,
-      /** Omitted on 2.4 terminals. */
+      /** Omitted only when the CLI has no viewer id for the drop. */
       viewerId: viewerIdSchema.optional(),
     })
     .strict(),
@@ -1058,7 +1025,15 @@ export type RelayServerControlMessage =
       expectBody: boolean;
     }
   | { type: "relay.cancel"; requestId: string; reason: RelayFailure }
-  | { type: "protocol.error"; failure: "protocol_error"; message: string; requestId?: string }
+  | {
+      type: "protocol.error";
+      failure: "protocol_error";
+      code: RelayProtocolErrorCode;
+      message: string;
+      supportedVersions: readonly RelayProtocolVersion[];
+      requestId?: string;
+    }
+  | { type: "hello.challenge"; nonce: string }
   | {
       type: "term.open";
       terminalId: string;
@@ -1146,8 +1121,8 @@ export type RelayServerControlMessage =
     }
   | { type: "file.cancel"; opId: string }
   | {
-      /** 2.4: Chat Completions engine tokenize. Request JSON follows as `relay.request.body`. */
-      type: "count_context";
+      /** Chat Completions engine tokenize. Request JSON follows as `relay.request.body`. */
+      type: "context.count";
       requestId: string;
       endpointSlug: string;
       model: string;
@@ -1268,6 +1243,21 @@ export const fileTermSpawnSchema = z
     "Only write requires bodyBytes.",
   );
 
+export function protocolErrorMessage(input: {
+  code: RelayProtocolErrorCode;
+  message: string;
+  requestId?: string;
+}): Extract<RelayServerControlMessage, { type: "protocol.error" }> {
+  return {
+    type: "protocol.error",
+    failure: "protocol_error",
+    code: input.code,
+    message: input.message,
+    supportedVersions: RELAY_PROTOCOL_VERSIONS,
+    ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
+  };
+}
+
 export function encodeRelayServerControlMessage(message: RelayServerControlMessage): string {
   // The one enforcement point for the only outbound message whose payload is
   // built from stored, user-authored data: a source list that fails the wire
@@ -1316,8 +1306,8 @@ export function parseRelayClientControlFrame(frame: string): RelayClientControlM
 /**
  * True for a hello that is not a protocol this server speaks: older than 2.4,
  * newer than the newest listed version, or the pre-naming `cli.label` field.
- * Checked before the strict schema so such a CLI gets
- * `RELAY_UPGRADE_REQUIRED_MESSAGE` instead of an opaque "malformed message".
+ * Checked before the strict schema so such a CLI gets a coded `protocol.error`
+ * instead of an opaque "malformed message".
  */
 export function helloNeedsUpgrade(frame: string): boolean {
   if (utf8Length(frame) > RELAY_JSON_CONTROL_MAX_BYTES) return false;
@@ -1335,13 +1325,7 @@ export function helloNeedsUpgrade(frame: string): boolean {
   if (!accepted(record.protocolVersion)) return true;
   const cli = record.cli;
   if (!cli || typeof cli !== "object" || Array.isArray(cli)) return false;
-  const cliRecord = cli as Record<string, unknown>;
-  if ("label" in cliRecord) return true;
-  const capabilities = cliRecord.capabilities;
-  if (!capabilities || typeof capabilities !== "object" || Array.isArray(capabilities)) {
-    return false;
-  }
-  return !accepted((capabilities as Record<string, unknown>).protocolVersion);
+  return "label" in (cli as Record<string, unknown>);
 }
 
 /** `major.minor`, the only shape `relayProtocolAtLeast` and the card's newer/older split read. */

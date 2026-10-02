@@ -24,6 +24,7 @@ const HKDF_INFO_LABEL_V2: &[u8] = b"wsmp-term-v2";
 const BROADCAST_LABEL: &[u8] = b"wsmp-term-v2-out";
 const APPROVAL_LABEL_V2: &[u8] = b"wsmp-term-approve-v2";
 const CLI_IDENTITY_LABEL: &[u8] = b"wsmp-term-cli-id-v1";
+const HELLO_IDENTITY_LABEL: &[u8] = b"wsmp-relay-hello-v1";
 pub const PLAINTEXT_OUTPUT_KEY: u8 = 0x03;
 /// Browser -> CLI: turn output review on or off for a supervised command.
 pub const PLAINTEXT_REVIEW_TOGGLE: u8 = 0x04;
@@ -779,6 +780,45 @@ pub fn verify_cli_identity(
     ecdh_public_raw: &[u8; 65],
 ) -> bool {
     let Ok(statement) = cli_identity_statement(cli_id, ecdh_public_raw) else {
+        return false;
+    };
+    let Ok(verifying) = VerifyingKey::from_sec1_bytes(identity_public_raw) else {
+        return false;
+    };
+    let Ok(signature) = Signature::from_slice(signature) else {
+        return false;
+    };
+    verifying.verify(&statement, &signature).is_ok()
+}
+
+/// `lp16("wsmp-relay-hello-v1") ‖ nonce(16) ‖ lp16(cli_slug)`.
+pub fn hello_identity_statement(nonce: &[u8; 16], cli_slug: &str) -> Result<Vec<u8>> {
+    let mut statement =
+        Vec::with_capacity(2 + HELLO_IDENTITY_LABEL.len() + nonce.len() + 2 + cli_slug.len());
+    push_length_prefixed(&mut statement, HELLO_IDENTITY_LABEL)?;
+    statement.extend_from_slice(nonce);
+    push_length_prefixed(&mut statement, cli_slug.as_bytes())?;
+    Ok(statement)
+}
+
+/// A 64-byte IEEE P1363 (`r ‖ s`) signature over the hello identity statement.
+pub fn sign_hello_identity(
+    signing_key: &SigningKey,
+    nonce: &[u8; 16],
+    cli_slug: &str,
+) -> Result<Vec<u8>> {
+    let statement = hello_identity_statement(nonce, cli_slug)?;
+    let signature: Signature = signing_key.sign(&statement);
+    Ok(signature.to_bytes().to_vec())
+}
+
+pub fn verify_hello_identity(
+    identity_public_raw: &[u8; 65],
+    signature: &[u8],
+    nonce: &[u8; 16],
+    cli_slug: &str,
+) -> bool {
+    let Ok(statement) = hello_identity_statement(nonce, cli_slug) else {
         return false;
     };
     let Ok(verifying) = VerifyingKey::from_sec1_bytes(identity_public_raw) else {

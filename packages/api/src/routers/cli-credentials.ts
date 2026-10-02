@@ -7,8 +7,8 @@ import {
   type DeviceLoginRefusalReason,
 } from "@ws-model-proxy/config/cli-device-login";
 import { cliDeviceDisplayName } from "@ws-model-proxy/config/cli-device-name";
+import { normalizeIdentityPublicKey } from "@ws-model-proxy/config/cli-identity-key";
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
-import { normalizeLoginMachineId } from "@ws-model-proxy/config/login-machine-id";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
   credentialLookupPrefix,
@@ -150,9 +150,10 @@ export const cliCredentialsRouter = {
         deviceCode: z.string().trim().min(1).max(512),
         cliSlug: cliSlugSchema,
         // Optional only so a pre-0.4.0 login still reaches the upgrade
-        // sentinel below. Every other exchange must carry a machine id; the
-        // handler refuses a missing or invalid one before it mints.
-        machineId: z.string().trim().min(1).max(80).optional(),
+        // sentinel below. Every other exchange must carry the CLI identity
+        // public key; the handler refuses a missing or invalid one before it
+        // mints.
+        identityPublicKey: z.string().trim().min(1).max(120).optional(),
       }),
     )
     .handler(async ({ input, context }) => {
@@ -166,10 +167,10 @@ export const cliCredentialsRouter = {
       if (input.deviceCode === CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE) {
         throw new ORPCError("BAD_REQUEST", { message: CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE });
       }
-      const machineId = normalizeLoginMachineId(input.machineId ?? "");
-      if (!machineId) {
+      const identityPublicKey = normalizeIdentityPublicKey(input.identityPublicKey ?? "");
+      if (!identityPublicKey) {
         throw new ORPCError("BAD_REQUEST", {
-          message: "machineId must be a machine-id or UUID.",
+          message: "identityPublicKey must be an uncompressed P-256 public key.",
         });
       }
       // Per IP and per device code, before any database work. A refusal is
@@ -188,7 +189,7 @@ export const cliCredentialsRouter = {
       const minted = await mintCliDeviceCredentialFromApprovedDeviceCode({
         deviceCode: input.deviceCode,
         cliSlug: input.cliSlug,
-        machineId,
+        identityPublicKey,
       });
       await closeRevokedCliCredentialSessions(context.services, minted.revoked);
       return { credentialId: minted.credentialId, userId: minted.userId, secret: minted.secret };

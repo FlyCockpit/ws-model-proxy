@@ -12,6 +12,12 @@ use crate::config::{
 pub use crate::terminal_identity::TerminalIdentityProof;
 
 pub const RELAY_PROTOCOL_VERSION: &str = "2.4";
+#[cfg(test)]
+const TEST_IDENTITY_PUBLIC_KEY: &str =
+    "BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A";
+#[cfg(test)]
+const TEST_IDENTITY_SIGNATURE: &str =
+    "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIg";
 pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v2";
 pub const RELAY_JSON_CONTROL_MAX_BYTES: usize = 64 * 1024;
 pub const RELAY_BINARY_CHUNK_MAX_BYTES: usize = 1024 * 1024;
@@ -34,17 +40,31 @@ pub const NODE_INTERFACE_MAX: usize = 32;
 pub const NODE_INTERFACE_ADDRESS_MAX: usize = 16;
 pub const NODE_DISK_MAX: usize = 16;
 
+/// Wire `protocol.error.code`. Unknown values stay `Other` so a newer server
+/// still prints its message instead of looking like a malformed frame.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolErrorCode {
+    UpgradeCli,
+    UpgradeServer,
+    MachineMismatch,
+    AccessDenied,
+    Malformed,
+    #[serde(other)]
+    Other,
+}
+
 /// The fatal error for a `protocol.error` that arrives before `hello.ok`.
 /// An older server rejects the newer hello as malformed; say so plainly.
-pub fn hello_rejection_message(message: &str) -> String {
-    // A pre-2.6 server answers "Malformed relay protocol message.". A 2.6
-    // server pre-checks the hello, answers its own upgrade-required text
-    // naming its (older) protocol, and never reaches its strict schema.
-    // Only the named version _older than_ ours means the server is behind;
-    // a future server naming a newer protocol leaves the message intact.
-    let server_too_old = message == OLDER_SERVER_HELLO_REJECTION
-        || named_relay_protocol_version(message)
-            .is_some_and(|version| version < local_relay_protocol_version());
+pub fn hello_rejection_message(message: &str, code: Option<&ProtocolErrorCode>) -> String {
+    // Prefer the coded enum. Fall back to the pre-code English parse so a
+    // 2.3 server that only sends `message` still tells the person to upgrade
+    // the server rather than the CLI.
+    let server_too_old = matches!(code, Some(ProtocolErrorCode::UpgradeServer))
+        || (code.is_none()
+            && (message == OLDER_SERVER_HELLO_REJECTION
+                || named_relay_protocol_version(message)
+                    .is_some_and(|version| version < local_relay_protocol_version())));
     if server_too_old {
         format!(
             "the server rejected relay protocol {RELAY_PROTOCOL_VERSION} (`{message}`); upgrade the WS Model Proxy server or use an older wsmp"
@@ -455,14 +475,14 @@ pub enum ClientControlMessage {
         detail: Option<Value>,
     },
     /// 2.4: Chat Completions engine tokenize finished.
-    #[serde(rename = "count_context.result")]
+    #[serde(rename = "context.count.result")]
     CountContextResult {
         request_id: String,
         tokens: u64,
         method: String,
     },
     /// 2.4: Chat Completions engine tokenize failed.
-    #[serde(rename = "count_context.error")]
+    #[serde(rename = "context.count.error")]
     CountContextError {
         request_id: String,
         failure: RelayFailure,
@@ -522,11 +542,14 @@ pub enum RelayMetricTokenizer {
 pub struct CliInventory {
     pub slug: String,
     /// This machine's hostname, a display label. Omitted when unavailable.
-    /// Not the credential bind: that is `machine_id`.
+    /// Not the credential bind: that is `identity_public_key`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
-    /// Login-time machine id. Required. The same value `wsmp login` sent.
-    pub machine_id: String,
+    /// Persistent P-256 identity public key. Login and CLI-token TOFU bind to
+    /// this key; hello proves possession with `identity_signature`.
+    pub identity_public_key: String,
+    /// Signature over the server nonce from `hello.challenge`.
+    pub identity_signature: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     pub capabilities: CliCapabilities,
@@ -576,33 +599,14 @@ pub struct CliReportedFeatures {
     pub allow_file_tools_as_root: bool,
 }
 
+/// Hello capabilities: only fields that vary per CLI. Protocol 2.4 always
+/// implements inventory, binary frames, terminals, exec, node telemetry,
+/// file ops, and context.count.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CliCapabilities {
-    pub protocol_version: String,
-    pub inventory_ack: bool,
-    pub inventory_replace: bool,
-    pub endpoint_targeting: bool,
-    pub binary_frames: bool,
-    pub cancellation: bool,
-    pub max_binary_chunk_bytes: usize,
-    pub request_body_streaming: bool,
-    pub request_body_window_chunks: usize,
-    pub shared_tokenizer_tps: bool,
-    pub standardized_metrics: bool,
-    pub terminal: bool,
-    pub exec: bool,
     pub features: CliReportedFeatures,
     pub terminal_public_key: String,
-    pub terminal_viewers: bool,
-    /// 2.6: this CLI implements supervised terminals (`term.spawn`).
-    pub supervised_commands: bool,
-    /// 2.7: this CLI sends `node.info`, `node.metrics` and `endpoint.load`.
-    pub node_telemetry: bool,
-    /// 2.8: this CLI runs `file.op` (ops it has not implemented answer `unsupported`).
-    pub file_ops: bool,
-    /// 2.4: this CLI runs `count_context` (Chat Completions engine tokenize).
-    pub count_context: bool,
     /// The browser pins this key and checks the signature before any
     /// terminal handshake.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -612,19 +616,6 @@ pub struct CliCapabilities {
 impl CliCapabilities {
     pub fn from_snapshot(snapshot: &TerminalFeatureSnapshot) -> Self {
         Self {
-            protocol_version: RELAY_PROTOCOL_VERSION.to_string(),
-            inventory_ack: true,
-            inventory_replace: true,
-            endpoint_targeting: true,
-            binary_frames: true,
-            cancellation: true,
-            max_binary_chunk_bytes: RELAY_BINARY_CHUNK_MAX_BYTES,
-            request_body_streaming: true,
-            request_body_window_chunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
-            shared_tokenizer_tps: true,
-            standardized_metrics: true,
-            terminal: true,
-            exec: true,
             features: CliReportedFeatures {
                 human_terminal: snapshot.allow_human_terminal,
                 mcp_command_mode: snapshot.mcp_command_mode,
@@ -637,11 +628,6 @@ impl CliCapabilities {
                 allow_file_tools_as_root: snapshot.allow_file_tools_as_root,
             },
             terminal_public_key: snapshot.terminal_public_key_b64url.clone(),
-            terminal_viewers: true,
-            supervised_commands: true,
-            node_telemetry: true,
-            file_ops: true,
-            count_context: true,
             terminal_identity: snapshot.terminal_identity.clone(),
         }
     }
@@ -1135,6 +1121,8 @@ pub struct TerminalIdentity {
     rename_all_fields = "camelCase"
 )]
 enum KnownServerControlMessage {
+    #[serde(rename = "hello.challenge")]
+    HelloChallenge { nonce: String },
     #[serde(rename = "hello.ok")]
     HelloOk {
         id: String,
@@ -1173,7 +1161,11 @@ enum KnownServerControlMessage {
     #[serde(rename = "protocol.error")]
     ProtocolError {
         failure: RelayFailure,
+        #[serde(default)]
+        code: Option<ProtocolErrorCode>,
         message: String,
+        #[serde(default)]
+        supported_versions: Vec<String>,
         request_id: Option<String>,
     },
     #[serde(rename = "term.open")]
@@ -1268,7 +1260,7 @@ enum KnownServerControlMessage {
     },
     #[serde(rename = "file.cancel")]
     FileCancel { op_id: String },
-    #[serde(rename = "count_context")]
+    #[serde(rename = "context.count")]
     CountContext {
         request_id: String,
         endpoint_slug: String,
@@ -1381,8 +1373,13 @@ pub enum ServerControlMessage {
     },
     ProtocolError {
         failure: RelayFailure,
+        code: Option<ProtocolErrorCode>,
         message: String,
+        supported_versions: Vec<String>,
         request_id: Option<String>,
+    },
+    HelloChallenge {
+        nonce: String,
     },
     TermOpen {
         terminal_id: String,
@@ -1944,7 +1941,8 @@ pub fn validate_remote_engine_adapters(adapters: &[RemoteEngineAdapter]) -> Resu
 fn known_server_frame(type_name: &str) -> bool {
     matches!(
         type_name,
-        "hello.ok"
+        "hello.challenge"
+            | "hello.ok"
             | "inventory.ok"
             | "inventory.error"
             | "heartbeat.pong"
@@ -1964,13 +1962,14 @@ fn known_server_frame(type_name: &str) -> bool {
             | "engine.adapters.set"
             | "file.op"
             | "file.cancel"
-            | "count_context"
+            | "context.count"
     )
 }
 
 impl From<KnownServerControlMessage> for ServerControlMessage {
     fn from(message: KnownServerControlMessage) -> Self {
         match message {
+            KnownServerControlMessage::HelloChallenge { nonce } => Self::HelloChallenge { nonce },
             KnownServerControlMessage::HelloOk {
                 id,
                 protocol_version,
@@ -2021,11 +2020,15 @@ impl From<KnownServerControlMessage> for ServerControlMessage {
             }
             KnownServerControlMessage::ProtocolError {
                 failure,
+                code,
                 message,
+                supported_versions,
                 request_id,
             } => Self::ProtocolError {
                 failure,
+                code,
                 message,
+                supported_versions,
                 request_id,
             },
             KnownServerControlMessage::TermOpen {
@@ -2605,7 +2608,8 @@ mod tests {
         let inventory = CliInventory {
             slug: "desktop".to_string(),
             hostname: None,
-            machine_id: "0123456789abcdef0123456789abcdef".to_string(),
+            identity_public_key: TEST_IDENTITY_PUBLIC_KEY.to_string(),
+            identity_signature: TEST_IDENTITY_SIGNATURE.to_string(),
             version: None,
             capabilities: CliCapabilities::from_snapshot(&TerminalFeatureSnapshot {
                 allow_human_terminal: false,
@@ -2622,7 +2626,8 @@ mod tests {
         };
         let encoded = serde_json::to_string(&inventory).expect("encode");
         assert!(!encoded.contains("hostname"));
-        assert!(encoded.contains(r#""machineId":"0123456789abcdef0123456789abcdef""#));
+        assert!(encoded.contains(&format!(r#""identityPublicKey":"{TEST_IDENTITY_PUBLIC_KEY}""#)));
+        assert!(!encoded.contains("machineId"));
         assert!(!encoded.contains("label"));
     }
 
@@ -2634,7 +2639,8 @@ mod tests {
             cli: CliInventory {
                 slug: "desktop".to_string(),
                 hostname: Some("desk-01.local".to_string()),
-                machine_id: "0123456789abcdef0123456789abcdef".to_string(),
+                identity_public_key: TEST_IDENTITY_PUBLIC_KEY.to_string(),
+                identity_signature: TEST_IDENTITY_SIGNATURE.to_string(),
                 version: None,
                 capabilities: CliCapabilities::from_snapshot(&TerminalFeatureSnapshot {
                     allow_human_terminal: false,
@@ -2667,30 +2673,32 @@ mod tests {
         let encoded = encode_control(&message).expect("encode");
 
         assert!(encoded.contains(r#""protocolVersion":"2.4""#));
-        assert!(encoded.contains(r#""nodeTelemetry":true"#));
-        assert!(encoded.contains(r#""fileOps":true"#));
-        assert!(encoded.contains(r#""countContext":true"#));
+        assert!(!encoded.contains(r#""nodeTelemetry""#));
+        assert!(!encoded.contains(r#""fileOps""#));
+        assert!(!encoded.contains(r#""countContext""#));
         assert!(encoded.contains(r#""mcpFileRead":false"#));
         assert!(encoded.contains(r#""fileRootsConfigured":false"#));
         assert!(encoded.contains(r#""allowFileToolsAsRoot":false"#));
         assert!(encoded.contains(r#""remoteMetricSources":false"#));
-        assert!(encoded.contains(r#""supervisedCommands":true"#));
+        assert!(!encoded.contains(r#""supervisedCommands""#));
         assert!(encoded.contains(r#""hostname":"desk-01.local""#));
-        assert!(encoded.contains(r#""machineId":"0123456789abcdef0123456789abcdef""#));
+        assert!(encoded.contains(&format!(r#""identityPublicKey":"{TEST_IDENTITY_PUBLIC_KEY}""#)));
+        assert!(encoded.contains(&format!(r#""identitySignature":"{TEST_IDENTITY_SIGNATURE}""#)));
+        assert!(!encoded.contains("machineId"));
         assert!(!encoded.contains(r#""label":"Desktop""#));
-        assert!(encoded.contains(r#""terminalViewers":true"#));
+        assert!(!encoded.contains(r#""terminalViewers""#));
         assert!(encoded.contains(r#""terminalIdentity":{"publicKey":"BAQE","signature":"Sig"}"#));
-        assert!(encoded.contains(r#""sharedTokenizerTps":true"#));
-        assert!(encoded.contains(r#""standardizedMetrics":true"#));
-        assert!(encoded.contains(r#""terminal":true"#));
-        assert!(encoded.contains(r#""exec":true"#));
+        assert!(!encoded.contains(r#""sharedTokenizerTps""#));
+        assert!(!encoded.contains(r#""standardizedMetrics""#));
+        assert!(!encoded.contains(r#""terminal":true"#));
+        assert!(!encoded.contains(r#""exec":true"#));
         assert!(encoded.contains(r#""terminalPublicKey":"AQID""#));
         assert!(encoded.contains(r#""mcpCommandMode":"supervised""#));
         assert!(!encoded.contains(r#""mcpCommands""#));
         assert!(encoded.contains(r#""humanTerminal":false"#));
-        assert!(encoded.contains(r#""maxBinaryChunkBytes":1048576"#));
-        assert!(encoded.contains(r#""requestBodyStreaming":true"#));
-        assert!(encoded.contains(r#""requestBodyWindowChunks":16"#));
+        assert!(!encoded.contains(r#""maxBinaryChunkBytes""#));
+        assert!(!encoded.contains(r#""requestBodyStreaming""#));
+        assert!(!encoded.contains(r#""requestBodyWindowChunks""#));
         assert!(!encoded.contains("protocol_version"));
         assert!(!encoded.contains(":null"));
 
@@ -2741,9 +2749,9 @@ mod tests {
         }
 
         let count_context = parse_server_control(
-            r#"{"type":"count_context","requestId":"r1","endpointSlug":"local","model":"m","timeoutMs":5000,"expectBody":true}"#,
+            r#"{"type":"context.count","requestId":"r1","endpointSlug":"local","model":"m","timeoutMs":5000,"expectBody":true}"#,
         )
-        .expect("parse count_context");
+        .expect("parse context.count");
         match count_context {
             ServerControlMessage::CountContext {
                 request_id,
@@ -2766,8 +2774,8 @@ mod tests {
             tokens: 12,
             method: "vllm_tokenize".to_string(),
         })
-        .expect("encode count_context.result");
-        assert!(count_result.contains(r#""type":"count_context.result""#));
+        .expect("encode context.count.result");
+        assert!(count_result.contains(r#""type":"context.count.result""#));
         assert!(count_result.contains(r#""requestId":"r1""#));
         assert!(count_result.contains(r#""tokens":12"#));
         assert!(count_result.contains(r#""method":"vllm_tokenize""#));
@@ -2947,16 +2955,21 @@ mod tests {
     }
     #[test]
     fn an_older_server_rejection_says_to_upgrade_the_server() {
-        let message = hello_rejection_message(OLDER_SERVER_HELLO_REJECTION);
+        let message = hello_rejection_message(OLDER_SERVER_HELLO_REJECTION, None);
         assert!(message.contains("rejected relay protocol 2.4"), "{message}");
         assert!(
             message.contains("upgrade the WS Model Proxy server"),
             "{message}"
         );
         assert_eq!(
-            hello_rejection_message("access_denied"),
+            hello_rejection_message("access_denied", None),
             "relay protocol error: access_denied"
         );
+        assert!(hello_rejection_message(
+            "This wsmp speaks a newer relay protocol than the server. Upgrade WS Model Proxy and restart the CLI.",
+            Some(&ProtocolErrorCode::UpgradeServer),
+        )
+        .contains("upgrade the WS Model Proxy server"));
     }
 
     #[test]
@@ -2966,7 +2979,7 @@ mod tests {
         let reply =
             "This server requires a newer wsmp (relay protocol 2.5). Upgrade wsmp and restart it.";
         assert_eq!(
-            hello_rejection_message(reply),
+            hello_rejection_message(reply, None),
             format!("relay protocol error: {reply}")
         );
     }
@@ -3407,7 +3420,8 @@ mod relay_27_vectors {
             cli: CliInventory {
                 slug: "desk".to_string(),
                 hostname: Some("desk-01.local".to_string()),
-                machine_id: "0123456789abcdef0123456789abcdef".to_string(),
+                identity_public_key: TEST_IDENTITY_PUBLIC_KEY.to_string(),
+                identity_signature: TEST_IDENTITY_SIGNATURE.to_string(),
                 version: Some("0.4.0".to_string()),
                 capabilities,
             },
@@ -3415,7 +3429,7 @@ mod relay_27_vectors {
         };
         assert_eq!(
             encoded(&hello),
-            vector(include_str!("../tests/fixtures/relay-2.9/hello.json"))
+            vector(include_str!("../tests/fixtures/relay-2.4/hello.json"))
         );
     }
 
@@ -3702,7 +3716,7 @@ mod relay_27_vectors {
         };
         assert_eq!(
             encoded(&ClientControlMessage::NodeInfo(info)),
-            vector(include_str!("../tests/fixtures/relay-2.7/node-info.json"))
+            vector(include_str!("../tests/fixtures/relay-2.4/node-info.json"))
         );
     }
 
@@ -3775,7 +3789,7 @@ mod relay_27_vectors {
         assert_eq!(
             encoded(&ClientControlMessage::NodeMetrics(metrics)),
             vector(include_str!(
-                "../tests/fixtures/relay-2.7/node-metrics.json"
+                "../tests/fixtures/relay-2.4/node-metrics.json"
             ))
         );
     }
@@ -3801,7 +3815,7 @@ mod relay_27_vectors {
         assert_eq!(
             encoded(&ClientControlMessage::EndpointLoad(load)),
             vector(include_str!(
-                "../tests/fixtures/relay-2.7/endpoint-load.json"
+                "../tests/fixtures/relay-2.4/endpoint-load.json"
             ))
         );
     }
@@ -3827,7 +3841,7 @@ mod relay_27_vectors {
         assert_eq!(
             encoded(&ClientControlMessage::EndpointLoad(load)),
             vector(include_str!(
-                "../tests/fixtures/relay-2.9/endpoint-load-custom.json"
+                "../tests/fixtures/relay-2.4/endpoint-load-custom.json"
             ))
         );
     }
@@ -3884,7 +3898,7 @@ mod relay_27_vectors {
     #[test]
     fn metrics_sources_set_parses_from_the_shared_vector() {
         let message = parse_server_control(include_str!(
-            "../tests/fixtures/relay-2.7/metrics-sources-set.json"
+            "../tests/fixtures/relay-2.4/metrics-sources-set.json"
         ))
         .expect("parse");
         let ServerControlMessage::MetricsSourcesSet { id, sources } = message else {
@@ -3941,14 +3955,14 @@ mod relay_27_vectors {
 }
 
 /// Relay 2.8 file frames, checked against the shared vectors in
-/// `tests/fixtures/relay-2.8/` that `apps/server/src/relay/file-protocol.test.ts`
+/// `tests/fixtures/relay-2.4/` that `apps/server/src/relay/file-protocol.test.ts`
 /// parses with its strict schemas: server-to-CLI frames must decode to exactly
 /// the vector's values, CLI-to-server frames must encode to exactly them.
 #[cfg(test)]
 mod relay_28_vectors {
     use super::*;
 
-    const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/relay-2.8");
+    const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/relay-2.4");
     const OPS: [&str; 9] = [
         "read", "stat", "list", "search", "edit", "write", "rename", "mkdir", "delete",
     ];

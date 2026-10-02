@@ -37,10 +37,12 @@ pub fn run(args: &Args) -> Result<()> {
         .context("server URL is not configured; run `wsmp config set-server <URL>`")?;
     let cli_slug = requested_cli_slug(args, cfg.cli_slug.as_deref())?;
     // Captured once, before the device code exists, and sent on every poll.
-    // Hello later reads the same id. A copy of the credential file does not
-    // carry `/etc/machine-id`, and the generated UUID is not in config.
-    let machine_id = crate::machine_id::login_machine_id()
-        .context("determining this machine's id for the device credential")?;
+    // Hello later presents the same identity public key and signs a server
+    // nonce. Copying only `device-auth.json` cannot take over another machine.
+    let state_dir = crate::paths::state_dir().context("determining the state directory")?;
+    let identity = crate::terminal_identity::load_or_create(&state_dir)
+        .context("loading the CLI identity key")?;
+    let identity_public_key = identity.public_b64url();
     let started = start_device_authorization(&server_url, &cli_slug)?;
     let approval_url = approval_url(&started);
     if args.json {
@@ -70,7 +72,12 @@ pub fn run(args: &Args) -> Result<()> {
             anyhow::bail!("device authorization expired");
         }
         thread::sleep(interval);
-        match exchange_device_code(&server_url, &started.device_code, &cli_slug, &machine_id) {
+        match exchange_device_code(
+            &server_url,
+            &started.device_code,
+            &cli_slug,
+            &identity_public_key,
+        ) {
             Ok(credential) => {
                 Config::update(true, |candidate| {
                     candidate.cli_slug = Some(cli_slug.clone());

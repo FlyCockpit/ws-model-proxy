@@ -669,7 +669,8 @@ describe("createApp registration contract — device-code exchange limiter (CI-2
           json: {
             deviceCode: `wiring-${BASE}-code`,
             cliSlug: "desk-01",
-            machineId: "0123456789abcdef0123456789abcdef",
+            identityPublicKey:
+              "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE",
           },
         }),
       });
@@ -701,7 +702,8 @@ describe("createApp registration contract — device-code exchange limiter (CI-2
           json: {
             deviceCode: "saturation-code",
             cliSlug: "desk-01",
-            machineId: "0123456789abcdef0123456789abcdef",
+            identityPublicKey:
+              "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE",
           },
         }),
       });
@@ -826,7 +828,8 @@ describe("createApp registration contract — device-login approval needs the CS
         json: {
           deviceCode: "headerless-code",
           cliSlug: "desk-01",
-          machineId: "0123456789abcdef0123456789abcdef",
+          identityPublicKey:
+            "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE",
         },
       }),
     });

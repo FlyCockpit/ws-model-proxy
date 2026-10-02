@@ -18,7 +18,8 @@ vi.mock("@ws-model-proxy/db", async () => {
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { cliCredentialsRouter } = await import("./cli-credentials");
 
-const LOGIN_MACHINE_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const LOGIN_IDENTITY_PUBLIC_KEY =
+  "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE";
 
 const db = prisma as unknown as {
   $transaction: ReturnType<typeof vi.fn>;
@@ -216,7 +217,7 @@ describe("cliCredentialsRouter", () => {
     const result = await client.exchangeDeviceCode({
       deviceCode: "approved-device-code",
       cliSlug: "desk-01",
-      machineId: LOGIN_MACHINE_ID,
+      identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
     });
 
     // The CLI gets exactly its credential; nothing about other credentials.
@@ -233,7 +234,7 @@ describe("cliCredentialsRouter", () => {
       data: expect.objectContaining({
         userId: "user-1",
         cliDeviceId: "cli-device-1",
-        machineId: LOGIN_MACHINE_ID,
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
       }),
       select: { id: true, userId: true },
     });
@@ -268,7 +269,7 @@ describe("cliCredentialsRouter", () => {
       client.exchangeDeviceCode({
         deviceCode: "approved-device-code",
         cliSlug: "desk-01",
-        machineId: LOGIN_MACHINE_ID,
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
       }),
     ).resolves.toMatchObject({ credentialId: "credential-1" });
     expect(db.cliDeviceCredential.create).toHaveBeenCalledWith(
@@ -298,7 +299,7 @@ describe("cliCredentialsRouter", () => {
       client.exchangeDeviceCode({
         deviceCode: "approved-device-code",
         cliSlug: "desk-01",
-        machineId: LOGIN_MACHINE_ID,
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
       }),
     ).resolves.toMatchObject({ credentialId: "credential-1" });
     expect(errorSpy).toHaveBeenCalledWith(
@@ -316,7 +317,7 @@ describe("cliCredentialsRouter", () => {
       client.exchangeDeviceCode({
         deviceCode: "approved-device-code",
         cliSlug: "desk-01",
-        machineId: LOGIN_MACHINE_ID,
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
       }),
     ).rejects.toSatisfy((error: ORPCError) => {
       expect(error.code).toBe("BAD_REQUEST");
@@ -334,7 +335,7 @@ describe("cliCredentialsRouter", () => {
       client.exchangeDeviceCode({
         deviceCode: "approved-device-code",
         cliSlug: "desk.01",
-        machineId: LOGIN_MACHINE_ID,
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
       }),
     ).rejects.toThrow();
     expect(db.deviceCode.findUnique).not.toHaveBeenCalled();
@@ -358,7 +359,7 @@ describe("cliCredentialsRouter", () => {
       client.exchangeDeviceCode({
         deviceCode: "pending-device-code",
         cliSlug: "desk-01",
-        machineId: LOGIN_MACHINE_ID,
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
       }),
     ).rejects.toSatisfy((error: ORPCError) => {
       expect(error).toBeInstanceOf(ORPCError);
@@ -401,7 +402,7 @@ describe("cliCredentialsRouter", () => {
       .exchangeDeviceCode({
         deviceCode: "device-code",
         cliSlug: "desk-01",
-        machineId: LOGIN_MACHINE_ID,
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
       })
       .catch((caught: unknown) => caught);
 
@@ -424,7 +425,7 @@ describe("cliCredentialsRouter", () => {
           json: {
             deviceCode: "device-code",
             cliSlug: "pending-ci",
-            machineId: LOGIN_MACHINE_ID,
+            identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
           },
         }),
       }),
@@ -454,7 +455,7 @@ describe("cliCredentialsRouter", () => {
       client.exchangeDeviceCode({
         deviceCode: "approved-device-code",
         cliSlug: "desk-01",
-        machineId: LOGIN_MACHINE_ID,
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
       }),
     ).resolves.toMatchObject({ credentialId: "credential-1" });
     expect(limitDeviceCodeExchange).toHaveBeenCalledWith("approved-device-code");
@@ -476,7 +477,7 @@ describe("cliCredentialsRouter", () => {
           json: {
             deviceCode: "approved-device-code",
             cliSlug: "desk-01",
-            machineId: LOGIN_MACHINE_ID,
+            identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
           },
         }),
       }),
@@ -512,7 +513,7 @@ describe("cliCredentialsRouter", () => {
       .exchangeDeviceCode({
         deviceCode: "approved-device-code",
         cliSlug: "desk-01",
-        machineId: LOGIN_MACHINE_ID,
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
       })
       .catch((caught: unknown) => caught);
 
@@ -598,7 +599,7 @@ describe("cliCredentialsRouter", () => {
       client.exchangeDeviceCode({
         deviceCode: "approved-device-code",
         cliSlug: "desk-01",
-        machineId: LOGIN_MACHINE_ID,
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
       }),
     ).resolves.toMatchObject({ credentialId: "credential-1", userId: "approved-user" });
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(

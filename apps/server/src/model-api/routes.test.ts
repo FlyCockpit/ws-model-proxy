@@ -416,7 +416,7 @@ class FakeRelayManager {
   ) {
     const handler = this.countContextHandlers.get(requestId);
     this.countContextHandlers.delete(requestId);
-    handler?.onResult({ type: "count_context.result", requestId, tokens, method });
+    handler?.onResult({ type: "context.count.result", requestId, tokens, method });
   }
 
   errorCountContext(
@@ -425,7 +425,7 @@ class FakeRelayManager {
   ) {
     const handler = this.countContextHandlers.get(requestId);
     this.countContextHandlers.delete(requestId);
-    handler?.onError({ type: "count_context.error", requestId, failure });
+    handler?.onError({ type: "context.count.error", requestId, failure });
   }
 }
 

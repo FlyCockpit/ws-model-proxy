@@ -97,6 +97,9 @@ describe("createRelayWebsocketMiddleware", () => {
     await expect(response.json()).resolves.toMatchObject({
       type: "protocol.error",
       failure: "protocol_error",
+      code: "upgrade_cli",
+      supportedVersions: ["2.4"],
+      supportedSubprotocol: "ws-model-proxy.relay.v2",
     });
   });
 

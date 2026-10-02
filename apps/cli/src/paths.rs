@@ -44,9 +44,3 @@ pub fn state_dir() -> Result<PathBuf> {
 pub fn device_credential_file() -> Result<PathBuf> {
     Ok(state_dir()?.join("device-auth.json"))
 }
-
-/// CLI-generated login machine id, beside the device credential. Not the
-/// user-edited config. Unused when `/etc/machine-id` is a real machine id.
-pub fn machine_id_file() -> Result<PathBuf> {
-    Ok(state_dir()?.join("machine-id"))
-}

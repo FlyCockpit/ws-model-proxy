@@ -4,7 +4,7 @@ import { z } from "zod";
  * Relay 2.8 node file tools (#103): the strict per-op argument and result
  * schemas, shared by the relay (frames), the MCP tool inputs (which add
  * `cliDeviceId`/`confirm`) and the cross-language fixtures under
- * `apps/cli/tests/fixtures/relay-2.8/file-*.json`. The Rust mirror is
+ * `apps/cli/tests/fixtures/relay-2.4/file-*.json`. The Rust mirror is
  * `apps/cli/src/file_ops` (`FileOps::execute`) and `apps/cli/src/file_relay.rs`.
  *
  * Wire shape recap (control frames stay <= 64 KiB):

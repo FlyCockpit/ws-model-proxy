@@ -9,11 +9,8 @@ import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as cliAgentAdmission from "./cli-agent-admission.js";
 import { FILE_ERROR_CODES } from "./file-protocol.js";
-import {
-  encodeRelayBinaryFrame,
-  parseRelayBinaryFrame,
-  RELAY_REQUEST_BODY_WINDOW_CHUNKS,
-} from "./protocol.js";
+import { generateTestHelloIdentity } from "./hello-identity.js";
+import { encodeRelayBinaryFrame, parseRelayBinaryFrame } from "./protocol.js";
 import { cancelRelayWorkForBannedUser } from "./user-ban.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
@@ -79,6 +76,7 @@ const identity: CliWebsocketIdentity = {
   lookupPrefix: "wsmp_cli_lookup",
 };
 const now = new Date("2026-01-01T00:00:00.000Z");
+const testIdentity = generateTestHelloIdentity();
 
 class FakeSocket {
   readyState = 1;
@@ -115,7 +113,22 @@ function uncompressedKey(): string {
   return bytes.toString("base64url");
 }
 
-function hello(slug: string, features: { mode: Mode; terminalSupported: boolean }) {
+function challengeNonce(socket: FakeSocket): string {
+  for (const send of socket.sends) {
+    if (typeof send !== "string") continue;
+    const parsed = JSON.parse(send) as { type?: string; nonce?: string };
+    if (parsed.type === "hello.challenge" && typeof parsed.nonce === "string") {
+      return parsed.nonce;
+    }
+  }
+  throw new Error("expected hello.challenge");
+}
+
+function hello(
+  socket: FakeSocket,
+  slug: string,
+  features: { mode: Mode; terminalSupported: boolean },
+) {
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
@@ -123,37 +136,22 @@ function hello(slug: string, features: { mode: Mode; terminalSupported: boolean 
     cli: {
       slug,
       hostname: `${slug}.local`,
-      machineId: "0123456789abcdef0123456789abcdef",
+      identityPublicKey: testIdentity.publicKey,
+      identitySignature: testIdentity.sign(challengeNonce(socket), slug),
       version: "0.4.0",
       capabilities: {
-        protocolVersion: "2.4",
-        inventoryAck: true,
-        inventoryReplace: true,
-        endpointTargeting: true,
-        binaryFrames: true,
-        cancellation: true,
-        maxBinaryChunkBytes: 1024 * 1024,
-        requestBodyStreaming: true,
-        requestBodyWindowChunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
-        sharedTokenizerTps: true,
-        standardizedMetrics: true,
-        terminal: true,
-        exec: true,
         features: {
           humanTerminal: false,
           mcpCommandMode: features.mode,
           terminalApproval: false,
           terminalSupported: features.terminalSupported,
           remoteMetricSources: false,
+          remoteEngineAdapters: false,
           mcpFileRead: false,
           fileRootsConfigured: false,
           allowFileToolsAsRoot: false,
         },
         terminalPublicKey: uncompressedKey(),
-        terminalViewers: true,
-        supervisedCommands: true,
-        nodeTelemetry: true,
-        fileOps: true,
       },
     },
     endpoints: [],
@@ -174,7 +172,7 @@ async function connect(
   relaySessionManager.acceptAuthenticatedSocket({ socket, identity, now });
   await relaySessionManager.handleTextFrame(
     socket,
-    hello(slug, {
+    hello(socket, slug, {
       mode: features.mode ?? "supervised",
       terminalSupported: features.terminalSupported ?? true,
     }),
@@ -255,6 +253,7 @@ describe("supervised commands", () => {
       revokedAt: null,
       expiresAt: null,
       cliDeviceId: null,
+      identityPublicKey: null,
     });
     db.cliToken.updateMany.mockResolvedValue({ count: 1 });
     db.user.findUnique.mockResolvedValue({ slug: "owner" });

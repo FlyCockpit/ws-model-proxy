@@ -375,8 +375,8 @@ model CliDevice {
   /// Relay 2.8: the CLI's `allowFileToolsAsRoot` config from its hello (null until a 2.8 hello).
   reportedAllowFileToolsAsRoot Boolean?
   /// The machine's hostname from the latest hello. A display label only
-  /// (`hostnamectl` can change it). Not the login machine id; that bind is
-  /// `CliDeviceCredential.machineId`. Null when not reported.
+  /// (`hostnamectl` can change it). Not the credential bind; that is
+  /// `CliDeviceCredential.identityPublicKey`. Null when not reported.
   reportedHostname             String?
   featuresReportedAt           DateTime?
   /// Relay 2.7 `node.info` from the latest connection (static machine facts).
@@ -428,19 +428,23 @@ model CliDevice {
 }
 
 model CliToken {
-  id           String     @id @default(cuid(2))
-  createdAt    DateTime   @default(now())
-  updatedAt    DateTime   @default(now()) @updatedAt
-  userId       String
-  cliDeviceId  String?
-  name         String
-  lookupPrefix String
-  secretDigest String
-  lastUsedAt   DateTime?
-  revokedAt    DateTime?
-  expiresAt    DateTime?
-  User         User       @relation("CliTokenOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  CliDevice    CliDevice? @relation(fields: [cliDeviceId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  id                String     @id @default(cuid(2))
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @default(now()) @updatedAt
+  userId            String
+  cliDeviceId       String?
+  name              String
+  lookupPrefix      String
+  secretDigest      String
+  /// Uncompressed P-256 identity public key (unpadded base64url). TOFU-bound
+  /// on the token's first hello. A copied `service.env` cannot hello as a
+  /// different identity. Null until that first hello.
+  identityPublicKey String?
+  lastUsedAt        DateTime?
+  revokedAt         DateTime?
+  expiresAt         DateTime?
+  User              User       @relation("CliTokenOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  CliDevice         CliDevice? @relation(fields: [cliDeviceId], references: [id], onDelete: SetNull, onUpdate: Cascade)
 
   @@unique([lookupPrefix])
   @@unique([secretDigest])
@@ -451,25 +455,26 @@ model CliToken {
 }
 
 /// Minted by `wsmp login` for exactly one device and never rebound: the device
-/// is required and deleting it deletes its credentials. `machineId` binds the
-/// secret to the machine that completed login. Copying the secret file does
-/// not move that bind.
+/// is required and deleting it deletes its credentials. `identityPublicKey`
+/// binds the secret to the CLI identity key that completed login. Copying
+/// the secret file does not move that bind.
 model CliDeviceCredential {
-  id           String    @id @default(cuid(2))
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @default(now()) @updatedAt
-  userId       String
-  cliDeviceId  String
-  lookupPrefix String
-  secretDigest String
-  /// `/etc/machine-id` or a CLI-generated UUID, captured when this credential
-  /// was minted. Hello must present the same id. Null only on a row minted
+  id                String    @id @default(cuid(2))
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @default(now()) @updatedAt
+  userId            String
+  cliDeviceId       String
+  lookupPrefix      String
+  secretDigest      String
+  /// Uncompressed P-256 identity public key (unpadded base64url), captured
+  /// when this credential was minted. Hello must present the same key and
+  /// prove possession by signing a server nonce. Null only on a row minted
   /// before the bind; those hellos are refused until `wsmp login`.
-  machineId    String?
-  lastUsedAt   DateTime?
-  revokedAt    DateTime?
-  User         User      @relation("CliDeviceCredentialOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  CliDevice    CliDevice @relation(fields: [cliDeviceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  identityPublicKey String?
+  lastUsedAt        DateTime?
+  revokedAt         DateTime?
+  User              User      @relation("CliDeviceCredentialOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  CliDevice         CliDevice @relation(fields: [cliDeviceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@unique([lookupPrefix])
   @@unique([secretDigest])

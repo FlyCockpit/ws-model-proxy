@@ -48,6 +48,7 @@ import {
   supervisedFileRejectReasonSchema,
 } from "./file-protocol.js";
 import { sanitizeRelayRequestHeaders } from "./headers.js";
+import { verifyHelloIdentitySignature } from "./hello-identity.js";
 import {
   createRoutingEvaluationState,
   MetricRoutingEvaluator,
@@ -71,20 +72,23 @@ import {
   type NodeMetricsMessage,
   parseRelayBinaryFrame,
   parseRelayClientControlFrame,
+  protocolErrorMessage,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+  RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE,
   RELAY_STALE_AFTER_MS,
   RELAY_UNREGISTERED_STALE_AFTER_MS,
   RELAY_UPGRADE_REQUIRED_MESSAGE,
   type RelayBinaryFrameMetadata,
   type RelayClientControlMessage,
   type RelayFailure,
+  type RelayProtocolErrorCode,
   type RelayProtocolVersion,
   type RelayResponseBodyMetadata,
   type RelayServerControlMessage,
   type RemoteEngineAdapter,
   type RemoteMetricSource,
+  refusedRelayProtocolReason,
   rejectedHelloFacts,
-  relayProtocolAtLeast,
   remoteEngineAdaptersSchema,
   remoteMetricSourcesSchema,
   type TerminalHandshakeIdentity,
@@ -144,8 +148,6 @@ export type CliReportedFeatures = {
   fileOps: boolean;
   /** 2.8: `wsmp config set-file-tools-as-root on`. */
   allowFileToolsAsRoot: boolean;
-  /** 2.4: the CLI implements `count_context`. */
-  countContext: boolean;
 };
 
 export type TrackedCliCommand = {
@@ -443,6 +445,8 @@ type SessionState = {
    */
   endingSupervised: Map<string, TrackedSupervisedCommand>;
   unauthenticatedTimer: ReturnType<typeof setTimeout>;
+  /** One-shot nonce from `hello.challenge`; consumed when hello is verified. */
+  helloNonce: string | null;
   bodyStreamsByRequest: Map<string, OutboundBodyStream>;
   /** 2.7 telemetry, in memory only (see `handleTelemetry`). */
   nodeInfoAcceptedAtMs: number | null;
@@ -467,11 +471,11 @@ export type ActiveRelayResponseHandlers = {
 
 export type CountContextResultMessage = Extract<
   RelayClientControlMessage,
-  { type: "count_context.result" }
+  { type: "context.count.result" }
 >;
 export type CountContextErrorMessage = Extract<
   RelayClientControlMessage,
-  { type: "count_context.error" }
+  { type: "context.count.error" }
 >;
 
 export type ActiveCountContextHandlers = {
@@ -499,11 +503,10 @@ function interactiveCapabilities(capabilities: HelloMessage["cli"]["capabilities
   return {
     features: {
       ...capabilities.features,
-      fileOps: capabilities.fileOps === true,
-      countContext: capabilities.countContext === true,
+      fileOps: true,
     },
     terminalPublicKey: capabilities.terminalPublicKey,
-    terminalViewers: capabilities.terminalViewers === true,
+    terminalViewers: true,
     terminalIdentity: capabilities.terminalIdentity ?? null,
   };
 }
@@ -635,17 +638,16 @@ function interactiveTargetFromBinary(
   }
 }
 
-function closeWithProtocolError(socket: RelaySocket, message: string) {
+function closeWithProtocolError(
+  socket: RelaySocket,
+  code: RelayProtocolErrorCode,
+  message: string,
+) {
   if (socket.readyState === WS_READY_STATE_OPEN) {
-    socket.send(
-      encodeRelayServerControlMessage({
-        type: "protocol.error",
-        failure: "protocol_error",
-        message,
-      }),
-    );
+    socket.send(encodeRelayServerControlMessage(protocolErrorMessage({ code, message })));
   }
-  socket.close(1002, "protocol_error");
+  const closeCode = code === "access_denied" || code === "machine_mismatch" ? 1008 : 1002;
+  socket.close(closeCode, code);
 }
 
 export class RelaySessionManager {
@@ -721,10 +723,11 @@ export class RelaySessionManager {
       }
       return false;
     }
+    const helloNonce = randomBytes(16).toString("base64url");
     const unauthenticatedTimer = setTimeout(() => {
       const session = this.sessionsBySocket.get(socket);
       if (!session?.registered) {
-        closeWithProtocolError(socket, "Registration was not received in time.");
+        closeWithProtocolError(socket, "malformed", "Registration was not received in time.");
         this.removeSession(socket, new Date());
       }
     }, RELAY_UNREGISTERED_STALE_AFTER_MS);
@@ -758,6 +761,7 @@ export class RelaySessionManager {
       supervisedById: new Map(),
       endingSupervised: new Map(),
       unauthenticatedTimer,
+      helloNonce,
       bodyStreamsByRequest: new Map(),
       nodeInfoAcceptedAtMs: null,
       nodeMetrics: null,
@@ -767,6 +771,9 @@ export class RelaySessionManager {
       malformedTelemetryLoggedAtMs: null,
       routingEvaluation: null,
     });
+    if (socket.readyState === WS_READY_STATE_OPEN) {
+      socket.send(encodeRelayServerControlMessage({ type: "hello.challenge", nonce: helloNonce }));
+    }
     return true;
   }
 
@@ -776,8 +783,16 @@ export class RelaySessionManager {
     // (an "upgrade wsmp" text), not an opaque schema rejection. Every released CLI treats protocol.error as fatal.
     if (!session.registered && helloNeedsUpgrade(frame)) {
       const rejected = rejectedHelloFacts(frame);
-      console.error("[relay] refused a hello older than the minimum relay protocol", rejected);
-      closeWithProtocolError(socket, RELAY_UPGRADE_REQUIRED_MESSAGE);
+      const reason = refusedRelayProtocolReason(rejected.protocolVersion);
+      const code = reason === "cli_too_new" ? "upgrade_server" : "upgrade_cli";
+      console.error("[relay] refused a hello this server does not speak", { ...rejected, code });
+      closeWithProtocolError(
+        socket,
+        code,
+        code === "upgrade_server"
+          ? RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE
+          : RELAY_UPGRADE_REQUIRED_MESSAGE,
+      );
       await this.recordRejectedHello(session, rejected, now);
       await this.removeSession(socket, now);
       return;
@@ -797,12 +812,27 @@ export class RelaySessionManager {
       } else {
         console.error("[relay] control frame parse failed", description.name);
       }
-      closeWithProtocolError(socket, "Malformed relay protocol message.");
+      closeWithProtocolError(socket, "malformed", "Malformed relay protocol message.");
       await this.removeSession(socket, now);
       return;
     }
 
     if (message.type === "hello") {
+      const nonce = session.helloNonce;
+      session.helloNonce = null;
+      if (
+        !nonce ||
+        !verifyHelloIdentitySignature({
+          identityPublicKey: message.cli.identityPublicKey,
+          signature: message.cli.identitySignature,
+          nonce,
+          cliSlug: message.cli.slug,
+        })
+      ) {
+        closeWithProtocolError(socket, "malformed", "Hello identity proof is invalid.");
+        await this.removeSession(socket, now);
+        return;
+      }
       try {
         const helloSeq = this.grantChangeSeq;
         const registration = await persistRelayRegistration({
@@ -813,7 +843,7 @@ export class RelaySessionManager {
           endpointTargeting: true,
           connection: true,
           reported: reportedFeaturesFromHello(message, now),
-          machineId: message.cli.machineId,
+          identityPublicKey: message.cli.identityPublicKey,
           now,
         });
         if (this.sessionsBySocket.get(socket) !== session) {
@@ -909,33 +939,40 @@ export class RelaySessionManager {
       } catch (error) {
         // Already detached and closed by whoever detached it.
         if (this.sessionsBySocket.get(socket) !== session) return;
-        // A machine-id mismatch rolls the registration back, so the session
+        // An identity-key mismatch rolls the registration back, so the session
         // already serving this device stays. The message tells the copy to
         // log in again; it is not an opaque protocol error.
-        const machineMismatch =
-          error instanceof RelayRegistrationError && error.code === "machine_mismatch";
-        const relayError =
-          error instanceof RelayRegistrationError && error.code === "access_denied"
-            ? "access_denied"
-            : machineMismatch
-              ? "machine_mismatch"
-              : "protocol_error";
+        const code: RelayProtocolErrorCode =
+          error instanceof RelayRegistrationError && error.code === "machine_mismatch"
+            ? "machine_mismatch"
+            : error instanceof RelayRegistrationError && error.code === "access_denied"
+              ? "access_denied"
+              : "malformed";
+        const protocolMessage =
+          error instanceof RelayRegistrationError && error.code === "machine_mismatch"
+            ? error.message
+            : code;
         socket.send(
-          encodeRelayServerControlMessage({
-            type: "protocol.error",
-            failure: "protocol_error",
-            message: machineMismatch ? error.message : relayError,
-            requestId: message.id,
-          }),
+          encodeRelayServerControlMessage(
+            protocolErrorMessage({
+              code,
+              message: protocolMessage,
+              requestId: message.id,
+            }),
+          ),
         );
-        socket.close(1008, relayError);
+        socket.close(code === "malformed" ? 1002 : 1008, code);
         await this.removeSession(socket, now);
       }
       return;
     }
 
     if (!session.registered || !session.cliDeviceId) {
-      closeWithProtocolError(socket, "Registration is required before relay messages.");
+      closeWithProtocolError(
+        socket,
+        "malformed",
+        "Registration is required before relay messages.",
+      );
       await this.removeSession(socket, now);
       return;
     }
@@ -978,12 +1015,13 @@ export class RelaySessionManager {
         if (error instanceof RelayRegistrationError && error.code === "access_denied") {
           // The credential was revoked (or its owner removed) since the hello.
           socket.send(
-            encodeRelayServerControlMessage({
-              type: "protocol.error",
-              failure: "protocol_error",
-              message: "access_denied",
-              requestId: message.id,
-            }),
+            encodeRelayServerControlMessage(
+              protocolErrorMessage({
+                code: "access_denied",
+                message: "access_denied",
+                requestId: message.id,
+              }),
+            ),
           );
           socket.close(1008, "access_denied");
           await this.removeSession(socket, now);
@@ -1069,7 +1107,7 @@ export class RelaySessionManager {
       return;
     }
 
-    if (message.type === "count_context.result") {
+    if (message.type === "context.count.result") {
       const active = this.takeActiveCountContextRequest(message.requestId);
       if (!active) return;
       active.onResult(message);
@@ -1077,7 +1115,7 @@ export class RelaySessionManager {
       return;
     }
 
-    if (message.type === "count_context.error") {
+    if (message.type === "context.count.error") {
       const active = this.takeActiveCountContextRequest(message.requestId);
       if (!active) return;
       active.onError(message);
@@ -1614,11 +1652,9 @@ export class RelaySessionManager {
       this.teardownInteractiveWork(session);
       if (session.socket.readyState === WS_READY_STATE_OPEN) {
         session.socket.send(
-          encodeRelayServerControlMessage({
-            type: "protocol.error",
-            failure: "protocol_error",
-            message: "access_denied",
-          }),
+          encodeRelayServerControlMessage(
+            protocolErrorMessage({ code: "access_denied", message: "access_denied" }),
+          ),
         );
         session.socket.close(1008, "access_denied");
       }
@@ -1986,7 +2022,6 @@ export class RelaySessionManager {
   }
 
   private async sendRemoteEngineAdaptersNow(session: SessionState): Promise<boolean> {
-    if (!relayProtocolAtLeast(session.protocolVersion, "2.4")) return false;
     const cliDeviceId = session.cliDeviceId;
     if (!cliDeviceId) return false;
     let adapters: RemoteEngineAdapter[] = [];
@@ -2100,22 +2135,16 @@ export class RelaySessionManager {
         cliVersion: session.cliVersion,
         humanTerminal: session.features?.humanTerminal ?? false,
         mcpCommandMode: session.features?.mcpCommandMode ?? "off",
-        supervisedCommands: relayProtocolAtLeast(session.protocolVersion, "2.4"),
+        supervisedCommands: true,
         terminalSupported: session.features?.terminalSupported ?? false,
         terminalApproval: session.features?.terminalApproval ?? false,
-        fileOps:
-          relayProtocolAtLeast(session.protocolVersion, "2.4") &&
-          session.features?.fileOps === true,
-        countContext:
-          relayProtocolAtLeast(session.protocolVersion, "2.4") &&
-          session.features?.countContext === true,
+        fileOps: true,
+        countContext: true,
         mcpFileRead: session.features?.mcpFileRead ?? false,
         fileRootsConfigured: session.features?.fileRootsConfigured ?? false,
         allowFileToolsAsRoot: session.features?.allowFileToolsAsRoot ?? false,
-        terminalPublicKey: relayProtocolAtLeast(session.protocolVersion, "2.4")
-          ? session.terminalPublicKey
-          : null,
-        terminalIdentity: session.terminalViewers ? session.terminalIdentity : null,
+        terminalPublicKey: session.terminalPublicKey,
+        terminalIdentity: session.terminalIdentity,
       });
     }
     return snapshots;
@@ -2648,10 +2677,7 @@ export class RelaySessionManager {
     if (!session) return null;
     const readGrant = {
       server: session.mcpFileRead === true,
-      live:
-        session.features?.mcpFileRead === true &&
-        session.features.fileOps === true &&
-        relayProtocolAtLeast(session.protocolVersion, "2.4"),
+      live: session.features?.mcpFileRead === true && session.features.fileOps === true,
       roots: session.features?.fileRootsConfigured === true,
     };
     return (
@@ -2734,11 +2760,7 @@ export class RelaySessionManager {
 
   supportsCountContext(cliDeviceId: string): boolean {
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
-    return (
-      session?.registered === true &&
-      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
-      session.features?.countContext === true
-    );
+    return session?.registered === true;
   }
 
   registerCountContextHandlers({
@@ -2780,7 +2802,7 @@ export class RelaySessionManager {
 
     const expectBody = bodyChunks.length > 0;
     const control: RelayServerControlMessage = {
-      type: "count_context",
+      type: "context.count",
       requestId,
       endpointSlug,
       model,
@@ -2853,7 +2875,7 @@ export class RelaySessionManager {
               });
               const count = this.takeActiveCountContextRequest(requestId);
               count?.onError({
-                type: "count_context.error",
+                type: "context.count.error",
                 requestId,
                 failure: "protocol_error",
                 message: "Relayed request body ended before its declared size.",
@@ -2892,7 +2914,7 @@ export class RelaySessionManager {
       });
       const count = this.takeActiveCountContextRequest(requestId);
       count?.onError({
-        type: "count_context.error",
+        type: "context.count.error",
         requestId,
         failure: "transport",
         message: "Failed to read relayed request body.",
@@ -3013,7 +3035,7 @@ export class RelaySessionManager {
       if (active.cliDeviceId !== session.cliDeviceId) continue;
       this.activeCountContextRequests.delete(requestId);
       active.onError({
-        type: "count_context.error",
+        type: "context.count.error",
         requestId,
         failure: "disconnected",
         message: "CLI session disconnected.",
@@ -3023,7 +3045,6 @@ export class RelaySessionManager {
 
   private canStartTerminal(session: SessionState): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       session.allowHumanTerminal &&
       session.features?.humanTerminal === true &&
       session.features.terminalSupported === true &&
@@ -3038,7 +3059,6 @@ export class RelaySessionManager {
    * Without a terminal, whether any terminal frame may be sent at all.
    */
   private canSignalTerminal(session: SessionState, terminal?: TerminalRecord): boolean {
-    if (!relayProtocolAtLeast(session.protocolVersion, "2.4")) return false;
     if (session.socket.readyState !== WS_READY_STATE_OPEN) return false;
     if (terminal?.origin === "agent") return true;
     if (terminal === undefined) return true;
@@ -3073,7 +3093,6 @@ export class RelaySessionManager {
   /** Supervised terminals: MCP command mode, not the human terminal grant. */
   private supervisedPolicyAllows(session: SessionState): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       allowsSupervisedCommands(this.effectiveCommandMode(session)) &&
       session.features?.terminalSupported === true &&
       session.terminalPublicKey !== null
@@ -3088,7 +3107,6 @@ export class RelaySessionManager {
 
   private canStartExec(session: SessionState): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       allowsHeadlessCommands(this.effectiveCommandMode(session)) &&
       session.socket.readyState === WS_READY_STATE_OPEN
     );
@@ -3097,7 +3115,6 @@ export class RelaySessionManager {
   /** Node file ops (2.8) follow the effective mode through the one file matrix. */
   private canStartFile(session: SessionState, opClass: FileOpClass): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       session.cliDeviceId !== null &&
       this.fileOpModeRefusal(session.cliDeviceId, opClass) === null &&
       session.features?.fileOps === true &&
@@ -3106,17 +3123,11 @@ export class RelaySessionManager {
   }
 
   private canSignalFile(session: SessionState): boolean {
-    return (
-      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
-      session.socket.readyState === WS_READY_STATE_OPEN
-    );
+    return session.socket.readyState === WS_READY_STATE_OPEN;
   }
 
   private canSignalExec(session: SessionState): boolean {
-    return (
-      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
-      session.socket.readyState === WS_READY_STATE_OPEN
-    );
+    return session.socket.readyState === WS_READY_STATE_OPEN;
   }
 
   private sendControl(session: SessionState, message: RelayServerControlMessage) {
@@ -3126,7 +3137,6 @@ export class RelaySessionManager {
 
   private reconcileInteractiveGrants(session: SessionState) {
     const terminalOk =
-      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       session.allowHumanTerminal &&
       session.features?.humanTerminal === true &&
       session.features.terminalSupported === true;
@@ -3137,9 +3147,7 @@ export class RelaySessionManager {
     if (!this.supervisedPolicyAllows(session)) {
       this.closeAllTerminals(session, this.canSignalTerminal(session), "policy", "agent");
     }
-    const execOk =
-      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
-      allowsHeadlessCommands(this.effectiveCommandMode(session));
+    const execOk = allowsHeadlessCommands(this.effectiveCommandMode(session));
     if (!execOk) this.cancelAllCommands(session);
     this.cancelFileOpsNoLongerAllowed(session);
   }

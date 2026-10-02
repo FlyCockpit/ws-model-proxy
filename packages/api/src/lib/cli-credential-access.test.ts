@@ -259,8 +259,9 @@ describe("cliCredentialAccess", () => {
     expect(db.cliDeviceCredential.updateMany).not.toHaveBeenCalled();
   });
 
-  it("refuses a device credential hello whose machine id is missing or different", async () => {
-    const machineId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  it("refuses a device credential hello whose identity key is missing or different", async () => {
+    const identityPublicKey =
+      "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE";
     const check = (presented: string) =>
       checkCliCredentialForDevice(
         prisma,
@@ -272,21 +273,25 @@ describe("cliCredentialAccess", () => {
     db.cliDeviceCredential.findUnique.mockResolvedValueOnce({
       revokedAt: null,
       cliDeviceId: "cli-device-id",
-      machineId,
+      identityPublicKey,
     });
-    await expect(check(machineId)).resolves.toBe("ok");
+    await expect(check(identityPublicKey)).resolves.toBe("ok");
     db.cliDeviceCredential.findUnique.mockResolvedValueOnce({
       revokedAt: null,
       cliDeviceId: "cli-device-id",
-      machineId,
+      identityPublicKey,
     });
-    await expect(check("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")).resolves.toBe("machineMismatch");
+    await expect(
+      check(
+        "BCIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+      ),
+    ).resolves.toBe("machineMismatch");
     db.cliDeviceCredential.findUnique.mockResolvedValueOnce({
       revokedAt: null,
       cliDeviceId: "cli-device-id",
-      machineId: null,
+      identityPublicKey: null,
     });
-    await expect(check(machineId)).resolves.toBe("machineMismatch");
+    await expect(check(identityPublicKey)).resolves.toBe("machineMismatch");
   });
 
   it("binds an unbound CLI token on its first hello with a conditional write", async () => {
@@ -302,6 +307,7 @@ describe("cliCredentialAccess", () => {
       revokedAt: null,
       expiresAt: null,
       cliDeviceId: null,
+      identityPublicKey: null,
     });
     db.cliToken.updateMany.mockResolvedValueOnce({ count: 1 });
     await expect(check()).resolves.toBe("ok");
@@ -386,13 +392,14 @@ describe("mintCliDeviceCredentialFromApprovedDeviceCode", () => {
     db.cliDeviceCredential.updateMany.mockResolvedValue({ count: 0 });
   });
 
-  const machineId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const identityPublicKey =
+    "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE";
 
   function mint(cliSlug = "desk-01") {
     return mintCliDeviceCredentialFromApprovedDeviceCode({
       deviceCode: "short-lived-device-code",
       cliSlug,
-      machineId,
+      identityPublicKey,
       now,
     });
   }
@@ -443,7 +450,7 @@ describe("mintCliDeviceCredentialFromApprovedDeviceCode", () => {
         cliDeviceId: "cli-device-id",
         lookupPrefix: expect.stringMatching(/^wsmp_device_/),
         secretDigest: expect.any(String),
-        machineId,
+        identityPublicKey,
       },
       select: { id: true, userId: true },
     });
@@ -619,7 +626,8 @@ describe("mintCliDeviceCredentialFromApprovedDeviceCode", () => {
 });
 
 describe("device-flow polling against the stored interval (milliseconds)", () => {
-  const machineId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const identityPublicKey =
+    "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE";
   const pending = (lastPolledAt: Date | null) =>
     approvedRow({ status: "pending", userId: null, lastPolledAt, pollingInterval: 5000 });
 
@@ -633,7 +641,7 @@ describe("device-flow polling against the stored interval (milliseconds)", () =>
     return mintCliDeviceCredentialFromApprovedDeviceCode({
       deviceCode: "short-lived-device-code",
       cliSlug: "desk-01",
-      machineId,
+      identityPublicKey,
       now,
     }).catch((error: unknown) => error);
   }
@@ -680,7 +688,7 @@ describe("device-flow polling against the stored interval (milliseconds)", () =>
     const error = await mintCliDeviceCredentialFromApprovedDeviceCode({
       deviceCode: "short-lived-device-code",
       cliSlug: "desk-01",
-      machineId,
+      identityPublicKey,
       now,
     }).catch((caught: unknown) => caught);
     expect((error as ORPCError<string, unknown>).data).toEqual({ deviceFlowError: "slow_down" });

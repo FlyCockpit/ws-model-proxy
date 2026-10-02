@@ -6,7 +6,11 @@ import {
 import type { Context, MiddlewareHandler } from "hono";
 import type { WSContext, WSEvents } from "hono/ws";
 import { authLimiter, createRateLimiterMiddleware } from "../rate-limit.js";
-import { parseRelaySubprotocolHeader, RELAY_SUBPROTOCOL } from "./protocol.js";
+import {
+  parseRelaySubprotocolHeader,
+  protocolErrorMessage,
+  RELAY_SUBPROTOCOL,
+} from "./protocol.js";
 import { type RelaySocket, relaySessionManager } from "./session-manager.js";
 import { settleSocketHandler } from "./socket-handler.js";
 
@@ -38,9 +42,10 @@ export function createRelayWebsocketMiddleware(): MiddlewareHandler<{ Variables:
     if (!requestedProtocol.supported) {
       return c.json(
         {
-          type: "protocol.error",
-          failure: "protocol_error",
-          message: "Unsupported relay websocket subprotocol.",
+          ...protocolErrorMessage({
+            code: "upgrade_cli",
+            message: "Unsupported relay websocket subprotocol.",
+          }),
           supportedSubprotocol: RELAY_SUBPROTOCOL,
         },
         426,

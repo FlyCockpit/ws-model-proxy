@@ -22,7 +22,7 @@ export type LiveCliFeatureSnapshot = {
   terminalApproval: boolean;
   /** 2.8: the CLI implements `file.op`. */
   fileOps: boolean;
-  /** 2.4: the CLI implements `count_context`. */
+  /** 2.4: the CLI implements `context.count`. */
   countContext: boolean;
   /** 2.8: the CLI's own read-only file grant. */
   mcpFileRead: boolean;

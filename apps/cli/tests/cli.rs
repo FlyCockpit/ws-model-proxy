@@ -603,7 +603,7 @@ fn login_writes_device_credential_to_state_dir() {
     assert!(!pending_request.contains(r#""name""#));
     let success_request = server.requests.recv().unwrap();
     assert!(success_request.contains(r#""cliSlug":"desk-01""#));
-    assert!(success_request.contains(r#""machineId":"#));
+    assert!(success_request.contains(r#""identityPublicKey":"#));
 
     let credential_path = state.join("device-auth.json");
     let credential_text = fs::read_to_string(&credential_path).unwrap();

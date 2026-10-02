@@ -309,16 +309,14 @@ export function classifyTerminalAvailability(input: {
   live: LiveCliFeatureSnapshot | null;
 }): { available: boolean; reason: TerminalAvailabilityReason; publicKey: string | null } {
   const live = input.live;
-  const interactive = relayProtocolAtLeast(live?.protocolVersion, "2.4");
-  const publicKey = interactive ? (live?.terminalPublicKey ?? null) : null;
+  const publicKey = live?.terminalPublicKey ?? null;
   if (input.status === "REVOKED") {
     return { available: false, reason: "device_disabled", publicKey };
   }
   if (!input.allowHumanTerminal) {
     return { available: false, reason: "not_granted", publicKey };
   }
-  if (!live || !interactive) {
-    if (live) return { available: false, reason: "cli_too_old", publicKey };
+  if (!live) {
     const neverReported =
       !relayProtocolAtLeast(input.relayProtocolVersion, "2.4") ||
       input.reportedHumanTerminal === null;
@@ -1001,7 +999,7 @@ export class TerminalBrowserHub {
           publicKey: availability.publicKey,
           reason: availability.reason,
           // 2.5 CLIs: several tabs can view one terminal (v2 terminal crypto).
-          terminalViewers: relayProtocolAtLeast(live.get(row.id)?.protocolVersion, "2.4"),
+          terminalViewers: live.get(row.id) != null,
           // 2.5 CLI identity, relayed unverified. Browsers check the signature
           // over `publicKey` and this slug, then pin the key per cliDeviceId.
           ...identityFields(availability.publicKey, live.get(row.id) ?? null),

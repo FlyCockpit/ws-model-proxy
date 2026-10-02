@@ -4,7 +4,7 @@
 //! re-read on reconnect and when an inventory reload is acknowledged; those
 //! replacements must not change the key or these flags.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::config::{Config, McpCommandMode};
 use crate::protocol::{CliCapabilities, TerminalFeatureSnapshot};
@@ -30,24 +30,14 @@ pub struct TerminalStartup {
 impl TerminalStartup {
     pub fn capture(config: &Config) -> Result<Self> {
         let startup = Self::from_key(CliTerminalKey::generate()?, config);
-        let identity = crate::paths::state_dir()
-            .and_then(|state_dir| terminal_identity::load_or_create(&state_dir));
-        Ok(match identity {
-            Ok(identity) => {
-                tracing::info!(
-                    fingerprint = %identity.fingerprint(),
-                    "loaded the terminal identity key"
-                );
-                startup.with_identity(identity)
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %format!("{error:#}"),
-                    "terminal identity key is unavailable; browsers will refuse terminals"
-                );
-                startup
-            }
-        })
+        let state_dir = crate::paths::state_dir().context("determining the state directory")?;
+        let identity = terminal_identity::load_or_create(&state_dir)
+            .context("loading the CLI identity key")?;
+        tracing::info!(
+            fingerprint = %identity.fingerprint(),
+            "loaded the CLI identity key"
+        );
+        Ok(startup.with_identity(identity))
     }
 
     pub fn from_key(key: CliTerminalKey, config: &Config) -> Self {
@@ -201,17 +191,12 @@ mod tests {
         assert!(capabilities.features.terminal_approval);
         assert_eq!(capabilities.features.terminal_supported, cfg!(unix));
         assert_eq!(capabilities.terminal_public_key, public_key);
-        assert!(capabilities.terminal);
-        assert!(capabilities.exec);
-        assert_eq!(capabilities.protocol_version, "2.4");
-        assert!(capabilities.file_ops);
         assert!(capabilities.features.mcp_file_read);
         assert!(startup.mcp_file_read());
         assert_eq!(startup.file_roots(), &[dir.path().to_path_buf()]);
         assert!(capabilities.features.file_roots_configured);
         assert!(capabilities.features.allow_file_tools_as_root);
-        assert!(capabilities.terminal_viewers);
-        assert!(capabilities.supervised_commands);
+        assert!(startup.identity().is_some());
     }
 
     #[test]

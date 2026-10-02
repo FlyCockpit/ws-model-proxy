@@ -8,11 +8,8 @@ import {
   readCliAgentAdmission,
   revokeOpenCliAgentAdmissions,
 } from "./cli-agent-admission.js";
-import {
-  encodeRelayBinaryFrame,
-  parseRelayBinaryFrame,
-  RELAY_REQUEST_BODY_WINDOW_CHUNKS,
-} from "./protocol.js";
+import { generateTestHelloIdentity } from "./hello-identity.js";
+import { encodeRelayBinaryFrame, parseRelayBinaryFrame } from "./protocol.js";
 import { cancelRelayWorkForBannedUser } from "./user-ban.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
@@ -78,6 +75,8 @@ const identity: CliWebsocketIdentity = {
 };
 
 const now = new Date("2026-01-01T00:00:00.000Z");
+const testIdentity = generateTestHelloIdentity();
+
 const waitFor = <T>(fn: () => T) => vi.waitFor(fn, { interval: 1 });
 const OP_TOKEN = { userId: "user-id", tokenId: "token", expiresAt: null } as const;
 
@@ -129,7 +128,18 @@ function uncompressedKey(): string {
 
 type Mode = "off" | "supervised" | "unsupervised";
 
-function hello(slug: string, mode: Mode, readSwitch = false, roots = false) {
+function challengeNonce(socket: FakeSocket): string {
+  for (const send of socket.sends) {
+    if (typeof send !== "string") continue;
+    const parsed = JSON.parse(send) as { type?: string; nonce?: string };
+    if (parsed.type === "hello.challenge" && typeof parsed.nonce === "string") {
+      return parsed.nonce;
+    }
+  }
+  throw new Error("expected hello.challenge");
+}
+
+function hello(socket: FakeSocket, slug: string, mode: Mode, readSwitch = false, roots = false) {
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
@@ -137,37 +147,22 @@ function hello(slug: string, mode: Mode, readSwitch = false, roots = false) {
     cli: {
       slug,
       hostname: `${slug}.local`,
-      machineId: "0123456789abcdef0123456789abcdef",
+      identityPublicKey: testIdentity.publicKey,
+      identitySignature: testIdentity.sign(challengeNonce(socket), slug),
       version: "9.9.9",
       capabilities: {
-        protocolVersion: "2.4",
-        inventoryAck: true,
-        inventoryReplace: true,
-        endpointTargeting: true,
-        binaryFrames: true,
-        cancellation: true,
-        maxBinaryChunkBytes: 1024 * 1024,
-        requestBodyStreaming: true,
-        requestBodyWindowChunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
-        sharedTokenizerTps: true,
-        standardizedMetrics: true,
-        terminal: true,
-        exec: true,
         features: {
           humanTerminal: false,
           mcpCommandMode: mode,
           terminalApproval: false,
           terminalSupported: false,
           remoteMetricSources: false,
+          remoteEngineAdapters: false,
           mcpFileRead: readSwitch,
           fileRootsConfigured: roots,
           allowFileToolsAsRoot: false,
         },
         terminalPublicKey: uncompressedKey(),
-        terminalViewers: true,
-        supervisedCommands: true,
-        nodeTelemetry: true,
-        fileOps: true,
       },
     },
     endpoints: [],
@@ -182,7 +177,11 @@ async function connect(
 ) {
   const socket = new FakeSocket();
   relaySessionManager.acceptAuthenticatedSocket({ socket, identity, now });
-  await relaySessionManager.handleTextFrame(socket, hello(slug, mode, readSwitch, roots), now);
+  await relaySessionManager.handleTextFrame(
+    socket,
+    hello(socket, slug, mode, readSwitch, roots),
+    now,
+  );
   socket.sends.length = 0;
   return socket;
 }
@@ -284,6 +283,7 @@ describe("cli file ops", () => {
       revokedAt: null,
       expiresAt: null,
       cliDeviceId: null,
+      identityPublicKey: null,
     });
     db.cliToken.updateMany.mockResolvedValue({ count: 1 });
     db.user.findUnique.mockResolvedValue({ slug: "owner" });
@@ -819,7 +819,7 @@ describe("cli file ops", () => {
         relaySessionManager.acceptAuthenticatedSocket({ socket: replacement, identity, now });
         const reconnect = relaySessionManager.handleTextFrame(
           replacement,
-          hello("desktop", initialMode, true, true),
+          hello(replacement, "desktop", initialMode, true, true),
           now,
         );
         await committed.promise;
@@ -916,7 +916,7 @@ describe("cli file ops", () => {
       relaySessionManager.acceptAuthenticatedSocket({ socket: replacement, identity, now });
       const reconnect = relaySessionManager.handleTextFrame(
         replacement,
-        hello("desktop", "off", true, true),
+        hello(replacement, "desktop", "off", true, true),
         now,
       );
       await committed.promise;
@@ -971,7 +971,7 @@ describe("cli file ops", () => {
         relaySessionManager.acceptAuthenticatedSocket({ socket, identity, now });
         const registration = relaySessionManager.handleTextFrame(
           socket,
-          hello("desktop", "off", true, true),
+          hello(socket, "desktop", "off", true, true),
           now,
         );
         await committed.promise;
@@ -2645,7 +2645,7 @@ describe("cli file ops", () => {
         identity: { ...identity, id: "token-id-other", userId: "other-user" },
         now,
       });
-      await relaySessionManager.handleTextFrame(other, hello("laptop", "unsupervised"), now);
+      await relaySessionManager.handleTextFrame(other, hello(other, "laptop", "unsupervised"), now);
       other.sends.length = 0;
       db.cliDevice.findUnique.mockImplementation((args: { where: { id: string } }) => ({
         id: args.where.id,

@@ -913,14 +913,23 @@ fn run_relay_session(
         )
     };
 
-    let machine_id = crate::machine_id::login_machine_id().map_err(RelaySessionError::Fatal)?;
+    let identity = startup.identity().ok_or_else(|| {
+        RelaySessionError::Fatal(anyhow::anyhow!(
+            "CLI identity key is unavailable; cannot bind this device"
+        ))
+    })?;
+    let nonce = wait_for_hello_challenge(&mut socket)?;
+    let identity_signature = identity
+        .sign_hello(&nonce, cli_slug)
+        .map_err(RelaySessionError::Fatal)?;
     let hello = ClientControlMessage::Hello {
         id: next_id("hello"),
         protocol_version: crate::protocol::RELAY_PROTOCOL_VERSION.to_string(),
         cli: CliInventory {
             slug: cli_slug.to_string(),
             hostname: crate::hostname::reported_hostname(),
-            machine_id,
+            identity_public_key: identity.public_b64url(),
+            identity_signature,
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
             capabilities: startup::hello_capabilities(startup, config, cli_slug),
         },
@@ -1062,7 +1071,7 @@ fn run_relay_session(
             next_telemetry_sync = Instant::now() + TELEMETRY_SYNC_INTERVAL;
         }
 
-        if Instant::now() >= next_heartbeat {
+        if registered && Instant::now() >= next_heartbeat {
             let heartbeat = ClientControlMessage::Heartbeat {
                 id: next_id("heartbeat"),
                 sent_at: None,
@@ -1785,14 +1794,20 @@ where
                 tracing::warn!(id, "late inventory rejection resolved uncertain publish");
             }
         }
-        ServerControlMessage::ProtocolError { message, .. } => {
-            // Before `hello.ok`, a pre-2.6 server rejects the hello itself.
+        ServerControlMessage::ProtocolError {
+            message, code, ..
+        } => {
             let text = if *registered {
                 format!("relay protocol error: {message}")
             } else {
-                hello_rejection_message(&message)
+                hello_rejection_message(&message, code.as_ref())
             };
             return Err(RelaySessionError::Fatal(anyhow::anyhow!(text)));
+        }
+        ServerControlMessage::HelloChallenge { .. } => {
+            return Err(RelaySessionError::Fatal(anyhow::anyhow!(
+                "server sent hello.challenge after hello"
+            )));
         }
         ServerControlMessage::RelayCancel { request_id, reason } => {
             tracing::warn!(request_id, ?reason, "relay request cancelled");
@@ -3249,6 +3264,71 @@ where
         }
     }
     Ok(())
+}
+
+fn wait_for_hello_challenge<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+) -> RelaySessionResult<String>
+where
+    S: std::io::Read + std::io::Write,
+{
+    loop {
+        if let Some(signal) = crate::shutdown::requested() {
+            return Err(RelaySessionError::Shutdown(signal));
+        }
+        match socket.read() {
+            Ok(Message::Text(text)) => match parse_server_control(&text) {
+                Ok(ServerControlMessage::HelloChallenge { nonce }) => return Ok(nonce),
+                Ok(ServerControlMessage::ProtocolError { message, code, .. }) => {
+                    return Err(RelaySessionError::Fatal(anyhow::anyhow!(
+                        hello_rejection_message(&message, code.as_ref())
+                    )));
+                }
+                Ok(other) => {
+                    let type_name = match other {
+                        ServerControlMessage::Unknown { type_name } => type_name,
+                        _ => "a control frame".to_string(),
+                    };
+                    return Err(RelaySessionError::Fatal(anyhow::anyhow!(
+                        "expected hello.challenge, received {type_name}"
+                    )));
+                }
+                Err(error) => {
+                    return Err(RelaySessionError::Fatal(
+                        error.context("parsing hello.challenge"),
+                    ));
+                }
+            },
+            Ok(Message::Ping(bytes)) => {
+                socket
+                    .send(Message::Pong(bytes))
+                    .map_err(|error| websocket_session_error(error, "sending relay pong", true))?;
+            }
+            Ok(Message::Pong(_) | Message::Frame(_)) => {}
+            Ok(Message::Binary(_)) => {
+                return Err(RelaySessionError::Fatal(anyhow::anyhow!(
+                    "unexpected binary frame before hello"
+                )));
+            }
+            Ok(Message::Close(frame)) => {
+                tracing::warn!(?frame, "relay websocket closed by server before hello");
+                return Err(RelaySessionError::Reconnectable {
+                    error: anyhow::anyhow!("relay websocket closed by server"),
+                    reset_backoff: true,
+                });
+            }
+            Err(tungstenite::Error::Io(err))
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(err) => {
+                return Err(websocket_session_error(
+                    err,
+                    "reading hello.challenge",
+                    true,
+                ));
+            }
+        }
+    }
 }
 
 fn send_control<S>(

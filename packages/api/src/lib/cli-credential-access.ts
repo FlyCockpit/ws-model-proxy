@@ -1,7 +1,7 @@
 import { ORPCError } from "@orpc/server";
 import { cliSlugFromDeviceLoginScope } from "@ws-model-proxy/config/cli-device-login";
+import { normalizeIdentityPublicKey } from "@ws-model-proxy/config/cli-identity-key";
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
-import { normalizeLoginMachineId } from "@ws-model-proxy/config/login-machine-id";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
   fenceOwners,
@@ -179,7 +179,8 @@ export async function authenticateCliWebsocketSecret(
  * Outcome of checking a relay identity's credential against the device a hello
  * names: `ok`, `revoked` (revoked, expired, or deleted with its device), or
  * `otherDevice` (bound to a different device), or `machineMismatch` (a device
- * credential whose login-time machine id is missing or differs from the hello).
+ * credential or TOFU-bound CLI token whose identity key is missing or differs
+ * from the hello).
  */
 export type CliCredentialDeviceCheck = "ok" | "revoked" | "otherDevice" | "machineMismatch";
 
@@ -191,53 +192,85 @@ export type CliCredentialDeviceCheck = "ok" | "revoked" | "otherDevice" | "machi
  * captured at websocket auth:
  *
  * - A device credential authenticates only as the device it was minted for
- *   (`cliDeviceId` is required and never rewritten). When `machineId` is set
- *   (a hello), it must equal the id stored at login. A null stored id is a
- *   credential from before the bind and is refused the same way. Inventory
- *   updates pass null: the socket was already admitted.
+ *   (`cliDeviceId` is required and never rewritten). When `identityPublicKey`
+ *   is set (a hello), it must equal the key stored at login. A null stored
+ *   key is a credential from before the bind and is refused the same way.
+ *   Inventory updates pass null: the socket was already admitted.
  * - A CLI token is bound on its first hello: a conditional write claims an
- *   unbound token, so two first hellos naming different devices cannot both
- *   bind it. Once bound, it authenticates only as that device. Tokens are not
- *   machine-bound; `machineId` is ignored for them.
+ *   unbound token for that device and TOFU-binds the identity key, so two
+ *   first hellos naming different devices or keys cannot both bind it. Once
+ *   bound, it authenticates only as that device and key.
  */
 export async function checkCliCredentialForDevice(
   db: Pick<Prisma.TransactionClient, "cliToken" | "cliDeviceCredential">,
   identity: Pick<CliWebsocketIdentity, "kind" | "id">,
   cliDeviceId: string,
   now: Date,
-  machineId: string | null,
+  identityPublicKey: string | null,
 ): Promise<CliCredentialDeviceCheck> {
   if (identity.kind === "deviceCredential") {
     const credential = await db.cliDeviceCredential.findUnique({
       where: { id: identity.id },
-      select: { revokedAt: true, cliDeviceId: true, machineId: true },
+      select: { revokedAt: true, cliDeviceId: true, identityPublicKey: true },
     });
     if (!credential || credential.revokedAt) return "revoked";
     if (credential.cliDeviceId !== cliDeviceId) return "otherDevice";
-    if (machineId !== null && credential.machineId !== machineId) return "machineMismatch";
+    if (identityPublicKey !== null && credential.identityPublicKey !== identityPublicKey) {
+      return "machineMismatch";
+    }
     return "ok";
   }
 
   const token = await db.cliToken.findUnique({
     where: { id: identity.id },
-    select: { revokedAt: true, expiresAt: true, cliDeviceId: true },
+    select: { revokedAt: true, expiresAt: true, cliDeviceId: true, identityPublicKey: true },
   });
   if (!token || token.revokedAt || isExpired(token.expiresAt, now)) return "revoked";
   if (token.cliDeviceId !== null) {
-    return token.cliDeviceId === cliDeviceId ? "ok" : "otherDevice";
+    if (token.cliDeviceId !== cliDeviceId) return "otherDevice";
+    if (identityPublicKey === null) return "ok";
+    if (token.identityPublicKey === identityPublicKey) return "ok";
+    if (token.identityPublicKey !== null) return "machineMismatch";
+    const bound = await db.cliToken.updateMany({
+      where: {
+        id: identity.id,
+        cliDeviceId,
+        identityPublicKey: null,
+        revokedAt: null,
+      },
+      data: { identityPublicKey },
+    });
+    if (bound.count === 1) return "ok";
+    const current = await db.cliToken.findUnique({
+      where: { id: identity.id },
+      select: { revokedAt: true, cliDeviceId: true, identityPublicKey: true },
+    });
+    if (!current || current.revokedAt) return "revoked";
+    if (current.cliDeviceId !== cliDeviceId) return "otherDevice";
+    return current.identityPublicKey === identityPublicKey ? "ok" : "machineMismatch";
   }
-  const claimed = await db.cliToken.updateMany({
-    where: { id: identity.id, cliDeviceId: null, revokedAt: null },
-    data: { cliDeviceId },
-  });
-  if (claimed.count === 1) return "ok";
+  if (identityPublicKey === null) {
+    const claimed = await db.cliToken.updateMany({
+      where: { id: identity.id, cliDeviceId: null, revokedAt: null },
+      data: { cliDeviceId },
+    });
+    if (claimed.count === 1) return "ok";
+  } else {
+    const claimed = await db.cliToken.updateMany({
+      where: { id: identity.id, cliDeviceId: null, identityPublicKey: null, revokedAt: null },
+      data: { cliDeviceId, identityPublicKey },
+    });
+    if (claimed.count === 1) return "ok";
+  }
   // Another hello bound (or a revoke hit) the token since the read above.
   const current = await db.cliToken.findUnique({
     where: { id: identity.id },
-    select: { revokedAt: true, cliDeviceId: true },
+    select: { revokedAt: true, cliDeviceId: true, identityPublicKey: true },
   });
   if (!current || current.revokedAt) return "revoked";
-  return current.cliDeviceId === cliDeviceId ? "ok" : "otherDevice";
+  if (current.cliDeviceId !== cliDeviceId) return "otherDevice";
+  if (identityPublicKey === null || current.identityPublicKey === identityPublicKey) return "ok";
+  return "machineMismatch";
 }
 
 /**
@@ -438,10 +471,10 @@ async function deleteCliDeviceInCapacityLockOrder({
  *    user, unexpired). Exactly one row must go, so a code mints at most once
  *    even under concurrent exchanges (the loser waits on the device row, then
  *    deletes 0 and rolls back its device touch).
- * 4. Mint the credential bound to `machineId`, then revoke the device's other
- *    active credentials. The id is the machine that is logging in, not a
- *    label. A later hello from anywhere else is refused and does not replace
- *    the live session.
+ * 4. Mint the credential bound to `identityPublicKey`, then revoke the
+ *    device's other active credentials. The key is the CLI identity that is
+ *    logging in. A later hello from a different identity is refused and does
+ *    not replace the live session.
  *
  * The caller closes live relay sessions of the returned revoked ids after the
  * commit (`ContextServices.onCliCredentialsRevoked`). Manually created
@@ -451,13 +484,13 @@ async function deleteCliDeviceInCapacityLockOrder({
 export async function mintCliDeviceCredentialFromApprovedDeviceCode({
   deviceCode,
   cliSlug,
-  machineId,
+  identityPublicKey,
   now = new Date(),
 }: {
   deviceCode: string;
   cliSlug: string;
-  /** Login-time machine id. Required; an invalid value is `BAD_REQUEST`. */
-  machineId: string;
+  /** Login-time CLI identity public key. Required; an invalid value is `BAD_REQUEST`. */
+  identityPublicKey: string;
   now?: Date;
 }): Promise<{
   credentialId: string;
@@ -472,10 +505,10 @@ export async function mintCliDeviceCredentialFromApprovedDeviceCode({
       message: "CLI slug must use lowercase letters, numbers, and hyphens only.",
     });
   }
-  const boundMachineId = normalizeLoginMachineId(machineId);
-  if (!boundMachineId) {
+  const boundIdentityPublicKey = normalizeIdentityPublicKey(identityPublicKey);
+  if (!boundIdentityPublicKey) {
     throw new ORPCError("BAD_REQUEST", {
-      message: "machineId must be a machine-id or UUID.",
+      message: "identityPublicKey must be an uncompressed P-256 public key.",
     });
   }
   const row = await prisma.deviceCode.findUnique({
@@ -575,7 +608,7 @@ export async function mintCliDeviceCredentialFromApprovedDeviceCode({
           cliDeviceId: cliDevice.id,
           lookupPrefix: credentialLookupPrefix(secret),
           secretDigest: digestCliDeviceCredentialSecret(secret),
-          machineId: boundMachineId,
+          identityPublicKey: boundIdentityPublicKey,
         },
         select: { id: true, userId: true },
       });
