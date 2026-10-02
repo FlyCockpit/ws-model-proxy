@@ -369,10 +369,12 @@ fn rename_preflight_errno_and_actual_object_table() {
 fn rename_noncommit_paths_never_dispose_the_user_source() {
     for object in OBJECTS {
         for shape in [Shape::Nr, Shape::Link] {
+            // Link-first's first capture is the destination. NR captures it second.
+            let dest_capture = if matches!(shape, Shape::Link) { 1 } else { 2 };
             for (primitive, nth, errno, after) in [
                 (Primitive::PublishPrepare, 1, Errno::EIO, false), // D1 site 1
-                (Primitive::Capture, 2, Errno::ENOENT, false),     // D1 site 2
-                (Primitive::Capture, 2, Errno::EIO, true),
+                (Primitive::Capture, dest_capture, Errno::ENOENT, false), // D1 site 2
+                (Primitive::Capture, dest_capture, Errno::EIO, true),
                 (shape.publish(), 1, Errno::EIO, false), // D1 site 5
                 (shape.publish(), 1, Errno::EPERM, false),
                 (shape.publish(), 1, Errno::EMLINK, false),
@@ -460,11 +462,16 @@ fn race_hook(fx: Fx, object: Object, overwrite: bool, race: Race) -> Fx {
             (Step::Renamed, Race::AfterSave) => object.save(&dst, RACER),
             (Step::Renamed, Race::AfterRemove) => std::fs::remove_file(&dst).unwrap(),
             (Step::Publishing, Race::PrivateSource) => {
-                let private = recovery_dirs(&root)[0].join("slot-1");
-                // Preserve the source elsewhere: same-UID private removal itself
-                // is outside the boundary, but publishing the successor isn't.
-                std::fs::rename(&private, root.join("source-rescued")).unwrap();
-                object.put_path(&private, RACER);
+                if std::fs::symlink_metadata(&src).is_ok() {
+                    // Link-first has not captured S. Replacing it must stop the link.
+                    object.save(&src, RACER);
+                } else {
+                    let private = recovery_dirs(&root)[0].join("slot-1");
+                    // Preserve the source elsewhere: same-UID private removal itself
+                    // is outside the boundary, but publishing the successor isn't.
+                    std::fs::rename(&private, root.join("source-rescued")).unwrap();
+                    object.put_path(&private, RACER);
+                }
             }
             _ => {}
         }
@@ -472,10 +479,27 @@ fn race_hook(fx: Fx, object: Object, overwrite: bool, race: Race) -> Fx {
     })
 }
 impl Object {
+    /// Exclusive create. Vacate-first races run against a vacant name; link-first
+    /// still has the source, and truncating it would destroy the admitted bytes.
     fn put_path(self, path: &Path, text: &str) {
         match self {
-            Self::File => std::fs::write(path, text).unwrap(),
-            Self::Symlink => std::os::unix::fs::symlink(text, path).unwrap(),
+            Self::File => {
+                use std::io::Write;
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                {
+                    Ok(mut file) => file.write_all(text.as_bytes()).unwrap(),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => panic!("create {path:?}: {error}"),
+                }
+            }
+            Self::Symlink => match std::os::unix::fs::symlink(text, path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("symlink {path:?}: {error}"),
+            },
         }
     }
 }
@@ -486,6 +510,7 @@ fn assert_race(
     race: Race,
     result: FileResult<Value>,
     link: bool,
+    link_first: bool,
     counts: bool,
 ) {
     let mut paths = match &result {
@@ -519,7 +544,7 @@ fn assert_race(
             if race == Race::SourceSave {
                 assert_eq!(
                     count(&FaultScope::calls(), Primitive::Capture),
-                    1,
+                    if link_first { 0 } else { 1 },
                     "source mismatch stops BEFORE destination capture"
                 );
                 assert!(
@@ -553,13 +578,21 @@ fn assert_race(
         }
         Race::DestinationCreate | Race::BothCreate => {
             let e = result.unwrap_err();
+            // Link-first never vacates the source, so a create at src does not
+            // land and a plain rename that finds the racer at dst is a clean EEXIST.
+            let expect_uncertain = if link_first {
+                overwrite
+            } else {
+                overwrite || race == Race::BothCreate
+            };
             assert_eq!(
                 e.code,
-                if overwrite || race == Race::BothCreate {
+                if expect_uncertain {
                     ErrorCode::UncertainOutcome
                 } else {
                     ErrorCode::Exists
-                }
+                },
+                "{race:?} link_first={link_first} {e:?}"
             );
             assert_eq!(object.bytes(&fx.root.join("dst")).as_deref(), Some(RACER));
             assert!(object.kept(&paths, SOURCE));
@@ -569,17 +602,21 @@ fn assert_race(
             if race == Race::BothCreate {
                 assert_eq!(
                     object.bytes(&fx.root.join("src")).as_deref(),
-                    Some("source racer")
+                    Some(if link_first { SOURCE } else { "source racer" })
                 );
             }
         }
         Race::PrivateSource => {
             assert_eq!(result.unwrap_err().code, ErrorCode::Conflict);
-            assert_eq!(
-                object.bytes(&fx.root.join("source-rescued")).as_deref(),
-                Some(SOURCE)
-            );
             assert_eq!(object.bytes(&fx.root.join("src")).as_deref(), Some(RACER));
+            if link_first {
+                assert!(std::fs::symlink_metadata(fx.root.join("source-rescued")).is_err());
+            } else {
+                assert_eq!(
+                    object.bytes(&fx.root.join("source-rescued")).as_deref(),
+                    Some(SOURCE)
+                );
+            }
             if overwrite {
                 assert_eq!(
                     object.bytes(&fx.root.join("dst")).as_deref(),
@@ -630,7 +667,9 @@ fn rename_races_restore_origins_preserve_creates_and_do_not_chase_commits() {
                     // direct NR verification retains its existing tests.
                     let mut faults = shape.faults(overwrite);
                     if !overwrite && matches!(shape, Shape::Nr) {
-                        faults.push((Primitive::Move, 1, Errno::EINVAL));
+                        // ENOSYS still means "flags unavailable" when the private
+                        // NR probe works. EINVAL in that case is a rejected name.
+                        faults.push((Primitive::Move, 1, Errno::ENOSYS));
                     }
                     let fx = race_hook(fx, object, overwrite, race);
                     let _scope = FaultScope::new(&faults);
@@ -641,6 +680,7 @@ fn rename_races_restore_origins_preserve_creates_and_do_not_chase_commits() {
                         overwrite,
                         race,
                         result,
+                        matches!(shape, Shape::Link),
                         matches!(shape, Shape::Link),
                         true,
                     );
@@ -688,7 +728,7 @@ fn rename_cancel_and_hook_errors_at_every_transaction_seam() {
                     });
                     let mut faults = shape.faults(overwrite);
                     if !overwrite && matches!(shape, Shape::Nr) {
-                        faults.push((Primitive::Move, 1, Errno::EINVAL));
+                        faults.push((Primitive::Move, 1, Errno::ENOSYS));
                     }
                     let _scope = FaultScope::new(&faults);
                     let result = rename_run(&fx, overwrite, etag.as_deref(), false);
@@ -715,15 +755,15 @@ fn rename_reply_loss_nr_commits_link_keeps_and_restore_never_overwrites() {
             let _scope =
                 FaultScope::with_after_effects(&shape.faults(true), &[(shape.publish(), 1, errno)]);
             let result = rename_run(&fx, true, etag.as_deref(), false);
-            if matches!(shape, Shape::Nr) {
-                assert!(result.unwrap().get("recovered").is_none());
-                clean(&fx);
-            } else {
-                let e = result.unwrap_err();
-                let paths = error_inventory(&fx, &e);
-                assert!(has_bytes(&paths, SOURCE));
-                assert!(has_bytes(&paths, DESTINATION));
-            }
+            // Lost publish reply: NR reconciles the transferred dentry, and a
+            // stable-inode link commits when `to` presents the held source.
+            let value = result.unwrap_or_else(|error| panic!("{shape:?} {errno:?}: {error:?}"));
+            assert!(
+                value.get("recovered").is_none(),
+                "{shape:?} {errno:?} {value}"
+            );
+            assert!(std::fs::symlink_metadata(fx.root.join("src")).is_err());
+            clean(&fx);
             assert_eq!(fx.get("dst"), SOURCE);
         }
     }
@@ -752,27 +792,47 @@ fn rename_reply_loss_nr_commits_link_keeps_and_restore_never_overwrites() {
     }
 }
 
-/// O5B-1: a plain link rename whose publish reply is lost must keep the recovery
-/// directory and name the destination that now holds the source.
+/// O5B-1: a lost plain-link reply. Stable inodes commit (the destination presents
+/// the held source). A noino probe leaves the reply unreconcilable: both public
+/// names hold the source and the destination stays in the recovery report.
 #[test]
 fn rename_plain_link_reply_loss_reports_the_published_name() {
     for object in OBJECTS {
         for errno in [Errno::EIO, Errno::ENOENT, Errno::EINVAL] {
-            let fx = Fx::new();
-            let etag = setup(&fx, object, false);
-            let _scope = FaultScope::with_after_effects(
-                &Shape::Link.faults(false),
-                &[(Shape::Link.publish(), 1, errno)],
-            );
-            let error = rename_run(&fx, false, etag.as_deref(), false).unwrap_err();
-            let paths = kept(&error);
-            assert!(
-                paths.iter().any(|path| path == &fx.root.join("dst")),
-                "{errno:?} {object:?} kept {paths:?}"
-            );
-            assert_eq!(object.bytes(&fx.root.join("src")).as_deref(), Some(SOURCE));
-            assert_eq!(object.bytes(&fx.root.join("dst")).as_deref(), Some(SOURCE));
-            assert!(object.kept(&paths, SOURCE), "{errno:?} {object:?}");
+            for destabilize in [false, true] {
+                let fx = Fx::new();
+                let etag = setup(&fx, object, false);
+                let root = fx.root.clone();
+                let fx = fx.with_hook(move |step| {
+                    if destabilize && step == Step::LinkProbed && !root.join("probe-decoy").exists()
+                    {
+                        swap_probe_inode(&root);
+                    }
+                    Ok(())
+                });
+                let _scope = FaultScope::with_after_effects(
+                    &Shape::Link.faults(false),
+                    &[(Shape::Link.publish(), 1, errno)],
+                );
+                let result = rename_run(&fx, false, etag.as_deref(), false);
+                if destabilize {
+                    let error = result.unwrap_err();
+                    let paths = kept(&error);
+                    assert!(
+                        paths.iter().any(|path| path == &fx.root.join("dst")),
+                        "{errno:?} {object:?} kept {paths:?}"
+                    );
+                    assert_eq!(object.bytes(&fx.root.join("src")).as_deref(), Some(SOURCE));
+                    assert_eq!(object.bytes(&fx.root.join("dst")).as_deref(), Some(SOURCE));
+                    assert!(object.kept(&paths, SOURCE), "{errno:?} {object:?}");
+                } else {
+                    let value = result.unwrap();
+                    assert!(value.get("recovered").is_none(), "{errno:?} {value}");
+                    assert!(std::fs::symlink_metadata(fx.root.join("src")).is_err());
+                    assert_eq!(object.bytes(&fx.root.join("dst")).as_deref(), Some(SOURCE));
+                    clean(&fx);
+                }
+            }
         }
     }
 }
@@ -812,7 +872,10 @@ fn rename_cleanup_failures_report_alias_and_destination_after_known_commit() {
 fn rename_directory_unsupported_nr_stays_unsafe_filesystem() {
     let fx = Fx::new();
     fx.put("tree/sub/child", SOURCE);
-    let _scope = FaultScope::new(&[(Primitive::Move, 1, Errno::EINVAL)]);
+    let _scope = FaultScope::new(&[
+        (Primitive::Move, 1, Errno::EINVAL),
+        (Primitive::ProbeNoReplace, 1, Errno::EINVAL),
+    ]);
     let error = fx
         .ops
         .rename(
@@ -1042,7 +1105,7 @@ pub(super) fn real_rename_rows(directory: &Path, class: RealClass) {
                 let etag = setup(&fx, object, overwrite);
                 let fx = race_hook(fx, object, overwrite, race);
                 let faults = if !overwrite && class.nr {
-                    vec![(Primitive::Move, 1, Errno::EINVAL)]
+                    vec![(Primitive::Move, 1, Errno::ENOSYS)]
                 } else {
                     vec![]
                 };
@@ -1055,6 +1118,7 @@ pub(super) fn real_rename_rows(directory: &Path, class: RealClass) {
                     race,
                     result,
                     !class.nr,
+                    !class.nr && class.link && !class.noino,
                     class.counts,
                 );
             }
@@ -1173,6 +1237,8 @@ fn rename_double_observation_and_unheld_failures_keep_data() {
                 *store.lock().unwrap() = Some(FaultScope::new(&[
                     (Primitive::Identity, 1, Errno::EIO),
                     (Primitive::Identity, 2, Errno::ESTALE),
+                    (Primitive::Identity, 3, Errno::EIO),
+                    (Primitive::Identity, 4, Errno::ESTALE),
                     (Primitive::Restore, 1, Errno::EINVAL),
                     (Primitive::Restore, 2, Errno::EINVAL),
                 ]));
@@ -1382,11 +1448,41 @@ fn rename_cross_parent_clean_and_both_origin_collision_table() {
                     });
                     let mut faults = shape.faults(overwrite);
                     if !overwrite && matches!(shape, Shape::Nr) {
-                        faults.push((Primitive::Move, 1, Errno::EINVAL));
+                        faults.push((Primitive::Move, 1, Errno::ENOSYS));
                     }
                     let _scope = FaultScope::new(&faults);
                     let result = fx.ops.execute("rename", json!({"from":fx.p("a/src"),"to":fx.p("b/dst"),"overwrite":overwrite,"expectedEtag":tag}), &fx.cancel);
-                    if race {
+                    if race && matches!(shape, Shape::Link) {
+                        // Stable inodes link first: the source name is still the
+                        // admitted object, so the exclusive create does not land.
+                        if overwrite {
+                            let e = result.unwrap_err();
+                            let paths = kept(&e);
+                            // S was never captured. D stays in R because the racer
+                            // occupies the destination name.
+                            assert!(object.kept(&paths, DESTINATION), "{e:?} {paths:?}");
+                            assert_eq!(
+                                object.bytes(&fx.root.join("a/src")).as_deref(),
+                                Some(SOURCE)
+                            );
+                            assert_eq!(
+                                object.bytes(&fx.root.join("b/dst")).as_deref(),
+                                Some(RACER)
+                            );
+                        } else {
+                            let e = result.unwrap_err();
+                            assert_eq!(e.code, ErrorCode::Exists, "{e:?}");
+                            assert_eq!(
+                                object.bytes(&fx.root.join("a/src")).as_deref(),
+                                Some(SOURCE)
+                            );
+                            assert_eq!(
+                                object.bytes(&fx.root.join("b/dst")).as_deref(),
+                                Some(RACER)
+                            );
+                            clean(&fx);
+                        }
+                    } else if race {
                         let e = result.unwrap_err();
                         let paths = kept(&e);
                         assert!(object.kept(&paths, SOURCE));
@@ -1446,7 +1542,11 @@ fn rename_failed_destination_capture_releases_source_before_restore_alias_unlink
         let root = fx.root.clone();
         let scope = Arc::new(Mutex::new(None));
         let injected = Arc::clone(&scope);
+        let probe_root = fx.root.clone();
         let fx=fx.with_hook(move|step| {
+            if step == Step::LinkProbed && !probe_root.join("probe-decoy").exists() {
+                swap_probe_inode(&probe_root);
+            }
             if step==Step::DestinationVacating {
                 let mut rows=vec![(Primitive::Capture,1,Errno::ENOENT),(Primitive::Restore,1,Errno::EINVAL)];
                 if let Some(errno)=failure {rows.push((Primitive::Identity,1,errno));}
@@ -1493,6 +1593,9 @@ fn rename_destination_mismatch_closes_source_proof_before_restore_unlink() {
     let root = fx.root.clone();
     let racer_root = fx.root.clone();
     let fx = fx.with_hook(move |step| {
+        if step == Step::LinkProbed && !racer_root.join("probe-decoy").exists() {
+            swap_probe_inode(&racer_root);
+        }
         if step == Step::DestinationVacating {
             let private = recovery_dirs(&racer_root)[0].join("slot-1");
             let public = racer_root.join("dst");
@@ -1620,6 +1723,13 @@ fn rename_each_link_alias_disposal_keeps_a_last_name() {
             let fx = fx.with_hook(move |step| {
                 let src = root.join("src");
                 let dst = root.join("dst");
+                if site == "restore"
+                    && step == Step::LinkProbed
+                    && !root.join("probe-decoy").exists()
+                {
+                    // Vacating save is observed only after S is already captured.
+                    swap_probe_inode(&root);
+                }
                 if site == "probe"
                     && step == Step::LinkProbed
                     && object.bytes(&src).as_deref() == Some(SOURCE)
@@ -1796,6 +1906,8 @@ fn rename_prepare_error_exit_closes_the_destination_proof_before_the_restore_unl
     let method = recovery
         .preflight_move(&fx.ops, &from, &to, &src, Some(&dst))
         .unwrap();
+    // Stable inodes would link first and fail PublishPrepare before capture.
+    recovery.set_link_order(crate::file_ops::recovery::LinkOrder::VacateFirst);
     #[cfg(target_os = "linux")]
     let checks = {
         use crate::file_ops::exchange::UNLINK_PROBE;
@@ -1897,7 +2009,9 @@ fn rename_true_alias_pair_closes_both_private_proofs_before_committed_unlinks() 
                 .unwrap();
             #[cfg(target_os = "linux")]
             let checks = if matches!(shape, Shape::Link) {
-                Some(watch_private_unlinks(&fx, &["slot-2", "slot-1"]))
+                // Link-first captures D into slot-1 and S into slot-2, and
+                // unlinks the displaced destination before the source alias.
+                Some(watch_private_unlinks(&fx, &["slot-1", "slot-2"]))
             } else {
                 None
             };
@@ -1924,4 +2038,128 @@ fn rename_true_alias_pair_closes_both_private_proofs_before_committed_unlinks() 
             clean(&fx);
         }
     }
+}
+
+/// Replace the first link probe with a different inode that still has two names,
+/// so alias disposal can unlink it and the rename takes the noino order.
+fn swap_probe_inode(root: &Path) {
+    let probe = recovery_dirs(root)
+        .into_iter()
+        .next()
+        .expect("recovery dir")
+        .join("probe");
+    std::fs::remove_file(&probe).unwrap();
+    let decoy = root.join("probe-decoy");
+    std::fs::write(&decoy, "different inode").unwrap();
+    std::fs::hard_link(&decoy, &probe).unwrap();
+}
+
+#[test]
+fn rename_link_order_follows_probe_inode_stability() {
+    for overwrite in [false, true] {
+        for destabilize in [false, true] {
+            let fx = Fx::new();
+            let etag = setup(&fx, Object::File, overwrite);
+            let root = fx.root.clone();
+            let at_publish = Arc::new(Mutex::new(None));
+            let record = Arc::clone(&at_publish);
+            let fx = fx.with_hook(move |step| {
+                if destabilize && step == Step::LinkProbed && !root.join("probe-decoy").exists() {
+                    swap_probe_inode(&root);
+                }
+                if step == Step::Publishing {
+                    *record.lock().unwrap() =
+                        Some(std::fs::symlink_metadata(root.join("src")).is_ok());
+                }
+                Ok(())
+            });
+            let _scope = FaultScope::new(&Shape::Link.faults(overwrite));
+            let value = rename_run(&fx, overwrite, etag.as_deref(), false).unwrap();
+            assert!(value.get("recovered").is_none(), "{value}");
+            let calls = FaultScope::calls();
+            let publish_at = calls
+                .iter()
+                .position(|call| *call == Primitive::PublishLink)
+                .expect("link publish");
+            let captures_before = calls[..publish_at]
+                .iter()
+                .filter(|call| **call == Primitive::Capture)
+                .count();
+            let src_public = at_publish.lock().unwrap().expect("publishing seam");
+            if destabilize {
+                assert!(!src_public, "vacate-first captures S before publish");
+                assert!(captures_before >= 1, "{calls:?}");
+            } else {
+                assert!(src_public, "link-first leaves S in place through publish");
+                assert_eq!(captures_before, if overwrite { 1 } else { 0 }, "{calls:?}");
+            }
+            assert_eq!(fx.get("dst"), SOURCE);
+            clean(&fx);
+        }
+    }
+}
+
+#[test]
+fn rename_intent_remains_when_destination_capture_fails_before_publish() {
+    let fx = Fx::new();
+    let etag = setup(&fx, Object::File, true);
+    let mut faults = Shape::Link.faults(true);
+    faults.retain(|(primitive, _, _)| *primitive != Primitive::Capture);
+    let _scope = FaultScope::with_after_effects(&faults, &[(Primitive::Capture, 1, Errno::EIO)]);
+    let error = rename_run(&fx, true, etag.as_deref(), false).unwrap_err();
+    assert_eq!(error.code, ErrorCode::UncertainOutcome);
+    assert_eq!(count(&FaultScope::calls(), Primitive::PublishLink), 0);
+    assert_eq!(fx.get("src"), SOURCE);
+    let dir = recovery_dirs(&fx.root)
+        .into_iter()
+        .next()
+        .expect("recovery");
+    let intent: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("INTENT")).unwrap()).unwrap();
+    assert_eq!(intent["order"], "link-first");
+    assert_eq!(intent["version"], 1);
+    assert_eq!(intent["source"], fx.p("src"));
+    assert_eq!(intent["destination"], fx.p("dst"));
+    assert_eq!(intent["slots"]["slot-1"], fx.p("dst"));
+    assert_eq!(intent["slots"]["slot-2"], fx.p("src"));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("slot-1")).unwrap(),
+        DESTINATION
+    );
+    assert!(!dir.join("slot-2").exists());
+    assert!(dir.join("INTENT").is_file());
+}
+
+#[test]
+fn rename_rejected_destination_name_is_invalid_input_before_capture() {
+    for overwrite in [false, true] {
+        let fx = Fx::new();
+        let etag = setup(&fx, Object::File, overwrite);
+        let before = snapshot(&fx.root);
+        let mut faults = vec![(Primitive::Move, 1, Errno::EINVAL)];
+        if overwrite {
+            faults.push((Primitive::ProbeExchange, 1, Errno::EINVAL));
+        }
+        let _scope = FaultScope::new(&faults);
+        let error = rename_run(&fx, overwrite, etag.as_deref(), false).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidInput, "{overwrite} {error:?}");
+        assert_eq!(count(&FaultScope::calls(), Primitive::Capture), 0);
+        assert_eq!(snapshot(&fx.root), before);
+        clean(&fx);
+    }
+    let fx = Fx::new();
+    fx.put("tree/sub/child", SOURCE);
+    let before = snapshot(&fx.root);
+    let _scope = FaultScope::new(&[(Primitive::Move, 1, Errno::EINVAL)]);
+    let error = fx
+        .ops
+        .rename(
+            &args(json!({"from":fx.p("tree"),"to":fx.p("elsewhere"),"overwrite":false})),
+            &fx.cancel,
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidInput, "{error:?}");
+    assert_eq!(count(&FaultScope::calls(), Primitive::Capture), 0);
+    assert_eq!(snapshot(&fx.root), before);
+    clean(&fx);
 }

@@ -37,6 +37,7 @@ pub mod policy;
 pub mod pool;
 pub mod read;
 mod recovery;
+pub(crate) use recovery::report_abandoned_recovery;
 pub mod redact;
 pub(crate) mod resolve;
 pub mod search;

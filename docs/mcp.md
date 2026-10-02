@@ -343,10 +343,12 @@ concurrent create at the vacant name survives; the original stays in recovery
 and the tool returns `uncertain_outcome`. If no safe publish primitive works,
 `unsafe_filesystem` is a definitive headless refusal: nothing was changed. A
 supervised error after acceptance remains unknown under the code-only outcome
-contract, including `unsafe_filesystem`. Overwrite rename first preflights privately,
-then captures and verifies the source. It exchanges that slot with the destination
-when supported; otherwise it captures/proves the destination too and publishes the
-source with no-replace rename or a non-following hard link. Unpublished user sources
+contract, including `unsafe_filesystem`. Overwrite rename first preflights privately.
+It exchanges the captured source with the destination when supported. Otherwise
+no-replace, and link publication on mounts that present a different inode per name
+(noino, sshfs), capture and prove both objects and publish the source fail-if-exists.
+Stable-inode link publication, including Linux NFS, links the still-public source
+onto the destination and then captures the source. Unpublished user sources
 are never disposed: they return only to the source name or stay named in recovery. Every captured
 object has a recorded origin; undo restores only to that origin, using identity
 proof to return a moved source to its original source name. An unsettled
@@ -368,9 +370,10 @@ when the confirmation child has exited. The child remains display-only; approval
 creates no read grant and recovery paths never reach the agent through these results.
 Inspect those paths using a shell, compare file contents, and restore them manually
 without overwriting newer files before retrying. Find crash leftovers by listing
-`.wsmp-recover-*` beside the target (a partial replace temp or probe is inside it). File tools
+`.wsmp-recover-*` beside the target (a partial replace temp, probe, or `INTENT` file is inside it). File tools
 permit reads and listing, but refuse writes, deletes, renames and creates inside recovery directories.
-Recovered objects are never automatically deleted; no startup recovery sweep runs.
+Recovered objects are never automatically deleted. Startup reports `.wsmp-recover-*` under
+configured roots and does not delete them.
 
 **Delete rule.** On every filesystem, files and symlinks are first captured into
 recovery, checked against a live held identity, and only that proven object is
@@ -400,14 +403,19 @@ permissions and link-count limits depend on the object. NFS and 9p
 reject rename flags but usually support links. exFAT and CIFS support
 no-replace rename only; exFAT has no hard links. Linux vfat supports both
 exchange and no-replace rename. macOS HFS+ supports RENAME_EXCL but not
-RENAME_SWAP. Overwrite rename works on no-replace-capable and link-only mounts:
-source and destination are captured and proven, then source is published into the
-vacant destination. On mounts with neither primitive, `unsafe_filesystem` refuses
-before moving anything; the unchanged public snapshot has no recovery residue.
-Plain file/symlink rename uses direct no-replace where supported (including
-supervised macOS files), otherwise vacate-first link publication. Directories move
-only with no-replace, never overwrite even an empty directory, and a directory
-moved into its resolved physical subtree refuses `invalid_input` before allocating R.
+RENAME_SWAP. Overwrite rename works on no-replace-capable and link-only mounts.
+No-replace and noino/sshfs link publication capture and prove source and destination,
+then publish source into the vacant destination. Stable-inode link publication links
+the still-public source onto the destination before capturing the source, so that
+name stays until the destination holds the object. On mounts with neither primitive,
+`unsafe_filesystem` refuses before moving anything; the unchanged public snapshot has
+no recovery residue. Plain file/symlink rename uses direct no-replace where supported
+(including supervised macOS files); otherwise it uses that same link order. A direct
+rename that returns EINVAL while no-replace works inside R is `invalid_input` (the
+destination name is not valid on this filesystem) and captures nothing. EINVAL while
+no-replace is also rejected stays `unsafe_filesystem`. Directories move only with
+no-replace, never overwrite even an empty directory, and a directory moved into its
+resolved physical subtree refuses `invalid_input` before allocating R.
 Private aliases are proven at their own names, including mounts where hard-link
 names present different inode numbers. A successful link syscall commits; a rename
 link error with ambiguous effect keeps/restores source and keeps destination, with
@@ -440,17 +448,30 @@ recovery (plain rename verification and exclusive-create cleanup instead keep a
 foreign object in recovery and report it). Unsupported
 NOREPLACE restore uses EEXIST-safe linkat followed by held-fd-proven private-slot
 unlink; directories and unsupported links stay in recovery with `uncertain_outcome`.
-(b2) recovery rename's SOURCE name is vacant from its initial capture until the
-operation ends. A concurrent create remains there on success; if it prevents a
-restore, it is kept and reported with `uncertain_outcome`. Independently of the
+(b2) vacate-first recovery rename and exchange-less no-replace overwrite leave the
+source name vacant from its capture until the operation ends. Link-first leaves the
+source name in place until the destination holds that object, and vacates only the
+destination on overwrite. A concurrent create remains at a vacant name on success;
+if it prevents a restore, it is kept and reported with `uncertain_outcome`. Independently of the
 filesystem, an in-place write into the inspected inode after the etag read can
 be lost on replace or delete: the etag proves content only up to that read.
 (d) a crash leaves `.wsmp-recover-*`, including a partial replace temp or
-`probe`, preflight dummies, or both links. A rename crash can leave source and
-destination in R with both public names vacant. The daemon logs R and both paths
-before the first capture; no durable intent file or replay runs. On stable-inode
-NFS, plain rename has this source-in-R crash shape only on link-only mounts;
-no-replace-capable mounts retain direct rename. A crash during exchange-less replace can leave the
+`probe`, preflight dummies, or both links. Before the first capture, exchange-less
+rename writes `INTENT` in that directory and fsyncs the file and the directory.
+It is one JSON object: `version` 1, `order` (`link-first` or `vacate-first`),
+`source`, `destination`, and `slots` mapping `slot-1` and `slot-2` to absolute paths.
+Link-first overwrite stores the destination in `slot-1` and the source in `slot-2`;
+other orders store the source in `slot-1`. Success removes `INTENT` with R. There is
+no replay. A rename crash can leave source and destination in R with both public
+names vacant (vacate-first) or only the destination vacant (link-first, before the
+link). Find R beside the destination, or in the startup log: wsmp reports each
+`.wsmp-recover-<10 alnum>` directory under a configured root and never deletes it.
+Read `INTENT`. `mv -n` a missing public path back from its slot, and do not overwrite
+a newer file. If both public names exist and the destination is a hard link of the
+source, the link may already have committed: compare, then remove only the private
+slots, `INTENT`, and the empty directory. On stable-inode NFS, plain rename uses
+link-first when rename flags are rejected; no-replace-capable mounts keep direct
+rename and do not write `INTENT`. A crash during exchange-less replace can leave the
 original and temp in recovery with the public name vacant; a delete crash can
 leave the captured file or symlink in recovery with its public name vacant.
 (e) unheld objects are never deleted and remain reported in recovery;

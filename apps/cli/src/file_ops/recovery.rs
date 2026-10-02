@@ -29,10 +29,15 @@
 //! SMB can lack links. Other Unix uses the no-replace/link ladder and fails closed.
 //! Overwrite rename preflights privately before capture: exchange or NR dummies,
 //! then link probes on the actual S/D objects. Without a usable method nothing
-//! public moves. Exchange-less rename vacates/proves S and D, then publishes S
-//! fail-if-exists; plain link rename vacates/proves S first. Direct NR plain
-//! rename (including supervised macOS files) needs no R. Directories use NR only,
-//! never overwrite, and resolved own-subtree requests refuse invalid_input.
+//! public moves. Exchange-less NR rename vacates/proves S and D, then publishes
+//! S fail-if-exists. Link publication is link-first when the probe alias and the
+//! held source fd are the same object (stable inodes, including Linux NFS): link
+//! S onto `to`, then capture S. noino/sshfs present a different inode per name
+//! and keep vacate-first. Direct NR plain rename (including supervised macOS
+//! files) needs no R. Directories use NR only, never overwrite, and resolved
+//! own-subtree requests refuse invalid_input. A direct Move that returns EINVAL
+//! while NR works inside R is a rejected destination name (`invalid_input`),
+//! not a missing capability, and captures nothing.
 //!
 //! Unsettled operations return uncertain_outcome; successful operations can report
 //! recovered paths, including delete. Find `.wsmp-recover-*` beside the target;
@@ -52,14 +57,20 @@
 //! (b) undo briefly vacates public names; a concurrent create blocks NOREPLACE/link
 //! restoration and leaves displaced data reported in recovery. Link restore cannot
 //! restore directories; unsupported links also stay in recovery with uncertainty.
-//! (b2) recovery rename's source is vacant from capture through operation end;
-//! exchange-less overwrite also vacates destination before publication.
+//! (b2) vacate-first recovery rename's source is vacant from capture through
+//! operation end; link-first leaves the source name in place until `to` holds
+//! that object. Exchange-less NR overwrite also vacates destination before
+//! publication. Link-first overwrite vacates only the destination, links S, then
+//! captures S.
 //! (d) a crash leaves the original and T (possibly partial tmp or renamed probe) in
 //! R with a vacant public name, a deleted file in R with its name vacant, or both
-//! published and private links. Rename can leave S/D in R and both public names
-//! vacant; preflight dummies can also survive a crash. R/s/d are logged before
-//! the first capture; no durable intent or automatic replay is maintained.
-//! Empty unreported R after power loss is harmless.
+//! published and private links. Rename can leave S/D in R with public names
+//! vacant (vacate-first) or only the destination vacant (link-first, before the
+//! link). An `INTENT` file in R, fsynced with the directory before the first
+//! capture, maps `slot-1`/`slot-2` to those paths. It is removed with R on
+//! success. There is no automatic replay. Startup reports `.wsmp-recover-*`
+//! under configured roots and never deletes them. Empty unreported R after
+//! power loss is harmless.
 //! (e) unheld objects are retained; they are never deleted by a snapshot.
 //! (f) on NFS another process holding the file open can leave a `.nfs*` entry in R;
 //! our own descriptors close before unlink (except T's pinned proof at the link
@@ -82,6 +93,7 @@
 //! commit across alias names on noino; rename keeps/restores S and keeps D.
 
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
@@ -205,6 +217,13 @@ impl Held {
         self.fd.is_some()
     }
 
+    /// Live inode of the held descriptor. Not a fault point: the link-order
+    /// decision compares this with the probe alias and must not consume `Identity`.
+    fn live_stat(&self) -> Option<Stat> {
+        let fd = self.fd.as_ref()?;
+        fstat(fd.as_fd()).ok().map(|raw| Stat::from_raw(&raw))
+    }
+
     /// Release this proof only after the live comparison; all duplicate handles
     /// owned by the caller must also close before the unlink syscall.
     pub(super) fn release(&mut self) {
@@ -234,6 +253,15 @@ pub(super) enum PublishMethod {
     Link,
 }
 
+/// Link publication order, learned from the source probe. Stable inodes prove
+/// the name created by `linkat` is the held source, so S can stay until `to`
+/// exists. Different presented inodes (noino, sshfs) cannot, and vacate first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LinkOrder {
+    LinkFirst,
+    VacateFirst,
+}
+
 /// The unpublished object has exactly one owner. Generated temps are disposable;
 /// a user's source always returns to its recorded origin or stays reported in R.
 pub(super) enum Published<'a> {
@@ -259,6 +287,8 @@ pub(super) struct RecoveryDir {
     /// link probe (see `calibrate_counts`). `Some(true)` is the only state that lets a count
     /// veto an alias unlink.
     counts_reliable: Option<bool>,
+    /// Set by the first link probe (the source object on rename). `None` until then.
+    link_order: Option<LinkOrder>,
 }
 
 /// State to return to when a capture provably changed nothing.
@@ -323,6 +353,7 @@ impl RecoveryDir {
                 finished: false,
                 last_errno: None,
                 counts_reliable: None,
+                link_order: None,
             });
         }
     }
@@ -513,7 +544,20 @@ impl RecoveryDir {
             AtFlags::AT_SYMLINK_NOFOLLOW,
         )
         .map_err(FileError::errno)?;
-        let mut held = Held::open(&self.dir, &alias.name, Stat::from_raw(&raw))?;
+        let alias_stat = Stat::from_raw(&raw);
+        // The first probe is the source. A test may swap `probe` at LinkProbed,
+        // after count calibration, so this comparison sees that inode.
+        if self.link_order.is_none() {
+            let stable = identity
+                .live_stat()
+                .is_some_and(|live| live.same_object(&alias_stat));
+            self.link_order = Some(if stable {
+                LinkOrder::LinkFirst
+            } else {
+                LinkOrder::VacateFirst
+            });
+        }
+        let mut held = Held::open(&self.dir, &alias.name, alias_stat)?;
         // The original proof pins its inode through alias disposal (the accepted
         // per-vnode NFS exception). The alias is proven at its OWN name on noino.
         if !self.dispose_alias(ops, &alias, &mut held) {
@@ -602,6 +646,115 @@ impl RecoveryDir {
             return Err(self.uncertain());
         }
         result
+    }
+
+    /// Private NR probe for a direct Move that returned EINVAL. `Ok(true)` means
+    /// the filesystem accepts no-replace, so that EINVAL was the destination
+    /// name rather than a missing flag.
+    pub(super) fn noreplace_works(&mut self, ops: &FileOps, anchor: &Resolved) -> FileResult<bool> {
+        let (mut slot, mut held) = self.dummy("preflight-1", anchor)?;
+        let probe = OsString::from("probe-nr");
+        let result = match no_replace(
+            self.dir.as_fd(),
+            &slot.name,
+            self.dir.as_fd(),
+            &probe,
+            Primitive::ProbeNoReplace,
+        ) {
+            Ok(()) => {
+                self.adopt_name(&mut slot, probe);
+                Ok(true)
+            }
+            Err(errno) if is_unsupported(errno) => Ok(false),
+            Err(errno) => {
+                if matches!(
+                    fstatat(
+                        self.dir.as_fd(),
+                        slot.name.as_os_str(),
+                        AtFlags::AT_SYMLINK_NOFOLLOW
+                    ),
+                    Err(Errno::ENOENT)
+                ) && fstatat(
+                    self.dir.as_fd(),
+                    probe.as_os_str(),
+                    AtFlags::AT_SYMLINK_NOFOLLOW,
+                )
+                .is_ok()
+                {
+                    self.adopt_name(&mut slot, probe);
+                }
+                Err(FileError::errno(errno))
+            }
+        };
+        self.dispose(ops, &slot, &mut held);
+        if !self.settled() {
+            return Err(self.uncertain());
+        }
+        result
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_link_order(&mut self, order: LinkOrder) {
+        self.link_order = Some(order);
+    }
+
+    /// Crash map for the slots this rename will capture. Fsynced before any
+    /// public name moves. Not added to `kept`: success removes it with R.
+    fn write_rename_intent(
+        &self,
+        order: LinkOrder,
+        from: &Resolved,
+        to: &Resolved,
+        overwrite: bool,
+    ) -> FileResult<()> {
+        let source = from.full_path();
+        let destination = to.full_path();
+        let (first, second) = match order {
+            LinkOrder::LinkFirst if overwrite => (destination.as_path(), Some(source.as_path())),
+            _ => (source.as_path(), overwrite.then_some(destination.as_path())),
+        };
+        let slots = match second {
+            Some(path) => json!({
+                "slot-1": first.to_string_lossy(),
+                "slot-2": path.to_string_lossy(),
+            }),
+            None => json!({ "slot-1": first.to_string_lossy() }),
+        };
+        let body = serde_json::to_vec(&json!({
+            "version": 1,
+            "order": match order {
+                LinkOrder::LinkFirst => "link-first",
+                LinkOrder::VacateFirst => "vacate-first",
+            },
+            "source": source.to_string_lossy(),
+            "destination": destination.to_string_lossy(),
+            "slots": slots,
+        }))
+        .expect("rename intent serializes");
+        self.persist_intent(&body)
+    }
+
+    fn persist_intent(&self, body: &[u8]) -> FileResult<()> {
+        let fd = openat(
+            self.dir.as_fd(),
+            "INTENT",
+            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        )
+        .map_err(FileError::errno)?;
+        let mut file = std::fs::File::from(fd);
+        file.write_all(body)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        nix::unistd::fsync(self.dir.as_fd()).map_err(FileError::errno)?;
+        Ok(())
+    }
+
+    fn discard_intent(&mut self) {
+        match unlinkat(self.dir.as_fd(), "INTENT", UnlinkatFlags::NoRemoveDir) {
+            Ok(()) | Err(Errno::ENOENT) => {}
+            Err(_) => self.unsettled = true,
+        }
     }
 
     fn publish_slot(
@@ -871,6 +1024,19 @@ impl RecoveryDir {
         method: Option<PublishMethod>,
         cancel: &Cancel,
     ) -> FileResult<bool> {
+        if matches!(method, Some(PublishMethod::Link))
+            && self.link_order == Some(LinkOrder::LinkFirst)
+        {
+            return self.commit_link_first(ops, from, to, src, dst, cancel);
+        }
+        if method.is_some() {
+            self.write_rename_intent(
+                self.link_order.unwrap_or(LinkOrder::VacateFirst),
+                from,
+                to,
+                dst.is_some(),
+            )?;
+        }
         ops.step(Step::Vacating)?;
         cancel.check()?; // last cancellation point, BEFORE S capture
         tracing::info!(recovery = %self.path().display(), source = %from.full_path().display(),
@@ -921,6 +1087,180 @@ impl RecoveryDir {
         }
         self.keep(&slot);
         Err(self.uncertain())
+    }
+
+    /// Stable-inode link rename. Overwrite captures D only, links the still-public
+    /// source onto `to`, then captures S. Plain rename links first and never
+    /// vacates S before `to` exists. A lost link reply is a commit when `to`
+    /// presents the held source inode.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_link_first(
+        &mut self,
+        ops: &FileOps,
+        from: &Resolved,
+        to: &Resolved,
+        src: &mut Held,
+        mut dst: Option<&mut Held>,
+        cancel: &Cancel,
+    ) -> FileResult<bool> {
+        self.write_rename_intent(LinkOrder::LinkFirst, from, to, dst.is_some())?;
+        fault(Primitive::PublishPrepare).map_err(FileError::errno)?;
+        tracing::info!(recovery = %self.path().display(), source = %from.full_path().display(),
+            destination = %to.full_path().display(), order = "link-first",
+            "rename capture; manual recovery after a crash");
+        ops.step(Step::Vacating)?;
+        cancel.check()?;
+        if !self.holds_name(&from.dir, &from.name, src) {
+            return Err(self.conflict_or_uncertain("replaced"));
+        }
+        let mut captured_dest = None;
+        if dst.is_some() {
+            let _ = ops.step(Step::DestinationVacating);
+            let mark = self.checkpoint();
+            let Some(slot) = self.capture(&to.dir, &to.name, &to.full_path()) else {
+                return Err(match self.abort_capture(mark) {
+                    Some(Errno::ENOENT) => FileError::conflict("gone"),
+                    Some(errno) => FileError::errno(errno),
+                    None => self.uncertain(),
+                });
+            };
+            let dest_matches = self.holds(&slot, dst.as_mut().unwrap());
+            if !dest_matches {
+                self.undo_captured_destination(ops, &Some(slot), src, dst.as_deref_mut());
+                return Err(self.conflict_or_uncertain("replaced"));
+            }
+            // One directory entry under two names: capturing D took S as well.
+            let source_went_with_dest =
+                !self.holds_name(&from.dir, &from.name, src) && self.holds(&slot, src);
+            if source_went_with_dest {
+                self.undo_captured_destination(ops, &Some(slot), src, dst.as_deref_mut());
+                return Err(self.conflict_or_uncertain("gone"));
+            }
+            captured_dest = Some(slot);
+        }
+        let _ = ops.step(Step::DestinationVacated);
+        let _ = ops.step(Step::Publishing);
+        if !self.holds_name(&from.dir, &from.name, src) {
+            self.undo_captured_destination(ops, &captured_dest, src, dst.as_deref_mut());
+            return Err(self.conflict_or_uncertain("replaced"));
+        }
+        let linked = run(Primitive::PublishLink, || {
+            linkat(
+                from.dir.as_fd(),
+                from.name.as_os_str(),
+                to.dir.as_fd(),
+                to.name.as_os_str(),
+                AtFlags::empty(),
+            )
+        });
+        let committed = linked.is_ok() || self.holds_name(&to.dir, &to.name, src);
+        if !committed {
+            let errno = linked.err().unwrap_or(Errno::EIO);
+            self.undo_captured_destination(ops, &captured_dest, src, dst.as_deref_mut());
+            if !self.settled() {
+                return Err(self.uncertain());
+            }
+            return Err(if errno == Errno::EEXIST {
+                FileError::errno(Errno::EEXIST)
+            } else if is_link_unsupported(errno) {
+                FileError::unsafe_filesystem()
+            } else {
+                FileError::errno(errno)
+            });
+        }
+        // `to` holds the source. Capture S before Renamed: a racer that replaces
+        // both public names after the link would otherwise orphan the inode.
+        if !self.holds_name(&from.dir, &from.name, src) {
+            if self.holds_name(&to.dir, &to.name, src) {
+                src.release();
+                if let (Some(slot), Some(held)) = (&captured_dest, dst.as_deref_mut()) {
+                    self.dispose(ops, slot, held);
+                }
+                return Ok(true);
+            }
+            if let Some(slot) = &captured_dest {
+                self.keep(slot);
+            }
+            self.unsettled = true;
+            return Err(self.uncertain());
+        }
+        let mark = self.checkpoint();
+        let Some(source_slot) = self.capture(&from.dir, &from.name, &from.full_path()) else {
+            match self.abort_capture(mark) {
+                Some(Errno::ENOENT) if self.holds_name(&to.dir, &to.name, src) => {
+                    src.release();
+                    if let (Some(slot), Some(held)) = (&captured_dest, dst.as_deref_mut()) {
+                        self.dispose(ops, slot, held);
+                    }
+                    return Ok(true);
+                }
+                _ => {
+                    if let Some(slot) = &captured_dest {
+                        self.keep(slot);
+                    }
+                    self.unsettled = true;
+                    return Err(self.uncertain());
+                }
+            }
+        };
+        let _ = ops.step(Step::Captured);
+        let _ = ops.step(Step::Vacated);
+        let _ = ops.step(Step::Renamed);
+        let _ = ops.step(Step::Linked);
+        if !self.holds(&source_slot, src) {
+            src.release();
+            if self.restore(ops, &source_slot) {
+                let _ = ops.step(Step::Restored);
+            }
+            if let (Some(slot), Some(held)) = (&captured_dest, dst.as_deref_mut()) {
+                self.dispose(ops, slot, held);
+            }
+            return self.ok_if_settled();
+        }
+        match (&captured_dest, dst.as_deref_mut()) {
+            (Some(slot), Some(held)) => {
+                self.dispose_link_move(ops, &source_slot, src, slot, held);
+            }
+            _ => {
+                self.dispose_alias(ops, &source_slot, src);
+            }
+        }
+        // The link committed. Residue (last alias, failed cleanup) is `recovered`.
+        Ok(true)
+    }
+
+    fn conflict_or_uncertain(&mut self, current: &str) -> FileError {
+        if self.settled() {
+            FileError::conflict(current)
+        } else {
+            self.uncertain()
+        }
+    }
+
+    fn ok_if_settled(&mut self) -> FileResult<bool> {
+        if self.settled() {
+            Ok(true)
+        } else {
+            Err(self.uncertain())
+        }
+    }
+
+    fn undo_captured_destination(
+        &mut self,
+        ops: &FileOps,
+        slot: &Option<Slot>,
+        src: &mut Held,
+        dst: Option<&mut Held>,
+    ) {
+        src.release();
+        if let Some(held) = dst {
+            held.release();
+        }
+        if let Some(slot) = slot
+            && self.restore(ops, slot)
+        {
+            let _ = ops.step(Step::Restored);
+        }
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1346,6 +1686,12 @@ impl RecoveryDir {
     pub(super) fn finish(&mut self) -> Vec<String> {
         if !self.finished {
             self.finished = true;
+            // Success and clean refusals drop the crash map with R. An unsettled
+            // operation keeps INTENT so a crash between capture and publish can
+            // be put back by hand.
+            if !self.unsettled {
+                self.discard_intent();
+            }
             if self.unsettled
                 || run(Primitive::Rmdir, || {
                     unlinkat(
@@ -1386,6 +1732,52 @@ impl RecoveryDir {
 
     pub(super) fn settled(&self) -> bool {
         !self.unsettled && self.kept.is_empty()
+    }
+}
+
+/// Report `.wsmp-recover-*` directories under configured roots. Never deletes.
+/// Bounded so a large root cannot stall daemon startup; symlinks are not followed.
+pub(crate) fn report_abandoned_recovery(roots: &[PathBuf]) {
+    for root in roots {
+        let mut reported = 0usize;
+        let mut visited = 0usize;
+        walk_recovery(root, &mut reported, &mut visited);
+    }
+}
+
+fn walk_recovery(dir: &Path, reported: &mut usize, visited: &mut usize) {
+    if *reported >= 32 || *visited >= 10_000 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries {
+        if *reported >= 32 || *visited >= 10_000 {
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        *visited += 1;
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(suffix) = name.strip_prefix(".wsmp-recover-")
+            && suffix.len() == 10
+            && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            tracing::warn!(
+                recovery = %entry.path().display(),
+                "abandoned .wsmp-recover directory; read INTENT and restore with mv -n; it will not be deleted"
+            );
+            *reported += 1;
+            continue;
+        }
+        walk_recovery(&entry.path(), reported, visited);
     }
 }
 
@@ -1876,5 +2268,21 @@ mod tests {
         let _faults = FaultScope::new(&[(Primitive::Mkdir, 1, Errno::EEXIST)]);
         let mut recovery = RecoveryDir::new(&parent, &fx.root).unwrap();
         assert!(recovery.finish().is_empty());
+    }
+
+    #[test]
+    fn startup_report_names_abandoned_recovery_and_leaves_it() {
+        let fx = Fx::new();
+        let dir = fx.root.join(".wsmp-recover-abcdefghij");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("INTENT"), "{\"version\":1}\n").unwrap();
+        std::fs::write(fx.root.join(".wsmp-recover-not-a-dir"), "file").unwrap();
+        std::os::unix::fs::symlink(&dir, fx.root.join("link-to-recover")).unwrap();
+        report_abandoned_recovery(&[fx.root.clone()]);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("INTENT")).unwrap(),
+            "{\"version\":1}\n"
+        );
+        assert!(dir.join("INTENT").is_file());
     }
 }
