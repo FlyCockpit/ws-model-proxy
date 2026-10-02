@@ -246,16 +246,18 @@ For each request, every local member that has no affinity hit for it is:
 
 Token-mode KV eviction feedback lowers the effective budget when a successful
 local pooled request continues a digest-proven, live-tip warm session whose
-previous matched record confirmed engine caching. Both the expected prefix and
+previous matched record confirmed engine caching. Warm protection and
+residency placement both read that effective K. Both the expected prefix and
 the actual reported prompt must be at least `protectMinTokens`; the record must
-be within that engine's protection window. A reported cache read of at most 5%
-of the expected prefix is an eviction observation. The first observation on a
-capacity that is not already cut only arms feedback from that session; a second
-observation from a different session lowers K. Later observations from the same
-session are ignored, including after a live cut, so one conversation's template
-rewrites cannot walk K down. Two independent sessions still cut. Pending
-corroboration lasts until `expiresAt` (30 minutes from the arming write). An
-expired row is a new first miss, matching readers that already ignore expiry.
+be within that engine's protection window and not older than an engine restart
+or prefix-cache counter drop. A reported cache read of at most 5% of the
+**reusable prompt prefix** (not prompt+completion) is a miss; a higher cache
+read is a hit. Each session is counted once per row lifetime (at most 16). The
+first unique miss only arms; a later unique miss steps 5% only when
+misses/continuations in that window are at least 15%. A single 5% step decays
+in 3 minutes at `0.5 / 30 min`. Alternating two sessions cannot walk K to the
+floor. Pending corroboration lasts until `expiresAt` (30 minutes from the
+arming write). An expired row is a new first miss.
 Chat templates that rewrite earlier turns (Qwen3 and DeepSeek-R1 strip reasoning;
 gpt-oss drops earlier analysis channels) can look like a miss on a long confirmed
 session when the user sends a follow-up. Follow-ups from that same session do not
@@ -292,23 +294,25 @@ excluded: they are cumulative, include bypass traffic and cannot be attributed
 to a matched prefix. Unconfirmed records cannot count; remembering a zero-read
 miss removes confirmation from that prefix.
 
-After a second distinct session corroborates, each further miss from a new
-session cuts 5% of the **reported** K (`KV_EVICTION_STEP = 0.05`), with at most
-10 distinct sessions per flush and a 50% maximum cut (`KV_EVICTION_MAX_CUT`).
+After a second distinct session corroborates at a ≥15% miss ratio, each further
+qualifying miss from a new session cuts 5% of the **reported** K
+(`KV_EVICTION_STEP = 0.05`), with at most 10 distinct sessions per flush, 16
+across the row lifetime, and a 50% maximum cut (`KV_EVICTION_MAX_CUT`).
 The integer effective budget stays between `ceil(0.5 * K)` and K. Cuts recover
 linearly at `0.5 / 1_800_000` per millisecond: a full cut recovers in exactly
-30 minutes (`KV_EVICTION_RECOVERY_MS`). Hits write nothing. Only the PROTECTED
-threshold (`W_protected + r > K_eff x 0.9`) uses the effective budget; the equity
-shares, and so which sessions are protected, stay on the reported K, so evidence
-can only make a member PROTECTED sooner (monotone), never release a protected
-session. A lower threshold redirects new sessions, which reduces evictions until
-evidence stops. The 50% cap, not the 10-per-flush clamp, bounds the cut: a burst
-of confirmed misses (for example after an engine restart that flushed every
-cache) can reach the cap within seconds, and the cut then recovers over 30
-minutes. Distinct sessions whose misses are small but non-zero can each cut
-once, and a single-member pool (nowhere to redirect) can hold the cut at the
-cap while it stays overloaded. All of this
-stays in the fail-safe direction: protection never blocks a request.
+30 minutes (`KV_EVICTION_RECOVERY_MS`); a single 5% step decays in 3 minutes.
+Hits count as continuations so the miss ratio stays low; they do not step K
+and they do not refresh the decay clock. Warm protection's PROTECTED
+threshold (`W_protected + r > K_eff x 0.9`) and residency placement both use
+the effective budget; the equity shares, and so which sessions are protected,
+stay on the reported K, so evidence can only make a member PROTECTED sooner
+(monotone), never release a protected session. A lower threshold redirects new
+sessions, which reduces evictions until evidence stops. An engine restart or
+prefix-cache counter drop clears the row and ignores older tips, so a flush
+does not walk K to the floor. Distinct sessions whose misses are small but
+non-zero can each cut once after the ratio threshold, and a single-member pool
+(nowhere to redirect) can hold the cut at the cap while it stays overloaded.
+All of this stays in the fail-safe direction: protection never blocks a request.
 Reported-budget changes automatically scale the relative cut. Slot mode,
 including llama.cpp, is unaffected. Budgets must be positive int32 counts;
 malformed budgets select slot mode, and corrupt stored cuts are clamped.

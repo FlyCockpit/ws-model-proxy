@@ -574,6 +574,8 @@ const endpointLoadSchema = z
     deferred: nonNegativeCountSchema.optional(),
     prefixCacheHitsDelta: byteCounterSchema.optional(),
     prefixCacheQueriesDelta: byteCounterSchema.optional(),
+    /** Engine prefix-cache counters dropped (restart / flush). Not a delta. */
+    prefixCacheReset: z.literal(true).optional(),
     source: z.enum([
       "llama.cpp-slots",
       "llama.cpp-metrics",

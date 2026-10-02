@@ -490,6 +490,7 @@ mod tests {
             deferred: Some(LOAD_COUNT_MAX),
             prefix_cache_hits_delta: Some(u64::MAX),
             prefix_cache_queries_delta: Some(BYTE_COUNTER_MAX),
+            prefix_cache_reset: None,
             source: LoadSource::VllmMetrics,
             ts: "2026-09-28T12:00:01.000Z".to_string(),
         }

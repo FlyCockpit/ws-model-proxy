@@ -258,7 +258,10 @@ ALTER TABLE capacity_kv_eviction DROP CONSTRAINT IF EXISTS capacity_kv_eviction_
 ALTER TABLE capacity_kv_eviction ADD CONSTRAINT capacity_kv_eviction_shape_check CHECK (
   "cutFraction" >= 0 AND "cutFraction" <= 1
   AND length("capacityId") BETWEEN 1 AND 128
-  AND length("lastSessionId") BETWEEN 1 AND 128
+  AND cardinality("sessionIds") <= 16
+  AND "missCount" >= 0
+  AND "continuationCount" >= 0
+  AND "missCount" <= "continuationCount"
   AND "expiresAt" >= "observedAt"
 );
 

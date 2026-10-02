@@ -1020,6 +1020,9 @@ pub struct EndpointLoad {
     pub prefix_cache_hits_delta: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix_cache_queries_delta: Option<u64>,
+    /// Engine prefix-cache counters dropped (restart / flush). Not a delta.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_cache_reset: Option<bool>,
     pub source: crate::engine::LoadSource,
     pub ts: String,
 }
@@ -3623,6 +3626,7 @@ mod relay_27_vectors {
             deferred: None,
             prefix_cache_hits_delta: Some(50),
             prefix_cache_queries_delta: Some(200),
+            prefix_cache_reset: None,
             source: LoadSource::VllmMetrics,
             ts: "2026-09-28T12:00:01.000Z".to_string(),
         };
@@ -3647,6 +3651,7 @@ mod relay_27_vectors {
             deferred: None,
             prefix_cache_hits_delta: None,
             prefix_cache_queries_delta: None,
+            prefix_cache_reset: None,
             source: LoadSource::Custom,
             ts: "2026-09-28T12:00:01.000Z".to_string(),
         };

@@ -114,7 +114,11 @@ import {
   SERVED_MODEL_HEADER,
   withResponseHeaders,
 } from "./external-route.js";
-import { observeKvEviction, qualifiesAsEvictionEvidence } from "./kv-eviction-feedback.js";
+import {
+  evictionContinuationKind,
+  kvEvictionResetMs,
+  observeKvEviction,
+} from "./kv-eviction-feedback.js";
 import {
   MODEL_API_MAX_REQUEST_BODY_BYTES,
   MODEL_API_RELAY_TIMEOUT_MS,
@@ -7135,22 +7139,22 @@ async function relayPool({
             const sessionId = affinityTarget
               ? affinityDecision?.matchedSessionIds?.[affinityTarget.executionTargetId]
               : undefined;
-            if (
-              affinityTarget &&
-              capacity &&
-              sessionId &&
-              qualifiesAsEvictionEvidence({
-                policy: protectionPolicy,
-                engineKind: capacity.engineKind,
-                kvBudgetTokens: capacity.kvBudgetTokens,
-                ok: terminal.ok,
-                usage,
-                evidence: affinityDecision?.prefixEvidence?.[affinityTarget.executionTargetId],
-                now: attemptDispatchedAt,
-              })
-            )
+            const continuationKind =
+              affinityTarget && capacity && sessionId
+                ? evictionContinuationKind({
+                    policy: protectionPolicy,
+                    engineKind: capacity.engineKind,
+                    kvBudgetTokens: capacity.kvBudgetTokens,
+                    ok: terminal.ok,
+                    usage,
+                    evidence: affinityDecision?.prefixEvidence?.[affinityTarget.executionTargetId],
+                    now: attemptDispatchedAt,
+                    resetAtMs: kvEvictionResetMs(capacity.id),
+                  })
+                : null;
+            if (affinityTarget && capacity && sessionId && continuationKind)
               // The same owner id the protection read filters by.
-              observeKvEviction(capacity.id, target.ownerUserId, sessionId);
+              observeKvEviction(capacity.id, target.ownerUserId, sessionId, continuationKind);
           } catch {
             /* Disposable feedback never changes the response. */
           }

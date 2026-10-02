@@ -617,6 +617,10 @@ fn counter_delta(previous: Option<f64>, current: Option<f64>) -> Option<u64> {
     (current >= previous).then(|| saturating_byte_counter((current - previous).round() as u64))
 }
 
+fn counter_reset(previous: Option<f64>, current: Option<f64>) -> bool {
+    matches!((previous, current), (Some(previous), Some(current)) if current < previous)
+}
+
 /// Decide whether a reading goes out: on change, or every
 /// `LOAD_REFRESH_INTERVAL` when unchanged. Prefix-cache counters become
 /// deltas against the last frame the relay loop accepted. The caller commits
@@ -633,8 +637,14 @@ fn next_load_frame(
         state.prefix_queries_total,
         reading.prefix_cache_queries_total,
     );
-    let changed_counters =
-        hits_delta.is_some_and(|delta| delta > 0) || queries_delta.is_some_and(|delta| delta > 0);
+    let prefix_cache_reset = counter_reset(state.prefix_hits_total, reading.prefix_cache_hits_total)
+        || counter_reset(
+            state.prefix_queries_total,
+            reading.prefix_cache_queries_total,
+        );
+    let changed_counters = prefix_cache_reset
+        || hits_delta.is_some_and(|delta| delta > 0)
+        || queries_delta.is_some_and(|delta| delta > 0);
     let due = match &state.last_sent {
         None => true,
         Some((at, last)) => {
@@ -657,6 +667,7 @@ fn next_load_frame(
         deferred: reading.deferred,
         prefix_cache_hits_delta: hits_delta,
         prefix_cache_queries_delta: queries_delta,
+        prefix_cache_reset: prefix_cache_reset.then_some(true),
         source: reading.source,
         ts: ts.to_string(),
     })

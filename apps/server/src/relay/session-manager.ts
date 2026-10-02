@@ -32,6 +32,10 @@ import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/opena
 import { parseStoredRemoteEngineAdapters } from "@ws-model-proxy/api/lib/remote-engine-adapters";
 import type { SupervisedCommandStatus } from "@ws-model-proxy/api/lib/supervised-command-types";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
+import {
+  resetKvEvictionForCliDevice,
+  resetKvEvictionForEndpoint,
+} from "../model-api/kv-eviction-feedback.js";
 import { startRelayAttempt } from "../model-api/relay-executor.js";
 import { EngineLoadHistoryStore } from "./engine-load-history.js";
 import { observeEngineLoadRollup } from "./engine-load-rollup.js";
@@ -841,6 +845,9 @@ export class RelaySessionManager {
         clearTimeout(session.unauthenticatedTimer);
         this.reconcileInteractiveGrants(session);
         this.replaceDuplicateSession(session);
+        void resetKvEvictionForCliDevice(registration.cliDeviceId, now).catch(() => {
+          /* Disposable: hello must not fail because evidence reset did. */
+        });
         if (stalePolicy) {
           void this.refreshFeatureGrants(registration.cliDeviceId).catch((error: unknown) => {
             console.error(
@@ -1655,6 +1662,11 @@ export class RelaySessionManager {
           queriesDelta,
         );
         return;
+      }
+      if (load.prefixCacheReset && cliDeviceId) {
+        void resetKvEvictionForEndpoint(cliDeviceId, load.endpointSlug, now).catch(() => {
+          /* Disposable: load frames must not fail closed on evidence reset. */
+        });
       }
       if (!previous && session.endpointLoad.size >= ENDPOINT_LOAD_MAX_KEYS) return;
       // "Sustained" waiting counts consecutive accepted frames. A gap longer

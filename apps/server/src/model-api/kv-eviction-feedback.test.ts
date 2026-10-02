@@ -99,13 +99,18 @@ describe("eviction evidence", () => {
       expected: true,
     },
     {
-      name: "5% boundary",
-      patch: { usage: { ...valid.usage, cacheReadTokens: 400 } },
+      name: "5% boundary of prompt",
+      patch: { usage: { ...valid.usage, cacheReadTokens: 450 } },
       expected: true,
     },
     {
-      name: "above 5%",
-      patch: { usage: { ...valid.usage, cacheReadTokens: 401 } },
+      name: "above 5% of prompt",
+      patch: { usage: { ...valid.usage, cacheReadTokens: 451 } },
+      expected: false,
+    },
+    {
+      name: "stale vs restart reset",
+      patch: { resetAtMs: now.getTime() + 1 },
       expected: false,
     },
     {
@@ -128,7 +133,7 @@ describe("eviction evidence", () => {
     expect(qualifiesAsEvictionEvidence({ ...valid, ...patch })).toBe(expected),
   );
 
-  it("a 12k reported prefix with an 18k estimate and 700 cached tokens is not evidence", () => {
+  it("a 12k reported prefix with an 18k estimate and 700 cached tokens is a hit on prompt", () => {
     const usage = { promptTokens: 12_000, cacheReadTokens: 700 };
     expect(
       qualifiesAsEvictionEvidence({
@@ -142,6 +147,23 @@ describe("eviction evidence", () => {
         ...valid,
         usage,
         evidence: { ...valid.evidence!, tokens: 18_000 },
+      }),
+    ).toBe(false);
+  });
+
+  it("reasoning follow-up with large C is not evidence when cache read covers P", () => {
+    expect(
+      qualifiesAsEvictionEvidence({
+        ...valid,
+        usage: { promptTokens: 9_000, cacheReadTokens: 9_000 },
+        evidence: { ...valid.evidence!, tokens: 209_000 },
+      }),
+    ).toBe(false);
+    expect(
+      qualifiesAsEvictionEvidence({
+        ...valid,
+        usage: { promptTokens: 9_000, cacheReadTokens: 0 },
+        evidence: { ...valid.evidence!, tokens: 209_000 },
       }),
     ).toBe(true);
   });
@@ -262,17 +284,18 @@ describe("buffered recorder", () => {
       ownerId: "o",
       sessionIds: ["s"],
       now,
+      kind: "miss",
     });
     for (let i = 0; i < 7; i++) r.observe("c", "o", `t${i}`);
     await vi.advanceTimersByTimeAsync(999);
     expect(r.write).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
-    expect(r.write).toHaveBeenCalledTimes(2);
+    expect(r.write).toHaveBeenCalledTimes(8);
     expect(r.write).toHaveBeenLastCalledWith(
-      expect.objectContaining({ sessionIds: ["t0", "t1", "t2", "t3", "t4", "t5", "t6"] }),
+      expect.objectContaining({ sessionIds: ["t6"], kind: "miss" }),
     );
     await vi.advanceTimersByTimeAsync(1000);
-    expect(r.write).toHaveBeenCalledTimes(2);
+    expect(r.write).toHaveBeenCalledTimes(8);
     expect(vi.getTimerCount()).toBe(0);
   });
   it("coalesces the same session in the buffer", async () => {
@@ -329,11 +352,12 @@ describe("buffered recorder", () => {
     for (let i = 0; i < 100; i++) r.observe("a", "o", `s${i}`);
     r.observe("b", "o", "t");
     await vi.advanceTimersByTimeAsync(1000);
-    expect(r.write).toHaveBeenCalledTimes(4);
+    expect(r.write).toHaveBeenCalledTimes(13);
     expect(r.write).toHaveBeenCalledWith(
       expect.objectContaining({
         capacityId: "a",
-        sessionIds: Array.from({ length: 10 }, (_, i) => `s${i}`),
+        sessionIds: ["s9"],
+        kind: "miss",
       }),
     );
     expect(r.write).toHaveBeenLastCalledWith(
@@ -372,19 +396,20 @@ describe("buffered recorder", () => {
     expect(r.write).toHaveBeenCalledTimes(1);
     settle!();
     await vi.advanceTimersByTimeAsync(1000);
-    expect(r.write).toHaveBeenCalledTimes(2);
+    expect(r.write).toHaveBeenCalledTimes(11);
     expect(r.write).toHaveBeenLastCalledWith(
       expect.objectContaining({
         capacityId: "a",
-        sessionIds: Array.from({ length: 10 }, (_, i) => `s${i}`),
+        sessionIds: ["s9"],
+        kind: "miss",
       }),
     );
     await vi.advanceTimersByTimeAsync(1000);
-    expect(r.write).toHaveBeenCalledTimes(2);
+    expect(r.write).toHaveBeenCalledTimes(11);
     expect(vi.getTimerCount()).toBe(0);
     r.observe("a", "o", "s");
     await vi.advanceTimersByTimeAsync(0);
-    expect(r.write).toHaveBeenCalledTimes(3);
+    expect(r.write).toHaveBeenCalledTimes(12);
     expect(r.write).toHaveBeenLastCalledWith(expect.objectContaining({ sessionIds: ["s"] }));
   });
   it("delayed failures that settle together still log at most once per minute", async () => {
@@ -432,11 +457,15 @@ describe("buffered recorder", () => {
     expect(r.write).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
   });
-  it("hits leave K untouched without any writer call", async () => {
+  it("hits flush as continuations without counting as misses", async () => {
     const r = setup();
-    if (qualifiesAsEvictionEvidence({ ...valid, usage: { ...valid.usage, cacheReadTokens: 8000 } }))
-      r.observe("a", "o", "s");
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(r.write).not.toHaveBeenCalled();
+    expect(
+      qualifiesAsEvictionEvidence({ ...valid, usage: { ...valid.usage, cacheReadTokens: 8000 } }),
+    ).toBe(false);
+    r.observe("a", "o", "s", "hit");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(r.write).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionIds: ["s"], kind: "hit" }),
+    );
   });
 });

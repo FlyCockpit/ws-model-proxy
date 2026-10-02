@@ -1408,15 +1408,16 @@ model PoolMemberRoutingVerdict {
 
 /// Disposable class-H cache: no FK, no deletion drain. Readers ignore expiry;
 /// retention removes rows expired more than an hour ago, including orphans.
-/// `lastSessionId` is the session that last armed or cut; same-session misses
-/// are ignored until the row expires or fully recovers.
+/// `sessionIds` is the bounded unique-session set for this row lifetime.
 model CapacityKvEviction {
-  capacityId    String   @id
-  userId        String
-  cutFraction   Float
-  observedAt    DateTime
-  expiresAt     DateTime
-  lastSessionId String
+  capacityId        String   @id
+  userId            String
+  cutFraction       Float
+  observedAt        DateTime
+  expiresAt         DateTime
+  sessionIds        String[] @default([])
+  missCount         Int      @default(0)
+  continuationCount Int      @default(0)
 
   @@index([userId])
   @@index([expiresAt])
