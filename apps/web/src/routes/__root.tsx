@@ -161,7 +161,7 @@ function RootComponent() {
             }}
           >
             <Header />
-            <main className="min-h-0 min-w-0 overflow-y-auto overflow-x-clip">
+            <main className="min-h-0 min-w-0 overflow-y-auto overflow-x-clip [container-type:size]">
               <Outlet />
             </main>
             <BottomNav hidden={mobileKeyboardOpen} />
