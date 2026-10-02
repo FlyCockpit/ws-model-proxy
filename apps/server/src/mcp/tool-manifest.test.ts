@@ -328,6 +328,7 @@ describe("MCP tool manifest — exact catalog", () => {
     const kvBudget = {
       reportedTokens: 100_000,
       effectiveTokens: 50_000,
+      source: "CONFIG",
       cutFraction: 0.5,
       floorFraction: 0.5,
       lastObservedAt: new Date("2030-01-01T00:00:00Z"),
@@ -346,6 +347,7 @@ describe("MCP tool manifest — exact catalog", () => {
     const mcpDoc = readFileSync(new URL("../../../../docs/mcp.md", import.meta.url), "utf8");
     expect(mcpDoc).toContain("effectiveTokens");
     expect(mcpDoc).toContain("floorFraction");
+    expect(mcpDoc).toContain("`source` (`PROBE` / `CONFIG` / `CUSTOM`)");
   });
 
   it("all command catalog entries disclose CLI masking and its limits", () => {

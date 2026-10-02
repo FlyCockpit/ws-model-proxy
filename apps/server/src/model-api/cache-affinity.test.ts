@@ -68,6 +68,7 @@ import {
   FREE_SAMPLING_PARAMS,
   instructionTokens,
   prefixBytesAtDepth,
+  prefixPayloadTokensAtDepth,
   prefixTokensAtDepth,
   rankAffinityTargets,
   rememberAffinity,
@@ -1976,8 +1977,10 @@ describe("cache affinity", () => {
       policy,
       target: served,
       estimatedTokens: 80_000,
+      reportedTokens: 50_000,
     });
-    const expected = prefixTokensAtDepth(canonical, depth, 80_000);
+    const expected = prefixTokensAtDepth(canonical, depth, 80_000, 50_000);
+    expect(expected).not.toBe(prefixTokensAtDepth(canonical, depth, 80_000));
     expect(expected).toBeGreaterThan(0);
     expect(conversationWrites().length).toBeGreaterThan(0);
     for (const { data, sql } of conversationWrites()) {
@@ -3344,7 +3347,49 @@ describe("cache affinity", () => {
     expect(result.reasons["target-b"]).toContain("confirmed:false");
   });
 
-  it("estimates prefix tokens as the byte share of the request through that depth", () => {
+  it("estimates prefix tokens from the payload-aware per-unit estimator, not byte share", () => {
+    const png = new Uint8Array(8_192);
+    png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+    png[11] = 13;
+    png.set([0x49, 0x48, 0x44, 0x52], 12);
+    new DataView(png.buffer).setUint32(16, 64);
+    new DataView(png.buffer).setUint32(20, 64);
+    const imageUrl = `data:image/png;base64,${Buffer.from(png).toString("base64")}`;
+    const canonical = buildCanonicalRequest(
+      digestArgs("runtime", {
+        messages: [
+          { role: "system", content: "S" },
+          { role: "user", content: "hello" },
+          { role: "assistant", content: "hi" },
+          {
+            role: "user",
+            content: [{ type: "image_url", image_url: { url: imageUrl } }],
+          },
+        ],
+      }),
+    )!;
+    const totalBytes = canonicalByteLength(canonical);
+    const payloadFull = prefixPayloadTokensAtDepth(canonical, canonical.conversationUnits.length);
+    const payloadRoot = prefixPayloadTokensAtDepth(canonical, 0);
+    const payloadDepth2 = prefixPayloadTokensAtDepth(canonical, 2);
+    expect(totalBytes).toBeGreaterThan(canonical.rootBytes);
+    expect(payloadFull).toBeGreaterThan(payloadRoot);
+    expect(instructionTokens(canonical, 1_000)).toBe(prefixTokensAtDepth(canonical, 0, 1_000));
+    expect(prefixTokensAtDepth(canonical, 0, 1_000)).toBe(
+      Math.round((1_000 * payloadRoot) / payloadFull),
+    );
+    expect(prefixTokensAtDepth(canonical, 2, 1_000)).toBe(
+      Math.round((1_000 * payloadDepth2) / payloadFull),
+    );
+    expect(prefixTokensAtDepth(canonical, 0, 1_000)).not.toBe(
+      Math.round((1_000 * prefixBytesAtDepth(canonical, 0)) / totalBytes),
+    );
+    expect(prefixTokensAtDepth(canonical, canonical.conversationUnits.length, 1_000)).toBe(1_000);
+    expect(prefixTokensAtDepth(canonical, 0, 0)).toBe(0);
+    expect(prefixTokensAtDepth(canonical, 2, Number.NaN)).toBe(0);
+  });
+
+  it("scales prefix tokens by engine-reported prompt tokens when those are known", () => {
     const canonical = buildCanonicalRequest(
       digestArgs("runtime", {
         messages: [
@@ -3355,18 +3400,17 @@ describe("cache affinity", () => {
         ],
       }),
     )!;
-    const total = canonicalByteLength(canonical);
-    expect(total).toBeGreaterThan(canonical.rootBytes);
-    expect(instructionTokens(canonical, 1_000)).toBe(prefixTokensAtDepth(canonical, 0, 1_000));
-    expect(prefixTokensAtDepth(canonical, 0, 1_000)).toBe(
-      Math.round((1_000 * prefixBytesAtDepth(canonical, 0)) / total),
+    const payloadFull = prefixPayloadTokensAtDepth(canonical, canonical.conversationUnits.length);
+    const payloadDepth2 = prefixPayloadTokensAtDepth(canonical, 2);
+    expect(prefixTokensAtDepth(canonical, 2, 18_000, 12_000)).toBe(
+      Math.round((12_000 * payloadDepth2) / payloadFull),
     );
-    expect(prefixTokensAtDepth(canonical, 2, 1_000)).toBe(
-      Math.round((1_000 * prefixBytesAtDepth(canonical, 2)) / total),
+    expect(prefixTokensAtDepth(canonical, 2, 18_000, 12_000)).not.toBe(
+      prefixTokensAtDepth(canonical, 2, 18_000),
     );
-    expect(prefixTokensAtDepth(canonical, canonical.conversationUnits.length, 1_000)).toBe(1_000);
-    expect(prefixTokensAtDepth(canonical, 0, 0)).toBe(0);
-    expect(prefixTokensAtDepth(canonical, 2, Number.NaN)).toBe(0);
+    expect(prefixTokensAtDepth(canonical, canonical.conversationUnits.length, 18_000, 12_000)).toBe(
+      12_000,
+    );
   });
 
   it("spreads sequential first turns with the same system prompt across three members", async () => {
@@ -3680,7 +3724,7 @@ describe("cache affinity", () => {
     expect(unknown.orderedTargetIds[0]).toBe("target-b");
   });
 
-  it("records matchFraction from the byte-share prefix of an affine continuation", async () => {
+  it("records matchFraction from the payload-aware prefix of an affine continuation", async () => {
     const warm = {
       ...cap8(target("target-a", "runtime-a", "capacity-a")),
       requestTokens: 1_000,

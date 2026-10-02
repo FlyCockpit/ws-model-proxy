@@ -29,6 +29,7 @@ import {
   stableJson,
   visitCanonical,
 } from "./cache-affinity-layers.js";
+import { estimatePayloadTokens } from "./capacity/payload-estimate.js";
 import { requestJsonDepthExceeded } from "./request-json-depth.js";
 import { protectionKvBudgetTokens } from "./warm-protection.js";
 
@@ -92,8 +93,9 @@ export type AffinityDecision = {
    */
   prefixTokens?: Record<string, number>;
   /**
-   * Byte-share estimate of the current request through the matched prefix
-   * depth (root + conversation units 1..depth). Absent when the request is
+   * Payload-aware estimate of the current request through the matched prefix
+   * depth (root + conversation units 1..depth), scaled by engine-reported
+   * prompt tokens when those are the request size. Absent when the request is
    * not affine on that target.
    */
   matchedPrefixTokens?: Record<string, number>;
@@ -515,29 +517,65 @@ export function canonicalByteLength(canonical: CanonicalRequest): number {
   );
 }
 
+function encodedPayloadTokens(encoded: string): number {
+  try {
+    const tokens = estimatePayloadTokens(JSON.parse(encoded) as unknown).tokens;
+    return Number.isFinite(tokens) && tokens > 0 ? tokens : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Payload-aware tokens of the root plus conversation units `1..depth`. */
+export function prefixPayloadTokensAtDepth(canonical: CanonicalRequest, depth: number): number {
+  let tokens = 0;
+  for (const instruction of canonical.instructions) tokens += encodedPayloadTokens(instruction);
+  if (canonical.tools) tokens += encodedPayloadTokens(canonical.tools);
+  const limit = Math.max(0, Math.min(Math.trunc(depth), canonical.conversationUnits.length));
+  for (let index = 0; index < limit; index += 1) {
+    tokens += encodedPayloadTokens(canonical.conversationUnits[index]!);
+  }
+  return tokens;
+}
+
 /**
- * Estimated tokens of the root (instructions, tools, parameters) plus
- * conversation units `1..depth`. Byte-share of the request estimate until
- * per-unit token counting lands: `estimate × bytesThroughDepth / canonicalBytes`.
- * Depth 0 is the root only (`instructionTokens`).
+ * Estimated tokens of the root (instructions, tools) plus conversation units
+ * `1..depth`. Each unit is sized with the payload-aware estimator. When
+ * engine-reported prompt tokens are known they scale the prefix; otherwise the
+ * local request estimate does. Depth 0 is the root only (`instructionTokens`).
  */
 export function prefixTokensAtDepth(
   canonical: CanonicalRequest,
   depth: number,
   estimate: number,
+  reportedPromptTokens?: number | null,
 ): number {
-  const tokens = Number(estimate);
-  if (!Number.isFinite(tokens) || tokens <= 0) return 0;
-  const total = canonicalByteLength(canonical);
+  const reported = Number(reportedPromptTokens);
+  const local = Number(estimate);
+  const scale =
+    Number.isFinite(reported) && reported > 0
+      ? reported
+      : Number.isFinite(local) && local > 0
+        ? local
+        : 0;
+  if (scale <= 0) return 0;
+  const total = prefixPayloadTokensAtDepth(canonical, canonical.conversationUnits.length);
   if (total <= 0) return 0;
   return Math.max(
     0,
-    Math.min(2_147_483_647, Math.round((tokens * prefixBytesAtDepth(canonical, depth)) / total)),
+    Math.min(
+      2_147_483_647,
+      Math.round((scale * prefixPayloadTokensAtDepth(canonical, depth)) / total),
+    ),
   );
 }
 
-export function instructionTokens(canonical: CanonicalRequest, estimate: number): number {
-  return prefixTokensAtDepth(canonical, 0, estimate);
+export function instructionTokens(
+  canonical: CanonicalRequest,
+  estimate: number,
+  reportedPromptTokens?: number | null,
+): number {
+  return prefixTokensAtDepth(canonical, 0, estimate, reportedPromptTokens);
 }
 
 /** Advisory identity must never reject a served request or expose partial material. */
@@ -1585,7 +1623,7 @@ export async function rememberAffinity({
       if (hit?.sessionId && hit.sessionId !== sessionId && Number.isFinite(depth)) {
         sharedWithSessionId = hit.sessionId;
         sharedPrefixTokens = canonical
-          ? prefixTokensAtDepth(canonical, depth, estimatedTokens ?? 0)
+          ? prefixTokensAtDepth(canonical, depth, estimatedTokens ?? 0, storedReportedTokens)
           : 0;
       }
     }

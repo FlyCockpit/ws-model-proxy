@@ -665,6 +665,7 @@
         "slots_one": "{{count}} ranura",
         "slots_other": "{{count}} ranuras",
         "kvBudget": "Presupuesto KV: {{value}} tokens",
+        "kvBudgetEffective": "efectivo {{value}}",
         "maxModelLen": "Contexto máximo: {{value}} tokens",
         "preset": "Preajuste: {{preset}}",
         "kinds": {

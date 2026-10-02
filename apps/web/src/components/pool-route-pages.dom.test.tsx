@@ -898,6 +898,7 @@ const NO_ENGINE_FACTS = {
   engineSlotsSource: null,
   kvBudgetTokens: null,
   kvBudgetTokensSource: null,
+  effectiveKvBudgetTokens: null,
   maxModelLen: null,
   maxModelLenSource: null,
   engineFactsSource: null,
@@ -1035,6 +1036,7 @@ describe("delete conflicts on pool pages", () => {
         engineSlotsSource: null,
         kvBudgetTokens: 262144,
         kvBudgetTokensSource: "CONFIG",
+        effectiveKvBudgetTokens: 131072,
         maxModelLen: null,
         maxModelLenSource: null,
         engineFactsSource: "CONFIG",
@@ -1053,6 +1055,9 @@ describe("delete conflicts on pool pages", () => {
       await screen.findByText(/dashboard:pools\.capacity\.engineFacts\.kvBudget/),
     ).toBeTruthy();
     expect(
+      screen.getByText(/dashboard:pools\.capacity\.engineFacts\.kvBudgetEffective/),
+    ).toBeTruthy();
+    expect(
       screen.getByText(/dashboard:pools\.capacity\.engineFacts\.factSources\.CONFIG/),
     ).toBeTruthy();
   });
@@ -1069,6 +1074,7 @@ describe("delete conflicts on pool pages", () => {
         engineSlotsSource: null,
         kvBudgetTokens: 262144,
         kvBudgetTokensSource: "CONFIG",
+        effectiveKvBudgetTokens: 262144,
         maxModelLen: null,
         maxModelLenSource: null,
         engineFactsSource: "CONFIG",

@@ -20,6 +20,7 @@ import {
 import { deletionConflict } from "../lib/deletion-conflict";
 import { enginePreset } from "../lib/engine-facts";
 import { refreshSharedAutoCapacities } from "../lib/engine-process-capacity";
+import { effectiveKvBudgetTokens } from "../lib/kv-eviction-budget";
 import { parseModelApiSurface } from "../lib/model-api-surface";
 import { assertRecommendedSurfaceServable } from "../lib/pool-recommended-surface";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
@@ -189,7 +190,8 @@ export const capacityManagementRouter = {
     // Live admission state is hot-path history that names its capacity by
     // plain id (no relation): counted by capacity id.
     const ids = capacities.map((capacity) => capacity.id);
-    const [leases, waiters] = ids.length
+    const now = new Date();
+    const [leases, waiters, evictions] = ids.length
       ? await Promise.all([
           prisma.capacityLease.groupBy({
             by: ["capacityId"],
@@ -201,10 +203,20 @@ export const capacityManagementRouter = {
             where: { capacityId: { in: ids }, state: "WAITING" },
             _count: { _all: true },
           }),
+          prisma.capacityKvEviction.findMany({
+            where: { capacityId: { in: ids }, userId, expiresAt: { gt: now } },
+            select: {
+              capacityId: true,
+              cutFraction: true,
+              observedAt: true,
+              expiresAt: true,
+            },
+          }),
         ])
-      : [[], []];
+      : [[], [], []];
     const activeLeases = new Map(leases.map((row) => [row.capacityId, row._count._all]));
     const waitingWaiters = new Map(waiters.map((row) => [row.capacityId, row._count._all]));
+    const evictionByCapacity = new Map(evictions.map((row) => [row.capacityId, row] as const));
     // The engine preset is derived from the stored engine kind (relay 2.7
     // engine facts); S-C and S-D read it, this list only shows it.
     return capacities.map((capacity) => ({
@@ -212,6 +224,11 @@ export const capacityManagementRouter = {
       enginePreset: enginePreset(capacity.engineKind, {
         kvBudgetTokens: capacity.kvBudgetTokens,
       }),
+      effectiveKvBudgetTokens: effectiveKvBudgetTokens(
+        capacity.engineKind === "LLAMA_CPP" ? null : capacity.kvBudgetTokens,
+        evictionByCapacity.get(capacity.id),
+        now,
+      ),
       _count: {
         ExecutionTargets: capacity._count.ExecutionTargets,
         CapacityLeases: activeLeases.get(capacity.id) ?? 0,
