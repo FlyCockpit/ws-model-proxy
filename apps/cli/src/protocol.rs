@@ -454,6 +454,21 @@ pub enum ClientControlMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         detail: Option<Value>,
     },
+    /// 2.4: Chat Completions engine tokenize finished.
+    #[serde(rename = "count_context.result")]
+    CountContextResult {
+        request_id: String,
+        tokens: u64,
+        method: String,
+    },
+    /// 2.4: Chat Completions engine tokenize failed.
+    #[serde(rename = "count_context.error")]
+    CountContextError {
+        request_id: String,
+        failure: RelayFailure,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     /// 2.7: static node facts, once per connection after `hello.ok`.
     #[serde(rename = "node.info")]
     NodeInfo(NodeInfo),
@@ -586,6 +601,8 @@ pub struct CliCapabilities {
     pub node_telemetry: bool,
     /// 2.8: this CLI runs `file.op` (ops it has not implemented answer `unsupported`).
     pub file_ops: bool,
+    /// 2.4: this CLI runs `count_context` (Chat Completions engine tokenize).
+    pub count_context: bool,
     /// The browser pins this key and checks the signature before any
     /// terminal handshake.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -624,6 +641,7 @@ impl CliCapabilities {
             supervised_commands: true,
             node_telemetry: true,
             file_ops: true,
+            count_context: true,
             terminal_identity: snapshot.terminal_identity.clone(),
         }
     }
@@ -741,6 +759,9 @@ pub struct EngineFacts {
     /// 2.9: a custom engine adapter is configured on this endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load_adapter: Option<EngineFact<LoadAdapterValue>>,
+    /// Chat Completions tokenize route recorded at probe time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count_context: Option<EngineFact<crate::count_context::CountContextMethod>>,
 }
 
 /// 2.9 `engineFacts.loadAdapter.value`.
@@ -1240,6 +1261,14 @@ enum KnownServerControlMessage {
     },
     #[serde(rename = "file.cancel")]
     FileCancel { op_id: String },
+    #[serde(rename = "count_context")]
+    CountContext {
+        request_id: String,
+        endpoint_slug: String,
+        model: String,
+        timeout_ms: u64,
+        expect_body: bool,
+    },
 }
 
 /// The supervised-file payload of `term.spawn` (`kind:"file"`), 2.8.
@@ -1415,6 +1444,15 @@ pub enum ServerControlMessage {
     /// 2.8: cancel a pending file op.
     FileCancel {
         op_id: String,
+    },
+    /// 2.4: Chat Completions engine tokenize. Request JSON follows as
+    /// `relay.request.body` when `expect_body` is true.
+    CountContext {
+        request_id: String,
+        endpoint_slug: String,
+        model: String,
+        timeout_ms: u64,
+        expect_body: bool,
     },
     Unknown {
         type_name: String,
@@ -1613,6 +1651,9 @@ pub fn endpoint_engine_facts_with(
             .filter(|aliases| !aliases.is_empty())
             .map(EngineFact::probe),
         load_adapter,
+        count_context: detected
+            .and_then(|engine| engine.count_context)
+            .map(EngineFact::probe),
     };
     (!facts.is_empty()).then_some(facts)
 }
@@ -1916,6 +1957,7 @@ fn known_server_frame(type_name: &str) -> bool {
             | "engine.adapters.set"
             | "file.op"
             | "file.cancel"
+            | "count_context"
     )
 }
 
@@ -2087,6 +2129,19 @@ impl From<KnownServerControlMessage> for ServerControlMessage {
                 read_grant,
             },
             KnownServerControlMessage::FileCancel { op_id } => Self::FileCancel { op_id },
+            KnownServerControlMessage::CountContext {
+                request_id,
+                endpoint_slug,
+                model,
+                timeout_ms,
+                expect_body,
+            } => Self::CountContext {
+                request_id,
+                endpoint_slug,
+                model,
+                timeout_ms,
+                expect_body,
+            },
         }
     }
 }
@@ -2607,6 +2662,7 @@ mod tests {
         assert!(encoded.contains(r#""protocolVersion":"2.4""#));
         assert!(encoded.contains(r#""nodeTelemetry":true"#));
         assert!(encoded.contains(r#""fileOps":true"#));
+        assert!(encoded.contains(r#""countContext":true"#));
         assert!(encoded.contains(r#""mcpFileRead":false"#));
         assert!(encoded.contains(r#""fileRootsConfigured":false"#));
         assert!(encoded.contains(r#""allowFileToolsAsRoot":false"#));
@@ -2676,6 +2732,38 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+
+        let count_context = parse_server_control(
+            r#"{"type":"count_context","requestId":"r1","endpointSlug":"local","model":"m","timeoutMs":5000,"expectBody":true}"#,
+        )
+        .expect("parse count_context");
+        match count_context {
+            ServerControlMessage::CountContext {
+                request_id,
+                endpoint_slug,
+                model,
+                timeout_ms,
+                expect_body,
+            } => {
+                assert_eq!(request_id, "r1");
+                assert_eq!(endpoint_slug, "local");
+                assert_eq!(model, "m");
+                assert_eq!(timeout_ms, 5_000);
+                assert!(expect_body);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        let count_result = encode_control(&ClientControlMessage::CountContextResult {
+            request_id: "r1".to_string(),
+            tokens: 12,
+            method: "vllm_tokenize".to_string(),
+        })
+        .expect("encode count_context.result");
+        assert!(count_result.contains(r#""type":"count_context.result""#));
+        assert!(count_result.contains(r#""requestId":"r1""#));
+        assert!(count_result.contains(r#""tokens":12"#));
+        assert!(count_result.contains(r#""method":"vllm_tokenize""#));
 
         let unknown =
             parse_server_control(r#"{"type":"future.frame","extra":1}"#).expect("unknown");

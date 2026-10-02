@@ -519,6 +519,70 @@ describe("relay protocol 2.4 minimum", () => {
     ).toThrow();
   });
 
+  it("accepts optional countContext on a 2.4 hello", () => {
+    expect(() => parseRelayClientControlFrame(hello("2.4", CAPABILITIES_28))).not.toThrow();
+    expect(() =>
+      parseRelayClientControlFrame(hello("2.4", { ...CAPABILITIES_28, countContext: true })),
+    ).not.toThrow();
+    expect(() =>
+      parseRelayClientControlFrame(hello("2.4", { ...CAPABILITIES_28, countContext: false })),
+    ).toThrow();
+  });
+
+  it("parses count_context result and error frames", () => {
+    expect(
+      parseRelayClientControlFrame(
+        JSON.stringify({
+          type: "count_context.result",
+          requestId: "count-1",
+          tokens: 12,
+          method: "vllm_tokenize",
+        }),
+      ),
+    ).toMatchObject({ type: "count_context.result", tokens: 12, method: "vllm_tokenize" });
+    expect(
+      parseRelayClientControlFrame(
+        JSON.stringify({
+          type: "count_context.error",
+          requestId: "count-1",
+          failure: "timeout",
+        }),
+      ),
+    ).toMatchObject({ type: "count_context.error", failure: "timeout" });
+    expect(() =>
+      parseRelayClientControlFrame(
+        JSON.stringify({
+          type: "count_context.result",
+          requestId: "count-1",
+          tokens: 12,
+          method: "unknown",
+        }),
+      ),
+    ).toThrow();
+  });
+
+  it("encodes a count_context server frame", () => {
+    expect(
+      JSON.parse(
+        encodeRelayServerControlMessage({
+          type: "count_context",
+          requestId: "count-1",
+          endpointSlug: "local",
+          model: "llama",
+          timeoutMs: 5000,
+          expectBody: true,
+        }),
+      ),
+    ).toEqual({
+      type: "count_context",
+      requestId: "count-1",
+      endpointSlug: "local",
+      model: "llama",
+      timeoutMs: 5000,
+      expectBody: true,
+    });
+  });
+
   it("accepts an optional, strict terminalIdentity", () => {
     const identityKey = Buffer.alloc(65, 3);
     identityKey[0] = 0x04;

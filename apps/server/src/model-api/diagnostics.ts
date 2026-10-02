@@ -164,6 +164,9 @@ type DiagnosticsManager = Pick<
   | "sendRelayRequest"
   | "cancelRelayRequest"
   | "completeRelayRequest"
+  | "supportsCountContext"
+  | "registerCountContextHandlers"
+  | "sendCountContext"
 >;
 
 export interface DiagnosticCoreDependencies {

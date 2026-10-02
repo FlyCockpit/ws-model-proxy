@@ -289,15 +289,27 @@ const mockedTokenAccess = tokenAccess as unknown as {
   listVisibleModelTargetsForToken: MockInstance;
 };
 
+type SendCountContextArgs = Parameters<RelaySessionManager["sendCountContext"]>[0];
+type CountContextHandlers = Parameters<
+  RelaySessionManager["registerCountContextHandlers"]
+>[0]["handlers"];
+
 class FakeRelayManager {
   activeCliDeviceIds = ["cli-device-id"];
   sent: SendRelayRequestArgs[] = [];
+  sentCountContext: SendCountContextArgs[] = [];
   cancelled: CancelRelayRequestArgs[] = [];
   completed: string[] = [];
   handlers = new Map<string, ActiveRelayResponseHandlers>();
+  countContextHandlers = new Map<string, CountContextHandlers>();
+  supportsCountContextFlag = false;
 
   getActiveCliDeviceIds() {
     return this.activeCliDeviceIds;
+  }
+
+  supportsCountContext(_cliDeviceId: string) {
+    return this.supportsCountContextFlag;
   }
 
   registerRelayResponseHandlers({
@@ -375,6 +387,40 @@ class FakeRelayManager {
       requestId,
       failure,
     });
+  }
+
+  registerCountContextHandlers({
+    requestId,
+    handlers,
+  }: {
+    cliDeviceId: string;
+    requestId: string;
+    handlers: CountContextHandlers;
+  }) {
+    this.countContextHandlers.set(requestId, handlers);
+  }
+
+  sendCountContext(args: SendCountContextArgs) {
+    this.sentCountContext.push(args);
+  }
+
+  completeCountContext(
+    requestId: string,
+    tokens: number,
+    method: "vllm_tokenize" | "tgi_chat_tokenize" | "llama_apply_template" = "vllm_tokenize",
+  ) {
+    const handler = this.countContextHandlers.get(requestId);
+    this.countContextHandlers.delete(requestId);
+    handler?.onResult({ type: "count_context.result", requestId, tokens, method });
+  }
+
+  errorCountContext(
+    requestId: string,
+    failure: "timeout" | "unsupported_capability" | "transport",
+  ) {
+    const handler = this.countContextHandlers.get(requestId);
+    this.countContextHandlers.delete(requestId);
+    handler?.onError({ type: "count_context.error", requestId, failure });
   }
 }
 
@@ -12951,6 +12997,113 @@ describe("model API routes", () => {
     );
   });
 
+  it("asks the CLI to count Chat Completions near the member ceiling", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({ physicalMaxContext: 45, countStrategy: "ENGINE_REPORTED" }),
+    );
+    const manager = new FakeRelayManager();
+    manager.supportsCountContextFlag = true;
+    const responsePromise = appWith(manager, admittingCapacityRuntime()).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(),
+      },
+    );
+    await vi.waitFor(() => expect(manager.sentCountContext).toHaveLength(1));
+    expect(manager.sent).toHaveLength(0);
+    const count = manager.sentCountContext[0]!;
+    expect(count.endpointSlug).toBe("endpoint-default");
+    expect(count.model).toBe("gpt-4o-mini");
+    manager.completeCountContext(count.requestId, 29);
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          contextTokenCount: 29,
+          contextCountMethod: "NATIVE",
+          contextCountExact: true,
+        }),
+      }),
+    );
+  });
+
+  it("skips Chat Completions count_context far from the member ceiling", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({ physicalMaxContext: 1_000_000, countStrategy: "ENGINE_REPORTED" }),
+    );
+    const manager = new FakeRelayManager();
+    manager.supportsCountContextFlag = true;
+    const responsePromise = appWith(manager, admittingCapacityRuntime()).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(),
+      },
+    );
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    expect(manager.sentCountContext).toHaveLength(0);
+    await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+  });
+
+  it("falls back to the estimate when Chat Completions count_context times out", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({ physicalMaxContext: 45, countStrategy: "ENGINE_REPORTED" }),
+    );
+    const manager = new FakeRelayManager();
+    manager.supportsCountContextFlag = true;
+    const responsePromise = appWith(manager, admittingCapacityRuntime()).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(),
+      },
+    );
+    await vi.waitFor(() => expect(manager.sentCountContext).toHaveLength(1));
+    manager.errorCountContext(manager.sentCountContext[0]!.requestId, "timeout");
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+    expect(db.relayRequest.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          contextCountMethod: "TOKEN_ESTIMATE",
+          contextCountExact: false,
+        }),
+      }),
+    );
+  });
+
+  it("skips Chat Completions count_context when the CLI does not advertise it", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({ physicalMaxContext: 45, countStrategy: "ENGINE_REPORTED" }),
+    );
+    const manager = new FakeRelayManager();
+    manager.supportsCountContextFlag = false;
+    const responsePromise = appWith(manager, admittingCapacityRuntime()).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(),
+      },
+    );
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    expect(manager.sentCountContext).toHaveLength(0);
+    await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+  });
+
   it("filters over-context pool members before admission", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
@@ -17264,7 +17417,8 @@ function cooldownPoolFixture(ownerUserId: string, surface = "openai-chat") {
 // preceded by the gate with no wait, admission or loop head in between. See
 // prs/64-76/design-authz-boundaries.md.
 describe("local send gate (static)", () => {
-  const sendCall = /\b(startRelayAttempt|sendRelayRequest|nativeContextCount)\(\{/g;
+  const sendCall =
+    /\b(startRelayAttempt|sendRelayRequest|nativeContextCount|startCountContextAttempt|sendCountContext)\(\{/g;
   const srcRoot = new URL("../", import.meta.url);
   const source = readFileSync(new URL("./routes.ts", import.meta.url), "utf8");
   const { parse } = createRequire(import.meta.url)(
@@ -17284,10 +17438,10 @@ describe("local send gate (static)", () => {
   it("lists every relay send site in the server sources", () => {
     // Other modules: exact counts, all exempt from the local-send gate.
     const exemptFiles: Record<string, number> = {
-      // The executor itself (definition and its one manager send).
-      "model-api/relay-executor.ts": 2,
-      // The manager's own definition and the owner's system health probe (no grantee data).
-      "relay/session-manager.ts": 2,
+      // The executor itself (definitions and manager sends).
+      "model-api/relay-executor.ts": 4,
+      // The manager's own definitions and the owner's system health probe (no grantee data).
+      "relay/session-manager.ts": 3,
       // Owner-only member diagnostics: the caller is the authenticated owner.
       "model-api/diagnostics.ts": 1,
     };
@@ -17418,7 +17572,7 @@ describe("local send gate (static)", () => {
       // Every media-transformer hop (owner-owned transformer model).
       maybeApplyPoolMediaTransformer: { gated: true, sends: 1, counts: 0 },
       // Gated when counting for a pool member (pool.ownerUserId).
-      nativeContextCount: { gated: true, sends: 1, counts: 0, conditions: ["pool"] },
+      nativeContextCount: { gated: true, sends: 2, counts: 0, conditions: ["pool"] },
       // The requester's own direct models; a banned requester cannot authenticate.
       relayDirect: { gated: false, sends: 1, counts: 1 },
     };

@@ -36,7 +36,8 @@
       "terminalViewers": true,
       "supervisedCommands": true,
       "nodeTelemetry": true,
-      "fileOps": true
+      "fileOps": true,
+      "countContext": true
     }
   },
   "endpoints": [

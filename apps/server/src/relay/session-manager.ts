@@ -147,6 +147,8 @@ export type CliReportedFeatures = {
   fileOps: boolean;
   /** 2.8: `wsmp config set-file-tools-as-root on`. */
   allowFileToolsAsRoot: boolean;
+  /** 2.4: the CLI implements `count_context`. */
+  countContext: boolean;
 };
 
 export type TrackedCliCommand = {
@@ -462,6 +464,24 @@ export type ActiveRelayResponseHandlers = {
   onCancelled(message: Extract<RelayClientControlMessage, { type: "relay.cancelled" }>): void;
 };
 
+export type CountContextResultMessage = Extract<
+  RelayClientControlMessage,
+  { type: "count_context.result" }
+>;
+export type CountContextErrorMessage = Extract<
+  RelayClientControlMessage,
+  { type: "count_context.error" }
+>;
+
+export type ActiveCountContextHandlers = {
+  onResult(message: CountContextResultMessage): void;
+  onError(message: CountContextErrorMessage): void;
+};
+
+type ActiveCountContextRequest = ActiveCountContextHandlers & {
+  cliDeviceId: string;
+};
+
 type ActiveRelayRequest = ActiveRelayResponseHandlers & {
   cliDeviceId: string;
 };
@@ -476,7 +496,11 @@ function interactiveCapabilities(capabilities: HelloMessage["cli"]["capabilities
   terminalIdentity: CliTerminalIdentity | null;
 } {
   return {
-    features: { ...capabilities.features, fileOps: capabilities.fileOps === true },
+    features: {
+      ...capabilities.features,
+      fileOps: capabilities.fileOps === true,
+      countContext: capabilities.countContext === true,
+    },
     terminalPublicKey: capabilities.terminalPublicKey,
     terminalViewers: capabilities.terminalViewers === true,
     terminalIdentity: capabilities.terminalIdentity ?? null,
@@ -642,6 +666,7 @@ export class RelaySessionManager {
    */
   private latestGenerationByCliDeviceId = new Map<string, number>();
   private activeRelayRequests = new Map<string, ActiveRelayRequest>();
+  private activeCountContextRequests = new Map<string, ActiveCountContextRequest>();
   /**
    * Shutdown drain flag, shared by the relay and the browser terminal hub.
    * Set by {@link beginDrain} (the HTTP drain's `stopAdmission`, index.ts) and
@@ -1039,6 +1064,22 @@ export class RelaySessionManager {
       return;
     }
 
+    if (message.type === "count_context.result") {
+      const active = this.takeActiveCountContextRequest(message.requestId);
+      if (!active) return;
+      active.onResult(message);
+      this.considerDrainClose(active.cliDeviceId);
+      return;
+    }
+
+    if (message.type === "count_context.error") {
+      const active = this.takeActiveCountContextRequest(message.requestId);
+      if (!active) return;
+      active.onError(message);
+      this.considerDrainClose(active.cliDeviceId);
+      return;
+    }
+
     if (
       message.type === "term.pending" ||
       message.type === "term.opened" ||
@@ -1408,6 +1449,9 @@ export class RelaySessionManager {
     for (const active of this.activeRelayRequests.values()) {
       if (active.cliDeviceId === session.cliDeviceId) return true;
     }
+    for (const active of this.activeCountContextRequests.values()) {
+      if (active.cliDeviceId === session.cliDeviceId) return true;
+    }
     return false;
   }
 
@@ -1415,6 +1459,13 @@ export class RelaySessionManager {
     const active = this.activeRelayRequests.get(requestId);
     if (!active) return undefined;
     this.activeRelayRequests.delete(requestId);
+    return active;
+  }
+
+  private takeActiveCountContextRequest(requestId: string): ActiveCountContextRequest | undefined {
+    const active = this.activeCountContextRequests.get(requestId);
+    if (!active) return undefined;
+    this.activeCountContextRequests.delete(requestId);
     return active;
   }
 
@@ -2019,6 +2070,9 @@ export class RelaySessionManager {
         fileOps:
           relayProtocolAtLeast(session.protocolVersion, "2.4") &&
           session.features?.fileOps === true,
+        countContext:
+          relayProtocolAtLeast(session.protocolVersion, "2.4") &&
+          session.features?.countContext === true,
         mcpFileRead: session.features?.mcpFileRead ?? false,
         fileRootsConfigured: session.features?.fileRootsConfigured ?? false,
         allowFileToolsAsRoot: session.features?.allowFileToolsAsRoot ?? false,
@@ -2642,6 +2696,77 @@ export class RelaySessionManager {
     void this.pumpBodyStream(session, requestId);
   }
 
+  supportsCountContext(cliDeviceId: string): boolean {
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    return (
+      session?.registered === true &&
+      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
+      session.features?.countContext === true
+    );
+  }
+
+  registerCountContextHandlers({
+    cliDeviceId,
+    requestId,
+    handlers,
+  }: {
+    cliDeviceId: string;
+    requestId: string;
+    handlers: ActiveCountContextHandlers;
+  }) {
+    if (this.activeRelayRequests.has(requestId) || this.activeCountContextRequests.has(requestId)) {
+      throw new Error("Relay request ID is already active.");
+    }
+    this.activeCountContextRequests.set(requestId, { cliDeviceId, ...handlers });
+  }
+
+  sendCountContext({
+    cliDeviceId,
+    endpointSlug,
+    requestId,
+    model,
+    bodyChunks = [],
+    timeoutMs,
+  }: {
+    cliDeviceId: string;
+    endpointSlug: string;
+    requestId: string;
+    model: string;
+    bodyChunks?: Uint8Array[];
+    timeoutMs: number;
+  }) {
+    if (this.relayDrain) throw new Error("CLI session is disconnected.");
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    if (!session) throw new Error("CLI session is disconnected.");
+    if (session.socket.readyState !== WS_READY_STATE_OPEN) {
+      throw new Error("CLI session is disconnected.");
+    }
+
+    const expectBody = bodyChunks.length > 0;
+    const control: RelayServerControlMessage = {
+      type: "count_context",
+      requestId,
+      endpointSlug,
+      model,
+      timeoutMs,
+      expectBody,
+    };
+    session.socket.send(encodeRelayServerControlMessage(control));
+    if (!expectBody) return;
+
+    const totalBytes = bodyChunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+    session.bodyStreamsByRequest.set(requestId, {
+      chunks: [...bodyChunks],
+      iterator: undefined,
+      nextChunkIndex: 0,
+      bytesSent: 0,
+      totalBytes,
+      credits: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+      pumping: false,
+    });
+    void this.pumpBodyStream(session, requestId);
+  }
+
   private grantBodyCredits(session: SessionState, requestId: string, credits: number) {
     const stream = session.bodyStreamsByRequest.get(requestId);
     if (!stream) return;
@@ -2690,6 +2815,13 @@ export class RelaySessionManager {
                 failure: "protocol_error",
                 message: "Relayed request body ended before its declared size.",
               });
+              const count = this.takeActiveCountContextRequest(requestId);
+              count?.onError({
+                type: "count_context.error",
+                requestId,
+                failure: "protocol_error",
+                message: "Relayed request body ended before its declared size.",
+              });
             }
             return;
           }
@@ -2722,6 +2854,13 @@ export class RelaySessionManager {
         failure: "transport",
         message: "Failed to read relayed request body.",
       });
+      const count = this.takeActiveCountContextRequest(requestId);
+      count?.onError({
+        type: "count_context.error",
+        requestId,
+        failure: "transport",
+        message: "Failed to read relayed request body.",
+      });
     } finally {
       stream.pumping = false;
     }
@@ -2736,7 +2875,7 @@ export class RelaySessionManager {
     requestId: string;
     handlers: ActiveRelayResponseHandlers;
   }) {
-    if (this.activeRelayRequests.has(requestId)) {
+    if (this.activeRelayRequests.has(requestId) || this.activeCountContextRequests.has(requestId)) {
       throw new Error("Relay request ID is already active.");
     }
     this.activeRelayRequests.set(requestId, { cliDeviceId, ...handlers });
@@ -2744,8 +2883,10 @@ export class RelaySessionManager {
 
   completeRelayRequest(requestId: string) {
     const active = this.takeActiveRelayRequest(requestId);
+    const count = this.takeActiveCountContextRequest(requestId);
     const cliDeviceIds = new Set<string>();
     if (active) cliDeviceIds.add(active.cliDeviceId);
+    if (count) cliDeviceIds.add(count.cliDeviceId);
     for (const session of this.sessionsBySocket.values()) {
       const stream = session.bodyStreamsByRequest.get(requestId);
       if (!stream) continue;
@@ -2766,6 +2907,7 @@ export class RelaySessionManager {
     reason: RelayFailure;
   }) {
     this.takeActiveRelayRequest(requestId);
+    this.takeActiveCountContextRequest(requestId);
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
     if (!session) return;
     const stream = session.bodyStreamsByRequest.get(requestId);
@@ -2826,6 +2968,16 @@ export class RelaySessionManager {
       this.activeRelayRequests.delete(requestId);
       activeRequest.onError({
         type: "relay.error",
+        requestId,
+        failure: "disconnected",
+        message: "CLI session disconnected.",
+      });
+    }
+    for (const [requestId, active] of this.activeCountContextRequests) {
+      if (active.cliDeviceId !== session.cliDeviceId) continue;
+      this.activeCountContextRequests.delete(requestId);
+      active.onError({
+        type: "count_context.error",
         requestId,
         failure: "disconnected",
         message: "CLI session disconnected.",

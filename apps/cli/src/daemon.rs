@@ -1967,6 +1967,26 @@ where
             #[cfg(not(unix))]
             let _ = op_id;
         }
+        ServerControlMessage::CountContext {
+            request_id,
+            endpoint_slug,
+            model,
+            timeout_ms,
+            expect_body,
+        } => {
+            start_count_context(
+                socket,
+                config,
+                worker_tx,
+                workers,
+                recent_finished,
+                request_id,
+                endpoint_slug,
+                model,
+                timeout_ms,
+                expect_body,
+            )?;
+        }
         ServerControlMessage::MetricsSourcesSet { id, sources } => {
             // Stored even without the opt-in so `wsmp metrics list` and
             // `wsmp metrics approve` can show them. A remote source runs only
@@ -2121,6 +2141,161 @@ where
         },
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_count_context<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    config: &Config,
+    worker_tx: &SyncSender<FromWorker>,
+    workers: &mut BTreeMap<String, WorkerHandle>,
+    recent_finished: &RecentlyFinished,
+    request_id: String,
+    endpoint_slug: String,
+    model: String,
+    timeout_ms: u64,
+    expect_body: bool,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    if workers.contains_key(&request_id) || recent_finished.contains(&request_id) {
+        send_control(
+            socket,
+            &ClientControlMessage::CountContextError {
+                request_id,
+                failure: RelayFailure::ProtocolError,
+                message: Some("request id is already in use".to_string()),
+            },
+            "sending a count_context rejection",
+        )?;
+        return Ok(());
+    }
+
+    let Some(endpoint) = config
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.enabled && endpoint.slug == endpoint_slug)
+        .cloned()
+    else {
+        send_control(
+            socket,
+            &ClientControlMessage::CountContextError {
+                request_id,
+                failure: RelayFailure::NotFound,
+                message: Some(format!("endpoint `{endpoint_slug}` is not enabled")),
+            },
+            "sending a count_context rejection",
+        )?;
+        return Ok(());
+    };
+
+    let method = endpoint
+        .last_probe
+        .as_ref()
+        .and_then(|probe| probe.engine.as_ref())
+        .and_then(|engine| engine.count_context);
+
+    let (cancellation, _cancellation_rx) = CancellationHandle::new();
+    let thread_tx = worker_tx.clone();
+    let thread_cancellation = cancellation.clone();
+    let (body_tx, body_rx) = if expect_body {
+        let (tx, rx) = mpsc::sync_channel::<BodyChunk>(REQUEST_BODY_INGRESS_CAPACITY);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    let worker_request_id = request_id.clone();
+    let handle = thread::spawn(move || {
+        run_count_context_worker(
+            worker_request_id,
+            endpoint,
+            model,
+            method,
+            timeout_ms,
+            body_rx,
+            thread_tx,
+            thread_cancellation,
+        );
+    });
+
+    workers.insert(
+        request_id,
+        WorkerHandle {
+            body_tx,
+            cancellation,
+            join: handle,
+        },
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_count_context_worker(
+    request_id: String,
+    endpoint: crate::config::EndpointConfig,
+    model: String,
+    method: Option<crate::count_context::CountContextMethod>,
+    timeout_ms: u64,
+    body_rx: Option<Receiver<BodyChunk>>,
+    tx: SyncSender<FromWorker>,
+    cancellation: CancellationHandle,
+) {
+    let outcome = (|| {
+        let bytes = if let Some(rx) = body_rx.as_ref() {
+            match collect_request_body(
+                rx,
+                &tx,
+                &request_id,
+                crate::count_context::COUNT_CONTEXT_MAX_BODY_BYTES,
+            ) {
+                Ok(bytes) => bytes,
+                Err(CollectError::Aborted) => return None,
+                Err(CollectError::TooLarge) => {
+                    return Some(ClientControlMessage::CountContextError {
+                        request_id: request_id.clone(),
+                        failure: RelayFailure::RequestTooLarge,
+                        message: Some("count_context body exceeds its size limit".to_string()),
+                    });
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        if cancellation.cancelled.load(Ordering::SeqCst) {
+            return None;
+        }
+        let body = match crate::count_context::parse_count_context_body(&bytes) {
+            Ok(body) => body,
+            Err(error) => {
+                return Some(ClientControlMessage::CountContextError {
+                    request_id: request_id.clone(),
+                    failure: error.kind.relay_failure(),
+                    message: Some(error.message),
+                });
+            }
+        };
+        let timeout = Duration::from_millis(timeout_ms.max(1));
+        match crate::count_context::count_chat(&endpoint, &model, &body, method, timeout) {
+            Ok(outcome) => Some(ClientControlMessage::CountContextResult {
+                request_id: request_id.clone(),
+                tokens: outcome.tokens,
+                method: outcome.method.as_str().to_string(),
+            }),
+            Err(error) => Some(ClientControlMessage::CountContextError {
+                request_id: request_id.clone(),
+                failure: error.kind.relay_failure(),
+                message: Some(error.message),
+            }),
+        }
+    })();
+    if !cancellation.cancelled.load(Ordering::SeqCst)
+        && let Some(message) = outcome
+    {
+        let _ = worker_send_control(&tx, &message);
+    }
+    let _ = tx.send(FromWorker::Finished(request_id));
 }
 
 fn apply_frame_fault<S>(
@@ -2881,7 +3056,9 @@ fn worker_send_control(tx: &SyncSender<FromWorker>, message: &ClientControlMessa
         | ClientControlMessage::RelayResponseHeaders { request_id, .. }
         | ClientControlMessage::RelayComplete { request_id, .. }
         | ClientControlMessage::RelayError { request_id, .. }
-        | ClientControlMessage::RelayCancelled { request_id } => request_id.clone(),
+        | ClientControlMessage::RelayCancelled { request_id }
+        | ClientControlMessage::CountContextResult { request_id, .. }
+        | ClientControlMessage::CountContextError { request_id, .. } => request_id.clone(),
         ClientControlMessage::Hello { .. }
         | ClientControlMessage::InventoryUpdate { .. }
         | ClientControlMessage::Heartbeat { .. }

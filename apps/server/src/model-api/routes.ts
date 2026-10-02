@@ -232,7 +232,11 @@ import {
   publicTargetCompatibility,
   resolvePublicProviderExecution,
 } from "./public-overflow.js";
-import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
+import {
+  type RelayAttemptTerminal,
+  startCountContextAttempt,
+  startRelayAttempt,
+} from "./relay-executor.js";
 import { classifyEngineContextOverflow, shouldRetryRelayOperation } from "./relay-retry-policy.js";
 import {
   LOCAL_RELAY_ATTEMPT_TTL_MS,
@@ -274,6 +278,9 @@ type ModelApiRouteDependencies = {
     | "sendRelayRequest"
     | "cancelRelayRequest"
     | "completeRelayRequest"
+    | "supportsCountContext"
+    | "registerCountContextHandlers"
+    | "sendCountContext"
   >;
   concurrencyLimiter?: ModelApiConcurrencyLimiter;
   capacityRuntime?: CapacityAdmissionRuntime;
@@ -580,6 +587,12 @@ function responseBodyForOperation({
 }
 
 const NATIVE_CONTEXT_COUNT_MAX_BYTES = 64 * 1024;
+const ENGINE_COUNT_NEAR_CEILING_RATIO = 0.85;
+const NATIVE_COUNT_TIMEOUT_MS = 5_000;
+
+function isNearContextCeiling(tokens: number, ceiling: number): boolean {
+  return tokens >= Math.ceil(ceiling * ENGINE_COUNT_NEAR_CEILING_RATIO);
+}
 
 async function readBoundedJson(
   stream: ReadableStream<Uint8Array>,
@@ -687,7 +700,116 @@ async function nativeContextCount({
       : operation.family === "messages"
         ? ("messages.countTokens" as const)
         : null;
-  if (!countCapability) return countWithConfiguredCounter();
+  if (!countCapability) {
+    const estimate = await countWithConfiguredCounter();
+    if (operation.family !== "chat.completions") return estimate;
+    const ceiling = capacity?.physicalMaxContext;
+    if (
+      ceiling == null ||
+      !Number.isSafeInteger(ceiling) ||
+      ceiling <= 0 ||
+      !isNearContextCeiling(estimate.tokens, ceiling)
+    ) {
+      return estimate;
+    }
+    if (!manager.supportsCountContext(selected.Endpoint.cliDeviceId)) return estimate;
+    let chatBuilt: BuiltRelayRequest | undefined;
+    let chatAttempt: ReturnType<typeof startCountContextAttempt> | undefined;
+    const chatExecution: LocalExecutionTelemetry = {
+      attemptKind: "CONTEXT_COUNT",
+      selectedExecutionTargetId: selected.ExecutionTarget?.id,
+      selectedPoolMemberId: pool?.memberId,
+      selectedPoolMemberTier: pool?.tier,
+      nativeSurface: telemetrySurfaceForOperation(operation),
+      requestedSurface: telemetrySurfaceForOperation(operation),
+      adapterMode: "NATIVE",
+      localAttemptId: crypto.randomUUID(),
+      poolId: pool?.id,
+      contextCount: operation.contextCount,
+    };
+    try {
+      chatBuilt = await operation.buildRequest(selected.upstreamModelId);
+      if (!(chatBuilt.body instanceof Uint8Array)) return estimate;
+      await startLocalExecutionTelemetry(relayRequestId, requester.userId, chatExecution);
+      if (pool)
+        await assertLocalSendAllowed({
+          poolId: pool.id,
+          ownerUserId: pool.ownerUserId,
+          requesterUserId: requester.userId,
+          accessGrantId: pool.accessGrantId,
+          poolMemberId: pool.tier === "PRIMARY" ? pool.memberId : null,
+        });
+      chatAttempt = startCountContextAttempt({
+        requestId: chatExecution.localAttemptId,
+        manager,
+        cliDeviceId: selected.Endpoint.cliDeviceId,
+        endpointSlug: selected.Endpoint.slug,
+        model: selected.upstreamModelId,
+        body: chatBuilt.body,
+        timeoutMs: NATIVE_COUNT_TIMEOUT_MS,
+        abortSignal: request.signal,
+      });
+      const outcome = await chatAttempt.result;
+      if (!outcome.ok) {
+        await recordLocalTerminal(relayRequestId, requester.userId, chatExecution, {
+          ok: false,
+          failure: outcome.failure,
+          httpStatusCode: outcome.failure === "timeout" ? 504 : null,
+          upstreamStatusCode: null,
+          usage: null,
+          metrics: null,
+          responseBytes: 0,
+          requestBytes: 0,
+        });
+        return estimate;
+      }
+      const exactCount = {
+        tokens: outcome.tokens,
+        method: "NATIVE" as const,
+        exact: true as const,
+        confidence: "EXACT" as const,
+        safetyMargin: 1,
+        serializedChars: JSON.stringify(operation.contextInput).length,
+      };
+      await recordLocalTerminal(
+        relayRequestId,
+        requester.userId,
+        { ...chatExecution, contextCount: exactCount },
+        {
+          ok: true,
+          failure: null,
+          httpStatusCode: 200,
+          upstreamStatusCode: null,
+          usage: null,
+          metrics: null,
+          responseBytes: 0,
+          requestBytes: 0,
+        },
+      );
+      return exactCount;
+    } catch (error) {
+      chatAttempt?.cancel(request.signal.aborted ? "cancelled" : "protocol_error");
+      if (chatAttempt) {
+        await chatAttempt.result.catch(() => undefined);
+        await recordLocalTerminal(
+          relayRequestId,
+          requester.userId,
+          chatExecution,
+          rejectedRelayTerminal(),
+        ).catch(metadataUpdateError);
+      } else if (error instanceof LocalSendRefused) {
+        await recordLocalTerminal(
+          relayRequestId,
+          requester.userId,
+          chatExecution,
+          rejectedRelayTerminal(),
+        ).catch(metadataUpdateError);
+      }
+      if (request.signal.aborted) throw request.signal.reason;
+      if (error instanceof LocalSendRefused && error.denial !== "MEMBER_UNAVAILABLE") throw error;
+      return estimate;
+    }
+  }
   const countOperation: RelayOperation = {
     family: operation.family,
     method: "POST",

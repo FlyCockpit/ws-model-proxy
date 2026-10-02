@@ -81,6 +81,9 @@ pub struct DetectedEngine {
     /// Ids one engine process serves (vLLM/SGLang `--served-model-name` lists).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub served_model_aliases: Vec<String>,
+    /// Chat Completions tokenize route recorded at probe time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count_context: Option<crate::count_context::CountContextMethod>,
 }
 
 /// The engine this endpoint runs and whether the person declared it.
@@ -115,7 +118,7 @@ pub fn engine_root_url(base_url: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn route_url(base_url: &str, route: &str) -> Result<Url> {
+pub(crate) fn route_url(base_url: &str, route: &str) -> Result<Url> {
     let base = engine_root_url(base_url)?;
     let joined = base
         .join(route)
@@ -124,6 +127,32 @@ fn route_url(base_url: &str, route: &str) -> Result<Url> {
         anyhow::bail!("route `{route}` leaves the endpoint origin");
     }
     Ok(joined)
+}
+
+pub(crate) fn endpoint_header_pairs(endpoint: &EndpointConfig) -> Result<Vec<(String, String)>> {
+    let mut pairs = Vec::new();
+    for header in &endpoint.headers {
+        let value = std::env::var(&header.env).with_context(|| {
+            format!(
+                "reading endpoint header `{}` from `{}`",
+                header.name, header.env
+            )
+        })?;
+        pairs.push((header.name.clone(), value));
+    }
+    if let Some(auth) = &endpoint.auth {
+        let value = std::env::var(&auth.env)
+            .with_context(|| format!("reading typed endpoint credential from `{}`", auth.env))?;
+        match auth.mode {
+            crate::config::EndpointAuthMode::ApiKey => {
+                pairs.push(("x-api-key".to_string(), value));
+            }
+            crate::config::EndpointAuthMode::Bearer => {
+                pairs.push(("authorization".to_string(), format!("Bearer {value}")));
+            }
+        }
+    }
+    Ok(pairs)
 }
 
 pub(crate) fn http_agent(timeout: Duration) -> ureq::Agent {
@@ -144,24 +173,8 @@ pub(crate) fn fetch_route(
 ) -> Result<String> {
     let url = route_url(&endpoint.base_url, route)?;
     let mut request = agent.get(url.as_str());
-    for header in &endpoint.headers {
-        let value = std::env::var(&header.env).with_context(|| {
-            format!(
-                "reading endpoint header `{}` from `{}`",
-                header.name, header.env
-            )
-        })?;
-        request = request.header(&header.name, &value);
-    }
-    if let Some(auth) = &endpoint.auth {
-        let value = std::env::var(&auth.env)
-            .with_context(|| format!("reading typed endpoint credential from `{}`", auth.env))?;
-        request = match auth.mode {
-            crate::config::EndpointAuthMode::ApiKey => request.header("x-api-key", &value),
-            crate::config::EndpointAuthMode::Bearer => {
-                request.header("authorization", &format!("Bearer {value}"))
-            }
-        };
+    for (name, value) in endpoint_header_pairs(endpoint)? {
+        request = request.header(&name, &value);
     }
     let mut response = request
         .call()
@@ -174,7 +187,7 @@ pub(crate) fn fetch_route(
 /// limit sits beneath content decoding and counts compressed bytes, so a
 /// small gzip body could otherwise expand far past it. The wire limit stays
 /// as well; the decoded reader then stops at `limit + 1` bytes.
-fn read_decoded_body(body: &mut ureq::Body, limit: u64) -> Result<String> {
+pub(crate) fn read_decoded_body(body: &mut ureq::Body, limit: u64) -> Result<String> {
     use std::io::Read;
     let mut decoded = Vec::new();
     // ureq refuses a body that reaches its limit; one byte of slack keeps an

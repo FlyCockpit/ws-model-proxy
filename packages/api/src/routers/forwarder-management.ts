@@ -1002,6 +1002,7 @@ function serializeCliDevice(
     labels: normalizeNodeLabels(row.labels ?? []),
     node: serializeCliDeviceNode(row, liveTelemetry?.nodeMetrics),
     fileTools: featureView.fileTools,
+    countContext: live?.countContext === true,
     allowFileToolsAsRoot: featureView.allowFileToolsAsRoot,
     mcpFileRead: featureView.mcpFileRead,
     reportedMcpFileRead: featureView.reportedMcpFileRead,

@@ -721,7 +721,7 @@
         "engine": "Use engine-reported count when available",
         "tokenizer": "Calibrated estimate",
         "template": "Calibrated estimate",
-        "engineRequirement": "Requires Anthropic Messages or Responses count_tokens on the selected target. Chat Completions fall back to the estimate. WSMP uses a conservative estimate when that support is unavailable.",
+        "engineRequirement": "Requires Anthropic Messages or Responses count_tokens, or a connected CLI that implements count_context for Chat Completions (vLLM /tokenize, TGI /chat_tokenize, llama.cpp /apply-template). Chat Completions asks the CLI only near the member ceiling; timeouts and unsupported engines fall back to the estimate. CLI upgrade required when this strategy is set and the connected CLI does not advertise countContext.",
         "calibratedRequirement": "Learns a per-capacity ratio from engine-reported prompt tokens on text-only requests, then uses the 95th percentile for context checks.",
         "registeredRequirement": "Learns a per-capacity ratio from engine-reported prompt tokens on text-only requests, then uses the 95th percentile for context checks."
       },
@@ -894,7 +894,7 @@
         "reservedSlots": "Reserved slots on the shared runtime",
         "reservedSlotsHint": "Reserves this many slots of the shared physical runtime for this pool. Other pools may use them only when idle, only under their borrowing policy, and never while a higher-priority queued request of this pool needs the slot. Cannot exceed this pool's ceiling.",
         "physicalCountStrategy": "Physical token count strategy",
-        "physicalCountStrategyHint": "How the runtime counts request tokens before the context-ceiling check. The default, conservative estimate, overcounts text (serialized UTF-8 bytes ÷ 3 with a 1.2 safety factor) and sizes images from headers. Calibrated estimate learns from engine-reported prompt tokens. Engine-reported count covers Anthropic Messages and Responses count_tokens only.",
+        "physicalCountStrategyHint": "How the runtime counts request tokens before the context-ceiling check. The default, conservative estimate, overcounts text (serialized UTF-8 bytes ÷ 3 with a 1.2 safety factor) and sizes images from headers. Calibrated estimate learns from engine-reported prompt tokens. Engine-reported count uses Anthropic Messages and Responses count_tokens, and for Chat Completions the CLI count_context op when the engine supports it (near the member ceiling).",
         "contextMargin": "Pool context safety margin (defaults to 0)",
         "contextMarginHint": "Headroom reserved below the ceiling: admission requires counted tokens plus this margin to fit the ceiling and the physical maximum. Must stay below the ceiling.",
         "memberContextInheritHint": "Inherits the optional pool ceiling; no member ceiling is set.",

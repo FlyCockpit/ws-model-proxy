@@ -203,6 +203,12 @@ const v28CliCapabilitiesSchema = z
     nodeTelemetry: z.literal(true),
     /** 2.8: the CLI runs `file.op` (answers `unsupported` for ops it has not implemented). */
     fileOps: z.literal(true),
+    /**
+     * 2.4: the CLI runs `count_context` (Chat Completions engine tokenize).
+     * Optional so a 2.4 hello without the flag still parses; the server
+     * preflights ENGINE_REPORTED Chat as "CLI upgrade required" when absent.
+     */
+    countContext: z.literal(true).optional(),
     /** Absent when the CLI could not load its identity; browsers then refuse it. */
     terminalIdentity: cliTerminalIdentitySchema.optional(),
   })
@@ -272,6 +278,10 @@ export const engineFactsSchema = z
       })
       .strict()
       .optional(),
+    /** Chat Completions tokenize route recorded at probe time. */
+    countContext: engineFact(
+      z.enum(["vllm_tokenize", "tgi_chat_tokenize", "llama_apply_template"]),
+    ).optional(),
   })
   .strict();
 
@@ -812,6 +822,22 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
+      type: z.literal("count_context.result"),
+      requestId: requestIdSchema,
+      tokens: z.number().int().min(0).max(TOKEN_COUNT_MAX),
+      method: z.enum(["vllm_tokenize", "tgi_chat_tokenize", "llama_apply_template"]),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("count_context.error"),
+      requestId: requestIdSchema,
+      failure: relayFailureSchema,
+      message: z.string().max(1000).optional(),
+    })
+    .strict(),
+  z
+    .object({
       type: z.literal("term.pending"),
       terminalId: base64Url16ByteSchema,
       viewerId: viewerIdSchema.optional(),
@@ -1098,7 +1124,16 @@ export type RelayServerControlMessage =
       mode: FileOpFrame["mode"];
       readGrant: boolean;
     }
-  | { type: "file.cancel"; opId: string };
+  | { type: "file.cancel"; opId: string }
+  | {
+      /** 2.4: Chat Completions engine tokenize. Request JSON follows as `relay.request.body`. */
+      type: "count_context";
+      requestId: string;
+      endpointSlug: string;
+      model: string;
+      timeoutMs: number;
+      expectBody: boolean;
+    };
 
 const relayBodyMetadataFields = {
   requestId: requestIdSchema,

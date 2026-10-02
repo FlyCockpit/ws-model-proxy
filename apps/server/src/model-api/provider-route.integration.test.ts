@@ -711,6 +711,9 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       sendRelayRequest: () => undefined,
       cancelRelayRequest: () => undefined,
       completeRelayRequest: () => undefined,
+      supportsCountContext: () => false,
+      registerCountContextHandlers: () => undefined,
+      sendCountContext: () => undefined,
     };
     const app = input.cookieAuth
       ? (() => {
