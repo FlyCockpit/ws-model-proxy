@@ -32,10 +32,7 @@ import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/opena
 import { parseStoredRemoteEngineAdapters } from "@ws-model-proxy/api/lib/remote-engine-adapters";
 import type { SupervisedCommandStatus } from "@ws-model-proxy/api/lib/supervised-command-types";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
-import {
-  resetKvEvictionForCliDevice,
-  resetKvEvictionForEndpoint,
-} from "../model-api/kv-eviction-feedback.js";
+import { resetKvEvictionForEndpoint } from "../model-api/kv-eviction-feedback.js";
 import { startRelayAttempt } from "../model-api/relay-executor.js";
 import { EngineLoadHistoryStore } from "./engine-load-history.js";
 import { observeEngineLoadRollup } from "./engine-load-rollup.js";
@@ -390,6 +387,8 @@ const TELEMETRY_FRAME_TYPES: ReadonlySet<string> = new Set([
 export const ENDPOINT_LOAD_MIN_INTERVAL_MS = 1_000;
 /** Distinct endpoint/model load keys kept per session. */
 export const ENDPOINT_LOAD_MAX_KEYS = 1_000;
+/** KV-eviction reset (epoch change or prefixCacheReset) at most this often per endpoint. */
+export const KV_EVICTION_RESET_DEBOUNCE_MS = 30_000;
 
 function addCapped(total: number, delta: number): number {
   return Math.min(Number.MAX_SAFE_INTEGER, total + delta);
@@ -416,6 +415,8 @@ type SessionState = {
   /** Serialises `engine.adapters.set` sends the same way. */
   remoteAdaptersQueue: Promise<void>;
   inventoryConfirmed: boolean;
+  /** Slugs from the last accepted hello / inventory.update. */
+  inventorySlugs: Set<string>;
   endpointTargeting: boolean;
   protocolVersion: RelayProtocolVersion | null;
   cliVersion: string | null;
@@ -652,6 +653,10 @@ export class RelaySessionManager {
   private sessionsByCliDeviceId = new Map<string, SessionState>();
   /** Manager-level so a reconnect does not wipe the 30-minute ring. */
   private engineLoadHistory = new EngineLoadHistoryStore();
+  /** Last `counterEpoch` per (device, endpoint). Survives reconnect of this process. */
+  private kvCounterEpochByEndpoint = new Map<string, number>();
+  /** Last KV-eviction reset time per (device, endpoint), for debounce. */
+  private kvResetAtByEndpoint = new Map<string, number>();
   private featureGrantsRefreshByCliDeviceId = new Map<string, Promise<void>>();
   private grantChangeSeq = 0;
   // One integer per device changed since process start. There is no device-delete
@@ -736,6 +741,7 @@ export class RelaySessionManager {
       remoteSourcesQueue: Promise.resolve(),
       remoteAdaptersQueue: Promise.resolve(),
       inventoryConfirmed: false,
+      inventorySlugs: new Set(),
       endpointTargeting: false,
       protocolVersion: null,
       cliVersion: null,
@@ -872,9 +878,7 @@ export class RelaySessionManager {
         clearTimeout(session.unauthenticatedTimer);
         this.reconcileInteractiveGrants(session);
         this.replaceDuplicateSession(session);
-        void resetKvEvictionForCliDevice(registration.cliDeviceId, now).catch(() => {
-          /* Disposable: hello must not fail because evidence reset did. */
-        });
+        session.inventorySlugs = new Set(message.endpoints.map((endpoint) => endpoint.slug));
         if (stalePolicy) {
           void this.refreshFeatureGrants(registration.cliDeviceId).catch((error: unknown) => {
             console.error(
@@ -960,6 +964,7 @@ export class RelaySessionManager {
         // Detached during the write: nothing to acknowledge. An inventory
         // update never writes connection state, so there is nothing to undo.
         if (this.sessionsBySocket.get(socket) !== session) return;
+        session.inventorySlugs = new Set(message.endpoints.map((endpoint) => endpoint.slug));
         socket.send(
           encodeRelayServerControlMessage({
             type: "inventory.ok",
@@ -1696,6 +1701,40 @@ export class RelaySessionManager {
   }
 
   /**
+   * Reset KV-eviction evidence only on a `counterEpoch` change or an explicit
+   * `prefixCacheReset`. Hello must not wipe rows. Unknown inventory slugs are
+   * ignored; repeats are debounced.
+   */
+  private noteKvEvictionResetSignal(
+    session: SessionState,
+    load: Pick<EndpointLoadMessage, "endpointSlug" | "prefixCacheReset" | "counterEpoch">,
+    now: Date,
+  ) {
+    const cliDeviceId = session.cliDeviceId;
+    if (!cliDeviceId || !session.inventorySlugs.has(load.endpointSlug)) return;
+    const key = `${cliDeviceId}\0${load.endpointSlug}`;
+    const previousEpoch = this.kvCounterEpochByEndpoint.get(key);
+    if (load.counterEpoch !== undefined) this.kvCounterEpochByEndpoint.set(key, load.counterEpoch);
+    const epochChanged =
+      load.counterEpoch !== undefined &&
+      previousEpoch !== undefined &&
+      load.counterEpoch !== previousEpoch;
+    if (!epochChanged && load.prefixCacheReset !== true) return;
+    const lastResetMs = this.kvResetAtByEndpoint.get(key);
+    const nowMs = now.getTime();
+    if (
+      lastResetMs !== undefined &&
+      Number.isFinite(nowMs) &&
+      nowMs - lastResetMs < KV_EVICTION_RESET_DEBOUNCE_MS
+    )
+      return;
+    if (Number.isFinite(nowMs)) this.kvResetAtByEndpoint.set(key, nowMs);
+    void resetKvEvictionForEndpoint(cliDeviceId, load.endpointSlug, now).catch(() => {
+      /* Disposable: load frames must not fail closed on evidence reset. */
+    });
+  }
+
+  /**
    * 2.7 telemetry. Frames above the rate limits are dropped, never fatal.
    * `endpoint.load` and the freshest metrics stay in memory; the CliDevice
    * row gets `node.info` once per connection and a metrics snapshot at most
@@ -1716,20 +1755,17 @@ export class RelaySessionManager {
       const hitsDelta = load.prefixCacheHitsDelta ?? 0;
       const queriesDelta = load.prefixCacheQueriesDelta ?? 0;
       if (previous && nowMs - previous.receivedAtMs < ENDPOINT_LOAD_MIN_INTERVAL_MS) {
-        // The reading is dropped but its counter deltas are not.
+        // The reading is dropped but its counter deltas and reset signals are not.
         previous.prefixCacheHitsTotal = addCapped(previous.prefixCacheHitsTotal, hitsDelta);
         previous.prefixCacheQueriesTotal = addCapped(
           previous.prefixCacheQueriesTotal,
           queriesDelta,
         );
+        this.noteKvEvictionResetSignal(session, load, now);
         return;
       }
-      if (load.prefixCacheReset && cliDeviceId) {
-        void resetKvEvictionForEndpoint(cliDeviceId, load.endpointSlug, now).catch(() => {
-          /* Disposable: load frames must not fail closed on evidence reset. */
-        });
-      }
       if (!previous && session.endpointLoad.size >= ENDPOINT_LOAD_MAX_KEYS) return;
+      this.noteKvEvictionResetSignal(session, load, now);
       // "Sustained" waiting counts consecutive accepted frames. A gap longer
       // than the staleness window restarts the count (fail open).
       const continuous = previous && nowMs - previous.receivedAtMs <= ENDPOINT_LOAD_STALE_AFTER_MS;

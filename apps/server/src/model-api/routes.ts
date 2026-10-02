@@ -6184,7 +6184,11 @@ async function relayPool({
           // S-C: even one member must know whether this is a continuation
           // (only protection needs it: a pool without it pays no extra reads).
           scoreSingleTarget: Boolean(capacityRuntime) && protectionPolicy.enabled,
-          collectPrefixEvidence: Boolean(capacityRuntime) && protectionPolicy.enabled,
+          collectPrefixEvidence:
+            Boolean(capacityRuntime) &&
+            protectionPolicy.enabled &&
+            (protectionPolicy.evictionFeedbackEnabled ?? true),
+          evictionFeedbackEnabled: protectionPolicy.evictionFeedbackEnabled ?? true,
         });
         const affinityOrder = new Map(
           affinityDecision.orderedTargetIds.map((executionTargetId, index) => [

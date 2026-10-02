@@ -19,6 +19,7 @@ import {
   effectiveKvBudgetTokens,
   effectiveKvCut,
   KV_EVICTION_FLOOR_FRACTION,
+  kvEvictionCutsApply,
   protectionKvBudgetTokens,
 } from "../lib/kv-eviction-budget";
 import {
@@ -118,6 +119,7 @@ export const metricRoutingProcedures = {
           slug: true,
           routingRules: true,
           protectionEnabled: true,
+          evictionFeedbackEnabled: true,
           PoolMembers: {
             where: { tier: "PRIMARY" },
             orderBy: { createdAt: "asc" },
@@ -250,10 +252,18 @@ export const metricRoutingProcedures = {
             member.capacity?.kvBudgetTokens ?? null,
           );
           const protectionEnabled = pool.protectionEnabled;
-          const placementTokens = effectiveKvBudgetTokens(reportedTokens, kvState, now);
+          const applyCuts = kvEvictionCutsApply(pool.evictionFeedbackEnabled);
+          const placementTokens = effectiveKvBudgetTokens(
+            reportedTokens,
+            kvState,
+            now,
+            pool.evictionFeedbackEnabled,
+          );
           const effectiveTokens = protectionEnabled ? placementTokens : reportedTokens;
           const cutFraction =
-            !protectionEnabled || effectiveTokens === null ? 0 : effectiveKvCut(kvState, now);
+            !protectionEnabled || !applyCuts || effectiveTokens === null
+              ? 0
+              : effectiveKvCut(kvState, now);
           return {
             poolMemberId: member.id,
             upstreamModelId: member.model.upstreamModelId,

@@ -640,7 +640,7 @@
       "description": "A new conversation avoids a member whose free capacity still holds the recent, large prompt caches of protected warm sessions (including your own) when another member (or, for :external, an external provider) can take it. Protection only redirects: it never makes a request wait, and a continuation always goes back to its warm member.",
       "enabled": "Protect active conversations",
       "evictionFeedback": "Lower KV budget from prefix-cache evictions",
-      "evictionFeedbackHint": "When off, protection stays on and the current effective KV budget is frozen. Turning it back on resumes cuts and recovery from that frozen state.",
+      "evictionFeedbackHint": "When off, protection stays on and admission uses the reported KV budget, ignoring stored cuts. Turning it back on resumes cuts and recovery from the stored state.",
       "windowSeconds": "Protection window (seconds)",
       "minTokens": "Minimum conversation size (tokens)",
       "share": "Share between users",

@@ -71,8 +71,17 @@ export function boundedKvEvictionSessions(sessionIds: readonly string[]): string
   return out;
 }
 
-export function effectiveKvCut(state: KvEvictionState | null | undefined, now: Date): number {
-  if (!state) return 0;
+/** Admission freeze: ignore stored cuts and use the reported K. */
+export function kvEvictionCutsApply(evictionFeedbackEnabled?: boolean): boolean {
+  return evictionFeedbackEnabled !== false;
+}
+
+export function effectiveKvCut(
+  state: KvEvictionState | null | undefined,
+  now: Date,
+  evictionFeedbackEnabled?: boolean,
+): number {
+  if (!kvEvictionCutsApply(evictionFeedbackEnabled) || !state) return 0;
   const elapsed = now.getTime() - state.observedAt.getTime();
   return Math.max(
     0,
@@ -204,9 +213,11 @@ export function effectiveKvBudgetTokens(
   reported: number | null | undefined,
   state: KvEvictionState | null | undefined,
   now: Date,
+  evictionFeedbackEnabled?: boolean,
 ): number | null {
   if (reported == null || !Number.isInteger(reported) || reported <= 0 || reported > 2_147_483_647)
     return null;
+  if (!kvEvictionCutsApply(evictionFeedbackEnabled)) return reported;
   const cut = effectiveKvCut(state, now);
   return Math.min(
     reported,

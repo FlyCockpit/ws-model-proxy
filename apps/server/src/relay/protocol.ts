@@ -595,6 +595,12 @@ const endpointLoadSchema = z
     prefixCacheQueriesDelta: byteCounterSchema.optional(),
     /** Engine prefix-cache counters dropped (restart / flush). Not a delta. */
     prefixCacheReset: z.literal(true).optional(),
+    /**
+     * Monotonic per-endpoint counter generation. The CLI bumps it when prefix
+     * counters drop or the engine identity changes. Optional so older frames
+     * still parse; the server resets KV-eviction state only on a change.
+     */
+    counterEpoch: z.number().int().min(0).max(4_294_967_295).optional(),
     source: z.enum([
       "llama.cpp-slots",
       "llama.cpp-metrics",

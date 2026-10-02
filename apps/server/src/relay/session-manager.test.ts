@@ -31,6 +31,12 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   },
 }));
 
+const kvEviction = vi.hoisted(() => ({
+  resetKvEvictionForCliDevice: vi.fn(async () => {}),
+  resetKvEvictionForEndpoint: vi.fn(async () => {}),
+}));
+vi.mock("../model-api/kv-eviction-feedback.js", () => kvEviction);
+
 const { RelaySessionManager } = await import("./session-manager.js");
 const { default: prisma } = await import("@ws-model-proxy/db");
 
@@ -3342,6 +3348,102 @@ describe("relay 2.7 telemetry", () => {
       prefixCacheHitsTotal: 16,
       prefixCacheQueriesTotal: 47,
     });
+    manager.dispose();
+  });
+
+  const inventoryLoad = (extra: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      type: "endpoint.load",
+      endpointSlug: "local-openai",
+      running: 1,
+      waiting: 0,
+      source: "vllm-metrics",
+      ts: "2026-01-01T00:00:00.000Z",
+      ...extra,
+    });
+
+  it("does not reset KV eviction evidence on hello", async () => {
+    const { manager } = await registered();
+    expect(kvEviction.resetKvEvictionForCliDevice).not.toHaveBeenCalled();
+    expect(kvEviction.resetKvEvictionForEndpoint).not.toHaveBeenCalled();
+    manager.dispose();
+  });
+
+  it("honours prefixCacheReset on a rate-limited endpoint.load frame", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad(), now);
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ prefixCacheReset: true, running: 2 }),
+      at(200),
+    );
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledWith(
+      "cli-device-id",
+      "local-openai",
+      at(200),
+    );
+    manager.dispose();
+  });
+
+  it("ignores prefixCacheReset for a slug outside the session inventory", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, load("vllm", 1), now);
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ ...JSON.parse(load("vllm", 1)), prefixCacheReset: true }),
+      at(1_500),
+    );
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).not.toHaveBeenCalled();
+    manager.dispose();
+  });
+
+  it("resets KV eviction only when counterEpoch changes", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 0 }), now);
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).not.toHaveBeenCalled();
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ counterEpoch: 0, running: 2 }),
+      at(1_500),
+    );
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).not.toHaveBeenCalled();
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ counterEpoch: 1, running: 3 }),
+      at(3_000),
+    );
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledWith(
+      "cli-device-id",
+      "local-openai",
+      at(3_000),
+    );
+    manager.dispose();
+  });
+
+  it("debounces KV eviction resets per endpoint", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad({ prefixCacheReset: true }), now);
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ prefixCacheReset: true, running: 2 }),
+      at(1_500),
+    );
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ prefixCacheReset: true, running: 3 }),
+      at(31_000),
+    );
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(2);
     manager.dispose();
   });
 

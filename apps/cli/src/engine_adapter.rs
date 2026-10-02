@@ -653,6 +653,7 @@ fn normalize(
             .map(|value| *value as u64),
         prefix_cache_hits_total: values.get(&AdapterSignal::PrefixCacheHitsTotal).copied(),
         prefix_cache_queries_total: values.get(&AdapterSignal::PrefixCacheQueriesTotal).copied(),
+        process_start_time_seconds: None,
         source: LoadSource::Custom,
     });
     let error = if reading.is_some() {

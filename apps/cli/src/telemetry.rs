@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -251,20 +251,66 @@ fn run(
     }
 }
 
+#[derive(Clone, Default)]
+struct PersistedLoadCounters {
+    counter_epoch: u32,
+    prefix_hits_total: Option<f64>,
+    prefix_queries_total: Option<f64>,
+    process_start_time_seconds: Option<f64>,
+}
+
+fn persisted_load_counters() -> &'static Mutex<BTreeMap<String, PersistedLoadCounters>> {
+    static MAP: OnceLock<Mutex<BTreeMap<String, PersistedLoadCounters>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
 #[derive(Default)]
 struct LoadState {
     last_sent: Option<(Instant, LoadReading)>,
     prefix_hits_total: Option<f64>,
     prefix_queries_total: Option<f64>,
+    process_start_time_seconds: Option<f64>,
+    counter_epoch: u32,
 }
 
 impl LoadState {
+    /// Seed from the process-wide map so a reconnect of this CLI keeps the
+    /// epoch and last counters (an engine restart while disconnected still
+    /// looks like a drop).
+    fn restore(slug: &str) -> Self {
+        persisted_load_counters()
+            .lock()
+            .ok()
+            .and_then(|map| map.get(slug).cloned())
+            .map(|persisted| Self {
+                last_sent: None,
+                prefix_hits_total: persisted.prefix_hits_total,
+                prefix_queries_total: persisted.prefix_queries_total,
+                process_start_time_seconds: persisted.process_start_time_seconds,
+                counter_epoch: persisted.counter_epoch,
+            })
+            .unwrap_or_default()
+    }
+
     /// Record a frame the relay loop accepted. A dropped frame is not
     /// committed, so its prefix-cache deltas fold into the next one.
-    fn commit(&mut self, reading: LoadReading, at: Instant) {
+    fn commit(&mut self, slug: &str, reading: LoadReading, at: Instant, counter_epoch: u32) {
         self.prefix_hits_total = reading.prefix_cache_hits_total;
         self.prefix_queries_total = reading.prefix_cache_queries_total;
+        self.process_start_time_seconds = reading.process_start_time_seconds;
+        self.counter_epoch = counter_epoch;
         self.last_sent = Some((at, reading));
+        if let Ok(mut map) = persisted_load_counters().lock() {
+            map.insert(
+                slug.to_string(),
+                PersistedLoadCounters {
+                    counter_epoch,
+                    prefix_hits_total: self.prefix_hits_total,
+                    prefix_queries_total: self.prefix_queries_total,
+                    process_start_time_seconds: self.process_start_time_seconds,
+                },
+            );
+        }
     }
 }
 
@@ -485,6 +531,9 @@ where
             let (targets, remote_statuses) =
                 load_targets_with_remote(&endpoints, &remote, allow_remote, &approved);
             schedules.retain(|slug, _| targets.iter().any(|(endpoint, _)| endpoint.slug == *slug));
+            if let Ok(mut map) = persisted_load_counters().lock() {
+                map.retain(|slug, _| targets.iter().any(|(endpoint, _)| endpoint.slug == *slug));
+            }
             if let Ok(mut shared) = shared.lock() {
                 let live: std::collections::BTreeSet<_> = targets
                     .iter()
@@ -512,12 +561,13 @@ where
                 if replace {
                     next_epoch += 1;
                     let interval = plan_interval(&target.1);
+                    let restored = LoadState::restore(&slug);
                     schedules.insert(
                         slug,
                         LoadSchedule {
                             epoch: next_epoch,
                             target,
-                            state: LoadState::default(),
+                            state: restored,
                             next_due: Instant::now(),
                             in_flight: false,
                             interval,
@@ -601,8 +651,13 @@ where
             ) else {
                 continue;
             };
+            let counter_epoch = frame.counter_epoch.unwrap_or(schedule.state.counter_epoch);
             match offer(tx, ClientControlMessage::EndpointLoad(frame)) {
-                Sent::Queued => schedule.state.commit(reading, done.finished),
+                Sent::Queued => {
+                    schedule
+                        .state
+                        .commit(&done.slug, reading, done.finished, counter_epoch)
+                }
                 Sent::Dropped => {}
                 Sent::Gone => return,
             }
@@ -643,6 +698,19 @@ fn next_load_frame(
                 state.prefix_queries_total,
                 reading.prefix_cache_queries_total,
             );
+    let identity_changed = match (
+        state.process_start_time_seconds,
+        reading.process_start_time_seconds,
+    ) {
+        (Some(previous), Some(current)) => previous != current,
+        _ => false,
+    };
+    let bump_epoch = prefix_cache_reset || identity_changed;
+    let counter_epoch = if bump_epoch {
+        state.counter_epoch.wrapping_add(1)
+    } else {
+        state.counter_epoch
+    };
     let changed_counters = prefix_cache_reset
         || hits_delta.is_some_and(|delta| delta > 0)
         || queries_delta.is_some_and(|delta| delta > 0);
@@ -651,6 +719,7 @@ fn next_load_frame(
         Some((at, last)) => {
             now.duration_since(*at) >= LOAD_REFRESH_INTERVAL
                 || changed_counters
+                || identity_changed
                 || !same_load(last, reading)
         }
     };
@@ -669,6 +738,7 @@ fn next_load_frame(
         prefix_cache_hits_delta: hits_delta,
         prefix_cache_queries_delta: queries_delta,
         prefix_cache_reset: prefix_cache_reset.then_some(true),
+        counter_epoch: Some(counter_epoch),
         source: reading.source,
         ts: ts.to_string(),
     })
@@ -1256,7 +1326,12 @@ mod tests {
         ts: &str,
     ) -> Option<EndpointLoad> {
         let frame = next_load_frame(state, "vllm", &reading, at, ts)?;
-        state.commit(reading, at);
+        state.commit(
+            "vllm",
+            reading,
+            at,
+            frame.counter_epoch.unwrap_or(state.counter_epoch),
+        );
         Some(frame)
     }
 
@@ -1304,6 +1379,49 @@ mod tests {
             reset.prefix_cache_hits_delta, None,
             "a counter reset is not a delta"
         );
+        assert_eq!(first.counter_epoch, Some(0));
+        assert_eq!(changed.counter_epoch, Some(0));
+        assert_eq!(reset.counter_epoch, Some(1));
+        assert_eq!(reset.prefix_cache_reset, Some(true));
+    }
+
+    fn reading_with_start(running: u64, hits: Option<f64>, start: Option<f64>) -> LoadReading {
+        LoadReading {
+            process_start_time_seconds: start,
+            ..reading(running, hits)
+        }
+    }
+
+    #[test]
+    fn counter_epoch_bumps_when_the_engine_identity_changes() {
+        let mut state = LoadState::default();
+        let start = Instant::now();
+        let first = step(
+            &mut state,
+            reading_with_start(1, Some(100.0), Some(1_700_000_000.0)),
+            start,
+            "t0",
+        )
+        .expect("first");
+        assert_eq!(first.counter_epoch, Some(0));
+        assert_eq!(first.prefix_cache_reset, None);
+        let restarted = step(
+            &mut state,
+            reading_with_start(1, Some(100.0), Some(1_700_000_100.0)),
+            start + Duration::from_secs(2),
+            "t1",
+        )
+        .expect("identity change is sent");
+        assert_eq!(restarted.counter_epoch, Some(1));
+        assert_eq!(restarted.prefix_cache_reset, None);
+        let same = step(
+            &mut state,
+            reading_with_start(1, Some(100.0), Some(1_700_000_100.0)),
+            start + Duration::from_secs(8),
+            "t2",
+        )
+        .expect("refresh");
+        assert_eq!(same.counter_epoch, Some(1));
     }
 
     #[test]

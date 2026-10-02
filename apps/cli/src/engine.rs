@@ -528,6 +528,10 @@ fn first_value(samples: &[PromSample], names: &[&str]) -> Option<f64> {
     })
 }
 
+fn process_start_time_seconds(samples: &[PromSample]) -> Option<f64> {
+    first_value(samples, &["process_start_time_seconds"]).filter(|value| *value > 0.0)
+}
+
 fn sum_values(samples: &[PromSample], names: &[&str]) -> Option<f64> {
     names.iter().find_map(|name| {
         let values = samples
@@ -562,6 +566,8 @@ pub struct LoadReading {
     /// Cumulative prefix-cache counters; the sampler turns them into deltas.
     pub prefix_cache_hits_total: Option<f64>,
     pub prefix_cache_queries_total: Option<f64>,
+    /// Prometheus `process_start_time_seconds` when the exposition has it.
+    pub process_start_time_seconds: Option<f64>,
     pub source: LoadSource,
 }
 
@@ -612,6 +618,7 @@ pub fn vllm_load(samples: &[PromSample]) -> Option<LoadReading> {
                 "vllm:prefix_cache_queries",
             ],
         ),
+        process_start_time_seconds: process_start_time_seconds(samples),
         source: LoadSource::VllmMetrics,
         ..LoadReading::default()
     })
@@ -624,6 +631,7 @@ pub fn sglang_load(samples: &[PromSample]) -> Option<LoadReading> {
         running,
         waiting: Some(count(sum_values(samples, &["sglang:num_queue_reqs"])).unwrap_or(0)),
         kv_usage: fraction(first_value(samples, &["sglang:token_usage"])),
+        process_start_time_seconds: process_start_time_seconds(samples),
         source: LoadSource::SglangMetrics,
         ..LoadReading::default()
     })
@@ -638,6 +646,7 @@ pub fn llama_metrics_load(samples: &[PromSample]) -> Option<LoadReading> {
         waiting: Some(deferred.unwrap_or(0)),
         deferred,
         kv_occupancy: fraction(first_value(samples, &["llamacpp:kv_cache_usage_ratio"])),
+        process_start_time_seconds: process_start_time_seconds(samples),
         source: LoadSource::LlamaCppMetrics,
         ..LoadReading::default()
     })
@@ -961,7 +970,29 @@ mod tests {
         assert_eq!(load.kv_usage, Some(0.42));
         assert_eq!(load.prefix_cache_hits_total, Some(1200.0));
         assert_eq!(load.prefix_cache_queries_total, Some(4000.0));
+        assert_eq!(load.process_start_time_seconds, None);
         assert_eq!(load.source, LoadSource::VllmMetrics);
+    }
+
+    #[test]
+    fn process_start_time_seconds_is_read_from_prometheus() {
+        let samples = parse_prometheus(concat!(
+            "process_start_time_seconds 1700000000.5\n",
+            "vllm:num_requests_running 1\n",
+            "vllm:num_requests_waiting 0\n",
+        ));
+        let load = vllm_load(&samples).expect("load");
+        assert_eq!(load.process_start_time_seconds, Some(1_700_000_000.5));
+        let missing = parse_prometheus(concat!(
+            "process_start_time_seconds 0\n",
+            "vllm:num_requests_running 1\n",
+        ));
+        assert_eq!(
+            vllm_load(&missing)
+                .expect("load")
+                .process_start_time_seconds,
+            None
+        );
     }
 
     #[test]

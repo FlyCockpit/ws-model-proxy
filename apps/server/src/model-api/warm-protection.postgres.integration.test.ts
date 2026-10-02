@@ -1171,6 +1171,32 @@ integration("warm-session protection with real PostgreSQL", () => {
           protectedTokens: 30_000,
           effectiveKvBudgetTokens: 50_000,
         });
+        expect(
+          (
+            await warm.assessWarmProtection({
+              ownerId: owner.id,
+              policy: { ...policy, evictionFeedbackEnabled: false },
+              now,
+              members: [
+                {
+                  poolMemberId: "m",
+                  capacityId,
+                  slots: 4,
+                  kvBudgetTokens: 100_000,
+                  engineKind: "VLLM",
+                  affine: false,
+                  requestTokens: 25_000,
+                },
+              ],
+              source: warm.warmProtectionSource,
+            })
+          ).get("m"),
+        ).toMatchObject({
+          state: "FREE",
+          protectedTokens: 30_000,
+          effectiveKvBudgetTokens: 100_000,
+        });
+        expect((await row(capacityId)).cutFraction).toBe(0.5);
         // Keep the row live beyond full recovery to prove read-time linear decay.
         await db.capacityKvEviction.update({
           where: { capacityId },

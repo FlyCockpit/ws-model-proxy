@@ -913,6 +913,35 @@ describe("effective KV assessment", () => {
     });
     expect(result.get("a")).toMatchObject({ state, effectiveKvBudgetTokens: effective });
   });
+  it("freeze admits on reported K and ignores a stored cut", async () => {
+    const result = await assessWarmProtection({
+      ownerId: "owner",
+      policy: policy({ share: "FIRST_COME", evictionFeedbackEnabled: false }),
+      members: [member],
+      now,
+      source: {
+        load: async () => ({
+          activeByCapacity: new Map(),
+          sessionsByCapacity: new Map([["cap-a", [session("alice", 10, 30_000)]]]),
+          kvEvictionByCapacity: new Map([["cap-a", { cutFraction: 0.5, observedAt: now }]]),
+        }),
+      },
+    });
+    expect(result.get("a")).toMatchObject({ state: "FREE", effectiveKvBudgetTokens: 100_000 });
+  });
+  it("frozen production source skips the eviction SQL", async () => {
+    readDb.capacityLease.groupBy.mockResolvedValue([]);
+    readDb.$queryRaw.mockResolvedValue([]);
+    readDb.capacityKvEviction.findMany.mockClear();
+    await assessWarmProtection({
+      ownerId: "owner",
+      policy: policy({ evictionFeedbackEnabled: false }),
+      members: [member],
+      source: warmProtectionSource,
+      now,
+    });
+    expect(readDb.capacityKvEviction.findMany).not.toHaveBeenCalled();
+  });
   it.each([
     { effective: 100_000, state: "PROTECTED" },
     { effective: 200_000, state: "PROTECTED" },

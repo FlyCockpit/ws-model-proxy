@@ -13,6 +13,7 @@ import { randomUUID } from "node:crypto";
 import {
   effectiveKvBudgetTokens,
   type KvEvictionState,
+  kvEvictionCutsApply,
 } from "@ws-model-proxy/api/lib/kv-eviction-budget";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
@@ -1079,6 +1080,7 @@ export async function rankAffinityTargets({
   targets,
   scoreSingleTarget = false,
   collectPrefixEvidence = false,
+  evictionFeedbackEnabled = true,
   sessionBinding,
   headers,
   now = new Date(),
@@ -1097,6 +1099,8 @@ export async function rankAffinityTargets({
   scoreSingleTarget?: boolean;
   /** Read the live-tip footprint snapshot only for enabled eviction feedback. */
   collectPrefixEvidence?: boolean;
+  /** False freezes residency K: skip stored cuts. Default true. */
+  evictionFeedbackEnabled?: boolean;
   sessionBinding?: AffinitySessionBinding;
   headers?: Headers;
   now?: Date;
@@ -1196,19 +1200,22 @@ export async function rankAffinityTargets({
           )
           .then((rows) => (Array.isArray(rows) ? rows : []))
           .catch(() => [] as AffinityResidencyRow[]);
+  const applyCuts = kvEvictionCutsApply(evictionFeedbackEnabled);
   const loadEvictions = () =>
-    Promise.resolve()
-      .then(() =>
-        db.capacityKvEviction.findMany({
-          where: {
-            capacityId: { in: capacityIds },
-            userId: resourceOwnerId,
-            expiresAt: { gt: now },
-          },
-        }),
-      )
-      .then((rows) => (Array.isArray(rows) ? rows : []))
-      .catch(() => [] as Array<KvEvictionState & { capacityId: string }>);
+    !applyCuts || capacityIds.length === 0
+      ? Promise.resolve([] as Array<KvEvictionState & { capacityId: string }>)
+      : Promise.resolve()
+          .then(() =>
+            db.capacityKvEviction.findMany({
+              where: {
+                capacityId: { in: capacityIds },
+                userId: resourceOwnerId,
+                expiresAt: { gt: now },
+              },
+            }),
+          )
+          .then((rows) => (Array.isArray(rows) ? rows : []))
+          .catch(() => [] as Array<KvEvictionState & { capacityId: string }>);
   const [records, activeLoads, waitingLoads, residencyRows, evictions] = await Promise.all([
     db.cacheAffinityRecord.findMany({
       where: {
@@ -1451,6 +1458,7 @@ export async function rankAffinityTargets({
       reportedK,
       evictionByCapacity.get(row.target.capacityId),
       now,
+      evictionFeedbackEnabled,
     );
     const slots = row.target.slots ?? row.target.hardConcurrencyLimit;
     const savedTokens =

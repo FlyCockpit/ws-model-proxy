@@ -13,6 +13,7 @@ import {
   KV_EVICTION_RECOVERY_MS,
   KV_EVICTION_SESSION_CAP,
   KV_EVICTION_STEP,
+  kvEvictionCutsApply,
   protectionKvBudgetTokens,
 } from "./kv-eviction-budget";
 
@@ -39,6 +40,14 @@ describe("relative eviction budget", () => {
     expect(protectionKvBudgetTokens("LLAMA_CPP", 100_000)).toBeNull();
     expect(protectionKvBudgetTokens("VLLM", 100_000)).toBe(100_000);
     expect(protectionKvBudgetTokens("VLLM", 0)).toBeNull();
+  });
+  it("freeze ignores stored cuts and returns the reported K", () => {
+    expect(kvEvictionCutsApply(false)).toBe(false);
+    expect(kvEvictionCutsApply(undefined)).toBe(true);
+    expect(effectiveKvCut(state(0.5), now, false)).toBe(0);
+    expect(effectiveKvBudgetTokens(100_000, state(0.5), now, false)).toBe(100_000);
+    expect(effectiveKvBudgetTokens(100_000, state(0.5), now, true)).toBe(50_000);
+    expect(effectiveKvBudgetTokens(100_000, state(0.5), now)).toBe(50_000);
   });
   it.each([
     { name: "no row", reported: 100, row: null, expected: 100 },

@@ -640,7 +640,7 @@
       "description": "Una conversación nueva evita un miembro cuya capacidad libre todavía guarda cachés de prompt recientes y grandes de sesiones calientes protegidas (incluidas las tuyas) cuando otro miembro (o, con :external, un proveedor externo) puede atenderla. La protección solo redirige: nunca hace esperar una solicitud, y una continuación siempre vuelve a su miembro con caché.",
       "enabled": "Proteger conversaciones activas",
       "evictionFeedback": "Bajar el presupuesto KV por desalojo de caché de prefijo",
-      "evictionFeedbackHint": "Si está apagado, la protección sigue activa y el presupuesto KV efectivo queda congelado. Al encenderlo de nuevo, los recortes y la recuperación continúan desde ese estado.",
+      "evictionFeedbackHint": "Si está apagado, la protección sigue activa y la admisión usa el presupuesto KV reportado, ignorando los recortes guardados. Al encenderlo de nuevo, los recortes y la recuperación continúan desde el estado guardado.",
       "windowSeconds": "Ventana de protección (segundos)",
       "minTokens": "Tamaño mínimo de la conversación (tokens)",
       "share": "Reparto entre usuarios",

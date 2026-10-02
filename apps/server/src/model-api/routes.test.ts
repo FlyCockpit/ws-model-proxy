@@ -2651,6 +2651,28 @@ describe("model API routes", () => {
       );
     });
 
+    it("skips prefix-evidence SQL when eviction feedback is frozen", async () => {
+      db.poolMember.findMany.mockResolvedValue(
+        members(1).map((member) => ({
+          ...member,
+          ModelPool: { ...member.ModelPool, evictionFeedbackEnabled: false },
+        })),
+      );
+      kvPools({ a: "FREE" });
+      const { runtime } = scripted(["member-a"]);
+
+      const { response } = await serveLocal(runtime, poolTarget.modelId);
+
+      expect(response.status).toBe(200);
+      expect(affinity.rank).toHaveBeenCalledWith(
+        expect.objectContaining({
+          scoreSingleTarget: true,
+          collectPrefixEvidence: false,
+          evictionFeedbackEnabled: false,
+        }),
+      );
+    });
+
     it("evidence collection is off without a capacity runtime", async () => {
       db.poolMember.findMany.mockResolvedValue(members());
       const manager = new FakeRelayManager();

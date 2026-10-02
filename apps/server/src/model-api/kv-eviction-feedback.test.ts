@@ -16,6 +16,8 @@ import {
   MAX_PENDING_CAPACITIES,
   qualifiesAsEvictionEvidence,
   recordKvEvictionObservations,
+  resetKvEvictionForCliDevice,
+  resetKvEvictionForEndpoint,
 } from "./kv-eviction-feedback.js";
 
 const now = new Date("2026-09-30T12:00:00Z");
@@ -154,6 +156,19 @@ describe("eviction evidence", () => {
         evidence: { ...valid.evidence!, tokens: 18_000 },
       }),
     ).toBe(false);
+  });
+
+  it("hello-style device reset still deletes matching rows when called", async () => {
+    const findMany = vi.fn(async () => [{ id: "c1" }, { id: "c2" }]);
+    const deleteMany = vi.fn(async () => ({ count: 2 }));
+    const db = {
+      inferenceCapacity: { findMany },
+      capacityKvEviction: { deleteMany },
+    } as unknown as NonNullable<Parameters<typeof resetKvEvictionForCliDevice>[2]>;
+    await resetKvEvictionForCliDevice("device", now, db);
+    expect(deleteMany).toHaveBeenCalledWith({ where: { capacityId: { in: ["c1", "c2"] } } });
+    await resetKvEvictionForEndpoint("device", "vllm", now, db);
+    expect(findMany).toHaveBeenCalledTimes(2);
   });
 
   it("freeze holds K: misses are not evidence until unfrozen", () => {

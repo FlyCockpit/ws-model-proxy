@@ -1,6 +1,7 @@
 import {
   effectiveKvBudgetTokens,
   type KvEvictionState,
+  kvEvictionCutsApply,
   protectionKvBudgetTokens,
 } from "@ws-model-proxy/api/lib/kv-eviction-budget";
 
@@ -69,7 +70,10 @@ export type ProtectionShareMode = "EQUAL_SHARE" | "FIRST_COME" | "FIXED_PERCENT"
 
 export type WarmProtectionPolicy = {
   enabled: boolean;
-  /** Default true. False freezes effective K: no new cuts, stored state kept. */
+  /**
+   * Default true. False is a real freeze: admission uses the reported K and
+   * ignores stored cuts. Rows stay unused until unfreeze.
+   */
   evictionFeedbackEnabled?: boolean;
   windowSeconds: number;
   minTokens: number;
@@ -567,6 +571,7 @@ export async function loadWarmSessions({
 /** Production source: active leases and warm sessions, plain reads only. */
 export const warmProtectionSource: WarmProtectionSource = {
   async load({ ownerId, capacityIds, policy, now = new Date() }) {
+    const applyCuts = kvEvictionCutsApply(policy.evictionFeedbackEnabled);
     const [active, sessionsByCapacity, kvEvictions] = await Promise.all([
       prisma.capacityLease.groupBy({
         by: ["capacityId"],
@@ -574,11 +579,17 @@ export const warmProtectionSource: WarmProtectionSource = {
         _count: { _all: true },
       }),
       loadWarmSessions({ ownerId, capacityIds, policy, now }),
-      prisma.capacityKvEviction
-        .findMany({
-          where: { capacityId: { in: [...capacityIds] }, userId: ownerId, expiresAt: { gt: now } },
-        })
-        .catch(() => []),
+      applyCuts
+        ? prisma.capacityKvEviction
+            .findMany({
+              where: {
+                capacityId: { in: [...capacityIds] },
+                userId: ownerId,
+                expiresAt: { gt: now },
+              },
+            })
+            .catch(() => [])
+        : Promise.resolve([]),
     ]);
     return {
       activeByCapacity: new Map(active.map((row) => [row.capacityId, row._count._all])),
@@ -630,11 +641,13 @@ export async function assessWarmProtection({
       kvBudgetTokens: protectionKvBudgetTokens(member.engineKind, member.kvBudgetTokens),
     };
     // Eviction feedback lowers ONLY the PROTECTED threshold; the equity shares
-    // stay on the reported K (a lower K never un-protects a session).
+    // stay on the reported K (a lower K never un-protects a session). A freeze
+    // ignores stored cuts and admits on the reported K.
     load.effectiveKvBudgetTokens = effectiveKvBudgetTokens(
       load.kvBudgetTokens,
       snapshot.kvEvictionByCapacity.get(member.capacityId),
       now,
+      policy.evictionFeedbackEnabled,
     );
     const protectedSessions = protectedWarmSessions(
       snapshot.sessionsByCapacity.get(member.capacityId) ?? [],
