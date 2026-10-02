@@ -151,7 +151,9 @@ describe("sanitizeValidationIssues", () => {
     if ("code" in issue && issue.code === "unrecognized_keys") {
       expect(issues?.[0]?.message).toBe("Unrecognized field");
       expect(issues?.[0]?.message).not.toContain(PLAIN_SECRET);
-      expect(issues?.[0]?.keys).toEqual([PLAIN_SECRET]);
+      expect(issues?.[0]?.unknownKeyCount).toBe(1);
+      expect(issues?.[0]?.suggestions).toBeUndefined();
+      expect(JSON.stringify(issues)).not.toContain(PLAIN_SECRET);
       return;
     }
     expect(JSON.stringify(issues)).not.toContain(PLAIN_SECRET);
@@ -218,7 +220,7 @@ describe("sanitizeValidationIssues", () => {
     ]);
   });
 
-  it("names identifier-shaped unrecognized keys and drops the rest", () => {
+  it("does not echo unrecognized keys and suggests the nearest declared names", () => {
     const issues = sanitize(
       [
         {
@@ -235,12 +237,35 @@ describe("sanitizeValidationIssues", () => {
         path: [],
         code: "unrecognized_keys",
         message: "Unrecognized field",
-        keys: ["capacityConcurrencyLimit"],
+        unknownKeyCount: 5,
       },
     ]);
     expect(JSON.stringify(issues)).not.toContain(PLAIN_SECRET);
     expect(JSON.stringify(issues)).not.toContain("SUPERSECRETVALUE");
-    expect(fieldsFromValidationIssues(issues ?? [])).toEqual(["capacityConcurrencyLimit"]);
+    expect(JSON.stringify(issues)).not.toContain("capacityConcurrencyLimit");
+    expect(fieldsFromValidationIssues(issues ?? [])).toEqual([]);
+
+    const suggested = sanitize(
+      [
+        {
+          code: "unrecognized_keys",
+          path: [],
+          keys: ["poolid", "fallbackEnabledX"],
+          message: 'Unrecognized key: "poolid"',
+        },
+      ],
+      new Set(["poolId", "fallbackEnabled", "weight"]),
+    );
+    expect(suggested).toEqual([
+      {
+        path: [],
+        code: "unrecognized_keys",
+        message: "Unrecognized field",
+        unknownKeyCount: 2,
+        suggestions: ["fallbackEnabled", "poolId"],
+      },
+    ]);
+    expect(fieldsFromValidationIssues(suggested ?? [])).toEqual(["fallbackEnabled", "poolId"]);
   });
 
   it("keeps only declared data.fields and a static message", () => {
@@ -338,11 +363,12 @@ describe("sanitizeValidationIssues", () => {
           path: [],
           code: "unrecognized_keys",
           message: "Unrecognized field",
-          keys: ["capacityConcurrencyLimit"],
+          unknownKeyCount: 1,
+          suggestions: ["capacityConcurrencyLimit"],
         },
       ]),
     ).toBe(
-      "poolId: Required; (input): Invalid value; a.0.b: Too small; capacityConcurrencyLimit: Unrecognized field",
+      "poolId: Required; (input): Invalid value; a.0.b: Too small; (input): Unrecognized field (1); try capacityConcurrencyLimit",
     );
   });
 });

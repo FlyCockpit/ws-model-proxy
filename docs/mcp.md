@@ -941,7 +941,8 @@ A schema-valid rejection names the procedure's fields and keeps its static messa
 
 `fields` is present whenever the failure is argument-shaped and at least one
 key can be named: missing or out-of-range values, a key that is not on this
-object (`unrecognized_keys`, also listed on the issue as `keys`), and a
+object (`unrecognized_keys`, counted on the issue as `unknownKeyCount` with
+`suggestions` drawn from the tool's declared names), and a
 schema-valid rejection such as a concurrency limit past physical capacity
 (`data.fields` on the procedure error, kept only when that tool advertises
 the name). `message` is the explanation. Validator `issues` are included when
@@ -949,9 +950,11 @@ the failure came from the schema: `path` names the failing field (array
 indexes are numbers; a segment that is not a field the tool declares is
 `"?"`), `code` is the validator's issue code (anything outside a short
 allowlist of standard codes is reported as `invalid`), and each issue
-`message` is the validator's own text. Input values are never echoed:
-messages that could quote a value (`custom`, `unrecognized_keys`, unknown
-codes) are replaced by fixed text, and at most 20 issues are returned. A
+`message` is the validator's own text. Input values and caller-chosen key
+names are never echoed: messages that could quote a value (`custom`,
+`unrecognized_keys`, unknown codes) are replaced by fixed text, unrecognized
+keys become a count plus server-chosen suggestions, and at most 20 issues
+are returned. A
 `BAD_REQUEST` that is not about an argument (for example a failed
 precondition with no field list) stays the plain "Invalid input".
 

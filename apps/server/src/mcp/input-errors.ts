@@ -15,11 +15,12 @@
  *     becomes `"?"`, so no caller-chosen text can ride in a path;
  *   - `message`: the zod message ONLY for codes whose message is built from
  *     the schema and the input's TYPE (never its value), capped in length;
- *     `unrecognized_keys` (echoes input key names), `custom` (author-written,
- *     may interpolate the value) and unknown codes get a fixed text;
- *   - `keys`: for `unrecognized_keys` only, the identifier-shaped key names
- *     (capped). The path still masks undeclared segments; the key itself is
- *     named here so an agent can see which argument was rejected (#200);
+ *     `unrecognized_keys` (would echo input key names), `custom`
+ *     (author-written, may interpolate the value) and unknown codes get a
+ *     fixed text;
+ *   - `unknownKeyCount` and `suggestions` for `unrecognized_keys` only.
+ *     Suggestions are nearest names the tool already declares. Caller-chosen
+ *     key text never leaves;
  *   - at most {@link MAX_ISSUES} issues; nothing else from the issue
  *     (`input`, `received`, `values`, `errors`, ...) is read.
  */
@@ -30,9 +31,14 @@ export interface McpValidationIssue {
   path: (string | number)[];
   code: string;
   message: string;
-  /** Identifier-shaped unrecognized keys. Absent for every other code. */
-  keys?: string[];
+  /** Count of unrecognized keys. Caller names are never included. */
+  unknownKeyCount?: number;
+  /** Nearest declared property names. Absent when none are close. */
+  suggestions?: string[];
 }
+
+export const MAX_UNKNOWN_KEY_SUGGESTIONS = 5;
+const SUGGESTION_MAX_DISTANCE = 3;
 
 export const MAX_ISSUES = 20;
 export const MAX_PATH_SEGMENTS = 8;
@@ -98,22 +104,54 @@ function sanitizeCode(code: unknown): string {
     : "invalid";
 }
 
+function editDistance(left: string, right: string): number {
+  const m = left.length;
+  const n = right.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  const row = new Array<number>(n + 1);
+  for (let j = 0; j <= n; j += 1) row[j] = j;
+  for (let i = 1; i <= m; i += 1) {
+    let previous = row[0]!;
+    row[0] = i;
+    for (let j = 1; j <= n; j += 1) {
+      const next = row[j]!;
+      const cost = left[i - 1] === right[j - 1] ? 0 : 1;
+      row[j] = Math.min(row[j]! + 1, row[j - 1]! + 1, previous + cost);
+      previous = next;
+    }
+  }
+  return row[n]!;
+}
+
+function unknownKeyCount(keys: unknown): number | undefined {
+  if (!Array.isArray(keys) || keys.length === 0) return undefined;
+  return Math.min(keys.length, MAX_ISSUES);
+}
+
 /**
- * Unrecognized keys are caller-chosen, so only identifier-shaped names are
- * kept. Credential-shaped names are dropped here; `redactSecrets` is the
- * second pass over the finished issue list.
+ * Nearest advertised property names for unrecognized keys. The caller key is
+ * used only as a distance probe and never copied into the result.
  */
-function sanitizeUnknownKeys(keys: unknown): string[] | undefined {
-  if (!Array.isArray(keys)) return undefined;
-  const names: string[] = [];
+function suggestDeclaredNames(keys: unknown, knownKeys: ReadonlySet<string>): string[] | undefined {
+  if (!Array.isArray(keys) || knownKeys.size === 0) return undefined;
+  const ranked = new Map<string, number>();
   for (const key of keys) {
-    if (names.length >= MAX_ISSUES) break;
     if (typeof key !== "string" || key.length === 0 || key.length > MAX_SEGMENT_LENGTH) continue;
     if (!IDENTIFIER_SEGMENT.test(key)) continue;
-    if (redactSecrets(key) !== key) continue;
-    if (!names.includes(key)) names.push(key);
+    for (const known of knownKeys) {
+      if (known.length > MAX_SEGMENT_LENGTH) continue;
+      const distance = editDistance(key, known);
+      if (distance > SUGGESTION_MAX_DISTANCE) continue;
+      const previous = ranked.get(known);
+      if (previous === undefined || distance < previous) ranked.set(known, distance);
+    }
   }
-  return names.length === 0 ? undefined : names;
+  if (ranked.size === 0) return undefined;
+  return [...ranked.entries()]
+    .sort((left, right) => left[1] - right[1] || left[0].localeCompare(right[0]))
+    .slice(0, MAX_UNKNOWN_KEY_SUGGESTIONS)
+    .map(([name]) => name);
 }
 
 /**
@@ -131,13 +169,16 @@ export function sanitizeValidationIssues(
   for (const issue of issues.slice(0, MAX_ISSUES)) {
     if (issue === null || typeof issue !== "object") continue;
     const code = sanitizeCode(Reflect.get(issue, "code"));
-    const keys =
-      code === "unrecognized_keys" ? sanitizeUnknownKeys(Reflect.get(issue, "keys")) : undefined;
+    const rawKeys = code === "unrecognized_keys" ? Reflect.get(issue, "keys") : undefined;
+    const count = code === "unrecognized_keys" ? unknownKeyCount(rawKeys) : undefined;
+    const suggestions =
+      code === "unrecognized_keys" ? suggestDeclaredNames(rawKeys, knownKeys) : undefined;
     result.push({
       path: sanitizePath(Reflect.get(issue, "path"), knownKeys),
       code,
       message: sanitizeMessage(code, Reflect.get(issue, "message")),
-      ...(keys === undefined ? {} : { keys }),
+      ...(count === undefined ? {} : { unknownKeyCount: count }),
+      ...(suggestions === undefined ? {} : { suggestions }),
     });
   }
   // Defense in depth: wsmp_ credential shapes that slipped into a path key.
@@ -146,8 +187,8 @@ export function sanitizeValidationIssues(
 
 /**
  * Argument names an agent can correct: declared path segments plus
- * unrecognized keys. `"?"` (a segment that is not a declared field) is
- * omitted. Order follows the issues.
+ * server-chosen suggestions. `"?"` (a segment that is not a declared field)
+ * is omitted. Order follows the issues.
  */
 export function fieldsFromValidationIssues(issues: readonly McpValidationIssue[]): string[] {
   const fields: string[] = [];
@@ -156,7 +197,7 @@ export function fieldsFromValidationIssues(issues: readonly McpValidationIssue[]
     fields.push(name);
   };
   for (const issue of issues) {
-    for (const key of issue.keys ?? []) add(key);
+    for (const key of issue.suggestions ?? []) add(key);
     for (const segment of issue.path) {
       if (typeof segment === "string") add(segment);
     }
@@ -214,9 +255,17 @@ export function formatValidationIssues(issues: readonly McpValidationIssue[]): s
   return issues
     .map((issue) => {
       const base = issue.path.join(".");
-      const named = (issue.keys ?? []).map((key) => (base.length > 0 ? `${base}.${key}` : key));
-      const where = named.length > 0 ? named.join(", ") : base.length > 0 ? base : "(input)";
-      return `${where}: ${issue.message}`;
+      const where = base.length > 0 ? base : "(input)";
+      if (issue.code !== "unrecognized_keys") return `${where}: ${issue.message}`;
+      const count =
+        issue.unknownKeyCount != null && issue.unknownKeyCount > 0
+          ? ` (${issue.unknownKeyCount})`
+          : "";
+      const hint =
+        issue.suggestions != null && issue.suggestions.length > 0
+          ? `; try ${issue.suggestions.join(", ")}`
+          : "";
+      return `${where}: ${issue.message}${count}${hint}`;
     })
     .join("; ");
 }

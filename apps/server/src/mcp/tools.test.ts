@@ -251,7 +251,11 @@ interface WireResult {
       code?: string;
       fields?: string[];
       message?: string;
-      issues?: { code: string; keys?: string[] }[];
+      issues?: {
+        code: string;
+        unknownKeyCount?: number;
+        suggestions?: string[];
+      }[];
     };
     requestId?: string;
   };
@@ -333,7 +337,7 @@ describe("#117 — real input schemas and named failing fields", () => {
     expect(bytes).toBeLessThanOrEqual(200 * 1024);
   });
 
-  it("an unknown key on a strict procedure is named in fields, never as a value", async () => {
+  it("an unknown key on a strict procedure is never echoed; suggestions are declared names", async () => {
     const KEY = "plain-hostile-key-4242";
     const VALUE = "plain-hostile-value-4242";
     const authInfo = buildAuthInfo(["mcp:write"]);
@@ -346,10 +350,11 @@ describe("#117 — real input schemas and named failing fields", () => {
     expect(body.result?.isError).toBe(true);
     const wire = JSON.stringify(body);
     expect(wire).not.toContain(VALUE);
-    expect(wire).toContain(KEY);
+    expect(wire).not.toContain(KEY);
     const issues = body.result?.structuredContent?.error?.issues ?? [];
     expect(issues.map((issue) => issue.code)).toContain("unrecognized_keys");
-    expect(body.result?.structuredContent?.error?.fields).toContain(KEY);
+    expect(body.result?.structuredContent?.error?.fields ?? []).not.toContain(KEY);
+    expect(issues.some((issue) => (issue.unknownKeyCount ?? 0) > 0)).toBe(true);
   });
 
   it("a missing required field is named by path and code, and the procedure stays the authority", async () => {
