@@ -1,4 +1,5 @@
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
+import { DEVICE_CREDENTIAL_MACHINE_MISMATCH_MESSAGE } from "@ws-model-proxy/config/login-machine-id";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -334,6 +335,64 @@ describe("capability override origin", () => {
     });
     // Never rebound to whatever device the hello names.
     expect(credentials.cliDeviceCredential.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses a device-credential hello whose machine id does not match", async () => {
+    const credentials = prisma as unknown as {
+      cliDeviceCredential: { findUnique: MockInstance };
+    };
+    const machineId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const register = (presented: string | undefined) =>
+      persistRelayRegistration({
+        identity: {
+          kind: "deviceCredential",
+          id: "credential-id",
+          userId: "user-id",
+          cliDeviceId: "cli-device-id",
+          lookupPrefix: "wsmp_device_prefix",
+        },
+        cli: { slug: "desktop" },
+        endpoints: [],
+        inventoryConfirmed: true,
+        endpointTargeting: true,
+        connection: true,
+        ...(presented === undefined ? {} : { machineId: presented }),
+        now,
+      });
+
+    credentials.cliDeviceCredential.findUnique.mockResolvedValue({
+      revokedAt: null,
+      cliDeviceId: "cli-device-id",
+      machineId,
+    });
+    await expect(register("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")).rejects.toMatchObject({
+      code: "machine_mismatch",
+      message: DEVICE_CREDENTIAL_MACHINE_MISMATCH_MESSAGE,
+    });
+    credentials.cliDeviceCredential.findUnique.mockResolvedValue({
+      revokedAt: null,
+      cliDeviceId: "cli-device-id",
+      machineId: null,
+    });
+    await expect(register(machineId)).rejects.toMatchObject({ code: "machine_mismatch" });
+    // Omitting the id on a hello is not a match.
+    credentials.cliDeviceCredential.findUnique.mockResolvedValue({
+      revokedAt: null,
+      cliDeviceId: "cli-device-id",
+      machineId,
+    });
+    await expect(register(undefined)).rejects.toMatchObject({ code: "machine_mismatch" });
+    expect(credentials.cliDeviceCredential.findUnique).toHaveBeenCalledWith({
+      where: { id: "credential-id" },
+      select: { revokedAt: true, cliDeviceId: true, machineId: true },
+    });
+
+    credentials.cliDeviceCredential.findUnique.mockResolvedValue({
+      revokedAt: null,
+      cliDeviceId: "cli-device-id",
+      machineId,
+    });
+    await expect(register(machineId)).resolves.toMatchObject({ cliDeviceId: "cli-device-id" });
   });
 
   it("leaves the reported hostname alone on inventory updates", async () => {

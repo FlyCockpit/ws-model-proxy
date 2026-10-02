@@ -18,6 +18,8 @@ vi.mock("@ws-model-proxy/db", async () => {
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { cliCredentialsRouter } = await import("./cli-credentials");
 
+const LOGIN_MACHINE_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
 const db = prisma as unknown as {
   $transaction: ReturnType<typeof vi.fn>;
   $queryRaw: ReturnType<typeof vi.fn>;
@@ -214,6 +216,7 @@ describe("cliCredentialsRouter", () => {
     const result = await client.exchangeDeviceCode({
       deviceCode: "approved-device-code",
       cliSlug: "desk-01",
+      machineId: LOGIN_MACHINE_ID,
     });
 
     // The CLI gets exactly its credential; nothing about other credentials.
@@ -230,6 +233,7 @@ describe("cliCredentialsRouter", () => {
       data: expect.objectContaining({
         userId: "user-1",
         cliDeviceId: "cli-device-1",
+        machineId: LOGIN_MACHINE_ID,
       }),
       select: { id: true, userId: true },
     });
@@ -261,7 +265,11 @@ describe("cliCredentialsRouter", () => {
     });
 
     await expect(
-      client.exchangeDeviceCode({ deviceCode: "approved-device-code", cliSlug: "desk-01" }),
+      client.exchangeDeviceCode({
+        deviceCode: "approved-device-code",
+        cliSlug: "desk-01",
+        machineId: LOGIN_MACHINE_ID,
+      }),
     ).resolves.toMatchObject({ credentialId: "credential-1" });
     expect(db.cliDeviceCredential.create).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -287,7 +295,11 @@ describe("cliCredentialsRouter", () => {
     });
 
     await expect(
-      client.exchangeDeviceCode({ deviceCode: "approved-device-code", cliSlug: "desk-01" }),
+      client.exchangeDeviceCode({
+        deviceCode: "approved-device-code",
+        cliSlug: "desk-01",
+        machineId: LOGIN_MACHINE_ID,
+      }),
     ).resolves.toMatchObject({ credentialId: "credential-1" });
     expect(errorSpy).toHaveBeenCalledWith(
       "[cli-credentials] closing revoked relay sessions failed",
@@ -301,7 +313,11 @@ describe("cliCredentialsRouter", () => {
     const client = createRouterClient(cliCredentialsRouter, { context: buildContext(null) });
 
     await expect(
-      client.exchangeDeviceCode({ deviceCode: "approved-device-code", cliSlug: "desk-01" }),
+      client.exchangeDeviceCode({
+        deviceCode: "approved-device-code",
+        cliSlug: "desk-01",
+        machineId: LOGIN_MACHINE_ID,
+      }),
     ).rejects.toSatisfy((error: ORPCError) => {
       expect(error.code).toBe("BAD_REQUEST");
       expect(error.data).toBeUndefined();
@@ -318,6 +334,7 @@ describe("cliCredentialsRouter", () => {
       client.exchangeDeviceCode({
         deviceCode: "approved-device-code",
         cliSlug: "desk.01",
+        machineId: LOGIN_MACHINE_ID,
       }),
     ).rejects.toThrow();
     expect(db.deviceCode.findUnique).not.toHaveBeenCalled();
@@ -341,6 +358,7 @@ describe("cliCredentialsRouter", () => {
       client.exchangeDeviceCode({
         deviceCode: "pending-device-code",
         cliSlug: "desk-01",
+        machineId: LOGIN_MACHINE_ID,
       }),
     ).rejects.toSatisfy((error: ORPCError) => {
       expect(error).toBeInstanceOf(ORPCError);
@@ -380,7 +398,11 @@ describe("cliCredentialsRouter", () => {
     const client = createRouterClient(cliCredentialsRouter, { context: buildContext(null) });
 
     const error = await client
-      .exchangeDeviceCode({ deviceCode: "device-code", cliSlug: "desk-01" })
+      .exchangeDeviceCode({
+        deviceCode: "device-code",
+        cliSlug: "desk-01",
+        machineId: LOGIN_MACHINE_ID,
+      })
       .catch((caught: unknown) => caught);
 
     expect(error).toBeInstanceOf(ORPCError);
@@ -398,7 +420,13 @@ describe("cliCredentialsRouter", () => {
       new Request("https://example.test/rpc/exchangeDeviceCode", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ json: { deviceCode: "device-code", cliSlug: "pending-ci" } }),
+        body: JSON.stringify({
+          json: {
+            deviceCode: "device-code",
+            cliSlug: "pending-ci",
+            machineId: LOGIN_MACHINE_ID,
+          },
+        }),
       }),
       { prefix: "/rpc", context: buildContext(null) },
     );
@@ -423,7 +451,11 @@ describe("cliCredentialsRouter", () => {
     });
 
     await expect(
-      client.exchangeDeviceCode({ deviceCode: "approved-device-code", cliSlug: "desk-01" }),
+      client.exchangeDeviceCode({
+        deviceCode: "approved-device-code",
+        cliSlug: "desk-01",
+        machineId: LOGIN_MACHINE_ID,
+      }),
     ).resolves.toMatchObject({ credentialId: "credential-1" });
     expect(limitDeviceCodeExchange).toHaveBeenCalledWith("approved-device-code");
   });
@@ -440,7 +472,13 @@ describe("cliCredentialsRouter", () => {
       new Request("https://example.test/rpc/exchangeDeviceCode", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ json: { deviceCode: "approved-device-code", cliSlug: "desk-01" } }),
+        body: JSON.stringify({
+          json: {
+            deviceCode: "approved-device-code",
+            cliSlug: "desk-01",
+            machineId: LOGIN_MACHINE_ID,
+          },
+        }),
       }),
       { prefix: "/rpc", context: buildContext(null, { limitDeviceCodeExchange }) },
     );
@@ -471,7 +509,11 @@ describe("cliCredentialsRouter", () => {
     });
 
     const error = await client
-      .exchangeDeviceCode({ deviceCode: "approved-device-code", cliSlug: "desk-01" })
+      .exchangeDeviceCode({
+        deviceCode: "approved-device-code",
+        cliSlug: "desk-01",
+        machineId: LOGIN_MACHINE_ID,
+      })
       .catch((caught: unknown) => caught);
 
     expect(error).toBeInstanceOf(ORPCError);
@@ -556,6 +598,7 @@ describe("cliCredentialsRouter", () => {
       client.exchangeDeviceCode({
         deviceCode: "approved-device-code",
         cliSlug: "desk-01",
+        machineId: LOGIN_MACHINE_ID,
       }),
     ).resolves.toMatchObject({ credentialId: "credential-1", userId: "approved-user" });
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(

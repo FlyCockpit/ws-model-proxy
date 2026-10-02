@@ -6,6 +6,7 @@ const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
   throw new Error("SCHEMA_VALIDATION_DATABASE_URL is required for PostgreSQL integration tests");
 const integration = databaseUrl ? describe : describe.skip;
+const LOGIN_MACHINE_ID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 integration("device-code exchange with real PostgreSQL", () => {
   let modules:
@@ -136,7 +137,11 @@ integration("device-code exchange with real PostgreSQL", () => {
     const row = await prisma.deviceCode.findUniqueOrThrow({ where: { deviceCode } });
 
     const exchange = () =>
-      access.mintCliDeviceCredentialFromApprovedDeviceCode({ deviceCode, cliSlug: "race-once" });
+      access.mintCliDeviceCredentialFromApprovedDeviceCode({
+        deviceCode,
+        cliSlug: "race-once",
+        machineId: LOGIN_MACHINE_ID,
+      });
     const outcomes = await contendBehindRowLock("device_code", row.id, [exchange, exchange]);
 
     expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
@@ -156,6 +161,7 @@ integration("device-code exchange with real PostgreSQL", () => {
     const first = await access.mintCliDeviceCredentialFromApprovedDeviceCode({
       deviceCode: await approvedCode(user.id, "desk-01"),
       cliSlug: "desk-01",
+      machineId: LOGIN_MACHINE_ID,
     });
     await prisma.cliDevice.update({
       where: { id: first.cliDeviceId },
@@ -165,6 +171,7 @@ integration("device-code exchange with real PostgreSQL", () => {
     const second = await access.mintCliDeviceCredentialFromApprovedDeviceCode({
       deviceCode: await approvedCode(user.id, "desk-01"),
       cliSlug: "desk-01",
+      machineId: LOGIN_MACHINE_ID,
     });
 
     expect(second.cliDeviceId).toBe(first.cliDeviceId);
@@ -191,6 +198,7 @@ integration("device-code exchange with real PostgreSQL", () => {
     const first = await access.mintCliDeviceCredentialFromApprovedDeviceCode({
       deviceCode: await approvedCode(user.id, "desk-02"),
       cliSlug: "desk-02",
+      machineId: LOGIN_MACHINE_ID,
     });
     const codes = [await approvedCode(user.id, "desk-02"), await approvedCode(user.id, "desk-02")];
 
@@ -199,7 +207,11 @@ integration("device-code exchange with real PostgreSQL", () => {
       first.cliDeviceId,
       codes.map(
         (deviceCode) => () =>
-          access.mintCliDeviceCredentialFromApprovedDeviceCode({ deviceCode, cliSlug: "desk-02" }),
+          access.mintCliDeviceCredentialFromApprovedDeviceCode({
+            deviceCode,
+            cliSlug: "desk-02",
+            machineId: LOGIN_MACHINE_ID,
+          }),
       ),
     );
 
@@ -242,7 +254,11 @@ integration("device-code exchange with real PostgreSQL", () => {
     await inserted;
     const outcomes = Promise.allSettled(
       codes.map((deviceCode) =>
-        access.mintCliDeviceCredentialFromApprovedDeviceCode({ deviceCode, cliSlug: "desk-03" }),
+        access.mintCliDeviceCredentialFromApprovedDeviceCode({
+          deviceCode,
+          cliSlug: "desk-03",
+          machineId: LOGIN_MACHINE_ID,
+        }),
       ),
     );
     let waiters = 0;
@@ -301,6 +317,7 @@ integration("device-code exchange with real PostgreSQL", () => {
         .mintCliDeviceCredentialFromApprovedDeviceCode({
           deviceCode: `device-${suffix}`,
           cliSlug: "desk-04",
+          machineId: LOGIN_MACHINE_ID,
           now: new Date(start.getTime() + offsetMs),
         })
         .then(
@@ -321,6 +338,7 @@ integration("device-code exchange with real PostgreSQL", () => {
     const minted = await access.mintCliDeviceCredentialFromApprovedDeviceCode({
       deviceCode: await approvedCode(user.id, "marked-user"),
       cliSlug: "marked-user",
+      machineId: LOGIN_MACHINE_ID,
     });
     await prisma.user.update({
       where: { id: user.id },
@@ -336,7 +354,11 @@ integration("device-code exchange with real PostgreSQL", () => {
     const deviceCode = await approvedCode(user.id, "approved-slug");
 
     await expect(
-      access.mintCliDeviceCredentialFromApprovedDeviceCode({ deviceCode, cliSlug: "other-slug" }),
+      access.mintCliDeviceCredentialFromApprovedDeviceCode({
+        deviceCode,
+        cliSlug: "other-slug",
+        machineId: LOGIN_MACHINE_ID,
+      }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(await prisma.deviceCode.count({ where: { deviceCode } })).toBe(1);
     expect(await prisma.cliDevice.count({ where: { userId: user.id } })).toBe(0);
@@ -449,7 +471,11 @@ integration("device-code exchange with real PostgreSQL", () => {
     await deletion.requestUserDeletion(prisma, user.id);
 
     await expect(
-      access.mintCliDeviceCredentialFromApprovedDeviceCode({ deviceCode, cliSlug: "marked-login" }),
+      access.mintCliDeviceCredentialFromApprovedDeviceCode({
+        deviceCode,
+        cliSlug: "marked-login",
+        machineId: LOGIN_MACHINE_ID,
+      }),
     ).rejects.toMatchObject({ code: "FORBIDDEN", data: { deviceFlowError: "access_denied" } });
     expect(await prisma.cliDevice.count({ where: { userId: user.id } })).toBe(0);
     expect(await prisma.cliDeviceCredential.count({ where: { userId: user.id } })).toBe(0);
@@ -469,6 +495,7 @@ integration("device-code exchange with real PostgreSQL", () => {
         access.mintCliDeviceCredentialFromApprovedDeviceCode({
           deviceCode,
           cliSlug: "delete-race",
+          machineId: LOGIN_MACHINE_ID,
         }),
       );
       await waitingOrSettled("%device_code%", login);
@@ -502,7 +529,11 @@ integration("device-code exchange with real PostgreSQL", () => {
     const pause = await pauseAfter("device_code", "DELETE", user.id, 16_004_002);
     try {
       const login = outcome(
-        access.mintCliDeviceCredentialFromApprovedDeviceCode({ deviceCode, cliSlug: "mark-race" }),
+        access.mintCliDeviceCredentialFromApprovedDeviceCode({
+          deviceCode,
+          cliSlug: "mark-race",
+          machineId: LOGIN_MACHINE_ID,
+        }),
       );
       await waitingOrSettled("%device_code%", login);
       // The exchange holds the device and has read the owner FOR SHARE: the
@@ -536,6 +567,7 @@ integration("device-code exchange with real PostgreSQL", () => {
         access.mintCliDeviceCredentialFromApprovedDeviceCode({
           deviceCode,
           cliSlug: "new-slug-race",
+          machineId: LOGIN_MACHINE_ID,
         }),
       );
       await waitingOrSettled("%cli_device%", login);
@@ -573,6 +605,7 @@ integration("device-code exchange with real PostgreSQL", () => {
         access.mintCliDeviceCredentialFromApprovedDeviceCode({
           deviceCode,
           cliSlug: "delete-first",
+          machineId: LOGIN_MACHINE_ID,
         }),
       );
       // The exchange waits at the owner fence the delete holds.
@@ -677,6 +710,7 @@ integration("device-code exchange with real PostgreSQL", () => {
       access.mintCliDeviceCredentialFromApprovedDeviceCode({
         deviceCode: row.deviceCode,
         cliSlug: "claim-race",
+        machineId: LOGIN_MACHINE_ID,
       }),
     ).resolves.toMatchObject({ userId: winner });
   });

@@ -506,9 +506,12 @@ pub enum RelayMetricTokenizer {
 #[serde(rename_all = "camelCase")]
 pub struct CliInventory {
     pub slug: String,
-    /// This machine's hostname, a reported fact. Omitted when unavailable.
+    /// This machine's hostname, a display label. Omitted when unavailable.
+    /// Not the credential bind: that is `machine_id`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// Login-time machine id. Required. The same value `wsmp login` sent.
+    pub machine_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     pub capabilities: CliCapabilities,
@@ -2523,6 +2526,7 @@ mod tests {
         let inventory = CliInventory {
             slug: "desktop".to_string(),
             hostname: None,
+            machine_id: "0123456789abcdef0123456789abcdef".to_string(),
             version: None,
             capabilities: CliCapabilities::from_snapshot(&TerminalFeatureSnapshot {
                 allow_human_terminal: false,
@@ -2539,6 +2543,7 @@ mod tests {
         };
         let encoded = serde_json::to_string(&inventory).expect("encode");
         assert!(!encoded.contains("hostname"));
+        assert!(encoded.contains(r#""machineId":"0123456789abcdef0123456789abcdef""#));
         assert!(!encoded.contains("label"));
     }
 
@@ -2550,6 +2555,7 @@ mod tests {
             cli: CliInventory {
                 slug: "desktop".to_string(),
                 hostname: Some("desk-01.local".to_string()),
+                machine_id: "0123456789abcdef0123456789abcdef".to_string(),
                 version: None,
                 capabilities: CliCapabilities::from_snapshot(&TerminalFeatureSnapshot {
                     allow_human_terminal: false,
@@ -2590,6 +2596,7 @@ mod tests {
         assert!(encoded.contains(r#""remoteMetricSources":false"#));
         assert!(encoded.contains(r#""supervisedCommands":true"#));
         assert!(encoded.contains(r#""hostname":"desk-01.local""#));
+        assert!(encoded.contains(r#""machineId":"0123456789abcdef0123456789abcdef""#));
         assert!(!encoded.contains(r#""label":"Desktop""#));
         assert!(encoded.contains(r#""terminalViewers":true"#));
         assert!(encoded.contains(r#""terminalIdentity":{"publicKey":"BAQE","signature":"Sig"}"#));
@@ -3312,6 +3319,7 @@ mod relay_27_vectors {
             cli: CliInventory {
                 slug: "desk".to_string(),
                 hostname: Some("desk-01.local".to_string()),
+                machine_id: "0123456789abcdef0123456789abcdef".to_string(),
                 version: Some("0.4.0".to_string()),
                 capabilities,
             },

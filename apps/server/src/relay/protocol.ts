@@ -9,6 +9,7 @@ import {
   relayProtocolAtLeast,
 } from "@ws-model-proxy/api/lib/relay-protocol-version";
 import { normalizeReportedHostname } from "@ws-model-proxy/config/cli-device-name";
+import { normalizeLoginMachineId } from "@ws-model-proxy/config/login-machine-id";
 import { z } from "zod";
 import {
   FILE_BODY_MAX_BYTES,
@@ -724,9 +725,29 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
       cli: z
         .object({
           slug: z.string().trim().min(1).max(63),
-          // A fact about the machine, stored as CliDevice.reportedHostname.
+          // A display label, stored as CliDevice.reportedHostname. Spoofable
+          // (`hostnamectl`); not what a device credential is bound to.
           // Normalized rather than rejected so an odd hostname never blocks hello.
           hostname: z.string().max(1024).nullish().transform(normalizeReportedHostname),
+          // Login-time machine id. Required on 2.4. The server refuses a device
+          // credential whose stored id differs. Not optional: a hello without
+          // it is a schema error, not a legacy registration.
+          machineId: z
+            .string()
+            .trim()
+            .min(1)
+            .max(80)
+            .transform((value, ctx) => {
+              const normalized = normalizeLoginMachineId(value);
+              if (!normalized) {
+                ctx.addIssue({
+                  code: "custom",
+                  message: "machineId must be a machine-id or UUID.",
+                });
+                return z.NEVER;
+              }
+              return normalized;
+            }),
           version: z.string().trim().max(80).optional(),
           capabilities: v28CliCapabilitiesSchema,
         })

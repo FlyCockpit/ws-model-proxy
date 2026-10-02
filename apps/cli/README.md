@@ -86,6 +86,8 @@ Each normal line is scanned once and held until a terminal ground-state LF or EO
 
 This release speaks relay protocol 2.4. Last cut was 2.3 (v0.3.1); terminal identity, supervised commands, engine facts, node telemetry, file tools, and custom engine adapters all ship in 2.4. An older server rejects 2.4 and wsmp stops with a message to upgrade the server; a newer server refuses an older wsmp with a message to upgrade wsmp.
 
+`wsmp login` binds the device credential to this machine's id (`/etc/machine-id`, or a UUID wsmp writes beside `device-auth.json` when that file is missing). Hello must present the same id. Copying `device-auth.json` or `service.env` to another machine does not take over the device: that hello is refused and the original session stays up. Run `wsmp login` on the machine that should connect. The hostname is only a display label.
+
 ### Node file tools (relay 2.4)
 
 Relay 2.4 adds the `file.op` frames behind the MCP node file tools (read, stat, list, search, edit, write, rename, mkdir, delete). The hello now reports `capabilities.fileOps`, `features.mcpFileRead`, `features.fileRootsConfigured` (the startup switch and usable-root snapshot) and `features.allowFileToolsAsRoot`. The server and every wsmp upgrade together: a 2.3 wsmp is refused with an upgrade message.

@@ -871,12 +871,14 @@ fn run_relay_session(
         )
     };
 
+    let machine_id = crate::machine_id::login_machine_id().map_err(RelaySessionError::Fatal)?;
     let hello = ClientControlMessage::Hello {
         id: next_id("hello"),
         protocol_version: crate::protocol::RELAY_PROTOCOL_VERSION.to_string(),
         cli: CliInventory {
             slug: cli_slug.to_string(),
             hostname: crate::hostname::reported_hostname(),
+            machine_id,
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
             capabilities: startup::hello_capabilities(startup, config, cli_slug),
         },

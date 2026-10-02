@@ -169,12 +169,14 @@ pub fn exchange_device_code(
     server_url: &str,
     device_code: &str,
     cli_slug: &str,
+    machine_id: &str,
 ) -> std::result::Result<DeviceCredential, ExchangeError> {
     let url = join(server_url, "/rpc/cliCredentials/exchangeDeviceCode")?;
     let request = serde_json::json!({
         "json": {
             "deviceCode": device_code,
             "cliSlug": cli_slug,
+            "machineId": machine_id,
         }
     });
     let body = serde_json::to_vec(&request).context("serializing device credential request")?;

@@ -186,6 +186,7 @@ function hello(slug: string, kind: CliKind, features?: CliFeatures) {
     cli: {
       slug,
       hostname: `${slug}.local`,
+      machineId: "0123456789abcdef0123456789abcdef",
       version: "9.9.9",
       capabilities: {
         protocolVersion: RELAY_MIN_PROTOCOL_VERSION,

@@ -1,6 +1,7 @@
 import { ORPCError } from "@orpc/server";
 import { cliSlugFromDeviceLoginScope } from "@ws-model-proxy/config/cli-device-login";
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
+import { normalizeLoginMachineId } from "@ws-model-proxy/config/login-machine-id";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
   fenceOwners,
@@ -177,9 +178,10 @@ export async function authenticateCliWebsocketSecret(
 /**
  * Outcome of checking a relay identity's credential against the device a hello
  * names: `ok`, `revoked` (revoked, expired, or deleted with its device), or
- * `otherDevice` (bound to a different device).
+ * `otherDevice` (bound to a different device), or `machineMismatch` (a device
+ * credential whose login-time machine id is missing or differs from the hello).
  */
-export type CliCredentialDeviceCheck = "ok" | "revoked" | "otherDevice";
+export type CliCredentialDeviceCheck = "ok" | "revoked" | "otherDevice" | "machineMismatch";
 
 /**
  * Registration's credential check, run inside its transaction right after the
@@ -189,24 +191,31 @@ export type CliCredentialDeviceCheck = "ok" | "revoked" | "otherDevice";
  * captured at websocket auth:
  *
  * - A device credential authenticates only as the device it was minted for
- *   (`cliDeviceId` is required and never rewritten).
+ *   (`cliDeviceId` is required and never rewritten). When `machineId` is set
+ *   (a hello), it must equal the id stored at login. A null stored id is a
+ *   credential from before the bind and is refused the same way. Inventory
+ *   updates pass null: the socket was already admitted.
  * - A CLI token is bound on its first hello: a conditional write claims an
  *   unbound token, so two first hellos naming different devices cannot both
- *   bind it. Once bound, it authenticates only as that device.
+ *   bind it. Once bound, it authenticates only as that device. Tokens are not
+ *   machine-bound; `machineId` is ignored for them.
  */
 export async function checkCliCredentialForDevice(
   db: Pick<Prisma.TransactionClient, "cliToken" | "cliDeviceCredential">,
   identity: Pick<CliWebsocketIdentity, "kind" | "id">,
   cliDeviceId: string,
   now: Date,
+  machineId: string | null,
 ): Promise<CliCredentialDeviceCheck> {
   if (identity.kind === "deviceCredential") {
     const credential = await db.cliDeviceCredential.findUnique({
       where: { id: identity.id },
-      select: { revokedAt: true, cliDeviceId: true },
+      select: { revokedAt: true, cliDeviceId: true, machineId: true },
     });
     if (!credential || credential.revokedAt) return "revoked";
-    return credential.cliDeviceId === cliDeviceId ? "ok" : "otherDevice";
+    if (credential.cliDeviceId !== cliDeviceId) return "otherDevice";
+    if (machineId !== null && credential.machineId !== machineId) return "machineMismatch";
+    return "ok";
   }
 
   const token = await db.cliToken.findUnique({
@@ -429,7 +438,10 @@ async function deleteCliDeviceInCapacityLockOrder({
  *    user, unexpired). Exactly one row must go, so a code mints at most once
  *    even under concurrent exchanges (the loser waits on the device row, then
  *    deletes 0 and rolls back its device touch).
- * 4. Mint the credential, then revoke the device's other active credentials.
+ * 4. Mint the credential bound to `machineId`, then revoke the device's other
+ *    active credentials. The id is the machine that is logging in, not a
+ *    label. A later hello from anywhere else is refused and does not replace
+ *    the live session.
  *
  * The caller closes live relay sessions of the returned revoked ids after the
  * commit (`ContextServices.onCliCredentialsRevoked`). Manually created
@@ -439,10 +451,13 @@ async function deleteCliDeviceInCapacityLockOrder({
 export async function mintCliDeviceCredentialFromApprovedDeviceCode({
   deviceCode,
   cliSlug,
+  machineId,
   now = new Date(),
 }: {
   deviceCode: string;
   cliSlug: string;
+  /** Login-time machine id. Required; an invalid value is `BAD_REQUEST`. */
+  machineId: string;
   now?: Date;
 }): Promise<{
   credentialId: string;
@@ -455,6 +470,12 @@ export async function mintCliDeviceCredentialFromApprovedDeviceCode({
   if (!slugValidation.ok) {
     throw new ORPCError("BAD_REQUEST", {
       message: "CLI slug must use lowercase letters, numbers, and hyphens only.",
+    });
+  }
+  const boundMachineId = normalizeLoginMachineId(machineId);
+  if (!boundMachineId) {
+    throw new ORPCError("BAD_REQUEST", {
+      message: "machineId must be a machine-id or UUID.",
     });
   }
   const row = await prisma.deviceCode.findUnique({
@@ -554,6 +575,7 @@ export async function mintCliDeviceCredentialFromApprovedDeviceCode({
           cliDeviceId: cliDevice.id,
           lookupPrefix: credentialLookupPrefix(secret),
           secretDigest: digestCliDeviceCredentialSecret(secret),
+          machineId: boundMachineId,
         },
         select: { id: true, userId: true },
       });

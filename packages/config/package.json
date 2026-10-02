@@ -19,6 +19,9 @@
     "./cli-device-login": {
       "default": "./src/cli-device-login.ts"
     },
+    "./login-machine-id": {
+      "default": "./src/login-machine-id.ts"
+    },
     "./theme-init": {
       "default": "./src/theme-init.ts"
     },

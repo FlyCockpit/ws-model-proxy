@@ -137,6 +137,7 @@ function hello(slug: string, mode: Mode, readSwitch = false, roots = false) {
     cli: {
       slug,
       hostname: `${slug}.local`,
+      machineId: "0123456789abcdef0123456789abcdef",
       version: "9.9.9",
       capabilities: {
         protocolVersion: "2.4",

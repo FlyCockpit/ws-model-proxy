@@ -123,6 +123,7 @@ function hello(slug: string, features: { mode: Mode; terminalSupported: boolean 
     cli: {
       slug,
       hostname: `${slug}.local`,
+      machineId: "0123456789abcdef0123456789abcdef",
       version: "0.4.0",
       capabilities: {
         protocolVersion: "2.4",

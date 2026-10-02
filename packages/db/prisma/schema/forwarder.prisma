@@ -369,7 +369,9 @@ model CliDevice {
   reportedTerminalSupported    Boolean?
   /// Relay 2.8: the CLI's `allowFileToolsAsRoot` config from its hello (null until a 2.8 hello).
   reportedAllowFileToolsAsRoot Boolean?
-  /// The machine's hostname from the latest hello. Null when not reported.
+  /// The machine's hostname from the latest hello. A display label only
+  /// (`hostnamectl` can change it). Not the login machine id; that bind is
+  /// `CliDeviceCredential.machineId`. Null when not reported.
   reportedHostname             String?
   featuresReportedAt           DateTime?
   /// Relay 2.7 `node.info` from the latest connection (static machine facts).
@@ -431,7 +433,9 @@ model CliToken {
 }
 
 /// Minted by `wsmp login` for exactly one device and never rebound: the device
-/// is required and deleting it deletes its credentials.
+/// is required and deleting it deletes its credentials. `machineId` binds the
+/// secret to the machine that completed login. Copying the secret file does
+/// not move that bind.
 model CliDeviceCredential {
   id           String    @id @default(cuid(2))
   createdAt    DateTime  @default(now())
@@ -440,6 +444,10 @@ model CliDeviceCredential {
   cliDeviceId  String
   lookupPrefix String
   secretDigest String
+  /// `/etc/machine-id` or a CLI-generated UUID, captured when this credential
+  /// was minted. Hello must present the same id. Null only on a row minted
+  /// before the bind; those hellos are refused until `wsmp login`.
+  machineId    String?
   lastUsedAt   DateTime?
   revokedAt    DateTime?
   User         User      @relation("CliDeviceCredentialOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)

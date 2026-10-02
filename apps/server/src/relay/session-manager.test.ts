@@ -1,4 +1,5 @@
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
+import { DEVICE_CREDENTIAL_MACHINE_MISMATCH_MESSAGE } from "@ws-model-proxy/config/login-machine-id";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { parseMultipartToSpool } from "../model-api/multipart-form-data.js";
@@ -98,6 +99,8 @@ const identity: CliWebsocketIdentity = {
 };
 
 const now = new Date("2026-01-01T00:00:00.000Z");
+/** Login machine id the 2.4 hello fixtures in this file present. */
+const LOGIN_MACHINE_ID = "0123456789abcdef0123456789abcdef";
 
 /** Holds the next registration transaction until `release()`. */
 function holdNextRegistration() {
@@ -163,6 +166,7 @@ function helloFrame() {
     cli: {
       slug: "desktop",
       hostname: "desk-01.local",
+      machineId: LOGIN_MACHINE_ID,
       capabilities: {
         ...capabilities26(),
       },
@@ -373,6 +377,7 @@ describe("revoked credentials", () => {
     credentials.cliDeviceCredential.findUnique.mockResolvedValue({
       revokedAt: null,
       cliDeviceId: "cli-device-id",
+      machineId: LOGIN_MACHINE_ID,
     });
   });
 
@@ -470,6 +475,43 @@ describe("revoked credentials", () => {
     expect(manager.getActiveCliDeviceIds()).toEqual([]);
     manager.dispose();
   });
+
+  it.each([
+    ["a different machine", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],
+    ["a credential minted before the bind", null],
+  ] as const)(
+    "refuses a hello bound to %s and keeps the live session",
+    async (_label, storedMachineId) => {
+      const manager = new RelaySessionManager();
+      const original = new FakeSocket();
+      manager.acceptAuthenticatedSocket({
+        socket: original,
+        identity: deviceIdentity("cred"),
+        now,
+      });
+      await manager.handleTextFrame(original, helloFrame(), now);
+      expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
+
+      credentials.cliDeviceCredential.findUnique.mockResolvedValue({
+        revokedAt: null,
+        cliDeviceId: "cli-device-id",
+        machineId: storedMachineId,
+      });
+      const copy = new FakeSocket();
+      manager.acceptAuthenticatedSocket({ socket: copy, identity: deviceIdentity("cred"), now });
+      await manager.handleTextFrame(copy, helloFrame(), now);
+
+      expect(copy.closes).toEqual([{ code: 1008, reason: "machine_mismatch" }]);
+      expect(JSON.parse(String(copy.sends.at(-1)))).toMatchObject({
+        type: "protocol.error",
+        failure: "protocol_error",
+        message: DEVICE_CREDENTIAL_MACHINE_MISMATCH_MESSAGE,
+      });
+      expect(original.closes).toEqual([]);
+      expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
+      manager.dispose();
+    },
+  );
 
   it("closes the socket when an inventory update finds the credential revoked", async () => {
     const manager = new RelaySessionManager();
@@ -963,6 +1005,7 @@ describe("revoked credentials", () => {
     credentials.cliDeviceCredential.findUnique.mockResolvedValueOnce({
       revokedAt: null,
       cliDeviceId: "cli-device-2",
+      machineId: LOGIN_MACHINE_ID,
     });
     const second = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: second, identity: deviceIdentity("b"), now });
@@ -1601,6 +1644,7 @@ describe("RelaySessionManager", () => {
       cli: {
         slug: "desktop",
         hostname: "desk-01.local",
+        machineId: LOGIN_MACHINE_ID,
         capabilities: capabilities26(),
       },
       endpoints: [
@@ -1980,6 +2024,7 @@ function helloCli(features?: {
     cli: {
       slug: "desktop",
       hostname: "desk-01.local",
+      machineId: LOGIN_MACHINE_ID,
       version: "9.9.9",
       capabilities: capabilities26(features),
     },

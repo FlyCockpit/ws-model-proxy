@@ -234,6 +234,7 @@ describe("cliCredentialAccess", () => {
         { kind: "deviceCredential", id: "credential-id" },
         "cli-device-id",
         now,
+        null,
       );
     db.cliDeviceCredential.findUnique.mockResolvedValueOnce({
       revokedAt: null,
@@ -258,6 +259,36 @@ describe("cliCredentialAccess", () => {
     expect(db.cliDeviceCredential.updateMany).not.toHaveBeenCalled();
   });
 
+  it("refuses a device credential hello whose machine id is missing or different", async () => {
+    const machineId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const check = (presented: string) =>
+      checkCliCredentialForDevice(
+        prisma,
+        { kind: "deviceCredential", id: "credential-id" },
+        "cli-device-id",
+        now,
+        presented,
+      );
+    db.cliDeviceCredential.findUnique.mockResolvedValueOnce({
+      revokedAt: null,
+      cliDeviceId: "cli-device-id",
+      machineId,
+    });
+    await expect(check(machineId)).resolves.toBe("ok");
+    db.cliDeviceCredential.findUnique.mockResolvedValueOnce({
+      revokedAt: null,
+      cliDeviceId: "cli-device-id",
+      machineId,
+    });
+    await expect(check("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")).resolves.toBe("machineMismatch");
+    db.cliDeviceCredential.findUnique.mockResolvedValueOnce({
+      revokedAt: null,
+      cliDeviceId: "cli-device-id",
+      machineId: null,
+    });
+    await expect(check(machineId)).resolves.toBe("machineMismatch");
+  });
+
   it("binds an unbound CLI token on its first hello with a conditional write", async () => {
     const check = () =>
       checkCliCredentialForDevice(
@@ -265,6 +296,7 @@ describe("cliCredentialAccess", () => {
         { kind: "cliToken", id: "token-id" },
         "cli-device-id",
         now,
+        null,
       );
     db.cliToken.findUnique.mockResolvedValueOnce({
       revokedAt: null,
@@ -293,6 +325,7 @@ describe("cliCredentialAccess", () => {
         { kind: "cliToken", id: "token-id" },
         "cli-device-id",
         now,
+        null,
       );
     db.cliToken.findUnique.mockResolvedValueOnce({
       revokedAt: null,
@@ -353,10 +386,13 @@ describe("mintCliDeviceCredentialFromApprovedDeviceCode", () => {
     db.cliDeviceCredential.updateMany.mockResolvedValue({ count: 0 });
   });
 
+  const machineId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
   function mint(cliSlug = "desk-01") {
     return mintCliDeviceCredentialFromApprovedDeviceCode({
       deviceCode: "short-lived-device-code",
       cliSlug,
+      machineId,
       now,
     });
   }
@@ -407,6 +443,7 @@ describe("mintCliDeviceCredentialFromApprovedDeviceCode", () => {
         cliDeviceId: "cli-device-id",
         lookupPrefix: expect.stringMatching(/^wsmp_device_/),
         secretDigest: expect.any(String),
+        machineId,
       },
       select: { id: true, userId: true },
     });
@@ -582,6 +619,7 @@ describe("mintCliDeviceCredentialFromApprovedDeviceCode", () => {
 });
 
 describe("device-flow polling against the stored interval (milliseconds)", () => {
+  const machineId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
   const pending = (lastPolledAt: Date | null) =>
     approvedRow({ status: "pending", userId: null, lastPolledAt, pollingInterval: 5000 });
 
@@ -595,6 +633,7 @@ describe("device-flow polling against the stored interval (milliseconds)", () =>
     return mintCliDeviceCredentialFromApprovedDeviceCode({
       deviceCode: "short-lived-device-code",
       cliSlug: "desk-01",
+      machineId,
       now,
     }).catch((error: unknown) => error);
   }
@@ -641,6 +680,7 @@ describe("device-flow polling against the stored interval (milliseconds)", () =>
     const error = await mintCliDeviceCredentialFromApprovedDeviceCode({
       deviceCode: "short-lived-device-code",
       cliSlug: "desk-01",
+      machineId,
       now,
     }).catch((caught: unknown) => caught);
     expect((error as ORPCError<string, unknown>).data).toEqual({ deviceFlowError: "slow_down" });

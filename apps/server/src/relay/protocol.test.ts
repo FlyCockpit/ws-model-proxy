@@ -271,7 +271,13 @@ function hello(protocolVersion: string, capabilities: unknown) {
     type: "hello",
     id: "hello-id",
     protocolVersion,
-    cli: { slug: "desktop", hostname: "desk-01.local", version: "0.4.0", capabilities },
+    cli: {
+      slug: "desktop",
+      hostname: "desk-01.local",
+      machineId: "0123456789abcdef0123456789abcdef",
+      version: "0.4.0",
+      capabilities,
+    },
     endpoints: [endpoint()],
   });
 }
@@ -283,6 +289,7 @@ function helloWithCli(cli: Record<string, unknown>) {
     protocolVersion: "2.4",
     cli: {
       slug: "desktop",
+      machineId: "0123456789abcdef0123456789abcdef",
       capabilities: CAPABILITIES_28,
       ...cli,
     },
@@ -360,6 +367,18 @@ describe("relay protocol 2.4 minimum", () => {
 
   it("accepts a self-consistent 2.4 hello", () => {
     expect(() => parseRelayClientControlFrame(hello("2.4", CAPABILITIES_28))).not.toThrow();
+  });
+
+  it("requires cli.machineId on a 2.4 hello", () => {
+    expect(() => parseRelayClientControlFrame(helloWithCli({ machineId: undefined }))).toThrow();
+    expect(() =>
+      parseRelayClientControlFrame(helloWithCli({ machineId: "not-a-machine" })),
+    ).toThrow();
+    const parsed = parseRelayClientControlFrame(
+      helloWithCli({ machineId: " 0123456789ABCDEF0123456789ABCDEF " }),
+    );
+    if (parsed.type !== "hello") throw new Error("expected hello");
+    expect(parsed.cli.machineId).toBe("0123456789abcdef0123456789abcdef");
   });
 
   describe("rejectedHelloFacts sanitising", () => {

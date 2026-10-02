@@ -109,6 +109,7 @@ function hello(terminalApproval = false) {
     cli: {
       slug: "desktop",
       hostname: "desktop.local",
+      machineId: "0123456789abcdef0123456789abcdef",
       version: "0.4.0",
       capabilities: {
         protocolVersion: "2.4",

@@ -781,6 +781,7 @@ export class RelaySessionManager {
           endpointTargeting: true,
           connection: true,
           reported: reportedFeaturesFromHello(message, now),
+          machineId: message.cli.machineId,
           now,
         });
         if (this.sessionsBySocket.get(socket) !== session) {
@@ -878,15 +879,22 @@ export class RelaySessionManager {
       } catch (error) {
         // Already detached and closed by whoever detached it.
         if (this.sessionsBySocket.get(socket) !== session) return;
+        // A machine-id mismatch rolls the registration back, so the session
+        // already serving this device stays. The message tells the copy to
+        // log in again; it is not an opaque protocol error.
+        const machineMismatch =
+          error instanceof RelayRegistrationError && error.code === "machine_mismatch";
         const relayError =
           error instanceof RelayRegistrationError && error.code === "access_denied"
             ? "access_denied"
-            : "protocol_error";
+            : machineMismatch
+              ? "machine_mismatch"
+              : "protocol_error";
         socket.send(
           encodeRelayServerControlMessage({
             type: "protocol.error",
             failure: "protocol_error",
-            message: relayError,
+            message: machineMismatch ? error.message : relayError,
             requestId: message.id,
           }),
         );
