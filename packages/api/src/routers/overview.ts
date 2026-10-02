@@ -33,7 +33,7 @@ import {
   externalFallbackMemberWhere,
   poolProviderDisclosure,
 } from "../lib/effective-provider-egress";
-import { DEFAULT_KV_FULL_THRESHOLD } from "../lib/engine-load";
+import { effectiveKvFullThreshold } from "../lib/engine-load";
 import { type EngineLoadMinuteRow, shapeEngineLoadOverview } from "../lib/engine-load-overview";
 import { readyOwnKeyPreferenceWhere } from "../lib/model-api-token-access";
 import {
@@ -77,6 +77,7 @@ const poolSelect = {
       healthStatus: true,
       routingStatus: true,
       executionTargetId: true,
+      kvFullThreshold: true,
       ExecutionTarget: {
         select: {
           id: true,
@@ -245,6 +246,11 @@ export type OverviewMemberRow = {
   stats: OverviewStats;
 };
 
+function poolEngineLoadThreshold(members: readonly { kvFullThreshold: number | null }[]): number {
+  if (members.length === 0) return effectiveKvFullThreshold(null);
+  return Math.min(...members.map((member) => effectiveKvFullThreshold(member.kvFullThreshold)));
+}
+
 export const overviewRouter = {
   metrics: protectedProcedure.input(metricsInput).handler(async ({ input, context }) => {
     const userId = context.session.user.id;
@@ -287,21 +293,26 @@ export const overviewRouter = {
     const engineLoadRows =
       capacityIds.length === 0
         ? []
-        : ((await prisma.engineLoadRollupMinute.findMany({
-            where: {
-              ownerUserId: userId,
-              capacityId: { in: capacityIds },
-              bucketStart: { gte: window.start, lt: window.end },
-            },
-            select: {
-              bucketStart: true,
-              capacityId: true,
-              maxRunning: true,
-              maxWaiting: true,
-              maxKvUsage: true,
-              maxKvOccupancy: true,
-            },
-          })) ?? []);
+        : await prisma.$queryRaw<EngineLoadMinuteRow[]>`
+            SELECT r."capacityId",
+                   to_timestamp(
+                     ${window.start.getTime() / 1000}
+                     + FLOOR(
+                         (EXTRACT(EPOCH FROM r."bucketStart") * 1000
+                           - ${window.start.getTime()})
+                         / ${window.bucketMs}
+                       ) * ${window.bucketMs} / 1000.0
+                   ) AS "bucketStart",
+                   MAX(r."maxRunning") AS "maxRunning",
+                   MAX(r."maxWaiting") AS "maxWaiting",
+                   MAX(r."maxKvUsage") AS "maxKvUsage",
+                   MAX(r."maxKvOccupancy") AS "maxKvOccupancy"
+              FROM engine_load_rollup_minute r
+             WHERE r."ownerUserId" = ${userId}
+               AND r."capacityId" = ANY(${capacityIds}::text[])
+               AND r."bucketStart" >= ${window.start}
+               AND r."bucketStart" < ${window.end}
+             GROUP BY 1, 2`;
     const [[aggregates, histograms, series], [sharedAggregates, sharedHistograms]] =
       await Promise.all([
         queryRollups({
@@ -398,7 +409,7 @@ export const overviewRouter = {
           seriesKeys,
         ),
         engineLoad: {
-          effectiveKvFullThreshold: DEFAULT_KV_FULL_THRESHOLD,
+          effectiveKvFullThreshold: poolEngineLoadThreshold(pool.PoolMembers),
           series:
             window.range === "1h"
               ? []
@@ -409,7 +420,7 @@ export const overviewRouter = {
                       ? [member.ExecutionTarget.inferenceCapacityId]
                       : [],
                   ),
-                  rows: engineLoadRows as EngineLoadMinuteRow[],
+                  rows: engineLoadRows,
                 }),
         },
       };

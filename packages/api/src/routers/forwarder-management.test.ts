@@ -6867,6 +6867,123 @@ describe("metric routing procedures (S-B part 2)", () => {
     expect(byId.get("m3")).toMatchObject({ hasSignal: false, state: "none", full: false });
   });
 
+  it("does not report snapshotState FULL for observe-only custom members", async () => {
+    const now = Date.now();
+    deep.modelPool.findFirst.mockResolvedValue({
+      id: "pool-1",
+      slug: "coder",
+      routingRules: [],
+      PoolMembers: [
+        {
+          id: "m-observe",
+          engineLoadMode: "AUTO",
+          customEngineLoadMode: "OBSERVE",
+          kvFullThreshold: null,
+          DiscoveredModel: null,
+          ExecutionTarget: {
+            InferenceCapacity: {
+              engineKind: "GENERIC",
+              engineSlots: null,
+              engineLoadSource: "CUSTOM",
+              engineLoadSignals: ["kvUsage"],
+            },
+            DiscoveredModel: {
+              slug: null,
+              upstreamModelId: "custom",
+              Endpoint: {
+                slug: "gpu",
+                cliDeviceId: "cli-id",
+                CliDevice: { slug: "desk", name: null, reportedHostname: "desk.local" },
+              },
+            },
+          },
+        },
+        {
+          id: "m-enforce",
+          engineLoadMode: "AUTO",
+          customEngineLoadMode: "ENFORCE",
+          kvFullThreshold: null,
+          DiscoveredModel: null,
+          ExecutionTarget: {
+            InferenceCapacity: {
+              engineKind: "GENERIC",
+              engineSlots: null,
+              engineLoadSource: "CUSTOM",
+              engineLoadSignals: ["kvUsage"],
+            },
+            DiscoveredModel: {
+              slug: null,
+              upstreamModelId: "custom",
+              Endpoint: {
+                slug: "gpu",
+                cliDeviceId: "cli-id",
+                CliDevice: { slug: "desk", name: null, reportedHostname: "desk.local" },
+              },
+            },
+          },
+        },
+      ],
+    });
+    deep.poolMemberRoutingVerdict.findMany.mockResolvedValue([
+      {
+        poolMemberId: "m-observe",
+        verdict: "NONE",
+        ruleStates: [],
+        engineState: "full_kv",
+        evaluatedAt: new Date(now - 1_000),
+        expiresAt: new Date(now + 10_000),
+      },
+      {
+        poolMemberId: "m-enforce",
+        verdict: "FULL",
+        ruleStates: [],
+        engineState: "full_kv",
+        evaluatedAt: new Date(now - 1_000),
+        expiresAt: new Date(now + 10_000),
+      },
+    ]);
+    deep.cliDevice.findMany.mockResolvedValue([]);
+    const fresh = new Date(now - 2_000);
+    const result = await client({
+      getLiveNodeTelemetry: (ids: readonly string[]) =>
+        new Map(
+          ids.map((id) => [
+            id,
+            {
+              nodeMetrics: null,
+              nodeMetricsReceivedAt: null,
+              endpointLoad: [
+                {
+                  endpointSlug: "gpu",
+                  modelSlug: null,
+                  running: 1,
+                  kvUsage: 1,
+                  source: "custom",
+                  ts: fresh.toISOString(),
+                  receivedAt: fresh,
+                },
+              ],
+            },
+          ]),
+        ),
+    }).getPoolRoutingRules({ poolId: "pool-1" });
+    const byId = new Map(result.members.map((member) => [member.poolMemberId, member.engineLoad]));
+    expect(byId.get("m-observe")).toMatchObject({
+      customMode: "observe",
+      state: "full_kv",
+      full: true,
+      enforced: false,
+      snapshotState: null,
+    });
+    expect(byId.get("m-enforce")).toMatchObject({
+      customMode: "enforce",
+      state: "full_kv",
+      full: true,
+      enforced: true,
+      snapshotState: "full_kv",
+    });
+  });
+
   it("sets a member's engine load override, scoped to the owner, and has the relay clear the pool's verdicts (S-D)", async () => {
     deep.poolMember.updateMany.mockResolvedValue({ count: 1 });
     const onPoolRoutingRulesChanged = vi.fn(async () => undefined);

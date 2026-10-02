@@ -1201,6 +1201,7 @@ export class RelaySessionManager {
     const cliDeviceId = session.cliDeviceId;
     if (!cliDeviceId || this.sessionsByCliDeviceId.get(cliDeviceId) !== session) return null;
     this.sessionsByCliDeviceId.delete(cliDeviceId);
+    this.engineLoadHistory.dropDevice(cliDeviceId);
     const connectionGeneration = session.connectionGeneration;
     return () =>
       this.writeDeviceDisconnected(cliDeviceId, {

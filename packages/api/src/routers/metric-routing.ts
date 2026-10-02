@@ -305,7 +305,8 @@ export const metricRoutingProcedures = {
               state: engineVerdict.state,
               full: engineVerdict.full,
               enforced: engineVerdict.enforced,
-              snapshotState: verdict && !expired ? verdict.engineState : null,
+              snapshotState:
+                verdict && !expired && verdict.verdict === "FULL" ? verdict.engineState : null,
               live: reading
                 ? {
                     running: reading.running,

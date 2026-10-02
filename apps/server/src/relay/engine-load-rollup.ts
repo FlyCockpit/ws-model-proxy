@@ -9,8 +9,15 @@ import { isDbShutdownFenceArmed } from "@ws-model-proxy/db/shutdown-fence";
 
 export const ENGINE_LOAD_ROLLUP_FLUSH_MIN_INTERVAL_MS = 1000;
 export const ENGINE_LOAD_ROLLUP_MAX_PENDING = 2000;
+/** Postgres `int4` ceiling so a busy prefix-cache counter cannot fail the flush. */
+export const ENGINE_LOAD_ROLLUP_INT4_MAX = 2_147_483_647;
 const MINUTE_MS = 60_000;
 const CAPACITY_CACHE_MS = 30_000;
+
+function addInt4(current: number, delta: number): number {
+  if (!Number.isFinite(delta) || delta <= 0) return current;
+  return Math.min(ENGINE_LOAD_ROLLUP_INT4_MAX, current + delta);
+}
 
 export type EngineLoadRollupSample = {
   ownerUserId: string;
@@ -96,8 +103,8 @@ export function mergeEngineLoadIncrements(
     maxKvUsage: maxOpt(next.maxKvUsage, sample.kvUsage),
     maxKvOccupancy: maxOpt(next.maxKvOccupancy, sample.kvOccupancy),
     maxSlotsBusy: maxOpt(next.maxSlotsBusy, sample.slotsBusy),
-    prefixCacheHits: next.prefixCacheHits + Math.max(0, sample.prefixCacheHitsDelta ?? 0),
-    prefixCacheQueries: next.prefixCacheQueries + Math.max(0, sample.prefixCacheQueriesDelta ?? 0),
+    prefixCacheHits: addInt4(next.prefixCacheHits, sample.prefixCacheHitsDelta ?? 0),
+    prefixCacheQueries: addInt4(next.prefixCacheQueries, sample.prefixCacheQueriesDelta ?? 0),
     lastSource: sample.source ?? next.lastSource,
   };
 }
@@ -143,8 +150,8 @@ function upsertSql(increment: EngineLoadRollupIncrement): Prisma.Sql {
         WHEN existing."maxSlotsBusy" IS NULL THEN EXCLUDED."maxSlotsBusy"
         WHEN EXCLUDED."maxSlotsBusy" IS NULL THEN existing."maxSlotsBusy"
         ELSE GREATEST(existing."maxSlotsBusy", EXCLUDED."maxSlotsBusy") END,
-      "prefixCacheHits" = existing."prefixCacheHits" + EXCLUDED."prefixCacheHits",
-      "prefixCacheQueries" = existing."prefixCacheQueries" + EXCLUDED."prefixCacheQueries",
+      "prefixCacheHits" = LEAST(${ENGINE_LOAD_ROLLUP_INT4_MAX}, existing."prefixCacheHits" + EXCLUDED."prefixCacheHits"),
+      "prefixCacheQueries" = LEAST(${ENGINE_LOAD_ROLLUP_INT4_MAX}, existing."prefixCacheQueries" + EXCLUDED."prefixCacheQueries"),
       "lastSource" = COALESCE(EXCLUDED."lastSource", existing."lastSource"),
       "cliDeviceId" = EXCLUDED."cliDeviceId",
       "updatedAt" = now()`;
@@ -155,18 +162,24 @@ type CapacityCache = { at: number; rows: CapacityRow[] };
 
 export async function writeEngineLoadIncrements(
   increments: readonly EngineLoadRollupIncrement[],
-  db: Pick<typeof prisma, "$executeRaw"> = prisma,
+  db: { $executeRaw: (query: Prisma.Sql) => Promise<unknown> } = prisma,
 ): Promise<number> {
   const sorted = [...increments].sort((left, right) => {
     const a = incrementKeyString(left);
     const b = incrementKeyString(right);
     return a < b ? -1 : a > b ? 1 : 0;
   });
+  let written = 0;
   for (const increment of sorted) {
-    if (isDbShutdownFenceArmed()) return 0;
-    await db.$executeRaw(upsertSql(increment));
+    if (isDbShutdownFenceArmed()) return written;
+    try {
+      await db.$executeRaw(upsertSql(increment));
+      written += 1;
+    } catch {
+      /* One overflowing or rejected row must not drop the rest of the flush. */
+    }
   }
-  return sorted.length;
+  return written;
 }
 
 export function createEngineLoadRollupWriter({

@@ -679,9 +679,10 @@ fn normalize_signal(signal: AdapterSignal, value: f64) -> Option<f64> {
         AdapterSignal::Running
         | AdapterSignal::Waiting
         | AdapterSignal::SlotsBusy
-        | AdapterSignal::Deferred
-        | AdapterSignal::PrefixCacheHitsTotal
-        | AdapterSignal::PrefixCacheQueriesTotal => drop_count(value, LOAD_COUNT_MAX),
+        | AdapterSignal::Deferred => drop_count(value, LOAD_COUNT_MAX),
+        AdapterSignal::PrefixCacheHitsTotal | AdapterSignal::PrefixCacheQueriesTotal => {
+            drop_count(value, TOKEN_COUNT_MAX)
+        }
         AdapterSignal::Slots => drop_count(value, SLOTS_MAX).filter(|kept| *kept >= 1.0),
         AdapterSignal::KvTokens | AdapterSignal::MaxModelLen | AdapterSignal::CtxPerSlot => {
             drop_count(value, TOKEN_COUNT_MAX).filter(|kept| *kept >= 1.0)
@@ -1045,6 +1046,32 @@ hits{model=\"b\"} 5
         assert!(sample.dropped.iter().any(
             |row| row.signal == AdapterSignal::KvUsage && row.reason == DropReason::OutOfRange
         ));
+    }
+
+    #[test]
+    fn prefix_cache_counters_use_the_token_bound() {
+        let spec = json_spec(BTreeMap::new());
+        let kept = parse_adapter_body(
+            &spec,
+            r#"{"running": 1, "prefixCacheHitsTotal": 1000001, "prefixCacheQueriesTotal": 2000000}"#,
+        )
+        .expect("parse");
+        let reading = kept.reading.expect("running");
+        assert_eq!(reading.prefix_cache_hits_total, Some(1_000_001.0));
+        assert_eq!(reading.prefix_cache_queries_total, Some(2_000_000.0));
+        let dropped = parse_adapter_body(
+            &spec,
+            r#"{"running": 1, "prefixCacheHitsTotal": 1000000000001}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            dropped.reading.expect("running").prefix_cache_hits_total,
+            None
+        );
+        assert!(dropped.dropped.iter().any(|row| {
+            row.signal == AdapterSignal::PrefixCacheHitsTotal
+                && row.reason == DropReason::OutOfRange
+        }));
     }
 
     #[test]

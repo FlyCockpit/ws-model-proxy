@@ -8,11 +8,13 @@ vi.mock("@ws-model-proxy/db/shutdown-fence", () => ({ isDbShutdownFenceArmed: ()
 
 import {
   createEngineLoadRollupWriter,
+  ENGINE_LOAD_ROLLUP_INT4_MAX,
   ENGINE_LOAD_ROLLUP_MAX_PENDING,
   type EngineLoadRollupSample,
   incrementKeyString,
   mergeEngineLoadIncrements,
   truncateToMinute,
+  writeEngineLoadIncrements,
 } from "./engine-load-rollup.js";
 
 const NOW = new Date("2026-09-30T12:00:30.000Z");
@@ -53,6 +55,21 @@ describe("engine-load rollup merge", () => {
     expect(second.maxKvOccupancy).toBe(0.8);
     expect(second.prefixCacheHits).toBe(6);
     expect(second.samples).toBe(2);
+  });
+
+  it("clamps prefix-cache counters to int4 so one minute cannot overflow the column", () => {
+    const merged = mergeEngineLoadIncrements(
+      undefined,
+      sample({ prefixCacheHitsDelta: ENGINE_LOAD_ROLLUP_INT4_MAX, prefixCacheQueriesDelta: 2 }),
+      "cap-1",
+    );
+    const overflowed = mergeEngineLoadIncrements(
+      merged,
+      sample({ prefixCacheHitsDelta: 10, prefixCacheQueriesDelta: ENGINE_LOAD_ROLLUP_INT4_MAX }),
+      "cap-1",
+    );
+    expect(overflowed.prefixCacheHits).toBe(ENGINE_LOAD_ROLLUP_INT4_MAX);
+    expect(overflowed.prefixCacheQueries).toBe(ENGINE_LOAD_ROLLUP_INT4_MAX);
   });
 
   it("sorts upserts by a stable key", () => {
@@ -201,5 +218,24 @@ describe("engine-load rollup writer", () => {
     const flushed = writes.flat() as Array<{ endpointSlug: string }>;
     expect(flushed.length).toBeLessThanOrEqual(ENGINE_LOAD_ROLLUP_MAX_PENDING + 1);
     expect(flushed.some((row) => row.endpointSlug === "ep-2010")).toBe(false);
+  });
+
+  it("isolates a failed increment so later rows still write", async () => {
+    const calls: unknown[] = [];
+    const written = await writeEngineLoadIncrements(
+      [
+        mergeEngineLoadIncrements(undefined, sample({ endpointSlug: "a" }), "cap-1"),
+        mergeEngineLoadIncrements(undefined, sample({ endpointSlug: "b" }), "cap-2"),
+      ],
+      {
+        $executeRaw: async (sql) => {
+          calls.push(sql);
+          if (calls.length === 1) throw new Error("int4 overflow");
+          return 1;
+        },
+      },
+    );
+    expect(calls).toHaveLength(2);
+    expect(written).toBe(1);
   });
 });

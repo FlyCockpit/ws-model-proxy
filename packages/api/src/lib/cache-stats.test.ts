@@ -66,6 +66,13 @@ describe("resolveCacheStatsWindow", () => {
     expect(twoMonths.bucketCount).toBeLessThanOrEqual(CACHE_STATS_MAX_SERIES_POINTS);
   });
 
+  it("cuts minute and hour retention from now, not the exclusive window end", () => {
+    const now = new Date("2026-09-24T12:00:30.000Z");
+    const window = resolveCacheStatsWindow({ lastDays: 60 }, now);
+    expect(window.source).toBe("mixed");
+    expect(window.hourUntil?.getTime()).toBe(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  });
+
   it("marks windows that start before hour retention as truncated", () => {
     const window = resolveCacheStatsWindow({ lastDays: 395 }, NOW);
     expect(window.source === "mixed" || window.source === "hour").toBe(true);

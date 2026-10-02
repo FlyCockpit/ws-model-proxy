@@ -148,6 +148,7 @@ export function expandHistorySeries(
 export class EngineLoadHistoryStore {
   private rings = new Map<string, Ring>();
   private keysByDevice = new Map<string, Set<string>>();
+  private recordsSincePrune = 0;
 
   get size(): number {
     return this.rings.size;
@@ -163,15 +164,20 @@ export class EngineLoadHistoryStore {
     modelSlug: string | null,
     sample: EngineLoadHistorySample,
   ): boolean {
+    this.recordsSincePrune += 1;
+    if (this.recordsSincePrune >= ENGINE_LOAD_HISTORY_MAX_KEYS_PER_DEVICE) {
+      this.recordsSincePrune = 0;
+      this.prune(sample.receivedAt);
+    }
     const key = historyKey(cliDeviceId, endpointSlug, modelSlug);
     const existing = this.rings.get(key);
     if (!existing) {
       if (
         (this.keysByDevice.get(cliDeviceId)?.size ?? 0) >= ENGINE_LOAD_HISTORY_MAX_KEYS_PER_DEVICE
       ) {
-        return false;
+        this.evictLeastRecentForDevice(cliDeviceId);
       }
-      if (this.rings.size >= ENGINE_LOAD_HISTORY_MAX_KEYS) return false;
+      if (this.rings.size >= ENGINE_LOAD_HISTORY_MAX_KEYS) this.evictLeastRecent();
     }
     const receivedMs = sample.receivedAt.getTime();
     this.pruneRing(existing, receivedMs);
@@ -222,6 +228,13 @@ export class EngineLoadHistoryStore {
     }
   }
 
+  dropDevice(cliDeviceId: string): void {
+    const keys = this.keysByDevice.get(cliDeviceId);
+    if (!keys) return;
+    for (const key of [...keys]) this.rings.delete(key);
+    this.keysByDevice.delete(cliDeviceId);
+  }
+
   private ringSeries(
     cliDeviceId: string,
     endpointSlug: string,
@@ -251,5 +264,31 @@ export class EngineLoadHistoryStore {
     const set = this.keysByDevice.get(cliDeviceId);
     set?.delete(key);
     if (set && set.size === 0) this.keysByDevice.delete(cliDeviceId);
+  }
+
+  private evictLeastRecentForDevice(cliDeviceId: string): void {
+    const keys = this.keysByDevice.get(cliDeviceId);
+    if (!keys || keys.size === 0) return;
+    this.evictOldest(keys);
+  }
+
+  private evictLeastRecent(): void {
+    this.evictOldest(this.rings.keys());
+  }
+
+  private evictOldest(keys: Iterable<string>): void {
+    let oldestKey: string | undefined;
+    let oldestMs = Number.POSITIVE_INFINITY;
+    let oldestDevice: string | undefined;
+    for (const key of keys) {
+      const ring = this.rings.get(key);
+      if (!ring) continue;
+      if (ring.lastMs < oldestMs) {
+        oldestMs = ring.lastMs;
+        oldestKey = key;
+        oldestDevice = ring.cliDeviceId;
+      }
+    }
+    if (oldestKey && oldestDevice) this.drop(oldestKey, oldestDevice);
   }
 }

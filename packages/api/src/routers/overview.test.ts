@@ -316,8 +316,9 @@ describe("overviewRouter.metrics", () => {
   });
 
   it("shapes 24h engine-load series from persisted minutes and keeps occupancy display-only", async () => {
-    const members = pool().PoolMembers.map((member) => ({
+    const members = pool().PoolMembers.map((member, index) => ({
       ...member,
+      kvFullThreshold: index === 0 ? 0.8 : null,
       ExecutionTarget: { ...member.ExecutionTarget, inferenceCapacityId: "cap-1" },
     }));
     db.modelPool.findMany.mockResolvedValue([{ ...pool(), PoolMembers: members }]);
@@ -325,30 +326,31 @@ describe("overviewRouter.metrics", () => {
     const windowStart = new Date(
       Math.floor(Date.now() / (15 * 60_000)) * (15 * 60_000) + 15 * 60_000 - 24 * 60 * 60_000,
     );
-    db.engineLoadRollupMinute.findMany.mockResolvedValue([
-      {
-        bucketStart: windowStart,
-        capacityId: "cap-1",
-        maxRunning: 4,
-        maxWaiting: 2,
-        maxKvUsage: 0.5,
-        maxKvOccupancy: 0.9,
-      },
-    ]);
+    const engineLoadRow = {
+      bucketStart: windowStart,
+      capacityId: "cap-1",
+      maxRunning: 4,
+      maxWaiting: 2,
+      maxKvUsage: 0.5,
+      maxKvOccupancy: 0.9,
+    };
+    db.$queryRaw.mockImplementation(async (strings: TemplateStringsArray) => {
+      const text = Array.from(strings).join("?");
+      if (text.includes("engine_load_rollup_minute")) return [engineLoadRow];
+      return [];
+    });
     const result = await client().metrics({ range: "24h" });
     const series = result.pools[0]!.engineLoad.series;
     expect(series.some((point) => !point.gap)).toBe(true);
     const first = series.find((point) => !point.gap)!;
     expect(first.running).toBe(4);
     expect(first.kvOccupancy).toBe(0.9);
-    expect(db.engineLoadRollupMinute.findMany).toHaveBeenCalledWith(
-      expect.objectContaining({
-        where: expect.objectContaining({
-          ownerUserId: "owner-id",
-          capacityId: { in: ["cap-1"] },
-        }),
-      }),
+    expect(result.pools[0]!.engineLoad.effectiveKvFullThreshold).toBe(0.8);
+    const engineLoadCalls = (db.$queryRaw.mock.calls as RawCall[]).filter((call) =>
+      rawText(call).includes("engine_load_rollup_minute"),
     );
+    expect(engineLoadCalls).toHaveLength(1);
+    expect(rawText(engineLoadCalls[0]!)).toContain("GROUP BY 1, 2");
   });
 
   it("scopes owned traffic by resource owner and shared-pool usage by requester only", async () => {
