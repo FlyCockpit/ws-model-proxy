@@ -465,10 +465,24 @@ describe("v4 inventory invariants", () => {
     ).toBeNull();
   });
 
-  it("rejects surfaces inconsistent with the declared protocol", () => {
+  it("lets openai-compatible gateways claim Messages and rejects OpenAI surfaces on Anthropic inventories", () => {
     expect(
       parseOpenAiCompatibleCapabilities({ ...anthropic, protocol: "openai-compatible" }),
-    ).toBeNull();
+    ).not.toBeNull();
+    expect(
+      parseOpenAiCompatibleCapabilities({
+        version: 4,
+        protocol: "openai-compatible",
+        surfaces: {
+          openaiChatCompletions: {
+            source: "provider",
+            confidence: "exact",
+            operations: ["create"],
+          },
+          anthropicMessages: anthropic.surfaces.anthropicMessages,
+        },
+      }),
+    ).not.toBeNull();
     expect(
       parseOpenAiCompatibleCapabilities({
         version: 4,

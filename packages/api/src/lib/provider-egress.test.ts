@@ -77,6 +77,39 @@ describe("provider egress policy", () => {
     expect(observed.cookie).toBeUndefined();
   });
 
+  it("sends Bearer Messages to OpenRouter without x-api-key and keeps anthropic-version", async () => {
+    let observed: Record<string, string | string[] | undefined> = {};
+    const server = createServer((request, response) => {
+      observed = request.headers;
+      response.writeHead(204);
+      response.end();
+    });
+    servers.push(server);
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("test server did not bind");
+    const response = await providerHttpsRequest(
+      `http://127.0.0.1:${address.port}`,
+      {
+        method: "POST",
+        headers: {
+          accept: "application/json",
+          "content-type": "application/json",
+          "anthropic-version": "2023-06-01",
+          "x-api-key": "must-stay-blank",
+        },
+      },
+      { allowPrivateNetworks: true, egressEnabled: true },
+      "anthropic",
+      { type: "BEARER", token: "openrouter-key" },
+    );
+    response.resume();
+    expect(observed.authorization).toBe("Bearer openrouter-key");
+    expect(observed["x-api-key"]).toBeUndefined();
+    expect(observed["anthropic-version"]).toBe("2023-06-01");
+  });
+
   it("streams the exact request bytes without reflecting inbound credentials", async () => {
     let observedBody = Buffer.alloc(0);
     const server = createServer((request, response) => {

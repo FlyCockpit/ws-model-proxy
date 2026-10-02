@@ -6,18 +6,14 @@ const PROVIDER_PROTOCOL_BY_TYPE = {
   "anthropic-compatible": "anthropic",
   openai: "openai",
   "openai-compatible": "openai",
-  // OpenRouter's Chat Completions API is OpenAI-compatible and the only
-  // surface claimed (see PROVIDER_ALLOWED_SURFACES). Checked against docs, not
-  // live (2026-09-26, no key used):
-  // - Anthropic Messages (base https://openrouter.ai/api): authenticates with
-  //   `Authorization: Bearer <key>` and `x-api-key` left blank; a non-blank
-  //   `x-api-key` is treated as a direct-Anthropic credential
-  //   (openrouter.ai/docs/cookbook/coding-agents/claude-code-integration).
-  //   A BEARER account could therefore serve it, but it stays unclaimed.
-  // - Responses API: documented as beta and stateless (no stored responses,
-  //   so no previous_response_id follow-ups, retrieve or cancel;
-  //   openrouter.ai/docs/api_reference/responses/overview). Unclaimed:
-  //   Responses clients are adapted to Chat Completions.
+  // OpenRouter is an OpenAI-compatible gateway that also serves native
+  // Anthropic Messages. Claimed surfaces: Chat Completions, Responses (create
+  // only; documented as stateless — no stored responses, retrieve, cancel, or
+  // previous_response_id), and Messages. Auth is the account's Bearer token;
+  // Messages must leave `x-api-key` blank (a non-blank value is treated as a
+  // direct-Anthropic credential).
+  // Docs: openrouter.ai/docs/cookbook/coding-agents/claude-code-integration
+  // and openrouter.ai/docs/api_reference/responses/overview.
   openrouter: "openai",
 } as const satisfies Record<string, ProviderProtocol>;
 
@@ -176,7 +172,7 @@ export function classifyCredentialProbeStatus(
  * v4 inventory, whose shape cannot claim surfaces through legacy fields.
  */
 const PROVIDER_ALLOWED_SURFACES = {
-  openrouter: ["openaiChatCompletions"],
+  openrouter: ["openaiChatCompletions", "openaiResponses", "anthropicMessages"],
 } as const satisfies Partial<Record<ProviderType, readonly string[]>>;
 
 function normalizedType(providerType: string): string {
@@ -208,6 +204,12 @@ export function providerInventorySurfacesAllowed(
 ): boolean {
   const normalized = normalizedType(providerType);
   if (providerProtocolForType(normalized) === null) return false;
+  if (
+    normalized === "openai" &&
+    inventory.surfaces &&
+    inventory.surfaces.anthropicMessages !== undefined
+  )
+    return false;
   if (!Object.hasOwn(PROVIDER_ALLOWED_SURFACES, normalized)) return true;
   const allowed: readonly string[] =
     PROVIDER_ALLOWED_SURFACES[normalized as keyof typeof PROVIDER_ALLOWED_SURFACES];

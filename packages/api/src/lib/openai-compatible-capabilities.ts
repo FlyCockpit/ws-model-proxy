@@ -288,16 +288,12 @@ const v4CapabilitiesSchema = z
   })
   .strict()
   .superRefine((inventory, context) => {
-    const hasAnthropic = inventory.surfaces.anthropicMessages !== undefined;
     const hasOpenAi =
       inventory.surfaces.openaiChatCompletions !== undefined ||
       inventory.surfaces.openaiResponses !== undefined;
-    if (inventory.protocol === "openai-compatible" && hasAnthropic)
-      context.addIssue({
-        code: "custom",
-        message: "OpenAI-compatible inventories cannot declare Anthropic surfaces.",
-        path: ["surfaces", "anthropicMessages"],
-      });
+    // OpenAI-compatible gateways (OpenRouter) may also claim Messages; the
+    // provider-type allowlist still rejects that claim on OpenAI itself.
+    // Anthropic-compatible inventories stay Anthropic-only.
     if (inventory.protocol === "anthropic-compatible" && hasOpenAi)
       context.addIssue({
         code: "custom",
