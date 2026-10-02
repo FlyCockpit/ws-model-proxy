@@ -364,7 +364,7 @@ describe("#117 — real input schemas and named failing fields", () => {
     expect(body.result?.isError).toBe(true);
     expect(body.result?.structuredContent).toEqual({
       error: {
-        code: "BAD_REQUEST",
+        code: "invalid_input",
         fields: ["poolId"],
         message: "poolId: Invalid input: expected string, received undefined",
         issues: [
@@ -400,7 +400,7 @@ describe("#117 — real input schemas and named failing fields", () => {
       const wire = JSON.stringify(body);
       expect(wire).not.toContain(PLAIN);
       expect(wire).not.toContain("ZZSECRETVALUEZZ");
-      expect(body.result?.structuredContent?.error?.code).toBe("BAD_REQUEST");
+      expect(body.result?.structuredContent?.error?.code).toBe("invalid_input");
     }
   });
 
@@ -438,7 +438,7 @@ describe("#117 — real input schemas and named failing fields", () => {
     expect(body.result?.isError).toBe(true);
     expect(body.result?.structuredContent).toEqual({
       error: {
-        code: "BAD_REQUEST",
+        code: "invalid_input",
         fields: ["capacityConcurrencyLimit"],
         message: "Effective concurrency limit exceeds physical capacity.",
       },

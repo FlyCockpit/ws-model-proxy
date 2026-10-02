@@ -629,7 +629,7 @@ function validationToolError(code: string, issues: readonly McpValidationIssue[]
 
 function declaredFieldToolError(fields: readonly string[], message: string): ToolResult {
   return toolError(`Invalid input: ${fields.join(", ")}: ${message}`, {
-    error: { code: "BAD_REQUEST", fields: [...fields], message },
+    error: { code: "invalid_input", fields: [...fields], message },
   });
 }
 
@@ -659,7 +659,7 @@ function mapToolError(
           // schema-valid still names the key via data.fields.
           const knownKeys = declaredInputKeys(descriptor);
           const issues = sanitizeValidationIssues(error.data, knownKeys);
-          if (issues !== null) return validationToolError(error.code, issues);
+          if (issues !== null) return validationToolError("invalid_input", issues);
           const fields = sanitizeDeclaredFields(error.data, knownKeys);
           if (fields !== null) {
             return declaredFieldToolError(

@@ -911,15 +911,15 @@ A deletion-related `CONFLICT` also carries a stable `reason`
 
 Only these values are forwarded; any other `data` on a `CONFLICT` is dropped.
 
-A `BAD_REQUEST` caused by invalid arguments names the failing fields, in the
-text and in `structuredContent`:
+An argument-shaped failure uses `invalid_input` and names the failing fields,
+in the text and in `structuredContent`:
 
 A schema rejection includes `issues`:
 
 ```json
 {
   "error": {
-    "code": "BAD_REQUEST",
+    "code": "invalid_input",
     "fields": ["poolId"],
     "message": "poolId: Invalid input: expected string, received undefined",
     "issues": [{ "path": ["poolId"], "code": "invalid_type", "message": "Invalid input: expected string, received undefined" }]
@@ -932,7 +932,7 @@ A schema-valid rejection names the procedure's fields and keeps its static messa
 ```json
 {
   "error": {
-    "code": "BAD_REQUEST",
+    "code": "invalid_input",
     "fields": ["capacityConcurrencyLimit"],
     "message": "Effective concurrency limit exceeds physical capacity."
   }
@@ -954,9 +954,8 @@ allowlist of standard codes is reported as `invalid`), and each issue
 names are never echoed: messages that could quote a value (`custom`,
 `unrecognized_keys`, unknown codes) are replaced by fixed text, unrecognized
 keys become a count plus server-chosen suggestions, and at most 20 issues
-are returned. A
-`BAD_REQUEST` that is not about an argument (for example a failed
-precondition with no field list) stays the plain "Invalid input".
+are returned. A `BAD_REQUEST` that is not about an argument (for example a
+failed precondition with no field list) stays the plain "Invalid input".
 
 ## Login, consent, and scope step-up
 
