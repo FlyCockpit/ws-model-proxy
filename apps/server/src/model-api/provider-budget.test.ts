@@ -23,7 +23,9 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep() };
 });
 
-const { grantCapDenial } = await import("./provider-budget.js");
+const { grantCapDenial, reservationIdentityWhere, reservationWindowWhere } = await import(
+  "./provider-budget.js"
+);
 
 describe("provider budget accounting", () => {
   it("uses half-open UTC day windows across a year boundary", () => {
@@ -125,5 +127,75 @@ describe("grantCapDenial", () => {
       grantCapDenial({ id: "policy", scopeType: "PROVIDER_ACCOUNT" }, "rule", "PRICING_UNAVAILABLE")
         .reason,
     ).toBe("PRICING_UNAVAILABLE");
+  });
+});
+
+describe("grant-cap reservation identity and window", () => {
+  const grantPolicy = { id: "policy-current", scopeType: "POOL_GRANT" as const };
+  const spendRule = {
+    id: "rule-usd-month",
+    metric: "SPEND" as const,
+    period: "UTC_MONTH" as const,
+    currency: "USD",
+  };
+  const window = {
+    windowStart: new Date("2026-04-01T00:00:00.000Z"),
+    windowEnd: new Date("2026-05-01T00:00:00.000Z"),
+  };
+
+  it("omits period so same-currency spend still matches after a period change", () => {
+    expect(
+      reservationIdentityWhere(grantPolicy, spendRule, ["policy-old", "policy-current"]),
+    ).toEqual({
+      policyId: { in: ["policy-old", "policy-current"] },
+      metric: "SPEND",
+      currency: "USD",
+    });
+  });
+
+  it("starts a new identity when the cap currency changes", () => {
+    expect(
+      reservationIdentityWhere(grantPolicy, { ...spendRule, currency: "EUR" }, ["policy-current"]),
+    ).toEqual({
+      policyId: { in: ["policy-current"] },
+      metric: "SPEND",
+      currency: "EUR",
+    });
+  });
+
+  it("sums POOL_GRANT reservations by createdAt in the current wall-clock window", () => {
+    expect(reservationWindowWhere(grantPolicy, spendRule, window, "attempt-1")).toEqual({
+      createdAt: { gte: window.windowStart, lt: window.windowEnd },
+    });
+    expect(
+      reservationWindowWhere(
+        grantPolicy,
+        { metric: "SPEND", period: "LIFETIME" },
+        { windowStart: window.windowStart, windowEnd: null },
+        "attempt-1",
+      ),
+    ).toEqual({ createdAt: { gte: window.windowStart } });
+  });
+
+  it("keeps non-grant reservations pinned to the stored window bounds", () => {
+    expect(
+      reservationWindowWhere({ scopeType: "PROVIDER_ACCOUNT" }, spendRule, window, "attempt-1"),
+    ).toEqual({ windowStart: window.windowStart, windowEnd: window.windowEnd });
+    expect(
+      reservationWindowWhere(
+        grantPolicy,
+        { metric: "CONCURRENCY", period: "UTC_MONTH" },
+        window,
+        "attempt-1",
+      ),
+    ).toEqual({});
+    expect(
+      reservationWindowWhere(
+        grantPolicy,
+        { metric: "SPEND", period: "PER_ATTEMPT" },
+        window,
+        "attempt-1",
+      ),
+    ).toEqual({ attemptId: "attempt-1" });
   });
 });

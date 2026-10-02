@@ -369,8 +369,9 @@ ALTER TABLE pool_member ADD CONSTRAINT pool_member_tier_shape_check CHECK (
 CREATE UNIQUE INDEX IF NOT EXISTS pool_member_public_order_unique
   ON pool_member ("poolId", "publicOrder") WHERE tier = 'PUBLIC_OVERFLOW';
 
--- Member-scoped routing rules: pool and member deletes cascade. exclude
--- without a member is invalid; a memberId must belong to this pool.
+-- Member-scoped routing rules: pool deletes cascade. Targeted memberId rules
+-- are deleted with the member; exclude rules SET NULL and become pool-wide.
+-- exclude without a member is invalid on write; a memberId must be PRIMARY.
 ALTER TABLE pool_routing_rule DROP CONSTRAINT IF EXISTS pool_routing_rule_shape_check;
 ALTER TABLE pool_routing_rule ADD CONSTRAINT pool_routing_rule_shape_check CHECK (
   position BETWEEN 0 AND 15
@@ -386,13 +387,20 @@ ALTER TABLE pool_routing_rule ADD CONSTRAINT pool_routing_rule_shape_check CHECK
   AND (labels IS NULL OR jsonb_typeof(labels) = 'object')
 );
 
+ALTER TABLE pool_routing_rule DROP CONSTRAINT IF EXISTS pool_routing_rule_memberId_fkey;
+ALTER TABLE pool_routing_rule
+  ADD CONSTRAINT pool_routing_rule_memberId_fkey
+  FOREIGN KEY ("memberId") REFERENCES pool_member(id)
+  ON DELETE SET NULL ON UPDATE CASCADE;
+
 CREATE OR REPLACE FUNCTION enforce_pool_routing_rule_member()
 RETURNS trigger LANGUAGE plpgsql AS $pool_routing_rule_member$
 BEGIN
   IF NEW."memberId" IS NOT NULL AND NOT EXISTS (
-    SELECT 1 FROM pool_member WHERE id = NEW."memberId" AND "poolId" = NEW."poolId"
+    SELECT 1 FROM pool_member
+     WHERE id = NEW."memberId" AND "poolId" = NEW."poolId" AND tier = 'PRIMARY'
   ) THEN
-    RAISE EXCEPTION 'pool routing rule member must belong to the pool'
+    RAISE EXCEPTION 'pool routing rule member must be a PRIMARY member of the pool'
       USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
@@ -403,6 +411,23 @@ DROP TRIGGER IF EXISTS pool_routing_rule_member ON pool_routing_rule;
 CREATE TRIGGER pool_routing_rule_member
 BEFORE INSERT OR UPDATE OF "poolId", "memberId" ON pool_routing_rule
 FOR EACH ROW EXECUTE FUNCTION enforce_pool_routing_rule_member();
+
+CREATE OR REPLACE FUNCTION pool_routing_rule_on_member_delete()
+RETURNS trigger LANGUAGE plpgsql AS $pool_routing_rule_on_member_delete$
+BEGIN
+  DELETE FROM pool_routing_rule
+   WHERE "memberId" = OLD.id AND exclude IS NOT TRUE;
+  UPDATE pool_routing_rule
+     SET "memberId" = NULL, exclude = false
+   WHERE "memberId" = OLD.id AND exclude IS TRUE;
+  RETURN OLD;
+END;
+$pool_routing_rule_on_member_delete$;
+
+DROP TRIGGER IF EXISTS pool_routing_rule_on_member_delete ON pool_member;
+CREATE TRIGGER pool_routing_rule_on_member_delete
+BEFORE DELETE ON pool_member
+FOR EACH ROW EXECUTE FUNCTION pool_routing_rule_on_member_delete();
 
 -- Fallback redesign: a pool's plain name never leaves the deployment.
 -- PRIMARY members are always local (discovered) models; provider models can

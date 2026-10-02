@@ -1591,7 +1591,10 @@ describe("metric routing procedures (S-B part 2)", () => {
   );
 
   it("replaces a pool's rules, scoped to the owner, and asks the relay to clear its verdicts (M never writes an H table)", async () => {
-    deep.modelPool.findFirst.mockResolvedValue({ id: "pool-1", PoolMembers: [{ id: "m1" }] });
+    deep.modelPool.findFirst.mockResolvedValue({
+      id: "pool-1",
+      PoolMembers: [{ id: "m1", tier: "PRIMARY" }],
+    });
     deep.poolRoutingRule.deleteMany.mockResolvedValue({ count: 0 });
     deep.poolRoutingRule.createMany.mockResolvedValue({ count: 1 });
     const onPoolRoutingRulesChanged = vi.fn(async () => undefined);
@@ -1626,7 +1629,10 @@ describe("metric routing procedures (S-B part 2)", () => {
   });
 
   it("persists label-less rules as SQL NULL, not JSON null", async () => {
-    deep.modelPool.findFirst.mockResolvedValue({ id: "pool-1", PoolMembers: [{ id: "m1" }] });
+    deep.modelPool.findFirst.mockResolvedValue({
+      id: "pool-1",
+      PoolMembers: [{ id: "m1", tier: "PRIMARY" }],
+    });
     deep.poolRoutingRule.deleteMany.mockResolvedValue({ count: 0 });
     deep.poolRoutingRule.createMany.mockResolvedValue({ count: 1 });
     const { Prisma } = await import("@ws-model-proxy/db");
@@ -1646,7 +1652,10 @@ describe("metric routing procedures (S-B part 2)", () => {
   });
 
   it("rejects a member-scoped rule whose id is not in the pool", async () => {
-    deep.modelPool.findFirst.mockResolvedValue({ id: "pool-1", PoolMembers: [{ id: "m1" }] });
+    deep.modelPool.findFirst.mockResolvedValue({
+      id: "pool-1",
+      PoolMembers: [{ id: "m1", tier: "PRIMARY" }],
+    });
     await expect(
       client().setPoolRoutingRules({
         poolId: "pool-1",
@@ -1658,6 +1667,47 @@ describe("metric routing procedures (S-B part 2)", () => {
         poolId: "pool-1",
         rules: [
           { metric: "x", op: ">", threshold: 1, effect: "avoid", excludeMemberId: "other-pool" },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(deep.poolRoutingRule.createMany).not.toHaveBeenCalled();
+  });
+
+  it("accepts a routing rule scoped to a PRIMARY member", async () => {
+    deep.modelPool.findFirst.mockResolvedValue({
+      id: "pool-1",
+      PoolMembers: [{ id: "m1", tier: "PRIMARY" }],
+    });
+    deep.poolRoutingRule.deleteMany.mockResolvedValue({ count: 0 });
+    deep.poolRoutingRule.createMany.mockResolvedValue({ count: 1 });
+    await client().setPoolRoutingRules({
+      poolId: "pool-1",
+      rules: [{ metric: "x", op: ">", threshold: 1, effect: "avoid", memberId: "m1" }],
+    });
+    expect(deep.poolRoutingRule.createMany).toHaveBeenCalledWith({
+      data: [expect.objectContaining({ memberId: "m1", exclude: false })],
+    });
+  });
+
+  it("rejects a routing rule that names a PUBLIC_OVERFLOW member", async () => {
+    deep.modelPool.findFirst.mockResolvedValue({
+      id: "pool-1",
+      PoolMembers: [
+        { id: "m1", tier: "PRIMARY" },
+        { id: "overflow", tier: "PUBLIC_OVERFLOW" },
+      ],
+    });
+    await expect(
+      client().setPoolRoutingRules({
+        poolId: "pool-1",
+        rules: [{ metric: "x", op: ">", threshold: 1, effect: "avoid", memberId: "overflow" }],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(
+      client().setPoolRoutingRules({
+        poolId: "pool-1",
+        rules: [
+          { metric: "x", op: ">", threshold: 1, effect: "avoid", excludeMemberId: "overflow" },
         ],
       }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });

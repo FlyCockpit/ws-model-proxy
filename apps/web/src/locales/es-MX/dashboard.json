@@ -1738,7 +1738,7 @@
       "other": "Otros miembros",
       "unrouted": "Sin enrutar",
       "removedMember": "Miembro eliminado",
-      "engineLoadCaption": "Carga del motor de {{name}} en el intervalo seleccionado: solicitudes en ejecución y en espera, uso de KV, ocupación y el umbral FULL.",
+      "engineLoadCaption": "Carga del motor de {{member}} en {{name}} en el intervalo seleccionado: solicitudes en ejecución y en espera, uso de KV, ocupación y el umbral FULL de ese miembro.",
       "legendRunning": "En ejecución",
       "legendWaiting": "En espera",
       "legendKv": "Uso de KV",

@@ -1318,11 +1318,12 @@ model PoolRoutingRule {
   threshold Float
   effect    String
   /// Null = pool-wide. Set with exclude=false for one member; exclude=true
-  /// for every other member. ON DELETE CASCADE drops the rule with the member.
+  /// for every other member. Targeted memberId rules are deleted with the
+  /// member (trigger). Exclude rules SET NULL and become pool-wide.
   memberId  String?
   exclude   Boolean     @default(false)
   ModelPool ModelPool   @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  Member    PoolMember? @relation(fields: [memberId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Member    PoolMember? @relation(fields: [memberId], references: [id], onDelete: SetNull, onUpdate: Cascade)
 
   @@unique([poolId, position])
   @@index([memberId])

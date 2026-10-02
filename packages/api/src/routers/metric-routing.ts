@@ -511,14 +511,16 @@ export const metricRoutingProcedures = {
            FOR NO KEY UPDATE`;
         const pool = await tx.modelPool.findFirst({
           where: { id: input.poolId, userId },
-          select: { id: true, PoolMembers: { select: { id: true } } },
+          select: { id: true, PoolMembers: { select: { id: true, tier: true } } },
         });
         if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
-        const memberIds = new Set(pool.PoolMembers.map((member) => member.id));
-        const unknown = scopedRoutingMemberIds(input.rules).filter((id) => !memberIds.has(id));
+        const primaryIds = new Set(
+          pool.PoolMembers.filter((member) => member.tier === "PRIMARY").map((member) => member.id),
+        );
+        const unknown = scopedRoutingMemberIds(input.rules).filter((id) => !primaryIds.has(id));
         if (unknown.length > 0) {
           throw new ORPCError("BAD_REQUEST", {
-            message: "memberId and excludeMemberId must name members of this pool.",
+            message: "memberId and excludeMemberId must name PRIMARY members of this pool.",
           });
         }
         await tx.poolRoutingRule.deleteMany({ where: { poolId: pool.id } });

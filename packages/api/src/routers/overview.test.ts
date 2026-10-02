@@ -311,8 +311,7 @@ describe("overviewRouter.metrics", () => {
     ]);
     expect(result.totals.current.requests).toBe(55);
     expect(result.totals.previous.requests).toBe(20);
-    expect(card.engineLoad.series).toHaveLength(96);
-    expect(card.engineLoad.series.every((point) => point.gap)).toBe(true);
+    expect(card.engineLoad.members).toEqual([]);
   });
 
   it("shapes 24h engine-load series from persisted minutes and keeps occupancy display-only", async () => {
@@ -340,12 +339,15 @@ describe("overviewRouter.metrics", () => {
       return [];
     });
     const result = await client().metrics({ range: "24h" });
-    const series = result.pools[0]!.engineLoad.series;
+    const loadMembers = result.pools[0]!.engineLoad.members;
+    expect(loadMembers).toHaveLength(2);
+    expect(loadMembers[0]).toMatchObject({ poolMemberId: "member-a", kvFullThreshold: 0.8 });
+    expect(loadMembers[1]).toMatchObject({ poolMemberId: "member-b", kvFullThreshold: 0.95 });
+    const series = loadMembers[0]!.series;
     expect(series.some((point) => !point.gap)).toBe(true);
     const first = series.find((point) => !point.gap)!;
     expect(first.running).toBe(4);
     expect(first.kvOccupancy).toBe(0.9);
-    expect(result.pools[0]!.engineLoad.effectiveKvFullThreshold).toBe(0.8);
     const engineLoadCalls = (db.$queryRaw.mock.calls as RawCall[]).filter((call) =>
       rawText(call).includes("engine_load_rollup_minute"),
     );
@@ -388,7 +390,9 @@ describe("overviewRouter.metrics", () => {
     db.executionTarget.findMany.mockResolvedValue([]);
     db.$queryRaw.mockResolvedValue([]);
     const result = await client().metrics({ range: "24h" });
-    expect(result.pools[0]!.engineLoad.effectiveKvFullThreshold).toBe(0.98);
+    expect(result.pools[0]!.engineLoad.members).toEqual([
+      expect.objectContaining({ poolMemberId: "member-a", kvFullThreshold: 0.98 }),
+    ]);
   });
 
   it("scopes owned traffic by resource owner and shared-pool usage by requester only", async () => {

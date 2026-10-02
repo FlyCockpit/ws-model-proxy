@@ -246,15 +246,28 @@ export type OverviewMemberRow = {
   stats: OverviewStats;
 };
 
-function poolEngineLoadThreshold(
-  members: readonly {
-    kvFullThreshold: number | null;
-    ExecutionTarget: { inferenceCapacityId: string | null } | null;
-  }[],
-): number {
-  const local = members.filter((member) => member.ExecutionTarget?.inferenceCapacityId);
-  if (local.length === 0) return effectiveKvFullThreshold(null);
-  return Math.min(...local.map((member) => effectiveKvFullThreshold(member.kvFullThreshold)));
+function localDiscoveredKvMembers<
+  T extends {
+    id: string;
+    ExecutionTarget: {
+      kind: string;
+      inferenceCapacityId: string | null;
+    } | null;
+  },
+>(
+  members: readonly T[],
+): Array<
+  T & { ExecutionTarget: NonNullable<T["ExecutionTarget"]> & { inferenceCapacityId: string } }
+> {
+  return members.filter(
+    (
+      member,
+    ): member is T & {
+      ExecutionTarget: NonNullable<T["ExecutionTarget"]> & { inferenceCapacityId: string };
+    } =>
+      member.ExecutionTarget?.kind === "DISCOVERED_MODEL" &&
+      typeof member.ExecutionTarget.inferenceCapacityId === "string",
+  );
 }
 
 export const overviewRouter = {
@@ -288,10 +301,8 @@ export const overviewRouter = {
     const capacityIds = [
       ...new Set(
         pools.flatMap((pool) =>
-          pool.PoolMembers.flatMap((member) =>
-            member.ExecutionTarget?.inferenceCapacityId
-              ? [member.ExecutionTarget.inferenceCapacityId]
-              : [],
+          localDiscoveredKvMembers(pool.PoolMembers).map(
+            (member) => member.ExecutionTarget.inferenceCapacityId,
           ),
         ),
       ),
@@ -415,19 +426,18 @@ export const overviewRouter = {
           seriesKeys,
         ),
         engineLoad: {
-          effectiveKvFullThreshold: poolEngineLoadThreshold(pool.PoolMembers),
-          series:
-            window.range === "1h"
-              ? []
-              : shapeEngineLoadOverview({
-                  window,
-                  capacityIds: pool.PoolMembers.flatMap((member) =>
-                    member.ExecutionTarget?.inferenceCapacityId
-                      ? [member.ExecutionTarget.inferenceCapacityId]
-                      : [],
-                  ),
-                  rows: engineLoadRows,
-                }),
+          members: localDiscoveredKvMembers(pool.PoolMembers).map((member) => ({
+            poolMemberId: member.id,
+            kvFullThreshold: effectiveKvFullThreshold(member.kvFullThreshold),
+            series:
+              window.range === "1h"
+                ? []
+                : shapeEngineLoadOverview({
+                    window,
+                    capacityIds: [member.ExecutionTarget.inferenceCapacityId],
+                    rows: engineLoadRows,
+                  }),
+          })),
         },
       };
     });

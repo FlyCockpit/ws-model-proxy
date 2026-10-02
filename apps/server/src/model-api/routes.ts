@@ -396,6 +396,44 @@ class ContextCeilingExceededError extends Error {
   }
 }
 
+function countFirstCeilingTokens(
+  physicalMaxContext: number | null | undefined,
+  effectiveContextCeiling: number | null | undefined,
+  contextMargin: number | null | undefined,
+): number | null {
+  const ceiling = effectiveContextCeilingTokens(physicalMaxContext, effectiveContextCeiling);
+  if (ceiling == null || !Number.isSafeInteger(ceiling) || ceiling <= 0) return null;
+  const margin =
+    typeof contextMargin === "number" && Number.isSafeInteger(contextMargin) && contextMargin > 0
+      ? contextMargin
+      : 0;
+  const inclusive = ceiling - margin;
+  if (!Number.isSafeInteger(inclusive) || inclusive <= 0) return null;
+  return inclusive;
+}
+
+function strictlyLargerCeilingRoutes<T extends { poolMemberId: string }>({
+  candidates,
+  fromMemberId,
+  fromCeiling,
+  memberCeiling,
+  minTokens = null,
+}: {
+  candidates: readonly T[];
+  fromMemberId: string;
+  fromCeiling: number | null;
+  memberCeiling: (poolMemberId: string) => number | null;
+  minTokens?: number | null;
+}): T[] {
+  return candidates.filter((route) => {
+    if (route.poolMemberId === fromMemberId) return false;
+    const ceiling = memberCeiling(route.poolMemberId);
+    if (fromCeiling === null || ceiling === null) return false;
+    if (ceiling <= fromCeiling) return false;
+    return minTokens === null || ceiling > minTokens;
+  });
+}
+
 function contextExceededResponse(
   operation: Pick<RelayOperation, "family">,
   message: string,
@@ -603,6 +641,7 @@ function chatCountFirstRelayFields({
   engineCountContext,
   physicalMaxContext,
   effectiveContextCeiling,
+  contextMargin,
   manager,
   cliDeviceId,
   relayRequestId,
@@ -614,6 +653,7 @@ function chatCountFirstRelayFields({
   engineCountContext: Parameters<typeof engineCountContextSupportsNative>[0];
   physicalMaxContext: number | null | undefined;
   effectiveContextCeiling: number | null | undefined;
+  contextMargin?: number | null;
   manager: NonNullable<ModelApiRouteDependencies["manager"]>;
   cliDeviceId: string;
   relayRequestId: string;
@@ -634,14 +674,12 @@ function chatCountFirstRelayFields({
   if (family !== "chat.completions") return {};
   if (!engineCountContextSupportsNative(engineCountContext)) return {};
   if (!manager.supportsCountContext(cliDeviceId)) return {};
-  const ceiling = effectiveContextCeilingTokens(physicalMaxContext, effectiveContextCeiling);
-  if (
-    ceiling == null ||
-    !Number.isSafeInteger(ceiling) ||
-    ceiling <= 0 ||
-    !contextCount ||
-    !isNearContextCeiling(contextCount.tokens, ceiling)
-  ) {
+  const ceiling = countFirstCeilingTokens(
+    physicalMaxContext,
+    effectiveContextCeiling,
+    contextMargin,
+  );
+  if (ceiling == null || !contextCount || !isNearContextCeiling(contextCount.tokens, ceiling)) {
     return {};
   }
   return {
@@ -4302,6 +4340,7 @@ async function relayDirect({
         engineCountContext: selected.ExecutionTarget?.InferenceCapacity?.engineCountContext,
         physicalMaxContext: selected.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
         effectiveContextCeiling: selected.ExecutionTarget?.directContextCeiling,
+        contextMargin: selected.ExecutionTarget?.directContextMargin,
         manager,
         cliDeviceId: selected.Endpoint.cliDeviceId,
         relayRequestId,
@@ -6278,6 +6317,34 @@ async function relayPool({
   }
   let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
   let selectedRouteCandidates = routeCandidates;
+  const memberEffectiveCeiling = (poolMemberId: string) => {
+    const member = memberById.get(poolMemberId);
+    if (!member) return null;
+    return effectiveContextCeilingTokens(
+      member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+      configuredContextCeilingForMember(member),
+    );
+  };
+  const respondLocalContextCeiling = async (details: ContextExceededDetails) => {
+    const overflow = await tryPublicOverflow("LOCAL_CONTEXT_CEILING", async () => undefined);
+    if (overflow.kind === "response") return overflow.response;
+    const lostAccess = terminalExternalFailure(overflow);
+    await operation.dispose?.();
+    if (lostAccess) {
+      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: lostAccess });
+      return operationFailureResponse(operation, lostAccess);
+    }
+    await failPoolRelayMetadata({
+      relayRequestId,
+      startedAt,
+      failure: "request_too_large",
+    }).catch(metadataUpdateError);
+    return contextExceededResponse(
+      operation,
+      "Request context exceeds the configured execution capacity ceiling.",
+      details,
+    );
+  };
   const applyMemberContextCount = async (poolMemberId: string) => {
     const member = memberById.get(poolMemberId);
     if (!member) return;
@@ -6465,37 +6532,43 @@ async function relayPool({
       await applyMemberContextCount(selectedPoolMemberId);
     } catch (error) {
       const admittedLease = capacityLease.lease;
-      await settleRelayCleanup([
-        () => capacityRuntime.release(admittedLease),
-        () => operation.dispose?.(),
-      ]);
       if (error instanceof ContextCeilingExceededError) {
-        await failPoolRelayMetadata({
-          relayRequestId,
-          startedAt,
-          failure: "request_too_large",
-        }).catch(metadataUpdateError);
-        return contextExceededResponse(
-          operation,
-          "Request context exceeds the configured execution capacity ceiling.",
-          error.details,
+        const larger = strictlyLargerCeilingRoutes({
+          candidates: routeCandidates,
+          fromMemberId: selectedPoolMemberId,
+          fromCeiling: error.details.effectiveContextCeilingTokens,
+          memberCeiling: memberEffectiveCeiling,
+        });
+        await settleRelayCleanup([() => capacityRuntime.release(admittedLease)]);
+        capacityLease = undefined;
+        if (larger.length > 0) {
+          selectedRouteCandidates = larger;
+        } else {
+          return respondLocalContextCeiling(error.details);
+        }
+      } else {
+        await settleRelayCleanup([
+          () => capacityRuntime.release(admittedLease),
+          () => operation.dispose?.(),
+        ]);
+        if (error instanceof LocalSendRefused && error.denial !== "MEMBER_UNAVAILABLE") {
+          const countFailure = LOCAL_SEND_DENIAL_FAILURE[error.denial];
+          externalAttempt.accessLost = true;
+          await failPoolRelayMetadata({ relayRequestId, startedAt, failure: countFailure });
+          return operationFailureResponse(operation, countFailure);
+        }
+        await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "unknown" }).catch(
+          metadataUpdateError,
         );
+        return operationFailureResponse(operation, "unknown");
       }
-      if (error instanceof LocalSendRefused && error.denial !== "MEMBER_UNAVAILABLE") {
-        const countFailure = LOCAL_SEND_DENIAL_FAILURE[error.denial];
-        externalAttempt.accessLost = true;
-        await failPoolRelayMetadata({ relayRequestId, startedAt, failure: countFailure });
-        return operationFailureResponse(operation, countFailure);
-      }
-      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "unknown" }).catch(
-        metadataUpdateError,
-      );
-      return operationFailureResponse(operation, "unknown");
     }
-    selectedRouteCandidates = [
-      ...routeCandidates.filter(({ poolMemberId }) => poolMemberId === selectedPoolMemberId),
-      ...routeCandidates.filter(({ poolMemberId }) => poolMemberId !== selectedPoolMemberId),
-    ];
+    if (capacityLease?.state === "ADMITTED") {
+      selectedRouteCandidates = [
+        ...routeCandidates.filter(({ poolMemberId }) => poolMemberId === selectedPoolMemberId),
+        ...routeCandidates.filter(({ poolMemberId }) => poolMemberId !== selectedPoolMemberId),
+      ];
+    }
   }
   try {
     globalLease = limiter.acquireGlobal({
@@ -6601,18 +6674,19 @@ async function relayPool({
       } catch (error) {
         await releaseCapacityAttempt();
         if (error instanceof ContextCeilingExceededError) {
-          globalLease?.release();
-          await operation.dispose?.();
-          await failPoolRelayMetadata({
-            relayRequestId,
-            startedAt,
-            failure: "request_too_large",
+          const larger = strictlyLargerCeilingRoutes({
+            candidates: selectedRouteCandidates.slice(candidateIndex),
+            fromMemberId: admittedPoolMemberId,
+            fromCeiling: error.details.effectiveContextCeilingTokens,
+            memberCeiling: memberEffectiveCeiling,
           });
-          return contextExceededResponse(
-            operation,
-            "Request context exceeds the configured execution capacity ceiling.",
-            error.details,
-          );
+          if (larger.length > 0) {
+            selectedRouteCandidates = larger;
+            candidateIndex = -1;
+            continue;
+          }
+          globalLease?.release();
+          return respondLocalContextCeiling(error.details);
         }
         if (error instanceof LocalSendRefused && error.denial !== "MEMBER_UNAVAILABLE") {
           finalFailure = LOCAL_SEND_DENIAL_FAILURE[error.denial];
@@ -6872,6 +6946,7 @@ async function relayPool({
           engineCountContext: member.ExecutionTarget?.InferenceCapacity?.engineCountContext,
           physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
           effectiveContextCeiling: configuredContextCeilingForMember(member),
+          contextMargin: contextMarginForMember(member),
           manager,
           cliDeviceId: candidate.cliDeviceId,
           relayRequestId,
@@ -6952,20 +7027,15 @@ async function relayPool({
             configuredContextCeilingForMember(member),
           );
           // One overflow retry, and only onto members whose ceiling exceeds
-          // both this member's ceiling and the engine-reported prompt size.
-          // Do not slice from the next larger index: that set includes smaller
-          // members later in the order.
-          const overflowRetryCandidates = selectedRouteCandidates.filter((route, index) => {
-            if (index <= candidateIndex) return false;
-            const next = memberById.get(route.poolMemberId);
-            if (!next) return false;
-            const ceiling = effectiveContextCeilingTokens(
-              next.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
-              configuredContextCeilingForMember(next),
-            );
-            if (thisCeiling === null || ceiling === null) return false;
-            if (ceiling <= thisCeiling) return false;
-            return overflow.promptTokens === null || ceiling > overflow.promptTokens;
+          // both this member's ceiling and the engine-reported size (requested
+          // tokens when the engine split prompt/completion, else prompt).
+          const overflowNeed = overflow.requestedTokens ?? overflow.promptTokens;
+          const overflowRetryCandidates = strictlyLargerCeilingRoutes({
+            candidates: selectedRouteCandidates.filter((_, index) => index > candidateIndex),
+            fromMemberId: candidate.poolMemberId,
+            fromCeiling: thisCeiling,
+            memberCeiling: memberEffectiveCeiling,
+            minTokens: overflowNeed,
           });
           const retryOverflow =
             !contextOverflowRetried &&
@@ -6997,7 +7067,17 @@ async function relayPool({
           }
           await releaseCapacityAttempt();
           globalLease?.release();
+          const overflowResponse = await tryPublicOverflow(
+            "LOCAL_CONTEXT_CEILING",
+            async () => undefined,
+          );
+          if (overflowResponse.kind === "response") return overflowResponse.response;
+          const lostAccess = terminalExternalFailure(overflowResponse);
           await operation.dispose?.();
+          if (lostAccess) {
+            await failPoolRelayMetadata({ relayRequestId, startedAt, failure: lostAccess });
+            return operationFailureResponse(operation, lostAccess);
+          }
           await failPoolRelayMetadata({
             relayRequestId,
             startedAt,
@@ -7509,35 +7589,35 @@ async function relayPool({
       );
       const failure = terminal.failure ?? "unknown";
       if (failure === "request_too_large" && operation.contextCount?.exact) {
+        const thisCeiling =
+          effectiveContextCeilingTokens(
+            member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+            configuredContextCeilingForMember(member),
+          ) ?? 1;
+        const larger = strictlyLargerCeilingRoutes({
+          candidates: selectedRouteCandidates.filter((_, index) => index > candidateIndex),
+          fromMemberId: candidate.poolMemberId,
+          fromCeiling: thisCeiling,
+          memberCeiling: memberEffectiveCeiling,
+        });
         await settleRelayCleanup([
           () => cliLease.release(),
           () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
-          () => globalLease?.release(),
-          () =>
-            capacityLease?.state === "ADMITTED"
-              ? capacityRuntime?.release(capacityLease.lease)
-              : undefined,
-          () => operation.dispose?.(),
         ]);
-        await failPoolRelayMetadata({
-          relayRequestId,
-          startedAt,
-          failure: "request_too_large",
+        await releaseCapacityAttempt();
+        if (larger.length > 0 && !contextOverflowRetried) {
+          contextOverflowRetried = true;
+          selectedRouteCandidates = larger;
+          candidateIndex = -1;
+          continue;
+        }
+        globalLease?.release();
+        return respondLocalContextCeiling({
+          estimatedInputTokens: operation.contextCount.tokens,
+          estimateMethod: operation.contextCount.method,
+          contextMarginTokens: contextMarginForMember(member),
+          effectiveContextCeilingTokens: thisCeiling,
         });
-        return contextExceededResponse(
-          operation,
-          "Request context exceeds the configured execution capacity ceiling.",
-          {
-            estimatedInputTokens: operation.contextCount.tokens,
-            estimateMethod: operation.contextCount.method,
-            contextMarginTokens: contextMarginForMember(member),
-            effectiveContextCeilingTokens:
-              effectiveContextCeilingTokens(
-                member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
-                configuredContextCeilingForMember(member),
-              ) ?? 1,
-          },
-        );
       }
       const operationRetryable = shouldRetryRelayOperation(operation, "precommit_transport");
       const memberRetryable =
@@ -7964,6 +8044,7 @@ async function relaySelectedModelNoFailover({
         engineCountContext: selected.ExecutionTarget?.InferenceCapacity?.engineCountContext,
         physicalMaxContext: selected.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
         effectiveContextCeiling: selected.ExecutionTarget?.directContextCeiling,
+        contextMargin: selected.ExecutionTarget?.directContextMargin,
         manager,
         cliDeviceId: selected.Endpoint.cliDeviceId,
         relayRequestId,

@@ -999,7 +999,7 @@ export const poolMemberProcedures = {
       const userId = context.session.user.id;
       // Read-only checks first; the transaction repeats them under its fence.
       await assertPoolMemberRemovable(prisma, input.id, userId);
-      return runCapacityDeleteTransaction(async (tx) => {
+      const result = await runCapacityDeleteTransaction(async (tx) => {
         // A plain delete under the owner fence (fenceParentDelete), which
         // also keeps the member set this decision is made against stable;
         // then the pool row, matching addPoolMember. Waiters and leases keep
@@ -1015,8 +1015,10 @@ export const poolMemberProcedures = {
         await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${candidate.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         await assertPoolMemberRemovable(tx, input.id, userId);
         await tx.poolMember.delete({ where: { id: input.id } });
-        return { deleted: true };
+        return { deleted: true as const, poolId: candidate.poolId };
       });
+      await context.services?.onPoolRoutingRulesChanged?.(result.poolId);
+      return { deleted: true };
     }),
 
   updateDiscoveredModelCapabilities: protectedProcedure

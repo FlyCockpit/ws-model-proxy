@@ -2956,6 +2956,26 @@ describe("forwarderManagementRouter pools", () => {
       });
       expect(db.poolMember.delete).toHaveBeenCalledTimes(1);
     });
+
+    it("asks the relay to re-evaluate routing rules after a member is deleted", async () => {
+      db.poolMember.findUnique.mockResolvedValue({
+        id: "member-a",
+        poolId: "pool-id",
+        tier: "PRIMARY",
+        ModelPool: {
+          userId: "user-id",
+          recommendedSurfaceOverride: null,
+          protocolAdaptationEnabled: false,
+        },
+      });
+      db.poolMember.findMany.mockResolvedValue([]);
+      const onPoolRoutingRulesChanged = vi.fn(async () => undefined);
+      const rpc = createRouterClient(forwarderManagementRouter, {
+        context: { ...buildContext(), services: { onPoolRoutingRulesChanged } },
+      });
+      await expect(rpc.removePoolMember({ id: "member-a" })).resolves.toEqual({ deleted: true });
+      expect(onPoolRoutingRulesChanged).toHaveBeenCalledWith("pool-id");
+    });
   });
 
   describe("capability-edit impact advisory (non-blocking)", () => {

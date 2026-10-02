@@ -204,7 +204,7 @@ function canonicalPayloadHash(value: unknown): string {
     .digest("hex");
 }
 
-function reservationIdentityWhere(
+export function reservationIdentityWhere(
   policy: { id: string; scopeType: string },
   rule: { id: string; metric: BudgetMetric; period: BudgetPeriod; currency: string | null },
   grantPolicyIds: readonly string[],
@@ -213,11 +213,34 @@ function reservationIdentityWhere(
     return {
       policyId: { in: [...grantPolicyIds] },
       metric: rule.metric,
-      period: rule.period,
       ...(rule.currency ? { currency: rule.currency } : {}),
     };
   }
   return { policyId: policy.id, ruleId: rule.id };
+}
+
+export function reservationWindowWhere(
+  policy: { scopeType: string },
+  rule: { metric: BudgetMetric; period: BudgetPeriod },
+  window: { windowStart: Date | null; windowEnd: Date | null },
+  attemptId: string,
+): Prisma.ProviderBudgetReservationWhereInput {
+  if (rule.metric === "CONCURRENCY") return {};
+  if (rule.period === "PER_ATTEMPT") return { attemptId };
+  if (policy.scopeType === "POOL_GRANT") {
+    if (rule.period === "LIFETIME") {
+      return window.windowStart ? { createdAt: { gte: window.windowStart } } : {};
+    }
+    if (!window.windowStart) return {};
+    return {
+      createdAt: {
+        gte: window.windowStart,
+        ...(window.windowEnd ? { lt: window.windowEnd } : {}),
+      },
+    };
+  }
+  if (rule.period === "LIFETIME") return { windowStart: window.windowStart, windowEnd: null };
+  return { windowStart: window.windowStart, windowEnd: window.windowEnd };
 }
 
 export function grantCapDenial(
@@ -634,14 +657,7 @@ export async function admitProviderBudget(
         }
         const window = budgetWindow(rule.period, policy.activatedAt, now);
         const identity = reservationIdentityWhere(policy, rule, grantPolicyIds);
-        const windowWhere =
-          rule.metric === "CONCURRENCY"
-            ? {}
-            : rule.period === "PER_ATTEMPT"
-              ? { attemptId: attempt.attemptId }
-              : rule.period === "LIFETIME"
-                ? { windowStart: window.windowStart, windowEnd: null }
-                : { windowStart: window.windowStart, windowEnd: window.windowEnd };
+        const windowWhere = reservationWindowWhere(policy, rule, window, attempt.attemptId);
         const aggregate = await tx.providerBudgetReservation.aggregate({
           where: {
             ...identity,

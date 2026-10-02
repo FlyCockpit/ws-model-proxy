@@ -13540,6 +13540,194 @@ describe("model API routes", () => {
     );
   });
 
+  it("re-counts Responses on a strictly larger local member after an exact over-ceiling", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "small-count",
+        discoveredModelId: "small-model",
+        upstreamModelId: "small-upstream",
+        cliDeviceId: "cli-small",
+        physicalMaxContext: 45,
+        countStrategy: "ENGINE_REPORTED",
+        weight: 10,
+      }),
+      poolMemberRow({
+        id: "large-count",
+        discoveredModelId: "large-model",
+        upstreamModelId: "large-upstream",
+        cliDeviceId: "cli-large",
+        physicalMaxContext: 10_000,
+        countStrategy: "ENGINE_REPORTED",
+        weight: 1,
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-small", "cli-large"];
+    const capacityRuntime = admittingCapacityRuntime();
+    const responsePromise = appWith(manager, capacityRuntime).request("/responses", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({ model: poolTarget.modelId, input: "hello" }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const firstCount = requireSent(manager, 0);
+    expect(firstCount.path).toBe("/v1/responses/count_tokens");
+    expect(firstCount.cliDeviceId).toBe("cli-small");
+    manager.headers(firstCount.requestId, 200, { "content-type": "application/json" });
+    manager.body(firstCount.requestId, JSON.stringify({ input_tokens: 50 }));
+    manager.complete(firstCount.requestId);
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+    const secondCount = requireSent(manager, 1);
+    expect(secondCount.path).toBe("/v1/responses/count_tokens");
+    expect(secondCount.cliDeviceId).toBe("cli-large");
+    manager.headers(secondCount.requestId, 200, { "content-type": "application/json" });
+    manager.body(secondCount.requestId, JSON.stringify({ input_tokens: 50 }));
+    manager.complete(secondCount.requestId);
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(3));
+    const inference = requireSent(manager, 2);
+    expect(inference.path).toBe("/v1/responses");
+    expect(inference.cliDeviceId).toBe("cli-large");
+    manager.headers(inference.requestId, 200, { "content-type": "application/json" });
+    const response = await responsePromise;
+    manager.body(inference.requestId, JSON.stringify({ id: "resp", object: "response" }));
+    manager.complete(inference.requestId);
+    expect(response.status).toBe(200);
+    expect(capacityRuntime.acquire).toHaveBeenCalledTimes(2);
+    expect(capacityRuntime.acquire).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        candidates: expect.arrayContaining([
+          expect.objectContaining({ poolMemberId: "small-count" }),
+        ]),
+      }),
+      expect.anything(),
+    );
+    expect(capacityRuntime.acquire).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        candidates: [expect.objectContaining({ poolMemberId: "large-count" })],
+      }),
+      expect.anything(),
+    );
+    await response.text();
+  });
+
+  it("re-counts Chat Completions on a strictly larger local member after count-first overflow", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "small-chat",
+        discoveredModelId: "small-chat-model",
+        upstreamModelId: "small-chat-upstream",
+        cliDeviceId: "cli-small",
+        physicalMaxContext: 40,
+        countStrategy: "ENGINE_REPORTED",
+        weight: 10,
+      }),
+      poolMemberRow({
+        id: "large-chat",
+        discoveredModelId: "large-chat-model",
+        upstreamModelId: "large-chat-upstream",
+        cliDeviceId: "cli-large",
+        physicalMaxContext: 10_000,
+        countStrategy: "ENGINE_REPORTED",
+        weight: 1,
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-small", "cli-large"];
+    manager.supportsCountContextFlag = true;
+    const capacityRuntime = admittingCapacityRuntime();
+    const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(poolTarget.modelId),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const first = requireSent(manager, 0);
+    expect(first.cliDeviceId).toBe("cli-small");
+    expect(first.countFirst).toBe(true);
+    expect(first.countCeiling).toBe(40);
+    manager.completeCountOnRelay(first.requestId, 50);
+    manager.error(first.requestId, "request_too_large");
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+    const second = requireSent(manager, 1);
+    expect(second.cliDeviceId).toBe("cli-large");
+    expect(second.path).toBe("/v1/chat/completions");
+    await completeJsonRelay({ manager, requestId: second.requestId });
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+    expect(capacityRuntime.acquire).toHaveBeenCalledTimes(2);
+    await response.text();
+  });
+
+  it("sends consented :external after exact local over-ceiling when no larger member remains", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [externalPoolTarget],
+    });
+    externalConsent.poolIds = [externalPoolTarget.id];
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "tiny-local",
+        discoveredModelId: "tiny-model",
+        upstreamModelId: "tiny-upstream",
+        cliDeviceId: "cli-local",
+        physicalMaxContext: 40,
+        countStrategy: "ENGINE_REPORTED",
+      }),
+    ]);
+    const provider = externalProviderTarget("overflow-member");
+    publicOverflow.list.mockResolvedValue(listedExternalTargets([provider]));
+    publicOverflow.dispatch.mockResolvedValue(externalDispatchResult(provider));
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-local"];
+    manager.supportsCountContextFlag = true;
+
+    const plainPromise = appWith(manager, admittingCapacityRuntime()).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: requestBody(externalPoolTarget.modelId),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    manager.completeCountOnRelay(requireSent(manager).requestId, 50);
+    manager.error(requireSent(manager).requestId, "request_too_large");
+    const plain = await plainPromise;
+    expect(plain.status).toBe(400);
+    await expect(plain.json()).resolves.toMatchObject({
+      error: { code: "context_length_exceeded" },
+    });
+    expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+
+    const externalManager = new FakeRelayManager();
+    externalManager.activeCliDeviceIds = ["cli-local"];
+    externalManager.supportsCountContextFlag = true;
+    const externalPromise = appWith(externalManager, admittingCapacityRuntime()).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      },
+    );
+    await vi.waitFor(() => expect(externalManager.sent).toHaveLength(1));
+    externalManager.completeCountOnRelay(requireSent(externalManager).requestId, 50);
+    externalManager.error(requireSent(externalManager).requestId, "request_too_large");
+    const external = await externalPromise;
+    expect(external.status).toBe(200);
+    expect(external.headers.get("x-wsmp-fallback-reason")).toBe("local_context_ceiling");
+    expect(publicOverflow.dispatch.mock.calls[0]?.[0]).toMatchObject({
+      reason: "LOCAL_CONTEXT_CEILING",
+    });
+  });
+
   it("replays a spooled transcription across compatible pool members and accounts both attempts", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
