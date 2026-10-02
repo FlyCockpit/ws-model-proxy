@@ -68,9 +68,10 @@ export type AffinityDecision = {
   matchedPrefixDepth: number;
   /**
    * Estimated size, in tokens, of the matched warm prefix per target: the
-   * `estimatedTokens` of the deepest matching prefix record (the conversation
-   * record's when the hit is conversation-only). Absent = unknown. Counts
-   * only; used to size the cache-holder wait (saturation S-A).
+   * reported engine tokens when known, else `estimatedTokens`, of the deepest
+   * matching prefix record (the conversation record's when the hit is
+   * conversation-only). Absent = unknown. Counts only; used to size the
+   * cache-holder wait (saturation S-A).
    */
   prefixTokens?: Record<string, number>;
   /**
@@ -91,6 +92,7 @@ export type AffinitySessionBinding = {
   tipDepth: number;
   canonicalBytes: number;
   estimatedTokens?: number;
+  reportedTokens?: number;
 };
 
 export function scopedAffinitySessionId(
@@ -735,10 +737,11 @@ export function affinityPrefixEvidenceSql(
   now: Date,
 ): Prisma.Sql {
   return Prisma.sql`
-    SELECT n."estimatedTokens", r."lastUsedAt", r."engineCacheConfirmed"
+    SELECT COALESCE(n."reportedTokens", n."estimatedTokens") AS tokens,
+           r."lastUsedAt", r."engineCacheConfirmed"
       FROM jsonb_to_recordset(${JSON.stringify(material.nodes)}::jsonb) AS p(digest text, depth int)
       JOIN LATERAL (
-        SELECT n."isTip", n."expiresAt", n."estimatedTokens" FROM cache_affinity_node n
+        SELECT n."isTip", n."expiresAt", n."estimatedTokens", n."reportedTokens" FROM cache_affinity_node n
          WHERE n."userId" = ${scope.userId}
            AND n."tenantUserId" = ${scope.tenantUserId}
            AND n."poolId" = ${scope.poolId}
@@ -748,7 +751,7 @@ export function affinityPrefixEvidenceSql(
            AND n."sessionId" = ${sessionId}
         OFFSET 0
       ) n ON n."isTip" AND n."expiresAt" > ${now}::timestamp
-             AND n."estimatedTokens" IS NOT NULL
+             AND COALESCE(n."reportedTokens", n."estimatedTokens") IS NOT NULL
       JOIN LATERAL (
         SELECT r."lastUsedAt", r."engineCacheConfirmed",
                r."sessionId", r."digestVersion", r."expiresAt"
@@ -897,6 +900,7 @@ export async function rankAffinityTargets({
         digestVersion: true,
         engineCacheConfirmed: true,
         estimatedTokens: true,
+        reportedTokens: true,
       },
     }),
     db.capacityLease.groupBy({
@@ -984,7 +988,8 @@ export async function rankAffinityTargets({
                 : record.conversationDigest === material.conversationDigest,
             )
           : undefined);
-      const prefixTokens = matchedRecord?.estimatedTokens ?? undefined;
+      const prefixTokens =
+        matchedRecord?.reportedTokens ?? matchedRecord?.estimatedTokens ?? undefined;
       const scope = {
         userId: resourceOwnerId,
         tenantUserId: ownerId,
@@ -1003,11 +1008,11 @@ export async function rankAffinityTargets({
       ) {
         try {
           const [row] = await db.$queryRaw<
-            { estimatedTokens: number; lastUsedAt: Date; engineCacheConfirmed: boolean }[]
+            { tokens: number; lastUsedAt: Date; engineCacheConfirmed: boolean }[]
           >(affinityPrefixEvidenceSql(scope, target.targetIdentity, material, sessionId, now));
           if (row)
             prefixEvidence = {
-              tokens: row.estimatedTokens,
+              tokens: row.tokens,
               lastUsedAt: row.lastUsedAt.getTime(),
               confirmed: row.engineCacheConfirmed,
             };
@@ -1115,6 +1120,11 @@ export function isAffinityTargetWarm(
   );
 }
 
+function clampAffinityTokens(value: number | undefined): number | null {
+  if (value === undefined) return null;
+  return Math.max(0, Math.min(2_147_483_647, Math.trunc(value)));
+}
+
 export async function rememberAffinity({
   ownerId,
   resourceOwnerId,
@@ -1127,6 +1137,7 @@ export async function rememberAffinity({
   target,
   estimatedTokens,
   estimatedDeltaTokens,
+  reportedTokens,
   engineCacheConfirmed,
   sessionBinding,
   headers,
@@ -1144,6 +1155,8 @@ export async function rememberAffinity({
   estimatedTokens?: number;
   /** Bound Responses delta estimate computed before dispatch, never at EOF. */
   estimatedDeltaTokens?: number;
+  /** Engine-reported prompt + completion for the served turn, when known. */
+  reportedTokens?: number;
   /**
    * Latest engine cache evidence from the served response. `true` (cached
    * prompt tokens reported) and `false` (cache fields reported with zero)
@@ -1182,7 +1195,14 @@ export async function rememberAffinity({
       sessionBinding.estimatedTokens + (estimatedDeltaTokens ?? 0),
     );
   }
+  if (material.boundSessionId && sessionBinding?.reportedTokens !== undefined) {
+    reportedTokens = Math.min(
+      2_147_483_647,
+      sessionBinding.reportedTokens + (estimatedDeltaTokens ?? 0),
+    );
+  }
   const expiresAt = new Date(now.getTime() + policy.ttlSeconds * 1000);
+  const storedReportedTokens = clampAffinityTokens(reportedTokens);
   // Every record this call writes (created or refreshed) carries the same
   // `lastUsedAt` and `sessionId`: warm-session protection (S-C,
   // ./warm-protection.ts) groups records into one session by the id, dates it
@@ -1280,10 +1300,8 @@ export async function rememberAffinity({
     }
     const tip = material.nodes.at(-1);
     if (tip) {
-      const tipEstimatedTokens =
-        estimatedTokens === undefined
-          ? null
-          : Math.max(0, Math.min(2_147_483_647, Math.trunc(estimatedTokens)));
+      const tipEstimatedTokens = clampAffinityTokens(estimatedTokens);
+      const tipReportedTokens = storedReportedTokens;
       const oldDigests = new Set(existingNodes.map((node) => node.nodeDigest));
       const inserts = retained.filter(
         (node) => !oldDigests.has(node.digest) || node.digest === tip.digest,
@@ -1295,19 +1313,23 @@ export async function rememberAffinity({
         await tx.$executeRaw(Prisma.sql`
         INSERT INTO cache_affinity_node
           (id, "userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest",
-           "nodeDigest", depth, "sessionId", "isTip", "estimatedTokens", "expiresAt") VALUES
+           "nodeDigest", depth, "sessionId", "isTip", "estimatedTokens", "reportedTokens", "expiresAt") VALUES
           ${Prisma.join(
             inserts.map(
               (node) => Prisma.sql`(${randomUUID()}, ${resourceOwnerId},
             ${ownerId}, ${poolId}, ${target.executionTargetId}, ${material.rootDigest},
             ${node.digest}, ${node.depth}, ${sessionId}, ${node.digest === tip.digest},
-            ${node.digest === tip.digest ? tipEstimatedTokens : null}, ${expiresAt})`,
+            ${node.digest === tip.digest ? tipEstimatedTokens : null},
+            ${node.digest === tip.digest ? tipReportedTokens : null}, ${expiresAt})`,
             ),
           )}
         ON CONFLICT ("userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest", "nodeDigest", "sessionId")
         DO UPDATE SET "isTip" = EXCLUDED."isTip", "expiresAt" = EXCLUDED."expiresAt",
           "estimatedTokens" = CASE WHEN EXCLUDED."isTip" THEN EXCLUDED."estimatedTokens"
-            ELSE cache_affinity_node."estimatedTokens" END`);
+            ELSE cache_affinity_node."estimatedTokens" END,
+          "reportedTokens" = CASE WHEN EXCLUDED."isTip"
+            THEN COALESCE(EXCLUDED."reportedTokens", cache_affinity_node."reportedTokens")
+            ELSE cache_affinity_node."reportedTokens" END`);
     }
     // Read the discarded node digests under the same fence before pruning hints.
     // Instruction hints have no node row, so omitted instructions remain matchable.
@@ -1399,6 +1421,7 @@ export async function rememberAffinity({
           prefixDepth,
           digestVersion: DIGEST_VERSION,
           estimatedTokens,
+          reportedTokens: storedReportedTokens,
           engineCacheConfirmed: engineCacheConfirmed ?? false,
           lastUsedAt: now,
           expiresAt,
@@ -1408,6 +1431,7 @@ export async function rememberAffinity({
           expiresAt,
           sessionId,
           estimatedTokens,
+          ...(storedReportedTokens === null ? {} : { reportedTokens: storedReportedTokens }),
           ...(engineCacheConfirmed === undefined ? {} : { engineCacheConfirmed }),
         },
       });
@@ -1432,15 +1456,16 @@ export async function rememberAffinity({
         INSERT INTO cache_affinity_record
           (id, "userId", "tenantUserId", "poolId", "executionTargetId", "targetIdentity",
            "bindingDigest", "prefixDigest", "conversationDigest", "sessionId", "prefixDepth",
-           "digestVersion", "estimatedTokens", "engineCacheConfirmed", "lastUsedAt", "expiresAt")
+           "digestVersion", "estimatedTokens", "reportedTokens", "engineCacheConfirmed", "lastUsedAt", "expiresAt")
         SELECT p.id, ${resourceOwnerId}, ${ownerId}, ${poolId}, ${target.executionTargetId},
           ${target.targetIdentity}, ${material.bindingDigest}, p.digest, NULL, ${sessionId}, p.depth,
-          ${DIGEST_VERSION}, ${estimatedTokens ?? null}, ${engineCacheConfirmed ?? false}, ${now}, ${expiresAt}
+          ${DIGEST_VERSION}, ${estimatedTokens ?? null}, ${storedReportedTokens}, ${engineCacheConfirmed ?? false}, ${now}, ${expiresAt}
         FROM jsonb_to_recordset(${JSON.stringify(prefixes.map((node) => ({ id: randomUUID(), ...node })))}::jsonb)
           AS p(id text, digest text, depth int)
         ON CONFLICT ("tenantUserId", "poolId", "executionTargetId", "targetIdentity", "bindingDigest", "prefixDigest")
         DO UPDATE SET "sessionId" = EXCLUDED."sessionId", "lastUsedAt" = EXCLUDED."lastUsedAt",
           "expiresAt" = EXCLUDED."expiresAt", "estimatedTokens" = COALESCE(EXCLUDED."estimatedTokens", cache_affinity_record."estimatedTokens"),
+          "reportedTokens" = COALESCE(EXCLUDED."reportedTokens", cache_affinity_record."reportedTokens"),
           "engineCacheConfirmed" = COALESCE(${engineCacheConfirmed ?? null}::boolean, cache_affinity_record."engineCacheConfirmed")`);
     }
     const upsertConversation = async (conversationDigest: string) => {
@@ -1449,15 +1474,16 @@ export async function rememberAffinity({
       await tx.$executeRaw`INSERT INTO cache_affinity_record
         (id, "userId", "tenantUserId", "poolId", "executionTargetId", "targetIdentity",
          "bindingDigest", "prefixDigest", "conversationDigest", "sessionId", "prefixDepth",
-         "digestVersion", "estimatedTokens", "engineCacheConfirmed", "lastUsedAt", "expiresAt")
+         "digestVersion", "estimatedTokens", "reportedTokens", "engineCacheConfirmed", "lastUsedAt", "expiresAt")
         VALUES (${randomUUID()}, ${resourceOwnerId}, ${ownerId}, ${poolId},
           ${target.executionTargetId}, ${target.targetIdentity}, ${material.bindingDigest},
           NULL, ${conversationDigest}, ${sessionId}, 0, ${DIGEST_VERSION},
-          ${estimatedTokens ?? null}, ${engineCacheConfirmed ?? false}, ${now}, ${expiresAt})
+          ${estimatedTokens ?? null}, ${storedReportedTokens}, ${engineCacheConfirmed ?? false}, ${now}, ${expiresAt})
         ON CONFLICT ("tenantUserId", "poolId", "executionTargetId", "targetIdentity", "bindingDigest", "conversationDigest")
         WHERE "conversationDigest" IS NOT NULL AND "prefixDigest" IS NULL
         DO UPDATE SET "lastUsedAt" = EXCLUDED."lastUsedAt", "expiresAt" = EXCLUDED."expiresAt",
           "sessionId" = EXCLUDED."sessionId", "estimatedTokens" = COALESCE(EXCLUDED."estimatedTokens", cache_affinity_record."estimatedTokens"),
+          "reportedTokens" = COALESCE(EXCLUDED."reportedTokens", cache_affinity_record."reportedTokens"),
           "engineCacheConfirmed" = COALESCE(${engineCacheConfirmed ?? null}::boolean, cache_affinity_record."engineCacheConfirmed")`;
     };
     // Independent footprint prevents shared routing hints from erasing a sibling.
@@ -1522,6 +1548,7 @@ export async function rememberAffinity({
       tipDepth: tip?.depth ?? 0,
       canonicalBytes: material.canonicalBytes,
       estimatedTokens,
+      ...(storedReportedTokens === null ? {} : { reportedTokens: storedReportedTokens }),
     };
   }, AFFINITY_TRANSACTION_LIMITS);
 }

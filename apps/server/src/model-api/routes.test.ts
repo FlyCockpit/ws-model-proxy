@@ -475,7 +475,12 @@ function directRow({
   endpointCapabilityMetadata?: Record<string, unknown> | null;
   optimisticBasicTranscription?: boolean;
   physicalMaxContext?: number;
-  countStrategy?: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
+  countStrategy?:
+    | "TOKENIZER"
+    | "TEMPLATE_AWARE"
+    | "ENGINE_REPORTED"
+    | "CONSERVATIVE_ESTIMATE"
+    | "CALIBRATED_ESTIMATE";
   directContextCeiling?: number;
   directContextMargin?: number;
 } = {}) {
@@ -587,7 +592,12 @@ function poolMemberRow({
   capacityWaitBudgetMode?: "INHERIT" | "LIMITED" | "UNLIMITED";
   capacityWaitBudgetMs?: number | null;
   affinityEnabled?: boolean;
-  countStrategy?: "TOKENIZER" | "TEMPLATE_AWARE" | "ENGINE_REPORTED" | "CONSERVATIVE_ESTIMATE";
+  countStrategy?:
+    | "TOKENIZER"
+    | "TEMPLATE_AWARE"
+    | "ENGINE_REPORTED"
+    | "CONSERVATIVE_ESTIMATE"
+    | "CALIBRATED_ESTIMATE";
   externalAfterWaitMs?: number;
   cacheHolderWaitMs?: number | null;
   engineKind?: "GENERIC" | "LLAMA_CPP" | "VLLM" | "SGLANG" | "OLLAMA" | "LM_STUDIO" | null;
@@ -1144,6 +1154,138 @@ describe("model API routes", () => {
     // A plain pool name never inspects external (PUBLIC_OVERFLOW) members.
     expect(publicOverflow.list).not.toHaveBeenCalled();
     expect(publicOverflow.dispatch).not.toHaveBeenCalled();
+  });
+
+  it("admits a Chat Test image on a 32k pool member", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "vision-member",
+        discoveredModelId: "vision-model",
+        upstreamModelId: "vision-upstream",
+        cliDeviceId: "cli-vision",
+        physicalMaxContext: 32_768,
+        countStrategy: "CONSERVATIVE_ESTIMATE",
+      }),
+    ]);
+    const header = Buffer.alloc(24);
+    header.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+    header[11] = 13;
+    header.write("IHDR", 12);
+    header.writeUInt32BE(64, 16);
+    header.writeUInt32BE(64, 20);
+    const binary = Buffer.alloc(Math.ceil((400_000 * 3) / 4));
+    header.copy(binary);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-vision"];
+    const responsePromise = appWith(manager).request("/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "describe this" },
+              {
+                type: "image_url",
+                image_url: { url: `data:image/png;base64,${binary.toString("base64")}` },
+              },
+            ],
+          },
+        ],
+      }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+  });
+
+  it("retries an engine context overflow onto a larger pool member", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "member-small",
+        discoveredModelId: "model-small",
+        upstreamModelId: "upstream-small",
+        cliDeviceId: "cli-small",
+        physicalMaxContext: 32_768,
+        weight: 100,
+      }),
+      poolMemberRow({
+        id: "member-large",
+        discoveredModelId: "model-large",
+        upstreamModelId: "upstream-large",
+        cliDeviceId: "cli-large",
+        physicalMaxContext: 128_000,
+        weight: 1,
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-small", "cli-large"];
+    const responsePromise = appWith(manager, admittingCapacityRuntime()).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(poolTarget.modelId),
+      },
+    );
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const first = requireSent(manager, 0);
+    manager.headers(first.requestId, 400, { "content-type": "application/json" });
+    manager.body(
+      first.requestId,
+      JSON.stringify({
+        error: { message: "This model's maximum context length is 32768 tokens" },
+      }),
+    );
+    manager.complete(first.requestId);
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+    await completeJsonRelay({ manager, requestId: requireSent(manager, 1).requestId });
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+    expect(manager.sent.map((sent) => sent.endpointSlug)).toEqual([
+      expect.any(String),
+      expect.any(String),
+    ]);
+    expect(manager.sent).toHaveLength(2);
+  });
+
+  it("returns the 413 context_exceeded shape for a direct engine overflow", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [directTarget],
+      modelPools: [],
+    });
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-device-id"];
+    const responsePromise = appWith(manager, admittingCapacityRuntime()).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(directTarget.modelId),
+      },
+    );
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const sent = requireSent(manager);
+    manager.headers(sent.requestId, 400, { "content-type": "application/json" });
+    manager.body(
+      sent.requestId,
+      JSON.stringify({ error: { message: "This model's maximum context length is 8192 tokens" } }),
+    );
+    manager.complete(sent.requestId);
+    const response = await responsePromise;
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "context_exceeded" } });
   });
 
   describe("S-A: wait for the cache holder", () => {

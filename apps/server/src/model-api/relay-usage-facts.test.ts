@@ -17,6 +17,7 @@ const { ResponseUsageRecorder, USAGE_SAMPLE_TAIL_BYTES } = await import(
 );
 const {
   engineCacheConfirmedFromUsageFacts,
+  reportedAffinityTokens,
   usageFactsFromProviderUsage,
   usageFactsFromRelayTerminal,
   UNKNOWN_USAGE_FACTS,
@@ -47,6 +48,14 @@ describe("ResponseUsageRecorder", () => {
     // The truncated window starts at the first complete event.
     expect(tail).toBe("data: {}\n\n");
     expect(sample.totalBytes).toBe(38);
+  });
+});
+
+describe("reportedAffinityTokens", () => {
+  it("sums prompt and completion when either is known", () => {
+    expect(reportedAffinityTokens({ promptTokens: null, completionTokens: null })).toBeUndefined();
+    expect(reportedAffinityTokens({ promptTokens: 12_000, completionTokens: 800 })).toBe(12_800);
+    expect(reportedAffinityTokens({ promptTokens: 12_000, completionTokens: null })).toBe(12_000);
   });
 });
 

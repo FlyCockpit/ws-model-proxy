@@ -131,6 +131,9 @@ fn completion_text_from_json_value(value: &serde_json::Value) -> Option<String> 
     let choices = value.get("choices")?.as_array()?;
     let mut out = String::new();
     for choice in choices {
+        push_reasoning_text(&mut out, choice);
+        push_tool_call_arguments(&mut out, choice.pointer("/delta/tool_calls"));
+        push_tool_call_arguments(&mut out, choice.pointer("/message/tool_calls"));
         if let Some(content) = choice
             .pointer("/delta/content")
             .and_then(serde_json::Value::as_str)
@@ -150,6 +153,34 @@ fn completion_text_from_json_value(value: &serde_json::Value) -> Option<String> 
         }
     }
     (!out.is_empty()).then_some(out)
+}
+
+fn push_reasoning_text(out: &mut String, choice: &serde_json::Value) {
+    for pointer in [
+        "/delta/reasoning_content",
+        "/delta/reasoning",
+        "/message/reasoning_content",
+        "/message/reasoning",
+    ] {
+        if let Some(text) = choice.pointer(pointer).and_then(serde_json::Value::as_str) {
+            out.push_str(text);
+            return;
+        }
+    }
+}
+
+fn push_tool_call_arguments(out: &mut String, tool_calls: Option<&serde_json::Value>) {
+    let Some(tool_calls) = tool_calls.and_then(serde_json::Value::as_array) else {
+        return;
+    };
+    for call in tool_calls {
+        if let Some(arguments) = call
+            .pointer("/function/arguments")
+            .and_then(serde_json::Value::as_str)
+        {
+            out.push_str(arguments);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -190,5 +221,43 @@ mod tests {
         );
         collector.feed(response.as_bytes());
         assert_eq!(collector.finish(), None);
+    }
+
+    #[test]
+    fn counts_reasoning_only_sse_deltas() {
+        let mut collector = CompletionTextCollector::default();
+        collector.feed(br#"data: {"choices":[{"delta":{"reasoning_content":"plan then "}}]}"#);
+        collector.feed(b"\n\n");
+        collector.feed(br#"data: {"choices":[{"delta":{"reasoning":"answer"}}]}"#);
+        collector.feed(b"\n\n");
+        assert_eq!(collector.finish().as_deref(), Some("plan then answer"));
+    }
+
+    #[test]
+    fn counts_mixed_reasoning_and_content() {
+        let mut collector = CompletionTextCollector::default();
+        collector.feed(
+            br#"data: {"choices":[{"delta":{"reasoning_content":"think ","content":"hi "}}]}"#,
+        );
+        collector.feed(b"\n\n");
+        collector.feed(
+            br#"data: {"choices":[{"message":{"reasoning_content":"more ","content":"there"}}]}"#,
+        );
+        collector.feed(b"\n\n");
+        assert_eq!(collector.finish().as_deref(), Some("think hi more there"));
+    }
+
+    #[test]
+    fn counts_tool_call_argument_deltas() {
+        let mut collector = CompletionTextCollector::default();
+        collector.feed(
+            br#"data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"{\"q\":"}}]}}]}"#,
+        );
+        collector.feed(b"\n\n");
+        collector.feed(
+            br#"data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"\"hi\"}"}}]}}]}"#,
+        );
+        collector.feed(b"\n\n");
+        assert_eq!(collector.finish().as_deref(), Some("{\"q\":\"hi\"}"));
     }
 }

@@ -147,4 +147,59 @@ describe("Chat Test relay wire helpers", () => {
     expect(onRoute).toHaveBeenCalledWith(expect.objectContaining({ externalUnavailable: true }));
     vi.unstubAllGlobals();
   });
+
+  it("computes tok/s from thinking time and shared thinking-inclusive tokens", async () => {
+    let now = 1_000;
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    const encoder = new TextEncoder();
+    const chunks = [
+      'data: {"choices":[{"delta":{"reasoning_content":"plan"}}]}\n\n',
+      'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+      'data: {"wsmp_metrics":{"completion_tokens":12,"tokenizer":"cl100k_base"}}\n\n',
+    ];
+    let index = 0;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (index === 0) now = 1_250;
+        if (index >= chunks.length) {
+          now = 2_250;
+          controller.close();
+          return;
+        }
+        controller.enqueue(encoder.encode(chunks[index]));
+        index += 1;
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(body, { status: 200, headers: { "content-type": "text/event-stream" } }),
+        ),
+    );
+    const onThinkingDelta = vi.fn();
+    const onDelta = vi.fn();
+    const metrics = await streamChatCompletion({
+      model: "demo",
+      messages: [{ role: "user", content: "hello" }],
+      routingMode: "PREFER_NATIVE",
+      surface: "OPENAI_CHAT_COMPLETIONS",
+      reasoning: {},
+      anthropicMaxTokens: 1024,
+      signal: new AbortController().signal,
+      fallbackErrorMessage: "failed",
+      onDelta,
+      onThinkingDelta,
+    });
+    expect(onThinkingDelta).toHaveBeenCalledWith("plan");
+    expect(onDelta).toHaveBeenCalledWith("ok");
+    expect(metrics).toEqual({
+      ttftMs: 250,
+      completionTokens: 12,
+      tokensPerSecond: 12,
+    });
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
 });

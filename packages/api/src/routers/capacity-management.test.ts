@@ -189,8 +189,14 @@ describe("capacityManagementRouter", () => {
       runtimeModel: "model",
       hardConcurrencyLimit: 2,
       physicalMaxContext: 4096,
+      imageTokenAllowance: 2048,
       countStrategy: "CONSERVATIVE_ESTIMATE",
     });
+    expect(db.inferenceCapacity.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ imageTokenAllowance: 2048 }),
+      }),
+    );
     expect(db.$transaction).toHaveBeenCalledTimes(1);
     expect(db.capacityAuditEvent.create).toHaveBeenCalledWith({
       data: expect.objectContaining({

@@ -66,9 +66,15 @@ import {
   spillDelayMs,
 } from "./cache-holder-wait.js";
 import {
+  calibratedContextTokens,
+  calibratedFootprintTokens,
+  observeContextCalibration,
+} from "./capacity/calibration.js";
+import {
   type ContextCountTelemetry,
   contextFitsLimits,
   countSerializedRequestContext,
+  withCalibratedContextCount,
 } from "./capacity/context.js";
 import { contextCounterRegistry } from "./capacity/counter-registry.js";
 import {
@@ -76,6 +82,7 @@ import {
   precommitLeaseLost,
   servedLocalTerminal,
 } from "./capacity/lease-loss.js";
+import { estimatePayloadTokens } from "./capacity/payload-estimate.js";
 import { PostgresCapacityAdmissionStore } from "./capacity/postgres-store.js";
 import { capacityRequestScopeMiddleware } from "./capacity/request-scope.js";
 import { releaseCapacityLeaseWithRetry } from "./capacity/response-lease.js";
@@ -210,11 +217,12 @@ import {
   type PublicOverflowRequest,
   type PublicOverflowSkipReason,
   type PublicProviderTarget,
+  payloadAwareInputTokens,
   publicTargetCompatibility,
   resolvePublicProviderExecution,
 } from "./public-overflow.js";
 import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
-import { shouldRetryRelayOperation } from "./relay-retry-policy.js";
+import { isEngineContextOverflow, shouldRetryRelayOperation } from "./relay-retry-policy.js";
 import {
   LOCAL_RELAY_ATTEMPT_TTL_MS,
   LOCAL_RELAY_PROCESS_EPOCH,
@@ -224,6 +232,7 @@ import {
 import {
   engineCacheConfirmedFromUsageFacts,
   type RelayUsageFacts,
+  reportedAffinityTokens,
   usageFactsFromProviderUsage,
   usageFactsFromRelayTerminal,
 } from "./relay-usage-facts.js";
@@ -401,6 +410,85 @@ function effectiveContextCeilingTokens(
   return ceilings.length === 0 ? null : Math.min(...ceilings);
 }
 
+function decodeUtf8Bytes(bytes: Uint8Array | null | undefined): string {
+  if (!bytes || bytes.byteLength === 0) return "";
+  return new TextDecoder().decode(bytes);
+}
+
+function bytesToReadableStream(bytes: Uint8Array): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      if (bytes.byteLength > 0) controller.enqueue(bytes);
+      controller.close();
+    },
+  });
+}
+
+async function readStreamBytes(body: ReadableStream<Uint8Array> | null): Promise<Uint8Array> {
+  if (!body) return new Uint8Array();
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  while (true) {
+    const result = await reader.read();
+    if (result.done) break;
+    if (result.value) chunks.push(result.value);
+  }
+  const total = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+type CalibrationCapacity = {
+  id: string;
+  runtimeIdentityKey?: string | null;
+  runtimeModel?: string | null;
+  runtimeRevision?: string | null;
+  imageTokenAllowance?: number | null;
+};
+
+function recordCalibrationFromUsage(
+  capacity: CalibrationCapacity | null | undefined,
+  payload: unknown,
+  usageFacts: RelayUsageFacts,
+): void {
+  if (!capacity || usageFacts.promptTokens === null) return;
+  try {
+    const estimate = estimatePayloadTokens(payload, {
+      imageTokenAllowance: capacity.imageTokenAllowance,
+    });
+    observeContextCalibration({
+      capacityId: capacity.id,
+      identity: capacity,
+      textEstimate: estimate.textTokens,
+      promptTokens: usageFacts.promptTokens,
+      mediaParts: estimate.mediaParts,
+    });
+  } catch {
+    /* Payload estimate failures must not fail the served request. */
+  }
+}
+
+function estimatedAffinityTokens(
+  capacity: CalibrationCapacity | null | undefined,
+  payload: unknown,
+  fallback?: number,
+): number | undefined {
+  if (!capacity) return fallback;
+  try {
+    const estimate = estimatePayloadTokens(payload, {
+      imageTokenAllowance: capacity.imageTokenAllowance,
+    });
+    return calibratedFootprintTokens(capacity.id, capacity, estimate.tokens) ?? estimate.tokens;
+  } catch {
+    return fallback;
+  }
+}
+
 function responseBodyForOperation({
   body,
   headers,
@@ -533,12 +621,23 @@ async function nativeContextCount({
       countStrategy === "TOKENIZER" ||
       countStrategy === "TEMPLATE_AWARE" ||
       countStrategy === "ENGINE_REPORTED";
-    return countSerializedRequestContext({
+    const raw = await countSerializedRequestContext({
       input: operation.contextInput,
       counters: useRegistry && registeredCounter ? [registeredCounter] : [],
       useTokenEstimate: true,
+      imageTokenAllowance: capacity?.imageTokenAllowance,
       signal: request.signal,
     });
+    if (raw.exact || raw.method === "TOKENIZER_TEMPLATE") return raw;
+    if (
+      !capacity ||
+      (countStrategy !== "CALIBRATED_ESTIMATE" &&
+        countStrategy !== "TOKENIZER" &&
+        countStrategy !== "TEMPLATE_AWARE")
+    )
+      return raw;
+    const calibrated = calibratedContextTokens(capacity.id, capacity, raw.tokens);
+    return calibrated === null ? raw : withCalibratedContextCount(raw, calibrated);
   };
   if (
     operation.capability === "responses.countTokens" ||
@@ -716,6 +815,7 @@ const inferenceCapacityRelaySelect = {
   id: true,
   hardConcurrencyLimit: true,
   physicalMaxContext: true,
+  imageTokenAllowance: true,
   countStrategy: true,
   runtimeIdentityKey: true,
   runtimeModel: true,
@@ -4093,6 +4193,45 @@ async function relayDirect({
 
   try {
     const started = await attempt.started;
+    let startedBody = started.body;
+    if (started.status >= 400 && started.status < 500) {
+      const errorBytes = await readStreamBytes(startedBody);
+      if (isEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes))) {
+        attempt.cancel("request_too_large");
+        cliLease.release();
+        globalLease.release();
+        if (capacityLease?.state === "ADMITTED")
+          await capacityRuntime?.release(capacityLease.lease);
+        if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+        await operation.dispose?.();
+        await failRelayMetadata({
+          relayRequestId,
+          startedAt,
+          failure: "request_too_large",
+          selectedDiscoveredModelId: selected.id,
+          attemptCount: 1,
+          localExecution,
+          userId: requester.userId,
+          localTerminal: rejectedRelayTerminal(),
+        });
+        const identity = selected.ExecutionTarget;
+        return contextExceededResponse(
+          operation,
+          "Engine rejected the request as exceeding context length.",
+          {
+            estimatedInputTokens: operation.contextCount?.tokens ?? 0,
+            estimateMethod: operation.contextCount?.method ?? "TOKEN_ESTIMATE",
+            contextMarginTokens: identity?.directContextMargin ?? 0,
+            effectiveContextCeilingTokens:
+              effectiveContextCeilingTokens(
+                identity?.InferenceCapacity?.physicalMaxContext,
+                identity?.directContextCeiling,
+              ) ?? 1,
+          },
+        );
+      }
+      startedBody = bytesToReadableStream(errorBytes);
+    }
     const stickiness = operation.responseStickiness;
     // The client sees EOF only once this response's binding is durable.
     const persistBinding = localStickinessPersister({
@@ -4110,7 +4249,7 @@ async function relayDirect({
         : null,
     });
     const responseBody = responseBodyForOperation({
-      body: started.body,
+      body: startedBody,
       headers: started.headers,
       terminal: attempt.terminal,
       operation,
@@ -4371,7 +4510,8 @@ async function relayPool({
     const estimatedInputTokens =
       operation.contextCount?.tokens !== undefined
         ? BigInt(operation.contextCount.tokens)
-        : conservativeSerializedInputTokens(publicRequestBytes);
+        : (payloadAwareInputTokens(built.body) ??
+          conservativeSerializedInputTokens(publicRequestBytes));
     const canonical = operation.adaptation
       ? (() => {
           try {
@@ -6139,6 +6279,7 @@ async function relayPool({
     ]);
   };
 
+  let contextOverflowRetried = false;
   for (let candidateIndex = 0; candidateIndex < selectedRouteCandidates.length; candidateIndex++) {
     let candidate = selectedRouteCandidates[candidateIndex]!;
     if (capacityRuntime && capacityLease?.state !== "ADMITTED") {
@@ -6505,6 +6646,73 @@ async function relayPool({
         continue;
       }
 
+      let startedBody = started.body;
+      if (started.status >= 400 && started.status < 500) {
+        const errorBytes = await readStreamBytes(startedBody);
+        if (isEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes))) {
+          const thisCeiling = effectiveContextCeilingTokens(
+            member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+            configuredContextCeilingForMember(member),
+          );
+          const remainingLarger = selectedRouteCandidates
+            .slice(candidateIndex + 1)
+            .some((route) => {
+              const next = memberById.get(route.poolMemberId);
+              if (!next) return false;
+              const ceiling = effectiveContextCeilingTokens(
+                next.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+                configuredContextCeilingForMember(next),
+              );
+              return thisCeiling !== null && ceiling !== null && ceiling > thisCeiling;
+            });
+          const retryOverflow =
+            !contextOverflowRetried &&
+            remainingLarger &&
+            shouldRetryRelayOperation(operation, "precommit_context_exceeded");
+          attempt.cancel("request_too_large");
+          const overflowTerminal = await attempt.terminal;
+          await recordLocalTerminal(
+            relayRequestId,
+            requester.userId,
+            localExecution,
+            overflowTerminal,
+          ).catch(metadataUpdateError);
+          cumulativeRequestBytes += overflowTerminal.requestBytes;
+          cumulativeResponseBytes += overflowTerminal.responseBytes;
+          await settleRelayCleanup([
+            () => cliLease.release(),
+            () =>
+              builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose(),
+          ]);
+          finalFailure = "request_too_large";
+          await releaseUnusedTrial();
+          if (retryOverflow) {
+            contextOverflowRetried = true;
+            await releaseCapacityAttempt();
+            continue;
+          }
+          await releaseCapacityAttempt();
+          globalLease?.release();
+          await operation.dispose?.();
+          await failPoolRelayMetadata({
+            relayRequestId,
+            startedAt,
+            failure: "request_too_large",
+          });
+          return contextExceededResponse(
+            operation,
+            "Engine rejected the request as exceeding context length.",
+            {
+              estimatedInputTokens: operation.contextCount?.tokens ?? 0,
+              estimateMethod: operation.contextCount?.method ?? "TOKEN_ESTIMATE",
+              contextMarginTokens: contextMarginForMember(member),
+              effectiveContextCeilingTokens: thisCeiling ?? 1,
+            },
+          );
+        }
+        startedBody = bytesToReadableStream(errorBytes);
+      }
+
       if (adaptedSource && operation.adaptation && started.status >= 200 && started.status < 300) {
         const upstreamSse =
           started.headers.get("content-type")?.toLowerCase().startsWith("text/event-stream") ===
@@ -6546,7 +6754,7 @@ async function relayPool({
       if (canonicalNonSuccess || (adaptedSource && operation.adaptation && !operation.stream)) {
         try {
           validatedAdaptedNonstream = await readAdaptedNonstreamBody({
-            body: started.body,
+            body: startedBody,
             source: adaptedSource ?? requestedSurface ?? "openai-responses",
             target:
               operation.adaptation?.requestedSurface ?? requestedSurface ?? "openai-responses",
@@ -6589,7 +6797,7 @@ async function relayPool({
           let protocolFailureObserved = false;
           const primed = await primeReadableStream(
             adaptedResponseBody({
-              body: started.body,
+              body: startedBody,
               source: adaptedSource,
               target: operation.adaptation.requestedSurface,
               stream: true,
@@ -6668,7 +6876,7 @@ async function relayPool({
               },
             })
           : responseBodyForOperation({
-              body: started.body,
+              body: startedBody,
               headers: started.headers,
               terminal: attempt.terminal,
               operation,
@@ -6782,26 +6990,32 @@ async function relayPool({
       let affinityWrite: Promise<AffinitySessionBinding | null> | undefined;
       const persistAffinity = () =>
         (affinityWrite ??= attemptOutcome
-          .then(({ terminal, upstreamTerminal }) =>
-            terminal.ok && requestedSurface && affinityPayload && servedAffinityTarget
-              ? rememberAffinity({
-                  ownerId: requester.userId,
-                  resourceOwnerId: member.DiscoveredModel.userId,
-                  poolId: target.id,
-                  securityScope: requester.limitKey,
-                  accessGrantId: target.accessGrantId,
-                  policy: affinityPolicy,
-                  surface: requestedSurface,
-                  payload: affinityPayload,
-                  headers: request.headers,
-                  target: servedAffinityTarget,
-                  engineCacheConfirmed: engineCacheConfirmedFromUsageFacts(
-                    usageFactsFromRelayTerminal(upstreamTerminal),
-                  ),
-                  estimatedTokens: operation.contextCount?.tokens,
-                })
-              : null,
-          )
+          .then(({ terminal, upstreamTerminal }) => {
+            if (!terminal.ok || !requestedSurface || !affinityPayload || !servedAffinityTarget)
+              return null;
+            const usageFacts = usageFactsFromRelayTerminal(upstreamTerminal);
+            const capacity = member.ExecutionTarget?.InferenceCapacity;
+            recordCalibrationFromUsage(capacity, affinityPayload, usageFacts);
+            return rememberAffinity({
+              ownerId: requester.userId,
+              resourceOwnerId: member.DiscoveredModel.userId,
+              poolId: target.id,
+              securityScope: requester.limitKey,
+              accessGrantId: target.accessGrantId,
+              policy: affinityPolicy,
+              surface: requestedSurface,
+              payload: affinityPayload,
+              headers: request.headers,
+              target: servedAffinityTarget,
+              engineCacheConfirmed: engineCacheConfirmedFromUsageFacts(usageFacts),
+              estimatedTokens: estimatedAffinityTokens(
+                capacity,
+                affinityPayload,
+                operation.contextCount?.tokens,
+              ),
+              reportedTokens: reportedAffinityTokens(usageFacts),
+            });
+          })
           .catch((error) => {
             metadataUpdateError(error);
             return null;
@@ -7427,38 +7641,81 @@ async function relaySelectedModelNoFailover({
 
   try {
     const started = await attempt.started;
+    let startedBody = started.body;
+    if (started.status >= 400 && started.status < 500) {
+      const errorBytes = await readStreamBytes(startedBody);
+      if (isEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes))) {
+        attempt.cancel("request_too_large");
+        cliLease.release();
+        globalLease.release();
+        if (capacityLease?.state === "ADMITTED")
+          await capacityRuntime?.release(capacityLease.lease);
+        if (!(builtRequest.body instanceof Uint8Array)) await builtRequest.body.dispose();
+        await operation.dispose?.();
+        await failRelayMetadata({
+          relayRequestId,
+          startedAt,
+          failure: "request_too_large",
+          selectedDiscoveredModelId: selected.id,
+        });
+        const identity = selected.ExecutionTarget;
+        return contextExceededResponse(
+          operation,
+          "Engine rejected the request as exceeding context length.",
+          {
+            estimatedInputTokens: operation.contextCount?.tokens ?? 0,
+            estimateMethod: operation.contextCount?.method ?? "TOKEN_ESTIMATE",
+            contextMarginTokens: identity?.directContextMargin ?? 0,
+            effectiveContextCeilingTokens:
+              effectiveContextCeilingTokens(
+                identity?.InferenceCapacity?.physicalMaxContext,
+                identity?.directContextCeiling,
+              ) ?? 1,
+          },
+        );
+      }
+      startedBody = bytesToReadableStream(errorBytes);
+    }
     const stickiness = operation.responseStickiness;
     let affinityWrite: Promise<AffinitySessionBinding | null> | undefined;
     // Bound Responses continuations are not eviction evidence: this path has
     // neither a ranked affinity decision nor a matched record's age/footprint.
     const persistAffinity = () =>
       (affinityWrite ??= attempt.terminal
-        .then((terminal) =>
-          terminal.ok &&
-          boundAffinityTarget &&
-          requestedModelPoolId &&
-          selectedPoolMember &&
-          operation.contextInput
-            ? rememberAffinity({
-                ownerId: requester.userId,
-                resourceOwnerId: selected.userId,
-                poolId: requestedModelPoolId,
-                securityScope: requester.limitKey,
-                accessGrantId: poolAccess?.accessGrantId,
-                policy: affinityPolicyForMember(selectedPoolMember),
-                surface: "OPENAI_RESPONSES",
-                payload: operation.contextInput,
-                headers: request.headers,
-                target: boundAffinityTarget,
-                sessionBinding: boundSessionId ? operation.sessionBinding : undefined,
-                estimatedTokens: operation.contextCount?.tokens,
-                estimatedDeltaTokens,
-                engineCacheConfirmed: engineCacheConfirmedFromUsageFacts(
-                  usageFactsFromRelayTerminal(terminal),
-                ),
-              })
-            : null,
-        )
+        .then((terminal) => {
+          if (
+            !terminal.ok ||
+            !boundAffinityTarget ||
+            !requestedModelPoolId ||
+            !selectedPoolMember ||
+            !operation.contextInput
+          )
+            return null;
+          const usageFacts = usageFactsFromRelayTerminal(terminal);
+          const capacity = selected.ExecutionTarget?.InferenceCapacity;
+          recordCalibrationFromUsage(capacity, operation.contextInput, usageFacts);
+          return rememberAffinity({
+            ownerId: requester.userId,
+            resourceOwnerId: selected.userId,
+            poolId: requestedModelPoolId,
+            securityScope: requester.limitKey,
+            accessGrantId: poolAccess?.accessGrantId,
+            policy: affinityPolicyForMember(selectedPoolMember),
+            surface: "OPENAI_RESPONSES",
+            payload: operation.contextInput,
+            headers: request.headers,
+            target: boundAffinityTarget,
+            sessionBinding: boundSessionId ? operation.sessionBinding : undefined,
+            estimatedTokens: estimatedAffinityTokens(
+              capacity,
+              operation.contextInput,
+              operation.contextCount?.tokens,
+            ),
+            estimatedDeltaTokens,
+            reportedTokens: reportedAffinityTokens(usageFacts),
+            engineCacheConfirmed: engineCacheConfirmedFromUsageFacts(usageFacts),
+          });
+        })
         .catch((error) => {
           metadataUpdateError(error);
           return null;
@@ -7479,7 +7736,7 @@ async function relaySelectedModelNoFailover({
         : null,
     });
     const responseBody = responseBodyForOperation({
-      body: started.body,
+      body: startedBody,
       headers: started.headers,
       terminal: attempt.terminal,
       operation,
@@ -8747,7 +9004,8 @@ async function relayBoundProviderResponse(input: {
       : 0n;
   const estimatedInputTokens = input.contextInput
     ? input.contextCount?.tokens === undefined
-      ? conservativeSerializedInputTokens(input.body.byteLength)
+      ? (payloadAwareInputTokens(input.body) ??
+        conservativeSerializedInputTokens(input.body.byteLength))
       : BigInt(input.contextCount.tokens)
     : 0n;
   const ownKey = input.stickyRoute.route === "own-key";

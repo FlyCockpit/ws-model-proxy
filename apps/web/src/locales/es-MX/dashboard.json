@@ -607,6 +607,8 @@
         "directConcurrencyLimit": "Límite de concurrencia directa",
         "capacityConcurrencyLimit": "Límite de concurrencia del miembro",
         "physicalMaxContext": "Máximo de tokens de contexto",
+        "imageTokenAllowance": "Asignación de tokens de imagen (opcional)",
+        "imageTokenAllowanceHint": "Se usa cuando no se puede leer el tamaño de la imagen en el encabezado del archivo, y como tope del conteo por encabezado. El valor predeterminado es 4096.",
         "countStrategy": "Conteo de contexto",
         "runtimeRevision": "Revisión del runtime (opcional)",
         "tokenizer": "Tokenizador (opcional)",
@@ -620,11 +622,13 @@
       },
       "strategies": {
         "estimate": "Estimación conservadora",
+        "calibrated": "Estimación calibrada",
         "engine": "Usar el conteo del motor cuando esté disponible",
-        "tokenizer": "Usar un tokenizador registrado coincidente",
-        "template": "Usar un tokenizador y plantilla registrados coincidentes",
-        "engineRequirement": "Requiere soporte para contar tokens en el destino seleccionado. WSMP usa una estimación conservadora cuando no está disponible.",
-        "registeredRequirement": "Requiere un contador registrado que coincida con esta identidad de runtime. WSMP usa una estimación conservadora cuando no hay coincidencia."
+        "tokenizer": "Estimación calibrada",
+        "template": "Estimación calibrada",
+        "engineRequirement": "Requiere count_tokens de Anthropic Messages o Responses en el destino seleccionado. Chat Completions usa la estimación. WSMP usa una estimación conservadora cuando no está disponible.",
+        "calibratedRequirement": "Aprende una proporción por capacidad a partir de los tokens de prompt informados por el motor en solicitudes solo de texto y usa el percentil 95 para las comprobaciones de contexto.",
+        "registeredRequirement": "Aprende una proporción por capacidad a partir de los tokens de prompt informados por el motor en solicitudes solo de texto y usa el percentil 95 para las comprobaciones de contexto."
       },
       "engineFacts": {
         "engine": "Motor: {{engine}}",
@@ -789,7 +793,7 @@
         "reservedSlots": "Espacios reservados en el runtime compartido",
         "reservedSlotsHint": "Reserva esta cantidad de espacios del runtime físico compartido para este pool. Otros pools pueden usarlos solo cuando están inactivos, solo según su política de préstamo, y nunca mientras una solicitud en cola de este pool, con mayor prioridad, necesite el espacio. No puede superar el tope de este pool.",
         "physicalCountStrategy": "Estrategia de conteo físico de tokens",
-        "physicalCountStrategyHint": "Cómo cuenta el runtime los tokens de la solicitud antes de revisar el tope de contexto. La estimación conservadora predeterminada sobrecuenta deliberadamente (bytes UTF-8 serializados ÷ 3 con un factor de seguridad de 1.2) en lugar de confiar en el tokenizador o el motor; las demás estrategias usan el tokenizador configurado, un contador según plantilla o el conteo informado por el motor.",
+        "physicalCountStrategyHint": "Cómo cuenta el runtime los tokens de la solicitud antes de revisar el tope de contexto. La estimación conservadora predeterminada sobrecuenta el texto (bytes UTF-8 serializados ÷ 3 con un factor de seguridad de 1.2) y mide las imágenes desde las cabeceras. La estimación calibrada aprende de los tokens de prompt del motor. El conteo del motor cubre solo count_tokens de Anthropic Messages y Responses.",
         "contextMargin": "Margen de seguridad de contexto del pool (predeterminado: 0)",
         "contextMarginHint": "Margen guardado bajo el tope: la admisión exige que los tokens contados más este margen quepan en el tope y en el máximo físico. Debe ser menor que el tope.",
         "memberContextInheritHint": "Hereda el límite opcional del pool; no se establece un límite por miembro.",
@@ -830,8 +834,9 @@
         "spendMonth": "Gasto / mes UTC"
       },
       "enums": {
-        "TOKENIZER": "Conteo del tokenizador",
-        "TEMPLATE_AWARE": "Conteo según plantilla",
+        "TOKENIZER": "Estimación calibrada",
+        "TEMPLATE_AWARE": "Estimación calibrada",
+        "CALIBRATED_ESTIMATE": "Estimación calibrada",
         "ENGINE_REPORTED": "Conteo informado por el motor",
         "CONSERVATIVE_ESTIMATE": "Estimación conservadora",
         "NEVER": "Nunca prestar",

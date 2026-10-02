@@ -39,6 +39,7 @@ import {
   rememberAffinity,
 } from "./cache-affinity.js";
 import { capacityLeaseLostSignal } from "./capacity/lease-loss.js";
+import { estimatePayloadTokens } from "./capacity/payload-estimate.js";
 import { type ExternalEgressConsent, isIssuedExternalConsent } from "./external-route.js";
 import {
   applyOpenRouterDataCollection,
@@ -1779,6 +1780,26 @@ export function engineCacheConfirmedFromUsage(
   return usage?.cacheReadTokens === undefined ? undefined : usage.cacheReadTokens > 0n;
 }
 
+function reportedTokensFromSettledUsage(usage: RawProviderUsage | undefined): number | undefined {
+  if (!usage) return undefined;
+  const parts = [
+    usage.inputTokens,
+    usage.outputTokens,
+    usage.cacheReadTokens,
+    usage.cacheWriteTokens,
+    usage.reasoningTokens,
+  ];
+  let total = 0n;
+  let known = false;
+  for (const part of parts) {
+    if (part === undefined) continue;
+    known = true;
+    total += part;
+  }
+  if (!known) return undefined;
+  return total > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(total);
+}
+
 /**
  * Derives engine cache-affinity evidence directly from retained response-body
  * chunks (SSE or JSON) using the shared provider usage normalizer. Never
@@ -2898,9 +2919,11 @@ export async function dispatchPublicOverflow(
       }).catch(() => undefined);
       continue;
     }
-    const renderedInputTokens = conservativeSerializedInputTokens(upstream.body.byteLength);
+    const byteEstimate = conservativeSerializedInputTokens(upstream.body.byteLength);
+    const renderedInputTokens =
+      payloadAwareInputTokens(upstream.body) ?? request.estimatedInputTokens ?? byteEstimate;
     const renderedLiability = liabilityFromPricing({
-      estimatedInputTokens: renderedInputTokens,
+      estimatedInputTokens: byteEstimate,
       requestedOutputTokens,
       pricing,
     });
@@ -3831,6 +3854,7 @@ export async function dispatchPublicOverflow(
                             ? BigInt(Number.MAX_SAFE_INTEGER)
                             : request.estimatedInputTokens,
                         ),
+                  reportedTokens: reportedTokensFromSettledUsage(settledUsage),
                 });
             } catch {
               // Affinity is a best-effort routing hint and cannot change a terminal result.
@@ -3971,6 +3995,19 @@ export function conservativeSerializedInputTokens(serializedBytes: number): bigi
     throw new TypeError("serializedBytes must be a non-negative safe integer");
   const bytes = BigInt(serializedBytes);
   return (bytes * 11n + 9n) / 10n + 64n;
+}
+
+/** Context-fit estimate for a rendered JSON body. Byte-per-token stays on the
+ * budget hold, which is settled from real usage. */
+export function payloadAwareInputTokens(serializedBody: Uint8Array): bigint | undefined {
+  try {
+    const parsed: unknown = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(serializedBody),
+    );
+    return BigInt(estimatePayloadTokens(parsed).tokens);
+  } catch {
+    return undefined;
+  }
 }
 
 export type { RawProviderUsage };

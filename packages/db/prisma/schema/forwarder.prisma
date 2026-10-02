@@ -228,6 +228,7 @@ enum CapacityCountStrategy {
   TEMPLATE_AWARE
   ENGINE_REPORTED
   CONSERVATIVE_ESTIMATE
+  CALIBRATED_ESTIMATE
 }
 
 /// How warm-session protection splits one member's KV pool between users
@@ -1112,6 +1113,8 @@ model CacheAffinityRecord {
   sessionId            String
   prefixDepth          Int
   estimatedTokens      Int?
+  /// Engine-reported prompt + completion tokens when known.
+  reportedTokens       Int?
   engineCacheConfirmed Boolean  @default(false)
 
   @@unique([tenantUserId, poolId, executionTargetId, targetIdentity, bindingDigest, prefixDigest])
@@ -1141,6 +1144,8 @@ model CacheAffinityNode {
   isTip             Boolean
   /// Whole-prompt footprint from the identifiable write that made this node a tip; NULL means no proven estimate.
   estimatedTokens   Int?
+  /// Engine-reported prompt + completion when the tip write observed usage.
+  reportedTokens    Int?
   expiresAt         DateTime
 
   @@unique([userId, tenantUserId, poolId, executionTargetId, rootDigest, nodeDigest, sessionId], map: "cache_affinity_node_owner_unique")
@@ -1219,6 +1224,8 @@ model InferenceCapacity {
   /// null = unlimited) are only changed through user-facing writes.
   hardConcurrencyLimitSource CapacityLimitSource   @default(AUTO)
   physicalMaxContext         Int?
+  /// Per-image token cap when the header has no size; also caps the header formula.
+  imageTokenAllowance        Int?
   countStrategy              CapacityCountStrategy @default(CONSERVATIVE_ESTIMATE)
   /// Stable, application-computed fingerprint for the physical runtime tuple.
   runtimeIdentityKey         String

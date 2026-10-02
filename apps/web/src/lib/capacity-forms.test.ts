@@ -11,6 +11,7 @@ import {
   directPolicyIsValid,
   directPolicyPayload,
   followUpRecoveryState,
+  formCountStrategy,
   memberPolicyPayload,
   newCapacityDefaults,
 } from "./capacity-forms";
@@ -24,6 +25,14 @@ describe("capacity form", () => {
       physicalMaxContext: 32_768,
       countStrategy: "CONSERVATIVE_ESTIMATE",
     });
+  });
+
+  it("maps stored tokenizer strategies to calibrated estimate", () => {
+    expect(formCountStrategy("TOKENIZER")).toBe("CALIBRATED_ESTIMATE");
+    expect(formCountStrategy("TEMPLATE_AWARE")).toBe("CALIBRATED_ESTIMATE");
+    expect(formCountStrategy("CALIBRATED_ESTIMATE")).toBe("CALIBRATED_ESTIMATE");
+    expect(formCountStrategy("ENGINE_REPORTED")).toBe("ENGINE_REPORTED");
+    expect(formCountStrategy("CONSERVATIVE_ESTIMATE")).toBe("CONSERVATIVE_ESTIMATE");
   });
 
   it("rejects blank identities and zero physical limits", () => {
@@ -52,7 +61,17 @@ describe("capacity form", () => {
       runtimeModel: "model",
       runtimeIdentityKey: "key",
       tokenizer: null,
+      imageTokenAllowance: null,
     });
+    expect(
+      capacityMutationPayload({
+        ...newCapacityDefaults,
+        label: "GPU",
+        runtimeModel: "model",
+        runtimeIdentityKey: "key",
+        imageTokenAllowance: 2048,
+      }),
+    ).toMatchObject({ imageTokenAllowance: 2048 });
   });
 
   it("persists explicit unlimited physical limits without coercing fallback values", () => {

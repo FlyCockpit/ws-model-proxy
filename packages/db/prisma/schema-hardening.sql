@@ -84,6 +84,7 @@ ALTER TABLE inference_capacity DROP CONSTRAINT IF EXISTS inference_capacity_limi
 ALTER TABLE inference_capacity ADD CONSTRAINT inference_capacity_limits_check CHECK (
   ("hardConcurrencyLimit" IS NULL OR "hardConcurrencyLimit" > 0)
   AND ("physicalMaxContext" IS NULL OR "physicalMaxContext" > 0)
+  AND ("imageTokenAllowance" IS NULL OR "imageTokenAllowance" > 0)
 );
 
 ALTER TABLE capacity_runtime DROP CONSTRAINT IF EXISTS capacity_runtime_scheduler_check;
@@ -166,6 +167,7 @@ ALTER TABLE cache_affinity_record ADD CONSTRAINT cache_affinity_record_shape_che
   "digestVersion" >= 5
   AND "prefixDepth" >= 0
   AND ("estimatedTokens" IS NULL OR "estimatedTokens" >= 0)
+  AND ("reportedTokens" IS NULL OR "reportedTokens" >= 0)
   AND "expiresAt" > "createdAt"
   AND length("bindingDigest") BETWEEN 32 AND 128
   AND (("prefixDigest" IS NOT NULL AND "prefixDepth" > 0
@@ -247,6 +249,7 @@ ALTER TABLE cache_affinity_node ADD CONSTRAINT cache_affinity_node_shape_check C
   AND length("nodeDigest") BETWEEN 32 AND 128
   AND length("sessionId") BETWEEN 1 AND 128
   AND ("estimatedTokens" IS NULL OR "estimatedTokens" >= 0)
+  AND ("reportedTokens" IS NULL OR "reportedTokens" >= 0)
 );
 DROP TRIGGER IF EXISTS cache_affinity_node_owner ON cache_affinity_node;
 CREATE TRIGGER cache_affinity_node_owner BEFORE INSERT ON cache_affinity_node

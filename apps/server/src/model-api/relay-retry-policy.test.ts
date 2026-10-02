@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
-import { relayOperationRetrySafety, shouldRetryRelayOperation } from "./relay-retry-policy.js";
+import {
+  isEngineContextOverflow,
+  relayOperationRetrySafety,
+  shouldRetryRelayOperation,
+} from "./relay-retry-policy.js";
 
 const failures = [
   "precommit_5xx",
   "precommit_transport",
   "precommit_content_type_mismatch",
+  "precommit_context_exceeded",
 ] as const;
 
 describe("relay retry policy", () => {
@@ -40,5 +45,18 @@ describe("relay retry policy", () => {
     expect(relayOperationRetrySafety(operation)).toBe(safety);
     for (const failure of failures)
       expect(shouldRetryRelayOperation(operation, failure)).toBe(true);
+  });
+
+  it.each([
+    [400, "This model's maximum context length is 32768 tokens", true],
+    [400, "exceed_context_size_error", true],
+    [400, "context_length_exceeded", true],
+    [413, "the input length exceeds the context window", true],
+    [400, "Requested token count exceeds the limit", true],
+    [400, "unrelated bad request", false],
+    [500, "maximum context length", false],
+    [200, "maximum context length", false],
+  ] as const)("classifies engine context overflow %s %s", (status, body, expected) => {
+    expect(isEngineContextOverflow(status, body)).toBe(expected);
   });
 });

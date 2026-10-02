@@ -1664,6 +1664,7 @@ export const forwarderManagementRouter = {
                   "TEMPLATE_AWARE",
                   "ENGINE_REPORTED",
                   "CONSERVATIVE_ESTIMATE",
+                  "CALIBRATED_ESTIMATE",
                 ]),
                 contextMargin: z.number().int().min(0).max(10_000_000),
                 borrowPolicy: z.enum(["NEVER", "WHEN_IDLE"]),
