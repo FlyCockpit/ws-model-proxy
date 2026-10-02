@@ -39,6 +39,18 @@ vi.mock("@ws-model-proxy/db", async () => {
     greaterThan(other: string | number) {
       return Number(this.value) > Number(other);
     }
+
+    toFixed() {
+      return this.value;
+    }
+
+    equals(other: { value?: string } | string | number) {
+      const right =
+        typeof other === "object" && other && "value" in other
+          ? String(other.value)
+          : String(other);
+      return this.value === right;
+    }
   }
   return {
     default: mockDeep(),
@@ -2374,7 +2386,9 @@ describe("forwarderManagementRouter", () => {
   it("lets the pool owner set and clear a per-grant owner-paid spend cap", async () => {
     db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
     db.$queryRaw.mockResolvedValue([{ id: "pool-id" }]);
+    db.poolGrant.findFirst.mockResolvedValue({ granteeUserId: "grantee-id" });
     db.poolGrant.updateMany.mockResolvedValue({ count: 1 });
+    db.poolMember.findMany.mockResolvedValue([]);
     db.providerBudgetPolicy.findFirst.mockResolvedValue(null);
     db.providerBudgetPolicy.create.mockResolvedValue({ id: "grant-cap" });
     db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
@@ -2384,8 +2398,10 @@ describe("forwarderManagementRouter", () => {
       granteeUserId: "grantee-id",
       protectionOverridePercent: null,
       queuePriority: null,
-      BudgetPolicies: [{ Rules: [{ limitValue: "25.5", currency: "USD", period: "UTC_MONTH" }] }],
     });
+    db.providerBudgetPolicy.findMany.mockResolvedValue([
+      { Rules: [{ limitValue: "25.5", currency: "USD", period: "UTC_MONTH" }] },
+    ]);
 
     await expect(
       client().updatePoolGrant({
@@ -2402,6 +2418,7 @@ describe("forwarderManagementRouter", () => {
           scopeType: "POOL_GRANT",
           poolGrantId: "grant-id",
           poolId: "pool-id",
+          granteeUserId: "grantee-id",
           providerAccountId: null,
           active: true,
         }),
@@ -2409,7 +2426,7 @@ describe("forwarderManagementRouter", () => {
     );
     expect(fenceCalls()).toEqual([
       ["00:owner:user-id"],
-      ["03:provider-budget-grant:user-id:grant-id"],
+      ["03:provider-budget-grant:user-id:pool-id:grantee-id"],
     ]);
     expect(lastFenceOrder()).toBeLessThan(firstRowLockOrder());
 
@@ -2420,14 +2437,7 @@ describe("forwarderManagementRouter", () => {
       Rules: [{ limitValue: "25.5", currency: "USD", period: "UTC_MONTH" }],
     });
     db.providerBudgetPolicy.update.mockResolvedValue({ id: "grant-cap" });
-    db.poolGrant.findUniqueOrThrow.mockResolvedValue({
-      id: "grant-id",
-      poolId: "pool-id",
-      granteeUserId: "grantee-id",
-      protectionOverridePercent: null,
-      queuePriority: null,
-      BudgetPolicies: [],
-    });
+    db.providerBudgetPolicy.findMany.mockResolvedValue([]);
     await expect(
       client().updatePoolGrant({ poolId: "pool-id", grantId: "grant-id", fallbackSpend: null }),
     ).resolves.toMatchObject({ fallbackSpend: null });

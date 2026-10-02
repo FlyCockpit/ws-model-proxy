@@ -1931,11 +1931,20 @@ BEGIN
     IF NEW."requestedExecutionTargetId" IS NOT NULL THEN
       SELECT "userId", "discoveredModelId" INTO target_owner, target_model
         FROM execution_target WHERE id = NEW."requestedExecutionTargetId";
-      IF FOUND AND (target_owner IS DISTINCT FROM NEW."userId"
-         OR (NEW."requestedDiscoveredModelId" IS NOT NULL
-             AND target_model IS DISTINCT FROM NEW."requestedDiscoveredModelId")) THEN
-        RAISE EXCEPTION 'relay request target must match its owner and discovered model'
-          USING ERRCODE = '23514';
+      IF FOUND THEN
+        -- Pool hops (including media transformers) target the pool owner's
+        -- machine. Direct targets still belong to the requester.
+        consumer_owner := NEW."userId";
+        IF NEW."requestedModelPoolId" IS NOT NULL THEN
+          SELECT "userId" INTO pool_owner FROM model_pool WHERE id = NEW."requestedModelPoolId";
+          consumer_owner := COALESCE(pool_owner, NEW."resourceOwnerUserId", NEW."userId");
+        END IF;
+        IF target_owner IS DISTINCT FROM consumer_owner
+           OR (NEW."requestedDiscoveredModelId" IS NOT NULL
+               AND target_model IS DISTINCT FROM NEW."requestedDiscoveredModelId") THEN
+          RAISE EXCEPTION 'relay request target must match its owner and discovered model'
+            USING ERRCODE = '23514';
+        END IF;
       END IF;
     END IF;
     -- A PENDING pool request whose pool is already gone (deleted while the
@@ -2002,6 +2011,19 @@ BEGIN
            OR NEW."requestedModelPoolId" IS DISTINCT FROM OLD."requestedModelPoolId"
            OR NEW."fallbackRoute" IS DISTINCT FROM OLD."fallbackRoute"
            OR NEW."selectedPoolMemberId" IS DISTINCT FROM OLD."selectedPoolMemberId")
+         -- Deleted parent: the late finalizer must still commit status.
+         AND EXISTS (SELECT 1 FROM model_pool WHERE id = NEW."requestedModelPoolId")
+         -- Media transformers are pool-owned and need not be members.
+         AND NOT (
+           NEW.source = 'TRANSFORMER'
+           AND EXISTS (
+             SELECT 1 FROM model_pool pool
+               JOIN execution_target transformer
+                 ON transformer."discoveredModelId" = pool."transformerDiscoveredModelId"
+              WHERE pool.id = NEW."requestedModelPoolId"
+                AND transformer.id = NEW."selectedExecutionTargetId"
+           )
+         )
          AND NOT EXISTS (
            SELECT 1 FROM pool_member member
             WHERE member."poolId" = NEW."requestedModelPoolId"
@@ -2085,7 +2107,8 @@ UPDATE relay_request AS request
 DROP TRIGGER IF EXISTS relay_request_execution_target_consistency ON relay_request;
 CREATE TRIGGER relay_request_execution_target_consistency
 BEFORE INSERT OR UPDATE OF "userId", "requestedDiscoveredModelId", "requestedExecutionTargetId",
-  "selectedDiscoveredModelId", "selectedExecutionTargetId", "requestedModelPoolId", "fallbackRoute" ON relay_request
+  "selectedDiscoveredModelId", "selectedExecutionTargetId", "requestedModelPoolId", "fallbackRoute",
+  "selectedPoolMemberId" ON relay_request
 FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
 
 UPDATE provider_account SET "endpointIdentity" = "baseUrl" WHERE "endpointIdentity" = '';
@@ -2177,19 +2200,26 @@ ALTER TABLE provider_credential ADD CONSTRAINT provider_credential_shape_check C
     OR (status = 'REVOKED' AND "revokedAt" IS NOT NULL))
 );
 
--- POOL_GRANT is grant-wide (no account attachment). Additive: existing rows
--- keep their account; new grant-cap rows store NULL.
+-- POOL_GRANT is grant-wide (no account attachment), keyed by pool + grantee
+-- so revoke/re-grant keep the cap. poolGrantId is last-seen audit, not an FK.
 ALTER TABLE provider_budget_policy ADD COLUMN IF NOT EXISTS "poolGrantId" TEXT;
+ALTER TABLE provider_budget_policy ADD COLUMN IF NOT EXISTS "granteeUserId" TEXT;
 ALTER TABLE provider_budget_policy ALTER COLUMN "providerAccountId" DROP NOT NULL;
+UPDATE provider_budget_policy AS policy
+   SET "granteeUserId" = grant_row."granteeUserId"
+  FROM pool_grant AS grant_row
+ WHERE policy."scopeType" = 'POOL_GRANT'
+   AND policy."granteeUserId" IS NULL
+   AND grant_row.id = policy."poolGrantId";
 
 ALTER TABLE provider_budget_policy DROP CONSTRAINT IF EXISTS provider_budget_policy_scope_check;
 ALTER TABLE provider_budget_policy ADD CONSTRAINT provider_budget_policy_scope_check CHECK (
   version > 0
   AND (("scopeType" = 'PROVIDER_ACCOUNT' AND "poolId" IS NULL AND "providerModelId" IS NULL
-        AND "poolGrantId" IS NULL AND "providerAccountId" IS NOT NULL)
+        AND "poolGrantId" IS NULL AND "granteeUserId" IS NULL AND "providerAccountId" IS NOT NULL)
     OR ("scopeType" = 'POOL_PROVIDER_MODEL' AND "poolId" IS NOT NULL AND "providerModelId" IS NOT NULL
-        AND "poolGrantId" IS NULL AND "providerAccountId" IS NOT NULL)
-    OR ("scopeType" = 'POOL_GRANT' AND "poolGrantId" IS NOT NULL AND "poolId" IS NOT NULL
+        AND "poolGrantId" IS NULL AND "granteeUserId" IS NULL AND "providerAccountId" IS NOT NULL)
+    OR ("scopeType" = 'POOL_GRANT' AND "granteeUserId" IS NOT NULL AND "poolId" IS NOT NULL
         AND "providerModelId" IS NULL AND "providerAccountId" IS NULL))
   AND ((active AND "activatedAt" IS NOT NULL AND "deactivatedAt" IS NULL)
     OR (NOT active AND ("activatedAt" IS NULL OR "deactivatedAt" IS NOT NULL)))
@@ -2201,8 +2231,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_account_version_unique
 CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_attachment_version_unique
   ON provider_budget_policy ("userId", "providerAccountId", "poolId", "providerModelId", version)
   WHERE "scopeType" = 'POOL_PROVIDER_MODEL';
+DROP INDEX IF EXISTS provider_budget_policy_grant_version_unique;
 CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_grant_version_unique
-  ON provider_budget_policy ("userId", "poolGrantId", version)
+  ON provider_budget_policy ("userId", "poolId", "granteeUserId", version)
   WHERE "scopeType" = 'POOL_GRANT';
 CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_one_active_account
   ON provider_budget_policy ("userId", "providerAccountId")
@@ -2210,8 +2241,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_one_active_account
 CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_one_active_attachment
   ON provider_budget_policy ("userId", "providerAccountId", "poolId", "providerModelId")
   WHERE active AND "scopeType" = 'POOL_PROVIDER_MODEL';
+DROP INDEX IF EXISTS provider_budget_policy_one_active_grant;
 CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_one_active_grant
-  ON provider_budget_policy ("userId", "poolGrantId")
+  ON provider_budget_policy ("userId", "poolId", "granteeUserId")
   WHERE active AND "scopeType" = 'POOL_GRANT';
 
 ALTER TABLE provider_budget_rule DROP CONSTRAINT IF EXISTS provider_budget_rule_shape_check;
@@ -2713,9 +2745,12 @@ BEGIN
         AND m."userId" = NEW."userId" AND m."providerAccountId" = NEW."providerAccountId") THEN
       RAISE EXCEPTION 'budget policy model must belong to its provider account' USING ERRCODE = '23514';
     END IF;
-    IF NEW."scopeType" = 'POOL_GRANT' AND NOT EXISTS (
-      SELECT 1 FROM pool_grant g WHERE g.id = NEW."poolGrantId"
-        AND g."poolId" = NEW."poolId" AND g."ownerUserId" = NEW."userId") THEN
+    IF NEW."scopeType" = 'POOL_GRANT' AND (
+         NEW."granteeUserId" IS NULL
+         OR NOT EXISTS (
+           SELECT 1 FROM model_pool mp
+            WHERE mp.id = NEW."poolId" AND mp."userId" = NEW."userId")
+       ) THEN
       RAISE EXCEPTION 'budget policy grant must belong to the pool owner' USING ERRCODE = '23514';
     END IF;
   ELSIF TG_TABLE_NAME = 'provider_attempt' THEN
@@ -2895,6 +2930,7 @@ BEGIN
        OR NEW."poolId" IS DISTINCT FROM OLD."poolId"
        OR NEW."providerModelId" IS DISTINCT FROM OLD."providerModelId"
        OR NEW."poolGrantId" IS DISTINCT FROM OLD."poolGrantId"
+       OR NEW."granteeUserId" IS DISTINCT FROM OLD."granteeUserId"
        OR NEW.version IS DISTINCT FROM OLD.version OR NEW."activatedAt" IS DISTINCT FROM OLD."activatedAt"
        OR NEW.active OR NEW."deactivatedAt" IS NULL THEN
       RAISE EXCEPTION 'activated provider budget policy is immutable except deactivation' USING ERRCODE = '55000';
@@ -2910,6 +2946,7 @@ BEGIN
        OR NEW."poolId" IS DISTINCT FROM OLD."poolId"
        OR NEW."providerModelId" IS DISTINCT FROM OLD."providerModelId"
        OR NEW."poolGrantId" IS DISTINCT FROM OLD."poolGrantId"
+       OR NEW."granteeUserId" IS DISTINCT FROM OLD."granteeUserId"
        OR NEW.version IS DISTINCT FROM OLD.version
        OR NOT NEW.active OR NEW."activatedAt" IS NULL OR NEW."deactivatedAt" IS NOT NULL THEN
       RAISE EXCEPTION 'provider budget policy permits only controlled activation' USING ERRCODE = '55000';
@@ -2920,7 +2957,9 @@ END;
 $provider_budget_history$;
 
 DROP TRIGGER IF EXISTS provider_budget_rule_immutable ON provider_budget_rule;
-CREATE TRIGGER provider_budget_rule_immutable BEFORE UPDATE OR DELETE ON provider_budget_rule
+-- UPDATE stays forbidden. DELETE is allowed so pool/user cascade can drop
+-- rules with their policy (an immutable trigger on DELETE blocked revoke).
+CREATE TRIGGER provider_budget_rule_immutable BEFORE UPDATE ON provider_budget_rule
 FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_history_transitions();
 DROP TRIGGER IF EXISTS provider_budget_policy_transition ON provider_budget_policy;
 CREATE TRIGGER provider_budget_policy_transition BEFORE UPDATE ON provider_budget_policy
@@ -3274,7 +3313,7 @@ BEGIN
     ('provider_account', 'id,userId,currentCredentialId', ''),
     ('provider_model', 'id,userId,providerAccountId,upstreamModelId', ''),
     ('provider_credential', 'id,userId,providerAccountId,replacedById', ''),
-    ('provider_budget_policy', 'id,userId,scopeType,providerAccountId,poolId,providerModelId,poolGrantId', ''),
+    ('provider_budget_policy', 'id,userId,scopeType,providerAccountId,poolId,providerModelId,poolGrantId,granteeUserId', ''),
     ('provider_budget_rule', 'id,policyId', ''),
     ('provider_pricing_version', 'id,userId,providerAccountId,providerModelId', ''),
     ('pool_fallback_preference', 'id,userId,poolId,poolGrantId,providerModelId', '')

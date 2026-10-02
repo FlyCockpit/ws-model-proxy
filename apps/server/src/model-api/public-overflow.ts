@@ -2993,6 +2993,10 @@ export async function dispatchPublicOverflow(
           request.ownKeyProviderModelId || request.externalConsent.requesterIsOwner
             ? undefined
             : (request.externalConsent.accessGrantId ?? undefined),
+        granteeUserId:
+          request.ownKeyProviderModelId || request.externalConsent.requesterIsOwner
+            ? undefined
+            : request.externalConsent.requesterUserId,
         requestId: request.requestId,
         attemptId,
         fencingToken,

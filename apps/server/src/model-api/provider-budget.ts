@@ -3,6 +3,7 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { runWithDbShutdownPermit } from "@ws-model-proxy/db/shutdown-fence";
 import {
+  type BudgetPeriod,
   budgetWindow,
   type ProviderTokenUsage,
   providerBillableTokens,
@@ -41,6 +42,8 @@ export interface ProviderBudgetAttempt {
   poolId?: string;
   /** Exact live grant for owner-paid grantee traffic; never own-key or owner. */
   poolGrantId?: string;
+  /** Grantee identity for the live grant; spend is summed by pool + grantee. */
+  granteeUserId?: string;
   requestId: string;
   attemptId: string;
   fencingToken: bigint;
@@ -198,6 +201,22 @@ function canonicalPayloadHash(value: unknown): string {
   return createHash("sha256")
     .update(JSON.stringify(normalize(value)))
     .digest("hex");
+}
+
+function reservationIdentityWhere(
+  policy: { id: string; scopeType: string },
+  rule: { id: string; metric: BudgetMetric; period: BudgetPeriod; currency: string | null },
+  grantPolicyIds: readonly string[],
+): Prisma.ProviderBudgetReservationWhereInput {
+  if (policy.scopeType === "POOL_GRANT") {
+    return {
+      policyId: { in: [...grantPolicyIds] },
+      metric: rule.metric,
+      period: rule.period,
+      ...(rule.currency ? { currency: rule.currency } : {}),
+    };
+  }
+  return { policyId: policy.id, ruleId: rule.id };
 }
 
 function grantCapDenial(
@@ -370,7 +389,9 @@ export async function admitProviderBudget(
     await acquireFences(tx, [
       fences.budgetAttempt(attempt.attemptId),
       fences.budgetAccount(attempt.userId, attempt.providerAccountId),
-      ...(attempt.poolGrantId ? [fences.budgetGrant(attempt.userId, attempt.poolGrantId)] : []),
+      ...(attempt.poolId && attempt.granteeUserId
+        ? [fences.budgetGrant(attempt.userId, attempt.poolId, attempt.granteeUserId)]
+        : []),
     ]);
     // This statement runs after possibly waiting for the account lock. Use the
     // actual post-wait database clock, not this transaction's start time, when
@@ -490,12 +511,12 @@ export async function admitProviderBudget(
                   },
                 ]
               : []),
-            ...(attempt.poolGrantId && attempt.poolId
+            ...(attempt.poolId && attempt.granteeUserId
               ? [
                   {
                     scopeType: "POOL_GRANT" as const,
-                    poolGrantId: attempt.poolGrantId,
                     poolId: attempt.poolId,
+                    granteeUserId: attempt.granteeUserId,
                     providerAccountId: null,
                   },
                 ]
@@ -552,6 +573,26 @@ export async function admitProviderBudget(
       windowEnd: Date | null;
     }> = [];
 
+    const grantCapPolicies = policies.filter((policy) => policy.scopeType === "POOL_GRANT");
+    const grantPolicyIds =
+      grantCapPolicies.length === 0
+        ? []
+        : [
+            ...new Set([
+              ...grantCapPolicies.map((policy) => policy.id),
+              ...(
+                await tx.providerBudgetPolicy.findMany({
+                  where: {
+                    userId: attempt.userId,
+                    scopeType: "POOL_GRANT",
+                    poolId: attempt.poolId,
+                    granteeUserId: attempt.granteeUserId,
+                  },
+                  select: { id: true },
+                })
+              ).map((row) => row.id),
+            ]),
+          ];
     for (const policy of policies) {
       if (!policy.activatedAt)
         throw new ProviderBudgetConfigurationError("Active policy has no activation");
@@ -589,23 +630,25 @@ export async function admitProviderBudget(
           if (!pricing) return grantCapDenial(policy, rule.id, "PRICING_UNAVAILABLE");
         }
         const window = budgetWindow(rule.period, policy.activatedAt, now);
+        const identity = reservationIdentityWhere(policy, rule, grantPolicyIds);
+        const windowWhere =
+          rule.metric === "CONCURRENCY"
+            ? {}
+            : rule.period === "PER_ATTEMPT"
+              ? { attemptId: attempt.attemptId }
+              : rule.period === "LIFETIME"
+                ? { windowStart: window.windowStart, windowEnd: null }
+                : { windowStart: window.windowStart, windowEnd: window.windowEnd };
         const aggregate = await tx.providerBudgetReservation.aggregate({
           where: {
-            policyId: policy.id,
-            ruleId: rule.id,
+            ...identity,
             ...(rule.metric === "CONCURRENCY"
               ? {
                   state: "RESERVED",
                   OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
                 }
               : { OR: [{ state: "RESERVED" }, { state: "SETTLED" }] }),
-            ...(rule.metric === "CONCURRENCY"
-              ? {}
-              : rule.period === "PER_ATTEMPT"
-                ? { attemptId: attempt.attemptId }
-                : rule.period === "LIFETIME"
-                  ? { windowStart: window.windowStart, windowEnd: null }
-                  : { windowStart: window.windowStart, windowEnd: window.windowEnd }),
+            ...windowWhere,
           },
           _sum: { reservedValue: true },
         });
@@ -615,14 +658,9 @@ export async function admitProviderBudget(
             ? null
             : await tx.providerBudgetReservation.aggregate({
                 where: {
-                  policyId: policy.id,
-                  ruleId: rule.id,
+                  ...identity,
                   state: "SETTLED",
-                  ...(rule.period === "PER_ATTEMPT"
-                    ? { attemptId: attempt.attemptId }
-                    : rule.period === "LIFETIME"
-                      ? { windowStart: window.windowStart, windowEnd: null }
-                      : { windowStart: window.windowStart, windowEnd: window.windowEnd }),
+                  ...windowWhere,
                 },
                 _sum: { reservedValue: true },
               });
@@ -632,13 +670,8 @@ export async function admitProviderBudget(
             : await tx.providerBudgetSettlement.aggregate({
                 where: {
                   Reservation: {
-                    policyId: policy.id,
-                    ruleId: rule.id,
-                    ...(rule.period === "PER_ATTEMPT"
-                      ? { attemptId: attempt.attemptId }
-                      : rule.period === "LIFETIME"
-                        ? { windowStart: window.windowStart, windowEnd: null }
-                        : { windowStart: window.windowStart, windowEnd: window.windowEnd }),
+                    ...identity,
+                    ...windowWhere,
                   },
                 },
                 _sum: { settledValue: true },

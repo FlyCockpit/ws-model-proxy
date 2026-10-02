@@ -8,8 +8,21 @@ vi.mock("@ws-model-proxy/db", () => ({
       constructor(value: string | number) {
         this.value = String(value);
       }
+      greaterThan(other: string | number) {
+        return Number(this.value) > Number(other);
+      }
       toString() {
         return this.value;
+      }
+      toFixed() {
+        return this.value;
+      }
+      equals(other: { value?: string } | string | number) {
+        const right =
+          typeof other === "object" && other && "value" in other
+            ? String(other.value)
+            : String(other);
+        return this.value === right;
       }
     },
   },

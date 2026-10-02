@@ -371,7 +371,7 @@ export const TOKEN_EXTERNAL_WAIT_COST_NOTICE =
 
 /** Cost statement for per-grantee owner-paid `:external` spend caps (#182). */
 export const POOL_GRANT_SPEND_CAP_COST_NOTICE =
-  "COST: a POOL_GRANT spend cap (scopeType=POOL_GRANT keyed by poolGrantId, or fallbackSpend on forwarder_pool_grant_update) limits how much owner-paid :external usage this exact grant can charge to YOUR provider accounts (real money). Exhausting the cap fails :external for that grantee with no remaining amount in the error; local members still serve. Clearing the cap (fallbackSpend=null, or deactivating the policy) never costs anything. PRECONDITIONS: you must own the pool and the grant; the cap is SPEND only (UTC_DAY or UTC_MONTH); a revoked and re-created grant is a new id with a fresh cap.";
+  "COST: a POOL_GRANT spend cap (fallbackSpend on forwarder_pool_grant_update, keyed by pool + grantee) limits how much owner-paid :external usage this grantee can charge to YOUR provider accounts (real money). Exhausting the cap fails :external for that grantee with no remaining amount in the error; local members still serve. Clearing the cap (fallbackSpend=null) never costs anything. PRECONDITIONS: you must own the pool and the grant; the cap is SPEND only (UTC_DAY or UTC_MONTH); a revoked and re-created grant for the same person keeps this cap.";
 
 // ---------------------------------------------------------------------------
 // Procedure invocation helper
@@ -1251,7 +1251,6 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     classification: "pure",
-    descriptionNote: POOL_GRANT_SPEND_CAP_COST_NOTICE,
     invokeProcedure: procedureInvoker((client) => client.providerManagement.createBudgetPolicy),
   },
   {

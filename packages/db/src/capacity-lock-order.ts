@@ -75,7 +75,7 @@
  *      provider-budget-attempt:<attempt>    provider budget admission/settlement
  *   02 execution-target:<identity>          target discovery/creation (M)
  *   03 provider-budget-account:<user>:<account>
- *      provider-budget-grant:<user>:<grant> per-grantee owner-paid spend cap
+ *      provider-budget-grant:<user>:<pool>:<grantee> per-grantee owner-paid spend cap
  *   04 provider-budget:<policy>
  *   05 provider-pricing:<user>:<model>
  *   06 capacity-policy:<target>             policy writers (M) and admission (H)
@@ -431,8 +431,8 @@ export const fences = {
   targetIdentity: (identity: string) => fence("02", "execution-target", identity),
   budgetAccount: (userId: string, providerAccountId: string) =>
     fence("03", "provider-budget-account", `${userId}:${providerAccountId}`),
-  budgetGrant: (userId: string, poolGrantId: string) =>
-    fence("03", "provider-budget-grant", `${userId}:${poolGrantId}`),
+  budgetGrant: (userId: string, poolId: string, granteeUserId: string) =>
+    fence("03", "provider-budget-grant", `${userId}:${poolId}:${granteeUserId}`),
   budgetPolicy: (policyId: string) => fence("04", "provider-budget", policyId),
   pricing: (userId: string, providerModelId: string) =>
     fence("05", "provider-pricing", `${userId}:${providerModelId}`),

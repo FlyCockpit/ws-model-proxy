@@ -2,14 +2,31 @@ import { ORPCError } from "@orpc/server";
 import { Prisma } from "@ws-model-proxy/db";
 import { z } from "zod";
 
-/** Owner-paid `:external` spend cap for one exact pool grant. */
+/** Owner-paid `:external` spend cap keyed by pool + grantee (survives re-grant). */
 export const poolGrantSpendCapSchema = z
   .object({
-    limit: z.string().regex(/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/u),
+    limit: z.string().regex(/^\d{1,21}(?:\.\d{1,9})?$/u),
     currency: z.string().regex(/^[A-Z]{3}$/u),
     period: z.enum(["UTC_DAY", "UTC_MONTH"]),
   })
-  .refine((value) => value.limit !== "0", { message: "Spend cap must be positive" });
+  .superRefine((value, context) => {
+    try {
+      const amount = new Prisma.Decimal(value.limit);
+      if (!amount.greaterThan(0) || Number(value.limit) >= 1e21) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Spend cap must be positive",
+          path: ["limit"],
+        });
+      }
+    } catch {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Spend cap must be positive",
+        path: ["limit"],
+      });
+    }
+  });
 
 export type PoolGrantSpendCap = z.infer<typeof poolGrantSpendCapSchema>;
 
@@ -19,6 +36,10 @@ type SpendRule = {
   period: string;
 };
 
+function serializeLimit(value: SpendRule["limitValue"]): string {
+  return new Prisma.Decimal(String(value)).toFixed();
+}
+
 /** Active POOL_GRANT spend rule, or null when the grant has no cap. */
 export function serializePoolGrantSpendCap(
   policies: readonly { Rules: readonly SpendRule[] }[] | undefined,
@@ -27,7 +48,7 @@ export function serializePoolGrantSpendCap(
   if (!rule?.limitValue || !rule.currency) return null;
   if (rule.period !== "UTC_DAY" && rule.period !== "UTC_MONTH") return null;
   return {
-    limit: String(rule.limitValue),
+    limit: serializeLimit(rule.limitValue),
     currency: rule.currency,
     period: rule.period,
   };
@@ -35,18 +56,62 @@ export function serializePoolGrantSpendCap(
 
 function sameSpendCap(policy: { Rules: readonly SpendRule[] }, spend: PoolGrantSpendCap): boolean {
   const rule = policy.Rules[0];
-  return (
-    policy.Rules.length === 1 &&
-    rule !== undefined &&
-    rule.period === spend.period &&
-    rule.currency === spend.currency &&
-    String(rule.limitValue ?? "") === spend.limit
+  if (policy.Rules.length !== 1 || rule === undefined) return false;
+  if (rule.period !== spend.period || rule.currency !== spend.currency || !rule.limitValue)
+    return false;
+  try {
+    return new Prisma.Decimal(String(rule.limitValue)).equals(new Prisma.Decimal(spend.limit));
+  } catch {
+    return false;
+  }
+}
+
+export function grantSpendFenceKey(poolId: string, granteeUserId: string): string {
+  return `${poolId}:${granteeUserId}`;
+}
+
+/**
+ * Unique overflow pricing currency on the pool, if every attached public
+ * member agrees. Mixed or missing pricing leaves the caller's currency.
+ */
+export async function resolvePoolSpendCurrency(
+  tx: Prisma.TransactionClient,
+  input: { userId: string; poolId: string },
+): Promise<string | null> {
+  const members = await tx.poolMember.findMany({
+    where: {
+      poolId: input.poolId,
+      ModelPool: { userId: input.userId },
+      tier: "PUBLIC_OVERFLOW",
+    },
+    select: {
+      ExecutionTarget: {
+        select: {
+          ProviderModel: {
+            select: {
+              PricingVersions: {
+                where: { status: { in: ["ACTIVE", "RETIRED"] } },
+                orderBy: { effectiveAt: "desc" },
+                take: 1,
+                select: { currency: true },
+              },
+            },
+          },
+        },
+      },
+    },
+  });
+  const currencies = new Set(
+    members
+      .map((member) => member.ExecutionTarget?.ProviderModel?.PricingVersions[0]?.currency)
+      .filter((currency): currency is string => Boolean(currency)),
   );
+  return currencies.size === 1 ? [...currencies][0]! : null;
 }
 
 /**
  * Activate, replace, or clear the POOL_GRANT spend cap. Caller must already
- * hold the owner fence and `fences.budgetGrant(userId, poolGrantId)`.
+ * hold the owner fence and `fences.budgetGrant(userId, poolId, granteeUserId)`.
  */
 export async function upsertPoolGrantSpendCap(
   tx: Prisma.TransactionClient,
@@ -54,14 +119,23 @@ export async function upsertPoolGrantSpendCap(
     userId: string;
     poolId: string;
     poolGrantId: string;
+    granteeUserId: string;
     spend: PoolGrantSpendCap | null;
   },
 ): Promise<void> {
+  if (input.spend) {
+    const poolCurrency = await resolvePoolSpendCurrency(tx, input);
+    if (poolCurrency && input.spend.currency !== poolCurrency)
+      throw new ORPCError("BAD_REQUEST", {
+        message: `Spend cap currency must be ${poolCurrency}.`,
+      });
+  }
   const latest = await tx.providerBudgetPolicy.findFirst({
     where: {
       userId: input.userId,
       scopeType: "POOL_GRANT",
-      poolGrantId: input.poolGrantId,
+      poolId: input.poolId,
+      granteeUserId: input.granteeUserId,
     },
     orderBy: { version: "desc" },
     include: { Rules: true },
@@ -97,6 +171,7 @@ export async function upsertPoolGrantSpendCap(
       poolId: input.poolId,
       providerModelId: null,
       poolGrantId: input.poolGrantId,
+      granteeUserId: input.granteeUserId,
       version: (latest?.version ?? 0) + 1,
       active: true,
       activatedAt: new Date(),

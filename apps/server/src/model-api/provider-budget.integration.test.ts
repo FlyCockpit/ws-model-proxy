@@ -1396,6 +1396,7 @@ integration("provider budget admission and reconciliation", () => {
         poolId: row.poolId,
         providerModelId: null,
         poolGrantId: grant.id,
+        granteeUserId: grantee.id,
         active: true,
         activatedAt: new Date(Date.now() - 86_400_000),
         Rules: {
@@ -1425,6 +1426,7 @@ integration("provider budget admission and reconciliation", () => {
     const spendAttempt = (id: string, spend: string, poolGrantId?: string) => ({
       ...attempt(row, id),
       poolGrantId,
+      granteeUserId: poolGrantId ? grantee.id : undefined,
       liability: {
         spend,
         currency: "USD",

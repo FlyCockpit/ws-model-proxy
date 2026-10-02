@@ -942,51 +942,13 @@ describe("providerManagementRouter security boundary", () => {
     });
   });
 
-  it("creates a POOL_GRANT spend cap keyed by poolGrantId without an account", async () => {
+  it("rejects POOL_GRANT create; grant spend caps use updatePoolGrant", async () => {
     envMock.enabled = true;
-    db.poolGrant.findFirst.mockResolvedValue({ id: "grant", poolId: "pool" });
-    db.providerBudgetPolicy.create.mockResolvedValue({ id: "grant-cap", Rules: [] });
-    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
     const client = createRouterClient(providerManagementRouter, { context });
-    await client.createBudgetPolicy({
-      scopeType: "POOL_GRANT",
-      providerAccountId: null,
-      providerModelId: null,
-      poolId: "pool",
-      poolGrantId: "grant",
-      active: true,
-      rules: [
-        {
-          metric: "SPEND",
-          period: "UTC_MONTH",
-          mode: "LIMITED",
-          limitValue: "25.5",
-          currency: "USD",
-        },
-      ],
-    });
-    expect(db.providerBudgetPolicy.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        scopeType: "POOL_GRANT",
-        providerAccountId: null,
-        poolId: "pool",
-        providerModelId: null,
-        poolGrantId: "grant",
-        active: true,
-      }),
-      include: { Rules: true },
-    });
-    expect(db.providerAuditEvent.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        userId: "owner",
-        action: "BUDGET_CREATED",
-        subjectId: "grant-cap",
-      }),
-    });
     await expect(
       client.createBudgetPolicy({
         scopeType: "POOL_GRANT",
-        providerAccountId: "account",
+        providerAccountId: null,
         providerModelId: null,
         poolId: "pool",
         poolGrantId: "grant",
@@ -1002,9 +964,29 @@ describe("providerManagementRouter security boundary", () => {
         ],
       }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.providerBudgetPolicy.create).not.toHaveBeenCalled();
     await expect(
       client.createBudgetPolicy({
-        scopeType: "POOL_GRANT",
+        scopeType: "PROVIDER_ACCOUNT",
+        providerAccountId: "account",
+        providerModelId: null,
+        poolId: null,
+        poolGrantId: "grant",
+        active: true,
+        rules: [
+          {
+            metric: "SPEND",
+            period: "UTC_MONTH",
+            mode: "LIMITED",
+            limitValue: "25.5",
+            currency: "USD",
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(
+      client.createBudgetPolicy({
+        scopeType: "PROVIDER_ACCOUNT",
         providerAccountId: null,
         providerModelId: null,
         poolId: "pool",
