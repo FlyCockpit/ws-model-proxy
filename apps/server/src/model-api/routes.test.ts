@@ -627,6 +627,7 @@ function poolMemberRow({
       externalAfterWaitMs,
       cacheHolderWaitMs,
       protectionEnabled: true,
+      evictionFeedbackEnabled: true,
       protectionWindowSeconds: 300,
       protectMinTokens: 8192,
       protectionShare: "EQUAL_SHARE" as const,

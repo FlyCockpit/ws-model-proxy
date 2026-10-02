@@ -1654,6 +1654,7 @@ const validPercent = (percent: number) =>
 
 function protectionSettingsFromForm(value: {
   protectionEnabled: boolean;
+  evictionFeedbackEnabled: boolean;
   protectionWindowSeconds: number;
   protectMinTokens: number;
   protectionShare: "EQUAL_SHARE" | "FIRST_COME" | "FIXED_PERCENT";
@@ -1663,6 +1664,7 @@ function protectionSettingsFromForm(value: {
 }) {
   return {
     protectionEnabled: value.protectionEnabled,
+    evictionFeedbackEnabled: value.evictionFeedbackEnabled,
     protectionWindowSeconds: value.protectionWindowSeconds,
     protectMinTokens: value.protectMinTokens,
     protectionShare: value.protectionShare,
@@ -1764,6 +1766,7 @@ export function PoolForm({
       cacheHolderWaitMode: z.enum(["AUTO", "FIXED"]),
       cacheHolderWaitMs: z.number().int().min(0).max(30_000),
       protectionEnabled: z.boolean(),
+      evictionFeedbackEnabled: z.boolean(),
       protectionWindowSeconds: z.number().int().min(1).max(3600),
       protectMinTokens: z.number().int().min(0).max(10_000_000),
       protectionShare: z.enum(["EQUAL_SHARE", "FIRST_COME", "FIXED_PERCENT"]),
@@ -1865,6 +1868,7 @@ export function PoolForm({
       cacheHolderWaitMs: pool?.cacheHolderWaitMs ?? 2_000,
       // S-C warm-session protection ("Protect active conversations").
       protectionEnabled: pool?.protection.enabled ?? true,
+      evictionFeedbackEnabled: pool?.protection.evictionFeedbackEnabled ?? true,
       protectionWindowSeconds: pool?.protection.windowSeconds ?? 300,
       protectMinTokens: pool?.protection.minTokens ?? 8192,
       protectionShare: (pool?.protection.share ?? "EQUAL_SHARE") as
@@ -2285,6 +2289,22 @@ export function PoolForm({
               </label>
             )}
           </form.Field>
+          <form.Field name="evictionFeedbackEnabled">
+            {(field) => (
+              <label className="flex min-h-11 items-center gap-3 text-sm">
+                <input
+                  type="checkbox"
+                  className="size-4"
+                  checked={field.state.value}
+                  onChange={(event) => field.handleChange(event.target.checked)}
+                />
+                {t("dashboard:pools.protection.evictionFeedback")}
+              </label>
+            )}
+          </form.Field>
+          <p className="mb-3 text-xs text-muted-foreground">
+            {t("dashboard:pools.protection.evictionFeedbackHint")}
+          </p>
           <div className="mt-3 grid gap-4 sm:grid-cols-2">
             <form.Field name="protectionWindowSeconds">
               {(field) => (

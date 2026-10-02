@@ -356,7 +356,9 @@ admission; after the external attempt they are ordinary (last) candidates.
 Protection is on by default. The pool's routing tab ("Protect active
 conversations"), `forwarderManagement.updateModelPool` and the
 `forwarder_model_pool_update` MCP tool set `protectionEnabled`,
-`protectionWindowSeconds` (1–3600), `protectMinTokens`, and how one member's
+`evictionFeedbackEnabled` (on by default; off freezes the current effective
+KV budget while protection stays on), `protectionWindowSeconds` (1–3600),
+`protectMinTokens`, and how one member's
 capacity is shared between the people whose sessions are warm
 (`protectionShare`):
 

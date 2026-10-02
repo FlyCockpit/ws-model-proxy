@@ -261,6 +261,8 @@ const poolFallbackFields = {
  */
 const poolProtectionFields = {
   protectionEnabled: z.boolean().optional(),
+  /** Keep protection but freeze eviction-derived effective K. Default on. */
+  evictionFeedbackEnabled: z.boolean().optional(),
   /** Only sessions used within this window are protected (seconds). */
   protectionWindowSeconds: z.number().int().min(1).max(3600).optional(),
   /** Only sessions of at least this many prompt tokens are protected. */
@@ -1020,6 +1022,7 @@ function serializePool(row: ModelPoolRow) {
     cacheHolderWaitMs: row.cacheHolderWaitMs,
     protection: {
       enabled: row.protectionEnabled,
+      evictionFeedbackEnabled: row.evictionFeedbackEnabled,
       windowSeconds: row.protectionWindowSeconds,
       minTokens: row.protectMinTokens,
       share: row.protectionShare,
@@ -1542,6 +1545,7 @@ const poolSelect = {
   affinityResidencyWeight: true,
   cacheHolderWaitMs: true,
   protectionEnabled: true,
+  evictionFeedbackEnabled: true,
   protectionWindowSeconds: true,
   protectMinTokens: true,
   protectionShare: true,
@@ -2994,6 +2998,7 @@ export const forwarderManagementRouter = {
         affinityResidencyWeight: input.affinityResidencyWeight ?? 100,
         cacheHolderWaitMs: input.cacheHolderWaitMs ?? null,
         protectionEnabled: input.protectionEnabled ?? true,
+        evictionFeedbackEnabled: input.evictionFeedbackEnabled ?? true,
         protectionWindowSeconds: input.protectionWindowSeconds ?? 300,
         protectMinTokens: input.protectMinTokens ?? 8192,
         protectionShare: protectionShare.protectionShare ?? "EQUAL_SHARE",
@@ -3280,6 +3285,9 @@ export const forwarderManagementRouter = {
               : {}),
             ...(input.protectionEnabled !== undefined
               ? { protectionEnabled: input.protectionEnabled }
+              : {}),
+            ...(input.evictionFeedbackEnabled !== undefined
+              ? { evictionFeedbackEnabled: input.evictionFeedbackEnabled }
               : {}),
             ...(input.protectionWindowSeconds !== undefined
               ? { protectionWindowSeconds: input.protectionWindowSeconds }

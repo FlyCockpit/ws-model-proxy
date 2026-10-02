@@ -686,6 +686,7 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
         externalAfterWaitMs: 500,
         cacheHolderWaitMs: 1_500,
         protectionEnabled: true,
+        evictionFeedbackEnabled: true,
         protectionWindowSeconds: 300,
         protectMinTokens: 8192,
         protectionShare: "FIXED_PERCENT",

@@ -83,6 +83,8 @@ export type ProtectionShareMode = "EQUAL_SHARE" | "FIRST_COME" | "FIXED_PERCENT"
 
 export type WarmProtectionPolicy = {
   enabled: boolean;
+  /** Default true. False freezes effective K: no new cuts, stored state kept. */
+  evictionFeedbackEnabled?: boolean;
   windowSeconds: number;
   minTokens: number;
   share: ProtectionShareMode;

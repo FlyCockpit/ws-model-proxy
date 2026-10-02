@@ -62,6 +62,7 @@ function isQualifyingContinuation({
 }): boolean {
   return (
     policy.enabled &&
+    (policy.evictionFeedbackEnabled ?? true) &&
     protectionKvBudgetTokens(engineKind, kvBudgetTokens) !== null &&
     ok &&
     usage.cacheReadTokens !== null &&

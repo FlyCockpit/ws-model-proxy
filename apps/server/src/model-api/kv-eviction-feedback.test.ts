@@ -50,6 +50,11 @@ describe("eviction evidence", () => {
       patch: { policy: { ...valid.policy, enabled: false } },
       expected: false,
     },
+    {
+      name: "frozen eviction feedback",
+      patch: { policy: { ...valid.policy, evictionFeedbackEnabled: false } },
+      expected: false,
+    },
     { name: "llama.cpp", patch: { engineKind: "LLAMA_CPP" as const }, expected: false },
     ...[null, 0, -1, Number.NaN, Number.POSITIVE_INFINITY].map((kvBudgetTokens) => ({
       name: `slot mode ${kvBudgetTokens}`,
@@ -149,6 +154,20 @@ describe("eviction evidence", () => {
         evidence: { ...valid.evidence!, tokens: 18_000 },
       }),
     ).toBe(false);
+  });
+
+  it("freeze holds K: misses are not evidence until unfrozen", () => {
+    const frozen = { ...valid, policy: { ...valid.policy, evictionFeedbackEnabled: false } };
+    expect(qualifiesAsEvictionEvidence(frozen)).toBe(false);
+    expect(
+      qualifiesAsEvictionEvidence({ ...frozen, policy: { ...valid.policy, enabled: false } }),
+    ).toBe(false);
+    expect(
+      qualifiesAsEvictionEvidence({
+        ...frozen,
+        policy: { ...valid.policy, evictionFeedbackEnabled: true },
+      }),
+    ).toBe(true);
   });
 
   it("reasoning follow-up with large C is not evidence when cache read covers P", () => {

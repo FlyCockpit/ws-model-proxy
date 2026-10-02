@@ -231,6 +231,7 @@ function poolRow(overrides: Record<string, unknown> = {}) {
     recommendedSurfaceOverride: null,
     cacheHolderWaitMs: null,
     protectionEnabled: true,
+    evictionFeedbackEnabled: true,
     protectionWindowSeconds: 300,
     protectMinTokens: 8192,
     protectionShare: "EQUAL_SHARE",
@@ -2257,6 +2258,10 @@ describe("forwarderManagementRouter", () => {
       protectionFixedPercent: 25,
       ownerProtectionPercent: 0,
     });
+    await client().updateModelPool({ id: "pool-id", evictionFeedbackEnabled: false });
+    expect(lastUpdate()).toMatchObject({ evictionFeedbackEnabled: false });
+    await client().updateModelPool({ id: "pool-id", evictionFeedbackEnabled: true });
+    expect(lastUpdate()).toMatchObject({ evictionFeedbackEnabled: true });
     // FIXED_PERCENT needs a percent; any other mode stores none.
     await expect(
       client().updateModelPool({ id: "pool-id", protectionShare: "FIXED_PERCENT" }),
@@ -2300,6 +2305,7 @@ describe("forwarderManagementRouter", () => {
       (db.modelPool.create.mock.calls.at(-1)![0] as { data: Record<string, unknown> }).data,
     ).toMatchObject({
       protectionEnabled: true,
+      evictionFeedbackEnabled: true,
       protectionWindowSeconds: 300,
       protectMinTokens: 8192,
       protectionShare: "EQUAL_SHARE",

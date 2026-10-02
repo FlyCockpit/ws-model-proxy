@@ -907,6 +907,7 @@ const poolMemberRelaySelect = {
       externalAfterWaitMs: true,
       cacheHolderWaitMs: true,
       protectionEnabled: true,
+      evictionFeedbackEnabled: true,
       protectionWindowSeconds: true,
       protectMinTokens: true,
       protectionShare: true,
@@ -1112,6 +1113,7 @@ function warmProtectionPolicyForMember(
   const pool = member?.ModelPool;
   return {
     enabled: pool?.protectionEnabled ?? false,
+    evictionFeedbackEnabled: pool?.evictionFeedbackEnabled ?? true,
     windowSeconds: pool?.protectionWindowSeconds ?? 300,
     minTokens: pool?.protectMinTokens ?? 8192,
     share: pool?.protectionShare ?? "EQUAL_SHARE",

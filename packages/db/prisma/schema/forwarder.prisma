@@ -1066,6 +1066,9 @@ model ModelPool {
   /// member (or, for `:external`, an
   /// external route) can take it. Redirect-only: it never blocks or queues.
   protectionEnabled               Boolean                       @default(true)
+  /// When false, protection stays on but eviction evidence stops moving
+  /// effective K. Unfreeze resumes decay and cuts from the stored state.
+  evictionFeedbackEnabled         Boolean                       @default(true)
   /// A session is protected only when used within this many seconds.
   protectionWindowSeconds         Int                           @default(300)
   /// A session is protected only when its prompt is at least this many tokens.
