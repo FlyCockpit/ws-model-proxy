@@ -14,6 +14,7 @@ import { z } from "zod";
 import {
   assertEffectiveConcurrencyPolicy,
   type CapacityPolicyFailureReasons,
+  type PoolPolicyFieldNames,
 } from "../lib/capacity-policy-safety";
 import type { GuardedPoolCreateFailureReason } from "../lib/guarded-pool-create-reasons";
 import {
@@ -210,8 +211,9 @@ export function assertConcurrencyPolicyWithinHardLimit(
     memberReserved?: number | null;
   },
   reasons?: CapacityPolicyFailureReasons,
+  fields?: PoolPolicyFieldNames,
 ): void {
-  assertEffectiveConcurrencyPolicy(input, reasons);
+  assertEffectiveConcurrencyPolicy(input, reasons, fields);
 }
 
 /** MCP list page size. A short page is the end; `nextCursor` continues. */

@@ -3333,9 +3333,9 @@ mod tests {
 }
 
 /// Cross-language vectors shared with `apps/server/src/relay/protocol.test.ts`:
-/// the server's strict 2.7 schemas must accept exactly what this CLI encodes.
+/// the server's strict 2.4 schemas must accept exactly what this CLI encodes.
 #[cfg(test)]
-mod relay_27_vectors {
+mod relay_24_vectors {
     use super::*;
     use crate::config::{ModelConfig, ProbeSnapshot, ProbeStatus};
     use crate::engine::{DetectedEngine, EngineKind, LoadSource};
@@ -3991,12 +3991,12 @@ mod relay_27_vectors {
     }
 }
 
-/// Relay 2.8 file frames, checked against the shared vectors in
+/// Relay 2.4 file frames, checked against the shared vectors in
 /// `tests/fixtures/relay-2.4/` that `apps/server/src/relay/file-protocol.test.ts`
 /// parses with its strict schemas: server-to-CLI frames must decode to exactly
 /// the vector's values, CLI-to-server frames must encode to exactly them.
 #[cfg(test)]
-mod relay_28_vectors {
+mod relay_24_file_vectors {
     use super::*;
 
     const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/relay-2.4");

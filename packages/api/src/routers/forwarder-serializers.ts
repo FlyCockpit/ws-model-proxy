@@ -1036,13 +1036,18 @@ export function serializePool(row: ModelPoolRow) {
   };
 }
 
+/** MCP pool-summary rows cap grants/members; full lists live on getModelPool. */
+export const POOL_SUMMARY_INLINE_CAP = 20;
+
 /** MCP pool list row: identity, grants, and member endpoint slugs. No models. */
 export function serializePoolSummary(row: PoolSummaryRow) {
   return {
     id: row.id,
     slug: row.slug,
     name: row.name,
-    grants: row.PoolGrants.map((grant) => ({
+    grantCount: row.PoolGrants.length,
+    memberCount: row.PoolMembers.length,
+    grants: row.PoolGrants.slice(0, POOL_SUMMARY_INLINE_CAP).map((grant) => ({
       id: grant.id,
       createdAt: grant.createdAt,
       granteeUserId: grant.granteeUserId,
@@ -1056,7 +1061,7 @@ export function serializePoolSummary(row: PoolSummaryRow) {
         ),
       ),
     })),
-    members: row.PoolMembers.map((member) => {
+    members: row.PoolMembers.slice(0, POOL_SUMMARY_INLINE_CAP).map((member) => {
       const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
       const provider = member.ExecutionTarget?.ProviderModel;
       return {

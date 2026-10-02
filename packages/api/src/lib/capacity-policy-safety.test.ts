@@ -7,6 +7,7 @@ import {
   assertModelPoolCapacityPolicy,
   fenceExecutionTargetIdentities,
   fenceExecutionTargetPolicies,
+  GUARDED_CREATE_POLICY_FIELDS,
 } from "./capacity-policy-safety";
 
 function thrownBy(action: () => void): ORPCError {
@@ -258,6 +259,23 @@ describe("capacity policy safety", () => {
         }),
       ).data,
     ).toEqual({ fields: ["capacityReservedSlots", "capacityConcurrencyLimit"] });
+    expect(
+      thrownBy(() =>
+        assertModelPoolCapacityPolicy(
+          {
+            concurrencyLimit: 2,
+            reservedSlots: 3,
+            contextCeiling: null,
+            contextMargin: 0,
+          },
+          "POOL_POLICY_INVALID",
+          GUARDED_CREATE_POLICY_FIELDS,
+        ),
+      ).data,
+    ).toEqual({
+      reason: "POOL_POLICY_INVALID",
+      fields: ["reservedSlots", "memberConcurrencyLimit"],
+    });
     expect(
       thrownBy(() =>
         assertModelPoolCapacityPolicy({

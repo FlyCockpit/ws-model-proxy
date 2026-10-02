@@ -6,6 +6,42 @@ import type { GuardedPoolCreateFailureReason } from "./guarded-pool-create-reaso
 
 export type CapacityLimitMode = "INHERIT" | "LIMITED" | "UNLIMITED";
 
+/** Input-key names reported in `data.fields` for pool policy rejections. */
+export type PoolPolicyFieldNames = {
+  reservedSlots: string;
+  concurrencyLimit: string;
+  contextMargin: string;
+  contextCeiling: string;
+};
+
+export const DEFAULT_POOL_POLICY_FIELDS: PoolPolicyFieldNames = {
+  reservedSlots: "capacityReservedSlots",
+  concurrencyLimit: "capacityConcurrencyLimit",
+  contextMargin: "capacityContextMargin",
+  contextCeiling: "capacityContextCeiling",
+};
+
+/** Guarded pool create input keys (#200). */
+export const GUARDED_CREATE_POLICY_FIELDS: PoolPolicyFieldNames = {
+  reservedSlots: "reservedSlots",
+  concurrencyLimit: "memberConcurrencyLimit",
+  contextMargin: "advanced.contextMargin",
+  contextCeiling: "memberContextCeiling",
+};
+
+function namedPolicyFields(
+  fields: readonly string[],
+  names: PoolPolicyFieldNames = DEFAULT_POOL_POLICY_FIELDS,
+): string[] {
+  const map: Record<string, string> = {
+    capacityReservedSlots: names.reservedSlots,
+    capacityConcurrencyLimit: names.concurrencyLimit,
+    capacityContextMargin: names.contextMargin,
+    capacityContextCeiling: names.contextCeiling,
+  };
+  return fields.map((field) => map[field] ?? field);
+}
+
 /**
  * Optional, caller-supplied machine-readable failure reasons. Shared helpers
  * stay generic for their other callers; procedures that surface curated
@@ -80,19 +116,20 @@ export function assertModelPoolCapacityPolicy(
     contextMargin: number | undefined;
   },
   reason?: GuardedPoolCreateFailureReason,
+  fields?: PoolPolicyFieldNames,
 ): void {
   const reserved = input.reservedSlots ?? 0;
   const margin = input.contextMargin ?? 0;
   if (input.concurrencyLimit != null && reserved > input.concurrencyLimit)
     rejectPolicy(
       "Reserved slots exceed the pool concurrency limit.",
-      ["capacityReservedSlots", "capacityConcurrencyLimit"],
+      namedPolicyFields(["capacityReservedSlots", "capacityConcurrencyLimit"], fields),
       reason,
     );
   if (input.contextCeiling != null && margin >= input.contextCeiling)
     rejectPolicy(
       "Pool context margin must be smaller than the context ceiling.",
-      ["capacityContextMargin", "capacityContextCeiling"],
+      namedPolicyFields(["capacityContextMargin", "capacityContextCeiling"], fields),
       reason,
     );
 }
@@ -185,6 +222,7 @@ export function assertEffectiveConcurrencyPolicy(
     memberReserved?: number | null;
   },
   reasons?: CapacityPolicyFailureReasons,
+  fields?: PoolPolicyFieldNames,
 ): void {
   const effectiveLimit =
     input.memberMode === "LIMITED"
@@ -196,20 +234,26 @@ export function assertEffectiveConcurrencyPolicy(
   if (effectiveLimit != null && effectiveReserved > effectiveLimit)
     rejectPolicy(
       "Reserved slots exceed the effective concurrency limit.",
-      ["capacityReservedSlots", "capacityConcurrencyLimit"],
+      namedPolicyFields(["capacityReservedSlots", "capacityConcurrencyLimit"], fields),
       reasons?.reservedExceeds,
     );
   if (input.hardLimit == null) return;
   if (effectiveLimit != null && effectiveLimit > input.hardLimit)
     rejectPolicy(
       "Effective concurrency limit exceeds physical capacity.",
-      ["capacityConcurrencyLimit", "hardConcurrencyLimit", "directConcurrencyLimit"],
+      namedPolicyFields(
+        ["capacityConcurrencyLimit", "hardConcurrencyLimit", "directConcurrencyLimit"],
+        fields,
+      ),
       reasons?.concurrencyExceedsPhysical,
     );
   if (effectiveReserved > input.hardLimit)
     rejectPolicy(
       "Reserved slots exceed physical concurrency capacity.",
-      ["capacityReservedSlots", "hardConcurrencyLimit", "directReservedSlots"],
+      namedPolicyFields(
+        ["capacityReservedSlots", "hardConcurrencyLimit", "directReservedSlots"],
+        fields,
+      ),
       reasons?.reservedExceedsPhysical,
     );
 }
@@ -224,6 +268,7 @@ export function assertEffectiveContextPolicy(
     memberMargin?: number | null;
   },
   reasons?: EffectiveContextPolicyFailureReasons,
+  fields?: PoolPolicyFieldNames,
 ): void {
   const ceiling =
     input.memberMode === "LIMITED"
@@ -235,12 +280,15 @@ export function assertEffectiveContextPolicy(
   if (ceiling != null && margin >= ceiling)
     rejectPolicy(
       "Context margin must be smaller than the effective context ceiling.",
-      [
-        "capacityContextMargin",
-        "capacityContextCeiling",
-        "directContextMargin",
-        "directContextCeiling",
-      ],
+      namedPolicyFields(
+        [
+          "capacityContextMargin",
+          "capacityContextCeiling",
+          "directContextMargin",
+          "directContextCeiling",
+        ],
+        fields,
+      ),
       reasons?.marginExceedsCeiling,
     );
   if (
@@ -250,13 +298,16 @@ export function assertEffectiveContextPolicy(
   )
     rejectPolicy(
       "Effective context policy exceeds physical capacity.",
-      [
-        "capacityContextCeiling",
-        "capacityContextMargin",
-        "directContextCeiling",
-        "directContextMargin",
-        "physicalMaxContext",
-      ],
+      namedPolicyFields(
+        [
+          "capacityContextCeiling",
+          "capacityContextMargin",
+          "directContextCeiling",
+          "directContextMargin",
+          "physicalMaxContext",
+        ],
+        fields,
+      ),
       reasons?.exceedsPhysical,
     );
 }

@@ -1243,6 +1243,8 @@ impl RecoveryDir {
             }
             return Err(if errno == Errno::EEXIST {
                 FileError::errno(Errno::EEXIST)
+            } else if errno == Errno::EINVAL {
+                FileError::invalid("destination name is not valid on this filesystem")
             } else if is_link_unsupported(errno) {
                 FileError::unsafe_filesystem()
             } else {

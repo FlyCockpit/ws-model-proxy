@@ -7,6 +7,7 @@ import { protectedProcedure } from "../index";
 import {
   assertEffectiveContextPolicy,
   assertModelPoolCapacityPolicy,
+  GUARDED_CREATE_POLICY_FIELDS,
 } from "../lib/capacity-policy-safety";
 import {
   type ContextWindowSeedDependent,
@@ -281,6 +282,7 @@ const guardedPoolProcedures = {
           contextMargin: input.advanced?.contextMargin,
         },
         "POOL_POLICY_INVALID",
+        GUARDED_CREATE_POLICY_FIELDS,
       );
       const userId = context.session.user.id;
       await assertPoolSlugAvailable(input.slug, userId, undefined, {
@@ -451,6 +453,7 @@ const guardedPoolProcedures = {
               reservedExceedsPhysical: "RESERVED_EXCEEDS_PHYSICAL",
               concurrencyExceedsPhysical: "CONCURRENCY_EXCEEDS_PHYSICAL",
             },
+            GUARDED_CREATE_POLICY_FIELDS,
           );
           if (!override) continue;
           if (
@@ -606,6 +609,7 @@ const guardedPoolProcedures = {
               marginExceedsCeiling: "CONTEXT_MARGIN_EXCEEDS_CEILING",
               exceedsPhysical: "CONTEXT_EXCEEDS_PHYSICAL",
             },
+            GUARDED_CREATE_POLICY_FIELDS,
           );
         }
         if (
@@ -635,6 +639,7 @@ const guardedPoolProcedures = {
               reservedExceedsPhysical: "RESERVED_EXCEEDS_PHYSICAL",
               concurrencyExceedsPhysical: "CONCURRENCY_EXCEEDS_PHYSICAL",
             },
+            GUARDED_CREATE_POLICY_FIELDS,
           );
         }
         const pool = await tx.modelPool.create({

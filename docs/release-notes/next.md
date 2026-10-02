@@ -177,6 +177,13 @@ caller waits the full local budget. MCP:
   30-minute rings. New keys at the 2000-ring (or 64-per-device) cap are refused
   while existing live rings stay; rings older than the window are pruned.
 - **MCP `fields` for nested argument errors are dotted paths** (`rules.0.threshold`).
+  Guarded pool-create policy errors name the create input keys (`reservedSlots`,
+  `memberConcurrencyLimit`, `memberContextCeiling`, `advanced.contextMargin`).
+- **Callers that match `context_exceeded` must switch to `context_length_exceeded`.**
+  Grant spend caps use the pool's pricing currency (`POOL_GRANT` scope). OpenRouter
+  inventories may declare Chat Completions, Responses, and Anthropic Messages.
+- **Prefix-cache resets send `delta = current` with `prefixCacheReset`.** A dropped
+  reset frame is retried on the next scrape so post-restart counts are not lost.
 
 ## Post-deploy verification
 

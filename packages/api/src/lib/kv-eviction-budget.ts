@@ -39,8 +39,6 @@ export type KvEvictionState = {
   sessionIds?: string[];
   missCount?: number;
   continuationCount?: number;
-  /** @deprecated unique sessions live in `sessionIds`. */
-  lastSessionId?: string | null;
 };
 
 /** Writers treat an expired row as absent, matching readers (`expiresAt > now`). */
@@ -108,7 +106,6 @@ function emptyKvEvictionState(now: Date): KvEvictionState {
 
 function sessionSet(state: KvEvictionState | null | undefined): string[] {
   if (state?.sessionIds && state.sessionIds.length > 0) return [...state.sessionIds];
-  if (state?.lastSessionId) return [state.lastSessionId];
   return [];
 }
 

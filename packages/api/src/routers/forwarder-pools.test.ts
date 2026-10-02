@@ -3350,6 +3350,8 @@ describe("MCP pool summaries", () => {
         id: "pool-id",
         slug: "general",
         name: "General",
+        grantCount: 1,
+        memberCount: 2,
         grants: [
           {
             id: "grant-id",

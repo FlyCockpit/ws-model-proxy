@@ -128,7 +128,7 @@ function holdNextRegistration() {
   return { started, release: () => release?.() };
 }
 
-function capabilities26(features?: {
+function helloCapabilities(features?: {
   humanTerminal?: boolean;
   mcpCommandMode?: "off" | "supervised" | "unsupervised";
   terminalApproval?: boolean;
@@ -182,7 +182,7 @@ function helloFrame(socket?: FakeSocket) {
       identityPublicKey: testIdentity.publicKey,
       identitySignature: testIdentity.sign(nonce, "desktop"),
       capabilities: {
-        ...capabilities26(),
+        ...helloCapabilities(),
       },
     },
     endpoints: [
@@ -1667,7 +1667,7 @@ describe("RelaySessionManager", () => {
         slug: "desktop",
         hostname: "desk-01.local",
         identityPublicKey: testIdentity.publicKey,
-        capabilities: capabilities26(),
+        capabilities: helloCapabilities(),
       },
       endpoints: [
         {
@@ -2053,7 +2053,7 @@ function helloCli(
       identityPublicKey: testIdentity.publicKey,
       identitySignature: testIdentity.sign(nonce, "desktop"),
       version: "9.9.9",
-      capabilities: capabilities26(features),
+      capabilities: helloCapabilities(features),
     },
     endpoints: [],
   });
