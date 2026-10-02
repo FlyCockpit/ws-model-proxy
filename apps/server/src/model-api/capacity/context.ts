@@ -72,17 +72,19 @@ export async function countSerializedRequestContext({
   };
 }
 
-export function contextFitsLimits({
-  count,
+export function contextTokensFitCeiling({
+  tokens,
   physicalMaxContext,
   effectiveContextCeiling,
   contextMargin = 0,
 }: {
-  count: ContextCount;
+  tokens: number;
   physicalMaxContext?: number | null;
   effectiveContextCeiling?: number | null;
   contextMargin?: number;
 }): boolean {
+  if (!Number.isSafeInteger(tokens) || tokens < 0)
+    throw new RangeError("Context token count must be a nonnegative safe integer.");
   if (!Number.isSafeInteger(contextMargin) || contextMargin < 0)
     throw new RangeError("Context margin must be a nonnegative safe integer.");
   const limits = [physicalMaxContext, effectiveContextCeiling].filter(
@@ -93,7 +95,29 @@ export function contextFitsLimits({
       throw new RangeError("Context ceilings must be positive safe integers.");
   }
   const ceiling = limits.length ? Math.min(...limits) : null;
-  return ceiling === null || count.tokens + contextMargin <= ceiling;
+  return ceiling === null || tokens + contextMargin <= ceiling;
+}
+
+export function contextFitsLimits({
+  count,
+  physicalMaxContext,
+  effectiveContextCeiling,
+  contextMargin = 0,
+}: {
+  count: ContextCount & { mediaTokens?: number };
+  physicalMaxContext?: number | null;
+  effectiveContextCeiling?: number | null;
+  contextMargin?: number;
+}): boolean {
+  // Document/image estimates overstate PDFs and unknown media. They rank and
+  // route; only a native exact count may fail closed near the ceiling.
+  const tokens = count.exact ? count.tokens : Math.max(0, count.tokens - (count.mediaTokens ?? 0));
+  return contextTokensFitCeiling({
+    tokens,
+    physicalMaxContext,
+    effectiveContextCeiling,
+    contextMargin,
+  });
 }
 
 export async function countContext({

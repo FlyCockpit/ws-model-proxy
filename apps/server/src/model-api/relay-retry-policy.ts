@@ -24,11 +24,20 @@ const OVERFLOW_MESSAGE_START = [
   /^requested token count exceeds/i,
   /^the input length exceeds the context window/i,
   /^exceed_context_size_error/i,
+  /^'max_tokens' or 'max_completion_tokens' is too large/i,
+  /^the decoder prompt \(length \d+\)/i,
+];
+
+const OVERFLOW_MESSAGE_BROAD = [
+  /maximum context length is \d+/i,
+  /max_model_len/i,
+  /maximum model length/i,
 ];
 
 export type EngineContextOverflowClassification = {
   overflow: boolean;
   promptTokens: number | null;
+  requestedTokens: number | null;
   contextLength: number | null;
   snippet: string;
 };
@@ -66,17 +75,36 @@ function firstLine(text: string): string {
 
 function extractOverflowTokenCounts(text: string): {
   promptTokens: number | null;
+  requestedTokens: number | null;
   contextLength: number | null;
 } {
-  const inputMatch = text.match(/input \((\d+) tokens\)/i);
+  const splitMatch = text.match(
+    /you requested (\d+) tokens \((\d+) in the messages, (\d+) in the completion\)/i,
+  );
+  const messagesOnly = text.match(/you requested (\d+) tokens in the messages/i);
+  const requestedOnly = text.match(/you requested (\d+) tokens/i);
+  const decoderPrompt = text.match(/decoder prompt \(length (\d+)\)/i);
+  const inputTokens = text.match(/has (\d+) input tokens/i);
+  const inputParen = text.match(/input \((\d+) tokens\)/i);
   const contextMatch =
     text.match(/context length(?: is)? \((\d+) tokens\)/i) ??
     text.match(/maximum context length is (\d+)/i) ??
+    text.match(/maximum context length of (\d+)/i) ??
+    text.match(/maximum model length of (\d+)/i) ??
     text.match(/context length(?: is)? (\d+)/i);
-  const requestedMatch = text.match(/you requested (\d+) tokens/i);
-  const promptTokens = parseCount(inputMatch?.[1] ?? requestedMatch?.[1]);
-  const contextLength = parseCount(contextMatch?.[1]);
-  return { promptTokens, contextLength };
+  const promptTokens = parseCount(
+    splitMatch?.[2] ??
+      decoderPrompt?.[1] ??
+      inputTokens?.[1] ??
+      inputParen?.[1] ??
+      messagesOnly?.[1],
+  );
+  const requestedTokens = parseCount(splitMatch?.[1] ?? requestedOnly?.[1] ?? messagesOnly?.[1]);
+  return {
+    promptTokens,
+    requestedTokens,
+    contextLength: parseCount(contextMatch?.[1]),
+  };
 }
 
 function parseCount(raw: string | undefined): number | null {
@@ -97,6 +125,7 @@ export function classifyEngineContextOverflow(
   const empty = {
     overflow: false,
     promptTokens: null,
+    requestedTokens: null,
     contextLength: null,
     snippet: "",
   };
@@ -106,17 +135,20 @@ export function classifyEngineContextOverflow(
   const type = fields.type?.toLowerCase();
   const message = fields.message ?? "";
   const detail = fields.detail ?? "";
+  const haystack = `${message} ${detail}`;
   const byCode =
     (code !== undefined && OVERFLOW_CODES.has(code)) ||
     (type !== undefined && OVERFLOW_CODES.has(type));
-  const byMessage = OVERFLOW_MESSAGE_START.some(
-    (pattern) => pattern.test(firstLine(message)) || pattern.test(firstLine(detail)),
-  );
+  const byMessage =
+    OVERFLOW_MESSAGE_START.some(
+      (pattern) => pattern.test(firstLine(message)) || pattern.test(firstLine(detail)),
+    ) || OVERFLOW_MESSAGE_BROAD.some((pattern) => pattern.test(haystack));
   if (!byCode && !byMessage) return empty;
-  const counts = extractOverflowTokenCounts(`${message} ${detail}`);
+  const counts = extractOverflowTokenCounts(haystack);
   return {
     overflow: true,
     promptTokens: counts.promptTokens,
+    requestedTokens: counts.requestedTokens,
     contextLength: counts.contextLength,
     snippet: sanitizeEngineOverflowSnippet(message || detail || bodyText),
   };

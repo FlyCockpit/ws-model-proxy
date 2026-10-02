@@ -1836,9 +1836,16 @@ export function engineCacheConfirmedFromResponseChunks(
   }
 }
 
+const RESPONSES_TERMINAL_EVENTS = new Set([
+  "response.completed",
+  "response.incomplete",
+  "response.failed",
+]);
+
 function classifyTerminalRecord(
   record: SseRecord,
   surface: ProtocolSurface,
+  dialect: ProviderUsageDialect = "generic",
 ): "SUCCESS" | "FAILED" | undefined {
   if (surface === "openai-chat") {
     if (record.data === "[DONE]") return "SUCCESS";
@@ -1852,11 +1859,20 @@ function classifyTerminalRecord(
   try {
     const value = JSON.parse(record.data) as Record<string, unknown>;
     const dataType = typeof value.type === "string" ? value.type : undefined;
-    // A terminal needs an explicit `event:` line that agrees with the record's
-    // `type`. OpenRouter's native Responses stream sends no `event:` lines, so
-    // its terminal is deliberately NOT recognised (the surface is unclaimed
-    // and the full hold stays). Reading to EOF for accounting does not itself
-    // certify protocol completion.
+    const responseUsage = usageRecord(usageRecord(value.response)?.usage);
+    // OpenRouter Responses is data-only SSE: a JSON `type` of
+    // response.completed / .failed / .incomplete with a `response.usage`
+    // object is the terminal. Other dialects still need an `event:` line that
+    // agrees with `type`.
+    if (
+      dialect === "openrouter" &&
+      surface === "openai-responses" &&
+      !record.event &&
+      dataType !== undefined &&
+      RESPONSES_TERMINAL_EVENTS.has(dataType) &&
+      responseUsage !== undefined
+    )
+      return dataType === "response.completed" ? "SUCCESS" : "FAILED";
     if (!record.event || record.event !== dataType) return undefined;
     if (record.event === "error") return "FAILED";
     if (surface === "anthropic-messages")
@@ -1940,12 +1956,6 @@ type OpenRouterRecordUsage =
   | { kind: "final"; usage: unknown }
   | { kind: "superseded"; usage: unknown }
   | { kind: "ambiguous" };
-
-const RESPONSES_TERMINAL_EVENTS = new Set([
-  "response.completed",
-  "response.incomplete",
-  "response.failed",
-]);
 
 function openRouterRecordUsage(
   surface: ProtocolSurface,
@@ -3717,6 +3727,7 @@ export async function dispatchPublicOverflow(
                     const outcome = classifyTerminalRecord(
                       record,
                       nativeSurface ?? request.requestedSurface,
+                      target.usageDialect ?? "generic",
                     );
                     protocolTerminal ||= outcome !== undefined;
                     protocolFailed ||= outcome === "FAILED";
@@ -3770,6 +3781,7 @@ export async function dispatchPublicOverflow(
                   const outcome = classifyTerminalRecord(
                     record,
                     nativeSurface ?? request.requestedSurface,
+                    target.usageDialect ?? "generic",
                   );
                   // Include bytes following the first terminal in its own chunk.
                   // Absolute decoder offsets exclude earlier streamed content.

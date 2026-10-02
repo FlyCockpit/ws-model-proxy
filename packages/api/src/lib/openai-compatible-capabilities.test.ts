@@ -486,7 +486,7 @@ describe("v4 inventory invariants", () => {
     ).toBeNull();
   });
 
-  it("lets openai-compatible gateways claim Messages and rejects OpenAI surfaces on Anthropic inventories", () => {
+  it("parses Messages on openai-compatible inventories (OpenRouter allowlist) and rejects OpenAI surfaces on Anthropic inventories", () => {
     expect(
       parseOpenAiCompatibleCapabilities({ ...anthropic, protocol: "openai-compatible" }),
     ).not.toBeNull();

@@ -5454,11 +5454,16 @@ describe("OpenRouter owner-paid settlement", () => {
       usage: { categoriesComplete: true },
     });
     expect(settled.usage.reportedCost?.toString()).toBe(cost);
-    // OpenRouter's Responses stream sends no `event:` lines and its terminal is
-    // deliberately not recognised (read to EOF, full hold): the observation
-    // completes only where the terminal is named (Messages `message_stop`,
-    // Chat `[DONE]`).
-    expect(settled.observationComplete).toBe(surface !== "openai-responses");
+    expect(settled.observationComplete).toBe(true);
+    expect(settled.reason).toBe("COMPLETED");
+    expect(recordProviderOutcome).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    expect(recordProviderAttemptEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: "TERMINAL",
+        reason: "COMPLETED",
+        terminalState: "COMPLETED",
+      }),
+    );
   });
 
   it("does not take a Responses terminal from an event line that disagrees with its type", async () => {
@@ -5484,10 +5489,9 @@ describe("OpenRouter owner-paid settlement", () => {
     expect(settled.observationComplete).toBe(false);
   });
 
-  // AC 13: an event-less (data-only) Responses record is never a terminal, for
-  // any provider type: recognising one would cut the read off at the first
-  // such record and make billing depend on transport chunking.
-  it.each(["openrouter", "openai", "openai-compatible"] as const)(
+  // Generic dialects still require an `event:` line. OpenRouter's claimed
+  // Responses surface is data-only: JSON `type` + `response.usage` is enough.
+  it.each(["openai", "openai-compatible"] as const)(
     "does not complete an event-less Responses terminal for the %s provider type",
     async (providerType) => {
       // Strip the trailing `data: [DONE]` sentinel so nothing else ends the stream.
@@ -5506,6 +5510,50 @@ describe("OpenRouter owner-paid settlement", () => {
       expect(settled.observationComplete).toBe(false);
     },
   );
+
+  it("completes OpenRouter's data-only Responses terminal from type and usage", async () => {
+    const raw = readFileSync(
+      new URL("./fixtures/openrouter-live/responses-stream.raw", import.meta.url),
+      "utf8",
+    );
+    const withoutDone = raw.replace(/data: \[DONE\]\s*$/, "");
+    expect(withoutDone).not.toBe(raw);
+    recordProviderOutcome.mockClear();
+    const settled = await settleOwnerStream(
+      "openrouter",
+      [Buffer.from(withoutDone)],
+      "owner",
+      "openai-responses",
+    );
+    expect(settled).toMatchObject({
+      reason: "COMPLETED",
+      observationComplete: true,
+      usage: { categoriesComplete: true },
+    });
+    expect(settled.usage.reportedCost?.toString()).toBe("0.00008");
+    expect(recordProviderOutcome).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    expect(recordProviderAttemptEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: "TERMINAL",
+        reason: "COMPLETED",
+        terminalState: "COMPLETED",
+      }),
+    );
+  });
+
+  it("does not complete an OpenRouter data-only Responses record without usage", async () => {
+    const settled = await settleOwnerStream(
+      "openrouter",
+      [
+        Buffer.from(
+          'data: {"type":"response.completed","response":{"id":"resp","status":"completed","usage":null}}\n\n',
+        ),
+      ],
+      "owner",
+      "openai-responses",
+    );
+    expect(settled.observationComplete).toBe(false);
+  });
 
   // AC 14 / M5: Messages stays strict. A data-only `message_stop` with no
   // `event:` line must never be taken as a terminal, even though the record's

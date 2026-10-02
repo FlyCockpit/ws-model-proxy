@@ -128,4 +128,94 @@ describe("relay retry policy", () => {
       }
     },
   );
+
+  it.each([
+    {
+      engine: "vLLM max_tokens too large",
+      body: JSON.stringify({
+        error: {
+          message:
+            "'max_tokens' or 'max_completion_tokens' is too large: Please set it to be less than the model's context length. This model's maximum context length is 4096 tokens.",
+        },
+      }),
+      overflow: true,
+      promptTokens: null,
+      requestedTokens: null,
+      contextLength: 4096,
+    },
+    {
+      engine: "vLLM decoder prompt vs max_model_len",
+      body: JSON.stringify({
+        error: {
+          message:
+            "The decoder prompt (length 5000) is longer than the maximum model length of 4096. Make sure that `max_model_len` is no smaller than the number of text tokens.",
+        },
+      }),
+      overflow: true,
+      promptTokens: 5000,
+      requestedTokens: null,
+      contextLength: 4096,
+    },
+    {
+      engine: "vLLM requested split messages/completion",
+      body: JSON.stringify({
+        error: {
+          message:
+            "This model's maximum context length is 4096 tokens. However, you requested 5000 tokens (4000 in the messages, 1000 in the completion). Please reduce the length of the messages or completion.",
+        },
+      }),
+      overflow: true,
+      promptTokens: 4000,
+      requestedTokens: 5000,
+      contextLength: 4096,
+    },
+    {
+      engine: "vLLM has N input tokens",
+      body: JSON.stringify({
+        error: {
+          message:
+            "This model's maximum context length is 4096 tokens. However, your request has 5000 input tokens and 128 output tokens.",
+        },
+      }),
+      overflow: true,
+      promptTokens: 5000,
+      requestedTokens: null,
+      contextLength: 4096,
+    },
+    {
+      engine: "SGLang maximum context length",
+      body: JSON.stringify({
+        object: "error",
+        message:
+          "Requested token count exceeds the model's maximum context length of 32768 tokens.",
+        code: 400,
+      }),
+      overflow: true,
+      promptTokens: null,
+      requestedTokens: null,
+      contextLength: 32768,
+    },
+    {
+      engine: "llama.cpp input longer than context",
+      body: JSON.stringify({
+        error: {
+          message:
+            "The input (41000 tokens) is longer than the model's context length (32768 tokens).",
+        },
+      }),
+      overflow: true,
+      promptTokens: 41000,
+      requestedTokens: null,
+      contextLength: 32768,
+    },
+  ] as const)(
+    "classifies $engine overflow strings",
+    ({ body, overflow, promptTokens, requestedTokens, contextLength }) => {
+      const classified = classifyEngineContextOverflow(400, body);
+      expect(classified.overflow).toBe(overflow);
+      expect(classified.promptTokens).toBe(promptTokens);
+      expect(classified.requestedTokens).toBe(requestedTokens);
+      expect(classified.contextLength).toBe(contextLength);
+    },
+  );
 });

@@ -79,6 +79,7 @@ import {
 import {
   type ContextCountTelemetry,
   contextFitsLimits,
+  contextTokensFitCeiling,
   countSerializedRequestContext,
   withCalibratedContextCount,
 } from "./capacity/context.js";
@@ -393,6 +394,13 @@ type ContextExceededDetails = {
   effectiveContextCeilingTokens: number;
 };
 
+class ContextCeilingExceededError extends Error {
+  readonly name = "ContextCeilingExceededError";
+  constructor(readonly details: ContextExceededDetails) {
+    super("Request context exceeds the configured execution capacity ceiling.");
+  }
+}
+
 function contextExceededResponse(
   operation: Pick<RelayOperation, "family">,
   message: string,
@@ -628,6 +636,7 @@ async function nativeContextCount({
   relayRequestId,
   requester,
   pool,
+  effectiveContextCeiling,
 }: {
   request: Request;
   selected: ContextCountModelRow;
@@ -643,6 +652,8 @@ async function nativeContextCount({
     ownerUserId: string;
     accessGrantId: string | null;
   };
+  /** Same min(physical, configured) ceiling `contextFitsLimits` uses. */
+  effectiveContextCeiling?: number | null;
 }): Promise<ContextCountTelemetry | null> {
   if (!operation.contextInput) return null;
   const capacity = selected.ExecutionTarget?.InferenceCapacity;
@@ -703,7 +714,10 @@ async function nativeContextCount({
   if (!countCapability) {
     const estimate = await countWithConfiguredCounter();
     if (operation.family !== "chat.completions") return estimate;
-    const ceiling = capacity?.physicalMaxContext;
+    const ceiling = effectiveContextCeilingTokens(
+      capacity?.physicalMaxContext,
+      effectiveContextCeiling,
+    );
     if (
       ceiling == null ||
       !Number.isSafeInteger(ceiling) ||
@@ -4142,6 +4156,7 @@ async function relayDirect({
         manager,
         relayRequestId,
         requester,
+        effectiveContextCeiling: selected.ExecutionTarget?.directContextCeiling,
       });
       if (exactCount) {
         operation.contextCount = exactCount;
@@ -5681,60 +5696,17 @@ async function relayPool({
   };
   const nativeCounts = new Map<string, ContextCountTelemetry>();
   if (capacityRuntime && operation.contextInput) {
-    // The native count sends the full request to the owner's machines: the
-    // same gate as the send, as an early exit before the count fan-out.
-    let countRefusal: LocalSendDenial | null = await localSendDenial({
+    // Same gate as the send: an early exit before counting the admitted
+    // member. Counts stay off the owner's machines when the pool is already
+    // unavailable (banned owner, revoked grant, failed check).
+    const countRefusal = await localSendDenial({
       poolId: target.id,
       ownerUserId: target.ownerUserId,
       requesterUserId: requester.userId,
       accessGrantId: target.accessGrantId,
       poolMemberId: null,
     });
-    if (!countRefusal) {
-      await Promise.all(
-        members.map(async (member) => {
-          const selected = {
-            ...member.DiscoveredModel,
-            optimisticBasicTranscription: false,
-            ExecutionTarget: member.ExecutionTarget,
-            Endpoint: {
-              ...member.DiscoveredModel.Endpoint,
-              status: member.DiscoveredModel.Endpoint.status ?? null,
-              CliDevice: member.DiscoveredModel.Endpoint.CliDevice ?? null,
-            },
-          } satisfies ContextCountModelRow;
-          if (!isEndpointConnected(selected, new Set(manager.getActiveCliDeviceIds()))) return;
-          try {
-            const count = await nativeContextCount({
-              request,
-              selected,
-              operation,
-              manager,
-              relayRequestId,
-              requester,
-              pool: {
-                id: target.id,
-                memberId: member.id,
-                tier: "PRIMARY",
-                ownerUserId: target.ownerUserId,
-                accessGrantId: target.accessGrantId,
-              },
-            });
-            if (count) nativeCounts.set(member.id, count);
-          } catch (error) {
-            // A refused count send (owner or requester lost access, grant
-            // revoked, failed check) ends the request below. The request-level
-            // abort is handled by admission/relay; an individual unavailable
-            // counter safely retains the estimate.
-            if (error instanceof LocalSendRefused && error.denial !== "MEMBER_UNAVAILABLE")
-              countRefusal ??= error.denial;
-          }
-        }),
-      );
-    }
     if (countRefusal) {
-      // Same exit as the early refusal: nothing admitted, no external phase,
-      // answered like arrival without route headers.
       const countFailure = LOCAL_SEND_DENIAL_FAILURE[countRefusal];
       externalAttempt.accessLost = true;
       await operation.dispose?.();
@@ -5953,12 +5925,30 @@ async function relayPool({
     const mode = executionByMember.get(candidate.poolMemberId)?.mode;
     return mode === "native" ? 0 : mode === "adapted" ? 1 : 2;
   };
+  // Document/image estimates never fail closed; they only prefer members whose
+  // full estimate (media included) still fits the same ceiling as admission.
+  const estimateFitIds = new Set(
+    operation.contextCount
+      ? eligibleMembers
+          .filter((member) =>
+            contextTokensFitCeiling({
+              tokens: operation.contextCount!.tokens,
+              physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+              effectiveContextCeiling: configuredContextCeilingForMember(member),
+              contextMargin: contextMarginForMember(member),
+            }),
+          )
+          .map((member) => member.id)
+      : eligibleMembers.map((member) => member.id),
+  );
+  const estimateFitRank = (poolMemberId: string) => (estimateFitIds.has(poolMemberId) ? 0 : 1);
   // PRIMARY members are always local. Native compatibility is the first class;
   // member weight remains only as a stable pre-affinity order (new
   // conversations treat weight as a proportional share inside ranking).
   let routeCandidates = [...localRouteCandidates].sort(
     (left, right) =>
       routeModeRank(left) - routeModeRank(right) ||
+      estimateFitRank(left.poolMemberId) - estimateFitRank(right.poolMemberId) ||
       right.weight - left.weight ||
       left.poolMemberId.localeCompare(right.poolMemberId),
   );
@@ -6307,10 +6297,67 @@ async function relayPool({
   let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
   let selectedRouteCandidates = routeCandidates;
   const applyMemberContextCount = async (poolMemberId: string) => {
-    const count = nativeCounts.get(poolMemberId);
+    const member = memberById.get(poolMemberId);
+    if (!member) return;
+    let count = nativeCounts.get(poolMemberId);
+    if (!count && capacityRuntime && operation.contextInput) {
+      const selected = {
+        ...member.DiscoveredModel,
+        optimisticBasicTranscription: false,
+        ExecutionTarget: member.ExecutionTarget,
+        Endpoint: {
+          ...member.DiscoveredModel.Endpoint,
+          status: member.DiscoveredModel.Endpoint.status ?? null,
+          CliDevice: member.DiscoveredModel.Endpoint.CliDevice ?? null,
+        },
+      } satisfies ContextCountModelRow;
+      if (isEndpointConnected(selected, new Set(manager.getActiveCliDeviceIds()))) {
+        const next = await nativeContextCount({
+          request,
+          selected,
+          operation,
+          manager,
+          relayRequestId,
+          requester,
+          pool: {
+            id: target.id,
+            memberId: member.id,
+            tier: "PRIMARY",
+            ownerUserId: target.ownerUserId,
+            accessGrantId: target.accessGrantId,
+          },
+          effectiveContextCeiling: configuredContextCeilingForMember(member),
+        });
+        if (next) {
+          count = next;
+          nativeCounts.set(member.id, next);
+        }
+      }
+    }
     if (!count) return;
     operation.contextCount = count;
     await updateContextCountMetadata(relayRequestId, count);
+    const ceiling = effectiveContextCeilingTokens(
+      member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+      configuredContextCeilingForMember(member),
+    );
+    const margin = contextMarginForMember(member);
+    if (
+      count.exact &&
+      !contextFitsLimits({
+        count,
+        physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+        effectiveContextCeiling: configuredContextCeilingForMember(member),
+        contextMargin: margin,
+      })
+    ) {
+      throw new ContextCeilingExceededError({
+        estimatedInputTokens: count.tokens,
+        estimateMethod: count.method,
+        contextMarginTokens: margin,
+        effectiveContextCeilingTokens: ceiling ?? 1,
+      });
+    }
   };
   if (capacityRuntime && affinityDecision) {
     try {
@@ -6434,12 +6481,30 @@ async function relayPool({
     }
     try {
       await applyMemberContextCount(selectedPoolMemberId);
-    } catch {
+    } catch (error) {
       const admittedLease = capacityLease.lease;
       await settleRelayCleanup([
         () => capacityRuntime.release(admittedLease),
         () => operation.dispose?.(),
       ]);
+      if (error instanceof ContextCeilingExceededError) {
+        await failPoolRelayMetadata({
+          relayRequestId,
+          startedAt,
+          failure: "request_too_large",
+        }).catch(metadataUpdateError);
+        return contextExceededResponse(
+          operation,
+          "Request context exceeds the configured execution capacity ceiling.",
+          error.details,
+        );
+      }
+      if (error instanceof LocalSendRefused && error.denial !== "MEMBER_UNAVAILABLE") {
+        const countFailure = LOCAL_SEND_DENIAL_FAILURE[error.denial];
+        externalAttempt.accessLost = true;
+        await failPoolRelayMetadata({ relayRequestId, startedAt, failure: countFailure });
+        return operationFailureResponse(operation, countFailure);
+      }
       await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "unknown" }).catch(
         metadataUpdateError,
       );
@@ -6551,8 +6616,28 @@ async function relayPool({
       const admittedPoolMemberId = capacityLease.lease.poolMemberId;
       try {
         await applyMemberContextCount(admittedPoolMemberId);
-      } catch {
+      } catch (error) {
         await releaseCapacityAttempt();
+        if (error instanceof ContextCeilingExceededError) {
+          globalLease?.release();
+          await operation.dispose?.();
+          await failPoolRelayMetadata({
+            relayRequestId,
+            startedAt,
+            failure: "request_too_large",
+          });
+          return contextExceededResponse(
+            operation,
+            "Request context exceeds the configured execution capacity ceiling.",
+            error.details,
+          );
+        }
+        if (error instanceof LocalSendRefused && error.denial !== "MEMBER_UNAVAILABLE") {
+          finalFailure = LOCAL_SEND_DENIAL_FAILURE[error.denial];
+          poolOwnerLostAccess = true;
+          externalAttempt.accessLost = true;
+          break;
+        }
         finalFailure = "unknown";
         break;
       }
@@ -6872,7 +6957,11 @@ async function relayPool({
             member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
             configuredContextCeilingForMember(member),
           );
-          const nextLargerIndex = selectedRouteCandidates.findIndex((route, index) => {
+          // One overflow retry, and only onto members whose ceiling exceeds
+          // both this member's ceiling and the engine-reported prompt size.
+          // Do not slice from the next larger index: that set includes smaller
+          // members later in the order.
+          const overflowRetryCandidates = selectedRouteCandidates.filter((route, index) => {
             if (index <= candidateIndex) return false;
             const next = memberById.get(route.poolMemberId);
             if (!next) return false;
@@ -6886,7 +6975,7 @@ async function relayPool({
           });
           const retryOverflow =
             !contextOverflowRetried &&
-            nextLargerIndex >= 0 &&
+            overflowRetryCandidates.length > 0 &&
             shouldRetryRelayOperation(operation, "precommit_context_exceeded");
           attempt.cancel("request_too_large");
           const overflowTerminal = await attempt.terminal;
@@ -6908,7 +6997,8 @@ async function relayPool({
           if (retryOverflow) {
             contextOverflowRetried = true;
             await releaseCapacityAttempt();
-            candidateIndex = nextLargerIndex - 1;
+            selectedRouteCandidates = overflowRetryCandidates;
+            candidateIndex = -1;
             continue;
           }
           await releaseCapacityAttempt();

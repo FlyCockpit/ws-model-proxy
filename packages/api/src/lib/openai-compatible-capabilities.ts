@@ -303,8 +303,9 @@ const v4CapabilitiesSchema = z
     const hasOpenAi =
       inventory.surfaces.openaiChatCompletions !== undefined ||
       inventory.surfaces.openaiResponses !== undefined;
-    // OpenAI-compatible gateways (OpenRouter) may also claim Messages; the
-    // provider-type allowlist still rejects that claim on OpenAI itself.
+    // OpenRouter may claim Messages on an openai-compatible inventory; the
+    // provider-type allowlist rejects that claim on OpenAI and generic
+    // openai-compatible gateways until a probe exists.
     // Anthropic-compatible inventories stay Anthropic-only.
     if (inventory.protocol === "anthropic-compatible" && hasOpenAi)
       context.addIssue({

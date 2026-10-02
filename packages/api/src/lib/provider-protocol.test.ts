@@ -86,6 +86,21 @@ describe("provider surface restrictions", () => {
     ).toBe(false);
   });
 
+  it("rejects Anthropic Messages on generic OpenAI-compatible gateways", () => {
+    expect(
+      providerInventorySurfacesAllowed("openai-compatible", {
+        version: 4,
+        surfaces: { anthropicMessages: { operations: ["create"] } },
+      }),
+    ).toBe(false);
+    expect(
+      providerInventorySurfacesAllowed("openai-compatible", {
+        version: 4,
+        surfaces: { ...chat, anthropicMessages: { operations: ["create"] } },
+      }),
+    ).toBe(false);
+  });
+
   it("requires the v4 inventory for restricted types so legacy fields cannot claim surfaces", () => {
     expect(providerInventorySurfacesAllowed("openrouter", { version: 3, surfaces: chat })).toBe(
       false,

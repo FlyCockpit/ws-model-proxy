@@ -5,6 +5,7 @@ export const DEFAULT_IMAGE_TOKEN_ALLOWANCE = 4096;
 export const DEFAULT_AUDIO_TOKEN_ALLOWANCE = 4096;
 /** URL-only / unknown-size documents. Not the image flat allowance. */
 export const DEFAULT_DOCUMENT_TOKEN_ALLOWANCE = 32_768;
+/** Bytes/2 overestimates PDFs; ranking hint only, never a reject threshold. */
 export const DOCUMENT_BYTES_PER_TOKEN = 2;
 export const MAX_WAV_DURATION_SECONDS = 3_600;
 export const IMAGE_PATCH_SIZE = 16;

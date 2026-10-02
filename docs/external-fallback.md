@@ -853,9 +853,10 @@ arrive, even if the transport is complete; unread records keep the liability.
 Before headers arrive, egress timeout or abort rejects the request instead.
 Cancellation is snapshotted at settlement entry: a later client disconnect
 stops delivery without changing that settlement's outcome.
-OpenRouter's native Responses stream sends no
-`event:` lines and its terminal is not recognised: the stream is read to EOF and
-the full hold stays (the surface is unclaimed). Several different authoritative usages, usage in
+OpenRouter's native Responses stream is data-only (no `event:` lines). Its
+terminal is a JSON `type` of `response.completed`, `response.failed`, or
+`response.incomplete` with a `response.usage` object; other dialects still
+need an `event:` line that agrees with `type`. Several different authoritative usages, usage in
 any other root carrier (`usage`, `response.usage`, `message.usage`; nested
 objects are never read), a second usage container in one record, a non-JSON `data:`
 record, or a stream that stops being valid SSE keep the usage as audit evidence

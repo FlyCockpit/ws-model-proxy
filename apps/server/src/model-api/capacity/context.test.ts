@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { contextFitsLimits, countContext, countSerializedRequestContext } from "./context.js";
+import {
+  contextFitsLimits,
+  contextTokensFitCeiling,
+  countContext,
+  countSerializedRequestContext,
+} from "./context.js";
 
 function largePngDataUrl(width: number, height: number, base64Chars: number): string {
   const header = Buffer.alloc(24);
@@ -149,5 +154,32 @@ describe("context counting hierarchy", () => {
         physicalMaxContext: 32_768,
       }),
     ).toBe(true);
+  });
+
+  it("does not fail closed on document or image estimates", () => {
+    const estimate = {
+      tokens: 150_000,
+      method: "TOKEN_ESTIMATE" as const,
+      exact: false,
+      mediaTokens: 149_900,
+    };
+    expect(
+      contextFitsLimits({
+        count: estimate,
+        physicalMaxContext: 32_768,
+      }),
+    ).toBe(true);
+    expect(
+      contextTokensFitCeiling({
+        tokens: estimate.tokens,
+        physicalMaxContext: 32_768,
+      }),
+    ).toBe(false);
+    expect(
+      contextFitsLimits({
+        count: { ...estimate, method: "NATIVE", exact: true },
+        physicalMaxContext: 32_768,
+      }),
+    ).toBe(false);
   });
 });

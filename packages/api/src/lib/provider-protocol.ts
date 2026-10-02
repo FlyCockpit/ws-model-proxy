@@ -204,12 +204,16 @@ export function providerInventorySurfacesAllowed(
 ): boolean {
   const normalized = normalizedType(providerType);
   if (providerProtocolForType(normalized) === null) return false;
-  if (
-    normalized === "openai" &&
-    inventory.surfaces &&
-    inventory.surfaces.anthropicMessages !== undefined
-  )
-    return false;
+  if (inventory.surfaces && inventory.surfaces.anthropicMessages !== undefined) {
+    // Messages is native on Anthropic types and claimed on OpenRouter.
+    // Generic OpenAI-compatible gateways stay off until a probe exists.
+    if (
+      normalized !== "openrouter" &&
+      normalized !== "anthropic" &&
+      normalized !== "anthropic-compatible"
+    )
+      return false;
+  }
   if (!Object.hasOwn(PROVIDER_ALLOWED_SURFACES, normalized)) return true;
   const allowed: readonly string[] =
     PROVIDER_ALLOWED_SURFACES[normalized as keyof typeof PROVIDER_ALLOWED_SURFACES];
