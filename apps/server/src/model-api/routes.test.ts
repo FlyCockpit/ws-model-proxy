@@ -1228,12 +1228,20 @@ describe("model API routes", () => {
     });
     db.poolMember.findMany.mockResolvedValue([
       poolMemberRow({
-        id: "member-small",
-        discoveredModelId: "model-small",
-        upstreamModelId: "upstream-small",
-        cliDeviceId: "cli-small",
+        id: "member-small-a",
+        discoveredModelId: "model-small-a",
+        upstreamModelId: "upstream-small-a",
+        cliDeviceId: "cli-small-a",
         physicalMaxContext: 32_768,
         weight: 100,
+      }),
+      poolMemberRow({
+        id: "member-small-b",
+        discoveredModelId: "model-small-b",
+        upstreamModelId: "upstream-small-b",
+        cliDeviceId: "cli-small-b",
+        physicalMaxContext: 32_768,
+        weight: 50,
       }),
       poolMemberRow({
         id: "member-large",
@@ -1245,7 +1253,7 @@ describe("model API routes", () => {
       }),
     ]);
     const manager = new FakeRelayManager();
-    manager.activeCliDeviceIds = ["cli-small", "cli-large"];
+    manager.activeCliDeviceIds = ["cli-small-a", "cli-small-b", "cli-large"];
     const responsePromise = appWith(manager, admittingCapacityRuntime()).request(
       "/chat/completions",
       {
@@ -1260,7 +1268,10 @@ describe("model API routes", () => {
     manager.body(
       first.requestId,
       JSON.stringify({
-        error: { message: "This model's maximum context length is 32768 tokens" },
+        error: {
+          message:
+            "This model's maximum context length is 32768 tokens. However, you requested 40000 tokens in the messages.",
+        },
       }),
     );
     manager.complete(first.requestId);
@@ -1268,39 +1279,154 @@ describe("model API routes", () => {
     await completeJsonRelay({ manager, requestId: requireSent(manager, 1).requestId });
     const response = await responsePromise;
     expect(response.status).toBe(200);
-    expect(manager.sent.map((sent) => sent.endpointSlug)).toEqual([
-      expect.any(String),
-      expect.any(String),
-    ]);
+    expect(manager.sent.map((sent) => sent.cliDeviceId)).toEqual(["cli-small-a", "cli-large"]);
     expect(manager.sent).toHaveLength(2);
   });
 
-  it("returns the 413 context_exceeded shape for a direct engine overflow", async () => {
-    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
-      directModels: [directTarget],
-      modelPools: [],
-    });
-    const manager = new FakeRelayManager();
-    manager.activeCliDeviceIds = ["cli-device-id"];
-    const responsePromise = appWith(manager, admittingCapacityRuntime()).request(
-      "/chat/completions",
-      {
-        method: "POST",
-        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
-        body: requestBody(directTarget.modelId),
+  it.each([
+    {
+      name: "chat",
+      path: "/chat/completions",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
       },
+      body: requestBody(directTarget.modelId),
+    },
+    {
+      name: "responses",
+      path: "/responses",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: directTarget.modelId, input: "hello" }),
+    },
+  ])(
+    "returns harness overflow codes for a direct $name engine overflow",
+    async ({ path, headers, body }) => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [directTarget],
+        modelPools: [],
+      });
+      db.discoveredModel.findUnique.mockResolvedValue(
+        directRow({ countStrategy: "CONSERVATIVE_ESTIMATE" }),
+      );
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-device-id"];
+      const responsePromise = appWith(manager, admittingCapacityRuntime()).request(path, {
+        method: "POST",
+        headers,
+        body,
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      const sent = requireSent(manager);
+      manager.headers(sent.requestId, 400, { "content-type": "application/json" });
+      manager.body(
+        sent.requestId,
+        JSON.stringify({
+          error: { message: "This model's maximum context length is 8192 tokens" },
+        }),
+      );
+      manager.complete(sent.requestId);
+      const response = await responsePromise;
+      expect(response.status).toBe(400);
+      const json = (await response.json()) as { error: { code: string; message: string } };
+      expect(json).toMatchObject({ error: { code: "context_length_exceeded" } });
+      expect(json.error.message).toContain("maximum context length is 8192");
+    },
+  );
+
+  it("returns prompt is too long for Messages overflow (engine and proxy)", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({
+        countStrategy: "CONSERVATIVE_ESTIMATE",
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "anthropic-compatible",
+          surfaces: {
+            anthropicMessages: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+              countTokens: true,
+              protocolVersion: "2023-06-01",
+            },
+          },
+        },
+      }),
     );
+    const manager = new FakeRelayManager();
+    const enginePromise = appWith(manager).request("/messages", {
+      method: "POST",
+      headers: {
+        authorization: "Bearer wsmp_model_test",
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: directTarget.modelId,
+        max_tokens: 32,
+        messages: [{ role: "user", content: "hello" }],
+      }),
+    });
     await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
     const sent = requireSent(manager);
     manager.headers(sent.requestId, 400, { "content-type": "application/json" });
     manager.body(
       sent.requestId,
-      JSON.stringify({ error: { message: "This model's maximum context length is 8192 tokens" } }),
+      JSON.stringify({
+        type: "error",
+        error: { type: "invalid_request_error", message: "prompt is too long: 9000 tokens > 8192" },
+      }),
     );
     manager.complete(sent.requestId);
-    const response = await responsePromise;
-    expect(response.status).toBe(400);
-    await expect(response.json()).resolves.toMatchObject({ error: { code: "context_exceeded" } });
+    const engine = await enginePromise;
+    expect(engine.status).toBe(400);
+    const engineJson = (await engine.json()) as { error: { message: string } };
+    expect(engineJson.error.message).toMatch(/^prompt is too long/);
+    expect(engineJson.error.message).toContain("8192");
+
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({
+        countStrategy: "CONSERVATIVE_ESTIMATE",
+        directContextCeiling: 1,
+        capabilityOverrideMetadata: {
+          version: 3,
+          protocol: "anthropic-compatible",
+          surfaces: {
+            anthropicMessages: {
+              source: "declared",
+              confidence: "exact",
+              supported: true,
+              streaming: true,
+              countTokens: true,
+              protocolVersion: "2023-06-01",
+            },
+          },
+        },
+      }),
+    );
+    const proxy = await appWith(new FakeRelayManager(), admittingCapacityRuntime()).request(
+      "/messages",
+      {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: directTarget.modelId,
+          max_tokens: 32,
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      },
+    );
+    expect(proxy.status).toBe(400);
+    const proxyJson = (await proxy.json()) as { error: { message: string } };
+    expect(proxyJson.error.message).toMatch(/^prompt is too long/);
   });
 
   describe("S-A: wait for the cache holder", () => {
@@ -11023,7 +11149,9 @@ describe("model API routes", () => {
       );
 
       expect(response.status).toBe(400);
-      await expect(response.json()).resolves.toMatchObject({ error: { code: "context_exceeded" } });
+      await expect(response.json()).resolves.toMatchObject({
+        error: { code: "context_length_exceeded" },
+      });
       expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
     });
 
@@ -11158,7 +11286,9 @@ describe("model API routes", () => {
       body: requestBody(externalPoolTarget.modelId),
     });
     expect(plain.status).toBe(400);
-    await expect(plain.json()).resolves.toMatchObject({ error: { code: "context_exceeded" } });
+    await expect(plain.json()).resolves.toMatchObject({
+      error: { code: "context_length_exceeded" },
+    });
     expect(publicOverflow.dispatch).not.toHaveBeenCalled();
 
     const external = await appWith(manager, admittingCapacityRuntime()).request(
@@ -12185,7 +12315,7 @@ describe("model API routes", () => {
     expect(response.status).toBe(400);
     await expect(response.json()).resolves.toMatchObject({
       error: {
-        code: "context_exceeded",
+        code: "context_length_exceeded",
         message: expect.stringContaining("context exceeds"),
         details: {
           estimatedInputTokens: expect.any(Number),
@@ -12291,7 +12421,7 @@ describe("model API routes", () => {
     expect(rejected.status).toBe(400);
     await expect(rejected.json()).resolves.toMatchObject({
       error: {
-        code: "context_exceeded",
+        code: "context_length_exceeded",
         type: "invalid_request_error",
         details: {
           estimatedInputTokens: expectedTokens,
@@ -12370,7 +12500,7 @@ describe("model API routes", () => {
       expect(response.status).toBe(400);
       await expect(response.json()).resolves.toMatchObject({
         error: {
-          code: "context_exceeded",
+          code: "context_length_exceeded",
           details: {
             estimatedInputTokens: 5_000,
             estimateMethod: "NATIVE",

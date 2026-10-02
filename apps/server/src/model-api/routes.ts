@@ -226,7 +226,7 @@ import {
   resolvePublicProviderExecution,
 } from "./public-overflow.js";
 import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
-import { isEngineContextOverflow, shouldRetryRelayOperation } from "./relay-retry-policy.js";
+import { classifyEngineContextOverflow, shouldRetryRelayOperation } from "./relay-retry-policy.js";
 import {
   LOCAL_RELAY_ATTEMPT_TTL_MS,
   LOCAL_RELAY_PROCESS_EPOCH,
@@ -383,21 +383,24 @@ function contextExceededResponse(
   operation: Pick<RelayOperation, "family">,
   message: string,
   details: ContextExceededDetails,
+  engineSnippet?: string,
 ) {
+  const counts = `Estimated input tokens: ${details.estimatedInputTokens}; estimate method: ${details.estimateMethod}; context margin: ${details.contextMarginTokens}; effective context ceiling: ${details.effectiveContextCeilingTokens}.`;
+  const engine = engineSnippet ? ` Engine: ${engineSnippet}` : "";
   if (operation.family === "messages") {
     return anthropicErrorResponse(
       400,
-      `${message} Estimated input tokens: ${details.estimatedInputTokens}; estimate method: ${details.estimateMethod}; context margin: ${details.contextMarginTokens}; effective context ceiling: ${details.effectiveContextCeilingTokens}.`,
+      `prompt is too long. ${message} ${counts}${engine}`,
       "invalid_request_error",
     );
   }
   return new Response(
     JSON.stringify({
       error: {
-        message,
+        message: `${message} ${counts}${engine}`.trim(),
         type: "invalid_request_error",
         param: null,
-        code: "context_exceeded",
+        code: "context_length_exceeded",
         details,
       },
     }),
@@ -4227,7 +4230,8 @@ async function relayDirect({
     let startedBody = started.body;
     if (started.status >= 400 && started.status < 500) {
       const errorBytes = await readStreamBytes(startedBody);
-      if (isEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes))) {
+      const overflow = classifyEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes));
+      if (overflow.overflow) {
         attempt.cancel("request_too_large");
         cliLease.release();
         globalLease.release();
@@ -4259,6 +4263,7 @@ async function relayDirect({
                 identity?.directContextCeiling,
               ) ?? 1,
           },
+          overflow.snippet,
         );
       }
       startedBody = bytesToReadableStream(errorBytes);
@@ -6704,25 +6709,27 @@ async function relayPool({
       let startedBody = started.body;
       if (started.status >= 400 && started.status < 500) {
         const errorBytes = await readStreamBytes(startedBody);
-        if (isEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes))) {
+        const overflow = classifyEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes));
+        if (overflow.overflow) {
           const thisCeiling = effectiveContextCeilingTokens(
             member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
             configuredContextCeilingForMember(member),
           );
-          const remainingLarger = selectedRouteCandidates
-            .slice(candidateIndex + 1)
-            .some((route) => {
-              const next = memberById.get(route.poolMemberId);
-              if (!next) return false;
-              const ceiling = effectiveContextCeilingTokens(
-                next.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
-                configuredContextCeilingForMember(next),
-              );
-              return thisCeiling !== null && ceiling !== null && ceiling > thisCeiling;
-            });
+          const nextLargerIndex = selectedRouteCandidates.findIndex((route, index) => {
+            if (index <= candidateIndex) return false;
+            const next = memberById.get(route.poolMemberId);
+            if (!next) return false;
+            const ceiling = effectiveContextCeilingTokens(
+              next.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+              configuredContextCeilingForMember(next),
+            );
+            if (thisCeiling === null || ceiling === null) return false;
+            if (ceiling <= thisCeiling) return false;
+            return overflow.promptTokens === null || ceiling > overflow.promptTokens;
+          });
           const retryOverflow =
             !contextOverflowRetried &&
-            remainingLarger &&
+            nextLargerIndex >= 0 &&
             shouldRetryRelayOperation(operation, "precommit_context_exceeded");
           attempt.cancel("request_too_large");
           const overflowTerminal = await attempt.terminal;
@@ -6744,6 +6751,7 @@ async function relayPool({
           if (retryOverflow) {
             contextOverflowRetried = true;
             await releaseCapacityAttempt();
+            candidateIndex = nextLargerIndex - 1;
             continue;
           }
           await releaseCapacityAttempt();
@@ -6763,6 +6771,7 @@ async function relayPool({
               contextMarginTokens: contextMarginForMember(member),
               effectiveContextCeilingTokens: thisCeiling ?? 1,
             },
+            overflow.snippet,
           );
         }
         startedBody = bytesToReadableStream(errorBytes);
@@ -7703,7 +7712,8 @@ async function relaySelectedModelNoFailover({
     let startedBody = started.body;
     if (started.status >= 400 && started.status < 500) {
       const errorBytes = await readStreamBytes(startedBody);
-      if (isEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes))) {
+      const overflow = classifyEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes));
+      if (overflow.overflow) {
         attempt.cancel("request_too_large");
         cliLease.release();
         globalLease.release();
@@ -7731,6 +7741,7 @@ async function relaySelectedModelNoFailover({
                 identity?.directContextCeiling,
               ) ?? 1,
           },
+          overflow.snippet,
         );
       }
       startedBody = bytesToReadableStream(errorBytes);
