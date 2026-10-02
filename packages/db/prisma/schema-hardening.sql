@@ -167,9 +167,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS cache_affinity_conversation_unique
 
 -- Newest-first footprints for new-conversation residency. The LATERAL
 -- per-target LIMIT in affinityResidencySql walks this instead of ranking
--- every live prefix row.
-CREATE INDEX IF NOT EXISTS cache_affinity_record_residency
-  ON cache_affinity_record ("executionTargetId", "expiresAt" DESC)
+-- every live prefix row. DROP first so existing deployments replace the
+-- old (executionTargetId, expiresAt DESC) shape.
+DROP INDEX IF EXISTS cache_affinity_record_residency;
+CREATE INDEX cache_affinity_record_residency
+  ON cache_affinity_record ("userId", "executionTargetId", "expiresAt" DESC, id DESC)
   WHERE "prefixDigest" IS NULL;
 
 ALTER TABLE cache_affinity_record DROP CONSTRAINT IF EXISTS cache_affinity_record_shape_check;
@@ -2264,6 +2266,9 @@ ALTER TABLE provider_credential ADD CONSTRAINT provider_credential_shape_check C
 ALTER TABLE provider_budget_policy ADD COLUMN IF NOT EXISTS "poolGrantId" TEXT;
 ALTER TABLE provider_budget_policy ADD COLUMN IF NOT EXISTS "granteeUserId" TEXT;
 ALTER TABLE provider_budget_policy ALTER COLUMN "providerAccountId" DROP NOT NULL;
+-- The transition trigger (installed on re-runs) forbids this UPDATE. Drop it
+-- for the backfill; the CREATE TRIGGER later in this file reinstalls it.
+DROP TRIGGER IF EXISTS provider_budget_policy_transition ON provider_budget_policy;
 UPDATE provider_budget_policy AS policy
    SET "granteeUserId" = grant_row."granteeUserId"
   FROM pool_grant AS grant_row

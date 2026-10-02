@@ -2146,13 +2146,16 @@ where
         let thread_cancellation = cancellation.clone();
         let (body_tx, body_rx) = mpsc::sync_channel::<BodyChunk>(REQUEST_BODY_INGRESS_CAPACITY);
         let endpoint = endpoint.clone();
+        let plan = CountFirstPlan {
+            method,
+            adapter_count_route,
+            count_ceiling,
+        };
         let handle = thread::spawn(move || {
             run_count_first_worker(
                 spec,
                 endpoint,
-                method,
-                adapter_count_route,
-                count_ceiling,
+                plan,
                 body_rx,
                 thread_tx,
                 thread_cancellation,
@@ -2622,6 +2625,12 @@ fn count_first_exceeds_ceiling(tokens: u64, ceiling: Option<u64>) -> bool {
     ceiling.is_some_and(|max| tokens > max)
 }
 
+struct CountFirstPlan {
+    method: Option<crate::count_context::CountContextMethod>,
+    adapter_count_route: Option<String>,
+    count_ceiling: Option<u64>,
+}
+
 fn endpoint_count_plan(
     config: &Config,
     endpoint: &crate::config::EndpointConfig,
@@ -2649,9 +2658,7 @@ fn endpoint_count_plan(
 fn run_count_first_worker(
     spec: UpstreamRequestSpec,
     endpoint: crate::config::EndpointConfig,
-    method: Option<crate::count_context::CountContextMethod>,
-    adapter_count_route: Option<String>,
-    count_ceiling: Option<u64>,
+    plan: CountFirstPlan,
     body_rx: Receiver<BodyChunk>,
     tx: SyncSender<FromWorker>,
     cancellation: CancellationHandle,
@@ -2683,7 +2690,7 @@ fn run_count_first_worker(
         if cancellation.cancelled.load(Ordering::SeqCst) {
             return None;
         }
-        let Some(method) = method else {
+        let Some(method) = plan.method else {
             return Some(bytes);
         };
         let body = match crate::count_context::parse_count_context_body(&bytes) {
@@ -2711,7 +2718,7 @@ fn run_count_first_worker(
             &model,
             &body,
             Some(method),
-            adapter_count_route.as_deref(),
+            plan.adapter_count_route.as_deref(),
             timeout,
         ) {
             Ok(outcome) => {
@@ -2723,7 +2730,7 @@ fn run_count_first_worker(
                         method: outcome.method,
                     },
                 );
-                if count_first_exceeds_ceiling(outcome.tokens, count_ceiling) {
+                if count_first_exceeds_ceiling(outcome.tokens, plan.count_ceiling) {
                     let _ = worker_send_control(
                         &tx,
                         &ClientControlMessage::RelayError {

@@ -39,6 +39,8 @@ export interface McpValidationIssue {
 
 export const MAX_UNKNOWN_KEY_SUGGESTIONS = 5;
 const SUGGESTION_MAX_DISTANCE = 3;
+/** Unrecognized keys considered for suggestions. Extra keys still count. */
+const MAX_UNKNOWN_KEYS_PROBED = 32;
 
 export const MAX_ISSUES = 20;
 export const MAX_PATH_SEGMENTS = 8;
@@ -136,11 +138,15 @@ function unknownKeyCount(keys: unknown): number | undefined {
 function suggestDeclaredNames(keys: unknown, knownKeys: ReadonlySet<string>): string[] | undefined {
   if (!Array.isArray(keys) || knownKeys.size === 0) return undefined;
   const ranked = new Map<string, number>();
+  let probed = 0;
   for (const key of keys) {
+    if (probed >= MAX_UNKNOWN_KEYS_PROBED) break;
     if (typeof key !== "string" || key.length === 0 || key.length > MAX_SEGMENT_LENGTH) continue;
     if (!IDENTIFIER_SEGMENT.test(key)) continue;
+    probed += 1;
     for (const known of knownKeys) {
       if (known.length > MAX_SEGMENT_LENGTH) continue;
+      if (Math.abs(key.length - known.length) > SUGGESTION_MAX_DISTANCE) continue;
       const distance = editDistance(key, known);
       if (distance > SUGGESTION_MAX_DISTANCE) continue;
       const previous = ranked.get(known);

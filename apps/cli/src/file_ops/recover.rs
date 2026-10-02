@@ -15,7 +15,8 @@ use serde::Serialize;
 use super::exchange::Primitive;
 use super::exchange::no_replace;
 use super::intent::{
-    INTENT_MAX_BYTES, Intent, IntentOp, IntentPhase, IntentSlot, kind_from_name, parse_intent,
+    INTENT_MAX_BYTES, Intent, IntentOp, IntentPhase, IntentSlot, intent_phase_name, kind_from_name,
+    parse_intent,
 };
 use super::registry::{self, RegistryEntry};
 use super::resolve::Stat;
@@ -122,20 +123,16 @@ pub fn recover_dir(path: &Path, apply: bool, entry: Option<&RegistryEntry>) -> R
             slots,
         };
     }
-    if let Some(entry) = entry {
-        let host = crate::hostname::reported_hostname().unwrap_or_else(|| "unknown".to_string());
-        if entry.summary.host == host && pid_is_live(entry.summary.pid) {
-            return RecoverReport {
-                path: path.display().to_string(),
-                action: RecoverAction::SkippedLive,
-                message: format!(
-                    "pid {} on this host still holds this recovery directory",
-                    entry.summary.pid
-                ),
-                phase: Some(entry.summary.phase.clone()),
-                slots,
-            };
-        }
+    if let Some(entry) = entry
+        && let Some(report) = skip_live_pid(
+            path,
+            &entry.summary.host,
+            entry.summary.pid,
+            Some(entry.summary.phase.clone()),
+            slots.clone(),
+        )
+    {
+        return report;
     }
     match read_intent_file(path) {
         Ok(None) => RecoverReport {
@@ -156,8 +153,39 @@ pub fn recover_dir(path: &Path, apply: bool, entry: Option<&RegistryEntry>) -> R
             phase: None,
             slots,
         },
-        Ok(Some(intent)) => apply_intent(path, &intent, apply, slots),
+        Ok(Some(intent)) => {
+            if let Some(report) = skip_live_pid(
+                path,
+                &intent.host,
+                intent.pid,
+                Some(intent_phase_name(intent.phase).to_string()),
+                slots.clone(),
+            ) {
+                return report;
+            }
+            apply_intent(path, &intent, apply, slots)
+        }
     }
+}
+
+fn skip_live_pid(
+    path: &Path,
+    host: &str,
+    pid: u32,
+    phase: Option<String>,
+    slots: Vec<String>,
+) -> Option<RecoverReport> {
+    let current = crate::hostname::reported_hostname().unwrap_or_else(|| "unknown".to_string());
+    if host != current || !pid_is_live(pid) {
+        return None;
+    }
+    Some(RecoverReport {
+        path: path.display().to_string(),
+        action: RecoverAction::SkippedLive,
+        message: format!("pid {pid} on this host still holds this recovery directory"),
+        phase,
+        slots,
+    })
 }
 
 fn apply_intent(path: &Path, intent: &Intent, apply: bool, slots: Vec<String>) -> RecoverReport {
@@ -587,6 +615,20 @@ mod tests {
         let report = recover_dir(&dir, true, Some(&entry));
         assert_eq!(report.action, RecoverAction::SkippedLive);
         assert!(dir.is_dir());
+    }
+
+    #[test]
+    fn recover_scan_skips_a_live_pid_from_intent() {
+        let fx = Fx::new();
+        let dir = fx.root.join(".wsmp-recover-abcdefghij");
+        std::fs::create_dir(&dir).unwrap();
+        let intent = Intent::delete(&fx.root.join("gone"));
+        std::fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
+        let reports = recover_scan(std::slice::from_ref(&fx.root), true);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].action, RecoverAction::SkippedLive);
+        assert!(dir.is_dir());
+        assert!(dir.join("INTENT").is_file());
     }
 
     #[test]

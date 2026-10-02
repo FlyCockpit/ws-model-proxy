@@ -9,7 +9,7 @@ import { join, resolve } from "node:path";
 import { waitForExit } from "../lib/wait-for-exit.mjs";
 import { openTerminalTestClient } from "./terminal-client.mjs";
 
-// End-to-end check of MCP node file tools (relay 2.8, #103/#106): a real server,
+// End-to-end check of MCP node file tools (relay 2.4, #103/#106): a real server,
 // a real wsmp relay CLI, a Postgres database and an MCP personal access token.
 //
 //   WSMP_E2E_DATABASE_URL=postgres://… node scripts/e2e/file-tools-relay.mjs
@@ -17,8 +17,8 @@ import { openTerminalTestClient } from "./terminal-client.mjs";
 // It needs a built server (apps/server/dist/index.mjs) and a built CLI
 // (apps/cli/target/debug/wsmp); override with WSMP_E2E_SERVER_ENTRY and
 // WSMP_E2E_CLI_BINARY. Optional: WSMP_E2E_OLD_CLI_BINARY, a wsmp that speaks
-// relay 2.7, to check the upgrade message with the real binary as well (a
-// scripted 2.7 hello is always checked).
+// relay 2.3, to check the upgrade message with the real binary as well (a
+// scripted 2.3 hello is always checked).
 
 // `pg` and `ws` are existing dependencies of @ws-model-proxy/db and the server.
 const requireFromDb = createRequire(new URL("../../packages/db/package.json", import.meta.url));
@@ -228,7 +228,7 @@ try {
     };
   };
 
-  // Wait for the CLI to connect at protocol 2.8 and for the file tools to be usable.
+  // Wait for the CLI to connect at protocol 2.4 and for the file tools to be usable.
   const readyDeadline = Date.now() + 40_000;
   let connected = false;
   while (Date.now() < readyDeadline) {
@@ -238,13 +238,13 @@ try {
       `SELECT status, "relayProtocolVersion" FROM cli_device WHERE id = $1`,
       [deviceId],
     );
-    if (row.rows[0]?.status === "CONNECTED" && row.rows[0]?.relayProtocolVersion === "2.8") {
+    if (row.rows[0]?.status === "CONNECTED" && row.rows[0]?.relayProtocolVersion === "2.4") {
       connected = true;
       break;
     }
     await sleep(250);
   }
-  assert(connected, `CLI did not connect at relay 2.8; relay log:\n${relayLog}`);
+  assert(connected, `CLI did not connect at relay 2.4; relay log:\n${relayLog}`);
 
   // The PAT sees all nine tools.
   const listed = await mcp("tools/list", {});
@@ -615,7 +615,7 @@ try {
   assert(stillOffline.isError);
   assert.equal(stillOffline.error.code, "offline");
 
-  // ---- a 2.7 CLI gets the upgrade message, and the tools say so ----------------
+  // ---- a 2.3 CLI gets the upgrade message, and the tools say so ----------------
   const upgradeMessage = await new Promise((resolveMessage, reject) => {
     const socket = new WebSocket(
       `${serverUrl.replace("http", "ws")}/api/cli/ws`,
@@ -624,14 +624,14 @@ try {
         headers: { authorization: `Bearer ${cliCredential.secret}` },
       },
     );
-    const timer = setTimeout(() => reject(new Error("no protocol.error for a 2.7 hello")), 10_000);
+    const timer = setTimeout(() => reject(new Error("no protocol.error for a 2.3 hello")), 10_000);
     socket.on("open", () => {
       socket.send(
         JSON.stringify({
           type: "hello",
           id: "hello-old",
-          protocolVersion: "2.7",
-          cli: { slug: cliSlug, version: "0.4.9", capabilities: { protocolVersion: "2.7" } },
+          protocolVersion: "2.3",
+          cli: { slug: cliSlug, version: "0.4.9", capabilities: { protocolVersion: "2.3" } },
           endpoints: [],
         }),
       );
@@ -644,7 +644,7 @@ try {
     socket.on("error", reject);
   });
   assert.equal(upgradeMessage.type, "protocol.error");
-  assert.match(upgradeMessage.message, /relay protocol 2\.8/);
+  assert.match(upgradeMessage.message, /relay protocol 2\.4/);
   assert.match(upgradeMessage.message, /Upgrade wsmp/);
   let rejectedVersion = null;
   const rejectedDeadline = Date.now() + 5_000;
@@ -656,13 +656,13 @@ try {
     rejectedVersion = row.rows[0]?.rejectedRelayProtocolVersion ?? null;
     if (rejectedVersion === null) await sleep(100);
   }
-  assert.equal(rejectedVersion, "2.7", "the refused hello was not recorded for the device card");
+  assert.equal(rejectedVersion, "2.3", "the refused hello was not recorded for the device card");
   const upgrade = await tool("forwarder_cli_file_read", { cliDeviceId: deviceId, path: target });
   assert(upgrade.isError);
   assert.equal(upgrade.error.code, "upgrade_required");
-  assert.match(upgrade.text, /this CLI speaks relay 2\.7; upgrade wsmp/i);
+  assert.match(upgrade.text, /older relay protocol; upgrade wsmp/i);
 
-  // Optional: the same check with a real 2.7 binary.
+  // Optional: the same check with a real 2.3 binary.
   const oldBinary = process.env.WSMP_E2E_OLD_CLI_BINARY?.trim();
   if (oldBinary) {
     const old = spawn(resolve(oldBinary), ["connect"], {

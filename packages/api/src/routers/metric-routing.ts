@@ -528,7 +528,7 @@ export const metricRoutingProcedures = {
             poolId: pool.id,
             position,
             metric: rule.metric,
-            labels: rule.labels ?? Prisma.JsonNull,
+            labels: rule.labels ?? Prisma.DbNull,
             aggregate: rule.aggregate,
             op: rule.op,
             threshold: rule.threshold,

@@ -268,6 +268,19 @@ describe("sanitizeValidationIssues", () => {
     expect(fieldsFromValidationIssues(suggested ?? [])).toEqual(["fallbackEnabled", "poolId"]);
   });
 
+  it("bounds unrecognized-key suggestion work", () => {
+    const known = new Set(Array.from({ length: 400 }, (_, index) => `field_${index}`));
+    const keys = Array.from({ length: 400 }, (_, index) => `zield_${index}`);
+    const started = Date.now();
+    const issues = sanitizeValidationIssues(
+      { issues: [{ code: "unrecognized_keys", path: [], keys, message: "Unrecognized keys" }] },
+      known,
+    );
+    expect(Date.now() - started).toBeLessThan(250);
+    expect(issues?.[0]?.unknownKeyCount).toBe(20);
+    expect((issues?.[0]?.suggestions ?? []).length).toBeLessThanOrEqual(5);
+  });
+
   it("names nested issues as dotted paths", () => {
     const issues = sanitize(
       [

@@ -130,8 +130,6 @@ const REACHED_DELETE_TRIGGERS: Record<string, string> = {
     "graph-write fence check (plain reads); the user delete holds the owner fences",
   "provider_audit_event_immutable:provider_audit_event":
     "retained history the preflight refuses; never fires on a delete that proceeds",
-  "provider_budget_rule_immutable:provider_budget_rule":
-    "raises 55000 on any DELETE, a permanent refusal (isPermanentParentDeletionFailure)",
 };
 
 /**

@@ -17696,7 +17696,7 @@ function cooldownPoolFixture(ownerUserId: string, surface = "openai-chat") {
 // prs/64-76/design-authz-boundaries.md.
 describe("local send gate (static)", () => {
   const sendCall =
-    /\b(startRelayAttempt|sendRelayRequest|nativeContextCount|startCountContextAttempt|sendCountContext)\(\{/g;
+    /\b(startRelayAttempt|sendRelayRequest|nativeContextCount|sendCountContext)\(\{/g;
   const srcRoot = new URL("../", import.meta.url);
   const source = readFileSync(new URL("./routes.ts", import.meta.url), "utf8");
   const { parse } = createRequire(import.meta.url)(
@@ -17717,7 +17717,7 @@ describe("local send gate (static)", () => {
     // Other modules: exact counts, all exempt from the local-send gate.
     const exemptFiles: Record<string, number> = {
       // The executor itself (definitions and manager sends).
-      "model-api/relay-executor.ts": 4,
+      "model-api/relay-executor.ts": 2,
       // The manager's own definitions and the owner's system health probe (no grantee data).
       "relay/session-manager.ts": 3,
       // Owner-only member diagnostics: the caller is the authenticated owner.

@@ -50,6 +50,7 @@ vi.mock("@ws-model-proxy/db", async () => {
     default: mockDeep(),
     Prisma: {
       DbNull: { kind: "DbNull" },
+      JsonNull: { kind: "JsonNull" },
       Decimal: TestDecimal,
       join: (values: readonly unknown[]) => values,
       TransactionIsolationLevel: { Serializable: "Serializable" },

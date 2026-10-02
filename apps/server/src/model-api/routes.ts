@@ -659,7 +659,7 @@ function chatCountFirstRelayFields({
         serializedChars: JSON.stringify(contextInput ?? {}).length,
       };
       operation.contextCount = exactCount;
-      void updateContextCountMetadata(relayRequestId, exactCount);
+      void updateContextCountMetadata(relayRequestId, exactCount).catch(metadataUpdateError);
     },
   };
 }

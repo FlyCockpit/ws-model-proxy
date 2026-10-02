@@ -962,7 +962,7 @@ export type AffinityResidencyRow = {
  * Bounded newest-first footprints (`prefixDigest IS NULL`) per execution
  * target, grouped later by `execution_target.inferenceCapacityId`. Each target
  * walks the partial index `cache_affinity_record_residency`
- * (`executionTargetId`, `expiresAt` DESC) WHERE `prefixDigest` IS NULL via
+ * (`userId`, `executionTargetId`, `expiresAt` DESC, `id` DESC) WHERE `prefixDigest` IS NULL via
  * `LATERAL ... LIMIT n` so live prefix rows are not scanned. EXPLAIN/buffer
  * coverage lives in `cache-affinity.integration.test.ts` and needs the
  * integration database (`SCHEMA_VALIDATION_DATABASE_URL`).
@@ -1130,13 +1130,29 @@ export async function rankAffinityTargets({
   // on it (an affinity hit is never redirected), even with nothing to reorder.
   if (!policy.enabled || targets.length < (scoreSingleTarget ? 1 : 2)) return unchanged;
 
+  const sharedCanonical = buildCanonicalRequest({
+    surface,
+    payload,
+    headers,
+  });
+  const prefixSumsByAllowance = new Map<string, number[]>();
+  const canonicalForAllowance = (imageTokenAllowance?: number | null): CanonicalRequest | null => {
+    if (!sharedCanonical) return null;
+    const key = imageTokenAllowance == null ? "" : String(imageTokenAllowance);
+    const cached = prefixSumsByAllowance.get(key);
+    const unitTokenPrefixSums =
+      cached ??
+      computeUnitTokenPrefixSums(
+        sharedCanonical.instructions,
+        sharedCanonical.tools,
+        sharedCanonical.conversationUnits,
+        imageTokenAllowance,
+      );
+    if (!cached) prefixSumsByAllowance.set(key, unitTokenPrefixSums);
+    return { ...sharedCanonical, unitTokenPrefixSums };
+  };
   const preparedTargets = targets.map((target) => {
-    const canonical = buildCanonicalRequest({
-      surface,
-      payload,
-      headers,
-      imageTokenAllowance: target.imageTokenAllowance,
-    });
+    const canonical = canonicalForAllowance(target.imageTokenAllowance);
     return {
       target,
       canonical,

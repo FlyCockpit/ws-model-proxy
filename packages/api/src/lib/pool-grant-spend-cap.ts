@@ -40,10 +40,6 @@ function sameSpendCap(policy: { Rules: readonly SpendRule[] }, spend: PoolGrantS
   }
 }
 
-export function grantSpendFenceKey(poolId: string, granteeUserId: string): string {
-  return `${poolId}:${granteeUserId}`;
-}
-
 /**
  * Unique overflow pricing currency on the pool, if every attached public
  * member agrees. Mixed or missing pricing leaves the caller's currency.

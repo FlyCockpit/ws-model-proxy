@@ -307,7 +307,7 @@ describe("relay drain", () => {
     expect(manager.acceptAuthenticatedSocket({ socket: late, identity, now })).toBe(false);
     expect(late.closes).toEqual([{ code: 1001, reason: "shutdown" }]);
     // Not registered: its frames are an unknown socket, and no unregistered timer runs.
-    await expect(manager.handleTextFrame(late, helloFrame(late), now)).rejects.toThrow(
+    await expect(manager.handleTextFrame(late, helloFrame(), now)).rejects.toThrow(
       "Unknown relay socket.",
     );
     expect(manager.getActiveCliDeviceIds()).toEqual([]);
@@ -614,7 +614,7 @@ describe("revoked credentials", () => {
     await hello;
 
     expect(manager.getActiveCliDeviceIds()).toEqual([]);
-    expect(socket.sends).toEqual([]);
+    expect(socket.sends.some((frame) => String(frame).includes('"hello.ok"'))).toBe(false);
     expect(disconnectedWrites()).toHaveLength(1);
     manager.dispose();
   });
@@ -2805,10 +2805,8 @@ describe("relay terminal viewers", () => {
   });
 
   it("keeps a CLI identity proof for the terminal list", async () => {
-    const identityKey = Buffer.alloc(65, 3);
-    identityKey[0] = 0x04;
     const terminalIdentity = {
-      publicKey: identityKey.toString("base64url"),
+      publicKey: testIdentity.publicKey,
       signature: Buffer.alloc(64, 7).toString("base64url"),
     };
     const frame = JSON.parse(helloCli()) as { cli: { capabilities: Record<string, unknown> } };

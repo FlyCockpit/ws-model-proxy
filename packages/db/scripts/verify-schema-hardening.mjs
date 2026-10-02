@@ -55,6 +55,8 @@ const requiredFragments = [
   'ALTER COLUMN "sessionId" SET NOT NULL',
   "cache_affinity_conversation_unique",
   "cache_affinity_record_residency",
+  'ON cache_affinity_record ("userId", "executionTargetId", "expiresAt" DESC, id DESC)',
+  "DROP INDEX IF EXISTS cache_affinity_record_residency",
   "enforce_cache_affinity_identity_immutable",
   'DELETE FROM cache_affinity_record\n WHERE "digestVersion" < 5',
   'ALTER COLUMN "tenantUserId" SET NOT NULL',

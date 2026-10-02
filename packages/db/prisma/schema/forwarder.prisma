@@ -1195,7 +1195,7 @@ model CacheAffinityRecord {
   @@index([userId, poolId, expiresAt])
   // Newest-first footprint scan for residency spreading. Prisma cannot
   // express WHERE "prefixDigest" IS NULL; the live partial index
-  // cache_affinity_record_residency (executionTargetId, expiresAt DESC)
+  // cache_affinity_record_residency (userId, executionTargetId, expiresAt DESC, id DESC)
   // is created in schema-hardening.sql.
   @@index([executionTargetId, expiresAt])
   // Warm-session protection (S-C): recent sessions per member KV pool.

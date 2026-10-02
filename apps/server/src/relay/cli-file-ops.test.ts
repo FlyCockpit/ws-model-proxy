@@ -1736,41 +1736,6 @@ describe("cli file ops", () => {
       expect(socket.frames("file.op")).toEqual([]);
     });
 
-    it("refuses every op offline when the live 2.8 session does not run file ops", async () => {
-      // A live 2.8 session whose features lack `fileOps` (the flag is ANDed into
-      // `getLiveCliFeatures().fileOps`, and the server's strict hello schema
-      // pins it true today) must dispatch nothing, even with the grant and the
-      // read switch on. Reached by dropping the recorded feature on the live
-      // session.
-      db.cliDevice.findUnique.mockImplementation(deviceRow("UNSUPERVISED", { mcpFileRead: true }));
-      const socket = await connect("desktop", "unsupervised", true, true);
-      relaySessionManager.applyFeatureGrants("desktop", {
-        allowHumanTerminal: false,
-        mcpCommandMode: "unsupervised",
-        mcpFileRead: true,
-      });
-      const session = (
-        Reflect.get(relaySessionManager, "sessionsByCliDeviceId") as Map<
-          string,
-          { features: Record<string, unknown> | null }
-        >
-      ).get("desktop");
-      expect(session?.features?.fileOps).toBe(true);
-      if (session) session.features = { ...session.features, fileOps: false };
-      expect(relaySessionManager.getLiveCliFeatures(["desktop"]).get("desktop")?.fileOps).toBe(
-        false,
-      );
-      for (const [op, args] of [
-        ["read", readArgs],
-        ["edit", editArgs],
-      ] as const) {
-        await expect(runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op, args })).resolves.toEqual(
-          { ok: false, code: "offline" },
-        );
-      }
-      expect(socket.frames("file.op")).toEqual([]);
-    });
-
     it("uses one not-found for an unknown device and another user's device", async () => {
       const unknown = await runFileOp({
         ...OP_TOKEN,

@@ -12,7 +12,7 @@ export const ENGINE_LOAD_HISTORY_WINDOW_MS =
 export const ENGINE_LOAD_HISTORY_MAX_KEYS_PER_DEVICE = 64;
 export const ENGINE_LOAD_HISTORY_MAX_KEYS = 2_000;
 /** Full prune cadence. Independent of the per-device key cap. */
-export const ENGINE_LOAD_HISTORY_PRUNE_EVERY_MS = ENGINE_LOAD_HISTORY_BUCKET_MS;
+export const ENGINE_LOAD_HISTORY_PRUNE_EVERY_MS = 10_000;
 
 export type EngineLoadHistorySample = {
   running: number;

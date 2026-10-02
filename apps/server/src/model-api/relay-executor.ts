@@ -4,7 +4,6 @@ import {
   type RelayServerControlMessage,
 } from "../relay/protocol.js";
 import type {
-  ActiveCountContextHandlers,
   ActiveRelayResponseHandlers,
   CountContextResultMessage,
   RelaySessionManager,
@@ -73,33 +72,6 @@ type RelayManager = Pick<
   | "cancelRelayRequest"
   | "completeRelayRequest"
 >;
-
-type CountContextManager = Pick<
-  RelaySessionManager,
-  | "registerCountContextHandlers"
-  | "sendCountContext"
-  | "cancelRelayRequest"
-  | "completeRelayRequest"
->;
-
-export type CountContextAttemptOutcome =
-  | {
-      ok: true;
-      tokens: number;
-      method:
-        | "vllm_tokenize"
-        | "tgi_chat_tokenize"
-        | "llama_apply_template"
-        | "llama_input_tokens"
-        | "adapter_count";
-    }
-  | { ok: false; failure: RelayFailure };
-
-export type CountContextAttempt = {
-  requestId: string;
-  result: Promise<CountContextAttemptOutcome>;
-  cancel(reason: RelayFailure): void;
-};
 
 type Deferred<T> = {
   promise: Promise<T>;
@@ -466,94 +438,6 @@ export function startRelayAttempt({
         usage: null,
         metrics: null,
       });
-    },
-  };
-}
-
-export function startCountContextAttempt({
-  requestId = crypto.randomUUID(),
-  manager,
-  cliDeviceId,
-  endpointSlug,
-  model,
-  body,
-  timeoutMs,
-  abortSignal,
-}: {
-  requestId?: string;
-  manager: CountContextManager;
-  cliDeviceId: string;
-  endpointSlug: string;
-  model: string;
-  body: Uint8Array;
-  timeoutMs: number;
-  abortSignal?: AbortSignal;
-}): CountContextAttempt {
-  const result = deferred<CountContextAttemptOutcome>();
-  let settled = false;
-
-  function finish(outcome: CountContextAttemptOutcome) {
-    if (settled) return;
-    settled = true;
-    clearTimeout(timeout);
-    abortSignal?.removeEventListener("abort", abort);
-    manager.completeRelayRequest(requestId);
-    result.resolve(outcome);
-  }
-
-  if (abortSignal?.aborted) {
-    result.resolve({ ok: false, failure: "cancelled" });
-    return {
-      requestId,
-      result: result.promise,
-      cancel() {
-        /* nothing dispatched */
-      },
-    };
-  }
-
-  const timeout = setTimeout(() => {
-    manager.cancelRelayRequest({ cliDeviceId, requestId, reason: "timeout" });
-    finish({ ok: false, failure: "timeout" });
-  }, timeoutMs);
-
-  const abort = () => {
-    manager.cancelRelayRequest({ cliDeviceId, requestId, reason: "cancelled" });
-    finish({ ok: false, failure: "cancelled" });
-  };
-  abortSignal?.addEventListener("abort", abort, { once: true });
-
-  const handlers: ActiveCountContextHandlers = {
-    onResult(message) {
-      finish({ ok: true, tokens: message.tokens, method: message.method });
-    },
-    onError(message) {
-      finish({ ok: false, failure: message.failure });
-    },
-  };
-
-  manager.registerCountContextHandlers({ cliDeviceId, requestId, handlers });
-  try {
-    manager.sendCountContext({
-      cliDeviceId,
-      endpointSlug,
-      requestId,
-      model,
-      bodyChunks: splitBodyChunks(body),
-      timeoutMs,
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "";
-    const failure: RelayFailure = message.includes("disconnected") ? "disconnected" : "transport";
-    finish({ ok: false, failure });
-  }
-
-  return {
-    requestId,
-    result: result.promise,
-    cancel(reason) {
-      manager.cancelRelayRequest({ cliDeviceId, requestId, reason });
-      finish({ ok: false, failure: reason });
     },
   };
 }

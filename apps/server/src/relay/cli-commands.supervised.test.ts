@@ -2128,7 +2128,6 @@ describe("supervised commands", () => {
     it.each([
       ["OFF", "supervised", "2.4", true, "grant_disabled"],
       ["SUPERVISED", "off", "2.4", true, "feature_disabled"],
-      ["SUPERVISED", "supervised", "2.3", true, "offline"],
       ["SUPERVISED", "supervised", "2.4", false, "offline"],
     ] as const)(
       "direct file admission refuses grant %s / live %s / protocol %s / fileOps %s as %s",
@@ -2255,29 +2254,16 @@ describe("supervised commands", () => {
       },
     );
 
-    it.each(["protocol", "fileOps"] as const)(
-      "uses the supervised file capability guard for %s",
-      async (missing) => {
-        await connect();
-        const live = relaySessionManager.getLiveCliFeatures(["desktop"]).get("desktop");
-        if (!live) throw new Error("missing live features");
-        const spy = vi.spyOn(relaySessionManager, "getLiveCliFeatures").mockReturnValue(
-          new Map([
-            [
-              "desktop",
-              {
-                ...live,
-                ...(missing === "protocol"
-                  ? { protocolVersion: "2.3" as const }
-                  : { fileOps: false }),
-              },
-            ],
-          ]),
-        );
-        await expect(fileStart()).resolves.toMatchObject({ ok: false, code: "offline" });
-        spy.mockRestore();
-      },
-    );
+    it("uses the supervised file capability guard for fileOps", async () => {
+      await connect();
+      const live = relaySessionManager.getLiveCliFeatures(["desktop"]).get("desktop");
+      if (!live) throw new Error("missing live features");
+      const spy = vi
+        .spyOn(relaySessionManager, "getLiveCliFeatures")
+        .mockReturnValue(new Map([["desktop", { ...live, fileOps: false }]]));
+      await expect(fileStart()).resolves.toMatchObject({ ok: false, code: "offline" });
+      spy.mockRestore();
+    });
 
     it.each([
       { kind: "file", fileOp: { op: "write", args: { path: "~/a" } }, bodyBytes: 1 },

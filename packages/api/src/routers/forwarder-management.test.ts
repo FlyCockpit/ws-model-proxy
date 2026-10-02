@@ -1625,6 +1625,26 @@ describe("metric routing procedures (S-B part 2)", () => {
     expect(deep.poolMemberRoutingVerdict.deleteMany).not.toHaveBeenCalled();
   });
 
+  it("persists label-less rules as SQL NULL, not JSON null", async () => {
+    deep.modelPool.findFirst.mockResolvedValue({ id: "pool-1", PoolMembers: [{ id: "m1" }] });
+    deep.poolRoutingRule.deleteMany.mockResolvedValue({ count: 0 });
+    deep.poolRoutingRule.createMany.mockResolvedValue({ count: 1 });
+    const { Prisma } = await import("@ws-model-proxy/db");
+    await client().setPoolRoutingRules({
+      poolId: "pool-1",
+      rules: [{ metric: "node.gpu.temperature_c", op: ">", threshold: 85, effect: "full" }],
+    });
+    expect(deep.poolRoutingRule.createMany).toHaveBeenCalledWith({
+      data: [
+        expect.objectContaining({
+          poolId: "pool-1",
+          labels: Prisma.DbNull,
+        }),
+      ],
+    });
+    expect(Prisma.DbNull).not.toEqual(Prisma.JsonNull);
+  });
+
   it("rejects a member-scoped rule whose id is not in the pool", async () => {
     deep.modelPool.findFirst.mockResolvedValue({ id: "pool-1", PoolMembers: [{ id: "m1" }] });
     await expect(
