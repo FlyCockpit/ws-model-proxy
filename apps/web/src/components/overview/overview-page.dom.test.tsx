@@ -244,23 +244,28 @@ describe("OverviewPage", () => {
             },
           ],
           engineLoad: {
-            effectiveKvFullThreshold: 0.95,
-            series: [
+            members: [
               {
-                start: "2026-09-24T10:00:00.000Z",
-                running: 2,
-                waiting: 1,
-                kvUsage: 0.4,
-                kvOccupancy: 0.7,
-                gap: false,
-              },
-              {
-                start: "2026-09-24T10:15:00.000Z",
-                running: 3,
-                waiting: 0,
-                kvUsage: 0.5,
-                kvOccupancy: 0.8,
-                gap: false,
+                poolMemberId: "member-a",
+                kvFullThreshold: 0.95,
+                series: [
+                  {
+                    start: "2026-09-24T10:00:00.000Z",
+                    running: 2,
+                    waiting: 1,
+                    kvUsage: 0.4,
+                    kvOccupancy: 0.7,
+                    gap: false,
+                  },
+                  {
+                    start: "2026-09-24T10:15:00.000Z",
+                    running: 3,
+                    waiting: 0,
+                    kvUsage: 0.5,
+                    kvOccupancy: 0.8,
+                    gap: false,
+                  },
+                ],
               },
             ],
           },

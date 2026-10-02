@@ -25,7 +25,7 @@ export function cliSlugFromDeviceLoginScope(scope: string | null | undefined): s
   return validateForwarderSlug(slug).ok ? slug : null;
 }
 
-/** First wsmp release that speaks relay protocol 2.6 and binds the login slug. */
+/** First wsmp release that speaks relay protocol 2.4 and binds the login slug. */
 export const WSMP_MIN_CLI_VERSION = "0.4.0";
 
 /**

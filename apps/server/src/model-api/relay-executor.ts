@@ -3,7 +3,11 @@ import {
   type RelayFailure,
   type RelayServerControlMessage,
 } from "../relay/protocol.js";
-import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
+import type {
+  ActiveRelayResponseHandlers,
+  CountContextResultMessage,
+  RelaySessionManager,
+} from "../relay/session-manager.js";
 import { isCapacityLeaseLost } from "./capacity/lease-loss.js";
 import type { ModelApiFailure } from "./openai-errors.js";
 import type { RelayBodySource } from "./request-body-source.js";
@@ -171,6 +175,9 @@ export function startRelayAttempt({
   timeoutMs,
   abortSignal,
   onResponseBodyChunk,
+  countFirst,
+  countCeiling,
+  onCountResult,
 }: {
   /** Caller-supplied only when durable telemetry must exist before dispatch. */
   requestId?: string;
@@ -186,6 +193,9 @@ export function startRelayAttempt({
   timeoutMs: number;
   abortSignal?: AbortSignal;
   onResponseBodyChunk?: (chunk: Uint8Array) => void;
+  countFirst?: boolean;
+  countCeiling?: number;
+  onCountResult?: (message: CountContextResultMessage) => void;
 }): RelayAttempt {
   const started = deferred<RelayAttemptStarted>();
   const terminal = deferred<RelayAttemptTerminal>();
@@ -305,6 +315,9 @@ export function startRelayAttempt({
     onRequestBodySent(byteLength) {
       if (!terminalSettled) requestBytes += byteLength;
     },
+    onCountResult(message) {
+      if (!terminalSettled) onCountResult?.(message);
+    },
     onHeaders(message) {
       headersResolved = true;
       upstreamStatusCode = message.status;
@@ -395,6 +408,8 @@ export function startRelayAttempt({
       bodyChunks: body ? splitBodyChunks(body) : undefined,
       bodySource,
       timeoutMs,
+      countFirst,
+      countCeiling,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : "";

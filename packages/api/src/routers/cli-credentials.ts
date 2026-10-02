@@ -7,6 +7,7 @@ import {
   type DeviceLoginRefusalReason,
 } from "@ws-model-proxy/config/cli-device-login";
 import { cliDeviceDisplayName } from "@ws-model-proxy/config/cli-device-name";
+import { normalizeIdentityPublicKey } from "@ws-model-proxy/config/cli-identity-key";
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import {
@@ -42,6 +43,9 @@ const cliTokenSelection = {
   revokedAt: true,
   expiresAt: true,
   cliDeviceId: true,
+  identityPublicKey: true,
+  lastRefusedAt: true,
+  lastRefusedReason: true,
 } satisfies Prisma.CliTokenSelect;
 
 type CliTokenRow = Prisma.CliTokenGetPayload<{ select: typeof cliTokenSelection }>;
@@ -57,6 +61,9 @@ function serializeCliToken(row: CliTokenRow) {
     revokedAt: row.revokedAt,
     expiresAt: row.expiresAt,
     cliDeviceId: row.cliDeviceId,
+    identityBound: row.identityPublicKey != null,
+    lastRefusedAt: row.lastRefusedAt,
+    lastRefusedReason: row.lastRefusedReason,
   };
 }
 
@@ -143,11 +150,43 @@ export const cliCredentialsRouter = {
       return serializeCliToken(row);
     }),
 
+  resetTokenIdentity: protectedProcedure
+    .input(z.object({ id: z.string().min(1) }))
+    .handler(async ({ input, context }) => {
+      const existing = await prisma.cliToken.findUnique({
+        where: { id: input.id },
+        select: { id: true, userId: true, revokedAt: true },
+      });
+      if (!existing || existing.userId !== context.session.user.id) {
+        throw new ORPCError("NOT_FOUND", { message: "CLI token not found." });
+      }
+      if (existing.revokedAt) {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Revoked CLI tokens cannot reset their identity bind.",
+        });
+      }
+      const row = await prisma.cliToken.update({
+        where: { id: input.id },
+        data: {
+          identityPublicKey: null,
+          lastRefusedAt: null,
+          lastRefusedReason: null,
+        },
+        select: cliTokenSelection,
+      });
+      return serializeCliToken(row);
+    }),
+
   exchangeDeviceCode: publicProcedure
     .input(
       z.object({
         deviceCode: z.string().trim().min(1).max(512),
         cliSlug: cliSlugSchema,
+        // Optional only so a pre-0.4.0 login still reaches the upgrade
+        // sentinel below. Every other exchange must carry the CLI identity
+        // public key; the handler refuses a missing or invalid one before it
+        // mints.
+        identityPublicKey: z.string().trim().min(1).max(120).optional(),
       }),
     )
     .handler(async ({ input, context }) => {
@@ -160,6 +199,12 @@ export const cliCredentialsRouter = {
       // suppress the upgrade message for the whole fleet.
       if (input.deviceCode === CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE) {
         throw new ORPCError("BAD_REQUEST", { message: CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE });
+      }
+      const identityPublicKey = normalizeIdentityPublicKey(input.identityPublicKey ?? "");
+      if (!identityPublicKey) {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "identityPublicKey must be an uncompressed P-256 public key.",
+        });
       }
       // Per IP and per device code, before any database work. A refusal is
       // RFC 8628 `slow_down`, so a polling CLI backs off instead of failing.
@@ -177,6 +222,7 @@ export const cliCredentialsRouter = {
       const minted = await mintCliDeviceCredentialFromApprovedDeviceCode({
         deviceCode: input.deviceCode,
         cliSlug: input.cliSlug,
+        identityPublicKey,
       });
       await closeRevokedCliCredentialSessions(context.services, minted.revoked);
       return { credentialId: minted.credentialId, userId: minted.userId, secret: minted.secret };

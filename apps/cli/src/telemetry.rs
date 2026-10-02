@@ -15,11 +15,14 @@
 //! latest values in `node.metrics.custom`.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
 
 use crate::config::EndpointConfig;
 use crate::engine::LoadReading;
@@ -251,20 +254,122 @@ fn run(
     }
 }
 
+const LOAD_COUNTERS_FILE: &str = "load-counters.json";
+const LOAD_COUNTERS_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+struct PersistedLoadCounters {
+    counter_epoch: u32,
+    prefix_hits_total: Option<f64>,
+    prefix_queries_total: Option<f64>,
+    process_start_time_seconds: Option<f64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct LoadCountersFile {
+    version: u32,
+    endpoints: BTreeMap<String, PersistedLoadCounters>,
+}
+
+fn load_counters_path() -> Option<PathBuf> {
+    crate::paths::state_dir()
+        .ok()
+        .map(|dir| dir.join(LOAD_COUNTERS_FILE))
+}
+
+fn read_load_counters_from(path: &Path) -> BTreeMap<String, PersistedLoadCounters> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return BTreeMap::new();
+    };
+    serde_json::from_slice::<LoadCountersFile>(&bytes)
+        .ok()
+        .filter(|file| file.version == LOAD_COUNTERS_VERSION)
+        .map(|file| file.endpoints)
+        .unwrap_or_default()
+}
+
+fn write_load_counters_to(path: &Path, map: &BTreeMap<String, PersistedLoadCounters>) {
+    let file = LoadCountersFile {
+        version: LOAD_COUNTERS_VERSION,
+        endpoints: map.clone(),
+    };
+    let Ok(mut bytes) = serde_json::to_vec_pretty(&file) else {
+        return;
+    };
+    bytes.push(b'\n');
+    let _ = crate::approvals::write_private_atomic(path, &bytes, "load counters", false);
+}
+
+fn persisted_load_counters() -> &'static Mutex<BTreeMap<String, PersistedLoadCounters>> {
+    static MAP: OnceLock<Mutex<BTreeMap<String, PersistedLoadCounters>>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        Mutex::new(if cfg!(test) {
+            BTreeMap::new()
+        } else {
+            load_counters_path()
+                .map(|path| read_load_counters_from(&path))
+                .unwrap_or_default()
+        })
+    })
+}
+
 #[derive(Default)]
 struct LoadState {
     last_sent: Option<(Instant, LoadReading)>,
     prefix_hits_total: Option<f64>,
     prefix_queries_total: Option<f64>,
+    process_start_time_seconds: Option<f64>,
+    counter_epoch: u32,
+    /// A reset frame was planned but the outbound queue dropped it. The next
+    /// frame still reports `prefixCacheReset` with `delta = current`.
+    pending_reset: bool,
 }
 
 impl LoadState {
+    /// Seed from the process-wide map so a reconnect of this CLI keeps the
+    /// epoch and last counters (an engine restart while disconnected still
+    /// looks like a drop).
+    fn restore(slug: &str) -> Self {
+        persisted_load_counters()
+            .lock()
+            .ok()
+            .and_then(|map| map.get(slug).cloned())
+            .map(|persisted| Self {
+                last_sent: None,
+                prefix_hits_total: persisted.prefix_hits_total,
+                prefix_queries_total: persisted.prefix_queries_total,
+                process_start_time_seconds: persisted.process_start_time_seconds,
+                counter_epoch: persisted.counter_epoch,
+                pending_reset: false,
+            })
+            .unwrap_or_default()
+    }
+
     /// Record a frame the relay loop accepted. A dropped frame is not
     /// committed, so its prefix-cache deltas fold into the next one.
-    fn commit(&mut self, reading: LoadReading, at: Instant) {
+    fn commit(&mut self, slug: &str, reading: LoadReading, at: Instant, counter_epoch: u32) {
         self.prefix_hits_total = reading.prefix_cache_hits_total;
         self.prefix_queries_total = reading.prefix_cache_queries_total;
+        self.process_start_time_seconds = reading.process_start_time_seconds;
+        self.counter_epoch = counter_epoch;
+        self.pending_reset = false;
         self.last_sent = Some((at, reading));
+        if let Ok(mut map) = persisted_load_counters().lock() {
+            map.insert(
+                slug.to_string(),
+                PersistedLoadCounters {
+                    counter_epoch,
+                    prefix_hits_total: self.prefix_hits_total,
+                    prefix_queries_total: self.prefix_queries_total,
+                    process_start_time_seconds: self.process_start_time_seconds,
+                },
+            );
+            if !cfg!(test)
+                && let Some(path) = load_counters_path()
+            {
+                write_load_counters_to(&path, &map);
+            }
+        }
     }
 }
 
@@ -485,6 +590,9 @@ where
             let (targets, remote_statuses) =
                 load_targets_with_remote(&endpoints, &remote, allow_remote, &approved);
             schedules.retain(|slug, _| targets.iter().any(|(endpoint, _)| endpoint.slug == *slug));
+            if let Ok(mut map) = persisted_load_counters().lock() {
+                map.retain(|slug, _| targets.iter().any(|(endpoint, _)| endpoint.slug == *slug));
+            }
             if let Ok(mut shared) = shared.lock() {
                 let live: std::collections::BTreeSet<_> = targets
                     .iter()
@@ -512,12 +620,13 @@ where
                 if replace {
                     next_epoch += 1;
                     let interval = plan_interval(&target.1);
+                    let restored = LoadState::restore(&slug);
                     schedules.insert(
                         slug,
                         LoadSchedule {
                             epoch: next_epoch,
                             target,
-                            state: LoadState::default(),
+                            state: restored,
                             next_due: Instant::now(),
                             in_flight: false,
                             interval,
@@ -601,9 +710,19 @@ where
             ) else {
                 continue;
             };
+            let counter_epoch = frame.counter_epoch;
+            let reset = frame.prefix_cache_reset == Some(true);
             match offer(tx, ClientControlMessage::EndpointLoad(frame)) {
-                Sent::Queued => schedule.state.commit(reading, done.finished),
-                Sent::Dropped => {}
+                Sent::Queued => {
+                    schedule
+                        .state
+                        .commit(&done.slug, reading, done.finished, counter_epoch)
+                }
+                Sent::Dropped => {
+                    if reset {
+                        schedule.state.pending_reset = true;
+                    }
+                }
                 Sent::Gone => return,
             }
         }
@@ -617,6 +736,16 @@ fn counter_delta(previous: Option<f64>, current: Option<f64>) -> Option<u64> {
     (current >= previous).then(|| saturating_byte_counter((current - previous).round() as u64))
 }
 
+/// Counts since the engine restarted. Used with `prefixCacheReset` so a dropped
+/// reset frame still reports the post-restart total instead of discarding it.
+fn counter_since_start(current: Option<f64>) -> Option<u64> {
+    current.map(|value| saturating_byte_counter(value.round() as u64))
+}
+
+fn counter_reset(previous: Option<f64>, current: Option<f64>) -> bool {
+    matches!((previous, current), (Some(previous), Some(current)) if current < previous)
+}
+
 /// Decide whether a reading goes out: on change, or every
 /// `LOAD_REFRESH_INTERVAL` when unchanged. Prefix-cache counters become
 /// deltas against the last frame the relay loop accepted. The caller commits
@@ -628,18 +757,48 @@ fn next_load_frame(
     now: Instant,
     ts: &str,
 ) -> Option<EndpointLoad> {
-    let hits_delta = counter_delta(state.prefix_hits_total, reading.prefix_cache_hits_total);
-    let queries_delta = counter_delta(
-        state.prefix_queries_total,
-        reading.prefix_cache_queries_total,
-    );
-    let changed_counters =
-        hits_delta.is_some_and(|delta| delta > 0) || queries_delta.is_some_and(|delta| delta > 0);
+    let identity_changed = match (
+        state.process_start_time_seconds,
+        reading.process_start_time_seconds,
+    ) {
+        (Some(previous), Some(current)) => previous != current,
+        _ => false,
+    };
+    let hits_reset = state.pending_reset
+        || counter_reset(state.prefix_hits_total, reading.prefix_cache_hits_total);
+    let queries_reset = state.pending_reset
+        || counter_reset(
+            state.prefix_queries_total,
+            reading.prefix_cache_queries_total,
+        );
+    let prefix_cache_reset = hits_reset || queries_reset || identity_changed;
+    let hits_delta = if prefix_cache_reset {
+        counter_since_start(reading.prefix_cache_hits_total)
+    } else {
+        counter_delta(state.prefix_hits_total, reading.prefix_cache_hits_total)
+    };
+    let queries_delta = if prefix_cache_reset {
+        counter_since_start(reading.prefix_cache_queries_total)
+    } else {
+        counter_delta(
+            state.prefix_queries_total,
+            reading.prefix_cache_queries_total,
+        )
+    };
+    let counter_epoch = if prefix_cache_reset {
+        state.counter_epoch.wrapping_add(1)
+    } else {
+        state.counter_epoch
+    };
+    let changed_counters = prefix_cache_reset
+        || hits_delta.is_some_and(|delta| delta > 0)
+        || queries_delta.is_some_and(|delta| delta > 0);
     let due = match &state.last_sent {
         None => true,
         Some((at, last)) => {
             now.duration_since(*at) >= LOAD_REFRESH_INTERVAL
                 || changed_counters
+                || identity_changed
                 || !same_load(last, reading)
         }
     };
@@ -657,6 +816,8 @@ fn next_load_frame(
         deferred: reading.deferred,
         prefix_cache_hits_delta: hits_delta,
         prefix_cache_queries_delta: queries_delta,
+        prefix_cache_reset: prefix_cache_reset.then_some(true),
+        counter_epoch,
         source: reading.source,
         ts: ts.to_string(),
     })
@@ -1155,6 +1316,16 @@ fn collect_node_metrics(
             engine_adapters.truncate(NODE_ENGINE_ADAPTERS_MAX);
             engine_adapters
         },
+        abandoned_recovery: {
+            #[cfg(unix)]
+            {
+                crate::file_ops::abandoned_recovery_count()
+            }
+            #[cfg(not(unix))]
+            {
+                None
+            }
+        },
     }
 }
 
@@ -1244,7 +1415,7 @@ mod tests {
         ts: &str,
     ) -> Option<EndpointLoad> {
         let frame = next_load_frame(state, "vllm", &reading, at, ts)?;
-        state.commit(reading, at);
+        state.commit("vllm", reading, at, frame.counter_epoch);
         Some(frame)
     }
 
@@ -1289,8 +1460,85 @@ mod tests {
         )
         .expect("a change is sent");
         assert_eq!(
-            reset.prefix_cache_hits_delta, None,
-            "a counter reset is not a delta"
+            reset.prefix_cache_hits_delta,
+            Some(5),
+            "a counter reset reports counts since restart"
+        );
+        assert_eq!(first.counter_epoch, 0);
+        assert_eq!(changed.counter_epoch, 0);
+        assert_eq!(reset.counter_epoch, 1);
+        assert_eq!(reset.prefix_cache_reset, Some(true));
+    }
+
+    fn reading_with_start(running: u64, hits: Option<f64>, start: Option<f64>) -> LoadReading {
+        LoadReading {
+            process_start_time_seconds: start,
+            ..reading(running, hits)
+        }
+    }
+
+    #[test]
+    fn counter_epoch_bumps_when_the_engine_identity_changes() {
+        let mut state = LoadState::default();
+        let start = Instant::now();
+        let first = step(
+            &mut state,
+            reading_with_start(1, Some(100.0), Some(1_700_000_000.0)),
+            start,
+            "t0",
+        )
+        .expect("first");
+        assert_eq!(first.counter_epoch, 0);
+        assert_eq!(first.prefix_cache_reset, None);
+        let restarted = step(
+            &mut state,
+            reading_with_start(1, Some(100.0), Some(1_700_000_100.0)),
+            start + Duration::from_secs(2),
+            "t1",
+        )
+        .expect("identity change is sent");
+        assert_eq!(restarted.counter_epoch, 1);
+        assert_eq!(restarted.prefix_cache_reset, Some(true));
+        let same = step(
+            &mut state,
+            reading_with_start(1, Some(100.0), Some(1_700_000_100.0)),
+            start + Duration::from_secs(8),
+            "t2",
+        )
+        .expect("refresh");
+        assert_eq!(same.counter_epoch, 1);
+    }
+
+    #[test]
+    fn load_counter_state_round_trips_through_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("load-counters.json");
+        let mut map = BTreeMap::new();
+        map.insert(
+            "vllm".to_string(),
+            PersistedLoadCounters {
+                counter_epoch: 4,
+                prefix_hits_total: Some(12.0),
+                prefix_queries_total: Some(20.0),
+                process_start_time_seconds: Some(1_700_000_000.0),
+            },
+        );
+        write_load_counters_to(&path, &map);
+        let restored = read_load_counters_from(&path);
+        assert_eq!(restored.get("vllm"), map.get("vllm"));
+        let mut state = LoadState::default();
+        state.commit(
+            "memory-slug",
+            reading_with_start(1, Some(9.0), Some(1_700_000_050.0)),
+            Instant::now(),
+            7,
+        );
+        let restored_memory = LoadState::restore("memory-slug");
+        assert_eq!(restored_memory.counter_epoch, 7);
+        assert_eq!(restored_memory.prefix_hits_total, Some(9.0));
+        assert_eq!(
+            restored_memory.process_start_time_seconds,
+            Some(1_700_000_050.0)
         );
     }
 
@@ -1318,6 +1566,34 @@ mod tests {
         )
         .expect("due");
         assert_eq!(next.prefix_cache_hits_delta, Some(70));
+    }
+
+    #[test]
+    fn a_dropped_reset_still_reports_counts_since_restart_after_climb_back() {
+        let mut state = LoadState::default();
+        let start = Instant::now();
+        step(&mut state, reading(1, Some(100.0)), start, "t0").expect("first");
+        let dropped = next_load_frame(
+            &state,
+            "vllm",
+            &reading(0, Some(5.0)),
+            start + Duration::from_secs(2),
+            "t1",
+        )
+        .expect("reset is due");
+        assert_eq!(dropped.prefix_cache_reset, Some(true));
+        assert_eq!(dropped.prefix_cache_hits_delta, Some(5));
+        state.pending_reset = true;
+        let climbed = step(
+            &mut state,
+            reading(1, Some(120.0)),
+            start + Duration::from_secs(4),
+            "t2",
+        )
+        .expect("climb-back after a dropped reset");
+        assert_eq!(climbed.prefix_cache_reset, Some(true));
+        assert_eq!(climbed.prefix_cache_hits_delta, Some(120));
+        assert_eq!(climbed.counter_epoch, 1);
     }
 
     fn load_endpoint(slug: &str) -> EndpointConfig {
@@ -1657,12 +1933,13 @@ mod tests {
             engine: crate::config::EndpointEngine::Generic,
             engine_adapter: Some(crate::engine_adapter::EngineAdapterConfig {
                 input: crate::engine_adapter::AdapterInput::Route {
-                    route: "stats".to_string(),
+                    route: "/stats".to_string(),
                 },
                 format: crate::engine_adapter::AdapterFormat::Json,
                 interval_secs: 2,
                 timeout_secs: 2,
                 map: Default::default(),
+                count_route: None,
             }),
             ..EndpointConfig::default()
         };
@@ -1702,6 +1979,7 @@ mod tests {
             interval_secs: 2,
             timeout_secs: 2,
             map: Default::default(),
+            count_route: None,
         }
     }
 

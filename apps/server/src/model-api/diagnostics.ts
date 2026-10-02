@@ -163,6 +163,7 @@ type DiagnosticsManager = Pick<
   | "sendRelayRequest"
   | "cancelRelayRequest"
   | "completeRelayRequest"
+  | "supportsCountContext"
 >;
 
 export interface DiagnosticCoreDependencies {
@@ -475,9 +476,10 @@ async function chatCompletionDiagnostic({
     };
   if (requestJsonDepthExceeded(body))
     return { outcome: "invalid-request", reason: REQUEST_JSON_DEPTH_ERROR };
+  const headers = new Headers({ "content-type": "application/json" });
   const request = new Request("http://diagnostic.internal/v1/chat/completions", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers,
     body: new TextEncoder().encode(JSON.stringify({ ...body, stream: false })),
     signal,
   });

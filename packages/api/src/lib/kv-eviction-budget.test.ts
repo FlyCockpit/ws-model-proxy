@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
+  applyKvEvictionContinuations,
   applyKvEvictionObservations,
   effectiveKvBudgetTokens,
   effectiveKvCut,
@@ -8,8 +9,12 @@ import {
   KV_EVICTION_FLOOR_FRACTION,
   KV_EVICTION_MAX_CUT,
   KV_EVICTION_MAX_OBSERVATIONS_PER_FLUSH,
+  KV_EVICTION_MISS_RATIO,
   KV_EVICTION_RECOVERY_MS,
+  KV_EVICTION_SESSION_CAP,
   KV_EVICTION_STEP,
+  kvEvictionCutsApply,
+  protectionKvBudgetTokens,
 } from "./kv-eviction-budget";
 
 const now = new Date("2026-09-30T12:00:00Z");
@@ -25,9 +30,24 @@ describe("relative eviction budget", () => {
       KV_EVICTION_MAX_CUT,
       KV_EVICTION_RECOVERY_MS,
       KV_EVICTION_MAX_OBSERVATIONS_PER_FLUSH,
+      KV_EVICTION_SESSION_CAP,
+      KV_EVICTION_MISS_RATIO,
       KV_EVICTION_FLOOR_FRACTION,
       KV_EVICTION_DECAY_PER_MS,
-    ]).toEqual([0.05, 0.5, 1_800_000, 10, 0.5, 0.5 / 1_800_000]);
+    ]).toEqual([0.05, 0.5, 1_800_000, 10, 16, 0.15, 0.5, 0.5 / 1_800_000]);
+  });
+  it("slot-mode engines have no token-mode K", () => {
+    expect(protectionKvBudgetTokens("LLAMA_CPP", 100_000)).toBeNull();
+    expect(protectionKvBudgetTokens("VLLM", 100_000)).toBe(100_000);
+    expect(protectionKvBudgetTokens("VLLM", 0)).toBeNull();
+  });
+  it("freeze ignores stored cuts and returns the reported K", () => {
+    expect(kvEvictionCutsApply(false)).toBe(false);
+    expect(kvEvictionCutsApply(undefined)).toBe(true);
+    expect(effectiveKvCut(state(0.5), now, false)).toBe(0);
+    expect(effectiveKvBudgetTokens(100_000, state(0.5), now, false)).toBe(100_000);
+    expect(effectiveKvBudgetTokens(100_000, state(0.5), now, true)).toBe(50_000);
+    expect(effectiveKvBudgetTokens(100_000, state(0.5), now)).toBe(50_000);
   });
   it.each([
     { name: "no row", reported: 100, row: null, expected: 100 },
@@ -64,16 +84,16 @@ describe("relative eviction budget", () => {
     expect(cut).toBeLessThanOrEqual(0.5);
   });
   it.each([
-    { cut: 0, n: 1, dt: 0, expected: 0.05 },
-    { cut: 0.05, n: 1, dt: 0, expected: 0.1 },
-    { cut: 0.1, n: 1, dt: 0, expected: 0.15 },
+    { cut: 0, n: 1, dt: 0, expected: 0 },
+    { cut: 0.05, n: 1, dt: 0, expected: 0.05 },
+    { cut: 0.1, n: 1, dt: 0, expected: 0.1 },
     { cut: 0.1, n: 0, dt: 0, expected: 0.1 },
-    { cut: 0, n: 11, dt: 0, expected: 0.5 },
-    { cut: 0, n: 100, dt: 0, expected: 0.5 },
+    { cut: 0, n: 11, dt: 0, expected: 0.45 },
+    { cut: 0, n: 100, dt: 0, expected: 0.45 },
     { cut: 0.5, n: 10, dt: 0, expected: 0.5 },
-    { cut: 0.5, n: 1, dt: 900_000, expected: 0.3 },
+    { cut: 0.5, n: 1, dt: 900_000, expected: 0.5 },
     { cut: 0.5, n: 1, dt: 1_800_000, expected: 0 },
-    { cut: 0.1, n: 1, dt: -1000, expected: 0.15 },
+    { cut: 0.1, n: 1, dt: -1000, expected: 0.1 },
   ])("decay/add $cut $n $dt", ({ cut, n, dt, expected }) => {
     const initial = state(cut, dt);
     const next = applyKvEvictionObservations(
@@ -82,21 +102,21 @@ describe("relative eviction budget", () => {
       now,
     );
     expect(next.cutFraction).toBeCloseTo(expected, 12);
+    const recovered = dt >= KV_EVICTION_RECOVERY_MS && cut > 0;
+    const stepped = n >= 2;
     expect(next.observedAt.getTime()).toBe(
-      n === 0
-        ? initial.observedAt.getTime()
-        : Math.max(initial.observedAt.getTime(), now.getTime()),
+      n === 0 || (!recovered && !stepped) ? initial.observedAt.getTime() : now.getTime(),
     );
   });
   it("a lone miss only arms; a second miss from another session cuts", () => {
     const armed = applyKvEvictionObservations(null, ["a"], now);
     expect(armed.cutFraction).toBe(0);
-    expect(armed.lastSessionId).toBe("a");
+    expect(armed.sessionIds).toEqual(["a"]);
     expect(effectiveKvBudgetTokens(100_000, armed, now)).toBe(100_000);
     expect(applyKvEvictionObservations(armed, ["a"], now).cutFraction).toBe(0);
     const cut = applyKvEvictionObservations(armed, ["b"], now);
     expect(cut.cutFraction).toBeCloseTo(0.05, 12);
-    expect(cut.lastSessionId).toBe("b");
+    expect(cut.sessionIds).toEqual(["a", "b"]);
     expect(effectiveKvBudgetTokens(100_000, cut, now)).toBe(95_000);
     expect(applyKvEvictionObservations(cut, ["b"], now).cutFraction).toBeCloseTo(0.05, 12);
   });
@@ -119,7 +139,7 @@ describe("relative eviction budget", () => {
       cutFraction: 0,
       observedAt: new Date(now.getTime() - KV_EVICTION_RECOVERY_MS),
       expiresAt: now,
-      lastSessionId: "a",
+      sessionIds: ["a"],
     };
     const rearmed = applyKvEvictionObservations(expired, ["a"], now);
     expect(rearmed.cutFraction).toBe(0);
@@ -131,7 +151,7 @@ describe("relative eviction budget", () => {
       cutFraction: 0.25,
       observedAt: new Date(now.getTime() - 60_000),
       expiresAt: now,
-      lastSessionId: "a",
+      sessionIds: ["a"],
     };
     expect(applyKvEvictionObservations(expired, ["b"], now).cutFraction).toBe(0);
   });
@@ -140,7 +160,9 @@ describe("relative eviction budget", () => {
       cutFraction: 0,
       observedAt: now,
       expiresAt: new Date(now.getTime() + KV_EVICTION_RECOVERY_MS),
-      lastSessionId: "a",
+      sessionIds: ["a"],
+      missCount: 1,
+      continuationCount: 1,
     };
     expect(applyKvEvictionObservations(pending, ["a"], now).cutFraction).toBe(0);
     expect(applyKvEvictionObservations(pending, ["b"], now).cutFraction).toBeCloseTo(0.05, 12);
@@ -161,5 +183,34 @@ describe("relative eviction budget", () => {
     expect(source).not.toMatch(/kvOccupancy|occupancy|kvUsage/);
     // Evidence is corroborating session ids only; occupancy is display-only.
     expect(applyKvEvictionObservations(null, ["a", "b"], now).cutFraction).toBeCloseTo(0.05, 12);
+  });
+  it("alternating two sessions cannot walk to the floor", () => {
+    let row = applyKvEvictionObservations(null, ["a"], now);
+    for (let i = 0; i < 40; i++) {
+      row = applyKvEvictionObservations(row, [i % 2 === 0 ? "b" : "a"], now);
+    }
+    expect(row.cutFraction).toBeCloseTo(0.05, 12);
+    expect(row.sessionIds).toEqual(["a", "b"]);
+    expect(effectiveKvBudgetTokens(100_000, row, now)).toBe(95_000);
+  });
+  it("steps on miss ratio, not miss count, so hits keep K up", () => {
+    const hits = Array.from({ length: 10 }, (_, i) => ({
+      sessionId: `h${i}`,
+      kind: "hit" as const,
+    }));
+    const withHits = applyKvEvictionContinuations(null, hits, now);
+    expect(withHits.cutFraction).toBe(0);
+    const oneMiss = applyKvEvictionContinuations(
+      withHits,
+      [{ sessionId: "m1", kind: "miss" }],
+      now,
+    );
+    expect(oneMiss.cutFraction).toBe(0);
+    const twoMisses = applyKvEvictionContinuations(
+      oneMiss,
+      [{ sessionId: "m2", kind: "miss" }],
+      now,
+    );
+    expect(twoMisses.cutFraction).toBeCloseTo(0.05, 12);
   });
 });

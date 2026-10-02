@@ -103,6 +103,7 @@ const GRAPH_TABLES: Record<string, string> = {
   inference_capacity: "configuration",
   model_pool: "configuration",
   pool_member: "configuration",
+  pool_routing_rule: "configuration: at most 16 rules per pool",
   pool_grant: "configuration",
   pool_fallback_preference: "configuration: at most one per exact pool grant",
   model_api_token: "configuration",
@@ -122,15 +123,15 @@ const hot = new Set<string>(HOT_PATH_TABLES);
 
 /**
  * DELETE triggers on tables a user delete reaches, and the work each adds:
- * none of them writes rows.
+ * none of them writes traffic-proportional rows.
  */
 const REACHED_DELETE_TRIGGERS: Record<string, string> = {
-  "z_graph_write_fence:user":
-    "graph-write fence check (plain reads); the user delete holds the owner fences",
+  "pool_routing_rule_on_member_delete:pool_member":
+    "rewrites at most 16 pool_routing_rule rows (delete targeted, SET NULL exclude to pool-wide); configuration, not per-request",
   "provider_audit_event_immutable:provider_audit_event":
     "retained history the preflight refuses; never fires on a delete that proceeds",
-  "provider_budget_rule_immutable:provider_budget_rule":
-    "raises 55000 on any DELETE, a permanent refusal (isPermanentParentDeletionFailure)",
+  "z_graph_write_fence:user":
+    "graph-write fence check (plain reads); the user delete holds the owner fences",
 };
 
 /**

@@ -439,6 +439,7 @@ describe("dedicated pool pages", () => {
           granteeName: "Grantee",
           protectionOverridePercent: null,
           queuePriority: null,
+          fallbackSpend: null,
           ...grant,
         },
       ],
@@ -473,6 +474,7 @@ describe("dedicated pool pages", () => {
             grantId: "grant-1",
             protectionOverridePercent: 0,
             queuePriority: 24,
+            fallbackSpend: null,
           },
         }),
       );
@@ -506,6 +508,7 @@ describe("dedicated pool pages", () => {
             grantId: "grant-1",
             protectionOverridePercent: null,
             queuePriority: null,
+            fallbackSpend: null,
           },
         }),
       );
@@ -535,6 +538,107 @@ describe("dedicated pool pages", () => {
             grantId: "grant-1",
             protectionOverridePercent: 0,
             queuePriority: 5,
+            fallbackSpend: null,
+          },
+        }),
+      );
+    });
+
+    it("shows a spend-limit error for invalid input", async () => {
+      state.tab = "access";
+      state.pools = [grantPool()];
+      mount(<PoolDetailPage poolId="pool-1" />);
+
+      fireEvent.click(
+        await screen.findByRole("button", { name: "dashboard:pools.grantRouting.editFor" }),
+      );
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.spendCap"), {
+        target: { value: "SET" },
+      });
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.spendLimit"), {
+        target: { value: "$10" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+      expect(
+        await screen.findByText("dashboard:pools.grantRouting.spendLimitInvalid"),
+      ).toBeTruthy();
+      expect(state.mutationCalls).toEqual([]);
+    });
+
+    it("accepts a locale decimal spend limit and rejects grouping", async () => {
+      state.tab = "access";
+      state.pools = [grantPool()];
+      mount(<PoolDetailPage poolId="pool-1" />);
+
+      fireEvent.click(
+        await screen.findByRole("button", { name: "dashboard:pools.grantRouting.editFor" }),
+      );
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.spendCap"), {
+        target: { value: "SET" },
+      });
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.spendLimit"), {
+        target: { value: "1,500" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+      expect(
+        await screen.findByText("dashboard:pools.grantRouting.spendLimitInvalid"),
+      ).toBeTruthy();
+      expect(state.mutationCalls).toEqual([]);
+
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.spendLimit"), {
+        target: { value: "25.5" },
+      });
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.spendCurrency"), {
+        target: { value: "eur" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+      await waitFor(() =>
+        expect(state.mutationCalls).toContainEqual({
+          name: "updatePoolGrant",
+          variables: {
+            poolId: "pool-1",
+            grantId: "grant-1",
+            protectionOverridePercent: null,
+            queuePriority: null,
+            fallbackSpend: { limit: "25.5", currency: "EUR", period: "UTC_MONTH" },
+          },
+        }),
+      );
+    });
+
+    it("saves an owner-paid spend cap for one grantee", async () => {
+      state.tab = "access";
+      state.pools = [grantPool()];
+      mount(<PoolDetailPage poolId="pool-1" />);
+
+      fireEvent.click(
+        await screen.findByRole("button", { name: "dashboard:pools.grantRouting.editFor" }),
+      );
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.spendCap"), {
+        target: { value: "SET" },
+      });
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.spendLimit"), {
+        target: { value: "25.5" },
+      });
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.spendCurrency"), {
+        target: { value: "eur" },
+      });
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.spendPeriod"), {
+        target: { value: "UTC_DAY" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+      await waitFor(() =>
+        expect(state.mutationCalls).toContainEqual({
+          name: "updatePoolGrant",
+          variables: {
+            poolId: "pool-1",
+            grantId: "grant-1",
+            protectionOverridePercent: null,
+            queuePriority: null,
+            fallbackSpend: { limit: "25.5", currency: "EUR", period: "UTC_DAY" },
           },
         }),
       );

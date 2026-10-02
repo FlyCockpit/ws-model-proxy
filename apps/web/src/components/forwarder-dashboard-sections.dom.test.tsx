@@ -33,6 +33,9 @@ vi.mock("@/components/cli-device-metric-sources", () => ({
 vi.mock("@/components/cli-device-engine-adapters", () => ({
   CliDeviceEngineAdapters: () => null,
 }));
+vi.mock("@/components/cli-device-node-card", () => ({
+  CliDeviceNodeCard: () => null,
+}));
 
 vi.mock("@/utils/orpc", () => {
   const query = (key: string, data: unknown) => ({
@@ -253,6 +256,7 @@ const editablePool = {
   cacheHolderWaitMs: null as number | null,
   protection: {
     enabled: true,
+    evictionFeedbackEnabled: true,
     windowSeconds: 300,
     minTokens: 8192,
     share: "EQUAL_SHARE" as "EQUAL_SHARE" | "FIRST_COME" | "FIXED_PERCENT",
@@ -664,6 +668,7 @@ describe("PoolForm affinity defaults", () => {
     await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
     expect(state.mutationPayloads[0]?.input).toMatchObject({
       protectionEnabled: true,
+      evictionFeedbackEnabled: true,
       protectionWindowSeconds: 300,
       protectMinTokens: 8192,
       protectionShare: "EQUAL_SHARE",

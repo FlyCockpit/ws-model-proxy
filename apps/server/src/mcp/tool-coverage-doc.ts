@@ -59,16 +59,18 @@ with started:true when the server received acceptance and started:null otherwise
 and blocked done before acceptance, and undispatched failures remain definitive.
 Finished file answers and their single audit event do not change on late reports.
 Only a supervised start id is delivered despite MCP abort; headless file results keep
-the abort fence. See [CLI file tools](mcp.md#cli-file-tools-relay-protocol-28).
+the abort fence. See [CLI file tools](mcp.md#cli-file-tools-relay-protocol-24).
 
 Overwrite rename preflights before capture and supports exchange-less no-replace
-and link mounts through one recovery-owned vacate-both publisher. Neither primitive
-means \`unsafe_filesystem\` with no public change. Plain link rename vacates first,
-uses own-name alias proofs and returns a source-bound etag at the published name.
+and link mounts. Stable-inode link publication links the source onto the destination
+before capturing it; no-replace and noino/sshfs vacate first. Neither primitive
+means \`unsafe_filesystem\` with no public change. Plain link rename uses that same
+order, own-name alias proofs, and a source-bound etag at the published name.
 Directories require no-replace, never overwrite, and own-subtree moves are invalid_input.
 Alias cleanup vetoes the unlink on a believable link count below 2 (statx FORCE_SYNC on Linux, calibrated per operation) and reports a last surviving alias; residual
-(g) also applies to rename. Crash residue includes captured source/destination and
-private preflight dummies, logged before capture, without intent/replay. Rust tests
+(g) also applies to rename. Crash residue includes captured source/destination, an
+INTENT slot map fsynced before the first capture, and private preflight dummies.
+Startup reports \`.wsmp-recover-*\` and never deletes them; there is no replay. Rust tests
 cover Linux/macOS injected capability, ownership, race, cancellation and reply-loss
 tables; the strict real-mount test checks six declared primitive/inode classes (plus a constant-link-count and a cached-attribute class). CI
 runs it on real FUSE mounts in the \`exchangeless-fs\` job (\`apps/cli/scripts/test-exchangeless-fs.sh\`,
@@ -111,6 +113,14 @@ MCP tools can never grant it:
 
 - \`modelApiTokens.updateExternalAccess\` (a token's \`allowExternal\` and
   per-pool \`includeExternal\`) is excluded from the catalog (decision C1);
+- \`modelApiTokens.updateExternalWait\` (a token's \`externalAfterWaitMs\`) is
+  an ordinary \`mcp:write\` tool, \`model_api_token_external_wait_update\`,
+  with no confirmation. Null uses each pool's wait. Pool \`externalAfterWaitMs\`
+  is an owner floor: callers may only lengthen, up to the local capacity wait
+  budget. A request header cannot go below the pool floor or past that budget.
+  Grantees cannot shorten below the pool floor. Every change writes a
+  \`TOKEN_EXTERNAL_WAIT_UPDATED\` provider audit event. MCP diagnostics cannot
+  use \`:external\`;
 - \`providerManagement.setAllowDataCollection\` (the OpenRouter
   "providers that may collect data" opt-out, decision D9) is excluded, and
   \`provider_account_create\` / \`provider_account_update\` reject

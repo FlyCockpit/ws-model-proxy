@@ -40,6 +40,7 @@ const db = vi.hoisted(() => ({
   $queryRaw: vi.fn(),
   $executeRaw: vi.fn(),
   capacityKvEviction: { findMany: vi.fn() },
+  poolMember: { update: vi.fn() },
 }));
 
 vi.mock("@ws-model-proxy/db", async () => ({
@@ -56,6 +57,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 import {
   AFFINITY_EXPIRY_BATCH,
   AFFINITY_RESIDENCY_QUERY_LIMIT,
+  AFFINITY_RESIDENCY_SESSION_FLOOR,
   AFFINITY_TRANSACTION_LIMITS,
   type AffinityTarget,
   affinityPrefixDigests,
@@ -67,6 +69,7 @@ import {
   extractClientConversationId,
   FREE_SAMPLING_PARAMS,
   instructionTokens,
+  markPoolMemberLastRoutedAt,
   prefixBytesAtDepth,
   prefixPayloadTokensAtDepth,
   prefixTokensAtDepth,
@@ -249,6 +252,7 @@ describe("cache affinity", () => {
     db.cacheAffinityRecord.upsert.mockResolvedValue({});
     db.capacityLease.groupBy.mockResolvedValue([]);
     db.capacityWaiter.groupBy.mockResolvedValue([]);
+    db.poolMember.update.mockResolvedValue({ id: "member" });
   });
 
   it.each([
@@ -713,7 +717,9 @@ describe("cache affinity", () => {
       ...args,
       estimatedTokens: 20000,
       reportedTokens: 15000,
+      reportedPromptTokens: 12000,
     });
+    db.$queryRaw.mockClear();
     const next = await rememberAffinity({
       ...args,
       payload: { input: "delta", previous_response_id: "response", conversation: "client" },
@@ -722,6 +728,8 @@ describe("cache affinity", () => {
     });
     expect(next!.estimatedTokens).toBe(20010);
     expect(next!.reportedTokens).toBe(15010);
+    expect(next!.reportedPromptTokens).toBe(12010);
+    expect(db.$queryRaw.mock.calls.filter(([query]) => isShareProbe(query))).toHaveLength(0);
     const empty = await rememberAffinity({
       ...args,
       payload: { previous_response_id: "next-response", conversation: "client" },
@@ -1978,8 +1986,10 @@ describe("cache affinity", () => {
       target: served,
       estimatedTokens: 80_000,
       reportedTokens: 50_000,
+      reportedPromptTokens: 40_000,
     });
-    const expected = prefixTokensAtDepth(canonical, depth, 80_000, 50_000);
+    const expected = prefixTokensAtDepth(canonical, depth, 80_000, 40_000);
+    expect(expected).not.toBe(prefixTokensAtDepth(canonical, depth, 80_000, 50_000));
     expect(expected).not.toBe(prefixTokensAtDepth(canonical, depth, 80_000));
     expect(expected).toBeGreaterThan(0);
     expect(conversationWrites().length).toBeGreaterThan(0);
@@ -2859,7 +2869,7 @@ describe("cache affinity", () => {
     });
     expect(result.instructionDepths?.["target-a"]).toBe(0);
     expect(result.instructionDepths?.["target-b"]).toBe(0);
-    expect(result.orderedTargetIds[0]).toBe("target-a");
+    expect(result.orderedTargetIds[0]).toBe("target-b");
   });
 
   it("queries instruction prefix HMACs even when the conversation digest list is empty", async () => {
@@ -3413,6 +3423,47 @@ describe("cache affinity", () => {
     );
   });
 
+  it("caps oversized images with imageTokenAllowance in the once-per-request prefix sums", () => {
+    const png = new Uint8Array(24);
+    png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+    png[11] = 13;
+    png.set([0x49, 0x48, 0x44, 0x52], 12);
+    new DataView(png.buffer).setUint32(16, 1024);
+    new DataView(png.buffer).setUint32(20, 1024);
+    const imageUrl = `data:image/png;base64,${Buffer.from(png).toString("base64")}`;
+    const payload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "hi" },
+        {
+          role: "user",
+          content: [{ type: "image_url", image_url: { url: imageUrl } }],
+        },
+      ],
+    };
+    const uncapped = buildCanonicalRequest(digestArgs("runtime", payload))!;
+    const capped = buildCanonicalRequest({
+      ...digestArgs("runtime", payload),
+      imageTokenAllowance: 100,
+    })!;
+    expect(capped.unitTokenPrefixSums).toHaveLength(capped.conversationUnits.length + 1);
+    expect(prefixPayloadTokensAtDepth(capped, 0)).toBe(capped.unitTokenPrefixSums[0]);
+    const uncappedFull = prefixPayloadTokensAtDepth(uncapped, uncapped.conversationUnits.length);
+    const cappedFull = prefixPayloadTokensAtDepth(capped, capped.conversationUnits.length);
+    expect(cappedFull).toBeLessThan(uncappedFull);
+    const lastUncapped = uncapped.conversationUnits.length;
+    const lastCapped = capped.conversationUnits.length;
+    const uncappedImage =
+      prefixPayloadTokensAtDepth(uncapped, lastUncapped) -
+      prefixPayloadTokensAtDepth(uncapped, lastUncapped - 1);
+    const cappedImage =
+      prefixPayloadTokensAtDepth(capped, lastCapped) -
+      prefixPayloadTokensAtDepth(capped, lastCapped - 1);
+    expect(cappedImage).toBeLessThan(uncappedImage);
+    expect(cappedImage).toBeLessThanOrEqual(uncappedImage - 1000);
+  });
+
   it("spreads sequential first turns with the same system prompt across three members", async () => {
     const members = (["a", "b", "c"] as const).map((id) => ({
       ...cap8(target(`target-${id}`, `runtime-${id}`, `capacity-${id}`)),
@@ -3463,10 +3514,12 @@ describe("cache affinity", () => {
     expect(await place("one")).toBe("target-a");
     expect(await place("two")).toBe("target-b");
     expect(await place("three")).toBe("target-c");
-    expect(affinityResidencySql("owner", ["capacity-a"], new Date()).strings.join("")).toContain(
-      "ROW_NUMBER()",
-    );
+    const residencySql = affinityResidencySql("owner", ["capacity-a"], new Date()).strings.join("");
+    expect(residencySql).toContain("JOIN LATERAL");
+    expect(residencySql).toContain("LIMIT");
+    expect(residencySql).not.toContain("ROW_NUMBER()");
     expect(AFFINITY_RESIDENCY_QUERY_LIMIT).toBe(2_000);
+    expect(AFFINITY_RESIDENCY_SESSION_FLOOR).toBe(1);
   });
 
   it("places about twice as many first turns on a member with twice the weight", async () => {
@@ -3770,6 +3823,52 @@ describe("cache affinity", () => {
     );
   });
 
+  it("falls back to payload-token share when ranking has no requestTokens", async () => {
+    const warm = {
+      ...cap8(target("target-a", "runtime-a", "capacity-a")),
+      requestTokens: 0,
+    };
+    const idle = cap8(target("target-b", "runtime-b", "capacity-b"));
+    const rankPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "U" },
+        { role: "assistant", content: "A" },
+        { role: "user", content: "next" },
+      ],
+    };
+    const canonical = buildCanonicalRequest(digestArgs(warm.targetIdentity, rankPayload))!;
+    const seeded = affinityPrefixDigests(
+      digestArgs(warm.targetIdentity, { messages: rankPayload.messages.slice(0, 3) }),
+    );
+    const ranked = affinityPrefixDigests(digestArgs(warm.targetIdentity, rankPayload));
+    db.cacheAffinityRecord.findMany.mockResolvedValue(
+      seeded.digests.map((prefixDigest, index) =>
+        affinityRow({
+          target: warm,
+          material: ranked,
+          prefixDigest,
+          prefixDepth: index + 1,
+        }),
+      ),
+    );
+    const result = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [idle, warm],
+    });
+    const total = prefixPayloadTokensAtDepth(canonical, canonical.conversationUnits.length);
+    const prefix = prefixPayloadTokensAtDepth(canonical, 2);
+    expect(result.reasons["target-a"]).toContain(
+      `matchFraction:${Number((prefix / total).toFixed(4))}`,
+    );
+  });
+
   it("treats weight 0 as infinite residency cost", async () => {
     const zero = {
       ...cap8(target("target-a", "runtime-a", "capacity-a")),
@@ -3895,6 +3994,352 @@ describe("cache affinity", () => {
       targets: [forked, small],
     });
     expect(ranked.orderedTargetIds[0]).toBe("target-b");
+  });
+
+  it("saturated lastRoutedAt still orders two full vLLM members", async () => {
+    const older = {
+      ...cap8(target("target-z", "runtime-z", "capacity-z")),
+      poolMemberId: "member-zzz",
+      kvBudgetTokens: 100_000,
+      requestTokens: 10_000,
+      lastRoutedAt: new Date("2026-01-01T00:00:00.000Z"),
+    };
+    const newer = {
+      ...cap8(target("target-a", "runtime-a", "capacity-a")),
+      poolMemberId: "member-aaa",
+      kvBudgetTokens: 100_000,
+      requestTokens: 10_000,
+      lastRoutedAt: new Date("2026-06-01T00:00:00.000Z"),
+    };
+    db.$queryRaw.mockImplementation((query) =>
+      Promise.resolve(
+        isResidencyQuery(query)
+          ? [
+              { capacityId: "capacity-z", sessionId: "full-z", tokens: 100_000 },
+              { capacityId: "capacity-a", sessionId: "full-a", tokens: 100_000 },
+            ]
+          : [],
+      ),
+    );
+    const ranked = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: {
+        messages: [
+          { role: "system", content: "S" },
+          { role: "user", content: "new" },
+        ],
+      },
+      targets: [newer, older],
+    });
+    expect(ranked.orderedTargetIds[0]).toBe("target-z");
+    expect(ranked.scores["target-z"]).toBe(ranked.scores["target-a"]);
+  });
+
+  it("mixed LLAMA_CPP slot occupancy and vLLM token fill share a [0, 1] scale", async () => {
+    const llama = {
+      ...target("target-llama", "runtime-llama", "capacity-llama"),
+      poolMemberId: "member-llama",
+      engineKind: "LLAMA_CPP" as const,
+      kvBudgetTokens: 100_000,
+      slots: 4,
+      hardConcurrencyLimit: 4,
+      requestTokens: 10_000,
+    };
+    const vllm = {
+      ...cap8(target("target-vllm", "runtime-vllm", "capacity-vllm")),
+      poolMemberId: "member-vllm",
+      engineKind: "VLLM" as const,
+      kvBudgetTokens: 100_000,
+      requestTokens: 10_000,
+    };
+    const rankPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "new" },
+      ],
+    };
+    db.$queryRaw.mockImplementation((query) =>
+      Promise.resolve(
+        isResidencyQuery(query)
+          ? [
+              ...Array.from({ length: 20 }, (_, index) => ({
+                capacityId: "capacity-llama",
+                sessionId: `llama-${index}`,
+                tokens: 8_000,
+              })),
+              { capacityId: "capacity-vllm", sessionId: "vllm-full", tokens: 100_000 },
+            ]
+          : [],
+      ),
+    );
+    const packed = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [llama, vllm],
+    });
+    expect(packed.scores["target-llama"]).toBe(packed.scores["target-vllm"]);
+    expect(packed.orderedTargetIds[0]).toBe("target-llama");
+
+    db.$queryRaw.mockImplementation((query) =>
+      Promise.resolve(
+        isResidencyQuery(query)
+          ? Array.from({ length: 20 }, (_, index) => ({
+              capacityId: "capacity-llama",
+              sessionId: `llama-${index}`,
+              tokens: 8_000,
+            }))
+          : [],
+      ),
+    );
+    const idleVllm = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [llama, vllm],
+    });
+    expect(idleVllm.orderedTargetIds[0]).toBe("target-vllm");
+    expect(idleVllm.scores["target-llama"]!).toBeGreaterThanOrEqual(-100);
+  });
+
+  it("member-expensive publicOrder = 0 ranks first when cost is incomparable", async () => {
+    const expensive = {
+      ...cap8(target("target-expensive", "runtime-expensive", "capacity-expensive")),
+      poolMemberId: "member-zzz-expensive",
+      publicEgressPenalty: 100,
+      costPenalty: 0,
+      kvBudgetTokens: null,
+      slots: null,
+    };
+    const cheap = {
+      ...cap8(target("target-cheap", "runtime-cheap", "capacity-cheap")),
+      poolMemberId: "member-aaa-cheap",
+      publicEgressPenalty: 100,
+      costPenalty: 0,
+      kvBudgetTokens: null,
+      slots: null,
+    };
+    const ranked = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy: { ...policy, residencyWeight: 0 },
+      surface: "openai-chat",
+      payload: {
+        messages: [
+          { role: "system", content: "S" },
+          { role: "user", content: "new" },
+        ],
+      },
+      targets: [expensive, cheap],
+    });
+    expect(ranked.orderedTargetIds[0]).toBe("target-expensive");
+    expect(ranked.scores["target-expensive"]).toBe(ranked.scores["target-cheap"]);
+  });
+
+  it("affinityResidencyWeight = 0 ties follow original order, not poolMemberId", async () => {
+    const lateId = {
+      ...cap8(target("target-late", "runtime-late", "capacity-late")),
+      poolMemberId: "member-zzz",
+      kvBudgetTokens: 100_000,
+      requestTokens: 10_000,
+    };
+    const earlyId = {
+      ...cap8(target("target-early", "runtime-early", "capacity-early")),
+      poolMemberId: "member-aaa",
+      kvBudgetTokens: 100_000,
+      requestTokens: 10_000,
+    };
+    const ranked = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy: { ...policy, residencyWeight: 0 },
+      surface: "openai-chat",
+      payload: {
+        messages: [
+          { role: "system", content: "S" },
+          { role: "user", content: "new" },
+        ],
+      },
+      targets: [lateId, earlyId],
+    });
+    expect(ranked.orderedTargetIds).toEqual(["target-late", "target-early"]);
+    expect(db.$queryRaw.mock.calls.filter(([query]) => isResidencyQuery(query))).toHaveLength(0);
+  });
+
+  it("dedups residency by capacityId and sessionId for conversation + conversation_id", async () => {
+    const doubled = {
+      ...cap8(target("target-a", "runtime-a", "capacity-a")),
+      kvBudgetTokens: 200_000,
+      requestTokens: 10_000,
+    };
+    const other = {
+      ...cap8(target("target-b", "runtime-b", "capacity-b")),
+      kvBudgetTokens: 200_000,
+      requestTokens: 10_000,
+    };
+    db.$queryRaw.mockImplementation((query) =>
+      Promise.resolve(
+        isResidencyQuery(query)
+          ? [
+              { capacityId: "capacity-a", sessionId: "same", tokens: 10_000 },
+              { capacityId: "capacity-a", sessionId: "same", tokens: 10_000 },
+              { capacityId: "capacity-b", sessionId: "other", tokens: 10_000 },
+            ]
+          : [],
+      ),
+    );
+    const ranked = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: {
+        conversation: "client",
+        conversation_id: "client",
+        messages: [
+          { role: "system", content: "S" },
+          { role: "user", content: "new" },
+        ],
+      },
+      targets: [doubled, other],
+    });
+    expect(ranked.scores["target-a"]).toBe(ranked.scores["target-b"]);
+    expect(ranked.orderedTargetIds[0]).toBe("target-a");
+  });
+
+  it("share-edge cycle A↔F does not under-bill residency", async () => {
+    const cyclic = {
+      ...cap8(target("target-a", "runtime-a", "capacity-a")),
+      kvBudgetTokens: 200_000,
+      requestTokens: 10_000,
+    };
+    const light = {
+      ...cap8(target("target-b", "runtime-b", "capacity-b")),
+      kvBudgetTokens: 200_000,
+      requestTokens: 10_000,
+    };
+    db.$queryRaw.mockImplementation((query) =>
+      Promise.resolve(
+        isResidencyQuery(query)
+          ? [
+              {
+                capacityId: "capacity-a",
+                sessionId: "A",
+                tokens: 80_000,
+                sharedWithSessionId: "F",
+                sharedPrefixTokens: 80_000,
+              },
+              {
+                capacityId: "capacity-a",
+                sessionId: "F",
+                tokens: 80_000,
+                sharedWithSessionId: "A",
+                sharedPrefixTokens: 80_000,
+              },
+              { capacityId: "capacity-b", sessionId: "other", tokens: 10_000 },
+            ]
+          : [],
+      ),
+    );
+    const ranked = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: {
+        messages: [
+          { role: "system", content: "S" },
+          { role: "user", content: "new" },
+        ],
+      },
+      targets: [cyclic, light],
+    });
+    expect(ranked.orderedTargetIds[0]).toBe("target-b");
+    expect(ranked.scores["target-a"]!).toBeLessThan(ranked.scores["target-b"]!);
+  });
+
+  it("skips residencyPenalty when any member is affine", async () => {
+    const affine = cap8(target("target-a", "runtime-a", "capacity-a"));
+    const packed = {
+      ...cap8(target("target-b", "runtime-b", "capacity-b")),
+      kvBudgetTokens: 100_000,
+      requestTokens: 10_000,
+    };
+    const idle = {
+      ...cap8(target("target-c", "runtime-c", "capacity-c")),
+      kvBudgetTokens: 100_000,
+      requestTokens: 10_000,
+    };
+    const rankPayload = {
+      conversation_id: "client",
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "hello" },
+      ],
+    };
+    const material = affinityPrefixDigests(digestArgs(affine.targetIdentity, rankPayload));
+    db.cacheAffinityRecord.findMany.mockResolvedValue([
+      affinityRow({
+        target: affine,
+        material,
+        conversationDigest: material.conversationDigest,
+        sessionId: material.clientSessionId,
+      }),
+    ]);
+    db.$queryRaw.mockImplementation((query) =>
+      Promise.resolve(
+        isResidencyQuery(query)
+          ? [{ capacityId: "capacity-b", sessionId: "resident", tokens: 90_000 }]
+          : [],
+      ),
+    );
+    const ranked = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [packed, idle, affine],
+    });
+    expect(ranked.orderedTargetIds[0]).toBe("target-a");
+    expect(ranked.conversationMatches["target-a"]).toBe(true);
+    expect(ranked.scores["target-b"]).toBe(ranked.scores["target-c"]);
+  });
+
+  it("writes lastRoutedAt outside the grant fence", async () => {
+    const at = new Date("2026-01-02T00:00:00.000Z");
+    await markPoolMemberLastRoutedAt("member-a", at, db);
+    expect(db.poolMember.update).toHaveBeenCalledWith({
+      where: { id: "member-a" },
+      data: { lastRoutedAt: at },
+    });
+    db.poolMember.update.mockRejectedValueOnce(new Error("unavailable"));
+    await expect(markPoolMemberLastRoutedAt("member-a", at, db)).resolves.toBeUndefined();
+    await markPoolMemberLastRoutedAt(undefined, at, db);
+    expect(db.poolMember.update).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -4273,6 +4718,43 @@ it("R4 bounds wide/deep canonical work and ranks 3 targets within 2 seconds", as
   );
   expect(reads).toBe(2); // validation and root capture, independent of target count
   expect(elapsed).toBeLessThan(2000);
+}, 10_000);
+
+it("precomputed unit tokens rank 8 targets on a 2 MiB canonical within 2 seconds", async () => {
+  db.cacheAffinityRecord.findMany.mockResolvedValue([]);
+  db.capacityLease.groupBy.mockResolvedValue([]);
+  db.capacityWaiter.groupBy.mockResolvedValue([]);
+  const chunk = "x".repeat(32_768);
+  const payload = {
+    conversation: "client",
+    messages: [
+      { role: "system", content: "rules" },
+      ...Array.from({ length: 60 }, (_, index) => ({
+        role: index % 2 ? "assistant" : "user",
+        content: chunk,
+      })),
+    ],
+  };
+  const canonical = buildCanonicalRequest(digestArgs("runtime", payload));
+  expect(canonical).not.toBeNull();
+  expect(canonicalByteLength(canonical!)).toBeGreaterThan(1_000_000);
+  expect(canonical!.unitTokenPrefixSums).toHaveLength(canonical!.conversationUnits.length + 1);
+  for (let depth = 0; depth <= canonical!.conversationUnits.length; depth += 1) {
+    expect(prefixPayloadTokensAtDepth(canonical!, depth)).toBe(
+      canonical!.unitTokenPrefixSums[depth],
+    );
+  }
+  const targets = Array.from({ length: 8 }, (_, index) => {
+    const id = `t${index}`;
+    return target(id, id);
+  });
+  const start = performance.now();
+  await rankAffinityTargets({
+    ...digestArgs("runtime", payload),
+    policy,
+    targets,
+  });
+  expect(performance.now() - start).toBeLessThan(2000);
 }, 10_000);
 
 it("R4 unit-count work refusal retains the safe prefix without identifying a truncated chain", () => {

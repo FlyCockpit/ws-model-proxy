@@ -46,7 +46,9 @@ function sourceFiles(directory: string): string[] {
     const path = join(directory, entry.name);
     if (entry.isDirectory())
       return ["node_modules", "generated", "e2e"].includes(entry.name) ? [] : sourceFiles(path);
-    return /\.(tsx?|mjs|sql|sh)$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name)
+    return /\.(tsx?|mjs|sql|sh)$/.test(entry.name) &&
+      !/\.test\.tsx?$/.test(entry.name) &&
+      !/test-helpers\.ts$/.test(entry.name)
       ? [path]
       : [];
   });
@@ -149,6 +151,8 @@ const HOT_PATH_WRITERS: Record<string, string> = {
     "H: disposable KV eviction feedback (one owner-guarded single-statement upsert, no fence)",
   "apps/server/src/relay/engine-load-rollup.ts":
     "H: persisted engine-load minutes (batched owner-guarded upserts, no fence)",
+  "apps/server/src/relay/node-metrics-rollup.ts":
+    "H: node metrics minutes (batched upserts, no fence)",
   "apps/server/src/model-api/usage-rollup.ts": "H: relay finalization and rollups",
   "apps/server/src/model-api/relay-telemetry-recovery.ts": "H/S: relay crash repair",
   "apps/server/src/model-api/usage-retention.ts": "S: relay and rollup retention",
@@ -177,7 +181,7 @@ const HOT_PATH_WRITERS: Record<string, string> = {
  */
 const GRAPH_WRITERS: Record<string, string> = {
   "packages/api/src/routers/metric-routing.ts":
-    "M: pool routing rules and member engine-load override (one owner-scoped row update of non-key columns each)",
+    "M: pool routing rules (owner fence, replace table rows) and member engine-load override (one owner-scoped row update of non-key columns)",
   "apps/server/src/relay/registration.ts": "M: relay registration",
   "apps/server/src/relay/session-manager.ts": "H status: device connection state",
   "apps/server/src/model-api/provider-attempt-runtime.ts":
@@ -185,6 +189,8 @@ const GRAPH_WRITERS: Record<string, string> = {
   "apps/server/src/model-api/public-overflow.ts": "H status: credential lastUsedAt",
   "packages/api/src/lib/model-pool-routing.ts":
     "H status: pool member health, one row per statement",
+  "apps/server/src/model-api/cache-affinity.ts":
+    "H status: pool member lastRoutedAt (one row per statement, outside the hot fence)",
   "packages/api/src/lib/model-api-token-access.ts": "H status: token lastUsedAt (SKIP LOCKED)",
   "packages/api/src/lib/engine-process-capacity.ts":
     "M: process capacity lifecycle and orphan cleanup",
@@ -192,9 +198,18 @@ const GRAPH_WRITERS: Record<string, string> = {
   "packages/api/src/lib/engine-facts.ts":
     "M: relay engine facts and AUTO limit refresh (registration holds the capacity fences)",
   "packages/api/src/lib/cli-credential-access.ts": "M: device login and deletion",
-  "packages/api/src/routers/forwarder-management.ts": "M: dashboard pool/device/model writes",
+  "packages/api/src/routers/forwarder-management.ts":
+    "M: guarded pool create (owner fence, pool/member/target/capacity/budget writes)",
+  "packages/api/src/routers/forwarder-cli-devices.ts":
+    "M: dashboard device, endpoint, discovered-model, and profile-slug writes",
+  "packages/api/src/routers/forwarder-pools.ts":
+    "M: dashboard pool create/update/delete and declared context seed (owner fence)",
+  "packages/api/src/routers/forwarder-pool-members.ts":
+    "M: dashboard pool member, grant, and discovered-model capability writes",
   "packages/api/src/routers/capacity-management.ts": "M: capacity policy",
   "packages/api/src/routers/provider-management.ts": "M: provider management",
+  "packages/api/src/lib/pool-grant-spend-cap.ts":
+    "M: per-grant owner-paid spend cap (caller already holds owner + budgetGrant fences)",
   "packages/api/src/routers/provider-catalog.ts": "M: provider catalog import",
   "packages/api/src/routers/pool-fallback.ts":
     "M: pool external-fallback settings (owner fence, pool row)",

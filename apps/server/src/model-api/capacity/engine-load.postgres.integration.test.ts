@@ -364,12 +364,14 @@ integration("PostgreSQL live engine load at candidate build and grant time", () 
         const { PostgresCapacityAdmissionStore } = await import("./postgres-store.js");
         const { applyMetricRoutingVerdicts } = await import("../metric-routing-order.js");
         if (scenario === "rules control") {
-          await db.modelPool.update({
-            where: { id: f.pool.id },
+          await db.poolRoutingRule.create({
             data: {
-              routingRules: [
-                { metric: "endpoint.waiting", op: ">=", threshold: 2, effect: "full" },
-              ],
+              poolId: f.pool.id,
+              position: 0,
+              metric: "endpoint.waiting",
+              op: ">=",
+              threshold: 2,
+              effect: "full",
             },
           });
         }

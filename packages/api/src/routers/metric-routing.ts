@@ -4,7 +4,8 @@
  */
 import { createHash } from "node:crypto";
 import { ORPCError } from "@orpc/server";
-import prisma from "@ws-model-proxy/db";
+import prisma, { Prisma } from "@ws-model-proxy/db";
+import { fenceOwners } from "@ws-model-proxy/db/capacity-lock-order";
 import { z } from "zod";
 import type { LiveNodeTelemetrySnapshot } from "../context";
 import { protectedProcedure } from "../index";
@@ -19,28 +20,33 @@ import {
   effectiveKvBudgetTokens,
   effectiveKvCut,
   KV_EVICTION_FLOOR_FRACTION,
+  kvEvictionCutsApply,
+  protectionKvBudgetTokens,
 } from "../lib/kv-eviction-budget";
 import {
   describeSeries,
   ENDPOINT_LOAD_STALE_AFTER_MS,
   type EndpointLoadSample,
   endpointLoadSeries,
+  engineLoadHistoryKey,
+  engineLoadHistoryLookupKeys,
+  idSchema,
   type MetricSeries,
   nodeMetricSeries,
   parseNodeMetricsSample,
   parseStoredRemoteMetricSources,
-  parseStoredRoutingRules,
   pickEndpointLoad,
+  pickEngineLoadHistorySeries,
   type RemoteMetricSourceDefinition,
   remoteMetricSourceDefinitionsSchema,
+  routingRulesFromRows,
   routingRulesSchema,
+  scopedRoutingMemberIds,
 } from "../lib/metric-routing";
 import {
   remoteEngineAdapterDefinitionsSchema,
   serializeRemoteEngineAdapters,
 } from "../lib/remote-engine-adapters";
-
-const idSchema = z.string().min(1);
 
 function commandSha256(command: string): string {
   return createHash("sha256").update(command, "utf8").digest("hex");
@@ -112,8 +118,22 @@ export const metricRoutingProcedures = {
         select: {
           id: true,
           slug: true,
-          routingRules: true,
           protectionEnabled: true,
+          evictionFeedbackEnabled: true,
+          PoolRoutingRules: {
+            orderBy: { position: "asc" },
+            select: {
+              position: true,
+              metric: true,
+              labels: true,
+              aggregate: true,
+              op: true,
+              threshold: true,
+              effect: true,
+              memberId: true,
+              exclude: true,
+            },
+          },
           PoolMembers: {
             where: { tier: "PRIMARY" },
             orderBy: { createdAt: "asc" },
@@ -144,7 +164,7 @@ export const metricRoutingProcedures = {
         },
       });
       if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
-      const rules = parseStoredRoutingRules(pool.routingRules);
+      const rules = routingRulesFromRows(pool.PoolRoutingRules);
       const members = pool.PoolMembers.flatMap((member) => {
         const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
         return model
@@ -241,19 +261,23 @@ export const metricRoutingProcedures = {
           const kvState = member.capacity
             ? kvEvictionByCapacity.get(member.capacity.id)
             : undefined;
-          const reportedTokens = member.capacity?.kvBudgetTokens ?? null;
+          const reportedTokens = protectionKvBudgetTokens(
+            member.capacity?.engineKind,
+            member.capacity?.kvBudgetTokens ?? null,
+          );
           const protectionEnabled = pool.protectionEnabled;
-          const effectiveTokens = protectionEnabled
-            ? effectiveKvBudgetTokens(
-                member.capacity?.engineKind === "LLAMA_CPP" ? null : reportedTokens,
-                kvState,
-                now,
-              )
-            : member.capacity?.engineKind === "LLAMA_CPP"
-              ? null
-              : reportedTokens;
+          const applyCuts = kvEvictionCutsApply(pool.evictionFeedbackEnabled);
+          const placementTokens = effectiveKvBudgetTokens(
+            reportedTokens,
+            kvState,
+            now,
+            pool.evictionFeedbackEnabled,
+          );
+          const effectiveTokens = protectionEnabled ? placementTokens : reportedTokens;
           const cutFraction =
-            !protectionEnabled || effectiveTokens === null ? 0 : effectiveKvCut(kvState, now);
+            !protectionEnabled || !applyCuts || effectiveTokens === null
+              ? 0
+              : effectiveKvCut(kvState, now);
           return {
             poolMemberId: member.id,
             upstreamModelId: member.model.upstreamModelId,
@@ -278,7 +302,9 @@ export const metricRoutingProcedures = {
               kvBudget: {
                 reportedTokens,
                 effectiveTokens,
-                source: member.capacity?.kvBudgetTokensSource ?? null,
+                placementTokens,
+                source:
+                  reportedTokens == null ? null : (member.capacity?.kvBudgetTokensSource ?? null),
                 cutFraction,
                 floorFraction: KV_EVICTION_FLOOR_FRACTION,
                 lastObservedAt: kvState?.observedAt ?? null,
@@ -303,7 +329,8 @@ export const metricRoutingProcedures = {
               state: engineVerdict.state,
               full: engineVerdict.full,
               enforced: engineVerdict.enforced,
-              snapshotState: verdict && !expired ? verdict.engineState : null,
+              snapshotState:
+                verdict && !expired && verdict.verdict === "FULL" ? verdict.engineState : null,
               live: reading
                 ? {
                     running: reading.running,
@@ -437,15 +464,11 @@ export const metricRoutingProcedures = {
           ];
         });
       }
-      const keys = members.map((member) => ({
-        cliDeviceId: member.cliDeviceId,
-        endpointSlug: member.endpointSlug,
-        modelSlug: member.modelSlug,
-      }));
+      const keys = engineLoadHistoryLookupKeys(members);
       const history = context.services?.getLiveEngineLoadHistory?.(keys, now) ?? [];
       const byKey = new Map(
         history.map((entry) => [
-          `${entry.cliDeviceId}\u0000${entry.endpointSlug}\u0000${entry.modelSlug ?? ""}`,
+          engineLoadHistoryKey(entry.cliDeviceId, entry.endpointSlug, entry.modelSlug),
           entry.series,
         ]),
       );
@@ -460,10 +483,7 @@ export const metricRoutingProcedures = {
           signals: member.engineLoadSignals,
           effectiveKvFullThreshold: effectiveKvFullThreshold(member.kvFullThreshold),
           kvBudgetTokens: member.kvBudgetTokens,
-          series:
-            byKey.get(
-              `${member.cliDeviceId}\u0000${member.endpointSlug}\u0000${member.modelSlug ?? ""}`,
-            ) ?? [],
+          series: pickEngineLoadHistorySeries(byKey, member),
         })),
       };
     }),
@@ -471,24 +491,55 @@ export const metricRoutingProcedures = {
   /**
    * Replace a pool's routing rules. `full` makes a member FULL (the request
    * queues, goes to another member, or goes external for `:external`
-   * callers); `avoid` ranks it last. Stale or missing metrics are ignored.
-   * The pool's stored gating (FULL and AVOID) verdicts are cleared so the new rules apply at the
-   * device's next metrics frame.
+   * callers); `avoid` ranks it last. `memberId` limits a rule to that member;
+   * `excludeMemberId` applies it to every other member. Stale or missing
+   * metrics are ignored. The pool's stored gating (FULL and AVOID) verdicts
+   * are cleared so the new rules apply at the device's next metrics frame.
    */
   setPoolRoutingRules: protectedProcedure
     .input(z.object({ poolId: idSchema, rules: routingRulesSchema }))
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
-      // One graph statement (a non-key JSON column). The stored gating verdicts are
-      // H-class rows: they are cleared afterwards by the relay (H module),
+      // Graph table replace under the owner fence. The stored gating verdicts
+      // are H-class rows: they are cleared afterwards by the relay (H module),
       // never by this M writer.
-      const updated = await prisma.modelPool.updateMany({
-        where: { id: input.poolId, userId },
-        data: { routingRules: input.rules },
+      await prisma.$transaction(async (tx) => {
+        await fenceOwners(tx, [userId]);
+        await tx.$queryRaw`
+          SELECT id FROM model_pool
+           WHERE id = ${input.poolId} AND "userId" = ${userId}
+           FOR NO KEY UPDATE`;
+        const pool = await tx.modelPool.findFirst({
+          where: { id: input.poolId, userId },
+          select: { id: true, PoolMembers: { select: { id: true, tier: true } } },
+        });
+        if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+        const primaryIds = new Set(
+          pool.PoolMembers.filter((member) => member.tier === "PRIMARY").map((member) => member.id),
+        );
+        const unknown = scopedRoutingMemberIds(input.rules).filter((id) => !primaryIds.has(id));
+        if (unknown.length > 0) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "memberId and excludeMemberId must name PRIMARY members of this pool.",
+          });
+        }
+        await tx.poolRoutingRule.deleteMany({ where: { poolId: pool.id } });
+        if (input.rules.length === 0) return;
+        await tx.poolRoutingRule.createMany({
+          data: input.rules.map((rule, position) => ({
+            poolId: pool.id,
+            position,
+            metric: rule.metric,
+            labels: rule.labels ?? Prisma.DbNull,
+            aggregate: rule.aggregate,
+            op: rule.op,
+            threshold: rule.threshold,
+            effect: rule.effect,
+            memberId: rule.memberId ?? rule.excludeMemberId ?? null,
+            exclude: Boolean(rule.excludeMemberId),
+          })),
+        });
       });
-      if (updated.count === 0) {
-        throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
-      }
       await context.services?.onPoolRoutingRulesChanged?.(input.poolId);
       return { poolId: input.poolId, rules: input.rules };
     }),

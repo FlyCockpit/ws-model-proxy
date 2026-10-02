@@ -167,6 +167,7 @@ describe("modelApiTokenAccess", () => {
         scopeMode: "ALL_VISIBLE",
         // Private only unless a person allows external providers.
         allowExternal: false,
+        externalAfterWaitMs: null,
         lookupPrefix,
         expiresAt: null,
         lastUsedAt: expect.any(Date),
@@ -194,6 +195,7 @@ describe("modelApiTokenAccess", () => {
         userId: "user-id",
         scopeMode: "ALL_VISIBLE",
         allowExternal: true,
+        externalAfterWaitMs: 500,
         lookupPrefix: credentialLookupPrefix(rawSecret),
         secretDigest: hmacDigestForForwarderPurpose({ purpose: "modelApiToken", value: rawSecret }),
         lastUsedAt: previous,
@@ -203,7 +205,12 @@ describe("modelApiTokenAccess", () => {
       if (updatedRows !== undefined)
         vi.mocked(prisma.$executeRaw).mockResolvedValueOnce(updatedRows);
       const result = await authenticateModelApiTokenSecret(rawSecret);
-      expect(result).toMatchObject({ id: "token-id", allowExternal: true, lastUsedAt: previous });
+      expect(result).toMatchObject({
+        id: "token-id",
+        allowExternal: true,
+        externalAfterWaitMs: 500,
+        lastUsedAt: previous,
+      });
       expect(vi.mocked(prisma.$executeRaw)).toHaveBeenCalledTimes(
         updatedRows === undefined ? 0 : 1,
       );

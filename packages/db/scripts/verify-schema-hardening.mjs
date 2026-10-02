@@ -19,6 +19,13 @@ const [packageJson, agentCompose, entrypoint, dangerousWrapper, applyScript] = a
 ]);
 const requiredFragments = [
   "pool_fallback_preference_grantee",
+  "pool_routing_rule_shape_check",
+  "capacity_kv_eviction_session_ids_ok",
+  "cli_device_node_budget_check",
+  "pool routing rule member must be a PRIMARY member of the pool",
+  "enforce_pool_routing_rule_member",
+  "pool_routing_rule_on_member_delete",
+  'FOREIGN KEY ("memberId") REFERENCES pool_member(id)',
   "own-key preference requires the exact non-owner grant",
   "model_pool_recommended_surface_override_check",
   'UPDATE model_pool\n   SET "recommendedSurfaceOverride" = NULL',
@@ -38,6 +45,7 @@ const requiredFragments = [
   '("sharedPrefixTokens" IS NULL OR "sharedPrefixTokens" >= 0)',
   "capacity_kv_eviction_shape_check",
   "engine_load_rollup_minute_shape_check",
+  "node_metrics_minute_shape_check",
   '"maxKvOccupancy" IS NULL OR ("maxKvOccupancy" >= 0 AND "maxKvOccupancy" <= 1)',
   '"cutFraction" >= 0 AND "cutFraction" <= 1',
   'length("capacityId") BETWEEN 1 AND 128',
@@ -48,6 +56,9 @@ const requiredFragments = [
   "enforce_cache_affinity_node_immutable",
   'ALTER COLUMN "sessionId" SET NOT NULL',
   "cache_affinity_conversation_unique",
+  "cache_affinity_record_residency",
+  'ON cache_affinity_record ("userId", "executionTargetId", "expiresAt" DESC, id DESC)',
+  "DROP INDEX IF EXISTS cache_affinity_record_residency",
   "enforce_cache_affinity_identity_immutable",
   'DELETE FROM cache_affinity_record\n WHERE "digestVersion" < 5',
   'ALTER COLUMN "tenantUserId" SET NOT NULL',
@@ -81,6 +92,16 @@ const requiredFragments = [
   "enforce_provider_credential_account_consistency",
   "enforce_provider_budget_graph_consistency",
   "enforce_provider_budget_history_transitions",
+  "provider_budget_policy_grant_version_unique",
+  "provider_budget_policy_one_active_grant",
+  'OR ("scopeType" = \'POOL_GRANT\' AND "granteeUserId" IS NOT NULL',
+  "budget policy grant must belong to the pool owner",
+  'ALTER TABLE provider_budget_policy ALTER COLUMN "providerAccountId" DROP NOT NULL',
+  'ALTER TABLE provider_budget_policy ADD COLUMN IF NOT EXISTS "poolGrantId" TEXT',
+  'ALTER TABLE provider_budget_policy ADD COLUMN IF NOT EXISTS "granteeUserId" TEXT',
+  '"selectedPoolMemberId" ON relay_request',
+  "NEW.source = 'TRANSFORMER'",
+  "budget reservation credential must match the reservation account",
   "enforce_provider_budget_reservation_transition",
   "provider_pricing_version_shape_check",
   "enforce_provider_pricing_version_immutability",
@@ -90,10 +111,12 @@ const requiredFragments = [
   "DROP TRIGGER IF EXISTS model_pool_public_disable ON model_pool",
   "primary pool members must be local discovered models",
   "model_pool_external_after_wait_check",
+  "model_api_token_external_after_wait_check",
   "relay_request_fallback_route_check",
   // #66: grantee local stickiness and durable relay owner attribution.
   "stickiness pool binding requires the pool owner or the exact grant",
   "stickiness selection must be a local member of its pool",
+  "relay request selection must be a member of its pool",
   "stickiness pool grant row=%s",
   '"selectedExecutionTargetId", "targetModelPoolId", "poolGrantId",\n  "routingVersion" ON response_stickiness_record',
   "derive_relay_request_resource_owner",
@@ -520,59 +543,96 @@ async function verifyAffinityNodeHardening() {
 }
 async function verifyKvEvictionHardening() {
   const cases = [
-    { capacity: "''", cut: "0.1", expires: "NOW() + interval '1 hour'", session: "'session-a'" },
+    {
+      capacity: "''",
+      cut: "0.1",
+      expires: "NOW() + interval '1 hour'",
+      sessions: "ARRAY['session-a']",
+      miss: 0,
+      cont: 0,
+    },
     {
       capacity: "repeat('c', 129)",
       cut: "0.1",
       expires: "NOW() + interval '1 hour'",
-      session: "'session-a'",
+      sessions: "ARRAY['session-a']",
+      miss: 0,
+      cont: 0,
     },
     {
       capacity: "'negative-cut'",
       cut: "-0.01",
       expires: "NOW() + interval '1 hour'",
-      session: "'session-a'",
+      sessions: "ARRAY['session-a']",
+      miss: 0,
+      cont: 0,
     },
     {
       capacity: "'oversized-cut'",
       cut: "1.01",
       expires: "NOW() + interval '1 hour'",
-      session: "'session-a'",
+      sessions: "ARRAY['session-a']",
+      miss: 0,
+      cont: 0,
     },
     {
       capacity: "'nan-cut'",
       cut: "'NaN'::double precision",
       expires: "NOW() + interval '1 hour'",
-      session: "'session-a'",
+      sessions: "ARRAY['session-a']",
+      miss: 0,
+      cont: 0,
     },
     {
       capacity: "'invalid-expiry'",
       cut: "0.1",
       expires: "NOW() - interval '1 second'",
-      session: "'session-a'",
+      sessions: "ARRAY['session-a']",
+      miss: 0,
+      cont: 0,
     },
     {
-      capacity: "'empty-session'",
+      capacity: "'too-many-sessions'",
       cut: "0.1",
       expires: "NOW() + interval '1 hour'",
-      session: "''",
+      sessions: "ARRAY(SELECT generate_series(1,17)::text)",
+      miss: 0,
+      cont: 0,
     },
     {
-      capacity: "'long-session'",
+      capacity: "'miss-over-cont'",
       cut: "0.1",
       expires: "NOW() + interval '1 hour'",
-      session: "repeat('s', 129)",
+      sessions: "ARRAY['session-a']",
+      miss: 2,
+      cont: 1,
+    },
+    {
+      capacity: "'empty-session-id'",
+      cut: "0.1",
+      expires: "NOW() + interval '1 hour'",
+      sessions: "ARRAY['']",
+      miss: 0,
+      cont: 0,
+    },
+    {
+      capacity: "'long-session-id'",
+      cut: "0.1",
+      expires: "NOW() + interval '1 hour'",
+      sessions: "ARRAY[repeat('s', 129)]",
+      miss: 0,
+      cont: 0,
     },
   ];
   for (const row of cases)
     await expectConstraintFailure(`
-    INSERT INTO capacity_kv_eviction ("capacityId", "userId", "cutFraction", "observedAt", "expiresAt", "lastSessionId")
-    VALUES (${row.capacity}, 'owner-a', ${row.cut}, NOW(), ${row.expires}, ${row.session})`);
+    INSERT INTO capacity_kv_eviction ("capacityId", "userId", "cutFraction", "observedAt", "expiresAt", "sessionIds", "missCount", "continuationCount")
+    VALUES (${row.capacity}, 'owner-a', ${row.cut}, NOW(), ${row.expires}, ${row.sessions}, ${row.miss}, ${row.cont})`);
   await client.query(`INSERT INTO capacity_kv_eviction
-    ("capacityId", "userId", "cutFraction", "observedAt", "expiresAt", "lastSessionId")
-    VALUES ('orphan-capacity', 'absent-owner', 0.5, NOW(), NOW(), 'session-a')`);
+    ("capacityId", "userId", "cutFraction", "observedAt", "expiresAt", "sessionIds", "missCount", "continuationCount")
+    VALUES ('orphan-capacity', 'absent-owner', 0.5, NOW(), NOW(), ARRAY['session-a'], 1, 1)`);
   process.stdout.write(
-    "KV eviction hardening: 8 shape negatives and FK-free orphan insert passed.\n",
+    "KV eviction hardening: 10 shape negatives and FK-free orphan insert passed.\n",
   );
 }
 
@@ -1774,6 +1834,35 @@ try {
     INSERT INTO provider_budget_policy
       (id, "createdAt", "updatedAt", "userId", "scopeType", "providerAccountId")
     VALUES ('budget-policy-a', NOW(), NOW(), 'owner-a', 'PROVIDER_ACCOUNT', 'provider-account-a')
+  `);
+  await expectConstraintFailure(`
+    INSERT INTO provider_budget_policy
+      (id, "createdAt", "updatedAt", "userId", "scopeType", "poolId", "poolGrantId")
+    VALUES ('bad-grant-policy-account', NOW(), NOW(), 'owner-a', 'POOL_GRANT',
+      'pool-a', 'sticky-provider-grant')
+  `);
+  await expectConstraintFailure(`
+    INSERT INTO provider_budget_policy
+      (id, "createdAt", "updatedAt", "userId", "scopeType", "providerAccountId", "poolId")
+    VALUES ('bad-grant-policy-keys', NOW(), NOW(), 'owner-a', 'POOL_GRANT',
+      'provider-account-a', 'pool-a')
+  `);
+  await client.query(`
+    INSERT INTO pool_grant
+      (id, "createdAt", "updatedAt", "poolId", "ownerUserId", "granteeUserId")
+    VALUES ('budget-grant-a', NOW(), NOW(), 'pool-a', 'owner-a', 'owner-b')
+  `);
+  await expectConstraintFailure(`
+    INSERT INTO provider_budget_policy
+      (id, "createdAt", "updatedAt", "userId", "scopeType", "poolId", "granteeUserId", "poolGrantId")
+    VALUES ('bad-grant-policy-owner', NOW(), NOW(), 'owner-b', 'POOL_GRANT',
+      'pool-a', 'owner-b', 'budget-grant-a')
+  `);
+  await client.query(`
+    INSERT INTO provider_budget_policy
+      (id, "createdAt", "updatedAt", "userId", "scopeType", "poolId", "granteeUserId", "poolGrantId")
+    VALUES ('budget-grant-policy-a', NOW(), NOW(), 'owner-a', 'POOL_GRANT',
+      'pool-a', 'owner-b', 'budget-grant-a')
   `);
   await expectConstraintFailure(`
     INSERT INTO provider_budget_rule

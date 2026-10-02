@@ -235,9 +235,21 @@ const v4CapabilitiesSchema = z
     protocol: z.enum(["openai-compatible", "anthropic-compatible"]),
     models: z.never().optional(),
     chatCompletions: z.never().optional(),
-    embeddings: z.never().optional(),
     responses: z.never().optional(),
-    audio: z.never().optional(),
+    embeddings: z
+      .object({
+        supported: booleanSupportSchema,
+      })
+      .strict()
+      .optional(),
+    audio: z
+      .object({
+        transcriptions: transcriptionCapabilitiesSchema.optional(),
+        translations: transcriptionCapabilitiesSchema.optional(),
+        speech: booleanSupportSchema,
+      })
+      .strict()
+      .optional(),
     sampling: samplingExtensionSchema.optional(),
     surfaces: z
       .object({
@@ -288,16 +300,13 @@ const v4CapabilitiesSchema = z
   })
   .strict()
   .superRefine((inventory, context) => {
-    const hasAnthropic = inventory.surfaces.anthropicMessages !== undefined;
     const hasOpenAi =
       inventory.surfaces.openaiChatCompletions !== undefined ||
       inventory.surfaces.openaiResponses !== undefined;
-    if (inventory.protocol === "openai-compatible" && hasAnthropic)
-      context.addIssue({
-        code: "custom",
-        message: "OpenAI-compatible inventories cannot declare Anthropic surfaces.",
-        path: ["surfaces", "anthropicMessages"],
-      });
+    // OpenRouter may claim Messages on an openai-compatible inventory; the
+    // provider-type allowlist rejects that claim on OpenAI and generic
+    // openai-compatible gateways until a probe exists.
+    // Anthropic-compatible inventories stay Anthropic-only.
     if (inventory.protocol === "anthropic-compatible" && hasOpenAi)
       context.addIssue({
         code: "custom",

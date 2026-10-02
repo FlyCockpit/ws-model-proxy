@@ -1,7 +1,10 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, Outlet } from "@tanstack/react-router";
+import { poolGrantSpendCapSchema } from "@ws-model-proxy/api/lib/pool-grant-spend-cap";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
+import { parseLocaleDecimal } from "@ws-model-proxy/config/decimal-input";
+import { DEFAULT_LOCALE } from "@ws-model-proxy/config/locales";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import {
@@ -865,6 +868,18 @@ function protectionOverrideLabel(
   return t("dashboard:pools.grantRouting.percentValue", { percent });
 }
 
+function spendCapLabel(
+  spend: PoolGrantRow["fallbackSpend"],
+  t: ReturnType<typeof useTranslation>["t"],
+): string {
+  if (!spend) return t("dashboard:pools.grantRouting.spendCapNone");
+  return t("dashboard:pools.grantRouting.spendCapSummary", {
+    limit: spend.limit,
+    currency: spend.currency,
+    period: t(`dashboard:providers.enums.${spend.period}`),
+  });
+}
+
 function PoolGrantsSection({
   pool,
   openGrant,
@@ -906,6 +921,7 @@ function PoolGrantsSection({
                       grant.queuePriority === null
                         ? t("dashboard:pools.grantRouting.inherit")
                         : grant.queuePriority,
+                    spendCap: spendCapLabel(grant.fallbackSpend, t),
                   })}
                 </span>
               </div>
@@ -972,7 +988,8 @@ function PoolGrantRoutingForm({
   grant: PoolGrantRow;
   onSaved: () => void;
 }) {
-  const { t } = useTranslation(["common", "dashboard"]);
+  const { t, i18n } = useTranslation(["common", "dashboard"]);
+  const locale = i18n.language || DEFAULT_LOCALE;
   const queryClient = useQueryClient();
   const update = useMutation({
     ...orpc.forwarderManagement.updatePoolGrant.mutationOptions({
@@ -997,6 +1014,10 @@ function PoolGrantRoutingForm({
       protectionPercent: grant.protectionOverridePercent || 50,
       priorityMode: (grant.queuePriority === null ? "INHERIT" : "SET") as "INHERIT" | "SET",
       queuePriority: grant.queuePriority ?? 16,
+      spendMode: (grant.fallbackSpend == null ? "NONE" : "SET") as "NONE" | "SET",
+      spendLimit: grant.fallbackSpend?.limit ?? "10",
+      spendCurrency: grant.fallbackSpend?.currency ?? "USD",
+      spendPeriod: (grant.fallbackSpend?.period ?? "UTC_MONTH") as "UTC_DAY" | "UTC_MONTH",
     },
     validators: {
       // A hidden field (its mode not selected) is never validated.
@@ -1006,6 +1027,10 @@ function PoolGrantRoutingForm({
           protectionPercent: z.number(),
           priorityMode: z.enum(["INHERIT", "SET"]),
           queuePriority: z.number(),
+          spendMode: z.enum(["NONE", "SET"]),
+          spendLimit: z.string(),
+          spendCurrency: z.string(),
+          spendPeriod: z.enum(["UTC_DAY", "UTC_MONTH"]),
         })
         .refine(
           (value) =>
@@ -1020,7 +1045,44 @@ function PoolGrantRoutingForm({
             (Number.isInteger(value.queuePriority) &&
               value.queuePriority >= 0 &&
               value.queuePriority <= 31),
-        ),
+        )
+        .superRefine((value, ctx) => {
+          if (value.spendMode !== "SET") return;
+          const limit = parseLocaleDecimal(value.spendLimit, locale);
+          if (limit === null) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["spendLimit"],
+              message: t("dashboard:pools.grantRouting.spendLimitInvalid"),
+            });
+            return;
+          }
+          const currency = value.spendCurrency.trim().toUpperCase();
+          const parsed = poolGrantSpendCapSchema.safeParse({
+            limit,
+            currency,
+            period: value.spendPeriod,
+          });
+          const positive = Number(limit) > 0;
+          if (parsed.success && positive) return;
+          const paths = new Set(
+            (parsed.success ? [] : parsed.error.issues).map((issue) => issue.path[0]),
+          );
+          if (!parsed.success && paths.has("currency")) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["spendCurrency"],
+              message: t("dashboard:pools.grantRouting.spendCurrencyInvalid"),
+            });
+          }
+          if (!positive || paths.has("limit") || paths.size === 0) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["spendLimit"],
+              message: t("dashboard:pools.grantRouting.spendLimitInvalid"),
+            });
+          }
+        }),
     },
     onSubmit: async ({ value }) => {
       await update
@@ -1034,6 +1096,14 @@ function PoolGrantRoutingForm({
                 ? 0
                 : value.protectionPercent,
           queuePriority: value.priorityMode === "INHERIT" ? null : value.queuePriority,
+          fallbackSpend:
+            value.spendMode === "NONE"
+              ? null
+              : {
+                  limit: parseLocaleDecimal(value.spendLimit, locale) ?? value.spendLimit,
+                  currency: value.spendCurrency.trim().toUpperCase(),
+                  period: value.spendPeriod,
+                },
         })
         .catch(() => undefined);
     },
@@ -1120,6 +1190,85 @@ function PoolGrantRoutingForm({
             ) : null}
             <p className="text-xs text-muted-foreground">
               {t("dashboard:pools.grantRouting.priorityHint")}
+            </p>
+          </div>
+        )}
+      </form.Field>
+      <form.Field name="spendMode">
+        {(modeField) => (
+          <div className="min-w-0 space-y-2">
+            <Label htmlFor={`grant-spend-${grant.id}`}>
+              {t("dashboard:pools.grantRouting.spendCap")}
+            </Label>
+            <select
+              id={`grant-spend-${grant.id}`}
+              className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+              value={modeField.state.value}
+              onChange={(event) => modeField.handleChange(event.target.value as "NONE" | "SET")}
+            >
+              <option value="NONE">{t("dashboard:pools.grantRouting.spendCapNone")}</option>
+              <option value="SET">{t("dashboard:pools.grantRouting.spendCapSet")}</option>
+            </select>
+            {modeField.state.value === "SET" ? (
+              <div className="grid min-w-0 gap-2 sm:grid-cols-3">
+                <form.Field name="spendLimit">
+                  {(field) => (
+                    <div className="min-w-0 space-y-1">
+                      <Input
+                        className="min-h-11 min-w-0"
+                        value={field.state.value}
+                        onChange={(event) => field.handleChange(event.target.value)}
+                        aria-label={t("dashboard:pools.grantRouting.spendLimit")}
+                      />
+                      {field.state.meta.errors.map((error) => (
+                        <p key={error?.message} className="text-sm text-destructive">
+                          {error?.message}
+                        </p>
+                      ))}
+                    </div>
+                  )}
+                </form.Field>
+                <form.Field name="spendCurrency">
+                  {(field) => (
+                    <div className="min-w-0 space-y-1">
+                      <Input
+                        className="min-h-11 min-w-0 uppercase"
+                        maxLength={3}
+                        value={field.state.value}
+                        onChange={(event) => field.handleChange(event.target.value.toUpperCase())}
+                        aria-label={t("dashboard:pools.grantRouting.spendCurrency")}
+                      />
+                      {field.state.meta.errors.map((error) => (
+                        <p key={error?.message} className="text-sm text-destructive">
+                          {error?.message}
+                        </p>
+                      ))}
+                    </div>
+                  )}
+                </form.Field>
+                <form.Field name="spendPeriod">
+                  {(field) => (
+                    <select
+                      className="h-11 min-w-0 rounded-md border bg-transparent px-3 text-sm"
+                      value={field.state.value}
+                      onChange={(event) =>
+                        field.handleChange(event.target.value as "UTC_DAY" | "UTC_MONTH")
+                      }
+                      aria-label={t("dashboard:pools.grantRouting.spendPeriod")}
+                    >
+                      <option value="UTC_DAY">
+                        {t("dashboard:pools.grantRouting.spendPeriodDay")}
+                      </option>
+                      <option value="UTC_MONTH">
+                        {t("dashboard:pools.grantRouting.spendPeriodMonth")}
+                      </option>
+                    </select>
+                  )}
+                </form.Field>
+              </div>
+            ) : null}
+            <p className="text-xs text-muted-foreground">
+              {t("dashboard:pools.grantRouting.spendCapHint")}
             </p>
           </div>
         )}
@@ -1325,21 +1474,22 @@ function CapacityEngineFacts({ capacity }: { capacity: PoolDetailCapacity }) {
         )
       : null,
     capacity.kvBudgetTokens !== null
-      ? withProvenance(
-          [
+      ? [
+          withProvenance(
             t("dashboard:pools.capacity.engineFacts.kvBudget", {
               value: capacity.kvBudgetTokens.toLocaleString(),
             }),
-            typeof capacity.effectiveKvBudgetTokens === "number"
-              ? t("dashboard:pools.capacity.engineFacts.kvBudgetEffective", {
-                  value: capacity.effectiveKvBudgetTokens.toLocaleString(),
-                })
-              : null,
-          ]
-            .filter((part): part is string => part !== null)
-            .join(" · "),
-          capacity.kvBudgetTokensSource,
-        )
+            capacity.kvBudgetTokensSource,
+          ),
+          typeof capacity.effectiveKvBudgetTokens === "number" &&
+          capacity.effectiveKvBudgetTokens < capacity.kvBudgetTokens
+            ? t("dashboard:pools.capacity.engineFacts.kvBudgetEffective", {
+                value: capacity.effectiveKvBudgetTokens.toLocaleString(),
+              })
+            : null,
+        ]
+          .filter((part): part is string => part !== null)
+          .join(" · ")
       : null,
     capacity.maxModelLen !== null
       ? withProvenance(

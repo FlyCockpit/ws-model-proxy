@@ -1,4 +1,10 @@
 import {
+  EXTERNAL_AFTER_WAIT_HEADER,
+  parseExternalAfterWaitMs,
+  resolveCallerExternalAfterWaitMs,
+} from "@ws-model-proxy/api/lib/caller-external-wait";
+import { engineCountContextSupportsNative } from "@ws-model-proxy/api/lib/engine-facts";
+import {
   getConfiguredMediaAttachmentMaxBytes,
   resolveAttachmentLimit,
 } from "@ws-model-proxy/api/lib/media-attachment-limits";
@@ -55,6 +61,7 @@ import {
   affinityPrefixDigests,
   buildAffinityTargetIdentity,
   isAffinityTargetWarm,
+  markPoolMemberLastRoutedAt,
   rankAffinityTargets,
   rememberAffinity,
   resolveAffinitySession,
@@ -73,6 +80,7 @@ import {
 import {
   type ContextCountTelemetry,
   contextFitsLimits,
+  contextTokensFitCeiling,
   countSerializedRequestContext,
   withCalibratedContextCount,
 } from "./capacity/context.js";
@@ -109,12 +117,17 @@ import {
   FALLBACK_HEADER,
   FALLBACK_REASON_HEADER,
   type FallbackRoute,
+  GRANTEE_SPEND_CAP_MESSAGE,
   ROUTE_HEADER,
   resolveRequestedModelName,
   SERVED_MODEL_HEADER,
   withResponseHeaders,
 } from "./external-route.js";
-import { observeKvEviction, qualifiesAsEvictionEvidence } from "./kv-eviction-feedback.js";
+import {
+  evictionContinuationKind,
+  kvEvictionResetMs,
+  observeKvEviction,
+} from "./kv-eviction-feedback.js";
 import {
   MODEL_API_MAX_REQUEST_BODY_BYTES,
   MODEL_API_RELAY_TIMEOUT_MS,
@@ -222,7 +235,7 @@ import {
   resolvePublicProviderExecution,
 } from "./public-overflow.js";
 import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
-import { isEngineContextOverflow, shouldRetryRelayOperation } from "./relay-retry-policy.js";
+import { classifyEngineContextOverflow, shouldRetryRelayOperation } from "./relay-retry-policy.js";
 import {
   LOCAL_RELAY_ATTEMPT_TTL_MS,
   LOCAL_RELAY_PROCESS_EPOCH,
@@ -263,6 +276,7 @@ type ModelApiRouteDependencies = {
     | "sendRelayRequest"
     | "cancelRelayRequest"
     | "completeRelayRequest"
+    | "supportsCountContext"
   >;
   concurrencyLimiter?: ModelApiConcurrencyLimiter;
   capacityRuntime?: CapacityAdmissionRuntime;
@@ -375,25 +389,73 @@ type ContextExceededDetails = {
   effectiveContextCeilingTokens: number;
 };
 
+class ContextCeilingExceededError extends Error {
+  readonly name = "ContextCeilingExceededError";
+  constructor(readonly details: ContextExceededDetails) {
+    super("Request context exceeds the configured execution capacity ceiling.");
+  }
+}
+
+function countFirstCeilingTokens(
+  physicalMaxContext: number | null | undefined,
+  effectiveContextCeiling: number | null | undefined,
+  contextMargin: number | null | undefined,
+): number | null {
+  const ceiling = effectiveContextCeilingTokens(physicalMaxContext, effectiveContextCeiling);
+  if (ceiling == null || !Number.isSafeInteger(ceiling) || ceiling <= 0) return null;
+  const margin =
+    typeof contextMargin === "number" && Number.isSafeInteger(contextMargin) && contextMargin > 0
+      ? contextMargin
+      : 0;
+  const inclusive = ceiling - margin;
+  if (!Number.isSafeInteger(inclusive) || inclusive <= 0) return null;
+  return inclusive;
+}
+
+function strictlyLargerCeilingRoutes<T extends { poolMemberId: string }>({
+  candidates,
+  fromMemberId,
+  fromCeiling,
+  memberCeiling,
+  minTokens = null,
+}: {
+  candidates: readonly T[];
+  fromMemberId: string;
+  fromCeiling: number | null;
+  memberCeiling: (poolMemberId: string) => number | null;
+  minTokens?: number | null;
+}): T[] {
+  return candidates.filter((route) => {
+    if (route.poolMemberId === fromMemberId) return false;
+    const ceiling = memberCeiling(route.poolMemberId);
+    if (fromCeiling === null || ceiling === null) return false;
+    if (ceiling <= fromCeiling) return false;
+    return minTokens === null || ceiling > minTokens;
+  });
+}
+
 function contextExceededResponse(
   operation: Pick<RelayOperation, "family">,
   message: string,
   details: ContextExceededDetails,
+  engineSnippet?: string,
 ) {
+  const counts = `Estimated input tokens: ${details.estimatedInputTokens}; estimate method: ${details.estimateMethod}; context margin: ${details.contextMarginTokens}; effective context ceiling: ${details.effectiveContextCeilingTokens}.`;
+  const engine = engineSnippet ? ` Engine: ${engineSnippet}` : "";
   if (operation.family === "messages") {
     return anthropicErrorResponse(
       400,
-      `${message} Estimated input tokens: ${details.estimatedInputTokens}; estimate method: ${details.estimateMethod}; context margin: ${details.contextMarginTokens}; effective context ceiling: ${details.effectiveContextCeilingTokens}.`,
+      `prompt is too long. ${message} ${counts}${engine}`,
       "invalid_request_error",
     );
   }
   return new Response(
     JSON.stringify({
       error: {
-        message,
+        message: `${message} ${counts}${engine}`.trim(),
         type: "invalid_request_error",
         param: null,
-        code: "context_exceeded",
+        code: "context_length_exceeded",
         details,
       },
     }),
@@ -452,6 +514,19 @@ type CalibrationCapacity = {
   imageTokenAllowance?: number | null;
 };
 
+function jsonPayloadFromRelayBody(
+  body: Uint8Array | RelayBodySource | unknown,
+): unknown | undefined {
+  if (body instanceof Uint8Array) {
+    try {
+      return JSON.parse(decodeUtf8Bytes(body));
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 function recordCalibrationFromUsage(
   capacity: CalibrationCapacity | null | undefined,
   payload: unknown,
@@ -484,7 +559,10 @@ function estimatedAffinityTokens(
     const estimate = estimatePayloadTokens(payload, {
       imageTokenAllowance: capacity.imageTokenAllowance,
     });
-    return calibratedFootprintTokens(capacity.id, capacity, estimate.tokens) ?? estimate.tokens;
+    return (
+      calibratedFootprintTokens(capacity.id, capacity, estimate.textTokens, estimate.mediaTokens) ??
+      estimate.tokens
+    );
   } catch {
     return fallback;
   }
@@ -550,6 +628,77 @@ function responseBodyForOperation({
 }
 
 const NATIVE_CONTEXT_COUNT_MAX_BYTES = 64 * 1024;
+const ENGINE_COUNT_NEAR_CEILING_RATIO = 0.85;
+
+function isNearContextCeiling(tokens: number, ceiling: number): boolean {
+  return tokens >= Math.ceil(ceiling * ENGINE_COUNT_NEAR_CEILING_RATIO);
+}
+
+function chatCountFirstRelayFields({
+  family,
+  contextCount,
+  contextInput,
+  engineCountContext,
+  physicalMaxContext,
+  effectiveContextCeiling,
+  contextMargin,
+  manager,
+  cliDeviceId,
+  relayRequestId,
+  operation,
+}: {
+  family: RelayOperation["family"];
+  contextCount: ContextCountTelemetry | undefined;
+  contextInput: RelayOperation["contextInput"];
+  engineCountContext: Parameters<typeof engineCountContextSupportsNative>[0];
+  physicalMaxContext: number | null | undefined;
+  effectiveContextCeiling: number | null | undefined;
+  contextMargin?: number | null;
+  manager: NonNullable<ModelApiRouteDependencies["manager"]>;
+  cliDeviceId: string;
+  relayRequestId: string;
+  operation: RelayOperation;
+}): {
+  countFirst?: true;
+  countCeiling?: number;
+  onCountResult?: (message: {
+    tokens: number;
+    method:
+      | "vllm_tokenize"
+      | "tgi_chat_tokenize"
+      | "llama_apply_template"
+      | "llama_input_tokens"
+      | "adapter_count";
+  }) => void;
+} {
+  if (family !== "chat.completions") return {};
+  if (!engineCountContextSupportsNative(engineCountContext)) return {};
+  if (!manager.supportsCountContext(cliDeviceId)) return {};
+  const ceiling = countFirstCeilingTokens(
+    physicalMaxContext,
+    effectiveContextCeiling,
+    contextMargin,
+  );
+  if (ceiling == null || !contextCount || !isNearContextCeiling(contextCount.tokens, ceiling)) {
+    return {};
+  }
+  return {
+    countFirst: true,
+    countCeiling: ceiling,
+    onCountResult(message) {
+      const exactCount: ContextCountTelemetry = {
+        tokens: message.tokens,
+        method: "NATIVE",
+        exact: true,
+        confidence: "EXACT",
+        safetyMargin: 1,
+        serializedChars: JSON.stringify(contextInput ?? {}).length,
+      };
+      operation.contextCount = exactCount;
+      void updateContextCountMetadata(relayRequestId, exactCount).catch(metadataUpdateError);
+    },
+  };
+}
 
 async function readBoundedJson(
   stream: ReadableStream<Uint8Array>,
@@ -585,6 +734,7 @@ async function nativeContextCount({
   relayRequestId,
   requester,
   pool,
+  effectiveContextCeiling: _effectiveContextCeiling,
 }: {
   request: Request;
   selected: ContextCountModelRow;
@@ -600,6 +750,8 @@ async function nativeContextCount({
     ownerUserId: string;
     accessGrantId: string | null;
   };
+  /** Same min(physical, configured) ceiling `contextFitsLimits` uses. */
+  effectiveContextCeiling?: number | null;
 }): Promise<ContextCountTelemetry | null> {
   if (!operation.contextInput) return null;
   const capacity = selected.ExecutionTarget?.InferenceCapacity;
@@ -637,7 +789,12 @@ async function nativeContextCount({
         countStrategy !== "TEMPLATE_AWARE")
     )
       return raw;
-    const calibrated = calibratedContextTokens(capacity.id, capacity, raw.tokens);
+    const calibrated = calibratedContextTokens(
+      capacity.id,
+      capacity,
+      raw.textTokens ?? raw.tokens,
+      raw.mediaTokens ?? 0,
+    );
     return calibrated === null ? raw : withCalibratedContextCount(raw, calibrated);
   };
   if (
@@ -829,6 +986,7 @@ const inferenceCapacityRelaySelect = {
   cacheNamespace: true,
   engineKind: true,
   kvBudgetTokens: true,
+  engineCountContext: true,
 } satisfies Prisma.InferenceCapacitySelect;
 
 const relayEndpointSelect = {
@@ -903,6 +1061,7 @@ const poolMemberRelaySelect = {
       externalAfterWaitMs: true,
       cacheHolderWaitMs: true,
       protectionEnabled: true,
+      evictionFeedbackEnabled: true,
       protectionWindowSeconds: true,
       protectMinTokens: true,
       protectionShare: true,
@@ -1021,6 +1180,8 @@ type RelayRequester = {
   limitKey: string;
   modelApiTokenId: string | null;
   modelApiTokenLookupPrefix: string | null;
+  /** Token-level `:external` wait; null uses the pool default. */
+  externalAfterWaitMs: number | null;
   exposeTransformDebug?: boolean;
 };
 
@@ -1036,9 +1197,10 @@ function effectiveMemberWaitBudget(member: PoolMemberRelayRow): number | null {
 
 /**
  * Local admission wait for one candidate. A consented `:external` caller with
- * an external plan waits at most the pool's externalAfterWaitMs, and never
- * longer than the member/pool budget. Null means no budget (only the request
- * deadline). The capacity store turns this into a database-clock deadline.
+ * an external plan waits the caller wait (pool floor, optionally lengthened),
+ * and never longer than the member/pool budget. Null means no budget (only
+ * the request deadline). The capacity store turns this into a database-clock
+ * deadline.
  */
 export function localAdmissionWaitBudget(
   memberBudgetMs: number | null,
@@ -1108,6 +1270,7 @@ function warmProtectionPolicyForMember(
   const pool = member?.ModelPool;
   return {
     enabled: pool?.protectionEnabled ?? false,
+    evictionFeedbackEnabled: pool?.evictionFeedbackEnabled ?? true,
     windowSeconds: pool?.protectionWindowSeconds ?? 300,
     minTokens: pool?.protectMinTokens ?? 8192,
     share: pool?.protectionShare ?? "EQUAL_SHARE",
@@ -1175,6 +1338,7 @@ function affinityTargetForMember(
     healthPenalty,
     publicEgressPenalty: 0,
     costPenalty: 0,
+    imageTokenAllowance: capacity.imageTokenAllowance,
   };
 }
 
@@ -2255,6 +2419,7 @@ function requesterFromToken(token: ModelApiTokenIdentity): RelayRequester {
     limitKey: token.id,
     modelApiTokenId: token.id,
     modelApiTokenLookupPrefix: token.lookupPrefix,
+    externalAfterWaitMs: token.externalAfterWaitMs,
   };
 }
 
@@ -2268,6 +2433,7 @@ function requesterFromChatTestUser(
     limitKey: `chat-test:${userId}`,
     modelApiTokenId: null,
     modelApiTokenLookupPrefix: null,
+    externalAfterWaitMs: null,
     exposeTransformDebug: true,
   };
 }
@@ -3650,15 +3816,61 @@ async function assertLocalSendAllowed(input: LocalSendInput): Promise<void> {
  * (supports_vision, capabilities, architecture.input_modalities, …). See
  * `model-list-modalities.ts`. Official OpenAI only requires id/created/object/owned_by.
  */
+const modelListEndpointSelect = {
+  published: true,
+  status: true,
+  cliDeviceId: true,
+  capabilityMetadata: true,
+  CliDevice: { select: { status: true } },
+} as const;
+
+const modelListDiscoveredSelect = {
+  published: true,
+  capabilityOverrideMode: true,
+  capabilityOverrideMetadata: true,
+  Endpoint: { select: modelListEndpointSelect },
+} as const;
+
+function discoveredModelIsActivelyServing(
+  model:
+    | {
+        published: boolean;
+        Endpoint: {
+          published: boolean;
+          status: string | null;
+          cliDeviceId: string;
+          CliDevice: { status: string } | null;
+        };
+      }
+    | null
+    | undefined,
+  activeCliDeviceIds: Set<string>,
+): boolean {
+  if (!model) return false;
+  return isPublishedEndpointExecutable({
+    modelPublished: model.published,
+    endpointPublished: model.Endpoint.published,
+    endpointStatus: model.Endpoint.status,
+    cliDeviceId: model.Endpoint.cliDeviceId,
+    cliDeviceStatus: model.Endpoint.CliDevice?.status,
+    activeCliDeviceIds,
+  });
+}
+
 async function modelListResponse(
   targets: {
     directModels: VisibleDirectModelTarget[];
     modelPools: VisibleModelPoolTarget[];
   },
-  external?: { requester: RelayRequester; externalPoolIds: ReadonlySet<string> },
+  external?: {
+    requester: RelayRequester;
+    externalPoolIds: ReadonlySet<string>;
+    activeCliDeviceIds?: Iterable<string>;
+  },
 ) {
   const directIds = targets.directModels.map((model) => model.id);
   const poolIds = targets.modelPools.map((pool) => pool.id);
+  const activeCliDeviceIds = new Set(external?.activeCliDeviceIds ?? []);
 
   const directRows =
     directIds.length === 0
@@ -3667,9 +3879,7 @@ async function modelListResponse(
           where: { id: { in: directIds } },
           select: {
             id: true,
-            capabilityOverrideMode: true,
-            capabilityOverrideMetadata: true,
-            Endpoint: { select: { capabilityMetadata: true } },
+            ...modelListDiscoveredSelect,
           },
         });
 
@@ -3703,13 +3913,7 @@ async function modelListResponse(
             tier: true,
             ExecutionTarget: {
               select: {
-                DiscoveredModel: {
-                  select: {
-                    capabilityOverrideMode: true,
-                    capabilityOverrideMetadata: true,
-                    Endpoint: { select: { capabilityMetadata: true } },
-                  },
-                },
+                DiscoveredModel: { select: modelListDiscoveredSelect },
                 ProviderModel: {
                   select: {
                     enabled: true,
@@ -3722,13 +3926,7 @@ async function modelListResponse(
                 },
               },
             },
-            DiscoveredModel: {
-              select: {
-                capabilityOverrideMode: true,
-                capabilityOverrideMetadata: true,
-                Endpoint: { select: { capabilityMetadata: true } },
-              },
-            },
+            DiscoveredModel: { select: modelListDiscoveredSelect },
           },
         });
 
@@ -3796,6 +3994,25 @@ async function modelListResponse(
   const localPoolIds = new Set(
     poolMemberRows.filter((row) => row.tier === "PRIMARY").map((row) => row.poolId),
   );
+  // Actively serving = published PRIMARY local member with a live CLI session.
+  // FULL / saturated pools stay listed. Health and KV occupancy are not a hide.
+  const servingDirectIds = new Set(
+    directRows
+      .filter((row) => discoveredModelIsActivelyServing(row, activeCliDeviceIds))
+      .map((row) => row.id),
+  );
+  const servingPoolIds = new Set(
+    poolMemberRows
+      .filter(
+        (row) =>
+          row.tier === "PRIMARY" &&
+          discoveredModelIsActivelyServing(
+            row.ExecutionTarget?.DiscoveredModel ?? row.DiscoveredModel,
+            activeCliDeviceIds,
+          ),
+      )
+      .map((row) => row.poolId),
+  );
   for (const poolId of poolIds) {
     // Provider-only pools advertise their external members' capabilities on
     // the `:external` entry; every other pool advertises its local members.
@@ -3854,15 +4071,18 @@ async function modelListResponse(
   return {
     object: "list" as const,
     data: [
-      ...targets.directModels.map((model) => {
+      ...targets.directModels.flatMap((model) => {
+        if (!servingDirectIds.has(model.id)) return [];
         const flags = directCapsById.get(model.id) ?? multimodalFlagsFromCapabilities(null);
-        return {
-          id: model.modelId,
-          object: "model" as const,
-          created: 0,
-          owned_by: model.ownerUserSlug,
-          ...openAiModelListExtensions(flags),
-        };
+        return [
+          {
+            id: model.modelId,
+            object: "model" as const,
+            created: 0,
+            owned_by: model.ownerUserSlug,
+            ...openAiModelListExtensions(flags),
+          },
+        ];
       }),
       ...targets.modelPools.flatMap((pool) => {
         const flags = poolFlagsById.get(pool.id) ?? multimodalFlagsFromCapabilities(null);
@@ -3873,10 +4093,7 @@ async function modelListResponse(
           owned_by: pool.ownerUserSlug,
           ...openAiModelListExtensions(flags),
         });
-        const hasLocalMembers = localPoolIds.has(pool.id);
-        // A pool with only external members cannot serve its plain name.
-        const plain =
-          hasLocalMembers || pool.externalMemberCount === 0 ? [entry(pool.modelId)] : [];
+        const plain = servingPoolIds.has(pool.id) ? [entry(pool.modelId)] : [];
         // `owner/pool:external` is listed only when this caller could be served
         // that way, from static configuration (never live health): switch on,
         // this token consents for this pool, the owner allows this requester,
@@ -3977,6 +4194,7 @@ async function relayDirect({
         manager,
         relayRequestId,
         requester,
+        effectiveContextCeiling: selected.ExecutionTarget?.directContextCeiling,
       });
       if (exactCount) {
         operation.contextCount = exactCount;
@@ -4166,6 +4384,19 @@ async function relayDirect({
       onResponseBodyChunk: responseIdCapture
         ? (chunk) => responseIdCapture.push(chunk, operation.stream)
         : undefined,
+      ...chatCountFirstRelayFields({
+        family: operation.family,
+        contextCount: operation.contextCount,
+        contextInput: operation.contextInput,
+        engineCountContext: selected.ExecutionTarget?.InferenceCapacity?.engineCountContext,
+        physicalMaxContext: selected.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+        effectiveContextCeiling: selected.ExecutionTarget?.directContextCeiling,
+        contextMargin: selected.ExecutionTarget?.directContextMargin,
+        manager,
+        cliDeviceId: selected.Endpoint.cliDeviceId,
+        relayRequestId,
+        operation,
+      }),
     });
   } catch {
     attempt?.cancel("unknown");
@@ -4200,7 +4431,8 @@ async function relayDirect({
     let startedBody = started.body;
     if (started.status >= 400 && started.status < 500) {
       const errorBytes = await readStreamBytes(startedBody);
-      if (isEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes))) {
+      const overflow = classifyEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes));
+      if (overflow.overflow) {
         attempt.cancel("request_too_large");
         cliLease.release();
         globalLease.release();
@@ -4232,6 +4464,7 @@ async function relayDirect({
                 identity?.directContextCeiling,
               ) ?? 1,
           },
+          overflow.snippet,
         );
       }
       startedBody = bytesToReadableStream(errorBytes);
@@ -4284,6 +4517,13 @@ async function relayDirect({
     const finalize = attempt.terminal
       .catch(() => rejectedRelayTerminal())
       .then(async (terminal) => {
+        if (terminal.ok) {
+          recordCalibrationFromUsage(
+            selected.ExecutionTarget?.InferenceCapacity,
+            jsonPayloadFromRelayBody(builtRequest.body) ?? operation.contextInput,
+            usageFactsFromRelayTerminal(terminal),
+          );
+        }
         const cleanup = await Promise.allSettled([
           Promise.resolve().then(() => cliLease.release()),
           Promise.resolve().then(() => globalLease.release()),
@@ -4341,6 +4581,23 @@ async function relayDirect({
       localExecution,
       userId: requester.userId,
     });
+    if (terminal.failure === "request_too_large" && operation.contextCount?.exact) {
+      const identity = selected.ExecutionTarget;
+      return contextExceededResponse(
+        operation,
+        "Request context exceeds the configured execution capacity ceiling.",
+        {
+          estimatedInputTokens: operation.contextCount.tokens,
+          estimateMethod: operation.contextCount.method,
+          contextMarginTokens: identity?.directContextMargin ?? 0,
+          effectiveContextCeilingTokens:
+            effectiveContextCeilingTokens(
+              identity?.InferenceCapacity?.physicalMaxContext,
+              identity?.directContextCeiling,
+            ) ?? 1,
+        },
+      );
+    }
     return operationFailureResponse(operation, terminal.failure ?? "unknown");
   }
 }
@@ -4799,6 +5056,7 @@ async function relayPool({
           await capacityRuntime.release(admission.lease);
           return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
         }
+        void markPoolMemberLastRoutedAt(selectedPoolMemberId);
         let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
         const previousRoute = routeIdentity;
         try {
@@ -5452,7 +5710,7 @@ async function relayPool({
       terminal ??
       (reason === "NO_COMPATIBLE"
         ? "unsupported_capability"
-        : reason === "SATURATED"
+        : reason === "SATURATED" || reason === "GRANTEE_SPEND_CAP"
           ? "rate_limited"
           : reason === "CANCELLED"
             ? "cancelled"
@@ -5484,6 +5742,12 @@ async function relayPool({
         headers,
       });
     }
+    if (reason === "GRANTEE_SPEND_CAP") {
+      return externalRouteErrorResponse(operation.family, {
+        code: "grantee_spend_cap",
+        message: GRANTEE_SPEND_CAP_MESSAGE,
+      });
+    }
     if (reason !== "UNAVAILABLE") {
       const response = operationFailureResponse(operation, failure);
       if (ownKeyOutcome && reason === "SATURATED") response.headers.set("retry-after", "1");
@@ -5500,60 +5764,17 @@ async function relayPool({
   };
   const nativeCounts = new Map<string, ContextCountTelemetry>();
   if (capacityRuntime && operation.contextInput) {
-    // The native count sends the full request to the owner's machines: the
-    // same gate as the send, as an early exit before the count fan-out.
-    let countRefusal: LocalSendDenial | null = await localSendDenial({
+    // Same gate as the send: an early exit before counting the admitted
+    // member. Counts stay off the owner's machines when the pool is already
+    // unavailable (banned owner, revoked grant, failed check).
+    const countRefusal = await localSendDenial({
       poolId: target.id,
       ownerUserId: target.ownerUserId,
       requesterUserId: requester.userId,
       accessGrantId: target.accessGrantId,
       poolMemberId: null,
     });
-    if (!countRefusal) {
-      await Promise.all(
-        members.map(async (member) => {
-          const selected = {
-            ...member.DiscoveredModel,
-            optimisticBasicTranscription: false,
-            ExecutionTarget: member.ExecutionTarget,
-            Endpoint: {
-              ...member.DiscoveredModel.Endpoint,
-              status: member.DiscoveredModel.Endpoint.status ?? null,
-              CliDevice: member.DiscoveredModel.Endpoint.CliDevice ?? null,
-            },
-          } satisfies ContextCountModelRow;
-          if (!isEndpointConnected(selected, new Set(manager.getActiveCliDeviceIds()))) return;
-          try {
-            const count = await nativeContextCount({
-              request,
-              selected,
-              operation,
-              manager,
-              relayRequestId,
-              requester,
-              pool: {
-                id: target.id,
-                memberId: member.id,
-                tier: "PRIMARY",
-                ownerUserId: target.ownerUserId,
-                accessGrantId: target.accessGrantId,
-              },
-            });
-            if (count) nativeCounts.set(member.id, count);
-          } catch (error) {
-            // A refused count send (owner or requester lost access, grant
-            // revoked, failed check) ends the request below. The request-level
-            // abort is handled by admission/relay; an individual unavailable
-            // counter safely retains the estimate.
-            if (error instanceof LocalSendRefused && error.denial !== "MEMBER_UNAVAILABLE")
-              countRefusal ??= error.denial;
-          }
-        }),
-      );
-    }
     if (countRefusal) {
-      // Same exit as the early refusal: nothing admitted, no external phase,
-      // answered like arrival without route headers.
       const countFailure = LOCAL_SEND_DENIAL_FAILURE[countRefusal];
       externalAttempt.accessLost = true;
       await operation.dispose?.();
@@ -5570,16 +5791,20 @@ async function relayPool({
         : member.ModelPool?.capacityContextCeiling;
   const contextMarginForMember = (member: PoolMemberRelayRow) =>
     member.capacityContextMargin ?? member.ModelPool?.capacityContextMargin ?? 0;
-  const contextEligibleMembers = operation.contextCount
-    ? members.filter((member) =>
-        contextFitsLimits({
-          count: nativeCounts.get(member.id) ?? operation.contextCount!,
-          physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
-          effectiveContextCeiling: configuredContextCeilingForMember(member),
-          contextMargin: contextMarginForMember(member),
-        }),
-      )
-    : members;
+  // Estimates rank at `estimateFitIds`; only an exact native count may drop a
+  // member here. Inexact TOKEN_ESTIMATE/CHAR_ESTIMATE must still count-first
+  // (or native-count) and follow this-member exact vs (ceiling − margin).
+  const contextEligibleMembers =
+    operation.contextCount?.exact === true
+      ? members.filter((member) =>
+          contextFitsLimits({
+            count: nativeCounts.get(member.id) ?? operation.contextCount!,
+            physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+            effectiveContextCeiling: configuredContextCeilingForMember(member),
+            contextMargin: contextMarginForMember(member),
+          }),
+        )
+      : members;
   let canonicalAdaptationRequest: ReturnType<typeof parseCanonicalRequest> | null = null;
   if (operation.adaptation?.poolEnabled === true) {
     try {
@@ -5772,12 +5997,30 @@ async function relayPool({
     const mode = executionByMember.get(candidate.poolMemberId)?.mode;
     return mode === "native" ? 0 : mode === "adapted" ? 1 : 2;
   };
+  // Estimates never fail closed; they only prefer members whose full estimate
+  // (media included) still fits the same ceiling as admission.
+  const estimateFitIds = new Set(
+    operation.contextCount
+      ? eligibleMembers
+          .filter((member) =>
+            contextTokensFitCeiling({
+              tokens: operation.contextCount!.tokens,
+              physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+              effectiveContextCeiling: configuredContextCeilingForMember(member),
+              contextMargin: contextMarginForMember(member),
+            }),
+          )
+          .map((member) => member.id)
+      : eligibleMembers.map((member) => member.id),
+  );
+  const estimateFitRank = (poolMemberId: string) => (estimateFitIds.has(poolMemberId) ? 0 : 1);
   // PRIMARY members are always local. Native compatibility is the first class;
   // member weight remains only as a stable pre-affinity order (new
   // conversations treat weight as a proportional share inside ranking).
   let routeCandidates = [...localRouteCandidates].sort(
     (left, right) =>
       routeModeRank(left) - routeModeRank(right) ||
+      estimateFitRank(left.poolMemberId) - estimateFitRank(right.poolMemberId) ||
       right.weight - left.weight ||
       left.poolMemberId.localeCompare(right.poolMemberId),
   );
@@ -5796,10 +6039,21 @@ async function relayPool({
 
   const memberById = new Map(eligibleMembers.map((member) => [member.id, member] as const));
   // An `:external` caller with an external plan leaves the local queue after
-  // the pool's externalAfterWaitMs (never later than the member budget).
+  // the caller wait (pool floor, then optional token/header lengthening),
+  // never later than the local wait budget.
+  const poolExternalAfterWaitMs = eligibleMembers[0]?.ModelPool?.externalAfterWaitMs;
   const externalAfterWaitMs =
-    external.consent && (target.externalMemberCount > 0 || external.consent.ownKeyProviderModelId)
-      ? (eligibleMembers[0]?.ModelPool?.externalAfterWaitMs ?? null)
+    poolExternalAfterWaitMs !== undefined &&
+    external.consent &&
+    (target.externalMemberCount > 0 || external.consent.ownKeyProviderModelId)
+      ? resolveCallerExternalAfterWaitMs({
+          poolExternalAfterWaitMs,
+          tokenExternalAfterWaitMs: requester.externalAfterWaitMs,
+          requestExternalAfterWaitMs: parseExternalAfterWaitMs(
+            request.headers.get(EXTERNAL_AFTER_WAIT_HEADER),
+          ),
+          capacityWaitBudgetMs: eligibleMembers[0]?.ModelPool?.capacityWaitBudgetMs,
+        })
       : null;
   // Local wait per admission (X1): "shortened" waits min(B, E) and then runs
   // the external phase once (one external phase per request; precommit
@@ -5922,7 +6176,11 @@ async function relayPool({
         },
         signal: request.signal,
       });
-      if (admission.state !== "LEASE_LOST") return admission;
+      if (admission.state !== "LEASE_LOST") {
+        if (admission.state === "ADMITTED")
+          void markPoolMemberLastRoutedAt(admission.lease.poolMemberId);
+        return admission;
+      }
       candidates = candidates
         .filter((candidate) =>
           admission.poolMemberId
@@ -5998,7 +6256,11 @@ async function relayPool({
           // S-C: even one member must know whether this is a continuation
           // (only protection needs it: a pool without it pays no extra reads).
           scoreSingleTarget: Boolean(capacityRuntime) && protectionPolicy.enabled,
-          collectPrefixEvidence: Boolean(capacityRuntime) && protectionPolicy.enabled,
+          collectPrefixEvidence:
+            Boolean(capacityRuntime) &&
+            protectionPolicy.enabled &&
+            (protectionPolicy.evictionFeedbackEnabled ?? true),
+          evictionFeedbackEnabled: protectionPolicy.evictionFeedbackEnabled ?? true,
         });
         const affinityOrder = new Map(
           affinityDecision.orderedTargetIds.map((executionTargetId, index) => [
@@ -6110,11 +6372,96 @@ async function relayPool({
   }
   let capacityLease: Awaited<ReturnType<CapacityAdmissionRuntime["acquire"]>> | undefined;
   let selectedRouteCandidates = routeCandidates;
+  const memberEffectiveCeiling = (poolMemberId: string) => {
+    const member = memberById.get(poolMemberId);
+    if (!member) return null;
+    return effectiveContextCeilingTokens(
+      member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+      configuredContextCeilingForMember(member),
+    );
+  };
+  const respondLocalContextCeiling = async (details: ContextExceededDetails) => {
+    const overflow = await tryPublicOverflow("LOCAL_CONTEXT_CEILING", async () => undefined);
+    if (overflow.kind === "response") return overflow.response;
+    const lostAccess = terminalExternalFailure(overflow);
+    await operation.dispose?.();
+    if (lostAccess) {
+      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: lostAccess });
+      return operationFailureResponse(operation, lostAccess);
+    }
+    await failPoolRelayMetadata({
+      relayRequestId,
+      startedAt,
+      failure: "request_too_large",
+    }).catch(metadataUpdateError);
+    return contextExceededResponse(
+      operation,
+      "Request context exceeds the configured execution capacity ceiling.",
+      details,
+    );
+  };
   const applyMemberContextCount = async (poolMemberId: string) => {
-    const count = nativeCounts.get(poolMemberId);
+    const member = memberById.get(poolMemberId);
+    if (!member) return;
+    let count = nativeCounts.get(poolMemberId);
+    if (!count && capacityRuntime && operation.contextInput) {
+      const selected = {
+        ...member.DiscoveredModel,
+        optimisticBasicTranscription: false,
+        ExecutionTarget: member.ExecutionTarget,
+        Endpoint: {
+          ...member.DiscoveredModel.Endpoint,
+          status: member.DiscoveredModel.Endpoint.status ?? null,
+          CliDevice: member.DiscoveredModel.Endpoint.CliDevice ?? null,
+        },
+      } satisfies ContextCountModelRow;
+      if (isEndpointConnected(selected, new Set(manager.getActiveCliDeviceIds()))) {
+        const next = await nativeContextCount({
+          request,
+          selected,
+          operation,
+          manager,
+          relayRequestId,
+          requester,
+          pool: {
+            id: target.id,
+            memberId: member.id,
+            tier: "PRIMARY",
+            ownerUserId: target.ownerUserId,
+            accessGrantId: target.accessGrantId,
+          },
+          effectiveContextCeiling: configuredContextCeilingForMember(member),
+        });
+        if (next) {
+          count = next;
+          nativeCounts.set(member.id, next);
+        }
+      }
+    }
     if (!count) return;
     operation.contextCount = count;
     await updateContextCountMetadata(relayRequestId, count);
+    const ceiling = effectiveContextCeilingTokens(
+      member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+      configuredContextCeilingForMember(member),
+    );
+    const margin = contextMarginForMember(member);
+    if (
+      count.exact &&
+      !contextFitsLimits({
+        count,
+        physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+        effectiveContextCeiling: configuredContextCeilingForMember(member),
+        contextMargin: margin,
+      })
+    ) {
+      throw new ContextCeilingExceededError({
+        estimatedInputTokens: count.tokens,
+        estimateMethod: count.method,
+        contextMarginTokens: margin,
+        effectiveContextCeilingTokens: ceiling ?? 1,
+      });
+    }
   };
   if (capacityRuntime && affinityDecision) {
     try {
@@ -6238,21 +6585,45 @@ async function relayPool({
     }
     try {
       await applyMemberContextCount(selectedPoolMemberId);
-    } catch {
+    } catch (error) {
       const admittedLease = capacityLease.lease;
-      await settleRelayCleanup([
-        () => capacityRuntime.release(admittedLease),
-        () => operation.dispose?.(),
-      ]);
-      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "unknown" }).catch(
-        metadataUpdateError,
-      );
-      return operationFailureResponse(operation, "unknown");
+      if (error instanceof ContextCeilingExceededError) {
+        const larger = strictlyLargerCeilingRoutes({
+          candidates: routeCandidates,
+          fromMemberId: selectedPoolMemberId,
+          fromCeiling: error.details.effectiveContextCeilingTokens,
+          memberCeiling: memberEffectiveCeiling,
+        });
+        await settleRelayCleanup([() => capacityRuntime.release(admittedLease)]);
+        capacityLease = undefined;
+        if (larger.length > 0) {
+          selectedRouteCandidates = larger;
+        } else {
+          return respondLocalContextCeiling(error.details);
+        }
+      } else {
+        await settleRelayCleanup([
+          () => capacityRuntime.release(admittedLease),
+          () => operation.dispose?.(),
+        ]);
+        if (error instanceof LocalSendRefused && error.denial !== "MEMBER_UNAVAILABLE") {
+          const countFailure = LOCAL_SEND_DENIAL_FAILURE[error.denial];
+          externalAttempt.accessLost = true;
+          await failPoolRelayMetadata({ relayRequestId, startedAt, failure: countFailure });
+          return operationFailureResponse(operation, countFailure);
+        }
+        await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "unknown" }).catch(
+          metadataUpdateError,
+        );
+        return operationFailureResponse(operation, "unknown");
+      }
     }
-    selectedRouteCandidates = [
-      ...routeCandidates.filter(({ poolMemberId }) => poolMemberId === selectedPoolMemberId),
-      ...routeCandidates.filter(({ poolMemberId }) => poolMemberId !== selectedPoolMemberId),
-    ];
+    if (capacityLease?.state === "ADMITTED") {
+      selectedRouteCandidates = [
+        ...routeCandidates.filter(({ poolMemberId }) => poolMemberId === selectedPoolMemberId),
+        ...routeCandidates.filter(({ poolMemberId }) => poolMemberId !== selectedPoolMemberId),
+      ];
+    }
   }
   try {
     globalLease = limiter.acquireGlobal({
@@ -6355,8 +6726,29 @@ async function relayPool({
       const admittedPoolMemberId = capacityLease.lease.poolMemberId;
       try {
         await applyMemberContextCount(admittedPoolMemberId);
-      } catch {
+      } catch (error) {
         await releaseCapacityAttempt();
+        if (error instanceof ContextCeilingExceededError) {
+          const larger = strictlyLargerCeilingRoutes({
+            candidates: selectedRouteCandidates.slice(candidateIndex),
+            fromMemberId: admittedPoolMemberId,
+            fromCeiling: error.details.effectiveContextCeilingTokens,
+            memberCeiling: memberEffectiveCeiling,
+          });
+          if (larger.length > 0) {
+            selectedRouteCandidates = larger;
+            candidateIndex = -1;
+            continue;
+          }
+          globalLease?.release();
+          return respondLocalContextCeiling(error.details);
+        }
+        if (error instanceof LocalSendRefused && error.denial !== "MEMBER_UNAVAILABLE") {
+          finalFailure = LOCAL_SEND_DENIAL_FAILURE[error.denial];
+          poolOwnerLostAccess = true;
+          externalAttempt.accessLost = true;
+          break;
+        }
         finalFailure = "unknown";
         break;
       }
@@ -6602,6 +6994,19 @@ async function relayPool({
         onResponseBodyChunk: (chunk) => {
           responseIdCapture?.push(chunk, operation.stream);
         },
+        ...chatCountFirstRelayFields({
+          family: adaptedSource ? nativeRouteForSurface(adaptedSource).family : operation.family,
+          contextCount: operation.contextCount,
+          contextInput: operation.contextInput,
+          engineCountContext: member.ExecutionTarget?.InferenceCapacity?.engineCountContext,
+          physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+          effectiveContextCeiling: configuredContextCeilingForMember(member),
+          contextMargin: contextMarginForMember(member),
+          manager,
+          cliDeviceId: candidate.cliDeviceId,
+          relayRequestId,
+          operation,
+        }),
       });
     } catch (error) {
       attempt?.cancel("unknown");
@@ -6670,25 +7075,26 @@ async function relayPool({
       let startedBody = started.body;
       if (started.status >= 400 && started.status < 500) {
         const errorBytes = await readStreamBytes(startedBody);
-        if (isEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes))) {
+        const overflow = classifyEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes));
+        if (overflow.overflow) {
           const thisCeiling = effectiveContextCeilingTokens(
             member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
             configuredContextCeilingForMember(member),
           );
-          const remainingLarger = selectedRouteCandidates
-            .slice(candidateIndex + 1)
-            .some((route) => {
-              const next = memberById.get(route.poolMemberId);
-              if (!next) return false;
-              const ceiling = effectiveContextCeilingTokens(
-                next.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
-                configuredContextCeilingForMember(next),
-              );
-              return thisCeiling !== null && ceiling !== null && ceiling > thisCeiling;
-            });
+          // One overflow retry, and only onto members whose ceiling exceeds
+          // both this member's ceiling and the engine-reported size (requested
+          // tokens when the engine split prompt/completion, else prompt).
+          const overflowNeed = overflow.requestedTokens ?? overflow.promptTokens;
+          const overflowRetryCandidates = strictlyLargerCeilingRoutes({
+            candidates: selectedRouteCandidates.filter((_, index) => index > candidateIndex),
+            fromMemberId: candidate.poolMemberId,
+            fromCeiling: thisCeiling,
+            memberCeiling: memberEffectiveCeiling,
+            minTokens: overflowNeed,
+          });
           const retryOverflow =
             !contextOverflowRetried &&
-            remainingLarger &&
+            overflowRetryCandidates.length > 0 &&
             shouldRetryRelayOperation(operation, "precommit_context_exceeded");
           attempt.cancel("request_too_large");
           const overflowTerminal = await attempt.terminal;
@@ -6710,11 +7116,23 @@ async function relayPool({
           if (retryOverflow) {
             contextOverflowRetried = true;
             await releaseCapacityAttempt();
+            selectedRouteCandidates = overflowRetryCandidates;
+            candidateIndex = -1;
             continue;
           }
           await releaseCapacityAttempt();
           globalLease?.release();
+          const overflowResponse = await tryPublicOverflow(
+            "LOCAL_CONTEXT_CEILING",
+            async () => undefined,
+          );
+          if (overflowResponse.kind === "response") return overflowResponse.response;
+          const lostAccess = terminalExternalFailure(overflowResponse);
           await operation.dispose?.();
+          if (lostAccess) {
+            await failPoolRelayMetadata({ relayRequestId, startedAt, failure: lostAccess });
+            return operationFailureResponse(operation, lostAccess);
+          }
           await failPoolRelayMetadata({
             relayRequestId,
             startedAt,
@@ -6729,6 +7147,7 @@ async function relayPool({
               contextMarginTokens: contextMarginForMember(member),
               effectiveContextCeilingTokens: thisCeiling ?? 1,
             },
+            overflow.snippet,
           );
         }
         startedBody = bytesToReadableStream(errorBytes);
@@ -7016,7 +7435,11 @@ async function relayPool({
               return null;
             const usageFacts = usageFactsFromRelayTerminal(upstreamTerminal);
             const capacity = member.ExecutionTarget?.InferenceCapacity;
-            recordCalibrationFromUsage(capacity, affinityPayload, usageFacts);
+            recordCalibrationFromUsage(
+              capacity,
+              jsonPayloadFromRelayBody(builtRequest.body) ?? affinityPayload,
+              usageFacts,
+            );
             return rememberAffinity({
               ownerId: requester.userId,
               resourceOwnerId: member.DiscoveredModel.userId,
@@ -7035,6 +7458,7 @@ async function relayPool({
                 operation.contextCount?.tokens,
               ),
               reportedTokens: reportedAffinityTokens(usageFacts),
+              reportedPromptTokens: usageFacts.promptTokens ?? undefined,
             });
           })
           .catch((error) => {
@@ -7135,22 +7559,22 @@ async function relayPool({
             const sessionId = affinityTarget
               ? affinityDecision?.matchedSessionIds?.[affinityTarget.executionTargetId]
               : undefined;
-            if (
-              affinityTarget &&
-              capacity &&
-              sessionId &&
-              qualifiesAsEvictionEvidence({
-                policy: protectionPolicy,
-                engineKind: capacity.engineKind,
-                kvBudgetTokens: capacity.kvBudgetTokens,
-                ok: terminal.ok,
-                usage,
-                evidence: affinityDecision?.prefixEvidence?.[affinityTarget.executionTargetId],
-                now: attemptDispatchedAt,
-              })
-            )
+            const continuationKind =
+              affinityTarget && capacity && sessionId
+                ? evictionContinuationKind({
+                    policy: protectionPolicy,
+                    engineKind: capacity.engineKind,
+                    kvBudgetTokens: capacity.kvBudgetTokens,
+                    ok: terminal.ok,
+                    usage,
+                    evidence: affinityDecision?.prefixEvidence?.[affinityTarget.executionTargetId],
+                    now: attemptDispatchedAt,
+                    resetAtMs: kvEvictionResetMs(capacity.id),
+                  })
+                : null;
+            if (affinityTarget && capacity && sessionId && continuationKind)
               // The same owner id the protection read filters by.
-              observeKvEviction(capacity.id, target.ownerUserId, sessionId);
+              observeKvEviction(capacity.id, target.ownerUserId, sessionId, continuationKind);
           } catch {
             /* Disposable feedback never changes the response. */
           }
@@ -7219,6 +7643,37 @@ async function relayPool({
         leaseLostNow,
       );
       const failure = terminal.failure ?? "unknown";
+      if (failure === "request_too_large" && operation.contextCount?.exact) {
+        const thisCeiling =
+          effectiveContextCeilingTokens(
+            member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+            configuredContextCeilingForMember(member),
+          ) ?? 1;
+        const larger = strictlyLargerCeilingRoutes({
+          candidates: selectedRouteCandidates.filter((_, index) => index > candidateIndex),
+          fromMemberId: candidate.poolMemberId,
+          fromCeiling: thisCeiling,
+          memberCeiling: memberEffectiveCeiling,
+        });
+        await settleRelayCleanup([
+          () => cliLease.release(),
+          () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
+        ]);
+        await releaseCapacityAttempt();
+        if (larger.length > 0 && !contextOverflowRetried) {
+          contextOverflowRetried = true;
+          selectedRouteCandidates = larger;
+          candidateIndex = -1;
+          continue;
+        }
+        globalLease?.release();
+        return respondLocalContextCeiling({
+          estimatedInputTokens: operation.contextCount.tokens,
+          estimateMethod: operation.contextCount.method,
+          contextMarginTokens: contextMarginForMember(member),
+          effectiveContextCeilingTokens: thisCeiling,
+        });
+      }
       const operationRetryable = shouldRetryRelayOperation(operation, "precommit_transport");
       const memberRetryable =
         isPoolRelayFailureClass(failure) && isRetryablePoolMemberRelayFailure(failure);
@@ -7637,6 +8092,19 @@ async function relaySelectedModelNoFailover({
       onResponseBodyChunk: responseIdCapture
         ? (chunk) => responseIdCapture.push(chunk, operation.stream)
         : undefined,
+      ...chatCountFirstRelayFields({
+        family: operation.family,
+        contextCount: operation.contextCount,
+        contextInput: operation.contextInput,
+        engineCountContext: selected.ExecutionTarget?.InferenceCapacity?.engineCountContext,
+        physicalMaxContext: selected.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+        effectiveContextCeiling: selected.ExecutionTarget?.directContextCeiling,
+        contextMargin: selected.ExecutionTarget?.directContextMargin,
+        manager,
+        cliDeviceId: selected.Endpoint.cliDeviceId,
+        relayRequestId,
+        operation,
+      }),
     });
   } catch (error) {
     const failure: RelayFailure = error instanceof LocalSendRefused ? error.failure : "unknown";
@@ -7665,7 +8133,8 @@ async function relaySelectedModelNoFailover({
     let startedBody = started.body;
     if (started.status >= 400 && started.status < 500) {
       const errorBytes = await readStreamBytes(startedBody);
-      if (isEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes))) {
+      const overflow = classifyEngineContextOverflow(started.status, decodeUtf8Bytes(errorBytes));
+      if (overflow.overflow) {
         attempt.cancel("request_too_large");
         cliLease.release();
         globalLease.release();
@@ -7693,6 +8162,7 @@ async function relaySelectedModelNoFailover({
                 identity?.directContextCeiling,
               ) ?? 1,
           },
+          overflow.snippet,
         );
       }
       startedBody = bytesToReadableStream(errorBytes);
@@ -7714,7 +8184,6 @@ async function relaySelectedModelNoFailover({
             return null;
           const usageFacts = usageFactsFromRelayTerminal(terminal);
           const capacity = selected.ExecutionTarget?.InferenceCapacity;
-          recordCalibrationFromUsage(capacity, operation.contextInput, usageFacts);
           return rememberAffinity({
             ownerId: requester.userId,
             resourceOwnerId: selected.userId,
@@ -7734,6 +8203,7 @@ async function relaySelectedModelNoFailover({
             ),
             estimatedDeltaTokens,
             reportedTokens: reportedAffinityTokens(usageFacts),
+            reportedPromptTokens: usageFacts.promptTokens ?? undefined,
             engineCacheConfirmed: engineCacheConfirmedFromUsageFacts(usageFacts),
           });
         })
@@ -7845,6 +8315,23 @@ async function relaySelectedModelNoFailover({
       localExecution,
       userId: requester.userId,
     });
+    if (terminal.failure === "request_too_large" && operation.contextCount?.exact) {
+      const identity = selected.ExecutionTarget;
+      return contextExceededResponse(
+        operation,
+        "Request context exceeds the configured execution capacity ceiling.",
+        {
+          estimatedInputTokens: operation.contextCount.tokens,
+          estimateMethod: operation.contextCount.method,
+          contextMarginTokens: identity?.directContextMargin ?? 0,
+          effectiveContextCeilingTokens:
+            effectiveContextCeilingTokens(
+              identity?.InferenceCapacity?.physicalMaxContext,
+              identity?.directContextCeiling,
+            ) ?? 1,
+        },
+      );
+    }
     return operationFailureResponse(operation, terminal.failure ?? "unknown");
   }
 }
@@ -8460,6 +8947,7 @@ type ExternalUnavailableReason =
   | "NO_COMPATIBLE"
   | "SATURATED"
   | "UNAVAILABLE"
+  | "GRANTEE_SPEND_CAP"
   | "CANCELLED"
   | "POOL_UNAVAILABLE"
   | "REQUESTER_BLOCKED";
@@ -8498,6 +8986,8 @@ function externalUnavailableReason(
   if (reason === "REQUESTER_ACCESS_BLOCKED") return "REQUESTER_BLOCKED";
   if (reason === "NO_COMPATIBLE_PROVIDER") return "NO_COMPATIBLE";
   if (reason === "PROVIDER_SATURATED") return "SATURATED";
+  if (reason === "GRANTEE_BUDGET_EXCEEDED" || reason === "GRANTEE_CAP_UNPRICEABLE")
+    return "GRANTEE_SPEND_CAP";
   return "UNAVAILABLE";
 }
 
@@ -9212,7 +9702,9 @@ async function relayBoundProviderResponse(input: {
       ? "cancelled"
       : denied
         ? "access_denied"
-        : result.reason === "PROVIDER_SATURATED"
+        : result.reason === "PROVIDER_SATURATED" ||
+            result.reason === "GRANTEE_BUDGET_EXCEEDED" ||
+            result.reason === "GRANTEE_CAP_UNPRICEABLE"
           ? "rate_limited"
           : result.reason === "BOUND_TARGET_INVALID" ||
               result.reason === "REQUESTER_NOT_VISIBLE" ||
@@ -9230,6 +9722,11 @@ async function relayBoundProviderResponse(input: {
     // Restorable consent withdrawals are permission errors; a lost exact
     // grant permanently invalidates the binding, just as at arrival.
     if (denied) return externalRouteErrorResponse("responses", denied);
+    if (result.reason === "GRANTEE_BUDGET_EXCEEDED" || result.reason === "GRANTEE_CAP_UNPRICEABLE")
+      return externalRouteErrorResponse("responses", {
+        code: "grantee_spend_cap",
+        message: GRANTEE_SPEND_CAP_MESSAGE,
+      });
     if (failure === "rate_limited" || failure === "cancelled")
       return openAiFailureJsonResponse(failure);
     if (failure === "disconnected" || failure === "capacity_lease_lost")
@@ -9867,7 +10364,11 @@ export function createModelApiRoutes(dependencies: ModelApiRouteDependencies = {
     const { targets, externalPoolIds } =
       await listVisibleModelTargetsWithExternalPermissionForToken(token);
     return c.json(
-      await modelListResponse(targets, { requester: requesterFromToken(token), externalPoolIds }),
+      await modelListResponse(targets, {
+        requester: requesterFromToken(token),
+        externalPoolIds,
+        activeCliDeviceIds: manager.getActiveCliDeviceIds(),
+      }),
     );
   });
 

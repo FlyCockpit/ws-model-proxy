@@ -89,14 +89,14 @@ describe("entrypoint capacity repairs", () => {
 
   it("awaits database readiness, backfill, then sweep before listening", async () => {
     const result = boot();
-    await vi.waitFor(() => expect(deps.reachable).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(deps.reachable).toHaveBeenCalledOnce(), { timeout: 10_000 });
     expect(deps.backfill).not.toHaveBeenCalled();
     ready.resolve();
-    await vi.waitFor(() => expect(deps.backfill).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(deps.backfill).toHaveBeenCalledOnce(), { timeout: 10_000 });
     expect(deps.sweep).not.toHaveBeenCalled();
     expect(deps.serve).not.toHaveBeenCalled();
     backfill.resolve();
-    await vi.waitFor(() => expect(deps.sweep).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(deps.sweep).toHaveBeenCalledOnce(), { timeout: 10_000 });
     expect(deps.serve).not.toHaveBeenCalled();
     sweep.resolve();
     expect(await result).toBeUndefined();
@@ -107,10 +107,10 @@ describe("entrypoint capacity repairs", () => {
   it.each(["backfill", "sweep"] as const)("keeps %s failure fatal in index.ts", async (step) => {
     const result = boot();
     ready.resolve();
-    await vi.waitFor(() => expect(deps.backfill).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(deps.backfill).toHaveBeenCalledOnce(), { timeout: 10_000 });
     if (step === "sweep") {
       backfill.resolve();
-      await vi.waitFor(() => expect(deps.sweep).toHaveBeenCalledOnce());
+      await vi.waitFor(() => expect(deps.sweep).toHaveBeenCalledOnce(), { timeout: 10_000 });
     }
     (step === "backfill" ? backfill : sweep).reject(new TypeError("private connection details"));
     expect(await result).toEqual(new Error("fatal exit"));

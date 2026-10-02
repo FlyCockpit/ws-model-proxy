@@ -18,7 +18,7 @@ BEGIN;
 -- locks is included by the backfills below; one that starts after they are
 -- released sees the installed triggers.
 LOCK TABLE "user", cli_device, endpoint, discovered_model, execution_target, model_pool,
-  model_api_token, pool_member, pool_grant, pool_fallback_preference,
+  model_api_token, pool_member, pool_routing_rule, pool_grant, pool_fallback_preference,
   model_api_token_allowlist_entry, response_stickiness_record,
   relay_request, inference_capacity, capacity_runtime, admission_request, capacity_waiter,
   capacity_lease, capacity_audit_event, provider_account, provider_model, provider_credential,
@@ -26,7 +26,7 @@ LOCK TABLE "user", cli_device, endpoint, discovered_model, execution_target, mod
   provider_usage_ledger, provider_pricing_version, provider_budget_settlement,
   provider_audit_event, public_provider_attempt_event, relay_execution_attempt,
   relay_execution_event, usage_rollup_minute, usage_rollup_hour, engine_load_rollup_minute,
-  cache_affinity_record, cache_affinity_node, capacity_kv_eviction, session IN ACCESS EXCLUSIVE MODE NOWAIT;
+  node_metrics_minute, cache_affinity_record, cache_affinity_node, capacity_kv_eviction, session IN ACCESS EXCLUSIVE MODE NOWAIT;
 
 -- Deploy writer (class D): the backfills below rewrite graph rows while every
 -- table is locked exclusively, so no fence can be contended. The graph-write
@@ -165,6 +165,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS cache_affinity_conversation_unique
     ("tenantUserId", "poolId", "executionTargetId", "targetIdentity", "bindingDigest", "conversationDigest")
   WHERE "conversationDigest" IS NOT NULL AND "prefixDigest" IS NULL;
 
+-- Newest-first footprints for new-conversation residency. The LATERAL
+-- per-target LIMIT in affinityResidencySql walks this instead of ranking
+-- every live prefix row. DROP first so existing deployments replace the
+-- old (executionTargetId, expiresAt DESC) shape.
+DROP INDEX IF EXISTS cache_affinity_record_residency;
+CREATE INDEX cache_affinity_record_residency
+  ON cache_affinity_record ("userId", "executionTargetId", "expiresAt" DESC, id DESC)
+  WHERE "prefixDigest" IS NULL;
+
 ALTER TABLE cache_affinity_record DROP CONSTRAINT IF EXISTS cache_affinity_record_shape_check;
 ALTER TABLE cache_affinity_record ADD CONSTRAINT cache_affinity_record_shape_check CHECK (
   "digestVersion" >= 5
@@ -253,13 +262,59 @@ ALTER TABLE engine_load_rollup_minute ADD CONSTRAINT engine_load_rollup_minute_s
   AND "prefixCacheHits" >= 0 AND "prefixCacheQueries" >= 0
 );
 
+-- Class-H node-metrics minutes for CLI node-card sparklines (min/avg/max).
+ALTER TABLE node_metrics_minute DROP CONSTRAINT IF EXISTS node_metrics_minute_shape_check;
+ALTER TABLE node_metrics_minute ADD CONSTRAINT node_metrics_minute_shape_check CHECK (
+  length("ownerUserId") BETWEEN 1 AND 128
+  AND length("cliDeviceId") BETWEEN 1 AND 128
+  AND samples >= 0 AND "cpuSamples" >= 0 AND "memorySamples" >= 0
+  AND "cpuSamples" <= samples AND "memorySamples" <= samples
+  AND ("minCpuPercent" IS NULL OR ("minCpuPercent" >= 0 AND "minCpuPercent" <= 100))
+  AND ("maxCpuPercent" IS NULL OR ("maxCpuPercent" >= 0 AND "maxCpuPercent" <= 100))
+  AND ("sumCpuPercent" IS NULL OR "sumCpuPercent" >= 0)
+  AND ("minMemoryAvailableMiB" IS NULL OR "minMemoryAvailableMiB" >= 0)
+  AND ("maxMemoryAvailableMiB" IS NULL OR "maxMemoryAvailableMiB" >= 0)
+  AND ("sumMemoryAvailableMiB" IS NULL OR "sumMemoryAvailableMiB" >= 0)
+  AND ("minMemoryUsedPercent" IS NULL OR ("minMemoryUsedPercent" >= 0 AND "minMemoryUsedPercent" <= 100))
+  AND ("maxMemoryUsedPercent" IS NULL OR ("maxMemoryUsedPercent" >= 0 AND "maxMemoryUsedPercent" <= 100))
+  AND ("sumMemoryUsedPercent" IS NULL OR "sumMemoryUsedPercent" >= 0)
+  AND ("maxGpuUtilizationPercent" IS NULL OR ("maxGpuUtilizationPercent" >= 0 AND "maxGpuUtilizationPercent" <= 100))
+);
+
 -- Disposable class H feedback; no graph locks or foreign keys.
+CREATE OR REPLACE FUNCTION capacity_kv_eviction_session_ids_ok(ids text[])
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+  SELECT array_position(ids, NULL) IS NULL
+     AND NOT EXISTS (
+       SELECT 1 FROM unnest(ids) AS session_id
+        WHERE length(session_id) NOT BETWEEN 1 AND 128
+     );
+$$;
+
 ALTER TABLE capacity_kv_eviction DROP CONSTRAINT IF EXISTS capacity_kv_eviction_shape_check;
 ALTER TABLE capacity_kv_eviction ADD CONSTRAINT capacity_kv_eviction_shape_check CHECK (
   "cutFraction" >= 0 AND "cutFraction" <= 1
   AND length("capacityId") BETWEEN 1 AND 128
-  AND length("lastSessionId") BETWEEN 1 AND 128
+  AND cardinality("sessionIds") <= 16
+  AND capacity_kv_eviction_session_ids_ok("sessionIds")
+  AND "missCount" >= 0
+  AND "continuationCount" >= 0
+  AND "missCount" <= "continuationCount"
   AND "expiresAt" >= "observedAt"
+);
+
+-- Owner-written node budgets and labels. Values above 1e6 GiB or the wrong
+-- JSON shape are rejected here; kind-appropriate GPU keys are an app check.
+ALTER TABLE cli_device DROP CONSTRAINT IF EXISTS cli_device_node_budget_check;
+ALTER TABLE cli_device ADD CONSTRAINT cli_device_node_budget_check CHECK (
+  cardinality(labels) <= 32
+  AND ("usableMemoryGb" IS NULL OR ("usableMemoryGb" >= 0 AND "usableMemoryGb" <= 1000000))
+  AND ("usableRamGb" IS NULL OR ("usableRamGb" >= 0 AND "usableRamGb" <= 1000000))
+  AND ("usableVramGb" IS NULL OR jsonb_typeof("usableVramGb") = 'object')
 );
 
 -- Digest-only class H state; indexed probes are ordered without a population sort.
@@ -313,6 +368,66 @@ ALTER TABLE pool_member ADD CONSTRAINT pool_member_tier_shape_check CHECK (
 
 CREATE UNIQUE INDEX IF NOT EXISTS pool_member_public_order_unique
   ON pool_member ("poolId", "publicOrder") WHERE tier = 'PUBLIC_OVERFLOW';
+
+-- Member-scoped routing rules: pool deletes cascade. Targeted memberId rules
+-- are deleted with the member; exclude rules SET NULL and become pool-wide.
+-- exclude without a member is invalid on write; a memberId must be PRIMARY.
+ALTER TABLE pool_routing_rule DROP CONSTRAINT IF EXISTS pool_routing_rule_shape_check;
+ALTER TABLE pool_routing_rule ADD CONSTRAINT pool_routing_rule_shape_check CHECK (
+  position BETWEEN 0 AND 15
+  AND length(metric) BETWEEN 1 AND 64
+  AND metric ~ '^[A-Za-z0-9_.:-]{1,64}$'
+  AND aggregate IN ('max', 'min', 'avg')
+  AND op IN ('>', '>=', '<', '<=')
+  AND effect IN ('full', 'avoid')
+  AND "threshold" = "threshold"
+  AND "threshold" BETWEEN -1e308 AND 1e308
+  AND (NOT exclude OR "memberId" IS NOT NULL)
+  AND ("memberId" IS NULL OR length("memberId") BETWEEN 1 AND 128)
+  AND (labels IS NULL OR jsonb_typeof(labels) = 'object')
+);
+
+ALTER TABLE pool_routing_rule DROP CONSTRAINT IF EXISTS pool_routing_rule_memberId_fkey;
+ALTER TABLE pool_routing_rule
+  ADD CONSTRAINT pool_routing_rule_memberId_fkey
+  FOREIGN KEY ("memberId") REFERENCES pool_member(id)
+  ON DELETE SET NULL ON UPDATE CASCADE;
+
+CREATE OR REPLACE FUNCTION enforce_pool_routing_rule_member()
+RETURNS trigger LANGUAGE plpgsql AS $pool_routing_rule_member$
+BEGIN
+  IF NEW."memberId" IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM pool_member
+     WHERE id = NEW."memberId" AND "poolId" = NEW."poolId" AND tier = 'PRIMARY'
+  ) THEN
+    RAISE EXCEPTION 'pool routing rule member must be a PRIMARY member of the pool'
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$pool_routing_rule_member$;
+
+DROP TRIGGER IF EXISTS pool_routing_rule_member ON pool_routing_rule;
+CREATE TRIGGER pool_routing_rule_member
+BEFORE INSERT OR UPDATE OF "poolId", "memberId" ON pool_routing_rule
+FOR EACH ROW EXECUTE FUNCTION enforce_pool_routing_rule_member();
+
+CREATE OR REPLACE FUNCTION pool_routing_rule_on_member_delete()
+RETURNS trigger LANGUAGE plpgsql AS $pool_routing_rule_on_member_delete$
+BEGIN
+  DELETE FROM pool_routing_rule
+   WHERE "memberId" = OLD.id AND exclude IS NOT TRUE;
+  UPDATE pool_routing_rule
+     SET "memberId" = NULL, exclude = false
+   WHERE "memberId" = OLD.id AND exclude IS TRUE;
+  RETURN OLD;
+END;
+$pool_routing_rule_on_member_delete$;
+
+DROP TRIGGER IF EXISTS pool_routing_rule_on_member_delete ON pool_member;
+CREATE TRIGGER pool_routing_rule_on_member_delete
+BEFORE DELETE ON pool_member
+FOR EACH ROW EXECUTE FUNCTION pool_routing_rule_on_member_delete();
 
 -- Fallback redesign: a pool's plain name never leaves the deployment.
 -- PRIMARY members are always local (discovered) models; provider models can
@@ -1507,6 +1622,11 @@ ALTER TABLE model_pool ADD CONSTRAINT model_pool_external_after_wait_check CHECK
   "externalAfterWaitMs" BETWEEN 0 AND 600000
 );
 
+ALTER TABLE model_api_token DROP CONSTRAINT IF EXISTS model_api_token_external_after_wait_check;
+ALTER TABLE model_api_token ADD CONSTRAINT model_api_token_external_after_wait_check CHECK (
+  "externalAfterWaitMs" IS NULL OR "externalAfterWaitMs" BETWEEN 0 AND 600000
+);
+
 -- Saturation S-A: null = automatic, 0 = off, otherwise fixed (capped at 30 s).
 ALTER TABLE model_pool DROP CONSTRAINT IF EXISTS model_pool_cache_holder_wait_check;
 ALTER TABLE model_pool ADD CONSTRAINT model_pool_cache_holder_wait_check CHECK (
@@ -1897,11 +2017,20 @@ BEGIN
     IF NEW."requestedExecutionTargetId" IS NOT NULL THEN
       SELECT "userId", "discoveredModelId" INTO target_owner, target_model
         FROM execution_target WHERE id = NEW."requestedExecutionTargetId";
-      IF FOUND AND (target_owner IS DISTINCT FROM NEW."userId"
-         OR (NEW."requestedDiscoveredModelId" IS NOT NULL
-             AND target_model IS DISTINCT FROM NEW."requestedDiscoveredModelId")) THEN
-        RAISE EXCEPTION 'relay request target must match its owner and discovered model'
-          USING ERRCODE = '23514';
+      IF FOUND THEN
+        -- Pool hops (including media transformers) target the pool owner's
+        -- machine. Direct targets still belong to the requester.
+        consumer_owner := NEW."userId";
+        IF NEW."requestedModelPoolId" IS NOT NULL THEN
+          SELECT "userId" INTO pool_owner FROM model_pool WHERE id = NEW."requestedModelPoolId";
+          consumer_owner := COALESCE(pool_owner, NEW."resourceOwnerUserId", NEW."userId");
+        END IF;
+        IF target_owner IS DISTINCT FROM consumer_owner
+           OR (NEW."requestedDiscoveredModelId" IS NOT NULL
+               AND target_model IS DISTINCT FROM NEW."requestedDiscoveredModelId") THEN
+          RAISE EXCEPTION 'relay request target must match its owner and discovered model'
+            USING ERRCODE = '23514';
+        END IF;
       END IF;
     END IF;
     -- A PENDING pool request whose pool is already gone (deleted while the
@@ -1955,6 +2084,44 @@ BEGIN
           RAISE EXCEPTION 'relay request selection must match its owner and discovered model'
             USING ERRCODE = '23514';
         END IF;
+      END IF;
+      -- INSERT-time membership: the selected target belonged to the requested
+      -- pool when this selection was written (same idea as stickiness v3).
+      -- Membership is mutable, so later status-only updates are not re-checked.
+      -- Grantee LOCAL rows keep the pool-owner graph; the caller need not own
+      -- the target. own-key selections are the caller's provider, not a member.
+      IF NEW."requestedModelPoolId" IS NOT NULL
+         AND NEW."fallbackRoute" IS DISTINCT FROM 'own-key'
+         AND (TG_OP = 'INSERT'
+           OR NEW."selectedExecutionTargetId" IS DISTINCT FROM OLD."selectedExecutionTargetId"
+           OR NEW."requestedModelPoolId" IS DISTINCT FROM OLD."requestedModelPoolId"
+           OR NEW."fallbackRoute" IS DISTINCT FROM OLD."fallbackRoute"
+           OR NEW."selectedPoolMemberId" IS DISTINCT FROM OLD."selectedPoolMemberId")
+         -- Deleted parent: the late finalizer must still commit status.
+         AND EXISTS (SELECT 1 FROM model_pool WHERE id = NEW."requestedModelPoolId")
+         -- Media transformers are pool-owned and need not be members.
+         AND NOT (
+           NEW.source = 'TRANSFORMER'
+           AND EXISTS (
+             SELECT 1 FROM model_pool pool
+               JOIN execution_target transformer
+                 ON transformer."discoveredModelId" = pool."transformerDiscoveredModelId"
+              WHERE pool.id = NEW."requestedModelPoolId"
+                AND transformer.id = NEW."selectedExecutionTargetId"
+           )
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM pool_member member
+            WHERE member."poolId" = NEW."requestedModelPoolId"
+              AND member."executionTargetId" = NEW."selectedExecutionTargetId"
+              AND (NEW."selectedPoolMemberId" IS NULL OR member.id = NEW."selectedPoolMemberId")
+              AND member.tier = CASE
+                WHEN NEW."fallbackRoute" = 'pool-external' THEN 'PUBLIC_OVERFLOW'::"PoolMemberTier"
+                ELSE 'PRIMARY'::"PoolMemberTier"
+              END
+         ) THEN
+        RAISE EXCEPTION 'relay request selection must be a member of its pool'
+          USING ERRCODE = '23514';
       END IF;
     END IF;
   END IF;
@@ -2026,7 +2193,8 @@ UPDATE relay_request AS request
 DROP TRIGGER IF EXISTS relay_request_execution_target_consistency ON relay_request;
 CREATE TRIGGER relay_request_execution_target_consistency
 BEFORE INSERT OR UPDATE OF "userId", "requestedDiscoveredModelId", "requestedExecutionTargetId",
-  "selectedDiscoveredModelId", "selectedExecutionTargetId", "requestedModelPoolId", "fallbackRoute" ON relay_request
+  "selectedDiscoveredModelId", "selectedExecutionTargetId", "requestedModelPoolId", "fallbackRoute",
+  "selectedPoolMemberId" ON relay_request
 FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
 
 UPDATE provider_account SET "endpointIdentity" = "baseUrl" WHERE "endpointIdentity" = '';
@@ -2118,11 +2286,30 @@ ALTER TABLE provider_credential ADD CONSTRAINT provider_credential_shape_check C
     OR (status = 'REVOKED' AND "revokedAt" IS NOT NULL))
 );
 
+-- POOL_GRANT is grant-wide (no account attachment), keyed by pool + grantee
+-- so revoke/re-grant keep the cap. poolGrantId is last-seen audit, not an FK.
+ALTER TABLE provider_budget_policy ADD COLUMN IF NOT EXISTS "poolGrantId" TEXT;
+ALTER TABLE provider_budget_policy ADD COLUMN IF NOT EXISTS "granteeUserId" TEXT;
+ALTER TABLE provider_budget_policy ALTER COLUMN "providerAccountId" DROP NOT NULL;
+-- The transition trigger (installed on re-runs) forbids this UPDATE. Drop it
+-- for the backfill; the CREATE TRIGGER later in this file reinstalls it.
+DROP TRIGGER IF EXISTS provider_budget_policy_transition ON provider_budget_policy;
+UPDATE provider_budget_policy AS policy
+   SET "granteeUserId" = grant_row."granteeUserId"
+  FROM pool_grant AS grant_row
+ WHERE policy."scopeType" = 'POOL_GRANT'
+   AND policy."granteeUserId" IS NULL
+   AND grant_row.id = policy."poolGrantId";
+
 ALTER TABLE provider_budget_policy DROP CONSTRAINT IF EXISTS provider_budget_policy_scope_check;
 ALTER TABLE provider_budget_policy ADD CONSTRAINT provider_budget_policy_scope_check CHECK (
   version > 0
-  AND (("scopeType" = 'PROVIDER_ACCOUNT' AND "poolId" IS NULL AND "providerModelId" IS NULL)
-    OR ("scopeType" = 'POOL_PROVIDER_MODEL' AND "poolId" IS NOT NULL AND "providerModelId" IS NOT NULL))
+  AND (("scopeType" = 'PROVIDER_ACCOUNT' AND "poolId" IS NULL AND "providerModelId" IS NULL
+        AND "poolGrantId" IS NULL AND "granteeUserId" IS NULL AND "providerAccountId" IS NOT NULL)
+    OR ("scopeType" = 'POOL_PROVIDER_MODEL' AND "poolId" IS NOT NULL AND "providerModelId" IS NOT NULL
+        AND "poolGrantId" IS NULL AND "granteeUserId" IS NULL AND "providerAccountId" IS NOT NULL)
+    OR ("scopeType" = 'POOL_GRANT' AND "granteeUserId" IS NOT NULL AND "poolId" IS NOT NULL
+        AND "providerModelId" IS NULL AND "providerAccountId" IS NULL))
   AND ((active AND "activatedAt" IS NOT NULL AND "deactivatedAt" IS NULL)
     OR (NOT active AND ("activatedAt" IS NULL OR "deactivatedAt" IS NOT NULL)))
 );
@@ -2133,12 +2320,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_account_version_unique
 CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_attachment_version_unique
   ON provider_budget_policy ("userId", "providerAccountId", "poolId", "providerModelId", version)
   WHERE "scopeType" = 'POOL_PROVIDER_MODEL';
+DROP INDEX IF EXISTS provider_budget_policy_grant_version_unique;
+CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_grant_version_unique
+  ON provider_budget_policy ("userId", "poolId", "granteeUserId", version)
+  WHERE "scopeType" = 'POOL_GRANT';
 CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_one_active_account
   ON provider_budget_policy ("userId", "providerAccountId")
   WHERE active AND "scopeType" = 'PROVIDER_ACCOUNT';
 CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_one_active_attachment
   ON provider_budget_policy ("userId", "providerAccountId", "poolId", "providerModelId")
   WHERE active AND "scopeType" = 'POOL_PROVIDER_MODEL';
+DROP INDEX IF EXISTS provider_budget_policy_one_active_grant;
+CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_one_active_grant
+  ON provider_budget_policy ("userId", "poolId", "granteeUserId")
+  WHERE active AND "scopeType" = 'POOL_GRANT';
 
 ALTER TABLE provider_budget_rule DROP CONSTRAINT IF EXISTS provider_budget_rule_shape_check;
 ALTER TABLE provider_budget_rule ADD CONSTRAINT provider_budget_rule_shape_check CHECK (
@@ -2629,10 +2824,23 @@ RETURNS trigger LANGUAGE plpgsql AS $provider_budget_graph$
 DECLARE p RECORD; r RECORD; c RECORD;
 BEGIN
   IF TG_TABLE_NAME = 'provider_budget_policy' THEN
+    IF NEW."providerAccountId" IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM provider_account a WHERE a.id = NEW."providerAccountId"
+        AND a."userId" = NEW."userId") THEN
+      RAISE EXCEPTION 'budget policy account must belong to its owner' USING ERRCODE = '23514';
+    END IF;
     IF NEW."providerModelId" IS NOT NULL AND NOT EXISTS (
       SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
         AND m."userId" = NEW."userId" AND m."providerAccountId" = NEW."providerAccountId") THEN
       RAISE EXCEPTION 'budget policy model must belong to its provider account' USING ERRCODE = '23514';
+    END IF;
+    IF NEW."scopeType" = 'POOL_GRANT' AND (
+         NEW."granteeUserId" IS NULL
+         OR NOT EXISTS (
+           SELECT 1 FROM model_pool mp
+            WHERE mp.id = NEW."poolId" AND mp."userId" = NEW."userId")
+       ) THEN
+      RAISE EXCEPTION 'budget policy grant must belong to the pool owner' USING ERRCODE = '23514';
     END IF;
   ELSIF TG_TABLE_NAME = 'provider_attempt' THEN
     IF NOT EXISTS (SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
@@ -2661,17 +2869,21 @@ BEGIN
        OR p."userId" <> NEW."userId" OR p.version <> NEW."policyVersion"
        OR r.metric::text <> NEW.metric::text OR r.period::text <> NEW.period::text
        OR r.currency IS DISTINCT FROM NEW.currency
-       OR p."providerAccountId" <> NEW."providerAccountId"
+       OR (p."scopeType" <> 'POOL_GRANT'
+         AND p."providerAccountId" IS DISTINCT FROM NEW."providerAccountId")
        OR NEW."providerModelId" = ''
        OR (p."scopeType" = 'POOL_PROVIDER_MODEL'
          AND (p."poolId" IS DISTINCT FROM NEW."poolId"
-           OR p."providerModelId" IS DISTINCT FROM NEW."providerModelId")) THEN
+           OR p."providerModelId" IS DISTINCT FROM NEW."providerModelId"))
+       OR (p."scopeType" = 'POOL_GRANT'
+         AND p."poolId" IS DISTINCT FROM NEW."poolId") THEN
       RAISE EXCEPTION 'budget reservation must match its policy version and rule' USING ERRCODE = '23514';
     END IF;
     IF NEW."credentialId" IS NOT NULL THEN
       SELECT * INTO c FROM provider_credential WHERE id = NEW."credentialId";
-      IF c."userId" IS DISTINCT FROM NEW."userId" OR c."providerAccountId" IS DISTINCT FROM p."providerAccountId" THEN
-        RAISE EXCEPTION 'budget reservation credential must match policy account' USING ERRCODE = '23514';
+      IF c."userId" IS DISTINCT FROM NEW."userId"
+         OR c."providerAccountId" IS DISTINCT FROM NEW."providerAccountId" THEN
+        RAISE EXCEPTION 'budget reservation credential must match the reservation account' USING ERRCODE = '23514';
       END IF;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
@@ -2806,6 +3018,8 @@ BEGIN
        OR NEW."providerAccountId" IS DISTINCT FROM OLD."providerAccountId"
        OR NEW."poolId" IS DISTINCT FROM OLD."poolId"
        OR NEW."providerModelId" IS DISTINCT FROM OLD."providerModelId"
+       OR NEW."poolGrantId" IS DISTINCT FROM OLD."poolGrantId"
+       OR NEW."granteeUserId" IS DISTINCT FROM OLD."granteeUserId"
        OR NEW.version IS DISTINCT FROM OLD.version OR NEW."activatedAt" IS DISTINCT FROM OLD."activatedAt"
        OR NEW.active OR NEW."deactivatedAt" IS NULL THEN
       RAISE EXCEPTION 'activated provider budget policy is immutable except deactivation' USING ERRCODE = '55000';
@@ -2820,6 +3034,8 @@ BEGIN
        OR NEW."providerAccountId" IS DISTINCT FROM OLD."providerAccountId"
        OR NEW."poolId" IS DISTINCT FROM OLD."poolId"
        OR NEW."providerModelId" IS DISTINCT FROM OLD."providerModelId"
+       OR NEW."poolGrantId" IS DISTINCT FROM OLD."poolGrantId"
+       OR NEW."granteeUserId" IS DISTINCT FROM OLD."granteeUserId"
        OR NEW.version IS DISTINCT FROM OLD.version
        OR NOT NEW.active OR NEW."activatedAt" IS NULL OR NEW."deactivatedAt" IS NOT NULL THEN
       RAISE EXCEPTION 'provider budget policy permits only controlled activation' USING ERRCODE = '55000';
@@ -2830,7 +3046,9 @@ END;
 $provider_budget_history$;
 
 DROP TRIGGER IF EXISTS provider_budget_rule_immutable ON provider_budget_rule;
-CREATE TRIGGER provider_budget_rule_immutable BEFORE UPDATE OR DELETE ON provider_budget_rule
+-- UPDATE stays forbidden. DELETE is allowed so pool/user cascade can drop
+-- rules with their policy (an immutable trigger on DELETE blocked revoke).
+CREATE TRIGGER provider_budget_rule_immutable BEFORE UPDATE ON provider_budget_rule
 FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_history_transitions();
 DROP TRIGGER IF EXISTS provider_budget_policy_transition ON provider_budget_policy;
 CREATE TRIGGER provider_budget_policy_transition BEFORE UPDATE ON provider_budget_policy
@@ -3057,6 +3275,8 @@ BEGIN
     WHEN 'user' THEN ARRAY[row_data ->> 'id']
     WHEN 'pool_member' THEN ARRAY[
       (SELECT "userId" FROM model_pool WHERE id = row_data ->> 'poolId')]
+    WHEN 'pool_routing_rule' THEN ARRAY[
+      (SELECT "userId" FROM model_pool WHERE id = row_data ->> 'poolId')]
     WHEN 'pool_grant' THEN ARRAY[row_data ->> 'ownerUserId', row_data ->> 'granteeUserId']
     WHEN 'model_api_token_allowlist_entry' THEN ARRAY[
       (SELECT "userId" FROM model_api_token WHERE id = row_data ->> 'modelApiTokenId'),
@@ -3178,13 +3398,14 @@ BEGIN
       'capacityPriority,capacityConcurrencyLimit,capacityReservedSlots,capacityBorrowPolicy,capacityWaitBudgetMs,capacityContextCeiling,capacityContextMargin'),
     ('pool_member', 'id,poolId,discoveredModelId,executionTargetId',
       'tier,capacityPriority,capacityConcurrencyMode,capacityConcurrencyLimit,capacityReservedSlots,capacityBorrowPolicy,capacityWaitBudgetMode,capacityWaitBudgetMs,capacityContextCeilingMode,capacityContextCeiling,capacityContextMargin'),
+    ('pool_routing_rule', 'id,poolId,memberId,exclude,position,metric,labels,aggregate,op,threshold,effect', ''),
     ('pool_grant', 'id,poolId,ownerUserId,granteeUserId', ''),
     ('model_api_token', 'id,userId,lookupPrefix,secretDigest', ''),
     ('model_api_token_allowlist_entry', 'id,modelApiTokenId,target,discoveredModelId,executionTargetId,modelPoolId', ''),
     ('provider_account', 'id,userId,currentCredentialId', ''),
     ('provider_model', 'id,userId,providerAccountId,upstreamModelId', ''),
     ('provider_credential', 'id,userId,providerAccountId,replacedById', ''),
-    ('provider_budget_policy', 'id,userId,scopeType,providerAccountId,poolId,providerModelId', ''),
+    ('provider_budget_policy', 'id,userId,scopeType,providerAccountId,poolId,providerModelId,poolGrantId,granteeUserId', ''),
     ('provider_budget_rule', 'id,policyId', ''),
     ('provider_pricing_version', 'id,userId,providerAccountId,providerModelId', ''),
     ('pool_fallback_preference', 'id,userId,poolId,poolGrantId,providerModelId', '')

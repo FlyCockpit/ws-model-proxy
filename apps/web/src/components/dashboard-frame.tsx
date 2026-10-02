@@ -151,15 +151,24 @@ function DashboardLayout({
 
   return (
     // The sidebar sits outside the centered container so it spans the full
-    // height at the window's left edge. At md the content pane scrolls on its
-    // own so the sidebar stays put; below md <main> keeps owning scroll.
-    <div className="flex h-full min-h-0 min-w-0 flex-col md:flex-row">
+    // height at the window's left edge. <main> owns page scroll. On padded
+    // routes the sidebar sticks to the main scrollport; fill routes keep a
+    // viewport-tall frame so terminals and chat can fill it.
+    <div
+      className={cn(
+        "flex min-w-0 flex-col md:flex-row",
+        layout === "fill" ? "h-full min-h-0" : "min-h-full",
+      )}
+    >
       <aside
         aria-label={t("dashboard:nav.ariaLabel")}
         data-dashboard-nav="sidebar"
         data-collapsed={sidebarCollapsed ? "true" : "false"}
         className={cn(
-          "hidden overflow-x-hidden overflow-y-auto overscroll-contain border-sidebar-border bg-sidebar md:flex md:h-full md:shrink-0 md:flex-col md:border-e",
+          "hidden overflow-x-hidden overflow-y-auto overscroll-contain border-sidebar-border bg-sidebar md:flex md:shrink-0 md:flex-col md:border-e",
+          layout === "fill"
+            ? "md:h-full"
+            : "md:sticky md:top-0 md:h-[100cqh] md:max-h-[100cqh] md:self-start",
           sidebarCollapsed ? "w-16" : "w-56",
         )}
       >
@@ -211,9 +220,9 @@ function DashboardLayout({
         ) : (
           <div
             data-dashboard-layout="padded"
-            className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col md:overflow-x-clip md:overflow-y-auto"
+            className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col"
           >
-            <div className="container mx-auto flex h-full min-h-0 min-w-0 max-w-6xl flex-col px-4 py-4 md:py-6">
+            <div className="container mx-auto flex min-h-0 min-w-0 max-w-6xl flex-col px-4 py-4 md:py-6">
               <MobileNavStrip lang={lang} className="mb-4" />
 
               <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col">

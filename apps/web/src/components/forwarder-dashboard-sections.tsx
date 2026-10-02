@@ -1,5 +1,6 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { EXTERNAL_AFTER_WAIT_MS_MAX } from "@ws-model-proxy/api/lib/caller-external-wait";
 import { grantPoolAccessServerMessage } from "@ws-model-proxy/api/lib/effective-provider-egress";
 import type { ExternalRouteKind } from "@ws-model-proxy/api/lib/model-api-token-access";
 import {
@@ -44,6 +45,7 @@ import { CliAgentActivity } from "@/components/cli-agent-activity";
 import { CliDeviceEngineAdapters } from "@/components/cli-device-engine-adapters";
 import { CliDeviceFeatureSwitches } from "@/components/cli-device-feature-switches";
 import { CliDeviceMetricSources } from "@/components/cli-device-metric-sources";
+import { CliDeviceNodeCard } from "@/components/cli-device-node-card";
 import { CliDeviceRename } from "@/components/cli-device-rename";
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { InlineRetry } from "@/components/inline-retry";
@@ -829,6 +831,14 @@ export function CliEndpointsModelsSection() {
                   </Button>
                 </div>
               </div>
+
+              {device.node ? (
+                <CliDeviceNodeCard
+                  cliDeviceId={device.id}
+                  deviceName={device.displayName}
+                  node={device.node}
+                />
+              ) : null}
 
               <CliDeviceFeatureSwitches
                 cliDeviceId={device.id}
@@ -1654,6 +1664,7 @@ const validPercent = (percent: number) =>
 
 function protectionSettingsFromForm(value: {
   protectionEnabled: boolean;
+  evictionFeedbackEnabled: boolean;
   protectionWindowSeconds: number;
   protectMinTokens: number;
   protectionShare: "EQUAL_SHARE" | "FIRST_COME" | "FIXED_PERCENT";
@@ -1663,6 +1674,7 @@ function protectionSettingsFromForm(value: {
 }) {
   return {
     protectionEnabled: value.protectionEnabled,
+    evictionFeedbackEnabled: value.evictionFeedbackEnabled,
     protectionWindowSeconds: value.protectionWindowSeconds,
     protectMinTokens: value.protectMinTokens,
     protectionShare: value.protectionShare,
@@ -1764,6 +1776,7 @@ export function PoolForm({
       cacheHolderWaitMode: z.enum(["AUTO", "FIXED"]),
       cacheHolderWaitMs: z.number().int().min(0).max(30_000),
       protectionEnabled: z.boolean(),
+      evictionFeedbackEnabled: z.boolean(),
       protectionWindowSeconds: z.number().int().min(1).max(3600),
       protectMinTokens: z.number().int().min(0).max(10_000_000),
       protectionShare: z.enum(["EQUAL_SHARE", "FIRST_COME", "FIXED_PERCENT"]),
@@ -1865,6 +1878,7 @@ export function PoolForm({
       cacheHolderWaitMs: pool?.cacheHolderWaitMs ?? 2_000,
       // S-C warm-session protection ("Protect active conversations").
       protectionEnabled: pool?.protection.enabled ?? true,
+      evictionFeedbackEnabled: pool?.protection.evictionFeedbackEnabled ?? true,
       protectionWindowSeconds: pool?.protection.windowSeconds ?? 300,
       protectMinTokens: pool?.protection.minTokens ?? 8192,
       protectionShare: (pool?.protection.share ?? "EQUAL_SHARE") as
@@ -2285,6 +2299,22 @@ export function PoolForm({
               </label>
             )}
           </form.Field>
+          <form.Field name="evictionFeedbackEnabled">
+            {(field) => (
+              <label className="flex min-h-11 items-center gap-3 text-sm">
+                <input
+                  type="checkbox"
+                  className="size-4"
+                  checked={field.state.value}
+                  onChange={(event) => field.handleChange(event.target.checked)}
+                />
+                {t("dashboard:pools.protection.evictionFeedback")}
+              </label>
+            )}
+          </form.Field>
+          <p className="mb-3 text-xs text-muted-foreground">
+            {t("dashboard:pools.protection.evictionFeedbackHint")}
+          </p>
           <div className="mt-3 grid gap-4 sm:grid-cols-2">
             <form.Field name="protectionWindowSeconds">
               {(field) => (
@@ -3496,6 +3526,7 @@ export function CliTokensSection() {
   const [name, setName] = useState("");
   const [secret, setSecret] = useState("");
   const [revokeToken, setRevokeToken] = useState<CliToken | null>(null);
+  const [resetIdentityToken, setResetIdentityToken] = useState<CliToken | null>(null);
   const create = useMutation(
     orpc.cliCredentials.createToken.mutationOptions({
       onSuccess: (result) => {
@@ -3511,6 +3542,15 @@ export function CliTokensSection() {
         queryClient.invalidateQueries({ queryKey: orpc.cliCredentials.key() });
         toast.success(t("dashboard:tokens.revoked"));
         setRevokeToken(null);
+      },
+    }),
+  );
+  const resetIdentity = useMutation(
+    orpc.cliCredentials.resetTokenIdentity.mutationOptions({
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: orpc.cliCredentials.key() });
+        toast.success(t("dashboard:tokens.identityReset"));
+        setResetIdentityToken(null);
       },
     }),
   );
@@ -3593,7 +3633,11 @@ export function CliTokensSection() {
           </Dialog>
         }
       />
-      <TokenTable tokens={tokensData} onRevoke={setRevokeToken} />
+      <TokenTable
+        tokens={tokensData}
+        onRevoke={setRevokeToken}
+        onResetIdentity={setResetIdentityToken}
+      />
       <ConfirmDeleteDialog
         open={Boolean(revokeToken)}
         onOpenChange={(open) => !open && setRevokeToken(null)}
@@ -3609,6 +3653,21 @@ export function CliTokensSection() {
           if (revokeToken) revoke.mutate({ id: revokeToken.id });
         }}
       />
+      <ConfirmDeleteDialog
+        open={Boolean(resetIdentityToken)}
+        onOpenChange={(open) => !open && setResetIdentityToken(null)}
+        title={t("dashboard:tokens.resetIdentityTitle")}
+        description={t("dashboard:tokens.resetIdentityDescription")}
+        confirmToken={resetIdentityToken?.name ?? ""}
+        typePrompt={t("dashboard:tokens.typeTokenName")}
+        copyAriaLabel={t("dashboard:actions.copyConfirm")}
+        confirmLabel={t("dashboard:tokens.resetIdentity")}
+        pendingLabel={t("dashboard:tokens.resettingIdentity")}
+        isPending={resetIdentity.isPending}
+        onConfirm={() => {
+          if (resetIdentityToken) resetIdentity.mutate({ id: resetIdentityToken.id });
+        }}
+      />
     </section>
   );
 }
@@ -3616,9 +3675,11 @@ export function CliTokensSection() {
 function TokenTable<TToken extends CliToken | ModelApiToken>({
   tokens,
   onRevoke,
+  onResetIdentity,
 }: {
   tokens: TToken[];
   onRevoke: (token: TToken) => void;
+  onResetIdentity?: (token: TToken) => void;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
 
@@ -3634,6 +3695,9 @@ function TokenTable<TToken extends CliToken | ModelApiToken>({
             <th className="p-3 font-medium">{t("dashboard:tokens.scope")}</th>
             <th className="p-3 font-medium">{t("dashboard:tokens.lastUsed")}</th>
             <th className="p-3 font-medium">{t("dashboard:tokens.createdAt")}</th>
+            {"identityBound" in (tokens[0] ?? {}) ? (
+              <th className="p-3 font-medium">{t("dashboard:tokens.lastRefused")}</th>
+            ) : null}
             <th className="p-3 text-right font-medium">{t("dashboard:actions.header")}</th>
           </tr>
         </thead>
@@ -3656,19 +3720,47 @@ function TokenTable<TToken extends CliToken | ModelApiToken>({
               </td>
               <td className="p-3 align-top tabular-nums">{formatDate(token.lastUsedAt)}</td>
               <td className="p-3 align-top tabular-nums">{formatDate(token.createdAt)}</td>
+              {"identityBound" in token ? (
+                <td className="p-3 align-top">
+                  {token.lastRefusedAt ? (
+                    <span>
+                      {t("dashboard:tokens.refusedIdentityMismatch")}
+                      <span className="mt-1 block tabular-nums text-muted-foreground">
+                        {formatDate(token.lastRefusedAt)}
+                      </span>
+                    </span>
+                  ) : token.identityBound ? (
+                    t("dashboard:tokens.identityBound")
+                  ) : (
+                    t("dashboard:tokens.identityUnbound")
+                  )}
+                </td>
+              ) : null}
               <td className="p-3 text-right align-top">
                 {token.revokedAt ? (
                   <StatusPill muted>{t("dashboard:tokens.revokedStatus")}</StatusPill>
                 ) : (
-                  <Button
-                    type="button"
-                    variant="destructive"
-                    size="touch"
-                    onClick={() => onRevoke(token)}
-                  >
-                    <Trash2 className="size-4" />
-                    {t("dashboard:tokens.revoke")}
-                  </Button>
+                  <div className="flex min-w-0 flex-wrap justify-end gap-2">
+                    {"identityBound" in token && token.identityBound && onResetIdentity ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="touch"
+                        onClick={() => onResetIdentity(token)}
+                      >
+                        {t("dashboard:tokens.resetIdentity")}
+                      </Button>
+                    ) : null}
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      size="touch"
+                      onClick={() => onRevoke(token)}
+                    >
+                      <Trash2 className="size-4" />
+                      {t("dashboard:tokens.revoke")}
+                    </Button>
+                  </div>
                 )}
               </td>
             </tr>
@@ -3796,6 +3888,22 @@ export function ModelApiTokensSection() {
   );
 }
 
+function tokenExternalWaitInputSchema() {
+  return z
+    .string()
+    .trim()
+    .refine(
+      (value) =>
+        value === "" ||
+        (/^(0|[1-9]\d*)$/.test(value) && Number(value) <= EXTERNAL_AFTER_WAIT_MS_MAX),
+    );
+}
+
+function tokenExternalWaitCreatePayload(value: string): { externalAfterWaitMs?: number } {
+  const trimmed = value.trim();
+  return trimmed === "" ? {} : { externalAfterWaitMs: Number(trimmed) };
+}
+
 function ModelApiTokenCreateForm({
   visibleModels,
   onPendingChange,
@@ -3819,6 +3927,7 @@ function ModelApiTokenCreateForm({
       modelIds: [] as string[],
       allowExternal: false,
       excludedPoolIds: [] as string[],
+      externalAfterWaitMs: "",
     },
     validators: {
       onSubmit: z
@@ -3828,8 +3937,19 @@ function ModelApiTokenCreateForm({
           modelIds: z.array(z.string()),
           allowExternal: z.boolean(),
           excludedPoolIds: z.array(z.string()),
+          externalAfterWaitMs: z.string(),
         })
-        .refine((value) => value.scopeMode !== "ALLOWLIST" || value.modelIds.length > 0),
+        .refine((value) => value.scopeMode !== "ALLOWLIST" || value.modelIds.length > 0)
+        .superRefine((value, ctx) => {
+          if (!value.allowExternal) return;
+          if (!tokenExternalWaitInputSchema().safeParse(value.externalAfterWaitMs).success) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["externalAfterWaitMs"],
+              message: "invalid",
+            });
+          }
+        }),
     },
     onSubmit: async ({ value }) => {
       if (secret) return;
@@ -3839,6 +3959,7 @@ function ModelApiTokenCreateForm({
           name: value.name,
           scopeMode: value.scopeMode,
           modelIds: value.scopeMode === "ALLOWLIST" ? value.modelIds : [],
+          ...(value.allowExternal ? tokenExternalWaitCreatePayload(value.externalAfterWaitMs) : {}),
         });
         // Retain the one-time secret even if the separate human consent save fails.
         setSecret(result.secret);
@@ -3941,6 +4062,35 @@ function ModelApiTokenCreateForm({
               <p className="text-sm text-muted-foreground">
                 {t("dashboard:tokens.externalAccess.description")}
               </p>
+              {values.allowExternal ? (
+                <form.Field name="externalAfterWaitMs">
+                  {(field) => (
+                    <div className="space-y-2">
+                      <Label htmlFor="model-api-token-external-wait">
+                        {t("dashboard:tokens.externalWait.label")}
+                      </Label>
+                      <Input
+                        id="model-api-token-external-wait"
+                        className="min-h-11"
+                        inputMode="numeric"
+                        placeholder={t("dashboard:tokens.externalWait.placeholder")}
+                        value={field.state.value}
+                        onBlur={field.handleBlur}
+                        onChange={(event) => field.handleChange(event.target.value)}
+                        autoComplete="off"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        {t("dashboard:tokens.externalWait.hint")}
+                      </p>
+                      {field.state.meta.errors.length > 0 ? (
+                        <p className="text-sm text-destructive">
+                          {t("dashboard:tokens.externalWait.invalid")}
+                        </p>
+                      ) : null}
+                    </div>
+                  )}
+                </form.Field>
+              ) : null}
               {!visibleModels.providerEgressEnabled ? (
                 <p role="note" className="text-sm text-muted-foreground">
                   {t("dashboard:tokens.externalAccess.createDisabledDeployment")}
@@ -4025,6 +4175,86 @@ function TokenScopePreview({ scopeMode, modelIds }: { scopeMode: ScopeMode; mode
   return <VisibleModelPreview preview={preview.data} />;
 }
 
+function TokenExternalWaitField({ token }: { token: ModelApiToken }) {
+  const { t } = useTranslation(["dashboard"]);
+  const queryClient = useQueryClient();
+  const fieldId = useId();
+  const update = useMutation(
+    orpc.modelApiTokens.updateExternalWait.mutationOptions({
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: orpc.modelApiTokens.key() });
+        toast.success(t("dashboard:tokens.externalWait.saved"));
+      },
+    }),
+  );
+  const form = useForm({
+    defaultValues: {
+      externalAfterWaitMs:
+        token.externalAfterWaitMs == null ? "" : String(token.externalAfterWaitMs),
+    },
+    validators: {
+      onSubmit: z.object({
+        externalAfterWaitMs: tokenExternalWaitInputSchema(),
+      }),
+    },
+    onSubmit: async ({ value }) => {
+      const trimmed = value.externalAfterWaitMs.trim();
+      const next = trimmed === "" ? null : Number(trimmed);
+      if (next === token.externalAfterWaitMs) return;
+      await update.mutateAsync({ id: token.id, externalAfterWaitMs: next }).catch(() => undefined);
+    },
+  });
+  return (
+    <form
+      className="min-w-0 space-y-2 pl-8"
+      onSubmit={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        void form.handleSubmit();
+      }}
+    >
+      <form.Field name="externalAfterWaitMs">
+        {(field) => (
+          <div className="space-y-2">
+            <Label htmlFor={fieldId}>{t("dashboard:tokens.externalWait.label")}</Label>
+            <Input
+              id={fieldId}
+              className="min-h-11"
+              inputMode="numeric"
+              placeholder={t("dashboard:tokens.externalWait.placeholder")}
+              value={field.state.value}
+              onBlur={field.handleBlur}
+              onChange={(event) => field.handleChange(event.target.value)}
+              autoComplete="off"
+            />
+            <p className="text-xs text-muted-foreground">
+              {t("dashboard:tokens.externalWait.hint")}
+            </p>
+            {field.state.meta.errors.length > 0 ? (
+              <p className="text-sm text-destructive">
+                {t("dashboard:tokens.externalWait.invalid")}
+              </p>
+            ) : null}
+          </div>
+        )}
+      </form.Field>
+      <form.Subscribe
+        selector={(state) => ({ canSubmit: state.canSubmit, isSubmitting: state.isSubmitting })}
+      >
+        {({ canSubmit, isSubmitting }) => (
+          <Button
+            type="submit"
+            size="touch"
+            disabled={!canSubmit || isSubmitting || update.isPending}
+          >
+            {t("dashboard:tokens.externalWait.save")}
+          </Button>
+        )}
+      </form.Subscribe>
+    </form>
+  );
+}
+
 /**
  * Human-only consent for `owner/pool:external` (never exposed to MCP). New and
  * existing tokens are private-only until a person turns this on. Allowlist
@@ -4087,6 +4317,12 @@ function TokenExternalAccess({
                   {t("dashboard:tokens.externalAccess.allow", { name: token.name })}
                 </span>
               </label>
+              {token.allowExternal ? (
+                <TokenExternalWaitField
+                  key={`${token.id}:${token.externalAfterWaitMs}`}
+                  token={token}
+                />
+              ) : null}
               {token.allowExternal && allowlistPoolIds.length > 0 ? (
                 <div className="space-y-1 pl-8">
                   <p className="text-xs text-muted-foreground">

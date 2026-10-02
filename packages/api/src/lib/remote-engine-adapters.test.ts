@@ -38,7 +38,8 @@ describe("remote engine adapter definitions", () => {
   });
 
   it("pins SHA-256 of the canonical spec including input and map", () => {
-    expect(adapterRouteIsValid("metrics")).toBe(true);
+    expect(adapterRouteIsValid("/metrics")).toBe(true);
+    expect(adapterRouteIsValid("/v1/load")).toBe(true);
     expect(adapterRouteIsValid("metrics?x=1")).toBe(false);
     const json = canonicalRemoteEngineAdapterJson(adapter);
     expect(json).toBe(
@@ -48,11 +49,42 @@ describe("remote engine adapter definitions", () => {
     const mapped = {
       ...adapter,
       format: "prometheus" as const,
-      input: { route: "metrics" },
+      input: { route: "/metrics" },
       map: { running: { series: "my_running", scale: 1 } },
     };
     const hashed = serializeRemoteEngineAdapters([mapped]);
     expect(hashed[0]?.specSha256).toBe(remoteEngineAdapterSpecSha256(mapped));
     expect(hashed[0]?.specSha256).not.toBe(remoteEngineAdapterSpecSha256(adapter));
+  });
+
+  it("rejects adapter routes that can leave the endpoint origin", () => {
+    expect(adapterRouteIsValid("https:evil.example/x")).toBe(false);
+    expect(adapterRouteIsValid("/\t/evil.example/x")).toBe(false);
+    expect(adapterRouteIsValid("http:foo")).toBe(false);
+    expect(adapterRouteIsValid(" /abs")).toBe(false);
+    expect(adapterRouteIsValid("foo/bar")).toBe(false);
+    expect(adapterRouteIsValid("//evil.example/x")).toBe(false);
+    expect(adapterRouteIsValid("metrics")).toBe(false);
+    expect(
+      remoteEngineAdapterDefinitionsSchema.safeParse([
+        { ...adapter, input: { route: "https:evil.example/x" } },
+      ]).success,
+    ).toBe(false);
+    expect(
+      remoteEngineAdapterDefinitionsSchema.safeParse([
+        { ...adapter, input: { route: "/\t/evil.example/x" } },
+      ]).success,
+    ).toBe(false);
+    expect(
+      remoteEngineAdapterDefinitionsSchema.safeParse([{ ...adapter, input: { route: "/metrics" } }])
+        .success,
+    ).toBe(true);
+    expect(
+      remoteEngineAdapterDefinitionsSchema.safeParse([{ ...adapter, countRoute: "/count" }])
+        .success,
+    ).toBe(true);
+    expect(
+      remoteEngineAdapterDefinitionsSchema.safeParse([{ ...adapter, countRoute: "count" }]).success,
+    ).toBe(false);
   });
 });

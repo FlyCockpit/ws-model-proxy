@@ -716,6 +716,95 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
     }
   }, 60_000);
 
+  it("rejects a pool relay_request whose selected target is not a member at write time (#185)", async () => {
+    if (!databaseUrl) return;
+    process.env.DATABASE_URL = databaseUrl;
+    const db = createFixturePrismaClient(databaseUrl);
+    const suffix = crypto.randomUUID();
+    const user = (label: string) =>
+      db.user.create({ data: { name: label, email: `${label}-${suffix}@example.test` } });
+    const owner = await user("rr-owner");
+    const grantee = await user("rr-grantee");
+    try {
+      const pool = await db.modelPool.create({
+        data: { userId: owner.id, name: "RR", slug: `rr-${suffix}` },
+      });
+      await db.poolGrant.create({
+        data: { poolId: pool.id, ownerUserId: owner.id, granteeUserId: grantee.id },
+      });
+      const localModel = async (label: string) => {
+        const cli = await db.cliDevice.create({
+          data: { userId: owner.id, slug: `${label}-${suffix}`, status: "CONNECTED" },
+        });
+        const endpoint = await db.endpoint.create({
+          data: {
+            userId: owner.id,
+            cliDeviceId: cli.id,
+            slug: `${label}-${suffix}`,
+            label,
+            status: "ONLINE",
+            capabilityMetadata: localCapabilities,
+          },
+        });
+        const model = await db.discoveredModel.create({
+          data: {
+            userId: owner.id,
+            endpointId: endpoint.id,
+            upstreamModelId: `${label}-model`,
+            encodedModelId: `${label}-model`,
+          },
+        });
+        const target = await db.executionTarget.findUniqueOrThrow({
+          where: { discoveredModelId: model.id },
+        });
+        return { model, target };
+      };
+      const member = await localModel("in-pool");
+      const outsider = await localModel("outsider");
+      const poolMember = await db.poolMember.create({
+        data: { poolId: pool.id, executionTargetId: member.target.id, healthStatus: "HEALTHY" },
+      });
+      const requestData = {
+        userId: grantee.id,
+        source: "CHAT_TEST" as const,
+        requestedModelPoolId: pool.id,
+        fallbackRoute: "local" as const,
+        status: "PENDING" as const,
+      };
+      const accepted = await db.relayRequest.create({
+        data: {
+          ...requestData,
+          selectedExecutionTargetId: member.target.id,
+          selectedPoolMemberId: poolMember.id,
+        },
+      });
+      expect(accepted.resourceOwnerUserId).toBe(owner.id);
+      await expect(
+        db.relayRequest.create({
+          data: {
+            ...requestData,
+            selectedExecutionTargetId: outsider.target.id,
+          },
+        }),
+      ).rejects.toThrow(/relay request selection must be a member of its pool/);
+      await db.poolMember.delete({ where: { id: poolMember.id } });
+      await db.relayRequest.update({
+        where: { id: accepted.id },
+        data: { attemptCount: 1 },
+      });
+      await expect(
+        db.relayRequest.create({
+          data: {
+            ...requestData,
+            selectedExecutionTargetId: member.target.id,
+          },
+        }),
+      ).rejects.toThrow(/relay request selection must be a member of its pool/);
+    } finally {
+      await db.$disconnect();
+    }
+  }, 30_000);
+
   it("deletes a pool owner's account while a grantee binding and an in-flight grantee request remain", async () => {
     if (!databaseUrl) return;
     const db = createFixturePrismaClient(databaseUrl);

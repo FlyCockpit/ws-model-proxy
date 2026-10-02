@@ -15,7 +15,7 @@
  *   `model_pool`, `pool_member`, `pool_grant`, `model_api_token`,
  *   `model_api_token_allowlist_entry`, `provider_account`, `provider_model`,
  *   `provider_credential`, `provider_budget_policy`, `provider_budget_rule`,
- *   `provider_pricing_version`, `pool_fallback_preference`.
+ *   `provider_pricing_version`, `pool_fallback_preference`, `pool_routing_rule`.
  * - Hot path, H-private ({@link HOT_PATH_TABLES}): admission and capacity
  *   runtime state, cache affinity, relay and provider history and accounting,
  *   response stickiness, usage rollups. They reference graph rows by plain id:
@@ -75,6 +75,7 @@
  *      provider-budget-attempt:<attempt>    provider budget admission/settlement
  *   02 execution-target:<identity>          target discovery/creation (M)
  *   03 provider-budget-account:<user>:<account>
+ *      provider-budget-grant:<user>:<pool>:<grantee> per-grantee owner-paid spend cap
  *   04 provider-budget:<policy>
  *   05 provider-pricing:<user>:<model>
  *   06 capacity-policy:<target>             policy writers (M) and admission (H)
@@ -357,6 +358,7 @@ export const HOT_PATH_TABLES = [
   "pool_member_routing_verdict",
   "capacity_kv_eviction",
   "engine_load_rollup_minute",
+  "node_metrics_minute",
 ] as const;
 
 /** The graph (configuration) tables: fence triggers guard their writes. */
@@ -369,6 +371,7 @@ export const GRAPH_TABLES = [
   "inference_capacity",
   "model_pool",
   "pool_member",
+  "pool_routing_rule",
   "pool_grant",
   "model_api_token",
   "model_api_token_allowlist_entry",
@@ -429,6 +432,8 @@ export const fences = {
   targetIdentity: (identity: string) => fence("02", "execution-target", identity),
   budgetAccount: (userId: string, providerAccountId: string) =>
     fence("03", "provider-budget-account", `${userId}:${providerAccountId}`),
+  budgetGrant: (userId: string, poolId: string, granteeUserId: string) =>
+    fence("03", "provider-budget-grant", `${userId}:${poolId}:${granteeUserId}`),
   budgetPolicy: (policyId: string) => fence("04", "provider-budget", policyId),
   pricing: (userId: string, providerModelId: string) =>
     fence("05", "provider-pricing", `${userId}:${providerModelId}`),

@@ -116,13 +116,22 @@ describe("OpenRouter provider type in provider management", () => {
     expect(db.providerModel.create).toHaveBeenCalled();
   });
 
-  it("rejects Responses on OpenRouter, which is not claimed", async () => {
-    await expect(
-      client().createModel(
-        modelInput({ openaiChatCompletions: surface, openaiResponses: surface }),
-      ),
-    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
-    expect(db.providerModel.create).not.toHaveBeenCalled();
+  it("accepts Responses and Messages on OpenRouter", async () => {
+    await client().createModel(
+      modelInput({ openaiChatCompletions: surface, openaiResponses: surface }),
+    );
+    expect(db.providerModel.create).toHaveBeenCalled();
+    db.providerModel.create.mockClear();
+    await client().createModel(
+      modelInput({
+        openaiChatCompletions: surface,
+        anthropicMessages: {
+          ...surface,
+          protocolVersions: [{ version: "2023-06-01" }],
+        },
+      }),
+    );
+    expect(db.providerModel.create).toHaveBeenCalled();
   });
 
   it("rejects legacy inventories that could claim surfaces through old fields", async () => {

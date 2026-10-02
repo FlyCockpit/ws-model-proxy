@@ -99,6 +99,32 @@ fn recovery_dirs(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn is_recovery_metadata(name: &std::ffi::OsStr) -> bool {
+    name == "INTENT" || name == "INTENT.new" || name == ".wsmp-lock"
+}
+
+fn private_object(dir: &Path) -> PathBuf {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| !is_recovery_metadata(p.file_name().unwrap()))
+        .expect("private slot")
+}
+
+fn slot_count(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter(|entry| {
+            let name = entry
+                .as_ref()
+                .ok()
+                .map(|e| e.file_name())
+                .unwrap_or_default();
+            !is_recovery_metadata(&name)
+        })
+        .count()
+}
+
 fn paths(value: &Value) -> Vec<PathBuf> {
     value
         .as_array()
@@ -119,10 +145,7 @@ fn uncertain(error: &FileError) -> Vec<PathBuf> {
     for p in &kept {
         assert!(p.is_absolute() && p.exists(), "reported object: {p:?}");
     }
-    assert!(
-        std::fs::read_dir(dir).unwrap().count() <= 2,
-        "two-slot bound"
-    );
+    assert!(slot_count(&dir) <= 2, "two-slot bound");
     kept
 }
 
@@ -227,7 +250,9 @@ fn compensation_c1a1_source_save_after_vacate_or_exchange_never_moves_to_destina
                     std::fs::write(root.join("dst.txt"), "unchecked destination").unwrap();
                 }
                 if step == phase {
-                    assert!(!root.join("src.txt").exists());
+                    if phase == Step::Vacated {
+                        assert!(!root.join("src.txt").exists());
+                    }
                     // A separate writer process, as in Opus's executed probe.
                     assert!(std::process::Command::new("sh").args([
                         "-c", "printf %s C-saved-to-src > incoming-save; mv -f incoming-save src.txt",
@@ -236,19 +261,31 @@ fn compensation_c1a1_source_save_after_vacate_or_exchange_never_moves_to_destina
                 Ok(())
             });
             if conflict {
-                let kept = uncertain(&Op::Rename.run(&fx, &etag).unwrap_err());
+                let error = Op::Rename.run(&fx, &etag).unwrap_err();
+                assert_eq!(error.code, ErrorCode::Conflict, "{phase:?} {error:?}");
                 assert_eq!(fx.get("dst.txt"), "unchecked destination");
                 assert_eq!(fx.get("checked-destination"), "original");
-                assert!(contains_bytes(&kept, "mine"));
-                assert!(contains_bytes(&kept, "C-saved-to-src"));
+                assert_eq!(fx.get("src.txt"), "mine");
+                clean(&fx);
+            } else if phase == Step::Exchanged {
+                let result = Op::Rename.run(&fx, &etag);
+                assert_eq!(fx.get("dst.txt"), "mine");
+                let kept = match result {
+                    Ok(value) => paths(&value["recovered"]),
+                    Err(error) => uncertain(&error),
+                };
+                assert!(
+                    contains_bytes(&kept, "C-saved-to-src")
+                        || fx.get("src.txt") == "C-saved-to-src"
+                );
             } else {
                 Op::Rename.run(&fx, &etag).unwrap();
                 assert_eq!(fx.get("dst.txt"), "mine");
                 // Only the held, checked destination was disposed.
                 assert!(!contains_bytes(&[fx.root.join("dst.txt")], "original"));
+                assert_eq!(fx.get("src.txt"), "C-saved-to-src");
                 clean(&fx);
             }
-            assert_eq!(fx.get("src.txt"), "C-saved-to-src");
         }
     }
 }
@@ -310,12 +347,7 @@ fn compensation_c1b1_unlink_then_recreate_before_private_dispose_survives() {
                 && (!matches!(op, Op::Rename) || !root.join("src.txt").exists())
             {
                 let dir = recovery_dirs(&root).pop().unwrap();
-                let private = std::fs::read_dir(dir)
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path();
+                let private = private_object(&dir);
                 let old = std::fs::symlink_metadata(&private).unwrap();
                 std::fs::remove_file(&private).unwrap();
                 std::fs::write(&private, "recreated only copy").unwrap();
@@ -407,6 +439,14 @@ fn compensation_c1a2_newer_destination_before_undo_is_reported_and_kept() {
             }
             Ok(())
         });
+        if matches!(op, Op::Rename) {
+            // Exchange-first sees the dest successor before any public swap.
+            assert_eq!(op.run(&fx, &etag).unwrap_err().code, ErrorCode::Conflict);
+            assert_eq!(fx.get("dst.txt"), "concurrent update");
+            assert_eq!(fx.get("src.txt"), "mine");
+            clean(&fx);
+            continue;
+        }
         let kept = uncertain(&op.run(&fx, &etag).unwrap_err());
         assert!(contains_bytes(&kept, "concurrent update"));
         assert_eq!(fx.get(op.destination()), "later update");
@@ -437,6 +477,19 @@ fn compensation_c1a3_each_failed_capture_restore_dispose_rmdir_reports_surviving
                 }
                 Ok(())
             });
+            if matches!(op, Op::Rename) {
+                // Exchange-first refuses the dest successor before capture.
+                let error = op.run(&fx, &etag).unwrap_err();
+                assert_eq!(
+                    error.code,
+                    ErrorCode::Conflict,
+                    "{op:?} {primitive:?}/{nth}"
+                );
+                assert_eq!(fx.get("dst.txt"), "concurrent update");
+                assert_eq!(fx.get("src.txt"), "mine");
+                clean(&fx);
+                continue;
+            }
             let _scope = FaultScope::new(&[(primitive, nth, Errno::EIO)]);
             let kept = uncertain(&op.run(&fx, &etag).unwrap_err());
             let mut locations = kept.clone();
@@ -659,6 +712,13 @@ fn compensation_restore_collision_keeps_both_generations_and_names_them() {
             }
             Ok(())
         });
+        if matches!(op, Op::Rename) {
+            assert_eq!(op.run(&fx, &etag).unwrap_err().code, ErrorCode::Conflict);
+            assert_eq!(fx.get("dst.txt"), "concurrent update");
+            assert_eq!(fx.get("src.txt"), "mine");
+            clean(&fx);
+            continue;
+        }
         let kept = uncertain(&op.run(&fx, &etag).unwrap_err());
         assert!(contains_bytes(&kept, "concurrent update"));
         assert!(contains_bytes(&kept, "created during vacant undo"));
@@ -682,10 +742,14 @@ fn compensation_rename_source_restore_collision_keeps_checked_source() {
         }
         Ok(())
     });
-    let kept = uncertain(&Op::Rename.run(&fx, &etag).unwrap_err());
-    assert!(contains_bytes(&kept, "mine"));
-    assert!(contains_bytes(&kept, "source squatter"));
+    // Exchange-first never vacates the source: dest successor is Conflict.
+    assert_eq!(
+        Op::Rename.run(&fx, &etag).unwrap_err().code,
+        ErrorCode::Conflict
+    );
     assert_eq!(fx.get("dst.txt"), "concurrent update");
+    assert_eq!(fx.get("src.txt"), "mine");
+    clean(&fx);
 }
 
 #[test]
@@ -775,12 +839,7 @@ fn compensation_private_slot_mismatch_is_kept_even_after_successful_commit() {
                 && (!matches!(op, Op::Rename) || !root.join("src.txt").exists())
             {
                 let dir = recovery_dirs(&root).pop().unwrap();
-                let slot = std::fs::read_dir(dir)
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path();
+                let slot = private_object(&dir);
                 successor(&slot, "private squatter");
             }
             Ok(())
@@ -932,6 +991,15 @@ fn compensation_capture_collision_never_replaces_a_private_slot_squatter() {
                 }
                 Ok(())
             });
+            if matches!(op, Op::Rename) {
+                let error = op.run(&fx, &etag).unwrap_err();
+                assert_eq!(error.code, ErrorCode::Conflict, "{unsupported}");
+                assert_eq!(fx.get("dst.txt"), "unchecked destination");
+                assert_eq!(fx.get("checked-destination"), "original");
+                assert_eq!(fx.get("src.txt"), "mine");
+                clean(&fx);
+                continue;
+            }
             let faults = [(
                 Primitive::Capture,
                 if matches!(op, Op::Rename) { 2 } else { 1 },
@@ -1128,7 +1196,8 @@ fn compensation_recovery_dir_is_private_and_holds_at_most_two_objects() {
         kept[0].ends_with("slot-1") && kept[1].ends_with("slot-2"),
         "{kept:?}"
     );
-    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+    assert_eq!(slot_count(&dir), 2);
+    assert!(dir.join("INTENT").is_file(), "unsettled R keeps INTENT");
 }
 
 thread_local! {
@@ -1220,42 +1289,23 @@ fn compensation_exchange_error_restores_vacated_source_without_plain_overwrite()
         Errno::EXDEV,
         Errno::EPERM,
     ] {
-        for collide in [false, true] {
-            let fx = Fx::new();
-            let etag = Op::Rename.prepare(&fx);
-            let source = fx.root.join("src.txt");
-            let fx = fx.with_hook(move |step| {
-                if step == Step::Vacated {
-                    assert!(!source.exists());
-                    if collide {
-                        std::fs::write(&source, "created in vacant source window").unwrap();
-                    }
-                }
-                Ok(())
-            });
-            let _scope = FaultScope::new(&[(Primitive::Exchange, 1, errno)]);
-            let error = Op::Rename.run(&fx, &etag).unwrap_err();
-            if collide {
-                let kept = uncertain(&error);
-                assert!(contains_bytes(&kept, "mine"));
-                assert!(contains_bytes(&kept, "created in vacant source window"));
-                assert_eq!(fx.get("src.txt"), "created in vacant source window");
+        let fx = Fx::new();
+        let etag = Op::Rename.prepare(&fx);
+        let _scope = FaultScope::new(&[(Primitive::Exchange, 1, errno)]);
+        let error = Op::Rename.run(&fx, &etag).unwrap_err();
+        assert_eq!(
+            error.code,
+            if crate::file_ops::exchange::is_unsupported(errno) {
+                ErrorCode::UnsafeFilesystem
             } else {
-                assert_eq!(
-                    error.code,
-                    if crate::file_ops::exchange::is_unsupported(errno) {
-                        ErrorCode::UnsafeFilesystem
-                    } else {
-                        ErrorCode::IoError
-                    },
-                    "{errno}"
-                );
-                assert_eq!(fx.get("src.txt"), "mine");
-                clean(&fx);
-            }
-            assert_eq!(fx.get("dst.txt"), "original");
-            assert!(!fx.steps.lock().unwrap().contains(&Step::Exchanged));
-        }
+                ErrorCode::IoError
+            },
+            "{errno}"
+        );
+        assert_eq!(fx.get("src.txt"), "mine");
+        assert_eq!(fx.get("dst.txt"), "original");
+        assert!(!fx.steps.lock().unwrap().contains(&Step::Exchanged));
+        clean(&fx);
     }
 }
 
@@ -1274,13 +1324,14 @@ fn compensation_vacate_mismatch_and_restore_collision_keep_every_object() {
         }
         Ok(())
     });
-    let kept = uncertain(&Op::Rename.run(&fx, &etag).unwrap_err());
-    assert!(contains_bytes(&kept, "unchecked source"));
-    assert!(contains_bytes(&kept, "newest source"));
+    // Exchange-first refuses a source successor before the swap.
+    let error = Op::Rename.run(&fx, &etag).unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
     assert_eq!(fx.get("checked-source"), "mine");
-    assert_eq!(fx.get("src.txt"), "newest source");
+    assert_eq!(fx.get("src.txt"), "unchecked source");
     assert_eq!(fx.get("dst.txt"), "original");
     assert!(!fx.steps.lock().unwrap().contains(&Step::Exchanged));
+    clean(&fx);
 }
 
 #[test]
@@ -1498,7 +1549,10 @@ fn compensation_failed_vacate_is_a_plain_settled_error() {
     ] {
         let fx = Fx::new();
         let etag = Op::Rename.prepare(&fx);
-        let _faults = FaultScope::new(&[(Primitive::Capture, 1, errno)]);
+        let _faults = FaultScope::new(&[
+            (Primitive::ProbeExchange, 1, Errno::EINVAL),
+            (Primitive::Capture, 1, errno),
+        ]);
         let error = Op::Rename.run(&fx, &etag).unwrap_err();
         assert_eq!(error.code, code, "{errno}: {error:?}");
         assert_eq!(fx.get("src.txt"), "mine", "{errno}");
@@ -1507,7 +1561,10 @@ fn compensation_failed_vacate_is_a_plain_settled_error() {
     }
     let fx = Fx::new();
     let etag = Op::Rename.prepare(&fx);
-    let _faults = FaultScope::new(&[(Primitive::Capture, 1, Errno::EIO)]);
+    let _faults = FaultScope::new(&[
+        (Primitive::ProbeExchange, 1, Errno::EINVAL),
+        (Primitive::Capture, 1, Errno::EIO),
+    ]);
     let error = Op::Rename.run(&fx, &etag).unwrap_err();
     assert_eq!(error.code, ErrorCode::UncertainOutcome, "{error:?}");
 }
@@ -1520,23 +1577,23 @@ fn compensation_exchange_error_never_restores_an_unproven_slot_to_the_source() {
     let etag = Op::Rename.prepare(&fx);
     let root = fx.root.clone();
     let fx = fx.with_hook(move |step| {
-        if step == Step::Vacated {
-            // the slot no longer holds the source (as if the exchange had completed)
+        if step == Step::Captured {
+            // the slot no longer holds the checked destination
             let slot = recovery_dirs(&root).pop().unwrap().join("slot-1");
             std::fs::remove_file(&slot).unwrap();
             std::fs::write(&slot, "destination object").unwrap();
         }
         Ok(())
     });
-    let _faults = FaultScope::new(&[(Primitive::Exchange, 1, Errno::EIO)]);
+    let _faults = FaultScope::after_effect(&[(Primitive::Exchange, 1, Errno::EIO)]);
     let error = Op::Rename.run(&fx, &etag).unwrap_err();
     let kept = uncertain(&error);
     assert!(contains_bytes(&kept, "destination object"));
     assert!(
         !fx.root.join("src.txt").exists(),
-        "nothing moved to the source name"
+        "leftover destination was captured from the source name"
     );
-    assert_eq!(fx.get("dst.txt"), "original");
+    assert_eq!(fx.get("dst.txt"), "mine");
 }
 
 #[test]
@@ -1554,30 +1611,31 @@ fn supervised_recovery_shares_private_staging_compensation_and_person_log() {
             let destination = fx.root.join(op.destination());
             let root = fx.root.clone();
             let cancel = fx.cancel.clone();
-            let fx =
-                fx.with_hook(move |step| {
-                    if step == Step::TempCreated {
-                        assert!(private_temp(&root).is_file());
-                        assert!(public_stages(&root).is_empty());
-                    }
-                    if step == Step::Exchanged {
-                        // A late cancellation cannot change the committed outcome.
-                        cancel.cancel();
-                        if state == "uncertain" {
-                            let displaced = recovery_dirs(&root).pop().unwrap().join(
-                                if matches!(op, Op::Rename) {
-                                    "slot-1"
-                                } else {
-                                    "tmp"
-                                },
-                            );
+            let fx = fx.with_hook(move |step| {
+                if step == Step::TempCreated {
+                    assert!(private_temp(&root).is_file());
+                    assert!(public_stages(&root).is_empty());
+                }
+                if step == Step::Exchanged {
+                    // A late cancellation cannot change the committed outcome.
+                    cancel.cancel();
+                    if state == "uncertain" {
+                        if matches!(op, Op::Rename) {
+                            // Exchange-first leaves D under the source name.
+                            std::fs::rename(root.join("src.txt"), root.join("prior-destination"))
+                                .unwrap();
+                            std::fs::write(root.join("src.txt"), "unchecked displaced writer")
+                                .unwrap();
+                        } else {
+                            let displaced = recovery_dirs(&root).pop().unwrap().join("tmp");
                             std::fs::rename(&displaced, root.join("prior-destination")).unwrap();
                             std::fs::write(&displaced, "unchecked displaced writer").unwrap();
-                            successor(&destination, "newest external writer");
                         }
+                        successor(&destination, "newest external writer");
                     }
-                    Ok(())
-                });
+                }
+                Ok(())
+            });
             let (name, args, body) = match op {
                 Op::Replace => (
                     "edit",
@@ -1616,11 +1674,7 @@ fn supervised_recovery_shares_private_staging_compensation_and_person_log() {
                     if matches!(op, Op::Rename) { 3 } else { 1 },
                     Errno::EIO,
                 )],
-                "uncertain" => vec![(
-                    Primitive::Capture,
-                    if matches!(op, Op::Rename) { 2 } else { 1 },
-                    Errno::EIO,
-                )],
+                "uncertain" => vec![(Primitive::Capture, 1, Errno::EIO)],
                 _ => vec![],
             };
             let _scope = FaultScope::new(&faults);

@@ -13,6 +13,7 @@ import { randomUUID } from "node:crypto";
 import {
   effectiveKvBudgetTokens,
   type KvEvictionState,
+  kvEvictionCutsApply,
 } from "@ws-model-proxy/api/lib/kv-eviction-budget";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
@@ -74,6 +75,8 @@ export type AffinityTarget = {
   slots?: number | null;
   lastRoutedAt?: Date | null;
   engineKind?: "GENERIC" | "LLAMA_CPP" | "VLLM" | "SGLANG" | "OLLAMA" | "LM_STUDIO" | null;
+  /** Per-capacity image cap passed into the once-per-request unit estimator. */
+  imageTokenAllowance?: number | null;
 };
 
 export type AffinityDecision = {
@@ -94,9 +97,9 @@ export type AffinityDecision = {
   prefixTokens?: Record<string, number>;
   /**
    * Payload-aware estimate of the current request through the matched prefix
-   * depth (root + conversation units 1..depth), scaled by engine-reported
-   * prompt tokens when those are the request size. Absent when the request is
-   * not affine on that target.
+   * depth (root + conversation units 1..depth). Ranking never passes a
+   * reported value; the figure is the local request estimate. Absent when the
+   * request is not affine on that target.
    */
   matchedPrefixTokens?: Record<string, number>;
   /**
@@ -118,6 +121,7 @@ export type AffinitySessionBinding = {
   canonicalBytes: number;
   estimatedTokens?: number;
   reportedTokens?: number;
+  reportedPromptTokens?: number;
 };
 
 export function scopedAffinitySessionId(
@@ -322,6 +326,7 @@ type AffinityRequestArgs = {
   runtimeIdentity: string;
   sessionBinding?: AffinitySessionBinding;
   headers?: Headers;
+  imageTokenAllowance?: number | null;
 };
 
 export type CanonicalRequest = {
@@ -337,11 +342,22 @@ export type CanonicalRequest = {
   isContinuation: boolean;
   conversation: string | undefined;
   previousResponse: boolean;
+  /**
+   * Payload-aware token prefix sums computed once per request.
+   * Index 0 is the root (instructions + tools); index `d` is root plus
+   * conversation units `1..d`.
+   */
+  unitTokenPrefixSums: number[];
 };
 
 /** Once per request; all request-derived traversal shares an 8 * 2 MiB node cap. */
 export function buildCanonicalRequest(
-  { surface, payload, headers }: Pick<AffinityRequestArgs, "surface" | "payload" | "headers">,
+  {
+    surface,
+    payload,
+    headers,
+    imageTokenAllowance,
+  }: Pick<AffinityRequestArgs, "surface" | "payload" | "headers" | "imageTokenAllowance">,
   work: CanonicalWork = { steps: 0 },
 ): CanonicalRequest | null {
   try {
@@ -479,6 +495,12 @@ export function buildCanonicalRequest(
       forwardedValue(payload.conversation) ?? forwardedValue(payload.conversation_id);
     const conversation =
       conversationValue === undefined ? undefined : encode(conversationValue, MAX_CANONICAL_BYTES);
+    const unitTokenPrefixSums = computeUnitTokenPrefixSums(
+      instructions,
+      tools,
+      conversationUnits,
+      imageTokenAllowance,
+    );
     return {
       surface: canonicalSurface,
       carrier,
@@ -494,6 +516,7 @@ export function buildCanonicalRequest(
       conversation,
       previousResponse:
         canonicalSurface === "openai-responses" && typeof payload.previous_response_id === "string",
+      unitTokenPrefixSums,
     };
   } catch {
     return null;
@@ -517,25 +540,39 @@ export function canonicalByteLength(canonical: CanonicalRequest): number {
   );
 }
 
-function encodedPayloadTokens(encoded: string): number {
+function encodedPayloadTokens(encoded: string, imageTokenAllowance?: number | null): number {
   try {
-    const tokens = estimatePayloadTokens(JSON.parse(encoded) as unknown).tokens;
+    const tokens = estimatePayloadTokens(JSON.parse(encoded) as unknown, {
+      imageTokenAllowance,
+    }).tokens;
     return Number.isFinite(tokens) && tokens > 0 ? tokens : 0;
   } catch {
     return 0;
   }
 }
 
+function computeUnitTokenPrefixSums(
+  instructions: string[],
+  tools: string | undefined,
+  conversationUnits: string[],
+  imageTokenAllowance?: number | null,
+): number[] {
+  let tokens = 0;
+  for (const instruction of instructions)
+    tokens += encodedPayloadTokens(instruction, imageTokenAllowance);
+  if (tools) tokens += encodedPayloadTokens(tools, imageTokenAllowance);
+  const sums = [tokens];
+  for (const unit of conversationUnits) {
+    tokens += encodedPayloadTokens(unit, imageTokenAllowance);
+    sums.push(tokens);
+  }
+  return sums;
+}
+
 /** Payload-aware tokens of the root plus conversation units `1..depth`. */
 export function prefixPayloadTokensAtDepth(canonical: CanonicalRequest, depth: number): number {
-  let tokens = 0;
-  for (const instruction of canonical.instructions) tokens += encodedPayloadTokens(instruction);
-  if (canonical.tools) tokens += encodedPayloadTokens(canonical.tools);
   const limit = Math.max(0, Math.min(Math.trunc(depth), canonical.conversationUnits.length));
-  for (let index = 0; index < limit; index += 1) {
-    tokens += encodedPayloadTokens(canonical.conversationUnits[index]!);
-  }
-  return tokens;
+  return canonical.unitTokenPrefixSums[limit] ?? 0;
 }
 
 /**
@@ -570,12 +607,8 @@ export function prefixTokensAtDepth(
   );
 }
 
-export function instructionTokens(
-  canonical: CanonicalRequest,
-  estimate: number,
-  reportedPromptTokens?: number | null,
-): number {
-  return prefixTokensAtDepth(canonical, 0, estimate, reportedPromptTokens);
+export function instructionTokens(canonical: CanonicalRequest, estimate: number): number {
+  return prefixTokensAtDepth(canonical, 0, estimate);
 }
 
 /** Advisory identity must never reject a served request or expose partial material. */
@@ -912,8 +945,10 @@ export function affinityPrefixEvidenceSql(
      ORDER BY p.depth DESC LIMIT 1`;
 }
 
-/** Newest unexpired footprints per member KV pool, for new-conversation placement. */
+/** Newest unexpired footprints per execution target, for new-conversation placement. */
 export const AFFINITY_RESIDENCY_QUERY_LIMIT = 2_000;
+/** Slot/unknown occupancy ignores empty footprints so mixed pools stay on [0, 1]. */
+export const AFFINITY_RESIDENCY_SESSION_FLOOR = 1;
 
 export type AffinityResidencyRow = {
   capacityId: string;
@@ -924,64 +959,86 @@ export type AffinityResidencyRow = {
 };
 
 /**
- * Bounded newest-first footprints (`prefixDigest IS NULL`) grouped by
- * `execution_target.inferenceCapacityId`. Uses the
- * `[executionTargetId, expiresAt]` index. Newest 2,000 per capacity.
+ * Bounded newest-first footprints (`prefixDigest IS NULL`) per execution
+ * target, grouped later by `execution_target.inferenceCapacityId`. Each target
+ * walks the partial index `cache_affinity_record_residency`
+ * (`userId`, `executionTargetId`, `expiresAt` DESC, `id` DESC) WHERE `prefixDigest` IS NULL via
+ * `LATERAL ... LIMIT n` so live prefix rows are not scanned. EXPLAIN/buffer
+ * coverage lives in `cache-affinity.integration.test.ts` and needs the
+ * integration database (`SCHEMA_VALIDATION_DATABASE_URL`).
  */
 export function affinityResidencySql(
   ownerUserId: string,
   capacityIds: readonly string[],
   now: Date,
-  limitPerCapacity = AFFINITY_RESIDENCY_QUERY_LIMIT,
+  limitPerTarget = AFFINITY_RESIDENCY_QUERY_LIMIT,
 ): Prisma.Sql {
   return Prisma.sql`
-    SELECT ranked."capacityId", ranked."sessionId", ranked.tokens,
-           ranked."sharedWithSessionId", ranked."sharedPrefixTokens"
-      FROM (
-        SELECT r."sessionId",
-               r."estimatedTokens" AS tokens,
-               r."sharedWithSessionId",
-               r."sharedPrefixTokens",
-               t."inferenceCapacityId" AS "capacityId",
-               ROW_NUMBER() OVER (
-                 PARTITION BY t."inferenceCapacityId"
-                 ORDER BY r."expiresAt" DESC, r.id DESC
-               ) AS rn
-          FROM cache_affinity_record r
-          JOIN execution_target t ON t.id = r."executionTargetId"
-         WHERE r."userId" = ${ownerUserId}
-           AND t."userId" = ${ownerUserId}
-           AND t."inferenceCapacityId" IN (${Prisma.join([...capacityIds])})
-           AND r."prefixDigest" IS NULL
-           AND r."expiresAt" > ${now}::timestamp
-      ) ranked
-     WHERE ranked.rn <= ${limitPerCapacity}`;
+    SELECT t."inferenceCapacityId" AS "capacityId",
+           r."sessionId",
+           r.tokens,
+           r."sharedWithSessionId",
+           r."sharedPrefixTokens"
+      FROM execution_target t
+      JOIN LATERAL (
+        SELECT r2."sessionId",
+               r2."estimatedTokens" AS tokens,
+               r2."sharedWithSessionId",
+               r2."sharedPrefixTokens"
+          FROM cache_affinity_record r2
+         WHERE r2."userId" = ${ownerUserId}
+           AND r2."executionTargetId" = t.id
+           AND r2."prefixDigest" IS NULL
+           AND r2."expiresAt" > ${now}::timestamp
+         ORDER BY r2."expiresAt" DESC, r2.id DESC
+         LIMIT ${limitPerTarget}
+      ) r ON true
+     WHERE t."userId" = ${ownerUserId}
+       AND t."inferenceCapacityId" IN (${Prisma.join([...capacityIds])})`;
 }
 
 function billedResidentTokens(
   row: AffinityResidencyRow,
-  residentSessionIds: ReadonlySet<string>,
+  resident: ReadonlyMap<string, AffinityResidencyRow>,
 ): number {
   const raw = Math.max(0, Number(row.tokens) || 0);
   const shared = Number(row.sharedPrefixTokens);
   const sharer = row.sharedWithSessionId;
-  if (!Number.isFinite(shared) || !sharer || !residentSessionIds.has(sharer)) return raw;
+  if (!Number.isFinite(shared) || !sharer) return raw;
+  const sharerRow = resident.get(sharer);
+  if (!sharerRow) return raw;
+  // A↔F after TTL: bill the edge once. Ignore the back-pointer (the
+  // lexicographically greater session id keeps the shared tokens).
+  if (sharerRow.sharedWithSessionId === row.sessionId && sharer >= row.sessionId) return raw;
   return Math.max(0, raw - shared);
 }
 
+function preferResidencyRow(left: AffinityResidencyRow, right: AffinityResidencyRow) {
+  const leftTokens = Math.max(0, Number(left.tokens) || 0);
+  const rightTokens = Math.max(0, Number(right.tokens) || 0);
+  if (leftTokens !== rightTokens) return leftTokens >= rightTokens ? left : right;
+  if (right.sharedWithSessionId && !left.sharedWithSessionId) return right;
+  return left;
+}
+
 function residencyByCapacity(rows: readonly AffinityResidencyRow[]) {
-  const grouped = new Map<string, AffinityResidencyRow[]>();
+  const grouped = new Map<string, Map<string, AffinityResidencyRow>>();
   for (const row of rows) {
-    const list = grouped.get(row.capacityId) ?? [];
-    list.push(row);
-    grouped.set(row.capacityId, list);
+    const sessions = grouped.get(row.capacityId) ?? new Map<string, AffinityResidencyRow>();
+    const existing = sessions.get(row.sessionId);
+    sessions.set(row.sessionId, existing ? preferResidencyRow(existing, row) : row);
+    grouped.set(row.capacityId, sessions);
   }
   const byCapacity = new Map<string, { tokens: number; sessions: number }>();
-  for (const [capacityId, list] of grouped) {
-    const residentSessionIds = new Set(list.map((row) => row.sessionId));
+  for (const [capacityId, sessions] of grouped) {
     let tokens = 0;
-    for (const row of list) tokens += billedResidentTokens(row, residentSessionIds);
-    byCapacity.set(capacityId, { tokens, sessions: list.length });
+    let sessionCount = 0;
+    for (const row of sessions.values()) {
+      const billed = billedResidentTokens(row, sessions);
+      tokens += billed;
+      if (billed >= AFFINITY_RESIDENCY_SESSION_FLOOR) sessionCount += 1;
+    }
+    byCapacity.set(capacityId, { tokens, sessions: sessionCount });
   }
   return byCapacity;
 }
@@ -1007,8 +1064,8 @@ function residencyProjected({
     const used = Math.max(0, residentTokens + Math.max(0, requestTokens) - savedTokens);
     return Math.min(1, used / kvBudgetTokens);
   }
-  if (slots !== null && slots > 0) return residentSessions / slots;
-  return residentSessions / Math.max(maxResidentSessions, 1);
+  if (slots !== null && slots > 0) return Math.min(1, residentSessions / slots);
+  return Math.min(1, residentSessions / Math.max(maxResidentSessions, 1));
 }
 
 export async function rankAffinityTargets({
@@ -1023,6 +1080,7 @@ export async function rankAffinityTargets({
   targets,
   scoreSingleTarget = false,
   collectPrefixEvidence = false,
+  evictionFeedbackEnabled = true,
   sessionBinding,
   headers,
   now = new Date(),
@@ -1041,6 +1099,8 @@ export async function rankAffinityTargets({
   scoreSingleTarget?: boolean;
   /** Read the live-tip footprint snapshot only for enabled eviction feedback. */
   collectPrefixEvidence?: boolean;
+  /** False freezes residency K: skip stored cuts. Default true. */
+  evictionFeedbackEnabled?: boolean;
   sessionBinding?: AffinitySessionBinding;
   headers?: Headers;
   now?: Date;
@@ -1070,11 +1130,33 @@ export async function rankAffinityTargets({
   // on it (an affinity hit is never redirected), even with nothing to reorder.
   if (!policy.enabled || targets.length < (scoreSingleTarget ? 1 : 2)) return unchanged;
 
-  const canonical = buildCanonicalRequest({ surface, payload, headers });
-  const materialByIdentity = new Map(
-    targets.map((target) => [
-      target.targetIdentity,
-      materialFromCanonical(
+  const sharedCanonical = buildCanonicalRequest({
+    surface,
+    payload,
+    headers,
+  });
+  const prefixSumsByAllowance = new Map<string, number[]>();
+  const canonicalForAllowance = (imageTokenAllowance?: number | null): CanonicalRequest | null => {
+    if (!sharedCanonical) return null;
+    const key = imageTokenAllowance == null ? "" : String(imageTokenAllowance);
+    const cached = prefixSumsByAllowance.get(key);
+    const unitTokenPrefixSums =
+      cached ??
+      computeUnitTokenPrefixSums(
+        sharedCanonical.instructions,
+        sharedCanonical.tools,
+        sharedCanonical.conversationUnits,
+        imageTokenAllowance,
+      );
+    if (!cached) prefixSumsByAllowance.set(key, unitTokenPrefixSums);
+    return { ...sharedCanonical, unitTokenPrefixSums };
+  };
+  const preparedTargets = targets.map((target) => {
+    const canonical = canonicalForAllowance(target.imageTokenAllowance);
+    return {
+      target,
+      canonical,
+      material: materialFromCanonical(
         {
           ownerId,
           resourceOwnerId,
@@ -1089,7 +1171,13 @@ export async function rankAffinityTargets({
         },
         canonical,
       ),
-    ]),
+    };
+  });
+  const materialByIdentity = new Map(
+    preparedTargets.map(({ target, material }) => [target.targetIdentity, material]),
+  );
+  const canonicalByIdentity = new Map(
+    preparedTargets.map(({ target, canonical }) => [target.targetIdentity, canonical]),
   );
   const conversationPrefixDigests = [
     ...new Set([...materialByIdentity.values()].flatMap(({ digests }) => digests)),
@@ -1124,8 +1212,10 @@ export async function rankAffinityTargets({
     (material) => material.isContinuation,
   );
   const capacityIds = [...new Set(targets.map(({ capacityId }) => capacityId))];
+  const residencyWeight = policy.residencyWeight ?? 100;
+  const needResidency = residencyWeight > 0 && targets.length >= 2;
   const loadResidency = () =>
-    capacityIds.length === 0
+    !needResidency || capacityIds.length === 0
       ? Promise.resolve([] as AffinityResidencyRow[])
       : Promise.resolve()
           .then(() =>
@@ -1135,19 +1225,22 @@ export async function rankAffinityTargets({
           )
           .then((rows) => (Array.isArray(rows) ? rows : []))
           .catch(() => [] as AffinityResidencyRow[]);
+  const applyCuts = kvEvictionCutsApply(evictionFeedbackEnabled);
   const loadEvictions = () =>
-    Promise.resolve()
-      .then(() =>
-        db.capacityKvEviction.findMany({
-          where: {
-            capacityId: { in: capacityIds },
-            userId: resourceOwnerId,
-            expiresAt: { gt: now },
-          },
-        }),
-      )
-      .then((rows) => (Array.isArray(rows) ? rows : []))
-      .catch(() => [] as Array<KvEvictionState & { capacityId: string }>);
+    !applyCuts || capacityIds.length === 0
+      ? Promise.resolve([] as Array<KvEvictionState & { capacityId: string }>)
+      : Promise.resolve()
+          .then(() =>
+            db.capacityKvEviction.findMany({
+              where: {
+                capacityId: { in: capacityIds },
+                userId: resourceOwnerId,
+                expiresAt: { gt: now },
+              },
+            }),
+          )
+          .then((rows) => (Array.isArray(rows) ? rows : []))
+          .catch(() => [] as Array<KvEvictionState & { capacityId: string }>);
   const [records, activeLoads, waitingLoads, residencyRows, evictions] = await Promise.all([
     db.cacheAffinityRecord.findMany({
       where: {
@@ -1196,8 +1289,10 @@ export async function rankAffinityTargets({
       },
       _count: { _all: true },
     }),
-    continuationRequest ? Promise.resolve([] as AffinityResidencyRow[]) : loadResidency(),
-    continuationRequest
+    continuationRequest || !needResidency
+      ? Promise.resolve([] as AffinityResidencyRow[])
+      : loadResidency(),
+    continuationRequest || !needResidency
       ? Promise.resolve([] as Array<KvEvictionState & { capacityId: string }>)
       : loadEvictions(),
   ]);
@@ -1207,6 +1302,7 @@ export async function rankAffinityTargets({
   const scored = await Promise.all(
     targets.map(async (target, originalIndex) => {
       const material = materialByIdentity.get(target.targetIdentity)!;
+      const canonical = canonicalByIdentity.get(target.targetIdentity);
       const conversationDepthByDigest = new Map(
         material.routingNodes.map(({ digest, depth }) => [digest, depth]),
       );
@@ -1316,8 +1412,16 @@ export async function rankAffinityTargets({
           ? 0
           : requestTokens > 0
             ? matchedPrefixTokens / requestTokens
-            : canonical && canonicalByteLength(canonical) > 0
-              ? prefixBytesAtDepth(canonical, scoredPrefixDepth) / canonicalByteLength(canonical)
+            : canonical
+              ? (() => {
+                  const total = prefixPayloadTokensAtDepth(
+                    canonical,
+                    canonical.conversationUnits.length,
+                  );
+                  return total > 0
+                    ? prefixPayloadTokensAtDepth(canonical, scoredPrefixDepth) / total
+                    : 0;
+                })()
               : 0;
       return {
         target,
@@ -1337,6 +1441,7 @@ export async function rankAffinityTargets({
         requestTokens,
         sessionId,
         prefixEvidence,
+        canonical,
         score: 0,
       };
     }),
@@ -1344,16 +1449,18 @@ export async function rankAffinityTargets({
   const anyAffine = scored.some((row) => row.affine);
   let residency = residencyRows;
   let evictionRows = evictions;
-  if (!anyAffine && continuationRequest) {
+  if (!anyAffine && continuationRequest && needResidency) {
     [residency, evictionRows] = await Promise.all([loadResidency(), loadEvictions()]);
   }
-  const resident = residencyByCapacity(residency);
-  const evictionByCapacity = new Map(evictionRows.map((row) => [row.capacityId, row] as const));
+  const spreadResidency = !anyAffine && needResidency;
+  const resident = spreadResidency ? residencyByCapacity(residency) : new Map();
+  const evictionByCapacity = spreadResidency
+    ? new Map(evictionRows.map((row) => [row.capacityId, row] as const))
+    : new Map();
   const maxResidentSessions = Math.max(0, ...[...resident.values()].map((row) => row.sessions));
   const weights = targets.map((target) => Math.max(0, target.weight ?? 1));
   const meanWeight =
     weights.reduce((sum, weight) => sum + weight, 0) / Math.max(weights.length, 1) || 1;
-  const residencyWeight = policy.residencyWeight ?? 100;
   for (const row of scored) {
     const penalties =
       row.loadPenalty +
@@ -1368,16 +1475,23 @@ export async function rankAffinityTargets({
         penalties;
       continue;
     }
+    if (!spreadResidency) {
+      row.score = 0 - penalties;
+      continue;
+    }
     const occupancy = resident.get(row.target.capacityId) ?? { tokens: 0, sessions: 0 };
     const reportedK = protectionKvBudgetTokens(row.target.engineKind, row.target.kvBudgetTokens);
     const kvBudgetTokens = effectiveKvBudgetTokens(
       reportedK,
       evictionByCapacity.get(row.target.capacityId),
       now,
+      evictionFeedbackEnabled,
     );
     const slots = row.target.slots ?? row.target.hardConcurrencyLimit;
     const savedTokens =
-      row.instructionDepth > 0 && canonical ? instructionTokens(canonical, row.requestTokens) : 0;
+      row.instructionDepth > 0 && row.canonical
+        ? instructionTokens(row.canonical, row.requestTokens)
+        : 0;
     const projected = residencyProjected({
       residentTokens: occupancy.tokens,
       residentSessions: occupancy.sessions,
@@ -1390,19 +1504,25 @@ export async function rankAffinityTargets({
     const weight = Math.max(0, row.target.weight ?? 1);
     const cost =
       weight <= 0 || meanWeight <= 0 ? Number.POSITIVE_INFINITY : projected / (weight / meanWeight);
-    const residencyPenalty = Number.isFinite(cost)
-      ? Math.ceil(cost * residencyWeight)
-      : 1_000_000_000;
+    // Keep the weighted fill off integer ceil so small occupancy differences
+    // survive; saturated members then break on lastRoutedAt / originalIndex.
+    const residencyPenalty = Number.isFinite(cost) ? cost * residencyWeight : 1_000_000_000;
     row.score = 0 - penalties - residencyPenalty;
   }
-  scored.sort(
-    (left, right) =>
-      right.score - left.score ||
-      right.instructionDepth - left.instructionDepth ||
-      (left.target.lastRoutedAt?.getTime() ?? 0) - (right.target.lastRoutedAt?.getTime() ?? 0) ||
-      left.target.poolMemberId.localeCompare(right.target.poolMemberId) ||
-      left.originalIndex - right.originalIndex,
-  );
+  scored.sort((left, right) => {
+    const score = right.score - left.score;
+    if (score !== 0) return score;
+    const instruction = right.instructionDepth - left.instructionDepth;
+    if (instruction !== 0) return instruction;
+    if (spreadResidency) {
+      const routed =
+        (left.target.lastRoutedAt?.getTime() ?? 0) - (right.target.lastRoutedAt?.getTime() ?? 0);
+      if (routed !== 0) return routed;
+    }
+    const original = left.originalIndex - right.originalIndex;
+    if (original !== 0) return original;
+    return spreadResidency ? left.target.poolMemberId.localeCompare(right.target.poolMemberId) : 0;
+  });
   return {
     orderedTargetIds: scored.map(({ target }) => target.executionTargetId),
     scores: Object.fromEntries(
@@ -1463,6 +1583,24 @@ export async function rankAffinityTargets({
   };
 }
 
+/** Cheap placement remainder after admission. Must not run inside the hot fence. */
+export async function markPoolMemberLastRoutedAt(
+  poolMemberId: string | null | undefined,
+  at = new Date(),
+  db: {
+    poolMember: {
+      update: (args: { where: { id: string }; data: { lastRoutedAt: Date } }) => Promise<unknown>;
+    };
+  } = prisma,
+): Promise<void> {
+  if (!poolMemberId) return;
+  try {
+    await db.poolMember.update({ where: { id: poolMemberId }, data: { lastRoutedAt: at } });
+  } catch {
+    // A missed stamp must not fail a granted request.
+  }
+}
+
 export function isAffinityTargetWarm(
   decision: Pick<AffinityDecision, "prefixDepths" | "conversationMatches">,
   executionTargetId: string,
@@ -1491,6 +1629,7 @@ export async function rememberAffinity({
   estimatedTokens,
   estimatedDeltaTokens,
   reportedTokens,
+  reportedPromptTokens,
   engineCacheConfirmed,
   sessionBinding,
   headers,
@@ -1510,6 +1649,8 @@ export async function rememberAffinity({
   estimatedDeltaTokens?: number;
   /** Engine-reported prompt + completion for the served turn, when known. */
   reportedTokens?: number;
+  /** Engine-reported prompt tokens only; used to scale shared prefixes. */
+  reportedPromptTokens?: number;
   /**
    * Latest engine cache evidence from the served response. `true` (cached
    * prompt tokens reported) and `false` (cache fields reported with zero)
@@ -1535,7 +1676,10 @@ export async function rememberAffinity({
     sessionBinding,
     headers,
   };
-  const canonical = buildCanonicalRequest(requestArgs);
+  const canonical = buildCanonicalRequest({
+    ...requestArgs,
+    imageTokenAllowance: target.imageTokenAllowance,
+  });
   const material = materialFromCanonical(requestArgs, canonical);
   if (
     material.instructionDigests.length === 0 &&
@@ -1556,8 +1700,15 @@ export async function rememberAffinity({
       sessionBinding.reportedTokens + (estimatedDeltaTokens ?? 0),
     );
   }
+  if (material.boundSessionId && sessionBinding?.reportedPromptTokens !== undefined) {
+    reportedPromptTokens = Math.min(
+      2_147_483_647,
+      sessionBinding.reportedPromptTokens + (estimatedDeltaTokens ?? 0),
+    );
+  }
   const expiresAt = new Date(now.getTime() + policy.ttlSeconds * 1000);
   const storedReportedTokens = clampAffinityTokens(reportedTokens);
+  const storedReportedPromptTokens = clampAffinityTokens(reportedPromptTokens);
   // Every record this call writes (created or refreshed) carries the same
   // `lastUsedAt` and `sessionId`: warm-session protection (S-C,
   // ./warm-protection.ts) groups records into one session by the id, dates it
@@ -1614,7 +1765,12 @@ export async function rememberAffinity({
       : [];
     let sharedWithSessionId: string | null = null;
     let sharedPrefixTokens: number | null = null;
-    if (material.identifiable && existingNodes.length === 0 && material.nodes.length > 0) {
+    if (
+      material.identifiable &&
+      existingNodes.length === 0 &&
+      material.nodes.length > 0 &&
+      !material.boundSessionId
+    ) {
       const shared = await tx.$queryRaw<{ sessionId: string; depth: number }[]>(
         affinitySharedPrefixProbeSql(scope, material, sessionId, now),
       );
@@ -1623,7 +1779,7 @@ export async function rememberAffinity({
       if (hit?.sessionId && hit.sessionId !== sessionId && Number.isFinite(depth)) {
         sharedWithSessionId = hit.sessionId;
         sharedPrefixTokens = canonical
-          ? prefixTokensAtDepth(canonical, depth, estimatedTokens ?? 0, storedReportedTokens)
+          ? prefixTokensAtDepth(canonical, depth, estimatedTokens ?? 0, storedReportedPromptTokens)
           : 0;
       }
     }
@@ -1921,6 +2077,9 @@ export async function rememberAffinity({
       canonicalBytes: material.canonicalBytes,
       estimatedTokens,
       ...(storedReportedTokens === null ? {} : { reportedTokens: storedReportedTokens }),
+      ...(storedReportedPromptTokens === null
+        ? {}
+        : { reportedPromptTokens: storedReportedPromptTokens }),
     };
   }, AFFINITY_TRANSACTION_LIMITS);
 }

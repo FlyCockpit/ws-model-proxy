@@ -30,6 +30,7 @@ pub struct Fx {
     pub ops: FileOps,
     pub cancel: Cancel,
     pub steps: Arc<Mutex<Vec<Step>>>,
+    _registry: crate::file_ops::registry::RegistryGuard,
 }
 
 pub fn args<T: DeserializeOwned>(value: Value) -> T {
@@ -81,6 +82,7 @@ impl Fx {
             ops,
             cancel: Cancel::new(),
             steps,
+            _registry: crate::file_ops::registry::install_temp_registry(),
         }
     }
 

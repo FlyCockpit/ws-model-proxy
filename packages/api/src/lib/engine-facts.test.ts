@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  engineCountContextSupportsNative,
   engineDefaultConcurrency,
   enginePreset,
   isHardLimitRefreshAdmissible,
@@ -43,6 +44,7 @@ describe("engine facts", () => {
       engineFactsSource: "MIXED",
       engineLoadSource: null,
       engineLoadSignals: [],
+      engineCountContext: null,
     });
     expect(
       storedEngineFacts({
@@ -80,6 +82,28 @@ describe("engine facts", () => {
       storedEngineFacts({ servedModelAliases: { value: ["a", "b"], source: "probe" } }),
     ).toBeNull();
     expect(storedEngineFacts(undefined)).toBeNull();
+    expect(
+      storedEngineFacts({
+        countContext: { value: "llama_input_tokens", source: "probe" },
+      }),
+    ).toMatchObject({
+      engineCountContext: "LLAMA_INPUT_TOKENS",
+      engineFactsSource: "PROBE",
+    });
+    expect(
+      storedEngineFacts({
+        engine: { value: "ollama", source: "probe" },
+        countContext: { value: "unsupported", source: "probe" },
+      }),
+    ).toMatchObject({ engineKind: "OLLAMA", engineCountContext: "UNSUPPORTED" });
+  });
+
+  it("gates native count on a probed tokenize method", () => {
+    expect(engineCountContextSupportsNative("LLAMA_INPUT_TOKENS")).toBe(true);
+    expect(engineCountContextSupportsNative("VLLM_TOKENIZE")).toBe(true);
+    expect(engineCountContextSupportsNative("UNSUPPORTED")).toBe(false);
+    expect(engineCountContextSupportsNative(null)).toBe(false);
+    expect(engineCountContextSupportsNative(undefined)).toBe(false);
   });
 
   it("compares stored facts field by field", () => {

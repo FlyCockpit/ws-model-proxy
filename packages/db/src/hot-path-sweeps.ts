@@ -231,7 +231,12 @@ export async function purgeDeletedUserHistory(
       }),
     batch,
   );
-  for (const table of ["usage_rollup_minute", "usage_rollup_hour", "engine_load_rollup_minute"])
+  for (const table of [
+    "usage_rollup_minute",
+    "usage_rollup_hour",
+    "engine_load_rollup_minute",
+    "node_metrics_minute",
+  ])
     processed += await sweepLoop(
       () => deleteOwnedBatch(db, table, "ctid", "ownerUserId", userId, batch),
       batch,
@@ -279,6 +284,7 @@ export async function purgeDeletedUserHistory(
         OR EXISTS (SELECT 1 FROM usage_rollup_hour
                     WHERE "ownerUserId" = ${userId} OR "requesterUserId" = ${userId})
         OR EXISTS (SELECT 1 FROM engine_load_rollup_minute WHERE "ownerUserId" = ${userId})
+        OR EXISTS (SELECT 1 FROM node_metrics_minute WHERE "ownerUserId" = ${userId})
         AS remaining`;
   return { processed, remaining: plainRemaining || (left?.remaining ?? true) };
 }

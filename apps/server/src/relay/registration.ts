@@ -41,6 +41,10 @@ import {
   coarseCapabilitiesFromOpenAi,
   resolveEffectiveCapabilityMetadata,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import {
+  CLI_TOKEN_IDENTITY_MISMATCH_MESSAGE,
+  DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE,
+} from "@ws-model-proxy/config/cli-identity-key";
 import { directModelId, validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
 import { acquireFences, fenceOwners, fences } from "@ws-model-proxy/db/capacity-lock-order";
@@ -61,7 +65,7 @@ export type DesiredModelCapability = {
 export class RelayRegistrationError extends Error {
   constructor(
     message: string,
-    public readonly code: "access_denied" | "protocol_error",
+    public readonly code: "access_denied" | "protocol_error" | "identity_mismatch",
   ) {
     super(message);
     this.name = "RelayRegistrationError";
@@ -156,6 +160,7 @@ export async function persistRelayRegistration({
   endpointTargeting,
   connection = false,
   reported,
+  identityPublicKey,
   now = new Date(),
 }: {
   identity: CliWebsocketIdentity;
@@ -164,6 +169,12 @@ export async function persistRelayRegistration({
   inventoryConfirmed: boolean;
   endpointTargeting: boolean;
   connection?: boolean;
+  /**
+   * Hello only: the CLI identity public key the hello presented. Required for
+   * a device-credential hello (omitting it is a mismatch). Inventory updates
+   * omit it; that socket was already admitted.
+   */
+  identityPublicKey?: string;
   /** Hello only. inventory.update must omit this so reported columns stay put. */
   reported?: ReportedRelayFeatures;
   now?: Date;
@@ -381,13 +392,20 @@ export async function persistRelayRegistration({
           // After the device upsert, which holds the device row lock that a
           // re-login's revoking transaction and a device delete also take. A
           // device credential only ever registers as its minted device; an
-          // unbound CLI token is bound here. Any refusal rolls back the
-          // upsert, including a device row it just created.
+          // unbound CLI token is bound here (device + identity key). Any
+          // refusal rolls back the upsert, including a device row it just
+          // created — a mismatched identity key therefore does not take the
+          // device from the session that already holds it.
+          // Hello always presents the identity key. An omitted key is not a
+          // match for a device credential. Inventory updates pass null: that
+          // socket was already admitted.
+          const presentedIdentityPublicKey = connection ? (identityPublicKey ?? "") : null;
           const credentialCheck = await checkCliCredentialForDevice(
             tx,
             identity,
             cliDevice.id,
             now,
+            presentedIdentityPublicKey,
           );
           if (credentialCheck === "revoked") {
             throw new RelayRegistrationError("Credential was revoked.", "access_denied");
@@ -397,6 +415,25 @@ export async function persistRelayRegistration({
               "Credential is bound to a different CLI device.",
               "access_denied",
             );
+          }
+          if (credentialCheck === "identityMismatch") {
+            throw new RelayRegistrationError(
+              identity.kind === "cliToken"
+                ? CLI_TOKEN_IDENTITY_MISMATCH_MESSAGE
+                : DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE,
+              "identity_mismatch",
+            );
+          }
+          if (identity.kind === "deviceCredential") {
+            await tx.cliDeviceCredential.updateMany({
+              where: { id: identity.id, lastRefusedAt: { not: null } },
+              data: { lastRefusedAt: null, lastRefusedReason: null },
+            });
+          } else {
+            await tx.cliToken.updateMany({
+              where: { id: identity.id, lastRefusedAt: { not: null } },
+              data: { lastRefusedAt: null, lastRefusedReason: null },
+            });
           }
 
           const inventoryChanged = cliDevice.inventoryDigest !== inventoryDigest;

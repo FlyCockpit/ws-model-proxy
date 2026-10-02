@@ -1,7 +1,8 @@
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { encodeRelayBinaryFrame, RELAY_REQUEST_BODY_WINDOW_CHUNKS } from "./protocol.js";
+import { generateTestHelloIdentity } from "./hello-identity.js";
+import { encodeRelayBinaryFrame } from "./protocol.js";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
@@ -70,6 +71,7 @@ const identity: CliWebsocketIdentity = {
   lookupPrefix: "wsmp_cli_lookup",
 };
 const now = new Date("2026-01-01T00:00:00.000Z");
+const testIdentity = generateTestHelloIdentity();
 
 class FakeSocket {
   readyState = 1;
@@ -101,44 +103,45 @@ function uncompressedKey(): string {
   return bytes.toString("base64url");
 }
 
-function hello(terminalApproval = false) {
+function challengeNonce(socket: FakeSocket): string {
+  for (const send of socket.sends) {
+    if (typeof send !== "string") continue;
+    const parsed = JSON.parse(send) as { type?: string; nonce?: string };
+    if (parsed.type === "hello.challenge" && typeof parsed.nonce === "string") {
+      return parsed.nonce;
+    }
+  }
+  throw new Error("expected hello.challenge");
+}
+
+function hello(socket: FakeSocket, terminalApproval = false) {
   return JSON.stringify({
     type: "hello",
     id: "hello-desktop",
-    protocolVersion: "2.8",
+    protocolVersion: "2.4",
     cli: {
       slug: "desktop",
       hostname: "desktop.local",
+      identityPublicKey: testIdentity.publicKey,
+      identitySignature: testIdentity.sign(
+        challengeNonce(socket),
+        "desktop",
+        "https://proxy.example.com",
+      ),
       version: "0.4.0",
       capabilities: {
-        protocolVersion: "2.8",
-        inventoryAck: true,
-        inventoryReplace: true,
-        endpointTargeting: true,
-        binaryFrames: true,
-        cancellation: true,
-        maxBinaryChunkBytes: 1024 * 1024,
-        requestBodyStreaming: true,
-        requestBodyWindowChunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
-        sharedTokenizerTps: true,
-        standardizedMetrics: true,
-        terminal: true,
-        exec: true,
         features: {
           humanTerminal: false,
           mcpCommandMode: "supervised",
           terminalApproval,
           terminalSupported: true,
           remoteMetricSources: false,
+          remoteEngineAdapters: false,
           mcpFileRead: false,
           fileRootsConfigured: false,
           allowFileToolsAsRoot: false,
         },
         terminalPublicKey: uncompressedKey(),
-        terminalViewers: true,
-        supervisedCommands: true,
-        nodeTelemetry: true,
-        fileOps: true,
       },
     },
     endpoints: [],
@@ -162,6 +165,7 @@ describe("terminal list pushes for supervised requests", () => {
       revokedAt: null,
       expiresAt: null,
       cliDeviceId: null,
+      identityPublicKey: null,
     });
     db.cliToken.updateMany.mockResolvedValue({ count: 1 });
     db.user.findUnique.mockResolvedValue({ slug: "owner" });
@@ -206,7 +210,7 @@ describe("terminal list pushes for supervised requests", () => {
     db.poolMember.findMany.mockResolvedValue([]);
     cli = new FakeSocket();
     relaySessionManager.acceptAuthenticatedSocket({ socket: cli, identity, now });
-    await relaySessionManager.handleTextFrame(cli, hello(), now);
+    await relaySessionManager.handleTextFrame(cli, hello(cli), now);
   });
 
   afterEach(async () => {
@@ -293,7 +297,7 @@ describe("terminal list pushes for supervised requests", () => {
     await relaySessionManager.removeSession(cli, now);
     cli = new FakeSocket();
     relaySessionManager.acceptAuthenticatedSocket({ socket: cli, identity, now });
-    await relaySessionManager.handleTextFrame(cli, hello(true), now);
+    await relaySessionManager.handleTextFrame(cli, hello(cli, true), now);
     const request = await startSupervisedRequest({
       kind: "file",
       userId: "user-id",

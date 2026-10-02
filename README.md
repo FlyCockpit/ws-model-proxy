@@ -188,7 +188,9 @@ curl --fail-with-body \
 For OpenWebUI and other OpenAI-compatible clients, set the API base URL to
 `$WSMP_SERVER_URL/v1` and provide the same bearer token. Use the exact client
 model ID returned by `/v1/models`; dashboard labels and upstream model IDs are
-search aids, not always the client ID.
+search aids, not always the client ID. `/v1/models` lists only ids this token
+can call now: live published local members, and `owner/pool:external` when
+the token has access.
 
 Dedicated speech-to-text requests use `POST /v1/audio/transcriptions` (and
 translations use `/v1/audio/translations`) with the standard multipart OpenAI

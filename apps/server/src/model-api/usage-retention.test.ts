@@ -30,6 +30,7 @@ const {
   deleteExpiredRoutingVerdicts,
   deleteExpiredKvEvictions,
   deleteExpiredEngineLoadMinutes,
+  deleteExpiredNodeMetricsMinutes,
   KV_EVICTION_RETENTION_MS,
   hourIncrementsFromMinuteRows,
   ROUTING_VERDICT_RETENTION_MS,
@@ -128,6 +129,7 @@ describe("usage retention", () => {
       routingVerdictsDeleted: 0,
       kvEvictionsDeleted: 0,
       engineLoadMinutesDeleted: 0,
+      nodeMetricsMinutesDeleted: 0,
     });
     expect(tx.$executeRaw).not.toHaveBeenCalled();
   });
@@ -459,6 +461,27 @@ describe("usage retention", () => {
     expect(prisma.$executeRaw).not.toHaveBeenCalled();
   });
 
+  it("deletes node-metrics minutes older than 7 days in SKIP LOCKED batches", async () => {
+    const { prisma } = fakePrisma();
+    prisma.$executeRaw.mockResolvedValueOnce(2).mockResolvedValueOnce(1);
+    expect(
+      await deleteExpiredNodeMetricsMinutes({ prisma: prisma as never, now: NOW, batch: 2 }),
+    ).toBe(3);
+    const [strings, cutoff, batch] = prisma.$executeRaw.mock.calls[0] as [
+      TemplateStringsArray,
+      Date,
+      number,
+    ];
+    expect(strings.join("?")).toContain("DELETE FROM node_metrics_minute");
+    expect(strings.join("?")).toContain("FOR UPDATE SKIP LOCKED");
+    expect(cutoff).toEqual(new Date(NOW.getTime() - 7 * DAY_MS));
+    expect(batch).toBe(2);
+    armDbShutdownFence();
+    prisma.$executeRaw.mockClear();
+    expect(await deleteExpiredNodeMetricsMinutes({ prisma: prisma as never, now: NOW })).toBe(0);
+    expect(prisma.$executeRaw).not.toHaveBeenCalled();
+  });
+
   it("moves minute rows older than 30 days into additive hourly upserts in one transaction", async () => {
     const { prisma, tx } = fakePrisma();
     tx.$queryRaw.mockResolvedValueOnce([
@@ -585,6 +608,7 @@ describe("usage retention", () => {
       routingVerdictsDeleted: 0,
       kvEvictionsDeleted: 0,
       engineLoadMinutesDeleted: 0,
+      nodeMetricsMinutesDeleted: 0,
     });
     const stop = startUsageRetention({ retentionDays: 14, intervalMs: 60_000, run });
     expect(startUsageRetention({ retentionDays: 14, run })).toBe(stop);

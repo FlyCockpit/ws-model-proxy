@@ -3,24 +3,31 @@
 //!
 //! Recovery owns overwrite and exchange-less plain rename in one transaction.
 //! Overwrite preflights before any public capture: exchange/NR private dummies,
-//! then link probes on the actual source and destination. Exchange-less overwrite
-//! vacates both into R, proves held identity, and publishes source fail-if-exists.
-//! Plain link rename vacates/proves source first; direct NR needs no R. Link
-//! publication uses own-name proofs, never cross-link inode equality; returned
-//! etags bind the published bytes/mtime to the admitted source. Unpublished user
-//! sources are restored only to source or kept, never disposed as generated temps.
-//! Directories never overwrite, use NR only, and own-subtree moves are invalid_input.
+//! then link probes on the actual source and destination. Exchange-less NR
+//! overwrite vacates both into R, proves held identity, and publishes source
+//! fail-if-exists. Link publication is link-first when the probe alias and the
+//! held source are one object (link S onto `to`, then capture S); noino keeps
+//! vacate-first. Direct NR needs no R. Returned etags bind the published
+//! bytes/mtime to the admitted source. Unpublished user sources are restored
+//! only to source or kept, never disposed as generated temps. Directories never
+//! overwrite, use NR only, and own-subtree moves are invalid_input. Move EINVAL
+//! while NR works in R is invalid_input before capture.
 //! File/symlink delete captures/proves before disposal; directory delete uses the
 //! kernel's empty-only rmdir rule. Cancellation ends before first capture.
 //!
 //! Recovery residuals: (a) same-user private-slot replacement between held proof,
 //! close and unlink; (a2) absent-private-slot plain capture permits a squatter race;
-//! (b) vacant public names during undo; (b2) recovery rename's source vacant from
-//! capture to operation end, plus destination vacancy on exchange-less overwrite.
+//! (b) vacant public names during undo; (b2) vacate-first recovery rename's source
+//! vacant from capture to operation end; link-first leaves it until `to` holds
+//! the object. NR overwrite also vacates the destination.
 //! Concurrent creates survive, and blocked restoration reports uncertain_outcome.
 //! (d) crashes leave S/D, partial temp/probes or preflight dummies in R, possibly
-//! with vacant names or two published/private links; R/s/d are logged before capture,
-//! with no intent file or replay; (e) unheld objects never authorize deletion;
+//! with vacant names or two published/private links. Every R-using op writes a
+//! versioned INTENT (phase, per-slot identity, pid/host) before the first capture,
+//! including exchange-first overwrite (swap `from <-> to`, then capture D from
+//! `from`). Live R dirs are indexed in the CLI state directory; `wsmp recover`
+//! rolls forward or back from phase. Success deletes INTENT with an empty R.
+//! There is no automatic replay; (e) unheld objects never authorize deletion;
 //! (f) another process's NFS fd can leave .nfs residue (own fds close before unlink,
 //! except pinned source proof through probe-alias unlink on per-vnode clients);
 //! (g) replace/rename expose a link before alias cleanup: on a mount with believable
@@ -47,7 +54,7 @@ use super::error::{ErrorCode, FileError, FileResult};
 use super::exchange::{Primitive, is_unsupported, no_replace};
 use super::policy::Access;
 use super::read::current_etag;
-use super::recovery::{Held, Origin, RecoveryDir};
+use super::recovery::{Held, Origin, PublishMethod, RecoveryDir};
 use super::resolve::{Kind, ResolveOpts, Resolved, Stat, resolve};
 use super::stat::kind_name;
 use super::write::{DEFAULT_PARENT_MODE, parse_mode};
@@ -755,7 +762,11 @@ fn commit_rename(
     }
     // A supported direct NR move requires no private directory (notably APFS
     // supervised files). Only HardLinksOnly deliberately skips the kernel rung.
+    // EINVAL is also how vfat/exFAT/SMB reject a destination name. When a later
+    // private NR probe succeeds, that EINVAL is `invalid_input`, not a missing
+    // rename flag — and nothing is captured.
     let mut candidate = None;
+    let mut move_errno: Option<Errno> = None;
     if !(overwrite && dst.is_some()) {
         if !supervised || ops.rename_atomic_capability() != RenameAtomicCapability::HardLinksOnly {
             candidate = from
@@ -789,11 +800,23 @@ fn commit_rename(
                     return finish_move(&mut recovery, result.map(|()| false));
                 }
                 Err(Errno::EEXIST) => return Err(exists_error()),
-                Err(errno) if is_unsupported(errno) => {}
+                Err(errno) if is_unsupported(errno) => move_errno = Some(errno),
                 Err(errno) => return Err(FileError::errno(errno)),
             }
         }
         if src.stat.kind() == Kind::Dir {
+            if move_errno == Some(Errno::EINVAL) {
+                let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path)?;
+                let result = match recovery.noreplace_works(ops, to) {
+                    Ok(true) => Err(rejected_name()),
+                    Ok(false) => Err(FileError::unsafe_filesystem()),
+                    Err(error) => Err(error),
+                };
+                drop(src);
+                drop(candidate);
+                drop(dst);
+                return finish_move(&mut recovery, result);
+            }
             return Err(FileError::unsafe_filesystem());
         }
     }
@@ -810,6 +833,34 @@ fn commit_rename(
     let result = recovery
         .preflight_move(ops, from, to, &src, dst.as_ref())
         .and_then(|method| {
+            if move_errno == Some(Errno::EINVAL) && matches!(method, Some(PublishMethod::NoReplace))
+            {
+                return Err(rejected_name());
+            }
+            // Overwrite never tried Move. NR working in R does not prove the
+            // public destination name is legal; EEXIST does, EINVAL does not.
+            if dst.is_some() && matches!(method, Some(PublishMethod::NoReplace)) {
+                match no_replace(
+                    from.dir.as_fd(),
+                    &from.name,
+                    to.dir.as_fd(),
+                    &to.name,
+                    Primitive::Move,
+                ) {
+                    Ok(()) => {
+                        let _ = ops.step(Step::Moved);
+                        if matches!(to.lstat(), Ok(Some(now)) if src.matches_for_restore(&now)) {
+                            return Ok(false);
+                        }
+                        // Landed, but not the admitted object. Keep it in R.
+                        let _ = recovery.capture(&to.dir, &to.name, &to.full_path());
+                        return Err(recovery.uncertain());
+                    }
+                    Err(Errno::EEXIST) => {}
+                    Err(Errno::EINVAL) => return Err(rejected_name()),
+                    Err(errno) => return Err(FileError::errno(errno)),
+                }
+            }
             recovery.commit_move(ops, from, to, &mut src, dst.as_mut(), method, cancel)
         });
     drop(src);
@@ -945,6 +996,10 @@ fn verify_moved(
 
 fn exists_error() -> FileError {
     FileError::new(ErrorCode::Exists, "the destination already exists")
+}
+
+fn rejected_name() -> FileError {
+    FileError::invalid("destination name is not valid on this filesystem")
 }
 
 pub(crate) fn mkdir(ops: &FileOps, args: &MkdirArgs, cancel: &Cancel) -> FileResult<MkdirResult> {
@@ -1152,6 +1207,7 @@ fn delete_impl(
     let result = (|| {
         ops.step(Step::Vacating)?;
         cancel.check()?; // last cancellation point before public capture
+        recovery.prepare_intent(super::intent::Intent::delete(&resolved.full_path()))?;
         let mark = recovery.checkpoint();
         let Some(slot) = recovery.capture(&resolved.dir, &resolved.name, &resolved.full_path())
         else {
@@ -1161,6 +1217,8 @@ fn delete_impl(
                 None => recovery.uncertain(),
             });
         };
+        let _ = recovery.record_slot_identity(&slot);
+        let _ = recovery.set_intent_phase(super::intent::IntentPhase::Captured);
         let _ = ops.step(Step::Vacated);
         if !recovery.holds(&slot, &held) {
             held.release();
@@ -1174,6 +1232,7 @@ fn delete_impl(
             };
         }
         // A proven delete is committed; failed cleanup is recoverable success.
+        let _ = recovery.set_intent_phase(super::intent::IntentPhase::Committed);
         recovery.dispose(ops, &slot, &mut held);
         Ok(())
     })();

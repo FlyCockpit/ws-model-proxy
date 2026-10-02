@@ -203,14 +203,15 @@ export function resolveCacheStatsWindow(input: CacheStatsWindowInput, now: Date)
       : defaultBucketMs(Math.min(durationMs, retentionMs), usesHour);
   bucketMs = capBucketMs(Math.min(durationMs, retentionMs), bucketMs, usesHour);
 
-  const endMs = Math.floor(now.getTime() / bucketMs) * bucketMs + bucketMs;
+  const nowMs = now.getTime();
+  const endMs = Math.floor(nowMs / bucketMs) * bucketMs + bucketMs;
   const requestedStartMs = endMs - durationMs;
-  const retentionStartMs = endMs - retentionMs;
+  const retentionStartMs = nowMs - retentionMs;
   const truncated = requestedStartMs < retentionStartMs;
   const startMs = Math.max(requestedStartMs, retentionStartMs);
   const alignedStartMs = Math.floor(startMs / bucketMs) * bucketMs;
   const bucketCount = Math.max(1, Math.round((endMs - alignedStartMs) / bucketMs));
-  const minuteCutoffMs = endMs - minuteRetentionMs;
+  const minuteCutoffMs = nowMs - minuteRetentionMs;
   const hourUntilMs = usesHour ? Math.max(alignedStartMs, minuteCutoffMs) : null;
 
   return {

@@ -9,6 +9,18 @@ interface PullToRefreshProps {
 const THRESHOLD = 80;
 const MAX_PULL = 128;
 
+function nearestVerticalScroller(start: HTMLElement): HTMLElement | null {
+  let node: HTMLElement | null = start;
+  while (node) {
+    const overflowY = getComputedStyle(node).overflowY;
+    if ((overflowY === "auto" || overflowY === "scroll") && node.scrollHeight > node.clientHeight) {
+      return node;
+    }
+    node = node.parentElement;
+  }
+  return (document.scrollingElement as HTMLElement | null) ?? document.documentElement;
+}
+
 export default function PullToRefresh({ onRefresh, children }: PullToRefreshProps) {
   const [refreshing, setRefreshing] = useState(false);
   const touchStartY = useRef(0);
@@ -33,7 +45,26 @@ export default function PullToRefresh({ onRefresh, children }: PullToRefreshProp
   const handleTouchStart = useCallback(
     (e: React.TouchEvent) => {
       const container = containerRef.current;
-      if (!container || container.scrollTop > 0 || refreshing) return;
+      if (!container || refreshing) return;
+      let node: HTMLElement | null =
+        e.target instanceof HTMLElement
+          ? e.target
+          : e.target instanceof Node
+            ? e.target.parentElement
+            : null;
+      while (node && node !== container) {
+        const overflowY = getComputedStyle(node).overflowY;
+        if (
+          (overflowY === "auto" || overflowY === "scroll") &&
+          node.scrollHeight > node.clientHeight &&
+          node.scrollTop > 0
+        ) {
+          return;
+        }
+        node = node.parentElement;
+      }
+      const scroller = nearestVerticalScroller(container);
+      if (scroller && scroller.scrollTop > 0) return;
       touchStartY.current = e.touches[0].clientY;
       pulling.current = true;
       if (indicatorRef.current) {
@@ -91,7 +122,7 @@ export default function PullToRefresh({ onRefresh, children }: PullToRefreshProp
   return (
     <div
       ref={containerRef}
-      className="relative h-full min-w-0 overflow-y-auto overflow-x-clip"
+      className="relative min-w-0"
       onTouchStart={handleTouchStart}
       onTouchMove={handleTouchMove}
       onTouchEnd={handleTouchEnd}

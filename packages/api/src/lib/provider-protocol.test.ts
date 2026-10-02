@@ -49,7 +49,7 @@ describe("provider protocol mapping", () => {
 describe("provider surface restrictions", () => {
   const chat = { openaiChatCompletions: { operations: ["create"] } };
 
-  it("allows only Chat Completions on OpenRouter (Messages and Responses are not claimed)", () => {
+  it("allows Chat Completions, Responses, and Messages on OpenRouter", () => {
     expect(providerInventorySurfacesAllowed("openrouter", { version: 4, surfaces: chat })).toBe(
       true,
     );
@@ -58,11 +58,45 @@ describe("provider surface restrictions", () => {
         version: 4,
         surfaces: { ...chat, openaiResponses: { operations: ["create"] } },
       }),
-    ).toBe(false);
+    ).toBe(true);
     expect(
       providerInventorySurfacesAllowed("openrouter", {
         version: 4,
         surfaces: { anthropicMessages: { operations: ["create"] } },
+      }),
+    ).toBe(true);
+    expect(
+      providerInventorySurfacesAllowed("openrouter", {
+        version: 4,
+        surfaces: {
+          ...chat,
+          openaiResponses: { operations: ["create"] },
+          anthropicMessages: { operations: ["create"] },
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it("rejects Anthropic Messages on OpenAI accounts", () => {
+    expect(
+      providerInventorySurfacesAllowed("openai", {
+        version: 4,
+        surfaces: { anthropicMessages: { operations: ["create"] } },
+      }),
+    ).toBe(false);
+  });
+
+  it("rejects Anthropic Messages on generic OpenAI-compatible gateways", () => {
+    expect(
+      providerInventorySurfacesAllowed("openai-compatible", {
+        version: 4,
+        surfaces: { anthropicMessages: { operations: ["create"] } },
+      }),
+    ).toBe(false);
+    expect(
+      providerInventorySurfacesAllowed("openai-compatible", {
+        version: 4,
+        surfaces: { ...chat, anthropicMessages: { operations: ["create"] } },
       }),
     ).toBe(false);
   });

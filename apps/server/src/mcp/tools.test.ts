@@ -113,6 +113,7 @@ const db = prisma as unknown as {
   providerCredential: { findMany: MockInstance };
   mcpGrant: { findUnique: MockInstance };
   user: { findUnique: MockInstance };
+  modelPool: { findUnique: MockInstance };
 };
 
 const ENVELOPE = {
@@ -246,7 +247,16 @@ interface WireResult {
   content?: { type: string; text: string }[];
   structuredContent?: {
     result?: unknown;
-    error?: { code?: string; issues?: { code: string }[] };
+    error?: {
+      code?: string;
+      fields?: string[];
+      message?: string;
+      issues?: {
+        code: string;
+        unknownKeyCount?: number;
+        suggestions?: string[];
+      }[];
+    };
     requestId?: string;
   };
   isError?: boolean;
@@ -327,20 +337,24 @@ describe("#117 — real input schemas and named failing fields", () => {
     expect(bytes).toBeLessThanOrEqual(200 * 1024);
   });
 
-  it("an unknown key on a strict procedure is reported as fixed text, never as a path or value", async () => {
-    const PLAIN = "plain-hostile-key-4242";
+  it("an unknown key on a strict procedure is never echoed; suggestions are declared names", async () => {
+    const KEY = "plain-hostile-key-4242";
+    const VALUE = "plain-hostile-value-4242";
     const authInfo = buildAuthInfo(["mcp:write"]);
     bindRequest(authInfo);
     const { body } = await callTool(authInfo, "forwarder_pool_fallback_update", {
       poolId: "pool-1",
       fallbackEnabled: true,
-      [PLAIN]: PLAIN,
+      [KEY]: VALUE,
     });
     expect(body.result?.isError).toBe(true);
     const wire = JSON.stringify(body);
-    expect(wire).not.toContain(PLAIN);
+    expect(wire).not.toContain(VALUE);
+    expect(wire).not.toContain(KEY);
     const issues = body.result?.structuredContent?.error?.issues ?? [];
     expect(issues.map((issue) => issue.code)).toContain("unrecognized_keys");
+    expect(body.result?.structuredContent?.error?.fields ?? []).not.toContain(KEY);
+    expect(issues.some((issue) => (issue.unknownKeyCount ?? 0) > 0)).toBe(true);
   });
 
   it("a missing required field is named by path and code, and the procedure stays the authority", async () => {
@@ -350,7 +364,9 @@ describe("#117 — real input schemas and named failing fields", () => {
     expect(body.result?.isError).toBe(true);
     expect(body.result?.structuredContent).toEqual({
       error: {
-        code: "BAD_REQUEST",
+        code: "invalid_input",
+        fields: ["poolId"],
+        message: "poolId: Invalid input: expected string, received undefined",
         issues: [
           {
             path: ["poolId"],
@@ -372,7 +388,7 @@ describe("#117 — real input schemas and named failing fields", () => {
       ["forwarder_pool_fallback_get", { poolId: SECRET.repeat(20) }],
       ["forwarder_pool_fallback_get", { poolId: { nested: PLAIN } }],
       ["forwarder_pool_fallback_get", { poolId: [PLAIN] }],
-      ["forwarder_pool_fallback_get", { poolId: 42, [PLAIN]: PLAIN }],
+      ["forwarder_pool_fallback_get", { poolId: 42, extraKey: PLAIN }],
       ["model_api_tokens_preview", { scopeMode: PLAIN }],
       ["model_api_tokens_preview", { scopeMode: "ALLOWLIST", modelIds: [PLAIN, 7, SECRET] }],
     ];
@@ -384,7 +400,7 @@ describe("#117 — real input schemas and named failing fields", () => {
       const wire = JSON.stringify(body);
       expect(wire).not.toContain(PLAIN);
       expect(wire).not.toContain("ZZSECRETVALUEZZ");
-      expect(body.result?.structuredContent?.error?.code).toBe("BAD_REQUEST");
+      expect(body.result?.structuredContent?.error?.code).toBe("invalid_input");
     }
   });
 
@@ -401,6 +417,132 @@ describe("#117 — real input schemas and named failing fields", () => {
     });
     expect(resultText(body.result ?? {})).toBe("Invalid input");
     expect(JSON.stringify(body)).not.toContain("SECRET");
+  });
+
+  it("a schema-valid BAD_REQUEST names the declared field and keeps the static message", async () => {
+    const { ORPCError } = await import("@orpc/server");
+    db.modelPool.findUnique.mockRejectedValueOnce(
+      new ORPCError("BAD_REQUEST", {
+        message: "Effective concurrency limit exceeds physical capacity.",
+        data: {
+          fields: ["capacityConcurrencyLimit", "hardConcurrencyLimit", "notAField", "pool id"],
+        },
+      }),
+    );
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_model_pool_update", {
+      id: "pool-1",
+      capacityConcurrencyLimit: 8,
+    });
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.structuredContent).toEqual({
+      error: {
+        code: "invalid_input",
+        fields: ["capacityConcurrencyLimit"],
+        message: "Effective concurrency limit exceeds physical capacity.",
+      },
+    });
+    expect(resultText(body.result ?? {})).toBe(
+      "Invalid input: capacityConcurrencyLimit: Effective concurrency limit exceeds physical capacity.",
+    );
+  });
+
+  it("forwards a guarded-pool-create reason next to data.fields", async () => {
+    const { ORPCError } = await import("@orpc/server");
+    db.modelPool.findUnique.mockRejectedValueOnce(
+      new ORPCError("BAD_REQUEST", {
+        message: "Effective concurrency limit exceeds physical capacity.",
+        data: {
+          fields: ["capacityConcurrencyLimit"],
+          reason: "CONCURRENCY_EXCEEDS_PHYSICAL",
+        },
+      }),
+    );
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_model_pool_update", {
+      id: "pool-1",
+      capacityConcurrencyLimit: 8,
+    });
+    expect(body.result?.structuredContent).toEqual({
+      error: {
+        code: "invalid_input",
+        fields: ["capacityConcurrencyLimit"],
+        message: "Effective concurrency limit exceeds physical capacity.",
+        reason: "CONCURRENCY_EXCEEDS_PHYSICAL",
+      },
+    });
+  });
+
+  it("drops an unknown reason on the data.fields path", async () => {
+    const { ORPCError } = await import("@orpc/server");
+    db.modelPool.findUnique.mockRejectedValueOnce(
+      new ORPCError("BAD_REQUEST", {
+        message: "Effective concurrency limit exceeds physical capacity.",
+        data: {
+          fields: ["capacityConcurrencyLimit"],
+          reason: "SECRET_REASON",
+        },
+      }),
+    );
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_model_pool_update", {
+      id: "pool-1",
+      capacityConcurrencyLimit: 8,
+    });
+    expect(body.result?.structuredContent).toEqual({
+      error: {
+        code: "invalid_input",
+        fields: ["capacityConcurrencyLimit"],
+        message: "Effective concurrency limit exceeds physical capacity.",
+      },
+    });
+    expect(JSON.stringify(body)).not.toContain("SECRET_REASON");
+  });
+
+  it("forwards guarded-create advanced.contextMargin through declared fields", async () => {
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_guarded_pool_create", {
+      slug: "guarded-margin",
+      name: "Guarded margin",
+      localModelIds: ["local-id"],
+      recommendedSurface: "OPENAI_RESPONSES",
+      memberConcurrencyLimit: 1,
+      memberContextCeiling: 100,
+      reservedSlots: 0,
+      localWaitBudgetMs: 30_000,
+      providerModels: [],
+      advanced: {
+        physicalCountStrategy: "CONSERVATIVE_ESTIMATE",
+        contextMargin: 100,
+        borrowPolicy: "WHEN_IDLE",
+        protocolAdaptationEnabled: false,
+        allowLossyDeveloperRoleCollapse: false,
+        affinity: {
+          enabled: false,
+          ttlSeconds: 3_600,
+          maxRecords: 10_000,
+          prefixWeight: 100,
+          conversationWeight: 150,
+          confirmedCacheWeight: 250,
+          loadPenaltyWeight: 100,
+        },
+        memberOverrides: [],
+      },
+    });
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.structuredContent).toEqual({
+      error: {
+        code: "invalid_input",
+        fields: ["advanced.contextMargin", "memberContextCeiling"],
+        message: "Pool context margin must be smaller than the context ceiling.",
+        reason: "POOL_POLICY_INVALID",
+      },
+    });
+    expect(JSON.stringify(body.result?.structuredContent)).not.toContain("capacityContextMargin");
   });
 });
 
@@ -1034,15 +1176,24 @@ describe("CLI presence through the MCP projection", () => {
     const authInfo = buildAuthInfo(["mcp:read"]);
     bindRequest(authInfo);
     const { body } = await callTool(authInfo, "forwarder_cli_devices_list", {});
-    const rows = body.result?.structuredContent?.result as {
-      status: string;
-      endpoints: { status: string; reportedStatus: string }[];
-    }[];
-    expect(rows.map((row) => [row.status, row.endpoints[0]?.status])).toEqual([
+    const page = body.result?.structuredContent?.result as {
+      items: {
+        status: string;
+        endpoints: { status: string; reportedStatus: string; slug: string }[];
+      }[];
+      nextCursor: string | null;
+    };
+    expect(page.items.map((row) => [row.status, row.endpoints[0]?.status])).toEqual([
       ["CONNECTED", "ONLINE"],
       ["DISCONNECTED", "OFFLINE"],
     ]);
-    expect(rows[1]?.endpoints[0]?.reportedStatus).toBe("ONLINE");
+    expect(page.items[1]?.endpoints[0]?.reportedStatus).toBe("ONLINE");
+    expect(page.items[0]?.endpoints[0]?.slug).toBe("ep");
+    expect(page.nextCursor).toBeNull();
+    const serialized = JSON.stringify(page);
+    expect(serialized).not.toContain("models");
+    expect(serialized).not.toContain("defaultCapabilities");
+    expect(serialized).not.toContain("capabilityMetadata");
   });
 });
 

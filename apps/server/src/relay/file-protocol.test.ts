@@ -20,7 +20,7 @@ import {
   type RelayServerControlMessage,
 } from "./protocol.js";
 
-const FIXTURE_DIR = new URL("../../../cli/tests/fixtures/relay-2.8/", import.meta.url);
+const FIXTURE_DIR = new URL("../../../cli/tests/fixtures/relay-2.4/", import.meta.url);
 
 function vector(name: string): Record<string, unknown> {
   return JSON.parse(readFileSync(new URL(`${name}.json`, FIXTURE_DIR), "utf8")) as Record<

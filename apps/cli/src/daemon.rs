@@ -94,10 +94,10 @@ use crate::probe::{ProbeReport, apply_probe_report, probe_endpoint};
 use crate::protocol::parse_binary_frame;
 use crate::protocol::{
     CliInventory, ClientControlMessage, EndpointInventory, EndpointStatus, FrameFault,
-    RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS, RELAY_REQUEST_BODY_WINDOW_CHUNKS, RELAY_SUBPROTOCOL,
-    RelayBinaryFrameMetadata, RelayFailure, ServerControlMessage, binary_frame_fault,
-    control_frame_fault, encode_binary_frame, encode_control, endpoint_inventory,
-    hello_rejection_message, parse_server_control,
+    ProtocolErrorCode, RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS, RELAY_PROTOCOL_VERSION,
+    RELAY_REQUEST_BODY_WINDOW_CHUNKS, RELAY_SUBPROTOCOL, RelayBinaryFrameMetadata, RelayFailure,
+    ServerControlMessage, binary_frame_fault, control_frame_fault, encode_binary_frame,
+    encode_control, hello_rejection_message, parse_server_control,
 };
 use crate::relay_bus::{FromWorker, WsFrame};
 use crate::sessions::{
@@ -113,6 +113,8 @@ const RELAY_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(300);
 /// output and send heartbeats. Bounds worker-frame latency (response streaming)
 /// without busy-spinning.
 const RELAY_SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// Bound on waiting for `hello.challenge`. An old server never sends it.
+const HELLO_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bounded capacity for the worker -> main-loop outbound frame channel. Provides
 /// backpressure toward workers (and therefore upstream response reads) so a fast
 /// upstream cannot grow unbounded memory ahead of the websocket writer.
@@ -447,6 +449,8 @@ pub fn connect_foreground() -> Result<()> {
     config.validate()?;
     let mut control = ControlServer::bind()?;
     let startup = TerminalStartup::capture(&config)?;
+    #[cfg(unix)]
+    crate::file_ops::report_abandoned_recovery();
     let mut last_inventory_revision = None;
     // The mtime accompanies the last server-acknowledged local snapshot. It
     // prevents an edit-and-revert from being treated as an unchanged desired
@@ -574,6 +578,14 @@ fn config_file_modified_at() -> Result<SystemTime> {
 }
 
 fn inventory_snapshot_from_config(config: &Config) -> Vec<EndpointInventory> {
+    let remote = crate::engine_adapter::load_remote_adapters().unwrap_or_default();
+    inventory_snapshot_from_config_with_remote(config, &remote)
+}
+
+fn inventory_snapshot_from_config_with_remote(
+    config: &Config,
+    remote: &[crate::protocol::RemoteEngineAdapter],
+) -> Vec<EndpointInventory> {
     config
         .endpoints
         .iter()
@@ -584,7 +596,13 @@ fn inventory_snapshot_from_config(config: &Config) -> Vec<EndpointInventory> {
                 Some(crate::config::ProbeStatus::Offline) => EndpointStatus::Offline,
                 None => EndpointStatus::Unknown,
             };
-            endpoint_inventory(endpoint, status)
+            let adapter = crate::engine_adapter::effective_engine_adapter(
+                endpoint,
+                remote,
+                config.allow_remote_engine_adapters,
+                &config.approved_remote_adapters,
+            );
+            crate::protocol::endpoint_inventory_with(endpoint, status, adapter.as_ref())
         })
         .collect()
 }
@@ -655,6 +673,7 @@ fn same_desired_config(left: &Config, right: &Config) -> bool {
 /// acknowledged identity, and nothing is written to the config file.
 fn config_with_fresh_engine_facts(active: &Config) -> (Config, Vec<EndpointInventory>) {
     let mut refreshed = active.clone();
+    let remote = crate::engine_adapter::load_remote_adapters().unwrap_or_default();
     let targets = refreshed
         .endpoints
         .iter()
@@ -662,7 +681,13 @@ fn config_with_fresh_engine_facts(active: &Config) -> (Config, Vec<EndpointInven
         .filter(|(_, endpoint)| {
             endpoint.enabled
                 && (endpoint.engine != crate::config::EndpointEngine::Generic
-                    || endpoint.engine_adapter.is_some())
+                    || crate::engine_adapter::effective_engine_adapter(
+                        endpoint,
+                        &remote,
+                        active.allow_remote_engine_adapters,
+                        &active.approved_remote_adapters,
+                    )
+                    .is_some())
                 && endpoint
                     .last_probe
                     .as_ref()
@@ -704,14 +729,22 @@ fn config_with_fresh_engine_facts(active: &Config) -> (Config, Vec<EndpointInven
                 .filter_map(|(index, handle)| handle.join().ok().map(|engine| (index, engine)))
                 .collect::<Vec<_>>()
         });
-        for (index, engine) in detected {
+        for (index, mut engine) in detected {
             // A failed re-detection keeps the facts the last probe found.
             if re_detection_replaces_stored(&engine)
                 && let Some(probe) = refreshed.endpoints[index].last_probe.as_mut()
             {
+                preserve_count_context(probe.engine.as_ref(), &mut engine);
                 probe.engine = Some(engine);
             }
-            if let Some(facts) = crate::engine_adapter::probe_facts(&refreshed.endpoints[index])
+            let spec = crate::engine_adapter::effective_engine_adapter(
+                &refreshed.endpoints[index],
+                &remote,
+                active.allow_remote_engine_adapters,
+                &active.approved_remote_adapters,
+            );
+            if let Some(facts) =
+                crate::engine_adapter::probe_facts_with(&refreshed.endpoints[index], spec.as_ref())
                 && let Some(probe) = refreshed.endpoints[index].last_probe.as_mut()
             {
                 probe.adapter = Some(facts);
@@ -734,6 +767,17 @@ fn config_with_fresh_engine_facts(active: &Config) -> (Config, Vec<EndpointInven
 /// successful detection (this fast path, a reload or a full probe).
 fn re_detection_replaces_stored(engine: &crate::engine::DetectedEngine) -> bool {
     engine.kind.is_some()
+}
+
+/// Keep the probed count-context fact across reconnect when the engine kind
+/// did not change. Detection never sets `count_context`.
+fn preserve_count_context(
+    previous: Option<&crate::engine::DetectedEngine>,
+    next: &mut crate::engine::DetectedEngine,
+) {
+    if previous.and_then(|engine| engine.kind) == next.kind {
+        next.count_context = previous.and_then(|engine| engine.count_context);
+    }
 }
 
 /// Probe a stable desired snapshot without holding the config lock across
@@ -871,12 +915,23 @@ fn run_relay_session(
         )
     };
 
+    let identity = startup.identity().ok_or_else(|| {
+        RelaySessionError::Fatal(anyhow::anyhow!(
+            "CLI identity key is unavailable; cannot bind this device"
+        ))
+    })?;
+    let (nonce, origin) = wait_for_hello_challenge(&mut socket)?;
+    let identity_signature = identity
+        .sign_hello(&nonce, cli_slug, &origin)
+        .map_err(RelaySessionError::Fatal)?;
     let hello = ClientControlMessage::Hello {
         id: next_id("hello"),
         protocol_version: crate::protocol::RELAY_PROTOCOL_VERSION.to_string(),
         cli: CliInventory {
             slug: cli_slug.to_string(),
             hostname: crate::hostname::reported_hostname(),
+            identity_public_key: identity.public_b64url(),
+            identity_signature,
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
             capabilities: startup::hello_capabilities(startup, config, cli_slug),
         },
@@ -1018,7 +1073,7 @@ fn run_relay_session(
             next_telemetry_sync = Instant::now() + TELEMETRY_SYNC_INTERVAL;
         }
 
-        if Instant::now() >= next_heartbeat {
+        if registered && Instant::now() >= next_heartbeat {
             let heartbeat = ClientControlMessage::Heartbeat {
                 id: next_id("heartbeat"),
                 sent_at: None,
@@ -1280,19 +1335,7 @@ where
                 let Some(pending) = pending_preparation.take() else {
                     continue;
                 };
-                let endpoints = candidate
-                    .endpoints
-                    .iter()
-                    .filter(|endpoint| endpoint.enabled)
-                    .map(|endpoint| {
-                        let status = match endpoint.last_probe.as_ref().map(|probe| &probe.status) {
-                            Some(crate::config::ProbeStatus::Online) => EndpointStatus::Online,
-                            Some(crate::config::ProbeStatus::Offline) => EndpointStatus::Offline,
-                            None => EndpointStatus::Unknown,
-                        };
-                        endpoint_inventory(endpoint, status)
-                    })
-                    .collect();
+                let endpoints = inventory_snapshot_from_config(&candidate);
                 let id = next_id("inventory");
                 if let Err(error) = send_control(
                     socket,
@@ -1383,20 +1426,7 @@ fn restore_previous_routing_after_timeout(config: &mut Config, previous: &Config
 
 #[cfg(unix)]
 fn inventory_digest_for_config(config: &Config) -> String {
-    let inventory = config
-        .endpoints
-        .iter()
-        .filter(|endpoint| endpoint.enabled)
-        .map(|endpoint| {
-            let status = match endpoint.last_probe.as_ref().map(|probe| &probe.status) {
-                Some(crate::config::ProbeStatus::Online) => EndpointStatus::Online,
-                Some(crate::config::ProbeStatus::Offline) => EndpointStatus::Offline,
-                None => EndpointStatus::Unknown,
-            };
-            endpoint_inventory(endpoint, status)
-        })
-        .collect::<Vec<_>>();
-    crate::protocol::inventory_digest(&inventory)
+    crate::protocol::inventory_digest(&inventory_snapshot_from_config(config))
 }
 
 #[cfg(unix)]
@@ -1766,14 +1796,24 @@ where
                 tracing::warn!(id, "late inventory rejection resolved uncertain publish");
             }
         }
-        ServerControlMessage::ProtocolError { message, .. } => {
-            // Before `hello.ok`, a pre-2.6 server rejects the hello itself.
+        ServerControlMessage::ProtocolError { message, code, .. } => {
+            if matches!(code, Some(ProtocolErrorCode::Internal)) {
+                return Err(RelaySessionError::Reconnectable {
+                    error: anyhow::anyhow!("relay protocol error: {message}"),
+                    reset_backoff: false,
+                });
+            }
             let text = if *registered {
                 format!("relay protocol error: {message}")
             } else {
-                hello_rejection_message(&message)
+                hello_rejection_message(&message, code.as_ref())
             };
             return Err(RelaySessionError::Fatal(anyhow::anyhow!(text)));
+        }
+        ServerControlMessage::HelloChallenge { .. } => {
+            return Err(RelaySessionError::Fatal(anyhow::anyhow!(
+                "server sent hello.challenge after hello"
+            )));
         }
         ServerControlMessage::RelayCancel { request_id, reason } => {
             tracing::warn!(request_id, ?reason, "relay request cancelled");
@@ -1800,6 +1840,8 @@ where
             timeout_ms,
             endpoint_slug,
             expect_body,
+            count_first,
+            count_ceiling,
             ..
         } => {
             start_relay_request(
@@ -1815,6 +1857,8 @@ where
                 timeout_ms,
                 endpoint_slug,
                 expect_body,
+                count_first,
+                count_ceiling,
             )?;
         }
         ServerControlMessage::Unknown { type_name } => {
@@ -2021,6 +2065,8 @@ fn start_relay_request<S>(
     timeout_ms: u64,
     endpoint_slug: String,
     expect_body: bool,
+    count_first: bool,
+    count_ceiling: Option<u64>,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
@@ -2080,6 +2126,40 @@ where
             &config.media_trusted_origins,
         ),
     };
+
+    if count_first && expect_body {
+        let (method, adapter_count_route) = endpoint_count_plan(config, endpoint);
+        let (cancellation, cancellation_rx) = CancellationHandle::new();
+        let thread_tx = worker_tx.clone();
+        let thread_cancellation = cancellation.clone();
+        let (body_tx, body_rx) = mpsc::sync_channel::<BodyChunk>(REQUEST_BODY_INGRESS_CAPACITY);
+        let endpoint = endpoint.clone();
+        let plan = CountFirstPlan {
+            method,
+            adapter_count_route,
+            count_ceiling,
+        };
+        let handle = thread::spawn(move || {
+            run_count_first_worker(
+                spec,
+                endpoint,
+                plan,
+                body_rx,
+                thread_tx,
+                thread_cancellation,
+                cancellation_rx,
+            );
+        });
+        workers.insert(
+            request_id,
+            WorkerHandle {
+                body_tx: Some(body_tx),
+                cancellation,
+                join: handle,
+            },
+        );
+        return Ok(());
+    }
 
     let (cancellation, cancellation_rx) = CancellationHandle::new();
     let thread_tx = worker_tx.clone();
@@ -2350,6 +2430,160 @@ where
             Ok(())
         }
     }
+}
+
+const COUNT_FIRST_TIMEOUT_MS: u64 = 5_000;
+
+fn count_first_exceeds_ceiling(tokens: u64, ceiling: Option<u64>) -> bool {
+    ceiling.is_some_and(|max| tokens > max)
+}
+
+struct CountFirstPlan {
+    method: Option<crate::count_context::CountContextMethod>,
+    adapter_count_route: Option<String>,
+    count_ceiling: Option<u64>,
+}
+
+fn endpoint_count_plan(
+    config: &Config,
+    endpoint: &crate::config::EndpointConfig,
+) -> (
+    Option<crate::count_context::CountContextMethod>,
+    Option<String>,
+) {
+    let method = endpoint
+        .last_probe
+        .as_ref()
+        .and_then(|probe| probe.engine.as_ref())
+        .and_then(|engine| engine.count_context)
+        .and_then(crate::count_context::CountContextFact::method);
+    let remote = crate::engine_adapter::load_remote_adapters().unwrap_or_default();
+    let adapter_count_route = crate::engine_adapter::effective_engine_adapter(
+        endpoint,
+        &remote,
+        config.allow_remote_engine_adapters,
+        &config.approved_remote_adapters,
+    )
+    .and_then(|spec| spec.count_route);
+    (method, adapter_count_route)
+}
+
+fn run_count_first_worker(
+    spec: UpstreamRequestSpec,
+    endpoint: crate::config::EndpointConfig,
+    plan: CountFirstPlan,
+    body_rx: Receiver<BodyChunk>,
+    tx: SyncSender<FromWorker>,
+    cancellation: CancellationHandle,
+    cancellation_rx: watch::Receiver<bool>,
+) {
+    let request_id = spec.request_id.clone();
+    let proceed = (|| {
+        let bytes = match collect_request_body(
+            &body_rx,
+            &tx,
+            &request_id,
+            crate::count_context::COUNT_CONTEXT_MAX_BODY_BYTES,
+        ) {
+            Ok(bytes) => bytes,
+            Err(CollectError::Aborted) => return None,
+            Err(CollectError::TooLarge) => {
+                let _ = worker_send_control(
+                    &tx,
+                    &ClientControlMessage::RelayError {
+                        request_id: request_id.clone(),
+                        failure: RelayFailure::RequestTooLarge,
+                        message: Some("request body exceeds its size limit".to_string()),
+                        upstream_status_code: None,
+                    },
+                );
+                return None;
+            }
+        };
+        if cancellation.cancelled.load(Ordering::SeqCst) {
+            return None;
+        }
+        let Some(method) = plan.method else {
+            return Some(bytes);
+        };
+        let body = match crate::count_context::parse_count_context_body(&bytes) {
+            Ok(body) => body,
+            Err(error) => {
+                let _ = worker_send_control(
+                    &tx,
+                    &ClientControlMessage::CountContextError {
+                        request_id: request_id.clone(),
+                        failure: error.kind.relay_failure(),
+                        message: Some(error.message),
+                    },
+                );
+                return Some(bytes);
+            }
+        };
+        let model = body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let timeout = Duration::from_millis(COUNT_FIRST_TIMEOUT_MS.min(spec.timeout_ms).max(1));
+        match crate::count_context::count_chat(
+            &endpoint,
+            &model,
+            &body,
+            Some(method),
+            plan.adapter_count_route.as_deref(),
+            timeout,
+        ) {
+            Ok(outcome) => {
+                let _ = worker_send_control(
+                    &tx,
+                    &ClientControlMessage::CountContextResult {
+                        request_id: request_id.clone(),
+                        tokens: outcome.tokens,
+                        method: outcome.method,
+                    },
+                );
+                if count_first_exceeds_ceiling(outcome.tokens, plan.count_ceiling) {
+                    let _ = worker_send_control(
+                        &tx,
+                        &ClientControlMessage::RelayError {
+                            request_id: request_id.clone(),
+                            failure: RelayFailure::RequestTooLarge,
+                            message: Some("prompt exceeds the context ceiling".to_string()),
+                            upstream_status_code: None,
+                        },
+                    );
+                    return None;
+                }
+            }
+            Err(error) => {
+                let _ = worker_send_control(
+                    &tx,
+                    &ClientControlMessage::CountContextError {
+                        request_id: request_id.clone(),
+                        failure: error.kind.relay_failure(),
+                        message: Some(error.message),
+                    },
+                );
+            }
+        }
+        Some(bytes)
+    })();
+    if cancellation.cancelled.load(Ordering::SeqCst) {
+        let _ = tx.send(FromWorker::Finished(request_id));
+        return;
+    }
+    let Some(bytes) = proceed else {
+        let _ = tx.send(FromWorker::Finished(request_id));
+        return;
+    };
+    let (body_tx, body_rx) = mpsc::sync_channel(1);
+    let _ = body_tx.send(BodyChunk {
+        data: bytes,
+        last: true,
+    });
+    drop(body_tx);
+    run_upstream_worker(spec, Some(body_rx), tx, cancellation, cancellation_rx);
 }
 
 /// Run one upstream request on a worker thread: stream the request body (if any)
@@ -2875,7 +3109,9 @@ fn worker_send_control(tx: &SyncSender<FromWorker>, message: &ClientControlMessa
         | ClientControlMessage::RelayResponseHeaders { request_id, .. }
         | ClientControlMessage::RelayComplete { request_id, .. }
         | ClientControlMessage::RelayError { request_id, .. }
-        | ClientControlMessage::RelayCancelled { request_id } => request_id.clone(),
+        | ClientControlMessage::RelayCancelled { request_id }
+        | ClientControlMessage::CountContextResult { request_id, .. }
+        | ClientControlMessage::CountContextError { request_id, .. } => request_id.clone(),
         ClientControlMessage::Hello { .. }
         | ClientControlMessage::InventoryUpdate { .. }
         | ClientControlMessage::Heartbeat { .. }
@@ -3022,6 +3258,87 @@ where
     Ok(())
 }
 
+fn old_server_upgrade_error() -> RelaySessionError {
+    RelaySessionError::Fatal(anyhow::anyhow!(
+        "the server did not complete the relay handshake for protocol {RELAY_PROTOCOL_VERSION}; upgrade the WS Model Proxy server"
+    ))
+}
+
+fn wait_for_hello_challenge<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+) -> RelaySessionResult<(String, String)>
+where
+    S: std::io::Read + std::io::Write,
+{
+    let deadline = Instant::now() + HELLO_CHALLENGE_TIMEOUT;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(old_server_upgrade_error());
+        }
+        if let Some(signal) = crate::shutdown::requested() {
+            return Err(RelaySessionError::Shutdown(signal));
+        }
+        match socket.read() {
+            Ok(Message::Text(text)) => match parse_server_control(&text) {
+                Ok(ServerControlMessage::HelloChallenge { nonce, origin }) => {
+                    let Some(origin) = origin.filter(|value| !value.is_empty()) else {
+                        return Err(old_server_upgrade_error());
+                    };
+                    return Ok((nonce, origin));
+                }
+                Ok(ServerControlMessage::ProtocolError { message, code, .. }) => {
+                    if matches!(code, Some(ProtocolErrorCode::Internal)) {
+                        return Err(RelaySessionError::Reconnectable {
+                            error: anyhow::anyhow!("relay protocol error: {message}"),
+                            reset_backoff: false,
+                        });
+                    }
+                    return Err(RelaySessionError::Fatal(anyhow::anyhow!(
+                        hello_rejection_message(&message, code.as_ref())
+                    )));
+                }
+                Ok(other) => {
+                    let type_name = match other {
+                        ServerControlMessage::Unknown { type_name } => type_name,
+                        _ => "a control frame".to_string(),
+                    };
+                    return Err(RelaySessionError::Fatal(anyhow::anyhow!(
+                        "expected hello.challenge, received {type_name}"
+                    )));
+                }
+                Err(_) => {
+                    return Err(old_server_upgrade_error());
+                }
+            },
+            Ok(Message::Ping(bytes)) => {
+                socket
+                    .send(Message::Pong(bytes))
+                    .map_err(|error| websocket_session_error(error, "sending relay pong", true))?;
+            }
+            Ok(Message::Pong(_) | Message::Frame(_)) => {}
+            Ok(Message::Binary(_)) => {
+                return Err(RelaySessionError::Fatal(anyhow::anyhow!(
+                    "unexpected binary frame before hello"
+                )));
+            }
+            Ok(Message::Close(frame)) => {
+                tracing::warn!(?frame, "relay websocket closed by server before hello");
+                return Err(old_server_upgrade_error());
+            }
+            Err(tungstenite::Error::Io(err))
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(err) => {
+                return Err(websocket_session_error(
+                    err,
+                    "reading hello.challenge",
+                    true,
+                ));
+            }
+        }
+    }
+}
+
 fn send_control<S>(
     socket: &mut tungstenite::WebSocket<S>,
     message: &ClientControlMessage,
@@ -3064,6 +3381,8 @@ fn next_reconnect_delay(current: Duration) -> Duration {
 /// to `prepare_inventory_candidate`, which rechecks the desired snapshot under
 /// the short-lived config lock before it writes anything.
 fn inventory_from_config(config: &mut Config) -> Vec<EndpointInventory> {
+    let allow_remote = config.allow_remote_engine_adapters;
+    let approved = config.approved_remote_adapters.clone();
     let enabled = config
         .endpoints
         .iter()
@@ -3078,9 +3397,12 @@ fn inventory_from_config(config: &mut Config) -> Vec<EndpointInventory> {
                 .cloned()
                 .map(|endpoint| {
                     let probe_endpoint_config = endpoint.clone();
+                    let approved = approved.clone();
                     (
                         endpoint,
-                        scope.spawn(move || probe_endpoint(&probe_endpoint_config)),
+                        scope.spawn(move || {
+                            probe_endpoint(&probe_endpoint_config, allow_remote, &approved)
+                        }),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -3111,19 +3433,7 @@ fn inventory_from_config(config: &mut Config) -> Vec<EndpointInventory> {
             tracing::warn!(error = %error, endpoint = report.endpoint_slug, "failed to apply probe report");
         }
     }
-    config
-        .endpoints
-        .iter()
-        .filter(|endpoint| endpoint.enabled)
-        .map(|endpoint| {
-            let status = match endpoint.last_probe.as_ref().map(|probe| &probe.status) {
-                Some(crate::config::ProbeStatus::Online) => EndpointStatus::Online,
-                Some(crate::config::ProbeStatus::Offline) => EndpointStatus::Offline,
-                None => EndpointStatus::Unknown,
-            };
-            endpoint_inventory(endpoint, status)
-        })
-        .collect()
+    inventory_snapshot_from_config(config)
 }
 
 fn set_socket_read_timeout(
@@ -3209,7 +3519,7 @@ mod tests {
             .endpoints
             .iter()
             .filter(|endpoint| endpoint.enabled)
-            .map(|endpoint| endpoint_inventory(endpoint, EndpointStatus::Online))
+            .map(|endpoint| crate::protocol::endpoint_inventory(endpoint, EndpointStatus::Online))
             .collect::<Vec<_>>();
         let revision = crate::protocol::InventoryRevision {
             inventory_seq: 42,
@@ -3654,6 +3964,8 @@ mod tests {
             1_000,
             "local".to_string(),
             false,
+            false,
+            None,
         );
         assert!(result.is_ok(), "start_relay_request should not error");
 
@@ -3690,6 +4002,8 @@ mod tests {
             1_000,
             "local".to_string(),
             false,
+            false,
+            None,
         );
         assert!(result.is_ok(), "start_relay_request should not error");
 
@@ -3872,6 +4186,39 @@ mod tests {
     }
 
     #[test]
+    fn count_first_exceeds_ceiling_is_exclusive() {
+        assert!(!count_first_exceeds_ceiling(8, None));
+        assert!(!count_first_exceeds_ceiling(8, Some(8)));
+        assert!(count_first_exceeds_ceiling(9, Some(8)));
+    }
+
+    #[test]
+    fn reconnect_keeps_count_context_when_the_kind_matches() {
+        let previous = crate::engine::DetectedEngine {
+            kind: Some(crate::engine::EngineKind::LlamaCpp),
+            count_context: Some(crate::count_context::CountContextFact::LlamaInputTokens),
+            slots: Some(4),
+            ..crate::engine::DetectedEngine::default()
+        };
+        let mut next = crate::engine::DetectedEngine {
+            kind: Some(crate::engine::EngineKind::LlamaCpp),
+            slots: Some(4),
+            ..crate::engine::DetectedEngine::default()
+        };
+        preserve_count_context(Some(&previous), &mut next);
+        assert_eq!(
+            next.count_context,
+            Some(crate::count_context::CountContextFact::LlamaInputTokens)
+        );
+        let mut changed = crate::engine::DetectedEngine {
+            kind: Some(crate::engine::EngineKind::Vllm),
+            ..crate::engine::DetectedEngine::default()
+        };
+        preserve_count_context(Some(&previous), &mut changed);
+        assert_eq!(changed.count_context, None);
+    }
+
+    #[test]
     fn the_reconnect_fast_path_hands_the_session_the_facts_its_hello_advertises() {
         // An acknowledged auto endpoint whose engine was not detectable at the
         // last probe; on reconnect `/props` answers. The hello advertises
@@ -3936,6 +4283,105 @@ mod tests {
         let mut edited = config.clone();
         edited.endpoints[0].label = "other".to_string();
         assert!(!same_desired_config(&edited, &active));
+    }
+
+    #[test]
+    fn approved_remote_adapter_publishes_load_adapter_on_inventory() {
+        use crate::engine_adapter::{
+            AdapterFormat, AdapterInput, AdapterSignal, EngineAdapterConfig, SignalSelector,
+        };
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            AdapterSignal::Running,
+            SignalSelector {
+                series: "running".to_string(),
+                labels: Default::default(),
+                aggregate: None,
+                scale: None,
+            },
+        );
+        map.insert(
+            AdapterSignal::KvOccupancy,
+            SignalSelector {
+                series: "kv".to_string(),
+                labels: Default::default(),
+                aggregate: None,
+                scale: None,
+            },
+        );
+        let spec = EngineAdapterConfig {
+            input: AdapterInput::Route {
+                route: "/stats".to_string(),
+            },
+            format: AdapterFormat::Json,
+            interval_secs: 2,
+            timeout_secs: 2,
+            map: map.clone(),
+            count_route: None,
+        };
+        let hash = crate::engine_adapter::spec_sha256("gpu", &spec);
+        let remote = crate::protocol::RemoteEngineAdapter {
+            endpoint_slug: "gpu".to_string(),
+            input: AdapterInput::Route {
+                route: "/stats".to_string(),
+            },
+            format: AdapterFormat::Json,
+            interval_secs: 2,
+            timeout_secs: 2,
+            map,
+            count_route: None,
+        };
+        let mut config = Config {
+            allow_remote_engine_adapters: true,
+            ..Config::default()
+        };
+        config
+            .approved_remote_adapters
+            .insert("gpu".to_string(), hash);
+        config.endpoints.push(crate::config::EndpointConfig {
+            slug: "gpu".to_string(),
+            enabled: true,
+            engine: crate::config::EndpointEngine::Generic,
+            engine_adapter: None,
+            last_probe: Some(crate::config::ProbeSnapshot {
+                status: crate::config::ProbeStatus::Online,
+                models: Vec::new(),
+                suggested_capabilities: crate::config::OpenAiCompatibleCapabilities::default(),
+                engine: None,
+                adapter: None,
+            }),
+            ..crate::config::EndpointConfig::default()
+        });
+
+        let mut unapproved = config.clone();
+        unapproved.approved_remote_adapters.clear();
+        let pending =
+            inventory_snapshot_from_config_with_remote(&unapproved, std::slice::from_ref(&remote));
+        assert!(
+            pending[0]
+                .engine_facts
+                .as_ref()
+                .and_then(|facts| facts.load_adapter.as_ref())
+                .is_none(),
+            "an unapproved remote adapter stays off the wire"
+        );
+
+        let inventory = inventory_snapshot_from_config_with_remote(&config, &[remote]);
+        let load = inventory[0]
+            .engine_facts
+            .as_ref()
+            .and_then(|facts| facts.load_adapter.as_ref())
+            .expect("approved remote adapter publishes loadAdapter");
+        assert_eq!(load.source, crate::protocol::FactSource::Config);
+        assert!(
+            !load.value.signals.is_empty(),
+            "the remote spec's signal list is published on the wire"
+        );
+        assert!(
+            load.value
+                .signals
+                .contains(&crate::engine_adapter::AdapterSignal::Running)
+        );
     }
 
     #[test]

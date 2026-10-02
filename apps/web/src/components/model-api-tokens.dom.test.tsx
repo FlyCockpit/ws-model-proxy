@@ -33,6 +33,12 @@ vi.mock("@/utils/orpc", () => {
         if (name === "update" && state.failConsent) throw new Error("save failed");
         if (name === "create")
           return { token: { id: "new-token" }, secret: "test-one-time-secret" };
+        if (name === "updateWait")
+          state.tokens = state.tokens.map((token) =>
+            token.id === input.id
+              ? { ...token, externalAfterWaitMs: input.externalAfterWaitMs }
+              : token,
+          );
         if (name === "update")
           state.tokens = state.tokens.map((token) =>
             token.id === input.id
@@ -66,6 +72,7 @@ vi.mock("@/utils/orpc", () => {
         })),
         create: mutation("create"),
         updateExternalAccess: mutation("update"),
+        updateExternalWait: mutation("updateWait"),
         revoke: mutation("revoke"),
       },
       forwarderManagement: {
@@ -494,4 +501,80 @@ it("words the saved-pools hint for tokens that got their pools at creation too",
   state.tokens = [existingToken()];
   mount();
   expect(screen.getByText("dashboard:tokens.externalAccess.savedPoolsHint")).toBeTruthy();
+});
+
+it("creates with an optional wait and omits it when left empty", async () => {
+  mount();
+  openCreate();
+  expect(screen.queryByLabelText("dashboard:tokens.externalWait.label")).toBeNull();
+  submit();
+  await waitFor(() => expect(state.calls).toHaveLength(1));
+  expect(state.calls[0]).toEqual({
+    name: "create",
+    input: { name: "Example", scopeMode: "ALL_VISIBLE", modelIds: [] },
+  });
+});
+
+it("does not validate the hidden wait when allow-external is off", async () => {
+  mount();
+  openCreate();
+  fireEvent.click(
+    screen.getByRole("checkbox", { name: "dashboard:tokens.externalAccess.createAllow" }),
+  );
+  fireEvent.change(screen.getByLabelText("dashboard:tokens.externalWait.label"), {
+    target: { value: "nope" },
+  });
+  fireEvent.click(
+    screen.getByRole("checkbox", { name: "dashboard:tokens.externalAccess.createAllow" }),
+  );
+  expect(screen.queryByLabelText("dashboard:tokens.externalWait.label")).toBeNull();
+  submit();
+  await waitFor(() => expect(state.calls).toHaveLength(1));
+  expect(state.calls[0]).toEqual({
+    name: "create",
+    input: { name: "Example", scopeMode: "ALL_VISIBLE", modelIds: [] },
+  });
+});
+
+it("creates with a stored wait when the field is set", async () => {
+  mount();
+  openCreate();
+  fireEvent.click(
+    screen.getByRole("checkbox", { name: "dashboard:tokens.externalAccess.createAllow" }),
+  );
+  fireEvent.change(screen.getByLabelText("dashboard:tokens.externalWait.label"), {
+    target: { value: "500" },
+  });
+  submit();
+  await waitFor(() => expect(state.calls).toHaveLength(2));
+  expect(state.calls[0]).toEqual({
+    name: "create",
+    input: { name: "Example", scopeMode: "ALL_VISIBLE", modelIds: [], externalAfterWaitMs: 500 },
+  });
+  expect(state.calls[1]).toEqual({
+    name: "update",
+    input: { id: "new-token", allowExternal: true },
+  });
+});
+
+it("saves a per-token wait and clears it back to the pool default", async () => {
+  state.tokens = [{ ...existingToken(), externalAfterWaitMs: null }];
+  mount();
+  const input = screen.getByLabelText("dashboard:tokens.externalWait.label");
+  fireEvent.change(input, { target: { value: "500" } });
+  fireEvent.click(screen.getByRole("button", { name: "dashboard:tokens.externalWait.save" }));
+  await waitFor(() => expect(state.calls).toHaveLength(1));
+  expect(state.calls[0]).toEqual({
+    name: "updateWait",
+    input: { id: "existing", externalAfterWaitMs: 500 },
+  });
+  fireEvent.change(screen.getByLabelText("dashboard:tokens.externalWait.label"), {
+    target: { value: "" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "dashboard:tokens.externalWait.save" }));
+  await waitFor(() => expect(state.calls).toHaveLength(2));
+  expect(state.calls[1]).toEqual({
+    name: "updateWait",
+    input: { id: "existing", externalAfterWaitMs: null },
+  });
 });

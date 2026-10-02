@@ -33,7 +33,7 @@ import {
   externalFallbackMemberWhere,
   poolProviderDisclosure,
 } from "../lib/effective-provider-egress";
-import { DEFAULT_KV_FULL_THRESHOLD } from "../lib/engine-load";
+import { effectiveKvFullThreshold } from "../lib/engine-load";
 import { type EngineLoadMinuteRow, shapeEngineLoadOverview } from "../lib/engine-load-overview";
 import { readyOwnKeyPreferenceWhere } from "../lib/model-api-token-access";
 import {
@@ -77,6 +77,7 @@ const poolSelect = {
       healthStatus: true,
       routingStatus: true,
       executionTargetId: true,
+      kvFullThreshold: true,
       ExecutionTarget: {
         select: {
           id: true,
@@ -245,6 +246,30 @@ export type OverviewMemberRow = {
   stats: OverviewStats;
 };
 
+function localDiscoveredKvMembers<
+  T extends {
+    id: string;
+    ExecutionTarget: {
+      kind: string;
+      inferenceCapacityId: string | null;
+    } | null;
+  },
+>(
+  members: readonly T[],
+): Array<
+  T & { ExecutionTarget: NonNullable<T["ExecutionTarget"]> & { inferenceCapacityId: string } }
+> {
+  return members.filter(
+    (
+      member,
+    ): member is T & {
+      ExecutionTarget: NonNullable<T["ExecutionTarget"]> & { inferenceCapacityId: string };
+    } =>
+      member.ExecutionTarget?.kind === "DISCOVERED_MODEL" &&
+      typeof member.ExecutionTarget.inferenceCapacityId === "string",
+  );
+}
+
 export const overviewRouter = {
   metrics: protectedProcedure.input(metricsInput).handler(async ({ input, context }) => {
     const userId = context.session.user.id;
@@ -276,10 +301,8 @@ export const overviewRouter = {
     const capacityIds = [
       ...new Set(
         pools.flatMap((pool) =>
-          pool.PoolMembers.flatMap((member) =>
-            member.ExecutionTarget?.inferenceCapacityId
-              ? [member.ExecutionTarget.inferenceCapacityId]
-              : [],
+          localDiscoveredKvMembers(pool.PoolMembers).map(
+            (member) => member.ExecutionTarget.inferenceCapacityId,
           ),
         ),
       ),
@@ -287,21 +310,26 @@ export const overviewRouter = {
     const engineLoadRows =
       capacityIds.length === 0
         ? []
-        : ((await prisma.engineLoadRollupMinute.findMany({
-            where: {
-              ownerUserId: userId,
-              capacityId: { in: capacityIds },
-              bucketStart: { gte: window.start, lt: window.end },
-            },
-            select: {
-              bucketStart: true,
-              capacityId: true,
-              maxRunning: true,
-              maxWaiting: true,
-              maxKvUsage: true,
-              maxKvOccupancy: true,
-            },
-          })) ?? []);
+        : await prisma.$queryRaw<EngineLoadMinuteRow[]>`
+            SELECT r."capacityId",
+                   to_timestamp(
+                     ${window.start.getTime() / 1000}
+                     + FLOOR(
+                         (EXTRACT(EPOCH FROM r."bucketStart") * 1000
+                           - ${window.start.getTime()})
+                         / ${window.bucketMs}
+                       ) * ${window.bucketMs} / 1000.0
+                   ) AS "bucketStart",
+                   MAX(r."maxRunning") AS "maxRunning",
+                   MAX(r."maxWaiting") AS "maxWaiting",
+                   MAX(r."maxKvUsage") AS "maxKvUsage",
+                   MAX(r."maxKvOccupancy") AS "maxKvOccupancy"
+              FROM engine_load_rollup_minute r
+             WHERE r."ownerUserId" = ${userId}
+               AND r."capacityId" = ANY(${capacityIds}::text[])
+               AND r."bucketStart" >= ${window.start}
+               AND r."bucketStart" < ${window.end}
+             GROUP BY 1, 2`;
     const [[aggregates, histograms, series], [sharedAggregates, sharedHistograms]] =
       await Promise.all([
         queryRollups({
@@ -398,19 +426,18 @@ export const overviewRouter = {
           seriesKeys,
         ),
         engineLoad: {
-          effectiveKvFullThreshold: DEFAULT_KV_FULL_THRESHOLD,
-          series:
-            window.range === "1h"
-              ? []
-              : shapeEngineLoadOverview({
-                  window,
-                  capacityIds: pool.PoolMembers.flatMap((member) =>
-                    member.ExecutionTarget?.inferenceCapacityId
-                      ? [member.ExecutionTarget.inferenceCapacityId]
-                      : [],
-                  ),
-                  rows: engineLoadRows as EngineLoadMinuteRow[],
-                }),
+          members: localDiscoveredKvMembers(pool.PoolMembers).map((member) => ({
+            poolMemberId: member.id,
+            kvFullThreshold: effectiveKvFullThreshold(member.kvFullThreshold),
+            series:
+              window.range === "1h"
+                ? []
+                : shapeEngineLoadOverview({
+                    window,
+                    capacityIds: [member.ExecutionTarget.inferenceCapacityId],
+                    rows: engineLoadRows,
+                  }),
+          })),
         },
       };
     });

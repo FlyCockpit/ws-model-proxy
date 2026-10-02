@@ -117,6 +117,10 @@ export type PublicOverflowSkipReason =
   | "NO_COMPATIBLE_PROVIDER"
   | "PROVIDER_UNHEALTHY"
   | "BUDGET_EXCEEDED"
+  /** Owner-paid grantee spend cap for this exact grant is exhausted. */
+  | "GRANTEE_BUDGET_EXCEEDED"
+  /** Grant cap cannot be priced (missing price or currency mismatch). Fail closed. */
+  | "GRANTEE_CAP_UNPRICEABLE"
   | "PROTECTION_POLICY_MISSING"
   /**
    * Transient: no provider attempt could be sent right now (fence allocation,
@@ -1803,6 +1807,22 @@ function reportedTokensFromSettledUsage(usage: RawProviderUsage | undefined): nu
   return total > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(total);
 }
 
+function reportedPromptTokensFromSettledUsage(
+  usage: RawProviderUsage | undefined,
+): number | undefined {
+  if (!usage) return undefined;
+  const parts = [usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens];
+  let total = 0n;
+  let known = false;
+  for (const part of parts) {
+    if (part === undefined) continue;
+    known = true;
+    total += part;
+  }
+  if (!known) return undefined;
+  return total > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(total);
+}
+
 /**
  * Derives engine cache-affinity evidence directly from retained response-body
  * chunks (SSE or JSON) using the shared provider usage normalizer. Never
@@ -1818,9 +1838,16 @@ export function engineCacheConfirmedFromResponseChunks(
   }
 }
 
+const RESPONSES_TERMINAL_EVENTS = new Set([
+  "response.completed",
+  "response.incomplete",
+  "response.failed",
+]);
+
 function classifyTerminalRecord(
   record: SseRecord,
   surface: ProtocolSurface,
+  dialect: ProviderUsageDialect = "generic",
 ): "SUCCESS" | "FAILED" | undefined {
   if (surface === "openai-chat") {
     if (record.data === "[DONE]") return "SUCCESS";
@@ -1834,11 +1861,20 @@ function classifyTerminalRecord(
   try {
     const value = JSON.parse(record.data) as Record<string, unknown>;
     const dataType = typeof value.type === "string" ? value.type : undefined;
-    // A terminal needs an explicit `event:` line that agrees with the record's
-    // `type`. OpenRouter's native Responses stream sends no `event:` lines, so
-    // its terminal is deliberately NOT recognised (the surface is unclaimed
-    // and the full hold stays). Reading to EOF for accounting does not itself
-    // certify protocol completion.
+    const responseUsage = usageRecord(usageRecord(value.response)?.usage);
+    // OpenRouter Responses is data-only SSE: a JSON `type` of
+    // response.completed / .failed / .incomplete with a `response.usage`
+    // object is the terminal. Other dialects still need an `event:` line that
+    // agrees with `type`.
+    if (
+      dialect === "openrouter" &&
+      surface === "openai-responses" &&
+      !record.event &&
+      dataType !== undefined &&
+      RESPONSES_TERMINAL_EVENTS.has(dataType) &&
+      responseUsage !== undefined
+    )
+      return dataType === "response.completed" ? "SUCCESS" : "FAILED";
     if (!record.event || record.event !== dataType) return undefined;
     if (record.event === "error") return "FAILED";
     if (surface === "anthropic-messages")
@@ -1922,12 +1958,6 @@ type OpenRouterRecordUsage =
   | { kind: "final"; usage: unknown }
   | { kind: "superseded"; usage: unknown }
   | { kind: "ambiguous" };
-
-const RESPONSES_TERMINAL_EVENTS = new Set([
-  "response.completed",
-  "response.incomplete",
-  "response.failed",
-]);
 
 function openRouterRecordUsage(
   surface: ProtocolSurface,
@@ -2927,10 +2957,14 @@ export async function dispatchPublicOverflow(
       continue;
     }
     const byteEstimate = conservativeSerializedInputTokens(upstream.body.byteLength);
+    const payloadTokens = payloadAwareInputTokens(upstream.body);
+    const estimatedTokens = request.estimatedInputTokens;
     const renderedInputTokens =
-      payloadAwareInputTokens(upstream.body) ?? request.estimatedInputTokens ?? byteEstimate;
+      (payloadTokens != null && payloadTokens > 0n ? payloadTokens : null) ??
+      (estimatedTokens != null && estimatedTokens > 0n ? estimatedTokens : null) ??
+      byteEstimate;
     const renderedLiability = liabilityFromPricing({
-      estimatedInputTokens: byteEstimate,
+      estimatedInputTokens: renderedInputTokens * 2n,
       requestedOutputTokens,
       pricing,
     });
@@ -2967,6 +3001,14 @@ export async function dispatchPublicOverflow(
         providerModelId: target.providerModelId,
         credentialId: target.credential.id,
         poolId: request.ownKeyProviderModelId ? undefined : request.poolId,
+        poolGrantId:
+          request.ownKeyProviderModelId || request.externalConsent.requesterIsOwner
+            ? undefined
+            : (request.externalConsent.accessGrantId ?? undefined),
+        granteeUserId:
+          request.ownKeyProviderModelId || request.externalConsent.requesterIsOwner
+            ? undefined
+            : request.externalConsent.requesterUserId,
         requestId: request.requestId,
         attemptId,
         fencingToken,
@@ -3687,6 +3729,7 @@ export async function dispatchPublicOverflow(
                     const outcome = classifyTerminalRecord(
                       record,
                       nativeSurface ?? request.requestedSurface,
+                      target.usageDialect ?? "generic",
                     );
                     protocolTerminal ||= outcome !== undefined;
                     protocolFailed ||= outcome === "FAILED";
@@ -3740,6 +3783,7 @@ export async function dispatchPublicOverflow(
                   const outcome = classifyTerminalRecord(
                     record,
                     nativeSurface ?? request.requestedSurface,
+                    target.usageDialect ?? "generic",
                   );
                   // Include bytes following the first terminal in its own chunk.
                   // Absolute decoder offsets exclude earlier streamed content.
@@ -3862,6 +3906,7 @@ export async function dispatchPublicOverflow(
                             : request.estimatedInputTokens,
                         ),
                   reportedTokens: reportedTokensFromSettledUsage(settledUsage),
+                  reportedPromptTokens: reportedPromptTokensFromSettledUsage(settledUsage),
                 });
             } catch {
               // Affinity is a best-effort routing hint and cannot change a terminal result.
@@ -3963,7 +4008,11 @@ export async function dispatchPublicOverflow(
       lastAdmission && !lastAdmission.admitted
         ? lastAdmission.reason === "PROTECTION_POLICY_MISSING"
           ? "PROTECTION_POLICY_MISSING"
-          : "BUDGET_EXCEEDED"
+          : lastAdmission.reason === "GRANTEE_BUDGET_EXCEEDED"
+            ? "GRANTEE_BUDGET_EXCEEDED"
+            : lastAdmission.reason === "GRANTEE_CAP_UNPRICEABLE"
+              ? "GRANTEE_CAP_UNPRICEABLE"
+              : "BUDGET_EXCEEDED"
         : (lastSendFailure ?? "PROVIDER_UNAVAILABLE"),
   };
 }
@@ -4004,8 +4053,8 @@ export function conservativeSerializedInputTokens(serializedBytes: number): bigi
   return (bytes * 11n + 9n) / 10n + 64n;
 }
 
-/** Context-fit estimate for a rendered JSON body. Byte-per-token stays on the
- * budget hold, which is settled from real usage. */
+/** Context-fit estimate for a rendered JSON body. The :external hold uses
+ * this figure × 2 plus requested output; settlement true-ups from real usage. */
 export function payloadAwareInputTokens(serializedBody: Uint8Array): bigint | undefined {
   try {
     const parsed: unknown = JSON.parse(

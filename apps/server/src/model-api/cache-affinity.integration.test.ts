@@ -4,6 +4,8 @@ import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
+type PrismaSql = typeof import("@ws-model-proxy/db").Prisma;
+
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
   throw new Error(
@@ -17,12 +19,14 @@ if (!databaseUrl)
 integration("cache affinity PostgreSQL concurrency and retention", () => {
   const db = databaseUrl ? createFixturePrismaClient(databaseUrl) : undefined;
   let service: typeof import("./cache-affinity.js");
+  let Prisma: PrismaSql;
 
   beforeAll(async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
     process.env.BETTER_AUTH_SECRET ??= "cache-affinity-integration-secret-32-bytes";
     process.env.BETTER_AUTH_URL ??= "http://localhost:3000";
+    ({ Prisma } = await import("@ws-model-proxy/db"));
     service = await import("./cache-affinity.js");
   });
 
@@ -464,5 +468,26 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     await Promise.all([lock, remembering]);
     expect(settled).toBe(true);
     await blocker.$disconnect();
+  });
+
+  // EXPLAIN/buffer bound needs SCHEMA_VALIDATION_DATABASE_URL. The partial
+  // index `cache_affinity_record_residency` is installed by schema-hardening.
+  it("bounds residency SQL with a per-target LATERAL limit", async () => {
+    if (!db) return;
+    const row = await fixture();
+    const sql = service.affinityResidencySql(row.owner.id, [row.target(0).capacityId], new Date());
+    expect(sql.strings.join("")).toContain("JOIN LATERAL");
+    const [explain] = await db.$queryRaw<{ "QUERY PLAN": unknown }[]>(
+      Prisma.sql`EXPLAIN (BUFFERS, FORMAT JSON) ${sql}`,
+    );
+    const planText = JSON.stringify(explain);
+    expect(planText).toContain("Limit");
+    expect(planText).not.toContain("WindowAgg");
+    const indexes = await db.$queryRaw<{ indexname: string }[]>`
+      SELECT indexname FROM pg_indexes
+       WHERE tablename = 'cache_affinity_record'
+         AND indexname = 'cache_affinity_record_residency'`;
+    expect(indexes.length).toBeGreaterThan(0);
+    expect(planText).toContain("cache_affinity_record_residency");
   });
 });

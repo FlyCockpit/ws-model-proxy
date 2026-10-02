@@ -15,8 +15,12 @@
  *     becomes `"?"`, so no caller-chosen text can ride in a path;
  *   - `message`: the zod message ONLY for codes whose message is built from
  *     the schema and the input's TYPE (never its value), capped in length;
- *     `unrecognized_keys` (echoes input key names), `custom` (author-written,
- *     may interpolate the value) and unknown codes get a fixed text;
+ *     `unrecognized_keys` (would echo input key names), `custom`
+ *     (author-written, may interpolate the value) and unknown codes get a
+ *     fixed text;
+ *   - `unknownKeyCount` and `suggestions` for `unrecognized_keys` only.
+ *     Suggestions are nearest names the tool already declares. Caller-chosen
+ *     key text never leaves;
  *   - at most {@link MAX_ISSUES} issues; nothing else from the issue
  *     (`input`, `received`, `values`, `errors`, ...) is read.
  */
@@ -27,7 +31,16 @@ export interface McpValidationIssue {
   path: (string | number)[];
   code: string;
   message: string;
+  /** Count of unrecognized keys. Caller names are never included. */
+  unknownKeyCount?: number;
+  /** Nearest declared property names. Absent when none are close. */
+  suggestions?: string[];
 }
+
+export const MAX_UNKNOWN_KEY_SUGGESTIONS = 5;
+const SUGGESTION_MAX_DISTANCE = 3;
+/** Unrecognized keys considered for suggestions. Extra keys still count. */
+const MAX_UNKNOWN_KEYS_PROBED = 32;
 
 export const MAX_ISSUES = 20;
 export const MAX_PATH_SEGMENTS = 8;
@@ -93,6 +106,60 @@ function sanitizeCode(code: unknown): string {
     : "invalid";
 }
 
+function editDistance(left: string, right: string): number {
+  const m = left.length;
+  const n = right.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  const row = new Array<number>(n + 1);
+  for (let j = 0; j <= n; j += 1) row[j] = j;
+  for (let i = 1; i <= m; i += 1) {
+    let previous = row[0]!;
+    row[0] = i;
+    for (let j = 1; j <= n; j += 1) {
+      const next = row[j]!;
+      const cost = left[i - 1] === right[j - 1] ? 0 : 1;
+      row[j] = Math.min(row[j]! + 1, row[j - 1]! + 1, previous + cost);
+      previous = next;
+    }
+  }
+  return row[n]!;
+}
+
+function unknownKeyCount(keys: unknown): number | undefined {
+  if (!Array.isArray(keys) || keys.length === 0) return undefined;
+  return Math.min(keys.length, MAX_ISSUES);
+}
+
+/**
+ * Nearest advertised property names for unrecognized keys. The caller key is
+ * used only as a distance probe and never copied into the result.
+ */
+function suggestDeclaredNames(keys: unknown, knownKeys: ReadonlySet<string>): string[] | undefined {
+  if (!Array.isArray(keys) || knownKeys.size === 0) return undefined;
+  const ranked = new Map<string, number>();
+  let probed = 0;
+  for (const key of keys) {
+    if (probed >= MAX_UNKNOWN_KEYS_PROBED) break;
+    if (typeof key !== "string" || key.length === 0 || key.length > MAX_SEGMENT_LENGTH) continue;
+    if (!IDENTIFIER_SEGMENT.test(key)) continue;
+    probed += 1;
+    for (const known of knownKeys) {
+      if (known.length > MAX_SEGMENT_LENGTH) continue;
+      if (Math.abs(key.length - known.length) > SUGGESTION_MAX_DISTANCE) continue;
+      const distance = editDistance(key, known);
+      if (distance > SUGGESTION_MAX_DISTANCE) continue;
+      const previous = ranked.get(known);
+      if (previous === undefined || distance < previous) ranked.set(known, distance);
+    }
+  }
+  if (ranked.size === 0) return undefined;
+  return [...ranked.entries()]
+    .sort((left, right) => left[1] - right[1] || left[0].localeCompare(right[0]))
+    .slice(0, MAX_UNKNOWN_KEY_SUGGESTIONS)
+    .map(([name]) => name);
+}
+
 /**
  * The sanitized issues of a BAD_REQUEST `data` payload, or `null` when it
  * carries no usable issue list (the caller then keeps the plain error).
@@ -108,22 +175,122 @@ export function sanitizeValidationIssues(
   for (const issue of issues.slice(0, MAX_ISSUES)) {
     if (issue === null || typeof issue !== "object") continue;
     const code = sanitizeCode(Reflect.get(issue, "code"));
+    const rawKeys = code === "unrecognized_keys" ? Reflect.get(issue, "keys") : undefined;
+    const count = code === "unrecognized_keys" ? unknownKeyCount(rawKeys) : undefined;
+    const suggestions =
+      code === "unrecognized_keys" ? suggestDeclaredNames(rawKeys, knownKeys) : undefined;
     result.push({
       path: sanitizePath(Reflect.get(issue, "path"), knownKeys),
       code,
       message: sanitizeMessage(code, Reflect.get(issue, "message")),
+      ...(count === undefined ? {} : { unknownKeyCount: count }),
+      ...(suggestions === undefined ? {} : { suggestions }),
     });
   }
   // Defense in depth: wsmp_ credential shapes that slipped into a path key.
   return result.length === 0 ? null : (redactSecrets(result) as McpValidationIssue[]);
 }
 
+/**
+ * Argument names an agent can correct: dotted declared paths plus
+ * server-chosen suggestions. `"?"` (a segment that is not a declared field)
+ * drops that path. Order follows the issues.
+ */
+export function fieldsFromValidationIssues(issues: readonly McpValidationIssue[]): string[] {
+  const fields: string[] = [];
+  const add = (name: string): void => {
+    if (name === "?" || name.length === 0 || fields.includes(name)) return;
+    fields.push(name);
+  };
+  for (const issue of issues) {
+    for (const key of issue.suggestions ?? []) add(key);
+    if (issue.path.length === 0 || issue.path.includes("?")) continue;
+    add(issue.path.map((segment) => String(segment)).join("."));
+  }
+  return fields;
+}
+
+const MAX_DECLARED_FIELD_LENGTH = MAX_PATH_SEGMENTS * (MAX_SEGMENT_LENGTH + 1);
+const INDEX_SEGMENT = /^(0|[1-9]\d*)$/;
+
+/**
+ * A dotted path whose every identifier segment is a property the tool
+ * advertises (`advanced.contextMargin`). Numeric segments are nested indexes
+ * (`rules.0.threshold`) and cannot lead the path.
+ */
+function isDeclaredFieldPath(item: string, knownKeys: ReadonlySet<string>): boolean {
+  if (item.length > MAX_DECLARED_FIELD_LENGTH) return false;
+  const segments = item.split(".");
+  if (segments.length === 0 || segments.length > MAX_PATH_SEGMENTS) return false;
+  return segments.every((segment, index) => {
+    if (segment.length === 0 || segment.length > MAX_SEGMENT_LENGTH) return false;
+    if (INDEX_SEGMENT.test(segment)) return index > 0;
+    return IDENTIFIER_SEGMENT.test(segment) && knownKeys.has(segment);
+  });
+}
+
+/**
+ * Procedure-authored `data.fields` (#200). Only names the tool's own
+ * advertised schema declares are returned, so a handler cannot echo an
+ * arbitrary caller string through this channel. Nested keys may be dotted.
+ */
+export function sanitizeDeclaredFields(
+  data: unknown,
+  knownKeys: ReadonlySet<string>,
+): string[] | null {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) return null;
+  if (!Object.hasOwn(data, "fields")) return null;
+  const raw: unknown = Reflect.get(data, "fields");
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const fields: string[] = [];
+  for (const item of raw) {
+    if (fields.length >= MAX_ISSUES) break;
+    if (typeof item !== "string" || item.length === 0) continue;
+    if (!isDeclaredFieldPath(item, knownKeys)) continue;
+    if (!fields.includes(item)) fields.push(item);
+  }
+  return fields.length === 0 ? null : fields;
+}
+
+/**
+ * Static procedure message for an argument-shaped BAD_REQUEST. Control
+ * characters are rejected; length is capped; credential shapes are redacted.
+ * Returns null when there is no usable message.
+ */
+function hasControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    if (value.charCodeAt(index) <= 0x1f) return true;
+  }
+  return false;
+}
+
+export function sanitizeArgumentMessage(message: unknown): string | null {
+  if (typeof message !== "string") return null;
+  const trimmed = message.trim();
+  if (trimmed.length === 0 || hasControlCharacter(trimmed)) return null;
+  const capped =
+    trimmed.length > MAX_MESSAGE_LENGTH ? `${trimmed.slice(0, MAX_MESSAGE_LENGTH)}...` : trimmed;
+  const redacted = redactSecrets(capped);
+  return typeof redacted === "string" ? redacted : null;
+}
+
 /** Human/agent-readable one-liner: `path: message; path: message`. */
 export function formatValidationIssues(issues: readonly McpValidationIssue[]): string {
   return issues
-    .map(
-      (issue) => `${issue.path.length === 0 ? "(input)" : issue.path.join(".")}: ${issue.message}`,
-    )
+    .map((issue) => {
+      const base = issue.path.join(".");
+      const where = base.length > 0 ? base : "(input)";
+      if (issue.code !== "unrecognized_keys") return `${where}: ${issue.message}`;
+      const count =
+        issue.unknownKeyCount != null && issue.unknownKeyCount > 0
+          ? ` (${issue.unknownKeyCount})`
+          : "";
+      const hint =
+        issue.suggestions != null && issue.suggestions.length > 0
+          ? `; try ${issue.suggestions.join(", ")}`
+          : "";
+      return `${where}: ${issue.message}${count}${hint}`;
+    })
     .join("; ");
 }
 

@@ -1363,11 +1363,14 @@ describe("public overflow compatibility", () => {
     expect(estimate).toBeDefined();
     expect(conservativeSerializedInputTokens(body.byteLength)).toBeGreaterThan(128_000n);
     expect(estimate! + 4_096n).toBeLessThanOrEqual(128_000n);
+    const holdInput = estimate! * 2n;
     const liability = conservativeProviderLiability({
-      estimatedInputTokens: conservativeSerializedInputTokens(body.byteLength),
+      estimatedInputTokens: holdInput,
       requestedOutputTokens: 4_096n,
     });
-    expect(liability.tokens).toBeGreaterThanOrEqual(estimate!);
+    expect(liability.tokens).toBe(holdInput + 4_096n);
+    const spendAt3PerMillion = (Number(liability.tokens) * 3) / 1_000_000;
+    expect(spendAt3PerMillion).toBeLessThan(10);
     expect(
       publicTargetCompatibility(
         {

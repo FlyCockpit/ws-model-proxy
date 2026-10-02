@@ -666,7 +666,12 @@ describe("createApp registration contract — device-code exchange limiter (CI-2
         method: "POST",
         headers: { ...HOST, "content-type": "application/json", "x-csrf-token": "orpc" },
         body: JSON.stringify({
-          json: { deviceCode: `wiring-${BASE}-code`, cliSlug: "desk-01" },
+          json: {
+            deviceCode: `wiring-${BASE}-code`,
+            cliSlug: "desk-01",
+            identityPublicKey:
+              "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE",
+          },
         }),
       });
     for (let call = 0; call < DEVICE_CODE_EXCHANGE_CODE_POINTS; call += 1) {
@@ -693,7 +698,14 @@ describe("createApp registration contract — device-code exchange limiter (CI-2
       app.request(`${BASE}/rpc/cliCredentials/exchangeDeviceCode`, {
         method: "POST",
         headers: { ...HOST, "content-type": "application/json", "x-csrf-token": "orpc" },
-        body: JSON.stringify({ json: { deviceCode: "saturation-code", cliSlug: "desk-01" } }),
+        body: JSON.stringify({
+          json: {
+            deviceCode: "saturation-code",
+            cliSlug: "desk-01",
+            identityPublicKey:
+              "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE",
+          },
+        }),
       });
     for (let call = 0; call < DEVICE_CODE_EXCHANGE_CODE_POINTS; call += 1) {
       await realExchange();
@@ -812,7 +824,14 @@ describe("createApp registration contract — device-login approval needs the CS
     const res = await app.request(`${BASE}/rpc/cliCredentials/exchangeDeviceCode`, {
       method: "POST",
       headers: { ...HOST, "content-type": "application/json" },
-      body: JSON.stringify({ json: { deviceCode: "headerless-code", cliSlug: "desk-01" } }),
+      body: JSON.stringify({
+        json: {
+          deviceCode: "headerless-code",
+          cliSlug: "desk-01",
+          identityPublicKey:
+            "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE",
+        },
+      }),
     });
     // The mocked database has no such code: the procedure ran.
     expect(res.status).toBe(404);

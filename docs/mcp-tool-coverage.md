@@ -68,14 +68,18 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.createGuardedModelPool` | `forwarder_guarded_pool_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.createModelPool` | `forwarder_model_pool_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.deleteModelPool` | `forwarder_model_pool_delete` | write | DELETE | destructive | — | — | — |
+| `forwarderManagement.getCliDevice` | `forwarder_cli_device_get` | read | — | pure | — | — | — |
 | `forwarderManagement.getCliDeviceMetrics` | `forwarder_device_metrics_get` | read | — | pure | — | — | — |
 | `forwarderManagement.getEngineLoadHistory` | `forwarder_engine_load_history_get` | read | — | pure | — | — | — |
+| `forwarderManagement.getModelPool` | `forwarder_model_pool_get` | read | — | pure | — | — | — |
 | `forwarderManagement.getPoolRoutingRules` | `forwarder_pool_routing_rules_get` | read | — | pure | — | — | — |
 | `forwarderManagement.getProfileSlug` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
 | `forwarderManagement.grantPoolAccessByEmail` | `forwarder_pool_grant_create` | write | — | pure | — | — | — |
-| `forwarderManagement.listCliDevices` | `forwarder_cli_devices_list` | read | — | pure | — | — | — |
+| `forwarderManagement.listCliDeviceSummaries` | `forwarder_cli_devices_list` | read | — | pure | — | — | — |
+| `forwarderManagement.listCliDevices` | — (excluded) | — | — | — | — | — | Dashboard inventory inlines models and capability JSON. Agents use forwarder_cli_devices_list and forwarder_cli_device_get. |
 | `forwarderManagement.listGuardedOverflowCandidates` | `forwarder_guarded_candidates_list` | read | — | pure | — | — | — |
-| `forwarderManagement.listModelPools` | `forwarder_model_pools_list` | read | — | pure | — | — | — |
+| `forwarderManagement.listModelPoolSummaries` | `forwarder_model_pools_list` | read | — | pure | — | — | — |
+| `forwarderManagement.listModelPools` | — (excluded) | — | — | — | — | — | Dashboard inventory inlines members and models. Agents use forwarder_model_pools_list and forwarder_model_pool_get. |
 | `forwarderManagement.poolCacheStats` | `forwarder_pool_cache_stats_get` | read | — | pure | — | — | — |
 | `forwarderManagement.previewProfileSlugChange` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
 | `forwarderManagement.removeCliDeviceMetadata` | `forwarder_cli_metadata_remove` | write | DELETE | destructive | — | — | — |
@@ -87,7 +91,9 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.revokePoolAccessByEmail` | `forwarder_pool_grant_revoke` | write | DELETE | destructive | — | — | — |
 | `forwarderManagement.setCliDeviceEngineAdapters` | `forwarder_device_engine_adapters_set` | write | RUN | external | — | — | — |
 | `forwarderManagement.setCliDeviceFeatureGrants` | — (excluded) | — | — | — | — | — | Human-only device grants including read-only file consent; requires the CLI read switch and configured roots reports. |
+| `forwarderManagement.setCliDeviceLabels` | — (excluded) | — | — | — | — | — | Human-only node placement labels. Agents read labels on forwarder_cli_devices_list, forwarder_cli_device_get, and forwarder_device_metrics_get. |
 | `forwarderManagement.setCliDeviceMetricSources` | `forwarder_device_metric_sources_set` | write | RUN | external | — | — | — |
+| `forwarderManagement.setCliDeviceUsableBudgets` | — (excluded) | — | — | — | — | — | Human-only usable memory/RAM/VRAM budgets. Agents read the effective budgets on forwarder_cli_device_get and forwarder_device_metrics_get. |
 | `forwarderManagement.setDiscoveredModelCapabilityProfile` | `forwarder_model_capability_profile_set` | write | — | pure | — | — | — |
 | `forwarderManagement.setPoolMemberEngineLoad` | `forwarder_pool_member_engine_load_set` | write | RUN | cost | — | — | — |
 | `forwarderManagement.setPoolRoutingRules` | `forwarder_pool_routing_rules_set` | write | RUN | cost | — | — | — |
@@ -109,6 +115,7 @@ fails the suite when a leaf is unclassified.
 | `modelApiTokens.preview` | `model_api_tokens_preview` | read | — | pure | — | — | — |
 | `modelApiTokens.revoke` | `model_api_token_revoke` | write | DELETE | destructive | — | — | — |
 | `modelApiTokens.updateExternalAccess` | — (excluded) | — | — | — | — | — | Human-only external-provider consent: an agent must never raise its own token's egress permission. |
+| `modelApiTokens.updateExternalWait` | `model_api_token_external_wait_update` | write | — | pure | — | — | — |
 | `overview.health` | `overview_health` | read | — | pure | — | — | — |
 | `overview.metrics` | `overview_metrics` | read | — | pure | — | — | — |
 | `poolFallback.get` | `forwarder_pool_fallback_get` | read | — | pure | — | — | — |
@@ -198,16 +205,18 @@ with started:true when the server received acceptance and started:null otherwise
 and blocked done before acceptance, and undispatched failures remain definitive.
 Finished file answers and their single audit event do not change on late reports.
 Only a supervised start id is delivered despite MCP abort; headless file results keep
-the abort fence. See [CLI file tools](mcp.md#cli-file-tools-relay-protocol-28).
+the abort fence. See [CLI file tools](mcp.md#cli-file-tools-relay-protocol-24).
 
 Overwrite rename preflights before capture and supports exchange-less no-replace
-and link mounts through one recovery-owned vacate-both publisher. Neither primitive
-means `unsafe_filesystem` with no public change. Plain link rename vacates first,
-uses own-name alias proofs and returns a source-bound etag at the published name.
+and link mounts. Stable-inode link publication links the source onto the destination
+before capturing it; no-replace and noino/sshfs vacate first. Neither primitive
+means `unsafe_filesystem` with no public change. Plain link rename uses that same
+order, own-name alias proofs, and a source-bound etag at the published name.
 Directories require no-replace, never overwrite, and own-subtree moves are invalid_input.
 Alias cleanup vetoes the unlink on a believable link count below 2 (statx FORCE_SYNC on Linux, calibrated per operation) and reports a last surviving alias; residual
-(g) also applies to rename. Crash residue includes captured source/destination and
-private preflight dummies, logged before capture, without intent/replay. Rust tests
+(g) also applies to rename. Crash residue includes captured source/destination, an
+INTENT slot map fsynced before the first capture, and private preflight dummies.
+Startup reports `.wsmp-recover-*` and never deletes them; there is no replay. Rust tests
 cover Linux/macOS injected capability, ownership, race, cancellation and reply-loss
 tables; the strict real-mount test checks six declared primitive/inode classes (plus a constant-link-count and a cached-attribute class). CI
 runs it on real FUSE mounts in the `exchangeless-fs` job (`apps/cli/scripts/test-exchangeless-fs.sh`,
@@ -250,6 +259,14 @@ MCP tools can never grant it:
 
 - `modelApiTokens.updateExternalAccess` (a token's `allowExternal` and
   per-pool `includeExternal`) is excluded from the catalog (decision C1);
+- `modelApiTokens.updateExternalWait` (a token's `externalAfterWaitMs`) is
+  an ordinary `mcp:write` tool, `model_api_token_external_wait_update`,
+  with no confirmation. Null uses each pool's wait. Pool `externalAfterWaitMs`
+  is an owner floor: callers may only lengthen, up to the local capacity wait
+  budget. A request header cannot go below the pool floor or past that budget.
+  Grantees cannot shorten below the pool floor. Every change writes a
+  `TOKEN_EXTERNAL_WAIT_UPDATED` provider audit event. MCP diagnostics cannot
+  use `:external`;
 - `providerManagement.setAllowDataCollection` (the OpenRouter
   "providers that may collect data" opt-out, decision D9) is excluded, and
   `provider_account_create` / `provider_account_update` reject

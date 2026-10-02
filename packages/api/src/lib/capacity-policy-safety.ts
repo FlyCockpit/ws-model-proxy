@@ -6,12 +6,48 @@ import type { GuardedPoolCreateFailureReason } from "./guarded-pool-create-reaso
 
 export type CapacityLimitMode = "INHERIT" | "LIMITED" | "UNLIMITED";
 
+/** Input-key names reported in `data.fields` for pool policy rejections. */
+export type PoolPolicyFieldNames = {
+  reservedSlots: string;
+  concurrencyLimit: string;
+  contextMargin: string;
+  contextCeiling: string;
+};
+
+export const DEFAULT_POOL_POLICY_FIELDS: PoolPolicyFieldNames = {
+  reservedSlots: "capacityReservedSlots",
+  concurrencyLimit: "capacityConcurrencyLimit",
+  contextMargin: "capacityContextMargin",
+  contextCeiling: "capacityContextCeiling",
+};
+
+/** Guarded pool create input keys (#200). */
+export const GUARDED_CREATE_POLICY_FIELDS: PoolPolicyFieldNames = {
+  reservedSlots: "reservedSlots",
+  concurrencyLimit: "memberConcurrencyLimit",
+  contextMargin: "advanced.contextMargin",
+  contextCeiling: "memberContextCeiling",
+};
+
+function namedPolicyFields(
+  fields: readonly string[],
+  names: PoolPolicyFieldNames = DEFAULT_POOL_POLICY_FIELDS,
+): string[] {
+  const map: Record<string, string> = {
+    capacityReservedSlots: names.reservedSlots,
+    capacityConcurrencyLimit: names.concurrencyLimit,
+    capacityContextMargin: names.contextMargin,
+    capacityContextCeiling: names.contextCeiling,
+  };
+  return fields.map((field) => map[field] ?? field);
+}
+
 /**
  * Optional, caller-supplied machine-readable failure reasons. Shared helpers
  * stay generic for their other callers; procedures that surface curated
  * failure copy (guarded pool create) pass their reason codes in so the thrown
- * ORPCError carries `data.reason`. Omitted reasons keep the error shape
- * exactly as before.
+ * ORPCError carries `data.reason`. Omitting a reason omits `data.reason`.
+ * Every rejection still carries `data.fields` naming the input keys (#200).
  */
 export type CapacityPolicyFailureReasons = {
   reservedExceeds?: GuardedPoolCreateFailureReason;
@@ -24,10 +60,23 @@ export type EffectiveContextPolicyFailureReasons = {
   exceedsPhysical?: GuardedPoolCreateFailureReason;
 };
 
-function reasonData(
-  reason: GuardedPoolCreateFailureReason | undefined,
-): { reason: GuardedPoolCreateFailureReason } | undefined {
-  return reason === undefined ? undefined : { reason };
+/**
+ * Argument-shaped policy rejection. `fields` are the input keys a caller can
+ * change; MCP keeps only the names that tool advertises (#200). `reason`
+ * stays the optional guarded-create code.
+ */
+function rejectPolicy(
+  message: string,
+  fields: readonly string[],
+  reason?: GuardedPoolCreateFailureReason,
+): never {
+  throw new ORPCError("BAD_REQUEST", {
+    message,
+    data: {
+      ...(reason === undefined ? {} : { reason }),
+      fields: [...fields],
+    },
+  });
 }
 
 export type ModelPoolCapacityPolicyInput = {
@@ -67,19 +116,22 @@ export function assertModelPoolCapacityPolicy(
     contextMargin: number | undefined;
   },
   reason?: GuardedPoolCreateFailureReason,
+  fields?: PoolPolicyFieldNames,
 ): void {
   const reserved = input.reservedSlots ?? 0;
   const margin = input.contextMargin ?? 0;
   if (input.concurrencyLimit != null && reserved > input.concurrencyLimit)
-    throw new ORPCError("BAD_REQUEST", {
-      message: "Reserved slots exceed the pool concurrency limit.",
-      data: reasonData(reason),
-    });
+    rejectPolicy(
+      "Reserved slots exceed the pool concurrency limit.",
+      namedPolicyFields(["capacityReservedSlots", "capacityConcurrencyLimit"], fields),
+      reason,
+    );
   if (input.contextCeiling != null && margin >= input.contextCeiling)
-    throw new ORPCError("BAD_REQUEST", {
-      message: "Pool context margin must be smaller than the context ceiling.",
-      data: reasonData(reason),
-    });
+    rejectPolicy(
+      "Pool context margin must be smaller than the context ceiling.",
+      namedPolicyFields(["capacityContextMargin", "capacityContextCeiling"], fields),
+      reason,
+    );
 }
 
 /**
@@ -126,31 +178,38 @@ export function assertDirectCapacityPolicy(input: {
   const reserved = input.reservedSlots ?? 0;
   const margin = input.contextMargin ?? 0;
   if (input.concurrencyLimit != null && reserved > input.concurrencyLimit)
-    throw new ORPCError("BAD_REQUEST", {
-      message: "Reserved slots exceed the direct concurrency limit.",
-    });
+    rejectPolicy("Reserved slots exceed the direct concurrency limit.", [
+      "directReservedSlots",
+      "directConcurrencyLimit",
+      "hardConcurrencyLimit",
+    ]);
   if (input.hardLimit != null) {
     if (input.concurrencyLimit != null && input.concurrencyLimit > input.hardLimit)
-      throw new ORPCError("BAD_REQUEST", {
-        message: "Direct concurrency limit exceeds physical capacity.",
-      });
+      rejectPolicy("Direct concurrency limit exceeds physical capacity.", [
+        "directConcurrencyLimit",
+        "hardConcurrencyLimit",
+      ]);
     if (reserved > input.hardLimit)
-      throw new ORPCError("BAD_REQUEST", {
-        message: "Direct reserved slots exceed physical concurrency capacity.",
-      });
+      rejectPolicy("Direct reserved slots exceed physical concurrency capacity.", [
+        "directReservedSlots",
+        "hardConcurrencyLimit",
+      ]);
   }
   if (input.contextCeiling != null && margin >= input.contextCeiling)
-    throw new ORPCError("BAD_REQUEST", {
-      message: "Direct context margin must be smaller than the context ceiling.",
-    });
+    rejectPolicy("Direct context margin must be smaller than the context ceiling.", [
+      "directContextMargin",
+      "directContextCeiling",
+    ]);
   if (
     input.physicalMaxContext != null &&
     input.contextCeiling != null &&
     input.contextCeiling + margin > input.physicalMaxContext
   )
-    throw new ORPCError("BAD_REQUEST", {
-      message: "Direct context policy exceeds physical capacity.",
-    });
+    rejectPolicy("Direct context policy exceeds physical capacity.", [
+      "directContextCeiling",
+      "directContextMargin",
+      "physicalMaxContext",
+    ]);
 }
 
 export function assertEffectiveConcurrencyPolicy(
@@ -163,6 +222,7 @@ export function assertEffectiveConcurrencyPolicy(
     memberReserved?: number | null;
   },
   reasons?: CapacityPolicyFailureReasons,
+  fields?: PoolPolicyFieldNames,
 ): void {
   const effectiveLimit =
     input.memberMode === "LIMITED"
@@ -172,21 +232,30 @@ export function assertEffectiveConcurrencyPolicy(
         : input.poolLimit;
   const effectiveReserved = input.memberReserved ?? input.poolReserved;
   if (effectiveLimit != null && effectiveReserved > effectiveLimit)
-    throw new ORPCError("BAD_REQUEST", {
-      message: "Reserved slots exceed the effective concurrency limit.",
-      data: reasonData(reasons?.reservedExceeds),
-    });
+    rejectPolicy(
+      "Reserved slots exceed the effective concurrency limit.",
+      namedPolicyFields(["capacityReservedSlots", "capacityConcurrencyLimit"], fields),
+      reasons?.reservedExceeds,
+    );
   if (input.hardLimit == null) return;
   if (effectiveLimit != null && effectiveLimit > input.hardLimit)
-    throw new ORPCError("BAD_REQUEST", {
-      message: "Effective concurrency limit exceeds physical capacity.",
-      data: reasonData(reasons?.concurrencyExceedsPhysical),
-    });
+    rejectPolicy(
+      "Effective concurrency limit exceeds physical capacity.",
+      namedPolicyFields(
+        ["capacityConcurrencyLimit", "hardConcurrencyLimit", "directConcurrencyLimit"],
+        fields,
+      ),
+      reasons?.concurrencyExceedsPhysical,
+    );
   if (effectiveReserved > input.hardLimit)
-    throw new ORPCError("BAD_REQUEST", {
-      message: "Reserved slots exceed physical concurrency capacity.",
-      data: reasonData(reasons?.reservedExceedsPhysical),
-    });
+    rejectPolicy(
+      "Reserved slots exceed physical concurrency capacity.",
+      namedPolicyFields(
+        ["capacityReservedSlots", "hardConcurrencyLimit", "directReservedSlots"],
+        fields,
+      ),
+      reasons?.reservedExceedsPhysical,
+    );
 }
 
 export function assertEffectiveContextPolicy(
@@ -199,6 +268,7 @@ export function assertEffectiveContextPolicy(
     memberMargin?: number | null;
   },
   reasons?: EffectiveContextPolicyFailureReasons,
+  fields?: PoolPolicyFieldNames,
 ): void {
   const ceiling =
     input.memberMode === "LIMITED"
@@ -208,19 +278,38 @@ export function assertEffectiveContextPolicy(
         : input.poolCeiling;
   const margin = input.memberMargin ?? input.poolMargin;
   if (ceiling != null && margin >= ceiling)
-    throw new ORPCError("BAD_REQUEST", {
-      message: "Context margin must be smaller than the effective context ceiling.",
-      data: reasonData(reasons?.marginExceedsCeiling),
-    });
+    rejectPolicy(
+      "Context margin must be smaller than the effective context ceiling.",
+      namedPolicyFields(
+        [
+          "capacityContextMargin",
+          "capacityContextCeiling",
+          "directContextMargin",
+          "directContextCeiling",
+        ],
+        fields,
+      ),
+      reasons?.marginExceedsCeiling,
+    );
   if (
     input.physicalMaxContext != null &&
     ceiling != null &&
     ceiling + margin > input.physicalMaxContext
   )
-    throw new ORPCError("BAD_REQUEST", {
-      message: "Effective context policy exceeds physical capacity.",
-      data: reasonData(reasons?.exceedsPhysical),
-    });
+    rejectPolicy(
+      "Effective context policy exceeds physical capacity.",
+      namedPolicyFields(
+        [
+          "capacityContextCeiling",
+          "capacityContextMargin",
+          "directContextCeiling",
+          "directContextMargin",
+          "physicalMaxContext",
+        ],
+        fields,
+      ),
+      reasons?.exceedsPhysical,
+    );
 }
 
 /**

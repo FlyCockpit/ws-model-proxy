@@ -1171,6 +1171,32 @@ integration("warm-session protection with real PostgreSQL", () => {
           protectedTokens: 30_000,
           effectiveKvBudgetTokens: 50_000,
         });
+        expect(
+          (
+            await warm.assessWarmProtection({
+              ownerId: owner.id,
+              policy: { ...policy, evictionFeedbackEnabled: false },
+              now,
+              members: [
+                {
+                  poolMemberId: "m",
+                  capacityId,
+                  slots: 4,
+                  kvBudgetTokens: 100_000,
+                  engineKind: "VLLM",
+                  affine: false,
+                  requestTokens: 25_000,
+                },
+              ],
+              source: warm.warmProtectionSource,
+            })
+          ).get("m"),
+        ).toMatchObject({
+          state: "FREE",
+          protectedTokens: 30_000,
+          effectiveKvBudgetTokens: 100_000,
+        });
+        expect((await row(capacityId)).cutFraction).toBeCloseTo(0.5, 12);
         // Keep the row live beyond full recovery to prove read-time linear decay.
         await db.capacityKvEviction.update({
           where: { capacityId },
@@ -1207,7 +1233,7 @@ integration("warm-session protection with real PostgreSQL", () => {
           : {
               cutFraction: cut,
               observedAt: new Date(now.getTime() - dt),
-              lastSessionId: "seed",
+              sessionIds: ["seed"],
             };
       const expiresAt = new Date(now.getTime() + 3_600_000);
       if (state)
@@ -1223,7 +1249,7 @@ integration("warm-session protection with real PostgreSQL", () => {
       const expected = applyKvEvictionObservations(state, sessionIds, now);
       expect(actual.cutFraction).toBe(expected.cutFraction);
       expect(actual.observedAt).toEqual(expected.observedAt);
-      expect(actual.lastSessionId).toBe(expected.lastSessionId ?? "seed");
+      expect(actual.sessionIds).toEqual(expected.sessionIds ?? ["seed"]);
       expect(actual.expiresAt).toEqual(
         state ? expiresAt : new Date(now.getTime() + KV_EVICTION_RECOVERY_MS),
       );
@@ -1284,7 +1310,7 @@ integration("warm-session protection with real PostgreSQL", () => {
             cutFraction: 0.5,
             observedAt: new Date(now.getTime() - 2000),
             expiresAt: new Date(now.getTime() + (capacityId === expired ? 0 : 1000)),
-            lastSessionId: "seed",
+            sessionIds: ["seed"],
           },
         });
       const snapshot = await warm.warmProtectionSource.load({
@@ -1318,7 +1344,7 @@ integration("warm-session protection with real PostgreSQL", () => {
             cutFraction: 0.5,
             observedAt: new Date(now.getTime() - age - 1000),
             expiresAt: new Date(now.getTime() - age),
-            lastSessionId: "seed",
+            sessionIds: ["seed"],
           },
         });
       await retention.deleteExpiredKvEvictions({ prisma: writers[0], now, batch: 1 });
@@ -1345,7 +1371,7 @@ integration("warm-session protection with real PostgreSQL", () => {
               cutFraction: 0.1,
               observedAt,
               expiresAt: expired,
-              lastSessionId: "seed",
+              sessionIds: ["seed"],
             }))
             .concat([
               {
@@ -1354,7 +1380,7 @@ integration("warm-session protection with real PostgreSQL", () => {
                 cutFraction: 0.1,
                 observedAt,
                 expiresAt: new Date(now.getTime() + 1000),
-                lastSessionId: "seed",
+                sessionIds: ["seed"],
               },
               {
                 capacityId: boundary,
@@ -1362,7 +1388,7 @@ integration("warm-session protection with real PostgreSQL", () => {
                 cutFraction: 0.1,
                 observedAt,
                 expiresAt: cutoff,
-                lastSessionId: "seed",
+                sessionIds: ["seed"],
               },
             ]),
         });
@@ -1450,7 +1476,7 @@ integration("warm-session protection with real PostgreSQL", () => {
           cutFraction: 0,
           observedAt: new Date(expiredAt.getTime() - KV_EVICTION_RECOVERY_MS),
           expiresAt: expiredAt,
-          lastSessionId: "a",
+          sessionIds: ["a"],
         },
       });
       await feedback.recordKvEvictionObservations(
@@ -1463,7 +1489,7 @@ integration("warm-session protection with real PostgreSQL", () => {
           cutFraction: 0,
           observedAt: new Date(expiredAt.getTime() - KV_EVICTION_RECOVERY_MS),
           expiresAt: expiredAt,
-          lastSessionId: "a",
+          sessionIds: ["a"],
         },
         ["a"],
         now,
@@ -1483,7 +1509,7 @@ integration("warm-session protection with real PostgreSQL", () => {
           cutFraction: 0.25,
           observedAt: new Date(now.getTime() - 60_000),
           expiresAt: expiredAt,
-          lastSessionId: "a",
+          sessionIds: ["a"],
         },
       });
       await feedback.recordKvEvictionObservations(

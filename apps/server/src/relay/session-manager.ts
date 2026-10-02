@@ -32,6 +32,7 @@ import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/opena
 import { parseStoredRemoteEngineAdapters } from "@ws-model-proxy/api/lib/remote-engine-adapters";
 import type { SupervisedCommandStatus } from "@ws-model-proxy/api/lib/supervised-command-types";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
+import { resetKvEvictionForEndpoint } from "../model-api/kv-eviction-feedback.js";
 import { startRelayAttempt } from "../model-api/relay-executor.js";
 import { EngineLoadHistoryStore } from "./engine-load-history.js";
 import { observeEngineLoadRollup } from "./engine-load-rollup.js";
@@ -47,11 +48,13 @@ import {
   supervisedFileRejectReasonSchema,
 } from "./file-protocol.js";
 import { sanitizeRelayRequestHeaders } from "./headers.js";
+import { relayHelloOrigin, verifyHelloIdentitySignature } from "./hello-identity.js";
 import {
   createRoutingEvaluationState,
   MetricRoutingEvaluator,
   type RoutingEvaluationState,
 } from "./metric-routing-evaluator.js";
+import { observeNodeMetricsRollup } from "./node-metrics-rollup.js";
 import {
   listDueOwnedPoolMemberRecoveries,
   type OwnedRecoveryMember,
@@ -69,20 +72,23 @@ import {
   type NodeMetricsMessage,
   parseRelayBinaryFrame,
   parseRelayClientControlFrame,
+  protocolErrorMessage,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+  RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE,
   RELAY_STALE_AFTER_MS,
   RELAY_UNREGISTERED_STALE_AFTER_MS,
   RELAY_UPGRADE_REQUIRED_MESSAGE,
   type RelayBinaryFrameMetadata,
   type RelayClientControlMessage,
   type RelayFailure,
+  type RelayProtocolErrorCode,
   type RelayProtocolVersion,
   type RelayResponseBodyMetadata,
   type RelayServerControlMessage,
   type RemoteEngineAdapter,
   type RemoteMetricSource,
+  refusedRelayProtocolReason,
   rejectedHelloFacts,
-  relayProtocolAtLeast,
   remoteEngineAdaptersSchema,
   remoteMetricSourcesSchema,
   type TerminalHandshakeIdentity,
@@ -383,6 +389,8 @@ const TELEMETRY_FRAME_TYPES: ReadonlySet<string> = new Set([
 export const ENDPOINT_LOAD_MIN_INTERVAL_MS = 1_000;
 /** Distinct endpoint/model load keys kept per session. */
 export const ENDPOINT_LOAD_MAX_KEYS = 1_000;
+/** KV-eviction reset (epoch change or prefixCacheReset) at most this often per endpoint. */
+export const KV_EVICTION_RESET_DEBOUNCE_MS = 30_000;
 
 function addCapped(total: number, delta: number): number {
   return Math.min(Number.MAX_SAFE_INTEGER, total + delta);
@@ -409,6 +417,8 @@ type SessionState = {
   /** Serialises `engine.adapters.set` sends the same way. */
   remoteAdaptersQueue: Promise<void>;
   inventoryConfirmed: boolean;
+  /** Slugs from the last accepted hello / inventory.update. */
+  inventorySlugs: Set<string>;
   endpointTargeting: boolean;
   protocolVersion: RelayProtocolVersion | null;
   cliVersion: string | null;
@@ -435,6 +445,8 @@ type SessionState = {
    */
   endingSupervised: Map<string, TrackedSupervisedCommand>;
   unauthenticatedTimer: ReturnType<typeof setTimeout>;
+  /** One-shot nonce from `hello.challenge`; consumed when hello is verified. */
+  helloNonce: string | null;
   bodyStreamsByRequest: Map<string, OutboundBodyStream>;
   /** 2.7 telemetry, in memory only (see `handleTelemetry`). */
   nodeInfoAcceptedAtMs: number | null;
@@ -450,12 +462,24 @@ type SessionState = {
 export type ActiveRelayResponseHandlers = {
   /** Called only after request-body bytes have been accepted by the relay socket. */
   onRequestBodySent?(byteLength: number): void;
+  /** Count-first Chat: the CLI reports tokenize before headers or a too-large error. */
+  onCountResult?(message: CountContextResultMessage): void;
+  onCountError?(message: CountContextErrorMessage): void;
   onHeaders(message: Extract<RelayClientControlMessage, { type: "relay.response.headers" }>): void;
   onBody(chunk: Uint8Array, metadata: RelayResponseBodyMetadata): void;
   onComplete(message: Extract<RelayClientControlMessage, { type: "relay.complete" }>): void;
   onError(message: Extract<RelayClientControlMessage, { type: "relay.error" }>): void;
   onCancelled(message: Extract<RelayClientControlMessage, { type: "relay.cancelled" }>): void;
 };
+
+export type CountContextResultMessage = Extract<
+  RelayClientControlMessage,
+  { type: "context.count.result" }
+>;
+export type CountContextErrorMessage = Extract<
+  RelayClientControlMessage,
+  { type: "context.count.error" }
+>;
 
 type ActiveRelayRequest = ActiveRelayResponseHandlers & {
   cliDeviceId: string;
@@ -471,9 +495,12 @@ function interactiveCapabilities(capabilities: HelloMessage["cli"]["capabilities
   terminalIdentity: CliTerminalIdentity | null;
 } {
   return {
-    features: { ...capabilities.features, fileOps: capabilities.fileOps === true },
+    features: {
+      ...capabilities.features,
+      fileOps: true,
+    },
     terminalPublicKey: capabilities.terminalPublicKey,
-    terminalViewers: capabilities.terminalViewers === true,
+    terminalViewers: true,
     terminalIdentity: capabilities.terminalIdentity ?? null,
   };
 }
@@ -605,17 +632,40 @@ function interactiveTargetFromBinary(
   }
 }
 
-function closeWithProtocolError(socket: RelaySocket, message: string) {
+function closeCodeForProtocolError(code: RelayProtocolErrorCode): number {
+  if (code === "access_denied" || code === "identity_mismatch") return 1008;
+  if (code === "internal") return 1011;
+  return 1002;
+}
+
+function closeWithProtocolError(
+  socket: RelaySocket,
+  code: RelayProtocolErrorCode,
+  message: string,
+  requestId?: string,
+) {
   if (socket.readyState === WS_READY_STATE_OPEN) {
     socket.send(
-      encodeRelayServerControlMessage({
-        type: "protocol.error",
-        failure: "protocol_error",
-        message,
-      }),
+      encodeRelayServerControlMessage(protocolErrorMessage({ code, message, requestId })),
     );
   }
-  socket.close(1002, "protocol_error");
+  socket.close(closeCodeForProtocolError(code), code);
+}
+
+function protocolErrorFromRegistration(error: unknown): {
+  code: RelayProtocolErrorCode;
+  message: string;
+} {
+  if (error instanceof RelayRegistrationError) {
+    if (error.code === "identity_mismatch") {
+      return { code: "identity_mismatch", message: error.message };
+    }
+    if (error.code === "access_denied") {
+      return { code: "access_denied", message: error.message };
+    }
+    return { code: "malformed", message: error.message };
+  }
+  return { code: "internal", message: "internal" };
 }
 
 export class RelaySessionManager {
@@ -623,6 +673,10 @@ export class RelaySessionManager {
   private sessionsByCliDeviceId = new Map<string, SessionState>();
   /** Manager-level so a reconnect does not wipe the 30-minute ring. */
   private engineLoadHistory = new EngineLoadHistoryStore();
+  /** Last `counterEpoch` per (device, endpoint). Survives reconnect of this process. */
+  private kvCounterEpochByEndpoint = new Map<string, number>();
+  /** Last KV-eviction reset time per (device, endpoint), for debounce. */
+  private kvResetAtByEndpoint = new Map<string, number>();
   private featureGrantsRefreshByCliDeviceId = new Map<string, Promise<void>>();
   private grantChangeSeq = 0;
   // One integer per device changed since process start. There is no device-delete
@@ -686,10 +740,11 @@ export class RelaySessionManager {
       }
       return false;
     }
+    const helloNonce = randomBytes(16).toString("base64url");
     const unauthenticatedTimer = setTimeout(() => {
       const session = this.sessionsBySocket.get(socket);
       if (!session?.registered) {
-        closeWithProtocolError(socket, "Registration was not received in time.");
+        closeWithProtocolError(socket, "malformed", "Registration was not received in time.");
         this.removeSession(socket, new Date());
       }
     }, RELAY_UNREGISTERED_STALE_AFTER_MS);
@@ -706,6 +761,7 @@ export class RelaySessionManager {
       remoteSourcesQueue: Promise.resolve(),
       remoteAdaptersQueue: Promise.resolve(),
       inventoryConfirmed: false,
+      inventorySlugs: new Set(),
       endpointTargeting: false,
       protocolVersion: null,
       cliVersion: null,
@@ -722,6 +778,7 @@ export class RelaySessionManager {
       supervisedById: new Map(),
       endingSupervised: new Map(),
       unauthenticatedTimer,
+      helloNonce,
       bodyStreamsByRequest: new Map(),
       nodeInfoAcceptedAtMs: null,
       nodeMetrics: null,
@@ -731,6 +788,15 @@ export class RelaySessionManager {
       malformedTelemetryLoggedAtMs: null,
       routingEvaluation: null,
     });
+    if (socket.readyState === WS_READY_STATE_OPEN) {
+      socket.send(
+        encodeRelayServerControlMessage({
+          type: "hello.challenge",
+          nonce: helloNonce,
+          origin: relayHelloOrigin(),
+        }),
+      );
+    }
     return true;
   }
 
@@ -740,8 +806,16 @@ export class RelaySessionManager {
     // (an "upgrade wsmp" text), not an opaque schema rejection. Every released CLI treats protocol.error as fatal.
     if (!session.registered && helloNeedsUpgrade(frame)) {
       const rejected = rejectedHelloFacts(frame);
-      console.error("[relay] refused a hello older than the minimum relay protocol", rejected);
-      closeWithProtocolError(socket, RELAY_UPGRADE_REQUIRED_MESSAGE);
+      const reason = refusedRelayProtocolReason(rejected.protocolVersion);
+      const code = reason === "cli_too_new" ? "upgrade_server" : "upgrade_cli";
+      console.error("[relay] refused a hello this server does not speak", { ...rejected, code });
+      closeWithProtocolError(
+        socket,
+        code,
+        code === "upgrade_server"
+          ? RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE
+          : RELAY_UPGRADE_REQUIRED_MESSAGE,
+      );
       await this.recordRejectedHello(session, rejected, now);
       await this.removeSession(socket, now);
       return;
@@ -761,12 +835,28 @@ export class RelaySessionManager {
       } else {
         console.error("[relay] control frame parse failed", description.name);
       }
-      closeWithProtocolError(socket, "Malformed relay protocol message.");
+      closeWithProtocolError(socket, "malformed", "Malformed relay protocol message.");
       await this.removeSession(socket, now);
       return;
     }
 
     if (message.type === "hello") {
+      const nonce = session.helloNonce;
+      session.helloNonce = null;
+      if (
+        !nonce ||
+        !verifyHelloIdentitySignature({
+          identityPublicKey: message.cli.identityPublicKey,
+          signature: message.cli.identitySignature,
+          nonce,
+          cliSlug: message.cli.slug,
+          origin: relayHelloOrigin(),
+        })
+      ) {
+        closeWithProtocolError(socket, "malformed", "Hello identity proof is invalid.");
+        await this.removeSession(socket, now);
+        return;
+      }
       try {
         const helloSeq = this.grantChangeSeq;
         const registration = await persistRelayRegistration({
@@ -777,6 +867,7 @@ export class RelaySessionManager {
           endpointTargeting: true,
           connection: true,
           reported: reportedFeaturesFromHello(message, now),
+          identityPublicKey: message.cli.identityPublicKey,
           now,
         });
         if (this.sessionsBySocket.get(socket) !== session) {
@@ -841,6 +932,7 @@ export class RelaySessionManager {
         clearTimeout(session.unauthenticatedTimer);
         this.reconcileInteractiveGrants(session);
         this.replaceDuplicateSession(session);
+        session.inventorySlugs = new Set(message.endpoints.map((endpoint) => endpoint.slug));
         if (stalePolicy) {
           void this.refreshFeatureGrants(registration.cliDeviceId).catch((error: unknown) => {
             console.error(
@@ -866,31 +958,31 @@ export class RelaySessionManager {
             desiredCapabilities: registration.desiredCapabilities,
           }),
         );
+        await this.seedCounterEpochs(registration.cliDeviceId);
         await this.sendRemoteMetricSources(session);
         await this.sendRemoteEngineAdapters(session);
       } catch (error) {
         // Already detached and closed by whoever detached it.
         if (this.sessionsBySocket.get(socket) !== session) return;
-        const relayError =
-          error instanceof RelayRegistrationError && error.code === "access_denied"
-            ? "access_denied"
-            : "protocol_error";
-        socket.send(
-          encodeRelayServerControlMessage({
-            type: "protocol.error",
-            failure: "protocol_error",
-            message: relayError,
-            requestId: message.id,
-          }),
-        );
-        socket.close(1008, relayError);
+        // An identity-key mismatch rolls the registration back, so the session
+        // already serving this device stays. The message tells the copy to
+        // log in again; it is not an opaque protocol error.
+        if (error instanceof RelayRegistrationError && error.code === "identity_mismatch") {
+          await this.recordIdentityRefusal(session.identity, now);
+        }
+        const mapped = protocolErrorFromRegistration(error);
+        closeWithProtocolError(socket, mapped.code, mapped.message, message.id);
         await this.removeSession(socket, now);
       }
       return;
     }
 
     if (!session.registered || !session.cliDeviceId) {
-      closeWithProtocolError(socket, "Registration is required before relay messages.");
+      closeWithProtocolError(
+        socket,
+        "malformed",
+        "Registration is required before relay messages.",
+      );
       await this.removeSession(socket, now);
       return;
     }
@@ -919,6 +1011,7 @@ export class RelaySessionManager {
         // Detached during the write: nothing to acknowledge. An inventory
         // update never writes connection state, so there is nothing to undo.
         if (this.sessionsBySocket.get(socket) !== session) return;
+        session.inventorySlugs = new Set(message.endpoints.map((endpoint) => endpoint.slug));
         socket.send(
           encodeRelayServerControlMessage({
             type: "inventory.ok",
@@ -932,12 +1025,13 @@ export class RelaySessionManager {
         if (error instanceof RelayRegistrationError && error.code === "access_denied") {
           // The credential was revoked (or its owner removed) since the hello.
           socket.send(
-            encodeRelayServerControlMessage({
-              type: "protocol.error",
-              failure: "protocol_error",
-              message: "access_denied",
-              requestId: message.id,
-            }),
+            encodeRelayServerControlMessage(
+              protocolErrorMessage({
+                code: "access_denied",
+                message: "access_denied",
+                requestId: message.id,
+              }),
+            ),
           );
           socket.close(1008, "access_denied");
           await this.removeSession(socket, now);
@@ -995,12 +1089,12 @@ export class RelaySessionManager {
     }
 
     if (message.type === "relay.response.headers") {
-      this.activeRelayRequests.get(message.requestId)?.onHeaders(message);
+      this.ownedRelayRequest(session, message.requestId)?.onHeaders(message);
       return;
     }
 
     if (message.type === "relay.complete") {
-      const activeRequest = this.takeActiveRelayRequest(message.requestId);
+      const activeRequest = this.takeOwnedRelayRequest(session, message.requestId);
       if (!activeRequest) return;
       activeRequest.onComplete(message);
       this.considerDrainClose(activeRequest.cliDeviceId);
@@ -1008,7 +1102,7 @@ export class RelaySessionManager {
     }
 
     if (message.type === "relay.error") {
-      const activeRequest = this.takeActiveRelayRequest(message.requestId);
+      const activeRequest = this.takeOwnedRelayRequest(session, message.requestId);
       if (!activeRequest) return;
       activeRequest.onError(message);
       this.considerDrainClose(activeRequest.cliDeviceId);
@@ -1016,10 +1110,20 @@ export class RelaySessionManager {
     }
 
     if (message.type === "relay.cancelled") {
-      const activeRequest = this.takeActiveRelayRequest(message.requestId);
+      const activeRequest = this.takeOwnedRelayRequest(session, message.requestId);
       if (!activeRequest) return;
       activeRequest.onCancelled(message);
       this.considerDrainClose(activeRequest.cliDeviceId);
+      return;
+    }
+
+    if (message.type === "context.count.result") {
+      this.ownedRelayRequest(session, message.requestId)?.onCountResult?.(message);
+      return;
+    }
+
+    if (message.type === "context.count.error") {
+      this.ownedRelayRequest(session, message.requestId)?.onCountError?.(message);
       return;
     }
 
@@ -1067,9 +1171,10 @@ export class RelaySessionManager {
       if (!session) return;
       const parsed = parseRelayBinaryFrame(frame);
       if (parsed.metadata.type === "relay.response.body") {
-        this.activeRelayRequests
-          .get(parsed.metadata.requestId)
-          ?.onBody(parsed.body, parsed.metadata);
+        this.ownedRelayRequest(session, parsed.metadata.requestId)?.onBody(
+          parsed.body,
+          parsed.metadata,
+        );
         return;
       }
       if (parsed.metadata.type === "term.sealed") {
@@ -1401,6 +1506,25 @@ export class RelaySessionManager {
     return active;
   }
 
+  private ownedRelayRequest(
+    session: SessionState,
+    requestId: string,
+  ): ActiveRelayRequest | undefined {
+    const active = this.activeRelayRequests.get(requestId);
+    if (!active || active.cliDeviceId !== session.cliDeviceId) return undefined;
+    return active;
+  }
+
+  private takeOwnedRelayRequest(
+    session: SessionState,
+    requestId: string,
+  ): ActiveRelayRequest | undefined {
+    const active = this.ownedRelayRequest(session, requestId);
+    if (!active) return undefined;
+    this.activeRelayRequests.delete(requestId);
+    return active;
+  }
+
   /** During drain, close a CLI socket once its last model request has finished. */
   private considerDrainClose(cliDeviceId: string | null | undefined) {
     if (!this.relayDrain || !cliDeviceId) return;
@@ -1529,7 +1653,14 @@ export class RelaySessionManager {
    * `session.impersonatedBy`) exists only on browser sessions.
    */
   async closeSessionsForUser(userId: string, now = new Date()) {
+    const deviceIds = new Set<string>();
+    for (const session of this.sessionsByCliDeviceId.values()) {
+      if (session.identity.userId === userId && session.cliDeviceId) {
+        deviceIds.add(session.cliDeviceId);
+      }
+    }
     await this.closeSessionsMatching((session) => session.identity.userId === userId, now);
+    for (const cliDeviceId of deviceIds) this.engineLoadHistory.dropDevice(cliDeviceId);
   }
 
   private async closeSessionsMatching(matches: (session: SessionState) => boolean, now: Date) {
@@ -1541,11 +1672,9 @@ export class RelaySessionManager {
       this.teardownInteractiveWork(session);
       if (session.socket.readyState === WS_READY_STATE_OPEN) {
         session.socket.send(
-          encodeRelayServerControlMessage({
-            type: "protocol.error",
-            failure: "protocol_error",
-            message: "access_denied",
-          }),
+          encodeRelayServerControlMessage(
+            protocolErrorMessage({ code: "access_denied", message: "access_denied" }),
+          ),
         );
         session.socket.close(1008, "access_denied");
       }
@@ -1597,6 +1726,48 @@ export class RelaySessionManager {
   }
 
   /**
+   * Seed last-seen `counterEpoch` from durable endpoint rows so a replica or
+   * reboot still resets KV evidence only on a real epoch change.
+   */
+  private async seedCounterEpochs(cliDeviceId: string) {
+    try {
+      const rows = await prisma.endpoint.findMany({
+        where: { cliDeviceId },
+        select: { slug: true, loadCounterEpoch: true },
+      });
+      for (const row of rows ?? []) {
+        if (row.loadCounterEpoch == null) continue;
+        this.kvCounterEpochByEndpoint.set(`${cliDeviceId}\0${row.slug}`, row.loadCounterEpoch);
+      }
+    } catch (error) {
+      console.error(
+        "[relay] seeding load counter epochs failed",
+        error instanceof Error ? error.name : typeof error,
+      );
+    }
+  }
+
+  /**
+   * Record an identity-key refusal on the credential or token after the
+   * registration transaction has rolled back, so the dashboard can show it.
+   */
+  private async recordIdentityRefusal(identity: CliWebsocketIdentity, now: Date) {
+    const data = { lastRefusedAt: now, lastRefusedReason: "identity_mismatch" };
+    try {
+      if (identity.kind === "deviceCredential") {
+        await prisma.cliDeviceCredential.updateMany({ where: { id: identity.id }, data });
+      } else {
+        await prisma.cliToken.updateMany({ where: { id: identity.id }, data });
+      }
+    } catch (error) {
+      console.error(
+        "[relay] recording an identity refusal failed",
+        error instanceof Error ? error.name : typeof error,
+      );
+    }
+  }
+
+  /**
    * Remember why a device's CLI was refused so its card can say "CLI upgrade
    * required", or "Server upgrade required" when the claimed protocol is newer
    * than this server speaks. Only a credential already bound to a device
@@ -1628,6 +1799,47 @@ export class RelaySessionManager {
   }
 
   /**
+   * Reset KV-eviction evidence only on a `counterEpoch` change or an explicit
+   * `prefixCacheReset`. Hello must not wipe rows. Unknown inventory slugs are
+   * ignored; repeats are debounced.
+   */
+  private noteKvEvictionResetSignal(
+    session: SessionState,
+    load: Pick<EndpointLoadMessage, "endpointSlug" | "prefixCacheReset" | "counterEpoch">,
+    now: Date,
+  ) {
+    const cliDeviceId = session.cliDeviceId;
+    if (!cliDeviceId || !session.inventorySlugs.has(load.endpointSlug)) return;
+    const key = `${cliDeviceId}\0${load.endpointSlug}`;
+    const previousEpoch = this.kvCounterEpochByEndpoint.get(key);
+    if (load.counterEpoch !== previousEpoch) {
+      this.kvCounterEpochByEndpoint.set(key, load.counterEpoch);
+      void prisma.endpoint
+        .updateMany({
+          where: { cliDeviceId, slug: load.endpointSlug },
+          data: { loadCounterEpoch: load.counterEpoch },
+        })
+        .catch(() => {
+          /* Disposable: load frames must not fail closed on epoch persist. */
+        });
+    }
+    const epochChanged = previousEpoch !== undefined && load.counterEpoch !== previousEpoch;
+    if (!epochChanged && load.prefixCacheReset !== true) return;
+    const lastResetMs = this.kvResetAtByEndpoint.get(key);
+    const nowMs = now.getTime();
+    if (
+      lastResetMs !== undefined &&
+      Number.isFinite(nowMs) &&
+      nowMs - lastResetMs < KV_EVICTION_RESET_DEBOUNCE_MS
+    )
+      return;
+    if (Number.isFinite(nowMs)) this.kvResetAtByEndpoint.set(key, nowMs);
+    void resetKvEvictionForEndpoint(cliDeviceId, load.endpointSlug, now).catch(() => {
+      /* Disposable: load frames must not fail closed on evidence reset. */
+    });
+  }
+
+  /**
    * 2.7 telemetry. Frames above the rate limits are dropped, never fatal.
    * `endpoint.load` and the freshest metrics stay in memory; the CliDevice
    * row gets `node.info` once per connection and a metrics snapshot at most
@@ -1648,15 +1860,17 @@ export class RelaySessionManager {
       const hitsDelta = load.prefixCacheHitsDelta ?? 0;
       const queriesDelta = load.prefixCacheQueriesDelta ?? 0;
       if (previous && nowMs - previous.receivedAtMs < ENDPOINT_LOAD_MIN_INTERVAL_MS) {
-        // The reading is dropped but its counter deltas are not.
+        // The reading is dropped but its counter deltas and reset signals are not.
         previous.prefixCacheHitsTotal = addCapped(previous.prefixCacheHitsTotal, hitsDelta);
         previous.prefixCacheQueriesTotal = addCapped(
           previous.prefixCacheQueriesTotal,
           queriesDelta,
         );
+        this.noteKvEvictionResetSignal(session, load, now);
         return;
       }
       if (!previous && session.endpointLoad.size >= ENDPOINT_LOAD_MAX_KEYS) return;
+      this.noteKvEvictionResetSignal(session, load, now);
       // "Sustained" waiting counts consecutive accepted frames. A gap longer
       // than the staleness window restarts the count (fail open).
       const continuous = previous && nowMs - previous.receivedAtMs <= ENDPOINT_LOAD_STALE_AFTER_MS;
@@ -1723,6 +1937,24 @@ export class RelaySessionManager {
     session.nodeMetricsAcceptedAtMs = nowMs;
     const { type: _type, ...sample } = message;
     session.nodeMetrics = { sample, receivedAt: now };
+    const gpuTemps = (sample.gpus ?? []).map((gpu) => gpu.temperatureC);
+    const gpuUtils = (sample.gpus ?? []).map((gpu) => gpu.utilizationPercent);
+    observeNodeMetricsRollup({
+      ownerUserId: session.identity.userId,
+      cliDeviceId,
+      receivedAt: now,
+      cpuPercent: sample.cpu?.usagePercent,
+      memoryAvailableMiB: sample.memory?.availableMiB,
+      memoryTotalMiB: sample.memory?.totalMiB,
+      gpuTemperatureC: gpuTemps.reduce<number | null>(
+        (max, value) => (value == null ? max : max == null ? value : Math.max(max, value)),
+        null,
+      ),
+      gpuUtilizationPercent: gpuUtils.reduce<number | null>(
+        (max, value) => (value == null ? max : max == null ? value : Math.max(max, value)),
+        null,
+      ),
+    });
     this.scheduleRoutingEvaluation(session);
     if (
       session.nodeMetricsPersistedAtMs !== null &&
@@ -1859,7 +2091,6 @@ export class RelaySessionManager {
   }
 
   private async sendRemoteEngineAdaptersNow(session: SessionState): Promise<boolean> {
-    if (!relayProtocolAtLeast(session.protocolVersion, "2.9")) return false;
     const cliDeviceId = session.cliDeviceId;
     if (!cliDeviceId) return false;
     let adapters: RemoteEngineAdapter[] = [];
@@ -1973,19 +2204,16 @@ export class RelaySessionManager {
         cliVersion: session.cliVersion,
         humanTerminal: session.features?.humanTerminal ?? false,
         mcpCommandMode: session.features?.mcpCommandMode ?? "off",
-        supervisedCommands: relayProtocolAtLeast(session.protocolVersion, "2.6"),
+        supervisedCommands: true,
         terminalSupported: session.features?.terminalSupported ?? false,
         terminalApproval: session.features?.terminalApproval ?? false,
-        fileOps:
-          relayProtocolAtLeast(session.protocolVersion, "2.8") &&
-          session.features?.fileOps === true,
+        fileOps: true,
+        countContext: true,
         mcpFileRead: session.features?.mcpFileRead ?? false,
         fileRootsConfigured: session.features?.fileRootsConfigured ?? false,
         allowFileToolsAsRoot: session.features?.allowFileToolsAsRoot ?? false,
-        terminalPublicKey: relayProtocolAtLeast(session.protocolVersion, "2.4")
-          ? session.terminalPublicKey
-          : null,
-        terminalIdentity: session.terminalViewers ? session.terminalIdentity : null,
+        terminalPublicKey: session.terminalPublicKey,
+        terminalIdentity: session.terminalIdentity,
       });
     }
     return snapshots;
@@ -2518,10 +2746,7 @@ export class RelaySessionManager {
     if (!session) return null;
     const readGrant = {
       server: session.mcpFileRead === true,
-      live:
-        session.features?.mcpFileRead === true &&
-        session.features.fileOps === true &&
-        relayProtocolAtLeast(session.protocolVersion, "2.8"),
+      live: session.features?.mcpFileRead === true && session.features.fileOps === true,
       roots: session.features?.fileRootsConfigured === true,
     };
     return (
@@ -2546,6 +2771,8 @@ export class RelaySessionManager {
     bodyChunks = [],
     bodySource,
     timeoutMs,
+    countFirst = false,
+    countCeiling,
   }: {
     cliDeviceId: string;
     endpointSlug: string;
@@ -2564,6 +2791,8 @@ export class RelaySessionManager {
     bodyChunks?: Uint8Array[];
     bodySource?: { size: number; open(): AsyncIterable<Uint8Array> };
     timeoutMs: number;
+    countFirst?: boolean;
+    countCeiling?: number;
   }) {
     if (this.relayDrain) throw new Error("CLI session is disconnected.");
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
@@ -2582,6 +2811,12 @@ export class RelaySessionManager {
       timeoutMs,
       endpointSlug,
       expectBody: (bodySource?.size ?? 0) > 0 || bodyChunks.length > 0,
+      ...(countFirst
+        ? {
+            countFirst: true as const,
+            ...(countCeiling != null ? { countCeiling } : {}),
+          }
+        : {}),
     };
     session.socket.send(encodeRelayServerControlMessage(control));
 
@@ -2600,6 +2835,11 @@ export class RelaySessionManager {
       pumping: false,
     });
     void this.pumpBodyStream(session, requestId);
+  }
+
+  supportsCountContext(cliDeviceId: string): boolean {
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    return session?.registered === true;
   }
 
   private grantBodyCredits(session: SessionState, requestId: string, credits: number) {
@@ -2795,7 +3035,6 @@ export class RelaySessionManager {
 
   private canStartTerminal(session: SessionState): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       session.allowHumanTerminal &&
       session.features?.humanTerminal === true &&
       session.features.terminalSupported === true &&
@@ -2810,7 +3049,6 @@ export class RelaySessionManager {
    * Without a terminal, whether any terminal frame may be sent at all.
    */
   private canSignalTerminal(session: SessionState, terminal?: TerminalRecord): boolean {
-    if (!relayProtocolAtLeast(session.protocolVersion, "2.6")) return false;
     if (session.socket.readyState !== WS_READY_STATE_OPEN) return false;
     if (terminal?.origin === "agent") return true;
     if (terminal === undefined) return true;
@@ -2845,7 +3083,6 @@ export class RelaySessionManager {
   /** Supervised terminals: MCP command mode, not the human terminal grant. */
   private supervisedPolicyAllows(session: SessionState): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
       allowsSupervisedCommands(this.effectiveCommandMode(session)) &&
       session.features?.terminalSupported === true &&
       session.terminalPublicKey !== null
@@ -2860,7 +3097,6 @@ export class RelaySessionManager {
 
   private canStartExec(session: SessionState): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
       allowsHeadlessCommands(this.effectiveCommandMode(session)) &&
       session.socket.readyState === WS_READY_STATE_OPEN
     );
@@ -2869,7 +3105,6 @@ export class RelaySessionManager {
   /** Node file ops (2.8) follow the effective mode through the one file matrix. */
   private canStartFile(session: SessionState, opClass: FileOpClass): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.8") &&
       session.cliDeviceId !== null &&
       this.fileOpModeRefusal(session.cliDeviceId, opClass) === null &&
       session.features?.fileOps === true &&
@@ -2878,17 +3113,11 @@ export class RelaySessionManager {
   }
 
   private canSignalFile(session: SessionState): boolean {
-    return (
-      relayProtocolAtLeast(session.protocolVersion, "2.8") &&
-      session.socket.readyState === WS_READY_STATE_OPEN
-    );
+    return session.socket.readyState === WS_READY_STATE_OPEN;
   }
 
   private canSignalExec(session: SessionState): boolean {
-    return (
-      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
-      session.socket.readyState === WS_READY_STATE_OPEN
-    );
+    return session.socket.readyState === WS_READY_STATE_OPEN;
   }
 
   private sendControl(session: SessionState, message: RelayServerControlMessage) {
@@ -2898,7 +3127,6 @@ export class RelaySessionManager {
 
   private reconcileInteractiveGrants(session: SessionState) {
     const terminalOk =
-      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
       session.allowHumanTerminal &&
       session.features?.humanTerminal === true &&
       session.features.terminalSupported === true;
@@ -2909,9 +3137,7 @@ export class RelaySessionManager {
     if (!this.supervisedPolicyAllows(session)) {
       this.closeAllTerminals(session, this.canSignalTerminal(session), "policy", "agent");
     }
-    const execOk =
-      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
-      allowsHeadlessCommands(this.effectiveCommandMode(session));
+    const execOk = allowsHeadlessCommands(this.effectiveCommandMode(session));
     if (!execOk) this.cancelAllCommands(session);
     this.cancelFileOpsNoLongerAllowed(session);
   }
@@ -3674,6 +3900,22 @@ export class RelaySessionManager {
         console.error("[relay] malformed telemetry frame dropped", type);
       }
       return true;
+    }
+    if (type === "context.count.result" || type === "context.count.error") {
+      const requestId = typeof record.requestId === "string" ? record.requestId : null;
+      if (!requestId) return false;
+      const relay = this.ownedRelayRequest(session, requestId);
+      if (relay) {
+        relay.onCountError?.({
+          type: "context.count.error",
+          requestId,
+          failure: "protocol_error",
+          message: "Malformed context.count frame.",
+        });
+        console.error("[relay] malformed context.count frame");
+        return true;
+      }
+      return false;
     }
     return false;
   }

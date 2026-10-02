@@ -60,6 +60,8 @@ enum BudgetLimitMode {
 enum BudgetScopeType {
   PROVIDER_ACCOUNT
   POOL_PROVIDER_MODEL
+  /// Per-grantee owner-paid `:external` spend cap, keyed by pool + grantee.
+  POOL_GRANT
 }
 
 enum BudgetMetric {
@@ -124,6 +126,9 @@ enum ProviderAuditAction {
   /// A pool's external-fallback settings changed (fallbackEnabled,
   /// fallbackForGrantees, externalAfterWaitMs). subjectId is the pool id.
   POOL_FALLBACK_UPDATED
+  /// A token's `:external` wait (`externalAfterWaitMs`) changed. subjectId is
+  /// the token id. metadata.source is mcp or dashboard.
+  TOKEN_EXTERNAL_WAIT_UPDATED
 }
 
 enum ExecutionTargetKind {
@@ -294,6 +299,17 @@ enum EngineFactSource {
   CUSTOM
 }
 
+/// Native Chat Completions count method from `engineFacts.countContext`.
+/// Null on the capacity means not probed.
+enum EngineCountContext {
+  UNSUPPORTED
+  VLLM_TOKENIZE
+  TGI_CHAT_TOKENIZE
+  LLAMA_APPLY_TEMPLATE
+  LLAMA_INPUT_TOKENS
+  ADAPTER_COUNT
+}
+
 enum AdmissionSourceKind {
   DIRECT
   POOL
@@ -369,7 +385,9 @@ model CliDevice {
   reportedTerminalSupported    Boolean?
   /// Relay 2.8: the CLI's `allowFileToolsAsRoot` config from its hello (null until a 2.8 hello).
   reportedAllowFileToolsAsRoot Boolean?
-  /// The machine's hostname from the latest hello. Null when not reported.
+  /// The machine's hostname from the latest hello. A display label only
+  /// (`hostnamectl` can change it). Not the credential bind; that is
+  /// `CliDeviceCredential.identityPublicKey`. Null when not reported.
   reportedHostname             String?
   featuresReportedAt           DateTime?
   /// Relay 2.7 `node.info` from the latest connection (static machine facts).
@@ -379,6 +397,19 @@ model CliDevice {
   /// relay session holds the freshest sample.
   nodeMetrics                  Json?
   nodeMetricsAt                DateTime?
+  /// Human-only placement tags (`dgx-spark`, `unified-memory`, …). Agents read
+  /// them; selectors are "has all of these" sets. Empty until someone accepts
+  /// the first-`node.info` suggestions or types their own.
+  labels                       String[]              @default([])
+  /// Unified-memory budget in GB. Null means the default from `node.info`
+  /// (total minus a small reserve). Human-only.
+  usableMemoryGb               Float?
+  /// Discrete/CPU system-RAM budget in GB. Null means the default from
+  /// `node.info`. Human-only.
+  usableRamGb                  Float?
+  /// Per-GPU VRAM budgets in GB, keyed by GPU UUID (`index:N` fallback).
+  /// Null/absent keys mean the default from `node.info`. Human-only.
+  usableVramGb                 Json?
   /// A hello refused for an unsupported relay protocol, older or newer than the
   /// server supports ("CLI upgrade required" / "Server upgrade required").
   /// Cleared by the next accepted hello.
@@ -408,19 +439,28 @@ model CliDevice {
 }
 
 model CliToken {
-  id           String     @id @default(cuid(2))
-  createdAt    DateTime   @default(now())
-  updatedAt    DateTime   @default(now()) @updatedAt
-  userId       String
-  cliDeviceId  String?
-  name         String
-  lookupPrefix String
-  secretDigest String
-  lastUsedAt   DateTime?
-  revokedAt    DateTime?
-  expiresAt    DateTime?
-  User         User       @relation("CliTokenOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  CliDevice    CliDevice? @relation(fields: [cliDeviceId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  id                String     @id @default(cuid(2))
+  createdAt         DateTime   @default(now())
+  updatedAt         DateTime   @default(now()) @updatedAt
+  userId            String
+  cliDeviceId       String?
+  name              String
+  lookupPrefix      String
+  secretDigest      String
+  /// Uncompressed P-256 identity public key (unpadded base64url). TOFU-bound
+  /// on the token's first hello. A copied `service.env` cannot hello as a
+  /// different identity. Null until that first hello. The owner can reset
+  /// this bind without revoking the token.
+  identityPublicKey String?
+  /// Last hello that was refused because the presented identity key did not
+  /// match this bind. Cleared by a successful hello or an owner reset.
+  lastRefusedAt     DateTime?
+  lastRefusedReason String?
+  lastUsedAt        DateTime?
+  revokedAt         DateTime?
+  expiresAt         DateTime?
+  User              User       @relation("CliTokenOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  CliDevice         CliDevice? @relation(fields: [cliDeviceId], references: [id], onDelete: SetNull, onUpdate: Cascade)
 
   @@unique([lookupPrefix])
   @@unique([secretDigest])
@@ -431,19 +471,30 @@ model CliToken {
 }
 
 /// Minted by `wsmp login` for exactly one device and never rebound: the device
-/// is required and deleting it deletes its credentials.
+/// is required and deleting it deletes its credentials. `identityPublicKey`
+/// binds the secret to the CLI identity key that completed login. Copying
+/// the secret file does not move that bind.
 model CliDeviceCredential {
-  id           String    @id @default(cuid(2))
-  createdAt    DateTime  @default(now())
-  updatedAt    DateTime  @default(now()) @updatedAt
-  userId       String
-  cliDeviceId  String
-  lookupPrefix String
-  secretDigest String
-  lastUsedAt   DateTime?
-  revokedAt    DateTime?
-  User         User      @relation("CliDeviceCredentialOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  CliDevice    CliDevice @relation(fields: [cliDeviceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  id                String    @id @default(cuid(2))
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @default(now()) @updatedAt
+  userId            String
+  cliDeviceId       String
+  lookupPrefix      String
+  secretDigest      String
+  /// Uncompressed P-256 identity public key (unpadded base64url), captured
+  /// when this credential was minted. Hello must present the same key and
+  /// prove possession by signing a server nonce. Null only on a row minted
+  /// before the bind; those hellos are refused until `wsmp login`.
+  identityPublicKey String?
+  /// Last hello that was refused because the presented identity key did not
+  /// match this bind. Cleared by a successful hello.
+  lastRefusedAt     DateTime?
+  lastRefusedReason String?
+  lastUsedAt        DateTime?
+  revokedAt         DateTime?
+  User              User      @relation("CliDeviceCredentialOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  CliDevice         CliDevice @relation(fields: [cliDeviceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
 
   @@unique([lookupPrefix])
   @@unique([secretDigest])
@@ -471,6 +522,9 @@ model Endpoint {
   failureReasonCode   String?
   published           Boolean           @default(true)
   unpublishedAt       DateTime?
+  /// Last `endpoint.load.counterEpoch` applied for KV-eviction reset. Survives
+  /// process restart so a replica or reboot does not treat a live epoch as new.
+  loadCounterEpoch    Int?
   User                User              @relation("EndpointOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   CliDevice           CliDevice         @relation(fields: [cliDeviceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   DiscoveredModels    DiscoveredModel[]
@@ -655,15 +709,21 @@ model ProviderBudgetPolicy {
   updatedAt         DateTime             @default(now()) @updatedAt
   userId            String
   scopeType         BudgetScopeType
-  providerAccountId String
+  /// Null only for POOL_GRANT (a grant-wide cap, not an account attachment).
+  providerAccountId String?
   poolId            String?
   providerModelId   String?
+  /// Optional last-seen grant id for POOL_GRANT. No FK: revoke/re-grant must
+  /// not cascade-delete the cap. The live key is (poolId, granteeUserId).
+  poolGrantId       String?
+  /// Set only for POOL_GRANT. Survives revoke and re-grant of the same grantee.
+  granteeUserId     String?
   version           Int                  @default(1)
   active            Boolean              @default(false)
   activatedAt       DateTime?
   deactivatedAt     DateTime?
   User              User                 @relation("ProviderBudgetPolicyOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ProviderAccount   ProviderAccount      @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ProviderAccount   ProviderAccount?     @relation(fields: [providerAccountId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Pool              ModelPool?           @relation(fields: [poolId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
   ProviderModel     ProviderModel?       @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
   Rules             ProviderBudgetRule[]
@@ -671,6 +731,8 @@ model ProviderBudgetPolicy {
   @@unique([id, userId])
   @@unique([userId, scopeType, providerAccountId, poolId, providerModelId, version])
   @@index([userId, active])
+  @@index([poolGrantId])
+  @@index([poolId, granteeUserId])
   @@map("provider_budget_policy")
 }
 
@@ -1066,6 +1128,9 @@ model ModelPool {
   /// member (or, for `:external`, an
   /// external route) can take it. Redirect-only: it never blocks or queues.
   protectionEnabled               Boolean                       @default(true)
+  /// When false, protection stays on but eviction evidence stops moving
+  /// effective K. Unfreeze resumes decay and cuts from the stored state.
+  evictionFeedbackEnabled         Boolean                       @default(true)
   /// A session is protected only when used within this many seconds.
   protectionWindowSeconds         Int                           @default(300)
   /// A session is protected only when its prompt is at least this many tokens.
@@ -1086,14 +1151,10 @@ model ModelPool {
   /// each user still picks their own model. Null = no consent: clearing it
   /// withdraws BYOK for this pool.
   externalEquivalentModel         String?
-  /// Metric-driven routing rules (S-B part 2): a zod-validated array of
-  /// `{metric, labels?, aggregate, op, threshold, effect}`
-  /// (packages/api/src/lib/metric-routing.ts). `full` makes a member FULL,
-  /// `avoid` ranks it last. Stale or missing metrics are ignored.
-  routingRules                    Json                          @default("[]")
   User                            User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   TransformerDiscoveredModel      DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
   PoolMembers                     PoolMember[]
+  PoolRoutingRules                PoolRoutingRule[]
   ProviderBudgetPolicies          ProviderBudgetPolicy[]
   PoolGrants                      PoolGrant[]
   ModelApiTokenAllowlistEntries   ModelApiTokenAllowlistEntry[]
@@ -1144,6 +1205,10 @@ model CacheAffinityRecord {
   @@index([tenantUserId, poolId, prefixDigest, expiresAt])
   @@index([tenantUserId, poolId, conversationDigest, expiresAt])
   @@index([userId, poolId, expiresAt])
+  // Newest-first footprint scan for residency spreading. Prisma cannot
+  // express WHERE "prefixDigest" IS NULL; the live partial index
+  // cache_affinity_record_residency (userId, executionTargetId, expiresAt DESC, id DESC)
+  // is created in schema-hardening.sql.
   @@index([executionTargetId, expiresAt])
   // Warm-session protection (S-C): recent sessions per member KV pool.
   @@index([executionTargetId, lastUsedAt])
@@ -1225,6 +1290,7 @@ model PoolMember {
   ModelPool                    ModelPool               @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   DiscoveredModel              DiscoveredModel?        @relation(fields: [discoveredModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTarget              ExecutionTarget?        @relation(fields: [executionTargetId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  RoutingRules                 PoolRoutingRule[]
 
   @@unique([poolId, discoveredModelId])
   @@unique([poolId, executionTargetId])
@@ -1233,6 +1299,35 @@ model PoolMember {
   @@index([poolId, routingStatus, healthStatus])
   @@index([healthStatus, nextRetryAt])
   @@map("pool_member")
+}
+
+/// Metric-driven pool routing rules (S-B part 2). Graph configuration:
+/// `full` makes a member FULL, `avoid` ranks it last. `memberId` scopes the
+/// rule to that member; `exclude` applies it to every other member. Pool and
+/// member deletes cascade. Stale or missing metrics are ignored at evaluation.
+model PoolRoutingRule {
+  id        String      @id @default(cuid(2))
+  createdAt DateTime    @default(now())
+  poolId    String
+  /// 0-based order in the pool's rule list (at most 16).
+  position  Int
+  metric    String
+  labels    Json?
+  aggregate String      @default("max")
+  op        String
+  threshold Float
+  effect    String
+  /// Null = pool-wide. Set with exclude=false for one member; exclude=true
+  /// for every other member. Targeted memberId rules are deleted with the
+  /// member (trigger). Exclude rules SET NULL and become pool-wide.
+  memberId  String?
+  exclude   Boolean     @default(false)
+  ModelPool ModelPool   @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Member    PoolMember? @relation(fields: [memberId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@unique([poolId, position])
+  @@index([memberId])
+  @@map("pool_routing_rule")
 }
 
 /// Owner-scoped physical inference capacity shared by every execution target
@@ -1281,6 +1376,8 @@ model InferenceCapacity {
   engineLoadSource           EngineLoadSource?
   /// Adapter signal names that can drive FULL (`waiting`, `kvUsage`, …).
   engineLoadSignals          String[]              @default([])
+  /// Native count method the CLI probed. Null = not probed this hello.
+  engineCountContext         EngineCountContext?
   User                       User                  @relation("InferenceCapacityOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTargets           ExecutionTarget[]
 
@@ -1408,15 +1505,16 @@ model PoolMemberRoutingVerdict {
 
 /// Disposable class-H cache: no FK, no deletion drain. Readers ignore expiry;
 /// retention removes rows expired more than an hour ago, including orphans.
-/// `lastSessionId` is the session that last armed or cut; same-session misses
-/// are ignored until the row expires or fully recovers.
+/// `sessionIds` is the bounded unique-session set for this row lifetime.
 model CapacityKvEviction {
-  capacityId    String   @id
-  userId        String
-  cutFraction   Float
-  observedAt    DateTime
-  expiresAt     DateTime
-  lastSessionId String
+  capacityId        String   @id
+  userId            String
+  cutFraction       Float
+  observedAt        DateTime
+  expiresAt         DateTime
+  sessionIds        String[] @default([])
+  missCount         Int      @default(0)
+  continuationCount Int      @default(0)
 
   @@index([userId])
   @@index([expiresAt])
@@ -1548,23 +1646,27 @@ model PoolGrant {
 }
 
 model ModelApiToken {
-  id               String                        @id @default(cuid(2))
-  createdAt        DateTime                      @default(now())
-  updatedAt        DateTime                      @default(now()) @updatedAt
-  userId           String
-  name             String
-  scopeMode        ModelApiTokenScopeMode        @default(ALL_VISIBLE)
+  id                  String                        @id @default(cuid(2))
+  createdAt           DateTime                      @default(now())
+  updatedAt           DateTime                      @default(now()) @updatedAt
+  userId              String
+  name                String
+  scopeMode           ModelApiTokenScopeMode        @default(ALL_VISIBLE)
   /// Human-only consent for `owner/pool:external` requests. False (private
   /// only) by default. ALLOWLIST tokens additionally need the pool entry's
   /// includeExternal; ALL_VISIBLE tokens are all-or-nothing.
-  allowExternal    Boolean                       @default(false)
-  lookupPrefix     String
-  secretDigest     String
-  lastUsedAt       DateTime?
-  revokedAt        DateTime?
-  expiresAt        DateTime?
-  User             User                          @relation("ModelApiTokenOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  AllowlistEntries ModelApiTokenAllowlistEntry[]
+  allowExternal       Boolean                       @default(false)
+  /// Optional caller wait before going external, in milliseconds. Null uses
+  /// each pool's `externalAfterWaitMs`. Capped by the pool at request time.
+  /// Grantees cannot shorten below the pool value.
+  externalAfterWaitMs Int?
+  lookupPrefix        String
+  secretDigest        String
+  lastUsedAt          DateTime?
+  revokedAt           DateTime?
+  expiresAt           DateTime?
+  User                User                          @relation("ModelApiTokenOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  AllowlistEntries    ModelApiTokenAllowlistEntry[]
 
   @@unique([lookupPrefix])
   @@unique([secretDigest])
@@ -1902,6 +2004,35 @@ model EngineLoadRollupMinute {
   @@index([ownerUserId, bucketStart])
   @@index([capacityId, bucketStart])
   @@map("engine_load_rollup_minute")
+}
+
+/// Class-H per-minute node telemetry (no FKs). Written from accepted
+/// `node.metrics` frames. Min/avg/max gauges for CLI node-card 1h/24h/7d
+/// sparklines. Kept 7 days in the usage-retention sweep.
+model NodeMetricsMinute {
+  bucketStart              DateTime
+  ownerUserId              String
+  cliDeviceId              String
+  updatedAt                DateTime @default(now())
+  samples                  Int      @default(0)
+  cpuSamples               Int      @default(0)
+  minCpuPercent            Float?
+  sumCpuPercent            Float?
+  maxCpuPercent            Float?
+  memorySamples            Int      @default(0)
+  minMemoryAvailableMiB    Float?
+  sumMemoryAvailableMiB    Float?
+  maxMemoryAvailableMiB    Float?
+  minMemoryUsedPercent     Float?
+  sumMemoryUsedPercent     Float?
+  maxMemoryUsedPercent     Float?
+  maxGpuTemperatureC       Float?
+  maxGpuUtilizationPercent Float?
+
+  @@id([bucketStart, ownerUserId, cliDeviceId])
+  @@index([ownerUserId, bucketStart])
+  @@index([cliDeviceId, bucketStart])
+  @@map("node_metrics_minute")
 }
 
 /// Append-only, prompt-free facts for each local CLI relay attempt. A separate

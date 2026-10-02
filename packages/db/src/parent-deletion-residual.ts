@@ -107,6 +107,8 @@ export const HISTORY_DRAIN_EDGES = {
   capacity_kv_eviction: { delete: [], internal: [] },
   // Persisted engine-load minutes (24h/7d Overview). Occupancy is display-only.
   engine_load_rollup_minute: { delete: [["ownerUserId", "user"]], internal: [] },
+  // Node-card sparkline minutes (7-day retention). Display only.
+  node_metrics_minute: { delete: [["ownerUserId", "user"]], internal: [] },
 } as const satisfies Record<string, { delete: readonly DrainEdge[]; internal: readonly string[] }>;
 
 /**

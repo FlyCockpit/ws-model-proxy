@@ -13,7 +13,6 @@ import {
 import { activeMcpPersonalTokenWhere } from "@ws-model-proxy/api/lib/mcp-token-active";
 import prisma from "@ws-model-proxy/db";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
-import { relayProtocolAtLeast } from "./protocol.js";
 import { relaySessionManager } from "./session-manager.js";
 
 /**
@@ -321,7 +320,7 @@ export function judgeCliAgentAdmission(
     // Mode `supervised`: a person must confirm each command. Headless exec is refused.
     if (!allowsHeadlessCommands(grant)) return { ok: false, error: "supervised_only" };
     const live = liveFeatures(input.cliDeviceId);
-    if (!live || !relayProtocolAtLeast(live.protocolVersion, "2.6")) {
+    if (!live) {
       return { ok: false, error: "offline" };
     }
     if (live.mcpCommandMode === "off") return { ok: false, error: "feature_disabled" };
@@ -336,10 +335,7 @@ export function judgeCliAgentAdmission(
     const live = liveFeatures(input.cliDeviceId);
     const readGrant = {
       server: device.mcpFileRead === true,
-      live:
-        live?.mcpFileRead === true &&
-        relayProtocolAtLeast(live.protocolVersion, "2.8") &&
-        live.fileOps === true,
+      live: live?.mcpFileRead === true && live.fileOps === true,
       roots: live?.fileRootsConfigured === true,
     };
     const grantRefusal = fileGrantStageRefusal(grant, opClass, readGrant);
@@ -355,7 +351,7 @@ export function judgeCliAgentAdmission(
           }
         : { ok: false, error: "offline" };
     }
-    if (!relayProtocolAtLeast(live.protocolVersion, "2.8") || !live.fileOps) {
+    if (!live.fileOps) {
       return { ok: false, error: "offline" };
     }
     const liveRefusal = fileLiveStageRefusal(grant, live.mcpCommandMode, opClass, readGrant);
@@ -377,12 +373,7 @@ export function judgeCliAgentAdmission(
       rejectedProtocolVersion: device.rejectedRelayProtocolVersion,
     };
   }
-  if (
-    !live ||
-    !relayProtocolAtLeast(live.protocolVersion, options?.fileWrite ? "2.8" : "2.6") ||
-    !live.supervisedCommands ||
-    (options?.fileWrite && !live.fileOps)
-  ) {
+  if (!live || !live.supervisedCommands || (options?.fileWrite && !live.fileOps)) {
     return { ok: false, error: "offline" };
   }
   if (!permitsSupervised(live.mcpCommandMode)) {

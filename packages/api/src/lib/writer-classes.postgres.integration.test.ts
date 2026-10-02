@@ -166,6 +166,20 @@ integration("DL-1 writer classes and fences on PostgreSQL", () => {
       expect(Number(rows[0]?.count)).toBe(0);
     });
 
+    it("classifies node-metrics minutes as H history without foreign keys", async () => {
+      const m = required();
+      const residual = await import("@ws-model-proxy/db/parent-deletion-residual");
+      expect(m.order.HOT_PATH_TABLES).toContain("node_metrics_minute");
+      expect(residual.HISTORY_DRAIN_EDGES.node_metrics_minute).toEqual({
+        delete: [["ownerUserId", "user"]],
+        internal: [],
+      });
+      const rows = await strict.$queryRaw<Array<{ count: bigint }>>`
+        SELECT count(*) FROM pg_constraint WHERE contype = 'f'
+          AND (conrelid = 'node_metrics_minute'::regclass OR confrelid = 'node_metrics_minute'::regclass)`;
+      expect(Number(rows[0]?.count)).toBe(0);
+    });
+
     it("classifies KV feedback as an expiring H cache without keys or deletion drain", async () => {
       const m = required();
       const residual = await import("@ws-model-proxy/db/parent-deletion-residual");

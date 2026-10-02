@@ -100,6 +100,7 @@ function engineLoad(overrides: Record<string, unknown> = {}) {
     kvBudget: {
       reportedTokens: 100_000,
       effectiveTokens: 100_000,
+      placementTokens: 100_000,
       source: "CONFIG" as const,
       cutFraction: 0,
       floorFraction: 0.5,
@@ -242,6 +243,75 @@ describe("PoolMetricRoutingRules", () => {
     });
   });
 
+  it("saves min aggregate and a member-only scope", async () => {
+    state.view = view();
+    mount(<PoolMetricRoutingRules poolId="pool-1" />);
+    fireEvent.change(screen.getByLabelText("dashboard:pools.metricRules.aggregate"), {
+      target: { value: "min" },
+    });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.metricRules.scope"), {
+      target: { value: "only" },
+    });
+    fireEvent.change(screen.getByLabelText("dashboard:pools.metricRules.member"), {
+      target: { value: "m1" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.metricRules.save" }));
+    await waitFor(() => expect(state.mutationCalls).toHaveLength(1));
+    expect(state.mutationCalls[0]).toEqual({
+      poolId: "pool-1",
+      rules: [
+        {
+          metric: "node.gpu.temperature_c",
+          labels: { gpu: "0" },
+          aggregate: "min",
+          op: ">",
+          threshold: 85,
+          effect: "full",
+          memberId: "m1",
+        },
+      ],
+    });
+    for (const bundle of [enDashboard, esDashboard]) {
+      expect(bundle.pools.metricRules.aggregates.min.length).toBeGreaterThan(0);
+      expect(bundle.pools.metricRules.aggregates.avg.length).toBeGreaterThan(0);
+      expect(bundle.pools.metricRules.scopes.only.length).toBeGreaterThan(0);
+      expect(bundle.pools.metricRules.scopes.except.length).toBeGreaterThan(0);
+      expect(bundle.pools.metricRules.memberRequired.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("saves an exclude-member rule and refuses a scoped rule without a member", async () => {
+    state.view = view();
+    mount(<PoolMetricRoutingRules poolId="pool-1" />);
+    fireEvent.change(screen.getByLabelText("dashboard:pools.metricRules.scope"), {
+      target: { value: "except" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.metricRules.save" }));
+    await waitFor(() =>
+      expect(screen.getByText("dashboard:pools.metricRules.memberRequired")).toBeTruthy(),
+    );
+    expect(state.mutationCalls).toEqual([]);
+    fireEvent.change(screen.getByLabelText("dashboard:pools.metricRules.member"), {
+      target: { value: "m2" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.metricRules.save" }));
+    await waitFor(() => expect(state.mutationCalls).toHaveLength(1));
+    expect(state.mutationCalls[0]).toEqual({
+      poolId: "pool-1",
+      rules: [
+        {
+          metric: "node.gpu.temperature_c",
+          labels: { gpu: "0" },
+          aggregate: "max",
+          op: ">",
+          threshold: 85,
+          effect: "full",
+          excludeMemberId: "m2",
+        },
+      ],
+    });
+  });
+
   it("refuses malformed labels and thresholds without saving", async () => {
     state.view = view();
     mount(<PoolMetricRoutingRules poolId="pool-1" />);
@@ -276,6 +346,7 @@ describe("PoolEngineLoad (S-D)", () => {
           kvBudget: {
             reportedTokens: 100_000,
             effectiveTokens: 50_000,
+            placementTokens: 50_000,
             source: "CONFIG" as const,
             cutFraction: 0.5,
             floorFraction: 0.5,

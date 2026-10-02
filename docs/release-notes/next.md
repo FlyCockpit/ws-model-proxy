@@ -147,6 +147,58 @@ assignment provenance and automatic concurrency seed columns.
   against the requester for own-key and direct routes (#61). The schema deploy
   above installs it.
 
+## Per-caller `:external` wait (#181)
+
+A model-API token can store `externalAfterWaitMs` (null uses each pool's wait).
+`:external` requests may also send `x-wsmp-external-after-wait-ms`. The pool
+value is an owner floor: callers may only lengthen, up to the local capacity
+wait budget, and cannot shorten below the floor. When fallback is off, the
+caller waits the full local budget. MCP:
+`model_api_token_external_wait_update`. The column is additive and nullable
+(`APPLY_SCHEMA=safe`).
+
+## CLI identity bind and native count
+
+- **CLI devices and CLI tokens bind to the CLI identity key, not `/etc/machine-id`.**
+  Hello signs a server nonce mixed with the server origin. Every existing
+  device credential is refused until `wsmp login` is run once per machine.
+  CLI tokens TOFU-bind the identity key on first hello; the owner can reset
+  that bind from the dashboard without revoking the token. A copied
+  `service.env` cannot take over another machine. Hello reports
+  `identity_mismatch` when the bound key does not match. A 2.4 CLI against an
+  older server exits with an upgrade-the-server error. Unexpected server
+  failures send `protocol.error` `internal` and the CLI reconnects.
+- **Metric routing rules live in `pool_routing_rule`.** Databases built from
+  v0.3.1 never stored `model_pool.routingRules` JSON. Unreleased master
+  databases that did lose those rules on the schema push (`APPLY_SCHEMA=safe`
+  stops on the column drop; `dangerous` drops them). Re-enter the rules in
+  the dashboard after upgrading a master-built DB.
+- **Native Chat Completions counting is per endpoint.** The CLI probe writes
+  `engineFacts.countContext` onto the inference capacity (`engineCountContext`,
+  additive, `APPLY_SCHEMA=safe`). Near-ceiling Chat Completions skip native
+  count when the method is missing or `unsupported` (Ollama, SGLang, generic,
+  failed probes). When a method exists, the same `relay.request` carries
+  `countFirst` and `countCeiling`: the CLI tokenizes, then either forwards the
+  body once or returns structured `request_too_large`. Estimates never reject.
+- **Reconnect keeps the probed count method** when the engine kind is unchanged.
+  Tokenize counts above `1e12` are refused instead of closing the relay session.
+- **Engine-load history survives a reconnect.** Disconnect no longer wipes the
+  30-minute rings. New keys at the 2000-ring (or 64-per-device) cap are refused
+  while existing live rings stay; rings older than the window are pruned.
+- **`GET /v1/models` lists only ids this token can call now.** Plain pool and
+  direct ids need a published PRIMARY local member (or the direct model) with
+  a live CLI session. Empty, unpublished, and disconnected ids are omitted.
+  FULL or saturated pools stay listed. `owner/pool:external` stays when the
+  token has access, even if no local member is live.
+- **MCP `fields` for nested argument errors are dotted paths** (`rules.0.threshold`).
+  Guarded pool-create policy errors name the create input keys (`reservedSlots`,
+  `memberConcurrencyLimit`, `memberContextCeiling`, `advanced.contextMargin`).
+- **Callers that match `context_exceeded` must switch to `context_length_exceeded`.**
+  Grant spend caps use the pool's pricing currency (`POOL_GRANT` scope). OpenRouter
+  inventories may declare Chat Completions, Responses, and Anthropic Messages.
+- **Prefix-cache resets send `delta = current` with `prefixCacheReset`.** A dropped
+  reset frame is retried on the next scrape so post-restart counts are not lost.
+
 ## Post-deploy verification
 
 The trigger fix is covered by the PostgreSQL CI suites but has not yet been

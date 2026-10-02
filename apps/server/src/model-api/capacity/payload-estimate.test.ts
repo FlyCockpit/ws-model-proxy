@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   AUDIO_TOKENS_PER_SECOND,
   DEFAULT_AUDIO_TOKEN_ALLOWANCE,
+  DEFAULT_DOCUMENT_TOKEN_ALLOWANCE,
   DEFAULT_IMAGE_TOKEN_ALLOWANCE,
+  DOCUMENT_BYTES_PER_TOKEN,
   estimatePayloadTokens,
   IMAGE_PATCH_SIZE,
   IMAGE_TOKEN_OVERHEAD,
@@ -180,7 +182,66 @@ describe("payload media estimates", () => {
       ],
     });
     expect(estimate.mediaParts).toBe(3);
-    expect(estimate.mediaTokens).toBe(imageTokensFor(32, 16) + DEFAULT_IMAGE_TOKEN_ALLOWANCE * 2);
+    const pdfTokens = Math.ceil(pngBytes(32, 16).byteLength / DOCUMENT_BYTES_PER_TOKEN);
+    expect(pdfTokens).not.toBe(DEFAULT_IMAGE_TOKEN_ALLOWANCE);
+    expect(estimate.mediaTokens).toBe(
+      imageTokensFor(32, 16) + DEFAULT_IMAGE_TOKEN_ALLOWANCE + pdfTokens,
+    );
+  });
+
+  it("counts Anthropic text documents as text, not the image allowance", () => {
+    const text = "a".repeat(900_000);
+    const estimate = estimatePayloadTokens({
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "document",
+              source: { type: "text", media_type: "text/plain", data: text },
+            },
+          ],
+        },
+      ],
+    });
+    expect(estimate.mediaParts).toBe(0);
+    expect(estimate.tokens).toBeGreaterThan(4096);
+    expect(estimate.textTokens).toBeGreaterThan(4096);
+  });
+
+  it("sizes PDFs from bytes and keeps the image flat allowance for unread dimensions", () => {
+    const pdf = new Uint8Array(50_000).fill(37);
+    const estimate = estimatePayloadTokens({
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "document",
+              source: {
+                type: "base64",
+                media_type: "application/pdf",
+                data: Buffer.from(pdf).toString("base64"),
+              },
+            },
+            {
+              type: "image_url",
+              image_url: { url: "https://cdn.example/photo.jpg" },
+            },
+          ],
+        },
+      ],
+    });
+    expect(estimate.mediaParts).toBe(2);
+    expect(estimate.mediaTokens).toBe(
+      Math.ceil(pdf.byteLength / DOCUMENT_BYTES_PER_TOKEN) + DEFAULT_IMAGE_TOKEN_ALLOWANCE,
+    );
+    expect(estimate.mediaTokens).not.toBe(DEFAULT_IMAGE_TOKEN_ALLOWANCE * 2);
+    const urlOnly = estimatePayloadTokens({
+      input: [{ type: "input_file", file_url: "https://files.example/doc.pdf" }],
+    });
+    expect(urlOnly.mediaTokens).toBe(DEFAULT_DOCUMENT_TOKEN_ALLOWANCE);
+    expect(urlOnly.mediaTokens).not.toBe(DEFAULT_IMAGE_TOKEN_ALLOWANCE);
   });
 
   it("reads Responses input_image and input_file shapes", () => {
@@ -198,7 +259,9 @@ describe("payload media estimates", () => {
       ],
     });
     expect(estimate.mediaParts).toBe(3);
-    expect(estimate.mediaTokens).toBe(imageTokensFor(48, 48) * 2 + DEFAULT_IMAGE_TOKEN_ALLOWANCE);
+    expect(estimate.mediaTokens).toBe(
+      imageTokensFor(48, 48) * 2 + DEFAULT_DOCUMENT_TOKEN_ALLOWANCE,
+    );
   });
 
   it("counts WAV duration and falls back for unknown audio", () => {

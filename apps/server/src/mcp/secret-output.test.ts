@@ -136,6 +136,7 @@ const NON_SECRET_COLUMNS: Readonly<Record<string, string>> = {
   tokenEndpointAuthMethod: "OAuth client metadata (auth method name).",
   signingKeyId: "Key identifier, not key material.",
   publicKey: "Public half of a JWKS key pair.",
+  identityPublicKey: "Public half of the CLI identity key pair.",
   inventoryDigest: "Digest of a CLI's published model inventory.",
   payloadHash: "Digest of an accounting payload for idempotency.",
   bindingDigest: "Cache-affinity routing digest of request content structure.",

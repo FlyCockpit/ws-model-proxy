@@ -12,11 +12,11 @@ import { Hono } from "hono";
 import { WSContext } from "hono/ws";
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { generateTestHelloIdentity } from "./hello-identity.js";
 import {
   encodeRelayBinaryFrame,
   parseRelayBinaryFrame,
   RELAY_MIN_PROTOCOL_VERSION,
-  RELAY_REQUEST_BODY_WINDOW_CHUNKS,
 } from "./protocol.js";
 
 const limiterState = vi.hoisted(() => ({ fail: false }));
@@ -104,6 +104,7 @@ const identity: CliWebsocketIdentity = {
   lookupPrefix: "wsmp_cli_lookup",
 };
 const now = new Date("2026-01-01T00:00:00.000Z");
+const testIdentity = generateTestHelloIdentity();
 
 class FakeSocket {
   readyState = 1;
@@ -153,7 +154,18 @@ type CliFeatures = {
 type CliKind = "current" | "identified" | "below-minimum";
 const BELOW_MINIMUM_PROTOCOL = "2.1";
 
-function hello(slug: string, kind: CliKind, features?: CliFeatures) {
+function challengeNonce(socket: FakeSocket): string {
+  for (const send of socket.sends) {
+    if (typeof send !== "string") continue;
+    const parsed = JSON.parse(send) as { type?: string; nonce?: string };
+    if (parsed.type === "hello.challenge" && typeof parsed.nonce === "string") {
+      return parsed.nonce;
+    }
+  }
+  throw new Error("expected hello.challenge");
+}
+
+function hello(socket: FakeSocket, slug: string, kind: CliKind, features?: CliFeatures) {
   if (kind === "below-minimum") {
     return JSON.stringify({
       type: "hello",
@@ -164,21 +176,14 @@ function hello(slug: string, kind: CliKind, features?: CliFeatures) {
         hostname: `${slug}.local`,
         capabilities: {
           protocolVersion: BELOW_MINIMUM_PROTOCOL,
-          inventoryAck: true,
-          inventoryReplace: true,
-          endpointTargeting: true,
-          binaryFrames: true,
-          cancellation: true,
-          maxBinaryChunkBytes: 1024 * 1024,
-          requestBodyStreaming: true,
-          requestBodyWindowChunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
         },
       },
       endpoints: [],
     });
   }
   // Every accepted CLI speaks the minimum protocol; `kind` only picks whether it
-  // carries an identity proof.
+  // carries an identity proof. Bind key is always required; terminalIdentity is
+  // the extra ECDH proof browsers pin.
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
@@ -186,37 +191,34 @@ function hello(slug: string, kind: CliKind, features?: CliFeatures) {
     cli: {
       slug,
       hostname: `${slug}.local`,
+      identityPublicKey: testIdentity.publicKey,
+      identitySignature: testIdentity.sign(
+        challengeNonce(socket),
+        slug,
+        "https://proxy.example.com",
+      ),
       version: "9.9.9",
       capabilities: {
-        protocolVersion: RELAY_MIN_PROTOCOL_VERSION,
-        inventoryAck: true,
-        inventoryReplace: true,
-        endpointTargeting: true,
-        binaryFrames: true,
-        cancellation: true,
-        maxBinaryChunkBytes: 1024 * 1024,
-        requestBodyStreaming: true,
-        requestBodyWindowChunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
-        sharedTokenizerTps: true,
-        standardizedMetrics: true,
-        terminal: true,
-        exec: true,
         features: {
           humanTerminal: features?.humanTerminal ?? true,
           mcpCommandMode: features?.mcpCommandMode ?? "off",
           terminalApproval: features?.terminalApproval ?? false,
           terminalSupported: features?.terminalSupported ?? true,
           remoteMetricSources: false,
+          remoteEngineAdapters: false,
           mcpFileRead: false,
           fileRootsConfigured: false,
           allowFileToolsAsRoot: false,
         },
         terminalPublicKey: uncompressedKey(),
-        terminalViewers: true,
-        supervisedCommands: true,
-        nodeTelemetry: true,
-        fileOps: true,
-        ...(kind === "identified" ? { terminalIdentity: cliIdentity() } : {}),
+        ...(kind === "identified"
+          ? {
+              terminalIdentity: {
+                publicKey: testIdentity.publicKey,
+                signature: cliIdentity().signature,
+              },
+            }
+          : {}),
       },
     },
     endpoints: [],
@@ -267,7 +269,7 @@ function middlewareApp() {
 async function connectCli(slug: string, kind: CliKind = "current", features?: CliFeatures) {
   const socket = new FakeSocket();
   relaySessionManager.acceptAuthenticatedSocket({ socket, identity, now });
-  await relaySessionManager.handleTextFrame(socket, hello(slug, kind, features), now);
+  await relaySessionManager.handleTextFrame(socket, hello(socket, slug, kind, features), now);
   return socket;
 }
 
@@ -433,6 +435,7 @@ describe("terminal browser hub", () => {
       revokedAt: null,
       expiresAt: null,
       cliDeviceId: null,
+      identityPublicKey: null,
     });
     db.cliToken.updateMany.mockResolvedValue({ count: 1 });
     db.user.findUnique.mockResolvedValue({ slug: "owner" });
@@ -1869,7 +1872,7 @@ describe("terminal browser hub", () => {
           terminalViewers: true,
           slug: "one",
           publicKey: uncompressedKey(),
-          identityPublicKey: cliIdentity().publicKey,
+          identityPublicKey: testIdentity.publicKey,
           identitySignature: cliIdentity().signature,
         }),
       ]);

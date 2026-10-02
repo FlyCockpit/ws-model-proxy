@@ -101,22 +101,76 @@ describe("engine-load history ring", () => {
     expect(series.every((point) => point.gap)).toBe(true);
   });
 
-  it("caps keys per device and per process", () => {
+  it("refuses new live keys at the cap and only evicts rings older than the window", () => {
     const store = new EngineLoadHistoryStore();
     for (let i = 0; i < ENGINE_LOAD_HISTORY_MAX_KEYS_PER_DEVICE; i += 1) {
-      expect(store.record("d1", `ep-${i}`, null, sample())).toBe(true);
+      expect(store.record("d1", `ep-${i}`, null, sample({ receivedAt: T0 }))).toBe(true);
     }
-    expect(store.record("d1", "overflow", null, sample())).toBe(false);
+    expect(
+      store.record("d1", "overflow", null, sample({ receivedAt: new Date(T0.getTime() + 90_000) })),
+    ).toBe(false);
     expect(store.deviceKeyCount("d1")).toBe(ENGINE_LOAD_HISTORY_MAX_KEYS_PER_DEVICE);
-    expect(store.record("d1", "ep-0", null, sample({ running: 9 }))).toBe(true);
-    expect(store.record("d1", "ep-0", "model", sample())).toBe(false);
+    expect(store.series("d1", "ep-0", null, T0).at(-1)).toMatchObject({ running: 1, gap: false });
+    expect(
+      store.record(
+        "d1",
+        "ep-1",
+        null,
+        sample({ running: 9, receivedAt: new Date(T0.getTime() + 90_000) }),
+      ),
+    ).toBe(true);
+
+    const stale = new Date(
+      T0.getTime() + ENGINE_LOAD_HISTORY_WINDOW_MS + ENGINE_LOAD_HISTORY_BUCKET_MS,
+    );
+    const aged = new EngineLoadHistoryStore();
+    for (let i = 0; i < ENGINE_LOAD_HISTORY_MAX_KEYS_PER_DEVICE; i += 1) {
+      expect(aged.record("d1", `ep-${i}`, null, sample({ receivedAt: T0 }))).toBe(true);
+    }
+    expect(aged.record("d1", "fresh", null, sample({ receivedAt: stale }))).toBe(true);
+    expect(aged.deviceKeyCount("d1")).toBe(1);
+    expect(aged.series("d1", "fresh", null, stale).at(-1)).toMatchObject({
+      running: 1,
+      gap: false,
+    });
 
     const other = new EngineLoadHistoryStore();
     for (let i = 0; i < ENGINE_LOAD_HISTORY_MAX_KEYS; i += 1) {
-      expect(other.record(`d-${i}`, "gpu", null, sample())).toBe(true);
+      expect(other.record(`d-${i}`, "gpu", null, sample({ receivedAt: T0 }))).toBe(true);
     }
-    expect(other.record("d-overflow", "gpu", null, sample())).toBe(false);
+    expect(
+      other.record(
+        "d-overflow",
+        "gpu",
+        null,
+        sample({ receivedAt: new Date(T0.getTime() + 90_000) }),
+      ),
+    ).toBe(false);
     expect(other.size).toBe(ENGINE_LOAD_HISTORY_MAX_KEYS);
+    expect(other.series("d-0", "gpu", null, T0).at(-1)).toMatchObject({ running: 1, gap: false });
+  });
+
+  it("drops a device's keys", () => {
+    const store = new EngineLoadHistoryStore();
+    store.record("d1", "gpu", null, sample({ running: 4 }));
+    store.record("d2", "gpu", null, sample({ running: 5 }));
+    store.dropDevice("d1");
+    expect(store.deviceKeyCount("d1")).toBe(0);
+    expect(store.series("d1", "gpu", null, T0).every((point) => point.gap)).toBe(true);
+    expect(store.series("d2", "gpu", null, T0).at(-1)).toMatchObject({ running: 5, gap: false });
+  });
+
+  it("falls back to the endpoint-wide ring when the sample slug is null", () => {
+    const store = new EngineLoadHistoryStore();
+    store.record("d1", "gpu", null, sample({ running: 7, kvUsage: 0.3 }));
+    const forModel = store.series("d1", "gpu", "qwen", T0);
+    expect(forModel.at(-1)).toMatchObject({ running: 7, kvUsage: 0.3, gap: false });
+    const endpointWide = store.series("d1", "gpu", null, T0);
+    expect(endpointWide.at(-1)).toMatchObject({ running: 7, gap: false });
+    store.record("d1", "gpu", "qwen", sample({ running: 2, receivedAt: T0 }));
+    const modelSpecific = store.series("d1", "gpu", "qwen", T0);
+    expect(modelSpecific.at(-1)).toMatchObject({ running: 2, gap: false });
+    expect(store.series("d1", "other", "qwen", T0).every((point) => point.gap)).toBe(true);
   });
 
   it("keeps history across a reconnect of the same manager store", () => {

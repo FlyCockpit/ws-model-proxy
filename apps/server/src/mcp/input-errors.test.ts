@@ -13,11 +13,14 @@ vi.mock("@ws-model-proxy/env/shared", () => ({
 }));
 
 const {
+  fieldsFromValidationIssues,
   formatValidationIssues,
   MAX_ISSUES,
   MAX_MESSAGE_LENGTH,
   MAX_PATH_SEGMENTS,
   collectSchemaPropertyNames,
+  sanitizeArgumentMessage,
+  sanitizeDeclaredFields,
   sanitizeValidationIssues,
 } = await import("./input-errors");
 
@@ -143,6 +146,16 @@ describe("sanitizeValidationIssues", () => {
     ],
   ])("never echoes a secret carried in: %s", (_label, issue) => {
     const issues = sanitize([issue]);
+    // #200 names an identifier-shaped unrecognized key. The zod message that
+    // quotes it stays the fixed text, and every other channel stays silent.
+    if ("code" in issue && issue.code === "unrecognized_keys") {
+      expect(issues?.[0]?.message).toBe("Unrecognized field");
+      expect(issues?.[0]?.message).not.toContain(PLAIN_SECRET);
+      expect(issues?.[0]?.unknownKeyCount).toBe(1);
+      expect(issues?.[0]?.suggestions).toBeUndefined();
+      expect(JSON.stringify(issues)).not.toContain(PLAIN_SECRET);
+      return;
+    }
     expect(JSON.stringify(issues)).not.toContain(PLAIN_SECRET);
   });
 
@@ -205,6 +218,113 @@ describe("sanitizeValidationIssues", () => {
       { path: ["x"], code: "unrecognized_keys", message: "Unrecognized field" },
       { path: [], code: "custom", message: "Invalid value" },
     ]);
+  });
+
+  it("does not echo unrecognized keys and suggests the nearest declared names", () => {
+    const issues = sanitize(
+      [
+        {
+          code: "unrecognized_keys",
+          path: [],
+          keys: ["capacityConcurrencyLimit", "not a key", SECRET, "k".repeat(65), 3],
+          message: `Unrecognized key: "${PLAIN_SECRET}"`,
+        },
+      ],
+      new Set(),
+    );
+    expect(issues).toEqual([
+      {
+        path: [],
+        code: "unrecognized_keys",
+        message: "Unrecognized field",
+        unknownKeyCount: 5,
+      },
+    ]);
+    expect(JSON.stringify(issues)).not.toContain(PLAIN_SECRET);
+    expect(JSON.stringify(issues)).not.toContain("SUPERSECRETVALUE");
+    expect(JSON.stringify(issues)).not.toContain("capacityConcurrencyLimit");
+    expect(fieldsFromValidationIssues(issues ?? [])).toEqual([]);
+
+    const suggested = sanitize(
+      [
+        {
+          code: "unrecognized_keys",
+          path: [],
+          keys: ["poolid", "fallbackEnabledX"],
+          message: 'Unrecognized key: "poolid"',
+        },
+      ],
+      new Set(["poolId", "fallbackEnabled", "weight"]),
+    );
+    expect(suggested).toEqual([
+      {
+        path: [],
+        code: "unrecognized_keys",
+        message: "Unrecognized field",
+        unknownKeyCount: 2,
+        suggestions: ["fallbackEnabled", "poolId"],
+      },
+    ]);
+    expect(fieldsFromValidationIssues(suggested ?? [])).toEqual(["fallbackEnabled", "poolId"]);
+  });
+
+  it("bounds unrecognized-key suggestion work", () => {
+    const known = new Set(Array.from({ length: 400 }, (_, index) => `field_${index}`));
+    const keys = Array.from({ length: 400 }, (_, index) => `zield_${index}`);
+    const started = Date.now();
+    const issues = sanitizeValidationIssues(
+      { issues: [{ code: "unrecognized_keys", path: [], keys, message: "Unrecognized keys" }] },
+      known,
+    );
+    expect(Date.now() - started).toBeLessThan(250);
+    expect(issues?.[0]?.unknownKeyCount).toBe(20);
+    expect((issues?.[0]?.suggestions ?? []).length).toBeLessThanOrEqual(5);
+  });
+
+  it("names nested issues as dotted paths", () => {
+    const issues = sanitize(
+      [
+        {
+          code: "too_small",
+          path: ["rules", 0, "threshold"],
+          message: "Number must be greater than 0",
+        },
+      ],
+      new Set(["rules", "threshold", "poolId"]),
+    );
+    expect(issues?.[0]?.path).toEqual(["rules", 0, "threshold"]);
+    expect(fieldsFromValidationIssues(issues ?? [])).toEqual(["rules.0.threshold"]);
+  });
+
+  it("keeps only declared data.fields and a static message", () => {
+    expect(
+      sanitizeDeclaredFields(
+        { fields: ["capacityConcurrencyLimit", "notAField", "pool id", 1] },
+        new Set(["capacityConcurrencyLimit", "poolId"]),
+      ),
+    ).toEqual(["capacityConcurrencyLimit"]);
+    expect(sanitizeDeclaredFields(Object.create({ fields: ["poolId"] }), KNOWN)).toBeNull();
+    expect(
+      sanitizeDeclaredFields(
+        {
+          fields: [
+            "advanced.contextMargin",
+            "memberContextCeiling",
+            "rules.0.threshold",
+            "not.a.field",
+            "0.leading",
+            "advanced.",
+            "pool id",
+          ],
+        },
+        new Set(["advanced", "contextMargin", "memberContextCeiling", "rules", "threshold"]),
+      ),
+    ).toEqual(["advanced.contextMargin", "memberContextCeiling", "rules.0.threshold"]);
+    expect(
+      sanitizeArgumentMessage("  Effective concurrency limit exceeds physical capacity.  "),
+    ).toBe("Effective concurrency limit exceeds physical capacity.");
+    expect(sanitizeArgumentMessage(SECRET)).toBe("[redacted]");
+    expect(sanitizeArgumentMessage("line\nbreak")).toBeNull();
   });
 
   it("maps an unknown code to 'invalid' with a fixed message", () => {
@@ -283,7 +403,16 @@ describe("sanitizeValidationIssues", () => {
         { path: ["poolId"], code: "invalid_type", message: "Required" },
         { path: [], code: "custom", message: "Invalid value" },
         { path: ["a", 0, "b"], code: "too_small", message: "Too small" },
+        {
+          path: [],
+          code: "unrecognized_keys",
+          message: "Unrecognized field",
+          unknownKeyCount: 1,
+          suggestions: ["capacityConcurrencyLimit"],
+        },
       ]),
-    ).toBe("poolId: Required; (input): Invalid value; a.0.b: Too small");
+    ).toBe(
+      "poolId: Required; (input): Invalid value; a.0.b: Too small; (input): Unrecognized field (1); try capacityConcurrencyLimit",
+    );
   });
 });

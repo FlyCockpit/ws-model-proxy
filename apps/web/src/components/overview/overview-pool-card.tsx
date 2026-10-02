@@ -304,22 +304,39 @@ export function OverviewPoolCard({
             </tbody>
           </table>
         </WideContent>
-        {range !== "1h" && pool.engineLoad?.series.some((point) => !point.gap) ? (
-          <div className="mt-4 min-w-0" data-testid="overview-engine-load">
-            <EngineLoadSparkline
-              series={pool.engineLoad.series}
-              threshold={pool.engineLoad.effectiveKvFullThreshold}
-              caption={t("overview.pools.engineLoadCaption", { name: pool.name })}
-              labels={{
-                running: t("overview.pools.legendRunning"),
-                waiting: t("overview.pools.legendWaiting"),
-                kvUsage: t("overview.pools.legendKv"),
-                kvOccupancy: t("overview.pools.legendOccupancy"),
-                threshold: t("overview.pools.legendThreshold"),
-              }}
-            />
-          </div>
-        ) : null}
+        {range !== "1h"
+          ? pool.engineLoad?.members
+              .filter((member) => member.series.some((point) => !point.gap))
+              .map((member) => {
+                const row = pool.members.find(
+                  (candidate) => candidate.poolMemberId === member.poolMemberId,
+                );
+                const label = row ? memberLabel(row, t).primary : member.poolMemberId;
+                return (
+                  <div
+                    key={member.poolMemberId}
+                    className="mt-4 min-w-0"
+                    data-testid="overview-engine-load"
+                  >
+                    <EngineLoadSparkline
+                      series={member.series}
+                      threshold={member.kvFullThreshold}
+                      caption={t("overview.pools.engineLoadCaption", {
+                        name: pool.name,
+                        member: label,
+                      })}
+                      labels={{
+                        running: t("overview.pools.legendRunning"),
+                        waiting: t("overview.pools.legendWaiting"),
+                        kvUsage: t("overview.pools.legendKv"),
+                        kvOccupancy: t("overview.pools.legendOccupancy"),
+                        threshold: t("overview.pools.legendThreshold"),
+                      }}
+                    />
+                  </div>
+                );
+              })
+          : null}
       </div>
     </section>
   );

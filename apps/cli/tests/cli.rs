@@ -603,6 +603,7 @@ fn login_writes_device_credential_to_state_dir() {
     assert!(!pending_request.contains(r#""name""#));
     let success_request = server.requests.recv().unwrap();
     assert!(success_request.contains(r#""cliSlug":"desk-01""#));
+    assert!(success_request.contains(r#""identityPublicKey":"#));
 
     let credential_path = state.join("device-auth.json");
     let credential_text = fs::read_to_string(&credential_path).unwrap();
@@ -803,7 +804,7 @@ fn endpoints_adapter_set_show_clear_round_trip_json() {
         "set",
         "local",
         "--route",
-        "stats",
+        "/stats",
         "--format",
         "json",
         "--interval",
@@ -814,12 +815,12 @@ fn endpoints_adapter_set_show_clear_round_trip_json() {
     let value = json_stdout(set);
     assert_eq!(value["engineAdapter"]["format"], "json");
     assert_eq!(value["engineAdapter"]["intervalSecs"], 3);
-    assert_eq!(value["engineAdapter"]["input"]["route"], "stats");
+    assert_eq!(value["engineAdapter"]["input"]["route"], "/stats");
 
     let mut show = cli(&config, &state);
     show.args(["endpoints", "--json", "adapter", "show", "local"]);
     let shown = json_stdout(show);
-    assert_eq!(shown["input"]["route"], "stats");
+    assert_eq!(shown["input"]["route"], "/stats");
     assert_eq!(shown["format"], "json");
 
     cli(&config, &state)
@@ -1406,6 +1407,7 @@ fn help_lists_ready_commands() {
         .stdout(predicate::str::contains("service"))
         .stdout(predicate::str::contains("reload"))
         .stdout(predicate::str::contains("metrics"))
+        .stdout(predicate::str::contains("recover"))
         .stdout(predicate::str::contains("logout"));
 }
 
@@ -1724,6 +1726,10 @@ mod signal_shutdown {
                 stream
                     .write_all(response.as_bytes())
                     .expect("write handshake");
+                write_text(
+                    &mut stream,
+                    r#"{"type":"hello.challenge","nonce":"AAECAwQFBgcICQoLDA0ODw","origin":"http://127.0.0.1"}"#,
+                );
                 let _ = socket_tx.send(stream.try_clone().expect("clone relay socket"));
                 while let Some((opcode, payload)) = read_frame(&mut stream) {
                     let seen = match opcode {
@@ -2018,7 +2024,7 @@ mod signal_shutdown {
             &json!({
                 "type": "hello.ok",
                 "id": hello["id"],
-                "protocolVersion": "2.7",
+                "protocolVersion": "2.4",
                 "revision": {
                     "inventorySeq": 1,
                     "inventoryDigest": "d",

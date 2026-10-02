@@ -4,6 +4,9 @@ export const CALIBRATION_WINDOW = 200;
 export const CALIBRATION_MIN_SAMPLES = 20;
 export const CALIBRATION_CLAMP_MIN = 0.3;
 export const CALIBRATION_CLAMP_MAX = 1.5;
+/** Stored-ratio band. Outside it the sample is dropped, not clamped into the window. */
+export const CALIBRATION_RATIO_MIN = 0.1;
+export const CALIBRATION_RATIO_MAX = 2;
 
 export type CalibrationIdentity = {
   runtimeIdentityKey?: string | null;
@@ -28,10 +31,12 @@ function quantile(sorted: number[], q: number): number {
 function scaledTokens(
   capacityId: string,
   identity: CalibrationIdentity,
-  rawTokens: number,
+  textTokens: number,
+  mediaTokens: number,
   q: number,
 ): number | null {
-  if (!capacityId || !Number.isFinite(rawTokens) || rawTokens < 0) return null;
+  if (!capacityId || !Number.isFinite(textTokens) || textTokens < 0) return null;
+  if (!Number.isFinite(mediaTokens) || mediaTokens < 0) return null;
   const slot = slots.get(capacityId);
   if (
     !slot ||
@@ -43,10 +48,10 @@ function scaledTokens(
     [...slot.ratios].sort((left, right) => left - right),
     q,
   );
-  const unclamped = Math.ceil(rawTokens * factor);
-  const lo = Math.ceil(rawTokens * CALIBRATION_CLAMP_MIN);
-  const hi = Math.ceil(rawTokens * CALIBRATION_CLAMP_MAX);
-  return Math.min(hi, Math.max(lo, unclamped));
+  const unclamped = Math.ceil(textTokens * factor);
+  const lo = Math.ceil(textTokens * CALIBRATION_CLAMP_MIN);
+  const hi = Math.ceil(textTokens * CALIBRATION_CLAMP_MAX);
+  return Math.min(hi, Math.max(lo, unclamped)) + mediaTokens;
 }
 
 export function resetContextCalibrationForTests(): void {
@@ -71,6 +76,7 @@ export function observeContextCalibration({
   if (!Number.isFinite(promptTokens) || promptTokens < 0) return;
   const ratio = promptTokens / textEstimate;
   if (!Number.isFinite(ratio) || ratio <= 0) return;
+  if (ratio < CALIBRATION_RATIO_MIN || ratio > CALIBRATION_RATIO_MAX) return;
   const key = identityKey(identity);
   let slot = slots.get(capacityId);
   if (!slot || slot.identity !== key) {
@@ -81,20 +87,24 @@ export function observeContextCalibration({
   if (slot.ratios.length > CALIBRATION_WINDOW) slot.ratios.shift();
 }
 
-/** 95th-percentile scale for context-limit checks. Null until warm. */
+/** 95th-percentile scale for context-limit checks. Null until warm.
+ * Factor applies to text only; media tokens are added unchanged. */
 export function calibratedContextTokens(
   capacityId: string,
   identity: CalibrationIdentity,
-  rawTokens: number,
+  textTokens: number,
+  mediaTokens = 0,
 ): number | null {
-  return scaledTokens(capacityId, identity, rawTokens, 0.95);
+  return scaledTokens(capacityId, identity, textTokens, mediaTokens, 0.95);
 }
 
-/** Median scale for warm footprints when the engine did not report tokens. */
+/** Median scale for warm footprints when the engine did not report tokens.
+ * Factor applies to text only; media tokens are added unchanged. */
 export function calibratedFootprintTokens(
   capacityId: string,
   identity: CalibrationIdentity,
-  rawTokens: number,
+  textTokens: number,
+  mediaTokens = 0,
 ): number | null {
-  return scaledTokens(capacityId, identity, rawTokens, 0.5);
+  return scaledTokens(capacityId, identity, textTokens, mediaTokens, 0.5);
 }

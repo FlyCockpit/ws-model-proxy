@@ -21,6 +21,24 @@ export type EngineKind = "GENERIC" | "LLAMA_CPP" | "VLLM" | "SGLANG" | "OLLAMA" 
 export type EngineFactsSource = "PROBE" | "CONFIG" | "MIXED" | "CUSTOM";
 /** Prisma `EngineFactSource` values (per-fact provenance). */
 export type EngineFactSource = "PROBE" | "CONFIG" | "CUSTOM";
+/** Prisma `EngineCountContext` values. */
+export type EngineCountContext =
+  | "UNSUPPORTED"
+  | "VLLM_TOKENIZE"
+  | "TGI_CHAT_TOKENIZE"
+  | "LLAMA_APPLY_TEMPLATE"
+  | "LLAMA_INPUT_TOKENS"
+  | "ADAPTER_COUNT";
+
+export const ENGINE_COUNT_CONTEXT_NAMES = [
+  "unsupported",
+  "vllm_tokenize",
+  "tgi_chat_tokenize",
+  "llama_apply_template",
+  "llama_input_tokens",
+  "adapter_count",
+] as const;
+export type EngineCountContextName = (typeof ENGINE_COUNT_CONTEXT_NAMES)[number];
 
 type WireFact<T> = { value: T; source: "probe" | "config" | "custom" };
 
@@ -37,6 +55,7 @@ export type WireEngineFacts = {
     value: { input: "route" | "command"; signals: string[] };
     source: "config";
   };
+  countContext?: WireFact<EngineCountContextName>;
 };
 
 /** Prisma `EngineLoadSource` values. */
@@ -54,6 +73,7 @@ export type StoredEngineFacts = {
   engineFactsSource: EngineFactsSource;
   engineLoadSource: EngineLoadSource | null;
   engineLoadSignals: string[];
+  engineCountContext: EngineCountContext | null;
 };
 
 const INT_COLUMN_MAX = 2 ** 31 - 1;
@@ -67,8 +87,28 @@ const KIND_TO_DB: Record<EngineKindName, EngineKind> = {
   "lm-studio": "LM_STUDIO",
 };
 
+const COUNT_CONTEXT_TO_DB: Record<EngineCountContextName, EngineCountContext> = {
+  unsupported: "UNSUPPORTED",
+  vllm_tokenize: "VLLM_TOKENIZE",
+  tgi_chat_tokenize: "TGI_CHAT_TOKENIZE",
+  llama_apply_template: "LLAMA_APPLY_TEMPLATE",
+  llama_input_tokens: "LLAMA_INPUT_TOKENS",
+  adapter_count: "ADAPTER_COUNT",
+};
+
 export function engineKindToDb(kind: EngineKindName): EngineKind {
   return KIND_TO_DB[kind];
+}
+
+export function engineCountContextToDb(method: EngineCountContextName): EngineCountContext {
+  return COUNT_CONTEXT_TO_DB[method];
+}
+
+/** True when the stored fact is a tokenize method the CLI can run. */
+export function engineCountContextSupportsNative(
+  method: EngineCountContext | null | undefined,
+): boolean {
+  return method != null && method !== "UNSUPPORTED";
 }
 
 /**
@@ -129,9 +169,12 @@ export function storedEngineFacts(facts: WireEngineFacts | undefined): StoredEng
     kvBudgetTokensSource: kv.source,
     maxModelLen: maxModelLen.value,
     maxModelLenSource: maxModelLen.source,
+    engineCountContext: facts.countContext
+      ? engineCountContextToDb(facts.countContext.value)
+      : null,
   };
   const sources = new Set(
-    [facts.engine, facts.slots, facts.kvTokens, facts.maxModelLen]
+    [facts.engine, facts.slots, facts.kvTokens, facts.maxModelLen, facts.countContext]
       .filter((fact) => fact !== undefined)
       .map((fact) => fact.source),
   );
@@ -168,7 +211,8 @@ export function sameStoredEngineFacts(left: StoredEngineFacts, right: StoredEngi
     left.engineFactsSource === right.engineFactsSource &&
     left.engineLoadSource === right.engineLoadSource &&
     left.engineLoadSignals.length === right.engineLoadSignals.length &&
-    left.engineLoadSignals.every((signal, index) => signal === right.engineLoadSignals[index])
+    left.engineLoadSignals.every((signal, index) => signal === right.engineLoadSignals[index]) &&
+    left.engineCountContext === right.engineCountContext
   );
 }
 

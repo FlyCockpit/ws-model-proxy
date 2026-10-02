@@ -53,11 +53,13 @@ const PLAN_READ_TOOLS: readonly string[] = [
   "app_config_get",
   "forwarder_guarded_candidates_list",
   "forwarder_cli_devices_list",
+  "forwarder_cli_device_get",
   "forwarder_cli_activity_list",
   "forwarder_device_metrics_get",
   "forwarder_pool_routing_rules_get",
   "forwarder_engine_load_history_get",
   "forwarder_model_pools_list",
+  "forwarder_model_pool_get",
   "forwarder_pool_fallback_get",
   "forwarder_affinity_stats_get",
   "forwarder_pool_cache_stats_get",
@@ -139,6 +141,7 @@ const PLAN_WRITE_TOOLS: readonly string[] = [
   "capacity_direct_policy_update",
   "capacity_pool_policy_update",
   "capacity_member_policy_update",
+  "model_api_token_external_wait_update",
   "model_api_token_revoke",
   "cli_token_revoke",
   "forwarder_pool_member_test",
@@ -193,7 +196,8 @@ const PLAN_CONFIRMATIONS: Readonly<Record<string, "DELETE" | "RUN" | null>> = Ob
 const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   app_config_get: "appConfig",
   forwarder_guarded_candidates_list: "forwarderManagement.listGuardedOverflowCandidates",
-  forwarder_cli_devices_list: "forwarderManagement.listCliDevices",
+  forwarder_cli_devices_list: "forwarderManagement.listCliDeviceSummaries",
+  forwarder_cli_device_get: "forwarderManagement.getCliDevice",
   forwarder_cli_activity_list: "cliAgentActivity.list",
   forwarder_device_metrics_get: "forwarderManagement.getCliDeviceMetrics",
   forwarder_pool_routing_rules_get: "forwarderManagement.getPoolRoutingRules",
@@ -203,7 +207,8 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   forwarder_device_metric_sources_set: "forwarderManagement.setCliDeviceMetricSources",
   forwarder_device_engine_adapters_set: "forwarderManagement.setCliDeviceEngineAdapters",
   forwarder_device_engine_adapters_clear: "forwarderManagement.clearCliDeviceEngineAdapters",
-  forwarder_model_pools_list: "forwarderManagement.listModelPools",
+  forwarder_model_pools_list: "forwarderManagement.listModelPoolSummaries",
+  forwarder_model_pool_get: "forwarderManagement.getModelPool",
   forwarder_pool_fallback_get: "poolFallback.get",
   forwarder_affinity_stats_get: "forwarderManagement.cacheAffinityStats",
   forwarder_pool_cache_stats_get: "forwarderManagement.poolCacheStats",
@@ -273,6 +278,7 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   capacity_direct_policy_update: "capacityManagement.updateDirectPolicy",
   capacity_pool_policy_update: "capacityManagement.updatePoolPolicy",
   capacity_member_policy_update: "capacityManagement.updateMemberPolicy",
+  model_api_token_external_wait_update: "modelApiTokens.updateExternalWait",
   model_api_token_revoke: "modelApiTokens.revoke",
   cli_token_revoke: "cliCredentials.revokeToken",
   forwarder_pool_member_test: "core:model-api/runPoolMemberTest",
@@ -328,6 +334,7 @@ describe("MCP tool manifest — exact catalog", () => {
     const kvBudget = {
       reportedTokens: 100_000,
       effectiveTokens: 50_000,
+      placementTokens: 50_000,
       source: "CONFIG",
       cutFraction: 0.5,
       floorFraction: 0.5,
@@ -346,8 +353,9 @@ describe("MCP tool manifest — exact catalog", () => {
     });
     const mcpDoc = readFileSync(new URL("../../../../docs/mcp.md", import.meta.url), "utf8");
     expect(mcpDoc).toContain("effectiveTokens");
+    expect(mcpDoc).toContain("placementTokens");
     expect(mcpDoc).toContain("floorFraction");
-    expect(mcpDoc).toContain("`source` (`PROBE` / `CONFIG` / `CUSTOM`)");
+    expect(mcpDoc).toContain("`source` (`PROBE` / `CONFIG` / `CUSTOM`");
   });
 
   it("all command catalog entries disclose CLI masking and its limits", () => {
@@ -388,13 +396,13 @@ describe("MCP tool manifest — exact catalog", () => {
     }
   });
 
-  it("contains exactly 35 read + 62 write names (no extras, no missing, no duplicates)", () => {
+  it("contains exactly 37 read + 63 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);
     expect([...names].sort()).toEqual([...PLAN_READ_TOOLS, ...PLAN_WRITE_TOOLS].sort());
-    expect(PLAN_READ_TOOLS).toHaveLength(35);
-    expect(PLAN_WRITE_TOOLS).toHaveLength(62);
-    expect(MCP_TOOL_MANIFEST).toHaveLength(97);
+    expect(PLAN_READ_TOOLS).toHaveLength(37);
+    expect(PLAN_WRITE_TOOLS).toHaveLength(63);
+    expect(MCP_TOOL_MANIFEST).toHaveLength(100);
   });
 
   it("the CLI device list explains effectiveMode and which switch limits it", () => {
@@ -504,6 +512,8 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
       "mcpTokens.updateMine",
       "mcpTokens.revokeMine",
       "forwarderManagement.setCliDeviceFeatureGrants",
+      "forwarderManagement.setCliDeviceLabels",
+      "forwarderManagement.setCliDeviceUsableBudgets",
       "supervisedCommands.pending",
       "supervisedCommands.submitOutput",
     ]) {
@@ -597,9 +607,9 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
         `${tool.name}: ${PLAN_TARGETS[tool.name]}`,
       );
     }
-    // 97 catalog entries − 14 extracted cores = 83 procedure dispatches.
-    expect(dispatched).toBe(83);
-    expect(invoked).toHaveLength(83);
+    // 100 catalog entries − 14 extracted cores = 86 procedure dispatches.
+    expect(dispatched).toBe(86);
+    expect(invoked).toHaveLength(86);
 
     // Human-only proof: ZERO mcpGrants access (property or invocation)
     // across every dispatch.
@@ -686,6 +696,7 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
         externalAfterWaitMs: 500,
         cacheHolderWaitMs: 1_500,
         protectionEnabled: true,
+        evictionFeedbackEnabled: true,
         protectionWindowSeconds: 300,
         protectMinTokens: 8192,
         protectionShare: "FIXED_PERCENT",
@@ -766,6 +777,51 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
     const read = byName.get("forwarder_pool_fallback_get")!;
     expect(read.scope).toBe("read");
     expect(read.confirmation).toBeNull();
+  });
+
+  it("issue #181: per-token :external wait is an ordinary mcp:write tool that states its cost", async () => {
+    const byName = new Map(MCP_TOOL_MANIFEST.map((tool) => [tool.name, tool]));
+    const update = byName.get("model_api_token_external_wait_update")!;
+    expect(update.scope).toBe("write");
+    expect(update.confirmation).toBeNull();
+    expect(update.classification).toBe("pure");
+    for (const phrase of [
+      "COST:",
+      "externalAfterWaitMs",
+      "Lower values spend more",
+      "x-wsmp-external-after-wait-ms",
+      "Grantees cannot shorten",
+      "TOKEN_EXTERNAL_WAIT_UPDATED",
+    ])
+      expect(update.descriptionNote).toContain(phrase);
+    expect(
+      await update.inputSchema["~standard"].validate({
+        id: "token",
+        externalAfterWaitMs: 500,
+      }),
+    ).not.toHaveProperty("issues");
+    expect(
+      update.inputSchema["~standard"].jsonSchema.input({ target: "draft-2020-12" }),
+    ).toMatchObject({
+      properties: {
+        externalAfterWaitMs: {
+          anyOf: [{ type: "integer", minimum: 0, maximum: 600_000 }, { type: "null" }],
+        },
+      },
+      required: ["id", "externalAfterWaitMs"],
+    });
+  });
+
+  it("issue #182: grant spend-cap writes keep the same confirmation class as other budget tools", () => {
+    const byName = new Map(MCP_TOOL_MANIFEST.map((tool) => [tool.name, tool]));
+    const tool = byName.get("forwarder_pool_grant_update")!;
+    expect(tool.scope).toBe("write");
+    expect(tool.confirmation).toBeNull();
+    expect(tool.classification).toBe("pure");
+    expect(tool.descriptionNote).toContain("COST:");
+    expect(tool.descriptionNote).toContain("POOL_GRANT");
+    expect(tool.descriptionNote).toContain("pool + grantee");
+    expect(tool.descriptionNote).toContain("PRECONDITIONS");
   });
 
   it("D9: MCP account tools cannot relax the OpenRouter data-collection setting", async () => {

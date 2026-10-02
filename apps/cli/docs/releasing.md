@@ -52,32 +52,20 @@ the generated Homebrew formula to the tap.
 The server accepts the listed relay protocol versions
 (`RELAY_PROTOCOL_VERSIONS`), oldest first; the minimum is
 `RELAY_MIN_PROTOCOL_VERSION`. A protocol bump ships the server and wsmp
-together when the minimum moves. Relay protocol 2.7 (engine facts,
-`node.info`, `node.metrics`, `endpoint.load`, `metrics.sources.set`) replaced
-2.6: a 2.6 wsmp (0.4.x) connecting to a 2.7 server is refused with "This
-server requires a newer wsmp (relay protocol 2.7). Upgrade wsmp and restart
-it." and its device card shows "CLI upgrade required (protocol 2.6)"; a 2.7
-wsmp against a 2.6 server stops with its "upgrade the WS Model Proxy server"
-message (the CLI recognizes both the `Malformed relay protocol message.` of
-pre-2.6 servers and a 2.6 server's "This server requires wsmp ... (relay
-protocol 2.6)" reply, while a genuine future-server "upgrade wsmp" reply stays
-as the CLI's own upgrade error). Release notes for the first wsmp that speaks
-2.7 must say that the server and every CLI need upgrading together.
+together when the minimum moves.
 
-Relay protocol 2.8 (the MCP node file tools, #103) replaces 2.7 the same way:
-a 2.7 wsmp connecting to a 2.8 server is refused with "This server requires a
-newer wsmp (relay protocol 2.8). Upgrade wsmp and restart it." and its device
-card shows "CLI upgrade required (protocol 2.7)". 2.8 defines every file frame
-at once (`file.op`, `file.cancel`, `file.body`, `file.result`, `file.rejected`,
-`file.data`, and the supervised-file `term.spawn` variant) so the fleet upgrades
-only once; a wsmp answers `unsupported` for the parts a later phase implements.
-
-Relay protocol 2.9 adds custom engine adapter fields (`engineFacts.loadAdapter`,
-`engineFacts.*.source` `custom`, `endpoint.load` source `custom` and
-`kvOccupancy`, optional `waiting` for custom, `node.metrics.engineAdapters`).
-This CLI speaks 2.9. The server still accepts 2.8 hellos; a 2.8 CLI does not
-send the new fields. 2.10 and above are too new. Word the 2.9 release note as
-a joint server and CLI upgrade, and keep 2.8 devices connected.
+This CLI speaks 2.4. Last cut release (v0.3.1) spoke 2.3. Unreleased work that
+had been numbered 2.4–2.9 (terminal identity, supervised commands, engine
+facts, node telemetry, MCP node file tools, custom engine adapters) all ships
+as 2.4. A 2.3 wsmp connecting to a 2.4 server is refused with "This server
+requires a newer wsmp (relay protocol 2.4). Upgrade wsmp and restart it." and
+its device card shows "CLI upgrade required (protocol 2.3)". A 2.4 wsmp against
+an older server stops with its "upgrade the WS Model Proxy server" message
+(the CLI recognizes both the `Malformed relay protocol message.` of pre-2.6
+servers and an older server's named-protocol upgrade reply, while a genuine
+future-server "upgrade wsmp" reply stays as the CLI's own upgrade error).
+Release notes for the first wsmp that speaks 2.4 must say that the server and
+every CLI need upgrading together. 2.5 and above are too new.
 
 ## One-time setup
 
