@@ -28,9 +28,11 @@
  *   5. OUTPUT: descriptor projector → defense-in-depth secret redactor →
  *      JSON-safe serialization → byte cap.
  *   6. ERRORS: ONLY allowlisted oRPC error codes map to stable MCP tool
- *      errors (arbitrary messages are never copied — Prisma/oRPC messages
- *      can carry SQL and credential material); ownership-hiding `NOT_FOUND`
- *      keeps its indistinguishable "Not found"; every unknown failure is a
+ *      errors. Messages stay on the server (they can carry SQL and
+ *      credential material) except an argument-shaped BAD_REQUEST, which
+ *      copies a sanitized static message alongside the failing field names.
+ *      Ownership-hiding `NOT_FOUND` keeps its indistinguishable "Not found";
+ *      every unknown failure is a
  *      generic internal error carrying the request id, with a sanitized log
  *      line (constructor name + tool name + request id ONLY).
  */
@@ -55,7 +57,11 @@ import { cliToolAllowed, isCliTool } from "./cli-tool-access";
 import { mcpSanitizedLog } from "./errors";
 import {
   collectSchemaPropertyNames,
+  fieldsFromValidationIssues,
   formatValidationIssues,
+  type McpValidationIssue,
+  sanitizeArgumentMessage,
+  sanitizeDeclaredFields,
   sanitizeValidationIssues,
 } from "./input-errors";
 import { redactSecrets } from "./redaction";
@@ -99,8 +105,9 @@ const MCP_TOOL_OUTPUT_EMITTED_BUDGET_BYTES =
 
 /**
  * Allowlisted oRPC error codes → stable tool-error messages. Codes outside
- * this map (and non-ORPCError failures) become the generic internal error;
- * ORPCError messages are NEVER copied verbatim into tool output.
+ * this map (and non-ORPCError failures) become the generic internal error.
+ * A procedure message is copied only for an argument-shaped BAD_REQUEST
+ * that names declared fields (#200), and only after it is sanitized.
  */
 const ORPC_ERROR_MESSAGES: Readonly<Record<string, string>> = Object.freeze({
   BAD_REQUEST: "Invalid input",
@@ -342,12 +349,9 @@ export async function runManifestTool(
         credential,
       });
       const issues = sanitizeValidationIssues(validationFailure, declaredInputKeys(descriptor));
-      return toolError(
-        issues === null ? "Invalid input" : `Invalid input: ${formatValidationIssues(issues)}`,
-        {
-          error: { code: "invalid_input", ...(issues === null ? {} : { issues }) },
-        },
-      );
+      return issues === null
+        ? toolError("Invalid input", { error: { code: "invalid_input" } })
+        : validationToolError("invalid_input", issues);
     }
   }
 
@@ -507,8 +511,15 @@ export async function runManifestTool(
           ? null
           : sanitizeValidationIssues(error.validation, declaredInputKeys(descriptor));
       if (issues !== null) {
+        const fields = fieldsFromValidationIssues(issues);
         return toolError(`${error.message}: ${formatValidationIssues(issues)}`, {
-          error: { code: error.code, ...error.extra, issues },
+          error: {
+            code: error.code,
+            ...error.extra,
+            ...(fields.length === 0 ? {} : { fields }),
+            message: formatValidationIssues(issues),
+            issues,
+          },
         });
       }
       return toolError(error.message, { error: { code: error.code, ...error.extra } });
@@ -598,6 +609,30 @@ function deletionConflictReasonOf(
 /** Per-descriptor cache of the property names its advertised schema declares. */
 const declaredKeysCache = new WeakMap<McpToolDescriptor, ReadonlySet<string>>();
 
+/**
+ * Argument-shaped failure (#200): `fields` names the keys, `message` says
+ * why. Zod issues keep their sanitized list; a procedure BAD_REQUEST with
+ * no issue list uses `data.fields` plus its static message.
+ */
+function validationToolError(code: string, issues: readonly McpValidationIssue[]): ToolResult {
+  const fields = fieldsFromValidationIssues(issues);
+  const message = formatValidationIssues(issues);
+  return toolError(`Invalid input: ${message}`, {
+    error: {
+      code,
+      ...(fields.length === 0 ? {} : { fields }),
+      message,
+      issues,
+    },
+  });
+}
+
+function declaredFieldToolError(fields: readonly string[], message: string): ToolResult {
+  return toolError(`Invalid input: ${fields.join(", ")}: ${message}`, {
+    error: { code: "BAD_REQUEST", fields: [...fields], message },
+  });
+}
+
 function declaredInputKeys(descriptor: McpToolDescriptor): ReadonlySet<string> {
   let keys = declaredKeysCache.get(descriptor);
   if (keys === undefined) {
@@ -619,13 +654,18 @@ function mapToolError(
       const stable = ORPC_ERROR_MESSAGES[error.code];
       if (stable !== undefined) {
         if (error.code === "BAD_REQUEST") {
-          // #117: name the failing field(s). Only sanitized {path, code,
-          // message} triples leave; input values never do.
-          const issues = sanitizeValidationIssues(error.data, declaredInputKeys(descriptor));
-          if (issues !== null) {
-            return toolError(`${stable}: ${formatValidationIssues(issues)}`, {
-              error: { code: error.code, issues },
-            });
+          // #117 / #200: name the failing field(s). Sanitized issues never
+          // carry input values. A procedure rejection whose input was
+          // schema-valid still names the key via data.fields.
+          const knownKeys = declaredInputKeys(descriptor);
+          const issues = sanitizeValidationIssues(error.data, knownKeys);
+          if (issues !== null) return validationToolError(error.code, issues);
+          const fields = sanitizeDeclaredFields(error.data, knownKeys);
+          if (fields !== null) {
+            return declaredFieldToolError(
+              fields,
+              sanitizeArgumentMessage(error.message) ?? "Invalid value",
+            );
           }
         }
         const reason = deletionConflictReasonOf(error);

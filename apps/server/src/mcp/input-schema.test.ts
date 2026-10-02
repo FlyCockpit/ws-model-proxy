@@ -261,7 +261,33 @@ describe("advertised schema equals the procedure schema plus declared overlays",
       const forbidden = FORBIDDEN[tool.name]?.fields ?? [];
       // Overlay property shapes are written out literally here (descriptions
       // that name a replacement tool are matched by the tool name).
-      const expectedProps: Record<string, unknown> = { ...(baseProperties as Json) };
+      // Union branches have no root properties. Copy small branch schemas up
+      // (#200); large or conflicting ones are a stub that only names the key.
+      const variantStub = {
+        description: "Accepted shape depends on the input variant. See oneOf/anyOf.",
+      };
+      const variantProps: Record<string, unknown> = {};
+      for (const branch of [
+        ...((Array.isArray(base.anyOf) ? base.anyOf : []) as Json[]),
+        ...((Array.isArray(base.oneOf) ? base.oneOf : []) as Json[]),
+      ]) {
+        const props = (branch.properties ?? {}) as Record<string, unknown>;
+        for (const [key, schema] of Object.entries(props)) {
+          const encoded = JSON.stringify(schema);
+          const compact = encoded !== undefined && encoded.length <= 400 ? schema : variantStub;
+          if (!(key in variantProps)) {
+            variantProps[key] = compact;
+            continue;
+          }
+          if (JSON.stringify(variantProps[key]) !== JSON.stringify(compact)) {
+            variantProps[key] = variantStub;
+          }
+        }
+      }
+      const expectedProps: Record<string, unknown> = {
+        ...variantProps,
+        ...(baseProperties as Json),
+      };
       for (const key of FORBIDDEN[tool.name]?.fields ?? []) {
         expectedProps[key] = {
           not: {},
@@ -316,6 +342,18 @@ describe("advertised schema equals the procedure schema plus declared overlays",
       expect(branch.required).toEqual(expect.arrayContaining(["mode"]));
     }
     expect(branches.some((branch) => (branch.required as string[]).includes("id"))).toBe(true);
+    expect((json.properties as Json).id).toMatchObject({ type: "string", minLength: 1 });
+  });
+
+  it("a union input lists each variant's id on root properties (#200)", () => {
+    const json = advertised(
+      MCP_TOOL_MANIFEST.find((tool) => tool.name === "forwarder_engine_load_history_get")!,
+    );
+    expect(json.properties).toMatchObject({
+      poolId: { type: "string", minLength: 1 },
+      capacityId: { type: "string", minLength: 1 },
+    });
+    expect(json.anyOf).toHaveLength(2);
   });
 
   it("strict procedures advertise their closed shape", () => {

@@ -239,7 +239,10 @@ function assertLossyDeveloperRoleCollapseRequiresAdaptation(
   if (allowLossyDeveloperRoleCollapse && !protocolAdaptationEnabled) {
     throw new ORPCError("BAD_REQUEST", {
       message: "Lossy developer-role collapse requires protocol adaptation to be enabled.",
-      ...(reason !== undefined ? { data: { reason } } : {}),
+      data: {
+        fields: ["allowLossyDeveloperRoleCollapse", "protocolAdaptationEnabled"],
+        ...(reason !== undefined ? { reason } : {}),
+      },
     });
   }
 }
@@ -298,6 +301,7 @@ export function resolvePoolProtectionShare(
   if (fixed === null)
     throw new ORPCError("BAD_REQUEST", {
       message: "The fixed-percent protection share needs a percent from 1 to 100.",
+      data: { fields: ["protectionFixedPercent", "protectionShare"] },
     });
   return { protectionShare: share, protectionFixedPercent: fixed };
 }
@@ -4240,10 +4244,12 @@ export const forwarderManagementRouter = {
           if (nextTier === "PRIMARY" && nextRoutingStatus === "ACTIVE" && nextWeight <= 0)
             throw new ORPCError("BAD_REQUEST", {
               message: "Primary members require a positive routing weight.",
+              data: { fields: ["weight"] },
             });
           if (input.tier && !providerModel)
             throw new ORPCError("BAD_REQUEST", {
               message: "Only provider-backed members can change tier.",
+              data: { fields: ["tier"] },
             });
           // PRIMARY is local-only (also enforced by the schema-hardening tier
           // trigger): plain pool names never leave the deployment.
@@ -4251,6 +4257,7 @@ export const forwarderManagementRouter = {
             throw new ORPCError("BAD_REQUEST", {
               message:
                 "Provider models can only be external fallback (PUBLIC_OVERFLOW) members; plain pool names never leave the deployment.",
+              data: { fields: ["tier"] },
             });
           const nextConcurrencyMode =
             input.capacityConcurrencyMode ?? member.capacityConcurrencyMode;
@@ -4270,6 +4277,7 @@ export const forwarderManagementRouter = {
           )
             throw new ORPCError("BAD_REQUEST", {
               message: "Reserved slots exceed the member concurrency limit.",
+              data: { fields: ["capacityReservedSlots", "capacityConcurrencyLimit"] },
             });
           assertConcurrencyPolicyWithinHardLimit({
             hardLimit: member.ExecutionTarget?.InferenceCapacity?.hardConcurrencyLimit,

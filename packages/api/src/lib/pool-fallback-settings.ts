@@ -54,6 +54,7 @@ export function assertExternalAfterWaitWithinBudget({
   if (capacityWaitBudgetMs !== null && externalAfterWaitMs > capacityWaitBudgetMs)
     throw new ORPCError("BAD_REQUEST", {
       message: "The external fallback wait cannot exceed the pool's local wait budget.",
+      data: { fields: ["externalAfterWaitMs", "capacityWaitBudgetMs"] },
     });
 }
 
@@ -81,6 +82,7 @@ export async function assertPoolFallbackEnableable(poolId: string, userId: strin
   if (targets.length !== attachments.length) {
     throw new ORPCError("BAD_REQUEST", {
       message: "Every public overflow attachment must reference a provider model.",
+      data: { fields: ["fallbackEnabled"] },
     });
   }
   const policies = await prisma.providerBudgetPolicy.findMany({
@@ -128,6 +130,7 @@ export async function assertPoolFallbackEnableable(poolId: string, userId: strin
     throw new ORPCError("BAD_REQUEST", {
       message:
         "Every public overflow attachment requires an active explicit LIMITED or UNLIMITED concurrency policy.",
+      data: { fields: ["fallbackEnabled"] },
     });
   }
   const auditChecks = await Promise.all(
@@ -146,6 +149,7 @@ export async function assertPoolFallbackEnableable(poolId: string, userId: strin
   if (auditChecks.some((audit) => !audit)) {
     throw new ORPCError("BAD_REQUEST", {
       message: "Every public overflow protection policy must have an activation audit trail.",
+      data: { fields: ["fallbackEnabled"] },
     });
   }
 }

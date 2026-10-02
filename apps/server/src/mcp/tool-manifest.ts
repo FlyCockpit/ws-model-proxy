@@ -23,9 +23,10 @@
  * `inputSchema`. Runtime validation is unchanged: the SDK only applies the
  * loose overlay/size-bound validator, and the oRPC procedure remains the
  * SINGLE validation authority for everything else. Its BAD_REQUEST issues
- * reach the client as a sanitized `{ path, code, message }` list
- * (input-errors.ts) — never input values — so an agent can name the field it
- * got wrong.
+ * reach the client as a sanitized `{ path, code, message }` list plus
+ * `fields` (input-errors.ts) — never input values — so an agent can name the
+ * field it got wrong. A schema-valid rejection carries `data.fields` the
+ * same way.
  */
 
 import type { StandardSchemaWithJSON } from "@modelcontextprotocol/server";
@@ -353,7 +354,7 @@ const DATA_COLLECTION_INPUTS = {
 
 /** Cost statement carried by the fallback write tool's description (issue #67). */
 export const POOL_FALLBACK_COST_NOTICE =
-  "COST: fallbackEnabled=true lets requests for owner/pool:external be sent to the pool's external provider members, billed to YOUR provider accounts (real money, and request data leaves this deployment). fallbackForGrantees=true makes YOU pay for external use by every user the pool is shared with. externalAfterWaitMs sets how long an :external request waits for local capacity before paying for a provider: lower values spend more. Turning a switch off never costs anything. Every change is recorded as a POOL_FALLBACK_UPDATED provider audit event. PRECONDITIONS: turning fallbackEnabled on needs provider egress enabled on this deployment (otherwise the call fails with Not found) and, on every external member, an active LIMITED or UNLIMITED per-attempt concurrency policy with an activation audit trail; a new externalAfterWaitMs cannot exceed the pool's local wait budget (these two fail with a plain Invalid input error that has no field list, because the input itself is valid).";
+  "COST: fallbackEnabled=true lets requests for owner/pool:external be sent to the pool's external provider members, billed to YOUR provider accounts (real money, and request data leaves this deployment). fallbackForGrantees=true makes YOU pay for external use by every user the pool is shared with. externalAfterWaitMs sets how long an :external request waits for local capacity before paying for a provider: lower values spend more. Turning a switch off never costs anything. Every change is recorded as a POOL_FALLBACK_UPDATED provider audit event. PRECONDITIONS: turning fallbackEnabled on needs provider egress enabled on this deployment (otherwise the call fails with Not found) and, on every external member, an active LIMITED or UNLIMITED per-attempt concurrency policy with an activation audit trail; a new externalAfterWaitMs cannot exceed the pool's local wait budget (these fail with BAD_REQUEST naming fallbackEnabled or externalAfterWaitMs, because the input itself is schema-valid).";
 
 /**
  * Cost statement for the general pool tools, which still accept

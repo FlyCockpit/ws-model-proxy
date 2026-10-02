@@ -60,6 +60,7 @@ function assertLossyDeveloperRoleCollapseRequiresAdaptation({
   if (allowLossyDeveloperRoleCollapse && !protocolAdaptationEnabled) {
     throw new ORPCError("BAD_REQUEST", {
       message: "Lossy developer-role collapse requires protocol adaptation to be enabled.",
+      data: { fields: ["allowLossyDeveloperRoleCollapse", "protocolAdaptationEnabled"] },
     });
   }
 }
@@ -255,7 +256,10 @@ export const capacityManagementRouter = {
       input.hardConcurrencyLimit !== undefined &&
       input.hardConcurrencyLimit < 1
     )
-      throw new ORPCError("BAD_REQUEST");
+      throw new ORPCError("BAD_REQUEST", {
+        message: "Hard concurrency limit must be at least 1.",
+        data: { fields: ["hardConcurrencyLimit"] },
+      });
     const userId = context.session.user.id;
     return capacityTransaction(
       userId,

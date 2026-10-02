@@ -113,6 +113,7 @@ const db = prisma as unknown as {
   providerCredential: { findMany: MockInstance };
   mcpGrant: { findUnique: MockInstance };
   user: { findUnique: MockInstance };
+  modelPool: { findUnique: MockInstance };
 };
 
 const ENVELOPE = {
@@ -246,7 +247,12 @@ interface WireResult {
   content?: { type: string; text: string }[];
   structuredContent?: {
     result?: unknown;
-    error?: { code?: string; issues?: { code: string }[] };
+    error?: {
+      code?: string;
+      fields?: string[];
+      message?: string;
+      issues?: { code: string; keys?: string[] }[];
+    };
     requestId?: string;
   };
   isError?: boolean;
@@ -327,20 +333,23 @@ describe("#117 — real input schemas and named failing fields", () => {
     expect(bytes).toBeLessThanOrEqual(200 * 1024);
   });
 
-  it("an unknown key on a strict procedure is reported as fixed text, never as a path or value", async () => {
-    const PLAIN = "plain-hostile-key-4242";
+  it("an unknown key on a strict procedure is named in fields, never as a value", async () => {
+    const KEY = "plain-hostile-key-4242";
+    const VALUE = "plain-hostile-value-4242";
     const authInfo = buildAuthInfo(["mcp:write"]);
     bindRequest(authInfo);
     const { body } = await callTool(authInfo, "forwarder_pool_fallback_update", {
       poolId: "pool-1",
       fallbackEnabled: true,
-      [PLAIN]: PLAIN,
+      [KEY]: VALUE,
     });
     expect(body.result?.isError).toBe(true);
     const wire = JSON.stringify(body);
-    expect(wire).not.toContain(PLAIN);
+    expect(wire).not.toContain(VALUE);
+    expect(wire).toContain(KEY);
     const issues = body.result?.structuredContent?.error?.issues ?? [];
     expect(issues.map((issue) => issue.code)).toContain("unrecognized_keys");
+    expect(body.result?.structuredContent?.error?.fields).toContain(KEY);
   });
 
   it("a missing required field is named by path and code, and the procedure stays the authority", async () => {
@@ -351,6 +360,8 @@ describe("#117 — real input schemas and named failing fields", () => {
     expect(body.result?.structuredContent).toEqual({
       error: {
         code: "BAD_REQUEST",
+        fields: ["poolId"],
+        message: "poolId: Invalid input: expected string, received undefined",
         issues: [
           {
             path: ["poolId"],
@@ -372,7 +383,7 @@ describe("#117 — real input schemas and named failing fields", () => {
       ["forwarder_pool_fallback_get", { poolId: SECRET.repeat(20) }],
       ["forwarder_pool_fallback_get", { poolId: { nested: PLAIN } }],
       ["forwarder_pool_fallback_get", { poolId: [PLAIN] }],
-      ["forwarder_pool_fallback_get", { poolId: 42, [PLAIN]: PLAIN }],
+      ["forwarder_pool_fallback_get", { poolId: 42, extraKey: PLAIN }],
       ["model_api_tokens_preview", { scopeMode: PLAIN }],
       ["model_api_tokens_preview", { scopeMode: "ALLOWLIST", modelIds: [PLAIN, 7, SECRET] }],
     ];
@@ -401,6 +412,35 @@ describe("#117 — real input schemas and named failing fields", () => {
     });
     expect(resultText(body.result ?? {})).toBe("Invalid input");
     expect(JSON.stringify(body)).not.toContain("SECRET");
+  });
+
+  it("a schema-valid BAD_REQUEST names the declared field and keeps the static message", async () => {
+    const { ORPCError } = await import("@orpc/server");
+    db.modelPool.findUnique.mockRejectedValueOnce(
+      new ORPCError("BAD_REQUEST", {
+        message: "Effective concurrency limit exceeds physical capacity.",
+        data: {
+          fields: ["capacityConcurrencyLimit", "hardConcurrencyLimit", "notAField", "pool id"],
+        },
+      }),
+    );
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_model_pool_update", {
+      id: "pool-1",
+      capacityConcurrencyLimit: 8,
+    });
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.structuredContent).toEqual({
+      error: {
+        code: "BAD_REQUEST",
+        fields: ["capacityConcurrencyLimit"],
+        message: "Effective concurrency limit exceeds physical capacity.",
+      },
+    });
+    expect(resultText(body.result ?? {})).toBe(
+      "Invalid input: capacityConcurrencyLimit: Effective concurrency limit exceeds physical capacity.",
+    );
   });
 });
 

@@ -745,10 +745,10 @@ dashboard, is recorded as a `POOL_FALLBACK_UPDATED` provider audit event
 (`metadata.source` is `mcp` or `dashboard`), readable with
 `provider_audit_events_list` (`poolId` filters one pool's history) and shown
 as the fallback change history on the pool's Fallback tab in the dashboard.
-The tool description also lists the preconditions an agent otherwise sees only
-as a plain "Invalid input". The general pool tools reject the two switches (the
-advertised schema describes each as forbidden and names this tool); they still
-accept `externalAfterWaitMs`, and their descriptions
+The tool description lists those preconditions. When they fail, the error
+names `fallbackEnabled` or `externalAfterWaitMs`. The general pool tools reject
+the two switches (the advertised schema describes each as forbidden and names
+this tool); they still accept `externalAfterWaitMs`, and their descriptions
 state its cost.
 
 Still human-only: token external consent (`allowExternal`, `includeExternal`),
@@ -873,27 +873,49 @@ A deletion-related `CONFLICT` also carries a stable `reason`
 
 Only these values are forwarded; any other `data` on a `CONFLICT` is dropped.
 
-A `BAD_REQUEST` caused by invalid arguments also lists what was wrong, in the
-text (`Invalid input: poolId: Invalid input: expected string, received
-undefined`) and in `structuredContent`:
+A `BAD_REQUEST` caused by invalid arguments names the failing fields, in the
+text and in `structuredContent`:
+
+A schema rejection includes `issues`:
 
 ```json
 {
   "error": {
     "code": "BAD_REQUEST",
+    "fields": ["poolId"],
+    "message": "poolId: Invalid input: expected string, received undefined",
     "issues": [{ "path": ["poolId"], "code": "invalid_type", "message": "Invalid input: expected string, received undefined" }]
   }
 }
 ```
 
-`path` names the failing field (array indexes are numbers; a segment that is
-not a field the tool declares is `"?"`), `code` is the validator's issue code (anything outside a short allowlist
-of standard codes is reported as `invalid`),
-and `message` is the validator's own text. Input values are never echoed:
+A schema-valid rejection names the procedure's fields and keeps its static message:
+
+```json
+{
+  "error": {
+    "code": "BAD_REQUEST",
+    "fields": ["capacityConcurrencyLimit"],
+    "message": "Effective concurrency limit exceeds physical capacity."
+  }
+}
+```
+
+`fields` is present whenever the failure is argument-shaped and at least one
+key can be named: missing or out-of-range values, a key that is not on this
+object (`unrecognized_keys`, also listed on the issue as `keys`), and a
+schema-valid rejection such as a concurrency limit past physical capacity
+(`data.fields` on the procedure error, kept only when that tool advertises
+the name). `message` is the explanation. Validator `issues` are included when
+the failure came from the schema: `path` names the failing field (array
+indexes are numbers; a segment that is not a field the tool declares is
+`"?"`), `code` is the validator's issue code (anything outside a short
+allowlist of standard codes is reported as `invalid`), and each issue
+`message` is the validator's own text. Input values are never echoed:
 messages that could quote a value (`custom`, `unrecognized_keys`, unknown
 codes) are replaced by fixed text, and at most 20 issues are returned. A
-`BAD_REQUEST` the procedure raises for a reason other than argument shape
-(for example a failed precondition) stays the plain "Invalid input".
+`BAD_REQUEST` that is not about an argument (for example a failed
+precondition with no field list) stays the plain "Invalid input".
 
 ## Login, consent, and scope step-up
 

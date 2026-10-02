@@ -171,14 +171,54 @@ function baseJsonSchema(spec: McpInputSchemaSpec): JsonObject {
   return toInputJsonSchema(input);
 }
 
+/**
+ * A branch property is copied onto the root only when its JSON Schema is
+ * small. Large or conflicting variant schemas stay on `oneOf`/`anyOf`; the
+ * root still names the key (#200) so `properties` is not empty.
+ */
+const VARIANT_PROPERTY_JSON_MAX = 400;
+const VARIANT_PROPERTY: JsonObject = {
+  description: "Accepted shape depends on the input variant. See oneOf/anyOf.",
+};
+
+function variantPropertySchema(schema: unknown): unknown {
+  const encoded = JSON.stringify(schema);
+  return encoded !== undefined && encoded.length <= VARIANT_PROPERTY_JSON_MAX
+    ? schema
+    : VARIANT_PROPERTY;
+}
+
+/** Property names declared on a union's branches, for clients that only read root `properties`. */
+function unionBranchProperties(base: JsonObject): JsonObject {
+  const branches = [
+    ...(Array.isArray(base.anyOf) ? base.anyOf : []),
+    ...(Array.isArray(base.oneOf) ? base.oneOf : []),
+  ];
+  const merged: JsonObject = {};
+  for (const branch of branches) {
+    for (const [name, schema] of Object.entries(objectOf(objectOf(branch).properties))) {
+      const compact = variantPropertySchema(schema);
+      if (!Object.hasOwn(merged, name)) {
+        merged[name] = compact;
+        continue;
+      }
+      if (JSON.stringify(merged[name]) !== JSON.stringify(compact)) merged[name] = VARIANT_PROPERTY;
+    }
+  }
+  return merged;
+}
+
 /** Merge the MCP-owned overlays into a generated JSON Schema (pure). */
 export function applyInputOverlay(base: JsonObject, spec: McpInputSchemaSpec): JsonObject {
-  // Union roots (`oneOf`/`anyOf`) carry no root `properties`; the overlay
-  // properties sit beside the branches, which is valid JSON Schema.
+  // Union roots (`oneOf`/`anyOf`) carry no root `properties`. Branch keys are
+  // copied up so required ids are visible; the branches stay the constraint.
   if (base.type !== undefined && base.type !== "object") {
     throw new Error(`MCP tool ${spec.target}: input schema root must be an object schema`);
   }
-  const properties: JsonObject = { ...objectOf(base.properties) };
+  const properties: JsonObject = {
+    ...unionBranchProperties(base),
+    ...objectOf(base.properties),
+  };
   let required = Array.isArray(base.required) ? [...(base.required as string[])] : [];
 
   for (const field of spec.isoDateFields ?? []) {

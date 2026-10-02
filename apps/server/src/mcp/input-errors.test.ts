@@ -13,11 +13,14 @@ vi.mock("@ws-model-proxy/env/shared", () => ({
 }));
 
 const {
+  fieldsFromValidationIssues,
   formatValidationIssues,
   MAX_ISSUES,
   MAX_MESSAGE_LENGTH,
   MAX_PATH_SEGMENTS,
   collectSchemaPropertyNames,
+  sanitizeArgumentMessage,
+  sanitizeDeclaredFields,
   sanitizeValidationIssues,
 } = await import("./input-errors");
 
@@ -143,6 +146,14 @@ describe("sanitizeValidationIssues", () => {
     ],
   ])("never echoes a secret carried in: %s", (_label, issue) => {
     const issues = sanitize([issue]);
+    // #200 names an identifier-shaped unrecognized key. The zod message that
+    // quotes it stays the fixed text, and every other channel stays silent.
+    if ("code" in issue && issue.code === "unrecognized_keys") {
+      expect(issues?.[0]?.message).toBe("Unrecognized field");
+      expect(issues?.[0]?.message).not.toContain(PLAIN_SECRET);
+      expect(issues?.[0]?.keys).toEqual([PLAIN_SECRET]);
+      return;
+    }
     expect(JSON.stringify(issues)).not.toContain(PLAIN_SECRET);
   });
 
@@ -205,6 +216,46 @@ describe("sanitizeValidationIssues", () => {
       { path: ["x"], code: "unrecognized_keys", message: "Unrecognized field" },
       { path: [], code: "custom", message: "Invalid value" },
     ]);
+  });
+
+  it("names identifier-shaped unrecognized keys and drops the rest", () => {
+    const issues = sanitize(
+      [
+        {
+          code: "unrecognized_keys",
+          path: [],
+          keys: ["capacityConcurrencyLimit", "not a key", SECRET, "k".repeat(65), 3],
+          message: `Unrecognized key: "${PLAIN_SECRET}"`,
+        },
+      ],
+      new Set(),
+    );
+    expect(issues).toEqual([
+      {
+        path: [],
+        code: "unrecognized_keys",
+        message: "Unrecognized field",
+        keys: ["capacityConcurrencyLimit"],
+      },
+    ]);
+    expect(JSON.stringify(issues)).not.toContain(PLAIN_SECRET);
+    expect(JSON.stringify(issues)).not.toContain("SUPERSECRETVALUE");
+    expect(fieldsFromValidationIssues(issues ?? [])).toEqual(["capacityConcurrencyLimit"]);
+  });
+
+  it("keeps only declared data.fields and a static message", () => {
+    expect(
+      sanitizeDeclaredFields(
+        { fields: ["capacityConcurrencyLimit", "notAField", "pool id", 1] },
+        new Set(["capacityConcurrencyLimit", "poolId"]),
+      ),
+    ).toEqual(["capacityConcurrencyLimit"]);
+    expect(sanitizeDeclaredFields(Object.create({ fields: ["poolId"] }), KNOWN)).toBeNull();
+    expect(
+      sanitizeArgumentMessage("  Effective concurrency limit exceeds physical capacity.  "),
+    ).toBe("Effective concurrency limit exceeds physical capacity.");
+    expect(sanitizeArgumentMessage(SECRET)).toBe("[redacted]");
+    expect(sanitizeArgumentMessage("line\nbreak")).toBeNull();
   });
 
   it("maps an unknown code to 'invalid' with a fixed message", () => {
@@ -283,7 +334,15 @@ describe("sanitizeValidationIssues", () => {
         { path: ["poolId"], code: "invalid_type", message: "Required" },
         { path: [], code: "custom", message: "Invalid value" },
         { path: ["a", 0, "b"], code: "too_small", message: "Too small" },
+        {
+          path: [],
+          code: "unrecognized_keys",
+          message: "Unrecognized field",
+          keys: ["capacityConcurrencyLimit"],
+        },
       ]),
-    ).toBe("poolId: Required; (input): Invalid value; a.0.b: Too small");
+    ).toBe(
+      "poolId: Required; (input): Invalid value; a.0.b: Too small; capacityConcurrencyLimit: Unrecognized field",
+    );
   });
 });

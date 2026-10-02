@@ -17,6 +17,9 @@
  *     the schema and the input's TYPE (never its value), capped in length;
  *     `unrecognized_keys` (echoes input key names), `custom` (author-written,
  *     may interpolate the value) and unknown codes get a fixed text;
+ *   - `keys`: for `unrecognized_keys` only, the identifier-shaped key names
+ *     (capped). The path still masks undeclared segments; the key itself is
+ *     named here so an agent can see which argument was rejected (#200);
  *   - at most {@link MAX_ISSUES} issues; nothing else from the issue
  *     (`input`, `received`, `values`, `errors`, ...) is read.
  */
@@ -27,6 +30,8 @@ export interface McpValidationIssue {
   path: (string | number)[];
   code: string;
   message: string;
+  /** Identifier-shaped unrecognized keys. Absent for every other code. */
+  keys?: string[];
 }
 
 export const MAX_ISSUES = 20;
@@ -94,6 +99,24 @@ function sanitizeCode(code: unknown): string {
 }
 
 /**
+ * Unrecognized keys are caller-chosen, so only identifier-shaped names are
+ * kept. Credential-shaped names are dropped here; `redactSecrets` is the
+ * second pass over the finished issue list.
+ */
+function sanitizeUnknownKeys(keys: unknown): string[] | undefined {
+  if (!Array.isArray(keys)) return undefined;
+  const names: string[] = [];
+  for (const key of keys) {
+    if (names.length >= MAX_ISSUES) break;
+    if (typeof key !== "string" || key.length === 0 || key.length > MAX_SEGMENT_LENGTH) continue;
+    if (!IDENTIFIER_SEGMENT.test(key)) continue;
+    if (redactSecrets(key) !== key) continue;
+    if (!names.includes(key)) names.push(key);
+  }
+  return names.length === 0 ? undefined : names;
+}
+
+/**
  * The sanitized issues of a BAD_REQUEST `data` payload, or `null` when it
  * carries no usable issue list (the caller then keeps the plain error).
  */
@@ -108,22 +131,93 @@ export function sanitizeValidationIssues(
   for (const issue of issues.slice(0, MAX_ISSUES)) {
     if (issue === null || typeof issue !== "object") continue;
     const code = sanitizeCode(Reflect.get(issue, "code"));
+    const keys =
+      code === "unrecognized_keys" ? sanitizeUnknownKeys(Reflect.get(issue, "keys")) : undefined;
     result.push({
       path: sanitizePath(Reflect.get(issue, "path"), knownKeys),
       code,
       message: sanitizeMessage(code, Reflect.get(issue, "message")),
+      ...(keys === undefined ? {} : { keys }),
     });
   }
   // Defense in depth: wsmp_ credential shapes that slipped into a path key.
   return result.length === 0 ? null : (redactSecrets(result) as McpValidationIssue[]);
 }
 
+/**
+ * Argument names an agent can correct: declared path segments plus
+ * unrecognized keys. `"?"` (a segment that is not a declared field) is
+ * omitted. Order follows the issues.
+ */
+export function fieldsFromValidationIssues(issues: readonly McpValidationIssue[]): string[] {
+  const fields: string[] = [];
+  const add = (name: string): void => {
+    if (name === "?" || name.length === 0 || fields.includes(name)) return;
+    fields.push(name);
+  };
+  for (const issue of issues) {
+    for (const key of issue.keys ?? []) add(key);
+    for (const segment of issue.path) {
+      if (typeof segment === "string") add(segment);
+    }
+  }
+  return fields;
+}
+
+/**
+ * Procedure-authored `data.fields` (#200). Only names the tool's own
+ * advertised schema declares are returned, so a handler cannot echo an
+ * arbitrary caller string through this channel.
+ */
+export function sanitizeDeclaredFields(
+  data: unknown,
+  knownKeys: ReadonlySet<string>,
+): string[] | null {
+  if (data === null || typeof data !== "object" || Array.isArray(data)) return null;
+  if (!Object.hasOwn(data, "fields")) return null;
+  const raw: unknown = Reflect.get(data, "fields");
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const fields: string[] = [];
+  for (const item of raw) {
+    if (fields.length >= MAX_ISSUES) break;
+    if (typeof item !== "string" || item.length === 0 || item.length > MAX_SEGMENT_LENGTH) continue;
+    if (!IDENTIFIER_SEGMENT.test(item) || !knownKeys.has(item)) continue;
+    if (!fields.includes(item)) fields.push(item);
+  }
+  return fields.length === 0 ? null : fields;
+}
+
+/**
+ * Static procedure message for an argument-shaped BAD_REQUEST. Control
+ * characters are rejected; length is capped; credential shapes are redacted.
+ * Returns null when there is no usable message.
+ */
+function hasControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    if (value.charCodeAt(index) <= 0x1f) return true;
+  }
+  return false;
+}
+
+export function sanitizeArgumentMessage(message: unknown): string | null {
+  if (typeof message !== "string") return null;
+  const trimmed = message.trim();
+  if (trimmed.length === 0 || hasControlCharacter(trimmed)) return null;
+  const capped =
+    trimmed.length > MAX_MESSAGE_LENGTH ? `${trimmed.slice(0, MAX_MESSAGE_LENGTH)}...` : trimmed;
+  const redacted = redactSecrets(capped);
+  return typeof redacted === "string" ? redacted : null;
+}
+
 /** Human/agent-readable one-liner: `path: message; path: message`. */
 export function formatValidationIssues(issues: readonly McpValidationIssue[]): string {
   return issues
-    .map(
-      (issue) => `${issue.path.length === 0 ? "(input)" : issue.path.join(".")}: ${issue.message}`,
-    )
+    .map((issue) => {
+      const base = issue.path.join(".");
+      const named = (issue.keys ?? []).map((key) => (base.length > 0 ? `${base}.${key}` : key));
+      const where = named.length > 0 ? named.join(", ") : base.length > 0 ? base : "(input)";
+      return `${where}: ${issue.message}`;
+    })
     .join("; ");
 }
 
