@@ -456,6 +456,19 @@ type CalibrationCapacity = {
   imageTokenAllowance?: number | null;
 };
 
+function jsonPayloadFromRelayBody(
+  body: Uint8Array | RelayBodySource | unknown,
+): unknown | undefined {
+  if (body instanceof Uint8Array) {
+    try {
+      return JSON.parse(decodeUtf8Bytes(body));
+    } catch {
+      return undefined;
+    }
+  }
+  return undefined;
+}
+
 function recordCalibrationFromUsage(
   capacity: CalibrationCapacity | null | undefined,
   payload: unknown,
@@ -488,7 +501,10 @@ function estimatedAffinityTokens(
     const estimate = estimatePayloadTokens(payload, {
       imageTokenAllowance: capacity.imageTokenAllowance,
     });
-    return calibratedFootprintTokens(capacity.id, capacity, estimate.tokens) ?? estimate.tokens;
+    return (
+      calibratedFootprintTokens(capacity.id, capacity, estimate.textTokens, estimate.mediaTokens) ??
+      estimate.tokens
+    );
   } catch {
     return fallback;
   }
@@ -641,7 +657,12 @@ async function nativeContextCount({
         countStrategy !== "TEMPLATE_AWARE")
     )
       return raw;
-    const calibrated = calibratedContextTokens(capacity.id, capacity, raw.tokens);
+    const calibrated = calibratedContextTokens(
+      capacity.id,
+      capacity,
+      raw.textTokens ?? raw.tokens,
+      raw.mediaTokens ?? 0,
+    );
     return calibrated === null ? raw : withCalibratedContextCount(raw, calibrated);
   };
   if (
@@ -4290,6 +4311,13 @@ async function relayDirect({
     const finalize = attempt.terminal
       .catch(() => rejectedRelayTerminal())
       .then(async (terminal) => {
+        if (terminal.ok) {
+          recordCalibrationFromUsage(
+            selected.ExecutionTarget?.InferenceCapacity,
+            jsonPayloadFromRelayBody(builtRequest.body) ?? operation.contextInput,
+            usageFactsFromRelayTerminal(terminal),
+          );
+        }
         const cleanup = await Promise.allSettled([
           Promise.resolve().then(() => cliLease.release()),
           Promise.resolve().then(() => globalLease.release()),
@@ -7022,7 +7050,11 @@ async function relayPool({
               return null;
             const usageFacts = usageFactsFromRelayTerminal(upstreamTerminal);
             const capacity = member.ExecutionTarget?.InferenceCapacity;
-            recordCalibrationFromUsage(capacity, affinityPayload, usageFacts);
+            recordCalibrationFromUsage(
+              capacity,
+              jsonPayloadFromRelayBody(builtRequest.body) ?? affinityPayload,
+              usageFacts,
+            );
             return rememberAffinity({
               ownerId: requester.userId,
               resourceOwnerId: member.DiscoveredModel.userId,
@@ -7720,7 +7752,6 @@ async function relaySelectedModelNoFailover({
             return null;
           const usageFacts = usageFactsFromRelayTerminal(terminal);
           const capacity = selected.ExecutionTarget?.InferenceCapacity;
-          recordCalibrationFromUsage(capacity, operation.contextInput, usageFacts);
           return rememberAffinity({
             ownerId: requester.userId,
             resourceOwnerId: selected.userId,

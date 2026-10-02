@@ -3,6 +3,8 @@ import {
   CALIBRATION_CLAMP_MAX,
   CALIBRATION_CLAMP_MIN,
   CALIBRATION_MIN_SAMPLES,
+  CALIBRATION_RATIO_MAX,
+  CALIBRATION_RATIO_MIN,
   calibratedContextTokens,
   calibratedFootprintTokens,
   observeContextCalibration,
@@ -51,10 +53,10 @@ describe("context calibration", () => {
     expect(median).toBeLessThanOrEqual(Math.ceil(1000 * 0.61));
   });
 
-  it("clamps to [0.3, 1.5] of the raw estimate", () => {
+  it("clamps to [0.3, 1.5] of the text estimate", () => {
     fill(
       "cap",
-      Array.from({ length: CALIBRATION_MIN_SAMPLES }, () => 0.05),
+      Array.from({ length: CALIBRATION_MIN_SAMPLES }, () => 0.2),
     );
     expect(calibratedContextTokens("cap", identity, 1000)).toBe(
       Math.ceil(1000 * CALIBRATION_CLAMP_MIN),
@@ -62,10 +64,60 @@ describe("context calibration", () => {
     resetContextCalibrationForTests();
     fill(
       "cap",
-      Array.from({ length: CALIBRATION_MIN_SAMPLES }, () => 4),
+      Array.from({ length: CALIBRATION_MIN_SAMPLES }, () => 1.8),
     );
     expect(calibratedContextTokens("cap", identity, 1000)).toBe(
       Math.ceil(1000 * CALIBRATION_CLAMP_MAX),
+    );
+  });
+
+  it("drops implausible ratios instead of storing them", () => {
+    fill(
+      "cap",
+      Array.from({ length: CALIBRATION_MIN_SAMPLES - 1 }, () => 0.8),
+    );
+    observeContextCalibration({
+      capacityId: "cap",
+      identity,
+      textEstimate: 1000,
+      promptTokens: 1000 * (CALIBRATION_RATIO_MIN / 2),
+      mediaParts: 0,
+    });
+    observeContextCalibration({
+      capacityId: "cap",
+      identity,
+      textEstimate: 1000,
+      promptTokens: 1000 * (CALIBRATION_RATIO_MAX + 1),
+      mediaParts: 0,
+    });
+    expect(calibratedContextTokens("cap", identity, 1000)).toBeNull();
+    fill("cap", [0.8]);
+    expect(calibratedContextTokens("cap", identity, 1000)).toBe(Math.ceil(1000 * 0.8));
+  });
+
+  it("does not let oversized metadata clamp other tenants to 0.3", () => {
+    fill(
+      "cap",
+      Array.from({ length: CALIBRATION_MIN_SAMPLES }, () => 0.8),
+    );
+    observeContextCalibration({
+      capacityId: "cap",
+      identity,
+      textEstimate: 100_000,
+      promptTokens: 800,
+      mediaParts: 0,
+    });
+    expect(calibratedContextTokens("cap", identity, 1000)).toBe(Math.ceil(1000 * 0.8));
+  });
+
+  it("applies the factor to text tokens only", () => {
+    fill(
+      "cap",
+      Array.from({ length: CALIBRATION_MIN_SAMPLES }, () => 0.8),
+    );
+    expect(calibratedContextTokens("cap", identity, 1000, 4096)).toBe(Math.ceil(1000 * 0.8) + 4096);
+    expect(calibratedFootprintTokens("cap", identity, 1000, 4096)).toBe(
+      Math.ceil(1000 * 0.8) + 4096,
     );
   });
 

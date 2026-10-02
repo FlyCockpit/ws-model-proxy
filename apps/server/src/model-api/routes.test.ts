@@ -11,6 +11,12 @@ import { POOL_MEMBER_HALF_OPEN_LEASE_MS } from "@ws-model-proxy/api/lib/model-po
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 import { afterEach, beforeEach, describe, expect, it, type MockInstance, vi } from "vitest";
 import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/session-manager.js";
+import {
+  CALIBRATION_MIN_SAMPLES,
+  calibratedContextTokens,
+  observeContextCalibration,
+  resetContextCalibrationForTests,
+} from "./capacity/calibration.js";
 import { CapacityLeaseLostError } from "./capacity/lease-loss.js";
 import { CapacityLeaseOwner } from "./capacity/lease-owner.js";
 import { holdCapacityLeaseForResponse } from "./capacity/response-lease.js";
@@ -343,13 +349,20 @@ class FakeRelayManager {
     });
   }
 
-  complete(requestId: string) {
+  complete(
+    requestId: string,
+    usage: { promptTokens: number; completionTokens: number; totalTokens: number } = {
+      promptTokens: 3,
+      completionTokens: 5,
+      totalTokens: 8,
+    },
+  ) {
     const handler = this.handlers.get(requestId);
     this.handlers.delete(requestId);
     handler?.onComplete({
       type: "relay.complete",
       requestId,
-      usage: { promptTokens: 3, completionTokens: 5, totalTokens: 8 },
+      usage,
     });
   }
 
@@ -501,6 +514,7 @@ function directRow({
         physicalMaxContext === undefined && countStrategy === undefined
           ? null
           : {
+              id: `${id}-capacity`,
               physicalMaxContext: physicalMaxContext ?? null,
               countStrategy: countStrategy ?? "ENGINE_REPORTED",
               runtimeIdentityKey: `${id}-runtime`,
@@ -5335,6 +5349,139 @@ describe("model API routes", () => {
         }),
       ),
     );
+  });
+
+  describe("context calibration samples (#190)", () => {
+    const identity = {
+      runtimeIdentityKey: "model-id-runtime",
+      runtimeModel: "gpt-4o-mini",
+      runtimeRevision: null,
+    };
+    const usage = { promptTokens: 40, completionTokens: 5, totalTokens: 45 };
+
+    afterEach(() => resetContextCalibrationForTests());
+
+    async function completeDirectChat(manager: FakeRelayManager) {
+      const responsePromise = appWith(manager).request("/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: requestBody(),
+      });
+      await vi.waitFor(() => expect(manager.sent.length).toBeGreaterThan(0));
+      const sent = manager.sent.at(-1)!;
+      manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+      const response = await responsePromise;
+      manager.body(sent.requestId, JSON.stringify({ id: "chatcmpl", choices: [] }));
+      manager.complete(sent.requestId, usage);
+      await response.arrayBuffer();
+    }
+
+    it("warms a direct capacity after the sample threshold", async () => {
+      db.discoveredModel.findUnique.mockResolvedValue(
+        directRow({ countStrategy: "CALIBRATED_ESTIMATE" }),
+      );
+      for (let i = 0; i < CALIBRATION_MIN_SAMPLES - 1; i++) {
+        observeContextCalibration({
+          capacityId: "model-id-capacity",
+          identity,
+          textEstimate: 40,
+          promptTokens: usage.promptTokens,
+          mediaParts: 0,
+        });
+      }
+      expect(calibratedContextTokens("model-id-capacity", identity, 1000)).toBeNull();
+      await completeDirectChat(new FakeRelayManager());
+      await vi.waitFor(() =>
+        expect(calibratedContextTokens("model-id-capacity", identity, 1000)).not.toBeNull(),
+      );
+    });
+
+    it("does not record bound Responses continuations", async () => {
+      const member = poolMemberRow({
+        id: "member-a",
+        discoveredModelId: "model-a",
+        upstreamModelId: "upstream-a",
+        cliDeviceId: "cli-a",
+        affinityEnabled: true,
+        countStrategy: "CALIBRATED_ESTIMATE",
+      });
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [poolTarget],
+      });
+      db.poolMember.findMany.mockResolvedValue([member]);
+      db.discoveredModel.findUnique.mockResolvedValue(
+        directRow({
+          id: "model-a",
+          upstreamModelId: "upstream-a",
+          cliDeviceId: "cli-a",
+          countStrategy: "CALIBRATED_ESTIMATE",
+        }),
+      );
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-a"];
+      const app = appWith(manager, admittingCapacityRuntime());
+      const first = app.request("/responses", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ model: poolTarget.modelId, input: "first" }),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      await completeJsonRelay({
+        manager,
+        requestId: requireSent(manager).requestId,
+        body: { id: "resp_local", object: "response" },
+      });
+      await (await first).text();
+      mockStickyRecord({
+        ...db.responseStickinessRecord.upsert.mock.calls[0]![0].create,
+        SelectedExecutionTarget: { discoveredModelId: "model-a" },
+      });
+      const observe = vi.spyOn(
+        await import("./capacity/calibration.js"),
+        "observeContextCalibration",
+      );
+      const follow = app.request("/responses", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          model: poolTarget.modelId,
+          previous_response_id: "resp_local",
+          input: "next",
+        }),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(2));
+      const sent = manager.sent[1]!;
+      manager.headers(sent.requestId, 200, { "content-type": "application/json" });
+      manager.body(
+        sent.requestId,
+        JSON.stringify({ id: "resp_next", object: "response", usage: { input_tokens: 400 } }),
+      );
+      manager.complete(sent.requestId, {
+        promptTokens: 400,
+        completionTokens: 5,
+        totalTokens: 405,
+      });
+      expect((await follow).status).toBe(200);
+      await vi.waitFor(() =>
+        expect(db.relayRequest.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({ status: "SUCCEEDED" }),
+          }),
+        ),
+      );
+      expect(observe).not.toHaveBeenCalled();
+      observe.mockRestore();
+    });
   });
 
   describe("usage rollups (exactly once per terminal transition)", () => {

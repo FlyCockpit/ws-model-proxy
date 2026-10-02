@@ -11,6 +11,8 @@ export type ContextCountTelemetry = ContextCount & {
   confidence: "EXACT" | "HIGH" | "CONSERVATIVE" | "FALLBACK";
   safetyMargin: number;
   serializedChars: number;
+  textTokens?: number;
+  mediaTokens?: number;
 };
 
 export interface ContextCounter {
@@ -65,6 +67,8 @@ export async function countSerializedRequestContext({
     safetyMargin:
       result.method === "CHAR_ESTIMATE" || result.method === "TOKEN_ESTIMATE" ? safetyMargin : 1,
     serializedChars: serialized.length,
+    textTokens: payloadEstimate.textTokens,
+    mediaTokens: payloadEstimate.mediaTokens,
   };
 }
 
