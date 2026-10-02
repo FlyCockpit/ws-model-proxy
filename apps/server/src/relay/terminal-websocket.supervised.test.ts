@@ -105,13 +105,13 @@ function hello(terminalApproval = false) {
   return JSON.stringify({
     type: "hello",
     id: "hello-desktop",
-    protocolVersion: "2.8",
+    protocolVersion: "2.4",
     cli: {
       slug: "desktop",
       hostname: "desktop.local",
       version: "0.4.0",
       capabilities: {
-        protocolVersion: "2.8",
+        protocolVersion: "2.4",
         inventoryAck: true,
         inventoryReplace: true,
         endpointTargeting: true,

@@ -321,7 +321,7 @@ export function judgeCliAgentAdmission(
     // Mode `supervised`: a person must confirm each command. Headless exec is refused.
     if (!allowsHeadlessCommands(grant)) return { ok: false, error: "supervised_only" };
     const live = liveFeatures(input.cliDeviceId);
-    if (!live || !relayProtocolAtLeast(live.protocolVersion, "2.6")) {
+    if (!live || !relayProtocolAtLeast(live.protocolVersion, "2.4")) {
       return { ok: false, error: "offline" };
     }
     if (live.mcpCommandMode === "off") return { ok: false, error: "feature_disabled" };
@@ -338,7 +338,7 @@ export function judgeCliAgentAdmission(
       server: device.mcpFileRead === true,
       live:
         live?.mcpFileRead === true &&
-        relayProtocolAtLeast(live.protocolVersion, "2.8") &&
+        relayProtocolAtLeast(live.protocolVersion, "2.4") &&
         live.fileOps === true,
       roots: live?.fileRootsConfigured === true,
     };
@@ -355,7 +355,7 @@ export function judgeCliAgentAdmission(
           }
         : { ok: false, error: "offline" };
     }
-    if (!relayProtocolAtLeast(live.protocolVersion, "2.8") || !live.fileOps) {
+    if (!relayProtocolAtLeast(live.protocolVersion, "2.4") || !live.fileOps) {
       return { ok: false, error: "offline" };
     }
     const liveRefusal = fileLiveStageRefusal(grant, live.mcpCommandMode, opClass, readGrant);
@@ -379,7 +379,7 @@ export function judgeCliAgentAdmission(
   }
   if (
     !live ||
-    !relayProtocolAtLeast(live.protocolVersion, options?.fileWrite ? "2.8" : "2.6") ||
+    !relayProtocolAtLeast(live.protocolVersion, "2.4") ||
     !live.supervisedCommands ||
     (options?.fileWrite && !live.fileOps)
   ) {

@@ -712,9 +712,9 @@ function liveTerminalFeature(snapshot: LiveCliFeatureSnapshot | null): boolean {
   );
 }
 
-/** The CLI's live MCP command mode; `off` while it is offline or pre-2.6. */
+/** The CLI's live MCP command mode; `off` while it is offline or older than 2.4. */
 function liveCommandMode(snapshot: LiveCliFeatureSnapshot | null): McpCommandModeName {
-  if (!snapshot || !relayProtocolAtLeast(snapshot.protocolVersion, "2.6")) return "off";
+  if (!snapshot || !relayProtocolAtLeast(snapshot.protocolVersion, "2.4")) return "off";
   return snapshot.mcpCommandMode;
 }
 
@@ -724,11 +724,11 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
   const terminalSupported = row.reportedTerminalSupported ?? null;
   const commandsGrant = mcpCommandModeFromDb(row.mcpCommandMode);
   const commandsDeviceMode = mcpCommandModeFromDb(row.reportedMcpCommandMode ?? null);
-  const commandsLive = live !== null && relayProtocolAtLeast(live.protocolVersion, "2.6");
+  const commandsLive = live !== null && relayProtocolAtLeast(live.protocolVersion, "2.4");
   const commandsEffective = lowestMcpCommandMode(commandsGrant, liveCommandMode(live));
-  // Node file tools (relay 2.8) follow the same effective mode through the one
-  // file matrix; a CLI that is offline or older than 2.8 runs none.
-  const fileToolsLive = live !== null && relayProtocolAtLeast(live.protocolVersion, "2.8");
+  // Node file tools follow the same effective mode through the one file
+  // matrix; a CLI that is offline or older than 2.4 runs none.
+  const fileToolsLive = live !== null && relayProtocolAtLeast(live.protocolVersion, "2.4");
   const refusals = mcpCommandRefusals({
     grant: commandsGrant,
     live:

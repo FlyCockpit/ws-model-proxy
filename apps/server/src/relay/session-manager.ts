@@ -1859,7 +1859,7 @@ export class RelaySessionManager {
   }
 
   private async sendRemoteEngineAdaptersNow(session: SessionState): Promise<boolean> {
-    if (!relayProtocolAtLeast(session.protocolVersion, "2.9")) return false;
+    if (!relayProtocolAtLeast(session.protocolVersion, "2.4")) return false;
     const cliDeviceId = session.cliDeviceId;
     if (!cliDeviceId) return false;
     let adapters: RemoteEngineAdapter[] = [];
@@ -1973,11 +1973,11 @@ export class RelaySessionManager {
         cliVersion: session.cliVersion,
         humanTerminal: session.features?.humanTerminal ?? false,
         mcpCommandMode: session.features?.mcpCommandMode ?? "off",
-        supervisedCommands: relayProtocolAtLeast(session.protocolVersion, "2.6"),
+        supervisedCommands: relayProtocolAtLeast(session.protocolVersion, "2.4"),
         terminalSupported: session.features?.terminalSupported ?? false,
         terminalApproval: session.features?.terminalApproval ?? false,
         fileOps:
-          relayProtocolAtLeast(session.protocolVersion, "2.8") &&
+          relayProtocolAtLeast(session.protocolVersion, "2.4") &&
           session.features?.fileOps === true,
         mcpFileRead: session.features?.mcpFileRead ?? false,
         fileRootsConfigured: session.features?.fileRootsConfigured ?? false,
@@ -2521,7 +2521,7 @@ export class RelaySessionManager {
       live:
         session.features?.mcpFileRead === true &&
         session.features.fileOps === true &&
-        relayProtocolAtLeast(session.protocolVersion, "2.8"),
+        relayProtocolAtLeast(session.protocolVersion, "2.4"),
       roots: session.features?.fileRootsConfigured === true,
     };
     return (
@@ -2810,7 +2810,7 @@ export class RelaySessionManager {
    * Without a terminal, whether any terminal frame may be sent at all.
    */
   private canSignalTerminal(session: SessionState, terminal?: TerminalRecord): boolean {
-    if (!relayProtocolAtLeast(session.protocolVersion, "2.6")) return false;
+    if (!relayProtocolAtLeast(session.protocolVersion, "2.4")) return false;
     if (session.socket.readyState !== WS_READY_STATE_OPEN) return false;
     if (terminal?.origin === "agent") return true;
     if (terminal === undefined) return true;
@@ -2845,7 +2845,7 @@ export class RelaySessionManager {
   /** Supervised terminals: MCP command mode, not the human terminal grant. */
   private supervisedPolicyAllows(session: SessionState): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
+      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       allowsSupervisedCommands(this.effectiveCommandMode(session)) &&
       session.features?.terminalSupported === true &&
       session.terminalPublicKey !== null
@@ -2860,7 +2860,7 @@ export class RelaySessionManager {
 
   private canStartExec(session: SessionState): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
+      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       allowsHeadlessCommands(this.effectiveCommandMode(session)) &&
       session.socket.readyState === WS_READY_STATE_OPEN
     );
@@ -2869,7 +2869,7 @@ export class RelaySessionManager {
   /** Node file ops (2.8) follow the effective mode through the one file matrix. */
   private canStartFile(session: SessionState, opClass: FileOpClass): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.8") &&
+      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       session.cliDeviceId !== null &&
       this.fileOpModeRefusal(session.cliDeviceId, opClass) === null &&
       session.features?.fileOps === true &&
@@ -2879,14 +2879,14 @@ export class RelaySessionManager {
 
   private canSignalFile(session: SessionState): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.8") &&
+      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       session.socket.readyState === WS_READY_STATE_OPEN
     );
   }
 
   private canSignalExec(session: SessionState): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
+      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       session.socket.readyState === WS_READY_STATE_OPEN
     );
   }
@@ -2898,7 +2898,7 @@ export class RelaySessionManager {
 
   private reconcileInteractiveGrants(session: SessionState) {
     const terminalOk =
-      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
+      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       session.allowHumanTerminal &&
       session.features?.humanTerminal === true &&
       session.features.terminalSupported === true;
@@ -2910,7 +2910,7 @@ export class RelaySessionManager {
       this.closeAllTerminals(session, this.canSignalTerminal(session), "policy", "agent");
     }
     const execOk =
-      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
+      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       allowsHeadlessCommands(this.effectiveCommandMode(session));
     if (!execOk) this.cancelAllCommands(session);
     this.cancelFileOpsNoLongerAllowed(session);

@@ -1001,7 +1001,7 @@ export class TerminalBrowserHub {
           publicKey: availability.publicKey,
           reason: availability.reason,
           // 2.5 CLIs: several tabs can view one terminal (v2 terminal crypto).
-          terminalViewers: relayProtocolAtLeast(live.get(row.id)?.protocolVersion, "2.5"),
+          terminalViewers: relayProtocolAtLeast(live.get(row.id)?.protocolVersion, "2.4"),
           // 2.5 CLI identity, relayed unverified. Browsers check the signature
           // over `publicKey` and this slug, then pin the key per cliDeviceId.
           ...identityFields(availability.publicKey, live.get(row.id) ?? null),

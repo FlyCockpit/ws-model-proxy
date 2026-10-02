@@ -203,7 +203,7 @@ mod tests {
         assert_eq!(capabilities.terminal_public_key, public_key);
         assert!(capabilities.terminal);
         assert!(capabilities.exec);
-        assert_eq!(capabilities.protocol_version, "2.9");
+        assert_eq!(capabilities.protocol_version, "2.4");
         assert!(capabilities.file_ops);
         assert!(capabilities.features.mcp_file_read);
         assert!(startup.mcp_file_read());

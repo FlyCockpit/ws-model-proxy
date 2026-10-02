@@ -11,8 +11,8 @@ excluded procedure) is maintained in the generated, test-enforced artifact
 [docs/mcp-tool-coverage.md](./mcp-tool-coverage.md). This document describes the
 server behavior around it; it does not duplicate the catalog.
 
-Node telemetry (relay protocol 2.7) is read-only over MCP. Node file tools
-(relay protocol 2.8) are described in [CLI file tools](#cli-file-tools-relay-protocol-28).
+Node telemetry (relay protocol 2.4) is read-only over MCP. Node file tools
+(relay protocol 2.4) are described in [CLI file tools](#cli-file-tools-relay-protocol-24).
 `forwarder_device_metrics_get` (`{ cliDeviceId }`) returns a CLI device's static
 `node.info`, its freshest `node.metrics` (live from the relay session, else the
 stored once-a-minute snapshot, with `nodeMetricsSource`), and the live
@@ -148,7 +148,7 @@ Owners see every requester on their pools; grantees see only their own. A
 foreign pool or member returns `NOT_FOUND`. Engine prefix-cache counters stay
 on the engine-load charts and are not mixed into this tool.
 
-## CLI file tools (relay protocol 2.8)
+## CLI file tools (relay protocol 2.4)
 
 Nine PAT-only tools read and change files on a CLI device (a node): `forwarder_cli_file_read`,
 `forwarder_cli_file_stat`, `forwarder_cli_dir_list`, `forwarder_cli_file_search`

@@ -11,7 +11,7 @@ use crate::config::{
 };
 pub use crate::terminal_identity::TerminalIdentityProof;
 
-pub const RELAY_PROTOCOL_VERSION: &str = "2.9";
+pub const RELAY_PROTOCOL_VERSION: &str = "2.4";
 pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v2";
 pub const RELAY_JSON_CONTROL_MAX_BYTES: usize = 64 * 1024;
 pub const RELAY_BINARY_CHUNK_MAX_BYTES: usize = 1024 * 1024;
@@ -2578,7 +2578,7 @@ mod tests {
 
         let encoded = encode_control(&message).expect("encode");
 
-        assert!(encoded.contains(r#""protocolVersion":"2.9""#));
+        assert!(encoded.contains(r#""protocolVersion":"2.4""#));
         assert!(encoded.contains(r#""nodeTelemetry":true"#));
         assert!(encoded.contains(r#""fileOps":true"#));
         assert!(encoded.contains(r#""mcpFileRead":false"#));
@@ -2826,7 +2826,7 @@ mod tests {
     #[test]
     fn an_older_server_rejection_says_to_upgrade_the_server() {
         let message = hello_rejection_message(OLDER_SERVER_HELLO_REJECTION);
-        assert!(message.contains("rejected relay protocol 2.9"), "{message}");
+        assert!(message.contains("rejected relay protocol 2.4"), "{message}");
         assert!(
             message.contains("upgrade the WS Model Proxy server"),
             "{message}"
@@ -2863,10 +2863,10 @@ mod tests {
 
     #[test]
     fn a_future_server_upgrade_required_reply_stays_a_cli_too_old_error() {
-        // A 2.9 server's genuine "upgrade wsmp" must pass through: the CLI is
+        // A future server's genuine "upgrade wsmp" must pass through: the CLI is
         // the one behind, so do not tell the person to upgrade the server.
         let reply =
-            "This server requires a newer wsmp (relay protocol 2.9). Upgrade wsmp and restart it.";
+            "This server requires a newer wsmp (relay protocol 2.5). Upgrade wsmp and restart it.";
         assert_eq!(
             hello_rejection_message(reply),
             format!("relay protocol error: {reply}")

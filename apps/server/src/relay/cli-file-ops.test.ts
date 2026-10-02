@@ -133,13 +133,13 @@ function hello(slug: string, mode: Mode, readSwitch = false, roots = false) {
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion: "2.8",
+    protocolVersion: "2.4",
     cli: {
       slug,
       hostname: `${slug}.local`,
       version: "9.9.9",
       capabilities: {
-        protocolVersion: "2.8",
+        protocolVersion: "2.4",
         inventoryAck: true,
         inventoryReplace: true,
         endpointTargeting: true,

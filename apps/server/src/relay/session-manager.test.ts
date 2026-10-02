@@ -124,7 +124,7 @@ function capabilities26(features?: {
   terminalSupported?: boolean;
 }) {
   return {
-    protocolVersion: "2.8",
+    protocolVersion: "2.4",
     inventoryAck: true,
     inventoryReplace: true,
     endpointTargeting: true,
@@ -159,7 +159,7 @@ function helloFrame() {
   return JSON.stringify({
     type: "hello",
     id: "hello-id",
-    protocolVersion: "2.8",
+    protocolVersion: "2.4",
     cli: {
       slug: "desktop",
       hostname: "desk-01.local",
@@ -1060,7 +1060,7 @@ describe("RelaySessionManager", () => {
     expect(JSON.parse(String(socket.sends[0]))).toEqual({
       type: "hello.ok",
       id: "hello-id",
-      protocolVersion: "2.8",
+      protocolVersion: "2.4",
       revision: {
         inventorySeq: 1,
         inventoryDigest: "digest",
@@ -1597,7 +1597,7 @@ describe("RelaySessionManager", () => {
     const frame = JSON.stringify({
       type: "hello",
       id: "hello-id",
-      protocolVersion: "2.8",
+      protocolVersion: "2.4",
       cli: {
         slug: "desktop",
         hostname: "desk-01.local",
@@ -1976,7 +1976,7 @@ function helloCli(features?: {
   return JSON.stringify({
     type: "hello",
     id: "hello-cli",
-    protocolVersion: "2.8",
+    protocolVersion: "2.4",
     cli: {
       slug: "desktop",
       hostname: "desk-01.local",
@@ -2032,7 +2032,7 @@ describe("relay terminal and exec sessions", () => {
       }),
     );
     expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
-      protocolVersion: "2.8",
+      protocolVersion: "2.4",
       fileOps: true,
       mcpFileRead: true,
       fileRootsConfigured: true,
@@ -2092,9 +2092,9 @@ describe("relay terminal and exec sessions", () => {
     expect(socket.closes).toEqual([]);
   });
 
-  it("reports fileOps live only when the 2.8 hello's own capability says so", async () => {
-    // The live snapshot ANDs `protocolVersion >= 2.8` with the hello's own
-    // `capabilities.fileOps`. A real 2.8 hello pins fileOps true (the strict
+  it("reports fileOps live only when the 2.4 hello's own capability says so", async () => {
+    // The live snapshot ANDs `protocolVersion >= 2.4` with the hello's own
+    // `capabilities.fileOps`. A real 2.4 hello pins fileOps true (the strict
     // schema requires `z.literal(true)`), so the false side is reached by
     // clearing the recorded feature, exactly as a degraded/absent capability
     // would leave it.
@@ -2102,7 +2102,7 @@ describe("relay terminal and exec sessions", () => {
     const socket = new FakeSocket();
     await register(manager, socket);
     const snapshot = () => manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id");
-    expect(snapshot()).toMatchObject({ protocolVersion: "2.8", fileOps: true, mcpFileRead: false });
+    expect(snapshot()).toMatchObject({ protocolVersion: "2.4", fileOps: true, mcpFileRead: false });
 
     const session = (
       Reflect.get(manager, "sessionsByCliDeviceId") as Map<
@@ -2112,7 +2112,7 @@ describe("relay terminal and exec sessions", () => {
     ).get("cli-device-id");
     if (session) session.features = { ...session.features, fileOps: false, mcpFileRead: true };
     // The read switch reports true, yet the capability term withdraws fileOps.
-    expect(snapshot()).toMatchObject({ protocolVersion: "2.8", fileOps: false, mcpFileRead: true });
+    expect(snapshot()).toMatchObject({ protocolVersion: "2.4", fileOps: false, mcpFileRead: true });
   });
 
   it("drops file frames for an unknown op and refuses them before registration", async () => {
@@ -2164,12 +2164,12 @@ describe("relay terminal and exec sessions", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     await register(manager, socket, helloCli({ mcpCommandMode: "supervised" }));
-    expect(JSON.parse(String(socket.sends[0])).protocolVersion).toBe("2.8");
+    expect(JSON.parse(String(socket.sends[0])).protocolVersion).toBe("2.4");
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         update: expect.objectContaining({
           cliVersion: "9.9.9",
-          relayProtocolVersion: "2.8",
+          relayProtocolVersion: "2.4",
           reportedHumanTerminal: true,
           reportedMcpCommandMode: "SUPERVISED",
           reportedTerminalApproval: false,
@@ -2434,7 +2434,7 @@ describe("relay terminal and exec sessions", () => {
     consoleError.mockRestore();
   });
 
-  it("registers a valid 2.8 hello", async () => {
+  it("registers a valid 2.4 hello", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     await register(manager, socket);
@@ -2442,19 +2442,19 @@ describe("relay terminal and exec sessions", () => {
     expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
   });
 
-  it("registers a valid 2.9 hello", async () => {
+  it("registers a 2.4 hello that includes custom adapter capability bits", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     const frame = JSON.parse(helloCli()) as {
       protocolVersion: string;
       cli: { capabilities: Record<string, unknown> };
     };
-    frame.protocolVersion = "2.9";
-    frame.cli.capabilities.protocolVersion = "2.9";
+    frame.protocolVersion = "2.4";
+    frame.cli.capabilities.protocolVersion = "2.4";
     await register(manager, socket, JSON.stringify(frame));
     expect(JSON.parse(String(socket.sends[0]))).toMatchObject({
       type: "hello.ok",
-      protocolVersion: "2.9",
+      protocolVersion: "2.4",
     });
     expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
   });
@@ -2720,14 +2720,14 @@ describe("relay terminal viewers", () => {
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         update: expect.objectContaining({
-          relayProtocolVersion: "2.8",
+          relayProtocolVersion: "2.4",
           reportedMcpCommandMode: "UNSUPERVISED",
           reportedHumanTerminal: true,
         }),
       }),
     );
     expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
-      protocolVersion: "2.8",
+      protocolVersion: "2.4",
       mcpCommandMode: "unsupervised",
       supervisedCommands: true,
       terminalPublicKey: uncompressedKey(),
@@ -3138,8 +3138,8 @@ describe("relay 2.7 telemetry", () => {
       protocolVersion: string;
       cli: { capabilities: { protocolVersion: string } };
     };
-    frame.protocolVersion = "2.9";
-    frame.cli.capabilities.protocolVersion = "2.9";
+    frame.protocolVersion = "2.4";
+    frame.cli.capabilities.protocolVersion = "2.4";
     return JSON.stringify(frame);
   }
 

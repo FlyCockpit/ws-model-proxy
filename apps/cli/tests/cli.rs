@@ -2018,7 +2018,7 @@ mod signal_shutdown {
             &json!({
                 "type": "hello.ok",
                 "id": hello["id"],
-                "protocolVersion": "2.7",
+                "protocolVersion": "2.4",
                 "revision": {
                     "inventorySeq": 1,
                     "inventoryDigest": "d",

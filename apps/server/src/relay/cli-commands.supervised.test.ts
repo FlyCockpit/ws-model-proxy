@@ -119,13 +119,13 @@ function hello(slug: string, features: { mode: Mode; terminalSupported: boolean 
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion: "2.8",
+    protocolVersion: "2.4",
     cli: {
       slug,
       hostname: `${slug}.local`,
       version: "0.4.0",
       capabilities: {
-        protocolVersion: "2.8",
+        protocolVersion: "2.4",
         inventoryAck: true,
         inventoryReplace: true,
         endpointTargeting: true,
@@ -2126,10 +2126,10 @@ describe("supervised commands", () => {
     );
 
     it.each([
-      ["OFF", "supervised", "2.8", true, "grant_disabled"],
-      ["SUPERVISED", "off", "2.8", true, "feature_disabled"],
+      ["OFF", "supervised", "2.4", true, "grant_disabled"],
+      ["SUPERVISED", "off", "2.4", true, "feature_disabled"],
       ["SUPERVISED", "supervised", "2.7", true, "offline"],
-      ["SUPERVISED", "supervised", "2.8", false, "offline"],
+      ["SUPERVISED", "supervised", "2.4", false, "offline"],
     ] as const)(
       "direct file admission refuses grant %s / live %s / protocol %s / fileOps %s as %s",
       async (grant, mode, protocolVersion, fileOps, error) => {
@@ -2268,7 +2268,7 @@ describe("supervised commands", () => {
               {
                 ...live,
                 ...(missing === "protocol"
-                  ? { protocolVersion: "2.7" as const }
+                  ? { protocolVersion: "2.3" as const }
                   : { fileOps: false }),
               },
             ],

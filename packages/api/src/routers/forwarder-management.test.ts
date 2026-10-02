@@ -5496,7 +5496,7 @@ describe("setCliDeviceFeatureGrants", () => {
       },
     ]);
     const live = {
-      protocolVersion: "2.8",
+      protocolVersion: "2.4",
       cliVersion: "0.4.0",
       humanTerminal: false,
       mcpCommandMode: "off",
@@ -5597,7 +5597,7 @@ describe("setCliDeviceFeatureGrants", () => {
         allowHumanTerminal: true,
         mcpCommandMode: "UNSUPERVISED",
         cliVersion: "0.4.0",
-        relayProtocolVersion: "2.8",
+        relayProtocolVersion: "2.4",
         reportedHumanTerminal: true,
         reportedMcpCommandMode: "SUPERVISED",
         reportedTerminalApproval: false,
@@ -5638,7 +5638,7 @@ describe("setCliDeviceFeatureGrants", () => {
     const liveClient = (
       mcpCommandMode: "off" | "supervised" | "unsupervised",
       terminalSupported = true,
-      protocolVersion = "2.8",
+      protocolVersion = "2.4",
       allowFileToolsAsRoot = false,
     ) =>
       createRouterClient(forwarderManagementRouter, {
@@ -5657,7 +5657,7 @@ describe("setCliDeviceFeatureGrants", () => {
                     supervisedCommands: true,
                     terminalSupported,
                     terminalApproval: false,
-                    fileOps: protocolVersion === "2.8",
+                    fileOps: protocolVersion === "2.4",
                     mcpFileRead: false,
                     fileRootsConfigured: false,
                     allowFileToolsAsRoot,
@@ -5755,7 +5755,7 @@ describe("setCliDeviceFeatureGrants", () => {
     expect(grantLimited[0]?.fileTools).toEqual({ read: "supervised", write: "supervised" });
     expect(liveOff[0]?.fileTools).toEqual({ read: "off", write: "off" });
     db.cliDevice.findMany.mockResolvedValue([{ ...row, mcpCommandMode: "UNSUPERVISED" }]);
-    const liveUnsupervised = await liveClient("unsupervised", true, "2.8", true).listCliDevices();
+    const liveUnsupervised = await liveClient("unsupervised", true, "2.4", true).listCliDevices();
     expect(liveUnsupervised[0]?.fileTools).toEqual({ read: "headless", write: "headless" });
     // The live root switch wins over the stored report.
     expect(liveUnsupervised[0]?.allowFileToolsAsRoot).toBe(true);
@@ -5769,7 +5769,7 @@ describe("setCliDeviceFeatureGrants", () => {
 
   it("grants no file tools when the dashboard grant is off, whatever the CLI reports", async () => {
     const liveRow = (overrides: Record<string, unknown>) => ({
-      protocolVersion: "2.8",
+      protocolVersion: "2.4",
       cliVersion: "0.5.0",
       humanTerminal: false,
       mcpCommandMode: "unsupervised" as const,
@@ -5795,7 +5795,7 @@ describe("setCliDeviceFeatureGrants", () => {
         allowHumanTerminal: false,
         mcpCommandMode: "OFF",
         cliVersion: "0.5.0",
-        relayProtocolVersion: "2.8",
+        relayProtocolVersion: "2.4",
         reportedHumanTerminal: false,
         reportedMcpCommandMode: "UNSUPERVISED",
         reportedTerminalApproval: false,
@@ -5823,7 +5823,7 @@ describe("setCliDeviceFeatureGrants", () => {
     // grant, the CLI's read switch and its roots; a session that reports
     // fileOps false runs no file op and must be summarized as off.
     const liveRow = (overrides: Record<string, unknown>) => ({
-      protocolVersion: "2.8",
+      protocolVersion: "2.4",
       cliVersion: "0.5.0",
       humanTerminal: false,
       mcpCommandMode: "supervised" as const,
@@ -5848,7 +5848,7 @@ describe("setCliDeviceFeatureGrants", () => {
       allowHumanTerminal: false,
       mcpCommandMode: mode,
       cliVersion: "0.5.0",
-      relayProtocolVersion: "2.8",
+      relayProtocolVersion: "2.4",
       reportedHumanTerminal: false,
       reportedMcpCommandMode: "UNSUPERVISED",
       reportedTerminalApproval: false,

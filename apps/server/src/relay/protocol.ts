@@ -34,10 +34,10 @@ export {
 type FileSpawnSpec = z.infer<typeof fileSpawnSpecSchema>;
 
 /**
- * Sent as `protocol.error` to a CLI whose hello is older than 2.8. Every
+ * Sent as `protocol.error` to a CLI whose hello is older than 2.4. Every
  * released wsmp prints `relay protocol error: <message>` and exits, so this
  * text is what the person sees. It names the protocol rather than a wsmp
- * version: the first release that speaks 2.8 is cut separately.
+ * version: the first release that speaks 2.4 is cut separately.
  */
 export const RELAY_UPGRADE_REQUIRED_MESSAGE = `This server requires a newer wsmp (relay protocol ${RELAY_MIN_PROTOCOL_VERSION}). Upgrade wsmp and restart it.`;
 export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v2";
@@ -158,7 +158,7 @@ const v28FeatureSchema = z
     /**
      * 2.9: the CLI accepts remotely defined engine adapters
      * (`engine.adapters.set`): its local `allowRemoteEngineAdapters` opt-in
-     * is on. Absent on 2.8 hellos.
+     * is on. Optional so older hellos still parse.
      */
     remoteEngineAdapters: z.boolean().optional(),
     /**
@@ -180,7 +180,7 @@ const v28FeatureSchema = z
  */
 const v28CliCapabilitiesSchema = z
   .object({
-    protocolVersion: z.enum(["2.8", "2.9"]),
+    protocolVersion: z.enum(["2.4"]),
     inventoryAck: z.literal(true),
     inventoryReplace: z.literal(true),
     endpointTargeting: z.literal(true),
@@ -718,7 +718,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
     .object({
       type: z.literal("hello"),
       id: requestIdSchema,
-      protocolVersion: z.enum(["2.8", "2.9"]),
+      protocolVersion: z.enum(["2.4"]),
       cli: z
         .object({
           slug: z.string().trim().min(1).max(63),
@@ -1249,7 +1249,7 @@ export function parseRelayClientControlFrame(frame: string): RelayClientControlM
 }
 
 /**
- * True for a hello that is not a protocol this server speaks: older than 2.8,
+ * True for a hello that is not a protocol this server speaks: older than 2.4,
  * newer than the newest listed version, or the pre-naming `cli.label` field.
  * Checked before the strict schema so such a CLI gets
  * `RELAY_UPGRADE_REQUIRED_MESSAGE` instead of an opaque "malformed message".
