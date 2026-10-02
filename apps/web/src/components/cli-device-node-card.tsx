@@ -60,11 +60,42 @@ function budgetInputSchema(invalidMessage: string) {
   }, invalidMessage);
 }
 
+function budgetDefaultMark(isDefault: boolean, t: (key: string) => string): string {
+  return isDefault ? t("dashboard:clis.node.budgetDefaultMark") : "";
+}
+
+function gpuStatLine(
+  gpu: NodeCardSnapshot["gpus"][number],
+  t: (key: string, options?: Record<string, unknown>) => string,
+): string {
+  const name = gpu.name ?? t("dashboard:clis.node.gpuIndex", { index: gpu.index });
+  const vram =
+    gpu.vramUsedGb != null && gpu.vramTotalGb != null
+      ? t("dashboard:clis.node.vramDetail", {
+          used: formatGb(gpu.vramUsedGb),
+          total: formatGb(gpu.vramTotalGb),
+        })
+      : gpu.vramTotalGb != null
+        ? t("dashboard:clis.node.vramTotalDetail", { total: formatGb(gpu.vramTotalGb) })
+        : "";
+  const temp =
+    gpu.temperatureC != null
+      ? t("dashboard:clis.node.tempDetail", { value: Math.round(gpu.temperatureC) })
+      : "";
+  const util =
+    gpu.utilizationPercent != null
+      ? t("dashboard:clis.node.utilDetail", { value: Math.round(gpu.utilizationPercent) })
+      : "";
+  return t("dashboard:clis.node.gpuLine", { name, vram, temp, util });
+}
+
 export function CliDeviceNodeCard({
   cliDeviceId,
+  deviceName,
   node,
 }: {
   cliDeviceId: string;
+  deviceName: string;
   node: NodeCardSnapshot;
 }) {
   const { t } = useTranslation("dashboard");
@@ -113,25 +144,7 @@ export function CliDeviceNodeCard({
             ) : (
               node.gpus.map((gpu) => (
                 <p key={gpuKey(gpu)} className="min-w-0 truncate">
-                  {gpu.name ?? t("dashboard:clis.node.gpuIndex", { index: gpu.index })}
-                  {gpu.vramUsedGb != null && gpu.vramTotalGb != null
-                    ? ` · ${t("dashboard:clis.node.vram", {
-                        used: formatGb(gpu.vramUsedGb),
-                        total: formatGb(gpu.vramTotalGb),
-                      })}`
-                    : gpu.vramTotalGb != null
-                      ? ` · ${t("dashboard:clis.node.vramTotal", {
-                          total: formatGb(gpu.vramTotalGb),
-                        })}`
-                      : ""}
-                  {gpu.temperatureC != null
-                    ? ` · ${t("dashboard:clis.node.temp", { value: Math.round(gpu.temperatureC) })}`
-                    : ""}
-                  {gpu.utilizationPercent != null
-                    ? ` · ${t("dashboard:clis.node.util", {
-                        value: Math.round(gpu.utilizationPercent),
-                      })}`
-                    : ""}
+                  {gpuStatLine(gpu, t)}
                 </p>
               ))
             )}
@@ -142,7 +155,7 @@ export function CliDeviceNodeCard({
       <div className="mt-4 min-w-0">
         <div className="flex flex-wrap items-center gap-2">
           <p className="text-xs text-muted-foreground">{t("dashboard:clis.node.labels")}</p>
-          <EditLabelsDialog cliDeviceId={cliDeviceId} node={node} />
+          <EditLabelsDialog cliDeviceId={cliDeviceId} deviceName={deviceName} node={node} />
           {showSuggest ? (
             <AcceptSuggestedLabels cliDeviceId={cliDeviceId} labels={node.suggestedLabels} />
           ) : null}
@@ -165,7 +178,9 @@ export function CliDeviceNodeCard({
         )}
         {showSuggest ? (
           <p className="mt-2 text-xs text-muted-foreground">
-            {t("dashboard:clis.node.suggested")}: {node.suggestedLabels.join(", ")}
+            {t("dashboard:clis.node.suggestedList", {
+              labels: node.suggestedLabels.join(", "),
+            })}
           </p>
         ) : null}
       </div>
@@ -173,42 +188,33 @@ export function CliDeviceNodeCard({
       <div className="mt-4 min-w-0">
         <div className="flex flex-wrap items-center gap-2">
           <p className="text-xs text-muted-foreground">{t("dashboard:clis.node.budgets")}</p>
-          <EditBudgetsDialog cliDeviceId={cliDeviceId} node={node} />
+          <EditBudgetsDialog cliDeviceId={cliDeviceId} deviceName={deviceName} node={node} />
         </div>
         <ul className="mt-2 space-y-1 text-sm">
           {showMemory && node.usableMemoryGb != null ? (
             <li>
-              {t("dashboard:clis.node.usableMemory")}:{" "}
-              {t("dashboard:clis.node.budgetGb", { value: formatGb(node.usableMemoryGb) })}
-              {node.usableMemoryGbDefault ? (
-                <span className="ml-1 text-xs text-muted-foreground">
-                  ({t("dashboard:clis.node.budgetDefault")})
-                </span>
-              ) : null}
+              {t("dashboard:clis.node.usableMemoryLine", {
+                value: formatGb(node.usableMemoryGb),
+                default: budgetDefaultMark(node.usableMemoryGbDefault, t),
+              })}
             </li>
           ) : null}
           {showRam && node.usableRamGb != null ? (
             <li>
-              {t("dashboard:clis.node.usableRam")}:{" "}
-              {t("dashboard:clis.node.budgetGb", { value: formatGb(node.usableRamGb) })}
-              {node.usableRamGbDefault ? (
-                <span className="ml-1 text-xs text-muted-foreground">
-                  ({t("dashboard:clis.node.budgetDefault")})
-                </span>
-              ) : null}
+              {t("dashboard:clis.node.usableRamLine", {
+                value: formatGb(node.usableRamGb),
+                default: budgetDefaultMark(node.usableRamGbDefault, t),
+              })}
             </li>
           ) : null}
           {node.gpus.map((gpu) =>
             gpu.usableVramGb == null ? null : (
               <li key={gpuKey(gpu)}>
-                {t("dashboard:clis.node.usableVram")}{" "}
-                {gpu.name ?? t("dashboard:clis.node.gpuIndex", { index: gpu.index })}:{" "}
-                {t("dashboard:clis.node.budgetGb", { value: formatGb(gpu.usableVramGb) })}
-                {gpu.usableVramGbDefault ? (
-                  <span className="ml-1 text-xs text-muted-foreground">
-                    ({t("dashboard:clis.node.budgetDefault")})
-                  </span>
-                ) : null}
+                {t("dashboard:clis.node.usableVramLine", {
+                  gpu: gpu.name ?? t("dashboard:clis.node.gpuIndex", { index: gpu.index }),
+                  value: formatGb(gpu.usableVramGb),
+                  default: budgetDefaultMark(gpu.usableVramGbDefault, t),
+                })}
               </li>
             ),
           )}
@@ -286,7 +292,15 @@ function AcceptSuggestedLabels({
   );
 }
 
-function EditLabelsDialog({ cliDeviceId, node }: { cliDeviceId: string; node: NodeCardSnapshot }) {
+function EditLabelsDialog({
+  cliDeviceId,
+  deviceName,
+  node,
+}: {
+  cliDeviceId: string;
+  deviceName: string;
+  node: NodeCardSnapshot;
+}) {
   const { t } = useTranslation("dashboard");
   const [open, setOpen] = useState(false);
   return (
@@ -295,7 +309,7 @@ function EditLabelsDialog({ cliDeviceId, node }: { cliDeviceId: string; node: No
         type="button"
         variant="outline"
         size="touch"
-        aria-label={t("dashboard:clis.node.editLabels")}
+        aria-label={t("dashboard:clis.node.editLabelsFor", { name: deviceName })}
         onClick={() => setOpen(true)}
       >
         <Pencil className="size-4" />
@@ -455,7 +469,15 @@ function LabelsForm({
   );
 }
 
-function EditBudgetsDialog({ cliDeviceId, node }: { cliDeviceId: string; node: NodeCardSnapshot }) {
+function EditBudgetsDialog({
+  cliDeviceId,
+  deviceName,
+  node,
+}: {
+  cliDeviceId: string;
+  deviceName: string;
+  node: NodeCardSnapshot;
+}) {
   const { t } = useTranslation("dashboard");
   const [open, setOpen] = useState(false);
   return (
@@ -464,7 +486,7 @@ function EditBudgetsDialog({ cliDeviceId, node }: { cliDeviceId: string; node: N
         type="button"
         variant="outline"
         size="touch"
-        aria-label={t("dashboard:clis.node.editBudgets")}
+        aria-label={t("dashboard:clis.node.editBudgetsFor", { name: deviceName })}
         onClick={() => setOpen(true)}
       >
         <Pencil className="size-4" />
@@ -587,9 +609,9 @@ function BudgetsForm({
           {(field) => (
             <BudgetField
               id={`usable-vram-${cliDeviceId}-${gpu.index}`}
-              label={`${t("dashboard:clis.node.usableVram")} ${
-                gpu.name ?? t("dashboard:clis.node.gpuIndex", { index: gpu.index })
-              }`}
+              label={t("dashboard:clis.node.usableVramForGpu", {
+                gpu: gpu.name ?? t("dashboard:clis.node.gpuIndex", { index: gpu.index }),
+              })}
               field={field}
             />
           )}
@@ -630,7 +652,6 @@ function BudgetField({
     handleChange: (value: string) => void;
   };
 }) {
-  const { t } = useTranslation("dashboard");
   return (
     <div className="space-y-2">
       <Label htmlFor={id}>{label}</Label>
@@ -644,7 +665,6 @@ function BudgetField({
         onBlur={field.handleBlur}
         onChange={(event) => field.handleChange(event.target.value)}
       />
-      <p className="text-xs text-muted-foreground">{t("dashboard:clis.node.budgetHint")}</p>
       {field.state.meta.errors.map((error) => (
         <p key={error?.message} className="text-sm text-destructive">
           {error?.message}

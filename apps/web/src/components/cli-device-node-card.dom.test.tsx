@@ -86,7 +86,7 @@ function renderCard(snapshot: NodeCardSnapshot = node()) {
     <QueryClientProvider
       client={new QueryClient({ defaultOptions: { mutations: { retry: false } } })}
     >
-      <CliDeviceNodeCard cliDeviceId="cli-1" node={snapshot} />
+      <CliDeviceNodeCard cliDeviceId="cli-1" deviceName="desk-01" node={snapshot} />
     </QueryClientProvider>,
   );
 }
@@ -102,7 +102,9 @@ describe("CliDeviceNodeCard", () => {
     expect(screen.getByTestId("cli-device-node-card")).toBeTruthy();
     expect(screen.getByText("dashboard:clis.node.kinds.unified")).toBeTruthy();
     expect(screen.getByText(/dashboard:clis.node.memoryLive/)).toBeTruthy();
-    expect(screen.getByText(/dashboard:clis.node.suggested/)).toBeTruthy();
+    expect(screen.getByText(/dashboard:clis.node.suggestedList/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: /dashboard:clis.node.editLabelsFor/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /dashboard:clis.node.editBudgetsFor/ })).toBeTruthy();
     expect(screen.getByText("dashboard:clis.node.warning.thermal")).toBeTruthy();
     expect(screen.getByText(/dashboard:clis.node.warningsHint/)).toBeTruthy();
   });

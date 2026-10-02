@@ -833,7 +833,11 @@ export function CliEndpointsModelsSection() {
               </div>
 
               {device.node ? (
-                <CliDeviceNodeCard cliDeviceId={device.id} node={device.node} />
+                <CliDeviceNodeCard
+                  cliDeviceId={device.id}
+                  deviceName={device.displayName}
+                  node={device.node}
+                />
               ) : null}
 
               <CliDeviceFeatureSwitches
