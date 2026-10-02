@@ -6,6 +6,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use std::collections::BTreeMap;
+
 use crate::config::{
     CapabilityConfidence, CapabilityOverrideMode, CapabilitySource, Config, EndpointConfig,
     ModelConfig, OpenAiCompatibleCapabilities, ProbeSnapshot, ProbeStatus, ReasoningConfig,
@@ -112,8 +114,24 @@ struct UpstreamModelSpec {
     capabilities: Option<UpstreamCapabilityFlags>,
 }
 
-pub fn probe_endpoint(endpoint: &EndpointConfig) -> ProbeReport {
-    match try_probe_endpoint(endpoint) {
+pub fn probe_from_config(endpoint: &EndpointConfig, config: &Config) -> ProbeReport {
+    probe_endpoint(
+        endpoint,
+        config.allow_remote_engine_adapters,
+        &config.approved_remote_adapters,
+    )
+}
+
+pub fn probe_endpoint(
+    endpoint: &EndpointConfig,
+    allow_remote_engine_adapters: bool,
+    approved_remote_adapters: &BTreeMap<String, String>,
+) -> ProbeReport {
+    match try_probe_endpoint(
+        endpoint,
+        allow_remote_engine_adapters,
+        approved_remote_adapters,
+    ) {
         Ok(mut report) => {
             report.endpoint_slug = endpoint.slug.clone();
             report
@@ -133,7 +151,11 @@ pub fn probe_endpoint(endpoint: &EndpointConfig) -> ProbeReport {
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
+fn try_probe_endpoint(
+    endpoint: &EndpointConfig,
+    allow_remote_engine_adapters: bool,
+    approved_remote_adapters: &BTreeMap<String, String>,
+) -> Result<ProbeReport> {
     let url = models_url(&endpoint.base_url)?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(PROBE_TIMEOUT))
@@ -186,13 +208,12 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
         .collect::<Vec<_>>();
     let mut engine = crate::engine::detect_engine(endpoint, &model_limits);
     let adapter_spec = endpoint.engine_adapter.clone().or_else(|| {
-        let config = crate::config::Config::load().ok()?;
         let remote = crate::engine_adapter::load_remote_adapters().ok()?;
         crate::engine_adapter::effective_engine_adapter(
             endpoint,
             &remote,
-            config.allow_remote_engine_adapters,
-            &config.approved_remote_adapters,
+            allow_remote_engine_adapters,
+            approved_remote_adapters,
         )
     });
     let model = rows.first().map(|row| row.id.as_str());

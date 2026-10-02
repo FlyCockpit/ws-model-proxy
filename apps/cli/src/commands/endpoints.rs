@@ -15,7 +15,7 @@ use crate::engine_adapter::{
 };
 use crate::exit::{CodedError, ExitCode};
 use crate::output;
-use crate::probe::{ProbeReport, apply_probe_report, probe_endpoint};
+use crate::probe::{ProbeReport, apply_probe_report, probe_from_config};
 use crate::slug::validate_slug;
 
 #[derive(Debug, clap::Args)]
@@ -322,7 +322,7 @@ fn probe_endpoints(json: bool, args: &ProbeArgs) -> Result<()> {
     }
     let reports = endpoints
         .iter()
-        .map(probe_endpoint)
+        .map(|endpoint| probe_from_config(endpoint, &cfg))
         .collect::<Vec<ProbeReport>>();
     if args.apply {
         Config::update(true, |candidate| {

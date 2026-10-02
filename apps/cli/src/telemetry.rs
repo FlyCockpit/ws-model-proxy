@@ -271,6 +271,9 @@ struct LoadState {
     prefix_queries_total: Option<f64>,
     process_start_time_seconds: Option<f64>,
     counter_epoch: u32,
+    /// A reset frame was planned but the outbound queue dropped it. The next
+    /// frame still reports `prefixCacheReset` with `delta = current`.
+    pending_reset: bool,
 }
 
 impl LoadState {
@@ -288,6 +291,7 @@ impl LoadState {
                 prefix_queries_total: persisted.prefix_queries_total,
                 process_start_time_seconds: persisted.process_start_time_seconds,
                 counter_epoch: persisted.counter_epoch,
+                pending_reset: false,
             })
             .unwrap_or_default()
     }
@@ -299,6 +303,7 @@ impl LoadState {
         self.prefix_queries_total = reading.prefix_cache_queries_total;
         self.process_start_time_seconds = reading.process_start_time_seconds;
         self.counter_epoch = counter_epoch;
+        self.pending_reset = false;
         self.last_sent = Some((at, reading));
         if let Ok(mut map) = persisted_load_counters().lock() {
             map.insert(
@@ -652,13 +657,18 @@ where
                 continue;
             };
             let counter_epoch = frame.counter_epoch.unwrap_or(schedule.state.counter_epoch);
+            let reset = frame.prefix_cache_reset == Some(true);
             match offer(tx, ClientControlMessage::EndpointLoad(frame)) {
                 Sent::Queued => {
                     schedule
                         .state
                         .commit(&done.slug, reading, done.finished, counter_epoch)
                 }
-                Sent::Dropped => {}
+                Sent::Dropped => {
+                    if reset {
+                        schedule.state.pending_reset = true;
+                    }
+                }
                 Sent::Gone => return,
             }
         }
@@ -670,6 +680,12 @@ fn counter_delta(previous: Option<f64>, current: Option<f64>) -> Option<u64> {
     // A reset (engine restart) is not a delta. The cap is applied again in
     // `telemetry_bounds::conform`; this keeps the float cast in range.
     (current >= previous).then(|| saturating_byte_counter((current - previous).round() as u64))
+}
+
+/// Counts since the engine restarted. Used with `prefixCacheReset` so a dropped
+/// reset frame still reports the post-restart total instead of discarding it.
+fn counter_since_start(current: Option<f64>) -> Option<u64> {
+    current.map(|value| saturating_byte_counter(value.round() as u64))
 }
 
 fn counter_reset(previous: Option<f64>, current: Option<f64>) -> bool {
@@ -687,17 +703,27 @@ fn next_load_frame(
     now: Instant,
     ts: &str,
 ) -> Option<EndpointLoad> {
-    let hits_delta = counter_delta(state.prefix_hits_total, reading.prefix_cache_hits_total);
-    let queries_delta = counter_delta(
-        state.prefix_queries_total,
-        reading.prefix_cache_queries_total,
-    );
-    let prefix_cache_reset =
-        counter_reset(state.prefix_hits_total, reading.prefix_cache_hits_total)
-            || counter_reset(
-                state.prefix_queries_total,
-                reading.prefix_cache_queries_total,
-            );
+    let hits_reset = state.pending_reset
+        || counter_reset(state.prefix_hits_total, reading.prefix_cache_hits_total);
+    let queries_reset = state.pending_reset
+        || counter_reset(
+            state.prefix_queries_total,
+            reading.prefix_cache_queries_total,
+        );
+    let prefix_cache_reset = hits_reset || queries_reset;
+    let hits_delta = if hits_reset {
+        counter_since_start(reading.prefix_cache_hits_total)
+    } else {
+        counter_delta(state.prefix_hits_total, reading.prefix_cache_hits_total)
+    };
+    let queries_delta = if queries_reset {
+        counter_since_start(reading.prefix_cache_queries_total)
+    } else {
+        counter_delta(
+            state.prefix_queries_total,
+            reading.prefix_cache_queries_total,
+        )
+    };
     let identity_changed = match (
         state.process_start_time_seconds,
         reading.process_start_time_seconds,
@@ -1386,8 +1412,9 @@ mod tests {
         )
         .expect("a change is sent");
         assert_eq!(
-            reset.prefix_cache_hits_delta, None,
-            "a counter reset is not a delta"
+            reset.prefix_cache_hits_delta,
+            Some(5),
+            "a counter reset reports counts since restart"
         );
         assert_eq!(first.counter_epoch, Some(0));
         assert_eq!(changed.counter_epoch, Some(0));
@@ -1458,6 +1485,34 @@ mod tests {
         )
         .expect("due");
         assert_eq!(next.prefix_cache_hits_delta, Some(70));
+    }
+
+    #[test]
+    fn a_dropped_reset_still_reports_counts_since_restart_after_climb_back() {
+        let mut state = LoadState::default();
+        let start = Instant::now();
+        step(&mut state, reading(1, Some(100.0)), start, "t0").expect("first");
+        let dropped = next_load_frame(
+            &state,
+            "vllm",
+            &reading(0, Some(5.0)),
+            start + Duration::from_secs(2),
+            "t1",
+        )
+        .expect("reset is due");
+        assert_eq!(dropped.prefix_cache_reset, Some(true));
+        assert_eq!(dropped.prefix_cache_hits_delta, Some(5));
+        state.pending_reset = true;
+        let climbed = step(
+            &mut state,
+            reading(1, Some(120.0)),
+            start + Duration::from_secs(4),
+            "t2",
+        )
+        .expect("climb-back after a dropped reset");
+        assert_eq!(climbed.prefix_cache_reset, Some(true));
+        assert_eq!(climbed.prefix_cache_hits_delta, Some(120));
+        assert_eq!(climbed.counter_epoch, Some(1));
     }
 
     fn load_endpoint(slug: &str) -> EndpointConfig {

@@ -3543,6 +3543,8 @@ fn next_reconnect_delay(current: Duration) -> Duration {
 /// to `prepare_inventory_candidate`, which rechecks the desired snapshot under
 /// the short-lived config lock before it writes anything.
 fn inventory_from_config(config: &mut Config) -> Vec<EndpointInventory> {
+    let allow_remote = config.allow_remote_engine_adapters;
+    let approved = config.approved_remote_adapters.clone();
     let enabled = config
         .endpoints
         .iter()
@@ -3557,9 +3559,12 @@ fn inventory_from_config(config: &mut Config) -> Vec<EndpointInventory> {
                 .cloned()
                 .map(|endpoint| {
                     let probe_endpoint_config = endpoint.clone();
+                    let approved = approved.clone();
                     (
                         endpoint,
-                        scope.spawn(move || probe_endpoint(&probe_endpoint_config)),
+                        scope.spawn(move || {
+                            probe_endpoint(&probe_endpoint_config, allow_remote, &approved)
+                        }),
                     )
                 })
                 .collect::<Vec<_>>();
