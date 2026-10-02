@@ -3,6 +3,10 @@
 
 export const DEFAULT_IMAGE_TOKEN_ALLOWANCE = 4096;
 export const DEFAULT_AUDIO_TOKEN_ALLOWANCE = 4096;
+/** URL-only / unknown-size documents. Not the image flat allowance. */
+export const DEFAULT_DOCUMENT_TOKEN_ALLOWANCE = 32_768;
+export const DOCUMENT_BYTES_PER_TOKEN = 2;
+export const MAX_WAV_DURATION_SECONDS = 3_600;
 export const IMAGE_PATCH_SIZE = 16;
 export const IMAGE_TOKEN_OVERHEAD = 16;
 export const AUDIO_TOKENS_PER_SECOND = 50;
@@ -79,7 +83,7 @@ function collectAndStrip(
 type RecognizedMedia =
   | { kind: "image"; bytes: Uint8Array | null }
   | { kind: "audio"; bytes: Uint8Array | null }
-  | { kind: "unknown" };
+  | { kind: "file"; bytes: Uint8Array | null };
 
 function recognizeMedia(record: Record<string, unknown>): RecognizedMedia | null {
   const type = typeof record.type === "string" ? record.type : "";
@@ -107,9 +111,10 @@ function recognizeMedia(record: Record<string, unknown>): RecognizedMedia | null
     };
   }
   if (type === "document" || type === "input_file") {
+    if (isRecord(record.source) && record.source.type === "text") return null;
     const source = fileSource(record);
     if (source?.kind === "image") return { kind: "image", bytes: source.bytes };
-    if (source) return { kind: "unknown" };
+    if (source) return { kind: "file", bytes: source.bytes };
   }
   return null;
 }
@@ -134,7 +139,7 @@ function audioSource(value: unknown): Uint8Array | null {
 
 function fileSource(
   record: Record<string, unknown>,
-): { kind: "image"; bytes: Uint8Array | null } | { kind: "unknown" } | null {
+): { kind: "image"; bytes: Uint8Array | null } | { kind: "file"; bytes: Uint8Array | null } | null {
   const data =
     typeof record.file_data === "string"
       ? record.file_data
@@ -149,7 +154,7 @@ function fileSource(
   const mediaType = mediaTypeOf(record);
   if (mediaType.startsWith("image/")) return { kind: "image", bytes: bytes ?? null };
   if (!mediaType && looksLikeImage(bytes)) return { kind: "image", bytes: bytes ?? null };
-  return { kind: "unknown" };
+  return { kind: "file", bytes: bytes ?? null };
 }
 
 function mediaTypeOf(record: Record<string, unknown>): string {
@@ -216,6 +221,11 @@ function mediaTokens(part: RecognizedMedia, allowance: Allowance): number {
       return Math.max(1, Math.ceil(duration * AUDIO_TOKENS_PER_SECOND));
     return DEFAULT_AUDIO_TOKEN_ALLOWANCE;
   }
+  if (part.kind === "file") {
+    if (part.bytes && part.bytes.byteLength > 0)
+      return Math.max(1, Math.ceil(part.bytes.byteLength / DOCUMENT_BYTES_PER_TOKEN));
+    return DEFAULT_DOCUMENT_TOKEN_ALLOWANCE;
+  }
   return allowance.unknownImage;
 }
 
@@ -245,17 +255,26 @@ export function readWavDurationSeconds(bytes: Uint8Array): number | null {
   let offset = 12;
   let byteRate = 0;
   let dataSize = 0;
+  let dataOffset = 0;
   while (offset + 8 <= bytes.length) {
     const id = asciiAt(bytes, offset, 4);
     const size = readUint32LE(bytes, offset + 4);
     const body = offset + 8;
     if (id === "fmt " && size >= 16 && body + 16 <= bytes.length)
       byteRate = readUint32LE(bytes, body + 8);
-    if (id === "data") dataSize = size;
+    if (id === "data") {
+      dataSize = size;
+      dataOffset = body;
+    }
     offset = body + size + (size % 2);
   }
-  if (byteRate <= 0 || dataSize <= 0) return null;
-  return dataSize / byteRate;
+  if (byteRate <= 0 || dataSize <= 0 || dataOffset <= 0) return null;
+  const remaining = Math.max(0, bytes.length - dataOffset);
+  dataSize = Math.min(dataSize, remaining);
+  if (dataSize <= 0) return null;
+  const duration = dataSize / byteRate;
+  if (!Number.isFinite(duration) || duration < 0) return null;
+  return Math.min(duration, MAX_WAV_DURATION_SECONDS);
 }
 
 function pngDimensions(bytes: Uint8Array): { width: number; height: number } | null {

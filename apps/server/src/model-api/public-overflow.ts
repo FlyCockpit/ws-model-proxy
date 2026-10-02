@@ -2930,7 +2930,7 @@ export async function dispatchPublicOverflow(
     const renderedInputTokens =
       payloadAwareInputTokens(upstream.body) ?? request.estimatedInputTokens ?? byteEstimate;
     const renderedLiability = liabilityFromPricing({
-      estimatedInputTokens: byteEstimate,
+      estimatedInputTokens: renderedInputTokens * 2n,
       requestedOutputTokens,
       pricing,
     });
@@ -4004,8 +4004,8 @@ export function conservativeSerializedInputTokens(serializedBytes: number): bigi
   return (bytes * 11n + 9n) / 10n + 64n;
 }
 
-/** Context-fit estimate for a rendered JSON body. Byte-per-token stays on the
- * budget hold, which is settled from real usage. */
+/** Context-fit estimate for a rendered JSON body. The :external hold uses
+ * this figure × 2 plus requested output; settlement true-ups from real usage. */
 export function payloadAwareInputTokens(serializedBody: Uint8Array): bigint | undefined {
   try {
     const parsed: unknown = JSON.parse(
