@@ -85,7 +85,12 @@ export type CountContextAttemptOutcome =
   | {
       ok: true;
       tokens: number;
-      method: "vllm_tokenize" | "tgi_chat_tokenize" | "llama_apply_template";
+      method:
+        | "vllm_tokenize"
+        | "tgi_chat_tokenize"
+        | "llama_apply_template"
+        | "llama_input_tokens"
+        | "adapter_count";
     }
   | { ok: false; failure: RelayFailure };
 

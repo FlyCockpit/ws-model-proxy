@@ -79,5 +79,12 @@ describe("remote engine adapter definitions", () => {
       remoteEngineAdapterDefinitionsSchema.safeParse([{ ...adapter, input: { route: "/metrics" } }])
         .success,
     ).toBe(true);
+    expect(
+      remoteEngineAdapterDefinitionsSchema.safeParse([{ ...adapter, countRoute: "/count" }])
+        .success,
+    ).toBe(true);
+    expect(
+      remoteEngineAdapterDefinitionsSchema.safeParse([{ ...adapter, countRoute: "count" }]).success,
+    ).toBe(false);
   });
 });

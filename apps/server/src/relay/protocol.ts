@@ -278,9 +278,16 @@ export const engineFactsSchema = z
       })
       .strict()
       .optional(),
-    /** Chat Completions tokenize route recorded at probe time. */
+    /** Chat Completions tokenize fact recorded at probe time. */
     countContext: engineFact(
-      z.enum(["vllm_tokenize", "tgi_chat_tokenize", "llama_apply_template"]),
+      z.enum([
+        "unsupported",
+        "vllm_tokenize",
+        "tgi_chat_tokenize",
+        "llama_apply_template",
+        "llama_input_tokens",
+        "adapter_count",
+      ]),
     ).optional(),
   })
   .strict();
@@ -706,6 +713,7 @@ export const remoteEngineAdapterSchema = z
           .strict(),
       )
       .optional(),
+    countRoute: adapterRouteSchema.optional(),
   })
   .strict();
 export type RemoteEngineAdapter = z.infer<typeof remoteEngineAdapterSchema>;
@@ -825,7 +833,13 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
       type: z.literal("count_context.result"),
       requestId: requestIdSchema,
       tokens: z.number().int().min(0).max(TOKEN_COUNT_MAX),
-      method: z.enum(["vllm_tokenize", "tgi_chat_tokenize", "llama_apply_template"]),
+      method: z.enum([
+        "vllm_tokenize",
+        "tgi_chat_tokenize",
+        "llama_apply_template",
+        "llama_input_tokens",
+        "adapter_count",
+      ]),
     })
     .strict(),
   z

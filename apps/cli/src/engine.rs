@@ -81,9 +81,10 @@ pub struct DetectedEngine {
     /// Ids one engine process serves (vLLM/SGLang `--served-model-name` lists).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub served_model_aliases: Vec<String>,
-    /// Chat Completions tokenize route recorded at probe time.
+    /// Chat Completions tokenize fact recorded at probe time (`method` or
+    /// `unsupported`). `None` means this endpoint has not been probed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub count_context: Option<crate::count_context::CountContextMethod>,
+    pub count_context: Option<crate::count_context::CountContextFact>,
 }
 
 /// The engine this endpoint runs and whether the person declared it.

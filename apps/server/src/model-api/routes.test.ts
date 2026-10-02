@@ -407,7 +407,12 @@ class FakeRelayManager {
   completeCountContext(
     requestId: string,
     tokens: number,
-    method: "vllm_tokenize" | "tgi_chat_tokenize" | "llama_apply_template" = "vllm_tokenize",
+    method:
+      | "vllm_tokenize"
+      | "tgi_chat_tokenize"
+      | "llama_apply_template"
+      | "llama_input_tokens"
+      | "adapter_count" = "vllm_tokenize",
   ) {
     const handler = this.countContextHandlers.get(requestId);
     this.countContextHandlers.delete(requestId);

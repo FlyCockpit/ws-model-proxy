@@ -1675,6 +1675,7 @@ mod tests {
                 interval_secs: 2,
                 timeout_secs: 2,
                 map: Default::default(),
+                count_route: None,
             }),
             ..EndpointConfig::default()
         };
@@ -1714,6 +1715,7 @@ mod tests {
             interval_secs: 2,
             timeout_secs: 2,
             map: Default::default(),
+            count_route: None,
         }
     }
 

@@ -97,6 +97,15 @@ export const remoteEngineAdapterDefinitionSchema = z
     intervalSecs: z.number().int().min(2).max(5),
     timeoutSecs: z.number().int().min(1).max(4),
     map: z.partialRecord(z.enum(ADAPTER_SIGNALS), signalSelectorSchema).optional(),
+    countRoute: z
+      .string()
+      .min(1)
+      .max(1024)
+      .refine((route) => adapterRouteIsValid(route), {
+        message:
+          "adapter count route must start with / and stay on the endpoint origin (no scheme, host, whitespace, .., query, or fragment)",
+      })
+      .optional(),
   })
   .strict()
   .superRefine((adapter, context) => {
@@ -178,6 +187,7 @@ export function canonicalRemoteEngineAdapterJson(adapter: RemoteEngineAdapterDef
       intervalSecs: adapter.intervalSecs,
       map,
       timeoutSecs: adapter.timeoutSecs,
+      ...(adapter.countRoute ? { countRoute: adapter.countRoute } : {}),
     }),
   );
 }

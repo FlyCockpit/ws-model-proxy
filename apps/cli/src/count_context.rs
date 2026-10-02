@@ -1,14 +1,16 @@
 //! Engine tokenize for Chat Completions (`count_context`).
 //!
-//! Probe records which route works; the live op POSTs the request's `messages`
-//! (never logged) and returns only a count. Token pieces and rendered prompts
-//! are dropped after the integer is known.
+//! Probe records a tri-state per endpoint (method / unsupported / not probed).
+//! POSTs run only when the engine kind or a custom adapter declares a count
+//! route. The live op POSTs the request's `messages` (never logged) and returns
+//! only a count. Token pieces and rendered prompts are dropped after the integer
+//! is known.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::config::EndpointConfig;
 use crate::engine::{self, EngineKind, read_decoded_body};
@@ -19,16 +21,21 @@ const TOKENIZE_BODY_LIMIT: u64 = 8 * 1024 * 1024;
 /// Probe and live count share this bound so a huge chat body cannot pin the CLI.
 pub const COUNT_CONTEXT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 
-const PROBE_MESSAGES: &str = r#"[{"role":"user","content":"a"}]"#;
+const LLAMA_INPUT_TOKEN_ROUTES: [&str; 2] = [
+    "v1/chat/completions/input_tokens",
+    "chat/completions/input_tokens",
+];
 
 /// How this engine counts Chat Completions context. Wire value of
-/// `engineFacts.countContext` and `count_context.result.method`.
+/// `count_context.result.method`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CountContextMethod {
     VllmTokenize,
     TgiChatTokenize,
     LlamaApplyTemplate,
+    LlamaInputTokens,
+    AdapterCount,
 }
 
 impl CountContextMethod {
@@ -37,6 +44,58 @@ impl CountContextMethod {
             Self::VllmTokenize => "vllm_tokenize",
             Self::TgiChatTokenize => "tgi_chat_tokenize",
             Self::LlamaApplyTemplate => "llama_apply_template",
+            Self::LlamaInputTokens => "llama_input_tokens",
+            Self::AdapterCount => "adapter_count",
+        }
+    }
+}
+
+/// Persisted tri-state for `engineFacts.countContext`: a method, explicit
+/// unsupported, or absent (`DetectedEngine.count_context == None`) when the
+/// endpoint has not been probed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CountContextFact {
+    Unsupported,
+    VllmTokenize,
+    TgiChatTokenize,
+    LlamaApplyTemplate,
+    LlamaInputTokens,
+    AdapterCount,
+}
+
+impl CountContextFact {
+    pub fn method(self) -> Option<CountContextMethod> {
+        match self {
+            Self::Unsupported => None,
+            Self::VllmTokenize => Some(CountContextMethod::VllmTokenize),
+            Self::TgiChatTokenize => Some(CountContextMethod::TgiChatTokenize),
+            Self::LlamaApplyTemplate => Some(CountContextMethod::LlamaApplyTemplate),
+            Self::LlamaInputTokens => Some(CountContextMethod::LlamaInputTokens),
+            Self::AdapterCount => Some(CountContextMethod::AdapterCount),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::VllmTokenize => "vllm_tokenize",
+            Self::TgiChatTokenize => "tgi_chat_tokenize",
+            Self::LlamaApplyTemplate => "llama_apply_template",
+            Self::LlamaInputTokens => "llama_input_tokens",
+            Self::AdapterCount => "adapter_count",
+        }
+    }
+}
+
+impl From<CountContextMethod> for CountContextFact {
+    fn from(method: CountContextMethod) -> Self {
+        match method {
+            CountContextMethod::VllmTokenize => Self::VllmTokenize,
+            CountContextMethod::TgiChatTokenize => Self::TgiChatTokenize,
+            CountContextMethod::LlamaApplyTemplate => Self::LlamaApplyTemplate,
+            CountContextMethod::LlamaInputTokens => Self::LlamaInputTokens,
+            CountContextMethod::AdapterCount => Self::AdapterCount,
         }
     }
 }
@@ -88,64 +147,131 @@ impl CountContextError {
     }
 }
 
+/// Inputs that decide whether a tokenize POST is allowed.
+#[derive(Debug, Clone, Copy)]
+pub struct CountProbeRequest<'a> {
+    pub declared: Option<EngineKind>,
+    pub kind: Option<EngineKind>,
+    pub model: Option<&'a str>,
+    pub adapter_count_route: Option<&'a str>,
+}
+
 /// Probe which tokenize route this engine answers. `post(route, json_body)`
-/// returns the response body on 2xx.
+/// returns the response body on 2xx. `get(route)` is used only to recognize
+/// TGI (`GET /info`) before POSTing `/chat_tokenize`.
 pub fn probe_with(
-    declared: Option<EngineKind>,
-    kind: Option<EngineKind>,
+    request: CountProbeRequest<'_>,
     post: impl Fn(&str, &Value) -> Option<String>,
-) -> Option<CountContextMethod> {
-    match declared.or(kind) {
+    get: impl Fn(&str) -> Option<String>,
+) -> CountContextFact {
+    if let Some(route) = request.adapter_count_route
+        && try_adapter(&post, route, request.model).is_some()
+    {
+        return CountContextFact::AdapterCount;
+    }
+    let resolved = request.declared.or(request.kind);
+    match resolved {
+        Some(EngineKind::Vllm) => return fact_from_method(try_vllm(&post, request.model)),
+        Some(EngineKind::LlamaCpp) => return fact_from_method(try_llama(&post, request.model)),
         Some(
             EngineKind::Generic | EngineKind::Ollama | EngineKind::LmStudio | EngineKind::Sglang,
         ) => {
-            return None;
+            return CountContextFact::Unsupported;
         }
-        Some(EngineKind::Vllm) => return try_vllm(&post),
-        Some(EngineKind::LlamaCpp) => return try_llama(&post),
         None => {}
     }
-    try_vllm(&post)
-        .or_else(|| try_tgi(&post))
-        .or_else(|| try_llama(&post))
+    if get("info").as_deref().is_some_and(is_tgi_info) {
+        return fact_from_method(try_tgi(&post, request.model));
+    }
+    CountContextFact::Unsupported
+}
+
+fn fact_from_method(method: Option<CountContextMethod>) -> CountContextFact {
+    method
+        .map(CountContextFact::from)
+        .unwrap_or(CountContextFact::Unsupported)
 }
 
 fn probe_messages() -> Value {
-    serde_json::from_str(PROBE_MESSAGES).expect("probe messages")
+    json!([{"role": "user", "content": "a"}])
 }
 
-fn try_vllm(post: &impl Fn(&str, &Value) -> Option<String>) -> Option<CountContextMethod> {
-    let body = json!({ "messages": probe_messages() });
-    let response = post("tokenize", &body)?;
-    parse_token_count(&response).map(|_| CountContextMethod::VllmTokenize)
+fn probe_chat_body(model: Option<&str>) -> Value {
+    let mut map = Map::new();
+    map.insert("messages".to_string(), probe_messages());
+    if let Some(model) = model {
+        map.insert("model".to_string(), json!(model));
+    }
+    Value::Object(map)
 }
 
-fn try_tgi(post: &impl Fn(&str, &Value) -> Option<String>) -> Option<CountContextMethod> {
-    let body = json!({ "messages": probe_messages() });
-    let response = post("chat_tokenize", &body)?;
-    parse_token_count(&response).map(|_| CountContextMethod::TgiChatTokenize)
+fn try_adapter(
+    post: &impl Fn(&str, &Value) -> Option<String>,
+    route: &str,
+    model: Option<&str>,
+) -> Option<CountContextMethod> {
+    let response = post(route, &probe_chat_body(model))?;
+    parse_probe_count(&response).map(|_| CountContextMethod::AdapterCount)
 }
 
-fn try_llama(post: &impl Fn(&str, &Value) -> Option<String>) -> Option<CountContextMethod> {
-    let body = json!({ "messages": probe_messages() });
-    let applied = post("apply-template", &body)?;
+fn try_vllm(
+    post: &impl Fn(&str, &Value) -> Option<String>,
+    model: Option<&str>,
+) -> Option<CountContextMethod> {
+    let response = post("tokenize", &probe_chat_body(model))?;
+    parse_probe_count(&response).map(|_| CountContextMethod::VllmTokenize)
+}
+
+fn try_tgi(
+    post: &impl Fn(&str, &Value) -> Option<String>,
+    model: Option<&str>,
+) -> Option<CountContextMethod> {
+    let response = post("chat_tokenize", &probe_chat_body(model))?;
+    parse_probe_count(&response).map(|_| CountContextMethod::TgiChatTokenize)
+}
+
+fn try_llama(
+    post: &impl Fn(&str, &Value) -> Option<String>,
+    model: Option<&str>,
+) -> Option<CountContextMethod> {
+    let chat = probe_chat_body(model);
+    for route in LLAMA_INPUT_TOKEN_ROUTES {
+        if let Some(response) = post(route, &chat)
+            && parse_probe_count(&response).is_some()
+        {
+            return Some(CountContextMethod::LlamaInputTokens);
+        }
+    }
+    let applied = post("apply-template", &chat)?;
     let prompt = parse_applied_prompt(&applied)?;
-    let tokenize = json!({ "content": prompt, "add_special": false });
-    let response = post("tokenize", &tokenize)?;
-    parse_token_count(&response).map(|_| CountContextMethod::LlamaApplyTemplate)
+    let response = post("tokenize", &llama_tokenize_body(model, prompt))?;
+    parse_probe_count(&response).map(|_| CountContextMethod::LlamaApplyTemplate)
 }
 
 /// Detect tokenize support with the endpoint's credentials.
 pub fn probe_count_context(
     endpoint: &EndpointConfig,
     kind: Option<EngineKind>,
-) -> Option<CountContextMethod> {
+    model: Option<&str>,
+    adapter_count_route: Option<&str>,
+) -> CountContextFact {
     let declared = endpoint.engine.declared_kind();
     let agent = engine::http_agent(engine::DETECT_TIMEOUT);
     let post = |route: &str, body: &Value| {
         post_json_route(&agent, endpoint, route, body, TOKENIZE_BODY_LIMIT).ok()
     };
-    probe_with(declared, kind, post)
+    let get =
+        |route: &str| engine::fetch_route(&agent, endpoint, route, engine::JSON_BODY_LIMIT).ok();
+    probe_with(
+        CountProbeRequest {
+            declared,
+            kind,
+            model,
+            adapter_count_route,
+        },
+        post,
+        get,
+    )
 }
 
 /// Count one Chat Completions body. `messages` must be a JSON array.
@@ -154,6 +280,7 @@ pub fn count_chat(
     model: &str,
     body: &Value,
     method: Option<CountContextMethod>,
+    adapter_count_route: Option<&str>,
     timeout: Duration,
 ) -> std::result::Result<CountContextOutcome, CountContextError> {
     let messages = body
@@ -166,90 +293,171 @@ pub fn count_chat(
                 "count_context body has no messages array",
             )
         })?;
-    let tools = body.get("tools").cloned();
-    let resolved = method.or_else(|| {
-        let kind = engine::effective_kind(endpoint).map(|(kind, _)| kind);
-        match kind {
-            Some(EngineKind::Vllm) => Some(CountContextMethod::VllmTokenize),
-            Some(EngineKind::LlamaCpp) => Some(CountContextMethod::LlamaApplyTemplate),
-            _ => None,
-        }
-    });
-    let Some(method) = resolved else {
+    let Some(method) = method else {
         return Err(CountContextError::new(
             CountContextErrorKind::Unsupported,
             "this engine has no tokenize route",
         ));
     };
-    let agent = engine::http_agent(timeout);
-    match method {
+    let deadline = Instant::now() + timeout;
+    let tokens = match method {
         CountContextMethod::VllmTokenize => {
-            let mut payload = json!({ "model": model, "messages": messages });
-            if let Some(tools) = tools {
-                payload
-                    .as_object_mut()
-                    .expect("object")
-                    .insert("tools".to_string(), tools);
-            }
-            let response = post_counted(&agent, endpoint, "tokenize", &payload)?;
-            let tokens = parse_token_count(&response).ok_or_else(|| {
-                CountContextError::new(
-                    CountContextErrorKind::Unsupported,
-                    "vLLM /tokenize returned no count",
-                )
-            })?;
-            Ok(CountContextOutcome { tokens, method })
+            let payload =
+                chat_count_payload(model, &messages, body, &["tools", "chat_template_kwargs"]);
+            let response = post_counted_until(endpoint, "tokenize", &payload, deadline)?;
+            parse_required_count(&response, "vLLM /tokenize returned no count")?
         }
         CountContextMethod::TgiChatTokenize => {
-            let mut payload = json!({ "model": model, "messages": messages });
-            if let Some(tools) = tools {
-                payload
-                    .as_object_mut()
-                    .expect("object")
-                    .insert("tools".to_string(), tools);
-            }
-            let response = post_counted(&agent, endpoint, "chat_tokenize", &payload)?;
-            let tokens = parse_token_count(&response).ok_or_else(|| {
-                CountContextError::new(
-                    CountContextErrorKind::Unsupported,
-                    "TGI /chat_tokenize returned no count",
-                )
-            })?;
-            Ok(CountContextOutcome { tokens, method })
+            let payload = chat_count_payload(model, &messages, body, &["tools"]);
+            let response = post_counted_until(endpoint, "chat_tokenize", &payload, deadline)?;
+            parse_required_count(&response, "TGI /chat_tokenize returned no count")?
+        }
+        CountContextMethod::LlamaInputTokens => {
+            let payload = chat_count_payload(
+                model,
+                &messages,
+                body,
+                &["tools", "tool_choice", "chat_template_kwargs"],
+            );
+            llama_input_tokens_count(endpoint, &payload, deadline)?
         }
         CountContextMethod::LlamaApplyTemplate => {
-            let payload = json!({ "messages": messages });
-            let applied = post_counted(&agent, endpoint, "apply-template", &payload)?;
+            let payload = chat_count_payload(
+                model,
+                &messages,
+                body,
+                &["tools", "tool_choice", "chat_template_kwargs"],
+            );
+            let applied = post_counted_until(endpoint, "apply-template", &payload, deadline)?;
             let prompt = parse_applied_prompt(&applied).ok_or_else(|| {
                 CountContextError::new(
                     CountContextErrorKind::Unsupported,
                     "llama.cpp /apply-template returned no prompt",
                 )
             })?;
-            let tokenize = json!({ "content": prompt, "add_special": false });
-            let response = post_counted(&agent, endpoint, "tokenize", &tokenize)?;
-            let tokens = parse_token_count(&response).ok_or_else(|| {
+            let tokenize = llama_tokenize_body(Some(model), prompt);
+            let response = post_counted_until(endpoint, "tokenize", &tokenize, deadline)?;
+            parse_required_count(&response, "llama.cpp /tokenize returned no count")?
+        }
+        CountContextMethod::AdapterCount => {
+            let route = adapter_count_route.ok_or_else(|| {
                 CountContextError::new(
                     CountContextErrorKind::Unsupported,
-                    "llama.cpp /tokenize returned no count",
+                    "this adapter has no count route",
                 )
             })?;
-            Ok(CountContextOutcome { tokens, method })
+            let payload = chat_count_payload(
+                model,
+                &messages,
+                body,
+                &["tools", "tool_choice", "chat_template_kwargs"],
+            );
+            let response = post_counted_until(endpoint, route, &payload, deadline)?;
+            parse_required_count(&response, "adapter count route returned no count")?
         }
+    };
+    let tokens = accept_count(tokens, &messages)?;
+    Ok(CountContextOutcome { tokens, method })
+}
+
+fn chat_count_payload(model: &str, messages: &Value, body: &Value, keys: &[&str]) -> Value {
+    let mut map = Map::new();
+    map.insert("model".to_string(), json!(model));
+    map.insert("messages".to_string(), messages.clone());
+    if let Some(src) = body.as_object() {
+        for key in keys {
+            if let Some(value) = src.get(*key) {
+                map.insert((*key).to_string(), value.clone());
+            }
+        }
+    }
+    Value::Object(map)
+}
+
+fn llama_tokenize_body(model: Option<&str>, prompt: String) -> Value {
+    let mut map = Map::new();
+    map.insert("content".to_string(), json!(prompt));
+    map.insert("add_special".to_string(), json!(true));
+    if let Some(model) = model {
+        map.insert("model".to_string(), json!(model));
+    }
+    Value::Object(map)
+}
+
+fn llama_input_tokens_count(
+    endpoint: &EndpointConfig,
+    payload: &Value,
+    deadline: Instant,
+) -> std::result::Result<u64, CountContextError> {
+    let mut last_error = None;
+    for route in LLAMA_INPUT_TOKEN_ROUTES {
+        match post_counted_until(endpoint, route, payload, deadline) {
+            Ok(response) => {
+                return parse_required_count(
+                    &response,
+                    "llama.cpp /input_tokens returned no count",
+                );
+            }
+            Err(error)
+                if matches!(
+                    error.kind,
+                    CountContextErrorKind::Upstream4xx | CountContextErrorKind::Unsupported
+                ) =>
+            {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    match last_error {
+        Some(error) => Err(error),
+        None => Err(CountContextError::new(
+            CountContextErrorKind::Unsupported,
+            "llama.cpp /input_tokens returned no count",
+        )),
     }
 }
 
+fn parse_required_count(
+    body: &str,
+    message: &'static str,
+) -> std::result::Result<u64, CountContextError> {
+    parse_token_count(body)
+        .ok_or_else(|| CountContextError::new(CountContextErrorKind::Unsupported, message))
+}
+
+fn accept_count(tokens: u64, messages: &Value) -> std::result::Result<u64, CountContextError> {
+    let empty = messages.as_array().is_none_or(|rows| rows.is_empty());
+    if tokens == 0 && !empty {
+        return Err(CountContextError::new(
+            CountContextErrorKind::Unsupported,
+            "tokenize returned 0 for a non-empty messages array",
+        ));
+    }
+    Ok(tokens)
+}
+
 /// Integer token count from a tokenize JSON body. Token strings are ignored.
+/// An explicit `count` (then `input_tokens`) wins over `tokens.len()`.
 pub fn parse_token_count(body: &str) -> Option<u64> {
     let value: Value = serde_json::from_str(body).ok()?;
     count_from_value(&value)
 }
 
+fn parse_probe_count(body: &str) -> Option<u64> {
+    parse_token_count(body).filter(|count| *count >= 1)
+}
+
 fn count_from_value(value: &Value) -> Option<u64> {
     as_count(value.get("count"))
-        .or_else(|| as_count(value.pointer("/tokenize_response/count")))
+        .or_else(|| as_count(value.get("input_tokens")))
+        .or_else(|| {
+            value
+                .get("tokenize_response")
+                .and_then(Value::as_array)
+                .map(|tokens| tokens.len() as u64)
+        })
         .or_else(|| tokens_len(value.get("tokens")))
-        .or_else(|| tokens_len(value.pointer("/tokenize_response/tokens")))
 }
 
 fn as_count(value: Option<&Value>) -> Option<u64> {
@@ -273,13 +481,40 @@ fn parse_applied_prompt(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn post_counted(
-    agent: &ureq::Agent,
+/// TGI `GET /info`: `model_id` plus the two length caps.
+pub fn is_tgi_info(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    object.get("model_id").is_some_and(Value::is_string)
+        && object
+            .get("max_input_length")
+            .and_then(Value::as_u64)
+            .is_some()
+        && object
+            .get("max_total_tokens")
+            .and_then(Value::as_u64)
+            .is_some()
+}
+
+fn post_counted_until(
     endpoint: &EndpointConfig,
     route: &str,
     body: &Value,
+    deadline: Instant,
 ) -> std::result::Result<String, CountContextError> {
-    post_json_route(agent, endpoint, route, body, TOKENIZE_BODY_LIMIT)
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(CountContextError::new(
+            CountContextErrorKind::Timeout,
+            format!("posting `{route}` timed out"),
+        ));
+    }
+    let agent = engine::http_agent(remaining);
+    post_json_route(&agent, endpoint, route, body, TOKENIZE_BODY_LIMIT)
         .map_err(|error| classify_post_error(error, route))
 }
 
@@ -298,6 +533,8 @@ fn classify_post_error(error: anyhow::Error, route: &str) -> CountContextError {
         let text = format!("{error:#}").to_ascii_lowercase();
         if text.contains("timed out") || text.contains("timeout") {
             CountContextErrorKind::Timeout
+        } else if text.contains("exceeds") {
+            CountContextErrorKind::TooLarge
         } else {
             CountContextErrorKind::Transport
         }
@@ -349,9 +586,12 @@ mod tests {
 
     const VLLM: &str = include_str!("../tests/fixtures/engines/vllm-tokenize.json");
     const TGI: &str = include_str!("../tests/fixtures/engines/tgi-chat-tokenize.json");
+    const TGI_INFO: &str =
+        r#"{"model_id":"placeholder","max_input_length":4096,"max_total_tokens":8192}"#;
     const LLAMA_TEMPLATE: &str =
         include_str!("../tests/fixtures/engines/llama-apply-template.json");
     const LLAMA_TOKENS: &str = include_str!("../tests/fixtures/engines/llama-tokenize.json");
+    const LLAMA_INPUT: &str = include_str!("../tests/fixtures/engines/llama-input-tokens.json");
 
     fn fixture_post(
         routes: &'static [(&'static str, &'static str)],
@@ -364,9 +604,38 @@ mod tests {
         }
     }
 
+    fn fixture_get(
+        routes: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<String> {
+        move |route| {
+            routes
+                .iter()
+                .find(|(name, _)| *name == route)
+                .map(|(_, body)| (*body).to_string())
+        }
+    }
+
+    fn probe(
+        declared: Option<EngineKind>,
+        kind: Option<EngineKind>,
+        posts: &'static [(&'static str, &'static str)],
+        gets: &'static [(&'static str, &'static str)],
+    ) -> CountContextFact {
+        probe_with(
+            CountProbeRequest {
+                declared,
+                kind,
+                model: None,
+                adapter_count_route: None,
+            },
+            fixture_post(posts),
+            fixture_get(gets),
+        )
+    }
+
     #[test]
     fn fixtures_carry_no_prompt_text() {
-        for body in [VLLM, TGI, LLAMA_TEMPLATE, LLAMA_TOKENS] {
+        for body in [VLLM, TGI, LLAMA_TEMPLATE, LLAMA_TOKENS, LLAMA_INPUT] {
             let lower = body.to_ascii_lowercase();
             assert!(!lower.contains("user prompt"));
             assert!(!lower.contains("tell me"));
@@ -380,97 +649,236 @@ mod tests {
         assert_eq!(parse_token_count(VLLM), Some(12));
         assert_eq!(parse_token_count(TGI), Some(8));
         assert_eq!(parse_token_count(LLAMA_TOKENS), Some(4));
+        assert_eq!(parse_token_count(LLAMA_INPUT), Some(6));
         assert_eq!(
-            parse_token_count(r#"{"tokenize_response":{"count":3}}"#),
-            Some(3)
+            parse_token_count(r#"{"count":5,"tokens":[1,2,3]}"#),
+            Some(5)
         );
-        assert_eq!(
-            parse_token_count(r#"{"tokenize_response":{"tokens":[1,2]}}"#),
-            Some(2)
-        );
+        assert_eq!(parse_token_count(r#"{"tokens":[]}"#), Some(0));
         assert_eq!(parse_token_count("{}"), None);
+        assert!(parse_token_count(r#"{"tokenize_response":{"count":3}}"#).is_none());
+        assert!(parse_token_count(r#"{"tokenize_response":{"tokens":[1,2]}}"#).is_none());
+    }
+
+    #[test]
+    fn probe_rejects_a_zero_count() {
+        assert_eq!(
+            probe(
+                Some(EngineKind::Vllm),
+                None,
+                &[("tokenize", r#"{"tokens":[]}"#)],
+                &[],
+            ),
+            CountContextFact::Unsupported
+        );
+        assert_eq!(parse_probe_count(r#"{"tokens":[]}"#), None);
+        assert_eq!(parse_probe_count(r#"{"count":0}"#), None);
+        assert_eq!(parse_probe_count(VLLM), Some(12));
+    }
+
+    #[test]
+    fn zero_on_non_empty_messages_is_unsupported() {
+        let messages = json!([{"role":"user","content":"a"}]);
+        assert!(accept_count(0, &messages).is_err());
+        assert_eq!(accept_count(3, &messages).unwrap(), 3);
+        assert_eq!(accept_count(0, &json!([])).unwrap(), 0);
     }
 
     #[test]
     fn probe_records_the_matching_route() {
         assert_eq!(
-            probe_with(
-                Some(EngineKind::Vllm),
-                None,
-                fixture_post(&[("tokenize", VLLM)]),
-            ),
-            Some(CountContextMethod::VllmTokenize)
+            probe(Some(EngineKind::Vllm), None, &[("tokenize", VLLM)], &[],),
+            CountContextFact::VllmTokenize
         );
         assert_eq!(
-            probe_with(None, None, fixture_post(&[("chat_tokenize", TGI)]),),
-            Some(CountContextMethod::TgiChatTokenize)
+            probe(None, None, &[("chat_tokenize", TGI)], &[("info", TGI_INFO)]),
+            CountContextFact::TgiChatTokenize
         );
         assert_eq!(
-            probe_with(
+            probe(
                 Some(EngineKind::LlamaCpp),
                 None,
-                fixture_post(&[
+                &[("v1/chat/completions/input_tokens", LLAMA_INPUT)],
+                &[],
+            ),
+            CountContextFact::LlamaInputTokens
+        );
+        assert_eq!(
+            probe(
+                Some(EngineKind::LlamaCpp),
+                None,
+                &[
                     ("apply-template", LLAMA_TEMPLATE),
                     ("tokenize", LLAMA_TOKENS)
-                ]),
+                ],
+                &[],
             ),
-            Some(CountContextMethod::LlamaApplyTemplate)
+            CountContextFact::LlamaApplyTemplate
         );
         assert_eq!(
-            probe_with(
+            probe(
                 Some(EngineKind::Ollama),
                 None,
-                fixture_post(&[("tokenize", VLLM), ("chat_tokenize", TGI)]),
+                &[("tokenize", VLLM), ("chat_tokenize", TGI)],
+                &[("info", TGI_INFO)],
             ),
-            None
+            CountContextFact::Unsupported
         );
         assert_eq!(
-            probe_with(
-                Some(EngineKind::Generic),
-                None,
-                fixture_post(&[("tokenize", VLLM)])
-            ),
-            None
+            probe(Some(EngineKind::Generic), None, &[("tokenize", VLLM)], &[],),
+            CountContextFact::Unsupported
         );
         assert_eq!(
-            probe_with(
-                Some(EngineKind::Sglang),
+            probe(Some(EngineKind::Sglang), None, &[("tokenize", VLLM)], &[],),
+            CountContextFact::Unsupported
+        );
+        assert_eq!(
+            probe(Some(EngineKind::LmStudio), None, &[("tokenize", VLLM)], &[],),
+            CountContextFact::Unsupported
+        );
+    }
+
+    #[test]
+    fn auto_undetected_does_not_post_tokenize_routes() {
+        assert_eq!(
+            probe(
                 None,
-                fixture_post(&[("tokenize", VLLM)]),
+                None,
+                &[("tokenize", VLLM), ("chat_tokenize", TGI)],
+                &[]
             ),
-            None
+            CountContextFact::Unsupported
         );
     }
 
     #[test]
     fn declared_vllm_does_not_fall_through_to_tgi() {
         assert_eq!(
-            probe_with(
+            probe(
                 Some(EngineKind::Vllm),
                 None,
-                fixture_post(&[("chat_tokenize", TGI)]),
+                &[("chat_tokenize", TGI)],
+                &[("info", TGI_INFO)],
             ),
-            None
+            CountContextFact::Unsupported
         );
     }
 
     #[test]
-    fn llama_probe_needs_both_routes() {
+    fn llama_prefers_input_tokens_over_apply_template() {
         assert_eq!(
-            probe_with(
+            probe(
                 Some(EngineKind::LlamaCpp),
                 None,
-                fixture_post(&[("apply-template", LLAMA_TEMPLATE)]),
+                &[
+                    ("v1/chat/completions/input_tokens", LLAMA_INPUT),
+                    ("apply-template", LLAMA_TEMPLATE),
+                    ("tokenize", LLAMA_TOKENS)
+                ],
+                &[],
             ),
-            None
+            CountContextFact::LlamaInputTokens
         );
         assert_eq!(
-            probe_with(
+            probe(
                 Some(EngineKind::LlamaCpp),
                 None,
-                fixture_post(&[("tokenize", LLAMA_TOKENS)]),
+                &[("chat/completions/input_tokens", LLAMA_INPUT)],
+                &[],
             ),
-            None
+            CountContextFact::LlamaInputTokens
         );
+    }
+
+    #[test]
+    fn llama_probe_needs_both_fallback_routes() {
+        assert_eq!(
+            probe(
+                Some(EngineKind::LlamaCpp),
+                None,
+                &[("apply-template", LLAMA_TEMPLATE)],
+                &[],
+            ),
+            CountContextFact::Unsupported
+        );
+        assert_eq!(
+            probe(
+                Some(EngineKind::LlamaCpp),
+                None,
+                &[("tokenize", LLAMA_TOKENS)],
+                &[],
+            ),
+            CountContextFact::Unsupported
+        );
+    }
+
+    #[test]
+    fn adapter_count_route_is_probed_when_declared() {
+        let fact = probe_with(
+            CountProbeRequest {
+                declared: Some(EngineKind::Generic),
+                kind: None,
+                model: Some("m"),
+                adapter_count_route: Some("/count"),
+            },
+            fixture_post(&[("/count", r#"{"count":4}"#)]),
+            fixture_get(&[]),
+        );
+        assert_eq!(fact, CountContextFact::AdapterCount);
+        let skipped = probe_with(
+            CountProbeRequest {
+                declared: Some(EngineKind::Generic),
+                kind: None,
+                model: None,
+                adapter_count_route: None,
+            },
+            fixture_post(&[("/count", r#"{"count":4}"#)]),
+            fixture_get(&[]),
+        );
+        assert_eq!(skipped, CountContextFact::Unsupported);
+    }
+
+    #[test]
+    fn tgi_info_is_recognized_without_posting() {
+        assert!(is_tgi_info(TGI_INFO));
+        assert!(!is_tgi_info(r#"{"version":"1"}"#));
+        assert!(!is_tgi_info("{}"));
+    }
+
+    #[test]
+    fn chat_payload_forwards_only_requested_keys_and_model() {
+        let body = json!({
+            "messages": [{"role":"user","content":"a"}],
+            "tools": [{"type":"function"}],
+            "tool_choice": "auto",
+            "chat_template_kwargs": {"enable_thinking": true},
+            "foo": 1
+        });
+        let payload = chat_count_payload(
+            "m",
+            &body["messages"],
+            &body,
+            &["tools", "chat_template_kwargs"],
+        );
+        assert_eq!(payload["model"], "m");
+        assert!(payload.get("tools").is_some());
+        assert!(payload.get("chat_template_kwargs").is_some());
+        assert!(payload.get("tool_choice").is_none());
+        assert!(payload.get("foo").is_none());
+    }
+
+    #[test]
+    fn llama_tokenize_fallback_sets_add_special_and_model() {
+        let body = llama_tokenize_body(Some("m"), "<s>".to_string());
+        assert_eq!(body["add_special"], true);
+        assert_eq!(body["model"], "m");
+        assert_eq!(body["content"], "<s>");
+    }
+
+    #[test]
+    fn over_limit_body_is_too_large() {
+        let error = anyhow::anyhow!("the decoded response body exceeds 8 bytes");
+        let classified = classify_post_error(error, "tokenize");
+        assert_eq!(classified.kind, CountContextErrorKind::TooLarge);
     }
 }

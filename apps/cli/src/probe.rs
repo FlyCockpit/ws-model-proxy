@@ -185,7 +185,6 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
         .map(|row| (row.id.clone(), row.max_model_len))
         .collect::<Vec<_>>();
     let mut engine = crate::engine::detect_engine(endpoint, &model_limits);
-    engine.count_context = crate::count_context::probe_count_context(endpoint, engine.kind);
     let adapter_spec = endpoint.engine_adapter.clone().or_else(|| {
         let config = crate::config::Config::load().ok()?;
         let remote = crate::engine_adapter::load_remote_adapters().ok()?;
@@ -196,6 +195,15 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
             &config.approved_remote_adapters,
         )
     });
+    let model = rows.first().map(|row| row.id.as_str());
+    engine.count_context = Some(crate::count_context::probe_count_context(
+        endpoint,
+        engine.kind,
+        model,
+        adapter_spec
+            .as_ref()
+            .and_then(|spec| spec.count_route.as_deref()),
+    ));
     let adapter = crate::engine_adapter::probe_facts_with(endpoint, adapter_spec.as_ref());
     Ok(ProbeReport {
         endpoint_slug: endpoint.slug.clone(),

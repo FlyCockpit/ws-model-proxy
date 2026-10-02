@@ -727,11 +727,12 @@ fn config_with_fresh_engine_facts(active: &Config) -> (Config, Vec<EndpointInven
                 .filter_map(|(index, handle)| handle.join().ok().map(|engine| (index, engine)))
                 .collect::<Vec<_>>()
         });
-        for (index, engine) in detected {
+        for (index, mut engine) in detected {
             // A failed re-detection keeps the facts the last probe found.
             if re_detection_replaces_stored(&engine)
                 && let Some(probe) = refreshed.endpoints[index].last_probe.as_mut()
             {
+                preserve_count_context(probe.engine.as_ref(), &mut engine);
                 probe.engine = Some(engine);
             }
             let spec = crate::engine_adapter::effective_engine_adapter(
@@ -764,6 +765,17 @@ fn config_with_fresh_engine_facts(active: &Config) -> (Config, Vec<EndpointInven
 /// successful detection (this fast path, a reload or a full probe).
 fn re_detection_replaces_stored(engine: &crate::engine::DetectedEngine) -> bool {
     engine.kind.is_some()
+}
+
+/// Keep the probed count-context fact across reconnect when the engine kind
+/// did not change. Detection never sets `count_context`.
+fn preserve_count_context(
+    previous: Option<&crate::engine::DetectedEngine>,
+    next: &mut crate::engine::DetectedEngine,
+) {
+    if previous.and_then(|engine| engine.kind) == next.kind {
+        next.count_context = previous.and_then(|engine| engine.count_context);
+    }
 }
 
 /// Probe a stable desired snapshot without holding the config lock across
@@ -2150,7 +2162,7 @@ fn start_count_context<S>(
     config: &Config,
     worker_tx: &SyncSender<FromWorker>,
     workers: &mut BTreeMap<String, WorkerHandle>,
-    recent_finished: &RecentlyFinished,
+    recent_finished: &mut RecentlyFinished,
     request_id: String,
     endpoint_slug: String,
     model: String,
@@ -2161,6 +2173,7 @@ where
     S: std::io::Read + std::io::Write,
 {
     if workers.contains_key(&request_id) || recent_finished.contains(&request_id) {
+        recent_finished.record(&request_id);
         send_control(
             socket,
             &ClientControlMessage::CountContextError {
@@ -2179,6 +2192,7 @@ where
         .find(|endpoint| endpoint.enabled && endpoint.slug == endpoint_slug)
         .cloned()
     else {
+        recent_finished.record(&request_id);
         send_control(
             socket,
             &ClientControlMessage::CountContextError {
@@ -2195,7 +2209,29 @@ where
         .last_probe
         .as_ref()
         .and_then(|probe| probe.engine.as_ref())
-        .and_then(|engine| engine.count_context);
+        .and_then(|engine| engine.count_context)
+        .and_then(crate::count_context::CountContextFact::method);
+    let remote = crate::engine_adapter::load_remote_adapters().unwrap_or_default();
+    let adapter_count_route = crate::engine_adapter::effective_engine_adapter(
+        &endpoint,
+        &remote,
+        config.allow_remote_engine_adapters,
+        &config.approved_remote_adapters,
+    )
+    .and_then(|spec| spec.count_route);
+    if method.is_none() {
+        recent_finished.record(&request_id);
+        send_control(
+            socket,
+            &ClientControlMessage::CountContextError {
+                request_id,
+                failure: RelayFailure::UnsupportedCapability,
+                message: Some("this engine has no tokenize route".to_string()),
+            },
+            "sending a count_context rejection",
+        )?;
+        return Ok(());
+    }
 
     let (cancellation, _cancellation_rx) = CancellationHandle::new();
     let thread_tx = worker_tx.clone();
@@ -2214,6 +2250,7 @@ where
             endpoint,
             model,
             method,
+            adapter_count_route,
             timeout_ms,
             body_rx,
             thread_tx,
@@ -2238,6 +2275,7 @@ fn run_count_context_worker(
     endpoint: crate::config::EndpointConfig,
     model: String,
     method: Option<crate::count_context::CountContextMethod>,
+    adapter_count_route: Option<String>,
     timeout_ms: u64,
     body_rx: Option<Receiver<BodyChunk>>,
     tx: SyncSender<FromWorker>,
@@ -2278,7 +2316,14 @@ fn run_count_context_worker(
             }
         };
         let timeout = Duration::from_millis(timeout_ms.max(1));
-        match crate::count_context::count_chat(&endpoint, &model, &body, method, timeout) {
+        match crate::count_context::count_chat(
+            &endpoint,
+            &model,
+            &body,
+            method,
+            adapter_count_route.as_deref(),
+            timeout,
+        ) {
             Ok(outcome) => Some(ClientControlMessage::CountContextResult {
                 request_id: request_id.clone(),
                 tokens: outcome.tokens,
@@ -4044,6 +4089,109 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_keeps_count_context_when_the_kind_matches() {
+        let previous = crate::engine::DetectedEngine {
+            kind: Some(crate::engine::EngineKind::LlamaCpp),
+            count_context: Some(crate::count_context::CountContextFact::LlamaInputTokens),
+            slots: Some(4),
+            ..crate::engine::DetectedEngine::default()
+        };
+        let mut next = crate::engine::DetectedEngine {
+            kind: Some(crate::engine::EngineKind::LlamaCpp),
+            slots: Some(4),
+            ..crate::engine::DetectedEngine::default()
+        };
+        preserve_count_context(Some(&previous), &mut next);
+        assert_eq!(
+            next.count_context,
+            Some(crate::count_context::CountContextFact::LlamaInputTokens)
+        );
+        let mut changed = crate::engine::DetectedEngine {
+            kind: Some(crate::engine::EngineKind::Vllm),
+            ..crate::engine::DetectedEngine::default()
+        };
+        preserve_count_context(Some(&previous), &mut changed);
+        assert_eq!(changed.count_context, None);
+    }
+
+    #[test]
+    fn count_context_early_rejection_records_recent_finished() {
+        let mut socket = sink_socket();
+        let config = Config::default();
+        let (worker_tx, _worker_rx) =
+            mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
+        let mut workers = BTreeMap::<String, WorkerHandle>::new();
+        let mut recent_finished = RecentlyFinished::new();
+        let result = start_count_context(
+            &mut socket,
+            &config,
+            &worker_tx,
+            &mut workers,
+            &mut recent_finished,
+            "count-missing".to_string(),
+            "missing".to_string(),
+            "m".to_string(),
+            1_000,
+            true,
+        );
+        assert!(result.is_ok());
+        assert!(workers.is_empty());
+        assert!(recent_finished.contains("count-missing"));
+
+        let mut config = Config::default();
+        config.endpoints.push(crate::config::EndpointConfig {
+            slug: "local".to_string(),
+            enabled: true,
+            last_probe: Some(crate::config::ProbeSnapshot {
+                status: crate::config::ProbeStatus::Online,
+                models: vec!["m".to_string()],
+                suggested_capabilities: crate::config::OpenAiCompatibleCapabilities::default(),
+                engine: Some(crate::engine::DetectedEngine {
+                    kind: Some(crate::engine::EngineKind::Ollama),
+                    count_context: Some(crate::count_context::CountContextFact::Unsupported),
+                    ..crate::engine::DetectedEngine::default()
+                }),
+                adapter: None,
+            }),
+            ..crate::config::EndpointConfig::default()
+        });
+        let mut recent_finished = RecentlyFinished::new();
+        let result = start_count_context(
+            &mut socket,
+            &config,
+            &worker_tx,
+            &mut workers,
+            &mut recent_finished,
+            "count-unsupported".to_string(),
+            "local".to_string(),
+            "m".to_string(),
+            1_000,
+            true,
+        );
+        assert!(result.is_ok());
+        assert!(workers.is_empty());
+        assert!(recent_finished.contains("count-unsupported"));
+
+        let mut recent_finished = RecentlyFinished::new();
+        recent_finished.record("count-dup");
+        let result = start_count_context(
+            &mut socket,
+            &config,
+            &worker_tx,
+            &mut workers,
+            &mut recent_finished,
+            "count-dup".to_string(),
+            "local".to_string(),
+            "m".to_string(),
+            1_000,
+            true,
+        );
+        assert!(result.is_ok());
+        assert!(workers.is_empty());
+        assert!(recent_finished.contains("count-dup"));
+    }
+
+    #[test]
     fn the_reconnect_fast_path_hands_the_session_the_facts_its_hello_advertises() {
         // An acknowledged auto endpoint whose engine was not detectable at the
         // last probe; on reconnect `/props` answers. The hello advertises
@@ -4142,6 +4290,7 @@ mod tests {
             interval_secs: 2,
             timeout_secs: 2,
             map: map.clone(),
+            count_route: None,
         };
         let hash = crate::engine_adapter::spec_sha256("gpu", &spec);
         let remote = crate::protocol::RemoteEngineAdapter {
@@ -4153,6 +4302,7 @@ mod tests {
             interval_secs: 2,
             timeout_secs: 2,
             map,
+            count_route: None,
         };
         let mut config = Config {
             allow_remote_engine_adapters: true,

@@ -158,6 +158,9 @@ pub struct EngineAdapterConfig {
     pub timeout_secs: u32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub map: BTreeMap<AdapterSignal, SignalSelector>,
+    /// Optional POST path that counts Chat Completions tokens, like a load route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_route: Option<String>,
 }
 
 fn default_interval_secs() -> u32 {
@@ -198,6 +201,10 @@ impl EngineAdapterConfig {
             if selector.series.trim().is_empty() {
                 bail!("adapter map series cannot be empty");
             }
+        }
+        if let Some(route) = &self.count_route {
+            validate_route(route)
+                .map_err(|reason| anyhow::anyhow!("adapter count route is invalid: {reason}"))?;
         }
         Ok(())
     }
@@ -681,7 +688,9 @@ fn normalize_signal(signal: AdapterSignal, value: f64) -> Option<f64> {
         | AdapterSignal::SlotsBusy
         | AdapterSignal::Deferred => drop_count(value, LOAD_COUNT_MAX),
         AdapterSignal::PrefixCacheHitsTotal | AdapterSignal::PrefixCacheQueriesTotal => {
-            drop_count(value, TOKEN_COUNT_MAX)
+            // Cumulative since engine start; bound like byte counters so a
+            // long-uptime engine keeps reporting. Wire values are deltas.
+            drop_count(value, crate::telemetry::BYTE_COUNTER_MAX)
         }
         AdapterSignal::Slots => drop_count(value, SLOTS_MAX).filter(|kept| *kept >= 1.0),
         AdapterSignal::KvTokens | AdapterSignal::MaxModelLen | AdapterSignal::CtxPerSlot => {
@@ -848,7 +857,7 @@ fn canonical_value(value: &serde_json::Value) -> String {
 
 /// Compact JSON with sorted keys; SHA-256 of this is the approval pin.
 pub fn canonical_spec_json(endpoint_slug: &str, spec: &EngineAdapterConfig) -> String {
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
         "endpointSlug": endpoint_slug,
         "format": spec.format,
         "input": spec.input,
@@ -856,6 +865,11 @@ pub fn canonical_spec_json(endpoint_slug: &str, spec: &EngineAdapterConfig) -> S
         "map": spec.map,
         "timeoutSecs": spec.timeout_secs,
     });
+    if let Some(route) = &spec.count_route
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("countRoute".to_string(), serde_json::json!(route));
+    }
     canonical_value(&value)
 }
 
@@ -946,6 +960,7 @@ mod tests {
             interval_secs: 2,
             timeout_secs: 2,
             map,
+            count_route: None,
         }
     }
 
@@ -958,6 +973,7 @@ mod tests {
             interval_secs: 2,
             timeout_secs: 2,
             map,
+            count_route: None,
         }
     }
 
@@ -1049,7 +1065,7 @@ hits{model=\"b\"} 5
     }
 
     #[test]
-    fn prefix_cache_counters_use_the_token_bound() {
+    fn prefix_cache_counters_use_the_byte_counter_bound() {
         let spec = json_spec(BTreeMap::new());
         let kept = parse_adapter_body(
             &spec,
@@ -1059,9 +1075,23 @@ hits{model=\"b\"} 5
         let reading = kept.reading.expect("running");
         assert_eq!(reading.prefix_cache_hits_total, Some(1_000_001.0));
         assert_eq!(reading.prefix_cache_queries_total, Some(2_000_000.0));
-        let dropped = parse_adapter_body(
+        // Long-uptime totals above the token bound (1e12) must still report.
+        let long_uptime = parse_adapter_body(
             &spec,
             r#"{"running": 1, "prefixCacheHitsTotal": 1000000000001}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            long_uptime
+                .reading
+                .expect("running")
+                .prefix_cache_hits_total,
+            Some(1_000_000_000_001.0)
+        );
+        let over = crate::telemetry::BYTE_COUNTER_MAX as f64 + 1.0;
+        let dropped = parse_adapter_body(
+            &spec,
+            &format!(r#"{{"running": 1, "prefixCacheHitsTotal": {over}}}"#),
         )
         .expect("parse");
         assert_eq!(
@@ -1125,6 +1155,7 @@ hits{model=\"b\"} 5
             interval_secs: 2,
             timeout_secs: 2,
             map: BTreeMap::new(),
+            count_route: None,
         };
         let spec = remote.to_config();
         let hash = spec_sha256("gpu", &spec);
@@ -1148,6 +1179,7 @@ hits{model=\"b\"} 5
             interval_secs: 2,
             timeout_secs: 2,
             map: BTreeMap::new(),
+            count_route: None,
         });
         let shadowed = effective_engine_adapter(&local, &[remote], true, &approved).expect("local");
         assert_eq!(
@@ -1178,6 +1210,7 @@ hits{model=\"b\"} 5
             interval_secs: 2,
             timeout_secs: 1,
             map: BTreeMap::new(),
+            count_route: None,
         };
         let endpoint = EndpointConfig {
             slug: "local".to_string(),
@@ -1200,6 +1233,7 @@ hits{model=\"b\"} 5
             interval_secs: 2,
             timeout_secs: 2,
             map: BTreeMap::new(),
+            count_route: None,
         }
     }
 
@@ -1219,6 +1253,7 @@ hits{model=\"b\"} 5
             interval_secs: 2,
             timeout_secs: 2,
             map,
+            count_route: None,
         };
         assert_eq!(
             canonical_spec_json("gpu", &mapped),
@@ -1266,6 +1301,7 @@ hits{model=\"b\"} 5
             interval_secs: 2,
             timeout_secs: 2,
             map: BTreeMap::new(),
+            count_route: None,
         };
         let hash = spec_sha256("gpu", &spec);
         assert_eq!(

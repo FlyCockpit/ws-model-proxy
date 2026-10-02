@@ -191,6 +191,9 @@ struct AdapterSetArgs {
     /// Per-sample timeout in seconds (1–4). Default 2.
     #[arg(long, value_parser = clap::value_parser!(u32).range(1..=4))]
     timeout: Option<u32>,
+    /// POST path on the endpoint origin that counts Chat Completions tokens.
+    #[arg(long = "count-route")]
+    count_route: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -431,6 +434,7 @@ fn adapter_set(json: bool, args: &AdapterSetArgs) -> Result<()> {
         interval_secs: args.interval.unwrap_or(2),
         timeout_secs: args.timeout.unwrap_or(2),
         map,
+        count_route: args.count_route.clone(),
     };
     spec.validate()?;
     let endpoint = update_endpoint(&args.slug, |endpoint| {
@@ -492,6 +496,9 @@ fn adapter_show(json: bool, slug: &str) -> Result<()> {
                 spec.interval_secs,
                 spec.timeout_secs
             ))?;
+            if let Some(route) = &spec.count_route {
+                output::line(format!("  count-route {route}"))?;
+            }
             for (signal, selector) in &spec.map {
                 output::line(format!("  map {}={}", signal.as_str(), selector.series))?;
             }

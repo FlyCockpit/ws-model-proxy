@@ -759,9 +759,9 @@ pub struct EngineFacts {
     /// 2.9: a custom engine adapter is configured on this endpoint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load_adapter: Option<EngineFact<LoadAdapterValue>>,
-    /// Chat Completions tokenize route recorded at probe time.
+    /// Chat Completions tokenize fact recorded at probe time.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub count_context: Option<EngineFact<crate::count_context::CountContextMethod>>,
+    pub count_context: Option<EngineFact<crate::count_context::CountContextFact>>,
 }
 
 /// 2.9 `engineFacts.loadAdapter.value`.
@@ -1080,6 +1080,9 @@ pub struct RemoteEngineAdapter {
         crate::engine_adapter::AdapterSignal,
         crate::engine_adapter::SignalSelector,
     >,
+    /// Optional POST path that counts Chat Completions tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_route: Option<String>,
 }
 
 impl RemoteEngineAdapter {
@@ -1090,6 +1093,7 @@ impl RemoteEngineAdapter {
             interval_secs: self.interval_secs,
             timeout_secs: self.timeout_secs,
             map: self.map.clone(),
+            count_route: self.count_route.clone(),
         }
     }
 }
@@ -3533,6 +3537,7 @@ mod relay_27_vectors {
                 interval_secs: 2,
                 timeout_secs: 2,
                 map,
+                count_route: None,
             }),
             last_probe: Some(ProbeSnapshot {
                 status: ProbeStatus::Online,
@@ -3601,6 +3606,7 @@ mod relay_27_vectors {
             interval_secs: 2,
             timeout_secs: 2,
             map,
+            count_route: None,
         };
         let endpoint = EndpointConfig {
             slug: "gpu".to_string(),
