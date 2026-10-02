@@ -151,6 +151,44 @@ The 10 s cap covers the whole external phase: a pre-commit retry on the next
 external member gets only what is left of it.
 Pools with only external members keep the provider member's own budget.
 
+### New-conversation placement
+
+When a request is not affine on any member (no scored conversation-prefix depth
+and no conversation match), ranking spreads it by how full each member KV pool
+already is. The resident set is every unexpired footprint record
+(`prefixDigest IS NULL`) on that capacity, newest 2,000. Continuations still
+pin with prefix, conversation, and confirmed-cache weights; residency is not
+consulted when those scores apply.
+
+- Token mode (the engine reports a KV budget K, using the effective budget when
+  eviction feedback has lowered it): projected fill is
+  `(residentTokens + requestTokens − savedTokens) / K`, capped at 1.
+  `savedTokens` is the instruction/root size when that member already holds the
+  system prompt, otherwise 0.
+- Slot mode (K unknown, a concurrency cap is known): projected fill is resident
+  sessions / slots. Instruction warmth is only a tie-break.
+- Unknown both: projected fill is that member's resident sessions over the
+  busiest member's count.
+
+Member `weight` is a proportional share of new conversations, not a strict
+preference: a member with twice the weight receives about twice as many first
+turns when members are equally full. The pool setting `affinityResidencyWeight`
+(0–10000, default 100) scales that term; 0 turns spreading off. Ties break by
+instruction depth, then least-recent `lastRoutedAt`, then member id.
+Warm-session protection still runs after placement and can redirect a new
+conversation away from a protected member.
+
+Only tenant-scoped HMAC digests, session ids, and integer token estimates are
+stored. Prompt text is never persisted.
+
+A client-id fork stores `sharedWithSessionId` and `sharedPrefixTokens` on its
+first footprint write when another live session on the same target already owns
+that prefix. Warm protection and new-conversation residency then count the
+shared history once when the sharer is still an eligible session on the same
+capacity. Chains subtract only against the direct sharer. If the sharer later
+drops out of the protected set because of a share cap, the child is slightly
+undercounted.
+
 ### Waiting for the cache holder
 
 Cache-aware routing predicts which member still holds a request's prompt
@@ -188,6 +226,11 @@ bypasses WSMP is not seen.
 
 A session is protected when it was used within the pool's protection window
 (default 5 minutes) and is at least the minimum size (default 8192 tokens).
+Eligibility uses that raw size; the tokens charged against a user's share and
+the member's protected total subtract `sharedPrefixTokens` when the direct
+sharer is also eligible on the same capacity, so a fork does not count the
+shared history twice. If the sharer later loses protection to a share cap, the
+child is slightly undercounted.
 For each request, every local member that has no affinity hit for it is:
 
 - **full** when all its slots are busy;

@@ -520,7 +520,7 @@
     },
     "affinity": {
       "title": "Cache-aware routing",
-      "description": "New sessions go to the member with the best availability score (load, health, external fallback, and cost). When those scores tie, prefer a runtime that may still hold a matching instruction prefix. System-prompt-aware routing is part of this switch. After an assistant or tool turn, prefer the member that served the conversation so far. A long conversation can outweigh modest load or a half-open member; a large queue still moves the request to another member.",
+      "description": "New conversations spread across members by how full each KV pool already is, scaled by member weight (a share of new conversations, not a strict preference). An instruction-warm member is preferred only when that still leaves it with the lowest projected use. After an assistant or tool turn, prefer the member that served the conversation so far. A long conversation can outweigh modest load or a half-open member; a large queue still moves the request to another member.",
       "enabled": "Enable optional cache affinity",
       "stats": "{{records}} active records across {{targets}} targets",
       "clear": "Clear affinity records",
@@ -531,6 +531,7 @@
         "affinityPrefixWeight": "Conversation prefix-depth weight",
         "affinityConversationWeight": "Conversation weight",
         "affinityLoadPenaltyWeight": "Active-load penalty",
+        "affinityResidencyWeight": "New-conversation residency weight",
         "cacheHolderWaitMs": "Wait for the cache holder"
       },
       "cacheHolderWait": {
@@ -816,6 +817,8 @@
         "affinityConfirmedCacheWeightHint": "Extra score when the member's warm prefix was confirmed by the engine cache.",
         "affinityLoadPenaltyWeight": "Current-load penalty weight",
         "affinityLoadPenaltyWeightHint": "Score subtracted per point of normalized member load (active and waiting), steering new requests to quieter members.",
+        "affinityResidencyWeight": "New-conversation residency weight",
+        "affinityResidencyWeightHint": "How strongly new conversations spread by how full each member's KV already is. 0 turns spreading off; 100 is the default. Member weight is a share of new conversations.",
         "memberConcurrencyOverride": "Concurrency override",
         "memberWaitOverride": "Wait-budget override (ms)",
         "memberContextOverride": "Context-ceiling override",
@@ -878,6 +881,7 @@
         "affinityConversationWeight": "Enter a weight from 0 to 10000.",
         "affinityConfirmedCacheWeight": "Enter a weight from 0 to 10000.",
         "affinityLoadPenaltyWeight": "Enter a weight from 0 to 10000.",
+        "affinityResidencyWeight": "Enter a weight from 0 to 10000.",
         "memberOverrides": "Every LIMITED member override must be positive, and reserved slots cannot exceed its concurrency limit.",
         "memberContextPhysical": "This member's context ceiling plus margin cannot exceed its physical capacity.",
         "tokenAttemptLimit": "Enter a positive token limit or choose UNLIMITED.",
@@ -976,6 +980,7 @@
     "transformerMaxAssets": "Max attachments per request",
     "updated": "Pool updated",
     "weight": "Weight",
+    "weightHint": "Share of new conversations. Members with twice the weight receive about twice as many first turns when they are equally full.",
     "metricRules": {
       "title": "Metric routing rules",
       "description": "Mark a member FULL or avoid it using its device's metrics. FULL members get no new requests (they queue, go to another member, or go external for :external callers). Avoided members are used last. A stale or missing metric is ignored, and when every member is FULL requests are still served.",

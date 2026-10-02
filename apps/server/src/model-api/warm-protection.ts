@@ -111,6 +111,12 @@ export type WarmSession = {
    * session right now: it occupies a busy slot, not an idle one.
    */
   inFlight: boolean;
+  /** Warm-session identity; required to apply shared-prefix accounting. */
+  sessionId?: string;
+  /** Direct sharer of this session's first-write prefix, if any. */
+  sharedWithSessionId?: string | null;
+  /** Token estimate of that shared prefix; subtracted when the sharer is eligible. */
+  sharedPrefixTokens?: number | null;
 };
 
 export type CapacityLoad = {
@@ -155,6 +161,15 @@ function eligible(session: WarmSession, policy: WarmProtectionPolicy) {
   );
 }
 
+/** Count shared history once when the direct sharer is also eligible on this capacity. */
+function billedWarmTokens(session: WarmSession, eligibleSessionIds: ReadonlySet<string>): number {
+  const raw = Math.max(0, session.tokens);
+  const shared = Number(session.sharedPrefixTokens);
+  const sharer = session.sharedWithSessionId;
+  if (!Number.isFinite(shared) || !sharer || !eligibleSessionIds.has(sharer)) return raw;
+  return Math.max(0, raw - shared);
+}
+
 /**
  * The sessions of one member KV pool that are shielded from new sessions.
  *
@@ -178,8 +193,10 @@ export function protectedWarmSessions(
 ): WarmSession[] {
   if (!policy.enabled) return [];
   const byUser = new Map<string, WarmSession[]>();
+  const eligibleSessionIds = new Set<string>();
   for (const session of sessions) {
     if (!eligible(session, policy)) continue;
+    if (session.sessionId) eligibleSessionIds.add(session.sessionId);
     const own = byUser.get(session.userId) ?? [];
     own.push(session);
     byUser.set(session.userId, own);
@@ -215,6 +232,7 @@ export function protectedWarmSessions(
       ...own.map(({ overridePercent }) => fractionFor(overridePercent)),
     );
     for (const session of own) {
+      const billed = billedWarmTokens(session, eligibleSessionIds);
       const bucket = buckets.get(session.overridePercent) ?? {
         count: 0,
         tokens: 0,
@@ -222,19 +240,19 @@ export function protectedWarmSessions(
       };
       buckets.set(session.overridePercent, bucket);
       if (user.closed || bucket.closed) continue;
-      if (!fits(user, userFraction, session.tokens)) {
+      if (!fits(user, userFraction, billed)) {
         user.closed = true;
         continue;
       }
-      if (!fits(bucket, fractionFor(session.overridePercent), session.tokens)) {
+      if (!fits(bucket, fractionFor(session.overridePercent), billed)) {
         bucket.closed = true;
         continue;
       }
       for (const scope of [user, bucket]) {
         scope.count += 1;
-        scope.tokens += session.tokens;
+        scope.tokens += billed;
       }
-      protectedSessions.push(session);
+      protectedSessions.push({ ...session, tokens: billed });
     }
   }
   return protectedSessions;
@@ -418,6 +436,9 @@ type WarmSessionRow = {
   tokens: number;
   overridePercent: number | null;
   inFlight: boolean;
+  sessionId: string;
+  sharedWithSessionId: string | null;
+  sharedPrefixTokens: number | null;
 };
 
 /**
@@ -495,6 +516,9 @@ export async function loadWarmSessions({
     scoped AS (
       SELECT s."capacityId", s."tenantUserId" AS "userId", s."lastUsedAt",
              s.tokens::int AS tokens,
+             s."sessionKey" AS "sessionId",
+             f."sharedWithSessionId",
+             f."sharedPrefixTokens",
              EXISTS (SELECT 1 FROM served v
                       WHERE v."capacityId" = s."capacityId"
                         AND v."executionTargetId" = s."executionTargetId"
@@ -503,6 +527,17 @@ export async function loadWarmSessions({
                   THEN p."ownerProtectionPercent"
                   ELSE g."protectionOverridePercent" END AS "overridePercent"
         FROM session s
+        LEFT JOIN LATERAL (
+          SELECT r."sharedWithSessionId", r."sharedPrefixTokens"
+            FROM cache_affinity_record r
+           WHERE r."userId" = ${ownerId}
+             AND r."sessionId" = s."sessionKey"
+             AND r."prefixDigest" IS NULL
+             AND r."expiresAt" > ${now}
+           ORDER BY r."lastUsedAt" DESC, r.id DESC
+           LIMIT 1
+           OFFSET 0
+        ) f ON true
         JOIN model_pool p ON p.id = s."poolId"
         LEFT JOIN pool_grant g ON g."poolId" = s."poolId" AND g."granteeUserId" = s."tenantUserId"
        WHERE s.tokens >= ${policy.minTokens}
@@ -518,7 +553,8 @@ export async function loadWarmSessions({
        -- not use up the read bound either.
        WHERE "overridePercent" IS DISTINCT FROM 0
     )
-    SELECT "capacityId", "userId", "lastUsedAt", tokens, "overridePercent", "inFlight"
+    SELECT "capacityId", "userId", "lastUsedAt", tokens, "overridePercent", "inFlight",
+           "sessionId", "sharedWithSessionId", "sharedPrefixTokens"
       FROM ranked
      WHERE "rank" <= ${limitPerUser}
      ORDER BY "lastUsedAt" DESC
@@ -531,6 +567,9 @@ export async function loadWarmSessions({
       tokens: Number(row.tokens),
       overridePercent: row.overridePercent === null ? null : Number(row.overridePercent),
       inFlight: row.inFlight,
+      sessionId: row.sessionId,
+      sharedWithSessionId: row.sharedWithSessionId ?? null,
+      sharedPrefixTokens: row.sharedPrefixTokens == null ? null : Number(row.sharedPrefixTokens),
     });
     sessions.set(row.capacityId, list);
   }

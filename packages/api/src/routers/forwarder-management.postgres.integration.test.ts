@@ -326,6 +326,7 @@ integration("guarded pool setup with real PostgreSQL", () => {
       affinityConversationWeight: 160,
       affinityConfirmedCacheWeight: 260,
       affinityLoadPenaltyWeight: 120,
+      affinityResidencyWeight: 100,
     });
     expect(persisted.PoolMembers.find((member) => member.tier === "PRIMARY")).toMatchObject({
       capacityConcurrencyMode: "LIMITED",

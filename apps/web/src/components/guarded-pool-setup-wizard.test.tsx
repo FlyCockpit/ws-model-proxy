@@ -242,6 +242,7 @@ describe("GuardedPoolSetupWizard", () => {
     for (const option of ["native", "lossless", "lossy"])
       expect(capacity).toContain(`dashboard:pools.protocolOptions.${option}.label`);
     expect(capacity).toContain("dashboard:pools.wizard.fields.affinityEnabled");
+    expect(capacity).toContain("dashboard:pools.wizard.fields.affinityResidencyWeight");
     expect(capacity).toContain("dashboard:pools.wizard.advanced.memberOverrides");
     expect(capacity).toContain("sm:grid-cols-2");
 
@@ -336,6 +337,7 @@ describe("GuardedPoolSetupWizard", () => {
     affinityConversationWeight: 150,
     affinityConfirmedCacheWeight: 250,
     affinityLoadPenaltyWeight: 100,
+    affinityResidencyWeight: 100,
     providerConcurrencyMode: "LIMITED" as const,
     tokenAttemptMode: "LIMITED" as const,
     tokenAttemptLimit: "100000",

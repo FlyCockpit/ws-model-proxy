@@ -235,6 +235,7 @@ export function GuardedPoolSetupWizard({
       affinityConversationWeight: 150,
       affinityConfirmedCacheWeight: 250,
       affinityLoadPenaltyWeight: 100,
+      affinityResidencyWeight: 100,
       providerConcurrencyMode: "LIMITED" as LimitMode,
       tokenAttemptMode: "LIMITED" as LimitMode,
       tokenAttemptLimit: "100000",
@@ -277,6 +278,7 @@ export function GuardedPoolSetupWizard({
               conversationWeight: value.affinityConversationWeight,
               confirmedCacheWeight: value.affinityConfirmedCacheWeight,
               loadPenaltyWeight: value.affinityLoadPenaltyWeight,
+              residencyWeight: value.affinityResidencyWeight,
             },
             memberOverrides: value.localModelIds.flatMap((discoveredModelId) => {
               if (!enabledMemberOverrides[discoveredModelId]) return [];
@@ -375,6 +377,7 @@ export function GuardedPoolSetupWizard({
       "affinityConversationWeight",
       "affinityConfirmedCacheWeight",
       "affinityLoadPenaltyWeight",
+      "affinityResidencyWeight",
       "memberOverrides",
     ],
     [
@@ -719,6 +722,7 @@ export function GuardedPoolSetupWizard({
                       "affinityConversationWeight",
                       "affinityConfirmedCacheWeight",
                       "affinityLoadPenaltyWeight",
+                      "affinityResidencyWeight",
                     ] as const
                   ).map((name) => (
                     <form.Field key={name} name={name}>

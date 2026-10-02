@@ -1036,6 +1036,10 @@ model ModelPool {
   affinityConversationWeight      Int                           @default(150)
   affinityConfirmedCacheWeight    Int                           @default(250)
   affinityLoadPenaltyWeight       Int                           @default(100)
+  /// How strongly new conversations spread by KV residency. 0 disables the
+  /// term; 100 is the default. Member `weight` is a proportional share of new
+  /// conversations, not a strict preference. Continuations ignore this.
+  affinityResidencyWeight         Int                           @default(100)
   /// How long a request whose prefix is warm on one member waits for that
   /// member before spilling to a cold one (saturation S-A). Null = automatic
   /// (expected re-prefill time of the matched prefix, 2 s when the member's
@@ -1116,6 +1120,11 @@ model CacheAffinityRecord {
   /// Engine-reported prompt + completion tokens when known.
   reportedTokens       Int?
   engineCacheConfirmed Boolean  @default(false)
+  /// Other live session on this target that owned the first-write prefix.
+  /// Written once on insert; later edits do not refresh it.
+  sharedWithSessionId  String?
+  /// Token estimate of that shared prefix. NULL when sharedWithSessionId is NULL.
+  sharedPrefixTokens   Int?
 
   @@unique([tenantUserId, poolId, executionTargetId, targetIdentity, bindingDigest, prefixDigest])
   @@index([tenantUserId, poolId, prefixDigest, expiresAt])

@@ -2004,6 +2004,199 @@ integration("cache-prefix identity #160", () => {
     },
   );
 
+  it("a client-id fork is its own session, routes to the shared-history member, and keeps the original nodes", async () => {
+    if (!db) return;
+    const row = await fixture();
+    const args = argsFor(row);
+    const originalPayload = { messages: baseHistory };
+    const original = await service.rememberAffinity({ ...args, payload: originalPayload });
+    expect(original).not.toBeNull();
+    const originalNodes = await db.cacheAffinityNode.findMany({
+      where: { sessionId: original!.sessionId, poolId: args.poolId },
+      select: { nodeDigest: true, depth: true, isTip: true },
+      orderBy: { depth: "asc" },
+    });
+    expect(originalNodes.length).toBeGreaterThan(0);
+    const forkPayload = { conversation_id: "fork-client", messages: baseHistory };
+    const ranked = await service.rankAffinityTargets({
+      ...args,
+      payload: forkPayload,
+      targets: [row.target(1), row.target(0)],
+    });
+    expect(ranked.orderedTargetIds[0]).toBe(row.target(0).executionTargetId);
+    expect(ranked.prefixDepths[row.target(0).executionTargetId]).toBeGreaterThan(0);
+    const fork = await service.rememberAffinity({
+      ...args,
+      payload: forkPayload,
+      target: row.target(0),
+    });
+    expect(fork).not.toBeNull();
+    expect(fork!.sessionId).not.toBe(original!.sessionId);
+    const forkMaterial = service.affinityPrefixDigests({
+      ...args,
+      payload: forkPayload,
+      runtimeIdentity: args.target.targetIdentity,
+    });
+    expect(fork!.sessionId).toBe(forkMaterial.clientSessionId);
+    expect(ranked.matchedSessionIds?.[row.target(0).executionTargetId]).toBe(
+      forkMaterial.clientSessionId,
+    );
+    const kept = await db.cacheAffinityNode.findMany({
+      where: { sessionId: original!.sessionId, poolId: args.poolId },
+      select: { nodeDigest: true, depth: true, isTip: true },
+      orderBy: { depth: "asc" },
+    });
+    expect(kept).toEqual(originalNodes);
+    expect(
+      await db.cacheAffinityNode.count({
+        where: { sessionId: fork!.sessionId, poolId: args.poolId },
+      }),
+    ).toBeGreaterThan(0);
+  });
+
+  it("first write of a client-id fork stores shared prefix fields; a non-fork stores null", async () => {
+    if (!db) return;
+    const args = argsFor(await fixture());
+    const original = await service.rememberAffinity({
+      ...args,
+      payload: { messages: baseHistory },
+      estimatedTokens: 80_000,
+    });
+    expect(original).not.toBeNull();
+    const originalFootprints = await db.cacheAffinityRecord.findMany({
+      where: { sessionId: original!.sessionId, poolId: args.poolId, prefixDigest: null },
+      select: { sharedWithSessionId: true, sharedPrefixTokens: true },
+    });
+    expect(originalFootprints.length).toBeGreaterThan(0);
+    expect(
+      originalFootprints.every(
+        (row) => row.sharedWithSessionId == null && row.sharedPrefixTokens == null,
+      ),
+    ).toBe(true);
+
+    const forkPayload = { conversation_id: "fork-share", messages: baseHistory };
+    const fork = await service.rememberAffinity({
+      ...args,
+      payload: forkPayload,
+      estimatedTokens: 80_000,
+    });
+    expect(fork).not.toBeNull();
+    expect(fork!.sessionId).not.toBe(original!.sessionId);
+    const canonical = service.buildCanonicalRequest({
+      surface: args.surface,
+      payload: forkPayload,
+    })!;
+    const material = service.affinityPrefixDigests({
+      ...args,
+      payload: forkPayload,
+      runtimeIdentity: args.target.targetIdentity,
+    });
+    const expected = service.prefixTokensAtDepth(canonical, material.nodes.at(-1)!.depth, 80_000);
+    const forkFootprints = await db.cacheAffinityRecord.findMany({
+      where: { sessionId: fork!.sessionId, poolId: args.poolId, prefixDigest: null },
+      select: { sharedWithSessionId: true, sharedPrefixTokens: true },
+    });
+    expect(forkFootprints.length).toBeGreaterThan(0);
+    expect(forkFootprints.every((row) => row.sharedWithSessionId === original!.sessionId)).toBe(
+      true,
+    );
+    expect(forkFootprints.every((row) => row.sharedPrefixTokens === expected)).toBe(true);
+  });
+
+  it("a fork without an id can switch branches repeatedly and stays one session", async () => {
+    if (!db) return;
+    const args = argsFor(await fixture());
+    const write = (messages: unknown[]) =>
+      service.rememberAffinity({ ...args, payload: { messages } });
+    const original = await write(baseHistory);
+    expect(original).not.toBeNull();
+    const left = [u("shared starter"), a("reply"), u("left branch")];
+    const right = [u("shared starter"), a("reply"), u("right branch")];
+    const first = await write(left);
+    expect(first!.sessionId).toBe(original!.sessionId);
+    const second = await write(right);
+    expect(second!.sessionId).toBe(original!.sessionId);
+    const back = await write(left);
+    expect(back!.sessionId).toBe(original!.sessionId);
+    expect(back!.tipDigest).toBe(first!.tipDigest);
+    expect(second!.tipDigest).not.toBe(first!.tipDigest);
+    expect(
+      await db.cacheAffinityRecord.groupBy({
+        by: ["sessionId"],
+        where: { poolId: args.poolId },
+      }),
+    ).toHaveLength(1);
+  });
+
+  it("parallel client-id forks stay distinct and keep the original nodes", async () => {
+    if (!db) return;
+    const args = argsFor(await fixture());
+    const original = await service.rememberAffinity({
+      ...args,
+      payload: { messages: baseHistory },
+    });
+    expect(original).not.toBeNull();
+    const originalNodes = await db.cacheAffinityNode.findMany({
+      where: { sessionId: original!.sessionId, poolId: args.poolId },
+      select: { nodeDigest: true, depth: true, isTip: true },
+      orderBy: { depth: "asc" },
+    });
+    const [forkA, forkB] = await Promise.all([
+      service.rememberAffinity({
+        ...args,
+        payload: { conversation_id: "fork-a", messages: baseHistory },
+      }),
+      service.rememberAffinity({
+        ...args,
+        payload: { conversation_id: "fork-b", messages: baseHistory },
+      }),
+    ]);
+    expect(forkA!.sessionId).not.toBe(original!.sessionId);
+    expect(forkB!.sessionId).not.toBe(original!.sessionId);
+    expect(forkA!.sessionId).not.toBe(forkB!.sessionId);
+    expect(
+      await db.cacheAffinityNode.findMany({
+        where: { sessionId: original!.sessionId, poolId: args.poolId },
+        select: { nodeDigest: true, depth: true, isTip: true },
+        orderBy: { depth: "asc" },
+      }),
+    ).toEqual(originalNodes);
+    expect(
+      await db.cacheAffinityRecord.groupBy({
+        by: ["sessionId"],
+        where: { poolId: args.poolId },
+      }),
+    ).toHaveLength(3);
+  });
+
+  it("parallel anonymous branch switches stay one session", async () => {
+    if (!db) return;
+    const args = argsFor(await fixture());
+    const original = await service.rememberAffinity({
+      ...args,
+      payload: { messages: baseHistory },
+    });
+    expect(original).not.toBeNull();
+    const [left, right] = await Promise.all([
+      service.rememberAffinity({
+        ...args,
+        payload: { messages: [u("shared starter"), a("reply"), u("anon left")] },
+      }),
+      service.rememberAffinity({
+        ...args,
+        payload: { messages: [u("shared starter"), a("reply"), u("anon right")] },
+      }),
+    ]);
+    expect(left!.sessionId).toBe(original!.sessionId);
+    expect(right!.sessionId).toBe(original!.sessionId);
+    expect(
+      await db.cacheAffinityRecord.groupBy({
+        by: ["sessionId"],
+        where: { poolId: args.poolId },
+      }),
+    ).toHaveLength(1);
+  });
+
   it("concurrent completions reread advanced tips inside the fence", async () => {
     if (!db) return;
     const args = argsFor(await fixture());

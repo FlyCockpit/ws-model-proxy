@@ -249,6 +249,7 @@ import {
 import { type RelayRequestSourceValue, transitionRelayRequestTerminal } from "./usage-rollup.js";
 import {
   assessWarmProtection,
+  protectionKvBudgetTokens,
   protectionRouting,
   type WarmProtectionPolicy,
   warmProtectionSource,
@@ -913,6 +914,7 @@ const poolMemberRelaySelect = {
       affinityConversationWeight: true,
       affinityConfirmedCacheWeight: true,
       affinityLoadPenaltyWeight: true,
+      affinityResidencyWeight: true,
     },
   },
   ExecutionTarget: {
@@ -924,6 +926,7 @@ const poolMemberRelaySelect = {
     },
   },
   weight: true,
+  lastRoutedAt: true,
   healthStatus: true,
   routingStatus: true,
   lastFailureClass: true,
@@ -1122,6 +1125,7 @@ function affinityPolicyForMember(member: PoolMemberRelayRow): AffinityPolicy {
     conversationWeight: pool?.affinityConversationWeight ?? 150,
     confirmedCacheWeight: pool?.affinityConfirmedCacheWeight ?? 250,
     loadPenaltyWeight: pool?.affinityLoadPenaltyWeight ?? 100,
+    residencyWeight: pool?.affinityResidencyWeight ?? 100,
   };
 }
 
@@ -5769,8 +5773,8 @@ async function relayPool({
     return mode === "native" ? 0 : mode === "adapted" ? 1 : 2;
   };
   // PRIMARY members are always local. Native compatibility is the first class;
-  // member weight is the score within a class, with stable member IDs
-  // providing deterministic ties.
+  // member weight remains only as a stable pre-affinity order (new
+  // conversations treat weight as a proportional share inside ranking).
   let routeCandidates = [...localRouteCandidates].sort(
     (left, right) =>
       routeModeRank(left) - routeModeRank(right) ||
@@ -5946,6 +5950,7 @@ async function relayPool({
         conversationWeight: 150,
         confirmedCacheWeight: 250,
         loadPenaltyWeight: 100,
+        residencyWeight: 100,
       };
   const protectionPolicy = warmProtectionPolicyForMember(eligibleMembers[0]);
   if (requestedSurface && affinityPayload && affinityPolicy.enabled) {
@@ -5959,7 +5964,23 @@ async function relayPool({
             candidate.healthStatus,
           )
         : null;
-      return affinityTarget ? [affinityTarget] : [];
+      const capacity = member?.ExecutionTarget?.InferenceCapacity;
+      return affinityTarget && member && capacity
+        ? [
+            {
+              ...affinityTarget,
+              weight: member.weight,
+              lastRoutedAt: member.lastRoutedAt,
+              requestTokens: (nativeCounts.get(member.id) ?? operation.contextCount)?.tokens ?? 0,
+              kvBudgetTokens: protectionKvBudgetTokens(
+                capacity.engineKind,
+                capacity.kvBudgetTokens,
+              ),
+              slots: capacity.hardConcurrencyLimit,
+              engineKind: capacity.engineKind,
+            },
+          ]
+        : [];
     });
     if (affinityTargets.length === routeCandidates.length) {
       try {

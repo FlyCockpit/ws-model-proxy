@@ -1007,6 +1007,7 @@ function serializePool(row: ModelPoolRow) {
       conversationWeight: row.affinityConversationWeight,
       confirmedCacheWeight: row.affinityConfirmedCacheWeight,
       loadPenaltyWeight: row.affinityLoadPenaltyWeight,
+      residencyWeight: row.affinityResidencyWeight,
     },
     cacheHolderWaitMs: row.cacheHolderWaitMs,
     protection: {
@@ -1431,6 +1432,7 @@ const poolSelect = {
   affinityConversationWeight: true,
   affinityConfirmedCacheWeight: true,
   affinityLoadPenaltyWeight: true,
+  affinityResidencyWeight: true,
   cacheHolderWaitMs: true,
   protectionEnabled: true,
   protectionWindowSeconds: true,
@@ -1678,6 +1680,7 @@ export const forwarderManagementRouter = {
                   conversationWeight: z.number().int().min(0).max(10_000),
                   confirmedCacheWeight: z.number().int().min(0).max(10_000),
                   loadPenaltyWeight: z.number().int().min(0).max(10_000),
+                  residencyWeight: z.number().int().min(0).max(10_000).optional(),
                 }),
                 memberOverrides: z
                   .array(
@@ -2187,6 +2190,7 @@ export const forwarderManagementRouter = {
             affinityConversationWeight: input.advanced?.affinity.conversationWeight ?? 150,
             affinityConfirmedCacheWeight: input.advanced?.affinity.confirmedCacheWeight ?? 250,
             affinityLoadPenaltyWeight: input.advanced?.affinity.loadPenaltyWeight ?? 100,
+            affinityResidencyWeight: input.advanced?.affinity.residencyWeight ?? 100,
           },
           select: { id: true },
         });
@@ -2734,6 +2738,7 @@ export const forwarderManagementRouter = {
         affinityConversationWeight: z.number().int().min(0).max(10_000).optional(),
         affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000).optional(),
         affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000).optional(),
+        affinityResidencyWeight: z.number().int().min(0).max(10_000).optional(),
         cacheHolderWaitMs: cacheHolderWaitMsSchema,
         ...poolProtectionFields,
       }),
@@ -2820,6 +2825,7 @@ export const forwarderManagementRouter = {
         affinityConversationWeight: input.affinityConversationWeight ?? 150,
         affinityConfirmedCacheWeight: input.affinityConfirmedCacheWeight ?? 250,
         affinityLoadPenaltyWeight: input.affinityLoadPenaltyWeight ?? 100,
+        affinityResidencyWeight: input.affinityResidencyWeight ?? 100,
         cacheHolderWaitMs: input.cacheHolderWaitMs ?? null,
         protectionEnabled: input.protectionEnabled ?? true,
         protectionWindowSeconds: input.protectionWindowSeconds ?? 300,
@@ -2900,6 +2906,7 @@ export const forwarderManagementRouter = {
         affinityConversationWeight: z.number().int().min(0).max(10_000).optional(),
         affinityConfirmedCacheWeight: z.number().int().min(0).max(10_000).optional(),
         affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000).optional(),
+        affinityResidencyWeight: z.number().int().min(0).max(10_000).optional(),
         cacheHolderWaitMs: cacheHolderWaitMsSchema,
         ...poolProtectionFields,
         ...modelPoolCapacityPolicyFields,
@@ -3098,6 +3105,9 @@ export const forwarderManagementRouter = {
               : {}),
             ...(input.affinityLoadPenaltyWeight !== undefined
               ? { affinityLoadPenaltyWeight: input.affinityLoadPenaltyWeight }
+              : {}),
+            ...(input.affinityResidencyWeight !== undefined
+              ? { affinityResidencyWeight: input.affinityResidencyWeight }
               : {}),
             ...(input.cacheHolderWaitMs !== undefined
               ? { cacheHolderWaitMs: input.cacheHolderWaitMs }

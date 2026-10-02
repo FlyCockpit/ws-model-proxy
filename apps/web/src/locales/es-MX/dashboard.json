@@ -520,7 +520,7 @@
     },
     "affinity": {
       "title": "Enrutamiento según caché",
-      "description": "Las sesiones nuevas van al miembro con la mejor puntuación de disponibilidad (carga, salud, respaldo externo y costo). Cuando esas puntuaciones empatan, se prefiere un entorno que quizá conserve un prefijo de instrucción coincidente. El enrutamiento consciente del prompt de sistema es parte de este interruptor. Después de un turno de asistente o de herramienta, se prefiere el miembro que sirvió la conversación hasta ahora. Una conversación larga puede superar una carga moderada o un miembro medio abierto; una cola grande igual envía la solicitud a otro miembro.",
+      "description": "Las conversaciones nuevas se reparten entre miembros según lo lleno que ya esté cada grupo de KV, escalado por el peso del miembro (una parte de las conversaciones nuevas, no una preferencia estricta). Un miembro con el prompt de sistema caliente solo gana cuando eso todavía deja su uso proyectado más bajo. Después de un turno de asistente o de herramienta, se prefiere el miembro que sirvió la conversación hasta ahora. Una conversación larga puede superar una carga moderada o un miembro medio abierto; una cola grande igual envía la solicitud a otro miembro.",
       "enabled": "Activar afinidad de caché opcional",
       "stats": "{{records}} registros activos en {{targets}} destinos",
       "clear": "Borrar registros de afinidad",
@@ -531,6 +531,7 @@
         "affinityPrefixWeight": "Peso por profundidad del prefijo de conversación",
         "affinityConversationWeight": "Peso de conversación",
         "affinityLoadPenaltyWeight": "Penalización por carga activa",
+        "affinityResidencyWeight": "Peso de residencia de conversaciones nuevas",
         "cacheHolderWaitMs": "Esperar al miembro con la caché"
       },
       "cacheHolderWait": {
@@ -816,6 +817,8 @@
         "affinityConfirmedCacheWeightHint": "Puntaje extra cuando el prefijo caliente del miembro fue confirmado por la caché del motor.",
         "affinityLoadPenaltyWeight": "Penalización por carga actual",
         "affinityLoadPenaltyWeightHint": "Puntaje restado por punto de carga normalizada del miembro (activa y en espera), dirigiendo las nuevas solicitudes a miembros menos cargados.",
+        "affinityResidencyWeight": "Peso de residencia de conversaciones nuevas",
+        "affinityResidencyWeightHint": "Qué tanto se reparten las conversaciones nuevas según lo lleno que ya esté el KV de cada miembro. 0 desactiva el reparto; 100 es el valor predeterminado. El peso del miembro es una parte de las conversaciones nuevas.",
         "memberConcurrencyOverride": "Anulación de concurrencia",
         "memberWaitOverride": "Anulación de espera (ms)",
         "memberContextOverride": "Anulación del límite de contexto",
@@ -878,6 +881,7 @@
         "affinityConversationWeight": "Ingresa un peso de 0 a 10000.",
         "affinityConfirmedCacheWeight": "Ingresa un peso de 0 a 10000.",
         "affinityLoadPenaltyWeight": "Ingresa un peso de 0 a 10000.",
+        "affinityResidencyWeight": "Ingresa un peso de 0 a 10000.",
         "memberOverrides": "Cada anulación LIMITED debe ser positiva y los espacios reservados no pueden superar su límite de concurrencia.",
         "memberContextPhysical": "El límite de contexto de este miembro más su margen no puede superar su capacidad física.",
         "tokenAttemptLimit": "Ingresa un límite positivo de tokens o elige UNLIMITED.",
@@ -976,6 +980,7 @@
     "transformerMaxAssets": "Máximo de adjuntos por solicitud",
     "updated": "Pool actualizado",
     "weight": "Peso",
+    "weightHint": "Parte de las conversaciones nuevas. Un miembro con el doble de peso recibe alrededor del doble de primeros turnos cuando están igual de llenos.",
     "metricRules": {
       "title": "Reglas de enrutamiento por métricas",
       "description": "Marca un miembro como LLENO o evítalo según las métricas de su dispositivo. Los miembros LLENOS no reciben solicitudes nuevas (esperan en cola, van a otro miembro o salen al proveedor externo para quienes usan :external). Los miembros evitados se usan al final. Una métrica obsoleta o ausente se ignora, y si todos los miembros están LLENOS las solicitudes se siguen atendiendo.",

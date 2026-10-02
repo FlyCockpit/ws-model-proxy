@@ -140,6 +140,7 @@ ALTER TABLE model_pool ADD CONSTRAINT model_pool_affinity_policy_check CHECK (
   AND "affinityConversationWeight" BETWEEN 0 AND 10000
   AND "affinityConfirmedCacheWeight" BETWEEN 0 AND 10000
   AND "affinityLoadPenaltyWeight" BETWEEN 0 AND 10000
+  AND "affinityResidencyWeight" BETWEEN 0 AND 10000
 );
 
 -- Affinity is disposable prediction state. Greenfield v5 uses cache-prefix
@@ -156,6 +157,8 @@ ALTER TABLE cache_affinity_record ADD COLUMN IF NOT EXISTS "sessionId" TEXT;
 DELETE FROM cache_affinity_record WHERE "sessionId" IS NULL; -- policy: bounded-delete
 ALTER TABLE cache_affinity_record ALTER COLUMN "sessionId" SET NOT NULL;
 ALTER TABLE cache_affinity_record ALTER COLUMN "digestVersion" SET DEFAULT 5;
+ALTER TABLE cache_affinity_record ADD COLUMN IF NOT EXISTS "sharedWithSessionId" TEXT;
+ALTER TABLE cache_affinity_record ADD COLUMN IF NOT EXISTS "sharedPrefixTokens" INTEGER;
 
 CREATE UNIQUE INDEX IF NOT EXISTS cache_affinity_conversation_unique
   ON cache_affinity_record
@@ -178,6 +181,7 @@ ALTER TABLE cache_affinity_record ADD CONSTRAINT cache_affinity_record_shape_che
         AND length("conversationDigest") BETWEEN 32 AND 128))
   AND length("sessionId") BETWEEN 1 AND 128
   AND length("targetIdentity") BETWEEN 1 AND 2048
+  AND ("sharedPrefixTokens" IS NULL OR "sharedPrefixTokens" >= 0)
 );
 
 CREATE OR REPLACE FUNCTION enforce_cache_affinity_identity_immutable()

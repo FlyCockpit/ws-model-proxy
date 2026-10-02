@@ -271,6 +271,82 @@ describe("S-C warm-session equity", () => {
       protectedWarmSessions([session("alice", 1)], slots(1), policy({ enabled: false })),
     ).toEqual([]);
   });
+
+  it("counts shared history once when the sharer is eligible", () => {
+    const parent = { ...session("alice", 1, 80_000), sessionId: "parent" };
+    const fork = {
+      ...session("alice", 2, 85_000),
+      sessionId: "fork",
+      sharedWithSessionId: "parent",
+      sharedPrefixTokens: 80_000,
+    };
+    const protectedSessions = protectedWarmSessions(
+      [parent, fork],
+      { slots: null, active: 0, kvBudgetTokens: 200_000 },
+      policy({ share: "FIRST_COME" }),
+    );
+    expect(protectedSessions).toHaveLength(2);
+    expect(protectedSessions.reduce((sum, row) => sum + row.tokens, 0)).toBe(85_000);
+  });
+
+  it("counts a fork in full when its sharer is not eligible", () => {
+    const parent = { ...session("alice", 1_000, 80_000), sessionId: "parent" };
+    const fork = {
+      ...session("alice", 2, 85_000),
+      sessionId: "fork",
+      sharedWithSessionId: "parent",
+      sharedPrefixTokens: 80_000,
+    };
+    const protectedSessions = protectedWarmSessions(
+      [parent, fork],
+      { slots: null, active: 0, kvBudgetTokens: 200_000 },
+      policy({ share: "FIRST_COME" }),
+    );
+    expect(protectedSessions).toHaveLength(1);
+    expect(protectedSessions[0]?.sessionId).toBe("fork");
+    expect(protectedSessions[0]?.tokens).toBe(85_000);
+  });
+
+  it("chains subtract shared history against the direct sharer only", () => {
+    const root = { ...session("alice", 1, 80_000), sessionId: "a" };
+    const first = {
+      ...session("alice", 2, 90_000),
+      sessionId: "f1",
+      sharedWithSessionId: "a",
+      sharedPrefixTokens: 80_000,
+    };
+    const second = {
+      ...session("alice", 3, 95_000),
+      sessionId: "f2",
+      sharedWithSessionId: "f1",
+      sharedPrefixTokens: 90_000,
+    };
+    const protectedSessions = protectedWarmSessions(
+      [root, first, second],
+      { slots: null, active: 0, kvBudgetTokens: 300_000 },
+      policy({ share: "FIRST_COME" }),
+    );
+    expect(protectedSessions.reduce((sum, row) => sum + row.tokens, 0)).toBe(95_000);
+  });
+
+  it("clamps shared-prefix subtraction at 0", () => {
+    const parent = { ...session("alice", 1, 10_000), sessionId: "parent" };
+    const fork = {
+      ...session("alice", 2, 10_000),
+      sessionId: "fork",
+      sharedWithSessionId: "parent",
+      sharedPrefixTokens: 80_000,
+    };
+    const protectedSessions = protectedWarmSessions(
+      [parent, fork],
+      { slots: null, active: 0, kvBudgetTokens: 200_000 },
+      policy({ share: "FIRST_COME" }),
+    );
+    expect(protectedSessions.map(({ sessionId, tokens }) => ({ sessionId, tokens }))).toEqual([
+      { sessionId: "parent", tokens: 10_000 },
+      { sessionId: "fork", tokens: 0 },
+    ]);
+  });
 });
 
 describe("S-C member state", () => {
@@ -955,6 +1031,38 @@ describe("effective KV assessment", () => {
     expect(readDb.capacityKvEviction.findMany).toHaveBeenLastCalledWith({
       where: { capacityId: { in: ["cap-a"] }, userId: "owner", expiresAt: { gt: now } },
     });
+  });
+
+  it("loadWarmSessions returns shared-prefix fields from the footprint", async () => {
+    const stamp = new Date("2026-01-01T00:00:00Z");
+    readDb.$queryRaw.mockResolvedValue([
+      {
+        capacityId: "cap-a",
+        userId: "alice",
+        lastUsedAt: stamp,
+        tokens: 80_000,
+        overridePercent: null,
+        inFlight: false,
+        sessionId: "fork",
+        sharedWithSessionId: "parent",
+        sharedPrefixTokens: 70_000,
+      },
+    ]);
+    const sessions = await loadWarmSessions({
+      ownerId: "owner",
+      capacityIds: ["cap-a"],
+      policy: policy(),
+      now: stamp,
+    });
+    expect(sessions.get("cap-a")?.[0]).toMatchObject({
+      sessionId: "fork",
+      sharedWithSessionId: "parent",
+      sharedPrefixTokens: 70_000,
+      tokens: 80_000,
+    });
+    const sql = [...(readDb.$queryRaw.mock.calls[0]![0].strings ?? [])].join("");
+    expect(sql).toContain("sharedPrefixTokens");
+    expect(sql).toContain('"prefixDigest" IS NULL');
   });
 });
 

@@ -1758,6 +1758,7 @@ export function PoolForm({
       affinityPrefixWeight: z.number().int().min(0).max(10_000),
       affinityConversationWeight: z.number().int().min(0).max(10_000),
       affinityLoadPenaltyWeight: z.number().int().min(0).max(10_000),
+      affinityResidencyWeight: z.number().int().min(0).max(10_000),
       cacheHolderWaitMode: z.enum(["AUTO", "FIXED"]),
       cacheHolderWaitMs: z.number().int().min(0).max(30_000),
       protectionEnabled: z.boolean(),
@@ -1856,6 +1857,7 @@ export function PoolForm({
       affinityPrefixWeight: pool?.affinity.prefixWeight ?? 100,
       affinityConversationWeight: pool?.affinity.conversationWeight ?? 150,
       affinityLoadPenaltyWeight: pool?.affinity.loadPenaltyWeight ?? 100,
+      affinityResidencyWeight: pool?.affinity.residencyWeight ?? 100,
       // S-A cache-holder wait: null = automatic; 0 = off; N = fixed ms.
       cacheHolderWaitMode: (pool?.cacheHolderWaitMs == null ? "AUTO" : "FIXED") as "AUTO" | "FIXED",
       cacheHolderWaitMs: pool?.cacheHolderWaitMs ?? 2_000,
@@ -1961,6 +1963,7 @@ export function PoolForm({
             affinityPrefixWeight: value.affinityPrefixWeight,
             affinityConversationWeight: value.affinityConversationWeight,
             affinityLoadPenaltyWeight: value.affinityLoadPenaltyWeight,
+            affinityResidencyWeight: value.affinityResidencyWeight,
             cacheHolderWaitMs:
               value.cacheHolderWaitMode === "FIXED" ? value.cacheHolderWaitMs : null,
             ...protectionSettingsFromForm(value),
@@ -1987,6 +1990,7 @@ export function PoolForm({
           affinityPrefixWeight: value.affinityPrefixWeight,
           affinityConversationWeight: value.affinityConversationWeight,
           affinityLoadPenaltyWeight: value.affinityLoadPenaltyWeight,
+          affinityResidencyWeight: value.affinityResidencyWeight,
           cacheHolderWaitMs: value.cacheHolderWaitMode === "FIXED" ? value.cacheHolderWaitMs : null,
           ...protectionSettingsFromForm(value),
         });
@@ -2162,6 +2166,7 @@ export function PoolForm({
                 "affinityPrefixWeight",
                 "affinityConversationWeight",
                 "affinityLoadPenaltyWeight",
+                "affinityResidencyWeight",
               ] as const
             ).map((name) => (
               <form.Field key={name} name={name}>
@@ -3225,6 +3230,7 @@ export function PoolMemberForm({
             value={weight}
             onChange={(event) => setWeight(event.target.value)}
           />
+          <p className="text-xs text-muted-foreground">{t("dashboard:pools.weightHint")}</p>
         </div>
       ) : null}
       <details className="rounded-md border p-3">
