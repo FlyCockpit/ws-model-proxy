@@ -99,6 +99,32 @@ fn recovery_dirs(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+fn is_recovery_metadata(name: &std::ffi::OsStr) -> bool {
+    name == "INTENT" || name == "INTENT.new" || name == ".wsmp-lock"
+}
+
+fn private_object(dir: &Path) -> PathBuf {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| !is_recovery_metadata(p.file_name().unwrap()))
+        .expect("private slot")
+}
+
+fn slot_count(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter(|entry| {
+            let name = entry
+                .as_ref()
+                .ok()
+                .map(|e| e.file_name())
+                .unwrap_or_default();
+            !is_recovery_metadata(&name)
+        })
+        .count()
+}
+
 fn paths(value: &Value) -> Vec<PathBuf> {
     value
         .as_array()
@@ -119,21 +145,7 @@ fn uncertain(error: &FileError) -> Vec<PathBuf> {
     for p in &kept {
         assert!(p.is_absolute() && p.exists(), "reported object: {p:?}");
     }
-    assert!(
-        std::fs::read_dir(dir)
-            .unwrap()
-            .filter(|entry| {
-                let name = entry
-                    .as_ref()
-                    .ok()
-                    .map(|e| e.file_name())
-                    .unwrap_or_default();
-                name != "INTENT" && name != "INTENT.new"
-            })
-            .count()
-            <= 2,
-        "two-slot bound"
-    );
+    assert!(slot_count(&dir) <= 2, "two-slot bound");
     kept
 }
 
@@ -335,12 +347,7 @@ fn compensation_c1b1_unlink_then_recreate_before_private_dispose_survives() {
                 && (!matches!(op, Op::Rename) || !root.join("src.txt").exists())
             {
                 let dir = recovery_dirs(&root).pop().unwrap();
-                let private = std::fs::read_dir(dir)
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path();
+                let private = private_object(&dir);
                 let old = std::fs::symlink_metadata(&private).unwrap();
                 std::fs::remove_file(&private).unwrap();
                 std::fs::write(&private, "recreated only copy").unwrap();
@@ -832,12 +839,7 @@ fn compensation_private_slot_mismatch_is_kept_even_after_successful_commit() {
                 && (!matches!(op, Op::Rename) || !root.join("src.txt").exists())
             {
                 let dir = recovery_dirs(&root).pop().unwrap();
-                let slot = std::fs::read_dir(dir)
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path();
+                let slot = private_object(&dir);
                 successor(&slot, "private squatter");
             }
             Ok(())
@@ -1194,7 +1196,8 @@ fn compensation_recovery_dir_is_private_and_holds_at_most_two_objects() {
         kept[0].ends_with("slot-1") && kept[1].ends_with("slot-2"),
         "{kept:?}"
     );
-    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+    assert_eq!(slot_count(&dir), 2);
+    assert!(dir.join("INTENT").is_file(), "unsettled R keeps INTENT");
 }
 
 thread_local! {

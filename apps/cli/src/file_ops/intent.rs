@@ -24,6 +24,8 @@ pub enum IntentOp {
     Rename,
     Replace,
     Delete,
+    /// Exclusive create or an unplanned capture (Move-verification fallback).
+    Create,
 }
 
 /// Which side of the commit point a crash landed on.
@@ -168,6 +170,12 @@ impl Intent {
         Self::new(IntentOp::Delete, None, path, None, slots)
     }
 
+    pub fn create(path: &Path) -> Self {
+        let mut slots = BTreeMap::new();
+        slots.insert("slot-1".to_string(), IntentSlot::planned(path));
+        Self::new(IntentOp::Create, None, path, None, slots)
+    }
+
     pub fn summary(&self) -> IntentSummary {
         IntentSummary {
             op: intent_op_name(self.op).to_string(),
@@ -243,6 +251,7 @@ pub fn intent_op_name(op: IntentOp) -> &'static str {
         IntentOp::Rename => "rename",
         IntentOp::Replace => "replace",
         IntentOp::Delete => "delete",
+        IntentOp::Create => "create",
     }
 }
 

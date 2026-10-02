@@ -5,19 +5,29 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::intent::{Intent, IntentSummary};
 
+#[cfg(not(test))]
 const REGISTRY_DIR_NAME: &str = "file-recovery";
 const ENTRY_MAX_BYTES: usize = 64 * 1024;
+/// Server `node.metrics.abandonedRecovery` wire max (`protocol.ts`).
+const ABANDONED_RECOVERY_WIRE_MAX: u32 = 10_000;
 
 #[cfg(test)]
 thread_local! {
     static OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
+
+/// Tests that never call `install_temp_registry` (file_relay pool threads)
+/// still must not write the developer's real state directory.
+#[cfg(test)]
+static PROCESS_REGISTRY: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,19 +62,7 @@ pub fn register(recovery: &Path, intent: &Intent) -> Result<(), String> {
     let path = entry_path(&dir, recovery);
     let body = serde_json::to_vec_pretty(&RegistryEntry::from_intent(recovery, intent))
         .map_err(|err| format!("registry serialize: {err}"))?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|err| format!("registry create: {err}"))?;
-    file.write_all(&body)
-        .and_then(|()| file.write_all(b"\n"))
-        .and_then(|()| file.sync_all())
-        .map_err(|err| format!("registry write: {err}"))?;
-    sync_dir(&dir);
-    Ok(())
+    write_entry_atomic(&dir, &path, &body)
 }
 
 pub fn unregister(recovery: &Path) {
@@ -114,7 +112,7 @@ pub fn abandoned_entries() -> Vec<RegistryEntry> {
 
 pub fn abandoned_count() -> Option<u32> {
     let count = abandoned_entries().len();
-    (count > 0).then(|| count.min(u32::MAX as usize) as u32)
+    (count > 0).then(|| count.min(ABANDONED_RECOVERY_WIRE_MAX as usize) as u32)
 }
 
 fn is_abandoned(entry: &RegistryEntry) -> bool {
@@ -150,11 +148,24 @@ fn pid_is_live(pid: u32) -> bool {
 
 fn registry_dir() -> Result<PathBuf, String> {
     #[cfg(test)]
-    if let Some(path) = OVERRIDE.with(|slot| slot.borrow().clone()) {
-        return Ok(path);
+    {
+        if let Some(path) = OVERRIDE.with(|slot| slot.borrow().clone()) {
+            return Ok(path);
+        }
+        return Ok(PROCESS_REGISTRY
+            .get_or_init(|| {
+                let dir = tempfile::TempDir::new().expect("process registry");
+                let path = dir.path().to_path_buf();
+                std::mem::forget(dir);
+                path
+            })
+            .clone());
     }
-    let state = crate::paths::state_dir().map_err(|err| format!("state directory: {err}"))?;
-    Ok(state.join(REGISTRY_DIR_NAME))
+    #[cfg(not(test))]
+    {
+        let state = crate::paths::state_dir().map_err(|err| format!("state directory: {err}"))?;
+        Ok(state.join(REGISTRY_DIR_NAME))
+    }
 }
 
 fn entry_path(dir: &Path, recovery: &Path) -> PathBuf {
@@ -180,7 +191,41 @@ fn read_entry(path: &Path) -> Option<RegistryEntry> {
         tracing::warn!(path = %path.display(), "file-recovery registry entry exceeds 64 KiB");
         return None;
     }
-    serde_json::from_slice(&buf).ok()
+    match serde_json::from_slice(&buf) {
+        Ok(entry) => Some(entry),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %error,
+                "file-recovery registry entry is unparseable"
+            );
+            None
+        }
+    }
+}
+
+fn write_entry_atomic(dir: &Path, dest: &Path, body: &[u8]) -> Result<(), String> {
+    let tmp = dest.with_extension("json.tmp");
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(format!("registry tmp unlink: {err}")),
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)
+        .map_err(|err| format!("registry tmp create: {err}"))?;
+    file.write_all(body)
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all())
+        .map_err(|err| format!("registry tmp write: {err}"))?;
+    drop(file);
+    fs::rename(&tmp, dest).map_err(|err| format!("registry rename: {err}"))?;
+    sync_dir(dir);
+    Ok(())
 }
 
 fn create_dir_synced(dir: &Path) -> Result<(), String> {
@@ -221,5 +266,33 @@ pub(crate) struct RegistryGuard {
 impl Drop for RegistryGuard {
     fn drop(&mut self) {
         OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::file_ops::intent::Intent;
+
+    #[test]
+    fn register_round_trips_through_an_atomic_rename() {
+        let _guard = install_temp_registry();
+        let recovery = PathBuf::from("/tmp/wsmp-recover-test-entry");
+        let intent = Intent::delete(&recovery.join("gone"));
+        register(&recovery, &intent).expect("register");
+        let entries = list_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].summary.op, "delete");
+        unregister(&recovery);
+        assert!(list_entries().is_empty());
+    }
+
+    #[test]
+    fn unparseable_registry_files_are_skipped() {
+        let _guard = install_temp_registry();
+        let dir = registry_dir().expect("dir");
+        create_dir_synced(&dir).expect("mkdir");
+        std::fs::write(dir.join("deadbeef.json"), "{not json").unwrap();
+        assert!(list_entries().is_empty());
     }
 }

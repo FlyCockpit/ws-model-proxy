@@ -67,12 +67,15 @@
 //! published and private links. Rename can leave S/D in R with public names
 //! vacant (vacate-first) or only the destination vacant (link-first, before the
 //! link). An `INTENT` file in R, fsynced with the directory before the first
-//! capture, is a versioned map of slots to paths with phase, per-slot identity,
-//! pid, host, and CLI version. Exchange rename swaps `from <-> to` first so no
-//! object is reachable only through R; D is briefly visible under the source
-//! name. Live R directories are indexed in the CLI state directory. `wsmp recover`
-//! rolls forward or back from INTENT phase. Startup reads that registry (O(registered))
-//! and never walks file roots. Empty unreported R after power loss is harmless.
+//! capture (including exclusive-create and Move-verification fallbacks), is a
+//! versioned map of slots to paths with phase, per-slot identity, pid, host,
+//! and CLI version. An exclusive flock on `.wsmp-lock` is held for the op;
+//! `wsmp recover` skips a directory it cannot lock and re-derives phase from
+//! the live tree. Exchange rename swaps `from <-> to` first so no object is
+//! reachable only through R; D is briefly visible under the source name. Live
+//! R directories are indexed in the CLI state directory. Startup reads that
+//! registry (O(registered)) and never walks file roots. Empty unreported R
+//! after power loss is harmless.
 //! (e) unheld objects are retained; they are never deleted by a snapshot.
 //! (f) on NFS another process holding the file open can leave a `.nfs*` entry in R;
 //! our own descriptors close before unlink (except T's pinned proof at the link
@@ -95,12 +98,14 @@
 //! commit across alias names on noino; rename keeps/restores S and keeps D.
 
 use std::ffi::{OsStr, OsString};
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use nix::errno::Errno;
-use nix::fcntl::{AtFlags, OFlag, openat, renameat};
+use nix::fcntl::{AtFlags, Flock, FlockArg, OFlag, openat, renameat};
 use nix::sys::stat::{Mode, fstat, fstatat, mkdirat};
 use nix::unistd::{UnlinkatFlags, dup, linkat, unlinkat};
 use rand::distr::{Alphanumeric, SampleString};
@@ -294,6 +299,9 @@ pub(super) struct RecoveryDir {
     link_order: Option<LinkOrder>,
     intent: Option<Intent>,
     registered: bool,
+    /// Exclusive flock on `.wsmp-lock` inside R. Recover skips a directory
+    /// it cannot lock, so a live op is never rolled back.
+    lock: Option<Flock<File>>,
 }
 
 /// State to return to when a capture provably changed nothing.
@@ -347,6 +355,7 @@ impl RecoveryDir {
                     return Err(FileError::errno(errno));
                 }
             };
+            let lock = lock_recovery_dir(&path);
             return Ok(Self {
                 parent,
                 dir,
@@ -361,6 +370,7 @@ impl RecoveryDir {
                 link_order: None,
                 intent: None,
                 registered: false,
+                lock,
             });
         }
     }
@@ -745,7 +755,15 @@ impl RecoveryDir {
         };
         intent.phase = phase;
         let intent = intent.clone();
-        self.persist_intent(&intent)?;
+        if let Err(error) = self.persist_intent(&intent) {
+            tracing::warn!(
+                recovery = %self.path.display(),
+                ?phase,
+                "INTENT phase persist failed; leaving recovery unsettled"
+            );
+            self.unsettled = true;
+            return Err(error);
+        }
         if self.registered {
             let _ = super::registry::register(&self.path, &intent);
         }
@@ -770,7 +788,14 @@ impl RecoveryDir {
             .unwrap_or_else(|| super::intent::IntentSlot::planned(&slot.origin.path));
         intent.slots.insert(key, recorded.with_stat(&stat));
         let intent = intent.clone();
-        self.persist_intent(&intent)?;
+        if let Err(error) = self.persist_intent(&intent) {
+            tracing::warn!(
+                recovery = %self.path.display(),
+                "INTENT slot identity persist failed; leaving recovery unsettled"
+            );
+            self.unsettled = true;
+            return Err(error);
+        }
         if self.registered {
             let _ = super::registry::register(&self.path, &intent);
         }
@@ -1449,6 +1474,16 @@ impl RecoveryDir {
         from_name: &OsStr,
         from_path: &Path,
     ) -> Option<Slot> {
+        if self.intent.is_none()
+            && let Err(error) = self.prepare_intent(super::intent::Intent::create(from_path))
+        {
+            tracing::warn!(
+                recovery = %self.path.display(),
+                error = %error,
+                "could not write INTENT before capture; leaving recovery unsettled"
+            );
+            self.unsettled = true;
+        }
         if self.used >= 2 {
             self.unsettled = true;
             self.remember(from_path.to_path_buf());
@@ -1784,6 +1819,11 @@ impl RecoveryDir {
     pub(super) fn finish(&mut self) -> Vec<String> {
         if !self.finished {
             self.finished = true;
+            self.lock = None;
+            match unlinkat(self.dir.as_fd(), ".wsmp-lock", UnlinkatFlags::NoRemoveDir) {
+                Ok(()) | Err(Errno::ENOENT) => {}
+                Err(_) => self.unsettled = true,
+            }
             // Success and clean refusals drop the crash map with R only when R
             // is actually empty. An unsettled operation, or a captured slot
             // still in `kept`, keeps INTENT.
@@ -1833,6 +1873,39 @@ impl RecoveryDir {
 
     pub(super) fn settled(&self) -> bool {
         !self.unsettled && self.kept.is_empty()
+    }
+}
+
+fn lock_recovery_dir(path: &Path) -> Option<Flock<File>> {
+    let lock_path = path.join(".wsmp-lock");
+    let file = match OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(
+                recovery = %path.display(),
+                error = %error,
+                "could not create recovery lock; recover falls back to pid liveness"
+            );
+            return None;
+        }
+    };
+    match Flock::lock(file, FlockArg::LockExclusive) {
+        Ok(lock) => Some(lock),
+        Err((_, error)) => {
+            tracing::warn!(
+                recovery = %path.display(),
+                error = %error,
+                "could not flock recovery directory; recover falls back to pid liveness"
+            );
+            None
+        }
     }
 }
 
@@ -2387,6 +2460,37 @@ mod tests {
             std::fs::read_to_string(recovery.path.join(&slot.name)).unwrap(),
             "kept bytes"
         );
+    }
+
+    #[test]
+    fn capture_without_prepare_writes_create_intent_and_registers() {
+        let fx = Fx::new();
+        let parent = root(&fx);
+        let path = fx.put("created", "bytes");
+        let mut recovery = RecoveryDir::new(&parent, &fx.root).unwrap();
+        let slot = recovery
+            .capture(&parent, "created".as_ref(), &path)
+            .unwrap();
+        let parsed = super::super::intent::parse_intent(
+            &std::fs::read(recovery.path.join("INTENT")).expect("INTENT"),
+        )
+        .expect("parse");
+        assert_eq!(parsed.op, super::super::intent::IntentOp::Create);
+        assert_eq!(parsed.phase, IntentPhase::Prepared);
+        assert!(
+            parsed
+                .slots
+                .contains_key(&slot.name.to_string_lossy().into_owned())
+        );
+        let registered = super::super::registry::list_entries();
+        assert!(
+            registered
+                .iter()
+                .any(|entry| entry.recovery_path() == recovery.path),
+            "{registered:?}"
+        );
+        recovery.keep(&slot);
+        let _ = recovery.finish();
     }
 
     #[test]

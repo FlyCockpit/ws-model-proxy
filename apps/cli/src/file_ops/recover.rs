@@ -1,13 +1,14 @@
 //! Idempotent recovery of abandoned `.wsmp-recover-*` directories from INTENT.
 
-use std::fs;
+use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use nix::errno::Errno;
-use nix::fcntl::{AtFlags, OFlag, open};
+use nix::fcntl::{AtFlags, Flock, FlockArg, OFlag, open};
 use nix::sys::stat::{Mode, fstatat};
 use nix::unistd::{UnlinkatFlags, unlinkat};
 use serde::Serialize;
@@ -65,6 +66,10 @@ pub fn recover_from_registry(apply: bool) -> Vec<RecoverReport> {
 }
 
 pub fn recover_scan(roots: &[PathBuf], apply: bool) -> Vec<RecoverReport> {
+    let already: HashSet<PathBuf> = registry::list_entries()
+        .into_iter()
+        .map(|entry| entry.recovery_path())
+        .collect();
     let mut reports = Vec::new();
     for root in roots {
         let mut reported = 0usize;
@@ -73,6 +78,7 @@ pub fn recover_scan(roots: &[PathBuf], apply: bool) -> Vec<RecoverReport> {
         reports.extend(
             found
                 .into_iter()
+                .filter(|path| !already.contains(path))
                 .map(|path| recover_dir(&path, apply, None)),
         );
         if visited >= SCAN_VISIT_MAX || reported >= SCAN_REPORT_MAX {
@@ -134,6 +140,11 @@ pub fn recover_dir(path: &Path, apply: bool, entry: Option<&RegistryEntry>) -> R
     {
         return report;
     }
+    let held_lock = match try_hold_recovery_lock(path) {
+        Ok(lock) => lock,
+        Err(report) => return report,
+    };
+    let _held_lock = held_lock;
     match read_intent_file(path) {
         Ok(None) => RecoverReport {
             path: path.display().to_string(),
@@ -168,6 +179,56 @@ pub fn recover_dir(path: &Path, apply: bool, entry: Option<&RegistryEntry>) -> R
     }
 }
 
+fn try_hold_recovery_lock(path: &Path) -> Result<Option<Flock<File>>, RecoverReport> {
+    let lock_path = path.join(".wsmp-lock");
+    let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Ok(None),
+    };
+    match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => Ok(Some(lock)),
+        Err((_, Errno::EWOULDBLOCK)) => Err(RecoverReport {
+            path: path.display().to_string(),
+            action: RecoverAction::SkippedLive,
+            message: "another process holds the recovery lock".to_string(),
+            phase: None,
+            slots: present_slots(path),
+        }),
+        Err(_) => Ok(None),
+    }
+}
+
+fn derived_phase(dir: &Path, intent: &Intent) -> IntentPhase {
+    let mut vacant_with_slot = false;
+    let mut origin_occupied_other = false;
+    for (slot_name, slot) in &intent.slots {
+        let slot_present = dir.join(slot_name).symlink_metadata().is_ok();
+        if !slot_present {
+            continue;
+        }
+        let Some(origin) = slot.origin.to_path() else {
+            continue;
+        };
+        match std::fs::symlink_metadata(&origin) {
+            Err(_) => vacant_with_slot = true,
+            Ok(meta) => {
+                let stat = Stat::from_metadata(&meta);
+                if slot.dev.is_some() && !slot.matches(&stat) {
+                    origin_occupied_other = true;
+                }
+            }
+        }
+    }
+    if origin_occupied_other {
+        IntentPhase::Committed
+    } else if vacant_with_slot {
+        IntentPhase::Captured
+    } else {
+        intent.phase
+    }
+}
+
 fn skip_live_pid(
     path: &Path,
     host: &str,
@@ -189,7 +250,8 @@ fn skip_live_pid(
 }
 
 fn apply_intent(path: &Path, intent: &Intent, apply: bool, slots: Vec<String>) -> RecoverReport {
-    let phase = super::intent::intent_phase_name(intent.phase).to_string();
+    let phase_enum = derived_phase(path, intent);
+    let phase = super::intent::intent_phase_name(phase_enum).to_string();
     if !apply {
         return RecoverReport {
             path: path.display().to_string(),
@@ -198,7 +260,7 @@ fn apply_intent(path: &Path, intent: &Intent, apply: bool, slots: Vec<String>) -
                 "{} {}; run `wsmp recover --apply` to {}",
                 super::intent::intent_op_name(intent.op),
                 phase,
-                match intent.phase {
+                match phase_enum {
                     IntentPhase::Committed => "dispose leftover slots",
                     _ => "restore missing public names with mv -n",
                 }
@@ -207,7 +269,7 @@ fn apply_intent(path: &Path, intent: &Intent, apply: bool, slots: Vec<String>) -
             slots,
         };
     }
-    let result = match intent.phase {
+    let result = match phase_enum {
         IntentPhase::Prepared | IntentPhase::Captured => roll_back(path, intent),
         IntentPhase::Committed => roll_forward(path, intent),
     };
@@ -392,6 +454,7 @@ fn remove_if_empty(
     dir: &Path,
 ) -> Result<RecoverAction, String> {
     let _ = fs::remove_file(dir.join("INTENT"));
+    let _ = fs::remove_file(dir.join(".wsmp-lock"));
     match unlinkat(parent.as_fd(), name, UnlinkatFlags::RemoveDir) {
         Ok(()) => Ok(RecoverAction::Cleaned),
         Err(Errno::ENOTEMPTY) => Ok(RecoverAction::Listed),
@@ -425,7 +488,7 @@ pub fn present_slots(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = read
         .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name != "INTENT" && !name.starts_with('.'))
+        .filter(|name| name != "INTENT" && name != "INTENT.new" && !name.starts_with('.'))
         .collect();
     names.sort();
     names
@@ -500,6 +563,9 @@ pub fn is_recovery_name(name: &std::ffi::OsStr) -> bool {
 
 /// Startup / human log: describe an abandoned R without claiming INTENT exists.
 pub fn describe_abandoned(path: &Path) -> String {
+    if !path.is_dir() {
+        return "registry entry only, recovery directory already gone; run `wsmp recover` to drop the entry".to_string();
+    }
     let slots = present_slots(path);
     let intent_present = path.join("INTENT").is_file();
     match (intent_present, slots.is_empty()) {
@@ -643,5 +709,67 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].action, RecoverAction::Listed);
         assert!(reports[0].message.contains("INTENT is absent"));
+    }
+
+    #[test]
+    fn recover_skips_a_directory_whose_lock_is_held() {
+        let fx = Fx::new();
+        let dir = fx.root.join(".wsmp-recover-abcdefghij");
+        std::fs::create_dir(&dir).unwrap();
+        let mut intent = abandoned_intent(&fx, "src", "dst", false);
+        intent.pid = 0;
+        std::fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
+        std::fs::write(dir.join("slot-1"), "source bytes").unwrap();
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(dir.join(".wsmp-lock"))
+            .unwrap();
+        let _lock = Flock::lock(lock_file, FlockArg::LockExclusive).expect("lock");
+        let report = recover_dir(&dir, true, None);
+        assert_eq!(report.action, RecoverAction::SkippedLive);
+        assert!(report.message.contains("recovery lock"));
+        assert!(dir.is_dir());
+        assert!(std::fs::read_to_string(fx.root.join("src")).is_err());
+    }
+
+    #[test]
+    fn recover_rederives_committed_when_origin_holds_a_different_object() {
+        let fx = Fx::new();
+        fx.put("target", "published new bytes");
+        let dir = fx.root.join(".wsmp-recover-abcdefghij");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("slot-1"), "captured original").unwrap();
+        let slot_stat =
+            Stat::from_metadata(&std::fs::symlink_metadata(dir.join("slot-1")).unwrap());
+        let mut intent = Intent::replace(&fx.root.join("target"));
+        intent.phase = IntentPhase::Captured;
+        intent.pid = 0;
+        intent.slots.insert(
+            "slot-1".to_string(),
+            crate::file_ops::intent::IntentSlot::planned(&fx.root.join("target"))
+                .with_stat(&slot_stat),
+        );
+        std::fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
+        let report = recover_dir(&dir, true, None);
+        assert!(
+            matches!(
+                report.action,
+                RecoverAction::RolledForward | RecoverAction::Cleaned
+            ),
+            "{report:?}"
+        );
+        assert_eq!(fx.get("target"), "published new bytes");
+        assert!(!dir.join("slot-1").exists());
+    }
+
+    #[test]
+    fn describe_abandoned_names_a_gone_directory() {
+        let fx = Fx::new();
+        let gone = fx.root.join(".wsmp-recover-gone00001");
+        let message = describe_abandoned(&gone);
+        assert!(message.contains("already gone"), "{message}");
+        assert!(message.contains("wsmp recover"), "{message}");
     }
 }
