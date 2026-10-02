@@ -13467,7 +13467,7 @@ describe("model API routes", () => {
     expect(response.status).toBe(200);
   });
 
-  it("filters over-context pool members before admission", async () => {
+  it("prefers pool members whose estimate still fits the ceiling", async () => {
     mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
       directModels: [],
       modelPools: [poolTarget],
@@ -13518,16 +13518,108 @@ describe("model API routes", () => {
     expect(requireSent(manager).cliDeviceId).toBe("cli-fits");
     expect(capacityRuntime.acquire).toHaveBeenCalledWith(
       expect.objectContaining({
-        candidates: [expect.objectContaining({ poolMemberId: "fits" })],
+        candidates: expect.arrayContaining([expect.objectContaining({ poolMemberId: "fits" })]),
       }),
       expect.anything(),
     );
+    expect(vi.mocked(capacityRuntime.acquire).mock.calls[0]?.[0]?.candidates[0]).toMatchObject({
+      poolMemberId: "fits",
+    });
     const sent = requireSent(manager);
     manager.headers(sent.requestId, 200, { "content-type": "application/json" });
     const response = await responsePromise;
     manager.body(sent.requestId, JSON.stringify({ id: "chatcmpl", choices: [] }));
     manager.complete(sent.requestId);
     await response.text();
+  });
+
+  it("count-firsts an over-ceiling Chat estimate then 400s only on the exact native count", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "only-local",
+        discoveredModelId: "only-model",
+        upstreamModelId: "only-upstream",
+        cliDeviceId: "cli-only",
+        physicalMaxContext: 200,
+        capacityContextCeiling: 100,
+        capacityContextMargin: 10,
+        countStrategy: "ENGINE_REPORTED",
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-only"];
+    manager.supportsCountContextFlag = true;
+    const responsePromise = appWith(manager, admittingCapacityRuntime()).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: JSON.stringify({
+          model: poolTarget.modelId,
+          messages: [{ role: "user", content: "x".repeat(400) }],
+        }),
+      },
+    );
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    expect(manager.sentCountContext).toHaveLength(0);
+    const first = requireSent(manager);
+    expect(first.cliDeviceId).toBe("cli-only");
+    expect(first.path).toBe("/v1/chat/completions");
+    expect(first.countFirst).toBe(true);
+    expect(first.countCeiling).toBe(90);
+    manager.completeCountOnRelay(first.requestId, 91);
+    manager.error(first.requestId, "request_too_large");
+    const response = await responsePromise;
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "context_length_exceeded" },
+    });
+  });
+
+  it("native-counts an over-ceiling Responses estimate then 400s only on the exact count", async () => {
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [],
+      modelPools: [poolTarget],
+    });
+    db.poolMember.findMany.mockResolvedValue([
+      poolMemberRow({
+        id: "only-local",
+        discoveredModelId: "only-model",
+        upstreamModelId: "only-upstream",
+        cliDeviceId: "cli-only",
+        physicalMaxContext: 200,
+        capacityContextCeiling: 100,
+        capacityContextMargin: 10,
+        countStrategy: "ENGINE_REPORTED",
+      }),
+    ]);
+    const manager = new FakeRelayManager();
+    manager.activeCliDeviceIds = ["cli-only"];
+    const responsePromise = appWith(manager, admittingCapacityRuntime()).request("/responses", {
+      method: "POST",
+      headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+      body: JSON.stringify({
+        model: poolTarget.modelId,
+        input: "x".repeat(400),
+      }),
+    });
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    const count = requireSent(manager, 0);
+    expect(count.path).toBe("/v1/responses/count_tokens");
+    expect(count.cliDeviceId).toBe("cli-only");
+    manager.headers(count.requestId, 200, { "content-type": "application/json" });
+    manager.body(count.requestId, JSON.stringify({ input_tokens: 91 }));
+    manager.complete(count.requestId);
+    const response = await responsePromise;
+    expect(response.status).toBe(400);
+    expect(manager.sent.filter((sent) => sent.path === "/v1/responses")).toHaveLength(0);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "context_length_exceeded" },
+    });
   });
 
   it("counts Responses tokens once on the admitted pool member", async () => {

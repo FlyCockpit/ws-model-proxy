@@ -5791,16 +5791,20 @@ async function relayPool({
         : member.ModelPool?.capacityContextCeiling;
   const contextMarginForMember = (member: PoolMemberRelayRow) =>
     member.capacityContextMargin ?? member.ModelPool?.capacityContextMargin ?? 0;
-  const contextEligibleMembers = operation.contextCount
-    ? members.filter((member) =>
-        contextFitsLimits({
-          count: nativeCounts.get(member.id) ?? operation.contextCount!,
-          physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
-          effectiveContextCeiling: configuredContextCeilingForMember(member),
-          contextMargin: contextMarginForMember(member),
-        }),
-      )
-    : members;
+  // Estimates rank at `estimateFitIds`; only an exact native count may drop a
+  // member here. Inexact TOKEN_ESTIMATE/CHAR_ESTIMATE must still count-first
+  // (or native-count) and follow this-member exact vs (ceiling − margin).
+  const contextEligibleMembers =
+    operation.contextCount?.exact === true
+      ? members.filter((member) =>
+          contextFitsLimits({
+            count: nativeCounts.get(member.id) ?? operation.contextCount!,
+            physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+            effectiveContextCeiling: configuredContextCeilingForMember(member),
+            contextMargin: contextMarginForMember(member),
+          }),
+        )
+      : members;
   let canonicalAdaptationRequest: ReturnType<typeof parseCanonicalRequest> | null = null;
   if (operation.adaptation?.poolEnabled === true) {
     try {
@@ -5993,8 +5997,8 @@ async function relayPool({
     const mode = executionByMember.get(candidate.poolMemberId)?.mode;
     return mode === "native" ? 0 : mode === "adapted" ? 1 : 2;
   };
-  // Document/image estimates never fail closed; they only prefer members whose
-  // full estimate (media included) still fits the same ceiling as admission.
+  // Estimates never fail closed; they only prefer members whose full estimate
+  // (media included) still fits the same ceiling as admission.
   const estimateFitIds = new Set(
     operation.contextCount
       ? eligibleMembers
