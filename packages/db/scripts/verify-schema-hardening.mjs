@@ -48,6 +48,7 @@ const requiredFragments = [
   "enforce_cache_affinity_node_immutable",
   'ALTER COLUMN "sessionId" SET NOT NULL',
   "cache_affinity_conversation_unique",
+  "cache_affinity_record_residency",
   "enforce_cache_affinity_identity_immutable",
   'DELETE FROM cache_affinity_record\n WHERE "digestVersion" < 5',
   'ALTER COLUMN "tenantUserId" SET NOT NULL',

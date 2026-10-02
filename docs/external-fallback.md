@@ -155,26 +155,33 @@ Pools with only external members keep the provider member's own budget.
 
 When a request is not affine on any member (no scored conversation-prefix depth
 and no conversation match), ranking spreads it by how full each member KV pool
-already is. The resident set is every unexpired footprint record
-(`prefixDigest IS NULL`) on that capacity, newest 2,000. Continuations still
+already is. The resident set is unique unexpired sessions
+(`prefixDigest IS NULL`) on that capacity, newest 2,000 footprints per
+execution target, counted only above a one-token floor. Continuations still
 pin with prefix, conversation, and confirmed-cache weights; residency is not
-consulted when those scores apply.
+consulted when any member is affine.
 
 - Token mode (the engine reports a KV budget K, using the effective budget when
   eviction feedback has lowered it): projected fill is
   `(residentTokens + requestTokens − savedTokens) / K`, capped at 1.
   `savedTokens` is the instruction/root size when that member already holds the
   system prompt, otherwise 0.
-- Slot mode (K unknown, a concurrency cap is known): projected fill is resident
-  sessions / slots. Instruction warmth is only a tie-break.
+- Slot mode (K unknown, a concurrency cap is known; llama.cpp is always slot
+  mode): projected fill is `min(1, residentSessions / slots)`. Instruction
+  warmth is only a tie-break.
 - Unknown both: projected fill is that member's resident sessions over the
-  busiest member's count.
+  busiest member's count, capped at 1.
 
-Member `weight` is a proportional share of new conversations, not a strict
-preference: a member with twice the weight receives about twice as many first
-turns when members are equally full. The pool setting `affinityResidencyWeight`
-(0–10000, default 100) scales that term; 0 turns spreading off. Ties break by
-instruction depth, then least-recent `lastRoutedAt`, then member id.
+Every mode is normalized to `[0, 1]` before member `weight` is applied, so a
+packed llama.cpp member cannot outscore a full vLLM member by raw session
+count. Member `weight` is a proportional share of new conversations, not a
+strict preference: a member with twice the weight receives about twice as many
+first turns when members are equally full. The pool setting
+`affinityResidencyWeight` (0–10000, default 100) scales that term; 0 turns
+spreading off. Ties break by instruction depth, then least-recent
+`lastRoutedAt` (written on grant), then the incoming member order
+(`publicOrder` / local weight order), then member id only on this residency
+branch. With spreading off, ties follow that incoming order, not member id.
 Warm-session protection still runs after placement and can redirect a new
 conversation away from a protected member.
 
@@ -185,7 +192,8 @@ A client-id fork stores `sharedWithSessionId` and `sharedPrefixTokens` on its
 first footprint write when another live session on the same target already owns
 that prefix. Warm protection and new-conversation residency then count the
 shared history once when the sharer is still an eligible session on the same
-capacity. Chains subtract only against the direct sharer. If the sharer later
+capacity. Chains subtract only against the direct sharer. A resumed A↔F cycle
+bills the shared prefix once (the back-pointer is ignored). If the sharer later
 drops out of the protected set because of a share cap, the child is slightly
 undercounted.
 

@@ -944,8 +944,10 @@ export function affinityPrefixEvidenceSql(
      ORDER BY p.depth DESC LIMIT 1`;
 }
 
-/** Newest unexpired footprints per member KV pool, for new-conversation placement. */
+/** Newest unexpired footprints per execution target, for new-conversation placement. */
 export const AFFINITY_RESIDENCY_QUERY_LIMIT = 2_000;
+/** Slot/unknown occupancy ignores empty footprints so mixed pools stay on [0, 1]. */
+export const AFFINITY_RESIDENCY_SESSION_FLOOR = 1;
 
 export type AffinityResidencyRow = {
   capacityId: string;
@@ -956,64 +958,86 @@ export type AffinityResidencyRow = {
 };
 
 /**
- * Bounded newest-first footprints (`prefixDigest IS NULL`) grouped by
- * `execution_target.inferenceCapacityId`. Uses the
- * `[executionTargetId, expiresAt]` index. Newest 2,000 per capacity.
+ * Bounded newest-first footprints (`prefixDigest IS NULL`) per execution
+ * target, grouped later by `execution_target.inferenceCapacityId`. Each target
+ * walks the partial index `cache_affinity_record_residency`
+ * (`executionTargetId`, `expiresAt` DESC) WHERE `prefixDigest` IS NULL via
+ * `LATERAL ... LIMIT n` so live prefix rows are not scanned. EXPLAIN/buffer
+ * coverage lives in `cache-affinity.integration.test.ts` and needs the
+ * integration database (`SCHEMA_VALIDATION_DATABASE_URL`).
  */
 export function affinityResidencySql(
   ownerUserId: string,
   capacityIds: readonly string[],
   now: Date,
-  limitPerCapacity = AFFINITY_RESIDENCY_QUERY_LIMIT,
+  limitPerTarget = AFFINITY_RESIDENCY_QUERY_LIMIT,
 ): Prisma.Sql {
   return Prisma.sql`
-    SELECT ranked."capacityId", ranked."sessionId", ranked.tokens,
-           ranked."sharedWithSessionId", ranked."sharedPrefixTokens"
-      FROM (
-        SELECT r."sessionId",
-               r."estimatedTokens" AS tokens,
-               r."sharedWithSessionId",
-               r."sharedPrefixTokens",
-               t."inferenceCapacityId" AS "capacityId",
-               ROW_NUMBER() OVER (
-                 PARTITION BY t."inferenceCapacityId"
-                 ORDER BY r."expiresAt" DESC, r.id DESC
-               ) AS rn
-          FROM cache_affinity_record r
-          JOIN execution_target t ON t.id = r."executionTargetId"
-         WHERE r."userId" = ${ownerUserId}
-           AND t."userId" = ${ownerUserId}
-           AND t."inferenceCapacityId" IN (${Prisma.join([...capacityIds])})
-           AND r."prefixDigest" IS NULL
-           AND r."expiresAt" > ${now}::timestamp
-      ) ranked
-     WHERE ranked.rn <= ${limitPerCapacity}`;
+    SELECT t."inferenceCapacityId" AS "capacityId",
+           r."sessionId",
+           r.tokens,
+           r."sharedWithSessionId",
+           r."sharedPrefixTokens"
+      FROM execution_target t
+      JOIN LATERAL (
+        SELECT r2."sessionId",
+               r2."estimatedTokens" AS tokens,
+               r2."sharedWithSessionId",
+               r2."sharedPrefixTokens"
+          FROM cache_affinity_record r2
+         WHERE r2."userId" = ${ownerUserId}
+           AND r2."executionTargetId" = t.id
+           AND r2."prefixDigest" IS NULL
+           AND r2."expiresAt" > ${now}::timestamp
+         ORDER BY r2."expiresAt" DESC, r2.id DESC
+         LIMIT ${limitPerTarget}
+      ) r ON true
+     WHERE t."userId" = ${ownerUserId}
+       AND t."inferenceCapacityId" IN (${Prisma.join([...capacityIds])})`;
 }
 
 function billedResidentTokens(
   row: AffinityResidencyRow,
-  residentSessionIds: ReadonlySet<string>,
+  resident: ReadonlyMap<string, AffinityResidencyRow>,
 ): number {
   const raw = Math.max(0, Number(row.tokens) || 0);
   const shared = Number(row.sharedPrefixTokens);
   const sharer = row.sharedWithSessionId;
-  if (!Number.isFinite(shared) || !sharer || !residentSessionIds.has(sharer)) return raw;
+  if (!Number.isFinite(shared) || !sharer) return raw;
+  const sharerRow = resident.get(sharer);
+  if (!sharerRow) return raw;
+  // A↔F after TTL: bill the edge once. Ignore the back-pointer (the
+  // lexicographically greater session id keeps the shared tokens).
+  if (sharerRow.sharedWithSessionId === row.sessionId && sharer >= row.sessionId) return raw;
   return Math.max(0, raw - shared);
 }
 
+function preferResidencyRow(left: AffinityResidencyRow, right: AffinityResidencyRow) {
+  const leftTokens = Math.max(0, Number(left.tokens) || 0);
+  const rightTokens = Math.max(0, Number(right.tokens) || 0);
+  if (leftTokens !== rightTokens) return leftTokens >= rightTokens ? left : right;
+  if (right.sharedWithSessionId && !left.sharedWithSessionId) return right;
+  return left;
+}
+
 function residencyByCapacity(rows: readonly AffinityResidencyRow[]) {
-  const grouped = new Map<string, AffinityResidencyRow[]>();
+  const grouped = new Map<string, Map<string, AffinityResidencyRow>>();
   for (const row of rows) {
-    const list = grouped.get(row.capacityId) ?? [];
-    list.push(row);
-    grouped.set(row.capacityId, list);
+    const sessions = grouped.get(row.capacityId) ?? new Map<string, AffinityResidencyRow>();
+    const existing = sessions.get(row.sessionId);
+    sessions.set(row.sessionId, existing ? preferResidencyRow(existing, row) : row);
+    grouped.set(row.capacityId, sessions);
   }
   const byCapacity = new Map<string, { tokens: number; sessions: number }>();
-  for (const [capacityId, list] of grouped) {
-    const residentSessionIds = new Set(list.map((row) => row.sessionId));
+  for (const [capacityId, sessions] of grouped) {
     let tokens = 0;
-    for (const row of list) tokens += billedResidentTokens(row, residentSessionIds);
-    byCapacity.set(capacityId, { tokens, sessions: list.length });
+    let sessionCount = 0;
+    for (const row of sessions.values()) {
+      const billed = billedResidentTokens(row, sessions);
+      tokens += billed;
+      if (billed >= AFFINITY_RESIDENCY_SESSION_FLOOR) sessionCount += 1;
+    }
+    byCapacity.set(capacityId, { tokens, sessions: sessionCount });
   }
   return byCapacity;
 }
@@ -1039,8 +1063,8 @@ function residencyProjected({
     const used = Math.max(0, residentTokens + Math.max(0, requestTokens) - savedTokens);
     return Math.min(1, used / kvBudgetTokens);
   }
-  if (slots !== null && slots > 0) return residentSessions / slots;
-  return residentSessions / Math.max(maxResidentSessions, 1);
+  if (slots !== null && slots > 0) return Math.min(1, residentSessions / slots);
+  return Math.min(1, residentSessions / Math.max(maxResidentSessions, 1));
 }
 
 export async function rankAffinityTargets({
@@ -1159,8 +1183,10 @@ export async function rankAffinityTargets({
     (material) => material.isContinuation,
   );
   const capacityIds = [...new Set(targets.map(({ capacityId }) => capacityId))];
+  const residencyWeight = policy.residencyWeight ?? 100;
+  const needResidency = residencyWeight > 0 && targets.length >= 2;
   const loadResidency = () =>
-    capacityIds.length === 0
+    !needResidency || capacityIds.length === 0
       ? Promise.resolve([] as AffinityResidencyRow[])
       : Promise.resolve()
           .then(() =>
@@ -1231,8 +1257,10 @@ export async function rankAffinityTargets({
       },
       _count: { _all: true },
     }),
-    continuationRequest ? Promise.resolve([] as AffinityResidencyRow[]) : loadResidency(),
-    continuationRequest
+    continuationRequest || !needResidency
+      ? Promise.resolve([] as AffinityResidencyRow[])
+      : loadResidency(),
+    continuationRequest || !needResidency
       ? Promise.resolve([] as Array<KvEvictionState & { capacityId: string }>)
       : loadEvictions(),
   ]);
@@ -1387,16 +1415,18 @@ export async function rankAffinityTargets({
   const anyAffine = scored.some((row) => row.affine);
   let residency = residencyRows;
   let evictionRows = evictions;
-  if (!anyAffine && continuationRequest) {
+  if (!anyAffine && continuationRequest && needResidency) {
     [residency, evictionRows] = await Promise.all([loadResidency(), loadEvictions()]);
   }
-  const resident = residencyByCapacity(residency);
-  const evictionByCapacity = new Map(evictionRows.map((row) => [row.capacityId, row] as const));
+  const spreadResidency = !anyAffine && needResidency;
+  const resident = spreadResidency ? residencyByCapacity(residency) : new Map();
+  const evictionByCapacity = spreadResidency
+    ? new Map(evictionRows.map((row) => [row.capacityId, row] as const))
+    : new Map();
   const maxResidentSessions = Math.max(0, ...[...resident.values()].map((row) => row.sessions));
   const weights = targets.map((target) => Math.max(0, target.weight ?? 1));
   const meanWeight =
     weights.reduce((sum, weight) => sum + weight, 0) / Math.max(weights.length, 1) || 1;
-  const residencyWeight = policy.residencyWeight ?? 100;
   for (const row of scored) {
     const penalties =
       row.loadPenalty +
@@ -1409,6 +1439,10 @@ export async function rankAffinityTargets({
         (row.conversation ? policy.conversationWeight : 0) +
         (row.confirmed ? policy.confirmedCacheWeight : 0) -
         penalties;
+      continue;
+    }
+    if (!spreadResidency) {
+      row.score = 0 - penalties;
       continue;
     }
     const occupancy = resident.get(row.target.capacityId) ?? { tokens: 0, sessions: 0 };
@@ -1433,19 +1467,25 @@ export async function rankAffinityTargets({
     const weight = Math.max(0, row.target.weight ?? 1);
     const cost =
       weight <= 0 || meanWeight <= 0 ? Number.POSITIVE_INFINITY : projected / (weight / meanWeight);
-    const residencyPenalty = Number.isFinite(cost)
-      ? Math.ceil(cost * residencyWeight)
-      : 1_000_000_000;
+    // Keep the weighted fill off integer ceil so small occupancy differences
+    // survive; saturated members then break on lastRoutedAt / originalIndex.
+    const residencyPenalty = Number.isFinite(cost) ? cost * residencyWeight : 1_000_000_000;
     row.score = 0 - penalties - residencyPenalty;
   }
-  scored.sort(
-    (left, right) =>
-      right.score - left.score ||
-      right.instructionDepth - left.instructionDepth ||
-      (left.target.lastRoutedAt?.getTime() ?? 0) - (right.target.lastRoutedAt?.getTime() ?? 0) ||
-      left.target.poolMemberId.localeCompare(right.target.poolMemberId) ||
-      left.originalIndex - right.originalIndex,
-  );
+  scored.sort((left, right) => {
+    const score = right.score - left.score;
+    if (score !== 0) return score;
+    const instruction = right.instructionDepth - left.instructionDepth;
+    if (instruction !== 0) return instruction;
+    if (spreadResidency) {
+      const routed =
+        (left.target.lastRoutedAt?.getTime() ?? 0) - (right.target.lastRoutedAt?.getTime() ?? 0);
+      if (routed !== 0) return routed;
+    }
+    const original = left.originalIndex - right.originalIndex;
+    if (original !== 0) return original;
+    return spreadResidency ? left.target.poolMemberId.localeCompare(right.target.poolMemberId) : 0;
+  });
   return {
     orderedTargetIds: scored.map(({ target }) => target.executionTargetId),
     scores: Object.fromEntries(
@@ -1504,6 +1544,24 @@ export async function rankAffinityTargets({
       ),
     ),
   };
+}
+
+/** Cheap placement remainder after admission. Must not run inside the hot fence. */
+export async function markPoolMemberLastRoutedAt(
+  poolMemberId: string | null | undefined,
+  at = new Date(),
+  db: {
+    poolMember: {
+      update: (args: { where: { id: string }; data: { lastRoutedAt: Date } }) => Promise<unknown>;
+    };
+  } = prisma,
+): Promise<void> {
+  if (!poolMemberId) return;
+  try {
+    await db.poolMember.update({ where: { id: poolMemberId }, data: { lastRoutedAt: at } });
+  } catch {
+    // A missed stamp must not fail a granted request.
+  }
 }
 
 export function isAffinityTargetWarm(

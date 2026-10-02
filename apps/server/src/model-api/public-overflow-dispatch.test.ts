@@ -1750,8 +1750,8 @@ describe("public overflow terminal response dispatch", () => {
       targets: listed.targets,
     });
     expect(mixedCurrency.targets.map((target) => target.executionTargetId)).toEqual([
-      "target-cheap",
       "target-expensive",
+      "target-cheap",
     ]);
     expect(
       mixedCurrency.targets.every((target) => target.affinity?.reason?.includes("costPenalty:0")),
@@ -1767,8 +1767,8 @@ describe("public overflow terminal response dispatch", () => {
       targets: listed.targets,
     });
     expect(incompletePricing.targets.map((target) => target.executionTargetId)).toEqual([
-      "target-cheap",
       "target-expensive",
+      "target-cheap",
     ]);
     expect(
       incompletePricing.targets.every((target) =>

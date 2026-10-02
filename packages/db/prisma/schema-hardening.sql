@@ -165,6 +165,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS cache_affinity_conversation_unique
     ("tenantUserId", "poolId", "executionTargetId", "targetIdentity", "bindingDigest", "conversationDigest")
   WHERE "conversationDigest" IS NOT NULL AND "prefixDigest" IS NULL;
 
+-- Newest-first footprints for new-conversation residency. The LATERAL
+-- per-target LIMIT in affinityResidencySql walks this instead of ranking
+-- every live prefix row.
+CREATE INDEX IF NOT EXISTS cache_affinity_record_residency
+  ON cache_affinity_record ("executionTargetId", "expiresAt" DESC)
+  WHERE "prefixDigest" IS NULL;
+
 ALTER TABLE cache_affinity_record DROP CONSTRAINT IF EXISTS cache_affinity_record_shape_check;
 ALTER TABLE cache_affinity_record ADD CONSTRAINT cache_affinity_record_shape_check CHECK (
   "digestVersion" >= 5

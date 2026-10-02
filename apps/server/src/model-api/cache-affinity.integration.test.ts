@@ -1,5 +1,6 @@
 // Fixture writes need no owner fences (the graph-write fence triggers accept
 // this client); production code under test uses its own clients.
+import { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -464,5 +465,25 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     await Promise.all([lock, remembering]);
     expect(settled).toBe(true);
     await blocker.$disconnect();
+  });
+
+  // EXPLAIN/buffer bound needs SCHEMA_VALIDATION_DATABASE_URL. The partial
+  // index `cache_affinity_record_residency` is installed by schema-hardening.
+  it("bounds residency SQL with a per-target LATERAL limit", async () => {
+    if (!db) return;
+    const row = await fixture();
+    const sql = service.affinityResidencySql(row.owner.id, [row.target(0).capacityId], new Date());
+    expect(sql.strings.join("")).toContain("JOIN LATERAL");
+    const [explain] = await db.$queryRaw<{ "QUERY PLAN": unknown }[]>(
+      Prisma.sql`EXPLAIN (BUFFERS, FORMAT JSON) ${sql}`,
+    );
+    const planText = JSON.stringify(explain);
+    expect(planText).toContain("Limit");
+    expect(planText).not.toContain("WindowAgg");
+    const indexes = await db.$queryRaw<{ indexname: string }[]>`
+      SELECT indexname FROM pg_indexes
+       WHERE tablename = 'cache_affinity_record'
+         AND indexname = 'cache_affinity_record_residency'`;
+    if (indexes.length > 0) expect(planText).toContain("cache_affinity_record_residency");
   });
 });

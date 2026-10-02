@@ -55,6 +55,7 @@ import {
   affinityPrefixDigests,
   buildAffinityTargetIdentity,
   isAffinityTargetWarm,
+  markPoolMemberLastRoutedAt,
   rankAffinityTargets,
   rememberAffinity,
   resolveAffinitySession,
@@ -4839,6 +4840,7 @@ async function relayPool({
           await capacityRuntime.release(admission.lease);
           return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
         }
+        await markPoolMemberLastRoutedAt(selectedPoolMemberId);
         let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
         const previousRoute = routeIdentity;
         try {
@@ -5962,7 +5964,11 @@ async function relayPool({
         },
         signal: request.signal,
       });
-      if (admission.state !== "LEASE_LOST") return admission;
+      if (admission.state !== "LEASE_LOST") {
+        if (admission.state === "ADMITTED")
+          await markPoolMemberLastRoutedAt(admission.lease.poolMemberId);
+        return admission;
+      }
       candidates = candidates
         .filter((candidate) =>
           admission.poolMemberId
