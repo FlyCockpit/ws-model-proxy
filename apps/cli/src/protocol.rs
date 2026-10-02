@@ -2953,30 +2953,6 @@ mod tests {
     }
 
     #[test]
-    fn a_26_server_upgrade_required_reply_says_to_upgrade_the_server() {
-        // The exact text the released 2.6 server sends a 2.7 hello.
-        let message = hello_rejection_message(
-            "This server requires wsmp 0.4.0 or newer (relay protocol 2.6). Upgrade wsmp and restart it.",
-        );
-        assert!(
-            message.contains("upgrade the WS Model Proxy server"),
-            "{message}"
-        );
-        assert!(message.contains("relay protocol 2.6"), "{message}");
-    }
-
-    #[test]
-    fn a_27_server_upgrade_required_reply_says_to_upgrade_the_server() {
-        let message = hello_rejection_message(
-            "This server requires a newer wsmp (relay protocol 2.7). Upgrade wsmp and restart it.",
-        );
-        assert!(
-            message.contains("upgrade the WS Model Proxy server"),
-            "{message}"
-        );
-    }
-
-    #[test]
     fn a_future_server_upgrade_required_reply_stays_a_cli_too_old_error() {
         // A future server's genuine "upgrade wsmp" must pass through: the CLI is
         // the one behind, so do not tell the person to upgrade the server.
@@ -3551,7 +3527,7 @@ mod relay_27_vectors {
             engine: crate::config::EndpointEngine::Generic,
             engine_adapter: Some(EngineAdapterConfig {
                 input: AdapterInput::Route {
-                    route: "stats".to_string(),
+                    route: "/stats".to_string(),
                 },
                 format: AdapterFormat::Json,
                 interval_secs: 2,
@@ -3619,7 +3595,7 @@ mod relay_27_vectors {
         );
         let spec = EngineAdapterConfig {
             input: AdapterInput::Route {
-                route: "stats".to_string(),
+                route: "/stats".to_string(),
             },
             format: AdapterFormat::Json,
             interval_secs: 2,

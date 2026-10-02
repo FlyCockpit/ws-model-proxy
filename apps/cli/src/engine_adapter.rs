@@ -1119,7 +1119,7 @@ hits{model=\"b\"} 5
         let remote = crate::protocol::RemoteEngineAdapter {
             endpoint_slug: "gpu".to_string(),
             input: AdapterInput::Route {
-                route: "stats".to_string(),
+                route: "/stats".to_string(),
             },
             format: AdapterFormat::Json,
             interval_secs: 2,
@@ -1131,16 +1131,18 @@ hits{model=\"b\"} 5
         let mut approved = BTreeMap::new();
         approved.insert("gpu".to_string(), hash);
         assert!(
-            effective_engine_adapter(&endpoint, &[remote.clone()], false, &approved).is_none(),
+            effective_engine_adapter(&endpoint, std::slice::from_ref(&remote), false, &approved)
+                .is_none(),
             "without opt-in the remote stays off"
         );
         let effective =
-            effective_engine_adapter(&endpoint, &[remote.clone()], true, &approved).expect("run");
+            effective_engine_adapter(&endpoint, std::slice::from_ref(&remote), true, &approved)
+                .expect("run");
         assert_eq!(effective, spec);
         let mut local = endpoint.clone();
         local.engine_adapter = Some(EngineAdapterConfig {
             input: AdapterInput::Route {
-                route: "local-stats".to_string(),
+                route: "/local-stats".to_string(),
             },
             format: AdapterFormat::Json,
             interval_secs: 2,
@@ -1151,7 +1153,7 @@ hits{model=\"b\"} 5
         assert_eq!(
             shadowed.input,
             AdapterInput::Route {
-                route: "local-stats".to_string()
+                route: "/local-stats".to_string()
             }
         );
     }

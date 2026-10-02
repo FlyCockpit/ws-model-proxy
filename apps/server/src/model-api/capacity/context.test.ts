@@ -74,6 +74,8 @@ describe("context counting hierarchy", () => {
       confidence: "FALLBACK",
       safetyMargin: 1.25,
       serializedChars,
+      textTokens: expect.any(Number),
+      mediaTokens: 0,
     });
   });
 

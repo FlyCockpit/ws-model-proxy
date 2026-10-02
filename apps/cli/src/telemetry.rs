@@ -637,11 +637,12 @@ fn next_load_frame(
         state.prefix_queries_total,
         reading.prefix_cache_queries_total,
     );
-    let prefix_cache_reset = counter_reset(state.prefix_hits_total, reading.prefix_cache_hits_total)
-        || counter_reset(
-            state.prefix_queries_total,
-            reading.prefix_cache_queries_total,
-        );
+    let prefix_cache_reset =
+        counter_reset(state.prefix_hits_total, reading.prefix_cache_hits_total)
+            || counter_reset(
+                state.prefix_queries_total,
+                reading.prefix_cache_queries_total,
+            );
     let changed_counters = prefix_cache_reset
         || hits_delta.is_some_and(|delta| delta > 0)
         || queries_delta.is_some_and(|delta| delta > 0);
@@ -1668,7 +1669,7 @@ mod tests {
             engine: crate::config::EndpointEngine::Generic,
             engine_adapter: Some(crate::engine_adapter::EngineAdapterConfig {
                 input: crate::engine_adapter::AdapterInput::Route {
-                    route: "stats".to_string(),
+                    route: "/stats".to_string(),
                 },
                 format: crate::engine_adapter::AdapterFormat::Json,
                 interval_secs: 2,

@@ -930,6 +930,7 @@ describe("model API routes", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    publicOverflow.dispatch.mockReset();
     db.$transaction.mockImplementation(async (input: unknown) => {
       if (typeof input === "function") return input(db);
       return Promise.all(input as Promise<unknown>[]);
@@ -2030,6 +2031,7 @@ describe("model API routes", () => {
         affinityMatch: true,
         ok: true,
         expected: 1,
+        kind: "miss" as const,
       },
       {
         name: "hit",
@@ -2038,7 +2040,8 @@ describe("model API routes", () => {
         tokens: 20_000,
         affinityMatch: true,
         ok: true,
-        expected: 0,
+        expected: 1,
+        kind: "hit" as const,
       },
       {
         name: "unknown usage",
@@ -2084,6 +2087,7 @@ describe("model API routes", () => {
         affinityMatch: true,
         ok: true,
         expected: 1,
+        kind: "miss" as const,
         throws: true,
       },
       {
@@ -2095,6 +2099,7 @@ describe("model API routes", () => {
         affinityMatch: true,
         ok: true,
         expected: 1,
+        kind: "miss" as const,
         ageMs: 299_000,
         advanceMs: 600_000,
       },
@@ -2138,6 +2143,7 @@ describe("model API routes", () => {
         affinityMatch,
         ok,
         expected,
+        kind,
         throws,
         ageMs,
         advanceMs,
@@ -2203,6 +2209,7 @@ describe("model API routes", () => {
             "member-a-capacity",
             poolTarget.ownerUserId,
             "session-a",
+            kind,
           );
         if (ok) expect(affinity.remember).toHaveBeenCalled();
       },
@@ -9441,9 +9448,6 @@ describe("model API routes", () => {
       publicOverflow.list.mockResolvedValue(
         listedExternalTargets([externalProviderTarget("overflow-member")], overflow),
       );
-      publicOverflow.dispatch.mockResolvedValueOnce(
-        externalDispatchResult(externalProviderTarget("overflow-member")),
-      );
     }
 
     function expiredLocalThenAdmit(): CapacityAdmissionRuntime {
@@ -9491,6 +9495,9 @@ describe("model API routes", () => {
         externalAfterWaitMs: tokenWait,
       });
       externalConsent.poolIds = [pool.id];
+      publicOverflow.dispatch.mockResolvedValueOnce(
+        externalDispatchResult(externalProviderTarget("overflow-member")),
+      );
       const capacityRuntime = expiredLocalThenAdmit();
       const manager = new FakeRelayManager();
       manager.activeCliDeviceIds = ["cli-local"];

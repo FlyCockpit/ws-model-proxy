@@ -503,16 +503,25 @@ impl Object {
         }
     }
 }
+struct RaceLink {
+    link: bool,
+    link_first: bool,
+    counts: bool,
+}
+
 fn assert_race(
     fx: &Fx,
     object: Object,
     overwrite: bool,
     race: Race,
     result: FileResult<Value>,
-    link: bool,
-    link_first: bool,
-    counts: bool,
+    publication: RaceLink,
 ) {
+    let RaceLink {
+        link,
+        link_first,
+        counts,
+    } = publication;
     let mut paths = match &result {
         Ok(value) => inventory(fx, value),
         Err(e) => error_inventory(fx, e),
@@ -680,9 +689,11 @@ fn rename_races_restore_origins_preserve_creates_and_do_not_chase_commits() {
                         overwrite,
                         race,
                         result,
-                        matches!(shape, Shape::Link),
-                        matches!(shape, Shape::Link),
-                        true,
+                        RaceLink {
+                            link: matches!(shape, Shape::Link),
+                            link_first: matches!(shape, Shape::Link),
+                            counts: true,
+                        },
                     );
                 }
             }
@@ -1117,9 +1128,11 @@ pub(super) fn real_rename_rows(directory: &Path, class: RealClass) {
                     overwrite,
                     race,
                     result,
-                    !class.nr,
-                    !class.nr && class.link && !class.noino,
-                    class.counts,
+                    RaceLink {
+                        link: !class.nr,
+                        link_first: !class.nr && class.link && !class.noino,
+                        counts: class.counts,
+                    },
                 );
             }
         }

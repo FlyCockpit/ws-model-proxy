@@ -1510,7 +1510,7 @@ integration("warm-session protection with real PostgreSQL", () => {
         writers[1],
       );
       const actual = await row(capacityId);
-      expect(actual.cutFraction).toBeCloseTo(0.1, 12);
+      expect(actual.cutFraction).toBeCloseTo(0.15, 12);
       expect(actual.observedAt).toEqual(now);
       expect(actual.expiresAt).toEqual(initial.expiresAt);
     });

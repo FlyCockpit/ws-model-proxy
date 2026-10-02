@@ -578,6 +578,9 @@ describe("cli file ops", () => {
   });
 
   describe("post-commit device grant refresh", () => {
+    beforeEach(() => {
+      vi.spyOn(relaySessionManager, "onRemoteEngineAdaptersChanged").mockResolvedValue(false);
+    });
     const policy = (mode: Mode, mcpFileRead: boolean) => ({
       id: "desktop",
       userId: "user-id",
@@ -978,10 +981,16 @@ describe("cli file ops", () => {
         db.cliDevice.findUnique.mockClear();
         release.resolve();
         await registration;
-        // Hello already reads remote metric sources; no additional policy read.
-        expect(db.cliDevice.findUnique).toHaveBeenCalledExactlyOnceWith({
+        // Hello already reads remote metric sources and engine adapters;
+        // no additional policy read.
+        expect(db.cliDevice.findUnique).toHaveBeenCalledTimes(2);
+        expect(db.cliDevice.findUnique).toHaveBeenCalledWith({
           where: { id: "desktop" },
           select: { userId: true, mcpCommandMode: true, remoteMetricSources: true },
+        });
+        expect(db.cliDevice.findUnique).toHaveBeenCalledWith({
+          where: { id: "desktop" },
+          select: { userId: true, mcpCommandMode: true, remoteEngineAdapters: true },
         });
         expect(queue().size).toBe(0);
         expect(metrics).toHaveBeenCalledTimes(change === "none" ? 0 : 1);

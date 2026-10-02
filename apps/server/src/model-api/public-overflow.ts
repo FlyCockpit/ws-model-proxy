@@ -2945,8 +2945,12 @@ export async function dispatchPublicOverflow(
       continue;
     }
     const byteEstimate = conservativeSerializedInputTokens(upstream.body.byteLength);
+    const payloadTokens = payloadAwareInputTokens(upstream.body);
+    const estimatedTokens = request.estimatedInputTokens;
     const renderedInputTokens =
-      payloadAwareInputTokens(upstream.body) ?? request.estimatedInputTokens ?? byteEstimate;
+      (payloadTokens != null && payloadTokens > 0n ? payloadTokens : null) ??
+      (estimatedTokens != null && estimatedTokens > 0n ? estimatedTokens : null) ??
+      byteEstimate;
     const renderedLiability = liabilityFromPricing({
       estimatedInputTokens: renderedInputTokens * 2n,
       requestedOutputTokens,

@@ -223,9 +223,8 @@ async function upsertKvEvictionSession(
             AND ${newContSql} > 0
             AND (${newMissSql})::double precision / (${newContSql})::double precision
               >= ${KV_EVICTION_MISS_RATIO}::double precision`;
-  const recoveredSql = Prisma.sql`${liveCutSql} <= 0
-            AND existing."cutFraction" > 0
-            AND ${elapsedSql} >= ${KV_EVICTION_RECOVERY_MS}::double precision`;
+  const recoveredSql = Prisma.sql`existing."cutFraction" > 0
+            AND (${liveCutSql} <= 0 OR ${elapsedSql} >= ${KV_EVICTION_RECOVERY_MS}::double precision)`;
   const newLifetimeSql = Prisma.sql`existing."expiresAt" <= ${now}::timestamp OR (${recoveredSql})`;
   const nextCutSql = Prisma.sql`LEAST(${KV_EVICTION_MAX_CUT}::double precision,
         CASE

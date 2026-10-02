@@ -1,9 +1,10 @@
 // Fixture writes need no owner fences (the graph-write fence triggers accept
 // this client); production code under test uses its own clients.
-import { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+
+type PrismaSql = typeof import("@ws-model-proxy/db").Prisma;
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
@@ -18,12 +19,14 @@ if (!databaseUrl)
 integration("cache affinity PostgreSQL concurrency and retention", () => {
   const db = databaseUrl ? createFixturePrismaClient(databaseUrl) : undefined;
   let service: typeof import("./cache-affinity.js");
+  let Prisma: PrismaSql;
 
   beforeAll(async () => {
     if (!databaseUrl) return;
     process.env.DATABASE_URL = databaseUrl;
     process.env.BETTER_AUTH_SECRET ??= "cache-affinity-integration-secret-32-bytes";
     process.env.BETTER_AUTH_URL ??= "http://localhost:3000";
+    ({ Prisma } = await import("@ws-model-proxy/db"));
     service = await import("./cache-affinity.js");
   });
 
@@ -484,6 +487,7 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
       SELECT indexname FROM pg_indexes
        WHERE tablename = 'cache_affinity_record'
          AND indexname = 'cache_affinity_record_residency'`;
-    if (indexes.length > 0) expect(planText).toContain("cache_affinity_record_residency");
+    expect(indexes.length).toBeGreaterThan(0);
+    expect(planText).toContain("cache_affinity_record_residency");
   });
 });

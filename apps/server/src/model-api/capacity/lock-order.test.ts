@@ -149,6 +149,8 @@ const HOT_PATH_WRITERS: Record<string, string> = {
     "H: disposable KV eviction feedback (one owner-guarded single-statement upsert, no fence)",
   "apps/server/src/relay/engine-load-rollup.ts":
     "H: persisted engine-load minutes (batched owner-guarded upserts, no fence)",
+  "apps/server/src/relay/node-metrics-rollup.ts":
+    "H: node metrics minutes (batched upserts, no fence)",
   "apps/server/src/model-api/usage-rollup.ts": "H: relay finalization and rollups",
   "apps/server/src/model-api/relay-telemetry-recovery.ts": "H/S: relay crash repair",
   "apps/server/src/model-api/usage-retention.ts": "S: relay and rollup retention",
@@ -185,6 +187,8 @@ const GRAPH_WRITERS: Record<string, string> = {
   "apps/server/src/model-api/public-overflow.ts": "H status: credential lastUsedAt",
   "packages/api/src/lib/model-pool-routing.ts":
     "H status: pool member health, one row per statement",
+  "apps/server/src/model-api/cache-affinity.ts":
+    "H status: pool member lastRoutedAt (one row per statement, outside the hot fence)",
   "packages/api/src/lib/model-api-token-access.ts": "H status: token lastUsedAt (SKIP LOCKED)",
   "packages/api/src/lib/engine-process-capacity.ts":
     "M: process capacity lifecycle and orphan cleanup",

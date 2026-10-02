@@ -96,7 +96,9 @@ pub fn probe_with(
     post: impl Fn(&str, &Value) -> Option<String>,
 ) -> Option<CountContextMethod> {
     match declared.or(kind) {
-        Some(EngineKind::Generic | EngineKind::Ollama | EngineKind::LmStudio | EngineKind::Sglang) => {
+        Some(
+            EngineKind::Generic | EngineKind::Ollama | EngineKind::LmStudio | EngineKind::Sglang,
+        ) => {
             return None;
         }
         Some(EngineKind::Vllm) => return try_vllm(&post),
@@ -134,7 +136,10 @@ fn try_llama(post: &impl Fn(&str, &Value) -> Option<String>) -> Option<CountCont
 }
 
 /// Detect tokenize support with the endpoint's credentials.
-pub fn probe_count_context(endpoint: &EndpointConfig, kind: Option<EngineKind>) -> Option<CountContextMethod> {
+pub fn probe_count_context(
+    endpoint: &EndpointConfig,
+    kind: Option<EngineKind>,
+) -> Option<CountContextMethod> {
     let declared = endpoint.engine.declared_kind();
     let agent = engine::http_agent(engine::DETECT_TIMEOUT);
     let post = |route: &str, body: &Value| {
@@ -155,7 +160,12 @@ pub fn count_chat(
         .get("messages")
         .filter(|value| value.is_array())
         .cloned()
-        .ok_or_else(|| CountContextError::new(CountContextErrorKind::InvalidInput, "count_context body has no messages array"))?;
+        .ok_or_else(|| {
+            CountContextError::new(
+                CountContextErrorKind::InvalidInput,
+                "count_context body has no messages array",
+            )
+        })?;
     let tools = body.get("tools").cloned();
     let resolved = method.or_else(|| {
         let kind = engine::effective_kind(endpoint).map(|(kind, _)| kind);
@@ -183,7 +193,10 @@ pub fn count_chat(
             }
             let response = post_counted(&agent, endpoint, "tokenize", &payload)?;
             let tokens = parse_token_count(&response).ok_or_else(|| {
-                CountContextError::new(CountContextErrorKind::Unsupported, "vLLM /tokenize returned no count")
+                CountContextError::new(
+                    CountContextErrorKind::Unsupported,
+                    "vLLM /tokenize returned no count",
+                )
             })?;
             Ok(CountContextOutcome { tokens, method })
         }
@@ -266,9 +279,8 @@ fn post_counted(
     route: &str,
     body: &Value,
 ) -> std::result::Result<String, CountContextError> {
-    post_json_route(agent, endpoint, route, body, TOKENIZE_BODY_LIMIT).map_err(|error| {
-        classify_post_error(error, route)
-    })
+    post_json_route(agent, endpoint, route, body, TOKENIZE_BODY_LIMIT)
+        .map_err(|error| classify_post_error(error, route))
 }
 
 fn classify_post_error(error: anyhow::Error, route: &str) -> CountContextError {
@@ -337,7 +349,8 @@ mod tests {
 
     const VLLM: &str = include_str!("../tests/fixtures/engines/vllm-tokenize.json");
     const TGI: &str = include_str!("../tests/fixtures/engines/tgi-chat-tokenize.json");
-    const LLAMA_TEMPLATE: &str = include_str!("../tests/fixtures/engines/llama-apply-template.json");
+    const LLAMA_TEMPLATE: &str =
+        include_str!("../tests/fixtures/engines/llama-apply-template.json");
     const LLAMA_TOKENS: &str = include_str!("../tests/fixtures/engines/llama-tokenize.json");
 
     fn fixture_post(
@@ -389,18 +402,17 @@ mod tests {
             Some(CountContextMethod::VllmTokenize)
         );
         assert_eq!(
-            probe_with(
-                None,
-                None,
-                fixture_post(&[("chat_tokenize", TGI)]),
-            ),
+            probe_with(None, None, fixture_post(&[("chat_tokenize", TGI)]),),
             Some(CountContextMethod::TgiChatTokenize)
         );
         assert_eq!(
             probe_with(
                 Some(EngineKind::LlamaCpp),
                 None,
-                fixture_post(&[("apply-template", LLAMA_TEMPLATE), ("tokenize", LLAMA_TOKENS)]),
+                fixture_post(&[
+                    ("apply-template", LLAMA_TEMPLATE),
+                    ("tokenize", LLAMA_TOKENS)
+                ]),
             ),
             Some(CountContextMethod::LlamaApplyTemplate)
         );
@@ -413,7 +425,11 @@ mod tests {
             None
         );
         assert_eq!(
-            probe_with(Some(EngineKind::Generic), None, fixture_post(&[("tokenize", VLLM)])),
+            probe_with(
+                Some(EngineKind::Generic),
+                None,
+                fixture_post(&[("tokenize", VLLM)])
+            ),
             None
         );
         assert_eq!(

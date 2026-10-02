@@ -2129,7 +2129,7 @@ describe("supervised commands", () => {
     it.each([
       ["OFF", "supervised", "2.4", true, "grant_disabled"],
       ["SUPERVISED", "off", "2.4", true, "feature_disabled"],
-      ["SUPERVISED", "supervised", "2.7", true, "offline"],
+      ["SUPERVISED", "supervised", "2.3", true, "offline"],
       ["SUPERVISED", "supervised", "2.4", false, "offline"],
     ] as const)(
       "direct file admission refuses grant %s / live %s / protocol %s / fileOps %s as %s",
@@ -2137,7 +2137,7 @@ describe("supervised commands", () => {
         const socket = await connect("desktop", { grant, mode });
         const live = relaySessionManager.getLiveCliFeatures(["desktop"]).get("desktop");
         if (!live) throw new Error("missing live features");
-        // Current hello validation refuses 2.7 / missing fileOps already.
+        // Current hello validation refuses 2.3 / missing fileOps already.
         // Inject the live snapshot to exercise admission's own guards.
         const features = vi
           .spyOn(relaySessionManager, "getLiveCliFeatures")

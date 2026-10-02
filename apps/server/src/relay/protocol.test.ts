@@ -390,7 +390,7 @@ describe("relay protocol 2.4 minimum", () => {
     it("keeps well-formed versions", () => {
       expect(facts("2.6", "0.4.0")).toEqual({ protocolVersion: "2.6", cliVersion: "0.4.0" });
       expect(facts("2.8", "1.2.3-rc.1+build.5")).toEqual({
-        protocolVersion: "2.4",
+        protocolVersion: "2.8",
         cliVersion: "1.2.3-rc.1+build.5",
       });
       expect(facts("2.10", "10.20.30").protocolVersion).toBe("2.10");

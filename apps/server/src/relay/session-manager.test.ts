@@ -3612,23 +3612,7 @@ describe("relay 2.7 telemetry", () => {
       .filter((frame) => frame.type === "engine.adapters.set");
   }
 
-  it("does not send engine.adapters.set on a 2.8 session", async () => {
-    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
-      .findUnique;
-    findUnique.mockResolvedValue({
-      userId: "user-id",
-      mcpCommandMode: "UNSUPERVISED",
-      remoteMetricSources: [fansSource],
-      remoteEngineAdapters: [gpuAdapter],
-    });
-    const { manager, socket } = await registered();
-    expect(adapterFrames(socket)).toEqual([]);
-    expect(await manager.onRemoteEngineAdaptersChanged("cli-device-id")).toBe(false);
-    expect(adapterFrames(socket)).toEqual([]);
-    manager.dispose();
-  });
-
-  it("sends remote engine adapters after hello.ok only on 2.9 unsupervised sessions", async () => {
+  it("sends remote engine adapters after hello.ok only on unsupervised sessions", async () => {
     const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
       .findUnique;
     findUnique.mockResolvedValue({

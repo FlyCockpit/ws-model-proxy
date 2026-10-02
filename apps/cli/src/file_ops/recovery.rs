@@ -1124,16 +1124,19 @@ impl RecoveryDir {
                     None => self.uncertain(),
                 });
             };
-            let dest_matches = self.holds(&slot, dst.as_mut().unwrap());
+            let Some(held) = dst.as_deref_mut() else {
+                return Err(self.uncertain());
+            };
+            let dest_matches = self.holds(&slot, held);
             if !dest_matches {
-                self.undo_captured_destination(ops, &Some(slot), src, dst.as_deref_mut());
+                self.undo_captured_destination(ops, &Some(slot), src, Some(held));
                 return Err(self.conflict_or_uncertain("replaced"));
             }
             // One directory entry under two names: capturing D took S as well.
             let source_went_with_dest =
                 !self.holds_name(&from.dir, &from.name, src) && self.holds(&slot, src);
             if source_went_with_dest {
-                self.undo_captured_destination(ops, &Some(slot), src, dst.as_deref_mut());
+                self.undo_captured_destination(ops, &Some(slot), src, Some(held));
                 return Err(self.conflict_or_uncertain("gone"));
             }
             captured_dest = Some(slot);
@@ -1212,12 +1215,12 @@ impl RecoveryDir {
             if self.restore(ops, &source_slot) {
                 let _ = ops.step(Step::Restored);
             }
-            if let (Some(slot), Some(held)) = (&captured_dest, dst.as_deref_mut()) {
+            if let (Some(slot), Some(held)) = (&captured_dest, dst.as_mut()) {
                 self.dispose(ops, slot, held);
             }
             return self.ok_if_settled();
         }
-        match (&captured_dest, dst.as_deref_mut()) {
+        match (&captured_dest, dst.as_mut()) {
             (Some(slot), Some(held)) => {
                 self.dispose_link_move(ops, &source_slot, src, slot, held);
             }
@@ -2278,7 +2281,7 @@ mod tests {
         std::fs::write(dir.join("INTENT"), "{\"version\":1}\n").unwrap();
         std::fs::write(fx.root.join(".wsmp-recover-not-a-dir"), "file").unwrap();
         std::os::unix::fs::symlink(&dir, fx.root.join("link-to-recover")).unwrap();
-        report_abandoned_recovery(&[fx.root.clone()]);
+        report_abandoned_recovery(std::slice::from_ref(&fx.root));
         assert_eq!(
             std::fs::read_to_string(dir.join("INTENT")).unwrap(),
             "{\"version\":1}\n"

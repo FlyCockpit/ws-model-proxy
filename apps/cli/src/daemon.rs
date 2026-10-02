@@ -447,6 +447,7 @@ pub fn connect_foreground() -> Result<()> {
     config.validate()?;
     let mut control = ControlServer::bind()?;
     let startup = TerminalStartup::capture(&config)?;
+    #[cfg(unix)]
     crate::file_ops::report_abandoned_recovery(startup.file_roots());
     let mut last_inventory_revision = None;
     // The mtime accompanies the last server-acknowledged local snapshot. It
@@ -4135,7 +4136,7 @@ mod tests {
         );
         let spec = EngineAdapterConfig {
             input: AdapterInput::Route {
-                route: "stats".to_string(),
+                route: "/stats".to_string(),
             },
             format: AdapterFormat::Json,
             interval_secs: 2,
@@ -4146,15 +4147,17 @@ mod tests {
         let remote = crate::protocol::RemoteEngineAdapter {
             endpoint_slug: "gpu".to_string(),
             input: AdapterInput::Route {
-                route: "stats".to_string(),
+                route: "/stats".to_string(),
             },
             format: AdapterFormat::Json,
             interval_secs: 2,
             timeout_secs: 2,
             map,
         };
-        let mut config = Config::default();
-        config.allow_remote_engine_adapters = true;
+        let mut config = Config {
+            allow_remote_engine_adapters: true,
+            ..Config::default()
+        };
         config
             .approved_remote_adapters
             .insert("gpu".to_string(), hash);
@@ -4175,7 +4178,8 @@ mod tests {
 
         let mut unapproved = config.clone();
         unapproved.approved_remote_adapters.clear();
-        let pending = inventory_snapshot_from_config_with_remote(&unapproved, &[remote.clone()]);
+        let pending =
+            inventory_snapshot_from_config_with_remote(&unapproved, std::slice::from_ref(&remote));
         assert!(
             pending[0]
                 .engine_facts
