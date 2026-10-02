@@ -21,7 +21,7 @@ import {
 import { clearCacheAffinityRecords } from "@ws-model-proxy/db/hot-path-sweeps";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
-import type { LiveCliFeatureSnapshot } from "../context";
+import type { LiveCliFeatureSnapshot, LiveNodeTelemetrySnapshot } from "../context";
 import { protectedProcedure } from "../index";
 import {
   CACHE_STATS_MAX_LAST_DAYS,
@@ -91,6 +91,14 @@ import {
 } from "../lib/model-api-token-access";
 import { suggestedConnectionSurface } from "../lib/model-connection-type";
 import { poolMemberRoutingStatuses } from "../lib/model-pool-routing";
+import {
+  buildNodeCardSnapshot,
+  type NodeCardSnapshot,
+  nodeLabelsSchema,
+  nodeUsableBudgetsInputSchema,
+  normalizeNodeLabels,
+  shapeNodeMetricsMinute,
+} from "../lib/node-inventory";
 import {
   audioOperationSupported,
   coarseCapabilitiesFromOpenAi,
@@ -462,6 +470,12 @@ const listCliDevicesSelect = {
   relayRejectedAt: true,
   nodeInfoAt: true,
   nodeMetricsAt: true,
+  nodeInfo: true,
+  nodeMetrics: true,
+  labels: true,
+  usableMemoryGb: true,
+  usableRamGb: true,
+  usableVramGb: true,
   User: { select: { slug: true } },
   Endpoints: {
     orderBy: { createdAt: "asc" as const },
@@ -542,6 +556,7 @@ const cliDeviceSummarySelect = {
   reportedTerminalApproval: true,
   reportedTerminalSupported: true,
   reportedAllowFileToolsAsRoot: true,
+  labels: true,
   Endpoints: {
     orderBy: { createdAt: "asc" as const },
     select: {
@@ -896,7 +911,51 @@ function serializeCliDeviceFeatures(
   };
 }
 
-function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSnapshot | null) {
+function serializeCliDeviceNode(
+  row: {
+    labels?: readonly string[] | null;
+    nodeInfo?: unknown;
+    nodeMetrics?: unknown;
+    usableMemoryGb?: number | null;
+    usableRamGb?: number | null;
+    usableVramGb?: unknown;
+  },
+  liveMetrics: unknown | null | undefined,
+): NodeCardSnapshot {
+  return buildNodeCardSnapshot({
+    nodeInfo: row.nodeInfo ?? null,
+    nodeMetrics: liveMetrics ?? row.nodeMetrics ?? null,
+    labels: row.labels ?? [],
+    usableMemoryGb: row.usableMemoryGb,
+    usableRamGb: row.usableRamGb,
+    usableVramGb: row.usableVramGb,
+  });
+}
+
+async function loadNodeMetricsMinuteHistory(input: {
+  ownerUserId: string;
+  cliDeviceId: string;
+  now: Date;
+}) {
+  const since = new Date(input.now.getTime() - 60 * 60 * 1000);
+  const rows = await prisma.nodeMetricsMinute.findMany({
+    where: {
+      ownerUserId: input.ownerUserId,
+      cliDeviceId: input.cliDeviceId,
+      bucketStart: { gte: since },
+    },
+    orderBy: { bucketStart: "asc" },
+    take: 60,
+  });
+  return (Array.isArray(rows) ? rows : []).map(shapeNodeMetricsMinute);
+}
+
+function serializeCliDevice(
+  row: CliDeviceRow,
+  now: Date,
+  live: LiveCliFeatureSnapshot | null,
+  liveTelemetry: LiveNodeTelemetrySnapshot | null = null,
+) {
   const featureView = serializeCliDeviceFeatures(row, now, live);
   return {
     id: row.id,
@@ -935,6 +994,8 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
       : null,
     nodeInfoAt: row.nodeInfoAt ?? null,
     nodeMetricsAt: row.nodeMetricsAt ?? null,
+    labels: normalizeNodeLabels(row.labels ?? []),
+    node: serializeCliDeviceNode(row, liveTelemetry?.nodeMetrics),
     fileTools: featureView.fileTools,
     allowFileToolsAsRoot: featureView.allowFileToolsAsRoot,
     mcpFileRead: featureView.mcpFileRead,
@@ -1011,6 +1072,7 @@ function serializeCliDeviceSummary(
     name: row.name,
     displayName: cliDeviceDisplayName(row),
     status: row.status,
+    labels: normalizeNodeLabels(row.labels ?? []),
     grants: featureView.grants,
     fileTools: featureView.fileTools,
     allowFileToolsAsRoot: featureView.allowFileToolsAsRoot,
@@ -2756,8 +2818,12 @@ export const forwarderManagementRouter = {
     });
 
     const now = new Date();
-    const live = await context.services?.getLiveCliFeatures?.(rows.map((row) => row.id));
-    return rows.map((row) => serializeCliDevice(row, now, live?.get(row.id) ?? null));
+    const ids = rows.map((row) => row.id);
+    const live = await context.services?.getLiveCliFeatures?.(ids);
+    const liveTelemetry = context.services?.getLiveNodeTelemetry?.(ids);
+    return rows.map((row) =>
+      serializeCliDevice(row, now, live?.get(row.id) ?? null, liveTelemetry?.get(row.id) ?? null),
+    );
   }),
 
   /**
@@ -2797,13 +2863,21 @@ export const forwarderManagementRouter = {
       }
       const now = new Date();
       const live = await context.services?.getLiveCliFeatures?.([row.id]);
-      return serializeCliDevice(row, now, live?.get(row.id) ?? null);
+      const liveTelemetry = context.services?.getLiveNodeTelemetry?.([row.id]);
+      return serializeCliDevice(
+        row,
+        now,
+        live?.get(row.id) ?? null,
+        liveTelemetry?.get(row.id) ?? null,
+      );
     }),
 
   /**
-   * Relay 2.7 node telemetry for one CLI device: its static `node.info`, the
+   * Relay 2.4 node telemetry for one CLI device: its static `node.info`, the
    * freshest `node.metrics` (live from the relay session, else the stored
-   * once-a-minute snapshot) and live engine load per endpoint. Read-only.
+   * once-a-minute snapshot), live engine load per endpoint, the node-card
+   * snapshot (labels, usable budgets, health warnings), and last-hour minute
+   * history. Read-only. Label and budget writes are dashboard-only.
    */
   getCliDeviceMetrics: protectedProcedure
     .input(z.object({ cliDeviceId: idSchema }))
@@ -2819,6 +2893,10 @@ export const forwarderManagementRouter = {
           nodeInfoAt: true,
           nodeMetrics: true,
           nodeMetricsAt: true,
+          labels: true,
+          usableMemoryGb: true,
+          usableRamGb: true,
+          usableVramGb: true,
           mcpCommandMode: true,
           remoteMetricSources: true,
           remoteMetricSourcesAt: true,
@@ -2835,6 +2913,7 @@ export const forwarderManagementRouter = {
       const series = liveMetrics
         ? deviceMetricSeries(liveMetrics.nodeMetrics, liveMetrics.nodeMetricsReceivedAt, now)
         : deviceMetricSeries(row.nodeMetrics ?? null, row.nodeMetricsAt ?? null, now);
+      const nodeMetrics = liveMetrics ? liveMetrics.nodeMetrics : (row.nodeMetrics ?? null);
       return {
         /**
          * Every metric a routing rule can name on this device right now:
@@ -2858,7 +2937,7 @@ export const forwarderManagementRouter = {
         live: live !== null,
         nodeInfo: row.nodeInfo ?? null,
         nodeInfoAt: row.nodeInfoAt ?? null,
-        nodeMetrics: liveMetrics ? liveMetrics.nodeMetrics : (row.nodeMetrics ?? null),
+        nodeMetrics,
         nodeMetricsAt: liveMetrics
           ? liveMetrics.nodeMetricsReceivedAt
           : (row.nodeMetricsAt ?? null),
@@ -2868,6 +2947,13 @@ export const forwarderManagementRouter = {
             ? ("stored" as const)
             : null,
         endpointLoad: live?.endpointLoad ?? [],
+        labels: normalizeNodeLabels(row.labels ?? []),
+        node: serializeCliDeviceNode(row, nodeMetrics),
+        minuteHistory: await loadNodeMetricsMinuteHistory({
+          ownerUserId: row.userId,
+          cliDeviceId: row.id,
+          now,
+        }),
       };
     }),
 
@@ -2949,6 +3035,92 @@ export const forwarderManagementRouter = {
         humanTerminal: updated.allowHumanTerminal,
         fileRead: updated.mcpFileRead,
         mcpCommandMode: mcpCommandModeFromDb(updated.mcpCommandMode),
+      };
+    }),
+
+  /**
+   * Human-only placement labels. Agents read them on the device and metrics
+   * tools; selectors are "has all of these" sets.
+   */
+  setCliDeviceLabels: protectedProcedure
+    .input(z.object({ cliDeviceId: idSchema, labels: nodeLabelsSchema }))
+    .handler(async ({ input, context }) => {
+      const owned = await prisma.cliDevice.findUnique({
+        where: { id: input.cliDeviceId },
+        select: { id: true, userId: true },
+      });
+      if (!owned || owned.userId !== context.session.user.id) {
+        throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+      }
+      const labels = normalizeNodeLabels(input.labels);
+      const row = await prisma.cliDevice.update({
+        where: { id: owned.id },
+        data: { labels },
+        select: {
+          labels: true,
+          nodeInfo: true,
+          nodeMetrics: true,
+          usableMemoryGb: true,
+          usableRamGb: true,
+          usableVramGb: true,
+        },
+      });
+      const live = context.services?.getLiveNodeTelemetry?.([owned.id]).get(owned.id) ?? null;
+      return {
+        cliDeviceId: owned.id,
+        labels: row.labels,
+        node: serializeCliDeviceNode(row, live?.nodeMetrics),
+      };
+    }),
+
+  /**
+   * Human-only usable memory/RAM/VRAM budgets. Null restores the default
+   * (node.info total minus a small reserve). Agents read; they never write.
+   */
+  setCliDeviceUsableBudgets: protectedProcedure
+    .input(
+      nodeUsableBudgetsInputSchema
+        .extend({ cliDeviceId: idSchema })
+        .refine(
+          (value) =>
+            value.usableMemoryGb !== undefined ||
+            value.usableRamGb !== undefined ||
+            value.usableVramGb !== undefined,
+          { message: "At least one usable budget is required." },
+        ),
+    )
+    .handler(async ({ input, context }) => {
+      const owned = await prisma.cliDevice.findUnique({
+        where: { id: input.cliDeviceId },
+        select: { id: true, userId: true },
+      });
+      if (!owned || owned.userId !== context.session.user.id) {
+        throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+      }
+      const row = await prisma.cliDevice.update({
+        where: { id: owned.id },
+        data: {
+          ...(input.usableMemoryGb !== undefined ? { usableMemoryGb: input.usableMemoryGb } : {}),
+          ...(input.usableRamGb !== undefined ? { usableRamGb: input.usableRamGb } : {}),
+          ...(input.usableVramGb !== undefined
+            ? {
+                usableVramGb: input.usableVramGb === null ? Prisma.DbNull : input.usableVramGb,
+              }
+            : {}),
+        },
+        select: {
+          labels: true,
+          nodeInfo: true,
+          nodeMetrics: true,
+          usableMemoryGb: true,
+          usableRamGb: true,
+          usableVramGb: true,
+        },
+      });
+      const live = context.services?.getLiveNodeTelemetry?.([owned.id]).get(owned.id) ?? null;
+      return {
+        cliDeviceId: owned.id,
+        node: serializeCliDeviceNode(row, live?.nodeMetrics),
       };
     }),
 

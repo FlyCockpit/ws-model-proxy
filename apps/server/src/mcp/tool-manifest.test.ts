@@ -512,6 +512,8 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
       "mcpTokens.updateMine",
       "mcpTokens.revokeMine",
       "forwarderManagement.setCliDeviceFeatureGrants",
+      "forwarderManagement.setCliDeviceLabels",
+      "forwarderManagement.setCliDeviceUsableBudgets",
       "supervisedCommands.pending",
       "supervisedCommands.submitOutput",
     ]) {

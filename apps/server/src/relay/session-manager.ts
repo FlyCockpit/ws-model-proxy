@@ -56,6 +56,7 @@ import {
   MetricRoutingEvaluator,
   type RoutingEvaluationState,
 } from "./metric-routing-evaluator.js";
+import { observeNodeMetricsRollup } from "./node-metrics-rollup.js";
 import {
   listDueOwnedPoolMemberRecoveries,
   type OwnedRecoveryMember,
@@ -1744,6 +1745,24 @@ export class RelaySessionManager {
     session.nodeMetricsAcceptedAtMs = nowMs;
     const { type: _type, ...sample } = message;
     session.nodeMetrics = { sample, receivedAt: now };
+    const gpuTemps = (sample.gpus ?? []).map((gpu) => gpu.temperatureC);
+    const gpuUtils = (sample.gpus ?? []).map((gpu) => gpu.utilizationPercent);
+    observeNodeMetricsRollup({
+      ownerUserId: session.identity.userId,
+      cliDeviceId,
+      receivedAt: now,
+      cpuPercent: sample.cpu?.usagePercent,
+      memoryAvailableMiB: sample.memory?.availableMiB,
+      memoryTotalMiB: sample.memory?.totalMiB,
+      gpuTemperatureC: gpuTemps.reduce<number | null>(
+        (max, value) => (value == null ? max : max == null ? value : Math.max(max, value)),
+        null,
+      ),
+      gpuUtilizationPercent: gpuUtils.reduce<number | null>(
+        (max, value) => (value == null ? max : max == null ? value : Math.max(max, value)),
+        null,
+      ),
+    });
     this.scheduleRoutingEvaluation(session);
     if (
       session.nodeMetricsPersistedAtMs !== null &&

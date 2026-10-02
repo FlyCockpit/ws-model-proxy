@@ -91,7 +91,9 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.revokePoolAccessByEmail` | `forwarder_pool_grant_revoke` | write | DELETE | destructive | — | — | — |
 | `forwarderManagement.setCliDeviceEngineAdapters` | `forwarder_device_engine_adapters_set` | write | RUN | external | — | — | — |
 | `forwarderManagement.setCliDeviceFeatureGrants` | — (excluded) | — | — | — | — | — | Human-only device grants including read-only file consent; requires the CLI read switch and configured roots reports. |
+| `forwarderManagement.setCliDeviceLabels` | — (excluded) | — | — | — | — | — | Human-only node placement labels. Agents read labels on forwarder_cli_devices_list, forwarder_cli_device_get, and forwarder_device_metrics_get. |
 | `forwarderManagement.setCliDeviceMetricSources` | `forwarder_device_metric_sources_set` | write | RUN | external | — | — | — |
+| `forwarderManagement.setCliDeviceUsableBudgets` | — (excluded) | — | — | — | — | — | Human-only usable memory/RAM/VRAM budgets. Agents read the effective budgets on forwarder_cli_device_get and forwarder_device_metrics_get. |
 | `forwarderManagement.setDiscoveredModelCapabilityProfile` | `forwarder_model_capability_profile_set` | write | — | pure | — | — | — |
 | `forwarderManagement.setPoolMemberEngineLoad` | `forwarder_pool_member_engine_load_set` | write | RUN | cost | — | — | — |
 | `forwarderManagement.setPoolRoutingRules` | `forwarder_pool_routing_rules_set` | write | RUN | cost | — | — | — |

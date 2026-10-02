@@ -45,6 +45,7 @@ import { CliAgentActivity } from "@/components/cli-agent-activity";
 import { CliDeviceEngineAdapters } from "@/components/cli-device-engine-adapters";
 import { CliDeviceFeatureSwitches } from "@/components/cli-device-feature-switches";
 import { CliDeviceMetricSources } from "@/components/cli-device-metric-sources";
+import { CliDeviceNodeCard } from "@/components/cli-device-node-card";
 import { CliDeviceRename } from "@/components/cli-device-rename";
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { InlineRetry } from "@/components/inline-retry";
@@ -830,6 +831,10 @@ export function CliEndpointsModelsSection() {
                   </Button>
                 </div>
               </div>
+
+              {device.node ? (
+                <CliDeviceNodeCard cliDeviceId={device.id} node={device.node} />
+              ) : null}
 
               <CliDeviceFeatureSwitches
                 cliDeviceId={device.id}

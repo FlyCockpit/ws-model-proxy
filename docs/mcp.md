@@ -15,8 +15,12 @@ Node telemetry (relay protocol 2.4) is read-only over MCP. Node file tools
 (relay protocol 2.4) are described in [CLI file tools](#cli-file-tools-relay-protocol-24).
 `forwarder_device_metrics_get` (`{ cliDeviceId }`) returns a CLI device's static
 `node.info`, its freshest `node.metrics` (live from the relay session, else the
-stored once-a-minute snapshot, with `nodeMetricsSource`), and the live
-`endpoint.load` readings the relay holds in memory. Detected engine facts
+stored once-a-minute snapshot, with `nodeMetricsSource`), the live
+`endpoint.load` readings the relay holds in memory, a `node` snapshot (kind,
+GPUs, live memory, labels, usable budgets, health warnings), and last-hour
+`minuteHistory` min/avg/max gauges. Labels and usable budgets are human-only
+dashboard writes; this tool is read-only. Health warnings are informational
+and never preflight gates. Detected engine facts
 (`engineKind`, `engineSlots`, `kvBudgetTokens`, `maxModelLen`,
 `engineFactsSource`, `engineFactsAt`) and the derived `enginePreset` appear on
 every capacity in `capacity_records_list`. `effectiveKvBudgetTokens` is the

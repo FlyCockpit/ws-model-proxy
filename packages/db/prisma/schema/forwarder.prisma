@@ -381,6 +381,19 @@ model CliDevice {
   /// relay session holds the freshest sample.
   nodeMetrics                  Json?
   nodeMetricsAt                DateTime?
+  /// Human-only placement tags (`dgx-spark`, `unified-memory`, …). Agents read
+  /// them; selectors are "has all of these" sets. Empty until someone accepts
+  /// the first-`node.info` suggestions or types their own.
+  labels                       String[]              @default([])
+  /// Unified-memory budget in GB. Null means the default from `node.info`
+  /// (total minus a small reserve). Human-only.
+  usableMemoryGb               Float?
+  /// Discrete/CPU system-RAM budget in GB. Null means the default from
+  /// `node.info`. Human-only.
+  usableRamGb                  Float?
+  /// Per-GPU VRAM budgets in GB, keyed by GPU UUID (`index:N` fallback).
+  /// Null/absent keys mean the default from `node.info`. Human-only.
+  usableVramGb                 Json?
   /// A hello refused for an unsupported relay protocol, older or newer than the
   /// server supports ("CLI upgrade required" / "Server upgrade required").
   /// Cleared by the next accepted hello.
@@ -1924,6 +1937,35 @@ model EngineLoadRollupMinute {
   @@index([ownerUserId, bucketStart])
   @@index([capacityId, bucketStart])
   @@map("engine_load_rollup_minute")
+}
+
+/// Class-H per-minute node telemetry (no FKs). Written from accepted
+/// `node.metrics` frames. Min/avg/max gauges for CLI node-card sparklines.
+/// Kept 7 days in the usage-retention sweep.
+model NodeMetricsMinute {
+  bucketStart              DateTime
+  ownerUserId              String
+  cliDeviceId              String
+  updatedAt                DateTime @default(now())
+  samples                  Int      @default(0)
+  cpuSamples               Int      @default(0)
+  minCpuPercent            Float?
+  sumCpuPercent            Float?
+  maxCpuPercent            Float?
+  memorySamples            Int      @default(0)
+  minMemoryAvailableMiB    Float?
+  sumMemoryAvailableMiB    Float?
+  maxMemoryAvailableMiB    Float?
+  minMemoryUsedPercent     Float?
+  sumMemoryUsedPercent     Float?
+  maxMemoryUsedPercent     Float?
+  maxGpuTemperatureC       Float?
+  maxGpuUtilizationPercent Float?
+
+  @@id([bucketStart, ownerUserId, cliDeviceId])
+  @@index([ownerUserId, bucketStart])
+  @@index([cliDeviceId, bucketStart])
+  @@map("node_metrics_minute")
 }
 
 /// Append-only, prompt-free facts for each local CLI relay attempt. A separate

@@ -5218,6 +5218,162 @@ describe("renameCliDevice", () => {
   });
 });
 
+describe("setCliDeviceLabels", () => {
+  function labelsClient(userId = "user-id") {
+    return createRouterClient(forwarderManagementRouter, {
+      context: buildContext({ user: { id: userId } }),
+    });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("saves unique kebab-case labels on an owned device", async () => {
+    db.cliDevice.findUnique.mockResolvedValue({ id: "cli-id", userId: "user-id" });
+    db.cliDevice.update.mockResolvedValue({
+      labels: ["dgx-spark", "unified-memory"],
+      nodeInfo: { nodeKind: "unified", unifiedMemory: true, gpus: [{ index: 0, name: "GB10" }] },
+      nodeMetrics: null,
+      usableMemoryGb: null,
+      usableRamGb: null,
+      usableVramGb: null,
+    });
+    const result = await labelsClient().setCliDeviceLabels({
+      cliDeviceId: "cli-id",
+      labels: ["dgx-spark", "unified-memory"],
+    });
+    expect(db.cliDevice.update).toHaveBeenCalledWith({
+      where: { id: "cli-id" },
+      data: { labels: ["dgx-spark", "unified-memory"] },
+      select: {
+        labels: true,
+        nodeInfo: true,
+        nodeMetrics: true,
+        usableMemoryGb: true,
+        usableRamGb: true,
+        usableVramGb: true,
+      },
+    });
+    expect(result.labels).toEqual(["dgx-spark", "unified-memory"]);
+    expect(result.node.suggestedLabels).toEqual(["dgx-spark", "unified-memory"]);
+  });
+
+  it("rejects negation, expressions, duplicates, and foreign devices", async () => {
+    await expect(
+      labelsClient().setCliDeviceLabels({
+        cliDeviceId: "cli-id",
+        labels: ["dgx-spark", "!low-power"],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(
+      labelsClient().setCliDeviceLabels({
+        cliDeviceId: "cli-id",
+        labels: ["unified-memory=true"],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(
+      labelsClient().setCliDeviceLabels({
+        cliDeviceId: "cli-id",
+        labels: ["dgx-spark", "dgx-spark"],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.cliDevice.findUnique).not.toHaveBeenCalled();
+    db.cliDevice.findUnique
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ id: "cli-id", userId: "other-user" });
+    await expect(
+      labelsClient().setCliDeviceLabels({ cliDeviceId: "missing", labels: ["dgx-spark"] }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(
+      labelsClient().setCliDeviceLabels({ cliDeviceId: "cli-id", labels: ["dgx-spark"] }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(db.cliDevice.update).not.toHaveBeenCalled();
+  });
+});
+
+describe("setCliDeviceUsableBudgets", () => {
+  function budgetsClient(userId = "user-id") {
+    return createRouterClient(forwarderManagementRouter, {
+      context: buildContext({ user: { id: userId } }),
+    });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("stores a human-edited unified budget and per-GPU VRAM map", async () => {
+    db.cliDevice.findUnique.mockResolvedValue({ id: "cli-id", userId: "user-id" });
+    db.cliDevice.update.mockResolvedValue({
+      labels: [],
+      nodeInfo: {
+        nodeKind: "discrete",
+        memoryTotalMiB: 32 * 1024,
+        gpus: [{ index: 0, uuid: "GPU-aaa", vramTotalMiB: 24 * 1024 }],
+      },
+      nodeMetrics: null,
+      usableMemoryGb: null,
+      usableRamGb: 28,
+      usableVramGb: { "GPU-aaa": 23.5 },
+    });
+    const result = await budgetsClient().setCliDeviceUsableBudgets({
+      cliDeviceId: "cli-id",
+      usableRamGb: 28,
+      usableVramGb: { "GPU-aaa": 23.5 },
+    });
+    expect(db.cliDevice.update).toHaveBeenCalledWith({
+      where: { id: "cli-id" },
+      data: { usableRamGb: 28, usableVramGb: { "GPU-aaa": 23.5 } },
+      select: {
+        labels: true,
+        nodeInfo: true,
+        nodeMetrics: true,
+        usableMemoryGb: true,
+        usableRamGb: true,
+        usableVramGb: true,
+      },
+    });
+    expect(result.node.usableRamGb).toBe(28);
+    expect(result.node.usableRamGbDefault).toBe(false);
+    expect(result.node.gpus[0]?.usableVramGb).toBe(23.5);
+  });
+
+  it("clears a VRAM map back to defaults with null", async () => {
+    db.cliDevice.findUnique.mockResolvedValue({ id: "cli-id", userId: "user-id" });
+    db.cliDevice.update.mockResolvedValue({
+      labels: [],
+      nodeInfo: null,
+      nodeMetrics: null,
+      usableMemoryGb: null,
+      usableRamGb: null,
+      usableVramGb: null,
+    });
+    await budgetsClient().setCliDeviceUsableBudgets({
+      cliDeviceId: "cli-id",
+      usableVramGb: null,
+    });
+    expect(db.cliDevice.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { usableVramGb: { kind: "DbNull" } },
+      }),
+    );
+  });
+
+  it("rejects an empty patch and a malformed VRAM key", async () => {
+    await expect(
+      budgetsClient().setCliDeviceUsableBudgets({ cliDeviceId: "cli-id" }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(
+      budgetsClient().setCliDeviceUsableBudgets({
+        cliDeviceId: "cli-id",
+        usableVramGb: { "index:999": 8 },
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.cliDevice.findUnique).not.toHaveBeenCalled();
+  });
+});
+
 describe("setCliDeviceFeatureGrants", () => {
   function grantsClient(userId = "user-id", hook?: (cliDeviceId: string) => void) {
     return createRouterClient(forwarderManagementRouter, {
@@ -5705,7 +5861,7 @@ describe("setCliDeviceFeatureGrants", () => {
       refusals: { headless: null, supervised: "unsupported" },
       available: true,
     });
-    // A connected CLI older than protocol 2.6 has no command support: offline.
+    // A connected CLI older than protocol 2.4 has no command support: offline.
     const oldClient = createRouterClient(forwarderManagementRouter, {
       context: {
         ...buildContext(),
@@ -5715,7 +5871,7 @@ describe("setCliDeviceFeatureGrants", () => {
               [
                 "cli-id",
                 {
-                  protocolVersion: "2.5",
+                  protocolVersion: "2.3",
                   cliVersion: "0.3.0",
                   humanTerminal: true,
                   mcpCommandMode: "unsupervised" as const,
@@ -5925,16 +6081,16 @@ describe("setCliDeviceFeatureGrants", () => {
     db.cliDevice.findMany.mockResolvedValue([
       {
         ...row,
-        rejectedRelayProtocolVersion: "2.6",
-        rejectedCliVersion: "0.4.0",
+        rejectedRelayProtocolVersion: "2.3",
+        rejectedCliVersion: "0.3.1",
         relayRejectedAt: rejectedAt,
       },
       { ...row, id: "cli-ok", relayRejectedAt: null },
       {
         ...row,
         id: "cli-newer",
-        rejectedRelayProtocolVersion: "2.10",
-        rejectedCliVersion: "0.9.0",
+        rejectedRelayProtocolVersion: "2.6",
+        rejectedCliVersion: "0.4.0",
         relayRejectedAt: rejectedAt,
       },
     ]);
@@ -5942,14 +6098,14 @@ describe("setCliDeviceFeatureGrants", () => {
       context: buildContext(),
     }).listCliDevices();
     expect(devices[0]?.upgradeRequired).toEqual({
-      protocolVersion: "2.6",
-      cliVersion: "0.4.0",
+      protocolVersion: "2.3",
+      cliVersion: "0.3.1",
       rejectedAt,
       reason: "cli_too_old",
     });
     expect(devices[1]?.upgradeRequired).toBeNull();
     expect(devices[2]?.upgradeRequired).toMatchObject({
-      protocolVersion: "2.10",
+      protocolVersion: "2.6",
       reason: "cli_too_new",
     });
   });
@@ -6231,9 +6387,12 @@ describe("getCliDeviceMetrics", () => {
     nodeMetrics: storedMetrics,
     nodeMetricsAt: new Date("2026-09-28T11:00:00.000Z"),
   };
+  const nodeMetricsMinute = (prisma as unknown as { nodeMetricsMinute: { findMany: MockInstance } })
+    .nodeMetricsMinute;
 
   beforeEach(() => {
     vi.clearAllMocks();
+    nodeMetricsMinute.findMany.mockResolvedValue([]);
   });
 
   function metricsClient(services?: Record<string, unknown>) {
@@ -6293,6 +6452,52 @@ describe("getCliDeviceMetrics", () => {
     await expect(
       metricsClient().getCliDeviceMetrics({ cliDeviceId: "cli-id" }),
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("includes a node snapshot, labels, and last-hour minute history", async () => {
+    db.cliDevice.findUnique.mockResolvedValue({
+      ...deviceMetricsRow,
+      labels: ["dgx-spark"],
+      usableMemoryGb: 120,
+      nodeInfo: {
+        nodeKind: "unified",
+        unifiedMemory: true,
+        memoryTotalMiB: 128 * 1024,
+        gpus: [{ index: 0, name: "NVIDIA GB10", uuid: "GPU-1" }],
+      },
+    });
+    nodeMetricsMinute.findMany.mockResolvedValue([
+      {
+        bucketStart: new Date("2026-09-28T10:00:00.000Z"),
+        samples: 2,
+        cpuSamples: 2,
+        minCpuPercent: 10,
+        sumCpuPercent: 30,
+        maxCpuPercent: 20,
+        memorySamples: 2,
+        minMemoryAvailableMiB: 1000,
+        sumMemoryAvailableMiB: 4000,
+        maxMemoryAvailableMiB: 3000,
+        minMemoryUsedPercent: 40,
+        sumMemoryUsedPercent: 100,
+        maxMemoryUsedPercent: 60,
+        maxGpuTemperatureC: 55,
+        maxGpuUtilizationPercent: 20,
+      },
+    ]);
+    const result = await metricsClient().getCliDeviceMetrics({ cliDeviceId: "cli-id" });
+    expect(result.labels).toEqual(["dgx-spark"]);
+    expect(result.node.kind).toBe("unified");
+    expect(result.node.usableMemoryGb).toBe(120);
+    expect(result.node.usableMemoryGbDefault).toBe(false);
+    expect(result.node.suggestedLabels).toEqual(["dgx-spark", "unified-memory"]);
+    expect(result.minuteHistory).toEqual([
+      expect.objectContaining({
+        start: "2026-09-28T10:00:00.000Z",
+        avgCpuPercent: 15,
+        avgMemoryAvailableMiB: 2000,
+      }),
+    ]);
   });
 });
 
@@ -6397,6 +6602,7 @@ describe("metric routing procedures (S-B part 2)", () => {
     capacityKvEviction: { findMany: MockInstance };
     poolMemberRoutingVerdict: { findMany: MockInstance; deleteMany: MockInstance };
     cliDevice: { findUnique: MockInstance; findMany: MockInstance; updateMany: MockInstance };
+    nodeMetricsMinute: { findMany: MockInstance };
   };
   const source = {
     name: "fans",
@@ -6409,6 +6615,7 @@ describe("metric routing procedures (S-B part 2)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     deep.capacityKvEviction.findMany.mockResolvedValue([]);
+    deep.nodeMetricsMinute.findMany.mockResolvedValue([]);
   });
 
   function client(services?: Record<string, unknown>) {

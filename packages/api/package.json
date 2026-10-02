@@ -74,6 +74,9 @@
     "./lib/metric-routing": {
       "default": "./src/lib/metric-routing.ts"
     },
+    "./lib/node-inventory": {
+      "default": "./src/lib/node-inventory.ts"
+    },
     "./lib/remote-engine-adapters": {
       "default": "./src/lib/remote-engine-adapters.ts"
     },

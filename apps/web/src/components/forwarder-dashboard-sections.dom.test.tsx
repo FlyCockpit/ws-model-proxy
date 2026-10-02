@@ -33,6 +33,9 @@ vi.mock("@/components/cli-device-metric-sources", () => ({
 vi.mock("@/components/cli-device-engine-adapters", () => ({
   CliDeviceEngineAdapters: () => null,
 }));
+vi.mock("@/components/cli-device-node-card", () => ({
+  CliDeviceNodeCard: () => null,
+}));
 
 vi.mock("@/utils/orpc", () => {
   const query = (key: string, data: unknown) => ({

@@ -503,7 +503,7 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     classification: "pure",
     descriptionNote:
-      "Summaries only: id, slug, status, grants, endpoint slugs and probe status (status, reportedStatus, failureReasonCode). No models[] and no capability JSON. Returns { items, nextCursor }; limit defaults to 20 and max is 50. Pass nextCursor for the next page. The full device, including models, is forwarder_cli_device_get. features.commands.effectiveMode is what an agent can run now: the stricter of the dashboard grant (mode) and the CLI's own wsmp config (deviceMode). features.commands.refusals says, per tool, what the relay would refuse right now, in its own check order: refusals.headless (forwarder_cli_command_run) and refusals.supervised (forwarder_cli_supervised_command_start) are null when admitted, else grant_disabled (dashboard grant), grant_supervised_only or cli_supervised_only (the relay's supervised_only: headless needs unsupervised, and the dashboard grant, or else wsmp config, is only supervised), offline (CLI not connected or too old), feature_disabled (wsmp config set-mcp-commands), or unsupported (no terminal support, supervised only). available is true when either tool would be admitted. A command token also needs mcp:write and allowCliCommands. fileTools follows that effective mode: unsupervised admits read/write; supervised/off admit reads only with the dashboard mcpFileRead grant, live CLI mcpFileRead and fileRootsConfigured. A read-only PAT needs allowCliFileRead and mcp:read for the four read tools; write tools retain allowCliCommands and mcp:write. Reported fields reportedMcpFileRead/reportedFileRoots describe CLI configuration; missing live features never authorize reads.",
+      "Summaries only: id, slug, status, grants, labels, endpoint slugs and probe status (status, reportedStatus, failureReasonCode). No models[] and no capability JSON. Returns { items, nextCursor }; limit defaults to 20 and max is 50. Pass nextCursor for the next page. The full device, including models and the node snapshot, is forwarder_cli_device_get. labels are human-only placement tags; a selector matches a node that has all of them (no expressions or negation). features.commands.effectiveMode is what an agent can run now: the stricter of the dashboard grant (mode) and the CLI's own wsmp config (deviceMode). features.commands.refusals says, per tool, what the relay would refuse right now, in its own check order: refusals.headless (forwarder_cli_command_run) and refusals.supervised (forwarder_cli_supervised_command_start) are null when admitted, else grant_disabled (dashboard grant), grant_supervised_only or cli_supervised_only (the relay's supervised_only: headless needs unsupervised, and the dashboard grant, or else wsmp config, is only supervised), offline (CLI not connected or too old), feature_disabled (wsmp config set-mcp-commands), or unsupported (no terminal support, supervised only). available is true when either tool would be admitted. A command token also needs mcp:write and allowCliCommands. fileTools follows that effective mode: unsupervised admits read/write; supervised/off admit reads only with the dashboard mcpFileRead grant, live CLI mcpFileRead and fileRootsConfigured. A read-only PAT needs allowCliFileRead and mcp:read for the four read tools; write tools retain allowCliCommands and mcp:write. Reported fields reportedMcpFileRead/reportedFileRoots describe CLI configuration; missing live features never authorize reads.",
     invokeProcedure: procedureInvoker(
       (client) => client.forwarderManagement.listCliDeviceSummaries,
     ),
@@ -515,7 +515,7 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     classification: "pure",
     descriptionNote:
-      "Full CLI device for cliDeviceId, including endpoints, models, and capability JSON. List summaries with forwarder_cli_devices_list.",
+      "Full CLI device for cliDeviceId, including endpoints, models, capability JSON, and a node snapshot (kind, GPUs, live memory, labels, usable budgets, health warnings). Labels and usable budgets are human-only writes; this tool is read-only. List summaries with forwarder_cli_devices_list.",
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getCliDevice),
   },
   {
@@ -533,6 +533,8 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     scope: "read",
     confirmation: null,
     classification: "pure",
+    descriptionNote:
+      "Read-only node telemetry for cliDeviceId: node.info, the freshest node.metrics (live or stored), endpoint.load, a node snapshot (kind, GPUs, live memory, labels, usable budgets, health warnings), last-hour minuteHistory min/avg/max gauges, and rule-addressable series. Labels and usable budgets are human-only dashboard writes; this tool never changes them. Health warnings are informational and never preflight gates.",
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getCliDeviceMetrics),
   },
   {
@@ -1621,6 +1623,16 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
     target: "forwarderManagement.setCliDeviceFeatureGrants",
     reason:
       "Human-only device grants including read-only file consent; requires the CLI read switch and configured roots reports.",
+  },
+  {
+    target: "forwarderManagement.setCliDeviceLabels",
+    reason:
+      "Human-only node placement labels. Agents read labels on forwarder_cli_devices_list, forwarder_cli_device_get, and forwarder_device_metrics_get.",
+  },
+  {
+    target: "forwarderManagement.setCliDeviceUsableBudgets",
+    reason:
+      "Human-only usable memory/RAM/VRAM budgets. Agents read the effective budgets on forwarder_cli_device_get and forwarder_device_metrics_get.",
   },
   {
     target: "forwarderManagement.listCliDevices",

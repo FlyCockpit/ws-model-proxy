@@ -26,7 +26,7 @@ LOCK TABLE "user", cli_device, endpoint, discovered_model, execution_target, mod
   provider_usage_ledger, provider_pricing_version, provider_budget_settlement,
   provider_audit_event, public_provider_attempt_event, relay_execution_attempt,
   relay_execution_event, usage_rollup_minute, usage_rollup_hour, engine_load_rollup_minute,
-  cache_affinity_record, cache_affinity_node, capacity_kv_eviction, session IN ACCESS EXCLUSIVE MODE NOWAIT;
+  node_metrics_minute, cache_affinity_record, cache_affinity_node, capacity_kv_eviction, session IN ACCESS EXCLUSIVE MODE NOWAIT;
 
 -- Deploy writer (class D): the backfills below rewrite graph rows while every
 -- table is locked exclusively, so no fence can be contended. The graph-write
@@ -258,6 +258,25 @@ ALTER TABLE engine_load_rollup_minute ADD CONSTRAINT engine_load_rollup_minute_s
   AND ("maxKvOccupancy" IS NULL OR ("maxKvOccupancy" >= 0 AND "maxKvOccupancy" <= 1))
   AND ("maxSlotsBusy" IS NULL OR "maxSlotsBusy" >= 0)
   AND "prefixCacheHits" >= 0 AND "prefixCacheQueries" >= 0
+);
+
+-- Class-H node-metrics minutes for CLI node-card sparklines (min/avg/max).
+ALTER TABLE node_metrics_minute DROP CONSTRAINT IF EXISTS node_metrics_minute_shape_check;
+ALTER TABLE node_metrics_minute ADD CONSTRAINT node_metrics_minute_shape_check CHECK (
+  length("ownerUserId") BETWEEN 1 AND 128
+  AND length("cliDeviceId") BETWEEN 1 AND 128
+  AND samples >= 0 AND "cpuSamples" >= 0 AND "memorySamples" >= 0
+  AND "cpuSamples" <= samples AND "memorySamples" <= samples
+  AND ("minCpuPercent" IS NULL OR ("minCpuPercent" >= 0 AND "minCpuPercent" <= 100))
+  AND ("maxCpuPercent" IS NULL OR ("maxCpuPercent" >= 0 AND "maxCpuPercent" <= 100))
+  AND ("sumCpuPercent" IS NULL OR "sumCpuPercent" >= 0)
+  AND ("minMemoryAvailableMiB" IS NULL OR "minMemoryAvailableMiB" >= 0)
+  AND ("maxMemoryAvailableMiB" IS NULL OR "maxMemoryAvailableMiB" >= 0)
+  AND ("sumMemoryAvailableMiB" IS NULL OR "sumMemoryAvailableMiB" >= 0)
+  AND ("minMemoryUsedPercent" IS NULL OR ("minMemoryUsedPercent" >= 0 AND "minMemoryUsedPercent" <= 100))
+  AND ("maxMemoryUsedPercent" IS NULL OR ("maxMemoryUsedPercent" >= 0 AND "maxMemoryUsedPercent" <= 100))
+  AND ("sumMemoryUsedPercent" IS NULL OR "sumMemoryUsedPercent" >= 0)
+  AND ("maxGpuUtilizationPercent" IS NULL OR ("maxGpuUtilizationPercent" >= 0 AND "maxGpuUtilizationPercent" <= 100))
 );
 
 -- Disposable class H feedback; no graph locks or foreign keys.
