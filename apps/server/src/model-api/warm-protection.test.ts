@@ -794,6 +794,11 @@ describe("S-C engine facts (token mode and the llama.cpp window)", () => {
     expect(await assess({ engineKind: "LLAMA_CPP", kvBudgetTokens: 100_000 })).toBe("PROTECTED");
   });
 
+  it("GENERIC with a declared K uses token mode", async () => {
+    expect(await assess({ engineKind: "GENERIC", kvBudgetTokens: 100_000 })).toBe("FREE");
+    expect(await assess({ engineKind: "GENERIC", kvBudgetTokens: null })).toBe("PROTECTED");
+  });
+
   it("llama.cpp protects sessions for a shorter window than other engines", async () => {
     // 200 s old: inside the 300 s pool window, outside llama.cpp's 150 s.
     expect(await assess({ engineKind: "LLAMA_CPP", kvBudgetTokens: null, ageSeconds: 200 })).toBe(

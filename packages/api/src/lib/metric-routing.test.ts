@@ -303,6 +303,7 @@ describe("series flattening", () => {
         running: 3,
         waiting: 2,
         kvUsage: 0.5,
+        kvOccupancy: 0.8,
         receivedAt: at(-1_000),
       },
       { endpointSlug: "b", modelSlug: null, running: 9, waiting: 9, receivedAt: at(-1_000) },
@@ -310,6 +311,7 @@ describe("series flattening", () => {
     const forModel = endpointLoadSeries(loads, { endpointSlug: "a", modelSlug: "m" }, NOW);
     expect(forModel.find((entry) => entry.name === "endpoint.running")?.value).toBe(3);
     expect(forModel.find((entry) => entry.name === "endpoint.kv_usage")?.value).toBe(0.5);
+    expect(forModel.find((entry) => entry.name === "endpoint.kv_occupancy")?.value).toBe(0.8);
     expect(forModel[0]?.staleAfterMs).toBe(ENDPOINT_LOAD_STALE_AFTER_MS);
     const endpointWide = endpointLoadSeries(loads, { endpointSlug: "a", modelSlug: "other" }, NOW);
     expect(endpointWide.find((entry) => entry.name === "endpoint.running")?.value).toBe(1);

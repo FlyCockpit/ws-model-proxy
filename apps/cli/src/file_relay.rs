@@ -67,6 +67,7 @@ pub fn is_read_op(op: &str) -> bool {
 
 /// A frame a settled op wants sent, in order.
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)] // 2.9 telemetry grew `ClientControlMessage`.
 pub enum FileFrame {
     Control(ClientControlMessage),
     Binary(RelayBinaryFrameMetadata, Vec<u8>),

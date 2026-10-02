@@ -22,13 +22,18 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::EndpointConfig;
-use crate::engine::{EngineKind, LoadReading};
+use crate::engine::LoadReading;
+use crate::engine_adapter::{
+    EngineAdapterStatus, LoadPlan, RemoteAdapterEligibility, remote_adapter_eligibility,
+    status_for_eligibility,
+};
 use crate::metric_sources::{Runner, RunnerSettings};
 use crate::protocol::{
-    ClientControlMessage, EndpointLoad, ExecutionMechanism, NODE_GPU_MAX, NODE_INTERFACE_MAX,
-    NODE_METRICS_SOURCES_MAX, NodeCpu, NodeCpuMetrics, NodeDiskMetrics, NodeGpuInfo,
-    NodeGpuMetrics, NodeInfo, NodeInterfaceInfo, NodeInterfaceMetrics, NodeKind, NodeMemoryMetrics,
-    NodeMetrics, NodeOs, RemoteMetricSource, encode_control,
+    ClientControlMessage, EndpointLoad, ExecutionMechanism, NODE_ENGINE_ADAPTERS_MAX, NODE_GPU_MAX,
+    NODE_INTERFACE_MAX, NODE_METRICS_SOURCES_MAX, NodeCpu, NodeCpuMetrics, NodeDiskMetrics,
+    NodeGpuInfo, NodeGpuMetrics, NodeInfo, NodeInterfaceInfo, NodeInterfaceMetrics, NodeKind,
+    NodeMemoryMetrics, NodeMetrics, NodeOs, RemoteEngineAdapter, RemoteMetricSource,
+    encode_control,
 };
 use crate::relay_bus::FromWorker;
 
@@ -65,6 +70,12 @@ struct Shared {
     endpoints_generation: u64,
     /// A `metrics.sources.set` list the thread has not applied yet.
     remote_sources: Option<Vec<RemoteMetricSource>>,
+    /// Applied remote engine adapters for this session.
+    remote_adapters: Vec<RemoteEngineAdapter>,
+    allow_remote_engine_adapters: bool,
+    approved_remote_adapters: BTreeMap<String, String>,
+    /// Latest adapter statuses, keyed by endpoint slug. No command text.
+    adapter_statuses: BTreeMap<String, EngineAdapterStatus>,
 }
 
 impl Telemetry {
@@ -73,10 +84,16 @@ impl Telemetry {
         tx: SyncSender<FromWorker>,
         endpoints: &[EndpointConfig],
         sources: RunnerSettings,
+        allow_remote_engine_adapters: bool,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
+        let approved_remote_adapters = crate::config::Config::load()
+            .map(|config| config.approved_remote_adapters)
+            .unwrap_or_default();
         let shared = Arc::new(Mutex::new(Shared {
             endpoints: endpoints.to_vec(),
+            allow_remote_engine_adapters,
+            approved_remote_adapters,
             ..Shared::default()
         }));
         let thread_stop = Arc::clone(&stop);
@@ -107,6 +124,18 @@ impl Telemetry {
     pub fn set_remote_sources(&self, sources: Vec<RemoteMetricSource>) {
         if let Ok(mut shared) = self.shared.lock() {
             shared.remote_sources = Some(bounded_remote_sources(&sources));
+        }
+    }
+
+    /// `engine.adapters.set`: replace the remote definitions. They run only
+    /// with the separate local opt-in and an approval of each canonical spec.
+    pub fn set_remote_adapters(&self, adapters: Vec<RemoteEngineAdapter>) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.remote_adapters = adapters
+                .into_iter()
+                .take(NODE_ENGINE_ADAPTERS_MAX)
+                .collect();
+            shared.endpoints_generation = shared.endpoints_generation.wrapping_add(1);
         }
     }
 }
@@ -177,8 +206,8 @@ fn run(
         .name("wsmp-load".to_string())
         .spawn(move || {
             let agent = crate::engine::http_agent(crate::engine::LOAD_TIMEOUT);
-            run_loads(&load_tx, &load_stop, &load_shared, move |endpoint, kind| {
-                crate::engine::sample_load(&agent, endpoint, kind)
+            run_loads(&load_tx, &load_stop, &load_shared, move |endpoint, plan| {
+                sample_plan(&agent, endpoint, plan)
             });
         });
     if let Err(error) = spawned {
@@ -206,7 +235,12 @@ fn run(
         let gap_ok = last_metrics.is_none_or(|at| now.duration_since(at) >= NODE_METRICS_MIN_GAP);
         if gap_ok && (now >= next_metrics || sources_changed) {
             sources_changed = false;
-            let metrics = collect_node_metrics(&mut cpu, &mut gpu, &runner);
+            let adapter_statuses = shared
+                .lock()
+                .ok()
+                .map(|shared| shared.adapter_statuses.values().cloned().collect())
+                .unwrap_or_default();
+            let metrics = collect_node_metrics(&mut cpu, &mut gpu, &runner, adapter_statuses);
             if offer(&tx, ClientControlMessage::NodeMetrics(metrics)) == Sent::Gone {
                 return;
             }
@@ -234,18 +268,142 @@ impl LoadState {
     }
 }
 
-/// Endpoints with a scrapeable engine, paired with their kind.
-pub fn load_targets(endpoints: &[EndpointConfig]) -> Vec<(EndpointConfig, EngineKind)> {
-    endpoints
-        .iter()
-        .filter(|endpoint| endpoint.enabled)
-        .filter_map(|endpoint| {
-            crate::engine::effective_kind(endpoint)
-                .map(|(kind, _)| kind)
-                .filter(|kind| kind.has_load_source())
-                .map(|kind| (endpoint.clone(), kind))
-        })
-        .collect()
+/// One scrape result: a load reading and, for adapters, a status row.
+pub struct LoadSample {
+    pub reading: Option<LoadReading>,
+    pub adapter_status: Option<EngineAdapterStatus>,
+}
+
+impl From<Option<LoadReading>> for LoadSample {
+    fn from(reading: Option<LoadReading>) -> Self {
+        Self {
+            reading,
+            adapter_status: None,
+        }
+    }
+}
+
+fn sample_plan(agent: &ureq::Agent, endpoint: &EndpointConfig, plan: &LoadPlan) -> LoadSample {
+    match plan {
+        LoadPlan::BuiltIn(kind) => crate::engine::sample_load(agent, endpoint, *kind).into(),
+        LoadPlan::Adapter(spec) => {
+            let result = crate::engine_adapter::sample(endpoint, spec, None);
+            let adapter_status = Some(crate::engine_adapter::status_for(
+                &endpoint.slug,
+                spec,
+                result.as_ref().map_err(|error| *error),
+            ));
+            LoadSample {
+                reading: result.ok().and_then(|sample| sample.reading),
+                adapter_status,
+            }
+        }
+    }
+}
+
+/// Endpoints with a scrapeable engine or a custom adapter.
+pub fn load_targets(endpoints: &[EndpointConfig]) -> Vec<(EndpointConfig, LoadPlan)> {
+    load_targets_with_remote(endpoints, &[], false, &BTreeMap::new()).0
+}
+
+pub fn load_targets_with_remote(
+    endpoints: &[EndpointConfig],
+    remote: &[RemoteEngineAdapter],
+    allow_remote: bool,
+    approved: &BTreeMap<String, String>,
+) -> (Vec<(EndpointConfig, LoadPlan)>, Vec<EngineAdapterStatus>) {
+    let mut targets = Vec::new();
+    let mut statuses = Vec::new();
+    let mut handled = std::collections::BTreeSet::new();
+    for endpoint in endpoints.iter().filter(|endpoint| endpoint.enabled) {
+        if let Some(spec) = endpoint.engine_adapter.clone() {
+            handled.insert(endpoint.slug.as_str());
+            if spec.validate().is_err() {
+                continue;
+            }
+            warn_adapter_replaces_builtin(endpoint);
+            targets.push((endpoint.clone(), LoadPlan::Adapter(spec)));
+            continue;
+        }
+        if let Some(adapter) = remote
+            .iter()
+            .find(|adapter| adapter.endpoint_slug == endpoint.slug)
+        {
+            handled.insert(adapter.endpoint_slug.as_str());
+            let spec = adapter.to_config();
+            let eligibility = remote_adapter_eligibility(
+                &spec,
+                &adapter.endpoint_slug,
+                allow_remote,
+                false,
+                approved.get(&adapter.endpoint_slug).map(String::as_str),
+            );
+            if eligibility == RemoteAdapterEligibility::Run {
+                warn_adapter_replaces_builtin(endpoint);
+                targets.push((endpoint.clone(), LoadPlan::Adapter(spec)));
+                continue;
+            }
+            statuses.push(status_for_eligibility(
+                &adapter.endpoint_slug,
+                &spec,
+                eligibility,
+            ));
+        }
+        if let Some(kind) = crate::engine::effective_kind(endpoint)
+            .map(|(kind, _)| kind)
+            .filter(|kind| kind.has_load_source())
+        {
+            targets.push((endpoint.clone(), LoadPlan::BuiltIn(kind)));
+        }
+    }
+    for adapter in remote {
+        if !handled.insert(adapter.endpoint_slug.as_str()) {
+            continue;
+        }
+        let spec = adapter.to_config();
+        let local = endpoints
+            .iter()
+            .find(|endpoint| endpoint.slug == adapter.endpoint_slug);
+        if local.is_some_and(|endpoint| endpoint.engine_adapter.is_some()) {
+            continue;
+        }
+        statuses.push(status_for_eligibility(
+            &adapter.endpoint_slug,
+            &spec,
+            if local.is_some_and(|endpoint| endpoint.enabled) {
+                remote_adapter_eligibility(
+                    &spec,
+                    &adapter.endpoint_slug,
+                    allow_remote,
+                    false,
+                    approved.get(&adapter.endpoint_slug).map(String::as_str),
+                )
+            } else {
+                RemoteAdapterEligibility::Refused
+            },
+        ));
+    }
+    (targets, statuses)
+}
+
+fn warn_adapter_replaces_builtin(endpoint: &EndpointConfig) {
+    use std::sync::Mutex;
+    static WARNED: Mutex<BTreeMap<String, ()>> = Mutex::new(BTreeMap::new());
+    let Some((kind, _)) = crate::engine::effective_kind(endpoint) else {
+        return;
+    };
+    if !kind.has_load_source() {
+        return;
+    }
+    if let Ok(mut warned) = WARNED.lock()
+        && warned.insert(endpoint.slug.clone(), ()).is_none()
+    {
+        tracing::warn!(
+            slug = %endpoint.slug,
+            engine = ?kind,
+            "engine adapter replaces the built-in load scrape for this endpoint"
+        );
+    }
 }
 
 /// One endpoint's place in the load scheduler.
@@ -253,10 +411,11 @@ struct LoadSchedule {
     /// Unique per schedule instance: a result is accepted only by the
     /// schedule that started it (not by a same-looking one re-added later).
     epoch: u64,
-    target: (EndpointConfig, EngineKind),
+    target: (EndpointConfig, LoadPlan),
     state: LoadState,
     next_due: Instant,
     in_flight: bool,
+    interval: Duration,
 }
 
 /// A finished scrape, reported by its worker.
@@ -264,8 +423,16 @@ struct LoadDone {
     slug: String,
     epoch: u64,
     reading: Option<LoadReading>,
+    adapter_status: Option<EngineAdapterStatus>,
     finished: Instant,
     ts: String,
+}
+
+fn plan_interval(plan: &LoadPlan) -> Duration {
+    match plan {
+        LoadPlan::BuiltIn(_) => LOAD_SAMPLE_INTERVAL,
+        LoadPlan::Adapter(spec) => Duration::from_secs(u64::from(spec.interval_secs)),
+    }
 }
 
 /// Per-endpoint load scheduling. Each endpoint is scraped every
@@ -279,14 +446,25 @@ struct LoadDone {
 /// removed) while it was in flight is discarded.
 fn run_loads<F>(tx: &SyncSender<FromWorker>, stop: &AtomicBool, shared: &Mutex<Shared>, sample: F)
 where
-    F: Fn(&EndpointConfig, EngineKind) -> Option<LoadReading> + Clone + Send + 'static,
+    F: Fn(&EndpointConfig, &LoadPlan) -> LoadSample + Clone + Send + 'static,
 {
     let (done_tx, done_rx) = mpsc::channel::<LoadDone>();
     let mut schedules = BTreeMap::<String, LoadSchedule>::new();
     let mut seen_generation = None;
     let mut in_flight = 0_usize;
     let mut next_epoch = 0_u64;
+    let mut next_approval_check = Instant::now();
     while !stop.load(Ordering::SeqCst) {
+        if Instant::now() >= next_approval_check {
+            next_approval_check = Instant::now() + Duration::from_secs(3);
+            if let Ok(config) = crate::config::Config::load()
+                && let Ok(mut shared) = shared.lock()
+                && shared.approved_remote_adapters != config.approved_remote_adapters
+            {
+                shared.approved_remote_adapters = config.approved_remote_adapters.clone();
+                shared.endpoints_generation = shared.endpoints_generation.wrapping_add(1);
+            }
+        }
         let (generation, endpoints) = match shared.lock() {
             Ok(shared) if seen_generation != Some(shared.endpoints_generation) => {
                 (shared.endpoints_generation, Some(shared.endpoints.clone()))
@@ -296,8 +474,36 @@ where
         };
         if let Some(endpoints) = endpoints {
             seen_generation = Some(generation);
-            let targets = load_targets(&endpoints);
+            let (allow_remote, remote, approved) = match shared.lock() {
+                Ok(shared) => (
+                    shared.allow_remote_engine_adapters,
+                    shared.remote_adapters.clone(),
+                    shared.approved_remote_adapters.clone(),
+                ),
+                Err(_) => return,
+            };
+            let (targets, remote_statuses) =
+                load_targets_with_remote(&endpoints, &remote, allow_remote, &approved);
             schedules.retain(|slug, _| targets.iter().any(|(endpoint, _)| endpoint.slug == *slug));
+            if let Ok(mut shared) = shared.lock() {
+                let live: std::collections::BTreeSet<_> = targets
+                    .iter()
+                    .map(|(endpoint, _)| endpoint.slug.clone())
+                    .chain(
+                        remote_statuses
+                            .iter()
+                            .map(|status| status.endpoint_slug.clone()),
+                    )
+                    .collect();
+                shared
+                    .adapter_statuses
+                    .retain(|slug, _| live.contains(slug));
+                for status in remote_statuses {
+                    shared
+                        .adapter_statuses
+                        .insert(status.endpoint_slug.clone(), status);
+                }
+            }
             for target in targets {
                 let slug = target.0.slug.clone();
                 let replace = schedules
@@ -305,6 +511,7 @@ where
                     .is_none_or(|schedule| schedule.target != target);
                 if replace {
                     next_epoch += 1;
+                    let interval = plan_interval(&target.1);
                     schedules.insert(
                         slug,
                         LoadSchedule {
@@ -313,6 +520,7 @@ where
                             state: LoadState::default(),
                             next_due: Instant::now(),
                             in_flight: false,
+                            interval,
                         },
                     );
                 }
@@ -340,11 +548,12 @@ where
             let spawned = thread::Builder::new()
                 .name("wsmp-load-scrape".to_string())
                 .spawn(move || {
-                    let reading = sample(&target.0, target.1);
+                    let result = sample(&target.0, &target.1);
                     let _ = done_tx.send(LoadDone {
                         slug,
                         epoch,
-                        reading,
+                        reading: result.reading,
+                        adapter_status: result.adapter_status,
                         finished: Instant::now(),
                         ts: now_rfc3339(),
                     });
@@ -353,7 +562,7 @@ where
                 schedule.in_flight = true;
                 in_flight += 1;
             } else {
-                schedule.next_due = now + LOAD_SAMPLE_INTERVAL;
+                schedule.next_due = now + schedule.interval;
             }
         }
 
@@ -374,7 +583,12 @@ where
                 continue;
             }
             schedule.in_flight = false;
-            schedule.next_due = done.finished + LOAD_SAMPLE_INTERVAL;
+            schedule.next_due = done.finished + schedule.interval;
+            if let Some(status) = done.adapter_status
+                && let Ok(mut shared) = shared.lock()
+            {
+                shared.adapter_statuses.insert(done.slug.clone(), status);
+            }
             let Some(reading) = done.reading else {
                 continue;
             };
@@ -438,6 +652,7 @@ fn next_load_frame(
         running: reading.running,
         waiting: reading.waiting,
         kv_usage: reading.kv_usage,
+        kv_occupancy: reading.kv_occupancy,
         slots_busy: reading.slots_busy,
         deferred: reading.deferred,
         prefix_cache_hits_delta: hits_delta,
@@ -447,16 +662,21 @@ fn next_load_frame(
     })
 }
 
+fn close_fraction(left: Option<f64>, right: Option<f64>) -> bool {
+    match (left, right) {
+        (Some(a), Some(b)) => (a - b).abs() < 0.01,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 fn same_load(left: &LoadReading, right: &LoadReading) -> bool {
     left.running == right.running
         && left.waiting == right.waiting
         && left.slots_busy == right.slots_busy
         && left.deferred == right.deferred
-        && match (left.kv_usage, right.kv_usage) {
-            (Some(a), Some(b)) => (a - b).abs() < 0.01,
-            (None, None) => true,
-            _ => false,
-        }
+        && close_fraction(left.kv_usage, right.kv_usage)
+        && close_fraction(left.kv_occupancy, right.kv_occupancy)
 }
 
 /// Cap a remotely defined source list at the server's schema bound. Invalid
@@ -881,7 +1101,12 @@ fn root_disk() -> Option<NodeDiskMetrics> {
     None
 }
 
-fn collect_node_metrics(cpu: &mut CpuSampler, gpu: &mut GpuQuery, sources: &Runner) -> NodeMetrics {
+fn collect_node_metrics(
+    cpu: &mut CpuSampler,
+    gpu: &mut GpuQuery,
+    sources: &Runner,
+    mut engine_adapters: Vec<EngineAdapterStatus>,
+) -> NodeMetrics {
     let (custom, sources) = sources.report(Instant::now());
     let load = read_text("/proc/loadavg").and_then(|text| parse_loadavg(&text));
     let memory = read_text("/proc/meminfo").map(|text| parse_meminfo(&text));
@@ -926,13 +1151,17 @@ fn collect_node_metrics(cpu: &mut CpuSampler, gpu: &mut GpuQuery, sources: &Runn
         interfaces,
         custom,
         sources,
+        engine_adapters: {
+            engine_adapters.truncate(NODE_ENGINE_ADAPTERS_MAX);
+            engine_adapters
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::LoadSource;
+    use crate::engine::{EngineKind, LoadSource};
     use crate::protocol::MetricSourceFormat;
 
     #[test]
@@ -1000,7 +1229,7 @@ mod tests {
     fn reading(running: u64, hits: Option<f64>) -> LoadReading {
         LoadReading {
             running,
-            waiting: 0,
+            waiting: Some(0),
             prefix_cache_hits_total: hits,
             source: LoadSource::VllmMetrics,
             ..LoadReading::default()
@@ -1135,6 +1364,7 @@ mod tests {
                     source: LoadSource::VllmMetrics,
                     ..LoadReading::default()
                 })
+                .into()
             });
         });
         let mut fast_at = None;
@@ -1184,7 +1414,7 @@ mod tests {
                 worker_peak.fetch_max(now, Ordering::SeqCst);
                 thread::sleep(Duration::from_millis(300));
                 worker_live.fetch_sub(1, Ordering::SeqCst);
-                None
+                None.into()
             });
         });
         thread::sleep(Duration::from_millis(1_000));
@@ -1222,6 +1452,7 @@ mod tests {
                     source: LoadSource::VllmMetrics,
                     ..LoadReading::default()
                 })
+                .into()
             });
         });
         thread::sleep(Duration::from_millis(150));
@@ -1273,7 +1504,7 @@ mod tests {
     fn run_scheduler_for(
         endpoints: Vec<EndpointConfig>,
         tx: SyncSender<FromWorker>,
-        sample: impl Fn(&EndpointConfig, EngineKind) -> Option<LoadReading> + Clone + Send + 'static,
+        sample: impl Fn(&EndpointConfig, &LoadPlan) -> LoadSample + Clone + Send + 'static,
     ) -> (Arc<AtomicBool>, Arc<Mutex<Shared>>, thread::JoinHandle<()>) {
         let shared = Arc::new(Mutex::new(Shared {
             endpoints,
@@ -1297,7 +1528,7 @@ mod tests {
             run_scheduler_for(vec![load_endpoint("vllm")], tx, move |_, _| {
                 let call = sampler_calls.fetch_add(1, Ordering::SeqCst);
                 let hits = [100.0, 150.0, 170.0][call.min(2)];
-                Some(reading(1, Some(hits)))
+                Some(reading(1, Some(hits))).into()
             });
         let text = |message: FromWorker| match message {
             FromWorker::Telemetry(text) => text,
@@ -1337,9 +1568,9 @@ mod tests {
             run_scheduler_for(vec![load_endpoint("vllm")], tx, move |_, _| {
                 if sampler_calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     thread::sleep(Duration::from_millis(700));
-                    return Some(reading(7, None));
+                    return Some(reading(7, None)).into();
                 }
-                Some(reading(1, None))
+                Some(reading(1, None)).into()
             });
         let set = |endpoints: Vec<EndpointConfig>| {
             let mut shared = shared.lock().expect("shared");
@@ -1419,20 +1650,114 @@ mod tests {
                 kind: Some(EngineKind::LlamaCpp),
                 ..crate::engine::DetectedEngine::default()
             }),
+            adapter: None,
         });
-        let targets = load_targets(&[vllm.clone(), auto, ollama, detected]);
+        let mut adapter = EndpointConfig {
+            slug: "adapter".to_string(),
+            engine: crate::config::EndpointEngine::Generic,
+            engine_adapter: Some(crate::engine_adapter::EngineAdapterConfig {
+                input: crate::engine_adapter::AdapterInput::Route {
+                    route: "stats".to_string(),
+                },
+                format: crate::engine_adapter::AdapterFormat::Json,
+                interval_secs: 2,
+                timeout_secs: 2,
+                map: Default::default(),
+            }),
+            ..EndpointConfig::default()
+        };
+        let targets = load_targets(&[vllm.clone(), auto, ollama, detected, adapter.clone()]);
         let slugs = targets
             .iter()
-            .map(|(endpoint, kind)| (endpoint.slug.as_str(), *kind))
+            .map(|(endpoint, plan)| {
+                (
+                    endpoint.slug.as_str(),
+                    matches!(plan, LoadPlan::BuiltIn(EngineKind::Vllm)),
+                    matches!(plan, LoadPlan::BuiltIn(EngineKind::LlamaCpp)),
+                    matches!(plan, LoadPlan::Adapter(_)),
+                )
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             slugs,
             [
-                ("vllm", EngineKind::Vllm),
-                ("detected", EngineKind::LlamaCpp)
+                ("vllm", true, false, false),
+                ("detected", false, true, false),
+                ("adapter", false, false, true),
             ]
         );
         vllm.enabled = false;
         assert!(load_targets(&[vllm]).is_empty());
+        adapter.enabled = false;
+        assert!(load_targets(&[adapter]).is_empty());
+    }
+
+    fn remote_json_adapter(slug: &str, command: &str) -> RemoteEngineAdapter {
+        RemoteEngineAdapter {
+            endpoint_slug: slug.to_string(),
+            input: crate::engine_adapter::AdapterInput::Command {
+                command: command.to_string(),
+            },
+            format: crate::engine_adapter::AdapterFormat::Json,
+            interval_secs: 2,
+            timeout_secs: 2,
+            map: Default::default(),
+        }
+    }
+
+    #[test]
+    fn remote_adapter_runs_only_with_opt_in_and_matching_hash() {
+        let endpoint = EndpointConfig {
+            slug: "gpu".to_string(),
+            engine: crate::config::EndpointEngine::Vllm,
+            ..EndpointConfig::default()
+        };
+        let remote = remote_json_adapter("gpu", "echo 1");
+        let spec = remote.to_config();
+        let hash = crate::engine_adapter::spec_sha256("gpu", &spec);
+        let mut approved = BTreeMap::new();
+        approved.insert("gpu".to_string(), hash.clone());
+        let endpoints = [endpoint];
+        let remotes = [remote];
+
+        let (targets, statuses) = load_targets_with_remote(&endpoints, &remotes, false, &approved);
+        assert!(
+            matches!(targets[0].1, LoadPlan::BuiltIn(EngineKind::Vllm)),
+            "metric-source opt-in is a different flag; without adapter opt-in the built-in scrape stays"
+        );
+        assert_eq!(
+            statuses[0].state,
+            crate::engine_adapter::AdapterState::Refused
+        );
+
+        let (targets, statuses) =
+            load_targets_with_remote(&endpoints, &remotes, true, &BTreeMap::new());
+        assert!(matches!(targets[0].1, LoadPlan::BuiltIn(EngineKind::Vllm)));
+        assert_eq!(
+            statuses[0].state,
+            crate::engine_adapter::AdapterState::PendingApproval
+        );
+
+        let mut wrong = BTreeMap::new();
+        wrong.insert("gpu".to_string(), "ab".repeat(32));
+        let (targets, statuses) = load_targets_with_remote(&endpoints, &remotes, true, &wrong);
+        assert!(matches!(targets[0].1, LoadPlan::BuiltIn(EngineKind::Vllm)));
+        assert_eq!(
+            statuses[0].state,
+            crate::engine_adapter::AdapterState::PendingApproval
+        );
+
+        let (targets, statuses) = load_targets_with_remote(&endpoints, &remotes, true, &approved);
+        assert!(matches!(targets[0].1, LoadPlan::Adapter(_)));
+        assert!(statuses.is_empty());
+
+        let mut local = endpoints[0].clone();
+        local.engine_adapter = Some(spec);
+        let (targets, statuses) = load_targets_with_remote(&[local], &remotes, true, &approved);
+        assert!(matches!(targets[0].1, LoadPlan::Adapter(_)));
+        assert!(
+            statuses.is_empty(),
+            "a local adapter shadows the remote definition"
+        );
     }
 }

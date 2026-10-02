@@ -740,6 +740,17 @@ export async function drainParentDeletionHistory(
               FOR UPDATE SKIP LOCKED)`,
       ),
     );
+    await drainLoop(report, "engine_load_rollup_minute.delete", budget, size, () =>
+      inBatch(
+        (tx) => tx.$executeRaw`
+        DELETE FROM engine_load_rollup_minute
+         WHERE ctid IN (
+           SELECT ctid FROM engine_load_rollup_minute
+            WHERE "ownerUserId" = ${userId}
+            LIMIT ${size.limit}
+              FOR UPDATE SKIP LOCKED)`,
+      ),
+    );
     // The merge into other owners' sentinel rows can wait on a destination
     // row (a finalizer or compaction holds it); the batch's lock_timeout
     // bounds that wait and the drain reports pending.

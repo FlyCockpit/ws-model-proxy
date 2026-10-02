@@ -160,6 +160,7 @@ pub(crate) use supervised_pty::{
     SUPERVISED_ENV_SHARE, supervised_marker,
 };
 
+#[allow(clippy::large_enum_variant)] // 2.9 telemetry grew `ClientControlMessage`.
 pub(crate) enum OutboundFrame {
     Control(ClientControlMessage),
     Binary(RelayBinaryFrameMetadata, Vec<u8>),

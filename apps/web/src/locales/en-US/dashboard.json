@@ -181,6 +181,35 @@
       "remoteNotAllowed": "Remote sources are sent to the CLI only while its MCP command mode is unsupervised.",
       "valuesTitle": "Latest values",
       "stale": "stale"
+    },
+    "engineAdapters": {
+      "title": "Engine adapters",
+      "loadFailed": "Could not load this device's engine adapters.",
+      "empty": "No engine adapters.",
+      "hint": "Configure with `wsmp endpoints adapter`. Status never includes command text or raw output.",
+      "inputs": {
+        "route": "Route",
+        "command": "Command"
+      },
+      "states": {
+        "active": "Active",
+        "failing": "Failing",
+        "disabled": "Disabled",
+        "pending_approval": "Pending approval",
+        "refused": "Refused"
+      },
+      "pendingHint": "Review the spec with `wsmp endpoints adapter show {{slug}}` on the machine and approve it with `wsmp endpoints adapter approve {{slug}} --sha256 <hash>`, using the hash shown there.",
+      "refusedHint": "The CLI refuses remote adapters unless `allowRemoteEngineAdapters` is on locally. Metric-source opt-in does not allow adapters.",
+      "errors": {
+        "spawn": "could not start",
+        "timeout": "timed out",
+        "exit_status": "exited with an error",
+        "output_too_large": "output too large",
+        "parse": "could not parse",
+        "http": "HTTP error",
+        "out_of_range": "value out of range",
+        "unmapped": "unmapped metric"
+      }
     }
   },
   "chatTest": {
@@ -656,6 +685,11 @@
           "PROBE": "detected by the CLI",
           "CONFIG": "from the CLI config",
           "MIXED": "detected and configured"
+        },
+        "factSources": {
+          "PROBE": "detected",
+          "CONFIG": "declared in CLI config",
+          "CUSTOM": "custom adapter"
         }
       }
     },
@@ -1044,13 +1078,31 @@
       "kvBudgetLowered": "KV budget lowered",
       "kvBudgetEvictions": "KV budget lowered to {{effective}} of {{reported}} tokens (cache evictions seen)",
       "use": "Use engine load",
+      "enforceCustom": "Enforce custom FULL",
+      "observeOnly": "would be FULL (observe only)",
       "saved": "Engine load setting saved",
       "saveFailed": "Could not save the engine load setting.",
+      "loadFailed": "Couldn't load engine-load history.",
+      "sparklineCaption": "Engine load over the last 30 minutes: running and waiting requests, KV usage, occupancy, and the FULL threshold.",
+      "legendRunning": "Running",
+      "legendWaiting": "Waiting",
+      "legendKv": "KV usage",
+      "legendOccupancy": "KV occupancy",
+      "legendThreshold": "FULL threshold",
+      "provenance": {
+        "custom": "Custom adapter",
+        "builtinLlamaSlots": "Built-in · llama.cpp slots",
+        "builtinLlamaMetrics": "Built-in · llama.cpp /metrics",
+        "builtinSglang": "Built-in · SGLang /metrics",
+        "builtinVllm": "Built-in · vLLM /metrics"
+      },
       "badges": {
         "off": "Engine load ignored",
         "noSignal": "No engine signal",
         "stale": "Load stale",
-        "clear": "Engine has room"
+        "clear": "Engine has room",
+        "custom": "Custom",
+        "noReading": "No reading"
       },
       "states": {
         "full_waiting": "Engine FULL: requests waiting",
@@ -1066,6 +1118,26 @@
       "slots": "{{busy}}/{{total}} slots",
       "prefixHit": "prefix hits {{value}}",
       "noReading": "No reading from the engine yet."
+    },
+    "cacheStats": {
+      "title": "Prompt-cache hit rate",
+      "description": "Token-weighted hit rate over requests whose engine reported cache usage. Continuation hit rate excludes first turns, so it is the stability figure to compare before and after a change.",
+      "chartLabel": "Prompt-cache hit rate over the selected window",
+      "empty": "No cache usage reported in this window.",
+      "noTraffic": "No traffic in this window.",
+      "lowCoverage": "Hit rate rests on few requests ({{coverage}} coverage).",
+      "loadFailed": "Couldn't load cache hit-rate stats.",
+      "hitRate": "Hit rate",
+      "continuationHitRate": "Continuation hit rate",
+      "coverage": "Coverage",
+      "notReported": "Not reported",
+      "stability": "Median {{median}} · p10 {{p10}} · σ {{stddev}}",
+      "rangeLabel": "Window",
+      "ranges": {
+        "1h": "1h",
+        "24h": "24h",
+        "7d": "7d"
+      }
     }
   },
   "relay": {
@@ -1539,6 +1611,12 @@
       "other": "Other members",
       "unrouted": "Not routed",
       "removedMember": "Removed member",
+      "engineLoadCaption": "Engine load for {{name}} over the selected window: running and waiting requests, KV usage, occupancy, and the FULL threshold.",
+      "legendRunning": "Running",
+      "legendWaiting": "Waiting",
+      "legendKv": "KV usage",
+      "legendOccupancy": "KV occupancy",
+      "legendThreshold": "FULL threshold",
       "columns": {
         "member": "Member",
         "share": "Share",

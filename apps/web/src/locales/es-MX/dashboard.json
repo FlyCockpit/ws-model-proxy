@@ -330,6 +330,35 @@
       "remoteNotAllowed": "Las fuentes remotas se envían a la CLI solo mientras su modo de comandos MCP es sin supervisión.",
       "valuesTitle": "Valores más recientes",
       "stale": "obsoleto"
+    },
+    "engineAdapters": {
+      "title": "Adaptadores de motor",
+      "loadFailed": "No se pudieron cargar los adaptadores de motor de este dispositivo.",
+      "empty": "Sin adaptadores de motor.",
+      "hint": "Configúralos con `wsmp endpoints adapter`. El estado nunca incluye el texto del comando ni la salida en bruto.",
+      "inputs": {
+        "route": "Ruta",
+        "command": "Comando"
+      },
+      "states": {
+        "active": "Activo",
+        "failing": "Con fallas",
+        "disabled": "Desactivado",
+        "pending_approval": "Pendiente de aprobación",
+        "refused": "Rechazado"
+      },
+      "pendingHint": "Revisa la especificación con `wsmp endpoints adapter show {{slug}}` en la máquina y apruébala con `wsmp endpoints adapter approve {{slug}} --sha256 <hash>`, usando el hash que aparece ahí.",
+      "refusedHint": "La CLI rechaza adaptadores remotos salvo que `allowRemoteEngineAdapters` esté activado localmente. El opt-in de fuentes de métricas no permite adaptadores.",
+      "errors": {
+        "spawn": "no se pudo iniciar",
+        "timeout": "tiempo agotado",
+        "exit_status": "terminó con error",
+        "output_too_large": "salida demasiado grande",
+        "parse": "no se pudo interpretar",
+        "http": "error HTTP",
+        "out_of_range": "valor fuera de rango",
+        "unmapped": "métrica sin mapear"
+      }
     }
   },
   "deploymentFeatures": {
@@ -656,6 +685,11 @@
           "PROBE": "detectado por la CLI",
           "CONFIG": "desde la configuración de la CLI",
           "MIXED": "detectado y configurado"
+        },
+        "factSources": {
+          "PROBE": "detectado",
+          "CONFIG": "declarado en la configuración de la CLI",
+          "CUSTOM": "adaptador personalizado"
         }
       }
     },
@@ -1044,13 +1078,31 @@
       "kvBudgetLowered": "Presupuesto KV reducido",
       "kvBudgetEvictions": "Presupuesto KV reducido a {{effective}} de {{reported}} tokens (se detectaron expulsiones de caché)",
       "use": "Usar carga del motor",
+      "enforceCustom": "Aplicar FULL personalizado",
+      "observeOnly": "estaría LLENO (solo observación)",
       "saved": "Configuración de carga del motor guardada",
       "saveFailed": "No se pudo guardar la configuración de carga del motor.",
+      "loadFailed": "No se pudo cargar el historial de carga del motor.",
+      "sparklineCaption": "Carga del motor en los últimos 30 minutos: solicitudes en ejecución y en espera, uso de KV, ocupación y el umbral FULL.",
+      "legendRunning": "En ejecución",
+      "legendWaiting": "En espera",
+      "legendKv": "Uso de KV",
+      "legendOccupancy": "Ocupación de KV",
+      "legendThreshold": "Umbral FULL",
+      "provenance": {
+        "custom": "Adaptador personalizado",
+        "builtinLlamaSlots": "Integrado · slots de llama.cpp",
+        "builtinLlamaMetrics": "Integrado · llama.cpp /metrics",
+        "builtinSglang": "Integrado · SGLang /metrics",
+        "builtinVllm": "Integrado · vLLM /metrics"
+      },
       "badges": {
         "off": "Carga del motor ignorada",
         "noSignal": "Sin señal del motor",
         "stale": "Carga vencida",
-        "clear": "El motor tiene espacio"
+        "clear": "El motor tiene espacio",
+        "custom": "Personalizado",
+        "noReading": "Sin lectura"
       },
       "states": {
         "full_waiting": "Motor LLENO: solicitudes en espera",
@@ -1066,6 +1118,26 @@
       "slots": "{{busy}}/{{total}} slots",
       "prefixHit": "aciertos de prefijo {{value}}",
       "noReading": "Aún no hay lectura del motor."
+    },
+    "cacheStats": {
+      "title": "Tasa de aciertos de caché de prompts",
+      "description": "Tasa ponderada por tokens sobre las solicitudes cuyo motor reportó uso de caché. La tasa de continuación excluye los primeros turnos, así que es la cifra de estabilidad para comparar antes y después de un cambio.",
+      "chartLabel": "Tasa de aciertos de caché de prompts en la ventana seleccionada",
+      "empty": "No se reportó uso de caché en esta ventana.",
+      "noTraffic": "No hay tráfico en esta ventana.",
+      "lowCoverage": "La tasa de aciertos se basa en pocas solicitudes (cobertura {{coverage}}).",
+      "loadFailed": "No se pudieron cargar las estadísticas de aciertos de caché.",
+      "hitRate": "Tasa de aciertos",
+      "continuationHitRate": "Tasa de aciertos en continuaciones",
+      "coverage": "Cobertura",
+      "notReported": "No reportado",
+      "stability": "Mediana {{median}} · p10 {{p10}} · σ {{stddev}}",
+      "rangeLabel": "Ventana",
+      "ranges": {
+        "1h": "1h",
+        "24h": "24h",
+        "7d": "7d"
+      }
     }
   },
   "providers": {
@@ -1539,6 +1611,12 @@
       "other": "Otros miembros",
       "unrouted": "Sin enrutar",
       "removedMember": "Miembro eliminado",
+      "engineLoadCaption": "Carga del motor de {{name}} en el intervalo seleccionado: solicitudes en ejecución y en espera, uso de KV, ocupación y el umbral FULL.",
+      "legendRunning": "En ejecución",
+      "legendWaiting": "En espera",
+      "legendKv": "Uso de KV",
+      "legendOccupancy": "Ocupación de KV",
+      "legendThreshold": "Umbral FULL",
       "columns": {
         "member": "Miembro",
         "share": "Porcentaje",

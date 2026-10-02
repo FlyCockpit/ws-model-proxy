@@ -520,12 +520,22 @@ const READ_TOOLS: readonly McpToolSpec[] = [
   {
     name: "forwarder_pool_routing_rules_get",
     descriptionNote:
-      "Read pool rules, member live engine load, and engineLoad.kvBudget (reported/effective tokens, eviction cut, floor, observation/expiry times and active state).",
+      "Read pool rules, member live engine load, and engineLoad.kvBudget (reported/effective tokens, eviction cut, floor, observation/expiry times and active state). engineLoad also reports customMode (observe/enforce), loadSource, signals, enforced, and live.kvOccupancy (display only; never FULL or eviction evidence). Custom FULL starts observe-only.",
     target: "forwarderManagement.getPoolRoutingRules",
     scope: "read",
     confirmation: null,
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getPoolRoutingRules),
+  },
+  {
+    name: "forwarder_engine_load_history_get",
+    descriptionNote:
+      "30-minute live engine-load history (10 s buckets) for a pool or capacity the caller owns. Returns per-member series (max running/waiting/kvUsage/kvOccupancy/slotsBusy, summed prefix deltas, source, gap markers), signals, the effective KV FULL threshold, and reported K. kvOccupancy is display only. A foreign pool or capacity returns NOT_FOUND.",
+    target: "forwarderManagement.getEngineLoadHistory",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getEngineLoadHistory),
   },
   {
     name: "forwarder_model_pools_list",
@@ -552,6 +562,16 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.cacheAffinityStats),
+  },
+  {
+    name: "forwarder_pool_cache_stats_get",
+    target: "forwarderManagement.poolCacheStats",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    descriptionNote:
+      "Prompt-cache hit rate for a pool (or one member) over lastMinutes or lastDays. hitRate is cacheReadTokens/cacheKnownInputTokens capped at 1, or null when nothing reported cache usage. continuationHitRate is the same ratio for matched-affinity requests (null for windows that predate those columns). coverage is cacheKnownRequests/requests. Compare continuationHitRate for equal windows before and after a change, and check coverage first. Owners see every requester on their pools; grantees see only their own. A foreign pool or member returns NOT_FOUND.",
+    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.poolCacheStats),
   },
   {
     name: "forwarder_models_visible_list",
@@ -860,7 +880,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     // Engine-load FULL can send `:external` callers to paid external providers.
     classification: "cost",
     descriptionNote:
-      "{poolMemberId, mode: 'auto'|'off', kvFullThreshold?: 0-1 or null}. 'off' ignores the engine's live load (endpoint.load) for that member; lease counts still apply. Read the live load with forwarder_pool_routing_rules_get.",
+      "{poolMemberId, mode: 'auto'|'off', customMode?: 'observe'|'enforce', kvFullThreshold?: 0-1 or null}. 'off' ignores the engine's live load (endpoint.load) for that member; lease counts still apply. customMode observe reports would-be FULL without gating admission; enforce lets custom FULL gate. Custom FULL starts observe-only. Read the live load with forwarder_pool_routing_rules_get.",
     invokeProcedure: procedureInvoker(
       (client) => client.forwarderManagement.setPoolMemberEngineLoad,
     ),
@@ -876,6 +896,30 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
       "Only for devices whose MCP command mode is unsupervised, and only for a personal token minted with the CLI commands option (like forwarder_cli_command_run). The CLI runs a source only with its local opt-in and after the person approves the exact command (wsmp metrics approve <name> --sha256 <hash>); a changed command needs approval again.",
     invokeProcedure: procedureInvoker(
       (client) => client.forwarderManagement.setCliDeviceMetricSources,
+    ),
+  },
+  {
+    name: "forwarder_device_engine_adapters_set",
+    target: "forwarderManagement.setCliDeviceEngineAdapters",
+    scope: "write",
+    confirmation: "RUN",
+    classification: "external",
+    descriptionNote:
+      "Only for devices whose MCP command mode is unsupervised, and only for a personal token minted with the CLI commands option. Replaces the device's remote engine adapters. The CLI runs one only with its separate local opt-in (allowRemoteEngineAdapters; metric-source opt-in is not enough) and after the person approves the canonical spec (wsmp endpoints adapter approve <slug> --sha256 <hash>); a changed spec needs approval again. Custom FULL starts observe-only.",
+    invokeProcedure: procedureInvoker(
+      (client) => client.forwarderManagement.setCliDeviceEngineAdapters,
+    ),
+  },
+  {
+    name: "forwarder_device_engine_adapters_clear",
+    target: "forwarderManagement.clearCliDeviceEngineAdapters",
+    scope: "write",
+    confirmation: "RUN",
+    classification: "external",
+    descriptionNote:
+      "Clears remotely defined engine adapters for an unsupervised device. Same credential and mode gate as forwarder_device_engine_adapters_set.",
+    invokeProcedure: procedureInvoker(
+      (client) => client.forwarderManagement.clearCliDeviceEngineAdapters,
     ),
   },
   {
@@ -1342,8 +1386,8 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
 ];
 
 /**
- * The checked catalog: exactly 33 read tools and 60 write tools
- * (79 procedure-backed + 14 extracted cores: 2 diagnostics, 3 CLI commands
+ * The checked catalog: exactly 35 read tools and 60 write tools
+ * (81 procedure-backed + 14 extracted cores: 2 diagnostics, 3 CLI commands
  * and 9 node file tools (4 read, 5 write)).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS].map(

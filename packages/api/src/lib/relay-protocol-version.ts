@@ -6,10 +6,11 @@
  * `endpoint.load` and `metrics.sources.set`. 2.8 adds the MCP node file tools
  * (#103): the `file.*` frames, `capabilities.fileOps`, the file feature flags
  * and the supervised-file `term.spawn` variant. It is also the minimum: an
- * older CLI is refused at hello. Model deployments take 2.9 (owner decision on
- * #70).
+ * older CLI is refused at hello. 2.9 adds custom engine adapter fields
+ * (`engineFacts.loadAdapter`, `endpoint.load` source `custom` and
+ * `kvOccupancy`, `node.metrics.engineAdapters`).
  */
-export const RELAY_PROTOCOL_VERSIONS = ["2.8"] as const;
+export const RELAY_PROTOCOL_VERSIONS = ["2.8", "2.9"] as const;
 export type RelayProtocolVersion = (typeof RELAY_PROTOCOL_VERSIONS)[number];
 export const RELAY_MIN_PROTOCOL_VERSION: RelayProtocolVersion = "2.8";
 

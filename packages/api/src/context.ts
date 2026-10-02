@@ -45,13 +45,14 @@ export type LiveEndpointLoad = {
   endpointSlug: string;
   modelSlug: string | null;
   running: number;
-  waiting: number;
+  waiting?: number;
   kvUsage?: number;
+  kvOccupancy?: number;
   slotsBusy?: number;
   deferred?: number;
   prefixCacheHitsDelta?: number;
   prefixCacheQueriesDelta?: number;
-  source: "llama.cpp-slots" | "llama.cpp-metrics" | "vllm-metrics" | "sglang-metrics";
+  source: "llama.cpp-slots" | "llama.cpp-metrics" | "vllm-metrics" | "sglang-metrics" | "custom";
   /** Consecutive accepted frames with `waiting > 0`; a gap or `waiting == 0` resets it. */
   waitingStreak: number;
   /** Prefix cache deltas summed over this session's frames (for the dashboard). */
@@ -93,6 +94,11 @@ export type ContextServices = {
    */
   onRemoteMetricSourcesChanged?: (cliDeviceId: string) => boolean | Promise<boolean>;
   /**
+   * Push a device's remote engine adapters to its live relay session. Resolves
+   * true when a session in this process received them.
+   */
+  onRemoteEngineAdaptersChanged?: (cliDeviceId: string) => boolean | Promise<boolean>;
+  /**
    * A pool's metric routing rules or one of its members' engine-load override
    * were replaced (committed). The relay clears
    * the pool's stored verdicts: they are hot-path (H) rows, which a management
@@ -131,6 +137,31 @@ export type ContextServices = {
   getLiveNodeTelemetry?: (
     cliDeviceIds: readonly string[],
   ) => ReadonlyMap<string, LiveNodeTelemetrySnapshot>;
+  /** 30-minute in-memory engine-load history (10 s buckets). Survives reconnect. */
+  getLiveEngineLoadHistory?: (
+    keys: readonly {
+      cliDeviceId: string;
+      endpointSlug: string;
+      modelSlug: string | null;
+    }[],
+    now?: Date,
+  ) => Array<{
+    cliDeviceId: string;
+    endpointSlug: string;
+    modelSlug: string | null;
+    series: Array<{
+      start: Date;
+      running: number | null;
+      waiting: number | null;
+      kvUsage: number | null;
+      kvOccupancy: number | null;
+      slotsBusy: number | null;
+      prefixCacheHits: number;
+      prefixCacheQueries: number;
+      source: string | null;
+      gap: boolean;
+    }>;
+  }>;
 };
 
 export async function createContext({ context, services }: CreateContextOptions) {

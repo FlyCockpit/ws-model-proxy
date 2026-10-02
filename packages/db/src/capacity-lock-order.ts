@@ -356,6 +356,7 @@ export const HOT_PATH_TABLES = [
   "provider_usage_ledger",
   "pool_member_routing_verdict",
   "capacity_kv_eviction",
+  "engine_load_rollup_minute",
 ] as const;
 
 /** The graph (configuration) tables: fence triggers guard their writes. */

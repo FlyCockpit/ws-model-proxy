@@ -323,10 +323,12 @@ export type EndpointLoadSample = {
   endpointSlug: string;
   modelSlug: string | null;
   running: number;
-  waiting: number;
+  waiting?: number;
   kvUsage?: number;
+  kvOccupancy?: number;
   slotsBusy?: number;
   deferred?: number;
+  source?: string;
   /** Consecutive accepted frames with `waiting > 0` (S-D; 0 when unknown). */
   waitingStreak?: number;
   /** Prefix cache totals accumulated by the session (S-D dashboard). */
@@ -380,6 +382,7 @@ export function endpointLoadSeries(
   push("endpoint.running", load.running);
   push("endpoint.waiting", load.waiting);
   push("endpoint.kv_usage", load.kvUsage);
+  push("endpoint.kv_occupancy", load.kvOccupancy);
   push("endpoint.slots_busy", load.slotsBusy);
   push("endpoint.deferred", load.deferred);
   return series;

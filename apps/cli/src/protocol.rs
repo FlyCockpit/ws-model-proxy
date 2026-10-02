@@ -11,7 +11,7 @@ use crate::config::{
 };
 pub use crate::terminal_identity::TerminalIdentityProof;
 
-pub const RELAY_PROTOCOL_VERSION: &str = "2.8";
+pub const RELAY_PROTOCOL_VERSION: &str = "2.9";
 pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v2";
 pub const RELAY_JSON_CONTROL_MAX_BYTES: usize = 64 * 1024;
 pub const RELAY_BINARY_CHUNK_MAX_BYTES: usize = 1024 * 1024;
@@ -28,6 +28,7 @@ pub const OLDER_SERVER_HELLO_REJECTION: &str = "Malformed relay protocol message
 /// server's strict 2.7 schemas (`apps/server/src/relay/protocol.ts`).
 pub const NODE_METRICS_CUSTOM_MAX: usize = 50;
 pub const NODE_METRICS_SOURCES_MAX: usize = 50;
+pub const NODE_ENGINE_ADAPTERS_MAX: usize = 64;
 pub const NODE_GPU_MAX: usize = 32;
 pub const NODE_INTERFACE_MAX: usize = 32;
 pub const NODE_INTERFACE_ADDRESS_MAX: usize = 16;
@@ -528,6 +529,8 @@ pub struct TerminalFeatureSnapshot {
     pub file_roots_configured: bool,
     /// The local `allowRemoteMetricSources` opt-in, read at startup.
     pub allow_remote_metric_sources: bool,
+    /// The local `allowRemoteEngineAdapters` opt-in, read at startup.
+    pub allow_remote_engine_adapters: bool,
     /// 65-byte uncompressed SEC1, base64url without padding.
     pub terminal_public_key_b64url: String,
     /// The persistent identity key and its signature over the ECDH key above.
@@ -545,6 +548,8 @@ pub struct CliReportedFeatures {
     /// 2.7: whether this CLI accepts remotely defined metric sources
     /// (`metrics.sources.set`): the local `allowRemoteMetricSources` opt-in.
     pub remote_metric_sources: bool,
+    /// 2.9: whether this CLI accepts remotely defined engine adapters.
+    pub remote_engine_adapters: bool,
     /// 2.8: the CLI's read-only file grant. From the startup config.
     pub mcp_file_read: bool,
     /// 2.8: `fileRoots` are configured. All configured roots were usable at startup.
@@ -606,6 +611,7 @@ impl CliCapabilities {
                 terminal_approval: snapshot.require_terminal_approval,
                 terminal_supported: cfg!(unix),
                 remote_metric_sources: snapshot.allow_remote_metric_sources,
+                remote_engine_adapters: snapshot.allow_remote_engine_adapters,
                 mcp_file_read: snapshot.mcp_file_read,
                 file_roots_configured: snapshot.file_roots_configured,
                 allow_file_tools_as_root: snapshot.allow_file_tools_as_root,
@@ -675,6 +681,7 @@ pub struct DiscoveredModelInventory {
 pub enum FactSource {
     Probe,
     Config,
+    Custom,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -695,6 +702,13 @@ impl<T> EngineFact<T> {
         Self {
             value,
             source: FactSource::Config,
+        }
+    }
+
+    pub fn custom(value: T) -> Self {
+        Self {
+            value,
+            source: FactSource::Custom,
         }
     }
 }
@@ -721,6 +735,17 @@ pub struct EngineFacts {
     /// Model ids one engine process serves.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub served_model_aliases: Option<EngineFact<Vec<String>>>,
+    /// 2.9: a custom engine adapter is configured on this endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_adapter: Option<EngineFact<LoadAdapterValue>>,
+}
+
+/// 2.9 `engineFacts.loadAdapter.value`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoadAdapterValue {
+    pub input: crate::engine_adapter::AdapterInputKind,
+    pub signals: Vec<crate::engine_adapter::AdapterSignal>,
 }
 
 impl EngineFacts {
@@ -843,6 +868,9 @@ pub struct NodeMetrics {
     /// Status of each configured or remotely defined metric source.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<MetricSourceStatus>,
+    /// 2.9: per-endpoint custom engine adapter status. No command text.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub engine_adapters: Vec<crate::engine_adapter::EngineAdapterStatus>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -978,9 +1006,12 @@ pub struct EndpointLoad {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_slug: Option<String>,
     pub running: u64,
-    pub waiting: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_usage: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kv_occupancy: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slots_busy: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1004,6 +1035,36 @@ pub struct RemoteMetricSource {
     pub interval_secs: u32,
     pub timeout_secs: u32,
     pub format: MetricSourceFormat,
+}
+
+/// 2.9 `engine.adapters.set` (server to CLI): remotely defined engine adapters.
+/// They run only with the local opt-in (`allowRemoteEngineAdapters`) and a
+/// local hash approval of the canonical spec (`wsmp endpoints adapter approve`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RemoteEngineAdapter {
+    pub endpoint_slug: String,
+    pub input: crate::engine_adapter::AdapterInput,
+    pub format: crate::engine_adapter::AdapterFormat,
+    pub interval_secs: u32,
+    pub timeout_secs: u32,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub map: std::collections::BTreeMap<
+        crate::engine_adapter::AdapterSignal,
+        crate::engine_adapter::SignalSelector,
+    >,
+}
+
+impl RemoteEngineAdapter {
+    pub fn to_config(&self) -> crate::engine_adapter::EngineAdapterConfig {
+        crate::engine_adapter::EngineAdapterConfig {
+            input: self.input.clone(),
+            format: self.format,
+            interval_secs: self.interval_secs,
+            timeout_secs: self.timeout_secs,
+            map: self.map.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1155,6 +1216,11 @@ enum KnownServerControlMessage {
     MetricsSourcesSet {
         id: String,
         sources: Vec<RemoteMetricSource>,
+    },
+    #[serde(rename = "engine.adapters.set")]
+    EngineAdaptersSet {
+        id: String,
+        adapters: Vec<RemoteEngineAdapter>,
     },
     #[serde(rename = "file.op")]
     FileOp {
@@ -1326,6 +1392,11 @@ pub enum ServerControlMessage {
         id: String,
         sources: Vec<RemoteMetricSource>,
     },
+    /// 2.9: remotely defined engine adapters (replaces the previous list).
+    EngineAdaptersSet {
+        id: String,
+        adapters: Vec<RemoteEngineAdapter>,
+    },
     /// 2.8: run one node file op (`args` is validated by `FileOps::execute`).
     FileOp {
         op_id: String,
@@ -1469,14 +1540,45 @@ pub fn endpoint_engine_facts(endpoint: &EndpointConfig) -> Option<EngineFacts> {
     let configured_slots = endpoint
         .concurrency_limit
         .filter(|limit| (1..=10_000).contains(limit));
+    let configured_kv = endpoint
+        .kv_tokens
+        .filter(|tokens| (1..=ENGINE_TOKEN_COUNT_MAX).contains(tokens));
+    let adapter = endpoint
+        .last_probe
+        .as_ref()
+        .and_then(|probe| probe.adapter.as_ref());
+    let adapter_slots = adapter
+        .and_then(|facts| facts.slots)
+        .filter(|slots| (1..=10_000).contains(slots));
+    let adapter_kv = adapter
+        .and_then(|facts| facts.kv_tokens)
+        .filter(|tokens| (1..=ENGINE_TOKEN_COUNT_MAX).contains(tokens));
+    let load_adapter = endpoint.engine_adapter.as_ref().map(|spec| {
+        EngineFact::config(LoadAdapterValue {
+            input: spec.input_kind(),
+            signals: spec.signals(),
+        })
+    });
     let facts = EngineFacts {
         engine,
         slots: configured_slots
             .map(EngineFact::config)
+            .or_else(|| adapter_slots.map(EngineFact::custom))
             .or_else(|| probed_slots.map(EngineFact::probe)),
-        ctx_per_slot: token_fact(detected.and_then(|engine| engine.ctx_per_slot)),
-        kv_tokens: token_fact(detected.and_then(|engine| engine.kv_tokens)),
-        max_model_len: token_fact(detected.and_then(|engine| engine.max_model_len)),
+        ctx_per_slot: adapter
+            .and_then(|facts| facts.ctx_per_slot)
+            .filter(|value| (1..=ENGINE_TOKEN_COUNT_MAX).contains(value))
+            .map(EngineFact::custom)
+            .or_else(|| token_fact(detected.and_then(|engine| engine.ctx_per_slot))),
+        kv_tokens: configured_kv
+            .map(EngineFact::config)
+            .or_else(|| adapter_kv.map(EngineFact::custom))
+            .or_else(|| token_fact(detected.and_then(|engine| engine.kv_tokens))),
+        max_model_len: adapter
+            .and_then(|facts| facts.max_model_len)
+            .filter(|value| (1..=ENGINE_TOKEN_COUNT_MAX).contains(value))
+            .map(EngineFact::custom)
+            .or_else(|| token_fact(detected.and_then(|engine| engine.max_model_len))),
         host_prompt_cache_mib: None,
         served_model_aliases: detected
             .map(|engine| {
@@ -1495,6 +1597,7 @@ pub fn endpoint_engine_facts(endpoint: &EndpointConfig) -> Option<EngineFacts> {
             })
             .filter(|aliases| !aliases.is_empty())
             .map(EngineFact::probe),
+        load_adapter,
     };
     (!facts.is_empty()).then_some(facts)
 }
@@ -1721,6 +1824,9 @@ pub fn parse_server_control(text: &str) -> Result<ServerControlMessage> {
     if let KnownServerControlMessage::MetricsSourcesSet { sources, .. } = &known {
         validate_remote_metric_sources(sources)?;
     }
+    if let KnownServerControlMessage::EngineAdaptersSet { adapters, .. } = &known {
+        validate_remote_engine_adapters(adapters)?;
+    }
     Ok(known.into())
 }
 
@@ -1748,6 +1854,22 @@ pub fn validate_remote_metric_sources(sources: &[RemoteMetricSource]) -> Result<
     Ok(())
 }
 
+pub fn validate_remote_engine_adapters(adapters: &[RemoteEngineAdapter]) -> Result<()> {
+    if adapters.len() > NODE_ENGINE_ADAPTERS_MAX {
+        anyhow::bail!("engine.adapters.set lists more than {NODE_ENGINE_ADAPTERS_MAX} adapters");
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for adapter in adapters {
+        if !seen.insert(adapter.endpoint_slug.as_str())
+            || crate::slug::validate_slug(&adapter.endpoint_slug).is_err()
+            || adapter.to_config().validate().is_err()
+        {
+            anyhow::bail!("engine.adapters.set carries an adapter outside the 2.9 contract");
+        }
+    }
+    Ok(())
+}
+
 fn known_server_frame(type_name: &str) -> bool {
     matches!(
         type_name,
@@ -1768,6 +1890,7 @@ fn known_server_frame(type_name: &str) -> bool {
             | "term.spawn"
             | "supervised.cancel"
             | "metrics.sources.set"
+            | "engine.adapters.set"
             | "file.op"
             | "file.cancel"
     )
@@ -1921,6 +2044,9 @@ impl From<KnownServerControlMessage> for ServerControlMessage {
             }
             KnownServerControlMessage::MetricsSourcesSet { id, sources } => {
                 Self::MetricsSourcesSet { id, sources }
+            }
+            KnownServerControlMessage::EngineAdaptersSet { id, adapters } => {
+                Self::EngineAdaptersSet { id, adapters }
             }
             KnownServerControlMessage::FileOp {
                 op_id,
@@ -2217,7 +2343,7 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
     }
     // 2.7 telemetry control is advisory: a malformed definition list is
     // dropped and the relay keeps running.
-    if type_name == "metrics.sources.set" {
+    if type_name == "metrics.sources.set" || type_name == "engine.adapters.set" {
         return FrameFault::Ignore;
     }
     // 2.8 file frames: a bad `file.op` is refused by name; any other bad
@@ -2403,6 +2529,7 @@ mod tests {
                 mcp_file_read: false,
                 file_roots_configured: false,
                 allow_remote_metric_sources: false,
+                allow_remote_engine_adapters: false,
                 terminal_public_key_b64url: "AQID".to_string(),
                 terminal_identity: None,
             }),
@@ -2429,6 +2556,7 @@ mod tests {
                     mcp_file_read: false,
                     file_roots_configured: false,
                     allow_remote_metric_sources: false,
+                    allow_remote_engine_adapters: false,
                     terminal_public_key_b64url: "AQID".to_string(),
                     terminal_identity: Some(TerminalIdentityProof {
                         public_key: "BAQE".to_string(),
@@ -2450,7 +2578,7 @@ mod tests {
 
         let encoded = encode_control(&message).expect("encode");
 
-        assert!(encoded.contains(r#""protocolVersion":"2.8""#));
+        assert!(encoded.contains(r#""protocolVersion":"2.9""#));
         assert!(encoded.contains(r#""nodeTelemetry":true"#));
         assert!(encoded.contains(r#""fileOps":true"#));
         assert!(encoded.contains(r#""mcpFileRead":false"#));
@@ -2698,7 +2826,7 @@ mod tests {
     #[test]
     fn an_older_server_rejection_says_to_upgrade_the_server() {
         let message = hello_rejection_message(OLDER_SERVER_HELLO_REJECTION);
-        assert!(message.contains("rejected relay protocol 2.8"), "{message}");
+        assert!(message.contains("rejected relay protocol 2.9"), "{message}");
         assert!(
             message.contains("upgrade the WS Model Proxy server"),
             "{message}"
@@ -3079,6 +3207,7 @@ mod relay_27_vectors {
             models: models.iter().map(|id| (*id).to_string()).collect(),
             suggested_capabilities: OpenAiCompatibleCapabilities::default(),
             engine: Some(engine),
+            adapter: None,
         })
     }
 
@@ -3169,6 +3298,7 @@ mod relay_27_vectors {
             mcp_file_read: false,
             file_roots_configured: false,
             allow_remote_metric_sources: false,
+            allow_remote_engine_adapters: false,
             terminal_public_key_b64url: "BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A".to_string(),
             terminal_identity: None,
         });
@@ -3186,7 +3316,7 @@ mod relay_27_vectors {
         };
         assert_eq!(
             encoded(&hello),
-            vector(include_str!("../tests/fixtures/relay-2.8/hello.json"))
+            vector(include_str!("../tests/fixtures/relay-2.9/hello.json"))
         );
     }
 
@@ -3203,6 +3333,7 @@ mod relay_27_vectors {
         };
         let without = inventory_digest(&[endpoint_inventory(&endpoint, EndpointStatus::Online)]);
         endpoint.concurrency_limit = Some(3);
+        endpoint.kv_tokens = Some(262_144);
         endpoint.last_probe = probed(
             DetectedEngine {
                 kind: Some(EngineKind::Vllm),
@@ -3259,6 +3390,91 @@ mod relay_27_vectors {
         endpoint.concurrency_limit = None;
         let facts = endpoint_engine_facts(&endpoint).expect("facts");
         assert_eq!(facts.slots, Some(EngineFact::probe(8)));
+    }
+
+    #[test]
+    fn a_configured_kv_tokens_wins_over_probed() {
+        let mut endpoint = EndpointConfig {
+            slug: "generic".to_string(),
+            kv_tokens: Some(262_144),
+            last_probe: probed(
+                DetectedEngine {
+                    kind: Some(EngineKind::Vllm),
+                    kv_tokens: Some(1_000),
+                    ..DetectedEngine::default()
+                },
+                &[],
+            ),
+            ..EndpointConfig::default()
+        };
+        let facts = endpoint_engine_facts(&endpoint).expect("facts");
+        assert_eq!(facts.kv_tokens, Some(EngineFact::config(262_144)));
+        endpoint.kv_tokens = None;
+        let facts = endpoint_engine_facts(&endpoint).expect("facts");
+        assert_eq!(facts.kv_tokens, Some(EngineFact::probe(1_000)));
+    }
+
+    #[test]
+    fn adapter_facts_sit_between_config_and_probe() {
+        use crate::engine_adapter::{
+            AdapterCachedFacts, AdapterFormat, AdapterInput, AdapterSignal, EngineAdapterConfig,
+            SignalSelector,
+        };
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            AdapterSignal::Running,
+            SignalSelector {
+                series: "running".to_string(),
+                labels: Default::default(),
+                aggregate: None,
+                scale: None,
+            },
+        );
+        let mut endpoint = EndpointConfig {
+            slug: "generic".to_string(),
+            engine: crate::config::EndpointEngine::Generic,
+            engine_adapter: Some(EngineAdapterConfig {
+                input: AdapterInput::Route {
+                    route: "stats".to_string(),
+                },
+                format: AdapterFormat::Json,
+                interval_secs: 2,
+                timeout_secs: 2,
+                map,
+            }),
+            last_probe: Some(ProbeSnapshot {
+                status: ProbeStatus::Online,
+                models: Vec::new(),
+                suggested_capabilities: OpenAiCompatibleCapabilities::default(),
+                engine: Some(DetectedEngine {
+                    kind: Some(EngineKind::Generic),
+                    slots: Some(1),
+                    kv_tokens: Some(1_000),
+                    max_model_len: Some(2_048),
+                    ..DetectedEngine::default()
+                }),
+                adapter: Some(AdapterCachedFacts {
+                    slots: Some(8),
+                    kv_tokens: Some(262_144),
+                    max_model_len: Some(8_192),
+                    ctx_per_slot: None,
+                }),
+            }),
+            ..EndpointConfig::default()
+        };
+        let facts = endpoint_engine_facts(&endpoint).expect("facts");
+        assert_eq!(facts.slots, Some(EngineFact::custom(8)));
+        assert_eq!(facts.kv_tokens, Some(EngineFact::custom(262_144)));
+        assert_eq!(facts.max_model_len, Some(EngineFact::custom(8_192)));
+        assert_eq!(
+            facts.load_adapter.as_ref().map(|fact| fact.source),
+            Some(FactSource::Config)
+        );
+        endpoint.kv_tokens = Some(4096);
+        endpoint.concurrency_limit = Some(4);
+        let facts = endpoint_engine_facts(&endpoint).expect("facts");
+        assert_eq!(facts.slots, Some(EngineFact::config(4)));
+        assert_eq!(facts.kv_tokens, Some(EngineFact::config(4096)));
     }
 
     #[test]
@@ -3384,6 +3600,7 @@ mod relay_27_vectors {
                     error: Some(MetricSourceError::Timeout),
                 },
             ],
+            engine_adapters: Vec::new(),
         };
         assert_eq!(
             encoded(&ClientControlMessage::NodeMetrics(metrics)),
@@ -3399,8 +3616,9 @@ mod relay_27_vectors {
             endpoint_slug: "vllm".to_string(),
             model_slug: None,
             running: 3,
-            waiting: 2,
+            waiting: Some(2),
             kv_usage: Some(0.42),
+            kv_occupancy: None,
             slots_busy: None,
             deferred: None,
             prefix_cache_hits_delta: Some(50),
@@ -3412,6 +3630,30 @@ mod relay_27_vectors {
             encoded(&ClientControlMessage::EndpointLoad(load)),
             vector(include_str!(
                 "../tests/fixtures/relay-2.7/endpoint-load.json"
+            ))
+        );
+    }
+
+    #[test]
+    fn custom_endpoint_load_matches_the_shared_vector() {
+        let load = EndpointLoad {
+            endpoint_slug: "generic".to_string(),
+            model_slug: None,
+            running: 3,
+            waiting: None,
+            kv_usage: Some(0.4),
+            kv_occupancy: Some(0.7),
+            slots_busy: Some(3),
+            deferred: None,
+            prefix_cache_hits_delta: None,
+            prefix_cache_queries_delta: None,
+            source: LoadSource::Custom,
+            ts: "2026-09-28T12:00:01.000Z".to_string(),
+        };
+        assert_eq!(
+            encoded(&ClientControlMessage::EndpointLoad(load)),
+            vector(include_str!(
+                "../tests/fixtures/relay-2.9/endpoint-load-custom.json"
             ))
         );
     }

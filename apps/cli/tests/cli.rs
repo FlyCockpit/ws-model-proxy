@@ -723,6 +723,309 @@ fn endpoints_concurrency_and_engine_round_trip() {
 }
 
 #[test]
+fn endpoints_kv_tokens_round_trip_json_and_llama_cpp_warning() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args([
+            "endpoints",
+            "add",
+            "--slug",
+            "local",
+            "--label",
+            "Local",
+            "--base-url",
+            "http://127.0.0.1:8080/v1",
+            "--engine",
+            "generic",
+        ])
+        .assert()
+        .success();
+
+    let mut set = cli(&config, &state);
+    set.args(["endpoints", "--json", "kv-tokens", "local", "262144"]);
+    let value = json_stdout(set);
+    assert_eq!(value["kvTokens"], 262144);
+
+    cli(&config, &state)
+        .args(["endpoints", "kv-tokens", "local", "--clear"])
+        .assert()
+        .success();
+    let mut list = cli(&config, &state);
+    list.args(["endpoints", "--json", "list"]);
+    assert!(json_stdout(list)["endpoints"][0].get("kvTokens").is_none());
+
+    cli(&config, &state)
+        .args(["endpoints", "engine", "local", "llama.cpp"])
+        .assert()
+        .success();
+    cli(&config, &state)
+        .args(["endpoints", "kv-tokens", "local", "4096"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("llama.cpp stays slot-based"));
+
+    cli(&config, &state)
+        .args(["endpoints", "kv-tokens", "missing", "2"])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains("endpoint `missing` not found"));
+}
+
+#[test]
+fn endpoints_adapter_set_show_clear_round_trip_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args([
+            "endpoints",
+            "add",
+            "--slug",
+            "local",
+            "--label",
+            "Local",
+            "--base-url",
+            "http://127.0.0.1:8080/v1",
+            "--engine",
+            "generic",
+        ])
+        .assert()
+        .success();
+
+    let mut set = cli(&config, &state);
+    set.args([
+        "endpoints",
+        "--json",
+        "adapter",
+        "set",
+        "local",
+        "--route",
+        "stats",
+        "--format",
+        "json",
+        "--interval",
+        "3",
+        "--timeout",
+        "2",
+    ]);
+    let value = json_stdout(set);
+    assert_eq!(value["engineAdapter"]["format"], "json");
+    assert_eq!(value["engineAdapter"]["intervalSecs"], 3);
+    assert_eq!(value["engineAdapter"]["input"]["route"], "stats");
+
+    let mut show = cli(&config, &state);
+    show.args(["endpoints", "--json", "adapter", "show", "local"]);
+    let shown = json_stdout(show);
+    assert_eq!(shown["input"]["route"], "stats");
+    assert_eq!(shown["format"], "json");
+
+    cli(&config, &state)
+        .args([
+            "endpoints",
+            "adapter",
+            "set",
+            "local",
+            "--route",
+            "http://127.0.0.1/metrics",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("adapter route is invalid"));
+
+    cli(&config, &state)
+        .args(["endpoints", "adapter", "clear", "local"])
+        .assert()
+        .success();
+    let mut list = cli(&config, &state);
+    list.args(["endpoints", "--json", "list"]);
+    assert!(
+        json_stdout(list)["endpoints"][0]
+            .get("engineAdapter")
+            .is_none()
+    );
+
+    cli(&config, &state)
+        .args(["endpoints", "adapter", "show", "missing"])
+        .assert()
+        .failure()
+        .code(3)
+        .stderr(predicate::str::contains("endpoint `missing` not found"));
+}
+
+#[test]
+fn remote_engine_adapters_need_separate_opt_in_and_hash() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({
+            "version": 1,
+            "allowRemoteMetricSources": true
+        }),
+    );
+    cli(&config, &state)
+        .args([
+            "endpoints",
+            "add",
+            "--slug",
+            "gpu",
+            "--label",
+            "GPU",
+            "--base-url",
+            "http://127.0.0.1:8080/v1",
+            "--engine",
+            "generic",
+        ])
+        .assert()
+        .success();
+    write_remote_adapters(
+        &state,
+        json!([{
+            "endpointSlug": "gpu",
+            "input": { "command": "echo 1" },
+            "format": "json",
+            "intervalSecs": 2,
+            "timeoutSecs": 2
+        }]),
+    );
+
+    let shown = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["endpoints", "--json", "adapter", "show", "gpu"]);
+        cmd
+    });
+    assert_eq!(shown["origin"], "remote");
+    assert_eq!(
+        shown["state"], "refused",
+        "metric-source opt-in does not allow adapters"
+    );
+    assert_eq!(shown["allowRemoteEngineAdapters"], false);
+    let hash = shown["specSha256"].as_str().expect("hash").to_string();
+    assert_eq!(hash.len(), 64);
+
+    cli(&config, &state)
+        .args(["config", "set-remote-engine-adapters", "on"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Restart wsmp to apply."));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["allowRemoteEngineAdapters"], true);
+    assert_eq!(cfg["allowRemoteMetricSources"], true);
+
+    let shown = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["endpoints", "--json", "adapter", "show", "gpu"]);
+        cmd
+    });
+    assert_eq!(shown["state"], "pending_approval");
+
+    cli(&config, &state)
+        .args(["endpoints", "adapter", "approve", "gpu"])
+        .assert()
+        .failure();
+    cli(&config, &state)
+        .args([
+            "endpoints",
+            "adapter",
+            "approve",
+            "gpu",
+            "--sha256",
+            "deadbeef",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(&hash));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(cfg.get("approvedRemoteAdapters").is_none());
+
+    cli(&config, &state)
+        .args(["endpoints", "adapter", "approve", "gpu", "--sha256", &hash])
+        .assert()
+        .success();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["approvedRemoteAdapters"]["gpu"], hash);
+
+    let shown = json_stdout({
+        let mut cmd = cli(&config, &state);
+        cmd.args(["endpoints", "--json", "adapter", "show", "gpu"]);
+        cmd
+    });
+    assert_eq!(shown["state"], "active");
+    assert!(!shown.to_string().contains("engineAdapters"));
+
+    cli(&config, &state)
+        .args(["endpoints", "adapter", "revoke", "gpu"])
+        .assert()
+        .success();
+    cli(&config, &state)
+        .args(["config", "set-remote-engine-adapters", "off"])
+        .assert()
+        .success();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(cfg.get("allowRemoteEngineAdapters").is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn endpoints_adapter_test_never_prints_raw_output() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args([
+            "endpoints",
+            "add",
+            "--slug",
+            "local",
+            "--label",
+            "Local",
+            "--base-url",
+            "http://127.0.0.1:8080/v1",
+            "--engine",
+            "generic",
+        ])
+        .assert()
+        .success();
+    cli(&config, &state)
+        .args([
+            "endpoints",
+            "adapter",
+            "set",
+            "local",
+            "--command",
+            r#"printf '{"running":3,"kvUsage":0.4}\n'; echo ADAPTER-SECRET >&2"#,
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success();
+
+    let mut test = cli(&config, &state);
+    test.args(["endpoints", "--json", "adapter", "test", "local"]);
+    let output = test.assert().success().get_output().clone();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let value: Value = serde_json::from_slice(&output.stdout).expect("stdout is valid JSON");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["running"], 3);
+    assert_eq!(value["kvUsage"], 0.4);
+    assert!(
+        !stdout.contains("ADAPTER-SECRET") && !stderr.contains("ADAPTER-SECRET"),
+        "adapter test never prints raw command output: {stdout} {stderr}"
+    );
+    assert!(
+        !value.to_string().contains("printf"),
+        "command text stays off the wire"
+    );
+}
+
+#[test]
 fn endpoints_remove_unknown_slug_exits_3_not_found() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
@@ -2274,6 +2577,15 @@ fn write_remote_sources(state: &Path, sources: Value) {
         serde_json::to_vec_pretty(&json!({ "sources": sources })).expect("json"),
     )
     .expect("write remote sources");
+}
+
+fn write_remote_adapters(state: &Path, adapters: Value) {
+    fs::create_dir_all(state).expect("state dir");
+    fs::write(
+        state.join("remote-engine-adapters.json"),
+        serde_json::to_vec_pretty(&json!({ "adapters": adapters })).expect("json"),
+    )
+    .expect("write remote adapters");
 }
 
 #[test]

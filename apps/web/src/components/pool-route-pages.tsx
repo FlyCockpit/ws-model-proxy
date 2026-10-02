@@ -33,6 +33,8 @@ import {
   resolveCapacityAvailability,
 } from "@/components/forwarder-dashboard-sections";
 import { InlineRetry } from "@/components/inline-retry";
+import { PoolCacheStats } from "@/components/pool-cache-stats";
+import { CapacityEngineLoadChart } from "@/components/pool-engine-load";
 import { ownerFallbackRoutes, PoolFallbackBadge } from "@/components/pool-fallback-badge";
 import { PoolMetricRoutingRules } from "@/components/pool-metric-routing-rules";
 import { ProviderOperationsSection } from "@/components/provider-operations-section";
@@ -521,6 +523,9 @@ export function PoolDetailTab({
           stickySave
           onSuccess={() => undefined}
         />
+        <div className="border-t pt-6">
+          <PoolCacheStats poolId={pool.id} />
+        </div>
         <section className="space-y-3 border-t pt-6" aria-labelledby="pool-members-title">
           <h3 id="pool-members-title" className="text-base font-semibold">
             {t("dashboard:pools.membersTitle")}
@@ -1297,14 +1302,16 @@ function PoolFallbackSettings({
 /** Relay 2.7 engine facts the CLI detected for this capacity, and their source. */
 function CapacityEngineFacts({ capacity }: { capacity: PoolDetailCapacity }) {
   const { t } = useTranslation(["dashboard"]);
-  if (
-    !capacity.engineKind &&
-    capacity.engineSlots === null &&
-    capacity.kvBudgetTokens === null &&
-    capacity.maxModelLen === null
-  ) {
-    return null;
-  }
+  const hasFacts = Boolean(
+    capacity.engineKind ||
+      capacity.engineSlots !== null ||
+      capacity.kvBudgetTokens !== null ||
+      capacity.maxModelLen !== null,
+  );
+  const showChart = capacity._count.ExecutionTargets === 1;
+  if (!hasFacts && !showChart) return null;
+  const withProvenance = (text: string, source: PoolDetailCapacity["engineSlotsSource"]) =>
+    source ? `${text} · ${t(`dashboard:pools.capacity.engineFacts.factSources.${source}`)}` : text;
   const facts = [
     capacity.engineKind
       ? t("dashboard:pools.capacity.engineFacts.engine", {
@@ -1312,30 +1319,46 @@ function CapacityEngineFacts({ capacity }: { capacity: PoolDetailCapacity }) {
         })
       : null,
     capacity.engineSlots !== null
-      ? t("dashboard:pools.capacity.engineFacts.slots", { count: capacity.engineSlots })
+      ? withProvenance(
+          t("dashboard:pools.capacity.engineFacts.slots", { count: capacity.engineSlots }),
+          capacity.engineSlotsSource,
+        )
       : null,
     capacity.kvBudgetTokens !== null
-      ? t("dashboard:pools.capacity.engineFacts.kvBudget", {
-          value: capacity.kvBudgetTokens.toLocaleString(),
-        })
+      ? withProvenance(
+          t("dashboard:pools.capacity.engineFacts.kvBudget", {
+            value: capacity.kvBudgetTokens.toLocaleString(),
+          }),
+          capacity.kvBudgetTokensSource,
+        )
       : null,
     capacity.maxModelLen !== null
-      ? t("dashboard:pools.capacity.engineFacts.maxModelLen", {
-          value: capacity.maxModelLen.toLocaleString(),
-        })
+      ? withProvenance(
+          t("dashboard:pools.capacity.engineFacts.maxModelLen", {
+            value: capacity.maxModelLen.toLocaleString(),
+          }),
+          capacity.maxModelLenSource,
+        )
       : null,
   ].filter((fact): fact is string => fact !== null);
   return (
     <div className="mt-2 min-w-0 space-y-1 text-xs text-muted-foreground">
-      <p className="break-words">{facts.join(" · ")}</p>
-      <p className="break-words">
-        {t("dashboard:pools.capacity.engineFacts.preset", {
-          preset: t(`dashboard:pools.capacity.engineFacts.presets.${capacity.enginePreset.preset}`),
-        })}
-        {capacity.engineFactsSource
-          ? ` · ${t(`dashboard:pools.capacity.engineFacts.sources.${capacity.engineFactsSource}`)}`
-          : null}
-      </p>
+      {hasFacts ? (
+        <>
+          <p className="break-words">{facts.join(" · ")}</p>
+          <p className="break-words">
+            {t("dashboard:pools.capacity.engineFacts.preset", {
+              preset: t(
+                `dashboard:pools.capacity.engineFacts.presets.${capacity.enginePreset.preset}`,
+              ),
+            })}
+            {capacity.engineFactsSource
+              ? ` · ${t(`dashboard:pools.capacity.engineFacts.sources.${capacity.engineFactsSource}`)}`
+              : null}
+          </p>
+        </>
+      ) : null}
+      {showChart ? <CapacityEngineLoadChart capacityId={capacity.id} /> : null}
     </div>
   );
 }

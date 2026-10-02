@@ -35,9 +35,14 @@ describe("engine facts", () => {
     ).toEqual({
       engineKind: "LLAMA_CPP",
       engineSlots: 4,
+      engineSlotsSource: "PROBE",
       kvBudgetTokens: null,
+      kvBudgetTokensSource: null,
       maxModelLen: null,
+      maxModelLenSource: null,
       engineFactsSource: "MIXED",
+      engineLoadSource: null,
+      engineLoadSignals: [],
     });
     expect(
       storedEngineFacts({
@@ -48,7 +53,27 @@ describe("engine facts", () => {
     expect(storedEngineFacts({ slots: { value: 2, source: "config" } })).toMatchObject({
       engineKind: null,
       engineSlots: 2,
+      engineSlotsSource: "CONFIG",
       engineFactsSource: "CONFIG",
+    });
+    expect(storedEngineFacts({ kvTokens: { value: 262_144, source: "custom" } })).toMatchObject({
+      kvBudgetTokens: 262_144,
+      kvBudgetTokensSource: "CUSTOM",
+      engineFactsSource: "CUSTOM",
+    });
+    expect(
+      storedEngineFacts({
+        engine: { value: "generic", source: "config" },
+        kvTokens: { value: 262_144, source: "config" },
+        maxModelLen: { value: 8_192, source: "probe" },
+      }),
+    ).toMatchObject({
+      engineKind: "GENERIC",
+      kvBudgetTokens: 262_144,
+      kvBudgetTokensSource: "CONFIG",
+      maxModelLen: 8_192,
+      maxModelLenSource: "PROBE",
+      engineFactsSource: "MIXED",
     });
     // Aliases and per-slot context are not capacity columns.
     expect(
@@ -128,5 +153,33 @@ describe("engine facts", () => {
     expect(enginePreset("SGLANG").preset).toBe("vllm-sglang");
     expect(enginePreset("OLLAMA").preset).toBe("ollama-lm-studio");
     expect(enginePreset(null).preset).toBe("generic");
+  });
+
+  it("switches GENERIC and Ollama to token mode when K is known", () => {
+    expect(enginePreset("GENERIC", { kvBudgetTokens: 262_144 }).protectionUnit).toBe("tokens");
+    expect(enginePreset("OLLAMA", { kvBudgetTokens: 32_768 }).protectionUnit).toBe("tokens");
+    expect(enginePreset("GENERIC").protectionUnit).toBe("slots");
+    expect(enginePreset("LLAMA_CPP", { kvBudgetTokens: 262_144 }).protectionUnit).toBe("slots");
+  });
+
+  it("stores custom loadAdapter as CUSTOM load source", () => {
+    expect(
+      storedEngineFacts({
+        loadAdapter: {
+          value: { input: "route", signals: ["running", "kvUsage"] },
+          source: "config",
+        },
+      }),
+    ).toMatchObject({
+      engineLoadSource: "CUSTOM",
+      engineLoadSignals: ["running", "kvUsage"],
+      engineFactsSource: "CONFIG",
+    });
+  });
+
+  it("shows engine load on a generic preset when an adapter supplies FULL", () => {
+    expect(enginePreset("GENERIC", { loadSource: "CUSTOM" }).fullWhen).toBe(
+      "user_cap_or_engine_load",
+    );
   });
 });

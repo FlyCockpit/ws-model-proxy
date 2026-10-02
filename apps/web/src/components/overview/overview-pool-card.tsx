@@ -11,6 +11,7 @@ import { ArrowRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from "recharts";
 
+import { EngineLoadSparkline } from "@/components/engine-load-sparkline";
 import { ownerFallbackRoutes, PoolFallbackBadge } from "@/components/pool-fallback-badge";
 import { WideContent } from "@/components/wide-content";
 import {
@@ -303,6 +304,22 @@ export function OverviewPoolCard({
             </tbody>
           </table>
         </WideContent>
+        {range !== "1h" && pool.engineLoad?.series.some((point) => !point.gap) ? (
+          <div className="mt-4 min-w-0" data-testid="overview-engine-load">
+            <EngineLoadSparkline
+              series={pool.engineLoad.series}
+              threshold={pool.engineLoad.effectiveKvFullThreshold}
+              caption={t("overview.pools.engineLoadCaption", { name: pool.name })}
+              labels={{
+                running: t("overview.pools.legendRunning"),
+                waiting: t("overview.pools.legendWaiting"),
+                kvUsage: t("overview.pools.legendKv"),
+                kvOccupancy: t("overview.pools.legendOccupancy"),
+                threshold: t("overview.pools.legendThreshold"),
+              }}
+            />
+          </div>
+        ) : null}
       </div>
     </section>
   );

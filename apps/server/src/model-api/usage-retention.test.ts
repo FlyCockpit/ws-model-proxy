@@ -29,6 +29,7 @@ const {
   deleteExpiredRelayRequests,
   deleteExpiredRoutingVerdicts,
   deleteExpiredKvEvictions,
+  deleteExpiredEngineLoadMinutes,
   KV_EVICTION_RETENTION_MS,
   hourIncrementsFromMinuteRows,
   ROUTING_VERDICT_RETENTION_MS,
@@ -80,6 +81,9 @@ function minuteRow(overrides: Record<string, unknown> = {}) {
     cacheWriteTokens: 0n,
     cacheKnownRequests: 2,
     cacheKnownInputTokens: 10n,
+    continuationRequests: 1,
+    continuationInputTokens: 5n,
+    continuationCacheReadTokens: 3n,
     durationCount: 2,
     durationSumMs: 300n,
     latencyHistogram: [0, 0, 0, 0, 0, 0, 2],
@@ -123,6 +127,7 @@ describe("usage retention", () => {
       expiredStickinessDeleted: 0,
       routingVerdictsDeleted: 0,
       kvEvictionsDeleted: 0,
+      engineLoadMinutesDeleted: 0,
     });
     expect(tx.$executeRaw).not.toHaveBeenCalled();
   });
@@ -433,6 +438,27 @@ describe("usage retention", () => {
     expect(prisma.$executeRaw).not.toHaveBeenCalled();
   });
 
+  it("deletes engine-load minutes older than 8 days in SKIP LOCKED batches", async () => {
+    const { prisma } = fakePrisma();
+    prisma.$executeRaw.mockResolvedValueOnce(2).mockResolvedValueOnce(1);
+    expect(
+      await deleteExpiredEngineLoadMinutes({ prisma: prisma as never, now: NOW, batch: 2 }),
+    ).toBe(3);
+    const [strings, cutoff, batch] = prisma.$executeRaw.mock.calls[0] as [
+      TemplateStringsArray,
+      Date,
+      number,
+    ];
+    expect(strings.join("?")).toContain("DELETE FROM engine_load_rollup_minute");
+    expect(strings.join("?")).toContain("FOR UPDATE SKIP LOCKED");
+    expect(cutoff).toEqual(new Date(NOW.getTime() - 8 * DAY_MS));
+    expect(batch).toBe(2);
+    armDbShutdownFence();
+    prisma.$executeRaw.mockClear();
+    expect(await deleteExpiredEngineLoadMinutes({ prisma: prisma as never, now: NOW })).toBe(0);
+    expect(prisma.$executeRaw).not.toHaveBeenCalled();
+  });
+
   it("moves minute rows older than 30 days into additive hourly upserts in one transaction", async () => {
     const { prisma, tx } = fakePrisma();
     tx.$queryRaw.mockResolvedValueOnce([
@@ -462,7 +488,14 @@ describe("usage retention", () => {
   it("re-keys minute rows to their hour without losing counters", () => {
     const [increment] = hourIncrementsFromMinuteRows([minuteRow() as never]);
     expect(increment?.bucketStart.toISOString()).toBe("2026-08-01T10:00:00.000Z");
-    expect(increment).toMatchObject({ requests: 2, inputTokens: 10n, durationSumMs: 300n });
+    expect(increment).toMatchObject({
+      requests: 2,
+      inputTokens: 10n,
+      durationSumMs: 300n,
+      continuationRequests: 1,
+      continuationInputTokens: 5n,
+      continuationCacheReadTokens: 3n,
+    });
     expect(increment?.latencyHistogram[6]).toBe(2);
   });
 
@@ -551,6 +584,7 @@ describe("usage retention", () => {
       agentActionsDeleted: 0,
       routingVerdictsDeleted: 0,
       kvEvictionsDeleted: 0,
+      engineLoadMinutesDeleted: 0,
     });
     const stop = startUsageRetention({ retentionDays: 14, intervalMs: 60_000, run });
     expect(startUsageRetention({ retentionDays: 14, run })).toBe(stop);

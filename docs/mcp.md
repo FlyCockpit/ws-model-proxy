@@ -65,18 +65,23 @@ Metric routing rules (S-B part 2):
   `stale` state, the member's `endpoint.*` load series (`endpoint.running`,
   `endpoint.waiting`, `endpoint.kv_usage`, ...) and the series of each member's
   device. Each member also carries `engineLoad` (S-D): its override `mode`
-  (`auto` / `off`), the engine kind and slots, the live reading (`running`,
-  `waiting`, `kvUsage`, `slotsBusy`, `deferred`, age, `stale`, prefix cache
-  totals) and the verdict state (`full_waiting`, `full_kv`, `full_slots`,
-  `full_deferred`, `clear`, `stale`, `none`, `off`). `engineLoad.kvBudget`
-  includes `reportedTokens`, `effectiveTokens`, `cutFraction` (0–0.5),
-  `floorFraction` (0.5), `lastObservedAt`, `expiresAt`, and `active`.
-  Prefix-eviction feedback temporarily lowers token-mode warm-protection budgets;
-  slot mode (including llama.cpp) has null effective tokens and is inactive.
-  Failed feedback reads fall back to the reported budget.
+  (`auto` / `off`), `customMode` (`observe` / `enforce`; custom FULL starts
+  observe-only), `loadSource`, `signals`, `enforced`, the engine kind and slots,
+  the live reading (`running`, `waiting`, `kvUsage`, `kvOccupancy`, `slotsBusy`,
+  `deferred`, age, `stale`, prefix cache totals) and the verdict state
+  (`full_waiting`, `full_kv`, `full_slots`, `full_deferred`, `clear`, `stale`,
+  `none`, `off`). `kvOccupancy` is display only: it never marks FULL and is not
+  eviction evidence. `engineLoad.kvBudget` includes `reportedTokens`,
+  `effectiveTokens`, `cutFraction` (0–0.5), `floorFraction` (0.5),
+  `lastObservedAt`, `expiresAt`, and `active`. Prefix-eviction feedback
+  temporarily lowers token-mode warm-protection budgets; slot mode (including
+  llama.cpp) has null effective tokens and is inactive. Failed feedback reads
+  fall back to the reported budget. `endpoint.kv_occupancy` is also available as
+  an explicit routing-rule series.
 - `forwarder_pool_member_engine_load_set` (`{ poolMemberId, mode: "auto" |
-  "off", kvFullThreshold?, confirm: "RUN" }`) turns "use engine load" off for
-  a member or overrides its vLLM/SGLang KV threshold (default 0.95). Engine
+  "off", customMode?: "observe" | "enforce", kvFullThreshold?, confirm: "RUN" }`)
+  turns "use engine load" off for a member, sets whether custom FULL gates
+  admission, or overrides its vLLM/SGLang KV threshold (default 0.95). Engine
   load only adds FULL (lease counts stay authoritative), a stale reading is
   ignored, and when every candidate is FULL a plain-name request is admitted by
   leases alone. Classified `cost` like the rules.
@@ -107,6 +112,41 @@ Metric routing rules (S-B part 2):
   (`wsmp metrics approve <name> --sha256 <hash>`, the hash of the command they
   read); a changed command stops until it is approved
   again. stderr and command output never leave the CLI; only parsed numbers do.
+- `forwarder_device_engine_adapters_set` (`{ cliDeviceId, adapters, confirm:
+  "RUN" }`) replaces a device's remotely defined engine adapters
+  (`{ endpointSlug, input: { route } | { command }, format: "json" |
+  "prometheus", intervalSecs 2..5, timeoutSecs 1..4, map? }`). Same
+  unsupervised-mode and CLI-commands credential gate as metric sources. The
+  CLI refuses remote adapters unless its separate local
+  `allowRemoteEngineAdapters` opt-in is on (metric-source opt-in is not
+  enough), and runs a spec only after the person approves that exact
+  canonical JSON on the machine (`wsmp endpoints adapter approve <slug>
+  --sha256 <hash>`); a changed spec stops until it is approved again. Custom
+  FULL starts observe-only. Occupancy is display only.
+- `forwarder_device_engine_adapters_clear` (`{ cliDeviceId, confirm: "RUN" }`)
+  clears those remote adapters and sends an empty list to the live CLI.
+
+`forwarder_engine_load_history_get` (`{ poolId } | { capacityId }`) returns the
+30-minute live engine-load history (10 s buckets) for a pool or capacity the
+caller owns. Each member includes `series` (max `running` / `waiting` /
+`kvUsage` / `kvOccupancy` / `slotsBusy`, summed prefix deltas, `source`, and
+`gap` markers), `signals`, the effective KV FULL threshold, and reported K.
+`kvOccupancy` is display only. A foreign pool or capacity returns `NOT_FOUND`.
+
+`forwarder_pool_cache_stats_get` (`{ poolId, poolMemberId?, lastMinutes | lastDays,
+bucket?, split? }`) returns the prompt-cache hit rate for a pool, or one member,
+over a window ending now. `hitRate` is `cacheReadTokens / cacheKnownInputTokens`,
+capped at 1, or `null` when nothing reported cache usage (never 0 for unknown).
+`continuationHitRate` is the same ratio for requests that continued a known
+session (matched affinity); it is `null` for windows that predate those rollup
+columns. `coverage` is `cacheKnownRequests / requests` — check it first.
+Compare `continuationHitRate` for equal windows before and after a change.
+`notes` may include `low_coverage`, `window_truncated_by_retention`,
+`hour_resolution`, and `engine_reports_no_cache_fields`. Minutes read minute
+rollups; days read minute rollups up to 30 days and hour rollups beyond.
+Owners see every requester on their pools; grantees see only their own. A
+foreign pool or member returns `NOT_FOUND`. Engine prefix-cache counters stay
+on the engine-load charts and are not mixed into this tool.
 
 ## CLI file tools (relay protocol 2.8)
 

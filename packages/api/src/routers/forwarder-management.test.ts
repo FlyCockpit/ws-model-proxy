@@ -113,6 +113,7 @@ const db = prisma as unknown as {
     upsert: MockInstance;
     deleteMany: MockInstance;
     findMany: MockInstance;
+    findFirst: MockInstance;
     updateMany: MockInstance;
     findUniqueOrThrow: MockInstance;
   };
@@ -286,6 +287,7 @@ describe("forwarderManagementRouter", () => {
     );
     db.poolMember.count.mockResolvedValue(0);
     db.poolGrant.findMany.mockResolvedValue([]);
+    db.poolGrant.findFirst.mockResolvedValue(null);
     db.$queryRaw.mockResolvedValue([]);
     db.executionTarget.upsert.mockResolvedValue({ id: "target-id" });
     db.executionTarget.findUnique.mockResolvedValue(null);
@@ -4303,6 +4305,78 @@ describe("forwarderManagementRouter", () => {
     expect(db.cacheAffinityRecord.deleteMany).not.toHaveBeenCalled();
   });
 
+  describe("poolCacheStats", () => {
+    function cacheRow(overrides: Record<string, unknown> = {}) {
+      return {
+        bucketStart: new Date(Date.now() - 5 * 60_000),
+        poolMemberId: "member-a",
+        requests: 10n,
+        cacheReadTokens: 40n,
+        cacheKnownRequests: 8n,
+        cacheKnownInputTokens: 80n,
+        continuationRequests: 4n,
+        continuationInputTokens: 40n,
+        continuationCacheReadTokens: 30n,
+        ...overrides,
+      };
+    }
+
+    it("lets the owner see every requester on their pool", async () => {
+      db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+      db.$queryRaw.mockResolvedValue([cacheRow()]);
+      const stats = await client().poolCacheStats({ poolId: "pool-id", lastMinutes: 60 });
+      expect(stats.hitRate).toBeCloseTo(0.5);
+      expect(stats.continuationHitRate).toBeCloseTo(0.75);
+      expect(db.poolGrant.findFirst).not.toHaveBeenCalled();
+      const dumped = JSON.stringify(db.$queryRaw.mock.calls);
+      expect(dumped).toContain("ownerUserId");
+      expect(dumped).toContain("usage_rollup_minute");
+    });
+
+    it("lets a grantee see only their own requests", async () => {
+      db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "owner-id" });
+      db.poolGrant.findFirst.mockResolvedValue({ id: "grant-id" });
+      db.$queryRaw.mockResolvedValue([cacheRow({ continuationInputTokens: 0n })]);
+      const grantee = createRouterClient(forwarderManagementRouter, {
+        context: buildContext({ user: { id: "grantee-id" } }),
+      });
+      const stats = await grantee.poolCacheStats({ poolId: "pool-id", lastMinutes: 60 });
+      expect(stats.hitRate).toBeCloseTo(0.5);
+      expect(stats.continuationHitRate).toBeNull();
+      expect(db.poolGrant.findFirst).toHaveBeenCalledWith({
+        where: { poolId: "pool-id", granteeUserId: "grantee-id" },
+        select: { id: true },
+      });
+      const dumped = JSON.stringify(db.$queryRaw.mock.calls);
+      expect(dumped).toContain("requesterUserId");
+      expect(dumped).toContain("ownerUserId");
+    });
+
+    it("returns NOT_FOUND for a foreign pool or member", async () => {
+      db.modelPool.findUnique.mockResolvedValue(null);
+      await expect(
+        client().poolCacheStats({ poolId: "missing", lastMinutes: 60 }),
+      ).rejects.toMatchObject({ code: "NOT_FOUND" });
+      expect(db.$queryRaw.mock.calls.some((call) => !isFenceCall(call))).toBe(false);
+
+      db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "other-user" });
+      db.poolGrant.findFirst.mockResolvedValue(null);
+      await expect(
+        client().poolCacheStats({ poolId: "pool-id", lastMinutes: 60 }),
+      ).rejects.toMatchObject({ code: "NOT_FOUND" });
+
+      db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+      db.poolMember.findUnique.mockResolvedValue({ id: "member-x", poolId: "other-pool" });
+      await expect(
+        client().poolCacheStats({
+          poolId: "pool-id",
+          poolMemberId: "member-x",
+          lastMinutes: 60,
+        }),
+      ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    });
+  });
+
   describe("update-path recommended-surface revalidation", () => {
     const chatNativeCapabilities = {
       version: 3,
@@ -5853,7 +5927,7 @@ describe("setCliDeviceFeatureGrants", () => {
       {
         ...row,
         id: "cli-newer",
-        rejectedRelayProtocolVersion: "2.9",
+        rejectedRelayProtocolVersion: "2.10",
         rejectedCliVersion: "0.9.0",
         relayRejectedAt: rejectedAt,
       },
@@ -5869,7 +5943,7 @@ describe("setCliDeviceFeatureGrants", () => {
     });
     expect(devices[1]?.upgradeRequired).toBeNull();
     expect(devices[2]?.upgradeRequired).toMatchObject({
-      protocolVersion: "2.9",
+      protocolVersion: "2.10",
       reason: "cli_too_new",
     });
   });
@@ -6049,6 +6123,7 @@ it("omits a shared pool entirely after its grant is revoked", async () => {
 describe("metric routing procedures (S-B part 2)", () => {
   const deep = prisma as unknown as {
     modelPool: { findFirst: MockInstance; updateMany: MockInstance };
+    inferenceCapacity: { findFirst: MockInstance };
     capacityKvEviction: { findMany: MockInstance };
     poolMemberRoutingVerdict: { findMany: MockInstance; deleteMany: MockInstance };
     cliDevice: { findUnique: MockInstance; findMany: MockInstance; updateMany: MockInstance };
@@ -6644,5 +6719,129 @@ describe("metric routing procedures (S-B part 2)", () => {
     await expect(
       client().setCliDeviceMetricSources({ cliDeviceId: "cli-id", sources: [source, source] }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+
+  it("stores remote engine adapters only while the device is unsupervised and pushes them", async () => {
+    const adapter = {
+      endpointSlug: "gpu",
+      input: { command: "echo 1" },
+      format: "json" as const,
+      intervalSecs: 2,
+      timeoutSecs: 2,
+    };
+    deep.cliDevice.findUnique.mockResolvedValue({
+      id: "cli-id",
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+    });
+    deep.cliDevice.updateMany.mockResolvedValue({ count: 1 });
+    const pushed: string[] = [];
+    const result = await client({
+      onRemoteEngineAdaptersChanged: async (id: string) => {
+        pushed.push(id);
+        return true;
+      },
+    }).setCliDeviceEngineAdapters({ cliDeviceId: "cli-id", adapters: [adapter] });
+    expect(deep.cliDevice.updateMany).toHaveBeenCalledWith({
+      where: { id: "cli-id", userId: "user-id", mcpCommandMode: "UNSUPERVISED" },
+      data: { remoteEngineAdapters: [adapter], remoteEngineAdaptersAt: expect.any(Date) },
+    });
+    expect(pushed).toEqual(["cli-id"]);
+    expect(result.delivered).toBe(true);
+    expect(result.adapters[0]?.specSha256).toMatch(/^[0-9a-f]{64}$/);
+
+    for (const mode of ["OFF", "SUPERVISED"]) {
+      vi.clearAllMocks();
+      deep.cliDevice.findUnique.mockResolvedValue({
+        id: "cli-id",
+        userId: "user-id",
+        mcpCommandMode: mode,
+      });
+      await expect(
+        client().setCliDeviceEngineAdapters({ cliDeviceId: "cli-id", adapters: [adapter] }),
+      ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+      expect(deep.cliDevice.updateMany).not.toHaveBeenCalled();
+    }
+
+    vi.clearAllMocks();
+    deep.cliDevice.findUnique.mockResolvedValue({
+      id: "cli-id",
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+    });
+    deep.cliDevice.updateMany.mockResolvedValue({ count: 1 });
+    await client({
+      onRemoteEngineAdaptersChanged: async () => true,
+    }).clearCliDeviceEngineAdapters({ cliDeviceId: "cli-id" });
+    expect(deep.cliDevice.updateMany).toHaveBeenCalledWith({
+      where: { id: "cli-id", userId: "user-id", mcpCommandMode: "UNSUPERVISED" },
+      data: { remoteEngineAdapters: [], remoteEngineAdaptersAt: expect.any(Date) },
+    });
+  });
+
+  it("returns engine-load history for an owned pool and NOT_FOUND for a foreign one", async () => {
+    deep.modelPool.findFirst.mockResolvedValue({
+      PoolMembers: [
+        {
+          id: "m1",
+          kvFullThreshold: 0.9,
+          ExecutionTarget: {
+            InferenceCapacity: {
+              id: "cap-1",
+              kvBudgetTokens: 262_144,
+              engineLoadSource: "CUSTOM",
+              engineLoadSignals: ["kvUsage"],
+            },
+            DiscoveredModel: {
+              slug: null,
+              upstreamModelId: "qwen",
+              Endpoint: { slug: "gpu", cliDeviceId: "cli-1", CliDevice: { name: "GPU" } },
+            },
+          },
+        },
+      ],
+    });
+    const series = [
+      {
+        start: new Date("2026-09-28T12:00:00.000Z"),
+        running: 4,
+        waiting: null,
+        kvUsage: 0.8,
+        kvOccupancy: 0.9,
+        slotsBusy: null,
+        prefixCacheHits: 2,
+        prefixCacheQueries: 5,
+        source: "custom",
+        gap: false,
+      },
+    ];
+    const result = await client({
+      getLiveEngineLoadHistory: () => [
+        { cliDeviceId: "cli-1", endpointSlug: "gpu", modelSlug: null, series },
+      ],
+    }).getEngineLoadHistory({ poolId: "pool-1" });
+    expect(result.members).toEqual([
+      {
+        poolMemberId: "m1",
+        capacityId: "cap-1",
+        endpointSlug: "gpu",
+        modelSlug: null,
+        cliDeviceId: "cli-1",
+        source: "custom",
+        signals: ["kvUsage"],
+        effectiveKvFullThreshold: 0.9,
+        kvBudgetTokens: 262_144,
+        series,
+      },
+    ]);
+
+    deep.modelPool.findFirst.mockResolvedValue(null);
+    await expect(client().getEngineLoadHistory({ poolId: "missing" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
+    deep.inferenceCapacity.findFirst.mockResolvedValue(null);
+    await expect(client().getEngineLoadHistory({ capacityId: "cap-x" })).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
   });
 });

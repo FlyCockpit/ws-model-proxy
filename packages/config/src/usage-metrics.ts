@@ -103,3 +103,5 @@ export const OVERVIEW_RANGE_CONFIG: Record<
 export const USAGE_ROLLUP_MINUTE_RETENTION_DAYS = 30;
 /** Hourly rollups are kept 13 months (395 days). */
 export const USAGE_ROLLUP_HOUR_RETENTION_DAYS = 395;
+/** Engine-load minute rollups cover Overview 24h/7d (kept 8 days). */
+export const ENGINE_LOAD_ROLLUP_MINUTE_RETENTION_DAYS = 8;

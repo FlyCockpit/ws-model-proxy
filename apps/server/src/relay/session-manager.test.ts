@@ -2280,24 +2280,24 @@ describe("relay terminal and exec sessions", () => {
       })(),
     ],
     [
-      "a 2.9 hello (a CLI newer than this server)",
+      "a 2.10 hello (a CLI newer than this server)",
       (() => {
         const frame = JSON.parse(helloCli()) as {
           protocolVersion: string;
           cli: { capabilities: Record<string, unknown> };
         };
-        frame.protocolVersion = "2.9";
-        frame.cli.capabilities.protocolVersion = "2.9";
+        frame.protocolVersion = "2.10";
+        frame.cli.capabilities.protocolVersion = "2.10";
         return JSON.stringify(frame);
       })(),
     ],
     [
       // The top-level version alone must trip the gate: the capability echo is
       // still 2.8, so the capability comparison would not refuse this frame.
-      "a 2.9 hello whose capability echo still says 2.8",
+      "a 2.10 hello whose capability echo still says 2.8",
       (() => {
         const frame = JSON.parse(helloCli()) as { protocolVersion: string };
-        frame.protocolVersion = "2.9";
+        frame.protocolVersion = "2.10";
         return JSON.stringify(frame);
       })(),
     ],
@@ -2403,9 +2403,9 @@ describe("relay terminal and exec sessions", () => {
       protocolVersion: string;
       cli: { version?: string; capabilities: Record<string, unknown> };
     };
-    frame.protocolVersion = "2.9";
+    frame.protocolVersion = "2.10";
     frame.cli.version = "0.9.0-rc.1+build.5";
-    frame.cli.capabilities.protocolVersion = "2.9";
+    frame.cli.capabilities.protocolVersion = "2.10";
     manager.acceptAuthenticatedSocket({
       socket,
       identity: { ...identity, kind: "deviceCredential", cliDeviceId: "bound-device" },
@@ -2423,7 +2423,7 @@ describe("relay terminal and exec sessions", () => {
     expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
       where: { id: "bound-device", userId: "user-id" },
       data: {
-        rejectedRelayProtocolVersion: "2.9",
+        rejectedRelayProtocolVersion: "2.10",
         rejectedCliVersion: "0.9.0-rc.1+build.5",
         relayRejectedAt: now,
       },
@@ -2439,6 +2439,23 @@ describe("relay terminal and exec sessions", () => {
     const socket = new FakeSocket();
     await register(manager, socket);
     expect(JSON.parse(String(socket.sends[0]))).toMatchObject({ type: "hello.ok" });
+    expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
+  });
+
+  it("registers a valid 2.9 hello", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    const frame = JSON.parse(helloCli()) as {
+      protocolVersion: string;
+      cli: { capabilities: Record<string, unknown> };
+    };
+    frame.protocolVersion = "2.9";
+    frame.cli.capabilities.protocolVersion = "2.9";
+    await register(manager, socket, JSON.stringify(frame));
+    expect(JSON.parse(String(socket.sends[0]))).toMatchObject({
+      type: "hello.ok",
+      protocolVersion: "2.9",
+    });
     expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
   });
 
@@ -3116,6 +3133,26 @@ describe("relay 2.7 telemetry", () => {
     return { manager, socket };
   }
 
+  function helloFrame29() {
+    const frame = JSON.parse(helloFrame()) as {
+      protocolVersion: string;
+      cli: { capabilities: { protocolVersion: string } };
+    };
+    frame.protocolVersion = "2.9";
+    frame.cli.capabilities.protocolVersion = "2.9";
+    return JSON.stringify(frame);
+  }
+
+  async function registered29() {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    await manager.handleTextFrame(socket, helloFrame29(), now);
+    db.cliDevice.updateMany.mockClear();
+    db.cliDevice.update.mockClear();
+    return { manager, socket };
+  }
+
   function telemetryWrites() {
     return db.cliDevice.updateMany.mock.calls
       .map((call) => call[0] as { where: { id: string }; data: Record<string, unknown> })
@@ -3211,6 +3248,31 @@ describe("relay 2.7 telemetry", () => {
     // A gap longer than the staleness window restarts the count (fail open).
     await manager.handleTextFrame(socket, waitingLoad(2), at(12_000 + 16_000));
     expect(liveLoad(manager)?.waitingStreak).toBe(1);
+    manager.dispose();
+  });
+
+  it("accepts a custom load frame without waiting and does not grow the streak", async () => {
+    const { manager, socket } = await registered();
+    const custom = (extra: Record<string, unknown> = {}) =>
+      JSON.stringify({
+        type: "endpoint.load",
+        endpointSlug: "generic",
+        running: 3,
+        kvOccupancy: 0.7,
+        source: "custom",
+        ts: "2026-01-01T00:00:00.000Z",
+        ...extra,
+      });
+    await manager.handleTextFrame(socket, custom(), now);
+    expect(liveLoad(manager)).toMatchObject({
+      source: "custom",
+      running: 3,
+      kvOccupancy: 0.7,
+      waitingStreak: 0,
+    });
+    expect(liveLoad(manager)?.waiting).toBeUndefined();
+    await manager.handleTextFrame(socket, custom({ running: 4 }), at(3_000));
+    expect(liveLoad(manager)?.waitingStreak).toBe(0);
     manager.dispose();
   });
 
@@ -3489,6 +3551,88 @@ describe("relay 2.7 telemetry", () => {
     // Changing the definitions pushes them to the live session.
     expect(await manager.onRemoteMetricSourcesChanged("cli-device-id")).toBe(true);
     expect(await manager.onRemoteMetricSourcesChanged("other-device")).toBe(false);
+    manager.dispose();
+  });
+
+  const gpuAdapter = {
+    endpointSlug: "gpu",
+    input: { command: "echo 1" },
+    format: "json",
+    intervalSecs: 2,
+    timeoutSecs: 2,
+  };
+  function adapterFrames(socket: FakeSocket) {
+    return socket.sends
+      .map((send) => JSON.parse(String(send)) as { type: string; adapters?: unknown[] })
+      .filter((frame) => frame.type === "engine.adapters.set");
+  }
+
+  it("does not send engine.adapters.set on a 2.8 session", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [fansSource],
+      remoteEngineAdapters: [gpuAdapter],
+    });
+    const { manager, socket } = await registered();
+    expect(adapterFrames(socket)).toEqual([]);
+    expect(await manager.onRemoteEngineAdaptersChanged("cli-device-id")).toBe(false);
+    expect(adapterFrames(socket)).toEqual([]);
+    manager.dispose();
+  });
+
+  it("sends remote engine adapters after hello.ok only on 2.9 unsupervised sessions", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [],
+      remoteEngineAdapters: [gpuAdapter],
+    });
+    const unsupervised = await registered29();
+    expect(JSON.parse(String(unsupervised.socket.sends[0]))).toMatchObject({ type: "hello.ok" });
+    expect(adapterFrames(unsupervised.socket)).toEqual([
+      expect.objectContaining({ type: "engine.adapters.set", adapters: [gpuAdapter] }),
+    ]);
+    unsupervised.manager.dispose();
+
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "SUPERVISED",
+      remoteMetricSources: [],
+      remoteEngineAdapters: [gpuAdapter],
+    });
+    const supervised = await registered29();
+    expect(adapterFrames(supervised.socket)).toEqual([
+      expect.objectContaining({ type: "engine.adapters.set", adapters: [] }),
+    ]);
+    supervised.manager.dispose();
+  });
+
+  it("withdraws remote engine adapters with an empty list", async () => {
+    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
+      .findUnique;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "UNSUPERVISED",
+      remoteMetricSources: [],
+      remoteEngineAdapters: [gpuAdapter],
+    });
+    const { manager, socket } = await registered29();
+    socket.sends.length = 0;
+    findUnique.mockResolvedValue({
+      userId: "user-id",
+      mcpCommandMode: "OFF",
+      remoteMetricSources: [],
+      remoteEngineAdapters: [gpuAdapter],
+    });
+    await expect(manager.onRemoteEngineAdaptersChanged("cli-device-id")).resolves.toBe(true);
+    expect(adapterFrames(socket)).toEqual([
+      expect.objectContaining({ type: "engine.adapters.set", adapters: [] }),
+    ]);
     manager.dispose();
   });
 

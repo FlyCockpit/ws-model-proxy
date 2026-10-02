@@ -35,6 +35,10 @@ import {
   remoteMetricSourceDefinitionsSchema,
   routingRulesSchema,
 } from "../lib/metric-routing";
+import {
+  remoteEngineAdapterDefinitionsSchema,
+  serializeRemoteEngineAdapters,
+} from "../lib/remote-engine-adapters";
 
 const idSchema = z.string().min(1);
 
@@ -68,8 +72,10 @@ function liveEndpointLoad(live: LiveNodeTelemetrySnapshot | null): EndpointLoadS
     running: load.running,
     waiting: load.waiting,
     kvUsage: load.kvUsage,
+    kvOccupancy: load.kvOccupancy,
     slotsBusy: load.slotsBusy,
     deferred: load.deferred,
+    source: load.source,
     waitingStreak: load.waitingStreak,
     prefixCacheHitsTotal: load.prefixCacheHitsTotal,
     prefixCacheQueriesTotal: load.prefixCacheQueriesTotal,
@@ -114,12 +120,20 @@ export const metricRoutingProcedures = {
             select: {
               id: true,
               engineLoadMode: true,
+              customEngineLoadMode: true,
               kvFullThreshold: true,
               DiscoveredModel: { select: memberModelSelect },
               ExecutionTarget: {
                 select: {
                   InferenceCapacity: {
-                    select: { id: true, engineKind: true, engineSlots: true, kvBudgetTokens: true },
+                    select: {
+                      id: true,
+                      engineKind: true,
+                      engineSlots: true,
+                      kvBudgetTokens: true,
+                      engineLoadSource: true,
+                      engineLoadSignals: true,
+                    },
                   },
                   DiscoveredModel: { select: memberModelSelect },
                 },
@@ -138,6 +152,7 @@ export const metricRoutingProcedures = {
                 id: member.id,
                 model,
                 engineLoadMode: member.engineLoadMode,
+                customEngineLoadMode: member.customEngineLoadMode,
                 kvFullThreshold: member.kvFullThreshold,
                 capacity: member.ExecutionTarget?.InferenceCapacity ?? null,
               },
@@ -205,12 +220,19 @@ export const metricRoutingProcedures = {
           };
           const reading = pickEndpointLoad(liveEndpointLoad(snapshot), memberRef);
           const engineKind = engineKindFromDb(member.capacity?.engineKind);
+          const loadSource =
+            member.capacity?.engineLoadSource === "CUSTOM" || reading?.source === "custom"
+              ? ("custom" as const)
+              : ("builtin" as const);
           const engineVerdict = evaluateEngineLoad(
             {
               engineKind,
               engineSlots: member.capacity?.engineSlots ?? null,
               mode: member.engineLoadMode === "OFF" ? "OFF" : "AUTO",
               kvFullThreshold: member.kvFullThreshold,
+              loadSource,
+              signals: member.capacity?.engineLoadSignals ?? [],
+              customMode: member.customEngineLoadMode === "ENFORCE" ? "ENFORCE" : "OBSERVE",
             },
             reading ? { ...reading, waitingStreak: reading.waitingStreak ?? 0 } : null,
             now,
@@ -262,19 +284,30 @@ export const metricRoutingProcedures = {
                 active: protectionEnabled && effectiveTokens !== null && cutFraction > 0,
               },
               mode: member.engineLoadMode === "OFF" ? ("off" as const) : ("auto" as const),
+              customMode:
+                member.customEngineLoadMode === "ENFORCE"
+                  ? ("enforce" as const)
+                  : ("observe" as const),
               kvFullThreshold: member.kvFullThreshold,
               effectiveKvFullThreshold: effectiveKvFullThreshold(member.kvFullThreshold),
               engineKind,
               engineSlots: member.capacity?.engineSlots ?? null,
-              hasSignal: engineHasLoadSignal(engineKind),
+              loadSource,
+              signals: member.capacity?.engineLoadSignals ?? [],
+              hasSignal: engineHasLoadSignal(engineKind, {
+                loadSource,
+                signals: member.capacity?.engineLoadSignals ?? [],
+              }),
               state: engineVerdict.state,
               full: engineVerdict.full,
+              enforced: engineVerdict.enforced,
               snapshotState: verdict && !expired ? verdict.engineState : null,
               live: reading
                 ? {
                     running: reading.running,
                     waiting: reading.waiting,
                     kvUsage: reading.kvUsage ?? null,
+                    kvOccupancy: reading.kvOccupancy ?? null,
                     slotsBusy: reading.slotsBusy ?? null,
                     deferred: reading.deferred ?? null,
                     waitingStreak: reading.waitingStreak ?? 0,
@@ -299,6 +332,137 @@ export const metricRoutingProcedures = {
           };
         }),
         devices,
+      };
+    }),
+
+  /**
+   * 30-minute live engine-load history (10 s buckets) for a pool or capacity
+   * the caller owns. A foreign id is NOT_FOUND. Occupancy is display-only.
+   */
+  getEngineLoadHistory: protectedProcedure
+    .input(z.union([z.object({ poolId: idSchema }), z.object({ capacityId: idSchema })]))
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      const now = new Date();
+      type HistoryMember = {
+        poolMemberId: string | null;
+        capacityId: string | null;
+        endpointSlug: string;
+        modelSlug: string | null;
+        cliDeviceId: string;
+        engineLoadSource: string | null;
+        engineLoadSignals: string[];
+        kvFullThreshold: number | null;
+        kvBudgetTokens: number | null;
+      };
+      let members: HistoryMember[] = [];
+      if ("poolId" in input) {
+        const pool = await prisma.modelPool.findFirst({
+          where: { id: input.poolId, userId },
+          select: {
+            PoolMembers: {
+              where: { tier: "PRIMARY" },
+              orderBy: { createdAt: "asc" },
+              select: {
+                id: true,
+                kvFullThreshold: true,
+                DiscoveredModel: { select: memberModelSelect },
+                ExecutionTarget: {
+                  select: {
+                    InferenceCapacity: {
+                      select: {
+                        id: true,
+                        kvBudgetTokens: true,
+                        engineLoadSource: true,
+                        engineLoadSignals: true,
+                      },
+                    },
+                    DiscoveredModel: { select: memberModelSelect },
+                  },
+                },
+              },
+            },
+          },
+        });
+        if (!pool) throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+        members = pool.PoolMembers.flatMap((member) => {
+          const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
+          if (!model) return [];
+          const capacity = member.ExecutionTarget?.InferenceCapacity ?? null;
+          return [
+            {
+              poolMemberId: member.id,
+              capacityId: capacity?.id ?? null,
+              endpointSlug: model.Endpoint.slug,
+              modelSlug: model.slug ?? null,
+              cliDeviceId: model.Endpoint.cliDeviceId,
+              engineLoadSource: capacity?.engineLoadSource ?? null,
+              engineLoadSignals: capacity?.engineLoadSignals ?? [],
+              kvFullThreshold: member.kvFullThreshold,
+              kvBudgetTokens: capacity?.kvBudgetTokens ?? null,
+            },
+          ];
+        });
+      } else {
+        const capacity = await prisma.inferenceCapacity.findFirst({
+          where: { id: input.capacityId, userId },
+          select: {
+            id: true,
+            kvBudgetTokens: true,
+            engineLoadSource: true,
+            engineLoadSignals: true,
+            ExecutionTargets: {
+              select: { DiscoveredModel: { select: memberModelSelect } },
+            },
+          },
+        });
+        if (!capacity) throw new ORPCError("NOT_FOUND", { message: "Capacity not found." });
+        members = capacity.ExecutionTargets.flatMap((target) => {
+          const model = target.DiscoveredModel;
+          if (!model) return [];
+          return [
+            {
+              poolMemberId: null,
+              capacityId: capacity.id,
+              endpointSlug: model.Endpoint.slug,
+              modelSlug: model.slug ?? null,
+              cliDeviceId: model.Endpoint.cliDeviceId,
+              engineLoadSource: capacity.engineLoadSource,
+              engineLoadSignals: capacity.engineLoadSignals,
+              kvFullThreshold: null,
+              kvBudgetTokens: capacity.kvBudgetTokens,
+            },
+          ];
+        });
+      }
+      const keys = members.map((member) => ({
+        cliDeviceId: member.cliDeviceId,
+        endpointSlug: member.endpointSlug,
+        modelSlug: member.modelSlug,
+      }));
+      const history = context.services?.getLiveEngineLoadHistory?.(keys, now) ?? [];
+      const byKey = new Map(
+        history.map((entry) => [
+          `${entry.cliDeviceId}\u0000${entry.endpointSlug}\u0000${entry.modelSlug ?? ""}`,
+          entry.series,
+        ]),
+      );
+      return {
+        members: members.map((member) => ({
+          poolMemberId: member.poolMemberId,
+          capacityId: member.capacityId,
+          endpointSlug: member.endpointSlug,
+          modelSlug: member.modelSlug,
+          cliDeviceId: member.cliDeviceId,
+          source: member.engineLoadSource === "CUSTOM" ? ("custom" as const) : ("builtin" as const),
+          signals: member.engineLoadSignals,
+          effectiveKvFullThreshold: effectiveKvFullThreshold(member.kvFullThreshold),
+          kvBudgetTokens: member.kvBudgetTokens,
+          series:
+            byKey.get(
+              `${member.cliDeviceId}\u0000${member.endpointSlug}\u0000${member.modelSlug ?? ""}`,
+            ) ?? [],
+        })),
       };
     }),
 
@@ -341,6 +505,7 @@ export const metricRoutingProcedures = {
       z.object({
         poolMemberId: idSchema,
         mode: z.enum(["auto", "off"]),
+        customMode: z.enum(["observe", "enforce"]).optional(),
         kvFullThreshold: z.number().gt(0).max(1).nullable().optional(),
       }),
     )
@@ -353,6 +518,9 @@ export const metricRoutingProcedures = {
         where: { id: input.poolMemberId, ModelPool: { userId } },
         data: {
           engineLoadMode: input.mode === "off" ? "OFF" : "AUTO",
+          ...(input.customMode !== undefined
+            ? { customEngineLoadMode: input.customMode === "enforce" ? "ENFORCE" : "OBSERVE" }
+            : {}),
           ...(input.kvFullThreshold !== undefined
             ? { kvFullThreshold: input.kvFullThreshold }
             : {}),
@@ -363,12 +531,20 @@ export const metricRoutingProcedures = {
       }
       const member = await prisma.poolMember.findFirst({
         where: { id: input.poolMemberId, ModelPool: { userId } },
-        select: { id: true, poolId: true, engineLoadMode: true, kvFullThreshold: true },
+        select: {
+          id: true,
+          poolId: true,
+          engineLoadMode: true,
+          customEngineLoadMode: true,
+          kvFullThreshold: true,
+        },
       });
       if (member) await context.services?.onPoolRoutingRulesChanged?.(member.poolId);
       return {
         poolMemberId: input.poolMemberId,
         mode: member?.engineLoadMode === "OFF" ? ("off" as const) : ("auto" as const),
+        customMode:
+          member?.customEngineLoadMode === "ENFORCE" ? ("enforce" as const) : ("observe" as const),
         kvFullThreshold: member?.kvFullThreshold ?? null,
         defaultKvFullThreshold: DEFAULT_KV_FULL_THRESHOLD,
       };
@@ -420,5 +596,82 @@ export const metricRoutingProcedures = {
         delivered,
         note: "The CLI runs a remote source only with its local opt-in (allowRemoteMetricSources) and after `wsmp metrics approve <name> --sha256 <hash>` (the hash of the command the person read); it reports each source's state in node.metrics.",
       };
+    }),
+
+  /**
+   * Replace a device's remotely defined engine adapters. Allowed only while
+   * the device's MCP command mode is `unsupervised`. The CLI still refuses
+   * them without its separate local opt-in (`allowRemoteEngineAdapters`) and
+   * runs each spec only after a local, hash-pinned approval; a changed spec
+   * needs approval again. Metric-source opt-in does not allow adapters.
+   */
+  setCliDeviceEngineAdapters: protectedProcedure
+    .input(z.object({ cliDeviceId: idSchema, adapters: remoteEngineAdapterDefinitionsSchema }))
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      const device = await prisma.cliDevice.findUnique({
+        where: { id: input.cliDeviceId },
+        select: { id: true, userId: true, mcpCommandMode: true },
+      });
+      if (!device || device.userId !== userId) {
+        throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+      }
+      if (device.mcpCommandMode !== "UNSUPERVISED") {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Remote engine adapters need this device's MCP command mode to be unsupervised.",
+        });
+      }
+      const updated = await prisma.cliDevice.updateMany({
+        where: { id: device.id, userId, mcpCommandMode: "UNSUPERVISED" },
+        data: { remoteEngineAdapters: input.adapters, remoteEngineAdaptersAt: new Date() },
+      });
+      if (updated.count === 0) {
+        throw new ORPCError("CONFLICT", {
+          message: "This device's MCP command mode changed; remote engine adapters were not saved.",
+        });
+      }
+      const delivered =
+        (await context.services?.onRemoteEngineAdaptersChanged?.(device.id)) ?? false;
+      return {
+        cliDeviceId: device.id,
+        adapters: serializeRemoteEngineAdapters(input.adapters),
+        delivered,
+        note: "The CLI runs a remote adapter only with its local opt-in (allowRemoteEngineAdapters) and after `wsmp endpoints adapter approve <slug> --sha256 <hash>` (the hash of the canonical spec the person read); it reports each adapter's state in node.metrics.engineAdapters. Metric-source opt-in does not allow adapters.",
+      };
+    }),
+
+  /**
+   * Clear a device's remotely defined engine adapters (same unsupervised
+   * gate as set). Sends an empty list to the live CLI.
+   */
+  clearCliDeviceEngineAdapters: protectedProcedure
+    .input(z.object({ cliDeviceId: idSchema }))
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      const device = await prisma.cliDevice.findUnique({
+        where: { id: input.cliDeviceId },
+        select: { id: true, userId: true, mcpCommandMode: true },
+      });
+      if (!device || device.userId !== userId) {
+        throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+      }
+      if (device.mcpCommandMode !== "UNSUPERVISED") {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Remote engine adapters need this device's MCP command mode to be unsupervised.",
+        });
+      }
+      const updated = await prisma.cliDevice.updateMany({
+        where: { id: device.id, userId, mcpCommandMode: "UNSUPERVISED" },
+        data: { remoteEngineAdapters: [], remoteEngineAdaptersAt: new Date() },
+      });
+      if (updated.count === 0) {
+        throw new ORPCError("CONFLICT", {
+          message:
+            "This device's MCP command mode changed; remote engine adapters were not cleared.",
+        });
+      }
+      const delivered =
+        (await context.services?.onRemoteEngineAdaptersChanged?.(device.id)) ?? false;
+      return { cliDeviceId: device.id, adapters: [], delivered };
     }),
 };

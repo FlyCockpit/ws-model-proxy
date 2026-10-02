@@ -33,6 +33,8 @@ import {
   externalFallbackMemberWhere,
   poolProviderDisclosure,
 } from "../lib/effective-provider-egress";
+import { DEFAULT_KV_FULL_THRESHOLD } from "../lib/engine-load";
+import { type EngineLoadMinuteRow, shapeEngineLoadOverview } from "../lib/engine-load-overview";
 import { readyOwnKeyPreferenceWhere } from "../lib/model-api-token-access";
 import {
   type Accumulator,
@@ -79,6 +81,7 @@ const poolSelect = {
         select: {
           id: true,
           kind: true,
+          inferenceCapacityId: true,
           DiscoveredModel: {
             select: {
               upstreamModelId: true,
@@ -270,6 +273,35 @@ export const overviewRouter = {
     if (input.poolId && pools.length === 0) {
       throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
     }
+    const capacityIds = [
+      ...new Set(
+        pools.flatMap((pool) =>
+          pool.PoolMembers.flatMap((member) =>
+            member.ExecutionTarget?.inferenceCapacityId
+              ? [member.ExecutionTarget.inferenceCapacityId]
+              : [],
+          ),
+        ),
+      ),
+    ];
+    const engineLoadRows =
+      capacityIds.length === 0
+        ? []
+        : ((await prisma.engineLoadRollupMinute.findMany({
+            where: {
+              ownerUserId: userId,
+              capacityId: { in: capacityIds },
+              bucketStart: { gte: window.start, lt: window.end },
+            },
+            select: {
+              bucketStart: true,
+              capacityId: true,
+              maxRunning: true,
+              maxWaiting: true,
+              maxKvUsage: true,
+              maxKvOccupancy: true,
+            },
+          })) ?? []);
     const [[aggregates, histograms, series], [sharedAggregates, sharedHistograms]] =
       await Promise.all([
         queryRollups({
@@ -365,6 +397,21 @@ export const overviewRouter = {
           series.filter((row) => row.poolId === pool.id),
           seriesKeys,
         ),
+        engineLoad: {
+          effectiveKvFullThreshold: DEFAULT_KV_FULL_THRESHOLD,
+          series:
+            window.range === "1h"
+              ? []
+              : shapeEngineLoadOverview({
+                  window,
+                  capacityIds: pool.PoolMembers.flatMap((member) =>
+                    member.ExecutionTarget?.inferenceCapacityId
+                      ? [member.ExecutionTarget.inferenceCapacityId]
+                      : [],
+                  ),
+                  rows: engineLoadRows as EngineLoadMinuteRow[],
+                }),
+        },
       };
     });
     poolCards.sort((left, right) => right.current.requests - left.current.requests);

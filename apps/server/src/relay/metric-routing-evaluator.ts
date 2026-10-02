@@ -69,12 +69,12 @@ export type RoutingEvaluationState = {
   probed: Set<string>;
 };
 
-/** Rule verdict OR engine-load verdict: engine load only adds FULL. */
+/** Rule verdict OR engine-load verdict: engine load only adds FULL when enforced. */
 export function combineWithEngineLoad(
   rules: RoutingEvaluation,
   engine: EngineLoadVerdict,
 ): RoutingEvaluation {
-  if (!engine.full || !engine.expiresAt) return rules;
+  if (!engine.full || !engine.enforced || !engine.expiresAt) return rules;
   const expiresAt =
     rules.verdict === "full" && rules.expiresAt.getTime() > engine.expiresAt.getTime()
       ? rules.expiresAt
@@ -113,8 +113,8 @@ function rulesKey(rules: unknown): string {
 }
 
 /** The member's engine-load override an evaluation used, compared by value. */
-function overrideKey(mode: string, kvFullThreshold: number | null): string {
-  return `${mode}:${kvFullThreshold ?? ""}`;
+function overrideKey(mode: string, kvFullThreshold: number | null, customMode?: string): string {
+  return `${mode}:${kvFullThreshold ?? ""}:${customMode ?? ""}`;
 }
 
 type PublishedEntry = {
@@ -220,12 +220,20 @@ export class MetricRoutingEvaluator {
         id: true,
         poolId: true,
         engineLoadMode: true,
+        customEngineLoadMode: true,
         kvFullThreshold: true,
         ModelPool: { select: { routingRules: true } },
         DiscoveredModel: { select: { slug: true, Endpoint: { select: { slug: true } } } },
         ExecutionTarget: {
           select: {
-            InferenceCapacity: { select: { engineKind: true, engineSlots: true } },
+            InferenceCapacity: {
+              select: {
+                engineKind: true,
+                engineSlots: true,
+                engineLoadSource: true,
+                engineLoadSignals: true,
+              },
+            },
             DiscoveredModel: { select: { slug: true, Endpoint: { select: { slug: true } } } },
           },
         },
@@ -244,13 +252,20 @@ export class MetricRoutingEvaluator {
       if (!model) continue;
       const memberRef = { endpointSlug: model.Endpoint.slug, modelSlug: model.slug ?? null };
       const capacity = member.ExecutionTarget?.InferenceCapacity ?? null;
+      const reading = pickEndpointLoad(inputs.endpointLoad, memberRef);
+      const loadSource =
+        capacity?.engineLoadSource === "CUSTOM" || reading?.source === "custom"
+          ? ("custom" as const)
+          : ("builtin" as const);
       const facts: EngineLoadFacts = {
         engineKind: engineKindFromDb(capacity?.engineKind),
         engineSlots: capacity?.engineSlots ?? null,
         mode: member.engineLoadMode === "OFF" ? "OFF" : "AUTO",
         kvFullThreshold: member.kvFullThreshold ?? null,
+        loadSource,
+        signals: capacity?.engineLoadSignals ?? [],
+        customMode: member.customEngineLoadMode === "ENFORCE" ? "ENFORCE" : "OBSERVE",
       };
-      const reading = pickEndpointLoad(inputs.endpointLoad, memberRef);
       const engine = evaluateEngineLoad(
         facts,
         reading ? { ...reading, waitingStreak: reading.waitingStreak ?? 0 } : null,
@@ -269,7 +284,7 @@ export class MetricRoutingEvaluator {
         engine,
       );
       // Rules and overrides invalidate the cache even when edited on another process.
-      const key = `${evaluation.verdict}:${evaluation.ruleStates.join(",")}:${engine.state}:${rulesKey(rules)}:${overrideKey(facts.mode, facts.kvFullThreshold)}`;
+      const key = `${evaluation.verdict}:${evaluation.ruleStates.join(",")}:${engine.state}:${engine.enforced}:${rulesKey(rules)}:${overrideKey(facts.mode, facts.kvFullThreshold, facts.customMode)}`;
       if (
         previous &&
         previous.key === key &&
@@ -301,7 +316,7 @@ export class MetricRoutingEvaluator {
           memberId: member.id,
           poolId: member.poolId,
           rulesKey: rulesKey(rules),
-          overrideKey: overrideKey(facts.mode, facts.kvFullThreshold),
+          overrideKey: overrideKey(facts.mode, facts.kvFullThreshold, facts.customMode),
         });
       }
     }
@@ -379,12 +394,16 @@ export class MetricRoutingEvaluator {
     );
     const members = await this.db.poolMember.findMany({
       where: { id: { in: published.map((entry) => entry.memberId) } },
-      select: { id: true, engineLoadMode: true, kvFullThreshold: true },
+      select: { id: true, engineLoadMode: true, customEngineLoadMode: true, kvFullThreshold: true },
     });
     const currentOverride = new Map(
       members.map((member) => [
         member.id,
-        overrideKey(member.engineLoadMode === "OFF" ? "OFF" : "AUTO", member.kvFullThreshold),
+        overrideKey(
+          member.engineLoadMode === "OFF" ? "OFF" : "AUTO",
+          member.kvFullThreshold,
+          member.customEngineLoadMode === "ENFORCE" ? "ENFORCE" : "OBSERVE",
+        ),
       ]),
     );
     const stale = published.filter(

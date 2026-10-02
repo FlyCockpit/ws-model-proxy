@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CUSTOM_FULL_SIGNALS,
   DEFAULT_KV_FULL_THRESHOLD,
   type EngineLoadFacts,
   type EngineLoadReading,
   effectiveKvFullThreshold,
+  engineHasLoadSignal,
   engineKindFromDb,
   evaluateEngineLoad,
 } from "./engine-load";
@@ -210,6 +212,119 @@ describe("evaluateEngineLoad", () => {
       state: "full_waiting",
       full: true,
     },
+    {
+      name: "custom occupancy never marks FULL",
+      facts: {
+        engineKind: "GENERIC" as const,
+        loadSource: "custom" as const,
+        signals: ["running", "kvOccupancy"],
+        customMode: "ENFORCE" as const,
+      },
+      reading: { kvOccupancy: 1, running: 1 },
+      state: "none",
+      full: false,
+    },
+    {
+      name: "custom kvUsage FULL only when that signal is present",
+      facts: {
+        engineKind: "GENERIC" as const,
+        loadSource: "custom" as const,
+        signals: ["kvUsage"],
+        customMode: "ENFORCE" as const,
+      },
+      reading: { kvUsage: 0.96, kvOccupancy: 1 },
+      state: "full_kv",
+      full: true,
+    },
+    {
+      name: "custom missing kvUsage does not FULL",
+      facts: {
+        engineKind: "GENERIC" as const,
+        loadSource: "custom" as const,
+        signals: ["kvUsage"],
+        customMode: "ENFORCE" as const,
+      },
+      reading: { kvOccupancy: 1 },
+      state: "clear",
+      full: false,
+    },
+    {
+      name: "custom waiting sustained is FULL",
+      facts: {
+        engineKind: "GENERIC" as const,
+        loadSource: "custom" as const,
+        signals: ["waiting"],
+        customMode: "ENFORCE" as const,
+      },
+      reading: { waiting: 2, waitingStreak: 2 },
+      state: "full_waiting",
+      full: true,
+    },
+    {
+      name: "custom slotsBusy FULL when slots known",
+      facts: {
+        engineKind: "GENERIC" as const,
+        engineSlots: 4,
+        loadSource: "custom" as const,
+        signals: ["slotsBusy"],
+        customMode: "ENFORCE" as const,
+      },
+      reading: { slotsBusy: 4 },
+      state: "full_slots",
+      full: true,
+    },
+    {
+      name: "custom deferred FULL",
+      facts: {
+        engineKind: "GENERIC" as const,
+        loadSource: "custom" as const,
+        signals: ["deferred"],
+        customMode: "ENFORCE" as const,
+      },
+      reading: { deferred: 1 },
+      state: "full_deferred",
+      full: true,
+    },
+    {
+      name: "custom stale fails open",
+      facts: {
+        engineKind: "GENERIC" as const,
+        loadSource: "custom" as const,
+        signals: ["kvUsage"],
+        customMode: "ENFORCE" as const,
+      },
+      reading: {
+        kvUsage: 1,
+        receivedAt: new Date(NOW.getTime() - ENDPOINT_LOAD_STALE_AFTER_MS - 1),
+      },
+      state: "stale",
+      full: false,
+    },
+    {
+      name: "OBSERVE custom FULL is reported but not enforced",
+      facts: {
+        engineKind: "GENERIC" as const,
+        loadSource: "custom" as const,
+        signals: ["kvUsage"],
+        customMode: "OBSERVE" as const,
+      },
+      reading: { kvUsage: 1 },
+      state: "full_kv",
+      full: true,
+    },
+    {
+      name: "OFF overrides custom ENFORCE",
+      facts: {
+        engineKind: "GENERIC" as const,
+        mode: "OFF" as const,
+        loadSource: "custom" as const,
+        signals: ["kvUsage"],
+        customMode: "ENFORCE" as const,
+      },
+      reading: { kvUsage: 1 },
+      state: "off",
+      full: false,
+    },
   ];
   it.each(cases)("$name", (testCase) => {
     const verdict = evaluateEngineLoad(
@@ -219,6 +334,11 @@ describe("evaluateEngineLoad", () => {
     );
     expect(verdict.state).toBe(testCase.state);
     expect(verdict.full).toBe(testCase.full);
+    if (testCase.name === "OBSERVE custom FULL is reported but not enforced") {
+      expect(verdict.enforced).toBe(false);
+    } else {
+      expect(verdict.enforced).toBe(testCase.full);
+    }
     // A FULL verdict always carries an expiry no later than the staleness window.
     if (testCase.full) {
       expect(verdict.expiresAt).not.toBeNull();
@@ -253,5 +373,13 @@ describe("helpers", () => {
     expect(engineKindFromDb("VLLM")).toBe("VLLM");
     expect(engineKindFromDb("nope")).toBeNull();
     expect(engineKindFromDb(null)).toBeNull();
+    expect(CUSTOM_FULL_SIGNALS).toEqual(["waiting", "kvUsage", "slotsBusy", "deferred"]);
+    expect(engineHasLoadSignal("GENERIC")).toBe(false);
+    expect(engineHasLoadSignal("GENERIC", { loadSource: "custom", signals: ["kvOccupancy"] })).toBe(
+      false,
+    );
+    expect(engineHasLoadSignal("GENERIC", { loadSource: "custom", signals: ["kvUsage"] })).toBe(
+      true,
+    );
   });
 });

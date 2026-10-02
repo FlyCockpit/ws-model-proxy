@@ -285,6 +285,14 @@ pub struct Config {
     /// still needs `wsmp metrics approve` of its exact command.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_remote_metric_sources: bool,
+    /// Accept remotely defined engine adapters (`engine.adapters.set`). Separate
+    /// from metric-source opt-in; read once when the relay starts. Each remote
+    /// adapter still needs `wsmp endpoints adapter approve` of its canonical spec.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_remote_engine_adapters: bool,
+    /// Remote adapter endpoint slug -> SHA-256 (hex) of the approved canonical spec.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub approved_remote_adapters: std::collections::BTreeMap<String, String>,
     /// Custom metric sources and remote-source approvals.
     #[serde(default, skip_serializing_if = "MetricsConfig::is_empty")]
     pub metrics: MetricsConfig,
@@ -353,6 +361,8 @@ struct ConfigWire {
     #[serde(deserialize_with = "deserialize_file_roots")]
     file_roots: Vec<PathBuf>,
     allow_remote_metric_sources: bool,
+    allow_remote_engine_adapters: bool,
+    approved_remote_adapters: std::collections::BTreeMap<String, String>,
     metrics: MetricsConfig,
 }
 
@@ -374,6 +384,8 @@ impl Default for ConfigWire {
             mcp_file_read: false,
             file_roots: Vec::new(),
             allow_remote_metric_sources: false,
+            allow_remote_engine_adapters: false,
+            approved_remote_adapters: std::collections::BTreeMap::new(),
             metrics: MetricsConfig::default(),
         }
     }
@@ -401,6 +413,8 @@ impl From<ConfigWire> for Config {
             mcp_file_read: wire.mcp_file_read,
             file_roots: wire.file_roots,
             allow_remote_metric_sources: wire.allow_remote_metric_sources,
+            allow_remote_engine_adapters: wire.allow_remote_engine_adapters,
+            approved_remote_adapters: wire.approved_remote_adapters,
             metrics: wire.metrics,
         }
     }
@@ -422,6 +436,8 @@ impl Default for Config {
             mcp_file_read: false,
             file_roots: Vec::new(),
             allow_remote_metric_sources: false,
+            allow_remote_engine_adapters: false,
+            approved_remote_adapters: std::collections::BTreeMap::new(),
             metrics: MetricsConfig::default(),
         }
     }
@@ -444,6 +460,14 @@ pub struct EndpointConfig {
     /// server fallback of 1. An existing non-null capacity is left unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub concurrency_limit: Option<u32>,
+    /// Declared total KV capacity in tokens. Digest-excluded like
+    /// `concurrencyLimit`; when set it wins over a probed K.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_tokens: Option<u64>,
+    /// Custom engine adapter. Digest-excluded; when set it replaces the
+    /// built-in load scrape for this endpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_adapter: Option<crate::engine_adapter::EngineAdapterConfig>,
     /// Upstream engine. `auto` (the default) detects it at probe time; an
     /// explicit value overrides detection. llama.cpp and vLLM advertise
     /// `top_k` in the inventory only when declared explicitly.
@@ -467,6 +491,8 @@ impl Default for EndpointConfig {
             enabled: true,
             expand_media: false,
             concurrency_limit: None,
+            kv_tokens: None,
+            engine_adapter: None,
             engine: EndpointEngine::Auto,
             default_capabilities: OpenAiCompatibleCapabilities::default(),
             headers: Vec::new(),
@@ -605,6 +631,10 @@ pub struct ProbeSnapshot {
     /// the inventory and never part of the inventory digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<crate::engine::DetectedEngine>,
+    /// Integer facts from the last successful adapter run. Kept across a
+    /// failing run so K does not flap to null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<crate::engine_adapter::AdapterCachedFacts>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1551,6 +1581,19 @@ impl Config {
                     endpoint.slug
                 );
             }
+            if let Some(tokens) = endpoint.kv_tokens
+                && !(1..=1_000_000_000_000).contains(&tokens)
+            {
+                anyhow::bail!(
+                    "endpoint `{}` kvTokens must be an integer from 1 to 1000000000000",
+                    endpoint.slug
+                );
+            }
+            if let Some(adapter) = &endpoint.engine_adapter {
+                adapter.validate().with_context(|| {
+                    format!("validating engine adapter for endpoint `{}`", endpoint.slug)
+                })?;
+            }
             if let Some(auth) = &endpoint.auth {
                 validate_env_name(&auth.env)?;
             }
@@ -2292,6 +2335,7 @@ mod tests {
             models: Vec::new(),
             suggested_capabilities: OpenAiCompatibleCapabilities::default(),
             engine: None,
+            adapter: None,
         });
         assert!(config.validate().is_err());
 

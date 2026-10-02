@@ -35,6 +35,8 @@ const CLI_TOOL_CAPABILITIES: ReadonlyMap<string, CliToolCapability> = new Map([
   // Defines commands that run on the person's machine (custom metric sources),
   // so it needs the same per-credential opt-in as the tools above.
   ["forwarder_device_metric_sources_set", "command"],
+  ["forwarder_device_engine_adapters_set", "command"],
+  ["forwarder_device_engine_adapters_clear", "command"],
   ["forwarder_cli_file_read", "file_read"],
   ["forwarder_cli_file_stat", "file_read"],
   ["forwarder_cli_dir_list", "file_read"],

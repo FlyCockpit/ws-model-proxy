@@ -49,8 +49,10 @@ the generated Homebrew formula to the tap.
 
 ## Relay protocol changes
 
-The server accepts exactly one relay protocol version, so a protocol bump
-ships the server and wsmp together. Relay protocol 2.7 (engine facts,
+The server accepts the listed relay protocol versions
+(`RELAY_PROTOCOL_VERSIONS`), oldest first; the minimum is
+`RELAY_MIN_PROTOCOL_VERSION`. A protocol bump ships the server and wsmp
+together when the minimum moves. Relay protocol 2.7 (engine facts,
 `node.info`, `node.metrics`, `endpoint.load`, `metrics.sources.set`) replaced
 2.6: a 2.6 wsmp (0.4.x) connecting to a 2.7 server is refused with "This
 server requires a newer wsmp (relay protocol 2.7). Upgrade wsmp and restart
@@ -69,9 +71,13 @@ card shows "CLI upgrade required (protocol 2.7)". 2.8 defines every file frame
 at once (`file.op`, `file.cancel`, `file.body`, `file.result`, `file.rejected`,
 `file.data`, and the supervised-file `term.spawn` variant) so the fleet upgrades
 only once; a wsmp answers `unsupported` for the parts a later phase implements.
-Do not cut a wsmp release until the whole file-tools series (P2 to P5) has
-landed, and word that release note as a joint server and CLI upgrade to 2.8.
-Model deployments take 2.9.
+
+Relay protocol 2.9 adds custom engine adapter fields (`engineFacts.loadAdapter`,
+`engineFacts.*.source` `custom`, `endpoint.load` source `custom` and
+`kvOccupancy`, optional `waiting` for custom, `node.metrics.engineAdapters`).
+This CLI speaks 2.9. The server still accepts 2.8 hellos; a 2.8 CLI does not
+send the new fields. 2.10 and above are too new. Word the 2.9 release note as
+a joint server and CLI upgrade, and keep 2.8 devices connected.
 
 ## One-time setup
 

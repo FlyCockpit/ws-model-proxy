@@ -40,6 +40,7 @@ export const relayRollupSelect = {
   cacheReadTokens: true,
   cacheWriteTokens: true,
   usageKnown: true,
+  affinityOutcome: true,
   // Durable resource owner (database-derived at insert; survives pool deletion).
   resourceOwnerUserId: true,
 } satisfies Prisma.RelayRequestSelect;
@@ -90,6 +91,9 @@ export type UsageRollupCounters = {
   cacheWriteTokens: bigint;
   cacheKnownRequests: number;
   cacheKnownInputTokens: bigint;
+  continuationRequests: number;
+  continuationInputTokens: bigint;
+  continuationCacheReadTokens: bigint;
   durationCount: number;
   durationSumMs: bigint;
   latencyHistogram: number[];
@@ -102,6 +106,11 @@ export type UsageRollupIncrement = UsageRollupKey & UsageRollupCounters;
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
+
+/** Routed onto a known session (not first-turn / no-match / spilled). */
+export function isMatchedAffinityOutcome(value: string | null | undefined): boolean {
+  return value === "PREDICTED_MATCH" || value === "HOLDER_WAITED";
+}
 
 export function truncateToMinute(value: Date): Date {
   return new Date(Math.floor(value.getTime() / MINUTE_MS) * MINUTE_MS);
@@ -135,6 +144,7 @@ export function rollupIncrementForRequest(
   const ttftHistogram = emptyLatencyHistogram();
   if (ttftMs !== null) ttftHistogram[latencyBucketIndex(ttftMs)]! += 1;
   const cacheKnown = row.usageKnown && row.cacheReadTokens !== null;
+  const continuation = cacheKnown && isMatchedAffinityOutcome(row.affinityOutcome);
   return {
     bucketStart: truncateToMinute(completedAt),
     ownerUserId: resourceOwnerUserId(row),
@@ -155,6 +165,9 @@ export function rollupIncrementForRequest(
     cacheWriteTokens: BigInt(row.usageKnown ? (row.cacheWriteTokens ?? 0) : 0),
     cacheKnownRequests: cacheKnown ? 1 : 0,
     cacheKnownInputTokens: BigInt(cacheKnown ? (row.promptTokens ?? 0) : 0),
+    continuationRequests: continuation ? 1 : 0,
+    continuationInputTokens: BigInt(continuation ? (row.promptTokens ?? 0) : 0),
+    continuationCacheReadTokens: BigInt(continuation ? (row.cacheReadTokens ?? 0) : 0),
     durationCount: durationMs === null ? 0 : 1,
     durationSumMs: BigInt(durationMs ?? 0),
     latencyHistogram,
@@ -202,6 +215,9 @@ export function addRollupCounters<T extends UsageRollupCounters>(
   target.cacheWriteTokens += add.cacheWriteTokens;
   target.cacheKnownRequests += add.cacheKnownRequests;
   target.cacheKnownInputTokens += add.cacheKnownInputTokens;
+  target.continuationRequests += add.continuationRequests;
+  target.continuationInputTokens += add.continuationInputTokens;
+  target.continuationCacheReadTokens += add.continuationCacheReadTokens;
   target.durationCount += add.durationCount;
   target.durationSumMs += add.durationSumMs;
   target.latencyHistogram = addHistograms(target.latencyHistogram, add.latencyHistogram);
@@ -262,6 +278,9 @@ const ADDITIVE_COLUMNS = [
   "cacheWriteTokens",
   "cacheKnownRequests",
   "cacheKnownInputTokens",
+  "continuationRequests",
+  "continuationInputTokens",
+  "continuationCacheReadTokens",
   "durationCount",
   "durationSumMs",
   "ttftCount",
@@ -289,7 +308,9 @@ export function rollupUpsertSql(
       "executionTargetId", "source", "updatedAt",
       "requests", "successes", "errors", "cancels", "retries", "usageKnownRequests",
       "inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens",
-      "cacheKnownRequests", "cacheKnownInputTokens", "durationCount", "durationSumMs",
+      "cacheKnownRequests", "cacheKnownInputTokens",
+      "continuationRequests", "continuationInputTokens", "continuationCacheReadTokens",
+      "durationCount", "durationSumMs",
       "latencyHistogram", "ttftCount", "ttftSumMs", "ttftHistogram"
     )
     SELECT
@@ -300,7 +321,10 @@ export function rollupUpsertSql(
       ${increment.retries}, ${increment.usageKnownRequests},
       ${increment.inputTokens}, ${increment.outputTokens}, ${increment.cacheReadTokens},
       ${increment.cacheWriteTokens}, ${increment.cacheKnownRequests},
-      ${increment.cacheKnownInputTokens}, ${increment.durationCount}, ${increment.durationSumMs},
+      ${increment.cacheKnownInputTokens},
+      ${increment.continuationRequests}, ${increment.continuationInputTokens},
+      ${increment.continuationCacheReadTokens},
+      ${increment.durationCount}, ${increment.durationSumMs},
       ${increment.latencyHistogram}::integer[], ${increment.ttftCount}, ${increment.ttftSumMs},
       ${increment.ttftHistogram}::integer[]
     -- The owner key is a durable plain id (relay_request.resourceOwnerUserId):

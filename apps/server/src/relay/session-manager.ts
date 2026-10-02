@@ -29,9 +29,12 @@ import {
   type PoolMemberFailureClass,
 } from "@ws-model-proxy/api/lib/model-pool-routing";
 import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import { parseStoredRemoteEngineAdapters } from "@ws-model-proxy/api/lib/remote-engine-adapters";
 import type { SupervisedCommandStatus } from "@ws-model-proxy/api/lib/supervised-command-types";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { startRelayAttempt } from "../model-api/relay-executor.js";
+import { EngineLoadHistoryStore } from "./engine-load-history.js";
+import { observeEngineLoadRollup } from "./engine-load-rollup.js";
 import {
   type FileOp,
   type FileOpFrame,
@@ -76,9 +79,11 @@ import {
   type RelayProtocolVersion,
   type RelayResponseBodyMetadata,
   type RelayServerControlMessage,
+  type RemoteEngineAdapter,
   type RemoteMetricSource,
   rejectedHelloFacts,
   relayProtocolAtLeast,
+  remoteEngineAdaptersSchema,
   remoteMetricSourcesSchema,
   type TerminalHandshakeIdentity,
   type TerminalSealedMetadata,
@@ -401,6 +406,8 @@ type SessionState = {
   registered: boolean;
   /** Serialises `metrics.sources.set` sends: each re-reads the device after the previous one was sent. */
   remoteSourcesQueue: Promise<void>;
+  /** Serialises `engine.adapters.set` sends the same way. */
+  remoteAdaptersQueue: Promise<void>;
   inventoryConfirmed: boolean;
   endpointTargeting: boolean;
   protocolVersion: RelayProtocolVersion | null;
@@ -614,6 +621,8 @@ function closeWithProtocolError(socket: RelaySocket, message: string) {
 export class RelaySessionManager {
   private sessionsBySocket = new Map<RelaySocket, SessionState>();
   private sessionsByCliDeviceId = new Map<string, SessionState>();
+  /** Manager-level so a reconnect does not wipe the 30-minute ring. */
+  private engineLoadHistory = new EngineLoadHistoryStore();
   private featureGrantsRefreshByCliDeviceId = new Map<string, Promise<void>>();
   private grantChangeSeq = 0;
   // One integer per device changed since process start. There is no device-delete
@@ -695,6 +704,7 @@ export class RelaySessionManager {
       cli: null,
       registered: false,
       remoteSourcesQueue: Promise.resolve(),
+      remoteAdaptersQueue: Promise.resolve(),
       inventoryConfirmed: false,
       endpointTargeting: false,
       protocolVersion: null,
@@ -857,6 +867,7 @@ export class RelaySessionManager {
           }),
         );
         await this.sendRemoteMetricSources(session);
+        await this.sendRemoteEngineAdapters(session);
       } catch (error) {
         // Already detached and closed by whoever detached it.
         if (this.sessionsBySocket.get(socket) !== session) return;
@@ -1448,6 +1459,7 @@ export class RelaySessionManager {
           // when the grant read above failed: the push re-reads the committed
           // mode itself and fails closed (an empty list) on any error.
           await this.onRemoteMetricSourcesChanged(cliDeviceId);
+          await this.onRemoteEngineAdaptersChanged(cliDeviceId);
         }
       });
     this.featureGrantsRefreshByCliDeviceId.set(cliDeviceId, refresh);
@@ -1648,7 +1660,10 @@ export class RelaySessionManager {
       // "Sustained" waiting counts consecutive accepted frames. A gap longer
       // than the staleness window restarts the count (fail open).
       const continuous = previous && nowMs - previous.receivedAtMs <= ENDPOINT_LOAD_STALE_AFTER_MS;
-      const waitingStreak = load.waiting > 0 ? (continuous ? previous.waitingStreak : 0) + 1 : 0;
+      const waitingStreak =
+        load.waiting != null && load.waiting > 0
+          ? (continuous ? previous.waitingStreak : 0) + 1
+          : 0;
       session.endpointLoad.set(key, {
         ...load,
         modelSlug: load.modelSlug ?? null,
@@ -1657,6 +1672,32 @@ export class RelaySessionManager {
         prefixCacheQueriesTotal: addCapped(previous?.prefixCacheQueriesTotal ?? 0, queriesDelta),
         receivedAt: now,
         receivedAtMs: nowMs,
+      });
+      this.engineLoadHistory.record(cliDeviceId, load.endpointSlug, load.modelSlug ?? null, {
+        running: load.running,
+        waiting: load.waiting,
+        kvUsage: load.kvUsage,
+        kvOccupancy: load.kvOccupancy,
+        slotsBusy: load.slotsBusy,
+        prefixCacheHitsDelta: hitsDelta,
+        prefixCacheQueriesDelta: queriesDelta,
+        source: load.source,
+        receivedAt: now,
+      });
+      observeEngineLoadRollup({
+        ownerUserId: session.identity.userId,
+        cliDeviceId,
+        endpointSlug: load.endpointSlug,
+        modelSlug: load.modelSlug ?? null,
+        receivedAt: now,
+        running: load.running,
+        waiting: load.waiting,
+        kvUsage: load.kvUsage,
+        kvOccupancy: load.kvOccupancy,
+        slotsBusy: load.slotsBusy,
+        prefixCacheHitsDelta: hitsDelta,
+        prefixCacheQueriesDelta: queriesDelta,
+        source: load.source,
       });
       this.scheduleRoutingEvaluation(session);
       return;
@@ -1805,6 +1846,77 @@ export class RelaySessionManager {
     return await this.sendRemoteMetricSources(session);
   }
 
+  /**
+   * Send the device's remotely defined engine adapters (`engine.adapters.set`)
+   * to its live 2.9 session. Only an `unsupervised` device gets definitions;
+   * any other mode gets an empty list. The CLI still needs its separate
+   * local opt-in and a hash approval of each canonical spec.
+   */
+  private sendRemoteEngineAdapters(session: SessionState): Promise<boolean> {
+    const turn = session.remoteAdaptersQueue.then(() => this.sendRemoteEngineAdaptersNow(session));
+    session.remoteAdaptersQueue = turn.then(() => undefined);
+    return turn;
+  }
+
+  private async sendRemoteEngineAdaptersNow(session: SessionState): Promise<boolean> {
+    if (!relayProtocolAtLeast(session.protocolVersion, "2.9")) return false;
+    const cliDeviceId = session.cliDeviceId;
+    if (!cliDeviceId) return false;
+    let adapters: RemoteEngineAdapter[] = [];
+    let intended = false;
+    try {
+      const device = await prisma.cliDevice.findUnique({
+        where: { id: cliDeviceId },
+        select: { userId: true, mcpCommandMode: true, remoteEngineAdapters: true },
+      });
+      if (device && device.userId === session.identity.userId) {
+        const wire = remoteEngineAdaptersSchema.safeParse(
+          device.mcpCommandMode === "UNSUPERVISED"
+            ? parseStoredRemoteEngineAdapters(device.remoteEngineAdapters)
+            : [],
+        );
+        if (wire.success) {
+          adapters = wire.data;
+          intended = true;
+        } else {
+          console.error(
+            "[relay] stored remote engine adapters failed the wire schema; sending none",
+          );
+        }
+      }
+    } catch (error) {
+      console.error(
+        "[relay] reading remote engine adapters failed; withdrawing them",
+        error instanceof Error ? error.name : typeof error,
+      );
+    }
+    if (this.sessionsByCliDeviceId.get(cliDeviceId) !== session) return false;
+    if (session.socket.readyState !== WS_READY_STATE_OPEN) return false;
+    try {
+      session.socket.send(
+        encodeRelayServerControlMessage({
+          type: "engine.adapters.set",
+          id: `adapters-${randomBytes(8).toString("hex")}`,
+          adapters,
+        }),
+      );
+      return intended;
+    } catch (error) {
+      console.error(
+        "[relay] sending remote engine adapters failed",
+        error instanceof Error ? error.name : typeof error,
+      );
+      return false;
+    }
+  }
+
+  /** The dashboard or MCP changed a device's remote engine adapters. */
+  async onRemoteEngineAdaptersChanged(cliDeviceId: string) {
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    if (!session?.registered) return false;
+    return await this.sendRemoteEngineAdapters(session);
+  }
+
   private async writeTelemetry(
     cliDeviceId: string,
     data:
@@ -1820,6 +1932,18 @@ export class RelaySessionManager {
         error instanceof Error ? error.name : typeof error,
       );
     }
+  }
+
+  /** 30-minute engine-load history; survives reconnect of the same process. */
+  getLiveEngineLoadHistory(
+    keys: readonly {
+      cliDeviceId: string;
+      endpointSlug: string;
+      modelSlug: string | null;
+    }[],
+    now: Date = new Date(),
+  ) {
+    return this.engineLoadHistory.snapshot(keys, now);
   }
 
   /** The freshest node metrics and endpoint load per connected CLI. */

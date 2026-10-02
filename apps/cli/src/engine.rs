@@ -20,9 +20,9 @@ use crate::config::EndpointConfig;
 
 /// Largest body read from `/props`, `/get_server_info`, `/api/version` and
 /// `/api/v0/models`.
-const JSON_BODY_LIMIT: u64 = 256 * 1024;
+pub(crate) const JSON_BODY_LIMIT: u64 = 256 * 1024;
 /// Largest `/metrics` body read. vLLM histograms are verbose.
-const METRICS_BODY_LIMIT: u64 = 2 * 1024 * 1024;
+pub(crate) const METRICS_BODY_LIMIT: u64 = 2 * 1024 * 1024;
 /// `/slots` may carry prompt text in some builds; the body is read (bounded)
 /// and parsed without keeping it.
 const SLOTS_BODY_LIMIT: u64 = 4 * 1024 * 1024;
@@ -534,8 +534,10 @@ pub fn vllm_kv_tokens(samples: &[PromSample]) -> Option<u64> {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LoadReading {
     pub running: u64,
-    pub waiting: u64,
+    pub waiting: Option<u64>,
     pub kv_usage: Option<f64>,
+    /// Active plus idle cached prefixes. Display only; never a FULL signal.
+    pub kv_occupancy: Option<f64>,
     pub slots_busy: Option<u64>,
     pub deferred: Option<u64>,
     /// Cumulative prefix-cache counters; the sampler turns them into deltas.
@@ -554,6 +556,7 @@ pub enum LoadSource {
     LlamaCppMetrics,
     VllmMetrics,
     SglangMetrics,
+    Custom,
 }
 
 fn count(value: Option<f64>) -> Option<u64> {
@@ -574,7 +577,7 @@ pub fn vllm_load(samples: &[PromSample]) -> Option<LoadReading> {
     let waiting = count(sum_values(samples, &["vllm:num_requests_waiting"])).unwrap_or(0);
     Some(LoadReading {
         running,
-        waiting,
+        waiting: Some(waiting),
         kv_usage: fraction(first_value(
             samples,
             &["vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"],
@@ -600,7 +603,7 @@ pub fn sglang_load(samples: &[PromSample]) -> Option<LoadReading> {
     let running = count(sum_values(samples, &["sglang:num_running_reqs"]))?;
     Some(LoadReading {
         running,
-        waiting: count(sum_values(samples, &["sglang:num_queue_reqs"])).unwrap_or(0),
+        waiting: Some(count(sum_values(samples, &["sglang:num_queue_reqs"])).unwrap_or(0)),
         kv_usage: fraction(first_value(samples, &["sglang:token_usage"])),
         source: LoadSource::SglangMetrics,
         ..LoadReading::default()
@@ -613,9 +616,9 @@ pub fn llama_metrics_load(samples: &[PromSample]) -> Option<LoadReading> {
     let deferred = count(first_value(samples, &["llamacpp:requests_deferred"]));
     Some(LoadReading {
         running,
-        waiting: deferred.unwrap_or(0),
+        waiting: Some(deferred.unwrap_or(0)),
         deferred,
-        kv_usage: fraction(first_value(samples, &["llamacpp:kv_cache_usage_ratio"])),
+        kv_occupancy: fraction(first_value(samples, &["llamacpp:kv_cache_usage_ratio"])),
         source: LoadSource::LlamaCppMetrics,
         ..LoadReading::default()
     })
@@ -647,7 +650,7 @@ pub fn llama_slots_load(slots: &[LlamaSlot]) -> LoadReading {
         .count() as u64;
     LoadReading {
         running: busy,
-        waiting: 0,
+        waiting: Some(0),
         slots_busy: Some(busy),
         source: LoadSource::LlamaCppSlots,
         ..LoadReading::default()
@@ -917,7 +920,7 @@ mod tests {
     fn vllm_load_reads_running_waiting_and_kv_usage() {
         let load = vllm_load(&parse_prometheus(VLLM_METRICS)).expect("load");
         assert_eq!(load.running, 3);
-        assert_eq!(load.waiting, 2);
+        assert_eq!(load.waiting, Some(2));
         assert_eq!(load.kv_usage, Some(0.42));
         assert_eq!(load.prefix_cache_hits_total, Some(1200.0));
         assert_eq!(load.prefix_cache_queries_total, Some(4000.0));
@@ -928,7 +931,7 @@ mod tests {
     fn sglang_load_reads_running_queue_and_token_usage() {
         let load = sglang_load(&parse_prometheus(SGLANG_METRICS)).expect("load");
         assert_eq!(load.running, 7);
-        assert_eq!(load.waiting, 1);
+        assert_eq!(load.waiting, Some(1));
         assert_eq!(load.kv_usage, Some(0.5));
     }
 
@@ -942,12 +945,14 @@ mod tests {
         .expect("load");
         assert_eq!(merged.running, 1);
         assert_eq!(merged.deferred, Some(2));
-        assert_eq!(merged.waiting, 2);
+        assert_eq!(merged.waiting, Some(2));
         assert_eq!(merged.slots_busy, Some(1));
+        assert_eq!(merged.kv_occupancy, Some(0.35));
+        assert_eq!(merged.kv_usage, None);
         assert_eq!(merged.source, LoadSource::LlamaCppMetrics);
         let slots_only = merge_llama_load(Some(llama_slots_load(&slots)), None).expect("load");
         assert_eq!(slots_only.running, 1);
-        assert_eq!(slots_only.waiting, 0);
+        assert_eq!(slots_only.waiting, Some(0));
     }
 
     #[test]

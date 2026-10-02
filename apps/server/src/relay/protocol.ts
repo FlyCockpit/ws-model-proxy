@@ -156,6 +156,12 @@ const v28FeatureSchema = z
      */
     remoteMetricSources: z.boolean(),
     /**
+     * 2.9: the CLI accepts remotely defined engine adapters
+     * (`engine.adapters.set`): its local `allowRemoteEngineAdapters` opt-in
+     * is on. Absent on 2.8 hellos.
+     */
+    remoteEngineAdapters: z.boolean().optional(),
+    /**
      * 2.8: the CLI's read-only file grant (`wsmp config set-file-read`), read
      * from the CLI's own startup switch and reported on every hello.
      */
@@ -174,7 +180,7 @@ const v28FeatureSchema = z
  */
 const v28CliCapabilitiesSchema = z
   .object({
-    protocolVersion: z.literal("2.8"),
+    protocolVersion: z.enum(["2.8", "2.9"]),
     inventoryAck: z.literal(true),
     inventoryReplace: z.literal(true),
     endpointTargeting: z.literal(true),
@@ -208,7 +214,21 @@ export const ENGINE_KINDS = [
   "ollama",
   "lm-studio",
 ] as const;
-const engineFactSourceSchema = z.enum(["probe", "config"]);
+const engineFactSourceSchema = z.enum(["probe", "config", "custom"]);
+const engineLoadSignalSchema = z.enum([
+  "running",
+  "waiting",
+  "kvUsage",
+  "kvOccupancy",
+  "slotsBusy",
+  "deferred",
+  "prefixCacheHitsTotal",
+  "prefixCacheQueriesTotal",
+  "kvTokens",
+  "slots",
+  "maxModelLen",
+  "ctxPerSlot",
+]);
 
 function engineFact<T extends z.ZodType>(value: T) {
   return z.object({ value, source: engineFactSourceSchema }).strict();
@@ -237,6 +257,19 @@ export const engineFactsSchema = z
     servedModelAliases: engineFact(
       z.array(z.string().trim().min(1).max(512)).min(1).max(64),
     ).optional(),
+    /** 2.9: a custom engine adapter is configured. Always source `config`. */
+    loadAdapter: z
+      .object({
+        value: z
+          .object({
+            input: z.enum(["route", "command"]),
+            signals: z.array(engineLoadSignalSchema).max(16),
+          })
+          .strict(),
+        source: z.literal("config"),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -316,6 +349,7 @@ const labelsSchema = z
   .pipe(z.record(metricNameSchema, metricNameSchema));
 export const NODE_METRICS_CUSTOM_MAX = 50;
 export const NODE_METRIC_SOURCES_MAX = 50;
+export const NODE_ENGINE_ADAPTERS_MAX = 64;
 const MIB_MAX = 1_000_000_000;
 const mibSchema = z.number().int().min(0).max(MIB_MAX);
 /**
@@ -495,6 +529,31 @@ const nodeMetricsSchema = z
     custom: z.array(customMetricSchema).max(NODE_METRICS_CUSTOM_MAX).optional(),
     /** Per-source status, local and remote (S-B part 2). */
     sources: z.array(metricSourceStatusSchema).max(NODE_METRIC_SOURCES_MAX).optional(),
+    /** 2.9: custom engine adapter status. No command text, output, or hash. */
+    engineAdapters: z
+      .array(
+        z
+          .object({
+            endpointSlug: z.string().trim().min(1).max(63),
+            input: z.enum(["route", "command"]),
+            state: z.enum(["active", "failing", "disabled", "pending_approval", "refused"]),
+            error: z
+              .enum([
+                "spawn",
+                "timeout",
+                "exit_status",
+                "output_too_large",
+                "parse",
+                "http",
+                "out_of_range",
+                "unmapped",
+              ])
+              .optional(),
+          })
+          .strict(),
+      )
+      .max(NODE_ENGINE_ADAPTERS_MAX)
+      .optional(),
   })
   .strict();
 export type NodeMetricsMessage = z.infer<typeof nodeMetricsSchema>;
@@ -505,18 +564,35 @@ const endpointLoadSchema = z
     endpointSlug: z.string().trim().min(1).max(63),
     modelSlug: z.string().trim().min(1).max(128).optional(),
     running: nonNegativeCountSchema,
-    /** 0 from llama.cpp `/slots`, which cannot see the queue. */
-    waiting: nonNegativeCountSchema,
+    /** 0 from llama.cpp `/slots`, which cannot see the queue. Optional for custom. */
+    waiting: nonNegativeCountSchema.optional(),
     kvUsage: z.number().min(0).max(1).optional(),
+    /** Active plus idle cached prefixes. Display only. */
+    kvOccupancy: z.number().min(0).max(1).optional(),
     slotsBusy: nonNegativeCountSchema.optional(),
     /** llama.cpp `requests_deferred` (`--metrics`). */
     deferred: nonNegativeCountSchema.optional(),
     prefixCacheHitsDelta: byteCounterSchema.optional(),
     prefixCacheQueriesDelta: byteCounterSchema.optional(),
-    source: z.enum(["llama.cpp-slots", "llama.cpp-metrics", "vllm-metrics", "sglang-metrics"]),
+    source: z.enum([
+      "llama.cpp-slots",
+      "llama.cpp-metrics",
+      "vllm-metrics",
+      "sglang-metrics",
+      "custom",
+    ]),
     ts: z.string().datetime(),
   })
-  .strict();
+  .strict()
+  .superRefine((load, ctx) => {
+    if (load.source !== "custom" && load.waiting === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "waiting is required for built-in load sources.",
+        path: ["waiting"],
+      });
+    }
+  });
 export type EndpointLoadMessage = z.infer<typeof endpointLoadSchema>;
 
 /** Blank as the CLI's `str::trim().is_empty()` sees it (Unicode White_Space; not JS `trim()`). */
@@ -550,12 +626,99 @@ export const remoteMetricSourcesSchema = z
   .array(remoteMetricSourceSchema)
   .max(NODE_METRIC_SOURCES_MAX);
 
+const adapterRouteSchema = z
+  .string()
+  .min(1)
+  .max(1024)
+  .refine(
+    (route) => {
+      const trimmed = route.trim();
+      return (
+        trimmed.length > 0 &&
+        !trimmed.includes("\u0000") &&
+        !trimmed.includes("\\") &&
+        !trimmed.includes("://") &&
+        !trimmed.startsWith("//") &&
+        !trimmed.includes("..") &&
+        !trimmed.includes("?") &&
+        !trimmed.includes("#")
+      );
+    },
+    {
+      message: "adapter route must be a relative path with no scheme, host, .., query, or fragment",
+    },
+  );
+
+const remoteEngineAdapterInputSchema = z.union([
+  z.object({ route: adapterRouteSchema }).strict(),
+  z
+    .object({
+      command: z
+        .string()
+        .min(1)
+        .max(4096)
+        .refine(
+          (command) =>
+            !BLANK_COMMAND.test(command) &&
+            !command.includes("\u0000") &&
+            new TextEncoder().encode(command).length <= 4096,
+          { message: "command must be non-blank, at most 4096 bytes and contain no NUL" },
+        ),
+    })
+    .strict(),
+]);
+
+/** Server to CLI (2.9): a remotely defined engine adapter. */
+export const remoteEngineAdapterSchema = z
+  .object({
+    endpointSlug: z
+      .string()
+      .min(3)
+      .max(63)
+      .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+    input: remoteEngineAdapterInputSchema,
+    format: z.enum(["json", "prometheus"]),
+    intervalSecs: z.number().int().min(2).max(5),
+    timeoutSecs: z.number().int().min(1).max(4),
+    map: z
+      .partialRecord(
+        z.enum([
+          "running",
+          "waiting",
+          "kvUsage",
+          "kvOccupancy",
+          "slotsBusy",
+          "deferred",
+          "prefixCacheHitsTotal",
+          "prefixCacheQueriesTotal",
+          "kvTokens",
+          "slots",
+          "maxModelLen",
+          "ctxPerSlot",
+        ]),
+        z
+          .object({
+            series: z.string().trim().min(1).max(256),
+            labels: z.record(z.string().min(1).max(64), z.string().min(1).max(64)).optional(),
+            aggregate: z.enum(["sum", "max", "first"]).optional(),
+            scale: z.number().finite().optional(),
+          })
+          .strict(),
+      )
+      .optional(),
+  })
+  .strict();
+export type RemoteEngineAdapter = z.infer<typeof remoteEngineAdapterSchema>;
+export const remoteEngineAdaptersSchema = z
+  .array(remoteEngineAdapterSchema)
+  .max(NODE_ENGINE_ADAPTERS_MAX);
+
 const relayClientControlMessageSchema = z.discriminatedUnion("type", [
   z
     .object({
       type: z.literal("hello"),
       id: requestIdSchema,
-      protocolVersion: z.literal("2.8"),
+      protocolVersion: z.enum(["2.8", "2.9"]),
       cli: z
         .object({
           slug: z.string().trim().min(1).max(63),
@@ -903,6 +1066,16 @@ export type RelayServerControlMessage =
     }
   | {
       /**
+       * 2.9: replace the CLI's remotely defined engine adapters. The CLI may
+       * refuse (separate local opt-in off, hash not approved) and reports
+       * each adapter's state in `node.metrics.engineAdapters`.
+       */
+      type: "engine.adapters.set";
+      id: string;
+      adapters: RemoteEngineAdapter[];
+    }
+  | {
+      /**
        * 2.8: run one node file op. `mode` and `readGrant` are the server's
        * admission verdict, re-checked by the CLI against its own startup
        * config; write content follows as one `file.body` binary frame.
@@ -1042,6 +1215,14 @@ export function encodeRelayServerControlMessage(message: RelayServerControlMessa
       "metrics.sources.set carries a source list that fails the wire schema.",
     );
   }
+  if (
+    message.type === "engine.adapters.set" &&
+    !remoteEngineAdaptersSchema.safeParse(message.adapters).success
+  ) {
+    throw new RelayProtocolError(
+      "engine.adapters.set carries an adapter list that fails the wire schema.",
+    );
+  }
   // File spawns fail closed even if a caller bypasses the TypeScript type.
   if (message.type === "term.spawn") {
     if (message.kind === "file") fileTermSpawnSchema.parse(message);
@@ -1068,11 +1249,10 @@ export function parseRelayClientControlFrame(frame: string): RelayClientControlM
 }
 
 /**
- * True for a hello that is not the minimum protocol 2.8: a different protocol
- * version (older than 2.8, or newer than this server speaks), or the
- * pre-naming `cli.label` field. Checked before the strict schema so such a CLI
- * gets `RELAY_UPGRADE_REQUIRED_MESSAGE` instead of an opaque "malformed
- * message".
+ * True for a hello that is not a protocol this server speaks: older than 2.8,
+ * newer than the newest listed version, or the pre-naming `cli.label` field.
+ * Checked before the strict schema so such a CLI gets
+ * `RELAY_UPGRADE_REQUIRED_MESSAGE` instead of an opaque "malformed message".
  */
 export function helloNeedsUpgrade(frame: string): boolean {
   if (utf8Length(frame) > RELAY_JSON_CONTROL_MAX_BYTES) return false;
@@ -1085,7 +1265,9 @@ export function helloNeedsUpgrade(frame: string): boolean {
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return false;
   const record = parsed as Record<string, unknown>;
   if (record.type !== "hello") return false;
-  if (record.protocolVersion !== RELAY_MIN_PROTOCOL_VERSION) return true;
+  const accepted = (value: unknown): value is RelayProtocolVersion =>
+    RELAY_PROTOCOL_VERSIONS.includes(value as RelayProtocolVersion);
+  if (!accepted(record.protocolVersion)) return true;
   const cli = record.cli;
   if (!cli || typeof cli !== "object" || Array.isArray(cli)) return false;
   const cliRecord = cli as Record<string, unknown>;
@@ -1094,7 +1276,7 @@ export function helloNeedsUpgrade(frame: string): boolean {
   if (!capabilities || typeof capabilities !== "object" || Array.isArray(capabilities)) {
     return false;
   }
-  return (capabilities as Record<string, unknown>).protocolVersion !== RELAY_MIN_PROTOCOL_VERSION;
+  return !accepted((capabilities as Record<string, unknown>).protocolVersion);
 }
 
 /** `major.minor`, the only shape `relayProtocolAtLeast` and the card's newer/older split read. */

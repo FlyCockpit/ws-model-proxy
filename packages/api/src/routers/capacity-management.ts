@@ -209,7 +209,9 @@ export const capacityManagementRouter = {
     // engine facts); S-C and S-D read it, this list only shows it.
     return capacities.map((capacity) => ({
       ...capacity,
-      enginePreset: enginePreset(capacity.engineKind),
+      enginePreset: enginePreset(capacity.engineKind, {
+        kvBudgetTokens: capacity.kvBudgetTokens,
+      }),
       _count: {
         ExecutionTargets: capacity._count.ExecutionTargets,
         CapacityLeases: activeLeases.get(capacity.id) ?? 0,
