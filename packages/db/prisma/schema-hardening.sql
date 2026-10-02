@@ -280,15 +280,39 @@ ALTER TABLE node_metrics_minute ADD CONSTRAINT node_metrics_minute_shape_check C
 );
 
 -- Disposable class H feedback; no graph locks or foreign keys.
+CREATE OR REPLACE FUNCTION capacity_kv_eviction_session_ids_ok(ids text[])
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+  SELECT array_position(ids, NULL) IS NULL
+     AND NOT EXISTS (
+       SELECT 1 FROM unnest(ids) AS session_id
+        WHERE length(session_id) NOT BETWEEN 1 AND 128
+     );
+$$;
+
 ALTER TABLE capacity_kv_eviction DROP CONSTRAINT IF EXISTS capacity_kv_eviction_shape_check;
 ALTER TABLE capacity_kv_eviction ADD CONSTRAINT capacity_kv_eviction_shape_check CHECK (
   "cutFraction" >= 0 AND "cutFraction" <= 1
   AND length("capacityId") BETWEEN 1 AND 128
   AND cardinality("sessionIds") <= 16
+  AND capacity_kv_eviction_session_ids_ok("sessionIds")
   AND "missCount" >= 0
   AND "continuationCount" >= 0
   AND "missCount" <= "continuationCount"
   AND "expiresAt" >= "observedAt"
+);
+
+-- Owner-written node budgets and labels. Values above 1e6 GiB or the wrong
+-- JSON shape are rejected here; kind-appropriate GPU keys are an app check.
+ALTER TABLE cli_device DROP CONSTRAINT IF EXISTS cli_device_node_budget_check;
+ALTER TABLE cli_device ADD CONSTRAINT cli_device_node_budget_check CHECK (
+  cardinality(labels) <= 32
+  AND ("usableMemoryGb" IS NULL OR ("usableMemoryGb" >= 0 AND "usableMemoryGb" <= 1000000))
+  AND ("usableRamGb" IS NULL OR ("usableRamGb" >= 0 AND "usableRamGb" <= 1000000))
+  AND ("usableVramGb" IS NULL OR jsonb_typeof("usableVramGb") = 'object')
 );
 
 -- Digest-only class H state; indexed probes are ordered without a population sort.

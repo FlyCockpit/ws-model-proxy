@@ -20,6 +20,8 @@ const [packageJson, agentCompose, entrypoint, dangerousWrapper, applyScript] = a
 const requiredFragments = [
   "pool_fallback_preference_grantee",
   "pool_routing_rule_shape_check",
+  "capacity_kv_eviction_session_ids_ok",
+  "cli_device_node_budget_check",
   "pool routing rule member must belong to the pool",
   "enforce_pool_routing_rule_member",
   "own-key preference requires the exact non-owner grant",
@@ -601,6 +603,22 @@ async function verifyKvEvictionHardening() {
       miss: 2,
       cont: 1,
     },
+    {
+      capacity: "'empty-session-id'",
+      cut: "0.1",
+      expires: "NOW() + interval '1 hour'",
+      sessions: "ARRAY['']",
+      miss: 0,
+      cont: 0,
+    },
+    {
+      capacity: "'long-session-id'",
+      cut: "0.1",
+      expires: "NOW() + interval '1 hour'",
+      sessions: "ARRAY[repeat('s', 129)]",
+      miss: 0,
+      cont: 0,
+    },
   ];
   for (const row of cases)
     await expectConstraintFailure(`
@@ -610,7 +628,7 @@ async function verifyKvEvictionHardening() {
     ("capacityId", "userId", "cutFraction", "observedAt", "expiresAt", "sessionIds", "missCount", "continuationCount")
     VALUES ('orphan-capacity', 'absent-owner', 0.5, NOW(), NOW(), ARRAY['session-a'], 1, 1)`);
   process.stdout.write(
-    "KV eviction hardening: 8 shape negatives and FK-free orphan insert passed.\n",
+    "KV eviction hardening: 10 shape negatives and FK-free orphan insert passed.\n",
   );
 }
 
