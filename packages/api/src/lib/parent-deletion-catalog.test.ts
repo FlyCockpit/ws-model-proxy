@@ -123,13 +123,15 @@ const hot = new Set<string>(HOT_PATH_TABLES);
 
 /**
  * DELETE triggers on tables a user delete reaches, and the work each adds:
- * none of them writes rows.
+ * none of them writes traffic-proportional rows.
  */
 const REACHED_DELETE_TRIGGERS: Record<string, string> = {
-  "z_graph_write_fence:user":
-    "graph-write fence check (plain reads); the user delete holds the owner fences",
+  "pool_routing_rule_on_member_delete:pool_member":
+    "rewrites at most 16 pool_routing_rule rows (delete targeted, SET NULL exclude to pool-wide); configuration, not per-request",
   "provider_audit_event_immutable:provider_audit_event":
     "retained history the preflight refuses; never fires on a delete that proceeds",
+  "z_graph_write_fence:user":
+    "graph-write fence check (plain reads); the user delete holds the owner fences",
 };
 
 /**
