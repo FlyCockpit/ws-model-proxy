@@ -55,6 +55,7 @@ const db = prisma as unknown as {
   modelPool: { findUnique: MockInstance; update: MockInstance };
   poolMember: { findUnique: MockInstance; findMany: MockInstance; update: MockInstance };
   capacityAuditEvent: { create: MockInstance; findMany: MockInstance };
+  capacityKvEviction: { findMany: MockInstance };
 };
 
 /** The fence arrays passed to `wsmp_acquire_fences`, one per call, in call order. */
@@ -127,6 +128,7 @@ describe("capacityManagementRouter", () => {
     );
     db.capacityAuditEvent.create.mockResolvedValue({ id: "audit" });
     db.$queryRaw.mockResolvedValue([{ acquired: true }]);
+    db.capacityKvEviction.findMany.mockResolvedValue([]);
   });
 
   it("lists owner-scoped capacities with aggregate load only", async () => {
@@ -143,6 +145,7 @@ describe("capacityManagementRouter", () => {
         userId: "owner",
         label: "A",
         enginePreset: enginePreset(null),
+        effectiveKvBudgetTokens: null,
         _count: { ExecutionTargets: 2, CapacityLeases: 3, CapacityWaiters: 0 },
       },
       {
@@ -150,6 +153,7 @@ describe("capacityManagementRouter", () => {
         userId: "owner",
         label: "B",
         enginePreset: enginePreset(null),
+        effectiveKvBudgetTokens: null,
         _count: { ExecutionTargets: 0, CapacityLeases: 0, CapacityWaiters: 1 },
       },
     ]);
@@ -171,6 +175,19 @@ describe("capacityManagementRouter", () => {
       where: { capacityId: { in: ["cap-a", "cap-b"] }, state: "WAITING" },
       _count: { _all: true },
     });
+    expect(db.capacityKvEviction.findMany).toHaveBeenCalledWith({
+      where: {
+        capacityId: { in: ["cap-a", "cap-b"] },
+        userId: "owner",
+        expiresAt: { gt: expect.any(Date) },
+      },
+      select: {
+        capacityId: true,
+        cutFraction: true,
+        observedAt: true,
+        expiresAt: true,
+      },
+    });
 
     // No capacities: no history query at all.
     vi.clearAllMocks();
@@ -178,6 +195,52 @@ describe("capacityManagementRouter", () => {
     await expect(client.list()).resolves.toEqual([]);
     expect(db.capacityLease.groupBy).not.toHaveBeenCalled();
     expect(db.capacityWaiter.groupBy).not.toHaveBeenCalled();
+    expect(db.capacityKvEviction.findMany).not.toHaveBeenCalled();
+  });
+
+  it("lists reported K with the live effective budget after an eviction cut", async () => {
+    const now = new Date("2026-10-02T00:00:00Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    try {
+      db.inferenceCapacity.findMany.mockResolvedValue([
+        {
+          id: "cap-a",
+          userId: "owner",
+          label: "A",
+          engineKind: "VLLM",
+          kvBudgetTokens: 100_000,
+          kvBudgetTokensSource: "CONFIG",
+          _count: { ExecutionTargets: 1 },
+        },
+      ]);
+      db.capacityLease.groupBy.mockResolvedValue([]);
+      db.capacityWaiter.groupBy.mockResolvedValue([]);
+      db.capacityKvEviction.findMany.mockResolvedValue([
+        {
+          capacityId: "cap-a",
+          cutFraction: 0.5,
+          observedAt: now,
+          expiresAt: new Date(now.getTime() + 1_800_000),
+        },
+      ]);
+      const client = createRouterClient(capacityManagementRouter, { context });
+      await expect(client.list()).resolves.toEqual([
+        {
+          id: "cap-a",
+          userId: "owner",
+          label: "A",
+          engineKind: "VLLM",
+          kvBudgetTokens: 100_000,
+          kvBudgetTokensSource: "CONFIG",
+          enginePreset: enginePreset("VLLM", { kvBudgetTokens: 100_000 }),
+          effectiveKvBudgetTokens: 50_000,
+          _count: { ExecutionTargets: 1, CapacityLeases: 0, CapacityWaiters: 0 },
+        },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("writes capacity creation and policy mutation audits in the same transaction", async () => {

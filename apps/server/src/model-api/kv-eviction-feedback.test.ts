@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@ws-model-proxy/db", () => ({
@@ -141,6 +142,17 @@ describe("eviction evidence", () => {
         ...valid,
         usage,
         evidence: { ...valid.evidence!, tokens: 18_000 },
+      }),
+    ).toBe(true);
+  });
+
+  it("never treats kvOccupancy as eviction evidence", () => {
+    const source = readFileSync(new URL("./kv-eviction-feedback.ts", import.meta.url), "utf8");
+    expect(source).not.toMatch(/kvOccupancy|occupancy/);
+    expect(
+      qualifiesAsEvictionEvidence({
+        ...valid,
+        usage: { promptTokens: 12_000, cacheReadTokens: 0 },
       }),
     ).toBe(true);
   });

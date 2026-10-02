@@ -520,7 +520,7 @@ const READ_TOOLS: readonly McpToolSpec[] = [
   {
     name: "forwarder_pool_routing_rules_get",
     descriptionNote:
-      "Read pool rules, member live engine load, and engineLoad.kvBudget (reported/effective tokens, eviction cut, floor, observation/expiry times and active state). engineLoad also reports customMode (observe/enforce), loadSource, signals, enforced, and live.kvOccupancy (display only; never FULL or eviction evidence). Custom FULL starts observe-only.",
+      "Read pool rules, member live engine load, and engineLoad.kvBudget (reported/effective tokens, K source, eviction cut, floor, observation/expiry times and active state). engineLoad also reports customMode (observe/enforce), loadSource, signals, enforced, and live.kvOccupancy (display only; never FULL or eviction evidence). Custom FULL starts observe-only.",
     target: "forwarderManagement.getPoolRoutingRules",
     scope: "read",
     confirmation: null,

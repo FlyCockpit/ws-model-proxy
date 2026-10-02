@@ -665,6 +665,7 @@
         "slots_one": "{{count}} slot",
         "slots_other": "{{count}} slots",
         "kvBudget": "KV budget: {{value}} tokens",
+        "kvBudgetEffective": "effective {{value}}",
         "maxModelLen": "Max context: {{value}} tokens",
         "preset": "Preset: {{preset}}",
         "kinds": {

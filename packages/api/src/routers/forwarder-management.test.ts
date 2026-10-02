@@ -6229,6 +6229,7 @@ describe("metric routing procedures (S-B part 2)", () => {
                   engineKind,
                   engineSlots: 4,
                   kvBudgetTokens: reported,
+                  kvBudgetTokensSource: "CONFIG",
                 },
                 DiscoveredModel: {
                   slug: "qwen",
@@ -6261,6 +6262,7 @@ describe("metric routing procedures (S-B part 2)", () => {
         expect(result.members[0]?.engineLoad.kvBudget).toEqual({
           reportedTokens: reported,
           effectiveTokens: effective,
+          source: "CONFIG",
           cutFraction: active ? cut : 0,
           floorFraction: 0.5,
           lastObservedAt: cut === null ? null : now,

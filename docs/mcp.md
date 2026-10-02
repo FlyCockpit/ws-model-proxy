@@ -72,7 +72,7 @@ Metric routing rules (S-B part 2):
   (`full_waiting`, `full_kv`, `full_slots`, `full_deferred`, `clear`, `stale`,
   `none`, `off`). `kvOccupancy` is display only: it never marks FULL and is not
   eviction evidence. `engineLoad.kvBudget` includes `reportedTokens`,
-  `effectiveTokens`, `cutFraction` (0–0.5), `floorFraction` (0.5),
+  `effectiveTokens`, `source` (`PROBE` / `CONFIG` / `CUSTOM`), `cutFraction` (0–0.5), `floorFraction` (0.5),
   `lastObservedAt`, `expiresAt`, and `active`. Prefix-eviction feedback
   temporarily lowers token-mode warm-protection budgets; slot mode (including
   llama.cpp) has null effective tokens and is inactive. Failed feedback reads

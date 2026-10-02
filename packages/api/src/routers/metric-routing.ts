@@ -131,6 +131,7 @@ export const metricRoutingProcedures = {
                       engineKind: true,
                       engineSlots: true,
                       kvBudgetTokens: true,
+                      kvBudgetTokensSource: true,
                       engineLoadSource: true,
                       engineLoadSignals: true,
                     },
@@ -277,6 +278,7 @@ export const metricRoutingProcedures = {
               kvBudget: {
                 reportedTokens,
                 effectiveTokens,
+                source: member.capacity?.kvBudgetTokensSource ?? null,
                 cutFraction,
                 floorFraction: KV_EVICTION_FLOOR_FRACTION,
                 lastObservedAt: kvState?.observedAt ?? null,
