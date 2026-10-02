@@ -1525,6 +1525,15 @@ fn token_fact(value: Option<u64>) -> Option<EngineFact<u64>> {
 /// numbers, and `slots`: the configured concurrency when set, else the
 /// engine's reported slots.
 pub fn endpoint_engine_facts(endpoint: &EndpointConfig) -> Option<EngineFacts> {
+    endpoint_engine_facts_with(endpoint, endpoint.engine_adapter.as_ref())
+}
+
+/// Endpoint-level engine facts using the effective adapter (local, else
+/// approved remote) for `loadAdapter`.
+pub fn endpoint_engine_facts_with(
+    endpoint: &EndpointConfig,
+    adapter: Option<&crate::engine_adapter::EngineAdapterConfig>,
+) -> Option<EngineFacts> {
     let detected = endpoint
         .last_probe
         .as_ref()
@@ -1549,17 +1558,17 @@ pub fn endpoint_engine_facts(endpoint: &EndpointConfig) -> Option<EngineFacts> {
     let configured_kv = endpoint
         .kv_tokens
         .filter(|tokens| (1..=ENGINE_TOKEN_COUNT_MAX).contains(tokens));
-    let adapter = endpoint
+    let cached = endpoint
         .last_probe
         .as_ref()
         .and_then(|probe| probe.adapter.as_ref());
-    let adapter_slots = adapter
+    let adapter_slots = cached
         .and_then(|facts| facts.slots)
         .filter(|slots| (1..=10_000).contains(slots));
-    let adapter_kv = adapter
+    let adapter_kv = cached
         .and_then(|facts| facts.kv_tokens)
         .filter(|tokens| (1..=ENGINE_TOKEN_COUNT_MAX).contains(tokens));
-    let load_adapter = endpoint.engine_adapter.as_ref().map(|spec| {
+    let load_adapter = adapter.map(|spec| {
         EngineFact::config(LoadAdapterValue {
             input: spec.input_kind(),
             signals: spec.signals(),
@@ -1571,7 +1580,7 @@ pub fn endpoint_engine_facts(endpoint: &EndpointConfig) -> Option<EngineFacts> {
             .map(EngineFact::config)
             .or_else(|| adapter_slots.map(EngineFact::custom))
             .or_else(|| probed_slots.map(EngineFact::probe)),
-        ctx_per_slot: adapter
+        ctx_per_slot: cached
             .and_then(|facts| facts.ctx_per_slot)
             .filter(|value| (1..=ENGINE_TOKEN_COUNT_MAX).contains(value))
             .map(EngineFact::custom)
@@ -1580,7 +1589,7 @@ pub fn endpoint_engine_facts(endpoint: &EndpointConfig) -> Option<EngineFacts> {
             .map(EngineFact::config)
             .or_else(|| adapter_kv.map(EngineFact::custom))
             .or_else(|| token_fact(detected.and_then(|engine| engine.kv_tokens))),
-        max_model_len: adapter
+        max_model_len: cached
             .and_then(|facts| facts.max_model_len)
             .filter(|value| (1..=ENGINE_TOKEN_COUNT_MAX).contains(value))
             .map(EngineFact::custom)
@@ -1624,6 +1633,14 @@ fn model_engine_facts(endpoint: &EndpointConfig, upstream_model_id: &str) -> Opt
 }
 
 pub fn endpoint_inventory(endpoint: &EndpointConfig, status: EndpointStatus) -> EndpointInventory {
+    endpoint_inventory_with(endpoint, status, endpoint.engine_adapter.as_ref())
+}
+
+pub fn endpoint_inventory_with(
+    endpoint: &EndpointConfig,
+    status: EndpointStatus,
+    adapter: Option<&crate::engine_adapter::EngineAdapterConfig>,
+) -> EndpointInventory {
     let mut default_capabilities = endpoint.default_capabilities.clone();
     if endpoint.engine.accepts_top_k() {
         default_capabilities.advertise_top_k();
@@ -1663,7 +1680,7 @@ pub fn endpoint_inventory(endpoint: &EndpointConfig, status: EndpointStatus) -> 
                 }
             })
             .collect(),
-        engine_facts: endpoint_engine_facts(endpoint),
+        engine_facts: endpoint_engine_facts_with(endpoint, adapter),
     }
 }
 
@@ -3486,6 +3503,75 @@ mod relay_27_vectors {
         let facts = endpoint_engine_facts(&endpoint).expect("facts");
         assert_eq!(facts.slots, Some(EngineFact::config(4)));
         assert_eq!(facts.kv_tokens, Some(EngineFact::config(4096)));
+    }
+
+    #[test]
+    fn an_approved_remote_adapter_publishes_load_adapter_facts() {
+        use crate::engine_adapter::{
+            AdapterFormat, AdapterInput, AdapterSignal, EngineAdapterConfig, SignalSelector,
+        };
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            AdapterSignal::Running,
+            SignalSelector {
+                series: "running".to_string(),
+                labels: Default::default(),
+                aggregate: None,
+                scale: None,
+            },
+        );
+        map.insert(
+            AdapterSignal::KvUsage,
+            SignalSelector {
+                series: "kv".to_string(),
+                labels: Default::default(),
+                aggregate: None,
+                scale: None,
+            },
+        );
+        let spec = EngineAdapterConfig {
+            input: AdapterInput::Route {
+                route: "stats".to_string(),
+            },
+            format: AdapterFormat::Json,
+            interval_secs: 2,
+            timeout_secs: 2,
+            map,
+        };
+        let endpoint = EndpointConfig {
+            slug: "gpu".to_string(),
+            engine: crate::config::EndpointEngine::Generic,
+            engine_adapter: None,
+            ..EndpointConfig::default()
+        };
+        assert!(
+            endpoint_engine_facts(&endpoint)
+                .and_then(|facts| facts.load_adapter)
+                .is_none(),
+            "local-only facts omit a remote-only adapter"
+        );
+        let facts = endpoint_engine_facts_with(&endpoint, Some(&spec)).expect("facts");
+        let load = facts.load_adapter.expect("loadAdapter");
+        assert_eq!(load.source, FactSource::Config);
+        assert_eq!(
+            load.value.input,
+            crate::engine_adapter::AdapterInputKind::Route
+        );
+        assert!(
+            !load.value.signals.is_empty(),
+            "the remote spec's signal list is published on the wire"
+        );
+        assert!(load.value.signals.contains(&AdapterSignal::Running));
+        assert!(load.value.signals.contains(&AdapterSignal::KvUsage));
+        let inventory = endpoint_inventory_with(&endpoint, EndpointStatus::Online, Some(&spec));
+        assert_eq!(
+            inventory
+                .engine_facts
+                .as_ref()
+                .and_then(|facts| facts.load_adapter.as_ref())
+                .map(|fact| fact.value.signals.len()),
+            Some(2)
+        );
     }
 
     #[test]

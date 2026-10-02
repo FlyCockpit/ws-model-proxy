@@ -96,8 +96,8 @@ use crate::protocol::{
     CliInventory, ClientControlMessage, EndpointInventory, EndpointStatus, FrameFault,
     RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS, RELAY_REQUEST_BODY_WINDOW_CHUNKS, RELAY_SUBPROTOCOL,
     RelayBinaryFrameMetadata, RelayFailure, ServerControlMessage, binary_frame_fault,
-    control_frame_fault, encode_binary_frame, encode_control, endpoint_inventory,
-    hello_rejection_message, parse_server_control,
+    control_frame_fault, encode_binary_frame, encode_control, hello_rejection_message,
+    parse_server_control,
 };
 use crate::relay_bus::{FromWorker, WsFrame};
 use crate::sessions::{
@@ -575,6 +575,14 @@ fn config_file_modified_at() -> Result<SystemTime> {
 }
 
 fn inventory_snapshot_from_config(config: &Config) -> Vec<EndpointInventory> {
+    let remote = crate::engine_adapter::load_remote_adapters().unwrap_or_default();
+    inventory_snapshot_from_config_with_remote(config, &remote)
+}
+
+fn inventory_snapshot_from_config_with_remote(
+    config: &Config,
+    remote: &[crate::protocol::RemoteEngineAdapter],
+) -> Vec<EndpointInventory> {
     config
         .endpoints
         .iter()
@@ -585,7 +593,13 @@ fn inventory_snapshot_from_config(config: &Config) -> Vec<EndpointInventory> {
                 Some(crate::config::ProbeStatus::Offline) => EndpointStatus::Offline,
                 None => EndpointStatus::Unknown,
             };
-            endpoint_inventory(endpoint, status)
+            let adapter = crate::engine_adapter::effective_engine_adapter(
+                endpoint,
+                remote,
+                config.allow_remote_engine_adapters,
+                &config.approved_remote_adapters,
+            );
+            crate::protocol::endpoint_inventory_with(endpoint, status, adapter.as_ref())
         })
         .collect()
 }
@@ -656,6 +670,7 @@ fn same_desired_config(left: &Config, right: &Config) -> bool {
 /// acknowledged identity, and nothing is written to the config file.
 fn config_with_fresh_engine_facts(active: &Config) -> (Config, Vec<EndpointInventory>) {
     let mut refreshed = active.clone();
+    let remote = crate::engine_adapter::load_remote_adapters().unwrap_or_default();
     let targets = refreshed
         .endpoints
         .iter()
@@ -663,7 +678,13 @@ fn config_with_fresh_engine_facts(active: &Config) -> (Config, Vec<EndpointInven
         .filter(|(_, endpoint)| {
             endpoint.enabled
                 && (endpoint.engine != crate::config::EndpointEngine::Generic
-                    || endpoint.engine_adapter.is_some())
+                    || crate::engine_adapter::effective_engine_adapter(
+                        endpoint,
+                        &remote,
+                        active.allow_remote_engine_adapters,
+                        &active.approved_remote_adapters,
+                    )
+                    .is_some())
                 && endpoint
                     .last_probe
                     .as_ref()
@@ -712,7 +733,14 @@ fn config_with_fresh_engine_facts(active: &Config) -> (Config, Vec<EndpointInven
             {
                 probe.engine = Some(engine);
             }
-            if let Some(facts) = crate::engine_adapter::probe_facts(&refreshed.endpoints[index])
+            let spec = crate::engine_adapter::effective_engine_adapter(
+                &refreshed.endpoints[index],
+                &remote,
+                active.allow_remote_engine_adapters,
+                &active.approved_remote_adapters,
+            );
+            if let Some(facts) =
+                crate::engine_adapter::probe_facts_with(&refreshed.endpoints[index], spec.as_ref())
                 && let Some(probe) = refreshed.endpoints[index].last_probe.as_mut()
             {
                 probe.adapter = Some(facts);
@@ -1283,19 +1311,7 @@ where
                 let Some(pending) = pending_preparation.take() else {
                     continue;
                 };
-                let endpoints = candidate
-                    .endpoints
-                    .iter()
-                    .filter(|endpoint| endpoint.enabled)
-                    .map(|endpoint| {
-                        let status = match endpoint.last_probe.as_ref().map(|probe| &probe.status) {
-                            Some(crate::config::ProbeStatus::Online) => EndpointStatus::Online,
-                            Some(crate::config::ProbeStatus::Offline) => EndpointStatus::Offline,
-                            None => EndpointStatus::Unknown,
-                        };
-                        endpoint_inventory(endpoint, status)
-                    })
-                    .collect();
+                let endpoints = inventory_snapshot_from_config(&candidate);
                 let id = next_id("inventory");
                 if let Err(error) = send_control(
                     socket,
@@ -1386,20 +1402,7 @@ fn restore_previous_routing_after_timeout(config: &mut Config, previous: &Config
 
 #[cfg(unix)]
 fn inventory_digest_for_config(config: &Config) -> String {
-    let inventory = config
-        .endpoints
-        .iter()
-        .filter(|endpoint| endpoint.enabled)
-        .map(|endpoint| {
-            let status = match endpoint.last_probe.as_ref().map(|probe| &probe.status) {
-                Some(crate::config::ProbeStatus::Online) => EndpointStatus::Online,
-                Some(crate::config::ProbeStatus::Offline) => EndpointStatus::Offline,
-                None => EndpointStatus::Unknown,
-            };
-            endpoint_inventory(endpoint, status)
-        })
-        .collect::<Vec<_>>();
-    crate::protocol::inventory_digest(&inventory)
+    crate::protocol::inventory_digest(&inventory_snapshot_from_config(config))
 }
 
 #[cfg(unix)]
@@ -3114,19 +3117,7 @@ fn inventory_from_config(config: &mut Config) -> Vec<EndpointInventory> {
             tracing::warn!(error = %error, endpoint = report.endpoint_slug, "failed to apply probe report");
         }
     }
-    config
-        .endpoints
-        .iter()
-        .filter(|endpoint| endpoint.enabled)
-        .map(|endpoint| {
-            let status = match endpoint.last_probe.as_ref().map(|probe| &probe.status) {
-                Some(crate::config::ProbeStatus::Online) => EndpointStatus::Online,
-                Some(crate::config::ProbeStatus::Offline) => EndpointStatus::Offline,
-                None => EndpointStatus::Unknown,
-            };
-            endpoint_inventory(endpoint, status)
-        })
-        .collect()
+    inventory_snapshot_from_config(config)
 }
 
 fn set_socket_read_timeout(
@@ -3212,7 +3203,7 @@ mod tests {
             .endpoints
             .iter()
             .filter(|endpoint| endpoint.enabled)
-            .map(|endpoint| endpoint_inventory(endpoint, EndpointStatus::Online))
+            .map(|endpoint| crate::protocol::endpoint_inventory(endpoint, EndpointStatus::Online))
             .collect::<Vec<_>>();
         let revision = crate::protocol::InventoryRevision {
             inventory_seq: 42,
@@ -3939,6 +3930,100 @@ mod tests {
         let mut edited = config.clone();
         edited.endpoints[0].label = "other".to_string();
         assert!(!same_desired_config(&edited, &active));
+    }
+
+    #[test]
+    fn approved_remote_adapter_publishes_load_adapter_on_inventory() {
+        use crate::engine_adapter::{
+            AdapterFormat, AdapterInput, AdapterSignal, EngineAdapterConfig, SignalSelector,
+        };
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            AdapterSignal::Running,
+            SignalSelector {
+                series: "running".to_string(),
+                labels: Default::default(),
+                aggregate: None,
+                scale: None,
+            },
+        );
+        map.insert(
+            AdapterSignal::KvOccupancy,
+            SignalSelector {
+                series: "kv".to_string(),
+                labels: Default::default(),
+                aggregate: None,
+                scale: None,
+            },
+        );
+        let spec = EngineAdapterConfig {
+            input: AdapterInput::Route {
+                route: "stats".to_string(),
+            },
+            format: AdapterFormat::Json,
+            interval_secs: 2,
+            timeout_secs: 2,
+            map: map.clone(),
+        };
+        let hash = crate::engine_adapter::spec_sha256("gpu", &spec);
+        let remote = crate::protocol::RemoteEngineAdapter {
+            endpoint_slug: "gpu".to_string(),
+            input: AdapterInput::Route {
+                route: "stats".to_string(),
+            },
+            format: AdapterFormat::Json,
+            interval_secs: 2,
+            timeout_secs: 2,
+            map,
+        };
+        let mut config = Config::default();
+        config.allow_remote_engine_adapters = true;
+        config
+            .approved_remote_adapters
+            .insert("gpu".to_string(), hash);
+        config.endpoints.push(crate::config::EndpointConfig {
+            slug: "gpu".to_string(),
+            enabled: true,
+            engine: crate::config::EndpointEngine::Generic,
+            engine_adapter: None,
+            last_probe: Some(crate::config::ProbeSnapshot {
+                status: crate::config::ProbeStatus::Online,
+                models: Vec::new(),
+                suggested_capabilities: crate::config::OpenAiCompatibleCapabilities::default(),
+                engine: None,
+                adapter: None,
+            }),
+            ..crate::config::EndpointConfig::default()
+        });
+
+        let mut unapproved = config.clone();
+        unapproved.approved_remote_adapters.clear();
+        let pending = inventory_snapshot_from_config_with_remote(&unapproved, &[remote.clone()]);
+        assert!(
+            pending[0]
+                .engine_facts
+                .as_ref()
+                .and_then(|facts| facts.load_adapter.as_ref())
+                .is_none(),
+            "an unapproved remote adapter stays off the wire"
+        );
+
+        let inventory = inventory_snapshot_from_config_with_remote(&config, &[remote]);
+        let load = inventory[0]
+            .engine_facts
+            .as_ref()
+            .and_then(|facts| facts.load_adapter.as_ref())
+            .expect("approved remote adapter publishes loadAdapter");
+        assert_eq!(load.source, crate::protocol::FactSource::Config);
+        assert!(
+            !load.value.signals.is_empty(),
+            "the remote spec's signal list is published on the wire"
+        );
+        assert!(
+            load.value
+                .signals
+                .contains(&crate::engine_adapter::AdapterSignal::Running)
+        );
     }
 
     #[test]

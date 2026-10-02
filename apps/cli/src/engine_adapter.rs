@@ -678,10 +678,41 @@ fn drop_count(value: f64, max: u64) -> Option<f64> {
     (rounded <= max as f64).then_some(rounded)
 }
 
+/// Local adapter, else an approved remote adapter for this endpoint.
+pub fn effective_engine_adapter(
+    endpoint: &EndpointConfig,
+    remote: &[RemoteEngineAdapter],
+    allow_remote: bool,
+    approved: &std::collections::BTreeMap<String, String>,
+) -> Option<EngineAdapterConfig> {
+    if let Some(spec) = endpoint.engine_adapter.clone() {
+        return spec.validate().is_ok().then_some(spec);
+    }
+    let adapter = remote
+        .iter()
+        .find(|adapter| adapter.endpoint_slug == endpoint.slug)?;
+    let spec = adapter.to_config();
+    (remote_adapter_eligibility(
+        &spec,
+        &adapter.endpoint_slug,
+        allow_remote,
+        false,
+        approved.get(&adapter.endpoint_slug).map(String::as_str),
+    ) == RemoteAdapterEligibility::Run)
+        .then_some(spec)
+}
+
 /// Probe-time adapter facts. `None` keeps the previous cache (a short outage
 /// must not drop K to null).
 pub fn probe_facts(endpoint: &EndpointConfig) -> Option<AdapterCachedFacts> {
-    let spec = endpoint.engine_adapter.as_ref()?;
+    probe_facts_with(endpoint, endpoint.engine_adapter.as_ref())
+}
+
+pub fn probe_facts_with(
+    endpoint: &EndpointConfig,
+    spec: Option<&EngineAdapterConfig>,
+) -> Option<AdapterCachedFacts> {
+    let spec = spec?;
     match sample(endpoint, spec, None) {
         Ok(sample) if !sample.facts.is_empty() => Some(sample.facts),
         _ => None,
@@ -1026,6 +1057,53 @@ hits{model=\"b\"} 5
         assert_eq!(selector.series, "kv_active");
         assert_eq!(selector.labels.get("engine").map(String::as_str), Some("0"));
         assert_eq!(selector.scale, Some(0.01));
+    }
+
+    #[test]
+    fn effective_adapter_prefers_local_then_approved_remote() {
+        let endpoint = EndpointConfig {
+            slug: "gpu".to_string(),
+            engine: crate::config::EndpointEngine::Generic,
+            ..EndpointConfig::default()
+        };
+        let remote = crate::protocol::RemoteEngineAdapter {
+            endpoint_slug: "gpu".to_string(),
+            input: AdapterInput::Route {
+                route: "stats".to_string(),
+            },
+            format: AdapterFormat::Json,
+            interval_secs: 2,
+            timeout_secs: 2,
+            map: BTreeMap::new(),
+        };
+        let spec = remote.to_config();
+        let hash = spec_sha256("gpu", &spec);
+        let mut approved = BTreeMap::new();
+        approved.insert("gpu".to_string(), hash);
+        assert!(
+            effective_engine_adapter(&endpoint, &[remote.clone()], false, &approved).is_none(),
+            "without opt-in the remote stays off"
+        );
+        let effective =
+            effective_engine_adapter(&endpoint, &[remote.clone()], true, &approved).expect("run");
+        assert_eq!(effective, spec);
+        let mut local = endpoint.clone();
+        local.engine_adapter = Some(EngineAdapterConfig {
+            input: AdapterInput::Route {
+                route: "local-stats".to_string(),
+            },
+            format: AdapterFormat::Json,
+            interval_secs: 2,
+            timeout_secs: 2,
+            map: BTreeMap::new(),
+        });
+        let shadowed = effective_engine_adapter(&local, &[remote], true, &approved).expect("local");
+        assert_eq!(
+            shadowed.input,
+            AdapterInput::Route {
+                route: "local-stats".to_string()
+            }
+        );
     }
 
     #[test]

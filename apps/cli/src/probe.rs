@@ -185,7 +185,17 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
         .map(|row| (row.id.clone(), row.max_model_len))
         .collect::<Vec<_>>();
     let engine = crate::engine::detect_engine(endpoint, &model_limits);
-    let adapter = crate::engine_adapter::probe_facts(endpoint);
+    let adapter_spec = endpoint.engine_adapter.clone().or_else(|| {
+        let config = crate::config::Config::load().ok()?;
+        let remote = crate::engine_adapter::load_remote_adapters().ok()?;
+        crate::engine_adapter::effective_engine_adapter(
+            endpoint,
+            &remote,
+            config.allow_remote_engine_adapters,
+            &config.approved_remote_adapters,
+        )
+    });
+    let adapter = crate::engine_adapter::probe_facts_with(endpoint, adapter_spec.as_ref());
     Ok(ProbeReport {
         endpoint_slug: endpoint.slug.clone(),
         status: ProbeStatus::Online,
