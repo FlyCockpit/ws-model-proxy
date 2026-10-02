@@ -19,6 +19,7 @@ import {
   effectiveKvBudgetTokens,
   effectiveKvCut,
   KV_EVICTION_FLOOR_FRACTION,
+  protectionKvBudgetTokens,
 } from "../lib/kv-eviction-budget";
 import {
   describeSeries,
@@ -241,17 +242,13 @@ export const metricRoutingProcedures = {
           const kvState = member.capacity
             ? kvEvictionByCapacity.get(member.capacity.id)
             : undefined;
-          const reportedTokens = member.capacity?.kvBudgetTokens ?? null;
+          const reportedTokens = protectionKvBudgetTokens(
+            member.capacity?.engineKind,
+            member.capacity?.kvBudgetTokens ?? null,
+          );
           const protectionEnabled = pool.protectionEnabled;
-          const effectiveTokens = protectionEnabled
-            ? effectiveKvBudgetTokens(
-                member.capacity?.engineKind === "LLAMA_CPP" ? null : reportedTokens,
-                kvState,
-                now,
-              )
-            : member.capacity?.engineKind === "LLAMA_CPP"
-              ? null
-              : reportedTokens;
+          const placementTokens = effectiveKvBudgetTokens(reportedTokens, kvState, now);
+          const effectiveTokens = protectionEnabled ? placementTokens : reportedTokens;
           const cutFraction =
             !protectionEnabled || effectiveTokens === null ? 0 : effectiveKvCut(kvState, now);
           return {
@@ -278,7 +275,9 @@ export const metricRoutingProcedures = {
               kvBudget: {
                 reportedTokens,
                 effectiveTokens,
-                source: member.capacity?.kvBudgetTokensSource ?? null,
+                placementTokens,
+                source:
+                  reportedTokens == null ? null : (member.capacity?.kvBudgetTokensSource ?? null),
                 cutFraction,
                 floorFraction: KV_EVICTION_FLOOR_FRACTION,
                 lastObservedAt: kvState?.observedAt ?? null,

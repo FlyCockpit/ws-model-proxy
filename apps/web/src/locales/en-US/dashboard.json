@@ -1077,7 +1077,7 @@
     },
     "engineLoad": {
       "title": "Live engine load",
-      "description": "Engines that report load (llama.cpp, vLLM, SGLang) can mark a member FULL from what they see right now, including traffic that bypasses the proxy. It only adds to FULL: capacity counts stay authoritative, a stale reading is ignored, and when every member is FULL requests are still served. Recent cache evictions can temporarily lower the KV budget used for warm protection.",
+      "description": "Engines that report load (llama.cpp, vLLM, SGLang) can mark a member FULL from what they see right now, including traffic that bypasses the proxy. It only adds to FULL: capacity counts stay authoritative, a stale reading is ignored, and when every member is FULL requests are still served. Recent cache evictions can temporarily lower the KV budget used for warm protection and for spreading new conversations.",
       "kvBudgetLowered": "KV budget lowered",
       "kvBudgetEvictions": "KV budget lowered to {{effective}} of {{reported}} tokens (cache evictions seen)",
       "use": "Use engine load",

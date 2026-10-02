@@ -19,7 +19,9 @@ stored once-a-minute snapshot, with `nodeMetricsSource`), and the live
 `endpoint.load` readings the relay holds in memory. Detected engine facts
 (`engineKind`, `engineSlots`, `kvBudgetTokens`, `maxModelLen`,
 `engineFactsSource`, `engineFactsAt`) and the derived `enginePreset` appear on
-every capacity in `capacity_records_list`. Neither ever contains prompt text:
+every capacity in `capacity_records_list`. `effectiveKvBudgetTokens` is the
+capacity-card cut (live prefix-eviction applied to reported K, or the reported
+K when the eviction read fails). Neither ever contains prompt text:
 the CLI reads only slot ids, context sizes and busy flags from llama.cpp
 `/slots`.
 
@@ -72,9 +74,13 @@ Metric routing rules (S-B part 2):
   (`full_waiting`, `full_kv`, `full_slots`, `full_deferred`, `clear`, `stale`,
   `none`, `off`). `kvOccupancy` is display only: it never marks FULL and is not
   eviction evidence. `engineLoad.kvBudget` includes `reportedTokens`,
-  `effectiveTokens`, `source` (`PROBE` / `CONFIG` / `CUSTOM`), `cutFraction` (0–0.5), `floorFraction` (0.5),
+  `effectiveTokens` (warm-protection K for this pool; equals reported when
+  protection is off), `placementTokens` (residency spreading K; always the
+  live cut), `source` (`PROBE` / `CONFIG` / `CUSTOM` — provenance of the
+  **reported** K, null when K is unknown), `cutFraction` (0–0.5), `floorFraction` (0.5),
   `lastObservedAt`, `expiresAt`, and `active`. Prefix-eviction feedback
-  temporarily lowers token-mode warm-protection budgets; slot mode (including
+  temporarily lowers token-mode warm-protection and residency-placement
+  budgets; slot mode (including
   llama.cpp) has null effective tokens and is inactive. Failed feedback reads
   fall back to the reported budget. `endpoint.kv_occupancy` is also available as
   an explicit routing-rule series.

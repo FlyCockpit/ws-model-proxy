@@ -13,6 +13,7 @@ import {
   KV_EVICTION_RECOVERY_MS,
   KV_EVICTION_SESSION_CAP,
   KV_EVICTION_STEP,
+  protectionKvBudgetTokens,
 } from "./kv-eviction-budget";
 
 const now = new Date("2026-09-30T12:00:00Z");
@@ -33,6 +34,11 @@ describe("relative eviction budget", () => {
       KV_EVICTION_FLOOR_FRACTION,
       KV_EVICTION_DECAY_PER_MS,
     ]).toEqual([0.05, 0.5, 1_800_000, 10, 16, 0.15, 0.5, 0.5 / 1_800_000]);
+  });
+  it("slot-mode engines have no token-mode K", () => {
+    expect(protectionKvBudgetTokens("LLAMA_CPP", 100_000)).toBeNull();
+    expect(protectionKvBudgetTokens("VLLM", 100_000)).toBe(100_000);
+    expect(protectionKvBudgetTokens("VLLM", 0)).toBeNull();
   });
   it.each([
     { name: "no row", reported: 100, row: null, expected: 100 },

@@ -1,7 +1,11 @@
 import {
   effectiveKvBudgetTokens,
   type KvEvictionState,
+  protectionKvBudgetTokens,
 } from "@ws-model-proxy/api/lib/kv-eviction-budget";
+
+export { protectionKvBudgetTokens };
+
 import prisma, { Prisma } from "@ws-model-proxy/db";
 
 /**
@@ -50,24 +54,6 @@ export type ProtectionEngineKind =
   | "SGLANG"
   | "OLLAMA"
   | "LM_STUDIO";
-
-/**
- * The KV budget token mode may use: the reported one (vLLM, SGLang), never
- * llama.cpp's (slot-based), and none when unknown or not positive.
- */
-export function protectionKvBudgetTokens(
-  engineKind: ProtectionEngineKind | null | undefined,
-  kvBudgetTokens: number | null | undefined,
-): number | null {
-  if (engineKind === "LLAMA_CPP") return null;
-  return kvBudgetTokens !== null &&
-    kvBudgetTokens !== undefined &&
-    Number.isInteger(kvBudgetTokens) &&
-    kvBudgetTokens > 0 &&
-    kvBudgetTokens <= 2_147_483_647
-    ? kvBudgetTokens
-    : null;
-}
 
 /** The window one member's warm sessions are protected for (seconds, at least 1). */
 export function protectionWindowSecondsFor(

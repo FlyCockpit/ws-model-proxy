@@ -20,7 +20,7 @@ import {
 import { deletionConflict } from "../lib/deletion-conflict";
 import { enginePreset } from "../lib/engine-facts";
 import { refreshSharedAutoCapacities } from "../lib/engine-process-capacity";
-import { effectiveKvBudgetTokens } from "../lib/kv-eviction-budget";
+import { effectiveKvBudgetTokens, protectionKvBudgetTokens } from "../lib/kv-eviction-budget";
 import { parseModelApiSurface } from "../lib/model-api-surface";
 import { assertRecommendedSurfaceServable } from "../lib/pool-recommended-surface";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
@@ -203,15 +203,17 @@ export const capacityManagementRouter = {
             where: { capacityId: { in: ids }, state: "WAITING" },
             _count: { _all: true },
           }),
-          prisma.capacityKvEviction.findMany({
-            where: { capacityId: { in: ids }, userId, expiresAt: { gt: now } },
-            select: {
-              capacityId: true,
-              cutFraction: true,
-              observedAt: true,
-              expiresAt: true,
-            },
-          }),
+          prisma.capacityKvEviction
+            .findMany({
+              where: { capacityId: { in: ids }, userId, expiresAt: { gt: now } },
+              select: {
+                capacityId: true,
+                cutFraction: true,
+                observedAt: true,
+                expiresAt: true,
+              },
+            })
+            .catch(() => []),
         ])
       : [[], [], []];
     const activeLeases = new Map(leases.map((row) => [row.capacityId, row._count._all]));
@@ -225,7 +227,7 @@ export const capacityManagementRouter = {
         kvBudgetTokens: capacity.kvBudgetTokens,
       }),
       effectiveKvBudgetTokens: effectiveKvBudgetTokens(
-        capacity.engineKind === "LLAMA_CPP" ? null : capacity.kvBudgetTokens,
+        protectionKvBudgetTokens(capacity.engineKind, capacity.kvBudgetTokens),
         evictionByCapacity.get(capacity.id),
         now,
       ),

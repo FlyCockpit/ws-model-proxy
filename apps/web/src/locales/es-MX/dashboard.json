@@ -1077,7 +1077,7 @@
     },
     "engineLoad": {
       "title": "Carga en vivo del motor",
-      "description": "Los motores que reportan carga (llama.cpp, vLLM, SGLang) pueden marcar un miembro como LLENO según lo que ven ahora, incluido el tráfico que no pasa por el proxy. Solo suma a LLENO: los conteos de capacidad siguen mandando, una lectura vencida se ignora y, cuando todos los miembros están LLENOS, las solicitudes se siguen atendiendo. Las expulsiones recientes de caché pueden reducir temporalmente el presupuesto KV usado para proteger las sesiones recientes.",
+      "description": "Los motores que reportan carga (llama.cpp, vLLM, SGLang) pueden marcar un miembro como LLENO según lo que ven ahora, incluido el tráfico que no pasa por el proxy. Solo suma a LLENO: los conteos de capacidad siguen mandando, una lectura vencida se ignora y, cuando todos los miembros están LLENOS, las solicitudes se siguen atendiendo. Las expulsiones recientes de caché pueden reducir temporalmente el presupuesto KV usado para proteger las sesiones recientes y para repartir conversaciones nuevas.",
       "kvBudgetLowered": "Presupuesto KV reducido",
       "kvBudgetEvictions": "Presupuesto KV reducido a {{effective}} de {{reported}} tokens (se detectaron expulsiones de caché)",
       "use": "Usar carga del motor",

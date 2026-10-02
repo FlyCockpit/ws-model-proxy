@@ -100,6 +100,7 @@ function engineLoad(overrides: Record<string, unknown> = {}) {
     kvBudget: {
       reportedTokens: 100_000,
       effectiveTokens: 100_000,
+      placementTokens: 100_000,
       source: "CONFIG" as const,
       cutFraction: 0,
       floorFraction: 0.5,
@@ -276,6 +277,7 @@ describe("PoolEngineLoad (S-D)", () => {
           kvBudget: {
             reportedTokens: 100_000,
             effectiveTokens: 50_000,
+            placementTokens: 50_000,
             source: "CONFIG" as const,
             cutFraction: 0.5,
             floorFraction: 0.5,

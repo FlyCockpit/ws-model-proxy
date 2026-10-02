@@ -6160,6 +6160,7 @@ describe("metric routing procedures (S-B part 2)", () => {
       engineKind: "VLLM",
       reported: 100_000,
       effective: 50_000,
+      placement: 50_000,
       active: true,
     },
     {
@@ -6168,6 +6169,7 @@ describe("metric routing procedures (S-B part 2)", () => {
       engineKind: "VLLM",
       reported: 100_000,
       effective: 100_000,
+      placement: 100_000,
       active: false,
     },
     {
@@ -6176,6 +6178,7 @@ describe("metric routing procedures (S-B part 2)", () => {
       engineKind: "VLLM",
       reported: 100_000,
       effective: 100_000,
+      placement: 100_000,
       active: false,
     },
     {
@@ -6184,6 +6187,7 @@ describe("metric routing procedures (S-B part 2)", () => {
       engineKind: "LLAMA_CPP",
       reported: 100_000,
       effective: null,
+      placement: null,
       active: false,
     },
     {
@@ -6192,6 +6196,7 @@ describe("metric routing procedures (S-B part 2)", () => {
       engineKind: "VLLM",
       reported: null,
       effective: null,
+      placement: null,
       active: false,
     },
     {
@@ -6200,6 +6205,7 @@ describe("metric routing procedures (S-B part 2)", () => {
       engineKind: "VLLM",
       reported: 100_000,
       effective: 100_000,
+      placement: 100_000,
       active: false,
       fail: true,
     },
@@ -6209,12 +6215,22 @@ describe("metric routing procedures (S-B part 2)", () => {
       engineKind: "VLLM",
       reported: 100_000,
       effective: 100_000,
+      placement: 50_000,
       active: false,
       protectionEnabled: false,
     },
   ])(
     "KV budget visibility: $name",
-    async ({ cut, engineKind, reported, effective, active, fail, protectionEnabled = true }) => {
+    async ({
+      cut,
+      engineKind,
+      reported,
+      effective,
+      placement,
+      active,
+      fail,
+      protectionEnabled = true,
+    }) => {
       vi.useFakeTimers();
       const now = new Date("2026-09-30T12:00:00Z");
       vi.setSystemTime(now);
@@ -6266,9 +6282,10 @@ describe("metric routing procedures (S-B part 2)", () => {
           );
         const result = await client().getPoolRoutingRules({ poolId: "pool-1" });
         expect(result.members[0]?.engineLoad.kvBudget).toEqual({
-          reportedTokens: reported,
+          reportedTokens: engineKind === "LLAMA_CPP" ? null : reported,
           effectiveTokens: effective,
-          source: "CONFIG",
+          placementTokens: placement,
+          source: engineKind === "LLAMA_CPP" || reported == null ? null : "CONFIG",
           cutFraction: active ? cut : 0,
           floorFraction: 0.5,
           lastObservedAt: cut === null ? null : now,

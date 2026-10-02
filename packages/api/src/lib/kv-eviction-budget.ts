@@ -182,6 +182,24 @@ export function applyKvEvictionObservations(
   );
 }
 
+/**
+ * Token-mode reported K: vLLM/SGLang (and generic) positive int32 budgets.
+ * llama.cpp is slot mode. Shared by protection, placement, and capacity cards.
+ */
+export function protectionKvBudgetTokens(
+  engineKind: string | null | undefined,
+  kvBudgetTokens: number | null | undefined,
+): number | null {
+  if (engineKind === "LLAMA_CPP") return null;
+  return kvBudgetTokens !== null &&
+    kvBudgetTokens !== undefined &&
+    Number.isInteger(kvBudgetTokens) &&
+    kvBudgetTokens > 0 &&
+    kvBudgetTokens <= 2_147_483_647
+    ? kvBudgetTokens
+    : null;
+}
+
 export function effectiveKvBudgetTokens(
   reported: number | null | undefined,
   state: KvEvictionState | null | undefined,

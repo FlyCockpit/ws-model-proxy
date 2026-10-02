@@ -1325,21 +1325,22 @@ function CapacityEngineFacts({ capacity }: { capacity: PoolDetailCapacity }) {
         )
       : null,
     capacity.kvBudgetTokens !== null
-      ? withProvenance(
-          [
+      ? [
+          withProvenance(
             t("dashboard:pools.capacity.engineFacts.kvBudget", {
               value: capacity.kvBudgetTokens.toLocaleString(),
             }),
-            typeof capacity.effectiveKvBudgetTokens === "number"
-              ? t("dashboard:pools.capacity.engineFacts.kvBudgetEffective", {
-                  value: capacity.effectiveKvBudgetTokens.toLocaleString(),
-                })
-              : null,
-          ]
-            .filter((part): part is string => part !== null)
-            .join(" · "),
-          capacity.kvBudgetTokensSource,
-        )
+            capacity.kvBudgetTokensSource,
+          ),
+          typeof capacity.effectiveKvBudgetTokens === "number" &&
+          capacity.effectiveKvBudgetTokens < capacity.kvBudgetTokens
+            ? t("dashboard:pools.capacity.engineFacts.kvBudgetEffective", {
+                value: capacity.effectiveKvBudgetTokens.toLocaleString(),
+              })
+            : null,
+        ]
+          .filter((part): part is string => part !== null)
+          .join(" · ")
       : null,
     capacity.maxModelLen !== null
       ? withProvenance(
