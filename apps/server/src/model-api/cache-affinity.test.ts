@@ -713,7 +713,9 @@ describe("cache affinity", () => {
       ...args,
       estimatedTokens: 20000,
       reportedTokens: 15000,
+      reportedPromptTokens: 12000,
     });
+    db.$queryRaw.mockClear();
     const next = await rememberAffinity({
       ...args,
       payload: { input: "delta", previous_response_id: "response", conversation: "client" },
@@ -722,6 +724,8 @@ describe("cache affinity", () => {
     });
     expect(next!.estimatedTokens).toBe(20010);
     expect(next!.reportedTokens).toBe(15010);
+    expect(next!.reportedPromptTokens).toBe(12010);
+    expect(db.$queryRaw.mock.calls.filter(([query]) => isShareProbe(query))).toHaveLength(0);
     const empty = await rememberAffinity({
       ...args,
       payload: { previous_response_id: "next-response", conversation: "client" },
@@ -1978,8 +1982,10 @@ describe("cache affinity", () => {
       target: served,
       estimatedTokens: 80_000,
       reportedTokens: 50_000,
+      reportedPromptTokens: 40_000,
     });
-    const expected = prefixTokensAtDepth(canonical, depth, 80_000, 50_000);
+    const expected = prefixTokensAtDepth(canonical, depth, 80_000, 40_000);
+    expect(expected).not.toBe(prefixTokensAtDepth(canonical, depth, 80_000, 50_000));
     expect(expected).not.toBe(prefixTokensAtDepth(canonical, depth, 80_000));
     expect(expected).toBeGreaterThan(0);
     expect(conversationWrites().length).toBeGreaterThan(0);
@@ -3767,6 +3773,52 @@ describe("cache affinity", () => {
     expect(result.matchedPrefixTokens?.["target-a"]).toBe(matched);
     expect(result.reasons["target-a"]).toContain(
       `matchFraction:${Number((matched / 1_000).toFixed(4))}`,
+    );
+  });
+
+  it("falls back to payload-token share when ranking has no requestTokens", async () => {
+    const warm = {
+      ...cap8(target("target-a", "runtime-a", "capacity-a")),
+      requestTokens: 0,
+    };
+    const idle = cap8(target("target-b", "runtime-b", "capacity-b"));
+    const rankPayload = {
+      messages: [
+        { role: "system", content: "S" },
+        { role: "user", content: "U" },
+        { role: "assistant", content: "A" },
+        { role: "user", content: "next" },
+      ],
+    };
+    const canonical = buildCanonicalRequest(digestArgs(warm.targetIdentity, rankPayload))!;
+    const seeded = affinityPrefixDigests(
+      digestArgs(warm.targetIdentity, { messages: rankPayload.messages.slice(0, 3) }),
+    );
+    const ranked = affinityPrefixDigests(digestArgs(warm.targetIdentity, rankPayload));
+    db.cacheAffinityRecord.findMany.mockResolvedValue(
+      seeded.digests.map((prefixDigest, index) =>
+        affinityRow({
+          target: warm,
+          material: ranked,
+          prefixDigest,
+          prefixDepth: index + 1,
+        }),
+      ),
+    );
+    const result = await rankAffinityTargets({
+      ownerId: "owner",
+      resourceOwnerId: "owner",
+      poolId: "pool",
+      securityScope: "token",
+      policy,
+      surface: "openai-chat",
+      payload: rankPayload,
+      targets: [idle, warm],
+    });
+    const total = prefixPayloadTokensAtDepth(canonical, canonical.conversationUnits.length);
+    const prefix = prefixPayloadTokensAtDepth(canonical, 2);
+    expect(result.reasons["target-a"]).toContain(
+      `matchFraction:${Number((prefix / total).toFixed(4))}`,
     );
   });
 

@@ -1803,6 +1803,22 @@ function reportedTokensFromSettledUsage(usage: RawProviderUsage | undefined): nu
   return total > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(total);
 }
 
+function reportedPromptTokensFromSettledUsage(
+  usage: RawProviderUsage | undefined,
+): number | undefined {
+  if (!usage) return undefined;
+  const parts = [usage.inputTokens, usage.cacheReadTokens, usage.cacheWriteTokens];
+  let total = 0n;
+  let known = false;
+  for (const part of parts) {
+    if (part === undefined) continue;
+    known = true;
+    total += part;
+  }
+  if (!known) return undefined;
+  return total > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(total);
+}
+
 /**
  * Derives engine cache-affinity evidence directly from retained response-body
  * chunks (SSE or JSON) using the shared provider usage normalizer. Never
@@ -3862,6 +3878,7 @@ export async function dispatchPublicOverflow(
                             : request.estimatedInputTokens,
                         ),
                   reportedTokens: reportedTokensFromSettledUsage(settledUsage),
+                  reportedPromptTokens: reportedPromptTokensFromSettledUsage(settledUsage),
                 });
             } catch {
               // Affinity is a best-effort routing hint and cannot change a terminal result.

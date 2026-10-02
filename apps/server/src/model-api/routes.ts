@@ -7082,6 +7082,7 @@ async function relayPool({
                 operation.contextCount?.tokens,
               ),
               reportedTokens: reportedAffinityTokens(usageFacts),
+              reportedPromptTokens: usageFacts.promptTokens ?? undefined,
             });
           })
           .catch((error) => {
@@ -7782,6 +7783,7 @@ async function relaySelectedModelNoFailover({
             ),
             estimatedDeltaTokens,
             reportedTokens: reportedAffinityTokens(usageFacts),
+            reportedPromptTokens: usageFacts.promptTokens ?? undefined,
             engineCacheConfirmed: engineCacheConfirmedFromUsageFacts(usageFacts),
           });
         })

@@ -94,9 +94,9 @@ export type AffinityDecision = {
   prefixTokens?: Record<string, number>;
   /**
    * Payload-aware estimate of the current request through the matched prefix
-   * depth (root + conversation units 1..depth), scaled by engine-reported
-   * prompt tokens when those are the request size. Absent when the request is
-   * not affine on that target.
+   * depth (root + conversation units 1..depth). Ranking never passes a
+   * reported value; the figure is the local request estimate. Absent when the
+   * request is not affine on that target.
    */
   matchedPrefixTokens?: Record<string, number>;
   /**
@@ -118,6 +118,7 @@ export type AffinitySessionBinding = {
   canonicalBytes: number;
   estimatedTokens?: number;
   reportedTokens?: number;
+  reportedPromptTokens?: number;
 };
 
 export function scopedAffinitySessionId(
@@ -570,12 +571,8 @@ export function prefixTokensAtDepth(
   );
 }
 
-export function instructionTokens(
-  canonical: CanonicalRequest,
-  estimate: number,
-  reportedPromptTokens?: number | null,
-): number {
-  return prefixTokensAtDepth(canonical, 0, estimate, reportedPromptTokens);
+export function instructionTokens(canonical: CanonicalRequest, estimate: number): number {
+  return prefixTokensAtDepth(canonical, 0, estimate);
 }
 
 /** Advisory identity must never reject a served request or expose partial material. */
@@ -1316,8 +1313,16 @@ export async function rankAffinityTargets({
           ? 0
           : requestTokens > 0
             ? matchedPrefixTokens / requestTokens
-            : canonical && canonicalByteLength(canonical) > 0
-              ? prefixBytesAtDepth(canonical, scoredPrefixDepth) / canonicalByteLength(canonical)
+            : canonical
+              ? (() => {
+                  const total = prefixPayloadTokensAtDepth(
+                    canonical,
+                    canonical.conversationUnits.length,
+                  );
+                  return total > 0
+                    ? prefixPayloadTokensAtDepth(canonical, scoredPrefixDepth) / total
+                    : 0;
+                })()
               : 0;
       return {
         target,
@@ -1491,6 +1496,7 @@ export async function rememberAffinity({
   estimatedTokens,
   estimatedDeltaTokens,
   reportedTokens,
+  reportedPromptTokens,
   engineCacheConfirmed,
   sessionBinding,
   headers,
@@ -1510,6 +1516,8 @@ export async function rememberAffinity({
   estimatedDeltaTokens?: number;
   /** Engine-reported prompt + completion for the served turn, when known. */
   reportedTokens?: number;
+  /** Engine-reported prompt tokens only; used to scale shared prefixes. */
+  reportedPromptTokens?: number;
   /**
    * Latest engine cache evidence from the served response. `true` (cached
    * prompt tokens reported) and `false` (cache fields reported with zero)
@@ -1556,8 +1564,15 @@ export async function rememberAffinity({
       sessionBinding.reportedTokens + (estimatedDeltaTokens ?? 0),
     );
   }
+  if (material.boundSessionId && sessionBinding?.reportedPromptTokens !== undefined) {
+    reportedPromptTokens = Math.min(
+      2_147_483_647,
+      sessionBinding.reportedPromptTokens + (estimatedDeltaTokens ?? 0),
+    );
+  }
   const expiresAt = new Date(now.getTime() + policy.ttlSeconds * 1000);
   const storedReportedTokens = clampAffinityTokens(reportedTokens);
+  const storedReportedPromptTokens = clampAffinityTokens(reportedPromptTokens);
   // Every record this call writes (created or refreshed) carries the same
   // `lastUsedAt` and `sessionId`: warm-session protection (S-C,
   // ./warm-protection.ts) groups records into one session by the id, dates it
@@ -1614,7 +1629,12 @@ export async function rememberAffinity({
       : [];
     let sharedWithSessionId: string | null = null;
     let sharedPrefixTokens: number | null = null;
-    if (material.identifiable && existingNodes.length === 0 && material.nodes.length > 0) {
+    if (
+      material.identifiable &&
+      existingNodes.length === 0 &&
+      material.nodes.length > 0 &&
+      !material.boundSessionId
+    ) {
       const shared = await tx.$queryRaw<{ sessionId: string; depth: number }[]>(
         affinitySharedPrefixProbeSql(scope, material, sessionId, now),
       );
@@ -1623,7 +1643,7 @@ export async function rememberAffinity({
       if (hit?.sessionId && hit.sessionId !== sessionId && Number.isFinite(depth)) {
         sharedWithSessionId = hit.sessionId;
         sharedPrefixTokens = canonical
-          ? prefixTokensAtDepth(canonical, depth, estimatedTokens ?? 0, storedReportedTokens)
+          ? prefixTokensAtDepth(canonical, depth, estimatedTokens ?? 0, storedReportedPromptTokens)
           : 0;
       }
     }
@@ -1921,6 +1941,9 @@ export async function rememberAffinity({
       canonicalBytes: material.canonicalBytes,
       estimatedTokens,
       ...(storedReportedTokens === null ? {} : { reportedTokens: storedReportedTokens }),
+      ...(storedReportedPromptTokens === null
+        ? {}
+        : { reportedPromptTokens: storedReportedPromptTokens }),
     };
   }, AFFINITY_TRANSACTION_LIMITS);
 }
