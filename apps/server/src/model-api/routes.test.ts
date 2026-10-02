@@ -525,6 +525,7 @@ function directRow({
   optimisticBasicTranscription = false,
   physicalMaxContext,
   countStrategy,
+  engineCountContext,
   directContextCeiling,
   directContextMargin = 0,
 }: {
@@ -547,6 +548,14 @@ function directRow({
     | "ENGINE_REPORTED"
     | "CONSERVATIVE_ESTIMATE"
     | "CALIBRATED_ESTIMATE";
+  engineCountContext?:
+    | "UNSUPPORTED"
+    | "VLLM_TOKENIZE"
+    | "TGI_CHAT_TOKENIZE"
+    | "LLAMA_APPLY_TEMPLATE"
+    | "LLAMA_INPUT_TOKENS"
+    | "ADAPTER_COUNT"
+    | null;
   directContextCeiling?: number;
   directContextMargin?: number;
 } = {}) {
@@ -578,6 +587,12 @@ function directRow({
               template: null,
               templateVersion: null,
               engine: null,
+              engineCountContext:
+                engineCountContext !== undefined
+                  ? engineCountContext
+                  : (countStrategy ?? "ENGINE_REPORTED") === "ENGINE_REPORTED"
+                    ? "LLAMA_INPUT_TOKENS"
+                    : null,
             },
     },
     Endpoint: {
@@ -640,6 +655,7 @@ function poolMemberRow({
   cacheHolderWaitMs = null,
   engineKind = null,
   kvBudgetTokens = null,
+  engineCountContext,
 }: {
   id: string;
   discoveredModelId: string;
@@ -669,6 +685,14 @@ function poolMemberRow({
   cacheHolderWaitMs?: number | null;
   engineKind?: "GENERIC" | "LLAMA_CPP" | "VLLM" | "SGLANG" | "OLLAMA" | "LM_STUDIO" | null;
   kvBudgetTokens?: number | null;
+  engineCountContext?:
+    | "UNSUPPORTED"
+    | "VLLM_TOKENIZE"
+    | "TGI_CHAT_TOKENIZE"
+    | "LLAMA_APPLY_TEMPLATE"
+    | "LLAMA_INPUT_TOKENS"
+    | "ADAPTER_COUNT"
+    | null;
 }) {
   return {
     id,
@@ -733,6 +757,12 @@ function poolMemberRow({
               cacheNamespace: "cache",
               engineKind,
               kvBudgetTokens,
+              engineCountContext:
+                engineCountContext !== undefined
+                  ? engineCountContext
+                  : countStrategy === "ENGINE_REPORTED"
+                    ? "LLAMA_INPUT_TOKENS"
+                    : null,
             },
       DiscoveredModel: null,
     },
@@ -13263,6 +13293,56 @@ describe("model API routes", () => {
     await vi.waitFor(() => expect(manager.sentCountContext).toHaveLength(1));
     manager.completeCountContext(manager.sentCountContext[0]!.requestId, 29);
     await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+  });
+
+  it("skips Chat Completions count_context when the endpoint has no count method", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({
+        physicalMaxContext: 45,
+        countStrategy: "ENGINE_REPORTED",
+        engineCountContext: null,
+      }),
+    );
+    const manager = new FakeRelayManager();
+    manager.supportsCountContextFlag = true;
+    const responsePromise = appWith(manager, admittingCapacityRuntime()).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(),
+      },
+    );
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    expect(manager.sentCountContext).toHaveLength(0);
+    await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+    const response = await responsePromise;
+    expect(response.status).toBe(200);
+  });
+
+  it("skips Chat Completions count_context when the endpoint reports count unsupported", async () => {
+    db.discoveredModel.findUnique.mockResolvedValue(
+      directRow({
+        physicalMaxContext: 45,
+        countStrategy: "ENGINE_REPORTED",
+        engineCountContext: "UNSUPPORTED",
+      }),
+    );
+    const manager = new FakeRelayManager();
+    manager.supportsCountContextFlag = true;
+    const responsePromise = appWith(manager, admittingCapacityRuntime()).request(
+      "/chat/completions",
+      {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(),
+      },
+    );
+    await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+    expect(manager.sentCountContext).toHaveLength(0);
     await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
     const response = await responsePromise;
     expect(response.status).toBe(200);

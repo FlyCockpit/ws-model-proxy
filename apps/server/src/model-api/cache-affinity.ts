@@ -1130,14 +1130,17 @@ export async function rankAffinityTargets({
   // on it (an affinity hit is never redirected), even with nothing to reorder.
   if (!policy.enabled || targets.length < (scoreSingleTarget ? 1 : 2)) return unchanged;
 
-  const imageTokenAllowance = targets.find(
-    (target) => target.imageTokenAllowance != null,
-  )?.imageTokenAllowance;
-  const canonical = buildCanonicalRequest({ surface, payload, headers, imageTokenAllowance });
-  const materialByIdentity = new Map(
-    targets.map((target) => [
-      target.targetIdentity,
-      materialFromCanonical(
+  const preparedTargets = targets.map((target) => {
+    const canonical = buildCanonicalRequest({
+      surface,
+      payload,
+      headers,
+      imageTokenAllowance: target.imageTokenAllowance,
+    });
+    return {
+      target,
+      canonical,
+      material: materialFromCanonical(
         {
           ownerId,
           resourceOwnerId,
@@ -1152,7 +1155,13 @@ export async function rankAffinityTargets({
         },
         canonical,
       ),
-    ]),
+    };
+  });
+  const materialByIdentity = new Map(
+    preparedTargets.map(({ target, material }) => [target.targetIdentity, material]),
+  );
+  const canonicalByIdentity = new Map(
+    preparedTargets.map(({ target, canonical }) => [target.targetIdentity, canonical]),
   );
   const conversationPrefixDigests = [
     ...new Set([...materialByIdentity.values()].flatMap(({ digests }) => digests)),
@@ -1277,6 +1286,7 @@ export async function rankAffinityTargets({
   const scored = await Promise.all(
     targets.map(async (target, originalIndex) => {
       const material = materialByIdentity.get(target.targetIdentity)!;
+      const canonical = canonicalByIdentity.get(target.targetIdentity);
       const conversationDepthByDigest = new Map(
         material.routingNodes.map(({ digest, depth }) => [digest, depth]),
       );
@@ -1415,6 +1425,7 @@ export async function rankAffinityTargets({
         requestTokens,
         sessionId,
         prefixEvidence,
+        canonical,
         score: 0,
       };
     }),
@@ -1462,7 +1473,9 @@ export async function rankAffinityTargets({
     );
     const slots = row.target.slots ?? row.target.hardConcurrencyLimit;
     const savedTokens =
-      row.instructionDepth > 0 && canonical ? instructionTokens(canonical, row.requestTokens) : 0;
+      row.instructionDepth > 0 && row.canonical
+        ? instructionTokens(row.canonical, row.requestTokens)
+        : 0;
     const projected = residencyProjected({
       residentTokens: occupancy.tokens,
       residentSessions: occupancy.sessions,

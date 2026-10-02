@@ -268,6 +268,21 @@ describe("sanitizeValidationIssues", () => {
     expect(fieldsFromValidationIssues(suggested ?? [])).toEqual(["fallbackEnabled", "poolId"]);
   });
 
+  it("names nested issues as dotted paths", () => {
+    const issues = sanitize(
+      [
+        {
+          code: "too_small",
+          path: ["rules", 0, "threshold"],
+          message: "Number must be greater than 0",
+        },
+      ],
+      new Set(["rules", "threshold", "poolId"]),
+    );
+    expect(issues?.[0]?.path).toEqual(["rules", 0, "threshold"]);
+    expect(fieldsFromValidationIssues(issues ?? [])).toEqual(["rules.0.threshold"]);
+  });
+
   it("keeps only declared data.fields and a static message", () => {
     expect(
       sanitizeDeclaredFields(

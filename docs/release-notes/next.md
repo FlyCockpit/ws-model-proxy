@@ -157,6 +157,23 @@ caller waits the full local budget. MCP:
 `model_api_token_external_wait_update`. The column is additive and nullable
 (`APPLY_SCHEMA=safe`).
 
+## CLI identity bind and native count
+
+- **CLI devices and CLI tokens bind to the CLI identity key, not `/etc/machine-id`.**
+  Hello signs a server nonce. Existing device credentials and CLI tokens that
+  stored a machine id must run `wsmp login` again on each machine. A copied
+  `service.env` cannot take over another machine. The hello still reports
+  `machine_mismatch` when the bound key does not match.
+- **Native Chat Completions counting is per endpoint.** The CLI probe writes
+  `engineFacts.countContext` onto the inference capacity (`engineCountContext`,
+  additive, `APPLY_SCHEMA=safe`). Near-ceiling Chat Completions skip the extra
+  body hop when the method is missing or `unsupported` (Ollama, SGLang, generic,
+  failed probes).
+- **Engine-load history survives a reconnect.** Disconnect no longer wipes the
+  30-minute rings. New keys at the 2000-ring (or 64-per-device) cap are refused
+  while existing live rings stay; rings older than the window are pruned.
+- **MCP `fields` for nested argument errors are dotted paths** (`rules.0.threshold`).
+
 ## Post-deploy verification
 
 The trigger fix is covered by the PostgreSQL CI suites but has not yet been

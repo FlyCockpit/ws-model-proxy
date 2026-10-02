@@ -1286,7 +1286,6 @@ export class RelaySessionManager {
     const cliDeviceId = session.cliDeviceId;
     if (!cliDeviceId || this.sessionsByCliDeviceId.get(cliDeviceId) !== session) return null;
     this.sessionsByCliDeviceId.delete(cliDeviceId);
-    this.engineLoadHistory.dropDevice(cliDeviceId);
     const connectionGeneration = session.connectionGeneration;
     return () =>
       this.writeDeviceDisconnected(cliDeviceId, {
@@ -1640,7 +1639,14 @@ export class RelaySessionManager {
    * `session.impersonatedBy`) exists only on browser sessions.
    */
   async closeSessionsForUser(userId: string, now = new Date()) {
+    const deviceIds = new Set<string>();
+    for (const session of this.sessionsByCliDeviceId.values()) {
+      if (session.identity.userId === userId && session.cliDeviceId) {
+        deviceIds.add(session.cliDeviceId);
+      }
+    }
     await this.closeSessionsMatching((session) => session.identity.userId === userId, now);
+    for (const cliDeviceId of deviceIds) this.engineLoadHistory.dropDevice(cliDeviceId);
   }
 
   private async closeSessionsMatching(matches: (session: SessionState) => boolean, now: Date) {

@@ -289,7 +289,7 @@ describe("capability override origin", () => {
     // Checked inside the registration transaction, after the device upsert.
     expect(db.cliToken.findUnique).toHaveBeenCalledWith({
       where: { id: "token-id" },
-      select: { revokedAt: true, expiresAt: true, cliDeviceId: true },
+      select: { revokedAt: true, expiresAt: true, cliDeviceId: true, identityPublicKey: true },
     });
     expect(db.cliToken.updateMany).not.toHaveBeenCalled();
   });
@@ -1420,6 +1420,7 @@ describe("capability override origin", () => {
         engineFactsSource: "PROBE",
         engineLoadSource: null,
         engineLoadSignals: [],
+        engineCountContext: null,
         engineFactsAt: now,
       },
     });

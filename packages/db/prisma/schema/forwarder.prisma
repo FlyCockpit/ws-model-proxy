@@ -299,6 +299,17 @@ enum EngineFactSource {
   CUSTOM
 }
 
+/// Native Chat Completions count method from `engineFacts.countContext`.
+/// Null on the capacity means not probed.
+enum EngineCountContext {
+  UNSUPPORTED
+  VLLM_TOKENIZE
+  TGI_CHAT_TOKENIZE
+  LLAMA_APPLY_TEMPLATE
+  LLAMA_INPUT_TOKENS
+  ADAPTER_COUNT
+}
+
 enum AdmissionSourceKind {
   DIRECT
   POOL
@@ -1352,6 +1363,8 @@ model InferenceCapacity {
   engineLoadSource           EngineLoadSource?
   /// Adapter signal names that can drive FULL (`waiting`, `kvUsage`, …).
   engineLoadSignals          String[]              @default([])
+  /// Native count method the CLI probed. Null = not probed this hello.
+  engineCountContext         EngineCountContext?
   User                       User                  @relation("InferenceCapacityOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   ExecutionTargets           ExecutionTarget[]
 

@@ -101,33 +101,42 @@ describe("engine-load history ring", () => {
     expect(series.every((point) => point.gap)).toBe(true);
   });
 
-  it("evicts the least-recent key instead of refusing inserts at the cap", () => {
+  it("refuses new live keys at the cap and only evicts rings older than the window", () => {
     const store = new EngineLoadHistoryStore();
     for (let i = 0; i < ENGINE_LOAD_HISTORY_MAX_KEYS_PER_DEVICE; i += 1) {
-      expect(
-        store.record(
-          "d1",
-          `ep-${i}`,
-          null,
-          sample({ receivedAt: new Date(T0.getTime() + i * 1000) }),
-        ),
-      ).toBe(true);
+      expect(store.record("d1", `ep-${i}`, null, sample({ receivedAt: T0 }))).toBe(true);
     }
     expect(
       store.record("d1", "overflow", null, sample({ receivedAt: new Date(T0.getTime() + 90_000) })),
-    ).toBe(true);
+    ).toBe(false);
     expect(store.deviceKeyCount("d1")).toBe(ENGINE_LOAD_HISTORY_MAX_KEYS_PER_DEVICE);
-    expect(store.series("d1", "ep-0", null, T0).every((point) => point.gap)).toBe(true);
+    expect(store.series("d1", "ep-0", null, T0).at(-1)).toMatchObject({ running: 1, gap: false });
     expect(
-      store.series("d1", "overflow", null, new Date(T0.getTime() + 90_000)).at(-1),
-    ).toMatchObject({ running: 1, gap: false });
-    expect(store.record("d1", "ep-1", null, sample({ running: 9 }))).toBe(true);
+      store.record(
+        "d1",
+        "ep-1",
+        null,
+        sample({ running: 9, receivedAt: new Date(T0.getTime() + 90_000) }),
+      ),
+    ).toBe(true);
+
+    const stale = new Date(
+      T0.getTime() + ENGINE_LOAD_HISTORY_WINDOW_MS + ENGINE_LOAD_HISTORY_BUCKET_MS,
+    );
+    const aged = new EngineLoadHistoryStore();
+    for (let i = 0; i < ENGINE_LOAD_HISTORY_MAX_KEYS_PER_DEVICE; i += 1) {
+      expect(aged.record("d1", `ep-${i}`, null, sample({ receivedAt: T0 }))).toBe(true);
+    }
+    expect(aged.record("d1", "fresh", null, sample({ receivedAt: stale }))).toBe(true);
+    expect(aged.deviceKeyCount("d1")).toBe(1);
+    expect(aged.series("d1", "fresh", null, stale).at(-1)).toMatchObject({
+      running: 1,
+      gap: false,
+    });
 
     const other = new EngineLoadHistoryStore();
     for (let i = 0; i < ENGINE_LOAD_HISTORY_MAX_KEYS; i += 1) {
-      expect(
-        other.record(`d-${i}`, "gpu", null, sample({ receivedAt: new Date(T0.getTime() + i) })),
-      ).toBe(true);
+      expect(other.record(`d-${i}`, "gpu", null, sample({ receivedAt: T0 }))).toBe(true);
     }
     expect(
       other.record(
@@ -136,12 +145,12 @@ describe("engine-load history ring", () => {
         null,
         sample({ receivedAt: new Date(T0.getTime() + 90_000) }),
       ),
-    ).toBe(true);
+    ).toBe(false);
     expect(other.size).toBe(ENGINE_LOAD_HISTORY_MAX_KEYS);
-    expect(other.series("d-0", "gpu", null, T0).every((point) => point.gap)).toBe(true);
+    expect(other.series("d-0", "gpu", null, T0).at(-1)).toMatchObject({ running: 1, gap: false });
   });
 
-  it("drops a device's keys on session close", () => {
+  it("drops a device's keys", () => {
     const store = new EngineLoadHistoryStore();
     store.record("d1", "gpu", null, sample({ running: 4 }));
     store.record("d2", "gpu", null, sample({ running: 5 }));

@@ -186,9 +186,9 @@ export function sanitizeValidationIssues(
 }
 
 /**
- * Argument names an agent can correct: declared path segments plus
+ * Argument names an agent can correct: dotted declared paths plus
  * server-chosen suggestions. `"?"` (a segment that is not a declared field)
- * is omitted. Order follows the issues.
+ * drops that path. Order follows the issues.
  */
 export function fieldsFromValidationIssues(issues: readonly McpValidationIssue[]): string[] {
   const fields: string[] = [];
@@ -198,9 +198,8 @@ export function fieldsFromValidationIssues(issues: readonly McpValidationIssue[]
   };
   for (const issue of issues) {
     for (const key of issue.suggestions ?? []) add(key);
-    for (const segment of issue.path) {
-      if (typeof segment === "string") add(segment);
-    }
+    if (issue.path.length === 0 || issue.path.includes("?")) continue;
+    add(issue.path.map((segment) => String(segment)).join("."));
   }
   return fields;
 }

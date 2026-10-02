@@ -11,6 +11,8 @@ export const ENGINE_LOAD_HISTORY_WINDOW_MS =
   ENGINE_LOAD_HISTORY_POINTS * ENGINE_LOAD_HISTORY_BUCKET_MS;
 export const ENGINE_LOAD_HISTORY_MAX_KEYS_PER_DEVICE = 64;
 export const ENGINE_LOAD_HISTORY_MAX_KEYS = 2_000;
+/** Full prune cadence. Independent of the per-device key cap. */
+export const ENGINE_LOAD_HISTORY_PRUNE_EVERY_MS = ENGINE_LOAD_HISTORY_BUCKET_MS;
 
 export type EngineLoadHistorySample = {
   running: number;
@@ -148,7 +150,7 @@ export function expandHistorySeries(
 export class EngineLoadHistoryStore {
   private rings = new Map<string, Ring>();
   private keysByDevice = new Map<string, Set<string>>();
-  private recordsSincePrune = 0;
+  private lastPruneMs = Number.NEGATIVE_INFINITY;
 
   get size(): number {
     return this.rings.size;
@@ -164,34 +166,40 @@ export class EngineLoadHistoryStore {
     modelSlug: string | null,
     sample: EngineLoadHistorySample,
   ): boolean {
-    this.recordsSincePrune += 1;
-    if (this.recordsSincePrune >= ENGINE_LOAD_HISTORY_MAX_KEYS_PER_DEVICE) {
-      this.recordsSincePrune = 0;
+    const receivedMs = sample.receivedAt.getTime();
+    if (
+      this.lastPruneMs === Number.NEGATIVE_INFINITY ||
+      receivedMs - this.lastPruneMs >= ENGINE_LOAD_HISTORY_PRUNE_EVERY_MS
+    ) {
+      this.lastPruneMs = receivedMs;
       this.prune(sample.receivedAt);
     }
     const key = historyKey(cliDeviceId, endpointSlug, modelSlug);
     const existing = this.rings.get(key);
     if (!existing) {
       if (
-        (this.keysByDevice.get(cliDeviceId)?.size ?? 0) >= ENGINE_LOAD_HISTORY_MAX_KEYS_PER_DEVICE
+        (this.keysByDevice.get(cliDeviceId)?.size ?? 0) >=
+          ENGINE_LOAD_HISTORY_MAX_KEYS_PER_DEVICE &&
+        !this.evictStaleForDevice(cliDeviceId, receivedMs)
       ) {
-        this.evictLeastRecentForDevice(cliDeviceId);
+        return false;
       }
-      if (this.rings.size >= ENGINE_LOAD_HISTORY_MAX_KEYS) this.evictLeastRecent();
-    }
-    const receivedMs = sample.receivedAt.getTime();
-    this.pruneRing(existing, receivedMs);
-    const startMs = bucketStartMs(receivedMs);
-    const bucket = mergeSampleIntoBucket(existing?.buckets.get(startMs), sample);
-    if (!existing) {
-      const buckets = new Map<number, EngineLoadHistoryBucket>([[startMs, bucket]]);
+      if (this.rings.size >= ENGINE_LOAD_HISTORY_MAX_KEYS && !this.evictStale(receivedMs)) {
+        return false;
+      }
+      const startMs = bucketStartMs(receivedMs);
+      const buckets = new Map<number, EngineLoadHistoryBucket>([
+        [startMs, mergeSampleIntoBucket(undefined, sample)],
+      ]);
       this.rings.set(key, { cliDeviceId, buckets, lastMs: receivedMs });
       const set = this.keysByDevice.get(cliDeviceId) ?? new Set<string>();
       set.add(key);
       this.keysByDevice.set(cliDeviceId, set);
       return true;
     }
-    existing.buckets.set(startMs, bucket);
+    this.pruneRing(existing, receivedMs);
+    const startMs = bucketStartMs(receivedMs);
+    existing.buckets.set(startMs, mergeSampleIntoBucket(existing.buckets.get(startMs), sample));
     existing.lastMs = Math.max(existing.lastMs, receivedMs);
     return true;
   }
@@ -254,8 +262,10 @@ export class EngineLoadHistoryStore {
   private pruneRing(ring: Ring | undefined, nowMs: number): void {
     if (!ring) return;
     const windowStart = windowStartMs(nowMs);
-    for (const startMs of [...ring.buckets.keys()]) {
-      if (startMs < windowStart) ring.buckets.delete(startMs);
+    // Buckets are inserted in time order; stop at the first one still in window.
+    for (const startMs of ring.buckets.keys()) {
+      if (startMs >= windowStart) break;
+      ring.buckets.delete(startMs);
     }
   }
 
@@ -266,29 +276,33 @@ export class EngineLoadHistoryStore {
     if (set && set.size === 0) this.keysByDevice.delete(cliDeviceId);
   }
 
-  private evictLeastRecentForDevice(cliDeviceId: string): void {
+  /** Drop one ring whose last sample is older than the history window. */
+  private evictStaleForDevice(cliDeviceId: string, nowMs: number): boolean {
     const keys = this.keysByDevice.get(cliDeviceId);
-    if (!keys || keys.size === 0) return;
-    this.evictOldest(keys);
+    if (!keys || keys.size === 0) return false;
+    return this.evictOldestStale(keys, nowMs);
   }
 
-  private evictLeastRecent(): void {
-    this.evictOldest(this.rings.keys());
+  private evictStale(nowMs: number): boolean {
+    return this.evictOldestStale(this.rings.keys(), nowMs);
   }
 
-  private evictOldest(keys: Iterable<string>): void {
+  private evictOldestStale(keys: Iterable<string>, nowMs: number): boolean {
+    const staleBefore = windowStartMs(nowMs);
     let oldestKey: string | undefined;
     let oldestMs = Number.POSITIVE_INFINITY;
     let oldestDevice: string | undefined;
     for (const key of keys) {
       const ring = this.rings.get(key);
-      if (!ring) continue;
+      if (!ring || ring.lastMs >= staleBefore) continue;
       if (ring.lastMs < oldestMs) {
         oldestMs = ring.lastMs;
         oldestKey = key;
         oldestDevice = ring.cliDeviceId;
       }
     }
-    if (oldestKey && oldestDevice) this.drop(oldestKey, oldestDevice);
+    if (!oldestKey || !oldestDevice) return false;
+    this.drop(oldestKey, oldestDevice);
+    return true;
   }
 }

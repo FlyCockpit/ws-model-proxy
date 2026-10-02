@@ -3,6 +3,7 @@ import {
   parseExternalAfterWaitMs,
   resolveCallerExternalAfterWaitMs,
 } from "@ws-model-proxy/api/lib/caller-external-wait";
+import { engineCountContextSupportsNative } from "@ws-model-proxy/api/lib/engine-facts";
 import {
   getConfiguredMediaAttachmentMaxBytes,
   resolveAttachmentLimit,
@@ -726,6 +727,7 @@ async function nativeContextCount({
     ) {
       return estimate;
     }
+    if (!engineCountContextSupportsNative(capacity?.engineCountContext)) return estimate;
     if (!manager.supportsCountContext(selected.Endpoint.cliDeviceId)) return estimate;
     let chatBuilt: BuiltRelayRequest | undefined;
     let chatAttempt: ReturnType<typeof startCountContextAttempt> | undefined;
@@ -1000,6 +1002,7 @@ const inferenceCapacityRelaySelect = {
   cacheNamespace: true,
   engineKind: true,
   kvBudgetTokens: true,
+  engineCountContext: true,
 } satisfies Prisma.InferenceCapacitySelect;
 
 const relayEndpointSelect = {
