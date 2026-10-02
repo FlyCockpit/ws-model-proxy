@@ -277,8 +277,6 @@ type ModelApiRouteDependencies = {
     | "cancelRelayRequest"
     | "completeRelayRequest"
     | "supportsCountContext"
-    | "registerCountContextHandlers"
-    | "sendCountContext"
   >;
   concurrencyLimiter?: ModelApiConcurrencyLimiter;
   capacityRuntime?: CapacityAdmissionRuntime;

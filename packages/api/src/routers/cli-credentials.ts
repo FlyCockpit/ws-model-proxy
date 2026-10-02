@@ -43,6 +43,9 @@ const cliTokenSelection = {
   revokedAt: true,
   expiresAt: true,
   cliDeviceId: true,
+  identityPublicKey: true,
+  lastRefusedAt: true,
+  lastRefusedReason: true,
 } satisfies Prisma.CliTokenSelect;
 
 type CliTokenRow = Prisma.CliTokenGetPayload<{ select: typeof cliTokenSelection }>;
@@ -58,6 +61,9 @@ function serializeCliToken(row: CliTokenRow) {
     revokedAt: row.revokedAt,
     expiresAt: row.expiresAt,
     cliDeviceId: row.cliDeviceId,
+    identityBound: row.identityPublicKey != null,
+    lastRefusedAt: row.lastRefusedAt,
+    lastRefusedReason: row.lastRefusedReason,
   };
 }
 
@@ -140,6 +146,33 @@ export const cliCredentialsRouter = {
       await closeRevokedCliCredentialSessions(context.services, {
         kind: "cliToken",
         ids: [row.id],
+      });
+      return serializeCliToken(row);
+    }),
+
+  resetTokenIdentity: protectedProcedure
+    .input(z.object({ id: z.string().min(1) }))
+    .handler(async ({ input, context }) => {
+      const existing = await prisma.cliToken.findUnique({
+        where: { id: input.id },
+        select: { id: true, userId: true, revokedAt: true },
+      });
+      if (!existing || existing.userId !== context.session.user.id) {
+        throw new ORPCError("NOT_FOUND", { message: "CLI token not found." });
+      }
+      if (existing.revokedAt) {
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Revoked CLI tokens cannot reset their identity bind.",
+        });
+      }
+      const row = await prisma.cliToken.update({
+        where: { id: input.id },
+        data: {
+          identityPublicKey: null,
+          lastRefusedAt: null,
+          lastRefusedReason: null,
+        },
+        select: cliTokenSelection,
       });
       return serializeCliToken(row);
     }),

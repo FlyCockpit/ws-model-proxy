@@ -285,13 +285,13 @@ describe("cliCredentialAccess", () => {
       check(
         "BCIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
       ),
-    ).resolves.toBe("machineMismatch");
+    ).resolves.toBe("identityMismatch");
     db.cliDeviceCredential.findUnique.mockResolvedValueOnce({
       revokedAt: null,
       cliDeviceId: "cli-device-id",
       identityPublicKey: null,
     });
-    await expect(check(identityPublicKey)).resolves.toBe("machineMismatch");
+    await expect(check(identityPublicKey)).resolves.toBe("identityMismatch");
   });
 
   it("binds an unbound CLI token on its first hello with a conditional write", async () => {

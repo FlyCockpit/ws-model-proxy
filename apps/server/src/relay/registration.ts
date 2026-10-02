@@ -41,7 +41,10 @@ import {
   coarseCapabilitiesFromOpenAi,
   resolveEffectiveCapabilityMetadata,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
-import { DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE } from "@ws-model-proxy/config/cli-identity-key";
+import {
+  CLI_TOKEN_IDENTITY_MISMATCH_MESSAGE,
+  DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE,
+} from "@ws-model-proxy/config/cli-identity-key";
 import { directModelId, validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
 import { acquireFences, fenceOwners, fences } from "@ws-model-proxy/db/capacity-lock-order";
@@ -62,7 +65,7 @@ export type DesiredModelCapability = {
 export class RelayRegistrationError extends Error {
   constructor(
     message: string,
-    public readonly code: "access_denied" | "protocol_error" | "machine_mismatch",
+    public readonly code: "access_denied" | "protocol_error" | "identity_mismatch",
   ) {
     super(message);
     this.name = "RelayRegistrationError";
@@ -413,11 +416,24 @@ export async function persistRelayRegistration({
               "access_denied",
             );
           }
-          if (credentialCheck === "machineMismatch") {
+          if (credentialCheck === "identityMismatch") {
             throw new RelayRegistrationError(
-              DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE,
-              "machine_mismatch",
+              identity.kind === "cliToken"
+                ? CLI_TOKEN_IDENTITY_MISMATCH_MESSAGE
+                : DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE,
+              "identity_mismatch",
             );
+          }
+          if (identity.kind === "deviceCredential") {
+            await tx.cliDeviceCredential.updateMany({
+              where: { id: identity.id, lastRefusedAt: { not: null } },
+              data: { lastRefusedAt: null, lastRefusedReason: null },
+            });
+          } else {
+            await tx.cliToken.updateMany({
+              where: { id: identity.id, lastRefusedAt: { not: null } },
+              data: { lastRefusedAt: null, lastRefusedReason: null },
+            });
           }
 
           const inventoryChanged = cliDevice.inventoryDigest !== inventoryDigest;

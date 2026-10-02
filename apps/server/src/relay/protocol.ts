@@ -50,9 +50,10 @@ export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v2";
 export const RELAY_PROTOCOL_ERROR_CODES = [
   "upgrade_cli",
   "upgrade_server",
-  "machine_mismatch",
+  "identity_mismatch",
   "access_denied",
   "malformed",
+  "internal",
 ] as const;
 export type RelayProtocolErrorCode = (typeof RELAY_PROTOCOL_ERROR_CODES)[number];
 
@@ -577,10 +578,12 @@ const endpointLoadSchema = z
     prefixCacheReset: z.literal(true).optional(),
     /**
      * Monotonic per-endpoint counter generation. The CLI bumps it when prefix
-     * counters drop or the engine identity changes. Optional so older frames
-     * still parse; the server resets KV-eviction state only on a change.
+     * counters drop or the engine identity changes, and always sends
+     * `prefixCacheReset` on a bump. Required on 2.4; the server resets
+     * KV-eviction state only when this value changes, including the first
+     * frame after a replica or reboot that stored a different epoch.
      */
-    counterEpoch: z.number().int().min(0).max(4_294_967_295).optional(),
+    counterEpoch: z.number().int().min(0).max(4_294_967_295),
     source: z.enum([
       "llama.cpp-slots",
       "llama.cpp-metrics",
@@ -1043,7 +1046,12 @@ export type RelayServerControlMessage =
       supportedVersions: readonly RelayProtocolVersion[];
       requestId?: string;
     }
-  | { type: "hello.challenge"; nonce: string }
+  | {
+      type: "hello.challenge";
+      nonce: string;
+      /** Canonical public origin mixed into the hello identity statement. */
+      origin: string;
+    }
   | {
       type: "term.open";
       terminalId: string;
@@ -1129,16 +1137,7 @@ export type RelayServerControlMessage =
       mode: FileOpFrame["mode"];
       readGrant: boolean;
     }
-  | { type: "file.cancel"; opId: string }
-  | {
-      /** Chat Completions engine tokenize. Request JSON follows as `relay.request.body`. */
-      type: "context.count";
-      requestId: string;
-      endpointSlug: string;
-      model: string;
-      timeoutMs: number;
-      expectBody: boolean;
-    };
+  | { type: "file.cancel"; opId: string };
 
 const relayBodyMetadataFields = {
   requestId: requestIdSchema,

@@ -25,6 +25,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES: 0,
     MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
     MODEL_API_TRANSCRIPTION_STALE_SPOOL_MS: 24 * 60 * 60 * 1000,
+    BETTER_AUTH_URL: "http://localhost:3000",
   },
 }));
 
@@ -148,7 +149,7 @@ function hello(socket: FakeSocket, slug: string, mode: Mode, readSwitch = false,
       slug,
       hostname: `${slug}.local`,
       identityPublicKey: testIdentity.publicKey,
-      identitySignature: testIdentity.sign(challengeNonce(socket), slug),
+      identitySignature: testIdentity.sign(challengeNonce(socket), slug, "http://localhost:3000"),
       version: "9.9.9",
       capabilities: {
         features: {

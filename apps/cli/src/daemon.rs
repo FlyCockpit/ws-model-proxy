@@ -94,10 +94,10 @@ use crate::probe::{ProbeReport, apply_probe_report, probe_endpoint};
 use crate::protocol::parse_binary_frame;
 use crate::protocol::{
     CliInventory, ClientControlMessage, EndpointInventory, EndpointStatus, FrameFault,
-    RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS, RELAY_REQUEST_BODY_WINDOW_CHUNKS, RELAY_SUBPROTOCOL,
-    RelayBinaryFrameMetadata, RelayFailure, ServerControlMessage, binary_frame_fault,
-    control_frame_fault, encode_binary_frame, encode_control, hello_rejection_message,
-    parse_server_control,
+    ProtocolErrorCode, RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS, RELAY_PROTOCOL_VERSION,
+    RELAY_REQUEST_BODY_WINDOW_CHUNKS, RELAY_SUBPROTOCOL, RelayBinaryFrameMetadata, RelayFailure,
+    ServerControlMessage, binary_frame_fault, control_frame_fault, encode_binary_frame,
+    encode_control, hello_rejection_message, parse_server_control,
 };
 use crate::relay_bus::{FromWorker, WsFrame};
 use crate::sessions::{
@@ -113,6 +113,8 @@ const RELAY_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(300);
 /// output and send heartbeats. Bounds worker-frame latency (response streaming)
 /// without busy-spinning.
 const RELAY_SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// Bound on waiting for `hello.challenge`. An old server never sends it.
+const HELLO_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bounded capacity for the worker -> main-loop outbound frame channel. Provides
 /// backpressure toward workers (and therefore upstream response reads) so a fast
 /// upstream cannot grow unbounded memory ahead of the websocket writer.
@@ -918,9 +920,9 @@ fn run_relay_session(
             "CLI identity key is unavailable; cannot bind this device"
         ))
     })?;
-    let nonce = wait_for_hello_challenge(&mut socket)?;
+    let (nonce, origin) = wait_for_hello_challenge(&mut socket)?;
     let identity_signature = identity
-        .sign_hello(&nonce, cli_slug)
+        .sign_hello(&nonce, cli_slug, &origin)
         .map_err(RelaySessionError::Fatal)?;
     let hello = ClientControlMessage::Hello {
         id: next_id("hello"),
@@ -1795,6 +1797,12 @@ where
             }
         }
         ServerControlMessage::ProtocolError { message, code, .. } => {
+            if matches!(code, Some(ProtocolErrorCode::Internal)) {
+                return Err(RelaySessionError::Reconnectable {
+                    error: anyhow::anyhow!("relay protocol error: {message}"),
+                    reset_backoff: false,
+                });
+            }
             let text = if *registered {
                 format!("relay protocol error: {message}")
             } else {
@@ -1997,26 +2005,6 @@ where
             #[cfg(not(unix))]
             let _ = op_id;
         }
-        ServerControlMessage::CountContext {
-            request_id,
-            endpoint_slug,
-            model,
-            timeout_ms,
-            expect_body,
-        } => {
-            start_count_context(
-                socket,
-                config,
-                worker_tx,
-                workers,
-                recent_finished,
-                request_id,
-                endpoint_slug,
-                model,
-                timeout_ms,
-                expect_body,
-            )?;
-        }
         ServerControlMessage::MetricsSourcesSet { id, sources } => {
             // Stored even without the opt-in so `wsmp metrics list` and
             // `wsmp metrics approve` can show them. A remote source runs only
@@ -2207,181 +2195,6 @@ where
         },
     );
     Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn start_count_context<S>(
-    socket: &mut tungstenite::WebSocket<S>,
-    config: &Config,
-    worker_tx: &SyncSender<FromWorker>,
-    workers: &mut BTreeMap<String, WorkerHandle>,
-    recent_finished: &mut RecentlyFinished,
-    request_id: String,
-    endpoint_slug: String,
-    model: String,
-    timeout_ms: u64,
-    expect_body: bool,
-) -> RelaySessionResult<()>
-where
-    S: std::io::Read + std::io::Write,
-{
-    if workers.contains_key(&request_id) || recent_finished.contains(&request_id) {
-        recent_finished.record(&request_id);
-        send_control(
-            socket,
-            &ClientControlMessage::CountContextError {
-                request_id,
-                failure: RelayFailure::ProtocolError,
-                message: Some("request id is already in use".to_string()),
-            },
-            "sending a count_context rejection",
-        )?;
-        return Ok(());
-    }
-
-    let Some(endpoint) = config
-        .endpoints
-        .iter()
-        .find(|endpoint| endpoint.enabled && endpoint.slug == endpoint_slug)
-        .cloned()
-    else {
-        recent_finished.record(&request_id);
-        send_control(
-            socket,
-            &ClientControlMessage::CountContextError {
-                request_id,
-                failure: RelayFailure::NotFound,
-                message: Some(format!("endpoint `{endpoint_slug}` is not enabled")),
-            },
-            "sending a count_context rejection",
-        )?;
-        return Ok(());
-    };
-
-    let (method, adapter_count_route) = endpoint_count_plan(config, &endpoint);
-    if method.is_none() {
-        recent_finished.record(&request_id);
-        send_control(
-            socket,
-            &ClientControlMessage::CountContextError {
-                request_id,
-                failure: RelayFailure::UnsupportedCapability,
-                message: Some("this engine has no tokenize route".to_string()),
-            },
-            "sending a count_context rejection",
-        )?;
-        return Ok(());
-    }
-
-    let (cancellation, _cancellation_rx) = CancellationHandle::new();
-    let thread_tx = worker_tx.clone();
-    let thread_cancellation = cancellation.clone();
-    let (body_tx, body_rx) = if expect_body {
-        let (tx, rx) = mpsc::sync_channel::<BodyChunk>(REQUEST_BODY_INGRESS_CAPACITY);
-        (Some(tx), Some(rx))
-    } else {
-        (None, None)
-    };
-
-    let worker_request_id = request_id.clone();
-    let handle = thread::spawn(move || {
-        run_count_context_worker(
-            worker_request_id,
-            endpoint,
-            model,
-            method,
-            adapter_count_route,
-            timeout_ms,
-            body_rx,
-            thread_tx,
-            thread_cancellation,
-        );
-    });
-
-    workers.insert(
-        request_id,
-        WorkerHandle {
-            body_tx,
-            cancellation,
-            join: handle,
-        },
-    );
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_count_context_worker(
-    request_id: String,
-    endpoint: crate::config::EndpointConfig,
-    model: String,
-    method: Option<crate::count_context::CountContextMethod>,
-    adapter_count_route: Option<String>,
-    timeout_ms: u64,
-    body_rx: Option<Receiver<BodyChunk>>,
-    tx: SyncSender<FromWorker>,
-    cancellation: CancellationHandle,
-) {
-    let outcome = (|| {
-        let bytes = if let Some(rx) = body_rx.as_ref() {
-            match collect_request_body(
-                rx,
-                &tx,
-                &request_id,
-                crate::count_context::COUNT_CONTEXT_MAX_BODY_BYTES,
-            ) {
-                Ok(bytes) => bytes,
-                Err(CollectError::Aborted) => return None,
-                Err(CollectError::TooLarge) => {
-                    return Some(ClientControlMessage::CountContextError {
-                        request_id: request_id.clone(),
-                        failure: RelayFailure::RequestTooLarge,
-                        message: Some("count_context body exceeds its size limit".to_string()),
-                    });
-                }
-            }
-        } else {
-            Vec::new()
-        };
-        if cancellation.cancelled.load(Ordering::SeqCst) {
-            return None;
-        }
-        let body = match crate::count_context::parse_count_context_body(&bytes) {
-            Ok(body) => body,
-            Err(error) => {
-                return Some(ClientControlMessage::CountContextError {
-                    request_id: request_id.clone(),
-                    failure: error.kind.relay_failure(),
-                    message: Some(error.message),
-                });
-            }
-        };
-        let timeout = Duration::from_millis(timeout_ms.max(1));
-        match crate::count_context::count_chat(
-            &endpoint,
-            &model,
-            &body,
-            method,
-            adapter_count_route.as_deref(),
-            timeout,
-        ) {
-            Ok(outcome) => Some(ClientControlMessage::CountContextResult {
-                request_id: request_id.clone(),
-                tokens: outcome.tokens,
-                method: outcome.method,
-            }),
-            Err(error) => Some(ClientControlMessage::CountContextError {
-                request_id: request_id.clone(),
-                failure: error.kind.relay_failure(),
-                message: Some(error.message),
-            }),
-        }
-    })();
-    if !cancellation.cancelled.load(Ordering::SeqCst)
-        && let Some(message) = outcome
-    {
-        let _ = worker_send_control(&tx, &message);
-    }
-    let _ = tx.send(FromWorker::Finished(request_id));
 }
 
 fn apply_frame_fault<S>(
@@ -3445,18 +3258,41 @@ where
     Ok(())
 }
 
-fn wait_for_hello_challenge<S>(socket: &mut tungstenite::WebSocket<S>) -> RelaySessionResult<String>
+fn old_server_upgrade_error() -> RelaySessionError {
+    RelaySessionError::Fatal(anyhow::anyhow!(
+        "the server did not complete the relay handshake for protocol {RELAY_PROTOCOL_VERSION}; upgrade the WS Model Proxy server"
+    ))
+}
+
+fn wait_for_hello_challenge<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+) -> RelaySessionResult<(String, String)>
 where
     S: std::io::Read + std::io::Write,
 {
+    let deadline = Instant::now() + HELLO_CHALLENGE_TIMEOUT;
     loop {
+        if Instant::now() >= deadline {
+            return Err(old_server_upgrade_error());
+        }
         if let Some(signal) = crate::shutdown::requested() {
             return Err(RelaySessionError::Shutdown(signal));
         }
         match socket.read() {
             Ok(Message::Text(text)) => match parse_server_control(&text) {
-                Ok(ServerControlMessage::HelloChallenge { nonce }) => return Ok(nonce),
+                Ok(ServerControlMessage::HelloChallenge { nonce, origin }) => {
+                    let Some(origin) = origin.filter(|value| !value.is_empty()) else {
+                        return Err(old_server_upgrade_error());
+                    };
+                    return Ok((nonce, origin));
+                }
                 Ok(ServerControlMessage::ProtocolError { message, code, .. }) => {
+                    if matches!(code, Some(ProtocolErrorCode::Internal)) {
+                        return Err(RelaySessionError::Reconnectable {
+                            error: anyhow::anyhow!("relay protocol error: {message}"),
+                            reset_backoff: false,
+                        });
+                    }
                     return Err(RelaySessionError::Fatal(anyhow::anyhow!(
                         hello_rejection_message(&message, code.as_ref())
                     )));
@@ -3470,10 +3306,8 @@ where
                         "expected hello.challenge, received {type_name}"
                     )));
                 }
-                Err(error) => {
-                    return Err(RelaySessionError::Fatal(
-                        error.context("parsing hello.challenge"),
-                    ));
+                Err(_) => {
+                    return Err(old_server_upgrade_error());
                 }
             },
             Ok(Message::Ping(bytes)) => {
@@ -3489,10 +3323,7 @@ where
             }
             Ok(Message::Close(frame)) => {
                 tracing::warn!(?frame, "relay websocket closed by server before hello");
-                return Err(RelaySessionError::Reconnectable {
-                    error: anyhow::anyhow!("relay websocket closed by server"),
-                    reset_backoff: true,
-                });
+                return Err(old_server_upgrade_error());
             }
             Err(tungstenite::Error::Io(err))
                 if err.kind() == std::io::ErrorKind::WouldBlock
@@ -4385,83 +4216,6 @@ mod tests {
         };
         preserve_count_context(Some(&previous), &mut changed);
         assert_eq!(changed.count_context, None);
-    }
-
-    #[test]
-    fn count_context_early_rejection_records_recent_finished() {
-        let mut socket = sink_socket();
-        let config = Config::default();
-        let (worker_tx, _worker_rx) =
-            mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
-        let mut workers = BTreeMap::<String, WorkerHandle>::new();
-        let mut recent_finished = RecentlyFinished::new();
-        let result = start_count_context(
-            &mut socket,
-            &config,
-            &worker_tx,
-            &mut workers,
-            &mut recent_finished,
-            "count-missing".to_string(),
-            "missing".to_string(),
-            "m".to_string(),
-            1_000,
-            true,
-        );
-        assert!(result.is_ok());
-        assert!(workers.is_empty());
-        assert!(recent_finished.contains("count-missing"));
-
-        let mut config = Config::default();
-        config.endpoints.push(crate::config::EndpointConfig {
-            slug: "local".to_string(),
-            enabled: true,
-            last_probe: Some(crate::config::ProbeSnapshot {
-                status: crate::config::ProbeStatus::Online,
-                models: vec!["m".to_string()],
-                suggested_capabilities: crate::config::OpenAiCompatibleCapabilities::default(),
-                engine: Some(crate::engine::DetectedEngine {
-                    kind: Some(crate::engine::EngineKind::Ollama),
-                    count_context: Some(crate::count_context::CountContextFact::Unsupported),
-                    ..crate::engine::DetectedEngine::default()
-                }),
-                adapter: None,
-            }),
-            ..crate::config::EndpointConfig::default()
-        });
-        let mut recent_finished = RecentlyFinished::new();
-        let result = start_count_context(
-            &mut socket,
-            &config,
-            &worker_tx,
-            &mut workers,
-            &mut recent_finished,
-            "count-unsupported".to_string(),
-            "local".to_string(),
-            "m".to_string(),
-            1_000,
-            true,
-        );
-        assert!(result.is_ok());
-        assert!(workers.is_empty());
-        assert!(recent_finished.contains("count-unsupported"));
-
-        let mut recent_finished = RecentlyFinished::new();
-        recent_finished.record("count-dup");
-        let result = start_count_context(
-            &mut socket,
-            &config,
-            &worker_tx,
-            &mut workers,
-            &mut recent_finished,
-            "count-dup".to_string(),
-            "local".to_string(),
-            "m".to_string(),
-            1_000,
-            true,
-        );
-        assert!(result.is_ok());
-        assert!(workers.is_empty());
-        assert!(recent_finished.contains("count-dup"));
     }
 
     #[test]

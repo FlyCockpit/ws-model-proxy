@@ -138,10 +138,6 @@ class FakeRelayManager {
     return false;
   }
 
-  registerCountContextHandlers() {}
-
-  sendCountContext() {}
-
   headers(requestId: string, status: number, headers: Record<string, string>) {
     this.handlers.get(requestId)?.onHeaders({
       type: "relay.response.headers",

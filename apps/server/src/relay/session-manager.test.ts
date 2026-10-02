@@ -31,6 +31,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES: 0,
     MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
     MODEL_API_TRANSCRIPTION_STALE_SPOOL_MS: 24 * 60 * 60 * 1000,
+    BETTER_AUTH_URL: "http://localhost:3000",
   },
 }));
 
@@ -160,18 +161,27 @@ function firstControl(socket: FakeSocket, type: string): Record<string, unknown>
 }
 
 function challengeNonce(socket: FakeSocket): string {
+  return challengeHello(socket).nonce;
+}
+
+function challengeHello(socket: FakeSocket): { nonce: string; origin: string } {
   for (const send of socket.sends) {
     if (typeof send !== "string") continue;
-    const parsed = JSON.parse(send) as { type?: string; nonce?: string };
+    const parsed = JSON.parse(send) as { type?: string; nonce?: string; origin?: string };
     if (parsed.type === "hello.challenge" && typeof parsed.nonce === "string") {
-      return parsed.nonce;
+      return {
+        nonce: parsed.nonce,
+        origin: typeof parsed.origin === "string" ? parsed.origin : "http://localhost:3000",
+      };
     }
   }
   throw new Error("expected hello.challenge");
 }
 
 function helloFrame(socket?: FakeSocket) {
-  const nonce = socket ? challengeNonce(socket) : Buffer.alloc(16, 7).toString("base64url");
+  const { nonce, origin } = socket
+    ? challengeHello(socket)
+    : { nonce: Buffer.alloc(16, 7).toString("base64url"), origin: "http://localhost:3000" };
   return JSON.stringify({
     type: "hello",
     id: "hello-id",
@@ -180,7 +190,7 @@ function helloFrame(socket?: FakeSocket) {
       slug: "desktop",
       hostname: "desk-01.local",
       identityPublicKey: testIdentity.publicKey,
-      identitySignature: testIdentity.sign(nonce, "desktop"),
+      identitySignature: testIdentity.sign(nonce, "desktop", origin),
       capabilities: {
         ...helloCapabilities(),
       },
@@ -381,7 +391,9 @@ describe("relay drain", () => {
 });
 
 describe("revoked credentials", () => {
-  const credentials = prisma as unknown as { cliDeviceCredential: { findUnique: MockInstance } };
+  const credentials = prisma as unknown as {
+    cliDeviceCredential: { findUnique: MockInstance; updateMany: MockInstance };
+  };
   const deviceIdentity = (id: string): CliWebsocketIdentity => ({
     kind: "deviceCredential",
     id,
@@ -523,11 +535,16 @@ describe("revoked credentials", () => {
       manager.acceptAuthenticatedSocket({ socket: copy, identity: deviceIdentity("cred"), now });
       await manager.handleTextFrame(copy, helloFrame(copy), now);
 
-      expect(copy.closes).toEqual([{ code: 1008, reason: "machine_mismatch" }]);
+      expect(copy.closes).toEqual([{ code: 1008, reason: "identity_mismatch" }]);
       expect(JSON.parse(String(copy.sends.at(-1)))).toMatchObject({
         type: "protocol.error",
         failure: "protocol_error",
+        code: "identity_mismatch",
         message: DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE,
+      });
+      expect(credentials.cliDeviceCredential.updateMany).toHaveBeenCalledWith({
+        where: { id: "cred" },
+        data: { lastRefusedAt: now, lastRefusedReason: "identity_mismatch" },
       });
       expect(original.closes).toEqual([]);
       expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
@@ -2042,7 +2059,9 @@ function helloCli(
   },
   socket?: FakeSocket,
 ) {
-  const nonce = socket ? challengeNonce(socket) : Buffer.alloc(16, 7).toString("base64url");
+  const { nonce, origin } = socket
+    ? challengeHello(socket)
+    : { nonce: Buffer.alloc(16, 7).toString("base64url"), origin: "http://localhost:3000" };
   return JSON.stringify({
     type: "hello",
     id: "hello-cli",
@@ -2051,7 +2070,7 @@ function helloCli(
       slug: "desktop",
       hostname: "desk-01.local",
       identityPublicKey: testIdentity.publicKey,
-      identitySignature: testIdentity.sign(nonce, "desktop"),
+      identitySignature: testIdentity.sign(nonce, "desktop", origin),
       version: "9.9.9",
       capabilities: helloCapabilities(features),
     },
@@ -2065,7 +2084,11 @@ function resignHello(socket: FakeSocket, frame: string): string {
   };
   const slug = typeof parsed.cli.slug === "string" ? parsed.cli.slug : "desktop";
   parsed.cli.identityPublicKey = testIdentity.publicKey;
-  parsed.cli.identitySignature = testIdentity.sign(challengeNonce(socket), slug);
+  parsed.cli.identitySignature = testIdentity.sign(
+    challengeNonce(socket),
+    slug,
+    challengeHello(socket).origin,
+  );
   return JSON.stringify(parsed);
 }
 
@@ -3172,6 +3195,7 @@ describe("relay 2.7 telemetry", () => {
       kvUsage: 0.25,
       source: "vllm-metrics",
       ts: "2026-01-01T00:00:00.000Z",
+      counterEpoch: 0,
     });
   const at = (ms: number) => new Date(now.getTime() + ms);
 
@@ -3272,6 +3296,7 @@ describe("relay 2.7 telemetry", () => {
       waiting,
       source: "vllm-metrics",
       ts: "2026-01-01T00:00:00.000Z",
+      counterEpoch: 0,
       ...extra,
     });
   const liveLoad = (manager: InstanceType<typeof RelaySessionManager>) =>
@@ -3308,6 +3333,7 @@ describe("relay 2.7 telemetry", () => {
         kvOccupancy: 0.7,
         source: "custom",
         ts: "2026-01-01T00:00:00.000Z",
+        counterEpoch: 0,
         ...extra,
       });
     await manager.handleTextFrame(socket, custom(), now);
@@ -3355,6 +3381,7 @@ describe("relay 2.7 telemetry", () => {
       waiting: 0,
       source: "vllm-metrics",
       ts: "2026-01-01T00:00:00.000Z",
+      counterEpoch: 0,
       ...extra,
     });
 
@@ -3420,6 +3447,29 @@ describe("relay 2.7 telemetry", () => {
       "local-openai",
       at(3_000),
     );
+    manager.dispose();
+  });
+
+  it("seeds counterEpoch from durable endpoint rows and resets only on a change", async () => {
+    db.endpoint.findMany.mockResolvedValue([{ slug: "local-openai", loadCounterEpoch: 5 }]);
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 5 }), now);
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).not.toHaveBeenCalled();
+    expect(db.endpoint.updateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: { loadCounterEpoch: 5 } }),
+    );
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ counterEpoch: 6, running: 2 }),
+      at(3_000),
+    );
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    expect(db.endpoint.updateMany).toHaveBeenCalledWith({
+      where: { cliDeviceId: "cli-device-id", slug: "local-openai" },
+      data: { loadCounterEpoch: 6 },
+    });
     manager.dispose();
   });
 

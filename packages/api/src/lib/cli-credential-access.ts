@@ -178,11 +178,11 @@ export async function authenticateCliWebsocketSecret(
 /**
  * Outcome of checking a relay identity's credential against the device a hello
  * names: `ok`, `revoked` (revoked, expired, or deleted with its device), or
- * `otherDevice` (bound to a different device), or `machineMismatch` (a device
+ * `otherDevice` (bound to a different device), or `identityMismatch` (a device
  * credential or TOFU-bound CLI token whose identity key is missing or differs
  * from the hello).
  */
-export type CliCredentialDeviceCheck = "ok" | "revoked" | "otherDevice" | "machineMismatch";
+export type CliCredentialDeviceCheck = "ok" | "revoked" | "otherDevice" | "identityMismatch";
 
 /**
  * Registration's credential check, run inside its transaction right after the
@@ -216,7 +216,7 @@ export async function checkCliCredentialForDevice(
     if (!credential || credential.revokedAt) return "revoked";
     if (credential.cliDeviceId !== cliDeviceId) return "otherDevice";
     if (identityPublicKey !== null && credential.identityPublicKey !== identityPublicKey) {
-      return "machineMismatch";
+      return "identityMismatch";
     }
     return "ok";
   }
@@ -230,7 +230,7 @@ export async function checkCliCredentialForDevice(
     if (token.cliDeviceId !== cliDeviceId) return "otherDevice";
     if (identityPublicKey === null) return "ok";
     if (token.identityPublicKey === identityPublicKey) return "ok";
-    if (token.identityPublicKey !== null) return "machineMismatch";
+    if (token.identityPublicKey !== null) return "identityMismatch";
     const bound = await db.cliToken.updateMany({
       where: {
         id: identity.id,
@@ -247,7 +247,7 @@ export async function checkCliCredentialForDevice(
     });
     if (!current || current.revokedAt) return "revoked";
     if (current.cliDeviceId !== cliDeviceId) return "otherDevice";
-    return current.identityPublicKey === identityPublicKey ? "ok" : "machineMismatch";
+    return current.identityPublicKey === identityPublicKey ? "ok" : "identityMismatch";
   }
   if (identityPublicKey === null) {
     const claimed = await db.cliToken.updateMany({
@@ -270,7 +270,7 @@ export async function checkCliCredentialForDevice(
   if (!current || current.revokedAt) return "revoked";
   if (current.cliDeviceId !== cliDeviceId) return "otherDevice";
   if (identityPublicKey === null || current.identityPublicKey === identityPublicKey) return "ok";
-  return "machineMismatch";
+  return "identityMismatch";
 }
 
 /**

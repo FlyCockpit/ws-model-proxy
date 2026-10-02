@@ -123,7 +123,11 @@ function hello(socket: FakeSocket, terminalApproval = false) {
       slug: "desktop",
       hostname: "desktop.local",
       identityPublicKey: testIdentity.publicKey,
-      identitySignature: testIdentity.sign(challengeNonce(socket), "desktop"),
+      identitySignature: testIdentity.sign(
+        challengeNonce(socket),
+        "desktop",
+        "https://proxy.example.com",
+      ),
       version: "0.4.0",
       capabilities: {
         features: {

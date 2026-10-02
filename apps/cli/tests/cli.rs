@@ -1728,7 +1728,7 @@ mod signal_shutdown {
                     .expect("write handshake");
                 write_text(
                     &mut stream,
-                    r#"{"type":"hello.challenge","nonce":"AAECAwQFBgcICQoLDA0ODw"}"#,
+                    r#"{"type":"hello.challenge","nonce":"AAECAwQFBgcICQoLDA0ODw","origin":"http://127.0.0.1"}"#,
                 );
                 let _ = socket_tx.send(stream.try_clone().expect("clone relay socket"));
                 while let Some((opcode, payload)) = read_frame(&mut stream) {

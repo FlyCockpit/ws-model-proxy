@@ -2092,10 +2092,6 @@ class PostgresRouteFakeRelayManager {
     return false;
   }
 
-  registerCountContextHandlers() {}
-
-  sendCountContext() {}
-
   headers(requestId: string, status: number, contentType: string) {
     this.handlers.get(requestId)?.onHeaders({
       type: "relay.response.headers",

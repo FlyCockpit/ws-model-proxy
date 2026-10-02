@@ -21,6 +21,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
     MODEL_API_TRANSCRIPTION_STALE_SPOOL_MS: 24 * 60 * 60 * 1000,
     BETTER_AUTH_SECRET: "test-better-auth-secret-value-32chars!",
+    BETTER_AUTH_URL: "http://localhost:3000",
   },
 }));
 
@@ -118,6 +119,17 @@ function challengeNonce(socket: FakeSocket): string {
   throw new Error("expected hello.challenge");
 }
 
+function challengeOrigin(socket: FakeSocket): string {
+  for (const send of socket.sends) {
+    if (typeof send !== "string") continue;
+    const parsed = JSON.parse(send) as { type?: string; origin?: string };
+    if (parsed.type === "hello.challenge" && typeof parsed.origin === "string") {
+      return parsed.origin;
+    }
+  }
+  return "http://localhost:3000";
+}
+
 function hello(socket: FakeSocket, slug: string, features: { mcpCommandMode: Mode }) {
   return JSON.stringify({
     type: "hello",
@@ -127,7 +139,7 @@ function hello(socket: FakeSocket, slug: string, features: { mcpCommandMode: Mod
       slug,
       hostname: `${slug}.local`,
       identityPublicKey: testIdentity.publicKey,
-      identitySignature: testIdentity.sign(challengeNonce(socket), slug),
+      identitySignature: testIdentity.sign(challengeNonce(socket), slug, challengeOrigin(socket)),
       version: "9.9.9",
       capabilities: {
         features: {

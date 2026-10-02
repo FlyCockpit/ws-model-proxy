@@ -111,14 +111,14 @@ impl CliIdentity {
         })
     }
 
-    /// Signs the server nonce from `hello.challenge`.
-    pub fn sign_hello(&self, nonce_b64url: &str, cli_slug: &str) -> Result<String> {
+    /// Signs the server nonce and origin from `hello.challenge`.
+    pub fn sign_hello(&self, nonce_b64url: &str, cli_slug: &str, origin: &str) -> Result<String> {
         let nonce = decode_exact(nonce_b64url, 16).context("decoding the hello challenge nonce")?;
         let nonce: [u8; 16] = nonce
             .as_slice()
             .try_into()
             .context("hello challenge nonce is not 16 bytes")?;
-        let signature = sign_hello_identity(&self.signing_key, &nonce, cli_slug)?;
+        let signature = sign_hello_identity(&self.signing_key, &nonce, cli_slug, origin)?;
         Ok(encode_b64url(&signature))
     }
 

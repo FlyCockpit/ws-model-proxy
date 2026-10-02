@@ -48,7 +48,7 @@ import {
   supervisedFileRejectReasonSchema,
 } from "./file-protocol.js";
 import { sanitizeRelayRequestHeaders } from "./headers.js";
-import { verifyHelloIdentitySignature } from "./hello-identity.js";
+import { relayHelloOrigin, verifyHelloIdentitySignature } from "./hello-identity.js";
 import {
   createRoutingEvaluationState,
   MetricRoutingEvaluator,
@@ -481,15 +481,6 @@ export type CountContextErrorMessage = Extract<
   { type: "context.count.error" }
 >;
 
-export type ActiveCountContextHandlers = {
-  onResult(message: CountContextResultMessage): void;
-  onError(message: CountContextErrorMessage): void;
-};
-
-type ActiveCountContextRequest = ActiveCountContextHandlers & {
-  cliDeviceId: string;
-};
-
 type ActiveRelayRequest = ActiveRelayResponseHandlers & {
   cliDeviceId: string;
 };
@@ -641,16 +632,40 @@ function interactiveTargetFromBinary(
   }
 }
 
+function closeCodeForProtocolError(code: RelayProtocolErrorCode): number {
+  if (code === "access_denied" || code === "identity_mismatch") return 1008;
+  if (code === "internal") return 1011;
+  return 1002;
+}
+
 function closeWithProtocolError(
   socket: RelaySocket,
   code: RelayProtocolErrorCode,
   message: string,
+  requestId?: string,
 ) {
   if (socket.readyState === WS_READY_STATE_OPEN) {
-    socket.send(encodeRelayServerControlMessage(protocolErrorMessage({ code, message })));
+    socket.send(
+      encodeRelayServerControlMessage(protocolErrorMessage({ code, message, requestId })),
+    );
   }
-  const closeCode = code === "access_denied" || code === "machine_mismatch" ? 1008 : 1002;
-  socket.close(closeCode, code);
+  socket.close(closeCodeForProtocolError(code), code);
+}
+
+function protocolErrorFromRegistration(error: unknown): {
+  code: RelayProtocolErrorCode;
+  message: string;
+} {
+  if (error instanceof RelayRegistrationError) {
+    if (error.code === "identity_mismatch") {
+      return { code: "identity_mismatch", message: error.message };
+    }
+    if (error.code === "access_denied") {
+      return { code: "access_denied", message: error.message };
+    }
+    return { code: "malformed", message: error.message };
+  }
+  return { code: "internal", message: "internal" };
 }
 
 export class RelaySessionManager {
@@ -676,7 +691,6 @@ export class RelaySessionManager {
    */
   private latestGenerationByCliDeviceId = new Map<string, number>();
   private activeRelayRequests = new Map<string, ActiveRelayRequest>();
-  private activeCountContextRequests = new Map<string, ActiveCountContextRequest>();
   /**
    * Shutdown drain flag, shared by the relay and the browser terminal hub.
    * Set by {@link beginDrain} (the HTTP drain's `stopAdmission`, index.ts) and
@@ -775,7 +789,13 @@ export class RelaySessionManager {
       routingEvaluation: null,
     });
     if (socket.readyState === WS_READY_STATE_OPEN) {
-      socket.send(encodeRelayServerControlMessage({ type: "hello.challenge", nonce: helloNonce }));
+      socket.send(
+        encodeRelayServerControlMessage({
+          type: "hello.challenge",
+          nonce: helloNonce,
+          origin: relayHelloOrigin(),
+        }),
+      );
     }
     return true;
   }
@@ -830,6 +850,7 @@ export class RelaySessionManager {
           signature: message.cli.identitySignature,
           nonce,
           cliSlug: message.cli.slug,
+          origin: relayHelloOrigin(),
         })
       ) {
         closeWithProtocolError(socket, "malformed", "Hello identity proof is invalid.");
@@ -937,6 +958,7 @@ export class RelaySessionManager {
             desiredCapabilities: registration.desiredCapabilities,
           }),
         );
+        await this.seedCounterEpochs(registration.cliDeviceId);
         await this.sendRemoteMetricSources(session);
         await this.sendRemoteEngineAdapters(session);
       } catch (error) {
@@ -945,26 +967,11 @@ export class RelaySessionManager {
         // An identity-key mismatch rolls the registration back, so the session
         // already serving this device stays. The message tells the copy to
         // log in again; it is not an opaque protocol error.
-        const code: RelayProtocolErrorCode =
-          error instanceof RelayRegistrationError && error.code === "machine_mismatch"
-            ? "machine_mismatch"
-            : error instanceof RelayRegistrationError && error.code === "access_denied"
-              ? "access_denied"
-              : "malformed";
-        const protocolMessage =
-          error instanceof RelayRegistrationError && error.code === "machine_mismatch"
-            ? error.message
-            : code;
-        socket.send(
-          encodeRelayServerControlMessage(
-            protocolErrorMessage({
-              code,
-              message: protocolMessage,
-              requestId: message.id,
-            }),
-          ),
-        );
-        socket.close(code === "malformed" ? 1002 : 1008, code);
+        if (error instanceof RelayRegistrationError && error.code === "identity_mismatch") {
+          await this.recordIdentityRefusal(session.identity, now);
+        }
+        const mapped = protocolErrorFromRegistration(error);
+        closeWithProtocolError(socket, mapped.code, mapped.message, message.id);
         await this.removeSession(socket, now);
       }
       return;
@@ -1111,23 +1118,11 @@ export class RelaySessionManager {
     }
 
     if (message.type === "context.count.result") {
-      const active = this.takeOwnedCountContextRequest(session, message.requestId);
-      if (active) {
-        active.onResult(message);
-        this.considerDrainClose(active.cliDeviceId);
-        return;
-      }
       this.ownedRelayRequest(session, message.requestId)?.onCountResult?.(message);
       return;
     }
 
     if (message.type === "context.count.error") {
-      const active = this.takeOwnedCountContextRequest(session, message.requestId);
-      if (active) {
-        active.onError(message);
-        this.considerDrainClose(active.cliDeviceId);
-        return;
-      }
       this.ownedRelayRequest(session, message.requestId)?.onCountError?.(message);
       return;
     }
@@ -1501,9 +1496,6 @@ export class RelaySessionManager {
     for (const active of this.activeRelayRequests.values()) {
       if (active.cliDeviceId === session.cliDeviceId) return true;
     }
-    for (const active of this.activeCountContextRequests.values()) {
-      if (active.cliDeviceId === session.cliDeviceId) return true;
-    }
     return false;
   }
 
@@ -1511,13 +1503,6 @@ export class RelaySessionManager {
     const active = this.activeRelayRequests.get(requestId);
     if (!active) return undefined;
     this.activeRelayRequests.delete(requestId);
-    return active;
-  }
-
-  private takeActiveCountContextRequest(requestId: string): ActiveCountContextRequest | undefined {
-    const active = this.activeCountContextRequests.get(requestId);
-    if (!active) return undefined;
-    this.activeCountContextRequests.delete(requestId);
     return active;
   }
 
@@ -1537,16 +1522,6 @@ export class RelaySessionManager {
     const active = this.ownedRelayRequest(session, requestId);
     if (!active) return undefined;
     this.activeRelayRequests.delete(requestId);
-    return active;
-  }
-
-  private takeOwnedCountContextRequest(
-    session: SessionState,
-    requestId: string,
-  ): ActiveCountContextRequest | undefined {
-    const active = this.activeCountContextRequests.get(requestId);
-    if (!active || active.cliDeviceId !== session.cliDeviceId) return undefined;
-    this.activeCountContextRequests.delete(requestId);
     return active;
   }
 
@@ -1751,6 +1726,48 @@ export class RelaySessionManager {
   }
 
   /**
+   * Seed last-seen `counterEpoch` from durable endpoint rows so a replica or
+   * reboot still resets KV evidence only on a real epoch change.
+   */
+  private async seedCounterEpochs(cliDeviceId: string) {
+    try {
+      const rows = await prisma.endpoint.findMany({
+        where: { cliDeviceId },
+        select: { slug: true, loadCounterEpoch: true },
+      });
+      for (const row of rows ?? []) {
+        if (row.loadCounterEpoch == null) continue;
+        this.kvCounterEpochByEndpoint.set(`${cliDeviceId}\0${row.slug}`, row.loadCounterEpoch);
+      }
+    } catch (error) {
+      console.error(
+        "[relay] seeding load counter epochs failed",
+        error instanceof Error ? error.name : typeof error,
+      );
+    }
+  }
+
+  /**
+   * Record an identity-key refusal on the credential or token after the
+   * registration transaction has rolled back, so the dashboard can show it.
+   */
+  private async recordIdentityRefusal(identity: CliWebsocketIdentity, now: Date) {
+    const data = { lastRefusedAt: now, lastRefusedReason: "identity_mismatch" };
+    try {
+      if (identity.kind === "deviceCredential") {
+        await prisma.cliDeviceCredential.updateMany({ where: { id: identity.id }, data });
+      } else {
+        await prisma.cliToken.updateMany({ where: { id: identity.id }, data });
+      }
+    } catch (error) {
+      console.error(
+        "[relay] recording an identity refusal failed",
+        error instanceof Error ? error.name : typeof error,
+      );
+    }
+  }
+
+  /**
    * Remember why a device's CLI was refused so its card can say "CLI upgrade
    * required", or "Server upgrade required" when the claimed protocol is newer
    * than this server speaks. Only a credential already bound to a device
@@ -1795,11 +1812,18 @@ export class RelaySessionManager {
     if (!cliDeviceId || !session.inventorySlugs.has(load.endpointSlug)) return;
     const key = `${cliDeviceId}\0${load.endpointSlug}`;
     const previousEpoch = this.kvCounterEpochByEndpoint.get(key);
-    if (load.counterEpoch !== undefined) this.kvCounterEpochByEndpoint.set(key, load.counterEpoch);
-    const epochChanged =
-      load.counterEpoch !== undefined &&
-      previousEpoch !== undefined &&
-      load.counterEpoch !== previousEpoch;
+    if (load.counterEpoch !== previousEpoch) {
+      this.kvCounterEpochByEndpoint.set(key, load.counterEpoch);
+      void prisma.endpoint
+        .updateMany({
+          where: { cliDeviceId, slug: load.endpointSlug },
+          data: { loadCounterEpoch: load.counterEpoch },
+        })
+        .catch(() => {
+          /* Disposable: load frames must not fail closed on epoch persist. */
+        });
+    }
+    const epochChanged = previousEpoch !== undefined && load.counterEpoch !== previousEpoch;
     if (!epochChanged && load.prefixCacheReset !== true) return;
     const lastResetMs = this.kvResetAtByEndpoint.get(key);
     const nowMs = now.getTime();
@@ -2818,68 +2842,6 @@ export class RelaySessionManager {
     return session?.registered === true;
   }
 
-  registerCountContextHandlers({
-    cliDeviceId,
-    requestId,
-    handlers,
-  }: {
-    cliDeviceId: string;
-    requestId: string;
-    handlers: ActiveCountContextHandlers;
-  }) {
-    if (this.activeRelayRequests.has(requestId) || this.activeCountContextRequests.has(requestId)) {
-      throw new Error("Relay request ID is already active.");
-    }
-    this.activeCountContextRequests.set(requestId, { cliDeviceId, ...handlers });
-  }
-
-  sendCountContext({
-    cliDeviceId,
-    endpointSlug,
-    requestId,
-    model,
-    bodyChunks = [],
-    timeoutMs,
-  }: {
-    cliDeviceId: string;
-    endpointSlug: string;
-    requestId: string;
-    model: string;
-    bodyChunks?: Uint8Array[];
-    timeoutMs: number;
-  }) {
-    if (this.relayDrain) throw new Error("CLI session is disconnected.");
-    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
-    if (!session) throw new Error("CLI session is disconnected.");
-    if (session.socket.readyState !== WS_READY_STATE_OPEN) {
-      throw new Error("CLI session is disconnected.");
-    }
-
-    const expectBody = bodyChunks.length > 0;
-    const control: RelayServerControlMessage = {
-      type: "context.count",
-      requestId,
-      endpointSlug,
-      model,
-      timeoutMs,
-      expectBody,
-    };
-    session.socket.send(encodeRelayServerControlMessage(control));
-    if (!expectBody) return;
-
-    const totalBytes = bodyChunks.reduce((total, chunk) => total + chunk.byteLength, 0);
-    session.bodyStreamsByRequest.set(requestId, {
-      chunks: [...bodyChunks],
-      iterator: undefined,
-      nextChunkIndex: 0,
-      bytesSent: 0,
-      totalBytes,
-      credits: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
-      pumping: false,
-    });
-    void this.pumpBodyStream(session, requestId);
-  }
-
   private grantBodyCredits(session: SessionState, requestId: string, credits: number) {
     const stream = session.bodyStreamsByRequest.get(requestId);
     if (!stream) return;
@@ -2928,13 +2890,6 @@ export class RelaySessionManager {
                 failure: "protocol_error",
                 message: "Relayed request body ended before its declared size.",
               });
-              const count = this.takeActiveCountContextRequest(requestId);
-              count?.onError({
-                type: "context.count.error",
-                requestId,
-                failure: "protocol_error",
-                message: "Relayed request body ended before its declared size.",
-              });
             }
             return;
           }
@@ -2967,13 +2922,6 @@ export class RelaySessionManager {
         failure: "transport",
         message: "Failed to read relayed request body.",
       });
-      const count = this.takeActiveCountContextRequest(requestId);
-      count?.onError({
-        type: "context.count.error",
-        requestId,
-        failure: "transport",
-        message: "Failed to read relayed request body.",
-      });
     } finally {
       stream.pumping = false;
     }
@@ -2988,7 +2936,7 @@ export class RelaySessionManager {
     requestId: string;
     handlers: ActiveRelayResponseHandlers;
   }) {
-    if (this.activeRelayRequests.has(requestId) || this.activeCountContextRequests.has(requestId)) {
+    if (this.activeRelayRequests.has(requestId)) {
       throw new Error("Relay request ID is already active.");
     }
     this.activeRelayRequests.set(requestId, { cliDeviceId, ...handlers });
@@ -2996,10 +2944,8 @@ export class RelaySessionManager {
 
   completeRelayRequest(requestId: string) {
     const active = this.takeActiveRelayRequest(requestId);
-    const count = this.takeActiveCountContextRequest(requestId);
     const cliDeviceIds = new Set<string>();
     if (active) cliDeviceIds.add(active.cliDeviceId);
-    if (count) cliDeviceIds.add(count.cliDeviceId);
     for (const session of this.sessionsBySocket.values()) {
       const stream = session.bodyStreamsByRequest.get(requestId);
       if (!stream) continue;
@@ -3020,7 +2966,6 @@ export class RelaySessionManager {
     reason: RelayFailure;
   }) {
     this.takeActiveRelayRequest(requestId);
-    this.takeActiveCountContextRequest(requestId);
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
     if (!session) return;
     const stream = session.bodyStreamsByRequest.get(requestId);
@@ -3081,16 +3026,6 @@ export class RelaySessionManager {
       this.activeRelayRequests.delete(requestId);
       activeRequest.onError({
         type: "relay.error",
-        requestId,
-        failure: "disconnected",
-        message: "CLI session disconnected.",
-      });
-    }
-    for (const [requestId, active] of this.activeCountContextRequests) {
-      if (active.cliDeviceId !== session.cliDeviceId) continue;
-      this.activeCountContextRequests.delete(requestId);
-      active.onError({
-        type: "context.count.error",
         requestId,
         failure: "disconnected",
         message: "CLI session disconnected.",
@@ -3969,18 +3904,6 @@ export class RelaySessionManager {
     if (type === "context.count.result" || type === "context.count.error") {
       const requestId = typeof record.requestId === "string" ? record.requestId : null;
       if (!requestId) return false;
-      const count = this.takeOwnedCountContextRequest(session, requestId);
-      if (count) {
-        count.onError({
-          type: "context.count.error",
-          requestId,
-          failure: "protocol_error",
-          message: "Malformed context.count frame.",
-        });
-        console.error("[relay] malformed context.count frame");
-        this.considerDrainClose(count.cliDeviceId);
-        return true;
-      }
       const relay = this.ownedRelayRequest(session, requestId);
       if (relay) {
         relay.onCountError?.({

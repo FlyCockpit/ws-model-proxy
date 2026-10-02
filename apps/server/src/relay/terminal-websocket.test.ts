@@ -192,7 +192,11 @@ function hello(socket: FakeSocket, slug: string, kind: CliKind, features?: CliFe
       slug,
       hostname: `${slug}.local`,
       identityPublicKey: testIdentity.publicKey,
-      identitySignature: testIdentity.sign(challengeNonce(socket), slug),
+      identitySignature: testIdentity.sign(
+        challengeNonce(socket),
+        slug,
+        "https://proxy.example.com",
+      ),
       version: "9.9.9",
       capabilities: {
         features: {

@@ -449,8 +449,13 @@ model CliToken {
   secretDigest      String
   /// Uncompressed P-256 identity public key (unpadded base64url). TOFU-bound
   /// on the token's first hello. A copied `service.env` cannot hello as a
-  /// different identity. Null until that first hello.
+  /// different identity. Null until that first hello. The owner can reset
+  /// this bind without revoking the token.
   identityPublicKey String?
+  /// Last hello that was refused because the presented identity key did not
+  /// match this bind. Cleared by a successful hello or an owner reset.
+  lastRefusedAt     DateTime?
+  lastRefusedReason String?
   lastUsedAt        DateTime?
   revokedAt         DateTime?
   expiresAt         DateTime?
@@ -482,6 +487,10 @@ model CliDeviceCredential {
   /// prove possession by signing a server nonce. Null only on a row minted
   /// before the bind; those hellos are refused until `wsmp login`.
   identityPublicKey String?
+  /// Last hello that was refused because the presented identity key did not
+  /// match this bind. Cleared by a successful hello.
+  lastRefusedAt     DateTime?
+  lastRefusedReason String?
   lastUsedAt        DateTime?
   revokedAt         DateTime?
   User              User      @relation("CliDeviceCredentialOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
@@ -513,6 +522,9 @@ model Endpoint {
   failureReasonCode   String?
   published           Boolean           @default(true)
   unpublishedAt       DateTime?
+  /// Last `endpoint.load.counterEpoch` applied for KV-eviction reset. Survives
+  /// process restart so a replica or reboot does not treat a live epoch as new.
+  loadCounterEpoch    Int?
   User                User              @relation("EndpointOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   CliDevice           CliDevice         @relation(fields: [cliDeviceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   DiscoveredModels    DiscoveredModel[]

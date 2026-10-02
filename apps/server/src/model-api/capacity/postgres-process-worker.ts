@@ -242,8 +242,6 @@ try {
       cancelRelayRequest: () => undefined,
       completeRelayRequest: () => undefined,
       supportsCountContext: () => false,
-      registerCountContextHandlers: () => undefined,
-      sendCountContext: () => undefined,
     };
     const app = new Hono();
     app.route(

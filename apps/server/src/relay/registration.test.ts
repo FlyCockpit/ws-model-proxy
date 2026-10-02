@@ -371,7 +371,7 @@ describe("capability override origin", () => {
         "BCIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
       ),
     ).rejects.toMatchObject({
-      code: "machine_mismatch",
+      code: "identity_mismatch",
       message: DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE,
     });
     credentials.cliDeviceCredential.findUnique.mockResolvedValue({
@@ -379,14 +379,16 @@ describe("capability override origin", () => {
       cliDeviceId: "cli-device-id",
       identityPublicKey: null,
     });
-    await expect(register(identityPublicKey)).rejects.toMatchObject({ code: "machine_mismatch" });
+    await expect(register(identityPublicKey)).rejects.toMatchObject({
+      code: "identity_mismatch",
+    });
     // Omitting the key on a hello is not a match.
     credentials.cliDeviceCredential.findUnique.mockResolvedValue({
       revokedAt: null,
       cliDeviceId: "cli-device-id",
       identityPublicKey,
     });
-    await expect(register(undefined)).rejects.toMatchObject({ code: "machine_mismatch" });
+    await expect(register(undefined)).rejects.toMatchObject({ code: "identity_mismatch" });
     expect(credentials.cliDeviceCredential.findUnique).toHaveBeenCalledWith({
       where: { id: "credential-id" },
       select: { revokedAt: true, cliDeviceId: true, identityPublicKey: true },

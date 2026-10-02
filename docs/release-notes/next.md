@@ -160,10 +160,13 @@ caller waits the full local budget. MCP:
 ## CLI identity bind and native count
 
 - **CLI devices and CLI tokens bind to the CLI identity key, not `/etc/machine-id`.**
-  Hello signs a server nonce. Existing device credentials and CLI tokens that
-  stored a machine id must run `wsmp login` again on each machine. A copied
-  `service.env` cannot take over another machine. The hello still reports
-  `machine_mismatch` when the bound key does not match.
+  Hello signs a server nonce mixed with the server origin. Every device
+  credential must run `wsmp login` again on each machine. CLI tokens TOFU-bind
+  on first hello; the owner can reset that bind from the dashboard. A copied
+  `service.env` cannot take over another machine. Hello reports
+  `identity_mismatch` when the bound key does not match. A 2.4 CLI against an
+  older server exits with an upgrade-the-server error. Unexpected server
+  failures send `protocol.error` `internal` and the CLI reconnects.
 - **Native Chat Completions counting is per endpoint.** The CLI probe writes
   `engineFacts.countContext` onto the inference capacity (`engineCountContext`,
   additive, `APPLY_SCHEMA=safe`). Near-ceiling Chat Completions skip native

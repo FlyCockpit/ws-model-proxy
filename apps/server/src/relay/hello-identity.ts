@@ -1,6 +1,10 @@
 import { createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
+import { env } from "@ws-model-proxy/env/server";
 
-/** `lp16("wsmp-relay-hello-v1") ‖ nonce(16) ‖ lp16(cliSlug)`. Matches the CLI. */
+/**
+ * `lp16("wsmp-relay-hello-v1") ‖ nonce(16) ‖ lp16(cliSlug) ‖ lp16(origin)`.
+ * Matches the CLI. Origin is the server's canonical public origin.
+ */
 const HELLO_IDENTITY_LABEL = Buffer.from("wsmp-relay-hello-v1");
 /** SPKI prefix for an uncompressed P-256 point (26 bytes + 65-byte SEC1). */
 const SPKI_P256_UNCOMPRESSED_PREFIX = Buffer.from(
@@ -18,8 +22,17 @@ function lp16(bytes: Buffer): Buffer {
   return out;
 }
 
-export function helloIdentityStatement(nonce: Buffer, cliSlug: string): Buffer {
-  return Buffer.concat([lp16(HELLO_IDENTITY_LABEL), nonce, lp16(Buffer.from(cliSlug, "utf8"))]);
+export function relayHelloOrigin(): string {
+  return new URL(env.BETTER_AUTH_URL).origin;
+}
+
+export function helloIdentityStatement(nonce: Buffer, cliSlug: string, origin: string): Buffer {
+  return Buffer.concat([
+    lp16(HELLO_IDENTITY_LABEL),
+    nonce,
+    lp16(Buffer.from(cliSlug, "utf8")),
+    lp16(Buffer.from(origin, "utf8")),
+  ]);
 }
 
 function p256KeyFromUncompressed(publicRaw: Buffer) {
@@ -40,6 +53,7 @@ export function verifyHelloIdentitySignature(input: {
   signature: string;
   nonce: string;
   cliSlug: string;
+  origin: string;
 }): boolean {
   const publicRaw = Buffer.from(input.identityPublicKey, "base64url");
   const signature = Buffer.from(input.signature, "base64url");
@@ -50,7 +64,7 @@ export function verifyHelloIdentitySignature(input: {
   try {
     return verify(
       "sha256",
-      helloIdentityStatement(nonce, input.cliSlug),
+      helloIdentityStatement(nonce, input.cliSlug, input.origin),
       { key, dsaEncoding: "ieee-p1363" },
       signature,
     );
@@ -61,7 +75,7 @@ export function verifyHelloIdentitySignature(input: {
 
 export type TestHelloIdentity = {
   publicKey: string;
-  sign(nonce: string, cliSlug: string): string;
+  sign(nonce: string, cliSlug: string, origin: string): string;
 };
 
 /** A throwaway P-256 identity for tests that need a real hello signature. */
@@ -73,9 +87,9 @@ export function generateTestHelloIdentity(): TestHelloIdentity {
   const signingKey = createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" });
   return {
     publicKey: publicRaw.toString("base64url"),
-    sign(nonce, cliSlug) {
+    sign(nonce, cliSlug, origin) {
       const nonceRaw = Buffer.from(nonce, "base64url");
-      const signature = sign("sha256", helloIdentityStatement(nonceRaw, cliSlug), {
+      const signature = sign("sha256", helloIdentityStatement(nonceRaw, cliSlug, origin), {
         key: signingKey,
         dsaEncoding: "ieee-p1363",
       });

@@ -546,6 +546,45 @@ describe("relay protocol 2.4 minimum", () => {
         }),
       ),
     ).toThrow();
+    expect(() =>
+      parseRelayClientControlFrame(
+        JSON.stringify({
+          type: "context.count",
+          requestId: "count-1",
+          endpointSlug: "local-openai",
+          model: "chat",
+        }),
+      ),
+    ).toThrow();
+  });
+
+  it("encodes identity_mismatch and internal protocol.error frames", () => {
+    expect(
+      JSON.parse(
+        encodeRelayServerControlMessage({
+          type: "protocol.error",
+          failure: "protocol_error",
+          code: "identity_mismatch",
+          message: "bound to another key",
+          supportedVersions: RELAY_PROTOCOL_VERSIONS,
+        }),
+      ),
+    ).toMatchObject({
+      type: "protocol.error",
+      code: "identity_mismatch",
+      supportedVersions: ["2.4"],
+    });
+    expect(
+      JSON.parse(
+        encodeRelayServerControlMessage({
+          type: "protocol.error",
+          failure: "protocol_error",
+          code: "internal",
+          message: "internal",
+          supportedVersions: RELAY_PROTOCOL_VERSIONS,
+        }),
+      ),
+    ).toMatchObject({ type: "protocol.error", code: "internal" });
   });
 
   it("encodes a count-first relay.request", () => {
@@ -577,28 +616,6 @@ describe("relay protocol 2.4 minimum", () => {
       expectBody: true,
       countFirst: true,
       countCeiling: 8192,
-    });
-  });
-
-  it("encodes a context.count server frame", () => {
-    expect(
-      JSON.parse(
-        encodeRelayServerControlMessage({
-          type: "context.count",
-          requestId: "count-1",
-          endpointSlug: "local",
-          model: "llama",
-          timeoutMs: 5000,
-          expectBody: true,
-        }),
-      ),
-    ).toEqual({
-      type: "context.count",
-      requestId: "count-1",
-      endpointSlug: "local",
-      model: "llama",
-      timeoutMs: 5000,
-      expectBody: true,
     });
   });
 

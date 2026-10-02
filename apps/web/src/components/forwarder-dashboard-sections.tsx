@@ -3526,6 +3526,7 @@ export function CliTokensSection() {
   const [name, setName] = useState("");
   const [secret, setSecret] = useState("");
   const [revokeToken, setRevokeToken] = useState<CliToken | null>(null);
+  const [resetIdentityToken, setResetIdentityToken] = useState<CliToken | null>(null);
   const create = useMutation(
     orpc.cliCredentials.createToken.mutationOptions({
       onSuccess: (result) => {
@@ -3541,6 +3542,15 @@ export function CliTokensSection() {
         queryClient.invalidateQueries({ queryKey: orpc.cliCredentials.key() });
         toast.success(t("dashboard:tokens.revoked"));
         setRevokeToken(null);
+      },
+    }),
+  );
+  const resetIdentity = useMutation(
+    orpc.cliCredentials.resetTokenIdentity.mutationOptions({
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: orpc.cliCredentials.key() });
+        toast.success(t("dashboard:tokens.identityReset"));
+        setResetIdentityToken(null);
       },
     }),
   );
@@ -3623,7 +3633,11 @@ export function CliTokensSection() {
           </Dialog>
         }
       />
-      <TokenTable tokens={tokensData} onRevoke={setRevokeToken} />
+      <TokenTable
+        tokens={tokensData}
+        onRevoke={setRevokeToken}
+        onResetIdentity={setResetIdentityToken}
+      />
       <ConfirmDeleteDialog
         open={Boolean(revokeToken)}
         onOpenChange={(open) => !open && setRevokeToken(null)}
@@ -3639,6 +3653,21 @@ export function CliTokensSection() {
           if (revokeToken) revoke.mutate({ id: revokeToken.id });
         }}
       />
+      <ConfirmDeleteDialog
+        open={Boolean(resetIdentityToken)}
+        onOpenChange={(open) => !open && setResetIdentityToken(null)}
+        title={t("dashboard:tokens.resetIdentityTitle")}
+        description={t("dashboard:tokens.resetIdentityDescription")}
+        confirmToken={resetIdentityToken?.name ?? ""}
+        typePrompt={t("dashboard:tokens.typeTokenName")}
+        copyAriaLabel={t("dashboard:actions.copyConfirm")}
+        confirmLabel={t("dashboard:tokens.resetIdentity")}
+        pendingLabel={t("dashboard:tokens.resettingIdentity")}
+        isPending={resetIdentity.isPending}
+        onConfirm={() => {
+          if (resetIdentityToken) resetIdentity.mutate({ id: resetIdentityToken.id });
+        }}
+      />
     </section>
   );
 }
@@ -3646,9 +3675,11 @@ export function CliTokensSection() {
 function TokenTable<TToken extends CliToken | ModelApiToken>({
   tokens,
   onRevoke,
+  onResetIdentity,
 }: {
   tokens: TToken[];
   onRevoke: (token: TToken) => void;
+  onResetIdentity?: (token: TToken) => void;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
 
@@ -3664,6 +3695,9 @@ function TokenTable<TToken extends CliToken | ModelApiToken>({
             <th className="p-3 font-medium">{t("dashboard:tokens.scope")}</th>
             <th className="p-3 font-medium">{t("dashboard:tokens.lastUsed")}</th>
             <th className="p-3 font-medium">{t("dashboard:tokens.createdAt")}</th>
+            {"identityBound" in (tokens[0] ?? {}) ? (
+              <th className="p-3 font-medium">{t("dashboard:tokens.lastRefused")}</th>
+            ) : null}
             <th className="p-3 text-right font-medium">{t("dashboard:actions.header")}</th>
           </tr>
         </thead>
@@ -3686,19 +3720,47 @@ function TokenTable<TToken extends CliToken | ModelApiToken>({
               </td>
               <td className="p-3 align-top tabular-nums">{formatDate(token.lastUsedAt)}</td>
               <td className="p-3 align-top tabular-nums">{formatDate(token.createdAt)}</td>
+              {"identityBound" in token ? (
+                <td className="p-3 align-top">
+                  {token.lastRefusedAt ? (
+                    <span>
+                      {t("dashboard:tokens.refusedIdentityMismatch")}
+                      <span className="mt-1 block tabular-nums text-muted-foreground">
+                        {formatDate(token.lastRefusedAt)}
+                      </span>
+                    </span>
+                  ) : token.identityBound ? (
+                    t("dashboard:tokens.identityBound")
+                  ) : (
+                    t("dashboard:tokens.identityUnbound")
+                  )}
+                </td>
+              ) : null}
               <td className="p-3 text-right align-top">
                 {token.revokedAt ? (
                   <StatusPill muted>{t("dashboard:tokens.revokedStatus")}</StatusPill>
                 ) : (
-                  <Button
-                    type="button"
-                    variant="destructive"
-                    size="touch"
-                    onClick={() => onRevoke(token)}
-                  >
-                    <Trash2 className="size-4" />
-                    {t("dashboard:tokens.revoke")}
-                  </Button>
+                  <div className="flex min-w-0 flex-wrap justify-end gap-2">
+                    {"identityBound" in token && token.identityBound && onResetIdentity ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="touch"
+                        onClick={() => onResetIdentity(token)}
+                      >
+                        {t("dashboard:tokens.resetIdentity")}
+                      </Button>
+                    ) : null}
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      size="touch"
+                      onClick={() => onRevoke(token)}
+                    >
+                      <Trash2 className="size-4" />
+                      {t("dashboard:tokens.revoke")}
+                    </Button>
+                  </div>
                 )}
               </td>
             </tr>

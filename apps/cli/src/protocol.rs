@@ -47,24 +47,19 @@ pub const NODE_DISK_MAX: usize = 16;
 pub enum ProtocolErrorCode {
     UpgradeCli,
     UpgradeServer,
-    MachineMismatch,
+    IdentityMismatch,
     AccessDenied,
     Malformed,
+    Internal,
     #[serde(other)]
     Other,
 }
 
 /// The fatal error for a `protocol.error` that arrives before `hello.ok`.
-/// An older server rejects the newer hello as malformed; say so plainly.
+/// An older server has no `code` and never sends `hello.challenge.origin`;
+/// say plainly to upgrade the server. A coded `upgrade_cli` still names the CLI.
 pub fn hello_rejection_message(message: &str, code: Option<&ProtocolErrorCode>) -> String {
-    // Prefer the coded enum. Fall back to the pre-code English parse so a
-    // 2.3 server that only sends `message` still tells the person to upgrade
-    // the server rather than the CLI.
-    let server_too_old = matches!(code, Some(ProtocolErrorCode::UpgradeServer))
-        || (code.is_none()
-            && (message == OLDER_SERVER_HELLO_REJECTION
-                || named_relay_protocol_version(message)
-                    .is_some_and(|version| version < local_relay_protocol_version())));
+    let server_too_old = matches!(code, Some(ProtocolErrorCode::UpgradeServer) | None);
     if server_too_old {
         format!(
             "the server rejected relay protocol {RELAY_PROTOCOL_VERSION} (`{message}`); upgrade the WS Model Proxy server or use an older wsmp"
@@ -72,24 +67,6 @@ pub fn hello_rejection_message(message: &str, code: Option<&ProtocolErrorCode>) 
     } else {
         format!("relay protocol error: {message}")
     }
-}
-
-/// The protocol version a rejection names in `(relay protocol X.Y)`, e.g. the
-/// `RELAY_UPGRADE_REQUIRED_MESSAGE` of a server older than this CLI.
-fn named_relay_protocol_version(message: &str) -> Option<(u32, u32)> {
-    const MARKER: &str = "(relay protocol ";
-    let rest = &message[message.find(MARKER)? + MARKER.len()..];
-    parse_relay_protocol_version(rest.get(..rest.find(')')?)?)
-}
-
-/// Numeric `major.minor` for a relay protocol version such as `2.7`.
-fn parse_relay_protocol_version(version: &str) -> Option<(u32, u32)> {
-    let (major, minor) = version.split_once('.')?;
-    Some((major.parse().ok()?, minor.parse().ok()?))
-}
-
-fn local_relay_protocol_version() -> (u32, u32) {
-    parse_relay_protocol_version(RELAY_PROTOCOL_VERSION).expect("RELAY_PROTOCOL_VERSION is X.Y")
 }
 
 /// A supervised file op's result (`supervised.done.fileResult`), 2.8.
@@ -1038,8 +1015,7 @@ pub struct EndpointLoad {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix_cache_reset: Option<bool>,
     /// Bumped when prefix-cache counters drop or the engine identity changes.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub counter_epoch: Option<u32>,
+    pub counter_epoch: u32,
     pub source: crate::engine::LoadSource,
     pub ts: String,
 }
@@ -1126,7 +1102,11 @@ pub struct TerminalIdentity {
 )]
 enum KnownServerControlMessage {
     #[serde(rename = "hello.challenge")]
-    HelloChallenge { nonce: String },
+    HelloChallenge {
+        nonce: String,
+        #[serde(default)]
+        origin: Option<String>,
+    },
     #[serde(rename = "hello.ok")]
     HelloOk {
         id: String,
@@ -1268,14 +1248,6 @@ enum KnownServerControlMessage {
     },
     #[serde(rename = "file.cancel")]
     FileCancel { op_id: String },
-    #[serde(rename = "context.count")]
-    CountContext {
-        request_id: String,
-        endpoint_slug: String,
-        model: String,
-        timeout_ms: u64,
-        expect_body: bool,
-    },
 }
 
 /// The supervised-file payload of `term.spawn` (`kind:"file"`), 2.8.
@@ -1390,6 +1362,7 @@ pub enum ServerControlMessage {
     },
     HelloChallenge {
         nonce: String,
+        origin: Option<String>,
     },
     TermOpen {
         terminal_id: String,
@@ -1458,15 +1431,6 @@ pub enum ServerControlMessage {
     /// 2.8: cancel a pending file op.
     FileCancel {
         op_id: String,
-    },
-    /// 2.4: Chat Completions engine tokenize. Request JSON follows as
-    /// `relay.request.body` when `expect_body` is true.
-    CountContext {
-        request_id: String,
-        endpoint_slug: String,
-        model: String,
-        timeout_ms: u64,
-        expect_body: bool,
     },
     Unknown {
         type_name: String,
@@ -1972,14 +1936,15 @@ fn known_server_frame(type_name: &str) -> bool {
             | "engine.adapters.set"
             | "file.op"
             | "file.cancel"
-            | "context.count"
     )
 }
 
 impl From<KnownServerControlMessage> for ServerControlMessage {
     fn from(message: KnownServerControlMessage) -> Self {
         match message {
-            KnownServerControlMessage::HelloChallenge { nonce } => Self::HelloChallenge { nonce },
+            KnownServerControlMessage::HelloChallenge { nonce, origin } => {
+                Self::HelloChallenge { nonce, origin }
+            }
             KnownServerControlMessage::HelloOk {
                 id,
                 protocol_version,
@@ -2153,19 +2118,6 @@ impl From<KnownServerControlMessage> for ServerControlMessage {
                 read_grant,
             },
             KnownServerControlMessage::FileCancel { op_id } => Self::FileCancel { op_id },
-            KnownServerControlMessage::CountContext {
-                request_id,
-                endpoint_slug,
-                model,
-                timeout_ms,
-                expect_body,
-            } => Self::CountContext {
-                request_id,
-                endpoint_slug,
-                model,
-                timeout_ms,
-                expect_body,
-            },
         }
     }
 }
@@ -2784,27 +2736,6 @@ mod tests {
             other => panic!("unexpected message: {other:?}"),
         }
 
-        let count_context = parse_server_control(
-            r#"{"type":"context.count","requestId":"r1","endpointSlug":"local","model":"m","timeoutMs":5000,"expectBody":true}"#,
-        )
-        .expect("parse context.count");
-        match count_context {
-            ServerControlMessage::CountContext {
-                request_id,
-                endpoint_slug,
-                model,
-                timeout_ms,
-                expect_body,
-            } => {
-                assert_eq!(request_id, "r1");
-                assert_eq!(endpoint_slug, "local");
-                assert_eq!(model, "m");
-                assert_eq!(timeout_ms, 5_000);
-                assert!(expect_body);
-            }
-            other => panic!("unexpected message: {other:?}"),
-        }
-
         let count_result = encode_control(&ClientControlMessage::CountContextResult {
             request_id: "r1".to_string(),
             tokens: 12,
@@ -2997,9 +2928,9 @@ mod tests {
             message.contains("upgrade the WS Model Proxy server"),
             "{message}"
         );
-        assert_eq!(
-            hello_rejection_message("access_denied", None),
-            "relay protocol error: access_denied"
+        assert!(
+            hello_rejection_message("access_denied", None)
+                .contains("upgrade the WS Model Proxy server")
         );
         assert!(hello_rejection_message(
             "This wsmp speaks a newer relay protocol than the server. Upgrade WS Model Proxy and restart the CLI.",
@@ -3010,14 +2941,63 @@ mod tests {
 
     #[test]
     fn a_future_server_upgrade_required_reply_stays_a_cli_too_old_error() {
-        // A future server's genuine "upgrade wsmp" must pass through: the CLI is
-        // the one behind, so do not tell the person to upgrade the server.
+        // A coded `upgrade_cli` from a newer server still names the CLI.
         let reply =
             "This server requires a newer wsmp (relay protocol 2.5). Upgrade wsmp and restart it.";
         assert_eq!(
-            hello_rejection_message(reply, None),
+            hello_rejection_message(reply, Some(&ProtocolErrorCode::UpgradeCli)),
             format!("relay protocol error: {reply}")
         );
+        assert_eq!(
+            hello_rejection_message(
+                "identity mismatch",
+                Some(&ProtocolErrorCode::IdentityMismatch)
+            ),
+            "relay protocol error: identity mismatch"
+        );
+    }
+
+    #[test]
+    fn hello_challenge_keeps_origin_optional_so_an_old_server_still_parses() {
+        let with_origin = parse_server_control(
+            r#"{"type":"hello.challenge","nonce":"AAECAwQFBgcICQoLDA0ODw","origin":"https://proxy.example.com"}"#,
+        )
+        .expect("challenge");
+        match with_origin {
+            ServerControlMessage::HelloChallenge { origin, .. } => {
+                assert_eq!(origin.as_deref(), Some("https://proxy.example.com"));
+            }
+            other => panic!("expected challenge, got {other:?}"),
+        }
+        let without_origin =
+            parse_server_control(r#"{"type":"hello.challenge","nonce":"AAECAwQFBgcICQoLDA0ODw"}"#)
+                .expect("old challenge");
+        match without_origin {
+            ServerControlMessage::HelloChallenge { origin, .. } => {
+                assert_eq!(origin, None);
+            }
+            other => panic!("expected challenge, got {other:?}"),
+        }
+        let internal = parse_server_control(
+            r#"{"type":"protocol.error","failure":"protocol_error","code":"internal","message":"internal","supportedVersions":["2.4"]}"#,
+        )
+        .expect("internal");
+        match internal {
+            ServerControlMessage::ProtocolError { code, .. } => {
+                assert_eq!(code, Some(ProtocolErrorCode::Internal));
+            }
+            other => panic!("expected protocol.error, got {other:?}"),
+        }
+        let mismatch = parse_server_control(
+            r#"{"type":"protocol.error","failure":"protocol_error","code":"identity_mismatch","message":"bound to another key","supportedVersions":["2.4"]}"#,
+        )
+        .expect("mismatch");
+        match mismatch {
+            ServerControlMessage::ProtocolError { code, .. } => {
+                assert_eq!(code, Some(ProtocolErrorCode::IdentityMismatch));
+            }
+            other => panic!("expected protocol.error, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3845,7 +3825,7 @@ mod relay_24_vectors {
             prefix_cache_hits_delta: Some(50),
             prefix_cache_queries_delta: Some(200),
             prefix_cache_reset: None,
-            counter_epoch: None,
+            counter_epoch: 0,
             source: LoadSource::VllmMetrics,
             ts: "2026-09-28T12:00:01.000Z".to_string(),
         };
@@ -3871,7 +3851,7 @@ mod relay_24_vectors {
             prefix_cache_hits_delta: None,
             prefix_cache_queries_delta: None,
             prefix_cache_reset: None,
-            counter_epoch: None,
+            counter_epoch: 0,
             source: LoadSource::Custom,
             ts: "2026-09-28T12:00:01.000Z".to_string(),
         };

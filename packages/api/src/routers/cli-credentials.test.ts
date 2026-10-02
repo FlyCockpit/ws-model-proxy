@@ -151,6 +151,9 @@ describe("cliCredentialsRouter", () => {
         lastUsedAt: null,
         revokedAt: null,
         expiresAt: null,
+        identityPublicKey: null,
+        lastRefusedAt: null,
+        lastRefusedReason: null,
       },
     ]);
     const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
@@ -166,6 +169,9 @@ describe("cliCredentialsRouter", () => {
         lastUsedAt: null,
         revokedAt: null,
         expiresAt: null,
+        identityBound: false,
+        lastRefusedAt: null,
+        lastRefusedReason: null,
       },
     ]);
     expect(db.cliToken.findMany).toHaveBeenCalledWith(
@@ -675,6 +681,46 @@ describe("cliCredentialsRouter", () => {
     await client.revokeToken({ id: "token-1" });
 
     expect(onCliCredentialsRevoked).toHaveBeenCalledWith({ kind: "cliToken", ids: ["token-1"] });
+  });
+
+  it("resets a CLI token identity bind without revoking it", async () => {
+    const now = new Date("2026-07-01T00:00:00.000Z");
+    db.cliToken.findUnique.mockResolvedValue({
+      id: "token-1",
+      userId: "user-1",
+      revokedAt: null,
+    });
+    db.cliToken.update.mockResolvedValue({
+      id: "token-1",
+      createdAt: now,
+      updatedAt: now,
+      userId: "user-1",
+      cliDeviceId: "cli-device-1",
+      name: "Laptop",
+      lookupPrefix: "wsmp_cli_abcdefghijkl",
+      lastUsedAt: null,
+      revokedAt: null,
+      expiresAt: null,
+      identityPublicKey: null,
+      lastRefusedAt: null,
+      lastRefusedReason: null,
+    });
+    const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
+
+    await expect(client.resetTokenIdentity({ id: "token-1" })).resolves.toMatchObject({
+      id: "token-1",
+      identityBound: false,
+      lastRefusedAt: null,
+    });
+    expect(db.cliToken.update).toHaveBeenCalledWith({
+      where: { id: "token-1" },
+      data: {
+        identityPublicKey: null,
+        lastRefusedAt: null,
+        lastRefusedReason: null,
+      },
+      select: expect.any(Object),
+    });
   });
 
   describe("deviceLoginRequest", () => {

@@ -289,19 +289,25 @@ const mockedTokenAccess = tokenAccess as unknown as {
   listVisibleModelTargetsForToken: MockInstance;
 };
 
-type SendCountContextArgs = Parameters<RelaySessionManager["sendCountContext"]>[0];
-type CountContextHandlers = Parameters<
-  RelaySessionManager["registerCountContextHandlers"]
->[0]["handlers"];
-
 class FakeRelayManager {
   activeCliDeviceIds = ["cli-device-id"];
   sent: SendRelayRequestArgs[] = [];
-  sentCountContext: SendCountContextArgs[] = [];
+  sentCountContext: Array<{ requestId: string }> = [];
   cancelled: CancelRelayRequestArgs[] = [];
   completed: string[] = [];
   handlers = new Map<string, ActiveRelayResponseHandlers>();
-  countContextHandlers = new Map<string, CountContextHandlers>();
+  countContextHandlers = new Map<
+    string,
+    {
+      onResult(message: {
+        type: "context.count.result";
+        requestId: string;
+        tokens: number;
+        method: string;
+      }): void;
+      onError(message: { type: "context.count.error"; requestId: string; failure: string }): void;
+    }
+  >();
   supportsCountContextFlag = false;
 
   getActiveCliDeviceIds() {
@@ -395,12 +401,20 @@ class FakeRelayManager {
   }: {
     cliDeviceId: string;
     requestId: string;
-    handlers: CountContextHandlers;
+    handlers: {
+      onResult(message: {
+        type: "context.count.result";
+        requestId: string;
+        tokens: number;
+        method: string;
+      }): void;
+      onError(message: { type: "context.count.error"; requestId: string; failure: string }): void;
+    };
   }) {
     this.countContextHandlers.set(requestId, handlers);
   }
 
-  sendCountContext(args: SendCountContextArgs) {
+  sendCountContext(args: { requestId: string }) {
     this.sentCountContext.push(args);
   }
 
@@ -17695,8 +17709,7 @@ function cooldownPoolFixture(ownerUserId: string, surface = "openai-chat") {
 // preceded by the gate with no wait, admission or loop head in between. See
 // prs/64-76/design-authz-boundaries.md.
 describe("local send gate (static)", () => {
-  const sendCall =
-    /\b(startRelayAttempt|sendRelayRequest|nativeContextCount|sendCountContext)\(\{/g;
+  const sendCall = /\b(startRelayAttempt|sendRelayRequest|nativeContextCount)\(\{/g;
   const srcRoot = new URL("../", import.meta.url);
   const source = readFileSync(new URL("./routes.ts", import.meta.url), "utf8");
   const { parse } = createRequire(import.meta.url)(

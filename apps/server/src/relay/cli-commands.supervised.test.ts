@@ -27,6 +27,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
     MODEL_API_TRANSCRIPTION_STALE_SPOOL_MS: 24 * 60 * 60 * 1000,
     BETTER_AUTH_SECRET: "test-better-auth-secret-value-32chars!",
+    BETTER_AUTH_URL: "http://localhost:3000",
   },
 }));
 
@@ -137,7 +138,7 @@ function hello(
       slug,
       hostname: `${slug}.local`,
       identityPublicKey: testIdentity.publicKey,
-      identitySignature: testIdentity.sign(challengeNonce(socket), slug),
+      identitySignature: testIdentity.sign(challengeNonce(socket), slug, "http://localhost:3000"),
       version: "0.4.0",
       capabilities: {
         features: {
