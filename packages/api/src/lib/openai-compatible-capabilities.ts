@@ -235,9 +235,21 @@ const v4CapabilitiesSchema = z
     protocol: z.enum(["openai-compatible", "anthropic-compatible"]),
     models: z.never().optional(),
     chatCompletions: z.never().optional(),
-    embeddings: z.never().optional(),
     responses: z.never().optional(),
-    audio: z.never().optional(),
+    embeddings: z
+      .object({
+        supported: booleanSupportSchema,
+      })
+      .strict()
+      .optional(),
+    audio: z
+      .object({
+        transcriptions: transcriptionCapabilitiesSchema.optional(),
+        translations: transcriptionCapabilitiesSchema.optional(),
+        speech: booleanSupportSchema,
+      })
+      .strict()
+      .optional(),
     sampling: samplingExtensionSchema.optional(),
     surfaces: z
       .object({

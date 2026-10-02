@@ -178,6 +178,27 @@ describe("capability inventory v4", () => {
     expect(parseOpenAiCompatibleCapabilities(endpointCaps)?.version).toBe(1);
   });
 
+  it("keeps embeddings and dedicated audio declarable on v4", () => {
+    const parsed = parseOpenAiCompatibleCapabilities({
+      ...v4,
+      embeddings: { supported: true },
+      audio: {
+        transcriptions: { supported: true, streaming: true },
+        translations: { supported: true },
+        speech: true,
+      },
+    });
+    expect(parsed?.version).toBe(4);
+    expect(parsed && "embeddings" in parsed ? parsed.embeddings : null).toEqual({
+      supported: true,
+    });
+    expect(parsed && "audio" in parsed ? parsed.audio : null).toEqual({
+      transcriptions: { supported: true, streaming: true },
+      translations: { supported: true },
+      speech: true,
+    });
+  });
+
   it("rejects unknown, duplicate, and legacy boolean operation declarations", () => {
     for (const operations of [["unknown"], ["create", "create"]]) {
       expect(

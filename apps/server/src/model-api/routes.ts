@@ -4973,7 +4973,7 @@ async function relayPool({
           await capacityRuntime.release(admission.lease);
           return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
         }
-        await markPoolMemberLastRoutedAt(selectedPoolMemberId);
+        void markPoolMemberLastRoutedAt(selectedPoolMemberId);
         let result: Awaited<ReturnType<typeof dispatchPublicOverflow>>;
         const previousRoute = routeIdentity;
         try {
@@ -6116,7 +6116,7 @@ async function relayPool({
       });
       if (admission.state !== "LEASE_LOST") {
         if (admission.state === "ADMITTED")
-          await markPoolMemberLastRoutedAt(admission.lease.poolMemberId);
+          void markPoolMemberLastRoutedAt(admission.lease.poolMemberId);
         return admission;
       }
       candidates = candidates
