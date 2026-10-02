@@ -46,7 +46,9 @@ function sourceFiles(directory: string): string[] {
     const path = join(directory, entry.name);
     if (entry.isDirectory())
       return ["node_modules", "generated", "e2e"].includes(entry.name) ? [] : sourceFiles(path);
-    return /\.(tsx?|mjs|sql|sh)$/.test(entry.name) && !/\.test\.tsx?$/.test(entry.name)
+    return /\.(tsx?|mjs|sql|sh)$/.test(entry.name) &&
+      !/\.test\.tsx?$/.test(entry.name) &&
+      !/test-helpers\.ts$/.test(entry.name)
       ? [path]
       : [];
   });
@@ -196,7 +198,14 @@ const GRAPH_WRITERS: Record<string, string> = {
   "packages/api/src/lib/engine-facts.ts":
     "M: relay engine facts and AUTO limit refresh (registration holds the capacity fences)",
   "packages/api/src/lib/cli-credential-access.ts": "M: device login and deletion",
-  "packages/api/src/routers/forwarder-management.ts": "M: dashboard pool/device/model writes",
+  "packages/api/src/routers/forwarder-management.ts":
+    "M: guarded pool create (owner fence, pool/member/target/capacity/budget writes)",
+  "packages/api/src/routers/forwarder-cli-devices.ts":
+    "M: dashboard device, endpoint, discovered-model, and profile-slug writes",
+  "packages/api/src/routers/forwarder-pools.ts":
+    "M: dashboard pool create/update/delete and declared context seed (owner fence)",
+  "packages/api/src/routers/forwarder-pool-members.ts":
+    "M: dashboard pool member, grant, and discovered-model capability writes",
   "packages/api/src/routers/capacity-management.ts": "M: capacity policy",
   "packages/api/src/routers/provider-management.ts": "M: provider management",
   "packages/api/src/lib/pool-grant-spend-cap.ts":
