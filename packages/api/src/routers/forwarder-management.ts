@@ -92,11 +92,13 @@ import {
 import { suggestedConnectionSurface } from "../lib/model-connection-type";
 import { poolMemberRoutingStatuses } from "../lib/model-pool-routing";
 import {
+  assertUsableBudgetWrite,
   buildNodeCardSnapshot,
   type NodeCardSnapshot,
   nodeLabelsSchema,
   nodeUsableBudgetsInputSchema,
   normalizeNodeLabels,
+  parseNodeInfo,
   shapeNodeMetricsMinute,
 } from "../lib/node-inventory";
 import {
@@ -3128,10 +3130,21 @@ export const forwarderManagementRouter = {
     .handler(async ({ input, context }) => {
       const owned = await prisma.cliDevice.findUnique({
         where: { id: input.cliDeviceId },
-        select: { id: true, userId: true },
+        select: { id: true, userId: true, nodeInfo: true },
       });
       if (!owned || owned.userId !== context.session.user.id) {
         throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+      }
+      const invalid = assertUsableBudgetWrite(parseNodeInfo(owned.nodeInfo), {
+        usableMemoryGb: input.usableMemoryGb,
+        usableRamGb: input.usableRamGb,
+        usableVramGb: input.usableVramGb,
+      });
+      if (invalid) {
+        throw new ORPCError("BAD_REQUEST", {
+          message: invalid.message,
+          data: { fields: invalid.fields },
+        });
       }
       const row = await prisma.cliDevice.update({
         where: { id: owned.id },

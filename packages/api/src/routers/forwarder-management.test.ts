@@ -5385,7 +5385,15 @@ describe("setCliDeviceUsableBudgets", () => {
   });
 
   it("stores a human-edited unified budget and per-GPU VRAM map", async () => {
-    db.cliDevice.findUnique.mockResolvedValue({ id: "cli-id", userId: "user-id" });
+    db.cliDevice.findUnique.mockResolvedValue({
+      id: "cli-id",
+      userId: "user-id",
+      nodeInfo: {
+        nodeKind: "discrete",
+        memoryTotalMiB: 32 * 1024,
+        gpus: [{ index: 0, uuid: "GPU-aaa", vramTotalMiB: 24 * 1024 }],
+      },
+    });
     db.cliDevice.update.mockResolvedValue({
       labels: [],
       nodeInfo: {
@@ -5452,6 +5460,34 @@ describe("setCliDeviceUsableBudgets", () => {
       }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.cliDevice.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("rejects over-physical, unknown GPU, and nodeKind-mismatched budgets", async () => {
+    db.cliDevice.findUnique.mockResolvedValue({
+      id: "cli-id",
+      userId: "user-id",
+      nodeInfo: {
+        nodeKind: "discrete",
+        memoryTotalMiB: 32 * 1024,
+        gpus: [{ index: 0, uuid: "GPU-aaa", vramTotalMiB: 24 * 1024 }],
+      },
+    });
+    await expect(
+      budgetsClient().setCliDeviceUsableBudgets({ cliDeviceId: "cli-id", usableRamGb: 64 }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(
+      budgetsClient().setCliDeviceUsableBudgets({
+        cliDeviceId: "cli-id",
+        usableVramGb: { "index:9": 8 },
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(
+      budgetsClient().setCliDeviceUsableBudgets({
+        cliDeviceId: "cli-id",
+        usableMemoryGb: 16,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(db.cliDevice.update).not.toHaveBeenCalled();
   });
 });
 

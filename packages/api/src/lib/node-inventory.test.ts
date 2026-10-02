@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
+  assertUsableBudgetWrite,
   buildNodeCardSnapshot,
   defaultUsableVramGb,
   gpuBudgetKey,
   NODE_GPU_VRAM_RESERVE_GB,
   NODE_MEMORY_RESERVE_GB,
+  NODE_VRAM_KEYS_MAX,
   nodeHasAllLabels,
   nodeHealthWarnings,
   nodeLabelsSchema,
@@ -144,6 +146,17 @@ describe("usable budgets", () => {
     expect(budgets.usableMemoryGb).toBe(128 - NODE_MEMORY_RESERVE_GB);
     expect(budgets.usableRamGb).toBeNull();
     expect(budgets.usableMemoryGbDefault).toBe(true);
+    expect(budgets.usableVramGb).toEqual({});
+  });
+
+  it("treats a missing nodeKind as RAM-only so memory is not shown twice", () => {
+    const budgets = resolveUsableBudgets(
+      { memoryTotalMiB: 32 * 1024, gpus: [{ index: 0, uuid: "GPU-aaa", vramTotalMiB: 8 * 1024 }] },
+      {},
+    );
+    expect(budgets.usableMemoryGb).toBeNull();
+    expect(budgets.usableRamGb).toBe(32 - NODE_MEMORY_RESERVE_GB);
+    expect(budgets.usableVramGb["GPU-aaa"]).toBe(8 - NODE_GPU_VRAM_RESERVE_GB);
   });
 
   it("defaults per-GPU VRAM minus 0.5 GB keyed by UUID with index fallback", () => {
@@ -176,6 +189,58 @@ describe("usable budgets", () => {
     expect(usableVramGbSchema.safeParse({ "index:0": 10 }).success).toBe(true);
     expect(usableVramGbSchema.safeParse({ "index:999": 10 }).success).toBe(false);
     expect(usableVramGbSchema.safeParse({ "": 10 }).success).toBe(false);
+    const tooMany: Record<string, number> = {};
+    for (let index = 0; index <= NODE_VRAM_KEYS_MAX; index += 1) tooMany[`GPU-${index}`] = 1;
+    expect(usableVramGbSchema.safeParse(tooMany).success).toBe(false);
+  });
+
+  it("prunes unknown GPU keys on read", () => {
+    const budgets = resolveUsableBudgets(
+      {
+        nodeKind: "discrete",
+        memoryTotalMiB: 32 * 1024,
+        gpus: [{ index: 0, uuid: "GPU-aaa", vramTotalMiB: 24 * 1024 }],
+      },
+      { usableVramGb: { "GPU-aaa": 20, "GPU-missing": 8, "index:9": 4 } },
+    );
+    expect(budgets.usableVramGb["GPU-aaa"]).toBe(20);
+    expect(budgets.usableVramGb["GPU-missing"]).toBeUndefined();
+    expect(budgets.usableVramGb["index:9"]).toBeUndefined();
+  });
+
+  it("rejects writes that do not apply, name an unknown GPU, or exceed physical totals", () => {
+    const discrete = {
+      nodeKind: "discrete" as const,
+      memoryTotalMiB: 32 * 1024,
+      gpus: [{ index: 0, uuid: "GPU-aaa", vramTotalMiB: 24 * 1024 }],
+    };
+    expect(
+      assertUsableBudgetWrite(discrete, { usableRamGb: 28, usableVramGb: { "GPU-aaa": 23.5 } }),
+    ).toBeNull();
+    expect(assertUsableBudgetWrite(discrete, { usableRamGb: null })).toBeNull();
+    expect(assertUsableBudgetWrite(discrete, { usableMemoryGb: 16 })?.fields).toEqual([
+      "usableMemoryGb",
+    ]);
+    expect(assertUsableBudgetWrite(discrete, { usableRamGb: 40 })?.fields).toEqual(["usableRamGb"]);
+    expect(assertUsableBudgetWrite(discrete, { usableVramGb: { "index:9": 8 } })?.fields).toEqual([
+      "usableVramGb",
+    ]);
+    expect(assertUsableBudgetWrite(discrete, { usableVramGb: { "GPU-aaa": 30 } })?.fields).toEqual([
+      "usableVramGb",
+    ]);
+    expect(
+      assertUsableBudgetWrite(
+        { nodeKind: "unified", memoryTotalMiB: 64 * 1024 },
+        { usableRamGb: 8 },
+      )?.fields,
+    ).toEqual(["usableRamGb"]);
+    expect(
+      assertUsableBudgetWrite(
+        { nodeKind: "cpu", memoryTotalMiB: 16 * 1024 },
+        { usableVramGb: { "index:0": 8 } },
+      )?.fields,
+    ).toEqual(["usableVramGb"]);
+    expect(assertUsableBudgetWrite(null, { usableRamGb: 8 })?.message).toMatch(/inventory/i);
   });
 });
 

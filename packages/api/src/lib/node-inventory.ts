@@ -18,6 +18,8 @@ export const NODE_MEMORY_RESERVE_GB = 2;
 /** Total minus this many GB becomes the default per-GPU VRAM budget. */
 export const NODE_GPU_VRAM_RESERVE_GB = 0.5;
 export const NODE_BUDGET_MAX_GB = 1_000_000;
+/** GPU index is 0–255, so a VRAM map cannot need more keys than that. */
+export const NODE_VRAM_KEYS_MAX = 256;
 
 /** Trim and turn a single comma decimal (`1,5`) into a dot decimal (`1.5`). */
 export function normalizeDecimalInput(raw: string): string {
@@ -62,7 +64,14 @@ const budgetGbSchema = z.number().finite().min(0).max(NODE_BUDGET_MAX_GB);
 export const usableVramGbSchema = z
   .record(z.string(), budgetGbSchema)
   .superRefine((map, context) => {
-    for (const key of Object.keys(map)) {
+    const keys = Object.keys(map);
+    if (keys.length > NODE_VRAM_KEYS_MAX) {
+      context.addIssue({
+        code: "custom",
+        message: `At most ${NODE_VRAM_KEYS_MAX} VRAM budget keys are allowed.`,
+      });
+    }
+    for (const key of keys) {
       if (!isGpuBudgetKey(key)) {
         context.addIssue({
           code: "custom",
@@ -271,6 +280,9 @@ export type NodeUsableBudgets = {
 
 export function defaultUsableVramGb(info: NodeInfoView): UsableVramGbMap {
   const map: UsableVramGbMap = {};
+  // Unified nodes budget the same bytes as usableMemoryGb; do not double-count
+  // a per-GPU VRAM carve-out as a second budget.
+  if (info.nodeKind === "unified") return map;
   for (const gpu of info.gpus ?? []) {
     const budget = defaultFromTotalMiB(gpu.vramTotalMiB ?? null, NODE_GPU_VRAM_RESERVE_GB);
     if (budget === null) continue;
@@ -294,8 +306,10 @@ export function resolveUsableBudgets(
   const usableVramGb: UsableVramGbMap = { ...vramDefaults };
   const usableVramGbDefaults: Record<string, boolean> = {};
   for (const key of Object.keys(vramDefaults)) usableVramGbDefaults[key] = true;
-  if (storedVram) {
+  const knownGpuKeys = new Set((info?.gpus ?? []).map((gpu) => gpuBudgetKey(gpu)));
+  if (storedVram && kind !== "unified") {
     for (const [key, value] of Object.entries(storedVram)) {
+      if (knownGpuKeys.size > 0 && !knownGpuKeys.has(key)) continue;
       usableVramGb[key] = value;
       usableVramGbDefaults[key] = false;
     }
@@ -303,22 +317,129 @@ export function resolveUsableBudgets(
 
   const storedMemory = stored.usableMemoryGb;
   const storedRam = stored.usableRamGb;
+  // Unknown nodeKind is RAM-only so the same bytes are not shown twice.
   const usableMemoryGb =
-    kind === "discrete" || kind === "cpu"
-      ? null
-      : storedMemory != null
-        ? storedMemory
-        : memoryDefault;
+    kind === "unified" ? (storedMemory != null ? storedMemory : memoryDefault) : null;
   const usableRamGb = kind === "unified" ? null : storedRam != null ? storedRam : memoryDefault;
 
   return {
     usableMemoryGb,
     usableRamGb,
     usableVramGb,
-    usableMemoryGbDefault: kind !== "discrete" && kind !== "cpu" && storedMemory == null,
+    usableMemoryGbDefault: kind === "unified" && storedMemory == null,
     usableRamGbDefault: kind !== "unified" && storedRam == null,
     usableVramGbDefaults,
   };
+}
+
+export type UsableBudgetWrite = {
+  usableMemoryGb?: number | null;
+  usableRamGb?: number | null;
+  usableVramGb?: UsableVramGbMap | null;
+};
+
+export type UsableBudgetWriteError = {
+  fields: string[];
+  message: string;
+};
+
+function reportedGpuTotals(info: NodeInfoView | null): Map<string, number | null> {
+  const map = new Map<string, number | null>();
+  for (const gpu of info?.gpus ?? []) {
+    map.set(gpuBudgetKey(gpu), mibToGb(gpu.vramTotalMiB ?? null));
+  }
+  return map;
+}
+
+/**
+ * Reject usable-budget writes that do not apply to this node, name an unknown
+ * GPU, or exceed the physical total. Null restores the default and is always
+ * allowed. Non-null writes need parsed `node.info`.
+ */
+export function assertUsableBudgetWrite(
+  info: NodeInfoView | null,
+  input: UsableBudgetWrite,
+): UsableBudgetWriteError | null {
+  const fields: string[] = [];
+  const messages: string[] = [];
+  const add = (field: string, message: string): void => {
+    if (!fields.includes(field)) fields.push(field);
+    if (!messages.includes(message)) messages.push(message);
+  };
+
+  const clearingOnly =
+    (input.usableMemoryGb === undefined || input.usableMemoryGb === null) &&
+    (input.usableRamGb === undefined || input.usableRamGb === null) &&
+    (input.usableVramGb === undefined || input.usableVramGb === null);
+  if (clearingOnly) return null;
+
+  const hasNumeric =
+    input.usableMemoryGb != null ||
+    input.usableRamGb != null ||
+    (input.usableVramGb != null && Object.keys(input.usableVramGb).length > 0);
+  if (info == null && hasNumeric) {
+    return {
+      fields: [
+        ...(input.usableMemoryGb != null ? ["usableMemoryGb"] : []),
+        ...(input.usableRamGb != null ? ["usableRamGb"] : []),
+        ...(input.usableVramGb != null ? ["usableVramGb"] : []),
+      ],
+      message: "Node inventory is required before setting usable budgets.",
+    };
+  }
+
+  const kind = info?.nodeKind;
+  if (input.usableMemoryGb != null) {
+    if (kind !== "unified") {
+      add("usableMemoryGb", "Unified memory budget applies only to unified nodes.");
+    } else {
+      const total = mibToGb(info?.memoryTotalMiB);
+      if (total == null) add("usableMemoryGb", "Physical memory total is unknown.");
+      else if (input.usableMemoryGb > total) {
+        add("usableMemoryGb", "Usable memory cannot exceed the physical total.");
+      }
+    }
+  }
+
+  if (input.usableRamGb != null) {
+    if (kind === "unified") {
+      add("usableRamGb", "RAM budget applies only to discrete and CPU nodes.");
+    } else {
+      const total = mibToGb(info?.memoryTotalMiB);
+      if (total == null) add("usableRamGb", "Physical memory total is unknown.");
+      else if (input.usableRamGb > total) {
+        add("usableRamGb", "Usable RAM cannot exceed the physical total.");
+      }
+    }
+  }
+
+  if (input.usableVramGb != null) {
+    if (kind === "unified") {
+      add("usableVramGb", "VRAM budgets apply only to discrete GPUs.");
+    } else if (kind === "cpu") {
+      add("usableVramGb", "CPU nodes have no GPU VRAM budget.");
+    } else {
+      const known = reportedGpuTotals(info);
+      if (known.size === 0) {
+        add("usableVramGb", "No GPUs are reported on this node.");
+      } else {
+        for (const [key, value] of Object.entries(input.usableVramGb)) {
+          if (!known.has(key)) {
+            add("usableVramGb", "VRAM budgets must use a reported GPU UUID or index.");
+            continue;
+          }
+          const total = known.get(key) ?? null;
+          if (total == null) add("usableVramGb", "Physical VRAM total is unknown for a GPU.");
+          else if (value > total) {
+            add("usableVramGb", "Usable VRAM cannot exceed the physical total.");
+          }
+        }
+      }
+    }
+  }
+
+  if (fields.length === 0) return null;
+  return { fields, message: messages.join(" ") };
 }
 
 export const NODE_HEALTH_WARNING_CODES = [
