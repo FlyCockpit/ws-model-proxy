@@ -8,6 +8,7 @@ import {
   nodeHasAllLabels,
   nodeHealthWarnings,
   nodeLabelsSchema,
+  normalizeDecimalInput,
   normalizeNodeLabels,
   parseNodeInfo,
   resolveUsableBudgets,
@@ -26,6 +27,35 @@ describe("suggestNodeLabels", () => {
         gpus: [{ index: 0, name: "NVIDIA GB10" }],
       }),
     ).toEqual(["dgx-spark", "unified-memory"]);
+  });
+
+  it("does not suggest apple-silicon for Ubuntu aarch64 GB10 / DGX Spark", () => {
+    expect(
+      suggestNodeLabels({
+        nodeKind: "unified",
+        unifiedMemory: true,
+        memoryTotalMiB: 128 * 1024,
+        os: { name: "Ubuntu", arch: "aarch64" },
+        gpus: [{ index: 0, name: "NVIDIA GB10" }],
+      }),
+    ).toEqual(["dgx-spark", "unified-memory"]);
+  });
+
+  it("suggests apple-silicon only on macOS when no M-series model matched", () => {
+    expect(
+      suggestNodeLabels({
+        nodeKind: "unified",
+        unifiedMemory: true,
+        os: { name: "macOS", arch: "arm64" },
+      }),
+    ).toEqual(["apple-silicon", "unified-memory"]);
+    expect(
+      suggestNodeLabels({
+        nodeKind: "unified",
+        unifiedMemory: true,
+        os: { name: "Ubuntu", arch: "aarch64" },
+      }),
+    ).toEqual(["unified-memory"]);
   });
 
   it("suggests strix-halo from the GPU name", () => {
@@ -67,6 +97,16 @@ describe("suggestNodeLabels", () => {
         memoryTotalMiB: 8 * 1024,
       }),
     ).toEqual(["low-power"]);
+  });
+});
+
+describe("normalizeDecimalInput", () => {
+  it("trims and turns one comma into a dot", () => {
+    expect(normalizeDecimalInput(" 1,5 ")).toBe("1.5");
+    expect(normalizeDecimalInput("1.5")).toBe("1.5");
+    expect(normalizeDecimalInput("1,5,0")).toBe("1,5,0");
+    expect(normalizeDecimalInput("1.5,0")).toBe("1.5,0");
+    expect(normalizeDecimalInput("")).toBe("");
   });
 });
 

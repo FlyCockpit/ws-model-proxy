@@ -9560,35 +9560,35 @@ describe("model API routes", () => {
       ]);
     });
 
-    it("caps a token or header wait at the pool value", async () => {
+    it("lets a token or header lengthen past the pool floor up to the local wait budget", async () => {
       localAndProviderMembers(2_000);
       const { capacityRuntime } = await requestExternal({
         tokenWait: 8_000,
         headers: { [EXTERNAL_AFTER_WAIT_HEADER]: "9000" },
       });
       expect(vi.mocked(capacityRuntime.acquire).mock.calls[0]?.[0].candidates).toEqual([
+        expect.objectContaining({ poolMemberId: "local-primary", waitBudgetMs: 9_000 }),
+      ]);
+    });
+
+    it("ignores shortening below the pool floor", async () => {
+      localAndProviderMembers(2_000);
+      const { capacityRuntime } = await requestExternal({
+        tokenWait: 500,
+        headers: { [EXTERNAL_AFTER_WAIT_HEADER]: "250" },
+      });
+      expect(vi.mocked(capacityRuntime.acquire).mock.calls[0]?.[0].candidates).toEqual([
         expect.objectContaining({ poolMemberId: "local-primary", waitBudgetMs: 2_000 }),
       ]);
     });
 
-    it("lets an owner token shorten the wait, and a header cannot exceed the token", async () => {
+    it("lets a header lengthen when the token has no override", async () => {
       localAndProviderMembers(2_000);
       const { capacityRuntime } = await requestExternal({
-        tokenWait: 500,
-        headers: { [EXTERNAL_AFTER_WAIT_HEADER]: "8000" },
+        headers: { [EXTERNAL_AFTER_WAIT_HEADER]: "5000" },
       });
       expect(vi.mocked(capacityRuntime.acquire).mock.calls[0]?.[0].candidates).toEqual([
-        expect.objectContaining({ poolMemberId: "local-primary", waitBudgetMs: 500 }),
-      ]);
-    });
-
-    it("lets a header lengthen up to the pool cap when the token has no override", async () => {
-      localAndProviderMembers(2_000);
-      const { capacityRuntime } = await requestExternal({
-        headers: { [EXTERNAL_AFTER_WAIT_HEADER]: "1500" },
-      });
-      expect(vi.mocked(capacityRuntime.acquire).mock.calls[0]?.[0].candidates).toEqual([
-        expect.objectContaining({ poolMemberId: "local-primary", waitBudgetMs: 1_500 }),
+        expect.objectContaining({ poolMemberId: "local-primary", waitBudgetMs: 5_000 }),
       ]);
     });
 

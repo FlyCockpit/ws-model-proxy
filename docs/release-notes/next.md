@@ -150,10 +150,10 @@ assignment provenance and automatic concurrency seed columns.
 ## Per-caller `:external` wait (#181)
 
 A model-API token can store `externalAfterWaitMs` (null uses each pool's wait).
-`:external` requests may also send `x-wsmp-external-after-wait-ms`. Neither
-exceeds the pool cap. Owner tokens may set any value in
-`[0, pool.externalAfterWaitMs]`; grantees cannot shorten below the pool value.
-When fallback is off, the caller waits the full local budget. MCP:
+`:external` requests may also send `x-wsmp-external-after-wait-ms`. The pool
+value is an owner floor: callers may only lengthen, up to the local capacity
+wait budget, and cannot shorten below the floor. When fallback is off, the
+caller waits the full local budget. MCP:
 `model_api_token_external_wait_update`. The column is additive and nullable
 (`APPLY_SCHEMA=safe`).
 

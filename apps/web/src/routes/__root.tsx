@@ -161,6 +161,7 @@ function RootComponent() {
             }}
           >
             <Header />
+            {/* [container-type:size] lets the sidebar use 100cqh; fixed descendants must be portaled. */}
             <main className="min-h-0 min-w-0 overflow-y-auto overflow-x-clip [container-type:size]">
               <Outlet />
             </main>

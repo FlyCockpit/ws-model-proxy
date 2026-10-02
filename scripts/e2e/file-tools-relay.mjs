@@ -262,9 +262,8 @@ try {
   ];
   for (const name of fileTools) assert(names.has(name), `${name} is not listed for the PAT`);
 
-  const devices = await tool("forwarder_cli_devices_list", {});
-  const device = devices.result.find((entry) => entry.id === deviceId);
-  assert.deepEqual(device?.fileTools, { read: "headless", write: "headless" });
+  const device = await tool("forwarder_cli_device_get", { cliDeviceId: deviceId });
+  assert.deepEqual(device.result.fileTools, { read: "headless", write: "headless" });
 
   const work = join(scratch, "work");
   await mkdir(work);
@@ -507,11 +506,8 @@ try {
     throw new Error("relay mode switch timed out");
   };
   await restartMode("supervised");
-  const supervisedDevices = await tool("forwarder_cli_devices_list", {});
-  assert.equal(
-    supervisedDevices.result.find((entry) => entry.id === deviceId)?.fileTools.write,
-    "supervised",
-  );
+  const supervisedDevice = await tool("forwarder_cli_device_get", { cliDeviceId: deviceId });
+  assert.equal(supervisedDevice.result.fileTools.write, "supervised");
   const pollFile = async (commandId) => {
     const deadline = Date.now() + 35_000;
     while (Date.now() < deadline) {

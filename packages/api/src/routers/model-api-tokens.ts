@@ -56,7 +56,7 @@ function serializeToken(row: TokenListRow) {
     scopeMode: String(row.scopeMode),
     /** Human-set consent for `owner/pool:external`; false means private only. */
     allowExternal: row.allowExternal,
-    /** Null uses each pool's `externalAfterWaitMs`. Capped per pool at request time. */
+    /** Null uses each pool's `externalAfterWaitMs`. Applied as a lengthening of that pool's floor, up to the local wait budget. */
     externalAfterWaitMs: row.externalAfterWaitMs,
     lookupPrefix: row.lookupPrefix,
     lastUsedAt: row.lastUsedAt,
@@ -305,8 +305,9 @@ export const modelApiTokensRouter = {
   /**
    * How long this token's `:external` requests wait for local capacity.
    * Null uses each pool's `externalAfterWaitMs`. The value is stored as-is
-   * (0..600000); each request still caps it at that pool's wait, and a
-   * grantee cannot shorten below the pool default.
+   * (0..600000); each request applies it as a lengthening of that pool's
+   * floor, up to the local wait budget. Callers cannot shorten below the
+   * pool floor.
    */
   updateExternalWait: protectedProcedure
     .input(

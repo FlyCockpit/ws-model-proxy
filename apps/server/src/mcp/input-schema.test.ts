@@ -101,7 +101,6 @@ const CORE_SCHEMAS: Record<string, Json> = {
     {
       model: { type: "string", minLength: 1 },
       messages: { type: "array", items: {} },
-      externalAfterWaitMs: { type: "integer", minimum: 0, maximum: 600_000 },
       confirm: RUN_CONFIRM,
     },
     ["model", "messages", "confirm"],

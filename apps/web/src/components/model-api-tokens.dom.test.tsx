@@ -506,7 +506,7 @@ it("words the saved-pools hint for tokens that got their pools at creation too",
 it("creates with an optional wait and omits it when left empty", async () => {
   mount();
   openCreate();
-  expect(screen.getByLabelText("dashboard:tokens.externalWait.label")).toHaveProperty("value", "");
+  expect(screen.queryByLabelText("dashboard:tokens.externalWait.label")).toBeNull();
   submit();
   await waitFor(() => expect(state.calls).toHaveLength(1));
   expect(state.calls[0]).toEqual({
@@ -518,14 +518,21 @@ it("creates with an optional wait and omits it when left empty", async () => {
 it("creates with a stored wait when the field is set", async () => {
   mount();
   openCreate();
+  fireEvent.click(
+    screen.getByRole("checkbox", { name: "dashboard:tokens.externalAccess.createAllow" }),
+  );
   fireEvent.change(screen.getByLabelText("dashboard:tokens.externalWait.label"), {
     target: { value: "500" },
   });
   submit();
-  await waitFor(() => expect(state.calls).toHaveLength(1));
+  await waitFor(() => expect(state.calls).toHaveLength(2));
   expect(state.calls[0]).toEqual({
     name: "create",
     input: { name: "Example", scopeMode: "ALL_VISIBLE", modelIds: [], externalAfterWaitMs: 500 },
+  });
+  expect(state.calls[1]).toEqual({
+    name: "update",
+    input: { id: "new-token", allowExternal: true },
   });
 });
 

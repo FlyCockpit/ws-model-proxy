@@ -1,6 +1,8 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, Outlet } from "@tanstack/react-router";
+import { normalizeDecimalInput } from "@ws-model-proxy/api/lib/node-inventory";
+import { poolGrantSpendCapSchema } from "@ws-model-proxy/api/lib/pool-grant-spend-cap";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
@@ -1042,13 +1044,35 @@ function PoolGrantRoutingForm({
               value.queuePriority >= 0 &&
               value.queuePriority <= 31),
         )
-        .refine(
-          (value) =>
-            value.spendMode !== "SET" ||
-            (/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/u.test(value.spendLimit) &&
-              value.spendLimit !== "0" &&
-              /^[A-Z]{3}$/u.test(value.spendCurrency)),
-        ),
+        .superRefine((value, ctx) => {
+          if (value.spendMode !== "SET") return;
+          const limit = normalizeDecimalInput(value.spendLimit);
+          const currency = value.spendCurrency.trim().toUpperCase();
+          const parsed = poolGrantSpendCapSchema.safeParse({
+            limit,
+            currency,
+            period: value.spendPeriod,
+          });
+          const positive = Number(limit) > 0;
+          if (parsed.success && positive) return;
+          const paths = new Set(
+            (parsed.success ? [] : parsed.error.issues).map((issue) => issue.path[0]),
+          );
+          if (!parsed.success && paths.has("currency")) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["spendCurrency"],
+              message: t("dashboard:pools.grantRouting.spendCurrencyInvalid"),
+            });
+          }
+          if (!positive || paths.has("limit") || paths.size === 0) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["spendLimit"],
+              message: t("dashboard:pools.grantRouting.spendLimitInvalid"),
+            });
+          }
+        }),
     },
     onSubmit: async ({ value }) => {
       await update
@@ -1066,8 +1090,8 @@ function PoolGrantRoutingForm({
             value.spendMode === "NONE"
               ? null
               : {
-                  limit: value.spendLimit,
-                  currency: value.spendCurrency,
+                  limit: normalizeDecimalInput(value.spendLimit),
+                  currency: value.spendCurrency.trim().toUpperCase(),
                   period: value.spendPeriod,
                 },
         })
@@ -1179,23 +1203,37 @@ function PoolGrantRoutingForm({
               <div className="grid min-w-0 gap-2 sm:grid-cols-3">
                 <form.Field name="spendLimit">
                   {(field) => (
-                    <Input
-                      className="min-h-11 min-w-0"
-                      value={field.state.value}
-                      onChange={(event) => field.handleChange(event.target.value)}
-                      aria-label={t("dashboard:pools.grantRouting.spendLimit")}
-                    />
+                    <div className="min-w-0 space-y-1">
+                      <Input
+                        className="min-h-11 min-w-0"
+                        value={field.state.value}
+                        onChange={(event) => field.handleChange(event.target.value)}
+                        aria-label={t("dashboard:pools.grantRouting.spendLimit")}
+                      />
+                      {field.state.meta.errors.map((error) => (
+                        <p key={error?.message} className="text-sm text-destructive">
+                          {error?.message}
+                        </p>
+                      ))}
+                    </div>
                   )}
                 </form.Field>
                 <form.Field name="spendCurrency">
                   {(field) => (
-                    <Input
-                      className="min-h-11 min-w-0 uppercase"
-                      maxLength={3}
-                      value={field.state.value}
-                      onChange={(event) => field.handleChange(event.target.value.toUpperCase())}
-                      aria-label={t("dashboard:pools.grantRouting.spendCurrency")}
-                    />
+                    <div className="min-w-0 space-y-1">
+                      <Input
+                        className="min-h-11 min-w-0 uppercase"
+                        maxLength={3}
+                        value={field.state.value}
+                        onChange={(event) => field.handleChange(event.target.value.toUpperCase())}
+                        aria-label={t("dashboard:pools.grantRouting.spendCurrency")}
+                      />
+                      {field.state.meta.errors.map((error) => (
+                        <p key={error?.message} className="text-sm text-destructive">
+                          {error?.message}
+                        </p>
+                      ))}
+                    </div>
                   )}
                 </form.Field>
                 <form.Field name="spendPeriod">

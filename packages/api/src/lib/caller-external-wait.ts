@@ -6,7 +6,7 @@ import { z } from "zod";
  */
 export const EXTERNAL_AFTER_WAIT_HEADER = "x-wsmp-external-after-wait-ms";
 
-/** Inclusive ceiling shared by the pool, token, header, and MCP argument. */
+/** Inclusive ceiling shared by the pool, token, and header. */
 export const EXTERNAL_AFTER_WAIT_MS_MAX = 600_000;
 
 export const externalAfterWaitMsSchema = z.number().int().min(0).max(EXTERNAL_AFTER_WAIT_MS_MAX);
@@ -30,25 +30,23 @@ export function parseExternalAfterWaitMs(
 
 /**
  * Effective local wait before an `:external` caller with an external plan
- * leaves the local queue. Never exceeds the pool cap. A missing token or
- * request override uses the next wider cap (token, then pool). Grantees may
- * only lengthen relative to the pool value, so a shorter token/header is
- * ignored on a shared pool.
+ * leaves the local queue. `poolExternalAfterWaitMs` is an owner floor:
+ * callers (owners and grantees) may only lengthen via token or header, never
+ * shorten below the floor. When `capacityWaitBudgetMs` is provided, the
+ * result never exceeds that local wait budget (B). A missing token or
+ * request override uses the pool floor.
  */
 export function resolveCallerExternalAfterWaitMs(input: {
   poolExternalAfterWaitMs: number;
   tokenExternalAfterWaitMs?: number | null;
   requestExternalAfterWaitMs?: number | null;
-  isPoolOwner: boolean;
+  capacityWaitBudgetMs?: number | null;
 }): number {
-  const poolCap = Math.max(0, input.poolExternalAfterWaitMs);
-  const tokenCap =
-    input.tokenExternalAfterWaitMs == null
-      ? poolCap
-      : Math.min(Math.max(0, input.tokenExternalAfterWaitMs), poolCap);
-  const requested =
-    input.requestExternalAfterWaitMs == null
-      ? tokenCap
-      : Math.min(Math.max(0, input.requestExternalAfterWaitMs), tokenCap);
-  return input.isPoolOwner ? requested : Math.max(requested, poolCap);
+  const poolFloor = Math.max(0, input.poolExternalAfterWaitMs);
+  const requested = input.requestExternalAfterWaitMs ?? input.tokenExternalAfterWaitMs ?? poolFloor;
+  let result = Math.max(poolFloor, Math.max(0, requested));
+  if (input.capacityWaitBudgetMs != null) {
+    result = Math.min(result, Math.max(0, input.capacityWaitBudgetMs));
+  }
+  return result;
 }

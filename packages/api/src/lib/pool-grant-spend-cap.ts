@@ -1,34 +1,8 @@
 import { ORPCError } from "@orpc/server";
 import { Prisma } from "@ws-model-proxy/db";
-import { z } from "zod";
+import { type PoolGrantSpendCap, poolGrantSpendCapSchema } from "./pool-grant-spend-cap-schema";
 
-/** Owner-paid `:external` spend cap keyed by pool + grantee (survives re-grant). */
-export const poolGrantSpendCapSchema = z
-  .object({
-    limit: z.string().regex(/^\d{1,21}(?:\.\d{1,9})?$/u),
-    currency: z.string().regex(/^[A-Z]{3}$/u),
-    period: z.enum(["UTC_DAY", "UTC_MONTH"]),
-  })
-  .superRefine((value, context) => {
-    try {
-      const amount = new Prisma.Decimal(value.limit);
-      if (!amount.greaterThan(0) || Number(value.limit) >= 1e21) {
-        context.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: "Spend cap must be positive",
-          path: ["limit"],
-        });
-      }
-    } catch {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "Spend cap must be positive",
-        path: ["limit"],
-      });
-    }
-  });
-
-export type PoolGrantSpendCap = z.infer<typeof poolGrantSpendCapSchema>;
+export { type PoolGrantSpendCap, poolGrantSpendCapSchema };
 
 type SpendRule = {
   limitValue: { toString(): string } | string | number | null;

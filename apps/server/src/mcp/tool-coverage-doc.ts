@@ -115,9 +115,11 @@ MCP tools can never grant it:
   per-pool \`includeExternal\`) is excluded from the catalog (decision C1);
 - \`modelApiTokens.updateExternalWait\` (a token's \`externalAfterWaitMs\`) is
   an ordinary \`mcp:write\` tool, \`model_api_token_external_wait_update\`,
-  with no confirmation. Null uses each pool's wait; a request header or MCP
-  argument cannot exceed the token setting (or the pool cap when the token
-  has no override). Grantees cannot shorten below the pool value;
+  with no confirmation. Null uses each pool's wait. Pool \`externalAfterWaitMs\`
+  is an owner floor: callers may only lengthen, up to the local capacity wait
+  budget. A request header cannot go below the pool floor or past that budget.
+  Grantees cannot shorten below the pool floor. MCP diagnostics cannot use
+  \`:external\`;
 - \`providerManagement.setAllowDataCollection\` (the OpenRouter
   "providers that may collect data" opt-out, decision D9) is excluded, and
   \`provider_account_create\` / \`provider_account_update\` reject

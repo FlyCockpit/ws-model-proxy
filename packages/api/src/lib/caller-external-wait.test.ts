@@ -33,12 +33,12 @@ describe("parseExternalAfterWaitMs", () => {
 
 describe("resolveCallerExternalAfterWaitMs", () => {
   const pool = 2_000;
+  const budget = 30_000;
 
-  it("omits to the pool default", () => {
+  it("omits to the pool floor", () => {
     expect(
       resolveCallerExternalAfterWaitMs({
         poolExternalAfterWaitMs: pool,
-        isPoolOwner: true,
       }),
     ).toBe(pool);
     expect(
@@ -46,97 +46,94 @@ describe("resolveCallerExternalAfterWaitMs", () => {
         poolExternalAfterWaitMs: pool,
         tokenExternalAfterWaitMs: null,
         requestExternalAfterWaitMs: undefined,
-        isPoolOwner: false,
+        capacityWaitBudgetMs: budget,
       }),
     ).toBe(pool);
   });
 
-  it("caps the token and header at the pool value", () => {
+  it("lets a token or header lengthen past the pool floor up to the local wait budget", () => {
     expect(
       resolveCallerExternalAfterWaitMs({
         poolExternalAfterWaitMs: pool,
         tokenExternalAfterWaitMs: 8_000,
-        isPoolOwner: true,
+        capacityWaitBudgetMs: budget,
       }),
-    ).toBe(pool);
+    ).toBe(8_000);
     expect(
       resolveCallerExternalAfterWaitMs({
         poolExternalAfterWaitMs: pool,
         requestExternalAfterWaitMs: 8_000,
-        isPoolOwner: true,
+        capacityWaitBudgetMs: budget,
       }),
-    ).toBe(pool);
+    ).toBe(8_000);
+    expect(
+      resolveCallerExternalAfterWaitMs({
+        poolExternalAfterWaitMs: pool,
+        tokenExternalAfterWaitMs: 5_000,
+        requestExternalAfterWaitMs: 8_000,
+        capacityWaitBudgetMs: budget,
+      }),
+    ).toBe(8_000);
   });
 
-  it("lets an owner shorten via token or header, and never exceed the token cap", () => {
+  it("caps a lengthened wait at the local capacity wait budget", () => {
+    expect(
+      resolveCallerExternalAfterWaitMs({
+        poolExternalAfterWaitMs: pool,
+        tokenExternalAfterWaitMs: 8_000,
+        capacityWaitBudgetMs: 5_000,
+      }),
+    ).toBe(5_000);
+    expect(
+      resolveCallerExternalAfterWaitMs({
+        poolExternalAfterWaitMs: pool,
+        requestExternalAfterWaitMs: 8_000,
+        capacityWaitBudgetMs: 5_000,
+      }),
+    ).toBe(5_000);
+  });
+
+  it("does not cap at the budget when none is provided", () => {
+    expect(
+      resolveCallerExternalAfterWaitMs({
+        poolExternalAfterWaitMs: pool,
+        tokenExternalAfterWaitMs: 8_000,
+      }),
+    ).toBe(8_000);
+  });
+
+  it("ignores shortening below the pool floor for owners and grantees", () => {
     expect(
       resolveCallerExternalAfterWaitMs({
         poolExternalAfterWaitMs: pool,
         tokenExternalAfterWaitMs: 500,
-        isPoolOwner: true,
+        capacityWaitBudgetMs: budget,
       }),
-    ).toBe(500);
+    ).toBe(pool);
     expect(
       resolveCallerExternalAfterWaitMs({
         poolExternalAfterWaitMs: pool,
         requestExternalAfterWaitMs: 250,
-        isPoolOwner: true,
+        capacityWaitBudgetMs: budget,
       }),
-    ).toBe(250);
-    expect(
-      resolveCallerExternalAfterWaitMs({
-        poolExternalAfterWaitMs: pool,
-        tokenExternalAfterWaitMs: 500,
-        requestExternalAfterWaitMs: 8_000,
-        isPoolOwner: true,
-      }),
-    ).toBe(500);
-    expect(
-      resolveCallerExternalAfterWaitMs({
-        poolExternalAfterWaitMs: pool,
-        tokenExternalAfterWaitMs: 500,
-        requestExternalAfterWaitMs: 100,
-        isPoolOwner: true,
-      }),
-    ).toBe(100);
-  });
-
-  it("lets a header lengthen up to the pool cap when the token has no override", () => {
-    expect(
-      resolveCallerExternalAfterWaitMs({
-        poolExternalAfterWaitMs: pool,
-        requestExternalAfterWaitMs: 1_500,
-        isPoolOwner: true,
-      }),
-    ).toBe(1_500);
-  });
-
-  it("ignores a grantee shortening below the pool default", () => {
+    ).toBe(pool);
     expect(
       resolveCallerExternalAfterWaitMs({
         poolExternalAfterWaitMs: pool,
         tokenExternalAfterWaitMs: 0,
         requestExternalAfterWaitMs: 0,
-        isPoolOwner: false,
-      }),
-    ).toBe(pool);
-    expect(
-      resolveCallerExternalAfterWaitMs({
-        poolExternalAfterWaitMs: pool,
-        tokenExternalAfterWaitMs: 500,
-        isPoolOwner: false,
+        capacityWaitBudgetMs: budget,
       }),
     ).toBe(pool);
   });
 
-  it("caps a grantee lengthening at the pool value", () => {
+  it("lets a header lengthen when the token has no override", () => {
     expect(
       resolveCallerExternalAfterWaitMs({
         poolExternalAfterWaitMs: pool,
-        tokenExternalAfterWaitMs: 8_000,
-        requestExternalAfterWaitMs: 8_000,
-        isPoolOwner: false,
+        requestExternalAfterWaitMs: 5_000,
+        capacityWaitBudgetMs: budget,
       }),
-    ).toBe(pool);
+    ).toBe(5_000);
   });
 });

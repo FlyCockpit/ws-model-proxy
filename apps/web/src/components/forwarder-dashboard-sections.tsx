@@ -3883,7 +3883,7 @@ function ModelApiTokenCreateForm({
           name: value.name,
           scopeMode: value.scopeMode,
           modelIds: value.scopeMode === "ALLOWLIST" ? value.modelIds : [],
-          ...tokenExternalWaitCreatePayload(value.externalAfterWaitMs),
+          ...(value.allowExternal ? tokenExternalWaitCreatePayload(value.externalAfterWaitMs) : {}),
         });
         // Retain the one-time secret even if the separate human consent save fails.
         setSecret(result.secret);
@@ -3986,33 +3986,35 @@ function ModelApiTokenCreateForm({
               <p className="text-sm text-muted-foreground">
                 {t("dashboard:tokens.externalAccess.description")}
               </p>
-              <form.Field name="externalAfterWaitMs">
-                {(field) => (
-                  <div className="space-y-2">
-                    <Label htmlFor="model-api-token-external-wait">
-                      {t("dashboard:tokens.externalWait.label")}
-                    </Label>
-                    <Input
-                      id="model-api-token-external-wait"
-                      className="min-h-11"
-                      inputMode="numeric"
-                      placeholder={t("dashboard:tokens.externalWait.placeholder")}
-                      value={field.state.value}
-                      onBlur={field.handleBlur}
-                      onChange={(event) => field.handleChange(event.target.value)}
-                      autoComplete="off"
-                    />
-                    <p className="text-xs text-muted-foreground">
-                      {t("dashboard:tokens.externalWait.hint")}
-                    </p>
-                    {field.state.meta.errors.length > 0 ? (
-                      <p className="text-sm text-destructive">
-                        {t("dashboard:tokens.externalWait.invalid")}
+              {values.allowExternal ? (
+                <form.Field name="externalAfterWaitMs">
+                  {(field) => (
+                    <div className="space-y-2">
+                      <Label htmlFor="model-api-token-external-wait">
+                        {t("dashboard:tokens.externalWait.label")}
+                      </Label>
+                      <Input
+                        id="model-api-token-external-wait"
+                        className="min-h-11"
+                        inputMode="numeric"
+                        placeholder={t("dashboard:tokens.externalWait.placeholder")}
+                        value={field.state.value}
+                        onBlur={field.handleBlur}
+                        onChange={(event) => field.handleChange(event.target.value)}
+                        autoComplete="off"
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        {t("dashboard:tokens.externalWait.hint")}
                       </p>
-                    ) : null}
-                  </div>
-                )}
-              </form.Field>
+                      {field.state.meta.errors.length > 0 ? (
+                        <p className="text-sm text-destructive">
+                          {t("dashboard:tokens.externalWait.invalid")}
+                        </p>
+                      ) : null}
+                    </div>
+                  )}
+                </form.Field>
+              ) : null}
               {!visibleModels.providerEgressEnabled ? (
                 <p role="note" className="text-sm text-muted-foreground">
                   {t("dashboard:tokens.externalAccess.createDisabledDeployment")}
@@ -4239,10 +4241,12 @@ function TokenExternalAccess({
                   {t("dashboard:tokens.externalAccess.allow", { name: token.name })}
                 </span>
               </label>
-              <TokenExternalWaitField
-                key={`${token.id}:${token.externalAfterWaitMs}`}
-                token={token}
-              />
+              {token.allowExternal ? (
+                <TokenExternalWaitField
+                  key={`${token.id}:${token.externalAfterWaitMs}`}
+                  token={token}
+                />
+              ) : null}
               {token.allowExternal && allowlistPoolIds.length > 0 ? (
                 <div className="space-y-1 pl-8">
                   <p className="text-xs text-muted-foreground">

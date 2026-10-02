@@ -1196,9 +1196,10 @@ function effectiveMemberWaitBudget(member: PoolMemberRelayRow): number | null {
 
 /**
  * Local admission wait for one candidate. A consented `:external` caller with
- * an external plan waits at most the pool's externalAfterWaitMs, and never
- * longer than the member/pool budget. Null means no budget (only the request
- * deadline). The capacity store turns this into a database-clock deadline.
+ * an external plan waits the caller wait (pool floor, optionally lengthened),
+ * and never longer than the member/pool budget. Null means no budget (only
+ * the request deadline). The capacity store turns this into a database-clock
+ * deadline.
  */
 export function localAdmissionWaitBudget(
   memberBudgetMs: number | null,
@@ -5976,8 +5977,8 @@ async function relayPool({
 
   const memberById = new Map(eligibleMembers.map((member) => [member.id, member] as const));
   // An `:external` caller with an external plan leaves the local queue after
-  // the caller wait (token, then optional header/MCP argument), never later
-  // than the pool's externalAfterWaitMs or the member budget.
+  // the caller wait (pool floor, then optional token/header lengthening),
+  // never later than the local wait budget.
   const poolExternalAfterWaitMs = eligibleMembers[0]?.ModelPool?.externalAfterWaitMs;
   const externalAfterWaitMs =
     poolExternalAfterWaitMs !== undefined &&
@@ -5989,7 +5990,7 @@ async function relayPool({
           requestExternalAfterWaitMs: parseExternalAfterWaitMs(
             request.headers.get(EXTERNAL_AFTER_WAIT_HEADER),
           ),
-          isPoolOwner: target.ownerUserId === requester.userId,
+          capacityWaitBudgetMs: eligibleMembers[0]?.ModelPool?.capacityWaitBudgetMs,
         })
       : null;
   // Local wait per admission (X1): "shortened" waits min(B, E) and then runs

@@ -2,10 +2,12 @@ import { useForm } from "@tanstack/react-form";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   gpuBudgetKey,
+  NODE_BUDGET_MAX_GB,
   NODE_LABEL_PATTERN,
   NODE_LABELS_MAX,
   type NodeCardSnapshot,
   nodeLabelsSchema,
+  normalizeDecimalInput,
 } from "@ws-model-proxy/api/lib/node-inventory";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
@@ -20,11 +22,12 @@ import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { Pencil, Tags, Thermometer } from "lucide-react";
-import { useState } from "react";
+import { Pencil, Tags, Thermometer, X } from "lucide-react";
+import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
+import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
 function formatGb(value: number | null | undefined): string | null {
@@ -41,12 +44,20 @@ function budgetInputValue(value: number | null, isDefault: boolean): string {
   return String(value);
 }
 
-function parseBudgetInput(raw: string): number | null | undefined {
-  const trimmed = raw.trim();
-  if (trimmed.length === 0) return null;
-  const value = Number(trimmed);
-  if (!Number.isFinite(value) || value < 0) return undefined;
-  return value;
+function parseBudgetInput(raw: string): number | null {
+  const normalized = normalizeDecimalInput(raw);
+  if (normalized.length === 0) return null;
+  return Number(normalized);
+}
+
+function budgetInputSchema(invalidMessage: string) {
+  return z.string().refine((raw) => {
+    const value = normalizeDecimalInput(raw);
+    return (
+      value === "" ||
+      (/^\d+(\.\d+)?$/.test(value) && Number(value) >= 0 && Number(value) <= NODE_BUDGET_MAX_GB)
+    );
+  }, invalidMessage);
 }
 
 export function CliDeviceNodeCard({
@@ -244,15 +255,18 @@ function AcceptSuggestedLabels({
 }) {
   const { t } = useTranslation("dashboard");
   const queryClient = useQueryClient();
-  const save = useMutation(
-    orpc.forwarderManagement.setCliDeviceLabels.mutationOptions({
+  const save = useMutation({
+    ...orpc.forwarderManagement.setCliDeviceLabels.mutationOptions({
       onSuccess: () => {
         void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:clis.node.labelsSaved"));
       },
-      onError: () => toast.error(t("dashboard:clis.node.labelsSaveFailed")),
+      onError: (error) => {
+        toast.error(friendly(error, t("dashboard:clis.node.labelsSaveFailed")));
+      },
     }),
-  );
+    meta: { skipGlobalErrorToast: true },
+  });
   return (
     <Button
       type="button"
@@ -310,23 +324,48 @@ function LabelsForm({
 }) {
   const { t } = useTranslation("dashboard");
   const queryClient = useQueryClient();
+  const labelsId = useId();
   const [draft, setDraft] = useState("");
   const [draftError, setDraftError] = useState<string | null>(null);
-  const save = useMutation(
-    orpc.forwarderManagement.setCliDeviceLabels.mutationOptions({
+  const save = useMutation({
+    ...orpc.forwarderManagement.setCliDeviceLabels.mutationOptions({
       onSuccess: () => {
         void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:clis.node.labelsSaved"));
         onDone();
       },
-      onError: () => toast.error(t("dashboard:clis.node.labelsSaveFailed")),
+      onError: (error) => {
+        toast.error(friendly(error, t("dashboard:clis.node.labelsSaveFailed")));
+      },
     }),
-  );
+    meta: { skipGlobalErrorToast: true },
+  });
+  const commitDraft = (labels: string[]): string[] | null => {
+    const next = draft.trim().toLowerCase();
+    if (!next) return labels;
+    if (!NODE_LABEL_PATTERN.test(next)) {
+      setDraftError(t("dashboard:clis.node.invalidLabel"));
+      return null;
+    }
+    if (labels.includes(next)) {
+      setDraftError(t("dashboard:clis.node.duplicateLabel"));
+      return null;
+    }
+    if (labels.length >= NODE_LABELS_MAX) {
+      setDraftError(t("dashboard:clis.node.labelsMax", { max: NODE_LABELS_MAX }));
+      return null;
+    }
+    setDraft("");
+    setDraftError(null);
+    return [...labels, next];
+  };
   const form = useForm({
     defaultValues: { labels: [...node.labels] },
     validators: { onSubmit: z.object({ labels: nodeLabelsSchema }) },
     onSubmit: async ({ value }) => {
-      await save.mutateAsync({ cliDeviceId, labels: value.labels }).catch(() => undefined);
+      const labels = commitDraft(value.labels);
+      if (labels === null) return;
+      await save.mutateAsync({ cliDeviceId, labels }).catch(() => undefined);
     },
   });
 
@@ -342,7 +381,7 @@ function LabelsForm({
       <form.Field name="labels">
         {(field) => (
           <div className="space-y-2">
-            <Label>{t("dashboard:clis.node.labels")}</Label>
+            <Label htmlFor={labelsId}>{t("dashboard:clis.node.labels")}</Label>
             <ul className="flex flex-wrap gap-1">
               {field.state.value.map((label) => (
                 <li key={label}>
@@ -350,17 +389,20 @@ function LabelsForm({
                     type="button"
                     variant="secondary"
                     size="touch"
+                    aria-label={t("dashboard:clis.node.removeLabel", { label })}
                     onClick={() =>
                       field.handleChange(field.state.value.filter((item) => item !== label))
                     }
                   >
-                    {label} ×
+                    {label}
+                    <X className="size-4" aria-hidden />
                   </Button>
                 </li>
               ))}
             </ul>
             <div className="flex flex-col gap-2 sm:flex-row">
               <Input
+                id={labelsId}
                 className="min-h-11 min-w-0"
                 autoComplete="off"
                 placeholder={t("dashboard:clis.node.addLabelPlaceholder")}
@@ -372,18 +414,8 @@ function LabelsForm({
                 onKeyDown={(event) => {
                   if (event.key !== "Enter") return;
                   event.preventDefault();
-                  const next = draft.trim().toLowerCase();
-                  if (!NODE_LABEL_PATTERN.test(next)) {
-                    setDraftError(t("dashboard:clis.node.invalidLabel"));
-                    return;
-                  }
-                  if (field.state.value.includes(next)) {
-                    setDraftError(t("dashboard:clis.node.duplicateLabel"));
-                    return;
-                  }
-                  if (field.state.value.length >= NODE_LABELS_MAX) return;
-                  field.handleChange([...field.state.value, next]);
-                  setDraft("");
+                  const committed = commitDraft(field.state.value);
+                  if (committed) field.handleChange(committed);
                 }}
               />
               <Button
@@ -391,18 +423,8 @@ function LabelsForm({
                 variant="outline"
                 size="touch"
                 onClick={() => {
-                  const next = draft.trim().toLowerCase();
-                  if (!NODE_LABEL_PATTERN.test(next)) {
-                    setDraftError(t("dashboard:clis.node.invalidLabel"));
-                    return;
-                  }
-                  if (field.state.value.includes(next)) {
-                    setDraftError(t("dashboard:clis.node.duplicateLabel"));
-                    return;
-                  }
-                  if (field.state.value.length >= NODE_LABELS_MAX) return;
-                  field.handleChange([...field.state.value, next]);
-                  setDraft("");
+                  const committed = commitDraft(field.state.value);
+                  if (committed) field.handleChange(committed);
                 }}
               >
                 {t("dashboard:clis.node.addLabel")}
@@ -473,16 +495,25 @@ function BudgetsForm({
   const queryClient = useQueryClient();
   const showMemory = node.kind !== "discrete" && node.kind !== "cpu";
   const showRam = node.kind !== "unified";
-  const save = useMutation(
-    orpc.forwarderManagement.setCliDeviceUsableBudgets.mutationOptions({
+  const invalidBudget = t("dashboard:clis.node.invalidBudget");
+  const save = useMutation({
+    ...orpc.forwarderManagement.setCliDeviceUsableBudgets.mutationOptions({
       onSuccess: () => {
         void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         toast.success(t("dashboard:clis.node.budgetsSaved"));
         onDone();
       },
-      onError: () => toast.error(t("dashboard:clis.node.budgetsSaveFailed")),
+      onError: (error) => {
+        toast.error(friendly(error, t("dashboard:clis.node.budgetsSaveFailed")));
+      },
     }),
-  );
+    meta: { skipGlobalErrorToast: true },
+  });
+  const budgetsSchema = z.object({
+    usableMemoryGb: budgetInputSchema(invalidBudget),
+    usableRamGb: budgetInputSchema(invalidBudget),
+    vram: z.record(z.string(), budgetInputSchema(invalidBudget)),
+  });
   const form = useForm({
     defaultValues: {
       usableMemoryGb: budgetInputValue(node.usableMemoryGb, node.usableMemoryGbDefault),
@@ -495,21 +526,15 @@ function BudgetsForm({
       ) as Record<string, string>,
     },
     validators: {
-      onSubmit: z.object({
-        usableMemoryGb: z.string(),
-        usableRamGb: z.string(),
-        vram: z.record(z.string(), z.string()),
-      }),
+      onChange: budgetsSchema,
+      onSubmit: budgetsSchema,
     },
     onSubmit: async ({ value }) => {
       const usableMemoryGb = showMemory ? parseBudgetInput(value.usableMemoryGb) : undefined;
       const usableRamGb = showRam ? parseBudgetInput(value.usableRamGb) : undefined;
-      if (showMemory && usableMemoryGb === undefined) return;
-      if (showRam && usableRamGb === undefined) return;
       const usableVramGb: Record<string, number> = {};
       for (const gpu of node.gpus) {
         const parsed = parseBudgetInput(value.vram[String(gpu.index)] ?? "");
-        if (parsed === undefined) return;
         if (parsed !== null) usableVramGb[gpuKey(gpu)] = parsed;
       }
       await save
@@ -539,7 +564,6 @@ function BudgetsForm({
               id={`usable-memory-${cliDeviceId}`}
               label={t("dashboard:clis.node.usableMemory")}
               field={field}
-              invalidMessage={t("dashboard:clis.node.invalidBudget")}
             />
           )}
         </form.Field>
@@ -551,7 +575,6 @@ function BudgetsForm({
               id={`usable-ram-${cliDeviceId}`}
               label={t("dashboard:clis.node.usableRam")}
               field={field}
-              invalidMessage={t("dashboard:clis.node.invalidBudget")}
             />
           )}
         </form.Field>
@@ -565,7 +588,6 @@ function BudgetsForm({
                 gpu.name ?? t("dashboard:clis.node.gpuIndex", { index: gpu.index })
               }`}
               field={field}
-              invalidMessage={t("dashboard:clis.node.invalidBudget")}
             />
           )}
         </form.Field>
@@ -595,20 +617,17 @@ function BudgetField({
   id,
   label,
   field,
-  invalidMessage,
 }: {
   id: string;
   label: string;
   field: {
     name: string;
-    state: { value: string };
+    state: { value: string; meta: { errors: Array<{ message?: string } | undefined> } };
     handleBlur: () => void;
     handleChange: (value: string) => void;
   };
-  invalidMessage: string;
 }) {
   const { t } = useTranslation("dashboard");
-  const parsed = parseBudgetInput(field.state.value);
   return (
     <div className="space-y-2">
       <Label htmlFor={id}>{label}</Label>
@@ -623,7 +642,11 @@ function BudgetField({
         onChange={(event) => field.handleChange(event.target.value)}
       />
       <p className="text-xs text-muted-foreground">{t("dashboard:clis.node.budgetHint")}</p>
-      {parsed === undefined ? <p className="text-sm text-destructive">{invalidMessage}</p> : null}
+      {field.state.meta.errors.map((error) => (
+        <p key={error?.message} className="text-sm text-destructive">
+          {error?.message}
+        </p>
+      ))}
     </div>
   );
 }

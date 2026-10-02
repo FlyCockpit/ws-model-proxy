@@ -18,6 +18,16 @@ export const NODE_MEMORY_RESERVE_GB = 2;
 /** Total minus this many GB becomes the default per-GPU VRAM budget. */
 export const NODE_GPU_VRAM_RESERVE_GB = 0.5;
 export const NODE_BUDGET_MAX_GB = 1_000_000;
+
+/** Trim and turn a single comma decimal (`1,5`) into a dot decimal (`1.5`). */
+export function normalizeDecimalInput(raw: string): string {
+  const trimmed = raw.trim();
+  const comma = trimmed.indexOf(",");
+  if (comma === -1 || trimmed.includes(".") || trimmed.indexOf(",", comma + 1) !== -1) {
+    return trimmed;
+  }
+  return `${trimmed.slice(0, comma)}.${trimmed.slice(comma + 1)}`;
+}
 const GPU_INDEX_KEY = /^index:(0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])$/;
 const GPU_UUID_KEY = /^[A-Za-z0-9_.:@-]{1,128}$/;
 
@@ -200,20 +210,21 @@ export function suggestNodeLabels(info: NodeInfoView): string[] {
   if (unified) labels.add("unified-memory");
   const blob = blobOf(info);
 
-  if (/\bgb10\b|dgx[\s-]?spark|nvidia spark/.test(blob)) labels.add("dgx-spark");
-  if (/strix[\s-]?halo|ryzen ai max|gfx1151/.test(blob)) labels.add("strix-halo");
+  const dgxSpark = /\bgb10\b|dgx[\s-]?spark|nvidia spark/.test(blob);
+  const strixHalo = /strix[\s-]?halo|ryzen ai max|gfx1151/.test(blob);
+  if (dgxSpark) labels.add("dgx-spark");
+  if (strixHalo) labels.add("strix-halo");
   if (/rtx[\s-]?3090/.test(blob)) labels.add("rtx-3090");
   if (/rtx[\s-]?3060/.test(blob)) labels.add("rtx-3060");
   if (/gtx[\s-]?1080/.test(blob)) labels.add("gtx-1080");
-  if (/apple[\s-]?m4|\bm4 (pro|max|ultra)\b/.test(blob)) labels.add("apple-m4");
-  else if (/apple[\s-]?m3|\bm3 (pro|max|ultra)\b/.test(blob)) labels.add("apple-m3");
-  else if (/apple[\s-]?m2|\bm2 (pro|max|ultra)\b/.test(blob)) labels.add("apple-m2");
-  else if (/apple[\s-]?m1|\bm1 (pro|max|ultra)\b/.test(blob)) labels.add("apple-m1");
-  else if (
-    unified &&
-    (/darwin|macos|mac os/.test(blob) || /\baarch64\b|\barm64\b/.test(info.os?.arch ?? ""))
-  ) {
-    labels.add("apple-silicon");
+  if (!dgxSpark && !strixHalo) {
+    if (/apple[\s-]?m4|\bm4 (pro|max|ultra)\b/.test(blob)) labels.add("apple-m4");
+    else if (/apple[\s-]?m3|\bm3 (pro|max|ultra)\b/.test(blob)) labels.add("apple-m3");
+    else if (/apple[\s-]?m2|\bm2 (pro|max|ultra)\b/.test(blob)) labels.add("apple-m2");
+    else if (/apple[\s-]?m1|\bm1 (pro|max|ultra)\b/.test(blob)) labels.add("apple-m1");
+    else if (unified && /darwin|macos|mac os/.test((info.os?.name ?? "").toLowerCase())) {
+      labels.add("apple-silicon");
+    }
   }
 
   const memoryGb = mibToGb(info.memoryTotalMiB);

@@ -30,7 +30,6 @@
  */
 
 import type { StandardSchemaWithJSON } from "@modelcontextprotocol/server";
-import { EXTERNAL_AFTER_WAIT_MS_MAX } from "@ws-model-proxy/api/lib/caller-external-wait";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { z } from "zod";
 import { runChatCompletionDiagnostic, runPoolMemberTest } from "../model-api/diagnostics.js";
@@ -367,7 +366,7 @@ export const POOL_EXTERNAL_WAIT_COST_NOTICE =
 
 /** Cost statement for the per-token `:external` wait (issue #181). */
 export const TOKEN_EXTERNAL_WAIT_COST_NOTICE =
-  "COST: externalAfterWaitMs is how long this token's :external requests wait for local capacity before they may be sent to a paid external provider. Lower values spend more. Null uses each pool's setting. A request may also send x-wsmp-external-after-wait-ms or forwarder_chat_completion_test's externalAfterWaitMs argument; that override cannot exceed the token setting, and if the token has no override it may lengthen up to the pool cap. Grantees cannot shorten below the pool value. The stored value is 0..600000; each request still caps it at that pool's wait.";
+  "COST: externalAfterWaitMs is how long this token's :external requests wait for local capacity before they may be sent to a paid external provider. Lower values spend more. Null uses each pool's setting. Pool externalAfterWaitMs is an owner floor: callers may only lengthen, up to the pool's local capacity wait budget. A request may also send x-wsmp-external-after-wait-ms; that override cannot go below the pool floor or past the local wait budget. Grantees cannot shorten below the pool floor. The stored value is 0..600000; each request still applies the floor and budget for that pool. MCP diagnostics cannot use :external.";
 
 /** Cost statement for per-grantee owner-paid `:external` spend caps (#182). */
 export const POOL_GRANT_SPEND_CAP_COST_NOTICE =
@@ -1374,21 +1373,13 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     coreShape: {
       model: z.string().min(1),
       messages: CHAT_MESSAGES_SCHEMA,
-      externalAfterWaitMs: z.number().int().min(0).max(EXTERNAL_AFTER_WAIT_MS_MAX).optional(),
     },
-    descriptionNote:
-      "externalAfterWaitMs is the per-request :external wait override (same as HTTP x-wsmp-external-after-wait-ms). It cannot exceed this caller's token setting or the pool cap. MCP diagnostics still cannot use :external.",
-    invokeCore: (input, deps) => {
-      const record = input as Record<string, unknown>;
-      const { externalAfterWaitMs, ...body } = record;
-      return runChatCompletionDiagnostic({
+    invokeCore: (input, deps) =>
+      runChatCompletionDiagnostic({
         userId: deps.userId,
-        body,
-        externalAfterWaitMs:
-          typeof externalAfterWaitMs === "number" ? externalAfterWaitMs : undefined,
+        body: input as Record<string, unknown>,
         signal: deps.signal,
-      });
-    },
+      }),
   },
   {
     name: "forwarder_cli_command_run",
