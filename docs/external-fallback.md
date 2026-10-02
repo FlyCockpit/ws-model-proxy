@@ -550,9 +550,16 @@ no grant, so `ownerProtectionPercent` sets the owner's own share (null = the
 share mode, 0 = unprotected, 1–100 = percent). Each grant has the same override
 (`protectionOverridePercent`) plus a queue priority (`queuePriority`, 0–31)
 that replaces the pool and member capacity priority for that grantee's waiting
-requests (null inherits). Only the pool owner sets them: the pool's access tab,
-`forwarderManagement.updatePoolGrant`, or the `forwarder_pool_grant_update` MCP
-tool.
+requests (null inherits). The owner can also set a per-grant owner-paid
+`:external` spend cap (`BudgetScopeType.POOL_GRANT`, keyed by `poolGrantId`,
+with `poolId` stored on the rule). Admission and settlement charge that cap
+first, then the owner's account and attachment budgets. Exhausting it fails
+`:external` for that grantee (`429 grantee_spend_cap`) without amounts or
+policy ids; local members still serve. A revoked and re-created grant is a new
+id with a fresh cap. Own-key traffic and the pool owner are not charged against
+it. Only the pool owner sets these: the pool's access tab,
+`forwarderManagement.updatePoolGrant`, `providerManagement.createBudgetPolicy`
+with `scopeType=POOL_GRANT`, or the matching MCP tools.
 
 ### When the external attempt does not happen
 
@@ -570,6 +577,7 @@ preserve the upstream status as described under [Own-key failure and accounting]
 | Pool has only external members, no external member fits the request | `400 unsupported_capability` |
 | Pool has only external members, the compatible ones are all in a provider health cooldown | `503 external_unavailable` |
 | Pool has only external members, provider busy | `429 rate_limited` |
+| Pool has only external members, this grantee's owner-paid spend cap is exhausted | `429 grantee_spend_cap` (no remaining amount, policy id, or account label) |
 | Pool has only external members, anything else (unhealthy, failure before the first byte, send check timed out, fallback or consent withdrawn) | `503 external_unavailable` |
 | Owner account banned or deletion pending (any pool shape) | `404`, the request ends (see [Pool owner account state](#pool-owner-account-state)) |
 | Requester account banned or deletion pending, seen by the external check | `401`, the request ends, no `x-wsmp-fallback` |

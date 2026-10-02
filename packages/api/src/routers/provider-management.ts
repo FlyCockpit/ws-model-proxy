@@ -20,6 +20,7 @@ import {
   poolIdsWithMembers,
   providerModelPoolMemberWhere,
 } from "../lib/pool-capability-impact";
+import { assertPoolGrantSpendRules } from "../lib/pool-grant-spend-cap";
 import {
   decryptProviderCredential,
   encryptProviderCredential,
@@ -1964,17 +1965,21 @@ export const providerManagementRouter = {
   listBudgetPolicies: protectedProcedure.handler(({ context }) => {
     readRevokeOrDeleteAllowed();
     return prisma.providerBudgetPolicy.findMany({
-      where: { userId: context.session.user.id, ProviderAccount: { deletedAt: null } },
+      where: {
+        userId: context.session.user.id,
+        OR: [{ scopeType: "POOL_GRANT" }, { ProviderAccount: { deletedAt: null } }],
+      },
       include: { Rules: true },
     });
   }),
   createBudgetPolicy: protectedProcedure
     .input(
       z.object({
-        scopeType: z.enum(["PROVIDER_ACCOUNT", "POOL_PROVIDER_MODEL"]),
-        providerAccountId: id,
+        scopeType: z.enum(["PROVIDER_ACCOUNT", "POOL_PROVIDER_MODEL", "POOL_GRANT"]),
+        providerAccountId: id.nullable().optional(),
         poolId: id.nullable(),
         providerModelId: id.nullable(),
+        poolGrantId: id.nullable().optional(),
         active: z.boolean().default(false),
         rules: z.array(rule).min(1),
       }),
@@ -1982,17 +1987,64 @@ export const providerManagementRouter = {
     .handler(async ({ input, context }) => {
       enabled();
       const userId = context.session.user.id;
-      if (
+      if (input.scopeType === "POOL_GRANT") {
+        if (!input.poolGrantId || input.providerAccountId || input.providerModelId)
+          throw new ORPCError("BAD_REQUEST");
+        assertPoolGrantSpendRules(input.rules);
+      } else if (
+        !input.providerAccountId ||
+        input.poolGrantId ||
         (input.scopeType === "POOL_PROVIDER_MODEL") !==
-        Boolean(input.poolId && input.providerModelId)
+          Boolean(input.poolId && input.providerModelId)
       )
         throw new ORPCError("BAD_REQUEST");
       return prisma.$transaction(async (tx) => {
         await fenceOwners(tx, [userId]);
-        await acquireFences(tx, [fences.budgetAccount(userId, input.providerAccountId)]);
-        await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
+        if (input.scopeType === "POOL_GRANT") {
+          const poolGrantId = input.poolGrantId;
+          if (!poolGrantId) throw new ORPCError("BAD_REQUEST");
+          await acquireFences(tx, [fences.budgetGrant(userId, poolGrantId)]);
+          const grant = await tx.poolGrant.findFirst({
+            where: { id: poolGrantId, ownerUserId: userId },
+            select: { id: true, poolId: true },
+          });
+          if (!grant) throw missing();
+          if (input.poolId && input.poolId !== grant.poolId) throw new ORPCError("BAD_REQUEST");
+          const row = await tx.providerBudgetPolicy.create({
+            data: {
+              userId,
+              scopeType: "POOL_GRANT",
+              providerAccountId: null,
+              poolId: grant.poolId,
+              providerModelId: null,
+              poolGrantId: grant.id,
+              active: input.active,
+              activatedAt: input.active ? new Date() : null,
+              Rules: {
+                create: input.rules.map((r) => ({
+                  ...r,
+                  limitValue: r.limitValue ? new Prisma.Decimal(r.limitValue) : null,
+                })),
+              },
+            },
+            include: { Rules: true },
+          });
+          await tx.providerAuditEvent.create({
+            data: {
+              userId,
+              action: "BUDGET_CREATED",
+              subjectId: row.id,
+              metadata: budgetAuditMetadata(input.rules),
+            },
+          });
+          return row;
+        }
+        const providerAccountId = input.providerAccountId;
+        if (!providerAccountId) throw new ORPCError("BAD_REQUEST");
+        await acquireFences(tx, [fences.budgetAccount(userId, providerAccountId)]);
+        await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
         const account = await tx.providerAccount.findFirst({
-          where: { id: input.providerAccountId, userId, deletedAt: null },
+          where: { id: providerAccountId, userId, deletedAt: null },
           select: { id: true },
         });
         if (!account) throw missing();
@@ -2022,7 +2074,7 @@ export const providerManagementRouter = {
           data: {
             userId,
             scopeType: input.scopeType,
-            providerAccountId: input.providerAccountId,
+            providerAccountId,
             poolId: input.poolId,
             providerModelId: input.providerModelId,
             active: input.active,
@@ -2039,7 +2091,7 @@ export const providerManagementRouter = {
         await tx.providerAuditEvent.create({
           data: {
             userId,
-            providerAccountId: input.providerAccountId,
+            providerAccountId,
             action: "BUDGET_CREATED",
             subjectId: row.id,
             metadata: budgetAuditMetadata(input.rules),
@@ -2057,14 +2109,24 @@ export const providerManagementRouter = {
         where: { id: input.id, userId },
       });
       if (!current) throw missing();
+      if (current.scopeType === "POOL_GRANT") assertPoolGrantSpendRules(input.rules);
       return prisma.$transaction(
         async (tx) => {
           await fenceOwners(tx, [userId]);
-          await acquireFences(tx, [fences.budgetAccount(userId, current.providerAccountId)]);
-          await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${current.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
+          if (current.scopeType === "POOL_GRANT") {
+            if (!current.poolGrantId) throw missing();
+            await acquireFences(tx, [fences.budgetGrant(userId, current.poolGrantId)]);
+          } else {
+            if (!current.providerAccountId) throw missing();
+            await acquireFences(tx, [fences.budgetAccount(userId, current.providerAccountId)]);
+            await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${current.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
+          }
           await tx.$queryRaw`SELECT id FROM provider_budget_policy WHERE id = ${current.id} AND "userId" = ${userId} FOR UPDATE`;
           const locked = await tx.providerBudgetPolicy.findFirst({
-            where: { id: current.id, userId, ProviderAccount: { deletedAt: null } },
+            where:
+              current.scopeType === "POOL_GRANT"
+                ? { id: current.id, userId }
+                : { id: current.id, userId, ProviderAccount: { deletedAt: null } },
           });
           if (!locked) throw missing();
           const latest = await tx.providerBudgetPolicy.findFirst({
@@ -2074,6 +2136,7 @@ export const providerManagementRouter = {
               providerAccountId: locked.providerAccountId,
               poolId: locked.poolId,
               providerModelId: locked.providerModelId,
+              poolGrantId: locked.poolGrantId,
             },
             orderBy: { version: "desc" },
             select: { id: true },
@@ -2093,6 +2156,7 @@ export const providerManagementRouter = {
               providerAccountId: locked.providerAccountId,
               poolId: locked.poolId,
               providerModelId: locked.providerModelId,
+              poolGrantId: locked.poolGrantId,
               version: locked.version + 1,
               active: input.active,
               activatedAt: input.active ? new Date() : null,
@@ -2126,17 +2190,26 @@ export const providerManagementRouter = {
       const userId = context.session.user.id;
       const current = await prisma.providerBudgetPolicy.findFirst({
         where: { id: input.id, userId },
-        select: { id: true, providerAccountId: true },
+        select: { id: true, providerAccountId: true, poolGrantId: true, scopeType: true },
       });
       if (!current) throw missing();
       await prisma.$transaction(
         async (tx) => {
           await fenceOwners(tx, [userId]);
-          await acquireFences(tx, [fences.budgetAccount(userId, current.providerAccountId)]);
-          await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${current.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
+          if (current.scopeType === "POOL_GRANT") {
+            if (!current.poolGrantId) throw missing();
+            await acquireFences(tx, [fences.budgetGrant(userId, current.poolGrantId)]);
+          } else {
+            if (!current.providerAccountId) throw missing();
+            await acquireFences(tx, [fences.budgetAccount(userId, current.providerAccountId)]);
+            await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${current.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
+          }
           await tx.$queryRaw`SELECT id FROM provider_budget_policy WHERE id = ${current.id} AND "userId" = ${userId} FOR UPDATE`;
           const locked = await tx.providerBudgetPolicy.findFirst({
-            where: { id: current.id, userId, ProviderAccount: { deletedAt: null } },
+            where:
+              current.scopeType === "POOL_GRANT"
+                ? { id: current.id, userId }
+                : { id: current.id, userId, ProviderAccount: { deletedAt: null } },
           });
           if (!locked) throw missing();
           if (!locked.active) return;

@@ -811,6 +811,20 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
     });
   });
 
+  it("issue #182: grant spend-cap writes keep the same confirmation class as other budget tools", () => {
+    const byName = new Map(MCP_TOOL_MANIFEST.map((tool) => [tool.name, tool]));
+    for (const name of ["forwarder_pool_grant_update", "provider_budget_policy_create"] as const) {
+      const tool = byName.get(name)!;
+      expect(tool.scope).toBe("write");
+      expect(tool.confirmation).toBeNull();
+      expect(tool.classification).toBe("pure");
+      expect(tool.descriptionNote).toContain("COST:");
+      expect(tool.descriptionNote).toContain("POOL_GRANT");
+      expect(tool.descriptionNote).toContain("poolGrantId");
+      expect(tool.descriptionNote).toContain("PRECONDITIONS");
+    }
+  });
+
   it("D9: MCP account tools cannot relax the OpenRouter data-collection setting", async () => {
     const byName = new Map(MCP_TOOL_MANIFEST.map((tool) => [tool.name, tool]));
     for (const name of ["provider_account_create", "provider_account_update"]) {

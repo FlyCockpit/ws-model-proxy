@@ -117,6 +117,8 @@ export type PublicOverflowSkipReason =
   | "NO_COMPATIBLE_PROVIDER"
   | "PROVIDER_UNHEALTHY"
   | "BUDGET_EXCEEDED"
+  /** Owner-paid grantee spend cap for this exact grant is exhausted. */
+  | "GRANTEE_BUDGET_EXCEEDED"
   | "PROTECTION_POLICY_MISSING"
   /**
    * Transient: no provider attempt could be sent right now (fence allocation,
@@ -2983,6 +2985,10 @@ export async function dispatchPublicOverflow(
         providerModelId: target.providerModelId,
         credentialId: target.credential.id,
         poolId: request.ownKeyProviderModelId ? undefined : request.poolId,
+        poolGrantId:
+          request.ownKeyProviderModelId || request.externalConsent.requesterIsOwner
+            ? undefined
+            : (request.externalConsent.accessGrantId ?? undefined),
         requestId: request.requestId,
         attemptId,
         fencingToken,
@@ -3980,7 +3986,9 @@ export async function dispatchPublicOverflow(
       lastAdmission && !lastAdmission.admitted
         ? lastAdmission.reason === "PROTECTION_POLICY_MISSING"
           ? "PROTECTION_POLICY_MISSING"
-          : "BUDGET_EXCEEDED"
+          : lastAdmission.reason === "GRANTEE_BUDGET_EXCEEDED"
+            ? "GRANTEE_BUDGET_EXCEEDED"
+            : "BUDGET_EXCEEDED"
         : (lastSendFailure ?? "PROVIDER_UNAVAILABLE"),
   };
 }

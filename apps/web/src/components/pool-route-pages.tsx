@@ -865,6 +865,18 @@ function protectionOverrideLabel(
   return t("dashboard:pools.grantRouting.percentValue", { percent });
 }
 
+function spendCapLabel(
+  spend: PoolGrantRow["fallbackSpend"],
+  t: ReturnType<typeof useTranslation>["t"],
+): string {
+  if (!spend) return t("dashboard:pools.grantRouting.spendCapNone");
+  return t("dashboard:pools.grantRouting.spendCapSummary", {
+    limit: spend.limit,
+    currency: spend.currency,
+    period: t(`dashboard:providers.enums.${spend.period}`),
+  });
+}
+
 function PoolGrantsSection({
   pool,
   openGrant,
@@ -906,6 +918,7 @@ function PoolGrantsSection({
                       grant.queuePriority === null
                         ? t("dashboard:pools.grantRouting.inherit")
                         : grant.queuePriority,
+                    spendCap: spendCapLabel(grant.fallbackSpend, t),
                   })}
                 </span>
               </div>
@@ -997,6 +1010,10 @@ function PoolGrantRoutingForm({
       protectionPercent: grant.protectionOverridePercent || 50,
       priorityMode: (grant.queuePriority === null ? "INHERIT" : "SET") as "INHERIT" | "SET",
       queuePriority: grant.queuePriority ?? 16,
+      spendMode: (grant.fallbackSpend == null ? "NONE" : "SET") as "NONE" | "SET",
+      spendLimit: grant.fallbackSpend?.limit ?? "10",
+      spendCurrency: grant.fallbackSpend?.currency ?? "USD",
+      spendPeriod: (grant.fallbackSpend?.period ?? "UTC_MONTH") as "UTC_DAY" | "UTC_MONTH",
     },
     validators: {
       // A hidden field (its mode not selected) is never validated.
@@ -1006,6 +1023,10 @@ function PoolGrantRoutingForm({
           protectionPercent: z.number(),
           priorityMode: z.enum(["INHERIT", "SET"]),
           queuePriority: z.number(),
+          spendMode: z.enum(["NONE", "SET"]),
+          spendLimit: z.string(),
+          spendCurrency: z.string(),
+          spendPeriod: z.enum(["UTC_DAY", "UTC_MONTH"]),
         })
         .refine(
           (value) =>
@@ -1020,6 +1041,13 @@ function PoolGrantRoutingForm({
             (Number.isInteger(value.queuePriority) &&
               value.queuePriority >= 0 &&
               value.queuePriority <= 31),
+        )
+        .refine(
+          (value) =>
+            value.spendMode !== "SET" ||
+            (/^(?:0|[1-9]\d*)(?:\.\d{1,9})?$/u.test(value.spendLimit) &&
+              value.spendLimit !== "0" &&
+              /^[A-Z]{3}$/u.test(value.spendCurrency)),
         ),
     },
     onSubmit: async ({ value }) => {
@@ -1034,6 +1062,14 @@ function PoolGrantRoutingForm({
                 ? 0
                 : value.protectionPercent,
           queuePriority: value.priorityMode === "INHERIT" ? null : value.queuePriority,
+          fallbackSpend:
+            value.spendMode === "NONE"
+              ? null
+              : {
+                  limit: value.spendLimit,
+                  currency: value.spendCurrency,
+                  period: value.spendPeriod,
+                },
         })
         .catch(() => undefined);
     },
@@ -1120,6 +1156,71 @@ function PoolGrantRoutingForm({
             ) : null}
             <p className="text-xs text-muted-foreground">
               {t("dashboard:pools.grantRouting.priorityHint")}
+            </p>
+          </div>
+        )}
+      </form.Field>
+      <form.Field name="spendMode">
+        {(modeField) => (
+          <div className="min-w-0 space-y-2">
+            <Label htmlFor={`grant-spend-${grant.id}`}>
+              {t("dashboard:pools.grantRouting.spendCap")}
+            </Label>
+            <select
+              id={`grant-spend-${grant.id}`}
+              className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+              value={modeField.state.value}
+              onChange={(event) => modeField.handleChange(event.target.value as "NONE" | "SET")}
+            >
+              <option value="NONE">{t("dashboard:pools.grantRouting.spendCapNone")}</option>
+              <option value="SET">{t("dashboard:pools.grantRouting.spendCapSet")}</option>
+            </select>
+            {modeField.state.value === "SET" ? (
+              <div className="grid min-w-0 gap-2 sm:grid-cols-3">
+                <form.Field name="spendLimit">
+                  {(field) => (
+                    <Input
+                      className="min-h-11 min-w-0"
+                      value={field.state.value}
+                      onChange={(event) => field.handleChange(event.target.value)}
+                      aria-label={t("dashboard:pools.grantRouting.spendLimit")}
+                    />
+                  )}
+                </form.Field>
+                <form.Field name="spendCurrency">
+                  {(field) => (
+                    <Input
+                      className="min-h-11 min-w-0 uppercase"
+                      maxLength={3}
+                      value={field.state.value}
+                      onChange={(event) => field.handleChange(event.target.value.toUpperCase())}
+                      aria-label={t("dashboard:pools.grantRouting.spendCurrency")}
+                    />
+                  )}
+                </form.Field>
+                <form.Field name="spendPeriod">
+                  {(field) => (
+                    <select
+                      className="h-11 min-w-0 rounded-md border bg-transparent px-3 text-sm"
+                      value={field.state.value}
+                      onChange={(event) =>
+                        field.handleChange(event.target.value as "UTC_DAY" | "UTC_MONTH")
+                      }
+                      aria-label={t("dashboard:pools.grantRouting.spendPeriod")}
+                    >
+                      <option value="UTC_DAY">
+                        {t("dashboard:pools.grantRouting.spendPeriodDay")}
+                      </option>
+                      <option value="UTC_MONTH">
+                        {t("dashboard:pools.grantRouting.spendPeriodMonth")}
+                      </option>
+                    </select>
+                  )}
+                </form.Field>
+              </div>
+            ) : null}
+            <p className="text-xs text-muted-foreground">
+              {t("dashboard:pools.grantRouting.spendCapHint")}
             </p>
           </div>
         )}

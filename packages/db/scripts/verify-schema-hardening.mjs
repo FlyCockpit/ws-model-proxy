@@ -83,6 +83,13 @@ const requiredFragments = [
   "enforce_provider_credential_account_consistency",
   "enforce_provider_budget_graph_consistency",
   "enforce_provider_budget_history_transitions",
+  "provider_budget_policy_grant_version_unique",
+  "provider_budget_policy_one_active_grant",
+  'OR ("scopeType" = \'POOL_GRANT\' AND "poolGrantId" IS NOT NULL',
+  "budget policy grant must belong to the pool owner",
+  'ALTER TABLE provider_budget_policy ALTER COLUMN "providerAccountId" DROP NOT NULL',
+  'ALTER TABLE provider_budget_policy ADD COLUMN IF NOT EXISTS "poolGrantId" TEXT',
+  "budget reservation credential must match the reservation account",
   "enforce_provider_budget_reservation_transition",
   "provider_pricing_version_shape_check",
   "enforce_provider_pricing_version_immutability",
@@ -1799,6 +1806,35 @@ try {
     INSERT INTO provider_budget_policy
       (id, "createdAt", "updatedAt", "userId", "scopeType", "providerAccountId")
     VALUES ('budget-policy-a', NOW(), NOW(), 'owner-a', 'PROVIDER_ACCOUNT', 'provider-account-a')
+  `);
+  await expectConstraintFailure(`
+    INSERT INTO provider_budget_policy
+      (id, "createdAt", "updatedAt", "userId", "scopeType", "poolId", "poolGrantId")
+    VALUES ('bad-grant-policy-account', NOW(), NOW(), 'owner-a', 'POOL_GRANT',
+      'pool-a', 'sticky-provider-grant')
+  `);
+  await expectConstraintFailure(`
+    INSERT INTO provider_budget_policy
+      (id, "createdAt", "updatedAt", "userId", "scopeType", "providerAccountId", "poolId")
+    VALUES ('bad-grant-policy-keys', NOW(), NOW(), 'owner-a', 'POOL_GRANT',
+      'provider-account-a', 'pool-a')
+  `);
+  await client.query(`
+    INSERT INTO pool_grant
+      (id, "createdAt", "updatedAt", "poolId", "ownerUserId", "granteeUserId")
+    VALUES ('budget-grant-a', NOW(), NOW(), 'pool-a', 'owner-a', 'owner-b')
+  `);
+  await expectConstraintFailure(`
+    INSERT INTO provider_budget_policy
+      (id, "createdAt", "updatedAt", "userId", "scopeType", "poolId", "poolGrantId")
+    VALUES ('bad-grant-policy-owner', NOW(), NOW(), 'owner-b', 'POOL_GRANT',
+      'pool-a', 'budget-grant-a')
+  `);
+  await client.query(`
+    INSERT INTO provider_budget_policy
+      (id, "createdAt", "updatedAt", "userId", "scopeType", "poolId", "poolGrantId")
+    VALUES ('budget-grant-policy-a', NOW(), NOW(), 'owner-a', 'POOL_GRANT',
+      'pool-a', 'budget-grant-a')
   `);
   await expectConstraintFailure(`
     INSERT INTO provider_budget_rule

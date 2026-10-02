@@ -21,9 +21,21 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 }));
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
+  class TestDecimal {
+    readonly value: string;
+    constructor(value: string | number) {
+      this.value = String(value);
+    }
+    toString() {
+      return this.value;
+    }
+  }
   return {
     default: mockDeep(),
-    Prisma: { TransactionIsolationLevel: { Serializable: "Serializable" } },
+    Prisma: {
+      Decimal: TestDecimal,
+      TransactionIsolationLevel: { Serializable: "Serializable" },
+    },
   };
 });
 vi.mock("../lib/provider-egress", async (importOriginal) => ({
@@ -63,6 +75,7 @@ const db = prisma as unknown as {
   executionTarget: { create: MockInstance; findUnique: MockInstance };
   inferenceCapacity: { updateMany: MockInstance };
   modelPool: { findFirst: MockInstance; findMany: MockInstance };
+  poolGrant: { findFirst: MockInstance };
   poolMember: { findMany: MockInstance };
   providerCredential: {
     count: MockInstance;
@@ -929,6 +942,87 @@ describe("providerManagementRouter security boundary", () => {
     });
   });
 
+  it("creates a POOL_GRANT spend cap keyed by poolGrantId without an account", async () => {
+    envMock.enabled = true;
+    db.poolGrant.findFirst.mockResolvedValue({ id: "grant", poolId: "pool" });
+    db.providerBudgetPolicy.create.mockResolvedValue({ id: "grant-cap", Rules: [] });
+    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+    const client = createRouterClient(providerManagementRouter, { context });
+    await client.createBudgetPolicy({
+      scopeType: "POOL_GRANT",
+      providerAccountId: null,
+      providerModelId: null,
+      poolId: "pool",
+      poolGrantId: "grant",
+      active: true,
+      rules: [
+        {
+          metric: "SPEND",
+          period: "UTC_MONTH",
+          mode: "LIMITED",
+          limitValue: "25.5",
+          currency: "USD",
+        },
+      ],
+    });
+    expect(db.providerBudgetPolicy.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        scopeType: "POOL_GRANT",
+        providerAccountId: null,
+        poolId: "pool",
+        providerModelId: null,
+        poolGrantId: "grant",
+        active: true,
+      }),
+      include: { Rules: true },
+    });
+    expect(db.providerAuditEvent.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        userId: "owner",
+        action: "BUDGET_CREATED",
+        subjectId: "grant-cap",
+      }),
+    });
+    await expect(
+      client.createBudgetPolicy({
+        scopeType: "POOL_GRANT",
+        providerAccountId: "account",
+        providerModelId: null,
+        poolId: "pool",
+        poolGrantId: "grant",
+        active: true,
+        rules: [
+          {
+            metric: "SPEND",
+            period: "UTC_MONTH",
+            mode: "LIMITED",
+            limitValue: "25.5",
+            currency: "USD",
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(
+      client.createBudgetPolicy({
+        scopeType: "POOL_GRANT",
+        providerAccountId: null,
+        providerModelId: null,
+        poolId: "pool",
+        poolGrantId: "grant",
+        active: true,
+        rules: [
+          {
+            metric: "CONCURRENCY",
+            period: "PER_ATTEMPT",
+            mode: "LIMITED",
+            limitValue: "1",
+            currency: null,
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+
   it("owner-scopes audit history and never returns credential envelopes", async () => {
     envMock.enabled = true;
     db.providerAuditEvent.findMany.mockResolvedValue([
@@ -1581,7 +1675,10 @@ describe("providerManagementRouter security boundary", () => {
     const client = createRouterClient(providerManagementRouter, { context });
     await expect(client.listBudgetPolicies()).resolves.toEqual([]);
     expect(db.providerBudgetPolicy.findMany).toHaveBeenCalledWith({
-      where: { userId: "owner", ProviderAccount: { deletedAt: null } },
+      where: {
+        userId: "owner",
+        OR: [{ scopeType: "POOL_GRANT" }, { ProviderAccount: { deletedAt: null } }],
+      },
       include: { Rules: true },
     });
   });

@@ -3188,6 +3188,7 @@ describe("own-key dispatch and authoritative send claim", () => {
     expect(admitProviderBudget).toHaveBeenCalledWith(
       expect.objectContaining({ userId: "grantee", poolId: undefined }),
     );
+    expect(vi.mocked(admitProviderBudget).mock.calls[0]?.[0].poolGrantId).toBeUndefined();
     expect(db.cacheAffinityRecord.findMany).not.toHaveBeenCalled();
     expect(rememberAffinity).not.toHaveBeenCalled();
     expect(locks.map((sql) => sql.match(/FROM ([a-z_]+)/)?.[1])).toEqual([
@@ -5330,6 +5331,86 @@ describe("OpenRouter owner-paid settlement", () => {
     }
   });
 
+  it("does not charge a grant spend cap for the pool owner's own traffic", async () => {
+    try {
+      await settleOwnerStream("openrouter", [Buffer.from("data: [DONE]\n\n")], "owner");
+      expect(vi.mocked(admitProviderBudget).mock.calls[0]?.[0].poolGrantId).toBeUndefined();
+    } finally {
+      resetConsentState();
+    }
+  });
+
+  it("returns GRANTEE_BUDGET_EXCEEDED when the grant spend cap refuses admission", async () => {
+    vi.mocked(admitProviderBudget).mockResolvedValueOnce({
+      admitted: false,
+      reason: "GRANTEE_BUDGET_EXCEEDED",
+      policyId: "grant-cap",
+      ruleId: "rule",
+    });
+    db.modelPool.findFirst.mockResolvedValue({
+      ...dispatchPoolFixture(),
+      fallbackForGrantees: true,
+    });
+    consentState.token = { ...consentState.token, userId: "grantee" };
+    consentState.grant = currentGrant();
+    const tx = {
+      ...consentDelegates(),
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+        mockRequesterValidityQuery(strings, values, consentDelegates()),
+      ),
+      providerAccount: {
+        findFirst: vi
+          .fn()
+          .mockResolvedValue({ providerType: "openai", allowDataCollection: false }),
+      },
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "credential-heartbeat",
+          credentialType: "BEARER",
+          aadVersion: 1,
+          algorithm: "AES-256-GCM",
+          keyVersion: "v1",
+          ciphertext: new Uint8Array(),
+          nonce: new Uint8Array(),
+          authTag: new Uint8Array(),
+        }),
+        update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    try {
+      await expect(
+        dispatchPublicOverflow({
+          userId: "owner",
+          poolId: "pool",
+          requestId: "grant-cap-hit",
+          reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+          ...ownerConsentFields("grantee"),
+          requestedProtocol: "openai",
+          requestedSurface: "openai-chat",
+          stream: false,
+          requiredFeatures: [],
+          path: "/v1/chat/completions",
+          headers: new Headers({ "content-type": "application/json" }),
+          body: new TextEncoder().encode('{"model":"pool","messages":[]}'),
+          signal: new AbortController().signal,
+          liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+          releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+          adaptationEnabled: false,
+          retrySafe: false,
+        }),
+      ).resolves.toEqual({ dispatched: false, reason: "GRANTEE_BUDGET_EXCEEDED" });
+      expect(providerHttpsRequest).not.toHaveBeenCalled();
+      expect(vi.mocked(admitProviderBudget)).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: "owner", poolId: "pool", poolGrantId: GRANT_ID }),
+      );
+    } finally {
+      resetConsentState();
+    }
+  });
+
   // #62 AC: pool fallback settles against the pool owner's budget even when a
   // grantee made the request (own-key settles against the requester, above).
   it("settles a grantee's OpenRouter pool fallback against the owner's budget", async () => {
@@ -5347,7 +5428,7 @@ describe("OpenRouter owner-paid settlement", () => {
       });
       expect(providerBillableTokens(settled.usage)).toBe(1_280n);
       expect(vi.mocked(admitProviderBudget)).toHaveBeenLastCalledWith(
-        expect.objectContaining({ userId: "owner", poolId: "pool" }),
+        expect.objectContaining({ userId: "owner", poolId: "pool", poolGrantId: GRANT_ID }),
       );
     } finally {
       resetConsentState();

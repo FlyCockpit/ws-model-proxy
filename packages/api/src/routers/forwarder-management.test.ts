@@ -107,7 +107,12 @@ const db = prisma as unknown as {
   executionTarget: { findMany: MockInstance; findUnique: MockInstance; upsert: MockInstance };
   inferenceCapacity: { findMany: MockInstance; updateMany: MockInstance; upsert: MockInstance };
   providerModel: { findFirst: MockInstance; findMany: MockInstance };
-  providerBudgetPolicy: { create: MockInstance; findFirst: MockInstance; findMany: MockInstance };
+  providerBudgetPolicy: {
+    create: MockInstance;
+    findFirst: MockInstance;
+    findMany: MockInstance;
+    update: MockInstance;
+  };
   providerAuditEvent: { create: MockInstance; findFirst: MockInstance };
   poolGrant: {
     upsert: MockInstance;
@@ -2364,6 +2369,72 @@ describe("forwarderManagementRouter", () => {
       client().updatePoolGrant({ poolId: "pool-id", grantId: "grant-id", queuePriority: 31 }),
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
     expect(db.poolGrant.updateMany).toHaveBeenCalledTimes(writes);
+  });
+
+  it("lets the pool owner set and clear a per-grant owner-paid spend cap", async () => {
+    db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
+    db.$queryRaw.mockResolvedValue([{ id: "pool-id" }]);
+    db.poolGrant.updateMany.mockResolvedValue({ count: 1 });
+    db.providerBudgetPolicy.findFirst.mockResolvedValue(null);
+    db.providerBudgetPolicy.create.mockResolvedValue({ id: "grant-cap" });
+    db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
+    db.poolGrant.findUniqueOrThrow.mockResolvedValue({
+      id: "grant-id",
+      poolId: "pool-id",
+      granteeUserId: "grantee-id",
+      protectionOverridePercent: null,
+      queuePriority: null,
+      BudgetPolicies: [{ Rules: [{ limitValue: "25.5", currency: "USD", period: "UTC_MONTH" }] }],
+    });
+
+    await expect(
+      client().updatePoolGrant({
+        poolId: "pool-id",
+        grantId: "grant-id",
+        fallbackSpend: { limit: "25.5", currency: "USD", period: "UTC_MONTH" },
+      }),
+    ).resolves.toMatchObject({
+      fallbackSpend: { limit: "25.5", currency: "USD", period: "UTC_MONTH" },
+    });
+    expect(db.providerBudgetPolicy.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          scopeType: "POOL_GRANT",
+          poolGrantId: "grant-id",
+          poolId: "pool-id",
+          providerAccountId: null,
+          active: true,
+        }),
+      }),
+    );
+    expect(fenceCalls()).toEqual([
+      ["00:owner:user-id"],
+      ["03:provider-budget-grant:user-id:grant-id"],
+    ]);
+    expect(lastFenceOrder()).toBeLessThan(firstRowLockOrder());
+
+    db.providerBudgetPolicy.findFirst.mockResolvedValue({
+      id: "grant-cap",
+      active: true,
+      version: 1,
+      Rules: [{ limitValue: "25.5", currency: "USD", period: "UTC_MONTH" }],
+    });
+    db.providerBudgetPolicy.update.mockResolvedValue({ id: "grant-cap" });
+    db.poolGrant.findUniqueOrThrow.mockResolvedValue({
+      id: "grant-id",
+      poolId: "pool-id",
+      granteeUserId: "grantee-id",
+      protectionOverridePercent: null,
+      queuePriority: null,
+      BudgetPolicies: [],
+    });
+    await expect(
+      client().updatePoolGrant({ poolId: "pool-id", grantId: "grant-id", fallbackSpend: null }),
+    ).resolves.toMatchObject({ fallbackSpend: null });
+    expect(db.providerBudgetPolicy.update).toHaveBeenCalledWith({
+      where: { id: "grant-cap" },
+      data: { active: false, deactivatedAt: expect.any(Date) },
+    });
   });
 
   it("rejects an external wait longer than the pool's local wait budget", async () => {
@@ -6335,6 +6406,7 @@ describe("MCP inventory summaries", () => {
             granteeName: "G",
             protectionOverridePercent: null,
             queuePriority: null,
+            fallbackSpend: null,
           },
         ],
         members: [

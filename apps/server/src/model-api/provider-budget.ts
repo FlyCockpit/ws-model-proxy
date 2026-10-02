@@ -39,6 +39,8 @@ export interface ProviderBudgetAttempt {
   providerModelId: string;
   credentialId?: string;
   poolId?: string;
+  /** Exact live grant for owner-paid grantee traffic; never own-key or owner. */
+  poolGrantId?: string;
   requestId: string;
   attemptId: string;
   fencingToken: bigint;
@@ -52,6 +54,7 @@ export type ProviderBudgetAdmission =
       admitted: false;
       reason:
         | "BUDGET_EXCEEDED"
+        | "GRANTEE_BUDGET_EXCEEDED"
         | "PROVIDER_CONCURRENCY_EXCEEDED"
         | "PROTECTION_POLICY_MISSING"
         | "CURRENCY_UNAVAILABLE"
@@ -195,6 +198,21 @@ function canonicalPayloadHash(value: unknown): string {
   return createHash("sha256")
     .update(JSON.stringify(normalize(value)))
     .digest("hex");
+}
+
+function grantCapDenial(
+  policy: { id: string; scopeType: string },
+  ruleId: string,
+  reason: Exclude<ProviderBudgetAdmission, { admitted: true }>["reason"],
+): Exclude<ProviderBudgetAdmission, { admitted: true }> {
+  if (
+    policy.scopeType === "POOL_GRANT" &&
+    (reason === "BUDGET_EXCEEDED" ||
+      reason === "CURRENCY_UNAVAILABLE" ||
+      reason === "PRICING_UNAVAILABLE")
+  )
+    return { admitted: false, reason: "GRANTEE_BUDGET_EXCEEDED", policyId: policy.id, ruleId };
+  return { admitted: false, reason, policyId: policy.id, ruleId };
 }
 
 /**
@@ -344,13 +362,15 @@ export async function admitProviderBudget(
     attempt.liability.spend === undefined ? undefined : decimal(attempt.liability.spend);
   return serializedByAdvisoryLocks(async (tx) => {
     // Writer class H (@ws-model-proxy/db/capacity-lock-order): fences only,
-    // attempt then account then (below) policy, before any row lock or
-    // write. The provider account and model are read without a lock, and the
-    // attempt, reservation and ledger rows it writes have no foreign key into
-    // the provider graph, so no insert takes an implicit account/model lock.
+    // attempt then account then grant (same level 03, "account" < "grant")
+    // then (below) policy, before any row lock or write. The provider account
+    // and model are read without a lock, and the attempt, reservation and
+    // ledger rows it writes have no foreign key into the provider graph, so
+    // no insert takes an implicit account/model lock.
     await acquireFences(tx, [
       fences.budgetAttempt(attempt.attemptId),
       fences.budgetAccount(attempt.userId, attempt.providerAccountId),
+      ...(attempt.poolGrantId ? [fences.budgetGrant(attempt.userId, attempt.poolGrantId)] : []),
     ]);
     // This statement runs after possibly waiting for the account lock. Use the
     // actual post-wait database clock, not this transaction's start time, when
@@ -448,26 +468,46 @@ export async function admitProviderBudget(
         return { admitted: false, reason: "PROVIDER_CONCURRENCY_EXCEEDED" };
       }
     }
-    const policies = await tx.providerBudgetPolicy.findMany({
-      where: {
-        userId: attempt.userId,
-        providerAccountId: attempt.providerAccountId,
-        active: true,
-        OR: [
-          { scopeType: "PROVIDER_ACCOUNT", poolId: null, providerModelId: null },
-          ...(attempt.poolId
-            ? [
-                {
-                  scopeType: "POOL_PROVIDER_MODEL" as const,
-                  poolId: attempt.poolId,
-                  providerModelId: attempt.providerModelId,
-                },
-              ]
-            : []),
-        ],
-      },
-      include: { Rules: true },
-      orderBy: { id: "asc" },
+    const policies = (
+      await tx.providerBudgetPolicy.findMany({
+        where: {
+          userId: attempt.userId,
+          active: true,
+          OR: [
+            {
+              scopeType: "PROVIDER_ACCOUNT",
+              providerAccountId: attempt.providerAccountId,
+              poolId: null,
+              providerModelId: null,
+            },
+            ...(attempt.poolId
+              ? [
+                  {
+                    scopeType: "POOL_PROVIDER_MODEL" as const,
+                    providerAccountId: attempt.providerAccountId,
+                    poolId: attempt.poolId,
+                    providerModelId: attempt.providerModelId,
+                  },
+                ]
+              : []),
+            ...(attempt.poolGrantId && attempt.poolId
+              ? [
+                  {
+                    scopeType: "POOL_GRANT" as const,
+                    poolGrantId: attempt.poolGrantId,
+                    poolId: attempt.poolId,
+                    providerAccountId: null,
+                  },
+                ]
+              : []),
+          ],
+        },
+        include: { Rules: true },
+      })
+    ).sort((left, right) => {
+      const rank = (scopeType: string) =>
+        scopeType === "POOL_GRANT" ? 0 : scopeType === "POOL_PROVIDER_MODEL" ? 1 : 2;
+      return rank(left.scopeType) - rank(right.scopeType) || left.id.localeCompare(right.id);
     });
     // Public egress is fail-closed: an account-wide policy may add additional
     // limits, but it does not constitute consent for a particular pool/model
@@ -519,28 +559,17 @@ export async function admitProviderBudget(
         if (rule.mode === "UNLIMITED") continue;
         const value = reservationValue(rule.metric, attempt.liability);
         if (value === null) {
-          return {
-            admitted: false,
-            reason: rule.metric === "TOKENS" ? "TOKEN_BOUND_UNAVAILABLE" : "PRICING_UNAVAILABLE",
-            policyId: policy.id,
-            ruleId: rule.id,
-          };
+          return grantCapDenial(
+            policy,
+            rule.id,
+            rule.metric === "TOKENS" ? "TOKEN_BOUND_UNAVAILABLE" : "PRICING_UNAVAILABLE",
+          );
         }
         if (rule.metric === "SPEND" && rule.currency !== currency) {
-          return {
-            admitted: false,
-            reason: "CURRENCY_UNAVAILABLE",
-            policyId: policy.id,
-            ruleId: rule.id,
-          };
+          return grantCapDenial(policy, rule.id, "CURRENCY_UNAVAILABLE");
         }
         if (rule.metric === "SPEND" && !pricingVersion) {
-          return {
-            admitted: false,
-            reason: "PRICING_UNAVAILABLE",
-            policyId: policy.id,
-            ruleId: rule.id,
-          };
+          return grantCapDenial(policy, rule.id, "PRICING_UNAVAILABLE");
         }
         if (rule.metric === "SPEND") {
           const pricing = await tx.providerPricingVersion.findFirst({
@@ -557,13 +586,7 @@ export async function admitProviderBudget(
             },
             select: { id: true },
           });
-          if (!pricing)
-            return {
-              admitted: false,
-              reason: "PRICING_UNAVAILABLE",
-              policyId: policy.id,
-              ruleId: rule.id,
-            };
+          if (!pricing) return grantCapDenial(policy, rule.id, "PRICING_UNAVAILABLE");
         }
         const window = budgetWindow(rule.period, policy.activatedAt, now);
         const aggregate = await tx.providerBudgetReservation.aggregate({
@@ -627,12 +650,7 @@ export async function admitProviderBudget(
           existing.length === 0 &&
           (!rule.limitValue || consumed.plus(value).greaterThan(rule.limitValue))
         ) {
-          return {
-            admitted: false,
-            reason: "BUDGET_EXCEEDED",
-            policyId: policy.id,
-            ruleId: rule.id,
-          };
+          return grantCapDenial(policy, rule.id, "BUDGET_EXCEEDED");
         }
         pending.push({ policy, rule, value, ...window });
       }

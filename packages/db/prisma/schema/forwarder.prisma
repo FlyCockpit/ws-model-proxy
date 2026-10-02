@@ -60,6 +60,8 @@ enum BudgetLimitMode {
 enum BudgetScopeType {
   PROVIDER_ACCOUNT
   POOL_PROVIDER_MODEL
+  /// Per-grantee owner-paid `:external` spend cap, keyed by poolGrantId.
+  POOL_GRANT
 }
 
 enum BudgetMetric {
@@ -676,22 +678,27 @@ model ProviderBudgetPolicy {
   updatedAt         DateTime             @default(now()) @updatedAt
   userId            String
   scopeType         BudgetScopeType
-  providerAccountId String
+  /// Null only for POOL_GRANT (a grant-wide cap, not an account attachment).
+  providerAccountId String?
   poolId            String?
   providerModelId   String?
+  /// Set only for POOL_GRANT; the exact live grant the cap applies to.
+  poolGrantId       String?
   version           Int                  @default(1)
   active            Boolean              @default(false)
   activatedAt       DateTime?
   deactivatedAt     DateTime?
   User              User                 @relation("ProviderBudgetPolicyOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  ProviderAccount   ProviderAccount      @relation(fields: [providerAccountId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  ProviderAccount   ProviderAccount?     @relation(fields: [providerAccountId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Pool              ModelPool?           @relation(fields: [poolId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
   ProviderModel     ProviderModel?       @relation(fields: [providerModelId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  PoolGrant         PoolGrant?           @relation(fields: [poolGrantId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Rules             ProviderBudgetRule[]
 
   @@unique([id, userId])
   @@unique([userId, scopeType, providerAccountId, poolId, providerModelId, version])
   @@index([userId, active])
+  @@index([poolGrantId])
   @@map("provider_budget_policy")
 }
 
@@ -1570,6 +1577,7 @@ model PoolGrant {
   Owner                     User                     @relation("PoolGrantOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   Grantee                   User                     @relation("PoolGrantGrantee", fields: [granteeUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   FallbackPreferences       PoolFallbackPreference[]
+  BudgetPolicies            ProviderBudgetPolicy[]
 
   @@unique([poolId, granteeUserId])
   @@unique([id, poolId, granteeUserId])

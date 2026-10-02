@@ -1374,4 +1374,96 @@ integration("provider budget admission and reconciliation", () => {
       expect(ledger).toMatchObject({ terminalReason: reason, billableTotal: 3n });
     },
   );
+
+  it("applies a POOL_GRANT spend cap to grantee traffic before owner rules", async () => {
+    if (!db) return;
+    const row = await fixture({ attachment: true, noPolicy: true });
+    const grantee = await db.user.create({
+      data: { name: "Grant cap grantee", email: `grantee-${crypto.randomUUID()}@example.test` },
+    });
+    const grant = await db.poolGrant.create({
+      data: { poolId: row.poolId!, ownerUserId: row.user.id, granteeUserId: grantee.id },
+    });
+    await policy(row, [{ metric: "CONCURRENCY", period: "PER_ATTEMPT", mode: "UNLIMITED" }], {
+      poolId: row.poolId,
+    });
+    await policy(row, [{ metric: "SPEND", period: "UTC_DAY", limitValue: "10", currency: "USD" }]);
+    await db.providerBudgetPolicy.create({
+      data: {
+        userId: row.user.id,
+        scopeType: "POOL_GRANT",
+        providerAccountId: null,
+        poolId: row.poolId,
+        providerModelId: null,
+        poolGrantId: grant.id,
+        active: true,
+        activatedAt: new Date(Date.now() - 86_400_000),
+        Rules: {
+          create: {
+            metric: "SPEND",
+            period: "UTC_DAY",
+            mode: "LIMITED",
+            limitValue: "5",
+            currency: "USD",
+          },
+        },
+      },
+    });
+    await db.providerPricingVersion.create({
+      data: {
+        userId: row.user.id,
+        providerAccountId: row.account.id,
+        providerModelId: row.model.id,
+        version: "price-v1",
+        currency: "USD",
+        status: "ACTIVE",
+        activatedAt: new Date(Date.now() - 1_000),
+        pricing: { input: "1" },
+        effectiveAt: new Date(Date.now() - 1_000),
+      },
+    });
+    const spendAttempt = (id: string, spend: string, poolGrantId?: string) => ({
+      ...attempt(row, id),
+      poolGrantId,
+      liability: {
+        spend,
+        currency: "USD",
+        pricingVersion: "price-v1",
+        accountingVersion: "usage-v1",
+      },
+    });
+
+    await expect(
+      service.admitProviderBudget(spendAttempt(`owner-${crypto.randomUUID()}`, "6")),
+    ).resolves.toMatchObject({ admitted: true });
+    await expect(
+      service.admitProviderBudget(
+        spendAttempt(`grantee-over-${crypto.randomUUID()}`, "6", grant.id),
+      ),
+    ).resolves.toMatchObject({ admitted: false, reason: "GRANTEE_BUDGET_EXCEEDED" });
+
+    const underGrant = spendAttempt(`grantee-under-${crypto.randomUUID()}`, "4", grant.id);
+    const admitted = await service.admitProviderBudget(underGrant);
+    expect(admitted.admitted && admitted.reservationIds.length).toBeGreaterThanOrEqual(2);
+    await service.reconcileProviderBudget({
+      ...underGrant,
+      reason: "COMPLETED",
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT",
+      usage: {
+        accountingVersion: "usage-v1",
+        confidence: "REPORTED",
+        categoriesComplete: false,
+        observationComplete: true,
+        reportedCost: "4",
+        reportedCostCurrency: "USD",
+        reportedCostPricingVersion: "price-v1",
+      },
+    });
+    await expect(
+      service.admitProviderBudget(
+        spendAttempt(`grantee-hit-${crypto.randomUUID()}`, "2", grant.id),
+      ),
+    ).resolves.toMatchObject({ admitted: false, reason: "GRANTEE_BUDGET_EXCEEDED" });
+  });
 });

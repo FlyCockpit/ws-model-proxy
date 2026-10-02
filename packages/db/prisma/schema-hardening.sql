@@ -2177,11 +2177,20 @@ ALTER TABLE provider_credential ADD CONSTRAINT provider_credential_shape_check C
     OR (status = 'REVOKED' AND "revokedAt" IS NOT NULL))
 );
 
+-- POOL_GRANT is grant-wide (no account attachment). Additive: existing rows
+-- keep their account; new grant-cap rows store NULL.
+ALTER TABLE provider_budget_policy ADD COLUMN IF NOT EXISTS "poolGrantId" TEXT;
+ALTER TABLE provider_budget_policy ALTER COLUMN "providerAccountId" DROP NOT NULL;
+
 ALTER TABLE provider_budget_policy DROP CONSTRAINT IF EXISTS provider_budget_policy_scope_check;
 ALTER TABLE provider_budget_policy ADD CONSTRAINT provider_budget_policy_scope_check CHECK (
   version > 0
-  AND (("scopeType" = 'PROVIDER_ACCOUNT' AND "poolId" IS NULL AND "providerModelId" IS NULL)
-    OR ("scopeType" = 'POOL_PROVIDER_MODEL' AND "poolId" IS NOT NULL AND "providerModelId" IS NOT NULL))
+  AND (("scopeType" = 'PROVIDER_ACCOUNT' AND "poolId" IS NULL AND "providerModelId" IS NULL
+        AND "poolGrantId" IS NULL AND "providerAccountId" IS NOT NULL)
+    OR ("scopeType" = 'POOL_PROVIDER_MODEL' AND "poolId" IS NOT NULL AND "providerModelId" IS NOT NULL
+        AND "poolGrantId" IS NULL AND "providerAccountId" IS NOT NULL)
+    OR ("scopeType" = 'POOL_GRANT' AND "poolGrantId" IS NOT NULL AND "poolId" IS NOT NULL
+        AND "providerModelId" IS NULL AND "providerAccountId" IS NULL))
   AND ((active AND "activatedAt" IS NOT NULL AND "deactivatedAt" IS NULL)
     OR (NOT active AND ("activatedAt" IS NULL OR "deactivatedAt" IS NOT NULL)))
 );
@@ -2192,12 +2201,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_account_version_unique
 CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_attachment_version_unique
   ON provider_budget_policy ("userId", "providerAccountId", "poolId", "providerModelId", version)
   WHERE "scopeType" = 'POOL_PROVIDER_MODEL';
+CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_grant_version_unique
+  ON provider_budget_policy ("userId", "poolGrantId", version)
+  WHERE "scopeType" = 'POOL_GRANT';
 CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_one_active_account
   ON provider_budget_policy ("userId", "providerAccountId")
   WHERE active AND "scopeType" = 'PROVIDER_ACCOUNT';
 CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_one_active_attachment
   ON provider_budget_policy ("userId", "providerAccountId", "poolId", "providerModelId")
   WHERE active AND "scopeType" = 'POOL_PROVIDER_MODEL';
+CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_one_active_grant
+  ON provider_budget_policy ("userId", "poolGrantId")
+  WHERE active AND "scopeType" = 'POOL_GRANT';
 
 ALTER TABLE provider_budget_rule DROP CONSTRAINT IF EXISTS provider_budget_rule_shape_check;
 ALTER TABLE provider_budget_rule ADD CONSTRAINT provider_budget_rule_shape_check CHECK (
@@ -2688,10 +2703,20 @@ RETURNS trigger LANGUAGE plpgsql AS $provider_budget_graph$
 DECLARE p RECORD; r RECORD; c RECORD;
 BEGIN
   IF TG_TABLE_NAME = 'provider_budget_policy' THEN
+    IF NEW."providerAccountId" IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM provider_account a WHERE a.id = NEW."providerAccountId"
+        AND a."userId" = NEW."userId") THEN
+      RAISE EXCEPTION 'budget policy account must belong to its owner' USING ERRCODE = '23514';
+    END IF;
     IF NEW."providerModelId" IS NOT NULL AND NOT EXISTS (
       SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
         AND m."userId" = NEW."userId" AND m."providerAccountId" = NEW."providerAccountId") THEN
       RAISE EXCEPTION 'budget policy model must belong to its provider account' USING ERRCODE = '23514';
+    END IF;
+    IF NEW."scopeType" = 'POOL_GRANT' AND NOT EXISTS (
+      SELECT 1 FROM pool_grant g WHERE g.id = NEW."poolGrantId"
+        AND g."poolId" = NEW."poolId" AND g."ownerUserId" = NEW."userId") THEN
+      RAISE EXCEPTION 'budget policy grant must belong to the pool owner' USING ERRCODE = '23514';
     END IF;
   ELSIF TG_TABLE_NAME = 'provider_attempt' THEN
     IF NOT EXISTS (SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
@@ -2720,17 +2745,21 @@ BEGIN
        OR p."userId" <> NEW."userId" OR p.version <> NEW."policyVersion"
        OR r.metric::text <> NEW.metric::text OR r.period::text <> NEW.period::text
        OR r.currency IS DISTINCT FROM NEW.currency
-       OR p."providerAccountId" <> NEW."providerAccountId"
+       OR (p."scopeType" <> 'POOL_GRANT'
+         AND p."providerAccountId" IS DISTINCT FROM NEW."providerAccountId")
        OR NEW."providerModelId" = ''
        OR (p."scopeType" = 'POOL_PROVIDER_MODEL'
          AND (p."poolId" IS DISTINCT FROM NEW."poolId"
-           OR p."providerModelId" IS DISTINCT FROM NEW."providerModelId")) THEN
+           OR p."providerModelId" IS DISTINCT FROM NEW."providerModelId"))
+       OR (p."scopeType" = 'POOL_GRANT'
+         AND p."poolId" IS DISTINCT FROM NEW."poolId") THEN
       RAISE EXCEPTION 'budget reservation must match its policy version and rule' USING ERRCODE = '23514';
     END IF;
     IF NEW."credentialId" IS NOT NULL THEN
       SELECT * INTO c FROM provider_credential WHERE id = NEW."credentialId";
-      IF c."userId" IS DISTINCT FROM NEW."userId" OR c."providerAccountId" IS DISTINCT FROM p."providerAccountId" THEN
-        RAISE EXCEPTION 'budget reservation credential must match policy account' USING ERRCODE = '23514';
+      IF c."userId" IS DISTINCT FROM NEW."userId"
+         OR c."providerAccountId" IS DISTINCT FROM NEW."providerAccountId" THEN
+        RAISE EXCEPTION 'budget reservation credential must match the reservation account' USING ERRCODE = '23514';
       END IF;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
@@ -2865,6 +2894,7 @@ BEGIN
        OR NEW."providerAccountId" IS DISTINCT FROM OLD."providerAccountId"
        OR NEW."poolId" IS DISTINCT FROM OLD."poolId"
        OR NEW."providerModelId" IS DISTINCT FROM OLD."providerModelId"
+       OR NEW."poolGrantId" IS DISTINCT FROM OLD."poolGrantId"
        OR NEW.version IS DISTINCT FROM OLD.version OR NEW."activatedAt" IS DISTINCT FROM OLD."activatedAt"
        OR NEW.active OR NEW."deactivatedAt" IS NULL THEN
       RAISE EXCEPTION 'activated provider budget policy is immutable except deactivation' USING ERRCODE = '55000';
@@ -2879,6 +2909,7 @@ BEGIN
        OR NEW."providerAccountId" IS DISTINCT FROM OLD."providerAccountId"
        OR NEW."poolId" IS DISTINCT FROM OLD."poolId"
        OR NEW."providerModelId" IS DISTINCT FROM OLD."providerModelId"
+       OR NEW."poolGrantId" IS DISTINCT FROM OLD."poolGrantId"
        OR NEW.version IS DISTINCT FROM OLD.version
        OR NOT NEW.active OR NEW."activatedAt" IS NULL OR NEW."deactivatedAt" IS NOT NULL THEN
       RAISE EXCEPTION 'provider budget policy permits only controlled activation' USING ERRCODE = '55000';
@@ -3243,7 +3274,7 @@ BEGIN
     ('provider_account', 'id,userId,currentCredentialId', ''),
     ('provider_model', 'id,userId,providerAccountId,upstreamModelId', ''),
     ('provider_credential', 'id,userId,providerAccountId,replacedById', ''),
-    ('provider_budget_policy', 'id,userId,scopeType,providerAccountId,poolId,providerModelId', ''),
+    ('provider_budget_policy', 'id,userId,scopeType,providerAccountId,poolId,providerModelId,poolGrantId', ''),
     ('provider_budget_rule', 'id,policyId', ''),
     ('provider_pricing_version', 'id,userId,providerAccountId,providerModelId', ''),
     ('pool_fallback_preference', 'id,userId,poolId,poolGrantId,providerModelId', '')

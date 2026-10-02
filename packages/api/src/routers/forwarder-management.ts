@@ -122,6 +122,11 @@ import {
   recordPoolFallbackAudit,
 } from "../lib/pool-fallback-settings";
 import {
+  poolGrantSpendCapSchema,
+  serializePoolGrantSpendCap,
+  upsertPoolGrantSpendCap,
+} from "../lib/pool-grant-spend-cap";
+import {
   assertRecommendedSurfaceServable,
   discoveredModelSurfaceCapabilities,
   providerModelSurfaceCapabilities,
@@ -1338,6 +1343,7 @@ function serializePool(row: ModelPoolRow) {
       granteeName: grant.Grantee.name,
       protectionOverridePercent: grant.protectionOverridePercent,
       queuePriority: grant.queuePriority,
+      fallbackSpend: serializePoolGrantSpendCap(grant.BudgetPolicies),
     })),
   };
 }
@@ -1356,6 +1362,7 @@ function serializePoolSummary(row: PoolSummaryRow) {
       granteeName: grant.Grantee.name,
       protectionOverridePercent: grant.protectionOverridePercent,
       queuePriority: grant.queuePriority,
+      fallbackSpend: serializePoolGrantSpendCap(grant.BudgetPolicies),
     })),
     members: row.PoolMembers.map((member) => {
       const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
@@ -1916,6 +1923,15 @@ const poolSelect = {
       protectionOverridePercent: true,
       queuePriority: true,
       Grantee: { select: { email: true, name: true } },
+      BudgetPolicies: {
+        where: { active: true, scopeType: "POOL_GRANT" },
+        select: {
+          Rules: {
+            where: { metric: "SPEND" },
+            select: { limitValue: true, currency: true, period: true },
+          },
+        },
+      },
     },
   },
 } satisfies Prisma.ModelPoolSelect;
@@ -1958,6 +1974,15 @@ const poolSummarySelect = {
       protectionOverridePercent: true,
       queuePriority: true,
       Grantee: { select: { email: true, name: true } },
+      BudgetPolicies: {
+        where: { active: true, scopeType: "POOL_GRANT" },
+        select: {
+          Rules: {
+            where: { metric: "SPEND" },
+            select: { limitValue: true, currency: true, period: true },
+          },
+        },
+      },
     },
   },
 } satisfies Prisma.ModelPoolSelect;
@@ -5043,8 +5068,9 @@ export const forwarderManagementRouter = {
   /**
    * Owner-only per-grant routing settings (saturation S-C): the grantee's
    * warm-session protection override (null = the pool's share mode,
-   * 0 = unprotected, 1..100 = percent) and queue priority (0..31, replaces
-   * the pool/member capacity priority for this grantee; null inherits).
+   * 0 = unprotected, 1..100 = percent), queue priority (0..31, replaces
+   * the pool/member capacity priority for this grantee; null inherits), and
+   * owner-paid `:external` spend cap (`fallbackSpend`; null clears it).
    * Omitted fields are left unchanged.
    */
   updatePoolGrant: protectedProcedure
@@ -5054,15 +5080,19 @@ export const forwarderManagementRouter = {
         grantId: idSchema,
         protectionOverridePercent: z.number().int().min(0).max(100).nullable().optional(),
         queuePriority: z.number().int().min(0).max(31).nullable().optional(),
+        fallbackSpend: poolGrantSpendCapSchema.nullable().optional(),
       }),
     )
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;
       await ownedPool(input.poolId, userId);
-      // Same lock order as grant creation: the owner fence first (writer
-      // class M), then the pool row, then the grant.
+      // Writer class M: owner fence, then the grant budget fence when the
+      // spend cap is written (level 03, before any row lock), then the pool
+      // row, then the grant.
       return runSerializableTransaction(async (tx) => {
         await fenceOwners(tx, [userId]);
+        if (input.fallbackSpend !== undefined)
+          await acquireFences(tx, [fences.budgetGrant(userId, input.grantId)]);
         const locked = await tx.$queryRaw<Array<{ id: string }>>`
           SELECT id FROM model_pool WHERE id = ${input.poolId} AND "userId" = ${userId} FOR NO KEY UPDATE`;
         if (locked.length !== 1)
@@ -5078,7 +5108,15 @@ export const forwarderManagementRouter = {
         });
         if (updated.count !== 1)
           throw new ORPCError("NOT_FOUND", { message: "Pool grant not found." });
-        return tx.poolGrant.findUniqueOrThrow({
+        if (input.fallbackSpend !== undefined) {
+          await upsertPoolGrantSpendCap(tx, {
+            userId,
+            poolId: input.poolId,
+            poolGrantId: input.grantId,
+            spend: input.fallbackSpend,
+          });
+        }
+        const grant = await tx.poolGrant.findUniqueOrThrow({
           where: { id: input.grantId },
           select: {
             id: true,
@@ -5086,8 +5124,25 @@ export const forwarderManagementRouter = {
             granteeUserId: true,
             protectionOverridePercent: true,
             queuePriority: true,
+            BudgetPolicies: {
+              where: { active: true, scopeType: "POOL_GRANT" },
+              select: {
+                Rules: {
+                  where: { metric: "SPEND" },
+                  select: { limitValue: true, currency: true, period: true },
+                },
+              },
+            },
           },
         });
+        return {
+          id: grant.id,
+          poolId: grant.poolId,
+          granteeUserId: grant.granteeUserId,
+          protectionOverridePercent: grant.protectionOverridePercent,
+          queuePriority: grant.queuePriority,
+          fallbackSpend: serializePoolGrantSpendCap(grant.BudgetPolicies),
+        };
       });
     }),
 

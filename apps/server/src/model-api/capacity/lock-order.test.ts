@@ -195,6 +195,8 @@ const GRAPH_WRITERS: Record<string, string> = {
   "packages/api/src/routers/forwarder-management.ts": "M: dashboard pool/device/model writes",
   "packages/api/src/routers/capacity-management.ts": "M: capacity policy",
   "packages/api/src/routers/provider-management.ts": "M: provider management",
+  "packages/api/src/lib/pool-grant-spend-cap.ts":
+    "M: per-grant owner-paid spend cap (caller already holds owner + budgetGrant fences)",
   "packages/api/src/routers/provider-catalog.ts": "M: provider catalog import",
   "packages/api/src/routers/pool-fallback.ts":
     "M: pool external-fallback settings (owner fence, pool row)",

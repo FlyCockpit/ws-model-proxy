@@ -115,6 +115,7 @@ import {
   FALLBACK_HEADER,
   FALLBACK_REASON_HEADER,
   type FallbackRoute,
+  GRANTEE_SPEND_CAP_MESSAGE,
   ROUTE_HEADER,
   resolveRequestedModelName,
   SERVED_MODEL_HEADER,
@@ -5503,7 +5504,7 @@ async function relayPool({
       terminal ??
       (reason === "NO_COMPATIBLE"
         ? "unsupported_capability"
-        : reason === "SATURATED"
+        : reason === "SATURATED" || reason === "GRANTEE_SPEND_CAP"
           ? "rate_limited"
           : reason === "CANCELLED"
             ? "cancelled"
@@ -5533,6 +5534,12 @@ async function relayPool({
       return new Response(response.body, {
         status: providerStatus ?? response.status,
         headers,
+      });
+    }
+    if (reason === "GRANTEE_SPEND_CAP") {
+      return externalRouteErrorResponse(operation.family, {
+        code: "grantee_spend_cap",
+        message: GRANTEE_SPEND_CAP_MESSAGE,
       });
     }
     if (reason !== "UNAVAILABLE") {
@@ -8537,6 +8544,7 @@ type ExternalUnavailableReason =
   | "NO_COMPATIBLE"
   | "SATURATED"
   | "UNAVAILABLE"
+  | "GRANTEE_SPEND_CAP"
   | "CANCELLED"
   | "POOL_UNAVAILABLE"
   | "REQUESTER_BLOCKED";
@@ -8575,6 +8583,7 @@ function externalUnavailableReason(
   if (reason === "REQUESTER_ACCESS_BLOCKED") return "REQUESTER_BLOCKED";
   if (reason === "NO_COMPATIBLE_PROVIDER") return "NO_COMPATIBLE";
   if (reason === "PROVIDER_SATURATED") return "SATURATED";
+  if (reason === "GRANTEE_BUDGET_EXCEEDED") return "GRANTEE_SPEND_CAP";
   return "UNAVAILABLE";
 }
 
@@ -9289,7 +9298,7 @@ async function relayBoundProviderResponse(input: {
       ? "cancelled"
       : denied
         ? "access_denied"
-        : result.reason === "PROVIDER_SATURATED"
+        : result.reason === "PROVIDER_SATURATED" || result.reason === "GRANTEE_BUDGET_EXCEEDED"
           ? "rate_limited"
           : result.reason === "BOUND_TARGET_INVALID" ||
               result.reason === "REQUESTER_NOT_VISIBLE" ||
@@ -9307,6 +9316,11 @@ async function relayBoundProviderResponse(input: {
     // Restorable consent withdrawals are permission errors; a lost exact
     // grant permanently invalidates the binding, just as at arrival.
     if (denied) return externalRouteErrorResponse("responses", denied);
+    if (result.reason === "GRANTEE_BUDGET_EXCEEDED")
+      return externalRouteErrorResponse("responses", {
+        code: "grantee_spend_cap",
+        message: GRANTEE_SPEND_CAP_MESSAGE,
+      });
     if (failure === "rate_limited" || failure === "cancelled")
       return openAiFailureJsonResponse(failure);
     if (failure === "disconnected" || failure === "capacity_lease_lost")

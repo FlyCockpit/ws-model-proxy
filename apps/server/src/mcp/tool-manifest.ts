@@ -369,6 +369,10 @@ export const POOL_EXTERNAL_WAIT_COST_NOTICE =
 export const TOKEN_EXTERNAL_WAIT_COST_NOTICE =
   "COST: externalAfterWaitMs is how long this token's :external requests wait for local capacity before they may be sent to a paid external provider. Lower values spend more. Null uses each pool's setting. A request may also send x-wsmp-external-after-wait-ms or forwarder_chat_completion_test's externalAfterWaitMs argument; that override cannot exceed the token setting, and if the token has no override it may lengthen up to the pool cap. Grantees cannot shorten below the pool value. The stored value is 0..600000; each request still caps it at that pool's wait.";
 
+/** Cost statement for per-grantee owner-paid `:external` spend caps (#182). */
+export const POOL_GRANT_SPEND_CAP_COST_NOTICE =
+  "COST: a POOL_GRANT spend cap (scopeType=POOL_GRANT keyed by poolGrantId, or fallbackSpend on forwarder_pool_grant_update) limits how much owner-paid :external usage this exact grant can charge to YOUR provider accounts (real money). Exhausting the cap fails :external for that grantee with no remaining amount in the error; local members still serve. Clearing the cap (fallbackSpend=null, or deactivating the policy) never costs anything. PRECONDITIONS: you must own the pool and the grant; the cap is SPEND only (UTC_DAY or UTC_MONTH); a revoked and re-created grant is a new id with a fresh cap.";
+
 // ---------------------------------------------------------------------------
 // Procedure invocation helper
 // ---------------------------------------------------------------------------
@@ -1085,6 +1089,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     scope: "write",
     confirmation: null,
     classification: "pure",
+    descriptionNote: POOL_GRANT_SPEND_CAP_COST_NOTICE,
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.updatePoolGrant),
   },
   {
@@ -1246,6 +1251,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     featureDependencies: [PROVIDER_EGRESS_FEATURE],
     classification: "pure",
+    descriptionNote: POOL_GRANT_SPEND_CAP_COST_NOTICE,
     invokeProcedure: procedureInvoker((client) => client.providerManagement.createBudgetPolicy),
   },
   {

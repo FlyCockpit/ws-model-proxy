@@ -11060,6 +11060,7 @@ describe("model API routes", () => {
       "OWN_KEY_CONSENT_WITHDRAWN",
       "REQUESTER_NOT_VISIBLE",
       "PROVIDER_SATURATED",
+      "GRANTEE_BUDGET_EXCEEDED",
     ] as const)("resumes locally after a fallback-only outcome: %s", async (reason) => {
       db.poolMember.findMany.mockResolvedValue([localMember()]);
       publicOverflow.list.mockResolvedValue(
@@ -11082,6 +11083,49 @@ describe("model API routes", () => {
       const response = await responsePromise;
       expect(response.status).toBe(200);
       expect(localBudgets(acquire)).toEqual([2_000, 28_000]);
+    });
+
+    it("serves local members when a grantee's owner-paid spend cap is exhausted", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [
+          {
+            ...externalPoolTarget,
+            ownerUserId: "pool-owner-id",
+            accessGrantId: "grant-id",
+            fallbackForGrantees: true,
+          },
+        ],
+      });
+      db.poolMember.findMany.mockResolvedValue([localMember()]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")], {
+          fallbackForGrantees: true,
+        }),
+      );
+      publicOverflow.dispatch.mockResolvedValueOnce({
+        dispatched: false,
+        reason: "GRANTEE_BUDGET_EXCEEDED",
+      });
+      const { runtime } = scriptedRuntime({
+        local: ["EXPIRED", "ADMITTED"],
+        provider: "ADMITTED",
+      });
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+      const responsePromise = appWith(manager, runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      const response = await responsePromise;
+      expect(response.status).toBe(200);
+      expect(response.headers.get("x-wsmp-route")).toBe("local");
+      expect(response.headers.get("x-wsmp-fallback")).toBe("unavailable");
+      const body = await response.text();
+      expect(body).not.toMatch(/grantee_spend_cap|grant-cap|remaining|policy/i);
     });
 
     // C2-3: an access loss seen by the external phase ends the request at
@@ -11182,6 +11226,49 @@ describe("model API routes", () => {
         expect(publicOverflow.dispatch).not.toHaveBeenCalled();
       },
     );
+
+    it("answers 429 grantee_spend_cap on a provider-only pool when the grantee spend cap is exhausted", async () => {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [
+          {
+            ...externalPoolTarget,
+            ownerUserId: "pool-owner-id",
+            accessGrantId: "grant",
+            fallbackForGrantees: true,
+          },
+        ],
+      });
+      db.poolMember.findMany.mockResolvedValue([]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")], {
+          fallbackForGrantees: true,
+        }),
+      );
+      publicOverflow.dispatch.mockResolvedValueOnce({
+        dispatched: false,
+        reason: "GRANTEE_BUDGET_EXCEEDED",
+      });
+      const { runtime } = scriptedRuntime({ local: [], provider: "ADMITTED" });
+
+      const response = await appWith(new FakeRelayManager(), runtime).request("/chat/completions", {
+        method: "POST",
+        headers: { authorization: "Bearer wsmp_model_test", "content-type": "application/json" },
+        body: requestBody(EXTERNAL_MODEL_ID),
+      });
+
+      expect(response.status).toBe(429);
+      expect(response.headers.get("x-wsmp-route")).toBeNull();
+      const body = await response.json();
+      expect(body).toMatchObject({
+        error: {
+          code: "grantee_spend_cap",
+          type: "rate_limit_error",
+          message: "External fallback is not available for this access.",
+        },
+      });
+      expect(JSON.stringify(body)).not.toMatch(/grant-cap|remaining|\bUSD\b|policy id/i);
+    });
 
     it("answers 429 (not 400) with the header on a provider-only pool whose provider is saturated", async () => {
       db.poolMember.findMany.mockResolvedValue([]);
@@ -14610,13 +14697,14 @@ describe("model API routes", () => {
       },
     );
 
-    // R3: only a permanently invalid binding is "gone". Every transient
-    // dispatcher outcome after listing is 503 with both leases released.
+    // R3: only a permanently invalid binding is "gone". Transient dispatcher
+    // outcomes after listing are 503, except a grantee spend cap (429).
     it.each([
       ["PROVIDER_UNHEALTHY", 503],
       ["SEND_CLAIM_FAILED", 503],
       ["PROVIDER_UNAVAILABLE", 503],
       ["BUDGET_EXCEEDED", 503],
+      ["GRANTEE_BUDGET_EXCEEDED", 429],
       ["BOUND_TARGET_INVALID", 404],
       ["REQUESTER_NOT_VISIBLE", 404],
       ["POOL_PRIVATE", 403],
@@ -14638,6 +14726,35 @@ describe("model API routes", () => {
       );
 
       expect(response.status).toBe(status);
+      expect(runtime.release).toHaveBeenCalledTimes(1);
+      expect(callerRelease).toHaveBeenCalledTimes(1);
+    });
+
+    it("answers 429 grantee_spend_cap for a bound Responses follow-up when the grant cap is exhausted", async () => {
+      publicOverflow.dispatch.mockResolvedValueOnce({
+        dispatched: false,
+        reason: "GRANTEE_BUDGET_EXCEEDED",
+      });
+      const limiter = new ModelApiConcurrencyLimiter();
+      const callerRelease = vi.fn();
+      vi.spyOn(limiter, "acquireGlobal").mockReturnValue({ release: callerRelease });
+      const runtime = admittingCapacityRuntime();
+
+      const response = await appWith(new FakeRelayManager(), runtime, limiter).request(
+        "/responses/resp_provider",
+        boundRequest("GET", false),
+      );
+
+      expect(response.status).toBe(429);
+      const body = await response.json();
+      expect(body).toMatchObject({
+        error: {
+          code: "grantee_spend_cap",
+          type: "rate_limit_error",
+          message: "External fallback is not available for this access.",
+        },
+      });
+      expect(JSON.stringify(body)).not.toMatch(/grant-cap|remaining|\bUSD\b|policy id/i);
       expect(runtime.release).toHaveBeenCalledTimes(1);
       expect(callerRelease).toHaveBeenCalledTimes(1);
     });

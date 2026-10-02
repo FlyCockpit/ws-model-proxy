@@ -73,11 +73,15 @@ export type ExternalRouteErrorCode =
   | "forced_member_requires_external"
   | "external_required"
   | "external_unavailable"
+  | "grantee_spend_cap"
   | "local_members_required"
   /** D9: OpenRouter has no upstream provider that accepts `data_collection: "deny"`. */
   | "provider_data_policy_unavailable";
 
 export type ExternalRouteError = { code: ExternalRouteErrorCode; message: string };
+
+/** Non-leaky refusal when a grantee's owner-paid spend cap is exhausted. */
+export const GRANTEE_SPEND_CAP_MESSAGE = "External fallback is not available for this access.";
 
 const errorStatus: Record<ExternalRouteErrorCode, number> = {
   model_not_found: 404,
@@ -88,6 +92,7 @@ const errorStatus: Record<ExternalRouteErrorCode, number> = {
   forced_member_requires_external: 400,
   external_required: 400,
   external_unavailable: 503,
+  grantee_spend_cap: 429,
   local_members_required: 400,
   provider_data_policy_unavailable: 503,
 };
@@ -111,9 +116,11 @@ export function externalRouteErrorResponse(
             ? "not_found_error"
             : status === 403
               ? "permission_error"
-              : status >= 500
-                ? "api_error"
-                : "invalid_request_error",
+              : status === 429
+                ? "rate_limit_error"
+                : status >= 500
+                  ? "api_error"
+                  : "invalid_request_error",
         )
       : new Response(
           JSON.stringify(
@@ -124,9 +131,11 @@ export function externalRouteErrorResponse(
                   ? "invalid_request_error"
                   : status === 403
                     ? "permission_error"
-                    : status >= 500
-                      ? "api_error"
-                      : "invalid_request_error",
+                    : status === 429
+                      ? "rate_limit_error"
+                      : status >= 500
+                        ? "api_error"
+                        : "invalid_request_error",
               param: error.code === "model_not_found" ? "model" : null,
               code: error.code,
             }),
