@@ -492,13 +492,25 @@ const READ_TOOLS: readonly McpToolSpec[] = [
   },
   {
     name: "forwarder_cli_devices_list",
-    target: "forwarderManagement.listCliDevices",
+    target: "forwarderManagement.listCliDeviceSummaries",
     scope: "read",
     confirmation: null,
     classification: "pure",
     descriptionNote:
-      "features.commands.effectiveMode is what an agent can run now: the stricter of the dashboard grant (mode) and the CLI's own wsmp config (deviceMode). features.commands.refusals says, per tool, what the relay would refuse right now, in its own check order: refusals.headless (forwarder_cli_command_run) and refusals.supervised (forwarder_cli_supervised_command_start) are null when admitted, else grant_disabled (dashboard grant), grant_supervised_only or cli_supervised_only (the relay's supervised_only: headless needs unsupervised, and the dashboard grant, or else wsmp config, is only supervised), offline (CLI not connected or too old), feature_disabled (wsmp config set-mcp-commands), or unsupported (no terminal support, supervised only). available is true when either tool would be admitted. A command token also needs mcp:write and allowCliCommands. fileTools follows that effective mode: unsupervised admits read/write; supervised/off admit reads only with the dashboard mcpFileRead grant, live CLI mcpFileRead and fileRootsConfigured. A read-only PAT needs allowCliFileRead and mcp:read for the four read tools; write tools retain allowCliCommands and mcp:write. Reported fields reportedMcpFileRead/reportedFileRoots describe CLI configuration; missing live features never authorize reads.",
-    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.listCliDevices),
+      "Summaries only: id, slug, status, grants, endpoint slugs and probe status (status, reportedStatus, failureReasonCode). No models[] and no capability JSON. Returns { items, nextCursor }; limit defaults to 20 and max is 50. Pass nextCursor for the next page. The full device, including models, is forwarder_cli_device_get. features.commands.effectiveMode is what an agent can run now: the stricter of the dashboard grant (mode) and the CLI's own wsmp config (deviceMode). features.commands.refusals says, per tool, what the relay would refuse right now, in its own check order: refusals.headless (forwarder_cli_command_run) and refusals.supervised (forwarder_cli_supervised_command_start) are null when admitted, else grant_disabled (dashboard grant), grant_supervised_only or cli_supervised_only (the relay's supervised_only: headless needs unsupervised, and the dashboard grant, or else wsmp config, is only supervised), offline (CLI not connected or too old), feature_disabled (wsmp config set-mcp-commands), or unsupported (no terminal support, supervised only). available is true when either tool would be admitted. A command token also needs mcp:write and allowCliCommands. fileTools follows that effective mode: unsupervised admits read/write; supervised/off admit reads only with the dashboard mcpFileRead grant, live CLI mcpFileRead and fileRootsConfigured. A read-only PAT needs allowCliFileRead and mcp:read for the four read tools; write tools retain allowCliCommands and mcp:write. Reported fields reportedMcpFileRead/reportedFileRoots describe CLI configuration; missing live features never authorize reads.",
+    invokeProcedure: procedureInvoker(
+      (client) => client.forwarderManagement.listCliDeviceSummaries,
+    ),
+  },
+  {
+    name: "forwarder_cli_device_get",
+    target: "forwarderManagement.getCliDevice",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    descriptionNote:
+      "Full CLI device for cliDeviceId, including endpoints, models, and capability JSON. List summaries with forwarder_cli_devices_list.",
+    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getCliDevice),
   },
   {
     name: "forwarder_cli_activity_list",
@@ -539,11 +551,25 @@ const READ_TOOLS: readonly McpToolSpec[] = [
   },
   {
     name: "forwarder_model_pools_list",
-    target: "forwarderManagement.listModelPools",
+    target: "forwarderManagement.listModelPoolSummaries",
     scope: "read",
     confirmation: null,
     classification: "pure",
-    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.listModelPools),
+    descriptionNote:
+      "Summaries only: pool id, slug, name, grants, and member endpoint slugs with routing and health status. No member models and no capability JSON. Returns { items, nextCursor }; limit defaults to 20 and max is 50. Pass nextCursor for the next page. The full pool is forwarder_model_pool_get.",
+    invokeProcedure: procedureInvoker(
+      (client) => client.forwarderManagement.listModelPoolSummaries,
+    ),
+  },
+  {
+    name: "forwarder_model_pool_get",
+    target: "forwarderManagement.getModelPool",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    descriptionNote:
+      "Full model pool for poolId, including members, models, and capability JSON. List summaries with forwarder_model_pools_list.",
+    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getModelPool),
   },
   {
     name: "forwarder_pool_fallback_get",
@@ -1386,8 +1412,8 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
 ];
 
 /**
- * The checked catalog: exactly 35 read tools and 60 write tools
- * (81 procedure-backed + 14 extracted cores: 2 diagnostics, 3 CLI commands
+ * The checked catalog: exactly 37 read tools and 62 write tools
+ * (85 procedure-backed + 14 extracted cores: 2 diagnostics, 3 CLI commands
  * and 9 node file tools (4 read, 5 write)).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS].map(
@@ -1569,6 +1595,16 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
     target: "forwarderManagement.setCliDeviceFeatureGrants",
     reason:
       "Human-only device grants including read-only file consent; requires the CLI read switch and configured roots reports.",
+  },
+  {
+    target: "forwarderManagement.listCliDevices",
+    reason:
+      "Dashboard inventory inlines models and capability JSON. Agents use forwarder_cli_devices_list and forwarder_cli_device_get.",
+  },
+  {
+    target: "forwarderManagement.listModelPools",
+    reason:
+      "Dashboard inventory inlines members and models. Agents use forwarder_model_pools_list and forwarder_model_pool_get.",
   },
   {
     target: "supervisedCommands.pending",

@@ -1034,15 +1034,24 @@ describe("CLI presence through the MCP projection", () => {
     const authInfo = buildAuthInfo(["mcp:read"]);
     bindRequest(authInfo);
     const { body } = await callTool(authInfo, "forwarder_cli_devices_list", {});
-    const rows = body.result?.structuredContent?.result as {
-      status: string;
-      endpoints: { status: string; reportedStatus: string }[];
-    }[];
-    expect(rows.map((row) => [row.status, row.endpoints[0]?.status])).toEqual([
+    const page = body.result?.structuredContent?.result as {
+      items: {
+        status: string;
+        endpoints: { status: string; reportedStatus: string; slug: string }[];
+      }[];
+      nextCursor: string | null;
+    };
+    expect(page.items.map((row) => [row.status, row.endpoints[0]?.status])).toEqual([
       ["CONNECTED", "ONLINE"],
       ["DISCONNECTED", "OFFLINE"],
     ]);
-    expect(rows[1]?.endpoints[0]?.reportedStatus).toBe("ONLINE");
+    expect(page.items[1]?.endpoints[0]?.reportedStatus).toBe("ONLINE");
+    expect(page.items[0]?.endpoints[0]?.slug).toBe("ep");
+    expect(page.nextCursor).toBeNull();
+    const serialized = JSON.stringify(page);
+    expect(serialized).not.toContain("models");
+    expect(serialized).not.toContain("defaultCapabilities");
+    expect(serialized).not.toContain("capabilityMetadata");
   });
 });
 

@@ -53,11 +53,13 @@ const PLAN_READ_TOOLS: readonly string[] = [
   "app_config_get",
   "forwarder_guarded_candidates_list",
   "forwarder_cli_devices_list",
+  "forwarder_cli_device_get",
   "forwarder_cli_activity_list",
   "forwarder_device_metrics_get",
   "forwarder_pool_routing_rules_get",
   "forwarder_engine_load_history_get",
   "forwarder_model_pools_list",
+  "forwarder_model_pool_get",
   "forwarder_pool_fallback_get",
   "forwarder_affinity_stats_get",
   "forwarder_pool_cache_stats_get",
@@ -193,7 +195,8 @@ const PLAN_CONFIRMATIONS: Readonly<Record<string, "DELETE" | "RUN" | null>> = Ob
 const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   app_config_get: "appConfig",
   forwarder_guarded_candidates_list: "forwarderManagement.listGuardedOverflowCandidates",
-  forwarder_cli_devices_list: "forwarderManagement.listCliDevices",
+  forwarder_cli_devices_list: "forwarderManagement.listCliDeviceSummaries",
+  forwarder_cli_device_get: "forwarderManagement.getCliDevice",
   forwarder_cli_activity_list: "cliAgentActivity.list",
   forwarder_device_metrics_get: "forwarderManagement.getCliDeviceMetrics",
   forwarder_pool_routing_rules_get: "forwarderManagement.getPoolRoutingRules",
@@ -203,7 +206,8 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   forwarder_device_metric_sources_set: "forwarderManagement.setCliDeviceMetricSources",
   forwarder_device_engine_adapters_set: "forwarderManagement.setCliDeviceEngineAdapters",
   forwarder_device_engine_adapters_clear: "forwarderManagement.clearCliDeviceEngineAdapters",
-  forwarder_model_pools_list: "forwarderManagement.listModelPools",
+  forwarder_model_pools_list: "forwarderManagement.listModelPoolSummaries",
+  forwarder_model_pool_get: "forwarderManagement.getModelPool",
   forwarder_pool_fallback_get: "poolFallback.get",
   forwarder_affinity_stats_get: "forwarderManagement.cacheAffinityStats",
   forwarder_pool_cache_stats_get: "forwarderManagement.poolCacheStats",
@@ -390,13 +394,13 @@ describe("MCP tool manifest — exact catalog", () => {
     }
   });
 
-  it("contains exactly 35 read + 62 write names (no extras, no missing, no duplicates)", () => {
+  it("contains exactly 37 read + 62 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);
     expect([...names].sort()).toEqual([...PLAN_READ_TOOLS, ...PLAN_WRITE_TOOLS].sort());
-    expect(PLAN_READ_TOOLS).toHaveLength(35);
+    expect(PLAN_READ_TOOLS).toHaveLength(37);
     expect(PLAN_WRITE_TOOLS).toHaveLength(62);
-    expect(MCP_TOOL_MANIFEST).toHaveLength(97);
+    expect(MCP_TOOL_MANIFEST).toHaveLength(99);
   });
 
   it("the CLI device list explains effectiveMode and which switch limits it", () => {
@@ -599,9 +603,9 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
         `${tool.name}: ${PLAN_TARGETS[tool.name]}`,
       );
     }
-    // 97 catalog entries − 14 extracted cores = 83 procedure dispatches.
-    expect(dispatched).toBe(83);
-    expect(invoked).toHaveLength(83);
+    // 99 catalog entries − 14 extracted cores = 85 procedure dispatches.
+    expect(dispatched).toBe(85);
+    expect(invoked).toHaveLength(85);
 
     // Human-only proof: ZERO mcpGrants access (property or invocation)
     // across every dispatch.

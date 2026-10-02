@@ -5955,6 +5955,270 @@ describe("setCliDeviceFeatureGrants", () => {
   });
 });
 
+describe("MCP inventory summaries", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function summaryDevice(
+    id: string,
+    createdAt: string,
+    status: "CONNECTED" | "DISCONNECTED" = "CONNECTED",
+  ) {
+    return {
+      id,
+      createdAt: new Date(createdAt),
+      slug: id,
+      name: null,
+      reportedHostname: `${id}.local`,
+      status,
+      lastHeartbeatAt: new Date("2026-01-02T00:00:30Z"),
+      allowHumanTerminal: true,
+      mcpCommandMode: "SUPERVISED",
+      mcpFileRead: false,
+      reportedHumanTerminal: true,
+      reportedMcpCommandMode: "SUPERVISED",
+      reportedMcpFileRead: false,
+      reportedFileRoots: false,
+      reportedTerminalApproval: true,
+      reportedTerminalSupported: true,
+      reportedAllowFileToolsAsRoot: false,
+      Endpoints: [
+        {
+          id: `${id}-ep`,
+          slug: "local",
+          status: "ONLINE",
+          failureReasonCode: "probe_failed",
+          defaultCapabilities: ["TEXT_GENERATION"],
+          capabilityMetadata: { chatCompletions: { supported: true } },
+          probeSuggestions: { responses: { supported: false } },
+          DiscoveredModels: [{ id: `${id}-model`, upstreamModelId: "llama" }],
+        },
+      ],
+    };
+  }
+
+  it("pages device summaries without models or capability JSON", async () => {
+    db.cliDevice.findMany.mockResolvedValue([
+      summaryDevice("cli-new", "2026-01-02T00:00:00Z"),
+      summaryDevice("cli-old", "2026-01-01T00:00:00Z", "DISCONNECTED"),
+    ]);
+
+    const page = await client().listCliDeviceSummaries({ limit: 1 });
+
+    expect(page.items).toHaveLength(1);
+    expect(page.items[0]).toMatchObject({
+      id: "cli-new",
+      slug: "cli-new",
+      displayName: "cli-new.local",
+      status: "CONNECTED",
+      grants: { humanTerminal: true, mcpCommandMode: "supervised", fileRead: false },
+      endpoints: [
+        {
+          id: "cli-new-ep",
+          slug: "local",
+          status: "OFFLINE",
+          reportedStatus: "ONLINE",
+          failureReasonCode: "probe_failed",
+        },
+      ],
+    });
+    expect(page.items[0]).not.toHaveProperty("models");
+    expect(page.items[0]?.endpoints[0]).not.toHaveProperty("models");
+    expect(page.items[0]?.endpoints[0]).not.toHaveProperty("defaultCapabilities");
+    expect(page.items[0]?.endpoints[0]).not.toHaveProperty("capabilityMetadata");
+    const serialized = JSON.stringify(page);
+    expect(serialized).not.toContain("llama");
+    expect(serialized).not.toContain("TEXT_GENERATION");
+    expect(serialized).not.toContain("chatCompletions");
+    expect(page.nextCursor).toBe(`${new Date("2026-01-02T00:00:00Z").getTime()}.cli-new`);
+    const query = db.cliDevice.findMany.mock.calls[0]?.[0];
+    expect(query?.take).toBe(2);
+    expect(query?.select?.Endpoints?.select).not.toHaveProperty("DiscoveredModels");
+    expect(query?.select?.Endpoints?.select).not.toHaveProperty("defaultCapabilities");
+    expect(query?.select?.Endpoints?.select).not.toHaveProperty("capabilityMetadata");
+    expect(query?.select?.Endpoints?.select).not.toHaveProperty("probeSuggestions");
+  });
+
+  it("rejects an invalid summary cursor before querying", async () => {
+    await expect(client().listCliDeviceSummaries({ cursor: "not-a-cursor" })).rejects.toSatisfy(
+      (error: ORPCError) => {
+        expect(error.code).toBe("BAD_REQUEST");
+        return true;
+      },
+    );
+    expect(db.cliDevice.findMany).not.toHaveBeenCalled();
+    expect(db.modelPool.findMany).not.toHaveBeenCalled();
+  });
+
+  it("returns one full CLI device and hides devices owned by someone else", async () => {
+    const owned = {
+      ...summaryDevice("cli-id", "2026-01-01T00:00:00Z"),
+      userId: "user-id",
+      updatedAt: new Date("2026-01-02T00:00:00Z"),
+      lastConnectedAt: null,
+      lastDisconnectedAt: null,
+      connectionCount: 1,
+      User: { slug: "owner" },
+      Endpoints: [
+        {
+          id: "endpoint-id",
+          createdAt: new Date("2026-01-01"),
+          updatedAt: new Date("2026-01-02"),
+          slug: "local",
+          label: "Local",
+          kind: "OPENAI_COMPATIBLE",
+          status: "ONLINE",
+          defaultCapabilities: ["TEXT_GENERATION"],
+          capabilityMetadata: null,
+          probeSuggestions: null,
+          lastSeenAt: null,
+          lastHealthCheckAt: null,
+          statusChangedAt: null,
+          failureReasonCode: null,
+          published: true,
+          unpublishedAt: null,
+          DiscoveredModels: [
+            {
+              id: "model-id",
+              createdAt: new Date("2026-01-01"),
+              updatedAt: new Date("2026-01-02"),
+              slug: null,
+              upstreamModelId: "llama",
+              encodedModelId: "owner/cli-id/local/llama",
+              capabilityOverrideMode: "INHERIT",
+              capabilityOverrides: [],
+              capabilityOverrideMetadata: null,
+              optimisticBasicTranscription: false,
+              probeSuggestions: null,
+              lastSeenAt: null,
+              published: true,
+              unpublishedAt: null,
+              maxAttachmentBytes: null,
+              ExecutionTarget: null,
+            },
+          ],
+        },
+      ],
+    };
+    db.cliDevice.findUnique.mockResolvedValueOnce(owned);
+    const result = await client().getCliDevice({ cliDeviceId: "cli-id" });
+    expect(result.endpoints[0]?.models[0]?.upstreamModelId).toBe("llama");
+    expect(result.endpoints[0]?.models[0]?.canonicalModelId).toBe("owner/cli-id/local/llama");
+
+    db.cliDevice.findUnique.mockResolvedValueOnce({ ...owned, userId: "other-user" });
+    await expect(client().getCliDevice({ cliDeviceId: "cli-id" })).rejects.toSatisfy(
+      (error: ORPCError) => {
+        expect(error.code).toBe("NOT_FOUND");
+        return true;
+      },
+    );
+  });
+
+  it("pages pool summaries without member models and returns the full pool from get", async () => {
+    db.modelPool.findMany.mockResolvedValue([
+      {
+        id: "pool-id",
+        createdAt: new Date("2026-01-03T00:00:00Z"),
+        slug: "general",
+        name: "General",
+        PoolGrants: [
+          {
+            id: "grant-id",
+            createdAt: new Date("2026-01-04T00:00:00Z"),
+            granteeUserId: "grantee",
+            protectionOverridePercent: null,
+            queuePriority: null,
+            Grantee: { email: "g@example.com", name: "G" },
+          },
+        ],
+        PoolMembers: [
+          {
+            id: "member-id",
+            tier: "PRIMARY",
+            healthStatus: "HEALTHY",
+            routingStatus: "ACTIVE",
+            DiscoveredModel: {
+              upstreamModelId: "should-not-leak",
+              capabilityOverrideMetadata: { chatCompletions: { supported: true } },
+              Endpoint: {
+                slug: "local",
+                capabilityMetadata: { chatCompletions: { supported: true } },
+                CliDevice: { slug: "desk" },
+              },
+            },
+            ExecutionTarget: {
+              DiscoveredModel: {
+                upstreamModelId: "target-model",
+                Endpoint: {
+                  slug: "gpu",
+                  capabilityMetadata: { responses: { supported: true } },
+                  CliDevice: { slug: "gx10" },
+                },
+              },
+            },
+          },
+        ],
+      },
+    ]);
+
+    const page = await client().listModelPoolSummaries({});
+    expect(page.nextCursor).toBeNull();
+    expect(db.modelPool.findMany.mock.calls[0]?.[0]?.take).toBe(21);
+    expect(page.items).toEqual([
+      {
+        id: "pool-id",
+        slug: "general",
+        name: "General",
+        grants: [
+          {
+            id: "grant-id",
+            createdAt: new Date("2026-01-04T00:00:00Z"),
+            granteeUserId: "grantee",
+            granteeEmail: "g@example.com",
+            granteeName: "G",
+            protectionOverridePercent: null,
+            queuePriority: null,
+          },
+        ],
+        members: [
+          {
+            id: "member-id",
+            tier: "PRIMARY",
+            routingStatus: "ACTIVE",
+            healthStatus: "HEALTHY",
+            endpointSlug: "gpu",
+            cliDeviceSlug: "gx10",
+          },
+        ],
+      },
+    ]);
+    const serialized = JSON.stringify(page);
+    expect(serialized).not.toContain("should-not-leak");
+    expect(serialized).not.toContain("target-model");
+    expect(serialized).not.toContain("chatCompletions");
+    const memberSelect = db.modelPool.findMany.mock.calls[0]?.[0]?.select?.PoolMembers?.select;
+    expect(memberSelect?.DiscoveredModel?.select).not.toHaveProperty("upstreamModelId");
+    expect(memberSelect?.DiscoveredModel?.select).not.toHaveProperty("capabilityOverrideMetadata");
+    expect(memberSelect?.ExecutionTarget?.select?.DiscoveredModel?.select).not.toHaveProperty(
+      "capabilityMetadata",
+    );
+
+    db.modelPool.findUnique.mockResolvedValueOnce({ ...poolRow(), userId: "user-id" });
+    const full = await client().getModelPool({ poolId: "pool-id" });
+    expect(full).toMatchObject({ id: "pool-id", slug: "general", members: [] });
+    expect(full).toHaveProperty("compatibility");
+
+    db.modelPool.findUnique.mockResolvedValueOnce(null);
+    await expect(client().getModelPool({ poolId: "missing" })).rejects.toSatisfy(
+      (error: ORPCError) => {
+        expect(error.code).toBe("NOT_FOUND");
+        return true;
+      },
+    );
+  });
+});
+
 describe("getCliDeviceMetrics", () => {
   const storedMetrics = { ts: "2026-09-28T11:00:00.000Z", cpu: { usagePercent: 5 } };
   const deviceMetricsRow = {

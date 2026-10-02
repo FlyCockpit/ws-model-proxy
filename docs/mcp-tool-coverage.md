@@ -68,14 +68,18 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.createGuardedModelPool` | `forwarder_guarded_pool_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.createModelPool` | `forwarder_model_pool_create` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.deleteModelPool` | `forwarder_model_pool_delete` | write | DELETE | destructive | — | — | — |
+| `forwarderManagement.getCliDevice` | `forwarder_cli_device_get` | read | — | pure | — | — | — |
 | `forwarderManagement.getCliDeviceMetrics` | `forwarder_device_metrics_get` | read | — | pure | — | — | — |
 | `forwarderManagement.getEngineLoadHistory` | `forwarder_engine_load_history_get` | read | — | pure | — | — | — |
+| `forwarderManagement.getModelPool` | `forwarder_model_pool_get` | read | — | pure | — | — | — |
 | `forwarderManagement.getPoolRoutingRules` | `forwarder_pool_routing_rules_get` | read | — | pure | — | — | — |
 | `forwarderManagement.getProfileSlug` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
 | `forwarderManagement.grantPoolAccessByEmail` | `forwarder_pool_grant_create` | write | — | pure | — | — | — |
-| `forwarderManagement.listCliDevices` | `forwarder_cli_devices_list` | read | — | pure | — | — | — |
+| `forwarderManagement.listCliDeviceSummaries` | `forwarder_cli_devices_list` | read | — | pure | — | — | — |
+| `forwarderManagement.listCliDevices` | — (excluded) | — | — | — | — | — | Dashboard inventory inlines models and capability JSON. Agents use forwarder_cli_devices_list and forwarder_cli_device_get. |
 | `forwarderManagement.listGuardedOverflowCandidates` | `forwarder_guarded_candidates_list` | read | — | pure | — | — | — |
-| `forwarderManagement.listModelPools` | `forwarder_model_pools_list` | read | — | pure | — | — | — |
+| `forwarderManagement.listModelPoolSummaries` | `forwarder_model_pools_list` | read | — | pure | — | — | — |
+| `forwarderManagement.listModelPools` | — (excluded) | — | — | — | — | — | Dashboard inventory inlines members and models. Agents use forwarder_model_pools_list and forwarder_model_pool_get. |
 | `forwarderManagement.poolCacheStats` | `forwarder_pool_cache_stats_get` | read | — | pure | — | — | — |
 | `forwarderManagement.previewProfileSlugChange` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
 | `forwarderManagement.removeCliDeviceMetadata` | `forwarder_cli_metadata_remove` | write | DELETE | destructive | — | — | — |

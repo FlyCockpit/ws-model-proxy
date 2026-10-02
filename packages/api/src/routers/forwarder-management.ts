@@ -515,11 +515,82 @@ const listCliDevicesSelect = {
   },
 } satisfies Prisma.CliDeviceSelect;
 
+/**
+ * MCP list page. Identity, grants, and endpoint probe status only: no
+ * discovered models and no capability JSON. The dashboard keeps
+ * {@link listCliDevicesSelect}.
+ */
+const cliDeviceSummarySelect = {
+  id: true,
+  createdAt: true,
+  slug: true,
+  name: true,
+  reportedHostname: true,
+  status: true,
+  lastHeartbeatAt: true,
+  allowHumanTerminal: true,
+  mcpCommandMode: true,
+  mcpFileRead: true,
+  reportedHumanTerminal: true,
+  reportedMcpCommandMode: true,
+  reportedMcpFileRead: true,
+  reportedFileRoots: true,
+  reportedTerminalApproval: true,
+  reportedTerminalSupported: true,
+  reportedAllowFileToolsAsRoot: true,
+  Endpoints: {
+    orderBy: { createdAt: "asc" as const },
+    select: {
+      id: true,
+      slug: true,
+      status: true,
+      failureReasonCode: true,
+    },
+  },
+} satisfies Prisma.CliDeviceSelect;
+
 type CliDeviceRow = Prisma.CliDeviceGetPayload<{ select: typeof listCliDevicesSelect }>;
+type CliDeviceSummaryRow = Prisma.CliDeviceGetPayload<{ select: typeof cliDeviceSummarySelect }>;
 type EndpointRow = CliDeviceRow["Endpoints"][number];
 type DiscoveredModelRow = EndpointRow["DiscoveredModels"][number];
 
+/** MCP list page size. A short page is the end; `nextCursor` continues. */
+const SUMMARY_PAGE_DEFAULT = 20;
+const SUMMARY_PAGE_MAX = 50;
+
+const summaryPageInput = z.object({
+  limit: z.number().int().min(1).max(SUMMARY_PAGE_MAX).default(SUMMARY_PAGE_DEFAULT),
+  cursor: z.string().min(1).max(200).optional(),
+});
+
+/** Keyset cursor over `(createdAt desc, id desc)`: `<epoch ms>.<id>`. */
+function encodeSummaryCursor(row: { createdAt: Date; id: string }): string {
+  return `${row.createdAt.getTime()}.${row.id}`;
+}
+
+function decodeSummaryCursor(cursor: string): { createdAt: Date; id: string } {
+  const match = /^(\d{1,16})\.([A-Za-z0-9_-]{1,128})$/.exec(cursor);
+  const createdAt = match?.[1] === undefined ? null : new Date(Number(match[1]));
+  if (match?.[2] === undefined || createdAt === null || Number.isNaN(createdAt.getTime())) {
+    throw new ORPCError("BAD_REQUEST", { message: "Invalid cursor." });
+  }
+  return { createdAt, id: match[2] };
+}
+
+function summaryPageWhere(userId: string, cursor: string | undefined) {
+  if (cursor === undefined) return { userId };
+  const after = decodeSummaryCursor(cursor);
+  return {
+    userId,
+    OR: [
+      { createdAt: { lt: after.createdAt } },
+      { createdAt: after.createdAt, id: { lt: after.id } },
+    ],
+  };
+}
+
 type ModelPoolRow = Prisma.ModelPoolGetPayload<{ select: typeof poolSelect }>;
+type PoolSummaryRow = Prisma.ModelPoolGetPayload<{ select: typeof poolSummarySelect }>;
 type PoolMemberModelRow = NonNullable<ModelPoolRow["PoolMembers"][number]["DiscoveredModel"]>;
 
 async function assertAttachmentLimitWithinGlobal(maxAttachmentBytes: number | null | undefined) {
@@ -720,7 +791,27 @@ function liveCommandMode(snapshot: LiveCliFeatureSnapshot | null): McpCommandMod
   return snapshot.mcpCommandMode;
 }
 
-function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSnapshot | null) {
+type CliDeviceFeatureSource = Pick<
+  CliDeviceRow,
+  | "allowHumanTerminal"
+  | "mcpCommandMode"
+  | "mcpFileRead"
+  | "reportedHumanTerminal"
+  | "reportedMcpCommandMode"
+  | "reportedMcpFileRead"
+  | "reportedFileRoots"
+  | "reportedTerminalApproval"
+  | "reportedTerminalSupported"
+  | "reportedAllowFileToolsAsRoot"
+  | "lastHeartbeatAt"
+>;
+
+/** Grant and live-feature view shared by the dashboard device and the MCP summary. */
+function serializeCliDeviceFeatures(
+  row: CliDeviceFeatureSource,
+  now: Date,
+  live: LiveCliFeatureSnapshot | null,
+) {
   const terminalLive = liveTerminalFeature(live);
   const terminalDeviceAllows = row.reportedHumanTerminal ?? null;
   const terminalSupported = row.reportedTerminalSupported ?? null;
@@ -742,44 +833,9 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
           }
         : null,
   });
-  const staleAt = cliHeartbeatStaleAt(row.lastHeartbeatAt);
   return {
-    id: row.id,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt,
-    slug: row.slug,
-    name: row.name,
-    reportedHostname: row.reportedHostname,
-    displayName: cliDeviceDisplayName(row),
-    status: row.status,
-    lastConnectedAt: row.lastConnectedAt,
-    lastDisconnectedAt: row.lastDisconnectedAt,
-    lastHeartbeatAt: row.lastHeartbeatAt,
-    staleAt,
+    staleAt: cliHeartbeatStaleAt(row.lastHeartbeatAt),
     isStale: cliHeartbeatIsStale(row.lastHeartbeatAt, now),
-    connectionCount: row.connectionCount,
-    inventorySeq: row.inventorySeq,
-    inventoryDigest: row.inventoryDigest,
-    inventoryAcknowledgedAt: row.inventoryAcknowledgedAt,
-    inventoryConfirmed: row.inventoryConfirmed,
-    endpointTargeting: row.endpointTargeting,
-    cliVersion: row.cliVersion ?? null,
-    relayProtocolVersion: row.relayProtocolVersion ?? null,
-    /**
-     * Set when this device's last hello was refused for an old relay
-     * protocol, or one newer than this server speaks (`reason`); the next
-     * accepted hello clears it.
-     */
-    upgradeRequired: row.relayRejectedAt
-      ? {
-          protocolVersion: row.rejectedRelayProtocolVersion ?? null,
-          cliVersion: row.rejectedCliVersion ?? null,
-          rejectedAt: row.relayRejectedAt,
-          reason: refusedRelayProtocolReason(row.rejectedRelayProtocolVersion),
-        }
-      : null,
-    nodeInfoAt: row.nodeInfoAt ?? null,
-    nodeMetricsAt: row.nodeMetricsAt ?? null,
     /**
      * What the MCP node file tools may do on this device right now
      * (`headless`, `supervised` = needs a person, or `off`), from the effective
@@ -828,6 +884,59 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
         available: refusals.headless === null || refusals.supervised === null,
       },
     },
+    grants: {
+      humanTerminal: row.allowHumanTerminal === true,
+      mcpCommandMode: commandsGrant,
+      fileRead: row.mcpFileRead === true,
+    },
+  };
+}
+
+function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSnapshot | null) {
+  const featureView = serializeCliDeviceFeatures(row, now, live);
+  return {
+    id: row.id,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    slug: row.slug,
+    name: row.name,
+    reportedHostname: row.reportedHostname,
+    displayName: cliDeviceDisplayName(row),
+    status: row.status,
+    lastConnectedAt: row.lastConnectedAt,
+    lastDisconnectedAt: row.lastDisconnectedAt,
+    lastHeartbeatAt: row.lastHeartbeatAt,
+    staleAt: featureView.staleAt,
+    isStale: featureView.isStale,
+    connectionCount: row.connectionCount,
+    inventorySeq: row.inventorySeq,
+    inventoryDigest: row.inventoryDigest,
+    inventoryAcknowledgedAt: row.inventoryAcknowledgedAt,
+    inventoryConfirmed: row.inventoryConfirmed,
+    endpointTargeting: row.endpointTargeting,
+    cliVersion: row.cliVersion ?? null,
+    relayProtocolVersion: row.relayProtocolVersion ?? null,
+    /**
+     * Set when this device's last hello was refused for an old relay
+     * protocol, or one newer than this server speaks (`reason`); the next
+     * accepted hello clears it.
+     */
+    upgradeRequired: row.relayRejectedAt
+      ? {
+          protocolVersion: row.rejectedRelayProtocolVersion ?? null,
+          cliVersion: row.rejectedCliVersion ?? null,
+          rejectedAt: row.relayRejectedAt,
+          reason: refusedRelayProtocolReason(row.rejectedRelayProtocolVersion),
+        }
+      : null,
+    nodeInfoAt: row.nodeInfoAt ?? null,
+    nodeMetricsAt: row.nodeMetricsAt ?? null,
+    fileTools: featureView.fileTools,
+    allowFileToolsAsRoot: featureView.allowFileToolsAsRoot,
+    mcpFileRead: featureView.mcpFileRead,
+    reportedMcpFileRead: featureView.reportedMcpFileRead,
+    reportedFileRoots: featureView.reportedFileRoots,
+    features: featureView.features,
     endpoints: row.Endpoints.map((endpoint) => ({
       id: endpoint.id,
       createdAt: endpoint.createdAt,
@@ -881,6 +990,36 @@ function serializeCliDevice(row: CliDeviceRow, now: Date, live: LiveCliFeatureSn
         maxAttachmentBytes: model.maxAttachmentBytes,
         executionTarget: model.ExecutionTarget ?? null,
       })),
+    })),
+  };
+}
+
+/** MCP device list row: id, slug, status, grants, endpoint slugs and probe status. */
+function serializeCliDeviceSummary(
+  row: CliDeviceSummaryRow,
+  now: Date,
+  live: LiveCliFeatureSnapshot | null,
+) {
+  const featureView = serializeCliDeviceFeatures(row, now, live);
+  return {
+    id: row.id,
+    slug: row.slug,
+    name: row.name,
+    displayName: cliDeviceDisplayName(row),
+    status: row.status,
+    grants: featureView.grants,
+    fileTools: featureView.fileTools,
+    allowFileToolsAsRoot: featureView.allowFileToolsAsRoot,
+    mcpFileRead: featureView.mcpFileRead,
+    reportedMcpFileRead: featureView.reportedMcpFileRead,
+    reportedFileRoots: featureView.reportedFileRoots,
+    features: featureView.features,
+    endpoints: row.Endpoints.map((endpoint) => ({
+      id: endpoint.id,
+      slug: endpoint.slug,
+      status: effectiveEndpointStatus(endpoint.status, row, now),
+      reportedStatus: endpoint.status,
+      failureReasonCode: endpoint.failureReasonCode,
     })),
   };
 }
@@ -1134,6 +1273,35 @@ function serializePool(row: ModelPoolRow) {
       protectionOverridePercent: grant.protectionOverridePercent,
       queuePriority: grant.queuePriority,
     })),
+  };
+}
+
+/** MCP pool list row: identity, grants, and member endpoint slugs. No models. */
+function serializePoolSummary(row: PoolSummaryRow) {
+  return {
+    id: row.id,
+    slug: row.slug,
+    name: row.name,
+    grants: row.PoolGrants.map((grant) => ({
+      id: grant.id,
+      createdAt: grant.createdAt,
+      granteeUserId: grant.granteeUserId,
+      granteeEmail: grant.Grantee.email,
+      granteeName: grant.Grantee.name,
+      protectionOverridePercent: grant.protectionOverridePercent,
+      queuePriority: grant.queuePriority,
+    })),
+    members: row.PoolMembers.map((member) => {
+      const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
+      return {
+        id: member.id,
+        tier: member.tier,
+        routingStatus: member.routingStatus,
+        healthStatus: member.healthStatus,
+        endpointSlug: model?.Endpoint.slug ?? null,
+        cliDeviceSlug: model?.Endpoint.CliDevice.slug ?? null,
+      };
+    }),
   };
 }
 
@@ -1667,6 +1835,48 @@ const poolSelect = {
               capabilityMetadata: true,
               defaultCapabilities: true,
               CliDevice: { select: { slug: true } },
+            },
+          },
+        },
+      },
+    },
+  },
+  PoolGrants: {
+    orderBy: { createdAt: "desc" as const },
+    select: {
+      id: true,
+      createdAt: true,
+      granteeUserId: true,
+      protectionOverridePercent: true,
+      queuePriority: true,
+      Grantee: { select: { email: true, name: true } },
+    },
+  },
+} satisfies Prisma.ModelPoolSelect;
+
+/** MCP pool list. Member endpoint slugs and grant rows; no model or capability JSON. */
+const poolSummarySelect = {
+  id: true,
+  createdAt: true,
+  slug: true,
+  name: true,
+  PoolMembers: {
+    orderBy: { createdAt: "asc" as const },
+    select: {
+      id: true,
+      tier: true,
+      healthStatus: true,
+      routingStatus: true,
+      DiscoveredModel: {
+        select: {
+          Endpoint: { select: { slug: true, CliDevice: { select: { slug: true } } } },
+        },
+      },
+      ExecutionTarget: {
+        select: {
+          DiscoveredModel: {
+            select: {
+              Endpoint: { select: { slug: true, CliDevice: { select: { slug: true } } } },
             },
           },
         },
@@ -2530,18 +2740,60 @@ export const forwarderManagementRouter = {
       return { slug: updated.slug, preview };
     }),
 
-  listCliDevices: protectedProcedure
-    .input(z.object({ includeModels: z.boolean().default(true) }).optional())
-    .handler(async ({ context }) => {
-      const rows = await prisma.cliDevice.findMany({
-        where: { userId: context.session.user.id },
-        orderBy: { createdAt: "desc" },
-        select: listCliDevicesSelect,
-      });
+  /**
+   * Dashboard inventory. Inlines endpoints and models; not an MCP tool.
+   * Agents use `listCliDeviceSummaries` and `getCliDevice`.
+   */
+  listCliDevices: protectedProcedure.handler(async ({ context }) => {
+    const rows = await prisma.cliDevice.findMany({
+      where: { userId: context.session.user.id },
+      orderBy: { createdAt: "desc" },
+      select: listCliDevicesSelect,
+    });
 
+    const now = new Date();
+    const live = await context.services?.getLiveCliFeatures?.(rows.map((row) => row.id));
+    return rows.map((row) => serializeCliDevice(row, now, live?.get(row.id) ?? null));
+  }),
+
+  /**
+   * MCP `forwarder_cli_devices_list`. Summaries only, one page at a time.
+   * No `models[]` and no capability JSON.
+   */
+  listCliDeviceSummaries: protectedProcedure
+    .input(summaryPageInput)
+    .handler(async ({ input, context }) => {
+      const rows = await prisma.cliDevice.findMany({
+        where: summaryPageWhere(context.session.user.id, input.cursor),
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: input.limit + 1,
+        select: cliDeviceSummarySelect,
+      });
+      const page = rows.slice(0, input.limit);
+      const last = page[page.length - 1];
       const now = new Date();
-      const live = await context.services?.getLiveCliFeatures?.(rows.map((row) => row.id));
-      return rows.map((row) => serializeCliDevice(row, now, live?.get(row.id) ?? null));
+      const live = await context.services?.getLiveCliFeatures?.(page.map((row) => row.id));
+      return {
+        items: page.map((row) => serializeCliDeviceSummary(row, now, live?.get(row.id) ?? null)),
+        nextCursor:
+          rows.length > input.limit && last !== undefined ? encodeSummaryCursor(last) : null,
+      };
+    }),
+
+  /** MCP `forwarder_cli_device_get`. The full device, including models. */
+  getCliDevice: protectedProcedure
+    .input(z.object({ cliDeviceId: idSchema }))
+    .handler(async ({ input, context }) => {
+      const row = await prisma.cliDevice.findUnique({
+        where: { id: input.cliDeviceId },
+        select: { ...listCliDevicesSelect, userId: true },
+      });
+      if (!row || row.userId !== context.session.user.id) {
+        throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+      }
+      const now = new Date();
+      const live = await context.services?.getLiveCliFeatures?.([row.id]);
+      return serializeCliDevice(row, now, live?.get(row.id) ?? null);
     }),
 
   /**
@@ -2772,6 +3024,7 @@ export const forwarderManagementRouter = {
       };
     }),
 
+  /** Dashboard inventory. Inlines members and models; not an MCP tool. */
   listModelPools: protectedProcedure.handler(async ({ context }) => {
     const rows = await prisma.modelPool.findMany({
       where: { userId: context.session.user.id },
@@ -2780,6 +3033,42 @@ export const forwarderManagementRouter = {
     });
     return rows.map(serializePool);
   }),
+
+  /**
+   * MCP `forwarder_model_pools_list`. Summaries only, one page at a time.
+   * Members carry endpoint slugs and probe-like routing status, not models.
+   */
+  listModelPoolSummaries: protectedProcedure
+    .input(summaryPageInput)
+    .handler(async ({ input, context }) => {
+      const rows = await prisma.modelPool.findMany({
+        where: summaryPageWhere(context.session.user.id, input.cursor),
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        take: input.limit + 1,
+        select: poolSummarySelect,
+      });
+      const page = rows.slice(0, input.limit);
+      const last = page[page.length - 1];
+      return {
+        items: page.map(serializePoolSummary),
+        nextCursor:
+          rows.length > input.limit && last !== undefined ? encodeSummaryCursor(last) : null,
+      };
+    }),
+
+  /** MCP `forwarder_model_pool_get`. The full pool, including members and models. */
+  getModelPool: protectedProcedure
+    .input(z.object({ poolId: idSchema }))
+    .handler(async ({ input, context }) => {
+      const row = await prisma.modelPool.findUnique({
+        where: { id: input.poolId },
+        select: { ...poolSelect, userId: true },
+      });
+      if (!row || row.userId !== context.session.user.id) {
+        throw new ORPCError("NOT_FOUND", { message: "Model pool not found." });
+      }
+      return serializePool(row);
+    }),
 
   poolCacheStats: protectedProcedure
     .input(poolCacheStatsInput)

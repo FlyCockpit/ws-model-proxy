@@ -2042,8 +2042,8 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
         904,
       ),
       904,
-    )) as unknown[];
-    expect(Array.isArray(poolsBefore)).toBe(true);
+    )) as { items: unknown[]; nextCursor: string | null };
+    expect(poolsBefore).toEqual({ items: [], nextCursor: null });
 
     // WRITE: create a pool owned by the verified sub.
     const slug = `it-pool-${suffix.replace(/-/g, "").slice(0, 12)}`;

@@ -276,8 +276,14 @@ supported. A concurrent local process that moves directories can still race a
 held fd after resolution; these tools do not confine arbitrary local processes.
 Without roots, unsupervised retains whole-filesystem access minus the protected set.
 
-`listCliDevices` reports `fileTools: {read, write}` (`headless`, `supervised`, `off`),
-`mcpFileRead`, `reportedMcpFileRead`, `reportedFileRoots`, and `allowFileToolsAsRoot`.
+`forwarder_cli_devices_list` returns summaries (id, slug, status, grants, endpoint
+slugs and probe status) and still reports `fileTools: {read, write}` (`headless`,
+`supervised`, `off`), `mcpFileRead`, `reportedMcpFileRead`, `reportedFileRoots`, and
+`allowFileToolsAsRoot`. It does not include `models[]` or capability JSON. Pages are
+`{ items, nextCursor }` (`limit` default 20, max 50). `forwarder_cli_device_get`
+`{ cliDeviceId }` returns one full device. `forwarder_model_pools_list` is the same
+kind of page (pool id, slug, name, grants, member endpoint slugs, routing and health
+status); `forwarder_model_pool_get` `{ poolId }` returns the full pool.
 `supervised` writes need a person's keypress. For a supervised read
 without the grant, request `cat` via a supervised command or enable the grant.
 The CLI independently checks local mode, read switch, roots and UID at every op;
