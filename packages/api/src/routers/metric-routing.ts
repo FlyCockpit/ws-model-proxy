@@ -26,12 +26,15 @@ import {
   ENDPOINT_LOAD_STALE_AFTER_MS,
   type EndpointLoadSample,
   endpointLoadSeries,
+  engineLoadHistoryKey,
+  engineLoadHistoryLookupKeys,
   type MetricSeries,
   nodeMetricSeries,
   parseNodeMetricsSample,
   parseStoredRemoteMetricSources,
   parseStoredRoutingRules,
   pickEndpointLoad,
+  pickEngineLoadHistorySeries,
   type RemoteMetricSourceDefinition,
   remoteMetricSourceDefinitionsSchema,
   routingRulesSchema,
@@ -436,15 +439,11 @@ export const metricRoutingProcedures = {
           ];
         });
       }
-      const keys = members.map((member) => ({
-        cliDeviceId: member.cliDeviceId,
-        endpointSlug: member.endpointSlug,
-        modelSlug: member.modelSlug,
-      }));
+      const keys = engineLoadHistoryLookupKeys(members);
       const history = context.services?.getLiveEngineLoadHistory?.(keys, now) ?? [];
       const byKey = new Map(
         history.map((entry) => [
-          `${entry.cliDeviceId}\u0000${entry.endpointSlug}\u0000${entry.modelSlug ?? ""}`,
+          engineLoadHistoryKey(entry.cliDeviceId, entry.endpointSlug, entry.modelSlug),
           entry.series,
         ]),
       );
@@ -459,10 +458,7 @@ export const metricRoutingProcedures = {
           signals: member.engineLoadSignals,
           effectiveKvFullThreshold: effectiveKvFullThreshold(member.kvFullThreshold),
           kvBudgetTokens: member.kvBudgetTokens,
-          series:
-            byKey.get(
-              `${member.cliDeviceId}\u0000${member.endpointSlug}\u0000${member.modelSlug ?? ""}`,
-            ) ?? [],
+          series: pickEngineLoadHistorySeries(byKey, member),
         })),
       };
     }),

@@ -804,7 +804,7 @@ fn endpoints_adapter_set_show_clear_round_trip_json() {
         "set",
         "local",
         "--route",
-        "stats",
+        "/stats",
         "--format",
         "json",
         "--interval",
@@ -815,12 +815,12 @@ fn endpoints_adapter_set_show_clear_round_trip_json() {
     let value = json_stdout(set);
     assert_eq!(value["engineAdapter"]["format"], "json");
     assert_eq!(value["engineAdapter"]["intervalSecs"], 3);
-    assert_eq!(value["engineAdapter"]["input"]["route"], "stats");
+    assert_eq!(value["engineAdapter"]["input"]["route"], "/stats");
 
     let mut show = cli(&config, &state);
     show.args(["endpoints", "--json", "adapter", "show", "local"]);
     let shown = json_stdout(show);
-    assert_eq!(shown["input"]["route"], "stats");
+    assert_eq!(shown["input"]["route"], "/stats");
     assert_eq!(shown["format"], "json");
 
     cli(&config, &state)

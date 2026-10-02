@@ -61,6 +61,7 @@ type Ring = {
   lastMs: number;
 };
 
+/** Same shape as live `endpoint.load`: null sample slug is the endpoint-wide key. */
 export function historyKey(
   cliDeviceId: string,
   endpointSlug: string,
@@ -195,12 +196,13 @@ export class EngineLoadHistoryStore {
     modelSlug: string | null,
     now: Date,
   ): EngineLoadHistoryPoint[] {
-    const ring = this.rings.get(historyKey(cliDeviceId, endpointSlug, modelSlug));
-    this.pruneRing(ring, now.getTime());
-    if (ring && ring.buckets.size === 0) {
-      this.drop(historyKey(cliDeviceId, endpointSlug, modelSlug), cliDeviceId);
+    const exact = this.ringSeries(cliDeviceId, endpointSlug, modelSlug, now);
+    // CLI samples are endpoint-wide (`modelSlug: null`). A member keyed by
+    // DiscoveredModel.slug falls back to that ring, like pickEndpointLoad.
+    if (modelSlug && !exact.ring) {
+      return this.ringSeries(cliDeviceId, endpointSlug, null, now).points;
     }
-    return expandHistorySeries(ring?.buckets.values() ?? [], now);
+    return exact.points;
   }
 
   snapshot(
@@ -218,6 +220,22 @@ export class EngineLoadHistoryStore {
       this.pruneRing(ring, now.getTime());
       if (ring.buckets.size === 0) this.drop(key, ring.cliDeviceId);
     }
+  }
+
+  private ringSeries(
+    cliDeviceId: string,
+    endpointSlug: string,
+    modelSlug: string | null,
+    now: Date,
+  ): { ring: Ring | undefined; points: EngineLoadHistoryPoint[] } {
+    const key = historyKey(cliDeviceId, endpointSlug, modelSlug);
+    const ring = this.rings.get(key);
+    this.pruneRing(ring, now.getTime());
+    if (ring && ring.buckets.size === 0) {
+      this.drop(key, cliDeviceId);
+      return { ring: undefined, points: expandHistorySeries([], now) };
+    }
+    return { ring, points: expandHistorySeries(ring?.buckets.values() ?? [], now) };
   }
 
   private pruneRing(ring: Ring | undefined, nowMs: number): void {

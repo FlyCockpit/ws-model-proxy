@@ -8,6 +8,7 @@ import {
   type RelayProtocolVersion,
   relayProtocolAtLeast,
 } from "@ws-model-proxy/api/lib/relay-protocol-version";
+import { adapterRouteIsValid } from "@ws-model-proxy/api/lib/remote-engine-adapters";
 import { normalizeReportedHostname } from "@ws-model-proxy/config/cli-device-name";
 import { normalizeLoginMachineId } from "@ws-model-proxy/config/login-machine-id";
 import { z } from "zod";
@@ -633,24 +634,10 @@ const adapterRouteSchema = z
   .string()
   .min(1)
   .max(1024)
-  .refine(
-    (route) => {
-      const trimmed = route.trim();
-      return (
-        trimmed.length > 0 &&
-        !trimmed.includes("\u0000") &&
-        !trimmed.includes("\\") &&
-        !trimmed.includes("://") &&
-        !trimmed.startsWith("//") &&
-        !trimmed.includes("..") &&
-        !trimmed.includes("?") &&
-        !trimmed.includes("#")
-      );
-    },
-    {
-      message: "adapter route must be a relative path with no scheme, host, .., query, or fragment",
-    },
-  );
+  .refine((route) => adapterRouteIsValid(route), {
+    message:
+      "adapter route must start with / and stay on the endpoint origin (no scheme, host, whitespace, .., query, or fragment)",
+  });
 
 const remoteEngineAdapterInputSchema = z.union([
   z.object({ route: adapterRouteSchema }).strict(),

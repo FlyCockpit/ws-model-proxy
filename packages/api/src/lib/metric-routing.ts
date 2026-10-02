@@ -355,6 +355,56 @@ export function pickEndpointLoad<T extends EndpointLoadSample>(
   );
 }
 
+/** Same key as live load / the in-memory history store: null slug is endpoint-wide. */
+export function engineLoadHistoryKey(
+  cliDeviceId: string,
+  endpointSlug: string,
+  modelSlug: string | null,
+): string {
+  return `${cliDeviceId}\u0000${endpointSlug}\u0000${modelSlug ?? ""}`;
+}
+
+/**
+ * History lookup mirrors `pickEndpointLoad`: a model-specific series wins;
+ * otherwise the endpoint-wide (`modelSlug: null`) sample is used. CLI samples
+ * always arrive with a null slug.
+ */
+export function pickEngineLoadHistorySeries<T extends { gap: boolean }>(
+  byKey: ReadonlyMap<string, readonly T[]>,
+  member: { cliDeviceId: string; endpointSlug: string; modelSlug: string | null },
+): T[] {
+  const exact =
+    byKey.get(engineLoadHistoryKey(member.cliDeviceId, member.endpointSlug, member.modelSlug)) ??
+    [];
+  if (member.modelSlug && !exact.some((point) => !point.gap)) {
+    const fallback =
+      byKey.get(engineLoadHistoryKey(member.cliDeviceId, member.endpointSlug, null)) ?? [];
+    if (fallback.some((point) => !point.gap)) return [...fallback];
+  }
+  return [...exact];
+}
+
+/** Exact member keys plus the endpoint-wide fallback when the member has a model slug. */
+export function engineLoadHistoryLookupKeys(
+  members: readonly { cliDeviceId: string; endpointSlug: string; modelSlug: string | null }[],
+): Array<{ cliDeviceId: string; endpointSlug: string; modelSlug: string | null }> {
+  const keys: Array<{ cliDeviceId: string; endpointSlug: string; modelSlug: string | null }> = [];
+  const seen = new Set<string>();
+  for (const member of members) {
+    for (const modelSlug of member.modelSlug ? [member.modelSlug, null] : [member.modelSlug]) {
+      const key = engineLoadHistoryKey(member.cliDeviceId, member.endpointSlug, modelSlug);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      keys.push({
+        cliDeviceId: member.cliDeviceId,
+        endpointSlug: member.endpointSlug,
+        modelSlug,
+      });
+    }
+  }
+  return keys;
+}
+
 /**
  * `endpoint.*` series for one member: the load of its own endpoint. A
  * model-specific reading wins over the endpoint-wide one.

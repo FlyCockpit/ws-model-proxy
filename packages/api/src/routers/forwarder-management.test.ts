@@ -7082,7 +7082,7 @@ describe("metric routing procedures (S-B part 2)", () => {
               engineLoadSignals: ["kvUsage"],
             },
             DiscoveredModel: {
-              slug: null,
+              slug: "qwen",
               upstreamModelId: "qwen",
               Endpoint: { slug: "gpu", cliDeviceId: "cli-1", CliDevice: { name: "GPU" } },
             },
@@ -7114,7 +7114,7 @@ describe("metric routing procedures (S-B part 2)", () => {
         poolMemberId: "m1",
         capacityId: "cap-1",
         endpointSlug: "gpu",
-        modelSlug: null,
+        modelSlug: "qwen",
         cliDeviceId: "cli-1",
         source: "custom",
         signals: ["kvUsage"],

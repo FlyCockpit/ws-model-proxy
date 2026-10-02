@@ -101,6 +101,72 @@ describe("engine-load rollup writer", () => {
     });
   });
 
+  it("maps a null sample slug onto every capacity on that endpoint", async () => {
+    const writes: unknown[] = [];
+    const writer = createEngineLoadRollupWriter({
+      clock: () => NOW.getTime() + 2_000,
+      write: async (increments) => {
+        writes.push(increments);
+        return increments.length;
+      },
+      resolveCapacities: async () => [
+        { capacityId: "cap-qwen", endpointSlug: "gpu", modelSlug: "qwen" },
+        { capacityId: "cap-other", endpointSlug: "gpu", modelSlug: "other" },
+        { capacityId: "cap-cpu", endpointSlug: "cpu", modelSlug: "qwen" },
+      ],
+    });
+    writers.push(writer);
+    writer.observe(sample({ modelSlug: null, running: 6, kvOccupancy: 0.4 }));
+    await writer.flushNow();
+    expect(writes).toHaveLength(1);
+    const increments = writes[0] as Array<{
+      capacityId: string;
+      modelSlug: string;
+      maxRunning: number;
+      maxKvOccupancy: number | null;
+    }>;
+    expect(increments).toHaveLength(2);
+    expect(increments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          capacityId: "cap-qwen",
+          modelSlug: "qwen",
+          maxRunning: 6,
+          maxKvOccupancy: 0.4,
+        }),
+        expect.objectContaining({
+          capacityId: "cap-other",
+          modelSlug: "other",
+          maxRunning: 6,
+          maxKvOccupancy: 0.4,
+        }),
+      ]),
+    );
+    expect(increments.some((row) => row.capacityId === "cap-cpu")).toBe(false);
+  });
+
+  it("keeps a non-null sample slug on its own capacity", async () => {
+    const writes: unknown[] = [];
+    const writer = createEngineLoadRollupWriter({
+      clock: () => NOW.getTime() + 2_000,
+      write: async (increments) => {
+        writes.push(increments);
+        return increments.length;
+      },
+      resolveCapacities: async () => [
+        { capacityId: "cap-qwen", endpointSlug: "gpu", modelSlug: "qwen" },
+        { capacityId: "cap-other", endpointSlug: "gpu", modelSlug: "other" },
+      ],
+    });
+    writers.push(writer);
+    writer.observe(sample({ modelSlug: "qwen", running: 3 }));
+    await writer.flushNow();
+    const increments = writes[0] as Array<{ capacityId: string; modelSlug: string }>;
+    expect(increments).toEqual([
+      expect.objectContaining({ capacityId: "cap-qwen", modelSlug: "qwen" }),
+    ]);
+  });
+
   it("refuses new pending keys at the process cap while a flush is in flight", async () => {
     const rows = [{ capacityId: "cap-1", endpointSlug: "gpu", modelSlug: "qwen" }];
     let releaseFirst: ((value: typeof rows) => void) | undefined;

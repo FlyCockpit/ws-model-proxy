@@ -173,7 +173,7 @@ enum AdapterSub {
 #[derive(Debug, clap::Args)]
 struct AdapterSetArgs {
     slug: String,
-    /// Relative path on the endpoint root (no scheme, host, `..`, or query).
+    /// Path on the endpoint origin (`/metrics`; no scheme, host, or `..`).
     #[arg(long, conflicts_with = "command")]
     route: Option<String>,
     /// Local command, run with the same bounds as metric sources.

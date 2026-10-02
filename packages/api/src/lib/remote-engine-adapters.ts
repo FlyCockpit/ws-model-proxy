@@ -31,16 +31,26 @@ function runnableCommand(command: string): boolean {
   );
 }
 
+const SCHEME_PREFIX = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+
+function hasAsciiControlOrWhitespace(route: string): boolean {
+  for (let i = 0; i < route.length; i += 1) {
+    const code = route.charCodeAt(i);
+    if (code <= 32 || code === 127) return true;
+  }
+  return false;
+}
+
+/** Path on the endpoint origin: one leading `/`, no scheme, host, whitespace, `..`, query, or fragment. */
 export function adapterRouteIsValid(route: string): boolean {
-  const trimmed = route.trim();
-  if (trimmed.length === 0) return false;
-  if (trimmed.includes("\u0000")) return false;
-  if (trimmed.includes("\\")) return false;
-  if (trimmed.includes("://")) return false;
-  if (trimmed.startsWith("//")) return false;
-  if (trimmed.includes("..")) return false;
-  if (trimmed.includes("?")) return false;
-  if (trimmed.includes("#")) return false;
+  if (route.length === 0) return false;
+  if (hasAsciiControlOrWhitespace(route)) return false;
+  if (route.includes("\\")) return false;
+  if (SCHEME_PREFIX.test(route)) return false;
+  if (!route.startsWith("/") || route.startsWith("//")) return false;
+  if (route.includes("..")) return false;
+  if (route.includes("?")) return false;
+  if (route.includes("#")) return false;
   return true;
 }
 
@@ -53,7 +63,7 @@ const adapterInputSchema = z.union([
         .max(1024)
         .refine((route) => adapterRouteIsValid(route), {
           message:
-            "adapter route must be a relative path with no scheme, host, .., query, or fragment",
+            "adapter route must start with / and stay on the endpoint origin (no scheme, host, whitespace, .., query, or fragment)",
         }),
     })
     .strict(),

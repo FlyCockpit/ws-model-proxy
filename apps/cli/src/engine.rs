@@ -116,9 +116,14 @@ pub fn engine_root_url(base_url: &str) -> Result<Url> {
 }
 
 fn route_url(base_url: &str, route: &str) -> Result<Url> {
-    engine_root_url(base_url)?
+    let base = engine_root_url(base_url)?;
+    let joined = base
         .join(route)
-        .with_context(|| format!("building `{route}` URL for `{base_url}`"))
+        .with_context(|| format!("building `{route}` URL for `{base_url}`"))?;
+    if joined.origin() != base.origin() {
+        anyhow::bail!("route `{route}` leaves the endpoint origin");
+    }
+    Ok(joined)
 }
 
 pub(crate) fn http_agent(timeout: Duration) -> ureq::Agent {
@@ -739,6 +744,24 @@ mod tests {
                 .expect("route")
                 .as_str(),
             "http://127.0.0.1:11434/api/version"
+        );
+        assert_eq!(
+            route_url("http://127.0.0.1:8080/v1", "/metrics")
+                .expect("route")
+                .as_str(),
+            "http://127.0.0.1:8080/metrics"
+        );
+        assert!(
+            route_url("http://127.0.0.1:8080/v1", "https:evil.example/x")
+                .unwrap_err()
+                .to_string()
+                .contains("leaves the endpoint origin")
+        );
+        assert!(
+            route_url("http://127.0.0.1:8080/v1", "//evil.example/x")
+                .unwrap_err()
+                .to_string()
+                .contains("leaves the endpoint origin")
         );
     }
 

@@ -3,12 +3,15 @@ import {
   describeSeries,
   ENDPOINT_LOAD_STALE_AFTER_MS,
   endpointLoadSeries,
+  engineLoadHistoryKey,
+  engineLoadHistoryLookupKeys,
   evaluateRoutingRules,
   type MetricSeries,
   NODE_METRICS_STALE_AFTER_MS,
   nodeMetricSeries,
   parseStoredRemoteMetricSources,
   parseStoredRoutingRules,
+  pickEngineLoadHistorySeries,
   type RoutingRule,
   remoteMetricSourceDefinitionsSchema,
   routingRulesSchema,
@@ -316,6 +319,42 @@ describe("series flattening", () => {
     const endpointWide = endpointLoadSeries(loads, { endpointSlug: "a", modelSlug: "other" }, NOW);
     expect(endpointWide.find((entry) => entry.name === "endpoint.running")?.value).toBe(1);
     expect(endpointLoadSeries(loads, { endpointSlug: "c", modelSlug: null }, NOW)).toEqual([]);
+  });
+
+  it("falls back to endpoint-wide engine-load history when the sample slug is null", () => {
+    const endpointWide = [{ gap: false as const, running: 4 }];
+    const modelSpecific = [{ gap: false as const, running: 1 }];
+    const byKey = new Map([
+      [engineLoadHistoryKey("cli", "gpu", null), endpointWide],
+      [engineLoadHistoryKey("cli", "gpu", "qwen"), modelSpecific],
+    ]);
+    expect(
+      pickEngineLoadHistorySeries(byKey, {
+        cliDeviceId: "cli",
+        endpointSlug: "gpu",
+        modelSlug: "other",
+      }),
+    ).toEqual(endpointWide);
+    expect(
+      pickEngineLoadHistorySeries(byKey, {
+        cliDeviceId: "cli",
+        endpointSlug: "gpu",
+        modelSlug: "qwen",
+      }),
+    ).toEqual(modelSpecific);
+    expect(
+      pickEngineLoadHistorySeries(byKey, {
+        cliDeviceId: "cli",
+        endpointSlug: "gpu",
+        modelSlug: null,
+      }),
+    ).toEqual(endpointWide);
+    expect(
+      engineLoadHistoryLookupKeys([{ cliDeviceId: "cli", endpointSlug: "gpu", modelSlug: "qwen" }]),
+    ).toEqual([
+      { cliDeviceId: "cli", endpointSlug: "gpu", modelSlug: "qwen" },
+      { cliDeviceId: "cli", endpointSlug: "gpu", modelSlug: null },
+    ]);
   });
 
   it("describes series for discovery with a stale flag", () => {

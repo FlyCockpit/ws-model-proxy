@@ -119,6 +119,19 @@ describe("engine-load history ring", () => {
     expect(other.size).toBe(ENGINE_LOAD_HISTORY_MAX_KEYS);
   });
 
+  it("falls back to the endpoint-wide ring when the sample slug is null", () => {
+    const store = new EngineLoadHistoryStore();
+    store.record("d1", "gpu", null, sample({ running: 7, kvUsage: 0.3 }));
+    const forModel = store.series("d1", "gpu", "qwen", T0);
+    expect(forModel.at(-1)).toMatchObject({ running: 7, kvUsage: 0.3, gap: false });
+    const endpointWide = store.series("d1", "gpu", null, T0);
+    expect(endpointWide.at(-1)).toMatchObject({ running: 7, gap: false });
+    store.record("d1", "gpu", "qwen", sample({ running: 2, receivedAt: T0 }));
+    const modelSpecific = store.series("d1", "gpu", "qwen", T0);
+    expect(modelSpecific.at(-1)).toMatchObject({ running: 2, gap: false });
+    expect(store.series("d1", "other", "qwen", T0).every((point) => point.gap)).toBe(true);
+  });
+
   it("keeps history across a reconnect of the same manager store", () => {
     const store = new EngineLoadHistoryStore();
     store.record("d1", "gpu", null, sample({ running: 6, kvOccupancy: 0.5, source: "custom" }));

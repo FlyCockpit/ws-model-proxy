@@ -249,17 +249,21 @@ export function createEngineLoadRollupWriter({
             : await resolveCapacities(ownerUserId, cliDeviceId);
         if (!cached || clock() - cached.at >= CAPACITY_CACHE_MS)
           capacityCache.set(cliDeviceId, { at: clock(), rows });
-        const byEndpoint = new Map(
-          rows.map((row) => [`${row.endpointSlug}\u0000${row.modelSlug}`, row.capacityId]),
-        );
         const merged = new Map<string, EngineLoadRollupIncrement>();
         for (const sample of samples) {
-          const capacityId = byEndpoint.get(
-            `${sample.endpointSlug}\u0000${sample.modelSlug ?? ""}`,
-          );
-          if (!capacityId) continue;
-          const key = `${capacityId}\u0000${pendingKey(sample)}`;
-          merged.set(key, mergeEngineLoadIncrements(merged.get(key), sample, capacityId));
+          // Null sample slug is endpoint-wide: attribute it to every capacity
+          // on that endpoint. A non-null slug still matches only that model.
+          const matches = sample.modelSlug
+            ? rows.filter(
+                (row) =>
+                  row.endpointSlug === sample.endpointSlug && row.modelSlug === sample.modelSlug,
+              )
+            : rows.filter((row) => row.endpointSlug === sample.endpointSlug);
+          for (const row of matches) {
+            const attributed = { ...sample, modelSlug: row.modelSlug };
+            const key = `${row.capacityId}\u0000${pendingKey(attributed)}`;
+            merged.set(key, mergeEngineLoadIncrements(merged.get(key), attributed, row.capacityId));
+          }
         }
         increments.push(...merged.values());
       }

@@ -314,23 +314,26 @@ pub enum LoadPlan {
     Adapter(EngineAdapterConfig),
 }
 
-/// Relative path on the endpoint root: no scheme, host, `..`, query, or fragment.
+/// Path on the endpoint origin: one leading `/`, no scheme, host, whitespace,
+/// `..`, query, or fragment. `Url::join` still has to stay on that origin.
 pub fn validate_route(route: &str) -> Result<(), &'static str> {
-    let route = route.trim();
     if route.is_empty() {
         return Err("empty");
     }
-    if route.as_bytes().contains(&0) {
-        return Err("nul");
+    if route.bytes().any(|byte| byte <= 32 || byte == 127) {
+        return Err("control");
     }
     if route.contains('\\') {
         return Err("backslash");
     }
-    if route.contains("://") {
+    if has_scheme_prefix(route) {
         return Err("scheme");
     }
     if route.starts_with("//") {
         return Err("host");
+    }
+    if !route.starts_with('/') {
+        return Err("path");
     }
     if route.contains("..") {
         return Err("parent");
@@ -342,6 +345,22 @@ pub fn validate_route(route: &str) -> Result<(), &'static str> {
         return Err("fragment");
     }
     Ok(())
+}
+
+fn has_scheme_prefix(route: &str) -> bool {
+    let bytes = route.as_bytes();
+    if bytes.first().is_none_or(|byte| !byte.is_ascii_alphabetic()) {
+        return false;
+    }
+    for byte in bytes.iter().skip(1) {
+        if *byte == b':' {
+            return true;
+        }
+        if !byte.is_ascii_alphanumeric() && !matches!(byte, b'+' | b'-' | b'.') {
+            return false;
+        }
+    }
+    false
 }
 
 /// Parse `--map signal=series[{k="v"}][*scale]`.
@@ -920,7 +939,7 @@ mod tests {
     fn json_spec(map: BTreeMap<AdapterSignal, SignalSelector>) -> EngineAdapterConfig {
         EngineAdapterConfig {
             input: AdapterInput::Route {
-                route: "stats".to_string(),
+                route: "/stats".to_string(),
             },
             format: AdapterFormat::Json,
             interval_secs: 2,
@@ -932,7 +951,7 @@ mod tests {
     fn prom_spec(map: BTreeMap<AdapterSignal, SignalSelector>) -> EngineAdapterConfig {
         EngineAdapterConfig {
             input: AdapterInput::Route {
-                route: "metrics".to_string(),
+                route: "/metrics".to_string(),
             },
             format: AdapterFormat::Prometheus,
             interval_secs: 2,
@@ -952,17 +971,21 @@ mod tests {
 
     #[test]
     fn route_validation_rejects_scheme_host_parent_query_and_fragment() {
-        assert_eq!(validate_route("metrics"), Ok(()));
         assert_eq!(validate_route("/metrics"), Ok(()));
-        assert_eq!(validate_route("v1/stats.json"), Ok(()));
+        assert_eq!(validate_route("/v1/load"), Ok(()));
         assert_eq!(validate_route(""), Err("empty"));
-        assert_eq!(validate_route("  "), Err("empty"));
+        assert_eq!(validate_route("  "), Err("control"));
+        assert_eq!(validate_route("https:evil.example/x"), Err("scheme"));
+        assert_eq!(validate_route("http:foo"), Err("scheme"));
         assert_eq!(validate_route("http://127.0.0.1/metrics"), Err("scheme"));
-        assert_eq!(validate_route("//host/metrics"), Err("host"));
-        assert_eq!(validate_route("../metrics"), Err("parent"));
-        assert_eq!(validate_route("foo/../metrics"), Err("parent"));
-        assert_eq!(validate_route("metrics?full=1"), Err("query"));
-        assert_eq!(validate_route("metrics#a"), Err("fragment"));
+        assert_eq!(validate_route("//evil.example/x"), Err("host"));
+        assert_eq!(validate_route("/\t/evil.example/x"), Err("control"));
+        assert_eq!(validate_route(" /abs"), Err("control"));
+        assert_eq!(validate_route("foo/bar"), Err("path"));
+        assert_eq!(validate_route("metrics"), Err("path"));
+        assert_eq!(validate_route("/foo/../metrics"), Err("parent"));
+        assert_eq!(validate_route("/metrics?full=1"), Err("query"));
+        assert_eq!(validate_route("/metrics#a"), Err("fragment"));
     }
 
     #[test]
@@ -1161,7 +1184,7 @@ hits{model=\"b\"} 5
         map.insert(AdapterSignal::Running, selector("my_running", Some(1.0)));
         let mapped = EngineAdapterConfig {
             input: AdapterInput::Route {
-                route: "metrics".to_string(),
+                route: "/metrics".to_string(),
             },
             format: AdapterFormat::Prometheus,
             interval_secs: 2,
@@ -1170,7 +1193,7 @@ hits{model=\"b\"} 5
         };
         assert_eq!(
             canonical_spec_json("gpu", &mapped),
-            r#"{"endpointSlug":"gpu","format":"prometheus","input":{"route":"metrics"},"intervalSecs":2,"map":{"running":{"scale":1,"series":"my_running"}},"timeoutSecs":2}"#
+            r#"{"endpointSlug":"gpu","format":"prometheus","input":{"route":"/metrics"},"intervalSecs":2,"map":{"running":{"scale":1,"series":"my_running"}},"timeoutSecs":2}"#
         );
         assert_ne!(
             spec_sha256("gpu", &command_spec()),
@@ -1202,5 +1225,24 @@ hits{model=\"b\"} 5
             remote_adapter_eligibility(&spec, "gpu", true, true, Some(&hash)),
             RemoteAdapterEligibility::Refused
         );
+    }
+
+    #[test]
+    fn remote_route_that_leaves_origin_is_refused_even_with_a_matching_hash() {
+        let spec = EngineAdapterConfig {
+            input: AdapterInput::Route {
+                route: "https:evil.example/x".to_string(),
+            },
+            format: AdapterFormat::Json,
+            interval_secs: 2,
+            timeout_secs: 2,
+            map: BTreeMap::new(),
+        };
+        let hash = spec_sha256("gpu", &spec);
+        assert_eq!(
+            remote_adapter_eligibility(&spec, "gpu", true, false, Some(&hash)),
+            RemoteAdapterEligibility::Refused
+        );
+        assert!(spec.validate().is_err());
     }
 }
