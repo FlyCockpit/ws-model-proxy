@@ -185,6 +185,11 @@ caller waits the full local budget. MCP:
 - **Engine-load history survives a reconnect.** Disconnect no longer wipes the
   30-minute rings. New keys at the 2000-ring (or 64-per-device) cap are refused
   while existing live rings stay; rings older than the window are pruned.
+- **`GET /v1/models` lists only ids this token can call now.** Plain pool and
+  direct ids need a published PRIMARY local member (or the direct model) with
+  a live CLI session. Empty, unpublished, and disconnected ids are omitted.
+  FULL or saturated pools stay listed. `owner/pool:external` stays when the
+  token has access, even if no local member is live.
 - **MCP `fields` for nested argument errors are dotted paths** (`rules.0.threshold`).
   Guarded pool-create policy errors name the create input keys (`reservedSlots`,
   `memberConcurrencyLimit`, `memberContextCeiling`, `advanced.contextMargin`).

@@ -609,8 +609,12 @@ All of these except the two account rows carry `x-wsmp-fallback: unavailable`.
 - A pool with only external members answers its plain name with
   `400 external_required`, naming the `:external` id.
 
-`/v1/models` lists `owner/pool:external` only when this token could be served
-that way (switch, token, owner consent, and a configured pool fallback or own-key route).
+`/v1/models` lists only ids this token can call now. Plain pool and direct ids
+need a published PRIMARY local member (or the direct model) with a live CLI
+session; empty, unpublished, and disconnected ids are omitted. FULL or
+saturated local pools stay listed. `owner/pool:external` is listed when this
+token could be served that way (switch, token, owner consent, and a configured
+pool fallback or own-key route), even if no local member is live.
 
 Attempts that are refused before provider I/O settle their token and spend
 reservations at zero. If bytes may have reached the provider and no trustworthy

@@ -5313,6 +5313,7 @@ describe("model API routes", () => {
     db.discoveredModel.findMany.mockResolvedValue([
       {
         id: directTarget.id,
+        published: true,
         capabilityOverrideMode: "OVERRIDE",
         capabilityOverrideMetadata: {
           version: 1,
@@ -5325,7 +5326,13 @@ describe("model API routes", () => {
             audio: true,
           },
         },
-        Endpoint: { capabilityMetadata: null },
+        Endpoint: {
+          published: true,
+          status: "ONLINE",
+          cliDeviceId: "cli-device-id",
+          CliDevice: { status: "CONNECTED" },
+          capabilityMetadata: null,
+        },
       },
     ]);
     db.poolMember.findMany.mockResolvedValue([]);
@@ -5364,32 +5371,6 @@ describe("model API routes", () => {
             modality: "text+image+audio+video->text",
           },
         },
-        {
-          id: poolTarget.modelId,
-          object: "model",
-          created: 0,
-          owned_by: "owner",
-          // Empty pool → text-only advertisement defaults.
-          supports_vision: false,
-          supports_video_input: false,
-          supports_audio_input: false,
-          supports_audio_output: false,
-          supports_audio_transcription: false,
-          supports_audio_translation: false,
-          capabilities: {
-            vision: false,
-            video_input: false,
-            audio_input: false,
-            audio_output: false,
-            audio_transcription: false,
-            audio_translation: false,
-          },
-          architecture: {
-            input_modalities: ["text"],
-            output_modalities: ["text"],
-            modality: "text->text",
-          },
-        },
       ],
     });
     expect(mockedTokenAccess.authenticateModelApiTokenSecret).toHaveBeenCalledWith(
@@ -5403,9 +5384,14 @@ describe("model API routes", () => {
     db.discoveredModel.findMany.mockResolvedValue([
       {
         id: directTarget.id,
+        published: true,
         capabilityOverrideMode: "OVERRIDE",
         capabilityOverrideMetadata: { not: "a valid capabilities object" },
         Endpoint: {
+          published: true,
+          status: "ONLINE",
+          cliDeviceId: "cli-device-id",
+          CliDevice: { status: "CONNECTED" },
           capabilityMetadata: {
             version: 1,
             protocol: "openai-compatible",
@@ -5457,19 +5443,34 @@ describe("model API routes", () => {
     };
   }
 
-  function localMemberListRow(poolId: string) {
+  function localMemberListRow(
+    poolId: string,
+    overrides: {
+      published?: boolean;
+      endpointPublished?: boolean;
+      cliDeviceId?: string;
+      cliDeviceStatus?: string;
+    } = {},
+  ) {
     return {
       poolId,
       tier: "PRIMARY",
       ExecutionTarget: {
         DiscoveredModel: {
+          published: overrides.published ?? true,
           capabilityOverrideMode: "OVERRIDE",
           capabilityOverrideMetadata: {
             version: 1,
             protocol: "openai-compatible",
             chatCompletions: { supported: true, streaming: true, video: true },
           },
-          Endpoint: { capabilityMetadata: null },
+          Endpoint: {
+            published: overrides.endpointPublished ?? true,
+            status: "ONLINE",
+            cliDeviceId: overrides.cliDeviceId ?? "cli-device-id",
+            CliDevice: { status: overrides.cliDeviceStatus ?? "CONNECTED" },
+            capabilityMetadata: null,
+          },
         },
         ProviderModel: null,
       },
@@ -5484,8 +5485,8 @@ describe("model API routes", () => {
     supports_video_input: boolean;
   };
 
-  async function listedModels() {
-    const response = await appWith(new FakeRelayManager()).request("/models", {
+  async function listedModels(manager = new FakeRelayManager()) {
+    const response = await appWith(manager).request("/models", {
       headers: { authorization: "Bearer wsmp_model_test" },
     });
     expect(response.status).toBe(200);
@@ -5542,6 +5543,69 @@ describe("model API routes", () => {
     expect((await listedModels()).map((entry) => entry.id)).toEqual([
       externalPoolTarget.modelId,
       EXTERNAL_MODEL_ID,
+    ]);
+  });
+
+  it("omits idle, unpublished, and disconnected plain ids and keeps :external", async () => {
+    const idlePool = { ...poolTarget, id: "idle-pool", modelId: "owner/idle" };
+    const unpublishedPool = { ...poolTarget, id: "unpublished-pool", modelId: "owner/unpublished" };
+    const disconnectedPool = {
+      ...externalPoolTarget,
+      id: "disconnected-pool",
+      modelId: "owner/disconnected",
+    };
+    mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+      directModels: [directTarget],
+      modelPools: [poolTarget, idlePool, unpublishedPool, disconnectedPool],
+    });
+    externalConsent.poolIds = [disconnectedPool.id];
+    db.discoveredModel.findMany.mockResolvedValue([
+      {
+        id: directTarget.id,
+        published: true,
+        capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+        capabilityOverrideMetadata: null,
+        Endpoint: {
+          published: true,
+          status: "ONLINE",
+          cliDeviceId: "cli-device-id",
+          CliDevice: { status: "CONNECTED" },
+          capabilityMetadata: null,
+        },
+      },
+    ]);
+    db.poolMember.findMany.mockResolvedValue([
+      localMemberListRow(poolTarget.id),
+      localMemberListRow(unpublishedPool.id, { published: false }),
+      localMemberListRow(disconnectedPool.id, { cliDeviceId: "cli-offline" }),
+      externalMemberListRow(disconnectedPool.id),
+    ]);
+
+    const connected = new FakeRelayManager();
+    expect((await listedModels(connected)).map((entry) => entry.id)).toEqual([
+      directTarget.modelId,
+      poolTarget.modelId,
+      `${disconnectedPool.modelId}:external`,
+    ]);
+
+    connected.activeCliDeviceIds = [];
+    db.discoveredModel.findMany.mockResolvedValue([
+      {
+        id: directTarget.id,
+        published: true,
+        capabilityOverrideMode: "INHERIT_ENDPOINT_DEFAULTS",
+        capabilityOverrideMetadata: null,
+        Endpoint: {
+          published: true,
+          status: "ONLINE",
+          cliDeviceId: "cli-device-id",
+          CliDevice: { status: "DISCONNECTED" },
+          capabilityMetadata: null,
+        },
+      },
+    ]);
+    expect((await listedModels(connected)).map((entry) => entry.id)).toEqual([
+      `${disconnectedPool.modelId}:external`,
     ]);
   });
 
@@ -17616,7 +17680,7 @@ describe("model API routes", () => {
         directModels: [],
         modelPools: [poolTarget],
       });
-      db.poolMember.findMany.mockResolvedValue([]);
+      db.poolMember.findMany.mockResolvedValue([localMemberListRow(poolTarget.id)]);
       db.modelPool.findMany.mockResolvedValue([
         {
           id: poolTarget.id,
@@ -17679,7 +17743,7 @@ describe("model API routes", () => {
         directModels: [],
         modelPools: [poolTarget],
       });
-      db.poolMember.findMany.mockResolvedValue([]);
+      db.poolMember.findMany.mockResolvedValue([localMemberListRow(poolTarget.id)]);
       db.modelPool.findMany.mockResolvedValue([
         {
           id: poolTarget.id,

@@ -3816,15 +3816,61 @@ async function assertLocalSendAllowed(input: LocalSendInput): Promise<void> {
  * (supports_vision, capabilities, architecture.input_modalities, …). See
  * `model-list-modalities.ts`. Official OpenAI only requires id/created/object/owned_by.
  */
+const modelListEndpointSelect = {
+  published: true,
+  status: true,
+  cliDeviceId: true,
+  capabilityMetadata: true,
+  CliDevice: { select: { status: true } },
+} as const;
+
+const modelListDiscoveredSelect = {
+  published: true,
+  capabilityOverrideMode: true,
+  capabilityOverrideMetadata: true,
+  Endpoint: { select: modelListEndpointSelect },
+} as const;
+
+function discoveredModelIsActivelyServing(
+  model:
+    | {
+        published: boolean;
+        Endpoint: {
+          published: boolean;
+          status: string | null;
+          cliDeviceId: string;
+          CliDevice: { status: string } | null;
+        };
+      }
+    | null
+    | undefined,
+  activeCliDeviceIds: Set<string>,
+): boolean {
+  if (!model) return false;
+  return isPublishedEndpointExecutable({
+    modelPublished: model.published,
+    endpointPublished: model.Endpoint.published,
+    endpointStatus: model.Endpoint.status,
+    cliDeviceId: model.Endpoint.cliDeviceId,
+    cliDeviceStatus: model.Endpoint.CliDevice?.status,
+    activeCliDeviceIds,
+  });
+}
+
 async function modelListResponse(
   targets: {
     directModels: VisibleDirectModelTarget[];
     modelPools: VisibleModelPoolTarget[];
   },
-  external?: { requester: RelayRequester; externalPoolIds: ReadonlySet<string> },
+  external?: {
+    requester: RelayRequester;
+    externalPoolIds: ReadonlySet<string>;
+    activeCliDeviceIds?: Iterable<string>;
+  },
 ) {
   const directIds = targets.directModels.map((model) => model.id);
   const poolIds = targets.modelPools.map((pool) => pool.id);
+  const activeCliDeviceIds = new Set(external?.activeCliDeviceIds ?? []);
 
   const directRows =
     directIds.length === 0
@@ -3833,9 +3879,7 @@ async function modelListResponse(
           where: { id: { in: directIds } },
           select: {
             id: true,
-            capabilityOverrideMode: true,
-            capabilityOverrideMetadata: true,
-            Endpoint: { select: { capabilityMetadata: true } },
+            ...modelListDiscoveredSelect,
           },
         });
 
@@ -3869,13 +3913,7 @@ async function modelListResponse(
             tier: true,
             ExecutionTarget: {
               select: {
-                DiscoveredModel: {
-                  select: {
-                    capabilityOverrideMode: true,
-                    capabilityOverrideMetadata: true,
-                    Endpoint: { select: { capabilityMetadata: true } },
-                  },
-                },
+                DiscoveredModel: { select: modelListDiscoveredSelect },
                 ProviderModel: {
                   select: {
                     enabled: true,
@@ -3888,13 +3926,7 @@ async function modelListResponse(
                 },
               },
             },
-            DiscoveredModel: {
-              select: {
-                capabilityOverrideMode: true,
-                capabilityOverrideMetadata: true,
-                Endpoint: { select: { capabilityMetadata: true } },
-              },
-            },
+            DiscoveredModel: { select: modelListDiscoveredSelect },
           },
         });
 
@@ -3962,6 +3994,25 @@ async function modelListResponse(
   const localPoolIds = new Set(
     poolMemberRows.filter((row) => row.tier === "PRIMARY").map((row) => row.poolId),
   );
+  // Actively serving = published PRIMARY local member with a live CLI session.
+  // FULL / saturated pools stay listed. Health and KV occupancy are not a hide.
+  const servingDirectIds = new Set(
+    directRows
+      .filter((row) => discoveredModelIsActivelyServing(row, activeCliDeviceIds))
+      .map((row) => row.id),
+  );
+  const servingPoolIds = new Set(
+    poolMemberRows
+      .filter(
+        (row) =>
+          row.tier === "PRIMARY" &&
+          discoveredModelIsActivelyServing(
+            row.ExecutionTarget?.DiscoveredModel ?? row.DiscoveredModel,
+            activeCliDeviceIds,
+          ),
+      )
+      .map((row) => row.poolId),
+  );
   for (const poolId of poolIds) {
     // Provider-only pools advertise their external members' capabilities on
     // the `:external` entry; every other pool advertises its local members.
@@ -4020,15 +4071,18 @@ async function modelListResponse(
   return {
     object: "list" as const,
     data: [
-      ...targets.directModels.map((model) => {
+      ...targets.directModels.flatMap((model) => {
+        if (!servingDirectIds.has(model.id)) return [];
         const flags = directCapsById.get(model.id) ?? multimodalFlagsFromCapabilities(null);
-        return {
-          id: model.modelId,
-          object: "model" as const,
-          created: 0,
-          owned_by: model.ownerUserSlug,
-          ...openAiModelListExtensions(flags),
-        };
+        return [
+          {
+            id: model.modelId,
+            object: "model" as const,
+            created: 0,
+            owned_by: model.ownerUserSlug,
+            ...openAiModelListExtensions(flags),
+          },
+        ];
       }),
       ...targets.modelPools.flatMap((pool) => {
         const flags = poolFlagsById.get(pool.id) ?? multimodalFlagsFromCapabilities(null);
@@ -4039,10 +4093,7 @@ async function modelListResponse(
           owned_by: pool.ownerUserSlug,
           ...openAiModelListExtensions(flags),
         });
-        const hasLocalMembers = localPoolIds.has(pool.id);
-        // A pool with only external members cannot serve its plain name.
-        const plain =
-          hasLocalMembers || pool.externalMemberCount === 0 ? [entry(pool.modelId)] : [];
+        const plain = servingPoolIds.has(pool.id) ? [entry(pool.modelId)] : [];
         // `owner/pool:external` is listed only when this caller could be served
         // that way, from static configuration (never live health): switch on,
         // this token consents for this pool, the owner allows this requester,
@@ -10309,7 +10360,11 @@ export function createModelApiRoutes(dependencies: ModelApiRouteDependencies = {
     const { targets, externalPoolIds } =
       await listVisibleModelTargetsWithExternalPermissionForToken(token);
     return c.json(
-      await modelListResponse(targets, { requester: requesterFromToken(token), externalPoolIds }),
+      await modelListResponse(targets, {
+        requester: requesterFromToken(token),
+        externalPoolIds,
+        activeCliDeviceIds: manager.getActiveCliDeviceIds(),
+      }),
     );
   });
 
