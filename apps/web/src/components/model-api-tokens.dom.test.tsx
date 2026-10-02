@@ -515,6 +515,27 @@ it("creates with an optional wait and omits it when left empty", async () => {
   });
 });
 
+it("does not validate the hidden wait when allow-external is off", async () => {
+  mount();
+  openCreate();
+  fireEvent.click(
+    screen.getByRole("checkbox", { name: "dashboard:tokens.externalAccess.createAllow" }),
+  );
+  fireEvent.change(screen.getByLabelText("dashboard:tokens.externalWait.label"), {
+    target: { value: "nope" },
+  });
+  fireEvent.click(
+    screen.getByRole("checkbox", { name: "dashboard:tokens.externalAccess.createAllow" }),
+  );
+  expect(screen.queryByLabelText("dashboard:tokens.externalWait.label")).toBeNull();
+  submit();
+  await waitFor(() => expect(state.calls).toHaveLength(1));
+  expect(state.calls[0]).toEqual({
+    name: "create",
+    input: { name: "Example", scopeMode: "ALL_VISIBLE", modelIds: [] },
+  });
+});
+
 it("creates with a stored wait when the field is set", async () => {
   mount();
   openCreate();

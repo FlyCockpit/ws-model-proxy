@@ -22,15 +22,6 @@ export const NODE_BUDGET_MAX_GB = 1_000_000;
 /** GPU index is 0–255, so a VRAM map cannot need more keys than that. */
 export const NODE_VRAM_KEYS_MAX = 256;
 
-/** Trim and turn a single comma decimal (`1,5`) into a dot decimal (`1.5`). */
-export function normalizeDecimalInput(raw: string): string {
-  const trimmed = raw.trim();
-  const comma = trimmed.indexOf(",");
-  if (comma === -1 || trimmed.includes(".") || trimmed.indexOf(",", comma + 1) !== -1) {
-    return trimmed;
-  }
-  return `${trimmed.slice(0, comma)}.${trimmed.slice(comma + 1)}`;
-}
 const GPU_INDEX_KEY = /^index:(0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])$/;
 const GPU_UUID_KEY = /^[A-Za-z0-9_.:@-]{1,128}$/;
 

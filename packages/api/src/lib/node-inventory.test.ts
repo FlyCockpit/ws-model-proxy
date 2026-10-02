@@ -10,7 +10,6 @@ import {
   nodeHasAllLabels,
   nodeHealthWarnings,
   nodeLabelsSchema,
-  normalizeDecimalInput,
   normalizeNodeLabels,
   parseNodeInfo,
   resolveUsableBudgets,
@@ -102,16 +101,6 @@ describe("suggestNodeLabels", () => {
         memoryTotalMiB: 8 * 1024,
       }),
     ).toEqual(["low-power"]);
-  });
-});
-
-describe("normalizeDecimalInput", () => {
-  it("trims and turns one comma into a dot", () => {
-    expect(normalizeDecimalInput(" 1,5 ")).toBe("1.5");
-    expect(normalizeDecimalInput("1.5")).toBe("1.5");
-    expect(normalizeDecimalInput("1,5,0")).toBe("1,5,0");
-    expect(normalizeDecimalInput("1.5,0")).toBe("1.5,0");
-    expect(normalizeDecimalInput("")).toBe("");
   });
 });
 

@@ -160,13 +160,19 @@ caller waits the full local budget. MCP:
 ## CLI identity bind and native count
 
 - **CLI devices and CLI tokens bind to the CLI identity key, not `/etc/machine-id`.**
-  Hello signs a server nonce mixed with the server origin. Every device
-  credential must run `wsmp login` again on each machine. CLI tokens TOFU-bind
-  on first hello; the owner can reset that bind from the dashboard. A copied
+  Hello signs a server nonce mixed with the server origin. Every existing
+  device credential is refused until `wsmp login` is run once per machine.
+  CLI tokens TOFU-bind the identity key on first hello; the owner can reset
+  that bind from the dashboard without revoking the token. A copied
   `service.env` cannot take over another machine. Hello reports
   `identity_mismatch` when the bound key does not match. A 2.4 CLI against an
   older server exits with an upgrade-the-server error. Unexpected server
   failures send `protocol.error` `internal` and the CLI reconnects.
+- **Metric routing rules live in `pool_routing_rule`.** Databases built from
+  v0.3.1 never stored `model_pool.routingRules` JSON. Unreleased master
+  databases that did lose those rules on the schema push (`APPLY_SCHEMA=safe`
+  stops on the column drop; `dangerous` drops them). Re-enter the rules in
+  the dashboard after upgrading a master-built DB.
 - **Native Chat Completions counting is per endpoint.** The CLI probe writes
   `engineFacts.countContext` onto the inference capacity (`engineCountContext`,
   additive, `APPLY_SCHEMA=safe`). Near-ceiling Chat Completions skip native

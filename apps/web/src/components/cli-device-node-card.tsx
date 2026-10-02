@@ -7,8 +7,9 @@ import {
   NODE_LABELS_MAX,
   type NodeCardSnapshot,
   nodeLabelsSchema,
-  normalizeDecimalInput,
 } from "@ws-model-proxy/api/lib/node-inventory";
+import { parseLocaleDecimal } from "@ws-model-proxy/config/decimal-input";
+import { DEFAULT_LOCALE } from "@ws-model-proxy/config/locales";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import {
   Dialog,
@@ -27,7 +28,7 @@ import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 
-import { friendly } from "@/utils/friendly-error";
+import { friendly, isBadRequest } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
 function formatGb(value: number | null | undefined): string | null {
@@ -39,25 +40,71 @@ function gpuKey(gpu: NodeCardSnapshot["gpus"][number]): string {
   return gpuBudgetKey({ index: gpu.index, uuid: gpu.uuid ?? undefined });
 }
 
-function budgetInputValue(value: number | null, isDefault: boolean): string {
-  if (isDefault || value == null) return "";
-  return String(value);
+function formatBudgetInput(value: number): string {
+  if (!Number.isFinite(value) || value < 0) return "";
+  const rounded = Math.round(value * 1e9) / 1e9;
+  if (rounded === 0) return "0";
+  return rounded.toFixed(9).replace(/\.?0+$/, "");
 }
 
-function parseBudgetInput(raw: string): number | null {
-  const normalized = normalizeDecimalInput(raw);
-  if (normalized.length === 0) return null;
+function budgetInputValue(value: number | null, isDefault: boolean): string {
+  if (isDefault || value == null) return "";
+  return formatBudgetInput(value);
+}
+
+function parseBudgetInput(raw: string, locale: string): number | null {
+  const normalized = parseLocaleDecimal(raw, locale);
+  if (normalized === null || normalized.length === 0) return null;
   return Number(normalized);
 }
 
-function budgetInputSchema(invalidMessage: string) {
-  return z.string().refine((raw) => {
-    const value = normalizeDecimalInput(raw);
-    return (
-      value === "" ||
-      (/^\d+(\.\d+)?$/.test(value) && Number(value) >= 0 && Number(value) <= NODE_BUDGET_MAX_GB)
-    );
-  }, invalidMessage);
+function budgetInputSchema(
+  invalidMessage: string,
+  locale: string,
+  options?: { maxGb?: number | null; exceedsMessage?: string },
+) {
+  return z.string().superRefine((raw, ctx) => {
+    const value = parseLocaleDecimal(raw, locale);
+    if (value === null) {
+      ctx.addIssue({ code: "custom", message: invalidMessage });
+      return;
+    }
+    if (value === "") return;
+    if (!/^\d+(\.\d+)?$/.test(value) || Number(value) < 0 || Number(value) > NODE_BUDGET_MAX_GB) {
+      ctx.addIssue({ code: "custom", message: invalidMessage });
+      return;
+    }
+    const maxGb = options?.maxGb;
+    if (
+      maxGb != null &&
+      Number.isFinite(maxGb) &&
+      Number(value) > maxGb &&
+      options?.exceedsMessage
+    ) {
+      ctx.addIssue({ code: "custom", message: options.exceedsMessage });
+    }
+  });
+}
+
+function declaredBudgetFields(error: unknown): string[] {
+  if (!isBadRequest(error) || !error || typeof error !== "object" || !("data" in error)) return [];
+  const data = (error as { data?: unknown }).data;
+  if (!data || typeof data !== "object" || !("fields" in data)) return [];
+  const fields = (data as { fields?: unknown }).fields;
+  if (!Array.isArray(fields)) return [];
+  return fields.filter((item): item is string => typeof item === "string" && item.length > 0);
+}
+
+function formFieldsForBudgetServerField(field: string, node: NodeCardSnapshot): string[] {
+  if (field === "usableMemoryGb") return ["usableMemoryGb"];
+  if (field === "usableRamGb") return ["usableRamGb"];
+  if (field === "usableVramGb") return node.gpus.map((gpu) => `vram.${gpu.index}`);
+  if (field.startsWith("usableVramGb.")) {
+    const key = field.slice("usableVramGb.".length);
+    const gpu = node.gpus.find((item) => gpuKey(item) === key || String(item.index) === key);
+    return gpu ? [`vram.${gpu.index}`] : node.gpus.map((item) => `vram.${item.index}`);
+  }
+  return [];
 }
 
 function budgetDefaultMark(isDefault: boolean, t: (key: string) => string): string {
@@ -516,11 +563,15 @@ function BudgetsForm({
   node: NodeCardSnapshot;
   onDone: () => void;
 }) {
-  const { t } = useTranslation("dashboard");
+  const { t, i18n } = useTranslation("dashboard");
+  const locale = i18n.language || DEFAULT_LOCALE;
   const queryClient = useQueryClient();
   const showMemory = node.kind !== "discrete" && node.kind !== "cpu";
   const showRam = node.kind !== "unified";
   const invalidBudget = t("dashboard:clis.node.invalidBudget");
+  const exceedsMessage = (total: number | null | undefined) =>
+    t("dashboard:clis.node.budgetExceedsTotal", { total: formatGb(total) });
+  const [serverErrors, setServerErrors] = useState<Record<string, string>>({});
   const save = useMutation({
     ...orpc.forwarderManagement.setCliDeviceUsableBudgets.mutationOptions({
       onSuccess: () => {
@@ -529,15 +580,37 @@ function BudgetsForm({
         onDone();
       },
       onError: (error) => {
-        toast.error(friendly(error, t("dashboard:clis.node.budgetsSaveFailed")));
+        const next: Record<string, string> = {};
+        for (const field of declaredBudgetFields(error)) {
+          for (const formField of formFieldsForBudgetServerField(field, node)) {
+            const total =
+              formField === "usableMemoryGb" || formField === "usableRamGb"
+                ? node.memoryTotalGb
+                : node.gpus.find((gpu) => formField === `vram.${gpu.index}`)?.vramTotalGb;
+            next[formField] = exceedsMessage(total);
+          }
+        }
+        setServerErrors(next);
+        if (Object.keys(next).length === 0) {
+          toast.error(friendly(error, t("dashboard:clis.node.budgetsSaveFailed")));
+        }
       },
     }),
     meta: { skipGlobalErrorToast: true },
   });
+  const visibleBudget = (maxGb: number | null | undefined) =>
+    budgetInputSchema(invalidBudget, locale, {
+      maxGb,
+      exceedsMessage: exceedsMessage(maxGb),
+    });
   const budgetsSchema = z.object({
-    usableMemoryGb: budgetInputSchema(invalidBudget),
-    usableRamGb: budgetInputSchema(invalidBudget),
-    vram: z.record(z.string(), budgetInputSchema(invalidBudget)),
+    usableMemoryGb: showMemory ? visibleBudget(node.memoryTotalGb) : z.string(),
+    usableRamGb: showRam ? visibleBudget(node.memoryTotalGb) : z.string(),
+    vram: z.object(
+      Object.fromEntries(
+        node.gpus.map((gpu) => [String(gpu.index), visibleBudget(gpu.vramTotalGb)]),
+      ),
+    ),
   });
   const form = useForm({
     defaultValues: {
@@ -555,11 +628,14 @@ function BudgetsForm({
       onSubmit: budgetsSchema,
     },
     onSubmit: async ({ value }) => {
-      const usableMemoryGb = showMemory ? parseBudgetInput(value.usableMemoryGb) : undefined;
-      const usableRamGb = showRam ? parseBudgetInput(value.usableRamGb) : undefined;
+      setServerErrors({});
+      const usableMemoryGb = showMemory
+        ? parseBudgetInput(value.usableMemoryGb, locale)
+        : undefined;
+      const usableRamGb = showRam ? parseBudgetInput(value.usableRamGb, locale) : undefined;
       const usableVramGb: Record<string, number> = {};
       for (const gpu of node.gpus) {
-        const parsed = parseBudgetInput(value.vram[String(gpu.index)] ?? "");
+        const parsed = parseBudgetInput(value.vram[String(gpu.index)] ?? "", locale);
         if (parsed !== null) usableVramGb[gpuKey(gpu)] = parsed;
       }
       await save
@@ -589,6 +665,15 @@ function BudgetsForm({
               id={`usable-memory-${cliDeviceId}`}
               label={t("dashboard:clis.node.usableMemory")}
               field={field}
+              extraError={serverErrors.usableMemoryGb}
+              onValueChange={() =>
+                setServerErrors((current) => {
+                  if (!("usableMemoryGb" in current)) return current;
+                  const next = { ...current };
+                  delete next.usableMemoryGb;
+                  return next;
+                })
+              }
             />
           )}
         </form.Field>
@@ -600,6 +685,15 @@ function BudgetsForm({
               id={`usable-ram-${cliDeviceId}`}
               label={t("dashboard:clis.node.usableRam")}
               field={field}
+              extraError={serverErrors.usableRamGb}
+              onValueChange={() =>
+                setServerErrors((current) => {
+                  if (!("usableRamGb" in current)) return current;
+                  const next = { ...current };
+                  delete next.usableRamGb;
+                  return next;
+                })
+              }
             />
           )}
         </form.Field>
@@ -613,6 +707,16 @@ function BudgetsForm({
                 gpu: gpu.name ?? t("dashboard:clis.node.gpuIndex", { index: gpu.index }),
               })}
               field={field}
+              extraError={serverErrors[`vram.${gpu.index}`]}
+              onValueChange={() => {
+                const key = `vram.${gpu.index}`;
+                setServerErrors((current) => {
+                  if (!(key in current)) return current;
+                  const next = { ...current };
+                  delete next[key];
+                  return next;
+                });
+              }}
             />
           )}
         </form.Field>
@@ -642,6 +746,8 @@ function BudgetField({
   id,
   label,
   field,
+  extraError,
+  onValueChange,
 }: {
   id: string;
   label: string;
@@ -651,7 +757,13 @@ function BudgetField({
     handleBlur: () => void;
     handleChange: (value: string) => void;
   };
+  extraError?: string;
+  onValueChange?: () => void;
 }) {
+  const messages = [
+    ...field.state.meta.errors.map((error) => error?.message).filter((message) => message),
+    ...(extraError ? [extraError] : []),
+  ];
   return (
     <div className="space-y-2">
       <Label htmlFor={id}>{label}</Label>
@@ -663,11 +775,14 @@ function BudgetField({
         autoComplete="off"
         value={field.state.value}
         onBlur={field.handleBlur}
-        onChange={(event) => field.handleChange(event.target.value)}
+        onChange={(event) => {
+          field.handleChange(event.target.value);
+          onValueChange?.();
+        }}
       />
-      {field.state.meta.errors.map((error) => (
-        <p key={error?.message} className="text-sm text-destructive">
-          {error?.message}
+      {messages.map((message) => (
+        <p key={message} className="text-sm text-destructive">
+          {message}
         </p>
       ))}
     </div>

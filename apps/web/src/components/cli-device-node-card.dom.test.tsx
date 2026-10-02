@@ -1,19 +1,22 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { NodeCardSnapshot } from "@ws-model-proxy/api/lib/node-inventory";
+import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
   payloads: [] as Array<{ name: string; input: unknown }>,
+  budgetError: null as unknown,
 }));
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
     t: (key: string, options?: Record<string, unknown>) =>
       options ? `${key}|${JSON.stringify(options)}` : key,
+    i18n: { language: "en-US" },
   }),
 }));
 
@@ -38,6 +41,7 @@ vi.mock("@/utils/orpc", () => ({
         mutationOptions: (options?: Record<string, unknown>) => ({
           mutationFn: async (input: unknown) => {
             state.payloads.push({ name: "setCliDeviceUsableBudgets", input });
+            if (state.budgetError) throw state.budgetError;
             return { cliDeviceId: "cli-1" };
           },
           ...options,
@@ -94,6 +98,7 @@ function renderCard(snapshot: NodeCardSnapshot = node()) {
 afterEach(() => {
   cleanup();
   state.payloads.length = 0;
+  state.budgetError = null;
 });
 
 describe("CliDeviceNodeCard", () => {
@@ -128,5 +133,56 @@ describe("CliDeviceNodeCard", () => {
         input: { cliDeviceId: "cli-1", labels: ["dgx-spark", "unified-memory"] },
       },
     ]);
+  });
+
+  it("rejects grouping-shaped budget input and amounts above the snapshot total", async () => {
+    const user = userEvent.setup();
+    renderCard();
+    await user.click(screen.getByRole("button", { name: /dashboard:clis.node.editBudgetsFor/ }));
+    const memory = await screen.findByLabelText("dashboard:clis.node.usableMemory");
+    await user.clear(memory);
+    await user.type(memory, "1,500");
+    await user.click(screen.getByRole("button", { name: "dashboard:clis.node.saveBudgets" }));
+    expect(await screen.findByText("dashboard:clis.node.invalidBudget")).toBeTruthy();
+    expect(state.payloads).toEqual([]);
+
+    await user.clear(memory);
+    await user.type(memory, "200");
+    await user.click(screen.getByRole("button", { name: "dashboard:clis.node.saveBudgets" }));
+    expect(await screen.findByText(/dashboard:clis.node.budgetExceedsTotal/)).toBeTruthy();
+    expect(state.payloads).toEqual([]);
+  });
+
+  it("maps a hardware-exceeded server field onto the form without the English message", async () => {
+    state.budgetError = {
+      code: "BAD_REQUEST",
+      message: "Usable memory cannot exceed the physical total.",
+      data: { fields: ["usableMemoryGb"] },
+    };
+    const user = userEvent.setup();
+    renderCard();
+    await user.click(screen.getByRole("button", { name: /dashboard:clis.node.editBudgetsFor/ }));
+    const memory = await screen.findByLabelText("dashboard:clis.node.usableMemory");
+    await user.clear(memory);
+    await user.type(memory, "10");
+    await user.click(screen.getByRole("button", { name: "dashboard:clis.node.saveBudgets" }));
+    expect(await screen.findByText(/dashboard:clis.node.budgetExceedsTotal/)).toBeTruthy();
+    await waitFor(() => expect(state.payloads).toHaveLength(1));
+    expect(screen.queryByText(/cannot exceed the physical total/i)).toBeNull();
+    expect(toast.error).not.toHaveBeenCalled();
+  });
+
+  it("formats a tiny stored budget without scientific notation", async () => {
+    const user = userEvent.setup();
+    renderCard(
+      node({
+        usableMemoryGb: 1e-7,
+        usableMemoryGbDefault: false,
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: /dashboard:clis.node.editBudgetsFor/ }));
+    const memory = await screen.findByLabelText("dashboard:clis.node.usableMemory");
+    expect((memory as HTMLInputElement).value).toBe("0.0000001");
+    expect((memory as HTMLInputElement).value).not.toMatch(/e/i);
   });
 });

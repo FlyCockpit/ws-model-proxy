@@ -1,9 +1,10 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, Outlet } from "@tanstack/react-router";
-import { normalizeDecimalInput } from "@ws-model-proxy/api/lib/node-inventory";
 import { poolGrantSpendCapSchema } from "@ws-model-proxy/api/lib/pool-grant-spend-cap";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
+import { parseLocaleDecimal } from "@ws-model-proxy/config/decimal-input";
+import { DEFAULT_LOCALE } from "@ws-model-proxy/config/locales";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import {
@@ -987,7 +988,8 @@ function PoolGrantRoutingForm({
   grant: PoolGrantRow;
   onSaved: () => void;
 }) {
-  const { t } = useTranslation(["common", "dashboard"]);
+  const { t, i18n } = useTranslation(["common", "dashboard"]);
+  const locale = i18n.language || DEFAULT_LOCALE;
   const queryClient = useQueryClient();
   const update = useMutation({
     ...orpc.forwarderManagement.updatePoolGrant.mutationOptions({
@@ -1046,7 +1048,15 @@ function PoolGrantRoutingForm({
         )
         .superRefine((value, ctx) => {
           if (value.spendMode !== "SET") return;
-          const limit = normalizeDecimalInput(value.spendLimit);
+          const limit = parseLocaleDecimal(value.spendLimit, locale);
+          if (limit === null) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["spendLimit"],
+              message: t("dashboard:pools.grantRouting.spendLimitInvalid"),
+            });
+            return;
+          }
           const currency = value.spendCurrency.trim().toUpperCase();
           const parsed = poolGrantSpendCapSchema.safeParse({
             limit,
@@ -1090,7 +1100,7 @@ function PoolGrantRoutingForm({
             value.spendMode === "NONE"
               ? null
               : {
-                  limit: normalizeDecimalInput(value.spendLimit),
+                  limit: parseLocaleDecimal(value.spendLimit, locale) ?? value.spendLimit,
                   currency: value.spendCurrency.trim().toUpperCase(),
                   period: value.spendPeriod,
                 },

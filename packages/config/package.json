@@ -22,6 +22,9 @@
     "./cli-identity-key": {
       "default": "./src/cli-identity-key.ts"
     },
+    "./decimal-input": {
+      "default": "./src/decimal-input.ts"
+    },
     "./theme-init": {
       "default": "./src/theme-init.ts"
     },

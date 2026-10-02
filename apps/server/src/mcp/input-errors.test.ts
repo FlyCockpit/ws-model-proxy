@@ -305,6 +305,22 @@ describe("sanitizeValidationIssues", () => {
     ).toEqual(["capacityConcurrencyLimit"]);
     expect(sanitizeDeclaredFields(Object.create({ fields: ["poolId"] }), KNOWN)).toBeNull();
     expect(
+      sanitizeDeclaredFields(
+        {
+          fields: [
+            "advanced.contextMargin",
+            "memberContextCeiling",
+            "rules.0.threshold",
+            "not.a.field",
+            "0.leading",
+            "advanced.",
+            "pool id",
+          ],
+        },
+        new Set(["advanced", "contextMargin", "memberContextCeiling", "rules", "threshold"]),
+      ),
+    ).toEqual(["advanced.contextMargin", "memberContextCeiling", "rules.0.threshold"]);
+    expect(
       sanitizeArgumentMessage("  Effective concurrency limit exceeds physical capacity.  "),
     ).toBe("Effective concurrency limit exceeds physical capacity.");
     expect(sanitizeArgumentMessage(SECRET)).toBe("[redacted]");

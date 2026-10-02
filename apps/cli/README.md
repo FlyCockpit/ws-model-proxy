@@ -89,7 +89,7 @@ Each normal line is scanned once and held until a terminal ground-state LF or EO
 
 This release speaks relay protocol 2.4. Last cut was 2.3 (v0.3.1); terminal identity, supervised commands, engine facts, node telemetry, file tools, and custom engine adapters all ship in 2.4. An older server rejects 2.4 and wsmp stops with a message to upgrade the server; a newer server refuses an older wsmp with a message to upgrade wsmp.
 
-`wsmp login` binds the device credential to this machine's id (`/etc/machine-id`, or a UUID wsmp writes beside `device-auth.json` when that file is missing). Hello must present the same id. Copying `device-auth.json` or `service.env` to another machine does not take over the device: that hello is refused and the original session stays up. Run `wsmp login` on the machine that should connect. The hostname is only a display label.
+`wsmp login` binds the device credential to this CLI's persistent P-256 identity key (`terminal-identity.json` in the same state directory as `device-auth.json`). Hello must present the same key and prove possession. Copying only `device-auth.json` or `service.env` to another machine does not take over the device: that hello is refused and the original session stays up. Copying the whole state directory transfers the identity key and the device. Run `wsmp login` on the machine that should connect. The hostname is only a display label.
 
 ### Node file tools (relay 2.4)
 

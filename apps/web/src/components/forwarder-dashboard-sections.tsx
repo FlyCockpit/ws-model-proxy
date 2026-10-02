@@ -3937,9 +3937,19 @@ function ModelApiTokenCreateForm({
           modelIds: z.array(z.string()),
           allowExternal: z.boolean(),
           excludedPoolIds: z.array(z.string()),
-          externalAfterWaitMs: tokenExternalWaitInputSchema(),
+          externalAfterWaitMs: z.string(),
         })
-        .refine((value) => value.scopeMode !== "ALLOWLIST" || value.modelIds.length > 0),
+        .refine((value) => value.scopeMode !== "ALLOWLIST" || value.modelIds.length > 0)
+        .superRefine((value, ctx) => {
+          if (!value.allowExternal) return;
+          if (!tokenExternalWaitInputSchema().safeParse(value.externalAfterWaitMs).success) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["externalAfterWaitMs"],
+              message: "invalid",
+            });
+          }
+        }),
     },
     onSubmit: async ({ value }) => {
       if (secret) return;

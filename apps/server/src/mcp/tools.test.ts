@@ -501,6 +501,49 @@ describe("#117 — real input schemas and named failing fields", () => {
     });
     expect(JSON.stringify(body)).not.toContain("SECRET_REASON");
   });
+
+  it("forwards guarded-create advanced.contextMargin through declared fields", async () => {
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_guarded_pool_create", {
+      slug: "guarded-margin",
+      name: "Guarded margin",
+      localModelIds: ["local-id"],
+      recommendedSurface: "OPENAI_RESPONSES",
+      memberConcurrencyLimit: 1,
+      memberContextCeiling: 100,
+      reservedSlots: 0,
+      localWaitBudgetMs: 30_000,
+      providerModels: [],
+      advanced: {
+        physicalCountStrategy: "CONSERVATIVE_ESTIMATE",
+        contextMargin: 100,
+        borrowPolicy: "WHEN_IDLE",
+        protocolAdaptationEnabled: false,
+        allowLossyDeveloperRoleCollapse: false,
+        affinity: {
+          enabled: false,
+          ttlSeconds: 3_600,
+          maxRecords: 10_000,
+          prefixWeight: 100,
+          conversationWeight: 150,
+          confirmedCacheWeight: 250,
+          loadPenaltyWeight: 100,
+        },
+        memberOverrides: [],
+      },
+    });
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.structuredContent).toEqual({
+      error: {
+        code: "invalid_input",
+        fields: ["advanced.contextMargin", "memberContextCeiling"],
+        message: "Pool context margin must be smaller than the context ceiling.",
+        reason: "POOL_POLICY_INVALID",
+      },
+    });
+    expect(JSON.stringify(body.result?.structuredContent)).not.toContain("capacityContextMargin");
+  });
 });
 
 describe("scope enforcement", () => {

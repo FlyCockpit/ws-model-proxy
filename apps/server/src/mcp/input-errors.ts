@@ -210,10 +210,29 @@ export function fieldsFromValidationIssues(issues: readonly McpValidationIssue[]
   return fields;
 }
 
+const MAX_DECLARED_FIELD_LENGTH = MAX_PATH_SEGMENTS * (MAX_SEGMENT_LENGTH + 1);
+const INDEX_SEGMENT = /^(0|[1-9]\d*)$/;
+
+/**
+ * A dotted path whose every identifier segment is a property the tool
+ * advertises (`advanced.contextMargin`). Numeric segments are nested indexes
+ * (`rules.0.threshold`) and cannot lead the path.
+ */
+function isDeclaredFieldPath(item: string, knownKeys: ReadonlySet<string>): boolean {
+  if (item.length > MAX_DECLARED_FIELD_LENGTH) return false;
+  const segments = item.split(".");
+  if (segments.length === 0 || segments.length > MAX_PATH_SEGMENTS) return false;
+  return segments.every((segment, index) => {
+    if (segment.length === 0 || segment.length > MAX_SEGMENT_LENGTH) return false;
+    if (INDEX_SEGMENT.test(segment)) return index > 0;
+    return IDENTIFIER_SEGMENT.test(segment) && knownKeys.has(segment);
+  });
+}
+
 /**
  * Procedure-authored `data.fields` (#200). Only names the tool's own
  * advertised schema declares are returned, so a handler cannot echo an
- * arbitrary caller string through this channel.
+ * arbitrary caller string through this channel. Nested keys may be dotted.
  */
 export function sanitizeDeclaredFields(
   data: unknown,
@@ -226,8 +245,8 @@ export function sanitizeDeclaredFields(
   const fields: string[] = [];
   for (const item of raw) {
     if (fields.length >= MAX_ISSUES) break;
-    if (typeof item !== "string" || item.length === 0 || item.length > MAX_SEGMENT_LENGTH) continue;
-    if (!IDENTIFIER_SEGMENT.test(item) || !knownKeys.has(item)) continue;
+    if (typeof item !== "string" || item.length === 0) continue;
+    if (!isDeclaredFieldPath(item, knownKeys)) continue;
     if (!fields.includes(item)) fields.push(item);
   }
   return fields.length === 0 ? null : fields;

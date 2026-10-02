@@ -566,7 +566,7 @@ describe("dedicated pool pages", () => {
       expect(state.mutationCalls).toEqual([]);
     });
 
-    it("normalizes a comma decimal on the spend limit", async () => {
+    it("accepts a locale decimal spend limit and rejects grouping", async () => {
       state.tab = "access";
       state.pools = [grantPool()];
       mount(<PoolDetailPage poolId="pool-1" />);
@@ -578,7 +578,16 @@ describe("dedicated pool pages", () => {
         target: { value: "SET" },
       });
       fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.spendLimit"), {
-        target: { value: "25,5" },
+        target: { value: "1,500" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+      expect(
+        await screen.findByText("dashboard:pools.grantRouting.spendLimitInvalid"),
+      ).toBeTruthy();
+      expect(state.mutationCalls).toEqual([]);
+
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.spendLimit"), {
+        target: { value: "25.5" },
       });
       fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.spendCurrency"), {
         target: { value: "eur" },
