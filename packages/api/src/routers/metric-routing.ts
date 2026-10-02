@@ -466,9 +466,10 @@ export const metricRoutingProcedures = {
   /**
    * Replace a pool's routing rules. `full` makes a member FULL (the request
    * queues, goes to another member, or goes external for `:external`
-   * callers); `avoid` ranks it last. Stale or missing metrics are ignored.
-   * The pool's stored gating (FULL and AVOID) verdicts are cleared so the new rules apply at the
-   * device's next metrics frame.
+   * callers); `avoid` ranks it last. `memberId` limits a rule to that member;
+   * `excludeMemberId` applies it to every other member. Stale or missing
+   * metrics are ignored. The pool's stored gating (FULL and AVOID) verdicts
+   * are cleared so the new rules apply at the device's next metrics frame.
    */
   setPoolRoutingRules: protectedProcedure
     .input(z.object({ poolId: idSchema, rules: routingRulesSchema }))

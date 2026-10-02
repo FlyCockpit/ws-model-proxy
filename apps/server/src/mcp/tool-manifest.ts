@@ -896,7 +896,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     // A `full` rule can send `:external` callers to paid external providers.
     classification: "cost",
     descriptionNote:
-      "Replaces the pool's whole rule list: [{metric, labels?, aggregate: 'max', op: '>'|'>='|'<'|'<=', threshold, effect: 'full'|'avoid'}]. Discover metric names with forwarder_device_metrics_get or forwarder_pool_routing_rules_get.",
+      "Replaces the pool's whole rule list: [{metric, labels?, aggregate: 'max'|'min'|'avg', op: '>'|'>='|'<'|'<=', threshold, effect: 'full'|'avoid', memberId?, excludeMemberId?}]. memberId limits the rule to that pool member; excludeMemberId applies it to every other member; do not set both. Discover metric names with forwarder_device_metrics_get or forwarder_pool_routing_rules_get.",
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.setPoolRoutingRules),
   },
   {

@@ -93,10 +93,13 @@ Metric routing rules (S-B part 2):
   leases alone. Classified `cost` like the rules.
 - `forwarder_pool_routing_rules_set` (`{ poolId, rules, confirm: "RUN" }`)
   replaces the whole list (at most 16). A rule is a flat record
-  `{ metric, labels?, aggregate: "max", op: ">" | ">=" | "<" | "<=",
-  threshold, effect: "full" | "avoid" }`; there is no expression language.
-  Label keys and values use the metric-name charset, and `__proto__` is not
-  accepted as a label key (the rule is rejected, never widened).
+  `{ metric, labels?, aggregate: "max" | "min" | "avg", op: ">" | ">=" |
+  "<" | "<=", threshold, effect: "full" | "avoid", memberId?,
+  excludeMemberId? }`; there is no expression language. `memberId` limits
+  the rule to that pool member; `excludeMemberId` applies it to every other
+  member; the two must not both be set. Label keys and values use the
+  metric-name charset, and `__proto__` is not accepted as a label key (the
+  rule is rejected, never widened).
   `full` makes the member FULL: the request queues, goes to another member, or
   (for `:external` callers only) goes external after `externalAfterWaitMs`.
   `avoid` ranks the member last among free members and never makes it

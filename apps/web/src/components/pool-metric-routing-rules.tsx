@@ -26,15 +26,35 @@ type SeriesView = RoutingRulesView["devices"][number]["series"][number];
 const METRIC_NAME = /^[A-Za-z0-9_.:-]{1,64}$/;
 const OPS = [">", ">=", "<", "<="] as const;
 const EFFECTS = ["full", "avoid"] as const;
+const AGGREGATES = ["max", "min", "avg"] as const;
+const SCOPES = ["all", "only", "except"] as const;
 const RULES_MAX = 16;
+
+type MemberOption = { poolMemberId: string; upstreamModelId: string };
 
 type RuleRow = {
   metric: string;
   labels: string;
+  aggregate: (typeof AGGREGATES)[number];
   op: (typeof OPS)[number];
   threshold: string;
   effect: (typeof EFFECTS)[number];
+  scope: (typeof SCOPES)[number];
+  memberId: string;
 };
+
+function storedScope(rule: StoredRule): RuleRow["scope"] {
+  if (rule.memberId) return "only";
+  if (rule.excludeMemberId) return "except";
+  return "all";
+}
+
+function memberSelectOptions(members: readonly MemberOption[], selected: string): MemberOption[] {
+  if (selected && !members.some((member) => member.poolMemberId === selected)) {
+    return [...members, { poolMemberId: selected, upstreamModelId: selected }];
+  }
+  return [...members];
+}
 
 function labelsToText(labels: Record<string, string> | undefined): string {
   return Object.entries(labels ?? {})
@@ -117,6 +137,10 @@ export function PoolMetricRoutingRules({ poolId }: { poolId: string }) {
         key={JSON.stringify(view.data.rules)}
         poolId={poolId}
         rules={view.data.rules}
+        members={view.data.members.map((member) => ({
+          poolMemberId: member.poolMemberId,
+          upstreamModelId: member.upstreamModelId,
+        }))}
         metricNames={[
           ...new Set([
             ...view.data.devices.flatMap((device) => device.series.map((series) => series.name)),
@@ -136,10 +160,12 @@ export function PoolMetricRoutingRules({ poolId }: { poolId: string }) {
 function MetricRulesEditor({
   poolId,
   rules,
+  members,
   metricNames,
 }: {
   poolId: string;
   rules: StoredRule[];
+  members: MemberOption[];
   metricNames: string[];
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
@@ -156,33 +182,49 @@ function MetricRulesEditor({
     }),
     meta: { skipGlobalErrorToast: true },
   });
-  const rowSchema = z.object({
-    metric: z.string().trim().regex(METRIC_NAME, t("dashboard:pools.metricRules.metricInvalid")),
-    labels: z
-      .string()
-      .refine(
-        (value) => parseLabelText(value) !== null,
-        t("dashboard:pools.metricRules.labelsInvalid"),
-      ),
-    op: z.enum(OPS),
-    threshold: z
-      .string()
-      .trim()
-      .refine(
-        (value) => value !== "" && Number.isFinite(Number(value)),
-        t("dashboard:pools.metricRules.thresholdInvalid"),
-      ),
-    effect: z.enum(EFFECTS),
-  });
+  const rowSchema = z
+    .object({
+      metric: z.string().trim().regex(METRIC_NAME, t("dashboard:pools.metricRules.metricInvalid")),
+      labels: z
+        .string()
+        .refine(
+          (value) => parseLabelText(value) !== null,
+          t("dashboard:pools.metricRules.labelsInvalid"),
+        ),
+      aggregate: z.enum(AGGREGATES),
+      op: z.enum(OPS),
+      threshold: z
+        .string()
+        .trim()
+        .refine(
+          (value) => value !== "" && Number.isFinite(Number(value)),
+          t("dashboard:pools.metricRules.thresholdInvalid"),
+        ),
+      effect: z.enum(EFFECTS),
+      scope: z.enum(SCOPES),
+      memberId: z.string(),
+    })
+    .superRefine((row, context) => {
+      if (row.scope !== "all" && row.memberId.trim() === "") {
+        context.addIssue({
+          code: "custom",
+          path: ["memberId"],
+          message: t("dashboard:pools.metricRules.memberRequired"),
+        });
+      }
+    });
   const form = useForm({
     defaultValues: {
       rules: rules.map(
         (rule): RuleRow => ({
           metric: rule.metric,
           labels: labelsToText(rule.labels),
+          aggregate: rule.aggregate,
           op: rule.op,
           threshold: String(rule.threshold),
           effect: rule.effect,
+          scope: storedScope(rule),
+          memberId: rule.memberId ?? rule.excludeMemberId ?? "",
         }),
       ),
     },
@@ -193,13 +235,16 @@ function MetricRulesEditor({
           poolId,
           rules: value.rules.map((row) => {
             const labels = parseLabelText(row.labels) ?? {};
+            const memberId = row.memberId.trim();
             return {
               metric: row.metric.trim(),
               ...(Object.keys(labels).length > 0 ? { labels } : {}),
-              aggregate: "max" as const,
+              aggregate: row.aggregate,
               op: row.op,
               threshold: Number(row.threshold),
               effect: row.effect,
+              ...(row.scope === "only" && memberId ? { memberId } : {}),
+              ...(row.scope === "except" && memberId ? { excludeMemberId: memberId } : {}),
             };
           }),
         })
@@ -234,7 +279,7 @@ function MetricRulesEditor({
               <fieldset
                 // Rows have no identity beyond their position in the list.
                 key={index}
-                className="grid min-w-0 gap-2 border p-3 sm:grid-cols-2 lg:grid-cols-[2fr_1.5fr_auto_1fr_auto_auto]"
+                className="grid min-w-0 gap-2 border p-3 sm:grid-cols-2 lg:grid-cols-3"
               >
                 <legend className="sr-only">
                   {t("dashboard:pools.metricRules.ruleLegend", { number: index + 1 })}
@@ -280,6 +325,29 @@ function MetricRulesEditor({
                           {error?.message}
                         </p>
                       ))}
+                    </div>
+                  )}
+                </form.Field>
+                <form.Field name={`rules[${index}].aggregate`}>
+                  {(sub) => (
+                    <div className="min-w-0 space-y-1">
+                      <Label htmlFor={`${datalistId}-aggregate-${index}`}>
+                        {t("dashboard:pools.metricRules.aggregate")}
+                      </Label>
+                      <select
+                        id={`${datalistId}-aggregate-${index}`}
+                        className="min-h-11 w-full rounded-md border bg-background px-3"
+                        value={sub.state.value}
+                        onChange={(event) =>
+                          sub.handleChange(event.target.value as (typeof AGGREGATES)[number])
+                        }
+                      >
+                        {AGGREGATES.map((aggregate) => (
+                          <option key={aggregate} value={aggregate}>
+                            {t(`dashboard:pools.metricRules.aggregates.${aggregate}`)}
+                          </option>
+                        ))}
+                      </select>
                     </div>
                   )}
                 </form.Field>
@@ -351,6 +419,64 @@ function MetricRulesEditor({
                     </div>
                   )}
                 </form.Field>
+                <form.Field name={`rules[${index}].scope`}>
+                  {(sub) => (
+                    <div className="min-w-0 space-y-1">
+                      <Label htmlFor={`${datalistId}-scope-${index}`}>
+                        {t("dashboard:pools.metricRules.scope")}
+                      </Label>
+                      <select
+                        id={`${datalistId}-scope-${index}`}
+                        className="min-h-11 w-full rounded-md border bg-background px-3"
+                        value={sub.state.value}
+                        onChange={(event) =>
+                          sub.handleChange(event.target.value as (typeof SCOPES)[number])
+                        }
+                      >
+                        {SCOPES.map((scope) => (
+                          <option key={scope} value={scope}>
+                            {t(`dashboard:pools.metricRules.scopes.${scope}`)}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+                </form.Field>
+                <form.Subscribe selector={(state) => state.values.rules[index]?.scope}>
+                  {(scope) =>
+                    scope === "all" ? null : (
+                      <form.Field name={`rules[${index}].memberId`}>
+                        {(sub) => (
+                          <div className="min-w-0 space-y-1">
+                            <Label htmlFor={`${datalistId}-member-${index}`}>
+                              {t("dashboard:pools.metricRules.member")}
+                            </Label>
+                            <select
+                              id={`${datalistId}-member-${index}`}
+                              className="min-h-11 w-full rounded-md border bg-background px-3"
+                              value={sub.state.value}
+                              onChange={(event) => sub.handleChange(event.target.value)}
+                            >
+                              <option value="">
+                                {t("dashboard:pools.metricRules.memberPlaceholder")}
+                              </option>
+                              {memberSelectOptions(members, sub.state.value).map((member) => (
+                                <option key={member.poolMemberId} value={member.poolMemberId}>
+                                  {member.upstreamModelId}
+                                </option>
+                              ))}
+                            </select>
+                            {sub.state.meta.errors.map((error) => (
+                              <p key={error?.message} className="text-sm text-destructive">
+                                {error?.message}
+                              </p>
+                            ))}
+                          </div>
+                        )}
+                      </form.Field>
+                    )
+                  }
+                </form.Subscribe>
                 <div className="flex items-end">
                   <Button
                     type="button"
@@ -373,9 +499,12 @@ function MetricRulesEditor({
                 field.pushValue({
                   metric: "",
                   labels: "",
+                  aggregate: "max",
                   op: ">",
                   threshold: "",
                   effect: "full",
+                  scope: "all",
+                  memberId: "",
                 })
               }
             >

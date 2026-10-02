@@ -62,9 +62,19 @@ describe("routing rule schema", () => {
     [{ metric: "x", op: "==", threshold: 1, effect: "full" }],
     [{ metric: "x", op: ">", threshold: Number.POSITIVE_INFINITY, effect: "full" }],
     [{ metric: "x", op: ">", threshold: 1, effect: "drain" }],
-    [{ metric: "x", op: ">", threshold: 1, effect: "full", aggregate: "avg" }],
+    [{ metric: "x", op: ">", threshold: 1, effect: "full", aggregate: "sum" }],
     [{ metric: "x", op: ">", threshold: 1, effect: "full", labels: { gpu: "0 1" } }],
     [{ metric: "x", op: ">", threshold: 1, effect: "full", extra: true }],
+    [
+      {
+        metric: "x",
+        op: ">",
+        threshold: 1,
+        effect: "full",
+        memberId: "m1",
+        excludeMemberId: "m2",
+      },
+    ],
   ])("rejects %j", (candidate) => {
     expect(routingRulesSchema.safeParse([candidate]).success).toBe(false);
   });
@@ -96,6 +106,24 @@ describe("routing rule schema", () => {
   it("treats an invalid stored column as no rules", () => {
     expect(parseStoredRoutingRules({ not: "an array" })).toEqual([]);
     expect(parseStoredRoutingRules(null)).toEqual([]);
+  });
+
+  it("accepts min/avg aggregates and a single member scope", () => {
+    const min = routingRulesSchema.parse([
+      { metric: "x", op: "<", threshold: 10, effect: "avoid", aggregate: "min", memberId: "m1" },
+    ]);
+    expect(min[0]).toMatchObject({ aggregate: "min", memberId: "m1" });
+    const avg = routingRulesSchema.parse([
+      {
+        metric: "x",
+        op: ">",
+        threshold: 1,
+        effect: "full",
+        aggregate: "avg",
+        excludeMemberId: "m2",
+      },
+    ]);
+    expect(avg[0]).toMatchObject({ aggregate: "avg", excludeMemberId: "m2" });
   });
 });
 
@@ -190,6 +218,83 @@ describe("evaluateRoutingRules", () => {
     expect(
       evaluateRoutingRules([anyGpu], [gpus[0]!, { ...gpus[1]!, ageMs: 60_000 }], NOW).verdict,
     ).toBe("none");
+  });
+
+  it("aggregates with min over the matching series", () => {
+    const gpus = [
+      series({ name: "node.gpu.temperature_c", labels: { gpu: "0" }, value: 70 }),
+      series({ name: "node.gpu.temperature_c", labels: { gpu: "1" }, value: 88 }),
+    ];
+    const coolest = rule({
+      metric: "node.gpu.temperature_c",
+      aggregate: "min",
+      op: "<",
+      threshold: 75,
+    });
+    expect(evaluateRoutingRules([coolest], gpus, NOW).verdict).toBe("full");
+    expect(evaluateRoutingRules([{ ...coolest, threshold: 70 }], gpus, NOW).verdict).toBe("none");
+    // A stale low reading does not count; the fresh high one decides.
+    expect(
+      evaluateRoutingRules([coolest], [{ ...gpus[0]!, ageMs: 60_000 }, gpus[1]!], NOW).verdict,
+    ).toBe("none");
+  });
+
+  it("aggregates with avg over the matching series", () => {
+    const gpus = [
+      series({ name: "node.gpu.temperature_c", labels: { gpu: "0" }, value: 70 }),
+      series({ name: "node.gpu.temperature_c", labels: { gpu: "1" }, value: 90 }),
+    ];
+    const average = rule({
+      metric: "node.gpu.temperature_c",
+      aggregate: "avg",
+      op: ">",
+      threshold: 79,
+    });
+    expect(evaluateRoutingRules([average], gpus, NOW).verdict).toBe("full");
+    expect(evaluateRoutingRules([{ ...average, threshold: 80 }], gpus, NOW).verdict).toBe("none");
+    // Dropping the high reading to stale lowers the average of what remains.
+    expect(
+      evaluateRoutingRules([average], [gpus[0]!, { ...gpus[1]!, ageMs: 60_000 }], NOW).verdict,
+    ).toBe("none");
+  });
+
+  it("applies a member-only rule only to that member", () => {
+    const scoped = rule({ memberId: "m1" });
+    const hot = [series({ value: 90 })];
+    expect(evaluateRoutingRules([scoped], hot, NOW, "m1")).toMatchObject({
+      verdict: "full",
+      ruleStates: ["triggered"],
+    });
+    expect(evaluateRoutingRules([scoped], hot, NOW, "m2")).toMatchObject({
+      verdict: "none",
+      ruleStates: ["clear"],
+    });
+    // Unknown member: the rule does not apply (fail open).
+    expect(evaluateRoutingRules([scoped], hot, NOW)).toMatchObject({
+      verdict: "none",
+      ruleStates: ["clear"],
+    });
+  });
+
+  it("skips a rule for the excluded member and applies it to everyone else", () => {
+    const scoped = rule({ excludeMemberId: "m1" });
+    const hot = [series({ value: 90 })];
+    expect(evaluateRoutingRules([scoped], hot, NOW, "m1")).toMatchObject({
+      verdict: "none",
+      ruleStates: ["clear"],
+    });
+    expect(evaluateRoutingRules([scoped], hot, NOW, "m2")).toMatchObject({
+      verdict: "full",
+      ruleStates: ["triggered"],
+    });
+  });
+
+  it("fails open when a member-scoped rule's metric is missing", () => {
+    const scoped = rule({ memberId: "m1", metric: "absent" });
+    expect(evaluateRoutingRules([scoped], [series({})], NOW, "m1")).toMatchObject({
+      verdict: "none",
+      ruleStates: ["stale"],
+    });
   });
 
   it.each([

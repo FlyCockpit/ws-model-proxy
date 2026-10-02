@@ -1021,11 +1021,17 @@
     "metricRules": {
       "title": "Metric routing rules",
       "description": "Mark a member FULL or avoid it using its device's metrics. FULL members get no new requests (they queue, go to another member, or go external for :external callers). Avoided members are used last. A stale or missing metric is ignored, and when every member is FULL requests are still served.",
-      "hint": "Each rule compares the highest value of one metric (optionally filtered by labels) with a threshold.",
+      "hint": "Each rule compares one aggregate of a metric (optionally filtered by labels) with a threshold. A rule can apply to every member, only one member, or every member except one.",
       "empty": "No rules. Routing uses capacity only.",
       "ruleLegend": "Rule {{number}}",
       "metric": "Metric",
       "labels": "Labels (optional)",
+      "aggregate": "Aggregate",
+      "aggregates": {
+        "max": "Max",
+        "min": "Min",
+        "avg": "Average"
+      },
       "op": "Compare",
       "threshold": "Threshold",
       "effect": "Effect",
@@ -1033,6 +1039,15 @@
         "full": "Mark FULL",
         "avoid": "Avoid"
       },
+      "scope": "Applies to",
+      "scopes": {
+        "all": "All members",
+        "only": "This member only",
+        "except": "All except this member"
+      },
+      "member": "Member",
+      "memberPlaceholder": "Choose a member",
+      "memberRequired": "Choose a member.",
       "add": "Add rule",
       "remove": "Remove rule {{number}}",
       "save": "Save rules",

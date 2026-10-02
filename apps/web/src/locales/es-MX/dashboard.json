@@ -1021,11 +1021,17 @@
     "metricRules": {
       "title": "Reglas de enrutamiento por métricas",
       "description": "Marca un miembro como LLENO o evítalo según las métricas de su dispositivo. Los miembros LLENOS no reciben solicitudes nuevas (esperan en cola, van a otro miembro o salen al proveedor externo para quienes usan :external). Los miembros evitados se usan al final. Una métrica obsoleta o ausente se ignora, y si todos los miembros están LLENOS las solicitudes se siguen atendiendo.",
-      "hint": "Cada regla compara el valor más alto de una métrica (opcionalmente filtrada por etiquetas) con un umbral.",
+      "hint": "Cada regla compara un agregado de una métrica (opcionalmente filtrada por etiquetas) con un umbral. Una regla puede aplicarse a todos los miembros, solo a uno o a todos excepto uno.",
       "empty": "Sin reglas. El enrutamiento usa solo la capacidad.",
       "ruleLegend": "Regla {{number}}",
       "metric": "Métrica",
       "labels": "Etiquetas (opcional)",
+      "aggregate": "Agregado",
+      "aggregates": {
+        "max": "Máximo",
+        "min": "Mínimo",
+        "avg": "Promedio"
+      },
       "op": "Comparar",
       "threshold": "Umbral",
       "effect": "Efecto",
@@ -1033,6 +1039,15 @@
         "full": "Marcar LLENO",
         "avoid": "Evitar"
       },
+      "scope": "Aplica a",
+      "scopes": {
+        "all": "Todos los miembros",
+        "only": "Solo este miembro",
+        "except": "Todos excepto este miembro"
+      },
+      "member": "Miembro",
+      "memberPlaceholder": "Elige un miembro",
+      "memberRequired": "Elige un miembro.",
       "add": "Agregar regla",
       "remove": "Quitar regla {{number}}",
       "save": "Guardar reglas",

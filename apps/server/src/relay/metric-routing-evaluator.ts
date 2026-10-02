@@ -280,7 +280,7 @@ export class MetricRoutingEvaluator {
       const evaluation = combineWithEngineLoad(
         rules.length === 0
           ? { verdict: "none", ruleStates: [], expiresAt: now }
-          : evaluateRoutingRules(rules, series, now),
+          : evaluateRoutingRules(rules, series, now, member.id),
         engine,
       );
       // Rules and overrides invalidate the cache even when edited on another process.

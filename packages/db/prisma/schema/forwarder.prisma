@@ -1098,9 +1098,11 @@ model ModelPool {
   /// withdraws BYOK for this pool.
   externalEquivalentModel         String?
   /// Metric-driven routing rules (S-B part 2): a zod-validated array of
-  /// `{metric, labels?, aggregate, op, threshold, effect}`
+  /// `{metric, labels?, aggregate, op, threshold, effect, memberId?, excludeMemberId?}`
   /// (packages/api/src/lib/metric-routing.ts). `full` makes a member FULL,
-  /// `avoid` ranks it last. Stale or missing metrics are ignored.
+  /// `avoid` ranks it last. `memberId` scopes the rule to one member;
+  /// `excludeMemberId` applies it to every other member (not both). Stale or
+  /// missing metrics are ignored.
   routingRules                    Json                          @default("[]")
   User                            User                          @relation("ModelPoolOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
   TransformerDiscoveredModel      DiscoveredModel?              @relation("ModelPoolTransformer", fields: [transformerDiscoveredModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
