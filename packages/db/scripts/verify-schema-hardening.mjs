@@ -94,6 +94,7 @@ const requiredFragments = [
   // #66: grantee local stickiness and durable relay owner attribution.
   "stickiness pool binding requires the pool owner or the exact grant",
   "stickiness selection must be a local member of its pool",
+  "relay request selection must be a member of its pool",
   "stickiness pool grant row=%s",
   '"selectedExecutionTargetId", "targetModelPoolId", "poolGrantId",\n  "routingVersion" ON response_stickiness_record',
   "derive_relay_request_resource_owner",

@@ -1959,6 +1959,31 @@ BEGIN
             USING ERRCODE = '23514';
         END IF;
       END IF;
+      -- INSERT-time membership: the selected target belonged to the requested
+      -- pool when this selection was written (same idea as stickiness v3).
+      -- Membership is mutable, so later status-only updates are not re-checked.
+      -- Grantee LOCAL rows keep the pool-owner graph; the caller need not own
+      -- the target. own-key selections are the caller's provider, not a member.
+      IF NEW."requestedModelPoolId" IS NOT NULL
+         AND NEW."fallbackRoute" IS DISTINCT FROM 'own-key'
+         AND (TG_OP = 'INSERT'
+           OR NEW."selectedExecutionTargetId" IS DISTINCT FROM OLD."selectedExecutionTargetId"
+           OR NEW."requestedModelPoolId" IS DISTINCT FROM OLD."requestedModelPoolId"
+           OR NEW."fallbackRoute" IS DISTINCT FROM OLD."fallbackRoute"
+           OR NEW."selectedPoolMemberId" IS DISTINCT FROM OLD."selectedPoolMemberId")
+         AND NOT EXISTS (
+           SELECT 1 FROM pool_member member
+            WHERE member."poolId" = NEW."requestedModelPoolId"
+              AND member."executionTargetId" = NEW."selectedExecutionTargetId"
+              AND (NEW."selectedPoolMemberId" IS NULL OR member.id = NEW."selectedPoolMemberId")
+              AND member.tier = CASE
+                WHEN NEW."fallbackRoute" = 'pool-external' THEN 'PUBLIC_OVERFLOW'::"PoolMemberTier"
+                ELSE 'PRIMARY'::"PoolMemberTier"
+              END
+         ) THEN
+        RAISE EXCEPTION 'relay request selection must be a member of its pool'
+          USING ERRCODE = '23514';
+      END IF;
     END IF;
   END IF;
   RETURN NEW;
