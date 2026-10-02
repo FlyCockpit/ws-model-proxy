@@ -1205,6 +1205,14 @@
       "createDisabledDeployment": "External providers are disabled on this deployment, so this token will be created private-only. You can allow external providers later, once the deployment enables them.",
       "savedPoolsHint": "Only checked pools may use external providers; the others stay local. Pools are never added automatically, so check each pool you want. Turning external access off and on keeps these choices."
     },
+    "externalWait": {
+      "label": "Wait for local capacity before going external (ms)",
+      "hint": "Leave empty to use each pool's wait. 0 goes external as soon as nothing is free. The value never exceeds the pool setting. People you share a pool with can only wait as long as that pool allows.",
+      "placeholder": "Pool default",
+      "save": "Save wait",
+      "saved": "External wait updated",
+      "invalid": "Enter a whole number of milliseconds from 0 to 600000, or leave empty for the pool default."
+    },
     "allVisible": "All visible",
     "allowlist": "Allowlist",
     "allowlistModels": "Allowlisted models",

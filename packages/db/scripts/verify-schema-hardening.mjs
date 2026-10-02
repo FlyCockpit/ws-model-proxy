@@ -91,6 +91,7 @@ const requiredFragments = [
   "DROP TRIGGER IF EXISTS model_pool_public_disable ON model_pool",
   "primary pool members must be local discovered models",
   "model_pool_external_after_wait_check",
+  "model_api_token_external_after_wait_check",
   "relay_request_fallback_route_check",
   // #66: grantee local stickiness and durable relay owner attribution.
   "stickiness pool binding requires the pool owner or the exact grant",

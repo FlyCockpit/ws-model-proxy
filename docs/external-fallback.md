@@ -116,6 +116,14 @@ The request goes external only after local routing could not serve it:
 - the local wait expired (an `:external` caller waits at most the pool's
   `externalAfterWaitMs`, default 2000 ms, and never longer than the local wait
   budget; 0 means "go external at once when no local member is free now").
+  A model-API token may store its own `externalAfterWaitMs` (null uses each
+  pool's wait). A request may send `x-wsmp-external-after-wait-ms` (or
+  `externalAfterWaitMs` on the MCP chat diagnostic); that override cannot
+  exceed the token setting, and if the token has none it may lengthen up to
+  the pool cap. Owner tokens may set any value in `[0, pool.externalAfterWaitMs]`;
+  grantees cannot shorten below the pool value. Invalid header values are
+  ignored. When `fallbackEnabled` or `fallbackForGrantees` is off, there is
+  no external plan and the caller waits the full local budget.
   When the request's prefix is warm on a busy member, the other local members
   are held back for the pool's cache-holder wait first (see
   [Waiting for the cache holder](#waiting-for-the-cache-holder)); the external
@@ -571,6 +579,10 @@ All of these except the two account rows carry `x-wsmp-fallback: unavailable`.
 
 ## Responses and headers
 
+- `x-wsmp-external-after-wait-ms` (request): optional per-request wait in
+  milliseconds for `:external` callers. Invalid values are ignored. Cannot
+  exceed the token setting (or the pool cap when the token has no override).
+  Grantees cannot shorten below the pool value.
 - `x-wsmp-route: local | pool-fallback | own-key`
 - `x-wsmp-fallback-reason` and `x-wsmp-served-model` on external responses.
   The reason is `local_wait_expired`, `local_saturated_protected`,

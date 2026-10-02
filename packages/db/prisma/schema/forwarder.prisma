@@ -1566,23 +1566,27 @@ model PoolGrant {
 }
 
 model ModelApiToken {
-  id               String                        @id @default(cuid(2))
-  createdAt        DateTime                      @default(now())
-  updatedAt        DateTime                      @default(now()) @updatedAt
-  userId           String
-  name             String
-  scopeMode        ModelApiTokenScopeMode        @default(ALL_VISIBLE)
+  id                  String                        @id @default(cuid(2))
+  createdAt           DateTime                      @default(now())
+  updatedAt           DateTime                      @default(now()) @updatedAt
+  userId              String
+  name                String
+  scopeMode           ModelApiTokenScopeMode        @default(ALL_VISIBLE)
   /// Human-only consent for `owner/pool:external` requests. False (private
   /// only) by default. ALLOWLIST tokens additionally need the pool entry's
   /// includeExternal; ALL_VISIBLE tokens are all-or-nothing.
-  allowExternal    Boolean                       @default(false)
-  lookupPrefix     String
-  secretDigest     String
-  lastUsedAt       DateTime?
-  revokedAt        DateTime?
-  expiresAt        DateTime?
-  User             User                          @relation("ModelApiTokenOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
-  AllowlistEntries ModelApiTokenAllowlistEntry[]
+  allowExternal       Boolean                       @default(false)
+  /// Optional caller wait before going external, in milliseconds. Null uses
+  /// each pool's `externalAfterWaitMs`. Capped by the pool at request time.
+  /// Grantees cannot shorten below the pool value.
+  externalAfterWaitMs Int?
+  lookupPrefix        String
+  secretDigest        String
+  lastUsedAt          DateTime?
+  revokedAt           DateTime?
+  expiresAt           DateTime?
+  User                User                          @relation("ModelApiTokenOwner", fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  AllowlistEntries    ModelApiTokenAllowlistEntry[]
 
   @@unique([lookupPrefix])
   @@unique([secretDigest])

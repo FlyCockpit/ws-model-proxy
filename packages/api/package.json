@@ -26,6 +26,9 @@
     "./lib/model-api-token-access": {
       "default": "./src/lib/model-api-token-access.ts"
     },
+    "./lib/caller-external-wait": {
+      "default": "./src/lib/caller-external-wait.ts"
+    },
     "./lib/media-attachment-limits": {
       "default": "./src/lib/media-attachment-limits.ts"
     },

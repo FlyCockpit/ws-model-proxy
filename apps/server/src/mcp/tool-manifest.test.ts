@@ -141,6 +141,7 @@ const PLAN_WRITE_TOOLS: readonly string[] = [
   "capacity_direct_policy_update",
   "capacity_pool_policy_update",
   "capacity_member_policy_update",
+  "model_api_token_external_wait_update",
   "model_api_token_revoke",
   "cli_token_revoke",
   "forwarder_pool_member_test",
@@ -277,6 +278,7 @@ const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
   capacity_direct_policy_update: "capacityManagement.updateDirectPolicy",
   capacity_pool_policy_update: "capacityManagement.updatePoolPolicy",
   capacity_member_policy_update: "capacityManagement.updateMemberPolicy",
+  model_api_token_external_wait_update: "modelApiTokens.updateExternalWait",
   model_api_token_revoke: "modelApiTokens.revoke",
   cli_token_revoke: "cliCredentials.revokeToken",
   forwarder_pool_member_test: "core:model-api/runPoolMemberTest",
@@ -394,13 +396,13 @@ describe("MCP tool manifest — exact catalog", () => {
     }
   });
 
-  it("contains exactly 37 read + 62 write names (no extras, no missing, no duplicates)", () => {
+  it("contains exactly 37 read + 63 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);
     expect([...names].sort()).toEqual([...PLAN_READ_TOOLS, ...PLAN_WRITE_TOOLS].sort());
     expect(PLAN_READ_TOOLS).toHaveLength(37);
-    expect(PLAN_WRITE_TOOLS).toHaveLength(62);
-    expect(MCP_TOOL_MANIFEST).toHaveLength(99);
+    expect(PLAN_WRITE_TOOLS).toHaveLength(63);
+    expect(MCP_TOOL_MANIFEST).toHaveLength(100);
   });
 
   it("the CLI device list explains effectiveMode and which switch limits it", () => {
@@ -603,9 +605,9 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
         `${tool.name}: ${PLAN_TARGETS[tool.name]}`,
       );
     }
-    // 99 catalog entries − 14 extracted cores = 85 procedure dispatches.
-    expect(dispatched).toBe(85);
-    expect(invoked).toHaveLength(85);
+    // 100 catalog entries − 14 extracted cores = 86 procedure dispatches.
+    expect(dispatched).toBe(86);
+    expect(invoked).toHaveLength(86);
 
     // Human-only proof: ZERO mcpGrants access (property or invocation)
     // across every dispatch.
@@ -773,6 +775,38 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
     const read = byName.get("forwarder_pool_fallback_get")!;
     expect(read.scope).toBe("read");
     expect(read.confirmation).toBeNull();
+  });
+
+  it("issue #181: per-token :external wait is an ordinary mcp:write tool that states its cost", async () => {
+    const byName = new Map(MCP_TOOL_MANIFEST.map((tool) => [tool.name, tool]));
+    const update = byName.get("model_api_token_external_wait_update")!;
+    expect(update.scope).toBe("write");
+    expect(update.confirmation).toBeNull();
+    expect(update.classification).toBe("pure");
+    for (const phrase of [
+      "COST:",
+      "externalAfterWaitMs",
+      "Lower values spend more",
+      "x-wsmp-external-after-wait-ms",
+      "Grantees cannot shorten",
+    ])
+      expect(update.descriptionNote).toContain(phrase);
+    expect(
+      await update.inputSchema["~standard"].validate({
+        id: "token",
+        externalAfterWaitMs: 500,
+      }),
+    ).not.toHaveProperty("issues");
+    expect(
+      update.inputSchema["~standard"].jsonSchema.input({ target: "draft-2020-12" }),
+    ).toMatchObject({
+      properties: {
+        externalAfterWaitMs: {
+          anyOf: [{ type: "integer", minimum: 0, maximum: 600_000 }, { type: "null" }],
+        },
+      },
+      required: ["id", "externalAfterWaitMs"],
+    });
   });
 
   it("D9: MCP account tools cannot relax the OpenRouter data-collection setting", async () => {

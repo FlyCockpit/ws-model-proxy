@@ -147,6 +147,16 @@ assignment provenance and automatic concurrency seed columns.
   against the requester for own-key and direct routes (#61). The schema deploy
   above installs it.
 
+## Per-caller `:external` wait (#181)
+
+A model-API token can store `externalAfterWaitMs` (null uses each pool's wait).
+`:external` requests may also send `x-wsmp-external-after-wait-ms`. Neither
+exceeds the pool cap. Owner tokens may set any value in
+`[0, pool.externalAfterWaitMs]`; grantees cannot shorten below the pool value.
+When fallback is off, the caller waits the full local budget. MCP:
+`model_api_token_external_wait_update`. The column is additive and nullable
+(`APPLY_SCHEMA=safe`).
+
 ## Post-deploy verification
 
 The trigger fix is covered by the PostgreSQL CI suites but has not yet been

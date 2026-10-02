@@ -34,6 +34,7 @@ import { REQUEST_JSON_DEPTH_ERROR, requestJsonDepthExceeded } from "./request-js
  * provider response NEVER crosses this boundary (invariant 10).
  */
 
+import { EXTERNAL_AFTER_WAIT_HEADER } from "@ws-model-proxy/api/lib/caller-external-wait";
 import { markPoolMemberRelaySuccess } from "@ws-model-proxy/api/lib/model-pool-routing";
 import {
   resolveEffectiveCapabilityMetadata,
@@ -425,6 +426,8 @@ export type ChatCompletionDiagnosticResult =
 interface ChatCompletionDiagnosticInput {
   /** OpenAI-compatible chat completion request body (model, messages, ...). */
   body: Record<string, unknown>;
+  /** Per-request `:external` wait override; forwarded as the HTTP header. */
+  externalAfterWaitMs?: number;
 }
 
 /**
@@ -452,6 +455,7 @@ export function runChatCompletionDiagnostic(
 async function chatCompletionDiagnostic({
   userId,
   body,
+  externalAfterWaitMs,
   signal,
   manager = relaySessionManager,
   concurrencyLimiter = modelApiConcurrencyLimiter,
@@ -475,9 +479,12 @@ async function chatCompletionDiagnostic({
     };
   if (requestJsonDepthExceeded(body))
     return { outcome: "invalid-request", reason: REQUEST_JSON_DEPTH_ERROR };
+  const headers = new Headers({ "content-type": "application/json" });
+  if (externalAfterWaitMs !== undefined)
+    headers.set(EXTERNAL_AFTER_WAIT_HEADER, String(externalAfterWaitMs));
   const request = new Request("http://diagnostic.internal/v1/chat/completions", {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers,
     body: new TextEncoder().encode(JSON.stringify({ ...body, stream: false })),
     signal,
   });

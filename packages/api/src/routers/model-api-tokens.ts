@@ -7,6 +7,7 @@ import {
 } from "@ws-model-proxy/db/forwarder-security";
 import { z } from "zod";
 import { protectedProcedure } from "../index";
+import { externalAfterWaitMsSchema } from "../lib/caller-external-wait";
 import {
   digestModelApiTokenSecret,
   listVisibleModelTargetsForUser,
@@ -28,6 +29,7 @@ const tokenSelection = {
   name: true,
   scopeMode: true,
   allowExternal: true,
+  externalAfterWaitMs: true,
   lookupPrefix: true,
   lastUsedAt: true,
   revokedAt: true,
@@ -54,6 +56,8 @@ function serializeToken(row: TokenListRow) {
     scopeMode: String(row.scopeMode),
     /** Human-set consent for `owner/pool:external`; false means private only. */
     allowExternal: row.allowExternal,
+    /** Null uses each pool's `externalAfterWaitMs`. Capped per pool at request time. */
+    externalAfterWaitMs: row.externalAfterWaitMs,
     lookupPrefix: row.lookupPrefix,
     lastUsedAt: row.lastUsedAt,
     revokedAt: row.revokedAt,
@@ -180,6 +184,7 @@ export const modelApiTokensRouter = {
         scopeMode: scopeModeSchema,
         modelIds: z.array(modelIdSchema).max(200).default([]),
         expiresAt: z.date().nullable().optional(),
+        externalAfterWaitMs: externalAfterWaitMsSchema.nullable().optional(),
       }),
     )
     .handler(async ({ input, context }) => {
@@ -207,6 +212,9 @@ export const modelApiTokensRouter = {
             lookupPrefix: credentialLookupPrefix(rawSecret),
             secretDigest: digestModelApiTokenSecret(rawSecret),
             expiresAt: input.expiresAt ?? null,
+            ...(input.externalAfterWaitMs !== undefined
+              ? { externalAfterWaitMs: input.externalAfterWaitMs }
+              : {}),
             AllowlistEntries: {
               create: buildModelApiTokenAllowlistEntries(allowlistTargets),
             },
@@ -288,6 +296,40 @@ export const modelApiTokensRouter = {
         const updated = await tx.modelApiToken.update({
           where: { id: existing.id },
           data: { allowExternal: input.allowExternal },
+          select: tokenSelection,
+        });
+        return serializeToken(updated);
+      });
+    }),
+
+  /**
+   * How long this token's `:external` requests wait for local capacity.
+   * Null uses each pool's `externalAfterWaitMs`. The value is stored as-is
+   * (0..600000); each request still caps it at that pool's wait, and a
+   * grantee cannot shorten below the pool default.
+   */
+  updateExternalWait: protectedProcedure
+    .input(
+      z.object({
+        id: z.string().min(1),
+        externalAfterWaitMs: externalAfterWaitMsSchema.nullable(),
+      }),
+    )
+    .handler(async ({ input, context }) => {
+      const userId = context.session.user.id;
+      return prisma.$transaction(async (tx) => {
+        await fenceOwners(tx, [userId]);
+        await tx.$queryRaw`SELECT id FROM model_api_token WHERE id = ${input.id} AND "userId" = ${userId} FOR NO KEY UPDATE`;
+        const existing = await tx.modelApiToken.findUnique({
+          where: { id: input.id, userId },
+          select: { id: true, userId: true, revokedAt: true },
+        });
+        if (!existing || existing.userId !== userId || existing.revokedAt) {
+          throw new ORPCError("NOT_FOUND", { message: "Model API token not found." });
+        }
+        const updated = await tx.modelApiToken.update({
+          where: { id: existing.id },
+          data: { externalAfterWaitMs: input.externalAfterWaitMs },
           select: tokenSelection,
         });
         return serializeToken(updated);

@@ -113,6 +113,11 @@ MCP tools can never grant it:
 
 - \`modelApiTokens.updateExternalAccess\` (a token's \`allowExternal\` and
   per-pool \`includeExternal\`) is excluded from the catalog (decision C1);
+- \`modelApiTokens.updateExternalWait\` (a token's \`externalAfterWaitMs\`) is
+  an ordinary \`mcp:write\` tool, \`model_api_token_external_wait_update\`,
+  with no confirmation. Null uses each pool's wait; a request header or MCP
+  argument cannot exceed the token setting (or the pool cap when the token
+  has no override). Grantees cannot shorten below the pool value;
 - \`providerManagement.setAllowDataCollection\` (the OpenRouter
   "providers that may collect data" opt-out, decision D9) is excluded, and
   \`provider_account_create\` / \`provider_account_update\` reject

@@ -69,6 +69,7 @@ type TokenCreateArgs = {
     lookupPrefix: string;
     secretDigest: string;
     expiresAt: Date | null;
+    externalAfterWaitMs?: number | null;
     AllowlistEntries: {
       create: {
         target: string;
@@ -211,6 +212,7 @@ function mockTokenCreate() {
       scopeMode: createArgs.data.scopeMode,
       // Column default: new tokens are private only.
       allowExternal: false,
+      externalAfterWaitMs: createArgs.data.externalAfterWaitMs ?? null,
       lookupPrefix: createArgs.data.lookupPrefix,
       lastUsedAt: null,
       revokedAt: null,
@@ -294,6 +296,7 @@ describe("modelApiTokensRouter", () => {
         revokedAt: null,
         expiresAt: null,
         allowExternal: false,
+        externalAfterWaitMs: null,
         allowlist: {
           directModelCount: 1,
           modelPoolCount: 2,
@@ -358,6 +361,20 @@ describe("modelApiTokensRouter", () => {
       expect(fenceCalls()).toEqual([["00:owner:user-id"]]);
     });
 
+    it("persists an optional caller :external wait on create", async () => {
+      seedVisibleModels();
+      mockTokenCreate();
+      const client = createRouterClient(modelApiTokensRouter, { context: buildContext() });
+      const result = await client.create({
+        name: "Waiter",
+        scopeMode: "ALL_VISIBLE",
+        externalAfterWaitMs: 500,
+      });
+      expect(result.token.externalAfterWaitMs).toBe(500);
+      const createCall = db.modelApiToken.create.mock.calls[0]?.[0] as TokenCreateArgs;
+      expect(createCall.data.externalAfterWaitMs).toBe(500);
+    });
+
     it("rejects another user's direct model canonical id", async () => {
       seedVisibleModels();
       mockTokenCreate();
@@ -416,6 +433,7 @@ describe("modelApiTokensRouter", () => {
           name: "Harness",
           scopeMode: "ALLOWLIST",
           allowExternal: false,
+          externalAfterWaitMs: null,
           lookupPrefix: "wsmp_model_abcd1234EFGH",
           secretDigest: "digest-that-must-not-leak",
           lastUsedAt: null,
@@ -443,6 +461,7 @@ describe("modelApiTokensRouter", () => {
           name: "Harness",
           scopeMode: "ALLOWLIST",
           allowExternal: false,
+          externalAfterWaitMs: null,
           lookupPrefix: "wsmp_model_abcd1234EFGH",
           lastUsedAt: null,
           revokedAt: null,
@@ -518,24 +537,25 @@ describe("modelApiTokensRouter", () => {
     });
   });
 
-  describe("updateExternalAccess", () => {
-    function tokenRow(scopeMode: "ALL_VISIBLE" | "ALLOWLIST", allowExternal: boolean) {
-      return {
-        id: "token-id",
-        createdAt,
-        updatedAt,
-        userId: "user-id",
-        name: "Harness",
-        scopeMode,
-        allowExternal,
-        lookupPrefix: "wsmp_model_abcd1234EFGH",
-        lastUsedAt: null,
-        revokedAt: null,
-        expiresAt: null,
-        AllowlistEntries: [],
-      };
-    }
+  function tokenRow(scopeMode: "ALL_VISIBLE" | "ALLOWLIST", allowExternal: boolean) {
+    return {
+      id: "token-id",
+      createdAt,
+      updatedAt,
+      userId: "user-id",
+      name: "Harness",
+      scopeMode,
+      allowExternal,
+      externalAfterWaitMs: null,
+      lookupPrefix: "wsmp_model_abcd1234EFGH",
+      lastUsedAt: null,
+      revokedAt: null,
+      expiresAt: null,
+      AllowlistEntries: [],
+    };
+  }
 
+  describe("updateExternalAccess", () => {
     beforeEach(() => {
       db.$transaction.mockImplementation(async (work: (tx: typeof db) => unknown) => work(db));
     });
@@ -655,6 +675,48 @@ describe("modelApiTokensRouter", () => {
       expect(db.modelApiToken.findUnique).toHaveBeenCalledWith(
         expect.objectContaining({ where: { id: "token-id", userId: "user-id" } }),
       );
+    });
+  });
+
+  describe("updateExternalWait", () => {
+    it("stores a caller wait and clears it back to the pool default", async () => {
+      db.modelApiToken.findUnique.mockResolvedValue({
+        id: "token-id",
+        userId: "user-id",
+        revokedAt: null,
+      });
+      db.modelApiToken.update.mockResolvedValueOnce({
+        ...tokenRow("ALL_VISIBLE", false),
+        externalAfterWaitMs: 500,
+      });
+      db.modelApiToken.update.mockResolvedValueOnce({
+        ...tokenRow("ALL_VISIBLE", false),
+        externalAfterWaitMs: null,
+      });
+      const client = createRouterClient(modelApiTokensRouter, { context: buildContext() });
+
+      await expect(
+        client.updateExternalWait({ id: "token-id", externalAfterWaitMs: 500 }),
+      ).resolves.toMatchObject({ externalAfterWaitMs: 500 });
+      await expect(
+        client.updateExternalWait({ id: "token-id", externalAfterWaitMs: null }),
+      ).resolves.toMatchObject({ externalAfterWaitMs: null });
+      expect(db.modelApiToken.update.mock.calls.map(([args]) => args.data)).toEqual([
+        { externalAfterWaitMs: 500 },
+        { externalAfterWaitMs: null },
+      ]);
+    });
+
+    it("hides tokens owned by another user", async () => {
+      db.modelApiToken.findUnique.mockResolvedValue(null);
+      const client = createRouterClient(modelApiTokensRouter, { context: buildContext() });
+      await expect(
+        client.updateExternalWait({ id: "token-id", externalAfterWaitMs: 0 }),
+      ).rejects.toSatisfy((error: ORPCError) => {
+        expect(error.code).toBe("NOT_FOUND");
+        return true;
+      });
+      expect(db.modelApiToken.update).not.toHaveBeenCalled();
     });
   });
 

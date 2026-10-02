@@ -30,6 +30,7 @@
  */
 
 import type { StandardSchemaWithJSON } from "@modelcontextprotocol/server";
+import { EXTERNAL_AFTER_WAIT_MS_MAX } from "@ws-model-proxy/api/lib/caller-external-wait";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { z } from "zod";
 import { runChatCompletionDiagnostic, runPoolMemberTest } from "../model-api/diagnostics.js";
@@ -363,6 +364,10 @@ export const POOL_FALLBACK_COST_NOTICE =
  */
 export const POOL_EXTERNAL_WAIT_COST_NOTICE =
   "fallbackEnabled and fallbackForGrantees are rejected here: use forwarder_pool_fallback_update. COST: externalAfterWaitMs sets how long an owner/pool:external request waits for local capacity before it is sent to a paid external provider billed to YOUR provider accounts: lower values spend more. Changes are recorded as POOL_FALLBACK_UPDATED provider audit events.";
+
+/** Cost statement for the per-token `:external` wait (issue #181). */
+export const TOKEN_EXTERNAL_WAIT_COST_NOTICE =
+  "COST: externalAfterWaitMs is how long this token's :external requests wait for local capacity before they may be sent to a paid external provider. Lower values spend more. Null uses each pool's setting. A request may also send x-wsmp-external-after-wait-ms or forwarder_chat_completion_test's externalAfterWaitMs argument; that override cannot exceed the token setting, and if the token has no override it may lengthen up to the pool cap. Grantees cannot shorten below the pool value. The stored value is 0..600000; each request still caps it at that pool's wait.";
 
 // ---------------------------------------------------------------------------
 // Procedure invocation helper
@@ -1308,7 +1313,16 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.capacityManagement.updateMemberPolicy),
   },
-  // --- token revocation (writes) ---
+  // --- token revocation and caller :external wait (writes) ---
+  {
+    name: "model_api_token_external_wait_update",
+    target: "modelApiTokens.updateExternalWait",
+    scope: "write",
+    confirmation: null,
+    classification: "pure",
+    descriptionNote: TOKEN_EXTERNAL_WAIT_COST_NOTICE,
+    invokeProcedure: procedureInvoker((client) => client.modelApiTokens.updateExternalWait),
+  },
   {
     name: "model_api_token_revoke",
     target: "modelApiTokens.revoke",
@@ -1350,13 +1364,24 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     scope: "write",
     confirmation: "RUN",
     classification: "cost",
-    coreShape: { model: z.string().min(1), messages: CHAT_MESSAGES_SCHEMA },
-    invokeCore: (input, deps) =>
-      runChatCompletionDiagnostic({
+    coreShape: {
+      model: z.string().min(1),
+      messages: CHAT_MESSAGES_SCHEMA,
+      externalAfterWaitMs: z.number().int().min(0).max(EXTERNAL_AFTER_WAIT_MS_MAX).optional(),
+    },
+    descriptionNote:
+      "externalAfterWaitMs is the per-request :external wait override (same as HTTP x-wsmp-external-after-wait-ms). It cannot exceed this caller's token setting or the pool cap. MCP diagnostics still cannot use :external.",
+    invokeCore: (input, deps) => {
+      const record = input as Record<string, unknown>;
+      const { externalAfterWaitMs, ...body } = record;
+      return runChatCompletionDiagnostic({
         userId: deps.userId,
-        body: input as Record<string, unknown>,
+        body,
+        externalAfterWaitMs:
+          typeof externalAfterWaitMs === "number" ? externalAfterWaitMs : undefined,
         signal: deps.signal,
-      }),
+      });
+    },
   },
   {
     name: "forwarder_cli_command_run",
@@ -1413,8 +1438,8 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
 ];
 
 /**
- * The checked catalog: exactly 37 read tools and 62 write tools
- * (85 procedure-backed + 14 extracted cores: 2 diagnostics, 3 CLI commands
+ * The checked catalog: exactly 37 read tools and 63 write tools
+ * (86 procedure-backed + 14 extracted cores: 2 diagnostics, 3 CLI commands
  * and 9 node file tools (4 read, 5 write)).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS].map(

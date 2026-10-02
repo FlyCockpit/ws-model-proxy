@@ -2,6 +2,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import type { IncomingMessage } from "node:http";
 import { createRequire } from "node:module";
 import { Readable } from "node:stream";
+import { EXTERNAL_AFTER_WAIT_HEADER } from "@ws-model-proxy/api/lib/caller-external-wait";
 import type {
   ModelApiTokenIdentity,
   VisibleDirectModelTarget,
@@ -382,6 +383,7 @@ const token: ModelApiTokenIdentity = {
   userId: "user-id",
   scopeMode: "ALL_VISIBLE",
   allowExternal: false,
+  externalAfterWaitMs: null,
   lookupPrefix: "wsmp_model_lookup",
   expiresAt: null,
   lastUsedAt: null,
@@ -9376,6 +9378,219 @@ describe("model API routes", () => {
     });
   });
 
+  describe("per-caller :external wait override (#181)", () => {
+    function localAndProviderMembers(
+      poolWaitMs: number,
+      overflow: { fallbackForGrantees?: boolean } = {},
+    ) {
+      db.poolMember.findMany.mockResolvedValue([
+        poolMemberRow({
+          id: "local-primary",
+          discoveredModelId: "local-model",
+          upstreamModelId: "local-upstream",
+          cliDeviceId: "cli-local",
+          externalAfterWaitMs: poolWaitMs,
+        }),
+      ]);
+      publicOverflow.list.mockResolvedValue(
+        listedExternalTargets([externalProviderTarget("overflow-member")], overflow),
+      );
+      publicOverflow.dispatch.mockResolvedValueOnce(
+        externalDispatchResult(externalProviderTarget("overflow-member")),
+      );
+    }
+
+    function expiredLocalThenAdmit(): CapacityAdmissionRuntime {
+      const acquire = vi.fn(async (attempt: Parameters<CapacityAdmissionRuntime["acquire"]>[0]) => {
+        const candidate = attempt.candidates[0]!;
+        if (candidate.poolMemberId === "local-primary") return { state: "EXPIRED" as const };
+        return {
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: `lease-${candidate.poolMemberId}`,
+            attemptId: attempt.attemptId,
+            capacityId: candidate.capacityId,
+            executionTargetId: candidate.executionTargetId,
+            poolMemberId: candidate.poolMemberId,
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        };
+      });
+      return {
+        acquire,
+        release: vi.fn(async () => true),
+        hold: vi.fn((response) => response),
+      };
+    }
+
+    async function requestExternal({
+      headers = {},
+      tokenWait = null,
+      pool = externalPoolTarget,
+      modelId = EXTERNAL_MODEL_ID,
+    }: {
+      headers?: Record<string, string>;
+      tokenWait?: number | null;
+      pool?: VisibleModelPoolTarget;
+      modelId?: string;
+    } = {}) {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [pool],
+      });
+      mockedTokenAccess.authenticateModelApiTokenSecret.mockResolvedValue({
+        ...token,
+        allowExternal: true,
+        externalAfterWaitMs: tokenWait,
+      });
+      externalConsent.poolIds = [pool.id];
+      const capacityRuntime = expiredLocalThenAdmit();
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+      const response = await appWith(manager, capacityRuntime).request("/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+          ...headers,
+        },
+        body: requestBody(modelId),
+      });
+      return { response, capacityRuntime, manager };
+    }
+
+    async function serveLocally({
+      pool,
+      modelId,
+      tokenWait = 0,
+      headers = {},
+    }: {
+      pool: VisibleModelPoolTarget;
+      modelId: string;
+      tokenWait?: number | null;
+      headers?: Record<string, string>;
+    }) {
+      mockedTokenAccess.listVisibleModelTargetsForToken.mockResolvedValue({
+        directModels: [],
+        modelPools: [pool],
+      });
+      mockedTokenAccess.authenticateModelApiTokenSecret.mockResolvedValue({
+        ...token,
+        allowExternal: true,
+        externalAfterWaitMs: tokenWait,
+      });
+      externalConsent.poolIds = [pool.id];
+      const capacityRuntime = admittingCapacityRuntime();
+      const manager = new FakeRelayManager();
+      manager.activeCliDeviceIds = ["cli-local"];
+      const responsePromise = appWith(manager, capacityRuntime).request("/chat/completions", {
+        method: "POST",
+        headers: {
+          authorization: "Bearer wsmp_model_test",
+          "content-type": "application/json",
+          ...headers,
+        },
+        body: requestBody(modelId),
+      });
+      await vi.waitFor(() => expect(manager.sent).toHaveLength(1));
+      await completeJsonRelay({ manager, requestId: requireSent(manager).requestId });
+      return { response: await responsePromise, capacityRuntime };
+    }
+
+    it("omits to the pool default", async () => {
+      localAndProviderMembers(2_000);
+      const { response, capacityRuntime } = await requestExternal();
+      expect(response.status).toBe(200);
+      expect(vi.mocked(capacityRuntime.acquire).mock.calls[0]?.[0].candidates).toEqual([
+        expect.objectContaining({ poolMemberId: "local-primary", waitBudgetMs: 2_000 }),
+      ]);
+    });
+
+    it("caps a token or header wait at the pool value", async () => {
+      localAndProviderMembers(2_000);
+      const { capacityRuntime } = await requestExternal({
+        tokenWait: 8_000,
+        headers: { [EXTERNAL_AFTER_WAIT_HEADER]: "9000" },
+      });
+      expect(vi.mocked(capacityRuntime.acquire).mock.calls[0]?.[0].candidates).toEqual([
+        expect.objectContaining({ poolMemberId: "local-primary", waitBudgetMs: 2_000 }),
+      ]);
+    });
+
+    it("lets an owner token shorten the wait, and a header cannot exceed the token", async () => {
+      localAndProviderMembers(2_000);
+      const { capacityRuntime } = await requestExternal({
+        tokenWait: 500,
+        headers: { [EXTERNAL_AFTER_WAIT_HEADER]: "8000" },
+      });
+      expect(vi.mocked(capacityRuntime.acquire).mock.calls[0]?.[0].candidates).toEqual([
+        expect.objectContaining({ poolMemberId: "local-primary", waitBudgetMs: 500 }),
+      ]);
+    });
+
+    it("lets a header lengthen up to the pool cap when the token has no override", async () => {
+      localAndProviderMembers(2_000);
+      const { capacityRuntime } = await requestExternal({
+        headers: { [EXTERNAL_AFTER_WAIT_HEADER]: "1500" },
+      });
+      expect(vi.mocked(capacityRuntime.acquire).mock.calls[0]?.[0].candidates).toEqual([
+        expect.objectContaining({ poolMemberId: "local-primary", waitBudgetMs: 1_500 }),
+      ]);
+    });
+
+    it("ignores a grantee shortening below the pool default", async () => {
+      const granted: VisibleModelPoolTarget = {
+        ...externalPoolTarget,
+        ownerUserId: "pool-owner-id",
+        accessGrantId: "grant-id",
+        fallbackForGrantees: true,
+      };
+      localAndProviderMembers(2_000, { fallbackForGrantees: true });
+      const { capacityRuntime } = await requestExternal({
+        pool: granted,
+        modelId: `${granted.modelId}:external`,
+        tokenWait: 0,
+        headers: { [EXTERNAL_AFTER_WAIT_HEADER]: "0" },
+      });
+      expect(vi.mocked(capacityRuntime.acquire).mock.calls[0]?.[0].candidates).toEqual([
+        expect.objectContaining({ poolMemberId: "local-primary", waitBudgetMs: 2_000 }),
+      ]);
+    });
+
+    it("keeps the full local wait when fallbackEnabled is off", async () => {
+      localAndProviderMembers(2_000);
+      const { response, capacityRuntime } = await serveLocally({
+        pool: { ...externalPoolTarget, fallbackEnabled: false, externalMemberCount: 1 },
+        modelId: EXTERNAL_MODEL_ID,
+        headers: { [EXTERNAL_AFTER_WAIT_HEADER]: "0" },
+      });
+      expect(response.status).toBe(200);
+      expect(vi.mocked(capacityRuntime.acquire).mock.calls[0]?.[0].candidates).toEqual([
+        expect.objectContaining({ poolMemberId: "local-primary", waitBudgetMs: 30_000 }),
+      ]);
+    });
+
+    it("keeps the full local wait when fallbackForGrantees is off for a grantee", async () => {
+      const granted: VisibleModelPoolTarget = {
+        ...externalPoolTarget,
+        ownerUserId: "pool-owner-id",
+        accessGrantId: "grant-id",
+        fallbackForGrantees: false,
+      };
+      localAndProviderMembers(2_000, { fallbackForGrantees: false });
+      const { response, capacityRuntime } = await serveLocally({
+        pool: granted,
+        modelId: `${granted.modelId}:external`,
+        headers: { [EXTERNAL_AFTER_WAIT_HEADER]: "0" },
+      });
+      expect(response.status).toBe(200);
+      expect(vi.mocked(capacityRuntime.acquire).mock.calls[0]?.[0].candidates).toEqual([
+        expect.objectContaining({ poolMemberId: "local-primary", waitBudgetMs: 30_000 }),
+      ]);
+    });
+  });
+
   describe("metric routing rules (S-B part 2)", () => {
     const members = () =>
       ["m1", "m2", "m3"].map((id) =>
@@ -12979,6 +13194,7 @@ describe("model API routes", () => {
         modelApiTokenId: "token-id",
         modelApiTokenLookupPrefix: "wsmp_model_lookup",
         limitKey: "token-id",
+        externalAfterWaitMs: null,
       },
       targetModelPoolId: "pool-id",
       poolGrantId: null,

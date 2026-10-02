@@ -97,6 +97,8 @@ export type ModelApiTokenIdentity = {
   scopeMode: ModelApiTokenScopeMode;
   /** Human-set consent for `owner/pool:external`; false (private only) by default. */
   allowExternal: boolean;
+  /** Null uses each pool's `externalAfterWaitMs`. Capped per pool at request time. */
+  externalAfterWaitMs: number | null;
   lookupPrefix: string;
   expiresAt: Date | null;
   lastUsedAt: Date | null;
@@ -698,6 +700,7 @@ export async function authenticateModelApiTokenSecret(
       userId: true,
       scopeMode: true,
       allowExternal: true,
+      externalAfterWaitMs: true,
       lookupPrefix: true,
       secretDigest: true,
       lastUsedAt: true,
@@ -731,6 +734,7 @@ export async function authenticateModelApiTokenSecret(
     userId: token.userId,
     scopeMode: String(token.scopeMode) as ModelApiTokenScopeMode,
     allowExternal: token.allowExternal === true,
+    externalAfterWaitMs: token.externalAfterWaitMs ?? null,
     lookupPrefix: token.lookupPrefix,
     expiresAt: token.expiresAt,
     lastUsedAt,

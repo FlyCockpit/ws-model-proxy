@@ -1517,6 +1517,11 @@ ALTER TABLE model_pool ADD CONSTRAINT model_pool_external_after_wait_check CHECK
   "externalAfterWaitMs" BETWEEN 0 AND 600000
 );
 
+ALTER TABLE model_api_token DROP CONSTRAINT IF EXISTS model_api_token_external_after_wait_check;
+ALTER TABLE model_api_token ADD CONSTRAINT model_api_token_external_after_wait_check CHECK (
+  "externalAfterWaitMs" IS NULL OR "externalAfterWaitMs" BETWEEN 0 AND 600000
+);
+
 -- Saturation S-A: null = automatic, 0 = off, otherwise fixed (capped at 30 s).
 ALTER TABLE model_pool DROP CONSTRAINT IF EXISTS model_pool_cache_holder_wait_check;
 ALTER TABLE model_pool ADD CONSTRAINT model_pool_cache_holder_wait_check CHECK (

@@ -775,6 +775,15 @@ the two switches (the advertised schema describes each as forbidden and names
 this tool); they still accept `externalAfterWaitMs`, and their descriptions
 state its cost.
 
+`model_api_token_external_wait_update` (`{ id, externalAfterWaitMs }`, write,
+no confirmation) stores how long this token's `:external` requests wait for
+local capacity. Null uses each pool's `externalAfterWaitMs`. A request may
+also send `x-wsmp-external-after-wait-ms`, or `externalAfterWaitMs` on
+`forwarder_chat_completion_test`; that override cannot exceed the token
+setting, and if the token has none it may lengthen up to the pool cap.
+Grantees cannot shorten below the pool value. The stored value is 0..600000;
+each request still caps it at that pool's wait.
+
 Still human-only: token external consent (`allowExternal`, `includeExternal`),
 own-key preferences, the pool external-equivalent picker, catalog search,
 the OpenRouter "providers that may collect data" account setting, and moving

@@ -1,4 +1,9 @@
 import {
+  EXTERNAL_AFTER_WAIT_HEADER,
+  parseExternalAfterWaitMs,
+  resolveCallerExternalAfterWaitMs,
+} from "@ws-model-proxy/api/lib/caller-external-wait";
+import {
   getConfiguredMediaAttachmentMaxBytes,
   resolveAttachmentLimit,
 } from "@ws-model-proxy/api/lib/media-attachment-limits";
@@ -1051,6 +1056,8 @@ type RelayRequester = {
   limitKey: string;
   modelApiTokenId: string | null;
   modelApiTokenLookupPrefix: string | null;
+  /** Token-level `:external` wait; null uses the pool default. */
+  externalAfterWaitMs: number | null;
   exposeTransformDebug?: boolean;
 };
 
@@ -2287,6 +2294,7 @@ function requesterFromToken(token: ModelApiTokenIdentity): RelayRequester {
     limitKey: token.id,
     modelApiTokenId: token.id,
     modelApiTokenLookupPrefix: token.lookupPrefix,
+    externalAfterWaitMs: token.externalAfterWaitMs,
   };
 }
 
@@ -2300,6 +2308,7 @@ function requesterFromChatTestUser(
     limitKey: `chat-test:${userId}`,
     modelApiTokenId: null,
     modelApiTokenLookupPrefix: null,
+    externalAfterWaitMs: null,
     exposeTransformDebug: true,
   };
 }
@@ -5838,10 +5847,21 @@ async function relayPool({
 
   const memberById = new Map(eligibleMembers.map((member) => [member.id, member] as const));
   // An `:external` caller with an external plan leaves the local queue after
-  // the pool's externalAfterWaitMs (never later than the member budget).
+  // the caller wait (token, then optional header/MCP argument), never later
+  // than the pool's externalAfterWaitMs or the member budget.
+  const poolExternalAfterWaitMs = eligibleMembers[0]?.ModelPool?.externalAfterWaitMs;
   const externalAfterWaitMs =
-    external.consent && (target.externalMemberCount > 0 || external.consent.ownKeyProviderModelId)
-      ? (eligibleMembers[0]?.ModelPool?.externalAfterWaitMs ?? null)
+    poolExternalAfterWaitMs !== undefined &&
+    external.consent &&
+    (target.externalMemberCount > 0 || external.consent.ownKeyProviderModelId)
+      ? resolveCallerExternalAfterWaitMs({
+          poolExternalAfterWaitMs,
+          tokenExternalAfterWaitMs: requester.externalAfterWaitMs,
+          requestExternalAfterWaitMs: parseExternalAfterWaitMs(
+            request.headers.get(EXTERNAL_AFTER_WAIT_HEADER),
+          ),
+          isPoolOwner: target.ownerUserId === requester.userId,
+        })
       : null;
   // Local wait per admission (X1): "shortened" waits min(B, E) and then runs
   // the external phase once (one external phase per request; precommit

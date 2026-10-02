@@ -1458,6 +1458,14 @@
       "createDisabledDeployment": "Los proveedores externos están desactivados en esta implementación, así que este token se creará solo privado. Podrás permitir proveedores externos más adelante, cuando la implementación los active.",
       "savedPoolsHint": "Solo los pools marcados pueden usar proveedores externos; los demás permanecen locales. Los pools nunca se agregan automáticamente, así que marca cada pool que quieras. Al desactivar y reactivar el acceso externo se conservan estas opciones."
     },
+    "externalWait": {
+      "label": "Esperar capacidad local antes de usar un proveedor externo (ms)",
+      "hint": "Déjalo vacío para usar la espera de cada pool. 0 usa un proveedor externo en cuanto nada está libre. El valor nunca supera el ajuste del pool. Quienes comparten un pool solo pueden esperar lo que ese pool permite.",
+      "placeholder": "Valor del pool",
+      "save": "Guardar espera",
+      "saved": "Espera externa actualizada",
+      "invalid": "Ingresa un número entero de milisegundos entre 0 y 600000, o déjalo vacío para usar el valor del pool."
+    },
     "allVisible": "Todos los visibles",
     "allowlist": "Lista permitida",
     "allowlistModels": "Modelos permitidos",
