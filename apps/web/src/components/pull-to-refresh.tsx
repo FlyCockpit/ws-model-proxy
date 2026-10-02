@@ -46,6 +46,23 @@ export default function PullToRefresh({ onRefresh, children }: PullToRefreshProp
     (e: React.TouchEvent) => {
       const container = containerRef.current;
       if (!container || refreshing) return;
+      let node: HTMLElement | null =
+        e.target instanceof HTMLElement
+          ? e.target
+          : e.target instanceof Node
+            ? e.target.parentElement
+            : null;
+      while (node && node !== container) {
+        const overflowY = getComputedStyle(node).overflowY;
+        if (
+          (overflowY === "auto" || overflowY === "scroll") &&
+          node.scrollHeight > node.clientHeight &&
+          node.scrollTop > 0
+        ) {
+          return;
+        }
+        node = node.parentElement;
+      }
       const scroller = nearestVerticalScroller(container);
       if (scroller && scroller.scrollTop > 0) return;
       touchStartY.current = e.touches[0].clientY;
