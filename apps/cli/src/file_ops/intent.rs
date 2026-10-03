@@ -1,6 +1,7 @@
 //! Versioned crash map written into a recovery directory before the first
-//! public capture. A reader uses `phase` and per-slot identity to roll forward
-//! or back; raw path bytes sit next to a lossy display string.
+//! public capture. v3 hardlink anchors keep identities allocated across restart;
+//! readers never use serialized inode snapshots alone to authorize mutations.
+//! Raw path bytes sit next to a lossy display string.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -9,11 +10,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::resolve::{Kind, Stat};
+use super::resolve::Stat;
 use super::stat::kind_name;
 
-/// Current on-disk INTENT schema. Version 1 was an untyped slot-to-path map.
-pub const INTENT_VERSION: u32 = 2;
+/// Current on-disk INTENT schema. v2 is read only for non-destructive reporting.
+pub const INTENT_VERSION: u32 = 3;
 
 /// Largest INTENT we will parse (recover / startup).
 pub const INTENT_MAX_BYTES: usize = 64 * 1024;
@@ -82,6 +83,10 @@ pub struct IntentSlot {
     pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    /// Private hardlink holding the inode alive across process death. A stored
+    /// dev/inode pair alone is never recovery ownership evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
 }
 
 impl IntentSlot {
@@ -92,6 +97,7 @@ impl IntentSlot {
             ino: None,
             kind: None,
             size: None,
+            anchor: None,
         }
     }
 
@@ -103,6 +109,7 @@ impl IntentSlot {
         self
     }
 
+    /// Snapshot consistency only. This does NOT prove ownership after restart.
     pub fn matches(&self, stat: &Stat) -> bool {
         match (self.dev, self.ino) {
             (Some(dev), Some(ino)) => stat.dev == dev && stat.ino == ino,
@@ -122,6 +129,11 @@ pub struct Intent {
     pub source: IntentPath,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub destination: Option<IntentPath>,
+    /// Identity of the object to publish, recorded before public mutation.
+    /// Recovery may advance an incomplete phase only when this identity is
+    /// positively present at the operation's destination.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published: Option<IntentSlot>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub slots: BTreeMap<String, IntentSlot>,
     pub pid: u32,
@@ -145,6 +157,7 @@ impl Intent {
             order,
             source: IntentPath::from_path(source),
             destination: destination.map(IntentPath::from_path),
+            published: None,
             slots,
             pid: std::process::id(),
             host: crate::hostname::reported_hostname().unwrap_or_else(|| "unknown".to_string()),
@@ -240,7 +253,7 @@ pub fn parse_intent(bytes: &[u8]) -> Result<Intent, String> {
         .get("version")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    if version != u64::from(INTENT_VERSION) {
+    if version != 2 && version != u64::from(INTENT_VERSION) {
         return Err(format!("INTENT version {version} is not supported"));
     }
     serde_json::from_value(value).map_err(|err| format!("INTENT is malformed: {err}"))
@@ -268,16 +281,6 @@ pub fn intent_order_name(order: IntentOrder) -> &'static str {
         IntentOrder::LinkFirst => "link-first",
         IntentOrder::VacateFirst => "vacate-first",
         IntentOrder::ExchangeFirst => "exchange-first",
-    }
-}
-
-pub fn kind_from_name(name: &str) -> Option<Kind> {
-    match name {
-        "file" => Some(Kind::File),
-        "dir" => Some(Kind::Dir),
-        "symlink" => Some(Kind::Symlink),
-        "other" => Some(Kind::Other),
-        _ => None,
     }
 }
 

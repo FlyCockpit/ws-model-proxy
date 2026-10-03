@@ -2157,7 +2157,7 @@ fn rename_intent_remains_when_destination_capture_fails_before_publish() {
     let intent: Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("INTENT")).unwrap()).unwrap();
     assert_eq!(intent["order"], "link-first");
-    assert_eq!(intent["version"], 2);
+    assert_eq!(intent["version"], 3);
     assert_eq!(intent["phase"], "prepared");
     assert_eq!(intent["op"], "rename");
     assert_eq!(intent["source"]["display"], fx.p("src"));
@@ -2236,7 +2236,7 @@ fn rename_exchange_first_writes_versioned_intent() {
     let value = rename_run(&fx, true, etag.as_deref(), false).unwrap();
     assert!(value.get("recovered").is_none(), "{value}");
     let intent = seen.lock().unwrap().clone().expect("INTENT at exchange");
-    assert_eq!(intent["version"], 2);
+    assert_eq!(intent["version"], 3);
     assert_eq!(intent["op"], "rename");
     assert_eq!(intent["order"], "exchange-first");
     assert_eq!(intent["phase"], "committed");

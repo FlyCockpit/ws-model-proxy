@@ -711,7 +711,10 @@ fn exchangeless_dispose_failures_report_private_alias_and_original() {
                         .ok()
                         .map(|e| e.file_name())
                         .unwrap_or_default();
-                    name != "INTENT" && name != "INTENT.new"
+                    name != "INTENT"
+                        && name != "INTENT.new"
+                        && name != ".wsmp-lock"
+                        && !name.to_string_lossy().starts_with(".wsmp-pin-")
                 })
                 .count(),
             2,
@@ -745,7 +748,27 @@ fn exchangeless_dispose_failures_report_private_alias_and_original() {
         let aliases = result_paths(&value);
         assert!(has_bytes(&aliases, EDITED), "{value}");
         use std::os::unix::fs::MetadataExt;
-        assert_eq!(std::fs::metadata(fx.root.join("doc")).unwrap().nlink(), 2);
+        let dir = recovery_dirs(&fx.root).pop().expect("recovery");
+        let public = std::fs::metadata(fx.root.join("doc")).unwrap();
+        let own_pins = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".wsmp-pin-")
+            })
+            .filter(|entry| {
+                std::fs::symlink_metadata(entry.path())
+                    .is_ok_and(|pin| (pin.dev(), pin.ino()) == (public.dev(), public.ino()))
+            })
+            .count() as u64;
+        assert_eq!(
+            public.nlink() - own_pins,
+            2,
+            "exactly public + retained private alias, excluding durable identity pins"
+        );
         assert_eq!(fx.get("doc"), EDITED);
         let new_etag = fx.etag("doc");
         assert_eq!(

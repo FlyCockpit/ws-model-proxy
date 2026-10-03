@@ -267,7 +267,10 @@ fn replace_inner(
             ops.step(Step::SupervisedPinVerified)?;
         }
         cancel.check()?;
-        recovery.prepare_intent(super::intent::Intent::replace(&dir_path.join(name)))?;
+        let mut intent = super::intent::Intent::replace(&dir_path.join(name));
+        intent.published =
+            Some(super::intent::IntentSlot::planned(&dir_path.join(name)).with_stat(&new_stat));
+        recovery.prepare_intent(intent)?;
         Ok(new_stat)
     })();
     // The Held proofs are now the only descriptors on these inodes. Their

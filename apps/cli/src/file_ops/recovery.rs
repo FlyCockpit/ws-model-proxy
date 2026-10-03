@@ -70,13 +70,22 @@
 //! capture (including exclusive-create and Move-verification fallbacks), is a
 //! versioned map of slots to paths with phase, per-slot identity, pid, host,
 //! and CLI version. An exclusive flock on `.wsmp-lock` is held for the op;
-//! `wsmp recover` skips a directory it cannot lock and re-derives phase from
-//! the live tree. Exchange rename swaps `from <-> to` first so no object is
+//! a stable sibling `.wsmp-lock-.wsmp-recover-<id>` protects final cleanup
+//! while the internal lock closes before unlink (NFS sillyrename avoidance).
+//! `wsmp recover` skips a directory it cannot lock and derives publication only
+//! against a surviving private v3 hardlink anchor's live descriptor. Legacy or
+//! missing anchors, directories and unsupported aliases retain ambiguity for
+//! manual resolution. Private INTENT/anchor integrity is required, as with the
+//! existing mode-0700 staging directory; malicious same-user tampering of all
+//! private metadata is not excluded. Exchange rename swaps `from <-> to` first so no object is
 //! reachable only through R; D is briefly visible under the source name. Live
 //! R directories are indexed in the CLI state directory. Startup reads that
 //! registry (O(registered)) and never walks file roots. Empty unreported R
 //! after power loss is harmless.
-//! (e) unheld objects are retained; they are never deleted by a snapshot.
+//! (e) unheld objects are retained; they are never deleted by a snapshot. The
+//! three pre-effect hardlink anchors (at most two user objects plus generated T)
+//! are private aliases, not extra captured slots. Live link-survival guards
+//! subtract those aliases, and original unlink closes matching anchor fds too.
 //! (f) on NFS another process holding the file open can leave a `.nfs*` entry in R;
 //! our own descriptors close before unlink (except T's pinned proof at the link
 //! probe's alias unlink: clients that silly-rename per vnode, macOS/BSD NFS, may keep a
@@ -302,6 +311,10 @@ pub(super) struct RecoveryDir {
     /// Exclusive flock on `.wsmp-lock` inside R. Recover skips a directory
     /// it cannot lock, so a live op is never rolled back.
     lock: Option<Flock<File>>,
+    /// Stable sibling lock survives deletion of metadata inside R.
+    cleanup_lock: Option<Flock<File>>,
+    /// Live proof for our own anchor names, never a persisted snapshot.
+    anchors: Vec<(String, Held)>,
 }
 
 /// State to return to when a capture provably changed nothing.
@@ -355,6 +368,7 @@ impl RecoveryDir {
                     return Err(FileError::errno(errno));
                 }
             };
+            let cleanup_lock = lock_cleanup(&path, false).map_err(|error| FileError::io(&error))?;
             let lock = lock_recovery_dir(&path);
             return Ok(Self {
                 parent,
@@ -371,6 +385,8 @@ impl RecoveryDir {
                 intent: None,
                 registered: false,
                 lock,
+                cleanup_lock,
+                anchors: Vec::new(),
             });
         }
     }
@@ -723,18 +739,33 @@ impl RecoveryDir {
         from: &Resolved,
         to: &Resolved,
         overwrite: bool,
+        source_stat: &Stat,
     ) -> FileResult<()> {
-        self.prepare_intent(Intent::rename(
-            order,
-            &from.full_path(),
-            &to.full_path(),
-            overwrite,
-        ))
+        let mut intent = Intent::rename(order, &from.full_path(), &to.full_path(), overwrite);
+        intent.published =
+            Some(super::intent::IntentSlot::planned(&to.full_path()).with_stat(source_stat));
+        self.prepare_intent(intent)
     }
 
-    pub(super) fn prepare_intent(&mut self, intent: Intent) -> FileResult<()> {
+    pub(super) fn prepare_intent(&mut self, mut intent: Intent) -> FileResult<()> {
         if self.intent.is_some() {
             return Ok(());
+        }
+        // Pin all known pre-effect objects before INTENT becomes durable. On
+        // filesystems without stable hardlinks the live operation still works,
+        // but abandoned objects cannot be automatically reconciled.
+        for record in intent.slots.values_mut() {
+            if let Some(path) = record.origin.to_path() {
+                self.anchor_path(record, &path)?;
+            }
+        }
+        if let Some(record) = intent.published.as_mut() {
+            if intent.op == super::intent::IntentOp::Replace {
+                let dir = dup(self.dir.as_fd()).map_err(FileError::errno)?;
+                self.anchor_at(record, &dir, OsStr::new("tmp"))?;
+            } else if let Some(path) = intent.source.to_path() {
+                self.anchor_path(record, &path)?;
+            }
         }
         self.persist_intent(&intent)?;
         match super::registry::register(&self.path, &intent) {
@@ -747,6 +778,92 @@ impl RecoveryDir {
         }
         self.intent = Some(intent);
         Ok(())
+    }
+
+    fn anchor_path(
+        &mut self,
+        record: &mut super::intent::IntentSlot,
+        path: &Path,
+    ) -> FileResult<()> {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Ok(());
+        };
+        let Ok(dir) = nix::fcntl::open(
+            parent,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) else {
+            return Ok(());
+        };
+        self.anchor_at(record, &dir, name)
+    }
+
+    fn anchor_at(
+        &mut self,
+        record: &mut super::intent::IntentSlot,
+        dir: &OwnedFd,
+        name: &OsStr,
+    ) -> FileResult<()> {
+        let Ok(raw) = fstatat(dir.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
+            return Ok(());
+        };
+        let stat = Stat::from_raw(&raw);
+        if !matches!(stat.kind(), Kind::File | Kind::Symlink)
+            || (record.dev.is_some() && !record.matches(&stat))
+        {
+            return Ok(());
+        }
+        let source = Held::open(dir, name, stat)?;
+        if !source.is_held() {
+            return Ok(());
+        }
+        let anchor = format!(
+            ".wsmp-pin-{}",
+            Alphanumeric.sample_string(&mut rand::rng(), 24)
+        );
+        match linkat(
+            dir.as_fd(),
+            name,
+            self.dir.as_fd(),
+            anchor.as_str(),
+            AtFlags::empty(),
+        ) {
+            Ok(()) => {}
+            Err(errno) if is_link_unsupported(errno) => return Ok(()),
+            Err(errno) => return Err(FileError::errno(errno)),
+        }
+        let raw = fstatat(
+            self.dir.as_fd(),
+            anchor.as_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .map_err(FileError::errno)?;
+        let pin = Held::open(&self.dir, OsStr::new(&anchor), Stat::from_raw(&raw))?;
+        let same = source
+            .live_stat()
+            .zip(pin.live_stat())
+            .is_some_and(|(a, b)| a.same_object(&b));
+        self.anchors.push((anchor.clone(), pin));
+        if !same {
+            // Some remote filesystems expose a different inode per alias. Do
+            // not turn that into a durable proof or discard an unknown alias.
+            self.unsettled = true;
+            return Err(self.uncertain());
+        }
+        // Do not advertise a durable pin where directory durability is not
+        // supported. Its live alias still belongs to us and is cleaned normally,
+        // but a crash leaves only ambiguity rather than destructive authority.
+        match nix::unistd::fsync(self.dir.as_fd())
+            .and_then(|()| nix::unistd::fsync(self.parent.as_fd()))
+        {
+            Ok(()) => {
+                *record = record.clone().with_stat(&source.stat);
+                record.anchor = Some(anchor);
+                Ok(())
+            }
+            Err(Errno::EINVAL | Errno::ENOTSUP) => Ok(()),
+            Err(errno) => Err(FileError::errno(errno)),
+        }
     }
 
     pub(super) fn set_intent_phase(&mut self, phase: IntentPhase) -> FileResult<()> {
@@ -782,10 +899,20 @@ impl RecoveryDir {
         )
         .map_err(FileError::errno)?;
         let stat = Stat::from_raw(&raw);
-        let recorded = intent
+        let mut recorded = intent
             .slots
             .remove(&key)
             .unwrap_or_else(|| super::intent::IntentSlot::planned(&slot.origin.path));
+        // Exchange and capture renumber slots. Only transfer a pre-effect pin
+        // belonging to this object; a newly captured stranger gains no authority.
+        if !recorded.matches(&stat) {
+            recorded.anchor = intent
+                .slots
+                .values()
+                .chain(intent.published.iter())
+                .find(|candidate| candidate.matches(&stat))
+                .and_then(|candidate| candidate.anchor.clone());
+        }
         intent.slots.insert(key, recorded.with_stat(&stat));
         let intent = intent.clone();
         if let Err(error) = self.persist_intent(&intent) {
@@ -1131,7 +1258,7 @@ impl RecoveryDir {
         };
         ops.step(Step::Vacating)?;
         cancel.check()?; // last cancellation point, BEFORE the first public mutation
-        self.write_rename_intent(order, from, to, dst.is_some())?;
+        self.write_rename_intent(order, from, to, dst.is_some(), &src.stat)?;
         tracing::info!(recovery = %self.path().display(), source = %from.full_path().display(),
             destination = %to.full_path().display(), order = ?order,
             "rename capture; manual recovery after a crash");
@@ -1213,7 +1340,7 @@ impl RecoveryDir {
         if !self.holds_name(&from.dir, &from.name, src) {
             return Err(self.conflict_or_uncertain("replaced"));
         }
-        self.write_rename_intent(IntentOrder::LinkFirst, from, to, dst.is_some())?;
+        self.write_rename_intent(IntentOrder::LinkFirst, from, to, dst.is_some(), &src.stat)?;
         let mut captured_dest = None;
         if dst.is_some() {
             let _ = ops.step(Step::DestinationVacating);
@@ -1760,7 +1887,8 @@ impl RecoveryDir {
             // The guard is a veto on a believable count only (Linux: forced-sync).
             // An unreadable count under a believable mount keeps the alias.
             let survives = self.counts_reliable != Some(true)
-                || link_count(self.dir.as_fd(), source.name.as_os_str())
+                || self
+                    .non_anchor_link_count(source)
                     .is_ok_and(|count| count >= 2);
             if survives {
                 self.unlink_proven(source);
@@ -1784,7 +1912,9 @@ impl RecoveryDir {
         // believable count below 2 (see `calibrate_counts`; best effort, never a proof).
         if alias
             && self.counts_reliable == Some(true)
-            && !link_count(self.dir.as_fd(), slot.name.as_os_str()).is_ok_and(|count| count >= 2)
+            && !self
+                .non_anchor_link_count(slot)
+                .is_ok_and(|count| count >= 2)
         {
             self.unsettled = true;
             return false;
@@ -1792,15 +1922,61 @@ impl RecoveryDir {
         true
     }
 
+    fn non_anchor_link_count(&self, slot: &Slot) -> Result<u64, Errno> {
+        let raw = fstatat(
+            self.dir.as_fd(),
+            slot.name.as_os_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )?;
+        let stat = Stat::from_raw(&raw);
+        let own = self
+            .anchors
+            .iter()
+            .filter(|(_, held)| held.live_stat().is_some_and(|pin| pin.same_object(&stat)))
+            .count() as u64;
+        link_count(self.dir.as_fd(), slot.name.as_os_str()).map(|count| count.saturating_sub(own))
+    }
+
     /// The caller has proved this private name and released every possible peer.
     fn unlink_proven(&mut self, slot: &Slot) -> bool {
-        match run(Primitive::Unlink, || {
+        // A durable anchor is a name, not an fd that may sillyrename the
+        // candidate on NFS. Close our anchor peers for this inode too. The
+        // protected hardlink remains throughout, so its inode cannot recycle.
+        let candidate = fstatat(
+            self.dir.as_fd(),
+            slot.name.as_os_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .ok()
+        .map(|raw| Stat::from_raw(&raw));
+        let mut released = Vec::new();
+        for (index, (_, held)) in self.anchors.iter_mut().enumerate() {
+            if candidate.is_some_and(|candidate| {
+                held.live_stat()
+                    .is_some_and(|pin| pin.same_object(&candidate))
+            }) {
+                held.release();
+                released.push(index);
+            }
+        }
+        let result = run(Primitive::Unlink, || {
             unlinkat(
                 self.dir.as_fd(),
                 slot.name.as_os_str(),
                 UnlinkatFlags::NoRemoveDir,
             )
-        }) {
+        });
+        for index in released {
+            let (name, held) = &mut self.anchors[index];
+            // The anchor was not unlinked, and its randomized private name is
+            // protected by the same integrity boundary as INTENT. Re-opening
+            // never adopts a mismatching occupant or an unheld proof.
+            match Held::open(&self.dir, OsStr::new(name), held.stat) {
+                Ok(reopened) if reopened.is_held() => *held = reopened,
+                _ => self.unsettled = true,
+            }
+        }
+        match result {
             Ok(()) => {
                 self.kept.retain(|p| *p != self.path.join(&slot.name));
                 true
@@ -1819,16 +1995,74 @@ impl RecoveryDir {
     pub(super) fn finish(&mut self) -> Vec<String> {
         if !self.finished {
             self.finished = true;
-            self.lock = None;
-            match unlinkat(self.dir.as_fd(), ".wsmp-lock", UnlinkatFlags::NoRemoveDir) {
-                Ok(()) | Err(Errno::ENOENT) => {}
-                Err(_) => self.unsettled = true,
+            let cleanup_intent = self.intent.clone();
+            if self.settled() {
+                // All candidate effects are finished. Prove every anchor with
+                // its original live descriptor, then close every peer before
+                // unlink (including NFS clients with per-vnode sillyrenames).
+                let mut proven = Vec::new();
+                for (name, held) in &self.anchors {
+                    if self.holds_name(&self.dir, OsStr::new(name), held) {
+                        proven.push(name.clone());
+                    } else {
+                        self.unsettled = true;
+                    }
+                }
+                self.anchors.clear();
+                for name in proven {
+                    if unlinkat(self.dir.as_fd(), name.as_str(), UnlinkatFlags::NoRemoveDir)
+                        .is_err()
+                    {
+                        self.unsettled = true;
+                    }
+                }
+            }
+            // Keep metadata for unresolved slots and foreign entries, including
+            // hidden NFS leftovers. Hold the lock through cleanup.
+            if self.settled() {
+                match self
+                    .dir
+                    .try_clone()
+                    .ok()
+                    .and_then(|fd| nix::dir::Dir::from_fd(fd).ok())
+                {
+                    Some(mut entries) => {
+                        for entry in entries.iter() {
+                            let Ok(entry) = entry else {
+                                self.unsettled = true;
+                                break;
+                            };
+                            let name = entry.file_name().to_bytes();
+                            if !matches!(
+                                name,
+                                b"." | b".." | b"INTENT" | b"INTENT.new" | b".wsmp-lock"
+                            ) {
+                                self.unsettled = true;
+                                break;
+                            }
+                        }
+                    }
+                    None => self.unsettled = true,
+                }
             }
             // Success and clean refusals drop the crash map with R only when R
             // is actually empty. An unsettled operation, or a captured slot
             // still in `kept`, keeps INTENT.
+            if self.settled() && self.cleanup_lock.is_none() {
+                // Unsupported locks cannot protect the handoff away from the
+                // internal inode. Keep discoverable metadata rather than race.
+                self.unsettled = true;
+            }
             if self.settled() {
+                // Close the lock fd before unlink: NFS otherwise creates a
+                // silly-rename which itself prevents removing R. The owner
+                // pid remains live while this final empty cleanup runs.
+                self.lock = None;
                 self.discard_intent();
+                match unlinkat(self.dir.as_fd(), ".wsmp-lock", UnlinkatFlags::NoRemoveDir) {
+                    Ok(()) | Err(Errno::ENOENT) => {}
+                    Err(_) => self.unsettled = true,
+                }
             }
             if self.unsettled
                 || run(Primitive::Rmdir, || {
@@ -1841,6 +2075,24 @@ impl RecoveryDir {
                 .is_err()
             {
                 self.unsettled = true;
+                // A refused/failed rmdir must not strand an otherwise empty
+                // directory after its metadata was removed.
+                if self.intent.is_none()
+                    && let Some(intent) = cleanup_intent
+                {
+                    if self.persist_intent(&intent).is_ok() {
+                        self.registered = super::registry::register(&self.path, &intent).is_ok();
+                    }
+                    self.intent = Some(intent);
+                }
+                let _ = OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .mode(0o600)
+                    .custom_flags(nix::libc::O_NOFOLLOW)
+                    .open(self.path.join(".wsmp-lock"));
                 // Include the directory itself (also discovers externally added slots).
                 if self.kept.is_empty() {
                     self.remember(self.path.clone());
@@ -1849,9 +2101,19 @@ impl RecoveryDir {
                 super::registry::unregister(&self.path);
                 self.registered = false;
             }
+            if !self.unsettled {
+                let lock_name = format!(".wsmp-lock-{}", self.name.to_string_lossy());
+                unlink_cleanup_lock(
+                    &self.parent,
+                    OsStr::new(&lock_name),
+                    self.cleanup_lock.as_ref(),
+                );
+                self.cleanup_lock = None;
+            }
             if self.unsettled || !self.kept.is_empty() {
                 tracing::warn!(recovery = %self.path.display(), kept = ?self.kept, "file recovery retained; manual recovery required");
             }
+            self.lock = None;
         }
         // The wire schema bounds the list (`recovered` <= 4); the warning above
         // names every retained path, so nothing is lost by the clamp.
@@ -1876,6 +2138,60 @@ impl RecoveryDir {
     }
 }
 
+pub(super) fn cleanup_lock_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        ".wsmp-lock-{}",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ))
+}
+
+pub(super) fn lock_cleanup(path: &Path, nonblocking: bool) -> std::io::Result<Option<Flock<File>>> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(cleanup_lock_path(path))?;
+    if file.metadata()?.len() != 0 {
+        return Err(std::io::Error::other("cleanup lock contains foreign bytes"));
+    }
+    let arg = if nonblocking {
+        FlockArg::LockExclusiveNonblock
+    } else {
+        FlockArg::LockExclusive
+    };
+    match Flock::lock(file, arg) {
+        Ok(lock) => {
+            use std::os::unix::fs::MetadataExt;
+            let held = lock.metadata()?;
+            let named = std::fs::symlink_metadata(cleanup_lock_path(path))?;
+            if !named.is_file() || held.dev() != named.dev() || held.ino() != named.ino() {
+                return Err(std::io::Error::other("cleanup lock identity changed"));
+            }
+            Ok(Some(lock))
+        }
+        Err((_, Errno::ENOTSUP | Errno::ENOSYS)) => Ok(None),
+        Err((_, errno)) => Err(std::io::Error::from_raw_os_error(errno as i32)),
+    }
+}
+
+pub(super) fn unlink_cleanup_lock(parent: &OwnedFd, name: &OsStr, lock: Option<&Flock<File>>) {
+    let Some(lock) = lock else { return };
+    let Ok(held) = fstat(lock.as_fd()) else {
+        return;
+    };
+    let Ok(named) = fstatat(parent.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
+        return;
+    };
+    if held.st_dev == named.st_dev && held.st_ino == named.st_ino && named.st_size == 0 {
+        // Outside R: even NFS sillyrename cannot prevent R's completed rmdir.
+        // Release the fd immediately after this final mutation.
+        let _ = unlinkat(parent.as_fd(), name, UnlinkatFlags::NoRemoveDir);
+    }
+}
+
 fn lock_recovery_dir(path: &Path) -> Option<Flock<File>> {
     let lock_path = path.join(".wsmp-lock");
     let file = match OpenOptions::new()
@@ -1884,6 +2200,7 @@ fn lock_recovery_dir(path: &Path) -> Option<Flock<File>> {
         .read(true)
         .write(true)
         .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
         .open(&lock_path)
     {
         Ok(file) => file,
@@ -1927,9 +2244,9 @@ fn tolerate_dir_fsync(result: Result<(), Errno>, path: &Path) -> FileResult<()> 
 /// Never walks file roots (that can hang on a dead NFS mount). Never deletes.
 pub(crate) fn report_abandoned_recovery() {
     for entry in super::registry::abandoned_entries() {
-        let path = entry.recovery_path();
-        let message = super::recover::describe_abandoned(&path);
-        tracing::warn!(recovery = %path.display(), "{message}");
+        tracing::warn!(recovery = %entry.path, op = %entry.summary.op,
+            phase = %entry.summary.phase,
+            "abandoned recovery registry entry; run `wsmp recover` to inspect (directory existence not checked at startup)");
     }
 }
 
@@ -2317,7 +2634,10 @@ mod tests {
                     recovery.kept,
                     [recovery.path.join("tmp"), recovery.path.join("probe")]
                 );
-                assert_eq!(std::fs::read_dir(&recovery.path).unwrap().count(), 2);
+                assert_eq!(
+                    super::super::recover::present_slots(&recovery.path).len(),
+                    2
+                );
                 assert!(!recovery.settled());
             } else {
                 assert!(matches!(result.unwrap(), PublishMethod::Link));
@@ -2500,5 +2820,123 @@ mod tests {
         assert!(tolerate_dir_fsync(Err(Errno::ENOTSUP), Path::new("/tmp")).is_ok());
         let error = tolerate_dir_fsync(Err(Errno::EIO), Path::new("/tmp")).unwrap_err();
         assert_eq!(error.code, ErrorCode::IoError);
+    }
+}
+#[cfg(test)]
+mod identity_boundary_tests {
+    use super::*;
+    use crate::file_ops::tests::Fx;
+
+    #[test]
+    fn final_sidecar_cleanup_keeps_actual_replaced_inode() {
+        let fx = Fx::new();
+        let parent = nix::fcntl::open(
+            &fx.root,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY,
+            Mode::empty(),
+        )
+        .expect("parent");
+        let recovery = RecoveryDir::new(&parent, &fx.root).expect("recovery");
+        let lock_path = cleanup_lock_path(&recovery.path);
+        let successor = fx.root.join("replacement-lock");
+        std::fs::write(&successor, b"foreign successor").expect("successor");
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("mv -- \"$1\" \"$2\"")
+            .arg("wsmp-fixture")
+            .arg(&successor)
+            .arg(&lock_path)
+            .status()
+            .expect("actual competing process");
+        assert!(status.success());
+        let lock_name = lock_path.file_name().unwrap();
+        unlink_cleanup_lock(&parent, lock_name, recovery.cleanup_lock.as_ref());
+        assert_eq!(
+            std::fs::read(&lock_path).expect("foreign successor retained"),
+            b"foreign successor"
+        );
+        drop(recovery);
+        assert_eq!(
+            std::fs::read(&lock_path).expect("drop also retains successor"),
+            b"foreign successor"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_cleanup_abrupt_child_helper() {
+        let Some(root) = std::env::var_os("WSMP_RECOVERY_CRASH_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let _registry = super::super::registry::install_temp_registry();
+        let parent = nix::fcntl::open(&root, OFlag::O_RDONLY | OFlag::O_DIRECTORY, Mode::empty())
+            .expect("parent");
+        let mut recovery = RecoveryDir::new(&parent, &root).expect("recovery");
+        let dir = recovery.path.clone();
+        super::super::exchange::RMDIR_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(root.join("ready"), dir.as_os_str().as_encoded_bytes())
+                    .expect("ready");
+                assert!(dir.is_dir(), "directory exists before actual rmdir");
+                nix::sys::signal::kill(nix::unistd::getpid(), nix::sys::signal::Signal::SIGKILL)
+                    .expect("actual SIGKILL at syscall boundary");
+            }));
+        });
+        let _ = recovery.finish();
+        panic!("SIGKILL must not return");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_resumes_after_sigkill_at_final_rmdir_boundary() {
+        use std::os::unix::ffi::OsStringExt;
+        let fixture = tempfile::tempdir().expect("fixture");
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "file_ops::recovery::identity_boundary_tests::recovery_cleanup_abrupt_child_helper",
+                "--nocapture",
+            ])
+            .env("WSMP_RECOVERY_CRASH_FIXTURE", fixture.path())
+            .spawn()
+            .expect("child");
+        let ready = fixture.path().join("ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if !ready.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child did not reach cleanup boundary");
+        }
+        let killed = child.wait().expect("wait killed child");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(killed.signal(), Some(nix::libc::SIGKILL));
+        let dir = PathBuf::from(std::ffi::OsString::from_vec(
+            std::fs::read(ready).expect("ready bytes"),
+        ));
+        assert!(
+            dir.is_dir(),
+            "residue {} after child {killed:?}; root {:?}",
+            dir.display(),
+            std::fs::read_dir(fixture.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            std::fs::read_dir(&dir)
+                .expect("empty residue")
+                .next()
+                .is_none()
+        );
+        assert_eq!(
+            super::super::recover::recover_dir(&dir, true, None).action,
+            super::super::recover::RecoverAction::Cleaned
+        );
+        assert!(!dir.exists());
+        assert!(!cleanup_lock_path(&dir).exists());
     }
 }

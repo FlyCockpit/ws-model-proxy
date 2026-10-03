@@ -82,7 +82,10 @@ fn public_stages(root: &Path) -> Vec<PathBuf> {
     std::fs::read_dir(root)
         .unwrap()
         .map(|e| e.unwrap().path())
-        .filter(|p| p.is_file() && p.file_name().unwrap().to_string_lossy().contains(".wsmp-"))
+        .filter(|p| {
+            let name = p.file_name().unwrap().to_string_lossy();
+            p.is_file() && name.contains(".wsmp-") && !name.starts_with(".wsmp-lock-.wsmp-recover-")
+        })
         .collect()
 }
 
@@ -100,7 +103,10 @@ fn recovery_dirs(root: &Path) -> Vec<PathBuf> {
 }
 
 fn is_recovery_metadata(name: &std::ffi::OsStr) -> bool {
-    name == "INTENT" || name == "INTENT.new" || name == ".wsmp-lock"
+    name == "INTENT"
+        || name == "INTENT.new"
+        || name == ".wsmp-lock"
+        || name.to_string_lossy().starts_with(".wsmp-pin-")
 }
 
 fn private_object(dir: &Path) -> PathBuf {
@@ -303,7 +309,26 @@ fn compensation_replace_has_only_a_private_temp_and_no_public_stage_to_race() {
                 if step == Step::TempCreated {
                     assert!(public_stages(&root).is_empty(), "no public staging name");
                     assert!(private_temp(&root).is_file());
-                    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
+                    let entries = std::fs::read_dir(&root)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        entries.len(),
+                        3,
+                        "public document, private recovery directory, cleanup lock only"
+                    );
+                    let locks = entries
+                        .iter()
+                        .filter(|path| {
+                            path.file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .starts_with(".wsmp-lock-.wsmp-recover-")
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(locks.len(), 1);
+                    assert_eq!(std::fs::metadata(locks[0]).unwrap().len(), 0);
                 }
                 if conflict && step == Step::EtagRechecked {
                     std::fs::rename(root.join("doc.txt"), root.join("checked-destination"))
@@ -1516,6 +1541,9 @@ fn compensation_closes_held_descriptors_before_removing_the_recovery_directory()
             .filter(|target| target.starts_with(root.to_string_lossy().as_ref()))
             // the directory descriptors the operation itself uses stay open
             .filter(|target| !target.ends_with(".wsmp-recover") && !Path::new(target).is_dir())
+            // Cleanup exclusion is outside R; unlike disposed objects, this
+            // inode must remain held through rmdir and is not unlinked yet.
+            .filter(|target| !target.contains("/.wsmp-lock-.wsmp-recover-"))
             .collect()
     }
 

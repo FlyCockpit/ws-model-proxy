@@ -4,6 +4,7 @@ use anyhow::Result;
 #[cfg(not(unix))]
 use anyhow::bail;
 
+#[cfg(unix)]
 use crate::output;
 
 #[derive(Debug, clap::Args)]

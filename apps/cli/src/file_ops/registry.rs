@@ -116,12 +116,8 @@ pub fn abandoned_count() -> Option<u32> {
 }
 
 fn is_abandoned(entry: &RegistryEntry) -> bool {
-    let path = entry.recovery_path();
-    if !path.is_dir() {
-        // Stale index row: R is already gone. Still report so recover can
-        // drop the registry entry; startup should mention it.
-        return true;
-    }
+    // Telemetry never stats an arbitrary recovery path (possibly blocked NFS).
+    // Stale rows remain visible until an explicit `recover --apply` sweep.
     let host = crate::hostname::reported_hostname().unwrap_or_else(|| "unknown".to_string());
     if entry.summary.host != host {
         return true;
@@ -152,14 +148,14 @@ fn registry_dir() -> Result<PathBuf, String> {
         if let Some(path) = OVERRIDE.with(|slot| slot.borrow().clone()) {
             return Ok(path);
         }
-        return Ok(PROCESS_REGISTRY
+        Ok(PROCESS_REGISTRY
             .get_or_init(|| {
                 let dir = tempfile::TempDir::new().expect("process registry");
                 let path = dir.path().to_path_buf();
                 std::mem::forget(dir);
                 path
             })
-            .clone());
+            .clone())
     }
     #[cfg(not(test))]
     {

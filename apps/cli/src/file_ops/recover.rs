@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -16,8 +16,7 @@ use serde::Serialize;
 use super::exchange::Primitive;
 use super::exchange::no_replace;
 use super::intent::{
-    INTENT_MAX_BYTES, Intent, IntentOp, IntentPhase, IntentSlot, intent_phase_name, kind_from_name,
-    parse_intent,
+    INTENT_MAX_BYTES, Intent, IntentOp, IntentPhase, IntentSlot, intent_phase_name, parse_intent,
 };
 use super::registry::{self, RegistryEntry};
 use super::resolve::Stat;
@@ -52,13 +51,19 @@ pub fn recover_from_registry(apply: bool) -> Vec<RecoverReport> {
     let mut reports = Vec::new();
     for entry in registry::list_entries() {
         reports.push(recover_entry(&entry, apply));
-        if matches!(
-            reports.last().map(|report| report.action),
-            Some(RecoverAction::RolledBack | RecoverAction::RolledForward | RecoverAction::Cleaned)
-        ) {
+        if apply
+            && matches!(
+                reports.last().map(|report| report.action),
+                Some(
+                    RecoverAction::RolledBack
+                        | RecoverAction::RolledForward
+                        | RecoverAction::Cleaned
+                )
+            )
+        {
             registry::unregister(&entry.recovery_path());
         }
-        if !entry.recovery_path().is_dir() {
+        if apply && !entry.recovery_path().is_dir() {
             registry::unregister(&entry.recovery_path());
         }
     }
@@ -121,6 +126,24 @@ fn recover_entry(entry: &RegistryEntry, apply: bool) -> RecoverReport {
 pub fn recover_dir(path: &Path, apply: bool, entry: Option<&RegistryEntry>) -> RecoverReport {
     let slots = present_slots(path);
     if !path.is_dir() {
+        if apply && super::recovery::cleanup_lock_path(path).exists() {
+            match super::recovery::lock_cleanup(path, true) {
+                Ok(Some(lock)) if !path.exists() => {
+                    unlink_cleanup_sibling(path, Some(&lock));
+                    drop(lock);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    return RecoverReport {
+                        path: path.display().to_string(),
+                        action: RecoverAction::Listed,
+                        message: format!("orphan cleanup lock retained: {error}"),
+                        phase: None,
+                        slots,
+                    };
+                }
+            }
+        }
         return RecoverReport {
             path: path.display().to_string(),
             action: RecoverAction::Cleaned,
@@ -140,12 +163,52 @@ pub fn recover_dir(path: &Path, apply: bool, entry: Option<&RegistryEntry>) -> R
     {
         return report;
     }
+    let cleanup_lock = match if apply {
+        super::recovery::lock_cleanup(path, true)
+    } else {
+        Ok(None)
+    } {
+        Ok(lock) => lock,
+        Err(error) => {
+            return RecoverReport {
+                path: path.display().to_string(),
+                action: RecoverAction::SkippedLive,
+                message: format!("cannot acquire cleanup lock: {error}"),
+                phase: None,
+                slots,
+            };
+        }
+    };
     let held_lock = match try_hold_recovery_lock(path) {
         Ok(lock) => lock,
         Err(report) => return report,
     };
-    let _held_lock = held_lock;
-    match read_intent_file(path) {
+    // The sibling remains locked through every mutation and final rmdir. Closing
+    // the internal lock now prevents NFS sillyrename inside the recovery dir.
+    let _held_lock = if cleanup_lock.is_some() {
+        drop(held_lock);
+        None
+    } else {
+        held_lock
+    };
+    let report = match read_intent_file(path) {
+        Ok(None)
+            if apply
+                && cleanup_lock.is_some()
+                && fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none()) =>
+        {
+            RecoverReport {
+                path: path.display().to_string(),
+                action: if fs::remove_dir(path).is_ok() {
+                    RecoverAction::Cleaned
+                } else {
+                    RecoverAction::Listed
+                },
+                message: "empty INTENT-less recovery residue".to_string(),
+                phase: None,
+                slots,
+            }
+        }
         Ok(None) => RecoverReport {
             path: path.display().to_string(),
             action: RecoverAction::Listed,
@@ -174,17 +237,45 @@ pub fn recover_dir(path: &Path, apply: bool, entry: Option<&RegistryEntry>) -> R
             ) {
                 return report;
             }
-            apply_intent(path, &intent, apply, slots)
+            apply_intent(path, &intent, apply && cleanup_lock.is_some(), slots)
         }
+    };
+    if !path.exists() {
+        unlink_cleanup_sibling(path, cleanup_lock.as_ref());
+        drop(cleanup_lock);
+    }
+    report
+}
+
+fn unlink_cleanup_sibling(path: &Path, lock: Option<&Flock<File>>) {
+    let lock_path = super::recovery::cleanup_lock_path(path);
+    if let Some(parent_path) = lock_path.parent()
+        && let Some(name) = lock_path.file_name()
+        && let Ok(parent) = open_dir(parent_path)
+    {
+        super::recovery::unlink_cleanup_lock(&parent, name, lock);
     }
 }
 
 fn try_hold_recovery_lock(path: &Path) -> Result<Option<Flock<File>>, RecoverReport> {
     let lock_path = path.join(".wsmp-lock");
-    let file = match OpenOptions::new().read(true).write(true).open(&lock_path) {
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&lock_path)
+    {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Ok(None),
+        Err(err) => {
+            return Err(RecoverReport {
+                path: path.display().to_string(),
+                action: RecoverAction::Listed,
+                message: format!("open recovery lock: {err}"),
+                phase: None,
+                slots: present_slots(path),
+            });
+        }
     };
     match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
         Ok(lock) => Ok(Some(lock)),
@@ -200,33 +291,22 @@ fn try_hold_recovery_lock(path: &Path) -> Result<Option<Flock<File>>, RecoverRep
 }
 
 fn derived_phase(dir: &Path, intent: &Intent) -> IntentPhase {
-    let mut vacant_with_slot = false;
-    let mut origin_occupied_other = false;
-    for (slot_name, slot) in &intent.slots {
-        let slot_present = dir.join(slot_name).symlink_metadata().is_ok();
-        if !slot_present {
-            continue;
-        }
-        let Some(origin) = slot.origin.to_path() else {
-            continue;
-        };
-        match std::fs::symlink_metadata(&origin) {
-            Err(_) => vacant_with_slot = true,
-            Ok(meta) => {
-                let stat = Stat::from_metadata(&meta);
-                if slot.dev.is_some() && !slot.matches(&stat) {
-                    origin_occupied_other = true;
-                }
-            }
-        }
+    // A durable commit is authoritative even if delete/rename vacated origin.
+    if intent.phase == IntentPhase::Committed {
+        return intent.phase;
     }
-    if origin_occupied_other {
-        IntentPhase::Committed
-    } else if vacant_with_slot {
-        IntentPhase::Captured
-    } else {
-        intent.phase
+    if matches!(intent.op, IntentOp::Rename | IntentOp::Replace)
+        && let Some(published) = &intent.published
+        && let Some(destination) = published.origin.to_path()
+        && let Ok(metadata) = fs::symlink_metadata(destination)
+        && intent.version >= 3
+        && let Ok(recovery) = open_dir(dir)
+        && anchored_identity(&recovery, published)
+            .is_ok_and(|pin| pin.matches_for_restore(&Stat::from_metadata(&metadata)))
+    {
+        return IntentPhase::Committed;
     }
+    intent.phase
 }
 
 fn skip_live_pid(
@@ -250,6 +330,16 @@ fn skip_live_pid(
 }
 
 fn apply_intent(path: &Path, intent: &Intent, apply: bool, slots: Vec<String>) -> RecoverReport {
+    if intent.version < 3 {
+        return RecoverReport {
+            path: path.display().to_string(),
+            action: RecoverAction::Listed,
+            message: "legacy INTENT has no durable identity anchors; manual resolution required"
+                .to_string(),
+            phase: Some(intent_phase_name(intent.phase).to_string()),
+            slots,
+        };
+    }
     let phase_enum = derived_phase(path, intent);
     let phase = super::intent::intent_phase_name(phase_enum).to_string();
     if !apply {
@@ -300,6 +390,11 @@ fn roll_back(dir: &Path, intent: &Intent) -> Result<RecoverAction, String> {
     let parent = open_dir(dir.parent().ok_or("recovery path has no parent")?)?;
     let name = dir.file_name().ok_or("recovery path has no file name")?;
     let recovery = open_dir(dir)?;
+    if intent.version < 3 && !present_slots(dir).is_empty() {
+        return Err(
+            "legacy INTENT has no durable identity anchors; manual resolution required".to_string(),
+        );
+    }
     for (slot_name, slot) in &intent.slots {
         let origin = slot
             .origin
@@ -307,6 +402,7 @@ fn roll_back(dir: &Path, intent: &Intent) -> Result<RecoverAction, String> {
             .ok_or_else(|| format!("{slot_name} origin path is not recoverable"))?;
         restore_slot(&recovery, slot_name, slot, &origin)?;
     }
+    remove_anchors(&recovery, intent)?;
     match remove_if_empty(&parent, name, dir)? {
         RecoverAction::Cleaned => Ok(RecoverAction::Cleaned),
         _ => Ok(RecoverAction::RolledBack),
@@ -317,14 +413,23 @@ fn roll_forward(dir: &Path, intent: &Intent) -> Result<RecoverAction, String> {
     let parent = open_dir(dir.parent().ok_or("recovery path has no parent")?)?;
     let name = dir.file_name().ok_or("recovery path has no file name")?;
     let recovery = open_dir(dir)?;
+    if intent.version < 3
+        && (!present_slots(dir).is_empty()
+            || intent.order == Some(super::intent::IntentOrder::ExchangeFirst))
+    {
+        return Err(
+            "legacy INTENT has no durable identity anchors; manual resolution required".to_string(),
+        );
+    }
     if intent.op == IntentOp::Rename
         && intent.order == Some(super::intent::IntentOrder::ExchangeFirst)
     {
-        dispose_exchange_source_leftover(intent)?;
+        dispose_exchange_source_leftover(&recovery, intent)?;
     }
     for (slot_name, slot) in &intent.slots {
         dispose_slot(&recovery, slot_name, slot)?;
     }
+    remove_anchors(&recovery, intent)?;
     match remove_if_empty(&parent, name, dir)? {
         RecoverAction::Cleaned => Ok(RecoverAction::Cleaned),
         _ => Ok(RecoverAction::RolledForward),
@@ -342,7 +447,8 @@ fn restore_slot(
         Err(Errno::ENOENT) => return Ok(()),
         Err(errno) => return Err(format!("stat {slot_name}: {errno}")),
     };
-    if !slot.matches(&slot_stat) && slot.dev.is_some() {
+    let pin = anchored_identity(recovery, slot)?;
+    if !pin.matches_for_restore(&slot_stat) {
         return Err(format!(
             "{slot_name} identity does not match INTENT; leaving it in place"
         ));
@@ -361,7 +467,10 @@ fn restore_slot(
         file_name,
         Primitive::Restore,
     ) {
-        Ok(()) | Err(Errno::EEXIST) | Err(Errno::ENOENT) => Ok(()),
+        Ok(()) | Err(Errno::ENOENT) => Ok(()),
+        Err(Errno::EEXIST) => Err(format!(
+            "{slot_name} origin is occupied; retaining slot and INTENT"
+        )),
         Err(errno) => Err(format!("restore {slot_name}: {errno}")),
     }
 }
@@ -372,20 +481,13 @@ fn dispose_slot(recovery: &OwnedFd, slot_name: &str, slot: &IntentSlot) -> Resul
         Err(Errno::ENOENT) => return Ok(()),
         Err(errno) => return Err(format!("stat {slot_name}: {errno}")),
     };
-    if slot.dev.is_some() && !slot.matches(&slot_stat) {
+    let pin = anchored_identity(recovery, slot)?;
+    if !pin.matches_for_restore(&slot_stat) {
         return Err(format!(
             "{slot_name} identity does not match INTENT; not disposing"
         ));
     }
-    let remove_dir = slot.kind.as_deref().and_then(kind_from_name)
-        == Some(super::resolve::Kind::Dir)
-        || slot_stat.kind() == super::resolve::Kind::Dir;
-    if remove_dir {
-        return match unlinkat(recovery.as_fd(), slot_name, UnlinkatFlags::RemoveDir) {
-            Ok(()) | Err(Errno::ENOENT) => Ok(()),
-            Err(errno) => Err(format!("rmdir {slot_name}: {errno}")),
-        };
-    }
+    drop(pin); // Anchor name itself continues pinning the original inode.
     match unlinkat(recovery.as_fd(), slot_name, UnlinkatFlags::NoRemoveDir) {
         Ok(()) | Err(Errno::ENOENT) => Ok(()),
         Err(Errno::EISDIR) | Err(Errno::ENOTDIR) => {
@@ -398,7 +500,7 @@ fn dispose_slot(recovery: &OwnedFd, slot_name: &str, slot: &IntentSlot) -> Resul
     }
 }
 
-fn dispose_exchange_source_leftover(intent: &Intent) -> Result<(), String> {
+fn dispose_exchange_source_leftover(recovery: &OwnedFd, intent: &Intent) -> Result<(), String> {
     let Some(source) = intent.source.to_path() else {
         return Ok(());
     };
@@ -425,19 +527,26 @@ fn dispose_exchange_source_leftover(intent: &Intent) -> Result<(), String> {
     };
     // After exchange-first commit, `to` holds S. Only then may leftover D under
     // the source name be removed.
+    if !intent.published.as_ref().is_some_and(|published| {
+        anchored_identity(recovery, published).is_ok_and(|pin| pin.matches_for_restore(&dest_stat))
+    }) {
+        return Err(
+            "exchange destination identity is not proven; retaining source leftover".to_string(),
+        );
+    }
     let source_slot = intent.slots.get("slot-1");
     let src_stat = match fstatat(src_dir.as_fd(), src_name, AtFlags::AT_SYMLINK_NOFOLLOW) {
         Ok(raw) => Stat::from_raw(&raw),
         Err(Errno::ENOENT) => return Ok(()),
         Err(errno) => return Err(format!("stat leftover source: {errno}")),
     };
-    if let Some(slot) = source_slot
-        && slot.dev.is_some()
-        && !slot.matches(&src_stat)
-    {
-        return Ok(());
+    if !source_slot.is_some_and(|slot| {
+        anchored_identity(recovery, slot).is_ok_and(|pin| pin.matches_for_restore(&src_stat))
+    }) {
+        return Err(
+            "exchange source leftover identity is not proven; leaving it in place".to_string(),
+        );
     }
-    let _ = dest_stat;
     match unlinkat(src_dir.as_fd(), src_name, UnlinkatFlags::NoRemoveDir) {
         Ok(()) | Err(Errno::ENOENT) => Ok(()),
         Err(Errno::EISDIR) => match unlinkat(src_dir.as_fd(), src_name, UnlinkatFlags::RemoveDir) {
@@ -448,17 +557,150 @@ fn dispose_exchange_source_leftover(intent: &Intent) -> Result<(), String> {
     }
 }
 
+/// The private hardlink, not the serialized inode number, prevents reuse. The
+/// snapshot only detects damaged metadata/anchors; all candidate comparisons
+/// use a currently held descriptor. Directories/unsupported aliases fail closed.
+fn anchored_identity(
+    recovery: &OwnedFd,
+    slot: &IntentSlot,
+) -> Result<super::recovery::Held, String> {
+    let name = slot
+        .anchor
+        .as_deref()
+        .filter(|name| {
+            name.starts_with(".wsmp-pin-")
+                && name.len() == 34
+                && name[10..].bytes().all(|b| b.is_ascii_alphanumeric())
+        })
+        .ok_or("durable identity anchor unavailable; manual resolution required")?;
+    let raw = fstatat(recovery.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(|error| {
+        format!("identity anchor unavailable: {error}; manual resolution required")
+    })?;
+    let stat = Stat::from_raw(&raw);
+    if !slot.matches(&stat)
+        || !matches!(
+            stat.kind(),
+            super::resolve::Kind::File | super::resolve::Kind::Symlink
+        )
+    {
+        return Err(
+            "identity anchor does not match INTENT; retaining ambiguous objects".to_string(),
+        );
+    }
+    let held = super::recovery::Held::open(recovery, name.as_ref(), stat)
+        .map_err(|error| error.to_string())?;
+    if !held.is_held() {
+        return Err("identity anchor cannot be held; retaining ambiguous objects".to_string());
+    }
+    Ok(held)
+}
+
+fn remove_anchors(recovery: &OwnedFd, intent: &Intent) -> Result<(), String> {
+    let known: HashSet<&str> = intent
+        .slots
+        .values()
+        .chain(intent.published.iter())
+        .filter_map(|slot| slot.anchor.as_deref())
+        .collect();
+    let copy = nix::unistd::dup(recovery.as_fd()).map_err(|error| error.to_string())?;
+    let mut entries = nix::dir::Dir::from_fd(copy).map_err(|error| error.to_string())?;
+    for entry in entries.iter() {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_bytes();
+        if !matches!(
+            name,
+            b"." | b".." | b"INTENT" | b"INTENT.new" | b".wsmp-lock"
+        ) && !std::str::from_utf8(name).is_ok_and(|name| known.contains(name))
+        {
+            return Err(
+                "unresolved recovery entries remain; retaining identity anchors".to_string(),
+            );
+        }
+    }
+    let mut names = HashSet::new();
+    let mut held = Vec::new();
+    for slot in intent.slots.values().chain(intent.published.iter()) {
+        if let Some(name) = &slot.anchor {
+            if !names.insert(name.clone()) {
+                continue;
+            }
+            match anchored_identity(recovery, slot) {
+                Ok(pin) => held.push(pin),
+                Err(error)
+                    if fstatat(
+                        recovery.as_fd(),
+                        name.as_str(),
+                        AtFlags::AT_SYMLINK_NOFOLLOW,
+                    ) == Err(Errno::ENOENT) =>
+                {
+                    let _ = error;
+                    names.remove(name);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    // No candidate remains. Close our proof handles before unlinking the final
+    // anchor names, so our own descriptors cannot make NFS sillyrename them.
+    drop(held);
+    for name in names {
+        unlinkat(recovery.as_fd(), name.as_str(), UnlinkatFlags::NoRemoveDir)
+            .map_err(|error| format!("remove identity anchor: {error}"))?;
+    }
+    Ok(())
+}
+
 fn remove_if_empty(
     parent: &OwnedFd,
     name: &std::ffi::OsStr,
     dir: &Path,
 ) -> Result<RecoverAction, String> {
+    // A failed/occupied restore or a foreign entry must keep its crash map and
+    // lock. Hidden foreign entries (including NFS silly-renames) count too.
+    for entry in fs::read_dir(dir).map_err(|err| format!("read recovery: {err}"))? {
+        let name = entry
+            .map_err(|err| format!("read recovery entry: {err}"))?
+            .file_name();
+        if name != "INTENT" && name != "INTENT.new" && name != ".wsmp-lock" {
+            return Err(
+                "unresolved recovery entries remain; retaining INTENT and lock".to_string(),
+            );
+        }
+    }
+    let intent = read_intent_file(dir)?.ok_or("INTENT disappeared before cleanup")?;
+    let _ = fs::remove_file(dir.join("INTENT.new"));
     let _ = fs::remove_file(dir.join("INTENT"));
     let _ = fs::remove_file(dir.join(".wsmp-lock"));
     match unlinkat(parent.as_fd(), name, UnlinkatFlags::RemoveDir) {
         Ok(()) => Ok(RecoverAction::Cleaned),
-        Err(Errno::ENOTEMPTY) => Ok(RecoverAction::Listed),
-        Err(errno) => Err(format!("rmdir recovery: {errno}")),
+        Err(errno) => {
+            // An entry can arrive after the emptiness check. Restore durable
+            // metadata when rmdir refuses instead of making recovery inert.
+            let bytes =
+                serde_json::to_vec(&intent).map_err(|err| format!("restore INTENT: {err}"))?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(nix::libc::O_NOFOLLOW)
+                .open(dir.join("INTENT"))
+                .map_err(|err| format!("restore INTENT after rmdir {errno}: {err}"))?;
+            file.write_all(&bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|err| format!("sync restored INTENT: {err}"))?;
+            let _ = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(nix::libc::O_NOFOLLOW)
+                .open(dir.join(".wsmp-lock"));
+            fs::File::open(dir)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|err| format!("sync recovery directory: {err}"))?;
+            Err(format!("rmdir recovery: {errno}; INTENT retained"))
+        }
     }
 }
 
@@ -541,6 +783,19 @@ fn collect_recovery(
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
+        if file_type.is_file()
+            && let Some(name) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix(".wsmp-lock-").map(str::to_owned))
+            && is_recovery_name(std::ffi::OsStr::new(&name))
+        {
+            let recovery = dir.join(name);
+            if !recovery.exists() {
+                found.push(recovery);
+                *reported += 1;
+            }
+        }
         if !file_type.is_dir() {
             continue;
         }
@@ -562,6 +817,7 @@ pub fn is_recovery_name(name: &std::ffi::OsStr) -> bool {
 }
 
 /// Startup / human log: describe an abandoned R without claiming INTENT exists.
+#[cfg(test)]
 pub fn describe_abandoned(path: &Path) -> String {
     if !path.is_dir() {
         return "registry entry only, recovery directory already gone; run `wsmp recover` to drop the entry".to_string();
@@ -595,6 +851,322 @@ mod tests {
     use crate::file_ops::registry;
     use crate::file_ops::tests::Fx;
 
+    fn anchor_fixture(dir: &Path, slot: &mut IntentSlot, actual: &Path, index: usize) {
+        let name = format!(".wsmp-pin-{index:024}");
+        fs::hard_link(actual, dir.join(&name)).expect("real durable anchor");
+        *slot = slot.clone().with_stat(&Stat::from_metadata(
+            &fs::symlink_metadata(actual).expect("stat"),
+        ));
+        slot.anchor = Some(name);
+        File::open(dir)
+            .expect("directory")
+            .sync_all()
+            .expect("sync anchor");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_matching_snapshots_never_authorize_disposal() {
+        for slot_mode in [false, true] {
+            let fx = Fx::new();
+            let dir = fx.root.join(".wsmp-recover-ABCDEFGHIJ");
+            fs::create_dir(&dir).unwrap();
+            let slot = dir.join("slot-1");
+            fs::write(&slot, b"ONLY ORIGINAL").unwrap();
+            let temp = if slot_mode {
+                slot.clone()
+            } else {
+                dir.join("tmp")
+            };
+            if !slot_mode {
+                fs::write(&temp, b"unpublished temporary").unwrap();
+            }
+            let old = Stat::from_metadata(&fs::symlink_metadata(&temp).unwrap());
+            let original = Stat::from_metadata(&fs::symlink_metadata(&slot).unwrap());
+            let target = fx.root.join("target");
+            let mut intent = if slot_mode {
+                Intent::delete(&target)
+            } else {
+                Intent::replace(&target)
+            };
+            intent.version = 2;
+            intent.pid = 0;
+            intent.phase = if slot_mode {
+                IntentPhase::Committed
+            } else {
+                IntentPhase::Captured
+            };
+            intent.published = Some(IntentSlot::planned(&target).with_stat(&old));
+            intent.slots.insert(
+                "slot-1".to_string(),
+                IntentSlot::planned(&target).with_stat(&original),
+            );
+            fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
+            fs::remove_file(&temp).unwrap();
+            let successor = if slot_mode { &slot } else { &target };
+            let mut reused = false;
+            for _ in 0..10_000 {
+                fs::write(successor, b"STRANGER").unwrap();
+                let now = Stat::from_metadata(&fs::symlink_metadata(successor).unwrap());
+                if old.same_object(&now) {
+                    reused = true;
+                    break;
+                }
+                fs::remove_file(successor).unwrap();
+            }
+            if !reused {
+                // Allocation policies differ between filesystems and runs. The
+                // deterministic contract is that even matching legacy metadata
+                // confers no destructive authority. Force that predicate, not a
+                // fake claim that the kernel recycled this particular inode.
+                fs::write(successor, b"STRANGER").unwrap();
+                let now = Stat::from_metadata(&fs::symlink_metadata(successor).unwrap());
+                if slot_mode {
+                    intent.slots.insert(
+                        "slot-1".to_string(),
+                        IntentSlot::planned(&target).with_stat(&now),
+                    );
+                } else {
+                    intent.published = Some(IntentSlot::planned(&target).with_stat(&now));
+                }
+                fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
+            }
+            crate::output::diagnostic(format!(
+                "legacy snapshot boundary slot={slot_mode}: actual kernel inode reuse={reused}"
+            ))
+            .expect("fixture diagnostic");
+            let report = recover_dir(&dir, true, None);
+            assert_eq!(report.action, RecoverAction::Listed, "{report:?}");
+            assert_eq!(fs::read(successor).unwrap(), b"STRANGER");
+            if !slot_mode {
+                assert_eq!(fs::read(&slot).unwrap(), b"ONLY ORIGINAL");
+            }
+            assert!(dir.join("INTENT").is_file());
+            if slot_mode {
+                assert!(!target.exists(), "committed delete must not resurrect");
+            }
+        }
+    }
+
+    #[test]
+    fn durable_anchor_preserves_strangers_and_missing_anchors_fail_closed() {
+        for committed in [false, true] {
+            let fx = Fx::new();
+            let dir = fx.root.join(".wsmp-recover-ABCDEFGHIJ");
+            fs::create_dir(&dir).unwrap();
+            let slot = dir.join("slot-1");
+            fs::write(&slot, b"original").unwrap();
+            let mut intent = Intent::delete(&fx.root.join("target"));
+            intent.pid = 0;
+            intent.phase = if committed {
+                IntentPhase::Committed
+            } else {
+                IntentPhase::Captured
+            };
+            anchor_fixture(&dir, intent.slots.get_mut("slot-1").unwrap(), &slot, 1);
+            fs::remove_file(&slot).unwrap();
+            fs::write(&slot, b"STRANGER").unwrap();
+            fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
+            assert_eq!(recover_dir(&dir, true, None).action, RecoverAction::Listed);
+            assert_eq!(fs::read(&slot).unwrap(), b"STRANGER");
+            assert_eq!(
+                fs::read(dir.join(intent.slots["slot-1"].anchor.as_ref().unwrap())).unwrap(),
+                b"original"
+            );
+            fs::remove_file(dir.join(intent.slots["slot-1"].anchor.as_ref().unwrap())).unwrap();
+            assert_eq!(recover_dir(&dir, true, None).action, RecoverAction::Listed);
+            assert_eq!(fs::read(&slot).unwrap(), b"STRANGER");
+            assert!(!fx.root.join("target").exists());
+        }
+    }
+
+    #[test]
+    fn unanchored_directory_recovery_is_explicitly_non_destructive() {
+        let fx = Fx::new();
+        let dir = fx.root.join(".wsmp-recover-ABCDEFGHIJ");
+        fs::create_dir(&dir).unwrap();
+        fs::create_dir(dir.join("slot-1")).unwrap();
+        fs::write(dir.join("slot-1/content"), b"keep").unwrap();
+        let mut intent = abandoned_intent(&fx, "source", "target", false);
+        intent.phase = IntentPhase::Captured;
+        fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
+        let report = recover_dir(&dir, true, None);
+        assert_eq!(report.action, RecoverAction::Listed);
+        assert!(report.message.contains("manual resolution"));
+        assert_eq!(fs::read(dir.join("slot-1/content")).unwrap(), b"keep");
+        assert!(!fx.root.join("source").exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn actual_replace_producer_child_helper() {
+        let Some(root) = std::env::var_os("WSMP_RECOVERY_PRODUCER_FIXTURE") else {
+            return;
+        };
+        use crate::file_ops::exchange::{FaultScope, Primitive};
+        use crate::file_ops::{Cancel, EtagKey, FileOps, Policy, Step};
+        let root = PathBuf::from(root);
+        let target = root.join("target");
+        fs::write(&target, b"ONLY ORIGINAL").unwrap();
+        let _registry = registry::install_temp_registry();
+        let mut ops = FileOps::new(
+            Policy::new(vec![], vec![], true),
+            EtagKey::from_bytes([7; 32]),
+        );
+        let cancel = Cancel::new();
+        let info = ops
+            .execute(
+                "stat",
+                serde_json::json!({"paths":[target],"hash":true}),
+                &cancel,
+            )
+            .unwrap();
+        let etag = info["entries"][0]["etag"].as_str().unwrap().to_string();
+        let abort = std::env::var_os("WSMP_RECOVERY_PRODUCER_ABORT").is_some();
+        let public = target.clone();
+        ops = ops.with_step_hook(std::sync::Arc::new(move |step| {
+            if abort && step == Step::Publishing {
+                fs::write(&public, b"STRANGER").unwrap();
+            }
+            if !abort && step == Step::Exchanged {
+                std::process::exit(0);
+            }
+            Ok(())
+        }));
+        let _scope = if abort {
+            Some(FaultScope::new(&[(Primitive::Exchange, 1, Errno::EINVAL)]))
+        } else {
+            None
+        };
+        let result = ops.execute("write", serde_json::json!({"path":target,"content":"published new bytes","ifExists":"replace","expectedEtag":etag}), &cancel);
+        assert!(result.is_err(), "occupied restore must retain the original");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn actual_aborted_and_published_replacements_recover_with_durable_pins() {
+        for abort in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "file_ops::recover::tests::actual_replace_producer_child_helper",
+                    "--nocapture",
+                ])
+                .env("WSMP_RECOVERY_PRODUCER_FIXTURE", root.path());
+            if abort {
+                child.env("WSMP_RECOVERY_PRODUCER_ABORT", "1");
+            }
+            assert!(child.status().unwrap().success(), "actual producer child");
+            let dir = scan_recovery_dirs(&[root.path().to_path_buf()])
+                .pop()
+                .expect("producer's real recovery directory");
+            let mut intent = read_intent_file(&dir).unwrap().unwrap();
+            assert_eq!(intent.version, 3);
+            assert!(intent.published.as_ref().unwrap().anchor.is_some());
+            let public = root.path().join("target");
+            if abort {
+                assert_eq!(fs::read(&public).unwrap(), b"STRANGER");
+                assert!(
+                    !dir.join("tmp").exists() && !dir.join("probe").exists(),
+                    "abort_published disposed generated temporary"
+                );
+                let original_slot = present_slots(&dir)
+                    .into_iter()
+                    .find(|name| {
+                        fs::read(dir.join(name)).is_ok_and(|bytes| bytes == b"ONLY ORIGINAL")
+                    })
+                    .expect("actual producer captured the sole original");
+                let report = recover_dir(&dir, true, None);
+                assert_eq!(report.action, RecoverAction::Listed, "{report:?}");
+                assert_eq!(report.phase.as_deref(), Some("captured"));
+                assert_eq!(fs::read(dir.join(original_slot)).unwrap(), b"ONLY ORIGINAL");
+                assert_eq!(fs::read(&public).unwrap(), b"STRANGER");
+            } else {
+                assert_eq!(fs::read(&public).unwrap(), b"published new bytes");
+                // Model loss of the phase update separately: publication itself
+                // was executed by the real producer, not inferred from metadata.
+                intent.phase = IntentPhase::Captured;
+                fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
+                let report = recover_dir(&dir, true, None);
+                assert_eq!(report.action, RecoverAction::Cleaned, "{report:?}");
+                assert_eq!(report.phase.as_deref(), Some("committed"));
+                assert_eq!(fs::read(&public).unwrap(), b"published new bytes");
+                assert!(!dir.exists());
+            }
+        }
+    }
+
+    #[test]
+    fn empty_residue_cleanup_is_excluded_and_never_removes_foreign_bytes() {
+        let root = tempfile::tempdir().expect("root");
+        let dir = root.path().join(".wsmp-recover-ABCDEFGHIJ");
+        fs::create_dir(&dir).expect("dir");
+        let lock = super::super::recovery::lock_cleanup(&dir, false).expect("lock");
+        assert_eq!(
+            recover_dir(&dir, true, None).action,
+            RecoverAction::SkippedLive
+        );
+        assert!(dir.exists());
+        drop(lock);
+        fs::write(dir.join("stranger"), b"retain").expect("stranger");
+        assert_eq!(recover_dir(&dir, true, None).action, RecoverAction::Listed);
+        assert_eq!(fs::read(dir.join("stranger")).expect("read"), b"retain");
+        fs::remove_file(dir.join("stranger")).expect("remove fixture");
+        assert_eq!(recover_dir(&dir, false, None).action, RecoverAction::Listed);
+        assert!(dir.exists());
+        assert_eq!(recover_dir(&dir, true, None).action, RecoverAction::Cleaned);
+        assert!(!dir.exists());
+        assert!(!super::super::recovery::cleanup_lock_path(&dir).exists());
+    }
+
+    #[test]
+    fn cleanup_lock_foreign_content_and_symlink_are_never_consumed() {
+        let root = tempfile::tempdir().expect("root");
+        let dir = root.path().join(".wsmp-recover-ABCDEFGHIJ");
+        fs::create_dir(&dir).expect("dir");
+        let lock_path = super::super::recovery::cleanup_lock_path(&dir);
+        fs::write(&lock_path, b"stranger-lock").expect("lock");
+        assert_eq!(
+            recover_dir(&dir, true, None).action,
+            RecoverAction::SkippedLive
+        );
+        assert_eq!(
+            fs::read(&lock_path).expect("lock retained"),
+            b"stranger-lock"
+        );
+        fs::remove_file(&lock_path).expect("remove fixture");
+        let target = root.path().join("target");
+        fs::write(&target, b"target").expect("target");
+        std::os::unix::fs::symlink(&target, &lock_path).expect("symlink");
+        assert_eq!(
+            recover_dir(&dir, true, None).action,
+            RecoverAction::SkippedLive
+        );
+        assert_eq!(fs::read(&target).expect("target retained"), b"target");
+        assert!(lock_path.is_symlink());
+    }
+
+    #[test]
+    fn orphan_cleanup_lock_is_bounded_explicit_and_dry_run_safe() {
+        let root = tempfile::tempdir().expect("root");
+        let dir = root.path().join(".wsmp-recover-ABCDEFGHIJ");
+        let lock_path = super::super::recovery::cleanup_lock_path(&dir);
+        let lock = super::super::recovery::lock_cleanup(&dir, false).expect("lock");
+        drop(lock);
+        assert_eq!(recover_scan(&[root.path().to_path_buf()], false).len(), 1);
+        assert!(lock_path.exists());
+        assert_eq!(recover_scan(&[root.path().to_path_buf()], true).len(), 1);
+        assert!(!lock_path.exists());
+        fs::write(&lock_path, b"foreign").expect("foreign");
+        assert_eq!(
+            recover_scan(&[root.path().to_path_buf()], true)[0].action,
+            RecoverAction::Listed
+        );
+        assert_eq!(fs::read(&lock_path).expect("retained"), b"foreign");
+    }
+
     fn abandoned_intent(fx: &Fx, from: &str, to: &str, overwrite: bool) -> Intent {
         let mut intent = Intent::rename(
             IntentOrder::VacateFirst,
@@ -626,7 +1198,13 @@ mod tests {
         let dir = fx.root.join(".wsmp-recover-abcdefghij");
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("slot-1"), "source bytes").unwrap();
-        let intent = abandoned_intent(&fx, "src", "dst", false);
+        let mut intent = abandoned_intent(&fx, "src", "dst", false);
+        anchor_fixture(
+            &dir,
+            intent.slots.get_mut("slot-1").unwrap(),
+            &dir.join("slot-1"),
+            1,
+        );
         std::fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
         registry::register(&dir, &intent).unwrap();
         let report = recover_dir(&dir, true, None);
@@ -656,6 +1234,27 @@ mod tests {
         );
         intent.phase = IntentPhase::Committed;
         intent.pid = 0;
+        let source_stat = Stat::from_metadata(&fs::symlink_metadata(fx.root.join("src")).unwrap());
+        intent.slots.insert(
+            "slot-1".to_string(),
+            IntentSlot::planned(&fx.root.join("dst")).with_stat(&source_stat),
+        );
+        let published_stat =
+            Stat::from_metadata(&fs::symlink_metadata(fx.root.join("dst")).unwrap());
+        intent.published =
+            Some(IntentSlot::planned(&fx.root.join("dst")).with_stat(&published_stat));
+        anchor_fixture(
+            &dir,
+            intent.slots.get_mut("slot-1").unwrap(),
+            &fx.root.join("src"),
+            1,
+        );
+        anchor_fixture(
+            &dir,
+            intent.published.as_mut().unwrap(),
+            &fx.root.join("dst"),
+            2,
+        );
         std::fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
         let report = recover_dir(&dir, true, None);
         assert!(
@@ -722,6 +1321,7 @@ mod tests {
         std::fs::write(dir.join("slot-1"), "source bytes").unwrap();
         let lock_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(dir.join(".wsmp-lock"))
@@ -735,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn recover_rederives_committed_when_origin_holds_a_different_object() {
+    fn recover_rederives_committed_only_with_published_identity() {
         let fx = Fx::new();
         fx.put("target", "published new bytes");
         let dir = fx.root.join(".wsmp-recover-abcdefghij");
@@ -746,10 +1346,24 @@ mod tests {
         let mut intent = Intent::replace(&fx.root.join("target"));
         intent.phase = IntentPhase::Captured;
         intent.pid = 0;
+        let published = Stat::from_metadata(&fs::symlink_metadata(fx.root.join("target")).unwrap());
+        intent.published = Some(IntentSlot::planned(&fx.root.join("target")).with_stat(&published));
         intent.slots.insert(
             "slot-1".to_string(),
             crate::file_ops::intent::IntentSlot::planned(&fx.root.join("target"))
                 .with_stat(&slot_stat),
+        );
+        anchor_fixture(
+            &dir,
+            intent.slots.get_mut("slot-1").unwrap(),
+            &dir.join("slot-1"),
+            1,
+        );
+        anchor_fixture(
+            &dir,
+            intent.published.as_mut().unwrap(),
+            &fx.root.join("target"),
+            2,
         );
         std::fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
         let report = recover_dir(&dir, true, None);
@@ -771,5 +1385,146 @@ mod tests {
         let message = describe_abandoned(&gone);
         assert!(message.contains("already gone"), "{message}");
         assert!(message.contains("wsmp recover"), "{message}");
+    }
+
+    #[test]
+    fn recover_preserves_original_when_precommit_origin_is_reoccupied() {
+        for op in [IntentOp::Rename, IntentOp::Create, IntentOp::Replace] {
+            let fx = Fx::new();
+            let dir = fx.root.join(".wsmp-recover-abcdefghij");
+            fs::create_dir(&dir).unwrap();
+            fs::write(dir.join("slot-1"), "only original").unwrap();
+            fx.put("src", "stranger");
+            let stat = Stat::from_metadata(&fs::symlink_metadata(dir.join("slot-1")).unwrap());
+            let mut intent = abandoned_intent(&fx, "src", "dst", false);
+            intent.op = op;
+            intent.phase = IntentPhase::Captured;
+            intent.slots.insert(
+                "slot-1".to_string(),
+                IntentSlot::planned(&fx.root.join("src")).with_stat(&stat),
+            );
+            anchor_fixture(
+                &dir,
+                intent.slots.get_mut("slot-1").unwrap(),
+                &dir.join("slot-1"),
+                1,
+            );
+            fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
+            fs::write(dir.join(".wsmp-lock"), "").unwrap();
+            registry::register(&dir, &intent).unwrap();
+            let report = recover_dir(&dir, true, None);
+            assert_eq!(report.action, RecoverAction::Listed, "{report:?}");
+            assert_eq!(fx.get("src"), "stranger");
+            assert_eq!(
+                fs::read_to_string(dir.join("slot-1")).unwrap(),
+                "only original"
+            );
+            assert!(dir.join("INTENT").is_file());
+            assert!(dir.join(".wsmp-lock").is_file());
+            assert_eq!(registry::list_entries().len(), 1);
+        }
+    }
+
+    #[test]
+    fn committed_delete_never_restores_a_vacant_origin() {
+        let fx = Fx::new();
+        let dir = fx.root.join(".wsmp-recover-abcdefghij");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("slot-1"), "deleted").unwrap();
+        let stat = Stat::from_metadata(&fs::symlink_metadata(dir.join("slot-1")).unwrap());
+        let mut intent = Intent::delete(&fx.root.join("src"));
+        intent.phase = IntentPhase::Committed;
+        intent.pid = 0;
+        intent.slots.insert(
+            "slot-1".to_string(),
+            IntentSlot::planned(&fx.root.join("src")).with_stat(&stat),
+        );
+        anchor_fixture(
+            &dir,
+            intent.slots.get_mut("slot-1").unwrap(),
+            &dir.join("slot-1"),
+            1,
+        );
+        fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
+        let report = recover_dir(&dir, true, None);
+        assert_eq!(report.action, RecoverAction::Cleaned);
+        assert!(!fx.root.join("src").exists());
+    }
+
+    #[test]
+    fn committed_link_rename_never_restores_source_alias() {
+        let fx = Fx::new();
+        let dir = fx.root.join(".wsmp-recover-abcdefghij");
+        fs::create_dir(&dir).unwrap();
+        fx.put("dst", "published source");
+        fs::hard_link(fx.root.join("dst"), dir.join("slot-1")).unwrap();
+        let stat = Stat::from_metadata(&fs::symlink_metadata(dir.join("slot-1")).unwrap());
+        let mut intent = Intent::rename(
+            IntentOrder::LinkFirst,
+            &fx.root.join("src"),
+            &fx.root.join("dst"),
+            false,
+        );
+        intent.pid = 0;
+        intent.phase = IntentPhase::Committed;
+        intent.slots.insert(
+            "slot-1".to_string(),
+            IntentSlot::planned(&fx.root.join("src")).with_stat(&stat),
+        );
+        anchor_fixture(
+            &dir,
+            intent.slots.get_mut("slot-1").unwrap(),
+            &dir.join("slot-1"),
+            1,
+        );
+        fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
+        assert_eq!(recover_dir(&dir, true, None).action, RecoverAction::Cleaned);
+        assert!(!fx.root.join("src").exists());
+        assert_eq!(fx.get("dst"), "published source");
+    }
+
+    #[test]
+    fn dry_run_keeps_stale_registry_and_symlink_lock_fails_closed() {
+        let fx = Fx::new();
+        let dir = fx.root.join(".wsmp-recover-abcdefghij");
+        let mut intent = Intent::delete(&fx.root.join("src"));
+        intent.pid = 0;
+        registry::register(&dir, &intent).unwrap();
+        recover_from_registry(false);
+        assert_eq!(registry::list_entries().len(), 1);
+        fs::create_dir(&dir).unwrap();
+        fx.put("foreign", "untouched");
+        std::os::unix::fs::symlink(fx.root.join("foreign"), dir.join(".wsmp-lock")).unwrap();
+        fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
+        let report = recover_dir(&dir, true, None);
+        assert_eq!(report.action, RecoverAction::Listed);
+        assert!(report.message.contains("open recovery lock"));
+        assert_eq!(fx.get("foreign"), "untouched");
+    }
+
+    #[test]
+    fn committed_delete_cleanup_fault_round_trips_through_recover() {
+        use crate::file_ops::exchange::FaultScope;
+        use crate::file_ops::tests::args;
+        let fx = Fx::new();
+        fx.put("src", "acknowledged delete");
+        let result = {
+            let _fault = FaultScope::new(&[(Primitive::Unlink, 1, Errno::EIO)]);
+            fx.ops
+                .delete(&args(serde_json::json!({"path": fx.p("src")})), &fx.cancel)
+                .unwrap()
+        };
+        assert!(result.deleted);
+        assert!(!result.recovered.is_empty());
+        let entry = registry::list_entries().into_iter().next().unwrap();
+        let dir = entry.recovery_path();
+        let mut intent = read_intent_file(&dir).unwrap().unwrap();
+        assert_eq!(intent.phase, IntentPhase::Committed);
+        assert!(dir.join(".wsmp-lock").is_file());
+        // Emulate the departed owner without altering the actual crash phase.
+        intent.pid = 0;
+        fs::write(dir.join("INTENT"), serde_json::to_vec(&intent).unwrap()).unwrap();
+        assert_eq!(recover_dir(&dir, true, None).action, RecoverAction::Cleaned);
+        assert!(!fx.root.join("src").exists());
     }
 }
