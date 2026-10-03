@@ -11,12 +11,13 @@ vi.mock("@ws-model-proxy/db/shutdown-fence", () => ({ isDbShutdownFenceArmed: ()
 
 import {
   createKvEvictionFeedback,
+  createKvEvictionResetLedger,
   EVICTION_MISS_FRACTION,
   KV_EVICTION_FLUSH_MIN_INTERVAL_MS,
   MAX_PENDING_CAPACITIES,
+  MAX_RESET_CAPACITIES,
   qualifiesAsEvictionEvidence,
   recordKvEvictionObservations,
-  resetKvEvictionForCliDevice,
   resetKvEvictionForEndpoint,
 } from "./kv-eviction-feedback.js";
 
@@ -158,17 +159,23 @@ describe("eviction evidence", () => {
     ).toBe(false);
   });
 
-  it("hello-style device reset still deletes matching rows when called", async () => {
+  it("endpoint reset deletes only matching capacity rows", async () => {
     const findMany = vi.fn(async () => [{ id: "c1" }, { id: "c2" }]);
     const deleteMany = vi.fn(async () => ({ count: 2 }));
     const db = {
       inferenceCapacity: { findMany },
       capacityKvEviction: { deleteMany },
-    } as unknown as NonNullable<Parameters<typeof resetKvEvictionForCliDevice>[2]>;
-    await resetKvEvictionForCliDevice("device", now, db);
-    expect(deleteMany).toHaveBeenCalledWith({ where: { capacityId: { in: ["c1", "c2"] } } });
+    } as unknown as NonNullable<Parameters<typeof resetKvEvictionForEndpoint>[3]>;
     await resetKvEvictionForEndpoint("device", "vllm", now, db);
-    expect(findMany).toHaveBeenCalledTimes(2);
+    expect(deleteMany).toHaveBeenCalledWith({ where: { capacityId: { in: ["c1", "c2"] } } });
+    expect(findMany).toHaveBeenCalledWith({
+      where: {
+        ExecutionTargets: {
+          some: { DiscoveredModel: { Endpoint: { cliDeviceId: "device", slug: "vllm" } } },
+        },
+      },
+      select: { id: true },
+    });
   });
 
   it("freeze holds K: misses are not evidence until unfrozen", () => {
@@ -501,5 +508,74 @@ describe("buffered recorder", () => {
     expect(r.write).toHaveBeenCalledWith(
       expect.objectContaining({ sessionIds: ["s"], kind: "hit" }),
     );
+  });
+});
+
+describe("bounded reset generations", () => {
+  it("never revives a long stream after target removal, churn or a backwards reset clock", () => {
+    const ledger = createKvEvictionResetLedger();
+    const oldRequest = ledger.snapshot();
+    ledger.note(["target"], now);
+    ledger.note(["target"], new Date(now.getTime() - 1000));
+    expect(ledger.resetMs("target", oldRequest)).toBe(Number.POSITIVE_INFINITY);
+    expect(ledger.resetMs("target", ledger.snapshot())).toBe(now.getTime());
+    // Removed targets need no explicit delete: the ledger is bounded even if
+    // every future reset is a different target. Old request tokens live alone.
+    for (let index = 0; index < MAX_RESET_CAPACITIES * 3; index++)
+      ledger.note([`churn-${index}`], new Date(now.getTime() + index));
+    expect(ledger.size()).toBe(MAX_RESET_CAPACITIES);
+    expect(
+      qualifiesAsEvictionEvidence({ ...valid, resetAtMs: ledger.resetMs("target", oldRequest) }),
+    ).toBe(false);
+    // Completing in reverse request order cannot lower either frontier.
+    const current = ledger.snapshot();
+    expect(ledger.resetMs("target", current)).toBeGreaterThanOrEqual(now.getTime());
+    expect(ledger.resetMs("target", oldRequest)).toBe(Number.POSITIVE_INFINITY);
+  });
+  it("preserves unrelated evidence before churn and fresh evidence after pruning", () => {
+    const ledger = createKvEvictionResetLedger();
+    const first = ledger.snapshot();
+    ledger.note(["reset-target"], now);
+    expect(ledger.resetMs("unrelated", first)).toBeUndefined();
+    for (let index = 0; index < MAX_RESET_CAPACITIES + 1; index++)
+      ledger.note([`churn-${index}`], now);
+    const fresh = ledger.snapshot();
+    expect(
+      qualifiesAsEvictionEvidence({ ...valid, resetAtMs: ledger.resetMs("unrelated", fresh) }),
+    ).toBe(true);
+    expect(
+      qualifiesAsEvictionEvidence({
+        ...valid,
+        evidence: { ...valid.evidence!, lastUsedAt: now.getTime() - 1 },
+        resetAtMs: ledger.resetMs("unrelated", fresh),
+      }),
+    ).toBe(false);
+  });
+  it("fences a retained target reset even with equal or backwards timestamps", () => {
+    for (const offset of [0, -1000]) {
+      const ledger = createKvEvictionResetLedger();
+      const requestGeneration = ledger.snapshot();
+      ledger.note(["target"], new Date(now.getTime() + offset));
+      expect(
+        qualifiesAsEvictionEvidence({
+          ...valid,
+          resetAtMs: ledger.resetMs("target", requestGeneration),
+        }),
+      ).toBe(false);
+      expect(
+        qualifiesAsEvictionEvidence({
+          ...valid,
+          resetAtMs: ledger.resetMs("target", ledger.snapshot()),
+        }),
+      ).toBe(true);
+    }
+  });
+
+  it("rejects malformed reset identifiers and dates without consuming capacity", () => {
+    const ledger = createKvEvictionResetLedger();
+    ledger.note(["", "a".repeat(129)], now);
+    ledger.note(["target"], new Date(Number.NaN));
+    expect(ledger.size()).toBe(0);
+    expect(ledger.snapshot()).toBe(0);
   });
 });

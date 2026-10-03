@@ -110,20 +110,57 @@ export type KvEvictionObservation = {
   kind?: KvEvictionContinuationKind;
 };
 
-const resetAtByCapacity = new Map<string, number>();
+export const MAX_RESET_CAPACITIES = 1024;
 
-export function kvEvictionResetMs(capacityId: string): number | undefined {
-  return resetAtByCapacity.get(capacityId);
+/**
+ * Fixed-size generation ledger, with a conservative frontier for pruned keys.
+ * Request generations are scalar values: no registration, timers, references
+ * or release paths can leak when a stream hangs/cancels/retries. Never expire
+ * the frontier by time: a very old active request must remain fenced forever.
+ * At extreme churn, old unrelated evidence can be discarded, never revived.
+ */
+export function createKvEvictionResetLedger() {
+  const resetAtByCapacity = new Map<string, { ms: number; generation: number }>();
+  let generation = 0;
+  let prunedThrough = 0;
+  let prunedResetMs = Number.NEGATIVE_INFINITY;
+  const snapshot = () => generation;
+  const resetMs = (capacityId: string, requestGeneration = generation): number | undefined => {
+    const retained = resetAtByCapacity.get(capacityId);
+    if (requestGeneration < prunedThrough || (retained && retained.generation > requestGeneration))
+      return Number.POSITIVE_INFINITY;
+    const ms = Math.max(retained?.ms ?? Number.NEGATIVE_INFINITY, prunedResetMs);
+    return ms === Number.NEGATIVE_INFINITY ? undefined : ms;
+  };
+  const note = (capacityIds: readonly string[], now: Date) => {
+    const ms = now.getTime();
+    if (!Number.isFinite(ms)) return;
+    for (const capacityId of capacityIds) {
+      if (!capacityId || capacityId.length > 128) continue;
+      // Move updated keys to the end, keeping the map in generation order.
+      const previous = resetAtByCapacity.get(capacityId);
+      resetAtByCapacity.delete(capacityId);
+      resetAtByCapacity.set(capacityId, {
+        ms: Math.max(ms, previous?.ms ?? prunedResetMs),
+        generation: ++generation,
+      });
+      if (resetAtByCapacity.size > MAX_RESET_CAPACITIES) {
+        const oldest = resetAtByCapacity.entries().next().value;
+        if (oldest) {
+          resetAtByCapacity.delete(oldest[0]);
+          prunedThrough = Math.max(prunedThrough, oldest[1].generation);
+          prunedResetMs = Math.max(prunedResetMs, oldest[1].ms);
+        }
+      }
+    }
+  };
+  return { snapshot, resetMs, note, size: () => resetAtByCapacity.size };
 }
 
-export function noteKvEvictionReset(capacityIds: readonly string[], now: Date): void {
-  const ms = now.getTime();
-  if (!Number.isFinite(ms)) return;
-  for (const capacityId of capacityIds) {
-    if (!capacityId || capacityId.length > 128) continue;
-    resetAtByCapacity.set(capacityId, ms);
-  }
-}
+const resets = createKvEvictionResetLedger();
+export const kvEvictionResetGeneration = resets.snapshot;
+export const kvEvictionResetMs = resets.resetMs;
+export const noteKvEvictionReset = resets.note;
 
 async function resetKvEvictionCapacities(
   where: Prisma.InferenceCapacityWhereInput,
@@ -140,19 +177,6 @@ async function resetKvEvictionCapacities(
   } catch {
     /* Disposable: a failed reset must not take down hello or load. */
   }
-}
-
-export async function resetKvEvictionForCliDevice(
-  cliDeviceId: string,
-  now: Date = new Date(),
-  db: Pick<typeof prisma, "inferenceCapacity" | "capacityKvEviction"> = prisma,
-): Promise<void> {
-  if (!cliDeviceId || cliDeviceId.length > 128) return;
-  await resetKvEvictionCapacities(
-    { ExecutionTargets: { some: { DiscoveredModel: { Endpoint: { cliDeviceId } } } } },
-    now,
-    db,
-  );
 }
 
 export async function resetKvEvictionForEndpoint(
