@@ -1,6 +1,10 @@
 /**
  * Batched class-H writer for node_metrics_minute. Accepted `node.metrics`
  * frames are merged in memory and flushed in sorted key order. Display only.
+ * Failed batches are isolated per row and reported with operational counts.
+ * No retry contract: increments are additive, so an uncertain commit cannot
+ * be retried safely without durable idempotency. Keep at most 2000 pending +
+ * 2000 in-flight increments; do not retain an unbounded failed-row queue.
  */
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { isDbShutdownFenceArmed } from "@ws-model-proxy/db/shutdown-fence";
@@ -257,6 +261,37 @@ function upsertManySql(increments: readonly NodeMetricsRollupIncrement[]): Prism
       "updatedAt" = now()`;
 }
 
+/** Operational counts only; never include telemetry payloads or database errors. */
+export class NodeMetricsRollupWriteError extends Error {
+  constructor(
+    readonly written: number,
+    readonly failed: number,
+    readonly uncertain = 0,
+  ) {
+    super("Node metrics rollup write incomplete");
+    this.name = "NodeMetricsRollupWriteError";
+  }
+}
+
+function rejectedStatement(error: unknown): boolean {
+  const property = (value: unknown, key: string): unknown =>
+    value && typeof value === "object" ? Reflect.get(value, key) : undefined;
+  const meta = property(error, "meta");
+  const driverCause = property(property(meta, "driverAdapterError"), "cause");
+  // PostgreSQL statement atomicity proves these data/constraint failures made
+  // no writes. Connection/unknown errors may have committed: never replay.
+  const codes = [
+    property(error, "code"),
+    property(meta, "code"),
+    property(property(error, "cause"), "originalCode"),
+    property(driverCause, "originalCode"),
+  ];
+  return codes.some(
+    (code) =>
+      typeof code === "string" && ["22003", "22001", "23502", "23503", "23514"].includes(code),
+  );
+}
+
 export async function writeNodeMetricsIncrements(
   increments: readonly NodeMetricsRollupIncrement[],
   db: { $executeRaw: (query: Prisma.Sql) => Promise<unknown> } = prisma,
@@ -267,23 +302,29 @@ export async function writeNodeMetricsIncrements(
     return a < b ? -1 : a > b ? 1 : 0;
   });
   if (sorted.length === 0) return 0;
-  if (isDbShutdownFenceArmed()) return 0;
+  if (isDbShutdownFenceArmed()) throw new NodeMetricsRollupWriteError(0, sorted.length);
   try {
     await db.$executeRaw(upsertManySql(sorted));
     return sorted.length;
-  } catch {
-    /* One overflowing or rejected row must not drop the rest of the flush. */
+  } catch (error) {
+    if (!rejectedStatement(error))
+      throw new NodeMetricsRollupWriteError(0, sorted.length, sorted.length);
+    /* A proven rejected statement can safely isolate overflowing rows. */
   }
   let written = 0;
+  let uncertain = 0;
   for (const increment of sorted) {
-    if (isDbShutdownFenceArmed()) return written;
+    if (isDbShutdownFenceArmed()) break;
     try {
       await db.$executeRaw(upsertSql(increment));
       written += 1;
-    } catch {
-      /* Isolate L1 row failures. */
+    } catch (error) {
+      if (!rejectedStatement(error)) uncertain += 1;
+      /* No retry, even if a connection error hides a committed row. */
     }
   }
+  if (written !== sorted.length)
+    throw new NodeMetricsRollupWriteError(written, sorted.length - written, uncertain);
   return written;
 }
 
@@ -291,12 +332,12 @@ export function createNodeMetricsRollupWriter({
   clock = Date.now,
   write = writeNodeMetricsIncrements,
   shutdown = isDbShutdownFenceArmed,
-  log = () => console.error("[node-metrics-rollup] flush failed"),
+  log = (counts) => console.error("[node-metrics-rollup] flush incomplete", counts),
 }: {
   clock?: () => number;
   write?: (increments: NodeMetricsRollupIncrement[]) => Promise<number>;
   shutdown?: () => boolean;
-  log?: () => void;
+  log?: (counts: { written: number; failed: number; uncertain?: number }) => void;
 } = {}) {
   const pending = new Map<string, NodeMetricsRollupIncrement>();
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -311,6 +352,8 @@ export function createNodeMetricsRollupWriter({
     if (timer !== undefined) clearTimeout(timer);
     timer = undefined;
     pending.clear();
+    // Join the one started write before the server disconnects its DB client.
+    return inFlight ?? Promise.resolve();
   };
 
   const schedule = () => {
@@ -346,13 +389,25 @@ export function createNodeMetricsRollupWriter({
     if (increments.length === 0) return;
     writing = true;
     try {
-      if (!stopped && !shutdown()) await write(increments);
-    } catch {
+      if (!stopped && !shutdown()) {
+        const written = await write(increments);
+        if (written !== increments.length)
+          throw new NodeMetricsRollupWriteError(written, increments.length - written);
+      }
+    } catch (error) {
       const failedAt = clock();
       if (failedAt - lastLog >= 60_000) {
         lastLog = failedAt;
         try {
-          log();
+          log(
+            error instanceof NodeMetricsRollupWriteError
+              ? {
+                  written: error.written,
+                  failed: error.failed,
+                  ...(error.uncertain ? { uncertain: error.uncertain } : {}),
+                }
+              : { written: 0, failed: increments.length },
+          );
         } catch {
           /* Logging must not escape the request path. */
         }
@@ -369,10 +424,11 @@ export function createNodeMetricsRollupWriter({
       if (pending.size === 0 || stopped) return;
     }
     const run = runFlush();
-    inFlight = run.finally(() => {
-      if (inFlight === run) inFlight = undefined;
+    const joined = run.finally(() => {
+      if (inFlight === joined) inFlight = undefined;
     });
-    await inFlight;
+    inFlight = joined;
+    await joined;
   };
 
   const observe = (sample: NodeMetricsRollupSample) => {

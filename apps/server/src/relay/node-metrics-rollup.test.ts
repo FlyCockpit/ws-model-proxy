@@ -15,6 +15,7 @@ import {
   mergeNodeMetricsIncrements,
   NODE_METRICS_ROLLUP_MAX_PENDING,
   type NodeMetricsRollupSample,
+  NodeMetricsRollupWriteError,
   truncateToMinute,
   writeNodeMetricsIncrements,
 } from "./node-metrics-rollup.js";
@@ -148,21 +149,85 @@ describe("node-metrics rollup writer", () => {
 
   it("isolates a failed increment so later rows still write", async () => {
     const calls: unknown[] = [];
-    const written = await writeNodeMetricsIncrements(
-      [
-        mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "a" })),
-        mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "b" })),
-      ],
-      {
-        $executeRaw: async () => {
-          calls.push(true);
-          if (calls.length === 1) throw new Error("batch overflow");
-          if (calls.length === 2) throw new Error("int4 overflow");
-          return 1;
+    await expect(
+      writeNodeMetricsIncrements(
+        [
+          mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "a" })),
+          mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "b" })),
+        ],
+        {
+          $executeRaw: async () => {
+            calls.push(true);
+            if (calls.length === 1) throw { code: "22003" };
+            if (calls.length === 2) throw { code: "22003" };
+            return 1;
+          },
         },
-      },
-    );
+      ),
+    ).rejects.toMatchObject({ written: 1, failed: 1 });
     expect(calls).toHaveLength(3);
-    expect(written).toBe(1);
+  });
+  it("routes database failures with counts, resumes on restored writes, and joins shutdown", async () => {
+    const log = vi.fn();
+    let fail = true;
+    let finish: (() => void) | undefined;
+    const write = vi.fn(async (increments: Parameters<typeof writeNodeMetricsIncrements>[0]) => {
+      if (fail) throw new NodeMetricsRollupWriteError(0, increments.length);
+      await new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      return increments.length;
+    });
+    const writer = createNodeMetricsRollupWriter({ clock: () => NOW.getTime(), write, log });
+    writers.push(writer);
+    writer.observe(sample());
+    await writer.flushNow();
+    expect(log).toHaveBeenCalledWith({ written: 0, failed: 1 });
+    fail = false;
+    writer.observe(sample({ cliDeviceId: "restored" }));
+    const flushing = writer.flushNow();
+    await Promise.resolve();
+    const stopping = writer.stop();
+    let settled = false;
+    void stopping.then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    writer.observe(sample({ cliDeviceId: "late" }));
+    finish?.();
+    await stopping;
+    await flushing;
+    expect(settled).toBe(true);
+    expect(write).toHaveBeenCalledTimes(2);
+    await writer.flushNow();
+    expect(write).toHaveBeenCalledTimes(2);
+  });
+  it("reports partial count returns and rate-limits only logging, not future writes", async () => {
+    let time = NOW.getTime();
+    const log = vi.fn();
+    const write = vi.fn(async () => 0);
+    const writer = createNodeMetricsRollupWriter({ clock: () => time, write, log });
+    writers.push(writer);
+    for (let index = 0; index < 3; index++) {
+      writer.observe(sample());
+      await writer.flushNow();
+      time += 1000;
+    }
+    expect(write).toHaveBeenCalledTimes(3);
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(log).toHaveBeenCalledWith({ written: 0, failed: 1 });
+  });
+
+  it("never replays a batch after an uncertain commit acknowledgement", async () => {
+    const execute = vi.fn(async () => {
+      throw new Error("connection lost after commit");
+    });
+    await expect(
+      writeNodeMetricsIncrements([mergeNodeMetricsIncrements(undefined, sample())], {
+        $executeRaw: execute,
+      }),
+    ).rejects.toMatchObject({ written: 0, failed: 1, uncertain: 1 });
+    expect(execute).toHaveBeenCalledTimes(1);
   });
 });
