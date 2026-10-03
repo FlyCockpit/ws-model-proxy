@@ -1700,7 +1700,7 @@ describe("providerManagementRouter security boundary", () => {
     });
     db.providerCredential.updateMany.mockResolvedValue({ count: 1 });
     db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
-    egressMock.request.mockResolvedValue({ statusCode: 204, resume: vi.fn() });
+    egressMock.request.mockResolvedValue({ statusCode: 204, destroy: vi.fn() });
     const client = createRouterClient(providerManagementRouter, { context });
     await expect(client.testCredential({ providerAccountId: "account" })).resolves.toEqual({
       ok: true,
@@ -1861,7 +1861,7 @@ describe("providerManagementRouter security boundary", () => {
     // before the post-egress transaction acquired its lifecycle locks.
     db.providerCredential.updateMany.mockResolvedValue({ count: 0 });
     db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
-    egressMock.request.mockResolvedValue({ statusCode: 204, resume: vi.fn() });
+    egressMock.request.mockResolvedValue({ statusCode: 204, destroy: vi.fn() });
 
     const client = createRouterClient(providerManagementRouter, { context });
     await expect(client.testCredential({ providerAccountId: "account" })).resolves.toEqual({

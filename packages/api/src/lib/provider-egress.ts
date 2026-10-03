@@ -1,7 +1,7 @@
 import { lookup as dnsLookup, type LookupAddress } from "node:dns";
-import { request as httpRequest, type IncomingMessage } from "node:http";
-import { request as httpsRequest, type RequestOptions } from "node:https";
-import { isIP } from "node:net";
+import { Agent as HttpAgent, request as httpRequest, type IncomingMessage } from "node:http";
+import { Agent as HttpsAgent, request as httpsRequest, type RequestOptions } from "node:https";
+import { isIP, type TcpSocketConnectOpts } from "node:net";
 import type { ProviderProtocol } from "./provider-protocol";
 
 export type { ProviderProtocol } from "./provider-protocol";
@@ -139,6 +139,7 @@ export function isPrivateOrSpecialAddress(address: string): boolean {
       inRange("172.16.0.0", 12) ||
       inRange("192.0.0.0", 24) ||
       inRange("192.0.2.0", 24) ||
+      inRange("192.88.99.2", 32) || // non-global 6a44 relay anycast
       inRange("192.168.0.0", 16) ||
       inRange("198.18.0.0", 15) ||
       inRange("198.51.100.0", 24) ||
@@ -169,6 +170,7 @@ export function isPrivateOrSpecialAddress(address: string): boolean {
     return (
       bytesInPrefix(bytes, prefix(0x00), 8) || // reserved low addresses
       bytesInPrefix(bytes, prefix(0x01, 0x00), 64) || // discard-only
+      bytesInPrefix(bytes, prefix(0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01), 64) || // dummy IPv6
       bytesInPrefix(bytes, prefix(0x20, 0x01, 0x00, 0x02), 48) || // benchmarking
       bytesInPrefix(bytes, prefix(0x20, 0x01, 0x00), 23) || // other IETF assignments
       bytesInPrefix(bytes, prefix(0x20, 0x01, 0x0d, 0xb8), 32) || // documentation
@@ -267,49 +269,100 @@ export function assertSafeProviderHeaders(headers: Record<string, string>): void
   }
 }
 
+export type ProviderRequestOptions = Pick<
+  RequestOptions,
+  "method" | "path" | "headers" | "signal" | "ca" | "family"
+> &
+  Pick<TcpSocketConnectOpts, "autoSelectFamily"> & { body?: Uint8Array };
+
+const REQUEST_OPTION_NAMES = new Set([
+  "method",
+  "path",
+  "headers",
+  "signal",
+  "ca",
+  "family",
+  "autoSelectFamily",
+  "body",
+]);
+
 /**
- * Low-level egress primitive. DNS validation occurs in the socket's lookup
- * callback, closing the validation/connect rebinding gap. Redirects are not
- * followed by Node and callers must re-enter this function for every Location.
+ * Each exchange owns a fresh, non-pooling agent. Every connection therefore
+ * uses this exchange's validated DNS answers, never a foreign or differently
+ * authorized socket. Connector, proxy and TLS verification overrides are not
+ * accepted. Custom trust roots remain supported; certificate identity and SNI
+ * use the original URL host. Redirects require a new, independently checked call.
+ * timeoutMs bounds DNS/connect/headers, then socket inactivity during the body;
+ * zero explicitly disables those timers. Streaming callers own total deadlines
+ * and response byte limits.
  */
 export async function providerHttpsRequest(
   rawUrl: string,
-  options: Omit<RequestOptions, "hostname" | "host" | "port" | "protocol" | "lookup"> & {
-    body?: Uint8Array;
-  },
+  options: ProviderRequestOptions,
   policy: ProviderEgressPolicy,
   protocol: ProviderProtocol,
   auth: ProviderEgressAuth,
 ) {
   if (policy.egressEnabled !== true) throw new ProviderEgressError();
+  if (
+    Reflect.ownKeys(options).some(
+      (key) => typeof key !== "string" || !REQUEST_OPTION_NAMES.has(key),
+    )
+  )
+    throw new ProviderEgressError();
+  if (
+    policy.timeoutMs !== undefined &&
+    (!Number.isFinite(policy.timeoutMs) || policy.timeoutMs < 0)
+  )
+    throw new ProviderEgressError();
   const url = validateProviderBaseUrl(rawUrl, policy);
   // Node's built-in signal handler destroys the request and dumps unread
   // response bytes. Own the signal so teardown always errors the body.
-  const { body, signal, ...requestOptions } = options;
+  const { body, signal, method, path, ca, family, autoSelectFamily } = options;
+  if (signal?.aborted) throw new ProviderEgressError();
   const headers = {
-    ...sanitizeProviderHeaders((requestOptions.headers ?? {}) as Record<string, string>, protocol),
+    ...sanitizeProviderHeaders((options.headers ?? {}) as Record<string, string>, protocol),
     ...providerAuthHeaders(auth),
   };
   return new Promise<IncomingMessage>((resolve, reject) => {
     const requestFunction = url.protocol === "https:" ? httpsRequest : httpRequest;
-    const request = requestFunction(url, {
-      ...requestOptions,
-      headers,
-      lookup(hostname, lookupOptions, callback) {
-        dnsLookup(hostname, { ...lookupOptions, all: true }, (error, addresses) => {
-          if (error) return callback(error, "", 0);
-          const resolved = Array.isArray(addresses) ? addresses : [addresses];
-          try {
-            assertResolvedAddressesSafe(resolved, policy);
-          } catch (validationError) {
-            return callback(validationError as Error, "", 0);
-          }
-          const selected = resolved[0];
-          if (!selected) return callback(new Error("Provider hostname did not resolve"), "", 0);
-          callback(null, selected.address, selected.family);
-        });
-      },
-    });
+    const agent =
+      url.protocol === "https:"
+        ? new HttpsAgent({ keepAlive: false, maxSockets: 1, maxCachedSessions: 0 })
+        : new HttpAgent({ keepAlive: false, maxSockets: 1 });
+    let request: ReturnType<typeof httpRequest>;
+    try {
+      const nativeOptions: RequestOptions & Pick<TcpSocketConnectOpts, "autoSelectFamily"> = {
+        method,
+        path: path ?? url.pathname,
+        ca,
+        family,
+        autoSelectFamily,
+        agent,
+        rejectUnauthorized: true,
+        headers,
+        lookup(hostname, lookupOptions, callback) {
+          dnsLookup(hostname, { ...lookupOptions, all: true }, (error, addresses) => {
+            if (error) return callback(new ProviderEgressError(), []);
+            const resolved = Array.isArray(addresses) ? addresses : [addresses];
+            try {
+              assertResolvedAddressesSafe(resolved, policy);
+            } catch {
+              return callback(new ProviderEgressError(), []);
+            }
+            const selected = resolved[0];
+            if (!selected) return callback(new ProviderEgressError(), []);
+            if (lookupOptions.all) callback(null, resolved);
+            else callback(null, selected.address, selected.family);
+          });
+        },
+      };
+      request = requestFunction(url, nativeOptions);
+    } catch {
+      agent.destroy();
+      reject(new ProviderEgressError());
+      return;
+    }
     let response: IncomingMessage | undefined;
     // Once headers exist, only a natural EOF with all bytes delivered or a
     // rejecting read is valid. ClientRequest.destroy() can discard buffered
@@ -319,23 +372,38 @@ export async function providerHttpsRequest(
       else request.destroy(error);
     };
     const timeoutMs = policy.timeoutMs ?? 10_000;
+    // ClientRequest.setTimeout starts after connect, so separately bound the
+    // DNS lookup, TCP/TLS handshake and response headers. A late DNS callback
+    // cannot connect a destroyed socket (Node's native connecting check).
+    const headerDeadline =
+      timeoutMs > 0
+        ? setTimeout(() => teardownExchange(new ProviderEgressError()), timeoutMs)
+        : undefined;
+    headerDeadline?.unref();
     request.setTimeout(timeoutMs, () => teardownExchange(new ProviderEgressError()));
     const abort = () => teardownExchange(new ProviderEgressError());
     const detachAbort = () => signal?.removeEventListener("abort", abort);
+    const cleanup = () => {
+      clearTimeout(headerDeadline);
+      detachAbort();
+      agent.destroy();
+    };
     request.once("response", (incoming) => {
+      clearTimeout(headerDeadline);
       response = incoming;
-      response.once("end", detachAbort);
-      response.once("close", detachAbort);
-      response.once("error", detachAbort);
+      response.once("end", cleanup);
+      response.once("close", cleanup);
+      response.once("error", cleanup);
       if ((response.statusCode ?? 0) >= 300 && (response.statusCode ?? 0) < 400) {
-        response.resume();
+        response.destroy();
+        cleanup();
         reject(new ProviderEgressError());
         return;
       }
       resolve(response);
     });
     request.once("error", () => {
-      detachAbort();
+      cleanup();
       reject(new ProviderEgressError());
     });
     signal?.addEventListener("abort", abort, { once: true });

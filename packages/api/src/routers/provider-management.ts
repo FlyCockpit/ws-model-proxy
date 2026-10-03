@@ -1912,13 +1912,19 @@ export const providerManagementRouter = {
             : ({ type: "API_KEY", apiKey: secret } as const);
         const response = await providerHttpsRequest(
           probe.url,
-          { method: "GET", headers: probe.headers },
+          {
+            method: "GET",
+            headers: probe.headers,
+            ...(callerSignal ? { signal: callerSignal } : {}),
+          },
           policy(),
           protocol,
           providerAuth,
         );
-        response.resume();
         statusCode = response.statusCode ?? null;
+        // The probe needs headers only. Stop an arbitrary active response body
+        // immediately so it cannot retain the owned egress socket indefinitely.
+        response.destroy();
       } catch (error) {
         requestError = error;
       }

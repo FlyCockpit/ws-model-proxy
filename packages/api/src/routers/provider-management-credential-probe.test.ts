@@ -1,5 +1,5 @@
 import { createServer, type IncomingHttpHeaders } from "node:http";
-import type { AddressInfo } from "node:net";
+import type { AddressInfo, Socket } from "node:net";
 import { createRouterClient } from "@orpc/server";
 import type { Session } from "@ws-model-proxy/auth";
 import type { MockInstance } from "vitest";
@@ -70,12 +70,26 @@ const client = () => createRouterClient(providerManagementRouter, { context });
 const secret = "fixture-bogus-key";
 // The root never looks at the key; /v1/models answers with `modelsStatus`.
 let modelsStatus = 401;
+let keepBodyOpen = false;
+let stallHeaders = false;
+let probeReceived: (() => void) | undefined;
+const probeSockets = new Set<Socket>();
 const seen: { path: string; headers: IncomingHttpHeaders }[] = [];
 const server = createServer((request, response) => {
   seen.push({ path: request.url ?? "", headers: request.headers });
+  probeReceived?.();
+  if (stallHeaders) return;
   response.statusCode =
     request.url === "/" ? 200 : request.url === "/v1/models" ? modelsStatus : 404;
+  if (keepBodyOpen) {
+    response.write("{}");
+    return;
+  }
   response.end("{}");
+});
+server.on("connection", (socket) => {
+  probeSockets.add(socket);
+  socket.once("close", () => probeSockets.delete(socket));
 });
 let baseUrl = "";
 
@@ -109,6 +123,8 @@ beforeAll(async () => {
   scopedBaseUrl = `http://127.0.0.1:${(scopedServer.address() as AddressInfo).port}`;
 });
 afterAll(async () => {
+  server.closeAllConnections();
+  scopedServer.closeAllConnections();
   await new Promise<void>((resolve) => server.close(() => resolve()));
   await new Promise<void>((resolve) => scopedServer.close(() => resolve()));
 });
@@ -151,12 +167,49 @@ function arrange(
 beforeEach(() => {
   vi.clearAllMocks();
   seen.length = 0;
+  keepBodyOpen = false;
+  stallHeaders = false;
+  probeReceived = undefined;
   db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) => callback(db));
   db.providerCredential.updateMany.mockResolvedValue({ count: 1 });
   db.providerAuditEvent.create.mockResolvedValue({ id: "audit" });
 });
 
 describe("compatible-provider credential test against a public-root gateway", () => {
+  it("caller cancellation settles the real pending probe and skips audit writes", async () => {
+    stallHeaders = true;
+    const received = new Promise<void>((resolve) => {
+      probeReceived = resolve;
+    });
+    arrange("openai-compatible", "BEARER");
+    const controller = new AbortController();
+    const caller = createRouterClient(providerManagementRouter, {
+      context: { ...context, services: { signal: controller.signal } },
+    });
+    const pending = expect(
+      caller.testCredential({ providerAccountId: "acct" }),
+    ).rejects.toMatchObject({
+      code: "CLIENT_CLOSED_REQUEST",
+    });
+    await received;
+    controller.abort();
+    await pending;
+    await vi.waitFor(() => expect(probeSockets.size).toBe(0), { timeout: 500 });
+    expect(db.providerAuditEvent.create).not.toHaveBeenCalled();
+    expect(db.providerCredential.updateMany).not.toHaveBeenCalled();
+  });
+
+  it("settles an unfinished real provider body immediately after status-only probe", async () => {
+    keepBodyOpen = true;
+    modelsStatus = 200;
+    arrange("openai-compatible", "BEARER");
+    await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toMatchObject({
+      statusCode: 200,
+      outcome: "INCONCLUSIVE",
+    });
+    expect(seen.map((request) => request.path)).toEqual(["/v1/models"]);
+    await vi.waitFor(() => expect(probeSockets.size).toBe(0), { timeout: 500 });
+  });
   it.each([
     ["openai-compatible", "BEARER", "authorization"],
     ["anthropic-compatible", "API_KEY", "x-api-key"],
