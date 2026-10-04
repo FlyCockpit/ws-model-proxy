@@ -74,7 +74,7 @@ async function postMediaAdminAction(
 
 function formatBytes(bytes: number): string {
   if (bytes <= 0) return "0 B";
-  const units = ["B", "KB", "MB", "GB", "TB"];
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   const exponent = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
   const value = bytes / 1024 ** exponent;
   const rounded = exponent === 0 ? value : Math.round(value * 10) / 10;
