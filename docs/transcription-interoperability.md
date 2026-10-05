@@ -125,8 +125,9 @@ Engine notes:
 
 - **whisper.cpp server.** Its transcription route is `/inference` unless
   changed. With `segmented`, start it with
-  `--inference-path /v1/audio/transcriptions`, and with `--convert` unless it
-  only receives WAV (the CLI sends 16 kHz WAV, which it accepts as is).
+  `--inference-path /v1/audio/transcriptions`. `--convert` is not needed for
+  live sessions (the CLI sends 16 kHz WAV); keep it if the same endpoint also
+  serves uploads in other formats.
 - **Voxtral realtime on vLLM.** A turn grows one context, so
   `--max-model-len` bounds how long a turn can be; a turn that outgrows it
   fails part-way. Keep `maxItemSeconds` well inside it (600 s of audio is
@@ -149,8 +150,8 @@ browser, as the subprotocol pair `realtime` and
 the URL are refused. Then:
 
 1. Receive `session.created`.
-2. Send `session.update` with
-   `{"type":"transcription","audio":{"input":{"transcription":{"model":"owner/pool"}}}}`
+2. Send
+   `{"type":"session.update","session":{"type":"transcription","audio":{"input":{"transcription":{"model":"owner/pool"}}}}}`
    unless the URL named the model. `turn_detection` and `noise_reduction` must
    be null; `format` is `audio/pcm` at 24000 Hz.
 3. Send `input_audio_buffer.append` with base64 16-bit little-endian mono PCM
@@ -181,11 +182,13 @@ socket.on("open", () => {
 
 Limits and closes: 4 sessions per token, 8 per user, 30 minutes per session,
 120 s without audio, 400 events per 10 s. An `error` event precedes every
-close other than 1000. 1001 is a server shutdown, 1008 lost access, 1011 an
-upstream or node failure, 1013 busy or a backlog. There is no failover after a
-session opens; reconnect. Access is checked at open and every 60 seconds: a
-revoked token, a ban or a deleted user ends sessions at once; an expired
-token or an allowlist edit that removes the model ends them within 60 s.
+close other than 1000. 1001 is a server shutdown, 1008 lost access or refused,
+1011 an upstream or node failure, 1013 busy or a backlog. There is no failover
+after a session opens; reconnect. Access is checked at open and every 60
+seconds: a revoked token, a ban or a deleted user ends sessions at once in the
+server process that made the change (other processes end theirs within 60 s);
+an expired token or an allowlist edit that removes the model ends them within
+60 s.
 
 Each opened session is recorded as one request (`audio.realtime_transcription`)
 with the forwarded audio duration (`audioInputMs`) and any engine token counts;

@@ -598,6 +598,11 @@ try {
     await db
       .query(`DELETE FROM deployment_config WHERE id = $1`, [ids.config])
       .catch(() => undefined);
+    for (const table of ["usage_rollup_minute", "usage_rollup_hour"]) {
+      await db
+        .query(`DELETE FROM ${table} WHERE "ownerUserId" = $1 OR "requesterUserId" = $1`, [userId])
+        .catch(() => undefined); // policy: bounded-delete -- generated test user's rollups only
+    }
     await db
       .query(`DELETE FROM relay_request WHERE "userId" = $1`, [userId])
       .catch(() => undefined); // policy: bounded-delete -- generated test user's rows only

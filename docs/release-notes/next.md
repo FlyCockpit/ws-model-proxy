@@ -335,8 +335,10 @@ assignment provenance and automatic concurrency seed columns.
   `supports_realtime_transcription`.
   Access is checked when the session opens (under the same locked send check
   as HTTP requests) and again every 60 seconds. Revoking the token, banning
-  or deleting a user ends live sessions at once; a token that expires, or an
-  allowlist edit that removes the model, ends them within 60 seconds.
+  or deleting a user ends live sessions at once in the server process that
+  made the change (other processes end theirs within 60 seconds); a token
+  that expires, or an allowlist edit that removes the model, ends them within
+  60 seconds.
   Each opened session is one request row (`audio.realtime_transcription`)
   with the forwarded audio in `audioInputMs`; its wall time is kept out of
   request latency statistics. The `segmented` adapter returns one result per
