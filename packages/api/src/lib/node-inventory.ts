@@ -5,6 +5,7 @@
  * validators the dashboard mutations share.
  */
 
+import { JSON_SCHEMA_REGISTRY } from "@orpc/zod/zod4";
 import { z } from "zod";
 import { parseNodeMetricsSample } from "./metric-routing";
 import type { OverviewWindow } from "./overview-metrics";
@@ -53,8 +54,36 @@ export const nodeLabelsSchema = z
 
 const budgetGbSchema = z.number().finite().min(0).max(NODE_BUDGET_MAX_GB);
 
+/** JSON dictionaries must retain every accepted key, including __proto__. */
+export function gpuBudgetMap<T>(entries: Iterable<readonly [string, T]> = []): Record<string, T> {
+  const map: Record<string, T> = Object.create(null);
+  for (const [key, value] of entries) map[key] = value;
+  return map;
+}
+
+export function ownGpuBudget<T>(map: Record<string, T>, key: string): T | undefined {
+  return Object.hasOwn(map, key) ? map[key] : undefined;
+}
+
+/** Prisma's generic object serializer also loses __proto__; its JSON input
+ * protocol accepts toJSON without rebuilding the dictionary by assignment. */
+export function gpuBudgetJson(map: Record<string, number>): {
+  toJSON: () => Record<string, number>;
+} {
+  return { toJSON: () => map };
+}
+
+// Zod's record parser strips __proto__. Validate the original own entries and
+// construct our dictionary instead, without admitting inherited record values.
 export const usableVramGbSchema = z
-  .record(z.string(), budgetGbSchema)
+  .custom<Record<string, number>>(
+    (value) => {
+      if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+      const prototype = Object.getPrototypeOf(value);
+      return prototype === null || prototype === Object.prototype;
+    },
+    { message: "VRAM budgets must be a JSON object." },
+  )
   .superRefine((map, context) => {
     const keys = Object.keys(map);
     if (keys.length > NODE_VRAM_KEYS_MAX) {
@@ -71,7 +100,28 @@ export const usableVramGbSchema = z
           message: "VRAM budgets are keyed by GPU UUID or index:N.",
         });
       }
+      const budget = budgetGbSchema.safeParse(map[key]);
+      if (!budget.success) {
+        for (const issue of budget.error.issues) {
+          context.addIssue({ ...issue, path: [key, ...issue.path] });
+        }
+      }
     }
+  })
+  .transform((map) => gpuBudgetMap(Object.entries(map)))
+  .register(JSON_SCHEMA_REGISTRY, {
+    type: "object",
+    maxProperties: NODE_VRAM_KEYS_MAX,
+    additionalProperties: { type: "number", minimum: 0, maximum: NODE_BUDGET_MAX_GB },
+    propertyNames: {
+      anyOf: [
+        { pattern: GPU_INDEX_KEY.source },
+        { pattern: GPU_UUID_KEY.source, not: { pattern: "^index:" } },
+      ],
+    },
+    // Override the converter's unsupported-custom-schema sentinel. Objects
+    // already exclude null, so this adds no constraint beyond type: object.
+    not: { type: "null" },
   });
 
 export const nodeUsableBudgetsInputSchema = z
@@ -165,7 +215,7 @@ export function parseNodeInfo(value: unknown): NodeInfoView | null {
 
 export function gpuBudgetKey(gpu: Pick<NodeGpuInfoView, "index" | "uuid">): string {
   const uuid = gpu.uuid?.trim();
-  if (uuid && GPU_UUID_KEY.test(uuid)) return uuid;
+  if (uuid && isGpuBudgetKey(uuid)) return uuid;
   return `index:${gpu.index}`;
 }
 
@@ -181,16 +231,6 @@ export function normalizeNodeLabels(labels: readonly string[]): string[] {
     if (next.length >= NODE_LABELS_MAX) break;
   }
   return next;
-}
-
-/** Selectors are "has all of these" sets. No negation. */
-export function nodeHasAllLabels(
-  deviceLabels: readonly string[],
-  required: readonly string[],
-): boolean {
-  if (required.length === 0) return true;
-  const have = new Set(deviceLabels);
-  return required.every((label) => have.has(label));
 }
 
 function blobOf(info: NodeInfoView): string {
@@ -227,10 +267,6 @@ export function suggestNodeLabels(info: NodeInfoView): string[] {
       labels.add("apple-silicon");
     }
   }
-
-  const memoryGb = mibToGb(info.memoryTotalMiB);
-  if (memoryGb !== null && memoryGb <= 16) labels.add("low-power");
-  else if (kind === "cpu" && memoryGb !== null && memoryGb <= 32) labels.add("low-power");
 
   return [...labels].sort();
 }
@@ -271,7 +307,7 @@ export type NodeUsableBudgets = {
 };
 
 export function defaultUsableVramGb(info: NodeInfoView): UsableVramGbMap {
-  const map: UsableVramGbMap = {};
+  const map = gpuBudgetMap<number>();
   // Unified nodes budget the same bytes as usableMemoryGb; do not double-count
   // a per-GPU VRAM carve-out as a second budget.
   if (info.nodeKind === "unified") return map;
@@ -294,9 +330,9 @@ export function resolveUsableBudgets(
   const kind = info?.nodeKind;
   const memoryDefault = defaultFromTotalMiB(info?.memoryTotalMiB, NODE_MEMORY_RESERVE_GB);
   const storedVram = parseUsableVramGb(stored.usableVramGb);
-  const vramDefaults = info ? defaultUsableVramGb(info) : {};
-  const usableVramGb: UsableVramGbMap = { ...vramDefaults };
-  const usableVramGbDefaults: Record<string, boolean> = {};
+  const vramDefaults = info ? defaultUsableVramGb(info) : gpuBudgetMap<number>();
+  const usableVramGb = gpuBudgetMap(Object.entries(vramDefaults));
+  const usableVramGbDefaults = gpuBudgetMap<boolean>();
   for (const key of Object.keys(vramDefaults)) usableVramGbDefaults[key] = true;
   const knownGpuKeys = new Set((info?.gpus ?? []).map((gpu) => gpuBudgetKey(gpu)));
   if (storedVram && kind !== "unified") {
@@ -417,13 +453,14 @@ export function assertUsableBudgetWrite(
       } else {
         for (const [key, value] of Object.entries(input.usableVramGb)) {
           if (!known.has(key)) {
-            add("usableVramGb", "VRAM budgets must use a reported GPU UUID or index.");
+            add(`usableVramGb.${key}`, "VRAM budgets must use a reported GPU UUID or index.");
             continue;
           }
           const total = known.get(key) ?? null;
-          if (total == null) add("usableVramGb", "Physical VRAM total is unknown for a GPU.");
+          if (total == null)
+            add(`usableVramGb.${key}`, "Physical VRAM total is unknown for a GPU.");
           else if (value > total) {
-            add("usableVramGb", "Usable VRAM cannot exceed the physical total.");
+            add(`usableVramGb.${key}`, "Usable VRAM cannot exceed the physical total.");
           }
         }
       }
@@ -588,8 +625,8 @@ export function buildNodeCardSnapshot(input: {
       uuid: gpu.uuid ?? null,
       driverVersion: gpu.driverVersion ?? null,
       vramTotalGb: mibToGb(gpu.vramTotalMiB ?? live?.vramTotalMiB ?? null),
-      usableVramGb: budgets.usableVramGb[key] ?? null,
-      usableVramGbDefault: budgets.usableVramGbDefaults[key] ?? true,
+      usableVramGb: ownGpuBudget(budgets.usableVramGb, key) ?? null,
+      usableVramGbDefault: ownGpuBudget(budgets.usableVramGbDefaults, key) ?? true,
       vramUsedGb: mibToGb(live?.vramUsedMiB ?? null),
       temperatureC: live?.temperatureC ?? null,
       utilizationPercent: live?.utilizationPercent ?? null,

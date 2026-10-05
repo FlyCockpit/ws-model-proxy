@@ -103,6 +103,12 @@ const GRAPH_TABLES: Record<string, string> = {
   inference_capacity: "configuration",
   model_pool: "configuration",
   pool_member: "configuration",
+  inference_contribution: "two-party inference-only configuration",
+  deployment_config: "recipes",
+  deployment_config_revision: "immutable recipe configuration",
+  deployment_plan: "bounded operational plans",
+  deployment_run: "operational runs removed after verified stops",
+  deployment_instance: "operational instances; live claims refuse deletion",
   pool_routing_rule: "configuration: at most 16 rules per pool",
   pool_grant: "configuration",
   pool_fallback_preference: "configuration: at most one per exact pool grant",
@@ -126,6 +132,10 @@ const hot = new Set<string>(HOT_PATH_TABLES);
  * none of them writes traffic-proportional rows.
  */
 const REACHED_DELETE_TRIGGERS: Record<string, string> = {
+  "deployment_owner_cleanup:user":
+    "refuses live claims then removes stopped operational dependencies",
+  "deployment_device_cleanup:cli_device":
+    "refuses any live group claims then removes stopped operational dependencies",
   "pool_routing_rule_on_member_delete:pool_member":
     "rewrites at most 16 pool_routing_rule rows (delete targeted, SET NULL exclude to pool-wide); configuration, not per-request",
   "provider_audit_event_immutable:provider_audit_event":

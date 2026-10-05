@@ -30,6 +30,8 @@ import {
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { isDbShutdownFenceArmed } from "@ws-model-proxy/db/shutdown-fence";
 import type { AffinityDecision } from "./cache-affinity.js";
+import { resetAffinityForCapacities } from "./cache-affinity-generation.js";
+import { queryAffinityResidency } from "./cache-affinity-residency.js";
 import {
   type ProtectionEngineKind,
   protectionKvBudgetTokens,
@@ -168,15 +170,12 @@ async function resetKvEvictionCapacities(
   db: Pick<typeof prisma, "inferenceCapacity" | "capacityKvEviction">,
 ): Promise<void> {
   if (isDbShutdownFenceArmed()) return;
-  try {
-    const rows = await db.inferenceCapacity.findMany({ where, select: { id: true } });
-    const ids = rows.map((row) => row.id);
-    noteKvEvictionReset(ids, now);
-    if (ids.length === 0) return;
-    await db.capacityKvEviction.deleteMany({ where: { capacityId: { in: ids } } });
-  } catch {
-    /* Disposable: a failed reset must not take down hello or load. */
-  }
+  const rows = await db.inferenceCapacity.findMany({ where, select: { id: true } });
+  const ids = rows.map((row) => row.id);
+  noteKvEvictionReset(ids, now);
+  if (ids.length === 0) return;
+  await resetAffinityForCapacities(ids);
+  await db.capacityKvEviction.deleteMany({ where: { capacityId: { in: ids } } }).catch(() => {});
 }
 
 export async function resetKvEvictionForEndpoint(
@@ -186,6 +185,20 @@ export async function resetKvEvictionForEndpoint(
   db: Pick<typeof prisma, "inferenceCapacity" | "capacityKvEviction"> = prisma,
 ): Promise<void> {
   if (!cliDeviceId || !endpointSlug || cliDeviceId.length > 128 || endpointSlug.length > 63) return;
+  if (db === prisma) {
+    const rows = await queryAffinityResidency<Array<{ id: string }>>(Prisma.sql`
+      SELECT DISTINCT t."inferenceCapacityId" AS id FROM endpoint e
+      JOIN discovered_model m ON m."endpointId" = e.id
+      JOIN execution_target t ON t."discoveredModelId" = m.id
+      WHERE e."cliDeviceId" = ${cliDeviceId} AND e.slug = ${endpointSlug}
+        AND t."inferenceCapacityId" IS NOT NULL`);
+    const ids = rows.map((row) => row.id);
+    noteKvEvictionReset(ids, now);
+    await resetAffinityForCapacities(ids);
+    await queryAffinityResidency(Prisma.sql`DELETE FROM capacity_kv_eviction
+      WHERE "capacityId" = ANY(${ids}::text[]) RETURNING "capacityId"`).catch(() => {});
+    return;
+  }
   await resetKvEvictionCapacities(
     {
       ExecutionTargets: {

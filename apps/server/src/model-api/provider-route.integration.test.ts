@@ -1,9 +1,10 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { EmbeddingContract } from "@ws-model-proxy/api/lib/embedding-contract";
 // Fixture writes need no owner fences (the graph-write fence triggers accept
 // this client); production code under test uses its own clients.
 import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { Hono } from "hono";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
@@ -16,6 +17,19 @@ if (!databaseUrl)
   console.warn("[provider-route] skipped: SCHEMA_VALIDATION_DATABASE_URL is not configured");
 
 type Surface = "openai-chat" | "openai-responses" | "anthropic-messages";
+const embeddingContract = {
+  model: "upstream-model",
+  revision: "embedding-rev-1",
+  dimensions: 3,
+  normalization: "l2" as const,
+  vectorSpace: "fixture-vector-space",
+};
+const embeddingCapabilities = (contract: EmbeddingContract = embeddingContract) => ({
+  version: 4,
+  protocol: "openai-compatible",
+  surfaces: {},
+  embeddings: { supported: true, contract },
+});
 type Behavior =
   | "json"
   | "stream"
@@ -85,6 +99,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
   const db = databaseUrl ? createFixturePrismaClient(databaseUrl) : undefined;
   let upstream: ReturnType<typeof createServer> | undefined;
   let origin = "";
+  const embeddingFixtureUserIds: string[] = [];
   const upstreamObservations: Array<{
     path: string;
     method?: string;
@@ -160,6 +175,25 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         authorization: request.headers.authorization,
         body,
       });
+      if (request.url?.endsWith("/v1/embeddings")) {
+        const payload = JSON.parse(body) as { input: unknown[] | string };
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({
+            object: "list",
+            model: "upstream-model",
+            data: (Array.isArray(payload.input) ? payload.input : [payload.input]).map(
+              (_, index) => ({
+                object: "embedding",
+                index,
+                embedding: [0.123456789, 0.234567891, 0.345678912],
+              }),
+            ),
+            usage: { prompt_tokens: 5, total_tokens: 5 },
+          }),
+        );
+        return;
+      }
       const segments = (request.url ?? "").split("/").filter(Boolean);
       const behavior = segments[0] as Behavior;
       const surface: Surface = request.url?.includes("/responses")
@@ -291,6 +325,24 @@ integration("provider dispatch routes with real PostgreSQL", () => {
 
   afterAll(async () => {
     await new Promise<void>((resolve) => upstream?.close(() => resolve()) ?? resolve());
+    if (modules && embeddingFixtureUserIds.length) {
+      // Activated pricing/accounting rows are immutable and intentionally
+      // retain their synthetic parents. Remove live fixture access exactly;
+      // never disable hardening or cascade through immutable accounting.
+      await modules.prisma.providerAccount.updateMany({
+        where: { userId: { in: embeddingFixtureUserIds } },
+        data: { enabled: false },
+      });
+      await modules.prisma.modelApiToken.deleteMany({
+        where: { userId: { in: embeddingFixtureUserIds }, name: "Provider route token" },
+      });
+      await modules.prisma.modelPool.deleteMany({
+        where: { userId: { in: embeddingFixtureUserIds }, name: "Provider route pool" },
+      });
+      await modules.prisma.cliDevice.deleteMany({
+        where: { userId: { in: embeddingFixtureUserIds }, slug: { startsWith: "embedding-" } },
+      });
+    }
     await modules?.prisma.$disconnect();
     await db?.$disconnect();
   });
@@ -348,6 +400,8 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     routingMode?: "PREFER_NATIVE" | "REQUIRE_NATIVE" | "REQUIRE_ADAPTED";
     multiSurfaceStreamingFallback?: boolean;
     developerPrefix?: boolean;
+    embeddings?: boolean;
+    openRouter?: boolean;
   }) {
     if (!modules) throw new Error("modules unavailable");
     const suffix = crypto.randomUUID();
@@ -368,6 +422,8 @@ integration("provider dispatch routes with real PostgreSQL", () => {
           },
         })
       : user;
+    if (input.embeddings)
+      embeddingFixtureUserIds.push(user.id, ...(requester.id === user.id ? [] : [requester.id]));
     const pool = await modules.prisma.modelPool.create({
       data: {
         userId: user.id,
@@ -378,6 +434,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         // `owner/pool:external`, and the owner pays for grantees explicitly.
         fallbackEnabled: true,
         fallbackForGrantees: input.grantee === true,
+        ...(input.embeddings ? { embeddingContract } : {}),
       },
     });
     expect(pool).toMatchObject({
@@ -409,7 +466,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       data: {
         id: accountId,
         userId: user.id,
-        providerType: protocolFor(input.native),
+        providerType: input.openRouter ? "openrouter" : protocolFor(input.native),
         label: `account-${suffix}`,
         baseUrl: `${origin}/${input.behavior}`,
         endpointIdentity: `${origin}/${input.behavior}`,
@@ -442,32 +499,34 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         enabled: true,
         healthStatus: "HEALTHY",
         contextWindow: 8_192,
-        maxOutputTokens: 256,
-        nativeCapabilities: input.multiSurfaceStreamingFallback
-          ? {
-              version: 4,
-              protocol: "openai-compatible",
-              surfaces: {
-                openaiChatCompletions: {
-                  source: "provider",
-                  confidence: "exact",
-                  operations: ["create"],
-                  streaming: false,
+        maxOutputTokens: input.embeddings ? null : 256,
+        nativeCapabilities: input.embeddings
+          ? embeddingCapabilities()
+          : input.multiSurfaceStreamingFallback
+            ? {
+                version: 4,
+                protocol: "openai-compatible",
+                surfaces: {
+                  openaiChatCompletions: {
+                    source: "provider",
+                    confidence: "exact",
+                    operations: ["create"],
+                    streaming: false,
+                  },
+                  openaiResponses: {
+                    source: "provider",
+                    confidence: "exact",
+                    operations: ["create"],
+                    streaming: true,
+                  },
                 },
-                openaiResponses: {
-                  source: "provider",
-                  confidence: "exact",
-                  operations: ["create"],
-                  streaming: true,
-                },
+              }
+            : {
+                protocols: [protocolFor(input.native)],
+                surfaces: [input.native],
+                streaming: true,
+                features: [],
               },
-            }
-          : {
-              protocols: [protocolFor(input.native)],
-              surfaces: [input.native],
-              streaming: true,
-              features: [],
-            },
       },
     });
     const capacity = await modules.prisma.inferenceCapacity.create({
@@ -556,7 +615,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
         data: {
           id: secondAccountId,
           userId: user.id,
-          providerType: protocolFor(input.native),
+          providerType: input.openRouter ? "openrouter" : protocolFor(input.native),
           label: `account-second-${suffix}`,
           baseUrl: `${origin}/${input.secondBehavior}`,
           endpointIdentity: `${origin}/${input.secondBehavior}`,
@@ -706,9 +765,55 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       },
     });
     const manager = {
-      getActiveCliDeviceIds: () => [],
-      registerRelayResponseHandlers: () => undefined,
-      sendRelayRequest: () => undefined,
+      activeDeviceIds: [] as string[],
+      localSends: [] as Array<{ path: string; body: string }>,
+      localStatus: 200,
+      handlers: new Map<
+        string,
+        import("../relay/session-manager.js").ActiveRelayResponseHandlers
+      >(),
+      getActiveCliDeviceIds: () => manager.activeDeviceIds,
+      registerRelayResponseHandlers: ({
+        requestId,
+        handlers,
+      }: Parameters<
+        import("../relay/session-manager.js").RelaySessionManager["registerRelayResponseHandlers"]
+      >[0]) => {
+        manager.handlers.set(requestId, handlers);
+      },
+      sendRelayRequest: ({
+        requestId,
+        path,
+        bodyChunks,
+      }: Parameters<
+        import("../relay/session-manager.js").RelaySessionManager["sendRelayRequest"]
+      >[0]) => {
+        manager.localSends.push({ path, body: Buffer.concat(bodyChunks ?? []).toString("utf8") });
+        queueMicrotask(() => {
+          const handlers = manager.handlers.get(requestId)!;
+          handlers.onHeaders({
+            type: "relay.response.headers",
+            requestId,
+            status: manager.localStatus,
+            headers: { "content-type": "application/json" },
+          });
+          handlers.onBody(
+            new TextEncoder().encode(
+              JSON.stringify({
+                object: "list",
+                data: [{ object: "embedding", index: 0, embedding: [1, 0, 0] }],
+                usage: { prompt_tokens: 1, total_tokens: 1 },
+              }),
+            ),
+            { type: "relay.response.body", requestId, chunkId: "embedding-0" },
+          );
+          handlers.onComplete({
+            type: "relay.complete",
+            requestId,
+            usage: { promptTokens: 1, completionTokens: 0, totalTokens: 1 },
+          });
+        });
+      },
       cancelRelayRequest: () => undefined,
       completeRelayRequest: () => undefined,
       supportsCountContext: () => false,
@@ -751,8 +856,13 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       poolSlug: pool.slug,
     })}:external`;
     const stream = input.behavior === "stream" || input.behavior === "crash";
-    const body =
-      input.requested === "openai-chat"
+    const body = input.embeddings
+      ? {
+          model: modelId,
+          input: ["embedding-private-first", "embedding-private-second"],
+          provider: { data_collection: "deny" },
+        }
+      : input.requested === "openai-chat"
         ? {
             model: modelId,
             stream,
@@ -783,11 +893,14 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     if (input.routingMode) headers["x-wsmp-chat-test-routing-mode"] = input.routingMode;
     if (input.requested === "anthropic-messages") headers["anthropic-version"] = "2023-06-01";
     const observationIndex = upstreamObservations.length;
-    const response = await app.request(pathFor(input.requested), {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-    });
+    const response = await app.request(
+      input.embeddings ? "/embeddings" : pathFor(input.requested),
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+      },
+    );
     const responseText = await response.text().catch(() => "");
     const ledger = await waitForLedger(model.id);
     const attempt = await waitForTerminalAttempt(model.id);
@@ -832,8 +945,579 @@ integration("provider dispatch routes with real PostgreSQL", () => {
       rawToken,
       app,
       modelId,
+      manager,
     };
   }
+
+  it("native embeddings exact contract pins dimensions, batches and settles input-only HTTP/PG usage", async () => {
+    const result = await runCase({
+      requested: "openai-chat",
+      native: "openai-chat",
+      behavior: "json",
+      embeddings: true,
+    });
+    expect(result.response.status, result.responseText).toBe(200);
+    expect(result.observation?.path).toBe("/json/v1/embeddings");
+    expect(result.observation?.authorization).toBe("Bearer route-provider-secret");
+    expect(JSON.parse(result.observation?.body ?? "{}")).toMatchObject({
+      model: "upstream-model",
+      dimensions: 3,
+      input: ["embedding-private-first", "embedding-private-second"],
+      provider: { data_collection: "deny" },
+    });
+    expect(JSON.parse(result.responseText).data).toHaveLength(2);
+    expect(result.model.maxOutputTokens).toBeNull();
+    expect(result.ledger).toMatchObject({ inputTokens: 5n, outputTokens: 0n, billableTotal: 5n });
+    expect(result.attempt.state).toBe("COMPLETED");
+    // Input costs $1/million and output costs $2/million: the actual
+    // admitted liability must contain no generated-token reservation.
+    expect(result.attempt.liabilityTokens).not.toBeNull();
+    expect(result.attempt.liabilitySpend?.mul(1_000_000).toString()).toBe(
+      result.attempt.liabilityTokens?.toString(),
+    );
+    for (const reservation of result.reservations) {
+      const settlement = result.settlements.find((row) => row.reservationId === reservation.id);
+      expect(settlement).toBeDefined();
+      expect(settlement?.settledValue.toString()).toBe(
+        reservation.Rule.metric === "TOKENS" ? "5" : "0.000005",
+      );
+    }
+  }, 30_000);
+
+  const embeddingCase = () =>
+    runCase({
+      requested: "openai-chat",
+      native: "openai-chat",
+      behavior: "json",
+      embeddings: true,
+      grantee: true,
+    });
+  const embeddingRequest = (
+    result: Awaited<ReturnType<typeof runCase>>,
+    model = result.modelId,
+    extra: Record<string, unknown> = {},
+  ) =>
+    result.app.request("/embeddings", {
+      method: "POST",
+      headers: bearerHeaders(result.rawToken, true),
+      body: JSON.stringify({
+        model,
+        input: ["embedding-private-first", "embedding-private-second"],
+        ...extra,
+      }),
+    });
+
+  it.each([
+    ["revision", { ...embeddingContract, revision: "other-revision" }],
+    ["vectorSpace", { ...embeddingContract, vectorSpace: "other-space" }],
+    ["normalization", { ...embeddingContract, normalization: "none" as const }],
+    ["model", { ...embeddingContract, model: "other-model" }],
+  ])(
+    "native embeddings same dimensions with different %s never sends HTTP",
+    async (_field, contract) => {
+      if (!modules) throw new Error("modules unavailable");
+      const result = await embeddingCase();
+      await modules.prisma.providerModel.update({
+        where: { id: result.model.id },
+        data: { nativeCapabilities: embeddingCapabilities(contract) },
+      });
+      const before = upstreamObservations.length;
+      const credential = await modules.prisma.providerCredential.findUniqueOrThrow({
+        where: { id: result.credentialId },
+      });
+      const response = await embeddingRequest(result);
+      expect(response.status).not.toBe(200);
+      await response.text();
+      expect(upstreamObservations.length).toBe(before);
+      expect(
+        (
+          await modules.prisma.providerCredential.findUniqueOrThrow({
+            where: { id: result.credentialId },
+          })
+        ).lastUsedAt,
+      ).toEqual(credential.lastUsedAt);
+    },
+    30_000,
+  );
+
+  it("native embeddings contract mutation after admission refuses actual locked send", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const result = await embeddingCase();
+    if (!result.grant) throw new Error("grant unavailable");
+    const before = upstreamObservations.length;
+    const credential = await modules.prisma.providerCredential.findUniqueOrThrow({
+      where: { id: result.credentialId },
+    });
+    const race = await whileClaimWaitsOnGrant(result.grant.id, async () => {
+      expect(
+        await modules!.prisma.providerAttempt.count({
+          where: { providerModelId: result.model.id, state: "ACTIVE" },
+        }),
+      ).toBe(1);
+      expect(
+        await modules!.prisma.providerBudgetReservation.count({
+          where: { providerModelId: result.model.id, state: "RESERVED" },
+        }),
+      ).toBeGreaterThan(0);
+      expect(upstreamObservations.length).toBe(before);
+      await modules!.prisma.providerModel.update({
+        where: { id: result.model.id },
+        data: {
+          nativeCapabilities: embeddingCapabilities({
+            ...embeddingContract,
+            revision: "withdrawn-after-admission",
+          }),
+        },
+      });
+    });
+    const pending = embeddingRequest(result);
+    await race.waitThenApply();
+    const response = await pending;
+    expect(response.status).not.toBe(200);
+    await response.text();
+    expect(upstreamObservations.length).toBe(before);
+    expect(
+      (
+        await modules.prisma.providerCredential.findUniqueOrThrow({
+          where: { id: result.credentialId },
+        })
+      ).lastUsedAt,
+    ).toEqual(credential.lastUsedAt);
+    expect(
+      await modules.prisma.providerBudgetReservation.count({
+        where: { providerModelId: result.model.id, state: "RESERVED" },
+      }),
+    ).toBe(0);
+    expect(
+      await modules.prisma.publicProviderAttemptEvent.count({
+        where: {
+          providerModelId: result.model.id,
+          eventType: "TERMINAL",
+          reason: "PROVIDER_UNAVAILABLE",
+        },
+      }),
+    ).toBe(1);
+  }, 30_000);
+
+  it("native embeddings plain names stay local when unavailable and explicit external requires consent", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const result = await embeddingCase();
+    const before = upstreamObservations.length;
+    const plain = await embeddingRequest(result, result.modelId.replace(/:external$/, ""));
+    expect(plain.status).not.toBe(200);
+    await plain.text();
+    expect(upstreamObservations.length).toBe(before);
+    const allowed = await embeddingRequest(result);
+    expect(allowed.status).toBe(200);
+    await allowed.text();
+    expect(upstreamObservations.length).toBe(before + 1);
+    const token = await modules.prisma.modelApiToken.findFirstOrThrow({
+      where: { userId: result.requester.id, name: "Provider route token" },
+    });
+    await modules.prisma.modelApiToken.update({
+      where: { id: token.id },
+      data: { allowExternal: false },
+    });
+    const denied = await embeddingRequest(result);
+    expect(denied.status).not.toBe(200);
+    await denied.text();
+    expect(upstreamObservations.length).toBe(before + 1);
+  }, 30_000);
+
+  it("native embeddings external variant serves an eligible local member before paid HTTP by default", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const result = await embeddingCase();
+    const device = await modules.prisma.cliDevice.create({
+      data: {
+        userId: result.user.id,
+        slug: `embedding-${crypto.randomUUID()}`,
+        status: "CONNECTED",
+      },
+    });
+    const endpoint = await modules.prisma.endpoint.create({
+      data: {
+        userId: result.user.id,
+        cliDeviceId: device.id,
+        slug: "embedding",
+        label: "embedding",
+        status: "ONLINE",
+        published: true,
+        capabilityMetadata: embeddingCapabilities(),
+      },
+    });
+    const model = await modules.prisma.discoveredModel.create({
+      data: {
+        userId: result.user.id,
+        endpointId: endpoint.id,
+        slug: "embedding",
+        upstreamModelId: "local-embedding",
+        encodedModelId: "local-embedding",
+        published: true,
+      },
+    });
+    const target = await modules.prisma.executionTarget.findUniqueOrThrow({
+      where: { discoveredModelId: model.id },
+    });
+    await modules.prisma.poolMember.create({
+      data: {
+        poolId: result.pool.id,
+        discoveredModelId: model.id,
+        executionTargetId: target.id,
+        tier: "PRIMARY",
+      },
+    });
+    result.manager.activeDeviceIds.push(device.id);
+    const before = upstreamObservations.length;
+    const response = await embeddingRequest(result);
+    expect(response.status).toBe(200);
+    expect(response.headers.get("x-wsmp-route")).toBe("local");
+    await response.text();
+    expect(result.manager.localSends).toHaveLength(1);
+    expect(result.manager.localSends[0]?.path).toBe("/v1/embeddings");
+    expect(upstreamObservations.length).toBe(before);
+    for (const status of [429, 403]) {
+      result.manager.localStatus = status;
+      const denied = await embeddingRequest(result);
+      expect(denied.status).toBe(status);
+      await denied.text();
+      expect(upstreamObservations.length).toBe(before);
+    }
+    // The plain and external listings require the same connected local graph.
+    const listing = await result.app.request("/models", {
+      headers: bearerHeaders(result.rawToken, true),
+    });
+    const listed = (await listing.json()) as { data: Array<{ id: string }> };
+    expect(listed.data.map(({ id }) => id)).toContain(result.modelId);
+    result.manager.activeDeviceIds.length = 0;
+    const disconnected = await result.app.request("/models", {
+      headers: bearerHeaders(result.rawToken, true),
+    });
+    const hidden = (await disconnected.json()) as { data: Array<{ id: string }> };
+    expect(hidden.data.map(({ id }) => id)).not.toContain(result.modelId);
+  }, 30_000);
+
+  it("native embeddings pool contract mutation after admission refuses actual locked send", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const result = await embeddingCase();
+    const before = upstreamObservations.length;
+    const credential = await modules.prisma.providerCredential.findUniqueOrThrow({
+      where: { id: result.credentialId },
+    });
+    const race = await whileClaimWaits(
+      async (tx) => {
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${result.pool.id} FOR NO KEY UPDATE`;
+      },
+      "%FROM model_pool WHERE%FOR SHARE%",
+      async () => {
+        expect(
+          await modules!.prisma.providerAttempt.count({
+            where: { providerModelId: result.model.id, state: "ACTIVE" },
+          }),
+        ).toBe(1);
+        expect(upstreamObservations.length).toBe(before);
+      },
+      async (tx) => {
+        await tx.modelPool.update({
+          where: { id: result.pool.id },
+          data: {
+            embeddingContract: { ...embeddingContract, vectorSpace: "pool-space-withdrawn" },
+          },
+        });
+      },
+    );
+    const pending = embeddingRequest(result);
+    await race.waitThenApply();
+    const response = await pending;
+    expect(response.status).not.toBe(200);
+    await response.text();
+    expect(upstreamObservations.length).toBe(before);
+    expect(
+      (
+        await modules.prisma.providerCredential.findUniqueOrThrow({
+          where: { id: result.credentialId },
+        })
+      ).lastUsedAt,
+    ).toEqual(credential.lastUsedAt);
+    expect(
+      await modules.prisma.providerBudgetReservation.count({
+        where: { providerModelId: result.model.id, state: "RESERVED" },
+      }),
+    ).toBe(0);
+  }, 30_000);
+
+  it("native embeddings enforces deny on outgoing HTTP and retains no raw content in PG or console", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const logs = [
+      vi.spyOn(console, "log"),
+      vi.spyOn(console, "info"),
+      vi.spyOn(console, "warn"),
+      vi.spyOn(console, "error"),
+      vi.spyOn(console, "debug"),
+    ];
+    try {
+      const result = await runCase({
+        requested: "openai-chat",
+        native: "openai-chat",
+        behavior: "json",
+        embeddings: true,
+        openRouter: true,
+      });
+      const before = upstreamObservations.length;
+      const response = await embeddingRequest(result, result.modelId, {
+        provider: { data_collection: "allow", order: ["fixture-provider"] },
+      });
+      expect(response.status).toBe(200);
+      await response.text();
+      expect(JSON.parse(upstreamObservations[before]?.body ?? "{}")).toMatchObject({
+        provider: { data_collection: "deny", order: ["fixture-provider"] },
+      });
+      await waitForTerminalAttempt(result.model.id);
+      // Both responses must be durably finalized before checking storage;
+      // an older terminal row cannot stand in for the second request.
+      await vi.waitFor(
+        async () => {
+          expect(
+            await modules!.prisma.providerUsageLedger.count({
+              where: { providerModelId: result.model.id },
+            }),
+          ).toBe(2);
+          expect(
+            await modules!.prisma.relayRequest.count({
+              where: { requestedModelPoolId: result.pool.id, status: "SUCCEEDED" },
+            }),
+          ).toBe(2);
+        },
+        { timeout: 5_000 },
+      );
+      const rows = await Promise.all([
+        modules.prisma.providerUsageLedger.findMany({
+          where: { providerModelId: result.model.id },
+        }),
+        modules.prisma.providerAttempt.findMany({ where: { providerModelId: result.model.id } }),
+        modules.prisma.providerBudgetReservation.findMany({
+          where: { providerModelId: result.model.id },
+        }),
+        modules.prisma.providerBudgetSettlement.findMany({
+          where: { providerModelId: result.model.id },
+        }),
+        modules.prisma.publicProviderAttemptEvent.findMany({
+          where: { providerModelId: result.model.id },
+        }),
+        modules.prisma.relayRequest.findMany({ where: { requestedModelPoolId: result.pool.id } }),
+        modules.prisma.relayExecutionEvent.findMany({ where: { userId: result.requester.id } }),
+        modules.prisma.relayExecutionAttempt.findMany({ where: { userId: result.requester.id } }),
+        modules.prisma.cacheAffinityRecord.findMany({ where: { poolId: result.pool.id } }),
+      ]);
+      const persisted = JSON.stringify(rows, (_, value: unknown) =>
+        typeof value === "bigint" ? value.toString() : value,
+      );
+      const logged = JSON.stringify(logs.flatMap((spy) => spy.mock.calls));
+      for (const sentinel of [
+        "embedding-private-first",
+        "embedding-private-second",
+        "0.123456789",
+        "0.234567891",
+        "0.345678912",
+      ]) {
+        expect(persisted).not.toContain(sentinel);
+        expect(logged).not.toContain(sentinel);
+      }
+      expect(rows[8]).toHaveLength(0);
+    } finally {
+      for (const spy of logs) spy.mockRestore();
+    }
+  }, 30_000);
+
+  it("native embeddings dimensions mismatch and actual spend budget denial never send HTTP", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const result = await embeddingCase();
+    const before = upstreamObservations.length;
+    const dimensions = await embeddingRequest(result, result.modelId, { dimensions: 4 });
+    expect(dimensions.status).not.toBe(200);
+    await dimensions.text();
+    expect(upstreamObservations.length).toBe(before);
+    const policy = await modules.prisma.providerBudgetPolicy.findFirstOrThrow({
+      where: { providerModelId: result.model.id, poolId: result.pool.id },
+    });
+    await modules.prisma.providerBudgetPolicy.update({
+      where: { id: policy.id },
+      data: { active: false, deactivatedAt: new Date() },
+    });
+    await modules.prisma.providerBudgetPolicy.create({
+      data: {
+        userId: result.user.id,
+        providerAccountId: result.account.id,
+        providerModelId: result.model.id,
+        poolId: result.pool.id,
+        scopeType: "POOL_PROVIDER_MODEL",
+        active: true,
+        activatedAt: new Date(),
+        version: 2,
+        Rules: {
+          create: [
+            { metric: "CONCURRENCY", period: "PER_ATTEMPT", mode: "UNLIMITED" },
+            { metric: "TOKENS", period: "UTC_DAY", mode: "UNLIMITED" },
+            {
+              metric: "SPEND",
+              period: "UTC_DAY",
+              mode: "LIMITED",
+              limitValue: "0.000001",
+              currency: "USD",
+            },
+          ],
+        },
+      },
+    });
+    const budgetDenied = await embeddingRequest(result);
+    expect(budgetDenied.status).not.toBe(200);
+    await budgetDenied.text();
+    expect(upstreamObservations.length).toBe(before);
+  }, 30_000);
+
+  it("native embeddings privacy withdrawal after admission tightens actual HTTP body", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const result = await runCase({
+      requested: "openai-chat",
+      native: "openai-chat",
+      behavior: "json",
+      embeddings: true,
+      openRouter: true,
+      grantee: true,
+    });
+    if (!result.grant) throw new Error("grant unavailable");
+    await modules.prisma.providerAccount.update({
+      where: { id: result.account.id },
+      data: { allowDataCollection: true },
+    });
+    const before = upstreamObservations.length;
+    const race = await whileClaimWaitsOnGrant(result.grant.id, async () => {
+      expect(
+        await modules!.prisma.providerAttempt.count({
+          where: { providerModelId: result.model.id, state: "ACTIVE" },
+        }),
+      ).toBe(1);
+      await modules!.prisma.providerAccount.update({
+        where: { id: result.account.id },
+        data: { allowDataCollection: false },
+      });
+    });
+    const pending = embeddingRequest(result, result.modelId, {
+      provider: { data_collection: "allow" },
+    });
+    await race.waitThenApply();
+    const response = await pending;
+    expect(response.status).toBe(200);
+    await response.text();
+    expect(upstreamObservations.length).toBe(before + 1);
+    expect(JSON.parse(upstreamObservations[before]?.body ?? "{}").provider.data_collection).toBe(
+      "deny",
+    );
+  }, 30_000);
+
+  async function embeddingDispatch(
+    result: Awaited<ReturnType<typeof runCase>>,
+    reason: import("./public-overflow.js").PublicOverflowReason,
+  ) {
+    if (!modules) throw new Error("modules unavailable");
+    const { evaluateExternalEgress } = await import("./external-route.js");
+    const { dispatchPublicOverflow } = await import("./public-overflow.js");
+    const token = await modules.prisma.modelApiToken.findFirstOrThrow({
+      where: { userId: result.requester.id, name: "Provider route token" },
+    });
+    const decision = evaluateExternalEgress({
+      requested: true,
+      tokenPermitsPool: true,
+      requester: { userId: result.requester.id, source: "API_TOKEN", modelApiTokenId: token.id },
+      pool: {
+        id: result.pool.id,
+        ownerUserId: result.user.id,
+        accessGrantId: result.grant?.id ?? null,
+        fallbackEnabled: true,
+        fallbackForGrantees: true,
+        externalEquivalentModel: null,
+        ownKeyProviderModelId: null,
+      },
+    });
+    if (!decision.granted) throw new Error("consent unavailable");
+    return dispatchPublicOverflow({
+      userId: result.user.id,
+      poolId: result.pool.id,
+      requestId: crypto.randomUUID(),
+      reason,
+      externalConsent: decision.consent,
+      requesterUserId: result.requester.id,
+      requesterModelApiTokenId: token.id,
+      requestedProtocol: "openai",
+      requestedSurface: "openai-chat",
+      embeddingContract,
+      stream: false,
+      requiredFeatures: [],
+      path: "/v1/embeddings",
+      headers: new Headers({ "content-type": "application/json" }),
+      body: new TextEncoder().encode(
+        JSON.stringify({
+          model: "upstream-model",
+          input: ["embedding-private-first", "embedding-private-second"],
+          dimensions: 3,
+        }),
+      ),
+      signal: new AbortController().signal,
+      liability: { tokens: 5n, accountingVersion: "provider-billable-v1" },
+      estimatedInputTokens: 5n,
+      requestedOutputTokens: 0n,
+      releaseLocalCapacity: async () => undefined,
+      adaptationEnabled: false,
+      retrySafe: true,
+    });
+  }
+
+  it("native embeddings sampled paid warm reason observes locked opt-in withdrawal and unavailable inverse", async () => {
+    if (!modules) throw new Error("modules unavailable");
+    const result = await embeddingCase();
+    await modules.prisma.modelPool.update({
+      where: { id: result.pool.id },
+      data: { paidWarmProtectionEnabled: true },
+    });
+    const before = upstreamObservations.length;
+    const positive = await embeddingDispatch(result, "LOCAL_SATURATED_PROTECTED");
+    expect(positive.dispatched).toBe(true);
+    if (positive.dispatched) {
+      await positive.response.text();
+      await positive.terminal;
+    }
+    expect(upstreamObservations.length).toBe(before + 1);
+    const race = await whileClaimWaits(
+      async (tx) => {
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${result.pool.id} FOR NO KEY UPDATE`;
+      },
+      "%FROM model_pool WHERE%FOR SHARE%",
+      async () => {
+        expect(
+          await modules!.prisma.providerAttempt.count({
+            where: { providerModelId: result.model.id, state: "ACTIVE" },
+          }),
+        ).toBe(1);
+        expect(upstreamObservations.length).toBe(before + 1);
+      },
+      async (tx) => {
+        await tx.modelPool.update({
+          where: { id: result.pool.id },
+          data: { paidWarmProtectionEnabled: false },
+        });
+      },
+    );
+    const pending = embeddingDispatch(result, "LOCAL_SATURATED_PROTECTED");
+    await race.waitThenApply();
+    expect(await pending).toMatchObject({ dispatched: false, reason: "PROVIDER_UNAVAILABLE" });
+    expect(upstreamObservations.length).toBe(before + 1);
+    const unavailable = await embeddingDispatch(result, "NO_COMPATIBLE_HEALTHY_PRIMARY");
+    expect(unavailable.dispatched).toBe(true);
+    if (unavailable.dispatched) {
+      await unavailable.response.text();
+      await unavailable.terminal;
+    }
+    expect(upstreamObservations.length).toBe(before + 2);
+  }, 30_000);
 
   function expectEgressContract(result: Awaited<ReturnType<typeof runCase>>, native: Surface) {
     expect(result.observation).toBeDefined();
@@ -1513,7 +2197,9 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     const plainModelId = result.modelId.replace(/:external$/, "");
     const listsPool = async () => (await listed()).some((id) => id.startsWith(plainModelId));
     expect(await visible()).toEqual([result.pool.id]);
-    expect(await listsPool()).toBe(true);
+    // Provider-only pools have no eligible connected local primary, so the
+    // model listing stays hidden even while this exact external route works.
+    expect(await listsPool()).toBe(false);
     const observations = upstreamObservations.length;
 
     // C1b-4: the provider listing itself reports the owner's state, so the
@@ -1705,6 +2391,7 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     beforeCommit: (tx: import("@ws-model-proxy/db").Prisma.TransactionClient) => Promise<void>,
   ) {
     if (!db) throw new Error("database unavailable");
+    let holderPid = 0;
     let release!: () => void;
     const gate = new Promise<void>((resolve) => {
       release = resolve;
@@ -1715,6 +2402,10 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     });
     const holder = db.$transaction(
       async (tx) => {
+        const [backend] = await tx.$queryRaw<
+          Array<{ pid: number }>
+        >`SELECT pg_backend_pid() AS pid`;
+        holderPid = backend!.pid;
         await lock(tx);
         locked();
         await gate;
@@ -1726,20 +2417,24 @@ integration("provider dispatch routes with real PostgreSQL", () => {
     return {
       holder,
       async waitThenApply() {
-        const deadline = Date.now() + 10_000;
-        for (;;) {
-          const [row] = await db!.$queryRaw<Array<{ waiting: bigint }>>`
+        try {
+          const deadline = Date.now() + 10_000;
+          for (;;) {
+            const [row] = await db!.$queryRaw<Array<{ waiting: bigint }>>`
             SELECT count(*) AS waiting FROM pg_stat_activity
              WHERE wait_event_type = 'Lock'
                AND query LIKE ${waiterQuery}
+               AND ${holderPid} = ANY(pg_blocking_pids(pid))
                AND pid <> pg_backend_pid()`;
-          if (row && row.waiting > 0n) break;
-          if (Date.now() > deadline) throw new Error("the claim never waited on the held row");
-          await new Promise((resolve) => setTimeout(resolve, 20));
+            if (row && row.waiting > 0n) break;
+            if (Date.now() > deadline) throw new Error("the claim never waited on the held row");
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
+          await during();
+        } finally {
+          release();
+          await holder;
         }
-        await during();
-        release();
-        await holder;
       },
     };
   }

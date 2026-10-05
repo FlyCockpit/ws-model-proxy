@@ -18,7 +18,8 @@ import {
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
-import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ShieldCheck } from "lucide-react";
+import { cn } from "@ws-model-proxy/ui/lib/utils";
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Check, ShieldCheck } from "lucide-react";
 import type { ReactNode } from "react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -473,9 +474,37 @@ export function GuardedPoolSetupWizard({
             <DialogDescription>{t("dashboard:pools.wizard.description")}</DialogDescription>
           </DialogHeader>
         )}
-        <p className="text-sm font-medium" aria-live="polite">
-          {t("dashboard:pools.wizard.step", { current: step + 1, total: 4 })}
-        </p>
+        <div className="min-w-0 space-y-2">
+          <p className="text-sm font-medium" aria-live="polite">
+            {t("dashboard:pools.wizard.step", { current: step + 1, total: 4 })}
+          </p>
+          <ol className="grid min-w-0 grid-cols-2 gap-2 sm:grid-cols-4">
+            {(["models", "limits", "cloud", "review"] as const).map((name, index) => (
+              <li
+                key={name}
+                aria-current={index === step ? "step" : undefined}
+                className={cn(
+                  "flex min-w-0 items-center gap-2 rounded-md border px-2 py-1.5 text-xs",
+                  index === step
+                    ? "border-primary bg-primary/5 font-medium text-foreground"
+                    : "text-muted-foreground",
+                )}
+              >
+                <span
+                  aria-hidden="true"
+                  className={cn(
+                    "flex size-5 shrink-0 items-center justify-center rounded-full border text-[11px]",
+                    index < step && "border-state-success bg-state-success text-white",
+                    index === step && "border-primary text-primary",
+                  )}
+                >
+                  {index < step ? <Check className="size-3" /> : index + 1}
+                </span>
+                <span className="truncate">{t(`dashboard:pools.wizard.stepNames.${name}`)}</span>
+              </li>
+            ))}
+          </ol>
+        </div>
         <form
           ref={formRef}
           className="space-y-5"

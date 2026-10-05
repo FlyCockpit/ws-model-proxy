@@ -43,6 +43,7 @@ import {
   assertRecommendedSurfaceServable,
   discoveredModelSurfaceCapabilities,
 } from "../lib/pool-recommended-surface";
+import { invalidatePoolRouting } from "../lib/pool-routing-invalidation";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
 import {
   runCapacityDeleteTransaction,
@@ -1017,7 +1018,7 @@ export const poolMemberProcedures = {
         await tx.poolMember.delete({ where: { id: input.id } });
         return { deleted: true as const, poolId: candidate.poolId };
       });
-      await context.services?.onPoolRoutingRulesChanged?.(result.poolId);
+      await invalidatePoolRouting(context.services, [result.poolId]);
       return { deleted: true };
     }),
 

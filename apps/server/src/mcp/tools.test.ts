@@ -227,6 +227,9 @@ const CLI_FILE_TOOL_NAMES = [
 
 /** Every PAT-only CLI tool: the three command tools and the nine node file tools. */
 const CLI_COMMAND_TOOL_NAMES = new Set<string>([
+  "deployment_plan_start",
+  "deployment_plan_stop",
+  "deployment_plan_apply",
   "forwarder_cli_command_run",
   "forwarder_cli_supervised_command_start",
   "forwarder_cli_command_result",
@@ -313,6 +316,129 @@ describe("tools/list — the manifest is the advertised catalog", () => {
 });
 
 describe("#117 — real input schemas and named failing fields", () => {
+  it("bounds owner-scoped deployment metadata pages through the actual MCP handler", async () => {
+    vi.mocked(prisma.deploymentConfig.findMany).mockResolvedValueOnce([]);
+    const authInfo = buildAuthInfo(["mcp:read"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "deployment_configs_list", {
+      limit: 1,
+      cursor: "another-owner-cursor",
+    });
+    expect(body.result?.structuredContent).toEqual({ result: { items: [], nextCursor: null } });
+    expect(prisma.deploymentConfig.findMany).toHaveBeenCalledWith({
+      where: { userId: "user-1", id: { gt: "another-owner-cursor" } },
+      orderBy: { id: "asc" },
+      take: 2,
+      include: { Revisions: { orderBy: { revision: "desc" }, take: 1 } },
+    });
+  });
+
+  it("walks deployment metadata pages with a non-null nextCursor until the last page", async () => {
+    const row = (id: string) => ({
+      id,
+      userId: "user-1",
+      name: id,
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+      Revisions: [],
+    });
+    vi.mocked(prisma.deploymentConfig.findMany)
+      .mockResolvedValueOnce([row("cfg-a"), row("cfg-b"), row("cfg-c")] as never)
+      .mockResolvedValueOnce([row("cfg-c")] as never);
+    const authInfo = buildAuthInfo(["mcp:read"]);
+    bindRequest(authInfo);
+
+    const first = await callTool(authInfo, "deployment_configs_list", { limit: 2 });
+    const firstPage = first.body.result?.structuredContent?.result as {
+      items: { id: string }[];
+      nextCursor: string | null;
+    };
+    expect(firstPage.items.map((item) => item.id)).toEqual(["cfg-a", "cfg-b"]);
+    expect(firstPage.nextCursor).toBe("cfg-b");
+    expect(prisma.deploymentConfig.findMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({ where: { userId: "user-1" }, take: 3 }),
+    );
+
+    const second = await callTool(authInfo, "deployment_configs_list", {
+      limit: 2,
+      cursor: firstPage.nextCursor,
+    });
+    const secondPage = second.body.result?.structuredContent?.result as {
+      items: { id: string }[];
+      nextCursor: string | null;
+    };
+    expect(secondPage.items.map((item) => item.id)).toEqual(["cfg-c"]);
+    expect(secondPage.nextCursor).toBeNull();
+    expect(prisma.deploymentConfig.findMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({ where: { userId: "user-1", id: { gt: "cfg-b" } }, take: 3 }),
+    );
+  });
+
+  it("rejects a malformed cursor as invalid input without a database read or echo", async () => {
+    const authInfo = buildAuthInfo(["mcp:read"]);
+    bindRequest(authInfo);
+    const badCursor = `not a cursor ${"x".repeat(8)}/..`;
+    const { body } = await callTool(authInfo, "deployment_configs_list", {
+      limit: 2,
+      cursor: badCursor,
+    });
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.structuredContent?.error?.fields).toEqual(["cursor"]);
+    expect(JSON.stringify(body)).not.toContain(badCursor);
+    expect(prisma.deploymentConfig.findMany).not.toHaveBeenCalled();
+  });
+
+  it("keeps safe procedure reason codes even when no declared field is supplied", async () => {
+    const { ORPCError } = await import("@orpc/server");
+    db.modelPool.findUnique.mockRejectedValueOnce(
+      new ORPCError("BAD_REQUEST", { data: { reason: "CONCURRENCY_EXCEEDS_PHYSICAL" } }),
+    );
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_model_pool_update", { id: "pool-1" });
+    expect(body.result?.structuredContent).toEqual({
+      error: { code: "invalid_input", reason: "CONCURRENCY_EXCEEDS_PHYSICAL" },
+    });
+  });
+  it("MCP trusted actor prevents a human-only paid policy mutation before database work", async () => {
+    db.modelPool.findUnique.mockClear();
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_model_pool_update", {
+      id: "pool-1",
+      paidWarmProtectionEnabled: true,
+    });
+    expect(body.result?.structuredContent).toEqual({ error: { code: "FORBIDDEN" } });
+    expect(db.modelPool.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("deployment command tools are hidden without PAT consent and visible with it", async () => {
+    const handler = createMcpTransport();
+    const oauth = buildAuthInfo(["mcp:write"]);
+    bindRequest(oauth, "deployment-oauth", { kind: "oauth" });
+    const oauthResult = await handler.fetch(toolsListRequest(902), { authInfo: oauth });
+    const oauthBody = (await oauthResult.json()) as { result: { tools: Array<{ name: string }> } };
+    expect(oauthBody.result.tools.map((tool) => tool.name)).not.toContain("deployment_plan_apply");
+    const pat = buildAuthInfo(["mcp:write"]);
+    bindRequest(pat, "deployment-pat", {
+      kind: "pat",
+      tokenId: "pat-1",
+      allowCliCommands: true,
+      allowCliFileRead: false,
+      scopes: ["mcp:write"],
+      expiresAt: null,
+    });
+    const patResult = await handler.fetch(toolsListRequest(903), { authInfo: pat });
+    const patBody = (await patResult.json()) as { result: { tools: Array<{ name: string }> } };
+    expect(patBody.result.tools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining([
+        "deployment_plan_start",
+        "deployment_plan_stop",
+        "deployment_plan_apply",
+        "deployment_config_create",
+      ]),
+    );
+  });
   it("tools/list advertises the real required fields of a procedure-backed tool", async () => {
     const handler = createMcpTransport();
     const response = await handler.fetch(toolsListRequest(21), undefined);
@@ -705,6 +831,53 @@ describe("error mapping", () => {
     // The app-authored oRPC message is never copied to the tool output.
     expect(JSON.stringify(body)).not.toContain("Model API token not found");
   });
+
+  it.each([
+    {
+      tool: "forwarder_cli_device_get",
+      args: { cliDeviceId: "cli-other-owner" },
+      mock: () =>
+        vi
+          .mocked(prisma.cliDevice.findUnique)
+          .mockResolvedValue({ id: "cli-other-owner", userId: "user-2" } as never),
+      appMessage: "CLI device not found.",
+    },
+    {
+      tool: "forwarder_model_pool_get",
+      args: { poolId: "pool-other-owner" },
+      mock: () =>
+        vi
+          .mocked(prisma.modelPool.findUnique)
+          .mockResolvedValue({ id: "pool-other-owner", userId: "user-2" } as never),
+      appMessage: "Model pool not found.",
+    },
+  ])(
+    "$tool hides another owner's id as NOT_FOUND through the manifest tool",
+    async ({ tool, args, mock, appMessage }) => {
+      mock();
+      const descriptor = MCP_TOOL_MANIFEST.find((entry) => entry.name === tool);
+      if (!descriptor) throw new Error(`missing manifest tool ${tool}`);
+      const orpcContext = createMcpContext({
+        user: USER,
+        expiresAt: new Date("2026-01-01T00:00:00Z"),
+        now: new Date("2025-06-01T00:00:00Z"),
+        services: undefined,
+      });
+      const { createRouterClient } = await import("@orpc/server");
+      const { appRouter } = await import("@ws-model-proxy/api/routers/index");
+      const result = await runManifestTool(descriptor, {
+        dispatch: { orpcContext, requestId: "req-42" },
+        scopes: ["mcp:read"],
+        client: createRouterClient(appRouter, { context: orpcContext }),
+        args,
+      });
+      expect(result.isError).toBe(true);
+      expect(resultText(result)).toBe("Not found");
+      expect(result.structuredContent).toMatchObject({ error: { code: "NOT_FOUND" } });
+      expect(JSON.stringify(result)).not.toContain(appMessage);
+      expect(JSON.stringify(result)).not.toContain("user-2");
+    },
+  );
 
   it("unknown failures become the generic internal error with the request id, never the cause", async () => {
     db.modelApiToken.findUnique.mockRejectedValue(
@@ -1114,7 +1287,7 @@ describe("G3 — JSON→Date input adaptation", () => {
     expect(body.result?.isError).toBe(true);
     expect(body.result?.content?.[0]?.text).toContain('"createdAfter"');
     expect(body.result?.structuredContent).toMatchObject({
-      error: { code: "INVALID_INPUT", field: "createdAfter" },
+      error: { code: "invalid_input", fields: ["createdAfter"] },
     });
     expect(findMany).not.toHaveBeenCalled();
   });
@@ -1127,10 +1300,10 @@ describe("G3 — JSON→Date input adaptation", () => {
       staleBefore: "2025-12-31T00:00:00Z",
       confirm: "DELETE",
     });
-    // The procedure ran (some downstream outcome), NOT an INVALID_INPUT
+    // The procedure ran (some downstream outcome), NOT an invalid_input
     // adapter error — the Date conversion satisfied z.date().
     expect(body.result?.structuredContent).not.toMatchObject({
-      error: { code: "INVALID_INPUT" },
+      error: { code: "invalid_input" },
     });
   });
 });

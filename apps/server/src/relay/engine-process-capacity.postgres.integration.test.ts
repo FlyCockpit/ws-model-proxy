@@ -38,7 +38,8 @@ vi.mock("@ws-model-proxy/db/capacity-lock-order", async (importOriginal) => {
   };
 });
 
-integration("engine process capacity lifecycle", () => {
+// A cold database (first connection, plan cache) can exceed the 5 s default.
+integration("engine process capacity lifecycle", { timeout: 30_000 }, () => {
   let fixture: ReturnType<typeof createFixturePrismaClient>;
   let modules: {
     registration: typeof import("./registration.js");

@@ -28,10 +28,44 @@ vi.mock("@ws-model-proxy/db", () => ({
   },
 }));
 
-const { assertPoolGrantSpendRules, poolGrantSpendCapSchema, serializePoolGrantSpendCap } =
-  await import("./pool-grant-spend-cap");
+const {
+  assertPoolGrantSpendRules,
+  poolGrantSpendCapSchema,
+  resolvePoolSpendCurrency,
+  serializePoolGrantSpendCap,
+} = await import("./pool-grant-spend-cap");
 
 describe("pool grant spend cap", () => {
+  it("accepts the exact Decimal(30,9) boundary without binary floating-point rounding", () => {
+    expect(
+      poolGrantSpendCapSchema.safeParse({
+        limit: "999999999999999999999.999999999",
+        currency: "USD",
+        period: "UTC_DAY",
+      }).success,
+    ).toBe(true);
+    expect(
+      poolGrantSpendCapSchema.safeParse({
+        limit: "0.000000001",
+        currency: "USD",
+        period: "UTC_DAY",
+      }).success,
+    ).toBe(true);
+    expect(
+      poolGrantSpendCapSchema.safeParse({
+        limit: "0.000000000",
+        currency: "USD",
+        period: "UTC_DAY",
+      }).success,
+    ).toBe(false);
+    expect(
+      poolGrantSpendCapSchema.safeParse({
+        limit: "1000000000000000000000",
+        currency: "USD",
+        period: "UTC_DAY",
+      }).success,
+    ).toBe(false);
+  });
   it("serializes the active SPEND rule and ignores empty policies", () => {
     expect(serializePoolGrantSpendCap(undefined)).toBeNull();
     expect(serializePoolGrantSpendCap([])).toBeNull();
@@ -88,5 +122,48 @@ describe("pool grant spend cap", () => {
         fields: ["fallbackSpend"],
       });
     }
+  });
+});
+
+describe("resolvePoolSpendCurrency", () => {
+  function txWith(versionsByMember: Array<Array<{ currency: string; status: string }>>) {
+    return {
+      poolMember: {
+        findMany: vi.fn().mockResolvedValue(
+          versionsByMember.map((PricingVersions) => ({
+            ExecutionTarget: { ProviderModel: { PricingVersions } },
+          })),
+        ),
+      },
+    } as unknown as Parameters<typeof resolvePoolSpendCurrency>[0];
+  }
+
+  it("takes the active version's currency over a newer retired one", async () => {
+    await expect(
+      resolvePoolSpendCurrency(
+        txWith([
+          [
+            { currency: "EUR", status: "RETIRED" },
+            { currency: "USD", status: "ACTIVE" },
+          ],
+        ]),
+        { userId: "owner", poolId: "pool" },
+      ),
+    ).resolves.toBe("USD");
+  });
+
+  it("falls back to the newest retired version, and returns null for mixed currencies", async () => {
+    await expect(
+      resolvePoolSpendCurrency(txWith([[{ currency: "EUR", status: "RETIRED" }]]), {
+        userId: "owner",
+        poolId: "pool",
+      }),
+    ).resolves.toBe("EUR");
+    await expect(
+      resolvePoolSpendCurrency(
+        txWith([[{ currency: "EUR", status: "ACTIVE" }], [{ currency: "USD", status: "ACTIVE" }]]),
+        { userId: "owner", poolId: "pool" },
+      ),
+    ).resolves.toBeNull();
   });
 });

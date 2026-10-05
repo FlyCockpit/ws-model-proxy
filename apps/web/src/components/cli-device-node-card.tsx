@@ -2,6 +2,7 @@ import { useForm } from "@tanstack/react-form";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   gpuBudgetKey,
+  gpuBudgetMap,
   NODE_BUDGET_MAX_GB,
   NODE_LABEL_PATTERN,
   NODE_LABELS_MAX,
@@ -43,6 +44,13 @@ function gpuKey(gpu: NodeCardSnapshot["gpus"][number]): string {
 function formatBudgetInput(value: number): string {
   if (!Number.isFinite(value) || value < 0) return "";
   const rounded = Math.round(value * 1e9) / 1e9;
+  if (rounded === 0 && value > 0) {
+    const text = String(value);
+    const [mantissa, exponent] = text.split("e-");
+    if (!exponent || !mantissa) return text;
+    const digits = mantissa.replace(".", "");
+    return `0.${"0".repeat(Number(exponent) - 1)}${digits}`;
+  }
   if (rounded === 0) return "0";
   return rounded.toFixed(9).replace(/\.?0+$/, "");
 }
@@ -61,16 +69,22 @@ function parseBudgetInput(raw: string, locale: string): number | null {
 function budgetInputSchema(
   invalidMessage: string,
   locale: string,
-  options?: { maxGb?: number | null; exceedsMessage?: string },
+  options?: { maxGb?: number | null; exceedsMessage?: string; whileTyping?: boolean },
 ) {
   return z.string().superRefine((raw, ctx) => {
+    // A lone decimal separator is an unfinished entry while typing, not an error.
+    if (options?.whileTyping && /^[.,]$/.test(raw.trim())) return;
     const value = parseLocaleDecimal(raw, locale);
     if (value === null) {
       ctx.addIssue({ code: "custom", message: invalidMessage });
       return;
     }
     if (value === "") return;
-    if (!/^\d+(\.\d+)?$/.test(value) || Number(value) < 0 || Number(value) > NODE_BUDGET_MAX_GB) {
+    if (
+      !/^(\d+(\.\d*)?|\.\d+)$/.test(value) ||
+      Number(value) < 0 ||
+      Number(value) > NODE_BUDGET_MAX_GB
+    ) {
       ctx.addIssue({ code: "custom", message: invalidMessage });
       return;
     }
@@ -404,7 +418,7 @@ function LabelsForm({
     }),
     meta: { skipGlobalErrorToast: true },
   });
-  const commitDraft = (labels: string[]): string[] | null => {
+  const commitDraft = (labels: string[], clear = true): string[] | null => {
     const next = draft.trim().toLowerCase();
     if (!next) return labels;
     if (!NODE_LABEL_PATTERN.test(next)) {
@@ -419,17 +433,33 @@ function LabelsForm({
       setDraftError(t("dashboard:clis.node.labelsMax", { max: NODE_LABELS_MAX }));
       return null;
     }
-    setDraft("");
     setDraftError(null);
+    if (clear) setDraft("");
     return [...labels, next];
   };
   const form = useForm({
     defaultValues: { labels: [...node.labels] },
-    validators: { onSubmit: z.object({ labels: nodeLabelsSchema }) },
+    validators: {
+      onSubmit: z.object({
+        labels: z.array(z.string()).superRefine((labels, ctx) => {
+          const result = nodeLabelsSchema.safeParse(labels);
+          if (!result.success)
+            for (const issue of result.error.issues)
+              ctx.addIssue({
+                code: "custom",
+                path: issue.path,
+                message: t("dashboard:clis.node.invalidLabel"),
+              });
+        }),
+      }),
+    },
     onSubmit: async ({ value }) => {
-      const labels = commitDraft(value.labels);
+      const labels = commitDraft(value.labels, false);
       if (labels === null) return;
-      await save.mutateAsync({ cliDeviceId, labels }).catch(() => undefined);
+      await save
+        .mutateAsync({ cliDeviceId, labels })
+        .then(() => setDraft(""))
+        .catch(() => undefined);
     },
   });
 
@@ -570,7 +600,9 @@ function BudgetsForm({
   const showRam = node.kind !== "unified";
   const invalidBudget = t("dashboard:clis.node.invalidBudget");
   const exceedsMessage = (total: number | null | undefined) =>
-    t("dashboard:clis.node.budgetExceedsTotal", { total: formatGb(total) });
+    total == null
+      ? t("dashboard:clis.node.budgetExceedsUnknownTotal")
+      : t("dashboard:clis.node.budgetExceedsTotal", { total: String(total) });
   const [serverErrors, setServerErrors] = useState<Record<string, string>>({});
   const save = useMutation({
     ...orpc.forwarderManagement.setCliDeviceUsableBudgets.mutationOptions({
@@ -598,20 +630,23 @@ function BudgetsForm({
     }),
     meta: { skipGlobalErrorToast: true },
   });
-  const visibleBudget = (maxGb: number | null | undefined) =>
-    budgetInputSchema(invalidBudget, locale, {
-      maxGb,
-      exceedsMessage: exceedsMessage(maxGb),
-    });
-  const budgetsSchema = z.object({
-    usableMemoryGb: showMemory ? visibleBudget(node.memoryTotalGb) : z.string(),
-    usableRamGb: showRam ? visibleBudget(node.memoryTotalGb) : z.string(),
-    vram: z.object(
-      Object.fromEntries(
-        node.gpus.map((gpu) => [String(gpu.index), visibleBudget(gpu.vramTotalGb)]),
+  const budgetsSchema = (whileTyping: boolean) => {
+    const visibleBudget = (maxGb: number | null | undefined) =>
+      budgetInputSchema(invalidBudget, locale, {
+        maxGb,
+        exceedsMessage: exceedsMessage(maxGb),
+        whileTyping,
+      });
+    return z.object({
+      usableMemoryGb: showMemory ? visibleBudget(node.memoryTotalGb) : z.string(),
+      usableRamGb: showRam ? visibleBudget(node.memoryTotalGb) : z.string(),
+      vram: z.object(
+        Object.fromEntries(
+          node.gpus.map((gpu) => [String(gpu.index), visibleBudget(gpu.vramTotalGb)]),
+        ),
       ),
-    ),
-  });
+    });
+  };
   const form = useForm({
     defaultValues: {
       usableMemoryGb: budgetInputValue(node.usableMemoryGb, node.usableMemoryGbDefault),
@@ -624,8 +659,9 @@ function BudgetsForm({
       ) as Record<string, string>,
     },
     validators: {
-      onChange: budgetsSchema,
-      onSubmit: budgetsSchema,
+      onChange: budgetsSchema(true),
+      onBlur: budgetsSchema(false),
+      onSubmit: budgetsSchema(false),
     },
     onSubmit: async ({ value }) => {
       setServerErrors({});
@@ -633,7 +669,7 @@ function BudgetsForm({
         ? parseBudgetInput(value.usableMemoryGb, locale)
         : undefined;
       const usableRamGb = showRam ? parseBudgetInput(value.usableRamGb, locale) : undefined;
-      const usableVramGb: Record<string, number> = {};
+      const usableVramGb = gpuBudgetMap<number>();
       for (const gpu of node.gpus) {
         const parsed = parseBudgetInput(value.vram[String(gpu.index)] ?? "", locale);
         if (parsed !== null) usableVramGb[gpuKey(gpu)] = parsed;
@@ -772,6 +808,8 @@ function BudgetField({
         name={field.name}
         className="min-h-11"
         inputMode="decimal"
+        aria-invalid={messages.length > 0}
+        aria-describedby={messages.length > 0 ? `${id}-errors` : undefined}
         autoComplete="off"
         value={field.state.value}
         onBlur={field.handleBlur}
@@ -780,11 +818,13 @@ function BudgetField({
           onValueChange?.();
         }}
       />
-      {messages.map((message) => (
-        <p key={message} className="text-sm text-destructive">
-          {message}
-        </p>
-      ))}
+      <div id={`${id}-errors`}>
+        {messages.map((message) => (
+          <p key={message} className="text-sm text-destructive">
+            {message}
+          </p>
+        ))}
+      </div>
     </div>
   );
 }

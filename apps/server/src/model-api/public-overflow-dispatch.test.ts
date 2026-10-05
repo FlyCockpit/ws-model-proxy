@@ -120,6 +120,15 @@ vi.mock("./provider-budget.js", () => ({
   reconcileProviderBudget,
 }));
 const rememberAffinity = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock("./cache-affinity-residency.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./cache-affinity-residency.js")>();
+  return {
+    ...actual,
+    captureAffinityTargetGenerations: vi.fn(async (targets: Array<{ executionTargetId: string }>) =>
+      targets.map((target) => ({ ...target, cacheGeneration: "" })),
+    ),
+  };
+});
 vi.mock("./cache-affinity.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./cache-affinity.js")>();
   return { ...actual, rememberAffinity };
@@ -3659,6 +3668,68 @@ describe("OpenRouter owner-paid settlement", () => {
           usage: expect.objectContaining({ categoriesComplete: false }),
         }),
       );
+    });
+
+    // OpenRouter Responses terminals are data-only (no `event:` line). Seeing
+    // one must not settle as COMPLETED when the transport is then cut before a
+    // clean end of stream: the liability stays retained.
+    const dataOnlyResponsesTerminal = Buffer.from(
+      `data: ${JSON.stringify({
+        type: "response.completed",
+        response: { status: "completed", usage: responsesUsage(14, 0.00008) },
+      })}\n\n`,
+    );
+
+    it("retains liability when EOF without transport completion follows a data-only terminal", async () => {
+      // Control: the same record with a completed transport settles cleanly,
+      // so the failure below is the cut, not an unrecognized terminal.
+      const clean = await startOwnerStream(
+        "openrouter",
+        [dataOnlyResponsesTerminal],
+        "owner",
+        "openai-responses",
+      );
+      await clean.response.text();
+      expect(await clean.terminal).toMatchObject({ ok: true });
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: "COMPLETED", observationComplete: true }),
+      );
+
+      const result = await startOwnerStream(
+        "openrouter",
+        [dataOnlyResponsesTerminal],
+        "owner",
+        "openai-responses",
+        false,
+      );
+      expect(await result.response.text()).toBe(dataOnlyResponsesTerminal.toString());
+      expect(await result.terminal).toMatchObject({ ok: false });
+      expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: "FAILED",
+          observationComplete: false,
+          usage: expect.objectContaining({ categoriesComplete: false }),
+        }),
+      );
+    });
+
+    it("retains liability when the socket resets after a data-only terminal", async () => {
+      const upstream = new Readable({ read() {} });
+      try {
+        const result = await startOwnerStream("openrouter", upstream, "owner", "openai-responses");
+        upstream.push(dataOnlyResponsesTerminal);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        upstream.destroy(new Error("socket reset after the data-only terminal"));
+        await result.response.text().catch(() => undefined);
+        expect(await result.terminal).toMatchObject({ ok: false });
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+        expect(reconcileProviderBudget).toHaveBeenCalledWith(
+          expect.objectContaining({ reason: "FAILED", observationComplete: false }),
+        );
+      } finally {
+        upstream.destroy();
+      }
     });
 
     it("holds a clean EOF terminal until settlement is durable", async () => {

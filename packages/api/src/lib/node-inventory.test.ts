@@ -1,17 +1,24 @@
+import { ZodToJsonSchemaConverter } from "@orpc/zod/zod4";
+import { DEPLOYMENT_PROTOCOL_VERSION } from "@ws-model-proxy/config/deployment-protocol";
 import { describe, expect, it } from "vitest";
+import { type DeploymentNode, planDeployment } from "./deployment-planner";
+import { deploymentVariantSchema } from "./deployment-spec";
 import {
   assertUsableBudgetWrite,
   buildNodeCardSnapshot,
   defaultUsableVramGb,
+  gpuBudgetJson,
   gpuBudgetKey,
   NODE_GPU_VRAM_RESERVE_GB,
   NODE_MEMORY_RESERVE_GB,
   NODE_VRAM_KEYS_MAX,
-  nodeHasAllLabels,
   nodeHealthWarnings,
   nodeLabelsSchema,
+  nodeUsableBudgetsInputSchema,
   normalizeNodeLabels,
+  ownGpuBudget,
   parseNodeInfo,
+  parseUsableVramGb,
   resolveUsableBudgets,
   shapeNodeMetricsMinute,
   shapeNodeMetricsRange,
@@ -94,12 +101,12 @@ describe("suggestNodeLabels", () => {
     ).toEqual(["apple-m4", "unified-memory"]);
   });
 
-  it("suggests low-power for a small CPU-only node", () => {
+  it("does not infer power consumption from memory capacity", () => {
+    for (const nodeKind of ["cpu", "discrete", "unified"] as const) {
+      expect(suggestNodeLabels({ nodeKind, memoryTotalMiB: 16 * 1024 })).not.toContain("low-power");
+    }
     expect(
-      suggestNodeLabels({
-        nodeKind: "cpu",
-        memoryTotalMiB: 8 * 1024,
-      }),
+      buildNodeCardSnapshot({ nodeInfo: {}, nodeMetrics: null, labels: ["low-power"] }).labels,
     ).toEqual(["low-power"]);
   });
 });
@@ -118,15 +125,158 @@ describe("node labels", () => {
     expect(nodeLabelsSchema.safeParse(["dgx-spark", "dgx-spark"]).success).toBe(false);
     expect(nodeLabelsSchema.safeParse(["dgx-spark", "unified-memory"]).success).toBe(true);
   });
-
-  it("matches selectors as has-all-of-these sets", () => {
-    expect(nodeHasAllLabels(["dgx-spark", "unified-memory"], ["dgx-spark"])).toBe(true);
-    expect(nodeHasAllLabels(["dgx-spark"], ["dgx-spark", "unified-memory"])).toBe(false);
-    expect(nodeHasAllLabels(["dgx-spark"], [])).toBe(true);
-  });
 });
 
 describe("usable budgets", () => {
+  it("serializes the GPU dictionary through Prisma JSON input without interpreting a toJSON GPU key", () => {
+    const map = usableVramGbSchema.parse(
+      Object.fromEntries([
+        ["__proto__", 6.25],
+        ["toJSON", 0],
+      ]),
+    );
+    expect(JSON.parse(JSON.stringify(gpuBudgetJson(map)))).toEqual(
+      Object.fromEntries([
+        ["__proto__", 6.25],
+        ["toJSON", 0],
+      ]),
+    );
+  });
+  it("documents the same numeric GPU dictionary on the OpenAPI input boundary", () => {
+    const [, json] = new ZodToJsonSchemaConverter().convert(usableVramGbSchema, {
+      strategy: "input",
+    });
+    expect(json).toMatchObject({
+      type: "object",
+      maxProperties: NODE_VRAM_KEYS_MAX,
+      additionalProperties: { type: "number", minimum: 0, maximum: 1000000 },
+      not: { type: "null" },
+    });
+    expect(json.not).not.toEqual({});
+    expect(json.propertyNames).toBeDefined();
+  });
+  it.each(["__proto__", "constructor", "toString", "GPU-aaa", "index:0"])(
+    "retains accepted GPU key %s through defaults, input/storage JSON, cards and placement",
+    (key) => {
+      const info = {
+        nodeKind: "discrete" as const,
+        memoryTotalMiB: 32 * 1024,
+        gpus: [{ index: 0, ...(key === "index:0" ? {} : { uuid: key }), vramTotalMiB: 8192 }],
+      };
+      expect(gpuBudgetKey(info.gpus[0]!)).toBe(key);
+      const defaults = defaultUsableVramGb(info);
+      expect(Object.hasOwn(defaults, key)).toBe(true);
+      expect(defaults[key]).toBe(7.5);
+      expect(Object.getPrototypeOf(defaults)).toBeNull();
+      const input = nodeUsableBudgetsInputSchema.parse({
+        usableVramGb: JSON.parse(JSON.stringify(Object.fromEntries([[key, 6.25]]))),
+      });
+      expect(Object.hasOwn(input.usableVramGb!, key)).toBe(true);
+      const persisted = JSON.parse(JSON.stringify(input.usableVramGb));
+      expect(parseUsableVramGb(persisted)?.[key]).toBe(6.25);
+      const resolved = resolveUsableBudgets(info, { usableVramGb: persisted });
+      expect(resolved.usableVramGb[key]).toBe(6.25);
+      expect(Object.hasOwn(resolved.usableVramGbDefaults, key)).toBe(true);
+      expect(resolved.usableVramGbDefaults[key]).toBe(false);
+      expect(resolveUsableBudgets(info, {}).usableVramGbDefaults[key]).toBe(true);
+      expect(resolveUsableBudgets(info, { usableVramGb: null }).usableVramGb[key]).toBe(7.5);
+      expect(assertUsableBudgetWrite(info, input)).toBeNull();
+      expect(
+        assertUsableBudgetWrite(info, { usableVramGb: Object.fromEntries([[key, 8.01]]) })?.fields,
+      ).toEqual([`usableVramGb.${key}`]);
+      for (const [stored, expected, isDefault] of [
+        [undefined, 7.5, true],
+        [persisted, 6.25, false],
+      ] as const) {
+        const card = JSON.parse(
+          JSON.stringify(
+            buildNodeCardSnapshot({
+              nodeInfo: info,
+              nodeMetrics: null,
+              labels: [],
+              usableVramGb: stored,
+            }),
+          ),
+        );
+        expect(card.gpus[0].usableVramGb).toBe(expected);
+        expect(card.gpus[0].usableVramGbDefault).toBe(isDefault);
+      }
+      const deploymentNode: DeploymentNode = {
+        id: "gpu-node",
+        online: true,
+        protocolVersion: DEPLOYMENT_PROTOCOL_VERSION,
+        allowDeployments: true,
+        reportedDeployments: true,
+        mode: "UNSUPERVISED",
+        localMode: "UNSUPERVISED",
+        execution: "systemd+linger",
+        labels: [],
+        info,
+        budgets: resolved,
+        portStart: 30000,
+        portEnd: 30010,
+      };
+      const variant = deploymentVariantSchema.parse({
+        key: "gpu",
+        groupSize: 1,
+        labels: [],
+        resources: [{ kind: "discrete", gpuCount: 1, vramGb: 6.25 }],
+        commands: [{ management: "ownedProcess", start: "serve", stop: "stop" }],
+        readiness: {},
+        models: ["gpu-model"],
+        attachment: { type: "llm", poolId: "pool" },
+        hardConcurrencyLimit: 1,
+      });
+      const plan = () =>
+        planDeployment({
+          nodes: [deploymentNode],
+          existing: [],
+          variant,
+          groupCount: 1,
+          actor: "USER",
+        });
+      expect(plan().placements[0]?.resources.gpus).toEqual([{ key, index: 0, vramGb: 6.25 }]);
+      deploymentNode.budgets = resolveUsableBudgets(info, {
+        usableVramGb: Object.fromEntries([[key, 0]]),
+      });
+      expect(() => plan()).toThrow("exceed usable budgets");
+      expect(Object.getPrototypeOf(persisted)).toBe(Object.prototype);
+    },
+  );
+
+  it("ignores inherited lookup values and rejects inherited/non-record inputs and invalid own values", () => {
+    expect(ownGpuBudget({}, "constructor")).toBeUndefined();
+    expect(ownGpuBudget(Object.create({ "GPU-aaa": 7 }), "GPU-aaa")).toBeUndefined();
+    for (const input of [Object.create({ "GPU-aaa": 7 }), [], new Date(), null, 3]) {
+      expect(usableVramGbSchema.safeParse(input).success).toBe(false);
+      expect(parseUsableVramGb(input)).toBeNull();
+    }
+    for (const value of [-1, Number.NaN, Number.POSITIVE_INFINITY, "7.5", {}, 1000001]) {
+      expect(usableVramGbSchema.safeParse(Object.fromEntries([["__proto__", value]])).success).toBe(
+        false,
+      );
+    }
+    expect(usableVramGbSchema.parse({})).toEqual({});
+    const nullPrototype: Record<string, number> = Object.create(null);
+    const prototypeKey = "__proto__";
+    nullPrototype[prototypeKey] = 0;
+    expect(usableVramGbSchema.parse(nullPrototype)[prototypeKey]).toBe(0);
+    const missing = buildNodeCardSnapshot({
+      nodeInfo: { nodeKind: "discrete", gpus: [{ index: 0, uuid: "constructor" }] },
+      nodeMetrics: null,
+      labels: [],
+    });
+    expect(missing.gpus[0]?.usableVramGb).toBeNull();
+    expect(missing.gpus[0]?.usableVramGbDefault).toBe(true);
+  });
+
+  it("uses the same reserved index grammar for reported UUIDs and mutation keys", () => {
+    expect(gpuBudgetKey({ index: 0, uuid: " index:999 " })).toBe("index:0");
+    expect(gpuBudgetKey({ index: 0, uuid: "index:01" })).toBe("index:0");
+    expect(gpuBudgetKey({ index: 0, uuid: " index:255 " })).toBe("index:255");
+    expect(gpuBudgetKey({ index: 0, uuid: " GPU.uuid:0 " })).toBe("GPU.uuid:0");
+    expect(usableVramGbSchema.safeParse({ "index:999": 1 }).success).toBe(false);
+  });
   it("defaults unified memory to total minus 2 GB with no percentage cap", () => {
     const info = parseNodeInfo({
       nodeKind: "unified",
@@ -215,10 +365,10 @@ describe("usable budgets", () => {
     ]);
     expect(assertUsableBudgetWrite(discrete, { usableRamGb: 40 })?.fields).toEqual(["usableRamGb"]);
     expect(assertUsableBudgetWrite(discrete, { usableVramGb: { "index:9": 8 } })?.fields).toEqual([
-      "usableVramGb",
+      "usableVramGb.index:9",
     ]);
     expect(assertUsableBudgetWrite(discrete, { usableVramGb: { "GPU-aaa": 30 } })?.fields).toEqual([
-      "usableVramGb",
+      "usableVramGb.GPU-aaa",
     ]);
     expect(
       assertUsableBudgetWrite(

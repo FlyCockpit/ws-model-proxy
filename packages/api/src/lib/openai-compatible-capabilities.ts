@@ -4,6 +4,7 @@
  * cannot drift.
  */
 import { z } from "zod";
+import { embeddingContractSchema } from "./embedding-contract";
 import { reasoningConfigSchema, validateSurfaceReasoningConfig } from "./reasoning-contract";
 
 const booleanSupportSchema = z.boolean().optional();
@@ -57,6 +58,7 @@ const commonCapabilityShape = {
   embeddings: z
     .object({
       supported: booleanSupportSchema,
+      contract: embeddingContractSchema.optional(),
     })
     .strict()
     .optional(),
@@ -239,6 +241,7 @@ const v4CapabilitiesSchema = z
     embeddings: z
       .object({
         supported: booleanSupportSchema,
+        contract: embeddingContractSchema.optional(),
       })
       .strict()
       .optional(),

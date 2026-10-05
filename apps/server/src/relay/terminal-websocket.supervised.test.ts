@@ -2,7 +2,7 @@ import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credentia
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { generateTestHelloIdentity } from "./hello-identity.js";
-import { encodeRelayBinaryFrame } from "./protocol.js";
+import { encodeRelayBinaryFrame, RELAY_MIN_PROTOCOL_VERSION } from "./protocol.js";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
@@ -118,7 +118,7 @@ function hello(socket: FakeSocket, terminalApproval = false) {
   return JSON.stringify({
     type: "hello",
     id: "hello-desktop",
-    protocolVersion: "2.4",
+    protocolVersion: RELAY_MIN_PROTOCOL_VERSION,
     cli: {
       slug: "desktop",
       hostname: "desktop.local",

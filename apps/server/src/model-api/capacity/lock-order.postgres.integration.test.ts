@@ -1029,6 +1029,23 @@ integration("admission scope-set validation under capacity fences (#139)", () =>
       try {
         if (row.mutation === "replace" || row.mutation === "remove" || row.mutation === "unchanged")
           initial = await db.$transaction((tx) => setup.seed(tx, "initial", 0, true));
+        if (row.mutation === "replace") {
+          await expect(
+            db.admissionRequest.update({
+              where: { id: initial!.admissionRequestId },
+              data: { poolId: setup.pool.id },
+            }),
+          ).rejects.toThrow(/admission historical request identity is immutable/);
+          expect(
+            await db.admissionRequest.findUniqueOrThrow({
+              where: { id: initial!.admissionRequestId },
+            }),
+          ).toMatchObject({
+            poolId: setup.oldPool.id,
+            requestId: initial!.requestId,
+            attemptId: initial!.attemptId,
+          });
+        }
         if (row.mutation === "shared") await db.$transaction((tx) => setup.seed(tx, "shared-b", 1));
         holderSide = holder.$transaction(
           async (tx) => {
@@ -1039,22 +1056,9 @@ integration("admission scope-set validation under capacity fences (#139)", () =>
               await tx.capacityWaiter.delete({ where: { id: initial!.id } });
             }
             if (row.mutation === "replace") {
-              // Preserve both request and waiter identity across replacement:
-              // its scope changes MEMBER -> POOL without bypassing the
-              // immutable-policy UPDATE trigger.
-              await tx.admissionRequest.update({
-                where: { id: initial!.admissionRequestId },
-                data: { poolId: setup.pool.id },
-              });
-              await tx.capacityWaiter.create({
-                data: {
-                  ...initial!,
-                  poolId: setup.pool.id,
-                  poolMemberId: setup.candidates[0]!.poolMemberId,
-                  effectiveConcurrencyScope: "POOL",
-                  effectiveConcurrencyScopeId: setup.pool.id,
-                },
-              });
+              // Request authorization identity is durable. A replacement
+              // waiter for another pool is a new logical admission/attempt.
+              await setup.seed(tx, "replacement", 0);
             }
             if (row.mutation === "join" || row.mutation === "shared")
               await setup.seed(tx, "joined-a", 0);

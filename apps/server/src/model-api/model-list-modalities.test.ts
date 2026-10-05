@@ -91,6 +91,7 @@ describe("openAiModelListExtensions", () => {
     expect(ext.supports_video_input).toBe(true);
     expect(ext.supports_audio_input).toBe(true);
     expect(ext.capabilities).toEqual({
+      embeddings: false,
       vision: true,
       video_input: true,
       audio_input: true,

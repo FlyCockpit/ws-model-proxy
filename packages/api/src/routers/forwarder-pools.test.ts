@@ -33,6 +33,7 @@ describe("forwarderManagementRouter pools", () => {
     );
     db.poolMember.count.mockResolvedValue(0);
     db.poolGrant.findMany.mockResolvedValue([]);
+    db.inferenceContribution.findMany.mockResolvedValue([]);
     db.poolGrant.findFirst.mockResolvedValue(null);
     db.$queryRaw.mockResolvedValue([]);
     db.executionTarget.upsert.mockResolvedValue({ id: "target-id" });
@@ -2414,6 +2415,7 @@ describe("forwarderManagementRouter pools", () => {
   });
 
   it("reports and clears cache affinity only after verifying pool ownership", async () => {
+    db.$queryRaw.mockResolvedValue([]);
     db.modelPool.findUnique.mockResolvedValue({ id: "pool-id", userId: "user-id" });
     db.cacheAffinityNode.count.mockResolvedValue(3);
     db.cacheAffinityNode.deleteMany.mockResolvedValue({ count: 3 });
@@ -2433,10 +2435,8 @@ describe("forwarderManagementRouter pools", () => {
     expect(stats.activeRecords).toBe(7);
     expect(stats.confirmedRecords).toBe(2);
     expect(stats.activeNodes).toBe(3);
-    expect(cleared).toEqual({ deleted: 10 });
-    expect(db.cacheAffinityRecord.deleteMany).toHaveBeenCalledWith({
-      where: { userId: "user-id", poolId: "pool-id" },
-    });
+    expect(cleared).toEqual({ cleared: true, reclamation: "pending" });
+    expect(db.cacheAffinityRecord.deleteMany).not.toHaveBeenCalled();
   });
 
   it("does not reveal or mutate another owner's affinity records", async () => {
@@ -3258,6 +3258,8 @@ describe("forwarderManagementRouter pools", () => {
           fallbackEnabled: false,
         });
         db.modelPool.delete.mockResolvedValue({ id: "pool-id" });
+        db.deploymentConfig.findMany.mockResolvedValue([]);
+        db.deploymentConfig.updateMany.mockResolvedValue({ count: 1 });
         await expect(client().deleteModelPool({ id: "pool-id" })).resolves.toEqual({
           deleted: true,
         });
@@ -3268,6 +3270,33 @@ describe("forwarderManagementRouter pools", () => {
         expect(fenceParentDelete.mock.invocationCallOrder.at(-1) ?? Number.NaN).toBeLessThan(
           db.modelPool.delete.mock.invocationCallOrder.at(-1) ?? Number.NaN,
         );
+        // The pool row is locked after the fences, then recipes are detached before the delete.
+        expect(fenceParentDelete.mock.invocationCallOrder.at(-1) ?? Number.NaN).toBeLessThan(
+          db.$queryRaw.mock.invocationCallOrder.at(-1) ?? Number.NaN,
+        );
+        expect(sqlOf(db.$queryRaw.mock.calls.at(-1) as unknown[])).toContain("FOR UPDATE");
+        expect(db.deploymentConfig.updateMany).toHaveBeenCalledWith({
+          where: { poolId: "pool-id" },
+          data: { poolId: null },
+        });
+        expect(
+          db.deploymentConfig.updateMany.mock.invocationCallOrder[0] ?? Number.NaN,
+        ).toBeLessThan(db.modelPool.delete.mock.invocationCallOrder.at(-1) ?? Number.NaN);
+      });
+
+      it("pool: deployments that still run or hold claims refuse the delete", async () => {
+        db.modelPool.findUnique.mockResolvedValue({
+          id: "pool-id",
+          userId: "user-id",
+          fallbackEnabled: false,
+        });
+        db.deploymentConfig.findMany.mockResolvedValue([{ name: "Qwen" }]);
+        await expect(client().deleteModelPool({ id: "pool-id" })).rejects.toMatchObject({
+          code: "CONFLICT",
+          data: { reason: "deployments_running" },
+        });
+        expect(db.deploymentConfig.updateMany).not.toHaveBeenCalled();
+        expect(db.modelPool.delete).not.toHaveBeenCalled();
       });
 
       it("pool: an owner set that keeps changing under the fences is delete_contended", async () => {
@@ -3297,6 +3326,7 @@ describe("forwarderManagementRouter pools", () => {
 describe("MCP pool summaries", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    db.providerBudgetPolicy.findMany.mockResolvedValue([]);
   });
 
   it("pages pool summaries without member models and returns the full pool from get", async () => {
@@ -3306,6 +3336,7 @@ describe("MCP pool summaries", () => {
         createdAt: new Date("2026-01-03T00:00:00Z"),
         slug: "general",
         name: "General",
+        _count: { PoolGrants: 1, PoolMembers: 2 },
         PoolGrants: [
           {
             id: "grant-id",
@@ -3365,6 +3396,23 @@ describe("MCP pool summaries", () => {
     const page = await client().listModelPoolSummaries({});
     expect(page.nextCursor).toBeNull();
     expect(db.modelPool.findMany.mock.calls[0]?.[0]?.take).toBe(21);
+    expect(db.modelPool.findMany.mock.calls[0]?.[0]?.select).toMatchObject({
+      _count: { select: { PoolMembers: true, PoolGrants: true } },
+      PoolMembers: { take: 20 },
+      PoolGrants: { take: 20 },
+    });
+    expect(db.modelPool.findMany.mock.calls[0]?.[0]?.select).not.toHaveProperty(
+      "ProviderBudgetPolicies",
+    );
+    expect(db.providerBudgetPolicy.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: {
+          active: true,
+          scopeType: "POOL_GRANT",
+          OR: [{ poolId: "pool-id", granteeUserId: "grantee" }],
+        },
+      }),
+    );
     expect(page.items).toEqual([
       {
         id: "pool-id",
@@ -3372,6 +3420,8 @@ describe("MCP pool summaries", () => {
         name: "General",
         grantCount: 1,
         memberCount: 2,
+        grantsTruncated: false,
+        membersTruncated: false,
         grants: [
           {
             id: "grant-id",
@@ -3439,6 +3489,78 @@ describe("MCP pool summaries", () => {
         return true;
       },
     );
+  });
+
+  it("bounds a pool with more than 20 grants and members and reports exact counts", async () => {
+    const grant = (index: number) => ({
+      id: `grant-${index}`,
+      createdAt: new Date("2026-01-04T00:00:00Z"),
+      granteeUserId: `grantee-${index}`,
+      protectionOverridePercent: null,
+      queuePriority: null,
+      Grantee: { email: `g${index}@example.com`, name: `G${index}` },
+    });
+    const member = (index: number) => ({
+      id: `member-${index}`,
+      tier: "PRIMARY",
+      healthStatus: "HEALTHY",
+      routingStatus: "ACTIVE",
+      DiscoveredModel: {
+        Endpoint: { slug: `ep-${index}`, CliDevice: { slug: "desk" } },
+      },
+      ExecutionTarget: null,
+    });
+    // Grants come back as `take: 20` returns them; members come back over the
+    // cap to show the serializer still bounds the inline list.
+    db.modelPool.findMany.mockResolvedValue([
+      {
+        id: "pool-id",
+        createdAt: new Date("2026-01-03T00:00:00Z"),
+        slug: "big",
+        name: "Big",
+        _count: { PoolGrants: 45, PoolMembers: 30 },
+        PoolGrants: Array.from({ length: 20 }, (_, index) => grant(index)),
+        PoolMembers: Array.from({ length: 25 }, (_, index) => member(index)),
+      },
+      {
+        id: "pool-exact",
+        createdAt: new Date("2026-01-03T00:00:00Z"),
+        slug: "exact",
+        name: "Exact",
+        _count: { PoolGrants: 20, PoolMembers: 20 },
+        PoolGrants: Array.from({ length: 20 }, (_, index) => grant(100 + index)),
+        PoolMembers: Array.from({ length: 20 }, (_, index) => member(100 + index)),
+      },
+    ]);
+
+    const page = await client().listModelPoolSummaries({});
+    const select = db.modelPool.findMany.mock.calls[0]?.[0]?.select;
+    expect(select?.PoolGrants?.take).toBe(20);
+    expect(select?.PoolMembers?.take).toBe(20);
+    const [big, exact] = page.items;
+    expect(big).toMatchObject({
+      grantCount: 45,
+      memberCount: 30,
+      grantsTruncated: true,
+      membersTruncated: true,
+    });
+    expect(big?.grants).toHaveLength(20);
+    expect(big?.members).toHaveLength(20);
+    expect(big?.grants.at(-1)?.id).toBe("grant-19");
+    expect(JSON.stringify(big)).not.toContain("grant-20");
+    expect(JSON.stringify(big)).not.toContain("ep-20");
+    expect(exact).toMatchObject({
+      grantCount: 20,
+      memberCount: 20,
+      grantsTruncated: false,
+      membersTruncated: false,
+    });
+    // Spend policies are read only for the grantees actually emitted.
+    const policyWhere = db.providerBudgetPolicy.findMany.mock.calls[0]?.[0]?.where as {
+      OR: { poolId: string; granteeUserId: string }[];
+    };
+    expect(policyWhere.OR.filter((entry) => entry.poolId === "pool-id")).toHaveLength(20);
+    expect(policyWhere.OR).not.toContainEqual({ poolId: "pool-id", granteeUserId: "grantee-20" });
   });
 });
 

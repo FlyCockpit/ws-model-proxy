@@ -1,12 +1,16 @@
 import { createRouterClient, ORPCError } from "@orpc/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { RELAY_MIN_PROTOCOL_VERSION } from "../lib/relay-protocol-version";
+
+const [currentMajor, currentMinor] = RELAY_MIN_PROTOCOL_VERSION.split(".").map(Number);
+const nextRelayProtocol = `${currentMajor}.${currentMinor! + 1}`;
+
 import {
   buildContext,
   client,
   db,
   fenceParentDelete,
   forwarderManagementRouter,
-  prisma,
   testEnv,
 } from "./forwarder-test-helpers";
 
@@ -118,6 +122,7 @@ describe("forwarderManagementRouter cli devices", () => {
         lastHeartbeatAt: new Date("2026-01-01T00:00:30Z"),
         connectionCount: 3,
         User: { slug: "renamed-owner" },
+        CliDeviceCredentials: [],
         Endpoints: [
           {
             id: "endpoint-id",
@@ -214,6 +219,7 @@ describe("forwarderManagementRouter cli devices", () => {
         lastHeartbeatAt: new Date("2026-01-01T00:00:30Z"),
         connectionCount: 3,
         User: { slug: "owner" },
+        CliDeviceCredentials: [],
         Endpoints: [
           {
             id: "endpoint-id",
@@ -282,6 +288,7 @@ describe("forwarderManagementRouter cli devices", () => {
   });
 
   it("deletes a device with its credentials and closes their live relay sessions", async () => {
+    db.poolMember.findMany.mockResolvedValue([]);
     db.cliDevice.findFirst.mockResolvedValue({ lastHeartbeatAt: null });
     fenceParentDelete.mockClear();
     db.cliDevice.updateMany.mockResolvedValue({ count: 1 });
@@ -497,6 +504,35 @@ describe("setCliDeviceUsableBudgets", () => {
     vi.clearAllMocks();
   });
 
+  it.each(["__proto__", "constructor", "toString", "GPU-aaa", "index:0"])(
+    "writes accepted GPU key %s unchanged and returns its numeric override",
+    async (key) => {
+      const nodeInfo = {
+        nodeKind: "discrete",
+        memoryTotalMiB: 32768,
+        gpus: [{ index: 0, ...(key === "index:0" ? {} : { uuid: key }), vramTotalMiB: 8192 }],
+      };
+      db.cliDevice.findUnique.mockResolvedValue({ id: "cli-id", userId: "user-id", nodeInfo });
+      db.cliDevice.update.mockImplementation(async (args: { data: { usableVramGb: unknown } }) => ({
+        labels: [],
+        nodeInfo,
+        nodeMetrics: null,
+        usableVramGb: JSON.parse(JSON.stringify(args.data.usableVramGb)),
+      }));
+      const result = await budgetsClient().setCliDeviceUsableBudgets({
+        cliDeviceId: "cli-id",
+        usableVramGb: Object.fromEntries([[key, 6.25]]),
+      });
+      const stored = JSON.parse(
+        JSON.stringify(db.cliDevice.update.mock.calls[0]?.[0].data.usableVramGb),
+      );
+      expect(Object.hasOwn(stored, key)).toBe(true);
+      expect(JSON.parse(JSON.stringify(stored))[key]).toBe(6.25);
+      expect(result.node.gpus[0]?.usableVramGb).toBe(6.25);
+      expect(result.node.gpus[0]?.usableVramGbDefault).toBe(false);
+    },
+  );
+
   it("stores a human-edited unified budget and per-GPU VRAM map", async () => {
     db.cliDevice.findUnique.mockResolvedValue({
       id: "cli-id",
@@ -526,7 +562,10 @@ describe("setCliDeviceUsableBudgets", () => {
     });
     expect(db.cliDevice.update).toHaveBeenCalledWith({
       where: { id: "cli-id" },
-      data: { usableRamGb: 28, usableVramGb: { "GPU-aaa": 23.5 } },
+      data: {
+        usableRamGb: 28,
+        usableVramGb: expect.objectContaining({ toJSON: expect.any(Function) }),
+      },
       select: {
         labels: true,
         nodeInfo: true,
@@ -537,6 +576,10 @@ describe("setCliDeviceUsableBudgets", () => {
       },
     });
     expect(result.node.usableRamGb).toBe(28);
+    expect(JSON.parse(JSON.stringify(db.cliDevice.update.mock.calls[0]?.[0].data))).toEqual({
+      usableRamGb: 28,
+      usableVramGb: { "GPU-aaa": 23.5 },
+    });
     expect(result.node.usableRamGbDefault).toBe(false);
     expect(result.node.gpus[0]?.usableVramGb).toBe(23.5);
   });
@@ -573,6 +616,51 @@ describe("setCliDeviceUsableBudgets", () => {
       }),
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
     expect(db.cliDevice.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("reports the exact offending GPU field and preserves fractional physical bounds", async () => {
+    const nodeInfo = {
+      nodeKind: "discrete",
+      memoryTotalMiB: 32768,
+      gpus: [
+        { index: 0, uuid: "GPU.uuid:0", vramTotalMiB: 24575 },
+        { index: 1, vramTotalMiB: 8192 },
+      ],
+    };
+    db.cliDevice.findUnique.mockResolvedValue({ id: "cli-id", userId: "user-id", nodeInfo });
+    const exact = 24575 / 1024;
+    await expect(
+      budgetsClient().setCliDeviceUsableBudgets({
+        cliDeviceId: "cli-id",
+        usableVramGb: { "GPU.uuid:0": exact + 0.00001, "index:1": 8 },
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST", data: { fields: ["usableVramGb.GPU.uuid:0"] } });
+    await expect(
+      budgetsClient().setCliDeviceUsableBudgets({
+        cliDeviceId: "cli-id",
+        usableVramGb: { "index:9": 1 },
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST", data: { fields: ["usableVramGb.index:9"] } });
+    expect(db.cliDevice.update).not.toHaveBeenCalled();
+    db.cliDevice.update.mockResolvedValue({
+      labels: [],
+      nodeInfo,
+      nodeMetrics: null,
+      usableVramGb: { "GPU.uuid:0": exact, "index:1": 0.125 },
+    });
+    await expect(
+      budgetsClient().setCliDeviceUsableBudgets({
+        cliDeviceId: "cli-id",
+        usableVramGb: { "GPU.uuid:0": exact, "index:1": 0.125 },
+      }),
+    ).resolves.toMatchObject({
+      node: {
+        gpus: [
+          expect.objectContaining({ usableVramGb: exact }),
+          expect.objectContaining({ usableVramGb: 0.125 }),
+        ],
+      },
+    });
   });
 
   it("rejects over-physical, unknown GPU, and nodeKind-mismatched budgets", async () => {
@@ -884,11 +972,12 @@ describe("setCliDeviceFeatureGrants", () => {
         reportedMcpFileRead: true,
         reportedFileRoots: true,
         User: { slug: "owner" },
+        CliDeviceCredentials: [],
         Endpoints: [],
       },
     ]);
     const live = {
-      protocolVersion: "2.4",
+      protocolVersion: "2.9",
       cliVersion: "0.4.0",
       humanTerminal: false,
       mcpCommandMode: "off",
@@ -957,6 +1046,7 @@ describe("setCliDeviceFeatureGrants", () => {
       status,
       lastHeartbeatAt: heartbeatAgoMs === null ? null : new Date(Date.now() - heartbeatAgoMs),
       User: { slug: "owner" },
+      CliDeviceCredentials: [],
       Endpoints: [endpoint(`${id}-ep`, "ONLINE")],
     });
     db.cliDevice.findMany.mockResolvedValue([
@@ -990,13 +1080,14 @@ describe("setCliDeviceFeatureGrants", () => {
         allowHumanTerminal: true,
         mcpCommandMode: "UNSUPERVISED",
         cliVersion: "0.4.0",
-        relayProtocolVersion: "2.4",
+        relayProtocolVersion: "2.9",
         reportedHumanTerminal: true,
         reportedMcpCommandMode: "SUPERVISED",
         reportedTerminalApproval: false,
         reportedTerminalSupported: true,
         reportedAllowFileToolsAsRoot: true,
         User: { slug: "owner" },
+        CliDeviceCredentials: [],
         Endpoints: [],
       },
     ]);
@@ -1031,7 +1122,7 @@ describe("setCliDeviceFeatureGrants", () => {
     const liveClient = (
       mcpCommandMode: "off" | "supervised" | "unsupervised",
       terminalSupported = true,
-      protocolVersion = "2.4",
+      protocolVersion = "2.9",
       allowFileToolsAsRoot = false,
     ) =>
       createRouterClient(forwarderManagementRouter, {
@@ -1050,8 +1141,8 @@ describe("setCliDeviceFeatureGrants", () => {
                     supervisedCommands: true,
                     terminalSupported,
                     terminalApproval: false,
-                    fileOps: protocolVersion === "2.4",
-                    countContext: protocolVersion === "2.4",
+                    fileOps: protocolVersion === "2.9",
+                    countContext: protocolVersion === "2.9",
                     mcpFileRead: false,
                     fileRootsConfigured: false,
                     allowFileToolsAsRoot,
@@ -1151,21 +1242,21 @@ describe("setCliDeviceFeatureGrants", () => {
     expect(grantLimited[0]?.fileTools).toEqual({ read: "supervised", write: "supervised" });
     expect(liveOff[0]?.fileTools).toEqual({ read: "off", write: "off" });
     db.cliDevice.findMany.mockResolvedValue([{ ...row, mcpCommandMode: "UNSUPERVISED" }]);
-    const liveUnsupervised = await liveClient("unsupervised", true, "2.4", true).listCliDevices();
+    const liveUnsupervised = await liveClient("unsupervised", true, "2.9", true).listCliDevices();
     expect(liveUnsupervised[0]?.fileTools).toEqual({ read: "headless", write: "headless" });
     // The live root switch wins over the stored report.
     expect(liveUnsupervised[0]?.allowFileToolsAsRoot).toBe(true);
     expect((await liveClient("unsupervised").listCliDevices())[0]?.allowFileToolsAsRoot).toBe(
       false,
     );
-    // A live CLI older than 2.8 runs no file tool.
+    // A live CLI older than 2.9 runs no file tool.
     const legacy = await liveClient("unsupervised", true, "2.7").listCliDevices();
     expect(legacy[0]?.fileTools).toEqual({ read: "off", write: "off" });
   });
 
   it("grants no file tools when the dashboard grant is off, whatever the CLI reports", async () => {
     const liveRow = (overrides: Record<string, unknown>) => ({
-      protocolVersion: "2.4",
+      protocolVersion: "2.9",
       cliVersion: "0.5.0",
       humanTerminal: false,
       mcpCommandMode: "unsupervised" as const,
@@ -1192,13 +1283,14 @@ describe("setCliDeviceFeatureGrants", () => {
         allowHumanTerminal: false,
         mcpCommandMode: "OFF",
         cliVersion: "0.5.0",
-        relayProtocolVersion: "2.4",
+        relayProtocolVersion: "2.9",
         reportedHumanTerminal: false,
         reportedMcpCommandMode: "UNSUPERVISED",
         reportedTerminalApproval: false,
         reportedTerminalSupported: true,
         reportedAllowFileToolsAsRoot: null,
         User: { slug: "owner" },
+        CliDeviceCredentials: [],
         Endpoints: [],
       },
     ]);
@@ -1215,12 +1307,12 @@ describe("setCliDeviceFeatureGrants", () => {
     expect(devices[0]?.allowFileToolsAsRoot).toBe(false);
   });
 
-  it("withdraws the file-tool claim when the live 2.8 session does not report fileOps", async () => {
+  it("withdraws the file-tool claim when the live current session does not report fileOps", async () => {
     // `listCliDevices.fileTools` requires `live.fileOps` in addition to the
     // grant, the CLI's read switch and its roots; a session that reports
     // fileOps false runs no file op and must be summarized as off.
     const liveRow = (overrides: Record<string, unknown>) => ({
-      protocolVersion: "2.4",
+      protocolVersion: "2.9",
       cliVersion: "0.5.0",
       humanTerminal: false,
       mcpCommandMode: "supervised" as const,
@@ -1246,7 +1338,7 @@ describe("setCliDeviceFeatureGrants", () => {
       allowHumanTerminal: false,
       mcpCommandMode: mode,
       cliVersion: "0.5.0",
-      relayProtocolVersion: "2.4",
+      relayProtocolVersion: "2.9",
       reportedHumanTerminal: false,
       reportedMcpCommandMode: "UNSUPERVISED",
       reportedTerminalApproval: false,
@@ -1254,6 +1346,7 @@ describe("setCliDeviceFeatureGrants", () => {
       reportedAllowFileToolsAsRoot: null,
       mcpFileRead: true,
       User: { slug: "owner" },
+      CliDeviceCredentials: [],
       Endpoints: [],
     });
     const summaryFor = async (mode: string, features: Record<string, unknown>) => {
@@ -1306,12 +1399,13 @@ describe("setCliDeviceFeatureGrants", () => {
       allowHumanTerminal: false,
       mcpCommandMode: "OFF",
       cliVersion: "0.4.0",
-      relayProtocolVersion: "2.6",
+      relayProtocolVersion: "2.9",
       reportedHumanTerminal: null,
       reportedMcpCommandMode: null,
       reportedTerminalApproval: null,
       reportedTerminalSupported: null,
       User: { slug: "owner" },
+      CliDeviceCredentials: [],
       Endpoints: [],
     };
     db.cliDevice.findMany.mockResolvedValue([
@@ -1325,7 +1419,7 @@ describe("setCliDeviceFeatureGrants", () => {
       {
         ...row,
         id: "cli-newer",
-        rejectedRelayProtocolVersion: "2.6",
+        rejectedRelayProtocolVersion: nextRelayProtocol,
         rejectedCliVersion: "0.4.0",
         relayRejectedAt: rejectedAt,
       },
@@ -1341,7 +1435,7 @@ describe("setCliDeviceFeatureGrants", () => {
     });
     expect(devices[1]?.upgradeRequired).toBeNull();
     expect(devices[2]?.upgradeRequired).toMatchObject({
-      protocolVersion: "2.6",
+      protocolVersion: nextRelayProtocol,
       reason: "cli_too_new",
     });
   });
@@ -1452,6 +1546,7 @@ describe("MCP inventory summaries", () => {
       lastDisconnectedAt: null,
       connectionCount: 1,
       User: { slug: "owner" },
+      CliDeviceCredentials: [],
       Endpoints: [
         {
           id: "endpoint-id",
@@ -1520,12 +1615,10 @@ describe("getCliDeviceMetrics", () => {
     nodeMetrics: storedMetrics,
     nodeMetricsAt: new Date("2026-09-28T11:00:00.000Z"),
   };
-  const nodeMetricsMinute = (prisma as unknown as { nodeMetricsMinute: { findMany: MockInstance } })
-    .nodeMetricsMinute;
 
   beforeEach(() => {
     vi.clearAllMocks();
-    nodeMetricsMinute.findMany.mockResolvedValue([]);
+    db.$queryRaw.mockResolvedValue([]);
   });
 
   function metricsClient(services?: Record<string, unknown>) {
@@ -1587,6 +1680,14 @@ describe("getCliDeviceMetrics", () => {
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
   });
 
+  it("propagates history DB failures rather than claiming an empty history", async () => {
+    db.cliDevice.findUnique.mockResolvedValue(deviceMetricsRow);
+    db.$queryRaw.mockRejectedValueOnce(new Error("history DB unavailable"));
+    await expect(metricsClient().getCliDeviceMetrics({ cliDeviceId: "cli-id" })).rejects.toThrow(
+      "history DB unavailable",
+    );
+  });
+
   it("includes a node snapshot, labels, and last-hour minute history", async () => {
     db.cliDevice.findUnique.mockResolvedValue({
       ...deviceMetricsRow,
@@ -1600,7 +1701,7 @@ describe("getCliDeviceMetrics", () => {
       },
     });
     const bucketStart = new Date(Math.floor(Date.now() / 60_000) * 60_000);
-    nodeMetricsMinute.findMany.mockResolvedValue([
+    db.$queryRaw.mockResolvedValue([
       {
         bucketStart,
         samples: 2,

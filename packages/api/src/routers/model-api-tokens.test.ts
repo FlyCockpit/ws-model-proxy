@@ -583,6 +583,52 @@ describe("modelApiTokensRouter", () => {
       expect(db.modelApiTokenAllowlistEntry.update).not.toHaveBeenCalled();
     });
 
+    it("saves the caller wait with the consent in the same transaction and audits a change", async () => {
+      db.modelApiToken.findUnique.mockResolvedValue({
+        id: "token-id",
+        userId: "user-id",
+        revokedAt: null,
+        scopeMode: "ALL_VISIBLE",
+        externalAfterWaitMs: 500,
+        AllowlistEntries: [],
+      });
+      db.modelApiToken.update.mockResolvedValue({
+        ...tokenRow("ALL_VISIBLE", true),
+        externalAfterWaitMs: 2000,
+      });
+      db.providerAuditEvent.create.mockResolvedValue({});
+      const client = createRouterClient(modelApiTokensRouter, { context: buildContext() });
+
+      await client.updateExternalAccess({
+        id: "token-id",
+        allowExternal: true,
+        externalAfterWaitMs: 2000,
+      });
+      // An unchanged wait is stored without a second audit row.
+      await client.updateExternalAccess({
+        id: "token-id",
+        allowExternal: true,
+        externalAfterWaitMs: 500,
+      });
+
+      expect(db.$transaction).toHaveBeenCalledTimes(2);
+      expect(db.modelApiToken.update.mock.calls.map(([args]) => args.data)).toEqual([
+        { allowExternal: true, externalAfterWaitMs: 2000 },
+        { allowExternal: true, externalAfterWaitMs: 500 },
+      ]);
+      expect(db.providerAuditEvent.create.mock.calls.map(([args]) => args.data)).toEqual([
+        {
+          userId: "user-id",
+          action: "TOKEN_EXTERNAL_WAIT_UPDATED",
+          subjectId: "token-id",
+          metadata: {
+            source: "dashboard",
+            changes: { externalAfterWaitMs: { before: 500, after: 2000 } },
+          },
+        },
+      ]);
+    });
+
     it("sets includeExternal only on the chosen allowlisted pools", async () => {
       db.modelApiToken.findUnique.mockResolvedValue({
         id: "token-id",

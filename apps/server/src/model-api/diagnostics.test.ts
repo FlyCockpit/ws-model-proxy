@@ -28,9 +28,14 @@ const envState = vi.hoisted(() => ({
 
 vi.mock("@ws-model-proxy/env/server", () => ({ env: envState.values }));
 
+vi.mock("@ws-model-proxy/env/shared", () => ({
+  env: { DATABASE_URL: "postgresql://diagnostic-test", NODE_ENV: "test" },
+}));
+
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
-  return { default: mockDeep() };
+  const actual = await vi.importActual<typeof import("@ws-model-proxy/db")>("@ws-model-proxy/db");
+  return { default: mockDeep(), Prisma: actual.Prisma };
 });
 
 vi.mock("@ws-model-proxy/api/lib/model-api-token-access", () => ({
@@ -45,8 +50,12 @@ const {
   diagnosticsCapacityRuntime,
   REASONING_ONLY_PROBE_DETAIL,
   runChatCompletionDiagnostic,
-  runPoolMemberTest,
+  runPoolMemberTest: actualRunPoolMemberTest,
 } = await import("./diagnostics");
+
+function runPoolMemberTest(input: Parameters<typeof actualRunPoolMemberTest>[0]) {
+  return actualRunPoolMemberTest({ capacityRuntime: admittingCapacityRuntime(), ...input });
+}
 
 function admittingCapacityRuntime(): CapacityAdmissionRuntime {
   return {
@@ -78,10 +87,17 @@ const tokenAccess = await import("@ws-model-proxy/api/lib/model-api-token-access
 const db = prisma as unknown as {
   $transaction: MockInstance;
   $queryRaw: MockInstance;
-  poolMember: { findUnique: MockInstance; updateMany: MockInstance };
+  poolMember: {
+    findUnique: MockInstance;
+    findMany: MockInstance;
+    findFirst: MockInstance;
+    updateMany: MockInstance;
+  };
+  poolMemberRoutingVerdict: { findMany: MockInstance };
+  user: { findUnique: MockInstance };
   discoveredModel: { findUnique: MockInstance };
   executionTarget: { findUnique: MockInstance };
-  modelPool: { findFirst: MockInstance };
+  modelPool: { findFirst: MockInstance; findUnique: MockInstance };
   relayRequest: { create: MockInstance; update: MockInstance; updateMany: MockInstance };
   relayExecutionEvent: { create: MockInstance; createMany: MockInstance };
   relayExecutionAttempt: { create: MockInstance; updateMany: MockInstance };
@@ -201,22 +217,38 @@ function memberRow({
 } = {}) {
   return {
     id: "member-id",
+    poolId: "pool-id",
+    tier: "PRIMARY",
+    instanceGate: "OPEN",
+    routingStatus: "ACTIVE",
+    healthStatus: "HEALTHY",
+    weight: 1,
+    inferenceContributionId: null,
+    InferenceContribution: null,
+    ExecutionTarget: {
+      id: "model-target",
+      inferenceCapacityId: "model-capacity",
+      DiscoveredModel: null,
+    },
     ModelPool: { userId: ownerUserId },
     DiscoveredModel: withModel
       ? {
           id: "model-id",
+          userId: ownerUserId,
           published,
           upstreamModelId: "upstream-chat",
           capabilityOverrideMode: "OVERRIDE",
           capabilityOverrides,
           capabilityOverrideMetadata,
           Endpoint: {
+            id: "endpoint-id",
+            status: "ONLINE",
             published: endpointPublished,
             slug: "local",
             cliDeviceId: "cli-device-id",
             capabilityMetadata: null,
             defaultCapabilities: ["TEXT_GENERATION"],
-            CliDevice: { status: "CONNECTED" },
+            CliDevice: { status: "CONNECTED", userId: "user-id" },
           },
         }
       : null,
@@ -279,7 +311,7 @@ function directRow() {
         protocol: "openai-compatible",
         chatCompletions: { supported: true, streaming: true },
       },
-      CliDevice: { status: "CONNECTED" },
+      CliDevice: { status: "CONNECTED", userId: "user-id" },
     },
     ExecutionTarget: {
       id: "model-target",
@@ -327,6 +359,23 @@ beforeEach(() => {
   db.$queryRaw.mockResolvedValue([{ now: new Date("2026-08-26T00:00:00.000Z") }]);
   db.poolMember.findUnique.mockResolvedValue(memberRow());
   db.poolMember.updateMany.mockResolvedValue({ count: 1 });
+  db.poolMember.findMany.mockImplementation(async () => {
+    const row = await prisma.poolMember.findUnique({ where: { id: "member-id" } });
+    return row ? [row] : [];
+  });
+  db.poolMember.findFirst.mockImplementation(async () =>
+    prisma.poolMember.findUnique({ where: { id: "member-id" } }),
+  );
+  db.modelPool.findUnique.mockResolvedValue({
+    userId: "user-id",
+    transformerDiscoveredModelId: null,
+  });
+  db.user.findUnique.mockResolvedValue({
+    banned: false,
+    banExpires: null,
+    deletionRequestedAt: null,
+  });
+  db.poolMemberRoutingVerdict.findMany.mockResolvedValue([]);
   mockedTokenAccess.listVisibleModelTargetsForUser.mockResolvedValue({
     directModels: [directTarget],
     modelPools: [poolTarget],
@@ -368,9 +417,9 @@ describe("runPoolMemberTest — typed core outcomes", () => {
         capabilityOverrideMetadata: {
           version: 1,
           protocol: "openai-compatible",
-          embeddings: { supported: true },
+          chatCompletions: { supported: false },
         },
-        capabilityOverrides: ["EMBEDDING"],
+        capabilityOverrides: [],
       }),
     );
     await expect(runPoolMemberTest({ userId: "user-id", memberId: "m" })).resolves.toEqual({
@@ -470,6 +519,20 @@ describe("runPoolMemberTest — typed core outcomes", () => {
     };
   }
 
+  it("refuses a chat surface whose reasoning contract only has an Anthropic encoding", async () => {
+    db.poolMember.findUnique.mockResolvedValue(
+      memberRow({
+        capabilityOverrideMetadata: reasoningInventory({
+          encoding: { kind: "anthropic_thinking", budgetTokensByLevel: { none: 0 } },
+        }),
+      }),
+    );
+    const manager = new FakeRelayManager();
+    const result = await runPoolMemberTest({ userId: "user-id", memberId: "member-id", manager });
+    expect(result.outcome).not.toBe("ok");
+    expect(manager.sent).toEqual([]);
+  });
+
   async function probeBody(capabilityOverrideMetadata: Record<string, unknown>) {
     db.poolMember.findUnique.mockResolvedValue(memberRow({ capabilityOverrideMetadata }));
     const manager = new FakeRelayManager();
@@ -524,11 +587,6 @@ describe("runPoolMemberTest — typed core outcomes", () => {
       "supportedLevels without none uses the lowest supported level",
       { supportedLevels: ["medium", "high"] },
       { reasoning_effort: "medium" },
-    ],
-    [
-      "anthropic encoding cannot ride the chat surface: no reasoning field",
-      { encoding: { kind: "anthropic_thinking" } },
-      {},
     ],
   ])("encodes probe reasoning level none: %s", async (_name, config, expected) => {
     const body = await probeBody(reasoningInventory(config));
@@ -598,7 +656,7 @@ describe("runPoolMemberTest — typed core outcomes", () => {
     manager.error(sent.requestId, "timeout");
     await expect(corePromise).resolves.toMatchObject({
       outcome: "probe-failed",
-      reason: expect.stringContaining("timeout"),
+      reason: expect.stringContaining("diagnostic response"),
     });
     expect(db.poolMember.updateMany).not.toHaveBeenCalled();
   });
@@ -613,7 +671,11 @@ describe("Hono route ↔ core parity (pool member test)", () => {
     });
     app.route(
       "/",
-      createPoolMemberTestRoutes({ manager, concurrencyLimiter: new ModelApiConcurrencyLimiter() }),
+      createPoolMemberTestRoutes({
+        manager,
+        concurrencyLimiter: new ModelApiConcurrencyLimiter(),
+        capacityRuntime: admittingCapacityRuntime(),
+      }),
     );
     return app;
   }

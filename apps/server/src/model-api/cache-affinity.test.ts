@@ -47,6 +47,17 @@ vi.mock("@ws-model-proxy/db", async () => ({
   Prisma: (await import("../../../../packages/db/prisma/generated/client")).Prisma,
   default: db,
 }));
+vi.mock("./cache-affinity-residency.js", async () => {
+  const { Prisma } = await import("../../../../packages/db/prisma/generated/client");
+  return {
+    affinityGenerationReadySql: () => Prisma.raw("true"),
+    queryAffinityResidency: async (query: unknown) => [
+      { complete: true, rows: await db.$queryRaw(query) },
+    ],
+    captureAffinityTargetGenerations: async (targets: Array<{ cacheGeneration?: string }>) =>
+      targets.map((target) => ({ ...target, cacheGeneration: target.cacheGeneration ?? "" })),
+  };
+});
 const contextEstimator = vi.hoisted(() => vi.fn());
 vi.mock("./capacity/context.js", () => ({ countSerializedRequestContext: contextEstimator }));
 
@@ -170,7 +181,7 @@ function querySql(query: { strings?: TemplateStringsArray; sql?: string } | stri
 
 function isResidencyQuery(query: { strings?: TemplateStringsArray; sql?: string } | string) {
   const sql = querySql(query);
-  return sql.includes("inferenceCapacityId") && sql.includes('"prefixDigest" IS NULL');
+  return sql.includes("inferenceCapacityId") && sql.includes("cache_affinity_residency");
 }
 
 function isShareProbe(query: { strings?: TemplateStringsArray; sql?: string } | string) {
@@ -191,22 +202,23 @@ function conversationWrites() {
           tenantUserId: values[2],
           poolId: values[3],
           executionTargetId: values[4],
-          targetIdentity: values[5],
-          bindingDigest: values[6],
+          cacheGeneration: values[5],
+          targetIdentity: values[6],
+          bindingDigest: values[7],
           prefixDigest: null,
-          conversationDigest: values[7],
-          sessionId: values[8],
+          conversationDigest: values[8],
+          sessionId: values[9],
           prefixDepth: 0,
-          digestVersion: values[9],
-          estimatedTokens: values[10],
-          reportedTokens: values[11],
-          engineCacheConfirmed: values[12],
-          lastUsedAt: values[13] as Date,
-          expiresAt: values[14] as Date,
-          sharedWithSessionId: values[15] ?? null,
-          sharedPrefixTokens: values[16] ?? null,
+          digestVersion: values[10],
+          estimatedTokens: values[11],
+          reportedTokens: values[12],
+          engineCacheConfirmed: values[13],
+          lastUsedAt: values[14] as Date,
+          expiresAt: values[15] as Date,
+          sharedWithSessionId: values[16] ?? null,
+          sharedPrefixTokens: values[17] ?? null,
         },
-        engineEvidence: values[17],
+        engineEvidence: values[18],
       },
     ];
   });
@@ -671,14 +683,14 @@ describe("cache affinity", () => {
       );
       expect(writes).toHaveLength(1);
       const values = writes[0]![0].values;
-      const rows = Array.from({ length: values.length / 13 }, (_, i) =>
-        values.slice(i * 13, (i + 1) * 13),
+      const rows = Array.from({ length: values.length / 14 }, (_, i) =>
+        values.slice(i * 14, (i + 1) * 14),
       );
       expect(rows.length).toBeGreaterThan(1);
-      expect(rows.filter((row) => row[9] === true)).toHaveLength(1);
+      expect(rows.filter((row) => row[10] === true)).toHaveLength(1);
       for (const row of rows) {
-        expect(row[10]).toBe(row[9] ? expected : null);
-        expect(row[11]).toBeNull();
+        expect(row[11]).toBe(row[10] ? expected : null);
+        expect(row[12]).toBeNull();
       }
     },
   );
@@ -699,12 +711,12 @@ describe("cache affinity", () => {
       'COALESCE(EXCLUDED."reportedTokens", cache_affinity_node."reportedTokens")',
     );
     const values = writes[0]![0].values;
-    const rows = Array.from({ length: values.length / 13 }, (_, i) =>
-      values.slice(i * 13, (i + 1) * 13),
+    const rows = Array.from({ length: values.length / 14 }, (_, i) =>
+      values.slice(i * 14, (i + 1) * 14),
     );
-    const tip = rows.find((row) => row[9] === true);
-    expect(tip?.[10]).toBe(18_000);
-    expect(tip?.[11]).toBe(12_000);
+    const tip = rows.find((row) => row[10] === true);
+    expect(tip?.[11]).toBe(18_000);
+    expect(tip?.[12]).toBe(12_000);
   });
 
   it("bound native delta uses the caller estimate and carries the parent size for empty input", async () => {
@@ -847,7 +859,7 @@ describe("cache affinity", () => {
         'ORDER BY "userId", "tenantUserId", "poolId", "expiresAt" LIMIT',
       );
       expect(values.at(-1)).toBe(AFFINITY_EXPIRY_BATCH);
-      expect(AFFINITY_EXPIRY_BATCH).toBe(200);
+      expect(AFFINITY_EXPIRY_BATCH).toBe(8);
     },
   );
 

@@ -380,7 +380,36 @@ pub fn run(
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<u8>, RunError> {
     let deadline = Instant::now() + timeout;
+    run_inner(program, args, deadline, limit, cancel, None)
+}
+
+/// Total budget variant: settlement shares the caller's absolute deadline.
+/// Pending reaping retains its permit and can never return a success verdict.
+pub fn run_until(
+    program: &str,
+    args: &[String],
+    deadline: Instant,
+    limit: usize,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<u8>, RunError> {
+    run_inner(program, args, deadline, limit, cancel, Some(deadline))
+}
+
+fn run_inner(
+    program: &str,
+    args: &[String],
+    deadline: Instant,
+    limit: usize,
+    cancel: Option<&AtomicBool>,
+    settlement: Option<Instant>,
+) -> Result<Vec<u8>, RunError> {
     let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
+    if cancelled() {
+        return Err(RunError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(RunError::Timeout);
+    }
     // The one admission point: reserved before anything is spawned.
     let Some(permit) = admit() else {
         return Err(RunError::Resources);
@@ -403,6 +432,14 @@ pub fn run(
         use std::os::unix::process::CommandExt;
         // Its own group, so the deadline kills everything it started.
         command.process_group(0);
+    }
+    if cancelled() || Instant::now() >= deadline {
+        spawn_failed();
+        return Err(if cancelled() {
+            RunError::Cancelled
+        } else {
+            RunError::Timeout
+        });
     }
     #[cfg(not(windows))]
     let mut child = match command.spawn() {
@@ -430,7 +467,11 @@ pub fn run(
     let registered = registration.is_some();
     #[cfg(windows)]
     let finish = |child, until, permit, cancelled: &dyn Fn() -> bool| {
-        finish_job(child, until, permit, cancelled, registration)
+        finish_job_until(child, until, permit, cancelled, registration, settlement)
+    };
+    #[cfg(not(windows))]
+    let finish = |child, until, permit, cancelled: &dyn Fn() -> bool| {
+        finish_until(child, until, permit, cancelled, settlement)
     };
     if !registered {
         finish(child, Instant::now(), permit, &|| true);
@@ -459,6 +500,9 @@ pub fn run(
     let finished = finish(child, wait_until, permit, &cancelled);
     if cancelled() {
         return Err(RunError::Cancelled);
+    }
+    if settlement.is_some() && Instant::now() >= deadline {
+        return Err(RunError::Timeout);
     }
     let Some(buffer) = output else {
         return Err(RunError::Timeout);
@@ -617,11 +661,12 @@ struct Finished {
 /// helper left the kill can only miss (a recycled pid would also have to have
 /// become a group leader in the microseconds between).
 #[cfg(not(windows))]
-fn finish(
+fn finish_until(
     mut child: Child,
     until: Instant,
     permit: Permit,
     cancelled: &dyn Fn() -> bool,
+    settlement: Option<Instant>,
 ) -> Finished {
     let exited = wait_for_exit(&mut child, until, cancelled);
     let pid = child.id();
@@ -631,7 +676,10 @@ fn finish(
     unregister(pid);
     // A child that already exited keeps the status it exited with; SIGKILL
     // cannot change it. std caches a status `try_wait` already reaped.
-    let status = reap_within(&mut child, Instant::now() + REAP_GRACE);
+    let status = reap_within(
+        &mut child,
+        settlement.unwrap_or_else(|| Instant::now() + REAP_GRACE),
+    );
     if status.is_none() {
         hand_off_to_reaper(child, permit);
     }
@@ -642,15 +690,28 @@ fn finish(
 /// A busy lock is inconclusive: keep both the registration and permit with
 /// the cleanup owner until the pending job kill is actually issued.
 #[cfg(windows)]
+#[cfg(test)]
 fn finish_job(
-    mut child: Child,
+    child: Child,
     until: Instant,
     permit: Permit,
     cancelled: &dyn Fn() -> bool,
     registration: Option<JobRegistration>,
 ) -> Finished {
+    finish_job_until(child, until, permit, cancelled, registration, None)
+}
+
+#[cfg(windows)]
+fn finish_job_until(
+    mut child: Child,
+    until: Instant,
+    permit: Permit,
+    cancelled: &dyn Fn() -> bool,
+    registration: Option<JobRegistration>,
+    settlement: Option<Instant>,
+) -> Finished {
     let exited = wait_for_exit(&mut child, until, cancelled);
-    let reap_until = Instant::now() + REAP_GRACE;
+    let reap_until = settlement.unwrap_or_else(|| Instant::now() + REAP_GRACE);
     if !child.ensure_terminated(reap_until) {
         hand_off_job_to_reaper(child, permit, registration);
         return Finished {

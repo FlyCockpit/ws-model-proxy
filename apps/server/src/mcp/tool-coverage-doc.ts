@@ -59,7 +59,7 @@ with started:true when the server received acceptance and started:null otherwise
 and blocked done before acceptance, and undispatched failures remain definitive.
 Finished file answers and their single audit event do not change on late reports.
 Only a supervised start id is delivered despite MCP abort; headless file results keep
-the abort fence. See [CLI file tools](mcp.md#cli-file-tools-relay-protocol-24).
+the abort fence. See [CLI file tools](mcp.md#cli-file-tools-relay-protocol-29).
 
 Overwrite rename preflights before capture and supports exchange-less no-replace
 and link mounts. Stable-inode link publication links the source onto the destination
@@ -118,7 +118,7 @@ MCP tools can never grant it:
   with no confirmation. Null uses each pool's wait. Pool \`externalAfterWaitMs\`
   is an owner floor: callers may only lengthen, up to the local capacity wait
   budget. A request header cannot go below the pool floor or past that budget.
-  Grantees cannot shorten below the pool floor. Every change writes a
+  Neither owners nor grantees can shorten requests below the pool floor. Every change writes a
   \`TOKEN_EXTERNAL_WAIT_UPDATED\` provider audit event. MCP diagnostics cannot
   use \`:external\`;
 - \`providerManagement.setAllowDataCollection\` (the OpenRouter
@@ -147,6 +147,11 @@ always seen:
 \`forwarder_pool_fallback_get\` reads the same data as the dashboard: owners
 get the switches, the external members in fallback order and the own-key
 request count; grantees get provider types only and their own-key route.
+
+\`forwarder_affinity_clear\` returns \`{cleared: true, reclamation: "pending"}\`.
+The pool's old hints are immediately ineligible; bounded background work reclaims
+their metadata. This does not delete the backend's stored Responses state or
+another pool's private hints. Ownership and DELETE confirmation remain required.
 
 No tool result can carry a secret value WMP holds (provider API keys,
 encrypted credential material, token secrets or hashes, device-flow and 2FA

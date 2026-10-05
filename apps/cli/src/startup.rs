@@ -13,8 +13,8 @@ use crate::terminal_identity::{self, CliIdentity};
 
 pub struct TerminalStartup {
     key: CliTerminalKey,
-    /// Persistent identity from `terminal-identity.json`. `None` when it could
-    /// not be loaded; browsers then refuse this CLI's terminals.
+    /// Persistent identity from `terminal-identity.json`. `None` only in tests;
+    /// production startup refuses to connect without a loadable identity.
     identity: Option<CliIdentity>,
     allow_human_terminal: bool,
     mcp_command_mode: McpCommandMode,
@@ -127,13 +127,15 @@ impl TerminalStartup {
     }
 }
 
-/// Hello capabilities always come from the startup snapshot, never the live config.
+/// Terminal grants remain startup-scoped; deployment opt-in is reported fresh.
 pub fn hello_capabilities(
     startup: &TerminalStartup,
-    _live: &Config,
+    live: &Config,
     cli_slug: &str,
 ) -> CliCapabilities {
-    startup.capabilities(cli_slug)
+    let mut capabilities = startup.capabilities(cli_slug);
+    capabilities.features.deployments = live.allow_deployments;
+    capabilities
 }
 
 #[cfg(test)]
@@ -165,6 +167,13 @@ mod tests {
         config.allow_remote_metric_sources = false;
         config.allow_remote_engine_adapters = false;
         let capabilities = hello_capabilities(&startup, &config, "desk-01");
+        assert!(!capabilities.features.deployments);
+        config.allow_deployments = true;
+        assert!(
+            hello_capabilities(&startup, &config, "desk-01")
+                .features
+                .deployments
+        );
         assert!(capabilities.features.human_terminal);
         assert!(
             capabilities.features.remote_metric_sources,

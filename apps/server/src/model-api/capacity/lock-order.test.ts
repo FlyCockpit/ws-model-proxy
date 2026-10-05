@@ -48,7 +48,7 @@ function sourceFiles(directory: string): string[] {
       return ["node_modules", "generated", "e2e"].includes(entry.name) ? [] : sourceFiles(path);
     return /\.(tsx?|mjs|sql|sh)$/.test(entry.name) &&
       !/\.test\.tsx?$/.test(entry.name) &&
-      !/test-helpers\.ts$/.test(entry.name)
+      !/(?:\.test-helper|-test-helpers)\.ts$/.test(entry.name)
       ? [path]
       : [];
   });
@@ -71,8 +71,10 @@ function productionSources(): Array<{ file: string; source: string }> {
 const ADVISORY_SITES: Record<string, string> = {
   "packages/db/src/capacity-lock-order.ts":
     "The fence module: acquireFences calls wsmp_acquire_fences (its docs name pg_advisory*).",
+  "packages/api/src/lib/deployment-service.ts":
+    "Deployment graph writers take the global owner fence first, then deployment-owner and sorted deployment-node transaction locks before any rows; target capacity fences follow before any graph write.",
   "packages/db/prisma/schema-hardening.sql":
-    "Defines wsmp_acquire_fences, the only function that takes a fence's advisory lock.",
+    "Defines wsmp_acquire_fences and the residency trigger's nonblocking target try-lock (never a waited fence).",
   "scripts/docker-entrypoint.sh":
     "Writer class D: the deploy's session-level lock serializing schema applies on a dedicated connection that holds nothing else.",
   "scripts/test-docker-entrypoint-schema.sh": "Test double for the entrypoint's deploy lock.",
@@ -138,11 +140,17 @@ function findTableWrites(
  * fences, and must never also hold an H row.
  */
 const HOT_PATH_WRITERS: Record<string, string> = {
+  "apps/server/src/model-api/cache-affinity-observers.ts":
+    "H: observer receipts and leases; status authority commits separately before receipt CAS, no graph locks held with history/projection.",
+  "apps/server/src/model-api/cache-affinity-maintenance.ts":
+    "S: durable clear claims and orphan metadata pruning; bounded H reclaim helper owns the pool fence before rows.",
   "apps/server/src/model-api/capacity/postgres-store.ts": "H: the admission store",
   "apps/server/src/model-api/capacity/postgres-process-worker.ts":
     "H: the multi-process admission proof worker (scheduler state under the capacity fence)",
   "apps/server/src/model-api/cache-affinity.ts":
     "H: cache affinity (fence) and its expiry sweep (S)",
+  "apps/server/src/model-api/cache-affinity-residency.ts":
+    "S: bounded disposable projection discovery/repair/GC; only bucket/cursor locks, no graph or source-row locks, statement-bounded upserts.",
   "apps/server/src/model-api/routes.ts": "H: relay status, execution telemetry and stickiness",
   "apps/server/src/model-api/public-overflow.ts": "H: external-provider relay status",
   "apps/server/src/model-api/provider-budget.ts": "H: provider budget admission and accounting",
@@ -180,6 +188,16 @@ const HOT_PATH_WRITERS: Record<string, string> = {
  * per statement or in the provider account -> model order.
  */
 const GRAPH_WRITERS: Record<string, string> = {
+  "apps/server/src/model-api/cache-affinity-generation.ts":
+    "H status: bounded capacity generation then endpoint epoch; commits each before optional projection publication, no source/bucket lock overlaps",
+  "packages/api/src/routers/inference-contributions.ts":
+    "M: sorted both-party owner fences then target capacity-policy/capacity fences before contribution/member writes",
+  "packages/api/src/lib/deployment-service.ts":
+    "M: global owner then deployment owner/sorted nodes then capacity-policy/capacity before recipe claims and serving gates",
+  "packages/api/src/routers/deployments.ts":
+    "M: owner-fenced recipes, revisions, plans and human-only grants",
+  "apps/server/src/deployments/reconciler.ts":
+    "M: durable deployment graph steps and gates under graph-owner/deployment-owner/sorted node then capacity fences",
   "packages/api/src/routers/metric-routing.ts":
     "M: pool routing rules (owner fence, replace table rows) and member engine-load override (one owner-scoped row update of non-key columns)",
   "apps/server/src/relay/registration.ts": "M: relay registration",
@@ -240,6 +258,12 @@ const SHARE_GUARDED_TABLES = ["execution_target", "model_pool", "pool_member", "
  * reason. Key: `<relative file>:<table>.FOR SHARE`.
  */
 const REVIEWED_SHARE_LOCKS: Record<string, string> = {
+  "apps/server/src/model-api/local-send.ts:pool_member.FOR SHARE":
+    "Taken after sorted owner and target-policy fences and device/endpoint/model rows, before sorted account rows. Serializes operational instance gates and health; this transaction acquires no hot-path or later fences.",
+  "apps/server/src/model-api/local-send.ts:model_pool.FOR SHARE":
+    "Local permission transaction takes sorted graph owner fences and target-policy before any row; no hot-path writes or admission locks, no response/body waits. Pool before device/endpoint/model/member, user last. Management writers sharing owners serialize before rows; operational writers follow device/endpoint/model/member and hold no user row.",
+  "apps/server/src/model-api/local-send.ts:user.FOR SHARE":
+    "Sorted user SHARE locks after graph owner/target-policy fences and graph rows catch unfenced Better Auth one-user bans. Ban writer updates one user and takes no inference row afterwards. Deletion writers share owner fences, and pool-before-user order matches deletion. No later fence/graph row acquisition.",
   "packages/api/src/routers/pool-fallback-preferences.ts:model_pool.FOR SHARE":
     "Own-key preference setter: after its owner fence, pool SHARE, then exact grant SHARE, requester account SHARE, model SHARE, preference upsert. No capacity fence. Writers/deletion serialize at the pool; provider writers serialize at the account before reaching model/preference. See capacity-lock-order.ts, preference setter transaction.",
   "packages/db/prisma/schema-hardening.sql:user.FOR SHARE":
@@ -328,6 +352,11 @@ describe("capacity lock order (DL-1 design (d)): writer classes and fences", () 
     }
     expect([...writers.keys()].filter((file) => !(file in HOT_PATH_WRITERS)).sort()).toEqual([]);
     expect(Object.keys(HOT_PATH_WRITERS).filter((file) => !writers.has(file))).toEqual([]);
+    // Discovery/repair/GC owns only the disposable projection. In particular,
+    // adding canonical record writes here must not inherit a broad H allowance.
+    expect(writers.get("apps/server/src/model-api/cache-affinity-residency.ts")).toEqual([
+      "cache_affinity_residency",
+    ]);
   });
 
   it("classifies every module that writes a graph table", () => {

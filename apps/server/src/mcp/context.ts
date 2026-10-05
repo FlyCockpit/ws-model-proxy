@@ -96,7 +96,9 @@ export function createMcpContext({
 }): McpContext {
   return {
     session: createMcpSyntheticSession({ user, expiresAt, now }),
-    services,
+    // This marker is created only after requireMcpAuth verifies the principal.
+    // Every MCP procedure is an agent action, including mixed human/agent APIs.
+    services: { ...services, deploymentActor: { kind: "AGENT", id: `mcp:${user.id}` } },
   };
 }
 

@@ -6,7 +6,7 @@ import {
   generateProductCredentialSecret,
 } from "@ws-model-proxy/db/forwarder-security";
 import { z } from "zod";
-import { protectedProcedure } from "../index";
+import { humanProcedure, protectedProcedure } from "../index";
 import { externalAfterWaitMsSchema } from "../lib/caller-external-wait";
 import { isMcpSession } from "../lib/mcp-session";
 import {
@@ -47,6 +47,29 @@ const tokenSelection = {
 } satisfies Prisma.ModelApiTokenSelect;
 
 type TokenListRow = Prisma.ModelApiTokenGetPayload<{ select: typeof tokenSelection }>;
+
+/** One audit row per real change of a token's wait, whichever operation saved it. */
+async function auditExternalWait(
+  tx: Prisma.TransactionClient,
+  context: Parameters<typeof isMcpSession>[0],
+  existing: { id: string; userId: string; externalAfterWaitMs: number | null },
+  externalAfterWaitMs: number | null,
+) {
+  if (existing.externalAfterWaitMs === externalAfterWaitMs) return;
+  await tx.providerAuditEvent.create({
+    data: {
+      userId: existing.userId,
+      action: "TOKEN_EXTERNAL_WAIT_UPDATED",
+      subjectId: existing.id,
+      metadata: {
+        source: isMcpSession(context) ? "mcp" : "dashboard",
+        changes: {
+          externalAfterWaitMs: { before: existing.externalAfterWaitMs, after: externalAfterWaitMs },
+        },
+      },
+    },
+  });
+}
 
 function serializeToken(row: TokenListRow) {
   return {
@@ -178,7 +201,7 @@ export const modelApiTokensRouter = {
       return serializeTargets(targets);
     }),
 
-  create: protectedProcedure
+  create: humanProcedure
     .input(
       z.object({
         name: tokenNameSchema,
@@ -236,13 +259,15 @@ export const modelApiTokensRouter = {
    * tokens also choose which allowlisted pools include external providers.
    * An agent must never be able to raise its own egress permission.
    */
-  updateExternalAccess: protectedProcedure
+  updateExternalAccess: humanProcedure
     .input(
       z.object({
         id: z.string().min(1),
         allowExternal: z.boolean(),
         /** ALLOWLIST tokens only: allowlisted pool ids that include external providers. */
         externalModelPoolIds: z.array(z.string().min(1)).max(200).optional(),
+        /** Saved with the consent in one transaction (same audit as `updateExternalWait`). */
+        externalAfterWaitMs: externalAfterWaitMsSchema.nullable().optional(),
       }),
     )
     .handler(async ({ input, context }) => {
@@ -264,6 +289,7 @@ export const modelApiTokensRouter = {
             userId: true,
             revokedAt: true,
             scopeMode: true,
+            externalAfterWaitMs: true,
             AllowlistEntries: {
               where: { target: "MODEL_POOL", modelPoolId: { not: null } },
               select: { id: true, modelPoolId: true },
@@ -296,9 +322,16 @@ export const modelApiTokensRouter = {
         }
         const updated = await tx.modelApiToken.update({
           where: { id: existing.id },
-          data: { allowExternal: input.allowExternal },
+          data: {
+            allowExternal: input.allowExternal,
+            ...(input.externalAfterWaitMs !== undefined
+              ? { externalAfterWaitMs: input.externalAfterWaitMs }
+              : {}),
+          },
           select: tokenSelection,
         });
+        if (input.externalAfterWaitMs !== undefined)
+          await auditExternalWait(tx, context, existing, input.externalAfterWaitMs);
         return serializeToken(updated);
       });
     }),
@@ -334,24 +367,7 @@ export const modelApiTokensRouter = {
           data: { externalAfterWaitMs: input.externalAfterWaitMs },
           select: tokenSelection,
         });
-        if (existing.externalAfterWaitMs !== input.externalAfterWaitMs) {
-          await tx.providerAuditEvent.create({
-            data: {
-              userId,
-              action: "TOKEN_EXTERNAL_WAIT_UPDATED",
-              subjectId: existing.id,
-              metadata: {
-                source: isMcpSession(context) ? "mcp" : "dashboard",
-                changes: {
-                  externalAfterWaitMs: {
-                    before: existing.externalAfterWaitMs,
-                    after: input.externalAfterWaitMs,
-                  },
-                },
-              },
-            },
-          });
-        }
+        await auditExternalWait(tx, context, existing, input.externalAfterWaitMs);
         return serializeToken(updated);
       });
     }),

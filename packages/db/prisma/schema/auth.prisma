@@ -1,73 +1,78 @@
 model User {
-  id                         String                 @id @default(cuid(2))
-  createdAt                  DateTime               @default(now())
-  updatedAt                  DateTime               @default(now()) @updatedAt
-  name                       String
-  email                      String
-  slug                       String                 @unique @default(cuid(2))
-  emailVerified              Boolean                @default(false)
-  image                      String?
+  DeploymentConfigs              DeploymentConfig[]
+  DeploymentPlans                DeploymentPlan[]
+  DeploymentInstances            DeploymentInstance[]
+  id                             String                  @id @default(cuid(2))
+  createdAt                      DateTime                @default(now())
+  updatedAt                      DateTime                @default(now()) @updatedAt
+  name                           String
+  email                          String
+  slug                           String                  @unique @default(cuid(2))
+  emailVerified                  Boolean                 @default(false)
+  image                          String?
   // Better-Auth's admin plugin stores role as a string and supports arbitrary
   // custom roles plus comma-separated multi-role values. Do not narrow this to
   // a Prisma enum unless you also drop those Better-Auth capabilities.
-  role                       String                 @default("user")
+  role                           String                  @default("user")
   // Preferred UI locale (BCP 47 tag). Synced into the i18n detection chain
   // ahead of localStorage / navigator so a signed-in user's choice follows
   // them across devices. Stored as String (not enum) because the supported-
   // locale set evolves outside the schema; new locales are added in
   // apps/web/src/i18n/config.ts without a Prisma migration.
-  locale                     String                 @default("en-US")
-  banned                     Boolean?
-  banReason                  String?
-  banExpires                 DateTime?
+  locale                         String                  @default("en-US")
+  banned                         Boolean?
+  banReason                      String?
+  banExpires                     DateTime?
   /// Durable intent of an accepted account deletion (users.remove or Better
   /// Auth admin remove-user). Set, with a ban, before any history is drained;
   /// the user-deletion sweeper finishes every marked user. See
   /// packages/db/src/parent-deletion.ts.
-  deletionRequestedAt        DateTime?
+  deletionRequestedAt            DateTime?
   /// Identity of the current deletion generation: set with
   /// deletionRequestedAt, cleared with it. Every marker transition
   /// (completion, abandon, sweep backoff) is predicated on the generation the
   /// worker selected, so a stale worker cannot act on a newer deletion. A
   /// random id, not a timestamp compare, so no column precision is involved.
-  deletionGeneration         String?
+  deletionGeneration             String?
   /// Transient sweeper failures of the current generation (exponential backoff).
-  deletionSweepAttempts      Int                    @default(0)
+  deletionSweepAttempts          Int                     @default(0)
   /// Last user-deletion sweeper attempt (fairness / backoff).
-  deletionSweepLastAttemptAt DateTime?
+  deletionSweepLastAttemptAt     DateTime?
   /// Do not select for sweeping before this instant (transient failures).
-  deletionSweepNextAttemptAt DateTime?
-  twoFactorEnabled           Boolean?
-  operationalAlerts          Boolean                @default(true)
-  sessions                   Session[]
-  accounts                   Account[]
-  twoFactors                 TwoFactor[]
-  deviceCodes                DeviceCode[]
+  deletionSweepNextAttemptAt     DateTime?
+  twoFactorEnabled               Boolean?
+  operationalAlerts              Boolean                 @default(true)
+  sessions                       Session[]
+  accounts                       Account[]
+  twoFactors                     TwoFactor[]
+  deviceCodes                    DeviceCode[]
   // Better Auth 1.7 OAuth Provider back-relations (Phase 0b).
-  oauthClients               OauthClient[]
-  oauthRefreshTokens         OauthRefreshToken[]
-  oauthAccessTokens          OauthAccessToken[]
-  oauthConsents              OauthConsent[]
-  mcpGrants                  McpGrant[]
-  mcpPersonalTokens          McpPersonalToken[]     @relation("McpPersonalTokenOwner")
-  cliDevices                 CliDevice[]            @relation("CliDeviceOwner")
-  cliTokens                  CliToken[]             @relation("CliTokenOwner")
-  cliDeviceCredentials       CliDeviceCredential[]  @relation("CliDeviceCredentialOwner")
-  endpoints                  Endpoint[]             @relation("EndpointOwner")
-  discoveredModels           DiscoveredModel[]      @relation("DiscoveredModelOwner")
-  modelPools                 ModelPool[]            @relation("ModelPoolOwner")
-  ownedPoolGrants            PoolGrant[]            @relation("PoolGrantOwner")
-  receivedPoolGrants         PoolGrant[]            @relation("PoolGrantGrantee")
-  modelApiTokens             ModelApiToken[]        @relation("ModelApiTokenOwner")
-  mediaAssets                MediaAsset[]           @relation("MediaAssetOwner")
-  providerAccounts           ProviderAccount[]      @relation("ProviderAccountOwner")
-  providerModels             ProviderModel[]        @relation("ProviderModelOwner")
-  providerCredentials        ProviderCredential[]   @relation("ProviderCredentialOwner")
-  providerBudgetPolicies     ProviderBudgetPolicy[] @relation("ProviderBudgetPolicyOwner")
-  providerAuditEvents        ProviderAuditEvent[]   @relation("ProviderAuditEventOwner")
-  executionTargets           ExecutionTarget[]      @relation("ExecutionTargetOwner")
-  inferenceCapacities        InferenceCapacity[]    @relation("InferenceCapacityOwner")
-  capacityAuditEvents        CapacityAuditEvent[]   @relation("CapacityAuditEventOwner")
+  oauthClients                   OauthClient[]
+  oauthRefreshTokens             OauthRefreshToken[]
+  oauthAccessTokens              OauthAccessToken[]
+  oauthConsents                  OauthConsent[]
+  mcpGrants                      McpGrant[]
+  mcpPersonalTokens              McpPersonalToken[]      @relation("McpPersonalTokenOwner")
+  cliDevices                     CliDevice[]             @relation("CliDeviceOwner")
+  cliTokens                      CliToken[]              @relation("CliTokenOwner")
+  cliDeviceCredentials           CliDeviceCredential[]   @relation("CliDeviceCredentialOwner")
+  endpoints                      Endpoint[]              @relation("EndpointOwner")
+  discoveredModels               DiscoveredModel[]       @relation("DiscoveredModelOwner")
+  modelPools                     ModelPool[]             @relation("ModelPoolOwner")
+  ownedPoolGrants                PoolGrant[]             @relation("PoolGrantOwner")
+  receivedPoolGrants             PoolGrant[]             @relation("PoolGrantGrantee")
+  modelApiTokens                 ModelApiToken[]         @relation("ModelApiTokenOwner")
+  mediaAssets                    MediaAsset[]            @relation("MediaAssetOwner")
+  providerAccounts               ProviderAccount[]       @relation("ProviderAccountOwner")
+  providerModels                 ProviderModel[]         @relation("ProviderModelOwner")
+  providerCredentials            ProviderCredential[]    @relation("ProviderCredentialOwner")
+  providerBudgetPolicies         ProviderBudgetPolicy[]  @relation("ProviderBudgetPolicyOwner")
+  providerAuditEvents            ProviderAuditEvent[]    @relation("ProviderAuditEventOwner")
+  executionTargets               ExecutionTarget[]       @relation("ExecutionTargetOwner")
+  inferenceCapacities            InferenceCapacity[]     @relation("InferenceCapacityOwner")
+  capacityAuditEvents            CapacityAuditEvent[]    @relation("CapacityAuditEventOwner")
+  inferenceContributions         InferenceContribution[] @relation("InferenceContributor")
+  receivedInferenceContributions InferenceContribution[] @relation("InferencePoolOwner")
 
   @@unique([email])
   @@index([slug])

@@ -22,6 +22,9 @@ function keyTree(value: unknown, prefix = ""): string[] {
 }
 
 describe("dashboard locale key parity (en-US / es-MX)", () => {
+  it("has identical managed deployment and contribution keys", () => {
+    expect(keyTree(esDashboard.deployments)).toEqual(keyTree(enDashboard.deployments));
+  });
   it("has identical key trees for the models surfaces section", () => {
     expect(keyTree(esDashboard.models.surfaces)).toEqual(keyTree(enDashboard.models.surfaces));
   });
@@ -334,7 +337,7 @@ it("uses external-fallback wording, not egress or overflow, on the fallback surf
   }
   expect(enDashboard.pools.fallbackBadge.label).toBe("Fallback available");
   expect(enDashboard).not.toHaveProperty("pools.privacyBadge");
-  expect(enDashboard.tokens.externalAccess.savedPoolsHint).not.toMatch(/first time/i);
+  expect(enDashboard.tokens.cloudAccess.poolsRemembered).not.toMatch(/first time/i);
   expect(keyTree(esDashboard.pools.fallbackBadge)).toEqual(
     keyTree(enDashboard.pools.fallbackBadge),
   );

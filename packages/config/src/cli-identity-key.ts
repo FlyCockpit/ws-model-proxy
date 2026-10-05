@@ -20,6 +20,13 @@ export const DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE =
   "This device credential is bound to another CLI identity key. Run `wsmp login` on this machine.";
 
 /**
+ * What a hello with a device credential from before identity binding is told.
+ * Such credentials are refused rather than bound on first use.
+ */
+export const DEVICE_CREDENTIAL_UNBOUND_MESSAGE =
+  "This device credential predates CLI identity binding. Run `wsmp login` on this machine.";
+
+/**
  * What a CLI token hello is told when its TOFU-bound identity key does not
  * match. The owner can reset the bind from the dashboard without revoking
  * the token.

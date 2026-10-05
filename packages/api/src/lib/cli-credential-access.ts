@@ -178,11 +178,17 @@ export async function authenticateCliWebsocketSecret(
 /**
  * Outcome of checking a relay identity's credential against the device a hello
  * names: `ok`, `revoked` (revoked, expired, or deleted with its device), or
- * `otherDevice` (bound to a different device), or `identityMismatch` (a device
- * credential or TOFU-bound CLI token whose identity key is missing or differs
- * from the hello).
+ * `otherDevice` (bound to a different device), `identityMismatch` (a device
+ * credential or TOFU-bound CLI token whose identity key differs from the
+ * hello), or `identityUnbound` (a device credential minted before identity
+ * binding, which needs a fresh `wsmp login`).
  */
-export type CliCredentialDeviceCheck = "ok" | "revoked" | "otherDevice" | "identityMismatch";
+export type CliCredentialDeviceCheck =
+  | "ok"
+  | "revoked"
+  | "otherDevice"
+  | "identityMismatch"
+  | "identityUnbound";
 
 /**
  * Registration's credential check, run inside its transaction right after the
@@ -216,7 +222,7 @@ export async function checkCliCredentialForDevice(
     if (!credential || credential.revokedAt) return "revoked";
     if (credential.cliDeviceId !== cliDeviceId) return "otherDevice";
     if (identityPublicKey !== null && credential.identityPublicKey !== identityPublicKey) {
-      return "identityMismatch";
+      return credential.identityPublicKey === null ? "identityUnbound" : "identityMismatch";
     }
     return "ok";
   }

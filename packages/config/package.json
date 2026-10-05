@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./deployment-protocol": {
+      "default": "./src/deployment-protocol.ts"
+    },
     "./tsconfig.base.json": "./tsconfig.base.json",
     "./biome.json": "./biome.json",
     "./postcss.config.mjs": "./postcss.config.mjs",

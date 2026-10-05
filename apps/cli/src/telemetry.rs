@@ -288,27 +288,65 @@ fn read_load_counters_from(path: &Path) -> BTreeMap<String, PersistedLoadCounter
         .unwrap_or_default()
 }
 
-fn write_load_counters_to(path: &Path, map: &BTreeMap<String, PersistedLoadCounters>) {
+fn write_load_counters_to(path: &Path, map: &BTreeMap<String, PersistedLoadCounters>) -> bool {
     let file = LoadCountersFile {
         version: LOAD_COUNTERS_VERSION,
         endpoints: map.clone(),
     };
     let Ok(mut bytes) = serde_json::to_vec_pretty(&file) else {
-        return;
+        return false;
     };
     bytes.push(b'\n');
-    let _ = crate::approvals::write_private_atomic(path, &bytes, "load counters", false);
+    match crate::approvals::write_private_atomic(path, &bytes, "load counters", false) {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(error = %error, "persisting load counters failed; the next idle sample retries");
+            false
+        }
+    }
 }
 
-fn persisted_load_counters() -> &'static Mutex<BTreeMap<String, PersistedLoadCounters>> {
-    static MAP: OnceLock<Mutex<BTreeMap<String, PersistedLoadCounters>>> = OnceLock::new();
+#[derive(Default)]
+struct CounterStore {
+    desired: BTreeMap<String, PersistedLoadCounters>,
+    dirty: bool,
+}
+
+impl CounterStore {
+    fn update(&mut self, slug: &str, value: PersistedLoadCounters, path: Option<&Path>) {
+        if self.desired.get(slug) != Some(&value) {
+            self.desired.insert(slug.to_string(), value);
+            self.dirty = true;
+        }
+        self.flush(path);
+    }
+
+    fn prune(&mut self, keep: impl Fn(&str) -> bool, path: Option<&Path>) {
+        let previous_len = self.desired.len();
+        self.desired.retain(|slug, _| keep(slug));
+        self.dirty |= previous_len != self.desired.len();
+        self.flush(path);
+    }
+
+    fn flush(&mut self, path: Option<&Path>) {
+        if self.dirty && path.is_some_and(|path| write_load_counters_to(path, &self.desired)) {
+            self.dirty = false;
+        }
+    }
+}
+
+fn persisted_load_counters() -> &'static Mutex<CounterStore> {
+    static MAP: OnceLock<Mutex<CounterStore>> = OnceLock::new();
     MAP.get_or_init(|| {
-        Mutex::new(if cfg!(test) {
-            BTreeMap::new()
-        } else {
-            load_counters_path()
-                .map(|path| read_load_counters_from(&path))
-                .unwrap_or_default()
+        Mutex::new(CounterStore {
+            desired: if cfg!(test) {
+                BTreeMap::new()
+            } else {
+                load_counters_path()
+                    .map(|path| read_load_counters_from(&path))
+                    .unwrap_or_default()
+            },
+            dirty: false,
         })
     })
 }
@@ -333,7 +371,7 @@ impl LoadState {
         persisted_load_counters()
             .lock()
             .ok()
-            .and_then(|map| map.get(slug).cloned())
+            .and_then(|map| map.desired.get(slug).cloned())
             .map(|persisted| Self {
                 last_sent: None,
                 prefix_hits_total: persisted.prefix_hits_total,
@@ -355,20 +393,18 @@ impl LoadState {
         self.pending_reset = false;
         self.last_sent = Some((at, reading));
         if let Ok(mut map) = persisted_load_counters().lock() {
-            map.insert(
-                slug.to_string(),
-                PersistedLoadCounters {
-                    counter_epoch,
-                    prefix_hits_total: self.prefix_hits_total,
-                    prefix_queries_total: self.prefix_queries_total,
-                    process_start_time_seconds: self.process_start_time_seconds,
-                },
-            );
-            if !cfg!(test)
-                && let Some(path) = load_counters_path()
-            {
-                write_load_counters_to(&path, &map);
-            }
+            let persisted = PersistedLoadCounters {
+                counter_epoch,
+                prefix_hits_total: self.prefix_hits_total,
+                prefix_queries_total: self.prefix_queries_total,
+                process_start_time_seconds: self.process_start_time_seconds,
+            };
+            let path = if cfg!(test) {
+                None
+            } else {
+                load_counters_path()
+            };
+            map.update(slug, persisted, path.as_deref());
         }
     }
 }
@@ -591,7 +627,15 @@ where
                 load_targets_with_remote(&endpoints, &remote, allow_remote, &approved);
             schedules.retain(|slug, _| targets.iter().any(|(endpoint, _)| endpoint.slug == *slug));
             if let Ok(mut map) = persisted_load_counters().lock() {
-                map.retain(|slug, _| targets.iter().any(|(endpoint, _)| endpoint.slug == *slug));
+                let path = if cfg!(test) {
+                    None
+                } else {
+                    load_counters_path()
+                };
+                map.prune(
+                    |slug| targets.iter().any(|(endpoint, _)| endpoint.slug == slug),
+                    path.as_deref(),
+                );
             }
             if let Ok(mut shared) = shared.lock() {
                 let live: std::collections::BTreeSet<_> = targets
@@ -636,6 +680,14 @@ where
             }
         }
 
+        if let Ok(mut map) = persisted_load_counters().lock() {
+            let path = if cfg!(test) {
+                None
+            } else {
+                load_counters_path()
+            };
+            map.flush(path.as_deref());
+        }
         let now = Instant::now();
         let mut due = schedules
             .iter()
@@ -1087,19 +1139,12 @@ fn node_kind(gpus: &[GpuRow]) -> (NodeKind, bool) {
 }
 
 fn execution_mechanism() -> ExecutionMechanism {
-    let exists = |path: &str| std::path::Path::new(path).exists();
-    if exists("/.dockerenv") || exists("/run/.containerenv") {
-        return ExecutionMechanism::Container;
+    match crate::deployments::mechanism() {
+        "systemd+linger" => ExecutionMechanism::SystemdLinger,
+        "systemd-no-linger" => ExecutionMechanism::SystemdNoLinger,
+        "macos" => ExecutionMechanism::Macos,
+        _ => ExecutionMechanism::Unsupported,
     }
-    if std::env::var_os("INVOCATION_ID").is_some() {
-        return ExecutionMechanism::Systemd;
-    }
-    if cfg!(target_os = "macos")
-        && std::env::var_os("XPC_SERVICE_NAME").is_some_and(|name| name != "0")
-    {
-        return ExecutionMechanism::Launchd;
-    }
-    ExecutionMechanism::Foreground
 }
 
 /// `/etc/os-release` `NAME` and `VERSION_ID`.
@@ -1331,6 +1376,44 @@ fn collect_node_metrics(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn counter_store_filesystem_update_prune_and_idle_retries() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("counters.json");
+        let mut store = super::CounterStore::default();
+        let value = super::PersistedLoadCounters {
+            counter_epoch: 7,
+            ..Default::default()
+        };
+        store.update("keep", value.clone(), Some(&path));
+        let inode = std::fs::metadata(&path).expect("file").ino();
+        store.update("keep", value.clone(), Some(&path));
+        assert_eq!(
+            std::fs::metadata(&path).expect("file").ino(),
+            inode,
+            "unchanged frame must not replace file"
+        );
+        std::fs::remove_file(&path).expect("remove fixture");
+        std::fs::create_dir(&path).expect("block replacement");
+        store.update("remove", value.clone(), Some(&path));
+        assert!(store.dirty);
+        std::fs::remove_dir(&path).expect("unblock");
+        store.update("remove", value.clone(), Some(&path));
+        assert!(!store.dirty);
+        assert!(super::read_load_counters_from(&path).contains_key("remove"));
+        std::fs::remove_file(&path).expect("remove fixture");
+        std::fs::create_dir(&path).expect("block prune");
+        store.prune(|slug| slug == "keep", Some(&path));
+        assert!(store.dirty);
+        std::fs::remove_dir(&path).expect("unblock");
+        store.flush(Some(&path));
+        assert!(!store.dirty);
+        let durable = super::read_load_counters_from(&path);
+        assert!(durable.contains_key("keep"));
+        assert!(!durable.contains_key("remove"));
+    }
     use super::*;
     use crate::engine::{EngineKind, LoadSource};
     use crate::protocol::MetricSourceFormat;
@@ -1507,6 +1590,68 @@ mod tests {
         )
         .expect("refresh");
         assert_eq!(same.counter_epoch, 1);
+    }
+
+    #[test]
+    fn corrupt_or_foreign_load_counters_fail_safe_and_are_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("load-counters.json");
+        let valid_entry = r#"{"counter_epoch":4,"prefix_hits_total":1.0,"prefix_queries_total":2.0,"process_start_time_seconds":null}"#;
+        let fixtures: [(&str, String); 7] = [
+            ("garbage", "not json at all".to_string()),
+            (
+                "truncated",
+                r#"{"version":1,"endpoints":{"vllm":"#.to_string(),
+            ),
+            ("empty", String::new()),
+            (
+                "future version",
+                format!(r#"{{"version":2,"endpoints":{{"vllm":{valid_entry}}}}}"#),
+            ),
+            (
+                "legacy version",
+                format!(r#"{{"version":0,"endpoints":{{"vllm":{valid_entry}}}}}"#),
+            ),
+            (
+                "missing version",
+                format!(r#"{{"endpoints":{{"vllm":{valid_entry}}}}}"#),
+            ),
+            (
+                "wrong entry shape",
+                r#"{"version":1,"endpoints":{"vllm":{"counter_epoch":"four"}}}"#.to_string(),
+            ),
+        ];
+        for (label, body) in fixtures {
+            std::fs::write(&path, body).expect("write fixture");
+            assert!(
+                read_load_counters_from(&path).is_empty(),
+                "{label}: unreadable counters must restore nothing"
+            );
+        }
+        std::fs::write(&path, b"\xff\xfe\x00binary").expect("write binary fixture");
+        assert!(read_load_counters_from(&path).is_empty());
+        assert!(read_load_counters_from(&dir.path().join("missing.json")).is_empty());
+
+        // A store that started from a corrupt file overwrites it with a valid
+        // current-version document on the next accepted frame.
+        let mut store = CounterStore::default();
+        store.update(
+            "vllm",
+            PersistedLoadCounters {
+                counter_epoch: 9,
+                ..Default::default()
+            },
+            Some(&path),
+        );
+        assert!(!store.dirty);
+        let restored = read_load_counters_from(&path);
+        assert_eq!(
+            restored.get("vllm").map(|value| value.counter_epoch),
+            Some(9)
+        );
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("valid json");
+        assert_eq!(raw["version"], serde_json::json!(LOAD_COUNTERS_VERSION));
     }
 
     #[test]

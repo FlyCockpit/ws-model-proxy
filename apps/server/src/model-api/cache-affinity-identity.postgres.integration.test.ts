@@ -1137,6 +1137,7 @@ integration("cache-prefix identity #160", () => {
       "Node Type": string;
       "Index Name"?: string;
       "Index Cond"?: string;
+      "Recheck Cond"?: string;
       "Shared Hit Blocks"?: number;
       "Shared Read Blocks"?: number;
       "Actual Rows"?: number;
@@ -1195,9 +1196,16 @@ integration("cache-prefix identity #160", () => {
       try {
         expect(affinityScans).toHaveLength(2);
         for (const scan of affinityScans) {
-          expect(scan["Index Cond"]).toBeDefined();
+          const pointScans =
+            scan["Node Type"] === "Bitmap Heap Scan"
+              ? flatten(scan).filter((child) => child["Node Type"] === "Bitmap Index Scan")
+              : [scan];
+          expect(pointScans.length).toBeGreaterThan(0);
+          for (const point of pointScans) expect(point["Index Cond"]).toBeDefined();
           if (scan["Relation Name"] === "cache_affinity_node") {
-            expect(scan["Index Name"]).toBe("cache_affinity_node_owner_unique");
+            expect(pointScans).toHaveLength(1);
+            const point = pointScans[0]!;
+            expect(point["Index Name"]).toBe("cache_affinity_node_owner_unique");
             for (const key of [
               "userId",
               "tenantUserId",
@@ -1207,10 +1215,31 @@ integration("cache-prefix identity #160", () => {
               "nodeDigest",
               "sessionId",
             ])
-              expect(scan["Index Cond"]).toContain(key);
-            expect(scan["Index Cond"]).not.toMatch(/[<>]/);
+              expect(point["Index Cond"]).toContain(key);
+            expect(point["Index Cond"]).not.toMatch(/[<>]/);
+          } else {
+            expect(pointScans).toHaveLength(1);
+            const point = pointScans[0]!;
+            expect([
+              recordIndex.name,
+              "cache_affinity_record_tenantUserId_poolId_prefixDigest_expi_idx",
+            ]).toContain(point["Index Name"]);
+            for (const key of ["tenantUserId", "poolId", "prefixDigest"])
+              expect(point["Index Cond"]).toContain(key);
+            expect(point["Index Cond"]).not.toMatch(/[<>]/);
           }
         }
+        // Bitmap materialization is work even when a parent LIMIT visits few
+        // heap tuples. Count it separately so an eager population scan cannot
+        // hide behind a small heap output.
+        expect(
+          scans
+            .filter((scan) => scan["Node Type"] === "Bitmap Index Scan")
+            .reduce(
+              (sum, scan) => sum + (scan["Actual Rows"] ?? 0) * (scan["Actual Loops"] ?? 0),
+              0,
+            ),
+        ).toBeLessThanOrEqual(64 * 4);
         for (const scan of scans) expect(scan["Index Cond"] ?? "").not.toMatch(/ROW\s*\(/i);
         expect(visited).toBeLessThanOrEqual(64 * 4);
         expect(buffers).toBeLessThan(1000);
@@ -3492,24 +3521,46 @@ integration("cache-prefix identity #160", () => {
 
   it("pool clear, expiry and tenant purge remove records and nodes together", async () => {
     if (!db) return;
-    const { clearCacheAffinityRecords, purgeDeletedUserHistory } = await import(
-      "@ws-model-proxy/db/hot-path-sweeps"
-    );
+    const { clearCacheAffinityRecords, purgeDeletedUserHistory, reclaimClearedAffinity } =
+      await import("@ws-model-proxy/db/hot-path-sweeps");
+    const { captureAffinityTargetGenerations } = await import("./cache-affinity-residency.js");
     const args = argsFor(await fixture());
-    const write = () => service.rememberAffinity({ ...args, payload: { messages: baseHistory } });
+    const write = (target = args.target) =>
+      service.rememberAffinity({ ...args, target, payload: { messages: baseHistory } });
+    const retained = async () =>
+      (await db.cacheAffinityRecord.count({ where: { poolId: args.poolId } })) +
+      (await db.cacheAffinityNode.count({ where: { poolId: args.poolId } }));
     await write();
+    const written = await retained();
+    expect(written).toBeGreaterThan(3);
+    // The scope epoch is the logical clear receipt; physical rows are
+    // reclaimed afterwards in independently committed, bounded batches.
     expect(
       await clearCacheAffinityRecords(db, {
         ownerUserId: args.resourceOwnerId,
         poolId: args.poolId,
       }),
-    ).toBeGreaterThan(3);
+    ).toEqual({ cleared: true, reclamation: "pending" });
+    expect(await retained()).toBe(written);
+    await expect(write()).rejects.toThrow(/generation has reset/);
+    let reclaimed = 0;
+    for (let batch = 0; batch < 10; batch++) {
+      const removed = await reclaimClearedAffinity(db, {
+        ownerUserId: args.resourceOwnerId,
+        poolId: args.poolId,
+      });
+      if (!removed) break;
+      reclaimed += removed;
+    }
+    expect(reclaimed).toBe(written);
     expect(await db.cacheAffinityRecord.count({ where: { poolId: args.poolId } })).toBe(0);
     expect(await db.cacheAffinityNode.count({ where: { poolId: args.poolId } })).toBe(0);
-    await write();
+    const [current] = await captureAffinityTargetGenerations([args.target], args.poolId);
+    expect(current!.cacheGeneration).toContain(":pool:");
+    await write(current);
     await service.sweepExpiredAffinity({ now: new Date(args.now.getTime() + 61000), limit: 10000 });
     expect(await db.cacheAffinityNode.count({ where: { poolId: args.poolId } })).toBe(0);
-    await write();
+    await write(current);
     const purged = await purgeDeletedUserHistory(db, args.ownerId);
     expect(purged.remaining).toBe(false);
     expect(await db.cacheAffinityRecord.count({ where: { tenantUserId: args.ownerId } })).toBe(0);
@@ -4086,8 +4137,8 @@ integration("cache-prefix identity #160", () => {
       await service.rememberAffinity({ ...args, payload: { messages: baseHistory } });
       expect(performance.now() - start).toBeLessThan(10000);
       const where = { poolId: args.poolId, expiresAt: { lte: args.now } };
-      expect(await db.cacheAffinityNode.count({ where })).toBe(count - 200);
-      expect(await db.cacheAffinityRecord.count({ where })).toBe(count - 200);
+      expect(await db.cacheAffinityNode.count({ where })).toBe(count - 8);
+      expect(await db.cacheAffinityRecord.count({ where })).toBe(count - 8);
     },
     180000,
   );

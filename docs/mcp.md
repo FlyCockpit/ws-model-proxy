@@ -11,8 +11,8 @@ excluded procedure) is maintained in the generated, test-enforced artifact
 [docs/mcp-tool-coverage.md](./mcp-tool-coverage.md). This document describes the
 server behavior around it; it does not duplicate the catalog.
 
-Node telemetry (relay protocol 2.4) is read-only over MCP. Node file tools
-(relay protocol 2.4) are described in [CLI file tools](#cli-file-tools-relay-protocol-24).
+Node telemetry (relay protocol 2.10) is read-only over MCP. Node file tools
+(relay protocol 2.10) are described in [CLI file tools](#cli-file-tools-relay-protocol-210).
 `forwarder_device_metrics_get` (`{ cliDeviceId }`) returns a CLI device's static
 `node.info`, its freshest `node.metrics` (live from the relay session, else the
 stored once-a-minute snapshot, with `nodeMetricsSource`), the live
@@ -161,7 +161,7 @@ Owners see every requester on their pools; grantees see only their own. A
 foreign pool or member returns `NOT_FOUND`. Engine prefix-cache counters stay
 on the engine-load charts and are not mixed into this tool.
 
-## CLI file tools (relay protocol 2.4)
+## CLI file tools (relay protocol 2.10)
 
 Nine PAT-only tools read and change files on a CLI device (a node): `forwarder_cli_file_read`,
 `forwarder_cli_file_stat`, `forwarder_cli_dir_list`, `forwarder_cli_file_search`
@@ -545,7 +545,7 @@ stable-inode alias pairs still refuse.
 
 
 **Version skew.** `uncertain_outcome` and `unsafe_filesystem` are new file error
-codes of relay 2.8. Upgrade the server before the `wsmp` CLI: a server that
+codes of relay 2.10. Upgrade the server before the `wsmp` CLI: a server that
 predates these codes treats the CLI's rejection frame as malformed instead of
 reporting the typed error (retained files stay on disk). An older CLI never
 emits `unsafe_filesystem`.
@@ -592,6 +592,35 @@ relay protocol returns `upgrade_required`
 ("this CLI speaks relay <v>; upgrade wsmp").
 
 ## Setup
+
+### Durable deployments and inference contributions (0.4.0)
+
+Recipe tools (`deployment_configs_list`, `deployment_config_get`,
+`deployment_config_create`, `deployment_config_update`) read and save immutable
+specifications; updates require `expectedRevision`. Deployment lists return
+`{items, nextCursor}` with `limit` default 50, maximum 100; use `cursor` for the
+next page. Config reads return the latest immutable revision; a plan's preview
+resolves its exact start revision and stopped groups rather than substituting a
+newer revision. Instance and plan step detail includes the latest 100 steps,
+with `stepsTruncated` and database step counts when history is longer.
+Deployment lifecycle tools
+(`deployment_plan_start`, `deployment_plan_stop`, `deployment_plan_apply`) require
+a command-enabled personal token, `mcp:write`, and live node command permissions.
+OAuth or a general write token never grants machine execution. Apply additionally
+requires `confirm: "RUN"`; this MCP literal does not replace a required person's
+confirmation. Read `deployment_plan_status` for the immutable commands and whole
+groups affected. Human confirmation, node grants and protected-instance preemption
+permission are dashboard-only. CLI local policy always remains authoritative.
+
+Inference tools list, offer and revoke a specific serving model contribution.
+`inferenceContributions.accept` is human-only. A pool contribution grants inference,
+not shell or deployment rights, and either party may revoke it.
+
+Pool summaries load at most 20 grants and 20 members per pool in the database.
+`grantCount` and `memberCount` are full database counts; `grantsTruncated` and
+`membersTruncated` explicitly report abbreviated inline lists. Budget policies are
+queried only for those selected grants, so truncation never drops their spend cap.
+Use the owner-scoped full pool read when detailed configuration is required.
 
 Required environment:
 
@@ -798,9 +827,10 @@ local capacity. Null uses each pool's `externalAfterWaitMs`. Pool
 `externalAfterWaitMs` is an owner floor: callers may only lengthen, up to the
 local capacity wait budget. A request may also send
 `x-wsmp-external-after-wait-ms`; that override cannot go below the pool floor
-or past the local wait budget. Grantees cannot shorten below the pool floor.
+or past the local wait budget. Neither owners nor grantees can shorten requests below the pool floor.
 The stored value is 0..600000; each request still applies the floor and budget
-for that pool. MCP diagnostics cannot use `:external`.
+for that pool. Every change records `TOKEN_EXTERNAL_WAIT_UPDATED` in the content-free
+provider audit log. MCP diagnostics cannot use `:external`.
 
 Still human-only: token external consent (`allowExternal`, `includeExternal`),
 own-key preferences, the pool external-equivalent picker, catalog search,
@@ -898,12 +928,13 @@ ignores the schema gets the same checks.
 ## Tool errors
 
 A failed tool call returns `isError: true`, a short stable text, and
-`structuredContent.error.code`. Application messages are never copied into
-tool output. Allowlisted oRPC codes keep their name (`BAD_REQUEST`,
+`structuredContent.error.code`. Application messages are not copied into
+tool output except sanitized static argument-shaped `BAD_REQUEST` messages described below.
+Allowlisted oRPC codes keep their name (`BAD_REQUEST`,
 `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `CONFLICT`, `TOO_MANY_REQUESTS`);
 anything else is `INTERNAL_ERROR` with a `requestId`. Wrapper-level errors
 use their own codes (for example `INSUFFICIENT_SCOPE`, `CONFIRMATION_REQUIRED`,
-`INVALID_INPUT`, `OUTPUT_TOO_LARGE`, `REQUEST_ABORTED`).
+`invalid_input`, `OUTPUT_TOO_LARGE`, `REQUEST_ABORTED`).
 
 A deletion-related `CONFLICT` also carries a stable `reason`
 (`@ws-model-proxy/config/deletion-conflict`), in the text (`Conflict:
@@ -952,6 +983,12 @@ A schema-valid rejection names the procedure's fields and keeps its static messa
 }
 ```
 
+`fields` contains only failing dotted caller-input paths (for example
+`advanced.contextMargin` or `rules.0.threshold`), never suggested replacement names.
+Suggestions remain separately on each issue; their total comparison work is bounded
+independently of tool-schema size. `unknownKeyCount` is the total count, not the number
+of suggestions. Safe declared reason enums survive even when no field can be named.
+Timestamp adapter failures use the same `invalid_input` / `fields` contract.
 `fields` is present whenever the failure is argument-shaped and at least one
 key can be named: missing or out-of-range values, a key that is not on this
 object (`unrecognized_keys`, counted on the issue as `unknownKeyCount` with

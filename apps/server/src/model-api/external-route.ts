@@ -341,7 +341,7 @@ export function externalDenialError(
   if (denial === "TOKEN_NOT_PERMITTED")
     return {
       code: "external_not_permitted",
-      message: `This API token does not allow external providers for "${pool.modelId}". A person can enable "Allow external providers" on the token (and include this pool for allowlist tokens) in the dashboard, or use "${pool.modelId}" to use local members only.`,
+      message: `This API token does not allow external providers for "${pool.modelId}". A person can turn on cloud access for the token (Dashboard → API tokens → Cloud access, and include this pool for allowlist tokens), or use "${pool.modelId}" to use local members only.`,
     };
   if (denial === "SOURCE_UNSUPPORTED")
     return {

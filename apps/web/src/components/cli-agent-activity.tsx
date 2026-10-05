@@ -65,12 +65,15 @@ export function splitAuditPath(kind: string, path: string): { hash: string | nul
 export function CliAgentActivity({
   cliDeviceId,
   deviceName,
+  defaultOpen = false,
 }: {
   cliDeviceId: string;
   deviceName: string;
+  /** Open when it is the only content of its container (a device tab). */
+  defaultOpen?: boolean;
 }) {
   const { t } = useTranslation(["dashboard", "common"]);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(defaultOpen);
   const panelId = useId();
   const query = useInfiniteQuery({
     ...orpc.cliAgentActivity.list.infiniteOptions({

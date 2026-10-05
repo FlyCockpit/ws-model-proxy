@@ -182,18 +182,29 @@ export async function writeEngineLoadIncrements(
   return written;
 }
 
+/** Some rows of a flush were rejected one by one; the rest were written. */
+class EngineLoadRollupWriteError extends Error {
+  constructor(
+    readonly written: number,
+    readonly failed: number,
+  ) {
+    super("engine-load rollup flush incomplete");
+  }
+}
+
 export function createEngineLoadRollupWriter({
   clock = Date.now,
   write = writeEngineLoadIncrements,
   resolveCapacities = defaultResolveCapacities,
   shutdown = isDbShutdownFenceArmed,
-  log = () => console.error("[engine-load-rollup] flush failed"),
+  log = (counts) => console.error("[engine-load-rollup] flush failed", counts ?? {}),
 }: {
   clock?: () => number;
   write?: (increments: EngineLoadRollupIncrement[]) => Promise<number>;
   resolveCapacities?: (ownerUserId: string, cliDeviceId: string) => Promise<CapacityRow[]>;
   shutdown?: () => boolean;
-  log?: () => void;
+  /** Called at most once a minute; `counts` when rows were rejected individually. */
+  log?: (counts?: { written: number; failed: number }) => void;
 } = {}) {
   const pending = new Map<string, EngineLoadRollupSample[]>();
   const capacityCache = new Map<string, CapacityCache>();
@@ -280,13 +291,22 @@ export function createEngineLoadRollupWriter({
         }
         increments.push(...merged.values());
       }
-      if (increments.length > 0 && !stopped && !shutdown()) await write(increments);
-    } catch {
+      if (increments.length > 0 && !stopped && !shutdown()) {
+        const written = await write(increments);
+        // A short count after the shutdown fence armed is expected, not a failure.
+        if (written !== increments.length && !shutdown())
+          throw new EngineLoadRollupWriteError(written, increments.length - written);
+      }
+    } catch (error) {
       const failedAt = clock();
       if (failedAt - lastLog >= 60_000) {
         lastLog = failedAt;
         try {
-          log();
+          log(
+            error instanceof EngineLoadRollupWriteError
+              ? { written: error.written, failed: error.failed }
+              : undefined,
+          );
         } catch {
           /* Logging must not escape the request path. */
         }

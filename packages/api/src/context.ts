@@ -74,6 +74,8 @@ export type LiveNodeTelemetrySnapshot = {
 };
 
 export type ContextServices = {
+  /** Verified MCP transport identity; absence means cookie-authenticated human. */
+  deploymentActor?: { kind: "AGENT"; id: string };
   /** Server-owned accounting repair. Kept injectable so the API package does not depend on the server. */
   repairExpiredProviderBudgets?: (scope: {
     userId: string;

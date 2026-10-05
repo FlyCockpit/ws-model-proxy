@@ -1732,6 +1732,41 @@ describe("metric routing procedures (S-B part 2)", () => {
     ).rejects.toMatchObject({ code: "BAD_REQUEST" });
   });
 
+  it("shows a contributed member's machine to its pool owner by name only, without telemetry", async () => {
+    deep.modelPool.findFirst.mockResolvedValue({
+      id: "pool-1",
+      slug: "coder",
+      PoolRoutingRules: [],
+      PoolMembers: [
+        {
+          id: "friend",
+          DiscoveredModel: null,
+          ExecutionTarget: {
+            DiscoveredModel: {
+              slug: null,
+              upstreamModelId: "friend-model",
+              Endpoint: {
+                slug: "gpu",
+                cliDeviceId: "friend-cli",
+                CliDevice: { slug: "friend", name: "Friend's box", reportedHostname: "friend.lan" },
+              },
+            },
+          },
+        },
+      ],
+    } as never);
+    deep.poolMemberRoutingVerdict.findMany.mockResolvedValue([]);
+    deep.capacityKvEviction.findMany.mockResolvedValue([]);
+    // The owner-scoped read finds no device: the machine is the contributor's.
+    deep.cliDevice.findMany.mockResolvedValue([]);
+    const getLiveNodeTelemetry = vi.fn(() => new Map());
+    const result = await client({ getLiveNodeTelemetry }).getPoolRoutingRules({
+      poolId: "pool-1",
+    });
+    expect(result.devices).toEqual([]);
+    expect(getLiveNodeTelemetry).toHaveBeenCalledWith([]);
+  });
+
   it("reports each member's verdict, staleness and the metrics its device offers", async () => {
     const now = Date.now();
     const model = (upstreamModelId: string) => ({
@@ -1769,7 +1804,10 @@ describe("metric routing procedures (S-B part 2)", () => {
         expiresAt: new Date(now - 30_000),
       },
     ]);
-    deep.cliDevice.findMany.mockResolvedValue([]);
+    // The owner-scoped read: this device belongs to the pool owner.
+    deep.cliDevice.findMany.mockResolvedValue([
+      { id: "cli-id", nodeMetrics: null, nodeMetricsAt: null },
+    ] as never);
     const receivedAt = new Date(now - 2_000);
     const result = await client({
       getLiveNodeTelemetry: (ids: readonly string[]) =>
@@ -1911,7 +1949,10 @@ describe("metric routing procedures (S-B part 2)", () => {
         expiresAt: new Date(now - 30_000),
       },
     ]);
-    deep.cliDevice.findMany.mockResolvedValue([]);
+    // The owner-scoped read: this device belongs to the pool owner.
+    deep.cliDevice.findMany.mockResolvedValue([
+      { id: "cli-id", nodeMetrics: null, nodeMetricsAt: null },
+    ] as never);
     const fresh = new Date(now - 2_000);
     // Outside the 15 s staleness window: ageSeconds > 15 and `live.stale` true.
     const stale = new Date(now - 20_000);
@@ -2067,7 +2108,10 @@ describe("metric routing procedures (S-B part 2)", () => {
         expiresAt: new Date(now + 10_000),
       },
     ]);
-    deep.cliDevice.findMany.mockResolvedValue([]);
+    // The owner-scoped read: this device belongs to the pool owner.
+    deep.cliDevice.findMany.mockResolvedValue([
+      { id: "cli-id", nodeMetrics: null, nodeMetricsAt: null },
+    ] as never);
     const fresh = new Date(now - 2_000);
     const result = await client({
       getLiveNodeTelemetry: (ids: readonly string[]) =>

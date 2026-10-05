@@ -375,7 +375,7 @@ describe("overviewRouter.metrics", () => {
             ExecutionTarget: {
               id: "target-ext",
               kind: "PROVIDER_MODEL",
-              inferenceCapacityId: null,
+              inferenceCapacityId: "cap-ext",
               DiscoveredModel: null,
               ProviderModel: {
                 displayName: "gpt-4o",

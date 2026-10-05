@@ -4,7 +4,11 @@ import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { commandAuditDigest } from "./command-audit-digest.js";
 import { generateTestHelloIdentity } from "./hello-identity.js";
-import { encodeRelayBinaryFrame, RELAY_REQUEST_BODY_WINDOW_CHUNKS } from "./protocol.js";
+import {
+  encodeRelayBinaryFrame,
+  RELAY_MIN_PROTOCOL_VERSION,
+  RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+} from "./protocol.js";
 import { cancelRelayWorkForBannedUser } from "./user-ban.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
@@ -134,7 +138,7 @@ function hello(socket: FakeSocket, slug: string, features: { mcpCommandMode: Mod
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion: "2.4",
+    protocolVersion: RELAY_MIN_PROTOCOL_VERSION,
     cli: {
       slug,
       hostname: `${slug}.local`,

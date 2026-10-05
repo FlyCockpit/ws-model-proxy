@@ -8,6 +8,9 @@ vi.mock("@ws-model-proxy/db", () => ({
   },
 }));
 vi.mock("@ws-model-proxy/db/shutdown-fence", () => ({ isDbShutdownFenceArmed: () => false }));
+vi.mock("./cache-affinity-generation.js", () => ({
+  resetAffinityForCapacities: vi.fn(async () => undefined),
+}));
 
 import {
   createKvEvictionFeedback,

@@ -1,5 +1,9 @@
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
-import { DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE } from "@ws-model-proxy/config/cli-identity-key";
+import {
+  CLI_TOKEN_IDENTITY_MISMATCH_MESSAGE,
+  DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE,
+  DEVICE_CREDENTIAL_UNBOUND_MESSAGE,
+} from "@ws-model-proxy/config/cli-identity-key";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { parseMultipartToSpool } from "../model-api/multipart-form-data.js";
@@ -40,6 +44,40 @@ const kvEviction = vi.hoisted(() => ({
   resetKvEvictionForEndpoint: vi.fn(async () => {}),
 }));
 vi.mock("../model-api/kv-eviction-feedback.js", () => kvEviction);
+vi.mock("../model-api/cache-affinity-residency.js", () => ({
+  beginAffinityReset: () => () => {},
+}));
+vi.mock("../model-api/cache-affinity-observers.js", () => ({
+  observeAffinityReset: vi.fn().mockResolvedValue([]),
+  acknowledgeAffinityObservations: vi.fn().mockResolvedValue(undefined),
+  registerAffinityObservers: vi.fn().mockResolvedValue(undefined),
+  renewAffinityObservers: vi.fn().mockResolvedValue(undefined),
+  recoverAffinityObservers: vi.fn().mockResolvedValue(undefined),
+  discoverAffinityObservers: vi.fn().mockResolvedValue(undefined),
+}));
+/** Stands in for the durable endpoint.loadCounterEpoch column. */
+const durableEpochs = vi.hoisted(() => new Map<string, number>());
+/** Holds a reset job at its durable read or write so frames can arrive mid-run. */
+const epochGate = vi.hoisted(() => ({
+  read: undefined as Promise<void> | undefined,
+  persist: undefined as Promise<void> | undefined,
+}));
+vi.mock("../model-api/cache-affinity-generation.js", () => ({
+  persistAffinityCounterEpoch: async (
+    cliDeviceId: string,
+    slug: string,
+    loadCounterEpoch: number,
+  ) => {
+    if (epochGate.persist) await epochGate.persist;
+    durableEpochs.set(`${cliDeviceId}/${slug}`, loadCounterEpoch);
+    return prisma.endpoint.updateMany({ where: { cliDeviceId, slug }, data: { loadCounterEpoch } });
+  },
+  readAffinityCounterEpoch: async (cliDeviceId: string, slug: string) => {
+    const value = durableEpochs.get(`${cliDeviceId}/${slug}`) ?? null;
+    if (epochGate.read) await epochGate.read;
+    return value;
+  },
+}));
 
 const { RelaySessionManager } = await import("./session-manager.js");
 const { default: prisma } = await import("@ws-model-proxy/db");
@@ -185,7 +223,7 @@ function helloFrame(socket?: FakeSocket) {
   return JSON.stringify({
     type: "hello",
     id: "hello-id",
-    protocolVersion: "2.4",
+    protocolVersion: RELAY_PROTOCOL_VERSIONS[0],
     cli: {
       slug: "desktop",
       hostname: "desk-01.local",
@@ -268,6 +306,126 @@ function seedRegistrationMocks() {
   });
   db.inferenceCapacity.findMany.mockResolvedValue([]);
 }
+
+describe("deployment snapshot resource accounting", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    seedRegistrationMocks();
+  });
+  async function peer(manager: InstanceType<typeof RelaySessionManager>, index: number) {
+    db.cliDevice.upsert.mockResolvedValueOnce({
+      id: `snapshot-device-${index}`,
+      userId: identity.userId,
+      slug: `snapshot-${index}`,
+      connectionGeneration: 1,
+    });
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
+    return socket;
+  }
+  function chunk(index: number, chunkIndex: number, large = false, final = false) {
+    return JSON.stringify({
+      type: "deployment.instances",
+      snapshotId: String(index).padStart(32, "0"),
+      chunkIndex,
+      final,
+      instances: large
+        ? Array.from({ length: 3 }, (_, rank) => ({
+            instanceId: `snapshot${index}chunk${chunkIndex}rank${rank}`,
+            revisionId: "revision",
+            rank: 0,
+            intentHash: "a".repeat(64),
+            phase: "unknown",
+            unitName: `wsmp-i-snapshot${index}chunk${chunkIndex}rank${rank}-r0`,
+            port: 30000,
+            endpointSlug: "snapshot",
+            models: Array.from({ length: 64 }, () => "m".repeat(256)),
+            contextWindow: null,
+          }))
+        : [],
+    });
+  }
+  it("caps global active slots and releases them on disconnect, completion and dispose", async () => {
+    const manager = new RelaySessionManager();
+    const inventory = vi.fn(async () => true);
+    manager.setDeploymentHandlers({ result: async () => true, inventory });
+    const sockets: FakeSocket[] = [];
+    for (let i = 0; i < 64; i++) {
+      const socket = await peer(manager, i);
+      sockets.push(socket);
+      await manager.handleTextFrame(socket, chunk(i, 0));
+    }
+    const refused = await peer(manager, 64);
+    await manager.handleTextFrame(refused, chunk(64, 0));
+    expect(refused.closes.at(-1)?.reason).toBe("malformed");
+    expect(inventory).not.toHaveBeenCalled();
+    await manager.removeSession(sockets[0]!);
+    const replacement = await peer(manager, 65);
+    await manager.handleTextFrame(replacement, chunk(65, 0, false, true));
+    expect(inventory).toHaveBeenCalledTimes(1);
+    expect(replacement.closes).toHaveLength(0);
+    manager.dispose();
+    const after = await peer(manager, 66);
+    await manager.handleTextFrame(after, chunk(66, 0, false, true));
+    expect(inventory).toHaveBeenCalledTimes(2);
+    await manager.closeRelaySessions(now);
+  });
+  it("caps aggregate snapshot bytes while each socket remains below its individual cap", async () => {
+    const manager = new RelaySessionManager();
+    const inventory = vi.fn(async () => true);
+    manager.setDeploymentHandlers({ result: async () => true, inventory });
+    let rejected = false;
+    for (let i = 0; i < 20 && !rejected; i++) {
+      const socket = await peer(manager, i);
+      for (let j = 0; j < 40 && socket.readyState === WS_READY_STATE_OPEN; j++) {
+        const value = chunk(i, j, true);
+        expect(Buffer.byteLength(value)).toBeLessThan(65536);
+        await manager.handleTextFrame(socket, value);
+      }
+      rejected = socket.closes.length > 0;
+    }
+    expect(rejected).toBe(true);
+    expect(inventory).not.toHaveBeenCalled();
+    manager.dispose();
+    const inverse = await peer(manager, 100);
+    await manager.handleTextFrame(inverse, chunk(100, 0, true, true));
+    expect(inventory).toHaveBeenCalledTimes(1);
+    await manager.closeRelaySessions(now);
+  });
+  it("keeps disconnected committing callbacks charged until their arrays are released", async () => {
+    const manager = new RelaySessionManager();
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    manager.setDeploymentHandlers({
+      result: async () => true,
+      inventory: async () => {
+        await gate;
+        return true;
+      },
+    });
+    const tasks: Promise<void>[] = [];
+    const sockets: FakeSocket[] = [];
+    for (let i = 0; i < 64; i++) {
+      const socket = await peer(manager, i);
+      sockets.push(socket);
+      tasks.push(manager.handleTextFrame(socket, chunk(i, 0, false, true)));
+    }
+    await manager.removeSession(sockets[0]!);
+    const refused = await peer(manager, 65);
+    await manager.handleTextFrame(refused, chunk(65, 0));
+    expect(refused.closes.at(-1)?.reason).toBe("malformed");
+    release();
+    await Promise.all(tasks);
+    const inverse = await peer(manager, 66);
+    await manager.handleTextFrame(inverse, chunk(66, 0, false, true));
+    expect(inverse.closes).toHaveLength(0);
+    await manager.closeRelaySessions(now);
+    manager.dispose();
+  });
+});
 
 describe("relay drain", () => {
   beforeEach(() => {
@@ -511,11 +669,12 @@ describe("revoked credentials", () => {
     [
       "a different identity key",
       "BCIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+      DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE,
     ],
-    ["a credential minted before the bind", null],
+    ["a credential minted before the bind", null, DEVICE_CREDENTIAL_UNBOUND_MESSAGE],
   ] as const)(
     "refuses a hello bound to %s and keeps the live session",
-    async (_label, storedMachineId) => {
+    async (_label, storedMachineId, message) => {
       const manager = new RelaySessionManager();
       const original = new FakeSocket();
       manager.acceptAuthenticatedSocket({
@@ -540,7 +699,7 @@ describe("revoked credentials", () => {
         type: "protocol.error",
         failure: "protocol_error",
         code: "identity_mismatch",
-        message: DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE,
+        message,
       });
       expect(credentials.cliDeviceCredential.updateMany).toHaveBeenCalledWith({
         where: { id: "cred" },
@@ -551,6 +710,90 @@ describe("revoked credentials", () => {
       manager.dispose();
     },
   );
+
+  describe("CLI token identity bind", () => {
+    const tokens = prisma as unknown as {
+      cliToken: { findUnique: MockInstance; updateMany: MockInstance };
+    };
+    const otherKey =
+      "BCIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI";
+
+    it("TOFU-binds an unbound token to the first hello's device and identity key", async () => {
+      const manager = new RelaySessionManager();
+      const socket = new FakeSocket();
+      manager.acceptAuthenticatedSocket({ socket, identity, now });
+      await manager.handleTextFrame(socket, helloFrame(socket), now);
+
+      expect(socket.closes).toEqual([]);
+      expect(firstControl(socket, "hello.ok")).toMatchObject({ type: "hello.ok" });
+      expect(tokens.cliToken.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: identity.id,
+          cliDeviceId: null,
+          identityPublicKey: null,
+          revokedAt: null,
+        },
+        data: { cliDeviceId: "cli-device-id", identityPublicKey: testIdentity.publicKey },
+      });
+      manager.dispose();
+    });
+
+    it("refuses a copied token bound to another key with the token message and records it", async () => {
+      tokens.cliToken.findUnique.mockResolvedValue({
+        revokedAt: null,
+        expiresAt: null,
+        cliDeviceId: "cli-device-id",
+        identityPublicKey: otherKey,
+      });
+      const manager = new RelaySessionManager();
+      const copy = new FakeSocket();
+      manager.acceptAuthenticatedSocket({ socket: copy, identity, now });
+      await manager.handleTextFrame(copy, helloFrame(copy), now);
+
+      expect(copy.closes).toEqual([{ code: 1008, reason: "identity_mismatch" }]);
+      expect(JSON.parse(String(copy.sends.at(-1)))).toMatchObject({
+        type: "protocol.error",
+        failure: "protocol_error",
+        code: "identity_mismatch",
+        message: CLI_TOKEN_IDENTITY_MISMATCH_MESSAGE,
+      });
+      // The refusal lands on the token row, never on a device credential.
+      expect(tokens.cliToken.updateMany).toHaveBeenCalledWith({
+        where: { id: identity.id },
+        data: { lastRefusedAt: now, lastRefusedReason: "identity_mismatch" },
+      });
+      expect(credentials.cliDeviceCredential.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: { lastRefusedAt: now, lastRefusedReason: "identity_mismatch" },
+        }),
+      );
+      expect(manager.getActiveCliDeviceIds()).toEqual([]);
+      manager.dispose();
+    });
+
+    it("still closes the copy when recording the token refusal fails", async () => {
+      tokens.cliToken.findUnique.mockResolvedValue({
+        revokedAt: null,
+        expiresAt: null,
+        cliDeviceId: "cli-device-id",
+        identityPublicKey: otherKey,
+      });
+      tokens.cliToken.updateMany.mockRejectedValue(new Error("db down"));
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      const manager = new RelaySessionManager();
+      const copy = new FakeSocket();
+      manager.acceptAuthenticatedSocket({ socket: copy, identity, now });
+      await manager.handleTextFrame(copy, helloFrame(copy), now);
+
+      expect(copy.closes).toEqual([{ code: 1008, reason: "identity_mismatch" }]);
+      expect(consoleError).toHaveBeenCalledWith(
+        "[relay] recording an identity refusal failed",
+        "Error",
+      );
+      consoleError.mockRestore();
+      manager.dispose();
+    });
+  });
 
   it("closes the socket when an inventory update finds the credential revoked", async () => {
     const manager = new RelaySessionManager();
@@ -1142,7 +1385,7 @@ describe("RelaySessionManager", () => {
     expect(firstControl(socket, "hello.ok")).toEqual({
       type: "hello.ok",
       id: "hello-id",
-      protocolVersion: "2.4",
+      protocolVersion: "2.10",
       revision: {
         inventorySeq: 1,
         inventoryDigest: "digest",
@@ -1679,7 +1922,7 @@ describe("RelaySessionManager", () => {
     const frame = JSON.stringify({
       type: "hello",
       id: "hello-id",
-      protocolVersion: "2.4",
+      protocolVersion: "2.10",
       cli: {
         slug: "desktop",
         hostname: "desk-01.local",
@@ -2065,7 +2308,7 @@ function helloCli(
   return JSON.stringify({
     type: "hello",
     id: "hello-cli",
-    protocolVersion: "2.4",
+    protocolVersion: "2.10",
     cli: {
       slug: "desktop",
       hostname: "desk-01.local",
@@ -2137,7 +2380,7 @@ describe("relay terminal and exec sessions", () => {
       }),
     );
     expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
-      protocolVersion: "2.4",
+      protocolVersion: "2.10",
       fileOps: true,
       mcpFileRead: true,
       fileRootsConfigured: true,
@@ -2203,7 +2446,7 @@ describe("relay terminal and exec sessions", () => {
     await register(manager, socket);
     const snapshot = () => manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id");
     expect(snapshot()).toMatchObject({
-      protocolVersion: "2.4",
+      protocolVersion: "2.10",
       fileOps: true,
       countContext: true,
       mcpFileRead: false,
@@ -2217,7 +2460,7 @@ describe("relay terminal and exec sessions", () => {
     ).get("cli-device-id");
     if (session) session.features = { ...session.features, fileOps: false, mcpFileRead: true };
     expect(snapshot()).toMatchObject({
-      protocolVersion: "2.4",
+      protocolVersion: "2.10",
       fileOps: true,
       countContext: true,
       mcpFileRead: true,
@@ -2273,12 +2516,12 @@ describe("relay terminal and exec sessions", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     await register(manager, socket, helloCli({ mcpCommandMode: "supervised" }));
-    expect(firstControl(socket, "hello.ok").protocolVersion).toBe("2.4");
+    expect(firstControl(socket, "hello.ok").protocolVersion).toBe("2.10");
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         update: expect.objectContaining({
           cliVersion: "9.9.9",
-          relayProtocolVersion: "2.4",
+          relayProtocolVersion: "2.10",
           reportedHumanTerminal: true,
           reportedMcpCommandMode: "SUPERVISED",
           reportedTerminalApproval: false,
@@ -2333,8 +2576,8 @@ describe("relay terminal and exec sessions", () => {
         frame.protocolVersion = "2.6";
         return JSON.stringify(frame);
       })(),
-      "upgrade_server",
-      RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE,
+      "upgrade_cli",
+      RELAY_UPGRADE_REQUIRED_MESSAGE,
     ],
     [
       "a 2.5 hello",
@@ -2343,8 +2586,8 @@ describe("relay terminal and exec sessions", () => {
         frame.protocolVersion = "2.5";
         return JSON.stringify(frame);
       })(),
-      "upgrade_server",
-      RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE,
+      "upgrade_cli",
+      RELAY_UPGRADE_REQUIRED_MESSAGE,
     ],
     [
       "a 0.3.x hello (2.3 with cli.label, no hostname)",
@@ -2374,10 +2617,10 @@ describe("relay terminal and exec sessions", () => {
       RELAY_UPGRADE_REQUIRED_MESSAGE,
     ],
     [
-      "a 2.10 hello (a CLI newer than this server)",
+      "a 2.11 hello (a CLI newer than this server)",
       (() => {
         const frame = JSON.parse(helloCli()) as { protocolVersion: string };
-        frame.protocolVersion = "2.10";
+        frame.protocolVersion = "2.11";
         return JSON.stringify(frame);
       })(),
       "upgrade_server",
@@ -2425,7 +2668,7 @@ describe("relay terminal and exec sessions", () => {
       now,
     });
     await manager.handleTextFrame(socket, JSON.stringify(frame), now);
-    expect(socket.closes).toEqual([{ code: 1002, reason: "upgrade_server" }]);
+    expect(socket.closes).toEqual([{ code: 1002, reason: "upgrade_cli" }]);
     expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
       where: { id: "bound-device", userId: "user-id" },
       data: {
@@ -2436,14 +2679,14 @@ describe("relay terminal and exec sessions", () => {
     });
     expect(consoleError).toHaveBeenCalledWith(
       "[relay] refused a hello this server does not speak",
-      { protocolVersion: "2.6", cliVersion: "0.4.0", code: "upgrade_server" },
+      { protocolVersion: "2.6", cliVersion: "0.4.0", code: "upgrade_cli" },
     );
 
     // An unbound token names no device: nothing is written.
     db.cliDevice.updateMany.mockClear();
     const unbound = new FakeSocket();
     await register(manager, unbound, JSON.stringify(frame));
-    expect(unbound.closes).toEqual([{ code: 1002, reason: "upgrade_server" }]);
+    expect(unbound.closes).toEqual([{ code: 1002, reason: "upgrade_cli" }]);
     expect(db.cliDevice.updateMany).not.toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ rejectedRelayProtocolVersion: "2.6" }),
@@ -2487,9 +2730,9 @@ describe("relay terminal and exec sessions", () => {
       protocolVersion: string;
       cli: { version?: string; capabilities: Record<string, unknown> };
     };
-    frame.protocolVersion = "2.10";
+    frame.protocolVersion = "2.11";
     frame.cli.version = "0.9.0-rc.1+build.5";
-    frame.cli.capabilities.protocolVersion = "2.10";
+    frame.cli.capabilities.protocolVersion = "2.11";
     manager.acceptAuthenticatedSocket({
       socket,
       identity: { ...identity, kind: "deviceCredential", cliDeviceId: "bound-device" },
@@ -2507,7 +2750,7 @@ describe("relay terminal and exec sessions", () => {
     expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
       where: { id: "bound-device", userId: "user-id" },
       data: {
-        rejectedRelayProtocolVersion: "2.10",
+        rejectedRelayProtocolVersion: "2.11",
         rejectedCliVersion: "0.9.0-rc.1+build.5",
         relayRejectedAt: now,
       },
@@ -2536,7 +2779,7 @@ describe("relay terminal and exec sessions", () => {
     await register(manager, socket, JSON.stringify(frame));
     expect(firstControl(socket, "hello.ok")).toMatchObject({
       type: "hello.ok",
-      protocolVersion: "2.4",
+      protocolVersion: "2.10",
     });
     expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
   });
@@ -2802,14 +3045,14 @@ describe("relay terminal viewers", () => {
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         update: expect.objectContaining({
-          relayProtocolVersion: "2.4",
+          relayProtocolVersion: "2.10",
           reportedMcpCommandMode: "UNSUPERVISED",
           reportedHumanTerminal: true,
         }),
       }),
     );
     expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
-      protocolVersion: "2.4",
+      protocolVersion: "2.10",
       mcpCommandMode: "unsupervised",
       supervisedCommands: true,
       terminalPublicKey: uncompressedKey(),
@@ -2846,6 +3089,19 @@ describe("relay terminal viewers", () => {
     expect(
       manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")?.terminalIdentity,
     ).toBeNull();
+  });
+
+  it("reports a deployment job on a closing socket as unsent", async () => {
+    const { manager, socket } = await setup();
+    const target = manager.deploymentSocket("cli-device-id");
+    expect(target).toBeTruthy();
+    const job = { type: "deployment.job" } as unknown as Parameters<
+      typeof manager.sendDeploymentJob
+    >[1];
+    socket.readyState = 2; // CLOSING
+    const before = socket.sends.length;
+    expect(manager.sendDeploymentJob(target!, job)).toBe(false);
+    expect(socket.sends.length).toBe(before);
   });
 
   it("lets two viewers coexist without a detached event", async () => {
@@ -3177,6 +3433,24 @@ describe("relay terminal viewers", () => {
 });
 
 describe("relay 2.7 telemetry", () => {
+  beforeEach(() => {
+    durableEpochs.clear();
+    epochGate.read = undefined;
+    epochGate.persist = undefined;
+  });
+  const gate = (stage: "read" | "persist") => {
+    let open = () => {};
+    epochGate[stage] = new Promise<void>((resolve) => {
+      open = () => {
+        epochGate[stage] = undefined;
+        resolve();
+      };
+    });
+    return open;
+  };
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
+  const pendingResets = (manager: unknown) =>
+    (manager as { pendingAffinityResets: Map<string, unknown> }).pendingAffinityResets;
   const metrics = (ts: string, extra: Record<string, unknown> = {}) =>
     JSON.stringify({
       type: "node.metrics",
@@ -3447,6 +3721,13 @@ describe("relay 2.7 telemetry", () => {
       "local-openai",
       at(3_000),
     );
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ counterEpoch: 2, running: 4 }),
+      at(4_500),
+    );
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(2);
     manager.dispose();
   });
 
@@ -3491,6 +3772,180 @@ describe("relay 2.7 telemetry", () => {
     await Promise.resolve();
     expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(2);
     manager.dispose();
+  });
+
+  it("applies a debounced explicit reset later instead of dropping it", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad({ prefixCacheReset: true }), now);
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ prefixCacheReset: true, running: 2 }),
+      at(1_500),
+    );
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    // An ordinary frame after the window applies the coalesced reset, timed at its arrival.
+    await manager.handleTextFrame(socket, inventoryLoad({ running: 3 }), at(31_000));
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(2);
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenLastCalledWith(
+      "cli-device-id",
+      "local-openai",
+      at(1_500),
+    );
+    manager.dispose();
+  });
+
+  it("does not drop a reset on a new load key once the session's key cap is full", async () => {
+    const { ENDPOINT_LOAD_MAX_KEYS } = await import("./session-manager.js");
+    const { manager, socket } = await registered();
+    for (let index = 0; index < ENDPOINT_LOAD_MAX_KEYS; index += 1)
+      await manager.handleTextFrame(socket, inventoryLoad({ modelSlug: `m${index}` }), now);
+    expect(kvEviction.resetKvEvictionForEndpoint).not.toHaveBeenCalled();
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ modelSlug: "beyond-the-cap", counterEpoch: 1 }),
+      at(1_500),
+    );
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    manager.dispose();
+  });
+
+  it("resolves a missing epoch cache entry against the durable epoch", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 0 }), now);
+    expect(durableEpochs.get("cli-device-id/local-openai")).toBe(0);
+    // Simulates eviction from the bounded cache: a miss must not read as "unchanged".
+    (
+      manager as unknown as { kvCounterEpochByEndpoint: Map<string, number> }
+    ).kvCounterEpochByEndpoint.clear();
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 0 }), at(1_500));
+    expect(kvEviction.resetKvEvictionForEndpoint).not.toHaveBeenCalled();
+    (
+      manager as unknown as { kvCounterEpochByEndpoint: Map<string, number> }
+    ).kvCounterEpochByEndpoint.clear();
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 1 }), at(3_000));
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    expect(durableEpochs.get("cli-device-id/local-openai")).toBe(1);
+    manager.dispose();
+  });
+
+  it("treats a first-seen epoch above 0 with nothing stored as a reset, and epoch 0 as a baseline", async () => {
+    const { manager, socket } = await registered();
+    // The CLI starts each endpoint at epoch 0; a later epoch with no stored
+    // value means a reset this server did not see (e.g. sent mid-inventory).
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 2 }), now);
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    expect(durableEpochs.get("cli-device-id/local-openai")).toBe(2);
+    manager.dispose();
+
+    durableEpochs.clear();
+    vi.mocked(kvEviction.resetKvEvictionForEndpoint).mockClear();
+    const second = await registered();
+    await second.manager.handleTextFrame(second.socket, inventoryLoad({ counterEpoch: 0 }), now);
+    expect(kvEviction.resetKvEvictionForEndpoint).not.toHaveBeenCalled();
+    expect(durableEpochs.get("cli-device-id/local-openai")).toBe(0);
+    second.manager.dispose();
+  });
+
+  it("treats an epoch that moves and returns while a job is pending as a reset", async () => {
+    // Earlier blocks may leave fake timers installed; these waits need the real clock.
+    vi.useRealTimers();
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 5 }), now);
+    (
+      manager as unknown as { kvCounterEpochByEndpoint: Map<string, number> }
+    ).kvCounterEpochByEndpoint.clear();
+    const open = gate("read");
+    const frames = [manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 5 }), at(2_000))];
+    await settle();
+    frames.push(
+      manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 6, running: 2 }), at(2_100)),
+      manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 5, running: 3 }), at(2_200)),
+    );
+    await settle();
+    open();
+    await Promise.all(frames);
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ counterEpoch: 5, running: 4 }),
+      at(4_000),
+    );
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalled();
+    expect(pendingResets(manager).size).toBe(0);
+    manager.dispose();
+  });
+
+  it("lets a reset complete while ordinary frames repeat its new epoch", async () => {
+    // Earlier blocks may leave fake timers installed; these waits need the real clock.
+    vi.useRealTimers();
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 0 }), now);
+    const open = gate("persist");
+    const reset = manager.handleTextFrame(
+      socket,
+      inventoryLoad({ counterEpoch: 1, prefixCacheReset: true, running: 2 }),
+      at(2_000),
+    );
+    await settle();
+    // The stock CLI's next ordinary frames carry the same new epoch.
+    const ordinary = manager.handleTextFrame(
+      socket,
+      inventoryLoad({ counterEpoch: 1, running: 3 }),
+      at(2_500),
+    );
+    await settle();
+    open();
+    await Promise.all([reset, ordinary]);
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    expect(pendingResets(manager).size).toBe(0);
+    expect(durableEpochs.get("cli-device-id/local-openai")).toBe(1);
+    manager.dispose();
+  });
+
+  it("keeps an endpoint that keeps reporting in the bounded epoch cache", async () => {
+    vi.useRealTimers();
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 0 }), now);
+    const { KV_COUNTER_EPOCH_CACHE_MAX } = await import("./session-manager.js");
+    const cache = (manager as unknown as { kvCounterEpochByEndpoint: Map<string, number> })
+      .kvCounterEpochByEndpoint;
+    for (let index = 0; cache.size < KV_COUNTER_EPOCH_CACHE_MAX; index += 1)
+      cache.set(`other${index}`, 0);
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ counterEpoch: 0, running: 2 }),
+      at(1_500),
+    );
+    // One more insertion by any path evicts the least recently used entry.
+    cache.set("newcomer", 0);
+    while (cache.size > KV_COUNTER_EPOCH_CACHE_MAX) {
+      const oldest = cache.keys().next().value;
+      if (oldest === undefined) break;
+      cache.delete(oldest);
+    }
+    expect(cache.has("cli-device-id\u0000local-openai")).toBe(true);
+    manager.dispose();
+  });
+
+  it("applies a delayed reset from the retry timer once it falls due", async () => {
+    vi.useFakeTimers({ now: now.getTime() });
+    try {
+      const { manager, socket } = await registered();
+      await manager.handleTextFrame(socket, inventoryLoad({ prefixCacheReset: true }), now);
+      await manager.handleTextFrame(
+        socket,
+        inventoryLoad({ prefixCacheReset: true, running: 2 }),
+        at(1_500),
+      );
+      expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(12_000);
+      expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(2);
+      expect(pendingResets(manager).size).toBe(0);
+      manager.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("bounds the endpoint load keys a session keeps", async () => {

@@ -107,6 +107,187 @@ use crate::slug::generated_slug;
 use crate::startup::{self, TerminalStartup};
 use crate::tokens::{CompletionTextCollector, standardized_completion_metrics};
 
+/// The session reactor is the sole deployment publisher. A complete snapshot
+/// must receive its durable ACK before its endpoints, then the next update.
+#[derive(Default)]
+struct DeploymentPublisher {
+    initialized: bool,
+    pending: Option<(DeploymentPublication, Instant)>,
+    watchdog: Option<PublicationWatchdog>,
+}
+
+/// One watchdog per connection enforces the absolute deadline even when a
+/// blocking TLS/plain write keeps making partial progress. It owns a clone of
+/// this exact socket, never a device name or successor connection.
+type PublicationDeadlineSignals = (
+    std::sync::Mutex<(bool, Option<Instant>)>,
+    std::sync::Condvar,
+);
+struct PublicationWatchdog {
+    state: Arc<PublicationDeadlineSignals>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl PublicationWatchdog {
+    fn start(stream: &tungstenite::stream::MaybeTlsStream<std::net::TcpStream>) -> Result<Self> {
+        let tcp = match stream {
+            tungstenite::stream::MaybeTlsStream::Plain(tcp) => tcp,
+            tungstenite::stream::MaybeTlsStream::Rustls(tls) => &tls.sock,
+            _ => anyhow::bail!("unsupported websocket deadline transport"),
+        }
+        .try_clone()
+        .context("cloning websocket deadline socket")?;
+        let state = Arc::new((
+            std::sync::Mutex::new((false, None::<Instant>)),
+            std::sync::Condvar::new(),
+        ));
+        let watched = state.clone();
+        let join = thread::Builder::new()
+            .name("wsmp-publication-deadline".into())
+            .spawn(move || {
+                let (lock, wake) = &*watched;
+                let Ok(mut state) = lock.lock() else {
+                    let _ = tcp.shutdown(std::net::Shutdown::Both);
+                    return;
+                };
+                loop {
+                    if state.0 {
+                        return;
+                    }
+                    if let Some(deadline) = state.1 {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            let _ = tcp.shutdown(std::net::Shutdown::Both);
+                            return;
+                        }
+                        match wake.wait_timeout(state, deadline - now) {
+                            Ok((next, _)) => state = next,
+                            Err(_) => {
+                                let _ = tcp.shutdown(std::net::Shutdown::Both);
+                                return;
+                            }
+                        }
+                    } else {
+                        match wake.wait(state) {
+                            Ok(next) => state = next,
+                            Err(_) => {
+                                let _ = tcp.shutdown(std::net::Shutdown::Both);
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+            .context("starting websocket publication deadline")?;
+        Ok(Self {
+            state,
+            join: Some(join),
+        })
+    }
+
+    fn arm(&self, deadline: Option<Instant>) -> Result<()> {
+        let mut state = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("websocket publication deadline unavailable"))?;
+        state.1 = deadline;
+        self.state.1.notify_all();
+        Ok(())
+    }
+}
+
+impl Drop for PublicationWatchdog {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.0.lock() {
+            state.0 = true;
+            self.state.1.notify_all();
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+enum DeploymentPublication {
+    Snapshot { id: String, publish_endpoints: bool },
+    Endpoints { id: String },
+}
+
+impl DeploymentPublisher {
+    fn check_deadline(&self) -> RelaySessionResult<()> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(_, deadline)| Instant::now() >= *deadline)
+        {
+            return Err(RelaySessionError::Reconnectable {
+                error: anyhow::anyhow!("deployment publication acknowledgement timed out"),
+                reset_backoff: true,
+            });
+        }
+        Ok(())
+    }
+    fn begin(&mut self, id: String, publish_endpoints: bool) -> Result<()> {
+        anyhow::ensure!(
+            self.pending.is_none(),
+            "deployment publication already pending"
+        );
+        self.initialized = true;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        if let Some(watchdog) = &self.watchdog {
+            watchdog.arm(Some(deadline))?;
+        }
+        self.pending = Some((
+            DeploymentPublication::Snapshot {
+                id,
+                publish_endpoints,
+            },
+            deadline,
+        ));
+        Ok(())
+    }
+
+    fn acknowledge_snapshot(&mut self, id: &str) -> Result<bool> {
+        let Some((
+            DeploymentPublication::Snapshot {
+                id: expected,
+                publish_endpoints,
+            },
+            deadline,
+        )) = &self.pending
+        else {
+            anyhow::bail!("unexpected deployment inventory acknowledgement");
+        };
+        anyhow::ensure!(
+            expected == id && Instant::now() < *deadline,
+            "stale deployment inventory acknowledgement"
+        );
+        let publish_endpoints = *publish_endpoints;
+        if let Some(watchdog) = &self.watchdog {
+            watchdog.arm(None)?;
+        }
+        self.pending = None;
+        Ok(publish_endpoints)
+    }
+
+    fn acknowledge_endpoints(&mut self, id: &str) -> Result<()> {
+        let Some((DeploymentPublication::Endpoints { id: expected }, deadline)) = &self.pending
+        else {
+            anyhow::bail!("unexpected deployment endpoint acknowledgement");
+        };
+        anyhow::ensure!(
+            expected == id && Instant::now() < *deadline,
+            "stale deployment endpoint acknowledgement"
+        );
+        if let Some(watchdog) = &self.watchdog {
+            watchdog.arm(None)?;
+        }
+        self.pending = None;
+        Ok(())
+    }
+}
+
 const RELAY_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const RELAY_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(300);
 /// How long the main loop parks in `socket.read()` before waking to drain worker
@@ -459,6 +640,10 @@ pub fn connect_foreground() -> Result<()> {
     let mut reconnect_delay = RELAY_RECONNECT_INITIAL_DELAY;
     loop {
         check_shutdown()?;
+        if crate::deployments::refresh_snapshot().is_err() {
+            crate::deployments::replace_snapshot(Vec::new(), Vec::new(), Vec::new());
+            tracing::warn!("deployment snapshot unavailable; publication remains closed");
+        }
         // Reuse only a locally unchanged snapshot that the server has already
         // acknowledged. Reconnect registration still replaces the server
         // inventory, but no network probe or config rewrite is needed.
@@ -586,7 +771,7 @@ fn inventory_snapshot_from_config_with_remote(
     config: &Config,
     remote: &[crate::protocol::RemoteEngineAdapter],
 ) -> Vec<EndpointInventory> {
-    config
+    let mut endpoints = config
         .endpoints
         .iter()
         .filter(|endpoint| endpoint.enabled)
@@ -604,7 +789,9 @@ fn inventory_snapshot_from_config_with_remote(
             );
             crate::protocol::endpoint_inventory_with(endpoint, status, adapter.as_ref())
         })
-        .collect()
+        .collect::<Vec<_>>();
+    endpoints.extend(crate::deployments::managed_inventory());
+    endpoints
 }
 
 fn acknowledged_inventory_matches_config(
@@ -864,6 +1051,7 @@ fn run_relay_session(
     _control: &mut ControlServer,
     last_inventory_revision: &mut Option<crate::protocol::InventoryRevision>,
 ) -> RelaySessionResult<()> {
+    let mut remote_adapters = crate::engine_adapter::load_remote_adapters().unwrap_or_default();
     let mut request = ws_url
         .as_str()
         .into_client_request()
@@ -888,7 +1076,15 @@ fn run_relay_session(
             "server did not accept relay websocket subprotocol `{RELAY_SUBPROTOCOL}`"
         )));
     }
-    set_socket_read_timeout(socket.get_mut(), RELAY_SOCKET_POLL_INTERVAL);
+    set_socket_timeouts(
+        socket.get_mut(),
+        RELAY_SOCKET_POLL_INTERVAL,
+        Duration::from_secs(5),
+    )
+    .map_err(|error| RelaySessionError::Reconnectable {
+        error,
+        reset_backoff: false,
+    })?;
 
     // Created before hello so an early `?` still drops (and kills) every child.
     let (worker_tx, worker_rx) = mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
@@ -960,14 +1156,82 @@ fn run_relay_session(
     let mut reload_preparing = false;
 
     let mut registered = false;
+    let mut deployment_publisher = DeploymentPublisher {
+        watchdog: Some(
+            PublicationWatchdog::start(socket.get_ref()).map_err(RelaySessionError::Fatal)?,
+        ),
+        ..Default::default()
+    };
+    #[cfg(unix)]
+    let deployment_runner = crate::deployments::service::Runner::start().ok();
     // 2.7 telemetry starts after `hello.ok` and stops with this session.
     let mut telemetry: Option<crate::telemetry::Telemetry> = None;
     let mut next_telemetry_sync = Instant::now();
     let mut next_heartbeat =
         Instant::now() + Duration::from_secs(RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS);
-    let result = loop {
+    let result = 'session: loop {
         if let Some(signal) = crate::shutdown::requested() {
-            break Err(RelaySessionError::Shutdown(signal));
+            break 'session Err(RelaySessionError::Shutdown(signal));
+        }
+        if let Err(error) = deployment_publisher.check_deadline() {
+            break 'session Err(error);
+        }
+        if registered && !deployment_publisher.initialized {
+            let snapshot = match crate::deployments::instances_frames() {
+                Ok(snapshot) => snapshot,
+                Err(error) => break 'session Err(RelaySessionError::Fatal(error)),
+            };
+            if let Err(error) = deployment_publisher.begin(snapshot.id, false) {
+                break 'session Err(RelaySessionError::Fatal(error));
+            }
+            for text in snapshot.frames {
+                if let Err(error) = deployment_publisher.check_deadline() {
+                    break 'session Err(error);
+                }
+                if let Err(error) = socket.send(Message::Text(text.into())) {
+                    break 'session Err(websocket_session_error(
+                        error,
+                        "reporting deployment instances",
+                        true,
+                    ));
+                }
+            }
+        }
+        #[cfg(unix)]
+        if registered
+            && deployment_publisher.pending.is_none()
+            && let Some(runner) = deployment_runner.as_ref()
+            && let Some(update) = runner.try_update()
+        {
+            crate::deployments::replace_snapshot(
+                update.instances,
+                update.published,
+                update.endpoints,
+            );
+            let frames = (|| -> RelaySessionResult<()> {
+                if let Some(result) = update.result {
+                    let text = serde_json::to_string(&result)
+                        .map_err(|error| RelaySessionError::Fatal(error.into()))?;
+                    socket.send(Message::Text(text.into())).map_err(|error| {
+                        websocket_session_error(error, "sending deployment result", true)
+                    })?;
+                }
+                let snapshot =
+                    crate::deployments::instances_frames().map_err(RelaySessionError::Fatal)?;
+                deployment_publisher
+                    .begin(snapshot.id, true)
+                    .map_err(RelaySessionError::Fatal)?;
+                for text in snapshot.frames {
+                    deployment_publisher.check_deadline()?;
+                    socket.send(Message::Text(text.into())).map_err(|error| {
+                        websocket_session_error(error, "sending deployment instances", true)
+                    })?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = frames {
+                break 'session Err(error);
+            }
         }
         if let Err(error) = drain_worker_output(
             &mut socket,
@@ -1055,14 +1319,16 @@ fn run_relay_session(
         }
 
         if registered && Instant::now() >= next_telemetry_sync {
+            let mut telemetry_endpoints = config.endpoints.clone();
+            telemetry_endpoints.extend(crate::deployments::managed_endpoints());
             // Follow acknowledged reloads: the sampled endpoints are the live
             // routing map's.
             match telemetry.as_ref() {
-                Some(telemetry) => telemetry.set_endpoints(&config.endpoints),
+                Some(telemetry) => telemetry.set_endpoints(&telemetry_endpoints),
                 None => {
                     telemetry = Some(crate::telemetry::Telemetry::start(
                         worker_tx.clone(),
-                        &config.endpoints,
+                        &telemetry_endpoints,
                         crate::metric_sources::RunnerSettings::from_environment(
                             startup.allow_remote_metric_sources(),
                         ),
@@ -1106,7 +1372,9 @@ fn run_relay_session(
                 #[cfg(unix)]
                 &mut files,
                 &mut registered,
+                &mut deployment_publisher,
                 telemetry.as_ref(),
+                &mut remote_adapters,
             ),
             Ok(Message::Binary(bytes)) => handle_binary(
                 &mut socket,
@@ -1142,6 +1410,9 @@ fn run_relay_session(
                 true,
             )),
         };
+        if let Err(error) = deployment_publisher.check_deadline() {
+            break Err(error);
+        }
         if let Err(error) = outcome {
             break Err(error);
         }
@@ -1663,11 +1934,39 @@ fn handle_text<S>(
     execs: &mut ExecRegistry,
     #[cfg(unix)] files: &mut crate::file_relay::FileRelay,
     registered: &mut bool,
+    deployment_publisher: &mut DeploymentPublisher,
     telemetry: Option<&crate::telemetry::Telemetry>,
+    remote_adapters: &mut Vec<crate::protocol::RemoteEngineAdapter>,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
 {
+    if text.len() <= crate::protocol::RELAY_JSON_CONTROL_MAX_BYTES
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+        && value.get("type").and_then(serde_json::Value::as_str) == Some("deployment.job")
+    {
+        let job = match serde_json::from_value::<crate::deployments::Job>(value) {
+            Ok(job) => job,
+            Err(_) => {
+                tracing::warn!("malformed deployment job refused");
+                return Ok(());
+            }
+        };
+        #[cfg(unix)]
+        let refused = !*registered || crate::deployments::service::submit(job.clone()).is_err();
+        #[cfg(not(unix))]
+        let refused = true;
+        if refused {
+            let result =
+                crate::deployments::JobResult::failure(&job, "deployment_worker_unavailable");
+            let text = serde_json::to_string(&result)
+                .map_err(|error| RelaySessionError::Fatal(error.into()))?;
+            socket
+                .send(Message::Text(text.into()))
+                .map_err(|error| websocket_session_error(error, "refusing deployment job", true))?;
+        }
+        return Ok(());
+    }
     let message = match parse_server_control(text) {
         Ok(message) => message,
         Err(error) => {
@@ -1677,9 +1976,46 @@ where
     let state_dir = crate::paths::state_dir().ok();
     match message {
         ServerControlMessage::HelloOk { id, revision, .. } => {
+            if *registered {
+                return Err(RelaySessionError::Fatal(anyhow::anyhow!(
+                    "duplicate relay registration acknowledgement"
+                )));
+            }
             *registered = true;
             *last_inventory_revision = Some(revision);
             tracing::info!(id, "relay registration accepted");
+        }
+        ServerControlMessage::DeploymentInstancesOk { snapshot_id } => {
+            deployment_publisher.check_deadline()?;
+            let deadline = deployment_publisher
+                .pending
+                .as_ref()
+                .map(|(_, deadline)| *deadline)
+                .context("unexpected deployment inventory acknowledgement")
+                .map_err(RelaySessionError::Fatal)?;
+            if deployment_publisher
+                .acknowledge_snapshot(&snapshot_id)
+                .map_err(RelaySessionError::Fatal)?
+            {
+                let id = next_id("deployment-inventory");
+                if let Some(watchdog) = &deployment_publisher.watchdog {
+                    watchdog
+                        .arm(Some(deadline))
+                        .map_err(RelaySessionError::Fatal)?;
+                }
+                deployment_publisher.pending = Some((
+                    DeploymentPublication::Endpoints { id: id.clone() },
+                    deadline,
+                ));
+                send_control(
+                    socket,
+                    &ClientControlMessage::InventoryUpdate {
+                        id,
+                        endpoints: inventory_snapshot_from_config(config),
+                    },
+                    "publishing deployment inventory",
+                )?;
+            }
         }
         ServerControlMessage::HeartbeatPong { id, .. } => {
             tracing::debug!(id, "relay heartbeat acknowledged");
@@ -1689,6 +2025,19 @@ where
             revision,
             desired_capabilities: _,
         } => {
+            if id.starts_with("deployment-inventory-") {
+                deployment_publisher.check_deadline()?;
+                deployment_publisher
+                    .acknowledge_endpoints(&id)
+                    .map_err(RelaySessionError::Fatal)?;
+                if last_inventory_revision
+                    .as_ref()
+                    .is_none_or(|previous| revision.inventory_seq > previous.inventory_seq)
+                {
+                    *last_inventory_revision = Some(revision);
+                }
+                return Ok(());
+            }
             #[cfg(not(unix))]
             let _ = &id;
             #[cfg(unix)]
@@ -1753,6 +2102,12 @@ where
             }
         }
         ServerControlMessage::InventoryError { id, message } => {
+            if id.starts_with("deployment-inventory-") {
+                return Err(RelaySessionError::Reconnectable {
+                    error: anyhow::anyhow!("deployment endpoint publication rejected"),
+                    reset_backoff: true,
+                });
+            }
             tracing::warn!(id, message, "relay inventory rejected");
             #[cfg(unix)]
             if pending_reload
@@ -1847,6 +2202,7 @@ where
             start_relay_request(
                 socket,
                 config,
+                remote_adapters,
                 worker_tx,
                 workers,
                 recent_finished,
@@ -2044,8 +2400,9 @@ where
                 );
             }
             if let Some(telemetry) = telemetry {
-                telemetry.set_remote_adapters(adapters);
+                telemetry.set_remote_adapters(adapters.clone());
             }
+            *remote_adapters = adapters;
         }
     }
     Ok(())
@@ -2055,6 +2412,7 @@ where
 fn start_relay_request<S>(
     socket: &mut tungstenite::WebSocket<S>,
     config: &Config,
+    remote_adapters: &[crate::protocol::RemoteEngineAdapter],
     worker_tx: &SyncSender<FromWorker>,
     workers: &mut BTreeMap<String, WorkerHandle>,
     recent_finished: &RecentlyFinished,
@@ -2088,9 +2446,11 @@ where
         return Ok(());
     }
 
+    let managed = crate::deployments::managed_endpoints();
     let Some(endpoint) = config
         .endpoints
         .iter()
+        .chain(managed.iter())
         .find(|endpoint| endpoint.enabled && endpoint.slug == endpoint_slug)
     else {
         send_relay_error(
@@ -2128,7 +2488,7 @@ where
     };
 
     if count_first && expect_body {
-        let (method, adapter_count_route) = endpoint_count_plan(config, endpoint);
+        let (method, adapter_count_route) = endpoint_count_plan(config, endpoint, remote_adapters);
         let (cancellation, cancellation_rx) = CancellationHandle::new();
         let thread_tx = worker_tx.clone();
         let thread_cancellation = cancellation.clone();
@@ -2447,6 +2807,7 @@ struct CountFirstPlan {
 fn endpoint_count_plan(
     config: &Config,
     endpoint: &crate::config::EndpointConfig,
+    remote: &[crate::protocol::RemoteEngineAdapter],
 ) -> (
     Option<crate::count_context::CountContextMethod>,
     Option<String>,
@@ -2457,10 +2818,9 @@ fn endpoint_count_plan(
         .and_then(|probe| probe.engine.as_ref())
         .and_then(|engine| engine.count_context)
         .and_then(crate::count_context::CountContextFact::method);
-    let remote = crate::engine_adapter::load_remote_adapters().unwrap_or_default();
     let adapter_count_route = crate::engine_adapter::effective_engine_adapter(
         endpoint,
-        &remote,
+        remote,
         config.allow_remote_engine_adapters,
         &config.approved_remote_adapters,
     )
@@ -3306,8 +3666,11 @@ where
                         "expected hello.challenge, received {type_name}"
                     )));
                 }
-                Err(_) => {
-                    return Err(old_server_upgrade_error());
+                Err(error) => {
+                    return Err(RelaySessionError::Reconnectable {
+                        error: anyhow::anyhow!("invalid hello.challenge frame: {error}"),
+                        reset_backoff: false,
+                    });
                 }
             },
             Ok(Message::Ping(bytes)) => {
@@ -3323,7 +3686,10 @@ where
             }
             Ok(Message::Close(frame)) => {
                 tracing::warn!(?frame, "relay websocket closed by server before hello");
-                return Err(old_server_upgrade_error());
+                return Err(RelaySessionError::Reconnectable {
+                    error: anyhow::anyhow!("relay websocket closed before hello.challenge"),
+                    reset_backoff: false,
+                });
             }
             Err(tungstenite::Error::Io(err))
                 if err.kind() == std::io::ErrorKind::WouldBlock
@@ -3436,20 +3802,22 @@ fn inventory_from_config(config: &mut Config) -> Vec<EndpointInventory> {
     inventory_snapshot_from_config(config)
 }
 
-fn set_socket_read_timeout(
+fn set_socket_timeouts(
     stream: &mut tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
-    timeout: Duration,
-) {
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Result<()> {
     let tcp = match stream {
         tungstenite::stream::MaybeTlsStream::Plain(stream) => Some(stream),
         tungstenite::stream::MaybeTlsStream::Rustls(stream) => Some(&mut stream.sock),
         _ => None,
     };
-    if let Some(tcp) = tcp
-        && let Err(error) = tcp.set_read_timeout(Some(timeout))
-    {
-        tracing::warn!(error = %error, "failed to set websocket read timeout");
-    }
+    let tcp = tcp.context("unsupported websocket transport timeout configuration")?;
+    tcp.set_read_timeout(Some(read_timeout))
+        .context("setting websocket read timeout")?;
+    tcp.set_write_timeout(Some(write_timeout))
+        .context("setting websocket write timeout")?;
+    Ok(())
 }
 
 fn websocket_url(server_url: &str) -> Result<Url> {
@@ -3496,6 +3864,142 @@ fn next_id(prefix: &str) -> String {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn publication_watchdog_interrupts_actual_stalled_websocket_write() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let (stop, stopped) = mpsc::channel();
+        let peer = thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("accept");
+            let _socket = tungstenite::accept(tcp).expect("handshake");
+            let _ = stopped.recv_timeout(Duration::from_secs(5));
+        });
+        let (mut socket, _) = connect(format!("ws://{address}")).expect("client");
+        set_socket_timeouts(
+            socket.get_mut(),
+            RELAY_SOCKET_POLL_INTERVAL,
+            Duration::from_secs(5),
+        )
+        .expect("timeouts");
+        let guard = PublicationWatchdog::start(socket.get_ref()).expect("guard");
+        socket
+            .send(Message::Text("legitimate initial frame".into()))
+            .expect("normal send");
+        let start = Instant::now();
+        guard
+            .arm(Some(start + Duration::from_millis(150)))
+            .expect("arm");
+        let mut failed = false;
+        for _ in 0..512 {
+            if socket
+                .send(Message::Binary(vec![0; 65_536].into()))
+                .is_err()
+            {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "a stopped reader must interrupt the actual write");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "absolute deadline beats the five-second native write timeout"
+        );
+        drop(guard);
+        let _ = stop.send(());
+        peer.join().expect("join peer");
+    }
+
+    #[test]
+    fn publication_watchdog_disarm_rearm_drop_preserve_live_and_successor_sockets() {
+        let pair = || {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+            let tcp = std::net::TcpStream::connect(listener.local_addr().expect("address"))
+                .expect("connect");
+            let (peer, _) = listener.accept().expect("accept");
+            (tungstenite::stream::MaybeTlsStream::Plain(tcp), peer)
+        };
+        let (mut socket, _peer) = pair();
+        let guard = PublicationWatchdog::start(&socket).expect("guard");
+        guard
+            .arm(Some(Instant::now() + Duration::from_millis(40)))
+            .expect("arm");
+        guard.arm(None).expect("disarm");
+        thread::sleep(Duration::from_millis(70));
+        socket
+            .write_all(b"still live after ACK")
+            .expect("disarmed socket remains live");
+        guard
+            .arm(Some(Instant::now() + Duration::from_millis(40)))
+            .expect("old phase");
+        guard
+            .arm(Some(Instant::now() + Duration::from_millis(200)))
+            .expect("next phase");
+        thread::sleep(Duration::from_millis(70));
+        socket
+            .write_all(b"next phase live")
+            .expect("old deadline cannot terminate a rearmed phase");
+        let (mut successor, _successor_peer) = pair();
+        drop(guard);
+        thread::sleep(Duration::from_millis(220));
+        socket
+            .write_all(b"drop joined without killing socket")
+            .expect("drop cancels timer");
+        successor
+            .write_all(b"separate connection")
+            .expect("old guard cannot affect successor");
+    }
+
+    #[test]
+    fn deployment_publication_requires_exact_ack_and_excludes_overlap() {
+        let mut publisher = DeploymentPublisher::default();
+        publisher.begin("a".repeat(32), true).expect("first");
+        assert!(publisher.begin("b".repeat(32), true).is_err());
+        assert!(publisher.acknowledge_snapshot(&"b".repeat(32)).is_err());
+        assert!(publisher.pending.is_some());
+        assert!(
+            publisher
+                .acknowledge_snapshot(&"a".repeat(32))
+                .expect("ACK")
+        );
+        assert!(publisher.acknowledge_snapshot(&"a".repeat(32)).is_err());
+        publisher.pending = Some((
+            DeploymentPublication::Endpoints {
+                id: "inventory-a".into(),
+            },
+            Instant::now() + Duration::from_secs(30),
+        ));
+        assert!(publisher.begin("b".repeat(32), true).is_err());
+        assert!(publisher.acknowledge_endpoints("inventory-b").is_err());
+        publisher
+            .acknowledge_endpoints("inventory-a")
+            .expect("endpoints ACK");
+        publisher.begin("b".repeat(32), false).expect("next");
+        assert!(
+            !publisher
+                .acknowledge_snapshot(&"b".repeat(32))
+                .expect("empty initial ACK")
+        );
+    }
+
+    #[test]
+    fn deployment_publication_expired_ack_does_not_release_successor() {
+        let mut publisher = DeploymentPublisher::default();
+        publisher.begin("a".repeat(32), true).expect("begin");
+        if let Some((_, deadline)) = &mut publisher.pending {
+            *deadline = Instant::now();
+        }
+        assert!(publisher.acknowledge_snapshot(&"a".repeat(32)).is_err());
+        assert!(publisher.pending.is_some());
+        let mut successor = DeploymentPublisher::default();
+        successor.begin("b".repeat(32), false).expect("successor");
+        assert!(successor.acknowledge_snapshot(&"a".repeat(32)).is_err());
+        assert!(
+            !successor
+                .acknowledge_snapshot(&"b".repeat(32))
+                .expect("successor ACK")
+        );
+    }
 
     #[cfg(unix)]
     #[test]
@@ -3871,6 +4375,77 @@ mod tests {
         )
     }
 
+    fn challenge_socket(message: Message) -> tungstenite::WebSocket<io::Cursor<Vec<u8>>> {
+        let mut server = sink_socket();
+        server.send(message).unwrap();
+        tungstenite::WebSocket::from_raw_socket(
+            io::Cursor::new(server.get_ref().written.clone()),
+            tungstenite::protocol::Role::Client,
+            None,
+        )
+    }
+
+    #[test]
+    fn hello_challenge_transient_close_and_parse_failure_reconnect() {
+        for message in [Message::Close(None), Message::Text("{garbled".into())] {
+            let mut socket = challenge_socket(message);
+            assert!(matches!(
+                wait_for_hello_challenge(&mut socket),
+                Err(RelaySessionError::Reconnectable {
+                    reset_backoff: false,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn hello_challenge_keeps_coded_internal_retryable_and_old_server_actionable() {
+        let mut socket = challenge_socket(Message::Text(
+            r#"{"type":"protocol.error","failure":"protocol_error","message":"database unavailable","code":"internal"}"#
+                .into(),
+        ));
+        assert!(matches!(
+            wait_for_hello_challenge(&mut socket),
+            Err(RelaySessionError::Reconnectable {
+                reset_backoff: false,
+                ..
+            })
+        ));
+        let mut socket = challenge_socket(Message::Text(
+            r#"{"type":"protocol.error","failure":"protocol_error","message":"Registration was not received in time."}"#
+                .into(),
+        ));
+        match wait_for_hello_challenge(&mut socket) {
+            Err(RelaySessionError::Fatal(error)) => assert!(
+                error
+                    .to_string()
+                    .contains("upgrade the WS Model Proxy server")
+            ),
+            _ => panic!("expected actionable old server refusal"),
+        }
+    }
+
+    #[test]
+    fn hello_challenge_requires_origin_and_accepts_current_server() {
+        let mut socket = challenge_socket(Message::Text(
+            r#"{"type":"hello.challenge","nonce":"AAAAAAAAAAAAAAAAAAAAAA"}"#.into(),
+        ));
+        assert!(matches!(
+            wait_for_hello_challenge(&mut socket),
+            Err(RelaySessionError::Fatal(_))
+        ));
+        let mut socket = challenge_socket(Message::Text(
+            r#"{"type":"hello.challenge","nonce":"AAAAAAAAAAAAAAAAAAAAAA","origin":"https://example.test"}"#.into()));
+        assert_eq!(
+            wait_for_hello_challenge(&mut socket).ok().unwrap(),
+            (
+                "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                "https://example.test".to_string()
+            )
+        );
+    }
+
     /// A malformed `exec.start` / `term.spawn` names a command but cannot be
     /// read as a request, so it never reaches a registry. The daemon still
     /// owes that command its one outcome line (AC 8): without the explicit
@@ -3954,6 +4529,7 @@ mod tests {
         let result = start_relay_request(
             &mut socket,
             &config,
+            &[],
             &worker_tx,
             &mut workers,
             &recent_finished,
@@ -3992,6 +4568,7 @@ mod tests {
         let result = start_relay_request(
             &mut socket,
             &config,
+            &[],
             &worker_tx,
             &mut workers,
             &recent_finished,

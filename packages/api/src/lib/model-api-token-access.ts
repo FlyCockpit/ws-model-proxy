@@ -63,6 +63,8 @@ export type VisibleModelPoolTarget = {
   /** Configured external fallback (provider) members, regardless of health. */
   externalMemberCount: number;
   externalEquivalentModel?: string | null;
+  embeddingContract?: Prisma.JsonValue | null;
+  paidWarmProtectionEnabled?: boolean;
   ownKeyProviderModelId?: string | null;
   /**
    * Static availability for this viewer: deployment switch, pool fallback,
@@ -132,6 +134,8 @@ const modelPoolSelect = {
   fallbackEnabled: true,
   fallbackForGrantees: true,
   externalEquivalentModel: true,
+  embeddingContract: true,
+  paidWarmProtectionEnabled: true,
   allowLossyDeveloperRoleCollapse: true,
   recommendedSurfaceOverride: true,
   PoolMembers: {
@@ -211,6 +215,8 @@ function serializeModelPool(
     fallbackEnabled: row.fallbackEnabled,
     fallbackForGrantees: row.fallbackForGrantees,
     externalEquivalentModel: row.externalEquivalentModel,
+    embeddingContract: row.embeddingContract,
+    paidWarmProtectionEnabled: row.paidWarmProtectionEnabled,
     externalMemberCount: (row.PoolMembers ?? []).length,
     ...disclosure,
     externalRoutes: disclosure.effectiveProviderEgress ? ["pool-fallback"] : [],

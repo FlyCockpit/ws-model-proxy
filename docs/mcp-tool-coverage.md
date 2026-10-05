@@ -41,6 +41,7 @@ fails the suite when a leaf is unclassified.
 | `cliCredentials.deviceLoginRequest` | — (excluded) | — | — | — | — | — | Browser device-login approval page read; not an MCP surface. |
 | `cliCredentials.exchangeDeviceCode` | — (excluded) | — | — | — | — | — | Public device-flow credential exchange; not an MCP surface. |
 | `cliCredentials.listTokens` | `cli_tokens_list` | read | — | pure | — | — | — |
+| `cliCredentials.resetTokenIdentity` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
 | `cliCredentials.revokeToken` | `cli_token_revoke` | write | DELETE | destructive | — | — | — |
 | `core:forwarderCliCommandResult` | `forwarder_cli_command_result` | write | — | pure | — | — | — |
 | `core:forwarderCliCommandRun` | `forwarder_cli_command_run` | write | RUN | external | — | — | — |
@@ -58,6 +59,21 @@ fails the suite when a leaf is unclassified.
 | `core:model-api/runPoolMemberTest` | `forwarder_pool_member_test` | write | RUN | cost | — | — | — |
 | `deploymentFeatures` | — (excluded) | — | — | — | — | — | Admin-only deployment inventory, including keyring status. |
 | `deploymentFlags` | — (excluded) | — | — | — | — | — | Signed-in product gates. The browser reads them; MCP does not. |
+| `deployments.applyPlan` | `deployment_plan_apply` | write | RUN | external | — | — | — |
+| `deployments.confirmPlan` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
+| `deployments.createConfig` | `deployment_config_create` | write | — | pure | — | — | — |
+| `deployments.deleteConfig` | — (excluded) | — | — | — | — | — | Human-only recipe deletion; agents may edit recipes but never delete them. |
+| `deployments.getConfig` | `deployment_config_get` | read | — | pure | — | — | — |
+| `deployments.getInstance` | `deployment_instance_get` | read | — | pure | — | — | — |
+| `deployments.listConfigs` | `deployment_configs_list` | read | — | pure | — | — | — |
+| `deployments.listInstances` | `deployment_instances_list` | read | — | pure | — | — | — |
+| `deployments.pendingPlans` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
+| `deployments.planStart` | `deployment_plan_start` | write | — | pure | — | — | — |
+| `deployments.planStatus` | `deployment_plan_status` | read | — | pure | — | — | — |
+| `deployments.planStop` | `deployment_plan_stop` | write | — | pure | — | — | — |
+| `deployments.setAgentsMayPreempt` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
+| `deployments.setNodeGrant` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
+| `deployments.updateConfig` | `deployment_config_update` | write | — | pure | — | — | — |
 | `devices.list` | — (excluded) | — | — | — | — | — | Admin-only device administration. |
 | `devices.revoke` | — (excluded) | — | — | — | — | — | Admin-only device administration. |
 | `forwarderManagement.addPoolMember` | `forwarder_pool_member_add` | write | — | pure | — | — | — |
@@ -104,6 +120,10 @@ fails the suite when a leaf is unclassified.
 | `forwarderManagement.updatePoolMember` | `forwarder_pool_member_update` | write | — | pure | — | `WMP_PUBLIC_PROVIDER_EGRESS_ENABLED` | — |
 | `forwarderManagement.updateProfileSlug` | — (excluded) | — | — | — | — | — | Profile-slug procedures are account identity management. |
 | `forwarderManagement.visibleModels` | `forwarder_models_visible_list` | read | — | pure | — | — | — |
+| `inferenceContributions.accept` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
+| `inferenceContributions.list` | `inference_contributions_list` | read | — | pure | — | — | — |
+| `inferenceContributions.offer` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
+| `inferenceContributions.revoke` | `inference_contribution_revoke` | write | — | pure | — | — | — |
 | `mcpGrants.listMine` | — (excluded) | — | — | — | — | — | Human-only MCP grant management (Phase 7): a connected MCP client must not enumerate the user's other authorizations. |
 | `mcpGrants.revokeMine` | — (excluded) | — | — | — | — | — | Human-only MCP grant revocation (Phase 7): only the browser session may kill grant generations. |
 | `mcpTokens.create` | — (excluded) | — | — | — | — | — | Returns the one-time raw MCP personal-token secret; human-only browser session. |
@@ -205,7 +225,7 @@ with started:true when the server received acceptance and started:null otherwise
 and blocked done before acceptance, and undispatched failures remain definitive.
 Finished file answers and their single audit event do not change on late reports.
 Only a supervised start id is delivered despite MCP abort; headless file results keep
-the abort fence. See [CLI file tools](mcp.md#cli-file-tools-relay-protocol-24).
+the abort fence. See [CLI file tools](mcp.md#cli-file-tools-relay-protocol-29).
 
 Overwrite rename preflights before capture and supports exchange-less no-replace
 and link mounts. Stable-inode link publication links the source onto the destination
@@ -264,7 +284,7 @@ MCP tools can never grant it:
   with no confirmation. Null uses each pool's wait. Pool `externalAfterWaitMs`
   is an owner floor: callers may only lengthen, up to the local capacity wait
   budget. A request header cannot go below the pool floor or past that budget.
-  Grantees cannot shorten below the pool floor. Every change writes a
+  Neither owners nor grantees can shorten requests below the pool floor. Every change writes a
   `TOKEN_EXTERNAL_WAIT_UPDATED` provider audit event. MCP diagnostics cannot
   use `:external`;
 - `providerManagement.setAllowDataCollection` (the OpenRouter
@@ -293,6 +313,11 @@ always seen:
 `forwarder_pool_fallback_get` reads the same data as the dashboard: owners
 get the switches, the external members in fallback order and the own-key
 request count; grantees get provider types only and their own-key route.
+
+`forwarder_affinity_clear` returns `{cleared: true, reclamation: "pending"}`.
+The pool's old hints are immediately ineligible; bounded background work reclaims
+their metadata. This does not delete the backend's stored Responses state or
+another pool's private hints. Ownership and DELETE confirmation remain required.
 
 No tool result can carry a secret value WMP holds (provider API keys,
 encrypted credential material, token secrets or hashes, device-flow and 2FA

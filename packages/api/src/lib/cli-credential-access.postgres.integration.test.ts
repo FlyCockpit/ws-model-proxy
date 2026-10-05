@@ -540,7 +540,8 @@ integration("device-code exchange with real PostgreSQL", () => {
       // The exchange holds the device and has read the owner FOR SHARE: the
       // mark waits for it instead of deleting around it.
       const deleting = outcome(deletion.deleteUserDurably(prisma, user.id));
-      await waitingOrSettled('%UPDATE "user"%', deleting);
+      await waitingOrSettled(OWNER_FENCE_WAITER, deleting);
+      expect(await lockWaiters(OWNER_FENCE_WAITER)).toBeGreaterThan(0);
       await pause.release();
       const [loginResult, deleteResult] = await Promise.all([login, deleting]);
 
@@ -807,6 +808,7 @@ integration("device-code exchange with real PostgreSQL", () => {
       "terminal relay execution attempt is immutable",
       "active relay execution ownership is immutable",
       "relay execution attempt identity is immutable",
+      "provider budget rules are immutable",
     ]) {
       expect(deletion.isPermanentParentDeletionFailure(await raise(message))).toBe(false);
     }
@@ -814,7 +816,6 @@ integration("device-code exchange with real PostgreSQL", () => {
       "provider_budget_settlement is append-only",
       "provider_attempt is durable history",
       "provider budget reservations cannot be deleted",
-      "provider budget rules are immutable",
     ]) {
       expect(deletion.isPermanentParentDeletionFailure(await raise(message))).toBe(true);
     }

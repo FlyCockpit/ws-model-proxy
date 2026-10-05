@@ -19,7 +19,7 @@ import {
 } from "@ws-model-proxy/db/forwarder-security";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
-import { protectedProcedure } from "../index";
+import { humanProcedure, protectedProcedure } from "../index";
 import {
   activeMcpPersonalTokenWhere,
   digestMcpPersonalTokenSecret,
@@ -134,7 +134,7 @@ export const mcpTokensRouter = {
       return rows.map(serializeToken);
     }),
 
-  create: protectedProcedure
+  create: humanProcedure
     .input(
       z
         .object({
@@ -226,7 +226,7 @@ export const mcpTokensRouter = {
    * commands and file ops started under old capabilities are cancelled after commit
    * when the edit narrows.
    */
-  updateMine: protectedProcedure
+  updateMine: humanProcedure
     .input(
       z
         .object({
@@ -285,7 +285,7 @@ export const mcpTokensRouter = {
       return serializeToken(row);
     }),
 
-  revokeMine: protectedProcedure
+  revokeMine: humanProcedure
     .input(z.object({ id: z.string().min(1) }))
     .handler(async ({ input, context }) => {
       const userId = context.session.user.id;

@@ -118,6 +118,22 @@ describe("engine-load rollup writer", () => {
     });
   });
 
+  it("logs rows rejected one by one, with counts, instead of losing them silently", async () => {
+    const logs: unknown[] = [];
+    const writer = createEngineLoadRollupWriter({
+      clock: () => NOW.getTime() + 2_000,
+      write: async () => 0,
+      resolveCapacities: async () => [
+        { capacityId: "cap-1", endpointSlug: "gpu", modelSlug: "qwen" },
+      ],
+      log: (counts) => logs.push(counts),
+    });
+    writers.push(writer);
+    writer.observe(sample());
+    await writer.flushNow();
+    expect(logs).toEqual([{ written: 0, failed: 1 }]);
+  });
+
   it("maps a null sample slug onto every capacity on that endpoint", async () => {
     const writes: unknown[] = [];
     const writer = createEngineLoadRollupWriter({

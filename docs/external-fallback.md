@@ -12,14 +12,37 @@ caller asks for it in the model name and every party allows it.
   - The variant is lowercase and used once. Unknown, uppercase, or stacked
     variants, and any suffix on a direct model id, return `404 model_not_found`
     with a message naming the correct id.
-  - Accepted on `/v1/chat/completions`, `/v1/responses`, and `/v1/messages`.
+  - Accepted on `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, and `/v1/embeddings`.
     `count_tokens` treats it as the plain name and never contacts a provider;
     on a pool with only external members it returns
     `400 local_members_required`.
-    Embeddings, audio, and multipart requests reject it with
+    Embeddings require an exact declared identity contract (below). Audio and multipart requests reject it with
     `400 external_variant_unsupported`.
 
 ## When a request may go external
+
+Local service comes first. After a bounded cache-holder wait, eligible local alternatives
+are used before paid fallback. Cache protection alone permits a paid redirect only when
+the pool owner explicitly enables `paidWarmProtectionEnabled` (default false, human-only).
+Token/provider consent is still required; rate limits and authorization failures never
+authorize a fallback bypass. Connected, published, eligible local serving members are
+required for every pool model variant to appear in `/v1/models`; saturation alone does
+not hide an actively served pool.
+
+### Embedding identity and privacy
+
+For `:external` embeddings the pool and provider must declare the exact same
+`{model, revision, dimensions, normalization, vectorSpace}` contract. Normalization is
+`none` or `l2`; revision and vector space identify immutable embedding semantics.
+Matching vector dimensions alone never authorizes substitution. WMP forwards to the
+provider's native embeddings operation and accounts input tokens, without chat KV affinity.
+Contracts and consent are checked again immediately before a provider send.
+
+WMP does not persist prompts, chat messages or responses. Native Responses requests
+default to `store: false`; `store: true` requires explicit caller input and delegates
+storage to that backend. Content-free routing/usage metadata remains bounded. Provider
+privacy controls remain enforced; this is not a guarantee about an arbitrary provider's
+independent logging practices.
 
 For owner-paid pool fallback, all of these must hold:
 
@@ -133,7 +156,8 @@ The request goes external only after local routing could not serve it:
   idle slot hold protected warm sessions (including your own; see
   [Warm-session protection](#warm-session-protection)). A pool is saturated
   for a request when no member is free for it, and "protected" counts as not
-  free: a new `:external` conversation may go external at once while a local
+  free for cache-protection scoring: with the owner's explicit
+  `paidWarmProtectionEnabled` consent, a new `:external` conversation may go external while a local
   slot is technically idle but holds protected sessions. The reason is
   `local_saturated_protected`. A continuation of a conversation is never
   sent away by protection;
@@ -191,6 +215,61 @@ spreading off. Ties break by instruction depth, then least-recent
 branch. With spreading off, ties follow that incoming order, not member id.
 Warm-session protection still runs after placement and can redirect a new
 conversation away from a protected member.
+
+Residency spreading reads a maintained bucket of at most 2,000 newest footprint
+records per execution target (expiry, then record id), with strict expiry filtering.
+Request completions update only these bounded metadata buckets. When deletion or
+an expiry reduction requires older records to be promoted, the bucket becomes
+unknown and spreading is suppressed for that ranking snapshot. Unknown is not
+evidence that a target is cold or unavailable and never authorizes paid fallback.
+A background worker discovers dormant targets in durable 32-target pages and repairs
+unknown buckets in durable 256-record pages; concurrent writes restart that repair.
+Fresh installs and upgrades start with unknown predictions, which warm through
+discovery, footprint writes and repair. No prompt content is stored in these
+buckets. Each published bucket and repair accumulator is limited to 4 MiB.
+Spreading reads at most eight targets (16,000 candidate records and 32 MiB of
+bucket JSON); larger fanout or a missing bucket suppresses this optional term.
+The database reader and repair worker separately enforce statement and connection
+budgets; the metadata bound does not promise a fixed number of physical database
+pages under arbitrary bloat, statistics or storage conditions.
+
+Private affinity belongs to the routing pool and remains isolated by requester,
+token/security scope, access grant and pool. A friend's active contribution can
+publish hints for that pool without granting machine or deployment control.
+Physical occupancy and warm protection aggregate bounded metadata from all pools
+sharing the target; they never match conversations across those private scopes.
+Revoking a contribution prevents new sends and may discard an in-flight request's
+optional cache metadata at completion. Clearing a pool or deleting its owner
+invalidates that pool's hints even when they reside on contributed hardware.
+Clear atomically advances the pool's private affinity incarnation. Its API/MCP
+receipt is `{cleared: true, reclamation: "pending"}`: old hints are immediately
+ineligible, while bounded background batches reclaim stored metadata after a
+restart too. Requests captured before clear cannot republish those hints;
+requests captured afterward can establish new warmth. Other pools retain their
+private hints and the backend's logical Responses state is unaffected.
+
+An observed cache reset commits the physical capacity's durable cache incarnation
+before attempting optional residency cleanup. Bucket contention cannot restore
+old warmth: canonical/session hints, occupancy and protection compare against
+the committed authority. A relay reconnect is also a conservative physical-cache
+boundary. If reset intent or epoch persistence fails, affected warmth stays
+unknown locally while bounded background recovery retries; serving streams remain open.
+Across processes, each registered physical-cache observer has a two-second lease
+measured by the database clock and renewed every 500ms. A pending receipt suppresses
+shared warmth immediately. If even that receipt cannot be written and the observer
+dies, confidence expires with its last admitted renewal; this is bounded freshness,
+not instantaneous communication through a database/network partition. An already
+dispatched renewal may finish within its 250ms statement/100ms checkout budgets.
+Expired confidence stays unknown until a worker commits a new physical generation
+and retires the observer. Re-entry first creates a pending incarnation and advances
+the physical fence. Fresh requests on surviving aliases can then warm normally.
+Re-registration advances the durable connection generation before serving again.
+The proxy cannot infer engine reset signals it never receives.
+Every consumer pool loses physical warmth together, old repair pages cannot
+republish it, and a completion captured before the reset cannot refresh it.
+A successful request captured after the reset establishes fresh warmth. Native
+Responses may still follow the backend's logical response binding, but an old
+physical cache prediction is not evidence of retained KV state.
 
 Only tenant-scoped HMAC digests, session ids, and integer token estimates are
 stored. Prompt text is never persisted.
@@ -358,14 +437,15 @@ Then:
 1. The cache holder or any free member serves as usual; protected members are
    tried last.
 2. With only protected members, or protected and full ones, a new `:external`
-   conversation goes external now (`local_saturated_protected`). Without an
+   conversation may go external (`local_saturated_protected`) only with the owner's
+   explicit default-off `paidWarmProtectionEnabled` consent. Without that consent or an
    external route (plain name, or the attempt does not dispatch), the request is
    admitted on the protected member whose protected sessions are oldest (then
    smallest), with the full local wait budget: protection never makes a request
    wait or queue behind full members.
 3. With only full members, the request queues as before.
 
-With an external route, protected members sit out only the first local
+With an opted-in paid cache-protection route, protected members sit out only the first local
 admission; after the external attempt they are ordinary (last) candidates.
 
 Protection is on by default. The pool's routing tab ("Protect active
@@ -530,7 +610,8 @@ delta estimate computed before dispatch (empty deltas carry size forward).
 EOF awaits the affinity commit before saving Responses warm lineage. Persistence
 uses `maxWait=2000ms`, `timeout=2500ms`, and `lock_timeout=1000ms`; errors save the
 Responses binding without a warm link. Resolution uses at most 64 indexed
-LIMIT 1/2 probes. Expiry cleanup takes at most 200 rows per table per completion;
+LIMIT 1/2 probes. Expiry cleanup takes at most eight rows per table per completion
+(each footprint may update a different 2000-entry physical projection bucket);
 the background sweeper drains the rest. Retention eviction also takes 200 rows
 per completion, so reducing a cap converges over subsequent writes. Normal
 writes add fewer than that batch. Pool clear and deleted-user drains remove both
@@ -551,15 +632,17 @@ share mode, 0 = unprotected, 1–100 = percent). Each grant has the same overrid
 (`protectionOverridePercent`) plus a queue priority (`queuePriority`, 0–31)
 that replaces the pool and member capacity priority for that grantee's waiting
 requests (null inherits). The owner can also set a per-grant owner-paid
-`:external` spend cap (`BudgetScopeType.POOL_GRANT`, keyed by `poolGrantId`,
-with `poolId` stored on the rule). Admission and settlement charge that cap
-first, then the owner's account and attachment budgets. Exhausting it fails
-`:external` for that grantee (`429 grantee_spend_cap`) without amounts or
-policy ids; local members still serve. A revoked and re-created grant is a new
-id with a fresh cap. Own-key traffic and the pool owner are not charged against
-it. Only the pool owner sets these: the pool's access tab,
-`forwarderManagement.updatePoolGrant`, `providerManagement.createBudgetPolicy`
-with `scopeType=POOL_GRANT`, or the matching MCP tools.
+`:external` spend cap (`BudgetScopeType.POOL_GRANT`, keyed by the owner, the
+pool and the grantee). Admission and settlement charge that cap first, then
+the owner's account and attachment budgets. Exhausting it fails `:external`
+for that grantee (`429 grantee_spend_cap`) without amounts or policy ids;
+local members still serve. The recorded spend survives revoking and
+re-granting the pool and editing the cap's period; changing its currency
+starts a new cap. The cap's currency must match the pool's provider pricing.
+Own-key traffic and the pool owner are not charged against it. Only the pool
+owner sets these: the pool's Sharing tab, `forwarderManagement.updatePoolGrant`,
+or the matching MCP tool. `providerManagement` budget procedures refuse
+`POOL_GRANT` scopes.
 
 ### When the external attempt does not happen
 
@@ -706,17 +789,16 @@ model names with copy buttons. Selecting provider models in the setup wizard
 enables fallback for the owner; sharing it stays off. No additional confirmation,
 grantee notice, or email is sent.
 
-Model API tokens start with external access off. During creation, or in the
-**External providers** editor afterward, a person can allow external providers.
-During creation, external access includes every selected pool; uncheck individual
-pools to keep them local only. Later, turning external access off and back on
-preserves the saved per-pool choices, including an empty selection. All-visible
-tokens allow all pools or none.
+API tokens are always created local only. Cloud access is a separate human
+choice made afterwards with **API tokens → Cloud access**, which saves the
+switch, the pools and the optional wait together. Allowlist tokens choose
+which of their pools may use the cloud; only pools with cloud providers are
+offered. Turning cloud access off and back on preserves the saved per-pool
+choices, including an empty selection. All-visible tokens allow all pools
+with cloud providers or none.
 Enabling the permission lets prompts, attachments, tools, and generated output
 leave this deployment for third-party providers when the request uses
-`<pool>:external` and local members cannot serve it. If creation succeeds but
-the separate permission save cannot be confirmed, the secret remains visible;
-check the token’s permissions before using it.
+`<pool>:external` and local members cannot serve it.
 
 The **Fallback available** badge (a static **Local only** chip otherwise)
 describes availability for the viewer, based on the deployment switch, pool
@@ -754,7 +836,7 @@ the field. If the rendered body already has a `provider` object, its other keys
 are kept and `data_collection` is overwritten, so a caller cannot relax it.
 
 Each OpenRouter account has the setting **Allow OpenRouter providers that may
-collect data** (off by default) on the Providers page. The owner sets it for
+collect data** (off by default) on the Cloud providers page. The owner sets it for
 owner-paid accounts; grantees set it on their own accounts. It is human-only:
 MCP cannot change it, and MCP cannot move an OpenRouter account to another
 provider type either (that would drop the preference, which is keyed on the
@@ -772,7 +854,7 @@ data collection on that account.
 
 ## Own-key routing (BYOK)
 
-`/{lang}/dashboard/providers` manages your provider keys. Its **Pools** tab
+`/{lang}/dashboard/cloud-providers` manages your provider keys. Its **Pools** tab
 lets a grantee choose a model from their own account for each shared pool.
 The owner must declare `externalEquivalentModel`; it is the picker's initial
 suggestion, not a required upstream id. An owner uses their own keys as pool

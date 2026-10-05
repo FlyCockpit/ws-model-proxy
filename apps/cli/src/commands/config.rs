@@ -21,6 +21,18 @@ pub struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 enum Sub {
+    /// Opt in to durable model deployment jobs (off by default). Each job
+    /// rechecks this flag; reconnect to refresh the server's feature report.
+    ///
+    /// Turning this on lets the server run shell commands on this machine
+    /// (`/bin/sh -c`, as the user running wsmp) for deployment jobs. The MCP
+    /// command mode does not limit jobs the server reports as approved by a
+    /// person: they run even when `set-mcp-commands` is `off`. Only jobs the
+    /// server reports as agent-authored are checked against the mode, and in
+    /// `supervised` their approval is the server's word, not a confirm screen
+    /// on this machine. Turn it on only for a server you would trust with a
+    /// shell here.
+    SetDeployments { state: Switch },
     /// Print the path to the config file.
     Path,
     /// Create a default JSON config file if one does not already exist.
@@ -35,7 +47,8 @@ enum Sub {
     SetHumanTerminal { state: Switch },
     /// Choose what MCP agents may run: `off`, `supervised` (a person confirms
     /// each command in a browser terminal), or `unsupervised` (headless exec
-    /// too). Takes effect the next time wsmp starts.
+    /// too). Takes effect the next time wsmp starts. This does not limit
+    /// person-approved deployment jobs; see `set-deployments`.
     SetMcpCommands { mode: McpMode },
     /// Opt in to headless read-only file access with the dashboard grant.
     /// Requires explicit file roots. Restart wsmp to apply.
@@ -97,6 +110,22 @@ impl Switch {
 
 pub fn run(args: &Args) -> Result<()> {
     match &args.command {
+        Sub::SetDeployments { state } => {
+            Config::update(false, |config| {
+                config.allow_deployments = state.enabled();
+                Ok(())
+            })?;
+            if args.json {
+                output::json(
+                    &serde_json::json!({"key":"allowDeployments","value":state.enabled()}),
+                )?;
+            } else {
+                output::line(format!(
+                    "set `allowDeployments` to `{}`; reconnect to refresh server preflight",
+                    state.enabled()
+                ))?;
+            }
+        }
         Sub::Path => {
             let path = crate::paths::config_file()?;
             if args.json {

@@ -1,0 +1,181 @@
+enum DeploymentActor {
+  USER
+  AGENT
+  SCHEDULE
+}
+
+enum DeploymentDesiredState {
+  RUNNING
+  STOPPED
+}
+
+enum DeploymentObservedState {
+  PENDING
+  STARTING
+  RUNNING
+  UNHEALTHY
+  STOPPING
+  STOP_PENDING
+  STOPPED
+  FAILED
+}
+
+enum DeploymentPlanState {
+  PENDING
+  AWAITING_CONFIRMATION
+  APPLIED
+  EXPIRED
+}
+
+enum DeploymentStepState {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+model DeploymentConfig {
+  id        String                     @id @default(cuid(2))
+  userId    String
+  /// Null after its pool was deleted: the recipe and its history remain, but nothing can start
+  /// from it until the owner rebinds it to a pool with a new revision.
+  poolId    String?
+  slug      String
+  name      String
+  createdAt DateTime                   @default(now())
+  updatedAt DateTime                   @default(now()) @updatedAt
+  User      User                       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  Pool      ModelPool?                 @relation(fields: [poolId], references: [id], onDelete: Restrict)
+  Revisions DeploymentConfigRevision[]
+  Instances DeploymentInstance[]
+
+  @@unique([userId, slug])
+  @@map("deployment_config")
+}
+
+model DeploymentConfigRevision {
+  id          String               @id @default(cuid(2))
+  configId    String
+  revision    Int
+  createdAt   DateTime             @default(now())
+  editorId    String
+  editorKind  DeploymentActor
+  contentHash String
+  spec        Json
+  Config      DeploymentConfig     @relation(fields: [configId], references: [id], onDelete: Cascade)
+  Instances   DeploymentInstance[]
+
+  @@unique([configId, revision])
+  @@map("deployment_config_revision")
+}
+
+model DeploymentPlan {
+  id            String              @id @default(cuid(2))
+  userId        String
+  requesterId   String
+  requesterKind DeploymentActor
+  createdAt     DateTime            @default(now())
+  expiresAt     DateTime
+  state         DeploymentPlanState
+  fingerprint   String
+  contents      Json
+  confirmedBy   String?
+  confirmedAt   DateTime?
+  User          User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  Run           DeploymentRun?
+
+  @@index([userId, state, expiresAt])
+  @@map("deployment_plan")
+}
+
+model DeploymentRun {
+  id          String               @id @default(cuid(2))
+  planId      String               @unique
+  createdAt   DateTime             @default(now())
+  completedAt DateTime?
+  Plan        DeploymentPlan       @relation(fields: [planId], references: [id], onDelete: Cascade)
+  Instances   DeploymentInstance[]
+  Steps       DeploymentStep[]
+
+  @@map("deployment_run")
+}
+
+model DeploymentInstance {
+  id               String                   @id @default(cuid(2))
+  userId           String
+  configId         String
+  revisionId       String
+  runId            String
+  variantKey       String
+  endpointSlug     String
+  createdAt        DateTime                 @default(now())
+  updatedAt        DateTime                 @default(now()) @updatedAt
+  desiredState     DeploymentDesiredState   @default(RUNNING)
+  observedState    DeploymentObservedState  @default(PENDING)
+  startedBy        DeploymentActor
+  agentsMayPreempt Boolean                  @default(false)
+  restartAttempts  Int                      @default(0)
+  nextRestartAt    DateTime?
+  healthFailures   Int                      @default(0)
+  healthSuccesses  Int                      @default(0)
+  lastHealthAt     DateTime?
+  User             User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  Config           DeploymentConfig         @relation(fields: [configId], references: [id], onDelete: Restrict)
+  Revision         DeploymentConfigRevision @relation(fields: [revisionId], references: [id], onDelete: Restrict)
+  Run              DeploymentRun            @relation(fields: [runId], references: [id], onDelete: Restrict)
+  Nodes            DeploymentInstanceNode[]
+  Steps            DeploymentStep[]
+  Endpoint         Endpoint?
+
+  @@unique([userId, endpointSlug])
+  @@index([userId, desiredState, observedState])
+  @@map("deployment_instance")
+}
+
+model DeploymentInstanceNode {
+  id          String             @id @default(cuid(2))
+  instanceId  String
+  cliDeviceId String
+  rank        Int
+  resources   Json
+  port        Int
+  distPort    Int?
+  /// False only after a confirmed stop. Offline/failed stops retain claims.
+  claimHeld   Boolean            @default(true)
+  /// New claims may be reserved behind this stopping instance, never dispatched before it releases.
+  blockedBy   String[]           @default([])
+  stoppedAt   DateTime?
+  Instance    DeploymentInstance @relation(fields: [instanceId], references: [id], onDelete: Restrict)
+  CliDevice   CliDevice          @relation(fields: [cliDeviceId], references: [id], onDelete: Restrict)
+
+  @@unique([instanceId, rank])
+  @@index([cliDeviceId, claimHeld])
+  @@map("deployment_instance_node")
+}
+
+model DeploymentStep {
+  id             String              @id @default(cuid(2))
+  runId          String
+  instanceId     String
+  cliDeviceId    String
+  rank           Int
+  phase          String
+  sequence       Int
+  state          DeploymentStepState @default(PENDING)
+  intent         Json
+  intentHash     String
+  attempts       Int                 @default(0)
+  ownerEpoch     String?
+  leaseExpiresAt DateTime?
+  deadline       DateTime?
+  notBefore      DateTime?
+  errorCode      String?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @default(now()) @updatedAt
+  Run            DeploymentRun       @relation(fields: [runId], references: [id], onDelete: Restrict)
+  Instance       DeploymentInstance  @relation(fields: [instanceId], references: [id], onDelete: Restrict)
+
+  @@unique([runId, instanceId, rank, phase, sequence])
+  @@index([state, notBefore, leaseExpiresAt])
+  @@map("deployment_step")
+}

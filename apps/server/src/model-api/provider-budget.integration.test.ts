@@ -1,3 +1,5 @@
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 // Fixture writes need no owner fences (the graph-write fence triggers accept
 // this client); production code under test uses its own clients.
 import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
@@ -250,6 +252,60 @@ integration("provider budget admission and reconciliation", () => {
       data: { state: "SETTLED", settledValue: 3, settledAt: new Date() },
     });
     await expect(service.admitProviderBudget(original)).rejects.toThrow("no longer replayable");
+  });
+
+  it("hardening preserves exact provider accounting history after its pool is deleted", async () => {
+    if (!db || !databaseUrl) return;
+    const row = await fixture({ attachment: true });
+    const original = attempt(row, `history-backfill-${crypto.randomUUID()}`);
+    const admitted = await service.admitProviderBudget(original);
+    expect(admitted.admitted).toBe(true);
+    await service.reconcileProviderBudget({
+      ...original,
+      reason: "COMPLETED",
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT",
+    });
+    await db.modelPool.delete({ where: { id: row.poolId } });
+    const before = await db.providerAttempt.findUniqueOrThrow({
+      where: { attemptId_fencingToken: { attemptId: original.attemptId, fencingToken: 1n } },
+    });
+    const reservationCount = await db.providerBudgetReservation.count({
+      where: { attemptId: original.attemptId },
+    });
+    for (let run = 0; run < 2; run++)
+      await promisify(execFile)(
+        process.execPath,
+        ["../../packages/db/scripts/apply-schema-hardening.mjs"],
+        {
+          env: { ...process.env, DATABASE_URL: databaseUrl, SCHEMA_HARDENING_FORCE: "1" },
+        },
+      );
+    expect(
+      await db.providerAttempt.findUniqueOrThrow({
+        where: { attemptId_fencingToken: { attemptId: original.attemptId, fencingToken: 1n } },
+      }),
+    ).toEqual(before);
+    expect(
+      await db.providerBudgetReservation.count({ where: { attemptId: original.attemptId } }),
+    ).toBe(reservationCount);
+    // A missing anchor still takes the complete graph guard. Retained history
+    // is not authority to create a new attempt against its deleted parent.
+    await expect(
+      db.providerAttempt.create({
+        data: {
+          userId: row.user.id,
+          providerAccountId: row.account.id,
+          providerModelId: row.model.id,
+          poolId: row.poolId,
+          requestId: crypto.randomUUID(),
+          attemptId: crypto.randomUUID(),
+          fencingToken: 2n,
+          accountingVersion: "usage-v1",
+          expiresAt: new Date(Date.now() + 60_000),
+        },
+      }),
+    ).rejects.toThrow(/provider attempt pool owner is inconsistent/);
   });
 
   it("fails closed for partial token usage and appends one terminal ledger row", async () => {
@@ -1467,5 +1523,263 @@ integration("provider budget admission and reconciliation", () => {
         spendAttempt(`grantee-hit-${crypto.randomUUID()}`, "2", grant.id),
       ),
     ).resolves.toMatchObject({ admitted: false, reason: "GRANTEE_BUDGET_EXCEEDED" });
+  });
+
+  // Grant-cap window semantics: spend is keyed by pool + grantee across cap
+  // versions, so it survives a period edit and a revoke/re-grant, and only a
+  // currency change starts a fresh total. The cap writes below mirror
+  // upsertPoolGrantSpendCap (deactivate the current version, create the next).
+  it("keeps POOL_GRANT spend across a period edit and re-grant and restarts it on a currency change", async () => {
+    if (!db) return;
+    const row = await fixture({ attachment: true, noPolicy: true });
+    const poolId = row.poolId!;
+    const grantee = await db.user.create({
+      data: { name: "Grant window grantee", email: `grantee-${crypto.randomUUID()}@example.test` },
+    });
+    let grant = await db.poolGrant.create({
+      data: { poolId, ownerUserId: row.user.id, granteeUserId: grantee.id },
+    });
+    await policy(row, [{ metric: "CONCURRENCY", period: "PER_ATTEMPT", mode: "UNLIMITED" }], {
+      poolId,
+    });
+    let capVersion = 0;
+    const setGrantCap = async (period: "UTC_DAY" | "UTC_MONTH", currency: string) => {
+      await db.providerBudgetPolicy.updateMany({
+        where: { userId: row.user.id, scopeType: "POOL_GRANT", poolId, active: true },
+        data: { active: false, deactivatedAt: new Date() },
+      });
+      capVersion += 1;
+      await db.providerBudgetPolicy.create({
+        data: {
+          userId: row.user.id,
+          scopeType: "POOL_GRANT",
+          providerAccountId: null,
+          poolId,
+          providerModelId: null,
+          poolGrantId: grant.id,
+          granteeUserId: grantee.id,
+          version: capVersion,
+          active: true,
+          activatedAt: new Date(),
+          Rules: {
+            create: { metric: "SPEND", period, mode: "LIMITED", limitValue: "5", currency },
+          },
+        },
+      });
+    };
+    await db.providerPricingVersion.create({
+      data: {
+        userId: row.user.id,
+        providerAccountId: row.account.id,
+        providerModelId: row.model.id,
+        version: "price-usd",
+        currency: "USD",
+        status: "ACTIVE",
+        activatedAt: new Date(Date.now() - 1_000),
+        pricing: { input: "1" },
+        effectiveAt: new Date(Date.now() - 1_000),
+      },
+    });
+    // A second model of the same account priced in EUR, attached to the pool.
+    const eurModel = await db.providerModel.create({
+      data: {
+        userId: row.user.id,
+        providerAccountId: row.account.id,
+        upstreamModelId: `eur-${crypto.randomUUID()}`,
+        enabled: true,
+      },
+    });
+    await db.providerBudgetPolicy.create({
+      data: {
+        userId: row.user.id,
+        providerAccountId: row.account.id,
+        providerModelId: eurModel.id,
+        poolId,
+        scopeType: "POOL_PROVIDER_MODEL",
+        active: true,
+        activatedAt: new Date(Date.now() - 86_400_000),
+        Rules: { create: { metric: "CONCURRENCY", period: "PER_ATTEMPT", mode: "UNLIMITED" } },
+      },
+    });
+    await db.providerPricingVersion.create({
+      data: {
+        userId: row.user.id,
+        providerAccountId: row.account.id,
+        providerModelId: eurModel.id,
+        version: "price-eur",
+        currency: "EUR",
+        status: "ACTIVE",
+        activatedAt: new Date(Date.now() - 1_000),
+        pricing: { input: "1" },
+        effectiveAt: new Date(Date.now() - 1_000),
+      },
+    });
+    const spendAttempt = (spend: string, currency: "USD" | "EUR" = "USD") => ({
+      ...attempt(row, `grant-window-${crypto.randomUUID()}`),
+      providerModelId: currency === "USD" ? row.model.id : eurModel.id,
+      poolGrantId: grant.id,
+      granteeUserId: grantee.id,
+      liability: {
+        spend,
+        currency,
+        pricingVersion: currency === "USD" ? "price-usd" : "price-eur",
+        accountingVersion: "usage-v1",
+      },
+    });
+
+    await setGrantCap("UTC_DAY", "USD");
+    const spent = spendAttempt("4");
+    await expect(service.admitProviderBudget(spent)).resolves.toMatchObject({ admitted: true });
+    await service.reconcileProviderBudget({
+      ...spent,
+      reason: "COMPLETED",
+      revisionSequence: 1n,
+      revisionKind: "SNAPSHOT",
+      usage: {
+        accountingVersion: "usage-v1",
+        confidence: "REPORTED",
+        categoriesComplete: false,
+        observationComplete: true,
+        reportedCost: "4",
+        reportedCostCurrency: "USD",
+        reportedCostPricingVersion: "price-usd",
+      },
+    });
+
+    // Period edit: the month window still holds today's 4 USD.
+    await setGrantCap("UTC_MONTH", "USD");
+    await expect(service.admitProviderBudget(spendAttempt("2"))).resolves.toMatchObject({
+      admitted: false,
+      reason: "GRANTEE_BUDGET_EXCEEDED",
+    });
+
+    // Revoke and re-grant: a new grant id, the same pool + grantee cap total.
+    await db.poolGrant.delete({ where: { id: grant.id } });
+    grant = await db.poolGrant.create({
+      data: { poolId, ownerUserId: row.user.id, granteeUserId: grantee.id },
+    });
+    await setGrantCap("UTC_MONTH", "USD");
+    await expect(service.admitProviderBudget(spendAttempt("2"))).resolves.toMatchObject({
+      admitted: false,
+      reason: "GRANTEE_BUDGET_EXCEEDED",
+    });
+
+    // Currency change: USD spend does not count against a EUR total.
+    await setGrantCap("UTC_MONTH", "EUR");
+    await expect(service.admitProviderBudget(spendAttempt("4", "EUR"))).resolves.toMatchObject({
+      admitted: true,
+    });
+    await expect(service.admitProviderBudget(spendAttempt("2", "EUR"))).resolves.toMatchObject({
+      admitted: false,
+      reason: "GRANTEE_BUDGET_EXCEEDED",
+    });
+  });
+
+  // Two concurrent grantee attempts through different provider accounts of
+  // one pool share the grant cap: the policy fence serializes them, so at
+  // most one 4 USD reservation fits under a 5 USD cap.
+  it("admits at most one of two concurrent cross-account grantee attempts under one cap", async () => {
+    if (!db) return;
+    const row = await fixture({ attachment: true, noPolicy: true });
+    const poolId = row.poolId!;
+    const grantee = await db.user.create({
+      data: { name: "Concurrent grantee", email: `grantee-${crypto.randomUUID()}@example.test` },
+    });
+    const grant = await db.poolGrant.create({
+      data: { poolId, ownerUserId: row.user.id, granteeUserId: grantee.id },
+    });
+    const secondAccount = await db.providerAccount.create({
+      data: {
+        userId: row.user.id,
+        providerType: "proof",
+        label: `budget-second-${crypto.randomUUID()}`,
+        baseUrl: "https://second.example.test",
+        endpointIdentity: "https://second.example.test",
+        authType: "BEARER",
+      },
+    });
+    const secondModel = await db.providerModel.create({
+      data: {
+        userId: row.user.id,
+        providerAccountId: secondAccount.id,
+        upstreamModelId: `second-${crypto.randomUUID()}`,
+        enabled: true,
+      },
+    });
+    for (const target of [
+      { accountId: row.account.id, modelId: row.model.id },
+      { accountId: secondAccount.id, modelId: secondModel.id },
+    ]) {
+      await db.providerBudgetPolicy.create({
+        data: {
+          userId: row.user.id,
+          providerAccountId: target.accountId,
+          providerModelId: target.modelId,
+          poolId,
+          scopeType: "POOL_PROVIDER_MODEL",
+          active: true,
+          activatedAt: new Date(Date.now() - 86_400_000),
+          Rules: { create: { metric: "CONCURRENCY", period: "PER_ATTEMPT", mode: "UNLIMITED" } },
+        },
+      });
+      await db.providerPricingVersion.create({
+        data: {
+          userId: row.user.id,
+          providerAccountId: target.accountId,
+          providerModelId: target.modelId,
+          version: "price-v1",
+          currency: "USD",
+          status: "ACTIVE",
+          activatedAt: new Date(Date.now() - 1_000),
+          pricing: { input: "1" },
+          effectiveAt: new Date(Date.now() - 1_000),
+        },
+      });
+    }
+    await db.providerBudgetPolicy.create({
+      data: {
+        userId: row.user.id,
+        scopeType: "POOL_GRANT",
+        providerAccountId: null,
+        poolId,
+        providerModelId: null,
+        poolGrantId: grant.id,
+        granteeUserId: grantee.id,
+        active: true,
+        activatedAt: new Date(Date.now() - 86_400_000),
+        Rules: {
+          create: {
+            metric: "SPEND",
+            period: "UTC_DAY",
+            mode: "LIMITED",
+            limitValue: "5",
+            currency: "USD",
+          },
+        },
+      },
+    });
+    const grantAttempt = (accountId: string, modelId: string) => ({
+      ...attempt(row, `concurrent-${crypto.randomUUID()}`),
+      providerAccountId: accountId,
+      providerModelId: modelId,
+      poolGrantId: grant.id,
+      granteeUserId: grantee.id,
+      liability: {
+        spend: "4",
+        currency: "USD",
+        pricingVersion: "price-v1",
+        accountingVersion: "usage-v1",
+      },
+    });
+
+    const outcomes = await Promise.all([
+      service.admitProviderBudget(grantAttempt(row.account.id, row.model.id)),
+      service.admitProviderBudget(grantAttempt(secondAccount.id, secondModel.id)),
+    ]);
+    expect(outcomes.filter((outcome) => outcome.admitted)).toHaveLength(1);
+    expect(outcomes.find((outcome) => !outcome.admitted)).toMatchObject({
+      admitted: false,
+      reason: "GRANTEE_BUDGET_EXCEEDED",
+    });
   });
 });

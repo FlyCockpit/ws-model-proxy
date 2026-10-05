@@ -717,6 +717,28 @@ integration("own-key preference integrity and requester capacity", () => {
         },
       });
       expect(binding.fallbackRoute).toBe("own-key");
+      const localBindingTarget = await db.poolMember.findFirstOrThrow({
+        where: { poolId: pool.id, tier: "PRIMARY", discoveredModelId: { not: null } },
+        select: { executionTargetId: true, discoveredModelId: true },
+      });
+      await expect(
+        db.responseStickinessRecord.update({
+          where: { id: binding.id },
+          data: {
+            routingVersion: 2,
+            fallbackRoute: null,
+            selectedExecutionTargetId: localBindingTarget.executionTargetId,
+            selectedDiscoveredModelId: localBindingTarget.discoveredModelId,
+            providerAccountId: null,
+            providerModelId: null,
+            providerEndpointIdentity: null,
+            providerEndpointVersion: null,
+            providerUpstreamModelId: null,
+            nativeSurface: null,
+            upstreamResponseIdDigest: null,
+          },
+        }),
+      ).rejects.toThrow(/provider Responses binding is immutable/);
       await db.poolGrant.delete({ where: { id: replacement.id } });
       expect(await db.poolFallbackPreference.count({ where: { poolId: pool.id } })).toBe(0);
       // DL-1 (d): stickiness is hot-path history with no foreign key to the
@@ -725,6 +747,12 @@ integration("own-key preference integrity and requester capacity", () => {
       expect(
         await db.responseStickinessRecord.findUnique({ where: { id: binding.id } }),
       ).not.toBeNull();
+      await expect(
+        db.responseStickinessRecord.update({
+          where: { id: binding.id },
+          data: { expiresAt: new Date(Date.now() + 120_000) },
+        }),
+      ).resolves.toMatchObject({ fallbackRoute: "own-key", poolGrantId: replacement.id });
       // Admission and lease history (from the real admissions above) no longer
       // block a pool delete under DL-1 (d): there is nothing to prepare.
       const { prepareParentDeletion } = await import("@ws-model-proxy/db/parent-deletion");

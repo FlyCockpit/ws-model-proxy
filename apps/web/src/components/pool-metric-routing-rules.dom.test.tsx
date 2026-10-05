@@ -215,6 +215,22 @@ describe("PoolMetricRoutingRules", () => {
       expect(input.className).toContain("min-h-11");
   });
 
+  it("reads each complete rule back as a sentence and prompts on an incomplete one", () => {
+    state.view = view();
+    mount(<PoolMetricRoutingRules poolId="pool-1" />);
+    expect(screen.getAllByTestId("metric-rule-sentence")).toHaveLength(1);
+    expect(screen.getByTestId("metric-rule-sentence").textContent).toBe(
+      "dashboard:pools.metricRules.sentence.when",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /metricRules.add/ }));
+    expect(screen.getByText("dashboard:pools.metricRules.sentence.incomplete")).toBeTruthy();
+    const thresholds = screen.getAllByLabelText("dashboard:pools.metricRules.threshold");
+    fireEvent.change(thresholds[1]!, { target: { value: "2" } });
+    const metricInputs = screen.getAllByLabelText("dashboard:pools.metricRules.metric");
+    fireEvent.change(metricInputs[1]!, { target: { value: "endpoint.waiting" } });
+    expect(screen.getAllByTestId("metric-rule-sentence")).toHaveLength(2);
+  });
+
   it("adds a rule and saves the whole list with parsed labels and numbers", async () => {
     state.view = view();
     mount(<PoolMetricRoutingRules poolId="pool-1" />);

@@ -10,7 +10,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as cliAgentAdmission from "./cli-agent-admission.js";
 import { FILE_ERROR_CODES } from "./file-protocol.js";
 import { generateTestHelloIdentity } from "./hello-identity.js";
-import { encodeRelayBinaryFrame, parseRelayBinaryFrame } from "./protocol.js";
+import {
+  encodeRelayBinaryFrame,
+  parseRelayBinaryFrame,
+  RELAY_MIN_PROTOCOL_VERSION,
+} from "./protocol.js";
 import { cancelRelayWorkForBannedUser } from "./user-ban.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
@@ -133,7 +137,7 @@ function hello(
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion: "2.4",
+    protocolVersion: RELAY_MIN_PROTOCOL_VERSION,
     cli: {
       slug,
       hostname: `${slug}.local`,

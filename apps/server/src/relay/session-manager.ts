@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import type {
   LiveCliFeatureSnapshot,
   LiveEndpointLoad,
@@ -31,7 +31,27 @@ import {
 import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { parseStoredRemoteEngineAdapters } from "@ws-model-proxy/api/lib/remote-engine-adapters";
 import type { SupervisedCommandStatus } from "@ws-model-proxy/api/lib/supervised-command-types";
+import type {
+  DeploymentInstancesFrame,
+  DeploymentJob,
+  DeploymentJobResult,
+  DeploymentObservedInstance,
+} from "@ws-model-proxy/config/deployment-protocol";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
+import type { DeploymentLiveSocket, DeploymentSocket } from "../deployments/reconciler.js";
+import {
+  persistAffinityCounterEpoch,
+  readAffinityCounterEpoch,
+} from "../model-api/cache-affinity-generation.js";
+import {
+  acknowledgeAffinityObservations,
+  discoverAffinityObservers,
+  observeAffinityReset,
+  recoverAffinityObservers,
+  registerAffinityObservers,
+  renewAffinityObservers,
+} from "../model-api/cache-affinity-observers.js";
+import { beginAffinityReset } from "../model-api/cache-affinity-residency.js";
 import { resetKvEvictionForEndpoint } from "../model-api/kv-eviction-feedback.js";
 import { startRelayAttempt } from "../model-api/relay-executor.js";
 import { EngineLoadHistoryStore } from "./engine-load-history.js";
@@ -136,6 +156,7 @@ async function closeBodyStream(stream: OutboundBodyStream | undefined) {
 }
 
 export type CliReportedFeatures = {
+  deployments?: boolean;
   humanTerminal: boolean;
   /** The CLI's own MCP command mode (its config), from hello. */
   mcpCommandMode: McpCommandModeName;
@@ -391,12 +412,33 @@ export const ENDPOINT_LOAD_MIN_INTERVAL_MS = 1_000;
 export const ENDPOINT_LOAD_MAX_KEYS = 1_000;
 /** KV-eviction reset (epoch change or prefixCacheReset) at most this often per endpoint. */
 export const KV_EVICTION_RESET_DEBOUNCE_MS = 30_000;
+/**
+ * Bounds the per-endpoint epoch cache. A miss is never read as "unchanged": it costs one
+ * durable epoch read, so this bounds memory, not correctness.
+ */
+export const KV_COUNTER_EPOCH_CACHE_MAX = 16_384;
 
 function addCapped(total: number, delta: number): number {
   return Math.min(Number.MAX_SAFE_INTEGER, total + delta);
 }
 
 type LiveEndpointLoadEntry = LiveEndpointLoad & { receivedAtMs: number };
+
+export const DEPLOYMENT_SNAPSHOT_TIMEOUT_MS = 30_000;
+const DEPLOYMENT_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+const DEPLOYMENT_SNAPSHOT_RECORDS = 65_536;
+const DEPLOYMENT_SNAPSHOT_GLOBAL_BYTES = 32 * 1024 * 1024;
+const DEPLOYMENT_SNAPSHOT_SLOTS = 64;
+type DeploymentSnapshot = {
+  id: string;
+  nextIndex: number;
+  bytes: number;
+  instances: DeploymentObservedInstance[];
+  keys: Set<string>;
+  completing: boolean;
+  released: boolean;
+  timer: ReturnType<typeof setTimeout>;
+};
 
 type SessionState = {
   socket: RelaySocket;
@@ -417,6 +459,10 @@ type SessionState = {
   /** Serialises `engine.adapters.set` sends the same way. */
   remoteAdaptersQueue: Promise<void>;
   inventoryConfirmed: boolean;
+  /** Connection generation whose complete deployment inventory was committed; null otherwise. */
+  deploymentInventoryGeneration: number | null;
+  deploymentSnapshot: DeploymentSnapshot | null;
+  lastDeploymentSnapshotId: string | null;
   /** Slugs from the last accepted hello / inventory.update. */
   inventorySlugs: Set<string>;
   endpointTargeting: boolean;
@@ -593,6 +639,7 @@ function reportedFeaturesFromHello(message: HelloMessage, now: Date): ReportedRe
     reportedTerminalApproval: features.terminalApproval,
     reportedTerminalSupported: features.terminalSupported,
     reportedAllowFileToolsAsRoot: features.allowFileToolsAsRoot,
+    reportedDeployments: features.deployments ?? false,
     reportedHostname: message.cli.hostname ?? null,
     featuresReportedAt: now,
   };
@@ -669,6 +716,74 @@ function protocolErrorFromRegistration(error: unknown): {
 }
 
 export class RelaySessionManager {
+  private readonly affinityObserverManagerId = randomUUID();
+  private affinityObserverTimer: ReturnType<typeof setInterval> | undefined;
+  private affinityObserverRunning: Promise<void> | undefined;
+  private affinityObserverRecovery: Promise<void> | undefined;
+  private pendingAffinityResets = new Map<
+    string,
+    {
+      cliDeviceId: string;
+      connectionGeneration: number;
+      slug: string;
+      epoch: number;
+      reset: boolean;
+      /** The cached previous epoch was missing: compare against the durable epoch. */
+      epochUnknown: boolean;
+      /** A debounced explicit reset is delayed until here, never dropped. */
+      notBefore: number;
+      now: Date;
+      version: number;
+      release: () => void;
+      running?: Promise<void>;
+    }
+  >();
+  private affinityResetTimer: ReturnType<typeof setInterval> | undefined;
+  private affinityResetRecoveryRunning = false;
+  private affinityResetClosed = false;
+  private affinityResetWrites = new Set<Promise<void>>();
+  private deploymentSnapshotBytes = 0;
+  private deploymentSnapshotSlots = 0;
+  private deploymentHandlers: {
+    result(socket: DeploymentSocket, result: DeploymentJobResult): Promise<unknown>;
+    inventory(socket: DeploymentSocket, instances: DeploymentObservedInstance[]): Promise<unknown>;
+    /** Called once a session is dispatch-ready (its inventory committed for this generation). */
+    ready?(socket: DeploymentSocket): void;
+  } | null = null;
+  setDeploymentHandlers(handlers: typeof this.deploymentHandlers) {
+    this.deploymentHandlers = handlers;
+  }
+  deploymentSocket(cliDeviceId: string): DeploymentLiveSocket | null {
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    if (this.relayDrain || !session?.registered || session.connectionGeneration === null)
+      return null;
+    return {
+      cliDeviceId,
+      userId: session.identity.userId,
+      generation: session.connectionGeneration,
+      // Inventory counts only for the generation that committed it; an in-place generation
+      // change (a newer hello settled under this session) requires fresh inventory.
+      inventoryComplete: session.deploymentInventoryGeneration === session.connectionGeneration,
+    };
+  }
+  sendDeploymentJob(socket: DeploymentSocket, job: DeploymentJob) {
+    const session = this.sessionsByCliDeviceId.get(socket.cliDeviceId);
+    if (
+      this.relayDrain ||
+      !session?.registered ||
+      session.connectionGeneration !== socket.generation ||
+      session.identity.userId !== socket.userId ||
+      // A closing socket would drop the frame silently; report it unsent.
+      session.socket.readyState !== WS_READY_STATE_OPEN
+    )
+      return false;
+    try {
+      this.sendControl(session, job);
+      return true;
+    } catch {
+      return false;
+    }
+  }
   private sessionsBySocket = new Map<RelaySocket, SessionState>();
   private sessionsByCliDeviceId = new Map<string, SessionState>();
   /** Manager-level so a reconnect does not wipe the 30-minute ring. */
@@ -761,6 +876,9 @@ export class RelaySessionManager {
       remoteSourcesQueue: Promise.resolve(),
       remoteAdaptersQueue: Promise.resolve(),
       inventoryConfirmed: false,
+      deploymentInventoryGeneration: null,
+      deploymentSnapshot: null,
+      lastDeploymentSnapshotId: null,
       inventorySlugs: new Set(),
       endpointTargeting: false,
       protocolVersion: null,
@@ -933,6 +1051,7 @@ export class RelaySessionManager {
         this.reconcileInteractiveGrants(session);
         this.replaceDuplicateSession(session);
         session.inventorySlugs = new Set(message.endpoints.map((endpoint) => endpoint.slug));
+        this.pruneCounterEpochs(registration.cliDeviceId, session.inventorySlugs);
         if (stalePolicy) {
           void this.refreshFeatureGrants(registration.cliDeviceId).catch((error: unknown) => {
             console.error(
@@ -949,6 +1068,13 @@ export class RelaySessionManager {
           now: new Date(),
         }).catch(() => 0);
         this.poolMemberRecovery.wake();
+        await registerAffinityObservers({
+          cliDeviceId: registration.cliDeviceId,
+          slugs: [...session.inventorySlugs],
+          connectionGeneration: registration.connectionGeneration,
+          managerId: this.affinityObserverManagerId,
+        }).catch(() => {});
+        this.startAffinityObserverMaintenance();
         socket.send(
           encodeRelayServerControlMessage({
             type: "hello.ok",
@@ -1012,6 +1138,7 @@ export class RelaySessionManager {
         // update never writes connection state, so there is nothing to undo.
         if (this.sessionsBySocket.get(socket) !== session) return;
         session.inventorySlugs = new Set(message.endpoints.map((endpoint) => endpoint.slug));
+        this.pruneCounterEpochs(registration.cliDeviceId, session.inventorySlugs);
         socket.send(
           encodeRelayServerControlMessage({
             type: "inventory.ok",
@@ -1047,6 +1174,20 @@ export class RelaySessionManager {
           }),
         );
       }
+      return;
+    }
+
+    if (message.type === "deployment.job.result" || message.type === "deployment.instances") {
+      const current = this.sessionsByCliDeviceId.get(session.cliDeviceId);
+      if (current !== session || session.connectionGeneration === null) return;
+      const identity = {
+        cliDeviceId: session.cliDeviceId,
+        userId: session.identity.userId,
+        generation: session.connectionGeneration,
+      };
+      if (message.type === "deployment.job.result")
+        await this.deploymentHandlers?.result(identity, message);
+      else await this.receiveDeploymentSnapshot(session, identity, message, frame);
       return;
     }
 
@@ -1243,10 +1384,21 @@ export class RelaySessionManager {
 
   /** Stops background recovery in controlled shutdowns and unit tests. */
   dispose() {
+    this.stopAffinityResetRecovery();
     this.poolMemberRecovery.stop();
     for (const session of this.sessionsBySocket.values()) {
+      this.clearDeploymentSnapshot(session);
+      session.deploymentInventoryGeneration = null;
       if (session.routingEvaluation) this.routingEvaluator.cancel(session.routingEvaluation);
     }
+  }
+
+  private stopAffinityResetRecovery() {
+    this.affinityResetClosed = true;
+    clearInterval(this.affinityResetTimer);
+    clearInterval(this.affinityObserverTimer);
+    for (const job of this.pendingAffinityResets.values()) job.release();
+    this.pendingAffinityResets.clear();
   }
 
   private async removeSessionWithStatus(
@@ -1269,6 +1421,125 @@ export class RelaySessionManager {
    * if any. Shutdown detaches every socket before it awaits a single write, so
    * a slow database cannot keep later sockets open.
    */
+  private clearDeploymentSnapshot(session: SessionState) {
+    const snapshot = session.deploymentSnapshot;
+    if (!snapshot) return;
+    clearTimeout(snapshot.timer);
+    // The callback still owns its array after disconnect/timeout; keep that memory charged until it joins.
+    if (!snapshot.completing) this.releaseDeploymentSnapshot(snapshot);
+    session.deploymentSnapshot = null;
+  }
+
+  private releaseDeploymentSnapshot(snapshot: DeploymentSnapshot) {
+    if (snapshot.released) return;
+    snapshot.released = true;
+    this.deploymentSnapshotBytes -= snapshot.bytes;
+    this.deploymentSnapshotSlots--;
+  }
+
+  private async receiveDeploymentSnapshot(
+    session: SessionState,
+    identity: DeploymentSocket,
+    frame: DeploymentInstancesFrame,
+    encoded: string,
+  ) {
+    const reject = async () => {
+      session.deploymentInventoryGeneration = null;
+      this.clearDeploymentSnapshot(session);
+      closeWithProtocolError(session.socket, "malformed", "Invalid deployment inventory snapshot.");
+      await this.removeSession(session.socket, new Date());
+    };
+    let snapshot = session.deploymentSnapshot;
+    if (frame.chunkIndex === 0) {
+      // A fresh start replaces an incomplete snapshot; never a committing callback.
+      session.deploymentInventoryGeneration = null;
+      if (
+        snapshot?.completing ||
+        snapshot?.id === frame.snapshotId ||
+        session.lastDeploymentSnapshotId === frame.snapshotId
+      )
+        return reject();
+      this.clearDeploymentSnapshot(session);
+      if (this.deploymentSnapshotSlots >= DEPLOYMENT_SNAPSHOT_SLOTS) return reject();
+      const timer = setTimeout(() => {
+        if (session.deploymentSnapshot !== snapshot) return;
+        const code = snapshot?.completing ? "internal" : "malformed";
+        session.deploymentInventoryGeneration = null;
+        this.clearDeploymentSnapshot(session);
+        closeWithProtocolError(session.socket, code, "Deployment inventory snapshot timed out.");
+        void this.removeSession(session.socket, new Date()).catch(() => {});
+      }, DEPLOYMENT_SNAPSHOT_TIMEOUT_MS);
+      timer.unref();
+      snapshot = {
+        id: frame.snapshotId,
+        nextIndex: 0,
+        bytes: 0,
+        instances: [],
+        keys: new Set(),
+        completing: false,
+        released: false,
+        timer,
+      };
+      session.deploymentSnapshot = snapshot;
+      this.deploymentSnapshotSlots++;
+    }
+    const bytes = Buffer.byteLength(encoded, "utf8");
+    if (
+      !snapshot ||
+      snapshot.completing ||
+      snapshot.id !== frame.snapshotId ||
+      snapshot.nextIndex !== frame.chunkIndex ||
+      snapshot.bytes + bytes > DEPLOYMENT_SNAPSHOT_BYTES ||
+      this.deploymentSnapshotBytes + bytes > DEPLOYMENT_SNAPSHOT_GLOBAL_BYTES ||
+      snapshot.instances.length + frame.instances.length > DEPLOYMENT_SNAPSHOT_RECORDS
+    )
+      return reject();
+    for (const instance of frame.instances) {
+      const key = `${instance.instanceId}:${instance.rank}`;
+      if (snapshot.keys.has(key)) return reject();
+      snapshot.keys.add(key);
+    }
+    snapshot.bytes += bytes;
+    this.deploymentSnapshotBytes += bytes;
+    snapshot.nextIndex++;
+    snapshot.instances.push(...frame.instances);
+    if (!frame.final) return;
+    snapshot.completing = true;
+    try {
+      if (!this.deploymentHandlers) throw new Error("deployment_inventory_handler_missing");
+      const accepted = await this.deploymentHandlers.inventory(identity, snapshot.instances);
+      if (accepted === false) throw new Error("deployment_inventory_not_committed");
+      if (
+        accepted !== false &&
+        this.sessionsByCliDeviceId.get(identity.cliDeviceId) === session &&
+        session.deploymentSnapshot === snapshot
+      ) {
+        session.lastDeploymentSnapshotId = snapshot.id;
+        session.deploymentInventoryGeneration = identity.generation;
+        session.socket.send(
+          encodeRelayServerControlMessage({
+            type: "deployment.instances.ok",
+            snapshotId: snapshot.id,
+          }),
+        );
+        this.deploymentHandlers.ready?.(identity);
+      }
+    } catch {
+      session.deploymentInventoryGeneration = null;
+      closeWithProtocolError(
+        session.socket,
+        "internal",
+        "Deployment inventory could not be committed.",
+      );
+      await this.removeSession(session.socket, new Date());
+    } finally {
+      if (session.deploymentSnapshot === snapshot) this.clearDeploymentSnapshot(session);
+      this.releaseDeploymentSnapshot(snapshot);
+    }
+    // ACK is emitted only by the current generation after durable completion.
+    // A rejected/timed-out/detached callback never acknowledges its snapshot.
+  }
+
   private detachSession(
     socket: RelaySocket,
     {
@@ -1283,6 +1554,8 @@ export class RelaySessionManager {
   ): (() => Promise<void>) | null {
     const session = this.sessionsBySocket.get(socket);
     if (!session) return null;
+    this.clearDeploymentSnapshot(session);
+    session.deploymentInventoryGeneration = null;
     this.teardownInteractiveWork(session);
     clearTimeout(session.unauthenticatedTimer);
     if (session.routingEvaluation) this.routingEvaluator.cancel(session.routingEvaluation);
@@ -1436,6 +1709,7 @@ export class RelaySessionManager {
    */
   beginDrain() {
     this.relayDrain = true;
+    this.stopAffinityResetRecovery();
   }
 
   isDraining(): boolean {
@@ -1445,6 +1719,7 @@ export class RelaySessionManager {
   /** Shutdown step: cancel interactive work, close remaining CLI sockets, mark devices disconnected. */
   async closeRelaySessions(now = new Date()) {
     this.beginDrain();
+    await Promise.allSettled([...this.affinityResetWrites]);
     await this.shutdownRelaySessions([...this.sessionsBySocket.values()], now);
   }
 
@@ -1737,13 +2012,76 @@ export class RelaySessionManager {
       });
       for (const row of rows ?? []) {
         if (row.loadCounterEpoch == null) continue;
-        this.kvCounterEpochByEndpoint.set(`${cliDeviceId}\0${row.slug}`, row.loadCounterEpoch);
+        const key = `${cliDeviceId}\0${row.slug}`;
+        if (!this.kvCounterEpochByEndpoint.has(key))
+          this.kvCounterEpochByEndpoint.set(key, row.loadCounterEpoch);
       }
     } catch (error) {
       console.error(
         "[relay] seeding load counter epochs failed",
         error instanceof Error ? error.name : typeof error,
       );
+    }
+  }
+
+  private startAffinityObserverMaintenance() {
+    this.affinityObserverTimer ??= setInterval(() => {
+      if (this.affinityResetClosed || this.affinityObserverRunning) return;
+      this.affinityObserverRunning = (async () => {
+        try {
+          await renewAffinityObservers(
+            this.affinityObserverManagerId,
+            [...this.sessionsByCliDeviceId.keys()],
+            [...this.pendingAffinityResets.values()].map(
+              (job) => `${job.cliDeviceId}\u0001${job.slug}`,
+            ),
+          );
+        } catch {
+          // Database-clock lease expiry suppresses confidence without stopping inference.
+        }
+      })().finally(() => {
+        this.affinityObserverRunning = undefined;
+      });
+      this.affinityResetWrites.add(this.affinityObserverRunning);
+      const running = this.affinityObserverRunning;
+      void running.finally(() => this.affinityResetWrites.delete(running));
+      if (!this.affinityObserverRecovery) {
+        this.affinityObserverRecovery = (async () => {
+          await recoverAffinityObservers();
+          if (!this.affinityResetClosed)
+            await discoverAffinityObservers(
+              this.affinityObserverManagerId,
+              [...this.sessionsByCliDeviceId.keys()],
+              [...this.pendingAffinityResets.values()].map(
+                (job) => `${job.cliDeviceId}\u0001${job.slug}`,
+              ),
+            );
+        })()
+          .catch(() => {})
+          .finally(() => {
+            this.affinityObserverRecovery = undefined;
+          });
+        const recovery = this.affinityObserverRecovery;
+        this.affinityResetWrites.add(recovery);
+        void recovery.finally(() => this.affinityResetWrites.delete(recovery));
+      }
+    }, 500);
+    this.affinityObserverTimer.unref?.();
+  }
+
+  private pruneCounterEpochs(cliDeviceId: string, slugs: ReadonlySet<string>) {
+    const prefix = `${cliDeviceId}\0`;
+    for (const key of this.kvCounterEpochByEndpoint.keys()) {
+      if (key.startsWith(prefix) && !slugs.has(key.slice(prefix.length))) {
+        this.kvCounterEpochByEndpoint.delete(key);
+        this.kvResetAtByEndpoint.delete(key);
+      }
+    }
+    while (this.kvCounterEpochByEndpoint.size > KV_COUNTER_EPOCH_CACHE_MAX) {
+      const first = this.kvCounterEpochByEndpoint.keys().next().value;
+      if (first === undefined) break;
+      this.kvCounterEpochByEndpoint.delete(first);
+      this.kvResetAtByEndpoint.delete(first);
     }
   }
 
@@ -1799,11 +2137,14 @@ export class RelaySessionManager {
   }
 
   /**
-   * Reset KV-eviction evidence only on a `counterEpoch` change or an explicit
-   * `prefixCacheReset`. Hello must not wipe rows. Unknown inventory slugs are
-   * ignored; repeats are debounced.
+   * Reset KV-eviction evidence on a `counterEpoch` change or an explicit `prefixCacheReset`.
+   * Hello must not wipe rows. Unknown inventory slugs are ignored.
+   *
+   * Only positive proof skips work: a cached epoch equal to the frame's. A missing cache entry
+   * (eviction, pruning) is resolved against the durable epoch, and repeated explicit resets
+   * inside the debounce window are coalesced into one delayed reset rather than dropped.
    */
-  private noteKvEvictionResetSignal(
+  private async noteKvEvictionResetSignal(
     session: SessionState,
     load: Pick<EndpointLoadMessage, "endpointSlug" | "prefixCacheReset" | "counterEpoch">,
     now: Date,
@@ -1811,32 +2152,148 @@ export class RelaySessionManager {
     const cliDeviceId = session.cliDeviceId;
     if (!cliDeviceId || !session.inventorySlugs.has(load.endpointSlug)) return;
     const key = `${cliDeviceId}\0${load.endpointSlug}`;
+    if (this.affinityResetClosed) return;
     const previousEpoch = this.kvCounterEpochByEndpoint.get(key);
-    if (load.counterEpoch !== previousEpoch) {
-      this.kvCounterEpochByEndpoint.set(key, load.counterEpoch);
-      void prisma.endpoint
-        .updateMany({
-          where: { cliDeviceId, slug: load.endpointSlug },
-          data: { loadCounterEpoch: load.counterEpoch },
-        })
-        .catch(() => {
-          /* Disposable: load frames must not fail closed on epoch persist. */
-        });
-    }
-    const epochChanged = previousEpoch !== undefined && load.counterEpoch !== previousEpoch;
-    if (!epochChanged && load.prefixCacheReset !== true) return;
+    const epochUnknown = previousEpoch === undefined;
+    const epochChanged = !epochUnknown && load.counterEpoch !== previousEpoch;
     const lastResetMs = this.kvResetAtByEndpoint.get(key);
     const nowMs = now.getTime();
-    if (
+    const resetRequested = epochChanged || load.prefixCacheReset === true;
+    const notBefore =
+      resetRequested &&
+      !epochChanged &&
       lastResetMs !== undefined &&
       Number.isFinite(nowMs) &&
       nowMs - lastResetMs < KV_EVICTION_RESET_DEBOUNCE_MS
-    )
+        ? lastResetMs + KV_EVICTION_RESET_DEBOUNCE_MS
+        : 0;
+    if (!resetRequested && !epochUnknown && !this.pendingAffinityResets.has(key)) {
+      // Least-recently-used: an endpoint that keeps reporting stays cached.
+      this.kvCounterEpochByEndpoint.delete(key);
+      this.kvCounterEpochByEndpoint.set(key, load.counterEpoch);
       return;
-    if (Number.isFinite(nowMs)) this.kvResetAtByEndpoint.set(key, nowMs);
-    void resetKvEvictionForEndpoint(cliDeviceId, load.endpointSlug, now).catch(() => {
-      /* Disposable: load frames must not fail closed on evidence reset. */
-    });
+    }
+    try {
+      const existing = this.pendingAffinityResets.get(key);
+      if (existing) {
+        // New reset evidence supersedes an in-flight snapshot: its completion may not clear
+        // this newer fence, even when the signal was rate-dropped. Evidence is judged against
+        // the pending job, not the (stale until it completes) cache: any epoch movement is a
+        // reset, and frames repeating the job's epoch leave it alone so it can complete.
+        const epochMoved = existing.epoch !== load.counterEpoch;
+        if (
+          load.prefixCacheReset === true ||
+          epochMoved ||
+          (epochUnknown && !existing.epochUnknown)
+        ) {
+          existing.epoch = load.counterEpoch;
+          existing.reset ||= resetRequested || epochMoved;
+          existing.epochUnknown ||= epochUnknown;
+          existing.notBefore = Math.min(existing.notBefore, notBefore);
+          existing.now = now;
+          existing.version++;
+        }
+      } else {
+        this.pendingAffinityResets.set(key, {
+          cliDeviceId,
+          connectionGeneration: session.connectionGeneration ?? 0,
+          slug: load.endpointSlug,
+          epoch: load.counterEpoch,
+          reset: resetRequested,
+          epochUnknown,
+          notBefore,
+          now,
+          version: 0,
+          release: beginAffinityReset(cliDeviceId, load.endpointSlug, session.identity.userId),
+        });
+      }
+    } catch {
+      // Only bounded observation-ledger overload relinquishes a connection;
+      // ordinary metadata persistence failures preserve all serving streams.
+      session.socket.close(1011, "cache_generation_unavailable");
+      await this.removeSession(session.socket, now);
+      return;
+    }
+    this.affinityResetTimer ??= setInterval(() => {
+      if (this.affinityResetClosed || this.affinityResetRecoveryRunning) return;
+      this.affinityResetRecoveryRunning = true;
+      void (async () => {
+        // At most four due jobs each tick; rotation prevents a locked first endpoint from
+        // monopolizing quiet recovery, and delayed (debounced) jobs never crowd out due ones.
+        const nowMs = Date.now();
+        const due = [...this.pendingAffinityResets.entries()]
+          .filter(([, job]) => job.notBefore <= nowMs && !job.running)
+          .slice(0, 4);
+        for (const [retryKey] of due) {
+          if (this.affinityResetClosed) break;
+          await this.runAffinityReset(retryKey);
+        }
+      })().finally(() => {
+        this.affinityResetRecoveryRunning = false;
+      });
+    }, 1000);
+    this.affinityResetTimer.unref?.();
+    await this.runAffinityReset(key, nowMs);
+  }
+
+  /** `nowMs` is the triggering frame's receipt time, or the clock for timer retries. */
+  private runAffinityReset(key: string, nowMs = Date.now()): Promise<void> {
+    const job = this.pendingAffinityResets.get(key);
+    if (!job || this.affinityResetClosed) return Promise.resolve();
+    if (job.running) return job.running;
+    const { cliDeviceId, connectionGeneration, slug, epoch, epochUnknown, now, version } = job;
+    // Move attempts to the tail, keeping a bounded fair recovery worklist.
+    this.pendingAffinityResets.delete(key);
+    this.pendingAffinityResets.set(key, job);
+    // A delayed reset keeps local confidence paused (its ledger entry is held) until it runs.
+    if (job.notBefore > nowMs) return Promise.resolve();
+    job.running = (async () => {
+      try {
+        const reset =
+          job.reset ||
+          (epochUnknown &&
+            (await readAffinityCounterEpoch(cliDeviceId, slug).then((durable) =>
+              // A CLI process starts each endpoint's counters at epoch 0. With
+              // nothing stored yet, a later epoch means a reset this server may
+              // not have seen (one sent while the slug was still being
+              // inventoried), so it is treated as one; epoch 0 is a baseline.
+              durable === null ? epoch > 0 : durable !== epoch,
+            )));
+        const observations = reset
+          ? await observeAffinityReset({
+              cliDeviceId,
+              slugs: [slug],
+              connectionGeneration,
+              managerId: this.affinityObserverManagerId,
+            })
+          : [];
+        if (reset) await resetKvEvictionForEndpoint(cliDeviceId, slug, now);
+        await persistAffinityCounterEpoch(cliDeviceId, slug, epoch);
+        if (this.affinityResetClosed || job.version !== version) return;
+        await acknowledgeAffinityObservations(observations);
+        if (this.affinityResetClosed || job.version !== version) return;
+        this.kvCounterEpochByEndpoint.set(key, epoch);
+        while (this.kvCounterEpochByEndpoint.size > KV_COUNTER_EPOCH_CACHE_MAX) {
+          const first = this.kvCounterEpochByEndpoint.keys().next().value;
+          if (first === undefined) break;
+          this.kvCounterEpochByEndpoint.delete(first);
+          this.kvResetAtByEndpoint.delete(first);
+        }
+        if (reset && Number.isFinite(now.getTime()))
+          this.kvResetAtByEndpoint.set(key, now.getTime());
+        job.release();
+        this.pendingAffinityResets.delete(key);
+      } catch {
+        // The affected physical capacity remains unknown until durable intent
+        // and epoch consumption both commit. Ordinary routing is unaffected.
+      } finally {
+        job.running = undefined;
+      }
+    })();
+    const running = job.running;
+    this.affinityResetWrites.add(running);
+    void running.finally(() => this.affinityResetWrites.delete(running));
+    return running;
   }
 
   /**
@@ -1855,22 +2312,23 @@ export class RelaySessionManager {
     const nowMs = now.getTime();
     if (message.type === "endpoint.load") {
       const { type: _type, ...load } = message;
+      // Reset evidence is evaluated for every frame before any lossy load bookkeeping (rate
+      // limit, key cap): a dropped reading must never drop a physical cache reset.
+      await this.noteKvEvictionResetSignal(session, load, now);
       const key = `${load.endpointSlug}\u0000${load.modelSlug ?? ""}`;
       const previous = session.endpointLoad.get(key);
       const hitsDelta = load.prefixCacheHitsDelta ?? 0;
       const queriesDelta = load.prefixCacheQueriesDelta ?? 0;
       if (previous && nowMs - previous.receivedAtMs < ENDPOINT_LOAD_MIN_INTERVAL_MS) {
-        // The reading is dropped but its counter deltas and reset signals are not.
+        // The reading is dropped but its counter deltas are not.
         previous.prefixCacheHitsTotal = addCapped(previous.prefixCacheHitsTotal, hitsDelta);
         previous.prefixCacheQueriesTotal = addCapped(
           previous.prefixCacheQueriesTotal,
           queriesDelta,
         );
-        this.noteKvEvictionResetSignal(session, load, now);
         return;
       }
       if (!previous && session.endpointLoad.size >= ENDPOINT_LOAD_MAX_KEYS) return;
-      this.noteKvEvictionResetSignal(session, load, now);
       // "Sustained" waiting counts consecutive accepted frames. A gap longer
       // than the staleness window restarts the count (fail open).
       const continuous = previous && nowMs - previous.receivedAtMs <= ENDPOINT_LOAD_STALE_AFTER_MS;
@@ -2996,6 +3454,8 @@ export class RelaySessionManager {
       // the device's terminals and live features changed without them asking.
       const owners = new Set<string>([newSession.identity.userId]);
       for (const terminal of existing.terminalsById.values()) owners.add(terminal.userId);
+      this.clearDeploymentSnapshot(existing);
+      existing.deploymentInventoryGeneration = null;
       this.teardownInteractiveWork(existing);
       // A replaced session must publish no more verdicts: its pending run
       // would start later than the successor's fence and win with an older reading.

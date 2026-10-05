@@ -1,6 +1,10 @@
 import { Readable } from "node:stream";
 import type { ReadableStreamReadResult } from "node:stream/web";
 import {
+  type EmbeddingContract,
+  embeddingContractsMatch,
+} from "@ws-model-proxy/api/lib/embedding-contract";
+import {
   type ExternalSendConsentDenial,
   lockExternalSendConsent,
   readExternalConsentDenial,
@@ -191,6 +195,8 @@ export interface PublicOverflowRequest {
   requesterModelApiTokenId: string | null;
   requestedProtocol: ProviderProtocol;
   requestedSurface: ProtocolSurface;
+  /** Native embedding operation; the transport surface is OpenAI JSON. */
+  embeddingContract?: EmbeddingContract;
   stream: boolean;
   requiredFeatures: readonly string[];
   path: string;
@@ -422,8 +428,12 @@ function providerEventRouting(input: {
   nativeSurface?: ProtocolSurface;
 }) {
   return {
-    requestedSurface: input.request.requestedSurface,
-    nativeSurface: input.nativeSurface,
+    requestedSurface:
+      input.request.path === "/v1/embeddings"
+        ? "OPENAI_EMBEDDINGS"
+        : input.request.requestedSurface,
+    nativeSurface:
+      input.request.path === "/v1/embeddings" ? "OPENAI_EMBEDDINGS" : input.nativeSurface,
     adapterMode: input.nativeSurface
       ? input.nativeSurface === input.request.requestedSurface
         ? "native"
@@ -531,6 +541,7 @@ async function recheckExternalSendTarget(
     target: PublicProviderTarget;
     consent: ExternalSendConsentIdentity;
     exactBinding?: boolean;
+    embeddingContract?: EmbeddingContract;
   },
 ): Promise<"BOUND_TARGET_INVALID" | "PROVIDER_UNAVAILABLE" | null> {
   const ownKey = Boolean(input.consent.ownKeyProviderModelId);
@@ -551,7 +562,11 @@ async function recheckExternalSendTarget(
           endpointVersion: input.target.endpointVersion,
         },
       },
-      select: { enabled: true, ProviderAccount: { select: { enabled: true } } },
+      select: {
+        enabled: true,
+        nativeCapabilities: true,
+        ProviderAccount: { select: { enabled: true } },
+      },
     }),
     ownKey
       ? Promise.resolve({ id: "" })
@@ -568,6 +583,19 @@ async function recheckExternalSendTarget(
   ]);
   if (!model || !member) return gone;
   if (!model.enabled || !model.ProviderAccount.enabled) return "PROVIDER_UNAVAILABLE";
+  if (input.embeddingContract) {
+    const pool = await tx.modelPool.findUnique({
+      where: { id: input.consent.poolId },
+      select: { embeddingContract: true },
+    });
+    const capabilities = parseOpenAiCompatibleCapabilities(model.nativeCapabilities);
+    if (
+      capabilities?.embeddings?.supported !== true ||
+      !embeddingContractsMatch(input.embeddingContract, capabilities.embeddings.contract) ||
+      !embeddingContractsMatch(input.embeddingContract, pool?.embeddingContract)
+    )
+      return "PROVIDER_UNAVAILABLE";
+  }
   return null;
 }
 
@@ -607,6 +635,8 @@ export async function claimPublicProviderCredentialForSend(input: {
   consent: ExternalSendConsentIdentity;
   /** The attempt serves a stored-response binding (exactResponsesBinding). */
   exactBinding?: boolean;
+  embeddingContract?: EmbeddingContract;
+  reason?: PublicOverflowReason;
 }): Promise<PublicProviderSendClaim> {
   if (!env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED)
     return { claimed: false, reason: "DEPLOYMENT_GATE_DISABLED" };
@@ -621,6 +651,14 @@ export async function claimPublicProviderCredentialForSend(input: {
       await tx.$executeRaw`SELECT set_config('lock_timeout', ${`${EXTERNAL_SEND_CLAIM_LOCK_TIMEOUT_MS}ms`}, true)`;
       const denial = await lockExternalSendConsent(tx, input.consent);
       if (denial) return { claimed: false, reason: consentSkipReason(denial) };
+      if (input.reason === "LOCAL_SATURATED_PROTECTED") {
+        const pool = await tx.modelPool.findUnique({
+          where: { id: input.consent.poolId },
+          select: { paidWarmProtectionEnabled: true },
+        });
+        if (pool?.paidWarmProtectionEnabled !== true)
+          return { claimed: false, reason: "PROVIDER_UNAVAILABLE" };
+      }
       await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.target.providerAccountId} AND "userId" = ${input.userId} FOR UPDATE`;
       // D9: the privacy switch commits under this same account row lock
       // (providerManagement.setAllowDataCollection), so this read sees every
@@ -712,8 +750,23 @@ export function resolvePublicProviderExecution(
     PublicOverflowRequest,
     "requestedSurface" | "stream" | "requiredFeatures" | "adaptationEnabled"
   > &
-    Partial<Pick<PublicOverflowRequest, "path" | "headers" | "method" | "exactResponsesBinding">>,
+    Partial<
+      Pick<
+        PublicOverflowRequest,
+        "path" | "headers" | "method" | "exactResponsesBinding" | "embeddingContract"
+      >
+    >,
 ): ProviderSurfaceExecution | undefined {
+  if (request.path === "/v1/embeddings") {
+    return !request.stream &&
+      target.capabilityInventory?.embeddings?.supported === true &&
+      embeddingContractsMatch(
+        request.embeddingContract,
+        target.capabilityInventory.embeddings.contract,
+      )
+      ? { mode: "native", nativeSurface: "openai-chat", limitations: [] }
+      : undefined;
+  }
   if (!target.capabilityInventory) return undefined;
   const requestedSurface = {
     "openai-chat": "OPENAI_CHAT_COMPLETIONS",
@@ -801,8 +854,20 @@ export function publicTargetCompatibility(
     | "contextTokens"
     | "skipContextValidation"
   > &
-    Partial<Pick<PublicOverflowRequest, "path" | "headers" | "method" | "exactResponsesBinding">>,
+    Partial<
+      Pick<
+        PublicOverflowRequest,
+        "path" | "headers" | "method" | "exactResponsesBinding" | "embeddingContract"
+      >
+    >,
 ): "COMPATIBLE" | "CONTEXT_UNKNOWN" | "CONTEXT_EXCEEDED" | "PROTOCOL_UNAVAILABLE" {
+  if (request.path === "/v1/embeddings") {
+    if (target.protocol !== "openai" || !resolvePublicProviderExecution(target, request))
+      return "PROTOCOL_UNAVAILABLE";
+    // Embedding windows bound each input, while billing counts the entire
+    // batch. A sum/estimate cannot reject the request; the engine decides fit.
+    return "COMPATIBLE";
+  }
   if (!inventoryMatchesProtocol(target.capabilityInventory, target.protocol))
     return "PROTOCOL_UNAVAILABLE";
   const requestedOutputTokens =
@@ -1687,6 +1752,36 @@ export function usageFromObject(
   };
 }
 
+/** Embeddings have no generated tokens. Normalize only this operation's usage. */
+export function parseEmbeddingProviderUsage(
+  chunks: readonly Uint8Array[],
+  pricing?: ProviderPricingSchedule,
+  dialect: ProviderUsageDialect = "generic",
+): RawProviderUsage | undefined {
+  try {
+    const root: unknown = JSON.parse(new TextDecoder().decode(Buffer.concat(chunks)));
+    const record = usageRecord(root);
+    const usage = usageRecord(record?.usage);
+    if (!usage || usageInteger(usage.prompt_tokens ?? usage.input_tokens) === undefined)
+      return undefined;
+    // Refuse contradictory output counts instead of overwriting observations.
+    if (
+      (usage.completion_tokens !== undefined && usage.completion_tokens !== 0) ||
+      (usage.output_tokens !== undefined && usage.output_tokens !== 0)
+    )
+      return undefined;
+    const normalized: Record<string, unknown> = { ...usage, completion_tokens: 0 };
+    delete normalized.output_tokens;
+    return parseProviderUsage(
+      [new TextEncoder().encode(JSON.stringify({ usage: normalized }))],
+      pricing,
+      dialect,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
 export function parseProviderUsage(
   chunks: readonly Uint8Array[],
   pricing?: ProviderPricingSchedule,
@@ -2533,7 +2628,8 @@ export async function rankPublicOverflowTargets(input: {
   policy: AffinityPolicy;
   targets: PublicProviderTarget[];
 }): Promise<{ targets: PublicProviderTarget[]; decision: AffinityDecision | null }> {
-  if (!input.policy.enabled) return { targets: input.targets, decision: null };
+  if (!input.policy.enabled || input.request.path === "/v1/embeddings")
+    return { targets: input.targets, decision: null };
   let payload: Record<string, unknown>;
   try {
     const parsed: unknown = JSON.parse(new TextDecoder().decode(input.request.body));
@@ -3158,6 +3254,9 @@ export async function dispatchPublicOverflow(
         keyring,
         consent: sendConsent,
         exactBinding: Boolean(binding),
+        embeddingContract:
+          request.path === "/v1/embeddings" ? request.embeddingContract : undefined,
+        reason: request.reason,
       });
     } catch {
       // The claim failed before any provider I/O (lock or connection
@@ -3546,24 +3645,27 @@ export async function dispatchPublicOverflow(
               fencingToken,
             }).catch(() => false);
           }
-          const combinedUsage = openRouterStreamRecords
-            ? openRouterStreamRecords.settle(pricing)
-            : target.usageDialect === "openrouter" && !request.stream
-              ? // The whole body is the one record; an overflowing body has none.
-                nonstreamOverflow
-                ? undefined
-                : parseProviderUsage(nonstreamChunks, pricing, "openrouter", surface)
-              : mergeProviderUsage(
-                  responseBytes > 1024 * 1024
-                    ? parseProviderUsage(initialUsageChunks, pricing, target.usageDialect)
-                    : undefined,
-                  parseProviderUsage(
-                    !request.stream && !nonstreamOverflow ? nonstreamChunks : usageChunks,
-                    pricing,
-                    target.usageDialect,
-                  ),
-                  surface,
-                );
+          const combinedUsage =
+            request.path === "/v1/embeddings" && !request.stream && !nonstreamOverflow
+              ? parseEmbeddingProviderUsage(nonstreamChunks, pricing, target.usageDialect)
+              : openRouterStreamRecords
+                ? openRouterStreamRecords.settle(pricing)
+                : target.usageDialect === "openrouter" && !request.stream
+                  ? // The whole body is the one record; an overflowing body has none.
+                    nonstreamOverflow
+                    ? undefined
+                    : parseProviderUsage(nonstreamChunks, pricing, "openrouter", surface)
+                  : mergeProviderUsage(
+                      responseBytes > 1024 * 1024
+                        ? parseProviderUsage(initialUsageChunks, pricing, target.usageDialect)
+                        : undefined,
+                      parseProviderUsage(
+                        !request.stream && !nonstreamOverflow ? nonstreamChunks : usageChunks,
+                        pricing,
+                        target.usageDialect,
+                      ),
+                      surface,
+                    );
           const combinedCost =
             combinedUsage && pricing ? calculatedCostForUsage(combinedUsage, pricing) : undefined;
           const observedUsage: RawProviderUsage | undefined = combinedCost

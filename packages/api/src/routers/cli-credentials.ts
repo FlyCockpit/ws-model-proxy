@@ -10,12 +10,13 @@ import { cliDeviceDisplayName } from "@ws-model-proxy/config/cli-device-name";
 import { normalizeIdentityPublicKey } from "@ws-model-proxy/config/cli-identity-key";
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma, { Prisma } from "@ws-model-proxy/db";
+import { fenceOwners } from "@ws-model-proxy/db/capacity-lock-order";
 import {
   credentialLookupPrefix,
   generateProductCredentialSecret,
 } from "@ws-model-proxy/db/forwarder-security";
 import { z } from "zod";
-import { protectedProcedure, publicProcedure } from "../index";
+import { humanProcedure, protectedProcedure, publicProcedure } from "../index";
 import {
   closeRevokedCliCredentialSessions,
   deviceFlowErrorData,
@@ -101,7 +102,7 @@ export const cliCredentialsRouter = {
       return rows.map(serializeCliToken);
     }),
 
-  createToken: protectedProcedure
+  createToken: humanProcedure
     .input(
       z.object({
         name: credentialNameSchema,
@@ -150,29 +151,49 @@ export const cliCredentialsRouter = {
       return serializeCliToken(row);
     }),
 
-  resetTokenIdentity: protectedProcedure
+  resetTokenIdentity: humanProcedure
     .input(z.object({ id: z.string().min(1) }))
     .handler(async ({ input, context }) => {
-      const existing = await prisma.cliToken.findUnique({
-        where: { id: input.id },
-        select: { id: true, userId: true, revokedAt: true },
-      });
-      if (!existing || existing.userId !== context.session.user.id) {
-        throw new ORPCError("NOT_FOUND", { message: "CLI token not found." });
-      }
-      if (existing.revokedAt) {
-        throw new ORPCError("BAD_REQUEST", {
-          message: "Revoked CLI tokens cannot reset their identity bind.",
+      if (context.services?.deploymentActor)
+        throw new ORPCError("FORBIDDEN", { message: "Resetting CLI identity requires a human." });
+      const row = await prisma.$transaction(async (tx) => {
+        await fenceOwners(tx, [context.session.user.id]);
+        await tx.$queryRaw`SELECT id FROM cli_token WHERE id = ${input.id} AND "userId" = ${context.session.user.id} FOR UPDATE`;
+        const existing = await tx.cliToken.findUnique({
+          where: { id: input.id },
+          select: { id: true, userId: true, revokedAt: true },
         });
-      }
-      const row = await prisma.cliToken.update({
-        where: { id: input.id },
-        data: {
-          identityPublicKey: null,
-          lastRefusedAt: null,
-          lastRefusedReason: null,
-        },
-        select: cliTokenSelection,
+        if (!existing || existing.userId !== context.session.user.id) {
+          throw new ORPCError("NOT_FOUND", { message: "CLI token not found." });
+        }
+        if (existing.revokedAt) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Revoked CLI tokens cannot reset their identity bind.",
+          });
+        }
+        const updated = await tx.cliToken.update({
+          where: { id: input.id },
+          data: {
+            identityPublicKey: null,
+            lastRefusedAt: null,
+            lastRefusedReason: null,
+          },
+          select: cliTokenSelection,
+        });
+        await tx.capacityAuditEvent.create({
+          data: {
+            userId: context.session.user.id,
+            actorUserId: context.session.user.id,
+            action: "RESET_IDENTITY",
+            resourceType: "CLI_TOKEN",
+            resourceId: input.id,
+          },
+        });
+        return updated;
+      });
+      await closeRevokedCliCredentialSessions(context.services, {
+        kind: "cliToken",
+        ids: [row.id],
       });
       return serializeCliToken(row);
     }),

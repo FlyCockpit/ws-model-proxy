@@ -1,37 +1,10 @@
 import { REQUEST_JSON_DEPTH_ERROR, requestJsonDepthExceeded } from "./request-json-depth.js";
 /**
- * Extracted diagnostic cores (Phase 5 — "Extracted diagnostic cores").
- *
- * Typed, USER-ID-BOUND application functions shared by the internal Hono
- * routes and the MCP tools. The Hono routes (chat-test.ts / pool-member-test.ts)
- * and the MCP bridge both consume THESE functions; neither calls the other.
- *
- * Invariants preserved from the original route implementations:
- * - the SINGLETON `relaySessionManager` and `modelApiConcurrencyLimiter` are
- *   the defaults (no runtime state is created per request and none is created
- *   per MCP request — the capacity runtime below is ONE module-lifetime
- *   instance shared by both transports);
- * - ownership checks (pool member / pool ownership by user id) happen in the
- *   core, keyed by the caller-supplied user id ONLY (MCP passes the verified
- *   JWT `sub`; the Hono route passes the session user);
- * - global + CLI concurrency leases are acquired/released exactly as before
- *   (acquire-global first, release in `finally`, no CLI lease taken when the
- *   global lease is exhausted);
- * - the relay attempt keeps its timeout, cancellation, and terminal-state
- *   handling (`startRelayAttempt`), and successful probes still mark pool
- *   member health (`markPoolMemberRelaySuccess`);
- * - capability checks (chat-completions support, published model/endpoint,
- *   connected CLI) run before any lease or relay dispatch.
- *
- * `runPoolMemberTest` returns a typed outcome discriminated union; the Hono
- * route maps it to the exact HTTP responses it always produced (its tests pin
- * that mapping byte-for-byte), and the MCP tool maps it to a JSON-safe result.
- *
- * `runChatCompletionDiagnostic` wraps the already-extracted, user-id-bound
- * `chatTestCompletionsHandler` core (routes.ts): it builds a synthetic
- * chat-completions Request, dispatches it through the SAME singletons, and
- * projects the response to a bounded, provider-safe summary — the raw
- * provider response NEVER crosses this boundary (invariant 10).
+ * User-bound diagnostic cores shared by Hono and MCP. Member probes use
+ * production pool routing, original physical capacity, final send permission
+ * and usage settlement. Chat probes classify pong/reasoning replies; an
+ * embedding-only member receives native vector inference, with no chat affinity.
+ * Synthetic requests and responses are never persisted as content.
  */
 
 import { markPoolMemberRelaySuccess } from "@ws-model-proxy/api/lib/model-pool-routing";
@@ -53,16 +26,10 @@ import {
   StoreCapacityAdmissionRuntime,
 } from "./capacity/runtime.js";
 import { splitModelVariant } from "./external-route.js";
-import {
-  type ModelApiConcurrencyLimiter,
-  ModelApiLimitError,
-  type ModelApiLimitLease,
-  modelApiConcurrencyLimiter,
-} from "./limits.js";
+import { type ModelApiConcurrencyLimiter, modelApiConcurrencyLimiter } from "./limits.js";
 import { extractAssistantTextFromChatCompletion, readResponseUtf8 } from "./media-transform.js";
 import { reasoningControlForSurface } from "./protocols/request-controls.js";
-import { startRelayAttempt } from "./relay-executor.js";
-import { chatTestCompletionsHandler } from "./routes.js";
+import { chatTestCompletionsHandler, poolMemberDiagnosticHandler } from "./routes.js";
 
 const TEST_TIMEOUT_MS = 20_000;
 const EXPECTED_PROBE_WORD = /\bpong\b/i;
@@ -121,6 +88,34 @@ export function classifyChatProbeReply(status: number, rawText: string): ChatPro
     return "reasoning-only";
   }
   return "failed";
+}
+
+function classifyEmbeddingProbeReply(status: number, raw: string): ChatProbeReplyClass {
+  if (status !== 200) return "failed";
+  try {
+    const value: unknown = JSON.parse(raw);
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      !("data" in value) ||
+      !Array.isArray(value.data)
+    )
+      return "failed";
+    return value.data.length === 1 &&
+      value.data.every(
+        (item: unknown) =>
+          typeof item === "object" &&
+          item !== null &&
+          "embedding" in item &&
+          Array.isArray(item.embedding) &&
+          item.embedding.length > 0 &&
+          item.embedding.every((v: unknown) => typeof v === "number" && Number.isFinite(v)),
+      )
+      ? "pong"
+      : "failed";
+  } catch {
+    return "failed";
+  }
 }
 
 /**
@@ -235,6 +230,7 @@ const poolMemberModelSelect = {
 /** EXACT select from the original Hono route (ownership + capability views). */
 const poolMemberTestSelect = {
   id: true,
+  poolId: true,
   ModelPool: { select: { userId: true } },
   ExecutionTarget: {
     select: {
@@ -253,12 +249,19 @@ type PoolMemberTestRow = Prisma.PoolMemberGetPayload<{ select: typeof poolMember
  * (`pool-member-test:<userId>`); MCP callers inherit the identical lease
  * bucket and limits.
  */
-export async function runPoolMemberTest({
+export function runPoolMemberTest(
+  input: Parameters<typeof poolMemberTest>[0],
+): Promise<PoolMemberTestResult> {
+  return withCapacityRequestScope(() => poolMemberTest(input));
+}
+
+async function poolMemberTest({
   userId,
   memberId,
   signal,
   manager = relaySessionManager,
   concurrencyLimiter = modelApiConcurrencyLimiter,
+  capacityRuntime,
 }: {
   userId: string;
   memberId: string;
@@ -304,73 +307,70 @@ export async function runPoolMemberTest({
         ? model.capabilityOverrides
         : model.Endpoint.defaultCapabilities,
   });
-  if (!supportsChat) {
-    return { outcome: "not-chat-capable" };
-  }
+  const embeddings = !supportsChat && effectiveCapabilities?.embeddings?.supported === true;
+  if (!supportsChat && !embeddings) return { outcome: "not-chat-capable" };
   if (!manager.getActiveCliDeviceIds().includes(model.Endpoint.cliDeviceId)) {
     return { outcome: "cli-disconnected" };
   }
 
   const startedAt = Date.now();
-  let globalLease: ModelApiLimitLease | null = null;
-  let cliLease: ModelApiLimitLease | null = null;
-  try {
-    globalLease = concurrencyLimiter.acquireGlobal({
-      tokenId: `pool-member-test:${userId}`,
-      userId,
-    });
-    cliLease = concurrencyLimiter.acquireCli(model.Endpoint.cliDeviceId);
-  } catch (error) {
-    globalLease?.release();
-    cliLease?.release();
-    if (error instanceof ModelApiLimitError) {
-      return { outcome: "rate-limited" };
-    }
-    throw error;
-  }
-
-  const body = new TextEncoder().encode(
-    JSON.stringify({
-      model: model.upstreamModelId,
-      stream: false,
-      max_tokens: PROBE_MAX_TOKENS,
-      ...probeReasoningFields(effectiveCapabilities),
-      messages: [{ role: "user", content: "Reply with the single word pong." }],
-    }),
-  );
-  const attempt = startRelayAttempt({
-    manager,
-    cliDeviceId: model.Endpoint.cliDeviceId,
-    endpointSlug: model.Endpoint.slug,
-    family: "chat.completions",
+  const body = embeddings
+    ? { model: "diagnostic", input: "pong" }
+    : {
+        model: "diagnostic",
+        stream: false,
+        max_tokens: PROBE_MAX_TOKENS,
+        ...probeReasoningFields(effectiveCapabilities),
+        messages: [{ role: "user", content: "Reply with the single word pong." }],
+      };
+  const request = new Request("http://diagnostic.internal/v1/probe", {
     method: "POST",
-    path: "/v1/chat/completions",
-    headers: new Headers({ "content-type": "application/json" }),
-    body,
-    timeoutMs: TEST_TIMEOUT_MS,
-    abortSignal: signal,
+    headers: {
+      "content-type": "application/json",
+      "x-wsmp-chat-test-member-id": member.id,
+      "x-wsmp-chat-test-routing-mode": embeddings ? "PREFER_NATIVE" : "REQUIRE_NATIVE",
+    },
+    body: JSON.stringify(body),
+    signal: signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(TEST_TIMEOUT_MS)])
+      : AbortSignal.timeout(TEST_TIMEOUT_MS),
   });
-
   try {
-    const started = await attempt.started;
-    const rawText = await readResponseUtf8(started.body);
-    const terminal = await attempt.terminal;
+    const response = await poolMemberDiagnosticHandler({
+      request,
+      userId,
+      poolId: member.poolId,
+      manager,
+      limiter: concurrencyLimiter,
+      capacityRuntime: capacityRuntime ?? diagnosticsCapacityRuntime(),
+      embeddings,
+    });
+    const status = response.status;
+    const rawText = await readResponseUtf8(
+      response.body ??
+        new ReadableStream({
+          start(controller) {
+            controller.close();
+          },
+        }),
+    );
+    if (status === 429) return { outcome: "rate-limited" };
     const latencyMs = Date.now() - startedAt;
-    const replyClass = classifyChatProbeReply(started.status, rawText);
-    if (!terminal.ok || replyClass === "failed") {
+    const replyClass = embeddings
+      ? classifyEmbeddingProbeReply(status, rawText)
+      : classifyChatProbeReply(status, rawText);
+    if (replyClass === "failed") {
       return {
         outcome: "probe-failed",
-        status: started.status,
+        status,
         latencyMs,
-        reason: terminal.failure
-          ? `Member test failed (${terminal.failure}).`
-          : "Member did not return a valid chat completion containing pong.",
+        reason: "Member did not return a valid diagnostic response.",
       };
     }
     await markPoolMemberRelaySuccess(member.id, { trialStartedAt: null });
     return {
       outcome: "ok",
-      status: started.status,
+      status,
       latencyMs,
       ...(replyClass === "reasoning-only" ? { detail: REASONING_ONLY_PROBE_DETAIL } : {}),
     };
@@ -391,9 +391,6 @@ export async function runPoolMemberTest({
       latencyMs: Date.now() - startedAt,
       reason: "Member test failed.",
     };
-  } finally {
-    cliLease.release();
-    globalLease.release();
   }
 }
 

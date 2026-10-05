@@ -4,7 +4,7 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fenceOwners, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
-import { protectedProcedure } from "../index";
+import { humanProcedure, protectedProcedure } from "../index";
 import {
   assertDirectCapacityPolicy,
   assertEffectiveConcurrencyPolicy,
@@ -665,7 +665,7 @@ export const providerManagementRouter = {
    * collect data". Off (the default) sends `provider.data_collection:
    * "deny"` on every OpenRouter request of this account. Excluded from MCP.
    */
-  setAllowDataCollection: protectedProcedure
+  setAllowDataCollection: humanProcedure
     .input(z.object({ id, allowDataCollection: z.boolean() }))
     .handler(async ({ input, context }) => {
       enabled();
@@ -1244,7 +1244,7 @@ export const providerManagementRouter = {
         },
       });
     }),
-  createCredential: protectedProcedure
+  createCredential: humanProcedure
     .input(z.object({ providerAccountId: id, credential: z.string().min(1).max(16_384) }))
     .handler(async ({ input, context }) => {
       enabled();
@@ -1304,7 +1304,7 @@ export const providerManagementRouter = {
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
       );
     }),
-  replaceCredential: protectedProcedure
+  replaceCredential: humanProcedure
     .input(z.object({ providerAccountId: id, credential: z.string().min(1).max(16_384) }))
     .handler(async ({ input, context }) => {
       enabled();

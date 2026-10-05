@@ -44,6 +44,10 @@ import { visibleModelAttachmentModalities } from "../lib/visible-model-modalitie
 import { visibleModelReasoning } from "../lib/visible-model-reasoning";
 
 export const listCliDevicesSelect = {
+  allowDeployments: true,
+  reportedDeployments: true,
+  deploymentPortStart: true,
+  deploymentPortEnd: true,
   id: true,
   createdAt: true,
   updatedAt: true,
@@ -84,6 +88,14 @@ export const listCliDevicesSelect = {
   usableRamGb: true,
   usableVramGb: true,
   User: { select: { slug: true } },
+  // The latest identity refusal of a live device credential (a copied
+  // credential presented by another machine); cleared by a successful hello.
+  CliDeviceCredentials: {
+    where: { revokedAt: null, lastRefusedAt: { not: null } },
+    orderBy: { lastRefusedAt: "desc" as const },
+    take: 1,
+    select: { lastRefusedAt: true },
+  },
   Endpoints: {
     orderBy: { createdAt: "asc" as const },
     select: {
@@ -191,6 +203,8 @@ export const poolSelect = {
   optimisticBasicTranscription: true,
   protocolAdaptationEnabled: true,
   fallbackEnabled: true,
+  embeddingContract: true,
+  paidWarmProtectionEnabled: true,
   fallbackForGrantees: true,
   externalAfterWaitMs: true,
   allowLossyDeveloperRoleCollapse: true,
@@ -365,11 +379,13 @@ export const poolSelect = {
 
 /** MCP pool list. Member endpoint slugs and grant rows; no model or capability JSON. */
 export const poolSummarySelect = {
+  _count: { select: { PoolMembers: true, PoolGrants: true } },
   id: true,
   createdAt: true,
   slug: true,
   name: true,
   PoolMembers: {
+    take: 20,
     orderBy: { createdAt: "asc" as const },
     select: {
       id: true,
@@ -401,6 +417,7 @@ export const poolSummarySelect = {
     },
   },
   PoolGrants: {
+    take: 20,
     orderBy: { createdAt: "desc" as const },
     select: {
       id: true,
@@ -411,17 +428,16 @@ export const poolSummarySelect = {
       Grantee: { select: { email: true, name: true } },
     },
   },
-  ProviderBudgetPolicies: {
-    where: { active: true, scopeType: "POOL_GRANT" },
-    select: {
-      granteeUserId: true,
-      Rules: {
-        where: { metric: "SPEND" },
-        select: { limitValue: true, currency: true, period: true },
-      },
-    },
-  },
 } satisfies Prisma.ModelPoolSelect;
+
+export const poolSummaryBudgetSelect = {
+  poolId: true,
+  granteeUserId: true,
+  Rules: { where: { metric: "SPEND" }, select: { limitValue: true, currency: true, period: true } },
+} satisfies Prisma.ProviderBudgetPolicySelect;
+type PoolSummaryBudget = Prisma.ProviderBudgetPolicyGetPayload<{
+  select: typeof poolSummaryBudgetSelect;
+}>;
 
 type ModelPoolRow = Prisma.ModelPoolGetPayload<{ select: typeof poolSelect }>;
 type PoolSummaryRow = Prisma.ModelPoolGetPayload<{ select: typeof poolSummarySelect }>;
@@ -665,6 +681,12 @@ export function serializeCliDevice(
     inventoryAcknowledgedAt: row.inventoryAcknowledgedAt,
     inventoryConfirmed: row.inventoryConfirmed,
     endpointTargeting: row.endpointTargeting,
+    deployment: {
+      allow: row.allowDeployments,
+      reported: row.reportedDeployments,
+      portStart: row.deploymentPortStart,
+      portEnd: row.deploymentPortEnd,
+    },
     cliVersion: row.cliVersion ?? null,
     relayProtocolVersion: row.relayProtocolVersion ?? null,
     /**
@@ -680,6 +702,8 @@ export function serializeCliDevice(
           reason: refusedRelayProtocolReason(row.rejectedRelayProtocolVersion),
         }
       : null,
+    /** When this device's credential last refused a hello for an identity mismatch. */
+    identityRefusedAt: row.CliDeviceCredentials[0]?.lastRefusedAt ?? null,
     nodeInfoAt: row.nodeInfoAt ?? null,
     nodeMetricsAt: row.nodeMetricsAt ?? null,
     labels: normalizeNodeLabels(row.labels ?? []),
@@ -883,6 +907,8 @@ export function serializePool(row: ModelPoolRow) {
     optimisticBasicTranscription: row.optimisticBasicTranscription,
     protocolAdaptationEnabled: row.protocolAdaptationEnabled,
     fallbackEnabled: row.fallbackEnabled,
+    embeddingContract: row.embeddingContract,
+    paidWarmProtectionEnabled: row.paidWarmProtectionEnabled,
     fallbackForGrantees: row.fallbackForGrantees,
     externalAfterWaitMs: row.externalAfterWaitMs,
     effectiveProviderEgress:
@@ -1040,13 +1066,18 @@ export function serializePool(row: ModelPoolRow) {
 export const POOL_SUMMARY_INLINE_CAP = 20;
 
 /** MCP pool list row: identity, grants, and member endpoint slugs. No models. */
-export function serializePoolSummary(row: PoolSummaryRow) {
+export function serializePoolSummary(
+  row: PoolSummaryRow,
+  policies: readonly PoolSummaryBudget[] = [],
+) {
   return {
     id: row.id,
     slug: row.slug,
     name: row.name,
-    grantCount: row.PoolGrants.length,
-    memberCount: row.PoolMembers.length,
+    grantCount: row._count.PoolGrants,
+    memberCount: row._count.PoolMembers,
+    grantsTruncated: row._count.PoolGrants > row.PoolGrants.length,
+    membersTruncated: row._count.PoolMembers > row.PoolMembers.length,
     grants: row.PoolGrants.slice(0, POOL_SUMMARY_INLINE_CAP).map((grant) => ({
       id: grant.id,
       createdAt: grant.createdAt,
@@ -1056,9 +1087,7 @@ export function serializePoolSummary(row: PoolSummaryRow) {
       protectionOverridePercent: grant.protectionOverridePercent,
       queuePriority: grant.queuePriority,
       fallbackSpend: serializePoolGrantSpendCap(
-        (row.ProviderBudgetPolicies ?? []).filter(
-          (policy) => policy.granteeUserId === grant.granteeUserId,
-        ),
+        policies.filter((policy) => policy.granteeUserId === grant.granteeUserId),
       ),
     })),
     members: row.PoolMembers.slice(0, POOL_SUMMARY_INLINE_CAP).map((member) => {

@@ -42,6 +42,10 @@ const requiredFragments = [
   "relay_execution_attempt_transition",
   "historical-split",
   "cache_affinity_record_shape_check",
+  "cache_affinity_scope_shape",
+  "cache_affinity_observer_shape",
+  "wsmp_affinity_generation_ready",
+  "wsmp_affinity_scope_generation",
   '("sharedPrefixTokens" IS NULL OR "sharedPrefixTokens" >= 0)',
   "capacity_kv_eviction_shape_check",
   "engine_load_rollup_minute_shape_check",
@@ -99,7 +103,7 @@ const requiredFragments = [
   'ALTER TABLE provider_budget_policy ALTER COLUMN "providerAccountId" DROP NOT NULL',
   'ALTER TABLE provider_budget_policy ADD COLUMN IF NOT EXISTS "poolGrantId" TEXT',
   'ALTER TABLE provider_budget_policy ADD COLUMN IF NOT EXISTS "granteeUserId" TEXT',
-  '"selectedPoolMemberId" ON relay_request',
+  "BEFORE INSERT OR UPDATE ON relay_request",
   "NEW.source = 'TRANSFORMER'",
   "budget reservation credential must match the reservation account",
   "enforce_provider_budget_reservation_transition",
@@ -118,7 +122,7 @@ const requiredFragments = [
   "stickiness selection must be a local member of its pool",
   "relay request selection must be a member of its pool",
   "stickiness pool grant row=%s",
-  '"selectedExecutionTargetId", "targetModelPoolId", "poolGrantId",\n  "routingVersion" ON response_stickiness_record',
+  "BEFORE INSERT OR UPDATE ON response_stickiness_record",
   "derive_relay_request_resource_owner",
   'BEFORE INSERT OR UPDATE OF "requestedModelPoolId", "resourceOwnerUserId" ON relay_request',
   'WHERE request."resourceOwnerUserId" IS NULL;',
@@ -1579,15 +1583,35 @@ try {
        "selectedExecutionTargetId", status, "startedAt")
     VALUES ('provider-relay', NOW(), NOW(), 'owner-a', 'provider-target-a',
       'provider-target-a', 'PENDING', NOW());
-    UPDATE response_stickiness_record
-       SET "targetExecutionTargetId" = 'provider-target-a',
-           "selectedExecutionTargetId" = 'provider-target-a'
-     WHERE id = 'dual-stickiness';
+    INSERT INTO response_stickiness_record
+      (id, "createdAt", "updatedAt", "userId", "routingKeyDigest",
+       "targetExecutionTargetId", "selectedExecutionTargetId")
+    VALUES ('provider-stickiness-second', NOW(), NOW(), 'owner-a', 'provider-second',
+      'provider-target-a', 'provider-target-a');
     UPDATE relay_request
        SET "requestedExecutionTargetId" = 'provider-target-a',
            "selectedExecutionTargetId" = 'provider-target-a'
      WHERE id = 'old-relay';
   `);
+  await expectConstraintFailure(`
+    UPDATE response_stickiness_record
+       SET "targetExecutionTargetId" = 'provider-target-a',
+           "selectedExecutionTargetId" = 'provider-target-a'
+     WHERE id = 'dual-stickiness'
+  `);
+  const preservedLocalBinding = await client.query(`
+    SELECT "selectedDiscoveredModelId", "selectedExecutionTargetId"
+      FROM response_stickiness_record WHERE id = 'dual-stickiness'
+  `);
+  const localTarget = await client.query(`
+    SELECT id FROM execution_target WHERE "discoveredModelId" = 'model-a'
+  `);
+  if (
+    preservedLocalBinding.rows[0].selectedDiscoveredModelId !== "model-a" ||
+    preservedLocalBinding.rows[0].selectedExecutionTargetId !== localTarget.rows[0].id
+  ) {
+    throw new Error("Refused stickiness retarget changed its original local binding");
+  }
   const providerCompatibility = await client.query(`
     SELECT "discoveredModelId" FROM pool_member WHERE id = 'provider-member'
   `);
@@ -1597,7 +1621,7 @@ try {
   const providerTelemetry = await client.query(`
     SELECT
       (SELECT COUNT(*)::int FROM response_stickiness_record
-        WHERE id IN ('provider-stickiness', 'dual-stickiness')
+        WHERE id IN ('provider-stickiness', 'provider-stickiness-second')
           AND "targetDiscoveredModelId" IS NULL
           AND "selectedDiscoveredModelId" IS NULL) AS stickiness,
       (SELECT COUNT(*)::int FROM relay_request

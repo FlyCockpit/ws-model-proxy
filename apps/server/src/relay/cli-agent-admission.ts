@@ -373,7 +373,7 @@ export function judgeCliAgentAdmission(
       rejectedProtocolVersion: device.rejectedRelayProtocolVersion,
     };
   }
-  if (!live || !live.supervisedCommands || (options?.fileWrite && !live.fileOps)) {
+  if (!live?.supervisedCommands || (options?.fileWrite && !live.fileOps)) {
     return { ok: false, error: "offline" };
   }
   if (!permitsSupervised(live.mcpCommandMode)) {

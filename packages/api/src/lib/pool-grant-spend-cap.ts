@@ -59,11 +59,13 @@ export async function resolvePoolSpendCurrency(
         select: {
           ProviderModel: {
             select: {
+              // The active version decides; the newest retired one is only a
+              // fallback (a retired future-dated version must not win).
               PricingVersions: {
                 where: { status: { in: ["ACTIVE", "RETIRED"] } },
                 orderBy: { effectiveAt: "desc" },
-                take: 1,
-                select: { currency: true },
+                take: 16,
+                select: { currency: true, status: true },
               },
             },
           },
@@ -73,7 +75,10 @@ export async function resolvePoolSpendCurrency(
   });
   const currencies = new Set(
     members
-      .map((member) => member.ExecutionTarget?.ProviderModel?.PricingVersions[0]?.currency)
+      .map((member) => {
+        const versions = member.ExecutionTarget?.ProviderModel?.PricingVersions ?? [];
+        return (versions.find((version) => version.status === "ACTIVE") ?? versions[0])?.currency;
+      })
       .filter((currency): currency is string => Boolean(currency)),
   );
   return currencies.size === 1 ? [...currencies][0]! : null;

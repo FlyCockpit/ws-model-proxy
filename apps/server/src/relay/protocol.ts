@@ -11,6 +11,7 @@ import {
 } from "@ws-model-proxy/api/lib/relay-protocol-version";
 import { adapterRouteIsValid } from "@ws-model-proxy/api/lib/remote-engine-adapters";
 import { normalizeReportedHostname } from "@ws-model-proxy/config/cli-device-name";
+import type { DeploymentJob } from "@ws-model-proxy/config/deployment-protocol";
 import { z } from "zod";
 import {
   FILE_BODY_MAX_BYTES,
@@ -176,6 +177,7 @@ const cliFeatureSchema = z
     fileRootsConfigured: z.boolean(),
     /** `wsmp config set-file-tools-as-root on` (default off). */
     allowFileToolsAsRoot: z.boolean(),
+    deployments: z.boolean().optional().default(false),
   })
   .strict();
 
@@ -288,6 +290,7 @@ const discoveredModelSchema = z
 const endpointInventorySchema = z
   .object({
     slug: z.string().trim().min(1).max(63),
+    deploymentInstanceId: z.string().min(1).max(128).optional(),
     label: z.string().trim().min(1).max(160),
     kind: z.enum(["openai-compatible", "anthropic-compatible"]),
     status: z.enum(["unknown", "online", "degraded", "offline"]).default("unknown"),
@@ -421,7 +424,18 @@ const nodeInfoSchema = z
       )
       .max(32)
       .optional(),
-    executionMechanism: z.enum(["foreground", "systemd", "launchd", "container"]).optional(),
+    executionMechanism: z
+      .enum([
+        "foreground",
+        "systemd",
+        "launchd",
+        "container",
+        "systemd+linger",
+        "systemd-no-linger",
+        "macos",
+        "unsupported",
+      ])
+      .optional(),
     cliVersion: storedTextSchema(80).optional(),
   })
   .strict();
@@ -713,9 +727,55 @@ export const remoteEngineAdaptersSchema = z
 const relayClientControlMessageSchema = z.discriminatedUnion("type", [
   z
     .object({
+      type: z.literal("deployment.job.result"),
+      stepId: requestIdSchema,
+      instanceId: requestIdSchema,
+      rank: z.number().int().min(0).max(63),
+      intentHash: z.string().regex(/^[a-f0-9]{64}$/),
+      ownerEpoch: requestIdSchema,
+      status: z.enum(["succeeded", "failed", "running"]),
+      stopped: z.boolean(),
+      error: z
+        .string()
+        .regex(/^[a-z0-9_]{1,64}$/)
+        .optional(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("deployment.instances"),
+      snapshotId: z.string().regex(/^[a-zA-Z0-9]{32}$/),
+      chunkIndex: z.number().int().min(0).max(131071),
+      final: z.boolean(),
+      instances: z
+        .array(
+          z
+            .object({
+              instanceId: requestIdSchema,
+              revisionId: requestIdSchema,
+              rank: z.number().int().min(0).max(63),
+              intentHash: z.string().regex(/^[a-f0-9]{64}$/),
+              stepId: requestIdSchema.optional(),
+              phase: z.enum(["starting", "ready", "unhealthy", "stopping", "stopped", "unknown"]),
+              unitName: z
+                .string()
+                .regex(/^wsmp-i-[a-zA-Z0-9]+-r[0-9]+$/)
+                .max(160),
+              port: z.number().int().min(1).max(65535),
+              endpointSlug: z.string().min(1).max(63),
+              models: z.array(z.string().min(1).max(256)).max(64),
+              contextWindow: z.number().int().positive().nullable(),
+            })
+            .strict(),
+        )
+        .max(512),
+    })
+    .strict(),
+  z
+    .object({
       type: z.literal("hello"),
       id: requestIdSchema,
-      protocolVersion: z.enum(["2.4"]),
+      protocolVersion: z.enum(RELAY_PROTOCOL_VERSIONS),
       cli: z
         .object({
           slug: z.string().trim().min(1).max(63),
@@ -993,6 +1053,8 @@ export type DesiredModelCapability = {
 export type TerminalHandshakeIdentity = z.infer<typeof terminalIdentitySchema>;
 
 export type RelayServerControlMessage =
+  | DeploymentJob
+  | { type: "deployment.instances.ok"; snapshotId: string }
   | {
       type: "hello.ok";
       id: string;
@@ -1268,6 +1330,9 @@ export function protocolErrorMessage(input: {
 }
 
 export function encodeRelayServerControlMessage(message: RelayServerControlMessage): string {
+  if (message.type === "deployment.instances.ok" && !/^[a-zA-Z0-9]{32}$/.test(message.snapshotId)) {
+    throw new RelayProtocolError("Invalid deployment inventory acknowledgement.");
+  }
   // The one enforcement point for the only outbound message whose payload is
   // built from stored, user-authored data: a source list that fails the wire
   // schema is never framed (callers send an empty list instead).
@@ -1297,7 +1362,12 @@ export function encodeRelayServerControlMessage(message: RelayServerControlMessa
     }
   }
   const encoded = stringifyWellFormed(message);
-  if (message.type === "term.spawn" && utf8Length(encoded) > RELAY_JSON_CONTROL_MAX_BYTES) {
+  // Both carry user-authored commands; the CLI drops larger control frames undecoded.
+  // Deployment admission bounds jobs first, so this only backstops a bypass.
+  if (
+    (message.type === "term.spawn" || message.type === "deployment.job") &&
+    utf8Length(encoded) > RELAY_JSON_CONTROL_MAX_BYTES
+  ) {
     throw new RelayProtocolError("JSON control frame exceeds 64 KiB.");
   }
   return encoded;

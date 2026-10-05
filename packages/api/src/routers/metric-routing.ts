@@ -43,6 +43,7 @@ import {
   routingRulesSchema,
   scopedRoutingMemberIds,
 } from "../lib/metric-routing";
+import { invalidatePoolRouting } from "../lib/pool-routing-invalidation";
 import {
   remoteEngineAdapterDefinitionsSchema,
   serializeRemoteEngineAdapters,
@@ -200,15 +201,21 @@ export const metricRoutingProcedures = {
         where: { poolId: pool.id, poolMemberId: { in: members.map((member) => member.id) } },
       });
       const verdictByMember = new Map(verdicts.map((row) => [row.poolMemberId, row]));
-      const deviceIds = [...new Set(members.map((member) => member.model.Endpoint.cliDeviceId))];
-      const live = context.services?.getLiveNodeTelemetry?.(deviceIds);
-      const stored = deviceIds.length
+      const memberDeviceIds = [
+        ...new Set(members.map((member) => member.model.Endpoint.cliDeviceId)),
+      ];
+      // Only the caller's own machines: a contributed member's device belongs to
+      // its contributor, whose telemetry, name and load the pool owner must not
+      // read (routing still uses it server-side).
+      const stored = memberDeviceIds.length
         ? await prisma.cliDevice.findMany({
-            where: { id: { in: deviceIds }, userId },
+            where: { id: { in: memberDeviceIds }, userId },
             select: { id: true, nodeMetrics: true, nodeMetricsAt: true },
           })
         : [];
       const storedById = new Map(stored.map((row) => [row.id, row]));
+      const deviceIds = memberDeviceIds.filter((id) => storedById.has(id));
+      const live = context.services?.getLiveNodeTelemetry?.(deviceIds);
       const devices = deviceIds.map((cliDeviceId) => {
         const snapshot = live?.get(cliDeviceId) ?? null;
         const device = members.find((member) => member.model.Endpoint.cliDeviceId === cliDeviceId)
@@ -234,7 +241,9 @@ export const metricRoutingProcedures = {
           const ruleStates = Array.isArray(verdict?.ruleStates)
             ? verdict.ruleStates.filter((state): state is string => typeof state === "string")
             : [];
-          const snapshot = live?.get(member.model.Endpoint.cliDeviceId) ?? null;
+          const snapshot = storedById.has(member.model.Endpoint.cliDeviceId)
+            ? (live?.get(member.model.Endpoint.cliDeviceId) ?? null)
+            : null;
           const memberRef = {
             endpointSlug: member.model.Endpoint.slug,
             modelSlug: member.model.slug ?? null,
@@ -390,7 +399,9 @@ export const metricRoutingProcedures = {
           where: { id: input.poolId, userId },
           select: {
             PoolMembers: {
-              where: { tier: "PRIMARY" },
+              // A contributed member runs on its contributor's machine: its load
+              // history is the contributor's, not the pool owner's, to read.
+              where: { tier: "PRIMARY", inferenceContributionId: null },
               orderBy: { createdAt: "asc" },
               select: {
                 id: true,
@@ -540,7 +551,7 @@ export const metricRoutingProcedures = {
           })),
         });
       });
-      await context.services?.onPoolRoutingRulesChanged?.(input.poolId);
+      await invalidatePoolRouting(context.services, [input.poolId]);
       return { poolId: input.poolId, rules: input.rules };
     }),
 
@@ -592,7 +603,7 @@ export const metricRoutingProcedures = {
           kvFullThreshold: true,
         },
       });
-      if (member) await context.services?.onPoolRoutingRulesChanged?.(member.poolId);
+      if (member) await invalidatePoolRouting(context.services, [member.poolId]);
       return {
         poolMemberId: input.poolMemberId,
         mode: member?.engineLoadMode === "OFF" ? ("off" as const) : ("auto" as const),

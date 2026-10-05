@@ -380,6 +380,22 @@ describe("advertised schema equals the procedure schema plus declared overlays",
     });
   });
 
+  it("does not narrow a union stub when any branch is untyped", () => {
+    const merged = applyInputOverlay(
+      {
+        anyOf: [
+          {
+            type: "object",
+            properties: { payload: { type: "string", description: "x".repeat(500) } },
+          },
+          { type: "object", properties: { payload: {} } },
+        ],
+      },
+      { target: "x.y", confirmation: null },
+    );
+    expect((merged.properties as Json).payload).not.toHaveProperty("type");
+  });
+
   it("a union input lists each variant's id on root properties (#200)", () => {
     const json = advertised(
       MCP_TOOL_MANIFEST.find((tool) => tool.name === "forwarder_engine_load_history_get")!,

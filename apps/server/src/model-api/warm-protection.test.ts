@@ -1063,7 +1063,7 @@ describe("effective KV assessment", () => {
       effectiveKvBudgetTokens: kind === "active" ? 50_000 : 100_000,
     });
     expect(readDb.capacityKvEviction.findMany).toHaveBeenLastCalledWith({
-      where: { capacityId: { in: ["cap-a"] }, userId: "owner", expiresAt: { gt: now } },
+      where: { capacityId: { in: ["cap-a"] }, expiresAt: { gt: now } },
     });
   });
 

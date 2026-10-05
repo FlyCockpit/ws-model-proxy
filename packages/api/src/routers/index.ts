@@ -8,8 +8,10 @@ import { authRouter } from "./auth";
 import { capacityManagementRouter } from "./capacity-management";
 import { cliAgentActivityRouter } from "./cli-agent-activity";
 import { cliCredentialsRouter } from "./cli-credentials";
+import { deploymentsRouter } from "./deployments";
 import { devicesRouter } from "./devices";
 import { forwarderManagementRouter } from "./forwarder-management";
+import { inferenceContributionsRouter } from "./inference-contributions";
 import { mcpGrantsRouter } from "./mcp-grants";
 import { mcpTokensRouter } from "./mcp-tokens";
 import { modelApiTokensRouter } from "./model-api-tokens";
@@ -77,6 +79,8 @@ export const appRouter = {
   adminObservability: adminObservabilityRouter,
   settings: settingsRouter,
   devices: devicesRouter,
+  deployments: deploymentsRouter,
+  inferenceContributions: inferenceContributionsRouter,
   forwarderManagement: forwarderManagementRouter,
   cliCredentials: cliCredentialsRouter,
   // Owner-scoped agent audit log (metadata only); MCP read tool

@@ -41,6 +41,8 @@ export const MAX_UNKNOWN_KEY_SUGGESTIONS = 5;
 const SUGGESTION_MAX_DISTANCE = 3;
 /** Unrecognized keys considered for suggestions. Extra keys still count. */
 const MAX_UNKNOWN_KEYS_PROBED = 32;
+/** Global request budget, independent of future tool-schema size. */
+const MAX_SUGGESTION_COMPARISONS = 256;
 
 export const MAX_ISSUES = 20;
 export const MAX_PATH_SEGMENTS = 8;
@@ -128,14 +130,18 @@ function editDistance(left: string, right: string): number {
 
 function unknownKeyCount(keys: unknown): number | undefined {
   if (!Array.isArray(keys) || keys.length === 0) return undefined;
-  return Math.min(keys.length, MAX_ISSUES);
+  return keys.length;
 }
 
 /**
  * Nearest advertised property names for unrecognized keys. The caller key is
  * used only as a distance probe and never copied into the result.
  */
-function suggestDeclaredNames(keys: unknown, knownKeys: ReadonlySet<string>): string[] | undefined {
+function suggestDeclaredNames(
+  keys: unknown,
+  knownKeys: ReadonlySet<string>,
+  budget: { remaining: number },
+): string[] | undefined {
   if (!Array.isArray(keys) || knownKeys.size === 0) return undefined;
   const ranked = new Map<string, number>();
   let probed = 0;
@@ -145,6 +151,8 @@ function suggestDeclaredNames(keys: unknown, knownKeys: ReadonlySet<string>): st
     if (!IDENTIFIER_SEGMENT.test(key)) continue;
     probed += 1;
     for (const known of knownKeys) {
+      if (budget.remaining <= 0) break;
+      budget.remaining -= 1;
       if (known.length > MAX_SEGMENT_LENGTH) continue;
       if (Math.abs(key.length - known.length) > SUGGESTION_MAX_DISTANCE) continue;
       const distance = editDistance(key, known);
@@ -172,13 +180,16 @@ export function sanitizeValidationIssues(
   const issues: unknown = Reflect.get(data, "issues");
   if (!Array.isArray(issues) || issues.length === 0) return null;
   const result: McpValidationIssue[] = [];
+  const suggestionBudget = { remaining: MAX_SUGGESTION_COMPARISONS };
   for (const issue of issues.slice(0, MAX_ISSUES)) {
     if (issue === null || typeof issue !== "object") continue;
     const code = sanitizeCode(Reflect.get(issue, "code"));
     const rawKeys = code === "unrecognized_keys" ? Reflect.get(issue, "keys") : undefined;
     const count = code === "unrecognized_keys" ? unknownKeyCount(rawKeys) : undefined;
     const suggestions =
-      code === "unrecognized_keys" ? suggestDeclaredNames(rawKeys, knownKeys) : undefined;
+      code === "unrecognized_keys"
+        ? suggestDeclaredNames(rawKeys, knownKeys, suggestionBudget)
+        : undefined;
     result.push({
       path: sanitizePath(Reflect.get(issue, "path"), knownKeys),
       code,
@@ -192,8 +203,8 @@ export function sanitizeValidationIssues(
 }
 
 /**
- * Argument names an agent can correct: dotted declared paths plus
- * server-chosen suggestions. `"?"` (a segment that is not a declared field)
+ * Failing caller argument paths, never suggested replacement names.
+ * `"?"` (a segment that is not a declared field)
  * drops that path. Order follows the issues.
  */
 export function fieldsFromValidationIssues(issues: readonly McpValidationIssue[]): string[] {
@@ -203,7 +214,6 @@ export function fieldsFromValidationIssues(issues: readonly McpValidationIssue[]
     fields.push(name);
   };
   for (const issue of issues) {
-    for (const key of issue.suggestions ?? []) add(key);
     if (issue.path.length === 0 || issue.path.includes("?")) continue;
     add(issue.path.map((segment) => String(segment)).join("."));
   }
@@ -257,11 +267,14 @@ export function sanitizeDeclaredFields(
  * characters are rejected; length is capped; credential shapes are redacted.
  * Returns null when there is no usable message.
  */
+/** Invisible format characters (bidi overrides, zero-width marks, BOM). */
+const FORMAT_CHARACTER = /\p{Cf}/u;
 function hasControlCharacter(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
-    if (value.charCodeAt(index) <= 0x1f) return true;
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) return true;
   }
-  return false;
+  return FORMAT_CHARACTER.test(value);
 }
 
 export function sanitizeArgumentMessage(message: unknown): string | null {

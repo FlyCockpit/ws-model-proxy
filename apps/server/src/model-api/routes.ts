@@ -3,6 +3,10 @@ import {
   parseExternalAfterWaitMs,
   resolveCallerExternalAfterWaitMs,
 } from "@ws-model-proxy/api/lib/caller-external-wait";
+import {
+  embeddingContractsMatch,
+  parseEmbeddingContract,
+} from "@ws-model-proxy/api/lib/embedding-contract";
 import { engineCountContextSupportsNative } from "@ws-model-proxy/api/lib/engine-facts";
 import {
   getConfiguredMediaAttachmentMaxBytes,
@@ -59,6 +63,7 @@ import {
   type AffinityPolicy,
   type AffinitySessionBinding,
   affinityPrefixDigests,
+  affinityRuntimeIdentity,
   buildAffinityTargetIdentity,
   isAffinityTargetWarm,
   markPoolMemberLastRoutedAt,
@@ -66,6 +71,7 @@ import {
   rememberAffinity,
   resolveAffinitySession,
 } from "./cache-affinity.js";
+import { captureAffinityTargetGenerations } from "./cache-affinity-residency.js";
 import {
   type CacheHolderPlan,
   cacheHolderOutcome,
@@ -125,6 +131,7 @@ import {
 } from "./external-route.js";
 import {
   evictionContinuationKind,
+  kvEvictionResetGeneration,
   kvEvictionResetMs,
   observeKvEviction,
 } from "./kv-eviction-feedback.js";
@@ -137,6 +144,13 @@ import {
   modelApiConcurrencyLimiter,
   remainingRelayBudgetMs,
 } from "./limits.js";
+import {
+  LOCAL_SEND_DENIAL_FAILURE,
+  type LocalSendBinding,
+  type LocalSendDenial,
+  LocalSendRefused,
+  startAuthorizedLocalRelayAttempt,
+} from "./local-send.js";
 import {
   anyTransformModalityEnabled,
   buildTransformerChatPayload,
@@ -234,7 +248,7 @@ import {
   publicTargetCompatibility,
   resolvePublicProviderExecution,
 } from "./public-overflow.js";
-import { type RelayAttemptTerminal, startRelayAttempt } from "./relay-executor.js";
+import { type RelayAttemptTerminal, type startRelayAttempt } from "./relay-executor.js";
 import { classifyEngineContextOverflow, shouldRetryRelayOperation } from "./relay-retry-policy.js";
 import {
   LOCAL_RELAY_ATTEMPT_TTL_MS,
@@ -331,6 +345,8 @@ function relayAttemptBody(body: Uint8Array | RelayBodySource) {
 type RelayRequestBuilder = (upstreamModelId: string) => Promise<BuiltRelayRequest>;
 
 type RelayOperation = {
+  /** Synthetic member diagnostics settle transport capacity here and classify probe health in diagnostics.ts. */
+  memberProbe?: boolean;
   family: ModelApiEndpointFamily;
   method: string;
   path: string;
@@ -417,20 +433,23 @@ function strictlyLargerCeilingRoutes<T extends { poolMemberId: string }>({
   fromMemberId,
   fromCeiling,
   memberCeiling,
+  sharesTokenizer = () => true,
   minTokens = null,
 }: {
   candidates: readonly T[];
   fromMemberId: string;
   fromCeiling: number | null;
   memberCeiling: (poolMemberId: string) => number | null;
+  sharesTokenizer?: (poolMemberId: string) => boolean;
   minTokens?: number | null;
 }): T[] {
   return candidates.filter((route) => {
     if (route.poolMemberId === fromMemberId) return false;
+    if (!sharesTokenizer(route.poolMemberId)) return true;
     const ceiling = memberCeiling(route.poolMemberId);
     if (fromCeiling === null || ceiling === null) return false;
     if (ceiling <= fromCeiling) return false;
-    return minTokens === null || ceiling > minTokens;
+    return minTokens === null || ceiling >= minTokens;
   });
 }
 
@@ -734,7 +753,6 @@ async function nativeContextCount({
   relayRequestId,
   requester,
   pool,
-  effectiveContextCeiling: _effectiveContextCeiling,
 }: {
   request: Request;
   selected: ContextCountModelRow;
@@ -746,12 +764,11 @@ async function nativeContextCount({
   pool?: {
     id: string;
     memberId: string;
+    contributionId: string | null;
     tier: "PRIMARY" | "PUBLIC_OVERFLOW";
     ownerUserId: string;
     accessGrantId: string | null;
   };
-  /** Same min(physical, configured) ceiling `contextFitsLimits` uses. */
-  effectiveContextCeiling?: number | null;
 }): Promise<ContextCountTelemetry | null> {
   if (!operation.contextInput) return null;
   const capacity = selected.ExecutionTarget?.InferenceCapacity;
@@ -845,28 +862,34 @@ async function nativeContextCount({
     built = await operation.buildRequest(selected.upstreamModelId);
     if (!(built.body instanceof Uint8Array)) return countWithConfiguredCounter();
     await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
-    // The count sends the full request to the pool owner's machine.
-    if (pool)
-      await assertLocalSendAllowed({
-        poolId: pool.id,
-        ownerUserId: pool.ownerUserId,
-        requesterUserId: requester.userId,
-        accessGrantId: pool.accessGrantId,
-        poolMemberId: pool.tier === "PRIMARY" ? pool.memberId : null,
-      });
-    attempt = startRelayAttempt({
-      requestId: localExecution.localAttemptId,
-      manager,
-      cliDeviceId: selected.Endpoint.cliDeviceId,
-      endpointSlug: selected.Endpoint.slug,
-      family: operation.family,
-      method: "POST",
-      path: countOperation.path,
-      headers: built.headers,
-      body: built.body,
-      timeoutMs: 5_000,
-      abortSignal: request.signal,
-    });
+    attempt = await startAuthorizedLocalRelayAttempt(
+      localSendBinding(
+        selected,
+        requester,
+        pool
+          ? {
+              id: pool.id,
+              ownerUserId: pool.ownerUserId,
+              accessGrantId: pool.accessGrantId,
+              memberId: pool.tier === "PRIMARY" ? pool.memberId : null,
+              contributionId: pool.contributionId,
+            }
+          : undefined,
+      ),
+      {
+        requestId: localExecution.localAttemptId,
+        manager,
+        cliDeviceId: selected.Endpoint.cliDeviceId,
+        endpointSlug: selected.Endpoint.slug,
+        family: operation.family,
+        method: "POST",
+        path: countOperation.path,
+        headers: built.headers,
+        body: built.body,
+        timeoutMs: 5_000,
+        abortSignal: request.signal,
+      },
+    );
     const started = await attempt.started;
     if (started.status < 200 || started.status >= 300) {
       await started.body.cancel("native_count_status");
@@ -913,7 +936,7 @@ async function nativeContextCount({
         relayRequestId,
         requester.userId,
         localExecution,
-        rejectedRelayTerminal(),
+        rejectedRelayTerminal(error.failure),
       ).catch(metadataUpdateError);
     }
     if (request.signal.aborted) throw request.signal.reason;
@@ -1002,6 +1025,7 @@ const relayEndpointSelect = {
 const poolDiscoveredModelRelaySelect = {
   id: true,
   userId: true,
+  User: { select: { banned: true, banExpires: true, deletionRequestedAt: true } },
   published: true,
   slug: true,
   upstreamModelId: true,
@@ -1047,6 +1071,16 @@ type ContextCountModelRow = Prisma.DiscoveredModelGetPayload<{
 const poolMemberRelaySelect = {
   id: true,
   poolId: true,
+  inferenceContributionId: true,
+  InferenceContribution: {
+    select: {
+      id: true,
+      state: true,
+      poolId: true,
+      discoveredModelId: true,
+      contributorUserId: true,
+    },
+  },
   discoveredModelId: true,
   capacityContextCeiling: true,
   capacityContextCeilingMode: true,
@@ -1055,12 +1089,15 @@ const poolMemberRelaySelect = {
   capacityWaitBudgetMode: true,
   ModelPool: {
     select: {
+      userId: true,
       capacityContextCeiling: true,
       capacityContextMargin: true,
       capacityWaitBudgetMs: true,
       externalAfterWaitMs: true,
       cacheHolderWaitMs: true,
       protectionEnabled: true,
+      paidWarmProtectionEnabled: true,
+      embeddingContract: true,
       evictionFeedbackEnabled: true,
       protectionWindowSeconds: true,
       protectMinTokens: true,
@@ -1088,6 +1125,7 @@ const poolMemberRelaySelect = {
   lastRoutedAt: true,
   healthStatus: true,
   routingStatus: true,
+  instanceGate: true,
   lastFailureClass: true,
   consecutiveRetryableFailures: true,
   lastFailureAt: true,
@@ -1775,7 +1813,9 @@ function supportsOperation({
 }
 
 function requestedSurfaceForOperation(operation: RelayOperation): ProtocolSurface | null {
-  if (operation.family === "chat.completions") return "openai-chat";
+  // Embeddings use the native OpenAI transport, with separate operation gates.
+  if (operation.family === "chat.completions" || operation.family === "embeddings")
+    return "openai-chat";
   if (operation.family === "responses") return "openai-responses";
   if (operation.family === "messages" && operation.capability === "messages.create")
     return "anthropic-messages";
@@ -2173,6 +2213,8 @@ function executionPathForPoolMember(
   operation: RelayOperation,
   canonical?: ReturnType<typeof parseCanonicalRequest> | null,
 ) {
+  // Vector inference has its own capability contract and never uses chat adaptation.
+  if (operation.family === "embeddings") return null;
   const requestedSurface = requestedSurfaceForOperation(operation);
   if (!requestedSurface) return null;
   const adaptationEnabled = operation.adaptation?.poolEnabled === true;
@@ -2252,6 +2294,7 @@ async function readModelApiBody(request: Request): Promise<Uint8Array | Response
 
 async function prepareJsonModeledRequest(
   request: Request,
+  defaultResponsesStorage = false,
 ): Promise<PreparedModeledRequest | Response> {
   const body = await readModelApiBody(request);
   if (body instanceof Response) return body;
@@ -2259,6 +2302,11 @@ async function prepareJsonModeledRequest(
   if (payload instanceof Response) return payload;
   const model = requestedModel(payload);
   if (model instanceof Response) return model;
+  if (defaultResponsesStorage) {
+    if (payload.store !== undefined && typeof payload.store !== "boolean")
+      return openAiFailureJsonResponse("unsupported_capability", "store must be a boolean.");
+    payload.store = payload.store === true;
+  }
 
   return {
     model,
@@ -3282,11 +3330,11 @@ async function cancelAbandonedBodies(
   await Promise.allSettled(bodies.map((body) => body?.cancel(reason)));
 }
 
-function rejectedRelayTerminal(): RelayAttemptTerminal {
+function rejectedRelayTerminal(failure: ModelApiFailure = "unknown"): RelayAttemptTerminal {
   return {
     ok: false,
-    failure: "unknown",
-    httpStatusCode: 500,
+    failure,
+    httpStatusCode: relayFailureHttpStatus(failure),
     upstreamStatusCode: null,
     usage: null,
     metrics: null,
@@ -3696,6 +3744,7 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
     where: {
       poolId,
       tier: "PRIMARY",
+      instanceGate: "OPEN",
       ExecutionTarget: { DiscoveredModel: { isNot: null } },
     },
     orderBy: { id: "asc" },
@@ -3704,14 +3753,31 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
   return rows.flatMap<PoolMemberRelayRow>((row) => {
     const discoveredModel = row.ExecutionTarget?.DiscoveredModel ?? row.DiscoveredModel;
     if (!discoveredModel) return [];
+    const contribution = row.InferenceContribution;
+    if (
+      row.inferenceContributionId &&
+      (contribution?.state !== "ACTIVE" ||
+        contribution.poolId !== poolId ||
+        contribution.discoveredModelId !== discoveredModel.id ||
+        contribution.contributorUserId !== discoveredModel.userId)
+    )
+      return [];
+    if (
+      row.ModelPool?.userId &&
+      discoveredModel.userId !== row.ModelPool.userId &&
+      !row.inferenceContributionId
+    )
+      return [];
+    if (discoveredModel.User && userCredentialAccessBlocked(discoveredModel.User, new Date()))
+      return [];
     return [{ ...row, discoveredModelId: discoveredModel.id, DiscoveredModel: discoveredModel }];
   });
 }
 
 /**
- * The ONE local-send authorization gate (#76 owner, #95 grantee/sticky access,
+ * Early local rejection (#76 owner, #95 grantee/sticky access,
  * requester re-validation). Every pool-scoped send of a request to a local
- * (owner's) machine goes through it, immediately before `startRelayAttempt`,
+ * machine receives an early advisory check here; local-send.ts owns acceptance,
  * after every wait and after any half-open trial claim. Reads current state
  * (JS clock, the same rules as arrival):
  *  - the pool owner is active (`poolOwnerActive`: not banned, not deletion-marked);
@@ -3721,12 +3787,13 @@ async function poolMemberRows(poolId: string): Promise<PoolMemberRelayRow[]> {
  *    request was resolved under (the owner with no grant, or the grantee's
  *    same grant row: a replacement grant is different access);
  *  - the member (when given) is still a PRIMARY member of the pool, not DISABLED.
- * Unlocked on purpose: nothing may hold database locks across relay I/O. A
- * change that commits before these reads is refused; one that commits
- * afterwards is ordered after the send (as for claimPublicProviderCredentialForSend).
+ * This is an early advisory rejection only; local-send.ts owns actual send authority.
+ * No unlocked read can authorize enqueue. A
+ * change that commits before these reads is refused; actual dispatch rechecks under locks.
  * A failed read is a denial, never a pass.
  */
 type LocalSendInput = {
+  embeddingContract?: unknown;
   poolId: string;
   ownerUserId: string;
   requesterUserId: string;
@@ -3734,22 +3801,7 @@ type LocalSendInput = {
   /** The member about to be used; null for gates that send to no single member. */
   poolMemberId: string | null;
 };
-type LocalSendDenial =
-  | "OWNER_INACTIVE"
-  | "REQUESTER_BLOCKED"
-  | "ACCESS_REVOKED"
-  | "MEMBER_UNAVAILABLE"
-  | "CHECK_FAILED";
-
-const LOCAL_SEND_DENIAL_FAILURE: Record<LocalSendDenial, RelayFailure> = {
-  OWNER_INACTIVE: "not_found",
-  REQUESTER_BLOCKED: "access_denied",
-  ACCESS_REVOKED: "not_found",
-  MEMBER_UNAVAILABLE: "not_found",
-  CHECK_FAILED: "unknown",
-};
-
-async function localSendDenial(input: LocalSendInput): Promise<LocalSendDenial | null> {
+async function earlyLocalSendDenial(input: LocalSendInput): Promise<LocalSendDenial | null> {
   try {
     const requesterIsOwner = input.requesterUserId === input.ownerUserId;
     if (requesterIsOwner !== (input.accessGrantId === null)) return "ACCESS_REVOKED";
@@ -3783,7 +3835,17 @@ async function localSendDenial(input: LocalSendInput): Promise<LocalSendDenial |
     if (input.accessGrantId !== null && grant?.id !== input.accessGrantId) return "ACCESS_REVOKED";
     if (input.poolMemberId !== null) {
       const member = members?.find((row) => row.id === input.poolMemberId);
-      if (!member || member.routingStatus === "DISABLED") return "MEMBER_UNAVAILABLE";
+      if (!member || member.routingStatus === "DISABLED" || member.instanceGate === "CLOSED")
+        return "MEMBER_UNAVAILABLE";
+      if (
+        input.embeddingContract &&
+        (!embeddingContractsMatch(input.embeddingContract, member.ModelPool?.embeddingContract) ||
+          !embeddingContractsMatch(
+            input.embeddingContract,
+            effectivePoolMemberCapabilities(member)?.embeddings?.contract,
+          ))
+      )
+        return "MEMBER_UNAVAILABLE";
     }
     return null;
   } catch {
@@ -3791,24 +3853,28 @@ async function localSendDenial(input: LocalSendInput): Promise<LocalSendDenial |
   }
 }
 
-/** Thrown by assertLocalSendAllowed; `failure` ends the request (MEMBER_UNAVAILABLE skips the member). */
-class LocalSendRefused extends Error {
-  readonly failure: RelayFailure;
-  constructor(readonly denial: LocalSendDenial) {
-    super(`local send refused: ${denial}`);
-    this.failure = LOCAL_SEND_DENIAL_FAILURE[denial];
-  }
-}
-
-/**
- * The gate as the statement IMMEDIATELY before `startRelayAttempt` at every
- * pool-scoped send site: nothing is awaited between it and the send (static
- * guard in routes.test.ts). Each site's catch cleans up and, after a
- * half-open claim, releases the unused trial.
- */
-async function assertLocalSendAllowed(input: LocalSendInput): Promise<void> {
-  const denial = await localSendDenial(input);
-  if (denial) throw new LocalSendRefused(denial);
+/** Exact snapshot used by all local sends, including direct and count operations. */
+function localSendBinding(
+  selected: Pick<
+    ContextCountModelRow,
+    "userId" | "id" | "ExecutionTarget" | "Endpoint" | "upstreamModelId"
+  >,
+  requester: RelayRequester,
+  pool?: LocalSendBinding["pool"],
+): LocalSendBinding {
+  return {
+    requesterUserId: requester.userId,
+    modelApiTokenId: requester.modelApiTokenId,
+    engineOwnerUserId: selected.userId,
+    discoveredModelId: selected.id,
+    executionTargetId: selected.ExecutionTarget?.id,
+    capacityId: selected.ExecutionTarget?.inferenceCapacityId,
+    endpointId: selected.Endpoint.id,
+    cliDeviceId: selected.Endpoint.cliDeviceId,
+    endpointSlug: selected.Endpoint.slug,
+    upstreamModelId: selected.upstreamModelId,
+    pool,
+  };
 }
 
 /**
@@ -3911,6 +3977,8 @@ async function modelListResponse(
           select: {
             poolId: true,
             tier: true,
+            routingStatus: true,
+            instanceGate: true,
             ExecutionTarget: {
               select: {
                 DiscoveredModel: { select: modelListDiscoveredSelect },
@@ -4006,6 +4074,8 @@ async function modelListResponse(
       .filter(
         (row) =>
           row.tier === "PRIMARY" &&
+          row.routingStatus === "ACTIVE" &&
+          row.instanceGate !== "CLOSED" &&
           discoveredModelIsActivelyServing(
             row.ExecutionTarget?.DiscoveredModel ?? row.DiscoveredModel,
             activeCliDeviceIds,
@@ -4101,6 +4171,7 @@ async function modelListResponse(
         // or upstream ids are advertised.
         const externalListed =
           external !== undefined &&
+          servingPoolIds.has(pool.id) &&
           (pool.externalMemberCount > 0 ||
             Boolean(pool.externalEquivalentModel && pool.ownKeyProviderModelId)) &&
           evaluateExternalEgress({
@@ -4194,16 +4265,16 @@ async function relayDirect({
         manager,
         relayRequestId,
         requester,
-        effectiveContextCeiling: selected.ExecutionTarget?.directContextCeiling,
       });
       if (exactCount) {
         operation.contextCount = exactCount;
         await updateContextCountMetadata(relayRequestId, exactCount);
       }
-    } catch {
+    } catch (error) {
       await operation.dispose?.();
-      await failRelayMetadata({ relayRequestId, startedAt, failure: "cancelled" });
-      return operationFailureResponse(operation, "cancelled");
+      const failure = error instanceof LocalSendRefused ? error.failure : "cancelled";
+      await failRelayMetadata({ relayRequestId, startedAt, failure });
+      return operationFailureResponse(operation, failure);
     }
   }
 
@@ -4216,7 +4287,7 @@ async function relayDirect({
       return operationFailureResponse(operation, "unsupported_capability");
     }
     if (
-      operation.contextCount &&
+      operation.contextCount?.exact === true &&
       !contextFitsLimits({
         count: operation.contextCount,
         physicalMaxContext: identity.InferenceCapacity?.physicalMaxContext,
@@ -4366,7 +4437,7 @@ async function relayDirect({
   };
   try {
     await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
-    attempt = startRelayAttempt({
+    attempt = await startAuthorizedLocalRelayAttempt(localSendBinding(selected, requester), {
       requestId: localExecution.localAttemptId,
       manager,
       cliDeviceId: selected.Endpoint.cliDeviceId,
@@ -4398,8 +4469,9 @@ async function relayDirect({
         operation,
       }),
     });
-  } catch {
-    attempt?.cancel("unknown");
+  } catch (error) {
+    const failure = error instanceof LocalSendRefused ? error.failure : "unknown";
+    attempt?.cancel(failure);
     await settleRelayCleanup([
       () => cliLease.release(),
       () => globalLease?.release(),
@@ -4415,14 +4487,14 @@ async function relayDirect({
     await failRelayMetadata({
       relayRequestId,
       startedAt,
-      failure: "unknown",
+      failure,
       selectedDiscoveredModelId: selected.id,
       attemptCount: 1,
       localExecution,
       userId: requester.userId,
-      localTerminal: rejectedRelayTerminal(),
+      localTerminal: rejectedRelayTerminal(failure),
     });
-    return operationFailureResponse(operation, "unknown");
+    return operationFailureResponse(operation, failure);
   }
   if (!attempt) throw new Error("local relay attempt was not initialized");
 
@@ -4627,6 +4699,7 @@ async function relayPool({
   externalAttempt: ExternalAttemptRecord;
 }): Promise<Response> {
   const startedAt = new Date();
+  const evictionResetGeneration = kvEvictionResetGeneration();
   const requestedSurface = requestedSurfaceForOperation(operation);
   const testRoutingMode = resolveChatTestRoutingMode(
     request.headers.get("x-wsmp-chat-test-routing-mode"),
@@ -4765,14 +4838,13 @@ async function relayPool({
       .filter(([, enabled]) => enabled === true)
       .map(([feature]) => feature);
     const requestedOutputTokens =
-      typeof maxOutput === "number" && Number.isSafeInteger(maxOutput) && maxOutput >= 0
-        ? BigInt(maxOutput)
-        : undefined;
+      operation.family === "embeddings"
+        ? 0n
+        : typeof maxOutput === "number" && Number.isSafeInteger(maxOutput) && maxOutput >= 0
+          ? BigInt(maxOutput)
+          : undefined;
     const estimatedInputTokens =
-      operation.contextCount?.tokens !== undefined
-        ? BigInt(operation.contextCount.tokens)
-        : (payloadAwareInputTokens(built.body) ??
-          conservativeSerializedInputTokens(publicRequestBytes));
+      payloadAwareInputTokens(built.body) ?? conservativeSerializedInputTokens(publicRequestBytes);
     const canonical = operation.adaptation
       ? (() => {
           try {
@@ -4807,6 +4879,10 @@ async function relayPool({
       requesterModelApiTokenId: requester.modelApiTokenId,
       requestedProtocol,
       requestedSurface,
+      embeddingContract:
+        operation.family === "embeddings"
+          ? (parseEmbeddingContract(target.embeddingContract) ?? undefined)
+          : undefined,
       stream: operation.stream,
       requiredFeatures,
       path: operation.path,
@@ -5393,7 +5469,10 @@ async function relayPool({
             selectedPoolMemberId: committedResult.target.ownKey
               ? null
               : committedResult.target.poolMemberId,
-            selectedNativeSurface: modelApiSurface(committedResult.nativeSurface),
+            selectedNativeSurface:
+              operation.family === "embeddings"
+                ? "OPENAI_EMBEDDINGS"
+                : modelApiSurface(committedResult.nativeSurface),
             adapterMode: committedResult.nativeSurface === requestedSurface ? "NATIVE" : "ADAPTED",
             adapterVersion: committedResult.nativeSurface === requestedSurface ? null : "1.0.0",
             publicEgress: true,
@@ -5763,11 +5842,13 @@ async function relayPool({
     });
   };
   const nativeCounts = new Map<string, ContextCountTelemetry>();
+  // Native counts belong to the selected engine/tokenizer, never the pool.
+  const initialContextCount = operation.contextCount;
   if (capacityRuntime && operation.contextInput) {
     // Same gate as the send: an early exit before counting the admitted
     // member. Counts stay off the owner's machines when the pool is already
     // unavailable (banned owner, revoked grant, failed check).
-    const countRefusal = await localSendDenial({
+    const countRefusal = await earlyLocalSendDenial({
       poolId: target.id,
       ownerUserId: target.ownerUserId,
       requesterUserId: requester.userId,
@@ -5791,20 +5872,9 @@ async function relayPool({
         : member.ModelPool?.capacityContextCeiling;
   const contextMarginForMember = (member: PoolMemberRelayRow) =>
     member.capacityContextMargin ?? member.ModelPool?.capacityContextMargin ?? 0;
-  // Estimates rank at `estimateFitIds`; only an exact native count may drop a
-  // member here. Inexact TOKEN_ESTIMATE/CHAR_ESTIMATE must still count-first
-  // (or native-count) and follow this-member exact vs (ceiling − margin).
-  const contextEligibleMembers =
-    operation.contextCount?.exact === true
-      ? members.filter((member) =>
-          contextFitsLimits({
-            count: nativeCounts.get(member.id) ?? operation.contextCount!,
-            physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
-            effectiveContextCeiling: configuredContextCeilingForMember(member),
-            contextMargin: contextMarginForMember(member),
-          }),
-        )
-      : members;
+  // Estimates rank at `estimateFitIds`. Each selected engine counts its own
+  // input after admission; token counts never filter unrelated tokenizers.
+  const contextEligibleMembers = members;
   let canonicalAdaptationRequest: ReturnType<typeof parseCanonicalRequest> | null = null;
   if (operation.adaptation?.poolEnabled === true) {
     try {
@@ -5828,6 +5898,15 @@ async function relayPool({
   );
   let adaptationDepthError: AdapterError | undefined;
   const protocolCandidates = contextEligibleMembers.filter((member) => {
+    if (
+      operation.family === "embeddings" &&
+      external.requested &&
+      !embeddingContractsMatch(
+        target.embeddingContract,
+        effectivePoolMemberCapabilities(member)?.embeddings?.contract,
+      )
+    )
+      return false;
     const execution = executionByMember.get(member.id);
     if (!execution)
       return supportsOperation({
@@ -5901,55 +5980,6 @@ async function relayPool({
       : [];
   // Known-compatible members always route before optimistic unknown fallbacks.
   const eligibleMembers = [...knownEligibleMembers, ...unknownFallbackMembers];
-  if (members.length > 0 && contextEligibleMembers.length === 0) {
-    // (c) Context ceiling: only an explicit, consented `:external` request may
-    // go external. A plain name keeps the context error.
-    const overflow = await tryPublicOverflow("LOCAL_CONTEXT_CEILING", async () => undefined);
-    if (overflow.kind === "response") return overflow.response;
-    const lostAccess = terminalExternalFailure(overflow);
-    if (lostAccess) {
-      await operation.dispose?.();
-      await failPoolRelayMetadata({ relayRequestId, startedAt, failure: lostAccess });
-      return operationFailureResponse(operation, lostAccess);
-    }
-    // Not dispatched: the plain-name context error (plus the D5 header).
-    await operation.dispose?.();
-    await failPoolRelayMetadata({ relayRequestId, startedAt, failure: "request_too_large" });
-    return contextExceededResponse(
-      operation,
-      "Request context exceeds every compatible pool member ceiling.",
-      (() => {
-        const reportedMember = members
-          .map((member) => ({
-            ceiling: effectiveContextCeilingTokens(
-              member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
-              configuredContextCeilingForMember(member),
-            ),
-            margin: contextMarginForMember(member),
-            count: nativeCounts.get(member.id) ?? operation.contextCount!,
-          }))
-          .filter(
-            (
-              candidate,
-            ): candidate is {
-              ceiling: number;
-              margin: number;
-              count: ContextCountTelemetry;
-            } => candidate.ceiling !== null,
-          )
-          .sort((left, right) => right.ceiling - right.margin - (left.ceiling - left.margin))[0];
-        if (!reportedMember) {
-          throw new Error("A context-rejected pool member must have a finite context ceiling.");
-        }
-        return {
-          estimatedInputTokens: reportedMember.count.tokens,
-          estimateMethod: reportedMember.count.method,
-          contextMarginTokens: reportedMember.margin,
-          effectiveContextCeilingTokens: reportedMember.ceiling,
-        };
-      })(),
-    );
-  }
   if (eligibleMembers.length === 0) {
     // (b) No compatible local member.
     const overflow = await tryPublicOverflow(
@@ -6198,18 +6228,19 @@ async function relayPool({
   };
   let affinityDecision: AffinityDecision | null = null;
   const affinityPayload = operation.contextInput ?? operation.adaptation?.payload ?? null;
-  const affinityPolicy: AffinityPolicy = eligibleMembers[0]
-    ? affinityPolicyForMember(eligibleMembers[0])
-    : {
-        enabled: false,
-        ttlSeconds: 3600,
-        maxRecords: 10_000,
-        prefixWeight: 100,
-        conversationWeight: 150,
-        confirmedCacheWeight: 250,
-        loadPenaltyWeight: 100,
-        residencyWeight: 100,
-      };
+  const affinityPolicy: AffinityPolicy =
+    eligibleMembers[0] && operation.family !== "embeddings"
+      ? affinityPolicyForMember(eligibleMembers[0])
+      : {
+          enabled: false,
+          ttlSeconds: 3600,
+          maxRecords: 10_000,
+          prefixWeight: 100,
+          conversationWeight: 150,
+          confirmedCacheWeight: 250,
+          loadPenaltyWeight: 100,
+          residencyWeight: 100,
+        };
   const protectionPolicy = warmProtectionPolicyForMember(eligibleMembers[0]);
   if (requestedSurface && affinityPayload && affinityPolicy.enabled) {
     const affinityTargets = routeCandidates.flatMap((candidate) => {
@@ -6351,7 +6382,9 @@ async function relayPool({
           affine: affineMember(poolMemberId),
         })),
         verdicts,
-        externalPlan: externalAfterWaitMs !== null,
+        externalPlan:
+          externalAfterWaitMs !== null &&
+          eligibleMembers[0]?.ModelPool?.paidWarmProtectionEnabled === true,
       });
       const candidateById = new Map(
         routeCandidates.map((candidate) => [candidate.poolMemberId, candidate] as const),
@@ -6375,10 +6408,47 @@ async function relayPool({
   const memberEffectiveCeiling = (poolMemberId: string) => {
     const member = memberById.get(poolMemberId);
     if (!member) return null;
-    return effectiveContextCeilingTokens(
+    const ceiling = effectiveContextCeilingTokens(
       member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
       configuredContextCeilingForMember(member),
     );
+    return ceiling === null ? null : ceiling - contextMarginForMember(member);
+  };
+  /** Only complete matching runtime identities count tokens the same way. */
+  const sameRuntimeIdentity = (fromMemberId: string, toMemberId: string) => {
+    const from = memberById.get(fromMemberId)?.ExecutionTarget?.InferenceCapacity;
+    const to = memberById.get(toMemberId)?.ExecutionTarget?.InferenceCapacity;
+    return Boolean(
+      from &&
+        to &&
+        from.runtimeIdentityKey &&
+        from.runtimeIdentityKey === to.runtimeIdentityKey &&
+        from.runtimeModel === to.runtimeModel &&
+        from.runtimeRevision === to.runtimeRevision,
+    );
+  };
+  const attemptedLocalMembers = new Set<string>();
+  let mostPermissiveRejection: ContextExceededDetails | undefined;
+  const remainingContextRoutes = (memberId: string, details: ContextExceededDetails) => {
+    attemptedLocalMembers.add(memberId);
+    if (
+      !mostPermissiveRejection ||
+      details.effectiveContextCeilingTokens - details.contextMarginTokens >
+        mostPermissiveRejection.effectiveContextCeilingTokens -
+          mostPermissiveRejection.contextMarginTokens
+    )
+      mostPermissiveRejection = details;
+    // A different tokenizer can fit even on a smaller nominal context window,
+    // so each such member is tried at most once and its own gate decides. A
+    // member with the same runtime identity counts the same tokens: one whose
+    // usable ceiling is below this count can never fit and is not tried (a busy
+    // one would otherwise answer a retryable 429 for a request that cannot fit).
+    return routeCandidates.filter((route) => {
+      if (attemptedLocalMembers.has(route.poolMemberId)) return false;
+      if (!sameRuntimeIdentity(memberId, route.poolMemberId)) return true;
+      const ceiling = memberEffectiveCeiling(route.poolMemberId);
+      return ceiling === null || ceiling >= details.estimatedInputTokens;
+    });
   };
   const respondLocalContextCeiling = async (details: ContextExceededDetails) => {
     const overflow = await tryPublicOverflow("LOCAL_CONTEXT_CEILING", async () => undefined);
@@ -6397,12 +6467,13 @@ async function relayPool({
     return contextExceededResponse(
       operation,
       "Request context exceeds the configured execution capacity ceiling.",
-      details,
+      mostPermissiveRejection ?? details,
     );
   };
   const applyMemberContextCount = async (poolMemberId: string) => {
     const member = memberById.get(poolMemberId);
     if (!member) return;
+    operation.contextCount = nativeCounts.get(poolMemberId) ?? initialContextCount;
     let count = nativeCounts.get(poolMemberId);
     if (!count && capacityRuntime && operation.contextInput) {
       const selected = {
@@ -6426,11 +6497,11 @@ async function relayPool({
           pool: {
             id: target.id,
             memberId: member.id,
+            contributionId: member.inferenceContributionId,
             tier: "PRIMARY",
             ownerUserId: target.ownerUserId,
             accessGrantId: target.accessGrantId,
           },
-          effectiveContextCeiling: configuredContextCeilingForMember(member),
         });
         if (next) {
           count = next;
@@ -6588,12 +6659,7 @@ async function relayPool({
     } catch (error) {
       const admittedLease = capacityLease.lease;
       if (error instanceof ContextCeilingExceededError) {
-        const larger = strictlyLargerCeilingRoutes({
-          candidates: routeCandidates,
-          fromMemberId: selectedPoolMemberId,
-          fromCeiling: error.details.effectiveContextCeilingTokens,
-          memberCeiling: memberEffectiveCeiling,
-        });
+        const larger = remainingContextRoutes(selectedPoolMemberId, error.details);
         await settleRelayCleanup([() => capacityRuntime.release(admittedLease)]);
         capacityLease = undefined;
         if (larger.length > 0) {
@@ -6671,7 +6737,6 @@ async function relayPool({
     ]);
   };
 
-  let contextOverflowRetried = false;
   for (let candidateIndex = 0; candidateIndex < selectedRouteCandidates.length; candidateIndex++) {
     let candidate = selectedRouteCandidates[candidateIndex]!;
     if (capacityRuntime && capacityLease?.state !== "ADMITTED") {
@@ -6729,12 +6794,7 @@ async function relayPool({
       } catch (error) {
         await releaseCapacityAttempt();
         if (error instanceof ContextCeilingExceededError) {
-          const larger = strictlyLargerCeilingRoutes({
-            candidates: selectedRouteCandidates.slice(candidateIndex),
-            fromMemberId: admittedPoolMemberId,
-            fromCeiling: error.details.effectiveContextCeilingTokens,
-            memberCeiling: memberEffectiveCeiling,
-          });
+          const larger = remainingContextRoutes(admittedPoolMemberId, error.details);
           if (larger.length > 0) {
             selectedRouteCandidates = larger;
             candidateIndex = -1;
@@ -6788,6 +6848,8 @@ async function relayPool({
     }
     const member = memberById.get(candidate.poolMemberId);
     if (!member) continue;
+    if (!capacityRuntime)
+      operation.contextCount = nativeCounts.get(member.id) ?? initialContextCount;
 
     let cliLease: ModelApiLimitLease;
     try {
@@ -6930,6 +6992,18 @@ async function relayPool({
       break;
     }
     attemptCount += 1;
+    const attemptAffinityBase = requestedSurface
+      ? affinityTargetForMember(
+          member,
+          requestedSurface,
+          executionByMember.get(member.id),
+          candidate.healthStatus,
+        )
+      : null;
+    const servedAffinityTarget =
+      attemptAffinityBase && affinityPolicy.enabled
+        ? ((await captureAffinityTargetGenerations([attemptAffinityBase], target.id))[0] ?? null)
+        : null;
     let attempt: ReturnType<typeof startRelayAttempt> | null = null;
     // When this attempt was handed to the relay: warm-prefix age for eviction
     // evidence is judged here, not at request arrival or after a long stream.
@@ -6965,49 +7039,57 @@ async function relayPool({
       capacityLease?.state === "ADMITTED" ? capacityLease.lease.signal : undefined;
     try {
       await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
-      // The one send gate, immediately before every local attempt (retries
-      // included), after every wait and the half-open claim: owner, requester,
-      // exact access and member are read again.
-      await assertLocalSendAllowed({
-        poolId: target.id,
-        ownerUserId: target.ownerUserId,
-        requesterUserId: requester.userId,
-        accessGrantId: target.accessGrantId,
-        poolMemberId: member.id,
-      });
       attemptDispatchedAt = new Date();
-      attempt = startRelayAttempt({
-        requestId: localExecution.localAttemptId,
-        manager,
-        cliDeviceId: candidate.cliDeviceId,
-        endpointSlug: member.DiscoveredModel.Endpoint.slug,
-        family: adaptedSource ? nativeRouteForSurface(adaptedSource).family : operation.family,
-        method: operation.method,
-        path: adaptedSource ? nativeRouteForSurface(adaptedSource).path : operation.path,
-        headers: builtRequest.headers,
-        ...relayAttemptBody(builtRequest.body),
-        timeoutMs: attemptTimeoutMs,
-        abortSignal:
-          capacityLease?.state === "ADMITTED"
-            ? (capacityLease.lease.signal ?? request.signal)
-            : request.signal,
-        onResponseBodyChunk: (chunk) => {
-          responseIdCapture?.push(chunk, operation.stream);
-        },
-        ...chatCountFirstRelayFields({
-          family: adaptedSource ? nativeRouteForSurface(adaptedSource).family : operation.family,
-          contextCount: operation.contextCount,
-          contextInput: operation.contextInput,
-          engineCountContext: member.ExecutionTarget?.InferenceCapacity?.engineCountContext,
-          physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
-          effectiveContextCeiling: configuredContextCeilingForMember(member),
-          contextMargin: contextMarginForMember(member),
+      attemptedLocalMembers.add(member.id);
+      attempt = await startAuthorizedLocalRelayAttempt(
+        localSendBinding(
+          { ...member.DiscoveredModel, ExecutionTarget: member.ExecutionTarget },
+          requester,
+          {
+            id: target.id,
+            ownerUserId: target.ownerUserId,
+            accessGrantId: target.accessGrantId,
+            memberId: member.id,
+            contributionId: member.inferenceContributionId,
+            embeddingContract:
+              operation.family === "embeddings" && external.requested
+                ? target.embeddingContract
+                : undefined,
+          },
+        ),
+        {
+          requestId: localExecution.localAttemptId,
           manager,
           cliDeviceId: candidate.cliDeviceId,
-          relayRequestId,
-          operation,
-        }),
-      });
+          endpointSlug: member.DiscoveredModel.Endpoint.slug,
+          family: adaptedSource ? nativeRouteForSurface(adaptedSource).family : operation.family,
+          method: operation.method,
+          path: adaptedSource ? nativeRouteForSurface(adaptedSource).path : operation.path,
+          headers: builtRequest.headers,
+          ...relayAttemptBody(builtRequest.body),
+          timeoutMs: attemptTimeoutMs,
+          abortSignal:
+            capacityLease?.state === "ADMITTED"
+              ? (capacityLease.lease.signal ?? request.signal)
+              : request.signal,
+          onResponseBodyChunk: (chunk) => {
+            responseIdCapture?.push(chunk, operation.stream);
+          },
+          ...chatCountFirstRelayFields({
+            family: adaptedSource ? nativeRouteForSurface(adaptedSource).family : operation.family,
+            contextCount: operation.contextCount,
+            contextInput: operation.contextInput,
+            engineCountContext: member.ExecutionTarget?.InferenceCapacity?.engineCountContext,
+            physicalMaxContext: member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+            effectiveContextCeiling: configuredContextCeilingForMember(member),
+            contextMargin: contextMarginForMember(member),
+            manager,
+            cliDeviceId: candidate.cliDeviceId,
+            relayRequestId,
+            operation,
+          }),
+        },
+      );
     } catch (error) {
       attempt?.cancel("unknown");
       // Nothing was sent unless the attempt started: the trial goes back.
@@ -7018,7 +7100,7 @@ async function relayPool({
         relayRequestId,
         requester.userId,
         localExecution,
-        rejectedRelayTerminal(),
+        rejectedRelayTerminal(error instanceof LocalSendRefused ? error.failure : "unknown"),
       ).catch(metadataUpdateError);
       await settleRelayCleanup([
         () => cliLease.release(),
@@ -7081,19 +7163,20 @@ async function relayPool({
             member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
             configuredContextCeilingForMember(member),
           );
-          // One overflow retry, and only onto members whose ceiling exceeds
-          // both this member's ceiling and the engine-reported size (requested
-          // tokens when the engine split prompt/completion, else prompt).
+          // Retry each remaining engine at most once. Counts constrain only
+          // matching runtime identities; another tokenizer gets its own gate.
           const overflowNeed = overflow.requestedTokens ?? overflow.promptTokens;
           const overflowRetryCandidates = strictlyLargerCeilingRoutes({
-            candidates: selectedRouteCandidates.filter((_, index) => index > candidateIndex),
+            candidates: routeCandidates.filter(
+              (route) => !attemptedLocalMembers.has(route.poolMemberId),
+            ),
             fromMemberId: candidate.poolMemberId,
-            fromCeiling: thisCeiling,
+            fromCeiling: memberEffectiveCeiling(candidate.poolMemberId),
             memberCeiling: memberEffectiveCeiling,
             minTokens: overflowNeed,
+            sharesTokenizer: (id) => sameRuntimeIdentity(candidate.poolMemberId, id),
           });
           const retryOverflow =
-            !contextOverflowRetried &&
             overflowRetryCandidates.length > 0 &&
             shouldRetryRelayOperation(operation, "precommit_context_exceeded");
           attempt.cancel("request_too_large");
@@ -7114,7 +7197,6 @@ async function relayPool({
           finalFailure = "request_too_large";
           await releaseUnusedTrial();
           if (retryOverflow) {
-            contextOverflowRetried = true;
             await releaseCapacityAttempt();
             selectedRouteCandidates = overflowRetryCandidates;
             candidateIndex = -1;
@@ -7419,14 +7501,6 @@ async function relayPool({
         },
       );
       const stickiness = operation.responseStickiness;
-      const servedAffinityTarget = requestedSurface
-        ? affinityTargetForMember(
-            member,
-            requestedSurface,
-            executionByMember.get(member.id),
-            candidate.healthStatus,
-          )
-        : null;
       let affinityWrite: Promise<AffinitySessionBinding | null> | undefined;
       const persistAffinity = () =>
         (affinityWrite ??= attemptOutcome
@@ -7442,7 +7516,7 @@ async function relayPool({
             );
             return rememberAffinity({
               ownerId: requester.userId,
-              resourceOwnerId: member.DiscoveredModel.userId,
+              resourceOwnerId: target.ownerUserId,
               poolId: target.id,
               securityScope: requester.limitKey,
               accessGrantId: target.accessGrantId,
@@ -7569,7 +7643,7 @@ async function relayPool({
                     usage,
                     evidence: affinityDecision?.prefixEvidence?.[affinityTarget.executionTargetId],
                     now: attemptDispatchedAt,
-                    resetAtMs: kvEvictionResetMs(capacity.id),
+                    resetAtMs: kvEvictionResetMs(capacity.id, evictionResetGeneration),
                   })
                 : null;
             if (affinityTarget && capacity && sessionId && continuationKind)
@@ -7579,21 +7653,23 @@ async function relayPool({
             /* Disposable feedback never changes the response. */
           }
           const terminalWrites = await Promise.allSettled([
-            terminal.ok
-              ? markPoolMemberRelaySuccess(candidate.poolMemberId, {
-                  trialStartedAt: claimedTrialAt,
-                })
-              : adaptationOutcome === "protocol_error" &&
-                  upstreamTerminal.failure !== "capacity_lease_lost"
-                ? recordPoolMemberRelayFailure({
-                    poolMemberId: candidate.poolMemberId,
+            operation.memberProbe
+              ? releaseUnusedTrial()
+              : terminal.ok
+                ? markPoolMemberRelaySuccess(candidate.poolMemberId, {
                     trialStartedAt: claimedTrialAt,
-                    failure: "protocol_error",
                   })
-                : // A served attempt that settled neither way (client abort
-                  // mid-stream, non-member failure) gives its trial back; a
-                  // no-op once success/failure already cleared it.
-                  releaseUnusedTrial(),
+                : adaptationOutcome === "protocol_error" &&
+                    upstreamTerminal.failure !== "capacity_lease_lost"
+                  ? recordPoolMemberRelayFailure({
+                      poolMemberId: candidate.poolMemberId,
+                      trialStartedAt: claimedTrialAt,
+                      failure: "protocol_error",
+                    })
+                  : // A served attempt that settled neither way (client abort
+                    // mid-stream, non-member failure) gives its trial back; a
+                    // no-op once success/failure already cleared it.
+                    releaseUnusedTrial(),
             updatePoolRelayMetadata(relayRequestId, {
               selectedDiscoveredModelId: member.discoveredModelId,
               status: terminalStatus(terminal),
@@ -7649,30 +7725,32 @@ async function relayPool({
             member.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
             configuredContextCeilingForMember(member),
           ) ?? 1;
-        const larger = strictlyLargerCeilingRoutes({
-          candidates: selectedRouteCandidates.filter((_, index) => index > candidateIndex),
-          fromMemberId: candidate.poolMemberId,
-          fromCeiling: thisCeiling,
-          memberCeiling: memberEffectiveCeiling,
-        });
+        const details = {
+          estimatedInputTokens: operation.contextCount.tokens,
+          estimateMethod: operation.contextCount.method,
+          contextMarginTokens: contextMarginForMember(member),
+          effectiveContextCeilingTokens: thisCeiling,
+        };
+        nativeCounts.set(member.id, operation.contextCount);
+        const larger = remainingContextRoutes(candidate.poolMemberId, details);
+        await recordLocalTerminal(relayRequestId, requester.userId, localExecution, terminal).catch(
+          metadataUpdateError,
+        );
+        cumulativeRequestBytes += terminal.requestBytes;
+        cumulativeResponseBytes += terminal.responseBytes;
+        await releaseUnusedTrial();
         await settleRelayCleanup([
           () => cliLease.release(),
           () => (builtRequest.body instanceof Uint8Array ? undefined : builtRequest.body.dispose()),
         ]);
         await releaseCapacityAttempt();
-        if (larger.length > 0 && !contextOverflowRetried) {
-          contextOverflowRetried = true;
+        if (larger.length > 0) {
           selectedRouteCandidates = larger;
           candidateIndex = -1;
           continue;
         }
         globalLease?.release();
-        return respondLocalContextCeiling({
-          estimatedInputTokens: operation.contextCount.tokens,
-          estimateMethod: operation.contextCount.method,
-          contextMarginTokens: contextMarginForMember(member),
-          effectiveContextCeilingTokens: thisCeiling,
-        });
+        return respondLocalContextCeiling(details);
       }
       const operationRetryable = shouldRetryRelayOperation(operation, "precommit_transport");
       const memberRetryable =
@@ -7870,7 +7948,7 @@ async function relaySelectedModelNoFailover({
     await failRelayMetadata({ relayRequestId, startedAt, failure: "not_found" });
     return operationFailureResponse(operation, "not_found");
   }
-  const boundAffinityTarget =
+  const boundAffinityBase =
     requestedModelPoolId &&
     selectedPoolMember?.ModelPool?.affinityEnabled &&
     operation.method === "POST" &&
@@ -7888,12 +7966,20 @@ async function relaySelectedModelNoFailover({
           ),
         )
       : null;
+  const boundAffinityTarget = boundAffinityBase
+    ? ((
+        await captureAffinityTargetGenerations(
+          [boundAffinityBase],
+          requestedModelPoolId ?? undefined,
+        )
+      )[0] ?? null)
+    : null;
   let boundMaterial: ReturnType<typeof affinityPrefixDigests> | null = null;
   if (boundAffinityTarget && requestedModelPoolId) {
     try {
       boundMaterial = affinityPrefixDigests({
         ownerId: requester.userId,
-        resourceOwnerId: selected.userId,
+        resourceOwnerId: poolAccess?.ownerUserId ?? selected.userId,
         poolId: requestedModelPoolId,
         securityScope: requester.limitKey,
         accessGrantId: poolAccess?.accessGrantId,
@@ -7901,7 +7987,7 @@ async function relaySelectedModelNoFailover({
         payload: operation.contextInput!,
         headers: request.headers,
         sessionBinding: operation.sessionBinding,
-        runtimeIdentity: boundAffinityTarget.targetIdentity,
+        runtimeIdentity: affinityRuntimeIdentity(boundAffinityTarget),
       });
     } catch (error) {
       metadataUpdateError(error);
@@ -7915,10 +8001,11 @@ async function relaySelectedModelNoFailover({
       ? await resolveAffinitySession(
           prisma,
           {
-            userId: selected.userId,
+            userId: poolAccess?.ownerUserId ?? selected.userId,
             tenantUserId: requester.userId,
             poolId: requestedModelPoolId,
             executionTargetId: boundAffinityTarget.executionTargetId,
+            cacheGeneration: boundAffinityTarget.cacheGeneration,
           },
           boundMaterial,
           new Date(),
@@ -8061,51 +8148,59 @@ async function relaySelectedModelNoFailover({
   let attempt: ReturnType<typeof startRelayAttempt>;
   try {
     await startLocalExecutionTelemetry(relayRequestId, requester.userId, localExecution);
-    // The one send gate, as in relayPool: the binding's pool access, owner,
-    // requester and member were resolved before the admission wait and are
-    // read again after every wait. Missing access facts fail closed.
-    if (requestedModelPoolId) {
-      if (!poolAccess || !selectedPoolMember) throw new LocalSendRefused("ACCESS_REVOKED");
-      await assertLocalSendAllowed({
-        poolId: requestedModelPoolId,
-        ownerUserId: poolAccess.ownerUserId,
-        requesterUserId: requester.userId,
-        accessGrantId: poolAccess.accessGrantId,
-        poolMemberId: selectedPoolMember.id,
-      });
-    }
-    attempt = startRelayAttempt({
-      requestId: localExecution.localAttemptId,
-      manager,
-      cliDeviceId: selected.Endpoint.cliDeviceId,
-      endpointSlug: selected.Endpoint.slug,
-      family: operation.family,
-      method: operation.method,
-      path: operation.path,
-      headers: builtRequest.headers,
-      ...relayAttemptBody(builtRequest.body),
-      timeoutMs: MODEL_API_RELAY_TIMEOUT_MS,
-      abortSignal:
-        capacityLease?.state === "ADMITTED"
-          ? (capacityLease.lease.signal ?? request.signal)
-          : request.signal,
-      onResponseBodyChunk: responseIdCapture
-        ? (chunk) => responseIdCapture.push(chunk, operation.stream)
-        : undefined,
-      ...chatCountFirstRelayFields({
-        family: operation.family,
-        contextCount: operation.contextCount,
-        contextInput: operation.contextInput,
-        engineCountContext: selected.ExecutionTarget?.InferenceCapacity?.engineCountContext,
-        physicalMaxContext: selected.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
-        effectiveContextCeiling: selected.ExecutionTarget?.directContextCeiling,
-        contextMargin: selected.ExecutionTarget?.directContextMargin,
+    if (requestedModelPoolId && (!poolAccess || !selectedPoolMember))
+      throw new LocalSendRefused("ACCESS_REVOKED");
+    attempt = await startAuthorizedLocalRelayAttempt(
+      localSendBinding(
+        {
+          ...selected,
+          userId: selectedPoolMember?.DiscoveredModel.userId ?? selected.userId,
+          ExecutionTarget: selectedPoolMember?.ExecutionTarget ?? selected.ExecutionTarget,
+        },
+        requester,
+        requestedModelPoolId && poolAccess && selectedPoolMember
+          ? {
+              id: requestedModelPoolId,
+              ownerUserId: poolAccess.ownerUserId,
+              accessGrantId: poolAccess.accessGrantId,
+              memberId: selectedPoolMember.id,
+              contributionId: selectedPoolMember.inferenceContributionId,
+            }
+          : undefined,
+      ),
+      {
+        requestId: localExecution.localAttemptId,
         manager,
         cliDeviceId: selected.Endpoint.cliDeviceId,
-        relayRequestId,
-        operation,
-      }),
-    });
+        endpointSlug: selected.Endpoint.slug,
+        family: operation.family,
+        method: operation.method,
+        path: operation.path,
+        headers: builtRequest.headers,
+        ...relayAttemptBody(builtRequest.body),
+        timeoutMs: MODEL_API_RELAY_TIMEOUT_MS,
+        abortSignal:
+          capacityLease?.state === "ADMITTED"
+            ? (capacityLease.lease.signal ?? request.signal)
+            : request.signal,
+        onResponseBodyChunk: responseIdCapture
+          ? (chunk) => responseIdCapture.push(chunk, operation.stream)
+          : undefined,
+        ...chatCountFirstRelayFields({
+          family: operation.family,
+          contextCount: operation.contextCount,
+          contextInput: operation.contextInput,
+          engineCountContext: selected.ExecutionTarget?.InferenceCapacity?.engineCountContext,
+          physicalMaxContext: selected.ExecutionTarget?.InferenceCapacity?.physicalMaxContext,
+          effectiveContextCeiling: selected.ExecutionTarget?.directContextCeiling,
+          contextMargin: selected.ExecutionTarget?.directContextMargin,
+          manager,
+          cliDeviceId: selected.Endpoint.cliDeviceId,
+          relayRequestId,
+          operation,
+        }),
+      },
+    );
   } catch (error) {
     const failure: RelayFailure = error instanceof LocalSendRefused ? error.failure : "unknown";
     cliLease.release();
@@ -8121,7 +8216,7 @@ async function relaySelectedModelNoFailover({
       attemptCount: 1,
       localExecution,
       userId: requester.userId,
-      localTerminal: rejectedRelayTerminal(),
+      localTerminal: rejectedRelayTerminal(failure),
     });
     const refused = operationFailureResponse(operation, failure);
     if (error instanceof LocalSendRefused) poolAccessLostResponses.add(refused);
@@ -8186,7 +8281,7 @@ async function relaySelectedModelNoFailover({
           const capacity = selected.ExecutionTarget?.InferenceCapacity;
           return rememberAffinity({
             ownerId: requester.userId,
-            resourceOwnerId: selected.userId,
+            resourceOwnerId: poolAccess?.ownerUserId ?? selected.userId,
             poolId: requestedModelPoolId,
             securityScope: requester.limitKey,
             accessGrantId: poolAccess?.accessGrantId,
@@ -8616,28 +8711,28 @@ async function maybeApplyPoolMediaTransformer({
     let attempt: ReturnType<typeof startRelayAttempt>;
     try {
       await startLocalExecutionTelemetry(transformRelayRequestId, requester.userId, localExecution);
-      // Every hop hands the grantee's media to the pool owner's machine; the
-      // one send gate runs immediately before each one.
-      await assertLocalSendAllowed({
-        poolId,
-        ownerUserId: pool.userId,
-        requesterUserId: requester.userId,
-        accessGrantId: access.accessGrantId,
-        poolMemberId: null,
-      });
-      attempt = startRelayAttempt({
-        requestId: localExecution.localAttemptId,
-        manager,
-        cliDeviceId: transformer.Endpoint.cliDeviceId,
-        endpointSlug: transformer.Endpoint.slug,
-        family: "chat.completions",
-        method: "POST",
-        path: "/v1/chat/completions",
-        headers: transformerRelayRequestHeaders(request),
-        body: transformerBody,
-        timeoutMs: callTimeoutMs,
-        abortSignal: request.signal,
-      });
+      attempt = await startAuthorizedLocalRelayAttempt(
+        localSendBinding(transformer, requester, {
+          id: poolId,
+          ownerUserId: pool.userId,
+          accessGrantId: access.accessGrantId,
+          memberId: null,
+          transformer: true,
+        }),
+        {
+          requestId: localExecution.localAttemptId,
+          manager,
+          cliDeviceId: transformer.Endpoint.cliDeviceId,
+          endpointSlug: transformer.Endpoint.slug,
+          family: "chat.completions",
+          method: "POST",
+          path: "/v1/chat/completions",
+          headers: transformerRelayRequestHeaders(request),
+          body: transformerBody,
+          timeoutMs: callTimeoutMs,
+          abortSignal: request.signal,
+        },
+      );
     } catch (error) {
       cliLease.release();
       globalLease.release();
@@ -8650,7 +8745,7 @@ async function maybeApplyPoolMediaTransformer({
         transformerErrorClass: failure,
         localExecution,
         userId: requester.userId,
-        localTerminal: rejectedRelayTerminal(),
+        localTerminal: rejectedRelayTerminal(failure),
       }).catch(metadataUpdateError);
       // The pool is unavailable (#76) or the requester blocked: answered like arrival.
       if (error instanceof LocalSendRefused) return openAiFailureJsonResponse(error.failure);
@@ -9031,7 +9126,8 @@ function operationAcceptsExternalVariant(
   return (
     operation.capability === "chat.completions" ||
     operation.capability === "responses.create" ||
-    operation.capability === "messages.create"
+    operation.capability === "messages.create" ||
+    operation.capability === "embeddings"
   );
 }
 
@@ -9077,7 +9173,7 @@ function resolvePoolExternalRoute({
   if (!operationAcceptsExternalVariant(operation))
     return {
       code: "external_variant_unsupported",
-      message: `The ":${EXTERNAL_MODEL_VARIANT}" variant is available only for chat completions, Responses, and Messages. Use "${pool.modelId}" for this endpoint; it is always served by local members.`,
+      message: `The ":${EXTERNAL_MODEL_VARIANT}" variant is available only for chat completions, Responses, Messages, and embeddings. Use "${pool.modelId}" for this endpoint; it is always served by local members.`,
     };
   const decision = evaluateExternalEgress({
     requested: true,
@@ -9129,6 +9225,22 @@ async function relayPreparedModeledRequest({
   }
   let external: PoolExternalRoute = NO_EXTERNAL_ROUTE;
   if (resolution.kind === "pool") {
+    if (operation.family === "embeddings" && resolution.externalRequested) {
+      const contract = parseEmbeddingContract(resolution.target.embeddingContract);
+      if (
+        !contract ||
+        (prepared.payload?.dimensions !== undefined &&
+          prepared.payload.dimensions !== contract.dimensions)
+      ) {
+        await prepared.dispose?.();
+        return externalRouteErrorResponse(operation.family, {
+          code: "external_variant_unsupported",
+          message:
+            "External embeddings require an explicit compatible vector-space contract and matching dimensions.",
+        });
+      }
+      if (prepared.payload) prepared.payload.dimensions = contract.dimensions;
+    }
     const route = resolvePoolExternalRoute({
       requester,
       pool: resolution.target,
@@ -9389,6 +9501,59 @@ async function completionsHandler({
   });
 }
 
+/** Owner diagnostic uses the same routing, physical admission, accounting and final send boundary. */
+export async function poolMemberDiagnosticHandler({
+  request,
+  userId,
+  poolId,
+  manager,
+  limiter,
+  capacityRuntime,
+  embeddings,
+}: {
+  request: Request;
+  userId: string;
+  poolId: string;
+  embeddings: boolean;
+  manager: NonNullable<ModelApiRouteDependencies["manager"]>;
+  limiter: ModelApiConcurrencyLimiter;
+  capacityRuntime: CapacityAdmissionRuntime;
+}): Promise<Response> {
+  const targets = await listVisibleModelTargetsForUser(userId);
+  const target = targets.modelPools.find(
+    (pool) => pool.id === poolId && pool.ownerUserId === userId,
+  );
+  if (!target) return openAiFailureJsonResponse("not_found");
+  const prepared = await prepareJsonModeledRequest(request);
+  if (prepared instanceof Response) return prepared;
+  prepared.model = target.modelId;
+  return relayPreparedModeledRequest({
+    request,
+    requester: { ...requesterFromChatTestUser(userId), limitKey: `pool-member-test:${userId}` },
+    targets,
+    prepared,
+    operation: embeddings
+      ? {
+          memberProbe: true,
+          family: "embeddings",
+          method: "POST",
+          path: "/v1/embeddings",
+          capability: "embeddings",
+        }
+      : {
+          memberProbe: true,
+          family: "chat.completions",
+          method: "POST",
+          path: "/v1/chat/completions",
+          capability: "chat.completions",
+          appendTerminalUsage: true,
+        },
+    manager,
+    limiter,
+    capacityRuntime,
+  });
+}
+
 export async function chatTestCompletionsHandler({
   request,
   userId,
@@ -9509,10 +9674,13 @@ async function relayBoundProviderResponse(input: {
     callerLease.release();
   };
   const maxOutput = input.contextInput?.max_output_tokens;
+  // An omitted limit is unknown, not zero: liability then comes from the
+  // target's own output ceiling (or the request is refused), exactly as on the
+  // main path, so spend caps cannot reserve input cost only.
   const requestedOutputTokens =
     typeof maxOutput === "number" && Number.isSafeInteger(maxOutput) && maxOutput >= 0
       ? BigInt(maxOutput)
-      : 0n;
+      : undefined;
   const estimatedInputTokens = input.contextInput
     ? input.contextCount?.tokens === undefined
       ? (payloadAwareInputTokens(input.body) ??
@@ -9539,10 +9707,16 @@ async function relayBoundProviderResponse(input: {
     affinityHeaders: input.request.headers,
     body: input.body,
     signal: input.request.signal,
-    liability: conservativeProviderLiability({ estimatedInputTokens, requestedOutputTokens }),
+    liability:
+      requestedOutputTokens === undefined
+        ? { accountingVersion: "provider-billable-v1" as const }
+        : conservativeProviderLiability({ estimatedInputTokens, requestedOutputTokens }),
     estimatedInputTokens,
     requestedOutputTokens,
-    contextTokens: estimatedInputTokens + requestedOutputTokens,
+    contextTokens:
+      requestedOutputTokens === undefined
+        ? undefined
+        : estimatedInputTokens + requestedOutputTokens,
     releaseLocalCapacity: async () => undefined,
     adaptationEnabled: false,
     retrySafe: false,
@@ -9964,7 +10138,7 @@ export async function responsesCreateHandler({
   if (!token && !chatTestUserId)
     return openAiFailureJsonResponse("access_denied", "Missing or invalid model API token.");
 
-  const prepared = await prepareJsonModeledRequest(request);
+  const prepared = await prepareJsonModeledRequest(request, true);
   if (prepared instanceof Response) return prepared;
   const requester = chatTestUserId
     ? requesterFromChatTestUser(chatTestUserId)
@@ -9982,9 +10156,8 @@ export async function responsesCreateHandler({
     path: "/v1/responses",
     capability: "responses.create",
     additionalCapabilities: previousId ? ["responses.statefulFollowUps"] : undefined,
-    // Explicitly stateless Responses requests do not create a follow-up route.
-    // Stored/default Responses served externally record a consented binding.
-    responseStickiness: prepared.payload?.store === false ? undefined : { requester },
+    // Only explicitly stored Responses create a follow-up route.
+    responseStickiness: prepared.payload?.store === true ? { requester } : undefined,
   };
 
   if (!previousId) {

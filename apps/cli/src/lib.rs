@@ -14,6 +14,7 @@ pub mod config;
 pub mod control;
 pub mod count_context;
 pub mod daemon;
+pub mod deployments;
 pub mod display_escape;
 pub mod engine;
 pub mod engine_adapter;

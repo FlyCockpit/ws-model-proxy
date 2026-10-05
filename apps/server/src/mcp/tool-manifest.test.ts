@@ -50,6 +50,12 @@ const { appRouter } = await import("@ws-model-proxy/api/routers/index");
 
 /** Read catalog — exact names, verbatim. */
 const PLAN_READ_TOOLS: readonly string[] = [
+  "deployment_configs_list",
+  "deployment_config_get",
+  "deployment_instances_list",
+  "deployment_instance_get",
+  "deployment_plan_status",
+  "inference_contributions_list",
   "app_config_get",
   "forwarder_guarded_candidates_list",
   "forwarder_cli_devices_list",
@@ -91,6 +97,12 @@ const PLAN_READ_TOOLS: readonly string[] = [
 
 /** Write catalog — exact names, verbatim. */
 const PLAN_WRITE_TOOLS: readonly string[] = [
+  "deployment_config_create",
+  "deployment_config_update",
+  "deployment_plan_start",
+  "deployment_plan_stop",
+  "deployment_plan_apply",
+  "inference_contribution_revoke",
   "forwarder_guarded_pool_create",
   "forwarder_cli_device_rename",
   "forwarder_cli_metadata_remove",
@@ -158,6 +170,7 @@ const PLAN_WRITE_TOOLS: readonly string[] = [
 
 /** Confirmation literals for the write catalog. */
 const PLAN_CONFIRMATIONS: Readonly<Record<string, "DELETE" | "RUN" | null>> = Object.freeze({
+  deployment_plan_apply: "RUN",
   forwarder_cli_metadata_remove: "DELETE",
   forwarder_endpoint_metadata_remove: "DELETE",
   forwarder_model_metadata_remove: "DELETE",
@@ -194,6 +207,18 @@ const PLAN_CONFIRMATIONS: Readonly<Record<string, "DELETE" | "RUN" | null>> = Ob
 
 /** Exact catalog targets (name → target) for drift detection. */
 const PLAN_TARGETS: Readonly<Record<string, string>> = Object.freeze({
+  deployment_configs_list: "deployments.listConfigs",
+  deployment_config_get: "deployments.getConfig",
+  deployment_instances_list: "deployments.listInstances",
+  deployment_instance_get: "deployments.getInstance",
+  deployment_plan_status: "deployments.planStatus",
+  inference_contributions_list: "inferenceContributions.list",
+  deployment_config_create: "deployments.createConfig",
+  deployment_config_update: "deployments.updateConfig",
+  deployment_plan_start: "deployments.planStart",
+  deployment_plan_stop: "deployments.planStop",
+  deployment_plan_apply: "deployments.applyPlan",
+  inference_contribution_revoke: "inferenceContributions.revoke",
   app_config_get: "appConfig",
   forwarder_guarded_candidates_list: "forwarderManagement.listGuardedOverflowCandidates",
   forwarder_cli_devices_list: "forwarderManagement.listCliDeviceSummaries",
@@ -396,13 +421,13 @@ describe("MCP tool manifest — exact catalog", () => {
     }
   });
 
-  it("contains exactly 37 read + 63 write names (no extras, no missing, no duplicates)", () => {
+  it("contains exactly 43 read + 69 write names (no extras, no missing, no duplicates)", () => {
     const names = MCP_TOOL_MANIFEST.map((tool) => tool.name);
     expect(new Set(names).size).toBe(names.length);
     expect([...names].sort()).toEqual([...PLAN_READ_TOOLS, ...PLAN_WRITE_TOOLS].sort());
-    expect(PLAN_READ_TOOLS).toHaveLength(37);
-    expect(PLAN_WRITE_TOOLS).toHaveLength(63);
-    expect(MCP_TOOL_MANIFEST).toHaveLength(100);
+    expect(PLAN_READ_TOOLS).toHaveLength(43);
+    expect(PLAN_WRITE_TOOLS).toHaveLength(69);
+    expect(MCP_TOOL_MANIFEST).toHaveLength(112);
   });
 
   it("the CLI device list explains effectiveMode and which switch limits it", () => {
@@ -607,9 +632,9 @@ describe("MCP tool manifest — appRouter leaf classification (invariant 12)", (
         `${tool.name}: ${PLAN_TARGETS[tool.name]}`,
       );
     }
-    // 100 catalog entries − 14 extracted cores = 86 procedure dispatches.
-    expect(dispatched).toBe(86);
-    expect(invoked).toHaveLength(86);
+    // 112 catalog entries − 14 extracted cores = 98 procedure dispatches.
+    expect(dispatched).toBe(98);
+    expect(invoked).toHaveLength(98);
 
     // Human-only proof: ZERO mcpGrants access (property or invocation)
     // across every dispatch.
@@ -790,7 +815,7 @@ describe("MCP tool manifest — feature-dependency metadata (G8a)", () => {
       "externalAfterWaitMs",
       "Lower values spend more",
       "x-wsmp-external-after-wait-ms",
-      "Grantees cannot shorten",
+      "Neither owners nor grantees can shorten",
       "TOKEN_EXTERNAL_WAIT_UPDATED",
     ])
       expect(update.descriptionNote).toContain(phrase);

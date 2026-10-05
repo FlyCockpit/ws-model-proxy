@@ -43,6 +43,41 @@ type RuleRow = {
   memberId: string;
 };
 
+const OP_KEYS = { ">": "gt", ">=": "gte", "<": "lt", "<=": "lte" } as const;
+
+/** One rule read back as a sentence, so the row's effect is clear at a glance. */
+function RuleSentence({ row, members }: { row: RuleRow; members: readonly MemberOption[] }) {
+  const { t } = useTranslation(["dashboard"]);
+  const metric = row.metric.trim();
+  const threshold = row.threshold.trim();
+  if (!metric || !threshold) {
+    return (
+      <p className="text-sm text-muted-foreground sm:col-span-2 lg:col-span-3">
+        {t("dashboard:pools.metricRules.sentence.incomplete")}
+      </p>
+    );
+  }
+  const labels = row.labels.trim();
+  const member =
+    members.find((entry) => entry.poolMemberId === row.memberId)?.upstreamModelId ??
+    (row.memberId || t("dashboard:pools.metricRules.sentence.unchosenMember"));
+  return (
+    <p
+      className="min-w-0 break-words text-sm font-medium sm:col-span-2 lg:col-span-3"
+      data-testid="metric-rule-sentence"
+    >
+      {t("dashboard:pools.metricRules.sentence.when", {
+        aggregate: t(`dashboard:pools.metricRules.sentence.aggregates.${row.aggregate}`),
+        metric: labels ? `${metric}{${labels}}` : metric,
+        op: t(`dashboard:pools.metricRules.sentence.ops.${OP_KEYS[row.op]}`),
+        threshold,
+        effect: t(`dashboard:pools.metricRules.sentence.effects.${row.effect}`),
+        target: t(`dashboard:pools.metricRules.sentence.targets.${row.scope}`, { member }),
+      })}
+    </p>
+  );
+}
+
 function storedScope(rule: StoredRule): RuleRow["scope"] {
   if (rule.memberId) return "only";
   if (rule.excludeMemberId) return "except";
@@ -284,6 +319,9 @@ function MetricRulesEditor({
                 <legend className="sr-only">
                   {t("dashboard:pools.metricRules.ruleLegend", { number: index + 1 })}
                 </legend>
+                <form.Subscribe selector={(state) => state.values.rules[index]}>
+                  {(row) => (row ? <RuleSentence row={row} members={members} /> : null)}
+                </form.Subscribe>
                 <form.Field name={`rules[${index}].metric`}>
                   {(sub) => (
                     <div className="min-w-0 space-y-1">

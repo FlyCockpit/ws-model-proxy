@@ -58,9 +58,16 @@ function seriesKey(series: { name: string; labels: Record<string, string> }): st
  * definitions the server holds that the CLI has not reported yet. Loaded
  * when opened.
  */
-export function CliDeviceMetricSources({ cliDeviceId }: { cliDeviceId: string }) {
+export function CliDeviceMetricSources({
+  cliDeviceId,
+  defaultOpen = false,
+}: {
+  cliDeviceId: string;
+  /** Open when shown on its own (a device tab). */
+  defaultOpen?: boolean;
+}) {
   const { t } = useTranslation(["dashboard"]);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(defaultOpen);
   const metrics = useQuery({
     ...orpc.forwarderManagement.getCliDeviceMetrics.queryOptions({ input: { cliDeviceId } }),
     enabled: open,

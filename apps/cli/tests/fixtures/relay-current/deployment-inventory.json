@@ -1,0 +1,35 @@
+{
+  "protocolVersion": "2.10",
+  "empty": [
+    {
+      "type": "deployment.instances",
+      "snapshotId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "chunkIndex": 0,
+      "final": true,
+      "instances": []
+    }
+  ],
+  "nonempty": [
+    {
+      "type": "deployment.instances",
+      "snapshotId": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "chunkIndex": 0,
+      "final": true,
+      "instances": [
+        {
+          "stepId": "step-fixture",
+          "instanceId": "fixture",
+          "revisionId": "revision",
+          "rank": 0,
+          "intentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "phase": "ready",
+          "unitName": "wsmp-i-fixture-r0",
+          "port": 30001,
+          "endpointSlug": "inst-fixture-1",
+          "models": ["fixture"],
+          "contextWindow": 4096
+        }
+      ]
+    }
+  ]
+}

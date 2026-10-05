@@ -21,6 +21,8 @@ import {
   type ContextWindowSeedDependent,
   isContextWindowSeedAdmissible,
 } from "../lib/declared-context-window";
+import { liveDeploymentInstanceWhere } from "../lib/deployment-service";
+import { embeddingContractSchema } from "../lib/embedding-contract";
 import { parseModelApiSurface } from "../lib/model-api-surface";
 import {
   resolveEffectiveCapabilityMetadata,
@@ -42,6 +44,7 @@ import {
 } from "../lib/serializable-transaction";
 import {
   poolSelect,
+  poolSummaryBudgetSelect,
   poolSummarySelect,
   serializePool,
   serializePoolSummary,
@@ -361,9 +364,25 @@ export const poolProcedures = {
         select: poolSummarySelect,
       });
       const page = rows.slice(0, input.limit);
+      // Fetch policy only for the grants actually emitted. Independently
+      // slicing policies could silently drop a selected grant's spend cap.
+      const selectedGrants = page.flatMap((pool) =>
+        pool.PoolGrants.map((grant) => ({ poolId: pool.id, granteeUserId: grant.granteeUserId })),
+      );
+      const policies = selectedGrants.length
+        ? await prisma.providerBudgetPolicy.findMany({
+            where: { active: true, scopeType: "POOL_GRANT", OR: selectedGrants },
+            select: poolSummaryBudgetSelect,
+          })
+        : [];
       const last = page[page.length - 1];
       return {
-        items: page.map(serializePoolSummary),
+        items: page.map((pool) =>
+          serializePoolSummary(
+            pool,
+            policies.filter((policy) => policy.poolId === pool.id),
+          ),
+        ),
         nextCursor:
           rows.length > input.limit && last !== undefined ? encodeSummaryCursor(last) : null,
       };
@@ -442,9 +461,19 @@ export const poolProcedures = {
     .handler(async ({ input, context }) => {
       await ownedPool(input.poolId, context.session.user.id);
       const now = new Date();
+      const [scope] = await prisma.$queryRaw<Array<{ generation: string }>>`
+        SELECT generation FROM cache_affinity_scope WHERE "poolId" = ${input.poolId}`;
+      const currentGeneration = scope
+        ? { cacheGeneration: { endsWith: `:pool:${scope.generation}` } }
+        : {};
       const [activeRecords, confirmedRecords, targetGroups, activeNodes] = await Promise.all([
         prisma.cacheAffinityRecord.count({
-          where: { userId: context.session.user.id, poolId: input.poolId, expiresAt: { gt: now } },
+          where: {
+            userId: context.session.user.id,
+            poolId: input.poolId,
+            expiresAt: { gt: now },
+            ...currentGeneration,
+          },
         }),
         prisma.cacheAffinityRecord.count({
           where: {
@@ -452,16 +481,27 @@ export const poolProcedures = {
             poolId: input.poolId,
             expiresAt: { gt: now },
             engineCacheConfirmed: true,
+            ...currentGeneration,
           },
         }),
         prisma.cacheAffinityRecord.groupBy({
           by: ["executionTargetId"],
-          where: { userId: context.session.user.id, poolId: input.poolId, expiresAt: { gt: now } },
+          where: {
+            userId: context.session.user.id,
+            poolId: input.poolId,
+            expiresAt: { gt: now },
+            ...currentGeneration,
+          },
           _count: { _all: true },
           _max: { lastUsedAt: true, expiresAt: true },
         }),
         prisma.cacheAffinityNode.count({
-          where: { userId: context.session.user.id, poolId: input.poolId, expiresAt: { gt: now } },
+          where: {
+            userId: context.session.user.id,
+            poolId: input.poolId,
+            expiresAt: { gt: now },
+            ...currentGeneration,
+          },
         }),
       ]);
       return {
@@ -481,12 +521,10 @@ export const poolProcedures = {
     .input(z.object({ poolId: idSchema }))
     .handler(async ({ input, context }) => {
       await ownedPool(input.poolId, context.session.user.id);
-      return {
-        deleted: await clearCacheAffinityRecords(prisma, {
-          ownerUserId: context.session.user.id,
-          poolId: input.poolId,
-        }),
-      };
+      return clearCacheAffinityRecords(prisma, {
+        ownerUserId: context.session.user.id,
+        poolId: input.poolId,
+      });
     }),
 
   createModelPool: protectedProcedure
@@ -499,6 +537,8 @@ export const poolProcedures = {
         optimisticBasicTranscription: z.boolean().optional(),
         protocolAdaptationEnabled: z.boolean().optional(),
         ...poolFallbackFields,
+        embeddingContract: embeddingContractSchema.nullable().optional(),
+        paidWarmProtectionEnabled: z.boolean().optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
         recommendedSurfaceOverride: poolRecommendedSurfaceSchema.nullable().optional(),
         ...poolTransformerFields,
@@ -516,6 +556,10 @@ export const poolProcedures = {
       }),
     )
     .handler(async ({ input, context }) => {
+      if (input.paidWarmProtectionEnabled === true && context.services?.deploymentActor)
+        throw new ORPCError("FORBIDDEN", {
+          message: "Paid warm-cache protection requires human consent.",
+        });
       if (input.fallbackEnabled === true)
         assertProviderEgressReleaseGate("PROVIDER_EGRESS_DISABLED");
       const protectionShare = resolvePoolProtectionShare(input, {
@@ -562,6 +606,8 @@ export const poolProcedures = {
         protocolAdaptationEnabled: input.protocolAdaptationEnabled ?? false,
         // Fallback fields not given keep the schema defaults (forwarder.prisma).
         ...(input.fallbackEnabled !== undefined ? { fallbackEnabled: input.fallbackEnabled } : {}),
+        embeddingContract: input.embeddingContract ?? Prisma.DbNull,
+        paidWarmProtectionEnabled: input.paidWarmProtectionEnabled ?? false,
         ...(input.fallbackForGrantees !== undefined
           ? { fallbackForGrantees: input.fallbackForGrantees }
           : {}),
@@ -652,6 +698,17 @@ export const poolProcedures = {
             after: JSON.parse(JSON.stringify(capacityPolicy)) as Prisma.InputJsonValue,
           },
         });
+        if (input.paidWarmProtectionEnabled !== undefined)
+          await tx.capacityAuditEvent.create({
+            data: {
+              userId,
+              actorUserId: userId,
+              action: "PAID_WARM_CONSENT",
+              resourceType: "MODEL_POOL",
+              resourceId: created.id,
+              after: { enabled: created.paidWarmProtectionEnabled },
+            },
+          });
         return created;
       });
       return serializePool(row);
@@ -670,6 +727,8 @@ export const poolProcedures = {
         optimisticBasicTranscription: z.boolean().optional(),
         protocolAdaptationEnabled: z.boolean().optional(),
         ...poolFallbackFields,
+        embeddingContract: embeddingContractSchema.nullable().optional(),
+        paidWarmProtectionEnabled: z.boolean().optional(),
         allowLossyDeveloperRoleCollapse: z.boolean().optional(),
         recommendedSurfaceOverride: poolRecommendedSurfaceSchema.nullable().optional(),
         affinityEnabled: z.boolean().optional(),
@@ -686,6 +745,10 @@ export const poolProcedures = {
       }),
     )
     .handler(async ({ input, context }) => {
+      if (input.paidWarmProtectionEnabled === true && context.services?.deploymentActor)
+        throw new ORPCError("FORBIDDEN", {
+          message: "Paid warm-cache protection requires human consent.",
+        });
       const existing = await prisma.modelPool.findUnique({
         where: { id: input.id },
         select: {
@@ -753,6 +816,7 @@ export const poolProcedures = {
             userId: true,
             name: true,
             fallbackEnabled: true,
+            paidWarmProtectionEnabled: true,
             fallbackForGrantees: true,
             externalAfterWaitMs: true,
             protocolAdaptationEnabled: true,
@@ -845,6 +909,12 @@ export const poolProcedures = {
               : {}),
             ...(input.fallbackEnabled !== undefined
               ? { fallbackEnabled: input.fallbackEnabled }
+              : {}),
+            ...(input.embeddingContract !== undefined
+              ? { embeddingContract: input.embeddingContract ?? Prisma.DbNull }
+              : {}),
+            ...(input.paidWarmProtectionEnabled !== undefined
+              ? { paidWarmProtectionEnabled: input.paidWarmProtectionEnabled }
               : {}),
             ...(input.fallbackForGrantees !== undefined
               ? { fallbackForGrantees: input.fallbackForGrantees }
@@ -942,6 +1012,21 @@ export const poolProcedures = {
           },
           source: poolFallbackChangeSource(context),
         });
+        if (
+          input.paidWarmProtectionEnabled !== undefined &&
+          input.paidWarmProtectionEnabled !== current.paidWarmProtectionEnabled
+        )
+          await tx.capacityAuditEvent.create({
+            data: {
+              userId,
+              actorUserId: userId,
+              action: "PAID_WARM_CONSENT",
+              resourceType: "MODEL_POOL",
+              resourceId: input.id,
+              before: { enabled: current.paidWarmProtectionEnabled ?? false },
+              after: { enabled: row.paidWarmProtectionEnabled },
+            },
+          });
         return row;
       });
       return serializePool(updated);
@@ -959,6 +1044,25 @@ export const poolProcedures = {
       // live orphans.
       await runCapacityDeleteTransaction(async (tx) => {
         await fenceParentDelete(tx, { userId, poolIds: [input.id] });
+        // Deployment admission reads this row FOR KEY SHARE before creating instances, so the
+        // live-instance check below cannot miss one that is being created.
+        await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${input.id} FOR UPDATE`;
+        const live = await tx.deploymentConfig.findMany({
+          where: { poolId: input.id, Instances: { some: liveDeploymentInstanceWhere } },
+          select: { name: true },
+          orderBy: { name: "asc" },
+          take: 5,
+        });
+        if (live.length > 0)
+          throw new ORPCError("CONFLICT", {
+            message: `Stop the deployments of ${live.map((c) => `"${c.name}"`).join(", ")} before deleting this pool`,
+            data: { reason: "deployments_running" },
+          });
+        // Recipes and their history stay; they can start again once rebound to another pool.
+        await tx.deploymentConfig.updateMany({
+          where: { poolId: input.id },
+          data: { poolId: null },
+        });
         await tx.modelPool.delete({ where: { id: input.id } });
       });
       return { deleted: true };

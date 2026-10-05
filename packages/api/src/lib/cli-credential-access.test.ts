@@ -291,7 +291,8 @@ describe("cliCredentialAccess", () => {
       cliDeviceId: "cli-device-id",
       identityPublicKey: null,
     });
-    await expect(check(identityPublicKey)).resolves.toBe("identityMismatch");
+    // A credential from before identity binding is told so, not "another key".
+    await expect(check(identityPublicKey)).resolves.toBe("identityUnbound");
   });
 
   it("binds an unbound CLI token on its first hello with a conditional write", async () => {
@@ -358,6 +359,145 @@ describe("cliCredentialAccess", () => {
     });
     await expect(check()).resolves.toBe("revoked");
     expect(db.cliToken.updateMany).not.toHaveBeenCalled();
+  });
+
+  describe("CLI token identity keys", () => {
+    const keyA =
+      "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE";
+    const keyB =
+      "BCIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI";
+    const check = (presented: string | null) =>
+      checkCliCredentialForDevice(
+        prisma,
+        { kind: "cliToken", id: "token-id" },
+        "cli-device-id",
+        now,
+        presented,
+      );
+
+    it("claims an unbound token for the device and key in one conditional write", async () => {
+      db.cliToken.findUnique.mockResolvedValueOnce({
+        revokedAt: null,
+        expiresAt: null,
+        cliDeviceId: null,
+        identityPublicKey: null,
+      });
+      db.cliToken.updateMany.mockResolvedValueOnce({ count: 1 });
+      await expect(check(keyA)).resolves.toBe("ok");
+      expect(db.cliToken.updateMany).toHaveBeenCalledTimes(1);
+      expect(db.cliToken.updateMany).toHaveBeenCalledWith({
+        where: { id: "token-id", cliDeviceId: null, identityPublicKey: null, revokedAt: null },
+        data: { cliDeviceId: "cli-device-id", identityPublicKey: keyA },
+      });
+    });
+
+    it("TOFU-binds the key of a device-bound token that has none yet", async () => {
+      db.cliToken.findUnique.mockResolvedValueOnce({
+        revokedAt: null,
+        expiresAt: null,
+        cliDeviceId: "cli-device-id",
+        identityPublicKey: null,
+      });
+      db.cliToken.updateMany.mockResolvedValueOnce({ count: 1 });
+      await expect(check(keyA)).resolves.toBe("ok");
+      expect(db.cliToken.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: "token-id",
+          cliDeviceId: "cli-device-id",
+          identityPublicKey: null,
+          revokedAt: null,
+        },
+        data: { identityPublicKey: keyA },
+      });
+    });
+
+    it("accepts the bound key and refuses a different one without writing", async () => {
+      db.cliToken.findUnique.mockResolvedValueOnce({
+        revokedAt: null,
+        expiresAt: null,
+        cliDeviceId: "cli-device-id",
+        identityPublicKey: keyA,
+      });
+      await expect(check(keyA)).resolves.toBe("ok");
+      db.cliToken.findUnique.mockResolvedValueOnce({
+        revokedAt: null,
+        expiresAt: null,
+        cliDeviceId: "cli-device-id",
+        identityPublicKey: keyA,
+      });
+      await expect(check(keyB)).resolves.toBe("identityMismatch");
+      // Inventory updates (no presented key) on an admitted socket stay ok.
+      db.cliToken.findUnique.mockResolvedValueOnce({
+        revokedAt: null,
+        expiresAt: null,
+        cliDeviceId: "cli-device-id",
+        identityPublicKey: keyA,
+      });
+      await expect(check(null)).resolves.toBe("ok");
+      expect(db.cliToken.updateMany).not.toHaveBeenCalled();
+    });
+
+    it("re-reads after a lost key-bind race and refuses another winner's key", async () => {
+      db.cliToken.findUnique
+        .mockResolvedValueOnce({
+          revokedAt: null,
+          expiresAt: null,
+          cliDeviceId: "cli-device-id",
+          identityPublicKey: null,
+        })
+        .mockResolvedValueOnce({
+          revokedAt: null,
+          cliDeviceId: "cli-device-id",
+          identityPublicKey: keyB,
+        });
+      db.cliToken.updateMany.mockResolvedValueOnce({ count: 0 });
+      await expect(check(keyA)).resolves.toBe("identityMismatch");
+
+      // The winner presented the same key: ok.
+      db.cliToken.findUnique
+        .mockResolvedValueOnce({
+          revokedAt: null,
+          expiresAt: null,
+          cliDeviceId: "cli-device-id",
+          identityPublicKey: null,
+        })
+        .mockResolvedValueOnce({
+          revokedAt: null,
+          cliDeviceId: "cli-device-id",
+          identityPublicKey: keyA,
+        });
+      db.cliToken.updateMany.mockResolvedValueOnce({ count: 0 });
+      await expect(check(keyA)).resolves.toBe("ok");
+
+      // A revoke landed between the read and the write.
+      db.cliToken.findUnique
+        .mockResolvedValueOnce({
+          revokedAt: null,
+          expiresAt: null,
+          cliDeviceId: "cli-device-id",
+          identityPublicKey: null,
+        })
+        .mockResolvedValueOnce({ revokedAt: now, cliDeviceId: "cli-device-id" });
+      db.cliToken.updateMany.mockResolvedValueOnce({ count: 0 });
+      await expect(check(keyA)).resolves.toBe("revoked");
+    });
+
+    it("refuses a first hello whose unbound-token claim lost to another key", async () => {
+      db.cliToken.findUnique
+        .mockResolvedValueOnce({
+          revokedAt: null,
+          expiresAt: null,
+          cliDeviceId: null,
+          identityPublicKey: null,
+        })
+        .mockResolvedValueOnce({
+          revokedAt: null,
+          cliDeviceId: "cli-device-id",
+          identityPublicKey: keyB,
+        });
+      db.cliToken.updateMany.mockResolvedValueOnce({ count: 0 });
+      await expect(check(keyA)).resolves.toBe("identityMismatch");
+    });
   });
 });
 

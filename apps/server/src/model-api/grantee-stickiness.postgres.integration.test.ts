@@ -137,7 +137,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       for (const userId of [stranger.id, secondGrantee.id])
         await expect(
           db.responseStickinessRecord.update({ where: { id: accepted.id }, data: { userId } }),
-        ).rejects.toThrow(/stickiness pool binding requires the pool owner or the exact grant/);
+        ).rejects.toThrow(/local stickiness binding is immutable/);
       // A foreign target without a pool (or grant) is still rejected.
       await expect(binding({ targetModelPoolId: null, poolGrantId: null })).rejects.toThrow(
         /stickiness selection must match its owner and discovered model/,
@@ -158,13 +158,13 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       ])
         await expect(
           db.responseStickinessRecord.update({ where: { id: accepted.id }, data }),
-        ).rejects.toThrow(/stickiness pool binding requires the pool owner or the exact grant/);
+        ).rejects.toThrow(/local stickiness binding is immutable/);
       await expect(
         db.responseStickinessRecord.update({
           where: { id: accepted.id },
           data: { targetExecutionTargetId: foreign.target.id },
         }),
-      ).rejects.toThrow(/stickiness binding targets either a pool or a direct model/);
+      ).rejects.toThrow(/local stickiness binding is immutable/);
       await expect(
         db.responseStickinessRecord.update({
           where: { id: accepted.id },
@@ -174,7 +174,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
             targetExecutionTargetId: foreign.target.id,
           },
         }),
-      ).rejects.toThrow(/stickiness target must match its owner and discovered model/);
+      ).rejects.toThrow(/local stickiness binding is immutable/);
       // Setting a target and clearing its paired column in one statement
       // (which bypasses canonicalization) is re-checked too.
       const direct = await binding({
@@ -188,14 +188,14 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
           where: { id: direct.id },
           data: { targetExecutionTargetId: foreign.target.id, targetDiscoveredModelId: null },
         }),
-      ).rejects.toThrow(/stickiness target must match its owner and discovered model/);
+      ).rejects.toThrow(/local stickiness binding is immutable/);
       await db.responseStickinessRecord.delete({ where: { id: direct.id } });
       await expect(
         db.responseStickinessRecord.update({
           where: { id: accepted.id },
           data: { selectedExecutionTargetId: foreign.target.id, selectedDiscoveredModelId: null },
         }),
-      ).rejects.toThrow(/stickiness selection must match its owner and discovered model/);
+      ).rejects.toThrow(/local stickiness binding is immutable/);
       // A pool binding never also names a direct target (routing would take
       // the direct branch and skip the pool's checks).
       await expect(
@@ -214,7 +214,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
           where: { id: accepted.id },
           data: { selectedExecutionTargetId: outsider.target.id, selectedDiscoveredModelId: null },
         }),
-      ).rejects.toThrow(/stickiness selection must be a local member of its pool/);
+      ).rejects.toThrow(/local stickiness binding is immutable/);
       // The owner binds without a grant.
       const ownerBinding = await binding({
         userId: owner.id,
@@ -236,10 +236,12 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
           selectedExecutionTargetId: memberB.target.id,
         },
       });
-      await db.responseStickinessRecord.update({
-        where: { id: ownerBinding.id },
-        data: { routingVersion: 1 },
-      });
+      await expect(
+        db.responseStickinessRecord.update({
+          where: { id: ownerBinding.id },
+          data: { routingVersion: 1 },
+        }),
+      ).rejects.toThrow(/local stickiness binding is immutable/);
       await expect(
         db.responseStickinessRecord.upsert({
           where: {
@@ -391,8 +393,21 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
         (await db.relayRequest.findUniqueOrThrow({ where: { id: relayRequestId } }))
           .selectedPoolMemberId;
 
-      // 1. A grantee's locally served Responses create writes its binding.
-      const createPromise = responses({ input: "first" });
+      // Omitted store defaults to false and must not create a binding.
+      const transientPromise = responses({ input: "transient" });
+      const transient = await nextSend();
+      serve(transient.attemptId, JSON.stringify({ id: "resp_transient", object: "response" }));
+      const transientResponse = await transientPromise;
+      expect(transientResponse.status).toBe(200);
+      await transientResponse.text();
+      expect(
+        await db.responseStickinessRecord.count({
+          where: { userId: grantee.id, poolGrantId: grant.id },
+        }),
+      ).toBe(1);
+
+      // 1. Explicit storage writes the persistent follow-up binding.
+      const createPromise = responses({ input: "first", store: true });
       const created = await nextSend();
       const firstMember = await servedMember(created.relayRequestId);
       expect([...poolMembers.values()]).toContain(firstMember);
@@ -414,7 +429,11 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
 
       // 2. Its follow-ups stick to the member (and backend) that stored it.
       for (const [index, previous] of ["resp_grantee_1", "resp_grantee_2"].entries()) {
-        const followPromise = responses({ previous_response_id: previous, input: "next" });
+        const followPromise = responses({
+          previous_response_id: previous,
+          input: "next",
+          store: true,
+        });
         const follow = await nextSend();
         expect(await servedMember(follow.relayRequestId)).toBe(firstMember);
         serve(
@@ -605,14 +624,20 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       );
       expect(warn).not.toHaveBeenCalledWith("[model-api] relay metadata update failed");
       warn.mockRestore();
-      // The orphaned grantee row still accepts no third party's target: the
-      // durable resource owner stands in for the deleted pool's owner.
+      // Terminal history pins its authorized identity after pool deletion.
       await expect(
         db.relayRequest.update({
           where: { id: inflight.relayRequestId },
           data: { selectedExecutionTargetId: foreign.target.id },
         }),
-      ).rejects.toThrow(/relay request selection must match its owner and discovered model/);
+      ).rejects.toThrow(/relay request selection must match its immutable terminal identity/);
+      expect(
+        await db.relayRequest.findUniqueOrThrow({ where: { id: inflight.relayRequestId } }),
+      ).toMatchObject({
+        selectedExecutionTargetId: pending.selectedExecutionTargetId,
+        selectedPoolMemberId: pending.selectedPoolMemberId,
+        status: "SUCCEEDED",
+      });
 
       // A PENDING orphan still rejects a third party's target.
       await expect(
@@ -655,7 +680,7 @@ integration("grantee local Responses stickiness and owner attribution (#66)", ()
       // Pool deleted in flight (success) and crash-recovered (failure): owner.
       // Responses traffic before the delete also belongs to the owner.
       // The follow-up refused at the send boundary is a failure on the owner.
-      expect(byOwner(owner.id)).toMatchObject({ successes: 4, errors: 2 });
+      expect(byOwner(owner.id)).toMatchObject({ successes: 5, errors: 2 });
       // DL-1 (d): the requests keep the deleted pool's id, so every owner row
       // (before and after the delete) is keyed by it; none falls back to "".
       expect(rollups.filter((row) => row.ownerUserId === owner.id && row.poolId === "")).toEqual(

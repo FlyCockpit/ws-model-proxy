@@ -37,6 +37,7 @@ const db = prisma as unknown as {
     findUnique: ReturnType<typeof vi.fn>;
     upsert: ReturnType<typeof vi.fn>;
   };
+  capacityAuditEvent: { create: ReturnType<typeof vi.fn> };
   cliDeviceCredential: {
     create: ReturnType<typeof vi.fn>;
     findMany: ReturnType<typeof vi.fn>;
@@ -705,7 +706,10 @@ describe("cliCredentialsRouter", () => {
       lastRefusedAt: null,
       lastRefusedReason: null,
     });
-    const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
+    const onCliCredentialsRevoked = vi.fn();
+    const client = createRouterClient(cliCredentialsRouter, {
+      context: buildContext(undefined, { onCliCredentialsRevoked }),
+    });
 
     await expect(client.resetTokenIdentity({ id: "token-1" })).resolves.toMatchObject({
       id: "token-1",
@@ -721,6 +725,66 @@ describe("cliCredentialsRouter", () => {
       },
       select: expect.any(Object),
     });
+    expect(db.capacityAuditEvent.create).toHaveBeenCalledWith({
+      data: {
+        userId: "user-1",
+        actorUserId: "user-1",
+        action: "RESET_IDENTITY",
+        resourceType: "CLI_TOKEN",
+        resourceId: "token-1",
+      },
+    });
+    expect(onCliCredentialsRevoked).toHaveBeenCalledWith({ kind: "cliToken", ids: ["token-1"] });
+  });
+
+  it.each([
+    ["another user's", { id: "token-1", userId: "user-2", revokedAt: null }],
+    ["a missing", null],
+  ])("answers NOT_FOUND when resetting %s token and writes nothing", async (_label, row) => {
+    db.cliToken.findUnique.mockResolvedValue(row);
+    const onCliCredentialsRevoked = vi.fn();
+    const client = createRouterClient(cliCredentialsRouter, {
+      context: buildContext(undefined, { onCliCredentialsRevoked }),
+    });
+
+    await expect(client.resetTokenIdentity({ id: "token-1" })).rejects.toSatisfy(
+      (error: ORPCError<string, unknown>) => error.code === "NOT_FOUND",
+    );
+    expect(db.cliToken.update).not.toHaveBeenCalled();
+    expect(db.capacityAuditEvent.create).not.toHaveBeenCalled();
+    expect(onCliCredentialsRevoked).not.toHaveBeenCalled();
+  });
+
+  it("refuses to reset a revoked token's identity bind", async () => {
+    db.cliToken.findUnique.mockResolvedValue({
+      id: "token-1",
+      userId: "user-1",
+      revokedAt: new Date("2026-07-01T00:00:00.000Z"),
+    });
+    const onCliCredentialsRevoked = vi.fn();
+    const client = createRouterClient(cliCredentialsRouter, {
+      context: buildContext(undefined, { onCliCredentialsRevoked }),
+    });
+
+    await expect(client.resetTokenIdentity({ id: "token-1" })).rejects.toSatisfy(
+      (error: ORPCError<string, unknown>) =>
+        error.code === "BAD_REQUEST" && /cannot reset their identity bind/.test(error.message),
+    );
+    expect(db.cliToken.update).not.toHaveBeenCalled();
+    expect(db.capacityAuditEvent.create).not.toHaveBeenCalled();
+    expect(onCliCredentialsRevoked).not.toHaveBeenCalled();
+  });
+
+  it("refuses an identity reset from a deployment agent before touching the token", async () => {
+    const client = createRouterClient(cliCredentialsRouter, {
+      context: buildContext(undefined, { deploymentActor: { kind: "AGENT", id: "agent-1" } }),
+    });
+
+    await expect(client.resetTokenIdentity({ id: "token-1" })).rejects.toSatisfy(
+      (error: ORPCError<string, unknown>) => error.code === "FORBIDDEN",
+    );
+    expect(db.$transaction).not.toHaveBeenCalled();
+    expect(db.cliToken.update).not.toHaveBeenCalled();
   });
 
   describe("deviceLoginRequest", () => {

@@ -16,6 +16,22 @@
 
 Self-hosted web app plus CLI for exposing locally hosted OpenAI-compatible model endpoints through a VPS without router port forwarding.
 
+The 0.4.0 workflow uses durable recipe revisions and group-aware deployment plans.
+Open Dashboard → Deployments to edit recipes, preview a start/switch/stop plan, grant
+node deployment permission, or confirm an agent's supervised plan. A conflict on one
+rank stops the entire old group; unrelated groups remain serving. Measured memory
+budgets and port claims determine placement. Readiness gates publication, and
+unproven stops retain their claims.
+
+Friends can offer specific serving inference to your pools with explicit two-party
+consent, without granting shell or deployment control of their hardware. Either
+party can revoke. Pool listings require connected, published local service.
+`:external` is local-first; paid cache-only protection is separately opt-in and off
+by default. External embeddings require an exact vector-space identity contract.
+WMP keeps content-free usage/routing metadata, never chat content. Native Responses
+defaults to `store: false`; backend storage requires explicit caller opt-in.
+See [external fallback](docs/external-fallback.md).
+
 ## Current Direction
 
 - Deploy one Docker web app on a VPS.
@@ -173,7 +189,7 @@ Model API clients call `/v1/*` with `Authorization: Bearer ...`. Cookie/session 
 
 ### OpenAI-compatible client API
 
-Create a Model API token in the dashboard, then use the public server URL as the
+Create an API token in the dashboard (API tokens), then use the public server URL as the
 OpenAI-compatible base URL. Browser-dashboard login cookies do not authenticate
 these routes.
 

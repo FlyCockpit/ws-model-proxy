@@ -135,6 +135,8 @@ export const db = prisma as unknown as {
     findUniqueOrThrow: MockInstance;
   };
   capacityAuditEvent: { create: MockInstance };
+  inferenceContribution: { findMany: MockInstance };
+  deploymentConfig: { findMany: MockInstance; updateMany: MockInstance };
   cacheAffinityNode: { count: MockInstance; deleteMany: MockInstance };
   cacheAffinityRecord: {
     count: MockInstance;

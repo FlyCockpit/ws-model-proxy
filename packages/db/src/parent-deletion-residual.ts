@@ -78,6 +78,9 @@ export const HISTORY_DRAIN_EDGES = {
     ],
     internal: [],
   },
+  cache_affinity_residency: { delete: [["userId", "user"]], internal: [] },
+  cache_affinity_scope: { delete: [["userId", "user"]], internal: [] },
+  cache_affinity_observer: { delete: [["userId", "user"]], internal: [] },
   cache_affinity_node: {
     delete: [
       ["userId", "user"],

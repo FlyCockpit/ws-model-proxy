@@ -1,7 +1,6 @@
 import { ORPCError } from "@orpc/server";
 import { cliDeviceDisplayName } from "@ws-model-proxy/config/cli-device-name";
 import { directModelId, poolModelId } from "@ws-model-proxy/config/forwarder-identifiers";
-import { OVERVIEW_RANGE_CONFIG } from "@ws-model-proxy/config/usage-metrics";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { fenceParentDelete } from "@ws-model-proxy/db/capacity-lock-order";
 import { z } from "zod";
@@ -11,6 +10,7 @@ import {
   deleteCliDeviceAndCredentials,
 } from "../lib/cli-credential-access";
 import { deletionConflict } from "../lib/deletion-conflict";
+import { lockDeploymentNodes, lockDeploymentOwner } from "../lib/deployment-service";
 import {
   deleteOrphanAutoCapacities,
   refreshSharedAutoCapacities,
@@ -24,6 +24,8 @@ import {
 import { describeSeries } from "../lib/metric-routing";
 import {
   assertUsableBudgetWrite,
+  gpuBudgetJson,
+  type NodeMetricsMinuteRow,
   nodeLabelsSchema,
   nodeUsableBudgetsInputSchema,
   normalizeNodeLabels,
@@ -37,6 +39,7 @@ import {
   discoveredModelPoolMemberWhere,
   poolIdsWithMembers,
 } from "../lib/pool-capability-impact";
+import { invalidatePoolRouting } from "../lib/pool-routing-invalidation";
 import { serializeRemoteEngineAdapters } from "../lib/remote-engine-adapters";
 import { runCapacityDeleteTransaction } from "../lib/serializable-transaction";
 import {
@@ -153,32 +156,46 @@ async function loadNodeMetricsHistories(input: {
   cliDeviceId: string;
   now: Date;
 }) {
-  const window7d = overviewWindow("7d", input.now);
-  const window24h = overviewWindow("24h", input.now);
-  const hourAgo = new Date(input.now.getTime() - OVERVIEW_RANGE_CONFIG["1h"].durationMs);
-  try {
-    const rows = await prisma.nodeMetricsMinute.findMany({
-      where: {
-        ownerUserId: input.ownerUserId,
-        cliDeviceId: input.cliDeviceId,
-        bucketStart: { gte: window7d.start, lt: window7d.end },
-      },
-      orderBy: { bucketStart: "asc" },
-    });
-    const list = Array.isArray(rows) ? rows : [];
-    return {
-      minuteHistory: list.flatMap((row) => {
-        const start = row.bucketStart instanceof Date ? row.bucketStart : new Date(row.bucketStart);
-        if (start.getTime() < hourAgo.getTime()) return [];
-        const point = tryShapeNodeMetricsMinute(row);
-        return point ? [point] : [];
-      }),
-      history24h: shapeNodeMetricsRange(list, window24h),
-      history7d: shapeNodeMetricsRange(list, window7d),
-    };
-  } catch {
-    return { minuteHistory: [], history24h: [], history7d: [] };
-  }
+  // Each query filters one owner/device and exact window. The planner may use
+  // an owner/time or device/time index; physical scans depend on that choice.
+  // Only SQL buckets cross the DB boundary (60 + 96 + 168 max).
+  const read = async (range: "1h" | "24h" | "7d") => {
+    const window = overviewWindow(range, input.now);
+    const rows = await prisma.$queryRaw<NodeMetricsMinuteRow[]>`
+      SELECT
+        ${window.start}::timestamp +
+          FLOOR(EXTRACT(EPOCH FROM ("bucketStart" - ${window.start}::timestamp))
+            * 1000 / ${window.bucketMs}) * ${window.bucketMs} * INTERVAL '1 millisecond'
+          AS "bucketStart",
+        SUM(samples)::double precision AS samples,
+        SUM("cpuSamples")::double precision AS "cpuSamples",
+        MIN("minCpuPercent") AS "minCpuPercent",
+        SUM("sumCpuPercent") AS "sumCpuPercent",
+        MAX("maxCpuPercent") AS "maxCpuPercent",
+        SUM("memorySamples")::double precision AS "memorySamples",
+        MIN("minMemoryAvailableMiB") AS "minMemoryAvailableMiB",
+        SUM("sumMemoryAvailableMiB") AS "sumMemoryAvailableMiB",
+        MAX("maxMemoryAvailableMiB") AS "maxMemoryAvailableMiB",
+        MIN("minMemoryUsedPercent") AS "minMemoryUsedPercent",
+        SUM("sumMemoryUsedPercent") AS "sumMemoryUsedPercent",
+        MAX("maxMemoryUsedPercent") AS "maxMemoryUsedPercent",
+        MAX("maxGpuTemperatureC") AS "maxGpuTemperatureC",
+        MAX("maxGpuUtilizationPercent") AS "maxGpuUtilizationPercent"
+      FROM node_metrics_minute
+      WHERE "ownerUserId" = ${input.ownerUserId} AND "cliDeviceId" = ${input.cliDeviceId}
+        AND "bucketStart" >= ${window.start} AND "bucketStart" < ${window.end}
+      GROUP BY 1 ORDER BY 1 LIMIT ${window.bucketCount}`;
+    return { rows, window };
+  };
+  const [minute, day, week] = await Promise.all([read("1h"), read("24h"), read("7d")]);
+  return {
+    minuteHistory: minute.rows.flatMap((row) => {
+      const point = tryShapeNodeMetricsMinute(row);
+      return point ? [point] : [];
+    }),
+    history24h: shapeNodeMetricsRange(day.rows, day.window),
+    history7d: shapeNodeMetricsRange(week.rows, week.window),
+  };
 }
 
 async function removeOwnedRow({
@@ -362,7 +379,7 @@ export const cliDeviceProcedures = {
    * freshest `node.metrics` (live from the relay session, else the stored
    * once-a-minute snapshot), live engine load per endpoint, the node-card
    * snapshot (labels, usable budgets, health warnings), last-hour minute
-   * history, and 24h/7d sparkline series from the 7-day minutes. Read-only.
+   * history, and 24h/7d sparkline series aggregated in SQL. Read-only.
    * Label and budget writes are dashboard-only.
    */
   getCliDeviceMetrics: protectedProcedure
@@ -461,59 +478,67 @@ export const cliDeviceProcedures = {
         ),
     )
     .handler(async ({ input, context }) => {
-      const row = await prisma.cliDevice.findUnique({
-        where: { id: input.cliDeviceId },
-        select: {
-          id: true,
-          userId: true,
-          reportedHumanTerminal: true,
-          reportedMcpCommandMode: true,
-          reportedMcpFileRead: true,
-          reportedFileRoots: true,
-          reportedTerminalSupported: true,
-        },
-      });
-      if (!row || row.userId !== context.session.user.id) {
-        throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
-      }
-      if (
-        input.humanTerminal === true &&
-        (row.reportedHumanTerminal !== true || row.reportedTerminalSupported !== true)
-      ) {
-        throw new ORPCError("BAD_REQUEST", {
-          message: "Browser terminal cannot be enabled until this CLI reports support.",
+      if (context.services?.deploymentActor)
+        throw new ORPCError("FORBIDDEN", { message: "Feature grants require a human." });
+      const updated = await prisma.$transaction(async (tx) => {
+        await lockDeploymentOwner(tx, context.session.user.id);
+        await lockDeploymentNodes(tx, [input.cliDeviceId]);
+        const row = await tx.cliDevice.findUnique({
+          where: { id: input.cliDeviceId },
+          select: {
+            id: true,
+            userId: true,
+            reportedHumanTerminal: true,
+            reportedMcpCommandMode: true,
+            reportedMcpFileRead: true,
+            reportedFileRoots: true,
+            reportedTerminalSupported: true,
+          },
         });
-      }
-      if (
-        input.mcpCommandMode !== undefined &&
-        input.mcpCommandMode !== "off" &&
-        !mcpCommandModeAtLeast(
-          mcpCommandModeFromDb(row.reportedMcpCommandMode ?? null),
-          input.mcpCommandMode,
-        )
-      ) {
-        throw new ORPCError("BAD_REQUEST", {
-          message: `MCP commands cannot be set to ${input.mcpCommandMode} until this CLI reports that mode (wsmp config set-mcp-commands).`,
+        if (!row || row.userId !== context.session.user.id) {
+          throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+        }
+        if (
+          input.humanTerminal === true &&
+          (row.reportedHumanTerminal !== true || row.reportedTerminalSupported !== true)
+        ) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "Browser terminal cannot be enabled until this CLI reports support.",
+          });
+        }
+        if (
+          input.mcpCommandMode !== undefined &&
+          input.mcpCommandMode !== "off" &&
+          !mcpCommandModeAtLeast(
+            mcpCommandModeFromDb(row.reportedMcpCommandMode ?? null),
+            input.mcpCommandMode,
+          )
+        ) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: `MCP commands cannot be set to ${input.mcpCommandMode} until this CLI reports that mode (wsmp config set-mcp-commands).`,
+          });
+        }
+        if (
+          input.fileRead === true &&
+          (row.reportedMcpFileRead !== true || row.reportedFileRoots !== true)
+        ) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: "File reading requires the CLI read switch and configured file roots.",
+          });
+        }
+        return tx.cliDevice.update({
+          where: { id: row.id },
+          data: {
+            ...(input.fileRead !== undefined ? { mcpFileRead: input.fileRead } : {}),
+            ...(input.humanTerminal !== undefined
+              ? { allowHumanTerminal: input.humanTerminal }
+              : {}),
+            ...(input.mcpCommandMode !== undefined
+              ? { mcpCommandMode: mcpCommandModeToDb(input.mcpCommandMode) }
+              : {}),
+          },
+          select: { id: true, allowHumanTerminal: true, mcpCommandMode: true, mcpFileRead: true },
         });
-      }
-      if (
-        input.fileRead === true &&
-        (row.reportedMcpFileRead !== true || row.reportedFileRoots !== true)
-      ) {
-        throw new ORPCError("BAD_REQUEST", {
-          message: "File reading requires the CLI read switch and configured file roots.",
-        });
-      }
-      const updated = await prisma.cliDevice.update({
-        where: { id: row.id },
-        data: {
-          ...(input.fileRead !== undefined ? { mcpFileRead: input.fileRead } : {}),
-          ...(input.humanTerminal !== undefined ? { allowHumanTerminal: input.humanTerminal } : {}),
-          ...(input.mcpCommandMode !== undefined
-            ? { mcpCommandMode: mcpCommandModeToDb(input.mcpCommandMode) }
-            : {}),
-        },
-        select: { id: true, allowHumanTerminal: true, mcpCommandMode: true, mcpFileRead: true },
       });
       await context.services?.onCliFeatureGrantsChanged?.(updated.id);
       return {
@@ -531,25 +556,32 @@ export const cliDeviceProcedures = {
   setCliDeviceLabels: protectedProcedure
     .input(z.object({ cliDeviceId: idSchema, labels: nodeLabelsSchema }))
     .handler(async ({ input, context }) => {
-      const owned = await prisma.cliDevice.findUnique({
-        where: { id: input.cliDeviceId },
-        select: { id: true, userId: true },
-      });
-      if (!owned || owned.userId !== context.session.user.id) {
-        throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
-      }
-      const labels = normalizeNodeLabels(input.labels);
-      const row = await prisma.cliDevice.update({
-        where: { id: owned.id },
-        data: { labels },
-        select: {
-          labels: true,
-          nodeInfo: true,
-          nodeMetrics: true,
-          usableMemoryGb: true,
-          usableRamGb: true,
-          usableVramGb: true,
-        },
+      if (context.services?.deploymentActor)
+        throw new ORPCError("FORBIDDEN", { message: "Placement labels require a human." });
+      const { owned, row } = await prisma.$transaction(async (tx) => {
+        await lockDeploymentOwner(tx, context.session.user.id);
+        await lockDeploymentNodes(tx, [input.cliDeviceId]);
+        const owned = await tx.cliDevice.findUnique({
+          where: { id: input.cliDeviceId },
+          select: { id: true, userId: true },
+        });
+        if (!owned || owned.userId !== context.session.user.id) {
+          throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+        }
+        const labels = input.labels;
+        const row = await tx.cliDevice.update({
+          where: { id: owned.id },
+          data: { labels },
+          select: {
+            labels: true,
+            nodeInfo: true,
+            nodeMetrics: true,
+            usableMemoryGb: true,
+            usableRamGb: true,
+            usableVramGb: true,
+          },
+        });
+        return { owned, row };
       });
       const live = context.services?.getLiveNodeTelemetry?.([owned.id]).get(owned.id) ?? null;
       return {
@@ -576,43 +608,51 @@ export const cliDeviceProcedures = {
         ),
     )
     .handler(async ({ input, context }) => {
-      const owned = await prisma.cliDevice.findUnique({
-        where: { id: input.cliDeviceId },
-        select: { id: true, userId: true, nodeInfo: true },
-      });
-      if (!owned || owned.userId !== context.session.user.id) {
-        throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
-      }
-      const invalid = assertUsableBudgetWrite(parseNodeInfo(owned.nodeInfo), {
-        usableMemoryGb: input.usableMemoryGb,
-        usableRamGb: input.usableRamGb,
-        usableVramGb: input.usableVramGb,
-      });
-      if (invalid) {
-        throw new ORPCError("BAD_REQUEST", {
-          message: invalid.message,
-          data: { fields: invalid.fields },
+      if (context.services?.deploymentActor)
+        throw new ORPCError("FORBIDDEN", { message: "Usable budgets require a human." });
+      const { owned, row } = await prisma.$transaction(async (tx) => {
+        await lockDeploymentOwner(tx, context.session.user.id);
+        await lockDeploymentNodes(tx, [input.cliDeviceId]);
+        const owned = await tx.cliDevice.findUnique({
+          where: { id: input.cliDeviceId },
+          select: { id: true, userId: true, nodeInfo: true },
         });
-      }
-      const row = await prisma.cliDevice.update({
-        where: { id: owned.id },
-        data: {
-          ...(input.usableMemoryGb !== undefined ? { usableMemoryGb: input.usableMemoryGb } : {}),
-          ...(input.usableRamGb !== undefined ? { usableRamGb: input.usableRamGb } : {}),
-          ...(input.usableVramGb !== undefined
-            ? {
-                usableVramGb: input.usableVramGb === null ? Prisma.DbNull : input.usableVramGb,
-              }
-            : {}),
-        },
-        select: {
-          labels: true,
-          nodeInfo: true,
-          nodeMetrics: true,
-          usableMemoryGb: true,
-          usableRamGb: true,
-          usableVramGb: true,
-        },
+        if (!owned || owned.userId !== context.session.user.id) {
+          throw new ORPCError("NOT_FOUND", { message: "CLI device not found." });
+        }
+        const invalid = assertUsableBudgetWrite(parseNodeInfo(owned.nodeInfo), {
+          usableMemoryGb: input.usableMemoryGb,
+          usableRamGb: input.usableRamGb,
+          usableVramGb: input.usableVramGb,
+        });
+        if (invalid) {
+          throw new ORPCError("BAD_REQUEST", {
+            message: invalid.message,
+            data: { fields: invalid.fields },
+          });
+        }
+        const row = await tx.cliDevice.update({
+          where: { id: owned.id },
+          data: {
+            ...(input.usableMemoryGb !== undefined ? { usableMemoryGb: input.usableMemoryGb } : {}),
+            ...(input.usableRamGb !== undefined ? { usableRamGb: input.usableRamGb } : {}),
+            ...(input.usableVramGb !== undefined
+              ? {
+                  usableVramGb:
+                    input.usableVramGb === null ? Prisma.DbNull : gpuBudgetJson(input.usableVramGb),
+                }
+              : {}),
+          },
+          select: {
+            labels: true,
+            nodeInfo: true,
+            nodeMetrics: true,
+            usableMemoryGb: true,
+            usableRamGb: true,
+            usableVramGb: true,
+          },
+        });
+        return { owned, row };
       });
       const live = context.services?.getLiveNodeTelemetry?.([owned.id]).get(owned.id) ?? null;
       return {
@@ -647,6 +687,16 @@ export const cliDeviceProcedures = {
   removeCliDeviceMetadata: protectedProcedure
     .input(z.object({ id: idSchema, staleBefore: z.date().optional() }))
     .handler(async ({ input, context }) => {
+      const members = await prisma.poolMember.findMany({
+        where: {
+          OR: [
+            { DiscoveredModel: { Endpoint: { cliDeviceId: input.id } } },
+            { ExecutionTarget: { DiscoveredModel: { Endpoint: { cliDeviceId: input.id } } } },
+          ],
+        },
+        select: { poolId: true },
+        distinct: ["poolId"],
+      });
       // Revokes the device's CLI tokens and deletes its device credentials in
       // the same transaction as the device, then closes their live sessions.
       const { revoked } = await deleteCliDeviceAndCredentials({
@@ -657,19 +707,38 @@ export const cliDeviceProcedures = {
       for (const credentials of revoked) {
         await closeRevokedCliCredentialSessions(context.services, credentials);
       }
+      await invalidatePoolRouting(
+        context.services,
+        members.map((member) => member.poolId),
+      );
       return { deleted: true };
     }),
 
   removeEndpointMetadata: protectedProcedure
     .input(z.object({ id: idSchema, staleBefore: z.date().optional() }))
-    .handler(({ input, context }) =>
-      removeOwnedRow({
+    .handler(async ({ input, context }) => {
+      const members = await prisma.poolMember.findMany({
+        where: {
+          OR: [
+            { DiscoveredModel: { endpointId: input.id } },
+            { ExecutionTarget: { DiscoveredModel: { endpointId: input.id } } },
+          ],
+        },
+        select: { poolId: true },
+        distinct: ["poolId"],
+      });
+      const removed = await removeOwnedRow({
         kind: "endpoint",
         id: input.id,
         userId: context.session.user.id,
         staleBefore: input.staleBefore,
-      }),
-    ),
+      });
+      await invalidatePoolRouting(
+        context.services,
+        members.map((member) => member.poolId),
+      );
+      return removed;
+    }),
 
   removeDiscoveredModelMetadata: protectedProcedure
     .input(z.object({ id: idSchema, staleBefore: z.date().optional() }))
@@ -682,12 +751,20 @@ export const cliDeviceProcedures = {
         context.session.user.id,
         discoveredModelPoolMemberWhere(input.id),
       );
+      const contributionPools = await prisma.inferenceContribution.findMany({
+        where: { discoveredModelId: input.id },
+        select: { poolId: true },
+      });
       const removed = await removeOwnedRow({
         kind: "discoveredModel",
         id: input.id,
         userId: context.session.user.id,
         staleBefore: input.staleBefore,
       });
+      await invalidatePoolRouting(context.services, [
+        ...poolIds,
+        ...contributionPools.map((offer) => offer.poolId),
+      ]);
       return {
         ...removed,
         impactedPools: await capabilityEditImpactedPools(prisma, {

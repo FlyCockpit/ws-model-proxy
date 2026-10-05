@@ -265,7 +265,35 @@ describe("sanitizeValidationIssues", () => {
         suggestions: ["fallbackEnabled", "poolId"],
       },
     ]);
-    expect(fieldsFromValidationIssues(suggested ?? [])).toEqual(["fallbackEnabled", "poolId"]);
+    expect(fieldsFromValidationIssues(suggested ?? [])).toEqual([]);
+  });
+
+  it("suggests declared names for an unknown key nested inside an object", () => {
+    const issues = sanitize(
+      [
+        {
+          code: "unrecognized_keys",
+          path: ["rules", 0],
+          keys: ["treshold", PLAIN_SECRET],
+          message: `Unrecognized keys: "treshold", "${PLAIN_SECRET}"`,
+        },
+      ],
+      new Set(["rules", "threshold", "poolId"]),
+    );
+    expect(issues).toEqual([
+      {
+        path: ["rules", 0],
+        code: "unrecognized_keys",
+        message: "Unrecognized field",
+        unknownKeyCount: 2,
+        suggestions: ["threshold"],
+      },
+    ]);
+    expect(JSON.stringify(issues)).not.toContain(PLAIN_SECRET);
+    expect(JSON.stringify(issues)).not.toContain("treshold");
+    // The failing object is named by its own path; suggestions never enter fields.
+    expect(fieldsFromValidationIssues(issues ?? [])).toEqual(["rules.0"]);
+    expect(formatValidationIssues(issues ?? [])).not.toContain(PLAIN_SECRET);
   });
 
   it("bounds unrecognized-key suggestion work", () => {
@@ -277,7 +305,7 @@ describe("sanitizeValidationIssues", () => {
       known,
     );
     expect(Date.now() - started).toBeLessThan(250);
-    expect(issues?.[0]?.unknownKeyCount).toBe(20);
+    expect(issues?.[0]?.unknownKeyCount).toBe(400);
     expect((issues?.[0]?.suggestions ?? []).length).toBeLessThanOrEqual(5);
   });
 
@@ -325,6 +353,9 @@ describe("sanitizeValidationIssues", () => {
     ).toBe("Effective concurrency limit exceeds physical capacity.");
     expect(sanitizeArgumentMessage(SECRET)).toBe("[redacted]");
     expect(sanitizeArgumentMessage("line\nbreak")).toBeNull();
+    // Invisible format characters could make a copied message read differently.
+    for (const hidden of ["\u202e", "\u200b", "\ufeff", "\u2066"])
+      expect(sanitizeArgumentMessage(`Limit ${hidden}exceeded`)).toBeNull();
   });
 
   it("maps an unknown code to 'invalid' with a fixed message", () => {

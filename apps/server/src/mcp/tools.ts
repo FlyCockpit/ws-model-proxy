@@ -489,7 +489,7 @@ export async function runManifestTool(
         requestId,
       });
       return toolError(`Invalid input: field "${error.field}" must be an ISO-8601 timestamp.`, {
-        error: { code: "INVALID_INPUT", field: error.field },
+        error: { code: "invalid_input", fields: [error.field] },
       });
     }
     if (error instanceof McpCliCommandRejectedError) {
@@ -686,6 +686,9 @@ function mapToolError(
               guardedPoolCreateReasonOf(error) ?? undefined,
             );
           }
+          const argumentReason = guardedPoolCreateReasonOf(error);
+          if (argumentReason !== null)
+            return toolError(stable, { error: { code: "invalid_input", reason: argumentReason } });
         }
         const reason = deletionConflictReasonOf(error);
         if (reason !== null) {

@@ -11,7 +11,7 @@ use crate::config::{
 };
 pub use crate::terminal_identity::TerminalIdentityProof;
 
-pub const RELAY_PROTOCOL_VERSION: &str = "2.4";
+pub const RELAY_PROTOCOL_VERSION: &str = "2.10";
 #[cfg(test)]
 const TEST_IDENTITY_PUBLIC_KEY: &str =
     "BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A";
@@ -556,9 +556,15 @@ pub struct TerminalFeatureSnapshot {
     pub terminal_identity: Option<TerminalIdentityProof>,
 }
 
+fn deployment_disabled(value: &bool) -> bool {
+    !value
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CliReportedFeatures {
+    #[serde(skip_serializing_if = "deployment_disabled")]
+    pub deployments: bool,
     pub human_terminal: bool,
     pub mcp_command_mode: McpCommandMode,
     pub terminal_approval: bool,
@@ -594,6 +600,7 @@ impl CliCapabilities {
     pub fn from_snapshot(snapshot: &TerminalFeatureSnapshot) -> Self {
         Self {
             features: CliReportedFeatures {
+                deployments: false,
                 human_terminal: snapshot.allow_human_terminal,
                 mcp_command_mode: snapshot.mcp_command_mode,
                 terminal_approval: snapshot.require_terminal_approval,
@@ -617,6 +624,8 @@ pub fn terminal_supported() -> bool {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EndpointInventory {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_instance_id: Option<String>,
     pub slug: String,
     pub label: String,
     pub kind: String,
@@ -827,6 +836,12 @@ pub struct NodeInterfaceInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExecutionMechanism {
+    #[serde(rename = "systemd+linger")]
+    SystemdLinger,
+    #[serde(rename = "systemd-no-linger")]
+    SystemdNoLinger,
+    Macos,
+    Unsupported,
     Foreground,
     Systemd,
     Launchd,
@@ -1101,6 +1116,8 @@ pub struct TerminalIdentity {
     rename_all_fields = "camelCase"
 )]
 enum KnownServerControlMessage {
+    #[serde(rename = "deployment.instances.ok")]
+    DeploymentInstancesOk { snapshot_id: String },
     #[serde(rename = "hello.challenge")]
     HelloChallenge {
         nonce: String,
@@ -1318,6 +1335,9 @@ impl SupervisedSpawn {
 
 #[derive(Debug, Clone)]
 pub enum ServerControlMessage {
+    DeploymentInstancesOk {
+        snapshot_id: String,
+    },
     HelloOk {
         id: String,
         protocol_version: String,
@@ -1665,6 +1685,7 @@ pub fn endpoint_inventory_with(
         default_capabilities.advertise_top_k();
     }
     EndpointInventory {
+        deployment_instance_id: None,
         slug: endpoint.slug.clone(),
         label: endpoint.label.clone(),
         kind: match endpoint.kind {
@@ -1861,8 +1882,25 @@ pub fn parse_server_control(text: &str) -> Result<ServerControlMessage> {
             anyhow::bail!("term.spawn carries an unknown field");
         }
     }
+    if type_name == "deployment.instances.ok" {
+        let object = value
+            .as_object()
+            .context("deployment inventory acknowledgement is not an object")?;
+        anyhow::ensure!(
+            object
+                .keys()
+                .all(|key| key == "type" || key == "snapshotId"),
+            "deployment inventory acknowledgement carries an unknown field"
+        );
+    }
     let known: KnownServerControlMessage =
         serde_json::from_value(value).context("parsing relay server control frame")?;
+    if let KnownServerControlMessage::DeploymentInstancesOk { snapshot_id } = &known {
+        anyhow::ensure!(
+            snapshot_id.len() == 32 && snapshot_id.bytes().all(|byte| byte.is_ascii_alphanumeric()),
+            "invalid deployment inventory acknowledgement"
+        );
+    }
     if let KnownServerControlMessage::MetricsSourcesSet { sources, .. } = &known {
         validate_remote_metric_sources(sources)?;
     }
@@ -1916,6 +1954,7 @@ fn known_server_frame(type_name: &str) -> bool {
     matches!(
         type_name,
         "hello.challenge"
+            | "deployment.instances.ok"
             | "hello.ok"
             | "inventory.ok"
             | "inventory.error"
@@ -1942,6 +1981,9 @@ fn known_server_frame(type_name: &str) -> bool {
 impl From<KnownServerControlMessage> for ServerControlMessage {
     fn from(message: KnownServerControlMessage) -> Self {
         match message {
+            KnownServerControlMessage::DeploymentInstancesOk { snapshot_id } => {
+                Self::DeploymentInstancesOk { snapshot_id }
+            }
             KnownServerControlMessage::HelloChallenge { nonce, origin } => {
                 Self::HelloChallenge { nonce, origin }
             }
@@ -2139,6 +2181,7 @@ mod inventory_digest_tests {
     #[test]
     fn inventory_digest_matches_shared_nonempty_snapshot_vector() {
         let endpoints = vec![EndpointInventory {
+            deployment_instance_id: None,
             slug: "example".to_string(),
             label: "Example".to_string(),
             kind: "openai-compatible".to_string(),
@@ -2482,6 +2525,21 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deployment_commit_ack_decoder_is_strict_and_bounded() {
+        let valid =
+            serde_json::json!({ "type": "deployment.instances.ok", "snapshotId": "A".repeat(32) });
+        assert!(
+            matches!(super::parse_server_control(&valid.to_string()).expect("ACK"), super::ServerControlMessage::DeploymentInstancesOk { snapshot_id } if snapshot_id == "A".repeat(32))
+        );
+        for invalid in [
+            serde_json::json!({ "type": "deployment.instances.ok", "snapshotId": "old" }),
+            serde_json::json!({ "type": "deployment.instances.ok", "snapshotId": "A".repeat(32), "extra": true }),
+            serde_json::json!({ "type": "deployment.instances.ok" }),
+        ] {
+            assert!(super::parse_server_control(&invalid.to_string()).is_err());
+        }
+    }
     use super::*;
 
     #[test]
@@ -2627,6 +2685,7 @@ mod tests {
                 }),
             },
             endpoints: vec![EndpointInventory {
+                deployment_instance_id: None,
                 slug: "local".to_string(),
                 label: "Local".to_string(),
                 kind: "openai-compatible".to_string(),
@@ -2640,7 +2699,7 @@ mod tests {
 
         let encoded = encode_control(&message).expect("encode");
 
-        assert!(encoded.contains(r#""protocolVersion":"2.4""#));
+        assert!(encoded.contains(&format!(r#""protocolVersion":"{RELAY_PROTOCOL_VERSION}""#)));
         assert!(!encoded.contains(r#""nodeTelemetry""#));
         assert!(!encoded.contains(r#""fileOps""#));
         assert!(!encoded.contains(r#""countContext""#));
@@ -2923,7 +2982,10 @@ mod tests {
     #[test]
     fn an_older_server_rejection_says_to_upgrade_the_server() {
         let message = hello_rejection_message(OLDER_SERVER_HELLO_REJECTION, None);
-        assert!(message.contains("rejected relay protocol 2.4"), "{message}");
+        assert!(
+            message.contains(&format!("rejected relay protocol {RELAY_PROTOCOL_VERSION}")),
+            "{message}"
+        );
         assert!(
             message.contains("upgrade the WS Model Proxy server"),
             "{message}"
@@ -2943,7 +3005,7 @@ mod tests {
     fn a_future_server_upgrade_required_reply_stays_a_cli_too_old_error() {
         // A coded `upgrade_cli` from a newer server still names the CLI.
         let reply =
-            "This server requires a newer wsmp (relay protocol 2.5). Upgrade wsmp and restart it.";
+            "This server requires a newer wsmp (relay protocol 3.0). Upgrade wsmp and restart it.";
         assert_eq!(
             hello_rejection_message(reply, Some(&ProtocolErrorCode::UpgradeCli)),
             format!("relay protocol error: {reply}")
@@ -3443,10 +3505,11 @@ mod relay_24_vectors {
             },
             endpoints: vec![inventory(&vllm), inventory(&llama)],
         };
-        assert_eq!(
-            encoded(&hello),
-            vector(include_str!("../tests/fixtures/relay-2.4/hello.json"))
-        );
+        let mut legacy_vector = vector(include_str!("../tests/fixtures/relay-2.4/hello.json"));
+        // Other fields remain the shared historical wire vector. Only the
+        // negotiated current protocol changes in this release.
+        legacy_vector["protocolVersion"] = RELAY_PROTOCOL_VERSION.into();
+        assert_eq!(encoded(&hello), legacy_vector);
     }
 
     #[test]
@@ -3878,6 +3941,7 @@ mod relay_24_vectors {
             }),
         };
         let endpoint = |models: usize| EndpointInventory {
+            deployment_instance_id: None,
             slug: "router".to_string(),
             label: "Router".to_string(),
             kind: "openai-compatible".to_string(),

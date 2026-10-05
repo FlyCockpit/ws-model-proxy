@@ -366,7 +366,7 @@ export const POOL_EXTERNAL_WAIT_COST_NOTICE =
 
 /** Cost statement for the per-token `:external` wait (issue #181). */
 export const TOKEN_EXTERNAL_WAIT_COST_NOTICE =
-  "COST: externalAfterWaitMs is how long this token's :external requests wait for local capacity before they may be sent to a paid external provider. Lower values spend more. Null uses each pool's setting. Pool externalAfterWaitMs is an owner floor: callers may only lengthen, up to the pool's local capacity wait budget. A request may also send x-wsmp-external-after-wait-ms; that override cannot go below the pool floor or past the local wait budget. Grantees cannot shorten below the pool floor. The stored value is 0..600000; each request still applies the floor and budget for that pool. Every change is recorded as a TOKEN_EXTERNAL_WAIT_UPDATED provider audit event. MCP diagnostics cannot use :external.";
+  "COST: externalAfterWaitMs is how long this token's :external requests wait for local capacity before they may be sent to a paid external provider. Lower values spend more. Null uses each pool's setting. Pool externalAfterWaitMs is an owner floor: callers may only lengthen, up to the pool's local capacity wait budget. A request may also send x-wsmp-external-after-wait-ms; that override cannot go below the pool floor or past the local wait budget. Neither owners nor grantees can shorten requests below the pool floor. The stored value is 0..600000; each request still applies the floor and budget for that pool. Every change is recorded as a TOKEN_EXTERNAL_WAIT_UPDATED provider audit event. MCP diagnostics cannot use :external.";
 
 /** Cost statement for per-grantee owner-paid `:external` spend caps (#182). */
 export const POOL_GRANT_SPEND_CAP_COST_NOTICE =
@@ -438,7 +438,7 @@ const PROVIDER_EGRESS_FEATURE = "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED";
 // ---------------------------------------------------------------------------
 
 /**
- * One node file tool (relay 2.8, #103) as an authored spec; `buildDescriptor`
+ * One node file tool (relay 2.9, #103) as an authored spec; `buildDescriptor`
  * generates its `inputSchema` (#117) from `coreShape`. Read-class tools are
  * scope `read`, pure, unconfirmed; write-class tools are scope `write`,
  * external, `RUN` (`DELETE` for delete). All nine are extracted cores that go
@@ -481,6 +481,66 @@ function fileToolSpec(name: FileToolName): McpToolSpec {
 }
 
 const READ_TOOLS: readonly McpToolSpec[] = [
+  {
+    name: "deployment_configs_list",
+    target: "deployments.listConfigs",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.listConfigs),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "deployment_config_get",
+    target: "deployments.getConfig",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.getConfig),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "deployment_instances_list",
+    target: "deployments.listInstances",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.listInstances),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "deployment_instance_get",
+    target: "deployments.getInstance",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.getInstance),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "deployment_plan_status",
+    target: "deployments.planStatus",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.planStatus),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "inference_contributions_list",
+    target: "inferenceContributions.list",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.inferenceContributions.list),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
   {
     name: "app_config_get",
     target: "appConfig",
@@ -790,7 +850,7 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.overview.health),
   },
-  // --- node file tools, read class (relay 2.8; PAT-only) ---
+  // --- node file tools, read class (relay 2.9; PAT-only) ---
   fileToolSpec("forwarder_cli_file_read"),
   fileToolSpec("forwarder_cli_file_stat"),
   fileToolSpec("forwarder_cli_dir_list"),
@@ -814,6 +874,66 @@ const READ_TOOLS: readonly McpToolSpec[] = [
 const CHAT_MESSAGES_SCHEMA = z.array(z.unknown());
 
 const WRITE_TOOLS: readonly McpToolSpec[] = [
+  {
+    name: "deployment_config_create",
+    target: "deployments.createConfig",
+    scope: "write",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.createConfig),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "deployment_config_update",
+    target: "deployments.updateConfig",
+    scope: "write",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.updateConfig),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "deployment_plan_start",
+    target: "deployments.planStart",
+    scope: "write",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.planStart),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "deployment_plan_stop",
+    target: "deployments.planStop",
+    scope: "write",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.planStop),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "deployment_plan_apply",
+    target: "deployments.applyPlan",
+    scope: "write",
+    confirmation: "RUN",
+    classification: "external",
+    invokeProcedure: procedureInvoker((client) => client.deployments.applyPlan),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "inference_contribution_revoke",
+    target: "inferenceContributions.revoke",
+    scope: "write",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.inferenceContributions.revoke),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
   // --- forwarder management (writes) ---
   {
     name: "forwarder_guarded_pool_create",
@@ -1427,7 +1547,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     inputAdapter: adaptCliCommandResultInput,
     invokeCore: (input, deps) => runForwarderCliCommandResult(input, deps),
   },
-  // --- node file tools, write class (relay 2.8; PAT-only) ---
+  // --- node file tools, write class (relay 2.9; PAT-only) ---
   fileToolSpec("forwarder_cli_file_edit"),
   fileToolSpec("forwarder_cli_file_write"),
   fileToolSpec("forwarder_cli_file_rename"),
@@ -1436,8 +1556,8 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
 ];
 
 /**
- * The checked catalog: exactly 37 read tools and 63 write tools
- * (86 procedure-backed + 14 extracted cores: 2 diagnostics, 3 CLI commands
+ * The checked catalog: exactly 43 read tools and 70 write tools
+ * (99 procedure-backed + 14 extracted cores: 2 diagnostics, 3 CLI commands
  * and 9 node file tools (4 read, 5 write)).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS].map(
@@ -1458,6 +1578,23 @@ export interface McpToolExclusion {
 }
 
 export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
+  ...[
+    "deployments.confirmPlan",
+    "deployments.pendingPlans",
+    "deployments.setNodeGrant",
+    "deployments.setAgentsMayPreempt",
+    "inferenceContributions.accept",
+    // Offering lends this user's machine to another owner's pool: consent, not an agent task.
+    "inferenceContributions.offer",
+    "cliCredentials.resetTokenIdentity",
+  ].map((target) => ({
+    target,
+    reason: "Human-only consent or credential identity management; never an agent tool.",
+  })),
+  {
+    target: "deployments.deleteConfig",
+    reason: "Human-only recipe deletion; agents may edit recipes but never delete them.",
+  },
   {
     target: "auth.verifyEmailTransport",
     reason: "Auth-router surface; not a model-proxy operation.",

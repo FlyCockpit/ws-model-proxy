@@ -9,11 +9,18 @@ const state = vi.hoisted(() => ({
   capacityEnabled: true,
   providerEgressEnabled: false,
   flagsStatus: "ready" as "ready" | "pending" | "error",
-  tab: "overview" as "overview" | "fallback" | "routing" | "capacity" | "media" | "access",
+  tab: "overview" as
+    | "overview"
+    | "fallback"
+    | "routing"
+    | "limits"
+    | "media"
+    | "sharing"
+    | "settings",
   detailTab: null as
     | null
     | ((props: {
-        tab: "overview" | "fallback" | "routing" | "capacity" | "media" | "access";
+        tab: "overview" | "fallback" | "routing" | "limits" | "media" | "sharing" | "settings";
       }) => ReactNode),
   pools: [] as Array<Record<string, unknown>>,
   capacities: [] as Array<Record<string, unknown>>,
@@ -22,6 +29,8 @@ const state = vi.hoisted(() => ({
   fallbackAudits: [] as Array<Record<string, unknown>>,
   auditQueryInputs: [] as unknown[],
   engineLoadHistory: { members: [] as unknown[] },
+  traffic: [] as Array<Record<string, unknown>>,
+  navigations: [] as unknown[],
 }));
 
 vi.mock("react-i18next", () => ({
@@ -36,6 +45,10 @@ vi.mock("@tanstack/react-router", async (importOriginal) => {
   const original = await importOriginal<typeof import("@tanstack/react-router")>();
   return {
     ...original,
+    useNavigate: () => (options: unknown) => {
+      state.navigations.push(options);
+      return Promise.resolve();
+    },
     Outlet: () => {
       const DetailTab = state.detailTab;
       return DetailTab ? <DetailTab tab={state.tab} /> : null;
@@ -160,6 +173,7 @@ vi.mock("@/utils/orpc", () => {
         addPoolMember: mutation(),
         updatePoolMember: mutation(),
         removePoolMember: mutation("removePoolMember"),
+        reorderProviderPoolMember: mutation("reorderProviderPoolMember"),
         grantPoolAccessByEmail: mutation(),
         updatePoolGrant: mutation("updatePoolGrant"),
         revokePoolAccessByEmail: mutation(),
@@ -172,6 +186,9 @@ vi.mock("@/utils/orpc", () => {
             return query("poolFallbackAudits", () => state.fallbackAudits).queryOptions();
           },
         },
+      },
+      overview: {
+        metrics: query("overviewMetrics", () => ({ pools: state.traffic })),
       },
       capacityManagement: {
         key: () => ["capacityManagement"],
@@ -222,6 +239,7 @@ afterEach(() => {
   state.capacities = [];
   state.nextReject = null;
   state.mutationCalls = [];
+  state.navigations = [];
   state.fallbackAudits = [];
   state.auditQueryInputs = [];
   state.engineLoadHistory = { members: [] };
@@ -271,6 +289,41 @@ describe("dedicated pool pages", () => {
     ).toBeTruthy();
   });
 
+  it("explains the request flow and summarizes each pool's health and last-day traffic", () => {
+    state.pools = [
+      {
+        id: "pool-busy",
+        slug: "busy",
+        name: "Busy",
+        description: null,
+        canonicalModelId: "owner/busy",
+        effectiveProviderEgress: false,
+        members: [
+          { id: "m1", tier: "PRIMARY", healthStatus: "HEALTHY" },
+          { id: "m2", tier: "PRIMARY", healthStatus: "UNHEALTHY" },
+        ],
+        grants: [{ id: "g1" }],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+      },
+    ];
+    state.traffic = [
+      {
+        poolId: "pool-busy",
+        current: { requests: 1234, errors: 5 },
+        series: [{ values: { m1: 1 } }, { values: { m1: 3, m2: 2 } }],
+      },
+    ];
+    mount(<PoolsListPage lang="en-US" />);
+    expect(screen.getByText("dashboard:pools.flow.cloud")).toBeTruthy();
+    expect(screen.getByText("dashboard:pools.healthSome")).toBeTruthy();
+    expect(screen.getByText("1,234")).toBeTruthy();
+    expect(screen.getByRole("img", { name: "dashboard:pools.trafficTrend" })).toBeTruthy();
+    // Provider operations live on the Cloud providers page, not here.
+    expect(screen.queryByText(/providerOperations|providers\.title/)).toBeNull();
+    state.traffic = [];
+  });
+
   it("links the list edit action to the pool detail route instead of opening a sheet", () => {
     state.pools = [
       {
@@ -318,13 +371,68 @@ describe("dedicated pool pages", () => {
 
     expect(screen.getByRole("button", { name: "dashboard:pools.addMember" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "dashboard:pools.grant" })).toBeTruthy();
-    expect(screen.getByRole("button", { name: "common:actions.delete" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "common:actions.delete" })).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.addMember" }));
     expect(screen.getByText("pool-member-form")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     fireEvent.click(screen.getByRole("button", { name: "dashboard:pools.grant" }));
     expect(screen.getByText("grant-pool-dialog")).toBeTruthy();
+  });
+
+  it("lists cloud fallback providers in order and moves one earlier", async () => {
+    state.providerEgressEnabled = true;
+    state.tab = "fallback";
+    const overflow = (id: string, model: string, publicOrder: number) => ({
+      id,
+      tier: "PUBLIC_OVERFLOW",
+      weight: 1,
+      publicOrder,
+      routingStatus: "ACTIVE",
+      model: null,
+      providerModel: { upstreamModelId: model, ProviderAccount: { label: `${model}-account` } },
+    });
+    state.pools = [
+      {
+        id: "pool-1",
+        slug: "primary",
+        name: "Primary",
+        description: null,
+        canonicalModelId: "owner/pool/primary",
+        fallbackEnabled: true,
+        fallbackForGrantees: false,
+        externalAfterWaitMs: 2000,
+        members: [overflow("m-b", "model-b", 1), overflow("m-a", "model-a", 0)],
+        grants: [],
+        compatibility: { recommendedSurface: null },
+        transformer: { model: null },
+      },
+    ];
+
+    mount(<PoolDetailPage poolId="pool-1" />);
+
+    const rows = screen.getAllByTestId("provider-order-row");
+    expect(rows.map((row) => row.querySelector("code")?.textContent)).toEqual([
+      "model-a",
+      "model-b",
+    ]);
+    const earlier = screen.getAllByRole("button", {
+      name: "dashboard:pools.providerOrder.moveEarlier",
+    }) as HTMLButtonElement[];
+    const later = screen.getAllByRole("button", {
+      name: "dashboard:pools.providerOrder.moveLater",
+    }) as HTMLButtonElement[];
+    expect(earlier.map((button) => button.disabled)).toEqual([true, false]);
+    expect(later.map((button) => button.disabled)).toEqual([false, true]);
+
+    fireEvent.click(earlier[1] as HTMLButtonElement);
+
+    await waitFor(() =>
+      expect(state.mutationCalls).toContainEqual({
+        name: "reorderProviderPoolMember",
+        variables: { id: "m-b", direction: "EARLIER" },
+      }),
+    );
   });
 
   it("renders all detail tab URLs and the fallback empty checklist", () => {
@@ -358,9 +466,10 @@ describe("dedicated pool pages", () => {
       "/en-US/dashboard/pools/pool-1",
       "/en-US/dashboard/pools/pool-1/fallback",
       "/en-US/dashboard/pools/pool-1/routing",
-      "/en-US/dashboard/pools/pool-1/capacity",
+      "/en-US/dashboard/pools/pool-1/limits",
       "/en-US/dashboard/pools/pool-1/media",
-      "/en-US/dashboard/pools/pool-1/access",
+      "/en-US/dashboard/pools/pool-1/sharing",
+      "/en-US/dashboard/pools/pool-1/settings",
     ]);
     expect(screen.getByText("dashboard:pools.fallbackEmpty")).toBeTruthy();
     expect(screen.getByText("dashboard:pools.fallbackSteps.account")).toBeTruthy();
@@ -448,7 +557,7 @@ describe("dedicated pool pages", () => {
     });
 
     it("saves an unprotected override and a queue priority for one grantee", async () => {
-      state.tab = "access";
+      state.tab = "sharing";
       state.pools = [grantPool()];
       mount(<PoolDetailPage poolId="pool-1" />);
 
@@ -481,7 +590,7 @@ describe("dedicated pool pages", () => {
     });
 
     it("loads stored values and saves 'pool default' as null", async () => {
-      state.tab = "access";
+      state.tab = "sharing";
       state.pools = [grantPool({ protectionOverridePercent: 30, queuePriority: 5 })];
       mount(<PoolDetailPage poolId="pool-1" />);
 
@@ -515,7 +624,7 @@ describe("dedicated pool pages", () => {
     });
 
     it("does not validate a hidden percent field (a stale invalid value never blocks save)", async () => {
-      state.tab = "access";
+      state.tab = "sharing";
       state.pools = [grantPool({ protectionOverridePercent: 30, queuePriority: 5 })];
       mount(<PoolDetailPage poolId="pool-1" />);
 
@@ -545,7 +654,7 @@ describe("dedicated pool pages", () => {
     });
 
     it("shows a spend-limit error for invalid input", async () => {
-      state.tab = "access";
+      state.tab = "sharing";
       state.pools = [grantPool()];
       mount(<PoolDetailPage poolId="pool-1" />);
 
@@ -567,7 +676,7 @@ describe("dedicated pool pages", () => {
     });
 
     it("accepts a locale decimal spend limit and rejects grouping", async () => {
-      state.tab = "access";
+      state.tab = "sharing";
       state.pools = [grantPool()];
       mount(<PoolDetailPage poolId="pool-1" />);
 
@@ -608,8 +717,70 @@ describe("dedicated pool pages", () => {
       );
     });
 
+    it("clears an existing spend cap back to null when No cap is chosen", async () => {
+      state.tab = "sharing";
+      state.pools = [
+        grantPool({ fallbackSpend: { limit: "25.5", currency: "EUR", period: "UTC_DAY" } }),
+      ];
+      mount(<PoolDetailPage poolId="pool-1" />);
+
+      fireEvent.click(
+        await screen.findByRole("button", { name: "dashboard:pools.grantRouting.editFor" }),
+      );
+      expect(
+        (screen.getByLabelText("dashboard:pools.grantRouting.spendCap") as HTMLSelectElement).value,
+      ).toBe("SET");
+      // A stale invalid limit is hidden once the cap is off and must not block save.
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.spendLimit"), {
+        target: { value: "1,500" },
+      });
+      fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.spendCap"), {
+        target: { value: "NONE" },
+      });
+      expect(screen.queryByLabelText("dashboard:pools.grantRouting.spendLimit")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+      await waitFor(() =>
+        expect(state.mutationCalls).toContainEqual({
+          name: "updatePoolGrant",
+          variables: {
+            poolId: "pool-1",
+            grantId: "grant-1",
+            protectionOverridePercent: null,
+            queuePriority: null,
+            fallbackSpend: null,
+          },
+        }),
+      );
+    });
+
+    it.each(["0", "0.0", "0.000000000"])(
+      "rejects a zero spend limit (%s) instead of saving an unusable cap",
+      async (limit) => {
+        state.tab = "sharing";
+        state.pools = [grantPool()];
+        mount(<PoolDetailPage poolId="pool-1" />);
+
+        fireEvent.click(
+          await screen.findByRole("button", { name: "dashboard:pools.grantRouting.editFor" }),
+        );
+        fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.spendCap"), {
+          target: { value: "SET" },
+        });
+        fireEvent.change(screen.getByLabelText("dashboard:pools.grantRouting.spendLimit"), {
+          target: { value: limit },
+        });
+        fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+        expect(
+          await screen.findByText("dashboard:pools.grantRouting.spendLimitInvalid"),
+        ).toBeTruthy();
+        expect(state.mutationCalls).toEqual([]);
+      },
+    );
+
     it("saves an owner-paid spend cap for one grantee", async () => {
-      state.tab = "access";
+      state.tab = "sharing";
       state.pools = [grantPool()];
       mount(<PoolDetailPage poolId="pool-1" />);
 
@@ -938,7 +1109,7 @@ describe("dedicated pool pages", () => {
     expect(state.mutationCalls).toEqual([]);
   });
 
-  it("shows stored member policy values and does not mark an override as inherited", () => {
+  it("lists only a member's custom limits and does not mark an override as inherited", () => {
     state.tab = "overview";
     state.pools = [
       {
@@ -982,10 +1153,11 @@ describe("dedicated pool pages", () => {
 
     mount(<PoolDetailPage poolId="pool-1" />);
 
-    const policy = screen.getByText(/dashboard:pools.capacity.modes.override/);
-    expect(policy.textContent).toContain("9");
-    expect(policy.textContent).toContain("16000");
-    expect(policy.textContent).not.toContain("dashboard:pools.inherited");
+    const policy = screen.getByTestId("member-limits");
+    expect(policy.textContent).toContain("dashboard:pools.memberLimits.custom");
+    expect(policy.textContent).toContain("dashboard:pools.capacity.fields.capacityPriority 9");
+    expect(policy.textContent).toContain("16,000");
+    expect(policy.textContent).not.toContain("dashboard:pools.memberLimits.inherited");
   });
 
   it("loads capacity records instead of a deployment-disabled reason", async () => {
@@ -1061,10 +1233,29 @@ describe("delete conflicts on pool pages", () => {
     transformer: { model: null },
   };
 
+  it("returns to the pools list after deleting the pool from Settings", async () => {
+    state.pools = [pool];
+    state.tab = "settings";
+    mountWithAppToasts(<PoolDetailPage poolId="pool-1" />);
+
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.delete" }));
+    fireEvent.click(screen.getByRole("button", { name: "confirm dashboard:pools.deleteTitle" }));
+
+    await waitFor(() =>
+      expect(state.navigations).toEqual([
+        { to: "/$lang/dashboard/pools", params: { lang: "en-US" } },
+      ]),
+    );
+  });
+
   it("shows the in-flight copy when a pool delete is still draining", async () => {
     state.pools = [pool];
     state.nextReject = { name: "deleteModelPool", error: conflict("delete_pending") };
+    state.tab = "settings";
     mountWithAppToasts(<PoolDetailPage poolId="pool-1" />);
+
+    expect(screen.getByText("dashboard:pools.dangerZone.title")).toBeTruthy();
+    expect(screen.getByText("pool-form")).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "common:actions.delete" }));
     fireEvent.click(screen.getByRole("button", { name: "confirm dashboard:pools.deleteTitle" }));

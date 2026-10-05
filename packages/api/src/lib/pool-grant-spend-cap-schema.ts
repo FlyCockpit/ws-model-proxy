@@ -8,8 +8,9 @@ export const poolGrantSpendCapSchema = z
     period: z.enum(["UTC_DAY", "UTC_MONTH"]),
   })
   .superRefine((value, context) => {
-    const amount = Number(value.limit);
-    if (!(amount > 0) || amount >= 1e21) {
+    // The syntax already bounds Decimal(30,9); Number rounds legitimate
+    // 21-digit values up to 1e21. Decimal positivity is simply any nonzero digit.
+    if (!/[1-9]/u.test(value.limit)) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
         message: "Spend cap must be positive",

@@ -190,7 +190,7 @@ function variantPropertyStub(schemas: readonly unknown[]): JsonObject {
   const types = new Set(
     schemas.map(jsonSchemaTypeOf).filter((type): type is string => type !== undefined),
   );
-  return types.size === 1
+  return types.size === 1 && schemas.every((schema) => jsonSchemaTypeOf(schema) !== undefined)
     ? { type: [...types][0]!, description: VARIANT_PROPERTY_DESCRIPTION }
     : { description: VARIANT_PROPERTY_DESCRIPTION };
 }

@@ -54,18 +54,13 @@ The server accepts the listed relay protocol versions
 `RELAY_MIN_PROTOCOL_VERSION`. A protocol bump ships the server and wsmp
 together when the minimum moves.
 
-This CLI speaks 2.4. Last cut release (v0.3.1) spoke 2.3. Unreleased work that
-had been numbered 2.4–2.9 (terminal identity, supervised commands, engine
-facts, node telemetry, MCP node file tools, custom engine adapters) all ships
-as 2.4. A 2.3 wsmp connecting to a 2.4 server is refused with "This server
-requires a newer wsmp (relay protocol 2.4). Upgrade wsmp and restart it." and
-its device card shows "CLI upgrade required (protocol 2.3)". A 2.4 wsmp against
-an older server stops with its "upgrade the WS Model Proxy server" message
-(the CLI recognizes both the `Malformed relay protocol message.` of pre-2.6
-servers and an older server's named-protocol upgrade reply, while a genuine
-future-server "upgrade wsmp" reply stays as the CLI's own upgrade error).
-Release notes for the first wsmp that speaks 2.4 must say that the server and
-every CLI need upgrading together. 2.5 and above are too new.
+This release speaks relay 2.10 and supports only that version. Release notes
+must require upgrading the server and every CLI together. Older CLIs are
+refused with an upgrade-CLI message; this CLI against an older server reports
+that the server needs upgrading. A genuine future-server upgrade-CLI reply
+still identifies the CLI as the component needing an upgrade. Historical
+wire fixtures retain their original directory names; that is not a claim
+that the current release supports those older negotiated versions.
 
 ## One-time setup
 

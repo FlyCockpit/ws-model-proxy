@@ -1,17 +1,21 @@
 import { Link, Outlet, useMatches, useMatchRoute, useNavigate } from "@tanstack/react-router";
 import { Button, buttonVariants } from "@ws-model-proxy/ui/components/button";
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@ws-model-proxy/ui/components/sheet";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
 import {
   Braces,
   Cable,
   ChevronDown,
+  Cpu,
   DatabaseZap,
-  Gauge,
   KeyRound,
   LayoutDashboard,
+  type LucideIcon,
   MessageSquareText,
   Network,
   PanelLeft,
+  Rocket,
+  ServerCog,
   SquareTerminal,
 } from "lucide-react";
 import { lazy, Suspense, useState } from "react";
@@ -24,68 +28,113 @@ import { usePendingAgentRequests } from "@/hooks/use-pending-agent-requests";
 import { TerminalWorkspaceProvider, useTerminalWorkspace } from "@/hooks/use-terminal-workspace";
 import { useUiPreferences } from "@/stores/ui-preferences";
 
-const dashboardSections = [
+type DashboardRoute =
+  | "/$lang/dashboard"
+  | "/$lang/dashboard/clis"
+  | "/$lang/dashboard/runtimes"
+  | "/$lang/dashboard/deployments"
+  | "/$lang/dashboard/pools"
+  | "/$lang/dashboard/cloud-providers"
+  | "/$lang/dashboard/api-tokens"
+  | "/$lang/dashboard/cli-tokens"
+  | "/$lang/dashboard/chat-test"
+  | "/$lang/dashboard/terminals"
+  | "/$lang/dashboard/request-log";
+type Section = { to: DashboardRoute; labelKey: string; icon: LucideIcon; exact: boolean };
+type NavGroup = { id: string; labelKey?: string; sections: readonly Section[] };
+
+const overview: Section = {
+  to: "/$lang/dashboard",
+  labelKey: "dashboard:nav.overview",
+  icon: LayoutDashboard,
+  exact: true,
+};
+const terminals: Section = {
+  to: "/$lang/dashboard/terminals",
+  labelKey: "dashboard:nav.terminals",
+  icon: SquareTerminal,
+  exact: false,
+};
+
+/** Sections in setup order: connect hardware, route models, hand out access, then tools. */
+const dashboardNav: readonly NavGroup[] = [
+  { id: "overview", sections: [overview] },
   {
-    to: "/$lang/dashboard",
-    labelKey: "dashboard:nav.overview",
-    icon: LayoutDashboard,
-    exact: true,
+    id: "hardware",
+    labelKey: "dashboard:nav.groups.hardware",
+    sections: [
+      { to: "/$lang/dashboard/clis", labelKey: "dashboard:nav.clis", icon: Cable, exact: false },
+      {
+        to: "/$lang/dashboard/runtimes",
+        labelKey: "dashboard:nav.runtimes",
+        icon: Cpu,
+        exact: false,
+      },
+      {
+        to: "/$lang/dashboard/deployments",
+        labelKey: "dashboard:nav.deployments",
+        icon: Rocket,
+        exact: false,
+      },
+    ],
   },
   {
-    to: "/$lang/dashboard/clis",
-    labelKey: "dashboard:nav.clis",
-    icon: Cable,
-    exact: false,
+    id: "routing",
+    labelKey: "dashboard:nav.groups.routing",
+    sections: [
+      {
+        to: "/$lang/dashboard/pools",
+        labelKey: "dashboard:nav.pools",
+        icon: Network,
+        exact: false,
+      },
+      {
+        to: "/$lang/dashboard/cloud-providers",
+        labelKey: "dashboard:nav.cloudProviders",
+        icon: ServerCog,
+        exact: false,
+      },
+    ],
   },
   {
-    to: "/$lang/dashboard/terminals",
-    labelKey: "dashboard:nav.terminals",
-    icon: SquareTerminal,
-    exact: false,
+    id: "access",
+    labelKey: "dashboard:nav.groups.access",
+    sections: [
+      {
+        to: "/$lang/dashboard/api-tokens",
+        labelKey: "dashboard:nav.apiTokens",
+        icon: Braces,
+        exact: false,
+      },
+      {
+        to: "/$lang/dashboard/cli-tokens",
+        labelKey: "dashboard:nav.cliTokens",
+        icon: KeyRound,
+        exact: false,
+      },
+    ],
   },
   {
-    to: "/$lang/dashboard/pools",
-    labelKey: "dashboard:nav.pools",
-    icon: Network,
-    exact: false,
+    id: "tools",
+    labelKey: "dashboard:nav.groups.tools",
+    sections: [
+      {
+        to: "/$lang/dashboard/chat-test",
+        labelKey: "dashboard:nav.chatTest",
+        icon: MessageSquareText,
+        exact: false,
+      },
+      terminals,
+      {
+        to: "/$lang/dashboard/request-log",
+        labelKey: "dashboard:nav.requestLog",
+        icon: DatabaseZap,
+        exact: false,
+      },
+    ],
   },
-  {
-    to: "/$lang/dashboard/providers",
-    labelKey: "dashboard:nav.providers",
-    icon: KeyRound,
-    exact: false,
-  },
-  {
-    to: "/$lang/dashboard/capacity",
-    labelKey: "dashboard:nav.capacity",
-    icon: Gauge,
-    exact: false,
-  },
-  {
-    to: "/$lang/dashboard/cli-tokens",
-    labelKey: "dashboard:nav.cliTokens",
-    icon: KeyRound,
-    exact: false,
-  },
-  {
-    to: "/$lang/dashboard/model-api-tokens",
-    labelKey: "dashboard:nav.modelApiTokens",
-    icon: Braces,
-    exact: false,
-  },
-  {
-    to: "/$lang/dashboard/chat-test",
-    labelKey: "dashboard:nav.chatTest",
-    icon: MessageSquareText,
-    exact: false,
-  },
-  {
-    to: "/$lang/dashboard/relay-metadata",
-    labelKey: "dashboard:nav.relayMetadata",
-    icon: DatabaseZap,
-    exact: false,
-  },
-] as const;
+];
+const dashboardSections = dashboardNav.flatMap((group) => group.sections);
 
 // xterm and the terminal UI load only once a terminal exists or the Terminals
 // page is opened.
@@ -94,8 +143,6 @@ const TerminalWorkspaceView = lazy(() =>
     default: module.TerminalWorkspaceView,
   })),
 );
-
-type Section = (typeof dashboardSections)[number];
 
 export type DashboardLayoutMode = "padded" | "fill";
 
@@ -185,26 +232,55 @@ function DashboardLayout({
           </Button>
         </div>
         <nav className="flex flex-col gap-1 px-2 pb-4" aria-label={t("dashboard:nav.ariaLabel")}>
-          {dashboardSections.map((item) =>
-            item.to === "/$lang/dashboard/terminals" ? (
-              <TerminalsNavItem
-                key={item.to}
-                item={item}
-                lang={lang}
-                collapsed={sidebarCollapsed}
-                onTerminals={onTerminals}
-              />
-            ) : (
-              <SidebarLink key={item.to} item={item} lang={lang} collapsed={sidebarCollapsed} />
-            ),
-          )}
+          {dashboardNav.map((group) => {
+            const labelKey = group.labelKey;
+            return (
+              <div
+                key={group.id}
+                role="group"
+                aria-label={labelKey ? t(labelKey) : undefined}
+                className="flex flex-col gap-1"
+              >
+                {labelKey ? (
+                  sidebarCollapsed ? (
+                    <div aria-hidden="true" className="mx-2 my-1 border-t border-sidebar-border" />
+                  ) : (
+                    <p
+                      aria-hidden="true"
+                      className="px-3 pt-3 pb-1 text-xs font-medium text-muted-foreground"
+                    >
+                      {t(labelKey)}
+                    </p>
+                  )
+                ) : null}
+                {group.sections.map((item) =>
+                  item.to === terminals.to ? (
+                    <TerminalsNavItem
+                      key={item.to}
+                      item={item}
+                      lang={lang}
+                      collapsed={sidebarCollapsed}
+                      onTerminals={onTerminals}
+                    />
+                  ) : (
+                    <SidebarLink
+                      key={item.to}
+                      item={item}
+                      lang={lang}
+                      collapsed={sidebarCollapsed}
+                    />
+                  ),
+                )}
+              </div>
+            );
+          })}
         </nav>
       </aside>
 
       <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
         {layout === "fill" ? (
           <>
-            <MobileNavStrip lang={lang} className="shrink-0 px-2 py-1" />
+            <MobileSectionMenu lang={lang} className="shrink-0 px-2 py-1" />
             {/* Keep agent requests visible above fill routes. */}
             <div data-agent-requests="fill" className="shrink-0 px-2 pt-2 empty:hidden md:px-4">
               {onTerminals ? null : <AgentRequestsNotice lang={lang} />}
@@ -223,7 +299,7 @@ function DashboardLayout({
             className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col"
           >
             <div className="container mx-auto flex min-h-0 min-w-0 max-w-6xl flex-col px-4 py-4 md:py-6">
-              <MobileNavStrip lang={lang} className="mb-4" />
+              <MobileSectionMenu lang={lang} className="mb-4" />
 
               <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
                 <AgentRequestsNotice lang={lang} />
@@ -400,44 +476,92 @@ function TerminalsNavItem({
   );
 }
 
-/** Below md: a horizontal strip of section links in place of the sidebar. */
-function MobileNavStrip({ lang, className }: { lang: string; className?: string }) {
+/**
+ * Below md: one button naming the current section opens every section, grouped, in a sheet.
+ * The app's BottomNav stays the only persistent mobile navigation bar.
+ */
+function MobileSectionMenu({ lang, className }: { lang: string; className?: string }) {
   const { t } = useTranslation(["dashboard"]);
+  const [open, setOpen] = useState(false);
+  const matchRoute = useMatchRoute();
   const agentRequests = usePendingAgentRequests();
+  const current =
+    dashboardSections.find((section) =>
+      matchRoute({ to: section.to, params: { lang }, fuzzy: !section.exact }),
+    ) ?? overview;
   return (
-    // Horizontal-only: overflow-y-hidden clips accidental vertical overflow;
-    // overscroll-x-contain keeps horizontal swipes from chaining. Avoid
-    // touch-pan-x so vertical page scrolls can still begin on this strip.
-    <div
-      data-dashboard-nav="strip"
-      className={cn(
-        "min-w-0 overflow-x-auto overflow-y-hidden overscroll-x-contain no-scrollbar md:hidden",
-        className,
-      )}
-    >
-      <nav className="flex w-max items-center gap-1" aria-label={t("dashboard:nav.ariaLabel")}>
-        {dashboardSections.map((item) => (
-          <Link
-            key={item.to}
-            to={item.to}
-            params={{ lang }}
-            activeOptions={{ exact: item.exact }}
-            className={cn(
-              buttonVariants({ variant: "ghost", size: "touch" }),
-              "shrink-0 justify-start gap-2 text-muted-foreground",
-            )}
-            activeProps={{
-              className: "bg-muted text-foreground",
-            }}
-          >
-            <item.icon aria-hidden="true" className="size-4" />
-            {t(item.labelKey)}
-            {item.to === "/$lang/dashboard/terminals" ? (
-              <AgentRequestsBadge count={agentRequests.count} />
-            ) : null}
-          </Link>
-        ))}
-      </nav>
+    <div data-dashboard-nav="mobile" className={cn("min-w-0 md:hidden", className)}>
+      <Sheet open={open} onOpenChange={setOpen}>
+        <Button
+          type="button"
+          variant="outline"
+          size="touch"
+          aria-haspopup="dialog"
+          aria-expanded={open}
+          className="w-full min-w-0 justify-start gap-2"
+          onClick={() => setOpen(true)}
+        >
+          <current.icon aria-hidden="true" className="size-4" />
+          <span className="min-w-0 truncate">{t(current.labelKey)}</span>
+          <span className="sr-only">{t("dashboard:nav.openSections")}</span>
+          <AgentRequestsBadge count={agentRequests.count} className="ms-auto" />
+          <ChevronDown
+            aria-hidden="true"
+            className={cn("size-4", agentRequests.count > 0 ? "" : "ms-auto")}
+          />
+        </Button>
+        <SheetContent
+          side="bottom"
+          className="max-h-[85dvh] overflow-x-hidden overflow-y-auto"
+          style={{ paddingBottom: "var(--safe-area-bottom)" }}
+        >
+          <SheetHeader>
+            <SheetTitle>{t("dashboard:nav.ariaLabel")}</SheetTitle>
+          </SheetHeader>
+          <nav className="flex flex-col gap-1 px-4 pb-4" aria-label={t("dashboard:nav.ariaLabel")}>
+            {dashboardNav.map((group) => {
+              const labelKey = group.labelKey;
+              return (
+                <div
+                  key={group.id}
+                  role="group"
+                  aria-label={labelKey ? t(labelKey) : undefined}
+                  className="flex flex-col gap-1"
+                >
+                  {labelKey ? (
+                    <p
+                      aria-hidden="true"
+                      className="px-3 pt-3 pb-1 text-xs font-medium text-muted-foreground"
+                    >
+                      {t(labelKey)}
+                    </p>
+                  ) : null}
+                  {group.sections.map((item) => (
+                    <Link
+                      key={item.to}
+                      to={item.to}
+                      params={{ lang }}
+                      activeOptions={{ exact: item.exact }}
+                      onClick={() => setOpen(false)}
+                      className={cn(
+                        buttonVariants({ variant: "ghost", size: "touch" }),
+                        "justify-start gap-2 text-muted-foreground",
+                      )}
+                      activeProps={{ className: "bg-muted text-foreground" }}
+                    >
+                      <item.icon aria-hidden="true" className="size-4" />
+                      {t(item.labelKey)}
+                      {item.to === terminals.to ? (
+                        <AgentRequestsBadge count={agentRequests.count} className="ms-auto" />
+                      ) : null}
+                    </Link>
+                  ))}
+                </div>
+              );
+            })}
+          </nav>
+        </SheetContent>
+      </Sheet>
     </div>
   );
 }
