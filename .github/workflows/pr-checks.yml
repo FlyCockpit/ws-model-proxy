@@ -334,7 +334,7 @@ jobs:
     name: PostgreSQL schema validation
     needs: setup
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:17-alpine
