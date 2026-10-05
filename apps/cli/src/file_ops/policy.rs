@@ -489,7 +489,13 @@ mod tests {
             std::fs::create_dir(&state).unwrap();
             std::os::unix::fs::symlink(&state, root.join("state-alias")).unwrap();
             let policy = Policy::from_environment(vec![], true);
-            for dir in ["state", "state-alias"] {
+            // `check_path` decides on physical paths (callers resolve first),
+            // so the state dir is checked under its physical name and under the
+            // configured alias. macOS temp dirs sit behind the `/var` ->
+            // `/private/var` symlink, so the fixture root itself is resolved.
+            let configured = root.join("state-alias");
+            let root = std::fs::canonicalize(&root).unwrap();
+            for dir in [root.join("state"), configured] {
                 for name in [
                     "instances.json",
                     "instances.lock",
@@ -498,10 +504,9 @@ mod tests {
                 ] {
                     for access in [Access::Read, Access::Write, Access::Remove] {
                         assert!(
-                            policy
-                                .check_path(access, &root.join(dir).join(name))
-                                .is_err(),
-                            "{dir}/{name} {access:?}"
+                            policy.check_path(access, &dir.join(name)).is_err(),
+                            "{}/{name} {access:?}",
+                            dir.display()
                         );
                     }
                 }
