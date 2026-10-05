@@ -30,6 +30,17 @@ export function deploymentJobNeedsOperator(
   return job.interactive === true || job.stopInteractive === true || job.operator !== undefined;
 }
 
+/**
+ * Who wrote an interactive job's command text, decided at dispatch from the recipe's revision
+ * history by command text: `agent` when any agent-saved revision holds that text, `user` only
+ * when a person demonstrably saved it (and no agent did), `unknown` otherwise.
+ */
+export const DEPLOYMENT_COMMAND_AUTHORS = ["user", "agent", "unknown"] as const;
+export type DeploymentCommandAuthor = (typeof DEPLOYMENT_COMMAND_AUTHORS)[number];
+export function isDeploymentCommandAuthor(value: unknown): value is DeploymentCommandAuthor {
+  return (DEPLOYMENT_COMMAND_AUTHORS as readonly unknown[]).includes(value);
+}
+export type DeploymentJobOperator = { terminalId: string; commandAuthor: DeploymentCommandAuthor };
 export type DeploymentJobAction =
   | "prepare"
   | "start"
@@ -82,9 +93,10 @@ export type DeploymentJob = {
   stopInteractive?: true;
   /**
    * 2.11. Present exactly when `interactive`: the operator terminal minted for this dispatch
-   * (16 random bytes, base64url). Per dispatch, so it is not part of the hashed intent.
+   * (16 random bytes, base64url) and who wrote `command`, as the confirm screen shows it. Per
+   * dispatch, so it is not part of the hashed intent.
    */
-  operator?: { terminalId: string };
+  operator?: DeploymentJobOperator;
   stopCommand?: string;
   statusCommand?: string | null;
   healthCommand?: string | null;
@@ -187,7 +199,8 @@ type DeploymentDispatchFields = keyof DeploymentDispatchEnvelope | "operator";
 /**
  * Upper bounds for the per-dispatch fields: step IDs are 24-character cuid2s, intent hashes
  * are SHA-256 hex, and owner epochs are `<uuid>:<connection generation>`. An interactive
- * intent also carries `operator.terminalId` (22 base64url characters).
+ * intent also carries `operator` (a 22-character base64url terminal ID and the longest command
+ * author, `unknown`).
  */
 const WORST_CASE_DISPATCH: DeploymentDispatchEnvelope = {
   stepId: "s".repeat(64),
@@ -207,7 +220,10 @@ export function deploymentJobFrameBytes(
 ): number | null {
   let wellFormed = true;
   const dispatch: Pick<DeploymentJob, DeploymentDispatchFields> = intent.interactive
-    ? { ...WORST_CASE_DISPATCH, operator: { terminalId: "A".repeat(22) } }
+    ? {
+        ...WORST_CASE_DISPATCH,
+        operator: { terminalId: "A".repeat(22), commandAuthor: "unknown" },
+      }
     : WORST_CASE_DISPATCH;
   const frame = JSON.stringify({ ...intent, ...dispatch }, (key, value: unknown) => {
     if (

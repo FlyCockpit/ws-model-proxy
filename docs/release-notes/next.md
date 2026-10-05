@@ -21,6 +21,13 @@ in `supervised` it accepts the server's approval flag; there is no confirm
 screen on the node. Turn deployments on only on nodes whose server you would
 trust with a shell there. Deployments stay off by default.
 
+Interactive recipe steps (a command a person must run, e.g. one asking for a
+sudo password) need a second, separate node-local switch:
+`wsmp config set-deployment-operator-terminal on` (off by default). The step
+then waits in an operator terminal showing the exact command and runs only after
+a person presses Enter from the dashboard. It never opens a shell and does not
+enable browser terminals.
+
 Recipe commands are limited to 4,096 UTF-8 bytes when saved and again after
 placeholder substitution, the same limit the CLI enforces, so a long command is
 refused at save or plan time instead of leaving an instance stuck stopping.

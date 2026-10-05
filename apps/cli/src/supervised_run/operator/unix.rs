@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 
 use super::{OperatorRequest, layout};
 use crate::sessions::{
-    SUPERVISED_ENV_MARKER, SUPERVISED_ENV_NAMES, SUPERVISED_ENV_OPERATOR, supervised_marker,
+    SUPERVISED_ENV_MARKER_FILE, SUPERVISED_ENV_NAMES, SUPERVISED_ENV_OPERATOR, supervised_marker,
 };
 use crate::supervised_screen::{ConfirmAction, ConfirmOutcome, interact, wait_for_any_key};
 
@@ -26,15 +26,38 @@ fn required_env(name: &str) -> Result<String> {
     })
 }
 
-/// The request and marker from the daemon's env, checked before anything is
-/// drawn.
+/// The request (env) and marker (a private file the daemon wrote), checked
+/// before anything is drawn. The marker file is removed here, before any
+/// command can run, so the command can read the marker neither from this
+/// process's env (on any platform) nor from the file.
 fn request_from_env() -> Result<(OperatorRequest, String)> {
-    let marker = required_env(SUPERVISED_ENV_MARKER)?;
-    if marker.len() != 32 || !marker.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        anyhow::bail!("`{SUPERVISED_ENV_MARKER}` is malformed");
-    }
+    let path = required_env(SUPERVISED_ENV_MARKER_FILE)?;
+    let marker = take_marker(std::path::Path::new(&path))?;
     let request = parse_request(&required_env(SUPERVISED_ENV_OPERATOR)?)?;
     Ok((request, marker))
+}
+
+/// Reads and removes the marker file: exactly 32 hex characters. Fails
+/// closed when it cannot be removed.
+fn take_marker(path: &std::path::Path) -> Result<String> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(nix::libc::O_NOFOLLOW);
+    }
+    let mut marker = String::new();
+    options
+        .open(path)
+        .and_then(|file| file.take(64).read_to_string(&mut marker))
+        .with_context(|| format!("reading `{SUPERVISED_ENV_MARKER_FILE}`"))?;
+    std::fs::remove_file(path)
+        .with_context(|| format!("removing `{SUPERVISED_ENV_MARKER_FILE}`"))?;
+    if marker.len() != 32 || !marker.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!("`{SUPERVISED_ENV_MARKER_FILE}` is malformed");
+    }
+    Ok(marker)
 }
 
 fn parse_request(json: &str) -> Result<OperatorRequest> {
@@ -95,11 +118,13 @@ fn block_terminal_signals() -> Result<()> {
     signals.thread_block().context("blocking terminal signals")
 }
 
-/// Keeps the command (same uid) from reading this process's initial env,
-/// which holds the marker and the request, through `/proc/<pid>/environ`
-/// or ptrace: a non-dumpable process needs `CAP_SYS_PTRACE` for both. The
-/// command execs and is dumpable again. Elsewhere (macOS exposes same-uid
-/// env through `KERN_PROCARGS2`) the daemon must not pass the marker in env.
+/// Keeps the command (same uid) from reading this process's memory and
+/// initial env (the request and the marker file's path; the marker itself
+/// never travels in env) through `/proc/<pid>/environ`, `/proc/<pid>/mem`
+/// or ptrace: a non-dumpable process needs `CAP_SYS_PTRACE` for those. The
+/// command execs and is dumpable again. Linux only; elsewhere the marker is
+/// protected by being read from a private file that is removed before any
+/// command runs.
 fn hide_own_env() -> Result<()> {
     #[cfg(target_os = "linux")]
     nix::sys::prctl::set_dumpable(false).context("hiding the marker from the command")?;

@@ -1,10 +1,12 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { ORPCError } from "@orpc/server";
 import { deploymentJobWireIssue } from "@ws-model-proxy/config/deployment-job-wire";
 import {
   DEPLOYMENT_JOB_FRAME_MAX_BYTES,
   DEPLOYMENT_PROTOCOL_VERSION,
+  type DeploymentCommandAuthor,
   type DeploymentJob,
+  type DeploymentJobOperator,
   deploymentJobFrameBytes,
 } from "@ws-model-proxy/config/deployment-protocol";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
@@ -240,6 +242,103 @@ async function agentWroteCommands(
       )
     );
   });
+}
+/**
+ * The recipe command field a rendered job runs, as `renderDeploymentGroup` picks it: a
+ * multi-node head starts with `afterJoin` when it has one and prepares with `prepare`; every
+ * stop runs `stop`. `null` for jobs that run no recipe command a person could be asked to run.
+ */
+export function deploymentCommandSource(
+  variant: Pick<DeploymentVariant, "groupSize" | "commands">,
+  rank: number,
+  action: DeploymentJob["action"],
+): "start" | "prepare" | "afterJoin" | "stop" | null {
+  const head = variant.groupSize > 1 && rank === 0;
+  switch (action) {
+    case "stop":
+      return "stop";
+    case "prepare":
+      return head ? "prepare" : null;
+    case "after_join":
+      return "afterJoin";
+    case "start":
+      return head && rankValue(variant.commands, rank).afterJoin ? "afterJoin" : "start";
+    default:
+      return null;
+  }
+}
+/** Revisions scanned for authorship; a longer history is `unknown` unless an agent shows up. */
+const AUTHORSHIP_REVISION_LIMIT = 1024;
+/**
+ * Who wrote the recipe text an interactive job runs, judged by command text like
+ * `agentWroteCommands` (a person editing another field does not launder it; an agent-saved
+ * revision that kept the text counts as the agent's): `agent` when any agent-saved revision up
+ * to the instance's holds that exact text; `user`
+ * only when the earliest revision holding it was saved by a person and no agent revision holds
+ * it; `unknown` whenever that cannot be shown (a scheduled save, an unreadable revision, a
+ * history longer than the scan). Never part of the hashed intent: it is per dispatch.
+ */
+export async function deploymentOperatorCommandAuthor(
+  tx: Tx,
+  instance: { revisionId: string; variantKey: string },
+  job: Pick<DeploymentJob, "rank" | "action">,
+): Promise<DeploymentCommandAuthor> {
+  const revision = await tx.deploymentConfigRevision.findUnique({
+    where: { id: instance.revisionId },
+    select: { configId: true, revision: true, spec: true },
+  });
+  if (!revision) return "unknown";
+  const spec = storedDeploymentSpecSchema.safeParse(revision.spec);
+  const variant = spec.success
+    ? spec.data.variants.find((candidate) => candidate.key === instance.variantKey)
+    : undefined;
+  if (!variant) return "unknown";
+  const source = deploymentCommandSource(variant, job.rank, job.action);
+  let text: unknown;
+  try {
+    text = source ? rankValue(variant.commands, job.rank)[source] : undefined;
+  } catch {
+    return "unknown";
+  }
+  if (typeof text !== "string") return "unknown";
+  const raw = text;
+  const history = await tx.deploymentConfigRevision.findMany({
+    where: { configId: revision.configId, revision: { lte: revision.revision } },
+    orderBy: { revision: "desc" },
+    take: AUTHORSHIP_REVISION_LIMIT,
+    select: { revision: true, editorKind: true, spec: true },
+  });
+  let earliest: { editorKind: string } | undefined;
+  let unreadable = false;
+  for (const candidate of history) {
+    const parsed = storedDeploymentSpecSchema.safeParse(candidate.spec);
+    if (!parsed.success) {
+      unreadable = true;
+      continue;
+    }
+    const holds = parsed.data.variants.some((v) => variantCommandTexts(v.commands).includes(raw));
+    if (!holds) continue;
+    if (candidate.editorKind === "AGENT") return "agent";
+    // `history` is newest first, so the last match is the earliest revision holding the text.
+    earliest = candidate;
+  }
+  // An unreadable revision may be an agent's; a truncated scan may miss the first author.
+  if (unreadable || history.length >= AUTHORSHIP_REVISION_LIMIT) return "unknown";
+  return earliest?.editorKind === "USER" ? "user" : "unknown";
+}
+/**
+ * The per-dispatch operator object of an interactive job: a fresh terminal ID (16 random
+ * bytes, base64url) and who wrote the command.
+ */
+export async function mintDeploymentOperator(
+  tx: Tx,
+  instance: { revisionId: string; variantKey: string },
+  job: Pick<DeploymentJob, "rank" | "action">,
+): Promise<DeploymentJobOperator> {
+  return {
+    terminalId: randomBytes(16).toString("base64url"),
+    commandAuthor: await deploymentOperatorCommandAuthor(tx, instance, job),
+  };
 }
 /** Plan warning recorded when a person starts commands an agent wrote. */
 export const AGENT_EDITED_REVISION = "agent_edited_revision";
@@ -524,7 +623,7 @@ export function deploymentDispatchShape(
     actor: dispatch.actor ?? "USER",
     humanApproved: dispatch.humanApproved ?? true,
     ...(intent.interactive
-      ? { operator: dispatch.operator ?? { terminalId: "A".repeat(22) } }
+      ? { operator: dispatch.operator ?? { terminalId: "A".repeat(22), commandAuthor: "unknown" } }
       : {}),
   };
 }

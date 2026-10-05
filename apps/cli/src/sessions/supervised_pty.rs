@@ -25,7 +25,11 @@ pub(crate) const SUPERVISED_ENV_FILE_ROOTS: &str = "WSMP_SUPERVISED_FILE_ROOTS";
 /// The operator (deployment) confirm screen's request, as JSON
 /// (`supervised_run::operator::OperatorRequest`).
 pub(crate) const SUPERVISED_ENV_OPERATOR: &str = "WSMP_SUPERVISED_OPERATOR";
-pub(crate) const SUPERVISED_ENV_NAMES: [&str; 14] = [
+/// The operator child's marker: the path of a private file holding it (the
+/// child reads and removes it before drawing). Never the marker itself: on
+/// macOS any same-user process can read another's environment.
+pub(crate) const SUPERVISED_ENV_MARKER_FILE: &str = "WSMP_SUPERVISED_MARKER_FILE";
+pub(crate) const SUPERVISED_ENV_NAMES: [&str; 15] = [
     SUPERVISED_ENV_COMMAND,
     SUPERVISED_ENV_REASON,
     SUPERVISED_ENV_REQUESTER,
@@ -40,6 +44,7 @@ pub(crate) const SUPERVISED_ENV_NAMES: [&str; 14] = [
     SUPERVISED_ENV_FILE_ALLOW_ROOT,
     SUPERVISED_ENV_FILE_ROOTS,
     SUPERVISED_ENV_OPERATOR,
+    SUPERVISED_ENV_MARKER_FILE,
 ];
 
 /// The in-band signal between the confirm child and the daemon: an OSC
@@ -75,7 +80,6 @@ enum Grammar {
     Supervised,
     /// Deployment operator step: ready -> accepted -> exited;<code>, where a
     /// non-zero code starts the cycle again (retry) and 0 ends it.
-    #[cfg_attr(not(test), allow(dead_code))] // Chunk 5 spawns operator terminals.
     Operator,
 }
 
@@ -150,7 +154,6 @@ impl MarkerScanner {
     /// person may run the command again. `exited;0` ends it. Any event out of
     /// that order, a `blocked` verdict or a malformed code is `Invalid` and
     /// ends the scan: the child never produces one.
-    #[cfg_attr(not(test), allow(dead_code))] // Chunk 5 spawns operator terminals.
     pub(super) fn operator(marker: &str) -> Self {
         Self::with_grammar(marker, Grammar::Operator)
     }
@@ -328,6 +331,15 @@ impl ChildLink {
     pub(super) fn new(marker: &str) -> Self {
         Self {
             scanner: MarkerScanner::new(marker),
+            go: supervised_marker("go", marker),
+            eof: false,
+        }
+    }
+
+    /// The link to an operator (deployment) confirm child.
+    pub(super) fn operator(marker: &str) -> Self {
+        Self {
+            scanner: MarkerScanner::operator(marker),
             go: supervised_marker("go", marker),
             eof: false,
         }

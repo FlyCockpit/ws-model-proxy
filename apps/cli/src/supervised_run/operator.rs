@@ -16,15 +16,15 @@
 //! reports `exited;<code>`, and after a non-zero exit draws the screen again
 //! so the owner can retry or close. It never opens a shell.
 //!
-//! Nothing spawns this screen yet: the job executor still refuses
-//! interactive jobs (`interactive_unsupported`) and the hello does not report
-//! `deploymentOperator`. The executor and daemon wiring come next.
+//! The relay daemon spawns it for an interactive deployment job (see
+//! `sessions::operator`) and hands it the marker through a private file
+//! (never the environment, which same-user processes can read on macOS).
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use super::{INDENT, Screen, command_size, field, fit, wrap_words};
-use crate::deployments::{Action, Actor, Job};
+use crate::deployments::{Action, Actor, CommandAuthor, Job};
 
 #[cfg(unix)]
 mod unix;
@@ -59,10 +59,12 @@ pub struct OperatorRequest {
     pub requested_by: Actor,
     /// A person confirmed the plan (always true for `requested_by: USER`).
     pub human_approved: bool,
-    /// Whether an agent wrote this command text; `None` when this machine
-    /// was not told (the 2.11 job carries no authorship field).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_written: Option<bool>,
+    /// Who wrote this command text, as the server judged it (`operator.commandAuthor`).
+    pub command_author: CommandAuthor,
+    /// An earlier terminal for this step took an Enter and was lost (wsmp
+    /// restarted or reconnected): whether that run finished is unknown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub previous_run_unknown: bool,
     /// The exact command, as the intent hash binds it.
     pub command: String,
 }
@@ -70,12 +72,13 @@ pub struct OperatorRequest {
 impl OperatorRequest {
     /// The screen for an interactive job on this `node`. Only a valid job
     /// whose own command is interactive has one.
-    pub fn from_job(job: &Job, node: &str) -> Result<Self> {
+    pub fn from_job(job: &Job, node: &str, previous_run_unknown: bool) -> Result<Self> {
         job.validate()?;
-        anyhow::ensure!(
-            job.interactive == Some(true) && job.operator.is_some(),
-            "not an interactive deployment job"
-        );
+        let operator = job
+            .operator
+            .as_ref()
+            .filter(|_| job.interactive == Some(true))
+            .ok_or_else(|| anyhow::anyhow!("not an interactive deployment job"))?;
         let request = Self {
             endpoint: job.endpoint_slug.clone(),
             models: job.models.clone(),
@@ -84,7 +87,8 @@ impl OperatorRequest {
             action: job.action,
             requested_by: job.actor,
             human_approved: job.human_approved,
-            agent_written: None,
+            command_author: operator.command_author,
+            previous_run_unknown,
             command: job.command.clone(),
         };
         request.validate()?;
@@ -153,11 +157,11 @@ fn requested_by_text(request: &OperatorRequest) -> &'static str {
     }
 }
 
-fn written_by_text(agent_written: Option<bool>) -> &'static str {
-    match agent_written {
-        Some(true) => "an agent. Read it before you run it.",
-        Some(false) => "you",
-        None => "not known here. Read it before you run it.",
+fn written_by_text(author: CommandAuthor) -> &'static str {
+    match author {
+        CommandAuthor::Agent => "an agent. Read it before you run it.",
+        CommandAuthor::User => "you",
+        CommandAuthor::Unknown => "not known. Read it before you run it.",
     }
 }
 
@@ -204,9 +208,17 @@ fn body_rows(request: &OperatorRequest, last_exit: Option<u8>, width: usize) -> 
     field(
         &mut rows,
         "Command written by: ",
-        written_by_text(request.agent_written),
+        written_by_text(request.command_author),
         width,
     );
+    if request.previous_run_unknown {
+        rows.push(String::new());
+        wrap_words(
+            &mut rows,
+            "Note: this step was started in an earlier terminal that wsmp lost (a restart or reconnect). Whether that run finished is not known; check before you run it again.",
+            width,
+        );
+    }
     rows.push(String::new());
     wrap_words(
         &mut rows,
@@ -218,6 +230,11 @@ fn body_rows(request: &OperatorRequest, last_exit: Option<u8>, width: usize) -> 
     wrap_words(
         &mut rows,
         "Enter runs it here with `sh -c`, as your user. This terminal never opens a shell; it closes when the command succeeds or you close it.",
+        width,
+    );
+    wrap_words(
+        &mut rows,
+        "If wsmp loses its connection to WS Model Proxy, this terminal ends, and so does a command still running in it.",
         width,
     );
     if last_exit.is_some() {
@@ -279,7 +296,8 @@ mod tests {
             action: Action::Start,
             requested_by: Actor::Agent,
             human_approved: true,
-            agent_written: None,
+            command_author: CommandAuthor::Unknown,
+            previous_run_unknown: false,
             command: command.to_string(),
         }
     }
@@ -306,10 +324,11 @@ mod tests {
             "Node: gpu-box (rank 0)",
             "Step: start the service",
             "Requested by: an agent; you confirmed the plan",
-            "Command written by: not known here. Read it before you run it.",
+            "Command written by: not known. Read it before you run it.",
             "Command (1 line, 25 bytes):",
             "    sudo systemctl start vllm",
             "never opens a shell",
+            "loses its connection",
             "NOPASSWD",
             PROMPT,
         ] {
@@ -339,19 +358,44 @@ mod tests {
         }
         let mut req = request("true");
         req.requested_by = Actor::User;
-        req.agent_written = Some(false);
+        req.command_author = CommandAuthor::User;
         let text = layout(&req, None, 100, 40, 0).rows.join("\n");
         assert!(text.contains("Requested by: you, from the dashboard"));
         assert!(text.contains("Command written by: you"));
         req.requested_by = Actor::Agent;
         req.human_approved = false;
-        req.agent_written = Some(true);
+        req.command_author = CommandAuthor::Agent;
         let text = layout(&req, None, 100, 40, 0).rows.join("\n");
         assert!(text.contains("Requested by: an agent; no person confirmed the plan"));
         assert!(text.contains("Command written by: an agent. Read it before you run it."));
         req.models = (0..5).map(|n| format!("m{n}")).collect();
         let text = layout(&req, None, 100, 40, 0).rows.join("\n");
         assert!(text.contains("Models: m0, m1, m2 and 2 more"), "{text}");
+    }
+
+    #[test]
+    fn a_lost_earlier_run_is_called_out_and_the_job_maps_to_the_screen() {
+        let mut req = request("sudo systemctl start vllm");
+        let text = layout(&req, None, 100, 40, 0).rows.join("\n");
+        assert!(!text.contains("earlier terminal"));
+        req.previous_run_unknown = true;
+        let text = layout(&req, None, 100, 40, 0).rows.join("\n");
+        assert!(text.contains("started in an earlier terminal"), "{text}");
+        assert!(text.contains("check before you run it again"), "{text}");
+
+        let golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/relay-current/deployment-jobs.json"
+        ))
+        .expect("golden");
+        let job: Job =
+            serde_json::from_value(golden["jobs"]["interactiveStop"].clone()).expect("job");
+        let screen = OperatorRequest::from_job(&job, "gpu-box", true).expect("request");
+        assert_eq!(screen.command, job.command);
+        assert_eq!(screen.action, Action::Stop);
+        assert_eq!(screen.command_author, CommandAuthor::Agent);
+        assert!(screen.previous_run_unknown);
+        let plain: Job = serde_json::from_value(golden["jobs"]["plainStart"].clone()).expect("job");
+        assert!(OperatorRequest::from_job(&plain, "gpu-box", false).is_err());
     }
 
     #[test]
@@ -443,7 +487,8 @@ mod tests {
     fn the_request_round_trips_as_strict_json_and_is_bounded() {
         let req = request("sudo systemctl start vllm");
         let json = serde_json::to_string(&req).expect("json");
-        assert!(!json.contains("agentWritten"));
+        assert!(json.contains(r#""commandAuthor":"unknown""#));
+        assert!(!json.contains("previousRunUnknown"));
         assert_eq!(
             serde_json::from_str::<OperatorRequest>(&json).expect("parse"),
             req

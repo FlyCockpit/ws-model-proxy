@@ -1210,11 +1210,22 @@ fn run_relay_session(
             );
             let frames = (|| -> RelaySessionResult<()> {
                 if let Some(result) = update.result {
-                    let text = serde_json::to_string(&result)
-                        .map_err(|error| RelaySessionError::Fatal(error.into()))?;
-                    socket.send(Message::Text(text.into())).map_err(|error| {
-                        websocket_session_error(error, "sending deployment result", true)
-                    })?;
+                    send_deployment_result(&mut socket, &result)?;
+                }
+                if let Some(open) = update.operator {
+                    // The step is durable; only a person can run it now.
+                    match terminals.spawn_operator(config, &open) {
+                        Ok(frames) => send_outbound_frames(&mut socket, frames)?,
+                        // Retryable: the step still waits for its person; a
+                        // reopen dispatches a new terminal.
+                        Err(code) => {
+                            if let Some(result) =
+                                crate::deployments::JobResult::operator_failed(&open.job, code)
+                            {
+                                send_deployment_result(&mut socket, &result)?;
+                            }
+                        }
+                    }
                 }
                 let snapshot =
                     crate::deployments::instances_frames().map_err(RelaySessionError::Fatal)?;
@@ -1258,6 +1269,10 @@ fn run_relay_session(
         if let Err(error) =
             send_outbound_frames(&mut socket, terminals.poll_with_startup(startup, now))
         {
+            break Err(error);
+        }
+        #[cfg(unix)]
+        if let Err(error) = forward_operator_events(&mut socket, &mut terminals) {
             break Err(error);
         }
         if let Err(error) = send_outbound_frames(&mut socket, execs.poll(now)) {
@@ -1952,6 +1967,20 @@ where
                 return Ok(());
             }
         };
+        // A stop for the instance cancels its start/prepare still waiting for
+        // a person. A person's command already running is never cut off: the
+        // stop waits for that run to end (so it cannot settle from status
+        // while the run may still be starting the service).
+        #[cfg(unix)]
+        if *registered && job.action == crate::deployments::Action::Stop {
+            let (frames, busy) =
+                terminals.close_operator_for_instance(&job.instance_id, &job.step_id);
+            send_outbound_frames(socket, frames)?;
+            if busy {
+                terminals.defer_until_runs_end(job);
+                return Ok(());
+            }
+        }
         #[cfg(unix)]
         let refused = !*registered || crate::deployments::service::submit(job.clone()).is_err();
         #[cfg(not(unix))]
@@ -3613,6 +3642,70 @@ where
                         websocket_session_error(error, "sending terminal or exec frame", true)
                     })?;
             }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn send_deployment_result<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    result: &crate::deployments::JobResult,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    let text =
+        serde_json::to_string(result).map_err(|error| RelaySessionError::Fatal(error.into()))?;
+    socket
+        .send(Message::Text(text.into()))
+        .map_err(|error| websocket_session_error(error, "sending deployment result", true))
+}
+
+/// Operator terminal events become 2.11 progress results and worker
+/// requests. A reported `exited;0` is only a request for the status proof:
+/// the worker sends the step's final result.
+#[cfg(unix)]
+fn forward_operator_events<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    terminals: &mut TerminalRegistry,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    use crate::sessions::OperatorEvent;
+    for event in terminals.take_operator_events() {
+        match event {
+            OperatorEvent::Progress(job, progress) => {
+                if let Some(result) = crate::deployments::JobResult::operator(&job, progress) {
+                    send_deployment_result(socket, &result)?;
+                }
+            }
+            OperatorEvent::Accepted(job) => {
+                if crate::deployments::service::submit_operator_accepted(job).is_err() {
+                    tracing::warn!("could not record an operator accept");
+                }
+            }
+            OperatorEvent::Verify(job) => {
+                if crate::deployments::service::submit_operator_verify(job.clone()).is_err() {
+                    send_deployment_result(
+                        socket,
+                        &crate::deployments::JobResult::failure(
+                            &job,
+                            "deployment_worker_unavailable",
+                        ),
+                    )?;
+                }
+            }
+        }
+    }
+    // After the events: a held stop follows the verify of the run it waited for.
+    for job in terminals.take_released_jobs() {
+        if crate::deployments::service::submit(job.clone()).is_err() {
+            send_deployment_result(
+                socket,
+                &crate::deployments::JobResult::failure(&job, "deployment_worker_unavailable"),
+            )?;
         }
     }
     Ok(())

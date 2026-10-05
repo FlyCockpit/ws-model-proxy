@@ -568,9 +568,8 @@ pub struct CliReportedFeatures {
     #[serde(skip_serializing_if = "deployment_disabled")]
     pub deployments: bool,
     /// 2.11: this CLI can run interactive deployment commands in an operator
-    /// terminal. Omitted while false. Not reported yet: this build decodes
-    /// interactive jobs but refuses them (`INTERACTIVE_UNSUPPORTED`), so the
-    /// server never sends it one.
+    /// terminal: deployments and the operator-terminal switch are on and
+    /// terminals are supported (Unix). Omitted while false.
     #[serde(skip_serializing_if = "deployment_disabled")]
     pub deployment_operator: bool,
     pub human_terminal: bool,
@@ -2741,8 +2740,8 @@ mod tests {
         assert!(!encoded.contains(r#""requestBodyWindowChunks""#));
         assert!(!encoded.contains("protocol_version"));
         assert!(!encoded.contains(":null"));
-        // 2.11: omitted while false, and this build never reports it (it
-        // refuses interactive jobs).
+        // 2.11: omitted while false (`hello_capabilities` sets it from the
+        // live deployments switch).
         assert!(!encoded.contains("deploymentOperator"));
         let ClientControlMessage::Hello { cli, .. } = &message else {
             unreachable!("hello")

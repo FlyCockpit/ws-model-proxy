@@ -1,6 +1,9 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { deploymentJobWireIssue } from "@ws-model-proxy/config/deployment-job-wire";
-import type { DeploymentJob } from "@ws-model-proxy/config/deployment-protocol";
+import type {
+  DeploymentCommandAuthor,
+  DeploymentJob,
+} from "@ws-model-proxy/config/deployment-protocol";
 import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import { describe, expect, it, vi } from "vitest";
 
@@ -22,6 +25,8 @@ const GOLDEN = new URL(
   import.meta.url,
 );
 const TERMINAL_ID = "AAECAwQFBgcICQoLDA0ODw";
+/** Terminal ids are never reused, so the stop has its own. */
+const STOP_TERMINAL_ID = "EBESExQVFhcYGRobHB0eHw";
 const OWNER_EPOCH = "3f2b8c1e-1d2a-4c3b-9e8f-0a1b2c3d4e5f:7";
 
 const node: DeploymentNode = {
@@ -89,13 +94,18 @@ function renderedStart(v: ReturnType<typeof variant>) {
   return start.intent;
 }
 
-function dispatched(intent: Parameters<typeof deploymentDispatchShape>[0], stepId: string) {
+function dispatched(
+  intent: Parameters<typeof deploymentDispatchShape>[0],
+  stepId: string,
+  commandAuthor: DeploymentCommandAuthor = "user",
+  terminalId = TERMINAL_ID,
+) {
   return deploymentDispatchShape(intent, {
     stepId,
     ownerEpoch: OWNER_EPOCH,
     actor: "USER",
     humanApproved: true,
-    operator: { terminalId: TERMINAL_ID },
+    operator: { terminalId, commandAuthor },
   });
 }
 
@@ -131,6 +141,8 @@ function generate() {
     interactiveStop: dispatched(
       originalDeploymentStopIntent(interactiveIntent),
       "tz4a98xxat96iws9zmbrgj3c",
+      "agent",
+      STOP_TERMINAL_ID,
     ),
     stopInteractiveStart: dispatched(stopInteractiveIntent, "tz4a98xxat96iws9zmbrgj3d"),
   };
@@ -159,6 +171,12 @@ function generate() {
       exitCode: 1,
     }),
     operatorDeclined: result(j, { status: "operator_closed", terminalId: TERMINAL_ID }),
+    // A terminal that could not open: retryable, the step still waits for its person.
+    operatorTerminalFailed: result(j, {
+      status: "operator_closed",
+      terminalId: TERMINAL_ID,
+      error: "operator_terminal_failed",
+    }),
   };
   // Edge cases both validators must agree on: the TS mirror here, `Job::validate` in Rust.
   const plain = jobs.plainStart;
@@ -184,6 +202,10 @@ function generate() {
   // A dispatch never omits it, but `Option<u64>` in Rust decodes an absent field as None.
   const wireCases = {
     accepted: {
+      operatorUnknownAuthorship: {
+        ...jobs.interactiveStart,
+        operator: { terminalId: TERMINAL_ID, commandAuthor: "unknown" },
+      },
       statusFeffIsNotBlank: external("\ufeff"),
       stopFeffIsNotBlank: external("status", "\ufeff"),
       embeddingTextFeffIsNotBlank: embeddings("\ufeff"),
@@ -226,9 +248,25 @@ function generate() {
       ownerEpochSlash: { ...plain, ownerEpoch: "epoch/7" },
       operatorNonCanonical: {
         ...jobs.interactiveStart,
-        operator: { terminalId: "AAECAwQFBgcICQoLDA0ODx" },
+        operator: { terminalId: "AAECAwQFBgcICQoLDA0ODx", commandAuthor: "user" },
       },
-      operatorWithoutInteractive: { ...plain, operator: { terminalId: TERMINAL_ID } },
+      operatorWithoutInteractive: {
+        ...plain,
+        operator: { terminalId: TERMINAL_ID, commandAuthor: "user" },
+      },
+      operatorNull: { ...jobs.interactiveStart, operator: null },
+      operatorWithoutAuthor: {
+        ...jobs.interactiveStart,
+        operator: { terminalId: TERMINAL_ID },
+      },
+      operatorUnknownAuthor: {
+        ...jobs.interactiveStart,
+        operator: { terminalId: TERMINAL_ID, commandAuthor: "person" },
+      },
+      operatorExtraField: {
+        ...jobs.interactiveStart,
+        operator: { terminalId: TERMINAL_ID, commandAuthor: "user", viewerId: "x" },
+      },
     },
   };
   // The forwarder slug rules (`validateForwarderSlug`, Rust `slug::validate_slug`) on their own,

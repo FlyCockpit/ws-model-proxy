@@ -11,7 +11,10 @@ import {
 } from "@ws-model-proxy/api/lib/relay-protocol-version";
 import { adapterRouteIsValid } from "@ws-model-proxy/api/lib/remote-engine-adapters";
 import { normalizeReportedHostname } from "@ws-model-proxy/config/cli-device-name";
-import { isCanonicalBase64Url16 } from "@ws-model-proxy/config/deployment-job-wire";
+import {
+  deploymentJobOperatorValid,
+  isCanonicalBase64Url16,
+} from "@ws-model-proxy/config/deployment-job-wire";
 import {
   DEPLOYMENT_OPERATOR_RESULT_STATUSES,
   type DeploymentJob,
@@ -1397,9 +1400,7 @@ export function encodeRelayServerControlMessage(message: RelayServerControlMessa
   if (
     message.type === "deployment.job" &&
     (message.interactive === true) !==
-      (message.operator !== undefined &&
-        Object.keys(message.operator).length === 1 &&
-        isCanonicalBase64Url16(message.operator.terminalId))
+      (message.operator !== undefined && deploymentJobOperatorValid(message.operator))
   ) {
     throw new RelayProtocolError(
       "deployment.job operator must accompany exactly interactive jobs.",

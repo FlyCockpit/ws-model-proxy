@@ -1264,6 +1264,7 @@ fn seeded_record(job: Job, stopped: bool, pad: usize) -> Record {
         consecutive_health_failures: 0,
         consecutive_health_successes: 0,
         stopped_at: stopped.then_some(T0),
+        operator: None,
         job,
     }
 }
@@ -1519,6 +1520,14 @@ fn current_job_wire_matches_shared_golden() {
         let result = JobResult::operator(&interactive, progress).expect(name);
         assert_eq!(encode(&result), results[name], "{name}");
     }
+    assert_eq!(
+        encode(
+            &JobResult::operator_failed(&interactive, "operator_terminal_failed")
+                .expect("operator job")
+        ),
+        results["operatorTerminalFailed"]
+    );
+    assert!(JobResult::operator_failed(&golden_job("plainStart"), "x").is_none());
     assert!(JobResult::operator(&golden_job("plainStart"), OperatorProgress::Awaiting).is_none());
 }
 
@@ -1570,6 +1579,8 @@ fn server_shaped_plain_job_runs_unchanged() {
     assert_eq!(runtime.launches.get(), 1);
 }
 
+/// Without operator terminals (no Unix PTY), every job with an interactive
+/// field is refused before any state is touched.
 #[test]
 fn interactive_jobs_are_refused_before_any_state_or_launch() {
     let root = tempfile::tempdir().expect("root");
@@ -1668,6 +1679,21 @@ fn interactive_fields_follow_the_server_intent_rules() {
     let mut extra = job_golden()["jobs"]["interactiveStart"].clone();
     extra["operator"]["viewerId"] = "x".into();
     assert!(serde_json::from_value::<Job>(extra).is_err());
+    let mut author = job_golden()["jobs"]["interactiveStart"].clone();
+    author["operator"]["commandAuthor"] = "person".into();
+    assert!(serde_json::from_value::<Job>(author).is_err());
+    let mut no_author = job_golden()["jobs"]["interactiveStart"].clone();
+    no_author["operator"]
+        .as_object_mut()
+        .expect("operator")
+        .remove("commandAuthor");
+    assert!(serde_json::from_value::<Job>(no_author).is_err());
+    assert_eq!(
+        golden_job("interactiveStop")
+            .operator
+            .map(|operator| operator.command_author),
+        Some(CommandAuthor::Agent)
+    );
     let mut extra = job_golden()["jobs"]["plainStart"].clone();
     extra["operatorTerminal"] = "x".into();
     assert!(serde_json::from_value::<Job>(extra).is_err());
@@ -1687,6 +1713,7 @@ impl TerminalId for Job {
     fn terminal(&mut self, id: &str) {
         self.operator = Some(Operator {
             terminal_id: id.into(),
+            command_author: CommandAuthor::Unknown,
         });
     }
 }

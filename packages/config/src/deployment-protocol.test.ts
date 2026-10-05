@@ -52,7 +52,11 @@ describe("2.11 job and result fields", () => {
     expect(deploymentJobNeedsOperator({})).toBe(false);
     expect(deploymentJobNeedsOperator({ interactive: true })).toBe(true);
     expect(deploymentJobNeedsOperator({ stopInteractive: true })).toBe(true);
-    expect(deploymentJobNeedsOperator({ operator: { terminalId: "A".repeat(22) } })).toBe(true);
+    expect(
+      deploymentJobNeedsOperator({
+        operator: { terminalId: "A".repeat(22), commandAuthor: "unknown" },
+      }),
+    ).toBe(true);
   });
 
   it("classifies the operator progress statuses", () => {
@@ -65,7 +69,9 @@ describe("2.11 job and result fields", () => {
   it("bounds an interactive job's frame including its operator terminal", () => {
     const plain = deploymentJobFrameBytes(intent) ?? 0;
     const interactive = deploymentJobFrameBytes({ ...intent, interactive: true }) ?? 0;
-    const terminal = JSON.stringify({ operator: { terminalId: "A".repeat(22) } }).length - 2;
+    const terminal =
+      JSON.stringify({ operator: { terminalId: "A".repeat(22), commandAuthor: "unknown" } })
+        .length - 2;
     // `,"interactive":true` plus `,"operator":{...}`.
     expect(interactive).toBe(plain + ',"interactive":true'.length + 1 + terminal);
     const job: DeploymentJob = {
@@ -76,7 +82,7 @@ describe("2.11 job and result fields", () => {
       ownerEpoch: `${"0".repeat(36)}:${"9".repeat(16)}`,
       actor: "AGENT",
       humanApproved: false,
-      operator: { terminalId: "AAECAwQFBgcICQoLDA0ODw" },
+      operator: { terminalId: "AAECAwQFBgcICQoLDA0ODw", commandAuthor: "unknown" },
     };
     expect(new TextEncoder().encode(JSON.stringify(job)).byteLength).toBe(interactive);
   });

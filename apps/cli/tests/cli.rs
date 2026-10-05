@@ -2273,7 +2273,10 @@ impl ConfirmChild {
         builder.args(["terminal", "supervised-run", "--deployment"]);
         builder.cwd(cwd);
         builder.env("WSMP_SUPERVISED_OPERATOR", request.to_string());
-        builder.env("WSMP_SUPERVISED_MARKER", Self::MARKER);
+        // The marker comes in a private file the child removes, never in env.
+        let marker_file = cwd.join("operator-marker");
+        fs::write(&marker_file, Self::MARKER).expect("marker file");
+        builder.env("WSMP_SUPERVISED_MARKER_FILE", marker_file.as_os_str());
         Self::start(pair, builder)
     }
 
@@ -2470,6 +2473,7 @@ fn operator_request(command: &str) -> serde_json::Value {
         "action": "start",
         "requestedBy": "AGENT",
         "humanApproved": true,
+        "commandAuthor": "unknown",
         "command": command,
     })
 }
@@ -2496,12 +2500,16 @@ fn operator_screen_runs_after_go_retries_a_failure_and_ends_on_success() {
         "# \\u{202e}gpj",
         "Step: start the service",
         "Requested by: an agent; you confirmed the plan",
-        "Command written by: not known here.",
+        "Command written by: not known.",
         "Enter to run · Ctrl-C, Ctrl-D or q to close",
     ] {
         assert!(screen.contains(part), "missing {part:?} in {screen}");
     }
     assert!(!screen.contains('\u{202e}'), "bidi override drawn raw");
+    assert!(
+        !tmp.path().join("operator-marker").exists(),
+        "the child removes the marker file before drawing"
+    );
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert!(!count.exists(), "type-ahead ran the command");
     child.type_keys(b"\r");
@@ -2656,18 +2664,45 @@ fn operator_screen_refuses_a_bad_request_before_drawing() {
     let witness = tmp.path().join("ran");
     let mut request = operator_request(&format!("touch {}", witness.display()));
     request["action"] = json!("status");
+    let marker_file = tmp.path().join("marker");
+    fs::write(&marker_file, "0123456789abcdef0123456789abcdef").unwrap();
     cli(&config, &state)
         .args(["terminal", "supervised-run", "--deployment"])
         .env("WSMP_SUPERVISED_OPERATOR", request.to_string())
-        .env("WSMP_SUPERVISED_MARKER", "0123456789abcdef0123456789abcdef")
+        .env("WSMP_SUPERVISED_MARKER_FILE", marker_file.as_os_str())
         .write_stdin("\n")
         .assert()
         .failure()
         .stderr(predicate::str::contains("cannot be interactive"));
+    assert!(!marker_file.exists(), "taken before the request is checked");
+    // A marker in env is not taken: only the private file counts.
+    cli(&config, &state)
+        .args(["terminal", "supervised-run", "--deployment"])
+        .env(
+            "WSMP_SUPERVISED_OPERATOR",
+            operator_request("true").to_string(),
+        )
+        .env("WSMP_SUPERVISED_MARKER", "0123456789abcdef0123456789abcdef")
+        .env_remove("WSMP_SUPERVISED_MARKER_FILE")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("started by the relay daemon"));
+    fs::write(&marker_file, "not-a-marker").unwrap();
+    cli(&config, &state)
+        .args(["terminal", "supervised-run", "--deployment"])
+        .env(
+            "WSMP_SUPERVISED_OPERATOR",
+            operator_request("true").to_string(),
+        )
+        .env("WSMP_SUPERVISED_MARKER_FILE", marker_file.as_os_str())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("malformed"));
+    fs::write(&marker_file, "0123456789abcdef0123456789abcdef").unwrap();
     cli(&config, &state)
         .args(["terminal", "supervised-run", "--deployment"])
         .env_remove("WSMP_SUPERVISED_OPERATOR")
-        .env("WSMP_SUPERVISED_MARKER", "0123456789abcdef0123456789abcdef")
+        .env("WSMP_SUPERVISED_MARKER_FILE", marker_file.as_os_str())
         .assert()
         .failure()
         .stderr(predicate::str::contains("started by the relay daemon"));

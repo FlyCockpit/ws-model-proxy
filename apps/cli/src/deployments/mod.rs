@@ -181,6 +181,21 @@ pub struct Health {
 pub struct Operator {
     /// 16 random bytes, unpadded base64url (22 characters).
     pub terminal_id: String,
+    /// Who wrote `command`, as the server judged it at dispatch. The
+    /// confirm screen shows it; it changes nothing else.
+    pub command_author: CommandAuthor,
+}
+
+/// Who wrote an interactive job's command text (`DeploymentCommandAuthor`).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CommandAuthor {
+    /// A person saved this exact text and no agent ever did.
+    User,
+    /// An agent saved this exact text in some revision.
+    Agent,
+    /// Not shown either way.
+    Unknown,
 }
 
 impl Operator {
@@ -195,9 +210,52 @@ impl Operator {
 }
 
 /// Error code for a 2.11 interactive job (`interactive`, `stopInteractive` or
-/// `operator`) that this CLI decodes but cannot yet run. It is refused before
-/// any state is touched, so nothing runs and nothing is recorded.
+/// `operator`) on a CLI that cannot open operator terminals (no Unix PTY; its
+/// hello does not report `deploymentOperator`). It is refused before any
+/// state is touched, so nothing runs and nothing is recorded.
 pub const INTERACTIVE_UNSUPPORTED: &str = "interactive_unsupported";
+/// A start/after_join/stop whose operator run exited 0 but whose status proof
+/// did not follow: the step failed, the service state is what status says.
+pub const OPERATOR_UNVERIFIED: &str = "operator_unverified";
+/// A job with an interactive field while the local operator-terminal switch
+/// (`allowDeploymentOperatorTerminal`) is off: refused before any state is
+/// touched.
+pub const OPERATOR_TERMINALS_DISABLED: &str = "operator_terminals_disabled";
+
+/// What executing a job asks of the caller.
+#[derive(Debug)]
+pub enum Execution {
+    /// The job settled (or failed) here; send this result.
+    Done(JobResult),
+    /// An interactive job needs its operator terminal. The pending step is
+    /// durable; nothing has run.
+    Operator(Box<OperatorOpen>),
+}
+
+/// An interactive job waiting for its operator terminal.
+#[derive(Clone, Debug)]
+pub struct OperatorOpen {
+    pub job: Job,
+    /// An earlier terminal for this same step took an Enter before this CLI
+    /// lost it (restart, reconnect): that run's outcome is unknown, and the
+    /// screen says so. A new run still needs a fresh Enter and `go`.
+    pub previous_run_unknown: bool,
+}
+
+/// Durable operator progress of a record's pending interactive step.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct OperatorState {
+    step_id: String,
+    intent_hash: String,
+    /// A person pressed Enter in some terminal for this step.
+    accepted: bool,
+    /// This stop replaced a prepare/start/after_join whose person had pressed
+    /// Enter (the run's outcome is unknown, e.g. its terminal died with a
+    /// reconnect): the service may still be coming up, so status alone can
+    /// never settle the stop.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    launch_run_unknown: bool,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -480,6 +538,15 @@ impl JobResult {
         }
     }
 
+    /// `operator_closed` with `error = code` for an operator terminal that
+    /// could not open: nothing ran and the step still waits for its person
+    /// (retryable, never a step failure). `None` for a non-interactive job.
+    pub fn operator_failed(job: &Job, code: &str) -> Option<Self> {
+        let mut result = Self::operator(job, OperatorProgress::Closed(None))?;
+        result.error = Some(code.to_owned());
+        Some(result)
+    }
+
     /// Operator progress for an interactive job; `None` for any other job.
     pub fn operator(job: &Job, progress: OperatorProgress) -> Option<Self> {
         let operator = job.operator.as_ref()?;
@@ -537,6 +604,9 @@ struct Record {
     /// Unix seconds when a stop was verified; `None` while not stopped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stopped_at: Option<u64>,
+    /// Present while `pending` is an interactive step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operator: Option<OperatorState>,
 }
 
 impl Record {
@@ -779,26 +849,52 @@ impl Executor {
         runtime: &impl Runtime,
         deadline: Deadline,
     ) -> JobResult {
-        if job.validate().is_err() {
-            return JobResult::failure(&job, "bad_job");
+        match self.execute_job_until(job, enabled, mode, false, false, runtime, deadline) {
+            Execution::Done(result) => result,
+            // Unreachable without operator support; kept total for callers
+            // that cannot open terminals.
+            Execution::Operator(open) => JobResult::failure(&open.job, INTERACTIVE_UNSUPPORTED),
         }
-        // The operator-terminal executor is not implemented yet: refuse before
-        // any state is read or written, so the job neither runs nor records.
-        if job.needs_operator() {
-            return JobResult::failure(&job, INTERACTIVE_UNSUPPORTED);
+    }
+
+    /// Executes one job. An interactive job (`interactive`) checks status
+    /// first and either settles here or asks for an operator terminal
+    /// (`Execution::Operator`); `operator_supported` is whether this CLI can
+    /// open one and `operator_terminals` the local operator-terminal switch.
+    /// A job carrying any interactive field is refused before any state is
+    /// touched when either is missing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_job_until(
+        &mut self,
+        job: Job,
+        enabled: bool,
+        mode: McpCommandMode,
+        operator_supported: bool,
+        operator_terminals: bool,
+        runtime: &impl Runtime,
+        deadline: Deadline,
+    ) -> Execution {
+        if job.validate().is_err() {
+            return Execution::Done(JobResult::failure(&job, "bad_job"));
+        }
+        if job.needs_operator() && !operator_supported {
+            return Execution::Done(JobResult::failure(&job, INTERACTIVE_UNSUPPORTED));
         }
         if !enabled {
-            return JobResult::failure(&job, "feature_disabled");
+            return Execution::Done(JobResult::failure(&job, "feature_disabled"));
+        }
+        if job.needs_operator() && !operator_terminals {
+            return Execution::Done(JobResult::failure(&job, OPERATOR_TERMINALS_DISABLED));
         }
         if job.actor == Actor::Agent
             && (mode == McpCommandMode::Off
                 || (mode == McpCommandMode::Supervised && !job.human_approved))
         {
-            return JobResult::failure(&job, "command_mode_denied");
+            return Execution::Done(JobResult::failure(&job, "command_mode_denied"));
         }
         match self.execute_inner(&job, runtime, deadline) {
-            Ok(result) => result,
-            Err(_) => JobResult::failure(&job, "execution_unconfirmed"),
+            Ok(execution) => execution,
+            Err(_) => Execution::Done(JobResult::failure(&job, "execution_unconfirmed")),
         }
     }
 
@@ -807,7 +903,8 @@ impl Executor {
         job: &Job,
         runtime: &impl Runtime,
         deadline: Deadline,
-    ) -> Result<JobResult> {
+    ) -> Result<Execution> {
+        let interactive = job.interactive == Some(true);
         deadline.remaining()?;
         anyhow::ensure!(!runtime.cancelled(), "session disconnected");
         let key = job.key();
@@ -857,7 +954,7 @@ impl Executor {
                 }
                 let mut result = done.result.clone();
                 result.owner_epoch = job.owner_epoch.clone();
-                return Ok(result);
+                return Ok(Execution::Done(result));
             }
             if let Some(pending) = &record.pending {
                 anyhow::ensure!(
@@ -866,11 +963,17 @@ impl Executor {
                     "another action is unresolved"
                 );
                 // A launch can have happened before the CLI died. Never replay it.
-                if matches!(
-                    job.action,
-                    Action::Prepare | Action::Start | Action::AfterJoin
-                ) {
-                    return self.adopt_launch(job, runtime, deadline);
+                // An interactive step is settled by status first instead, and
+                // a new run always needs a fresh Enter in a new terminal.
+                if !interactive
+                    && matches!(
+                        job.action,
+                        Action::Prepare | Action::Start | Action::AfterJoin
+                    )
+                {
+                    return self
+                        .adopt_launch(job, runtime, deadline)
+                        .map(Execution::Done);
                 }
             }
         } else {
@@ -896,6 +999,7 @@ impl Executor {
                     consecutive_health_failures: 0,
                     consecutive_health_successes: 0,
                     stopped_at: None,
+                    operator: None,
                 },
             );
         }
@@ -913,6 +1017,32 @@ impl Executor {
         if job.action == Action::Start {
             record.job = job.clone();
         }
+        // An earlier terminal for this very step took an Enter: its outcome is
+        // unknown. Any other pending step's operator state no longer applies.
+        let same_step = record.operator.as_ref().filter(|operator| {
+            operator.step_id == job.step_id && operator.intent_hash == job.intent_hash
+        });
+        let previous_run_unknown = same_step.is_some_and(|operator| operator.accepted);
+        // Captured before this stop's state replaces the launch's, and kept
+        // across deliveries of the same stop.
+        let launch_run_unknown = job.action == Action::Stop
+            && (same_step.is_some_and(|operator| operator.launch_run_unknown)
+                || record.pending.as_ref().is_some_and(|pending| {
+                    matches!(
+                        pending.action,
+                        Action::Prepare | Action::Start | Action::AfterJoin
+                    ) && record.operator.as_ref().is_some_and(|operator| {
+                        operator.step_id == pending.step_id
+                            && operator.intent_hash == pending.intent_hash
+                            && operator.accepted
+                    })
+                }));
+        record.operator = (interactive || launch_run_unknown).then(|| OperatorState {
+            step_id: job.step_id.clone(),
+            intent_hash: job.intent_hash.clone(),
+            accepted: previous_run_unknown,
+            launch_run_unknown,
+        });
         record.pending = Some(job.clone());
         if matches!(
             job.action,
@@ -946,6 +1076,15 @@ impl Executor {
         anyhow::ensure!(!runtime.cancelled(), "session disconnected");
 
         deadline.remaining()?;
+        if interactive {
+            return self.interactive_first(
+                job,
+                previous_run_unknown,
+                launch_run_unknown,
+                runtime,
+                deadline,
+            );
+        }
         let outcome = match job.action {
             Action::Prepare | Action::Start | Action::AfterJoin => {
                 let unit = phase_unit(job);
@@ -982,13 +1121,12 @@ impl Executor {
             }
             Action::Readiness => {
                 anyhow::ensure!(
-                    runtime
-                        .launch_completed(
-                            &self.state.records.get(&key).context("record")?.job,
-                            &self.state.owner_id,
-                            deadline
-                        )?
-                        .is_some(),
+                    serving_confirmed(
+                        self.state.records.get(&key).context("record")?,
+                        &self.state.owner_id,
+                        runtime,
+                        deadline
+                    )?,
                     "serving process unconfirmed"
                 );
                 while !runtime.healthy_until(job, deadline.cap(Duration::from_secs(2))) {
@@ -1002,13 +1140,12 @@ impl Executor {
             }
             Action::Health | Action::Status => {
                 anyhow::ensure!(
-                    runtime
-                        .launch_completed(
-                            &self.state.records.get(&key).context("record")?.job,
-                            &self.state.owner_id,
-                            deadline
-                        )?
-                        .is_some(),
+                    serving_confirmed(
+                        self.state.records.get(&key).context("record")?,
+                        &self.state.owner_id,
+                        runtime,
+                        deadline
+                    )?,
                     "serving process unconfirmed"
                 );
                 let healthy = if !job.command.trim().is_empty() {
@@ -1043,67 +1180,253 @@ impl Executor {
                     if healthy { None } else { Some("unhealthy") },
                 )
             }
-            Action::Stop => {
-                let record = self.state.records.get(&key).context("record")?;
-                // A failed/empty start has never established the declared
-                // backend boundary. Cleaning its wrapper cannot settle a
-                // potentially detached backend or release its claims.
-                anyhow::ensure!(
-                    job.management != Management::OwnedProcess
-                        || record.invocations.contains_key(&job.unit_name),
-                    "owned backend launch was never confirmed"
-                );
-                // A pending launch may have executed before its reply was persisted.
-                let mut units = record.invocations.clone();
-                for unit in [
-                    job.unit_name.clone(),
-                    format!("{}-prepare", job.unit_name),
-                    format!("{}-after-join", job.unit_name),
-                ] {
-                    if let Some(identity) =
-                        runtime.identity(&unit, &self.state.owner_id, deadline)?
-                    {
-                        units.entry(unit).or_insert(identity);
-                    }
-                }
-                if let Some(stop) = job.stop_command.as_deref().filter(|s| !s.trim().is_empty()) {
-                    runtime.shell_until(stop, deadline)?;
-                }
-                for (unit, invocation) in units {
-                    if invocation != "external" && invocation != "self-detached" {
-                        runtime.stop(&unit, &self.state.owner_id, &invocation, deadline)?;
-                    } else {
-                        anyhow::ensure!(
-                            job.status_command
-                                .as_ref()
-                                .is_some_and(|s| !s.trim().is_empty()),
-                            "detached stop requires status proof"
-                        );
-                    }
-                }
-                if let Some(status) = job
-                    .status_command
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                {
-                    // External detached services are stopped only on a verified
-                    // negative status, not missing record/disconnected socket.
-                    anyhow::ensure!(
-                        !runtime.status_until(status, deadline.cap(Duration::from_secs(30)))?,
-                        "external service remains alive"
-                    );
-                }
-                deadline.remaining()?;
-                anyhow::ensure!(!runtime.cancelled(), "session disconnected");
-                let now = (self.clock)();
-                let record = self.state.records.get_mut(&key).context("record")?;
-                record.invocations.clear();
-                record.phase = "stopped".into();
-                record.stopped_at = Some(now);
-                JobResult::new(job, true, true, None)
-            }
+            // After a person's launch run of unknown outcome, the service may
+            // still be coming up: poll for stopped instead of one read.
+            Action::Stop => self
+                .stop_teardown(job, true, launch_run_unknown, runtime, deadline)?
+                .context("external service remains alive")?,
         };
-        self.complete(job, outcome)
+        self.complete(job, outcome).map(Execution::Done)
+    }
+
+    /// Stops what a stop job covers: the recipe's stop command when
+    /// `run_stop_command` (an interactive stop's person ran it instead), every
+    /// owned unit, then requires status to show the service stopped (polled
+    /// until the deadline when `poll_status`: a person's stop may return
+    /// before the service is down). Marks the record stopped and returns the
+    /// result for the caller to complete; `None` when status still shows the
+    /// service alive.
+    fn stop_teardown(
+        &mut self,
+        job: &Job,
+        run_stop_command: bool,
+        poll_status: bool,
+        runtime: &impl Runtime,
+        deadline: Deadline,
+    ) -> Result<Option<JobResult>> {
+        let key = job.key();
+        let record = self.state.records.get(&key).context("record")?;
+        // A failed/empty start has never established the declared
+        // backend boundary. Cleaning its wrapper cannot settle a
+        // potentially detached backend or release its claims.
+        anyhow::ensure!(
+            job.management != Management::OwnedProcess
+                || record.invocations.contains_key(&job.unit_name),
+            "owned backend launch was never confirmed"
+        );
+        // A pending launch may have executed before its reply was persisted.
+        let mut units = record.invocations.clone();
+        for unit in [
+            job.unit_name.clone(),
+            format!("{}-prepare", job.unit_name),
+            format!("{}-after-join", job.unit_name),
+        ] {
+            if let Some(identity) = runtime.identity(&unit, &self.state.owner_id, deadline)? {
+                units.entry(unit).or_insert(identity);
+            }
+        }
+        if run_stop_command
+            && let Some(stop) = job.stop_command.as_deref().filter(|s| !s.trim().is_empty())
+        {
+            runtime.shell_until(stop, deadline)?;
+        }
+        for (unit, invocation) in units {
+            if invocation != "external" && invocation != "self-detached" {
+                runtime.stop(&unit, &self.state.owner_id, &invocation, deadline)?;
+            } else {
+                anyhow::ensure!(
+                    job.status_command
+                        .as_ref()
+                        .is_some_and(|s| !s.trim().is_empty()),
+                    "detached stop requires status proof"
+                );
+            }
+        }
+        if let Some(status) = job
+            .status_command
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        {
+            // External detached services are stopped only on a verified
+            // negative status, not missing record/disconnected socket.
+            let stopped = if poll_status {
+                wait_for_status(runtime, status, false, deadline)?
+            } else {
+                !runtime.status_until(status, deadline.cap(Duration::from_secs(30)))?
+            };
+            if !stopped {
+                return Ok(None);
+            }
+        }
+        deadline.remaining()?;
+        anyhow::ensure!(!runtime.cancelled(), "session disconnected");
+        let now = (self.clock)();
+        let record = self.state.records.get_mut(&key).context("record")?;
+        record.invocations.clear();
+        record.phase = "stopped".into();
+        record.stopped_at = Some(now);
+        Ok(Some(JobResult::new(job, true, true, None)))
+    }
+
+    /// The status-first check of an interactive step, after its pending
+    /// record is durable. A start/after_join whose status already shows the
+    /// service alive adopts it as external; a stop whose status already shows
+    /// it stopped settles (owned units are still stopped here). Otherwise the
+    /// step needs its operator terminal. A prepare has no status to check.
+    fn interactive_first(
+        &mut self,
+        job: &Job,
+        previous_run_unknown: bool,
+        launch_run_unknown: bool,
+        runtime: &impl Runtime,
+        deadline: Deadline,
+    ) -> Result<Execution> {
+        let status = job
+            .status_command
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .context("interactive job requires status proof")?;
+        let observed = || runtime.status_until(status, deadline.cap(Duration::from_secs(30)));
+        let settled = match job.action {
+            Action::Start | Action::AfterJoin => match observed() {
+                Ok(true) => {
+                    self.adopt_external(job)?;
+                    Some(JobResult::new(job, true, false, None))
+                }
+                // Not alive, or not known: a person decides, and the result
+                // still needs status proof afterwards.
+                Ok(false) | Err(_) => None,
+            },
+            // A launch run of unknown outcome may still be starting the
+            // service: a person runs the stop, and its proof is polled.
+            Action::Stop if launch_run_unknown => None,
+            Action::Stop => match observed() {
+                Ok(false) => Some(
+                    self.stop_teardown(job, false, false, runtime, deadline)?
+                        .context("external service remains alive")?,
+                ),
+                Ok(true) | Err(_) => None,
+            },
+            _ => None,
+        };
+        if let Some(result) = settled {
+            return self.complete(job, result).map(Execution::Done);
+        }
+        anyhow::ensure!(!runtime.cancelled(), "session disconnected");
+        Ok(Execution::Operator(Box::new(OperatorOpen {
+            job: job.clone(),
+            previous_run_unknown,
+        })))
+    }
+
+    fn adopt_external(&mut self, job: &Job) -> Result<()> {
+        self.state
+            .records
+            .get_mut(&job.key())
+            .context("record")?
+            .invocations
+            .insert(phase_unit(job), "external".to_owned());
+        Ok(())
+    }
+
+    /// The pending interactive step `job` matches this record.
+    fn operator_pending(&self, job: &Job) -> bool {
+        self.state.records.get(&job.key()).is_some_and(|record| {
+            record.pending.as_ref().is_some_and(|pending| {
+                pending.step_id == job.step_id && pending.intent_hash == job.intent_hash
+            }) && record.operator.as_ref().is_some_and(|operator| {
+                operator.step_id == job.step_id && operator.intent_hash == job.intent_hash
+            })
+        })
+    }
+
+    /// A person pressed Enter in this step's terminal: remember that a run
+    /// started, so a later terminal for the step says its outcome is unknown.
+    /// A step that is no longer pending is left alone.
+    pub fn operator_accepted(&mut self, job: &Job) -> Result<()> {
+        if !self.operator_pending(job) {
+            return Ok(());
+        }
+        let key = job.key();
+        let record = self.state.records.get_mut(&key).context("record")?;
+        if let Some(operator) = record.operator.as_mut() {
+            if operator.accepted {
+                return Ok(());
+            }
+            operator.accepted = true;
+        }
+        let limit = if job.action == Action::Stop {
+            STATE_LIMIT
+        } else {
+            STATE_LIMIT - STOP_RESERVE
+        };
+        self.persist_within(limit, &key)
+    }
+
+    /// The operator's command reported exit 0 and its terminal child exited
+    /// 0. That only triggers the proof: a start/after_join needs status to
+    /// show the service alive (it is then adopted as external), a stop needs
+    /// every owned unit stopped and status to show it stopped. A prepare has
+    /// no status proof; the clean exit is its result. A step no longer
+    /// pending answers from history, or fails.
+    pub fn operator_verify_until(
+        &mut self,
+        job: &Job,
+        enabled: bool,
+        runtime: &impl Runtime,
+        deadline: Deadline,
+    ) -> JobResult {
+        if job.validate().is_err() || job.interactive != Some(true) {
+            return JobResult::failure(job, "bad_job");
+        }
+        if let Some(done) = self
+            .state
+            .records
+            .get(&job.key())
+            .and_then(|record| record.completed.get(&job.step_id))
+            .filter(|done| done.hash == job.intent_hash)
+        {
+            let mut result = done.result.clone();
+            result.owner_epoch = job.owner_epoch.clone();
+            return result;
+        }
+        if !self.operator_pending(job) {
+            return JobResult::failure(job, "execution_unconfirmed");
+        }
+        if !enabled {
+            return JobResult::failure(job, "feature_disabled");
+        }
+        let verified = (|| -> Result<Option<JobResult>> {
+            deadline.remaining()?;
+            anyhow::ensure!(!runtime.cancelled(), "session disconnected");
+            match job.action {
+                Action::Prepare => Ok(Some(JobResult::new(job, true, false, None))),
+                Action::Start | Action::AfterJoin => {
+                    let status = job
+                        .status_command
+                        .as_deref()
+                        .context("interactive job requires status proof")?;
+                    // A person's start may return before the service is up.
+                    if wait_for_status(runtime, status, true, deadline)? {
+                        self.adopt_external(job)?;
+                        Ok(Some(JobResult::new(job, true, false, None)))
+                    } else {
+                        Ok(None)
+                    }
+                }
+                // `None` (still alive at the deadline) is `operator_unverified`;
+                // a failed unit stop or a cancellation is an execution error.
+                Action::Stop => self.stop_teardown(job, false, true, runtime, deadline),
+                _ => anyhow::bail!("action cannot be interactive"),
+            }
+        })();
+        match verified {
+            Ok(Some(result)) => self
+                .complete(job, result)
+                .unwrap_or_else(|_| JobResult::failure(job, "execution_unconfirmed")),
+            Ok(None) => JobResult::failure(job, OPERATOR_UNVERIFIED),
+            Err(_) => JobResult::failure(job, "execution_unconfirmed"),
+        }
     }
 
     fn adopt_launch(
@@ -1141,6 +1464,11 @@ impl Executor {
             .filter_map(|record| record.pending.clone())
             .collect::<Vec<_>>();
         for job in pending {
+            // An interactive step settles only through its status-first
+            // dispatch or its operator's verified run, never by observation.
+            if job.interactive == Some(true) {
+                continue;
+            }
             if matches!(
                 job.action,
                 Action::Prepare | Action::Start | Action::AfterJoin
@@ -1175,6 +1503,7 @@ impl Executor {
             },
         );
         record.pending = None;
+        record.operator = None;
         record.observed_step = job.step_id.clone();
         record.observed_hash = job.intent_hash.clone();
         // An effect already happened: record it whenever it fits at all.
@@ -1205,9 +1534,8 @@ impl Executor {
                             .identity(unit, &self.state.owner_id, deadline)
                             .is_ok_and(|seen| seen.as_ref() == Some(identity))
                     })
-                    && runtime
-                        .launch_completed(job, &self.state.owner_id, deadline)
-                        .is_ok_and(|seen| seen.is_some());
+                    && serving_confirmed(record, &self.state.owner_id, runtime, deadline)
+                        .is_ok_and(|serving| serving);
                 let absent = record.phase == "stopped"
                     && [
                         job.unit_name.clone(),
@@ -1271,6 +1599,63 @@ impl Executor {
             .map(|record| record.job.clone())
             .collect()
     }
+}
+
+/// Time between status probes while waiting for an operator's proof.
+const OPERATOR_STATUS_POLL: Duration = Duration::from_millis(500);
+
+/// Polls `status` until it shows `alive == want` or the deadline passes
+/// (`Ok(false)`). A probe that fails is no answer: polling continues. A
+/// disconnected session is an error.
+fn wait_for_status(
+    runtime: &impl Runtime,
+    status: &str,
+    want: bool,
+    deadline: Deadline,
+) -> Result<bool> {
+    loop {
+        anyhow::ensure!(!runtime.cancelled(), "session disconnected");
+        if deadline.remaining().is_err() {
+            return Ok(false);
+        }
+        if runtime
+            .status_until(status, deadline.cap(Duration::from_secs(30)))
+            .is_ok_and(|alive| alive == want)
+        {
+            return Ok(true);
+        }
+        if deadline.sleep(OPERATOR_STATUS_POLL).is_err() {
+            return Ok(false);
+        }
+    }
+}
+
+/// Whether the record's serving process is up. A service a person started
+/// (or one that detached itself) runs outside any CLI-owned unit: the
+/// recipe's status command is its proof. A CLI-owned launch is proven by its
+/// unit.
+fn serving_confirmed(
+    record: &Record,
+    owner: &str,
+    runtime: &impl Runtime,
+    deadline: Deadline,
+) -> Result<bool> {
+    let serving = record.invocations.get(&phase_unit(&record.job));
+    if matches!(
+        serving.map(String::as_str),
+        Some("external" | "self-detached")
+    ) {
+        let status = record
+            .job
+            .status_command
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .context("external service requires status proof")?;
+        return runtime.status_until(status, deadline.cap(Duration::from_secs(30)));
+    }
+    Ok(runtime
+        .launch_completed(&record.job, owner, deadline)?
+        .is_some())
 }
 
 fn phase_unit(job: &Job) -> String {
@@ -1906,6 +2291,8 @@ pub fn activation_supported(action: Action, mechanism: &str) -> bool {
         || matches!(mechanism, "systemd+linger" | "macos")
 }
 
+#[cfg(test)]
+mod operator_tests;
 #[cfg(unix)]
 pub mod service;
 #[cfg(test)]

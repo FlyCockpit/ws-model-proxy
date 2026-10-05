@@ -2,6 +2,7 @@ import {
   DEPLOYMENT_COMMAND_MAX_BYTES,
   type DeploymentJob,
   deploymentCommandBytes,
+  isDeploymentCommandAuthor,
 } from "./deployment-protocol";
 import { validateForwarderSlug } from "./forwarder-identifiers";
 
@@ -139,7 +140,7 @@ function interactiveIssue(job: DeploymentJob): string | null {
     return "interactive flag";
   const interactive = job.interactive === true;
   if (interactive !== (job.operator !== undefined)) return "operator";
-  if (job.operator && !isCanonicalBase64Url16(job.operator.terminalId)) return "operator";
+  if (job.operator !== undefined && !deploymentJobOperatorValid(job.operator)) return "operator";
   if (interactive) {
     if (!["prepare", "start", "after_join", "stop"].includes(job.action))
       return "interactive action";
@@ -152,6 +153,24 @@ function interactiveIssue(job: DeploymentJob): string | null {
   if ((interactive || job.stopInteractive === true) && rustBlank(job.statusCommand))
     return "interactive status";
   return null;
+}
+
+/**
+ * The operator object exactly as the CLI's strict decoder takes it: a canonical terminal ID and
+ * a known command author, nothing else.
+ */
+export function deploymentJobOperatorValid(operator: unknown): boolean {
+  if (typeof operator !== "object" || operator === null || Array.isArray(operator)) return false;
+  const keys = Object.keys(operator).sort();
+  const value = operator as { terminalId?: unknown; commandAuthor?: unknown };
+  return (
+    keys.length === 2 &&
+    keys[0] === "commandAuthor" &&
+    keys[1] === "terminalId" &&
+    typeof value.terminalId === "string" &&
+    isCanonicalBase64Url16(value.terminalId) &&
+    isDeploymentCommandAuthor(value.commandAuthor)
+  );
 }
 
 /** 16 bytes as canonical unpadded base64url (22 characters, zero trailing bits). */

@@ -297,6 +297,13 @@ pub struct Config {
     /// Local deployment execution opt-in; every job rechecks the file.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_deployments: bool,
+    /// Local opt-in for interactive recipe steps: an operator terminal in
+    /// which a person runs the step's command (e.g. one that asks for a sudo
+    /// password) from the dashboard. Separate from browser terminals (it
+    /// never opens a shell). Needs `allow_deployments` too; read fresh for
+    /// every job, every Enter and every viewer.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_deployment_operator_terminal: bool,
     /// Remote adapter endpoint slug -> SHA-256 (hex) of the approved canonical spec.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub approved_remote_adapters: std::collections::BTreeMap<String, String>,
@@ -370,6 +377,7 @@ struct ConfigWire {
     allow_remote_metric_sources: bool,
     allow_remote_engine_adapters: bool,
     allow_deployments: bool,
+    allow_deployment_operator_terminal: bool,
     approved_remote_adapters: std::collections::BTreeMap<String, String>,
     metrics: MetricsConfig,
 }
@@ -394,6 +402,7 @@ impl Default for ConfigWire {
             allow_remote_metric_sources: false,
             allow_remote_engine_adapters: false,
             allow_deployments: false,
+            allow_deployment_operator_terminal: false,
             approved_remote_adapters: std::collections::BTreeMap::new(),
             metrics: MetricsConfig::default(),
         }
@@ -424,6 +433,7 @@ impl From<ConfigWire> for Config {
             allow_remote_metric_sources: wire.allow_remote_metric_sources,
             allow_remote_engine_adapters: wire.allow_remote_engine_adapters,
             allow_deployments: wire.allow_deployments,
+            allow_deployment_operator_terminal: wire.allow_deployment_operator_terminal,
             approved_remote_adapters: wire.approved_remote_adapters,
             metrics: wire.metrics,
         }
@@ -448,6 +458,7 @@ impl Default for Config {
             allow_remote_metric_sources: false,
             allow_remote_engine_adapters: false,
             allow_deployments: false,
+            allow_deployment_operator_terminal: false,
             approved_remote_adapters: std::collections::BTreeMap::new(),
             metrics: MetricsConfig::default(),
         }

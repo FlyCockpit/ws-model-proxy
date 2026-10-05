@@ -33,6 +33,15 @@ enum Sub {
     /// on this machine. Turn it on only for a server you would trust with a
     /// shell here.
     SetDeployments { state: Switch },
+    /// Opt in to interactive recipe steps (off by default; needs
+    /// `set-deployments on` too). Such a step (typically one that runs
+    /// `sudo`) waits for a person: wsmp opens an operator terminal that shows
+    /// the exact command, and the command runs only after someone presses
+    /// Enter in it from the dashboard. It never opens a shell and does not
+    /// enable browser terminals (`set-human-terminal`). Read for every job;
+    /// turning it off closes terminals still waiting. Reconnect to refresh
+    /// the server's feature report.
+    SetDeploymentOperatorTerminal { state: Switch },
     /// Print the path to the config file.
     Path,
     /// Create a default JSON config file if one does not already exist.
@@ -122,6 +131,23 @@ pub fn run(args: &Args) -> Result<()> {
             } else {
                 output::line(format!(
                     "set `allowDeployments` to `{}`; reconnect to refresh server preflight",
+                    state.enabled()
+                ))?;
+            }
+        }
+        Sub::SetDeploymentOperatorTerminal { state } => {
+            Config::update(false, |config| {
+                config.allow_deployment_operator_terminal = state.enabled();
+                Ok(())
+            })?;
+            if args.json {
+                output::json(&serde_json::json!({
+                    "key": "allowDeploymentOperatorTerminal",
+                    "value": state.enabled()
+                }))?;
+            } else {
+                output::line(format!(
+                    "set `allowDeploymentOperatorTerminal` to `{}`; reconnect to refresh server preflight",
                     state.enabled()
                 ))?;
             }

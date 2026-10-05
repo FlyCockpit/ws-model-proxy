@@ -9,11 +9,21 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use super::{Deadline, Executor, Job, JobResult, NativeRuntime, Observed};
+use super::{Deadline, Execution, Executor, Job, JobResult, NativeRuntime, Observed, OperatorOpen};
 
 struct Admitted {
     job: Job,
     deadline: Deadline,
+}
+
+/// Work for the deployment worker, which alone holds the state lock.
+enum Work {
+    /// A `deployment.job` from the server.
+    Job(Admitted),
+    /// A person pressed Enter in an operator terminal for this job.
+    OperatorAccepted(Job),
+    /// The operator's command exited 0 in its terminal: check the proof.
+    OperatorVerify(Admitted),
 }
 
 impl Admitted {
@@ -26,13 +36,15 @@ impl Admitted {
 #[derive(Debug)]
 pub struct Update {
     pub result: Option<JobResult>,
+    /// An interactive job whose operator terminal the session must open.
+    pub operator: Option<OperatorOpen>,
     pub instances: Vec<Observed>,
     pub published: Vec<Job>,
     pub endpoints: Vec<crate::config::EndpointConfig>,
 }
 
 pub struct Runner {
-    jobs: SyncSender<Admitted>,
+    jobs: SyncSender<Work>,
     updates: Receiver<Update>,
     cancel: Arc<AtomicBool>,
 }
@@ -56,26 +68,41 @@ fn publish_update(tx: &SyncSender<Update>, cancel: &AtomicBool, mut update: Upda
     }
 }
 
-fn active_sender() -> &'static std::sync::Mutex<Option<SyncSender<Admitted>>> {
-    static ACTIVE: std::sync::OnceLock<std::sync::Mutex<Option<SyncSender<Admitted>>>> =
+fn active_sender() -> &'static std::sync::Mutex<Option<SyncSender<Work>>> {
+    static ACTIVE: std::sync::OnceLock<std::sync::Mutex<Option<SyncSender<Work>>>> =
         std::sync::OnceLock::new();
     ACTIVE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
-pub fn submit(job: Job) -> Result<()> {
-    let admitted = Admitted::new(job);
+fn submit_work(work: Work) -> Result<()> {
     active_sender()
         .lock()
         .map_err(|_| anyhow::anyhow!("deployment queue unavailable"))?
         .as_ref()
         .context("deployment worker unavailable")?
-        .try_send(admitted)
+        .try_send(work)
         .context("deployment queue full")
+}
+
+pub fn submit(job: Job) -> Result<()> {
+    submit_work(Work::Job(Admitted::new(job)))
+}
+
+/// Records that a person pressed Enter for `job` (best effort: it only
+/// changes what a later terminal for the same step says).
+pub fn submit_operator_accepted(job: Job) -> Result<()> {
+    submit_work(Work::OperatorAccepted(job))
+}
+
+/// Checks the proof after the operator's command exited 0; the worker
+/// publishes the step's final result.
+pub fn submit_operator_verify(job: Job) -> Result<()> {
+    submit_work(Work::OperatorVerify(Admitted::new(job)))
 }
 
 impl Runner {
     pub fn start() -> Result<Self> {
-        let (jobs, rx) = mpsc::sync_channel::<Admitted>(32);
+        let (jobs, rx) = mpsc::sync_channel::<Work>(32);
         *active_sender()
             .lock()
             .map_err(|_| anyhow::anyhow!("deployment queue unavailable"))? = Some(jobs.clone());
@@ -88,7 +115,10 @@ impl Runner {
                 let runtime = NativeRuntime {
                     cancel: Some(worker_cancel.clone()),
                 };
-                let publish = |executor: &mut Executor, result, deadline: Deadline| {
+                let publish = |executor: &mut Executor,
+                               result,
+                               operator: Option<OperatorOpen>,
+                               deadline: Deadline| {
                     let _ = executor.reconcile_until(&runtime, deadline);
                     let published = executor.published_jobs_until(&runtime, deadline);
                     // Native probes belong to reconnect initialization, not an
@@ -109,6 +139,7 @@ impl Runner {
                         &worker_cancel,
                         Update {
                             result,
+                            operator,
                             instances: executor.observations_until(&runtime, deadline),
                             published,
                             endpoints,
@@ -128,30 +159,59 @@ impl Runner {
                     let path = super::state_path()?;
                     let _lock = state_lock(&path)?;
                     let mut executor = Executor::load(path)?;
-                    let result = admitted.map(|Admitted { job, deadline }| {
+                    let execution = admitted.map(|Admitted { job, deadline }| {
+                        let failure = |code| Execution::Done(JobResult::failure(&job, code));
                         if worker_cancel.load(Ordering::SeqCst) {
-                            return JobResult::failure(&job, "session_disconnected");
+                            return failure("session_disconnected");
                         }
                         let config = match crate::config::Config::load() {
                             Ok(config) => config,
-                            Err(_) => return JobResult::failure(&job, "local_config_unavailable"),
+                            Err(_) => return failure("local_config_unavailable"),
                         };
                         if !super::activation_supported(
                             job.action,
                             super::mechanism_until(deadline, Some(&worker_cancel)),
                         ) {
-                            return JobResult::failure(&job, "execution_mechanism_unavailable");
+                            return failure("execution_mechanism_unavailable");
                         }
-                        executor.execute_until(
+                        executor.execute_job_until(
                             job,
                             config.allow_deployments,
                             config.mcp_command_mode,
+                            crate::protocol::terminal_supported(),
+                            config.allow_deployment_operator_terminal,
                             &runtime,
                             deadline,
                         )
                     });
+                    let (result, operator) = match execution {
+                        Some(Execution::Done(result)) => (Some(result), None),
+                        Some(Execution::Operator(open)) => (None, Some(*open)),
+                        None => (None, None),
+                    };
                     if !worker_cancel.load(Ordering::SeqCst)
-                        && !publish(&mut executor, result, deadline)
+                        && !publish(&mut executor, result, operator, deadline)
+                    {
+                        anyhow::bail!("deployment update queue unavailable");
+                    }
+                    Ok(())
+                };
+                // Operator follow-ups use the same lock and fresh state.
+                let accepted = |job: Job| -> Result<()> {
+                    let path = super::state_path()?;
+                    let _lock = state_lock(&path)?;
+                    Executor::load(path)?.operator_accepted(&job)
+                };
+                let verify = |Admitted { job, deadline }: Admitted| -> Result<()> {
+                    let path = super::state_path()?;
+                    let _lock = state_lock(&path)?;
+                    let mut executor = Executor::load(path)?;
+                    let enabled = crate::config::Config::load()
+                        .map(|config| config.allow_deployments)
+                        .unwrap_or(false);
+                    let result = executor.operator_verify_until(&job, enabled, &runtime, deadline);
+                    if !worker_cancel.load(Ordering::SeqCst)
+                        && !publish(&mut executor, Some(result), None, deadline)
                     {
                         anyhow::bail!("deployment update queue unavailable");
                     }
@@ -163,6 +223,7 @@ impl Runner {
                         &worker_cancel,
                         Update {
                             result: None,
+                            operator: None,
                             instances: Vec::new(),
                             published: Vec::new(),
                             endpoints: Vec::new(),
@@ -171,7 +232,31 @@ impl Runner {
                 }
                 while !worker_cancel.load(Ordering::SeqCst) {
                     match rx.recv_timeout(Duration::from_millis(100)) {
-                        Ok(admitted) => {
+                        Ok(Work::OperatorAccepted(job)) => {
+                            if accepted(job).is_err() {
+                                tracing::warn!("recording an operator accept failed");
+                            }
+                        }
+                        Ok(Work::OperatorVerify(admitted)) => {
+                            let fallback = admitted.job.clone();
+                            if verify(admitted).is_err() {
+                                let _ = publish_update(
+                                    &tx,
+                                    &worker_cancel,
+                                    Update {
+                                        result: Some(JobResult::failure(
+                                            &fallback,
+                                            "state_unavailable",
+                                        )),
+                                        operator: None,
+                                        instances: Vec::new(),
+                                        published: Vec::new(),
+                                        endpoints: Vec::new(),
+                                    },
+                                );
+                            }
+                        }
+                        Ok(Work::Job(admitted)) => {
                             let fallback = admitted.job.clone();
                             if execute(Some(admitted)).is_err() {
                                 let _ = publish_update(
@@ -182,6 +267,7 @@ impl Runner {
                                             &fallback,
                                             "state_unavailable",
                                         )),
+                                        operator: None,
                                         instances: Vec::new(),
                                         published: Vec::new(),
                                         endpoints: Vec::new(),
@@ -204,7 +290,7 @@ impl Runner {
 
     pub fn submit(&self, job: Job) -> Result<()> {
         self.jobs
-            .try_send(Admitted::new(job))
+            .try_send(Work::Job(Admitted::new(job)))
             .context("deployment queue is full")
     }
 
@@ -259,6 +345,7 @@ mod publication_tests {
     fn update() -> Update {
         Update {
             result: None,
+            operator: None,
             instances: Vec::new(),
             published: Vec::new(),
             endpoints: Vec::new(),

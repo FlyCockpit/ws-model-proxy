@@ -132,7 +132,10 @@ describe("current deployment job / result golden shared with the Rust decoder", 
       expect(deploymentJobNeedsOperator(job), name).toBe(name !== "plainStart");
     }
     const { interactiveStart, interactiveStop } = jobGolden.jobs;
-    expect(interactiveStart.operator).toEqual(interactiveStop.operator);
+    // Terminal ids are per dispatch and never reused.
+    expect(interactiveStart.operator?.terminalId).not.toEqual(interactiveStop.operator?.terminalId);
+    expect(interactiveStart.operator?.commandAuthor).toBe("user");
+    expect(interactiveStop.operator?.commandAuthor).toBe("agent");
     // The interactive stop is the start's derived stop intent.
     expect(intentOf(interactiveStop)).toEqual(
       originalDeploymentStopIntent(intentOf(interactiveStart)),
@@ -142,16 +145,27 @@ describe("current deployment job / result golden shared with the Rust decoder", 
   it("frames an operator terminal with exactly the interactive jobs", () => {
     const { plainStart, interactiveStart } = jobGolden.jobs;
     const { operator, ...withoutOperator } = interactiveStart;
-    for (const job of [
+    const jobs: DeploymentJob[] = [
       withoutOperator,
       { ...plainStart, operator },
-      { ...interactiveStart, operator: { terminalId: "too-short" } },
-      { ...interactiveStart, operator: { terminalId: "A".repeat(23) } },
+      { ...interactiveStart, operator: { terminalId: "too-short", commandAuthor: "user" } },
+      { ...interactiveStart, operator: { terminalId: "A".repeat(23), commandAuthor: "user" } },
       // Decodes to 16 bytes in Node, but the CLI's strict base64 refuses the trailing bits.
-      { ...interactiveStart, operator: { terminalId: "AAECAwQFBgcICQoLDA0ODx" } },
-      { ...interactiveStart, operator: { ...operator, viewerId: "x" } as { terminalId: string } },
-    ])
-      expect(() => encodeRelayServerControlMessage(job)).toThrow(/operator/);
+      {
+        ...interactiveStart,
+        operator: { terminalId: "AAECAwQFBgcICQoLDA0ODx", commandAuthor: "user" },
+      },
+      { ...interactiveStart, operator: { ...operator, viewerId: "x" } as typeof operator },
+      {
+        ...interactiveStart,
+        operator: { terminalId: operator?.terminalId } as unknown as typeof operator,
+      },
+      {
+        ...interactiveStart,
+        operator: { ...operator, commandAuthor: "person" } as unknown as typeof operator,
+      },
+    ];
+    for (const job of jobs) expect(() => encodeRelayServerControlMessage(job)).toThrow(/operator/);
   });
 
   it("accepts every result the Rust encoder produces", () => {

@@ -135,6 +135,11 @@ pub fn hello_capabilities(
 ) -> CliCapabilities {
     let mut capabilities = startup.capabilities(cli_slug);
     capabilities.features.deployments = live.allow_deployments;
+    // Interactive deployment steps run in an operator terminal: only with
+    // both local opt-ins and a PTY.
+    capabilities.features.deployment_operator = live.allow_deployments
+        && live.allow_deployment_operator_terminal
+        && crate::protocol::terminal_supported();
     capabilities
 }
 
@@ -174,12 +179,28 @@ mod tests {
                 .features
                 .deployments
         );
-        // Interactive jobs are refused by this build, so it never claims them.
+        // Operator terminals need deployments, their own switch and a PTY.
+        assert!(!capabilities.features.deployment_operator);
+        assert!(
+            !hello_capabilities(&startup, &config, "desk-01")
+                .features
+                .deployment_operator,
+            "deployments alone do not enable operator terminals"
+        );
+        config.allow_deployment_operator_terminal = true;
+        assert_eq!(
+            hello_capabilities(&startup, &config, "desk-01")
+                .features
+                .deployment_operator,
+            crate::protocol::terminal_supported()
+        );
+        config.allow_deployments = false;
         assert!(
             !hello_capabilities(&startup, &config, "desk-01")
                 .features
                 .deployment_operator
         );
+        config.allow_deployments = true;
         assert!(capabilities.features.human_terminal);
         assert!(
             capabilities.features.remote_metric_sources,
