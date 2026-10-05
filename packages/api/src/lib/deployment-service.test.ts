@@ -3,6 +3,14 @@ import { mockDeep } from "vitest-mock-extended";
 import type { PrismaClient } from "../../../db/prisma/generated/client";
 
 vi.mock("@ws-model-proxy/db", () => ({ default: mockDeep<PrismaClient>() }));
+// The real check by default; one test lifts the "not supported yet" refusal to inspect intents.
+vi.mock("./deployment-spec", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./deployment-spec")>();
+  return {
+    ...actual,
+    variantHasInteractiveCommands: vi.fn(actual.variantHasInteractiveCommands),
+  };
+});
 
 import prisma from "@ws-model-proxy/db";
 import {
@@ -10,7 +18,7 @@ import {
   createDeploymentPlan,
   deploymentExecutionAllowed,
 } from "./deployment-service";
-import { deploymentSpecSchema } from "./deployment-spec";
+import { deploymentSpecSchema, variantHasInteractiveCommands } from "./deployment-spec";
 
 const db = vi.mocked(prisma);
 const person = { userId: "owner", id: "owner", kind: "USER" as const };
@@ -326,5 +334,204 @@ describe("deployment durable API boundary", () => {
       applyDeploymentPlan({ ...person, id: "token", kind: "AGENT" }, "plan", true),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
     expect(db.deploymentRun.create).not.toHaveBeenCalled();
+  });
+});
+
+describe("interactive recipe commands before operator terminals exist", () => {
+  const interactiveCommands = {
+    management: "externalService",
+    start: "start --port {{port}}",
+    stop: "stop --port {{port}}",
+    status: "status --port {{port}}",
+    interactive: { start: true, stop: true },
+  } as const;
+  const interactiveSpec = (commands: Record<string, unknown>[], extra = {}) =>
+    deploymentSpecSchema.parse({
+      variants: [{ ...spec.variants[0], ...extra, commands }],
+    });
+  const revision = (value: unknown, editorKind = "USER") =>
+    resolveMock(db.deploymentConfigRevision.findFirst, {
+      id: "revision",
+      configId: "config",
+      revision: 2,
+      editorKind,
+      spec: value,
+      Config: { slug: "recipe", poolId: "pool" },
+    });
+  const start = { start: { revisionId: "revision", variantKey: "one", groupCount: 1 } };
+  async function applyPlan() {
+    const plan = await createDeploymentPlan(person, start);
+    const recorded = db.deploymentPlan.create.mock.calls.at(-1)?.[0].data;
+    if (!recorded) throw new Error("Expected a persisted plan");
+    resolveMock(db.deploymentPlan.findFirst, {
+      id: "plan",
+      userId: "owner",
+      requesterId: "owner",
+      requesterKind: "USER",
+      state: "PENDING",
+      expiresAt: new Date(Date.now() + 60_000),
+      fingerprint: recorded.fingerprint,
+      contents: plan.contents,
+    });
+    await applyDeploymentPlan(person, "plan", false);
+    return db.deploymentStep.create.mock.calls.map((c) => c[0].data);
+  }
+
+  it.each([
+    ["start", { start: true }],
+    ["stop", { stop: true }],
+  ])("refuses to plan a start whose %s is interactive", async (_field, interactive) => {
+    revision(interactiveSpec([{ ...interactiveCommands, interactive }]));
+    await expect(createDeploymentPlan(person, start)).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+      message: "Interactive recipe commands are not supported yet",
+    });
+    expect(db.deploymentPlan.create).not.toHaveBeenCalled();
+  });
+  it("refuses at admission too, if a plan reaches it for an interactive revision", async () => {
+    const plan = await createDeploymentPlan(person, start);
+    const recorded = db.deploymentPlan.create.mock.calls[0]?.[0].data;
+    if (!recorded) throw new Error("Expected a persisted plan");
+    resolveMock(db.deploymentPlan.findFirst, {
+      id: "plan",
+      userId: "owner",
+      requesterId: "owner",
+      requesterKind: "USER",
+      state: "PENDING",
+      expiresAt: new Date(Date.now() + 60_000),
+      fingerprint: recorded.fingerprint,
+      contents: plan.contents,
+    });
+    revision(interactiveSpec([interactiveCommands]));
+    await expect(applyDeploymentPlan(person, "plan", false)).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+    });
+    expect(db.deploymentInstance.create).not.toHaveBeenCalled();
+    expect(db.deploymentStep.create).not.toHaveBeenCalled();
+  });
+  it("persists automatic intents without any interactive field", async () => {
+    for (const intent of (await applyPlan()).map((step) => step.intent)) {
+      expect(intent).not.toHaveProperty("interactive");
+      expect(intent).not.toHaveProperty("stopInteractive");
+    }
+  });
+  it("sets the flags from the rank's interactive commands per phase", async () => {
+    vi.mocked(variantHasInteractiveCommands).mockReturnValue(false);
+    revision(interactiveSpec([interactiveCommands]));
+    const steps = await applyPlan();
+    expect(steps.map((step) => [step.phase, step.intent])).toEqual([
+      ["start", expect.objectContaining({ interactive: true, stopInteractive: true })],
+      ["readiness", expect.objectContaining({ stopInteractive: true })],
+    ]);
+    expect(steps[1]?.intent).not.toHaveProperty("interactive");
+  });
+  it("marks a multi-node head's prepare and afterJoin phases from their own flags", async () => {
+    vi.mocked(variantHasInteractiveCommands).mockReturnValue(false);
+    const node = (id: string, address: string) => ({
+      ...rawNode,
+      id,
+      nodeInfo: {
+        ...rawNode.nodeInfo,
+        interfaces: [{ name: "eth0", addresses: [address] }],
+      },
+    });
+    resolveMock(db.cliDevice.findMany, [node("head", "10.0.0.1"), node("worker", "10.0.0.2")]);
+    revision(
+      interactiveSpec(
+        [
+          {
+            ...interactiveCommands,
+            prepare: "prepare",
+            afterJoin: "after-join",
+            // `start` is flagged too: the head's start phase must still follow afterJoin.
+            interactive: { prepare: true, start: true },
+          },
+          { ...interactiveCommands, interactive: { start: true } },
+        ],
+        {
+          groupSize: 2,
+          iface: "eth0",
+          resources: [{ kind: "unified", memoryGb: 100 }],
+        },
+      ),
+    );
+    const steps = await applyPlan();
+    const byPhase = Object.fromEntries(
+      steps.map((step) => [`${step.rank}:${step.phase}`, step.intent]),
+    );
+    expect(byPhase["0:prepare"]).toMatchObject({ interactive: true });
+    // The head's start phase runs afterJoin, which is automatic here although `start` is not.
+    expect(byPhase["0:start"]).toMatchObject({ command: "after-join" });
+    expect(byPhase["0:start"]).not.toHaveProperty("interactive");
+    expect(byPhase["1:start"]).toMatchObject({ interactive: true });
+    for (const intent of Object.values(byPhase))
+      expect(intent).not.toHaveProperty("stopInteractive");
+  });
+  it("marks a multi-node head's start phase interactive when its afterJoin is", async () => {
+    vi.mocked(variantHasInteractiveCommands).mockReturnValue(false);
+    const node = (id: string, address: string) => ({
+      ...rawNode,
+      id,
+      nodeInfo: {
+        ...rawNode.nodeInfo,
+        interfaces: [{ name: "eth0", addresses: [address] }],
+      },
+    });
+    resolveMock(db.cliDevice.findMany, [node("head", "10.0.0.1"), node("worker", "10.0.0.2")]);
+    revision(
+      interactiveSpec(
+        [
+          { ...interactiveCommands, afterJoin: "after-join", interactive: { afterJoin: true } },
+          interactiveCommands,
+        ],
+        { groupSize: 2, iface: "eth0", resources: [{ kind: "unified", memoryGb: 100 }] },
+      ),
+    );
+    const steps = await applyPlan();
+    const headStart = steps.find((step) => step.rank === 0 && step.phase === "start")?.intent;
+    expect(headStart).toMatchObject({ command: "after-join", interactive: true });
+  });
+  it("saving is not refused: the strict recipe schema accepts interactive commands", () => {
+    expect(() => interactiveSpec([interactiveCommands])).not.toThrow();
+  });
+  it.each([
+    [
+      "an agent flipped a person's interactive stop to automatic, then the person saved",
+      false,
+      false,
+    ],
+    ["a person flipped an agent's interactive stop to automatic", true, false],
+    ["a person flipped an agent's automatic stop to interactive", false, true],
+  ])("flags agent authorship when %s", async (_case, agentInteractive, currentInteractive) => {
+    vi.mocked(variantHasInteractiveCommands).mockReturnValue(false);
+    const commands = (interactive: boolean) => [
+      { ...interactiveCommands, interactive: interactive ? { stop: true } : {} },
+    ];
+    // The current revision is the person's; the agent's earlier one holds the same text.
+    revision(interactiveSpec(commands(currentInteractive)));
+    resolveMock(db.deploymentConfigRevision.findMany, [
+      { spec: interactiveSpec(commands(agentInteractive)) },
+    ]);
+    await createDeploymentPlan(person, start);
+    expect(db.deploymentPlan.create.mock.calls.at(-1)?.[0].data).toMatchObject({
+      state: "AWAITING_CONFIRMATION",
+      contents: { warnings: ["agent_edited_revision"] },
+    });
+  });
+  it("flags the agent's own flip when it is the revision being started", async () => {
+    vi.mocked(variantHasInteractiveCommands).mockReturnValue(false);
+    revision(interactiveSpec([{ ...interactiveCommands, interactive: {} }]), "AGENT");
+    await createDeploymentPlan(person, start);
+    expect(db.deploymentPlan.create.mock.calls.at(-1)?.[0].data).toMatchObject({
+      contents: { warnings: ["agent_edited_revision"] },
+    });
+  });
+  it("a person's revision no agent touched needs no review", async () => {
+    vi.mocked(variantHasInteractiveCommands).mockReturnValue(false);
+    revision(interactiveSpec([interactiveCommands]));
+    await createDeploymentPlan(person, start);
+    expect(db.deploymentPlan.create.mock.calls.at(-1)?.[0].data).toMatchObject({
+      contents: { warnings: [] },
+    });
   });
 });

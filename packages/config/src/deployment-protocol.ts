@@ -46,6 +46,10 @@ export type DeploymentJob = {
     acceptedMimeTypes?: string[];
   };
   command: string;
+  /** A person runs `command` in an operator terminal; present only when true. */
+  interactive?: true;
+  /** The rank's stop command is interactive; present only when true. */
+  stopInteractive?: true;
   stopCommand?: string;
   statusCommand?: string | null;
   healthCommand?: string | null;

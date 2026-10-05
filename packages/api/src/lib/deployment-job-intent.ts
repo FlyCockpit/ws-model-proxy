@@ -16,6 +16,11 @@ export const deploymentJobIntentSchema = z
     rank: z.number().int().min(0).max(63),
     action: z.enum(["prepare", "start", "after_join", "readiness", "health", "stop", "status"]),
     command: z.string(),
+    /** A person runs `command` in an operator terminal. Present only when true, so intents
+     * without interactive commands (and their hashes) are unchanged. */
+    interactive: z.literal(true).optional(),
+    /** The rank's stop command is interactive; becomes `interactive` on the derived stop. */
+    stopInteractive: z.literal(true).optional(),
     stopCommand: z.string().refine((s) => !!s.trim()),
     statusCommand: z.string().nullable().optional(),
     healthCommand: z.string().nullable().optional(),
@@ -44,22 +49,61 @@ export const deploymentJobIntentSchema = z
         path: ["statusCommand"],
         message: "External services require reliable status.",
       });
+    if (intent.interactive && !["prepare", "start", "after_join", "stop"].includes(intent.action))
+      ctx.addIssue({
+        code: "custom",
+        path: ["interactive"],
+        message: "Only prepare, start and stop jobs can be interactive.",
+      });
+    if (
+      intent.interactive &&
+      intent.action !== "stop" &&
+      intent.action !== "prepare" &&
+      intent.management !== "externalService"
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["management"],
+        message: "An interactive start must be an external service.",
+      });
+    if ((intent.interactive || intent.stopInteractive) && !intent.statusCommand?.trim())
+      ctx.addIssue({
+        code: "custom",
+        path: ["statusCommand"],
+        message: "Interactive jobs require reliable status.",
+      });
   });
 
-/** Only action, command and action deadline may change; all immutable local identity survives. */
+/**
+ * Only action, command, action deadline and whether a person runs the command may change; all
+ * immutable local identity survives. The rank's `stopInteractive` becomes the stop's own
+ * `interactive`.
+ */
 export function originalDeploymentStopIntent(value: unknown) {
-  const original = deploymentJobIntentSchema.parse(value);
+  const {
+    interactive: _interactive,
+    stopInteractive,
+    ...original
+  } = deploymentJobIntentSchema.parse(value);
   return {
     ...original,
+    ...(stopInteractive ? { interactive: true as const } : {}),
     action: "stop" as const,
     command: original.stopCommand,
     timeoutMs: 300_000,
   };
 }
 
-/** Periodic health reuses the rank's start identity with its own command and deadline. */
+/**
+ * Periodic health reuses the rank's start identity with its own command and deadline. Health
+ * is never interactive, so both interactive flags are dropped.
+ */
 export function deploymentHealthIntent(value: unknown) {
-  const start = deploymentJobIntentSchema.parse(value);
+  const {
+    interactive: _interactive,
+    stopInteractive: _stopInteractive,
+    ...start
+  } = deploymentJobIntentSchema.parse(value);
   return {
     ...start,
     action: "health" as const,

@@ -1,6 +1,10 @@
 import { DEPLOYMENT_COMMAND_MAX_BYTES } from "@ws-model-proxy/config/deployment-protocol";
 import { describe, expect, it } from "vitest";
-import { deploymentVariantSchema, storedDeploymentVariantSchema } from "./deployment-spec";
+import {
+  deploymentVariantSchema,
+  storedDeploymentVariantSchema,
+  variantHasInteractiveCommands,
+} from "./deployment-spec";
 
 const base = {
   key: "spark",
@@ -162,5 +166,95 @@ describe("deployment recipe text", () => {
         accepts({ attachment: { type: "transcription", poolId: "pool", transcription: bad } }),
         JSON.stringify(bad).slice(0, 40),
       ).toBe(false);
+  });
+});
+
+describe("interactive recipe commands", () => {
+  const external = {
+    management: "externalService",
+    start: "systemctl start llm",
+    stop: "systemctl stop llm",
+    prepare: "prepare",
+    afterJoin: "after-join",
+    status: "systemctl is-active llm",
+  };
+  const owned = { management: "ownedProcess", start: "serve", stop: "stop", prepare: "prep" };
+  const withCommands = (commands: Record<string, unknown>) =>
+    deploymentVariantSchema.safeParse({ ...base, commands: [commands] });
+
+  it("accepts every interactive phase on an external service with status", () => {
+    for (const interactive of [
+      { start: true },
+      { stop: true },
+      { prepare: true },
+      { afterJoin: true },
+      { start: true, stop: true, prepare: true, afterJoin: true },
+      {},
+    ]) {
+      const parsed = withCommands({ ...external, interactive });
+      expect(parsed.success, JSON.stringify(interactive)).toBe(true);
+      expect(parsed.data?.commands[0]?.interactive).toEqual(interactive);
+    }
+  });
+  it("lets an owned process mark stop or prepare interactive when it has a status command", () => {
+    for (const interactive of [{ stop: true }, { prepare: true }])
+      expect(withCommands({ ...owned, status: "check", interactive }).success).toBe(true);
+  });
+  it("refuses an interactive start or afterJoin unless the rank is an external service", () => {
+    for (const interactive of [{ start: true }, { afterJoin: true }]) {
+      const parsed = withCommands({
+        ...owned,
+        afterJoin: "after",
+        status: "check",
+        interactive,
+      });
+      expect(parsed.success).toBe(false);
+      expect(parsed.error?.issues.map((i) => i.path.at(-1))).toContain("management");
+    }
+  });
+  it("refuses any interactive command without a status command", () => {
+    for (const interactive of [{ stop: true }, { prepare: true }]) {
+      const parsed = withCommands({ ...owned, interactive });
+      expect(parsed.success).toBe(false);
+      expect(parsed.error?.issues.map((i) => i.path.at(-1))).toContain("status");
+    }
+  });
+  it("refuses an interactive phase the rank has no command for", () => {
+    const { prepare: _prepare, afterJoin: _afterJoin, ...bare } = external;
+    expect(withCommands({ ...bare, interactive: { prepare: true } }).success).toBe(false);
+    expect(withCommands({ ...bare, interactive: { afterJoin: true } }).success).toBe(false);
+  });
+  it("never lets status or health be interactive, and takes only literal true", () => {
+    for (const interactive of [
+      { status: true },
+      { health: true },
+      { start: false },
+      { start: "yes" },
+      { unknown: true },
+    ])
+      expect(
+        withCommands({ ...external, health: "curl", interactive }).success,
+        JSON.stringify(interactive),
+      ).toBe(false);
+  });
+  it("the stored schema reads the field without the save-time rules", () => {
+    const stored = storedDeploymentVariantSchema.safeParse({
+      ...base,
+      commands: [{ ...owned, interactive: { start: true, stop: true } }],
+    });
+    expect(stored.success).toBe(true);
+    expect(stored.data?.commands[0]?.interactive).toEqual({ start: true, stop: true });
+    expect(
+      storedDeploymentVariantSchema.safeParse({
+        ...base,
+        commands: [{ ...owned, interactive: { health: true } }],
+      }).success,
+    ).toBe(false);
+  });
+  it("detects a variant with an interactive command on any rank", () => {
+    expect(variantHasInteractiveCommands({ commands: [{}, { interactive: { stop: true } }] })).toBe(
+      true,
+    );
+    expect(variantHasInteractiveCommands({ commands: [{}, { interactive: {} }] })).toBe(false);
   });
 });

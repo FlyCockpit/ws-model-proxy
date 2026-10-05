@@ -160,3 +160,71 @@ describe("deliverable deployment job frames", () => {
     expect(stopBytes).toBeGreaterThan(DEPLOYMENT_JOB_FRAME_MAX_BYTES);
   });
 });
+
+describe("interactive intent fields", () => {
+  it("an intent without interactive fields hashes exactly as it did before they existed", () => {
+    // Frozen from the code before `interactive`/`stopInteractive` were added (HEAD b2348fd).
+    expect(deploymentDerivedIntents(original).map(deploymentFingerprint)).toEqual([
+      "a2a30a0ad9b2e2f0f1350b1b03b3f1a48e02f8df355918a7b14c9c29833d5036",
+      "906153a9e693b5ef83bc1155f07c42ec3d4bcb23a2af16c18798268ccd765f9c",
+      "9645f4caf24e35d6e06bca85afcad87148d8f4352e925dad38d43913e69aca2a",
+    ]);
+    for (const derived of deploymentDerivedIntents(original)) {
+      expect(derived).not.toHaveProperty("interactive");
+      expect(derived).not.toHaveProperty("stopInteractive");
+    }
+  });
+  it("binds the flags into the hash and accepts only literal true", () => {
+    const interactive = { ...original, interactive: true, stopInteractive: true };
+    expect(deploymentFingerprint(deploymentJobIntentSchema.parse(interactive))).not.toBe(
+      deploymentFingerprint(original),
+    );
+    for (const value of [false, "true", 1])
+      for (const field of ["interactive", "stopInteractive"])
+        expect(
+          deploymentJobIntentSchema.safeParse({ ...original, [field]: value }).success,
+          `${field}=${String(value)}`,
+        ).toBe(false);
+  });
+  it("maps stopInteractive to the stop's interactive and strips both from health", () => {
+    const start = { ...original, interactive: true, stopInteractive: true };
+    const [self, stop, health] = deploymentDerivedIntents(start);
+    expect(self).toMatchObject({ interactive: true, stopInteractive: true });
+    expect(stop).toEqual({
+      ...original,
+      interactive: true,
+      action: "stop",
+      command: "original-stop",
+      timeoutMs: 300_000,
+    });
+    expect(health).toEqual(deploymentHealthIntent(original));
+    // An automatic start with an interactive stop, and the reverse.
+    expect(originalDeploymentStopIntent({ ...original, stopInteractive: true })).toHaveProperty(
+      "interactive",
+      true,
+    );
+    const automaticStop = originalDeploymentStopIntent({ ...original, interactive: true });
+    expect(automaticStop).not.toHaveProperty("interactive");
+    expect(deploymentFingerprint(automaticStop)).toBe(
+      deploymentFingerprint(originalDeploymentStopIntent(original)),
+    );
+  });
+  it("refuses interactive flags no execution could honor", () => {
+    const reject = (intent: Record<string, unknown>) =>
+      expect(deploymentJobIntentSchema.safeParse(intent).success, JSON.stringify(intent)).toBe(
+        false,
+      );
+    for (const action of ["health", "status", "readiness"])
+      reject({ ...original, action, interactive: true });
+    reject({ ...original, management: "ownedProcess", interactive: true });
+    reject({ ...original, management: "ownedProcess", statusCommand: null, stopInteractive: true });
+    expect(
+      deploymentJobIntentSchema.safeParse({
+        ...original,
+        management: "ownedProcess",
+        action: "prepare",
+        interactive: true,
+      }).success,
+    ).toBe(true);
+  });
+});

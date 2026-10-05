@@ -100,6 +100,68 @@ export const deploymentResourcesSchema = z.discriminatedUnion("kind", [
     .strict(),
 ]);
 /**
+ * Commands a person runs in an operator terminal instead of the CLI running them. `status`
+ * and `health` are never interactive: the reconciler must be able to run them unattended.
+ */
+const interactiveCommandsSchema = z
+  .object({
+    start: z.literal(true).optional(),
+    stop: z.literal(true).optional(),
+    prepare: z.literal(true).optional(),
+    afterJoin: z.literal(true).optional(),
+  })
+  .strict();
+export type DeploymentInteractiveCommands = z.infer<typeof interactiveCommandsSchema>;
+const INTERACTIVE_FIELDS = ["start", "stop", "prepare", "afterJoin"] as const;
+/**
+ * Rules for interactive commands, checked when a recipe is saved or started.
+ * A process started from a terminal is outside the CLI-owned unit (and would get SIGHUP when
+ * the terminal closes), so an interactive start or afterJoin must be an external service. Every
+ * interactive command needs a status command, so a step whose outcome status already shows can
+ * settle without a person.
+ */
+function interactiveCommandIssues(
+  commands: {
+    management: "ownedProcess" | "externalService";
+    prepare?: string;
+    afterJoin?: string;
+    status?: string;
+    interactive?: DeploymentInteractiveCommands;
+  },
+  ctx: z.RefinementCtx,
+) {
+  const interactive = commands.interactive;
+  if (!interactive) return;
+  for (const field of ["prepare", "afterJoin"] as const)
+    if (interactive[field] && !commands[field])
+      ctx.addIssue({
+        code: "custom",
+        path: ["interactive", field],
+        message: `An interactive ${field} requires a ${field} command.`,
+      });
+  if ((interactive.start || interactive.afterJoin) && commands.management !== "externalService")
+    ctx.addIssue({
+      code: "custom",
+      path: ["management"],
+      message:
+        "An interactive start or afterJoin requires management externalService: a process started from a terminal is not owned by the CLI.",
+    });
+  if (INTERACTIVE_FIELDS.some((field) => interactive[field]) && !commands.status?.trim())
+    ctx.addIssue({
+      code: "custom",
+      path: ["status"],
+      message: "Interactive commands require a status command (exit 0 alive, exit 3 stopped).",
+    });
+}
+/** Whether any rank of a variant has a command a person must run. */
+export function variantHasInteractiveCommands(variant: {
+  commands: readonly { interactive?: DeploymentInteractiveCommands }[];
+}) {
+  return variant.commands.some((rank) =>
+    INTERACTIVE_FIELDS.some((field) => rank.interactive?.[field] === true),
+  );
+}
+/**
  * The recipe schema. `strict` holds every rule for text a person or agent
  * saves; the lenient form keeps the same shape for reading revisions that were
  * stored before the current text rules, so existing instances keep running.
@@ -131,12 +193,18 @@ function variantSchema(strict: boolean) {
               afterJoin: commandText.optional(),
               status: commandText.optional(),
               health: commandText.optional(),
+              interactive: interactiveCommandsSchema.optional(),
             })
             .strict()
             .refine(
               (commands) => commands.management !== "externalService" || !!commands.status?.trim(),
               "External services require a reliable status command (exit 0 alive, exit 3 stopped).",
-            ),
+            )
+            // Saves only: a stored agent revision must keep parsing, or its commands would stop
+            // counting as agent-written.
+            .superRefine((commands, ctx) => {
+              if (strict) interactiveCommandIssues(commands, ctx);
+            }),
         )
         .min(1)
         .max(64),

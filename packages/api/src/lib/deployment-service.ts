@@ -27,6 +27,7 @@ import {
   deploymentSpecSchema,
   rankValue,
   storedDeploymentSpecSchema,
+  variantHasInteractiveCommands,
 } from "./deployment-spec";
 import { gpuBudgetKey, parseNodeInfo, resolveUsableBudgets } from "./node-inventory";
 
@@ -191,7 +192,13 @@ export async function deploymentExecutionAllowed(
   }
   return ranks.length > 0;
 }
-/** Every command text a variant runs: each rank's start, stop and optional phases. */
+/**
+ * Every command text a variant runs: each rank's start, stop and optional phases. A command's
+ * interactive flag is deliberately not part of the match: an agent revision that flips a
+ * person's interactive command to automatic (or the reverse) still holds that text, so the
+ * flipped command counts as agent-written, and a person flipping the flag of an agent-written
+ * command does not launder it.
+ */
 function variantCommandTexts(commands: readonly Record<string, unknown>[]): string[] {
   return commands.flatMap((rank) =>
     (["start", "stop", "prepare", "afterJoin", "status", "health"] as const).flatMap((field) =>
@@ -338,6 +345,7 @@ export async function createDeploymentPlan(
           input.start.revisionId,
           input.start.variantKey,
         );
+        assertInteractiveCommandsSupported(variant);
         const plan = planDeployment({ ...state, variant, ...input.start, actor: requester.kind });
         // Refuse undeliverable jobs now rather than after confirmation. Apply re-renders with
         // the real identities, whose lengths these placeholders match.
@@ -406,18 +414,36 @@ export async function createDeploymentPlan(
     { isolationLevel: "ReadCommitted", timeout: 30_000 },
   );
 }
+/**
+ * Until operator terminals ship, no job a person must run is ever dispatched: a CLI that does
+ * not know the interactive fields would refuse the job, and one that ignored them would run the
+ * command unattended. Saving such a recipe is allowed; starting it is not.
+ */
+function assertInteractiveCommandsSupported(variant: DeploymentVariant) {
+  if (variantHasInteractiveCommands(variant))
+    throw new ORPCError("BAD_REQUEST", {
+      message: "Interactive recipe commands are not supported yet",
+    });
+}
+/** The recipe command a phase runs, which decides whether that phase is interactive. */
+type DeploymentPhaseSource = "start" | "prepare" | "afterJoin" | null;
 function jobIntent(
   variant: DeploymentVariant,
   instance: { id: string; revisionId: string; endpointSlug: string },
   p: DeploymentPlanContents["placements"][number],
   phase: DeploymentJob["action"],
+  source: DeploymentPhaseSource,
   command: string,
 ): Omit<DeploymentJob, "stepId" | "intentHash" | "ownerEpoch" | "actor" | "humanApproved"> {
+  const rankCommands = rankValue(variant.commands, p.rank);
   return {
     type: "deployment.job",
     attachment: variant.attachment.type,
     engine: variant.engine,
-    management: rankValue(variant.commands, p.rank).management,
+    management: rankCommands.management,
+    // Present only when true, so intents without interactive commands hash as before.
+    ...(source && rankCommands.interactive?.[source] ? { interactive: true as const } : {}),
+    ...(rankCommands.interactive?.stop ? { stopInteractive: true as const } : {}),
     ...(variant.attachment.embeddingContract
       ? { embeddingContract: variant.attachment.embeddingContract }
       : {}),
@@ -513,19 +539,30 @@ function renderDeploymentGroup(
       head_addr: headAddr,
     };
     const stopCommand = renderDeploymentCommand(rankCommands.stop, values);
-    const phases: Array<{ phase: DeploymentJob["action"]; sequence: number; command: string }> = [];
+    const phases: Array<{
+      phase: DeploymentJob["action"];
+      sequence: number;
+      source: DeploymentPhaseSource;
+      command: string;
+    }> = [];
     if (variant.groupSize === 1)
-      phases.push({ phase: "start", sequence: 0, command: rankCommands.start });
+      phases.push({ phase: "start", sequence: 0, source: "start", command: rankCommands.start });
     else if (p.rank === 0) {
       if (rankCommands.prepare)
-        phases.push({ phase: "prepare", sequence: 0, command: rankCommands.prepare });
-      phases.push({
-        phase: "start",
-        sequence: 2,
-        command: rankCommands.afterJoin ?? rankCommands.start,
-      });
-    } else phases.push({ phase: "start", sequence: 1, command: rankCommands.start });
-    if (p.rank === 0) phases.push({ phase: "readiness", sequence: 3, command: "" });
+        phases.push({
+          phase: "prepare",
+          sequence: 0,
+          source: "prepare",
+          command: rankCommands.prepare,
+        });
+      phases.push(
+        rankCommands.afterJoin
+          ? { phase: "start", sequence: 2, source: "afterJoin", command: rankCommands.afterJoin }
+          : { phase: "start", sequence: 2, source: "start", command: rankCommands.start },
+      );
+    } else
+      phases.push({ phase: "start", sequence: 1, source: "start", command: rankCommands.start });
+    if (p.rank === 0) phases.push({ phase: "readiness", sequence: 3, source: null, command: "" });
     const steps = phases.map((phase) => {
       const intent = {
         ...jobIntent(
@@ -533,6 +570,7 @@ function renderDeploymentGroup(
           instance,
           p,
           phase.phase,
+          phase.source,
           renderDeploymentCommand(phase.command, values),
         ),
         stopCommand,
@@ -671,6 +709,7 @@ export async function applyDeploymentPlan(
           contents.start.revisionId,
           contents.start.variantKey,
         );
+        assertInteractiveCommandsSupported(variant);
         for (let group = 0; group < contents.start.groupCount; group++) {
           const id = randomUUID().replaceAll("-", "");
           const identity = {
