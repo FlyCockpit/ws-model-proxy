@@ -681,6 +681,34 @@ describe("adminObservabilityRouter", () => {
     expect(serialized).not.toContain("token-secret-digest");
   });
 
+  it("keeps live transcription session wall time out of the duration summary, not out of tokens", async () => {
+    db.relayRequest.count.mockResolvedValue(0);
+    db.relayRequest.findMany.mockResolvedValue([]);
+    db.relayRequest.groupBy.mockResolvedValueOnce([]).mockResolvedValueOnce([]);
+    db.relayRequest.aggregate
+      .mockResolvedValueOnce({ _sum: { promptTokens: 40, completionTokens: 9, totalTokens: 49 } })
+      .mockResolvedValueOnce({
+        _avg: { durationMs: 900 },
+        _min: { durationMs: 800 },
+        _max: { durationMs: 1000 },
+      });
+    relations.user.findMany.mockResolvedValue([]);
+    relations.modelApiToken.findMany.mockResolvedValue([]);
+    relations.discoveredModel.findMany.mockResolvedValue([]);
+    relations.modelPool.findMany.mockResolvedValue([]);
+    const result = await client().listRelayMetadataSummaries({ status: "SUCCEEDED" });
+    expect(result.summary.durationMs).toEqual({ average: 900, minimum: 800, maximum: 1000 });
+    expect(result.summary.tokens).toEqual({ prompt: 40, completion: 9, total: 49 });
+    const [tokenCall, durationCall] = db.relayRequest.aggregate.mock.calls as unknown as [
+      [{ where: unknown; _avg?: unknown }],
+      [{ where: { AND: unknown[] }; _avg: unknown }],
+    ];
+    expect(tokenCall[0]).not.toHaveProperty("_avg");
+    expect(durationCall[0].where.AND[1]).toEqual({
+      OR: [{ operation: null }, { operation: { not: "audio.realtime_transcription" } }],
+    });
+  });
+
   it("rejects inverted relay date ranges", async () => {
     await expect(
       client().listRelayMetadataSummaries({

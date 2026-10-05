@@ -91,8 +91,10 @@ export function realtimeTerminal(
   const code: RealtimeCloseCode | null = outcome.closeCode;
   const error = outcome.errorCode;
   if (code === null || code === 1000) {
-    // Client close, idle timeout, maximum duration: the session served.
-    return { status: "SUCCEEDED", httpStatusCode: 200, errorClass: error };
+    // Client close, idle timeout, maximum duration: the session served. A
+    // SUCCEEDED row carries no error class (as HTTP rows), so normal ends
+    // never show up among the admin error classes.
+    return { status: "SUCCEEDED", httpStatusCode: 200, errorClass: null };
   }
   if (code === 1001) return { status: "CANCELED", httpStatusCode: 503, errorClass: error };
   if (code === 1008) {

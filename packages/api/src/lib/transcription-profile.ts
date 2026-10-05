@@ -9,6 +9,9 @@ const profileToken = z.string().regex(/^[A-Za-z0-9_.+/-]{1,64}$/);
  * `segmented` sends each committed turn to the endpoint's file transcription route.
  */
 export const REALTIME_TRANSCRIPTION_ADAPTERS = ["vllm", "segmented"] as const;
+
+/** `RelayRequest.operation` of a live `/v1/realtime` transcription session. */
+export const REALTIME_TRANSCRIPTION_OPERATION = "audio.realtime_transcription";
 export type RealtimeTranscriptionAdapter = (typeof REALTIME_TRANSCRIPTION_ADAPTERS)[number];
 
 /** Bounds shared with the CLI (`RealtimeTranscriptionProfile` in `apps/cli/src/deployments/mod.rs`). */

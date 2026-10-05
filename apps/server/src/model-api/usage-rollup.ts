@@ -13,6 +13,7 @@
  * Prompt-free: only ids, enum source, counts, token integers and timings.
  */
 
+import { REALTIME_TRANSCRIPTION_OPERATION } from "@ws-model-proxy/api/lib/transcription-profile";
 import {
   addHistograms,
   emptyLatencyHistogram,
@@ -106,8 +107,8 @@ export type UsageRollupCounters = {
   audioInputMs: bigint;
 };
 
-/** The operation of a live transcription session row. */
-export const REALTIME_TRANSCRIPTION_OPERATION = "audio.realtime_transcription";
+/** The operation of a live transcription session row (shared with the admin summary). */
+export { REALTIME_TRANSCRIPTION_OPERATION };
 
 export type UsageRollupIncrement = UsageRollupKey & UsageRollupCounters;
 

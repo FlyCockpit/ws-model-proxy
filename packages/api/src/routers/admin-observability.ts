@@ -9,6 +9,7 @@ import {
   effectiveEndpointStatus,
   endpointEffectiveStatusWhere,
 } from "../lib/cli-presence";
+import { REALTIME_TRANSCRIPTION_OPERATION } from "../lib/transcription-profile";
 
 const cliStatusSchema = z.enum(["DISCONNECTED", "CONNECTED", "STALE", "REVOKED"]);
 const endpointStatusSchema = z.enum(["UNKNOWN", "ONLINE", "DEGRADED", "OFFLINE"]);
@@ -851,36 +852,54 @@ export const adminObservabilityRouter = {
         ...(input?.status ? { status: input.status } : {}),
         ...(input?.errorClass ? { errorClass: input.errorClass } : {}),
       };
-      const [total, rows, statusGroups, errorClassGroups, aggregate] = await Promise.all([
-        prisma.relayRequest.count({ where }),
-        prisma.relayRequest.findMany({
-          where,
-          orderBy: { createdAt: "desc" },
-          ...pagination(page, pageSize),
-          select: relayRequestSelect,
-        }),
-        prisma.relayRequest.groupBy({
-          by: ["status"],
-          where,
-          _count: { _all: true },
-        }),
-        prisma.relayRequest.groupBy({
-          by: ["errorClass"],
-          where,
-          _count: { _all: true },
-        }),
-        prisma.relayRequest.aggregate({
-          where,
-          _avg: { durationMs: true },
-          _min: { durationMs: true },
-          _max: { durationMs: true },
-          _sum: {
-            promptTokens: true,
-            completionTokens: true,
-            totalTokens: true,
-          },
-        }),
-      ]);
+      const [total, rows, statusGroups, errorClassGroups, aggregate, durations] = await Promise.all(
+        [
+          prisma.relayRequest.count({ where }),
+          prisma.relayRequest.findMany({
+            where,
+            orderBy: { createdAt: "desc" },
+            ...pagination(page, pageSize),
+            select: relayRequestSelect,
+          }),
+          prisma.relayRequest.groupBy({
+            by: ["status"],
+            where,
+            _count: { _all: true },
+          }),
+          prisma.relayRequest.groupBy({
+            by: ["errorClass"],
+            where,
+            _count: { _all: true },
+          }),
+          prisma.relayRequest.aggregate({
+            where,
+            _sum: {
+              promptTokens: true,
+              completionTokens: true,
+              totalTokens: true,
+            },
+          }),
+          // Request latency only: a live transcription session's wall time (up
+          // to 30 min) is not a request duration. A NULL operation must stay
+          // in (`<>` alone would drop it).
+          prisma.relayRequest.aggregate({
+            where: {
+              AND: [
+                where,
+                {
+                  OR: [
+                    { operation: null },
+                    { operation: { not: REALTIME_TRANSCRIPTION_OPERATION } },
+                  ],
+                },
+              ],
+            },
+            _avg: { durationMs: true },
+            _min: { durationMs: true },
+            _max: { durationMs: true },
+          }),
+        ],
+      );
 
       return {
         ...paginatedResult({
@@ -902,9 +921,9 @@ export const adminObservabilityRouter = {
             count: row._count._all,
           })),
           durationMs: {
-            average: aggregate._avg.durationMs,
-            minimum: aggregate._min.durationMs,
-            maximum: aggregate._max.durationMs,
+            average: durations._avg.durationMs,
+            minimum: durations._min.durationMs,
+            maximum: durations._max.durationMs,
           },
           tokens: {
             prompt: aggregate._sum.promptTokens,

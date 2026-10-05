@@ -260,9 +260,11 @@ describe("live transcription usage rows", () => {
       [1013, "audio_backlog", "FAILED", 503],
     ];
     for (const [closeCode, errorCode, status, httpStatusCode] of cases) {
-      expect(realtimeTerminal({ closeCode: closeCode as never, errorCode })).toMatchObject({
+      expect(realtimeTerminal({ closeCode: closeCode as never, errorCode })).toEqual({
         status,
         httpStatusCode,
+        // A normal end (idle, expired, client close) carries no error class.
+        errorClass: status === "SUCCEEDED" ? null : errorCode,
       });
     }
     expect(audioInputMsFromBytes(48)).toBe(1);
