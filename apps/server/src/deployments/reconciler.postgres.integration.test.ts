@@ -364,7 +364,7 @@ integration("interactive operator steps at PostgreSQL", () => {
         lastHeartbeatAt: new Date(),
         allowDeployments: true,
         reportedDeployments: true,
-        relayProtocolVersion: "2.11",
+        relayProtocolVersion: "2.4",
         usableMemoryGb: 64,
         deploymentPortStart: 30000,
         deploymentPortEnd: 30999,
@@ -613,7 +613,7 @@ integration("interactive operator steps at PostgreSQL", () => {
         ownerEpoch: job.ownerEpoch,
         status,
         stopped: false,
-        // 2.11: every result of an interactive job names its dispatch's terminal.
+        // Every result of an interactive job names its dispatch's terminal.
         ...(job.operator ? { terminalId: job.operator.terminalId } : {}),
         ...extra,
       });

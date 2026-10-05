@@ -166,7 +166,7 @@ async function closeBodyStream(stream: OutboundBodyStream | undefined) {
 
 export type CliReportedFeatures = {
   deployments?: boolean;
-  /** 2.11: interactive deployment commands; see `deploymentOperatorSupported`. */
+  /** Interactive deployment commands; see `deploymentOperatorSupported`. */
   deploymentOperator?: boolean;
   humanTerminal: boolean;
   /** The CLI's own MCP command mode (its config), from hello. */
@@ -313,7 +313,7 @@ export type TerminalRecord = {
    * has its own slot limits, is gated by the MCP command mode (not the human
    * terminal grant), and starts with no viewers.
    * `deployment`: the operator terminal of an interactive deployment step
-   * (2.11). Registered when the job is sent, open once the CLI reports
+   * Registered when the job is sent, open once the CLI reports
    * `awaiting_operator` for it; gated by the node's deployment operator
    * capability (not the human grant or the MCP mode); never idle-closed and
    * never counted against the human terminal limits.
@@ -543,7 +543,7 @@ type SessionState = {
   filesById: Map<string, TrackedFileOp>;
   /** Supervised commands by command id, from `term.spawn` until their terminal ends. */
   supervisedById: Map<string, TrackedSupervisedCommand>;
-  /** 2.11 interactive deployment steps with an operator terminal, by step id. */
+  /** Interactive deployment steps with an operator terminal, by step id. */
   operatorSteps: Map<string, OperatorStepTracker>;
   /**
    * Supervised commands whose terminal the server ended, by terminal id,

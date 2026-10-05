@@ -36,7 +36,8 @@ instances are dropped an hour after their stop, or sooner (oldest first) when
 the 256-instance cap needs room, and stops always have 2 MiB of state reserved,
 so state growth can no longer block a stop.
 
-Upgrade every CLI to relay protocol 2.11. Deployment inventory is a complete snapshot
+Upgrade the server and every CLI together to relay protocol 2.4, the one protocol
+bump since v0.3.1 (relay 2.3). Deployment inventory is a complete snapshot
 framed by `snapshotId`, sequential `chunkIndex` and `final`; chunks carry at most 512
 records and the CLI also bounds encoded frame bytes. The server acknowledges only
 after durable current-session commit; the CLI then waits for endpoint-inventory
@@ -243,7 +244,7 @@ assignment provenance and automatic concurrency seed columns.
   MIME types) so requests that use those options route to it — and note that
   a profile also narrows what it accepts (for example a lower upload limit).
   Agents create these recipes through the MCP recipe tools like any other.
-  Upgrade the server and every CLI together (relay 2.11 only). After
+  Upgrade the server and every CLI together (relay protocol 2.4 only). After
   downgrading a CLI that ran one, remove its deployment state file.
 
 - **Recipes can be renamed while stopped.** A recipe's slug can be changed

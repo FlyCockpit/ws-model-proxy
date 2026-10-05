@@ -106,7 +106,7 @@ function intentOf(job: DeploymentJob) {
 describe("current deployment job / result golden shared with the Rust decoder", () => {
   it("is the current protocol and pins a non-interactive job's intent hash", () => {
     expect(jobGolden.protocolVersion).toBe(DEPLOYMENT_PROTOCOL_VERSION);
-    // A job without interactive commands hashes exactly as it did before 2.11.
+    // A job without interactive commands hashes exactly as it did before interactive fields existed.
     expect(jobGolden.jobs.plainStart.intentHash).toBe(
       "c207d85160e877498399c678104792dd0e1eea8529090aad0fed3b29d31e6e67",
     );

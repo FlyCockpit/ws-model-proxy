@@ -3662,7 +3662,7 @@ where
         .map_err(|error| websocket_session_error(error, "sending deployment result", true))
 }
 
-/// Operator terminal events become 2.11 progress results and worker
+/// Operator terminal events become operator progress results and worker
 /// requests. A reported `exited;0` is only a request for the status proof:
 /// the worker sends the step's final result.
 #[cfg(unix)]

@@ -11,9 +11,9 @@ use crate::config::{
 };
 pub use crate::terminal_identity::TerminalIdentityProof;
 
-/// 2.11 (2.10 was never released) adds interactive deployment jobs
-/// (`deploymentOperator`). The server accepts only this version.
-pub const RELAY_PROTOCOL_VERSION: &str = "2.11";
+/// The one protocol bump of this release (v0.3.1 spoke 2.3). The server
+/// accepts only this version.
+pub const RELAY_PROTOCOL_VERSION: &str = "2.4";
 #[cfg(test)]
 const TEST_IDENTITY_PUBLIC_KEY: &str =
     "BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A";
@@ -567,7 +567,7 @@ fn deployment_disabled(value: &bool) -> bool {
 pub struct CliReportedFeatures {
     #[serde(skip_serializing_if = "deployment_disabled")]
     pub deployments: bool,
-    /// 2.11: this CLI can run interactive deployment commands in an operator
+    /// This CLI can run interactive deployment commands in an operator
     /// terminal: deployments and the operator-terminal switch are on and
     /// terminals are supported (Unix). Omitted while false.
     #[serde(skip_serializing_if = "deployment_disabled")]
@@ -2740,7 +2740,7 @@ mod tests {
         assert!(!encoded.contains(r#""requestBodyWindowChunks""#));
         assert!(!encoded.contains("protocol_version"));
         assert!(!encoded.contains(":null"));
-        // 2.11: omitted while false (`hello_capabilities` sets it from the
+        // Omitted while false (`hello_capabilities` sets it from the
         // live deployments switch).
         assert!(!encoded.contains("deploymentOperator"));
         let ClientControlMessage::Hello { cli, .. } = &message else {

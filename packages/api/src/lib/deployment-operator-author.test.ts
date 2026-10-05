@@ -171,7 +171,7 @@ describe("deploymentCommandSource", () => {
   const nodes = [0, 1].map((index) => ({
     id: `node-${index}`,
     online: true,
-    protocolVersion: "2.11",
+    protocolVersion: "2.4",
     allowDeployments: true,
     reportedDeployments: true,
     mode: "UNSUPERVISED" as const,

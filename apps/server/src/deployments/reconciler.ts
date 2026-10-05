@@ -41,7 +41,7 @@ export type DeploymentSocket = {
 export type DeploymentLiveSocket = DeploymentSocket & {
   inventoryComplete: boolean;
   /**
-   * The session can hold operator terminals for interactive jobs (2.11 +
+   * The session can hold operator terminals for interactive jobs (2.4 +
    * deployments + `deploymentOperator` + terminal support and key; the CLI
    * reports the feature only with its operator-terminal switch on). Absent
    * means no. Interactive steps (and starts whose stop is interactive) are
@@ -398,7 +398,7 @@ export class DeploymentReconciler {
     });
   }
   /**
-   * 2.11 operator progress for an interactive step of the current dispatch (the session
+   * Operator progress for an interactive step of the current dispatch (the session
    * manager forwards only frames matching its tracker; the stored terminal id fences a
    * replaced or closed terminal here too):
    * - `awaiting_operator`: the confirm screen is up (again, after a failed run) and waits

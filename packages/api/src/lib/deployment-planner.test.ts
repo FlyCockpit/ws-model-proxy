@@ -26,7 +26,7 @@ function node(id: string): DeploymentNode {
   return {
     id,
     online: true,
-    protocolVersion: "2.11",
+    protocolVersion: "2.4",
     allowDeployments: true,
     reportedDeployments: true,
     mode: "UNSUPERVISED",
@@ -65,7 +65,7 @@ function existing(id: string, nodeIds: string[], memory = 100): ExistingDeployme
   };
 }
 describe("durable deployment placement policy", () => {
-  it.each(["2.9", "2.10", "2.12", "3.0", "2.11.0"])(
+  it.each(["2.3", "2.5", "2.11", "3.0", "2.4.0"])(
     "refuses incompatible plan protocol %s",
     (protocolVersion) => {
       expect(() =>

@@ -32,7 +32,7 @@ const OWNER_EPOCH = "3f2b8c1e-1d2a-4c3b-9e8f-0a1b2c3d4e5f:7";
 const node: DeploymentNode = {
   id: "node",
   online: true,
-  protocolVersion: "2.11",
+  protocolVersion: "2.4",
   allowDeployments: true,
   reportedDeployments: true,
   mode: "UNSUPERVISED",
@@ -281,7 +281,7 @@ function generate() {
     accepted: ["abc", "inst-qwen-a1b2c3d4e5f6", "a".repeat(63), "healthy", "v12"],
     rejected: ["health", "api", "tokens", "ab", "-abc", "abc-", "a--b", "Abc", "a".repeat(64)],
   };
-  return { protocolVersion: "2.11", jobs, results, wireCases, slugCases };
+  return { protocolVersion: "2.4", jobs, results, wireCases, slugCases };
 }
 
 describe("deployment job golden generated from admission rendering", () => {

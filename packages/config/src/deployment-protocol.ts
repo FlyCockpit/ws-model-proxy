@@ -1,11 +1,11 @@
 /**
- * Relay 2.11 deployment jobs. The step ID is an idempotency key across reconnects.
+ * Relay 2.4 deployment jobs. The step ID is an idempotency key across reconnects.
  *
- * 2.11 adds interactive (operator-run) commands to the first deployment protocol: the
+ * Interactive (operator-run) commands are part of the same protocol: the
  * `interactive`/`stopInteractive` job fields, `DeploymentJob.operator`, the operator progress
  * statuses on `DeploymentJobResult`, and the `deploymentOperator` hello feature.
  */
-export const DEPLOYMENT_PROTOCOL_VERSION = "2.11";
+export const DEPLOYMENT_PROTOCOL_VERSION = "2.4";
 
 /**
  * The node can run interactive jobs: it speaks the deployment protocol, reports deployments,
@@ -92,7 +92,7 @@ export type DeploymentJob = {
   /** The rank's stop command is interactive; present only when true. */
   stopInteractive?: true;
   /**
-   * 2.11. Present exactly when `interactive`: the operator terminal minted for this dispatch
+   * Present exactly when `interactive`: the operator terminal minted for this dispatch
    * (16 random bytes, base64url) and who wrote `command`, as the confirm screen shows it. Per
    * dispatch, so it is not part of the hashed intent.
    */
@@ -117,7 +117,7 @@ export type DeploymentJobResult = {
   intentHash: string;
   ownerEpoch: string;
   /**
-   * `running` is progress. 2.11 operator progress for interactive jobs (never final):
+   * `running` is progress. Operator progress for interactive jobs (never final):
    * `awaiting_operator` (terminal spawned, confirm screen drawn), `operator_running` (the
    * operator pressed Enter and the command started) and `operator_closed` (declined, or the
    * terminal ended without success). Each carries the job's `operator.terminalId`.
@@ -128,11 +128,11 @@ export type DeploymentJobResult = {
   /** Operational failure codes only: never persist command output/model content. */
   error?: string;
   /**
-   * 2.11: the job's `operator.terminalId`. Present on the operator statuses and on every
+   * The job's `operator.terminalId`. Present on the operator statuses and on every
    * final (`succeeded`/`failed`) of an interactive job, binding it to the dispatch it answers.
    */
   terminalId?: string;
-  /** 2.11, `operator_closed` only: the last attempt's exit code, absent when nothing ran. */
+  /** `operator_closed` only: the last attempt's exit code, absent when nothing ran. */
   exitCode?: number;
 };
 export const DEPLOYMENT_OPERATOR_RESULT_STATUSES = [

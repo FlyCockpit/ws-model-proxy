@@ -32,22 +32,22 @@ const intent: Parameters<typeof deploymentJobFrameBytes>[0] = {
 };
 
 describe("deployment protocol version", () => {
-  it("is 2.11 only", () => {
-    expect(DEPLOYMENT_PROTOCOL_VERSION).toBe("2.11");
+  it("is 2.4 only", () => {
+    expect(DEPLOYMENT_PROTOCOL_VERSION).toBe("2.4");
   });
 
-  it("allows interactive jobs only on 2.11 with deployments and deploymentOperator", () => {
-    const node = { protocolVersion: "2.11", deployments: true, deploymentOperator: true };
+  it("allows interactive jobs only on 2.4 with deployments and deploymentOperator", () => {
+    const node = { protocolVersion: "2.4", deployments: true, deploymentOperator: true };
     expect(deploymentOperatorSupported(node)).toBe(true);
-    for (const protocolVersion of ["2.10", "2.12", "2.11.0", null])
+    for (const protocolVersion of ["2.3", "2.5", "2.11", "2.4.0", null])
       expect(deploymentOperatorSupported({ ...node, protocolVersion })).toBe(false);
     expect(deploymentOperatorSupported({ ...node, deployments: false })).toBe(false);
     expect(deploymentOperatorSupported({ ...node, deploymentOperator: null })).toBe(false);
-    expect(deploymentOperatorSupported({ protocolVersion: "2.11" })).toBe(false);
+    expect(deploymentOperatorSupported({ protocolVersion: "2.4" })).toBe(false);
   });
 });
 
-describe("2.11 job and result fields", () => {
+describe("interactive job and result fields", () => {
   it("needs an operator-capable node for any interactive field", () => {
     expect(deploymentJobNeedsOperator({})).toBe(false);
     expect(deploymentJobNeedsOperator({ interactive: true })).toBe(true);

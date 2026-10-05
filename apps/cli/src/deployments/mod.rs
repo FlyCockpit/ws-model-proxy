@@ -175,7 +175,7 @@ pub struct Health {
     pub success_threshold: u32,
 }
 
-/// 2.11: the operator terminal the server minted for one interactive dispatch.
+/// The operator terminal the server minted for one interactive dispatch.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Operator {
@@ -209,7 +209,7 @@ impl Operator {
     }
 }
 
-/// Error code for a 2.11 interactive job (`interactive`, `stopInteractive` or
+/// Error code for an interactive job (`interactive`, `stopInteractive` or
 /// `operator`) on a CLI that cannot open operator terminals (no Unix PTY; its
 /// hello does not report `deploymentOperator`). It is refused before any
 /// state is touched, so nothing runs and nothing is recorded.
@@ -279,14 +279,14 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcription_profile: Option<TranscriptionProfile>,
     pub command: String,
-    /// 2.11: a person runs `command` in an operator terminal. The server sends
+    /// A person runs `command` in an operator terminal. The server sends
     /// it only as `true`; absent on every other job.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interactive: Option<bool>,
-    /// 2.11: the rank's stop command is interactive. Only `true` or absent.
+    /// The rank's stop command is interactive. Only `true` or absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_interactive: Option<bool>,
-    /// 2.11: present exactly when `interactive`; not part of the intent hash.
+    /// Present exactly when `interactive`; not part of the intent hash.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operator: Option<Operator>,
     #[serde(default)]
@@ -435,7 +435,7 @@ impl Job {
         format!("{}:{}", self.instance_id, self.rank)
     }
 
-    /// Carries any 2.11 interactive field. Such a job needs an operator
+    /// Carries any interactive field. Such a job needs an operator
     /// terminal now or for its stop later.
     pub fn needs_operator(&self) -> bool {
         self.interactive.is_some() || self.stop_interactive.is_some() || self.operator.is_some()
@@ -497,17 +497,17 @@ pub struct JobResult {
     pub stopped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// 2.11: the job's `operator.terminalId`, on every result of an interactive
+    /// The job's `operator.terminalId`, on every result of an interactive
     /// job (progress and final), so the server binds a final to the dispatch
     /// it answers and a late answer to an earlier copy settles nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
-    /// 2.11 `operator_closed` only: the last attempt's exit code.
+    /// `operator_closed` only: the last attempt's exit code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<u8>,
 }
 
-/// 2.11 progress for an interactive job. Never final: the step still ends
+/// Progress for an interactive job. Never final: the step still ends
 /// with an ordinary `succeeded`/`failed` result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperatorProgress {

@@ -165,7 +165,7 @@ integration("deployment lifecycle on PostgreSQL and real manager/WebSocket", () 
             JSON.stringify({
               type: "hello",
               id: "deployment-hello",
-              protocolVersion: "2.11",
+              protocolVersion: "2.4",
               cli: {
                 slug: "node",
                 hostname: "fixture",
@@ -204,7 +204,7 @@ integration("deployment lifecycle on PostgreSQL and real manager/WebSocket", () 
       data: {
         allowDeployments: true,
         reportedDeployments: true,
-        relayProtocolVersion: "2.11",
+        relayProtocolVersion: "2.4",
         usableMemoryGb: 20,
         deploymentPortStart: 30000,
         deploymentPortEnd: 30999,
@@ -314,7 +314,7 @@ integration("deployment lifecycle on PostgreSQL and real manager/WebSocket", () 
           lastHeartbeatAt: new Date(),
           allowDeployments: true,
           reportedDeployments: true,
-          relayProtocolVersion: "2.11",
+          relayProtocolVersion: "2.4",
           usableMemoryGb: 20,
           nodeInfo: {
             nodeKind: "unified",
@@ -1049,7 +1049,7 @@ integration("deployment lifecycle on PostgreSQL and real manager/WebSocket", () 
         status: "DISCONNECTED",
         allowDeployments: true,
         reportedDeployments: true,
-        relayProtocolVersion: "2.11",
+        relayProtocolVersion: "2.4",
         nodeInfo: {
           nodeKind: "unified",
           memoryTotalMiB: 32 * 1024,
@@ -1308,7 +1308,7 @@ integration("deployment lifecycle on PostgreSQL and real manager/WebSocket", () 
           status: "CONNECTED",
           allowDeployments: true,
           reportedDeployments: true,
-          relayProtocolVersion: "2.11",
+          relayProtocolVersion: "2.4",
           nodeInfo: {
             nodeKind: "unified",
             memoryTotalMiB: 32 * 1024,

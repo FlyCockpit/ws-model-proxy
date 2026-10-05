@@ -54,8 +54,8 @@ The server accepts the listed relay protocol versions
 `RELAY_MIN_PROTOCOL_VERSION`. A protocol bump ships the server and wsmp
 together when the minimum moves.
 
-This release speaks relay 2.11 and supports only that version (2.10 was never
-released; 2.11 adds interactive deployment commands). Release notes must
+A release bumps the protocol at most once. This release speaks relay protocol
+2.4 (v0.3.1 spoke 2.3) and supports only that version. Release notes must
 require upgrading the server and every CLI together. Older CLIs are
 refused with an upgrade-CLI message; this CLI against an older server reports
 that the server needs upgrading. A genuine future-server upgrade-CLI reply

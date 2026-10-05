@@ -225,7 +225,7 @@ with started:true when the server received acceptance and started:null otherwise
 and blocked done before acceptance, and undispatched failures remain definitive.
 Finished file answers and their single audit event do not change on late reports.
 Only a supervised start id is delivered despite MCP abort; headless file results keep
-the abort fence. See [CLI file tools](mcp.md#cli-file-tools-relay-protocol-29).
+the abort fence. See [CLI file tools](mcp.md#cli-file-tools-relay-protocol-24).
 
 Overwrite rename preflights before capture and supports exchange-less no-replace
 and link mounts. Stable-inode link publication links the source onto the destination

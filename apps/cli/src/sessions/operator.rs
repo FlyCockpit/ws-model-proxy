@@ -1,5 +1,5 @@
 //! Operator terminals: the PTY in which a person runs an interactive
-//! deployment step (relay 2.11, `DeploymentJob.operator`).
+//! deployment step (relay 2.4, `DeploymentJob.operator`).
 //!
 //! The deployment worker persists the pending step and checks status first;
 //! only a step that still needs a person reaches [`TerminalRegistry::spawn_operator`].

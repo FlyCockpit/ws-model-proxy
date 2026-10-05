@@ -750,11 +750,11 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
         .regex(/^[a-z0-9_]{1,64}$/)
         .optional(),
       /**
-       * 2.11: the job's `operator.terminalId`. Required on operator progress; also on every
+       * The job's `operator.terminalId`. Required on operator progress; also on every
        * final (`succeeded`/`failed`) of an interactive job, which binds it to its dispatch.
        */
       terminalId: base64Url16ByteSchema.optional(),
-      /** 2.11 `operator_closed`: the last attempt's exit code. */
+      /** `operator_closed`: the last attempt's exit code. */
       exitCode: z.number().int().min(0).max(255).optional(),
     })
     .strict()
@@ -1403,7 +1403,7 @@ export function encodeRelayServerControlMessage(message: RelayServerControlMessa
       throw new RelayProtocolError("File fields require kind file.");
     }
   }
-  // 2.11: an operator terminal accompanies exactly the interactive jobs.
+  // An operator terminal accompanies exactly the interactive jobs.
   if (
     message.type === "deployment.job" &&
     (message.interactive === true) !==

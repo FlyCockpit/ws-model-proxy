@@ -1390,7 +1390,7 @@ describe("RelaySessionManager", () => {
     expect(firstControl(socket, "hello.ok")).toEqual({
       type: "hello.ok",
       id: "hello-id",
-      protocolVersion: "2.11",
+      protocolVersion: "2.4",
       revision: {
         inventorySeq: 1,
         inventoryDigest: "digest",
@@ -1927,7 +1927,7 @@ describe("RelaySessionManager", () => {
     const frame = JSON.stringify({
       type: "hello",
       id: "hello-id",
-      protocolVersion: "2.11",
+      protocolVersion: "2.4",
       cli: {
         slug: "desktop",
         hostname: "desk-01.local",
@@ -2313,7 +2313,7 @@ function helloCli(
   return JSON.stringify({
     type: "hello",
     id: "hello-cli",
-    protocolVersion: "2.11",
+    protocolVersion: "2.4",
     cli: {
       slug: "desktop",
       hostname: "desk-01.local",
@@ -2385,7 +2385,7 @@ describe("relay terminal and exec sessions", () => {
       }),
     );
     expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
-      protocolVersion: "2.11",
+      protocolVersion: "2.4",
       fileOps: true,
       mcpFileRead: true,
       fileRootsConfigured: true,
@@ -2451,7 +2451,7 @@ describe("relay terminal and exec sessions", () => {
     await register(manager, socket);
     const snapshot = () => manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id");
     expect(snapshot()).toMatchObject({
-      protocolVersion: "2.11",
+      protocolVersion: "2.4",
       fileOps: true,
       countContext: true,
       mcpFileRead: false,
@@ -2465,7 +2465,7 @@ describe("relay terminal and exec sessions", () => {
     ).get("cli-device-id");
     if (session) session.features = { ...session.features, fileOps: false, mcpFileRead: true };
     expect(snapshot()).toMatchObject({
-      protocolVersion: "2.11",
+      protocolVersion: "2.4",
       fileOps: true,
       countContext: true,
       mcpFileRead: true,
@@ -2521,12 +2521,12 @@ describe("relay terminal and exec sessions", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     await register(manager, socket, helloCli({ mcpCommandMode: "supervised" }));
-    expect(firstControl(socket, "hello.ok").protocolVersion).toBe("2.11");
+    expect(firstControl(socket, "hello.ok").protocolVersion).toBe("2.4");
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         update: expect.objectContaining({
           cliVersion: "9.9.9",
-          relayProtocolVersion: "2.11",
+          relayProtocolVersion: "2.4",
           reportedHumanTerminal: true,
           reportedMcpCommandMode: "SUPERVISED",
           reportedTerminalApproval: false,
@@ -2575,20 +2575,20 @@ describe("relay terminal and exec sessions", () => {
 
   it.each([
     [
-      "a 2.6 hello (a released 0.4.x CLI)",
+      "a 2.3 hello (a released 0.3.x CLI)",
       (() => {
         const frame = JSON.parse(helloCli()) as { protocolVersion: string };
-        frame.protocolVersion = "2.6";
+        frame.protocolVersion = "2.3";
         return JSON.stringify(frame);
       })(),
       "upgrade_cli",
       RELAY_UPGRADE_REQUIRED_MESSAGE,
     ],
     [
-      "a 2.5 hello",
+      "a 2.2 hello",
       (() => {
         const frame = JSON.parse(helloCli()) as { protocolVersion: string };
-        frame.protocolVersion = "2.5";
+        frame.protocolVersion = "2.2";
         return JSON.stringify(frame);
       })(),
       "upgrade_cli",
@@ -2622,10 +2622,10 @@ describe("relay terminal and exec sessions", () => {
       RELAY_UPGRADE_REQUIRED_MESSAGE,
     ],
     [
-      "a 2.12 hello (a CLI newer than this server)",
+      "a 2.5 hello (a CLI newer than this server)",
       (() => {
         const frame = JSON.parse(helloCli()) as { protocolVersion: string };
-        frame.protocolVersion = "2.12";
+        frame.protocolVersion = "2.5";
         return JSON.stringify(frame);
       })(),
       "upgrade_server",
@@ -2664,9 +2664,9 @@ describe("relay terminal and exec sessions", () => {
       protocolVersion: string;
       cli: { version?: string; capabilities: Record<string, unknown> };
     };
-    frame.protocolVersion = "2.6";
-    frame.cli.version = "0.4.0";
-    frame.cli.capabilities.protocolVersion = "2.6";
+    frame.protocolVersion = "2.3";
+    frame.cli.version = "0.3.1";
+    frame.cli.capabilities.protocolVersion = "2.3";
     manager.acceptAuthenticatedSocket({
       socket,
       identity: { ...identity, kind: "deviceCredential", cliDeviceId: "bound-device" },
@@ -2677,14 +2677,14 @@ describe("relay terminal and exec sessions", () => {
     expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
       where: { id: "bound-device", userId: "user-id" },
       data: {
-        rejectedRelayProtocolVersion: "2.6",
-        rejectedCliVersion: "0.4.0",
+        rejectedRelayProtocolVersion: "2.3",
+        rejectedCliVersion: "0.3.1",
         relayRejectedAt: now,
       },
     });
     expect(consoleError).toHaveBeenCalledWith(
       "[relay] refused a hello this server does not speak",
-      { protocolVersion: "2.6", cliVersion: "0.4.0", code: "upgrade_cli" },
+      { protocolVersion: "2.3", cliVersion: "0.3.1", code: "upgrade_cli" },
     );
 
     // An unbound token names no device: nothing is written.
@@ -2694,7 +2694,7 @@ describe("relay terminal and exec sessions", () => {
     expect(unbound.closes).toEqual([{ code: 1002, reason: "upgrade_cli" }]);
     expect(db.cliDevice.updateMany).not.toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ rejectedRelayProtocolVersion: "2.6" }),
+        data: expect.objectContaining({ rejectedRelayProtocolVersion: "2.3" }),
       }),
     );
     consoleError.mockRestore();
@@ -2735,9 +2735,9 @@ describe("relay terminal and exec sessions", () => {
       protocolVersion: string;
       cli: { version?: string; capabilities: Record<string, unknown> };
     };
-    frame.protocolVersion = "2.12";
+    frame.protocolVersion = "2.5";
     frame.cli.version = "0.9.0-rc.1+build.5";
-    frame.cli.capabilities.protocolVersion = "2.12";
+    frame.cli.capabilities.protocolVersion = "2.5";
     manager.acceptAuthenticatedSocket({
       socket,
       identity: { ...identity, kind: "deviceCredential", cliDeviceId: "bound-device" },
@@ -2755,7 +2755,7 @@ describe("relay terminal and exec sessions", () => {
     expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
       where: { id: "bound-device", userId: "user-id" },
       data: {
-        rejectedRelayProtocolVersion: "2.12",
+        rejectedRelayProtocolVersion: "2.5",
         rejectedCliVersion: "0.9.0-rc.1+build.5",
         relayRejectedAt: now,
       },
@@ -2784,7 +2784,7 @@ describe("relay terminal and exec sessions", () => {
     await register(manager, socket, JSON.stringify(frame));
     expect(firstControl(socket, "hello.ok")).toMatchObject({
       type: "hello.ok",
-      protocolVersion: "2.11",
+      protocolVersion: "2.4",
     });
     expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
   });
@@ -3050,14 +3050,14 @@ describe("relay terminal viewers", () => {
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         update: expect.objectContaining({
-          relayProtocolVersion: "2.11",
+          relayProtocolVersion: "2.4",
           reportedMcpCommandMode: "UNSUPERVISED",
           reportedHumanTerminal: true,
         }),
       }),
     );
     expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
-      protocolVersion: "2.11",
+      protocolVersion: "2.4",
       mcpCommandMode: "unsupervised",
       supervisedCommands: true,
       terminalPublicKey: uncompressedKey(),
@@ -3134,9 +3134,9 @@ describe("relay terminal viewers", () => {
       return JSON.stringify(parsed);
     };
     const cases: Array<[string, Record<string, boolean>, boolean]> = [
-      ["2.11", { deployments: true }, false],
-      ["2.11", { deploymentOperator: true }, false],
-      ["2.11", { deployments: true, deploymentOperator: true }, true],
+      ["2.4", { deployments: true }, false],
+      ["2.4", { deploymentOperator: true }, false],
+      ["2.4", { deployments: true, deploymentOperator: true }, true],
     ];
     for (const [version, features, operator] of cases) {
       const { manager, socket } = await setup(frame(version, features));
@@ -3159,7 +3159,7 @@ describe("relay terminal viewers", () => {
     }
   });
 
-  describe("deployment operator terminals (2.11)", () => {
+  describe("deployment operator terminals", () => {
     type Job = Parameters<InstanceType<typeof RelaySessionManager>["sendDeploymentJob"]>[1];
     const golden = JSON.parse(
       readFileSync(
