@@ -157,6 +157,17 @@ const requiredFragments = [
   // Single writer of the deletion marker (parent-deletion.ts abandonUserDeletion).
   'BEFORE UPDATE OF "deletionRequestedAt", "deletionGeneration" ON "user"',
   "current_setting('wsmp.user_deletion_writer', true) IS DISTINCT FROM 'on'",
+  // Interactive recipe commands: operator-terminal state, instance need and audit log.
+  "deployment step enters AWAITING_OPERATOR only from RUNNING",
+  "deployment step leaves AWAITING_OPERATOR only for RUNNING, PENDING, FAILED or SUCCEEDED",
+  "only an accepted operator command can succeed",
+  "an operator terminal keeps its open time",
+  "OLD.state NOT IN ('RUNNING', 'AWAITING_OPERATOR') AND lower(NEW.phase) <> 'stop'",
+  "only an open operator terminal can be accepted",
+  "deployment_step_operator_shape",
+  "deployment_instance_operator_shape",
+  "deployment_operator_event_shape",
+  "CREATE TRIGGER deployment_operator_event_append_only BEFORE UPDATE ON deployment_operator_event",
 ];
 for (const fragment of requiredFragments) {
   if (!sql.includes(fragment)) throw new Error(`Missing schema-hardening fragment: ${fragment}`);
@@ -641,6 +652,396 @@ async function verifyKvEvictionHardening() {
 }
 
 // End R1 node behavioral cases.
+
+// Interactive recipe commands: AWAITING_OPERATOR transitions, operator column
+// shape, the instance's operator need and the append-only operator audit log.
+async function verifyDeploymentOperatorHardening() {
+  const intent = (fields) =>
+    `'${JSON.stringify({ type: "deployment.job", rank: 0, ...fields })}'::jsonb`;
+  await client.query(`
+    INSERT INTO deployment_config (id, "userId", "poolId", slug, name)
+    VALUES ('op-config', 'owner-a', 'pool-a', 'op-config', 'Operator');
+    INSERT INTO deployment_config_revision
+      (id, "configId", revision, "editorId", "editorKind", "contentHash", spec)
+    VALUES ('op-revision', 'op-config', 1, 'owner-a', 'USER', 'hash', '{}'::jsonb);
+    INSERT INTO deployment_plan
+      (id, "userId", "requesterId", "requesterKind", "expiresAt", state, fingerprint, contents)
+    VALUES ('op-plan', 'owner-a', 'owner-a', 'USER', NOW() + interval '1 hour', 'APPLIED', 'fp', '{}'::jsonb);
+    INSERT INTO deployment_run (id, "planId") VALUES ('op-run', 'op-plan');
+    INSERT INTO deployment_instance
+      (id, "userId", "configId", "revisionId", "runId", "variantKey", "endpointSlug", "startedBy")
+    VALUES ('op-instance', 'owner-a', 'op-config', 'op-revision', 'op-run', 'default', 'op-endpoint', 'USER');
+    -- The shared deployment_integrity trigger must not read step-only columns on a node row.
+    INSERT INTO deployment_instance_node
+      (id, "instanceId", "cliDeviceId", rank, resources, port, "claimHeld", "stoppedAt")
+    VALUES ('op-node', 'op-instance', 'cli-a', 0, '{}'::jsonb, 30001, false, NOW());
+    UPDATE deployment_instance_node SET port = 30002 WHERE id = 'op-node';
+    INSERT INTO deployment_step
+      (id, "runId", "instanceId", "cliDeviceId", rank, phase, sequence, intent, "intentHash")
+    VALUES
+      ('op-step', 'op-run', 'op-instance', 'cli-a', 0, 'start', 0,
+        ${intent({ action: "start", interactive: true })}, 'h1'),
+      ('op-plain', 'op-run', 'op-instance', 'cli-a', 0, 'start', 1,
+        ${intent({ action: "start" })}, 'h2'),
+      ('op-health', 'op-run', 'op-instance', 'cli-a', 0, 'health', 2,
+        ${intent({ action: "health", interactive: true })}, 'h3'),
+      ('op-false', 'op-run', 'op-instance', 'cli-a', 0, 'start', 3,
+        ${intent({ action: "start", interactive: false })}, 'h4'),
+      ('op-sites', 'op-run', 'op-instance', 'cli-a', 0, 'start', 4,
+        ${intent({ action: "start", interactive: true })}, 'h5'),
+      ('op-prepare', 'op-run', 'op-instance', 'cli-a', 0, 'prepare', 5,
+        ${intent({ action: "prepare", interactive: true })}, 'h6'),
+      ('op-after-join', 'op-run', 'op-instance', 'cli-a', 0, 'start', 6,
+        ${intent({ action: "after_join", interactive: true })}, 'h7'),
+      ('op-ban-start', 'op-run', 'op-instance', 'cli-a', 0, 'start', 7,
+        ${intent({ action: "start", interactive: true })}, 'h8'),
+      ('op-ban-stop', 'op-run', 'op-instance', 'cli-a', 0, 'stop', 8,
+        ${intent({ action: "stop", interactive: true })}, 'h9'),
+      ('op-ban-dispatch', 'op-run', 'op-instance', 'cli-a', 0, 'start', 9,
+        ${intent({ action: "start", interactive: true })}, 'h10');
+  `);
+  const step = (sets, id = "op-step") =>
+    client.query(`UPDATE deployment_step SET ${sets} WHERE id = '${id}'`);
+  const row = async (id = "op-step") =>
+    (await client.query(`SELECT * FROM deployment_step WHERE id = '${id}'`)).rows[0];
+  const expectRow = async (id, expected, label) => {
+    const actual = await row(id);
+    for (const [column, value] of Object.entries(expected)) {
+      const got =
+        actual[column] === null ? null : actual[column] instanceof Date ? "set" : actual[column];
+      if (got !== value) throw new Error(`${label}: ${id}.${column} is ${got}, expected ${value}`);
+    }
+  };
+  const awaiting = `state = 'AWAITING_OPERATOR', deadline = NULL, "operatorTerminalId" = 'term-1', "operatorSince" = NOW()`;
+  /** PENDING -> RUNNING (dispatch with a terminal id) -> AWAITING_OPERATOR. */
+  const open = async (id, terminal = "term-1") => {
+    await step(
+      `state = 'RUNNING', deadline = NOW() + interval '1 minute', "operatorTerminalId" = '${terminal}'`,
+      id,
+    );
+    await step(`state = 'AWAITING_OPERATOR', deadline = NULL, "operatorSince" = NOW()`, id);
+  };
+  const accept = (id) =>
+    step(
+      `state = 'RUNNING', "operatorAcceptedAt" = NOW(), deadline = NOW() + interval '15 minutes'`,
+      id,
+    );
+  let negatives = 0;
+  let positives = 0;
+  const refuse = async (statement) => {
+    await expectConstraintFailure(statement);
+    negatives += 1;
+  };
+  // Never inserted awaiting; never PENDING/SUCCEEDED/FAILED -> AWAITING_OPERATOR.
+  await refuse(`
+    INSERT INTO deployment_step
+      (id, "runId", "instanceId", "cliDeviceId", rank, phase, sequence, intent, "intentHash",
+       state, "operatorSince")
+    VALUES ('op-inserted', 'op-run', 'op-instance', 'cli-a', 0, 'stop', 99,
+      ${intent({ action: "stop", interactive: true })}, 'h99', 'AWAITING_OPERATOR', NOW())`);
+  await refuse(`UPDATE deployment_step SET ${awaiting} WHERE id = 'op-step'`);
+  // PENDING carries no operator state: an explicit write of one fails (the trigger only
+  // clears values carried over from the old row).
+  await refuse(`UPDATE deployment_step SET "operatorLastExit" = 1 WHERE id = 'op-step'`);
+  // Operator columns are refused on non-interactive intents (missing key, explicit false,
+  // an action that can never be interactive).
+  for (const id of ["op-plain", "op-false", "op-health"]) {
+    await step(`state = 'RUNNING', deadline = NOW() + interval '1 minute'`, id);
+    await refuse(
+      `UPDATE deployment_step SET "operatorTerminalId" = 'x', "operatorSince" = NOW() WHERE id = '${id}'`,
+    );
+    await refuse(`UPDATE deployment_step SET ${awaiting} WHERE id = '${id}'`);
+  }
+  // RUNNING -> AWAITING_OPERATOR needs an open time and no deadline.
+  await step(
+    `state = 'RUNNING', deadline = NOW() + interval '1 minute', "operatorTerminalId" = 'term-1'`,
+  );
+  await refuse(
+    `UPDATE deployment_step SET state = 'AWAITING_OPERATOR', deadline = NULL WHERE id = 'op-step'`,
+  );
+  await refuse(
+    `UPDATE deployment_step SET state = 'AWAITING_OPERATOR', "operatorSince" = NOW() WHERE id = 'op-step'`,
+  );
+  await step(awaiting);
+  // While awaiting: no unaccepted success, no new terminal, no rewritten open time, no deadline.
+  await refuse(`UPDATE deployment_step SET state = 'SUCCEEDED' WHERE id = 'op-step'`);
+  await refuse(`UPDATE deployment_step SET "operatorTerminalId" = 'term-2' WHERE id = 'op-step'`);
+  await refuse(
+    `UPDATE deployment_step SET "operatorSince" = NOW() - interval '1 hour' WHERE id = 'op-step'`,
+  );
+  await refuse(`UPDATE deployment_step SET deadline = NOW() WHERE id = 'op-step'`);
+  // Accept requires the open terminal and an acceptance time.
+  await refuse(`UPDATE deployment_step SET state = 'RUNNING' WHERE id = 'op-step'`);
+  await refuse(
+    `UPDATE deployment_step SET state = 'RUNNING', "operatorAcceptedAt" = NOW(), "operatorTerminalId" = 'term-2' WHERE id = 'op-step'`,
+  );
+  await accept("op-step");
+  // A retry cycle in the same terminal keeps its open time.
+  await refuse(
+    `UPDATE deployment_step SET state = 'AWAITING_OPERATOR', deadline = NULL, "operatorSince" = NOW() + interval '1 second' WHERE id = 'op-step'`,
+  );
+  await step(`state = 'AWAITING_OPERATOR', deadline = NULL`);
+  await accept("op-step");
+  // Closed after a failed run: back to awaiting with the terminal gone and the exit kept.
+  await step(
+    `state = 'AWAITING_OPERATOR', deadline = NULL, "operatorTerminalId" = NULL, "operatorLastExit" = 2`,
+  );
+  // A closed terminal cannot be accepted or silently reopened.
+  await refuse(
+    `UPDATE deployment_step SET state = 'RUNNING', "operatorAcceptedAt" = NOW() WHERE id = 'op-step'`,
+  );
+  await refuse(`UPDATE deployment_step SET "operatorTerminalId" = 'term-3' WHERE id = 'op-step'`);
+  // Reopen through PENDING: the trigger clears every operator column.
+  await step(`state = 'PENDING'`);
+  await expectRow(
+    "op-step",
+    {
+      operatorTerminalId: null,
+      operatorSince: null,
+      operatorAcceptedAt: null,
+      operatorLastExit: null,
+    },
+    "reopen",
+  );
+  // A final result that overtakes "operator running": AWAITING -> SUCCEEDED with the
+  // acceptance in the same update; the terminal id is dropped, the history kept.
+  await open("op-step", "term-3");
+  await step(
+    `state = 'SUCCEEDED', "operatorAcceptedAt" = NOW(), "operatorLastExit" = 0, "leaseExpiresAt" = NULL`,
+  );
+  await expectRow(
+    "op-step",
+    {
+      state: "SUCCEEDED",
+      operatorTerminalId: null,
+      operatorSince: "set",
+      operatorAcceptedAt: "set",
+    },
+    "out-of-order success",
+  );
+  await refuse(`UPDATE deployment_step SET ${awaiting} WHERE id = 'op-step'`);
+  positives += 4;
+  // Existing generic write sites (apps/server/src/deployments/reconciler.ts, which knows
+  // nothing about operator terminals) on a RUNNING interactive step carrying every operator
+  // column: none may throw, and the trigger normalises what becomes invalid.
+  const sites = [
+    [
+      "acceptResult :209 success",
+      `state = 'SUCCEEDED', "leaseExpiresAt" = NULL, "errorCode" = NULL`,
+      "SUCCEEDED",
+    ],
+    [
+      "acceptResult :209 failure",
+      `state = 'FAILED', "leaseExpiresAt" = NULL, "errorCode" = 'job_failed'`,
+      "FAILED",
+    ],
+    [
+      "result lost :407",
+      `state = 'FAILED', "errorCode" = 'result_lost', "leaseExpiresAt" = NULL`,
+      "FAILED",
+    ],
+    [
+      "stop deadline reset :662",
+      `state = 'PENDING', "ownerEpoch" = NULL, "leaseExpiresAt" = NULL`,
+      "PENDING",
+    ],
+    [
+      "job deadline :667/673/682",
+      `state = 'FAILED', "errorCode" = 'job_deadline', "leaseExpiresAt" = NULL`,
+      "FAILED",
+    ],
+    [
+      "undeliver :829",
+      `state = 'PENDING', "ownerEpoch" = NULL, "leaseExpiresAt" = NULL, deadline = NULL`,
+      "PENDING",
+    ],
+  ];
+  for (const [label, sets, state] of sites) {
+    await step(`state = 'PENDING'`, "op-sites");
+    await open("op-sites", "term-sites");
+    await accept("op-sites");
+    await step(`"operatorLastExit" = 1`, "op-sites");
+    await step(sets, "op-sites");
+    await expectRow(
+      "op-sites",
+      state === "PENDING"
+        ? {
+            state,
+            operatorTerminalId: null,
+            operatorSince: null,
+            operatorAcceptedAt: null,
+            operatorLastExit: null,
+          }
+        : {
+            state,
+            operatorTerminalId: null,
+            operatorSince: "set",
+            operatorAcceptedAt: "set",
+            operatorLastExit: 1,
+          },
+      label,
+    );
+    positives += 1;
+    if (state === "FAILED") {
+      // Inventory adoption :357/:380 settles a FAILED (or RUNNING) step as SUCCEEDED.
+      await step(`state = 'SUCCEEDED', "leaseExpiresAt" = NULL, "errorCode" = NULL`, "op-sites");
+      await expectRow(
+        "op-sites",
+        { state: "SUCCEEDED", operatorTerminalId: null },
+        `${label} + adoption`,
+      );
+      positives += 1;
+    }
+  }
+  // Explicit operator values that contradict the new state fail instead of being dropped.
+  await step(`state = 'PENDING'`, "op-sites");
+  await open("op-sites", "term-explicit");
+  await refuse(
+    `UPDATE deployment_step SET state = 'PENDING', "operatorSince" = NOW() + interval '1 second' WHERE id = 'op-sites'`,
+  );
+  await refuse(
+    `UPDATE deployment_step SET state = 'PENDING', "operatorTerminalId" = 'term-new' WHERE id = 'op-sites'`,
+  );
+  await refuse(
+    `UPDATE deployment_step SET state = 'FAILED', "operatorTerminalId" = 'term-other' WHERE id = 'op-sites'`,
+  );
+  // ... including on a non-interactive step (op-health is RUNNING with no operator state).
+  await refuse(
+    `UPDATE deployment_step SET state = 'PENDING', "operatorSince" = NOW(), "operatorTerminalId" = 'new' WHERE id = 'op-health'`,
+  );
+  await refuse(
+    `UPDATE deployment_step SET state = 'FAILED', "operatorTerminalId" = 'zzz' WHERE id = 'op-health'`,
+  );
+  // prepare and after_join are interactive actions too: the full happy path.
+  for (const id of ["op-prepare", "op-after-join"]) {
+    await open(id);
+    await accept(id);
+    await step(`state = 'SUCCEEDED', "operatorLastExit" = 0`, id);
+    await expectRow(id, { state: "SUCCEEDED", operatorTerminalId: null, operatorLastExit: 0 }, id);
+    positives += 1;
+  }
+  // An inactive (banned) owner: dispatch PENDING -> RUNNING of a start is refused, but an
+  // operator's accept (a command already running) is recorded for a start and a stop.
+  await open("op-ban-start");
+  await open("op-ban-stop");
+  const { rows: banRows } = await client.query(
+    `SELECT banned, "banExpires" FROM "user" WHERE id = 'owner-a'`,
+  );
+  await client.query(`UPDATE "user" SET banned = true, "banExpires" = NULL WHERE id = 'owner-a'`);
+  try {
+    await refuse(
+      `UPDATE deployment_step SET state = 'RUNNING', deadline = NOW() + interval '1 minute' WHERE id = 'op-ban-dispatch'`,
+    );
+    await accept("op-ban-start");
+    await accept("op-ban-stop");
+    await expectRow(
+      "op-ban-start",
+      { state: "RUNNING", operatorTerminalId: "term-1" },
+      "banned accept start",
+    );
+    await expectRow(
+      "op-ban-stop",
+      { state: "RUNNING", operatorTerminalId: "term-1" },
+      "banned accept stop",
+    );
+    positives += 2;
+  } finally {
+    await client.query(`UPDATE "user" SET banned = $1, "banExpires" = $2 WHERE id = 'owner-a'`, [
+      banRows[0].banned,
+      banRows[0].banExpires,
+    ]);
+  }
+  // Instance: need and its timestamp together; RESTART only for a stopped instance meant to
+  // run. Generic writers that stop or start the instance clear a RESTART need.
+  const instance = async () =>
+    (await client.query(`SELECT * FROM deployment_instance WHERE id = 'op-instance'`)).rows[0];
+  const expectNeed = async (need, label) => {
+    const current = await instance();
+    if (current.needsOperator !== need || (need === null) !== (current.needsOperatorSince === null))
+      throw new Error(
+        `${label}: needsOperator ${current.needsOperator}/${current.needsOperatorSince}`,
+      );
+  };
+  await refuse(`UPDATE deployment_instance SET "needsOperator" = 'STEP' WHERE id = 'op-instance'`);
+  // Explicit contradictory writes fail; only carried-over needs are cleared.
+  await refuse(
+    `UPDATE deployment_instance SET "needsOperatorSince" = NOW() WHERE id = 'op-instance'`,
+  );
+  await refuse(
+    `UPDATE deployment_instance SET "needsOperator" = 'RESTART', "needsOperatorSince" = NOW() WHERE id = 'op-instance'`,
+  );
+  // e.g. gangStop setting RESTART before its stops settled.
+  for (const observed of ["STOPPING", "STOP_PENDING"]) {
+    await refuse(
+      `UPDATE deployment_instance SET "observedState" = '${observed}', "needsOperator" = 'RESTART', "needsOperatorSince" = NOW() WHERE id = 'op-instance'`,
+    );
+  }
+  await client.query(
+    `UPDATE deployment_instance SET "needsOperator" = 'STEP', "needsOperatorSince" = NOW() WHERE id = 'op-instance'`,
+  );
+  await expectNeed("STEP", "STEP");
+  await client.query(
+    `UPDATE deployment_instance SET "observedState" = 'STOPPED', "needsOperator" = 'RESTART' WHERE id = 'op-instance'`,
+  );
+  await expectNeed("RESTART", "RESTART");
+  // Maintenance restartAttempts>=3 -> FAILED keeps the need.
+  await client.query(
+    `UPDATE deployment_instance SET "observedState" = 'FAILED' WHERE id = 'op-instance'`,
+  );
+  await expectNeed("RESTART", "RESTART survives FAILED");
+  // deployment-service.ts:656 human stop.
+  await client.query(
+    `UPDATE deployment_instance SET "desiredState" = 'STOPPED', "observedState" = 'STOPPING' WHERE id = 'op-instance'`,
+  );
+  await expectNeed(null, "human stop clears RESTART");
+  await client.query(`UPDATE deployment_instance SET "desiredState" = 'RUNNING', "observedState" = 'STOPPED',
+    "needsOperator" = 'RESTART', "needsOperatorSince" = NOW() WHERE id = 'op-instance'`);
+  // reconciler.ts:796 dispatch of a start.
+  await client.query(
+    `UPDATE deployment_instance SET "observedState" = 'STARTING', "operatorRestartRequestedAt" = NOW() WHERE id = 'op-instance'`,
+  );
+  await expectNeed(null, "STARTING clears RESTART");
+  // A writer that ends a need explicitly clears both columns.
+  await client.query(`UPDATE deployment_instance SET "observedState" = 'STOPPED',
+    "needsOperator" = 'RESTART', "needsOperatorSince" = NOW() WHERE id = 'op-instance'`);
+  await refuse(`UPDATE deployment_instance SET "needsOperator" = NULL WHERE id = 'op-instance'`);
+  await client.query(`UPDATE deployment_instance SET "needsOperator" = NULL,
+    "needsOperatorSince" = NULL WHERE id = 'op-instance'`);
+  await expectNeed(null, "explicit clear");
+  positives += 6;
+  // Audit log: shape-checked, append-only, deletable (user drain), no foreign keys.
+  const event = (overrides = {}) => {
+    const row = { rank: "0", action: "'start'", outcome: "'opened'", exit: "NULL", ...overrides };
+    return `INSERT INTO deployment_operator_event
+      (id, "userId", "instanceId", "stepId", "cliDeviceId", rank, action, outcome, "exitCode")
+      VALUES ('${row.id ?? `op-event-${negatives}`}', 'owner-a', 'op-instance', 'op-step', 'cli-a',
+        ${row.rank}, ${row.action}, ${row.outcome}, ${row.exit})`;
+  };
+  await refuse(event({ rank: "64" }));
+  await refuse(event({ action: "'health'" }));
+  await refuse(event({ outcome: "'opened'", exit: "1" }));
+  await client.query(event({ id: "op-event-ok", outcome: "'closed'", exit: "1" }));
+  await refuse(`UPDATE deployment_operator_event SET "exitCode" = 0 WHERE id = 'op-event-ok'`);
+  await refuse(
+    `UPDATE deployment_operator_event SET "userId" = 'owner-b' WHERE id = 'op-event-ok'`,
+  );
+  const { rows: fks } = await client.query(`SELECT count(*)::int AS n FROM pg_constraint
+    WHERE conrelid = 'deployment_operator_event'::regclass AND contype = 'f'`);
+  if (fks[0].n !== 0) throw new Error("deployment_operator_event must have no foreign keys");
+  await client.query(`DELETE FROM deployment_operator_event WHERE id = 'op-event-ok'`);
+  // Clean up the fixture so later checks see the original graph.
+  await client.query(`
+    DELETE FROM deployment_step WHERE "runId" = 'op-run';
+    DELETE FROM deployment_instance_node WHERE id = 'op-node';
+    DELETE FROM deployment_instance WHERE id = 'op-instance';
+    DELETE FROM deployment_run WHERE id = 'op-run';
+    DELETE FROM deployment_plan WHERE id = 'op-plan';
+    DELETE FROM deployment_config WHERE id = 'op-config';
+  `);
+  process.stdout.write(
+    `Deployment operator hardening: ${negatives} transition/shape/append-only negatives and ${positives} normalisation/write-site positives passed.\n`,
+  );
+}
 
 const schemaUrl = new URL(baseUrl);
 schemaUrl.searchParams.set("options", `-c search_path=${schema}`);
@@ -1476,6 +1877,7 @@ try {
   `);
   await verifyAffinityNodeHardening();
   await verifyKvEvictionHardening();
+  await verifyDeploymentOperatorHardening();
   await expectConstraintFailure(
     `
     INSERT INTO pool_member

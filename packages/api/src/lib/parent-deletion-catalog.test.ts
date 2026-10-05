@@ -197,6 +197,14 @@ describe("plain user-id tables", () => {
     });
   });
 
+  it("drains deployment_operator_event by its userId column", () => {
+    expect(USER_PLAIN_ID_HISTORY_TABLES.deployment_operator_event.userColumn).toBe("userId");
+    expect(plainUserIdTables()).toContainEqual({
+      table: "deployment_operator_event",
+      column: "userId",
+    });
+  });
+
   it("has no stale classification", () => {
     const actual = new Set(plainUserIdTables().map(({ table }) => table));
     for (const table of [

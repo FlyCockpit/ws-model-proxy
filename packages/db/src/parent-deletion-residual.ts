@@ -129,6 +129,8 @@ export const HISTORY_DRAIN_EDGES = {
  */
 export const USER_PLAIN_ID_HISTORY_TABLES = {
   cli_agent_action_event: { userColumn: "userId" },
+  // Operator-terminal audit of interactive deployment steps (append-only, no FKs).
+  deployment_operator_event: { userColumn: "userId" },
 } as const satisfies Record<string, { userColumn: string }>;
 
 /**

@@ -279,9 +279,10 @@ export async function purgeDeletedUserHistory(
     }
   }, batch);
   // History keyed by a plain user id outside the hot path (the agent audit
-  // log). A row the drain skipped (locked) or an event written after the
-  // drain (a queued audit write, another replica) is taken here, and counts
-  // as remaining until it is gone, so the entry is not retired early.
+  // log and the deployment operator audit). A row the drain skipped (locked)
+  // or an event written after the drain (a queued audit write, another
+  // replica) is taken here, and counts as remaining until it is gone, so the
+  // entry is not retired early.
   let plainRemaining = false;
   for (const [table, { userColumn }] of Object.entries(USER_PLAIN_ID_HISTORY_TABLES)) {
     processed += await sweepLoop(

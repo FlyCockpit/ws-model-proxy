@@ -32,6 +32,32 @@ enum DeploymentStepState {
   RUNNING
   SUCCEEDED
   FAILED
+  /// An interactive step whose operator terminal is open (or was closed without success) and
+  /// waits for a person. Entered only from RUNNING; left only for RUNNING, PENDING, FAILED or
+  /// (with the acceptance in the same update) SUCCEEDED (schema-hardening.sql).
+  /// Declared last so fresh and upgraded databases share one enum order.
+  AWAITING_OPERATOR
+}
+
+/// Why an instance waits for a person. Kept apart from `observedState` on purpose:
+/// "stopped, needs you" is STOPPED + desired RUNNING + RESTART.
+enum DeploymentOperatorNeed {
+  /// An interactive step is AWAITING_OPERATOR.
+  STEP
+  /// An interactive start stopped; only a human restart brings it back.
+  RESTART
+}
+
+/// Outcome codes of the operator-terminal audit log (`DeploymentOperatorEvent`).
+enum DeploymentOperatorOutcome {
+  opened
+  accepted
+  succeeded
+  failed
+  declined
+  closed
+  auto_settled
+  cancelled
 }
 
 model DeploymentConfig {
@@ -101,31 +127,37 @@ model DeploymentRun {
 }
 
 model DeploymentInstance {
-  id               String                   @id @default(cuid(2))
-  userId           String
-  configId         String
-  revisionId       String
-  runId            String
-  variantKey       String
-  endpointSlug     String
-  createdAt        DateTime                 @default(now())
-  updatedAt        DateTime                 @default(now()) @updatedAt
-  desiredState     DeploymentDesiredState   @default(RUNNING)
-  observedState    DeploymentObservedState  @default(PENDING)
-  startedBy        DeploymentActor
-  agentsMayPreempt Boolean                  @default(false)
-  restartAttempts  Int                      @default(0)
-  nextRestartAt    DateTime?
-  healthFailures   Int                      @default(0)
-  healthSuccesses  Int                      @default(0)
-  lastHealthAt     DateTime?
-  User             User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  Config           DeploymentConfig         @relation(fields: [configId], references: [id], onDelete: Restrict)
-  Revision         DeploymentConfigRevision @relation(fields: [revisionId], references: [id], onDelete: Restrict)
-  Run              DeploymentRun            @relation(fields: [runId], references: [id], onDelete: Restrict)
-  Nodes            DeploymentInstanceNode[]
-  Steps            DeploymentStep[]
-  Endpoint         Endpoint?
+  id                         String                   @id @default(cuid(2))
+  userId                     String
+  configId                   String
+  revisionId                 String
+  runId                      String
+  variantKey                 String
+  endpointSlug               String
+  createdAt                  DateTime                 @default(now())
+  updatedAt                  DateTime                 @default(now()) @updatedAt
+  desiredState               DeploymentDesiredState   @default(RUNNING)
+  observedState              DeploymentObservedState  @default(PENDING)
+  startedBy                  DeploymentActor
+  agentsMayPreempt           Boolean                  @default(false)
+  restartAttempts            Int                      @default(0)
+  nextRestartAt              DateTime?
+  healthFailures             Int                      @default(0)
+  healthSuccesses            Int                      @default(0)
+  lastHealthAt               DateTime?
+  /// Set (with `needsOperatorSince`) while the instance waits for a person; see
+  /// DeploymentOperatorNeed. RESTART only with desired RUNNING and observed STOPPED/FAILED.
+  needsOperator              DeploymentOperatorNeed?
+  needsOperatorSince         DateTime?
+  /// When a person last asked for a restart of an interactive start.
+  operatorRestartRequestedAt DateTime?
+  User                       User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  Config                     DeploymentConfig         @relation(fields: [configId], references: [id], onDelete: Restrict)
+  Revision                   DeploymentConfigRevision @relation(fields: [revisionId], references: [id], onDelete: Restrict)
+  Run                        DeploymentRun            @relation(fields: [runId], references: [id], onDelete: Restrict)
+  Nodes                      DeploymentInstanceNode[]
+  Steps                      DeploymentStep[]
+  Endpoint                   Endpoint?
 
   @@unique([userId, endpointSlug])
   @@index([userId, desiredState, observedState])
@@ -154,28 +186,64 @@ model DeploymentInstanceNode {
 }
 
 model DeploymentStep {
-  id             String              @id @default(cuid(2))
-  runId          String
-  instanceId     String
-  cliDeviceId    String
-  rank           Int
-  phase          String
-  sequence       Int
-  state          DeploymentStepState @default(PENDING)
-  intent         Json
-  intentHash     String
-  attempts       Int                 @default(0)
-  ownerEpoch     String?
-  leaseExpiresAt DateTime?
-  deadline       DateTime?
-  notBefore      DateTime?
-  errorCode      String?
-  createdAt      DateTime            @default(now())
-  updatedAt      DateTime            @default(now()) @updatedAt
-  Run            DeploymentRun       @relation(fields: [runId], references: [id], onDelete: Restrict)
-  Instance       DeploymentInstance  @relation(fields: [instanceId], references: [id], onDelete: Restrict)
+  id                 String              @id @default(cuid(2))
+  runId              String
+  instanceId         String
+  cliDeviceId        String
+  rank               Int
+  phase              String
+  sequence           Int
+  state              DeploymentStepState @default(PENDING)
+  intent             Json
+  intentHash         String
+  attempts           Int                 @default(0)
+  ownerEpoch         String?
+  leaseExpiresAt     DateTime?
+  deadline           DateTime?
+  notBefore          DateTime?
+  errorCode          String?
+  /// Operator terminal of an interactive step (AWAITING_OPERATOR or RUNNING only); null once it
+  /// closed. All operator columns are null while PENDING (schema-hardening.sql).
+  operatorTerminalId String?
+  /// When the operator terminal opened; required while AWAITING_OPERATOR.
+  operatorSince      DateTime?
+  /// When the person pressed Enter (the command started).
+  operatorAcceptedAt DateTime?
+  /// Exit code of the last command run in the operator terminal.
+  operatorLastExit   Int?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @default(now()) @updatedAt
+  Run                DeploymentRun       @relation(fields: [runId], references: [id], onDelete: Restrict)
+  Instance           DeploymentInstance  @relation(fields: [instanceId], references: [id], onDelete: Restrict)
 
   @@unique([runId, instanceId, rank, phase, sequence])
   @@index([state, notBefore, leaseExpiresAt])
   @@map("deployment_step")
+}
+
+/// What happened to an operator terminal of an interactive deployment step. Metadata only:
+/// never command text (the step intent holds it) or terminal output.
+/// Plain id columns and NO foreign keys, on purpose (like CliAgentActionEvent): owner history
+/// outside the user-deletion lock graph. A user delete drains the user's rows
+/// (USER_PLAIN_ID_HISTORY_TABLES in packages/db/src/parent-deletion-residual.ts); a device or
+/// instance delete keeps them. Until the orphan sweep and 90-day retention land (interactive
+/// commands chunk 7/8, apps/server/src/model-api/usage-retention.ts), those rows stay until
+/// their user is deleted. Append-only: schema-hardening.sql refuses updates.
+model DeploymentOperatorEvent {
+  id          String                    @id @default(cuid(2))
+  createdAt   DateTime                  @default(now())
+  userId      String
+  instanceId  String
+  stepId      String
+  cliDeviceId String
+  rank        Int
+  /// The step intent's action: prepare, start, after_join or stop.
+  action      String
+  outcome     DeploymentOperatorOutcome
+  exitCode    Int?
+
+  @@index([userId, createdAt])
+  @@index([instanceId, createdAt])
+  @@index([createdAt])
+  @@map("deployment_operator_event")
 }

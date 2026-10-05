@@ -20,7 +20,7 @@ BEGIN;
 LOCK TABLE "user", cli_device, endpoint, discovered_model, execution_target, model_pool,
   inference_contribution, deployment_config, deployment_config_revision, deployment_plan,
   deployment_run, deployment_instance, deployment_instance_node, deployment_step,
-  model_api_token, pool_member, pool_routing_rule, pool_grant, pool_fallback_preference,
+  deployment_operator_event, model_api_token, pool_member, pool_routing_rule, pool_grant, pool_fallback_preference,
   model_api_token_allowlist_entry, response_stickiness_record,
   relay_request, inference_capacity, capacity_runtime, admission_request, capacity_waiter,
   capacity_lease, capacity_audit_event, provider_account, provider_model, provider_credential,
@@ -830,6 +830,20 @@ BEGIN
       RAISE EXCEPTION 'deployment pool must belong to recipe owner' USING ERRCODE = '23514';
     END IF;
   ELSIF TG_TABLE_NAME = 'deployment_instance' THEN
+    -- Operator need normalisation: generic writers that stop, restart or start an
+    -- instance never have to know about it. A RESTART need ("stopped, needs you") CARRIED
+    -- OVER unchanged from the old row ends once the instance is no longer meant to run or
+    -- is no longer stopped. Values the writer sets in this update are never rewritten: a
+    -- contradictory explicit write (RESTART on a stopping instance, a lone timestamp) hits
+    -- deployment_instance_operator_shape and fails.
+    IF TG_OP = 'UPDATE' THEN
+      IF NEW."needsOperator" = 'RESTART' AND OLD."needsOperator" IS NOT DISTINCT FROM 'RESTART'
+        AND NEW."needsOperatorSince" IS NOT DISTINCT FROM OLD."needsOperatorSince"
+        AND NOT (NEW."desiredState" = 'RUNNING' AND NEW."observedState" IN ('STOPPED', 'FAILED')) THEN
+        NEW."needsOperator" := NULL;
+        NEW."needsOperatorSince" := NULL;
+      END IF;
+    END IF;
     IF (TG_OP = 'INSERT' OR (TG_OP = 'UPDATE' AND NEW."desiredState" = 'RUNNING'
       AND (OLD."desiredState" = 'STOPPED' OR (NEW."observedState" = 'STARTING' AND OLD."observedState" <> 'STARTING'))))
       AND NOT EXISTS (SELECT 1 FROM "user" owner WHERE owner.id = NEW."userId" AND owner."deletionRequestedAt" IS NULL
@@ -856,13 +870,75 @@ BEGIN
       IF (NEW.intent, NEW."intentHash", NEW.phase, NEW.sequence) IS DISTINCT FROM (OLD.intent, OLD."intentHash", OLD.phase, OLD.sequence) THEN
         RAISE EXCEPTION 'deployment job intent is immutable' USING ERRCODE = '23514';
       END IF;
+      -- Operator column normalisation: generic writers (result settlement, inventory
+      -- adoption, deadline resets, undeliver) never have to know about operator terminals.
+      -- A terminal id lives only while AWAITING_OPERATOR or RUNNING; PENDING is a fresh
+      -- attempt with no operator state; history stays in deployment_operator_event. Only
+      -- values CARRIED OVER unchanged from the old row are cleared: a value the writer sets
+      -- in this update that contradicts the new state hits deployment_step_operator_shape.
+      IF NEW.state NOT IN ('AWAITING_OPERATOR', 'RUNNING')
+        AND NEW."operatorTerminalId" IS NOT DISTINCT FROM OLD."operatorTerminalId" THEN
+        NEW."operatorTerminalId" := NULL;
+      END IF;
+      IF NEW.state = 'PENDING' THEN
+        IF NEW."operatorSince" IS NOT DISTINCT FROM OLD."operatorSince" THEN
+          NEW."operatorSince" := NULL;
+        END IF;
+        IF NEW."operatorAcceptedAt" IS NOT DISTINCT FROM OLD."operatorAcceptedAt" THEN
+          NEW."operatorAcceptedAt" := NULL;
+        END IF;
+        IF NEW."operatorLastExit" IS NOT DISTINCT FROM OLD."operatorLastExit" THEN
+          NEW."operatorLastExit" := NULL;
+        END IF;
+      END IF;
+      -- Operator terminals (interactive commands): a step reaches AWAITING_OPERATOR only from
+      -- RUNNING (the dispatched job drew its confirm screen) and leaves it only for RUNNING (the
+      -- person pressed Enter), PENDING (reopen / reconnect), FAILED (cancelled) or SUCCEEDED
+      -- (a final result that overtook its "operator running" report; it carries the
+      -- acceptance in the same update).
+      IF NEW.state = 'AWAITING_OPERATOR' AND OLD.state NOT IN ('RUNNING', 'AWAITING_OPERATOR') THEN
+        RAISE EXCEPTION 'deployment step enters AWAITING_OPERATOR only from RUNNING' USING ERRCODE = '23514';
+      END IF;
+      IF OLD.state = 'AWAITING_OPERATOR' AND NEW.state NOT IN ('AWAITING_OPERATOR', 'RUNNING', 'PENDING', 'FAILED', 'SUCCEEDED') THEN
+        RAISE EXCEPTION 'deployment step leaves AWAITING_OPERATOR only for RUNNING, PENDING, FAILED or SUCCEEDED' USING ERRCODE = '23514';
+      END IF;
+      IF OLD.state = 'AWAITING_OPERATOR' AND NEW.state = 'SUCCEEDED' AND (
+        NEW."operatorAcceptedAt" IS NULL OR NEW."operatorSince" IS DISTINCT FROM OLD."operatorSince") THEN
+        RAISE EXCEPTION 'only an accepted operator command can succeed' USING ERRCODE = '23514';
+      END IF;
+      -- The open time belongs to the terminal: a retry cycle in the same terminal
+      -- (AWAITING -> RUNNING -> AWAITING) keeps it.
+      IF OLD.state = 'RUNNING' AND NEW.state = 'AWAITING_OPERATOR'
+        AND OLD."operatorTerminalId" IS NOT NULL AND OLD."operatorSince" IS NOT NULL
+        AND NEW."operatorTerminalId" IS NOT DISTINCT FROM OLD."operatorTerminalId"
+        AND NEW."operatorSince" IS DISTINCT FROM OLD."operatorSince" THEN
+        RAISE EXCEPTION 'an operator terminal keeps its open time' USING ERRCODE = '23514';
+      END IF;
+      IF OLD.state = 'AWAITING_OPERATOR' AND NEW.state = 'AWAITING_OPERATOR' AND (
+        NEW."operatorSince" IS DISTINCT FROM OLD."operatorSince"
+        OR (NEW."operatorTerminalId" IS NOT NULL AND NEW."operatorTerminalId" IS DISTINCT FROM OLD."operatorTerminalId")) THEN
+        RAISE EXCEPTION 'an awaiting operator terminal can only close; reopen through PENDING' USING ERRCODE = '23514';
+      END IF;
+      IF OLD.state = 'AWAITING_OPERATOR' AND NEW.state = 'RUNNING' AND (
+        OLD."operatorTerminalId" IS NULL OR NEW."operatorTerminalId" IS DISTINCT FROM OLD."operatorTerminalId"
+        OR NEW."operatorAcceptedAt" IS NULL OR NEW."operatorSince" IS DISTINCT FROM OLD."operatorSince") THEN
+        RAISE EXCEPTION 'only an open operator terminal can be accepted' USING ERRCODE = '23514';
+      END IF;
+    ELSIF TG_TABLE_NAME = 'deployment_step' THEN
+      -- Nested: NEW.state does not exist on deployment_instance_node rows.
+      IF NEW.state = 'AWAITING_OPERATOR' THEN
+        RAISE EXCEPTION 'deployment step enters AWAITING_OPERATOR only from RUNNING' USING ERRCODE = '23514';
+      END IF;
     END IF;
     IF TG_TABLE_NAME = 'deployment_step' THEN
       IF NOT EXISTS (SELECT 1 FROM deployment_run run JOIN deployment_plan plan ON plan.id = run."planId" WHERE run.id = NEW."runId" AND plan."userId" = owner_id) THEN
         RAISE EXCEPTION 'deployment step run must share instance owner' USING ERRCODE = '23514';
       END IF;
       IF TG_OP = 'UPDATE' THEN
-        IF NEW.state = 'RUNNING' AND OLD.state <> 'RUNNING' AND lower(NEW.phase) <> 'stop' AND NOT EXISTS (
+        -- Dispatch only. Recording an operator's accept (AWAITING_OPERATOR -> RUNNING) is
+        -- evidence of a command already running (the CLI writes `go` on Enter), not a new
+        -- start, so it is never refused here.
+        IF NEW.state = 'RUNNING' AND OLD.state NOT IN ('RUNNING', 'AWAITING_OPERATOR') AND lower(NEW.phase) <> 'stop' AND NOT EXISTS (
           SELECT 1 FROM "user" owner WHERE owner.id = owner_id AND owner."deletionRequestedAt" IS NULL
             AND (owner.banned IS NOT TRUE OR owner."banExpires" <= now())) THEN
           RAISE EXCEPTION 'inactive owners cannot start deployment jobs' USING ERRCODE = '23514';
@@ -892,6 +968,57 @@ ALTER TABLE deployment_instance_node DROP CONSTRAINT IF EXISTS deployment_instan
 ALTER TABLE deployment_instance_node ADD CONSTRAINT deployment_instance_node_bounds
   CHECK (rank BETWEEN 0 AND 63 AND port BETWEEN 1024 AND 65535 AND ("distPort" IS NULL OR "distPort" BETWEEN 1024 AND 65535) AND ("claimHeld" OR "stoppedAt" IS NOT NULL));
 CREATE UNIQUE INDEX IF NOT EXISTS deployment_instance_node_held_port ON deployment_instance_node ("cliDeviceId", port) WHERE "claimHeld";
+
+-- Operator terminals of interactive steps. Row shape only (the deployment_integrity
+-- trigger first clears values carried over from the old row; explicit contradictory
+-- writes fail here); transitions are in
+-- enforce_deployment_integrity. Operator columns exist only on an interactive
+-- prepare/start/after_join/stop intent; a terminal id only while AWAITING_OPERATOR or
+-- RUNNING; AWAITING_OPERATOR has an open time and no wall-clock deadline; PENDING carries
+-- no operator state (a reopen or reconnect starts a fresh terminal).
+ALTER TABLE deployment_step DROP CONSTRAINT IF EXISTS deployment_step_operator_shape;
+ALTER TABLE deployment_step ADD CONSTRAINT deployment_step_operator_shape CHECK (
+  ("operatorTerminalId" IS NULL
+    OR (state IN ('AWAITING_OPERATOR', 'RUNNING') AND length("operatorTerminalId") BETWEEN 1 AND 128))
+  AND (state <> 'AWAITING_OPERATOR' OR ("operatorSince" IS NOT NULL AND deadline IS NULL))
+  AND ("operatorAcceptedAt" IS NULL OR "operatorSince" IS NOT NULL)
+  AND ("operatorLastExit" IS NULL OR "operatorSince" IS NOT NULL)
+  AND (state <> 'PENDING' OR ("operatorTerminalId" IS NULL AND "operatorSince" IS NULL
+    AND "operatorAcceptedAt" IS NULL AND "operatorLastExit" IS NULL))
+  AND (("operatorTerminalId" IS NULL AND "operatorSince" IS NULL)
+    -- IS TRUE: a missing key yields NULL, which a CHECK would accept.
+    OR (intent -> 'interactive' = 'true'::jsonb
+      AND intent ->> 'action' IN ('prepare', 'start', 'after_join', 'stop')) IS TRUE));
+-- needsOperator and its timestamp travel together; RESTART ("stopped, needs you") only
+-- for an instance that should run but has stopped. The trigger clears a carried-over
+-- RESTART; an explicit contradictory write fails here.
+ALTER TABLE deployment_instance DROP CONSTRAINT IF EXISTS deployment_instance_operator_shape;
+ALTER TABLE deployment_instance ADD CONSTRAINT deployment_instance_operator_shape CHECK (
+  ("needsOperator" IS NULL) = ("needsOperatorSince" IS NULL)
+  AND ("needsOperator" IS DISTINCT FROM 'RESTART'
+    OR ("desiredState" = 'RUNNING' AND "observedState" IN ('STOPPED', 'FAILED'))));
+
+-- Operator audit log: plain ids, no foreign keys (drained on user delete by
+-- USER_PLAIN_ID_HISTORY_TABLES), no command text, append-only. Deletes stay allowed
+-- for that drain and the deleted-user purge.
+ALTER TABLE deployment_operator_event DROP CONSTRAINT IF EXISTS deployment_operator_event_shape;
+ALTER TABLE deployment_operator_event ADD CONSTRAINT deployment_operator_event_shape CHECK (
+  rank BETWEEN 0 AND 63
+  AND action IN ('prepare', 'start', 'after_join', 'stop')
+  AND length("userId") BETWEEN 1 AND 128
+  AND length("instanceId") BETWEEN 1 AND 128
+  AND length("stepId") BETWEEN 1 AND 128
+  AND length("cliDeviceId") BETWEEN 1 AND 128
+  AND ("exitCode" IS NULL OR outcome IN ('succeeded', 'failed', 'closed')));
+CREATE OR REPLACE FUNCTION enforce_deployment_operator_event_append_only()
+RETURNS trigger LANGUAGE plpgsql AS $deployment_operator_event_append_only$
+BEGIN
+  RAISE EXCEPTION 'deployment operator events are append-only' USING ERRCODE = '23514';
+END;
+$deployment_operator_event_append_only$;
+DROP TRIGGER IF EXISTS deployment_operator_event_append_only ON deployment_operator_event;
+CREATE TRIGGER deployment_operator_event_append_only BEFORE UPDATE ON deployment_operator_event
+FOR EACH ROW EXECUTE FUNCTION enforce_deployment_operator_event_append_only();
 
 CREATE OR REPLACE FUNCTION cleanup_stopped_deployment_owner()
 RETURNS trigger LANGUAGE plpgsql AS $deployment_owner_cleanup$
