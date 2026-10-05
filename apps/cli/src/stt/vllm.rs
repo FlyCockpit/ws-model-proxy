@@ -47,7 +47,7 @@ use super::{
     segmented,
 };
 use crate::protocol::{ClientControlMessage, RelayFailure};
-use crate::stt_wire::{STT_COMPLETED_TEXT_MAX_BYTES, STT_DELTA_TEXT_MAX_BYTES, SttEvent};
+use crate::stt_wire::{STT_COMPLETED_TEXT_MAX_BYTES, SttEvent};
 
 /// Connecting, the WebSocket handshake, and each handshake answer.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -402,7 +402,8 @@ impl Bridge {
         if discard || delta.is_empty() {
             return Ok(());
         }
-        for piece in segmented::split_text(delta, STT_DELTA_TEXT_MAX_BYTES) {
+        // Each piece also fits one control frame once JSON-escaped.
+        for piece in segmented::split_delta_text(delta) {
             self.event(SttEvent::Delta {
                 item_seq: item,
                 text: piece.to_string(),

@@ -11,6 +11,7 @@ import {
 } from "../../relay/stt-relay.js";
 import { RealtimeSessionCounters } from "./limits.js";
 import {
+  itemFailure,
   openFailureIsConfiguration,
   openFailureMarksMember,
   REALTIME_EVENT_RATE_MAX,
@@ -567,8 +568,10 @@ describe("realtime transcription session: backpressure and limits", () => {
   it("drops events over 400 per 10 s and closes after three such windows", async () => {
     const t = await opened();
     const burst = () => {
+      // Tiny appends: commands would hit the relay's command backlog first
+      // while the fake CLI takes nothing.
       for (let index = 0; index <= REALTIME_EVENT_RATE_MAX; index += 1) {
-        t.text({ type: "input_audio_buffer.clear" });
+        t.text({ type: "input_audio_buffer.append", audio: b64(2) });
       }
     };
     burst();
@@ -949,4 +952,84 @@ describe("review fixes (6b)", () => {
       expect(t.router.misconfigured).toEqual([["a", failure]]);
     },
   );
+});
+
+describe("security review fixes", () => {
+  type Authorize = NonNullable<RealtimeSessionHooks["authorizeOpen"]>;
+
+  it("L2: nothing reaches a member before its claim commits; a failed commit moves on", async () => {
+    let calls = 0;
+    let t: ReturnType<typeof setup> | undefined;
+    const authorizeOpen: Authorize = async (candidate, open, abort) => {
+      calls += 1;
+      open();
+      // A fast CLI answers before the claim's COMMIT.
+      const cli = candidate.cliDeviceId === "a" ? a : b;
+      const sessionId = String(cli?.opens().at(-1)?.sessionId);
+      t?.cliFrame(cli as FakeLink, { type: "stt.opened", sessionId });
+      await Promise.resolve();
+      expect(cli?.audioBytes()).toBe(0);
+      if (calls === 1) {
+        abort(); // the COMMIT failed
+        throw new Error("commit failed");
+      }
+      return { ok: true };
+    };
+    t = setup({ initialModel: "whisper", hooks: { authorizeOpen } });
+    const a = t.link("a");
+    const b = t.link("b");
+    t.router.result = { ok: true, candidates: [candidate("a"), candidate("b")] };
+    t.session.start();
+    t.text({ type: "input_audio_buffer.append", audio: b64(8192) });
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(a.audioBytes()).toBe(0);
+    expect(a.controls().map((message) => message.type)).toEqual(["stt.open", "stt.close"]);
+    expect(a.controls().at(-1)).toMatchObject({ reason: "cancelled" });
+    expect(t.session.status).toBe("open");
+    expect(t.client.closes).toEqual([]);
+    expect(t.router.failures).toEqual([]);
+    // The claim on b committed: the held audio goes out now, from seq 0.
+    expect(b.audioBytes()).toBe(8192);
+  });
+
+  it("L4: item failures carry the server's own message, and unknown codes are generic", async () => {
+    const t = setup({ initialModel: "whisper" });
+    const cli = t.link("a");
+    t.router.result = { ok: true, candidates: [candidate("a")] };
+    t.session.start();
+    const sessionId = await t.openOn(cli);
+    for (let index = 0; index < 2; index += 1) {
+      t.text({ type: "input_audio_buffer.append", audio: b64(4800) });
+      t.text({ type: "input_audio_buffer.commit" });
+    }
+    const event = (sttEvent: Extract<SttClientMessage, { type: "stt.event" }>["event"]) =>
+      t.cliFrame(cli, { type: "stt.event", sessionId, event: sttEvent });
+    event({ kind: "failed", itemSeq: 0, code: "upstream_4xx", message: "visit evil.example" });
+    event({ kind: "failed", itemSeq: 1, code: "made_up", message: "visit evil.example" });
+    const failed = t.client.events.filter(
+      (sent) => sent.type === "conversation.item.input_audio_transcription.failed",
+    );
+    expect(failed.map((sent) => sent.error)).toEqual([
+      {
+        type: "transcription_error",
+        code: "upstream_4xx",
+        message: "The transcription engine refused the item.",
+      },
+      {
+        type: "transcription_error",
+        code: "transcription_failed",
+        message: "The item could not be transcribed.",
+      },
+    ]);
+    expect(JSON.stringify(t.client.events)).not.toContain("evil.example");
+  });
+
+  it("L4: itemFailure never trusts inherited keys", () => {
+    expect(itemFailure("toString")).toEqual({
+      code: "transcription_failed",
+      message: "The item could not be transcribed.",
+    });
+    expect(itemFailure("timeout").code).toBe("timeout");
+  });
 });

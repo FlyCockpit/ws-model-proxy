@@ -1220,6 +1220,9 @@ fn run_relay_session(
                     // A failed stop leaves its endpoint serving.
                     if result.status == "failed" {
                         stt.stop_failed(&result.step_id);
+                    } else if result.status == "succeeded" {
+                        // A start that arrived meanwhile may take sessions again.
+                        stt.stop_finished(&result.step_id);
                     }
                     send_deployment_result(&mut socket, &result)?;
                 }

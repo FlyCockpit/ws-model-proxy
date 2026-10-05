@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use tokio::sync::watch;
 
 use super::EngineEndpoint;
+use crate::protocol::RELAY_JSON_CONTROL_MAX_BYTES;
 use crate::stt_wire::{
     STT_COMPLETED_TEXT_MAX_BYTES, STT_DELTA_TEXT_MAX_BYTES, STT_MESSAGE_MAX_BYTES,
     STT_TOKEN_COUNT_MAX, SttConfig, SttEngineUsage, SttEvent,
@@ -236,20 +237,46 @@ pub fn write_wav(wav: &mut Vec<u8>, samples: &[i16]) {
     }
 }
 
+/// Room for event text in one JSON control frame: the 64 KiB frame less a
+/// margin for the `stt.event` envelope (type, session id, item number, usage
+/// counts), which is a few hundred bytes at most.
+pub const STT_EVENT_TEXT_ESCAPED_MAX_BYTES: usize = RELAY_JSON_CONTROL_MAX_BYTES - 1024;
+
+/// The bytes `text` takes as a JSON string (quotes included), as serde_json
+/// writes it: `"` and `\` and the short escapes take 2 bytes, other control
+/// characters 6 (`\u00XX`), everything else its UTF-8 length.
+pub fn json_escaped_len(text: &str) -> usize {
+    2 + text
+        .chars()
+        .map(|character| match character {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            control if (control as u32) < 0x20 => 6,
+            other => other.len_utf8(),
+        })
+        .sum::<usize>()
+}
+
+/// Whether a final transcript fits the wire: at most 48 KiB as text and one
+/// control frame once JSON-escaped. Otherwise only its item fails.
+pub fn transcript_fits(text: &str) -> bool {
+    text.len() <= STT_COMPLETED_TEXT_MAX_BYTES
+        && json_escaped_len(text) <= STT_EVENT_TEXT_ESCAPED_MAX_BYTES
+}
+
 /// The events one turn produces, always within the wire bounds: the text as
-/// deltas of at most 16 KiB, then `completed`; a transcript over 48 KiB
-/// fails the item instead.
+/// deltas that each fit one frame, then `completed`; a transcript over the
+/// bounds ([`transcript_fits`]) fails the item instead, never the session.
 pub fn events(item_seq: u32, outcome: Outcome) -> Vec<SttEvent> {
     match outcome {
-        Outcome::Text { text, .. } if text.len() > STT_COMPLETED_TEXT_MAX_BYTES => {
+        Outcome::Text { text, .. } if !transcript_fits(&text) => {
             vec![SttEvent::Failed {
                 item_seq,
                 code: "transcript_too_large".into(),
-                message: "the transcript exceeds 48 KiB".into(),
+                message: "the transcript exceeds the frame limit".into(),
             }]
         }
         Outcome::Text { text, usage } => {
-            let mut events: Vec<SttEvent> = split_text(&text, STT_DELTA_TEXT_MAX_BYTES)
+            let mut events: Vec<SttEvent> = split_delta_text(&text)
                 .into_iter()
                 .map(|delta| SttEvent::Delta {
                     item_seq,
@@ -269,6 +296,33 @@ pub fn events(item_seq: u32, outcome: Outcome) -> Vec<SttEvent> {
             message: truncate(&message, STT_MESSAGE_MAX_BYTES).to_string(),
         }],
     }
+}
+
+/// Delta pieces of at most 16 KiB of text whose JSON-escaped form also fits
+/// one control frame, cut on character boundaries.
+pub fn split_delta_text(text: &str) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut start = 0;
+    let mut raw = 0;
+    let mut escaped = 2;
+    for (index, character) in text.char_indices() {
+        let width = character.len_utf8();
+        let cost = json_escaped_len(&text[index..index + width]) - 2;
+        if raw + width > STT_DELTA_TEXT_MAX_BYTES
+            || escaped + cost > STT_EVENT_TEXT_ESCAPED_MAX_BYTES
+        {
+            pieces.push(&text[start..index]);
+            start = index;
+            raw = 0;
+            escaped = 2;
+        }
+        raw += width;
+        escaped += cost;
+    }
+    if start < text.len() {
+        pieces.push(&text[start..]);
+    }
+    pieces
 }
 
 /// `text` in pieces of at most `max` bytes, cut on character boundaries.

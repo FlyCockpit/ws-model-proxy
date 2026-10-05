@@ -741,6 +741,62 @@ fn poll_ends_sessions_past_their_deadline_or_whose_deployment_stopped() {
 }
 
 #[test]
+fn escape_heavy_transcripts_fail_only_their_item_and_deltas_fit_a_frame() {
+    let text = |text: String| segmented::Outcome::Text { text, usage: None };
+    let encodes = |event: SttEvent| {
+        crate::protocol::encode_control(&ClientControlMessage::SttEvent {
+            session_id: SESSION.into(),
+            event,
+        })
+        .is_ok()
+    };
+    // Each control character escapes to 6 bytes: 11 000 of them are 66 000
+    // bytes once escaped, over the 64 KiB frame, though only 11 KB raw.
+    let controls = "\u{1}".repeat(11_000);
+    assert_eq!(segmented::json_escaped_len(&controls), 66_002);
+    let events = segmented::events(7, text(controls));
+    assert!(matches!(
+        &events[..],
+        [SttEvent::Failed { code, .. }] if code == "transcript_too_large"
+    ));
+    assert!(events.into_iter().all(encodes));
+    // Quotes and newlines (2 bytes each) just under 48 KiB raw: also too big.
+    let quotes = "\"\n".repeat(20_000);
+    assert!(!segmented::transcript_fits(&quotes));
+    // A transcript that fits is delivered whole, and every delta piece
+    // (16 KiB of control characters would be 96 KiB escaped) fits a frame.
+    let fits = format!("{}{}", "\u{2}".repeat(9_000), "ok \"quoted\" é");
+    assert!(segmented::transcript_fits(&fits));
+    let events = segmented::events(8, text(fits.clone()));
+    let deltas: String = events
+        .iter()
+        .filter_map(|event| match event {
+            SttEvent::Delta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deltas, fits);
+    assert!(events.into_iter().all(encodes));
+    let control_run = "\u{3}".repeat(16_384);
+    let pieces = segmented::split_delta_text(&control_run);
+    assert!(pieces.len() > 1);
+    assert!(pieces.iter().all(|piece| {
+        piece.len() <= crate::stt_wire::STT_DELTA_TEXT_MAX_BYTES
+            && segmented::json_escaped_len(piece) <= segmented::STT_EVENT_TEXT_ESCAPED_MAX_BYTES
+    }));
+    assert_eq!(pieces.concat(), control_run);
+    // The escape table agrees with serde_json.
+    for sample in ["a\"b\\c\n\r\t\u{8}\u{c}\u{1f}é😀", ""] {
+        assert_eq!(
+            segmented::json_escaped_len(sample),
+            serde_json::to_string(sample)
+                .map(|json| json.len())
+                .unwrap_or(0)
+        );
+    }
+}
+
+#[test]
 fn turn_events_stay_within_the_wire_contract() {
     let long = "é".repeat(20_000);
     let text = |text: String| segmented::Outcome::Text { text, usage: None };
@@ -876,6 +932,87 @@ fn a_burst_of_small_frames_within_credit_stalls_instead_of_failing() {
 }
 
 #[test]
+fn queued_audio_frames_are_bounded_in_count_too() {
+    let engine = FakeEngine::start(vec![Reply {
+        delay: Duration::from_secs(30),
+        ..Reply::text("slow")
+    }]);
+    let (mut registry, rx) = registry();
+    let managed = [endpoint("inst-a", &engine.base_url, segmented(None, None))];
+    assert!(
+        registry
+            .handle(open(SESSION, "inst-a"), &managed, Instant::now())
+            .is_empty()
+    );
+    let first = speech(1);
+    let mut seq = first.len() as u64;
+    stream_audio(&mut registry, &rx, SESSION, 0, first);
+    // Block the session thread behind the stuck engine (as in the command test).
+    for item_seq in 0..3 {
+        assert!(
+            registry
+                .handle(
+                    SttServerMessage::Commit {
+                        session_id: SESSION.into(),
+                        item_seq,
+                    },
+                    &[],
+                    Instant::now(),
+                )
+                .is_empty()
+        );
+    }
+    thread::sleep(Duration::from_millis(300));
+    // 2-byte frames fit the credit window many times over; the count cap ends it.
+    let mut refused = Vec::new();
+    for _ in 0..=AUDIO_FRAMES_QUEUED_MAX {
+        refused = registry.audio(SESSION, seq, vec![0, 0]);
+        seq += 1;
+        if !refused.is_empty() {
+            break;
+        }
+    }
+    assert!(
+        is_error(&refused[0], RelayFailure::ProtocolError),
+        "{refused:?}"
+    );
+    assert!(!registry.is_live(SESSION));
+    registry.abort_all();
+}
+
+#[test]
+fn session_threads_still_running_count_against_new_opens() {
+    let (mut registry, _rx) = registry();
+    let now = Instant::now();
+    let managed = [endpoint(
+        "inst-a",
+        "http://127.0.0.1:9",
+        segmented(None, None),
+    )];
+    // As if earlier sessions' threads were still stuck connecting.
+    registry.threads.store(STT_THREADS_MAX, Ordering::SeqCst);
+    let refused = registry.handle(open(&session_id(1), "inst-a"), &managed, now);
+    assert!(
+        is_error(&refused[0], RelayFailure::RateLimited),
+        "{refused:?}"
+    );
+    registry.threads.store(0, Ordering::SeqCst);
+    assert!(
+        registry
+            .handle(open(&session_id(2), "inst-a"), &managed, now)
+            .is_empty()
+    );
+    assert_eq!(registry.threads.load(Ordering::SeqCst), 1);
+    // The slot is released when the thread itself ends, not when the session does.
+    registry.abort_all();
+    let until = Instant::now() + WAIT;
+    while registry.threads.load(Ordering::SeqCst) > 0 && Instant::now() < until {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(registry.threads.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn queued_commands_are_bounded_per_session() {
     let engine = FakeEngine::start(vec![Reply {
         delay: Duration::from_secs(30),
@@ -950,13 +1087,31 @@ fn a_stop_job_ends_the_endpoints_sessions_before_it_runs() {
     // Still in the snapshot while the stop runs, but no new session there.
     let refused = registry.handle(open(&session_id(4), "inst-a"), &managed, now);
     assert!(is_error(&refused[0], RelayFailure::NotFound));
-    // A start job for it lifts the mark.
+    // A start job that arrives while the stop still runs keeps the mark:
+    // the engine is about to die.
     registry.endpoint_starting("inst-a");
+    let refused = registry.handle(open(&session_id(7), "inst-a"), &managed, now);
+    assert!(is_error(&refused[0], RelayFailure::NotFound));
+    // Another stop finishing changes nothing; this stop finishing lifts it.
+    registry.stop_finished("step-other");
+    assert!(
+        !registry
+            .handle(open(&session_id(8), "inst-a"), &managed, now)
+            .is_empty()
+    );
+    registry.stop_finished("step-1");
     assert!(
         registry
             .handle(open(&session_id(5), "inst-a"), &managed, now)
             .is_empty()
     );
+    // A stop that finished with no start waiting keeps the mark until the
+    // endpoint leaves the snapshot.
+    registry.endpoint_stopping("inst-b", "step-2");
+    registry.stop_finished("step-2");
+    let refused = registry.handle(open(&session_id(9), "inst-b"), &managed, now);
+    assert!(is_error(&refused[0], RelayFailure::NotFound));
+    registry.stop_failed("step-2");
     // Or the endpoint leaving the snapshot does.
     registry.endpoint_stopping("inst-a", "step-1");
     let after = registry.poll(now, || managed[1..].to_vec());

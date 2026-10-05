@@ -42,6 +42,13 @@ pub const STT_SESSIONS_MAX: usize = 8;
 /// bounded in bytes by the credit window instead, so a burst of small
 /// frames within credit is paced, never refused.
 const CONTROL_QUEUE_MAX: usize = 64;
+/// Audio frames queued for one session thread. The credit window bounds the
+/// bytes; this bounds the count too (a hostile server sending 2-byte frames
+/// within credit), far above what the coalescing server sends.
+const AUDIO_FRAMES_QUEUED_MAX: usize = 4_096;
+/// Session threads alive at once, including those still connecting to an
+/// engine after their session ended (an engine connect cannot be cut off).
+const STT_THREADS_MAX: usize = 2 * STT_SESSIONS_MAX;
 /// How often the relay loop compares live sessions with the managed
 /// endpoint snapshot (deadlines are checked on every pass).
 const ENDPOINT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
@@ -105,6 +112,8 @@ struct Session {
     input: Sender<Input>,
     /// Control inputs queued and not yet taken by the thread.
     controls: Arc<AtomicUsize>,
+    /// Audio frames queued and not yet taken by the thread.
+    frames: Arc<AtomicUsize>,
     cancel: watch::Sender<bool>,
     /// The `seq` the next `stt.audio` must carry.
     next_seq: u64,
@@ -122,9 +131,10 @@ pub struct SttRegistry {
     sessions: BTreeMap<String, Session>,
     recent: VecDeque<String>,
     recent_set: BTreeSet<String>,
-    /// Endpoints with a stop job on its way, with that job's step id: no
-    /// new sessions there.
-    stopping: BTreeMap<String, String>,
+    /// Endpoints with a stop job on its way: no new sessions there.
+    stopping: BTreeMap<String, StopMark>,
+    /// Session threads still running (see [`STT_THREADS_MAX`]).
+    threads: Arc<AtomicUsize>,
     next_endpoint_check: Option<Instant>,
     tx: SyncSender<FromWorker>,
 }
@@ -136,6 +146,7 @@ impl SttRegistry {
             recent: VecDeque::new(),
             recent_set: BTreeSet::new(),
             stopping: BTreeMap::new(),
+            threads: Arc::new(AtomicUsize::new(0)),
             next_endpoint_check: None,
             tx,
         }
@@ -150,8 +161,13 @@ impl SttRegistry {
         endpoint_slug: &str,
         step_id: &str,
     ) -> Vec<ClientControlMessage> {
-        self.stopping
-            .insert(endpoint_slug.to_string(), step_id.to_string());
+        self.stopping.insert(
+            endpoint_slug.to_string(),
+            StopMark {
+                step_id: step_id.to_string(),
+                start_waiting: false,
+            },
+        );
         let ids: Vec<String> = self
             .sessions
             .iter()
@@ -163,15 +179,27 @@ impl SttRegistry {
             .collect()
     }
 
-    /// A start job for `endpoint_slug`: it may take sessions again once ready.
+    /// A start job for `endpoint_slug`. While its stop is still running the
+    /// endpoint keeps refusing sessions (the engine is about to die); the
+    /// mark goes once that stop finishes ([`Self::stop_finished`]).
     pub fn endpoint_starting(&mut self, endpoint_slug: &str) {
-        self.stopping.remove(endpoint_slug);
+        if let Some(mark) = self.stopping.get_mut(endpoint_slug) {
+            mark.start_waiting = true;
+        }
+    }
+
+    /// The stop step `step_id` finished. If a start is already waiting, the
+    /// endpoint may take sessions again once that start makes it ready;
+    /// otherwise the mark stays until the endpoint leaves the snapshot.
+    pub fn stop_finished(&mut self, step_id: &str) {
+        self.stopping
+            .retain(|_, mark| mark.step_id != step_id || !mark.start_waiting);
     }
 
     /// The deployment step `step_id` was refused or failed. If it was a
     /// stop, its endpoint is still serving, so it takes sessions again.
     pub fn stop_failed(&mut self, step_id: &str) {
-        self.stopping.retain(|_, stop_step| stop_step != step_id);
+        self.stopping.retain(|_, mark| mark.step_id != step_id);
     }
 
     pub fn len(&self) -> usize {
@@ -272,9 +300,16 @@ impl SttRegistry {
                 "audio exceeded the credit window",
             );
         }
-        // Unbounded in count: the credit window already bounds the bytes.
+        if session.frames.load(Ordering::SeqCst) >= AUDIO_FRAMES_QUEUED_MAX {
+            return self.fail(
+                session_id,
+                RelayFailure::ProtocolError,
+                "too many audio frames are queued",
+            );
+        }
         // A send error means the thread already ended and reported why.
         if session.input.send(Input::Audio(body)).is_ok() {
+            session.frames.fetch_add(1, Ordering::SeqCst);
             session.next_seq += 1;
             session.outstanding += bytes;
         }
@@ -516,8 +551,17 @@ impl SttRegistry {
                 .map(|auth| (auth.mode.clone(), auth.env.clone())),
             model: request.upstream_model.clone(),
         };
+        if self.threads.load(Ordering::SeqCst) >= STT_THREADS_MAX {
+            return refuse(
+                RelayFailure::RateLimited,
+                "this node is still closing earlier live sessions",
+            );
+        }
         let (input_tx, input_rx) = mpsc::channel();
         let controls = Arc::new(AtomicUsize::new(0));
+        let frames = Arc::new(AtomicUsize::new(0));
+        let thread_frames = Arc::clone(&frames);
+        let slot = ThreadSlot::take(&self.threads);
         let (cancel, cancel_rx) = watch::channel(false);
         let tx = self.tx.clone();
         let thread_id = id.clone();
@@ -529,6 +573,8 @@ impl SttRegistry {
         let spawned = thread::Builder::new()
             .name("wsmp-stt".into())
             .spawn(move || {
+                // Released when the thread ends, however late that is.
+                let _slot = slot;
                 let session = SessionThread {
                     session_id: thread_id,
                     endpoint: engine_endpoint,
@@ -537,6 +583,7 @@ impl SttRegistry {
                     inbox: SessionInput {
                         input: input_rx,
                         controls: thread_controls,
+                        frames: thread_frames,
                     },
                     tx,
                     cancel: cancel_rx,
@@ -561,6 +608,7 @@ impl SttRegistry {
                 endpoint_slug: request.endpoint_slug,
                 input: input_tx,
                 controls,
+                frames,
                 cancel,
                 next_seq: 0,
                 window: u64::from(request.audio_window_bytes),
@@ -695,10 +743,34 @@ fn emit_event(tx: &SyncSender<FromWorker>, session_id: &str, event: SttEvent) ->
     )
 }
 
-/// A session thread's inbox and its count of queued control inputs.
+/// A stop job's mark on its endpoint.
+struct StopMark {
+    step_id: String,
+    /// A start job for the endpoint arrived while the stop still ran.
+    start_waiting: bool,
+}
+
+/// One running session thread, counted until the thread itself ends.
+struct ThreadSlot(Arc<AtomicUsize>);
+
+impl ThreadSlot {
+    fn take(threads: &Arc<AtomicUsize>) -> Self {
+        threads.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(threads))
+    }
+}
+
+impl Drop for ThreadSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A session thread's inbox and its counts of queued inputs.
 struct SessionInput {
     input: Receiver<Input>,
     controls: Arc<AtomicUsize>,
+    frames: Arc<AtomicUsize>,
 }
 
 impl SessionInput {
@@ -715,7 +787,9 @@ impl SessionInput {
     }
 
     fn taken(&self, input: &Input) {
-        if !matches!(input, Input::Audio(_)) {
+        if matches!(input, Input::Audio(_)) {
+            self.frames.fetch_sub(1, Ordering::SeqCst);
+        } else {
             self.controls.fetch_sub(1, Ordering::SeqCst);
         }
     }

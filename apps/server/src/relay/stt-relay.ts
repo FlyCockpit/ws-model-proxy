@@ -61,8 +61,20 @@ export const STT_AUDIO_FLUSH_MS = 100;
 export const STT_PENDING_AUDIO_MAX_BYTES = 256 * 1024;
 /** One decoded client append (512 KiB of base64). */
 export const STT_APPEND_MAX_BYTES = 384 * 1024;
-/** Commands (commit, clear, update) queued behind audio. Matches the CLI's own cap. */
+/**
+ * Commands (commit, clear, update) queued here or not yet taken by the CLI's
+ * session thread. Matches the CLI's own cap, counted the same way: a command
+ * leaves the count only once the CLI shows it took it (an ack for audio sent
+ * after it, or the result of the item it committed).
+ */
 export const STT_PENDING_CONTROLS_MAX = 64;
+/**
+ * Audio frames sent and not yet acknowledged. Well under the CLI's own frame
+ * cap, so a trickle of small flushed frames to a stalled engine waits here.
+ */
+export const STT_AUDIO_FRAMES_IN_FLIGHT_MAX = 1_024;
+/** Delta text forwarded per item; the completed transcript has the same bound. */
+export const STT_ITEM_DELTA_MAX_BYTES = 48 * 1024;
 /** Items ended and awaiting their result. */
 export const STT_PENDING_ITEMS_MAX = 64;
 /** No `stt.opened` within this: the attempt fails and the next member may be tried. */
@@ -386,7 +398,26 @@ function writeAudio(entry: AudioEntry, pcm: Uint8Array) {
   entry.bytes += pcm.byteLength;
 }
 
-type ItemRecord = { sentBytes: number; ended: boolean };
+type ItemRecord = {
+  sentBytes: number;
+  ended: boolean;
+  deltaBytes: number;
+  /** The CLI cut it before taking our commit: its result says nothing about that commit. */
+  raced: boolean;
+};
+
+function newItemRecord(sentBytes: number): ItemRecord {
+  return { sentBytes, ended: false, deltaBytes: 0, raced: false };
+}
+
+/**
+ * What the CLI must have taken once this mark is reached: an audio frame
+ * (reached when acks cover `end`) or a commit (reached by its item's result).
+ * `controls` is the number of commands sent up to and including the mark.
+ */
+type ConsumeMark =
+  | { kind: "audio"; end: number; controls: number }
+  | { kind: "commit"; itemSeq: number; controls: number };
 
 export class SttRelaySession {
   private state: "detached" | "opening" | "open" | "ended" = "detached";
@@ -405,6 +436,8 @@ export class SttRelaySession {
   private busyTimer: Timer | null = null;
   private expiryTimer: Timer | null = null;
   private pumping = false;
+  /** Opened, but nothing is sent until the caller's send claim commits ({@link releaseHold}). */
+  private held = false;
   /** Set from `opened` until the awaiting caller has seen the `opened` result. */
   private openedUnobserved = false;
   /** Absolute end of the session; its clock starts with the first `stt.open` sent. */
@@ -413,11 +446,17 @@ export class SttRelaySession {
   private seq = 0;
   private outstanding = 0;
   private sent = 0;
+  /** Commands sent, and those the CLI has shown it took (see {@link STT_PENDING_CONTROLS_MAX}). */
+  private controlsSent = 0;
+  private controlsConsumed = 0;
+  private acked = 0;
+  private readonly marks: ConsumeMark[] = [];
+  private framesInFlight = 0;
 
   private openSeq = 0;
   private openHasAudio = false;
   /** The open item and the ended items awaiting a result. */
-  private readonly items = new Map<number, ItemRecord>([[0, { sentBytes: 0, ended: false }]]);
+  private readonly items = new Map<number, ItemRecord>([[0, newItemRecord(0)]]);
   /** The config `stt.open` carries; later changes travel as queued updates. */
   private readonly openConfig: SttConfig;
 
@@ -467,6 +506,12 @@ export class SttRelaySession {
     options: {
       /** This attempt's own open budget, at most {@link STT_OPEN_TIMEOUT_MS}. */
       openTimeoutMs?: number;
+      /**
+       * Send nothing after `stt.opened` until {@link releaseHold}: the
+       * caller's send claim has not committed yet, and audio must not reach a
+       * member whose claim may still fail ({@link cancelOpening} withdraws it).
+       */
+      holdUntilReleased?: boolean;
     } = {},
   ): Promise<SttAttachResult> {
     if (this.state === "ended") return Promise.resolve({ status: "ended" });
@@ -549,6 +594,7 @@ export class SttRelaySession {
     this.registry.add(leg);
     this.leg = leg;
     this.state = "opening";
+    this.held = options.holdUntilReleased === true;
     this.adapter = realtime.adapter;
     this.maxItemSeconds = maxItemSeconds;
     // A non-finite budget (NaN, Infinity) falls back to the default; it must
@@ -651,19 +697,27 @@ export class SttRelaySession {
     if (this.adapter === "vllm" && this.state !== "detached" && !configEmpty(config)) {
       return { ok: false, reason: "unsupported" };
     }
-    if (this.pendingControls >= STT_PENDING_CONTROLS_MAX) {
-      return { ok: false, reason: "control_backlog" };
-    }
+    if (this.controlBacklogged()) return { ok: false, reason: "control_backlog" };
     this.enqueueControl({ type: "stt.update", config: wireConfig(config) });
     this.pump();
     return { ok: true };
   }
 
+  /** The send claim committed: what queued while held goes out now. */
+  releaseHold() {
+    if (!this.held) return;
+    this.held = false;
+    this.pump();
+  }
+
   /**
    * Withdraws the attempt in flight: its send authorization did not commit.
    * An opening attempt fails `aborted` (the queue stays for the next
-   * candidate) and the CLI gets `stt.close{cancelled}`. A session that has
-   * already opened is closed (`access_denied`): it must not run unauthorized.
+   * candidate) and the CLI gets `stt.close{cancelled}`. A held open session
+   * has sent nothing yet, so it is withdrawn the same way: detached again
+   * with its queue intact (the caller already saw `opened` and moves on). A
+   * session that has already sent is closed (`access_denied`): it must not
+   * run unauthorized.
    */
   cancelOpening() {
     const leg = this.leg;
@@ -672,7 +726,17 @@ export class SttRelaySession {
       this.openFailed(leg, { reason: "aborted", failure: "cancelled" }, "cancelled");
       return;
     }
-    if (this.state === "open") this.close("access_denied");
+    if (this.state !== "open") return;
+    if (this.held && this.seq === 0 && this.controlsSent === 0) {
+      this.registry.retire(leg, "cancelled");
+      this.leg = null;
+      this.state = "detached";
+      this.held = false;
+      this.adapter = null;
+      this.maxItemSeconds = 0;
+      return;
+    }
+    this.close("access_denied");
   }
 
   /** Ends the session and tells the CLI. `onEnd` follows with cause `consumer`. */
@@ -780,10 +844,19 @@ export class SttRelaySession {
 
   // ---- internals ----
 
+  /** Commands queued here plus those sent and not yet taken by the CLI. */
+  private controlBacklogged(): boolean {
+    const untaken = this.controlsSent - this.controlsConsumed;
+    return this.pendingControls + untaken >= STT_PENDING_CONTROLS_MAX;
+  }
+
+  /** The CLI took everything up to `controls` commands. */
+  private consumed(controls: number) {
+    if (controls > this.controlsConsumed) this.controlsConsumed = controls;
+  }
+
   private controlRefusal(): SttItemResult | null {
-    if (this.pendingControls >= STT_PENDING_CONTROLS_MAX) {
-      return { ok: false, reason: "control_backlog" };
-    }
+    if (this.controlBacklogged()) return { ok: false, reason: "control_backlog" };
     if (this.openSeq >= STT_ITEM_SEQ_MAX) return { ok: false, reason: "exhausted" };
     return null;
   }
@@ -796,7 +869,7 @@ export class SttRelaySession {
   /** The open item ended; a new one opens with `carriedBytes` already sent for it. */
   private advance(carriedBytes: number) {
     this.openSeq += 1;
-    this.items.set(this.openSeq, { sentBytes: carriedBytes, ended: false });
+    this.items.set(this.openSeq, newItemRecord(carriedBytes));
     this.openHasAudio = false;
   }
 
@@ -855,7 +928,39 @@ export class SttRelaySession {
       return;
     }
     this.outstanding -= bytes;
+    this.acked += bytes;
+    // The CLI's thread takes its inbox in order: a frame it acknowledged was
+    // taken after every command sent before it.
+    let reached = -1;
+    for (let i = 0; i < this.marks.length; i += 1) {
+      const mark = this.marks[i];
+      if (mark?.kind !== "audio") continue;
+      if (mark.end > this.acked) break;
+      reached = i;
+    }
+    if (reached >= 0) {
+      const removed = this.marks.splice(0, reached + 1);
+      for (const mark of removed) {
+        if (mark.kind === "audio") this.framesInFlight -= 1;
+      }
+      const last = removed.at(-1);
+      if (last) this.consumed(last.controls);
+    }
     this.pump();
+  }
+
+  /** A result for `itemSeq`: the CLI took its commit, and everything before it. */
+  private commitReached(itemSeq: number) {
+    const index = this.marks.findIndex(
+      (mark) => mark.kind === "commit" && mark.itemSeq === itemSeq,
+    );
+    if (index < 0) return;
+    const removed = this.marks.splice(0, index + 1);
+    for (const mark of removed) {
+      if (mark.kind === "audio") this.framesInFlight -= 1;
+    }
+    const last = removed.at(-1);
+    if (last) this.consumed(last.controls);
   }
 
   private event(event: SttEvent) {
@@ -875,7 +980,13 @@ export class SttRelaySession {
     }
     const record = this.items.get(itemSeq);
     if (event.kind === "delta") {
-      if (record) this.emit({ kind: "delta", itemSeq, text: event.text });
+      if (!record) return;
+      // Past the bound the client still gets the completed transcript; the
+      // extra deltas from a CLI that keeps sending are dropped.
+      const bytes = Buffer.byteLength(event.text, "utf8");
+      if (record.deltaBytes + bytes > STT_ITEM_DELTA_MAX_BYTES) return;
+      record.deltaBytes += bytes;
+      this.emit({ kind: "delta", itemSeq, text: event.text });
       return;
     }
     if (itemSeq === this.openSeq) {
@@ -884,6 +995,7 @@ export class SttRelaySession {
       return;
     }
     if (!record?.ended) return; // cleared or already finished: late
+    if (!record.raced) this.commitReached(itemSeq);
     this.items.delete(itemSeq);
     if (event.kind === "completed") {
       this.emit({
@@ -903,7 +1015,7 @@ export class SttRelaySession {
       this.protocolError();
       return;
     }
-    const record = this.items.get(itemSeq) ?? { sentBytes: 0, ended: false };
+    const record = this.items.get(itemSeq) ?? newItemRecord(0);
     record.ended = true;
     this.items.set(itemSeq, record);
     // The CLI cut the item at its length limit (or earlier, when the engine
@@ -933,7 +1045,9 @@ export class SttRelaySession {
    */
   private racedAutoCommit(itemSeq: number) {
     const record = this.items.get(itemSeq);
-    if (!record?.ended || itemSeq !== this.openSeq - 1) return;
+    if (!record?.ended) return;
+    record.raced = true;
+    if (itemSeq !== this.openSeq - 1) return;
     const limit = this.maxItemSeconds * STT_PCM_BYTES_PER_SECOND;
     const carried = Math.max(0, record.sentBytes - limit);
     record.sentBytes -= carried;
@@ -972,7 +1086,7 @@ export class SttRelaySession {
 
   /** Sends queued audio within credit, coalesced, and commands in order. */
   private pump() {
-    if (this.pumping || this.state !== "open" || !this.leg) return;
+    if (this.pumping || this.held || this.state !== "open" || !this.leg) return;
     this.pumping = true;
     try {
       this.pumpLoop(this.leg);
@@ -1006,6 +1120,14 @@ export class SttRelaySession {
         }
         this.queue.shift();
         this.pendingControls -= 1;
+        this.controlsSent += 1;
+        if (head.message.type === "stt.commit") {
+          this.marks.push({
+            kind: "commit",
+            itemSeq: head.message.itemSeq,
+            controls: this.controlsSent,
+          });
+        }
         continue;
       }
       const want = Math.min(head.bytes, STT_AUDIO_FRAME_MAX_BYTES);
@@ -1018,6 +1140,8 @@ export class SttRelaySession {
         });
         return;
       }
+      // The CLI bounds queued frames by count as well as bytes.
+      if (this.framesInFlight >= STT_AUDIO_FRAMES_IN_FLIGHT_MAX) return;
       const credit = STT_AUDIO_WINDOW_BYTES - this.outstanding;
       let size = Math.min(want, credit);
       size -= size % 2;
@@ -1035,6 +1159,8 @@ export class SttRelaySession {
       this.outstanding += size;
       this.sent += size;
       this.pendingAudio -= size;
+      this.framesInFlight += 1;
+      this.marks.push({ kind: "audio", end: this.sent, controls: this.controlsSent });
       const record = this.items.get(head.itemSeq);
       if (record) record.sentBytes += size;
       if (head.bytes === 0) this.queue.shift();
@@ -1070,6 +1196,9 @@ export class SttRelaySession {
     this.queue.length = 0;
     this.pendingAudio = 0;
     this.pendingControls = 0;
+    this.marks.length = 0;
+    this.framesInFlight = 0;
+    this.held = false;
     this.items.clear();
     const leg = this.leg;
     this.leg = null;

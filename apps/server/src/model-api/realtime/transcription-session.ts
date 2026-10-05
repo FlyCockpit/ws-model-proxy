@@ -224,6 +224,37 @@ export interface RealtimeRelay {
   createSttSession(input: { consumer: SttSessionConsumer; config?: SttConfig }): SttCreateResult;
 }
 
+/**
+ * The client-visible text of an item failure (security review L4). The code
+ * and message come from a contributor's CLI, which is trusted less than the
+ * server: known codes get the server's own message, anything else becomes a
+ * generic failure. Engine text never reaches the client.
+ */
+const ITEM_FAILURE_MESSAGES: Readonly<Record<string, string>> = {
+  empty_item: "The item has no audio.",
+  transcript_too_large: "The transcript is too large to deliver.",
+  upstream_1xx: "The transcription engine did not finish the item.",
+  upstream_redirect: "The transcription engine could not take the item.",
+  upstream_4xx: "The transcription engine refused the item.",
+  upstream_5xx: "The transcription engine failed the item.",
+  invalid_response: "The transcription engine gave an invalid response.",
+  invalid_audio: "The transcription engine refused the audio.",
+  engine_error: "The transcription engine failed the item.",
+  timeout: "The transcription engine did not finish the item in time.",
+  transport: "The transcription engine could not be reached.",
+};
+
+/** Exported for tests. */
+export function itemFailure(code: string): { code: string; message: string } {
+  const message = Object.hasOwn(ITEM_FAILURE_MESSAGES, code)
+    ? ITEM_FAILURE_MESSAGES[code]
+    : undefined;
+  if (message === undefined) {
+    return { code: "transcription_failed", message: "The item could not be transcribed." };
+  }
+  return { code, message };
+}
+
 function realOpenFailure(result: Extract<SttAttachResult, { status: "failed" }>): boolean {
   return (
     result.reason === "refused" || result.reason === "timeout" || result.reason === "protocol_error"
@@ -694,7 +725,13 @@ export class RealtimeTranscriptionSession {
       const attempt: { pending: Promise<SttAttachResult> | null } = { pending: null };
       const open = () => {
         this.attempting = candidate;
-        attempt.pending = relay.attach(candidate, { openTimeoutMs: budget });
+        // With a send claim, nothing is sent after `stt.opened` until the
+        // claim commits (security review L2); a failed commit withdraws the
+        // opened leg and routing moves on.
+        attempt.pending = relay.attach(candidate, {
+          openTimeoutMs: budget,
+          holdUntilReleased: Boolean(this.deps.hooks?.authorizeOpen),
+        });
       };
       const authorized = await this.authorizeOpen(candidate, open, () => relay.cancelOpening());
       // Awaited directly (review L2): `opened` is seen before any `onEnd`.
@@ -702,6 +739,9 @@ export class RealtimeTranscriptionSession {
       this.attempting = null;
       if (this.state !== "routing" || signal.aborted || outcome?.status === "ended") return;
       if (!authorized.ok || !outcome) {
+        // Never left open unauthorized, whatever the claim did with `abort`.
+        if (outcome?.status === "opened") relay.cancelOpening();
+        if (relay.status === "ended") return;
         this.releaseLease(this.lease);
         this.lease = null;
         if (!authorized.ok && authorized.denial === "requester") {
@@ -720,6 +760,7 @@ export class RealtimeTranscriptionSession {
       }
       if (outcome.status === "opened") {
         this.opened(candidate, outcome);
+        relay.releaseHold();
         return;
       }
       this.releaseLease(this.lease);
@@ -880,6 +921,7 @@ export class RealtimeTranscriptionSession {
       case "failed": {
         const record = this.itemRecord(event.itemSeq);
         this.items.delete(event.itemSeq);
+        const failure = itemFailure(event.code);
         this.hook(() =>
           this.deps.hooks?.itemFinished?.({
             itemSeq: event.itemSeq,
@@ -887,11 +929,11 @@ export class RealtimeTranscriptionSession {
             status: "failed",
             audioBytes: 0,
             audioSeconds: 0,
-            code: event.code,
+            code: failure.code,
             transcriptBytes: 0,
           }),
         );
-        this.send(transcriptionFailedEvent(record.id, event.code, event.message));
+        this.send(transcriptionFailedEvent(record.id, failure.code, failure.message));
         return;
       }
     }

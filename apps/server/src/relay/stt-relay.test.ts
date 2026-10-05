@@ -7,9 +7,11 @@ import {
   realtimeTranscriptionCapability,
   STT_AUDIO_FLUSH_MS,
   STT_AUDIO_FRAME_MIN_BYTES,
+  STT_AUDIO_FRAMES_IN_FLIGHT_MAX,
   STT_AUDIO_WINDOW_BYTES,
   STT_BACKLOG_STALL_MS,
   STT_CLOSE_GRACE_MS,
+  STT_ITEM_DELTA_MAX_BYTES,
   STT_OPEN_TIMEOUT_MS,
   STT_PENDING_AUDIO_MAX_BYTES,
   STT_PENDING_CONTROLS_MAX,
@@ -1167,5 +1169,137 @@ describe("review fixes", () => {
     expect((await attempt).status).toBe("failed");
     expect(await created.session.attach(target("cli-b"))).toEqual({ status: "ended" });
     expect(consumer.ends).toEqual([{ cause: "expired", failure: "timeout" }]);
+  });
+});
+
+describe("security review fixes", () => {
+  it("L2: a held open sends nothing until released, and a cancel withdraws it with its queue", async () => {
+    const { hub, link, create } = setup();
+    const a = link("cli-a");
+    const b = link("cli-b");
+    const { session, consumer } = create();
+    session.appendAudio(pcm(8192));
+    expect(session.clear().ok).toBe(true);
+    session.appendAudio(pcm(8192));
+    const first = session.attach(target("cli-a"), { holdUntilReleased: true });
+    const legA = String(session.relaySessionId);
+    frame(a, hub, { type: "stt.opened", sessionId: legA });
+    expect(await first).toMatchObject({ status: "opened" });
+    expect(a.timeline()).toEqual(["stt.open"]);
+    session.cancelOpening();
+    expect(a.controls().at(-1)).toEqual({
+      type: "stt.close",
+      sessionId: legA,
+      reason: "cancelled",
+    });
+    expect(session.status).toBe("detached");
+    expect(consumer.ends).toEqual([]);
+    expect(session.queuedAudioBytes).toBe(8192);
+
+    const second = session.attach(target("cli-b"), { holdUntilReleased: true });
+    const legB = String(session.relaySessionId);
+    frame(b, hub, { type: "stt.opened", sessionId: legB });
+    expect(await second).toMatchObject({ status: "opened" });
+    session.appendAudio(pcm(8192));
+    expect(b.timeline()).toEqual(["stt.open"]);
+    session.releaseHold();
+    // The clear dropped the first item's unsent audio, as it does unheld.
+    expect(b.timeline()).toEqual(["stt.open", "stt.clear:0", "audio:16384"]);
+    expect(b.audio().map((sent) => sent.seq)).toEqual([0]);
+  });
+
+  it("L2: once anything was sent, a cancel closes the session instead", async () => {
+    const { hub, link, create } = setup();
+    const a = link("cli-a");
+    const { session, consumer } = create();
+    session.appendAudio(pcm(8192));
+    const pending = session.attach(target("cli-a"), { holdUntilReleased: true });
+    frame(a, hub, { type: "stt.opened", sessionId: String(session.relaySessionId) });
+    await pending;
+    session.releaseHold();
+    session.cancelOpening();
+    expect(consumer.ends).toEqual([{ cause: "consumer", failure: "access_denied" }]);
+  });
+
+  it("L3: commands count until the CLI shows it took them, as the CLI counts them", async () => {
+    const { hub, link, create } = setup();
+    const cli = link("cli-a");
+    const { session } = create();
+    const { sessionId } = await openOn(hub, cli, session);
+    for (let index = 0; index < STT_PENDING_CONTROLS_MAX; index += 1) {
+      expect(session.clear().ok).toBe(true);
+    }
+    // All sent, none taken yet: the CLI would refuse one more.
+    expect(cli.controls().filter((sent) => sent.type === "stt.clear")).toHaveLength(
+      STT_PENDING_CONTROLS_MAX,
+    );
+    expect(session.clear()).toEqual({ ok: false, reason: "control_backlog" });
+    expect(session.update({})).toEqual({ ok: false, reason: "control_backlog" });
+    session.appendAudio(pcm(4096));
+    expect(session.commit()).toEqual({ ok: false, reason: "control_backlog" });
+    // An ack for audio sent after them: the CLI's thread took them all.
+    ack(cli, hub, sessionId, 4096);
+    expect(session.commit().ok).toBe(true);
+    for (let index = 1; index < STT_PENDING_CONTROLS_MAX; index += 1) {
+      expect(session.clear().ok).toBe(true);
+    }
+    expect(session.clear()).toEqual({ ok: false, reason: "control_backlog" });
+    // The committed item's result shows its commit (and what came before) was taken.
+    const committed = STT_PENDING_CONTROLS_MAX;
+    event(cli, hub, sessionId, { kind: "completed", itemSeq: committed, text: "x" });
+    expect(session.clear().ok).toBe(true);
+    expect(session.clear()).toEqual({ ok: false, reason: "control_backlog" });
+  });
+
+  it("L3: a result for a commit that raced the valve does not count the commit as taken", async () => {
+    const { hub, link, create } = setup();
+    const cli = link("cli-a");
+    const { session } = create();
+    const { sessionId } = await openOn(hub, cli, session);
+    session.appendAudio(pcm(4096));
+    expect(session.commit()).toEqual({ ok: true, itemSeq: 0 });
+    event(cli, hub, sessionId, { kind: "auto_committed", itemSeq: 0 });
+    event(cli, hub, sessionId, { kind: "completed", itemSeq: 0, text: "x" });
+    for (let index = 1; index < STT_PENDING_CONTROLS_MAX; index += 1) {
+      expect(session.clear().ok).toBe(true);
+    }
+    expect(session.clear()).toEqual({ ok: false, reason: "control_backlog" });
+  });
+
+  it("L3: frames in flight are bounded by count, so tiny flushes wait for acks", async () => {
+    const { hub, link, create } = setup();
+    const cli = link("cli-a");
+    const { session } = create();
+    const { sessionId } = await openOn(hub, cli, session);
+    for (let index = 0; index <= STT_AUDIO_FRAMES_IN_FLIGHT_MAX; index += 1) {
+      session.appendAudio(pcm(2));
+      vi.advanceTimersByTime(STT_AUDIO_FLUSH_MS);
+    }
+    expect(cli.audio()).toHaveLength(STT_AUDIO_FRAMES_IN_FLIGHT_MAX);
+    expect(session.queuedAudioBytes).toBe(2);
+    ack(cli, hub, sessionId, 2);
+    vi.advanceTimersByTime(STT_AUDIO_FLUSH_MS);
+    expect(cli.audio()).toHaveLength(STT_AUDIO_FRAMES_IN_FLIGHT_MAX + 1);
+  });
+
+  it("L4: deltas past the per-item bound are dropped; the result still arrives", async () => {
+    const { hub, link, create } = setup();
+    const cli = link("cli-a");
+    const { session, consumer } = create();
+    const { sessionId } = await openOn(hub, cli, session, { capabilities: VLLM });
+    session.appendAudio(pcm(4096));
+    const piece = "é".repeat(4096); // 8 KiB of UTF-8
+    const pieces = STT_ITEM_DELTA_MAX_BYTES / Buffer.byteLength(piece);
+    for (let index = 0; index < pieces + 2; index += 1) {
+      event(cli, hub, sessionId, { kind: "delta", itemSeq: 0, text: piece });
+    }
+    expect(consumer.events.filter((sent) => sent.kind === "delta")).toHaveLength(pieces);
+    session.commit();
+    event(cli, hub, sessionId, { kind: "completed", itemSeq: 0, text: "done" });
+    expect(consumer.events.at(-1)).toMatchObject({ kind: "completed", itemSeq: 0 });
+    // The next item has its own budget.
+    session.appendAudio(pcm(4096));
+    event(cli, hub, sessionId, { kind: "delta", itemSeq: 1, text: piece });
+    expect(consumer.events.at(-1)).toMatchObject({ kind: "delta", itemSeq: 1 });
   });
 });
