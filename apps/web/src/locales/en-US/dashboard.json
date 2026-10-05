@@ -55,7 +55,7 @@
     "pool": "Target pool",
     "choose": "Choose…",
     "spec": "Recipe specification (JSON)",
-    "specHint": "Each variant needs key, engine, groupSize, measured resources in GiB, commands (management, start, stop), readiness, models, attachment {type, poolId}, and hardConcurrencyLimit. attachment.type is llm, embeddings or transcription (speech-to-text); a transcription attachment may add a transcription profile (languages, responseFormats, timestampGranularities, maxUploadBytes, ...) so requests using those options reach it. Commands management is ownedProcess or externalService; externalService also requires status (exit 0 alive, exit 3 stopped). Multi-node groups require iface. Never paste credentials.",
+    "specHint": "Each variant needs key, engine, groupSize, measured resources in GiB, commands (management, start, stop), readiness, models, attachment {type, poolId}, and hardConcurrencyLimit. attachment.type is llm, embeddings or transcription (speech-to-text); a transcription attachment may add a transcription profile (languages, responseFormats, timestampGranularities, maxUploadBytes, ...) so requests using those options reach it, and an optional realtime block for live sessions: {\"adapter\":\"vllm\"} for a vLLM realtime model, or {\"adapter\":\"segmented\",\"maxItemSeconds\":30} for any engine with a file transcription route. Commands management is ownedProcess or externalService; externalService also requires status (exit 0 alive, exit 3 stopped). Multi-node groups require iface. Never paste credentials.",
     "invalid": "Check required fields and allowed ranges.",
     "invalidSpec": "Invalid recipe JSON or schema. Check every variant, resource, command and attachment.",
     "saveRecipe": "Save new revision",

@@ -6,6 +6,12 @@
         "languageDetection": true,
         "languages": ["en", "es"],
         "maxUploadBytes": 26214400,
+        "realtime": {
+          "adapter": "segmented",
+          "maxItemSeconds": 30,
+          "maxSessions": 4,
+          "supported": true
+        },
         "responseFormats": ["json", "verbose_json", "text"],
         "streaming": true,
         "supported": true,

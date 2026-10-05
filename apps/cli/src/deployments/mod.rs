@@ -130,6 +130,37 @@ pub struct TranscriptionProfile {
     pub max_upload_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_mime_types: Option<Vec<String>>,
+    /// Opt-in live transcription: absent means the endpoint takes no
+    /// `/v1/realtime` sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realtime: Option<RealtimeTranscriptionProfile>,
+}
+
+/// How live sessions reach the engine, with the bounds the server's
+/// `realtimeTranscriptionProfileSchema` and `deploymentJobWireIssue` share.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RealtimeTranscriptionProfile {
+    pub adapter: crate::config::RealtimeAdapter,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_item_seconds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_sessions: Option<u32>,
+}
+
+impl RealtimeTranscriptionProfile {
+    fn valid(&self) -> bool {
+        let item_max = match self.adapter {
+            // A segmented turn is buffered whole before it is sent.
+            crate::config::RealtimeAdapter::Segmented => 120,
+            crate::config::RealtimeAdapter::Vllm => 600,
+        };
+        self.max_item_seconds
+            .is_none_or(|seconds| (5..=item_max).contains(&seconds))
+            && self
+                .max_sessions
+                .is_none_or(|sessions| (1..=8).contains(&sessions))
+    }
 }
 
 impl TranscriptionProfile {
@@ -153,6 +184,10 @@ impl TranscriptionProfile {
             && self
                 .max_upload_bytes
                 .is_none_or(|bytes| bytes > 0 && bytes <= (i32::MAX as u64))
+            && self
+                .realtime
+                .as_ref()
+                .is_none_or(RealtimeTranscriptionProfile::valid)
     }
 }
 

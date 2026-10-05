@@ -112,7 +112,8 @@ export function deploymentJobWireIssue(job: DeploymentJob): string | null {
       (profile.maxUploadBytes !== undefined &&
         (!uint(profile.maxUploadBytes) ||
           profile.maxUploadBytes < 1 ||
-          profile.maxUploadBytes > 2 ** 31 - 1))
+          profile.maxUploadBytes > 2 ** 31 - 1)) ||
+      (profile.realtime != null && !realtimeProfileValid(profile.realtime))
     )
       return "transcription profile";
   }
@@ -129,6 +130,24 @@ export function deploymentJobWireIssue(job: DeploymentJob): string | null {
   )
     return "embedding contract";
   return interactiveIssue(job);
+}
+
+/** Rust `RealtimeTranscriptionProfile`: strict keys, the adapter enum and its bounds. */
+function realtimeProfileValid(realtime: unknown): boolean {
+  if (typeof realtime !== "object" || realtime === null || Array.isArray(realtime)) return false;
+  const value = realtime as Record<string, unknown>;
+  const keys = ["adapter", "maxItemSeconds", "maxSessions"];
+  if (!Object.keys(value).every((key) => keys.includes(key))) return false;
+  const { adapter, maxItemSeconds, maxSessions } = value;
+  if (adapter !== "vllm" && adapter !== "segmented") return false;
+  const itemMax = adapter === "segmented" ? 120 : 600;
+  const int = (n: unknown, min: number, max: number) =>
+    typeof n === "number" && Number.isSafeInteger(n) && n >= min && n <= max;
+  return (
+    // Rust decodes an `Option` from null as well as from an absent key.
+    (maxItemSeconds == null || int(maxItemSeconds, 5, itemMax)) &&
+    (maxSessions == null || int(maxSessions, 1, 8))
+  );
 }
 
 function interactiveIssue(job: DeploymentJob): string | null {

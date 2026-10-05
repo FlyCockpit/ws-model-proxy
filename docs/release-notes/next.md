@@ -285,6 +285,29 @@ assignment provenance and automatic concurrency seed columns.
   unacknowledged delete, and a rename or replace that may have published stays
   manual. See [`apps/cli/docs/file-recovery.md`](../../apps/cli/docs/file-recovery.md).
 
+- **Live transcription profile (groundwork).** A transcription profile may add
+  an opt-in `realtime` block, `{adapter, maxItemSeconds?, maxSessions?}`, that
+  marks the endpoint for live speech-to-text sessions. `adapter` is `vllm` (the
+  engine serves vLLM's own `/v1/realtime`; needs engine `vllm` or `other`) or
+  `segmented` (each turn the client ends goes to the endpoint's
+  `/v1/audio/transcriptions`). `maxItemSeconds` (5–600, at most 120 for
+  `segmented`; default 300 for `vllm`, 30 for `segmented`) is when an unfinished
+  turn is ended for the client, since there is no voice activity detection;
+  `maxSessions` (1–8) caps live sessions per endpoint. Without the block an
+  endpoint takes no live sessions. The CLI advertises the block in its
+  transcription capability; this is part of relay protocol 2.11, not a new
+  version. The live `/v1/realtime` endpoint itself is not available yet.
+  For a Voxtral realtime model, the whole turn shares one context, so a small
+  `--max-model-len` can fail a long turn part-way; keep `maxItemSeconds` well
+  inside it (600 s is roughly 7.5k audio tokens). Qwen3-ASR realtime is not
+  affected.
+  Version skew (development builds only, since 2.11 is unreleased): upgrade
+  every CLI before adding a `realtime` block, because an older CLI cannot read
+  the job and the start fails only at its deadline (up to 15 minutes). After
+  downgrading a CLI that ran one, remove its deployment state file. Do not roll
+  the server back while a realtime deployment exists: an older server refuses
+  that node's whole inventory, and the node stays offline.
+
 ## Fixed
 
 - **A disconnect that arrives just after a CLI reconnects no longer re-opens

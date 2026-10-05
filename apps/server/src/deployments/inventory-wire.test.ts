@@ -15,6 +15,7 @@ import { describe, expect, it } from "vitest";
 import {
   encodeRelayServerControlMessage,
   type OpenAiCompatibleCapabilities,
+  openAiCompatibleCapabilitiesSchema,
   parseRelayClientControlFrame,
   RELAY_PROTOCOL_VERSIONS,
 } from "../relay/protocol.js";
@@ -75,6 +76,17 @@ describe("current Rust transcription endpoint / Node inventory golden", () => {
     // A rejected inventory would close the whole CLI connection as malformed.
     expect(() => parseRelayClientControlFrame(JSON.stringify(frame))).not.toThrow();
     expect(coarseCapabilitiesFromOpenAi(endpoint.defaultCapabilities)).toEqual(["AUDIO_INPUT"]);
+  });
+
+  it("keeps the opt-in live transcription block the profile advertises", () => {
+    const parsed = openAiCompatibleCapabilitiesSchema.parse(endpoint.defaultCapabilities);
+    const transcriptions = parsed.version === 2 ? parsed.audio?.transcriptions : undefined;
+    expect(typeof transcriptions === "object" ? transcriptions.realtime : undefined).toEqual({
+      supported: true,
+      adapter: "segmented",
+      maxItemSeconds: 30,
+      maxSessions: 4,
+    });
   });
 });
 
