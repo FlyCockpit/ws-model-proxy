@@ -40,7 +40,10 @@ import {
   modelApiSurfaces,
   surfaceAvailabilityMatrix,
 } from "../lib/surface-capabilities";
-import { visibleModelAttachmentModalities } from "../lib/visible-model-modalities";
+import {
+  visibleModelAttachmentModalities,
+  visibleModelRealtimeTranscription,
+} from "../lib/visible-model-modalities";
 import { visibleModelReasoning } from "../lib/visible-model-reasoning";
 
 export const listCliDevicesSelect = {
@@ -444,7 +447,7 @@ type PoolSummaryRow = Prisma.ModelPoolGetPayload<{ select: typeof poolSummarySel
 type PoolMemberModelRow = NonNullable<ModelPoolRow["PoolMembers"][number]["DiscoveredModel"]>;
 
 export async function serializeVisibleTargets(targets: VisibleModelTargets) {
-  const [modalities, reasoning, poolRows] = await Promise.all([
+  const [modalities, reasoning, poolRows, realtime] = await Promise.all([
     visibleModelAttachmentModalities(targets),
     visibleModelReasoning(targets),
     targets.modelPools.length
@@ -453,6 +456,7 @@ export async function serializeVisibleTargets(targets: VisibleModelTargets) {
           select: poolSelect,
         })
       : [],
+    visibleModelRealtimeTranscription(targets),
   ]);
   const serializedPools = new Map(
     poolRows.map((row) => {
@@ -479,6 +483,7 @@ export async function serializeVisibleTargets(targets: VisibleModelTargets) {
         video: false,
       },
       reasoning: reasoning.directById.get(model.id) ?? {},
+      realtimeTranscription: realtime.directIds.has(model.id),
     })),
     modelPools: targets.modelPools.map((pool) => ({
       target: pool.target,
@@ -503,6 +508,7 @@ export async function serializeVisibleTargets(targets: VisibleModelTargets) {
         video: false,
       },
       reasoning: reasoning.poolById.get(pool.id) ?? {},
+      realtimeTranscription: realtime.poolIds.has(pool.id),
     })),
   };
 }

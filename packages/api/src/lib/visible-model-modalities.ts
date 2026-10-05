@@ -2,6 +2,7 @@ import prisma from "@ws-model-proxy/db";
 import type { VisibleModelTargets } from "./model-api-token-access";
 import {
   effectiveTransformModalities,
+  realtimeTranscriptionAdvertised,
   resolveEffectiveCapabilityMetadata,
   transformerSupportedModalities,
 } from "./openai-compatible-capabilities";
@@ -181,4 +182,60 @@ export async function visibleModelAttachmentModalities(targets: VisibleModelTarg
     );
   }
   return { directById, poolById };
+}
+
+const capabilitySelect = {
+  capabilityOverrideMode: true,
+  capabilityOverrideMetadata: true,
+  Endpoint: { select: { capabilityMetadata: true } },
+} as const;
+
+/**
+ * Visible models whose capabilities advertise live transcription
+ * (`/v1/realtime`): a direct model itself, or any member of a pool. A hint
+ * for the dashboard's live transcription test; routing decides at connect.
+ */
+export async function visibleModelRealtimeTranscription(targets: VisibleModelTargets): Promise<{
+  directIds: Set<string>;
+  poolIds: Set<string>;
+}> {
+  const directIds = targets.directModels.map((model) => model.id);
+  const poolIds = targets.modelPools.map((pool) => pool.id);
+  const [directRows, memberRows] = await Promise.all([
+    directIds.length === 0
+      ? []
+      : prisma.discoveredModel.findMany({
+          where: { id: { in: directIds } },
+          select: { id: true, ...capabilitySelect },
+        }),
+    poolIds.length === 0
+      ? []
+      : prisma.poolMember.findMany({
+          where: { poolId: { in: poolIds }, tier: "PRIMARY" },
+          select: {
+            poolId: true,
+            ExecutionTarget: { select: { DiscoveredModel: { select: capabilitySelect } } },
+            DiscoveredModel: { select: capabilitySelect },
+          },
+        }),
+  ]);
+  const live = (row: {
+    capabilityOverrideMode: string;
+    capabilityOverrideMetadata: unknown;
+    Endpoint: { capabilityMetadata: unknown };
+  }) =>
+    realtimeTranscriptionAdvertised(
+      resolveEffectiveCapabilityMetadata({
+        capabilityOverrideMode: row.capabilityOverrideMode,
+        capabilityOverrideMetadata: row.capabilityOverrideMetadata,
+        endpointCapabilityMetadata: row.Endpoint.capabilityMetadata,
+      }),
+    );
+  const direct = new Set((directRows ?? []).filter(live).map((row) => row.id));
+  const pools = new Set<string>();
+  for (const row of memberRows ?? []) {
+    const model = row.ExecutionTarget?.DiscoveredModel ?? row.DiscoveredModel;
+    if (model && live(model)) pools.add(row.poolId);
+  }
+  return { directIds: direct, poolIds: pools };
 }

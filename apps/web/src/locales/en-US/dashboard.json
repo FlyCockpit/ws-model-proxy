@@ -600,6 +600,51 @@
         "local_failure": "the local attempt failed",
         "other": "{{reason}}"
       }
+    },
+    "live": {
+      "open": "Live transcription",
+      "title": "Live transcription",
+      "description": "Speak into your microphone and watch a live-capable model transcribe it through /v1/realtime, the way an API client would.",
+      "model": "Model",
+      "noModels": "No model you can use takes live sessions. A speech-to-text recipe needs a realtime profile, and a live member must be running.",
+      "token": "Model API token",
+      "tokenHelp": "Paste a model API token that can use this model. It stays in this dialog, is sent as a WebSocket subprotocol (never in the URL) and is forgotten when you close it.",
+      "tokenInvalid": "That is not a model API token (it starts with wsmp_model_).",
+      "start": "Start microphone",
+      "stop": "Stop",
+      "commit": "End turn",
+      "status": {
+        "idle": "Not started.",
+        "starting": "Connecting…",
+        "live": "Listening. Press End turn when you finish speaking.",
+        "stopped": "Stopped.",
+        "failed": "The session ended."
+      },
+      "transcribing": "Transcribing…",
+      "itemFailed": "This turn could not be transcribed.",
+      "seconds": "{{seconds}} s of audio",
+      "empty": "Transcripts appear here after each turn.",
+      "privacy": "Audio and transcripts are not stored or logged.",
+      "problems": {
+        "mic": {
+          "denied": "Microphone access was denied. Allow it in your browser's site settings and try again.",
+          "missing": "No microphone was found.",
+          "failed": "The microphone could not be started.",
+          "unsupported": "This browser cannot capture microphone audio for live transcription."
+        },
+        "invalidKey": "The API token is not valid (revoked or expired).",
+        "modelNotFound": "This token cannot use that model.",
+        "busy": "No live member is free right now. Try again shortly.",
+        "backlog": "Audio arrived faster than the model could take it.",
+        "upstream": "The transcription node failed or disconnected.",
+        "shutdown": "The server is restarting. Try again shortly.",
+        "expired": "The session reached its maximum duration.",
+        "idle": "The session ended after two minutes without audio.",
+        "emptyCommit": "Nothing was said since the last turn.",
+        "denied": "The server refused the session or its access ended.",
+        "connection": "Could not connect. Check the token and that the model has a live member.",
+        "server": "The server reported an error."
+      }
     }
   },
   "deploymentFeatures": {

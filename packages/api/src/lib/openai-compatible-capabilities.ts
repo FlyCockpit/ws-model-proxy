@@ -386,6 +386,22 @@ export function normalizeTranscriptionCapabilities(
   return value ?? undefined;
 }
 
+/**
+ * Whether capabilities advertise live transcription: `audio.transcriptions.realtime`
+ * with `supported: true` (never translations). A hint for lists; sessions open
+ * only on recipe-managed, healthy members.
+ */
+export function realtimeTranscriptionAdvertised(
+  capabilities: OpenAiCompatibleCapabilities | null | undefined,
+): boolean {
+  const transcriptions = capabilities?.audio?.transcriptions;
+  return (
+    typeof transcriptions === "object" &&
+    transcriptions !== null &&
+    transcriptions.realtime?.supported === true
+  );
+}
+
 export function audioOperationSupported(
   value: boolean | TranscriptionCapabilities | null | undefined,
 ): boolean | undefined {

@@ -234,6 +234,13 @@ export default defineConfig(({ mode }) => {
           changeOrigin: true,
           secure: false,
         },
+        // Chat Test → Live transcription connects to the public realtime socket.
+        "/v1/realtime": {
+          target: devProxyTarget.ws,
+          ws: true,
+          changeOrigin: true,
+          secure: false,
+        },
         "/api": { target: devProxyTarget.http, changeOrigin: true, secure: false },
         "/rpc": { target: devProxyTarget.http, changeOrigin: true, secure: false },
         "/ws": { target: devProxyTarget.ws, ws: true, changeOrigin: true, secure: false },

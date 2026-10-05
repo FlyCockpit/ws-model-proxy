@@ -318,6 +318,13 @@ assignment provenance and automatic concurrency seed columns.
   server log and is not counted against the member's health, so a wrong
   `realtime` block cannot take the member out of HTTP routing.
 
+- **Live transcription test panel.** Chat Test has a microphone button that
+  opens a live transcription panel for a live-capable model you can use. It
+  connects to `/v1/realtime` like any client: paste a model API token, which
+  stays in the open panel only and is sent as the WebSocket subprotocol, never
+  in the URL. The microphone needs HTTPS or localhost. Stop ends the session
+  without transcribing the turn in progress; use End turn first.
+
 - **Live transcription sessions (`GET /v1/realtime?intent=transcription`).**
   A WebSocket API following the OpenAI Realtime GA transcription events
   (`session.update`, `input_audio_buffer.append/commit/clear`; transcription

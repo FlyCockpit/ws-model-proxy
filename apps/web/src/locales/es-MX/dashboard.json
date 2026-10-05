@@ -278,6 +278,51 @@
         "local_failure": "el intento local falló",
         "other": "{{reason}}"
       }
+    },
+    "live": {
+      "open": "Transcripción en vivo",
+      "title": "Transcripción en vivo",
+      "description": "Habla al micrófono y observa cómo un modelo con sesiones en vivo lo transcribe mediante /v1/realtime, como lo haría un cliente de la API.",
+      "model": "Modelo",
+      "noModels": "Ningún modelo que puedas usar acepta sesiones en vivo. Una receta de voz a texto necesita un perfil realtime y un miembro en vivo en ejecución.",
+      "token": "Token de la API de modelos",
+      "tokenHelp": "Pega un token de la API de modelos que pueda usar este modelo. Se queda en este diálogo, se envía como subprotocolo de WebSocket (nunca en la URL) y se olvida al cerrarlo.",
+      "tokenInvalid": "Eso no es un token de la API de modelos (empieza con wsmp_model_).",
+      "start": "Iniciar micrófono",
+      "stop": "Detener",
+      "commit": "Terminar turno",
+      "status": {
+        "idle": "Sin iniciar.",
+        "starting": "Conectando…",
+        "live": "Escuchando. Pulsa Terminar turno cuando acabes de hablar.",
+        "stopped": "Detenido.",
+        "failed": "La sesión terminó."
+      },
+      "transcribing": "Transcribiendo…",
+      "itemFailed": "No se pudo transcribir este turno.",
+      "seconds": "{{seconds}} s de audio",
+      "empty": "Las transcripciones aparecen aquí después de cada turno.",
+      "privacy": "El audio y las transcripciones no se guardan ni se registran.",
+      "problems": {
+        "mic": {
+          "denied": "Se negó el acceso al micrófono. Permítelo en la configuración del sitio de tu navegador e inténtalo de nuevo.",
+          "missing": "No se encontró ningún micrófono.",
+          "failed": "No se pudo iniciar el micrófono.",
+          "unsupported": "Este navegador no puede capturar audio del micrófono para la transcripción en vivo."
+        },
+        "invalidKey": "El token de la API no es válido (revocado o vencido).",
+        "modelNotFound": "Este token no puede usar ese modelo.",
+        "busy": "No hay ningún miembro en vivo libre ahora. Inténtalo de nuevo en un momento.",
+        "backlog": "El audio llegó más rápido de lo que el modelo podía procesarlo.",
+        "upstream": "El nodo de transcripción falló o se desconectó.",
+        "shutdown": "El servidor se está reiniciando. Inténtalo de nuevo en un momento.",
+        "expired": "La sesión alcanzó su duración máxima.",
+        "idle": "La sesión terminó tras dos minutos sin audio.",
+        "emptyCommit": "No se dijo nada desde el último turno.",
+        "denied": "El servidor rechazó la sesión o su acceso terminó.",
+        "connection": "No se pudo conectar. Revisa el token y que el modelo tenga un miembro en vivo.",
+        "server": "El servidor informó un error."
+      }
     }
   },
   "clis": {
