@@ -33,6 +33,8 @@ export type RelayMaintenanceDeps = {
   terminalHub: { recheckSessions(): Promise<unknown> };
   /** Flushes the agent audit queue at stop (see ./relay/cli-agent-audit.ts). */
   stopCliAgentAudit?: () => Promise<void>;
+  /** Flushes the deployment operator audit queue at stop (../deployments/operator-audit.ts). */
+  stopDeploymentOperatorAudit?: () => Promise<void>;
 };
 
 function errorClass(error: unknown): string {
@@ -94,6 +96,13 @@ export function startRelayMaintenance(deps: RelayMaintenanceDeps): () => Promise
         await deps.stopCliAgentAudit();
       } catch (error) {
         console.error("[server] agent audit flush failed", errorClass(error));
+      }
+    }
+    if (deps.stopDeploymentOperatorAudit !== undefined) {
+      try {
+        await deps.stopDeploymentOperatorAudit();
+      } catch (error) {
+        console.error("[server] operator audit flush failed", errorClass(error));
       }
     }
   };

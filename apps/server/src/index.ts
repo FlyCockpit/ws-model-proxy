@@ -9,6 +9,10 @@ import { env } from "@ws-model-proxy/env/server";
 import { WebSocketServer } from "ws";
 import { createApp } from "./app.js";
 import { installBetterCallErrorLogShim } from "./better-call-error-log-shim.js";
+import {
+  flushDeploymentOperatorAudit,
+  stopDeploymentOperatorAuditWriter,
+} from "./deployments/operator-audit.js";
 import { DeploymentReconciler } from "./deployments/reconciler.js";
 import { startOauthCleanup } from "./mcp/oauth-cleanup.js";
 import { startMediaCleanup } from "./media/cleanup.js";
@@ -159,6 +163,8 @@ const stopMediaCleanup = startMediaCleanup();
 const deploymentReconciler = new DeploymentReconciler({
   current: (deviceId) => relaySessionManager.deploymentSocket(deviceId),
   send: (socket, job) => relaySessionManager.sendDeploymentJob(socket, job),
+  closeOperatorStep: (stepId, options) =>
+    relaySessionManager.closeDeploymentOperatorStep(stepId, options),
 });
 relaySessionManager.setDeploymentHandlers({
   result: (socket, result) => deploymentReconciler.acceptResult(socket, result),
@@ -213,6 +219,7 @@ const stopRelayMaintenance = startRelayMaintenance({
   },
   terminalHub: terminalBrowserHub,
   stopCliAgentAudit: stopCliAgentAuditWriter,
+  stopDeploymentOperatorAudit: stopDeploymentOperatorAuditWriter,
 });
 
 // ---------------------------------------------------------------------------
@@ -245,6 +252,7 @@ installServerShutdown({
   userDeletionSweepClient,
   relaySessions: relaySessionManager,
   flushAgentAudit: flushCliAgentAudit,
+  flushDeploymentOperatorAudit,
   terminalHub: terminalBrowserHub,
   server,
   capacityLifecycle,

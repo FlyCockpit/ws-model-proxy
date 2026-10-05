@@ -41,6 +41,17 @@ export type DeploymentLiveSocket = DeploymentSocket & { inventoryComplete: boole
 export type DeploymentTransport = {
   current(deviceId: string): DeploymentLiveSocket | null;
   send(socket: DeploymentSocket, job: DeploymentJob): boolean;
+  /**
+   * Close the operator terminal of an interactive step by step id, on whichever
+   * session holds it (design §12b: a PENDING reset loses `operatorTerminalId`).
+   * `keepRunning` leaves a terminal whose command already runs (`running`).
+   * Read `operatorTerminalId` before the settling update if it matters; this
+   * hook does not need it. Unused until interactive dispatch (chunk 7).
+   */
+  closeOperatorStep?(
+    stepId: string,
+    options?: { keepRunning?: boolean },
+  ): "closed" | "running" | "absent";
 };
 const BATCH = 64;
 const STOP_GRACE = 60_000;

@@ -1,10 +1,13 @@
 import { cancelCommandsForUser } from "./cli-commands.js";
 import { cancelFileOpsForUser } from "./cli-file-ops.js";
+import { relaySessionManager } from "./session-manager.js";
 
 /**
  * The ban fence (#159): a user was banned, so nothing they started may keep
  * running. Ends their running and supervised commands, their in-flight file
- * ops, and refuses admissions still reading (the per-user twin of the token
+ * ops, their deployment operator terminals (design §12b policy: a terminal
+ * nobody may answer is cancelled; the reconciler settles the step), and
+ * refuses admissions still reading (the per-user twin of the token
  * revoke that `cancelMcpTokenCommands` does). Their relay sockets stay open; a
  * ban already refuses reauthentication and every new admission re-reads the
  * owner's ban state.
@@ -21,6 +24,10 @@ export function cancelRelayWorkForBannedUser(userId: string): void {
   try {
     cancelCommandsForUser(userId);
   } finally {
-    cancelFileOpsForUser(userId);
+    try {
+      cancelFileOpsForUser(userId);
+    } finally {
+      relaySessionManager.cancelDeploymentOperatorTerminalsForUser(userId);
+    }
   }
 }

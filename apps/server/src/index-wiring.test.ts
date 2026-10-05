@@ -38,6 +38,16 @@ describe("index.ts relay maintenance wiring", () => {
     );
   });
 
+  it("wires the deployment operator audit stop and flush", () => {
+    expect(source).toMatch(
+      /import \{\s*flushDeploymentOperatorAudit,\s*stopDeploymentOperatorAuditWriter,\s*\} from "\.\/deployments\/operator-audit\.js";/,
+    );
+    expect(maintenanceOptions()).toMatch(
+      /stopDeploymentOperatorAudit:\s*stopDeploymentOperatorAuditWriter\b/,
+    );
+    expect(source).toMatch(/installServerShutdown\(\{[\s\S]*?\bflushDeploymentOperatorAudit\b/);
+  });
+
   it("keeps the relay maintenance stop in the shutdown periodic-job list", () => {
     expect(source).toMatch(/periodicJobStops:\s*\[[\s\S]*?\bstopRelayMaintenance\b/);
   });

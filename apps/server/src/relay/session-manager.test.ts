@@ -7,6 +7,10 @@ import {
 } from "@ws-model-proxy/config/cli-identity-key";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  queuedDeploymentOperatorEventsForTests,
+  resetDeploymentOperatorAuditForTests,
+} from "../deployments/operator-audit.js";
 import { parseMultipartToSpool } from "../model-api/multipart-form-data.js";
 import { generateTestHelloIdentity } from "./hello-identity.js";
 import {
@@ -80,7 +84,7 @@ vi.mock("../model-api/cache-affinity-generation.js", () => ({
   },
 }));
 
-const { RelaySessionManager } = await import("./session-manager.js");
+const { RelaySessionManager, OPERATOR_STEPS_PER_SESSION } = await import("./session-manager.js");
 const { default: prisma } = await import("@ws-model-proxy/db");
 
 const db = prisma as unknown as {
@@ -3151,6 +3155,419 @@ describe("relay terminal viewers", () => {
       expect(result).toHaveBeenCalledTimes(operator ? 2 : 1);
       expect(socket.closes).toHaveLength(0);
     }
+  });
+
+  describe("deployment operator terminals (2.11)", () => {
+    type Job = Parameters<InstanceType<typeof RelaySessionManager>["sendDeploymentJob"]>[1];
+    const golden = JSON.parse(
+      readFileSync(
+        new URL("../../../cli/tests/fixtures/relay-current/deployment-jobs.json", import.meta.url),
+        "utf8",
+      ),
+    ) as { jobs: Record<string, Job>; results: Record<string, Record<string, unknown>> };
+    const start = golden.jobs.interactiveStart as Job;
+    const terminalId = start.operator?.terminalId as string;
+
+    beforeEach(() => {
+      resetDeploymentOperatorAuditForTests();
+    });
+
+    /** A CLI with deployments and the operator feature, no browser terminals and MCP off. */
+    function operatorHello(extra: Record<string, unknown> = {}) {
+      const parsed = JSON.parse(helloCli({ humanTerminal: false, mcpCommandMode: "off" })) as {
+        cli: { capabilities: { features: Record<string, unknown> } };
+      };
+      Object.assign(parsed.cli.capabilities.features, {
+        deployments: true,
+        deploymentOperator: true,
+        ...extra,
+      });
+      return JSON.stringify(parsed);
+    }
+
+    async function operatorSetup() {
+      db.cliDevice.upsert.mockResolvedValue({
+        id: "cli-device-id",
+        userId: "user-id",
+        slug: "desktop",
+        allowHumanTerminal: false,
+        mcpCommandMode: "OFF",
+        connectionGeneration: 1,
+      });
+      const { manager, socket } = await setup(operatorHello());
+      const target = manager.deploymentSocket("cli-device-id");
+      expect(target).toBeTruthy();
+      const result = vi.fn(async () => true);
+      manager.setDeploymentHandlers({ result, inventory: async () => true });
+      const report = (status: string, fields: Record<string, unknown> = {}) =>
+        manager.handleTextFrame(
+          socket,
+          JSON.stringify({
+            ...golden.results.awaitingOperator,
+            status,
+            ...(status === "succeeded" || status === "failed" ? { terminalId: undefined } : {}),
+            ...fields,
+          }),
+          now,
+        );
+      return { manager, socket, target: target!, result, report };
+    }
+
+    const outcomes = () => queuedDeploymentOperatorEventsForTests().map((row) => row.outcome);
+
+    it("registers the terminal on send and lists it once awaiting_operator names it", async () => {
+      const { manager, socket, target, result, report } = await operatorSetup();
+      expect(manager.sendDeploymentJob(target, start)).toBe(true);
+      expect(control(socket).at(-1)).toMatchObject({
+        type: "deployment.job",
+        operator: { terminalId },
+      });
+      expect(manager.hasTerminal(terminalId)).toBe(true);
+      expect(manager.listTerminalsForUser("user-id")).toEqual([]);
+      await report("awaiting_operator");
+      expect(result).toHaveBeenCalledTimes(1);
+      expect(manager.listTerminalsForUser("user-id")).toEqual([
+        expect.objectContaining({
+          terminalId,
+          origin: "deployment",
+          deployment: {
+            stepId: start.stepId,
+            instanceId: start.instanceId,
+            rank: 0,
+            action: "start",
+            state: "awaiting",
+          },
+        }),
+      ]);
+      expect(events).toContainEqual({ type: "list_changed", userId: "user-id" });
+      // Not a human terminal: never counted against the human limits.
+      expect(manager.terminalCounts("user-id", "cli-device-id")).toEqual({ user: 0, cli: 0 });
+      const row = queuedDeploymentOperatorEventsForTests()[0];
+      expect(row).toEqual({
+        userId: "user-id",
+        instanceId: start.instanceId,
+        stepId: start.stepId,
+        cliDeviceId: "cli-device-id",
+        rank: 0,
+        action: "start",
+        outcome: "opened",
+        exitCode: null,
+      });
+      expect(JSON.stringify(row)).not.toContain(start.command);
+    });
+
+    it("lets the owner attach with browser terminals and MCP commands off; others cannot", async () => {
+      const { manager, socket, target, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      // Nothing to attach to before the CLI drew the confirm screen.
+      expect(attach(manager, "a", terminalId)).toEqual({ ok: false, error: "not_found" });
+      await report("awaiting_operator");
+      const attached = attach(manager, "a", terminalId);
+      expect(attached.ok).toBe(true);
+      const viewerId = attached.ok ? attached.viewerId : "";
+      expect(control(socket).at(-1)).toMatchObject({ type: "term.attach", terminalId, viewerId });
+      // Viewer approval (term.pending) still applies: it is the CLI's handshake.
+      await manager.handleTextFrame(
+        socket,
+        JSON.stringify({ type: "term.attached", terminalId, viewerId, cliNonce: id16(6) }),
+        now,
+      );
+      expect(eventsFor("a")).toContainEqual(
+        expect.objectContaining({ type: "attached", terminalId, viewerId }),
+      );
+      expect(
+        manager.attachTerminal({
+          terminalId,
+          userId: "someone-else",
+          connId: "x",
+          browserPublicKey: uncompressedKey(),
+          browserNonce: id16(4),
+        }),
+      ).toEqual({ ok: false, error: "not_found" });
+      // A browser cannot "open" one, and a late term.opened is ignored.
+      await manager.handleTextFrame(
+        socket,
+        JSON.stringify({ type: "term.opened", terminalId, viewerId: id16(9), cliNonce: id16(6) }),
+        now,
+      );
+      expect(manager.listTerminalsForUser("user-id")).toHaveLength(1);
+    });
+
+    it("audits accept, a failed attempt, a retry and the verified success, then forgets the step", async () => {
+      const { manager, socket, target, result, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("awaiting_operator");
+      await report("operator_running");
+      expect(manager.listTerminalsForUser("user-id")[0]?.deployment?.state).toBe("running");
+      await report("awaiting_operator"); // exited;1, retry screen
+      await report("awaiting_operator"); // a repeated delivery re-reports; no row
+      await report("operator_running");
+      // The CLI ends the terminal before it verifies.
+      await manager.handleTextFrame(
+        socket,
+        JSON.stringify({ type: "term.exit", terminalId, exitCode: 0 }),
+        now,
+      );
+      expect(manager.listTerminalsForUser("user-id")).toEqual([]);
+      // An ended terminal is never reopened under its id.
+      expect(manager.sendDeploymentJob(target, start)).toBe(false);
+      await report("succeeded");
+      expect(outcomes()).toEqual(["opened", "accepted", "failed", "accepted", "succeeded"]);
+      expect(result).toHaveBeenCalledTimes(6);
+    });
+
+    it("records a decline, a close with the last exit code, and ends the record", async () => {
+      const { manager, target, result, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("awaiting_operator");
+      const attached = attach(manager, "a", terminalId);
+      expect(attached.ok).toBe(true);
+      await report("operator_closed");
+      expect(outcomes()).toEqual(["opened", "declined"]);
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: "exit", terminalId, connIds: ["a"] }),
+      );
+      expect(manager.hasTerminal(terminalId)).toBe(false);
+      expect(result).toHaveBeenCalledTimes(2);
+
+      const second = { ...start, operator: { terminalId: id16(40), commandAuthor: "user" } } as Job;
+      expect(manager.sendDeploymentJob(target, second)).toBe(true);
+      const secondId = second.operator?.terminalId;
+      await report("awaiting_operator", { terminalId: secondId });
+      await report("operator_running", { terminalId: secondId });
+      await report("operator_closed", { terminalId: secondId, exitCode: 3 });
+      expect(queuedDeploymentOperatorEventsForTests().slice(2)).toEqual([
+        expect.objectContaining({ outcome: "opened", exitCode: null }),
+        expect.objectContaining({ outcome: "accepted", exitCode: null }),
+        expect.objectContaining({ outcome: "closed", exitCode: 3 }),
+      ]);
+    });
+
+    it("drops progress that does not match the tracked terminal and closes strays", async () => {
+      const { manager, socket, target, result, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("awaiting_operator", { intentHash: "f".repeat(64) });
+      await report("awaiting_operator", { ownerEpoch: "other:1" });
+      await report("operator_running"); // before any awaiting_operator
+      expect(result).not.toHaveBeenCalled();
+      expect(outcomes()).toEqual([]);
+      // Stale frames never close the tracked terminal.
+      expect(control(socket).some((frame) => frame.type === "term.close")).toBe(false);
+      const stray = id16(41);
+      await report("awaiting_operator", { terminalId: stray });
+      expect(result).not.toHaveBeenCalled();
+      expect(control(socket).at(-1)).toEqual({ type: "term.close", terminalId: stray });
+      // The tracked terminal is untouched.
+      await report("awaiting_operator");
+      expect(result).toHaveBeenCalledTimes(1);
+      expect(manager.listTerminalsForUser("user-id")).toHaveLength(1);
+    });
+
+    it("refuses a terminal id held by another terminal and re-sends a live one as is", async () => {
+      const { manager, socket, target } = await operatorSetup();
+      expect(manager.sendDeploymentJob(target, start)).toBe(true);
+      const clash = { ...(golden.jobs.interactiveStop as Job), operator: start.operator } as Job;
+      const before = socket.sends.length;
+      expect(manager.sendDeploymentJob(target, clash)).toBe(false);
+      expect(socket.sends.length).toBe(before);
+      // Re-delivery of the same terminal: sent again, one record.
+      expect(manager.sendDeploymentJob(target, start)).toBe(true);
+      expect(socket.sends.length).toBe(before + 1);
+      // A new terminal for the step replaces the old record.
+      const replaced = {
+        ...start,
+        operator: { terminalId: id16(42), commandAuthor: "user" },
+      } as Job;
+      expect(manager.sendDeploymentJob(target, replaced)).toBe(true);
+      expect(manager.hasTerminal(terminalId)).toBe(false);
+      expect(manager.hasTerminal(id16(42))).toBe(true);
+    });
+
+    it("refuses operator jobs to a CLI without terminal support", async () => {
+      db.cliDevice.upsert.mockResolvedValue({
+        id: "cli-device-id",
+        userId: "user-id",
+        slug: "desktop",
+        allowHumanTerminal: false,
+        mcpCommandMode: "OFF",
+        connectionGeneration: 1,
+      });
+      const { manager } = await setup(operatorHello({ terminalSupported: false }));
+      const target = manager.deploymentSocket("cli-device-id");
+      expect(manager.sendDeploymentJob(target!, start)).toBe(false);
+      expect(manager.hasTerminal(terminalId)).toBe(false);
+    });
+
+    it("closes by step id, records the cancel and still routes the CLI's answer", async () => {
+      const { manager, socket, target, result, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("awaiting_operator");
+      await report("operator_running");
+      expect(manager.closeDeploymentOperatorStep(start.stepId, { keepRunning: true })).toBe(
+        "running",
+      );
+      expect(manager.hasTerminal(terminalId)).toBe(true);
+      expect(manager.closeDeploymentOperatorStep(start.stepId)).toBe("closed");
+      expect(control(socket).at(-1)).toEqual({ type: "term.close", terminalId });
+      expect(manager.hasTerminal(terminalId)).toBe(false);
+      expect(manager.closeDeploymentOperatorStep(start.stepId)).toBe("absent");
+      await report("operator_closed");
+      expect(result).toHaveBeenCalledTimes(3);
+      expect(outcomes()).toEqual(["opened", "accepted", "cancelled"]);
+      expect(manager.closeDeploymentOperatorStep("no-such-step")).toBe("absent");
+    });
+
+    it("closes a terminal that spawns after a cancel sent before it existed", async () => {
+      const { manager, socket, target, result, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      expect(manager.closeDeploymentOperatorStep(start.stepId)).toBe("closed");
+      expect(outcomes()).toEqual([]);
+      await report("awaiting_operator");
+      expect(result).not.toHaveBeenCalled();
+      expect(control(socket).at(-1)).toEqual({ type: "term.close", terminalId });
+    });
+
+    it("records auto_settled when status settles a step before any terminal opened", async () => {
+      const { manager, target, result, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("succeeded");
+      expect(outcomes()).toEqual(["auto_settled"]);
+      expect(manager.hasTerminal(terminalId)).toBe(false);
+      expect(result).toHaveBeenCalledTimes(1);
+    });
+
+    it("records nothing for a spawn refusal before the terminal opened", async () => {
+      const { manager, target, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("failed", { error: "operator_terminal_limit" });
+      expect(outcomes()).toEqual([]);
+      expect(manager.hasTerminal(terminalId)).toBe(false);
+    });
+
+    it("never idle-closes an operator terminal", async () => {
+      const { manager, target, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("awaiting_operator");
+      manager.sweepExpiredPendingTerminals(Date.now() + 7 * 24 * 60 * 60 * 1000);
+      expect(manager.listTerminalsForUser("user-id")).toHaveLength(1);
+    });
+
+    it("keeps operator terminals open when the human or MCP grants change", async () => {
+      const { manager, target, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("awaiting_operator");
+      manager.applyFeatureGrants("cli-device-id", {
+        allowHumanTerminal: true,
+        mcpCommandMode: "unsupervised",
+        mcpFileRead: true,
+      });
+      manager.applyFeatureGrants("cli-device-id", {
+        allowHumanTerminal: false,
+        mcpCommandMode: "off",
+        mcpFileRead: false,
+      });
+      expect(manager.listTerminalsForUser("user-id")).toEqual([
+        expect.objectContaining({ terminalId, origin: "deployment" }),
+      ]);
+      expect(outcomes()).toEqual(["opened"]);
+    });
+
+    it("caps tracked steps per session; a cancelled one gives way only on a successful send", async () => {
+      const { manager, socket, target } = await operatorSetup();
+      const job = (n: number) =>
+        ({
+          ...start,
+          stepId: `step-${n}`,
+          operator: { terminalId: id16(100 + n), commandAuthor: "user" },
+        }) as Job;
+      for (let n = 0; n < OPERATOR_STEPS_PER_SESSION; n += 1)
+        expect(manager.sendDeploymentJob(target, job(n))).toBe(true);
+      expect(manager.sendDeploymentJob(target, job(OPERATOR_STEPS_PER_SESSION))).toBe(false);
+      expect(manager.closeDeploymentOperatorStep("step-0")).toBe("closed");
+      // A failed send keeps the cancelled tracker: its operator_closed still routes.
+      socket.send = () => {
+        throw new Error("socket gone");
+      };
+      expect(manager.sendDeploymentJob(target, job(OPERATOR_STEPS_PER_SESSION))).toBe(false);
+      socket.send = (data) => {
+        socket.sends.push(data);
+      };
+      const result = vi.fn(async () => true);
+      manager.setDeploymentHandlers({ result, inventory: async () => true });
+      const closed = {
+        ...golden.results.operatorDeclined,
+        stepId: "step-0",
+        terminalId: id16(100),
+      };
+      await manager.handleTextFrame(socket, JSON.stringify(closed), now);
+      expect(result).toHaveBeenCalledTimes(1);
+      // Answered: the slot is free again.
+      expect(manager.sendDeploymentJob(target, job(OPERATOR_STEPS_PER_SESSION))).toBe(true);
+      expect(manager.sendDeploymentJob(target, job(OPERATOR_STEPS_PER_SESSION + 1))).toBe(false);
+      // At the cap, an unanswered cancelled tracker gives way to a successful send.
+      expect(manager.closeDeploymentOperatorStep("step-1")).toBe("closed");
+      expect(manager.sendDeploymentJob(target, job(OPERATOR_STEPS_PER_SESSION + 1))).toBe(true);
+      await manager.handleTextFrame(
+        socket,
+        JSON.stringify({ ...closed, stepId: "step-1", terminalId: id16(101) }),
+        now,
+      );
+      expect(result).toHaveBeenCalledTimes(1);
+    });
+
+    it("ignores another device's session reporting this session's step and terminal", async () => {
+      const { manager, socket, target, result, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      db.cliDevice.upsert.mockResolvedValueOnce({
+        id: "cli-device-2",
+        userId: "user-id",
+        slug: "laptop",
+        allowHumanTerminal: false,
+        mcpCommandMode: "OFF",
+        connectionGeneration: 1,
+      });
+      const other = new FakeSocket();
+      manager.acceptAuthenticatedSocket({ socket: other, identity, now });
+      await manager.handleTextFrame(other, resignHello(other, operatorHello()), now);
+      expect(manager.deploymentSocket("cli-device-2")).toBeTruthy();
+      const sentBefore = socket.sends.length;
+      await manager.handleTextFrame(
+        other,
+        JSON.stringify({ ...golden.results.awaitingOperator }),
+        now,
+      );
+      await manager.handleTextFrame(
+        other,
+        JSON.stringify({ ...golden.results.operatorDeclined }),
+        now,
+      );
+      expect(result).not.toHaveBeenCalled();
+      expect(manager.listTerminalsForUser("user-id")).toEqual([]);
+      expect(manager.hasTerminal(terminalId)).toBe(true);
+      expect(socket.sends.length).toBe(sentBefore);
+      // The spoofing CLI's own stray is closed on that CLI only; nothing was audited.
+      expect(outcomes()).toEqual([]);
+      await report("awaiting_operator");
+      expect(result).toHaveBeenCalledTimes(1);
+      expect(manager.listTerminalsForUser("user-id")).toHaveLength(1);
+    });
+
+    it("ends tracked steps with the session and on a ban", async () => {
+      const first = await operatorSetup();
+      first.manager.sendDeploymentJob(first.target, start);
+      await first.report("awaiting_operator");
+      first.manager.cancelDeploymentOperatorTerminalsForUser("user-id");
+      expect(first.manager.hasTerminal(terminalId)).toBe(false);
+      expect(outcomes()).toEqual(["opened", "cancelled"]);
+
+      resetDeploymentOperatorAuditForTests();
+      const second = await operatorSetup();
+      second.manager.sendDeploymentJob(second.target, start);
+      await second.report("awaiting_operator");
+      await second.manager.removeSession(second.socket, now);
+      expect(outcomes()).toEqual(["opened", "closed"]);
+      expect(events).toContainEqual(expect.objectContaining({ type: "exit", terminalId }));
+    });
   });
 
   it("lets two viewers coexist without a detached event", async () => {

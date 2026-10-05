@@ -41,6 +41,12 @@ import {
   deploymentOperatorSupported,
 } from "@ws-model-proxy/config/deployment-protocol";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
+import {
+  type DeploymentOperatorAction,
+  type DeploymentOperatorOutcome,
+  isDeploymentOperatorAction,
+  recordDeploymentOperatorEvent,
+} from "../deployments/operator-audit.js";
 import type { DeploymentLiveSocket, DeploymentSocket } from "../deployments/reconciler.js";
 import {
   persistAffinityCounterEpoch,
@@ -306,10 +312,17 @@ export type TerminalRecord = {
    * `agent`: a supervised terminal the CLI spawned for an MCP request. It
    * has its own slot limits, is gated by the MCP command mode (not the human
    * terminal grant), and starts with no viewers.
+   * `deployment`: the operator terminal of an interactive deployment step
+   * (2.11). Registered when the job is sent, open once the CLI reports
+   * `awaiting_operator` for it; gated by the node's deployment operator
+   * capability (not the human grant or the MCP mode); never idle-closed and
+   * never counted against the human terminal limits.
    */
-  origin: "user" | "agent";
+  origin: TerminalOrigin;
   /** Set iff `origin` is `agent`. */
   supervised: TrackedSupervisedCommand | null;
+  /** Set iff `origin` is `deployment`. */
+  deployment?: DeploymentTerminalInfo;
   /**
    * Agent terminals: browser sockets that sent Decline. They hear whether an
    * Enter beat it (`decline` event, once, on the waiting -> running step) and
@@ -318,6 +331,42 @@ export type TerminalRecord = {
    * is removed); bounded by the owner's sockets.
    */
   decliners?: Set<string>;
+};
+
+export type TerminalOrigin = "user" | "agent" | "deployment";
+
+/** What the terminal list shows for a deployment operator terminal (no command text). */
+export type DeploymentTerminalInfo = {
+  stepId: string;
+  instanceId: string;
+  rank: number;
+  action: DeploymentOperatorAction;
+  /** `awaiting`: the confirm screen waits for Enter; `running`: the command runs. */
+  state: "awaiting" | "running";
+};
+
+/**
+ * One interactive step the session sent with an operator terminal, by step id,
+ * from the send until its final result, `operator_closed`, a replacement, a
+ * server cancel, or the session's end. It outlives the `TerminalRecord`: the
+ * CLI reports `term.exit` before the worker's final result.
+ */
+type OperatorStepTracker = {
+  stepId: string;
+  instanceId: string;
+  rank: number;
+  action: DeploymentOperatorAction;
+  intentHash: string;
+  ownerEpoch: string;
+  terminalId: string;
+  userId: string;
+  cliDeviceId: string;
+  /** `spawning` until the first `awaiting_operator`. */
+  phase: "spawning" | "awaiting" | "running";
+  /** An Enter started the command at least once in this terminal. */
+  attempted: boolean;
+  /** The server closed the terminal (`cancelled` is recorded); only routing remains. */
+  cancelled: boolean;
 };
 
 export type TerminalWriterLabel = "you" | "other" | "none";
@@ -383,6 +432,11 @@ export function registerTerminalBridge(bridge: TerminalBridge) {
 }
 
 export const TERMINAL_USER_LIMIT = 4;
+/**
+ * Interactive steps one session may track at once. The reconciler opens at
+ * most a few operator terminals per node (design §4: 4); the CLI caps 8.
+ */
+export const OPERATOR_STEPS_PER_SESSION = 16;
 export const TERMINAL_CLI_LIMIT = 2;
 /** 2.5: attached viewers plus pending approvals per terminal. */
 export const TERMINAL_VIEWER_LIMIT = 8;
@@ -489,6 +543,8 @@ type SessionState = {
   filesById: Map<string, TrackedFileOp>;
   /** Supervised commands by command id, from `term.spawn` until their terminal ends. */
   supervisedById: Map<string, TrackedSupervisedCommand>;
+  /** 2.11 interactive deployment steps with an operator terminal, by step id. */
+  operatorSteps: Map<string, OperatorStepTracker>;
   /**
    * Supervised commands whose terminal the server ended, by terminal id,
    * until the CLI's own `term.exit` for it: a `supervised.accepted` still in
@@ -784,6 +840,7 @@ export class RelaySessionManager {
       (deploymentJobNeedsOperator(job) && !this.sessionRunsOperatorJobs(session))
     )
       return false;
+    if (job.operator !== undefined) return this.sendOperatorJob(session, socket, job);
     try {
       this.sendControl(session, job);
       return true;
@@ -797,6 +854,315 @@ export class RelaySessionManager {
       deployments: session.features?.deployments,
       deploymentOperator: session.features?.deploymentOperator,
     });
+  }
+
+  /**
+   * Whether this node may hold operator terminals the owner can attach to:
+   * the deployment operator capability plus browser terminal crypto. NOT the
+   * human-terminal grant or the MCP command mode (design §5, §11.5). The
+   * node owner's opt-in (U1, design §12i: a separate node-local switch, off by
+   * default) is enforced by the CLI: it reports `deploymentOperator` only
+   * while that switch, deployments and a PTY are all on, and re-checks the
+   * switch at attach. The server's view is the hello snapshot.
+   */
+  private deploymentTerminalPolicyAllows(session: SessionState): boolean {
+    return (
+      this.sessionRunsOperatorJobs(session) &&
+      session.features?.terminalSupported === true &&
+      session.terminalPublicKey !== null
+    );
+  }
+
+  /**
+   * Send an interactive job and pre-register its operator terminal (origin
+   * `deployment`, phase `opening`; listed once `awaiting_operator` names it).
+   * A repeated send of the same terminal for the same step re-sends the job and
+   * keeps the record (the CLI re-reports its state). A new terminal for a step
+   * replaces the old one: the CLI closes it itself on the new job. Terminal ids
+   * are never reused: an id held by any other terminal refuses the send.
+   */
+  private sendOperatorJob(session: SessionState, socket: DeploymentSocket, job: DeploymentJob) {
+    const operator = job.operator;
+    if (
+      operator === undefined ||
+      job.interactive !== true ||
+      !isDeploymentOperatorAction(job.action) ||
+      !this.deploymentTerminalPolicyAllows(session)
+    )
+      return false;
+    const terminalId = operator.terminalId;
+    const previous = session.operatorSteps.get(job.stepId);
+    const repeat =
+      previous !== undefined &&
+      previous.terminalId === terminalId &&
+      !previous.cancelled &&
+      previous.intentHash === job.intentHash &&
+      previous.ownerEpoch === job.ownerEpoch &&
+      previous.instanceId === job.instanceId &&
+      previous.rank === job.rank &&
+      // An ended terminal is never reopened under its id (the CLI would spawn a
+      // new one): a re-dispatch after `term.exit` needs a freshly minted id.
+      session.terminalsById.get(terminalId)?.origin === "deployment";
+    // At the cap a cancelled tracker gives way, but only once the send succeeded:
+    // until then it still routes the CLI's answer to the server's own close.
+    let evict: OperatorStepTracker | null = null;
+    if (!repeat) {
+      if (this.hasTerminal(terminalId) || this.operatorTerminalIdTracked(terminalId)) return false;
+      if (previous === undefined && session.operatorSteps.size >= OPERATOR_STEPS_PER_SESSION) {
+        evict = [...session.operatorSteps.values()].find((tracker) => tracker.cancelled) ?? null;
+        if (evict === null) return false;
+      }
+    }
+    let frame: string;
+    try {
+      // Encoded first: a job the CLI could not read throws here, before
+      // anything is registered or sent.
+      frame = encodeRelayServerControlMessage(job);
+    } catch {
+      return false;
+    }
+    try {
+      session.socket.send(frame);
+    } catch {
+      return false;
+    }
+    if (repeat) return true;
+    if (evict !== null) session.operatorSteps.delete(evict.stepId);
+    if (previous !== undefined) this.replaceOperatorStep(session, previous);
+    session.operatorSteps.set(job.stepId, {
+      stepId: job.stepId,
+      instanceId: job.instanceId,
+      rank: job.rank,
+      action: job.action,
+      intentHash: job.intentHash,
+      ownerEpoch: job.ownerEpoch,
+      terminalId,
+      userId: socket.userId,
+      cliDeviceId: socket.cliDeviceId,
+      phase: "spawning",
+      attempted: false,
+      cancelled: false,
+    });
+    session.terminalsById.set(terminalId, {
+      terminalId,
+      userId: socket.userId,
+      cliDeviceId: socket.cliDeviceId,
+      cols: 80,
+      rows: 24,
+      multiViewer: true,
+      viewers: new Map(),
+      pendingViewers: new Map(),
+      writerViewerId: null,
+      phase: "opening",
+      createdAt: Date.now(),
+      origin: "deployment",
+      supervised: null,
+      deployment: {
+        stepId: job.stepId,
+        instanceId: job.instanceId,
+        rank: job.rank,
+        action: job.action,
+        state: "awaiting",
+      },
+    });
+    return true;
+  }
+
+  private operatorTerminalIdTracked(terminalId: string): boolean {
+    for (const session of this.sessionsByCliDeviceId.values()) {
+      for (const tracker of session.operatorSteps.values()) {
+        if (tracker.terminalId === terminalId) return true;
+      }
+    }
+    return false;
+  }
+
+  private recordOperatorEvent(
+    tracker: OperatorStepTracker,
+    outcome: DeploymentOperatorOutcome,
+    exitCode?: number,
+  ) {
+    recordDeploymentOperatorEvent({
+      userId: tracker.userId,
+      instanceId: tracker.instanceId,
+      stepId: tracker.stepId,
+      cliDeviceId: tracker.cliDeviceId,
+      rank: tracker.rank,
+      action: tracker.action,
+      outcome,
+      ...(exitCode !== undefined ? { exitCode } : {}),
+    });
+  }
+
+  /**
+   * A new terminal replaced this step's terminal: forget the old one and end
+   * its record (viewers see the exit). The CLI closes the old terminal itself
+   * when it takes the new job; `closed` is recorded when it had opened.
+   */
+  private replaceOperatorStep(session: SessionState, tracker: OperatorStepTracker) {
+    if (session.operatorSteps.get(tracker.stepId) === tracker)
+      session.operatorSteps.delete(tracker.stepId);
+    if (tracker.phase !== "spawning" && !tracker.cancelled)
+      this.recordOperatorEvent(tracker, "closed");
+    const terminal = session.terminalsById.get(tracker.terminalId);
+    if (terminal?.origin === "deployment") this.closeTerminal(session, terminal, false);
+  }
+
+  /**
+   * Operator progress (`awaiting_operator`, `operator_running`,
+   * `operator_closed`) for this session. Only progress naming the terminal
+   * this session sent for exactly that step (id, intent hash, owner epoch,
+   * instance, rank) is passed on; anything else is dropped, and a live
+   * terminal nobody tracks is closed on the CLI. Writes the audit rows.
+   * Returns whether the result goes on to the reconciler.
+   */
+  private observeOperatorProgress(session: SessionState, result: DeploymentJobResult): boolean {
+    const terminalId = result.terminalId;
+    if (terminalId === undefined) return false;
+    const tracker = session.operatorSteps.get(result.stepId);
+    const matches =
+      tracker !== undefined &&
+      tracker.terminalId === terminalId &&
+      tracker.intentHash === result.intentHash &&
+      tracker.ownerEpoch === result.ownerEpoch &&
+      tracker.instanceId === result.instanceId &&
+      tracker.rank === result.rank;
+    if (!matches || tracker === undefined) {
+      // A terminal this session no longer tracks (replaced, or never sent)
+      // must not stay open on its CLI. A tracked one stays: a mismatched
+      // (stale) frame naming it is only dropped. Only this session's state is
+      // consulted, so a CLI learns nothing about other sessions' terminals.
+      if (
+        result.status !== "operator_closed" &&
+        !session.terminalsById.has(terminalId) &&
+        ![...session.operatorSteps.values()].some((other) => other.terminalId === terminalId) &&
+        session.socket.readyState === WS_READY_STATE_OPEN
+      )
+        this.sendControl(session, { type: "term.close", terminalId });
+      return false;
+    }
+    if (tracker.cancelled) {
+      // Only the CLI's answer to the server's own close still matters. A
+      // terminal that spawned after that close reached the CLI is closed again.
+      if (result.status === "operator_closed") {
+        session.operatorSteps.delete(tracker.stepId);
+        return true;
+      }
+      if (session.socket.readyState === WS_READY_STATE_OPEN)
+        this.sendControl(session, { type: "term.close", terminalId });
+      return false;
+    }
+    const terminal = session.terminalsById.get(terminalId);
+    const record = terminal?.origin === "deployment" ? terminal : undefined;
+    if (result.status === "awaiting_operator") {
+      if (tracker.phase === "spawning") this.recordOperatorEvent(tracker, "opened");
+      // An attempt ended without success (exit code n != 0); the person may retry.
+      else if (tracker.phase === "running") this.recordOperatorEvent(tracker, "failed");
+      tracker.phase = "awaiting";
+      if (record?.deployment) {
+        record.phase = "open";
+        record.deployment.state = "awaiting";
+        this.notifyTerminalListChanged(record.userId);
+      }
+      return true;
+    }
+    if (result.status === "operator_running") {
+      if (tracker.phase === "spawning") return false;
+      if (tracker.phase === "awaiting") this.recordOperatorEvent(tracker, "accepted");
+      tracker.phase = "running";
+      tracker.attempted = true;
+      if (record?.deployment && record.deployment.state !== "running") {
+        record.deployment.state = "running";
+        this.notifyTerminalListChanged(record.userId);
+      }
+      return true;
+    }
+    // operator_closed: declined (nothing ran), or the terminal ended without success.
+    session.operatorSteps.delete(tracker.stepId);
+    if (tracker.phase !== "spawning") {
+      if (result.exitCode !== undefined || tracker.attempted || tracker.phase === "running")
+        this.recordOperatorEvent(tracker, "closed", result.exitCode);
+      else this.recordOperatorEvent(tracker, "declined");
+    }
+    if (record) this.closeTerminal(session, record, false);
+    return true;
+  }
+
+  /**
+   * A final result (`succeeded` / `failed`) for a tracked interactive step:
+   * `succeeded`/`failed` when its terminal had been opened, `auto_settled`
+   * when the CLI's status-first check settled a step nobody ran. A failure
+   * before any terminal opened (spawn refused) records nothing.
+   */
+  private observeOperatorFinal(session: SessionState, result: DeploymentJobResult) {
+    if (result.status !== "succeeded" && result.status !== "failed") return;
+    const tracker = session.operatorSteps.get(result.stepId);
+    if (
+      tracker === undefined ||
+      tracker.intentHash !== result.intentHash ||
+      tracker.ownerEpoch !== result.ownerEpoch ||
+      tracker.instanceId !== result.instanceId ||
+      tracker.rank !== result.rank
+    )
+      return;
+    session.operatorSteps.delete(tracker.stepId);
+    // Recorded even after a server cancel: a verify that won the race is the truth.
+    if (tracker.phase !== "spawning")
+      this.recordOperatorEvent(tracker, result.status === "succeeded" ? "succeeded" : "failed");
+    else if (result.status === "succeeded") this.recordOperatorEvent(tracker, "auto_settled");
+    const terminal = session.terminalsById.get(tracker.terminalId);
+    // The CLI ends the terminal before it verifies; a record still here is stale.
+    if (terminal?.origin === "deployment") this.closeTerminal(session, terminal, true);
+  }
+
+  /**
+   * Close the operator terminal of a deployment step, by step id (design
+   * §12b: a step reset to PENDING loses its stored terminal id). Any session
+   * holding the step is searched. Records `cancelled` when the terminal had
+   * opened. `keepRunning` leaves a terminal whose command already runs alone
+   * (answer `running`). The CLI's `operator_closed` answer still reaches the
+   * reconciler.
+   */
+  closeDeploymentOperatorStep(
+    stepId: string,
+    options: { keepRunning?: boolean } = {},
+  ): "closed" | "running" | "absent" {
+    for (const session of this.sessionsByCliDeviceId.values()) {
+      const tracker = session.operatorSteps.get(stepId);
+      if (tracker === undefined || tracker.cancelled) continue;
+      if (options.keepRunning === true && tracker.phase === "running") return "running";
+      this.cancelOperatorStep(session, tracker);
+      return "closed";
+    }
+    return "absent";
+  }
+
+  /** Ban fence: close every operator terminal of this user (see `./user-ban.ts`). */
+  cancelDeploymentOperatorTerminalsForUser(userId: string) {
+    for (const session of this.sessionsByCliDeviceId.values()) {
+      if (session.identity.userId !== userId) continue;
+      for (const tracker of [...session.operatorSteps.values()]) {
+        if (!tracker.cancelled) this.cancelOperatorStep(session, tracker);
+      }
+    }
+  }
+
+  private cancelOperatorStep(session: SessionState, tracker: OperatorStepTracker) {
+    if (tracker.phase !== "spawning") this.recordOperatorEvent(tracker, "cancelled");
+    tracker.cancelled = true;
+    const terminal = session.terminalsById.get(tracker.terminalId);
+    if (terminal?.origin === "deployment") this.closeTerminal(session, terminal, true);
+    else if (session.socket.readyState === WS_READY_STATE_OPEN)
+      this.sendControl(session, { type: "term.close", terminalId: tracker.terminalId });
+  }
+
+  /** The session ended: its operator terminals are gone with it. */
+  private endOperatorSteps(session: SessionState) {
+    for (const tracker of [...session.operatorSteps.values()]) {
+      session.operatorSteps.delete(tracker.stepId);
+      if (tracker.phase !== "spawning" && !tracker.cancelled)
+        this.recordOperatorEvent(tracker, "closed");
+    }
   }
   private sessionsBySocket = new Map<RelaySocket, SessionState>();
   private sessionsByCliDeviceId = new Map<string, SessionState>();
@@ -908,6 +1274,7 @@ export class RelaySessionManager {
       commandsById: new Map(),
       filesById: new Map(),
       supervisedById: new Map(),
+      operatorSteps: new Map(),
       endingSupervised: new Map(),
       unauthenticatedTimer,
       helloNonce,
@@ -1202,11 +1569,11 @@ export class RelaySessionManager {
       if (message.type === "deployment.job.result") {
         // Operator progress answers only interactive jobs, which only a CLI that
         // reported `deploymentOperator` is ever sent.
-        if (
-          deploymentOperatorResultStatus(message.status) &&
-          !this.sessionRunsOperatorJobs(session)
-        )
-          return;
+        if (deploymentOperatorResultStatus(message.status)) {
+          if (!this.sessionRunsOperatorJobs(session)) return;
+          // Only progress for the operator terminal this session sent goes on.
+          if (!this.observeOperatorProgress(session, message)) return;
+        } else this.observeOperatorFinal(session, message);
         await this.deploymentHandlers?.result(identity, message);
       } else await this.receiveDeploymentSnapshot(session, identity, message, frame);
       return;
@@ -2703,8 +3070,9 @@ export class RelaySessionManager {
     let cli = 0;
     for (const session of this.sessionsByCliDeviceId.values()) {
       for (const terminal of session.terminalsById.values()) {
-        // Supervised terminals have their own limits (see cli-commands.ts).
-        if (terminal.phase === "pending" || terminal.origin === "agent") continue;
+        // Supervised terminals have their own limits (see cli-commands.ts);
+        // operator terminals are bounded per session (OPERATOR_STEPS_PER_SESSION).
+        if (terminal.phase === "pending" || terminal.origin !== "user") continue;
         if (terminal.userId === userId) user += 1;
         if (terminal.cliDeviceId === cliDeviceId) cli += 1;
       }
@@ -2734,17 +3102,19 @@ export class RelaySessionManager {
     viewerCount: number;
     attachedHere: boolean;
     writerHere: boolean;
-    origin: "user" | "agent";
+    origin: TerminalOrigin;
     /** Present for agent terminals. Server-asserted request details. */
     supervised?: SupervisedTerminalListing;
+    /** Present for deployment operator terminals: which step it runs (no command text). */
+    deployment?: DeploymentTerminalInfo;
   }> {
     const terminals: ReturnType<RelaySessionManager["listTerminalsForUser"]> = [];
     for (const session of this.sessionsByCliDeviceId.values()) {
       for (const terminal of session.terminalsById.values()) {
         if (terminal.userId !== userId) continue;
-        // A supervised terminal is listed once the CLI spawned it: before
-        // that there is nothing to attach to.
-        if (terminal.origin === "agent" && terminal.phase !== "open") continue;
+        // A supervised or operator terminal is listed once the CLI spawned
+        // it: before that there is nothing to attach to.
+        if (terminal.origin !== "user" && terminal.phase !== "open") continue;
         const writer = terminalWriterViewerId(terminal);
         const writerConn = writer ? terminal.viewers.get(writer)?.connId : undefined;
         terminals.push({
@@ -2756,6 +3126,7 @@ export class RelaySessionManager {
           writerHere: connId !== undefined && writerConn === connId,
           origin: terminal.origin,
           ...(terminal.supervised ? { supervised: terminal.supervised.listing() } : {}),
+          ...(terminal.deployment ? { deployment: { ...terminal.deployment } } : {}),
         });
       }
     }
@@ -2851,7 +3222,11 @@ export class RelaySessionManager {
     if (!located) return { ok: false, error: "not_found" };
     const { session, terminal } = located;
     const allowed =
-      terminal.origin === "agent" ? this.canRunSupervised(session) : this.canStartTerminal(session);
+      terminal.origin === "agent"
+        ? this.canRunSupervised(session)
+        : terminal.origin === "deployment"
+          ? this.canAttachDeploymentTerminal(session)
+          : this.canStartTerminal(session);
     if (!allowed) return { ok: false, error: "offline" };
     const now = Date.now();
     if (!terminal.multiViewer) {
@@ -3531,7 +3906,7 @@ export class RelaySessionManager {
    */
   private canSignalTerminal(session: SessionState, terminal?: TerminalRecord): boolean {
     if (session.socket.readyState !== WS_READY_STATE_OPEN) return false;
-    if (terminal?.origin === "agent") return true;
+    if (terminal?.origin === "agent" || terminal?.origin === "deployment") return true;
     if (terminal === undefined) return true;
     return session.features?.humanTerminal === true;
   }
@@ -3573,6 +3948,14 @@ export class RelaySessionManager {
   private canRunSupervised(session: SessionState): boolean {
     return (
       this.supervisedPolicyAllows(session) && session.socket.readyState === WS_READY_STATE_OPEN
+    );
+  }
+
+  /** Operator terminals: the deployment operator policy, not the human or MCP grants. */
+  private canAttachDeploymentTerminal(session: SessionState): boolean {
+    return (
+      this.deploymentTerminalPolicyAllows(session) &&
+      session.socket.readyState === WS_READY_STATE_OPEN
     );
   }
 
@@ -3624,6 +4007,7 @@ export class RelaySessionManager {
   }
 
   private teardownInteractiveWork(session: SessionState) {
+    this.endOperatorSteps(session);
     this.closeAllTerminals(session, this.canSignalTerminal(session), "disconnected");
     this.cancelAllCommands(session);
     this.cancelAllFileOps(session);
@@ -3699,7 +4083,8 @@ export class RelaySessionManager {
       connIds: terminalConnIds(terminal),
       ...(supervised ? supervisedExitFields(supervised) : {}),
     });
-    if (supervised) this.notifyTerminalListChanged(terminal.userId);
+    if (supervised || terminal.origin === "deployment")
+      this.notifyTerminalListChanged(terminal.userId);
   }
 
   /** 2.4: the new viewer takes the terminal and every other tab hears `detached`. */
@@ -3955,13 +4340,15 @@ export class RelaySessionManager {
         ...(message.signal !== undefined ? { signal: message.signal } : {}),
         ...(supervised ? { supervisedStatus: supervised.listing().status } : {}),
       });
-      if (supervised) this.notifyTerminalListChanged(terminal.userId);
+      if (supervised || terminal.origin === "deployment")
+        this.notifyTerminalListChanged(terminal.userId);
       return;
     }
-    // A supervised terminal is spawned with `term.spawn`, never opened by a
-    // browser; before `term.spawned` nothing on it can be attached.
+    // A supervised terminal is spawned with `term.spawn` and an operator
+    // terminal with its deployment job, never opened by a browser; before
+    // `term.spawned` / `awaiting_operator` nothing on it can be attached.
     if (
-      terminal.origin === "agent" &&
+      terminal.origin !== "user" &&
       (message.type === "term.opened" || terminal.phase !== "open")
     ) {
       return;
