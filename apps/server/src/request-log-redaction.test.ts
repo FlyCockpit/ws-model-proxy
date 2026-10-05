@@ -22,6 +22,12 @@ vi.mock("@ws-model-proxy/env/server", () => ({
 }));
 
 describe("request-log redaction (OAuth query stripping)", () => {
+  it("strips the query of the live transcription upgrade path", () => {
+    expect(stripsOAuthQuery("/v1/realtime")).toBe(true);
+    expect(stripsOAuthQuery("/v1/realtime/")).toBe(true);
+    expect(stripsOAuthQuery("/v1/realtimeish")).toBe(false);
+  });
+
   it("flags exactly the /api/auth/oauth2/ prefix family", () => {
     expect(stripsOAuthQuery("/api/auth/oauth2/authorize")).toBe(true);
     expect(stripsOAuthQuery("/api/auth/oauth2/token")).toBe(true);

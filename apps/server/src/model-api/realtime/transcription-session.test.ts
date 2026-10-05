@@ -349,6 +349,25 @@ describe("realtime transcription session: setup and routing", () => {
     expect(t.counters.count("server")).toBe(0);
   });
 
+  it("a last attempt failing at the routing deadline closes 1013, deterministically", async () => {
+    const t = setup({ initialModel: "whisper" });
+    const clis = ["a", "b", "c"].map((id) => t.link(id));
+    t.router.result = { ok: true, candidates: ["a", "b", "c"].map((id) => candidate(id)) };
+    t.session.start();
+    // a and b use their 4 s budgets; c gets the last 2 s and fails just before
+    // the deadline, inside the tie window.
+    await vi.advanceTimersByTimeAsync(REALTIME_ROUTING_DEADLINE_MS - 100);
+    const c = clis[2];
+    if (!c) throw new Error("no cli");
+    t.cliFrame(c, {
+      type: "stt.error",
+      sessionId: String(c.opens().at(-1)?.sessionId),
+      failure: "transport",
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(t.client.closes).toEqual([{ code: 1013, reason: "server_busy" }]);
+  });
+
   it("enforces the deadline while the router itself hangs", async () => {
     const t = setup({ initialModel: "whisper" });
     t.router.result = new Promise(() => {});

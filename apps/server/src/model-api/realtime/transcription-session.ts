@@ -82,8 +82,28 @@ export const REALTIME_CLOSE_CODES = {
 } as const;
 export type RealtimeCloseCode = (typeof REALTIME_CLOSE_CODES)[keyof typeof REALTIME_CLOSE_CODES];
 
+/**
+ * Where a candidate sits in the database: what admission, health and
+ * accounting need. Opaque to this module; the router fills it.
+ */
+export type RealtimeRouteIdentity = {
+  kind: "pool" | "direct";
+  poolId: string | null;
+  poolMemberId: string | null;
+  discoveredModelId: string;
+  endpointId: string;
+  executionTargetId: string | null;
+  capacityId: string | null;
+  /** The engine owner (pool owner or contributor's model owner for admission). */
+  ownerUserId: string;
+  accessGrantId: string | null;
+};
+
 /** A candidate member, in route order. `deploymentManaged` comes from the database. */
-export type RealtimeCandidate = SttAttachTarget & { memberId: string | null };
+export type RealtimeCandidate = SttAttachTarget & {
+  memberId: string | null;
+  route?: RealtimeRouteIdentity;
+};
 
 export type RealtimeRouteResult =
   | { ok: true; candidates: readonly RealtimeCandidate[] }
@@ -104,7 +124,11 @@ export interface RealtimeRouter {
   memberOpenFailed(candidate: RealtimeCandidate, failure: RelayFailure): void;
 }
 
-export type RealtimeCandidateLease = { release(): void };
+export type RealtimeCandidateLease = {
+  release(): void;
+  /** Aborts if the lease is lost (heartbeat refused); the session then ends 1011. */
+  signal?: AbortSignal;
+};
 
 export type RealtimeAdmitResult = { ok: true; lease: RealtimeCandidateLease } | { ok: false };
 
@@ -649,6 +673,10 @@ export class RealtimeTranscriptionSession {
       });
       return;
     }
+    // The routing deadline, not the members, ended the search when the last
+    // attempt timed out against it (its timer and the deadline can fire in
+    // the same tick): that is busy (1013), deterministically.
+    if (Date.now() >= deadline - REALTIME_OPEN_ATTEMPT_MIN_MS) sawCapacity = true;
     this.fail(
       sawCapacity ? REALTIME_CLOSE_CODES.tryAgainLater : REALTIME_CLOSE_CODES.internal,
       sawCapacity

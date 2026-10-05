@@ -5,7 +5,8 @@
  * - every 15 s: stale relay sessions (`checkStaleSessions`) and expired
  *   pending terminals (`sweepExpiredPendingTerminals`);
  * - every 60 s: expired token-scoped CLI commands (`sweepExpiredTokenCommands`);
- * - every 60 s: browser terminal session rechecks (`recheckSessions`).
+ * - every 60 s: browser terminal session rechecks (`recheckSessions`) and
+ *   live transcription session rechecks (credential, model, member).
  *
  * - on stop: the agent audit queue is flushed (`stopCliAgentAuditWriter`), so
  *   events recorded so far reach the database before the relay sessions close
@@ -31,6 +32,8 @@ export type RelayMaintenanceDeps = {
   };
   sweepExpiredTokenCommands: () => void;
   terminalHub: { recheckSessions(): Promise<unknown> };
+  /** Live transcription sessions: credential, model access and member (60 s). */
+  realtimeSessions?: { recheckSessions(): Promise<unknown> };
   /** Flushes the agent audit queue at stop (see ./relay/cli-agent-audit.ts). */
   stopCliAgentAudit?: () => Promise<void>;
   /** Flushes the deployment operator audit queue at stop (../deployments/operator-audit.ts). */
@@ -86,6 +89,10 @@ export function startRelayMaintenance(deps: RelayMaintenanceDeps): () => Promise
     }, CLI_COMMAND_SWEEP_INTERVAL_MS),
     schedule(() => {
       track(() => deps.terminalHub.recheckSessions(), "[server] terminal session recheck failed");
+      const realtime = deps.realtimeSessions;
+      if (realtime) {
+        track(() => realtime.recheckSessions(), "[server] realtime session recheck failed");
+      }
     }, TERMINAL_SESSION_RECHECK_INTERVAL_MS),
   ];
   return async () => {

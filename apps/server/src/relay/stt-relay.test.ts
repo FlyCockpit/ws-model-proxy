@@ -411,6 +411,19 @@ describe("pre-open failover", () => {
     expect(hub.stats().legs).toBe(0);
   });
 
+  it("treats a non-finite open budget as the default, never an immediate timeout", async () => {
+    const { link, create } = setup();
+    link("cli-a");
+    for (const openTimeoutMs of [Number.NaN, Number.POSITIVE_INFINITY]) {
+      const { session } = create();
+      const attempt = session.attach(target("cli-a"), { openTimeoutMs });
+      vi.advanceTimersByTime(STT_OPEN_TIMEOUT_MS - 1);
+      expect(session.status).toBe("opening");
+      vi.advanceTimersByTime(1);
+      expect(await attempt).toMatchObject({ reason: "timeout" });
+    }
+  });
+
   it("honours a shorter per-attempt open budget and caps a longer one", async () => {
     const { link, create } = setup();
     link("cli-a");

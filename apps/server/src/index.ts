@@ -26,6 +26,7 @@ import {
   startProviderAttemptExpiry,
 } from "./model-api/provider-attempt-lifecycle.js";
 import { startProviderBudgetRepair } from "./model-api/provider-budget-runtime.js";
+import { realtimeSessionRegistry } from "./model-api/realtime/registry.js";
 import { startRelayTelemetryRecovery } from "./model-api/relay-telemetry-recovery.js";
 import { startUsageRetention } from "./model-api/usage-retention.js";
 import { warnMissingProviderCredentialKeyring } from "./provider-keyring-startup.js";
@@ -34,7 +35,7 @@ import { sweepExpiredTokenCommands } from "./relay/cli-commands.js";
 import { sweepExpiredFileOps } from "./relay/cli-file-ops.js";
 import { stopEngineLoadRollup } from "./relay/engine-load-rollup.js";
 import { stopNodeMetricsRollup } from "./relay/node-metrics-rollup.js";
-import { RELAY_SUBPROTOCOL, RELAY_WS_MAX_PAYLOAD_BYTES } from "./relay/protocol.js";
+import { RELAY_WS_MAX_PAYLOAD_BYTES } from "./relay/protocol.js";
 import { relaySessionManager } from "./relay/session-manager.js";
 import { terminalBrowserHub } from "./relay/terminal-websocket.js";
 import { startRelayMaintenance } from "./relay-maintenance.js";
@@ -43,6 +44,7 @@ import { configureHttpServerTimeouts } from "./server-timeouts.js";
 import { startSessionCleanup } from "./session-cleanup.js";
 import { runStartupCapacityRepairs } from "./startup-capacity-repairs.js";
 import { createUserDeletionSweepClient, startUserDeletionSweep } from "./user-deletion-sweep.js";
+import { selectWebSocketSubprotocol } from "./websocket-subprotocols.js";
 
 // ---------------------------------------------------------------------------
 // Startup guards
@@ -139,8 +141,8 @@ const server = serve(
       server: new WebSocketServer({
         noServer: true,
         maxPayload: RELAY_WS_MAX_PAYLOAD_BYTES,
-        handleProtocols(protocols) {
-          return protocols.has(RELAY_SUBPROTOCOL) ? RELAY_SUBPROTOCOL : false;
+        handleProtocols(protocols, request) {
+          return selectWebSocketSubprotocol(protocols, request.url);
         },
       }),
     },
@@ -218,6 +220,7 @@ const stopRelayMaintenance = startRelayMaintenance({
     sweepExpiredFileOps();
   },
   terminalHub: terminalBrowserHub,
+  realtimeSessions: realtimeSessionRegistry,
   stopCliAgentAudit: stopCliAgentAuditWriter,
   stopDeploymentOperatorAudit: stopDeploymentOperatorAuditWriter,
 });
@@ -254,6 +257,7 @@ installServerShutdown({
   flushAgentAudit: flushCliAgentAudit,
   flushDeploymentOperatorAudit,
   terminalHub: terminalBrowserHub,
+  realtimeSessions: realtimeSessionRegistry,
   server,
   capacityLifecycle,
   closeDiagnosticsCapacityRuntime,

@@ -549,10 +549,13 @@ export class SttRelaySession {
     this.state = "opening";
     this.adapter = realtime.adapter;
     this.maxItemSeconds = maxItemSeconds;
-    const openTimeoutMs = Math.max(
-      1,
-      Math.min(STT_OPEN_TIMEOUT_MS, Math.floor(options.openTimeoutMs ?? STT_OPEN_TIMEOUT_MS)),
-    );
+    // A non-finite budget (NaN, Infinity) falls back to the default; it must
+    // never become an immediate timer.
+    const requested = options.openTimeoutMs;
+    const openTimeoutMs =
+      requested !== undefined && Number.isFinite(requested)
+        ? Math.max(1, Math.min(STT_OPEN_TIMEOUT_MS, Math.floor(requested)))
+        : STT_OPEN_TIMEOUT_MS;
     leg.timer = startTimer(openTimeoutMs, () =>
       this.openFailed(leg, { reason: "timeout", failure: "timeout" }, "timeout"),
     );
