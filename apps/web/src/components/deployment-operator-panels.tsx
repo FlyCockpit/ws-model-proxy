@@ -223,8 +223,12 @@ export function PlanOperatorSteps({ contents }: { contents: unknown }) {
     >
       <p className="font-medium">{t("deployments.operatorRequired")}</p>
       <ul className="min-w-0 space-y-2" data-testid="plan-operator-steps">
-        {operatorSteps.map((step) => (
-          <li key={`${step.instanceId ?? "new"}:${step.rank}:${step.action}`} className="min-w-0">
+        {operatorSteps.map((step, index) => (
+          // Every new group's steps have no instance yet: the row index keeps keys unique.
+          <li
+            key={`${index}:${step.instanceId ?? "new"}:${step.nodeId}:${step.rank}:${step.action}`}
+            className="min-w-0"
+          >
             <p className="break-words">
               {t(
                 step.instanceId ? "deploymentOperator.planStopStep" : "deploymentOperator.planStep",

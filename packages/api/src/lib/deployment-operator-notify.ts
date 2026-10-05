@@ -4,6 +4,8 @@ import type defaultPrisma from "@ws-model-proxy/db";
 export const DEPLOYMENT_NEED_EMAIL_DELAY_MS = 120_000;
 /** At most one notice per instance in this window, however often its need comes and goes. */
 export const DEPLOYMENT_NEED_EMAIL_INTERVAL_MS = 6 * 60 * 60 * 1000;
+/** A claimed notice whose send failed is tried again after this, not after the full interval. */
+export const DEPLOYMENT_NEED_EMAIL_RETRY_MS = 10 * 60 * 1000;
 const BATCH = 32;
 
 type NotifyDb = Pick<typeof defaultPrisma, "deploymentInstance">;
@@ -15,7 +17,8 @@ type SendEmail = (message: { to: string; subject: string; html: string }) => Pro
  * `needsOperatorNotifiedAt`, so one replica sends it, at most once per need and per
  * {@link DEPLOYMENT_NEED_EMAIL_INTERVAL_MS}, and only after the need lasted
  * {@link DEPLOYMENT_NEED_EMAIL_DELAY_MS}. Best effort: a failed send is logged by error class
- * only (transport errors can carry addresses) and not retried. Inactive owners and unverified
+ * only (transport errors can carry addresses) and its claim is moved back so the notice is due
+ * again after {@link DEPLOYMENT_NEED_EMAIL_RETRY_MS}. Inactive owners and unverified
  * addresses get nothing. Returns how many notices were sent.
  */
 export async function notifyDeploymentOperatorNeeds({
@@ -23,12 +26,18 @@ export async function notifyDeploymentOperatorNeeds({
   now = new Date(),
   send,
   configured,
+  shouldStop = () => false,
 }: {
   db: NotifyDb;
   now?: Date;
   send?: SendEmail;
   /** Defaults to the mailer's own check (SMTP_HOST set). */
   configured?: boolean;
+  /**
+   * Checked before each claim (the caller's shutdown): once true, nothing more is claimed or
+   * sent, so no mail goes out after the reconciler stopped.
+   */
+  shouldStop?: () => boolean;
 }): Promise<number> {
   // Nothing loads the mailer or the server env until SMTP is configured, so a process (or a
   // unit test) without either never evaluates them.
@@ -61,6 +70,7 @@ export async function notifyDeploymentOperatorNeeds({
   });
   let sent = 0;
   for (const instance of due) {
+    if (shouldStop()) break;
     if (!instance.needsOperator || !instance.needsOperatorSince) continue;
     const claimed = await db.deploymentInstance.updateMany({
       where: {
@@ -85,6 +95,20 @@ export async function notifyDeploymentOperatorNeeds({
     } catch (error) {
       const label = error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error;
       console.warn(`[deployments] needs-you email failed: ${label}`);
+      // Not lost for the whole interval: this claim is moved back so the notice becomes due
+      // again after DEPLOYMENT_NEED_EMAIL_RETRY_MS (guarded: only this run's own claim).
+      await db.deploymentInstance
+        .updateMany({
+          where: { id: instance.id, needsOperatorNotifiedAt: now },
+          data: {
+            needsOperatorNotifiedAt: new Date(
+              now.getTime() - DEPLOYMENT_NEED_EMAIL_INTERVAL_MS + DEPLOYMENT_NEED_EMAIL_RETRY_MS,
+            ),
+          },
+        })
+        .catch(() => {
+          console.warn("[deployments] needs-you retry release failed");
+        });
     }
   }
   return sent;

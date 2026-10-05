@@ -5,6 +5,8 @@ vi.mock("@ws-model-proxy/env/shared", () => ({ env: {} }));
 
 import {
   DEPLOYMENT_NEED_EMAIL_DELAY_MS,
+  DEPLOYMENT_NEED_EMAIL_INTERVAL_MS,
+  DEPLOYMENT_NEED_EMAIL_RETRY_MS,
   notifyDeploymentOperatorNeeds,
 } from "./deployment-operator-notify";
 
@@ -84,5 +86,43 @@ describe("needs-you email notices", () => {
     ).toBe(0);
     expect(warn).toHaveBeenCalledWith("[deployments] needs-you email failed: Error");
     warn.mockRestore();
+  });
+
+  it("moves a failed send's claim back so the notice is retried soon, not in 6 hours", async () => {
+    const db = fakeDb([row]);
+    const send = vi.fn().mockRejectedValue(new Error("smtp down"));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await notifyDeploymentOperatorNeeds({ db: db as never, now, send, configured: true });
+    warn.mockRestore();
+    expect(db.deploymentInstance.updateMany).toHaveBeenCalledTimes(2);
+    expect(db.deploymentInstance.updateMany.mock.calls[1]?.[0]).toEqual({
+      // Only this run's own claim.
+      where: { id: "instance", needsOperatorNotifiedAt: now },
+      data: {
+        needsOperatorNotifiedAt: new Date(
+          now.getTime() - DEPLOYMENT_NEED_EMAIL_INTERVAL_MS + DEPLOYMENT_NEED_EMAIL_RETRY_MS,
+        ),
+      },
+    });
+  });
+
+  it("claims and sends nothing once its caller stops", async () => {
+    const db = fakeDb([row, { ...row, id: "second" }]);
+    let stopping = false;
+    const send = vi.fn().mockImplementation(async () => {
+      // Shutdown begins while the first notice is being sent.
+      stopping = true;
+    });
+    expect(
+      await notifyDeploymentOperatorNeeds({
+        db: db as never,
+        now,
+        send,
+        configured: true,
+        shouldStop: () => stopping,
+      }),
+    ).toBe(1);
+    expect(db.deploymentInstance.updateMany).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(1);
   });
 });

@@ -26,6 +26,7 @@ import {
 } from "@ws-model-proxy/config/deployment-protocol";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
+import { isDbShutdownFenceArmed } from "@ws-model-proxy/db/shutdown-fence";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import { z } from "zod";
 import { MANAGED_IDENTITY_REFUSED } from "./managed-identity.js";
@@ -1411,7 +1412,13 @@ export class DeploymentReconciler {
     const now = Date.now();
     if (now - this.lastNeedsEmailAt < NEEDS_EMAIL_INTERVAL_MS) return;
     this.lastNeedsEmailAt = now;
-    void this.track(notifyDeploymentOperatorNeeds({ db: this.db })).catch(() => {
+    void this.track(
+      notifyDeploymentOperatorNeeds({
+        db: this.db,
+        // No claim (and no mail) once the reconciler stops or the DB shutdown fence is armed.
+        shouldStop: () => this.stopped || isDbShutdownFenceArmed(),
+      }),
+    ).catch(() => {
       console.error("[deployments] needs-you notices failed");
     });
   }

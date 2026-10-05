@@ -558,6 +558,43 @@ describe("managed inference dashboard", () => {
     expect(screen.getByText("deploymentOperator.moreSteps")).toBeTruthy();
   });
 
+  it("keys every new group's operator steps apart", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const groupStep = (nodeId: string) => ({
+      instanceId: null,
+      nodeId,
+      rank: 0,
+      action: "start",
+      command: "sudo start",
+      nodeReady: true,
+    });
+    state.data.pending = { items: [{ id: "plan-groups" }], nextCursor: null };
+    state.data.plan = {
+      id: "plan-groups",
+      state: "AWAITING_CONFIRMATION",
+      contents: {
+        action: "start",
+        stopIds: [],
+        affectedNodeIds: ["node-a", "node-b"],
+        start: { revisionId: "rev", variantKey: "one" },
+        warnings: ["interactive_operator_required"],
+        // Two groups: both start on rank 0 and have no instance yet.
+        operatorSteps: [groupStep("node-a"), groupStep("node-b"), groupStep("node-a")],
+        operatorStepCount: 3,
+      },
+      preview: { start: { commands: [] }, agentEdited: false, stopped: [] },
+    };
+    const user = userEvent.setup();
+    show();
+    await user.click(
+      await screen.findByRole("button", { name: /deployments.reviewPlan.*plan-groups/ }),
+    );
+    const steps = await screen.findByTestId("plan-operator-steps");
+    expect(within(steps).getAllByText("deploymentOperator.planStep")).toHaveLength(3);
+    expect(error.mock.calls.some((call) => String(call[0]).includes("same key"))).toBe(false);
+    error.mockRestore();
+  });
+
   it("warns after saving about interactive marks that never take effect", async () => {
     state.data.create = {
       id: "saved",
