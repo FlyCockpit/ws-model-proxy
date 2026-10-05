@@ -116,4 +116,51 @@ describe("deployment recipe text", () => {
     expect(accepts({ readiness: { path: "/health\u0000" } })).toBe(false);
     expect(accepts({ readiness: { path: "/v1/models" } })).toBe(true);
   });
+
+  it("accepts a speech-to-text recipe and keeps embedding contracts to embedding recipes", () => {
+    expect(accepts({ attachment: { type: "transcription", poolId: "pool" } })).toBe(true);
+    expect(
+      accepts({
+        attachment: {
+          type: "transcription",
+          poolId: "pool",
+          embeddingContract: {
+            model: "e",
+            revision: "1",
+            dimensions: 8,
+            normalization: "l2",
+            vectorSpace: "s",
+          },
+        },
+      }),
+    ).toBe(false);
+    expect(accepts({ attachment: { type: "speech", poolId: "pool" } })).toBe(false);
+  });
+
+  it("takes a bounded transcription profile on transcription recipes only", () => {
+    const profile = {
+      languages: ["en", "es-MX"],
+      responseFormats: ["json", "verbose_json"],
+      timestampGranularities: ["word"],
+      maxUploadBytes: 26_214_400,
+      acceptedMimeTypes: ["audio/wav", "audio/x-m4a"],
+    };
+    expect(
+      accepts({ attachment: { type: "transcription", poolId: "pool", transcription: profile } }),
+    ).toBe(true);
+    expect(accepts({ attachment: { type: "llm", poolId: "pool", transcription: profile } })).toBe(
+      false,
+    );
+    for (const bad of [
+      { languages: ["en us"] },
+      { languages: Array.from({ length: 129 }, (_, i) => `l${i}`) },
+      { acceptedMimeTypes: ["audio/wav;rate=1"] },
+      { maxUploadBytes: 0 },
+      { unknown: true },
+    ])
+      expect(
+        accepts({ attachment: { type: "transcription", poolId: "pool", transcription: bad } }),
+        JSON.stringify(bad).slice(0, 40),
+      ).toBe(false);
+  });
 });

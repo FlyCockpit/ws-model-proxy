@@ -56,6 +56,7 @@ fn job(action: Action) -> Job {
         engine: Engine::Other,
         management: Management::OwnedProcess,
         embedding_contract: None,
+        transcription_profile: None,
         command: "sleep 30".into(),
         stop_command: Some("true".into()),
         status_command: None,
@@ -363,6 +364,91 @@ fn embedding_contract_and_engine_declaration_do_not_invent_native_count() {
         assert!(!activation_supported(Action::Start, mechanism));
         assert!(activation_supported(Action::Stop, mechanism));
     }
+}
+
+#[test]
+fn transcription_recipe_advertises_its_profile_as_the_server_golden() {
+    let mut transcription = job(Action::Start);
+    transcription.attachment = "transcription".into();
+    transcription.transcription_profile = Some(TranscriptionProfile {
+        response_formats: Some(vec!["json".into(), "verbose_json".into(), "text".into()]),
+        timestamp_granularities: Some(vec!["word".into()]),
+        languages: Some(vec!["en".into(), "es".into()]),
+        language_detection: Some(true),
+        max_upload_bytes: Some(26_214_400),
+        accepted_mime_types: Some(vec!["audio/wav".into(), "audio/mpeg".into()]),
+        ..Default::default()
+    });
+    assert!(transcription.validate().is_ok());
+    let endpoint = endpoint_for(&transcription);
+    assert!(endpoint.default_capabilities.chat_completions.is_none());
+    assert!(endpoint.default_capabilities.embeddings.is_none());
+    let inventory =
+        crate::protocol::endpoint_inventory(&endpoint, crate::protocol::EndpointStatus::Online);
+    let actual = serde_json::to_value(inventory).expect("inventory");
+    // The server parses this exact payload (apps/server/src/deployments/inventory-wire.test.ts).
+    let golden = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/relay-current/transcription-endpoint.json"
+    );
+    if std::env::var_os("WSMP_UPDATE_GOLDEN").is_some() {
+        std::fs::write(
+            golden,
+            serde_json::to_string_pretty(&actual).expect("json") + "\n",
+        )
+        .expect("write golden");
+    }
+    let expected: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(golden).expect("golden")).expect("json");
+    assert_eq!(actual, expected);
+    let capabilities = &actual["defaultCapabilities"];
+    // Version 2 is the first that carries a detailed transcription profile.
+    assert_eq!(capabilities["version"], 2);
+    assert_eq!(capabilities["audio"]["transcriptions"]["streaming"], true);
+
+    let mut misplaced = job(Action::Start);
+    misplaced.transcription_profile = Some(TranscriptionProfile::default());
+    assert!(
+        misplaced.validate().is_err(),
+        "a profile needs a transcription attachment"
+    );
+    let mut unknown = job(Action::Start);
+    unknown.attachment = "speech".into();
+    assert!(unknown.validate().is_err());
+}
+
+#[test]
+fn a_maximal_transcription_endpoint_fits_one_control_frame() {
+    let token = |i: usize| format!("{i:0>64}");
+    let mut transcription = job(Action::Start);
+    transcription.attachment = "transcription".into();
+    // vLLM also sends the profile once more as probe suggestions.
+    transcription.engine = Engine::Vllm;
+    transcription.models = (0..64)
+        .map(|i| format!("{}{i:0>3}", "m".repeat(253)))
+        .collect();
+    transcription.transcription_profile = Some(TranscriptionProfile {
+        streaming: Some(true),
+        response_formats: Some((0..8).map(token).collect()),
+        timestamp_granularities: Some((0..4).map(token).collect()),
+        diarization: Some(true),
+        languages: Some((0..128).map(token).collect()),
+        language_detection: Some(true),
+        multiple_language_hints: Some(true),
+        max_upload_bytes: Some(i32::MAX as u64),
+        accepted_mime_types: Some((0..16).map(token).collect()),
+    });
+    assert!(transcription.validate().is_ok());
+    let inventory = crate::protocol::endpoint_inventory(
+        &endpoint_for(&transcription),
+        crate::protocol::EndpointStatus::Online,
+    );
+    let bytes = serde_json::to_vec(&inventory).expect("inventory").len();
+    // Fits one relay control frame with room for the hello or update around it.
+    assert!(
+        bytes < crate::protocol::RELAY_JSON_CONTROL_MAX_BYTES * 3 / 4,
+        "{bytes} bytes"
+    );
 }
 
 #[test]

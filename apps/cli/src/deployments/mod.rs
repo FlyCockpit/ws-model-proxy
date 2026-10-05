@@ -107,6 +107,55 @@ pub struct EmbeddingContract {
     pub vector_space: String,
 }
 
+/// What a recipe-deployed speech-to-text server accepts beyond plain JSON
+/// requests (the server bounds these lists; `validate` re-checks them).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TranscriptionProfile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_formats: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_granularities: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diarization: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub languages: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language_detection: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multiple_language_hints: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_upload_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_mime_types: Option<Vec<String>>,
+}
+
+impl TranscriptionProfile {
+    fn valid(&self) -> bool {
+        let tokens = |values: &Option<Vec<String>>, max: usize| {
+            values.as_ref().is_none_or(|values| {
+                values.len() <= max
+                    && values.iter().all(|value| {
+                        !value.is_empty()
+                            && value.len() <= 64
+                            && value
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b"_.+/-".contains(&b))
+                    })
+            })
+        };
+        tokens(&self.response_formats, 8)
+            && tokens(&self.timestamp_granularities, 4)
+            && tokens(&self.languages, 128)
+            && tokens(&self.accepted_mime_types, 16)
+            && self
+                .max_upload_bytes
+                .is_none_or(|bytes| bytes > 0 && bytes <= (i32::MAX as u64))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Readiness {
@@ -141,6 +190,8 @@ pub struct Job {
     pub management: Management,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embedding_contract: Option<EmbeddingContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcription_profile: Option<TranscriptionProfile>,
     pub command: String,
     #[serde(default)]
     pub stop_command: Option<String>,
@@ -205,7 +256,10 @@ impl Job {
             "bad deployment models"
         );
         anyhow::ensure!(
-            matches!(self.attachment.as_str(), "llm" | "embeddings"),
+            matches!(
+                self.attachment.as_str(),
+                "llm" | "embeddings" | "transcription"
+            ),
             "bad deployment attachment"
         );
         anyhow::ensure!(
@@ -253,6 +307,12 @@ impl Job {
                         .as_ref()
                         .is_some_and(|s| !s.trim().is_empty()),
                 "external service requires stop and status proof"
+            );
+        }
+        if let Some(profile) = &self.transcription_profile {
+            anyhow::ensure!(
+                self.attachment == "transcription" && profile.valid(),
+                "bad transcription profile"
             );
         }
         if let Some(contract) = &self.embedding_contract {
@@ -631,6 +691,7 @@ impl Executor {
                     && record.job.status_command == job.status_command
                     && record.job.attachment == job.attachment
                     && record.job.embedding_contract == job.embedding_contract
+                    && record.job.transcription_profile == job.transcription_profile
                     && record.job.models == job.models,
                 "deployment identity mismatch"
             );
@@ -1565,10 +1626,12 @@ pub fn managed_endpoints() -> Vec<crate::config::EndpointConfig> {
 }
 
 fn endpoint_for(job: &Job) -> crate::config::EndpointConfig {
-    let mut capabilities = if job.attachment == "embeddings" {
-        crate::config::OpenAiCompatibleCapabilities::embedding_defaults()
-    } else {
-        crate::config::OpenAiCompatibleCapabilities::openai_defaults()
+    let mut capabilities = match job.attachment.as_str() {
+        "embeddings" => crate::config::OpenAiCompatibleCapabilities::embedding_defaults(),
+        "transcription" => crate::config::OpenAiCompatibleCapabilities::transcription(
+            job.transcription_profile.as_ref(),
+        ),
+        _ => crate::config::OpenAiCompatibleCapabilities::openai_defaults(),
     };
     if let Some(embeddings) = capabilities.embeddings.as_mut() {
         embeddings.contract = job.embedding_contract.clone();
@@ -1589,7 +1652,10 @@ fn endpoint_for(job: &Job) -> crate::config::EndpointConfig {
             .iter()
             .map(|model| crate::config::ModelConfig {
                 upstream_model_id: model.clone(),
-                capabilities: Some(capabilities.clone()),
+                // A transcription profile can be large; per-model copies are
+                // read only in override mode, so the endpoint default alone
+                // carries it (64 models x 6.5 KB would overflow the frame).
+                capabilities: (job.attachment != "transcription").then(|| capabilities.clone()),
                 pinned: true,
                 ..Default::default()
             })

@@ -5,6 +5,7 @@ import {
 import { z } from "zod";
 import { embeddingContractSchema } from "./embedding-contract";
 import { nodeLabelsSchema } from "./node-inventory";
+import { transcriptionProfileSchema } from "./transcription-profile";
 
 /** Placeholders a command may use; anything else is refused when the recipe is saved. */
 export const DEPLOYMENT_PLACEHOLDERS = [
@@ -162,14 +163,19 @@ function variantSchema(strict: boolean) {
         .max(64),
       attachment: z
         .object({
-          type: z.enum(["llm", "embeddings"]),
+          type: z.enum(["llm", "embeddings", "transcription"]),
           poolId: strict ? deploymentIdSchema : z.string().min(1),
           embeddingContract: (strict ? savedEmbeddingContract : embeddingContractSchema).optional(),
+          transcription: transcriptionProfileSchema.optional(),
         })
         .strict()
         .refine(
           (a) => a.type === "embeddings" || !a.embeddingContract,
           "Embedding contracts require an embedding attachment.",
+        )
+        .refine(
+          (a) => a.type === "transcription" || !a.transcription,
+          "A transcription profile requires a transcription attachment.",
         ),
       weight: z.number().int().min(1).max(1000).default(1),
       hardConcurrencyLimit: z.number().int().min(1).max(10_000),

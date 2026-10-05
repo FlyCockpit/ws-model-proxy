@@ -1,14 +1,16 @@
 import { z } from "zod";
 import { embeddingContractSchema } from "./embedding-contract";
+import { transcriptionProfileSchema } from "./transcription-profile";
 
 /** Durable execution identity shared by admission and every reconciler effect. No defaults. */
 export const deploymentJobIntentSchema = z
   .object({
     type: z.literal("deployment.job"),
-    attachment: z.enum(["llm", "embeddings"]),
+    attachment: z.enum(["llm", "embeddings", "transcription"]),
     engine: z.enum(["vllm", "sglang", "llama.cpp", "other"]),
     management: z.enum(["ownedProcess", "externalService"]),
     embeddingContract: embeddingContractSchema.optional(),
+    transcriptionProfile: transcriptionProfileSchema.optional(),
     instanceId: z.string().min(1),
     revisionId: z.string().min(1),
     rank: z.number().int().min(0).max(63),

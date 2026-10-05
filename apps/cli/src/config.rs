@@ -911,6 +911,43 @@ impl OpenAiCompatibleCapabilities {
         }
     }
 
+    /// A speech-to-text server: transcriptions only, with the options its
+    /// recipe declares. Version 2 is the first that carries a detailed
+    /// transcription profile (version 1 accepts only a boolean there).
+    pub fn transcription(profile: Option<&crate::deployments::TranscriptionProfile>) -> Self {
+        let profile = profile.cloned().unwrap_or_default();
+        Self {
+            version: 2,
+            protocol: "openai-compatible".to_string(),
+            surfaces: None,
+            source: None,
+            confidence: None,
+            models: Some(ModelListCapabilities { list: Some(true) }),
+            chat_completions: None,
+            embeddings: None,
+            responses: None,
+            audio: Some(AudioCapabilities {
+                transcriptions: Some(AudioOperationCapabilities::Detailed(
+                    TranscriptionCapabilities {
+                        supported: Some(true),
+                        streaming: Some(profile.streaming.unwrap_or(true)),
+                        response_formats: profile.response_formats,
+                        timestamp_granularities: profile.timestamp_granularities,
+                        diarization: profile.diarization,
+                        languages: profile.languages,
+                        language_detection: profile.language_detection,
+                        multiple_language_hints: profile.multiple_language_hints,
+                        max_upload_bytes: profile.max_upload_bytes,
+                        accepted_mime_types: profile.accepted_mime_types,
+                    },
+                )),
+                translations: None,
+                speech: None,
+            }),
+            sampling: None,
+        }
+    }
+
     pub fn advertise_top_k(&mut self) {
         let sampling = self
             .sampling

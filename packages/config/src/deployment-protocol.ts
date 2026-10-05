@@ -21,7 +21,7 @@ export type DeploymentJob = {
   ownerEpoch: string;
   actor: "USER" | "AGENT";
   humanApproved: boolean;
-  attachment: "llm" | "embeddings";
+  attachment: "llm" | "embeddings" | "transcription";
   /** Explicit immutable recipe declaration; unknown engines remain other. */
   engine: "vllm" | "sglang" | "llama.cpp" | "other";
   /** Owned processes remain in the unit cgroup; external services require stop/status proof. */
@@ -32,6 +32,18 @@ export type DeploymentJob = {
     dimensions: number;
     normalization: "none" | "l2";
     vectorSpace: string;
+  };
+  /** Options a speech-to-text server accepts; advertised for routing. */
+  transcriptionProfile?: {
+    streaming?: boolean;
+    responseFormats?: string[];
+    timestampGranularities?: string[];
+    diarization?: boolean;
+    languages?: string[];
+    languageDetection?: boolean;
+    multipleLanguageHints?: boolean;
+    maxUploadBytes?: number;
+    acceptedMimeTypes?: string[];
   };
   command: string;
   stopCommand?: string;

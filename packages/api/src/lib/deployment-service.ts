@@ -421,6 +421,9 @@ function jobIntent(
     ...(variant.attachment.embeddingContract
       ? { embeddingContract: variant.attachment.embeddingContract }
       : {}),
+    ...(variant.attachment.transcription
+      ? { transcriptionProfile: variant.attachment.transcription }
+      : {}),
     revisionId: instance.revisionId,
     instanceId: instance.id,
     rank: p.rank,

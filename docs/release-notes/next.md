@@ -228,6 +228,20 @@ assignment provenance and automatic concurrency seed columns.
   across revisions, so editing one field does not relabel the rest), the
   dashboard shows them for review and asks for confirmation first.
 
+- **Speech-to-text recipes.** A recipe's `attachment.type` can be `llm`,
+  `embeddings` or `transcription`. A transcription deployment joins its pool
+  as a speech-to-text model for `/audio/transcriptions`, including streamed
+  results. Without a profile it receives plain JSON requests; declare an
+  optional `attachment.transcription` profile (languages, response formats,
+  timestamp granularities, diarization, language detection, upload size and
+  MIME types) so requests that use those options route to it — and note that
+  a profile also narrows what it accepts (for example a lower upload limit).
+  Agents create these recipes through the MCP recipe tools like any other.
+  Upgrade every CLI before starting one: an older CLI refuses a transcription
+  job, and with a profile it cannot read the job at all, so the start fails
+  only at its deadline (up to 15 minutes). After downgrading a CLI that ran
+  one, remove its deployment state file.
+
 ## Fixed
 
 - **A disconnect that arrives just after a CLI reconnects no longer re-opens

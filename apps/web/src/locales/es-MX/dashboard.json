@@ -59,7 +59,7 @@
     "pool": "Pool de destino",
     "choose": "Elige…",
     "spec": "Especificación de receta (JSON)",
-    "specHint": "Cada variante requiere key, engine, groupSize, resources medidos en GiB, commands (management, start, stop), readiness, models, attachment {type, poolId} y hardConcurrencyLimit. management es ownedProcess o externalService; externalService también requiere status (salida 0: activo, salida 3: detenido). Los grupos de varios nodos requieren iface. No pegues credenciales.",
+    "specHint": "Cada variante requiere key, engine, groupSize, resources medidos en GiB, commands (management, start, stop), readiness, models, attachment {type, poolId} y hardConcurrencyLimit. attachment.type es llm, embeddings o transcription (voz a texto); un attachment transcription puede añadir un perfil transcription (languages, responseFormats, timestampGranularities, maxUploadBytes, ...) para que le lleguen las solicitudes que usan esas opciones. management es ownedProcess o externalService; externalService también requiere status (salida 0: activo, salida 3: detenido). Los grupos de varios nodos requieren iface. No pegues credenciales.",
     "invalid": "Revisa campos obligatorios e intervalos permitidos.",
     "invalidSpec": "JSON o esquema de receta inválido. Revisa cada variante, recurso, comando y destino.",
     "saveRecipe": "Guardar nueva revisión",
