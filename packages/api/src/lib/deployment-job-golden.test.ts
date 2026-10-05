@@ -158,7 +158,13 @@ function generate() {
   });
   const j = jobs.interactiveStart;
   const results = {
-    interactiveRefused: result(j, { status: "failed", error: "interactive_unsupported" }),
+    // Every result of an interactive job names its dispatch's terminal, finals included.
+    interactiveRefused: result(j, {
+      status: "failed",
+      error: "interactive_unsupported",
+      terminalId: TERMINAL_ID,
+    }),
+    operatorSucceeded: result(j, { status: "succeeded", terminalId: TERMINAL_ID }),
     stopInteractiveRefused: result(jobs.stopInteractiveStart, {
       status: "failed",
       error: "interactive_unsupported",

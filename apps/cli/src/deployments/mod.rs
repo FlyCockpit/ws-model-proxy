@@ -497,7 +497,9 @@ pub struct JobResult {
     pub stopped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// 2.11 operator progress only: the job's `operator.terminalId`.
+    /// 2.11: the job's `operator.terminalId`, on every result of an interactive
+    /// job (progress and final), so the server binds a final to the dispatch
+    /// it answers and a late answer to an earlier copy settles nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_id: Option<String>,
     /// 2.11 `operator_closed` only: the last attempt's exit code.
@@ -533,9 +535,17 @@ impl JobResult {
             status: if succeeded { "succeeded" } else { "failed" }.into(),
             stopped,
             error: error.map(str::to_owned),
-            terminal_id: None,
+            terminal_id: job.operator.as_ref().map(|op| op.terminal_id.clone()),
             exit_code: None,
         }
+    }
+
+    /// A remembered final answering a later delivery of the same step: it
+    /// carries that delivery's owner epoch and operator terminal.
+    fn answering(mut self, job: &Job) -> Self {
+        self.owner_epoch = job.owner_epoch.clone();
+        self.terminal_id = job.operator.as_ref().map(|op| op.terminal_id.clone());
+        self
     }
 
     /// `operator_closed` with `error = code` for an operator terminal that
@@ -952,9 +962,7 @@ impl Executor {
                         );
                     }
                 }
-                let mut result = done.result.clone();
-                result.owner_epoch = job.owner_epoch.clone();
-                return Ok(Execution::Done(result));
+                return Ok(Execution::Done(done.result.clone().answering(job)));
             }
             if let Some(pending) = &record.pending {
                 anyhow::ensure!(
@@ -1386,9 +1394,7 @@ impl Executor {
             .and_then(|record| record.completed.get(&job.step_id))
             .filter(|done| done.hash == job.intent_hash)
         {
-            let mut result = done.result.clone();
-            result.owner_epoch = job.owner_epoch.clone();
-            return result;
+            return done.result.clone().answering(job);
         }
         if !self.operator_pending(job) {
             return JobResult::failure(job, "execution_unconfirmed");

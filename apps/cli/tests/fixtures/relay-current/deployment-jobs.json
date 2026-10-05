@@ -164,7 +164,19 @@
       "ownerEpoch": "3f2b8c1e-1d2a-4c3b-9e8f-0a1b2c3d4e5f:7",
       "stopped": false,
       "status": "failed",
-      "error": "interactive_unsupported"
+      "error": "interactive_unsupported",
+      "terminalId": "AAECAwQFBgcICQoLDA0ODw"
+    },
+    "operatorSucceeded": {
+      "type": "deployment.job.result",
+      "stepId": "tz4a98xxat96iws9zmbrgj3b",
+      "instanceId": "cm9instancefixture000000a",
+      "rank": 0,
+      "intentHash": "e4ee672f2e093c24782ec4f25a276e7dfd5a61f58f2a25edba35bce803ba58e7",
+      "ownerEpoch": "3f2b8c1e-1d2a-4c3b-9e8f-0a1b2c3d4e5f:7",
+      "stopped": false,
+      "status": "succeeded",
+      "terminalId": "AAECAwQFBgcICQoLDA0ODw"
     },
     "stopInteractiveRefused": {
       "type": "deployment.job.result",

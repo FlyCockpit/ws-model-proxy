@@ -825,6 +825,11 @@ export class RelaySessionManager {
       // Inventory counts only for the generation that committed it; an in-place generation
       // change (a newer hello settled under this session) requires fresh inventory.
       inventoryComplete: session.deploymentInventoryGeneration === session.connectionGeneration,
+      // The reconciler claims interactive steps only where the send below would go through.
+      deploymentOperator: this.deploymentTerminalPolicyAllows(session),
+      operatorRoom:
+        session.operatorSteps.size < OPERATOR_STEPS_PER_SESSION ||
+        [...session.operatorSteps.values()].some((tracker) => tracker.cancelled),
     };
   }
   sendDeploymentJob(socket: DeploymentSocket, job: DeploymentJob) {
@@ -1099,6 +1104,9 @@ export class RelaySessionManager {
     const tracker = session.operatorSteps.get(result.stepId);
     if (
       tracker === undefined ||
+      // A final names its dispatch's terminal: a late answer to an earlier copy of the step
+      // must not end (or be audited against) the current terminal.
+      tracker.terminalId !== result.terminalId ||
       tracker.intentHash !== result.intentHash ||
       tracker.ownerEpoch !== result.ownerEpoch ||
       tracker.instanceId !== result.instanceId ||

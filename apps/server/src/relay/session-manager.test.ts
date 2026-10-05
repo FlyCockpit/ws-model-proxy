@@ -3100,6 +3100,8 @@ describe("relay terminal viewers", () => {
     const { manager, socket } = await setup();
     const target = manager.deploymentSocket("cli-device-id");
     expect(target).toBeTruthy();
+    // No `deploymentOperator` feature: the reconciler never claims interactive steps here.
+    expect(target?.deploymentOperator).toBe(false);
     const job = { type: "deployment.job" } as unknown as Parameters<
       typeof manager.sendDeploymentJob
     >[1];
@@ -3205,7 +3207,6 @@ describe("relay terminal viewers", () => {
           JSON.stringify({
             ...golden.results.awaitingOperator,
             status,
-            ...(status === "succeeded" || status === "failed" ? { terminalId: undefined } : {}),
             ...fields,
           }),
           now,
@@ -3472,6 +3473,20 @@ describe("relay terminal viewers", () => {
       expect(outcomes()).toEqual(["opened"]);
     });
 
+    it("a final naming another terminal of the step leaves the current one alone", async () => {
+      const { manager, target, result, report } = await operatorSetup();
+      expect(manager.sendDeploymentJob(target, start)).toBe(true);
+      await report("awaiting_operator");
+      // A late answer to an earlier copy of the step (another terminal id).
+      await report("failed", { terminalId: "BBECAwQFBgcICQoLDA0ODw", error: "state_unavailable" });
+      expect(manager.hasTerminal(terminalId)).toBe(true);
+      expect(outcomes()).toEqual(["opened"]);
+      await report("succeeded");
+      expect(manager.hasTerminal(terminalId)).toBe(false);
+      expect(outcomes()).toEqual(["opened", "succeeded"]);
+      expect(result).toHaveBeenCalledTimes(3);
+    });
+
     it("caps tracked steps per session; a cancelled one gives way only on a successful send", async () => {
       const { manager, socket, target } = await operatorSetup();
       const job = (n: number) =>
@@ -3480,10 +3495,14 @@ describe("relay terminal viewers", () => {
           stepId: `step-${n}`,
           operator: { terminalId: id16(100 + n), commandAuthor: "user" },
         }) as Job;
+      // The reconciler sees the capability and the room before it claims a step.
+      expect(target).toMatchObject({ deploymentOperator: true, operatorRoom: true });
       for (let n = 0; n < OPERATOR_STEPS_PER_SESSION; n += 1)
         expect(manager.sendDeploymentJob(target, job(n))).toBe(true);
+      expect(manager.deploymentSocket("cli-device-id")?.operatorRoom).toBe(false);
       expect(manager.sendDeploymentJob(target, job(OPERATOR_STEPS_PER_SESSION))).toBe(false);
       expect(manager.closeDeploymentOperatorStep("step-0")).toBe("closed");
+      expect(manager.deploymentSocket("cli-device-id")?.operatorRoom).toBe(true);
       // A failed send keeps the cancelled tracker: its operator_closed still routes.
       socket.send = () => {
         throw new Error("socket gone");

@@ -749,7 +749,10 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
         .string()
         .regex(/^[a-z0-9_]{1,64}$/)
         .optional(),
-      /** 2.11 operator progress: the job's `operator.terminalId`. */
+      /**
+       * 2.11: the job's `operator.terminalId`. Required on operator progress; also on every
+       * final (`succeeded`/`failed`) of an interactive job, which binds it to its dispatch.
+       */
       terminalId: base64Url16ByteSchema.optional(),
       /** 2.11 `operator_closed`: the last attempt's exit code. */
       exitCode: z.number().int().min(0).max(255).optional(),
@@ -757,11 +760,15 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
     .strict()
     .superRefine((result, ctx) => {
       const operator = deploymentOperatorResultStatus(result.status);
-      if (operator !== (result.terminalId !== undefined))
+      if (
+        operator
+          ? result.terminalId === undefined
+          : result.status === "running" && result.terminalId !== undefined
+      )
         ctx.addIssue({
           code: "custom",
           path: ["terminalId"],
-          message: "terminalId is present exactly on operator statuses.",
+          message: "terminalId is present on operator statuses and interactive finals only.",
         });
       if (result.exitCode !== undefined && result.status !== "operator_closed")
         ctx.addIssue({

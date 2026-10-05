@@ -127,7 +127,10 @@ export type DeploymentJobResult = {
   stopped: boolean;
   /** Operational failure codes only: never persist command output/model content. */
   error?: string;
-  /** 2.11: present exactly on the operator statuses; equals the job's `operator.terminalId`. */
+  /**
+   * 2.11: the job's `operator.terminalId`. Present on the operator statuses and on every
+   * final (`succeeded`/`failed`) of an interactive job, binding it to the dispatch it answers.
+   */
   terminalId?: string;
   /** 2.11, `operator_closed` only: the last attempt's exit code, absent when nothing ran. */
   exitCode?: number;

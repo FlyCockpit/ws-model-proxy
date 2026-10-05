@@ -1511,6 +1511,25 @@ fn current_job_wire_matches_shared_golden() {
         )),
         results["stopInteractiveRefused"]
     );
+    // Finals of an interactive job are bound to its dispatch's terminal; a
+    // remembered final answers a later delivery under that delivery's ids.
+    let succeeded = JobResult::new(&interactive, true, false, None);
+    assert_eq!(encode(&succeeded), results["operatorSucceeded"]);
+    let mut later = interactive.clone();
+    later.owner_epoch = "later:2".into();
+    if let Some(operator) = later.operator.as_mut() {
+        operator.terminal_id = "BBECAwQFBgcICQoLDA0ODw".into();
+    }
+    let answered = succeeded.clone().answering(&later);
+    assert_eq!(answered.owner_epoch, "later:2");
+    assert_eq!(
+        answered.terminal_id.as_deref(),
+        Some("BBECAwQFBgcICQoLDA0ODw")
+    );
+    assert_eq!(
+        JobResult::new(&golden_job("plainStart"), true, false, None).terminal_id,
+        None
+    );
     for (progress, name) in [
         (OperatorProgress::Awaiting, "awaitingOperator"),
         (OperatorProgress::Running, "operatorRunning"),
@@ -1597,7 +1616,12 @@ fn interactive_jobs_are_refused_before_any_state_or_launch() {
             assert_eq!(result.status, "failed", "{name}");
             assert_eq!(result.error.as_deref(), Some(INTERACTIVE_UNSUPPORTED));
             assert!(!result.stopped);
-            assert_eq!(result.terminal_id, None);
+            // A final names the job's operator terminal, if it had one.
+            let job = golden_job(name);
+            assert_eq!(
+                result.terminal_id.as_deref(),
+                job.operator.as_ref().map(|op| op.terminal_id.as_str())
+            );
         }
     }
     assert_eq!(runtime.launches.get(), 0);

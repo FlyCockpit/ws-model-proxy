@@ -173,11 +173,13 @@ describe("current deployment job / result golden shared with the Rust decoder", 
       expect(parseRelayClientControlFrame(JSON.stringify(result)), name).toEqual(result);
   });
 
-  it("binds terminal ids and exit codes to the operator statuses", () => {
+  it("binds terminal ids and exit codes to the operator statuses and finals", () => {
     const { awaitingOperator, operatorClosed, interactiveRefused } = jobGolden.results;
     for (const result of [
       { ...awaitingOperator, terminalId: undefined },
-      { ...interactiveRefused, terminalId: awaitingOperator?.terminalId },
+      // `running` is plain progress; finals may carry the terminal (interactive jobs).
+      { ...interactiveRefused, status: "running", error: undefined },
+      { ...interactiveRefused, terminalId: "bad" },
       { ...awaitingOperator, exitCode: 0 },
       { ...operatorClosed, exitCode: 256 },
       { ...operatorClosed, exitCode: -1 },
