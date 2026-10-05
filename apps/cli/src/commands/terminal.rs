@@ -36,7 +36,11 @@ enum Sub {
     /// Internal: the confirm screen of an agent-requested (supervised)
     /// command. The relay daemon runs it inside the command's terminal.
     #[command(hide = true)]
-    SupervisedRun,
+    SupervisedRun {
+        /// The confirm screen of an interactive deployment step instead.
+        #[arg(long)]
+        deployment: bool,
+    },
     /// Internal: independently preview an agent-requested supervised file change.
     #[command(hide = true)]
     SupervisedFile,
@@ -52,13 +56,16 @@ enum Approvals {
 
 pub fn run(args: &Args) -> Result<()> {
     match &args.command {
-        Sub::SupervisedRun => return crate::supervised_run::run(),
+        Sub::SupervisedRun { deployment: false } => return crate::supervised_run::run(),
+        Sub::SupervisedRun { deployment: true } => {
+            return crate::supervised_run::operator::run();
+        }
         Sub::SupervisedFile => return crate::supervised_file::run(),
         _ => {}
     }
     let state_dir = crate::paths::state_dir()?;
     match &args.command {
-        Sub::SupervisedRun => {}
+        Sub::SupervisedRun { .. } => {}
         Sub::SupervisedFile => {}
         Sub::Approve { code } => {
             let code = approvals::approve(&state_dir, code)?;

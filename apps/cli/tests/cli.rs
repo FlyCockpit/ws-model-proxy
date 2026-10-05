@@ -2255,6 +2255,29 @@ impl ConfirmChild {
         builder.env("WSMP_SUPERVISED_REQUESTER", "test agent");
         builder.env("WSMP_SUPERVISED_SHARE", if share { "1" } else { "0" });
         builder.env("WSMP_SUPERVISED_MARKER", Self::MARKER);
+        Self::start(pair, builder)
+    }
+
+    /// The deployment operator screen (`--deployment`) for `request` (the
+    /// JSON the daemon hands over).
+    fn spawn_operator(request: &serde_json::Value, cwd: &Path) -> Self {
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 40,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("open a pty");
+        let mut builder = portable_pty::CommandBuilder::new(assert_cmd::cargo::cargo_bin("wsmp"));
+        builder.args(["terminal", "supervised-run", "--deployment"]);
+        builder.cwd(cwd);
+        builder.env("WSMP_SUPERVISED_OPERATOR", request.to_string());
+        builder.env("WSMP_SUPERVISED_MARKER", Self::MARKER);
+        Self::start(pair, builder)
+    }
+
+    fn start(pair: portable_pty::PtyPair, mut builder: portable_pty::CommandBuilder) -> Self {
         builder.env_remove("WSMP_LOG");
         builder.env_remove("RUST_LOG");
         let child = pair.slave.spawn_command(builder).expect("spawn wsmp");
@@ -2299,6 +2322,24 @@ impl ConfirmChild {
             {
                 self.seen.extend(bytes);
             }
+        }
+        false
+    }
+
+    /// Waits until `needle` was seen at least `count` times.
+    fn wait_for_count(&mut self, needle: &[u8], count: usize) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if self
+                .seen
+                .windows(needle.len())
+                .filter(|window| *window == needle)
+                .count()
+                >= count
+            {
+                return true;
+            }
+            self.pump(std::time::Duration::from_millis(50));
         }
         false
     }
@@ -2417,6 +2458,220 @@ fn confirm_screen_ignores_type_ahead_and_runs_only_after_enter() {
     assert!(child.wait_for(b"hello-supervised"));
     assert_eq!(child.exit_code(), 0);
     assert!(witness.exists());
+}
+
+#[cfg(unix)]
+fn operator_request(command: &str) -> serde_json::Value {
+    json!({
+        "endpoint": "inst-abc123",
+        "models": ["org/model"],
+        "node": "test-node",
+        "rank": 1,
+        "action": "start",
+        "requestedBy": "AGENT",
+        "humanApproved": true,
+        "command": command,
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn operator_screen_runs_after_go_retries_a_failure_and_ends_on_success() {
+    let tmp = tempfile::tempdir().unwrap();
+    let count = tmp.path().join("runs");
+    // Fails on the first run, succeeds on the second.
+    let command = format!(
+        "# \u{202e}gpj\nn=$(cat {count} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {count}; echo run-$n; [ $n -ge 2 ]",
+        count = count.display()
+    );
+    let mut child = ConfirmChild::spawn_operator(&operator_request(&command), tmp.path());
+    // Type-ahead before the screen is drawn runs nothing.
+    child.type_keys(b"\r\r");
+    assert!(child.wait_for(&ConfirmChild::marker("ready")));
+    let screen = String::from_utf8_lossy(&child.seen).to_string();
+    for part in [
+        "a deployment step needs you to run a command",
+        "Endpoint: inst-abc123",
+        "Node: test-node (rank 1)",
+        "# \\u{202e}gpj",
+        "Step: start the service",
+        "Requested by: an agent; you confirmed the plan",
+        "Command written by: not known here.",
+        "Enter to run · Ctrl-C, Ctrl-D or q to close",
+    ] {
+        assert!(screen.contains(part), "missing {part:?} in {screen}");
+    }
+    assert!(!screen.contains('\u{202e}'), "bidi override drawn raw");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!count.exists(), "type-ahead ran the command");
+    child.type_keys(b"\r");
+    assert!(child.wait_for(&ConfirmChild::marker("accepted")));
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(!count.exists(), "the command ran before the go");
+    child.release();
+    assert!(child.wait_for(b"run-1"));
+    assert!(child.wait_for(&ConfirmChild::marker("exited;1")));
+    assert!(child.wait_for(b"exited with code 1. Press any key to continue."));
+    // The terminal state the command left is reset before the child draws.
+    let mut reset = b"\x1b[!p\x1b[0m\x1b(B\x1b[r\x1b[?7h\x1b[?25h".to_vec();
+    reset.extend(ConfirmChild::marker("exited;1"));
+    assert!(child.wait_for(&reset));
+    // The output stays until a key; the retry screen is a new `ready`.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    child.type_keys(b"x");
+    assert!(child.wait_for_count(&ConfirmChild::marker("ready"), 2));
+    let retry = child.last_paint().join("\n");
+    assert!(
+        retry.contains("the deployment command exited with code 1"),
+        "{retry}"
+    );
+    assert!(
+        retry.ends_with("Enter to run it again · Ctrl-C, Ctrl-D or q to close"),
+        "{retry}"
+    );
+    child.type_keys(b"\r");
+    assert!(child.wait_for_count(&ConfirmChild::marker("accepted"), 2));
+    // The retry needs its own go: the first one does not run it again.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(std::fs::read_to_string(&count).unwrap().trim(), "1");
+    child.release();
+    assert!(child.wait_for(b"run-2"));
+    assert!(child.wait_for(&ConfirmChild::marker("exited;0")));
+    assert_eq!(child.exit_code(), 0);
+    assert_eq!(std::fs::read_to_string(&count).unwrap().trim(), "2");
+}
+
+#[cfg(unix)]
+#[test]
+fn operator_ctrl_c_ends_only_the_command_and_q_closes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let started = tmp.path().join("started");
+    let command = format!("touch {}; sleep 30", started.display());
+    let mut child = ConfirmChild::spawn_operator(&operator_request(&command), tmp.path());
+    assert!(child.wait_for(&ConfirmChild::marker("ready")));
+    child.type_keys(b"\r");
+    assert!(child.wait_for(&ConfirmChild::marker("accepted")));
+    child.release();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !started.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the command never started"
+        );
+        child.pump(std::time::Duration::from_millis(50));
+    }
+    // Ctrl-C reaches the command (130 = 128 + SIGINT); the screen survives.
+    child.type_keys(b"\x03");
+    assert!(child.wait_for(&ConfirmChild::marker("exited;130")));
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    child.type_keys(b" ");
+    assert!(child.wait_for_count(&ConfirmChild::marker("ready"), 2));
+    child.type_keys(b"q");
+    assert!(child.wait_for(b"Declined."));
+    assert_eq!(child.exit_code(), 0);
+    // Only the first screen was accepted; the retry screen was closed.
+    let accepted = ConfirmChild::marker("accepted");
+    let accepts = child
+        .seen
+        .windows(accepted.len())
+        .filter(|window| *window == accepted)
+        .count();
+    assert_eq!(accepts, 1);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn operator_command_cannot_read_the_marker_or_the_daemon_env() {
+    let tmp = tempfile::tempdir().unwrap();
+    // $PPID is the confirm child, whose initial env holds the marker.
+    let command = "if cat /proc/$PPID/environ >/dev/null 2>&1; then echo ENV_READ\"ABLE\"; \
+                   else echo ENV_NOT_\"READABLE\"; fi; \
+                   env | grep -q WSMP_SUPERVISED || echo NO_DAEMON_\"ENV\"";
+    let mut child = ConfirmChild::spawn_operator(&operator_request(command), tmp.path());
+    assert!(child.wait_for(&ConfirmChild::marker("ready")));
+    child.type_keys(b"\r");
+    assert!(child.wait_for(&ConfirmChild::marker("accepted")));
+    child.release();
+    assert!(child.wait_for(&ConfirmChild::marker("exited;0")));
+    assert_eq!(child.exit_code(), 0);
+    let output = String::from_utf8_lossy(&child.seen).to_string();
+    assert!(output.contains("ENV_NOT_READABLE"), "{output}");
+    assert!(!output.contains("ENV_READABLE"), "{output}");
+    assert!(output.contains("NO_DAEMON_ENV"), "{output}");
+}
+
+#[cfg(unix)]
+#[test]
+fn operator_terminal_gone_during_a_run_leaves_no_command_behind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pid_file = tmp.path().join("pid");
+    let command = format!("echo $$ > {}; exec sleep 30", pid_file.display());
+    let mut child = ConfirmChild::spawn_operator(&operator_request(&command), tmp.path());
+    assert!(child.wait_for(&ConfirmChild::marker("ready")));
+    child.type_keys(b"\r");
+    assert!(child.wait_for(&ConfirmChild::marker("accepted")));
+    child.release();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let pid = loop {
+        if let Some(pid) = fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the command never started"
+        );
+        child.pump(std::time::Duration::from_millis(50));
+    };
+    // The confirm child (the terminal's session leader) goes away, as when the
+    // terminal closes: the kernel hangs up its foreground group, the command.
+    child.child.kill().expect("end the confirm child");
+    let _ = child.child.wait();
+    let alive = || {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while alive() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the command outlived its terminal"
+        );
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(!child.seen.windows(7).any(|window| window == b"exited;"));
+}
+
+#[cfg(unix)]
+#[test]
+fn operator_screen_refuses_a_bad_request_before_drawing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    let witness = tmp.path().join("ran");
+    let mut request = operator_request(&format!("touch {}", witness.display()));
+    request["action"] = json!("status");
+    cli(&config, &state)
+        .args(["terminal", "supervised-run", "--deployment"])
+        .env("WSMP_SUPERVISED_OPERATOR", request.to_string())
+        .env("WSMP_SUPERVISED_MARKER", "0123456789abcdef0123456789abcdef")
+        .write_stdin("\n")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be interactive"));
+    cli(&config, &state)
+        .args(["terminal", "supervised-run", "--deployment"])
+        .env_remove("WSMP_SUPERVISED_OPERATOR")
+        .env("WSMP_SUPERVISED_MARKER", "0123456789abcdef0123456789abcdef")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("started by the relay daemon"));
+    assert!(!witness.exists());
 }
 
 #[cfg(unix)]

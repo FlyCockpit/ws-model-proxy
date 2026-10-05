@@ -276,6 +276,14 @@ where
     }));
 }
 
+/// Installs the stdin restore hook once per process: a confirm child that
+/// draws several screens (the operator retry loop) does not stack hooks. The
+/// first screen's saved settings are the child's original ones.
+fn restore_stdin_on_panic(original: &nix::sys::termios::Termios) {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| restore_terminal_on_panic(std::io::stdin(), original.clone()));
+}
+
 fn read_byte(stdin: &std::io::Stdin) -> Result<Option<u8>> {
     use std::os::fd::AsFd;
     let mut byte = [0_u8; 1];
@@ -301,7 +309,7 @@ pub(crate) fn interact(
     use nix::sys::termios::{self, FlushArg};
 
     let raw_mode = RawMode::enter(std::io::stdin(), confirm_raw_mode)?;
-    restore_terminal_on_panic(std::io::stdin(), raw_mode.original().clone());
+    restore_stdin_on_panic(raw_mode.original());
     let stdin = raw_mode.fd();
     let _ = termios::tcflush(stdin, FlushArg::TCIFLUSH);
     let mut stdout = std::io::stdout().lock();
@@ -380,6 +388,31 @@ pub(crate) fn interact(
     raw_mode.restore();
     drop(stdout);
     Ok(ConfirmOutcome::Accepted)
+}
+
+/// Prints `message` and waits for one key, so output above it stays on screen
+/// until a person has read it (the next confirm screen clears the terminal).
+/// Type-ahead from before the message is flushed after a settle delay, like
+/// the confirm screen, so a key pressed earlier does not skip it. `Ok(false)`
+/// when the terminal closed instead.
+pub(crate) fn wait_for_any_key(message: &str) -> Result<bool> {
+    use std::io::Write;
+
+    use nix::sys::termios::{self, FlushArg};
+
+    let raw_mode = RawMode::enter(std::io::stdin(), confirm_raw_mode)?;
+    restore_stdin_on_panic(raw_mode.original());
+    let stdin = raw_mode.fd();
+    let mut stdout = std::io::stdout().lock();
+    stdout
+        .write_all(message.as_bytes())
+        .and_then(|()| stdout.flush())
+        .context("writing to the terminal")?;
+    std::thread::sleep(SETTLE);
+    let _ = termios::tcflush(stdin, FlushArg::TCIFLUSH);
+    let key = read_byte(stdin)?;
+    raw_mode.restore();
+    Ok(key.is_some())
 }
 
 // Panic hooks are process-global; both confirm children share this test lock.

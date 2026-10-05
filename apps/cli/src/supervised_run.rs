@@ -24,6 +24,7 @@
 use crate::display_escape::escape_for_display;
 pub use crate::supervised_screen::Screen;
 
+pub mod operator;
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
@@ -31,7 +32,7 @@ pub use unix::run;
 
 const PROMPT: &str = "Enter to run · Ctrl-C, Ctrl-D or q to decline";
 /// Continuation indent for multi-row fields and the command.
-const INDENT: &str = "    ";
+pub(crate) const INDENT: &str = "    ";
 /// Marks a line break inside agent-supplied text.
 const LINE_BREAK: char = '↵';
 
@@ -142,7 +143,7 @@ fn plural(count: usize, one: &str, many: &str) -> String {
 }
 
 /// The command's size as the screen states it.
-fn command_size(command: &str) -> String {
+pub(crate) fn command_size(command: &str) -> String {
     let lines = command.split('\n').count();
     format!(
         "{}, {}",
@@ -198,7 +199,8 @@ fn body_rows(request: &Request<'_>, width: usize) -> Vec<String> {
 }
 
 fn footer_rows(
-    request: &Request<'_>,
+    size: &str,
+    prompt: &str,
     offset: usize,
     height: usize,
     total: usize,
@@ -207,32 +209,52 @@ fn footer_rows(
     let mut rows = Vec::new();
     let status = if height == 0 {
         format!(
-            "Too small to show this request (command: {}); enlarge the terminal to read it here before pressing Enter.",
-            command_size(request.command)
+            "Too small to show this request (command: {size}); enlarge the terminal to read it here before pressing Enter."
         )
     } else {
         format!(
-            "Showing rows {}-{} of {}; the rest is not shown. Command: {}. Scroll with ↑↓ PgUp PgDn Home End to read all of it here before pressing Enter.",
+            "Showing rows {}-{} of {}; the rest is not shown. Command: {size}. Scroll with ↑↓ PgUp PgDn Home End to read all of it here before pressing Enter.",
             offset + 1,
             offset + height,
             total,
-            command_size(request.command)
         )
     };
     wrap_words(&mut rows, &status, width);
-    wrap_words(&mut rows, PROMPT, width);
+    wrap_words(&mut rows, prompt, width);
     rows
 }
 
 /// Lays the screen out for a `cols` x `rows` terminal with the body scrolled
 /// to `offset` (clamped). The prompt row is always the last row drawn.
 pub fn layout(request: &Request<'_>, cols: usize, rows: usize, offset: usize) -> Screen {
+    fit(
+        |width| body_rows(request, width),
+        &command_size(request.command),
+        PROMPT,
+        cols,
+        rows,
+        offset,
+    )
+}
+
+/// Fits a confirm screen to a `cols` x `rows` terminal: the body (laid out
+/// by `body` for a given width) scrolls to `offset` (clamped) above a pinned
+/// footer whose last row is `prompt`. When the body does not fit, the footer
+/// says so with the command's `size` and how to scroll.
+pub(crate) fn fit(
+    body: impl FnOnce(usize) -> Vec<String>,
+    size: &str,
+    prompt: &str,
+    cols: usize,
+    rows: usize,
+    offset: usize,
+) -> Screen {
     // One spare column, so a full row never leaves the cursor in the wrap state.
     let width = cols.saturating_sub(1).max(2);
     let rows = rows.max(1);
-    let body = body_rows(request, width);
+    let body = body(width);
     let mut fitting_footer = vec![String::new()];
-    wrap_words(&mut fitting_footer, PROMPT, width);
+    wrap_words(&mut fitting_footer, prompt, width);
     if body.len() + fitting_footer.len() <= rows {
         let mut all = body;
         let height = all.len();
@@ -247,11 +269,11 @@ pub fn layout(request: &Request<'_>, cols: usize, rows: usize, offset: usize) ->
     let total = body.len();
     // The footer's size depends on the numbers it shows; the body shrinks
     // until both fit. `height` only decreases, so this ends.
-    let mut height = rows.saturating_sub(footer_rows(request, 0, total, total, width).len());
+    let mut height = rows.saturating_sub(footer_rows(size, prompt, 0, total, total, width).len());
     let (offset, footer) = loop {
         let height_now = height.min(total);
         let offset = offset.min(total - height_now);
-        let footer = footer_rows(request, offset, height_now, total, width);
+        let footer = footer_rows(size, prompt, offset, height_now, total, width);
         if height_now + footer.len() <= rows || height_now == 0 {
             height = height_now;
             break (offset, footer);

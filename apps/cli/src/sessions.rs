@@ -156,8 +156,8 @@ pub(crate) use supervised_pty::{
     SUPERVISED_ENV_COMMAND, SUPERVISED_ENV_FILE_ALLOW_ROOT, SUPERVISED_ENV_FILE_ARGS,
     SUPERVISED_ENV_FILE_BLOCKED, SUPERVISED_ENV_FILE_BODY, SUPERVISED_ENV_FILE_ETAG_KEY,
     SUPERVISED_ENV_FILE_OP, SUPERVISED_ENV_FILE_PREIMAGE, SUPERVISED_ENV_FILE_ROOTS,
-    SUPERVISED_ENV_MARKER, SUPERVISED_ENV_NAMES, SUPERVISED_ENV_REASON, SUPERVISED_ENV_REQUESTER,
-    SUPERVISED_ENV_SHARE, supervised_marker,
+    SUPERVISED_ENV_MARKER, SUPERVISED_ENV_NAMES, SUPERVISED_ENV_OPERATOR, SUPERVISED_ENV_REASON,
+    SUPERVISED_ENV_REQUESTER, SUPERVISED_ENV_SHARE, supervised_marker,
 };
 
 #[allow(clippy::large_enum_variant)] // 2.9 telemetry grew `ClientControlMessage`.
@@ -1636,7 +1636,9 @@ impl TerminalSession {
                             },
                         ));
                     }
-                    Piece::Event(MarkerEvent::Invalid) => {
+                    // Agent terminals scan with the supervised grammar,
+                    // which reports `exited` as `Invalid`; never seen here.
+                    Piece::Event(MarkerEvent::Invalid | MarkerEvent::Exited(_)) => {
                         supervised.marker_invalid = true;
                     }
                 }

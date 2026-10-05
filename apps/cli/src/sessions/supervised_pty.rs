@@ -22,7 +22,10 @@ pub(crate) const SUPERVISED_ENV_FILE_PREIMAGE: &str = "WSMP_SUPERVISED_FILE_PREI
 pub(crate) const SUPERVISED_ENV_FILE_BLOCKED: &str = "WSMP_SUPERVISED_FILE_BLOCKED";
 pub(crate) const SUPERVISED_ENV_FILE_ALLOW_ROOT: &str = "WSMP_SUPERVISED_FILE_ALLOW_ROOT";
 pub(crate) const SUPERVISED_ENV_FILE_ROOTS: &str = "WSMP_SUPERVISED_FILE_ROOTS";
-pub(crate) const SUPERVISED_ENV_NAMES: [&str; 13] = [
+/// The operator (deployment) confirm screen's request, as JSON
+/// (`supervised_run::operator::OperatorRequest`).
+pub(crate) const SUPERVISED_ENV_OPERATOR: &str = "WSMP_SUPERVISED_OPERATOR";
+pub(crate) const SUPERVISED_ENV_NAMES: [&str; 14] = [
     SUPERVISED_ENV_COMMAND,
     SUPERVISED_ENV_REASON,
     SUPERVISED_ENV_REQUESTER,
@@ -36,6 +39,7 @@ pub(crate) const SUPERVISED_ENV_NAMES: [&str; 13] = [
     SUPERVISED_ENV_FILE_BLOCKED,
     SUPERVISED_ENV_FILE_ALLOW_ROOT,
     SUPERVISED_ENV_FILE_ROOTS,
+    SUPERVISED_ENV_OPERATOR,
 ];
 
 /// The in-band signal between the confirm child and the daemon: an OSC
@@ -45,6 +49,11 @@ pub(crate) const SUPERVISED_ENV_NAMES: [&str; 13] = [
 /// the daemon's decision that the command may start: it is written only when
 /// the daemon takes `accepted` while the request is still waiting, so a
 /// server expiry or cancel handled first means the command never starts.
+///
+/// The operator (deployment) confirm child adds `exited;<code>` on the PTY
+/// output: the command it ran after `go` ended with `<code>` (0..=255,
+/// decimal, no leading zeros). A non-zero code is followed by a new `ready`
+/// when the child offers a retry; see [`MarkerScanner::operator`].
 pub(crate) fn supervised_marker(kind: &str, marker: &str) -> Vec<u8> {
     format!("\x1b]7717;wsmp-supervised;{kind};{marker}\x07").into_bytes()
 }
@@ -54,7 +63,40 @@ pub(super) enum MarkerEvent {
     Ready,
     Accepted,
     Blocked(FileErrorCode),
+    /// Operator grammar only: the confirmed command exited with this code.
+    Exited(u8),
     Invalid,
+}
+
+/// Which confirm child the scanner listens to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grammar {
+    /// Agent command or file: ready -> (accepted | blocked;<code>), once.
+    Supervised,
+    /// Deployment operator step: ready -> accepted -> exited;<code>, where a
+    /// non-zero code starts the cycle again (retry) and 0 ends it.
+    #[cfg_attr(not(test), allow(dead_code))] // Chunk 5 spawns operator terminals.
+    Operator,
+}
+
+/// Where an operator child is in its cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperatorPhase {
+    /// Before the (first or retry) screen's `ready`.
+    AwaitReady,
+    /// The screen is up; only `accepted` may follow.
+    AwaitDecision,
+    /// The command runs; only `exited;<code>` may follow.
+    Running,
+}
+
+/// `<code>` of an `exited;<code>` marker: canonical decimal 0..=255.
+fn exit_code(text: &str) -> Option<u8> {
+    let canonical = !text.is_empty()
+        && text.len() <= 3
+        && text.bytes().all(|byte| byte.is_ascii_digit())
+        && (text == "0" || !text.starts_with('0'));
+    canonical.then(|| text.parse().ok()).flatten()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -69,6 +111,8 @@ pub(super) enum Piece {
 /// per-request marker. Each decision is honored once; later output passes
 /// through untouched, so a command printing a marker changes nothing.
 pub(super) struct MarkerScanner {
+    grammar: Grammar,
+    operator: OperatorPhase,
     prefix: Vec<u8>,
     marker: Vec<u8>,
     /// Output that may be the start of a marker, held until it is decided.
@@ -97,7 +141,24 @@ fn marker_prefix_suffix(bytes: &[u8], marker: &[u8]) -> usize {
 
 impl MarkerScanner {
     pub(super) fn new(marker: &str) -> Self {
+        Self::with_grammar(marker, Grammar::Supervised)
+    }
+
+    /// A scanner for the operator (deployment) confirm child. Its grammar is
+    /// `ready -> accepted -> exited;<code>`, repeated while `<code>` is not 0:
+    /// after a failed run the child redraws the screen (a new `ready`) and a
+    /// person may run the command again. `exited;0` ends it. Any event out of
+    /// that order, a `blocked` verdict or a malformed code is `Invalid` and
+    /// ends the scan: the child never produces one.
+    #[cfg_attr(not(test), allow(dead_code))] // Chunk 5 spawns operator terminals.
+    pub(super) fn operator(marker: &str) -> Self {
+        Self::with_grammar(marker, Grammar::Operator)
+    }
+
+    fn with_grammar(marker: &str, grammar: Grammar) -> Self {
         Self {
+            grammar,
+            operator: OperatorPhase::AwaitReady,
             prefix: b"\x1b]7717;wsmp-supervised;".to_vec(),
             marker: marker.as_bytes().to_vec(),
             pending: Vec::new(),
@@ -151,6 +212,18 @@ impl MarkerScanner {
                 return pieces;
             };
             let end = marker_start + end;
+            // Output that began like a marker but never ended (a bare prefix,
+            // no BEL) must not swallow a later real marker: anchor on the last
+            // prefix before this BEL and pass everything before it through.
+            if let Some(last) = rest[at + 1..end]
+                .windows(self.prefix.len())
+                .rposition(|window| window == self.prefix.as_slice())
+            {
+                let anchor = at + 1 + last;
+                pieces.push(Piece::Bytes(rest[at..anchor].to_vec()));
+                start += anchor;
+                continue;
+            }
             let payload = &rest[marker_start..end];
             let Some(separator) = payload.iter().rposition(|byte| *byte == b';') else {
                 pieces.push(Piece::Bytes(rest[at..=end].to_vec()));
@@ -177,8 +250,17 @@ impl MarkerScanner {
                         .map(MarkerEvent::Blocked)
                         .unwrap_or(MarkerEvent::Invalid)
                 }
+                Some(value) if value.starts_with("exited;") => exit_code(&value["exited;".len()..])
+                    .map(MarkerEvent::Exited)
+                    .unwrap_or(MarkerEvent::Invalid),
                 _ => MarkerEvent::Invalid,
             };
+            if self.grammar == Grammar::Operator {
+                let event = self.operator_event(event);
+                pieces.push(Piece::Event(event));
+                start += end + 1;
+                continue;
+            }
             match event {
                 MarkerEvent::Ready if !self.ready_seen => {
                     self.ready_seen = true;
@@ -192,7 +274,8 @@ impl MarkerScanner {
                     self.done = true;
                     pieces.push(Piece::Event(MarkerEvent::Blocked(code)));
                 }
-                MarkerEvent::Invalid => {
+                // `exited` belongs to the operator grammar only.
+                MarkerEvent::Invalid | MarkerEvent::Exited(_) => {
                     self.done = true;
                     pieces.push(Piece::Event(MarkerEvent::Invalid));
                 }
@@ -200,6 +283,34 @@ impl MarkerScanner {
                 _ => {}
             }
             start += end + 1;
+        }
+    }
+}
+
+impl MarkerScanner {
+    /// One authenticated operator-child event, checked against the cycle.
+    /// Returns the event to report; anything out of order is `Invalid` and
+    /// ends the scan, so later output passes through untouched.
+    fn operator_event(&mut self, event: MarkerEvent) -> MarkerEvent {
+        let next = match (self.operator, event) {
+            (OperatorPhase::AwaitReady, MarkerEvent::Ready) => Some(OperatorPhase::AwaitDecision),
+            (OperatorPhase::AwaitDecision, MarkerEvent::Accepted) => Some(OperatorPhase::Running),
+            (OperatorPhase::Running, MarkerEvent::Exited(0)) => {
+                self.done = true;
+                return event;
+            }
+            (OperatorPhase::Running, MarkerEvent::Exited(_)) => Some(OperatorPhase::AwaitReady),
+            _ => None,
+        };
+        match next {
+            Some(phase) => {
+                self.operator = phase;
+                event
+            }
+            None => {
+                self.done = true;
+                MarkerEvent::Invalid
+            }
         }
     }
 }
@@ -322,6 +433,193 @@ mod tests {
             assert!(pieces.iter().all(|piece| !matches!(piece, Piece::Bytes(bytes) if
                 bytes.windows(b"wsmp-supervised".len()).any(|window| window == b"wsmp-supervised"))));
         }
+    }
+
+    fn events_and_bytes(scanner: &mut MarkerScanner, stream: &[u8]) -> (Vec<MarkerEvent>, Vec<u8>) {
+        let mut events = Vec::new();
+        let mut bytes = Vec::new();
+        // Split reads: every marker crosses a read boundary somewhere.
+        for chunk in stream.chunks(5) {
+            for piece in scanner.feed(chunk) {
+                match piece {
+                    Piece::Event(event) => events.push(event),
+                    Piece::Bytes(chunk) => bytes.extend(chunk),
+                }
+            }
+        }
+        (events, bytes)
+    }
+
+    #[test]
+    fn operator_scanner_follows_ready_accepted_exited_with_retries() {
+        let marker = "00112233445566778899aabbccddeeff";
+        let m = |kind: &str| supervised_marker(kind, marker);
+        let mut stream = b"screen".to_vec();
+        stream.extend(m("ready"));
+        stream.extend(m("accepted"));
+        stream.extend(b"sudo: password");
+        stream.extend(m("exited;1"));
+        stream.extend(b"retry screen");
+        stream.extend(m("ready"));
+        stream.extend(m("accepted"));
+        stream.extend(b"ok");
+        stream.extend(m("exited;0"));
+        stream.extend(b"done");
+        // After the end every byte passes through, a late marker included.
+        stream.extend(m("ready"));
+        let mut scanner = MarkerScanner::operator(marker);
+        let (events, bytes) = events_and_bytes(&mut scanner, &stream);
+        assert_eq!(
+            events,
+            vec![
+                MarkerEvent::Ready,
+                MarkerEvent::Accepted,
+                MarkerEvent::Exited(1),
+                MarkerEvent::Ready,
+                MarkerEvent::Accepted,
+                MarkerEvent::Exited(0),
+            ]
+        );
+        let mut expected = b"screensudo: passwordretry screenokdone".to_vec();
+        expected.extend(m("ready"));
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn operator_scanner_refuses_out_of_order_and_malformed_events() {
+        let marker = "00112233445566778899aabbccddeeff";
+        let m = |kind: &str| supervised_marker(kind, marker);
+        for (kinds, expected) in [
+            // `accepted` or `exited` before the screen is drawn.
+            (vec!["accepted"], vec![MarkerEvent::Invalid]),
+            (vec!["exited;0"], vec![MarkerEvent::Invalid]),
+            // A second `ready` while the screen waits.
+            (
+                vec!["ready", "ready"],
+                vec![MarkerEvent::Ready, MarkerEvent::Invalid],
+            ),
+            // `exited` while nothing runs.
+            (
+                vec!["ready", "exited;0"],
+                vec![MarkerEvent::Ready, MarkerEvent::Invalid],
+            ),
+            // A second `accepted` while the command runs.
+            (
+                vec!["ready", "accepted", "accepted"],
+                vec![
+                    MarkerEvent::Ready,
+                    MarkerEvent::Accepted,
+                    MarkerEvent::Invalid,
+                ],
+            ),
+            // A retry must redraw (`ready`) before it is accepted.
+            (
+                vec!["ready", "accepted", "exited;2", "accepted"],
+                vec![
+                    MarkerEvent::Ready,
+                    MarkerEvent::Accepted,
+                    MarkerEvent::Exited(2),
+                    MarkerEvent::Invalid,
+                ],
+            ),
+            // File verdicts are not part of this grammar.
+            (
+                vec!["ready", "blocked;conflict"],
+                vec![MarkerEvent::Ready, MarkerEvent::Invalid],
+            ),
+        ] {
+            let mut stream = Vec::new();
+            for kind in &kinds {
+                stream.extend(m(kind));
+            }
+            let mut scanner = MarkerScanner::operator(marker);
+            let (events, _) = events_and_bytes(&mut scanner, &stream);
+            assert_eq!(events, expected, "{kinds:?}");
+        }
+        for code in ["", "256", "-1", "+1", "01", "00", "1a", "1;2", "1000", " 1"] {
+            let mut stream = m("ready");
+            stream.extend(m("accepted"));
+            stream.extend(m(&format!("exited;{code}")));
+            let mut scanner = MarkerScanner::operator(marker);
+            let (events, bytes) = events_and_bytes(&mut scanner, &stream);
+            assert_eq!(events.last(), Some(&MarkerEvent::Invalid), "{code:?}");
+            assert!(bytes.is_empty(), "{code:?}");
+        }
+        for (code, value) in [("0", 0), ("9", 9), ("127", 127), ("255", 255)] {
+            assert_eq!(exit_code(code), Some(value));
+        }
+        // Another request's markers are ordinary output, even mid-run.
+        let mut stream = m("ready");
+        stream.extend(m("accepted"));
+        let forged = supervised_marker("exited;0", "ffffffffffffffffffffffffffffffff");
+        stream.extend(&forged);
+        let mut scanner = MarkerScanner::operator(marker);
+        let (events, bytes) = events_and_bytes(&mut scanner, &stream);
+        assert_eq!(events, vec![MarkerEvent::Ready, MarkerEvent::Accepted]);
+        assert_eq!(bytes, forged);
+    }
+
+    #[test]
+    fn a_dangling_prefix_in_output_neither_hides_output_nor_the_real_marker() {
+        let marker = "00112233445566778899aabbccddeeff";
+        let m = |kind: &str| supervised_marker(kind, marker);
+        let prefix = b"\x1b]7717;wsmp-supervised;".to_vec();
+        let mut junk_300 = prefix.clone();
+        junk_300.extend(vec![b'j'; 300]);
+        let mut fake_exit = prefix.clone();
+        fake_exit.extend(format!("exited;0;{marker}").as_bytes());
+        for (junk, real, code) in [
+            (prefix.clone(), "exited;0", 0),
+            (fake_exit, "exited;1", 1),
+            (junk_300, "exited;0", 0),
+        ] {
+            let mut stream = m("ready");
+            stream.extend(m("accepted"));
+            stream.extend(b"out:");
+            stream.extend(&junk);
+            stream.extend(m(real));
+            for chunk_size in [1, 5, 4096] {
+                let mut scanner = MarkerScanner::operator(marker);
+                let mut events = Vec::new();
+                let mut bytes = Vec::new();
+                for chunk in stream.chunks(chunk_size) {
+                    for piece in scanner.feed(chunk) {
+                        match piece {
+                            Piece::Event(event) => events.push(event),
+                            Piece::Bytes(chunk) => bytes.extend(chunk),
+                        }
+                    }
+                }
+                assert_eq!(
+                    events,
+                    vec![
+                        MarkerEvent::Ready,
+                        MarkerEvent::Accepted,
+                        MarkerEvent::Exited(code)
+                    ],
+                    "{real} after {chunk_size}-byte reads"
+                );
+                let mut expected = b"out:".to_vec();
+                expected.extend(&junk);
+                assert_eq!(bytes, expected, "{real} after {chunk_size}-byte reads");
+            }
+        }
+        // The agent grammar re-anchors the same way.
+        let mut stream = prefix;
+        stream.extend(m("ready"));
+        let mut scanner = MarkerScanner::new(marker);
+        let (events, _) = events_and_bytes(&mut scanner, &stream);
+        assert_eq!(events, vec![MarkerEvent::Ready]);
+    }
+
+    #[test]
+    fn the_supervised_scanner_treats_exited_as_invalid() {
+        let marker = "00112233445566778899aabbccddeeff";
+        let mut stream = supervised_marker("ready", marker);
+        stream.extend(supervised_marker("exited;0", marker));
+        let mut scanner = MarkerScanner::new(marker);
+        let (events, _) = events_and_bytes(&mut scanner, &stream);
+        assert_eq!(events, vec![MarkerEvent::Ready, MarkerEvent::Invalid]);
     }
 
     #[test]
