@@ -1544,6 +1544,15 @@ fn wire_edge_cases_agree_with_the_server_mirror() {
             .map_or(true, |job| job.validate().is_err());
         assert!(refused, "{name} must be refused");
     }
+    // The forwarder slug rules on their own, reserved words included.
+    for slug in golden["slugCases"]["accepted"].as_array().expect("slugs") {
+        let slug = slug.as_str().expect("slug");
+        assert!(crate::slug::validate_slug(slug).is_ok(), "{slug}");
+    }
+    for slug in golden["slugCases"]["rejected"].as_array().expect("slugs") {
+        let slug = slug.as_str().expect("slug");
+        assert!(crate::slug::validate_slug(slug).is_err(), "{slug}");
+    }
 }
 
 #[test]

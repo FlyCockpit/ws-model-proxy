@@ -106,7 +106,11 @@
     "dimensions": "Vector dimensions",
     "normalization": "Normalization",
     "vectorSpace": "Vector-space identity",
-    "savePolicy": "Save routing policy"
+    "savePolicy": "Save routing policy",
+    "slugHint": "Lowercase letters, digits and single hyphens; it cannot end with a hyphen. You can rename a recipe while none of its deployments are running.",
+    "stopBeforeChange": "Stop this recipe's deployments before renaming it or moving it to another pool.",
+    "slugTaken": "Another recipe already uses this slug.",
+    "invalidRecipeSlug": "This recipe's slug is not valid on nodes (it ends with or repeats a hyphen). Rename the recipe while none of its deployments are running, then start it again."
   },
   "appSettingsLoadFailed": "Failed to load app settings.",
   "actions": {

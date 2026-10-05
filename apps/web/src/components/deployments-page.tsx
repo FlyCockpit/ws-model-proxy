@@ -28,6 +28,30 @@ import { useAuthSession } from "@/hooks/use-auth-session";
 import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
 
+/** Copy for the deployment conflicts a person can fix themselves, by `data.reason`. */
+const RECIPE_ERROR_KEYS = {
+  deployments_running: "deployments.stopBeforeChange",
+  slug_taken: "deployments.slugTaken",
+  invalid_recipe_slug: "deployments.invalidRecipeSlug",
+} as const;
+type RecipeErrorKey = (typeof RECIPE_ERROR_KEYS)[keyof typeof RECIPE_ERROR_KEYS];
+function recipeErrorKey(error: unknown): RecipeErrorKey | null {
+  const data = (error as { data?: unknown } | null)?.data;
+  const reason =
+    data && typeof data === "object" ? (data as { reason?: unknown }).reason : undefined;
+  return typeof reason === "string" && Object.hasOwn(RECIPE_ERROR_KEYS, reason)
+    ? RECIPE_ERROR_KEYS[reason as keyof typeof RECIPE_ERROR_KEYS]
+    : null;
+}
+/** Specific copy for a fixable recipe conflict, else the generic localized error. */
+function recipeErrorText(
+  error: unknown,
+  t: (key: RecipeErrorKey | "deployments.failed") => string,
+): string {
+  const key = recipeErrorKey(error);
+  return key ? t(key) : friendly(error, t("deployments.failed"));
+}
+
 function parseSpec(text: string): unknown {
   try {
     return JSON.parse(text);
@@ -311,7 +335,10 @@ function RecipeEditor({
   const baseId = useId();
   const schema = z.object({
     name: z.string().min(1).max(128),
-    slug: config ? z.string() : z.string().regex(DEPLOYMENT_CONFIG_SLUG_PATTERN),
+    // An unchanged slug saved before the current rule still saves; a new one must be valid.
+    slug: z
+      .string()
+      .refine((slug) => slug === config?.slug || DEPLOYMENT_CONFIG_SLUG_PATTERN.test(slug)),
     poolId: z.string().min(1),
     spec: recipeJsonSchema,
   });
@@ -331,7 +358,9 @@ function RecipeEditor({
             id: config.id,
             expectedRevision,
             name: value.name,
-            // Moving a recipe (or rebinding one whose pool was deleted) needs its deployments stopped.
+            // Renaming or moving a recipe (or rebinding one whose pool was deleted) needs its
+            // deployments stopped.
+            ...(value.slug !== config.slug ? { slug: value.slug } : {}),
             ...(value.poolId !== config.poolId ? { poolId: value.poolId } : {}),
             spec,
           });
@@ -369,10 +398,15 @@ function RecipeEditor({
                 id={`${baseId}-${name}`}
                 className="min-h-11"
                 value={field.state.value}
-                disabled={name === "slug" && !!config}
                 onChange={(event) => field.handleChange(event.target.value)}
                 aria-invalid={field.state.meta.errors.length > 0}
+                aria-describedby={name === "slug" ? `${baseId}-slug-help` : undefined}
               />
+              {name === "slug" ? (
+                <p id={`${baseId}-slug-help`} className="text-sm text-muted-foreground">
+                  {t("deployments.slugHint")}
+                </p>
+              ) : null}
               {field.state.meta.errors.length ? (
                 <p role="alert">{t("deployments.invalid")}</p>
               ) : null}
@@ -446,9 +480,7 @@ function RecipeEditor({
         ) : null}
       </div>
       {create.isError || update.isError || remove.isError ? (
-        <p role="alert">
-          {friendly(create.error ?? update.error ?? remove.error, t("deployments.failed"))}
-        </p>
+        <p role="alert">{recipeErrorText(create.error ?? update.error ?? remove.error, t)}</p>
       ) : null}
       {config ? (
         <ConfirmDeleteDialog
@@ -570,7 +602,7 @@ function StartPlanForm({
       <Button type="submit" size="touch" disabled={start.isPending}>
         {t("deployments.preview")}
       </Button>
-      {start.isError ? <p role="alert">{friendly(start.error, t("deployments.failed"))}</p> : null}
+      {start.isError ? <p role="alert">{recipeErrorText(start.error, t)}</p> : null}
     </form>
   );
 }
@@ -716,7 +748,7 @@ function PlanPreview({ planId, onApplied }: { planId: string; onApplied: () => v
         </AlertDialogContent>
       </AlertDialog>
       {plan.isError || confirm.isError ? (
-        <p role="alert">{friendly(plan.error ?? confirm.error, t("deployments.failed"))}</p>
+        <p role="alert">{recipeErrorText(plan.error ?? confirm.error, t)}</p>
       ) : null}
     </section>
   );

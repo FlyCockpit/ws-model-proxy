@@ -317,7 +317,8 @@ describe("deployment durable API boundary", () => {
         }),
       ).rejects.toMatchObject({
         code: "BAD_REQUEST",
-        message: expect.stringContaining("endpoint slug"),
+        message: expect.stringContaining("Rename the recipe while none of its deployments"),
+        data: { reason: "invalid_recipe_slug" },
       });
     }
     expect(db.deploymentPlan.create).not.toHaveBeenCalled();

@@ -186,6 +186,11 @@ export const deploymentsRouter = {
           id: deploymentIdSchema,
           expectedRevision: z.number().int().positive(),
           name: recipeName.optional(),
+          /**
+           * Renames the recipe while none of its deployments run. Running instances keep the
+           * endpoint they were started with; new instances use the new slug.
+           */
+          slug: z.string().regex(DEPLOYMENT_CONFIG_SLUG_PATTERN).optional(),
           /** Moves the recipe to another pool; required for a recipe whose pool was deleted. */
           poolId: deploymentIdSchema.optional(),
           spec: deploymentSpecSchema,
@@ -229,15 +234,36 @@ export const deploymentsRouter = {
                 data: { reason: "deployments_running" },
               });
           }
+          const slug = input.slug !== undefined && input.slug !== config.slug ? input.slug : null;
+          if (slug) {
+            const live = await tx.deploymentInstance.count({
+              where: { configId: config.id, ...liveDeploymentInstanceWhere },
+            });
+            if (live)
+              throw new ORPCError("CONFLICT", {
+                message: "Stop this recipe's deployments before renaming it",
+                data: { reason: "deployments_running" },
+              });
+            const taken = await tx.deploymentConfig.findFirst({
+              where: { userId: actor.userId, slug, id: { not: config.id } },
+              select: { id: true },
+            });
+            if (taken)
+              throw new ORPCError("CONFLICT", {
+                message: "Another recipe already uses this slug",
+                data: { reason: "slug_taken" },
+              });
+          }
           if (input.spec.variants.some((v) => v.attachment.poolId !== poolId))
             throw new ORPCError("BAD_REQUEST", {
               message: "All variants must attach to the config target pool",
             });
-          if (input.name || poolId !== config.poolId)
+          if (input.name || slug || poolId !== config.poolId)
             await tx.deploymentConfig.update({
               where: { id: config.id },
               data: {
                 ...(input.name ? { name: input.name } : {}),
+                ...(slug ? { slug } : {}),
                 ...(poolId !== config.poolId ? { poolId } : {}),
               },
             });

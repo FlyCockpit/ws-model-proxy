@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { deploymentJobWireIssue } from "@ws-model-proxy/config/deployment-job-wire";
 import type { DeploymentJob } from "@ws-model-proxy/config/deployment-protocol";
+import { validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import { describe, expect, it, vi } from "vitest";
 
 import type { DeploymentNode } from "./deployment-planner";
@@ -172,8 +173,22 @@ function generate() {
       vectorSpace: "space",
     },
   });
+  // Rust `char::is_whitespace`: U+0085 is whitespace, U+FEFF is not (JavaScript differs on both).
+  const external = (status: string, stop = "true"): DeploymentJob => ({
+    ...plain,
+    management: "externalService",
+    stopCommand: stop,
+    statusCommand: status,
+  });
+  const { contextWindow: _contextWindow, ...withoutContextWindow } = plain;
+  // A dispatch never omits it, but `Option<u64>` in Rust decodes an absent field as None.
   const wireCases = {
     accepted: {
+      statusFeffIsNotBlank: external("\ufeff"),
+      stopFeffIsNotBlank: external("status", "\ufeff"),
+      embeddingTextFeffIsNotBlank: embeddings("\ufeff"),
+      contextWindowAbsent: withoutContextWindow,
+      contextWindowAbove2To53: { ...plain, contextWindow: 2 ** 60 },
       endpointSlugSingleHyphens: { ...plain, endpointSlug: "inst-qwen-3-a1b2c3d4e5f6" },
       readinessPath2048Bytes: {
         ...plain,
@@ -186,7 +201,16 @@ function generate() {
     rejected: {
       endpointSlugTrailingHyphen: { ...plain, endpointSlug: "inst-qwen--a1b2c3d4e5f6" },
       endpointSlugDoubleHyphen: { ...plain, endpointSlug: "inst-qw--en-a1b2c3d4e5f6" },
-      endpointSlugReserved: { ...plain, endpointSlug: "health" },
+      // Every `inst-` slug is outside the reserved list, so reserved words are exercised by
+      // `slugCases` instead.
+      endpointSlugWithoutPrefix: { ...plain, endpointSlug: "qwen-a1b2c3d4e5f6" },
+      endpointSlugTooLong: { ...plain, endpointSlug: `inst-${"a".repeat(59)}` },
+      statusU0085IsBlank: external("\u0085"),
+      stopU0085IsBlank: external("status", "\u0085 "),
+      statusIdeographicSpaceIsBlank: external("\u3000\u2028"),
+      embeddingTextU0085IsBlank: embeddings("\u0085"),
+      contextWindowNegative: { ...plain, contextWindow: -1 },
+      contextWindowFraction: { ...plain, contextWindow: 1.5 },
       readinessFragment: { ...plain, readiness: { ...plain.readiness, path: "/health#x" } },
       readinessDoubleSlash: { ...plain, readiness: { ...plain.readiness, path: "//health" } },
       readinessPath2049Bytes: {
@@ -207,7 +231,13 @@ function generate() {
       operatorWithoutInteractive: { ...plain, operator: { terminalId: TERMINAL_ID } },
     },
   };
-  return { protocolVersion: "2.11", jobs, results, wireCases };
+  // The forwarder slug rules (`validateForwarderSlug`, Rust `slug::validate_slug`) on their own,
+  // including the reserved list.
+  const slugCases = {
+    accepted: ["abc", "inst-qwen-a1b2c3d4e5f6", "a".repeat(63), "healthy", "v12"],
+    rejected: ["health", "api", "tokens", "ab", "-abc", "abc-", "a--b", "Abc", "a".repeat(64)],
+  };
+  return { protocolVersion: "2.11", jobs, results, wireCases, slugCases };
 }
 
 describe("deployment job golden generated from admission rendering", () => {
@@ -226,8 +256,13 @@ describe("deployment job golden generated from admission rendering", () => {
 
   it("agrees with the CLI on every edge case", () => {
     for (const [name, job] of Object.entries(golden.wireCases.accepted))
-      expect(deploymentJobWireIssue(job), name).toBeNull();
+      expect(deploymentJobWireIssue(job as DeploymentJob), name).toBeNull();
     for (const [name, job] of Object.entries(golden.wireCases.rejected))
       expect(deploymentJobWireIssue(job as DeploymentJob), name).not.toBeNull();
+    for (const slug of golden.slugCases.accepted)
+      expect(validateForwarderSlug(slug).ok, slug).toBe(true);
+    for (const slug of golden.slugCases.rejected)
+      expect(validateForwarderSlug(slug).ok, slug).toBe(false);
+    expect(validateForwarderSlug("health")).toEqual({ ok: false, reason: "reserved" });
   });
 });

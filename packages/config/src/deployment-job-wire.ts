@@ -81,7 +81,12 @@ export function deploymentJobWireIssue(job: DeploymentJob): string | null {
       ? 300_000
       : 30_000;
   if (!uint(job.timeoutMs) || job.timeoutMs < 1 || job.timeoutMs > maximum) return "timeout";
-  if (job.contextWindow !== null && !uint(job.contextWindow)) return "context window";
+  // `Option<u64>`: absent, null, or any non-negative integer below 2^64.
+  if (
+    job.contextWindow != null &&
+    !(Number.isInteger(job.contextWindow) && job.contextWindow >= 0 && job.contextWindow < 2 ** 64)
+  )
+    return "context window";
   for (const command of [job.command, job.stopCommand, job.statusCommand, job.healthCommand]) {
     const text = command ?? "";
     if (deploymentCommandBytes(text) > DEPLOYMENT_COMMAND_MAX_BYTES || text.includes("\0"))
@@ -89,7 +94,7 @@ export function deploymentJobWireIssue(job: DeploymentJob): string | null {
   }
   if (
     job.management === "externalService" &&
-    (!job.stopCommand?.trim() || !job.statusCommand?.trim())
+    (rustBlank(job.stopCommand) || rustBlank(job.statusCommand))
   )
     return "external service proof";
   const profile = job.transcriptionProfile;
@@ -118,7 +123,7 @@ export function deploymentJobWireIssue(job: DeploymentJob): string | null {
       contract.dimensions > 1_000_000 ||
       !["none", "l2"].includes(contract.normalization) ||
       ![contract.model, contract.revision, contract.vectorSpace].every(
-        (v) => !!v.trim() && utf8(v) <= 256,
+        (v) => !rustBlank(v) && utf8(v) <= 256,
       ))
   )
     return "embedding contract";
@@ -144,7 +149,7 @@ function interactiveIssue(job: DeploymentJob): string | null {
     )
       return "interactive management";
   }
-  if ((interactive || job.stopInteractive === true) && !job.statusCommand?.trim())
+  if ((interactive || job.stopInteractive === true) && rustBlank(job.statusCommand))
     return "interactive status";
   return null;
 }
@@ -154,6 +159,15 @@ export function isCanonicalBase64Url16(value: string): boolean {
   if (!/^[A-Za-z0-9_-]{22}$/.test(value)) return false;
   // The 22nd character carries 2 data bits; its 4 low bits must be zero ("A", "Q", "g", "w").
   return "AQgw".includes(value.charAt(21));
+}
+
+/**
+ * Rust `str::trim().is_empty()`: only Unicode White_Space (`char::is_whitespace`) counts, so
+ * U+0085 is blank and U+FEFF is not (JavaScript `trim()` differs on both).
+ */
+const RUST_WHITESPACE = /^[\t-\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*$/;
+export function rustBlank(value: string | null | undefined): boolean {
+  return !value || RUST_WHITESPACE.test(value);
 }
 
 function uint(value: number) {

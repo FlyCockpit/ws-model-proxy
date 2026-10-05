@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({
   calls: [] as Array<{ name: string; input: unknown }>,
   data: {} as Record<string, unknown>,
+  errors: {} as Record<string, unknown>,
 }));
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key, i18n: { language: "en-US" } }),
@@ -26,6 +27,7 @@ vi.mock("@/utils/orpc", () => {
     mutationOptions: (options?: Record<string, unknown>) => ({
       mutationFn: async (input: unknown) => {
         state.calls.push({ name, input });
+        if (state.errors[name]) throw state.errors[name];
         return state.data[name] ?? { id: "saved", revision: 2 };
       },
       ...options,
@@ -95,6 +97,7 @@ function show(component = <DeploymentsPage />) {
 }
 beforeEach(() => {
   state.calls.length = 0;
+  state.errors = {};
   state.data = {
     configs: { items: [], nextCursor: null },
     instances: { items: [], nextCursor: null },
@@ -173,6 +176,48 @@ describe("managed inference dashboard", () => {
         id: "recipe",
       }),
     );
+  });
+
+  it("renames a recipe whose slug predates the slug rule, and explains a refused rename", async () => {
+    const user = userEvent.setup();
+    const legacy = {
+      id: "recipe",
+      name: "Small",
+      slug: "small-",
+      poolId: "pool",
+      Revisions: [{ id: "revision", revision: 1, spec: { variants: [variant] } }],
+    };
+    state.data.configs = { items: [legacy], nextCursor: null };
+    state.data.config = legacy;
+    show();
+    await user.click(await screen.findByRole("button", { name: /Small · 1/ }));
+    const slug = (await screen.findByLabelText("deployments.slug")) as HTMLInputElement;
+    expect(slug.disabled).toBe(false);
+    expect(screen.getByText("deployments.slugHint")).toBeTruthy();
+    // The unchanged legacy slug still saves other edits, without a rename.
+    await user.click(screen.getByRole("button", { name: "deployments.saveRecipe" }));
+    await waitFor(() => expect(state.calls.some((call) => call.name === "update")).toBe(true));
+    expect(state.calls.find((call) => call.name === "update")?.input).not.toHaveProperty("slug");
+    // A new slug must be valid.
+    state.calls.length = 0;
+    await user.clear(slug);
+    await user.type(slug, "sm--all");
+    await user.click(screen.getByRole("button", { name: "deployments.saveRecipe" }));
+    expect(await screen.findByText("deployments.invalid")).toBeTruthy();
+    expect(state.calls.some((call) => call.name === "update")).toBe(false);
+    // A running recipe cannot be renamed; the refusal says what to do.
+    state.errors.update = Object.assign(new Error("conflict"), {
+      code: "CONFLICT",
+      status: 409,
+      data: { reason: "deployments_running" },
+    });
+    await user.clear(slug);
+    await user.type(slug, "small");
+    await user.click(screen.getByRole("button", { name: "deployments.saveRecipe" }));
+    expect(await screen.findByText("deployments.stopBeforeChange")).toBeTruthy();
+    expect(state.calls.find((call) => call.name === "update")?.input).toMatchObject({
+      slug: "small",
+    });
   });
 
   it("human confirmation displays the immutable stop commands and cannot apply without explicit review", async () => {

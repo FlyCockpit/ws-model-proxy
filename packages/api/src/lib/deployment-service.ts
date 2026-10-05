@@ -481,6 +481,13 @@ function assertDeploymentJobsDeliverable(intent: unknown) {
     // The CLI refuses a job breaking its own rules as `bad_job`, and a refused stop would hold
     // the instance's claims, so nothing it would refuse is ever admitted.
     const issue = deploymentJobWireIssue(deploymentDispatchShape(job));
+    // Only a recipe slug saved before the current slug rule renders an invalid endpoint slug.
+    if (issue === "endpoint slug")
+      throw new ORPCError("BAD_REQUEST", {
+        message:
+          "This recipe's slug is not valid on nodes (it ends with or repeats '-'). Rename the recipe while none of its deployments are running, then start it again.",
+        data: { reason: "invalid_recipe_slug" },
+      });
     if (issue)
       throw new ORPCError("BAD_REQUEST", {
         message: `Rendered ${job.action} job for rank ${job.rank} would be refused by the node (${issue}). Fix the recipe.`,
