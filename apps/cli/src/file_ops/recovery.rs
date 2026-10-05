@@ -883,13 +883,14 @@ impl RecoveryDir {
             .live_stat()
             .zip(pin.live_stat())
             .is_some_and(|(a, b)| a.same_object(&b));
-        self.anchors.push((anchor.clone(), pin));
         if !same {
-            // Some remote filesystems expose a different inode per alias. Do
-            // not turn that into a durable proof or discard an unknown alias.
-            self.unsettled = true;
-            return Err(self.uncertain());
+            // Some filesystems (noino FUSE, sshfs) present a different inode per
+            // name, so this alias can never become a durable proof. The live
+            // operation still works there without a pin; only crash recovery
+            // stays manual (see `prepare_intent`).
+            return self.drop_unproven_anchor(dir, name, &source, anchor, pin);
         }
+        self.anchors.push((anchor.clone(), pin));
         // Do not advertise a durable pin where directory durability is not
         // supported. Its live alias still belongs to us and is cleaned normally,
         // but a crash leaves only ambiguity rather than destructive authority.
@@ -903,6 +904,52 @@ impl RecoveryDir {
             }
             Err(errno) => Err(self.barrier_failed(barrier_error(errno))),
         }
+    }
+
+    /// Remove a pre-effect pin whose identity cannot be proven against the
+    /// source, leaving the record without an anchor. The alias is proven only at
+    /// its OWN private name (as the noino link probe is), and removed only while
+    /// the public name it was linked from still holds the source, so it is never
+    /// the last name of an object. A pin that matches the current public name instead of
+    /// the held source means the name was swapped: that, or any failed proof,
+    /// keeps the alias reported with an uncertain outcome.
+    fn drop_unproven_anchor(
+        &mut self,
+        dir: &OwnedFd,
+        name: &OsStr,
+        source: &Held,
+        anchor: String,
+        mut pin: Held,
+    ) -> FileResult<()> {
+        let public = fstatat(dir.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW)
+            .ok()
+            .map(|raw| Stat::from_raw(&raw));
+        let swapped = public
+            .zip(pin.live_stat())
+            .is_some_and(|(public, pin)| public.same_object(&pin));
+        if public.is_none()
+            || swapped
+            || !self.holds_name(dir, name, source)
+            || !self.holds_name(&self.dir, OsStr::new(&anchor), &pin)
+        {
+            self.anchors.push((anchor, pin));
+            self.unsettled = true;
+            return Err(self.uncertain());
+        }
+        // Close our pin descriptor before unlink (NFS sillyrename avoidance).
+        pin.release();
+        if unlinkat(
+            self.dir.as_fd(),
+            anchor.as_str(),
+            UnlinkatFlags::NoRemoveDir,
+        )
+        .is_err()
+        {
+            self.remember(self.path.join(&anchor));
+            self.unsettled = true;
+            return Err(self.uncertain());
+        }
+        Ok(())
     }
 
     pub(super) fn set_intent_phase(&mut self, phase: IntentPhase) -> FileResult<()> {
