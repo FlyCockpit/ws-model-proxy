@@ -2135,4 +2135,21 @@ integration("interactive operator steps at PostgreSQL", () => {
     expect(await step(stopId)).toMatchObject({ state: "RUNNING", operatorHold: null });
     expect(await need(s.instance.id)).toBeNull();
   }, 30_000);
+
+  it("a new need starts its email notice over: the failure count resets (N2)", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id]);
+    await fixture.deploymentInstance.update({
+      where: { id: s.instance.id },
+      data: { needsOperatorNotifyFailures: 1 },
+    });
+    const h = harness([socketFor(user.id, device.id)]);
+    await h.tickUntil(() => h.jobs.length > 0);
+    expect(await h.report(h.jobs[0]!, "awaiting_operator")).toBe(true);
+    expect(await inst(s.instance.id)).toMatchObject({
+      needsOperator: "STEP",
+      needsOperatorNotifyFailures: 0,
+    });
+  }, 30_000);
 });

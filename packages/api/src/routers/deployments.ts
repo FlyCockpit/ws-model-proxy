@@ -9,11 +9,13 @@ import {
   AGENT_EDITED_REVISION,
   applyDeploymentPlan,
   createDeploymentPlan,
+  type DeploymentAuthorshipHistory,
   type DeploymentRequester,
-  deploymentOperatorCommandAuthor,
+  deploymentCommandAuthorFromHistory,
   deploymentPlanContentsSchema,
   deploymentStartInputSchema,
   liveDeploymentInstanceWhere,
+  loadDeploymentAuthorship,
   loadDeploymentState,
   lockDeploymentOwner,
   reopenDeploymentOperatorStep,
@@ -158,31 +160,58 @@ function operatorStepView(step: OperatorStepRow, author: DeploymentCommandAuthor
   };
 }
 /**
- * Operator step views with each command's author (security review L2). The authorship scan
- * is memoized per recipe revision, variant, rank and action within one call.
+ * Operator step views with each command's author (security review L2), for several instances
+ * at once: one query for their revisions, then one history query per recipe shared by all of
+ * its instances (review N1; the 5 s dashboard poll and MCP read this). The rule is the node
+ * confirm screen's (`deploymentCommandAuthorFromHistory`); a history that cannot be read gives
+ * `unknown`.
  */
-async function operatorStepViews(
-  instance: { revisionId: string; variantKey: string },
-  steps: readonly OperatorStepRow[],
-  memo: Map<string, Promise<DeploymentCommandAuthor>>,
+async function operatorStepViewsFor(
+  groups: ReadonlyArray<{
+    instance: { revisionId: string; variantKey: string };
+    steps: readonly OperatorStepRow[];
+  }>,
 ) {
-  return Promise.all(
-    steps.map(async (step) => {
-      const intent = intentCommand.safeParse(step.intent);
-      const action = intent.success ? intent.data.action : step.phase;
-      const key = `${instance.revisionId}\u0000${instance.variantKey}\u0000${step.rank}\u0000${action}`;
-      let author = memo.get(key);
-      if (!author) {
-        author = isDeploymentJobAction(action)
-          ? deploymentOperatorCommandAuthor(prisma, instance, { rank: step.rank, action }).catch(
-              () => "unknown" as const,
-            )
-          : Promise.resolve("unknown" as const);
-        memo.set(key, author);
-      }
-      return operatorStepView(step, await author);
+  const wanted = groups.filter((group) => group.steps.length > 0);
+  const revisions = wanted.length
+    ? await prisma.deploymentConfigRevision.findMany({
+        where: { id: { in: [...new Set(wanted.map((group) => group.instance.revisionId))] } },
+        select: { id: true, configId: true, revision: true },
+      })
+    : [];
+  const byId = new Map(revisions.map((revision) => [revision.id, revision]));
+  const perConfig = new Map<string, number[]>();
+  for (const revision of revisions)
+    perConfig.set(revision.configId, [
+      ...(perConfig.get(revision.configId) ?? []),
+      revision.revision,
+    ]);
+  const histories = new Map<string, DeploymentAuthorshipHistory | null>();
+  await Promise.all(
+    [...perConfig].map(async ([configId, numbers]) => {
+      histories.set(
+        configId,
+        await loadDeploymentAuthorship(prisma, configId, numbers).catch(() => null),
+      );
     }),
   );
+  return groups.map(({ instance, steps }) => {
+    const revision = byId.get(instance.revisionId);
+    const history = revision ? histories.get(revision.configId) : null;
+    return steps.map((step) => {
+      const intent = intentCommand.safeParse(step.intent);
+      const action = intent.success ? intent.data.action : step.phase;
+      const author =
+        revision && history && isDeploymentJobAction(action)
+          ? deploymentCommandAuthorFromHistory(
+              history,
+              { revision: revision.revision, variantKey: instance.variantKey },
+              { rank: step.rank, action },
+            )
+          : "unknown";
+      return operatorStepView(step, author);
+    });
+  });
 }
 const DEPLOYMENT_JOB_ACTIONS = [
   "prepare",
@@ -456,15 +485,15 @@ export const deploymentsRouter = {
       }),
       input.limit,
     );
-    const memo = new Map<string, Promise<DeploymentCommandAuthor>>();
+    const views = await operatorStepViewsFor(
+      page.items.map((item) => ({ instance: item, steps: item.Steps })),
+    );
     return {
       ...page,
-      items: await Promise.all(
-        page.items.map(async ({ Steps, ...instance }) => ({
-          ...instance,
-          operatorSteps: await operatorStepViews(instance, Steps, memo),
-        })),
-      ),
+      items: page.items.map(({ Steps: _steps, ...instance }, index) => ({
+        ...instance,
+        operatorSteps: views[index] ?? [],
+      })),
     };
   }),
   /**
@@ -508,7 +537,7 @@ export const deploymentsRouter = {
     return {
       ...instance,
       Steps: instance.Steps.map(publicStep),
-      operatorSteps: await operatorStepViews(instance, operatorSteps, new Map()),
+      operatorSteps: (await operatorStepViewsFor([{ instance, steps: operatorSteps }]))[0] ?? [],
       stepsTruncated: instance._count.Steps > instance.Steps.length,
     };
   }),

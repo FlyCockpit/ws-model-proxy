@@ -323,13 +323,69 @@ export async function deploymentOperatorCommandAuthor(
 ): Promise<DeploymentCommandAuthor> {
   const revision = await tx.deploymentConfigRevision.findUnique({
     where: { id: instance.revisionId },
-    select: { configId: true, revision: true, spec: true },
+    select: { configId: true, revision: true },
   });
   if (!revision) return "unknown";
-  const spec = storedDeploymentSpecSchema.safeParse(revision.spec);
-  const variant = spec.success
-    ? spec.data.variants.find((candidate) => candidate.key === instance.variantKey)
-    : undefined;
+  const history = await loadDeploymentAuthorship(tx, revision.configId, [revision.revision]);
+  return deploymentCommandAuthorFromHistory(
+    history,
+    { revision: revision.revision, variantKey: instance.variantKey },
+    job,
+  );
+}
+/** A recipe's revisions, newest first, each parsed once (null: unreadable). */
+export type DeploymentAuthorshipHistory = ReadonlyArray<{
+  revision: number;
+  editorKind: string;
+  spec: z.infer<typeof storedDeploymentSpecSchema> | null;
+}>;
+/**
+ * The revision history the authorship rule reads for every given revision number of one
+ * recipe, in ONE query: for each revision r, the rule reads the newest
+ * {@link AUTHORSHIP_REVISION_LIMIT} revisions <= r, and those all lie within the newest
+ * `limit + (max - min)` revisions <= max (revision numbers are unique per recipe).
+ */
+export async function loadDeploymentAuthorship(
+  tx: Pick<Tx, "deploymentConfigRevision">,
+  configId: string,
+  revisions: readonly number[],
+): Promise<DeploymentAuthorshipHistory> {
+  if (!revisions.length) return [];
+  const max = Math.max(...revisions);
+  const min = Math.min(...revisions);
+  const rows = await tx.deploymentConfigRevision.findMany({
+    where: { configId, revision: { lte: max } },
+    orderBy: { revision: "desc" },
+    take: AUTHORSHIP_REVISION_LIMIT + (max - min),
+    select: { revision: true, editorKind: true, spec: true },
+  });
+  return rows.map((row) => {
+    const spec = storedDeploymentSpecSchema.safeParse(row.spec);
+    return {
+      revision: row.revision,
+      editorKind: row.editorKind,
+      spec: spec.success ? spec.data : null,
+    };
+  });
+}
+/**
+ * The authorship rule (chunk 5; the node's confirm screen shows its result) over a loaded
+ * history: the raw recipe text the step runs, then `agent` if any AGENT revision up to the
+ * instance's holds that exact text, `user` only if the earliest revision holding it was saved
+ * by USER, else `unknown` (SCHEDULE, an unreadable revision, more than
+ * {@link AUTHORSHIP_REVISION_LIMIT} revisions, or a missing revision, variant or command).
+ */
+export function deploymentCommandAuthorFromHistory(
+  history: DeploymentAuthorshipHistory,
+  instance: { revision: number; variantKey: string },
+  job: Pick<DeploymentJob, "rank" | "action">,
+): DeploymentCommandAuthor {
+  const window = history
+    .filter((candidate) => candidate.revision <= instance.revision)
+    .slice(0, AUTHORSHIP_REVISION_LIMIT);
+  const own = window[0];
+  if (own?.revision !== instance.revision) return "unknown";
+  const variant = own.spec?.variants.find((candidate) => candidate.key === instance.variantKey);
   if (!variant) return "unknown";
   const source = deploymentCommandSource(variant, job.rank, job.action);
   let text: unknown;
@@ -340,28 +396,23 @@ export async function deploymentOperatorCommandAuthor(
   }
   if (typeof text !== "string") return "unknown";
   const raw = text;
-  const history = await tx.deploymentConfigRevision.findMany({
-    where: { configId: revision.configId, revision: { lte: revision.revision } },
-    orderBy: { revision: "desc" },
-    take: AUTHORSHIP_REVISION_LIMIT,
-    select: { revision: true, editorKind: true, spec: true },
-  });
   let earliest: { editorKind: string } | undefined;
   let unreadable = false;
-  for (const candidate of history) {
-    const parsed = storedDeploymentSpecSchema.safeParse(candidate.spec);
-    if (!parsed.success) {
+  for (const candidate of window) {
+    if (!candidate.spec) {
       unreadable = true;
       continue;
     }
-    const holds = parsed.data.variants.some((v) => variantCommandTexts(v.commands).includes(raw));
+    const holds = candidate.spec.variants.some((v) =>
+      variantCommandTexts(v.commands).includes(raw),
+    );
     if (!holds) continue;
     if (candidate.editorKind === "AGENT") return "agent";
-    // `history` is newest first, so the last match is the earliest revision holding the text.
+    // `window` is newest first, so the last match is the earliest revision holding the text.
     earliest = candidate;
   }
   // An unreadable revision may be an agent's; a truncated scan may miss the first author.
-  if (unreadable || history.length >= AUTHORSHIP_REVISION_LIMIT) return "unknown";
+  if (unreadable || window.length >= AUTHORSHIP_REVISION_LIMIT) return "unknown";
   return earliest?.editorKind === "USER" ? "user" : "unknown";
 }
 /**
@@ -457,7 +508,12 @@ export async function syncDeploymentOperatorNeed(tx: Tx, instanceId: string) {
   if (need === instance.needsOperator) return;
   await tx.deploymentInstance.update({
     where: { id: instanceId },
-    data: { needsOperator: need, needsOperatorSince: need ? now : null },
+    // A new need is a new notice: its send-failure count starts over.
+    data: {
+      needsOperator: need,
+      needsOperatorSince: need ? now : null,
+      needsOperatorNotifyFailures: 0,
+    },
   });
 }
 /**
@@ -520,6 +576,7 @@ export async function restartDeploymentInstance(
           operatorRestartRequestedAt: now,
           needsOperator: null,
           needsOperatorSince: null,
+          needsOperatorNotifyFailures: 0,
         },
       });
     },
