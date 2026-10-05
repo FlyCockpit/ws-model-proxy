@@ -413,6 +413,28 @@ export const deploymentsRouter = {
       })),
     };
   }),
+  /**
+   * The dashboard's "needs you" feed: the owner's instances that wait for them (a step to run
+   * in an operator terminal, or a restart), newest first, at most 20, with the total count.
+   */
+  operatorNeeds: protectedProcedure.handler(async ({ context }) => {
+    const where = { userId: context.session.user.id, needsOperator: { not: null } } as const;
+    const [count, items] = await Promise.all([
+      prisma.deploymentInstance.count({ where }),
+      prisma.deploymentInstance.findMany({
+        where,
+        select: {
+          id: true,
+          endpointSlug: true,
+          needsOperator: true,
+          needsOperatorSince: true,
+        },
+        orderBy: [{ needsOperatorSince: "desc" }, { id: "asc" }],
+        take: 20,
+      }),
+    ]);
+    return { count, items };
+  }),
   getInstance: protectedProcedure.input(idInput).handler(async ({ context, input }) => {
     const instance = await prisma.deploymentInstance.findFirst({
       where: { id: input.id, userId: context.session.user.id },

@@ -2253,5 +2253,70 @@
     "failed": "Could not save your own-key choice. Try again.",
     "aggregate": "Requests served with grantees’ own keys: {{count}}",
     "adaptation": "Allow protocol adaptation for my own model"
+  },
+  "deploymentOperator": {
+    "badge_one": "{{count}} deployment needs you",
+    "badge_other": "{{count}} deployments need you",
+    "noticeTitle_one": "A deployment is waiting for you",
+    "noticeTitle_other": "{{count}} deployments are waiting for you",
+    "noticeStep": "{{endpoint}} waits for a command you run yourself in a terminal on the node.",
+    "noticeRestart": "{{endpoint}} stopped and waits for you to restart it.",
+    "open": "Open deployments",
+    "tabLabel": "Deployment step · {{cli}}",
+    "closeStep": "Close terminal",
+    "closeStepTitle": "Close this deployment step's terminal?",
+    "closeStepDescription": "Nothing has run yet. The deployment keeps waiting for you; reopen the step from Deployments when you are ready.",
+    "closeRunningDescription": "The command running in this terminal stops too. The deployment keeps waiting for you; reopen the step from Deployments to run it again.",
+    "panelTitle": "Deployment step: {{action}} on rank {{rank}}",
+    "panelTitleUnknown": "Deployment step",
+    "panelAwaiting": "The terminal shows the exact command. Press Enter there to run it, or q to close it. It never opens a shell.",
+    "panelRunning": "The command is running. Closing this terminal stops it.",
+    "view": "View",
+    "ended": "This deployment step's terminal ended. Deployments shows what happens next.",
+    "actions": {
+      "prepare": "Prepare",
+      "start": "Start",
+      "after_join": "Start after join",
+      "stop": "Stop"
+    },
+    "status": {
+      "waitingTerminal": "waiting for you in its terminal",
+      "closed": "terminal closed; reopen it to run the step",
+      "running": "running in its terminal",
+      "overdue": "running longer than expected; it may wait for input in its terminal",
+      "pending": "waiting to open its terminal",
+      "heldCheck": "checking that an earlier service stopped"
+    },
+    "reasons": {
+      "capabilityMissing": "The node cannot open operator terminals. On the node run `wsmp config set-deployment-operator-terminal on`, then reconnect it.",
+      "sessionFull": "The node has too many terminals open; it opens when one closes.",
+      "nodeFull": "The node already has the most step terminals it can show at once; it opens when one finishes.",
+      "terminalFailed": "The node could not open the terminal. Reopen the step to try again.",
+      "terminalLimit": "The node has too many terminals open. Close one, then reopen the step.",
+      "unverified": "The command finished, but the status check did not confirm it. Reopen the step; the status check decides again.",
+      "heldCheck": "A status check that the earlier service stopped.",
+      "other": "Reason: {{code}}"
+    },
+    "needStep": "Needs you: a step waits for you to run it in a terminal on the node.",
+    "needRestart": "Stopped, needs you: its start runs in a terminal, so it is never restarted automatically.",
+    "stepsLabel": "Steps you run",
+    "stepTitle": "{{action}} · rank {{rank}} · node {{node}}",
+    "lastExit": "Last run exited with code {{code}}.",
+    "openTerminal": "Open terminal",
+    "reopen": "Reopen step",
+    "restart": "Restart",
+    "heldTitle": "Resources held until an earlier stop is confirmed",
+    "heldNode": "Node {{node}}, rank {{rank}}, port {{port}}",
+    "heldHint": "They stay reserved so no other deployment uses them while the earlier service might still run. A status check frees them once the node is connected.",
+    "planStep": "{{action}} on rank {{rank}}, node {{node}}",
+    "planStopStep": "{{action}} of {{instance}} on rank {{rank}}, node {{node}}",
+    "moreSteps_one": "And {{count}} more step.",
+    "moreSteps_other": "And {{count}} more steps.",
+    "unusedReasons": {
+      "single_node": "A single-node deployment does not run it.",
+      "not_head": "Only the head node runs it.",
+      "after_join_replaces_start": "The head runs afterJoin instead of start.",
+      "no_command": "The recipe does not define that command."
+    }
   }
 }

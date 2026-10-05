@@ -1,0 +1,8 @@
+{
+  "subject": "A deployment needs you",
+  "heading": "A deployment is waiting for you",
+  "stepBody": "The deployment {{endpoint}} is waiting for a command that you run yourself in a terminal on the node (for example one that asks for a sudo password).",
+  "restartBody": "The deployment {{endpoint}} stopped. Its start command is one you run yourself, so WS Model Proxy does not restart it on its own: restart it from the dashboard when you are ready.",
+  "cta": "Open deployments",
+  "footer": "You get this email because a deployment you own uses interactive recipe commands. Agents cannot answer these steps for you."
+}

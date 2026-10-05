@@ -1467,6 +1467,40 @@ describe("useTerminalSessions (agent requests)", () => {
     await waitFor(() => expect(sentOfType("attach")).toHaveLength(1));
   });
 
+  it("lists a deployment step's terminal without attaching; picking it attaches, closing the tab keeps it listed", async () => {
+    currentCli = await fakeCli();
+    const listed = await listedCli(currentCli);
+    const view = renderHook(() => useTerminalSessions({ pinStore: createMemoryCliPinStore() }));
+    const deployment = {
+      ...listedTerminal(false),
+      origin: "deployment" as const,
+      supervised: null,
+      deployment: {
+        stepId: "step-1",
+        instanceId: "instance-1",
+        rank: 0,
+        action: "start" as const,
+        state: "awaiting" as const,
+      },
+    };
+    message({ type: "terminals", clis: [listed], terminals: [deployment] });
+    await settle();
+    expect(sentOfType("attach")).toEqual([]);
+    const tab = view.result.current.tabs[0];
+    expect(tab).toMatchObject({
+      origin: "deployment",
+      phase: "waiting",
+      deployment: { stepId: "step-1", action: "start" },
+    });
+    act(() => view.result.current.selectTab(tab?.localId ?? ""));
+    await waitFor(() => expect(sentOfType("attach")).toHaveLength(1));
+    // Closing the tab only stops viewing it: the step's terminal stays listed and waiting.
+    act(() => view.result.current.detachTab(tab?.localId ?? ""));
+    await settle();
+    expect(view.result.current.tabs[0]).toMatchObject({ origin: "deployment", phase: "waiting" });
+    expect(sentOfType("close")).toEqual([]);
+  });
+
   it("drops keystrokes until the confirm screen has been shown", async () => {
     const { view, cli, localId, events } = await attachAgent();
     act(() => view.result.current.sendInput(localId, "\r"));

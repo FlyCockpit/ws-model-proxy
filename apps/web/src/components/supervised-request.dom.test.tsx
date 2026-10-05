@@ -67,6 +67,7 @@ function agentTab(overrides: Partial<TerminalTab> = {}): TerminalTab {
     ptyRows: null,
     opener: false,
     origin: "agent",
+    deployment: null,
     supervised: {
       commandId: "Y29tbWFuZC1pZC0wMDAwMQ",
       status: "awaiting_output_review",

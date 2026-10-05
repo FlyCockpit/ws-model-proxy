@@ -2045,4 +2045,49 @@ integration("interactive operator steps at PostgreSQL", () => {
     });
     expect(h.jobs[0]!.operator?.commandAuthor).toBe("user");
   }, 30_000);
+
+  // ---- Chunk 10: "needs you" email notices ----
+
+  it("emails a settled need once, in the owner's locale, and only to an active verified owner", async () => {
+    const { notifyDeploymentOperatorNeeds } = await import(
+      "@ws-model-proxy/api/lib/deployment-operator-notify"
+    );
+    const user = await owner();
+    await fixture.user.update({
+      where: { id: user.id },
+      data: { emailVerified: true, locale: "es-MX" },
+    });
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id]);
+    const since = new Date(Date.now() - 10 * 60_000);
+    await fixture.deploymentInstance.update({
+      where: { id: s.instance.id },
+      data: { needsOperator: "STEP", needsOperatorSince: since },
+    });
+    const sent: Array<{ to: string; subject: string; html: string }> = [];
+    const send = async (message: { to: string; subject: string; html: string }) => {
+      sent.push(message);
+    };
+    const notify = () => notifyDeploymentOperatorNeeds({ db: production, send, configured: true });
+    await notify();
+    const mine = () => sent.filter((message) => message.to === user.email);
+    expect(mine()).toHaveLength(1);
+    expect(mine()[0]?.subject).toBe("Un despliegue te necesita");
+    expect(mine()[0]?.html).toContain(s.instance.endpointSlug);
+    // Claimed: a second sweep (or another replica) sends nothing more.
+    await notify();
+    expect(mine()).toHaveLength(1);
+    expect((await inst(s.instance.id)).needsOperatorNotifiedAt?.getTime()).toBeGreaterThan(
+      since.getTime(),
+    );
+    // A banned owner gets nothing, even for a fresh need.
+    const other = await instance(user.id, [device.id], { port: 30900 });
+    await fixture.deploymentInstance.update({
+      where: { id: other.instance.id },
+      data: { needsOperator: "STEP", needsOperatorSince: since },
+    });
+    await fixture.user.update({ where: { id: user.id }, data: { banned: true } });
+    await notify();
+    expect(mine()).toHaveLength(1);
+  }, 30_000);
 });

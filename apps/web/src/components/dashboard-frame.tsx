@@ -23,7 +23,12 @@ import { useTranslation } from "react-i18next";
 
 import { AgentRequestsBadge } from "@/components/agent-requests-badge";
 import { AgentRequestsNotice } from "@/components/agent-requests-notice";
+import {
+  DeploymentNeedsBadge,
+  DeploymentOperatorNotice,
+} from "@/components/deployment-operator-notice";
 import { TerminalStatusDot } from "@/components/terminal-status-dot";
+import { useDeploymentOperatorNeeds } from "@/hooks/use-deployment-operator-needs";
 import { usePendingAgentRequests } from "@/hooks/use-pending-agent-requests";
 import { TerminalWorkspaceProvider, useTerminalWorkspace } from "@/hooks/use-terminal-workspace";
 import { useUiPreferences } from "@/stores/ui-preferences";
@@ -49,6 +54,7 @@ const overview: Section = {
   icon: LayoutDashboard,
   exact: true,
 };
+const DEPLOYMENTS_ROUTE = "/$lang/dashboard/deployments";
 const terminals: Section = {
   to: "/$lang/dashboard/terminals",
   labelKey: "dashboard:nav.terminals",
@@ -186,6 +192,11 @@ function DashboardLayout({
   const sidebarCollapsed = useUiPreferences((state) => state.sidebarCollapsed);
   const toggleSidebar = useUiPreferences((state) => state.toggleSidebar);
   const workspace = useTerminalWorkspace();
+  const deploymentNeeds = useDeploymentOperatorNeeds();
+  const matchDeployments = useMatchRoute();
+  const onDeployments = Boolean(
+    matchDeployments({ to: DEPLOYMENTS_ROUTE, params: { lang }, fuzzy: true }),
+  );
   // Once mounted, the workspace stays mounted (hidden) so terminals keep their
   // screens while other dashboard pages show.
   const [workspaceMounted, setWorkspaceMounted] = useState(false);
@@ -268,6 +279,7 @@ function DashboardLayout({
                       item={item}
                       lang={lang}
                       collapsed={sidebarCollapsed}
+                      needs={item.to === DEPLOYMENTS_ROUTE ? deploymentNeeds.count : 0}
                     />
                   ),
                 )}
@@ -284,6 +296,7 @@ function DashboardLayout({
             {/* Keep agent requests visible above fill routes. */}
             <div data-agent-requests="fill" className="shrink-0 px-2 pt-2 empty:hidden md:px-4">
               {onTerminals ? null : <AgentRequestsNotice lang={lang} />}
+              {onTerminals || onDeployments ? null : <DeploymentOperatorNotice lang={lang} />}
             </div>
             {/* The terminals route renders nothing; the workspace below fills instead. */}
             <div
@@ -303,6 +316,7 @@ function DashboardLayout({
 
               <div className="flex min-h-0 min-w-0 max-w-full flex-1 flex-col">
                 <AgentRequestsNotice lang={lang} />
+                {onDeployments ? null : <DeploymentOperatorNotice lang={lang} />}
                 <Outlet />
               </div>
             </div>
@@ -327,6 +341,7 @@ function SidebarLink({
   collapsed,
   className,
   badge = 0,
+  needs = 0,
 }: {
   item: Section;
   lang: string;
@@ -334,6 +349,8 @@ function SidebarLink({
   className?: string;
   /** Agent requests waiting (Terminals only). */
   badge?: number;
+  /** Deployments waiting for the user (Deployments only). */
+  needs?: number;
 }) {
   const { t } = useTranslation(["dashboard"]);
   return (
@@ -349,7 +366,7 @@ function SidebarLink({
           size: collapsed ? "icon-touch" : "touch",
         }),
         "text-muted-foreground",
-        collapsed ? "justify-center" : "justify-start gap-2",
+        collapsed ? "relative justify-center" : "justify-start gap-2",
         className,
       )}
       activeProps={{
@@ -358,11 +375,18 @@ function SidebarLink({
     >
       <item.icon aria-hidden="true" className="size-4" />
       {collapsed ? (
-        <span className="sr-only">{t(item.labelKey)}</span>
+        <>
+          <span className="sr-only">{t(item.labelKey)}</span>
+          <DeploymentNeedsBadge
+            count={needs}
+            className="pointer-events-none absolute bottom-1 end-1"
+          />
+        </>
       ) : (
         <>
           <span className="min-w-0 truncate">{t(item.labelKey)}</span>
           <AgentRequestsBadge count={badge} className="ms-auto" />
+          <DeploymentNeedsBadge count={needs} className="ms-auto" />
         </>
       )}
     </Link>
@@ -485,6 +509,7 @@ function MobileSectionMenu({ lang, className }: { lang: string; className?: stri
   const [open, setOpen] = useState(false);
   const matchRoute = useMatchRoute();
   const agentRequests = usePendingAgentRequests();
+  const deploymentNeeds = useDeploymentOperatorNeeds();
   const current =
     dashboardSections.find((section) =>
       matchRoute({ to: section.to, params: { lang }, fuzzy: !section.exact }),
@@ -505,9 +530,16 @@ function MobileSectionMenu({ lang, className }: { lang: string; className?: stri
           <span className="min-w-0 truncate">{t(current.labelKey)}</span>
           <span className="sr-only">{t("dashboard:nav.openSections")}</span>
           <AgentRequestsBadge count={agentRequests.count} className="ms-auto" />
+          <DeploymentNeedsBadge
+            count={deploymentNeeds.count}
+            className={agentRequests.count > 0 ? "" : "ms-auto"}
+          />
           <ChevronDown
             aria-hidden="true"
-            className={cn("size-4", agentRequests.count > 0 ? "" : "ms-auto")}
+            className={cn(
+              "size-4",
+              agentRequests.count > 0 || deploymentNeeds.count > 0 ? "" : "ms-auto",
+            )}
           />
         </Button>
         <SheetContent
@@ -553,6 +585,9 @@ function MobileSectionMenu({ lang, className }: { lang: string; className?: stri
                       {t(item.labelKey)}
                       {item.to === terminals.to ? (
                         <AgentRequestsBadge count={agentRequests.count} className="ms-auto" />
+                      ) : null}
+                      {item.to === DEPLOYMENTS_ROUTE ? (
+                        <DeploymentNeedsBadge count={deploymentNeeds.count} className="ms-auto" />
                       ) : null}
                     </Link>
                   ))}

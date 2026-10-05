@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { notifyDeploymentOperatorNeeds } from "@ws-model-proxy/api/lib/deployment-operator-notify";
 import { deploymentFingerprint } from "@ws-model-proxy/api/lib/deployment-planner";
 import {
   DEPLOYMENT_OPERATOR_RESTART_LIMIT,
@@ -120,6 +121,8 @@ const HELD_UNKNOWN_PROBE_RETRY = 300_000;
 /** Probe stops get their own sequences, clear of the gang stops' `100 + 10 * generation`. */
 const HELD_UNKNOWN_PROBE_SEQUENCE = 5000;
 const LIVE_STEP_STATES = ["PENDING", "RUNNING", "AWAITING_OPERATOR"] as const;
+/** How often the reconciler checks for "needs you" emails to send. */
+const NEEDS_EMAIL_INTERVAL_MS = 30_000;
 /** The audit action of an interactive step's intent (prepare, start, after_join or stop). */
 function operatorAction(intent: Prisma.JsonValue) {
   const action =
@@ -167,6 +170,7 @@ export class DeploymentReconciler {
   private drainCursor: string | null = null;
   private probeCursor: string | null = null;
   private revokedCursor: string | null = null;
+  private lastNeedsEmailAt = 0;
   private instanceCursor: { updatedAt: Date; id: string } | null = null;
   private resultChains = new Map<string, Promise<unknown>>();
   constructor(
@@ -1396,7 +1400,20 @@ export class DeploymentReconciler {
     await this.drainInactiveOwners();
     await this.probeHeldUnknown();
     await this.closeRevokedOperatorTerminals();
+    this.emailOperatorNeeds();
     await this.pruneHealthHistory();
+  }
+  /**
+   * Email owners whose deployments wait for them (SMTP only), every
+   * {@link NEEDS_EMAIL_INTERVAL_MS}, off the tick's critical path (joined at shutdown).
+   */
+  private emailOperatorNeeds() {
+    const now = Date.now();
+    if (now - this.lastNeedsEmailAt < NEEDS_EMAIL_INTERVAL_MS) return;
+    this.lastNeedsEmailAt = now;
+    void this.track(notifyDeploymentOperatorNeeds({ db: this.db })).catch(() => {
+      console.error("[deployments] needs-you notices failed");
+    });
   }
   private async ownerActive(tx: Tx, userId: string) {
     const owner = await tx.user.findUnique({

@@ -207,3 +207,26 @@ describe("interactive recipe commands", () => {
     expect(JSON.stringify(status)).not.toContain("AAECAwQFBgcICQoLDA0ODw");
   });
 });
+
+describe("the needs-you feed", () => {
+  it("counts and lists only this owner's waiting deployments", async () => {
+    db.deploymentInstance.count.mockResolvedValue(3);
+    db.deploymentInstance.findMany.mockResolvedValue([
+      {
+        id: "i1",
+        endpointSlug: "inst-a",
+        needsOperator: "RESTART",
+        needsOperatorSince: new Date(),
+      },
+    ]);
+    const feed = await client().operatorNeeds();
+    expect(feed).toMatchObject({ count: 3, items: [{ id: "i1", needsOperator: "RESTART" }] });
+    expect(db.deploymentInstance.count).toHaveBeenCalledWith({
+      where: { userId: "user-id", needsOperator: { not: null } },
+    });
+    expect(db.deploymentInstance.findMany.mock.calls[0]?.[0]).toMatchObject({
+      where: { userId: "user-id", needsOperator: { not: null } },
+      take: 20,
+    });
+  });
+});

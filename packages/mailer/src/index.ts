@@ -96,6 +96,10 @@ export {
   resolveMailerLocale,
 } from "./locales/index.js";
 export {
+  type RenderDeploymentNeedsYouArgs,
+  renderDeploymentNeedsYou,
+} from "./templates/deployment-needs-you.js";
+export {
   type RenderInviteUserArgs,
   type RenderInviteUserResult,
   renderInviteUser,

@@ -24,6 +24,11 @@ import { useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { z } from "zod";
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
+import {
+  InstanceOperatorPanel,
+  PlanOperatorSteps,
+  RecipeInteractiveWarnings,
+} from "@/components/deployment-operator-panels";
 import { useAuthSession } from "@/hooks/use-auth-session";
 import { friendly } from "@/utils/friendly-error";
 import { orpc } from "@/utils/orpc";
@@ -213,6 +218,7 @@ export function DeploymentsPage() {
                 {instance.endpointSlug} · {t(`deployments.states.${instance.observedState}`)} ·{" "}
                 {t(`deployments.states.${instance.desiredState}`)}
               </p>
+              <InstanceOperatorPanel instance={instance} />
               <ul className="text-sm">
                 {instance.Nodes.map((node) => (
                   <li key={node.id} className="break-words">
@@ -331,6 +337,9 @@ function RecipeEditor({
   const update = useMutation(orpc.deployments.updateConfig.mutationOptions());
   const remove = useMutation(orpc.deployments.deleteConfig.mutationOptions());
   const [deleteOpen, setDeleteOpen] = useState(false);
+  const [warnings, setWarnings] = useState<
+    Awaited<ReturnType<AppRouterClient["deployments"]["updateConfig"]>>["interactiveWarnings"]
+  >([]);
   const latest = config?.Revisions[0];
   // The edit base is captured with the draft, not advanced by background
   // refetches. Only our successful save advances optimistic concurrency.
@@ -368,13 +377,16 @@ function RecipeEditor({
             spec,
           });
           setExpectedRevision(revision.revision);
-        } else
-          await create.mutateAsync({
+          setWarnings(revision.interactiveWarnings);
+        } else {
+          const created = await create.mutateAsync({
             name: value.name,
             slug: value.slug,
             poolId: value.poolId,
             spec,
           });
+          setWarnings(created.interactiveWarnings);
+        }
         onSaved();
       } catch {
         /* mutation state retains the draft */
@@ -482,6 +494,7 @@ function RecipeEditor({
           </Button>
         ) : null}
       </div>
+      <RecipeInteractiveWarnings warnings={warnings} />
       {create.isError || update.isError || remove.isError ? (
         <p role="alert">{recipeErrorText(create.error ?? update.error ?? remove.error, t)}</p>
       ) : null}
@@ -670,6 +683,7 @@ function PlanPreview({ planId, onApplied }: { planId: string; onApplied: () => v
           <pre className="min-w-0 whitespace-pre-wrap break-all rounded bg-muted p-3 text-xs">
             {reviewText(contents)}
           </pre>
+          <PlanOperatorSteps contents={contents} />
           {plan.data?.preview.agentEdited ? (
             <p
               role="note"

@@ -151,6 +151,9 @@ model DeploymentInstance {
   needsOperatorSince         DateTime?
   /// When a person last asked for a restart of an interactive start.
   operatorRestartRequestedAt DateTime?
+  /// When the owner was last emailed that this instance needs them (SMTP configured only).
+  /// Claimed with a guarded update so one replica sends each notice.
+  needsOperatorNotifiedAt    DateTime?
   User                       User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
   Config                     DeploymentConfig         @relation(fields: [configId], references: [id], onDelete: Restrict)
   Revision                   DeploymentConfigRevision @relation(fields: [revisionId], references: [id], onDelete: Restrict)

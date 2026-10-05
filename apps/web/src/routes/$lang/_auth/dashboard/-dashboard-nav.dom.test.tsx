@@ -48,6 +48,12 @@ vi.mock("@/hooks/use-pending-agent-requests", () => ({
   usePendingAgentRequests: () => ({ requests: [], count: agentRequests.count }),
 }));
 
+const deploymentNeeds = vi.hoisted(() => ({ count: 0 }));
+
+vi.mock("@/hooks/use-deployment-operator-needs", () => ({
+  useDeploymentOperatorNeeds: () => ({ count: deploymentNeeds.count, items: [] }),
+}));
+
 type RouteMatchStub = { staticData?: { dashboardLayout?: "padded" | "fill" } };
 
 const routeState = vi.hoisted(() => ({
@@ -90,6 +96,7 @@ afterEach(() => {
   workspace.tabs = [];
   routeState.matches = [];
   agentRequests.count = 0;
+  deploymentNeeds.count = 0;
 });
 
 describe("dashboard sidebar", () => {
@@ -102,6 +109,19 @@ describe("dashboard sidebar", () => {
     // The sidebar's Terminals link and the mobile section button each carry the badge.
     expect(screen.getAllByText("dashboard:agentRequests.badge").length).toBeGreaterThanOrEqual(2);
     expect(screen.getAllByText("2").length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("badges Deployments while deployments wait for the user, and not otherwise", () => {
+    renderLayout();
+    expect(screen.queryAllByText("dashboard:deploymentOperator.badge")).toHaveLength(0);
+    cleanup();
+    deploymentNeeds.count = 3;
+    renderLayout();
+    // The sidebar's Deployments link and the mobile section button each carry the badge.
+    expect(screen.getAllByText("dashboard:deploymentOperator.badge").length).toBeGreaterThanOrEqual(
+      2,
+    );
+    expect(screen.getAllByText("3").length).toBeGreaterThanOrEqual(2);
   });
 
   it("shows the aside at md and hides the mobile section menu at md", () => {

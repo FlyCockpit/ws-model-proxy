@@ -8,6 +8,9 @@
     "./lib/deployment-spec": {
       "default": "./src/lib/deployment-spec.ts"
     },
+    "./lib/deployment-operator-notify": {
+      "default": "./src/lib/deployment-operator-notify.ts"
+    },
     "./lib/deployment-planner": {
       "default": "./src/lib/deployment-planner.ts"
     },

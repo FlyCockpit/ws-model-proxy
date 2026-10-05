@@ -1589,6 +1589,11 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
     target,
     reason: "Human-only consent or credential identity management; never an agent tool.",
   })),
+  {
+    target: "deployments.operatorNeeds",
+    reason:
+      "Dashboard notice feed; agents read the same needsOperator fields through deployment_instances_list.",
+  },
   ...["deployments.restartInstance", "deployments.reopenOperatorStep"].map((target) => ({
     target,
     reason:

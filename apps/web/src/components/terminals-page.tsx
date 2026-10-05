@@ -38,6 +38,7 @@ import {
   Bot,
   EllipsisVertical,
   Plus,
+  Rocket,
   ShieldAlert,
   ShieldCheck,
   SquareTerminal,
@@ -80,10 +81,24 @@ function terminalRejectionLabel(t: (key: string) => string, reason: string | nul
 
 const APPROVAL_COMMAND_PREFIX = "wsmp terminal approve";
 
-/** An agent request that is still waiting for Enter is declined, not ended. */
-function endSessionLabelKey(tab: TerminalTab | null): "decline" | "end" {
+/**
+ * An agent request that is still waiting for Enter is declined, not ended. A deployment
+ * step's terminal is closed: the step keeps waiting (reopened from Deployments).
+ */
+function endSessionLabelKey(tab: TerminalTab | null): "decline" | "end" | "closeStep" {
+  if (tab?.origin === "deployment") return "closeStep";
   return tab?.origin === "agent" && tab.supervised?.status === "awaiting_user" ? "decline" : "end";
 }
+const END_LABELS = {
+  decline: "dashboard:agentRequests.decline",
+  end: "dashboard:terminals.endSession",
+  closeStep: "dashboard:deploymentOperator.closeStep",
+} as const;
+const END_TITLES = {
+  decline: "dashboard:agentRequests.declineTitle",
+  end: "dashboard:terminals.endSessionTitle",
+  closeStep: "dashboard:deploymentOperator.closeStepTitle",
+} as const;
 
 /**
  * False while another dashboard page hides the workspace. Menus and dialogs
@@ -268,7 +283,7 @@ function TabStrip({
                   selected
                     ? "bg-(--term-bg) text-(--term-fg) shadow-[inset_0_2px_0_var(--color-primary)]"
                     : "text-(--term-muted) hover:bg-(--term-hover) hover:text-(--term-fg)",
-                  tab.origin === "agent" &&
+                  tab.origin !== "user" &&
                     (selected
                       ? "shadow-[inset_0_2px_0_var(--color-amber-400)]"
                       : "bg-amber-400/10 text-amber-200"),
@@ -283,12 +298,18 @@ function TabStrip({
                 >
                   {tab.origin === "agent" ? (
                     <Bot className="size-4 shrink-0 text-amber-400" aria-hidden="true" />
+                  ) : tab.origin === "deployment" ? (
+                    <Rocket className="size-4 shrink-0 text-amber-400" aria-hidden="true" />
                   ) : null}
                   <TerminalStatusDot tab={tab} />
                   <span className="truncate">
                     {tab.origin === "agent"
                       ? t("dashboard:agentRequests.tabLabel", { cli: workspace.tabLabel(tab) })
-                      : workspace.tabLabel(tab)}
+                      : tab.origin === "deployment"
+                        ? t("dashboard:deploymentOperator.tabLabel", {
+                            cli: workspace.tabLabel(tab),
+                          })
+                        : workspace.tabLabel(tab)}
                   </span>
                 </button>
                 <ChromeButton
@@ -339,9 +360,7 @@ function TabStrip({
               className="min-h-11"
               onClick={() => onEnd(active.localId)}
             >
-              {endSessionLabelKey(active) === "decline"
-                ? t("dashboard:agentRequests.decline")
-                : t("dashboard:terminals.endSession")}
+              {t(END_LABELS[endSessionLabelKey(active)])}
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
@@ -421,6 +440,30 @@ function Notices({ onReviewIdentities }: { onReviewIdentities: () => void }) {
           </ChromeTextButton>
         </Banner>
       ) : null}
+      {active?.origin === "deployment" ? (
+        <Banner>
+          <div className="min-w-0 flex-1 space-y-1">
+            <p className="font-medium">
+              {active.deployment
+                ? t("dashboard:deploymentOperator.panelTitle", {
+                    action: t(`dashboard:deploymentOperator.actions.${active.deployment.action}`),
+                    rank: active.deployment.rank,
+                  })
+                : t("dashboard:deploymentOperator.panelTitleUnknown")}
+            </p>
+            <p className="text-(--term-muted)">
+              {active.deployment?.state === "running"
+                ? t("dashboard:deploymentOperator.panelRunning")
+                : t("dashboard:deploymentOperator.panelAwaiting")}
+            </p>
+          </div>
+          {active.phase === "waiting" ? (
+            <ChromeTextButton onClick={() => workspace.selectTab(active.localId)}>
+              {t("dashboard:deploymentOperator.view")}
+            </ChromeTextButton>
+          ) : null}
+        </Banner>
+      ) : null}
       {active?.origin === "agent" ? (
         <AgentRequestPanel
           tab={active}
@@ -454,9 +497,11 @@ function Notices({ onReviewIdentities }: { onReviewIdentities: () => void }) {
       {active?.phase === "exited" && active.origin !== "agent" ? (
         <Banner>
           <p className="min-w-0 text-(--term-muted)">
-            {active.error === TERMINAL_GONE
-              ? t("dashboard:terminals.gone")
-              : t("dashboard:terminals.exited")}
+            {active.origin === "deployment"
+              ? t("dashboard:deploymentOperator.ended")
+              : active.error === TERMINAL_GONE
+                ? t("dashboard:terminals.gone")
+                : t("dashboard:terminals.exited")}
           </p>
         </Banner>
       ) : null}
@@ -590,9 +635,8 @@ export function TerminalWorkspaceView({ visible }: { visible: boolean }) {
     setIdentitiesOpen(false);
   }
   const active = workspace.tabs.find((tab) => tab.localId === workspace.activeLocalId) ?? null;
-  const endKey = endSessionLabelKey(
-    workspace.tabs.find((tab) => tab.localId === endTarget) ?? null,
-  );
+  const endTab = workspace.tabs.find((tab) => tab.localId === endTarget) ?? null;
+  const endKey = endSessionLabelKey(endTab);
   // One review at a time; the active tab's first.
   const reviewTab =
     (active && tabAwaitsReview(active) ? active : null) ??
@@ -664,15 +708,17 @@ export function TerminalWorkspaceView({ visible }: { visible: boolean }) {
         >
           <AlertDialogContent>
             <AlertDialogHeader>
-              <AlertDialogTitle>
-                {endKey === "decline"
-                  ? t("dashboard:agentRequests.declineTitle")
-                  : t("dashboard:terminals.endSessionTitle")}
-              </AlertDialogTitle>
+              <AlertDialogTitle>{t(END_TITLES[endKey])}</AlertDialogTitle>
               <AlertDialogDescription>
                 {endKey === "decline"
                   ? t("dashboard:agentRequests.declineDescription")
-                  : t("dashboard:terminals.endSessionDescription")}
+                  : endKey === "closeStep"
+                    ? t(
+                        endTab?.deployment?.state === "running"
+                          ? "dashboard:deploymentOperator.closeRunningDescription"
+                          : "dashboard:deploymentOperator.closeStepDescription",
+                      )
+                    : t("dashboard:terminals.endSessionDescription")}
               </AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>
@@ -691,9 +737,7 @@ export function TerminalWorkspaceView({ visible }: { visible: boolean }) {
                   setEndTarget(null);
                 }}
               >
-                {endKey === "decline"
-                  ? t("dashboard:agentRequests.decline")
-                  : t("dashboard:terminals.endSession")}
+                {t(END_LABELS[endKey])}
               </AlertDialogAction>
             </AlertDialogFooter>
           </AlertDialogContent>

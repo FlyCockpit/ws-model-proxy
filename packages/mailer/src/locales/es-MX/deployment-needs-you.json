@@ -1,0 +1,8 @@
+{
+  "subject": "Un despliegue te necesita",
+  "heading": "Un despliegue te está esperando",
+  "stepBody": "El despliegue {{endpoint}} está esperando un comando que tú mismo ejecutas en una terminal del nodo (por ejemplo, uno que pide una contraseña de sudo).",
+  "restartBody": "El despliegue {{endpoint}} se detuvo. Su comando de inicio lo ejecutas tú mismo, así que WS Model Proxy no lo reinicia por su cuenta: reinícialo desde el panel cuando estés listo.",
+  "cta": "Abrir despliegues",
+  "footer": "Recibes este correo porque un despliegue tuyo usa comandos de receta interactivos. Los agentes no pueden responder estos pasos por ti."
+}

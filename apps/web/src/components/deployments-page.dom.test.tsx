@@ -2,6 +2,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
@@ -11,6 +12,14 @@ const state = vi.hoisted(() => ({
 }));
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key, i18n: { language: "en-US" } }),
+}));
+vi.mock("@tanstack/react-router", () => ({
+  useParams: () => ({ lang: "en-US" }),
+  Link: ({ children, className }: { children: ReactNode; className?: string }) => (
+    <a href="/en-US/dashboard/terminals" className={className}>
+      {children}
+    </a>
+  ),
 }));
 vi.mock("@/hooks/use-auth-session", () => ({
   useAuthSession: () => ({ state: { session: { user: { id: "owner" } } } }),
@@ -28,7 +37,7 @@ vi.mock("@/utils/orpc", () => {
       mutationFn: async (input: unknown) => {
         state.calls.push({ name, input });
         if (state.errors[name]) throw state.errors[name];
-        return state.data[name] ?? { id: "saved", revision: 2 };
+        return state.data[name] ?? { id: "saved", revision: 2, interactiveWarnings: [] };
       },
       ...options,
     }),
@@ -50,6 +59,8 @@ vi.mock("@/utils/orpc", () => {
         confirmPlan: mutation("confirm"),
         setNodeGrant: mutation("grant"),
         setAgentsMayPreempt: mutation("preempt"),
+        reopenOperatorStep: mutation("reopen"),
+        restartInstance: mutation("restart"),
       },
       forwarderManagement: {
         key: () => ["forwarder"],
@@ -391,6 +402,183 @@ describe("managed inference dashboard", () => {
     });
   });
 
+  it("shows what a deployment waits on and offers the person's actions", async () => {
+    const step = (overrides: Record<string, unknown>) => ({
+      stepId: "step",
+      nodeId: "node-a",
+      rank: 0,
+      action: "start",
+      command: "sudo systemctl start model\u202e",
+      state: "AWAITING_OPERATOR",
+      heldResourceCheck: false,
+      since: null,
+      acceptedAt: null,
+      overdue: false,
+      terminalOpen: false,
+      lastExit: null,
+      errorCode: null,
+      ...overrides,
+    });
+    state.data.instances = {
+      items: [
+        {
+          id: "waiting",
+          endpointSlug: "group-a",
+          observedState: "STARTING",
+          desiredState: "RUNNING",
+          agentsMayPreempt: false,
+          needsOperator: "STEP",
+          Nodes: [],
+          operatorSteps: [
+            step({ stepId: "closed", lastExit: 3, errorCode: "operator_unverified" }),
+            step({ stepId: "open", terminalOpen: true }),
+            step({ stepId: "late", state: "RUNNING", overdue: true, terminalOpen: true }),
+            step({ stepId: "held", state: "PENDING", errorCode: "operator_capability_missing" }),
+          ],
+        },
+        {
+          id: "stopped",
+          endpointSlug: "group-b",
+          observedState: "STOPPED",
+          desiredState: "RUNNING",
+          agentsMayPreempt: false,
+          needsOperator: "RESTART",
+          Nodes: [
+            {
+              id: "n1",
+              rank: 0,
+              cliDeviceId: "node-b",
+              port: 30000,
+              claimHeld: false,
+              heldUnknownSince: "2026-10-05T00:00:00.000Z",
+              resources: {},
+            },
+          ],
+          operatorSteps: [],
+        },
+      ],
+      nextCursor: null,
+    };
+    const user = userEvent.setup();
+    show();
+    expect(await screen.findByText("deploymentOperator.needStep")).toBeTruthy();
+    expect(screen.getByText("deploymentOperator.needRestart")).toBeTruthy();
+    // Commands are escaped exactly as the node's confirm screen shows them.
+    expect(screen.getAllByText("sudo systemctl start model\\u{202e}").length).toBe(4);
+    expect(screen.getByText("deploymentOperator.reasons.unverified")).toBeTruthy();
+    expect(screen.getByText("deploymentOperator.reasons.capabilityMissing")).toBeTruthy();
+    expect(screen.getByText("deploymentOperator.status.overdue")).toBeTruthy();
+    expect(screen.getByText("deploymentOperator.lastExit")).toBeTruthy();
+    expect(screen.getAllByText("deploymentOperator.openTerminal")).toHaveLength(2);
+    expect(screen.getByText("deploymentOperator.heldTitle")).toBeTruthy();
+    // Only the closed waiting step can be reopened.
+    const reopen = screen.getAllByRole("button", { name: "deploymentOperator.reopen" });
+    expect(reopen).toHaveLength(1);
+    await user.click(reopen[0] as HTMLElement);
+    await user.click(screen.getByRole("button", { name: "deploymentOperator.restart" }));
+    await waitFor(() =>
+      expect(state.calls).toEqual(
+        expect.arrayContaining([
+          { name: "reopen", input: { stepId: "closed" } },
+          { name: "restart", input: { instanceId: "stopped" } },
+        ]),
+      ),
+    );
+  });
+
+  it("explains a restart that must wait for an earlier stop", async () => {
+    state.errors.restart = Object.assign(new Error("waiting"), {
+      code: "CONFLICT",
+      data: { reason: "deployment_stop_pending" },
+    });
+    state.data.instances = {
+      items: [
+        {
+          id: "stopped",
+          endpointSlug: "group-b",
+          observedState: "STOPPED",
+          desiredState: "RUNNING",
+          agentsMayPreempt: false,
+          needsOperator: "RESTART",
+          Nodes: [],
+          operatorSteps: [],
+        },
+      ],
+      nextCursor: null,
+    };
+    const user = userEvent.setup();
+    show();
+    await user.click(await screen.findByRole("button", { name: "deploymentOperator.restart" }));
+    expect(await screen.findByText("deployments.stopPending")).toBeTruthy();
+  });
+
+  it("lists the commands a person will run before the plan is confirmed", async () => {
+    state.data.pending = { items: [{ id: "plan-op" }], nextCursor: null };
+    state.data.plan = {
+      id: "plan-op",
+      state: "AWAITING_CONFIRMATION",
+      contents: {
+        action: "start",
+        stopIds: [],
+        affectedNodeIds: ["node-a"],
+        start: { revisionId: "rev", variantKey: "one" },
+        warnings: ["interactive_operator_required", "interactive_operator_unavailable"],
+        operatorSteps: [
+          {
+            instanceId: null,
+            nodeId: "node-a",
+            rank: 0,
+            action: "start",
+            command: "sudo start",
+            nodeReady: true,
+          },
+          {
+            instanceId: "old",
+            nodeId: "node-b",
+            rank: 0,
+            action: "stop",
+            command: "sudo stop",
+            nodeReady: false,
+          },
+        ],
+        operatorStepCount: 3,
+      },
+      preview: { start: { commands: [] }, agentEdited: false, stopped: [] },
+    };
+    const user = userEvent.setup();
+    show();
+    await user.click(
+      await screen.findByRole("button", { name: /deployments.reviewPlan.*plan-op/ }),
+    );
+    const steps = await screen.findByTestId("plan-operator-steps");
+    expect(within(steps).getByText("deploymentOperator.planStep")).toBeTruthy();
+    expect(within(steps).getByText("deploymentOperator.planStopStep")).toBeTruthy();
+    expect(within(steps).getByText("sudo stop")).toBeTruthy();
+    expect(within(steps).getByText("deployments.operatorNodeNotReady")).toBeTruthy();
+    expect(screen.getByText("deploymentOperator.moreSteps")).toBeTruthy();
+  });
+
+  it("warns after saving about interactive marks that never take effect", async () => {
+    state.data.create = {
+      id: "saved",
+      interactiveWarnings: [
+        { variant: "small", rank: null, command: "prepare", reason: "single_node" },
+      ],
+    };
+    const user = userEvent.setup();
+    show();
+    await user.type(await screen.findByLabelText("deployments.name"), "Small");
+    await user.type(screen.getByLabelText("deployments.slug"), "small");
+    await user.selectOptions(screen.getByLabelText("deployments.pool"), "pool");
+    const spec = screen.getByLabelText("deployments.spec");
+    await user.clear(spec);
+    await user.click(spec);
+    await user.paste(JSON.stringify({ variants: [variant] }));
+    await user.click(screen.getByRole("button", { name: "deployments.saveRecipe" }));
+    expect(await screen.findByText(/deployments.interactiveFlagUnused/)).toBeTruthy();
+    expect(screen.getByText(/deploymentOperator.unusedReasons.single_node/)).toBeTruthy();
+  });
+
   it("confirms a start that stops nothing without the stop dialog", async () => {
     state.data.pending = { items: [{ id: "plan-5" }], nextCursor: null };
     state.data.plan = {
@@ -490,6 +678,8 @@ describe("managed inference dashboard", () => {
           observedState: "SERVING",
           desiredState: "SERVING",
           Nodes: [],
+          operatorSteps: [],
+          needsOperator: null,
           agentsMayPreempt: false,
         },
       ],

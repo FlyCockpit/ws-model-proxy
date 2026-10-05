@@ -41,7 +41,22 @@ export type SupervisedInfo = {
   signal: string | null;
 };
 
-export type TerminalOrigin = "user" | "agent";
+/**
+ * `user`: a shell this person opened. `agent`: a supervised command an MCP agent requested.
+ * `deployment`: an operator terminal of an interactive recipe step, waiting for this person to
+ * run the step's exact command. Only `user` terminals are attached automatically.
+ */
+export type TerminalOrigin = "user" | "agent" | "deployment";
+
+/** Which recipe step a deployment operator terminal runs (the relay sends no command text). */
+export type DeploymentTerminalInfo = {
+  stepId: string;
+  instanceId: string;
+  rank: number;
+  action: "prepare" | "start" | "after_join" | "stop";
+  /** `awaiting`: the confirm screen waits for Enter; `running`: the command runs. */
+  state: "awaiting" | "running";
+};
 
 export type ListedTerminal = {
   terminalId: string;
@@ -49,6 +64,8 @@ export type ListedTerminal = {
   origin: TerminalOrigin;
   /** Present on agent terminals. */
   supervised: SupervisedInfo | null;
+  /** Present on deployment operator terminals (the parser always sets it). */
+  deployment?: DeploymentTerminalInfo | null;
   cliDeviceId: string;
   cols: number;
   rows: number;
@@ -220,19 +237,43 @@ export function readSupervisedInfo(value: unknown): SupervisedInfo | null {
   };
 }
 
+const DEPLOYMENT_ACTIONS: ReadonlySet<string> = new Set(["prepare", "start", "after_join", "stop"]);
+
+export function readDeploymentInfo(value: unknown): DeploymentTerminalInfo | null {
+  if (!isRecord(value)) return null;
+  const stepId = readString(value, "stepId");
+  const instanceId = readString(value, "instanceId");
+  const action = readString(value, "action");
+  const rank = value.rank;
+  if (!stepId || !instanceId || !action || !DEPLOYMENT_ACTIONS.has(action)) return null;
+  if (typeof rank !== "number" || !Number.isInteger(rank) || rank < 0) return null;
+  return {
+    stepId,
+    instanceId,
+    rank,
+    action: action as DeploymentTerminalInfo["action"],
+    state: value.state === "running" ? "running" : "awaiting",
+  };
+}
+
+function readOrigin(value: unknown): TerminalOrigin {
+  // An agent or deployment terminal without readable details stays one: never treat it as
+  // the user's own shell (that would auto-attach).
+  return value === "agent" || value === "deployment" ? value : "user";
+}
+
 function readListedTerminal(value: unknown): ListedTerminal | null {
   if (!isRecord(value)) return null;
   const terminalId = readString(value, "terminalId");
   const cliDeviceId = readString(value, "cliDeviceId") ?? readString(value, "id");
   if (!terminalId || !cliDeviceId) return null;
   const viewerAttached = value.viewerAttached === true;
-  // An agent terminal without readable request details is still an agent
-  // terminal: never treat it as the user's own shell (that would auto-attach).
-  const origin: TerminalOrigin = value.origin === "agent" ? "agent" : "user";
+  const origin = readOrigin(value.origin);
   return {
     terminalId,
     origin,
     supervised: origin === "agent" ? readSupervisedInfo(value.supervised) : null,
+    deployment: origin === "deployment" ? readDeploymentInfo(value.deployment) : null,
     cliDeviceId,
     cols: readDimension(value.cols, 80),
     rows: readDimension(value.rows, 24),

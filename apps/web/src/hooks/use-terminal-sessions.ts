@@ -41,6 +41,7 @@ import {
 import { takePendingByTerminalId } from "@/lib/terminal-pending";
 import {
   clampTerminalAxis,
+  type DeploymentTerminalInfo,
   encodeSealedFrame,
   type ListedCli,
   type SealedTerminalFrame,
@@ -99,6 +100,11 @@ export type ReviewCapture = { head: Uint8Array; tail: Uint8Array; totalBytes: nu
 /** Supervised statuses in which the command can still take keystrokes. */
 const SUPERVISED_INPUT_STATUSES: ReadonlySet<string> = new Set(["awaiting_user", "running"]);
 
+/** Terminals this page lists but attaches only when the person picks them. */
+export function pickedToAttach(origin: TerminalOrigin): boolean {
+  return origin !== "user";
+}
+
 export type TerminalTab = {
   localId: string;
   terminalId: string | null;
@@ -111,10 +117,15 @@ export type TerminalTab = {
    * attaches only when the user selects it.
    */
   phase: "waiting" | "opening" | "live" | "rejected" | "exited";
-  /** `agent`: a supervised command an MCP agent requested. */
+  /**
+   * `agent`: a supervised command an MCP agent requested. `deployment`: an operator terminal
+   * of an interactive recipe step. Both are listed and attach only when picked.
+   */
   origin: TerminalOrigin;
   /** Request details from the relay's list (agent terminals only). */
   supervised: SupervisedInfo | null;
+  /** The recipe step from the relay's list (deployment terminals only). */
+  deployment: DeploymentTerminalInfo | null;
   /** The CLI-reported output review flag; null until the CLI reports it. */
   reviewOutput: boolean | null;
   /** The capture awaiting this person's review, once the CLI sent it. */
@@ -277,17 +288,19 @@ function newTab(input: {
   viewerCount: number;
   origin?: TerminalOrigin;
   supervised?: SupervisedInfo | null;
+  deployment?: DeploymentTerminalInfo | null;
 }): TerminalTab {
   const origin = input.origin ?? "user";
   return {
     ...input,
     origin,
     supervised: input.supervised ?? null,
+    deployment: input.deployment ?? null,
     reviewOutput: null,
     reviewCapture: null,
     exitCode: null,
     exitSignal: null,
-    phase: origin === "agent" ? "waiting" : "opening",
+    phase: pickedToAttach(origin) ? "waiting" : "opening",
     approvalCode: null,
     rejectionReason: null,
     error: null,
@@ -1025,8 +1038,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
     if (!tab.terminalId || tab.phase === "exited" || tab.phase === "rejected") return false;
     // Being ended: no new viewer slot for it.
     if (closesRef.current.has(tab.terminalId)) return false;
-    // An agent request attaches only once the user picked it.
-    if (tab.origin === "agent" && !userAttachedRef.current.has(tab.localId)) return false;
+    // An agent request or a deployment step's terminal attaches only once the user picked it.
+    if (pickedToAttach(tab.origin) && !userAttachedRef.current.has(tab.localId)) return false;
     if (sessionsRef.current.has(tab.terminalId)) return false;
     // An attach may still be checking the CLI identity before its handshake.
     if (attachingRef.current.has(tab.terminalId)) return false;
@@ -1148,7 +1161,8 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
           const terminalId = tab.terminalId;
           if (!terminalId || listed.has(terminalId)) continue;
           if (closesRef.current.has(terminalId)) continue;
-          const settled = tab.origin === "agent" || tab.phase === "live" || tab.phase === "waiting";
+          const settled =
+            pickedToAttach(tab.origin) || tab.phase === "live" || tab.phase === "waiting";
           if (!settled || tab.phase === "exited" || tab.phase === "rejected") continue;
           if (!knownSinceRef.current.has(terminalId)) continue;
           markTerminalGone(tab.localId, terminalId);
@@ -1209,6 +1223,9 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
               ...(remote.origin === "agent"
                 ? { origin: "agent" as const, supervised: remote.supervised }
                 : {}),
+              ...(remote.origin === "deployment"
+                ? { origin: "deployment" as const, deployment: remote.deployment ?? null }
+                : {}),
               ...(known.decline === "unsent" && remote.supervised
                 ? {
                     decline: redecline(known.localId, remote.terminalId, remote.supervised.status),
@@ -1232,13 +1249,14 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
             viewerCount: remote.viewerCount,
             origin: remote.origin,
             supervised: remote.supervised,
+            deployment: remote.deployment,
           });
           noteTerminalKnown(remote.terminalId);
           viewRef.current.set(tab.localId, { writer: tab.writer });
           additions.push(tab);
-          // Agent requests are listed, not attached: attaching takes a viewer
-          // slot and is the oversight step the person chooses.
-          if (tab.origin !== "agent") toAttach.push(tab);
+          // Agent requests and deployment steps are listed, not attached: attaching takes a
+          // viewer slot and is the step the person chooses.
+          if (!pickedToAttach(tab.origin)) toAttach.push(tab);
         }
         if (additions.length > 0) {
           tabsRef.current = [
@@ -1830,7 +1848,7 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
       const tab = tabsRef.current.find((item) => item.localId === localId);
       if (!tab) return;
       if (
-        tab.origin === "agent" &&
+        pickedToAttach(tab.origin) &&
         tab.phase !== "exited" &&
         tab.phase !== "rejected" &&
         tab.ending !== "pending"
@@ -1910,13 +1928,13 @@ export function useTerminalSessions(options: UseTerminalSessionsOptions = {}): {
         return;
       }
       if (
-        tab.origin === "agent" &&
+        pickedToAttach(tab.origin) &&
         tab.terminalId &&
         tab.phase !== "exited" &&
         tab.phase !== "rejected"
       ) {
-        // An agent request stays pending when this page stops viewing it:
-        // keep it listed, unattached, so it can be picked again.
+        // An agent request or a deployment step stays pending when this page stops viewing
+        // it: keep it listed, unattached, so it can be picked again. Only End session ends it.
         const terminalId = tab.terminalId;
         if (tab.phase !== "waiting") sendRef.current({ type: "detach", terminalId });
         userAttachedRef.current.delete(localId);
