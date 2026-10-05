@@ -11,21 +11,25 @@ import type {
 import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
 import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { type DeploymentLiveSocket, DeploymentReconciler } from "./reconciler.js";
+import type { DeploymentLiveSocket } from "./reconciler.js";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
   throw new Error("Postgres fixture URL required");
 const integration = databaseUrl ? describe : describe.skip;
+// Loaded after the skip guard: `./reconciler.js` imports the production
+// Prisma client, whose env validation fails in a unit run with no database.
+let DeploymentReconciler: typeof import("./reconciler.js").DeploymentReconciler;
 
 integration("deployment result fencing at PostgreSQL", () => {
   let fixture: ReturnType<typeof createFixturePrismaClient>;
   let production: ReturnType<typeof createPrismaClient>;
   const users: string[] = [];
-  beforeAll(() => {
+  beforeAll(async () => {
     if (!databaseUrl) throw new Error("fixture missing");
     fixture = createFixturePrismaClient(databaseUrl);
     production = createPrismaClient(databaseUrl);
+    ({ DeploymentReconciler } = await import("./reconciler.js"));
   });
   afterAll(async () => {
     // Synthetic jobs only; this fixture transport never launches operating-system processes.
@@ -329,11 +333,12 @@ integration("interactive operator steps at PostgreSQL", () => {
   let fixture: ReturnType<typeof createFixturePrismaClient>;
   let production: ReturnType<typeof createPrismaClient>;
   const users: string[] = [];
-  const reconcilers: DeploymentReconciler[] = [];
-  beforeAll(() => {
+  const reconcilers: InstanceType<typeof DeploymentReconciler>[] = [];
+  beforeAll(async () => {
     if (!databaseUrl) throw new Error("fixture missing");
     fixture = createFixturePrismaClient(databaseUrl);
     production = createPrismaClient(databaseUrl);
+    ({ DeploymentReconciler } = await import("./reconciler.js"));
   });
   afterAll(async () => {
     for (const reconciler of reconcilers) await reconciler.stop();

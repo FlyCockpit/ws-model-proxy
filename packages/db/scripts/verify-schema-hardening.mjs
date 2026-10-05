@@ -1028,15 +1028,15 @@ async function verifyDeploymentOperatorHardening() {
   const { rows: fks } = await client.query(`SELECT count(*)::int AS n FROM pg_constraint
     WHERE conrelid = 'deployment_operator_event'::regclass AND contype = 'f'`);
   if (fks[0].n !== 0) throw new Error("deployment_operator_event must have no foreign keys");
-  await client.query(`DELETE FROM deployment_operator_event WHERE id = 'op-event-ok'`);
+  await client.query(`DELETE FROM deployment_operator_event WHERE id = 'op-event-ok'`); // policy: bounded-delete
   // Clean up the fixture so later checks see the original graph.
   await client.query(`
-    DELETE FROM deployment_step WHERE "runId" = 'op-run';
-    DELETE FROM deployment_instance_node WHERE id = 'op-node';
-    DELETE FROM deployment_instance WHERE id = 'op-instance';
-    DELETE FROM deployment_run WHERE id = 'op-run';
-    DELETE FROM deployment_plan WHERE id = 'op-plan';
-    DELETE FROM deployment_config WHERE id = 'op-config';
+    DELETE FROM deployment_step WHERE "runId" = 'op-run'; -- policy: bounded-delete
+    DELETE FROM deployment_instance_node WHERE id = 'op-node'; -- policy: bounded-delete
+    DELETE FROM deployment_instance WHERE id = 'op-instance'; -- policy: bounded-delete
+    DELETE FROM deployment_run WHERE id = 'op-run'; -- policy: bounded-delete
+    DELETE FROM deployment_plan WHERE id = 'op-plan'; -- policy: bounded-delete
+    DELETE FROM deployment_config WHERE id = 'op-config'; -- policy: bounded-delete
   `);
   process.stdout.write(
     `Deployment operator hardening: ${negatives} transition/shape/append-only negatives and ${positives} normalisation/write-site positives passed.\n`,

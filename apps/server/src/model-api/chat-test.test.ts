@@ -12,9 +12,10 @@ import { CapacityLeaseOwner } from "./capacity/lease-owner.js";
 import type { CapacityAdmissionRuntime } from "./capacity/runtime.js";
 import { LocalSendRefused } from "./local-send.js";
 
-vi.mock("@ws-model-proxy/db", async (importOriginal) => {
+vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
-  const { Prisma } = await importOriginal<typeof import("@ws-model-proxy/db")>();
+  // The generated client, not `importOriginal()`: the real index needs a live env.
+  const { Prisma } = await import("../../../../packages/db/prisma/generated/client");
   return { default: mockDeep<typeof import("@ws-model-proxy/db").default>(), Prisma };
 });
 

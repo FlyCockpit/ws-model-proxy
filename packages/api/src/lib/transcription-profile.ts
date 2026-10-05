@@ -27,5 +27,3 @@ export const transcriptionProfileSchema = z
     acceptedMimeTypes: z.array(profileToken).max(16).optional(),
   })
   .strict();
-
-export type TranscriptionProfile = z.infer<typeof transcriptionProfileSchema>;

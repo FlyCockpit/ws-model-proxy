@@ -526,7 +526,7 @@ integration("schema hardening behaviors with real PostgreSQL", () => {
       labelsSql: "NULL",
     });
 
-    await db().$executeRaw`DELETE FROM pool_member WHERE id = ${gone.id}`;
+    await db().$executeRaw`DELETE FROM pool_member WHERE id = ${gone.id}`; // policy: bounded-delete
 
     const rows = await db().$queryRaw<
       { position: number; memberId: string | null; exclude: boolean }[]

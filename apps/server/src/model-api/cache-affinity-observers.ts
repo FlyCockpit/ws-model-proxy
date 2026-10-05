@@ -3,8 +3,8 @@ import { Prisma } from "@ws-model-proxy/db";
 import { resetAffinityForCapacities } from "./cache-affinity-generation.js";
 import { queryAffinityResidency } from "./cache-affinity-residency.js";
 
-/** Database-clock confidence bound, independent of observer process survival. */
-export const AFFINITY_OBSERVER_LEASE_MS = 2000;
+// Observer leases last two seconds on the database clock (`interval '2 seconds'`
+// below): a confidence bound independent of observer process survival.
 type Observation = {
   capacityId: string;
   cliDeviceId: string;

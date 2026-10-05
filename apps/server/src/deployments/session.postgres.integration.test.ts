@@ -2,11 +2,6 @@ import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { deploymentFingerprint } from "@ws-model-proxy/api/lib/deployment-planner";
 import {
-  applyDeploymentPlan,
-  createDeploymentPlan,
-  lockDeploymentOwner,
-} from "@ws-model-proxy/api/lib/deployment-service";
-import {
   type DeploymentClaim,
   deploymentJobIntentSchema,
   deploymentSpecSchema,
@@ -22,12 +17,19 @@ import { createPrismaClient } from "@ws-model-proxy/db/client-factory";
 import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { WebSocket, WebSocketServer } from "ws";
-import { type DeploymentLiveSocket, DeploymentReconciler } from "./reconciler.js";
+import type { DeploymentLiveSocket } from "./reconciler.js";
 
 const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
   throw new Error("PostgreSQL fixture required");
 const integration = databaseUrl ? describe : describe.skip;
+// Loaded after the skip guard: the reconciler and deployment service import the
+// production Prisma client, whose env validation fails in a unit run with no database.
+type DeploymentService = typeof import("@ws-model-proxy/api/lib/deployment-service");
+let DeploymentReconciler: typeof import("./reconciler.js").DeploymentReconciler;
+let applyDeploymentPlan: DeploymentService["applyDeploymentPlan"];
+let createDeploymentPlan: DeploymentService["createDeploymentPlan"];
+let lockDeploymentOwner: DeploymentService["lockDeploymentOwner"];
 function deferred() {
   let resolve = () => {};
   const promise = new Promise<void>((done) => {
@@ -60,6 +62,10 @@ integration("deployment lifecycle on PostgreSQL and real manager/WebSocket", () 
     production = createPrismaClient(databaseUrl);
     ({ RelaySessionManager: Manager } = await import("../relay/session-manager.js"));
     ({ generateTestHelloIdentity: helloIdentity } = await import("../relay/hello-identity.js"));
+    ({ DeploymentReconciler } = await import("./reconciler.js"));
+    ({ applyDeploymentPlan, createDeploymentPlan, lockDeploymentOwner } = await import(
+      "@ws-model-proxy/api/lib/deployment-service"
+    ));
   });
   afterAll(async () => {
     for (const cleanup of cleanups.reverse()) await cleanup();

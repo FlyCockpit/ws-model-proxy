@@ -2120,21 +2120,28 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
    * context.session.user.id exactly like a browser-session request would.
    * The oRPC/router modules are imported LAZILY so skip-mode runs never
    * load the appRouter chain (and through it the auth instance).
+   *
+   * A person's context carries no `deploymentActor`: `createMcpContext`
+   * marks every MCP request as an agent, which human-only procedures such
+   * as `mcpGrants.revokeMine` refuse.
    */
   async function humanGrantsClient(email: string) {
-    const [{ createRouterClient }, { appRouter }, { createMcpContext }] = await Promise.all([
-      import("@orpc/server"),
-      import("@ws-model-proxy/api/routers/index"),
-      import("./context"),
-    ]);
+    const [{ createRouterClient }, { appRouter }, { createMcpSyntheticSession }] =
+      await Promise.all([
+        import("@orpc/server"),
+        import("@ws-model-proxy/api/routers/index"),
+        import("./context"),
+      ]);
     const user = await db.user.findUniqueOrThrow({ where: { email } });
     return createRouterClient(appRouter, {
-      context: createMcpContext({
-        user,
-        expiresAt: new Date(Date.now() + 3_600_000),
-        now: new Date(),
+      context: {
+        session: createMcpSyntheticSession({
+          user,
+          expiresAt: new Date(Date.now() + 3_600_000),
+          now: new Date(),
+        }),
         services: undefined,
-      }),
+      },
     });
   }
 

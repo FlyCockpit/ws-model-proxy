@@ -1,5 +1,12 @@
 import { describe, expect, it, vi } from "vitest";
 
+// No database in unit tests: the real env module would demand DATABASE_URL.
+vi.mock("@ws-model-proxy/env/server", () => ({ env: {} }));
+vi.mock("@ws-model-proxy/db", async () => ({
+  default: {},
+  Prisma: (await import("../../../../packages/db/prisma/generated/client")).Prisma,
+}));
+
 async function freshLedger() {
   vi.resetModules();
   return (await import("./cache-affinity-residency.js")).beginAffinityReset;

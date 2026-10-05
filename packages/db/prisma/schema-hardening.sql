@@ -1027,11 +1027,11 @@ BEGIN
     WHERE instance."userId" = OLD.id AND node."claimHeld") THEN
     RAISE EXCEPTION 'deployment processes must be confirmed stopped before deleting their owner' USING ERRCODE = '23514';
   END IF;
-  DELETE FROM deployment_step WHERE "instanceId" IN (SELECT id FROM deployment_instance WHERE "userId" = OLD.id);
-  DELETE FROM deployment_instance_node WHERE "instanceId" IN (SELECT id FROM deployment_instance WHERE "userId" = OLD.id);
-  DELETE FROM deployment_instance WHERE "userId" = OLD.id;
-  DELETE FROM deployment_config WHERE "userId" = OLD.id;
-  DELETE FROM deployment_plan WHERE "userId" = OLD.id;
+  DELETE FROM deployment_step WHERE "instanceId" IN (SELECT id FROM deployment_instance WHERE "userId" = OLD.id); -- policy: bounded-delete
+  DELETE FROM deployment_instance_node WHERE "instanceId" IN (SELECT id FROM deployment_instance WHERE "userId" = OLD.id); -- policy: bounded-delete
+  DELETE FROM deployment_instance WHERE "userId" = OLD.id; -- policy: bounded-delete
+  DELETE FROM deployment_config WHERE "userId" = OLD.id; -- policy: bounded-delete
+  DELETE FROM deployment_plan WHERE "userId" = OLD.id; -- policy: bounded-delete
   RETURN OLD;
 END;
 $deployment_owner_cleanup$;
@@ -1047,9 +1047,9 @@ BEGIN
   IF EXISTS (SELECT 1 FROM deployment_instance_node WHERE "instanceId" = ANY(instances) AND "claimHeld") THEN
     RAISE EXCEPTION 'deployment group must be confirmed stopped before deleting its device' USING ERRCODE = '23514';
   END IF;
-  DELETE FROM deployment_step WHERE "instanceId" = ANY(instances);
-  DELETE FROM deployment_instance_node WHERE "instanceId" = ANY(instances);
-  DELETE FROM deployment_instance WHERE id = ANY(instances);
+  DELETE FROM deployment_step WHERE "instanceId" = ANY(instances); -- policy: bounded-delete
+  DELETE FROM deployment_instance_node WHERE "instanceId" = ANY(instances); -- policy: bounded-delete
+  DELETE FROM deployment_instance WHERE id = ANY(instances); -- policy: bounded-delete
   RETURN OLD;
 END;
 $deployment_device_cleanup$;

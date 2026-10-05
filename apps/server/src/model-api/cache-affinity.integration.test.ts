@@ -10,13 +10,6 @@ import {
 } from "@ws-model-proxy/db/hot-path-sweeps";
 import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import {
-  discoverAffinityResidency,
-  pruneAffinityResidency,
-  queryAffinityResidency,
-  repairAffinityResidencyPage,
-  startAffinityResidencyRepair,
-} from "./cache-affinity-residency.js";
 
 type PrismaSql = typeof import("@ws-model-proxy/db").Prisma;
 const runFile = promisify(execFile);
@@ -31,6 +24,15 @@ const integration = databaseUrl ? describe : describe.skip;
 if (!databaseUrl)
   console.warn("[cache-affinity] skipped: SCHEMA_VALIDATION_DATABASE_URL is not configured");
 
+// Loaded after the skip guard: the residency module imports the production
+// Prisma client and env, whose validation fails in a unit run with no database.
+type Residency = typeof import("./cache-affinity-residency.js");
+let discoverAffinityResidency: Residency["discoverAffinityResidency"];
+let pruneAffinityResidency: Residency["pruneAffinityResidency"];
+let queryAffinityResidency: Residency["queryAffinityResidency"];
+let repairAffinityResidencyPage: Residency["repairAffinityResidencyPage"];
+let startAffinityResidencyRepair: Residency["startAffinityResidencyRepair"];
+
 integration("cache affinity PostgreSQL concurrency and retention", () => {
   const db = databaseUrl ? createFixturePrismaClient(databaseUrl) : undefined;
   let service: typeof import("./cache-affinity.js");
@@ -43,6 +45,13 @@ integration("cache affinity PostgreSQL concurrency and retention", () => {
     process.env.BETTER_AUTH_URL ??= "http://localhost:3000";
     ({ Prisma } = await import("@ws-model-proxy/db"));
     service = await import("./cache-affinity.js");
+    ({
+      discoverAffinityResidency,
+      pruneAffinityResidency,
+      queryAffinityResidency,
+      repairAffinityResidencyPage,
+      startAffinityResidencyRepair,
+    } = await import("./cache-affinity-residency.js"));
   });
 
   afterAll(async () => db?.$disconnect());

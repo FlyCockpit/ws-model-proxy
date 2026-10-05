@@ -5,6 +5,8 @@ const readDb = vi.hoisted(() => ({
   capacityLease: { groupBy: vi.fn() },
   $queryRaw: vi.fn(),
 }));
+// No database in unit tests: the real env module would demand DATABASE_URL.
+vi.mock("@ws-model-proxy/env/server", () => ({ env: {} }));
 vi.mock("@ws-model-proxy/db", async () => ({
   default: readDb,
   Prisma: (await import("../../../../packages/db/prisma/generated/client")).Prisma,

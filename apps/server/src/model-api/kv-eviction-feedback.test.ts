@@ -7,6 +7,8 @@ vi.mock("@ws-model-proxy/db", () => ({
     sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({ strings, values }),
   },
 }));
+// No database in unit tests: the real env module would demand DATABASE_URL.
+vi.mock("@ws-model-proxy/env/server", () => ({ env: {} }));
 vi.mock("@ws-model-proxy/db/shutdown-fence", () => ({ isDbShutdownFenceArmed: () => false }));
 vi.mock("./cache-affinity-generation.js", () => ({
   resetAffinityForCapacities: vi.fn(async () => undefined),

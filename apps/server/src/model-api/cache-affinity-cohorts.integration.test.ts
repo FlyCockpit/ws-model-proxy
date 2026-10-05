@@ -13,28 +13,52 @@ import {
 } from "@ws-model-proxy/db/hot-path-sweeps";
 import { deleteUserDurably } from "@ws-model-proxy/db/parent-deletion";
 import { createFixturePrismaClient } from "@ws-model-proxy/db/test-fixture-client";
-import { afterAll, expect, it } from "vitest";
-import { generateTestHelloIdentity } from "../relay/hello-identity.js";
-import { persistRelayRegistration } from "../relay/registration.js";
-import { RelaySessionManager } from "../relay/session-manager.js";
-import { createUserDeletionSweepClient } from "../user-deletion-sweep.js";
-import { affinityResidencySql, rankAffinityTargets, rememberAffinity } from "./cache-affinity.js";
-import { registerAffinityObservers } from "./cache-affinity-observers.js";
-import {
-  captureAffinityTargetGenerations,
-  repairAffinityResidencyPage,
-} from "./cache-affinity-residency.js";
-import { resetKvEvictionForEndpoint } from "./kv-eviction-feedback.js";
-import {
-  authorizedKvEvictionRows,
-  loadWarmSessions,
-  warmProtectionSource,
-} from "./warm-protection.js";
+import { afterAll, beforeAll, expect, it } from "vitest";
 
 const url = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !url)
   throw new Error("PostgreSQL integration required");
 const integration = url ? it : it.skip;
+
+// The server modules under test import the production Prisma client and env,
+// whose validation fails in a unit run with no database: load them only when
+// the suite runs.
+type RelaySessionManager = import("../relay/session-manager.js").RelaySessionManager;
+type CacheAffinity = typeof import("./cache-affinity.js");
+type Residency = typeof import("./cache-affinity-residency.js");
+type WarmProtection = typeof import("./warm-protection.js");
+let generateTestHelloIdentity: typeof import("../relay/hello-identity.js").generateTestHelloIdentity;
+let persistRelayRegistration: typeof import("../relay/registration.js").persistRelayRegistration;
+let RelaySessionManager: typeof import("../relay/session-manager.js").RelaySessionManager;
+let createUserDeletionSweepClient: typeof import("../user-deletion-sweep.js").createUserDeletionSweepClient;
+let affinityResidencySql: CacheAffinity["affinityResidencySql"];
+let rankAffinityTargets: CacheAffinity["rankAffinityTargets"];
+let rememberAffinity: CacheAffinity["rememberAffinity"];
+let registerAffinityObservers: typeof import("./cache-affinity-observers.js").registerAffinityObservers;
+let captureAffinityTargetGenerations: Residency["captureAffinityTargetGenerations"];
+let repairAffinityResidencyPage: Residency["repairAffinityResidencyPage"];
+let resetKvEvictionForEndpoint: typeof import("./kv-eviction-feedback.js").resetKvEvictionForEndpoint;
+let authorizedKvEvictionRows: WarmProtection["authorizedKvEvictionRows"];
+let loadWarmSessions: WarmProtection["loadWarmSessions"];
+let warmProtectionSource: WarmProtection["warmProtectionSource"];
+beforeAll(async () => {
+  if (!url) return;
+  ({ generateTestHelloIdentity } = await import("../relay/hello-identity.js"));
+  ({ persistRelayRegistration } = await import("../relay/registration.js"));
+  ({ RelaySessionManager } = await import("../relay/session-manager.js"));
+  ({ createUserDeletionSweepClient } = await import("../user-deletion-sweep.js"));
+  ({ affinityResidencySql, rankAffinityTargets, rememberAffinity } = await import(
+    "./cache-affinity.js"
+  ));
+  ({ registerAffinityObservers } = await import("./cache-affinity-observers.js"));
+  ({ captureAffinityTargetGenerations, repairAffinityResidencyPage } = await import(
+    "./cache-affinity-residency.js"
+  ));
+  ({ resetKvEvictionForEndpoint } = await import("./kv-eviction-feedback.js"));
+  ({ authorizedKvEvictionRows, loadWarmSessions, warmProtectionSource } = await import(
+    "./warm-protection.js"
+  ));
+}, 120_000);
 const db = createFixturePrismaClient(url ?? "postgresql://unused:unused@localhost/unused");
 const production = createPrismaClient(url ?? "postgresql://unused:unused@localhost/unused");
 const bounded = createStatementBoundedPrismaClient(

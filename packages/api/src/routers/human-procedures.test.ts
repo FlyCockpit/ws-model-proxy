@@ -4,6 +4,25 @@ import { mockDeep } from "vitest-mock-extended";
 import type { PrismaClient } from "../../../db/prisma/generated/client";
 
 vi.mock("@ws-model-proxy/db", () => ({ default: mockDeep<PrismaClient>() }));
+// The refusal happens before any procedure reads configuration; the real env
+// module would demand DATABASE_URL and the auth secrets.
+vi.mock("@ws-model-proxy/env/server", () => ({
+  env: {
+    SIGNUP_ENABLED: false,
+    WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true,
+    WMP_MCP_ENABLED: true,
+    WMP_MCP_PAT_ALLOW_NO_EXPIRY: true,
+    WMP_PROVIDER_ALLOW_PRIVATE_NETWORKS: false,
+    BETTER_AUTH_URL: "https://proxy.example.com",
+  },
+  SIGNUP_ENABLED: false,
+}));
+vi.mock("@ws-model-proxy/auth", () => ({ auth: { api: {} } }));
+vi.mock("@ws-model-proxy/mailer", () => ({
+  sendEmail: vi.fn(),
+  renderInviteUser: vi.fn(() => ({ subject: "", html: "" })),
+  verifyTransport: vi.fn(async () => false),
+}));
 
 import prisma from "@ws-model-proxy/db";
 import type { Context } from "../context";
