@@ -336,9 +336,11 @@ assignment provenance and automatic concurrency seed columns.
   base64 per append; turns end when the client commits (`turn_detection`
   must be null; there is no voice activity detection) or at the profile's
   `maxItemSeconds`. Limits: 4 sessions per token, 8 per user, 30 minutes per
-  session, 120 s without audio. `:external` model names are refused: live
-  audio never leaves your nodes. There is no failover once a session has
-  opened; clients reconnect. `GET /v1/models` marks live models with
+  session, 120 s without audio. More than 64 clears or `session.update`s
+  with no audio after them get `rate_limited` ("Too many pending commands")
+  until the node catches up; the session stays open. `:external` model
+  names are refused: live audio never leaves your nodes. There is no
+  failover once a session has opened; clients reconnect. `GET /v1/models` marks live models with
   `supports_realtime_transcription`.
   Access is checked when the session opens (under the same locked send check
   as HTTP requests) and again every 60 seconds. Revoking the token, banning

@@ -166,6 +166,7 @@ impl SttRegistry {
             StopMark {
                 step_id: step_id.to_string(),
                 start_waiting: false,
+                stop_done: false,
             },
         );
         let ids: Vec<String> = self
@@ -181,19 +182,31 @@ impl SttRegistry {
 
     /// A start job for `endpoint_slug`. While its stop is still running the
     /// endpoint keeps refusing sessions (the engine is about to die); the
-    /// mark goes once that stop finishes ([`Self::stop_finished`]).
+    /// mark goes once that stop finishes ([`Self::stop_finished`]). A stop
+    /// that already finished leaves nothing to wait for: the mark goes now.
     pub fn endpoint_starting(&mut self, endpoint_slug: &str) {
-        if let Some(mark) = self.stopping.get_mut(endpoint_slug) {
+        let Some(mark) = self.stopping.get_mut(endpoint_slug) else {
+            return;
+        };
+        if mark.stop_done {
+            self.stopping.remove(endpoint_slug);
+        } else {
             mark.start_waiting = true;
         }
     }
 
     /// The stop step `step_id` finished. If a start is already waiting, the
     /// endpoint may take sessions again once that start makes it ready;
-    /// otherwise the mark stays until the endpoint leaves the snapshot.
+    /// otherwise the mark stays until a start arrives or the endpoint leaves
+    /// the snapshot.
     pub fn stop_finished(&mut self, step_id: &str) {
-        self.stopping
-            .retain(|_, mark| mark.step_id != step_id || !mark.start_waiting);
+        self.stopping.retain(|_, mark| {
+            if mark.step_id != step_id {
+                return true;
+            }
+            mark.stop_done = true;
+            !mark.start_waiting
+        });
     }
 
     /// The deployment step `step_id` was refused or failed. If it was a
@@ -748,6 +761,8 @@ struct StopMark {
     step_id: String,
     /// A start job for the endpoint arrived while the stop still ran.
     start_waiting: bool,
+    /// The stop step finished (succeeded); a later start lifts the mark.
+    stop_done: bool,
 }
 
 /// One running session thread, counted until the thread itself ends.

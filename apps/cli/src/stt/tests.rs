@@ -1062,6 +1062,35 @@ fn queued_commands_are_bounded_per_session() {
 }
 
 #[test]
+fn a_start_that_arrives_after_its_stop_finished_lifts_the_mark() {
+    // The usual order: the server sends the start after the stop's result.
+    // A fast start can republish the endpoint before the snapshot ever drops
+    // it, so the start itself must lift the mark.
+    let (mut registry, _rx) = registry();
+    let now = Instant::now();
+    let managed = vec![endpoint(
+        "inst-a",
+        "http://127.0.0.1:9",
+        segmented(None, None),
+    )];
+    registry.endpoint_stopping("inst-a", "step-1");
+    registry.stop_finished("step-1");
+    let refused = registry.handle(open(&session_id(1), "inst-a"), &managed, now);
+    assert!(is_error(&refused[0], RelayFailure::NotFound));
+    registry.endpoint_starting("inst-a");
+    assert!(
+        registry
+            .handle(open(&session_id(2), "inst-a"), &managed, now)
+            .is_empty()
+    );
+    // A later stop marks the endpoint afresh.
+    registry.endpoint_stopping("inst-a", "step-2");
+    let refused = registry.handle(open(&session_id(3), "inst-a"), &managed, now);
+    assert!(is_error(&refused[0], RelayFailure::NotFound));
+    registry.abort_all();
+}
+
+#[test]
 fn a_stop_job_ends_the_endpoints_sessions_before_it_runs() {
     let (mut registry, _rx) = registry();
     let now = Instant::now();
