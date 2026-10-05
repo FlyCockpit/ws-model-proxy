@@ -113,6 +113,23 @@ assignment provenance and automatic concurrency seed columns.
 
 ## Before you deploy
 
+- **Schema: every install with endpoints needs one `APPLY_SCHEMA=dangerous`
+  deploy for 0.4.0, after a backup.** Managed deployments add
+  `endpoint.deploymentInstanceId`, a new nullable column with a unique
+  constraint. The column starts all NULL, so the constraint cannot fail, but
+  Prisma treats any new unique constraint on a table with rows as possible
+  data loss: `APPLY_SCHEMA=safe` and `pnpm db:push` stop on it for any
+  database with at least one endpoint, whether it was built from v0.3.1 or
+  from master. (Prisma needs the constraint for the one-to-one relation, so
+  it cannot move into the schema hardening.) From a master-built database,
+  the only data the push drops is two columns: `capacity_kv_eviction.lastSessionId`
+  (a disposable cache value) and `model_pool.routingRules` (re-enter metric
+  routing rules afterwards; see below). From v0.3.1, the push also makes the
+  changes the items below list. Run `safe` first and read every warning it
+  prints, deploy once with `APPLY_SCHEMA=dangerous`, then go back to
+  `APPLY_SCHEMA=off`. One dangerous push applies every schema item in this
+  section at once; follow their conditions too (every server stopped).
+
 - **Schema: `cli_device.connectionGeneration` is added (#129).** An additive
   non-null `int` with a default of `0`, so `APPLY_SCHEMA=safe` applies it
   without a "possible data loss" stop. It fences disconnect writes to the
