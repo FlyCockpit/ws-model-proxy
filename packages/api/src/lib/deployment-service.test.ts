@@ -47,7 +47,7 @@ const rawNode = {
   id: "node",
   userId: "owner",
   status: "CONNECTED",
-  relayProtocolVersion: "2.10",
+  relayProtocolVersion: "2.11",
   allowDeployments: true,
   reportedDeployments: true,
   mcpCommandMode: "UNSUPERVISED",
@@ -112,7 +112,7 @@ describe("deployment durable API boundary", () => {
       }),
     );
   });
-  it.each(["2.9", "2.11", "3.0", "2.10.0"])(
+  it.each(["2.9", "2.10", "2.12", "3.0", "2.11.0"])(
     "refuses execution on incompatible protocol %s",
     async (version) => {
       resolveMock(db.deploymentPlan.findFirst, {

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
 import {
   CLI_TOKEN_IDENTITY_MISMATCH_MESSAGE,
@@ -1385,7 +1386,7 @@ describe("RelaySessionManager", () => {
     expect(firstControl(socket, "hello.ok")).toEqual({
       type: "hello.ok",
       id: "hello-id",
-      protocolVersion: "2.10",
+      protocolVersion: "2.11",
       revision: {
         inventorySeq: 1,
         inventoryDigest: "digest",
@@ -1922,7 +1923,7 @@ describe("RelaySessionManager", () => {
     const frame = JSON.stringify({
       type: "hello",
       id: "hello-id",
-      protocolVersion: "2.10",
+      protocolVersion: "2.11",
       cli: {
         slug: "desktop",
         hostname: "desk-01.local",
@@ -2308,7 +2309,7 @@ function helloCli(
   return JSON.stringify({
     type: "hello",
     id: "hello-cli",
-    protocolVersion: "2.10",
+    protocolVersion: "2.11",
     cli: {
       slug: "desktop",
       hostname: "desk-01.local",
@@ -2380,7 +2381,7 @@ describe("relay terminal and exec sessions", () => {
       }),
     );
     expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
-      protocolVersion: "2.10",
+      protocolVersion: "2.11",
       fileOps: true,
       mcpFileRead: true,
       fileRootsConfigured: true,
@@ -2446,7 +2447,7 @@ describe("relay terminal and exec sessions", () => {
     await register(manager, socket);
     const snapshot = () => manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id");
     expect(snapshot()).toMatchObject({
-      protocolVersion: "2.10",
+      protocolVersion: "2.11",
       fileOps: true,
       countContext: true,
       mcpFileRead: false,
@@ -2460,7 +2461,7 @@ describe("relay terminal and exec sessions", () => {
     ).get("cli-device-id");
     if (session) session.features = { ...session.features, fileOps: false, mcpFileRead: true };
     expect(snapshot()).toMatchObject({
-      protocolVersion: "2.10",
+      protocolVersion: "2.11",
       fileOps: true,
       countContext: true,
       mcpFileRead: true,
@@ -2516,12 +2517,12 @@ describe("relay terminal and exec sessions", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     await register(manager, socket, helloCli({ mcpCommandMode: "supervised" }));
-    expect(firstControl(socket, "hello.ok").protocolVersion).toBe("2.10");
+    expect(firstControl(socket, "hello.ok").protocolVersion).toBe("2.11");
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         update: expect.objectContaining({
           cliVersion: "9.9.9",
-          relayProtocolVersion: "2.10",
+          relayProtocolVersion: "2.11",
           reportedHumanTerminal: true,
           reportedMcpCommandMode: "SUPERVISED",
           reportedTerminalApproval: false,
@@ -2617,10 +2618,10 @@ describe("relay terminal and exec sessions", () => {
       RELAY_UPGRADE_REQUIRED_MESSAGE,
     ],
     [
-      "a 2.11 hello (a CLI newer than this server)",
+      "a 2.12 hello (a CLI newer than this server)",
       (() => {
         const frame = JSON.parse(helloCli()) as { protocolVersion: string };
-        frame.protocolVersion = "2.11";
+        frame.protocolVersion = "2.12";
         return JSON.stringify(frame);
       })(),
       "upgrade_server",
@@ -2730,9 +2731,9 @@ describe("relay terminal and exec sessions", () => {
       protocolVersion: string;
       cli: { version?: string; capabilities: Record<string, unknown> };
     };
-    frame.protocolVersion = "2.11";
+    frame.protocolVersion = "2.12";
     frame.cli.version = "0.9.0-rc.1+build.5";
-    frame.cli.capabilities.protocolVersion = "2.11";
+    frame.cli.capabilities.protocolVersion = "2.12";
     manager.acceptAuthenticatedSocket({
       socket,
       identity: { ...identity, kind: "deviceCredential", cliDeviceId: "bound-device" },
@@ -2750,7 +2751,7 @@ describe("relay terminal and exec sessions", () => {
     expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
       where: { id: "bound-device", userId: "user-id" },
       data: {
-        rejectedRelayProtocolVersion: "2.11",
+        rejectedRelayProtocolVersion: "2.12",
         rejectedCliVersion: "0.9.0-rc.1+build.5",
         relayRejectedAt: now,
       },
@@ -2779,7 +2780,7 @@ describe("relay terminal and exec sessions", () => {
     await register(manager, socket, JSON.stringify(frame));
     expect(firstControl(socket, "hello.ok")).toMatchObject({
       type: "hello.ok",
-      protocolVersion: "2.10",
+      protocolVersion: "2.11",
     });
     expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
   });
@@ -3045,14 +3046,14 @@ describe("relay terminal viewers", () => {
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         update: expect.objectContaining({
-          relayProtocolVersion: "2.10",
+          relayProtocolVersion: "2.11",
           reportedMcpCommandMode: "UNSUPERVISED",
           reportedHumanTerminal: true,
         }),
       }),
     );
     expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
-      protocolVersion: "2.10",
+      protocolVersion: "2.11",
       mcpCommandMode: "unsupervised",
       supervisedCommands: true,
       terminalPublicKey: uncompressedKey(),
@@ -3102,6 +3103,54 @@ describe("relay terminal viewers", () => {
     const before = socket.sends.length;
     expect(manager.sendDeploymentJob(target!, job)).toBe(false);
     expect(socket.sends.length).toBe(before);
+  });
+
+  it("sends interactive jobs and takes operator progress only with deploymentOperator", async () => {
+    const golden = JSON.parse(
+      readFileSync(
+        new URL("../../../cli/tests/fixtures/relay-current/deployment-jobs.json", import.meta.url),
+        "utf8",
+      ),
+    ) as {
+      jobs: Record<
+        string,
+        Parameters<InstanceType<typeof RelaySessionManager>["sendDeploymentJob"]>[1]
+      >;
+      results: Record<string, unknown>;
+    };
+    const frame = (protocolVersion: string, features: Record<string, boolean>) => {
+      const parsed = JSON.parse(helloCli()) as {
+        protocolVersion: string;
+        cli: { capabilities: { features: Record<string, unknown> } };
+      };
+      parsed.protocolVersion = protocolVersion;
+      Object.assign(parsed.cli.capabilities.features, features);
+      return JSON.stringify(parsed);
+    };
+    const cases: Array<[string, Record<string, boolean>, boolean]> = [
+      ["2.11", { deployments: true }, false],
+      ["2.11", { deploymentOperator: true }, false],
+      ["2.11", { deployments: true, deploymentOperator: true }, true],
+    ];
+    for (const [version, features, operator] of cases) {
+      const { manager, socket } = await setup(frame(version, features));
+      const target = manager.deploymentSocket("cli-device-id");
+      expect(target).toBeTruthy();
+      expect(manager.sendDeploymentJob(target!, golden.jobs.plainStart!)).toBe(true);
+      for (const name of ["interactiveStart", "interactiveStop", "stopInteractiveStart"]) {
+        const before = socket.sends.length;
+        expect(manager.sendDeploymentJob(target!, golden.jobs[name]!), `${version} ${name}`).toBe(
+          operator,
+        );
+        expect(socket.sends.length).toBe(before + (operator ? 1 : 0));
+      }
+      const result = vi.fn(async () => true);
+      manager.setDeploymentHandlers({ result, inventory: async () => true });
+      await manager.handleTextFrame(socket, JSON.stringify(golden.results.awaitingOperator), now);
+      await manager.handleTextFrame(socket, JSON.stringify(golden.results.interactiveRefused), now);
+      expect(result).toHaveBeenCalledTimes(operator ? 2 : 1);
+      expect(socket.closes).toHaveLength(0);
+    }
   });
 
   it("lets two viewers coexist without a detached event", async () => {

@@ -11,7 +11,11 @@ import {
 } from "@ws-model-proxy/api/lib/relay-protocol-version";
 import { adapterRouteIsValid } from "@ws-model-proxy/api/lib/remote-engine-adapters";
 import { normalizeReportedHostname } from "@ws-model-proxy/config/cli-device-name";
-import type { DeploymentJob } from "@ws-model-proxy/config/deployment-protocol";
+import {
+  DEPLOYMENT_OPERATOR_RESULT_STATUSES,
+  type DeploymentJob,
+  deploymentOperatorResultStatus,
+} from "@ws-model-proxy/config/deployment-protocol";
 import { z } from "zod";
 import {
   FILE_BODY_MAX_BYTES,
@@ -178,6 +182,11 @@ const cliFeatureSchema = z
     /** `wsmp config set-file-tools-as-root on` (default off). */
     allowFileToolsAsRoot: z.boolean(),
     deployments: z.boolean().optional().default(false),
+    /**
+     * The CLI can run interactive deployment commands in an operator terminal. Counts only
+     * with `deployments` (`deploymentOperatorSupported`).
+     */
+    deploymentOperator: z.boolean().optional().default(false),
   })
   .strict();
 
@@ -733,14 +742,39 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
       rank: z.number().int().min(0).max(63),
       intentHash: z.string().regex(/^[a-f0-9]{64}$/),
       ownerEpoch: requestIdSchema,
-      status: z.enum(["succeeded", "failed", "running"]),
+      status: z.enum(["succeeded", "failed", "running", ...DEPLOYMENT_OPERATOR_RESULT_STATUSES]),
       stopped: z.boolean(),
       error: z
         .string()
         .regex(/^[a-z0-9_]{1,64}$/)
         .optional(),
+      /** 2.11 operator progress: the job's `operator.terminalId`. */
+      terminalId: base64Url16ByteSchema.optional(),
+      /** 2.11 `operator_closed`: the last attempt's exit code. */
+      exitCode: z.number().int().min(0).max(255).optional(),
     })
-    .strict(),
+    .strict()
+    .superRefine((result, ctx) => {
+      const operator = deploymentOperatorResultStatus(result.status);
+      if (operator !== (result.terminalId !== undefined))
+        ctx.addIssue({
+          code: "custom",
+          path: ["terminalId"],
+          message: "terminalId is present exactly on operator statuses.",
+        });
+      if (result.exitCode !== undefined && result.status !== "operator_closed")
+        ctx.addIssue({
+          code: "custom",
+          path: ["exitCode"],
+          message: "Only operator_closed carries an exit code.",
+        });
+      if (operator && result.stopped)
+        ctx.addIssue({
+          code: "custom",
+          path: ["stopped"],
+          message: "Operator progress never reports a stop.",
+        });
+    }),
   z
     .object({
       type: z.literal("deployment.instances"),
@@ -1360,6 +1394,18 @@ export function encodeRelayServerControlMessage(message: RelayServerControlMessa
     } else if (message.fileOp !== undefined || message.bodyBytes !== undefined) {
       throw new RelayProtocolError("File fields require kind file.");
     }
+  }
+  // 2.11: an operator terminal accompanies exactly the interactive jobs.
+  if (
+    message.type === "deployment.job" &&
+    (message.interactive === true) !==
+      (message.operator !== undefined &&
+        Object.keys(message.operator).length === 1 &&
+        base64Url16ByteSchema.safeParse(message.operator.terminalId).success)
+  ) {
+    throw new RelayProtocolError(
+      "deployment.job operator must accompany exactly interactive jobs.",
+    );
   }
   const encoded = stringifyWellFormed(message);
   // Both carry user-authored commands; the CLI drops larger control frames undecoded.

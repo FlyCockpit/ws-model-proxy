@@ -31,11 +31,14 @@ import {
 import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { parseStoredRemoteEngineAdapters } from "@ws-model-proxy/api/lib/remote-engine-adapters";
 import type { SupervisedCommandStatus } from "@ws-model-proxy/api/lib/supervised-command-types";
-import type {
-  DeploymentInstancesFrame,
-  DeploymentJob,
-  DeploymentJobResult,
-  DeploymentObservedInstance,
+import {
+  type DeploymentInstancesFrame,
+  type DeploymentJob,
+  type DeploymentJobResult,
+  type DeploymentObservedInstance,
+  deploymentJobNeedsOperator,
+  deploymentOperatorResultStatus,
+  deploymentOperatorSupported,
 } from "@ws-model-proxy/config/deployment-protocol";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import type { DeploymentLiveSocket, DeploymentSocket } from "../deployments/reconciler.js";
@@ -157,6 +160,8 @@ async function closeBodyStream(stream: OutboundBodyStream | undefined) {
 
 export type CliReportedFeatures = {
   deployments?: boolean;
+  /** 2.11: interactive deployment commands; see `deploymentOperatorSupported`. */
+  deploymentOperator?: boolean;
   humanTerminal: boolean;
   /** The CLI's own MCP command mode (its config), from hello. */
   mcpCommandMode: McpCommandModeName;
@@ -774,7 +779,9 @@ export class RelaySessionManager {
       session.connectionGeneration !== socket.generation ||
       session.identity.userId !== socket.userId ||
       // A closing socket would drop the frame silently; report it unsent.
-      session.socket.readyState !== WS_READY_STATE_OPEN
+      session.socket.readyState !== WS_READY_STATE_OPEN ||
+      // Interactive jobs reach only a CLI that reported it can run them.
+      (deploymentJobNeedsOperator(job) && !this.sessionRunsOperatorJobs(session))
     )
       return false;
     try {
@@ -783,6 +790,13 @@ export class RelaySessionManager {
     } catch {
       return false;
     }
+  }
+  private sessionRunsOperatorJobs(session: SessionState) {
+    return deploymentOperatorSupported({
+      protocolVersion: session.protocolVersion,
+      deployments: session.features?.deployments,
+      deploymentOperator: session.features?.deploymentOperator,
+    });
   }
   private sessionsBySocket = new Map<RelaySocket, SessionState>();
   private sessionsByCliDeviceId = new Map<string, SessionState>();
@@ -1185,9 +1199,16 @@ export class RelaySessionManager {
         userId: session.identity.userId,
         generation: session.connectionGeneration,
       };
-      if (message.type === "deployment.job.result")
+      if (message.type === "deployment.job.result") {
+        // Operator progress answers only interactive jobs, which only a CLI that
+        // reported `deploymentOperator` is ever sent.
+        if (
+          deploymentOperatorResultStatus(message.status) &&
+          !this.sessionRunsOperatorJobs(session)
+        )
+          return;
         await this.deploymentHandlers?.result(identity, message);
-      else await this.receiveDeploymentSnapshot(session, identity, message, frame);
+      } else await this.receiveDeploymentSnapshot(session, identity, message, frame);
       return;
     }
 

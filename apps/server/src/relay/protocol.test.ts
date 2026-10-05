@@ -2,8 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
   DEPLOYMENT_JOB_FRAME_MAX_BYTES,
+  DEPLOYMENT_PROTOCOL_VERSION,
   type DeploymentJob,
   deploymentJobFrameBytes,
+  deploymentOperatorSupported,
 } from "@ws-model-proxy/config/deployment-protocol";
 import { describe, expect, it } from "vitest";
 import { sanitizeRelayRequestHeaders } from "./headers.js";
@@ -329,7 +331,7 @@ function helloWithCli(cli: Record<string, unknown>) {
   return JSON.stringify({
     type: "hello",
     id: "hello-id",
-    protocolVersion: "2.10",
+    protocolVersion: "2.11",
     cli: {
       slug: "desktop",
       identityPublicKey: uncompressedKey(),
@@ -365,9 +367,10 @@ describe("hello hostname", () => {
 });
 
 describe("current relay protocol minimum", () => {
-  it("speaks 2.10 and names the minimum protocol in the upgrade message", () => {
-    expect(RELAY_PROTOCOL_VERSIONS).toEqual(["2.10"]);
-    expect(RELAY_MIN_PROTOCOL_VERSION).toBe("2.10");
+  it("speaks only 2.11 and names the minimum protocol in the upgrade message", () => {
+    expect(RELAY_PROTOCOL_VERSIONS).toEqual(["2.11"]);
+    expect(RELAY_MIN_PROTOCOL_VERSION).toBe("2.11");
+    expect(DEPLOYMENT_PROTOCOL_VERSION).toBe(RELAY_MIN_PROTOCOL_VERSION);
     expect(RELAY_UPGRADE_REQUIRED_MESSAGE).toContain(
       `relay protocol ${RELAY_MIN_PROTOCOL_VERSION}`,
     );
@@ -375,7 +378,7 @@ describe("current relay protocol minimum", () => {
   });
 
   it("flags every hello that is not the minimum protocol, and the pre-naming label field", () => {
-    for (const version of ["2.0", "2.3", "2.4", "2.5", "2.6", "2.7", "2.8", "2.9"]) {
+    for (const version of ["2.0", "2.3", "2.4", "2.5", "2.6", "2.7", "2.8", "2.9", "2.10"]) {
       expect(helloNeedsUpgrade(hello(version, { protocolVersion: version }))).toBe(true);
     }
     // 0.3.x shape: protocol 2.3 with `cli.label` and no hostname.
@@ -399,7 +402,7 @@ describe("current relay protocol minimum", () => {
   });
 
   it("flags a hello newer than the newest protocol: the server must be upgraded", () => {
-    for (const version of ["2.11", "3.0"]) {
+    for (const version of ["2.12", "3.0"]) {
       expect(helloNeedsUpgrade(hello(version, { ...CAPABILITIES, protocolVersion: version }))).toBe(
         true,
       );
@@ -410,6 +413,35 @@ describe("current relay protocol minimum", () => {
     expect(() =>
       parseRelayClientControlFrame(hello(RELAY_MIN_PROTOCOL_VERSION, CAPABILITIES)),
     ).not.toThrow();
+  });
+
+  it("reads the 2.11 deploymentOperator feature", () => {
+    const features = (version: string, extra: Record<string, unknown>) => {
+      const frame = hello(version, {
+        ...CAPABILITIES,
+        features: { ...CAPABILITIES.features, ...extra },
+      });
+      expect(helloNeedsUpgrade(frame)).toBe(false);
+      const parsed = parseRelayClientControlFrame(frame);
+      if (parsed.type !== "hello") throw new Error("expected hello");
+      return { protocolVersion: parsed.protocolVersion, ...parsed.cli.capabilities.features };
+    };
+    // Omitted means false, as the Rust encoder skips a false flag.
+    expect(features("2.11", {}).deploymentOperator).toBe(false);
+    expect(features("2.11", { deployments: true }).deploymentOperator).toBe(false);
+    const operator = features("2.11", { deployments: true, deploymentOperator: true });
+    expect(operator.deploymentOperator).toBe(true);
+    expect(deploymentOperatorSupported(operator)).toBe(true);
+    // The flag counts only with deployments on.
+    expect(deploymentOperatorSupported(features("2.11", { deploymentOperator: true }))).toBe(false);
+    expect(() =>
+      parseRelayClientControlFrame(
+        hello("2.11", {
+          ...CAPABILITIES,
+          features: { ...CAPABILITIES.features, deploymentOperator: "yes" },
+        }),
+      ),
+    ).toThrow();
   });
 
   it("requires cli.identityPublicKey and identitySignature on a current hello", () => {
@@ -505,7 +537,7 @@ describe("current relay protocol minimum", () => {
       parseRelayClientControlFrame(hello(RELAY_MIN_PROTOCOL_VERSION, CAPABILITIES)),
     ).toMatchObject({
       type: "hello",
-      protocolVersion: "2.10",
+      protocolVersion: "2.11",
       cli: {
         capabilities: {
           features: { mcpCommandMode: "supervised" },
@@ -640,7 +672,7 @@ describe("current relay protocol minimum", () => {
     ).toMatchObject({
       type: "protocol.error",
       code: "identity_mismatch",
-      supportedVersions: [RELAY_MIN_PROTOCOL_VERSION],
+      supportedVersions: [...RELAY_PROTOCOL_VERSIONS],
     });
     expect(
       JSON.parse(
@@ -1051,7 +1083,7 @@ function currentTelemetryHello() {
   return { ...relay24Vector("hello.json"), protocolVersion: RELAY_MIN_PROTOCOL_VERSION };
 }
 
-describe("relay protocol 2.10 telemetry frames", () => {
+describe("current relay protocol telemetry frames", () => {
   it("accepts every CLI-encoded telemetry vector and current hello engine facts", () => {
     for (const name of [
       "node-info.json",

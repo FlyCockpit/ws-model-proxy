@@ -5,11 +5,12 @@
  * Last cut release (v0.3.1) spoke 2.3. Unreleased work that had been numbered
  * 2.4–2.9 (terminal identity, supervised commands, engine facts / node
  * telemetry, MCP node file tools, custom engine adapters) and deployments
- * ship together as 2.10 with durable snapshot ACKs. Older CLIs are refused at hello.
+ * ship together, with durable snapshot ACKs and interactive deployment commands, as 2.11
+ * (2.10 was never released). Older CLIs are refused at hello.
  */
-export const RELAY_PROTOCOL_VERSIONS = ["2.10"] as const;
+export const RELAY_PROTOCOL_VERSIONS = ["2.11"] as const;
 export type RelayProtocolVersion = (typeof RELAY_PROTOCOL_VERSIONS)[number];
-export const RELAY_MIN_PROTOCOL_VERSION: RelayProtocolVersion = "2.10";
+export const RELAY_MIN_PROTOCOL_VERSION: RelayProtocolVersion = "2.11";
 
 /**
  * Why a hello claiming `protocolVersion` was refused: `cli_too_new` when it is

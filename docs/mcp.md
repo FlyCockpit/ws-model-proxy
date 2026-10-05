@@ -11,8 +11,8 @@ excluded procedure) is maintained in the generated, test-enforced artifact
 [docs/mcp-tool-coverage.md](./mcp-tool-coverage.md). This document describes the
 server behavior around it; it does not duplicate the catalog.
 
-Node telemetry (relay protocol 2.10) is read-only over MCP. Node file tools
-(relay protocol 2.10) are described in [CLI file tools](#cli-file-tools-relay-protocol-210).
+Node telemetry (relay protocol 2.11) is read-only over MCP. Node file tools
+(relay protocol 2.11) are described in [CLI file tools](#cli-file-tools-relay-protocol-211).
 `forwarder_device_metrics_get` (`{ cliDeviceId }`) returns a CLI device's static
 `node.info`, its freshest `node.metrics` (live from the relay session, else the
 stored once-a-minute snapshot, with `nodeMetricsSource`), the live
@@ -161,7 +161,7 @@ Owners see every requester on their pools; grantees see only their own. A
 foreign pool or member returns `NOT_FOUND`. Engine prefix-cache counters stay
 on the engine-load charts and are not mixed into this tool.
 
-## CLI file tools (relay protocol 2.10)
+## CLI file tools (relay protocol 2.11)
 
 Nine PAT-only tools read and change files on a CLI device (a node): `forwarder_cli_file_read`,
 `forwarder_cli_file_stat`, `forwarder_cli_dir_list`, `forwarder_cli_file_search`
@@ -545,7 +545,7 @@ stable-inode alias pairs still refuse.
 
 
 **Version skew.** `uncertain_outcome` and `unsafe_filesystem` are new file error
-codes of relay 2.10. Upgrade the server before the `wsmp` CLI: a server that
+codes of relay 2.11. Upgrade the server before the `wsmp` CLI: a server that
 predates these codes treats the CLI's rejection frame as malformed instead of
 reporting the typed error (retained files stay on disk). An older CLI never
 emits `unsafe_filesystem`.

@@ -11,7 +11,9 @@ use crate::config::{
 };
 pub use crate::terminal_identity::TerminalIdentityProof;
 
-pub const RELAY_PROTOCOL_VERSION: &str = "2.10";
+/// 2.11 (2.10 was never released) adds interactive deployment jobs
+/// (`deploymentOperator`). The server accepts only this version.
+pub const RELAY_PROTOCOL_VERSION: &str = "2.11";
 #[cfg(test)]
 const TEST_IDENTITY_PUBLIC_KEY: &str =
     "BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A";
@@ -565,6 +567,12 @@ fn deployment_disabled(value: &bool) -> bool {
 pub struct CliReportedFeatures {
     #[serde(skip_serializing_if = "deployment_disabled")]
     pub deployments: bool,
+    /// 2.11: this CLI can run interactive deployment commands in an operator
+    /// terminal. Omitted while false. Not reported yet: this build decodes
+    /// interactive jobs but refuses them (`INTERACTIVE_UNSUPPORTED`), so the
+    /// server never sends it one.
+    #[serde(skip_serializing_if = "deployment_disabled")]
+    pub deployment_operator: bool,
     pub human_terminal: bool,
     pub mcp_command_mode: McpCommandMode,
     pub terminal_approval: bool,
@@ -601,6 +609,7 @@ impl CliCapabilities {
         Self {
             features: CliReportedFeatures {
                 deployments: false,
+                deployment_operator: false,
                 human_terminal: snapshot.allow_human_terminal,
                 mcp_command_mode: snapshot.mcp_command_mode,
                 terminal_approval: snapshot.require_terminal_approval,
@@ -2732,6 +2741,18 @@ mod tests {
         assert!(!encoded.contains(r#""requestBodyWindowChunks""#));
         assert!(!encoded.contains("protocol_version"));
         assert!(!encoded.contains(":null"));
+        // 2.11: omitted while false, and this build never reports it (it
+        // refuses interactive jobs).
+        assert!(!encoded.contains("deploymentOperator"));
+        let ClientControlMessage::Hello { cli, .. } = &message else {
+            unreachable!("hello")
+        };
+        let mut features = cli.capabilities.features.clone();
+        features.deployments = true;
+        features.deployment_operator = true;
+        let features = serde_json::to_value(&features).expect("features");
+        assert_eq!(features["deployments"], true);
+        assert_eq!(features["deploymentOperator"], true);
 
         let ack = encode_control(&ClientControlMessage::RelayRequestBodyAck {
             request_id: "request-1".to_string(),

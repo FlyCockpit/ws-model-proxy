@@ -12,10 +12,11 @@ import {
   originalDeploymentStopIntent,
   storedDeploymentSpecSchema,
 } from "@ws-model-proxy/api/lib/deployment-spec";
-import type {
-  DeploymentJob,
-  DeploymentJobResult,
-  DeploymentObservedInstance,
+import {
+  type DeploymentJob,
+  type DeploymentJobResult,
+  type DeploymentObservedInstance,
+  deploymentOperatorResultStatus,
 } from "@ws-model-proxy/config/deployment-protocol";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
@@ -155,6 +156,8 @@ export class DeploymentReconciler {
   }
   acceptResult(socket: DeploymentSocket, result: DeploymentJobResult) {
     if (this.stopped || !this.current(socket)) return Promise.resolve(false);
+    // Operator progress is never final; it is unused until interactive jobs dispatch.
+    if (deploymentOperatorResultStatus(result.status)) return Promise.resolve(false);
     return this.track(
       this.locked(socket.userId, result.instanceId, async (tx) => {
         if (!(await this.fenceSocket(tx, socket))) return false;

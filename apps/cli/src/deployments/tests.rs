@@ -58,6 +58,9 @@ fn job(action: Action) -> Job {
         embedding_contract: None,
         transcription_profile: None,
         command: "sleep 30".into(),
+        interactive: None,
+        stop_interactive: None,
+        operator: None,
         stop_command: Some("true".into()),
         status_command: None,
         health_command: None,
@@ -70,6 +73,7 @@ fn job(action: Action) -> Job {
         readiness: Readiness {
             path: "/health".into(),
             expected_status: 200,
+            timeout_ms: None,
         },
         health: Health {
             interval_ms: 30_000,
@@ -1447,4 +1451,209 @@ fn stop_runs_when_state_is_near_its_limit_and_new_work_is_refused() {
     assert_eq!(admitted.status, "succeeded", "{:?}", admitted.error);
     assert!(state_bytes(&executor) <= STATE_LIMIT - STOP_RESERVE);
     assert!(executor.state.records.len() < count);
+}
+
+fn job_golden() -> serde_json::Value {
+    serde_json::from_str(include_str!(
+        "../../tests/fixtures/relay-current/deployment-jobs.json"
+    ))
+    .expect("golden JSON")
+}
+
+fn golden_job(name: &str) -> Job {
+    serde_json::from_value(job_golden()["jobs"][name].clone()).expect(name)
+}
+
+fn fake_runtime(path: &std::path::Path) -> Fake {
+    Fake {
+        units: RefCell::new(BTreeMap::new()),
+        launches: Cell::new(0),
+        intent_path: path.to_path_buf(),
+        stop_fails: Cell::new(false),
+        ready: Cell::new(true),
+    }
+}
+
+#[test]
+fn current_job_wire_matches_shared_golden() {
+    let golden = job_golden();
+    assert_eq!(
+        golden["protocolVersion"],
+        crate::protocol::RELAY_PROTOCOL_VERSION
+    );
+    let jobs = golden["jobs"].as_object().expect("jobs");
+    assert_eq!(jobs.len(), 4);
+    for (name, value) in jobs {
+        let job: Job = serde_json::from_value(value.clone()).expect(name);
+        job.validate().expect(name);
+        // Decoding and re-encoding loses nothing, so a persisted job stays the
+        // job the server hashed.
+        assert_eq!(
+            &serde_json::to_value(&job).expect("encode"),
+            value,
+            "{name}"
+        );
+        assert_eq!(job.needs_operator(), name != "plainStart", "{name}");
+    }
+
+    let interactive = golden_job("interactiveStart");
+    let results = &golden["results"];
+    let encode = |result: &JobResult| serde_json::to_value(result).expect("result");
+    assert_eq!(
+        encode(&JobResult::failure(&interactive, INTERACTIVE_UNSUPPORTED)),
+        results["interactiveRefused"]
+    );
+    assert_eq!(
+        encode(&JobResult::failure(
+            &golden_job("stopInteractiveStart"),
+            INTERACTIVE_UNSUPPORTED
+        )),
+        results["stopInteractiveRefused"]
+    );
+    for (progress, name) in [
+        (OperatorProgress::Awaiting, "awaitingOperator"),
+        (OperatorProgress::Running, "operatorRunning"),
+        (OperatorProgress::Closed(Some(1)), "operatorClosed"),
+        (OperatorProgress::Closed(None), "operatorDeclined"),
+    ] {
+        let result = JobResult::operator(&interactive, progress).expect(name);
+        assert_eq!(encode(&result), results[name], "{name}");
+    }
+    assert!(JobResult::operator(&golden_job("plainStart"), OperatorProgress::Awaiting).is_none());
+}
+
+#[test]
+fn server_shaped_plain_job_runs_unchanged() {
+    // The exact frame the server dispatches: an `<uuid>:<generation>` owner
+    // epoch and the recipe's `readiness.timeoutMs`.
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("instances.json");
+    let runtime = fake_runtime(&path);
+    let mut executor = Executor::load(path).expect("load");
+    let start = golden_job("plainStart");
+    let result = executor.execute(start.clone(), true, McpCommandMode::Off, &runtime);
+    assert_eq!(result.status, "succeeded", "{result:?}");
+    assert_eq!(result.owner_epoch, start.owner_epoch);
+    assert_eq!(runtime.launches.get(), 1);
+}
+
+#[test]
+fn interactive_jobs_are_refused_before_any_state_or_launch() {
+    let root = tempfile::tempdir().expect("root");
+    let path = root.path().join("instances.json");
+    let runtime = fake_runtime(&path);
+    let mut executor = Executor::load(path.clone()).expect("load");
+    for name in [
+        "interactiveStart",
+        "interactiveStop",
+        "stopInteractiveStart",
+    ] {
+        for mode in [McpCommandMode::Off, McpCommandMode::Unsupervised] {
+            let result = executor.execute(golden_job(name), true, mode, &runtime);
+            assert_eq!(result.status, "failed", "{name}");
+            assert_eq!(result.error.as_deref(), Some(INTERACTIVE_UNSUPPORTED));
+            assert!(!result.stopped);
+            assert_eq!(result.terminal_id, None);
+        }
+    }
+    assert_eq!(runtime.launches.get(), 0);
+    assert!(!path.exists(), "nothing was recorded");
+    // A malformed interactive job is still `bad_job`, not a refusal.
+    let mut malformed = golden_job("interactiveStart");
+    malformed.operator = None;
+    let result = executor.execute(malformed, true, McpCommandMode::Off, &runtime);
+    assert_eq!(result.error.as_deref(), Some("bad_job"));
+}
+
+#[test]
+fn interactive_fields_follow_the_server_intent_rules() {
+    let valid = golden_job("interactiveStart");
+    let refused = |change: &dyn Fn(&mut Job), why: &str| {
+        let mut job = valid.clone();
+        change(&mut job);
+        assert!(job.validate().is_err(), "{why}");
+    };
+    refused(&|j| j.interactive = Some(false), "false is never sent");
+    refused(&|j| j.stop_interactive = Some(false), "false is never sent");
+    refused(&|j| j.operator = None, "interactive without a terminal");
+    refused(
+        &|j| j.terminal("AAECAwQFBgcICQoLDA0OD"),
+        "terminal id is 22 characters",
+    );
+    refused(
+        &|j| j.terminal("AAECAwQFBgcICQoLDA0OD!"),
+        "terminal id is base64url",
+    );
+    refused(
+        &|j| j.action = Action::Readiness,
+        "readiness is never interactive",
+    );
+    refused(
+        &|j| j.action = Action::Health,
+        "health is never interactive",
+    );
+    refused(
+        &|j| j.action = Action::Status,
+        "status is never interactive",
+    );
+    refused(
+        &|j| {
+            j.action = Action::AfterJoin;
+            j.management = Management::OwnedProcess;
+        },
+        "interactive after_join must be an external service",
+    );
+    refused(
+        &|j| j.management = Management::OwnedProcess,
+        "interactive start must be an external service",
+    );
+    refused(&|j| j.status_command = Some(" ".into()), "needs status");
+
+    let mut prepare = valid.clone();
+    prepare.action = Action::Prepare;
+    prepare.management = Management::OwnedProcess;
+    prepare
+        .validate()
+        .expect("an owned prepare may be interactive");
+
+    let mut terminal_only = golden_job("plainStart");
+    terminal_only.operator = valid.operator.clone();
+    assert!(
+        terminal_only.validate().is_err(),
+        "a terminal without interactive"
+    );
+    let mut stop_flag = golden_job("plainStart");
+    stop_flag.stop_interactive = Some(true);
+    assert!(
+        stop_flag.validate().is_err(),
+        "an interactive stop needs status"
+    );
+    stop_flag.status_command = Some("pgrep fixture".into());
+    stop_flag.validate().expect("stopInteractive with status");
+
+    // Strict decoding is unchanged for everything else.
+    let mut extra = job_golden()["jobs"]["interactiveStart"].clone();
+    extra["operator"]["viewerId"] = "x".into();
+    assert!(serde_json::from_value::<Job>(extra).is_err());
+    let mut extra = job_golden()["jobs"]["plainStart"].clone();
+    extra["operatorTerminal"] = "x".into();
+    assert!(serde_json::from_value::<Job>(extra).is_err());
+
+    let mut epoch = golden_job("plainStart");
+    epoch.owner_epoch = "epoch/7".into();
+    assert!(epoch.validate().is_err());
+    let mut readiness = golden_job("plainStart");
+    readiness.readiness.timeout_ms = Some(900_001);
+    assert!(readiness.validate().is_err());
+}
+
+trait TerminalId {
+    fn terminal(&mut self, id: &str);
+}
+impl TerminalId for Job {
+    fn terminal(&mut self, id: &str) {
+        self.operator = Some(Operator {
+            terminal_id: id.into(),
+        });
+    }
 }

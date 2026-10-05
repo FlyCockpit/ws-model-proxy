@@ -161,6 +161,10 @@ impl TranscriptionProfile {
 pub struct Readiness {
     pub path: String,
     pub expected_status: u16,
+    /// The recipe's readiness budget. The server always sends it (it sets the
+    /// start job's `timeoutMs`); the CLI only bounds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -170,6 +174,30 @@ pub struct Health {
     pub failure_threshold: u32,
     pub success_threshold: u32,
 }
+
+/// 2.11: the operator terminal the server minted for one interactive dispatch.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Operator {
+    /// 16 random bytes, unpadded base64url (22 characters).
+    pub terminal_id: String,
+}
+
+impl Operator {
+    fn valid(&self) -> bool {
+        self.terminal_id.len() == 22
+            && base64::Engine::decode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                &self.terminal_id,
+            )
+            .is_ok_and(|bytes| bytes.len() == 16)
+    }
+}
+
+/// Error code for a 2.11 interactive job (`interactive`, `stopInteractive` or
+/// `operator`) that this CLI decodes but cannot yet run. It is refused before
+/// any state is touched, so nothing runs and nothing is recorded.
+pub const INTERACTIVE_UNSUPPORTED: &str = "interactive_unsupported";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -193,6 +221,16 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcription_profile: Option<TranscriptionProfile>,
     pub command: String,
+    /// 2.11: a person runs `command` in an operator terminal. The server sends
+    /// it only as `true`; absent on every other job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactive: Option<bool>,
+    /// 2.11: the rank's stop command is interactive. Only `true` or absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_interactive: Option<bool>,
+    /// 2.11: present exactly when `interactive`; not part of the intent hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator: Option<Operator>,
     #[serde(default)]
     pub stop_command: Option<String>,
     #[serde(default)]
@@ -218,12 +256,14 @@ impl Job {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         }
+        // The server's owner epoch is `<uuid>:<connection generation>`.
+        let epoch = |value: &str| id(&value.replace(':', "-"));
         anyhow::ensure!(
             self.frame_type == "deployment.job"
                 && id(&self.step_id)
                 && id(&self.instance_id)
                 && id(&self.revision_id)
-                && id(&self.owner_epoch),
+                && epoch(&self.owner_epoch),
             "bad deployment identity"
         );
         anyhow::ensure!(
@@ -273,7 +313,11 @@ impl Job {
                 && !self.readiness.path.starts_with("//")
                 && self.readiness.path.len() <= 2048
                 && !self.readiness.path.contains(['\r', '\n', '#'])
-                && (200..=399).contains(&self.readiness.expected_status),
+                && (200..=399).contains(&self.readiness.expected_status)
+                && self
+                    .readiness
+                    .timeout_ms
+                    .is_none_or(|ms| (1_000..=900_000).contains(&ms)),
             "bad deployment readiness"
         );
         let maximum = match self.action {
@@ -315,6 +359,7 @@ impl Job {
                 "bad transcription profile"
             );
         }
+        self.validate_interactive()?;
         if let Some(contract) = &self.embedding_contract {
             anyhow::ensure!(
                 contract.dimensions > 0
@@ -330,6 +375,53 @@ impl Job {
     }
     fn key(&self) -> String {
         format!("{}:{}", self.instance_id, self.rank)
+    }
+
+    /// Carries any 2.11 interactive field. Such a job needs an operator
+    /// terminal now or for its stop later.
+    pub fn needs_operator(&self) -> bool {
+        self.interactive.is_some() || self.stop_interactive.is_some() || self.operator.is_some()
+    }
+
+    /// Mirrors `deploymentJobIntentSchema` (server): flags are only `true`,
+    /// the operator terminal accompanies exactly an interactive job, only
+    /// prepare/start/after_join/stop can be interactive, an interactive start
+    /// or after_join is an external service, and any interactive command has
+    /// status proof.
+    fn validate_interactive(&self) -> Result<()> {
+        let interactive = self.interactive == Some(true);
+        anyhow::ensure!(
+            self.interactive != Some(false) && self.stop_interactive != Some(false),
+            "bad deployment interactive flag"
+        );
+        anyhow::ensure!(
+            interactive == self.operator.is_some()
+                && self.operator.as_ref().is_none_or(Operator::valid),
+            "bad deployment operator"
+        );
+        if interactive {
+            anyhow::ensure!(
+                matches!(
+                    self.action,
+                    Action::Prepare | Action::Start | Action::AfterJoin | Action::Stop
+                ),
+                "action cannot be interactive"
+            );
+            anyhow::ensure!(
+                !matches!(self.action, Action::Start | Action::AfterJoin)
+                    || self.management == Management::ExternalService,
+                "interactive start requires an external service"
+            );
+        }
+        if interactive || self.stop_interactive == Some(true) {
+            anyhow::ensure!(
+                self.status_command
+                    .as_ref()
+                    .is_some_and(|s| !s.trim().is_empty()),
+                "interactive job requires status proof"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -347,6 +439,25 @@ pub struct JobResult {
     pub stopped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// 2.11 operator progress only: the job's `operator.terminalId`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_id: Option<String>,
+    /// 2.11 `operator_closed` only: the last attempt's exit code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u8>,
+}
+
+/// 2.11 progress for an interactive job. Never final: the step still ends
+/// with an ordinary `succeeded`/`failed` result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperatorProgress {
+    /// The terminal is spawned and its confirm screen drawn.
+    Awaiting,
+    /// The operator pressed Enter; the command started.
+    Running,
+    /// Declined, or the terminal ended without success. Carries the last
+    /// attempt's exit code when one ran.
+    Closed(Option<u8>),
 }
 
 impl JobResult {
@@ -364,7 +475,24 @@ impl JobResult {
             status: if succeeded { "succeeded" } else { "failed" }.into(),
             stopped,
             error: error.map(str::to_owned),
+            terminal_id: None,
+            exit_code: None,
         }
+    }
+
+    /// Operator progress for an interactive job; `None` for any other job.
+    pub fn operator(job: &Job, progress: OperatorProgress) -> Option<Self> {
+        let operator = job.operator.as_ref()?;
+        let (status, exit_code) = match progress {
+            OperatorProgress::Awaiting => ("awaiting_operator", None),
+            OperatorProgress::Running => ("operator_running", None),
+            OperatorProgress::Closed(code) => ("operator_closed", code),
+        };
+        let mut result = Self::new(job, false, false, None);
+        result.status = status.into();
+        result.terminal_id = Some(operator.terminal_id.clone());
+        result.exit_code = exit_code;
+        Some(result)
     }
 }
 
@@ -653,6 +781,11 @@ impl Executor {
     ) -> JobResult {
         if job.validate().is_err() {
             return JobResult::failure(&job, "bad_job");
+        }
+        // The operator-terminal executor is not implemented yet: refuse before
+        // any state is read or written, so the job neither runs nor records.
+        if job.needs_operator() {
+            return JobResult::failure(&job, INTERACTIVE_UNSUPPORTED);
         }
         if !enabled {
             return JobResult::failure(&job, "feature_disabled");

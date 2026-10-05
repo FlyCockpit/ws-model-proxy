@@ -1,0 +1,224 @@
+{
+  "protocolVersion": "2.11",
+  "jobs": {
+    "plainStart": {
+      "type": "deployment.job",
+      "attachment": "llm",
+      "engine": "vllm",
+      "management": "ownedProcess",
+      "revisionId": "cm9revisionfixture000000a",
+      "instanceId": "cm9instancefixture000000a",
+      "rank": 0,
+      "action": "start",
+      "command": "vllm serve fixture/model --port 30001",
+      "timeoutMs": 600000,
+      "unitName": "wsmp-i-cm9instancefixture000000a-r0",
+      "port": 30001,
+      "endpointSlug": "inst-fixture-a1b2c3d4e5f6",
+      "models": ["fixture/model"],
+      "contextWindow": 32768,
+      "readiness": {
+        "path": "/health",
+        "expectedStatus": 200,
+        "timeoutMs": 600000
+      },
+      "health": {
+        "intervalMs": 30000,
+        "failureThreshold": 3,
+        "successThreshold": 1
+      },
+      "stopCommand": "true",
+      "statusCommand": null,
+      "healthCommand": null,
+      "stepId": "tz4a98xxat96iws9zmbrgj3a",
+      "ownerEpoch": "3f2b8c1e-1d2a-4c3b-9e8f-0a1b2c3d4e5f:7",
+      "actor": "USER",
+      "humanApproved": true,
+      "intentHash": "c207d85160e877498399c678104792dd0e1eea8529090aad0fed3b29d31e6e67"
+    },
+    "interactiveStart": {
+      "type": "deployment.job",
+      "attachment": "llm",
+      "engine": "vllm",
+      "management": "externalService",
+      "revisionId": "cm9revisionfixture000000a",
+      "instanceId": "cm9instancefixture000000a",
+      "rank": 0,
+      "action": "start",
+      "command": "sudo systemctl start fixture-vllm.service",
+      "timeoutMs": 600000,
+      "unitName": "wsmp-i-cm9instancefixture000000a-r0",
+      "port": 30001,
+      "endpointSlug": "inst-fixture-a1b2c3d4e5f6",
+      "models": ["fixture/model"],
+      "contextWindow": 32768,
+      "readiness": {
+        "path": "/health",
+        "expectedStatus": 200,
+        "timeoutMs": 600000
+      },
+      "health": {
+        "intervalMs": 30000,
+        "failureThreshold": 3,
+        "successThreshold": 1
+      },
+      "stopCommand": "sudo systemctl stop fixture-vllm.service",
+      "statusCommand": "systemctl is-active --quiet fixture-vllm.service",
+      "healthCommand": null,
+      "interactive": true,
+      "stopInteractive": true,
+      "stepId": "tz4a98xxat96iws9zmbrgj3b",
+      "ownerEpoch": "3f2b8c1e-1d2a-4c3b-9e8f-0a1b2c3d4e5f:7",
+      "actor": "USER",
+      "humanApproved": true,
+      "intentHash": "e4ee672f2e093c24782ec4f25a276e7dfd5a61f58f2a25edba35bce803ba58e7",
+      "operator": {
+        "terminalId": "AAECAwQFBgcICQoLDA0ODw"
+      }
+    },
+    "interactiveStop": {
+      "type": "deployment.job",
+      "attachment": "llm",
+      "engine": "vllm",
+      "management": "externalService",
+      "instanceId": "cm9instancefixture000000a",
+      "revisionId": "cm9revisionfixture000000a",
+      "rank": 0,
+      "action": "stop",
+      "command": "sudo systemctl stop fixture-vllm.service",
+      "stopCommand": "sudo systemctl stop fixture-vllm.service",
+      "statusCommand": "systemctl is-active --quiet fixture-vllm.service",
+      "healthCommand": null,
+      "timeoutMs": 300000,
+      "unitName": "wsmp-i-cm9instancefixture000000a-r0",
+      "port": 30001,
+      "endpointSlug": "inst-fixture-a1b2c3d4e5f6",
+      "models": ["fixture/model"],
+      "contextWindow": 32768,
+      "readiness": {
+        "path": "/health",
+        "expectedStatus": 200,
+        "timeoutMs": 600000
+      },
+      "health": {
+        "intervalMs": 30000,
+        "failureThreshold": 3,
+        "successThreshold": 1
+      },
+      "interactive": true,
+      "stepId": "tz4a98xxat96iws9zmbrgj3c",
+      "ownerEpoch": "3f2b8c1e-1d2a-4c3b-9e8f-0a1b2c3d4e5f:7",
+      "actor": "USER",
+      "humanApproved": true,
+      "intentHash": "fe0007aec3edbc41987c9e225a9e150f5d187ca64a998e56855580a38ae56e5d",
+      "operator": {
+        "terminalId": "AAECAwQFBgcICQoLDA0ODw"
+      }
+    },
+    "stopInteractiveStart": {
+      "type": "deployment.job",
+      "attachment": "llm",
+      "engine": "vllm",
+      "management": "ownedProcess",
+      "revisionId": "cm9revisionfixture000000a",
+      "instanceId": "cm9instancefixture000000a",
+      "rank": 0,
+      "action": "start",
+      "command": "vllm serve fixture/model --port 30001",
+      "timeoutMs": 600000,
+      "unitName": "wsmp-i-cm9instancefixture000000a-r0",
+      "port": 30001,
+      "endpointSlug": "inst-fixture-a1b2c3d4e5f6",
+      "models": ["fixture/model"],
+      "contextWindow": 32768,
+      "readiness": {
+        "path": "/health",
+        "expectedStatus": 200,
+        "timeoutMs": 600000
+      },
+      "health": {
+        "intervalMs": 30000,
+        "failureThreshold": 3,
+        "successThreshold": 1
+      },
+      "stopCommand": "sudo /usr/local/bin/fixture-stop",
+      "statusCommand": "pgrep -f fixture/model",
+      "healthCommand": null,
+      "stopInteractive": true,
+      "stepId": "tz4a98xxat96iws9zmbrgj3d",
+      "ownerEpoch": "3f2b8c1e-1d2a-4c3b-9e8f-0a1b2c3d4e5f:7",
+      "actor": "USER",
+      "humanApproved": true,
+      "intentHash": "a1349bda084f4c1fc1478b590d48049d75d2660409d73137a40a04deb2b79924"
+    }
+  },
+  "results": {
+    "interactiveRefused": {
+      "type": "deployment.job.result",
+      "stepId": "tz4a98xxat96iws9zmbrgj3b",
+      "instanceId": "cm9instancefixture000000a",
+      "rank": 0,
+      "intentHash": "e4ee672f2e093c24782ec4f25a276e7dfd5a61f58f2a25edba35bce803ba58e7",
+      "ownerEpoch": "3f2b8c1e-1d2a-4c3b-9e8f-0a1b2c3d4e5f:7",
+      "stopped": false,
+      "status": "failed",
+      "error": "interactive_unsupported"
+    },
+    "stopInteractiveRefused": {
+      "type": "deployment.job.result",
+      "stepId": "tz4a98xxat96iws9zmbrgj3d",
+      "instanceId": "cm9instancefixture000000a",
+      "rank": 0,
+      "intentHash": "a1349bda084f4c1fc1478b590d48049d75d2660409d73137a40a04deb2b79924",
+      "ownerEpoch": "3f2b8c1e-1d2a-4c3b-9e8f-0a1b2c3d4e5f:7",
+      "stopped": false,
+      "status": "failed",
+      "error": "interactive_unsupported"
+    },
+    "awaitingOperator": {
+      "type": "deployment.job.result",
+      "stepId": "tz4a98xxat96iws9zmbrgj3b",
+      "instanceId": "cm9instancefixture000000a",
+      "rank": 0,
+      "intentHash": "e4ee672f2e093c24782ec4f25a276e7dfd5a61f58f2a25edba35bce803ba58e7",
+      "ownerEpoch": "3f2b8c1e-1d2a-4c3b-9e8f-0a1b2c3d4e5f:7",
+      "stopped": false,
+      "status": "awaiting_operator",
+      "terminalId": "AAECAwQFBgcICQoLDA0ODw"
+    },
+    "operatorRunning": {
+      "type": "deployment.job.result",
+      "stepId": "tz4a98xxat96iws9zmbrgj3b",
+      "instanceId": "cm9instancefixture000000a",
+      "rank": 0,
+      "intentHash": "e4ee672f2e093c24782ec4f25a276e7dfd5a61f58f2a25edba35bce803ba58e7",
+      "ownerEpoch": "3f2b8c1e-1d2a-4c3b-9e8f-0a1b2c3d4e5f:7",
+      "stopped": false,
+      "status": "operator_running",
+      "terminalId": "AAECAwQFBgcICQoLDA0ODw"
+    },
+    "operatorClosed": {
+      "type": "deployment.job.result",
+      "stepId": "tz4a98xxat96iws9zmbrgj3b",
+      "instanceId": "cm9instancefixture000000a",
+      "rank": 0,
+      "intentHash": "e4ee672f2e093c24782ec4f25a276e7dfd5a61f58f2a25edba35bce803ba58e7",
+      "ownerEpoch": "3f2b8c1e-1d2a-4c3b-9e8f-0a1b2c3d4e5f:7",
+      "stopped": false,
+      "status": "operator_closed",
+      "terminalId": "AAECAwQFBgcICQoLDA0ODw",
+      "exitCode": 1
+    },
+    "operatorDeclined": {
+      "type": "deployment.job.result",
+      "stepId": "tz4a98xxat96iws9zmbrgj3b",
+      "instanceId": "cm9instancefixture000000a",
+      "rank": 0,
+      "intentHash": "e4ee672f2e093c24782ec4f25a276e7dfd5a61f58f2a25edba35bce803ba58e7",
+      "ownerEpoch": "3f2b8c1e-1d2a-4c3b-9e8f-0a1b2c3d4e5f:7",
+      "stopped": false,
+      "status": "operator_closed",
+      "terminalId": "AAECAwQFBgcICQoLDA0ODw"
+    }
+  }
+}

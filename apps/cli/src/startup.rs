@@ -174,6 +174,12 @@ mod tests {
                 .features
                 .deployments
         );
+        // Interactive jobs are refused by this build, so it never claims them.
+        assert!(
+            !hello_capabilities(&startup, &config, "desk-01")
+                .features
+                .deployment_operator
+        );
         assert!(capabilities.features.human_terminal);
         assert!(
             capabilities.features.remote_metric_sources,

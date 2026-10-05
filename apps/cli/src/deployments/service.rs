@@ -304,6 +304,8 @@ mod publication_tests {
                 status: "succeeded".into(),
                 stopped: false,
                 error: None,
+                terminal_id: None,
+                exit_code: None,
             });
             publish_update(&tx, &AtomicBool::new(false), last)
         });

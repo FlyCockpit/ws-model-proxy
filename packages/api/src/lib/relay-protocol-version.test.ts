@@ -35,6 +35,7 @@ describe("refusedRelayProtocolReason", () => {
 
   it("calls anything at or below it, or unreadable, too old", () => {
     expect(refusedRelayProtocolReason(RELAY_MIN_PROTOCOL_VERSION)).toBe("cli_too_old");
+    expect(refusedRelayProtocolReason("2.10")).toBe("cli_too_old");
     expect(refusedRelayProtocolReason("2.9")).toBe("cli_too_old");
     expect(refusedRelayProtocolReason("2.4")).toBe("cli_too_old");
     expect(refusedRelayProtocolReason("2.3")).toBe("cli_too_old");

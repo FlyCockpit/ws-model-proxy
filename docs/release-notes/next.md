@@ -30,7 +30,7 @@ instances are dropped an hour after their stop, or sooner (oldest first) when
 the 256-instance cap needs room, and stops always have 2 MiB of state reserved,
 so state growth can no longer block a stop.
 
-Upgrade every CLI to relay protocol 2.10. Deployment inventory is a complete snapshot
+Upgrade every CLI to relay protocol 2.11. Deployment inventory is a complete snapshot
 framed by `snapshotId`, sequential `chunkIndex` and `final`; chunks carry at most 512
 records and the CLI also bounds encoded frame bytes. The server acknowledges only
 after durable current-session commit; the CLI then waits for endpoint-inventory
