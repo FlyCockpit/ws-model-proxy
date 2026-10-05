@@ -16,6 +16,7 @@ import {
   lockDeploymentOwner,
 } from "../lib/deployment-service";
 import {
+  DEPLOYMENT_CONFIG_SLUG_PATTERN,
   deploymentIdSchema,
   deploymentSpecSchema,
   deploymentTextSchema,
@@ -135,7 +136,7 @@ export const deploymentsRouter = {
     .input(
       z
         .object({
-          slug: z.string().regex(/^[a-z][a-z0-9-]{0,40}$/),
+          slug: z.string().regex(DEPLOYMENT_CONFIG_SLUG_PATTERN),
           name: recipeName,
           poolId: deploymentIdSchema,
           spec: deploymentSpecSchema,

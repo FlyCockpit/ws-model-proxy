@@ -147,6 +147,8 @@ describe("current deployment job / result golden shared with the Rust decoder", 
       { ...plainStart, operator },
       { ...interactiveStart, operator: { terminalId: "too-short" } },
       { ...interactiveStart, operator: { terminalId: "A".repeat(23) } },
+      // Decodes to 16 bytes in Node, but the CLI's strict base64 refuses the trailing bits.
+      { ...interactiveStart, operator: { terminalId: "AAECAwQFBgcICQoLDA0ODx" } },
       { ...interactiveStart, operator: { ...operator, viewerId: "x" } as { terminalId: string } },
     ])
       expect(() => encodeRelayServerControlMessage(job)).toThrow(/operator/);
@@ -167,6 +169,7 @@ describe("current deployment job / result golden shared with the Rust decoder", 
       { ...operatorClosed, exitCode: -1 },
       { ...awaitingOperator, stopped: true },
       { ...awaitingOperator, terminalId: "bad" },
+      { ...awaitingOperator, terminalId: "AAECAwQFBgcICQoLDA0ODx" },
       { ...awaitingOperator, status: "operator_paused" },
     ])
       expect(() => parseRelayClientControlFrame(JSON.stringify(result))).toThrow();

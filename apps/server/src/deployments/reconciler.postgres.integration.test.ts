@@ -253,4 +253,66 @@ integration("deployment result fencing at PostgreSQL", () => {
     expect(await reconciler.acceptResult(socket, { ...base, stopped: true })).toBe(false);
     await reconciler.stop();
   });
+  it("operator progress never settles, fails or mutates a running step", async () => {
+    const s = await seed(true);
+    const socket: DeploymentLiveSocket = {
+      userId: s.user.id,
+      cliDeviceId: s.device.id,
+      generation: 1,
+      inventoryComplete: true,
+    };
+    const jobs: DeploymentJob[] = [];
+    const reconciler = new DeploymentReconciler(
+      {
+        current: () => socket,
+        send: (_socket, job) => {
+          jobs.push(job);
+          return true;
+        },
+      },
+      production,
+    );
+    await reconciler.acceptInventory(socket, []);
+    await reconciler.runOnce();
+    const job = jobs[0];
+    if (!job) throw new Error("dispatch missing");
+    const before = await fixture.deploymentStep.findUniqueOrThrow({ where: { id: s.step.id } });
+    const instanceBefore = await fixture.deploymentInstance.findUniqueOrThrow({
+      where: { id: s.instance.id },
+    });
+    expect(before.state).toBe("RUNNING");
+    const base = {
+      type: "deployment.job.result" as const,
+      stepId: job.stepId,
+      instanceId: job.instanceId,
+      rank: job.rank,
+      intentHash: job.intentHash,
+      ownerEpoch: job.ownerEpoch,
+      stopped: false,
+      terminalId: "AAECAwQFBgcICQoLDA0ODw",
+    };
+    for (const result of [
+      { ...base, status: "awaiting_operator" as const },
+      { ...base, status: "operator_running" as const },
+      { ...base, status: "operator_closed" as const, exitCode: 1 },
+      { ...base, status: "operator_closed" as const },
+    ])
+      expect(await reconciler.acceptResult(socket, result)).toBe(false);
+    expect(await fixture.deploymentStep.findUniqueOrThrow({ where: { id: s.step.id } })).toEqual(
+      before,
+    );
+    expect(
+      await fixture.deploymentInstance.findUniqueOrThrow({ where: { id: s.instance.id } }),
+    ).toEqual(instanceBefore);
+    expect(
+      (await fixture.deploymentInstanceNode.findUniqueOrThrow({ where: { id: s.node.id } }))
+        .claimHeld,
+    ).toBe(true);
+    // The real final result still settles the step.
+    const { terminalId: _terminalId, ...final } = base;
+    expect(
+      await reconciler.acceptResult(socket, { ...final, status: "succeeded", stopped: true }),
+    ).toBe(true);
+    await reconciler.stop();
+  });
 });

@@ -1,6 +1,10 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { deploymentSpecSchema, isHiddenCodePoint } from "@ws-model-proxy/api/lib/deployment-spec";
+import {
+  DEPLOYMENT_CONFIG_SLUG_PATTERN,
+  deploymentSpecSchema,
+  isHiddenCodePoint,
+} from "@ws-model-proxy/api/lib/deployment-spec";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import {
   AlertDialog,
@@ -307,7 +311,7 @@ function RecipeEditor({
   const baseId = useId();
   const schema = z.object({
     name: z.string().min(1).max(128),
-    slug: config ? z.string() : z.string().regex(/^[a-z][a-z0-9-]{0,40}$/),
+    slug: config ? z.string() : z.string().regex(DEPLOYMENT_CONFIG_SLUG_PATTERN),
     poolId: z.string().min(1),
     spec: recipeJsonSchema,
   });

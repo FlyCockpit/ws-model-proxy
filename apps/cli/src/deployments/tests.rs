@@ -1523,6 +1523,30 @@ fn current_job_wire_matches_shared_golden() {
 }
 
 #[test]
+fn wire_edge_cases_agree_with_the_server_mirror() {
+    // The server's `deploymentJobWireIssue` accepts and rejects exactly these
+    // (`packages/api/src/lib/deployment-job-golden.test.ts`).
+    let golden = job_golden();
+    let accepted = golden["wireCases"]["accepted"]
+        .as_object()
+        .expect("accepted");
+    let rejected = golden["wireCases"]["rejected"]
+        .as_object()
+        .expect("rejected");
+    assert!(!accepted.is_empty() && !rejected.is_empty());
+    for (name, value) in accepted {
+        let job: Job = serde_json::from_value(value.clone()).expect(name);
+        job.validate()
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+    for (name, value) in rejected {
+        let refused = serde_json::from_value::<Job>(value.clone())
+            .map_or(true, |job| job.validate().is_err());
+        assert!(refused, "{name} must be refused");
+    }
+}
+
+#[test]
 fn server_shaped_plain_job_runs_unchanged() {
     // The exact frame the server dispatches: an `<uuid>:<generation>` owner
     // epoch and the recipe's `readiness.timeoutMs`.

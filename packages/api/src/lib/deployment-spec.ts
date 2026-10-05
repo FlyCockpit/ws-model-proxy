@@ -70,6 +70,11 @@ const command = deploymentTextSchema(DEPLOYMENT_COMMAND_MAX_BYTES)
         ctx.addIssue({ code: "custom", message: `Unknown placeholder {{${key}}}.` });
     }
   });
+/**
+ * A recipe slug. Instances serve it as `inst-<slug>-<id>`, which the CLI checks as a forwarder
+ * slug, so a slug never ends with or repeats a hyphen.
+ */
+export const DEPLOYMENT_CONFIG_SLUG_PATTERN = /^[a-z](?:[a-z0-9]|-(?=[a-z0-9])){0,40}$/;
 /** A row id named by a caller (cuid, uuid): never free text that reaches SQL as-is. */
 export const deploymentIdSchema = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/);
 /** A served model id exactly as the relay normalizes it: trimmed, single-line. */
@@ -77,14 +82,24 @@ const modelId = deploymentTextSchema(256)
   .refine((value) => value.length > 0 && value.trim() === value, {
     message: "Model ids must not be blank or have leading or trailing spaces.",
   })
-  .refine((value) => !/[\n\t]/.test(value), "Model ids must be a single line.");
+  .refine((value) => !/[\n\t]/.test(value), "Model ids must be a single line.")
+  .refine((value) => deploymentCommandBytes(value) <= 256, "Model ids must be at most 256 bytes.");
 /** An embedding contract as saved in a recipe: its text follows the recipe rules. */
 const savedEmbeddingContract = embeddingContractSchema.superRefine((contract, ctx) => {
   for (const key of ["model", "revision", "vectorSpace"] as const) {
-    const issue = deploymentTextIssue(contract[key]);
+    const issue =
+      deploymentTextIssue(contract[key]) ??
+      (deploymentCommandBytes(contract[key]) > 256 ? "Text must be at most 256 bytes." : null);
     if (issue) ctx.addIssue({ code: "custom", path: [key], message: issue });
   }
 });
+/** The CLI's readiness path rules: one leading slash, no fragment, at most 2048 bytes. */
+const readinessPath = deploymentTextSchema(2048)
+  .regex(/^\/(?!\/)[^\r\n#]*$/, "The readiness path must start with a single / and contain no #.")
+  .refine(
+    (value) => deploymentCommandBytes(value) <= 2048,
+    "The readiness path must be at most 2048 bytes.",
+  );
 // Historical *Gb API names measure GiB (2^30 bytes), matching node budgets.
 const gb = z.number().finite().positive().max(1_000_000).describe("Memory in GiB (2^30 bytes).");
 export const deploymentResourcesSchema = z.discriminatedUnion("kind", [
@@ -210,9 +225,13 @@ function variantSchema(strict: boolean) {
         .max(64),
       readiness: z
         .object({
-          path: (strict ? deploymentTextSchema(2048) : z.string().max(2048))
-            .regex(/^\/[^\r\n]*$/)
-            .default("/health"),
+          path: (strict
+            ? readinessPath
+            : z
+                .string()
+                .max(2048)
+                .regex(/^\/[^\r\n]*$/)
+          ).default("/health"),
           expectedStatus: z.number().int().min(200).max(399).default(200),
           timeoutMs: z.number().int().min(1000).max(900_000).default(900_000),
         })

@@ -11,6 +11,7 @@ import {
 } from "@ws-model-proxy/api/lib/relay-protocol-version";
 import { adapterRouteIsValid } from "@ws-model-proxy/api/lib/remote-engine-adapters";
 import { normalizeReportedHostname } from "@ws-model-proxy/config/cli-device-name";
+import { isCanonicalBase64Url16 } from "@ws-model-proxy/config/deployment-job-wire";
 import {
   DEPLOYMENT_OPERATOR_RESULT_STATUSES,
   type DeploymentJob,
@@ -111,13 +112,10 @@ const orderedHeadersSchema = z.array(z.tuple([headerNameSchema, headerValueSchem
 
 export { type OpenAiCompatibleCapabilities, openAiCompatibleCapabilitiesSchema };
 
-/** 16 raw bytes, unpadded base64url (22 characters). */
+/** 16 raw bytes, canonical unpadded base64url (22 characters, zero trailing bits). */
 export const base64Url16ByteSchema = z
   .string()
-  .regex(/^[A-Za-z0-9_-]{22}$/)
-  .refine((value) => Buffer.from(value, "base64url").length === 16, {
-    message: "Expected 16 bytes of base64url.",
-  });
+  .refine(isCanonicalBase64Url16, { message: "Expected 16 bytes of canonical base64url." });
 
 /** Uncompressed P-256 point: 65 bytes, leading 0x04, unpadded base64url (87 characters). */
 export const uncompressedP256PublicKeySchema = z
@@ -1401,7 +1399,7 @@ export function encodeRelayServerControlMessage(message: RelayServerControlMessa
     (message.interactive === true) !==
       (message.operator !== undefined &&
         Object.keys(message.operator).length === 1 &&
-        base64Url16ByteSchema.safeParse(message.operator.terminalId).success)
+        isCanonicalBase64Url16(message.operator.terminalId))
   ) {
     throw new RelayProtocolError(
       "deployment.job operator must accompany exactly interactive jobs.",

@@ -1,6 +1,7 @@
 import { DEPLOYMENT_COMMAND_MAX_BYTES } from "@ws-model-proxy/config/deployment-protocol";
 import { describe, expect, it } from "vitest";
 import {
+  DEPLOYMENT_CONFIG_SLUG_PATTERN,
   deploymentVariantSchema,
   storedDeploymentVariantSchema,
   variantHasInteractiveCommands,
@@ -113,6 +114,32 @@ describe("deployment recipe text", () => {
     expect(embedding({ model: "embed\u0000" })).toBe(false);
     expect(embedding({ revision: "\ud800" })).toBe(false);
     expect(embedding({ vectorSpace: "space\u202e" })).toBe(false);
+    // The CLI counts UTF-8 bytes: 128 two-byte characters fit, one more byte does not.
+    for (const key of ["model", "revision", "vectorSpace"]) {
+      expect(embedding({ [key]: "é".repeat(128) }), key).toBe(true);
+      expect(embedding({ [key]: `${"é".repeat(128)}a` }), key).toBe(false);
+    }
+  });
+
+  it("matches the CLI's model id and readiness path limits in UTF-8 bytes", () => {
+    expect(accepts({ models: ["é".repeat(128)] })).toBe(true);
+    expect(accepts({ models: [`${"é".repeat(128)}a`] })).toBe(false);
+    expect(accepts({ readiness: { path: `/${"é".repeat(1023)}a` } })).toBe(true);
+    expect(accepts({ readiness: { path: `/${"é".repeat(1024)}` } })).toBe(false);
+    expect(accepts({ readiness: { path: "/health?ready=1" } })).toBe(true);
+    expect(accepts({ readiness: { path: "/" } })).toBe(true);
+    for (const path of ["/health#ready", "//health", "//", "health"])
+      expect(accepts({ readiness: { path } }), path).toBe(false);
+    // The stored schema keeps reading older revisions; starting them is refused.
+    for (const readiness of [{ path: "/health#ready" }, { path: "//health" }])
+      expect(storedDeploymentVariantSchema.safeParse({ ...base, readiness }).success).toBe(true);
+  });
+
+  it("allows recipe slugs that render a valid instance endpoint slug only", () => {
+    for (const slug of ["q", "qwen", "qwen-3", "a1-b2-c3", "a".repeat(41)])
+      expect(DEPLOYMENT_CONFIG_SLUG_PATTERN.test(slug), slug).toBe(true);
+    for (const slug of ["qwen-", "qw--en", "-qwen", "1qwen", "Qwen", "a".repeat(42), ""])
+      expect(DEPLOYMENT_CONFIG_SLUG_PATTERN.test(slug), slug).toBe(false);
   });
 
   it("takes only id-shaped pool ids and a readiness path without controls", () => {

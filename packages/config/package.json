@@ -7,6 +7,9 @@
     "./deployment-protocol": {
       "default": "./src/deployment-protocol.ts"
     },
+    "./deployment-job-wire": {
+      "default": "./src/deployment-job-wire.ts"
+    },
     "./tsconfig.base.json": "./tsconfig.base.json",
     "./biome.json": "./biome.json",
     "./postcss.config.mjs": "./postcss.config.mjs",

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { ORPCError } from "@orpc/server";
+import { deploymentJobWireIssue } from "@ws-model-proxy/config/deployment-job-wire";
 import {
   DEPLOYMENT_JOB_FRAME_MAX_BYTES,
   DEPLOYMENT_PROTOCOL_VERSION,
@@ -477,6 +478,13 @@ function jobIntent(
  */
 function assertDeploymentJobsDeliverable(intent: unknown) {
   for (const job of deploymentDerivedIntents(intent)) {
+    // The CLI refuses a job breaking its own rules as `bad_job`, and a refused stop would hold
+    // the instance's claims, so nothing it would refuse is ever admitted.
+    const issue = deploymentJobWireIssue(deploymentDispatchShape(job));
+    if (issue)
+      throw new ORPCError("BAD_REQUEST", {
+        message: `Rendered ${job.action} job for rank ${job.rank} would be refused by the node (${issue}). Fix the recipe.`,
+      });
     const bytes = deploymentJobFrameBytes(job);
     if (bytes === null)
       throw new ORPCError("BAD_REQUEST", {
@@ -488,13 +496,38 @@ function assertDeploymentJobsDeliverable(intent: unknown) {
       });
   }
 }
+/**
+ * A durable intent framed as the reconciler dispatches it, with well-formed stand-ins for the
+ * per-dispatch fields (their real values always pass the CLI's identity rules).
+ */
+export function deploymentDispatchShape(
+  intent: Omit<
+    DeploymentJob,
+    "stepId" | "intentHash" | "ownerEpoch" | "actor" | "humanApproved" | "operator"
+  >,
+  dispatch: Partial<
+    Pick<DeploymentJob, "stepId" | "ownerEpoch" | "actor" | "humanApproved" | "operator">
+  > = {},
+): DeploymentJob {
+  return {
+    ...intent,
+    stepId: dispatch.stepId ?? "s".repeat(24),
+    intentHash: deploymentFingerprint(intent),
+    ownerEpoch: dispatch.ownerEpoch ?? `${"0".repeat(8)}-0000-4000-8000-${"0".repeat(12)}:1`,
+    actor: dispatch.actor ?? "USER",
+    humanApproved: dispatch.humanApproved ?? true,
+    ...(intent.interactive
+      ? { operator: dispatch.operator ?? { terminalId: "A".repeat(22) } }
+      : {}),
+  };
+}
 type DeploymentPlacement = DeploymentPlanContents["placements"][number];
 /**
  * Every durable step of one group exactly as admission persists it, each checked deliverable.
  * Plan creation renders with placeholder identities of the same lengths, so an undeliverable
  * recipe is refused before it is sent for confirmation.
  */
-function renderDeploymentGroup(
+export function renderDeploymentGroup(
   variant: DeploymentVariant,
   instance: { id: string; revisionId: string; endpointSlug: string },
   placements: DeploymentPlacement[],

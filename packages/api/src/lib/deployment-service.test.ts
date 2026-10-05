@@ -18,7 +18,11 @@ import {
   createDeploymentPlan,
   deploymentExecutionAllowed,
 } from "./deployment-service";
-import { deploymentSpecSchema, variantHasInteractiveCommands } from "./deployment-spec";
+import {
+  deploymentSpecSchema,
+  storedDeploymentSpecSchema,
+  variantHasInteractiveCommands,
+} from "./deployment-spec";
 
 const db = vi.mocked(prisma);
 const person = { userId: "owner", id: "owner", kind: "USER" as const };
@@ -295,6 +299,53 @@ describe("deployment durable API boundary", () => {
     expect(db.deploymentInstanceNode.create).not.toHaveBeenCalled();
     expect(db.deploymentStep.create).not.toHaveBeenCalled();
     expect(db.deploymentPlan.update).not.toHaveBeenCalled();
+  });
+  it("refuses to plan a stored recipe whose slug renders an endpoint the node refuses", async () => {
+    // Saved before the slug rule: `inst-qwen--…` fails the CLI's forwarder-slug check.
+    for (const slug of ["qwen-", "qw--en"]) {
+      resolveMock(db.deploymentConfigRevision.findFirst, {
+        id: "revision",
+        configId: "config",
+        revision: 2,
+        editorKind: "USER",
+        spec,
+        Config: { slug, poolId: "pool" },
+      });
+      await expect(
+        createDeploymentPlan(person, {
+          start: { revisionId: "revision", variantKey: "one", groupCount: 1 },
+        }),
+      ).rejects.toMatchObject({
+        code: "BAD_REQUEST",
+        message: expect.stringContaining("endpoint slug"),
+      });
+    }
+    expect(db.deploymentPlan.create).not.toHaveBeenCalled();
+  });
+  it.each([
+    ["a readiness fragment", { readiness: { path: "/health#ready" } }],
+    ["a protocol-relative readiness path", { readiness: { path: "//health" } }],
+    ["a readiness path over 2048 bytes", { readiness: { path: `/${"é".repeat(1024)}` } }],
+    ["a model id over 256 bytes", { models: [`${"é".repeat(128)}a`] }],
+  ])("refuses to start a stored revision with %s, which still loads", async (_case, change) => {
+    const stored = { variants: [{ ...spec.variants[0], ...change }] };
+    // Readable for existing instances and authorship checks, never startable.
+    expect(storedDeploymentSpecSchema.safeParse(stored).success).toBe(true);
+    expect(deploymentSpecSchema.safeParse(stored).success).toBe(false);
+    resolveMock(db.deploymentConfigRevision.findFirst, {
+      id: "revision",
+      configId: "config",
+      revision: 2,
+      editorKind: "USER",
+      spec: stored,
+      Config: { slug: "recipe", poolId: "pool" },
+    });
+    await expect(
+      createDeploymentPlan(person, {
+        start: { revisionId: "revision", variantKey: "one", groupCount: 1 },
+      }),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(db.deploymentPlan.create).not.toHaveBeenCalled();
   });
   it("stale fingerprint refuses claims and jobs", async () => {
     resolveMock(db.deploymentPlan.findFirst, {
