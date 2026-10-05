@@ -146,6 +146,8 @@ export function inventoryDigestFor(endpoints: EndpointInventory[]): string {
 
 export type ReportedRelayFeatures = {
   reportedDeployments?: boolean;
+  /** The CLI can run interactive deployment jobs (`deploymentOperator`). */
+  reportedDeploymentOperator?: boolean;
   cliVersion: string | null;
   relayProtocolVersion: string;
   reportedHumanTerminal: boolean | null;
@@ -221,6 +223,7 @@ export async function persistRelayRegistration({
           reportedTerminalSupported: reported.reportedTerminalSupported,
           reportedAllowFileToolsAsRoot: reported.reportedAllowFileToolsAsRoot,
           reportedDeployments: reported.reportedDeployments ?? false,
+          reportedDeploymentOperator: reported.reportedDeploymentOperator ?? false,
           reportedHostname: reported.reportedHostname,
           featuresReportedAt: reported.featuresReportedAt,
           // An accepted hello ends any "CLI upgrade required" state.

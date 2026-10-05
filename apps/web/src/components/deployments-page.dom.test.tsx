@@ -360,7 +360,7 @@ describe("managed inference dashboard", () => {
     expect(state.calls.some((call) => call.name === "confirm")).toBe(false);
   });
 
-  it("explains why a recipe with interactive commands cannot be started yet", async () => {
+  it("explains that an interactive recipe needs nodes that can open operator terminals", async () => {
     const recipe = {
       id: "recipe",
       name: "Small",
@@ -369,14 +369,11 @@ describe("managed inference dashboard", () => {
       Revisions: [{ id: "revision", revision: 1, spec: { variants: [variant] } }],
     };
     state.data.configs = { items: [recipe], nextCursor: null };
-    state.errors.start = Object.assign(
-      new Error("Interactive recipe commands are not supported yet"),
-      {
-        code: "BAD_REQUEST",
-        status: 400,
-        data: { reason: "interactive_commands_unsupported" },
-      },
-    );
+    state.errors.start = Object.assign(new Error("These nodes cannot open operator terminals"), {
+      code: "PRECONDITION_FAILED",
+      status: 412,
+      data: { reason: "deployment_operator_unavailable", nodeIds: ["node"] },
+    });
     const user = userEvent.setup();
     show();
     const form = (await screen.findByRole("heading", { name: "deployments.planStart" }))
@@ -387,7 +384,7 @@ describe("managed inference dashboard", () => {
     );
     await user.type(within(form).getByLabelText("deployments.variantKey"), "small");
     await user.click(within(form).getByRole("button", { name: "deployments.preview" }));
-    expect(await within(form).findByText("deployments.interactiveUnsupported")).toBeTruthy();
+    expect(await within(form).findByText("deployments.operatorUnavailable")).toBeTruthy();
     expect(state.calls).toContainEqual({
       name: "start",
       input: { revisionId: "revision", variantKey: "small", groupCount: 1 },

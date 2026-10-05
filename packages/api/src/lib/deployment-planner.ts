@@ -51,6 +51,11 @@ export type DeploymentNode = {
   protocolVersion: string | null;
   allowDeployments: boolean;
   reportedDeployments: boolean | null;
+  /**
+   * The node can run interactive recipe commands (its hello reported `deploymentOperator` and
+   * terminal support on the deployment protocol). Absent means no.
+   */
+  operator?: boolean;
   mode: "OFF" | "SUPERVISED" | "UNSUPERVISED";
   localMode: "OFF" | "SUPERVISED" | "UNSUPERVISED" | null;
   execution: string;

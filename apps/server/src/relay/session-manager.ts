@@ -716,6 +716,7 @@ function reportedFeaturesFromHello(message: HelloMessage, now: Date): ReportedRe
     reportedTerminalSupported: features.terminalSupported,
     reportedAllowFileToolsAsRoot: features.allowFileToolsAsRoot,
     reportedDeployments: features.deployments ?? false,
+    reportedDeploymentOperator: features.deploymentOperator ?? false,
     reportedHostname: message.cli.hostname ?? null,
     featuresReportedAt: now,
   };

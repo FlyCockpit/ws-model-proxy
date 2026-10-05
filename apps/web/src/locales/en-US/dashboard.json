@@ -111,7 +111,12 @@
     "stopBeforeChange": "Stop this recipe's deployments before renaming it or moving it to another pool.",
     "slugTaken": "Another recipe already uses this slug.",
     "invalidRecipeSlug": "This recipe's slug is not valid on nodes (it ends with or repeats a hyphen). Rename the recipe while none of its deployments are running, then start it again.",
-    "interactiveUnsupported": "This recipe has commands marked interactive. Starting such a recipe is not supported yet; it will be in a later release. To start it now, remove \"interactive\" from those commands in the recipe."
+    "operatorUnavailable": "This recipe has commands a person runs in a terminal on the node, and at least one chosen node cannot open such terminals. On that node run `wsmp config set-deployment-operator-terminal on` (deployments must be on and the node must support terminals), reconnect it, then plan again.",
+    "stopPending": "WS Model Proxy is still checking that this deployment's earlier service stopped. Restart it once that check has finished; if the check waits for you, answer it first.",
+    "resourcesUnconfirmed": "Resources on this node stay held until WS Model Proxy confirms that an earlier deployment there stopped. Keep deployments allowed and the node connected, with its operator-terminal switch on, so the check can run, or remove the device.",
+    "operatorRequired": "Applying this plan opens terminals where you run commands yourself:",
+    "operatorNodeNotReady": "This node cannot open operator terminals right now; the stop waits there until it can.",
+    "interactiveFlagUnused": "The \"interactive\" mark on {{command}} (variant {{variant}}) has no effect: that command does not run there."
   },
   "appSettingsLoadFailed": "Failed to load app settings.",
   "actions": {

@@ -480,6 +480,14 @@ function fileToolSpec(name: FileToolName): McpToolSpec {
   };
 }
 
+/**
+ * Deployment tools. Interactive recipe commands (a person runs them in an operator terminal,
+ * e.g. sudo) wait for the owner: agents may write and plan them, but never answer, reopen or
+ * restart them (dashboard-only).
+ */
+const DEPLOYMENT_TOOL_NOTE =
+  "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only. Commands marked interactive wait for the owner to run them in an operator terminal on the node; agents cannot answer, reopen or restart them, and instances report needsOperator/operatorSteps while they wait. Planning refuses interactive recipes on nodes without the operator-terminal capability (reason deployment_operator_unavailable).";
+
 const READ_TOOLS: readonly McpToolSpec[] = [
   {
     name: "deployment_configs_list",
@@ -488,8 +496,7 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.deployments.listConfigs),
-    descriptionNote:
-      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+    descriptionNote: DEPLOYMENT_TOOL_NOTE,
   },
   {
     name: "deployment_config_get",
@@ -498,8 +505,7 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.deployments.getConfig),
-    descriptionNote:
-      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+    descriptionNote: DEPLOYMENT_TOOL_NOTE,
   },
   {
     name: "deployment_instances_list",
@@ -508,8 +514,7 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.deployments.listInstances),
-    descriptionNote:
-      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+    descriptionNote: DEPLOYMENT_TOOL_NOTE,
   },
   {
     name: "deployment_instance_get",
@@ -518,8 +523,7 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.deployments.getInstance),
-    descriptionNote:
-      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+    descriptionNote: DEPLOYMENT_TOOL_NOTE,
   },
   {
     name: "deployment_plan_status",
@@ -528,8 +532,7 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.deployments.planStatus),
-    descriptionNote:
-      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+    descriptionNote: DEPLOYMENT_TOOL_NOTE,
   },
   {
     name: "inference_contributions_list",
@@ -881,8 +884,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.deployments.createConfig),
-    descriptionNote:
-      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+    descriptionNote: DEPLOYMENT_TOOL_NOTE,
   },
   {
     name: "deployment_config_update",
@@ -891,8 +893,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.deployments.updateConfig),
-    descriptionNote:
-      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+    descriptionNote: DEPLOYMENT_TOOL_NOTE,
   },
   {
     name: "deployment_plan_start",
@@ -901,8 +902,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.deployments.planStart),
-    descriptionNote:
-      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+    descriptionNote: DEPLOYMENT_TOOL_NOTE,
   },
   {
     name: "deployment_plan_stop",
@@ -911,8 +911,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     confirmation: null,
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.deployments.planStop),
-    descriptionNote:
-      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+    descriptionNote: DEPLOYMENT_TOOL_NOTE,
   },
   {
     name: "deployment_plan_apply",
@@ -921,8 +920,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     confirmation: "RUN",
     classification: "external",
     invokeProcedure: procedureInvoker((client) => client.deployments.applyPlan),
-    descriptionNote:
-      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+    descriptionNote: DEPLOYMENT_TOOL_NOTE,
   },
   {
     name: "inference_contribution_revoke",
@@ -1590,6 +1588,11 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
   ].map((target) => ({
     target,
     reason: "Human-only consent or credential identity management; never an agent tool.",
+  })),
+  ...["deployments.restartInstance", "deployments.reopenOperatorStep"].map((target) => ({
+    target,
+    reason:
+      "Human-only: interactive recipe steps wait for the owner, who restarts or reopens them from the dashboard; never an agent tool.",
   })),
   {
     target: "deployments.deleteConfig",

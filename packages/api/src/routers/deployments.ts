@@ -14,12 +14,15 @@ import {
   liveDeploymentInstanceWhere,
   loadDeploymentState,
   lockDeploymentOwner,
+  reopenDeploymentOperatorStep,
+  restartDeploymentInstance,
 } from "../lib/deployment-service";
 import {
   DEPLOYMENT_CONFIG_SLUG_PATTERN,
   deploymentIdSchema,
   deploymentSpecSchema,
   deploymentTextSchema,
+  unusedInteractiveFlags,
 } from "../lib/deployment-spec";
 
 function requester(context: Context): DeploymentRequester {
@@ -70,6 +73,82 @@ const storedSpecShape = z.object({
 function storedVariant(spec: unknown, key: string) {
   const parsed = storedSpecShape.safeParse(spec);
   return parsed.success ? (parsed.data.variants.find((v) => v.key === key) ?? null) : null;
+}
+/** Interactive flags the saved recipe carries that never take effect (IC1-3), per variant. */
+function interactiveWarnings(spec: z.infer<typeof deploymentSpecSchema>) {
+  return spec.variants.flatMap((variant) => unusedInteractiveFlags(variant));
+}
+/**
+ * Steps that wait for (or are being run by) a person, or are held before their terminal can
+ * open: an interactive step waiting in a terminal or closed, a person's run in progress, a
+ * pending step held with an operator reason, and a pending status check of resources held
+ * since an unconfirmed stop (probe stops, sequence 5000+).
+ */
+const operatorStepWhere = {
+  OR: [
+    { state: "AWAITING_OPERATOR" as const },
+    { state: "RUNNING" as const, operatorSince: { not: null } },
+    { state: "PENDING" as const, errorCode: { startsWith: "operator_" } },
+    // Any pending interactive step: an automatic stop held for a node that lost the
+    // capability keeps its gang-stop reason (node_offline, startup_failed, ...) instead of a
+    // hold code, and must still show as one a person will run (review L1).
+    { state: "PENDING" as const, intent: { path: ["interactive"], equals: true } },
+    {
+      phase: "stop",
+      sequence: { gte: 5000 },
+      state: { in: ["PENDING" as const, "RUNNING" as const] },
+    },
+  ],
+};
+type OperatorStepRow = {
+  id: string;
+  cliDeviceId: string;
+  rank: number;
+  phase: string;
+  sequence: number;
+  state: string;
+  intent: unknown;
+  errorCode: string | null;
+  operatorTerminalId: string | null;
+  operatorSince: Date | null;
+  operatorAcceptedAt: Date | null;
+  operatorLastExit: number | null;
+  deadline: Date | null;
+};
+const intentCommand = z.object({ action: z.string(), command: z.string() });
+/**
+ * A person-facing view of an operator step. The terminal id is never exposed (MCP clients see
+ * these too and can never attach); `terminalOpen` says whether the person answers it in its
+ * terminal (else a closed waiting step is reopened from the dashboard).
+ */
+function operatorStepView(step: OperatorStepRow) {
+  const intent = intentCommand.safeParse(step.intent);
+  return {
+    stepId: step.id,
+    nodeId: step.cliDeviceId,
+    rank: step.rank,
+    action: intent.success ? intent.data.action : step.phase,
+    command: intent.success ? intent.data.command : "",
+    state: step.state,
+    /** A status check of resources held since an earlier stop could not be confirmed. */
+    heldResourceCheck: step.phase === "stop" && step.sequence >= 5000,
+    since: step.operatorSince,
+    acceptedAt: step.operatorAcceptedAt,
+    /** A person's run past its timeout (it may hang on a prompt). */
+    overdue:
+      step.state === "RUNNING" &&
+      step.operatorSince !== null &&
+      step.deadline !== null &&
+      step.deadline.getTime() <= Date.now(),
+    terminalOpen: step.operatorTerminalId !== null,
+    lastExit: step.operatorLastExit,
+    errorCode: step.errorCode,
+  };
+}
+/** A step row without its operator terminal id (see {@link operatorStepView}). */
+function publicStep<T extends { operatorTerminalId: string | null }>(step: T) {
+  const { operatorTerminalId, ...rest } = step;
+  return { ...rest, terminalOpen: operatorTerminalId !== null };
 }
 async function previewPlan(userId: string, raw: unknown) {
   const contents = deploymentPlanContentsSchema.parse(raw);
@@ -157,7 +236,7 @@ export const deploymentsRouter = {
             throw new ORPCError("BAD_REQUEST", {
               message: "All variants must attach to the config target pool",
             });
-          return tx.deploymentConfig.create({
+          const created = await tx.deploymentConfig.create({
             data: {
               userId: actor.userId,
               poolId: pool.id,
@@ -175,6 +254,7 @@ export const deploymentsRouter = {
             },
             include: { Revisions: true },
           });
+          return { ...created, interactiveWarnings: interactiveWarnings(input.spec) };
         },
         { isolationLevel: "ReadCommitted" },
       );
@@ -267,7 +347,7 @@ export const deploymentsRouter = {
                 ...(poolId !== config.poolId ? { poolId } : {}),
               },
             });
-          return tx.deploymentConfigRevision.create({
+          const revision = await tx.deploymentConfigRevision.create({
             data: {
               configId: config.id,
               revision: input.expectedRevision + 1,
@@ -277,6 +357,7 @@ export const deploymentsRouter = {
               contentHash: deploymentFingerprint(input.spec),
             },
           });
+          return { ...revision, interactiveWarnings: interactiveWarnings(input.spec) };
         },
         { isolationLevel: "ReadCommitted" },
       );
@@ -304,20 +385,34 @@ export const deploymentsRouter = {
       { isolationLevel: "ReadCommitted" },
     );
   }),
-  listInstances: protectedProcedure.input(pageInput).handler(async ({ context, input }) =>
-    deploymentPage(
+  listInstances: protectedProcedure.input(pageInput).handler(async ({ context, input }) => {
+    const page = deploymentPage(
       await prisma.deploymentInstance.findMany({
         where: {
           userId: context.session.user.id,
           ...(input.cursor ? { id: { gt: input.cursor } } : {}),
         },
-        include: { Nodes: { take: 64, orderBy: { rank: "asc" } } },
+        include: {
+          Nodes: { take: 64, orderBy: { rank: "asc" } },
+          Steps: {
+            where: operatorStepWhere,
+            orderBy: [{ sequence: "asc" }, { rank: "asc" }],
+            take: 64,
+          },
+        },
         orderBy: { id: "asc" },
         take: input.limit + 1,
       }),
       input.limit,
-    ),
-  ),
+    );
+    return {
+      ...page,
+      items: page.items.map(({ Steps, ...instance }) => ({
+        ...instance,
+        operatorSteps: Steps.map(operatorStepView),
+      })),
+    };
+  }),
   getInstance: protectedProcedure.input(idInput).handler(async ({ context, input }) => {
     const instance = await prisma.deploymentInstance.findFirst({
       where: { id: input.id, userId: context.session.user.id },
@@ -329,7 +424,17 @@ export const deploymentsRouter = {
       },
     });
     if (!instance) throw new ORPCError("NOT_FOUND");
-    return { ...instance, stepsTruncated: instance._count.Steps > instance.Steps.length };
+    const operatorSteps = await prisma.deploymentStep.findMany({
+      where: { instanceId: instance.id, ...operatorStepWhere },
+      orderBy: [{ sequence: "asc" }, { rank: "asc" }],
+      take: 64,
+    });
+    return {
+      ...instance,
+      Steps: instance.Steps.map(publicStep),
+      operatorSteps: operatorSteps.map(operatorStepView),
+      stepsTruncated: instance._count.Steps > instance.Steps.length,
+    };
   }),
   planStart: protectedProcedure
     .input(deploymentStartInputSchema)
@@ -364,6 +469,8 @@ export const deploymentsRouter = {
     if (!plan) throw new ORPCError("NOT_FOUND");
     return {
       ...plan,
+      // Never a terminal id (this is MCP `deployment_plan_status` too).
+      Run: plan.Run ? { ...plan.Run, Steps: plan.Run.Steps.map(publicStep) } : null,
       stepsTruncated: plan.Run ? plan.Run._count.Steps > plan.Run.Steps.length : false,
       preview: await previewPlan(context.session.user.id, plan.contents),
     };
@@ -384,6 +491,28 @@ export const deploymentsRouter = {
       input.limit,
     );
   }),
+  /**
+   * A person restarts an instance that stopped while its start is interactive ("stopped,
+   * needs you"). Human only and excluded from MCP: an agent can never be the person.
+   */
+  restartInstance: humanProcedure
+    .input(z.object({ instanceId: deploymentIdSchema }).strict())
+    .handler(async ({ context, input }) => {
+      human(context);
+      const instance = await restartDeploymentInstance(context.session.user.id, input.instanceId);
+      return { id: instance.id, nextRestartAt: instance.nextRestartAt };
+    }),
+  /**
+   * A person reopens an interactive step whose terminal closed (declined, closed, it never
+   * opened, or its run was not verified): it is dispatched again with a fresh terminal.
+   * Human only and excluded from MCP.
+   */
+  reopenOperatorStep: humanProcedure
+    .input(z.object({ stepId: deploymentIdSchema }).strict())
+    .handler(({ context, input }) => {
+      human(context);
+      return reopenDeploymentOperatorStep(context.session.user.id, input.stepId);
+    }),
   setNodeGrant: humanProcedure
     .input(
       z

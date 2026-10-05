@@ -485,6 +485,15 @@ integration("deployment lifecycle on PostgreSQL and real manager/WebSocket", () 
     return { instance, nodes, starts, run, revision, config, pool, devices, spec };
   }
 
+  it("a hello records whether the node can run interactive recipe commands", async () => {
+    const a = await arrangement();
+    // This hello reports deployments but not `deploymentOperator`.
+    expect(
+      (await fixture.cliDevice.findUniqueOrThrow({ where: { id: a.deviceId } }))
+        .reportedDeploymentOperator,
+    ).toBe(false);
+  });
+
   it("durable snapshot ACK waits for actual PostgreSQL commit, then permits repeated publication", async () => {
     const a = await arrangement();
     const held = deferred();

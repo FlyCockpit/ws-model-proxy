@@ -168,13 +168,66 @@ function interactiveCommandIssues(
       message: "Interactive commands require a status command (exit 0 alive, exit 3 stopped).",
     });
 }
-/** Whether any rank of a variant has a command a person must run. */
-export function variantHasInteractiveCommands(variant: {
-  commands: readonly { interactive?: DeploymentInteractiveCommands }[];
-}) {
-  return variant.commands.some((rank) =>
-    INTERACTIVE_FIELDS.some((field) => rank.interactive?.[field] === true),
-  );
+/**
+ * An interactive flag that never takes effect where the recipe runs it (IC1-3): a recipe saves
+ * it, but no job a person runs comes from it. `rank` is the commands entry (null: one entry
+ * shared by every rank).
+ */
+type UnusedInteractiveFlag = {
+  variant: string;
+  rank: number | null;
+  command: (typeof INTERACTIVE_FIELDS)[number];
+  reason: "single_node" | "not_head" | "after_join_replaces_start" | "no_command";
+};
+/**
+ * Which flags are inert, mirroring `renderDeploymentGroup`: a single-node instance runs only
+ * `start` and `stop`; on a multi-node group workers run `start`/`stop`, and the head runs
+ * `prepare` (when set), then `afterJoin` instead of `start` when it has one. A flag on a
+ * command the entry does not define is inert too. An entry shared by every rank counts as used
+ * when any rank uses it.
+ */
+export function unusedInteractiveFlags(variant: {
+  key: string;
+  groupSize: number;
+  commands: readonly {
+    prepare?: string;
+    afterJoin?: string;
+    interactive?: DeploymentInteractiveCommands;
+  }[];
+}): UnusedInteractiveFlag[] {
+  const unused: UnusedInteractiveFlag[] = [];
+  const shared = variant.commands.length === 1;
+  variant.commands.forEach((entry, index) => {
+    const ranks = shared ? Array.from({ length: variant.groupSize }, (_, rank) => rank) : [index];
+    for (const command of INTERACTIVE_FIELDS) {
+      if (entry.interactive?.[command] !== true) continue;
+      const defined =
+        command === "prepare"
+          ? !!entry.prepare
+          : command === "afterJoin"
+            ? !!entry.afterJoin
+            : true;
+      let reason: UnusedInteractiveFlag["reason"] | null = defined ? null : "no_command";
+      if (!reason && command !== "stop") {
+        const used = ranks.some((rank) => {
+          if (variant.groupSize === 1) return command === "start";
+          if (rank !== 0) return command === "start";
+          if (command === "prepare") return true;
+          return command === "afterJoin" ? true : !entry.afterJoin;
+        });
+        if (!used)
+          reason =
+            variant.groupSize === 1
+              ? "single_node"
+              : command === "start"
+                ? "after_join_replaces_start"
+                : "not_head";
+      }
+      if (reason)
+        unused.push({ variant: variant.key, rank: shared ? null : index, command, reason });
+    }
+  });
+  return unused;
 }
 /**
  * The recipe schema. `strict` holds every rule for text a person or agent

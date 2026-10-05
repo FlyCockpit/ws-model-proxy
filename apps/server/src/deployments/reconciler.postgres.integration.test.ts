@@ -26,6 +26,8 @@ let reopenDeploymentOperatorStep: DeploymentService["reopenDeploymentOperatorSte
 let restartDeploymentInstance: DeploymentService["restartDeploymentInstance"];
 let DeploymentReconciler: typeof import("./reconciler.js").DeploymentReconciler;
 let flushDeploymentOperatorAudit: typeof import("./operator-audit.js").flushDeploymentOperatorAudit;
+let createDeploymentPlan: DeploymentService["createDeploymentPlan"];
+let applyDeploymentPlan: DeploymentService["applyDeploymentPlan"];
 
 integration("deployment result fencing at PostgreSQL", () => {
   let fixture: ReturnType<typeof createFixturePrismaClient>;
@@ -346,8 +348,13 @@ integration("interactive operator steps at PostgreSQL", () => {
     production = createPrismaClient(databaseUrl);
     ({ DeploymentReconciler } = await import("./reconciler.js"));
     ({ flushDeploymentOperatorAudit } = await import("./operator-audit.js"));
-    ({ loadDeploymentState, reopenDeploymentOperatorStep, restartDeploymentInstance } =
-      await import("@ws-model-proxy/api/lib/deployment-service"));
+    ({
+      loadDeploymentState,
+      reopenDeploymentOperatorStep,
+      restartDeploymentInstance,
+      createDeploymentPlan,
+      applyDeploymentPlan,
+    } = await import("@ws-model-proxy/api/lib/deployment-service"));
   });
   afterAll(async () => {
     for (const reconciler of reconcilers) await reconciler.stop();
@@ -1984,5 +1991,58 @@ integration("interactive operator steps at PostgreSQL", () => {
     expect((await production.$transaction((tx) => loadDeploymentState(tx, user.id))).held).toEqual(
       [],
     );
+  }, 30_000);
+
+  // ---- Chunk 9: the planner lifts the interactive refusal behind the capability gate ----
+
+  it("plans and starts an interactive recipe only on a node that can open operator terminals", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    // Only the recipe (config, revision, pool) of this fixture is used; its own instance is
+    // stopped and released so the node is free.
+    const recipe = await instance(user.id, [device.id], { stopInteractive: true, stopping: true });
+    await fixture.deploymentStep.updateMany({
+      where: { instanceId: recipe.instance.id, phase: "stop" },
+      data: { state: "FAILED", errorCode: "fixture" },
+    });
+    await fixture.deploymentInstanceNode.updateMany({
+      where: { instanceId: recipe.instance.id },
+      data: { claimHeld: false, stoppedAt: new Date() },
+    });
+    await fixture.deploymentInstance.update({
+      where: { id: recipe.instance.id },
+      data: { observedState: "STOPPED" },
+    });
+    const requester = { userId: user.id, id: user.id, kind: "USER" as const };
+    const start = { revisionId: recipe.instance.revisionId, variantKey: "one", groupCount: 1 };
+    await expect(createDeploymentPlan(requester, { start })).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+      data: { reason: "deployment_operator_unavailable", nodeIds: [device.id] },
+    });
+    await fixture.cliDevice.update({
+      where: { id: device.id },
+      data: { reportedDeploymentOperator: true, reportedTerminalSupported: true },
+    });
+    const plan = await createDeploymentPlan(requester, { start });
+    expect(plan.contents).toMatchObject({
+      warnings: ["interactive_operator_required"],
+      operatorSteps: [
+        { instanceId: null, nodeId: device.id, action: "start", nodeReady: true },
+        { instanceId: null, nodeId: device.id, action: "stop", nodeReady: true },
+      ],
+    });
+    await applyDeploymentPlan(requester, plan.id, false);
+    const started = await fixture.deploymentInstance.findFirstOrThrow({
+      where: { userId: user.id, id: { not: recipe.instance.id } },
+    });
+    const h = harness([socketFor(user.id, device.id)]);
+    await h.tickUntil(() => h.jobs.length > 0);
+    expect(h.jobs[0]).toMatchObject({
+      instanceId: started.id,
+      action: "start",
+      interactive: true,
+      stopInteractive: true,
+    });
+    expect(h.jobs[0]!.operator?.commandAuthor).toBe("user");
   }, 30_000);
 });

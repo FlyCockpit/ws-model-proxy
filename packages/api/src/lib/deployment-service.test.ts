@@ -3,14 +3,6 @@ import { mockDeep } from "vitest-mock-extended";
 import type { PrismaClient } from "../../../db/prisma/generated/client";
 
 vi.mock("@ws-model-proxy/db", () => ({ default: mockDeep<PrismaClient>() }));
-// The real check by default; one test lifts the "not supported yet" refusal to inspect intents.
-vi.mock("./deployment-spec", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./deployment-spec")>();
-  return {
-    ...actual,
-    variantHasInteractiveCommands: vi.fn(actual.variantHasInteractiveCommands),
-  };
-});
 
 import prisma from "@ws-model-proxy/db";
 import {
@@ -18,11 +10,7 @@ import {
   createDeploymentPlan,
   deploymentExecutionAllowed,
 } from "./deployment-service";
-import {
-  deploymentSpecSchema,
-  storedDeploymentSpecSchema,
-  variantHasInteractiveCommands,
-} from "./deployment-spec";
+import { deploymentSpecSchema, storedDeploymentSpecSchema } from "./deployment-spec";
 
 const db = vi.mocked(prisma);
 const person = { userId: "owner", id: "owner", kind: "USER" as const };
@@ -54,6 +42,9 @@ const rawNode = {
   relayProtocolVersion: "2.4",
   allowDeployments: true,
   reportedDeployments: true,
+  // Interactive recipe commands can open operator terminals here.
+  reportedDeploymentOperator: true,
+  reportedTerminalSupported: true,
   mcpCommandMode: "UNSUPERVISED",
   reportedMcpCommandMode: "UNSUPERVISED",
   nodeInfo: {
@@ -389,7 +380,7 @@ describe("deployment durable API boundary", () => {
   });
 });
 
-describe("interactive recipe commands before operator terminals exist", () => {
+describe("interactive recipe commands and the operator-terminal capability", () => {
   const interactiveCommands = {
     management: "externalService",
     start: "start --port {{port}}",
@@ -432,16 +423,120 @@ describe("interactive recipe commands before operator terminals exist", () => {
   it.each([
     ["start", { start: true }],
     ["stop", { stop: true }],
-  ])("refuses to plan a start whose %s is interactive", async (_field, interactive) => {
-    revision(interactiveSpec([{ ...interactiveCommands, interactive }]));
-    await expect(createDeploymentPlan(person, start)).rejects.toMatchObject({
-      code: "BAD_REQUEST",
-      message: "Interactive recipe commands are not supported yet",
-      data: { reason: "interactive_commands_unsupported" },
+    ["switch off", { start: true }, { reportedDeploymentOperator: false }],
+    ["terminals unsupported", { stop: true }, { reportedTerminalSupported: false }],
+    ["unreported", { start: true }, { reportedDeploymentOperator: null }],
+  ])(
+    "refuses to plan an interactive %s on a node that cannot open operator terminals",
+    async (_case, interactive, node = { reportedDeploymentOperator: false }) => {
+      resolveMock(db.cliDevice.findMany, [{ ...rawNode, ...node }]);
+      revision(interactiveSpec([{ ...interactiveCommands, interactive }]));
+      await expect(createDeploymentPlan(person, start)).rejects.toMatchObject({
+        code: "PRECONDITION_FAILED",
+        data: { reason: "deployment_operator_unavailable", nodeIds: ["node"] },
+      });
+      expect(db.deploymentPlan.create).not.toHaveBeenCalled();
+    },
+  );
+  it("plans an interactive start on a capable node and lists the steps a person runs", async () => {
+    revision(interactiveSpec([interactiveCommands]));
+    await createDeploymentPlan(person, start);
+    expect(db.deploymentPlan.create.mock.calls.at(-1)?.[0].data).toMatchObject({
+      contents: {
+        warnings: ["interactive_operator_required"],
+        operatorStepCount: 2,
+        operatorSteps: [
+          {
+            instanceId: null,
+            nodeId: "node",
+            rank: 0,
+            action: "start",
+            command: "start --port 30000",
+            nodeReady: true,
+          },
+          { instanceId: null, nodeId: "node", rank: 0, action: "stop", nodeReady: true },
+        ],
+      },
     });
-    expect(db.deploymentPlan.create).not.toHaveBeenCalled();
   });
-  it("refuses at admission too, if a plan reaches it for an interactive revision", async () => {
+  it.each([
+    ["can", true],
+    ["cannot", false],
+  ])(
+    "lists a stopped instance's interactive stop, and never refuses it, when its node %s open terminals",
+    async (_case, ready) => {
+      resolveMock(db.cliDevice.findMany, [{ ...rawNode, reportedDeploymentOperator: ready }]);
+      resolveMock(db.deploymentInstance.findMany, [
+        {
+          id: "old",
+          startedBy: "USER",
+          agentsMayPreempt: false,
+          Nodes: [
+            {
+              cliDeviceId: "node",
+              rank: 0,
+              claimHeld: true,
+              resources: { kind: "unified", memoryGb: 10, ramGb: 0, gpus: [] },
+              port: 30000,
+              distPort: null,
+              blockedBy: [],
+            },
+          ],
+        },
+      ]);
+      resolveMock(db.deploymentInstanceNode.findMany, [
+        { instanceId: "old", cliDeviceId: "node", rank: 0, claimHeld: true },
+      ]);
+      resolveMock(db.deploymentStep.findFirst, {
+        intent: {
+          type: "deployment.job",
+          attachment: "llm",
+          engine: "other",
+          management: "externalService",
+          instanceId: "old",
+          revisionId: "revision",
+          rank: 0,
+          action: "start",
+          command: "start",
+          stopInteractive: true,
+          stopCommand: "sudo systemctl stop model",
+          statusCommand: "systemctl is-active model",
+          timeoutMs: 120_000,
+          unitName: "wsmp-i-old-r0",
+          port: 30000,
+          endpointSlug: "inst-old",
+          models: ["model"],
+          contextWindow: null,
+          readiness: { path: "/health", expectedStatus: 200 },
+          health: { intervalMs: 60_000, failureThreshold: 3, successThreshold: 1 },
+        },
+      });
+      await createDeploymentPlan(person, { stopInstanceId: "old" });
+      expect(db.deploymentPlan.create.mock.calls.at(-1)?.[0].data.contents).toMatchObject({
+        warnings: ready
+          ? ["interactive_operator_required"]
+          : ["interactive_operator_required", "interactive_operator_unavailable"],
+        operatorSteps: [
+          {
+            instanceId: "old",
+            nodeId: "node",
+            rank: 0,
+            action: "stop",
+            command: "sudo systemctl stop model",
+            nodeReady: ready,
+          },
+        ],
+      });
+    },
+  );
+  it("a plain recipe carries no operator steps", async () => {
+    await createDeploymentPlan(person, start);
+    const contents = db.deploymentPlan.create.mock.calls.at(-1)?.[0].data.contents;
+    expect(contents).not.toHaveProperty("operatorSteps");
+    expect(contents).toMatchObject({ warnings: [] });
+  });
+  it("refuses at admission when the node lost the capability after planning", async () => {
+    revision(interactiveSpec([interactiveCommands]));
     const plan = await createDeploymentPlan(person, start);
     const recorded = db.deploymentPlan.create.mock.calls[0]?.[0].data;
     if (!recorded) throw new Error("Expected a persisted plan");
@@ -455,10 +550,10 @@ describe("interactive recipe commands before operator terminals exist", () => {
       fingerprint: recorded.fingerprint,
       contents: plan.contents,
     });
-    revision(interactiveSpec([interactiveCommands]));
+    resolveMock(db.cliDevice.findMany, [{ ...rawNode, reportedDeploymentOperator: false }]);
+    // The capability is part of the node state the plan was computed on.
     await expect(applyDeploymentPlan(person, "plan", false)).rejects.toMatchObject({
-      code: "BAD_REQUEST",
-      data: { reason: "interactive_commands_unsupported" },
+      code: "CONFLICT",
     });
     expect(db.deploymentInstance.create).not.toHaveBeenCalled();
     expect(db.deploymentStep.create).not.toHaveBeenCalled();
@@ -470,7 +565,6 @@ describe("interactive recipe commands before operator terminals exist", () => {
     }
   });
   it("sets the flags from the rank's interactive commands per phase", async () => {
-    vi.mocked(variantHasInteractiveCommands).mockReturnValue(false);
     revision(interactiveSpec([interactiveCommands]));
     const steps = await applyPlan();
     expect(steps.map((step) => [step.phase, step.intent])).toEqual([
@@ -480,7 +574,6 @@ describe("interactive recipe commands before operator terminals exist", () => {
     expect(steps[1]?.intent).not.toHaveProperty("interactive");
   });
   it("marks a multi-node head's prepare and afterJoin phases from their own flags", async () => {
-    vi.mocked(variantHasInteractiveCommands).mockReturnValue(false);
     const node = (id: string, address: string) => ({
       ...rawNode,
       id,
@@ -522,7 +615,6 @@ describe("interactive recipe commands before operator terminals exist", () => {
       expect(intent).not.toHaveProperty("stopInteractive");
   });
   it("marks a multi-node head's start phase interactive when its afterJoin is", async () => {
-    vi.mocked(variantHasInteractiveCommands).mockReturnValue(false);
     const node = (id: string, address: string) => ({
       ...rawNode,
       id,
@@ -557,7 +649,6 @@ describe("interactive recipe commands before operator terminals exist", () => {
     ["a person flipped an agent's interactive stop to automatic", true, false],
     ["a person flipped an agent's automatic stop to interactive", false, true],
   ])("flags agent authorship when %s", async (_case, agentInteractive, currentInteractive) => {
-    vi.mocked(variantHasInteractiveCommands).mockReturnValue(false);
     const commands = (interactive: boolean) => [
       { ...interactiveCommands, interactive: interactive ? { stop: true } : {} },
     ];
@@ -569,23 +660,24 @@ describe("interactive recipe commands before operator terminals exist", () => {
     await createDeploymentPlan(person, start);
     expect(db.deploymentPlan.create.mock.calls.at(-1)?.[0].data).toMatchObject({
       state: "AWAITING_CONFIRMATION",
-      contents: { warnings: ["agent_edited_revision"] },
+      contents: { warnings: expect.arrayContaining(["agent_edited_revision"]) },
     });
   });
   it("flags the agent's own flip when it is the revision being started", async () => {
-    vi.mocked(variantHasInteractiveCommands).mockReturnValue(false);
     revision(interactiveSpec([{ ...interactiveCommands, interactive: {} }]), "AGENT");
     await createDeploymentPlan(person, start);
     expect(db.deploymentPlan.create.mock.calls.at(-1)?.[0].data).toMatchObject({
       contents: { warnings: ["agent_edited_revision"] },
     });
+    expect(db.deploymentPlan.create.mock.calls.at(-1)?.[0].data.contents).not.toHaveProperty(
+      "operatorSteps",
+    );
   });
   it("a person's revision no agent touched needs no review", async () => {
-    vi.mocked(variantHasInteractiveCommands).mockReturnValue(false);
     revision(interactiveSpec([interactiveCommands]));
     await createDeploymentPlan(person, start);
     expect(db.deploymentPlan.create.mock.calls.at(-1)?.[0].data).toMatchObject({
-      contents: { warnings: [] },
+      contents: { warnings: ["interactive_operator_required"] },
     });
   });
 });

@@ -33,7 +33,9 @@ const RECIPE_ERROR_KEYS = {
   deployments_running: "deployments.stopBeforeChange",
   slug_taken: "deployments.slugTaken",
   invalid_recipe_slug: "deployments.invalidRecipeSlug",
-  interactive_commands_unsupported: "deployments.interactiveUnsupported",
+  deployment_operator_unavailable: "deployments.operatorUnavailable",
+  deployment_stop_pending: "deployments.stopPending",
+  deployment_resources_unconfirmed: "deployments.resourcesUnconfirmed",
 } as const;
 type RecipeErrorKey = (typeof RECIPE_ERROR_KEYS)[keyof typeof RECIPE_ERROR_KEYS];
 function recipeErrorKey(error: unknown): RecipeErrorKey | null {
@@ -852,7 +854,7 @@ function NodeGrantForm({ device }: { device: Device }) {
       <Button type="submit" size="touch" disabled={grant.isPending}>
         {t("deployments.saveGrant")}
       </Button>
-      {grant.isError ? <p role="alert">{friendly(grant.error, t("deployments.failed"))}</p> : null}
+      {grant.isError ? <p role="alert">{recipeErrorText(grant.error, t)}</p> : null}
     </form>
   );
 }

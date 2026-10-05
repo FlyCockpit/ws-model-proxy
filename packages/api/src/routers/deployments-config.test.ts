@@ -95,3 +95,115 @@ describe("renaming a recipe", () => {
       await expect(update(slug)).rejects.toMatchObject({ code: "BAD_REQUEST" });
   });
 });
+
+describe("interactive recipe commands", () => {
+  const interactiveSpec = (variant: Record<string, unknown>) => ({
+    variants: [
+      {
+        ...spec.variants[0],
+        commands: [
+          {
+            management: "externalService",
+            start: "serve",
+            stop: "stop",
+            status: "status",
+            prepare: "prepare",
+            interactive: { start: true, prepare: true },
+          },
+        ],
+        ...variant,
+      },
+    ],
+  });
+
+  it("warns on save about interactive flags that never take effect (IC1-3)", async () => {
+    const saved = await client().updateConfig({
+      id: "config",
+      expectedRevision: 1,
+      spec: interactiveSpec({}) as never,
+    });
+    expect(saved.interactiveWarnings).toEqual([
+      { variant: "one", rank: null, command: "prepare", reason: "single_node" },
+    ]);
+  });
+
+  it("keeps restart and reopen for a person: an agent session is refused", async () => {
+    const agent = createRouterClient(deploymentsRouter, {
+      context: { ...buildContext(), services: { deploymentActor: { kind: "AGENT", id: "token" } } },
+    });
+    await expect(agent.restartInstance({ instanceId: "instance" })).rejects.toMatchObject({
+      code: "FORBIDDEN",
+    });
+    await expect(agent.reopenOperatorStep({ stepId: "step" })).rejects.toMatchObject({
+      code: "FORBIDDEN",
+    });
+    expect(db.$transaction).not.toHaveBeenCalled();
+  });
+
+  it("never returns terminal ids: instance list and detail, plan status", async () => {
+    const step = {
+      id: "step",
+      cliDeviceId: "node",
+      rank: 0,
+      phase: "start",
+      sequence: 0,
+      state: "AWAITING_OPERATOR",
+      intent: { action: "start", command: "sudo systemctl start model" },
+      errorCode: null,
+      operatorTerminalId: "AAECAwQFBgcICQoLDA0ODw",
+      operatorSince: new Date(),
+      operatorAcceptedAt: null,
+      operatorLastExit: 3,
+      deadline: null,
+    };
+    db.deploymentInstance.findMany.mockResolvedValue([
+      { id: "instance", needsOperator: "STEP", Nodes: [], Steps: [step] },
+    ]);
+    const page = await client().listInstances({ limit: 10 });
+    expect(page.items[0]).toMatchObject({
+      needsOperator: "STEP",
+      operatorSteps: [
+        {
+          stepId: "step",
+          nodeId: "node",
+          action: "start",
+          command: "sudo systemctl start model",
+          terminalOpen: true,
+          lastExit: 3,
+          heldResourceCheck: false,
+        },
+      ],
+    });
+    expect(JSON.stringify(page)).not.toContain("AAECAwQFBgcICQoLDA0ODw");
+    db.deploymentInstance.findFirst.mockResolvedValue({
+      id: "instance",
+      Nodes: [],
+      Steps: [step],
+      _count: { Steps: 1 },
+      Revision: {},
+    });
+    db.deploymentStep.findMany.mockResolvedValue([step]);
+    const detail = await client().getInstance({ id: "instance" });
+    expect(detail.Steps[0]).toMatchObject({ id: "step", terminalOpen: true });
+    expect(JSON.stringify(detail)).not.toContain("AAECAwQFBgcICQoLDA0ODw");
+    db.deploymentPlan.findFirst.mockResolvedValue({
+      id: "plan",
+      userId: "user-id",
+      contents: {
+        action: "stop",
+        stopInstanceId: "instance",
+        affectedNodeIds: ["node"],
+        stopIds: [],
+        placements: [],
+        effectiveMode: "OFF",
+        requiresConfirmation: true,
+        headAddr: "",
+        warnings: [],
+      },
+      Run: { id: "run", Instances: [], Steps: [step], _count: { Steps: 1 } },
+    });
+    const status = await client().planStatus({ id: "plan" });
+    expect(status.Run?.Steps[0]).toMatchObject({ id: "step", terminalOpen: true });
+    expect(JSON.stringify(status)).not.toContain("AAECAwQFBgcICQoLDA0ODw");
+  });
+});

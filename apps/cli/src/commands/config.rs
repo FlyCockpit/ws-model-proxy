@@ -33,9 +33,11 @@ enum Sub {
     /// on this machine. Turn it on only for a server you would trust with a
     /// shell here.
     SetDeployments { state: Switch },
-    /// Reserved for interactive recipe steps (off by default). Has no effect
-    /// yet: the server refuses to start recipes with interactive commands
-    /// until a follow-up release.
+    /// Allow operator terminals for interactive recipe steps (off by default).
+    /// Needs deployments on and terminal support; it never enables browser
+    /// shells. The owner runs each step's exact command after pressing Enter in
+    /// a terminal opened from the dashboard. Without it the server refuses to
+    /// plan interactive recipes on this node.
     SetDeploymentOperatorTerminal { state: Switch },
     /// Print the path to the config file.
     Path,

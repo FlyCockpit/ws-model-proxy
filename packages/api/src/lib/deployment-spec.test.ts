@@ -4,7 +4,7 @@ import {
   DEPLOYMENT_CONFIG_SLUG_PATTERN,
   deploymentVariantSchema,
   storedDeploymentVariantSchema,
-  variantHasInteractiveCommands,
+  unusedInteractiveFlags,
 } from "./deployment-spec";
 
 const base = {
@@ -307,10 +307,55 @@ describe("interactive recipe commands", () => {
       }).success,
     ).toBe(false);
   });
-  it("detects a variant with an interactive command on any rank", () => {
-    expect(variantHasInteractiveCommands({ commands: [{}, { interactive: { stop: true } }] })).toBe(
-      true,
-    );
-    expect(variantHasInteractiveCommands({ commands: [{}, { interactive: {} }] })).toBe(false);
+});
+
+describe("interactive flags that never take effect (IC1-3)", () => {
+  const entry = (interactive: Record<string, boolean>, extra: Record<string, string> = {}) => ({
+    start: "start",
+    stop: "stop",
+    interactive,
+    ...extra,
+  });
+  it("single node: prepare and afterJoin never run; start and stop do", () => {
+    expect(
+      unusedInteractiveFlags({
+        key: "v",
+        groupSize: 1,
+        commands: [
+          entry(
+            { start: true, stop: true, prepare: true, afterJoin: true },
+            { prepare: "p", afterJoin: "a" },
+          ),
+        ],
+      }),
+    ).toEqual([
+      { variant: "v", rank: null, command: "prepare", reason: "single_node" },
+      { variant: "v", rank: null, command: "afterJoin", reason: "single_node" },
+    ]);
+  });
+  it("multi-node: the head's afterJoin replaces its start; workers run no prepare", () => {
+    expect(
+      unusedInteractiveFlags({
+        key: "v",
+        groupSize: 2,
+        commands: [
+          entry({ start: true, prepare: true }, { afterJoin: "a", prepare: "p" }),
+          entry({ start: true, prepare: true, afterJoin: true }, { prepare: "p", afterJoin: "a" }),
+        ],
+      }),
+    ).toEqual([
+      { variant: "v", rank: 0, command: "start", reason: "after_join_replaces_start" },
+      { variant: "v", rank: 1, command: "prepare", reason: "not_head" },
+      { variant: "v", rank: 1, command: "afterJoin", reason: "not_head" },
+    ]);
+  });
+  it("a shared entry counts as used when any rank uses it; a flag without its command is inert", () => {
+    expect(
+      unusedInteractiveFlags({
+        key: "v",
+        groupSize: 2,
+        commands: [entry({ start: true, prepare: true, afterJoin: true }, { afterJoin: "a" })],
+      }),
+    ).toEqual([{ variant: "v", rank: null, command: "prepare", reason: "no_command" }]);
   });
 });

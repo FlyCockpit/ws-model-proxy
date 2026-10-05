@@ -22,10 +22,22 @@ screen on the node. Turn deployments on only on nodes whose server you would
 trust with a shell there. Deployments stay off by default.
 
 Interactive recipe commands (a command a person must run, e.g. one asking for
-a sudo password) are not usable yet. A recipe can mark commands `interactive`
-and be saved, but starting it is refused until a follow-up release. The
-node-local switch `wsmp config set-deployment-operator-terminal` exists (off by
-default) but has no effect yet.
+a sudo password) are marked `interactive` in the recipe. When such a step is
+due, the deployment waits for you: the node opens an operator terminal that
+shows the exact command, runs it only after you press Enter there (never a
+shell), and for starts and stops checks the recipe's status command before the
+step counts as done.
+An interactive start or `afterJoin` requires `management: externalService`, and
+any interactive command requires a `status` command. Automatic stops (a failed
+start, a node going offline, preemption) also wait for you, with the
+deployment's resources held; an instance whose start is interactive is never
+restarted automatically, it waits for you to restart it. Agents can write and
+plan such recipes but can never answer, reopen or restart these steps.
+Each node must opt in with `wsmp config set-deployment-operator-terminal on`
+(off by default; it also needs deployments on and terminal support, and does not
+enable browser shells). Planning refuses an interactive recipe on a node
+without it, naming the setting. A sudoers `NOPASSWD` rule for the exact
+absolute command remains the fully automatic alternative.
 
 Recipe commands are limited to 4,096 UTF-8 bytes when saved and again after
 placeholder substitution, the same limit the CLI enforces, so a long command is

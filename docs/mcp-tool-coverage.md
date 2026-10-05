@@ -71,6 +71,8 @@ fails the suite when a leaf is unclassified.
 | `deployments.planStart` | `deployment_plan_start` | write | — | pure | — | — | — |
 | `deployments.planStatus` | `deployment_plan_status` | read | — | pure | — | — | — |
 | `deployments.planStop` | `deployment_plan_stop` | write | — | pure | — | — | — |
+| `deployments.reopenOperatorStep` | — (excluded) | — | — | — | — | — | Human-only: interactive recipe steps wait for the owner, who restarts or reopens them from the dashboard; never an agent tool. |
+| `deployments.restartInstance` | — (excluded) | — | — | — | — | — | Human-only: interactive recipe steps wait for the owner, who restarts or reopens them from the dashboard; never an agent tool. |
 | `deployments.setAgentsMayPreempt` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
 | `deployments.setNodeGrant` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
 | `deployments.updateConfig` | `deployment_config_update` | write | — | pure | — | — | — |
