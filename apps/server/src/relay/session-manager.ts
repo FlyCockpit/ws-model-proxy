@@ -567,6 +567,8 @@ type SessionState = {
   nodeMetricsPersistedAtMs: number | null;
   endpointLoad: Map<string, LiveEndpointLoadEntry>;
   malformedTelemetryLoggedAtMs: number | null;
+  /** Last time a malformed `stt.*` frame from this CLI was logged (rate limit). */
+  malformedSttLoggedAtMs: number | null;
   /** Metric routing rule evaluation for this device (S-B part 2). */
   routingEvaluation: RoutingEvaluationState | null;
 };
@@ -1301,6 +1303,7 @@ export class RelaySessionManager {
       nodeMetricsPersistedAtMs: null,
       endpointLoad: new Map(),
       malformedTelemetryLoggedAtMs: null,
+      malformedSttLoggedAtMs: null,
       routingEvaluation: null,
     });
     if (socket.readyState === WS_READY_STATE_OPEN) {
@@ -4801,8 +4804,16 @@ export class RelaySessionManager {
     if (type.startsWith("stt.") && session.registered) {
       // A live speech-to-text answer outside the strict schema concerns one
       // session only; with no sessions open yet it is dropped. Nothing of the
-      // frame is logged (it may carry transcript text).
-      console.error("[relay] malformed speech-to-text frame dropped");
+      // frame is logged (it may carry transcript text), and at most once a
+      // minute per CLI, since a broken CLI could send one per delta.
+      const nowMs = Date.now();
+      if (
+        session.malformedSttLoggedAtMs === null ||
+        nowMs - session.malformedSttLoggedAtMs >= MALFORMED_TELEMETRY_LOG_INTERVAL_MS
+      ) {
+        session.malformedSttLoggedAtMs = nowMs;
+        console.error("[relay] malformed speech-to-text frame dropped");
+      }
       return true;
     }
     // Telemetry is advisory: a reading outside the strict schema (or an

@@ -2546,7 +2546,12 @@ describe("relay terminal and exec sessions", () => {
     expect(socket.closes).toEqual([]);
     expect(socket.sends).toEqual([]);
     expect(JSON.stringify(errors.mock.calls)).not.toContain("secret");
-    expect(errors.mock.calls).toContainEqual(["[relay] malformed speech-to-text frame dropped"]);
+    // Two malformed frames, one log line: the log is rate limited per CLI.
+    expect(
+      errors.mock.calls.filter(
+        ([line]) => line === "[relay] malformed speech-to-text frame dropped",
+      ),
+    ).toHaveLength(1);
 
     const early = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: early, identity, now });

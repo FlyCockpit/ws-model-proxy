@@ -96,6 +96,14 @@ function generate(): Golden {
     openPrompt4097Bytes: raw({ ...open, config: { prompt: `${"é".repeat(2048)}a` } }),
     openLanguageNotToken: raw({ ...open, config: { language: "en US" } }),
     openConfigUnknownKey: raw({ ...open, config: { temperature: 0 } }),
+    openConfigArray: raw({ ...open, config: ["en", "prompt"] }),
+    openConfigNullLanguage: raw({ ...open, config: { language: null } }),
+    updateConfigNullPrompt: raw({
+      type: "stt.update",
+      sessionId: SESSION,
+      config: { prompt: null },
+    }),
+    updateConfigNumber: raw({ type: "stt.update", sessionId: SESSION, config: 0 }),
     openUnknownKey: raw({ ...open, extra: true }),
     openMissingConfig: raw({ ...open, config: undefined }),
     commitNegative: raw({ type: "stt.commit", sessionId: SESSION, itemSeq: -1 }),
@@ -157,10 +165,14 @@ describe("stt.* server frames golden shared with the CLI decoder", () => {
       expect(parseRelayBinaryFrame(frame).metadata, name).toEqual(parsedMetadata);
     }
     for (const [name, { metadata, bodyBytes }] of Object.entries(golden.audio.rejected)) {
-      expect(
-        () => encodeRelayBinaryFrame(JSON.parse(metadata), new Uint8Array(bodyBytes)),
-        name,
-      ).toThrow();
+      let thrown: unknown;
+      try {
+        encodeRelayBinaryFrame(JSON.parse(metadata), new Uint8Array(bodyBytes));
+      } catch (error) {
+        thrown = error;
+      }
+      // The same error type as every other framing refusal, never a ZodError.
+      expect((thrown as Error | undefined)?.name, name).toBe("RelayProtocolError");
     }
   });
 });

@@ -1558,7 +1558,9 @@ export function encodeRelayBinaryFrame(
     throw new RelayProtocolError("Binary body chunk exceeds 1 MiB.");
   }
   if (metadata.type === "stt.audio") {
-    sttAudioMetadataSchema.parse(metadata);
+    if (!sttAudioMetadataSchema.safeParse(metadata).success) {
+      throw new RelayProtocolError("stt.audio metadata fails the wire schema.");
+    }
     if (!sttAudioBodyValid(body.byteLength)) {
       throw new RelayProtocolError(
         `stt.audio carries 1 to ${STT_AUDIO_FRAME_MAX_BYTES} bytes of whole samples.`,

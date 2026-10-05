@@ -344,7 +344,7 @@ fn current_stt_frames_match_shared_golden() {
 }
 
 #[test]
-fn a_malformed_open_is_refused_by_name_and_other_stt_frames_are_dropped() {
+fn a_malformed_stt_frame_names_its_session_and_is_never_fatal() {
     let open = format!(r#"{{"type":"stt.open","sessionId":"{SESSION}","adapter":"openai"}}"#);
     assert!(parse_server_control(&open).is_err());
     assert_eq!(
@@ -356,21 +356,29 @@ fn a_malformed_open_is_refused_by_name_and_other_stt_frames_are_dropped() {
     // A session id the CLI would not echo is dropped instead.
     let unnamed = r#"{"type":"stt.open","sessionId":"x","adapter":"vllm"}"#;
     assert_eq!(control_frame_fault(unnamed), FrameFault::Ignore);
+    // Any other malformed frame names its session: a live one fails, an
+    // unknown one is ignored (`SttRegistry::malformed`).
+    let named = FrameFault::FailStt {
+        session_id: session(),
+    };
     let commit = format!(r#"{{"type":"stt.commit","sessionId":"{SESSION}","itemSeq":-1}}"#);
-    assert_eq!(control_frame_fault(&commit), FrameFault::Ignore);
+    assert_eq!(control_frame_fault(&commit), named);
     let unknown = format!(r#"{{"type":"stt.pause","sessionId":"{SESSION}"}}"#);
     assert!(parse_server_control(&unknown).is_err());
-    assert_eq!(control_frame_fault(&unknown), FrameFault::Ignore);
+    assert_eq!(control_frame_fault(&unknown), named);
+    let config =
+        format!(r#"{{"type":"stt.update","sessionId":"{SESSION}","config":{{"language":null}}}}"#);
+    assert!(parse_server_control(&config).is_err());
+    assert_eq!(control_frame_fault(&config), named);
+    let no_session = r#"{"type":"stt.commit","itemSeq":1}"#;
+    assert_eq!(control_frame_fault(no_session), FrameFault::Ignore);
 
-    // A malformed audio frame is dropped, never fatal.
+    // A malformed audio frame names its session too, never fatal.
     let metadata = format!(r#"{{"type":"stt.audio","sessionId":"{SESSION}","seq":0}}"#);
     let mut odd = (metadata.len() as u32).to_be_bytes().to_vec();
     odd.extend_from_slice(metadata.as_bytes());
     odd.push(0);
-    assert_eq!(
-        crate::protocol::binary_frame_fault(&odd).err(),
-        Some(FrameFault::Ignore)
-    );
+    assert_eq!(crate::protocol::binary_frame_fault(&odd).err(), Some(named));
 }
 
 #[test]

@@ -1896,6 +1896,14 @@ pub fn parse_server_control(text: &str) -> Result<ServerControlMessage> {
         anyhow::bail!("parsing relay server control frame");
     };
     if type_name.starts_with("stt.") {
+        // serde reads a struct from an array too, and an `Option` from null;
+        // the server's strict schema allows neither.
+        if let Some(config) = value.get("config") {
+            let strict = config
+                .as_object()
+                .is_some_and(|fields| fields.values().all(Value::is_string));
+            anyhow::ensure!(strict, "stt config must be an object of strings");
+        }
         let message: crate::stt_wire::SttServerMessage =
             serde_json::from_value(value).context("parsing relay stt frame")?;
         message.validate()?;
@@ -2344,6 +2352,11 @@ pub enum FrameFault {
     RejectStt {
         session_id: String,
     },
+    /// 2.11: any other malformed `stt.*` frame (text or `stt.audio`) that
+    /// names a session: a live session fails, an unknown one is ignored.
+    FailStt {
+        session_id: String,
+    },
 }
 
 pub fn control_frame_fault(text: &str) -> FrameFault {
@@ -2515,17 +2528,20 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
     if type_name.starts_with("file.") {
         return FrameFault::Ignore;
     }
-    // 2.11 live speech-to-text: a bad `stt.open` is refused by name so the
-    // server can try another node at once; any other bad `stt.*` frame is
-    // dropped (it concerns one session, never the relay).
-    if type_name == "stt.open"
-        && let Some(session_id) =
-            string_field(value, "sessionId").filter(|id| crate::stt_wire::is_session_id(id))
-    {
-        return FrameFault::RejectStt { session_id };
-    }
+    // 2.11 live speech-to-text: a bad frame concerns one session, never the
+    // relay. A bad `stt.open` is refused by name so the server can try
+    // another node at once; any other bad frame for a live session fails
+    // that session (its audio or commands would be lost otherwise).
     if type_name.starts_with("stt.") {
-        return FrameFault::Ignore;
+        let Some(session_id) =
+            string_field(value, "sessionId").filter(|id| crate::stt_wire::is_session_id(id))
+        else {
+            return FrameFault::Ignore;
+        };
+        if type_name == "stt.open" {
+            return FrameFault::RejectStt { session_id };
+        }
+        return FrameFault::FailStt { session_id };
     }
     if type_name == "term.spawn"
         && let Some(command_id) = string_field(value, "commandId")
