@@ -2257,6 +2257,11 @@ where
                 "ignoring unknown relay server frame"
             );
         }
+        ServerControlMessage::Stt(message) => {
+            if let Some(refusal) = stt_refusal(message) {
+                send_control(socket, &refusal, "refusing a speech-to-text session")?;
+            }
+        }
         ServerControlMessage::TermOpen {
             terminal_id,
             cols,
@@ -2591,6 +2596,22 @@ where
     Ok(())
 }
 
+/// 2.11 live speech-to-text is not served by this CLI yet: an open is refused
+/// at once (the server tries another node), and any other frame can only name
+/// an unknown session, so it is dropped.
+fn stt_refusal(message: crate::stt_wire::SttServerMessage) -> Option<ClientControlMessage> {
+    match message {
+        crate::stt_wire::SttServerMessage::Open { session_id, .. } => {
+            Some(ClientControlMessage::SttError {
+                session_id,
+                failure: RelayFailure::UnsupportedCapability,
+                message: Some("live transcription is not available on this node".into()),
+            })
+        }
+        _ => None,
+    }
+}
+
 fn apply_frame_fault<S>(
     socket: &mut tungstenite::WebSocket<S>,
     fault: FrameFault,
@@ -2672,6 +2693,18 @@ where
             );
             send_outbound_frames(socket, terminals.cancel_supervised(&command_id, false))
         }
+        FrameFault::RejectStt { session_id } => {
+            tracing::warn!("refusing a malformed speech-to-text session");
+            send_control(
+                socket,
+                &ClientControlMessage::SttError {
+                    session_id,
+                    failure: RelayFailure::ProtocolError,
+                    message: Some("malformed stt.open".into()),
+                },
+                "refusing a speech-to-text session",
+            )
+        }
     }
 }
 
@@ -2752,6 +2785,9 @@ where
                 tracing::warn!("ignoring an unexpected file.data frame");
                 Ok(())
             }
+            // 2.11: no speech-to-text session is open yet, so the audio can
+            // only be late for a closed or refused one.
+            RelayBinaryFrameMetadata::SttAudio { .. } => Ok(()),
             RelayBinaryFrameMetadata::RequestBody { .. } => Ok(()),
         };
     };
@@ -3528,7 +3564,12 @@ fn worker_send_control(tx: &SyncSender<FromWorker>, message: &ClientControlMessa
         | ClientControlMessage::FileRejected { .. }
         | ClientControlMessage::NodeInfo(_)
         | ClientControlMessage::NodeMetrics(_)
-        | ClientControlMessage::EndpointLoad(_) => {
+        | ClientControlMessage::EndpointLoad(_)
+        | ClientControlMessage::SttOpened { .. }
+        | ClientControlMessage::SttAudioAck { .. }
+        | ClientControlMessage::SttEvent { .. }
+        | ClientControlMessage::SttError { .. }
+        | ClientControlMessage::SttClosed { .. } => {
             anyhow::bail!("worker emitted non-request relay control")
         }
     };
@@ -4602,6 +4643,51 @@ mod tests {
             !log.contains("x\\u0000y") && !log.contains("x\u{0}"),
             "the command text leaked: {log}"
         );
+    }
+
+    #[test]
+    fn stt_frames_are_refused_or_dropped_until_sessions_exist() {
+        let session = "AAECAwQFBgcICQoLDA0ODw";
+        let open = format!(
+            r#"{{"type":"stt.open","sessionId":"{session}","endpointSlug":"inst-a1b2c3","upstreamModel":"m","adapter":"segmented","config":{{}},"maxItemSeconds":30,"maxSessionMs":60000,"audioWindowBytes":262144}}"#
+        );
+        let ServerControlMessage::Stt(message) = parse_server_control(&open).expect("open") else {
+            panic!("not an stt frame");
+        };
+        let refusal = stt_refusal(message).expect("an open is refused");
+        let wire = encode_control(&refusal).expect("refusal encodes");
+        assert!(wire.contains(r#""type":"stt.error""#) && wire.contains("unsupported_capability"));
+        for other in [
+            format!(r#"{{"type":"stt.commit","sessionId":"{session}","itemSeq":1}}"#),
+            format!(r#"{{"type":"stt.close","sessionId":"{session}","reason":"cancelled"}}"#),
+        ] {
+            let ServerControlMessage::Stt(message) = parse_server_control(&other).expect("frame")
+            else {
+                panic!("not an stt frame");
+            };
+            assert!(stt_refusal(message).is_none(), "{other}");
+        }
+
+        // A malformed open that names its session is refused by name, not fatally.
+        let (tx, _rx) = mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
+        let mut terminals = TerminalRegistry::new(tx);
+        let (exec_tx, _exec_rx) = mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
+        let mut execs = ExecRegistry::new(exec_tx, DEFAULT_EXEC_TIMEOUT);
+        let mut socket = sink_socket();
+        let malformed = format!(r#"{{"type":"stt.open","sessionId":"{session}"}}"#);
+        let fault = crate::protocol::control_frame_fault(&malformed);
+        assert!(
+            apply_frame_fault(
+                &mut socket,
+                fault,
+                &mut terminals,
+                &mut execs,
+                &anyhow::anyhow!("malformed")
+            )
+            .is_ok()
+        );
+        let written = String::from_utf8_lossy(&socket.get_ref().written).to_string();
+        assert!(written.contains("stt.error") && written.contains("protocol_error"));
     }
 
     #[test]

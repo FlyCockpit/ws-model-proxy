@@ -2519,6 +2519,42 @@ describe("relay terminal and exec sessions", () => {
     errors.mockRestore();
   });
 
+  it("drops stt frames (no live sessions yet) and refuses them before registration", async () => {
+    const manager = new RelaySessionManager();
+    const socket = new FakeSocket();
+    await register(manager, socket);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    socket.sends.length = 0;
+    const sessionId = id16(7);
+    for (const frame of [
+      { type: "stt.opened", sessionId },
+      { type: "stt.audio.ack", sessionId, bytes: 2048 },
+      { type: "stt.event", sessionId, event: { kind: "delta", itemSeq: 0, text: "private words" } },
+      { type: "stt.error", sessionId, failure: "transport" },
+      { type: "stt.closed", sessionId },
+      // Outside the strict schema: dropped too, and none of it is logged.
+      { type: "stt.event", sessionId, event: { kind: "delta", itemSeq: -1, text: "secret" } },
+      { type: "stt.opened", sessionId, extra: "secret" },
+    ]) {
+      await manager.handleTextFrame(socket, JSON.stringify(frame), now);
+    }
+    // Server-to-CLI audio coming back from a CLI is ignored.
+    manager.handleBinaryFrame(
+      socket,
+      encodeRelayBinaryFrame({ type: "stt.audio", sessionId, seq: 0 }, new Uint8Array(4)),
+    );
+    expect(socket.closes).toEqual([]);
+    expect(socket.sends).toEqual([]);
+    expect(JSON.stringify(errors.mock.calls)).not.toContain("secret");
+    expect(errors.mock.calls).toContainEqual(["[relay] malformed speech-to-text frame dropped"]);
+
+    const early = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket: early, identity, now });
+    await manager.handleTextFrame(early, JSON.stringify({ type: "stt.opened", sessionId }), now);
+    expect(early.closes.length).toBeGreaterThan(0);
+    errors.mockRestore();
+  });
+
   it("echoes the client protocol version and persists reported columns only from hello", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();

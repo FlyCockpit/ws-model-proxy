@@ -5,8 +5,10 @@
  * Last cut release (v0.3.1) spoke 2.3. This release bumps the protocol once, to 2.4:
  * terminal identity, supervised commands, engine facts / node telemetry, MCP
  * node file tools, custom engine adapters and deployments (with durable
- * snapshot ACKs and interactive deployment commands) all ship as 2.4. Older
- * CLIs are refused at hello.
+ * snapshot ACKs and interactive deployment commands) all ship as 2.4. Live
+ * speech-to-text (`stt.*` frames, gated per endpoint by the advertised
+ * `audio.transcriptions.realtime` capability, not by a hello flag) extends 2.4
+ * in place. Older CLIs are refused at hello.
  */
 export const RELAY_PROTOCOL_VERSIONS = ["2.4"] as const;
 export type RelayProtocolVersion = (typeof RELAY_PROTOCOL_VERSIONS)[number];

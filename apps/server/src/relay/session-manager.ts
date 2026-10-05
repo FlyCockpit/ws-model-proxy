@@ -1704,6 +1704,10 @@ export class RelaySessionManager {
       return;
     }
 
+    // 2.11 live speech-to-text: the server opens no sessions yet, so every
+    // answer names an unknown session and is dropped, as a late frame would be.
+    if (message.type.startsWith("stt.")) return;
+
     if (
       message.type === "term.spawned" ||
       message.type === "supervised.rejected" ||
@@ -1746,7 +1750,7 @@ export class RelaySessionManager {
         session.filesById.get(parsed.metadata.opId)?.markData(parsed.body);
         return;
       }
-      if (parsed.metadata.type === "file.body") {
+      if (parsed.metadata.type === "file.body" || parsed.metadata.type === "stt.audio") {
         // Server to CLI only. A CLI has no business sending it.
         return;
       }
@@ -4792,6 +4796,13 @@ export class RelaySessionManager {
         tracked.markMalformed();
       }
       console.error("[relay] malformed file frame");
+      return true;
+    }
+    if (type.startsWith("stt.") && session.registered) {
+      // A live speech-to-text answer outside the strict schema concerns one
+      // session only; with no sessions open yet it is dropped. Nothing of the
+      // frame is logged (it may carry transcript text).
+      console.error("[relay] malformed speech-to-text frame dropped");
       return true;
     }
     // Telemetry is advisory: a reading outside the strict schema (or an
