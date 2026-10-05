@@ -297,7 +297,8 @@ fn sync_dir(dir: &Path) -> Result<(), RegistryError> {
         })
 }
 
-#[cfg(test)]
+/// Only the Linux durability tests (`tests/durability.rs`) read it.
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn current_registry_dir() -> PathBuf {
     registry_dir().expect("registry dir")
 }
