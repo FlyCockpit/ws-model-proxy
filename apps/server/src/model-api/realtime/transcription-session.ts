@@ -167,6 +167,8 @@ export type RealtimeItemOutcome = {
   audioSeconds: number;
   code?: string;
   engineUsage?: { inputTokens?: number; outputTokens?: number };
+  /** UTF-8 bytes of the final transcript (a count only; the text is never passed on). */
+  transcriptBytes: number;
 };
 
 export type RealtimeSessionOutcome = {
@@ -861,6 +863,7 @@ export class RealtimeTranscriptionSession {
             status: "completed",
             audioBytes: event.audioBytes,
             audioSeconds: audioSeconds(event.audioBytes),
+            transcriptBytes: Buffer.byteLength(event.text, "utf8"),
             ...(event.engineUsage ? { engineUsage: event.engineUsage } : {}),
           }),
         );
@@ -885,6 +888,7 @@ export class RealtimeTranscriptionSession {
             audioBytes: 0,
             audioSeconds: 0,
             code: event.code,
+            transcriptBytes: 0,
           }),
         );
         this.send(transcriptionFailedEvent(record.id, event.code, event.message));
@@ -932,6 +936,7 @@ export class RealtimeTranscriptionSession {
           audioBytes: 0,
           audioSeconds: 0,
           code: mapped.error.code,
+          transcriptBytes: 0,
         }),
       );
       this.send(transcriptionFailedEvent(record.id, mapped.error.code, mapped.itemMessage));

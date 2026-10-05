@@ -575,6 +575,23 @@ describe("usage retention", () => {
     expect(increment?.latencyHistogram[6]).toBe(2);
   });
 
+  it("carries live transcription audio into the hourly rollup", () => {
+    const [increment] = hourIncrementsFromMinuteRows([
+      minuteRow({ audioInputMs: 61_000n }) as never,
+    ]);
+    expect(increment?.audioInputMs).toBe(61_000n);
+    const [legacy] = hourIncrementsFromMinuteRows([minuteRow() as never]);
+    expect(legacy?.audioInputMs).toBe(0n);
+  });
+
+  it("selects audioInputMs when it moves minute rows", async () => {
+    const { prisma, tx } = fakePrisma();
+    tx.$queryRaw.mockResolvedValueOnce([]);
+    await compactMinuteRollups({ prisma: prisma as never, now: NOW });
+    const [strings] = tx.$queryRaw.mock.calls[0] as [TemplateStringsArray];
+    expect(strings.join("?")).toContain('m."audioInputMs"');
+  });
+
   it("reaps abandoned PENDING requests through the guarded transition and counts them once", async () => {
     const { prisma, tx } = fakePrisma();
     prisma.$queryRaw.mockResolvedValueOnce([{ id: "relay-1" }, { id: "relay-2" }]);

@@ -93,6 +93,8 @@ integration("usage rollups with real PostgreSQL", () => {
       cacheWriteTokens: null,
       usageKnown: true,
       affinityOutcome: "PREDICTED_MATCH",
+      operation: null,
+      audioInputMs: null,
       resourceOwnerUserId: null,
       ...overrides,
     };

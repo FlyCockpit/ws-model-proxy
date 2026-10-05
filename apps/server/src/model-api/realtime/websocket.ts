@@ -24,6 +24,7 @@ import {
   type RealtimeSessionCounters,
   realtimeSessionCounters,
 } from "./limits.js";
+import { RealtimeSessionMeter } from "./metering.js";
 import {
   type RealtimeRegistration,
   type RealtimeSessionRegistry,
@@ -80,6 +81,12 @@ export type RealtimeEndpointDeps = {
     tokenId: string;
     userId: string;
   }) => NonNullable<RealtimeSessionHooks["authorizeOpen"]>;
+  /** Tests replace the usage meter (the default writes RelayRequest rows). */
+  createMeter?: (requester: {
+    tokenId: string;
+    userId: string;
+    tokenLookupPrefix: string;
+  }) => Pick<RealtimeSessionMeter, "opened" | "itemFinished" | "ended">;
   /** Tests replace the database router. */
   router?: (input: {
     token: ModelApiTokenIdentity;
@@ -309,15 +316,27 @@ export function realtimeSocketEvents(
           onResolved,
         });
     const requester = { tokenId: auth.token.id, userId: auth.token.userId };
+    const meterRequester = {
+      tokenId: auth.token.id,
+      userId: auth.token.userId,
+      tokenLookupPrefix: auth.token.lookupPrefix,
+    };
+    const meter = deps.createMeter
+      ? deps.createMeter(meterRequester)
+      : new RealtimeSessionMeter(meterRequester);
     const hooks: RealtimeSessionHooks = {
       ...(deps.capacityRuntime ? { admit: createRealtimeAdmit(deps.capacityRuntime) } : {}),
       // Every open is a locked, authorized send, like an HTTP relay request.
       authorizeOpen: deps.authorizeOpen
         ? deps.authorizeOpen(requester)
         : createRealtimeAuthorizer(requester),
-      opened: (candidate, info) => holder.registration?.opened(candidate, info.lease),
-      // Metering persistence is chunk 7; this chunk only plumbs `itemFinished`.
-      ended: () => {
+      opened: (candidate, info) => {
+        holder.registration?.opened(candidate, info.lease);
+        meter.opened(candidate);
+      },
+      itemFinished: (outcome) => meter.itemFinished(outcome),
+      ended: (outcome) => {
+        meter.ended(outcome);
         holder.registration?.remove();
         stopKeepalive();
       },

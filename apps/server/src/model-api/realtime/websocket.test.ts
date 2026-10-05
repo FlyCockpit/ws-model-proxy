@@ -312,6 +312,25 @@ describe("realtime socket events", () => {
     expect(authorizeOpen).toHaveBeenCalledWith({ tokenId: TOKEN.id, userId: TOKEN.userId });
   });
 
+  it("feeds the usage meter from the session hooks", () => {
+    const meter = { opened: vi.fn(), itemFinished: vi.fn(), ended: vi.fn() };
+    const createMeter = vi.fn(() => meter);
+    const t = deps({ createMeter });
+    const events = realtimeSocketEvents(admitted(t), t.deps);
+    const { ws } = fakeWs();
+    events.onOpen?.(new Event("open"), ws);
+    events.onClose?.(new CloseEvent("close"), ws);
+    expect(createMeter).toHaveBeenCalledWith({
+      tokenId: TOKEN.id,
+      userId: TOKEN.userId,
+      tokenLookupPrefix: TOKEN.lookupPrefix,
+    });
+    expect(meter.ended).toHaveBeenCalledWith(
+      expect.objectContaining({ candidate: null, closeCode: null, sentAudioBytes: 0 }),
+    );
+    expect(meter.opened).not.toHaveBeenCalled();
+  });
+
   it("gives the admission back when the handshake never opens", () => {
     vi.useFakeTimers();
     const t = deps();

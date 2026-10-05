@@ -1932,6 +1932,10 @@ model RelayRequest {
   affinityWaitMs             Int?
   /// Protocol operation only; never stores prompts, filenames, audio, or transcripts.
   operation                  String?
+  /// Live transcription sessions (`audio.realtime_transcription`): milliseconds
+  /// of audio the server forwarded to the member, from the PCM bytes it sent
+  /// (24 kHz s16 mono: bytes / 48). Server-authoritative; null otherwise.
+  audioInputMs               Int?
   /// Sum of rebuilt upstream request-body bytes across all relay attempts.
   /// Includes multipart boundaries/headers; it is not the source audio size.
   requestBytes               BigInt?
@@ -2024,6 +2028,10 @@ model UsageRollupMinute {
   ttftCount                   Int                @default(0)
   ttftSumMs                   BigInt             @default(0)
   ttftHistogram               Int[]              @default([])
+  /// Milliseconds of live transcription audio forwarded (`/v1/realtime`
+  /// sessions; 24 kHz PCM bytes / 48). Counted by the server, never reported
+  /// by an engine. Zero for every other operation.
+  audioInputMs                BigInt             @default(0)
 
   @@id([bucketStart, ownerUserId, requesterUserId, poolId, poolMemberId, executionTargetId, source])
   @@index([ownerUserId, bucketStart])
@@ -2064,6 +2072,10 @@ model UsageRollupHour {
   ttftCount                   Int                @default(0)
   ttftSumMs                   BigInt             @default(0)
   ttftHistogram               Int[]              @default([])
+  /// Milliseconds of live transcription audio forwarded (`/v1/realtime`
+  /// sessions; 24 kHz PCM bytes / 48). Counted by the server, never reported
+  /// by an engine. Zero for every other operation.
+  audioInputMs                BigInt             @default(0)
 
   @@id([bucketStart, ownerUserId, requesterUserId, poolId, poolMemberId, executionTargetId, source])
   @@index([ownerUserId, bucketStart])

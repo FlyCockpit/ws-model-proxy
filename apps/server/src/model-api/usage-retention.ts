@@ -248,6 +248,7 @@ type MovedMinuteRow = {
   ttftCount: number;
   ttftSumMs: bigint;
   ttftHistogram: number[] | null;
+  audioInputMs: bigint;
 };
 
 /** Pure: re-keys moved minute rows onto their hour bucket. */
@@ -283,6 +284,7 @@ export function hourIncrementsFromMinuteRows(
     ttftCount: Number(row.ttftCount),
     ttftSumMs: BigInt(row.ttftSumMs),
     ttftHistogram: (row.ttftHistogram ?? []).map(Number),
+    audioInputMs: BigInt(row.audioInputMs ?? 0),
   }));
 }
 
@@ -318,7 +320,7 @@ export async function compactMinuteRollups({
           m."continuationRequests", m."continuationInputTokens",
           m."continuationCacheReadTokens", m."durationCount",
           m."durationSumMs", m."latencyHistogram", m."ttftCount", m."ttftSumMs",
-          m."ttftHistogram"`;
+          m."ttftHistogram", m."audioInputMs"`;
       if (rows.length === 0) return 0;
       await writeRollupIncrements(tx, "usage_rollup_hour", hourIncrementsFromMinuteRows(rows));
       return rows.length;

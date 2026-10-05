@@ -41,6 +41,8 @@ export const relayRollupSelect = {
   cacheWriteTokens: true,
   usageKnown: true,
   affinityOutcome: true,
+  operation: true,
+  audioInputMs: true,
   // Durable resource owner (database-derived at insert; survives pool deletion).
   resourceOwnerUserId: true,
 } satisfies Prisma.RelayRequestSelect;
@@ -100,7 +102,12 @@ export type UsageRollupCounters = {
   ttftCount: number;
   ttftSumMs: bigint;
   ttftHistogram: number[];
+  /** Live transcription audio forwarded, in milliseconds (zero for other operations). */
+  audioInputMs: bigint;
 };
+
+/** The operation of a live transcription session row. */
+export const REALTIME_TRANSCRIPTION_OPERATION = "audio.realtime_transcription";
 
 export type UsageRollupIncrement = UsageRollupKey & UsageRollupCounters;
 
@@ -133,8 +140,11 @@ export function rollupIncrementForRequest(
     return null;
   const completedAt = row.completedAt ?? now;
   // Only measured durations feed latency: crash repair and the abandoned
-  // reaper leave durationMs null because the real end time is unknown.
-  const durationMs = row.durationMs;
+  // reaper leave durationMs null because the real end time is unknown. A
+  // live transcription session's wall time (up to 30 min) is not request
+  // latency: it is kept on the row, and its audio is counted instead.
+  const realtime = row.operation === REALTIME_TRANSCRIPTION_OPERATION;
+  const durationMs = realtime ? null : row.durationMs;
   const ttftMs =
     row.firstClientByteAt === null
       ? null
@@ -174,6 +184,7 @@ export function rollupIncrementForRequest(
     ttftCount: ttftMs === null ? 0 : 1,
     ttftSumMs: BigInt(ttftMs ?? 0),
     ttftHistogram,
+    audioInputMs: BigInt(row.audioInputMs ?? 0),
   };
 }
 
@@ -224,6 +235,7 @@ export function addRollupCounters<T extends UsageRollupCounters>(
   target.ttftCount += add.ttftCount;
   target.ttftSumMs += add.ttftSumMs;
   target.ttftHistogram = addHistograms(target.ttftHistogram, add.ttftHistogram);
+  target.audioInputMs += add.audioInputMs;
   return target;
 }
 
@@ -285,6 +297,7 @@ const ADDITIVE_COLUMNS = [
   "durationSumMs",
   "ttftCount",
   "ttftSumMs",
+  "audioInputMs",
 ] as const;
 
 /** One idempotent-per-call additive upsert for a merged increment. */
@@ -311,7 +324,7 @@ export function rollupUpsertSql(
       "cacheKnownRequests", "cacheKnownInputTokens",
       "continuationRequests", "continuationInputTokens", "continuationCacheReadTokens",
       "durationCount", "durationSumMs",
-      "latencyHistogram", "ttftCount", "ttftSumMs", "ttftHistogram"
+      "latencyHistogram", "ttftCount", "ttftSumMs", "ttftHistogram", "audioInputMs"
     )
     SELECT
       ${increment.bucketStart}, ${increment.ownerUserId}, ${increment.requesterUserId},
@@ -326,7 +339,7 @@ export function rollupUpsertSql(
       ${increment.continuationCacheReadTokens},
       ${increment.durationCount}, ${increment.durationSumMs},
       ${increment.latencyHistogram}::integer[], ${increment.ttftCount}, ${increment.ttftSumMs},
-      ${increment.ttftHistogram}::integer[]
+      ${increment.ttftHistogram}::integer[], ${increment.audioInputMs}
     -- The owner key is a durable plain id (relay_request.resourceOwnerUserId):
     -- a deleted owner's history is gone, so its late increment is skipped
     -- instead of failing the finalizer on the foreign key.

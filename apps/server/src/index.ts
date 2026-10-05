@@ -26,6 +26,7 @@ import {
   startProviderAttemptExpiry,
 } from "./model-api/provider-attempt-lifecycle.js";
 import { startProviderBudgetRepair } from "./model-api/provider-budget-runtime.js";
+import { flushRealtimeMetering } from "./model-api/realtime/metering.js";
 import { realtimeSessionRegistry } from "./model-api/realtime/registry.js";
 import { startRelayTelemetryRecovery } from "./model-api/relay-telemetry-recovery.js";
 import { startUsageRetention } from "./model-api/usage-retention.js";
@@ -258,6 +259,7 @@ installServerShutdown({
   flushDeploymentOperatorAudit,
   terminalHub: terminalBrowserHub,
   realtimeSessions: realtimeSessionRegistry,
+  flushRealtimeMetering,
   server,
   capacityLifecycle,
   closeDiagnosticsCapacityRuntime,

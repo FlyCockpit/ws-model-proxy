@@ -62,6 +62,9 @@ function harness(overrides: Partial<ServerShutdownDeps> = {}): Harness {
     },
     terminalHub: { closeAll: record("terminals:closeAll") },
     realtimeSessions: { closeAll: record("realtime:closeAll") },
+    flushRealtimeMetering: async () => {
+      events.push("realtime:flushMetering");
+    },
     server: {
       close: (callback) => {
         events.push("http:close");
@@ -144,6 +147,7 @@ describe("installServerShutdown", () => {
       "relay:closeIdle",
       // 4. relay close.
       "relay:close",
+      "realtime:flushMetering",
       "audit:flush",
       // 5. both capacity runtimes, once each.
       "capacity:close",

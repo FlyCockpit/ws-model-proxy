@@ -78,6 +78,12 @@ export type ServerShutdownDeps = {
   terminalHub: { closeAll(): void };
   /** Live transcription client sessions, including those still waiting for a model. */
   realtimeSessions?: { closeAll(): void };
+  /**
+   * Waits for live transcription usage writes already started (sessions
+   * ended by `realtimeSessions.closeAll`). Runs with the relay close, before
+   * the database fence arms; never rejects.
+   */
+  flushRealtimeMetering?: () => Promise<void>;
   server: ShutdownHttpServer;
   capacityLifecycle?: {
     stopMaintenance(): Promise<void>;
@@ -149,6 +155,7 @@ export function installServerShutdown(deps: ServerShutdownDeps): ServerShutdown 
       },
       closeRelaySessions: async () => {
         await relaySessions.closeRelaySessions();
+        await deps.flushRealtimeMetering?.();
         await deps.flushAgentAudit();
         await deps.flushDeploymentOperatorAudit?.();
       },

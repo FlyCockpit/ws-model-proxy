@@ -48,6 +48,8 @@ function row(overrides: Partial<RelayRollupRow> = {}): RelayRollupRow {
     cacheWriteTokens: null,
     usageKnown: true,
     affinityOutcome: "PREDICTED_MATCH",
+    operation: null,
+    audioInputMs: null,
     // Derived by the database at insert (schema-hardening.sql): the pool owner.
     resourceOwnerUserId: "owner-1",
     ...overrides,
@@ -62,6 +64,32 @@ function recordNotFound() {
 }
 
 describe("rollupIncrementForRequest", () => {
+  it("counts live transcription audio and keeps session wall time out of latency", () => {
+    const realtime = rollupIncrementForRequest(
+      row({
+        operation: "audio.realtime_transcription",
+        durationMs: 900_000,
+        audioInputMs: 812_000,
+      }),
+    );
+    expect(realtime).toMatchObject({
+      requests: 1,
+      durationCount: 0,
+      durationSumMs: 0n,
+      audioInputMs: 812_000n,
+    });
+    expect(realtime?.latencyHistogram.every((count) => count === 0)).toBe(true);
+    const http = rollupIncrementForRequest(
+      row({ operation: "audio.transcriptions", durationMs: 900 }),
+    );
+    expect(http).toMatchObject({ durationCount: 1, durationSumMs: 900n, audioInputMs: 0n });
+    const sql = rollupUpsertSql("usage_rollup_minute", realtime!);
+    expect(sql.sql).toContain(
+      '"audioInputMs" = usage_rollup_minute."audioInputMs" + EXCLUDED."audioInputMs"',
+    );
+    expect(sql.values).toContain(812_000n);
+  });
+
   it("builds one increment keyed on the completion minute", () => {
     const increment = rollupIncrementForRequest(row())!;
     expect(increment.bucketStart.toISOString()).toBe("2026-09-24T10:15:00.000Z");
