@@ -1,10 +1,5 @@
 import { deploymentFingerprint } from "@ws-model-proxy/api/lib/deployment-planner";
 import {
-  loadDeploymentState,
-  reopenDeploymentOperatorStep,
-  restartDeploymentInstance,
-} from "@ws-model-proxy/api/lib/deployment-service";
-import {
   deploymentJobIntentSchema,
   deploymentSpecSchema,
   originalDeploymentStopIntent,
@@ -22,8 +17,13 @@ const databaseUrl = process.env.SCHEMA_VALIDATION_DATABASE_URL;
 if (process.env.REQUIRE_POSTGRES_INTEGRATION === "1" && !databaseUrl)
   throw new Error("Postgres fixture URL required");
 const integration = databaseUrl ? describe : describe.skip;
-// Loaded after the skip guard: `./reconciler.js` imports the production
-// Prisma client, whose env validation fails in a unit run with no database.
+// Loaded after the skip guard: `./reconciler.js` and the deployment service
+// import the production Prisma client, whose env validation fails in a unit
+// run with no database.
+type DeploymentService = typeof import("@ws-model-proxy/api/lib/deployment-service");
+let loadDeploymentState: DeploymentService["loadDeploymentState"];
+let reopenDeploymentOperatorStep: DeploymentService["reopenDeploymentOperatorStep"];
+let restartDeploymentInstance: DeploymentService["restartDeploymentInstance"];
 let DeploymentReconciler: typeof import("./reconciler.js").DeploymentReconciler;
 let flushDeploymentOperatorAudit: typeof import("./operator-audit.js").flushDeploymentOperatorAudit;
 
@@ -346,6 +346,8 @@ integration("interactive operator steps at PostgreSQL", () => {
     production = createPrismaClient(databaseUrl);
     ({ DeploymentReconciler } = await import("./reconciler.js"));
     ({ flushDeploymentOperatorAudit } = await import("./operator-audit.js"));
+    ({ loadDeploymentState, reopenDeploymentOperatorStep, restartDeploymentInstance } =
+      await import("@ws-model-proxy/api/lib/deployment-service"));
   });
   afterAll(async () => {
     for (const reconciler of reconcilers) await reconciler.stop();
