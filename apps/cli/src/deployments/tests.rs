@@ -918,20 +918,23 @@ fn actual_total_deadline_covers_shell_status_readiness_and_admission() {
     let root = tempfile::tempdir().expect("root");
     let effect = root.path().join("effect");
     let runtime = NativeRuntime { cancel: None };
-    let budget = Deadline::new(Duration::from_millis(100));
+    // Wide margins: spawning a shell takes tens of milliseconds on loaded
+    // CI runners (macOS especially), so the first operation must fit easily
+    // and the second must clearly overrun what is left.
+    let budget = Deadline::new(Duration::from_millis(1500));
     runtime
-        .shell("sleep 0.06", budget.remaining().expect("budget"))
+        .shell("sleep 0.3", budget.remaining().expect("budget"))
         .expect("first operation");
     assert!(
         runtime
             .shell(
-                &format!("sleep 0.08; touch '{}'", effect.display()),
+                &format!("sleep 1.5; touch '{}'", effect.display()),
                 budget.remaining().expect("remaining")
             )
             .is_err()
     );
     assert!(budget.remaining().is_err());
-    std::thread::sleep(Duration::from_millis(100));
+    std::thread::sleep(Duration::from_millis(1500));
     assert!(!effect.exists(), "effect after total deadline");
     assert!(
         runtime
