@@ -411,8 +411,9 @@ export async function deploymentStartsInteractive(tx: Tx, instanceId: string) {
 }
 /**
  * Keep `needsOperator` in step with what the instance waits for:
- * - `STEP` while a step waits for its person (AWAITING_OPERATOR), or a person's run is past
- *   its timeout (it may hang on a prompt);
+ * - `STEP` while a step waits for its person (AWAITING_OPERATOR), a person's run is past
+ *   its timeout (it may hang on a prompt), or a step is held before its terminal can open
+ *   (`operatorHold`);
  * - otherwise `RESTART` ("stopped, needs you") while an instance meant to run, whose start is
  *   interactive, has stopped with no restart pending and restarts left;
  * - otherwise none.
@@ -438,6 +439,9 @@ export async function syncDeploymentOperatorNeed(tx: Tx, instanceId: string) {
       OR: [
         { state: "AWAITING_OPERATOR" },
         { state: "RUNNING", operatorSince: { not: null }, deadline: { lte: now } },
+        // Held before its terminal can open (the node's operator-terminal switch is off, or
+        // it has no room): the person must act on the node (security review L1).
+        { state: "PENDING", operatorHold: { not: null } },
       ],
     },
   });

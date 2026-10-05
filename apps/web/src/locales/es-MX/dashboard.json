@@ -2263,7 +2263,7 @@
     "badge_other": "{{count}} despliegues te necesitan",
     "noticeTitle_one": "Un despliegue te está esperando",
     "noticeTitle_other": "{{count}} despliegues te están esperando",
-    "noticeStep": "{{endpoint}} espera un comando que tú mismo ejecutas en una terminal del nodo.",
+    "noticeStep": "{{endpoint}} te necesita: ejecuta un comando en una terminal del nodo, o activa la terminal de operador del nodo.",
     "noticeRestart": "{{endpoint}} se detuvo y espera que lo reinicies.",
     "open": "Abrir despliegues",
     "tabLabel": "Paso de despliegue · {{cli}}",
@@ -2301,7 +2301,7 @@
       "heldCheck": "Una comprobación de estado de que el servicio anterior se detuvo.",
       "other": "Motivo: {{code}}"
     },
-    "needStep": "Te necesita: un paso espera que lo ejecutes en una terminal del nodo.",
+    "needStep": "Te necesita: ejecuta un paso en su terminal del nodo, o haz lo que indica su motivo abajo (por ejemplo, activar la terminal de operador del nodo).",
     "needRestart": "Detenido, te necesita: su inicio se ejecuta en una terminal, así que nunca se reinicia automáticamente.",
     "stepsLabel": "Pasos que ejecutas tú",
     "stepTitle": "{{action}} · rango {{rank}} · nodo {{node}}",
@@ -2321,6 +2321,11 @@
       "not_head": "Solo el nodo principal lo ejecuta.",
       "after_join_replaces_start": "El nodo principal ejecuta afterJoin en lugar de start.",
       "no_command": "La receta no define ese comando."
+    },
+    "author": {
+      "user": "Lo escribiste tú.",
+      "agent": "Lo escribió un agente. Léelo antes de ejecutarlo.",
+      "unknown": "Aquí no se sabe quién lo escribió. Léelo antes de ejecutarlo."
     }
   }
 }

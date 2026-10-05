@@ -2259,7 +2259,7 @@
     "badge_other": "{{count}} deployments need you",
     "noticeTitle_one": "A deployment is waiting for you",
     "noticeTitle_other": "{{count}} deployments are waiting for you",
-    "noticeStep": "{{endpoint}} waits for a command you run yourself in a terminal on the node.",
+    "noticeStep": "{{endpoint}} needs you: run a command in a terminal on the node, or turn on the node's operator terminal.",
     "noticeRestart": "{{endpoint}} stopped and waits for you to restart it.",
     "open": "Open deployments",
     "tabLabel": "Deployment step · {{cli}}",
@@ -2297,7 +2297,7 @@
       "heldCheck": "A status check that the earlier service stopped.",
       "other": "Reason: {{code}}"
     },
-    "needStep": "Needs you: a step waits for you to run it in a terminal on the node.",
+    "needStep": "Needs you: run a step in its terminal on the node, or do what its reason below says (for example, turn on the node's operator terminal).",
     "needRestart": "Stopped, needs you: its start runs in a terminal, so it is never restarted automatically.",
     "stepsLabel": "Steps you run",
     "stepTitle": "{{action}} · rank {{rank}} · node {{node}}",
@@ -2317,6 +2317,11 @@
       "not_head": "Only the head node runs it.",
       "after_join_replaces_start": "The head runs afterJoin instead of start.",
       "no_command": "The recipe does not define that command."
+    },
+    "author": {
+      "user": "Written by you.",
+      "agent": "Written by an agent. Read it before you run it.",
+      "unknown": "Who wrote it is not known here. Read it before you run it."
     }
   }
 }

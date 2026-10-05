@@ -880,6 +880,10 @@ BEGIN
         AND NEW."operatorTerminalId" IS NOT DISTINCT FROM OLD."operatorTerminalId" THEN
         NEW."operatorTerminalId" := NULL;
       END IF;
+      -- A hold reason exists only while the step waits to be dispatched (PENDING).
+      IF NEW.state <> 'PENDING' AND NEW."operatorHold" IS NOT DISTINCT FROM OLD."operatorHold" THEN
+        NEW."operatorHold" := NULL;
+      END IF;
       IF NEW.state = 'PENDING' THEN
         IF NEW."operatorSince" IS NOT DISTINCT FROM OLD."operatorSince" THEN
           NEW."operatorSince" := NULL;
@@ -1005,6 +1009,15 @@ ALTER TABLE deployment_step ADD CONSTRAINT deployment_step_operator_shape CHECK 
     -- IS TRUE: a missing key yields NULL, which a CHECK would accept.
     OR (intent -> 'interactive' = 'true'::jsonb
       AND intent ->> 'action' IN ('prepare', 'start', 'after_join', 'stop')) IS TRUE));
+-- Why a PENDING interactive step cannot open its terminal yet; PENDING only.
+ALTER TABLE deployment_step DROP CONSTRAINT IF EXISTS deployment_step_operator_hold;
+ALTER TABLE deployment_step ADD CONSTRAINT deployment_step_operator_hold CHECK (
+  "operatorHold" IS NULL
+  OR (state = 'PENDING' AND "operatorHold" IN
+    ('operator_capability_missing', 'operator_session_full', 'operator_node_full')));
+ALTER TABLE deployment_instance DROP CONSTRAINT IF EXISTS deployment_instance_notify_failures;
+ALTER TABLE deployment_instance ADD CONSTRAINT deployment_instance_notify_failures
+  CHECK ("needsOperatorNotifyFailures" BETWEEN 0 AND 1000);
 -- needsOperator and its timestamp travel together; RESTART ("stopped, needs you") only
 -- for an instance that should run but has stopped. The trigger clears a carried-over
 -- RESTART; an explicit contradictory write fails here.

@@ -24,6 +24,8 @@ const row = {
   endpointSlug: "inst-qwen",
   needsOperator: "STEP",
   needsOperatorSince: new Date(now.getTime() - 10 * 60_000),
+  needsOperatorNotifyFailures: 0,
+  updatedAt: new Date(now.getTime() - 60 * 60_000),
   User: { email: "owner@example.com", locale: "es-MX" },
 };
 
@@ -52,8 +54,14 @@ describe("needs-you email notices", () => {
     });
     expect(query.where.User).toMatchObject({ emailVerified: true, deletionRequestedAt: null });
     expect(db.deploymentInstance.updateMany.mock.calls[0]?.[0]).toMatchObject({
-      where: { id: "instance", needsOperator: "STEP", needsOperatorSince: row.needsOperatorSince },
-      data: { needsOperatorNotifiedAt: now },
+      where: {
+        id: "instance",
+        // Claimed only while unchanged, and its updatedAt is kept (not bumped).
+        updatedAt: row.updatedAt,
+        needsOperator: "STEP",
+        needsOperatorSince: row.needsOperatorSince,
+      },
+      data: { needsOperatorNotifiedAt: now, updatedAt: row.updatedAt },
     });
     expect(send).toHaveBeenCalledWith(
       expect.objectContaining({ to: "owner@example.com", subject: "Un despliegue te necesita" }),
@@ -88,21 +96,40 @@ describe("needs-you email notices", () => {
     warn.mockRestore();
   });
 
-  it("moves a failed send's claim back so the notice is retried soon, not in 6 hours", async () => {
-    const db = fakeDb([row]);
+  it("retries a failed send once soon, then falls back to the regular interval", async () => {
     const send = vi.fn().mockRejectedValue(new Error("smtp down"));
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    await notifyDeploymentOperatorNeeds({ db: db as never, now, send, configured: true });
-    warn.mockRestore();
-    expect(db.deploymentInstance.updateMany).toHaveBeenCalledTimes(2);
-    expect(db.deploymentInstance.updateMany.mock.calls[1]?.[0]).toEqual({
-      // Only this run's own claim.
-      where: { id: "instance", needsOperatorNotifiedAt: now },
+    const ours = { id: "instance", updatedAt: row.updatedAt, needsOperatorNotifiedAt: now };
+    // First failure: the claim moves back to the retry time, counted.
+    const first = fakeDb([row]);
+    await notifyDeploymentOperatorNeeds({ db: first as never, now, send, configured: true });
+    expect(first.deploymentInstance.updateMany.mock.calls[1]?.[0]).toEqual({
+      where: ours,
       data: {
         needsOperatorNotifiedAt: new Date(
           now.getTime() - DEPLOYMENT_NEED_EMAIL_INTERVAL_MS + DEPLOYMENT_NEED_EMAIL_RETRY_MS,
         ),
+        needsOperatorNotifyFailures: 1,
+        updatedAt: row.updatedAt,
       },
+    });
+    // The retry fails too: the claim stays (6 h), so no mail every 10 minutes.
+    const second = fakeDb([{ ...row, needsOperatorNotifyFailures: 1 }]);
+    await notifyDeploymentOperatorNeeds({ db: second as never, now, send, configured: true });
+    expect(second.deploymentInstance.updateMany.mock.calls[1]?.[0]).toEqual({
+      where: ours,
+      data: { needsOperatorNotifyFailures: 0, updatedAt: row.updatedAt },
+    });
+    warn.mockRestore();
+    // A successful retry resets the count for the next notice.
+    const third = fakeDb([{ ...row, needsOperatorNotifyFailures: 1 }]);
+    const ok = vi.fn().mockResolvedValue(undefined);
+    expect(
+      await notifyDeploymentOperatorNeeds({ db: third as never, now, send: ok, configured: true }),
+    ).toBe(1);
+    expect(third.deploymentInstance.updateMany.mock.calls[1]?.[0]).toEqual({
+      where: ours,
+      data: { needsOperatorNotifyFailures: 0, updatedAt: row.updatedAt },
     });
   });
 

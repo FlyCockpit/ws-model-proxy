@@ -1,4 +1,5 @@
 import { ORPCError } from "@orpc/server";
+import type { DeploymentCommandAuthor } from "@ws-model-proxy/config/deployment-protocol";
 import prisma from "@ws-model-proxy/db";
 import { z } from "zod";
 import type { Context } from "../context";
@@ -9,6 +10,7 @@ import {
   applyDeploymentPlan,
   createDeploymentPlan,
   type DeploymentRequester,
+  deploymentOperatorCommandAuthor,
   deploymentPlanContentsSchema,
   deploymentStartInputSchema,
   liveDeploymentInstanceWhere,
@@ -89,6 +91,7 @@ const operatorStepWhere = {
     { state: "AWAITING_OPERATOR" as const },
     { state: "RUNNING" as const, operatorSince: { not: null } },
     { state: "PENDING" as const, errorCode: { startsWith: "operator_" } },
+    { state: "PENDING" as const, operatorHold: { not: null } },
     // Any pending interactive step: an automatic stop held for a node that lost the
     // capability keeps its gang-stop reason (node_offline, startup_failed, ...) instead of a
     // hold code, and must still show as one a person will run (review L1).
@@ -113,6 +116,7 @@ type OperatorStepRow = {
   operatorSince: Date | null;
   operatorAcceptedAt: Date | null;
   operatorLastExit: number | null;
+  operatorHold: string | null;
   deadline: Date | null;
 };
 const intentCommand = z.object({ action: z.string(), command: z.string() });
@@ -121,7 +125,7 @@ const intentCommand = z.object({ action: z.string(), command: z.string() });
  * these too and can never attach); `terminalOpen` says whether the person answers it in its
  * terminal (else a closed waiting step is reopened from the dashboard).
  */
-function operatorStepView(step: OperatorStepRow) {
+function operatorStepView(step: OperatorStepRow, author: DeploymentCommandAuthor = "unknown") {
   const intent = intentCommand.safeParse(step.intent);
   return {
     stepId: step.id,
@@ -143,7 +147,54 @@ function operatorStepView(step: OperatorStepRow) {
     terminalOpen: step.operatorTerminalId !== null,
     lastExit: step.operatorLastExit,
     errorCode: step.errorCode,
+    /** Why the step cannot open its terminal yet; the person acts on the node. */
+    hold: step.operatorHold,
+    /**
+     * Who wrote the command, by the same rule as the node's confirm screen: `agent` when any
+     * agent revision of the recipe holds that text, `user` only when a person demonstrably
+     * wrote it, `unknown` otherwise.
+     */
+    author,
   };
+}
+/**
+ * Operator step views with each command's author (security review L2). The authorship scan
+ * is memoized per recipe revision, variant, rank and action within one call.
+ */
+async function operatorStepViews(
+  instance: { revisionId: string; variantKey: string },
+  steps: readonly OperatorStepRow[],
+  memo: Map<string, Promise<DeploymentCommandAuthor>>,
+) {
+  return Promise.all(
+    steps.map(async (step) => {
+      const intent = intentCommand.safeParse(step.intent);
+      const action = intent.success ? intent.data.action : step.phase;
+      const key = `${instance.revisionId}\u0000${instance.variantKey}\u0000${step.rank}\u0000${action}`;
+      let author = memo.get(key);
+      if (!author) {
+        author = isDeploymentJobAction(action)
+          ? deploymentOperatorCommandAuthor(prisma, instance, { rank: step.rank, action }).catch(
+              () => "unknown" as const,
+            )
+          : Promise.resolve("unknown" as const);
+        memo.set(key, author);
+      }
+      return operatorStepView(step, await author);
+    }),
+  );
+}
+const DEPLOYMENT_JOB_ACTIONS = [
+  "prepare",
+  "start",
+  "after_join",
+  "readiness",
+  "health",
+  "stop",
+  "status",
+] as const;
+function isDeploymentJobAction(action: string): action is (typeof DEPLOYMENT_JOB_ACTIONS)[number] {
+  return (DEPLOYMENT_JOB_ACTIONS as readonly string[]).includes(action);
 }
 /** A step row without its operator terminal id (see {@link operatorStepView}). */
 function publicStep<T extends { operatorTerminalId: string | null }>(step: T) {
@@ -405,12 +456,15 @@ export const deploymentsRouter = {
       }),
       input.limit,
     );
+    const memo = new Map<string, Promise<DeploymentCommandAuthor>>();
     return {
       ...page,
-      items: page.items.map(({ Steps, ...instance }) => ({
-        ...instance,
-        operatorSteps: Steps.map(operatorStepView),
-      })),
+      items: await Promise.all(
+        page.items.map(async ({ Steps, ...instance }) => ({
+          ...instance,
+          operatorSteps: await operatorStepViews(instance, Steps, memo),
+        })),
+      ),
     };
   }),
   /**
@@ -454,7 +508,7 @@ export const deploymentsRouter = {
     return {
       ...instance,
       Steps: instance.Steps.map(publicStep),
-      operatorSteps: operatorSteps.map(operatorStepView),
+      operatorSteps: await operatorStepViews(instance, operatorSteps, new Map()),
       stepsTruncated: instance._count.Steps > instance.Steps.length,
     };
   }),

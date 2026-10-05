@@ -17,9 +17,15 @@ type SendEmail = (message: { to: string; subject: string; html: string }) => Pro
  * `needsOperatorNotifiedAt`, so one replica sends it, at most once per need and per
  * {@link DEPLOYMENT_NEED_EMAIL_INTERVAL_MS}, and only after the need lasted
  * {@link DEPLOYMENT_NEED_EMAIL_DELAY_MS}. Best effort: a failed send is logged by error class
- * only (transport errors can carry addresses) and its claim is moved back so the notice is due
- * again after {@link DEPLOYMENT_NEED_EMAIL_RETRY_MS}. Inactive owners and unverified
- * addresses get nothing. Returns how many notices were sent.
+ * only (transport errors can carry addresses). The first failure of a notice moves its claim
+ * back so it is due again after {@link DEPLOYMENT_NEED_EMAIL_RETRY_MS}; a second keeps the
+ * claim (the regular interval), so a send the server accepted but reported as failed repeats
+ * at most once. Inactive owners and unverified addresses get nothing. Returns how many notices
+ * were sent.
+ *
+ * Every write keeps the instance's `updatedAt` (written back explicitly, guarded by it): the
+ * notice bookkeeping must not reset the reconciler's offline grace or maintenance order, and a
+ * row changed meanwhile is simply claimed on a later sweep.
  */
 export async function notifyDeploymentOperatorNeeds({
   db,
@@ -63,6 +69,8 @@ export async function notifyDeploymentOperatorNeeds({
       endpointSlug: true,
       needsOperator: true,
       needsOperatorSince: true,
+      needsOperatorNotifyFailures: true,
+      updatedAt: true,
       User: { select: { email: true, locale: true } },
     },
     orderBy: { needsOperatorSince: "asc" },
@@ -72,16 +80,18 @@ export async function notifyDeploymentOperatorNeeds({
   for (const instance of due) {
     if (shouldStop()) break;
     if (!instance.needsOperator || !instance.needsOperatorSince) continue;
+    const unchanged = { id: instance.id, updatedAt: instance.updatedAt };
     const claimed = await db.deploymentInstance.updateMany({
       where: {
-        id: instance.id,
+        ...unchanged,
         needsOperator: instance.needsOperator,
         needsOperatorSince: instance.needsOperatorSince,
         OR: [{ needsOperatorNotifiedAt: null }, { needsOperatorNotifiedAt: { lt: quietSince } }],
       },
-      data: { needsOperatorNotifiedAt: now },
+      data: { needsOperatorNotifiedAt: now, updatedAt: instance.updatedAt },
     });
     if (!claimed.count) continue;
+    const ours = { ...unchanged, needsOperatorNotifiedAt: now };
     try {
       const locale = mailer.resolveMailerLocale(instance.User.locale);
       const { subject, html } = mailer.renderDeploymentNeedsYou({
@@ -92,22 +102,38 @@ export async function notifyDeploymentOperatorNeeds({
       });
       await deliver({ to: instance.User.email, subject, html });
       sent += 1;
+      if (instance.needsOperatorNotifyFailures > 0)
+        await db.deploymentInstance
+          .updateMany({
+            where: ours,
+            data: { needsOperatorNotifyFailures: 0, updatedAt: instance.updatedAt },
+          })
+          .catch(() => {
+            console.warn("[deployments] needs-you failure reset failed");
+          });
     } catch (error) {
       const label = error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error;
       console.warn(`[deployments] needs-you email failed: ${label}`);
-      // Not lost for the whole interval: this claim is moved back so the notice becomes due
-      // again after DEPLOYMENT_NEED_EMAIL_RETRY_MS (guarded: only this run's own claim).
+      // The first failure is retried soon (the claim moves back); a repeated one keeps the
+      // claim, so an accepted-but-reported-failed send cannot repeat every few minutes.
+      const retry = instance.needsOperatorNotifyFailures === 0;
       await db.deploymentInstance
         .updateMany({
-          where: { id: instance.id, needsOperatorNotifiedAt: now },
-          data: {
-            needsOperatorNotifiedAt: new Date(
-              now.getTime() - DEPLOYMENT_NEED_EMAIL_INTERVAL_MS + DEPLOYMENT_NEED_EMAIL_RETRY_MS,
-            ),
-          },
+          where: ours,
+          data: retry
+            ? {
+                needsOperatorNotifiedAt: new Date(
+                  now.getTime() -
+                    DEPLOYMENT_NEED_EMAIL_INTERVAL_MS +
+                    DEPLOYMENT_NEED_EMAIL_RETRY_MS,
+                ),
+                needsOperatorNotifyFailures: 1,
+                updatedAt: instance.updatedAt,
+              }
+            : { needsOperatorNotifyFailures: 0, updatedAt: instance.updatedAt },
         })
         .catch(() => {
-          console.warn("[deployments] needs-you retry release failed");
+          console.warn("[deployments] needs-you retry bookkeeping failed");
         });
     }
   }

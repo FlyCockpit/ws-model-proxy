@@ -1958,13 +1958,28 @@ integration("interactive operator steps at PostgreSQL", () => {
       where: { id: s.instance.id },
       data: { desiredState: "RUNNING", observedState: "STOPPED" },
     });
-    const h = harness([{ ...socketFor(user.id, device.id), deploymentOperator: false }]);
+    const socket = socketFor(user.id, device.id);
+    const h = harness([{ ...socket, deploymentOperator: false }]);
     const probe = async () =>
       fixture.deploymentStep.findFirst({
         where: { instanceId: s.instance.id, phase: "stop", sequence: { gte: 5000 } },
       });
     await h.tickUntil(async () => (await probe())?.errorCode === "operator_capability_missing");
-    expect(await probe()).toMatchObject({ state: "PENDING" });
+    expect(await probe()).toMatchObject({
+      state: "PENDING",
+      operatorHold: "operator_capability_missing",
+    });
+    // The held check needs its person first (turn on the node's operator terminal): STEP, not
+    // RESTART (security review L1), so a restart is refused.
+    expect(await need(s.instance.id)).toBe("STEP");
+    await expect(
+      restartDeploymentInstance(user.id, s.instance.id, production),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(h.jobs).toEqual([]);
+    // The node can open terminals: the check goes, the need is RESTART again, and a restart
+    // still waits for the check instead of clearing the need.
+    h.live.set(device.id, socket);
+    await h.tickUntil(() => h.jobs.length > 0);
     expect(await need(s.instance.id)).toBe("RESTART");
     await expect(
       restartDeploymentInstance(user.id, s.instance.id, production),
@@ -1973,7 +1988,6 @@ integration("interactive operator steps at PostgreSQL", () => {
       needsOperator: "RESTART",
       nextRestartAt: null,
     });
-    expect(h.jobs).toEqual([]);
   }, 30_000);
 
   it("deleting the device clears its held-unknown resources", async () => {
@@ -2069,7 +2083,10 @@ integration("interactive operator steps at PostgreSQL", () => {
       sent.push(message);
     };
     const notify = () => notifyDeploymentOperatorNeeds({ db: production, send, configured: true });
+    const before = (await inst(s.instance.id)).updatedAt;
     await notify();
+    // The claim keeps updatedAt: the offline grace and maintenance order are not reset.
+    expect((await inst(s.instance.id)).updatedAt).toEqual(before);
     const mine = () => sent.filter((message) => message.to === user.email);
     expect(mine()).toHaveLength(1);
     expect(mine()[0]?.subject).toBe("Un despliegue te necesita");
@@ -2089,5 +2106,33 @@ integration("interactive operator steps at PostgreSQL", () => {
     await fixture.user.update({ where: { id: user.id }, data: { banned: true } });
     await notify();
     expect(mine()).toHaveLength(1);
+  }, 30_000);
+
+  // ---- Security review L1: a step held before its terminal can open needs its person ----
+
+  it("an automatic stop held for a node without the capability raises needs-you and keeps its reason", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id], { stopInteractive: true, stopping: true });
+    const stopId = s.stops[0]!.id;
+    await fixture.deploymentStep.update({
+      where: { id: stopId },
+      data: { errorCode: "node_offline" },
+    });
+    const socket = socketFor(user.id, device.id);
+    const h = harness([{ ...socket, deploymentOperator: false }]);
+    await h.tickUntil(async () => (await need(s.instance.id)) === "STEP");
+    expect(await step(stopId)).toMatchObject({
+      state: "PENDING",
+      operatorHold: "operator_capability_missing",
+      // The gang-stop reason stays.
+      errorCode: "node_offline",
+    });
+    expect(h.jobs).toEqual([]);
+    // The node can open terminals again: the claim clears the hold, and the need follows.
+    h.live.set(device.id, socket);
+    await h.tickUntil(() => h.jobs.some((job) => job.stepId === stopId));
+    expect(await step(stopId)).toMatchObject({ state: "RUNNING", operatorHold: null });
+    expect(await need(s.instance.id)).toBeNull();
   }, 30_000);
 });

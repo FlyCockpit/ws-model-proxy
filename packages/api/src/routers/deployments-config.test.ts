@@ -208,6 +208,63 @@ describe("interactive recipe commands", () => {
   });
 });
 
+describe("operator step authorship and holds", () => {
+  it("shows who wrote each waiting command and why a step is held", async () => {
+    const agentSpec = {
+      variants: [
+        {
+          ...spec.variants[0],
+          commands: [{ management: "ownedProcess", start: "sudo start", stop: "sudo stop" }],
+        },
+      ],
+    };
+    db.deploymentInstance.findMany.mockResolvedValue([
+      {
+        id: "instance",
+        revisionId: "rev-2",
+        variantKey: "one",
+        needsOperator: "STEP",
+        Nodes: [],
+        Steps: [
+          {
+            id: "held",
+            cliDeviceId: "node",
+            rank: 0,
+            phase: "stop",
+            sequence: 100,
+            state: "PENDING",
+            intent: { action: "stop", command: "sudo stop" },
+            errorCode: "node_offline",
+            operatorTerminalId: null,
+            operatorSince: null,
+            operatorAcceptedAt: null,
+            operatorLastExit: null,
+            operatorHold: "operator_capability_missing",
+            deadline: null,
+          },
+        ],
+      },
+    ]);
+    db.deploymentConfigRevision.findUnique.mockResolvedValue({
+      configId: "config",
+      revision: 2,
+      spec: agentSpec,
+    });
+    // An agent's revision holds the same stop text: the command counts as the agent's.
+    db.deploymentConfigRevision.findMany.mockResolvedValue([
+      { revision: 2, editorKind: "USER", spec: agentSpec },
+      { revision: 1, editorKind: "AGENT", spec: agentSpec },
+    ]);
+    const page = await client().listInstances({ limit: 10 });
+    expect(page.items[0]?.operatorSteps[0]).toMatchObject({
+      stepId: "held",
+      hold: "operator_capability_missing",
+      errorCode: "node_offline",
+      author: "agent",
+    });
+  });
+});
+
 describe("the needs-you feed", () => {
   it("counts and lists only this owner's waiting deployments", async () => {
     db.deploymentInstance.count.mockResolvedValue(3);

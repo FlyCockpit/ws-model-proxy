@@ -486,6 +486,47 @@ describe("managed inference dashboard", () => {
     );
   });
 
+  it("says who wrote a waiting command, and what a held step needs from the person", async () => {
+    state.data.instances = {
+      items: [
+        {
+          id: "held",
+          endpointSlug: "group-h",
+          observedState: "STOPPING",
+          desiredState: "STOPPED",
+          agentsMayPreempt: false,
+          needsOperator: "STEP",
+          Nodes: [],
+          operatorSteps: [
+            {
+              stepId: "stop",
+              nodeId: "node-a",
+              rank: 0,
+              action: "stop",
+              command: "sudo stop",
+              state: "PENDING",
+              heldResourceCheck: false,
+              since: null,
+              acceptedAt: null,
+              overdue: false,
+              terminalOpen: false,
+              lastExit: null,
+              // The gang-stop reason stays in errorCode; the hold says what to do.
+              errorCode: "node_offline",
+              hold: "operator_capability_missing",
+              author: "agent",
+            },
+          ],
+        },
+      ],
+      nextCursor: null,
+    };
+    show();
+    expect(await screen.findByText("deploymentOperator.author.agent")).toBeTruthy();
+    expect(screen.getByText("deploymentOperator.reasons.capabilityMissing")).toBeTruthy();
+    expect(screen.queryByText("deploymentOperator.reasons.other")).toBeNull();
+  });
+
   it("explains a restart that must wait for an earlier stop", async () => {
     state.errors.restart = Object.assign(new Error("waiting"), {
       code: "CONFLICT",

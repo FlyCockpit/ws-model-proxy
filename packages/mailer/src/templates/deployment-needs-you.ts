@@ -46,7 +46,8 @@ export function renderDeploymentNeedsYou(args: RenderDeploymentNeedsYouArgs): {
   const bundle = BUNDLES[locale] ?? BUNDLES["en-US"];
   const body = pick(bundle, args.need === "step" ? "stepBody" : "restartBody").replace(
     /\{\{\s*endpoint\s*\}\}/g,
-    `<strong>${escapeHtml(args.endpoint)}</strong>`,
+    // A replacer function: `$&`, `$'` and the like in the value are never expanded.
+    () => `<strong>${escapeHtml(args.endpoint)}</strong>`,
   );
   const href = safeHref(args.deploymentsUrl);
   const html = `<!DOCTYPE html>

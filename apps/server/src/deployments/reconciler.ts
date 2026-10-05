@@ -713,19 +713,23 @@ export class DeploymentReconciler {
   }
   /** Record (once) why a PENDING interactive step is held; see {@link OPERATOR_HOLD}. */
   private async recordOperatorHold(tx: Tx, step: StepRow, reason: string) {
-    if (step.errorCode === reason) return;
+    // The hold itself (`operatorHold`) is always recorded: the step needs its person, and the
+    // instance raises `needsOperator` (badge, notice, email; security review L1), also for a
+    // stop whose `errorCode` keeps its gang-stop reason.
+    const holdChanged = step.operatorHold !== reason;
     // A held-unknown status check's marker gives way too, so its wait has a reason (review
     // L1); the probe stays identifiable by its sequence.
-    if (
-      step.errorCode !== null &&
-      step.errorCode !== HELD_UNKNOWN_PROBE &&
-      !OPERATOR_HOLD_CODES.includes(step.errorCode)
-    )
-      return;
+    const codeChanges =
+      step.errorCode !== reason &&
+      (step.errorCode === null ||
+        step.errorCode === HELD_UNKNOWN_PROBE ||
+        OPERATOR_HOLD_CODES.includes(step.errorCode));
+    if (!holdChanged && !codeChanges) return;
     await tx.deploymentStep.updateMany({
       where: { id: step.id, state: "PENDING" },
-      data: { errorCode: reason },
+      data: { operatorHold: reason, ...(codeChanges ? { errorCode: reason } : {}) },
     });
+    if (holdChanged) await this.syncNeedsOperator(tx, step.instanceId);
   }
   /**
    * A person's command runs in an operator terminal for this instance on this node, in the
@@ -1362,6 +1366,8 @@ export class DeploymentReconciler {
           },
         });
         if (!claimed.count) return null;
+        // The claim cleared the hold (schema-hardening.sql): the need follows.
+        if (step.operatorHold !== null) await this.syncNeedsOperator(tx, instance.id);
         if (step.phase === "stop") {
           await tx.poolMember.updateMany({
             where: memberWhere(instance.id),

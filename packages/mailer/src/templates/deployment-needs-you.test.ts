@@ -46,4 +46,14 @@ describe("renderDeploymentNeedsYou", () => {
       }),
     ).toThrow();
   });
+
+  it("never expands replacement patterns in the endpoint", () => {
+    const { html } = renderDeploymentNeedsYou({
+      ...base,
+      endpoint: "a$&b$'c",
+      need: "step",
+      locale: "en-US",
+    });
+    expect(html).toContain("<strong>a$&amp;b$&#39;c</strong>");
+  });
 });

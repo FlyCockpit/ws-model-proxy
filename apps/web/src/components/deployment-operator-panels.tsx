@@ -31,6 +31,15 @@ const STEP_REASON_KEYS: Record<string, string> = {
   held_unknown_probe: "deploymentOperator.reasons.heldCheck",
 };
 
+/** A hold (what the person must do on the node) or error code, in the person's words. */
+function stepReasonText(
+  code: string,
+  t: (key: string, options?: Record<string, unknown>) => string,
+): string {
+  const key = STEP_REASON_KEYS[code];
+  return key ? t(key) : t("deploymentOperator.reasons.other", { code });
+}
+
 function useLang() {
   const params = useParams({ strict: false });
   return isSupportedLocale(params.lang) ? params.lang : DEFAULT_LOCALE;
@@ -105,11 +114,21 @@ export function InstanceOperatorPanel({ instance }: { instance: Instance }) {
                   {escapeForDisplay(step.command)}
                 </pre>
               ) : null}
-              {step.errorCode ? (
+              {step.command ? (
+                <p
+                  className={cn(
+                    "break-words",
+                    step.author === "agent"
+                      ? "font-medium text-amber-700 dark:text-amber-300"
+                      : "text-muted-foreground",
+                  )}
+                >
+                  {t(`deploymentOperator.author.${step.author}`)}
+                </p>
+              ) : null}
+              {(step.hold ?? step.errorCode) ? (
                 <p className="break-words text-muted-foreground">
-                  {STEP_REASON_KEYS[step.errorCode]
-                    ? t(STEP_REASON_KEYS[step.errorCode] ?? "")
-                    : t("deploymentOperator.reasons.other", { code: step.errorCode })}
+                  {stepReasonText(step.hold ?? step.errorCode ?? "", t)}
                 </p>
               ) : null}
               {step.lastExit !== null ? (
