@@ -2,6 +2,16 @@ import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { deploymentSpecSchema, isHiddenCodePoint } from "@ws-model-proxy/api/lib/deployment-spec";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@ws-model-proxy/ui/components/alert-dialog";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
@@ -590,7 +600,12 @@ function PlanPreview({ planId, onApplied }: { planId: string; onApplied: () => v
     orpc.deployments.confirmPlan.mutationOptions({ onSuccess: onApplied }),
   );
   const [accepted, setAccepted] = useState(false);
+  const [confirmStops, setConfirmStops] = useState(false);
   const ready = !!plan.data && parsed.success;
+  // Starting here would stop deployments that are running now: the person
+  // confirms that explicitly, naming each one, single- or multi-node alike.
+  const stopsRunning =
+    parsed.success && parsed.data.action === "start" && parsed.data.stopIds.length > 0;
   const variant = plan.data?.preview.start;
   const commandsReady =
     ready &&
@@ -654,10 +669,48 @@ function PlanPreview({ planId, onApplied }: { planId: string; onApplied: () => v
         disabled={
           !commandsReady || !accepted || confirm.isPending || plan.data?.state === "APPLIED"
         }
-        onClick={() => confirm.mutate({ planId })}
+        onClick={() => (stopsRunning ? setConfirmStops(true) : confirm.mutate({ planId }))}
       >
         {t("deployments.confirm")}
       </Button>
+      <AlertDialog open={confirmStops} onOpenChange={setConfirmStops}>
+        <AlertDialogContent className="max-w-[calc(100%-2rem)]! sm:max-w-md! data-[size=default]:max-w-[calc(100%-2rem)]! data-[size=default]:sm:max-w-md! data-[size=sm]:max-w-[calc(100%-2rem)]! data-[size=sm]:sm:max-w-md!">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="min-w-0 break-words">
+              {t("deployments.preemptTitle", { count: plan.data?.preview.stopped.length ?? 0 })}
+            </AlertDialogTitle>
+            <AlertDialogDescription className="min-w-0 max-w-full break-words">
+              {t("deployments.preemptBody")}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <ul className="min-w-0 space-y-1 text-sm" data-testid="preempted-deployments">
+            {plan.data?.preview.stopped.map((instance) => (
+              <li key={instance.id} className="min-w-0 break-all font-mono">
+                {instance.endpointSlug}
+                <span className="ml-2 font-sans text-muted-foreground">
+                  {t("deployments.preemptNodes", { count: instance.nodes.length })}
+                </span>
+              </li>
+            ))}
+          </ul>
+          <AlertDialogFooter className="sm:flex-wrap">
+            <AlertDialogCancel className="min-h-[44px] w-full sm:w-auto">
+              {t("deployments.preemptCancel", { count: plan.data?.preview.stopped.length ?? 0 })}
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="min-h-[44px] w-full sm:w-auto"
+              variant="destructive"
+              disabled={confirm.isPending}
+              onClick={() => {
+                setConfirmStops(false);
+                confirm.mutate({ planId });
+              }}
+            >
+              {t("deployments.preemptConfirm")}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
       {plan.isError || confirm.isError ? (
         <p role="alert">{friendly(plan.error ?? confirm.error, t("deployments.failed"))}</p>
       ) : null}

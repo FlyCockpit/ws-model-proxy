@@ -12,6 +12,14 @@
     "ariaLabel": "What does this mean?"
   },
   "deployments": {
+    "preemptCancel_other": "Keep them running",
+    "preemptCancel_one": "Keep it running",
+    "preemptConfirm": "Stop and start",
+    "preemptNodes_other": "{{count}} nodes",
+    "preemptNodes_one": "{{count}} node",
+    "preemptBody": "Starting this needs the hardware these deployments use. They stop first, on every node they run on. New requests go to other members or wait; requests already running get about a minute to finish.",
+    "preemptTitle_other": "Stop {{count}} running models?",
+    "preemptTitle_one": "Stop {{count}} running model?",
     "agentEditedRevision": "An agent last edited this recipe. Read every command below before you confirm: once confirmed, the job runs as yours.",
     "states": {
       "PENDING": "Pending",

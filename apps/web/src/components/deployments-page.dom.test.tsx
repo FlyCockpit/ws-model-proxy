@@ -233,6 +233,116 @@ describe("managed inference dashboard", () => {
     expect(commands.textContent).not.toMatch(/[\u202a-\u202e\u2066-\u2069]/);
   });
 
+  it("asks in an alert dialog before a start stops running deployments, naming each one", async () => {
+    state.data.pending = { items: [{ id: "plan-3" }], nextCursor: null };
+    state.data.plan = {
+      id: "plan-3",
+      state: "AWAITING_CONFIRMATION",
+      contents: {
+        action: "start",
+        stopIds: ["running-1"],
+        affectedNodeIds: ["node-a", "node-b"],
+        start: { revisionId: "rev", variantKey: "one" },
+      },
+      preview: {
+        start: { commands: [{ start: "serve-new", stop: "stop-new" }] },
+        agentEdited: false,
+        stopped: [
+          {
+            id: "running-1",
+            endpointSlug: "inst-old-model",
+            nodes: [{ rank: 0 }, { rank: 1 }],
+            variant: { commands: [{ stop: "stop-old" }] },
+          },
+        ],
+      },
+    };
+    const user = userEvent.setup();
+    show();
+    await user.click(await screen.findByRole("button", { name: /deployments.reviewPlan.*plan-3/ }));
+    await user.click(await screen.findByLabelText("deployments.confirmHint"));
+    await user.click(screen.getByRole("button", { name: "deployments.confirm" }));
+    // The plan is not applied until the person confirms the stop.
+    expect(state.calls.some((call) => call.name === "confirm")).toBe(false);
+    const dialog = await screen.findByRole("alertdialog");
+    expect(within(dialog).getByText("inst-old-model")).toBeTruthy();
+    await user.click(within(dialog).getByRole("button", { name: "deployments.preemptConfirm" }));
+    await waitFor(() =>
+      expect(state.calls).toContainEqual({ name: "confirm", input: { planId: "plan-3" } }),
+    );
+  });
+
+  it("leaves a stopping start unapplied when the dialog is cancelled, and lists every stopped deployment", async () => {
+    state.data.pending = { items: [{ id: "plan-4" }], nextCursor: null };
+    state.data.plan = {
+      id: "plan-4",
+      state: "AWAITING_CONFIRMATION",
+      contents: {
+        action: "start",
+        stopIds: ["old-1", "old-2"],
+        affectedNodeIds: ["node-a"],
+        start: { revisionId: "rev", variantKey: "one" },
+      },
+      preview: {
+        start: { commands: [{ start: "serve-new", stop: "stop-new" }] },
+        agentEdited: false,
+        stopped: [
+          {
+            id: "old-1",
+            endpointSlug: "inst-first",
+            nodes: [{ rank: 0 }],
+            variant: { commands: [] },
+          },
+          {
+            id: "old-2",
+            endpointSlug: "inst-second",
+            nodes: [{ rank: 0 }],
+            variant: { commands: [] },
+          },
+        ],
+      },
+    };
+    const user = userEvent.setup();
+    show();
+    await user.click(await screen.findByRole("button", { name: /deployments.reviewPlan.*plan-4/ }));
+    await user.click(await screen.findByLabelText("deployments.confirmHint"));
+    await user.click(screen.getByRole("button", { name: "deployments.confirm" }));
+    const dialog = await screen.findByRole("alertdialog");
+    expect(within(dialog).getByText("inst-first")).toBeTruthy();
+    expect(within(dialog).getByText("inst-second")).toBeTruthy();
+    await user.click(within(dialog).getByRole("button", { name: "deployments.preemptCancel" }));
+    await waitFor(() => expect(screen.queryByRole("alertdialog")).toBeNull());
+    expect(state.calls.some((call) => call.name === "confirm")).toBe(false);
+  });
+
+  it("confirms a start that stops nothing without the stop dialog", async () => {
+    state.data.pending = { items: [{ id: "plan-5" }], nextCursor: null };
+    state.data.plan = {
+      id: "plan-5",
+      state: "AWAITING_CONFIRMATION",
+      contents: {
+        action: "start",
+        stopIds: [],
+        affectedNodeIds: ["node-a"],
+        start: { revisionId: "rev", variantKey: "one" },
+      },
+      preview: {
+        start: { commands: [{ start: "serve", stop: "stop" }] },
+        agentEdited: true,
+        stopped: [],
+      },
+    };
+    const user = userEvent.setup();
+    show();
+    await user.click(await screen.findByRole("button", { name: /deployments.reviewPlan.*plan-5/ }));
+    await user.click(await screen.findByLabelText("deployments.confirmHint"));
+    await user.click(screen.getByRole("button", { name: "deployments.confirm" }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await waitFor(() =>
+      expect(state.calls).toContainEqual({ name: "confirm", input: { planId: "plan-5" } }),
+    );
+  });
+
   it("defaults paid-cache consent off and validates embedding identity before saving", async () => {
     const user = userEvent.setup();
     show(<PoolExecutionPolicy pool={{ id: "pool" }} />);

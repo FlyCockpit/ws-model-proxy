@@ -12,6 +12,14 @@
     "ariaLabel": "¿Qué significa esto?"
   },
   "deployments": {
+    "preemptCancel_other": "Mantenerlos en ejecución",
+    "preemptCancel_one": "Mantenerlo en ejecución",
+    "preemptConfirm": "Detener e iniciar",
+    "preemptNodes_other": "{{count}} nodos",
+    "preemptNodes_one": "{{count}} nodo",
+    "preemptBody": "Iniciar esto necesita el hardware que usan estos despliegues. Se detienen primero, en todos sus nodos. Las solicitudes nuevas van a otros miembros o esperan; las que ya están en curso tienen alrededor de un minuto para terminar.",
+    "preemptTitle_other": "¿Detener {{count}} modelos en ejecución?",
+    "preemptTitle_one": "¿Detener {{count}} modelo en ejecución?",
     "agentEditedRevision": "Un agente editó esta receta por última vez. Lee cada comando de abajo antes de confirmar: una vez confirmado, el trabajo se ejecuta como tuyo.",
     "states": {
       "PENDING": "Pendiente",
