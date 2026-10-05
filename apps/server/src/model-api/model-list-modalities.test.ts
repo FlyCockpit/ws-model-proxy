@@ -76,6 +76,37 @@ describe("multimodalFlagsFromCapabilities", () => {
   });
 });
 
+function v2Audio(
+  audio: Extract<OpenAiCompatibleCapabilities, { version: 2 }>["audio"],
+): OpenAiCompatibleCapabilities {
+  return { version: 2, protocol: "openai-compatible", audio };
+}
+
+describe("live transcription advertisement", () => {
+  it("flags only audio.transcriptions.realtime with supported: true", () => {
+    const realtime = { supported: true, adapter: "segmented" as const };
+    const live = openAiModelListExtensionsFromCapabilities(
+      v2Audio({ transcriptions: { supported: true, realtime } }),
+    );
+    expect(live.supports_realtime_transcription).toBe(true);
+    expect(live.capabilities.realtime_transcription).toBe(true);
+    const translationsOnly = openAiModelListExtensionsFromCapabilities(
+      v2Audio({ translations: { supported: true, realtime } }),
+    );
+    expect(translationsOnly.supports_realtime_transcription).toBe(false);
+    const notSupported = openAiModelListExtensionsFromCapabilities(
+      v2Audio({ transcriptions: { supported: true, realtime: { ...realtime, supported: false } } }),
+    );
+    expect(notSupported.supports_realtime_transcription).toBe(false);
+    expect(
+      unionMultimodalFlags([
+        multimodalFlagsFromCapabilities(v2Audio({ transcriptions: { supported: true } })),
+        multimodalFlagsFromCapabilities(v2Audio({ transcriptions: { supported: true, realtime } })),
+      ]).realtimeTranscription,
+    ).toBe(true);
+  });
+});
+
 describe("openAiModelListExtensions", () => {
   it("emits OpenRouter-style architecture and LM Studio-style capability flags", () => {
     const ext = openAiModelListExtensions({
@@ -98,7 +129,9 @@ describe("openAiModelListExtensions", () => {
       audio_output: false,
       audio_transcription: true,
       audio_translation: false,
+      realtime_transcription: false,
     });
+    expect(ext.supports_realtime_transcription).toBe(false);
     expect(ext.architecture.input_modalities).toEqual(["text", "image", "audio", "video"]);
     expect(ext.architecture.output_modalities).toEqual(["text"]);
     expect(ext.architecture.modality).toBe("text+image+audio+video->text");

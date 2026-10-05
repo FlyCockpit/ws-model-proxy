@@ -14,6 +14,7 @@
 
 import { audioOperationSupported } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import type { OpenAiCompatibleCapabilities } from "../relay/protocol.js";
+import { realtimeTranscriptionCapability } from "../relay/stt-relay.js";
 
 export type ModelInputModality = "text" | "image" | "audio" | "video" | "file";
 export type ModelOutputModality = "text" | "image" | "audio" | "embedding";
@@ -26,6 +27,8 @@ export type ModelListCapabilitiesAdvertisement = {
   audio_output: boolean;
   audio_transcription: boolean;
   audio_translation: boolean;
+  /** Live `/v1/realtime?intent=transcription` sessions (a hint; routing decides). */
+  realtime_transcription: boolean;
 };
 
 export type ModelListArchitectureAdvertisement = {
@@ -49,7 +52,19 @@ export type MultimodalFlags = {
   audioOutput: boolean;
   audioTranscription: boolean;
   audioTranslation: boolean;
+  /**
+   * The capability advertises live transcription (`audio.transcriptions.realtime`
+   * with `supported: true`; never translations). Sessions still open only on
+   * recipe-managed, healthy members.
+   */
+  realtimeTranscription?: boolean;
 };
+
+function realtimeFlag(capabilities: OpenAiCompatibleCapabilities): {
+  realtimeTranscription?: true;
+} {
+  return realtimeTranscriptionCapability(capabilities) ? { realtimeTranscription: true } : {};
+}
 
 export function multimodalFlagsFromCapabilities(
   capabilities: OpenAiCompatibleCapabilities | null | undefined,
@@ -87,6 +102,7 @@ export function multimodalFlagsFromCapabilities(
         legacyAudio?.speech === true,
       audioTranscription,
       audioTranslation,
+      ...realtimeFlag(capabilities),
     };
   }
 
@@ -119,6 +135,7 @@ export function multimodalFlagsFromCapabilities(
     audioOutput,
     audioTranscription,
     audioTranslation,
+    ...realtimeFlag(capabilities),
   };
 }
 
@@ -136,6 +153,9 @@ export function unionMultimodalFlags(flags: MultimodalFlags[]): MultimodalFlags 
       audioOutput: acc.audioOutput || next.audioOutput,
       audioTranscription: acc.audioTranscription || next.audioTranscription,
       audioTranslation: acc.audioTranslation || next.audioTranslation,
+      ...(acc.realtimeTranscription || next.realtimeTranscription
+        ? { realtimeTranscription: true }
+        : {}),
     }),
     {
       text: false,
@@ -184,6 +204,7 @@ export function openAiModelListExtensions(flags: MultimodalFlags): {
   supports_audio_output: boolean;
   supports_audio_transcription: boolean;
   supports_audio_translation: boolean;
+  supports_realtime_transcription: boolean;
   capabilities: ModelListCapabilitiesAdvertisement;
   architecture: ModelListArchitectureAdvertisement;
 } {
@@ -196,6 +217,7 @@ export function openAiModelListExtensions(flags: MultimodalFlags): {
     supports_audio_output: flags.audioOutput,
     supports_audio_transcription: flags.audioTranscription,
     supports_audio_translation: flags.audioTranslation,
+    supports_realtime_transcription: flags.realtimeTranscription === true,
     capabilities: {
       embeddings: flags.embeddings === true,
       vision: flags.vision,
@@ -204,6 +226,7 @@ export function openAiModelListExtensions(flags: MultimodalFlags): {
       audio_output: flags.audioOutput,
       audio_transcription: flags.audioTranscription,
       audio_translation: flags.audioTranslation,
+      realtime_transcription: flags.realtimeTranscription === true,
     },
     architecture: {
       input_modalities,

@@ -285,7 +285,7 @@ assignment provenance and automatic concurrency seed columns.
   unacknowledged delete, and a rename or replace that may have published stays
   manual. See [`apps/cli/docs/file-recovery.md`](../../apps/cli/docs/file-recovery.md).
 
-- **Live transcription profile (groundwork).** A transcription profile may add
+- **Live transcription profile.** A transcription profile may add
   an opt-in `realtime` block, `{adapter, maxItemSeconds?, maxSessions?}`, that
   marks the endpoint for live speech-to-text sessions. `adapter` is `vllm` (the
   engine serves vLLM's own `/v1/realtime`; needs engine `vllm` or `other`) or
@@ -296,7 +296,7 @@ assignment provenance and automatic concurrency seed columns.
   `maxSessions` (1–8) caps live sessions per endpoint. Without the block an
   endpoint takes no live sessions. The CLI advertises the block in its
   transcription capability; this is part of relay protocol 2.11, not a new
-  version. The live `/v1/realtime` endpoint itself is not available yet.
+  version. Live sessions open only on recipe-managed endpoints.
   For a Voxtral realtime model, the whole turn shares one context, so a small
   `--max-model-len` can fail a long turn part-way; keep `maxItemSeconds` well
   inside it (600 s is roughly 7.5k audio tokens). Qwen3-ASR realtime is not
@@ -317,6 +317,36 @@ assignment provenance and automatic concurrency seed columns.
   realtime claim on an engine without `/v1/realtime`) is reported in the
   server log and is not counted against the member's health, so a wrong
   `realtime` block cannot take the member out of HTTP routing.
+
+- **Live transcription sessions (`GET /v1/realtime?intent=transcription`).**
+  A WebSocket API following the OpenAI Realtime GA transcription events
+  (`session.update`, `input_audio_buffer.append/commit/clear`; transcription
+  `delta`/`completed`/`failed` with `usage: {type: "duration", seconds}`).
+  Authenticate with `Authorization: Bearer <model API token>`, or from a
+  browser with the subprotocols `realtime` and
+  `openai-insecure-api-key.<token>` (only `realtime` is echoed). A key in the
+  URL is refused. Input is `audio/pcm` at 24 kHz only, at most 512 KiB of
+  base64 per append; turns end when the client commits (`turn_detection`
+  must be null; there is no voice activity detection) or at the profile's
+  `maxItemSeconds`. Limits: 4 sessions per token, 8 per user, 30 minutes per
+  session, 120 s without audio. `:external` model names are refused: live
+  audio never leaves your nodes. There is no failover once a session has
+  opened; clients reconnect. `GET /v1/models` marks live models with
+  `supports_realtime_transcription`.
+  Access is checked when the session opens (under the same locked send check
+  as HTTP requests) and again every 60 seconds. Revoking the token, banning
+  or deleting a user ends live sessions at once; a token that expires, or an
+  allowlist edit that removes the model, ends them within 60 seconds.
+  Each opened session is one request row (`audio.realtime_transcription`)
+  with the forwarded audio in `audioInputMs`; its wall time is kept out of
+  request latency statistics. The `segmented` adapter returns one result per
+  turn; live partial results need a vLLM realtime model. With vLLM, audio
+  appended after the engine ended a turn on its own (its token limit), but
+  before the CLI read that, can be lost (a few hundred milliseconds).
+  See `docs/transcription-interoperability.md` for client usage and recipe
+  notes (whisper.cpp needs `--inference-path /v1/audio/transcriptions`).
+  Database: three additive columns (`relay_request."audioInputMs"`,
+  `usage_rollup_minute/_hour."audioInputMs"`); `APPLY_SCHEMA=safe` adds them.
 
 ## Fixed
 

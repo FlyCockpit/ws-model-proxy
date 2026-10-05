@@ -5581,6 +5581,7 @@ describe("model API routes", () => {
           supports_audio_output: false,
           supports_audio_transcription: false,
           supports_audio_translation: false,
+          supports_realtime_transcription: false,
           capabilities: {
             embeddings: false,
             vision: true,
@@ -5589,6 +5590,7 @@ describe("model API routes", () => {
             audio_output: false,
             audio_transcription: false,
             audio_translation: false,
+            realtime_transcription: false,
           },
           architecture: {
             input_modalities: ["text", "image", "audio", "video"],
