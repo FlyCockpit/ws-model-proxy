@@ -325,6 +325,28 @@ describe("direct candidates and model resolution", () => {
     expect(await resolveRealtimeModel(token, "owner/asr")).toMatchObject({ kind: "pool" });
   });
 
+  it("reports a configuration refusal without touching member health", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const router = createRealtimeRouter({
+      token: { id: "t", userId: "u", scopeMode: "ALL_VISIBLE", allowExternal: false },
+      activeCliDeviceIds: () => [],
+    });
+    router.memberMisconfigured?.(
+      {
+        cliDeviceId: "cli-1",
+        endpointSlug: "inst-aaaaaaaaaaaaaaaa",
+        upstreamModel: "m",
+        capabilities: null,
+        deploymentManaged: true,
+        memberId: "m1",
+      },
+      "unsupported_capability",
+    );
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(health.recordPoolMemberRelayFailure).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
   it("the router reports no_live_member and records health only for pool members", async () => {
     visible.targets = {
       directModels: [],
@@ -407,7 +429,9 @@ describe("access rechecks", () => {
     const input = await opened();
     db.modelApiToken.findUnique.mockResolvedValue(token);
     db.poolMember.findFirst.mockResolvedValue(member("m1", model()));
-    expect(await recheckRealtimeAccess(input)).toEqual({ ok: true });
+    expect(await recheckRealtimeAccess({ ...input, permission: async () => null })).toEqual({
+      ok: true,
+    });
   });
 
   it.each([
@@ -420,6 +444,33 @@ describe("access rechecks", () => {
     expect(await recheckRealtimeAccess(input)).toEqual({ ok: false, reason: "credential" });
   });
 
+  it.each([
+    ["requester", "credential"],
+    ["access", "model"],
+    ["member", "member"],
+  ] as const)("denies when the shared send check says %s", async (denied, reason) => {
+    const input = await opened();
+    db.modelApiToken.findUnique.mockResolvedValue(token);
+    db.poolMember.findFirst.mockResolvedValue(member("m1", model()));
+    const permission = vi.fn(async () => denied);
+    expect(await recheckRealtimeAccess({ ...input, permission })).toEqual({ ok: false, reason });
+    expect(permission).toHaveBeenCalledWith({ tokenId: "t", userId: "u" }, input.candidate);
+  });
+
+  it("propagates a failed send check (the registry skips that sweep)", async () => {
+    const input = await opened();
+    db.modelApiToken.findUnique.mockResolvedValue(token);
+    db.poolMember.findFirst.mockResolvedValue(member("m1", model()));
+    await expect(
+      recheckRealtimeAccess({
+        ...input,
+        permission: async () => {
+          throw new Error("lock timeout");
+        },
+      }),
+    ).rejects.toThrow();
+  });
+
   it("denies a model no longer visible and a member no longer managed", async () => {
     const input = await opened();
     db.modelApiToken.findUnique.mockResolvedValue(token);
@@ -427,7 +478,10 @@ describe("access rechecks", () => {
     expect(await recheckRealtimeAccess(input)).toEqual({ ok: false, reason: "model" });
     visible.targets = { directModels: [], modelPools: [poolTarget] };
     db.poolMember.findFirst.mockResolvedValue(member("m1", model({ instance: null })));
-    expect(await recheckRealtimeAccess(input)).toEqual({ ok: false, reason: "member" });
+    expect(await recheckRealtimeAccess({ ...input, permission: async () => null })).toEqual({
+      ok: false,
+      reason: "member",
+    });
     db.poolMember.findFirst.mockResolvedValue(null);
     expect(await recheckRealtimeAccess(input)).toEqual({ ok: false, reason: "member" });
   });

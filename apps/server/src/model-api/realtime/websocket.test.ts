@@ -265,6 +265,53 @@ describe("realtime socket events", () => {
     expect(t.counters.count("server")).toBe(0);
   });
 
+  it("L1: a failure while setting the session up releases the admission and closes 1011", () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const t = deps({
+      router: () => {
+        throw new Error("setup bug");
+      },
+    });
+    const events = realtimeSocketEvents(admitted(t), t.deps);
+    const { ws, closes } = fakeWs();
+    expect(() => events.onOpen?.(new Event("open"), ws)).not.toThrow();
+    expect(t.counters.count("server")).toBe(0);
+    expect(closes).toEqual([{ code: 1011, reason: "server_error" }]);
+    expect(t.registry.size).toBe(0);
+    errors.mockRestore();
+  });
+
+  it("uses the injected send claim for opens", async () => {
+    const authorizeOpen = vi.fn(() => async () => ({
+      ok: false as const,
+      denial: "access" as const,
+    }));
+    const t = deps({
+      authorizeOpen,
+      router: () => ({
+        candidates: async () => ({
+          ok: true,
+          candidates: [
+            {
+              cliDeviceId: "cli",
+              endpointSlug: "inst-aaaaaaaaaaaaaaaa",
+              upstreamModel: "m",
+              capabilities: null,
+              deploymentManaged: true,
+              memberId: null,
+            },
+          ],
+        }),
+        memberOpenFailed: () => {},
+      }),
+    });
+    const events = realtimeSocketEvents({ ...admitted(t), model: "owner/asr" }, t.deps);
+    const { ws, closes } = fakeWs();
+    events.onOpen?.(new Event("open"), ws);
+    await vi.waitFor(() => expect(closes).toEqual([{ code: 1008, reason: "model_not_found" }]));
+    expect(authorizeOpen).toHaveBeenCalledWith({ tokenId: TOKEN.id, userId: TOKEN.userId });
+  });
+
   it("gives the admission back when the handshake never opens", () => {
     vi.useFakeTimers();
     const t = deps();

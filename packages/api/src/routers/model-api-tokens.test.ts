@@ -830,6 +830,49 @@ describe("modelApiTokensRouter", () => {
       });
     });
 
+    it("ends the token's live sessions after the revoke commits, and survives a failing hook", async () => {
+      db.modelApiToken.findUnique.mockResolvedValue({
+        id: "token-id",
+        userId: "user-id",
+        revokedAt: null,
+      });
+      db.modelApiToken.update.mockResolvedValue({
+        id: "token-id",
+        createdAt,
+        updatedAt,
+        userId: "user-id",
+        name: "Harness",
+        scopeMode: "ALL_VISIBLE",
+        lookupPrefix: "wsmp_model_abcd1234EFGH",
+        lastUsedAt: null,
+        revokedAt: new Date("2026-01-02T00:00:00.000Z"),
+        expiresAt: null,
+        AllowlistEntries: [],
+      });
+      const onModelApiTokenRevoked = vi.fn();
+      const context = { ...buildContext(), services: { onModelApiTokenRevoked } };
+      await createRouterClient(modelApiTokensRouter, { context }).revoke({ id: "token-id" });
+      expect(onModelApiTokenRevoked).toHaveBeenCalledWith("token-id");
+      expect(db.modelApiToken.update.mock.invocationCallOrder[0]).toBeLessThan(
+        onModelApiTokenRevoked.mock.invocationCallOrder[0] ?? 0,
+      );
+
+      const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const failing = {
+        ...buildContext(),
+        services: {
+          onModelApiTokenRevoked: () => {
+            throw new Error("hook");
+          },
+        },
+      };
+      const result = await createRouterClient(modelApiTokensRouter, { context: failing }).revoke({
+        id: "token-id",
+      });
+      expect(result.revokedAt).toEqual(new Date("2026-01-02T00:00:00.000Z"));
+      errors.mockRestore();
+    });
+
     it("hides tokens owned by another user", async () => {
       db.modelApiToken.findUnique.mockResolvedValue({
         id: "token-id",

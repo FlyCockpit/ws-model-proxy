@@ -34,7 +34,7 @@ describe("realtime session registry", () => {
       return reason ? { ok: false, reason } : { ok: true };
     });
     const sessions = Object.fromEntries([...verdicts.keys()].map((id) => [id, fakeSession()]));
-    for (const [id, session] of Object.entries(sessions)) registry.add(session, id);
+    for (const [id, session] of Object.entries(sessions)) registry.add(session, id, "user");
     await registry.recheckSessions();
     expect(sessions.waiting?.terminate).toHaveBeenCalledWith(
       1008,
@@ -54,7 +54,7 @@ describe("realtime session registry", () => {
   it("passes the resolved model and opened member to the recheck", async () => {
     const recheck = vi.fn(async () => ({ ok: true as const }));
     const registry = new RealtimeSessionRegistry(recheck);
-    const registration = registry.add(fakeSession(), "t");
+    const registration = registry.add(fakeSession(), "t", "user");
     registration?.resolved({ kind: "direct", target: { id: "dm" } as never }, "owner/asr");
     registration?.opened(candidate, null);
     await registry.recheckSessions();
@@ -72,7 +72,7 @@ describe("realtime session registry", () => {
       throw new Error("db down");
     });
     const session = fakeSession();
-    registry.add(session, "t");
+    registry.add(session, "t", "user");
     await registry.recheckSessions();
     expect(session.terminate).not.toHaveBeenCalled();
     expect(errors).toHaveBeenCalled();
@@ -88,7 +88,7 @@ describe("realtime session registry", () => {
         }),
     );
     const session = fakeSession();
-    const registration = registry.add(session, "t");
+    const registration = registry.add(session, "t", "user");
     const sweep = registry.recheckSessions();
     registration?.remove();
     finish({ ok: false, reason: "credential" });
@@ -102,9 +102,11 @@ describe("realtime session registry", () => {
     const released = fakeSession();
     const lostController = new AbortController();
     const releasedController = new AbortController();
-    registry.add(lost, "a")?.opened(candidate, { release() {}, signal: lostController.signal });
     registry
-      .add(released, "b")
+      .add(lost, "a", "user")
+      ?.opened(candidate, { release() {}, signal: lostController.signal });
+    registry
+      .add(released, "b", "user")
       ?.opened(candidate, { release() {}, signal: releasedController.signal });
     releasedController.abort(new DOMException("Aborted", "AbortError"));
     lostController.abort(new CapacityLeaseLostError("heartbeat_timeout"));
@@ -115,16 +117,69 @@ describe("realtime session registry", () => {
     expect(released.terminate).not.toHaveBeenCalled();
   });
 
+  it("ends a banned or deleted user's sessions, and those their members serve, at once", () => {
+    const registry = new RealtimeSessionRegistry(async () => ({ ok: true }));
+    const own = fakeSession();
+    const served = fakeSession();
+    const other = fakeSession();
+    registry.add(own, "t1", "banned");
+    registry.add(served, "t2", "someone")?.opened(
+      {
+        ...candidate,
+        route: {
+          kind: "pool",
+          poolId: "p",
+          poolMemberId: "m1",
+          discoveredModelId: "dm",
+          endpointId: "ep",
+          executionTargetId: "et",
+          capacityId: "cap",
+          ownerUserId: "pool-owner",
+          engineOwnerUserId: "banned",
+          accessGrantId: "g",
+          contributionId: "ic",
+        },
+      },
+      null,
+    );
+    registry.add(other, "t3", "someone");
+    registry.terminateForUser("banned");
+    expect(own.terminate).toHaveBeenCalledWith(
+      1008,
+      expect.objectContaining({ code: "invalid_api_key" }),
+    );
+    expect(served.terminate).toHaveBeenCalledWith(
+      1011,
+      expect.objectContaining({ code: "model_unavailable" }),
+    );
+    expect(other.terminate).not.toHaveBeenCalled();
+    expect(registry.size).toBe(1);
+  });
+
+  it("ends a revoked token's sessions at once", () => {
+    const registry = new RealtimeSessionRegistry(async () => ({ ok: true }));
+    const revoked = fakeSession();
+    const kept = fakeSession();
+    registry.add(revoked, "revoked", "u");
+    registry.add(kept, "kept", "u");
+    registry.terminateForToken("revoked");
+    expect(revoked.terminate).toHaveBeenCalledWith(
+      1008,
+      expect.objectContaining({ code: "invalid_api_key" }),
+    );
+    expect(kept.terminate).not.toHaveBeenCalled();
+  });
+
   it("closeAll ends every session with 1001 and refuses later ones", () => {
     const registry = new RealtimeSessionRegistry(async () => ({ ok: true }));
     const session = fakeSession();
-    registry.add(session, "t");
+    registry.add(session, "t", "user");
     registry.closeAll();
     expect(session.terminate).toHaveBeenCalledWith(
       1001,
       expect.objectContaining({ code: "server_shutting_down" }),
     );
-    expect(registry.add(fakeSession(), "t")).toBeNull();
+    expect(registry.add(fakeSession(), "t", "user")).toBeNull();
     expect(registry.closing).toBe(true);
     expect(registry.size).toBe(0);
   });

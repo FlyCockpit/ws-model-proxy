@@ -308,6 +308,16 @@ assignment provenance and automatic concurrency seed columns.
   the server back while a realtime deployment exists: an older server refuses
   that node's whole inventory, and the node stays offline.
 
+- **Live transcription routing (`/v1/realtime`).** A live session opens only on
+  a recipe-managed member that is fully healthy. A pool whose members are all
+  degraded or recovering (half-open) refuses live sessions with close code
+  1013 (`model_not_available`) until one is healthy again, even when ordinary
+  HTTP requests can still use a degraded single member. An endpoint that
+  refuses live sessions for a configuration reason (for example a `vllm`
+  realtime claim on an engine without `/v1/realtime`) is reported in the
+  server log and is not counted against the member's health, so a wrong
+  `realtime` block cannot take the member out of HTTP routing.
+
 ## Fixed
 
 - **A disconnect that arrives just after a CLI reconnects no longer re-opens

@@ -411,6 +411,31 @@ describe("pre-open failover", () => {
     expect(hub.stats().legs).toBe(0);
   });
 
+  it("cancelOpening withdraws an opening attempt (queue kept) and closes an open session", async () => {
+    const { hub, link, create } = setup();
+    const cli = link("cli-a");
+    const { session, consumer } = create();
+    session.appendAudio(pcm(4096));
+    const attempt = session.attach(target("cli-a"));
+    const legId = session.relaySessionId;
+    session.cancelOpening();
+    expect(await attempt).toEqual({ status: "failed", reason: "aborted", failure: "cancelled" });
+    expect(cli.controls().at(-1)).toEqual({
+      type: "stt.close",
+      sessionId: legId,
+      reason: "cancelled",
+    });
+    expect(session.queuedAudioBytes).toBe(4096);
+    const { sessionId } = await openOn(hub, cli, session);
+    session.cancelOpening();
+    expect(consumer.ends).toEqual([{ cause: "consumer", failure: "access_denied" }]);
+    expect(cli.controls().at(-1)).toEqual({
+      type: "stt.close",
+      sessionId,
+      reason: "access_denied",
+    });
+  });
+
   it("treats a non-finite open budget as the default, never an immediate timeout", async () => {
     const { link, create } = setup();
     link("cli-a");

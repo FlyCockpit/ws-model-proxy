@@ -22,6 +22,7 @@ import type { RelayFailure } from "../../relay/relay-failure.js";
 import type { SttConfig } from "../../relay/stt-protocol.js";
 import { realtimeTranscriptionCapability } from "../../relay/stt-relay.js";
 import { resolveRequestedModelName } from "../external-route.js";
+import { recheckRealtimePermission } from "./authorize.js";
 import type {
   RealtimeCandidate,
   RealtimeRouteResult,
@@ -292,7 +293,9 @@ export async function poolCandidates({
         executionTargetId: entry.row.ExecutionTarget?.id ?? null,
         capacityId: entry.row.ExecutionTarget?.inferenceCapacityId ?? null,
         ownerUserId: pool.ownerUserId,
+        engineOwnerUserId: entry.model.userId,
         accessGrantId: pool.accessGrantId,
+        contributionId: entry.row.inferenceContributionId,
       }),
     );
   }
@@ -339,7 +342,9 @@ export async function directCandidates({
       executionTargetId: model.ExecutionTarget?.id ?? null,
       capacityId: model.ExecutionTarget?.inferenceCapacityId ?? null,
       ownerUserId: model.userId,
+      engineOwnerUserId: model.userId,
       accessGrantId: null,
+      contributionId: null,
     }),
   ];
 }
@@ -402,6 +407,15 @@ export function createRealtimeRouter({
       if (candidates.length === 0) return { ok: false, code: "no_live_member" };
       return { ok: true, candidates };
     },
+    memberMisconfigured(candidate: RealtimeCandidate, failure: RelayFailure) {
+      // A recipe that claims live transcription its engine does not serve:
+      // reported for the operator, never written to the shared member health.
+      console.warn("[realtime] member refused live sessions (configuration)", {
+        poolMemberId: candidate.route?.poolMemberId ?? null,
+        endpointSlug: candidate.endpointSlug,
+        failure,
+      });
+    },
     memberOpenFailed(candidate: RealtimeCandidate, failure: RelayFailure) {
       const poolMemberId = candidate.route?.poolMemberId;
       if (!poolMemberId) return;
@@ -437,6 +451,7 @@ export async function recheckRealtimeAccess({
   candidate,
   config,
   now = new Date(),
+  permission = recheckRealtimePermission,
 }: {
   tokenId: string;
   model: string | null;
@@ -444,6 +459,8 @@ export async function recheckRealtimeAccess({
   candidate: RealtimeCandidate | null;
   config: SttConfig;
   now?: Date;
+  /** The HTTP send claim's permission check, without a send (review 6b M1). */
+  permission?: typeof recheckRealtimePermission;
 }): Promise<RealtimeAccessVerdict> {
   const token = await prisma.modelApiToken.findUnique({
     where: { id: tokenId },
@@ -510,15 +527,22 @@ export async function recheckRealtimeAccess({
     ) {
       return { ok: false, reason: "member" };
     }
-    return { ok: true };
+  } else {
+    const direct = await prisma.discoveredModel.findUnique({
+      where: { id: route.discoveredModelId },
+      select: modelSelect,
+    });
+    if (!direct || !memberStillServes(direct, candidate, config, now)) {
+      return { ok: false, reason: "member" };
+    }
   }
-  const direct = await prisma.discoveredModel.findUnique({
-    where: { id: route.discoveredModelId },
-    select: modelSelect,
-  });
-  if (!direct || !memberStillServes(direct, candidate, config, now)) {
-    return { ok: false, reason: "member" };
-  }
+  // The same locked permission check an HTTP send takes: CLI device of the
+  // model owner and connected, the token's allowlist entry for this exact
+  // target, the grant row, every user active.
+  const denied = await permission({ tokenId: token.id, userId: token.userId }, candidate);
+  if (denied === "requester") return { ok: false, reason: "credential" };
+  if (denied === "access") return { ok: false, reason: "model" };
+  if (denied === "member") return { ok: false, reason: "member" };
   return { ok: true };
 }
 

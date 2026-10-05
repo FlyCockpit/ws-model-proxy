@@ -128,7 +128,9 @@ export type SttOpenFailureReason =
   | "refused"
   | "timeout"
   | "disconnected"
-  | "protocol_error";
+  | "protocol_error"
+  /** The caller withdrew the attempt (its send claim did not commit). */
+  | "aborted";
 
 export type SttAttachResult =
   | { status: "opened"; adapter: RealtimeTranscriptionAdapter; maxItemSeconds: number }
@@ -655,6 +657,22 @@ export class SttRelaySession {
     this.enqueueControl({ type: "stt.update", config: wireConfig(config) });
     this.pump();
     return { ok: true };
+  }
+
+  /**
+   * Withdraws the attempt in flight: its send authorization did not commit.
+   * An opening attempt fails `aborted` (the queue stays for the next
+   * candidate) and the CLI gets `stt.close{cancelled}`. A session that has
+   * already opened is closed (`access_denied`): it must not run unauthorized.
+   */
+  cancelOpening() {
+    const leg = this.leg;
+    if (!leg) return;
+    if (leg.state === "opening") {
+      this.openFailed(leg, { reason: "aborted", failure: "cancelled" }, "cancelled");
+      return;
+    }
+    if (this.state === "open") this.close("access_denied");
   }
 
   /** Ends the session and tells the CLI. `onEnd` follows with cause `consumer`. */

@@ -11,6 +11,7 @@ import {
 } from "../../relay/stt-relay.js";
 import { RealtimeSessionCounters } from "./limits.js";
 import {
+  openFailureIsConfiguration,
   openFailureMarksMember,
   REALTIME_EVENT_RATE_MAX,
   REALTIME_EVENT_RATE_WINDOW_MS,
@@ -96,6 +97,10 @@ class FakeRouter implements RealtimeRouter {
   result: Promise<RealtimeRouteResult> | RealtimeRouteResult = { ok: true, candidates: [] };
   calls: unknown[] = [];
   failures: [string, RelayFailure][] = [];
+  misconfigured: [string, RelayFailure][] = [];
+  memberMisconfigured(candidate: RealtimeCandidate, failure: RelayFailure) {
+    this.misconfigured.push([candidate.cliDeviceId, failure]);
+  }
   async candidates(input: { model: string }) {
     this.calls.push(input.model);
     return this.result;
@@ -647,7 +652,15 @@ describe("open failure classification (L4)", () => {
       failure: RelayFailure,
     ) => openFailureMarksMember({ status: "failed", reason, failure });
     expect(failed("refused", "upstream_5xx")).toBe(true);
-    expect(failed("refused", "unsupported_capability")).toBe(true);
+    // Configuration faults never mark the shared member (review 6b L2).
+    expect(failed("refused", "unsupported_capability")).toBe(false);
+    expect(failed("refused", "upstream_4xx")).toBe(false);
+    expect(
+      openFailureIsConfiguration({ status: "failed", reason: "refused", failure: "upstream_4xx" }),
+    ).toBe(true);
+    expect(
+      openFailureIsConfiguration({ status: "failed", reason: "cli_full", failure: "upstream_4xx" }),
+    ).toBe(false);
     expect(failed("timeout", "timeout")).toBe(true);
     expect(failed("refused", "rate_limited")).toBe(false);
     expect(failed("refused", "not_found")).toBe(false);
@@ -832,4 +845,108 @@ describe("review fixes (6a)", () => {
       t.client.last("conversation.item.input_audio_transcription.delta").item_id,
     ]);
   });
+});
+
+describe("review fixes (6b)", () => {
+  type Authorize = NonNullable<RealtimeSessionHooks["authorizeOpen"]>;
+
+  it("M1: stt.open is sent only inside the send claim, after its check passed", async () => {
+    const order: string[] = [];
+    let cli: FakeLink | undefined;
+    const authorizeOpen: Authorize = async (_candidate, open) => {
+      order.push(`check:${cli?.opens().length}`);
+      open();
+      order.push(`sent:${cli?.opens().length}`);
+      return { ok: true };
+    };
+    const t = setup({ initialModel: "whisper", hooks: { authorizeOpen } });
+    cli = t.link("a");
+    t.router.result = { ok: true, candidates: [candidate("a")] };
+    t.session.start();
+    await t.openOn(cli);
+    expect(order).toEqual(["check:0", "sent:1"]);
+    expect(t.session.status).toBe("open");
+  });
+
+  it.each([
+    ["requester", 1008, "invalid_api_key"],
+    ["access", 1008, "model_not_found"],
+  ] as const)(
+    "M1: a %s denial ends the session (%d %s) and sends no open",
+    async (denial, code, reason) => {
+      const t = setup({
+        initialModel: "whisper",
+        hooks: { authorizeOpen: async () => ({ ok: false, denial }) },
+      });
+      const cli = t.link("a");
+      t.link("b");
+      t.router.result = { ok: true, candidates: [candidate("a"), candidate("b")] };
+      t.session.start();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(cli.opens()).toEqual([]);
+      expect(t.client.closes).toEqual([{ code, reason }]);
+      expect(t.router.failures).toEqual([]);
+    },
+  );
+
+  it("M1: a member denial or a failed commit moves on to the next member, never as health", async () => {
+    let calls = 0;
+    const authorizeOpen: Authorize = async (_candidate, open, abort) => {
+      calls += 1;
+      if (calls === 1) return { ok: false, denial: "member" };
+      if (calls === 2) {
+        open(); // sent, then the claim fails to commit
+        abort();
+        return { ok: false, denial: "check_failed" };
+      }
+      open();
+      return { ok: true };
+    };
+    const t = setup({ initialModel: "whisper", hooks: { authorizeOpen } });
+    const [a, b, c] = ["a", "b", "c"].map((id) => t.link(id));
+    t.router.result = { ok: true, candidates: ["a", "b", "c"].map((id) => candidate(id)) };
+    t.session.start();
+    if (!a || !b || !c) throw new Error("links");
+    await t.openOn(c);
+    expect(a.opens()).toEqual([]);
+    // b's open was withdrawn: the CLI is told, and it never counted as health.
+    expect(b.controls().map((message) => message.type)).toEqual(["stt.open", "stt.close"]);
+    expect(b.controls().at(-1)).toMatchObject({ reason: "cancelled" });
+    expect(t.router.failures).toEqual([]);
+    expect(t.session.status).toBe("open");
+  });
+
+  it("M1: a throwing claim withdraws its open", async () => {
+    let calls = 0;
+    const authorizeOpen: Authorize = async (_candidate, open) => {
+      calls += 1;
+      open();
+      if (calls === 1) throw new Error("db");
+      return { ok: true };
+    };
+    const t = setup({ initialModel: "whisper", hooks: { authorizeOpen } });
+    const [a, b] = ["a", "b"].map((id) => t.link(id));
+    t.router.result = { ok: true, candidates: [candidate("a"), candidate("b")] };
+    t.session.start();
+    if (!a || !b) throw new Error("links");
+    await t.openOn(b);
+    expect(a.controls().at(-1)).toMatchObject({ type: "stt.close", reason: "cancelled" });
+    expect(t.session.status).toBe("open");
+  });
+
+  it.each(["unsupported_capability", "upstream_4xx"] as const)(
+    "L2: a %s refusal is reported as configuration, never as member health",
+    async (failure) => {
+      const t = setup({ initialModel: "whisper" });
+      const a = t.link("a");
+      const b = t.link("b");
+      t.router.result = { ok: true, candidates: [candidate("a"), candidate("b")] };
+      t.session.start();
+      await vi.advanceTimersByTimeAsync(0);
+      t.cliFrame(a, { type: "stt.error", sessionId: String(a.opens()[0]?.sessionId), failure });
+      await t.openOn(b);
+      expect(t.router.failures).toEqual([]);
+      expect(t.router.misconfigured).toEqual([["a", failure]]);
+    },
+  );
 });

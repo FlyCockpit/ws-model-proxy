@@ -38,6 +38,7 @@ type Terminable = Pick<RealtimeTranscriptionSession, "terminate">;
 type Entry = {
   session: Terminable;
   tokenId: string;
+  userId: string;
   model: string | null;
   resolved: RealtimeResolvedTarget | null;
   candidate: RealtimeCandidate | null;
@@ -102,11 +103,12 @@ export class RealtimeSessionRegistry {
   }
 
   /** Null after `closeAll()`: the caller must refuse the session (1001). */
-  add(session: Terminable, tokenId: string): RealtimeRegistration | null {
+  add(session: Terminable, tokenId: string, userId: string): RealtimeRegistration | null {
     if (this.closed) return null;
     const entry: Entry = {
       session,
       tokenId,
+      userId,
       model: null,
       resolved: null,
       candidate: null,
@@ -137,6 +139,39 @@ export class RealtimeSessionRegistry {
         this.entries.delete(entry);
       },
     };
+  }
+
+  /**
+   * A user was banned, marked for deletion or deleted (review 6b L3): their
+   * own sessions end at once (1008), and sessions served by their engines or
+   * pools end too (1011), without waiting for the 60 s recheck.
+   */
+  terminateForUser(userId: string) {
+    for (const entry of [...this.entries]) {
+      const route = entry.candidate?.route;
+      if (entry.userId === userId) {
+        this.end(entry, "credential");
+      } else if (route && (route.ownerUserId === userId || route.engineOwnerUserId === userId)) {
+        this.end(entry, "member");
+      }
+    }
+  }
+
+  /** A model API token was revoked: its sessions end at once (1008). */
+  terminateForToken(tokenId: string) {
+    for (const entry of [...this.entries]) {
+      if (entry.tokenId === tokenId) this.end(entry, "credential");
+    }
+  }
+
+  private end(entry: Entry, reason: "credential" | "model" | "member") {
+    this.entries.delete(entry);
+    const denial = DENIALS[reason];
+    entry.session.terminate(denial.close, {
+      type: denial.type,
+      code: denial.code,
+      message: denial.message,
+    });
   }
 
   /** Shutdown: every session ends with 1001; later additions are refused. */
@@ -183,12 +218,7 @@ export class RealtimeSessionRegistry {
       entry.checking = false;
     }
     if (verdict.ok || !this.entries.has(entry)) return;
-    const denial = DENIALS[verdict.reason];
-    entry.session.terminate(denial.close, {
-      type: denial.type,
-      code: denial.code,
-      message: denial.message,
-    });
+    this.end(entry, verdict.reason);
   }
 }
 

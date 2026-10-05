@@ -23,6 +23,8 @@ function candidate(
       capacityId: "cap",
       ownerUserId: "owner",
       accessGrantId: "grant",
+      engineOwnerUserId: "owner",
+      contributionId: null,
       ...route,
     },
   };

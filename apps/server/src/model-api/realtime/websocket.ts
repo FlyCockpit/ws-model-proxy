@@ -11,6 +11,7 @@ import { createRateLimiterMiddleware, realtimeUpgradeLimiter } from "../../rate-
 import { relaySessionManager } from "../../relay/session-manager.js";
 import type { CapacityAdmissionRuntime } from "../capacity/runtime.js";
 import { openAiErrorBody } from "../openai-errors.js";
+import { createRealtimeAuthorizer } from "./authorize.js";
 import { createRealtimeAdmit } from "./capacity.js";
 import {
   REALTIME_KEY_SUBPROTOCOL_PREFIX,
@@ -74,6 +75,11 @@ export type RealtimeEndpointDeps = {
   registry: RealtimeSessionRegistry;
   authenticate: (secret: string) => Promise<ModelApiTokenIdentity | null>;
   capacityRuntime?: CapacityAdmissionRuntime;
+  /** Tests replace the send claim (the default is the HTTP send's locked check). */
+  authorizeOpen?: (requester: {
+    tokenId: string;
+    userId: string;
+  }) => NonNullable<RealtimeSessionHooks["authorizeOpen"]>;
   /** Tests replace the database router. */
   router?: (input: {
     token: ModelApiTokenIdentity;
@@ -274,89 +280,119 @@ export function realtimeSocketEvents(
     keepalive = null;
   };
 
+  const openSession = (ws: WSContext<WebSocketLike>) => {
+    const raw = rawSocket(ws);
+    let paused = false;
+    let lastPong = Date.now();
+    const client: RealtimeClientSocket = {
+      send: (text) => ws.send(text),
+      close: (code, reason) => ws.close(code, reason),
+      pause: () => {
+        paused = true;
+        raw?.pause();
+      },
+      resume: () => {
+        paused = false;
+        lastPong = Date.now();
+        raw?.resume();
+      },
+      bufferedAmount: () => raw?.bufferedAmount ?? 0,
+    };
+    const holder: { registration: RealtimeRegistration | null } = { registration: null };
+    const onResolved = (target: RealtimeResolvedTarget, model: string) =>
+      holder.registration?.resolved(target, model);
+    const router = deps.router
+      ? deps.router({ token: auth.token, onResolved })
+      : createRealtimeRouter({
+          token: auth.token,
+          activeCliDeviceIds: () => deps.relay.getActiveCliDeviceIds(),
+          onResolved,
+        });
+    const requester = { tokenId: auth.token.id, userId: auth.token.userId };
+    const hooks: RealtimeSessionHooks = {
+      ...(deps.capacityRuntime ? { admit: createRealtimeAdmit(deps.capacityRuntime) } : {}),
+      // Every open is a locked, authorized send, like an HTTP relay request.
+      authorizeOpen: deps.authorizeOpen
+        ? deps.authorizeOpen(requester)
+        : createRealtimeAuthorizer(requester),
+      opened: (candidate, info) => holder.registration?.opened(candidate, info.lease),
+      // Metering persistence is chunk 7; this chunk only plumbs `itemFinished`.
+      ended: () => {
+        holder.registration?.remove();
+        stopKeepalive();
+      },
+    };
+    const created = new RealtimeTranscriptionSession({
+      client,
+      router,
+      relay: deps.relay,
+      admission: auth.admission,
+      initialModel: auth.model,
+      hooks,
+    });
+    session = created;
+    const registration = deps.registry.add(created, auth.token.id, auth.token.userId);
+    if (!registration || deps.relay.isDraining()) {
+      registration?.remove();
+      created.terminate(REALTIME_CLOSE_CODES.goingAway, {
+        type: "server_error",
+        code: "server_shutting_down",
+        message: "The server is shutting down.",
+      });
+      return;
+    }
+    holder.registration = registration;
+    created.start();
+    if (raw && created.status !== "closed") {
+      raw.on("pong", () => {
+        lastPong = Date.now();
+      });
+      keepalive = setInterval(() => {
+        const now = Date.now();
+        // Paused by us for backpressure: the backlog rules cover it.
+        if (paused) {
+          lastPong = now;
+          return;
+        }
+        if (now - lastPong > REALTIME_PONG_TIMEOUT_MS) {
+          raw.terminate();
+          return;
+        }
+        try {
+          raw.ping();
+        } catch {
+          // Closing; the close event ends the session.
+        }
+      }, REALTIME_PING_INTERVAL_MS);
+      keepalive.unref?.();
+    }
+  };
+
   return {
     onOpen(_event, ws) {
       opened = true;
       clearTimeout(guard);
-      const raw = rawSocket(ws);
-      let paused = false;
-      let lastPong = Date.now();
-      const client: RealtimeClientSocket = {
-        send: (text) => ws.send(text),
-        close: (code, reason) => ws.close(code, reason),
-        pause: () => {
-          paused = true;
-          raw?.pause();
-        },
-        resume: () => {
-          paused = false;
-          lastPong = Date.now();
-          raw?.resume();
-        },
-        bufferedAmount: () => raw?.bufferedAmount ?? 0,
-      };
-      const holder: { registration: RealtimeRegistration | null } = { registration: null };
-      const onResolved = (target: RealtimeResolvedTarget, model: string) =>
-        holder.registration?.resolved(target, model);
-      const router = deps.router
-        ? deps.router({ token: auth.token, onResolved })
-        : createRealtimeRouter({
-            token: auth.token,
-            activeCliDeviceIds: () => deps.relay.getActiveCliDeviceIds(),
-            onResolved,
-          });
-      const hooks: RealtimeSessionHooks = {
-        ...(deps.capacityRuntime ? { admit: createRealtimeAdmit(deps.capacityRuntime) } : {}),
-        opened: (candidate, info) => holder.registration?.opened(candidate, info.lease),
-        // Metering persistence is chunk 7; this chunk only plumbs `itemFinished`.
-        ended: () => {
-          holder.registration?.remove();
-          stopKeepalive();
-        },
-      };
-      const created = new RealtimeTranscriptionSession({
-        client,
-        router,
-        relay: deps.relay,
-        admission: auth.admission,
-        initialModel: auth.model,
-        hooks,
-      });
-      session = created;
-      const registration = deps.registry.add(created, auth.token.id);
-      if (!registration || deps.relay.isDraining()) {
-        registration?.remove();
-        created.terminate(REALTIME_CLOSE_CODES.goingAway, {
+      try {
+        openSession(ws);
+      } catch (error) {
+        // Nothing may leak the admission (review 6b L1): whatever failed,
+        // end the session (which releases it) or release it here, and close.
+        console.error(
+          "[realtime] session setup failed",
+          error instanceof Error ? (error.constructor?.name ?? "Error") : typeof error,
+        );
+        stopKeepalive();
+        session?.terminate(REALTIME_CLOSE_CODES.internal, {
           type: "server_error",
-          code: "server_shutting_down",
-          message: "The server is shutting down.",
+          code: "server_error",
+          message: "The session could not start.",
         });
-        return;
-      }
-      holder.registration = registration;
-      created.start();
-      if (raw && created.status !== "closed") {
-        raw.on("pong", () => {
-          lastPong = Date.now();
-        });
-        keepalive = setInterval(() => {
-          const now = Date.now();
-          // Paused by us for backpressure: the backlog rules cover it.
-          if (paused) {
-            lastPong = now;
-            return;
-          }
-          if (now - lastPong > REALTIME_PONG_TIMEOUT_MS) {
-            raw.terminate();
-            return;
-          }
-          try {
-            raw.ping();
-          } catch {
-            // Closing; the close event ends the session.
-          }
-        }, REALTIME_PING_INTERVAL_MS);
-        keepalive.unref?.();
+        auth.admission.release();
+        try {
+          ws.close(REALTIME_CLOSE_CODES.internal, "server_error");
+        } catch {
+          // Already closed.
+        }
       }
     },
     onMessage(event) {

@@ -88,6 +88,7 @@ import { MODEL_API_MAX_REQUEST_BODY_BYTES } from "./model-api/limits.js";
 import { openAiErrorBody } from "./model-api/openai-errors.js";
 import { createPoolMemberTestRoutes } from "./model-api/pool-member-test.js";
 import { repairExpiredProviderBudgets } from "./model-api/provider-budget.js";
+import { realtimeSessionRegistry } from "./model-api/realtime/registry.js";
 import {
   createRealtimeWebsocketMiddleware,
   productionRealtimeDeps,
@@ -238,6 +239,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  */
 const closeRelaySessionsForDeletedUser = async (userId: string): Promise<void> => {
   terminalBrowserHub.revokeTerminalAccessForUser(userId);
+  realtimeSessionRegistry.terminateForUser(userId);
   await relaySessionManager.closeSessionsForUser(userId);
 };
 onUserDeleted(closeRelaySessionsForDeletedUser);
@@ -245,6 +247,9 @@ onUserDeletionMarked(closeRelaySessionsForDeletedUser);
 
 // A ban ends the user's in-flight relay file ops and commands (#159; ./relay/user-ban.ts).
 onUserBanned(cancelRelayWorkForBannedUser);
+// A ban ends the user's live transcription sessions, and those their engines
+// or pools serve, at once (not at the next 60 s recheck).
+onUserBanned((userId) => realtimeSessionRegistry.terminateForUser(userId));
 
 function cliContextServices() {
   return {
@@ -258,6 +263,7 @@ function cliContextServices() {
       relaySessionManager.onRemoteEngineAdaptersChanged(cliDeviceId),
     onPoolRoutingRulesChanged: (poolId: string) =>
       relaySessionManager.onPoolRoutingRulesChanged(poolId),
+    onModelApiTokenRevoked: (tokenId: string) => realtimeSessionRegistry.terminateForToken(tokenId),
     onCliCredentialsRevoked: (revoked: {
       kind: "cliToken" | "deviceCredential";
       ids: readonly string[];

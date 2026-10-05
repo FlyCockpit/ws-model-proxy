@@ -94,9 +94,13 @@ export type RealtimeRouteIdentity = {
   endpointId: string;
   executionTargetId: string | null;
   capacityId: string | null;
-  /** The engine owner (pool owner or contributor's model owner for admission). */
+  /** The admission owner: the pool owner for pools, the model owner for direct models. */
   ownerUserId: string;
+  /** The model's owner (a contributor's model in a pool may belong to someone else). */
+  engineOwnerUserId: string;
   accessGrantId: string | null;
+  /** The member's inference contribution, when the model is contributed. */
+  contributionId: string | null;
 };
 
 /** A candidate member, in route order. `deploymentManaged` comes from the database. */
@@ -122,6 +126,12 @@ export interface RealtimeRouter {
   }): Promise<RealtimeRouteResult>;
   /** An open failed in a way that reflects the member's health (see {@link openFailureMarksMember}). */
   memberOpenFailed(candidate: RealtimeCandidate, failure: RelayFailure): void;
+  /**
+   * The member refused the open for a configuration reason (no realtime
+   * route, a wrong model or credential): reported, never counted against the
+   * member's health, which HTTP shares (review 6b L2).
+   */
+  memberMisconfigured?(candidate: RealtimeCandidate, failure: RelayFailure): void;
 }
 
 export type RealtimeCandidateLease = {
@@ -131,6 +141,15 @@ export type RealtimeCandidateLease = {
 };
 
 export type RealtimeAdmitResult = { ok: true; lease: RealtimeCandidateLease } | { ok: false };
+
+/**
+ * The send claim's verdict on one open (review 6b M1). `requester` and
+ * `access` end the session (the caller lost access); `member` and
+ * `check_failed` move on to the next candidate, never as a health failure.
+ */
+export type RealtimeAuthorizeResult =
+  | { ok: true }
+  | { ok: false; denial: "requester" | "access" | "member" | "check_failed" };
 
 export type RealtimeOpenedInfo = {
   adapter: "vllm" | "segmented";
@@ -171,6 +190,17 @@ export interface RealtimeSessionHooks {
    * released if the attempt fails, or when the session ends.
    */
   admit?(candidate: RealtimeCandidate, signal: AbortSignal): Promise<RealtimeAdmitResult>;
+  /**
+   * The locked send claim around one open (the HTTP send's permission check):
+   * `open` sends `stt.open` synchronously and must be called inside the
+   * claim, after the check passed; `abort` withdraws a sent open whose claim
+   * did not commit. Without this hook the open is sent unclaimed (tests).
+   */
+  authorizeOpen?(
+    candidate: RealtimeCandidate,
+    open: () => void,
+    abort: () => void,
+  ): Promise<RealtimeAuthorizeResult>;
   /** The session opened on `candidate`: bind the lease, start rechecks, open the usage row. */
   opened?(candidate: RealtimeCandidate, info: RealtimeOpenedInfo): void;
   /** One item finished (completed or failed), with its audio and engine usage. */
@@ -192,30 +222,46 @@ export interface RealtimeRelay {
   createSttSession(input: { consumer: SttSessionConsumer; config?: SttConfig }): SttCreateResult;
 }
 
+function realOpenFailure(result: Extract<SttAttachResult, { status: "failed" }>): boolean {
+  return (
+    result.reason === "refused" || result.reason === "timeout" || result.reason === "protocol_error"
+  );
+}
+
 /**
  * Whether a failed open should count against the member's health (review
- * L4). A refusal for capacity (`rate_limited`), a stopping or unknown
- * deployment (`not_found`), a CLI that left (`disconnected`, recorded by the
- * relay itself) or a server-side refusal before anything was sent is not.
+ * L4, 6b L2). Only an engine or transport fault does: a refusal for capacity
+ * (`rate_limited`), a stopping or unknown deployment (`not_found`), a CLI
+ * that left (`disconnected`, recorded by the relay itself), a configuration
+ * fault ({@link openFailureIsConfiguration}) or a server-side refusal before
+ * anything was sent is not. The pool member's health is shared with HTTP: a
+ * wrong realtime claim in a recipe must not push the member out of HTTP
+ * routing.
  */
 export function openFailureMarksMember(
   result: Extract<SttAttachResult, { status: "failed" }>,
 ): boolean {
-  if (
-    result.reason !== "refused" &&
-    result.reason !== "timeout" &&
-    result.reason !== "protocol_error"
-  ) {
-    return false;
-  }
+  if (!realOpenFailure(result)) return false;
   return (
     result.failure === "transport" ||
     result.failure === "timeout" ||
     result.failure === "upstream_5xx" ||
-    result.failure === "upstream_4xx" ||
-    result.failure === "unsupported_capability" ||
     result.failure === "protocol_error" ||
     result.failure === "unknown"
+  );
+}
+
+/**
+ * A configuration fault of the member's live transcription: the engine has
+ * no `/v1/realtime` (`unsupported_capability`) or refused the request itself
+ * (`upstream_4xx`: a wrong model or credential).
+ */
+export function openFailureIsConfiguration(
+  result: Extract<SttAttachResult, { status: "failed" }>,
+): boolean {
+  return (
+    realOpenFailure(result) &&
+    (result.failure === "unsupported_capability" || result.failure === "upstream_4xx")
   );
 }
 
@@ -643,11 +689,33 @@ export class RealtimeTranscriptionSession {
         this.lease = null;
         return; // the routing deadline ends the session
       }
-      this.attempting = candidate;
+      const attempt: { pending: Promise<SttAttachResult> | null } = { pending: null };
+      const open = () => {
+        this.attempting = candidate;
+        attempt.pending = relay.attach(candidate, { openTimeoutMs: budget });
+      };
+      const authorized = await this.authorizeOpen(candidate, open, () => relay.cancelOpening());
       // Awaited directly (review L2): `opened` is seen before any `onEnd`.
-      const outcome = await relay.attach(candidate, { openTimeoutMs: budget });
+      const outcome = attempt.pending ? await attempt.pending : null;
       this.attempting = null;
-      if (this.state !== "routing" || signal.aborted || outcome.status === "ended") return;
+      if (this.state !== "routing" || signal.aborted || outcome?.status === "ended") return;
+      if (!authorized.ok || !outcome) {
+        this.releaseLease(this.lease);
+        this.lease = null;
+        if (!authorized.ok && authorized.denial === "requester") {
+          this.fail(REALTIME_CLOSE_CODES.policy, {
+            type: "invalid_request_error",
+            code: "invalid_api_key",
+            message: "The API key is no longer valid.",
+          });
+          return;
+        }
+        if (!authorized.ok && authorized.denial === "access") {
+          this.fail(REALTIME_CLOSE_CODES.policy, ROUTE_ERRORS.model_not_found.error);
+          return;
+        }
+        continue; // this member is unavailable now; never a health failure
+      }
       if (outcome.status === "opened") {
         this.opened(candidate, outcome);
         return;
@@ -659,6 +727,10 @@ export class RealtimeTranscriptionSession {
       if (openWasAttempted(outcome.reason)) attempts += 1;
       if (outcome.failure === "rate_limited") sawCapacity = true;
       if (openFailureMarksMember(outcome)) this.notifyMemberFailed(candidate, outcome.failure);
+      else if (openFailureIsConfiguration(outcome)) {
+        const failure = outcome.failure;
+        this.hook(() => this.deps.router.memberMisconfigured?.(candidate, failure));
+      }
     }
     const config = this.config();
     if (tried > 0 && notEligible === tried && !sawCapacity && (config.language || config.prompt)) {
@@ -726,6 +798,25 @@ export class RealtimeTranscriptionSession {
       return await admit(candidate, signal);
     } catch {
       return { ok: false };
+    }
+  }
+
+  private async authorizeOpen(
+    candidate: RealtimeCandidate,
+    open: () => void,
+    abort: () => void,
+  ): Promise<RealtimeAuthorizeResult> {
+    const authorize = this.deps.hooks?.authorizeOpen;
+    if (!authorize) {
+      open();
+      return { ok: true };
+    }
+    try {
+      return await authorize(candidate, open, abort);
+    } catch {
+      // A broken claim never lets an open stand.
+      abort();
+      return { ok: false, denial: "check_failed" };
     }
   }
 
