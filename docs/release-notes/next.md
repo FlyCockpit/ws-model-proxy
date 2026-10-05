@@ -287,6 +287,18 @@ assignment provenance and automatic concurrency seed columns.
   against the requester for own-key and direct routes (#61). The schema deploy
   above installs it.
 
+## Security fixes
+
+- **`wsmp -vv` and trace log filters no longer print credentials or relay
+  traffic.** At trace level, the CLI used to log the WebSocket client's relay
+  connection request, including the device credential (`authorization`
+  header), and every relay frame (model requests, completions, transcripts) to
+  stderr. The HTTP and WebSocket client crates (`tungstenite`, `ureq`,
+  `reqwest`, `hyper`) are now capped at INFO unless `WSMP_LOG`/`RUST_LOG`
+  names one of them explicitly. If you have shared or stored trace logs from
+  an earlier CLI, treat them as sensitive and revoke the credential or CLI
+  token they contain from the dashboard.
+
 ## Per-caller `:external` wait (#181)
 
 A model-API token can store `externalAfterWaitMs` (null uses each pool's wait).

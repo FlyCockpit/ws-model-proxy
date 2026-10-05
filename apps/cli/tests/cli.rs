@@ -1873,6 +1873,16 @@ mod signal_shutdown {
 
     /// `extra` is merged over the base config (top-level keys).
     fn start_relay_with(args: &[&str], extra: Value) -> Setup {
+        start_relay_logged(args, extra, &[], Stdio::null())
+    }
+
+    /// `start_relay_with`, plus extra environment and a chosen stderr.
+    fn start_relay_logged(
+        args: &[&str],
+        extra: Value,
+        env: &[(&str, &str)],
+        stderr: Stdio,
+    ) -> Setup {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path().canonicalize().expect("canonical tempdir");
         let config = dir.join("config.json");
@@ -1898,9 +1908,10 @@ mod signal_shutdown {
             .env(TOKEN_ENV, "signal-test-token")
             .env_remove("WSMP_LOG")
             .env_remove("RUST_LOG")
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(stderr)
             .spawn()
             .expect("start relay");
         Setup {
@@ -2174,6 +2185,66 @@ mod signal_shutdown {
             !setup.state.join("relay-control.sock").exists(),
             "control socket removed"
         );
+    }
+
+    /// At trace verbosity the WebSocket client must not print the relay
+    /// handshake (it carries the credential) or relay frames (they carry
+    /// model requests and transcripts), whichever way trace is turned on.
+    #[test]
+    fn trace_logging_never_prints_the_credential_or_relay_frames() {
+        // The credential and a marker the server puts in a frame body.
+        const FRAME_MARKER: &str = "frame-body-marker-5c1e";
+        /// Arguments, then extra environment.
+        type Case<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)]);
+        let cases: [Case; 3] = [
+            (&["-vv", "connect"], &[]),
+            (&["connect"], &[("RUST_LOG", "trace")]),
+            (&["connect"], &[("WSMP_LOG", "trace")]),
+        ];
+        for (args, env) in cases {
+            let log = tempfile::NamedTempFile::new().expect("log file");
+            let stderr = Stdio::from(log.reopen().expect("reopen log"));
+            let mut setup = start_relay_logged(args, json!({}), env, stderr);
+            setup.relay.next_text("hello");
+            let mut socket = setup
+                .relay
+                .socket
+                .recv_timeout(Duration::from_secs(5))
+                .expect("relay socket");
+            // Not a frame the CLI understands, but it is read and dropped,
+            // which is where a frame trace would print it.
+            write_text(
+                &mut socket,
+                &json!({ "type": "x.unknown", "body": FRAME_MARKER }).to_string(),
+            );
+            // wsmp's own DEBUG line proves the verbose filter is in effect.
+            write_text(
+                &mut socket,
+                r#"{"type":"heartbeat.pong","id":"pong-1","receivedAt":"2026-01-01T00:00:00Z"}"#,
+            );
+            thread::sleep(Duration::from_millis(500));
+            signal(setup.child.id(), "TERM");
+            let _ = wait_for_exit(&mut setup.child);
+            let output = fs::read_to_string(log.path()).expect("read log");
+            let case = format!("{args:?} {env:?}");
+            assert!(
+                output.contains("relay heartbeat acknowledged"),
+                "{case}: verbose logging was not on:\n{output}"
+            );
+            for secret in [
+                "signal-test-token",
+                "Bearer",
+                "authorization",
+                "Authorization",
+                "AAECAwQFBgcICQoLDA0ODw",
+                FRAME_MARKER,
+            ] {
+                assert!(
+                    !output.contains(secret),
+                    "{case}: `{secret}` reached the log:\n{output}"
+                );
+            }
+        }
     }
 
     /// JSON may escape an unpaired UTF-16 surrogate, which no Rust string can
