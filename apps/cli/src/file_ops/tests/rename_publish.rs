@@ -961,7 +961,10 @@ fn rename_directories_subtree_and_macos_direct_nr_inverse() {
             assert!(result.unwrap().recovered.is_empty());
             assert_eq!(fx.get("moved/sub/child"), SOURCE);
         }
-        assert_eq!(count(&FaultScope::calls(), Primitive::Mkdir), 0);
+        assert_eq!(
+            count(&FaultScope::calls(), Primitive::Mkdir),
+            usize::from(expected.is_none())
+        );
         clean(&fx);
     }
     let fx = Fx::new();
@@ -976,7 +979,7 @@ fn rename_directories_subtree_and_macos_direct_nr_inverse() {
             .is_none()
     );
     assert_eq!(count(&FaultScope::calls(), Primitive::Move), 1);
-    assert_eq!(count(&FaultScope::calls(), Primitive::Mkdir), 0);
+    assert_eq!(count(&FaultScope::calls(), Primitive::Mkdir), 1);
     clean(&fx);
 }
 
@@ -2158,7 +2161,7 @@ fn rename_intent_remains_when_destination_capture_fails_before_publish() {
         serde_json::from_str(&std::fs::read_to_string(dir.join("INTENT")).unwrap()).unwrap();
     assert_eq!(intent["order"], "link-first");
     assert_eq!(intent["version"], 3);
-    assert_eq!(intent["phase"], "prepared");
+    assert_eq!(intent["phase"], "capturing");
     assert_eq!(intent["op"], "rename");
     assert_eq!(intent["source"]["display"], fx.p("src"));
     assert_eq!(intent["destination"]["display"], fx.p("dst"));
@@ -2176,6 +2179,20 @@ fn rename_intent_remains_when_destination_capture_fails_before_publish() {
     );
     assert!(!dir.join("slot-2").exists());
     assert!(dir.join("INTENT").is_file());
+    let mut departed = intent;
+    departed["pid"] = json!(0);
+    std::fs::write(dir.join("INTENT"), serde_json::to_vec(&departed).unwrap()).unwrap();
+    // Recovery runs in a later process: no injected faults remain.
+    drop(_scope);
+    // An interrupted `capturing` rename rolls back through the pinned restore.
+    assert!(matches!(
+        crate::file_ops::recover::recover_dir(&dir, true, None).action,
+        crate::file_ops::recover::RecoverAction::Cleaned
+            | crate::file_ops::recover::RecoverAction::RolledBack
+    ));
+    assert_eq!(fx.get("dst"), DESTINATION);
+    assert_eq!(fx.get("src"), SOURCE);
+    assert!(!dir.exists());
 }
 
 #[test]
@@ -2204,7 +2221,10 @@ fn rename_link_first_source_capture_failure_after_publish_keeps_commit() {
             .expect("recovery");
         let intent: Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("INTENT")).unwrap()).unwrap();
-        assert_eq!(intent["phase"], "committed", "{intent}");
+        assert_eq!(
+            intent["phase"], "committed",
+            "a post-commit capture never demotes the durable commit"
+        );
         assert_eq!(intent["order"], "link-first");
         assert!(fx.steps.lock().unwrap().contains(&Step::Linked));
         if overwrite {
@@ -2213,6 +2233,19 @@ fn rename_link_first_source_capture_failure_after_publish_keeps_commit() {
                 DESTINATION
             );
         }
+        let mut departed = intent;
+        departed["pid"] = json!(0);
+        std::fs::write(dir.join("INTENT"), serde_json::to_vec(&departed).unwrap()).unwrap();
+        // Committed only rolls forward: the overwritten destination is disposed
+        // and nothing is ever restored over the published source.
+        assert!(matches!(
+            crate::file_ops::recover::recover_dir(&dir, true, None).action,
+            crate::file_ops::recover::RecoverAction::RolledForward
+                | crate::file_ops::recover::RecoverAction::Cleaned
+        ));
+        assert!(!dir.exists());
+        assert_eq!(fx.get("dst"), SOURCE);
+        assert_eq!(fx.get("src"), SOURCE);
     }
 }
 
@@ -2239,7 +2272,10 @@ fn rename_exchange_first_writes_versioned_intent() {
     assert_eq!(intent["version"], 3);
     assert_eq!(intent["op"], "rename");
     assert_eq!(intent["order"], "exchange-first");
-    assert_eq!(intent["phase"], "committed");
+    assert_eq!(
+        intent["phase"], "publishing",
+        "exchange is fenced until post-effect validation and barriers"
+    );
     assert_eq!(intent["source"]["display"], fx.p("src"));
     assert_eq!(intent["destination"]["display"], fx.p("dst"));
     assert_eq!(intent["slots"]["slot-1"]["origin"]["display"], fx.p("dst"));

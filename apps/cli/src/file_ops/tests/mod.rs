@@ -13,6 +13,8 @@ use super::{Cancel, ErrorCode, EtagKey, FileOps, FileResult, Policy, Step};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod compensation;
+#[cfg(target_os = "linux")]
+mod durability;
 mod edit_write;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod exchangeless;

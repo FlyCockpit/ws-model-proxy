@@ -290,9 +290,34 @@ fn try_hold_recovery_lock(path: &Path) -> Result<Option<Flock<File>>, RecoverRep
     }
 }
 
+/// Narrow automatic undo. An interrupted `capturing` journal moved at most
+/// the captured object into R, and a delete in `publishing` was never
+/// acknowledged (success is returned only after `committed` is durable;
+/// between `captured` and `committed` a delete issues no public syscall).
+/// Both roll back through `restore_slot`'s rules only: the kept hardlink pin
+/// must match and `mv -n` never overwrites a newer public file. A rename or
+/// replace in `publishing` may already have published a new object at a public
+/// name, so it stays manual.
+fn manual_only(op: IntentOp, phase: IntentPhase) -> bool {
+    phase == IntentPhase::Publishing && op != IntentOp::Delete
+}
+
+/// Rename/replace `publishing`: the interrupted operation never proved its
+/// outcome, so neither rollback nor roll-forward is chosen automatically.
+const MANUAL_RESOLUTION: &str = "the operation stopped before its outcome was proven, so nothing is applied automatically. \
+For each listed slot, compare it with its `origin` in INTENT and with the current public file; \
+move a copy you want back with `mv -n <slot> <origin>` (never overwrite a newer public file). \
+Then delete this directory, including its `.wsmp-pin-*` hardlinks (which otherwise make the public file look hard-linked), and the sibling `.wsmp-lock-.wsmp-recover-*` file beside it";
+
 fn derived_phase(dir: &Path, intent: &Intent) -> IntentPhase {
     // A durable commit is authoritative even if delete/rename vacated origin.
     if intent.phase == IntentPhase::Committed {
+        return intent.phase;
+    }
+    if matches!(
+        intent.phase,
+        IntentPhase::Publishing | IntentPhase::Compensating | IntentPhase::Capturing
+    ) {
         return intent.phase;
     }
     if matches!(intent.op, IntentOp::Rename | IntentOp::Replace)
@@ -342,6 +367,15 @@ fn apply_intent(path: &Path, intent: &Intent, apply: bool, slots: Vec<String>) -
     }
     let phase_enum = derived_phase(path, intent);
     let phase = super::intent::intent_phase_name(phase_enum).to_string();
+    if manual_only(intent.op, phase_enum) {
+        return RecoverReport {
+            path: path.display().to_string(),
+            action: RecoverAction::Listed,
+            message: MANUAL_RESOLUTION.to_string(),
+            phase: Some(phase),
+            slots,
+        };
+    }
     if !apply {
         return RecoverReport {
             path: path.display().to_string(),
@@ -360,8 +394,13 @@ fn apply_intent(path: &Path, intent: &Intent, apply: bool, slots: Vec<String>) -
         };
     }
     let result = match phase_enum {
-        IntentPhase::Prepared | IntentPhase::Captured => roll_back(path, intent),
+        IntentPhase::Prepared
+        | IntentPhase::Captured
+        | IntentPhase::Compensating
+        | IntentPhase::Capturing => roll_back(path, intent),
+        IntentPhase::Publishing if intent.op == IntentOp::Delete => roll_back(path, intent),
         IntentPhase::Committed => roll_forward(path, intent),
+        IntentPhase::Publishing => Err(MANUAL_RESOLUTION.to_string()),
     };
     match result {
         Ok(action) => RecoverReport {
@@ -395,13 +434,39 @@ fn roll_back(dir: &Path, intent: &Intent) -> Result<RecoverAction, String> {
             "legacy INTENT has no durable identity anchors; manual resolution required".to_string(),
         );
     }
+    // Undoing a replace never publishes its own temp T (CLI-generated, never
+    // acknowledged): T is identified ONLY by the live `published` pin, moved off
+    // the public name if a compensation had not captured it yet, and disposed
+    // wherever it sits in R. Every other slot is then restored as usual.
+    let temp_anchor = match &intent.published {
+        Some(published) if intent.op == IntentOp::Replace => published.anchor.as_deref(),
+        _ => None,
+    };
+    if let (Some(published), Some(anchor)) = (&intent.published, temp_anchor)
+        && fstatat(recovery.as_fd(), anchor, AtFlags::AT_SYMLINK_NOFOLLOW).is_ok()
+    {
+        let pin = anchored_identity(&recovery, published)?;
+        if let Some(origin) = intent.source.to_path() {
+            remove_public_temp(&recovery, &origin, &pin)?;
+        }
+        let mut names: Vec<&str> = intent.slots.keys().map(String::as_str).collect();
+        names.extend(["tmp", "probe", PUBLISHED_LEFTOVER]);
+        for slot_name in names {
+            dispose_if_temp(&recovery, slot_name, &pin)?;
+        }
+        sync_directory(&recovery)?;
+    }
     for (slot_name, slot) in &intent.slots {
+        if temp_anchor.is_some() && slot.anchor.as_deref() == temp_anchor {
+            continue; // the temp's own record: disposed above, never restored
+        }
         let origin = slot
             .origin
             .to_path()
             .ok_or_else(|| format!("{slot_name} origin path is not recoverable"))?;
         restore_slot(&recovery, slot_name, slot, &origin)?;
     }
+    sync_directory(&recovery)?;
     remove_anchors(&recovery, intent)?;
     match remove_if_empty(&parent, name, dir)? {
         RecoverAction::Cleaned => Ok(RecoverAction::Cleaned),
@@ -409,10 +474,70 @@ fn roll_back(dir: &Path, intent: &Intent) -> Result<RecoverAction, String> {
     }
 }
 
+/// Private name a rejected public temp is captured to before its disposal.
+const PUBLISHED_LEFTOVER: &str = "published-leftover";
+
+/// A rejected replace temp still at the public name (interrupted before its
+/// compensation capture) leaves it with the same proof the live protocol uses:
+/// no-replace capture into R, identity re-proven there, then unlink.
+fn remove_public_temp(
+    recovery: &OwnedFd,
+    origin: &Path,
+    pin: &super::recovery::Held,
+) -> Result<(), String> {
+    let parent = origin.parent().ok_or("origin has no parent")?;
+    let name = origin.file_name().ok_or("origin has no file name")?;
+    let public = open_dir(parent)?;
+    match fstatat(public.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(raw) if pin.matches_for_restore(&Stat::from_raw(&raw)) => {}
+        Ok(_) | Err(Errno::ENOENT) => return Ok(()),
+        Err(errno) => return Err(format!("stat public temp candidate: {errno}")),
+    }
+    no_replace(
+        public.as_fd(),
+        name,
+        recovery.as_fd(),
+        PUBLISHED_LEFTOVER.as_ref(),
+        Primitive::Capture,
+    )
+    .map_err(|errno| format!("capture rejected temp from its public name: {errno}"))?;
+    sync_directory(&public)?;
+    sync_directory(recovery)
+}
+
+/// Unlink `name` in R only when it is the replace's own temp (pin match).
+fn dispose_if_temp(
+    recovery: &OwnedFd,
+    name: &str,
+    pin: &super::recovery::Held,
+) -> Result<(), String> {
+    match fstatat(recovery.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(raw) if pin.matches_for_restore(&Stat::from_raw(&raw)) => {
+            // The anchor keeps naming this inode, so the unlink is never the
+            // last name (no NFS silly-rename from our open proof).
+            unlinkat(recovery.as_fd(), name, UnlinkatFlags::NoRemoveDir)
+                .map_err(|errno| format!("dispose rejected temp {name}: {errno}"))
+        }
+        Ok(_) | Err(Errno::ENOENT) => Ok(()),
+        Err(errno) => Err(format!("stat {name}: {errno}")),
+    }
+}
+
 fn roll_forward(dir: &Path, intent: &Intent) -> Result<RecoverAction, String> {
     let parent = open_dir(dir.parent().ok_or("recovery path has no parent")?)?;
     let name = dir.file_name().ok_or("recovery path has no file name")?;
     let recovery = open_dir(dir)?;
+    // Cleanup retries must cross public barriers even if slots are now absent.
+    for path in std::iter::once(&intent.source)
+        .chain(intent.destination.iter())
+        .chain(intent.published.iter().map(|slot| &slot.origin))
+    {
+        if let Some(path) = path.to_path()
+            && let Some(parent) = path.parent()
+        {
+            sync_directory(&open_dir(parent)?)?;
+        }
+    }
     if intent.version < 3
         && (!present_slots(dir).is_empty()
             || intent.order == Some(super::intent::IntentOrder::ExchangeFirst))
@@ -429,6 +554,7 @@ fn roll_forward(dir: &Path, intent: &Intent) -> Result<RecoverAction, String> {
     for (slot_name, slot) in &intent.slots {
         dispose_slot(&recovery, slot_name, slot)?;
     }
+    sync_directory(&recovery)?;
     remove_anchors(&recovery, intent)?;
     match remove_if_empty(&parent, name, dir)? {
         RecoverAction::Cleaned => Ok(RecoverAction::Cleaned),
@@ -444,7 +570,29 @@ fn restore_slot(
 ) -> Result<(), String> {
     let slot_stat = match fstatat(recovery.as_fd(), slot_name, AtFlags::AT_SYMLINK_NOFOLLOW) {
         Ok(raw) => Stat::from_raw(&raw),
-        Err(Errno::ENOENT) => return Ok(()),
+        Err(Errno::ENOENT) => {
+            // Absence is not durable restoration evidence. A surviving pin
+            // requires proof of the public original before evidence removal.
+            if slot.anchor.as_deref().is_some_and(|name| {
+                fstatat(recovery.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW).is_ok()
+            }) {
+                let pin = anchored_identity(recovery, slot)?;
+                let parent = origin.parent().ok_or("origin has no parent")?;
+                let name = origin.file_name().ok_or("origin has no file name")?;
+                let dest = open_dir(parent)?;
+                let now =
+                    fstatat(dest.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(|error| {
+                        format!("absent {slot_name} has no proven public original: {error}")
+                    })?;
+                if !pin.matches_for_restore(&Stat::from_raw(&now)) {
+                    return Err(format!(
+                        "absent {slot_name} public origin differs; retaining evidence"
+                    ));
+                }
+                sync_directory(&dest)?;
+            }
+            return Ok(());
+        }
         Err(errno) => return Err(format!("stat {slot_name}: {errno}")),
     };
     let pin = anchored_identity(recovery, slot)?;
@@ -467,7 +615,13 @@ fn restore_slot(
         file_name,
         Primitive::Restore,
     ) {
-        Ok(()) | Err(Errno::ENOENT) => Ok(()),
+        Ok(()) => {
+            sync_directory(&dest_dir)?;
+            sync_directory(recovery)
+        }
+        Err(Errno::ENOENT) => Err(format!(
+            "restore {slot_name} became absent; retaining INTENT"
+        )),
         Err(Errno::EEXIST) => Err(format!(
             "{slot_name} origin is occupied; retaining slot and INTENT"
         )),
@@ -547,14 +701,16 @@ fn dispose_exchange_source_leftover(recovery: &OwnedFd, intent: &Intent) -> Resu
             "exchange source leftover identity is not proven; leaving it in place".to_string(),
         );
     }
-    match unlinkat(src_dir.as_fd(), src_name, UnlinkatFlags::NoRemoveDir) {
+    let result = match unlinkat(src_dir.as_fd(), src_name, UnlinkatFlags::NoRemoveDir) {
         Ok(()) | Err(Errno::ENOENT) => Ok(()),
         Err(Errno::EISDIR) => match unlinkat(src_dir.as_fd(), src_name, UnlinkatFlags::RemoveDir) {
             Ok(()) | Err(Errno::ENOENT) => Ok(()),
             Err(errno) => Err(format!("rmdir leftover source: {errno}")),
         },
         Err(errno) => Err(format!("unlink leftover source: {errno}")),
-    }
+    };
+    result?;
+    sync_directory(&src_dir)
 }
 
 /// The private hardlink, not the serialized inode number, prevents reuse. The
@@ -596,6 +752,7 @@ fn anchored_identity(
 }
 
 fn remove_anchors(recovery: &OwnedFd, intent: &Intent) -> Result<(), String> {
+    sync_directory(recovery)?;
     let known: HashSet<&str> = intent
         .slots
         .values()
@@ -647,7 +804,7 @@ fn remove_anchors(recovery: &OwnedFd, intent: &Intent) -> Result<(), String> {
         unlinkat(recovery.as_fd(), name.as_str(), UnlinkatFlags::NoRemoveDir)
             .map_err(|error| format!("remove identity anchor: {error}"))?;
     }
-    Ok(())
+    sync_directory(recovery)
 }
 
 fn remove_if_empty(
@@ -668,11 +825,17 @@ fn remove_if_empty(
         }
     }
     let intent = read_intent_file(dir)?.ok_or("INTENT disappeared before cleanup")?;
+    let recovery = open_dir(dir)?;
+    sync_directory(&recovery)?;
     let _ = fs::remove_file(dir.join("INTENT.new"));
     let _ = fs::remove_file(dir.join("INTENT"));
     let _ = fs::remove_file(dir.join(".wsmp-lock"));
+    sync_directory(&recovery)?;
     match unlinkat(parent.as_fd(), name, UnlinkatFlags::RemoveDir) {
-        Ok(()) => Ok(RecoverAction::Cleaned),
+        Ok(()) => {
+            sync_directory(parent)?;
+            Ok(RecoverAction::Cleaned)
+        }
         Err(errno) => {
             // An entry can arrive after the emptiness check. Restore durable
             // metadata when rmdir refuses instead of making recovery inert.
@@ -702,6 +865,11 @@ fn remove_if_empty(
             Err(format!("rmdir recovery: {errno}; INTENT retained"))
         }
     }
+}
+
+fn sync_directory(dir: &OwnedFd) -> Result<(), String> {
+    nix::unistd::fsync(dir.as_fd())
+        .map_err(|error| format!("directory sync: {error}; durability is not proven"))
 }
 
 fn read_intent_file(dir: &Path) -> Result<Option<Intent>, String> {
@@ -1080,7 +1248,7 @@ mod tests {
                     .expect("actual producer captured the sole original");
                 let report = recover_dir(&dir, true, None);
                 assert_eq!(report.action, RecoverAction::Listed, "{report:?}");
-                assert_eq!(report.phase.as_deref(), Some("captured"));
+                assert_eq!(report.phase.as_deref(), Some("compensating"));
                 assert_eq!(fs::read(dir.join(original_slot)).unwrap(), b"ONLY ORIGINAL");
                 assert_eq!(fs::read(&public).unwrap(), b"STRANGER");
             } else {

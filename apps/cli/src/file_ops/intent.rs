@@ -38,6 +38,16 @@ pub enum IntentPhase {
     /// At least one public object is in R; the rename/replace/delete has not
     /// committed.
     Captured,
+    /// Capture or its directory barriers are pending. An unproven capture must
+    /// not become restoration authority after restart. A capture after a
+    /// durable `Committed` record keeps `Committed`.
+    Capturing,
+    /// Publication/deletion may have taken effect, but validated durable commit
+    /// is not yet proven. Never infer rollback or disposal from this fence.
+    Publishing,
+    /// Rejected publication is being undone using the recorded origin map.
+    /// Public publication identity must not re-upgrade this to committed.
+    Compensating,
     /// The public commit has taken effect. Remaining slots are leftovers to
     /// dispose, not restore.
     Committed,
@@ -272,6 +282,9 @@ pub fn intent_phase_name(phase: IntentPhase) -> &'static str {
     match phase {
         IntentPhase::Prepared => "prepared",
         IntentPhase::Captured => "captured",
+        IntentPhase::Capturing => "capturing",
+        IntentPhase::Publishing => "publishing",
+        IntentPhase::Compensating => "compensating",
         IntentPhase::Committed => "committed",
     }
 }

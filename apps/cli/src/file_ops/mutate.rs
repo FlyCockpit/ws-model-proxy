@@ -7,7 +7,7 @@
 //! overwrite vacates both into R, proves held identity, and publishes source
 //! fail-if-exists. Link publication is link-first when the probe alias and the
 //! held source are one object (link S onto `to`, then capture S); noino keeps
-//! vacate-first. Direct NR needs no R. Returned etags bind the published
+//! vacate-first. Direct NR prepares R before moving public names. Returned etags bind the published
 //! bytes/mtime to the admitted source. Unpublished user sources are restored
 //! only to source or kept, never disposed as generated temps. Directories never
 //! overwrite, use NR only, and own-subtree moves are invalid_input. Move EINVAL
@@ -54,6 +54,7 @@ use super::error::{ErrorCode, FileError, FileResult};
 use super::exchange::{Primitive, is_unsupported, no_replace};
 use super::policy::Access;
 use super::read::current_etag;
+use super::recovery::refused_without_effect;
 use super::recovery::{Held, Origin, PublishMethod, RecoveryDir};
 use super::resolve::{Kind, ResolveOpts, Resolved, Stat, resolve};
 use super::stat::kind_name;
@@ -748,6 +749,8 @@ fn commit_rename(
                 ));
             }
             SameObjectRename::CaseOnlyRename => {
+                super::recovery::probe_dir_barrier(&from.dir)?;
+                super::recovery::probe_dir_barrier(&to.dir)?;
                 renameat(
                     from.dir.as_fd(),
                     from.name.as_os_str(),
@@ -755,13 +758,16 @@ fn commit_rename(
                     to.name.as_os_str(),
                 )
                 .map_err(FileError::errno)?;
+                nix::unistd::fsync(from.dir.as_fd())
+                    .map_err(|_| FileError::mutation_uncertain())?;
+                nix::unistd::fsync(to.dir.as_fd()).map_err(|_| FileError::mutation_uncertain())?;
                 return Ok((Vec::new(), false));
             }
             SameObjectRename::NotSameObject => {}
         }
     }
-    // A supported direct NR move requires no private directory (notably APFS
-    // supervised files). Only HardLinksOnly deliberately skips the kernel rung.
+    // Direct NR uses a pre-effect journal too, including APFS supervised files.
+    // Only HardLinksOnly deliberately skips the kernel rung.
     // EINVAL is also how vfat/exFAT/SMB reject a destination name. When a later
     // private NR probe succeeds, that EINVAL is `invalid_input`, not a missing
     // rename flag — and nothing is captured.
@@ -773,19 +779,41 @@ fn commit_rename(
                 .lstat()?
                 .map(|stat| Held::open(&from.dir, &from.name, stat))
                 .transpose()?;
-            match no_replace(
+            let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path)?;
+            let mut intent = super::intent::Intent::rename(
+                super::intent::IntentOrder::VacateFirst,
+                &from.full_path(),
+                &to.full_path(),
+                false,
+            );
+            intent.published =
+                Some(super::intent::IntentSlot::planned(&to.full_path()).with_stat(&src.stat));
+            recovery.prepare_intent(intent)?;
+            recovery.set_intent_phase(super::intent::IntentPhase::Publishing)?;
+            let before = recovery.effect_checkpoint();
+            recovery.begin_public_effect()?;
+            let moved = no_replace(
                 from.dir.as_fd(),
                 &from.name,
                 to.dir.as_fd(),
                 &to.name,
                 Primitive::Move,
-            ) {
+            );
+            if let Err(errno) = moved {
+                recovery.effect_refused(before, errno);
+            }
+            match moved {
                 Ok(()) => {
                     let _ = ops.step(Step::Moved);
                     if matches!(to.lstat(), Ok(Some(now)) if src.matches_for_restore(&now)) {
-                        return Ok((Vec::new(), false));
+                        let result = recovery
+                            .sync_effect(&[&from.dir, &to.dir])
+                            .and_then(|()| {
+                                recovery.set_intent_phase(super::intent::IntentPhase::Committed)
+                            })
+                            .map(|()| false);
+                        return finish_move(&mut recovery, result);
                     }
-                    let mut recovery = RecoveryDir::new(&to.dir, &to.dir_path)?;
                     let origin = Origin::new(&from.dir, &from.name, &from.full_path())
                         .map_err(FileError::errno)?;
                     let result = match candidate.as_mut() {
@@ -800,8 +828,32 @@ fn commit_rename(
                     return finish_move(&mut recovery, result.map(|()| false));
                 }
                 Err(Errno::EEXIST) => return Err(exists_error()),
-                Err(errno) if is_unsupported(errno) => move_errno = Some(errno),
-                Err(errno) => return Err(FileError::errno(errno)),
+                Err(errno) if is_unsupported(errno) => {
+                    // Nothing moved. Release this R (pins, journal, registry)
+                    // before any fallback allocates its own.
+                    recovery.close_unused()?;
+                    move_errno = Some(errno);
+                }
+                Err(errno) if refused_without_effect(errno) => {
+                    return Err(FileError::errno(errno));
+                }
+                // Ambiguous reply (EIO, timeouts, ENOENT/ESTALE after an NFS
+                // retransmit, EINTR): decide from the names, never the errno.
+                Err(errno) if matches!(from.lstat(), Ok(Some(now)) if src.matches_for_restore(&now)) =>
+                {
+                    return Err(FileError::errno(errno));
+                }
+                Err(_) if matches!(to.lstat(), Ok(Some(now)) if src.matches_for_restore(&now)) => {
+                    let _ = ops.step(Step::Moved);
+                    let result = recovery
+                        .sync_effect(&[&from.dir, &to.dir])
+                        .and_then(|()| {
+                            recovery.set_intent_phase(super::intent::IntentPhase::Committed)
+                        })
+                        .map(|()| false);
+                    return finish_move(&mut recovery, result);
+                }
+                Err(_) => return Err(recovery.uncertain()),
             }
         }
         if src.stat.kind() == Kind::Dir {
@@ -840,25 +892,58 @@ fn commit_rename(
             // Overwrite never tried Move. NR working in R does not prove the
             // public destination name is legal; EEXIST does, EINVAL does not.
             if dst.is_some() && matches!(method, Some(PublishMethod::NoReplace)) {
-                match no_replace(
+                let mut intent = super::intent::Intent::rename(
+                    super::intent::IntentOrder::VacateFirst,
+                    &from.full_path(),
+                    &to.full_path(),
+                    false,
+                );
+                intent.published =
+                    Some(super::intent::IntentSlot::planned(&to.full_path()).with_stat(&src.stat));
+                recovery.prepare_intent(intent)?;
+                recovery.set_intent_phase(super::intent::IntentPhase::Publishing)?;
+                let before = recovery.effect_checkpoint();
+                recovery.begin_public_effect()?;
+                let moved = no_replace(
                     from.dir.as_fd(),
                     &from.name,
                     to.dir.as_fd(),
                     &to.name,
                     Primitive::Move,
-                ) {
+                );
+                if let Err(errno) = moved {
+                    recovery.effect_refused(before, errno);
+                }
+                match moved {
                     Ok(()) => {
                         let _ = ops.step(Step::Moved);
                         if matches!(to.lstat(), Ok(Some(now)) if src.matches_for_restore(&now)) {
+                            recovery.sync_effect(&[&from.dir, &to.dir])?;
+                            recovery.set_intent_phase(super::intent::IntentPhase::Committed)?;
                             return Ok(false);
                         }
-                        // Landed, but not the admitted object. Keep it in R.
-                        let _ = recovery.capture(&to.dir, &to.name, &to.full_path());
+                        // Publication is unvalidated. Leave its fence and public
+                        // names intact; do not manufacture a destination origin.
+                        recovery.record_public(&to.dir, &to.name, &to.full_path());
                         return Err(recovery.uncertain());
                     }
-                    Err(Errno::EEXIST) => {}
+                    Err(Errno::EEXIST) => {
+                        recovery.set_intent_phase(super::intent::IntentPhase::Prepared)?;
+                    }
                     Err(Errno::EINVAL) => return Err(rejected_name()),
-                    Err(errno) => return Err(FileError::errno(errno)),
+                    Err(errno) if refused_without_effect(errno) => {
+                        return Err(FileError::errno(errno));
+                    }
+                    // Ambiguous reply: decide from the names, never the errno.
+                    Err(errno) if matches!(from.lstat(), Ok(Some(now)) if src.matches_for_restore(&now)) => {
+                        return Err(FileError::errno(errno));
+                    }
+                    Err(_) if matches!(to.lstat(), Ok(Some(now)) if src.matches_for_restore(&now)) => {
+                        recovery.sync_effect(&[&from.dir, &to.dir])?;
+                        recovery.set_intent_phase(super::intent::IntentPhase::Committed)?;
+                        return Ok(false);
+                    }
+                    Err(_) => return Err(recovery.uncertain()),
                 }
             }
             recovery.commit_move(ops, from, to, &mut src, dst.as_mut(), method, cancel)
@@ -882,7 +967,15 @@ fn finish_move(
 ) -> FileResult<(Vec<String>, bool)> {
     let recovered = recovery.finish();
     match result {
+        Ok(_) if !recovery.acknowledges_success() => Err(recovery.uncertain()),
         Ok(linked) => Ok((recovered, linked)),
+        // The durable `committed` record proves the rename took effect: a later
+        // durability-barrier failure is reported residue, not an uncertain
+        // outcome. The published etag is re-derived from the public name.
+        Err(error) if recovery.committed_barrier_failed() => {
+            tracing::warn!(error = %error.message, "rename committed; cleanup residue retained");
+            Ok((recovered, true))
+        }
         Err(error) if error.code == ErrorCode::UncertainOutcome || !recovery.settled() => {
             Err(recovery.uncertain())
         }
@@ -972,9 +1065,9 @@ fn verify_moved(
     match to.lstat() {
         Ok(Some(now)) if src.matches_for_restore(&now) => Ok(()),
         _ => {
-            if let Some(mut slot) = recovery.capture(&to.dir, &to.name, &to.full_path()) {
+            if let Some(slot) = recovery.capture_moved(to, candidate, origin) {
                 let _ = ops.step(Step::Captured);
-                if recovery.reclaim_origin(&mut slot, candidate, origin) {
+                if recovery.matches_for_restore(&slot, candidate) {
                     // Nothing after this uses either proof, and restore may unlink
                     // a private alias of this inode: close both unconditionally
                     // (a failed observation must not leave one open).
@@ -1086,6 +1179,7 @@ fn mkdir_resolved(
         pin.verify(ops, resolved, Access::Write, cancel)?;
     }
     cancel.check()?;
+    super::recovery::probe_dir_barrier(&resolved.dir)?;
     match mkdirat(
         resolved.dir.as_fd(),
         resolved.name.as_os_str(),
@@ -1093,6 +1187,16 @@ fn mkdir_resolved(
     ) {
         Ok(()) => {
             resolved.created.clear();
+            let directory = openat(
+                resolved.dir.as_fd(),
+                resolved.name.as_os_str(),
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|_| FileError::mutation_uncertain())?;
+            nix::unistd::fsync(directory.as_fd()).map_err(|_| FileError::mutation_uncertain())?;
+            nix::unistd::fsync(resolved.dir.as_fd())
+                .map_err(|_| FileError::mutation_uncertain())?;
             Ok(MkdirResult { created: true })
         }
         Err(Errno::EEXIST) => match resolved.lstat()? {
@@ -1191,12 +1295,14 @@ fn delete_impl(
     if st.kind() == Kind::Dir {
         // Never capture directories: link-only filesystems cannot restore them.
         // Kernel rmdir removes only an empty directory, preserving saved data.
+        super::recovery::probe_dir_barrier(&resolved.dir)?;
         unlinkat(
             resolved.dir.as_fd(),
             resolved.name.as_os_str(),
             UnlinkatFlags::RemoveDir,
         )
         .map_err(FileError::errno)?;
+        nix::unistd::fsync(resolved.dir.as_fd()).map_err(|_| FileError::mutation_uncertain())?;
         return Ok(DeleteResult {
             deleted: true,
             kind: "dir",
@@ -1217,8 +1323,8 @@ fn delete_impl(
                 None => recovery.uncertain(),
             });
         };
-        let _ = recovery.record_slot_identity(&slot);
-        let _ = recovery.set_intent_phase(super::intent::IntentPhase::Captured);
+        recovery.record_slot_identity(&slot)?;
+        recovery.set_intent_phase(super::intent::IntentPhase::Captured)?;
         let _ = ops.step(Step::Vacated);
         if !recovery.holds(&slot, &held) {
             held.release();
@@ -1232,13 +1338,16 @@ fn delete_impl(
             };
         }
         // A proven delete is committed; failed cleanup is recoverable success.
-        let _ = recovery.set_intent_phase(super::intent::IntentPhase::Committed);
+        recovery.set_intent_phase(super::intent::IntentPhase::Publishing)?;
+        recovery.sync_effect(&[&resolved.dir])?;
+        recovery.set_intent_phase(super::intent::IntentPhase::Committed)?;
         recovery.dispose(ops, &slot, &mut held);
         Ok(())
     })();
     held.release();
     let recovered = recovery.finish();
     match result {
+        Ok(()) if !recovery.acknowledges_success() => Err(recovery.uncertain()),
         Ok(()) => Ok(DeleteResult {
             deleted: true,
             kind: kind_name(st.kind()),

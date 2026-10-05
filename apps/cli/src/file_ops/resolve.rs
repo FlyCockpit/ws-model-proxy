@@ -418,6 +418,7 @@ pub fn resolve(input: &str, opts: &ResolveOpts<'_>) -> FileResult<Resolved> {
                     let mode = opts.make_parents.unwrap_or(0o755);
                     let here = fd_path(&cur).unwrap_or_else(|| join_names(&names));
                     opts.policy.check_path(Access::Write, &here.join(&comp))?;
+                    super::recovery::probe_dir_barrier(&cur)?;
                     mkdirat(cur.as_fd(), comp.as_os_str(), perm_mode(mode))
                         .map_err(FileError::errno)?;
                     let parent = cur.try_clone()?;
@@ -426,6 +427,11 @@ pub fn resolve(input: &str, opts: &ResolveOpts<'_>) -> FileResult<Resolved> {
                         name: comp.clone(),
                     });
                     cur = open_dir_at(&cur, &comp).map_err(FileError::errno)?;
+                    nix::unistd::fsync(cur.as_fd()).map_err(|_| FileError::mutation_uncertain())?;
+                    if let Some(created) = created.last() {
+                        nix::unistd::fsync(created.parent.as_fd())
+                            .map_err(|_| FileError::mutation_uncertain())?;
+                    }
                     names.push(comp);
                 }
                 Err(Errno::ENOENT) if opts.preview_missing => {

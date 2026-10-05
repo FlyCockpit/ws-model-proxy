@@ -56,7 +56,41 @@ impl RegistryEntry {
     }
 }
 
-pub fn register(recovery: &Path, intent: &Intent) -> Result<(), String> {
+/// Why a registry write failed. A state directory without directory fsync can
+/// never hold a durable discovery entry: callers report an unsafe filesystem
+/// naming that directory instead of a transient I/O error.
+#[derive(Debug)]
+pub enum RegistryError {
+    UnsupportedDirSync(PathBuf),
+    Io(String),
+}
+
+impl std::fmt::Display for RegistryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedDirSync(dir) => write!(
+                f,
+                "the CLI state directory `{}` does not support directory fsync, so file-recovery journals cannot be registered durably; nothing was changed",
+                dir.display()
+            ),
+            Self::Io(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<String> for RegistryError {
+    fn from(message: String) -> Self {
+        Self::Io(message)
+    }
+}
+
+impl From<&str> for RegistryError {
+    fn from(message: &str) -> Self {
+        Self::Io(message.to_string())
+    }
+}
+
+pub fn register(recovery: &Path, intent: &Intent) -> Result<(), RegistryError> {
     let dir = registry_dir()?;
     create_dir_synced(&dir)?;
     let path = entry_path(&dir, recovery);
@@ -78,6 +112,9 @@ pub fn unregister(recovery: &Path) {
             error = %err,
             "could not remove file-recovery registry entry"
         ),
+    }
+    if let Err(error) = sync_dir(&dir) {
+        tracing::warn!(recovery = %recovery.display(), %error, "registry removal sync failed; stale discovery may remain");
     }
 }
 
@@ -193,19 +230,19 @@ fn read_entry(path: &Path) -> Option<RegistryEntry> {
             tracing::warn!(
                 path = %path.display(),
                 error = %error,
-                "file-recovery registry entry is unparseable"
+                "file-recovery registry entry is unparsable"
             );
             None
         }
     }
 }
 
-fn write_entry_atomic(dir: &Path, dest: &Path, body: &[u8]) -> Result<(), String> {
+fn write_entry_atomic(dir: &Path, dest: &Path, body: &[u8]) -> Result<(), RegistryError> {
     let tmp = dest.with_extension("json.tmp");
     match fs::remove_file(&tmp) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(format!("registry tmp unlink: {err}")),
+        Err(err) => return Err(format!("registry tmp unlink: {err}").into()),
     }
     let mut file = OpenOptions::new()
         .create(true)
@@ -214,36 +251,55 @@ fn write_entry_atomic(dir: &Path, dest: &Path, body: &[u8]) -> Result<(), String
         .mode(0o600)
         .open(&tmp)
         .map_err(|err| format!("registry tmp create: {err}"))?;
-    file.write_all(body)
+    let written = file
+        .write_all(body)
         .and_then(|()| file.write_all(b"\n"))
-        .and_then(|()| file.sync_all())
-        .map_err(|err| format!("registry tmp write: {err}"))?;
+        .and_then(|()| file.sync_all());
     drop(file);
-    fs::rename(&tmp, dest).map_err(|err| format!("registry rename: {err}"))?;
-    sync_dir(dir);
-    Ok(())
-}
-
-fn create_dir_synced(dir: &Path) -> Result<(), String> {
-    fs::create_dir_all(dir).map_err(|err| format!("registry mkdir: {err}"))?;
-    sync_dir(dir);
-    Ok(())
-}
-
-fn sync_dir(dir: &Path) {
-    if let Ok(file) = File::open(dir)
-        && let Err(err) = file.sync_all()
-    {
-        let raw = err.raw_os_error();
-        if raw == Some(nix::libc::EINVAL) || raw == Some(nix::libc::ENOTSUP) {
-            tracing::warn!(
-                dir = %dir.display(),
-                "directory fsync is unsupported; file-recovery registry durability is best-effort"
-            );
-            return;
-        }
-        tracing::warn!(dir = %dir.display(), error = %err, "file-recovery registry dir fsync failed");
+    if let Err(err) = written.and_then(|()| fs::rename(&tmp, dest)) {
+        // Never leave a torn temp behind; its writeback is not retried.
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("registry tmp write: {err}").into());
     }
+    sync_dir(dir)
+}
+
+fn create_dir_synced(dir: &Path) -> Result<(), RegistryError> {
+    let mut missing = Vec::new();
+    let mut ancestor = dir;
+    while !ancestor.is_dir() {
+        missing.push(ancestor);
+        ancestor = ancestor
+            .parent()
+            .ok_or("registry has no existing ancestor")?;
+    }
+    fs::create_dir_all(dir).map_err(|err| format!("registry mkdir: {err}"))?;
+    sync_dir(dir)?;
+    for created in missing {
+        sync_dir(created)?;
+        if let Some(parent) = created.parent() {
+            sync_dir(parent)?;
+        }
+    }
+    Ok(())
+}
+
+fn sync_dir(dir: &Path) -> Result<(), RegistryError> {
+    File::open(dir)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| {
+            let raw = error.raw_os_error();
+            if raw == Some(nix::libc::EINVAL) || raw == Some(nix::libc::ENOTSUP) {
+                RegistryError::UnsupportedDirSync(dir.to_path_buf())
+            } else {
+                RegistryError::Io(format!("registry directory sync: {error}"))
+            }
+        })
+}
+
+#[cfg(test)]
+pub(crate) fn current_registry_dir() -> PathBuf {
+    registry_dir().expect("registry dir")
 }
 
 #[cfg(test)]
@@ -284,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_registry_files_are_skipped() {
+    fn unparsable_registry_files_are_skipped() {
         let _guard = install_temp_registry();
         let dir = registry_dir().expect("dir");
         create_dir_synced(&dir).expect("mkdir");
