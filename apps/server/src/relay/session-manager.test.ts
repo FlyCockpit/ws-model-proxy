@@ -5034,3 +5034,224 @@ describe("relay 2.7 telemetry", () => {
     manager.dispose();
   });
 });
+
+describe("relay live speech-to-text sessions", () => {
+  const SLUG = "inst-0123456789abcdef";
+  const realtimeEndpoint = {
+    slug: SLUG,
+    label: "Whisper",
+    kind: "openai-compatible",
+    status: "online",
+    defaultCapabilities: {
+      version: 2,
+      protocol: "openai-compatible",
+      audio: {
+        transcriptions: {
+          supported: true,
+          realtime: { supported: true, adapter: "segmented", maxItemSeconds: 30 },
+        },
+      },
+    },
+    models: [{ slug: "whisper", upstreamModelId: "whisper-large" }],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+    seedRegistrationMocks();
+  });
+
+  async function registered(manager: InstanceType<typeof RelaySessionManager>) {
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    const hello = JSON.parse(helloCli(undefined, socket)) as { endpoints: unknown[] };
+    hello.endpoints = [realtimeEndpoint];
+    await manager.handleTextFrame(socket, JSON.stringify(hello), now);
+    expect(socket.closes).toEqual([]);
+    socket.sends.length = 0;
+    return socket;
+  }
+
+  type Recorded = { events: unknown[]; ends: unknown[] };
+  function sttSession(manager: InstanceType<typeof RelaySessionManager>) {
+    const recorded: Recorded = { events: [], ends: [] };
+    const created = manager.createSttSession({
+      consumer: {
+        onEvent: (event) => recorded.events.push(event),
+        onDrain: () => {},
+        onEnd: (end) => recorded.ends.push(end),
+      },
+    });
+    if (!created.ok) throw new Error(created.reason);
+    return { session: created.session, recorded };
+  }
+
+  const sttTarget = {
+    cliDeviceId: "cli-device-id",
+    endpointSlug: SLUG,
+    upstreamModel: "whisper-large",
+    capabilities: {
+      version: 2 as const,
+      protocol: "openai-compatible" as const,
+      audio: {
+        transcriptions: {
+          supported: true,
+          realtime: { supported: true, adapter: "segmented" as const, maxItemSeconds: 30 },
+        },
+      },
+    },
+    deploymentManaged: true,
+  };
+
+  async function opened(manager: InstanceType<typeof RelaySessionManager>, socket: FakeSocket) {
+    const { session, recorded } = sttSession(manager);
+    const attempt = session.attach(sttTarget);
+    const open = firstControl(socket, "stt.open");
+    const sessionId = open.sessionId as string;
+    await manager.handleTextFrame(socket, JSON.stringify({ type: "stt.opened", sessionId }), now);
+    expect(await attempt).toMatchObject({ status: "opened", adapter: "segmented" });
+    return { session, recorded, sessionId };
+  }
+
+  it("opens on the CLI socket, streams audio, and routes events to the session", async () => {
+    const manager = new RelaySessionManager();
+    const socket = await registered(manager);
+    const { session, recorded, sessionId } = await opened(manager, socket);
+    session.appendAudio(new Uint8Array(8192));
+    expect(session.commit()).toEqual({ ok: true, itemSeq: 0 });
+    const audio = socket.sends.filter((send) => typeof send !== "string");
+    expect(audio).toHaveLength(1);
+    const parsed = parseRelayBinaryFrame(audio[0] as ArrayBuffer);
+    expect(parsed.metadata).toEqual({ type: "stt.audio", sessionId, seq: 0 });
+    expect(firstControl(socket, "stt.commit")).toEqual({
+      type: "stt.commit",
+      sessionId,
+      itemSeq: 0,
+    });
+    for (const frame of [
+      { type: "stt.audio.ack", sessionId, bytes: 8192 },
+      { type: "stt.event", sessionId, event: { kind: "completed", itemSeq: 0, text: "hello" } },
+    ]) {
+      await manager.handleTextFrame(socket, JSON.stringify(frame), now);
+    }
+    expect(recorded.events).toEqual([
+      { kind: "completed", itemSeq: 0, text: "hello", audioBytes: 8192 },
+    ]);
+    expect(socket.closes).toEqual([]);
+  });
+
+  it("refuses an endpoint the CLI does not list, and an offline CLI", async () => {
+    const manager = new RelaySessionManager();
+    await registered(manager);
+    const { session } = sttSession(manager);
+    expect(
+      await session.attach({ ...sttTarget, endpointSlug: "inst-ffffffffffffffff" }),
+    ).toMatchObject({ status: "failed", reason: "endpoint_unavailable" });
+    expect(await session.attach({ ...sttTarget, cliDeviceId: "other-device" })).toMatchObject({
+      status: "failed",
+      reason: "offline",
+    });
+  });
+
+  it("fails the CLI's sessions when its socket goes away", async () => {
+    const manager = new RelaySessionManager();
+    const socket = await registered(manager);
+    const { recorded } = await opened(manager, socket);
+    const opening = sttSession(manager);
+    const attempt = opening.session.attach(sttTarget);
+    await manager.removeSession(socket, now);
+    expect(recorded.ends).toEqual([{ cause: "disconnected", failure: "disconnected" }]);
+    expect(await attempt).toMatchObject({ status: "failed", reason: "disconnected" });
+  });
+
+  it("ends a session a malformed frame names, without logging its content", async () => {
+    const manager = new RelaySessionManager();
+    const socket = await registered(manager);
+    const errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const { recorded, sessionId } = await opened(manager, socket);
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({
+        type: "stt.event",
+        sessionId,
+        event: { kind: "delta", itemSeq: -1, text: "secret" },
+      }),
+      now,
+    );
+    expect(recorded.ends).toEqual([{ cause: "protocol_error", failure: "protocol_error" }]);
+    expect(firstControl(socket, "stt.close")).toEqual({
+      type: "stt.close",
+      sessionId,
+      reason: "protocol_error",
+    });
+    expect(JSON.stringify(errors.mock.calls)).not.toContain("secret");
+    expect(socket.closes).toEqual([]);
+    errors.mockRestore();
+  });
+
+  it("ends sessions whose endpoint leaves the inventory", async () => {
+    const manager = new RelaySessionManager();
+    const socket = await registered(manager);
+    const { recorded } = await opened(manager, socket);
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ type: "inventory.update", id: "inventory-id", endpoints: [] }),
+      now,
+    );
+    expect(recorded.ends).toEqual([{ cause: "endpoint_unavailable", failure: "not_found" }]);
+  });
+
+  it("drain ends live sessions at once and then closes the idle CLI socket", async () => {
+    const manager = new RelaySessionManager();
+    const socket = await registered(manager);
+    const { recorded, sessionId } = await opened(manager, socket);
+    manager.beginDrain();
+    expect(recorded.ends).toEqual([{ cause: "shutdown", failure: "cancelled" }]);
+    expect(firstControl(socket, "stt.close")).toEqual({
+      type: "stt.close",
+      sessionId,
+      reason: "cancelled",
+    });
+    // The closing leg is not work: the drain's idle close runs without
+    // waiting for stt.closed or the HTTP drain deadline.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(socket.closes).toEqual([{ code: 1001, reason: "shutdown" }]);
+  });
+
+  it("drain keeps a CLI socket that still serves a model request after its sessions end", async () => {
+    const manager = new RelaySessionManager();
+    const socket = await registered(manager);
+    await opened(manager, socket);
+    manager.registerRelayResponseHandlers({
+      requestId: "request-1",
+      cliDeviceId: "cli-device-id",
+      handlers: {
+        onHeaders() {},
+        onBody() {},
+        onComplete() {},
+        onError() {},
+        onCancelled() {},
+      },
+    });
+    manager.beginDrain();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(socket.closes).toEqual([]);
+  });
+
+  it("shutdown closes sessions before the CLI sockets and refuses new ones", async () => {
+    const manager = new RelaySessionManager();
+    const socket = await registered(manager);
+    const { recorded, sessionId } = await opened(manager, socket);
+    await manager.closeRelaySessions(now);
+    expect(recorded.ends).toEqual([{ cause: "shutdown", failure: "cancelled" }]);
+    expect(firstControl(socket, "stt.close")).toEqual({
+      type: "stt.close",
+      sessionId,
+      reason: "cancelled",
+    });
+    expect(socket.closes.length).toBeGreaterThan(0);
+    expect(
+      manager.createSttSession({ consumer: { onEvent() {}, onDrain() {}, onEnd() {} } }),
+    ).toEqual({ ok: false, reason: "shutting_down" });
+  });
+});

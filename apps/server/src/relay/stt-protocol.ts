@@ -72,7 +72,7 @@ export const sttSessionIdSchema = z
 const itemSeqSchema = z.number().int().min(0).max(STT_ITEM_SEQ_MAX);
 
 /** Per-item options; the vLLM adapter ignores both (it has neither). */
-const sttConfigSchema = z
+export const sttConfigSchema = z
   .object({
     language: z
       .string()

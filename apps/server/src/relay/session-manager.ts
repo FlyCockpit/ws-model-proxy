@@ -128,6 +128,14 @@ import {
   RelayRegistrationError,
   type ReportedRelayFeatures,
 } from "./registration.js";
+import type { SttConfig } from "./stt-protocol.js";
+import {
+  type SttClientMessage,
+  type SttCreateResult,
+  SttRelayHub,
+  type SttRelayLink,
+  type SttSessionConsumer,
+} from "./stt-relay.js";
 
 const WS_READY_STATE_OPEN = 1;
 /** Close code and reason for a socket closed because the server is shutting down. */
@@ -747,6 +755,10 @@ function interactiveTargetFromBinary(
   }
 }
 
+function isSttClientMessage(message: RelayClientControlMessage): message is SttClientMessage {
+  return message.type.startsWith("stt.");
+}
+
 function closeCodeForProtocolError(code: RelayProtocolErrorCode): number {
   if (code === "access_denied" || code === "identity_mismatch") return 1008;
   if (code === "internal") return 1011;
@@ -1223,6 +1235,17 @@ export class RelaySessionManager {
    * step) and CLI sockets by the close calls above.
    */
   private relayDrain = false;
+  /** Live speech-to-text sessions; each registered CLI session is one link. */
+  private readonly stt = new SttRelayHub({
+    resolveLink: (cliDeviceId, endpointSlug) => this.resolveSttLink(cliDeviceId, endpointSlug),
+    // During drain, the CLI socket closes once its last live session ended
+    // (deferred: the hub is mid-operation when it calls this).
+    onLinkIdle: (link) => {
+      if (!this.relayDrain) return;
+      queueMicrotask(() => this.considerDrainClose(link.cliDeviceId));
+    },
+  });
+  private readonly sttLinks = new WeakMap<SessionState, SttRelayLink>();
   private readonly routingEvaluator = new MetricRoutingEvaluator();
   private readonly poolMemberRecovery = new PoolMemberRecoveryScheduler({
     getOwnedCliDeviceIds: () => this.getActiveCliDeviceIds(),
@@ -1544,6 +1567,8 @@ export class RelaySessionManager {
         if (this.sessionsBySocket.get(socket) !== session) return;
         session.inventorySlugs = new Set(message.endpoints.map((endpoint) => endpoint.slug));
         this.pruneCounterEpochs(registration.cliDeviceId, session.inventorySlugs);
+        const sttLink = this.sttLinks.get(session);
+        if (sttLink) this.stt.endpointsChanged(sttLink, session.inventorySlugs);
         socket.send(
           encodeRelayServerControlMessage({
             type: "inventory.ok",
@@ -1707,9 +1732,12 @@ export class RelaySessionManager {
       return;
     }
 
-    // 2.11 live speech-to-text: the server opens no sessions yet, so every
-    // answer names an unknown session and is dropped, as a late frame would be.
-    if (message.type.startsWith("stt.")) return;
+    // 2.11 live speech-to-text. Frames for sessions this CLI does not hold
+    // (late, or another CLI's) are dropped.
+    if (isSttClientMessage(message)) {
+      if (session.cliDeviceId) this.stt.handleClientFrame(this.sttLinkFor(session), message);
+      return;
+    }
 
     if (
       message.type === "term.spawned" ||
@@ -1977,6 +2005,7 @@ export class RelaySessionManager {
     if (session.routingEvaluation) this.routingEvaluator.cancel(session.routingEvaluation);
     this.sessionsBySocket.delete(socket);
     this.failActiveRequestsForSession(session);
+    this.failSttSessions(session);
     const cliDeviceId = session.cliDeviceId;
     if (!cliDeviceId || this.sessionsByCliDeviceId.get(cliDeviceId) !== session) return null;
     this.sessionsByCliDeviceId.delete(cliDeviceId);
@@ -2126,6 +2155,9 @@ export class RelaySessionManager {
   beginDrain() {
     this.relayDrain = true;
     this.stopAffinityResetRecovery();
+    // Live transcription streams cannot be resumed and would hold their CLI
+    // sockets through the whole HTTP drain: they end now (clients reconnect).
+    this.stt.closeAll();
   }
 
   isDraining(): boolean {
@@ -2135,6 +2167,8 @@ export class RelaySessionManager {
   /** Shutdown step: cancel interactive work, close remaining CLI sockets, mark devices disconnected. */
   async closeRelaySessions(now = new Date()) {
     this.beginDrain();
+    // Live sessions end first, while the CLI sockets can still carry `stt.close`.
+    this.stt.closeAll();
     await Promise.allSettled([...this.affinityResetWrites]);
     await this.shutdownRelaySessions([...this.sessionsBySocket.values()], now);
   }
@@ -2183,6 +2217,8 @@ export class RelaySessionManager {
 
   private sessionHasActiveRelayWork(session: SessionState): boolean {
     if (session.bodyStreamsByRequest.size > 0) return true;
+    const sttLink = this.sttLinks.get(session);
+    if (sttLink && this.stt.hasActiveLegs(sttLink)) return true;
     if (!session.cliDeviceId) return false;
     for (const active of this.activeRelayRequests.values()) {
       if (active.cliDeviceId === session.cliDeviceId) return true;
@@ -3896,6 +3932,7 @@ export class RelaySessionManager {
       // would start later than the successor's fence and win with an older reading.
       if (existing.routingEvaluation) this.routingEvaluator.cancel(existing.routingEvaluation);
       this.failActiveRequestsForSession(existing);
+      this.failSttSessions(existing);
       existing.socket.close(1000, "replaced");
       this.sessionsBySocket.delete(existing.socket);
       clearTimeout(existing.unauthenticatedTimer);
@@ -3904,6 +3941,63 @@ export class RelaySessionManager {
       return;
     }
     this.sessionsByCliDeviceId.set(newSession.cliDeviceId, newSession);
+  }
+
+  /**
+   * A live speech-to-text session (design §3). Routing, admission and the
+   * client protocol (chunk 6) sit on top: the caller attaches the session to a
+   * candidate member with `attach`, and may try the next one when that fails.
+   */
+  createSttSession(input: {
+    consumer: SttSessionConsumer;
+    config?: SttConfig;
+    maxSessionMs?: number;
+  }): SttCreateResult {
+    if (this.relayDrain) return { ok: false, reason: "shutting_down" };
+    return this.stt.createSession(input);
+  }
+
+  private resolveSttLink(cliDeviceId: string, endpointSlug: string) {
+    if (this.relayDrain) return { ok: false as const, reason: "draining" as const };
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    if (
+      !session?.registered ||
+      !session.cliDeviceId ||
+      session.socket.readyState !== WS_READY_STATE_OPEN
+    ) {
+      return { ok: false as const, reason: "offline" as const };
+    }
+    if (!session.inventorySlugs.has(endpointSlug)) {
+      return { ok: false as const, reason: "endpoint_unavailable" as const };
+    }
+    return { ok: true as const, link: this.sttLinkFor(session) };
+  }
+
+  /** One link per registered CLI session; a successor session is a new link. */
+  private sttLinkFor(session: SessionState): SttRelayLink {
+    let link = this.sttLinks.get(session);
+    if (link) return link;
+    const socket = session.socket;
+    link = {
+      cliDeviceId: session.cliDeviceId ?? "",
+      isOpen: () =>
+        socket.readyState === WS_READY_STATE_OPEN && this.sessionsBySocket.get(socket) === session,
+      bufferedAmount: () => socket.bufferedAmount ?? 0,
+      send: (data) => {
+        if (socket.readyState !== WS_READY_STATE_OPEN) {
+          throw new Error("CLI session is disconnected.");
+        }
+        socket.send(data);
+      },
+    };
+    this.sttLinks.set(session, link);
+    return link;
+  }
+
+  /** The CLI connection is gone or replaced: its live sessions fail. */
+  private failSttSessions(session: SessionState) {
+    const link = this.sttLinks.get(session);
+    if (link) this.stt.linkLost(link);
   }
 
   private requireSession(socket: RelaySocket): SessionState {
@@ -4802,10 +4896,15 @@ export class RelaySessionManager {
       return true;
     }
     if (type.startsWith("stt.") && session.registered) {
-      // A live speech-to-text answer outside the strict schema concerns one
-      // session only; with no sessions open yet it is dropped. Nothing of the
-      // frame is logged (it may carry transcript text), and at most once a
-      // minute per CLI, since a broken CLI could send one per delta.
+      // A live speech-to-text answer outside the strict schema fails the one
+      // session it names (its events or credits would be lost otherwise); an
+      // unknown session id is dropped. Nothing of the frame is logged (it may
+      // carry transcript text), and at most once a minute per CLI, since a
+      // broken CLI could send one per delta.
+      const sttLink = this.sttLinks.get(session);
+      if (sttLink && typeof record.sessionId === "string") {
+        this.stt.malformed(sttLink, record.sessionId);
+      }
       const nowMs = Date.now();
       if (
         session.malformedSttLoggedAtMs === null ||
