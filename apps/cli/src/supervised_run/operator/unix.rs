@@ -69,39 +69,105 @@ fn parse_request(json: &str) -> Result<OperatorRequest> {
 
 /// The code `exited;<code>` reports: the exit status, or 128 + the signal
 /// that ended the command, as a shell reports it.
-fn exit_code(status: std::process::ExitStatus) -> u8 {
-    use std::os::unix::process::ExitStatusExt;
-    let code = status
-        .code()
-        .or_else(|| status.signal().map(|signal| 128 + signal))
-        .unwrap_or(255);
+fn exit_code(status: nix::sys::wait::WaitStatus) -> u8 {
+    use nix::sys::wait::WaitStatus;
+    let code = match status {
+        WaitStatus::Exited(_, code) => code,
+        WaitStatus::Signaled(_, signal, _) => 128 + signal as i32,
+        _ => 255,
+    };
     u8::try_from(code.clamp(0, 255)).unwrap_or(255)
 }
 
-/// `/bin/sh -c <command>` (as non-interactive deployment commands run)
-/// without the daemon's env names.
-fn shell_command(command: &str) -> std::process::Command {
-    let mut process = std::process::Command::new("/bin/sh");
-    process.arg("-c").arg(command);
-    for name in SUPERVISED_ENV_NAMES {
-        process.env_remove(name);
+/// The shell non-interactive deployment commands run in: `/bin/sh -c`.
+const SHELL: &std::ffi::CStr = c"/bin/sh";
+
+fn shell_args(command: &str) -> Result<Vec<std::ffi::CString>> {
+    Ok(vec![
+        c"sh".to_owned(),
+        c"-c".to_owned(),
+        std::ffi::CString::new(command).context("the command contains a NUL byte")?,
+    ])
+}
+
+/// This process's env without the daemon's env names, as `NAME=value`.
+fn command_env() -> Vec<std::ffi::CString> {
+    env_without_daemon_names(std::env::vars_os())
+}
+
+fn env_without_daemon_names(
+    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Vec<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    vars.filter(|(name, _)| {
+        !SUPERVISED_ENV_NAMES
+            .iter()
+            .any(|removed| name.as_bytes() == removed.as_bytes())
+    })
+    .filter_map(|(name, value)| {
+        let mut entry = name.as_bytes().to_vec();
+        entry.push(b'=');
+        entry.extend_from_slice(value.as_bytes());
+        std::ffi::CString::new(entry).ok()
+    })
+    .collect()
+}
+
+/// Spawns `path` with `args` and `env` in this terminal and waits for it.
+///
+/// The child starts with no blocked signals (this screen blocks SIGINT and
+/// SIGQUIT in [`block_terminal_signals`]) and with SIGINT, SIGQUIT and SIGPIPE
+/// back at their default actions. `std::process::Command` cannot do this without
+/// `unsafe`: it hands the caller's mask on unchanged. Not every `/bin/sh`
+/// clears an inherited mask (dash does; bash, which is `/bin/sh` on macOS
+/// and some Linux distributions, keeps it and passes it to everything it
+/// runs), so a command started through std would ignore Ctrl-C there.
+fn spawn_and_wait(
+    path: &std::ffi::CStr,
+    args: &[std::ffi::CString],
+    env: &[std::ffi::CString],
+) -> nix::Result<nix::sys::wait::WaitStatus> {
+    use nix::errno::Errno;
+    use nix::spawn::{PosixSpawnAttr, PosixSpawnFileActions, PosixSpawnFlags, posix_spawn};
+    use nix::sys::signal::{SigSet, Signal};
+    use nix::sys::wait::waitpid;
+
+    let mask = SigSet::empty();
+    let mut defaults = SigSet::empty();
+    for signal in [Signal::SIGINT, Signal::SIGQUIT, Signal::SIGPIPE] {
+        defaults.add(signal);
     }
-    process
+    let mut attr = PosixSpawnAttr::init()?;
+    attr.set_sigmask(&mask)?;
+    attr.set_sigdefault(&defaults)?;
+    attr.set_flags(
+        PosixSpawnFlags::POSIX_SPAWN_SETSIGMASK | PosixSpawnFlags::POSIX_SPAWN_SETSIGDEF,
+    )?;
+    let actions = PosixSpawnFileActions::init()?;
+    let pid = posix_spawn(path, &actions, &attr, args, env)?;
+    loop {
+        match waitpid(pid, None) {
+            Err(Errno::EINTR) => {}
+            result => return result,
+        }
+    }
 }
 
 /// Runs the confirmed command in this terminal and returns its exit code.
 /// The daemon's env names are removed from its env; this process's own env
-/// (which still holds the marker) is hidden by [`hide_own_env`] on Linux. A
-/// command that cannot start reports 127, like a shell.
+/// (which still holds the marker) is hidden by [`hide_own_env`] on Linux.
+/// Ctrl-C and Ctrl-\ reach the command (see [`spawn_and_wait`]) while this
+/// process, which blocks them, survives to report the exit and offer a
+/// retry. A command that cannot start reports 127, like a shell.
 fn run_command(command: &str) -> u8 {
-    let mut process = shell_command(command);
-    // std resets the signal mask in the child, so the command gets Ctrl-C
-    // and Ctrl-\ normally while this process (which blocks them) survives
-    // to report the exit and offer a retry.
-    match process.status() {
+    let status = shell_args(command).and_then(|args| {
+        spawn_and_wait(SHELL, &args, &command_env()).context("starting `/bin/sh`")
+    });
+    match status {
         Ok(status) => exit_code(status),
         Err(error) => {
-            let _ = crate::output::diagnostic(format!("wsmp: could not run the command: {error}"));
+            let _ =
+                crate::output::diagnostic(format!("wsmp: could not run the command: {error:#}"));
             127
         }
     }
@@ -228,60 +294,67 @@ mod tests {
 
     #[test]
     fn exit_codes_follow_the_shell_convention() {
-        let status = |script: &str| {
-            std::process::Command::new("sh")
-                .arg("-c")
-                .arg(script)
-                .status()
-                .expect("sh runs")
-        };
-        assert_eq!(exit_code(status("exit 0")), 0);
-        assert_eq!(exit_code(status("exit 3")), 3);
-        assert_eq!(exit_code(status("exit 255")), 255);
+        assert_eq!(run_command("exit 0"), 0);
+        assert_eq!(run_command("exit 3"), 3);
+        assert_eq!(run_command("exit 255"), 255);
         // Killed by SIGTERM (15): 128 + 15.
-        assert_eq!(exit_code(status("kill -TERM $$")), 143);
+        assert_eq!(run_command("kill -TERM $$"), 143);
         assert_eq!(run_command("exit 7"), 7);
     }
 
     #[test]
     fn the_command_does_not_see_the_daemon_env() {
-        let process = shell_command("true");
-        assert_eq!(process.get_program(), "/bin/sh");
+        assert_eq!(SHELL, c"/bin/sh");
         assert_eq!(
-            process.get_args().collect::<Vec<_>>(),
-            vec![std::ffi::OsStr::new("-c"), std::ffi::OsStr::new("true")]
+            shell_args("true").expect("args"),
+            vec![c"sh".to_owned(), c"-c".to_owned(), c"true".to_owned()]
         );
-        let removed = process
-            .get_envs()
-            .filter(|(_, value)| value.is_none())
-            .map(|(name, _)| name.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        for name in SUPERVISED_ENV_NAMES {
-            assert!(removed.iter().any(|removed| removed == name), "{name}");
-        }
+        assert!(shell_args("a\0b").is_err());
+        let vars = SUPERVISED_ENV_NAMES
+            .iter()
+            .map(|name| (name.into(), "secret".into()))
+            .chain([("PATH".into(), "/usr/bin".into())]);
+        assert_eq!(
+            env_without_daemon_names(vars),
+            vec![c"PATH=/usr/bin".to_owned()]
+        );
         assert!(SUPERVISED_ENV_NAMES.contains(&SUPERVISED_ENV_OPERATOR));
     }
 
-    #[cfg(target_os = "linux")]
+    /// The command must take Ctrl-C even though this process blocks it, and
+    /// whichever shell `/bin/sh` is: bash keeps an inherited mask, so a
+    /// blocked SIGINT would leave `kill -INT $$` pending and the script
+    /// would carry on to `exit 0`.
     #[test]
-    fn the_command_starts_with_no_blocked_signals() {
+    fn the_command_ends_on_sigint_although_this_process_blocks_it() {
         // Run on a fresh thread: the block applies to that thread only.
-        let blocked = std::thread::spawn(|| {
+        let code = std::thread::spawn(|| {
             block_terminal_signals().expect("block");
-            let output = std::process::Command::new("sh")
-                .arg("-c")
-                .arg("grep '^SigBlk:' /proc/self/status")
-                .output()
-                .expect("sh");
-            String::from_utf8(output.stdout).expect("utf8")
+            run_command("kill -INT $$; exit 0")
         })
         .join()
         .expect("thread");
-        let mask = blocked
-            .trim()
-            .strip_prefix("SigBlk:")
-            .expect("SigBlk line")
-            .trim();
-        assert!(mask.bytes().all(|byte| byte == b'0'), "{mask}");
+        assert_eq!(code, 130);
+    }
+
+    /// The mask the command starts with, checked without a shell in between
+    /// (dash would clear it and hide a leak).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_command_starts_with_no_blocked_signals() {
+        let status = std::thread::spawn(|| {
+            block_terminal_signals().expect("block");
+            let args = [
+                c"env".to_owned(),
+                c"grep".to_owned(),
+                c"-Eq".to_owned(),
+                c"^SigBlk:[[:space:]]+0+$".to_owned(),
+                c"/proc/self/status".to_owned(),
+            ];
+            spawn_and_wait(c"/usr/bin/env", &args, &command_env()).expect("spawn")
+        })
+        .join()
+        .expect("thread");
+        assert_eq!(exit_code(status), 0, "{status:?}");
     }
 }
