@@ -460,7 +460,13 @@ export class SttRelaySession {
    * One open attempt on one candidate. On `failed` the session is detached
    * again with its queue intact; the caller may try the next candidate.
    */
-  attach(target: SttAttachTarget): Promise<SttAttachResult> {
+  attach(
+    target: SttAttachTarget,
+    options: {
+      /** This attempt's own open budget, at most {@link STT_OPEN_TIMEOUT_MS}. */
+      openTimeoutMs?: number;
+    } = {},
+  ): Promise<SttAttachResult> {
     if (this.state === "ended") return Promise.resolve({ status: "ended" });
     if (this.state !== "detached") throw new Error("The session is already attached.");
     if (this.remainingSessionMs() < STT_MAX_SESSION_MS_MIN) {
@@ -543,7 +549,11 @@ export class SttRelaySession {
     this.state = "opening";
     this.adapter = realtime.adapter;
     this.maxItemSeconds = maxItemSeconds;
-    leg.timer = startTimer(STT_OPEN_TIMEOUT_MS, () =>
+    const openTimeoutMs = Math.max(
+      1,
+      Math.min(STT_OPEN_TIMEOUT_MS, Math.floor(options.openTimeoutMs ?? STT_OPEN_TIMEOUT_MS)),
+    );
+    leg.timer = startTimer(openTimeoutMs, () =>
       this.openFailed(leg, { reason: "timeout", failure: "timeout" }, "timeout"),
     );
     return new Promise((resolve) => {

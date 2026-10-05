@@ -411,6 +411,20 @@ describe("pre-open failover", () => {
     expect(hub.stats().legs).toBe(0);
   });
 
+  it("honours a shorter per-attempt open budget and caps a longer one", async () => {
+    const { link, create } = setup();
+    link("cli-a");
+    const { session } = create();
+    const short = session.attach(target("cli-a"), { openTimeoutMs: 1_000 });
+    vi.advanceTimersByTime(999);
+    expect(session.status).toBe("opening");
+    vi.advanceTimersByTime(1);
+    expect(await short).toEqual({ status: "failed", reason: "timeout", failure: "timeout" });
+    const long = session.attach(target("cli-a"), { openTimeoutMs: 60_000 });
+    vi.advanceTimersByTime(STT_OPEN_TIMEOUT_MS);
+    expect(await long).toMatchObject({ reason: "timeout" });
+  });
+
   it("fails an opening attempt when the CLI disconnects, and the session can still open elsewhere", async () => {
     const { hub, link, create } = setup();
     const first = link("cli-a");
