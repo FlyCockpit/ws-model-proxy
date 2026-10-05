@@ -950,6 +950,13 @@ BEGIN
           AND (owner.banned IS NOT TRUE OR owner."banExpires" <= now())) THEN
         RAISE EXCEPTION 'inactive owners cannot reclaim deployment resources' USING ERRCODE = '23514';
       END IF;
+      -- Retaking a claim covers resources released without proof of a stop (interactive
+      -- commands, banned-owner policy): a generic reclaim never has to know about it. An
+      -- explicit contradictory write hits deployment_instance_node_held_unknown.
+      IF NEW."claimHeld" AND NOT OLD."claimHeld"
+        AND NEW."heldUnknownSince" IS NOT DISTINCT FROM OLD."heldUnknownSince" THEN
+        NEW."heldUnknownSince" := NULL;
+      END IF;
     END IF;
   END IF;
   RETURN NEW;
@@ -968,6 +975,15 @@ ALTER TABLE deployment_instance_node DROP CONSTRAINT IF EXISTS deployment_instan
 ALTER TABLE deployment_instance_node ADD CONSTRAINT deployment_instance_node_bounds
   CHECK (rank BETWEEN 0 AND 63 AND port BETWEEN 1024 AND 65535 AND ("distPort" IS NULL OR "distPort" BETWEEN 1024 AND 65535) AND ("claimHeld" OR "stoppedAt" IS NOT NULL));
 CREATE UNIQUE INDEX IF NOT EXISTS deployment_instance_node_held_port ON deployment_instance_node ("cliDeviceId", port) WHERE "claimHeld";
+-- Resources released without proof the service stopped stay reserved for placement
+-- (deployment-service loadDeploymentState) but never alongside a held claim.
+ALTER TABLE deployment_instance_node DROP CONSTRAINT IF EXISTS deployment_instance_node_held_unknown;
+ALTER TABLE deployment_instance_node ADD CONSTRAINT deployment_instance_node_held_unknown
+  CHECK ("heldUnknownSince" IS NULL OR NOT "claimHeld");
+-- The reconciler's per-tick status-check sweep pages these rows by id; the table keeps every
+-- rank ever deployed, so only the (rare) held-unknown rows are indexed.
+CREATE INDEX IF NOT EXISTS deployment_instance_node_held_unknown_id
+  ON deployment_instance_node (id) WHERE "heldUnknownSince" IS NOT NULL;
 
 -- Operator terminals of interactive steps. Row shape only (the deployment_integrity
 -- trigger first clears values carried over from the old row; explicit contradictory

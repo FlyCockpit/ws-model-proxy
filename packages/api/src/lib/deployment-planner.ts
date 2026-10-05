@@ -72,6 +72,18 @@ export type ExistingDeployment = {
     blockedBy: string[];
   }>;
 };
+/**
+ * A rank's resources released WITHOUT proof that its service stopped (an inactive owner's
+ * cancelled interactive stop; `DeploymentInstanceNode.heldUnknownSince`). Never stoppable by a
+ * plan and always occupied, ports included, until a status check proves the service stopped.
+ */
+export type HeldDeploymentResources = {
+  instanceId: string;
+  nodeId: string;
+  resources: DeploymentClaim;
+  port: number;
+  distPort: number | null;
+};
 export type Placement = {
   nodeId: string;
   rank: number;
@@ -204,12 +216,17 @@ export function deploymentPermission(
 export function planDeployment(input: {
   nodes: DeploymentNode[];
   existing: ExistingDeployment[];
+  /** Resources held until a status check proves their service stopped; see the type. */
+  held?: HeldDeploymentResources[];
   variant: DeploymentVariant;
   nodeIds?: string[];
   groupCount: number;
   actor: "USER" | "AGENT" | "SCHEDULE";
 }): DeploymentPlacementPlan {
   const { nodes, existing, variant } = input;
+  const held = input.held ?? [];
+  const heldOn = (nodeId: string) =>
+    held.filter((h) => h.nodeId === nodeId).map((h) => h.resources);
   const count = variant.groupSize * input.groupCount;
   if (count > 256 || count < 1) throw refusal("BAD_REQUEST", "A plan supports 1–256 ranks");
   const byId = new Map(nodes.map((n) => [n.id, n]));
@@ -227,20 +244,20 @@ export function planDeployment(input: {
   candidates.sort(
     (a, b) =>
       Number(
-        !fit(
-          a,
-          rankValue(variant.resources, 0),
-          existing.flatMap((i) => i.nodes.filter((n) => n.nodeId === a.id).map((n) => n.resources)),
-        ),
+        !fit(a, rankValue(variant.resources, 0), [
+          ...existing.flatMap((i) =>
+            i.nodes.filter((n) => n.nodeId === a.id).map((n) => n.resources),
+          ),
+          ...heldOn(a.id),
+        ]),
       ) -
         Number(
-          !fit(
-            b,
-            rankValue(variant.resources, 0),
-            existing.flatMap((i) =>
+          !fit(b, rankValue(variant.resources, 0), [
+            ...existing.flatMap((i) =>
               i.nodes.filter((n) => n.nodeId === b.id).map((n) => n.resources),
             ),
-          ),
+            ...heldOn(b.id),
+          ]),
         ) || a.id.localeCompare(b.id),
   );
   const selected = input.nodeIds
@@ -264,27 +281,34 @@ export function planDeployment(input: {
     if (!node) throw new Error("Missing node");
     const req = rankValue(variant.resources, index % variant.groupSize);
     const active = existing.filter((i) => !stopIds.has(i.id));
-    const claims = active.flatMap((i) =>
-      i.nodes.filter((n) => n.nodeId === node.id).map((n) => n.resources),
-    );
+    const claims = [
+      ...active.flatMap((i) => i.nodes.filter((n) => n.nodeId === node.id).map((n) => n.resources)),
+      ...heldOn(node.id),
+    ];
     if (!fit(node, req, claims)) for (const id of conflicts(node, req, active)) stopIds.add(id);
   }
   const placements = selected.map((node, index) => {
     const rank = index % variant.groupSize;
     const active = existing.filter((i) => !stopIds.has(i.id));
-    const resources = fit(
-      node,
-      rankValue(variant.resources, rank),
-      active.flatMap((i) => i.nodes.filter((n) => n.nodeId === node.id).map((n) => n.resources)),
+    const claims = active.flatMap((i) =>
+      i.nodes.filter((n) => n.nodeId === node.id).map((n) => n.resources),
     );
-    if (!resources) throw refusal("CONFLICT", `Requirements exceed usable budgets on ${node.id}`);
+    const resources = fit(node, rankValue(variant.resources, rank), [
+      ...claims,
+      ...heldOn(node.id),
+    ]);
+    if (!resources)
+      throw refusal(
+        "CONFLICT",
+        fit(node, rankValue(variant.resources, rank), claims)
+          ? `Resources on ${node.id} stay held until WS Model Proxy confirms that an earlier service there stopped`
+          : `Requirements exceed usable budgets on ${node.id}`,
+      );
     // Stopping claims still own ports until confirmed stop: never reuse them now.
     const busy = new Set(
-      existing.flatMap((i) =>
-        i.nodes
-          .filter((n) => n.nodeId === node.id)
-          .flatMap((n) => (n.distPort === null ? [n.port] : [n.port, n.distPort])),
-      ),
+      [...existing.flatMap((i) => i.nodes), ...held]
+        .filter((n) => n.nodeId === node.id)
+        .flatMap((n) => (n.distPort === null ? [n.port] : [n.port, n.distPort])),
     );
     const ports: number[] = [];
     for (

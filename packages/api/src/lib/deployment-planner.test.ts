@@ -223,6 +223,56 @@ describe("durable deployment placement policy", () => {
       }).stopIds,
     ).toEqual(["a"]);
   });
+  it("never places on resources held until an earlier service is proven stopped", () => {
+    const held = [
+      {
+        instanceId: "gone",
+        nodeId: "1",
+        resources: { kind: "unified" as const, memoryGb: 100, ramGb: 0, gpus: [] },
+        port: 30000,
+        distPort: 30001,
+      },
+    ];
+    // Nothing to stop frees them: the plan is refused with the reason.
+    expect(() =>
+      planDeployment({
+        nodes: [node("1"), node("2")],
+        existing: [],
+        held,
+        variant,
+        nodeIds: ["1", "2"],
+        groupCount: 1,
+        actor: "USER",
+      }),
+    ).toThrow("stay held until WS Model Proxy confirms");
+    // Free nodes are preferred over a node with held resources, and held ports stay taken.
+    const plan = planDeployment({
+      nodes: [node("1"), node("2"), node("3")],
+      existing: [],
+      held,
+      variant,
+      groupCount: 1,
+      actor: "USER",
+    });
+    expect(plan.placements.map((p) => p.nodeId)).toEqual(["2", "3"]);
+    expect(plan.stopIds).toEqual([]);
+    const small = deploymentVariantSchema.parse({
+      ...variant,
+      groupSize: 1,
+      resources: [{ kind: "unified", memoryGb: 10 }],
+      iface: undefined,
+    });
+    const beside = planDeployment({
+      nodes: [node("1")],
+      existing: [],
+      held,
+      variant: small,
+      nodeIds: ["1"],
+      groupCount: 1,
+      actor: "USER",
+    });
+    expect(beside.placements[0]?.port).toBe(30002);
+  });
   it("uses free nodes first and never preempts when fit is sufficient", () => {
     const result = planDeployment({
       nodes: [node("1"), node("2"), node("3")],

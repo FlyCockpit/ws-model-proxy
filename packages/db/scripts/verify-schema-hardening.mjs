@@ -732,6 +732,26 @@ async function verifyDeploymentOperatorHardening() {
     await expectConstraintFailure(statement);
     negatives += 1;
   };
+  // Resources released without proof of a stop (held unknown): never with a held claim;
+  // retaking the claim clears the mark.
+  await refuse(`UPDATE deployment_instance_node SET "claimHeld" = true, "stoppedAt" = NULL,
+    "heldUnknownSince" = NOW() WHERE id = 'op-node'`);
+  await client.query(
+    `UPDATE deployment_instance_node SET "heldUnknownSince" = NOW() WHERE id = 'op-node'`,
+  );
+  await client.query(
+    `UPDATE deployment_instance_node SET "claimHeld" = true, "stoppedAt" = NULL WHERE id = 'op-node'`,
+  );
+  const retaken = (
+    await client.query(
+      `SELECT "heldUnknownSince" FROM deployment_instance_node WHERE id = 'op-node'`,
+    )
+  ).rows[0];
+  if (retaken?.heldUnknownSince !== null) throw new Error("retaking a claim keeps held-unknown");
+  await client.query(
+    `UPDATE deployment_instance_node SET "claimHeld" = false, "stoppedAt" = NOW() WHERE id = 'op-node'`,
+  );
+  positives += 2;
   // Never inserted awaiting; never PENDING/SUCCEEDED/FAILED -> AWAITING_OPERATOR.
   await refuse(`
     INSERT INTO deployment_step

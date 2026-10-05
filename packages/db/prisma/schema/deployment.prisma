@@ -165,20 +165,29 @@ model DeploymentInstance {
 }
 
 model DeploymentInstanceNode {
-  id          String             @id @default(cuid(2))
-  instanceId  String
-  cliDeviceId String
-  rank        Int
-  resources   Json
-  port        Int
-  distPort    Int?
-  /// False only after a confirmed stop. Offline/failed stops retain claims.
-  claimHeld   Boolean            @default(true)
+  id               String             @id @default(cuid(2))
+  instanceId       String
+  cliDeviceId      String
+  rank             Int
+  resources        Json
+  port             Int
+  distPort         Int?
+  /// False only after a confirmed stop (or, marked `heldUnknownSince`, an inactive owner's
+  /// cancelled interactive stop). Offline/failed stops retain claims.
+  claimHeld        Boolean            @default(true)
   /// New claims may be reserved behind this stopping instance, never dispatched before it releases.
-  blockedBy   String[]           @default([])
-  stoppedAt   DateTime?
-  Instance    DeploymentInstance @relation(fields: [instanceId], references: [id], onDelete: Restrict)
-  CliDevice   CliDevice          @relation(fields: [cliDeviceId], references: [id], onDelete: Restrict)
+  blockedBy        String[]           @default([])
+  stoppedAt        DateTime?
+  /// Set (with `claimHeld` false) when the claim was released WITHOUT proof that the service
+  /// stopped: an inactive (banned or deletion-pending) owner's unanswerable interactive stop
+  /// was cancelled so that account deletion is never blocked. Account and device deletion
+  /// ignore it, but placement and execution budgets still count these resources and ports
+  /// (no GPU double allocation) until a status check proves the service stopped (a
+  /// status-first stop of the rank, or the CLI's verified `stopped` inventory), the
+  /// instance retakes the claim, or the row goes with its device or owner.
+  heldUnknownSince DateTime?
+  Instance         DeploymentInstance @relation(fields: [instanceId], references: [id], onDelete: Restrict)
+  CliDevice        CliDevice          @relation(fields: [cliDeviceId], references: [id], onDelete: Restrict)
 
   @@unique([instanceId, rank])
   @@index([cliDeviceId, claimHeld])

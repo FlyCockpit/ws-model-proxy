@@ -534,6 +534,11 @@ type SessionState = {
   /** 2.5 CLI identity proof, relayed to browsers as is. */
   terminalIdentity: CliTerminalIdentity | null;
   allowHumanTerminal: boolean;
+  /**
+   * Server grant for deployments (dashboard `allowDeployments`). Operator terminals need it
+   * (send, attach); revoking it closes the waiting ones (design §12h L5).
+   */
+  allowDeployments: boolean;
   mcpFileRead: boolean;
   /** Server grant for MCP commands (dashboard). The CLI's own mode is in `features`. */
   mcpCommandMode: McpCommandModeName;
@@ -872,6 +877,8 @@ export class RelaySessionManager {
    */
   private deploymentTerminalPolicyAllows(session: SessionState): boolean {
     return (
+      // The dashboard grant too (design §12h L5): revoking it blocks sends and attaches.
+      session.allowDeployments &&
       this.sessionRunsOperatorJobs(session) &&
       session.features?.terminalSupported === true &&
       session.terminalPublicKey !== null
@@ -1276,6 +1283,7 @@ export class RelaySessionManager {
       terminalViewers: false,
       terminalIdentity: null,
       allowHumanTerminal: false,
+      allowDeployments: false,
       mcpCommandMode: "off",
       mcpFileRead: false,
       terminalsById: new Map(),
@@ -1422,7 +1430,12 @@ export class RelaySessionManager {
         this.installSessionFeatureGrants(
           session,
           stalePolicy
-            ? { allowHumanTerminal: false, mcpCommandMode: "off", mcpFileRead: false }
+            ? {
+                allowHumanTerminal: false,
+                allowDeployments: false,
+                mcpCommandMode: "off",
+                mcpFileRead: false,
+              }
             : registration,
         );
         const interactive = interactiveCapabilities(message.cli.capabilities);
@@ -2233,10 +2246,16 @@ export class RelaySessionManager {
         try {
           const device = await prisma.cliDevice.findUnique({
             where: { id: cliDeviceId },
-            select: { allowHumanTerminal: true, mcpCommandMode: true, mcpFileRead: true },
+            select: {
+              allowHumanTerminal: true,
+              allowDeployments: true,
+              mcpCommandMode: true,
+              mcpFileRead: true,
+            },
           });
           this.applyFeatureGrants(cliDeviceId, {
             allowHumanTerminal: device?.allowHumanTerminal === true,
+            allowDeployments: device?.allowDeployments === true,
             mcpCommandMode: device ? mcpCommandModeFromDb(device.mcpCommandMode) : "off",
             mcpFileRead: device?.mcpFileRead === true,
           });
@@ -2245,6 +2264,7 @@ export class RelaySessionManager {
           // unsupervised access. Reconciliation cancels work before we rethrow.
           this.applyFeatureGrants(cliDeviceId, {
             allowHumanTerminal: false,
+            allowDeployments: false,
             mcpCommandMode: "off",
             mcpFileRead: false,
           });
@@ -2372,6 +2392,8 @@ export class RelaySessionManager {
     cliDeviceId: string,
     grants: {
       allowHumanTerminal: boolean;
+      /** Absent: the deployments grant is unchanged. */
+      allowDeployments?: boolean;
       mcpCommandMode: McpCommandModeName;
       mcpFileRead: boolean;
     },
@@ -2387,11 +2409,13 @@ export class RelaySessionManager {
     session: SessionState,
     grants: {
       allowHumanTerminal: boolean;
+      allowDeployments?: boolean;
       mcpCommandMode: McpCommandModeName;
       mcpFileRead: boolean;
     },
   ) {
     session.allowHumanTerminal = grants.allowHumanTerminal;
+    if (grants.allowDeployments !== undefined) session.allowDeployments = grants.allowDeployments;
     session.mcpCommandMode = grants.mcpCommandMode;
     session.mcpFileRead = grants.mcpFileRead === true;
   }
@@ -4012,6 +4036,13 @@ export class RelaySessionManager {
     const execOk = allowsHeadlessCommands(this.effectiveCommandMode(session));
     if (!execOk) this.cancelAllCommands(session);
     this.cancelFileOpsNoLongerAllowed(session);
+    // Operator terminals follow the deployment operator policy (dashboard grant included):
+    // waiting ones close; a person's command already running is left to finish, like the
+    // CLI's own switch (its attach is refused meanwhile).
+    if (!this.deploymentTerminalPolicyAllows(session))
+      for (const tracker of [...session.operatorSteps.values()])
+        if (!tracker.cancelled && tracker.phase !== "running")
+          this.cancelOperatorStep(session, tracker);
   }
 
   private teardownInteractiveWork(session: SessionState) {

@@ -20,7 +20,10 @@
  *     older than CLI_AGENT_ACTION_RETENTION_DAYS, in `FOR UPDATE SKIP LOCKED`
  *     batches ordered by the (createdAt) index, and audit events whose user
  *     no longer exists (an independent bound for a row that outlived the
- *     deletion drain and the deleted-user purge).
+ *     deletion drain and the deleted-user purge). The deployment operator
+ *     audit (deployment_operator_event, same plain-id contract) gets the same
+ *     two sweeps with DEPLOYMENT_OPERATOR_EVENT_RETENTION_DAYS; its rows of a
+ *     deleted device or instance are bounded by the expiry.
  *  6. Hot-path history sweeps (DL-1 design (d), #78; @ws-model-proxy/db/hot-path-sweeps):
  *     terminal admission history older than RELAY_REQUEST_RETENTION_DAYS (it
  *     no longer blocks a parent delete, so it needs its own bound), the rest
@@ -79,6 +82,8 @@ import {
 } from "./usage-rollup.js";
 
 export const USAGE_RETENTION_INTERVAL_MS = 60 * 60 * 1000;
+/** Deployment operator terminal audit rows (interactive recipe commands) are kept this long. */
+export const DEPLOYMENT_OPERATOR_EVENT_RETENTION_DAYS = 90;
 export const USAGE_RETENTION_BATCH = 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -100,6 +105,7 @@ export type UsageRetentionResult = {
   minuteRowsCompacted: number;
   hourRowsDeleted: number;
   agentActionsDeleted: number;
+  operatorEventsDeleted: number;
   routingVerdictsDeleted: number;
   kvEvictionsDeleted: number;
   engineLoadMinutesDeleted: number;
@@ -406,6 +412,66 @@ export async function deleteOrphanCliAgentActions({
   }
 }
 
+/**
+ * Deletes deployment operator audit events (`deployment_operator_event`, plain ids, no
+ * foreign keys) older than {@link DEPLOYMENT_OPERATOR_EVENT_RETENTION_DAYS}, oldest first
+ * by the (createdAt) index, like {@link deleteExpiredCliAgentActions}.
+ */
+export async function deleteExpiredDeploymentOperatorEvents({
+  prisma = defaultPrisma as RetentionPrisma,
+  now,
+  retentionDays = DEPLOYMENT_OPERATOR_EVENT_RETENTION_DAYS,
+  batch = USAGE_RETENTION_BATCH,
+}: {
+  prisma?: RetentionPrisma;
+  now: Date;
+  retentionDays?: number;
+  batch?: number;
+}): Promise<number> {
+  const cutoff = new Date(now.getTime() - retentionDays * DAY_MS);
+  let deleted = 0;
+  for (;;) {
+    if (isDbShutdownFenceArmed()) return deleted;
+    const count = await prisma.$executeRaw`
+      DELETE FROM deployment_operator_event
+       WHERE ctid IN (
+         SELECT ctid FROM deployment_operator_event
+          WHERE "createdAt" < ${cutoff}
+          ORDER BY "createdAt"
+          LIMIT ${batch}
+          FOR UPDATE SKIP LOCKED)`;
+    deleted += count;
+    if (count < batch) return deleted;
+  }
+}
+
+/**
+ * Deletes deployment operator audit events whose user no longer exists: the independent
+ * bound behind the user delete's drain and the deleted-user purge, like
+ * {@link deleteOrphanCliAgentActions}.
+ */
+export async function deleteOrphanDeploymentOperatorEvents({
+  prisma = defaultPrisma as RetentionPrisma,
+  batch = USAGE_RETENTION_BATCH,
+}: {
+  prisma?: RetentionPrisma;
+  batch?: number;
+} = {}): Promise<number> {
+  let deleted = 0;
+  for (;;) {
+    if (isDbShutdownFenceArmed()) return deleted;
+    const count = await prisma.$executeRaw`
+      DELETE FROM deployment_operator_event
+       WHERE ctid IN (
+         SELECT e.ctid FROM deployment_operator_event e
+          WHERE NOT EXISTS (SELECT 1 FROM "user" u WHERE u.id = e."userId")
+          LIMIT ${batch}
+          FOR UPDATE OF e SKIP LOCKED)`;
+    deleted += count;
+    if (count < batch) return deleted;
+  }
+}
+
 export async function deleteExpiredRoutingVerdicts({
   prisma = defaultPrisma as RetentionPrisma,
   now,
@@ -538,6 +604,9 @@ export async function runUsageRetention({
   const agentActionsDeleted =
     (await deleteExpiredCliAgentActions({ prisma, now, batch })) +
     (await deleteOrphanCliAgentActions({ prisma, batch }));
+  const operatorEventsDeleted =
+    (await deleteExpiredDeploymentOperatorEvents({ prisma, now, batch })) +
+    (await deleteOrphanDeploymentOperatorEvents({ prisma, batch }));
   const routingVerdictsDeleted = await deleteExpiredRoutingVerdicts({ prisma, now, batch });
   const kvEvictionsDeleted = await deleteExpiredKvEvictions({ prisma, now, batch });
   const engineLoadMinutesDeleted = await deleteExpiredEngineLoadMinutes({ prisma, now, batch });
@@ -560,6 +629,7 @@ export async function runUsageRetention({
     minuteRowsCompacted,
     hourRowsDeleted,
     agentActionsDeleted,
+    operatorEventsDeleted,
     routingVerdictsDeleted,
     kvEvictionsDeleted,
     engineLoadMinutesDeleted,

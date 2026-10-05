@@ -284,6 +284,8 @@ function seedRegistrationMocks() {
     id: "cli-device-id",
     userId: "user-id",
     slug: "desktop",
+    // The dashboard deployments grant (operator terminals need it).
+    allowDeployments: true,
     connectionGeneration: 1,
   });
   db.cliToken.update.mockResolvedValue({ id: "token-id" });
@@ -3112,6 +3114,13 @@ describe("relay terminal viewers", () => {
   });
 
   it("sends interactive jobs and takes operator progress only with deploymentOperator", async () => {
+    db.cliDevice.upsert.mockResolvedValue({
+      id: "cli-device-id",
+      userId: "user-id",
+      slug: "desktop",
+      allowDeployments: true,
+      connectionGeneration: 1,
+    });
     const golden = JSON.parse(
       readFileSync(
         new URL("../../../cli/tests/fixtures/relay-current/deployment-jobs.json", import.meta.url),
@@ -3193,6 +3202,7 @@ describe("relay terminal viewers", () => {
         userId: "user-id",
         slug: "desktop",
         allowHumanTerminal: false,
+        allowDeployments: true,
         mcpCommandMode: "OFF",
         connectionGeneration: 1,
       });
@@ -3390,6 +3400,7 @@ describe("relay terminal viewers", () => {
         userId: "user-id",
         slug: "desktop",
         allowHumanTerminal: false,
+        allowDeployments: true,
         mcpCommandMode: "OFF",
         connectionGeneration: 1,
       });
@@ -3451,6 +3462,43 @@ describe("relay terminal viewers", () => {
       await report("awaiting_operator");
       manager.sweepExpiredPendingTerminals(Date.now() + 7 * 24 * 60 * 60 * 1000);
       expect(manager.listTerminalsForUser("user-id")).toHaveLength(1);
+    });
+
+    it("closes waiting operator terminals when the deployments grant is revoked (§12h L5)", async () => {
+      const { manager, target, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("awaiting_operator");
+      manager.applyFeatureGrants("cli-device-id", {
+        allowHumanTerminal: false,
+        allowDeployments: false,
+        mcpCommandMode: "off",
+        mcpFileRead: false,
+      });
+      expect(manager.listTerminalsForUser("user-id")).toEqual([]);
+      expect(outcomes()).toEqual(["opened", "cancelled"]);
+      // Nothing more is sent or attached while the grant is off.
+      expect(manager.deploymentSocket("cli-device-id")).toMatchObject({
+        deploymentOperator: false,
+      });
+      const fresh = { ...start, operator: { terminalId: id16(77), commandAuthor: "user" } } as Job;
+      expect(manager.sendDeploymentJob(target, fresh)).toBe(false);
+    });
+
+    it("leaves a person's running command alone when the deployments grant is revoked", async () => {
+      const { manager, target, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("awaiting_operator");
+      await report("operator_running");
+      manager.applyFeatureGrants("cli-device-id", {
+        allowHumanTerminal: false,
+        allowDeployments: false,
+        mcpCommandMode: "off",
+        mcpFileRead: false,
+      });
+      expect(outcomes()).toEqual(["opened", "accepted"]);
+      expect(manager.closeDeploymentOperatorStep(start.stepId, { keepRunning: true })).toBe(
+        "running",
+      );
     });
 
     it("keeps operator terminals open when the human or MCP grants change", async () => {
@@ -3542,6 +3590,7 @@ describe("relay terminal viewers", () => {
         userId: "user-id",
         slug: "laptop",
         allowHumanTerminal: false,
+        allowDeployments: true,
         mcpCommandMode: "OFF",
         connectionGeneration: 1,
       });

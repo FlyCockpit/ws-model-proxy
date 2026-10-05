@@ -24,7 +24,9 @@ const {
   ABANDONED_PENDING_AFTER_MS,
   compactMinuteRollups,
   deleteExpiredCliAgentActions,
+  deleteExpiredDeploymentOperatorEvents,
   deleteOrphanCliAgentActions,
+  deleteOrphanDeploymentOperatorEvents,
   deleteExpiredHourRollups,
   deleteExpiredRelayRequests,
   deleteExpiredRoutingVerdicts,
@@ -122,6 +124,7 @@ describe("usage retention", () => {
       minuteRowsCompacted: 0,
       hourRowsDeleted: 0,
       agentActionsDeleted: 0,
+      operatorEventsDeleted: 0,
       admissionHistoryPruned: 0,
       deletedUserRowsPurged: 0,
       orphanCapacityRuntimeDeleted: 0,
@@ -146,6 +149,56 @@ describe("usage retention", () => {
     await expect(
       runUsageRetention({ prisma: prisma as never, retentionDays: 14, batch: 100 }),
     ).resolves.toMatchObject({ agentActionsDeleted: 8 }); // 4 expired + 4 orphaned
+  });
+
+  it("runs the deployment operator audit steps in every sweep and reports their count", async () => {
+    const { prisma, tx } = fakePrisma();
+    prisma.$queryRaw.mockImplementation(async (strings: TemplateStringsArray) =>
+      strings.join("").includes("clock_timestamp") ? [{ now: NOW }] : [],
+    );
+    prisma.$executeRaw.mockImplementation(async (strings: TemplateStringsArray) =>
+      strings.join("?").includes("deployment_operator_event") ? 3 : 0,
+    );
+    tx.$queryRaw.mockResolvedValue([]);
+    await expect(
+      runUsageRetention({ prisma: prisma as never, retentionDays: 14, batch: 100 }),
+    ).resolves.toMatchObject({ operatorEventsDeleted: 6, agentActionsDeleted: 0 });
+  });
+
+  it("deletes expired and orphaned operator audit events in SKIP LOCKED batches, fence-checked", async () => {
+    const { prisma } = fakePrisma();
+    const statements: Array<{ sql: string; values: unknown[] }> = [];
+    let round = 0;
+    prisma.$executeRaw.mockImplementation(
+      async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        statements.push({ sql: strings.join("?"), values });
+        round += 1;
+        return round % 2 === 1 ? 2 : 1;
+      },
+    );
+    await expect(
+      deleteExpiredDeploymentOperatorEvents({ prisma: prisma as never, now: NOW, batch: 2 }),
+    ).resolves.toBe(3);
+    expect(statements[0]?.sql).toContain("DELETE FROM deployment_operator_event");
+    expect(statements[0]?.sql).toContain("FOR UPDATE SKIP LOCKED");
+    expect(statements[0]?.values[0]).toEqual(new Date(NOW.getTime() - 90 * 24 * 60 * 60 * 1000));
+    statements.length = 0;
+    await expect(
+      deleteOrphanDeploymentOperatorEvents({ prisma: prisma as never, batch: 2 }),
+    ).resolves.toBe(3);
+    expect(statements[0]?.sql).toContain(
+      'NOT EXISTS (SELECT 1 FROM "user" u WHERE u.id = e."userId")',
+    );
+    expect(statements[0]?.sql).toContain("FOR UPDATE OF e SKIP LOCKED");
+    armDbShutdownFence();
+    statements.length = 0;
+    await expect(
+      deleteExpiredDeploymentOperatorEvents({ prisma: prisma as never, now: NOW, batch: 2 }),
+    ).resolves.toBe(0);
+    await expect(
+      deleteOrphanDeploymentOperatorEvents({ prisma: prisma as never, batch: 2 }),
+    ).resolves.toBe(0);
+    expect(statements).toEqual([]);
   });
 
   it("deletes orphaned audit events (no such user) in SKIP LOCKED batches, fence-checked", async () => {

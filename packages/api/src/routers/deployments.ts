@@ -397,7 +397,7 @@ export const deploymentsRouter = {
     )
     .handler(async ({ context, input }) => {
       human(context);
-      return prisma.$transaction(
+      const updated = await prisma.$transaction(
         async (tx) => {
           await lockDeploymentOwner(tx, context.session.user.id);
           const state = await loadDeploymentState(tx, context.session.user.id);
@@ -408,14 +408,12 @@ export const deploymentsRouter = {
           if (portEnd < portStart)
             throw new ORPCError("BAD_REQUEST", { message: "Invalid deployment port range" });
           if (
-            state.existing.some((i) =>
-              i.nodes.some(
-                (n) =>
-                  n.nodeId === node.id &&
-                  (n.port < portStart ||
-                    n.port > portEnd ||
-                    (n.distPort !== null && (n.distPort < portStart || n.distPort > portEnd))),
-              ),
+            [...state.existing.flatMap((i) => i.nodes), ...state.held].some(
+              (n) =>
+                n.nodeId === node.id &&
+                (n.port < portStart ||
+                  n.port > portEnd ||
+                  (n.distPort !== null && (n.distPort < portStart || n.distPort > portEnd))),
             )
           )
             throw new ORPCError("CONFLICT", {
@@ -424,6 +422,21 @@ export const deploymentsRouter = {
           // Stops are dispatched only to granted nodes, so revoking while any
           // live instance has a rank here (claim held or not) would leave its
           // automatic stops waiting until the node is granted again.
+          // Resources held until a status check proves their service stopped need that check,
+          // which is a stop dispatched to this node: revoking would strand them (review L5).
+          if (
+            !input.allow &&
+            node.allowDeployments &&
+            !state.existing.some((i) => i.rankNodeIds.includes(node.id)) &&
+            state.held.some((h) => h.nodeId === node.id)
+          )
+            throw new ORPCError("CONFLICT", {
+              message:
+                "Resources on this node are held until WS Model Proxy confirms that an earlier " +
+                "deployment there stopped. Keep deployments allowed and the node connected (with " +
+                "its operator-terminal switch on) so the check can run, or remove the device",
+              data: { reason: "deployment_resources_unconfirmed" },
+            });
           if (
             !input.allow &&
             node.allowDeployments &&
@@ -450,6 +463,10 @@ export const deploymentsRouter = {
         },
         { isolationLevel: "ReadCommitted" },
       );
+      // A revoked grant closes the node's waiting operator terminals and blocks attaching
+      // to them (design §12h L5); the relay re-reads the committed grant.
+      await context.services?.onCliFeatureGrantsChanged?.(updated.id);
+      return updated;
     }),
   setAgentsMayPreempt: humanProcedure
     .input(z.object({ instanceId: deploymentIdSchema, allow: z.boolean() }).strict())

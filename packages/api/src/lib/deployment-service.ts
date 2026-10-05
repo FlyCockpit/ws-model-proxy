@@ -20,6 +20,7 @@ import {
   deploymentHeadAddress,
   deploymentPermission,
   type ExistingDeployment,
+  type HeldDeploymentResources,
   planDeployment,
   renderDeploymentCommand,
 } from "./deployment-planner";
@@ -112,7 +113,32 @@ export async function loadDeploymentState(tx: Tx, userId: string) {
       blockedBy: n.blockedBy,
     })),
   }));
-  return { nodes, existing, fingerprint: deploymentFingerprint({ nodes, existing }) };
+  // Released without proof that the service stopped: still occupied for placement and
+  // execution budgets (never stoppable by a plan), see DeploymentInstanceNode.heldUnknownSince.
+  const heldUnknown = { claimHeld: false, heldUnknownSince: { not: null } } as const;
+  const heldRows = await tx.deploymentInstance.findMany({
+    where: { userId, Nodes: { some: heldUnknown } },
+    select: { id: true, Nodes: { where: heldUnknown, orderBy: { rank: "asc" } } },
+    orderBy: { id: "asc" },
+  });
+  const held: HeldDeploymentResources[] = heldRows.flatMap((i) =>
+    i.Nodes.filter((n) => !n.claimHeld && n.heldUnknownSince != null).map((n) => ({
+      instanceId: i.id,
+      nodeId: n.cliDeviceId,
+      resources: deploymentClaimSchema.parse(n.resources),
+      port: n.port,
+      distPort: n.distPort,
+    })),
+  );
+  return {
+    nodes,
+    existing,
+    held,
+    // `held` joins the fingerprint only when present, so states without it hash as before.
+    fingerprint: deploymentFingerprint(
+      held.length ? { nodes, existing, held } : { nodes, existing },
+    ),
+  };
 }
 /** Caller holds owner, all affected node, policy and device generation locks. */
 export async function deploymentExecutionAllowed(
@@ -159,9 +185,11 @@ export async function deploymentExecutionAllowed(
     if (!node?.online || !affected.data.affectedNodeIds.includes(node.id)) return false;
     const own = deploymentClaimSchema.safeParse(rank.resources);
     if (!own.success || own.data.kind !== node.info.nodeKind) return false;
-    const others = state.existing
-      .filter((i) => i.id !== instanceId)
-      .flatMap((i) => i.nodes.filter((n) => n.nodeId === node.id));
+    const others = [
+      ...state.existing.filter((i) => i.id !== instanceId).flatMap((i) => i.nodes),
+      // Another instance's resources still held until its service is proven stopped.
+      ...state.held.filter((h) => h.instanceId !== instanceId),
+    ].filter((n) => n.nodeId === node.id);
     const claims = [own.data, ...others.map((n) => n.resources)];
     if (
       claims.reduce((sum, c) => sum + c.memoryGb, 0) >
@@ -339,6 +367,214 @@ export async function mintDeploymentOperator(
     terminalId: randomBytes(16).toString("base64url"),
     commandAuthor: await deploymentOperatorCommandAuthor(tx, instance, job),
   };
+}
+/** Whether a stored intent runs its command in an operator terminal, or its rank's stop does. */
+export function deploymentIntentOperatorFlags(intent: Prisma.JsonValue) {
+  const value =
+    intent !== null && typeof intent === "object" && !Array.isArray(intent) ? intent : {};
+  return {
+    interactive: value.interactive === true,
+    stopInteractive: value.stopInteractive === true,
+  };
+}
+/**
+ * Restart generations a person may request for an instance whose start is interactive (design
+ * §4): the automatic `restartAttempts >= 3` rule does not apply to a person's restart, but
+ * start sequences (`10 * generation + 0..3`) must stay below the health sequences (1000+).
+ */
+export const DEPLOYMENT_OPERATOR_RESTART_LIMIT = 90;
+/**
+ * Whether the instance's start generation runs a command in an operator terminal. Such an
+ * instance is never restarted automatically (a person must be there to run it): it stops and
+ * waits with `needsOperator=RESTART`. Restarts copy generation 0, so its intents decide.
+ */
+export async function deploymentStartsInteractive(tx: Tx, instanceId: string) {
+  const starts = await tx.deploymentStep.findMany({
+    where: {
+      instanceId,
+      phase: { in: ["prepare", "start", "after_join"] },
+      sequence: { lt: 10 },
+    },
+    select: { intent: true },
+  });
+  return starts.some((step) => deploymentIntentOperatorFlags(step.intent).interactive);
+}
+/**
+ * Keep `needsOperator` in step with what the instance waits for:
+ * - `STEP` while a step waits for its person (AWAITING_OPERATOR), or a person's run is past
+ *   its timeout (it may hang on a prompt);
+ * - otherwise `RESTART` ("stopped, needs you") while an instance meant to run, whose start is
+ *   interactive, has stopped with no restart pending and restarts left;
+ * - otherwise none.
+ * A waiting step comes first: a restart waits for the instance's stops anyway. Writes only on
+ * change; the timestamp is when the current need began.
+ */
+export async function syncDeploymentOperatorNeed(tx: Tx, instanceId: string) {
+  const instance = await tx.deploymentInstance.findUnique({
+    where: { id: instanceId },
+    select: {
+      needsOperator: true,
+      desiredState: true,
+      observedState: true,
+      nextRestartAt: true,
+      restartAttempts: true,
+    },
+  });
+  if (!instance) return;
+  const now = new Date();
+  const waiting = await tx.deploymentStep.count({
+    where: {
+      instanceId,
+      OR: [
+        { state: "AWAITING_OPERATOR" },
+        { state: "RUNNING", operatorSince: { not: null }, deadline: { lte: now } },
+      ],
+    },
+  });
+  const need = waiting
+    ? "STEP"
+    : instance.desiredState === "RUNNING" &&
+        instance.observedState === "STOPPED" &&
+        instance.nextRestartAt === null &&
+        instance.restartAttempts < DEPLOYMENT_OPERATOR_RESTART_LIMIT &&
+        (await deploymentStartsInteractive(tx, instanceId))
+      ? "RESTART"
+      : null;
+  if (need === instance.needsOperator) return;
+  await tx.deploymentInstance.update({
+    where: { id: instanceId },
+    data: { needsOperator: need, needsOperatorSince: need ? now : null },
+  });
+}
+/**
+ * A person restarts an instance that stopped while its start is interactive ("stopped, needs
+ * you"; design §4). Human only: the caller (chunk 9's `deployments.restartInstance`, a
+ * `humanProcedure` excluded from MCP) must have authenticated a person. The reconciler's
+ * maintenance then restarts it at once, past the automatic three-attempt rule, up to
+ * {@link DEPLOYMENT_OPERATOR_RESTART_LIMIT} generations.
+ */
+export async function restartDeploymentInstance(
+  userId: string,
+  instanceId: string,
+  db: Pick<typeof prisma, "$transaction"> = prisma,
+) {
+  return db.$transaction(
+    async (tx) => {
+      await lockDeploymentOwner(tx, userId);
+      await assertDeploymentOwnerActive(tx, userId);
+      const instance = await tx.deploymentInstance.findFirst({
+        where: { id: instanceId, userId },
+        include: { Nodes: true },
+      });
+      if (!instance) throw new ORPCError("NOT_FOUND");
+      if (
+        instance.needsOperator !== "RESTART" ||
+        instance.desiredState !== "RUNNING" ||
+        instance.observedState !== "STOPPED" ||
+        instance.Nodes.some((node) => node.claimHeld)
+      )
+        throw new ORPCError("CONFLICT", {
+          message: "This deployment is not stopped waiting for a restart",
+        });
+      // A stop still in flight (a status check of resources held since an earlier stop could
+      // not be confirmed, or a person's stop) must finish first; accepting the restart would
+      // clear the need and leave the instance waiting silently behind it (review L1).
+      const liveStop = await tx.deploymentStep.findFirst({
+        where: {
+          instanceId: instance.id,
+          phase: "stop",
+          state: { in: ["PENDING", "RUNNING", "AWAITING_OPERATOR"] },
+        },
+        select: { errorCode: true },
+      });
+      if (liveStop)
+        throw new ORPCError("CONFLICT", {
+          message:
+            "WS Model Proxy is still waiting for proof that this deployment's earlier service stopped; " +
+            "restart it once that check has finished",
+          data: { reason: "deployment_stop_pending", stopErrorCode: liveStop.errorCode },
+        });
+      if (instance.restartAttempts >= DEPLOYMENT_OPERATOR_RESTART_LIMIT)
+        throw new ORPCError("CONFLICT", {
+          message: "This deployment was restarted too many times; start it again from its recipe",
+        });
+      const now = new Date();
+      return tx.deploymentInstance.update({
+        where: { id: instance.id },
+        data: {
+          nextRestartAt: now,
+          operatorRestartRequestedAt: now,
+          needsOperator: null,
+          needsOperatorSince: null,
+        },
+      });
+    },
+    { isolationLevel: "ReadCommitted" },
+  );
+}
+/**
+ * A person reopens an interactive step whose operator terminal closed (declined, closed, or it
+ * never opened): AWAITING_OPERATOR without a terminal goes back to PENDING, and the reconciler
+ * dispatches it with a fresh terminal (the CLI checks status first). Human only (chunk 9's
+ * `deployments.reopenOperatorStep`). A step whose terminal is still open is refused (the
+ * person answers it there), and so is a step that is no longer the one to run (the reconciler
+ * settles those). Attempts are untouched: the close already gave a decline's attempt back.
+ */
+export async function reopenDeploymentOperatorStep(
+  userId: string,
+  stepId: string,
+  db: Pick<typeof prisma, "$transaction"> = prisma,
+) {
+  return db.$transaction(
+    async (tx) => {
+      await lockDeploymentOwner(tx, userId);
+      await assertDeploymentOwnerActive(tx, userId);
+      const step = await tx.deploymentStep.findFirst({
+        where: { id: stepId, Instance: { userId } },
+        include: { Instance: true },
+      });
+      if (!step) throw new ORPCError("NOT_FOUND");
+      if (step.state !== "AWAITING_OPERATOR")
+        throw new ORPCError("CONFLICT", { message: "This step does not wait for you" });
+      if (step.operatorTerminalId !== null)
+        throw new ORPCError("CONFLICT", { message: "This step's terminal is still open" });
+      const instance = step.Instance;
+      if (step.phase === "stop") {
+        const latest = await tx.deploymentStep.findFirst({
+          where: { instanceId: step.instanceId, rank: step.rank, phase: "stop" },
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+          select: { id: true },
+        });
+        const start = await tx.deploymentStep.findFirst({
+          where: { instanceId: step.instanceId, rank: step.rank, phase: "start" },
+          orderBy: [{ sequence: "desc" }, { id: "desc" }],
+          select: { createdAt: true },
+        });
+        if (latest?.id !== step.id || (start && step.createdAt < start.createdAt))
+          throw new ORPCError("CONFLICT", { message: "This step was replaced" });
+      } else if (
+        Math.floor(step.sequence / 10) !== instance.restartAttempts ||
+        instance.desiredState !== "RUNNING" ||
+        !["PENDING", "STARTING"].includes(instance.observedState)
+      )
+        throw new ORPCError("CONFLICT", { message: "This step was replaced" });
+      const reopened = await tx.deploymentStep.updateMany({
+        where: { id: step.id, state: "AWAITING_OPERATOR", operatorTerminalId: null },
+        data: {
+          state: "PENDING",
+          ownerEpoch: null,
+          deadline: null,
+          leaseExpiresAt: null,
+          // A spawn failure's reason is answered by the reopen; a stop's gang-stop reason stays.
+          ...(step.errorCode?.startsWith("operator_") ? { errorCode: null } : {}),
+        },
+      });
+      if (!reopened.count) throw new ORPCError("CONFLICT", { message: "This step changed" });
+      await syncDeploymentOperatorNeed(tx, step.instanceId);
+      return { stepId: step.id, instanceId: step.instanceId };
+    },
+    { isolationLevel: "ReadCommitted" },
+  );
 }
 /** Plan warning recorded when a person starts commands an agent wrote. */
 export const AGENT_EDITED_REVISION = "agent_edited_revision";

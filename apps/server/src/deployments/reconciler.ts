@@ -1,11 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { deploymentFingerprint } from "@ws-model-proxy/api/lib/deployment-planner";
 import {
+  DEPLOYMENT_OPERATOR_RESTART_LIMIT,
   deploymentCommandActor,
   deploymentExecutionAllowed,
+  deploymentStartsInteractive,
   lockDeploymentNodes,
   lockDeploymentOwner,
   mintDeploymentOperator,
+  deploymentIntentOperatorFlags as operatorFlags,
+  syncDeploymentOperatorNeed,
 } from "@ws-model-proxy/api/lib/deployment-service";
 import {
   deploymentHealthIntent,
@@ -21,8 +25,10 @@ import {
 } from "@ws-model-proxy/config/deployment-protocol";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
+import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import { z } from "zod";
 import { MANAGED_IDENTITY_REFUSED } from "./managed-identity.js";
+import { isDeploymentOperatorAction, recordDeploymentOperatorEvent } from "./operator-audit.js";
 
 type Tx = Prisma.TransactionClient;
 export type DeploymentSocket = {
@@ -94,20 +100,54 @@ const OPERATOR_HOLD_CODES: readonly string[] = Object.values(OPERATOR_HOLD);
 const OPERATOR_SUPERSEDED = "operator_superseded";
 /** The CLI refused an interactive job: its node-local operator-terminal switch is off. */
 const OPERATOR_TERMINALS_DISABLED = "operator_terminals_disabled";
-/** Whether a stored intent runs its command in an operator terminal, or its stop does. */
-function operatorFlags(intent: Prisma.JsonValue) {
-  const value =
-    intent !== null && typeof intent === "object" && !Array.isArray(intent) ? intent : {};
-  return {
-    interactive: value.interactive === true,
-    stopInteractive: value.stopInteractive === true,
-  };
+/** Final refusals of an interactive job (the CLI never ran it): not a stop to wait on. */
+const OPERATOR_STOP_REFUSALS: readonly string[] = [
+  "feature_disabled",
+  "command_mode_denied",
+  "interactive_unsupported",
+  "bad_job",
+];
+/**
+ * The owner is banned or deleting: their waiting operator steps are cancelled and claims
+ * released (as held unknown), so account deletion never waits for a terminal nobody may
+ * answer (design §12b policy).
+ */
+const OWNER_INACTIVE = "owner_inactive";
+/** Gang-stop reason of the stop that checks whether a held-unknown rank's service stopped. */
+const HELD_UNKNOWN_PROBE = "held_unknown_probe";
+/** A failed or cancelled held-unknown status check is retried no sooner than this. */
+const HELD_UNKNOWN_PROBE_RETRY = 300_000;
+/** Probe stops get their own sequences, clear of the gang stops' `100 + 10 * generation`. */
+const HELD_UNKNOWN_PROBE_SEQUENCE = 5000;
+const LIVE_STEP_STATES = ["PENDING", "RUNNING", "AWAITING_OPERATOR"] as const;
+/** The audit action of an interactive step's intent (prepare, start, after_join or stop). */
+function operatorAction(intent: Prisma.JsonValue) {
+  const action =
+    intent !== null && typeof intent === "object" && !Array.isArray(intent)
+      ? intent.action
+      : undefined;
+  return typeof action === "string" && isDeploymentOperatorAction(action) ? action : null;
 }
 type StepRow = Prisma.DeploymentStepGetPayload<true>;
 type InstanceRow = Pick<
   Prisma.DeploymentInstanceGetPayload<true>,
   "id" | "restartAttempts" | "desiredState" | "observedState"
 >;
+/** A banned (ban active now) or deletion-pending owner, as `userCredentialAccessBlocked`. */
+const inactiveOwner = (now: Date): Prisma.UserWhereInput => ({
+  OR: [
+    { deletionRequestedAt: { not: null } },
+    { banned: true, OR: [{ banExpires: null }, { banExpires: { gte: now } }] },
+  ],
+});
+/**
+ * The complement of {@link inactiveOwner}, spelled out: `NOT` over a nullable `banned` would
+ * drop never-banned owners (`banned` NULL) in SQL's three-valued logic.
+ */
+const activeOwner = (now: Date): Prisma.UserWhereInput => ({
+  deletionRequestedAt: null,
+  OR: [{ banned: null }, { banned: false }, { banExpires: { lt: now } }],
+});
 const memberWhere = (instanceId: string): Prisma.PoolMemberWhereInput => ({
   OR: [
     { DiscoveredModel: { Endpoint: { deploymentInstanceId: instanceId } } },
@@ -124,6 +164,9 @@ export class DeploymentReconciler {
   private timer: ReturnType<typeof setInterval> | null = null;
   private stepCursor: { updatedAt: Date; id: string } | null = null;
   private retentionCursor: string | null = null;
+  private drainCursor: string | null = null;
+  private probeCursor: string | null = null;
+  private revokedCursor: string | null = null;
   private instanceCursor: { updatedAt: Date; id: string } | null = null;
   private resultChains = new Map<string, Promise<unknown>>();
   constructor(
@@ -297,6 +340,16 @@ export class DeploymentReconciler {
       // waits for them (closed terminal, reopenable) instead of failing the deployment.
       if (interactive && result.status === "failed" && result.error === OPERATOR_TERMINALS_DISABLED)
         return this.operatorClosed(tx, step, { error: OPERATOR_TERMINALS_DISABLED });
+      // An interactive stop that did not end with proof (the person's run left the service
+      // alive, or execution failed) waits for its person again, claims held and reopenable:
+      // automatic stops wait for the human (review M1). The CLI's refusals stay failures.
+      if (
+        interactive &&
+        step.phase === "stop" &&
+        result.status === "failed" &&
+        !OPERATOR_STOP_REFUSALS.includes(result.error ?? "")
+      )
+        return this.operatorClosed(tx, step, { error: result.error ?? "job_failed" });
       const succeeded = result.status === "succeeded" && (step.phase !== "stop" || result.stopped);
       const changed = await tx.deploymentStep.updateMany({
         where: {
@@ -319,30 +372,28 @@ export class DeploymentReconciler {
       if (!changed.count) return false;
       if (interactive) await this.syncNeedsOperator(tx, step.instanceId);
       if (step.phase === "stop") {
+        const rank = {
+          instanceId: step.instanceId,
+          cliDeviceId: socket.cliDeviceId,
+          rank: step.rank,
+        };
         if (succeeded) {
           await tx.deploymentInstanceNode.updateMany({
-            where: {
-              instanceId: step.instanceId,
-              cliDeviceId: socket.cliDeviceId,
-              rank: step.rank,
-              claimHeld: true,
-            },
+            where: { ...rank, claimHeld: true },
             data: { claimHeld: false, stoppedAt: new Date() },
           });
-          const held = await tx.deploymentInstanceNode.count({
-            where: { instanceId: step.instanceId, claimHeld: true },
+          // The stop's status check proved the service stopped: resources released without
+          // that proof (an inactive owner's cancelled interactive stop) are free again.
+          await tx.deploymentInstanceNode.updateMany({
+            where: { ...rank, heldUnknownSince: { not: null } },
+            data: { heldUnknownSince: null },
           });
-          if (!held) {
-            await tx.deploymentInstance.update({
-              where: { id: step.instanceId },
-              data: { observedState: "STOPPED" },
-            });
-            await tx.poolMember.updateMany({
-              where: memberWhere(step.instanceId),
-              data: { instanceGate: "CLOSED", routingStatus: "DISABLED" },
-            });
-          }
-        } else {
+          await this.settleStopped(tx, step.instanceId);
+        } else if (
+          // A stop that only checked a held-unknown rank (claim already released) leaves the
+          // instance as it is; the rank stays held and the check is retried.
+          await tx.deploymentInstanceNode.count({ where: { ...rank, claimHeld: true } })
+        ) {
           await tx.deploymentInstance.update({
             where: { id: step.instanceId },
             data: { observedState: "STOP_PENDING" },
@@ -489,35 +540,64 @@ export class DeploymentReconciler {
     return true;
   }
   /**
-   * `needsOperator=STEP` exactly while a step of the instance waits for a person (or a
-   * person's run is past its timeout). A RESTART need (chunk 8) is left alone.
+   * `needsOperator`: STEP while a step of the instance waits for a person (or a person's run
+   * is past its timeout), else RESTART while an interactive start stopped and waits for a
+   * person's restart; see {@link syncDeploymentOperatorNeed}.
    */
-  private async syncNeedsOperator(tx: Tx, instanceId: string) {
-    const instance = await tx.deploymentInstance.findUnique({
-      where: { id: instanceId },
-      select: { needsOperator: true },
+  private syncNeedsOperator(tx: Tx, instanceId: string) {
+    return syncDeploymentOperatorNeed(tx, instanceId);
+  }
+  /**
+   * End a waiting interactive step the reconciler cancels (FAILED with `code`): its terminal
+   * is closed by step id first. A terminal whose command already runs is left alone and the
+   * step kept (its answer settles it; the CLI holds any stop behind it), so a person's run
+   * is never cut off and no `cancelled` row is written for it (§12h L6). Returns whether the
+   * step ended. A waiting step whose open terminal the session manager did not close (it
+   * had already closed, or its session is gone) is audited `cancelled` here.
+   */
+  private async cancelOperatorStep(tx: Tx, step: StepRow, code: string, userId: string) {
+    const closed = this.transport.closeOperatorStep?.(step.id, { keepRunning: true });
+    if (closed === "running") return false;
+    const changed = await tx.deploymentStep.updateMany({
+      where: { id: step.id, state: step.state, ownerEpoch: step.ownerEpoch },
+      data: { state: "FAILED", deadline: null, leaseExpiresAt: null, errorCode: code },
     });
-    if (!instance || instance.needsOperator === "RESTART") return;
-    // A person's run past its timeout needs them again too (it may hang on a prompt).
-    const waiting = await tx.deploymentStep.count({
+    if (!changed.count) return false;
+    const action = operatorAction(step.intent);
+    if (step.state === "AWAITING_OPERATOR" && closed !== "closed" && action)
+      recordDeploymentOperatorEvent({
+        userId,
+        instanceId: step.instanceId,
+        stepId: step.id,
+        cliDeviceId: step.cliDeviceId,
+        rank: step.rank,
+        action,
+        outcome: "cancelled",
+      });
+    return true;
+  }
+  /**
+   * The instance no longer starts (gang stop, desired stop, a newer generation): end its
+   * waiting interactive start steps (AWAITING_OPERATOR, or RUNNING with a terminal that has
+   * not drawn its screen yet) and close their terminals, so none outlives the instance's
+   * stop or keeps `needsOperator` (chunk 7 review, probe C). A person's run in progress is
+   * left to answer; the CLI holds the instance's stop behind it.
+   */
+  private async settleOperatorStarts(tx: Tx, instanceId: string, code: string) {
+    const steps = await tx.deploymentStep.findMany({
       where: {
         instanceId,
-        OR: [
-          { state: "AWAITING_OPERATOR" },
-          { state: "RUNNING", operatorSince: { not: null }, deadline: { lte: new Date() } },
-        ],
+        phase: { notIn: ["stop", "health"] },
+        OR: [{ state: "AWAITING_OPERATOR" }, { state: "RUNNING", operatorSince: null }],
       },
+      include: { Instance: { select: { userId: true } } },
     });
-    if (waiting && instance.needsOperator === null)
-      await tx.deploymentInstance.update({
-        where: { id: instanceId },
-        data: { needsOperator: "STEP", needsOperatorSince: new Date() },
-      });
-    else if (!waiting && instance.needsOperator === "STEP")
-      await tx.deploymentInstance.update({
-        where: { id: instanceId },
-        data: { needsOperator: null, needsOperatorSince: null },
-      });
+    let settled = false;
+    for (const step of steps) {
+      if (!operatorFlags(step.intent).interactive) continue;
+      if (await this.cancelOperatorStep(tx, step, code, step.Instance.userId)) settled = true;
+    }
+    if (settled) await this.syncNeedsOperator(tx, instanceId);
   }
   /**
    * Return an interactive step to PENDING so it is dispatched again with a fresh terminal
@@ -629,7 +709,14 @@ export class DeploymentReconciler {
   /** Record (once) why a PENDING interactive step is held; see {@link OPERATOR_HOLD}. */
   private async recordOperatorHold(tx: Tx, step: StepRow, reason: string) {
     if (step.errorCode === reason) return;
-    if (step.errorCode !== null && !OPERATOR_HOLD_CODES.includes(step.errorCode)) return;
+    // A held-unknown status check's marker gives way too, so its wait has a reason (review
+    // L1); the probe stays identifiable by its sequence.
+    if (
+      step.errorCode !== null &&
+      step.errorCode !== HELD_UNKNOWN_PROBE &&
+      !OPERATOR_HOLD_CODES.includes(step.errorCode)
+    )
+      return;
     await tx.deploymentStep.updateMany({
       where: { id: step.id, state: "PENDING" },
       data: { errorCode: reason },
@@ -706,10 +793,13 @@ export class DeploymentReconciler {
                 (latestStart && step.createdAt < latestStart.createdAt)
               )
                 return;
-              // A verified reconnect observation can settle only the exact durable stop.
+              // A verified reconnect observation can settle only the exact durable stop. It is
+              // also the status proof a held-unknown rank waits for (its cancelled stop).
+              const heldUnknown = !node.claimHeld && node.heldUnknownSince !== null;
               if (
                 step.phase !== "stop" ||
-                !["STOPPING", "STOP_PENDING"].includes(node.Instance.observedState) ||
+                (!heldUnknown &&
+                  !["STOPPING", "STOP_PENDING"].includes(node.Instance.observedState)) ||
                 !["RUNNING", "FAILED"].includes(step.state)
               )
                 return;
@@ -722,15 +812,11 @@ export class DeploymentReconciler {
                 where: { id: node.id, claimHeld: true },
                 data: { claimHeld: false, stoppedAt: new Date() },
               });
-              if (
-                !(await tx.deploymentInstanceNode.count({
-                  where: { instanceId: node.instanceId, claimHeld: true },
-                }))
-              )
-                await tx.deploymentInstance.update({
-                  where: { id: node.instanceId },
-                  data: { observedState: "STOPPED" },
-                });
+              await tx.deploymentInstanceNode.updateMany({
+                where: { id: node.id, heldUnknownSince: { not: null } },
+                data: { heldUnknownSince: null },
+              });
+              await this.settleStopped(tx, node.instanceId);
             } else if (
               observed.phase === "ready" &&
               ["start", "prepare", "after_join", "readiness"].includes(step.phase)
@@ -919,18 +1005,50 @@ export class DeploymentReconciler {
       data: { published: healthy, unpublishedAt: healthy ? null : new Date() },
     });
   }
+  /**
+   * After a confirmed stop: once no rank holds its claim, the instance is STOPPED and leaves
+   * routing, its waiting starts end, and its operator need follows (RESTART for an
+   * interactive start that should run). A FAILED instance (a held-unknown status check after
+   * its restarts ran out) stays FAILED.
+   */
+  private async settleStopped(tx: Tx, instanceId: string) {
+    const held = await tx.deploymentInstanceNode.count({ where: { instanceId, claimHeld: true } });
+    if (held) return;
+    await tx.deploymentInstance.updateMany({
+      where: { id: instanceId, observedState: { notIn: ["STOPPED", "FAILED"] } },
+      data: { observedState: "STOPPED" },
+    });
+    await tx.poolMember.updateMany({
+      where: memberWhere(instanceId),
+      data: { instanceGate: "CLOSED", routingStatus: "DISABLED" },
+    });
+    await this.settleOperatorStarts(tx, instanceId, OPERATOR_SUPERSEDED);
+    await this.syncNeedsOperator(tx, instanceId);
+  }
+  /**
+   * Stop every held rank of the instance (startup failure, deadline, node offline, desired
+   * stop seen in inventory, inactive owner). An interactive stop waits for its person with the
+   * claims held (§11). An instance whose start is interactive is never restarted
+   * automatically: once its stops settle it waits with `needsOperator=RESTART` for a person's
+   * restart (design §4).
+   */
   private async gangStop(tx: Tx, instanceId: string, code: string) {
     const instance = await tx.deploymentInstance.findUniqueOrThrow({
       where: { id: instanceId },
       include: { Nodes: { where: { claimHeld: true } } },
     });
+    const operatorStart = await deploymentStartsInteractive(tx, instanceId);
     await tx.deploymentInstance.update({
       where: { id: instanceId },
       data: {
         // Without held claims nothing can still be running, so there is nothing to stop.
         observedState: instance.Nodes.length ? "STOP_PENDING" : "STOPPED",
         ...(instance.desiredState === "RUNNING"
-          ? { nextRestartAt: new Date(Date.now() + (BACKOFF[instance.restartAttempts] ?? 300_000)) }
+          ? {
+              nextRestartAt: operatorStart
+                ? null
+                : new Date(Date.now() + (BACKOFF[instance.restartAttempts] ?? 300_000)),
+            }
           : {}),
       },
     });
@@ -946,6 +1064,8 @@ export class DeploymentReconciler {
       where: { instanceId, phase: { not: "stop" }, state: "PENDING" },
       data: { state: "FAILED", errorCode: code },
     });
+    // Waiting start terminals end with the start they belong to (design §4).
+    await this.settleOperatorStarts(tx, instanceId, code);
     for (const node of instance.Nodes) {
       const start = await tx.deploymentStep.findFirst({
         where: { instanceId, rank: node.rank, phase: "start" },
@@ -958,8 +1078,9 @@ export class DeploymentReconciler {
         phase: "stop",
         createdAt: { gte: start.createdAt },
       };
+      // A stop waiting for its person is live too: never a second stop beside it.
       const activeStop = await tx.deploymentStep.findFirst({
-        where: { ...currentStops, state: { in: ["PENDING", "RUNNING"] } },
+        where: { ...currentStops, state: { in: [...LIVE_STEP_STATES] } },
       });
       if (activeStop) continue;
       const priorStops = await tx.deploymentStep.count({ where: currentStops });
@@ -979,6 +1100,7 @@ export class DeploymentReconciler {
         },
       });
     }
+    await this.syncNeedsOperator(tx, instanceId);
   }
   private async tick() {
     const rows = await this.db.deploymentStep.findMany({
@@ -997,6 +1119,8 @@ export class DeploymentReconciler {
         id: true,
         updatedAt: true,
         instanceId: true,
+        cliDeviceId: true,
+        state: true,
         Instance: { select: { userId: true } },
       },
       orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
@@ -1006,6 +1130,9 @@ export class DeploymentReconciler {
     this.stepCursor = lastStep ? { updatedAt: lastStep.updatedAt, id: lastStep.id } : null;
     for (const row of rows) {
       if (this.stopped) return;
+      // Without a session for its node a step can change only if it waits for a person (a
+      // superseded waiting step ends); skip the others without a transaction.
+      if (row.state !== "AWAITING_OPERATOR" && !this.transport.current(row.cliDeviceId)) continue;
       const dispatch = await this.locked(row.Instance.userId, row.instanceId, async (tx) => {
         const step = await tx.deploymentStep.findUnique({
           where: { id: row.id },
@@ -1013,6 +1140,17 @@ export class DeploymentReconciler {
         });
         if (!step || !["PENDING", "RUNNING", "AWAITING_OPERATOR"].includes(step.state)) return null;
         const instance = step.Instance;
+        // A waiting step that is no longer the one to run (its instance stopped or restarted,
+        // a newer stop replaced it) ends, also while its node is away: it must not keep its
+        // instance's need or its claims' wait alive (chunk 7 review, probe C).
+        if (
+          step.state === "AWAITING_OPERATOR" &&
+          !(await this.operatorStepCurrent(tx, step, instance))
+        ) {
+          if (await this.cancelOperatorStep(tx, step, OPERATOR_SUPERSEDED, instance.userId))
+            await this.syncNeedsOperator(tx, instance.id);
+          return null;
+        }
         const socket = this.transport.current(step.cliDeviceId);
         if (!socket || socket.userId !== instance.userId || !socket.inventoryComplete) return null;
         const ownerEpoch = `${this.epoch}:${socket.generation}`;
@@ -1178,6 +1316,9 @@ export class DeploymentReconciler {
         )
           return null;
         if (operator.interactive) {
+          // A banned or deleting owner's terminal could never be answered (stops are otherwise
+          // dispatched for inactive owners; starts never are): the drain cancels it instead.
+          if (!(await this.ownerActive(tx, instance.userId))) return null;
           const hold = await this.operatorHold(tx, step, socket, instance);
           if (hold === "wait") return null;
           if (hold) {
@@ -1252,7 +1393,217 @@ export class DeploymentReconciler {
       if (!delivered) await this.undeliver(row.Instance.userId, row.instanceId, dispatch.job);
     }
     await this.maintenance();
+    await this.drainInactiveOwners();
+    await this.probeHeldUnknown();
+    await this.closeRevokedOperatorTerminals();
     await this.pruneHealthHistory();
+  }
+  private async ownerActive(tx: Tx, userId: string) {
+    const owner = await tx.user.findUnique({
+      where: { id: userId },
+      select: { banned: true, banExpires: true, deletionRequestedAt: true },
+    });
+    return !!owner && !userCredentialAccessBlocked(owner, new Date());
+  }
+  /**
+   * Banned or deletion-pending owners (design §12b policy, user decision §12g): their waiting
+   * operator steps (start or stop, waiting to open, open or closed) are cancelled (audit
+   * `cancelled`, terminals closed), a cancelled start gang-stops its instance, and a rank
+   * whose latest stop is a cancelled or failed interactive stop releases its claim, so account
+   * deletion is never blocked by a terminal nobody may answer. The service may still run
+   * there, so the release keeps the resources held unknown (`heldUnknownSince`): placement
+   * and execution budgets count them until a status check proves the service stopped. A
+   * person's run already in progress is left to answer. The indefinite hold of §11.3 applies
+   * to active owners only.
+   */
+  private async drainInactiveOwners() {
+    const now = new Date();
+    const interactive = { path: ["interactive"], equals: true };
+    const instances = await this.db.deploymentInstance.findMany({
+      where: {
+        ...(this.drainCursor ? { id: { gt: this.drainCursor } } : {}),
+        User: inactiveOwner(now),
+        OR: [
+          { Steps: { some: { state: { in: [...LIVE_STEP_STATES] }, intent: interactive } } },
+          {
+            Nodes: { some: { claimHeld: true } },
+            Steps: { some: { phase: "stop", state: "FAILED", intent: interactive } },
+          },
+        ],
+      },
+      select: { id: true, userId: true },
+      orderBy: { id: "asc" },
+      take: BATCH,
+    });
+    this.drainCursor = instances.at(-1)?.id ?? null;
+    for (const row of instances) {
+      if (this.stopped) return;
+      await this.locked(row.userId, row.id, async (tx) => {
+        if (await this.ownerActive(tx, row.userId)) return;
+        const instance = await tx.deploymentInstance.findUnique({ where: { id: row.id } });
+        if (!instance) return;
+        const starts = await tx.deploymentStep.findMany({
+          where: {
+            instanceId: row.id,
+            phase: { not: "stop" },
+            state: { in: [...LIVE_STEP_STATES] },
+          },
+        });
+        let startCancelled = false;
+        for (const step of starts) {
+          if (!operatorFlags(step.intent).interactive) continue;
+          if (await this.cancelOperatorStep(tx, step, OWNER_INACTIVE, row.userId))
+            startCancelled = true;
+        }
+        if (
+          startCancelled &&
+          !["STOP_PENDING", "STOPPING", "STOPPED", "FAILED"].includes(instance.observedState)
+        )
+          await this.gangStop(tx, row.id, OWNER_INACTIVE);
+        const stops = await tx.deploymentStep.findMany({
+          where: { instanceId: row.id, phase: "stop", state: { in: [...LIVE_STEP_STATES] } },
+        });
+        for (const stop of stops)
+          if (operatorFlags(stop.intent).interactive)
+            await this.cancelOperatorStep(tx, stop, OWNER_INACTIVE, row.userId);
+        const held = await tx.deploymentInstanceNode.findMany({
+          where: { instanceId: row.id, claimHeld: true },
+        });
+        let released = false;
+        for (const node of held) {
+          const latestStop = await tx.deploymentStep.findFirst({
+            where: { instanceId: row.id, rank: node.rank, phase: "stop" },
+            orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+          });
+          const latestStart = await tx.deploymentStep.findFirst({
+            where: { instanceId: row.id, rank: node.rank, phase: "start" },
+            orderBy: [{ sequence: "desc" }, { id: "desc" }],
+            select: { createdAt: true },
+          });
+          if (
+            latestStop?.state !== "FAILED" ||
+            !operatorFlags(latestStop.intent).interactive ||
+            (latestStart && latestStop.createdAt < latestStart.createdAt)
+          )
+            continue;
+          const changed = await tx.deploymentInstanceNode.updateMany({
+            where: { id: node.id, claimHeld: true },
+            data: { claimHeld: false, stoppedAt: now, heldUnknownSince: now },
+          });
+          if (changed.count) released = true;
+        }
+        if (released) await this.settleStopped(tx, row.id);
+        else await this.syncNeedsOperator(tx, row.id);
+      }).catch(() => {
+        console.error("[deployments] inactive owner drain failed");
+      });
+    }
+  }
+  /**
+   * Resources held unknown (see {@link drainInactiveOwners}) of an owner who is active again
+   * need a status check: a stop of the rank (its intent from the rank's latest start), which
+   * the CLI settles from status when the service is already stopped, and otherwise opens for
+   * the person. Its success frees the resources. One check at a time per rank; a failed or
+   * cancelled one is retried after {@link HELD_UNKNOWN_PROBE_RETRY}.
+   */
+  private async probeHeldUnknown() {
+    const nodes = await this.db.deploymentInstanceNode.findMany({
+      where: {
+        ...(this.probeCursor ? { id: { gt: this.probeCursor } } : {}),
+        claimHeld: false,
+        heldUnknownSince: { not: null },
+        Instance: { User: activeOwner(new Date()) },
+      },
+      select: { id: true, instanceId: true, Instance: { select: { userId: true } } },
+      orderBy: { id: "asc" },
+      take: BATCH,
+    });
+    this.probeCursor = nodes.at(-1)?.id ?? null;
+    for (const row of nodes) {
+      if (this.stopped) return;
+      await this.locked(row.Instance.userId, row.instanceId, async (tx) => {
+        if (!(await this.ownerActive(tx, row.Instance.userId))) return;
+        const node = await tx.deploymentInstanceNode.findUnique({
+          where: { id: row.id },
+          include: { Instance: { select: { runId: true } } },
+        });
+        if (!node || node.claimHeld || node.heldUnknownSince === null) return;
+        const start = await tx.deploymentStep.findFirst({
+          where: { instanceId: node.instanceId, rank: node.rank, phase: "start" },
+          orderBy: [{ sequence: "desc" }, { id: "desc" }],
+        });
+        if (!start) return;
+        const latest = await tx.deploymentStep.findFirst({
+          where: { instanceId: node.instanceId, rank: node.rank, phase: "stop" },
+          orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        });
+        if (latest && (LIVE_STEP_STATES as readonly string[]).includes(latest.state)) return;
+        // An earlier check (probe sequences) that failed or was cancelled is retried after a
+        // pause; the cancelled stop that released the resources is no check.
+        if (
+          latest &&
+          latest.sequence >= HELD_UNKNOWN_PROBE_SEQUENCE &&
+          latest.updatedAt.getTime() > Date.now() - HELD_UNKNOWN_PROBE_RETRY
+        )
+          return;
+        const top = await tx.deploymentStep.aggregate({
+          where: { instanceId: node.instanceId, rank: node.rank, phase: "stop" },
+          _max: { sequence: true },
+        });
+        const intent = originalDeploymentStopIntent(start.intent);
+        await tx.deploymentStep.create({
+          data: {
+            runId: node.Instance.runId,
+            instanceId: node.instanceId,
+            cliDeviceId: node.cliDeviceId,
+            rank: node.rank,
+            phase: "stop",
+            sequence: Math.max(HELD_UNKNOWN_PROBE_SEQUENCE - 1, top._max.sequence ?? 0) + 1,
+            intent,
+            intentHash: deploymentFingerprint(intent),
+            errorCode: HELD_UNKNOWN_PROBE,
+          },
+        });
+      }).catch(() => {
+        console.error("[deployments] held resource check failed");
+      });
+    }
+  }
+  /**
+   * A dashboard grant revocation (`allowDeployments` off) closes the node's waiting operator
+   * terminals (design §12h L5); the session manager also does on the grant change, and its
+   * attach gate requires the grant. A person's run in progress is left to finish. Repeats are
+   * no-ops: a cancelled terminal is not closed twice.
+   */
+  private async closeRevokedOperatorTerminals() {
+    const close = this.transport.closeOperatorStep?.bind(this.transport);
+    if (!close) return;
+    // Paged by id across ticks (review L4), so every live terminal is examined in turn.
+    const steps = await this.db.deploymentStep.findMany({
+      where: {
+        ...(this.revokedCursor ? { id: { gt: this.revokedCursor } } : {}),
+        state: { in: ["RUNNING", "AWAITING_OPERATOR"] },
+        operatorTerminalId: { not: null },
+      },
+      select: { id: true, cliDeviceId: true },
+      orderBy: { id: "asc" },
+      take: 256,
+    });
+    this.revokedCursor = steps.length === 256 ? (steps.at(-1)?.id ?? null) : null;
+    if (!steps.length) return;
+    const revoked = new Set(
+      (
+        await this.db.cliDevice.findMany({
+          where: {
+            id: { in: [...new Set(steps.map((s) => s.cliDeviceId))] },
+            allowDeployments: false,
+          },
+          select: { id: true },
+        })
+      ).map((device) => device.id),
+    );
+    for (const step of steps)
+      if (revoked.has(step.cliDeviceId)) close(step.id, { keepRunning: true });
   }
   /**
    * The CLI provably never received this job (no current socket, a refused
@@ -1428,11 +1779,16 @@ export class DeploymentReconciler {
             where: { deploymentInstanceId: instance.id },
             data: { published: false, unpublishedAt: new Date() },
           });
-          if (instance.Nodes.every((n) => !n.claimHeld))
+          // A start waiting for its person is cancelled by the desired stop (design §4); the
+          // stop's status-first check settles a start that never ran without anyone.
+          await this.settleOperatorStarts(tx, instance.id, "desired_stop");
+          if (instance.Nodes.every((n) => !n.claimHeld)) {
             await tx.deploymentInstance.update({
               where: { id: instance.id },
               data: { observedState: "STOPPED" },
             });
+            await this.syncNeedsOperator(tx, instance.id);
+          }
           return;
         }
         if (
@@ -1444,6 +1800,8 @@ export class DeploymentReconciler {
             where: { id: instance.id },
             data: { observedState: "STOPPED" },
           });
+          await this.settleOperatorStarts(tx, instance.id, OPERATOR_SUPERSEDED);
+          await this.syncNeedsOperator(tx, instance.id);
           return;
         }
         const liveNodes = await tx.cliDevice.findMany({
@@ -1469,13 +1827,32 @@ export class DeploymentReconciler {
           instance.nextRestartAt &&
           instance.nextRestartAt.getTime() <= Date.now()
         ) {
-          if (instance.restartAttempts >= 3) {
+          // A person's restart (an interactive start never restarts on its own) is not held
+          // to the automatic three attempts, only to the generation limit.
+          const personRequested =
+            instance.operatorRestartRequestedAt !== null &&
+            instance.nextRestartAt.getTime() <= instance.operatorRestartRequestedAt.getTime();
+          if (
+            instance.restartAttempts >= (personRequested ? DEPLOYMENT_OPERATOR_RESTART_LIMIT : 3)
+          ) {
             await tx.deploymentInstance.update({
               where: { id: instance.id },
               data: { observedState: "FAILED", nextRestartAt: null },
             });
             return;
           }
+          // A stop still in flight (a status check of held-unknown resources, or a person's
+          // stop) finishes before the instance starts again.
+          if (
+            await tx.deploymentStep.count({
+              where: {
+                instanceId: instance.id,
+                phase: "stop",
+                state: { in: [...LIVE_STEP_STATES] },
+              },
+            })
+          )
+            return;
           if (
             instance.Nodes.some((n) => n.claimHeld) ||
             !(await deploymentExecutionAllowed(tx, instance.userId, instance.id, instance.runId))
@@ -1492,9 +1869,10 @@ export class DeploymentReconciler {
             })
           )
             return;
+          // Retaking the claim also covers resources held unknown since a cancelled stop.
           await tx.deploymentInstanceNode.updateMany({
             where: { instanceId: instance.id },
-            data: { claimHeld: true, stoppedAt: null },
+            data: { claimHeld: true, stoppedAt: null, heldUnknownSince: null },
           });
           const starts = await tx.deploymentStep.findMany({
             where: {
@@ -1527,7 +1905,11 @@ export class DeploymentReconciler {
           });
           return;
         }
-        if (!["RUNNING", "UNHEALTHY"].includes(instance.observedState)) return;
+        if (!["RUNNING", "UNHEALTHY"].includes(instance.observedState)) {
+          // e.g. "stopped, needs you" for an interactive start (RESTART), kept current.
+          if (instance.observedState === "STOPPED") await this.syncNeedsOperator(tx, instance.id);
+          return;
+        }
         await this.attachMembers(tx, instance.id);
         await tx.poolMember.updateMany({
           where: memberWhere(instance.id),

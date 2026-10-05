@@ -191,6 +191,8 @@ export async function persistRelayRegistration({
   cliDeviceId: string;
   userId: string;
   allowHumanTerminal: boolean;
+  /** Dashboard deployments grant (operator terminals need it). */
+  allowDeployments: boolean;
   mcpCommandMode: McpCommandModeName;
   mcpFileRead: boolean;
   /** Fence for the connection this registration accepted; see the schema. */
@@ -393,6 +395,7 @@ export async function persistRelayRegistration({
               inventoryAcknowledgedAt: true,
               inventoryConfirmed: true,
               allowHumanTerminal: true,
+              allowDeployments: true,
               mcpCommandMode: true,
               mcpFileRead: true,
               connectionGeneration: true,
@@ -1029,6 +1032,7 @@ export async function persistRelayRegistration({
             cliDeviceId: cliDevice.id,
             userId: cliDevice.userId,
             allowHumanTerminal: cliDevice.allowHumanTerminal === true,
+            allowDeployments: cliDevice.allowDeployments === true,
             mcpCommandMode: mcpCommandModeFromDb(cliDevice.mcpCommandMode),
             mcpFileRead: cliDevice.mcpFileRead === true,
             connectionGeneration: cliDevice.connectionGeneration,

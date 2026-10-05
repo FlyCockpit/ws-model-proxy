@@ -1,5 +1,10 @@
 import { deploymentFingerprint } from "@ws-model-proxy/api/lib/deployment-planner";
 import {
+  loadDeploymentState,
+  reopenDeploymentOperatorStep,
+  restartDeploymentInstance,
+} from "@ws-model-proxy/api/lib/deployment-service";
+import {
   deploymentJobIntentSchema,
   deploymentSpecSchema,
   originalDeploymentStopIntent,
@@ -20,6 +25,7 @@ const integration = databaseUrl ? describe : describe.skip;
 // Loaded after the skip guard: `./reconciler.js` imports the production
 // Prisma client, whose env validation fails in a unit run with no database.
 let DeploymentReconciler: typeof import("./reconciler.js").DeploymentReconciler;
+let flushDeploymentOperatorAudit: typeof import("./operator-audit.js").flushDeploymentOperatorAudit;
 
 integration("deployment result fencing at PostgreSQL", () => {
   let fixture: ReturnType<typeof createFixturePrismaClient>;
@@ -339,9 +345,12 @@ integration("interactive operator steps at PostgreSQL", () => {
     fixture = createFixturePrismaClient(databaseUrl);
     production = createPrismaClient(databaseUrl);
     ({ DeploymentReconciler } = await import("./reconciler.js"));
+    ({ flushDeploymentOperatorAudit } = await import("./operator-audit.js"));
   });
   afterAll(async () => {
     for (const reconciler of reconcilers) await reconciler.stop();
+    await flushDeploymentOperatorAudit();
+    await fixture.deploymentOperatorEvent.deleteMany({ where: { userId: { in: users } } });
     // Synthetic jobs only; this fixture transport never launches operating-system processes.
     await fixture.deploymentInstanceNode.updateMany({
       where: { Instance: { userId: { in: users } } },
@@ -572,6 +581,8 @@ integration("interactive operator steps at PostgreSQL", () => {
     const jobs: DeploymentJob[] = [];
     const deviceOf = new Map<string, string>();
     const closes: Array<{ stepId: string; keepRunning: boolean }> = [];
+    /** Sends and closes in the order they happened. */
+    const log: string[] = [];
     const control = {
       closeAnswer: "absent" as "closed" | "running" | "absent",
       sendOk: true,
@@ -581,11 +592,13 @@ integration("interactive operator steps at PostgreSQL", () => {
         current: (id) => live.get(id) ?? null,
         send: (socket, job) => {
           jobs.push(job);
+          log.push(`send:${job.stepId}`);
           deviceOf.set(job.stepId, socket.cliDeviceId);
           return control.sendOk;
         },
         closeOperatorStep: (stepId, options) => {
           closes.push({ stepId, keepRunning: options?.keepRunning === true });
+          log.push(`close:${stepId}`);
           return control.closeAnswer;
         },
       },
@@ -623,7 +636,7 @@ integration("interactive operator steps at PostgreSQL", () => {
         ...extra,
       });
     }
-    return { reconciler, jobs, closes, control, live, ticks, tickUntil, report };
+    return { reconciler, jobs, closes, log, control, live, ticks, tickUntil, report };
   }
   const step = (id: string) => fixture.deploymentStep.findUniqueOrThrow({ where: { id } });
   const need = async (id: string) =>
@@ -1281,4 +1294,693 @@ integration("interactive operator steps at PostgreSQL", () => {
       await fixture.deploymentStep.count({ where: { instanceId: b.instance.id, phase: "stop" } }),
     ).toBe(1);
   });
+
+  // ---- Chunk 8: lifecycle (gang stop, desired stop, restart policy, inactive owners) ----
+
+  /** Steps of the instance's rank in a phase, oldest first. */
+  const stepsOf = (instanceId: string, phase: string) =>
+    fixture.deploymentStep.findMany({
+      where: { instanceId, phase },
+      orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+    });
+  /** Make the instance's node look offline long enough for maintenance's gang stop. */
+  async function offline(deviceId: string, instanceId: string) {
+    await fixture.cliDevice.update({
+      where: { id: deviceId },
+      data: { lastHeartbeatAt: new Date(Date.now() - 300_000) },
+    });
+    await fixture.$executeRaw`UPDATE deployment_instance SET "updatedAt" = now() - interval '5 minutes' WHERE id = ${instanceId}`;
+  }
+
+  it("a gang stop waits for an interactive stop's person, never adds a second stop, and never restarts an interactive start on its own", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id], { stopInteractive: true });
+    const h = harness([socketFor(user.id, device.id)]);
+    await h.tickUntil(() => h.jobs.length > 0);
+    const start = h.jobs[0]!;
+    expect(await h.report(start, "awaiting_operator")).toBe(true);
+    // The person's run exited 0 but status never showed the service: startup failed.
+    expect(await h.report(start, "failed", { error: "operator_unverified" })).toBe(true);
+    let row = await inst(s.instance.id);
+    expect(row).toMatchObject({ observedState: "STOP_PENDING", nextRestartAt: null });
+    const [stop] = await stepsOf(s.instance.id, "stop");
+    expect(stop).toMatchObject({ state: "PENDING", errorCode: "startup_failed" });
+    await h.tickUntil(() => h.jobs.some((job) => job.stepId === stop!.id));
+    const stopJob = h.jobs.find((job) => job.stepId === stop!.id)!;
+    expect(stopJob).toMatchObject({ action: "stop", interactive: true });
+    expect(await h.report(stopJob, "awaiting_operator")).toBe(true);
+    expect(await need(s.instance.id)).toBe("STEP");
+    // The node goes away while the stop waits: maintenance gang-stops again, which must
+    // treat the waiting stop as live (no second stop), with claims still held.
+    await offline(device.id, s.instance.id);
+    await h.ticks(3);
+    expect(await stepsOf(s.instance.id, "stop")).toHaveLength(1);
+    expect((await step(stop!.id)).state).toBe("AWAITING_OPERATOR");
+    expect(
+      await fixture.deploymentInstanceNode.count({
+        where: { instanceId: s.instance.id, claimHeld: true },
+      }),
+    ).toBe(1);
+    expect((await inst(s.instance.id)).nextRestartAt).toBeNull();
+    await fixture.cliDevice.update({
+      where: { id: device.id },
+      data: { lastHeartbeatAt: new Date() },
+    });
+    // The person stops it: claims are released, and the instance waits for a restart.
+    expect(await h.report(stopJob, "succeeded", { stopped: true })).toBe(true);
+    row = await inst(s.instance.id);
+    expect(row).toMatchObject({
+      observedState: "STOPPED",
+      desiredState: "RUNNING",
+      needsOperator: "RESTART",
+      nextRestartAt: null,
+    });
+    expect(row.needsOperatorSince).not.toBeNull();
+    const sent = h.jobs.length;
+    await h.ticks(4);
+    expect(h.jobs).toHaveLength(sent);
+    expect((await inst(s.instance.id)).restartAttempts).toBe(0);
+
+    // A person's restart goes past the automatic three attempts.
+    await fixture.deploymentInstance.update({
+      where: { id: s.instance.id },
+      data: { restartAttempts: 3 },
+    });
+    const restarted = await restartDeploymentInstance(user.id, s.instance.id, production);
+    expect(restarted).toMatchObject({ needsOperator: null, needsOperatorSince: null });
+    expect(restarted.operatorRestartRequestedAt).not.toBeNull();
+    await expect(
+      restartDeploymentInstance(user.id, s.instance.id, production),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    await h.tickUntil(() => h.jobs.length > sent);
+    row = await inst(s.instance.id);
+    expect(row.restartAttempts).toBe(4);
+    expect(h.jobs.at(-1)).toMatchObject({ action: "start", interactive: true });
+    const fresh = await step(h.jobs.at(-1)!.stepId);
+    expect(fresh.sequence).toBe(40);
+  }, 30_000);
+
+  it("an automatic start whose stop is interactive still restarts on its own", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    // Start not interactive, stop interactive: an automatic restart needs nobody.
+    const plain = await instance(user.id, [device.id], {
+      interactiveStart: false,
+      stopInteractive: true,
+    });
+    const h = harness([socketFor(user.id, device.id)]);
+    await h.tickUntil(() => h.jobs.length > 0);
+    expect(await h.report(h.jobs[0]!, "failed", { error: "launch_failed" })).toBe(true);
+    const row = await inst(plain.instance.id);
+    expect(row.observedState).toBe("STOP_PENDING");
+    expect(row.nextRestartAt).not.toBeNull();
+    expect(row.needsOperator).toBeNull();
+  }, 30_000);
+
+  it("a desired stop cancels a waiting start and clears its need; the stop settles it (probe C)", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const open = await instance(user.id, [device.id]);
+    const declined = await instance(user.id, [device.id], { port: 30400 });
+    const h = harness([socketFor(user.id, device.id)]);
+    await h.tickUntil(() => h.jobs.length > 0);
+    const first = h.jobs[0]!;
+    expect(await h.report(first, "awaiting_operator")).toBe(true);
+    expect(await h.report(first, "operator_closed")).toBe(true);
+    await h.tickUntil(() => h.jobs.length > 1);
+    const second = h.jobs[1]!;
+    expect(await h.report(second, "awaiting_operator")).toBe(true);
+    const byStep = new Map([
+      [first.stepId, first.instanceId],
+      [second.stepId, second.instanceId],
+    ]);
+    expect(new Set(byStep.values())).toEqual(new Set([open.instance.id, declined.instance.id]));
+    // The owner stops both (as applyDeploymentPlan does: desired STOPPED + a stop per rank).
+    for (const target of [open, declined]) {
+      await fixture.deploymentInstance.update({
+        where: { id: target.instance.id },
+        data: { desiredState: "STOPPED", observedState: "STOPPING" },
+      });
+      const stopIntent = originalDeploymentStopIntent(target.starts[0]!.intent);
+      await fixture.deploymentStep.create({
+        data: {
+          runId: target.instance.runId,
+          instanceId: target.instance.id,
+          cliDeviceId: device.id,
+          rank: 0,
+          phase: "stop",
+          sequence: 0,
+          intent: stopIntent,
+          intentHash: deploymentFingerprint(stopIntent),
+        },
+      });
+    }
+    h.control.closeAnswer = "closed";
+    await h.tickUntil(async () =>
+      (await Promise.all([first.stepId, second.stepId].map((id) => step(id)))).every(
+        (row) => row.state === "FAILED",
+      ),
+    );
+    for (const id of [first.stepId, second.stepId]) {
+      expect(await step(id)).toMatchObject({ state: "FAILED", operatorTerminalId: null });
+      expect(h.closes).toContainEqual({ stepId: id, keepRunning: true });
+    }
+    expect(await need(open.instance.id)).toBeNull();
+    expect(await need(declined.instance.id)).toBeNull();
+    // The stops go (non-interactive here) and settle; nothing waits afterwards.
+    await h.tickUntil(() => h.jobs.filter((job) => job.action === "stop").length === 2);
+    for (const job of h.jobs.filter((j) => j.action === "stop"))
+      expect(await h.report(job, "succeeded", { stopped: true })).toBe(true);
+    for (const target of [open, declined]) {
+      expect(await inst(target.instance.id)).toMatchObject({
+        observedState: "STOPPED",
+        needsOperator: null,
+      });
+    }
+  }, 30_000);
+
+  it("a waiting start that outlives its instance's stop is settled, even with its node away", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id], { stopInteractive: true });
+    const h = harness([socketFor(user.id, device.id)]);
+    await h.tickUntil(() => h.jobs.length > 0);
+    const job = h.jobs[0]!;
+    expect(await h.report(job, "awaiting_operator")).toBe(true);
+    expect(await h.report(job, "operator_closed")).toBe(true);
+    // Probe C: the instance's stop completed behind the waiting start's back.
+    await fixture.deploymentInstanceNode.updateMany({
+      where: { instanceId: s.instance.id },
+      data: { claimHeld: false, stoppedAt: new Date() },
+    });
+    await fixture.deploymentInstance.update({
+      where: { id: s.instance.id },
+      data: { observedState: "STOPPED" },
+    });
+    expect(await need(s.instance.id)).toBe("STEP");
+    h.live.delete(device.id);
+    await h.tickUntil(async () => (await step(job.stepId)).state === "FAILED");
+    expect((await step(job.stepId)).errorCode).toBe("operator_superseded");
+    // Stopped, meant to run, interactive start: it now waits for a person's restart.
+    expect(await need(s.instance.id)).toBe("RESTART");
+    await flushDeploymentOperatorAudit();
+    expect(
+      (
+        await fixture.deploymentOperatorEvent.findMany({
+          where: { stepId: job.stepId },
+          select: { outcome: true },
+        })
+      ).map((row) => row.outcome),
+    ).toContain("cancelled");
+  }, 30_000);
+
+  it("a banned owner's waiting steps are cancelled, claims released but held unknown, until a status check", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id], { stopInteractive: true });
+    const h = harness([socketFor(user.id, device.id)]);
+    await h.tickUntil(() => h.jobs.length > 0);
+    const start = h.jobs[0]!;
+    expect(await h.report(start, "awaiting_operator")).toBe(true);
+    await fixture.user.update({ where: { id: user.id }, data: { banned: true, banExpires: null } });
+    await h.tickUntil(
+      async () =>
+        (await fixture.deploymentInstanceNode.count({
+          where: { instanceId: s.instance.id, claimHeld: true },
+        })) === 0,
+    );
+    expect(await step(start.stepId)).toMatchObject({
+      state: "FAILED",
+      errorCode: "owner_inactive",
+    });
+    const stops = await stepsOf(s.instance.id, "stop");
+    expect(stops).toHaveLength(1);
+    expect(stops[0]).toMatchObject({ state: "FAILED", errorCode: "owner_inactive" });
+    // Nobody may answer a terminal now: the stop was never sent.
+    expect(h.jobs.map((job) => job.stepId)).toEqual([start.stepId]);
+    const released = await fixture.deploymentInstanceNode.findFirstOrThrow({
+      where: { instanceId: s.instance.id },
+    });
+    expect(released.claimHeld).toBe(false);
+    expect(released.heldUnknownSince).not.toBeNull();
+    expect(await inst(s.instance.id)).toMatchObject({ observedState: "STOPPED" });
+    await flushDeploymentOperatorAudit();
+    expect(
+      (
+        await fixture.deploymentOperatorEvent.findMany({
+          where: { stepId: start.stepId },
+          select: { outcome: true },
+        })
+      ).map((row) => row.outcome),
+    ).toContain("cancelled");
+    // Placement still counts the resources (and their port), which nobody can stop.
+    const held = await production.$transaction((tx) => loadDeploymentState(tx, user.id));
+    expect(held.held).toEqual([
+      expect.objectContaining({ instanceId: s.instance.id, nodeId: device.id, port: 30000 }),
+    ]);
+    expect(held.existing.flatMap((i) => i.nodes)).toEqual([]);
+    await h.ticks(3);
+    expect(await stepsOf(s.instance.id, "stop")).toHaveLength(1);
+
+    // The ban is lifted: a status check (the rank's stop, status first) is sent; its proof
+    // frees the resources.
+    await fixture.user.update({ where: { id: user.id }, data: { banned: false } });
+    await h.tickUntil(() => h.jobs.length > 1);
+    const probe = h.jobs[1]!;
+    expect(probe).toMatchObject({ action: "stop", interactive: true });
+    expect(await step(probe.stepId)).toMatchObject({
+      errorCode: "held_unknown_probe",
+      sequence: 5000,
+    });
+    expect(await h.report(probe, "succeeded", { stopped: true })).toBe(true);
+    expect(
+      (
+        await fixture.deploymentInstanceNode.findFirstOrThrow({
+          where: { instanceId: s.instance.id },
+        })
+      ).heldUnknownSince,
+    ).toBeNull();
+    const after = await production.$transaction((tx) => loadDeploymentState(tx, user.id));
+    expect(after.held).toEqual([]);
+    expect(await inst(s.instance.id)).toMatchObject({
+      observedState: "STOPPED",
+      needsOperator: "RESTART",
+    });
+  }, 30_000);
+
+  it("revoking the deployments grant closes the node's waiting terminals", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id]);
+    const h = harness([socketFor(user.id, device.id)]);
+    await h.tickUntil(() => h.jobs.length > 0);
+    expect(await h.report(h.jobs[0]!, "awaiting_operator")).toBe(true);
+    await fixture.cliDevice.update({ where: { id: device.id }, data: { allowDeployments: false } });
+    await h.tickUntil(() => h.closes.some((close) => close.stepId === s.starts[0]!.id));
+    expect(h.closes).toContainEqual({ stepId: s.starts[0]!.id, keepRunning: true });
+  }, 30_000);
+
+  it("a person reopens a closed waiting step; an open one is answered in its terminal", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id]);
+    const id = s.starts[0]!.id;
+    const h = harness([socketFor(user.id, device.id)]);
+    await h.tickUntil(() => h.jobs.length > 0);
+    const first = h.jobs[0]!;
+    expect(await h.report(first, "awaiting_operator")).toBe(true);
+    await expect(reopenDeploymentOperatorStep(user.id, id, production)).rejects.toMatchObject({
+      code: "CONFLICT",
+    });
+    expect(await h.report(first, "operator_closed", { error: "operator_terminal_limit" })).toBe(
+      true,
+    );
+    expect(await reopenDeploymentOperatorStep(user.id, id, production)).toMatchObject({
+      stepId: id,
+    });
+    // The spawn failure already gave its attempt back.
+    expect(await step(id)).toMatchObject({ state: "PENDING", errorCode: null, attempts: 0 });
+    expect(await need(s.instance.id)).toBeNull();
+    await h.tickUntil(() => h.jobs.length > 1);
+    expect(h.jobs[1]!.stepId).toBe(id);
+    expect(h.jobs[1]!.operator?.terminalId).not.toBe(first.operator?.terminalId);
+  }, 30_000);
+
+  it("the turn waits only on the current generation's terminals (N4)", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id]);
+    const old = s.starts[0]!;
+    // Generation 0's start was left waiting with its terminal closed; generation 1 runs.
+    await fixture.deploymentStep.update({
+      where: { id: old.id },
+      data: {
+        state: "RUNNING",
+        ownerEpoch: "stale:1",
+        deadline: new Date(Date.now() + 60_000),
+        operatorTerminalId: "AAECAwQFBgcICQoLDA0ODw",
+      },
+    });
+    await fixture.deploymentStep.update({
+      where: { id: old.id },
+      data: {
+        state: "AWAITING_OPERATOR",
+        deadline: null,
+        operatorTerminalId: null,
+        operatorSince: new Date(),
+      },
+    });
+    await fixture.deploymentStep.updateMany({
+      where: { instanceId: s.instance.id, phase: "readiness" },
+      data: { state: "FAILED", errorCode: "startup_failed" },
+    });
+    await fixture.deploymentInstance.update({
+      where: { id: s.instance.id },
+      data: { restartAttempts: 1, observedState: "PENDING" },
+    });
+    const fresh = await fixture.deploymentStep.create({
+      data: {
+        runId: old.runId,
+        instanceId: s.instance.id,
+        cliDeviceId: device.id,
+        rank: 0,
+        phase: "start",
+        sequence: 10,
+        intent: old.intent as object,
+        intentHash: old.intentHash,
+      },
+    });
+    // Touched last, so the tick reaches the new generation's start first.
+    await fixture.deploymentStep.update({
+      where: { id: old.id },
+      data: { operatorLastExit: 1 },
+    });
+    const h = harness([socketFor(user.id, device.id)]);
+    await h.tickUntil(() => h.jobs.length > 0);
+    expect(h.jobs[0]!.stepId).toBe(fresh.id);
+    // Dispatched without waiting for the old generation's step to be settled.
+    const sent = h.log.indexOf(`send:${fresh.id}`);
+    const closed = h.log.indexOf(`close:${old.id}`);
+    expect(closed === -1 || sent < closed).toBe(true);
+    await h.ticks(2);
+    expect(await step(old.id)).toMatchObject({ state: "FAILED", errorCode: "operator_superseded" });
+  }, 30_000);
+
+  it("a hold reason never overwrites a real error code, and the claim keeps it (N8)", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id]);
+    const id = s.starts[0]!.id;
+    await fixture.deploymentStep.update({ where: { id }, data: { errorCode: "some_real_code" } });
+    const socket = socketFor(user.id, device.id);
+    const h = harness([{ ...socket, deploymentOperator: false }]);
+    await h.ticks(3);
+    expect(await step(id)).toMatchObject({ state: "PENDING", errorCode: "some_real_code" });
+    h.live.set(device.id, { ...socket, operatorRoom: false });
+    await h.ticks(3);
+    expect(await step(id)).toMatchObject({ state: "PENDING", errorCode: "some_real_code" });
+    h.live.set(device.id, socket);
+    await h.tickUntil(() => h.jobs.length > 0);
+    expect(await step(id)).toMatchObject({ state: "RUNNING", errorCode: "some_real_code" });
+  }, 30_000);
+
+  it("only the rank's latest stop, newer than its latest start, is re-sent after a reconnect (N17)", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const terminal = "AAECAwQFBgcICQoLDA0ODw";
+    const spawning = (id: string) =>
+      fixture.deploymentStep.update({
+        where: { id },
+        data: {
+          state: "RUNNING",
+          ownerEpoch: "stale:1",
+          attempts: 1,
+          deadline: new Date(Date.now() + 60_000),
+          operatorTerminalId: terminal,
+        },
+      });
+    // An older stop, replaced by a newer one.
+    const replaced = await instance(user.id, [device.id], {
+      stopInteractive: true,
+      stopping: true,
+    });
+    const older = replaced.stops[0]!;
+    await spawning(older.id);
+    await fixture.deploymentStep.create({
+      data: {
+        runId: older.runId,
+        instanceId: replaced.instance.id,
+        cliDeviceId: device.id,
+        rank: 0,
+        phase: "stop",
+        sequence: 101,
+        intent: older.intent as object,
+        intentHash: older.intentHash,
+      },
+    });
+    // The latest stop, but older than the rank's latest start.
+    const restarted = await instance(user.id, [device.id], {
+      port: 30600,
+      stopInteractive: true,
+      stopping: true,
+    });
+    const behind = restarted.stops[0]!;
+    await spawning(behind.id);
+    await fixture.deploymentStep.create({
+      data: {
+        runId: behind.runId,
+        instanceId: restarted.instance.id,
+        cliDeviceId: device.id,
+        rank: 0,
+        phase: "start",
+        sequence: 10,
+        intent: restarted.starts[0]!.intent as object,
+        intentHash: restarted.starts[0]!.intentHash,
+        state: "SUCCEEDED",
+      },
+    });
+    // The current stop: re-sent under the new session.
+    const current = await instance(user.id, [device.id], {
+      port: 30700,
+      stopInteractive: true,
+      stopping: true,
+    });
+    const latest = current.stops[0]!;
+    await spawning(latest.id);
+    const h = harness([socketFor(user.id, device.id)]);
+    await h.tickUntil(async () => (await step(behind.id)).state !== "RUNNING");
+    await h.ticks(2);
+    expect(await step(older.id)).toMatchObject({
+      state: "FAILED",
+      errorCode: "operator_superseded",
+    });
+    expect(await step(behind.id)).toMatchObject({
+      state: "FAILED",
+      errorCode: "operator_superseded",
+    });
+    await h.tickUntil(() => h.jobs.some((job) => job.stepId === latest.id));
+    expect(h.jobs.some((job) => job.stepId === older.id || job.stepId === behind.id)).toBe(false);
+  }, 30_000);
+
+  it("a gang stop ends the waiting start with its own reason", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id]);
+    const h = harness([socketFor(user.id, device.id)]);
+    await h.tickUntil(() => h.jobs.length > 0);
+    const job = h.jobs[0]!;
+    expect(await h.report(job, "awaiting_operator")).toBe(true);
+    // The node stops heartbeating while the start waits: maintenance gang-stops the instance.
+    await fixture.cliDevice.update({
+      where: { id: device.id },
+      data: { lastHeartbeatAt: new Date(Date.now() - 300_000) },
+    });
+    await fixture.$executeRaw`UPDATE deployment_instance SET "createdAt" = now() - interval '5 minutes' WHERE id = ${s.instance.id}`;
+    h.control.closeAnswer = "closed";
+    await h.tickUntil(async () => (await step(job.stepId)).state === "FAILED");
+    expect(await step(job.stepId)).toMatchObject({ state: "FAILED", errorCode: "node_offline" });
+    expect(h.closes).toContainEqual({ stepId: job.stepId, keepRunning: true });
+    expect(await inst(s.instance.id)).toMatchObject({
+      observedState: "STOP_PENDING",
+      nextRestartAt: null,
+      needsOperator: null,
+    });
+  }, 30_000);
+
+  it("never opens an interactive stop for a banned owner", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id], { stopInteractive: true, stopping: true });
+    await fixture.user.update({ where: { id: user.id }, data: { banned: true, banExpires: null } });
+    const h = harness([socketFor(user.id, device.id)]);
+    await h.ticks(1);
+    expect(h.jobs).toEqual([]);
+    expect(await step(s.stops[0]!.id)).toMatchObject({
+      state: "FAILED",
+      errorCode: "owner_inactive",
+    });
+    const released = await fixture.deploymentInstanceNode.findFirstOrThrow({
+      where: { instanceId: s.instance.id },
+    });
+    expect(released).toMatchObject({ claimHeld: false });
+    expect(released.heldUnknownSince).not.toBeNull();
+    // A deletion is no longer blocked by the claim.
+    expect(await inst(s.instance.id)).toMatchObject({ observedState: "STOPPED" });
+    await h.ticks(2);
+    expect(h.jobs).toEqual([]);
+    // The CLI's verified `stopped` inventory for that stop is the proof that frees them.
+    const stop = await step(s.stops[0]!.id);
+    expect(
+      await h.reconciler.acceptInventory(socketFor(user.id, device.id), [
+        {
+          stepId: stop.id,
+          instanceId: s.instance.id,
+          revisionId: s.instance.revisionId,
+          rank: 0,
+          intentHash: stop.intentHash,
+          phase: "stopped",
+          unitName: `wsmp-i-${s.instance.id}-r0`,
+          port: 30000,
+          endpointSlug: s.instance.endpointSlug,
+          models: ["model"],
+          contextWindow: null,
+        },
+      ]),
+    ).toBe(true);
+    expect(await step(stop.id)).toMatchObject({ state: "SUCCEEDED" });
+    expect(
+      (
+        await fixture.deploymentInstanceNode.findFirstOrThrow({
+          where: { instanceId: s.instance.id },
+        })
+      ).heldUnknownSince,
+    ).toBeNull();
+  }, 30_000);
+
+  // ---- Chunk 8 review fixes ----
+
+  /** Release an instance's rank-0 claim as held unknown after a cancelled stop (the drain's write). */
+  async function heldUnknown(target: Awaited<ReturnType<typeof instance>>, memoryGb = 10) {
+    await fixture.deploymentStep.updateMany({
+      where: { instanceId: target.instance.id, phase: "stop" },
+      data: { state: "FAILED", errorCode: "owner_inactive" },
+    });
+    await fixture.deploymentInstanceNode.updateMany({
+      where: { instanceId: target.instance.id },
+      data: {
+        claimHeld: false,
+        stoppedAt: new Date(),
+        heldUnknownSince: new Date(),
+        resources: { kind: "unified", memoryGb, ramGb: 0, gpus: [] },
+      },
+    });
+    await fixture.deploymentInstance.update({
+      where: { id: target.instance.id },
+      data: { observedState: "STOPPED" },
+    });
+  }
+
+  it("an interactive stop whose run is not verified waits for its person again (M1)", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id], { stopInteractive: true, stopping: true });
+    const stopId = s.stops[0]!.id;
+    const h = harness([socketFor(user.id, device.id)]);
+    await h.tickUntil(() => h.jobs.length > 0);
+    const first = h.jobs[0]!;
+    expect(first.stepId).toBe(stopId);
+    expect(await h.report(first, "awaiting_operator")).toBe(true);
+    expect(await h.report(first, "operator_running")).toBe(true);
+    expect(await h.report(first, "failed", { error: "operator_unverified" })).toBe(true);
+    expect(await step(stopId)).toMatchObject({
+      state: "AWAITING_OPERATOR",
+      operatorTerminalId: null,
+      errorCode: "operator_unverified",
+    });
+    expect(await need(s.instance.id)).toBe("STEP");
+    expect((await inst(s.instance.id)).observedState).toBe("STOPPING");
+    expect(
+      await fixture.deploymentInstanceNode.count({
+        where: { instanceId: s.instance.id, claimHeld: true },
+      }),
+    ).toBe(1);
+    // Nothing re-sends it by itself: it waits for its person.
+    await h.ticks(2);
+    expect(h.jobs).toHaveLength(1);
+    // The person reopens it; status decides again.
+    await reopenDeploymentOperatorStep(user.id, stopId, production);
+    await h.tickUntil(() => h.jobs.length > 1);
+    const second = h.jobs[1]!;
+    expect(second.stepId).toBe(stopId);
+    expect(await h.report(second, "succeeded", { stopped: true })).toBe(true);
+    expect(await inst(s.instance.id)).toMatchObject({
+      observedState: "STOPPED",
+      needsOperator: null,
+    });
+  }, 30_000);
+
+  it("held-unknown resources block another instance's budget; a failed check is retried after a pause", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const held = await instance(user.id, [device.id], { interactiveStart: false, stopping: true });
+    await heldUnknown(held, 40);
+    const other = await instance(user.id, [device.id], { port: 30100, interactiveStart: false });
+    await fixture.deploymentInstanceNode.updateMany({
+      where: { instanceId: other.instance.id },
+      data: { resources: { kind: "unified", memoryGb: 40, ramGb: 0, gpus: [] } },
+    });
+    const h = harness([socketFor(user.id, device.id)]);
+    const probes = () =>
+      fixture.deploymentStep.findMany({
+        where: { instanceId: held.instance.id, phase: "stop", sequence: { gte: 5000 } },
+        orderBy: { sequence: "asc" },
+      });
+    await h.tickUntil(() => h.jobs.length > 0);
+    const probe = h.jobs[0]!;
+    expect(probe).toMatchObject({ action: "stop", instanceId: held.instance.id });
+    expect((await step(probe.stepId)).sequence).toBe(5000);
+    // 40 + 40 GB exceed the node's 64: the other start waits while the resources are held.
+    await h.ticks(3);
+    expect(h.jobs.some((job) => job.stepId === other.starts[0]!.id)).toBe(false);
+    // The check fails: the rank stays held and the check is not re-created at once.
+    expect(await h.report(probe, "failed", { error: "execution_unconfirmed" })).toBe(true);
+    expect((await inst(held.instance.id)).observedState).toBe("STOPPED");
+    await h.ticks(3);
+    expect(await probes()).toHaveLength(1);
+    expect(h.jobs.some((job) => job.stepId === other.starts[0]!.id)).toBe(false);
+    // After the pause a new check goes; its proof frees the resources for the other start.
+    await fixture.$executeRaw`UPDATE deployment_step SET "updatedAt" = now() - interval '6 minutes' WHERE id = ${probe.stepId}`;
+    await h.tickUntil(async () => (await probes()).length === 2);
+    const retry = (await probes())[1]!;
+    expect(retry.sequence).toBe(5001);
+    await h.tickUntil(() => h.jobs.some((job) => job.stepId === retry.id));
+    const retryJob = h.jobs.find((job) => job.stepId === retry.id)!;
+    expect(await h.report(retryJob, "succeeded", { stopped: true })).toBe(true);
+    await h.tickUntil(() => h.jobs.some((job) => job.stepId === other.starts[0]!.id));
+  }, 30_000);
+
+  it("a check that cannot open says why, and a person's restart waits for it instead of clearing the need (L1)", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id], { stopInteractive: true, stopping: true });
+    await heldUnknown(s);
+    await fixture.deploymentInstance.update({
+      where: { id: s.instance.id },
+      data: { desiredState: "RUNNING", observedState: "STOPPED" },
+    });
+    const h = harness([{ ...socketFor(user.id, device.id), deploymentOperator: false }]);
+    const probe = async () =>
+      fixture.deploymentStep.findFirst({
+        where: { instanceId: s.instance.id, phase: "stop", sequence: { gte: 5000 } },
+      });
+    await h.tickUntil(async () => (await probe())?.errorCode === "operator_capability_missing");
+    expect(await probe()).toMatchObject({ state: "PENDING" });
+    expect(await need(s.instance.id)).toBe("RESTART");
+    await expect(
+      restartDeploymentInstance(user.id, s.instance.id, production),
+    ).rejects.toMatchObject({ code: "CONFLICT", data: { reason: "deployment_stop_pending" } });
+    expect(await inst(s.instance.id)).toMatchObject({
+      needsOperator: "RESTART",
+      nextRestartAt: null,
+    });
+    expect(h.jobs).toEqual([]);
+  }, 30_000);
+
+  it("deleting the device clears its held-unknown resources", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id], { interactiveStart: false, stopping: true });
+    await heldUnknown(s);
+    expect(
+      (await production.$transaction((tx) => loadDeploymentState(tx, user.id))).held,
+    ).toHaveLength(1);
+    await fixture.cliDevice.delete({ where: { id: device.id } });
+    expect(
+      await fixture.deploymentInstanceNode.count({ where: { instanceId: s.instance.id } }),
+    ).toBe(0);
+    expect((await production.$transaction((tx) => loadDeploymentState(tx, user.id))).held).toEqual(
+      [],
+    );
+  }, 30_000);
 });
