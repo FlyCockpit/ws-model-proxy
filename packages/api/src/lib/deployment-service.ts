@@ -523,6 +523,7 @@ function assertInteractiveCommandsSupported(variant: DeploymentVariant) {
   if (variantHasInteractiveCommands(variant))
     throw new ORPCError("BAD_REQUEST", {
       message: "Interactive recipe commands are not supported yet",
+      data: { reason: "interactive_commands_unsupported" },
     });
 }
 /** The recipe command a phase runs, which decides whether that phase is interactive. */

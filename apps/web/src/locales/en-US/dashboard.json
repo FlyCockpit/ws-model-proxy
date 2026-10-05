@@ -110,7 +110,8 @@
     "slugHint": "Lowercase letters, digits and single hyphens; it cannot end with a hyphen. You can rename a recipe while none of its deployments are running.",
     "stopBeforeChange": "Stop this recipe's deployments before renaming it or moving it to another pool.",
     "slugTaken": "Another recipe already uses this slug.",
-    "invalidRecipeSlug": "This recipe's slug is not valid on nodes (it ends with or repeats a hyphen). Rename the recipe while none of its deployments are running, then start it again."
+    "invalidRecipeSlug": "This recipe's slug is not valid on nodes (it ends with or repeats a hyphen). Rename the recipe while none of its deployments are running, then start it again.",
+    "interactiveUnsupported": "This recipe has commands marked interactive. Starting such a recipe is not supported yet; it will be in a later release. To start it now, remove \"interactive\" from those commands in the recipe."
   },
   "appSettingsLoadFailed": "Failed to load app settings.",
   "actions": {

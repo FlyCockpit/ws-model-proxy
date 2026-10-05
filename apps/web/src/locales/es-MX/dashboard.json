@@ -114,7 +114,8 @@
     "slugHint": "Letras minúsculas, dígitos y guiones sencillos; no puede terminar en guion. Puedes renombrar una receta mientras ninguno de sus despliegues esté en ejecución.",
     "stopBeforeChange": "Detén los despliegues de esta receta antes de renombrarla o moverla a otro pool.",
     "slugTaken": "Otra receta ya usa este slug.",
-    "invalidRecipeSlug": "El slug de esta receta no es válido en los nodos (termina en guion o repite guiones). Renombra la receta mientras ninguno de sus despliegues esté en ejecución y vuelve a iniciarla."
+    "invalidRecipeSlug": "El slug de esta receta no es válido en los nodos (termina en guion o repite guiones). Renombra la receta mientras ninguno de sus despliegues esté en ejecución y vuelve a iniciarla.",
+    "interactiveUnsupported": "Esta receta tiene comandos marcados como interactivos. Todavía no se puede iniciar una receta así; será posible en una versión posterior. Para iniciarla ahora, quita \"interactive\" de esos comandos en la receta."
   },
   "actions": {
     "copyConfirm": "Copiar texto de confirmación",

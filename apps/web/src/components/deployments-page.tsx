@@ -33,6 +33,7 @@ const RECIPE_ERROR_KEYS = {
   deployments_running: "deployments.stopBeforeChange",
   slug_taken: "deployments.slugTaken",
   invalid_recipe_slug: "deployments.invalidRecipeSlug",
+  interactive_commands_unsupported: "deployments.interactiveUnsupported",
 } as const;
 type RecipeErrorKey = (typeof RECIPE_ERROR_KEYS)[keyof typeof RECIPE_ERROR_KEYS];
 function recipeErrorKey(error: unknown): RecipeErrorKey | null {

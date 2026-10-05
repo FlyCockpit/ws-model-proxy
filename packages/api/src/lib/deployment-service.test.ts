@@ -437,6 +437,7 @@ describe("interactive recipe commands before operator terminals exist", () => {
     await expect(createDeploymentPlan(person, start)).rejects.toMatchObject({
       code: "BAD_REQUEST",
       message: "Interactive recipe commands are not supported yet",
+      data: { reason: "interactive_commands_unsupported" },
     });
     expect(db.deploymentPlan.create).not.toHaveBeenCalled();
   });
@@ -457,6 +458,7 @@ describe("interactive recipe commands before operator terminals exist", () => {
     revision(interactiveSpec([interactiveCommands]));
     await expect(applyDeploymentPlan(person, "plan", false)).rejects.toMatchObject({
       code: "BAD_REQUEST",
+      data: { reason: "interactive_commands_unsupported" },
     });
     expect(db.deploymentInstance.create).not.toHaveBeenCalled();
     expect(db.deploymentStep.create).not.toHaveBeenCalled();

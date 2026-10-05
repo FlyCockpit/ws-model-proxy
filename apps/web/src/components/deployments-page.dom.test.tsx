@@ -360,6 +360,40 @@ describe("managed inference dashboard", () => {
     expect(state.calls.some((call) => call.name === "confirm")).toBe(false);
   });
 
+  it("explains why a recipe with interactive commands cannot be started yet", async () => {
+    const recipe = {
+      id: "recipe",
+      name: "Small",
+      slug: "small",
+      poolId: "pool",
+      Revisions: [{ id: "revision", revision: 1, spec: { variants: [variant] } }],
+    };
+    state.data.configs = { items: [recipe], nextCursor: null };
+    state.errors.start = Object.assign(
+      new Error("Interactive recipe commands are not supported yet"),
+      {
+        code: "BAD_REQUEST",
+        status: 400,
+        data: { reason: "interactive_commands_unsupported" },
+      },
+    );
+    const user = userEvent.setup();
+    show();
+    const form = (await screen.findByRole("heading", { name: "deployments.planStart" }))
+      .parentElement as HTMLElement;
+    await user.selectOptions(
+      await within(form).findByLabelText("deployments.revision"),
+      "revision",
+    );
+    await user.type(within(form).getByLabelText("deployments.variantKey"), "small");
+    await user.click(within(form).getByRole("button", { name: "deployments.preview" }));
+    expect(await within(form).findByText("deployments.interactiveUnsupported")).toBeTruthy();
+    expect(state.calls).toContainEqual({
+      name: "start",
+      input: { revisionId: "revision", variantKey: "small", groupCount: 1 },
+    });
+  });
+
   it("confirms a start that stops nothing without the stop dialog", async () => {
     state.data.pending = { items: [{ id: "plan-5" }], nextCursor: null };
     state.data.plan = {

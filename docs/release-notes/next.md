@@ -21,12 +21,11 @@ in `supervised` it accepts the server's approval flag; there is no confirm
 screen on the node. Turn deployments on only on nodes whose server you would
 trust with a shell there. Deployments stay off by default.
 
-Interactive recipe steps (a command a person must run, e.g. one asking for a
-sudo password) need a second, separate node-local switch:
-`wsmp config set-deployment-operator-terminal on` (off by default). The step
-then waits in an operator terminal showing the exact command and runs only after
-a person presses Enter from the dashboard. It never opens a shell and does not
-enable browser terminals.
+Interactive recipe commands (a command a person must run, e.g. one asking for
+a sudo password) are not usable yet. A recipe can mark commands `interactive`
+and be saved, but starting it is refused until a follow-up release. The
+node-local switch `wsmp config set-deployment-operator-terminal` exists (off by
+default) but has no effect yet.
 
 Recipe commands are limited to 4,096 UTF-8 bytes when saved and again after
 placeholder substitution, the same limit the CLI enforces, so a long command is
@@ -244,10 +243,29 @@ assignment provenance and automatic concurrency seed columns.
   MIME types) so requests that use those options route to it — and note that
   a profile also narrows what it accepts (for example a lower upload limit).
   Agents create these recipes through the MCP recipe tools like any other.
-  Upgrade every CLI before starting one: an older CLI refuses a transcription
-  job, and with a profile it cannot read the job at all, so the start fails
-  only at its deadline (up to 15 minutes). After downgrading a CLI that ran
-  one, remove its deployment state file.
+  Upgrade the server and every CLI together (relay 2.11 only). After
+  downgrading a CLI that ran one, remove its deployment state file.
+
+- **Recipes can be renamed while stopped.** A recipe's slug can be changed
+  while none of its deployments are running, in the dashboard or by an agent
+  over MCP (`updateConfig`, while MCP commands are allowed on a CLI). A rename
+  is refused while any deployment of the recipe runs, and a slug another
+  recipe uses is refused.
+- **Legacy recipe slugs must be renamed before starting.** A recipe saved
+  earlier whose slug ends with `-` or repeats `-` (`--`) is refused at start
+  (`invalid_recipe_slug`) because nodes refuse the endpoint it would create.
+  Rename it while it is stopped, then start it.
+- **A start that stops running models asks first.** When a start or switch
+  would stop running deployments, the dashboard shows a confirm dialog naming
+  each one before anything is stopped; cancelling leaves them running.
+- **File-tool writes need a filesystem that can sync directories.** The CLI
+  now journals file-tool writes so an interrupted one can be recovered. Where
+  a file root or the CLI state directory is on a filesystem that cannot sync
+  directories (some NFS, FUSE or sshfs mounts), writes are refused with
+  `unsafe_filesystem` before anything changes. `wsmp recover` lists
+  interrupted work; `--apply` undoes only an interrupted capture or an
+  unacknowledged delete, and a rename or replace that may have published stays
+  manual. See [`apps/cli/docs/file-recovery.md`](../../apps/cli/docs/file-recovery.md).
 
 ## Fixed
 

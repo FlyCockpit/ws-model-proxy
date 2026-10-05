@@ -545,10 +545,7 @@ stable-inode alias pairs still refuse.
 
 
 **Version skew.** `uncertain_outcome` and `unsafe_filesystem` are new file error
-codes of relay 2.11. Upgrade the server before the `wsmp` CLI: a server that
-predates these codes treats the CLI's rejection frame as malformed instead of
-reporting the typed error (retained files stay on disk). An older CLI never
-emits `unsafe_filesystem`.
+codes of relay 2.11. Upgrade the server and every CLI together (relay 2.11 only).
 
 **Revocation and bans.** Revoking or narrowing a personal token, revoking a CLI
 credential or device, and deleting a user end that principal's in-flight file operations and

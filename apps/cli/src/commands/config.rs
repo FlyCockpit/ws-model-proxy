@@ -33,14 +33,9 @@ enum Sub {
     /// on this machine. Turn it on only for a server you would trust with a
     /// shell here.
     SetDeployments { state: Switch },
-    /// Opt in to interactive recipe steps (off by default; needs
-    /// `set-deployments on` too). Such a step (typically one that runs
-    /// `sudo`) waits for a person: wsmp opens an operator terminal that shows
-    /// the exact command, and the command runs only after someone presses
-    /// Enter in it from the dashboard. It never opens a shell and does not
-    /// enable browser terminals (`set-human-terminal`). Read for every job;
-    /// turning it off closes terminals still waiting. Reconnect to refresh
-    /// the server's feature report.
+    /// Reserved for interactive recipe steps (off by default). Has no effect
+    /// yet: the server refuses to start recipes with interactive commands
+    /// until a follow-up release.
     SetDeploymentOperatorTerminal { state: Switch },
     /// Print the path to the config file.
     Path,
