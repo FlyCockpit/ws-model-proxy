@@ -47,6 +47,11 @@ pub struct SttConfig {
 }
 
 impl SttConfig {
+    /// No language and no prompt.
+    pub fn is_empty(&self) -> bool {
+        self.language.is_none() && self.prompt.is_none()
+    }
+
     fn validate(&self) -> Result<()> {
         if let Some(language) = &self.language {
             ensure!(

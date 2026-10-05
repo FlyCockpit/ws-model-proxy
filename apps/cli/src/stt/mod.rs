@@ -15,17 +15,23 @@
 
 pub mod resample;
 pub mod segmented;
+pub mod vllm;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Arc;
+use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 
-use crate::config::{AudioOperationCapabilities, EndpointConfig, RealtimeAdapter};
+use anyhow::{Context, Result};
+
+use crate::config::{
+    AudioOperationCapabilities, EndpointAuthMode, EndpointConfig, RealtimeAdapter,
+};
 use crate::protocol::{ClientControlMessage, RelayFailure};
 use crate::relay_bus::FromWorker;
 use crate::stt_wire::{SttConfig, SttEvent, SttServerMessage, is_session_id};
@@ -50,6 +56,41 @@ const IDLE_POLL: Duration = Duration::from_millis(100);
 /// stops the session thread taking audio, so credit stops flowing back.
 const PENDING_TURNS: usize = 1;
 
+/// The engine connection of a `vllm` session, shut down by the relay loop
+/// when the session ends so a thread blocked on the engine wakes at once.
+pub(crate) type EngineSocket = Arc<Mutex<Option<TcpStream>>>;
+
+/// Where a session's engine lives and how to authenticate to it.
+#[derive(Debug, Clone)]
+pub struct EngineEndpoint {
+    pub base_url: String,
+    /// `(header name, environment variable)` pairs, as configured.
+    pub headers: Vec<(String, String)>,
+    pub auth: Option<(EndpointAuthMode, String)>,
+    pub model: String,
+}
+
+impl EngineEndpoint {
+    /// The configured headers and typed credential, read from the
+    /// environment now. Errors never carry the values.
+    pub fn credential_headers(&self) -> Result<Vec<(String, String)>> {
+        let mut headers = Vec::with_capacity(self.headers.len() + 1);
+        for (name, env) in &self.headers {
+            let value =
+                std::env::var(env).with_context(|| format!("reading endpoint header `{name}`"))?;
+            headers.push((name.clone(), value));
+        }
+        if let Some((mode, env)) = &self.auth {
+            let value = std::env::var(env).context("reading typed endpoint credential")?;
+            headers.push(match mode {
+                EndpointAuthMode::ApiKey => ("x-api-key".into(), value),
+                EndpointAuthMode::Bearer => ("authorization".into(), format!("Bearer {value}")),
+            });
+        }
+        Ok(headers)
+    }
+}
+
 /// Input for a session thread, in arrival order.
 enum Input {
     Audio(Vec<u8>),
@@ -71,6 +112,8 @@ struct Session {
     /// Audio bytes received and not yet acknowledged.
     outstanding: u64,
     deadline: Instant,
+    /// The `vllm` engine connection, when one is open.
+    engine: EngineSocket,
     _thread: JoinHandle<()>,
 }
 
@@ -79,8 +122,9 @@ pub struct SttRegistry {
     sessions: BTreeMap<String, Session>,
     recent: VecDeque<String>,
     recent_set: BTreeSet<String>,
-    /// Endpoints with a stop job on its way: no new sessions there.
-    stopping: BTreeSet<String>,
+    /// Endpoints with a stop job on its way, with that job's step id: no
+    /// new sessions there.
+    stopping: BTreeMap<String, String>,
     next_endpoint_check: Option<Instant>,
     tx: SyncSender<FromWorker>,
 }
@@ -91,7 +135,7 @@ impl SttRegistry {
             sessions: BTreeMap::new(),
             recent: VecDeque::new(),
             recent_set: BTreeSet::new(),
-            stopping: BTreeSet::new(),
+            stopping: BTreeMap::new(),
             next_endpoint_check: None,
             tx,
         }
@@ -99,9 +143,15 @@ impl SttRegistry {
 
     /// A deployment stop for `endpoint_slug` is about to run: its sessions
     /// end now (`not_found`, "model_unavailable") and no new one opens there
-    /// until a start job for it arrives or the endpoint leaves the snapshot.
-    pub fn endpoint_stopping(&mut self, endpoint_slug: &str) -> Vec<ClientControlMessage> {
-        self.stopping.insert(endpoint_slug.to_string());
+    /// until a start job for it arrives, the endpoint leaves the snapshot, or
+    /// the stop (`step_id`) is refused or fails ([`Self::stop_failed`]).
+    pub fn endpoint_stopping(
+        &mut self,
+        endpoint_slug: &str,
+        step_id: &str,
+    ) -> Vec<ClientControlMessage> {
+        self.stopping
+            .insert(endpoint_slug.to_string(), step_id.to_string());
         let ids: Vec<String> = self
             .sessions
             .iter()
@@ -116,6 +166,12 @@ impl SttRegistry {
     /// A start job for `endpoint_slug`: it may take sessions again once ready.
     pub fn endpoint_starting(&mut self, endpoint_slug: &str) {
         self.stopping.remove(endpoint_slug);
+    }
+
+    /// The deployment step `step_id` was refused or failed. If it was a
+    /// stop, its endpoint is still serving, so it takes sessions again.
+    pub fn stop_failed(&mut self, step_id: &str) {
+        self.stopping.retain(|_, stop_step| stop_step != step_id);
     }
 
     pub fn len(&self) -> usize {
@@ -322,7 +378,7 @@ impl SttRegistry {
             .map(|endpoint| endpoint.slug)
             .collect();
         // A finished stop removed the endpoint; a later start adds it anew.
-        self.stopping.retain(|slug| live.contains(slug));
+        self.stopping.retain(|slug, _| live.contains(slug));
         let gone: Vec<String> = self
             .sessions
             .iter()
@@ -370,7 +426,7 @@ impl SttRegistry {
             tracing::info!(session_id = %id, reason = message, "speech-to-text session refused");
             vec![error(&id, failure, message)]
         };
-        if self.stopping.contains(&request.endpoint_slug) {
+        if self.stopping.contains_key(&request.endpoint_slug) {
             return refuse(RelayFailure::NotFound, "model_unavailable");
         }
         let Some(endpoint) = managed
@@ -403,10 +459,11 @@ impl SttRegistry {
                 "the endpoint uses a different realtime adapter",
             );
         }
-        if request.adapter != RealtimeAdapter::Segmented {
+        // vLLM's realtime protocol has no language or prompt.
+        if request.adapter == RealtimeAdapter::Vllm && !request.config.is_empty() {
             return refuse(
                 RelayFailure::UnsupportedCapability,
-                "this wsmp does not serve the vllm realtime adapter yet",
+                "the vllm adapter takes no language or prompt",
             );
         }
         if !endpoint
@@ -446,7 +503,7 @@ impl SttRegistry {
             RealtimeAdapter::Vllm => 300,
         });
         let max_item_seconds = request.max_item_seconds.min(declared);
-        let file_endpoint = segmented::FileEndpoint {
+        let engine_endpoint = EngineEndpoint {
             base_url: endpoint.base_url.clone(),
             headers: endpoint
                 .headers
@@ -466,21 +523,28 @@ impl SttRegistry {
         let thread_id = id.clone();
         let config = request.config.clone();
         let thread_controls = Arc::clone(&controls);
+        let engine: EngineSocket = Arc::default();
+        let thread_engine = Arc::clone(&engine);
+        let adapter = request.adapter;
         let spawned = thread::Builder::new()
             .name("wsmp-stt".into())
             .spawn(move || {
-                run_session(
-                    thread_id,
-                    file_endpoint,
+                let session = SessionThread {
+                    session_id: thread_id,
+                    endpoint: engine_endpoint,
                     config,
                     max_item_seconds,
-                    SessionInput {
+                    inbox: SessionInput {
                         input: input_rx,
                         controls: thread_controls,
                     },
                     tx,
-                    cancel_rx,
-                );
+                    cancel: cancel_rx,
+                };
+                match adapter {
+                    RealtimeAdapter::Segmented => run_session(session),
+                    RealtimeAdapter::Vllm => vllm::run_session(session, &thread_engine),
+                }
             });
         let Ok(thread) = spawned else {
             return refuse(RelayFailure::Unknown, "could not start the session");
@@ -502,6 +566,7 @@ impl SttRegistry {
                 window: u64::from(request.audio_window_bytes),
                 outstanding: 0,
                 deadline: now + Duration::from_millis(request.max_session_ms) + SESSION_GRACE,
+                engine,
                 _thread: thread,
             },
         );
@@ -549,6 +614,11 @@ impl SttRegistry {
             return false;
         };
         let _ = session.cancel.send(true);
+        // A thread blocked on the engine socket wakes now, and the engine
+        // sees the hang-up (vLLM then cancels the generation).
+        if let Some(socket) = session.engine.lock().ok().and_then(|mut slot| slot.take()) {
+            let _ = socket.shutdown(Shutdown::Both);
+        }
         // Dropping the input sender wakes an idle thread; the thread detaches.
         drop(session.input);
         self.remember(session_id);
@@ -631,19 +701,57 @@ struct SessionInput {
     controls: Arc<AtomicUsize>,
 }
 
-/// One session: resample incoming audio into the open turn, end turns on
-/// commit (or at `max_item_seconds`), and hand ended turns, in order, to a
-/// transcriber thread so audio keeps flowing while the engine works.
-fn run_session(
+impl SessionInput {
+    /// The next input without waiting. `Err(())` once the session is gone.
+    fn try_next(&self) -> Result<Option<Input>, ()> {
+        match self.input.try_recv() {
+            Ok(input) => {
+                self.taken(&input);
+                Ok(Some(input))
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::TryRecvError::Disconnected) => Err(()),
+        }
+    }
+
+    fn taken(&self, input: &Input) {
+        if !matches!(input, Input::Audio(_)) {
+            self.controls.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// What every session thread starts with, whatever its adapter.
+struct SessionThread {
     session_id: String,
-    endpoint: segmented::FileEndpoint,
+    endpoint: EngineEndpoint,
     config: SttConfig,
     max_item_seconds: u32,
     inbox: SessionInput,
     tx: SyncSender<FromWorker>,
     cancel: watch::Receiver<bool>,
-) {
-    let SessionInput { input, controls } = inbox;
+}
+
+fn ack(session_id: &str, bytes: u32) -> ClientControlMessage {
+    ClientControlMessage::SttAudioAck {
+        session_id: session_id.to_string(),
+        bytes,
+    }
+}
+
+/// One session: resample incoming audio into the open turn, end turns on
+/// commit (or at `max_item_seconds`), and hand ended turns, in order, to a
+/// transcriber thread so audio keeps flowing while the engine works.
+fn run_session(session: SessionThread) {
+    let SessionThread {
+        session_id,
+        endpoint,
+        config,
+        max_item_seconds,
+        inbox,
+        tx,
+        cancel,
+    } = session;
     let (turns_tx, turns_rx) = mpsc::sync_channel::<segmented::Item>(PENDING_TURNS);
     let transcriber = {
         let session_id = session_id.clone();
@@ -679,26 +787,17 @@ fn run_session(
         if *cancel.borrow() {
             return;
         }
-        let next = match input.recv_timeout(IDLE_POLL) {
+        let next = match inbox.input.recv_timeout(IDLE_POLL) {
             Ok(next) => next,
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return,
         };
-        if !matches!(next, Input::Audio(_)) {
-            controls.fetch_sub(1, Ordering::SeqCst);
-        }
+        inbox.taken(&next);
         let step = match next {
             Input::Audio(bytes) => {
                 let received = bytes.len() as u32;
                 let ended = turn.audio(&bytes);
-                if !emit(
-                    &tx,
-                    &session_id,
-                    ClientControlMessage::SttAudioAck {
-                        session_id: session_id.clone(),
-                        bytes: received,
-                    },
-                ) {
+                if !emit(&tx, &session_id, ack(&session_id, received)) {
                     return;
                 }
                 ended.map(|items| (items, true))
@@ -745,7 +844,7 @@ fn run_session(
 
 fn run_transcriber(
     session_id: &str,
-    endpoint: &segmented::FileEndpoint,
+    endpoint: &EngineEndpoint,
     turns: Receiver<segmented::Item>,
     tx: &SyncSender<FromWorker>,
     mut cancel: watch::Receiver<bool>,

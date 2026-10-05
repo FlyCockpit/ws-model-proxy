@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::sync::watch;
 
-use crate::config::EndpointAuthMode;
+use super::EngineEndpoint;
 use crate::stt_wire::{
     STT_COMPLETED_TEXT_MAX_BYTES, STT_DELTA_TEXT_MAX_BYTES, STT_MESSAGE_MAX_BYTES,
     STT_TOKEN_COUNT_MAX, SttConfig, SttEngineUsage, SttEvent,
@@ -19,16 +19,6 @@ pub const SAMPLE_RATE: u32 = 16_000;
 /// A response body larger than this is not a transcript.
 const RESPONSE_MAX_BYTES: usize = 1024 * 1024;
 const TIMEOUT_MIN: Duration = Duration::from_secs(30);
-
-/// Where and how to post one turn.
-#[derive(Debug, Clone)]
-pub struct FileEndpoint {
-    pub base_url: String,
-    /// `(header name, environment variable)` pairs, as configured.
-    pub headers: Vec<(String, String)>,
-    pub auth: Option<(EndpointAuthMode, String)>,
-    pub model: String,
-}
 
 /// One ended turn.
 pub struct Item {
@@ -56,7 +46,7 @@ pub enum Outcome {
 /// The turn is consumed: its samples are freed once the request body holds
 /// them, so a turn is never held twice while the engine works.
 pub fn transcribe(
-    endpoint: &FileEndpoint,
+    endpoint: &EngineEndpoint,
     item: Item,
     cancel: &mut watch::Receiver<bool>,
 ) -> Option<Outcome> {
@@ -107,7 +97,7 @@ async fn cancelled(cancel: &mut watch::Receiver<bool>) {
     }
 }
 
-async fn post(endpoint: &FileEndpoint, request: Request) -> Outcome {
+async fn post(endpoint: &EngineEndpoint, request: Request) -> Outcome {
     match send(endpoint, request).await {
         Ok(outcome) => outcome,
         // Never the error text: it can name the endpoint's credentials setup.
@@ -118,7 +108,7 @@ async fn post(endpoint: &FileEndpoint, request: Request) -> Outcome {
     }
 }
 
-async fn send(endpoint: &FileEndpoint, request: Request) -> Result<Outcome> {
+async fn send(endpoint: &EngineEndpoint, request: Request) -> Result<Outcome> {
     let url = crate::daemon::endpoint_url(&endpoint.base_url, "/v1/audio/transcriptions")?;
     let mut builder = crate::daemon::upstream_http_client()?
         .post(url.as_str())
@@ -128,17 +118,8 @@ async fn send(endpoint: &FileEndpoint, request: Request) -> Result<Outcome> {
             format!("multipart/form-data; boundary={}", request.boundary),
         )
         .body(request.body);
-    for (name, env) in &endpoint.headers {
-        let value =
-            std::env::var(env).with_context(|| format!("reading endpoint header `{name}`"))?;
+    for (name, value) in endpoint.credential_headers()? {
         builder = builder.header(name, value);
-    }
-    if let Some((mode, env)) = &endpoint.auth {
-        let value = std::env::var(env).context("reading typed endpoint credential")?;
-        builder = match mode {
-            EndpointAuthMode::ApiKey => builder.header("x-api-key", value),
-            EndpointAuthMode::Bearer => builder.header("authorization", format!("Bearer {value}")),
-        };
     }
     let mut response = builder.send().await.context("posting a turn")?;
     let status = response.status();
@@ -156,7 +137,7 @@ async fn send(endpoint: &FileEndpoint, request: Request) -> Result<Outcome> {
 }
 
 /// Maps an engine answer to an outcome. Redirects are never followed, so a
-/// 3xx is its own failure, not a server error.
+/// 3xx is its own failure, not a server error; so is a stray 1xx.
 pub fn outcome(status: u16, body: &[u8]) -> Outcome {
     let failed = |code, verb: &str| Outcome::Failed {
         code,
@@ -164,6 +145,7 @@ pub fn outcome(status: u16, body: &[u8]) -> Outcome {
     };
     match status {
         200..=299 => {}
+        100..=199 => return failed("upstream_1xx", "did not finish"),
         300..=399 => return failed("upstream_redirect", "redirected"),
         400..=499 => return failed("upstream_4xx", "refused"),
         _ => return failed("upstream_5xx", "failed"),
@@ -188,7 +170,7 @@ pub fn outcome(status: u16, body: &[u8]) -> Outcome {
 /// Token usage in either the OpenAI (`input_tokens`/`output_tokens`) or the
 /// vLLM (`prompt_tokens`/`completion_tokens`) spelling; duration-only usage
 /// and counts outside the wire bound are dropped.
-fn usage(value: &serde_json::Value) -> Option<SttEngineUsage> {
+pub(crate) fn usage(value: &serde_json::Value) -> Option<SttEngineUsage> {
     let count = |names: [&str; 2]| {
         names
             .iter()
@@ -205,7 +187,7 @@ fn usage(value: &serde_json::Value) -> Option<SttEngineUsage> {
 /// The OpenAI file transcription form: the WAV plus `model`,
 /// `response_format=json` and the optional language and prompt. The WAV is
 /// written straight into the body (one copy of the turn, not two).
-pub fn multipart_body(boundary: &str, endpoint: &FileEndpoint, item: &Item) -> Vec<u8> {
+pub fn multipart_body(boundary: &str, endpoint: &EngineEndpoint, item: &Item) -> Vec<u8> {
     let mut body = Vec::with_capacity(1024 + 44 + item.samples.len() * 2);
     let mut field = |name: &str, value: &str| {
         body.extend_from_slice(

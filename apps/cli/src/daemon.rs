@@ -1217,6 +1217,10 @@ fn run_relay_session(
             );
             let frames = (|| -> RelaySessionResult<()> {
                 if let Some(result) = update.result {
+                    // A failed stop leaves its endpoint serving.
+                    if result.status == "failed" {
+                        stt.stop_failed(&result.step_id);
+                    }
                     send_deployment_result(&mut socket, &result)?;
                 }
                 if let Some(open) = update.operator {
@@ -1280,7 +1284,7 @@ fn run_relay_session(
             break Err(error);
         }
         #[cfg(unix)]
-        if let Err(error) = forward_operator_events(&mut socket, &mut terminals) {
+        if let Err(error) = forward_operator_events(&mut socket, &mut terminals, &mut stt) {
             break Err(error);
         }
         if let Err(error) = send_outbound_frames(&mut socket, execs.poll(now)) {
@@ -1996,7 +2000,7 @@ where
         // Live speech-to-text sessions on the endpoint end before its stop
         // runs, and none opens there until a start job for it arrives.
         if job.action == crate::deployments::Action::Stop {
-            let frames = stt.endpoint_stopping(&job.endpoint_slug);
+            let frames = stt.endpoint_stopping(&job.endpoint_slug, &job.step_id);
             send_stt_frames(socket, stt, frames)?;
         } else if job.action == crate::deployments::Action::Start {
             stt.endpoint_starting(&job.endpoint_slug);
@@ -2020,6 +2024,8 @@ where
         #[cfg(not(unix))]
         let refused = true;
         if refused {
+            // A refused stop leaves its endpoint serving.
+            stt.stop_failed(&job.step_id);
             let result =
                 crate::deployments::JobResult::failure(&job, "deployment_worker_unavailable");
             let text = serde_json::to_string(&result)
@@ -3803,6 +3809,7 @@ where
 fn forward_operator_events<S>(
     socket: &mut tungstenite::WebSocket<S>,
     terminals: &mut TerminalRegistry,
+    stt: &mut crate::stt::SttRegistry,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
@@ -3822,6 +3829,7 @@ where
             }
             OperatorEvent::Verify(job) => {
                 if crate::deployments::service::submit_operator_verify(job.clone()).is_err() {
+                    stt.stop_failed(&job.step_id);
                     send_deployment_result(
                         socket,
                         &crate::deployments::JobResult::failure(
@@ -3836,6 +3844,7 @@ where
     // After the events: a held stop follows the verify of the run it waited for.
     for job in terminals.take_released_jobs() {
         if crate::deployments::service::submit(job.clone()).is_err() {
+            stt.stop_failed(&job.step_id);
             send_deployment_result(
                 socket,
                 &crate::deployments::JobResult::failure(&job, "deployment_worker_unavailable"),

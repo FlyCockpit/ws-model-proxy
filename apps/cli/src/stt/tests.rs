@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::config::{ModelConfig, OpenAiCompatibleCapabilities};
+
+mod vllm;
 use crate::deployments::{RealtimeTranscriptionProfile, TranscriptionProfile};
 
 const SESSION: &str = "AAECAwQFBgcICQoLDA0ODw";
@@ -324,7 +326,7 @@ fn opens_only_on_a_recipe_endpoint_that_advertises_the_requested_adapter() {
             max_sessions: None,
         }),
     );
-    // Adapter mismatch, and the vllm adapter is not served by this chunk.
+    // Adapter mismatch, and a vllm open with a language (vLLM has none).
     refused(
         &mut registry,
         open(&session_id(4), "inst-a"),
@@ -774,7 +776,7 @@ fn turn_events_stay_within_the_wire_contract() {
     // An empty turn is reported, not posted.
     let mut cancel = watch::channel(false).1;
     let empty = segmented::transcribe(
-        &segmented::FileEndpoint {
+        &EngineEndpoint {
             base_url: "http://127.0.0.1:9".into(),
             headers: Vec::new(),
             auth: None,
@@ -937,7 +939,7 @@ fn a_stop_job_ends_the_endpoints_sessions_before_it_runs() {
                 .is_empty()
         );
     }
-    let ended = registry.endpoint_stopping("inst-a");
+    let ended = registry.endpoint_stopping("inst-a", "step-1");
     assert_eq!(ended.len(), 2);
     assert!(ended.iter().all(|frame| matches!(
         frame,
@@ -956,7 +958,7 @@ fn a_stop_job_ends_the_endpoints_sessions_before_it_runs() {
             .is_empty()
     );
     // Or the endpoint leaving the snapshot does.
-    registry.endpoint_stopping("inst-a");
+    registry.endpoint_stopping("inst-a", "step-1");
     let after = registry.poll(now, || managed[1..].to_vec());
     assert!(after.is_empty(), "inst-a has no session left: {after:?}");
     let reopened = vec![managed[0].clone()];
@@ -998,6 +1000,7 @@ fn engine_answers_map_to_outcomes_and_keep_usage() {
         segmented::Outcome::Failed { code, .. } => code,
         segmented::Outcome::Text { .. } => "text",
     };
+    assert_eq!(code(text(101, "")), "upstream_1xx");
     assert_eq!(code(text(302, "")), "upstream_redirect");
     assert_eq!(code(text(404, "")), "upstream_4xx");
     assert_eq!(code(text(503, "")), "upstream_5xx");
