@@ -119,6 +119,11 @@ struct DeploymentPublisher {
 /// One watchdog per connection enforces the absolute deadline even when a
 /// blocking TLS/plain write keeps making partial progress. It owns a clone of
 /// this exact socket, never a device name or successor connection.
+///
+/// On Windows, `shutdown` does not interrupt a send already blocked in
+/// another thread, so a stalled write there ends at the native write timeout
+/// instead. Deployments run only on Unix; a Windows node publishes just the
+/// empty snapshot, one small frame.
 type PublicationDeadlineSignals = (
     std::sync::Mutex<(bool, Option<Instant>)>,
     std::sync::Condvar,
@@ -3958,6 +3963,9 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    // Unix only: Windows `shutdown` does not interrupt a blocked send (see
+    // `PublicationWatchdog`).
+    #[cfg(unix)]
     #[test]
     fn publication_watchdog_interrupts_actual_stalled_websocket_write() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
