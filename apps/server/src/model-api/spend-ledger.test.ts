@@ -19,15 +19,18 @@ vi.hoisted(() => {
   process.env.SIGNUP_ENABLED ??= "true";
 });
 
-/** A reader that records each rendered statement and answers with `totals` in order. */
+/** A reader that records each rendered statement and answers with `rows` (or `{ total }`). */
 function recordingReader(totals: unknown[]) {
   const statements: Array<{ text: string; values: unknown[] }> = [];
   const reader: SpendReader = {
     $queryRaw: ((strings: TemplateStringsArray, ...values: unknown[]) => {
       const sql = Prisma.sql(strings, ...values);
-      statements.push({ text: sql.text.replace(/\s+/g, " "), values: sql.values });
+      statements.push({ text: sql.text.replace(/\s+/g, " ").trim(), values: sql.values });
       const total = totals.shift();
-      return Promise.resolve(total === undefined ? [] : [{ total }]);
+      if (total === undefined) return Promise.resolve([]);
+      return Promise.resolve([
+        typeof total === "object" && total !== null && "settled" in total ? total : { total },
+      ]);
     }) as SpendReader["$queryRaw"],
   };
   return { reader, statements };
@@ -90,7 +93,7 @@ describe("spend ledger read model", () => {
   });
 
   it("answers the provider spend view as settled this month plus reserved now", async () => {
-    const { reader } = recordingReader(["1.25", "0.5"]);
+    const { reader, statements } = recordingReader([{ settled: "1.25", reserved: "0.5" }]);
     await expect(
       providerAccountSpend(reader, {
         providerAccountId: "account",
@@ -101,18 +104,23 @@ describe("spend ledger read model", () => {
       spentThisMonth: new Prisma.Decimal("1.25"),
       reservedNow: new Prisma.Decimal("0.5"),
     });
+    // One statement: settled and reserved come from the same snapshot, so a settlement that
+    // commits between two reads can never drop an attempt from both.
+    expect(statements).toHaveLength(1);
+    expect(statements[0]?.text).toMatch(/^SELECT \( WITH attempts AS .* AS settled, \( SELECT/);
   });
 
   it("attributes cap spend by the reservation window and holds open reservations", async () => {
-    const { reader, statements } = recordingReader(["2.05", "0.7"]);
+    const { reader, statements } = recordingReader([{ settled: "2.05", reserved: "0.7" }]);
     const now = new Date("2026-10-06T00:00:00Z");
     await expect(shareCapSpend(reader, { capId: "cap", currency: "USD", now })).resolves.toEqual({
       spentThisMonth: new Prisma.Decimal("2.05"),
       reservedNow: new Prisma.Decimal("0.7"),
     });
     expect(statements[0]?.text).toContain(`r."windowStart" =`);
-    expect(statements[0]?.values).toEqual(["cap", utcMonthWindow(now).start, "USD"]);
-    expect(statements[1]?.text).toContain(`r.state = 'RESERVED'::"ReservationState"`);
+    expect(statements).toHaveLength(1);
+    expect(statements[0]?.values).toEqual(["cap", utcMonthWindow(now).start, "USD", "cap", "USD"]);
+    expect(statements[0]?.text).toContain(`r.state = 'RESERVED'::"ReservationState"`);
   });
 
   it("refuses a malformed currency before querying", async () => {
