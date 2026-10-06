@@ -371,6 +371,7 @@ export const profileProcedures = {
               where: { id: input.profileId, userId },
               select: {
                 id: true,
+                updatedAt: true,
                 Nodes: { select: { nodeId: true, hold: true, holdNote: true } },
                 Items: { select: { runtimeId: true, versionId: true } },
               },
@@ -464,13 +465,21 @@ export const profileProcedures = {
           editor: actor.actor,
           editorUserId: userId,
         };
-        const profile = existing
-          ? await tx.profile.update({
-              where: { id: existing.id },
-              data: fields,
-              select: { id: true },
-            })
-          : await tx.profile.create({ data: { ...fields, userId }, select: { id: true } });
+        let profile: { id: string };
+        if (existing) {
+          // Optimistic: a save that read an older profile (hold lines included) loses.
+          const updated = await tx.profile.updateMany({
+            where: { id: existing.id, userId, updatedAt: existing.updatedAt },
+            data: fields,
+          });
+          if (updated.count === 0)
+            throw new ORPCError("CONFLICT", {
+              message: "The profile changed meanwhile. Load it again and retry.",
+            });
+          profile = { id: existing.id };
+        } else {
+          profile = await tx.profile.create({ data: { ...fields, userId }, select: { id: true } });
+        }
         await tx.profileNode.deleteMany({ where: { profileId: profile.id } });
         await tx.profileNode.createMany({
           data: nodeIds.map((nodeId) => {
@@ -507,8 +516,22 @@ export const profileProcedures = {
     assertMayWrite(context.auth);
     const userId = context.session.user.id;
     await prisma.$transaction(async (tx) => {
-      const deleted = await tx.profile.deleteMany({ where: { id: input.profileId, userId } });
-      if (deleted.count === 0) throw notFound("Profile");
+      const profile = await tx.profile.findFirst({
+        where: { id: input.profileId, userId },
+        select: { id: true, Nodes: { where: { hold: true }, select: { nodeId: true } } },
+      });
+      if (!profile) throw notFound("Profile");
+      if (agentRulesApply(context.auth)) {
+        // Deleting drops hold lines and releases the holds the profile set: people only.
+        const holding = await tx.node.count({ where: { userId, holdProfileId: profile.id } });
+        if (profile.Nodes.length > 0 || holding > 0)
+          throw refuse(
+            "human_only",
+            "This profile has hold lines; only a person deletes it.",
+            "FORBIDDEN",
+          );
+      }
+      await tx.profile.deleteMany({ where: { id: profile.id, userId } });
       // Holds this profile set would otherwise outlive it (nothing could release them).
       await tx.node.updateMany({
         where: { userId, holdProfileId: input.profileId },
@@ -553,24 +576,37 @@ export const profileProcedures = {
         },
         select: { id: true, createdAt: true },
       });
+      if (planInput.agentRules) {
+        // Re-checked at write time: a person's hold set after the plan still refuses an agent.
+        const personHeld = await tx.node.findFirst({
+          where: {
+            userId,
+            id: { in: planInput.owned.map((line) => line.nodeId) },
+            holdAt: { not: null },
+            holdProfileId: null,
+          },
+          select: { id: true },
+        });
+        if (personHeld)
+          throw refuseAbout(
+            "node_held",
+            personHeld.id,
+            "A person holds this node; agents cannot apply here.",
+          );
+      }
       for (const nodeId of plan.holdNodeIds) {
-        const held = await tx.node.updateMany({
+        // A person's own hold stays theirs (never converted into a profile hold, note kept).
+        // An agent never takes another profile's hold either.
+        await tx.node.updateMany({
           where: {
             id: nodeId,
             userId,
-            // An agent never takes over a person's hold, even one set after the plan.
             ...(planInput.agentRules
-              ? { NOT: { holdAt: { not: null }, holdProfileId: null } }
-              : {}),
+              ? { OR: [{ holdAt: null }, { holdProfileId: profile.id }] }
+              : { NOT: { holdAt: { not: null }, holdProfileId: null } }),
           },
           data: { holdAt: now, holdNote: holdNotes.get(nodeId) ?? null, holdProfileId: profile.id },
         });
-        if (held.count === 0)
-          throw refuseAbout(
-            "node_held",
-            nodeId,
-            "A person holds this node; agents cannot apply here.",
-          );
       }
       if (plan.releaseNodeIds.length > 0)
         await tx.node.updateMany({

@@ -164,6 +164,7 @@ describe("profiles.save hold lines (people only)", () => {
     db.node.findMany.mockResolvedValueOnce([{ id: "a" }] as never);
     db.profile.findFirst.mockResolvedValueOnce({
       id: "p-1",
+      updatedAt: new Date("2026-10-06T09:00:00Z"),
       Nodes: [{ nodeId: "a", hold: existingHold, holdNote: null }],
       Items: [],
     } as never);
@@ -181,7 +182,7 @@ describe("profiles.save hold lines (people only)", () => {
         code: "FORBIDDEN",
         data: { reason: "human_only" },
       });
-      expect(db.profile.update).not.toHaveBeenCalled();
+      expect(db.profile.updateMany).not.toHaveBeenCalled();
     });
 
     it(`refuses a ${label} that removes a hold line's node`, async () => {
@@ -196,7 +197,7 @@ describe("profiles.save hold lines (people only)", () => {
 
   it("keeps existing hold lines when an agent omits them", async () => {
     saveState(true);
-    db.profile.update.mockResolvedValueOnce({ id: "p-1" } as never);
+    db.profile.updateMany.mockResolvedValueOnce({ count: 1 });
     db.profile.findMany.mockResolvedValueOnce([]);
     await client(FULL_AGENT)
       .save(base)
@@ -208,7 +209,7 @@ describe("profiles.save hold lines (people only)", () => {
 
   it("lets a person set hold lines", async () => {
     saveState(false);
-    db.profile.update.mockResolvedValueOnce({ id: "p-1" } as never);
+    db.profile.updateMany.mockResolvedValueOnce({ count: 1 });
     db.profile.findMany.mockResolvedValueOnce([]);
     await client()
       .save({ ...base, holds: [{ nodeId: "a", note: "gaming" }] })
@@ -276,9 +277,14 @@ describe("profiles.save validation", () => {
 
   it("releases holds this profile set on nodes it no longer owns", async () => {
     db.node.findMany.mockResolvedValueOnce([{ id: "a" }] as never);
-    db.profile.findFirst.mockResolvedValueOnce({ id: "p-1", Nodes: [], Items: [] } as never);
+    db.profile.findFirst.mockResolvedValueOnce({
+      id: "p-1",
+      updatedAt: new Date(),
+      Nodes: [],
+      Items: [],
+    } as never);
     db.runtime.findMany.mockResolvedValueOnce([]);
-    db.profile.update.mockResolvedValueOnce({ id: "p-1" } as never);
+    db.profile.updateMany.mockResolvedValueOnce({ count: 1 });
     db.profile.findMany.mockResolvedValueOnce([]);
     await client()
       .save({ ...base, profileId: "p-1" })
@@ -292,9 +298,10 @@ describe("profiles.save validation", () => {
 
 describe("profiles.delete", () => {
   it("clears the holds the profile set", async () => {
+    db.profile.findFirst.mockResolvedValueOnce({ id: "p-1", Nodes: [{ nodeId: "a" }] } as never);
     db.profile.deleteMany.mockResolvedValueOnce({ count: 1 });
-    await client(FULL_AGENT).delete({ profileId: "p-1" });
-    expect(db.profile.deleteMany.mock.calls[0]?.[0]?.where).toEqual({
+    await client().delete({ profileId: "p-1" });
+    expect(db.profile.findFirst.mock.calls[0]?.[0]?.where).toEqual({
       id: "p-1",
       userId: "owner-1",
     });
@@ -302,6 +309,35 @@ describe("profiles.delete", () => {
       userId: "owner-1",
       holdProfileId: "p-1",
     });
+  });
+
+  for (const [label, auth] of [
+    ["Full agent token", FULL_AGENT],
+    ["cookie without CSRF", CSRF_LESS],
+  ] as const) {
+    it(`refuses a ${label} deleting a profile with hold lines`, async () => {
+      db.profile.findFirst.mockResolvedValueOnce({ id: "p-1", Nodes: [{ nodeId: "a" }] } as never);
+      db.node.count.mockResolvedValueOnce(0);
+      await expect(client(auth).delete({ profileId: "p-1" })).rejects.toMatchObject({
+        data: { reason: "human_only" },
+      });
+      expect(db.profile.deleteMany).not.toHaveBeenCalled();
+    });
+
+    it(`refuses a ${label} deleting a profile whose hold is still set`, async () => {
+      db.profile.findFirst.mockResolvedValueOnce({ id: "p-1", Nodes: [] } as never);
+      db.node.count.mockResolvedValueOnce(1);
+      await expect(client(auth).delete({ profileId: "p-1" })).rejects.toMatchObject({
+        data: { reason: "human_only" },
+      });
+    });
+  }
+
+  it("lets an agent delete a profile without holds", async () => {
+    db.profile.findFirst.mockResolvedValueOnce({ id: "p-1", Nodes: [] } as never);
+    db.node.count.mockResolvedValueOnce(0);
+    await client(FULL_AGENT).delete({ profileId: "p-1" });
+    expect(db.profile.deleteMany).toHaveBeenCalled();
   });
 
   it("refuses a read-only agent", async () => {
@@ -347,12 +383,79 @@ describe("profiles.apply hold race", () => {
       id: "op-1",
       createdAt: new Date(),
     } as never);
-    db.node.updateMany.mockResolvedValueOnce({ count: 0 });
+    db.node.findFirst.mockResolvedValueOnce({ id: "a" } as never);
     await expect(client(FULL_AGENT).apply({ profileId: "p-1" })).rejects.toMatchObject({
       data: { reason: "node_held" },
     });
+    expect(db.node.findFirst.mock.calls[0]?.[0]?.where).toMatchObject({
+      holdAt: { not: null },
+      holdProfileId: null,
+    });
+    expect(db.node.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe("hold writes on apply", () => {
+  function heldPlan(holdProfileId: string | null) {
+    db.profile.findFirst.mockResolvedValueOnce({
+      id: "p-1",
+      Nodes: [{ nodeId: "a", hold: true, holdNote: "games" }],
+      Items: [],
+    } as never);
+    db.node.findMany.mockResolvedValueOnce([
+      {
+        id: "a",
+        slug: "a",
+        connection: "ONLINE",
+        trust: "FULL",
+        trustChangedAt: null,
+        trustLowerRequestedAt: null,
+        labels: [],
+        holdAt: new Date(),
+        holdProfileId,
+        portStart: 30000,
+        portEnd: 30010,
+        heldDefinitions: [],
+        declaredResources: null,
+        nodeInfo: null,
+        nodeMetrics: null,
+        nodeMetricsAt: null,
+      },
+    ] as never);
+    db.runtimeVersion.findMany.mockResolvedValueOnce([]);
+    db.runtimeInstance.findMany.mockResolvedValueOnce([]);
+    db.instanceRank.findMany.mockResolvedValueOnce([]);
+    db.fabric.findMany.mockResolvedValueOnce([]);
+    db.runtimeOperation.create.mockResolvedValueOnce({
+      id: "op-1",
+      createdAt: new Date(),
+    } as never);
+  }
+
+  it("never converts a person's own hold into a profile hold", async () => {
+    heldPlan(null);
+    const preview = await client().apply({ profileId: "p-1", preview: true });
+    if (preview.mode !== "preview") throw new Error("expected a preview");
+    heldPlan(null);
+    await client().apply({ profileId: "p-1", fingerprint: preview.preview.fingerprint });
     expect(db.node.updateMany.mock.calls[0]?.[0]?.where).toMatchObject({
       NOT: { holdAt: { not: null }, holdProfileId: null },
     });
+  });
+
+  it("lets an agent set a hold only where no one else holds the node", async () => {
+    heldPlan("p-other");
+    db.node.findFirst.mockResolvedValueOnce(null);
+    await client(FULL_AGENT).apply({ profileId: "p-1" });
+    expect(db.node.updateMany.mock.calls[0]?.[0]?.where).toMatchObject({
+      OR: [{ holdAt: null }, { holdProfileId: "p-1" }],
+    });
+  });
+
+  it("records a cookie without CSRF as an agent", async () => {
+    heldPlan("p-1");
+    db.node.findFirst.mockResolvedValueOnce(null);
+    await client(CSRF_LESS).apply({ profileId: "p-1" });
+    expect(db.runtimeOperation.create.mock.calls[0]?.[0]?.data).toMatchObject({ actor: "AGENT" });
   });
 });

@@ -1,5 +1,5 @@
 import { ORPCError } from "@orpc/server";
-import type { AnonymousAuth, CallerAuth } from "../contracts/auth-context";
+import { type AnonymousAuth, type CallerAuth, isHumanCaller } from "../contracts/auth-context";
 
 export type CallerActor = {
   actor: "USER" | "AGENT";
@@ -9,8 +9,9 @@ export type CallerActor = {
 /** Who an audit or provenance row names for this caller. */
 export function callerActor(auth: CallerAuth | AnonymousAuth): CallerActor {
   if (auth.kind === "agent_token") return { actor: "AGENT", agentTokenId: auth.agentTokenId };
-  if (auth.kind === "oauth_access_token") return { actor: "AGENT", agentTokenId: null };
-  return { actor: "USER", agentTokenId: null };
+  if (isHumanCaller(auth)) return { actor: "USER", agentTokenId: null };
+  // OAuth connections, and a cookie whose CSRF check failed (not a verified person).
+  return { actor: "AGENT", agentTokenId: null };
 }
 
 /**
