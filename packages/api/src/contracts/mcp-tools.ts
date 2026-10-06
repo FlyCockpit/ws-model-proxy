@@ -45,7 +45,12 @@ export type McpToolContract = {
   /** Procedure paths (`router.sub.name`) the handler calls. */
   procedures: readonly string[];
   /** Calls per minute per token, when stricter than the MCP default. */
-  rateLimit?: { perMinute: number; key: "start_stop_apply" | "node_command" | "bench" };
+  rateLimit?: {
+    perMinute: number;
+    key: "start_stop_apply" | "node_command" | "bench";
+    /** Counted only for calls that set this input field (model_test: bench runs only). */
+    onlyWhen?: "bench";
+  };
 };
 
 function tool(contract: Omit<McpToolContract, "level">): McpToolContract {
@@ -111,8 +116,17 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
     name: "pools_get",
     description:
       "List your pools (and pools shared with you), or one pool: callable IDs, type, routing, cloud setting (read-only for agents), sidecars, advanced settings with effective values, metric routing rules, members with status and live load, number of shares.",
-    input: z.object({ poolId: idSchema.optional() }).strict(),
-    output: z.union([poolsContract.list.output, poolViewSchema]),
+    input: z
+      .object({
+        poolId: idSchema.optional(),
+        /** With poolId: also the pool's configuration history (newest first). */
+        history: z.boolean().optional(),
+      })
+      .strict(),
+    output: z.union([
+      poolsContract.list.output,
+      poolViewSchema.extend({ history: poolsContract.history.list.output.optional() }).strict(),
+    ]),
     procedures: ["pools.list", "pools.get", "pools.history.list"],
   }),
   tool({
@@ -159,7 +173,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
     input: modelsContract.test.input,
     output: modelsContract.test.output,
     procedures: ["models.test"],
-    rateLimit: { perMinute: 2, key: "bench" },
+    rateLimit: { perMinute: 2, key: "bench", onlyWhen: "bench" },
   }),
   tool({
     name: "pool_create",
@@ -217,7 +231,7 @@ export const MCP_TOOLS: readonly McpToolContract[] = [
       "Start a runtime on given nodes (or let the server place count instances), or restart an instance with instanceId. preview: true shows placements, what would be stopped to make room, and warnings (such as low free memory) without acting. No confirmation is needed and other startable runtimes may be stopped. Refused on Relay-only nodes (trust_relay): only people start runtimes there.",
     input: runtimesContract.start.input,
     output: runtimesContract.start.output,
-    procedures: ["runtimes.start", "runtimes.restart"],
+    procedures: ["runtimes.start"],
     rateLimit: { perMinute: 10, key: "start_stop_apply" },
   }),
   tool({

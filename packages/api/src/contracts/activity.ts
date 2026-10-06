@@ -2,6 +2,7 @@ import { z } from "zod";
 import {
   idSchema,
   isoDateSchema,
+  NODE_TRUST,
   OPERATOR_NEED,
   pageInputShape,
   pageOf,
@@ -47,8 +48,8 @@ export const needsYouItemSchema = z
     runtimeName: z.string(),
     nodeId: idSchema.nullable(),
     since: isoDateSchema,
-    /** For STEP: the operator terminal to open. */
-    operatorTerminalId: z.string().nullable(),
+    /** For STEP: the step to attach to (`runtimes.steps.attach`). */
+    stepId: idSchema.nullable(),
   })
   .strict();
 
@@ -114,7 +115,12 @@ export const activityContract = {
             .strict(),
           nodes: z.array(
             z
-              .object({ id: idSchema, slug: z.string(), online: z.boolean(), trust: z.string() })
+              .object({
+                id: idSchema,
+                slug: z.string(),
+                online: z.boolean(),
+                trust: z.enum(NODE_TRUST),
+              })
               .strict(),
           ),
           pools: z.array(

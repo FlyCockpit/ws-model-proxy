@@ -43,8 +43,6 @@ export const nodeTrustViewSchema = z
     lowerPending: z.boolean(),
     frozen: z.boolean(),
     changedAt: isoDateSchema.nullable(),
-    /** Shown on Relay-only nodes: the command that raises trust on the node itself. */
-    raiseCommand: z.literal("wsmp trust full"),
   })
   .strict();
 
@@ -331,6 +329,35 @@ export const nodesContract = {
     z.object({ nodeId: idSchema }).strict(),
     z.object({ deleted: z.literal(true), stoppedInstances: z.array(idSchema) }).strict(),
     "Delete a node: its always-on runtimes go, every reservation there is released and instances with a part there stop.",
+  ),
+  lowerTrustPreview: query(
+    "human",
+    z.object({ nodeId: idSchema }).strict(),
+    z
+      .object({
+        /** What stays defined and keeps running, frozen (lowering protects against future compromise only). */
+        frozenRuntimes: z.array(
+          z
+            .object({
+              runtimeId: idSchema,
+              versionId: idSchema,
+              name: z.string(),
+              agentWritten: z.boolean(),
+              running: z.boolean(),
+            })
+            .strict(),
+        ),
+        frozenMetricCommands: z.array(
+          z.object({ name: z.string(), agentWritten: z.boolean() }).strict(),
+        ),
+        /** Multi-node runtimes whose other nodes could not start here afterwards (no frozen peer set). */
+        multiNodeWithoutPeerSet: z.array(idSchema),
+        /** What stops working: commands, files, browser terminals, definition changes, agent starts/stops. */
+        openBrowserTerminals: z.number().int(),
+        queuedCommandsRefused: z.number().int(),
+      })
+      .strict(),
+    "What the Lower dialog lists before the click: definitions and metric commands that freeze (agent-written ones flagged).",
   ),
   lowerTrust: mutation(
     "human",

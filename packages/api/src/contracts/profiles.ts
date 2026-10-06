@@ -107,7 +107,10 @@ export const profilesContract = {
       .object({
         profileId: idSchema,
         preview: z.boolean().optional(),
-        /** People confirm the stops by echoing the preview's fingerprint. */
+        /**
+         * Required for people (refused with preview_required / preview_stale): they apply exactly
+         * the preview they confirmed. Agents may omit it.
+         */
         fingerprint: sha256Schema.optional(),
       })
       .strict(),

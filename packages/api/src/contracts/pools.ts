@@ -145,6 +145,25 @@ export const poolViewSchema = z
     rules: z.array(poolRoutingRuleViewSchema),
     members: z.array(poolMemberViewSchema),
     sharesCount: z.number().int(),
+    /** "Hardware it runs on": nodes with an instance serving a LOCAL member now. */
+    runsOn: z.array(
+      z
+        .object({
+          nodeId: idSchema,
+          slug: z.string(),
+          mine: z.boolean(),
+          instances: z.number().int(),
+        })
+        .strict(),
+    ),
+    /** Pool cards: last 24 h (agent tests excluded), 24 hourly request counts. */
+    traffic24h: z
+      .object({
+        requests: z.number().int(),
+        errors: z.number().int(),
+        sparkline: z.array(z.number().int()).length(24),
+      })
+      .strict(),
   })
   .strict();
 

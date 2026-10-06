@@ -32,6 +32,7 @@ import {
   slugSchema,
 } from "./common";
 import { mutation, query } from "./procedure";
+import { refusalReasonSchema, refusalSchema } from "./refusals";
 
 /** Built-in starting points (`packages/config/src/runtime-presets.ts`). */
 export const RUNTIME_PRESETS = [
@@ -87,7 +88,16 @@ export const instanceStepViewSchema = z
     state: z.enum(STEP_STATE),
     attempts: z.number().int(),
     errorCode: z.string().nullable(),
-    operatorTerminalId: z.string().nullable(),
+    /** A person runs this step in an operator terminal. */
+    interactive: z.boolean(),
+    /**
+     * The command text the step runs (from the launched version, placeholders unrendered) and who
+     * wrote it, so a person can judge it before typing a sudo password. Terminal ids are never in
+     * a view (agents read this through runtimes_get); people attach by step id.
+     */
+    command: z.string().nullable(),
+    commandAuthor: z.enum(["user", "agent", "unknown"]).nullable(),
+    terminalOpen: z.boolean(),
     updatedAt: isoDateSchema,
   })
   .strict();
@@ -242,8 +252,8 @@ export const startPreviewSchema = z
     ),
     kept: z.array(idSchema),
     warnings: z.array(previewWarningSchema),
-    /** Why it cannot run (e.g. trust_relay for an agent, definition_frozen). */
-    refusals: z.array(z.object({ code: z.string(), nodeId: idSchema.nullable() }).strict()),
+    /** Why it cannot run (e.g. trust_relay for an agent, definition_frozen, no_frozen_peer_set). */
+    refusals: z.array(refusalSchema),
   })
   .strict();
 
@@ -338,6 +348,10 @@ export const runtimesContract = {
         kind: z.enum(RUNTIME_KIND),
         /** ALWAYS_ON: the node it lives on (Full control for agents). */
         nodeId: idSchema.optional(),
+        /**
+         * The built-in starting point the spec came from (from presets.list). Recorded and shown
+         * only; `spec` is always complete and is what gets validated.
+         */
         preset: z.enum(RUNTIME_PRESETS).optional(),
         spec: runtimeSpecSchema,
         limits: limitsInput,
@@ -385,7 +399,11 @@ export const runtimesContract = {
           z
             .object({
               instanceId: idSchema,
-              reason: z.enum(["launch_changed", "trust_relay", "interactive"]),
+              reason: refusalReasonSchema.extract([
+                "launch_changed",
+                "trust_relay",
+                "interactive_needs_person",
+              ]),
             })
             .strict(),
         ),
@@ -393,7 +411,7 @@ export const runtimesContract = {
         define: z.array(defineResultSchema),
       })
       .strict(),
-    "New version. Same launch hash: adopted live. A launch change to an always-on runtime on a Relay-only node is refused.",
+    "New version. Same launch hash: adopted live. A launch change to an always-on runtime on a Relay-only node is refused (launch_change_on_relay_only). With MCP capability overrides, the overrides and the new version commit in one transaction or not at all.",
     ["runtime_update"],
   ),
   delete: mutation(
@@ -411,7 +429,7 @@ export const runtimesContract = {
         versionId: idSchema.optional(),
         nodeIds: z.array(idSchema).min(1).max(64).optional(),
         count: z.number().int().min(1).max(64).optional(),
-        /** Restart this instance (same as `restart`). */
+        /** Restart this instance (resets its restart window); the placement is its own. */
         instanceId: idSchema.optional(),
         preview: z.boolean().optional(),
         fingerprint: sha256Schema.optional(),
@@ -421,7 +439,7 @@ export const runtimesContract = {
         message: "Give nodeIds or count, not both.",
       }),
     previewOrOperationSchema,
-    "Start (or preview) instances; may stop others to make room. Agents: refused on Relay-only nodes.",
+    "Start, or restart with instanceId (or preview); may stop others to make room. People must echo the preview fingerprint (preview_required / preview_stale); agents may omit it and need no confirmation. Agents: refused on Relay-only nodes (trust_relay).",
     ["runtime_start"],
   ),
   stop: mutation(
@@ -434,19 +452,40 @@ export const runtimesContract = {
     "Stop instances. Agents: refused on Relay-only nodes.",
     ["runtime_stop"],
   ),
-  restart: mutation(
-    "agent",
-    z
-      .object({
-        instanceId: idSchema,
-        preview: z.boolean().optional(),
-        fingerprint: sha256Schema.optional(),
-      })
-      .strict(),
-    previewOrOperationSchema,
-    "Restart an instance (resets its restart window). Agents: Full-control nodes only.",
-    ["runtime_start"],
-  ),
+  steps: {
+    /** Open (or rejoin) the operator terminal of an interactive step; works on Relay-only nodes. */
+    attach: mutation(
+      "human",
+      z
+        .object({
+          stepId: idSchema,
+          cols: z.number().int().min(1).max(1_000),
+          rows: z.number().int().min(1).max(1_000),
+        })
+        .strict(),
+      z
+        .object({
+          step: instanceStepViewSchema,
+          ticket: z.string(),
+          terminalId: z.string(),
+          expiresAt: isoDateSchema,
+        })
+        .strict(),
+      "Attach to the operator terminal of a step waiting for you.",
+    ),
+    reopen: mutation(
+      "human",
+      z.object({ stepId: idSchema }).strict(),
+      instanceStepViewSchema,
+      "Run an interactive step's command again in a fresh terminal (after it closed without success).",
+    ),
+    cancel: mutation(
+      "human",
+      z.object({ stepId: idSchema }).strict(),
+      instanceStepViewSchema,
+      "Give up on an interactive step: it fails and the instance follows its stop/restart rules.",
+    ),
+  },
   instances: {
     forget: mutation(
       "human",

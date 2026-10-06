@@ -66,3 +66,23 @@ export const nodeEnrollResponseSchema = z.discriminatedUnion("ok", [
     })
     .strict(),
 ]);
+
+// ── Web Test page → /v1 (spec §7.2 #4) ──
+//
+// The Test page calls the public API routes (`/v1/chat/completions`, `/v1/embeddings`,
+// `/v1/audio/transcriptions`, `/v1/realtime`) with the person's session instead of an API key,
+// so streaming, attachments and live STT run through the real path. Such a request:
+// - carries the Better Auth session cookie, an `Origin` equal to the public origin, and the
+//   header `x-wsmp-test: 1` (WebSocket upgrades, which cannot set headers, use `?test=1`);
+// - is recorded with source TEST and never accepts an API key at the same time;
+// - names a callable ID (`owner/pool[:external]`, as with an API key) or, Test page only, one of
+//   the person's served models directly as `runtime:<runtimeId>:<upstreamModelId>`. Direct
+//   names are refused with an API key (D1: the public API serves pools only).
+// - may pin an instance with `x-wsmp-instance: <instanceId>` (direct names only).
+
+export const TEST_REQUEST_HEADER = "x-wsmp-test";
+export const TEST_INSTANCE_HEADER = "x-wsmp-instance";
+export const TEST_REALTIME_QUERY = "test";
+
+/** `runtime:<runtimeId>:<upstreamModelId>`; the model id may contain `:` and `/`. */
+export const DIRECT_TEST_MODEL_PATTERN = /^runtime:([A-Za-z0-9_-]{1,128}):(.{1,256})$/;

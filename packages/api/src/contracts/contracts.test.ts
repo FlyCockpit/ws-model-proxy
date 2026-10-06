@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
+import { type CallerAuth, callerMayReach } from "./auth-context";
 import { PRISMA_ENUM_MIRRORS } from "./common";
 import {
   apiContract,
@@ -42,6 +43,7 @@ const INVENTORY = [
   "nodes.update",
   "nodes.rename",
   "nodes.delete",
+  "nodes.lowerTrustPreview",
   "nodes.lowerTrust",
   "nodes.enrollmentCodes.list",
   "nodes.enrollmentCodes.create",
@@ -68,7 +70,9 @@ const INVENTORY = [
   "runtimes.delete",
   "runtimes.start",
   "runtimes.stop",
-  "runtimes.restart",
+  "runtimes.steps.attach",
+  "runtimes.steps.reopen",
+  "runtimes.steps.cancel",
   "runtimes.instances.forget",
   "runtimes.models.setCapabilities",
   "runtimes.detected.add",
@@ -230,6 +234,41 @@ describe("0.4.0 oRPC contract", () => {
   });
 });
 
+describe("caller auth (positive human check)", () => {
+  const callers: Record<string, CallerAuth> = {
+    cookie: { kind: "cookie_session", userId: "u", sessionId: "s", csrfVerified: true },
+    cookieNoCsrf: { kind: "cookie_session", userId: "u", sessionId: "s", csrfVerified: false },
+    fullAgent: { kind: "agent_token", userId: "u", agentTokenId: "t", level: "FULL" },
+    oauth: { kind: "oauth_access_token", userId: "u", grantId: "g", level: "FULL" },
+    apiKey: { kind: "api_key", userId: "u", apiKeyId: "k" },
+  };
+
+  it("lets only a CSRF-checked cookie session reach human procedures", () => {
+    for (const [path, procedure] of procedures) {
+      if (procedure.access !== "human" && procedure.access !== "human_admin") continue;
+      expect(callerMayReach(procedure.access, callers.cookie as CallerAuth), path).toBe(true);
+      for (const name of ["cookieNoCsrf", "fullAgent", "oauth", "apiKey"])
+        expect(
+          callerMayReach(procedure.access, callers[name] as CallerAuth),
+          `${path} ${name}`,
+        ).toBe(false);
+    }
+  });
+
+  it("refuses tokens on session and admin procedures; API keys reach no procedure", () => {
+    for (const [path, procedure] of procedures) {
+      if (procedure.access === "session" || procedure.access === "admin")
+        for (const name of ["fullAgent", "oauth", "apiKey"])
+          expect(
+            callerMayReach(procedure.access, callers[name] as CallerAuth),
+            `${path} ${name}`,
+          ).toBe(false);
+      if (procedure.access !== "public")
+        expect(callerMayReach(procedure.access, callers.apiKey as CallerAuth), path).toBe(false);
+    }
+  });
+});
+
 describe("0.4.0 MCP tool manifest", () => {
   it("has the 25 tools in order, 7 of them read-only", () => {
     expect(MCP_TOOLS.map((tool) => tool.name)).toEqual([...MCP_TOOL_NAMES]);
@@ -298,6 +337,26 @@ describe("metrics_query input", () => {
         ...base,
         scope: { node: "n" },
         metrics: ["custom:gpu_power"],
+      }).success,
+    ).toBe(true);
+  });
+
+  it("caps each family to what its tables keep", () => {
+    expect(
+      metricsQueryInputSchema.safeParse({
+        ...base,
+        scope: { pool: "p" },
+        metrics: ["kv_usage_max"],
+        range: "30d",
+        step: "1h",
+      }).success,
+    ).toBe(false);
+    expect(
+      metricsQueryInputSchema.safeParse({
+        ...base,
+        scope: { pool: "p" },
+        range: { from: "2026-01-01T00:00:00Z", to: "2026-06-01T00:00:00Z" },
+        step: "1d",
       }).success,
     ).toBe(true);
   });

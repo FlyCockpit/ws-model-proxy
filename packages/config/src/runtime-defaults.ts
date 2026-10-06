@@ -27,11 +27,14 @@ export const RUNTIME_LIMIT_COLUMNS = {
     auto: { source: "engine" },
   },
   kvFullThreshold: { kind: "number", min: 0.01, max: 1, auto: { default: 0.95 } },
-  /** Column with a non-null default; "automatic" is AUTO. */
+  /**
+   * A Prisma enum column, so its values are the upper-case Prisma values like every enum in the
+   * API (values that live only in JSON are lower-case). "Automatic" is AUTO.
+   */
   engineLoadGate: {
     kind: "enum",
-    values: ["auto", "enforce", "observe"],
-    auto: { default: "auto" },
+    values: ["AUTO", "ENFORCE", "OBSERVE"],
+    auto: { default: "AUTO" },
   },
 } as const satisfies Record<string, RegistryEntry>;
 

@@ -1,8 +1,16 @@
 /**
  * `metrics_query` / `activity.metrics.query` (spec §6.2 #7): the metric names, which rollup each
  * reads, and which `groupBy` values are valid for each scope. Every groupBy is a rollup key;
- * percentiles come from the fixed, versioned histogram bounds (HISTOGRAM_BOUNDS_V1).
+ * percentiles come from the fixed, versioned histogram bounds: `histogramVersion: "v1"` =
+ * `LATENCY_HISTOGRAM_BOUNDS_MS` in `@ws-model-proxy/config/usage-metrics` (a change is a new
+ * version).
  */
+import {
+  ENGINE_LOAD_ROLLUP_MINUTE_RETENTION_DAYS,
+  NODE_METRICS_MINUTE_RETENTION_DAYS,
+  USAGE_ROLLUP_HOUR_RETENTION_DAYS,
+  USAGE_ROLLUP_MINUTE_RETENTION_DAYS,
+} from "@ws-model-proxy/config/usage-metrics";
 import { z } from "zod";
 import { idSchema, isoDateSchema } from "./common";
 
@@ -104,9 +112,26 @@ export const GROUP_BY_BY_SCOPE: Record<MetricScope, Record<MetricFamily, readonl
 export const METRIC_RANGES = ["1h", "24h", "7d", "30d"] as const;
 export const METRIC_STEPS = ["1m", "5m", "1h", "1d"] as const;
 const DAY_MS = 86_400_000;
-/** Minute buckets cover 30 days, hour buckets 13 months. */
-export const MINUTE_STEP_MAX_RANGE_MS = 30 * DAY_MS;
-export const HOUR_STEP_MAX_RANGE_MS = 396 * DAY_MS;
+/**
+ * How far back each family is kept, so a query never promises more than the tables hold:
+ * request rollups 30 days per minute and 13 months per hour; engine load (per minute only) 8
+ * days; node gauges (per minute only) 7 days. Load and node rows carry no pool key: a pool scope
+ * follows the pool's CURRENT members back in time.
+ */
+export const RANGE_LIMIT_MS: Record<MetricFamily, { minuteSteps: number; any: number }> = {
+  request: {
+    minuteSteps: USAGE_ROLLUP_MINUTE_RETENTION_DAYS * DAY_MS,
+    any: USAGE_ROLLUP_HOUR_RETENTION_DAYS * DAY_MS,
+  },
+  load: {
+    minuteSteps: ENGINE_LOAD_ROLLUP_MINUTE_RETENTION_DAYS * DAY_MS,
+    any: ENGINE_LOAD_ROLLUP_MINUTE_RETENTION_DAYS * DAY_MS,
+  },
+  node: {
+    minuteSteps: NODE_METRICS_MINUTE_RETENTION_DAYS * DAY_MS,
+    any: NODE_METRICS_MINUTE_RETENTION_DAYS * DAY_MS,
+  },
+};
 
 export const metricsQueryInputSchema = z
   .object({
@@ -143,10 +168,17 @@ export const metricsQueryInputSchema = z
         ? { "1h": 3_600_000, "24h": DAY_MS, "7d": 7 * DAY_MS, "30d": 30 * DAY_MS }[input.range]
         : Date.parse(input.range.to) - Date.parse(input.range.from);
     if (rangeMs <= 0) ctx.addIssue({ code: "custom", path: ["range"], message: "Empty range." });
-    if ((input.step === "1m" || input.step === "5m") && rangeMs > MINUTE_STEP_MAX_RANGE_MS)
-      ctx.addIssue({ code: "custom", path: ["step"], message: "Minute steps cover 30 days." });
-    if (rangeMs > HOUR_STEP_MAX_RANGE_MS)
-      ctx.addIssue({ code: "custom", path: ["range"], message: "History covers 13 months." });
+    const minuteStep = input.step === "1m" || input.step === "5m";
+    for (const metric of input.metrics) {
+      const limit = RANGE_LIMIT_MS[metricFamily(metric)];
+      const maxMs = minuteStep ? limit.minuteSteps : limit.any;
+      if (rangeMs > maxMs)
+        ctx.addIssue({
+          code: "custom",
+          path: ["range"],
+          message: `${metric} is kept ${Math.round(maxMs / DAY_MS)} days for this step.`,
+        });
+    }
   });
 
 const metricValues = z.record(z.string(), z.number().nullable());
