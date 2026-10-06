@@ -96,7 +96,7 @@
     "revoke": "Revoke contribution",
     "firstPage": "First page",
     "nextPage": "Next page",
-    "policyTitle": "External routing and embedding identity",
+    "policyTitle": "Cloud fallback and embedding identity",
     "paidProtection": "Allow paid fallback solely to protect a warm cache",
     "paidProtectionHint": "Off by default: local free capacity is used first. Enabling can incur provider costs despite free local capacity. Provider/token consent still applies.",
     "embeddingEnable": "Declare an external embedding identity",
@@ -221,12 +221,12 @@
       "commandModeHelp": {
         "off": "MCP agents cannot run commands on this CLI.",
         "supervised": "An agent can ask to run a command; it runs only after someone presses Enter on the CLI's confirm screen.",
-        "unsupervised": "Dangerous: any agent holding an MCP token for this account can run any command on this machine, as the CLI's OS user, with no one confirming it. Prefer Supervised."
+        "unsupervised": "Dangerous: any agent holding an MCP token for this account can run any command on this machine, as the CLI's OS user, with no one confirming it. Prefer Ask first."
       },
       "commandModeRecommended": "Recommended",
       "unsupervisedConfirm": {
         "title": "Allow unrestricted commands on {{name}}?",
-        "description": "Any agent holding an MCP token for this account will be able to run any command on {{name}}, as the operating-system user the CLI runs as, without anyone confirming it. A leaked or misused token means full control of that account on this machine. Supervised mode keeps a person in the loop and is recommended.",
+        "description": "Any agent holding an MCP token for this account will be able to run any command on {{name}}, as the operating-system user the CLI runs as, without anyone confirming it. A leaked or misused token means full control of that account on this machine. Ask first keeps a person in the loop and is recommended.",
         "cancel": "Keep current mode",
         "confirm": "Allow unrestricted"
       },
@@ -249,14 +249,14 @@
       "commandSwitches": "A command runs only when the MCP token, this grant and the CLI's own config all allow it. The effective mode is the stricter of the last two.",
       "commandKind": {
         "headless": "Headless commands",
-        "supervised": "Supervised commands"
+        "supervised": "Ask-first commands"
       },
       "commandAllowed": "allowed now",
       "commandRefusal": {
         "grant_disabled": "refused: the dashboard grant above does not allow it. Raise the grant to allow it.",
         "offline": "refused: this CLI is offline or too old for it. It works again once the CLI reconnects on a current wsmp.",
         "feature_disabled": "refused: this CLI's own config does not allow it. On that machine run wsmp config set-mcp-commands and restart wsmp.",
-        "unsupported": "refused: this CLI has no terminal support (for example on Windows), so supervised commands cannot run on it.",
+        "unsupported": "refused: this CLI has no terminal support (for example on Windows), so ask-first commands cannot run on it.",
         "grant_supervised_only": "refused: needs Unrestricted, and the dashboard grant above is Ask first. Raise the grant to allow it (this CLI's config must then allow it too).",
         "cli_supervised_only": "refused: needs Unrestricted, and this CLI's own config is Ask first (supervised). On that machine run wsmp config set-mcp-commands unsupervised and restart wsmp."
       },
@@ -369,7 +369,7 @@
       "program": "Program: {{value}}",
       "kinds": {
         "command": "Command",
-        "supervised_command": "Supervised command",
+        "supervised_command": "Ask-first command",
         "file_read": "Read file",
         "file_stat": "File info",
         "file_list": "List folder",
@@ -379,7 +379,7 @@
         "file_rename": "Rename",
         "file_mkdir": "Create folder",
         "file_delete": "Delete",
-        "supervised_file_write": "Supervised file write"
+        "supervised_file_write": "Ask-first file write"
       },
       "outcomes": {
         "completed": "Completed",
@@ -592,10 +592,10 @@
     "user": "User",
     "route": {
       "local": "Local",
-      "poolFallback": "Pool fallback · {{model}}",
+      "poolFallback": "Cloud fallback · {{model}}",
       "ownKey": "Your key · {{model}}",
       "unknownModel": "unknown model",
-      "externalUnavailable": "External unavailable",
+      "externalUnavailable": "Cloud fallback unavailable",
       "reasonLabel": "Reason: {{reason}}",
       "reasons": {
         "local_wait_expired": "local members stayed busy past the wait limit",
@@ -1683,8 +1683,8 @@
     "typeTokenName": "Type the token name to confirm",
     "visiblePreview": "{{count}} models visible to this token",
     "publicEgressWarningTitle": "Cloud fallback is available",
-    "publicEgressWarning": "Pools: {{pools}}. Enabling external access on a token lets prompts leave this deployment for third-party providers, only with <pool>:external when local members cannot serve the request. Plain names stay local.",
-    "publicEgressWarningNamed": "Pools: {{pools}}. Providers: {{providers}}. Enabling external access on a token lets prompts leave this deployment, only with <pool>:external when local members cannot serve the request. Plain names stay local."
+    "publicEgressWarning": "Pools: {{pools}}. Turning on cloud access for a token lets prompts leave this deployment for third-party providers, only with <pool>:external when local members cannot serve the request. Plain names stay local.",
+    "publicEgressWarningNamed": "Pools: {{pools}}. Providers: {{providers}}. Turning on cloud access for a token lets prompts leave this deployment, only with <pool>:external when local members cannot serve the request. Plain names stay local."
   },
   "providers": {
     "title": "Cloud providers",
@@ -1932,7 +1932,7 @@
     "disabledDeployment": "Cloud providers are disabled on this deployment. Stored accounts and key details remain available; you can revoke keys and delete configuration. Creation, edits, and credential tests are disabled.",
     "externalFallbackHint": "Enable “Allow cloud fallback” in the pool’s Cloud fallback tab before attaching a provider. Provider models never serve plain pool names.",
     "externalRequestHint": "Only <pool>:external requests with token permission can use these providers when local members cannot serve the request. Provider charges apply.",
-    "accessSummary": "Pool grants: {{grants}}. Tokens that include this pool: {{tokens}}. External access also requires token consent and the pool’s grantee setting.",
+    "accessSummary": "Pool grants: {{grants}}. Tokens that include this pool: {{tokens}}. Cloud access also requires token consent and the pool’s grantee setting.",
     "dataCollection": {
       "label": "Allow OpenRouter providers that may collect data",
       "deniedHint": "Off: requests carry data_collection: \"deny\", so OpenRouter uses only providers that do not store or train on prompts. Some models may then have no provider.",
@@ -2055,7 +2055,7 @@
       "runtimes": "Runtimes with a queue",
       "sectionLabel": "Health",
       "clis": "CLIs online",
-      "endpoints": "Endpoints healthy",
+      "endpoints": "Model servers reachable",
       "members": "Pool members",
       "ratio": "{{value}} / {{total}}",
       "membersValue": "{{degraded}} degraded · {{open}} paused",
@@ -2094,7 +2094,7 @@
       },
       "tier": {
         "PRIMARY": "Primary",
-        "PUBLIC_OVERFLOW": "Fallback"
+        "PUBLIC_OVERFLOW": "Cloud fallback"
       },
       "health": {
         "UNKNOWN": "Unknown",

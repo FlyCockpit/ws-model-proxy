@@ -398,7 +398,7 @@ describe("CLI feature switches", () => {
       commands: commands(),
     };
 
-    it("marks Unsupervised as dangerous and Supervised as recommended", () => {
+    it("marks Unrestricted as dangerous and Ask first as recommended", () => {
       renderSwitches(allowsAll);
       const unsupervised = modeRadio("unsupervised").closest("label");
       expect(unsupervised?.className).toContain("text-destructive");
@@ -441,7 +441,7 @@ describe("CLI feature switches", () => {
       expect((modeRadio("unsupervised") as HTMLInputElement).checked).toBe(false);
     });
 
-    it("needs no confirm for Off or Supervised", async () => {
+    it("needs no confirm for Off or Ask first", async () => {
       const user = userEvent.setup();
       renderSwitches(allowsAll);
       await user.click(modeRadio("supervised"));

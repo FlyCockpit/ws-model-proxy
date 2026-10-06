@@ -91,7 +91,7 @@ describe("RouteChip", () => {
     ).toBeTruthy();
   });
 
-  it("shows External unavailable alone and next to a local route", () => {
+  it("shows Cloud fallback unavailable alone and next to a local route", () => {
     const { rerender } = render(<RouteChip route={{ ...base, externalUnavailable: true }} />);
     expect(screen.getByText("dashboard:chatTest.route.externalUnavailable")).toBeTruthy();
     expect(screen.queryByText("dashboard:chatTest.route.local")).toBeNull();

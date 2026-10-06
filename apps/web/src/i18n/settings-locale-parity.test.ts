@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
+import enDashboard from "../locales/en-US/dashboard.json";
 import enSettings from "../locales/en-US/settings.json";
+import esDashboard from "../locales/es-MX/dashboard.json";
 import esSettings from "../locales/es-MX/settings.json";
 
 /**
@@ -132,5 +134,19 @@ describe("settings locale key parity (en-US / es-MX)", () => {
     ].sort();
     expect(keyTree(enSettings.mcp).sort()).toEqual(expected);
     expect(keyTree(esSettings.mcp).sort()).toEqual(expected);
+  });
+
+  it("names MCP command modes the same way the dashboard grant does", () => {
+    for (const [settings, dashboard] of [
+      [enSettings, enDashboard],
+      [esSettings, esDashboard],
+    ] as const) {
+      expect(settings.mcp.tokens.cliDeviceMode.supervised).toBe(
+        dashboard.clis.features.commandModes.supervised,
+      );
+      expect(settings.mcp.tokens.cliDeviceMode.unsupervised).toBe(
+        dashboard.clis.features.commandModes.unsupervised,
+      );
+    }
   });
 });

@@ -100,7 +100,7 @@
     "revoke": "Revocar contribución",
     "firstPage": "Primera página",
     "nextPage": "Página siguiente",
-    "policyTitle": "Enrutamiento externo e identidad de embeddings",
+    "policyTitle": "Respaldo en la nube e identidad de embeddings",
     "paidProtection": "Permitir respaldo pagado solo para proteger una caché caliente",
     "paidProtectionHint": "Desactivado por defecto: primero se usa capacidad local libre. Activarlo puede generar costos aunque haya capacidad local. Siguen aplicándose permisos del proveedor y token.",
     "embeddingEnable": "Declarar identidad de embeddings externos",
@@ -270,10 +270,10 @@
     },
     "route": {
       "local": "Local",
-      "poolFallback": "Respaldo del pool · {{model}}",
+      "poolFallback": "Respaldo en la nube · {{model}}",
       "ownKey": "Tu clave · {{model}}",
       "unknownModel": "modelo desconocido",
-      "externalUnavailable": "Externo no disponible",
+      "externalUnavailable": "Respaldo en la nube no disponible",
       "reasonLabel": "Motivo: {{reason}}",
       "reasons": {
         "local_wait_expired": "los miembros locales siguieron ocupados después del límite de espera",
@@ -416,12 +416,12 @@
       "commandModeHelp": {
         "off": "Los agentes MCP no pueden ejecutar comandos en este CLI.",
         "supervised": "Un agente puede pedir ejecutar un comando; solo se ejecuta después de que alguien presione Enter en la pantalla de confirmación del CLI.",
-        "unsupervised": "Peligroso: cualquier agente con un token MCP de esta cuenta puede ejecutar cualquier comando en esta máquina, como el usuario del sistema operativo del CLI, sin que nadie lo confirme. Prefiere Supervisado."
+        "unsupervised": "Peligroso: cualquier agente con un token MCP de esta cuenta puede ejecutar cualquier comando en esta máquina, como el usuario del sistema operativo del CLI, sin que nadie lo confirme. Prefiere Preguntar primero."
       },
       "commandModeRecommended": "Recomendado",
       "unsupervisedConfirm": {
         "title": "¿Permitir comandos sin restricciones en {{name}}?",
-        "description": "Cualquier agente con un token MCP de esta cuenta podrá ejecutar cualquier comando en {{name}}, como el usuario del sistema operativo con el que se ejecuta el CLI, sin que nadie lo confirme. Un token filtrado o mal usado significa control total de esa cuenta en esta máquina. El modo Supervisado mantiene a una persona en el proceso y es el recomendado.",
+        "description": "Cualquier agente con un token MCP de esta cuenta podrá ejecutar cualquier comando en {{name}}, como el usuario del sistema operativo con el que se ejecuta el CLI, sin que nadie lo confirme. Un token filtrado o mal usado significa control total de esa cuenta en esta máquina. Preguntar primero mantiene a una persona en el proceso y es el recomendado.",
         "cancel": "Mantener el modo actual",
         "confirm": "Permitir sin restricciones"
       },
@@ -444,14 +444,14 @@
       "commandSwitches": "Un comando se ejecuta solo cuando el token MCP, este permiso y la configuración propia del CLI lo permiten. El modo efectivo es el más estricto de los dos últimos.",
       "commandKind": {
         "headless": "Comandos sin cabecera (headless)",
-        "supervised": "Comandos supervisados"
+        "supervised": "Comandos que preguntan primero"
       },
       "commandAllowed": "permitido ahora",
       "commandRefusal": {
         "grant_disabled": "rechazado: el permiso del panel de arriba no lo permite. Sube el permiso para permitirlo.",
         "offline": "rechazado: este CLI está desconectado o es demasiado antiguo. Funciona de nuevo cuando el CLI se reconecte con un wsmp actual.",
         "feature_disabled": "rechazado: la configuración propia de este CLI no lo permite. En esa máquina ejecuta wsmp config set-mcp-commands y reinicia wsmp.",
-        "unsupported": "rechazado: este CLI no tiene compatibilidad con terminal (por ejemplo en Windows), así que no puede ejecutar comandos supervisados.",
+        "unsupported": "rechazado: este CLI no tiene compatibilidad con terminal (por ejemplo en Windows), así que no puede ejecutar comandos que preguntan primero.",
         "grant_supervised_only": "rechazado: requiere Sin restricciones, y el permiso del panel de arriba es Preguntar primero. Sube el permiso para permitirlo (la configuración de este CLI también debe permitirlo).",
         "cli_supervised_only": "rechazado: requiere Sin restricciones, y la configuración propia de este CLI es Preguntar primero (supervised). En esa máquina ejecuta wsmp config set-mcp-commands unsupervised y reinicia wsmp."
       },
@@ -564,7 +564,7 @@
       "program": "Programa: {{value}}",
       "kinds": {
         "command": "Comando",
-        "supervised_command": "Comando supervisado",
+        "supervised_command": "Comando que pregunta primero",
         "file_read": "Leer archivo",
         "file_stat": "Info del archivo",
         "file_list": "Listar carpeta",
@@ -574,7 +574,7 @@
         "file_rename": "Renombrar",
         "file_mkdir": "Crear carpeta",
         "file_delete": "Eliminar",
-        "supervised_file_write": "Escritura de archivo supervisada"
+        "supervised_file_write": "Escritura de archivo que pregunta primero"
       },
       "outcomes": {
         "completed": "Completada",
@@ -1810,7 +1810,7 @@
     "disabledDeployment": "Los proveedores en la nube están deshabilitados en esta implementación. Las cuentas guardadas y los detalles de las claves siguen disponibles; puedes revocar claves y eliminar configuración. La creación, edición y pruebas de credenciales están deshabilitadas.",
     "externalFallbackHint": "Habilita “Permitir respaldo en la nube” en la pestaña Respaldo en la nube del pool antes de agregar un proveedor. Los modelos de proveedores nunca atienden nombres simples de pools.",
     "externalRequestHint": "Solo las solicitudes <pool>:external con permiso del token pueden usar estos proveedores cuando los miembros locales no pueden atenderlas. Se aplican cargos del proveedor.",
-    "accessSummary": "Accesos compartidos al pool: {{grants}}. Tokens que incluyen este pool: {{tokens}}. El acceso externo también requiere el consentimiento del token y la configuración del pool para usuarios con acceso compartido.",
+    "accessSummary": "Accesos compartidos al pool: {{grants}}. Tokens que incluyen este pool: {{tokens}}. El acceso a la nube también requiere el consentimiento del token y la configuración del pool para usuarios con acceso compartido.",
     "dataCollection": {
       "label": "Permitir proveedores de OpenRouter que pueden recopilar datos",
       "deniedHint": "Desactivado: las solicitudes llevan data_collection: \"deny\", así que OpenRouter solo usa proveedores que no guardan los prompts ni entrenan con ellos. Algunos modelos pueden quedarse sin proveedor.",
@@ -1940,8 +1940,8 @@
     "typeTokenName": "Escribe el nombre del token para confirmar",
     "visiblePreview": "{{count}} modelos visibles para este token",
     "publicEgressWarningTitle": "Respaldo en la nube disponible",
-    "publicEgressWarning": "Pools: {{pools}}. Habilitar el acceso externo de un token permite enviar prompts fuera de esta implementación a proveedores externos, solo con <pool>:external cuando los miembros locales no pueden atender la solicitud. Los nombres simples permanecen locales.",
-    "publicEgressWarningNamed": "Pools: {{pools}}. Proveedores: {{providers}}. Habilitar el acceso externo de un token permite enviar prompts fuera de esta implementación, solo con <pool>:external cuando los miembros locales no pueden atender la solicitud. Los nombres simples permanecen locales."
+    "publicEgressWarning": "Pools: {{pools}}. Activar el acceso a la nube de un token permite enviar prompts fuera de esta implementación a proveedores externos, solo con <pool>:external cuando los miembros locales no pueden atender la solicitud. Los nombres simples permanecen locales.",
+    "publicEgressWarningNamed": "Pools: {{pools}}. Proveedores: {{providers}}. Activar el acceso a la nube de un token permite enviar prompts fuera de esta implementación, solo con <pool>:external cuando los miembros locales no pueden atender la solicitud. Los nombres simples permanecen locales."
   },
   "providerCatalog": {
     "presets": {
@@ -2059,7 +2059,7 @@
       "runtimes": "Runtimes con cola",
       "sectionLabel": "Salud",
       "clis": "CLI en línea",
-      "endpoints": "Endpoints en buen estado",
+      "endpoints": "Servidores de modelos accesibles",
       "members": "Miembros de pools",
       "ratio": "{{value}} / {{total}}",
       "membersValue": "{{degraded}} degradados · {{open}} en pausa",
@@ -2098,7 +2098,7 @@
       },
       "tier": {
         "PRIMARY": "Principal",
-        "PUBLIC_OVERFLOW": "Respaldo"
+        "PUBLIC_OVERFLOW": "Respaldo en la nube"
       },
       "health": {
         "UNKNOWN": "Desconocido",
