@@ -15,6 +15,9 @@ use wsmp::exit::ExitCode;
 use wsmp::{commands, exit, logging, output, shutdown, tls};
 
 fn main() {
+    // A relay that took a shutdown signal re-executes itself only to die
+    // from it; do that before anything else runs.
+    shutdown::die_if_reexecuted();
     let cli = Cli::parse();
     tls::install_crypto_provider();
     logging::init(cli.log_format, cli.verbose, cli.quiet);

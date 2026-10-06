@@ -381,6 +381,14 @@ assignment provenance and automatic concurrency seed columns.
 
 ## Fixed
 
+- **Commands the CLI starts can be stopped with signals again (since #51).**
+  The relay blocked SIGTERM, SIGINT and SIGHUP for its own shutdown handling,
+  and every command it started (exec commands, metric sources, engine
+  adapters, deployment start/stop/status commands) inherited that mask. Where
+  `/bin/sh` is bash (macOS, Fedora/RHEL, Arch) those commands then ignored
+  `kill`, `pkill` and `timeout`, and a stop command could not end a `nohup`'d
+  backend. The CLI now takes shutdown signals with a handler instead, so its
+  commands start with nothing blocked; relay shutdown behaves as before.
 - **A disconnect that arrives just after a CLI reconnects no longer re-opens
   its pool members (#113, #129).** The reconnect hello had already made the
   members due, but the old socket's close could still be processed during the

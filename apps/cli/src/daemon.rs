@@ -628,8 +628,7 @@ fn check_shutdown() -> Result<()> {
 }
 
 pub fn connect_foreground() -> Result<()> {
-    // First, before any thread exists, so every thread inherits the blocked
-    // shutdown signals and only the watcher thread takes them.
+    // First, so a stop that lands during startup still unwinds cleanly.
     crate::shutdown::install()?;
     let mut config = Config::load_required()?;
     config.validate()?;
@@ -1434,12 +1433,7 @@ fn run_relay_session(
                 .map_err(|error| websocket_session_error(error, "sending relay pong", true)),
             Ok(Message::Pong(_)) => Ok(()),
             Ok(Message::Frame(_)) => Ok(()),
-            Err(tungstenite::Error::Io(err))
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                Ok(())
-            }
+            Err(tungstenite::Error::Io(err)) if read_poll_woke(&err) => Ok(()),
             Err(err) => Err(websocket_session_error(
                 err,
                 "reading relay websocket",
@@ -3930,9 +3924,7 @@ where
                     reset_backoff: false,
                 });
             }
-            Err(tungstenite::Error::Io(err))
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(tungstenite::Error::Io(err)) if read_poll_woke(&err) => {}
             Err(err) => {
                 return Err(websocket_session_error(
                     err,
@@ -4039,6 +4031,19 @@ fn inventory_from_config(config: &mut Config) -> Vec<EndpointInventory> {
         }
     }
     inventory_snapshot_from_config(config)
+}
+
+/// A relay socket read that returned without data and can simply be retried:
+/// the poll timeout set by [`set_socket_timeouts`], or a shutdown signal
+/// that landed on this thread (`EINTR`; a socket timeout keeps the read from
+/// restarting). The loop then checks for shutdown as after a timeout.
+fn read_poll_woke(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+    )
 }
 
 fn set_socket_timeouts(

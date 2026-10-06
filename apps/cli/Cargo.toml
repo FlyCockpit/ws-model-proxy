@@ -67,7 +67,11 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 # Named directly only to install the process-wide `ring` crypto provider (see
 # `wsmp::tls`); default features would add aws-lc-rs back.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "net", "io-util"] }
+# `signal`: shutdown signals (SIGTERM/SIGINT/SIGHUP on Unix; console control
+# events on Windows) start the bounded relay shutdown (`wsmp::shutdown`). On
+# Unix a handler replaces blocking them for `sigwait`, so children never
+# inherit a blocked mask.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
 # The `Stream` trait lets a request body remain credit-paced while reqwest owns
 # the cancellable connection future.
 futures-core = "0.3"
@@ -135,9 +139,6 @@ rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 # that conversion needs no extra Tokio feature. Windows kill-on-drop is also
 # synchronous and does not wait (ChildDropGuard delegates to std Child::kill).
 process-wrap = { version = "10", default-features = false, features = ["tokio1", "job-object", "kill-on-drop"] }
-# Console control events (Ctrl-C, Ctrl-Break, close, shutdown) start the same
-# bounded relay shutdown as SIGINT/SIGTERM on Unix. Unix keeps `sigwait`.
-tokio = { version = "1", features = ["signal"] }
 
 [dev-dependencies]
 # Black-box CLI testing: run the built binary and assert on stdout/stderr/exit.
