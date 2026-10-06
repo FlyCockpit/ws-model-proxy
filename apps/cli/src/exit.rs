@@ -7,7 +7,7 @@
 //!   1  generic runtime error (the default for any `anyhow::Error`)
 //!   2  usage error (clap emits this automatically for bad arguments)
 //!   3  the requested resource was not found
-//!   4  the relay has no usable credential (missing, revoked, or rejected);
+//!   4  the relay has no usable credential (missing, or rejected with 401);
 //!      run `wsmp login`. The systemd unit lists this in
 //!      `RestartPreventExitStatus=` so it does not restart in a loop.
 //!

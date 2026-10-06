@@ -262,9 +262,12 @@ pub fn render_systemd_user_unit(
          ExecStart={exec} daemon start --foreground\n\
          Restart=on-failure\n\
          RestartSec=5\n\
-         # Exit 4: the credential is missing or was rejected; restarting cannot fix it.\n\
-         # Run `wsmp login`, then `systemctl --user restart wsmp.service`.\n\
+         # Exit 4: the credential is missing or was rejected (HTTP 401, including a\n\
+         # temporary ban); restarting cannot fix it. Run `wsmp login`, then\n\
+         # `systemctl --user restart wsmp.service`.\n\
          RestartPreventExitStatus=4\n\
+         # Tells the relay it may exit 4 here instead of retrying in-process.\n\
+         Environment=WSMP_STOP_ON_REJECTED_CREDENTIAL=1\n\
          # The config and state paths `wsmp service install` resolved, so the service\n\
          # reads the same device credential as the installing shell.\n\
          {pinned}\
@@ -745,8 +748,12 @@ mod tests {
         );
         assert!(unit.contains("Environment=\"WSMP_STATE_DIR=/srv/wsmp state/100%%\"\n"));
         assert!(unit.contains("Environment=PATH=/home/user/.local/bin:/usr/bin\n"));
-        // Only the pinned paths: no token or header variables in the unit.
-        assert_eq!(unit.matches("Environment=").count(), 3);
+        assert!(unit.contains(&format!(
+            "Environment={}=1\n",
+            crate::daemon::STOP_ON_REJECTED_CREDENTIAL_ENV
+        )));
+        // Only the pinned paths and the stop marker: no token or header variables.
+        assert_eq!(unit.matches("Environment=").count(), 4);
     }
 
     #[test]

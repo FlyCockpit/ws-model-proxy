@@ -260,12 +260,29 @@ The terminals page shows each CLI's fingerprint: base32 of the first 20 bytes of
   `wsmp service install` after changing any of them.
   `wsmp config show` prints `configFile` and `stateDir`, and `wsmp status`
   prints the state directory in use.
-- **A rejected credential stops the relay.** When the server answers the relay
-  handshake with 401 or 403 (the credential was revoked, replaced by a newer
-  `wsmp login`, or is invalid), or no credential exists, the relay exits with
-  code 4 instead of retrying. The systemd unit does not restart on exit 4: run
-  `wsmp login`, then `systemctl --user restart wsmp.service`. Network errors and
-  server errors (5xx, 429) still reconnect with backoff.
+- **A rejected or missing credential.** The server answers the relay
+  handshake with 401 when the credential was revoked, replaced by a newer
+  `wsmp login`, is invalid, or is temporarily banned. "Missing" means the CLI
+  token variable is unset or empty, or no device credential is saved in an
+  existing state directory. What happens then depends on where the relay runs:
+  - **Linux systemd user service** (`wsmp service install`): the relay exits
+    with code 4, which the unit lists in `RestartPreventExitStatus=`, so the
+    service stays stopped instead of restarting every 5 seconds. This also
+    applies to a temporary ban: the relay stays down until you restart it. Run
+    `wsmp login` if needed, then `systemctl --user restart wsmp.service`.
+  - **Interactive terminal** (`wsmp connect` or `wsmp daemon start
+    --foreground` with stderr on a terminal): the relay exits with code 4 and
+    the message.
+  - **Everywhere else** (macOS LaunchAgent, whose `KeepAlive` would relaunch
+    any exit; a detached daemon; a unit installed by an older wsmp): the relay
+    logs the error and retries in-process with the normal backoff, capped at 5
+    minutes, and connects by itself once `wsmp login` has saved a credential.
+
+  Anything else is always retried with backoff: network errors, 403 (which
+  comes from a proxy or firewall, not the WS Model Proxy server), 429, 5xx,
+  and a credential that cannot be read yet (an I/O or parse error, or a state
+  directory that does not exist, such as an encrypted home before it is
+  mounted).
 - **Logging in again.** `wsmp login` names its CLI slug in the approval
   request, and the browser approval page shows it. Approving a slug you
   already use replaces that device's login: the device keeps its name,
@@ -376,7 +393,7 @@ path (never the URL signature).
 | 1 | runtime error |
 | 2 | usage error |
 | 3 | not found |
-| 4 | the relay has no usable credential (none saved, or the server rejected it as revoked or invalid); run `wsmp login`. The systemd unit does not restart on this code. |
+| 4 | the relay has no usable credential (none saved, or the server rejected it with HTTP 401); run `wsmp login`. Only under the systemd unit and in an interactive terminal; elsewhere the relay retries instead. The systemd unit does not restart on this code. |
 | 128 + signal | the relay stopped on SIGHUP (129), SIGINT (130), or SIGTERM (143); on Unix it dies from that signal after cleanup |
 
 ## Install After Release

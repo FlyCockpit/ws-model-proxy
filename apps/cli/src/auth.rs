@@ -13,13 +13,51 @@ pub enum ResolvedCredential {
     Device { secret: String },
 }
 
+/// Definitely no credential: the CLI token variable is unset or empty, or no
+/// device credential is saved in an existing state directory. Waiting cannot
+/// fix it; the user must log in. Every other resolution failure (an I/O or
+/// parse error, a state directory that is not there yet, such as an encrypted
+/// home before it is mounted) may clear up and is retried.
+#[derive(Debug)]
+pub struct MissingCredential(String);
+
+impl std::fmt::Display for MissingCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MissingCredential {}
+
+/// Whether `error` (anywhere in its chain) is a [`MissingCredential`].
+pub fn is_missing_credential(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<MissingCredential>().is_some())
+}
+
 pub fn resolve_credential(config: &Config) -> Result<ResolvedCredential> {
     if let Some(env) = &config.cli_token_env {
         validate_env_name(env)?;
-        let secret = std::env::var(env)
-            .with_context(|| format!("reading CLI token from environment variable `{env}`"))?;
+        let secret = match std::env::var(env) {
+            Ok(secret) => secret,
+            Err(std::env::VarError::NotPresent) => {
+                return Err(MissingCredential(format!(
+                    "CLI token environment variable `{env}` is not set; export it (and run `wsmp service env-sync` for the service) or run `wsmp login`"
+                ))
+                .into());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("reading CLI token from environment variable `{env}`")
+                });
+            }
+        };
         if secret.trim().is_empty() {
-            anyhow::bail!("CLI token environment variable `{env}` is empty");
+            return Err(MissingCredential(format!(
+                "CLI token environment variable `{env}` is empty"
+            ))
+            .into());
         }
         return Ok(ResolvedCredential::CliToken {
             env: env.clone(),
@@ -27,9 +65,17 @@ pub fn resolve_credential(config: &Config) -> Result<ResolvedCredential> {
         });
     }
     let Some(credential) = load_device_credential()? else {
-        anyhow::bail!(
-            "no CLI token env var is configured and no device credential exists; run `wsmp login` or `wsmp token login <ENV_VAR>`"
-        );
+        let state_dir = crate::paths::state_dir()?;
+        if !state_dir.is_dir() {
+            anyhow::bail!(
+                "state directory `{}` does not exist (not mounted yet?); no device credential can be read",
+                state_dir.display()
+            );
+        }
+        return Err(MissingCredential(
+            "no CLI token env var is configured and no device credential exists; run `wsmp login` or `wsmp token login <ENV_VAR>`".to_string(),
+        )
+        .into());
     };
     Ok(ResolvedCredential::Device {
         secret: credential.secret,
@@ -372,6 +418,19 @@ mod tests {
             }
             ExchangeError::DeviceFlow(state) => panic!("classified as {state:?}"),
         }
+    }
+
+    #[test]
+    fn an_unset_token_variable_is_a_definite_missing_credential() {
+        let config = Config {
+            cli_token_env: Some("WSMP_TEST_TOKEN_NEVER_SET_6F3A".to_string()),
+            ..Config::default()
+        };
+        let error = resolve_credential(&config).expect_err("unset token");
+        assert!(is_missing_credential(&error));
+        assert!(!is_missing_credential(&anyhow::anyhow!(
+            "reading device credential: permission denied"
+        )));
     }
 
     #[test]

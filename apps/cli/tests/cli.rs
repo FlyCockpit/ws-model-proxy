@@ -301,15 +301,40 @@ fn connect_persists_generated_slug_before_auth_failure() {
         }),
     );
 
+    // As under the systemd unit: a definitely missing credential exits 4
+    // (elsewhere the relay keeps retrying in-process).
     cli(&config, &state)
         .arg("connect")
+        .env("WSMP_STOP_ON_REJECTED_CREDENTIAL", "1")
+        .timeout(std::time::Duration::from_secs(60))
         .assert()
-        .failure()
+        .code(4)
         .stderr(predicate::str::contains("no CLI token env var"));
     let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
     let slug = cfg["cliSlug"].as_str().expect("slug");
     assert!(slug.starts_with("cli-"));
     assert!(slug.len() <= 63);
+}
+
+#[test]
+fn connect_without_the_stop_marker_keeps_retrying_a_missing_credential() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    write_config(
+        &config,
+        json!({ "version": 1, "serverUrl": "http://127.0.0.1:9", "endpoints": [] }),
+    );
+    // A macOS LaunchAgent or detached daemon: exiting would only relaunch.
+    cli(&config, &state)
+        .arg("connect")
+        .env_remove("WSMP_STOP_ON_REJECTED_CREDENTIAL")
+        .timeout(std::time::Duration::from_secs(3))
+        .assert()
+        .interrupted()
+        .stderr(predicate::str::contains(
+            "relay credential unavailable; retrying",
+        ));
 }
 
 #[test]
