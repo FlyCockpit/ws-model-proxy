@@ -246,6 +246,12 @@ The terminals page shows each CLI's fingerprint: base32 of the first 20 bytes of
   LaunchAgent (macOS). Re-running install rewrites the unit/plist and restarts.
 - **Device credentials** (`wsmp login`) live in the state directory and work
   under services without extra setup.
+- **A rejected credential stops the relay.** When the server answers the relay
+  handshake with 401 or 403 (the credential was revoked, replaced by a newer
+  `wsmp login`, or is invalid), or no credential exists, the relay exits with
+  code 4 instead of retrying. The systemd unit does not restart on exit 4: run
+  `wsmp login`, then `systemctl --user restart wsmp.service`. Network errors and
+  server errors (5xx, 429) still reconnect with backoff.
 - **Logging in again.** `wsmp login` names its CLI slug in the approval
   request, and the browser approval page shows it. Approving a slug you
   already use replaces that device's login: the device keeps its name,
@@ -356,6 +362,7 @@ path (never the URL signature).
 | 1 | runtime error |
 | 2 | usage error |
 | 3 | not found |
+| 4 | the relay has no usable credential (none saved, or the server rejected it as revoked or invalid); run `wsmp login`. The systemd unit does not restart on this code. |
 | 128 + signal | the relay stopped on SIGHUP (129), SIGINT (130), or SIGTERM (143); on Unix it dies from that signal after cleanup |
 
 ## Install After Release

@@ -115,6 +115,20 @@ fn executable() -> Result<String> {
         .map_err(|_| anyhow::anyhow!("wsmp executable path is not valid UTF-8"))
 }
 
+/// After `wsmp login`, a relay service that stopped on a rejected credential
+/// (exit 4, which systemd does not restart) needs a manual restart.
+pub fn restart_hint_after_login() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        if service_file().is_ok_and(|file| file.exists()) {
+            return Some(format!(
+                "if the relay service stopped for lack of a credential, restart it: `systemctl --user restart {LINUX_UNIT}`"
+            ));
+        }
+    }
+    None
+}
+
 /// Env var names the relay may need at runtime (CLI token + endpoint headers).
 pub fn required_service_env_names(config: &Config) -> Vec<String> {
     let mut names = Vec::new();
@@ -207,6 +221,9 @@ pub fn render_systemd_user_unit(executable: &str, env_file: &str) -> String {
          ExecStart={exec} daemon start --foreground\n\
          Restart=on-failure\n\
          RestartSec=5\n\
+         # Exit 4: the credential is missing or was rejected; restarting cannot fix it.\n\
+         # Run `wsmp login`, then `systemctl --user restart wsmp.service`.\n\
+         RestartPreventExitStatus=4\n\
          # Optional: CLI-token / endpoint-header env vars (see `wsmp service env-sync`).\n\
          # The leading `-` means a missing file is not fatal (device credentials still work).\n\
          EnvironmentFile=-{env_file}\n\
@@ -649,6 +666,10 @@ mod tests {
         assert!(unit.contains("ExecStart=\"/opt/ws model/wsmp\" daemon start --foreground"));
         assert!(unit.contains("EnvironmentFile=-/home/user/.config/ws-model-proxy/service.env"));
         assert!(unit.contains("Restart=on-failure"));
+        assert!(unit.contains(&format!(
+            "RestartPreventExitStatus={}",
+            crate::exit::ExitCode::CredentialRejected as i32
+        )));
         assert!(unit.contains("WantedBy=default.target"));
         assert!(!unit.contains("Environment=WSMP_"));
     }

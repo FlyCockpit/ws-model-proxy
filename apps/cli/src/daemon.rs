@@ -675,7 +675,11 @@ pub fn connect_foreground() -> Result<()> {
         };
         config = candidate;
         let cli_slug = ensure_cli_slug(&mut config)?;
-        let credential = resolve_credential(&config)?;
+        // Retrying cannot conjure a credential; exit with the code the
+        // systemd unit does not restart on.
+        let credential = resolve_credential(&config).context(crate::exit::CodedError::new(
+            crate::exit::ExitCode::CredentialRejected,
+        ))?;
         let secret = match credential {
             crate::auth::ResolvedCredential::CliToken { secret, .. } => secret,
             crate::auth::ResolvedCredential::Device { secret } => secret,
@@ -1066,11 +1070,7 @@ fn run_relay_session(
         HeaderValue::from_static(RELAY_SUBPROTOCOL),
     );
     request.headers_mut().insert("Authorization", auth_value);
-    let (mut socket, response) =
-        connect(request).map_err(|error| RelaySessionError::Reconnectable {
-            error: anyhow::Error::new(error).context("opening relay websocket"),
-            reset_backoff: false,
-        })?;
+    let (mut socket, response) = connect(request).map_err(relay_connect_error)?;
     if response
         .headers()
         .get("Sec-WebSocket-Protocol")
@@ -4027,6 +4027,30 @@ where
         .map_err(|error| websocket_session_error(error, context, true))
 }
 
+/// Classify a failed relay websocket handshake. A 401 or 403 means the server
+/// rejected the credential (revoked, replaced by a newer login, or invalid);
+/// retrying would only hammer the server, so it is fatal and asks for
+/// `wsmp login`. Network failures, 429, and 5xx stay reconnectable.
+fn relay_connect_error(error: tungstenite::Error) -> RelaySessionError {
+    if let tungstenite::Error::Http(response) = &error {
+        let status = response.status().as_u16();
+        if matches!(status, 401 | 403) {
+            return RelaySessionError::Fatal(
+                anyhow::anyhow!(
+                    "the server rejected this machine's relay credential (HTTP {status}); it is revoked or invalid. Run `wsmp login` to sign in again"
+                )
+                .context(crate::exit::CodedError::new(
+                    crate::exit::ExitCode::CredentialRejected,
+                )),
+            );
+        }
+    }
+    RelaySessionError::Reconnectable {
+        error: anyhow::Error::new(error).context("opening relay websocket"),
+        reset_backoff: false,
+    }
+}
+
 fn websocket_session_error(
     error: tungstenite::Error,
     context: &'static str,
@@ -5215,6 +5239,41 @@ mod tests {
                 .as_str(),
             "http://localhost:11434/v1/models"
         );
+    }
+
+    #[test]
+    fn rejected_relay_credentials_are_fatal_but_server_trouble_reconnects() {
+        let http = |status: u16| {
+            let response = tungstenite::http::Response::builder()
+                .status(status)
+                .body(None)
+                .expect("response");
+            tungstenite::Error::Http(Box::new(response))
+        };
+        for status in [401, 403] {
+            match relay_connect_error(http(status)) {
+                RelaySessionError::Fatal(error) => {
+                    assert_eq!(
+                        crate::exit::code_for(&error),
+                        crate::exit::ExitCode::CredentialRejected
+                    );
+                    assert!(crate::exit::message_for(&error).contains("`wsmp login`"));
+                }
+                _ => panic!("HTTP {status} must be fatal"),
+            }
+        }
+        for status in [429, 500, 502, 503] {
+            assert!(matches!(
+                relay_connect_error(http(status)),
+                RelaySessionError::Reconnectable { .. }
+            ));
+        }
+        let io =
+            tungstenite::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert!(matches!(
+            relay_connect_error(io),
+            RelaySessionError::Reconnectable { .. }
+        ));
     }
 
     #[test]
