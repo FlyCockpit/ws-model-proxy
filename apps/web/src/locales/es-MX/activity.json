@@ -1,1 +1,72 @@
-{}
+{
+  "requests": {
+    "status": "Estado",
+    "source": "Origen",
+    "all": "Todas",
+    "statusValue": {
+      "PENDING": "En curso",
+      "SUCCEEDED": "Exitosa",
+      "FAILED": "Fallida",
+      "CANCELED": "Cancelada"
+    },
+    "sourceValue": {
+      "API_KEY": "Clave de API",
+      "TEST": "Página de prueba",
+      "AGENT_TEST": "Prueba de agente",
+      "SIDECAR": "Paso de medios"
+    },
+    "routeValue": {
+      "local": "Local",
+      "cloud": "Nube",
+      "own_key": "Clave propia"
+    },
+    "direct": "Modelo directo",
+    "queueWait": "Cola {{ms}} ms",
+    "ttft": "Primer token {{ms}} ms",
+    "duration": "{{ms}} ms",
+    "tokens": "{{prompt}} entrada / {{completion}} salida",
+    "attempts_one": "{{count}} intento",
+    "attempts_other": "{{count}} intentos",
+    "rejection": "Rechazada: {{reason}}",
+    "error": "Error: {{reason}}",
+    "empty": "Ninguna solicitud coincide.",
+    "loadMore": "Cargar más",
+    "loadFailed": "No se pudo cargar el registro de solicitudes.",
+    "clear": "Borrar mi registro",
+    "clearTitle": "¿Borrar tu registro de solicitudes?",
+    "clearDescription": "Se borra cada solicitud terminada que hiciste (las que siguen en curso se quedan). Las solicitudes que otras personas hicieron a tus pools se quedan en sus registros.",
+    "cleared_one": "{{count}} solicitud borrada.",
+    "cleared_other": "{{count}} solicitudes borradas."
+  },
+  "commands": {
+    "title": "Comandos",
+    "description": "Comandos que agentes y personas ejecutaron en tus nodos. La salida llega en vivo desde el nodo y solo se guarda ahí.",
+    "state": {
+      "RUNNING": "En ejecución",
+      "SUCCEEDED": "Exitoso",
+      "FAILED": "Fallido",
+      "CANCELLED": "Cancelado",
+      "TIMED_OUT": "Tiempo agotado",
+      "INTERRUPTED": "Interrumpido",
+      "UNKNOWN": "Desconocido"
+    },
+    "interruptedHint": "Se detuvo cuando el nodo bajó a solo relé o su servicio se reinició.",
+    "byAgent": "Agente {{name}}",
+    "byUnknownAgent": "Un agente",
+    "byPerson": "Tú",
+    "bySystem": "Sistema",
+    "exit": "Salida {{code}}",
+    "endsBy": "Se detiene a más tardar",
+    "output": "Salida",
+    "showOutput": "Ver salida",
+    "refresh": "Actualizar",
+    "cancel": "Cancelar comando",
+    "cancelled": "Cancelación enviada.",
+    "offline": "El nodo está desconectado, así que no hay salida disponible.",
+    "truncated": "Solo se muestra el final de la salida.",
+    "noOutput": "Todavía no hay salida.",
+    "empty": "Todavía no hay comandos.",
+    "loadFailed": "No se pudo cargar el registro de comandos.",
+    "loadMore": "Cargar más"
+  }
+}

@@ -1,1 +1,23 @@
-{}
+{
+  "nodesTitle": "Terminales del navegador",
+  "nodesDescription": "Abre una shell en un nodo con control completo. Los nodos solo relé no aceptan terminales del navegador.",
+  "open": "Abrir terminal",
+  "opening": "Abriendo…",
+  "noFullNodes": "Ningún nodo tiene control completo y está conectado.",
+  "nodesUnavailable": "No se pudieron cargar tus nodos.",
+  "offline": "Desconectado",
+  "relayOnly": "Solo relé",
+  "attachPending": "La terminal {{terminalId}} está abierta en {{node}}. Conectarla en el navegador necesita el socket de terminal del servidor, que aún no está conectado en esta vista previa.",
+  "close": "Cerrar",
+  "queuedTitle": "Comandos en espera para ti",
+  "queuedDescription": "Un agente te pidió ejecutarlos. Ejecutar abre una terminal con el comando escrito; tú presionas Enter.",
+  "queuedEmpty": "Nada te está esperando.",
+  "queuedLoadFailed": "No se pudieron cargar los comandos en espera.",
+  "run": "Ejecutar",
+  "dismiss": "Descartar",
+  "dismissed": "Descartado.",
+  "onNode": "En {{node}}",
+  "fromAgent": "Puesto en espera por un agente",
+  "expires": "Vence",
+  "copyCommand": "Copiar comando"
+}

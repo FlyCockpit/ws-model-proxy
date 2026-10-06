@@ -41,6 +41,21 @@ function ActivityLayout() {
         </Link>
       ),
     },
+    {
+      key: "commands",
+      labelKey: "dashboard:tabs.activity.commands",
+      render: (className, activeClassName, children) => (
+        <Link
+          to="/$lang/activity/commands"
+          params={{ lang }}
+          activeOptions={{ exact: false }}
+          className={className}
+          activeProps={{ className: activeClassName }}
+        >
+          {children}
+        </Link>
+      ),
+    },
   ];
   return (
     <div className="flex min-w-0 flex-col gap-4">

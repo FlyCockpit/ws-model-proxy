@@ -1,1 +1,72 @@
-{}
+{
+  "requests": {
+    "status": "Status",
+    "source": "Source",
+    "all": "All",
+    "statusValue": {
+      "PENDING": "In progress",
+      "SUCCEEDED": "Succeeded",
+      "FAILED": "Failed",
+      "CANCELED": "Canceled"
+    },
+    "sourceValue": {
+      "API_KEY": "API key",
+      "TEST": "Test page",
+      "AGENT_TEST": "Agent test",
+      "SIDECAR": "Media step"
+    },
+    "routeValue": {
+      "local": "Local",
+      "cloud": "Cloud",
+      "own_key": "Own key"
+    },
+    "direct": "Direct model",
+    "queueWait": "Queue {{ms}} ms",
+    "ttft": "First token {{ms}} ms",
+    "duration": "{{ms}} ms",
+    "tokens": "{{prompt}} in / {{completion}} out",
+    "attempts_one": "{{count}} attempt",
+    "attempts_other": "{{count}} attempts",
+    "rejection": "Refused: {{reason}}",
+    "error": "Error: {{reason}}",
+    "empty": "No requests match.",
+    "loadMore": "Load more",
+    "loadFailed": "Could not load the request log.",
+    "clear": "Clear my log",
+    "clearTitle": "Delete your request log?",
+    "clearDescription": "Every finished request you made is deleted (requests still running stay). Requests other people made to your pools stay in their logs.",
+    "cleared_one": "{{count}} request deleted.",
+    "cleared_other": "{{count}} requests deleted."
+  },
+  "commands": {
+    "title": "Commands",
+    "description": "Commands agents and people ran on your nodes. Output comes live from the node and is kept only there.",
+    "state": {
+      "RUNNING": "Running",
+      "SUCCEEDED": "Succeeded",
+      "FAILED": "Failed",
+      "CANCELLED": "Cancelled",
+      "TIMED_OUT": "Timed out",
+      "INTERRUPTED": "Interrupted",
+      "UNKNOWN": "Unknown"
+    },
+    "interruptedHint": "Stopped when the node was lowered to Relay only or its service restarted.",
+    "byAgent": "Agent {{name}}",
+    "byUnknownAgent": "An agent",
+    "byPerson": "You",
+    "bySystem": "System",
+    "exit": "Exit {{code}}",
+    "endsBy": "Stops by",
+    "output": "Output",
+    "showOutput": "Show output",
+    "refresh": "Refresh",
+    "cancel": "Cancel command",
+    "cancelled": "Cancel sent.",
+    "offline": "The node is offline, so no output is available.",
+    "truncated": "Only the end of the output is shown.",
+    "noOutput": "No output yet.",
+    "empty": "No commands yet.",
+    "loadFailed": "Could not load the command log.",
+    "loadMore": "Load more"
+  }
+}

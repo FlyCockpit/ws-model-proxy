@@ -32,7 +32,8 @@
     },
     "activity": {
       "metrics": "Métricas",
-      "requests": "Solicitudes"
+      "requests": "Solicitudes",
+      "commands": "Comandos"
     }
   },
   "pages": {

@@ -38,6 +38,7 @@ import { Route as LangAuthAppAccessApiKeysRouteImport } from './routes/$lang/_au
 import { Route as LangAuthAppAccessContributionsRouteImport } from './routes/$lang/_auth/_app/access/contributions'
 import { Route as LangAuthAppAccessSharesRouteImport } from './routes/$lang/_auth/_app/access/shares'
 import { Route as LangAuthAppActivityIndexRouteImport } from './routes/$lang/_auth/_app/activity/index'
+import { Route as LangAuthAppActivityCommandsRouteImport } from './routes/$lang/_auth/_app/activity/commands'
 import { Route as LangAuthAppActivityRequestsRouteImport } from './routes/$lang/_auth/_app/activity/requests'
 import { Route as LangAuthAppNodesIndexRouteImport } from './routes/$lang/_auth/_app/nodes/index'
 import { Route as LangAuthAppNodesNodeIdRouteImport } from './routes/$lang/_auth/_app/nodes/$nodeId'
@@ -208,6 +209,12 @@ const LangAuthAppActivityIndexRoute =
     path: '/',
     getParentRoute: () => LangAuthAppActivityRoute,
   } as any)
+const LangAuthAppActivityCommandsRoute =
+  LangAuthAppActivityCommandsRouteImport.update({
+    id: '/commands',
+    path: '/commands',
+    getParentRoute: () => LangAuthAppActivityRoute,
+  } as any)
 const LangAuthAppActivityRequestsRoute =
   LangAuthAppActivityRequestsRouteImport.update({
     id: '/requests',
@@ -368,6 +375,7 @@ export interface FileRoutesByFullPath {
   '/$lang/access/api-keys': typeof LangAuthAppAccessApiKeysRoute
   '/$lang/access/contributions': typeof LangAuthAppAccessContributionsRoute
   '/$lang/access/shares': typeof LangAuthAppAccessSharesRoute
+  '/$lang/activity/commands': typeof LangAuthAppActivityCommandsRoute
   '/$lang/activity/requests': typeof LangAuthAppActivityRequestsRoute
   '/$lang/nodes/$nodeId': typeof LangAuthAppNodesNodeIdRoute
   '/$lang/pools/$poolId': typeof LangAuthAppPoolsPoolIdRouteWithChildren
@@ -415,6 +423,7 @@ export interface FileRoutesByTo {
   '/$lang/access/api-keys': typeof LangAuthAppAccessApiKeysRoute
   '/$lang/access/contributions': typeof LangAuthAppAccessContributionsRoute
   '/$lang/access/shares': typeof LangAuthAppAccessSharesRoute
+  '/$lang/activity/commands': typeof LangAuthAppActivityCommandsRoute
   '/$lang/activity/requests': typeof LangAuthAppActivityRequestsRoute
   '/$lang/nodes/$nodeId': typeof LangAuthAppNodesNodeIdRoute
   '/$lang/profiles/$profileId': typeof LangAuthAppProfilesProfileIdRoute
@@ -468,6 +477,7 @@ export interface FileRoutesById {
   '/$lang/_auth/_app/access/api-keys': typeof LangAuthAppAccessApiKeysRoute
   '/$lang/_auth/_app/access/contributions': typeof LangAuthAppAccessContributionsRoute
   '/$lang/_auth/_app/access/shares': typeof LangAuthAppAccessSharesRoute
+  '/$lang/_auth/_app/activity/commands': typeof LangAuthAppActivityCommandsRoute
   '/$lang/_auth/_app/activity/requests': typeof LangAuthAppActivityRequestsRoute
   '/$lang/_auth/_app/nodes/$nodeId': typeof LangAuthAppNodesNodeIdRoute
   '/$lang/_auth/_app/pools/$poolId': typeof LangAuthAppPoolsPoolIdRouteWithChildren
@@ -522,6 +532,7 @@ export interface FileRouteTypes {
     | '/$lang/access/api-keys'
     | '/$lang/access/contributions'
     | '/$lang/access/shares'
+    | '/$lang/activity/commands'
     | '/$lang/activity/requests'
     | '/$lang/nodes/$nodeId'
     | '/$lang/pools/$poolId'
@@ -569,6 +580,7 @@ export interface FileRouteTypes {
     | '/$lang/access/api-keys'
     | '/$lang/access/contributions'
     | '/$lang/access/shares'
+    | '/$lang/activity/commands'
     | '/$lang/activity/requests'
     | '/$lang/nodes/$nodeId'
     | '/$lang/profiles/$profileId'
@@ -621,6 +633,7 @@ export interface FileRouteTypes {
     | '/$lang/_auth/_app/access/api-keys'
     | '/$lang/_auth/_app/access/contributions'
     | '/$lang/_auth/_app/access/shares'
+    | '/$lang/_auth/_app/activity/commands'
     | '/$lang/_auth/_app/activity/requests'
     | '/$lang/_auth/_app/nodes/$nodeId'
     | '/$lang/_auth/_app/pools/$poolId'
@@ -858,6 +871,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAuthAppActivityIndexRouteImport
       parentRoute: typeof LangAuthAppActivityRoute
     }
+    '/$lang/_auth/_app/activity/commands': {
+      id: '/$lang/_auth/_app/activity/commands'
+      path: '/commands'
+      fullPath: '/$lang/activity/commands'
+      preLoaderRoute: typeof LangAuthAppActivityCommandsRouteImport
+      parentRoute: typeof LangAuthAppActivityRoute
+    }
     '/$lang/_auth/_app/activity/requests': {
       id: '/$lang/_auth/_app/activity/requests'
       path: '/requests'
@@ -1042,11 +1062,13 @@ const LangAuthAppAccessRouteWithChildren =
   LangAuthAppAccessRoute._addFileChildren(LangAuthAppAccessRouteChildren)
 
 interface LangAuthAppActivityRouteChildren {
+  LangAuthAppActivityCommandsRoute: typeof LangAuthAppActivityCommandsRoute
   LangAuthAppActivityRequestsRoute: typeof LangAuthAppActivityRequestsRoute
   LangAuthAppActivityIndexRoute: typeof LangAuthAppActivityIndexRoute
 }
 
 const LangAuthAppActivityRouteChildren: LangAuthAppActivityRouteChildren = {
+  LangAuthAppActivityCommandsRoute: LangAuthAppActivityCommandsRoute,
   LangAuthAppActivityRequestsRoute: LangAuthAppActivityRequestsRoute,
   LangAuthAppActivityIndexRoute: LangAuthAppActivityIndexRoute,
 }
