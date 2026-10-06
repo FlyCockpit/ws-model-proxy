@@ -46,12 +46,17 @@ export async function refreshFabricsHashes(
       Fabric: { select: { name: true, Members: { select: { ip: true } } } },
     },
   });
+  const held = await tx.node.findMany({
+    where: { userId, id: { in: ids } },
+    select: { id: true, heldFabricsHash: true },
+  });
+  const heldById = new Map(held.map((node) => [node.id, node.heldFabricsHash]));
   for (const nodeId of ids) {
     const sets = nodeFabricSets(memberships.filter((member) => member.nodeId === nodeId));
-    await tx.node.updateMany({
-      where: { id: nodeId, userId },
-      data: { fabricsHash: nodeFabricsHash(sets) },
-    });
+    // Like metric commands: no fabrics and nothing held is "nothing to push" (null).
+    const fabricsHash =
+      sets.length === 0 && (heldById.get(nodeId) ?? null) === null ? null : nodeFabricsHash(sets);
+    await tx.node.updateMany({ where: { id: nodeId, userId }, data: { fabricsHash } });
   }
 }
 

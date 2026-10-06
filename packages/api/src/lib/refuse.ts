@@ -36,3 +36,17 @@ export function isUniqueViolation(error: unknown): boolean {
   const cause = Reflect.get(error, "cause");
   return !!cause && typeof cause === "object" && Reflect.get(cause, "originalCode") === "23505";
 }
+
+/** A CHECK, trigger or unique violation (23xxx / P0001 raised by a hardening trigger). */
+export function isConstraintViolation(error: unknown): boolean {
+  if (isUniqueViolation(error)) return true;
+  if (!error || typeof error !== "object") return false;
+  const meta = Reflect.get(error, "meta");
+  const metaCode = meta && typeof meta === "object" ? Reflect.get(meta, "code") : undefined;
+  const cause = Reflect.get(error, "cause");
+  const causeCode =
+    cause && typeof cause === "object" ? Reflect.get(cause, "originalCode") : undefined;
+  return [Reflect.get(error, "code"), metaCode, causeCode].some(
+    (code) => typeof code === "string" && (/^23[0-9A-Z]{3}$/.test(code) || code === "P0001"),
+  );
+}

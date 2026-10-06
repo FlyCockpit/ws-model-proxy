@@ -244,14 +244,15 @@ describe("nodes.update", () => {
     db.node.findFirst
       .mockResolvedValueOnce(trustRow as never)
       .mockResolvedValueOnce(nodeRow() as never);
+    db.node.updateMany.mockResolvedValueOnce({ count: 1 });
     await client(FULL_AGENT, { definitionChanged }).update({
       nodeId: "node-1",
       labels: ["gpu", "big"],
       portRange: [31000, 31099],
       note: "more ports",
     });
-    expect(db.node.update.mock.calls[0]?.[0]).toMatchObject({
-      where: { id: "node-1" },
+    expect(db.node.updateMany.mock.calls[0]?.[0]).toMatchObject({
+      where: { id: "node-1", userId: "owner-1", trust: "FULL", trustLowerRequestedAt: null },
       data: { labels: ["gpu", "big"], portStart: 31000, portEnd: 31099 },
     });
     expect(db.nodeAuditEvent.create.mock.calls[0]?.[0]?.data).toMatchObject({
@@ -283,6 +284,7 @@ describe("nodes.update", () => {
         },
       ] as never);
     db.fabric.upsert.mockResolvedValueOnce({ id: "f-1" } as never);
+    db.node.updateMany.mockResolvedValueOnce({ count: 1 });
     await client().update({ nodeId: "node-1", fabrics: [{ name: "qsfp", ip: "10.0.0.1" }] });
     expect(db.fabricMember.create.mock.calls[0]?.[0]?.data).toEqual({
       userId: "owner-1",
@@ -290,11 +292,31 @@ describe("nodes.update", () => {
       nodeId: "node-1",
       ip: "10.0.0.1",
     });
-    const hashed = db.node.updateMany.mock.calls.map((call) => call[0]?.where);
+    const hashed = db.node.updateMany.mock.calls.slice(1).map((call) => call[0]?.where);
     expect(hashed).toEqual([
       { id: "node-1", userId: "owner-1" },
       { id: "node-2", userId: "owner-1" },
     ]);
+  });
+
+  it("refuses when trust was lowered between the read and the write", async () => {
+    db.node.findFirst.mockResolvedValueOnce(trustRow as never);
+    db.node.updateMany.mockResolvedValueOnce({ count: 0 });
+    await expect(client().update({ nodeId: "node-1", labels: ["a"] })).rejects.toMatchObject({
+      data: { reason: "trust_relay" },
+    });
+    expect(db.nodeAuditEvent.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses an OAuth connection without Full level", async () => {
+    await expect(
+      client({
+        kind: "oauth_access_token",
+        userId: "owner-1",
+        grantId: "g",
+        level: "READ",
+      } as never).update({ nodeId: "node-1", labels: ["a"] }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 
   it("maps a duplicate fabric address to CONFLICT", async () => {
@@ -358,9 +380,11 @@ describe("trust lowering", () => {
     ] as never);
     db.instanceRank.findMany.mockResolvedValueOnce([] as never);
     db.nodeAuditEvent.findFirst.mockResolvedValueOnce(null);
+    db.node.updateMany.mockResolvedValueOnce({ count: 1 });
     const out = await client(PERSON, { lowerTrust }).lowerTrust({ nodeId: "node-1" });
-    expect(db.node.update.mock.calls[0]?.[0]?.data).toMatchObject({
-      trustLowerRequestedBy: "owner-1",
+    expect(db.node.updateMany.mock.calls[0]?.[0]).toMatchObject({
+      where: { trustLowerRequestedAt: null, NOT: { trust: "RELAY" } },
+      data: { trustLowerRequestedBy: "owner-1" },
     });
     expect(db.queuedNodeCommand.updateMany.mock.calls[0]?.[0]).toMatchObject({
       where: { state: "QUEUED", nodeId: "node-1" },
@@ -387,7 +411,7 @@ describe("trust lowering", () => {
     db.instanceRank.findMany.mockResolvedValueOnce([] as never);
     db.nodeAuditEvent.findFirst.mockResolvedValueOnce(null);
     await client().lowerTrust({ nodeId: "node-1" });
-    expect(db.node.update).not.toHaveBeenCalled();
+    expect(db.node.updateMany).not.toHaveBeenCalled();
     expect(db.nodeAuditEvent.create).not.toHaveBeenCalled();
   });
 });
@@ -412,5 +436,41 @@ describe("fabrics", () => {
     await expect(client().fabrics.rename({ fabricId: "f-1", name: "taken" })).rejects.toMatchObject(
       { data: { reason: "slug_taken" } },
     );
+  });
+});
+
+describe("activity", () => {
+  it("refuses a cursor that is not one of the caller's rows", async () => {
+    db.nodeAuditEvent.findFirst.mockResolvedValueOnce(null);
+    await expect(client().activity.list({ cursor: "foreign" })).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+    });
+    expect(db.nodeAuditEvent.findFirst.mock.calls[0]?.[0]?.where).toEqual({
+      id: "foreign",
+      userId: "owner-1",
+    });
+    expect(db.nodeAuditEvent.findMany).not.toHaveBeenCalled();
+  });
+
+  it("pages with a next cursor", async () => {
+    const row = (id: string) => ({
+      id,
+      createdAt: new Date("2026-10-06T10:00:00Z"),
+      userId: "owner-1",
+      nodeId: "node-1",
+      actor: "USER",
+      agentTokenId: null,
+      kind: "node_update",
+      subject: "node:labels",
+      outcome: "completed",
+      reason: null,
+      exitCode: null,
+      startedAt: new Date("2026-10-06T10:00:00Z"),
+      finishedAt: null,
+    });
+    db.nodeAuditEvent.findMany.mockResolvedValueOnce([row("a"), row("b"), row("c")] as never);
+    const out = await client().activity.list({ limit: 2 });
+    expect(out.items.map((item) => item.id)).toEqual(["a", "b"]);
+    expect(out.nextCursor).toBe("b");
   });
 });

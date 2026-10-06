@@ -17,6 +17,14 @@ import { loadNodeDetail, loadNodeSummary } from "./load";
 import { isFullControl, nodeTrustView } from "./trust";
 import { nodeSummarySelect, parseHeldDefinitions, toNodeSummary } from "./views";
 
+function relayOnly(nodeId: string) {
+  return refuseAbout(
+    "trust_relay",
+    nodeId,
+    "This node is Relay only: its definition is frozen. Run `wsmp trust full` on the node to change it.",
+  );
+}
+
 /** Run a relay hook after commit; the node resyncs at its next hello if it fails. */
 async function afterCommit(hook: (() => Promise<void>) | undefined): Promise<void> {
   if (!hook) return;
@@ -74,13 +82,7 @@ export const nodeProcedures = {
         "Set node secrets with `wsmp secret set NAME` on the node.",
       );
     }
-    if (!isFullControl(node)) {
-      throw refuseAbout(
-        "trust_relay",
-        node.id,
-        "This node is Relay only: its definition is frozen. Run `wsmp trust full` on the node to change it.",
-      );
-    }
+    if (!isFullControl(node)) throw relayOnly(node.id);
     if (input.metricCommands) nodeMetricCommandsSchema.parse(input.metricCommands);
 
     const changed = (
@@ -92,8 +94,9 @@ export const nodeProcedures = {
     try {
       pushTo = await prisma.$transaction(async (tx) => {
         const metricCommands = input.metricCommands;
-        await tx.node.update({
-          where: { id: node.id },
+        // Conditional on Full control, so a lower that commits after the read above wins.
+        const written = await tx.node.updateMany({
+          where: { id: node.id, userId, trust: "FULL", trustLowerRequestedAt: null },
           data: {
             ...(input.labels !== undefined ? { labels: input.labels } : {}),
             ...(input.portRange !== undefined
@@ -116,6 +119,7 @@ export const nodeProcedures = {
             ...(input.commandMaxMs !== undefined ? { commandMaxMs: input.commandMaxMs } : {}),
           },
         });
+        if (written.count === 0) throw relayOnly(node.id);
         let affected: string[] = [node.id];
         if (input.fabrics !== undefined) {
           const fabricNodes = await replaceNodeFabrics(tx, userId, node.id, input.fabrics);
@@ -289,11 +293,19 @@ export const nodeProcedures = {
       });
       if (!node) throw notFound("Node");
       let trustColumns = node;
-      if (node.trust !== "RELAY" && node.trustLowerRequestedAt === null) {
-        await tx.node.update({
-          where: { id: node.id },
-          data: { trustLowerRequestedAt: now, trustLowerRequestedBy: userId },
-        });
+      const requested =
+        node.trust !== "RELAY" && node.trustLowerRequestedAt === null
+          ? await tx.node.updateMany({
+              where: {
+                id: node.id,
+                userId,
+                trustLowerRequestedAt: null,
+                NOT: { trust: "RELAY" },
+              },
+              data: { trustLowerRequestedAt: now, trustLowerRequestedBy: userId },
+            })
+          : { count: 0 };
+      if (requested.count === 1) {
         trustColumns = { ...node, trustLowerRequestedAt: now };
         await tx.queuedNodeCommand.updateMany({
           where: { userId, nodeId: node.id, state: "QUEUED" },
@@ -421,9 +433,19 @@ export const nodeProcedures = {
 
   activity: {
     list: contractProcedure(c.activity.list).handler(async ({ context, input }) => {
+      const userId = context.session.user.id;
+      // Prisma's cursor subquery ignores `where`: only the caller's own rows position a page.
+      if (
+        input.cursor &&
+        !(await prisma.nodeAuditEvent.findFirst({
+          where: { id: input.cursor, userId },
+          select: { id: true },
+        }))
+      )
+        throw new ORPCError("BAD_REQUEST", { message: "Unknown cursor." });
       const rows = await prisma.nodeAuditEvent.findMany({
         where: {
-          userId: context.session.user.id,
+          userId,
           ...(input.nodeId ? { nodeId: input.nodeId } : {}),
           ...(input.kind ? { kind: input.kind } : {}),
         },
@@ -508,8 +530,10 @@ async function frozenParts(
       where: {
         userId,
         nodeId,
-        kind: { in: ["node_update", "metric_commands_define"] },
-        subject: { contains: "metricCommands" },
+        OR: [
+          { kind: "metric_commands_define" },
+          { kind: "node_update", subject: { contains: "metricCommands" } },
+        ],
         outcome: "completed",
       },
       orderBy: { createdAt: "desc" },

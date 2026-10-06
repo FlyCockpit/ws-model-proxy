@@ -3,6 +3,7 @@
  * Minting a code is the person's approval of the nodes that use it (human only); the exchange
  * itself is plain HTTP in `apps/server` (`POST /api/node/enroll`).
  */
+import { ORPCError } from "@orpc/server";
 import prisma from "@ws-model-proxy/db";
 import { credentialDigest } from "@ws-model-proxy/db/node-security";
 import { env } from "@ws-model-proxy/env/server";
@@ -10,7 +11,7 @@ import type { z } from "zod";
 import { contractProcedure } from "../contract-procedure";
 import type { enrollmentCodeViewSchema } from "../contracts/nodes";
 import { nodesContract as c } from "../contracts/nodes";
-import { notFound, refuse } from "../lib/refuse";
+import { isConstraintViolation, notFound, refuse } from "../lib/refuse";
 import {
   enrollmentCodePrefix,
   enrollmentInstallCommand,
@@ -81,6 +82,19 @@ export function toEnrollmentCodeView(row: CodeRow): z.infer<typeof enrollmentCod
   };
 }
 
+/** A concurrent Replace code for the same node trips `node_enrollment_replace_shape`. */
+async function mintCode<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    if (isConstraintViolation(error))
+      throw new ORPCError("CONFLICT", {
+        message: "Another enrollment code was created for this node at the same time. Try again.",
+      });
+    throw error;
+  }
+}
+
 function liveCodeWhere(userId: string, now: Date) {
   return { userId, revokedAt: null, expiresAt: { gt: now } };
 }
@@ -109,45 +123,47 @@ export const enrollmentProcedures = {
     const userId = context.session.user.id;
     const now = new Date();
     const secret = generateEnrollmentCode();
-    const row = await prisma.$transaction(async (tx) => {
-      if (input.replaceNodeId) {
-        const node = await tx.node.findFirst({
-          where: { id: input.replaceNodeId, userId },
-          select: { id: true },
+    const row = await mintCode(async () =>
+      prisma.$transaction(async (tx) => {
+        if (input.replaceNodeId) {
+          const node = await tx.node.findFirst({
+            where: { id: input.replaceNodeId, userId },
+            select: { id: true },
+          });
+          if (!node) throw notFound("Node");
+          // At most one live Replace code per node (`node_enrollment_replace_shape`): a new one
+          // supersedes the previous.
+          await tx.nodeEnrollmentCode.updateMany({
+            where: { ...liveCodeWhere(userId, now), replaceNodeId: node.id, usedCount: 0 },
+            data: { revokedAt: now },
+          });
+        }
+        const live = await tx.nodeEnrollmentCode.findMany({
+          where: liveCodeWhere(userId, now),
+          select: { usedCount: true, maxUses: true },
         });
-        if (!node) throw notFound("Node");
-        // At most one live Replace code per node (`node_enrollment_replace_shape`): a new one
-        // supersedes the previous.
-        await tx.nodeEnrollmentCode.updateMany({
-          where: { ...liveCodeWhere(userId, now), replaceNodeId: node.id, usedCount: 0 },
-          data: { revokedAt: now },
+        if (live.filter((code) => code.usedCount < code.maxUses).length >= MAX_LIVE_CODES)
+          throw refuse(
+            "rate_limited",
+            `At most ${MAX_LIVE_CODES} enrollment codes can be live at once. Revoke one first.`,
+            "TOO_MANY_REQUESTS",
+          );
+        return tx.nodeEnrollmentCode.create({
+          data: {
+            userId,
+            codePrefix: enrollmentCodePrefix(secret),
+            codeDigest: credentialDigest("enrollmentCode", secret),
+            expiresAt: new Date(now.getTime() + input.ttlHours * HOUR_MS),
+            suggestedSlug: input.suggestedSlug ?? null,
+            replaceNodeId: input.replaceNodeId ?? null,
+            maxUses: input.maxUses,
+            labels: input.labels ?? [],
+            removeAfterOfflineMs: input.removeAfterOfflineMs ?? null,
+          },
+          select: codeSelect,
         });
-      }
-      const live = await tx.nodeEnrollmentCode.findMany({
-        where: liveCodeWhere(userId, now),
-        select: { usedCount: true, maxUses: true },
-      });
-      if (live.filter((code) => code.usedCount < code.maxUses).length >= MAX_LIVE_CODES)
-        throw refuse(
-          "rate_limited",
-          `At most ${MAX_LIVE_CODES} enrollment codes can be live at once. Revoke one first.`,
-          "TOO_MANY_REQUESTS",
-        );
-      return tx.nodeEnrollmentCode.create({
-        data: {
-          userId,
-          codePrefix: enrollmentCodePrefix(secret),
-          codeDigest: credentialDigest("enrollmentCode", secret),
-          expiresAt: new Date(now.getTime() + input.ttlHours * HOUR_MS),
-          suggestedSlug: input.suggestedSlug ?? null,
-          replaceNodeId: input.replaceNodeId ?? null,
-          maxUses: input.maxUses,
-          labels: input.labels ?? [],
-          removeAfterOfflineMs: input.removeAfterOfflineMs ?? null,
-        },
-        select: codeSelect,
-      });
-    });
+      }),
+    );
     return {
       code: toEnrollmentCodeView(row),
       secret,
