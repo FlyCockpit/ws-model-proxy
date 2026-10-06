@@ -88,6 +88,9 @@
     },
     "./routers/index": {
       "default": "./src/routers/index.ts"
+    },
+    "./lib/pool-routing": {
+      "default": "./src/lib/pool-routing.ts"
     }
   },
   "scripts": {

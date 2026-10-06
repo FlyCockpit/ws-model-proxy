@@ -1,4 +1,5 @@
 import { ORPCError } from "@orpc/server";
+import { type Locale, SUPPORTED_LOCALES } from "@ws-model-proxy/config/locales";
 import prisma from "@ws-model-proxy/db";
 import { contractProcedure } from "../contract-procedure";
 import { settingsContract as c } from "../contracts/account";
@@ -23,9 +24,14 @@ type UserSettingsRow = {
   onboardingDoneAt: Date | null;
 };
 
+function supportedLocale(value: string): Locale {
+  return SUPPORTED_LOCALES.find((locale) => locale === value) ?? "en-US";
+}
+
 function settingsView(row: UserSettingsRow) {
   return {
     ...row,
+    locale: supportedLocale(row.locale),
     twoFactorEnabled: row.twoFactorEnabled ?? false,
     onboardingDoneAt: row.onboardingDoneAt?.toISOString() ?? null,
   };
