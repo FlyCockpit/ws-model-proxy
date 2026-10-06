@@ -3,7 +3,7 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { LiveTranscriptionPanel } from "./live-transcription-panel";
+import { LiveTranscriptionLauncher, LiveTranscriptionPanel } from "./live-transcription-panel";
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -59,5 +59,17 @@ describe("LiveTranscriptionPanel", () => {
     expect((button as HTMLButtonElement).disabled).toBe(false);
     fireEvent.click(button);
     expect(start).toHaveBeenCalledWith({ model: "owner/asr" });
+  });
+
+  it("mounts the panel (and its microphone session) only once the mic button is pressed", () => {
+    render(
+      <LiveTranscriptionLauncher
+        models={[{ modelId: "owner/asr", label: "ASR" }]}
+        modelsPending={false}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: /dashboard:chatTest.live.start/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:chatTest.live.open" }));
+    expect(screen.getByRole("button", { name: /dashboard:chatTest.live.start/ })).toBeTruthy();
   });
 });

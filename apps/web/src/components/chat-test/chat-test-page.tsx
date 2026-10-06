@@ -13,7 +13,7 @@ import {
 } from "@ws-model-proxy/ui/components/drawer";
 import { Popover, PopoverContent, PopoverTrigger } from "@ws-model-proxy/ui/components/popover";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
-import { FlaskConical, MessageSquarePlus, Mic, Settings2 } from "lucide-react";
+import { FlaskConical, MessageSquarePlus, Settings2 } from "lucide-react";
 import {
   type ChangeEvent,
   type ClipboardEvent,
@@ -42,7 +42,7 @@ import type {
 import { ChatTranscript } from "@/components/chat-test/chat-transcript";
 import {
   type LiveModelOption,
-  LiveTranscriptionPanel,
+  LiveTranscriptionLauncher,
 } from "@/components/chat-test/live-transcription-panel";
 import { ModelPicker } from "@/components/chat-test/model-picker";
 import { RequestSettingsFields } from "@/components/chat-test/request-settings";
@@ -187,7 +187,6 @@ export function ChatTestPage({ lang }: { lang: string }) {
   // Collapsed by default so the mobile transcript keeps most of the viewport;
   // users expand only when they need a session system prompt.
   const [systemPromptOpen, setSystemPromptOpen] = useState(false);
-  const [liveOpen, setLiveOpen] = useState(false);
   const liveModels = useMemo(() => liveModelOptions(visibleModelsData), [visibleModelsData]);
   const systemPromptId = useId();
   const systemPromptPanelId = `${systemPromptId}-panel`;
@@ -1205,16 +1204,7 @@ export function ChatTestPage({ lang }: { lang: string }) {
           >
             <MessageSquarePlus className="size-4" />
           </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="icon-touch"
-            onClick={() => setLiveOpen(true)}
-            aria-label={t("dashboard:chatTest.live.open")}
-            title={t("dashboard:chatTest.live.open")}
-          >
-            <Mic className="size-4" />
-          </Button>
+          <LiveTranscriptionLauncher models={liveModels} modelsPending={visibleModelsIsPending} />
           {import.meta.env.DEV ? (
             <Button
               type="button"
@@ -1231,15 +1221,6 @@ export function ChatTestPage({ lang }: { lang: string }) {
           ) : null}
         </div>
       </div>
-      {/* Mounted only while open: the microphone and socket live and die with it. */}
-      {liveOpen ? (
-        <LiveTranscriptionPanel
-          open
-          onOpenChange={setLiveOpen}
-          models={liveModels}
-          modelsPending={visibleModelsIsPending}
-        />
-      ) : null}
       {!isDesktop ? (
         <Drawer open={requestSettingsOpen} onOpenChange={setRequestSettingsOpen}>
           <DrawerContent

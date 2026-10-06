@@ -33,6 +33,40 @@ export type RealtimeTranscription = {
   reset(): void;
 };
 
+/** The Chat Test realtime socket, reporting parsed events and its close. */
+function openSessionSocket(
+  model: string,
+  handlers: { onEvent(event: unknown): void; onClose(code: number): void },
+): WebSocket {
+  const socket = new WebSocket(realtimeSocketUrl(model, window.location));
+  socket.onmessage = (message) => {
+    if (typeof message.data !== "string") return;
+    try {
+      handlers.onEvent(JSON.parse(message.data));
+    } catch {
+      // Not JSON: nothing this panel can show.
+    }
+  };
+  socket.onclose = (event) => handlers.onClose(event.code);
+  return socket;
+}
+
+/** Worklet PCM becomes appends; its "flushed" mark (after End turn) becomes the commit. */
+function pipeWorkletToSocket(node: AudioWorkletNode, socket: WebSocket) {
+  node.port.onmessage = (message: MessageEvent<ArrayBuffer | { type?: string }>) => {
+    if (socket.readyState !== WebSocket.OPEN) return;
+    const data = message.data;
+    if (data instanceof ArrayBuffer) {
+      // A client that falls far behind drops audio rather than piling it up.
+      if (socket.bufferedAmount > SOCKET_BUFFER_LIMIT) return;
+      socket.send(JSON.stringify({ type: "input_audio_buffer.append", audio: pcm16Base64(data) }));
+      return;
+    }
+    if (data?.type === "flushed")
+      socket.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+  };
+}
+
 /**
  * The Chat Test live transcription session: microphone capture through an
  * AudioWorklet (24 kHz PCM16 mono), the Chat Test realtime socket (the
@@ -112,36 +146,20 @@ export function useRealtimeTranscription(): RealtimeTranscription {
         return;
       }
 
-      const socket = new WebSocket(realtimeSocketUrl(model, window.location));
+      // Owned by `resources`: `stop` (and the unmount cleanup) closes it.
+      const socket = openSessionSocket(model, {
+        onEvent: (event) => {
+          if (generation.current === attempt) dispatch({ type: "event", event });
+        },
+        onClose: (code) => {
+          if (resources.socket !== socket || generation.current !== attempt) return;
+          release(resources);
+          if (current.current === resources) current.current = null;
+          dispatch({ type: "closed", code, requested: resources.stopping });
+        },
+      });
       resources.socket = socket;
-      socket.onmessage = (message) => {
-        if (generation.current !== attempt || typeof message.data !== "string") return;
-        try {
-          dispatch({ type: "event", event: JSON.parse(message.data) });
-        } catch {
-          // Not JSON: nothing this panel can show.
-        }
-      };
-      socket.onclose = (event) => {
-        if (resources.socket !== socket || generation.current !== attempt) return;
-        release(resources);
-        if (current.current === resources) current.current = null;
-        dispatch({ type: "closed", code: event.code, requested: resources.stopping });
-      };
-      resources.node.port.onmessage = (message: MessageEvent<ArrayBuffer | { type?: string }>) => {
-        if (socket.readyState !== WebSocket.OPEN) return;
-        const data = message.data;
-        if (data instanceof ArrayBuffer) {
-          // A client that falls far behind drops audio rather than piling it up.
-          if (socket.bufferedAmount > SOCKET_BUFFER_LIMIT) return;
-          socket.send(
-            JSON.stringify({ type: "input_audio_buffer.append", audio: pcm16Base64(data) }),
-          );
-          return;
-        }
-        if (data?.type === "flushed")
-          socket.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
-      };
+      pipeWorkletToSocket(resources.node, socket);
     },
     [release, stop],
   );
