@@ -47,6 +47,10 @@ vi.mock("@ws-model-proxy/db", async () => {
     $queryRaw: (strings: TemplateStringsArray, ...values: unknown[]) => {
       const text = strings.join("?");
       if (text.includes("clock_timestamp")) return Promise.resolve([{ now: state.now }]);
+      if (text.includes("FROM attempt WHERE id") && text.includes("FOR UPDATE")) {
+        state.log.push("lock:attempt");
+        return Promise.resolve([]);
+      }
       if (text.includes("wsmp_acquire_fences")) {
         state.log.push(`fences:${(values[0] as string[]).join(",")}`);
         return Promise.resolve([{ acquired: true }]);
@@ -54,17 +58,12 @@ vi.mock("@ws-model-proxy/db", async () => {
       throw new Error(`unexpected query ${text}`);
     },
     spendCap: {
-      findMany: async ({
-        where,
-      }: {
-        where: { userId: string; OR: Array<Record<string, unknown>> };
-      }) => {
+      findMany: async ({ where }: { where: { OR: Array<Record<string, unknown>> } }) => {
         state.log.push("read:caps");
-        const rows = state.caps.filter(
-          (cap) => cap.userId === where.userId && where.OR.some((clause) => matches(cap, clause)),
-        );
-        return rows.map(({ id, scope, monthlyLimit, currency, version }) => ({
+        const rows = state.caps.filter((cap) => where.OR.some((clause) => matches(cap, clause)));
+        return rows.map(({ id, userId, scope, monthlyLimit, currency, version }) => ({
           id,
+          userId,
           scope,
           monthlyLimit,
           currency,
@@ -510,6 +509,15 @@ describe("spend admission", () => {
     });
   });
 
+  it("refuses (fail closed) when a cap on the subject is paid by someone else", async () => {
+    capOnAccount("5");
+    state.caps[0]!.userId = "grantee";
+    await expect(admitProviderBudget(attempt())).rejects.toBeInstanceOf(
+      ProviderBudgetConfigurationError,
+    );
+    expect(state.attempts.size).toBe(0);
+  });
+
   it("replays an identical admission and refuses a conflicting one", async () => {
     capOnAccount("5");
     const input = attempt();
@@ -555,6 +563,11 @@ describe("spend settlement", () => {
     });
     expect(state.ledger).toEqual([
       expect.objectContaining({ settledCost: D("0"), costKnown: false, revisionSequence: 1n }),
+    ]);
+    // The attempt fence, then the attempt row (the heartbeat's row) before any write.
+    expect(state.log.slice(-2)).toEqual([
+      `fences:01:spend-attempt:${input.attemptId}`,
+      "lock:attempt",
     ]);
     expect(state.reservations[0]).toMatchObject({ state: "SETTLED", settledValue: D("0") });
     expect(state.settlements[0]).toMatchObject({ settledValue: D("0"), reason: "CANCELLED" });

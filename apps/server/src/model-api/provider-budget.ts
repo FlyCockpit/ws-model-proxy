@@ -12,14 +12,21 @@
  * their liability. Every accounting error fails closed: admission throws (the dispatcher skips
  * the member, nothing is sent), so money is never spent without a reservation.
  *
- * Locks (packages/db/src/capacity-lock-order.ts, writer class H): the `spend-attempt` fence, then
- * the sorted `spend-cap` fences, before any row lock or write. Cap writers (M) take the same
- * `spend-cap` fence, so a cap read after the fence is the cap this admission enforces; a cap set
- * that changed between the unlocked read and the fence restarts the transaction. Provider
- * account and model rows are read without a lock, and the rows written here (attempt,
- * reservations, settlements, ledger) are hot-path rows with no foreign key into the graph.
- * Consumption is read in one statement (@ws-model-proxy/db/spend), so a settlement committing
- * concurrently is counted either as reserved or as settled, never as neither.
+ * Locks (packages/db/src/capacity-lock-order.ts, writer class H): admission takes the
+ * `spend-attempt` fence, then the cap-subject fences (`spend-account`, and `spend-share` for
+ * owner-paid share traffic) whether or not a cap exists, before any row lock or write. Every
+ * admission on a subject therefore runs after the previous one committed, and its consumption
+ * read sees that attempt. A cap edit committing concurrently linearizes before or after the
+ * admission. Reconciliation and repair take the `spend-attempt` fence, then the attempt row
+ * FOR UPDATE (the heartbeat's renewal takes the same row). Provider account and model rows are
+ * read without a lock, and the rows written here (attempt, reservations, settlements, ledger)
+ * are hot-path rows with no foreign key into the graph. Consumption is read in one statement
+ * (@ws-model-proxy/db/spend), so a settlement committing concurrently is counted either as
+ * reserved or as settled, never as neither.
+ *
+ * Known limit: an attempt admitted without a price (an uncapped account with no active
+ * pricing) carries no liability; if a cap is set while it is in flight, its unknown cost is not
+ * reserved against that cap (a provider-reported cost still lands in the ledger).
  */
 import { createHash, randomUUID } from "node:crypto";
 import prisma, { Prisma } from "@ws-model-proxy/db";
@@ -329,6 +336,7 @@ async function databaseNow(tx: Prisma.TransactionClient): Promise<Date> {
 
 type CapRow = {
   id: string;
+  userId: string;
   scope: "PROVIDER_ACCOUNT" | "SHARE";
   monthlyLimit: Prisma.Decimal;
   currency: string;
@@ -340,16 +348,26 @@ async function readCaps(
   tx: Prisma.TransactionClient,
   attempt: ProviderBudgetAttempt,
 ): Promise<CapRow[]> {
+  // By subject only: a cap paid by anyone but this attempt's payer is a broken invariant, and
+  // a cap is never skipped silently.
   const caps = await tx.spendCap.findMany({
     where: {
-      userId: attempt.userId,
       OR: [
         { scope: "PROVIDER_ACCOUNT", providerAccountId: attempt.providerAccountId },
         ...(attempt.shareId ? [{ scope: "SHARE" as const, shareId: attempt.shareId }] : []),
       ],
     },
-    select: { id: true, scope: true, monthlyLimit: true, currency: true, version: true },
+    select: {
+      id: true,
+      userId: true,
+      scope: true,
+      monthlyLimit: true,
+      currency: true,
+      version: true,
+    },
   });
+  if (caps.some((cap) => cap.userId !== attempt.userId))
+    throw new ProviderBudgetConfigurationError("A spend cap is not paid by the attempt's payer");
   return caps.sort((left, right) =>
     left.scope === right.scope
       ? left.id < right.id
@@ -656,6 +674,8 @@ export async function reconcileProviderBudget(terminal: ProviderBudgetTerminal):
     serializedSpend(async (tx) => {
       // Reservations are written only under this fence, so the set read below is final.
       await acquireFences(tx, [fences.spendAttempt(terminal.attemptId)]);
+      // The heartbeat renews this row; holding it makes the expiry checked below final.
+      await tx.$queryRaw`SELECT id FROM attempt WHERE id = ${terminal.attemptId} FOR UPDATE`;
       const anchor = await tx.attempt.findUnique({ where: { id: terminal.attemptId } });
       if (anchor?.kind !== "CLOUD" || anchor.fencingToken !== terminal.fencingToken)
         throw new ProviderBudgetConfigurationError("No admitted provider attempt exists");
