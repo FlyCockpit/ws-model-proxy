@@ -171,6 +171,18 @@ pub(crate) fn write_private_atomic(
     what: &str,
     no_clobber: bool,
 ) -> Result<bool> {
+    write_private_atomic_with_sync(path, bytes, what, no_clobber, |dir| {
+        fs::File::open(dir).and_then(|directory| directory.sync_all())
+    })
+}
+
+fn write_private_atomic_with_sync(
+    path: &Path,
+    bytes: &[u8],
+    what: &str,
+    no_clobber: bool,
+    parent_sync: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> Result<bool> {
     let dir = path
         .parent()
         .with_context(|| format!("{what} path has no parent directory"))?;
@@ -208,6 +220,10 @@ pub(crate) fn write_private_atomic(
     }
     #[cfg(unix)]
     set_mode(path, 0o600)?;
+    #[cfg(unix)]
+    parent_sync(dir).with_context(|| format!("syncing {what} directory `{}`", dir.display()))?;
+    #[cfg(not(unix))]
+    let _ = parent_sync;
     Ok(true)
 }
 
@@ -227,6 +243,23 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
 mod tests {
     use super::*;
     use crate::terminal_crypto::CliTerminalKey;
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_parent_sync_error_propagates_after_publication() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("state.json");
+        let error =
+            write_private_atomic_with_sync(&path, b"durable-intent", "test state", false, |_| {
+                Err(std::io::Error::from_raw_os_error(nix::libc::EIO))
+            })
+            .expect_err("parent sync failure must propagate");
+        assert!(error.to_string().contains("syncing test state directory"));
+        assert_eq!(fs::read(&path).expect("published"), b"durable-intent");
+        assert!(
+            write_private_atomic(&path, b"durable-intent", "test state", false).expect("retry")
+        );
+    }
 
     #[test]
     fn approve_moves_a_pending_identity() {

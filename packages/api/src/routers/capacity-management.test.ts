@@ -243,6 +243,26 @@ describe("capacityManagementRouter", () => {
     }
   });
 
+  it("fails soft when the eviction read is rejected", async () => {
+    db.inferenceCapacity.findMany.mockResolvedValue([
+      {
+        id: "cap-a",
+        userId: "owner",
+        label: "A",
+        engineKind: "VLLM",
+        kvBudgetTokens: 100_000,
+        _count: { ExecutionTargets: 1 },
+      },
+    ]);
+    db.capacityLease.groupBy.mockResolvedValue([]);
+    db.capacityWaiter.groupBy.mockResolvedValue([]);
+    db.capacityKvEviction.findMany.mockRejectedValue(new Error("timeout"));
+    const client = createRouterClient(capacityManagementRouter, { context });
+    const rows = await client.list();
+    expect(rows[0]?.effectiveKvBudgetTokens).toBe(100_000);
+    expect(rows[0]?.kvBudgetTokens).toBe(100_000);
+  });
+
   it("writes capacity creation and policy mutation audits in the same transaction", async () => {
     db.inferenceCapacity.create.mockResolvedValue({ id: "capacity", userId: "owner" });
     const client = createRouterClient(capacityManagementRouter, { context });

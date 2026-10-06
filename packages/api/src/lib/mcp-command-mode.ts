@@ -82,7 +82,7 @@ export type McpCommandRefusal =
   | "feature_disabled"
   | "unsupported";
 
-/** The live CLI facts the relay reads; null when offline or older than protocol 2.6. */
+/** The live CLI facts the relay reads; null when offline or older than protocol 2.4. */
 export type McpCommandLive = {
   mode: McpCommandModeName;
   supervisedCommands: boolean;

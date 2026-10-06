@@ -13,6 +13,8 @@ use super::{Cancel, ErrorCode, EtagKey, FileOps, FileResult, Policy, Step};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod compensation;
+#[cfg(target_os = "linux")]
+mod durability;
 mod edit_write;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod exchangeless;
@@ -30,6 +32,7 @@ pub struct Fx {
     pub ops: FileOps,
     pub cancel: Cancel,
     pub steps: Arc<Mutex<Vec<Step>>>,
+    _registry: crate::file_ops::registry::RegistryGuard,
 }
 
 pub fn args<T: DeserializeOwned>(value: Value) -> T {
@@ -81,6 +84,7 @@ impl Fx {
             ops,
             cancel: Cancel::new(),
             steps,
+            _registry: crate::file_ops::registry::install_temp_registry(),
         }
     }
 

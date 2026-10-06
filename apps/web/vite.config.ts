@@ -227,6 +227,13 @@ export default defineConfig(({ mode }) => {
           changeOrigin: true,
           secure: false,
         },
+        // The CLI relay socket, so `wsmp config set-server` can name the dev origin.
+        "/api/cli/ws": {
+          target: devProxyTarget.ws,
+          ws: true,
+          changeOrigin: true,
+          secure: false,
+        },
         "/api": { target: devProxyTarget.http, changeOrigin: true, secure: false },
         "/rpc": { target: devProxyTarget.http, changeOrigin: true, secure: false },
         "/ws": { target: devProxyTarget.ws, ws: true, changeOrigin: true, secure: false },

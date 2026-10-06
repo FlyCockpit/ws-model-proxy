@@ -1,12 +1,25 @@
+import { readFileSync } from "node:fs";
 import type { CliWebsocketIdentity } from "@ws-model-proxy/api/lib/cli-credential-access";
+import {
+  CLI_TOKEN_IDENTITY_MISMATCH_MESSAGE,
+  DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE,
+  DEVICE_CREDENTIAL_UNBOUND_MESSAGE,
+} from "@ws-model-proxy/config/cli-identity-key";
 import type { MockInstance } from "vitest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  queuedDeploymentOperatorEventsForTests,
+  resetDeploymentOperatorAuditForTests,
+} from "../deployments/operator-audit.js";
 import { parseMultipartToSpool } from "../model-api/multipart-form-data.js";
+import { generateTestHelloIdentity } from "./hello-identity.js";
 import {
   encodeRelayBinaryFrame,
   parseRelayBinaryFrame,
   parseRelayClientControlFrame,
+  RELAY_PROTOCOL_VERSIONS,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+  RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE,
   RELAY_STALE_AFTER_MS,
   RELAY_UPGRADE_REQUIRED_MESSAGE,
 } from "./protocol.js";
@@ -27,10 +40,51 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES: 0,
     MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
     MODEL_API_TRANSCRIPTION_STALE_SPOOL_MS: 24 * 60 * 60 * 1000,
+    BETTER_AUTH_URL: "http://localhost:3000",
   },
 }));
 
-const { RelaySessionManager } = await import("./session-manager.js");
+const kvEviction = vi.hoisted(() => ({
+  resetKvEvictionForCliDevice: vi.fn(async () => {}),
+  resetKvEvictionForEndpoint: vi.fn(async () => {}),
+}));
+vi.mock("../model-api/kv-eviction-feedback.js", () => kvEviction);
+vi.mock("../model-api/cache-affinity-residency.js", () => ({
+  beginAffinityReset: () => () => {},
+}));
+vi.mock("../model-api/cache-affinity-observers.js", () => ({
+  observeAffinityReset: vi.fn().mockResolvedValue([]),
+  acknowledgeAffinityObservations: vi.fn().mockResolvedValue(undefined),
+  registerAffinityObservers: vi.fn().mockResolvedValue(undefined),
+  renewAffinityObservers: vi.fn().mockResolvedValue(undefined),
+  recoverAffinityObservers: vi.fn().mockResolvedValue(undefined),
+  discoverAffinityObservers: vi.fn().mockResolvedValue(undefined),
+}));
+/** Stands in for the durable endpoint.loadCounterEpoch column. */
+const durableEpochs = vi.hoisted(() => new Map<string, number>());
+/** Holds a reset job at its durable read or write so frames can arrive mid-run. */
+const epochGate = vi.hoisted(() => ({
+  read: undefined as Promise<void> | undefined,
+  persist: undefined as Promise<void> | undefined,
+}));
+vi.mock("../model-api/cache-affinity-generation.js", () => ({
+  persistAffinityCounterEpoch: async (
+    cliDeviceId: string,
+    slug: string,
+    loadCounterEpoch: number,
+  ) => {
+    if (epochGate.persist) await epochGate.persist;
+    durableEpochs.set(`${cliDeviceId}/${slug}`, loadCounterEpoch);
+    return prisma.endpoint.updateMany({ where: { cliDeviceId, slug }, data: { loadCounterEpoch } });
+  },
+  readAffinityCounterEpoch: async (cliDeviceId: string, slug: string) => {
+    const value = durableEpochs.get(`${cliDeviceId}/${slug}`) ?? null;
+    if (epochGate.read) await epochGate.read;
+    return value;
+  },
+}));
+
+const { RelaySessionManager, OPERATOR_STEPS_PER_SESSION } = await import("./session-manager.js");
 const { default: prisma } = await import("@ws-model-proxy/db");
 
 const db = prisma as unknown as {
@@ -98,6 +152,7 @@ const identity: CliWebsocketIdentity = {
 };
 
 const now = new Date("2026-01-01T00:00:00.000Z");
+const testIdentity = generateTestHelloIdentity();
 
 /** Holds the next registration transaction until `release()`. */
 function holdNextRegistration() {
@@ -117,54 +172,70 @@ function holdNextRegistration() {
   return { started, release: () => release?.() };
 }
 
-function capabilities26(features?: {
+function helloCapabilities(features?: {
   humanTerminal?: boolean;
   mcpCommandMode?: "off" | "supervised" | "unsupervised";
   terminalApproval?: boolean;
   terminalSupported?: boolean;
 }) {
   return {
-    protocolVersion: "2.8",
-    inventoryAck: true,
-    inventoryReplace: true,
-    endpointTargeting: true,
-    binaryFrames: true,
-    cancellation: true,
-    maxBinaryChunkBytes: 1024 * 1024,
-    requestBodyStreaming: true,
-    requestBodyWindowChunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
-    sharedTokenizerTps: true,
-    standardizedMetrics: true,
-    terminal: true,
-    exec: true,
     features: {
       humanTerminal: features?.humanTerminal ?? true,
       mcpCommandMode: features?.mcpCommandMode ?? "unsupervised",
       terminalApproval: features?.terminalApproval ?? false,
       terminalSupported: features?.terminalSupported ?? true,
       remoteMetricSources: false,
+      remoteEngineAdapters: false,
       mcpFileRead: false,
       fileRootsConfigured: false,
       allowFileToolsAsRoot: false,
     },
     terminalPublicKey: uncompressedKey(),
-    terminalViewers: true,
-    supervisedCommands: true,
-    nodeTelemetry: true,
-    fileOps: true,
   };
 }
 
-function helloFrame() {
+function firstControl(socket: FakeSocket, type: string): Record<string, unknown> {
+  for (const send of socket.sends) {
+    if (typeof send !== "string") continue;
+    const parsed = JSON.parse(send) as { type?: string };
+    if (parsed.type === type) return parsed as Record<string, unknown>;
+  }
+  throw new Error(`missing ${type}`);
+}
+
+function challengeNonce(socket: FakeSocket): string {
+  return challengeHello(socket).nonce;
+}
+
+function challengeHello(socket: FakeSocket): { nonce: string; origin: string } {
+  for (const send of socket.sends) {
+    if (typeof send !== "string") continue;
+    const parsed = JSON.parse(send) as { type?: string; nonce?: string; origin?: string };
+    if (parsed.type === "hello.challenge" && typeof parsed.nonce === "string") {
+      return {
+        nonce: parsed.nonce,
+        origin: typeof parsed.origin === "string" ? parsed.origin : "http://localhost:3000",
+      };
+    }
+  }
+  throw new Error("expected hello.challenge");
+}
+
+function helloFrame(socket?: FakeSocket) {
+  const { nonce, origin } = socket
+    ? challengeHello(socket)
+    : { nonce: Buffer.alloc(16, 7).toString("base64url"), origin: "http://localhost:3000" };
   return JSON.stringify({
     type: "hello",
     id: "hello-id",
-    protocolVersion: "2.8",
+    protocolVersion: RELAY_PROTOCOL_VERSIONS[0],
     cli: {
       slug: "desktop",
       hostname: "desk-01.local",
+      identityPublicKey: testIdentity.publicKey,
+      identitySignature: testIdentity.sign(nonce, "desktop", origin),
       capabilities: {
-        ...capabilities26(),
+        ...helloCapabilities(),
       },
     },
     endpoints: [
@@ -201,13 +272,20 @@ function helloFrame() {
 function seedRegistrationMocks() {
   db.$transaction.mockImplementation(async (callback: (tx: typeof db) => unknown) => callback(db));
   // An unbound CLI token: every hello's conditional bind claims it.
-  db.cliToken.findUnique.mockResolvedValue({ revokedAt: null, expiresAt: null, cliDeviceId: null });
+  db.cliToken.findUnique.mockResolvedValue({
+    revokedAt: null,
+    expiresAt: null,
+    cliDeviceId: null,
+    identityPublicKey: null,
+  });
   db.cliToken.updateMany.mockResolvedValue({ count: 1 });
   db.user.findUnique.mockResolvedValue({ id: "user-id", slug: "owner" });
   db.cliDevice.upsert.mockResolvedValue({
     id: "cli-device-id",
     userId: "user-id",
     slug: "desktop",
+    // The dashboard deployments grant (operator terminals need it).
+    allowDeployments: true,
     connectionGeneration: 1,
   });
   db.cliToken.update.mockResolvedValue({ id: "token-id" });
@@ -236,6 +314,126 @@ function seedRegistrationMocks() {
   db.inferenceCapacity.findMany.mockResolvedValue([]);
 }
 
+describe("deployment snapshot resource accounting", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    seedRegistrationMocks();
+  });
+  async function peer(manager: InstanceType<typeof RelaySessionManager>, index: number) {
+    db.cliDevice.upsert.mockResolvedValueOnce({
+      id: `snapshot-device-${index}`,
+      userId: identity.userId,
+      slug: `snapshot-${index}`,
+      connectionGeneration: 1,
+    });
+    const socket = new FakeSocket();
+    manager.acceptAuthenticatedSocket({ socket, identity, now });
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
+    return socket;
+  }
+  function chunk(index: number, chunkIndex: number, large = false, final = false) {
+    return JSON.stringify({
+      type: "deployment.instances",
+      snapshotId: String(index).padStart(32, "0"),
+      chunkIndex,
+      final,
+      instances: large
+        ? Array.from({ length: 3 }, (_, rank) => ({
+            instanceId: `snapshot${index}chunk${chunkIndex}rank${rank}`,
+            revisionId: "revision",
+            rank: 0,
+            intentHash: "a".repeat(64),
+            phase: "unknown",
+            unitName: `wsmp-i-snapshot${index}chunk${chunkIndex}rank${rank}-r0`,
+            port: 30000,
+            endpointSlug: "snapshot",
+            models: Array.from({ length: 64 }, () => "m".repeat(256)),
+            contextWindow: null,
+          }))
+        : [],
+    });
+  }
+  it("caps global active slots and releases them on disconnect, completion and dispose", async () => {
+    const manager = new RelaySessionManager();
+    const inventory = vi.fn(async () => true);
+    manager.setDeploymentHandlers({ result: async () => true, inventory });
+    const sockets: FakeSocket[] = [];
+    for (let i = 0; i < 64; i++) {
+      const socket = await peer(manager, i);
+      sockets.push(socket);
+      await manager.handleTextFrame(socket, chunk(i, 0));
+    }
+    const refused = await peer(manager, 64);
+    await manager.handleTextFrame(refused, chunk(64, 0));
+    expect(refused.closes.at(-1)?.reason).toBe("malformed");
+    expect(inventory).not.toHaveBeenCalled();
+    await manager.removeSession(sockets[0]!);
+    const replacement = await peer(manager, 65);
+    await manager.handleTextFrame(replacement, chunk(65, 0, false, true));
+    expect(inventory).toHaveBeenCalledTimes(1);
+    expect(replacement.closes).toHaveLength(0);
+    manager.dispose();
+    const after = await peer(manager, 66);
+    await manager.handleTextFrame(after, chunk(66, 0, false, true));
+    expect(inventory).toHaveBeenCalledTimes(2);
+    await manager.closeRelaySessions(now);
+  });
+  it("caps aggregate snapshot bytes while each socket remains below its individual cap", async () => {
+    const manager = new RelaySessionManager();
+    const inventory = vi.fn(async () => true);
+    manager.setDeploymentHandlers({ result: async () => true, inventory });
+    let rejected = false;
+    for (let i = 0; i < 20 && !rejected; i++) {
+      const socket = await peer(manager, i);
+      for (let j = 0; j < 40 && socket.readyState === WS_READY_STATE_OPEN; j++) {
+        const value = chunk(i, j, true);
+        expect(Buffer.byteLength(value)).toBeLessThan(65536);
+        await manager.handleTextFrame(socket, value);
+      }
+      rejected = socket.closes.length > 0;
+    }
+    expect(rejected).toBe(true);
+    expect(inventory).not.toHaveBeenCalled();
+    manager.dispose();
+    const inverse = await peer(manager, 100);
+    await manager.handleTextFrame(inverse, chunk(100, 0, true, true));
+    expect(inventory).toHaveBeenCalledTimes(1);
+    await manager.closeRelaySessions(now);
+  });
+  it("keeps disconnected committing callbacks charged until their arrays are released", async () => {
+    const manager = new RelaySessionManager();
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    manager.setDeploymentHandlers({
+      result: async () => true,
+      inventory: async () => {
+        await gate;
+        return true;
+      },
+    });
+    const tasks: Promise<void>[] = [];
+    const sockets: FakeSocket[] = [];
+    for (let i = 0; i < 64; i++) {
+      const socket = await peer(manager, i);
+      sockets.push(socket);
+      tasks.push(manager.handleTextFrame(socket, chunk(i, 0, false, true)));
+    }
+    await manager.removeSession(sockets[0]!);
+    const refused = await peer(manager, 65);
+    await manager.handleTextFrame(refused, chunk(65, 0));
+    expect(refused.closes.at(-1)?.reason).toBe("malformed");
+    release();
+    await Promise.all(tasks);
+    const inverse = await peer(manager, 66);
+    await manager.handleTextFrame(inverse, chunk(66, 0, false, true));
+    expect(inverse.closes).toHaveLength(0);
+    await manager.closeRelaySessions(now);
+    manager.dispose();
+  });
+});
+
 describe("relay drain", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -246,7 +444,7 @@ describe("relay drain", () => {
     const manager = new RelaySessionManager();
     const first = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: first, identity, now });
-    await manager.handleTextFrame(first, helloFrame(), now);
+    await manager.handleTextFrame(first, helloFrame(first), now);
     db.cliDevice.upsert.mockResolvedValueOnce({
       id: "second-device",
       userId: "user-id",
@@ -258,7 +456,7 @@ describe("relay drain", () => {
       identity: { ...identity, id: "token-2" },
       now,
     });
-    await manager.handleTextFrame(second, helloFrame(), now);
+    await manager.handleTextFrame(second, helloFrame(second), now);
     expect(manager.getActiveCliDeviceIds()).toHaveLength(2);
 
     db.cliDevice.updateMany.mockImplementation(() => new Promise(() => {}));
@@ -301,7 +499,7 @@ describe("relay drain", () => {
     const idle = new FakeSocket();
     const pending = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: idle, identity, now });
-    await manager.handleTextFrame(idle, helloFrame(), now);
+    await manager.handleTextFrame(idle, helloFrame(idle), now);
     manager.acceptAuthenticatedSocket({ socket: pending, identity, now });
 
     db.cliDevice.upsert.mockResolvedValueOnce({
@@ -315,7 +513,7 @@ describe("relay drain", () => {
       identity: { ...identity, id: "token-2" },
       now,
     });
-    await manager.handleTextFrame(busy, helloFrame(), now);
+    await manager.handleTextFrame(busy, helloFrame(busy), now);
     manager.registerRelayResponseHandlers({
       cliDeviceId: "busy-device",
       requestId: "request-id",
@@ -358,7 +556,9 @@ describe("relay drain", () => {
 });
 
 describe("revoked credentials", () => {
-  const credentials = prisma as unknown as { cliDeviceCredential: { findUnique: MockInstance } };
+  const credentials = prisma as unknown as {
+    cliDeviceCredential: { findUnique: MockInstance; updateMany: MockInstance };
+  };
   const deviceIdentity = (id: string): CliWebsocketIdentity => ({
     kind: "deviceCredential",
     id,
@@ -373,6 +573,7 @@ describe("revoked credentials", () => {
     credentials.cliDeviceCredential.findUnique.mockResolvedValue({
       revokedAt: null,
       cliDeviceId: "cli-device-id",
+      identityPublicKey: testIdentity.publicKey,
     });
   });
 
@@ -380,7 +581,7 @@ describe("revoked credentials", () => {
     const manager = new RelaySessionManager();
     const registered = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: registered, identity: deviceIdentity("old"), now });
-    await manager.handleTextFrame(registered, helloFrame(), now);
+    await manager.handleTextFrame(registered, helloFrame(registered), now);
     const unregistered = new FakeSocket();
     manager.acceptAuthenticatedSocket({
       socket: unregistered,
@@ -420,7 +621,7 @@ describe("revoked credentials", () => {
     const manager = new RelaySessionManager();
     const registered = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: registered, identity: deviceIdentity("old"), now });
-    await manager.handleTextFrame(registered, helloFrame(), now);
+    await manager.handleTextFrame(registered, helloFrame(registered), now);
     // Minted after any snapshot a caller could have taken: still the user's.
     const mintedLater = new FakeSocket();
     manager.acceptAuthenticatedSocket({
@@ -464,18 +665,148 @@ describe("revoked credentials", () => {
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity: deviceIdentity("old"), now });
 
-    await manager.handleTextFrame(socket, helloFrame(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
 
     expect(socket.closes).toEqual([{ code: 1008, reason: "access_denied" }]);
     expect(manager.getActiveCliDeviceIds()).toEqual([]);
     manager.dispose();
   });
 
+  it.each([
+    [
+      "a different identity key",
+      "BCIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI",
+      DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE,
+    ],
+    ["a credential minted before the bind", null, DEVICE_CREDENTIAL_UNBOUND_MESSAGE],
+  ] as const)(
+    "refuses a hello bound to %s and keeps the live session",
+    async (_label, storedMachineId, message) => {
+      const manager = new RelaySessionManager();
+      const original = new FakeSocket();
+      manager.acceptAuthenticatedSocket({
+        socket: original,
+        identity: deviceIdentity("cred"),
+        now,
+      });
+      await manager.handleTextFrame(original, helloFrame(original), now);
+      expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
+
+      credentials.cliDeviceCredential.findUnique.mockResolvedValue({
+        revokedAt: null,
+        cliDeviceId: "cli-device-id",
+        identityPublicKey: storedMachineId,
+      });
+      const copy = new FakeSocket();
+      manager.acceptAuthenticatedSocket({ socket: copy, identity: deviceIdentity("cred"), now });
+      await manager.handleTextFrame(copy, helloFrame(copy), now);
+
+      expect(copy.closes).toEqual([{ code: 1008, reason: "identity_mismatch" }]);
+      expect(JSON.parse(String(copy.sends.at(-1)))).toMatchObject({
+        type: "protocol.error",
+        failure: "protocol_error",
+        code: "identity_mismatch",
+        message,
+      });
+      expect(credentials.cliDeviceCredential.updateMany).toHaveBeenCalledWith({
+        where: { id: "cred" },
+        data: { lastRefusedAt: now, lastRefusedReason: "identity_mismatch" },
+      });
+      expect(original.closes).toEqual([]);
+      expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
+      manager.dispose();
+    },
+  );
+
+  describe("CLI token identity bind", () => {
+    const tokens = prisma as unknown as {
+      cliToken: { findUnique: MockInstance; updateMany: MockInstance };
+    };
+    const otherKey =
+      "BCIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI";
+
+    it("TOFU-binds an unbound token to the first hello's device and identity key", async () => {
+      const manager = new RelaySessionManager();
+      const socket = new FakeSocket();
+      manager.acceptAuthenticatedSocket({ socket, identity, now });
+      await manager.handleTextFrame(socket, helloFrame(socket), now);
+
+      expect(socket.closes).toEqual([]);
+      expect(firstControl(socket, "hello.ok")).toMatchObject({ type: "hello.ok" });
+      expect(tokens.cliToken.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: identity.id,
+          cliDeviceId: null,
+          identityPublicKey: null,
+          revokedAt: null,
+        },
+        data: { cliDeviceId: "cli-device-id", identityPublicKey: testIdentity.publicKey },
+      });
+      manager.dispose();
+    });
+
+    it("refuses a copied token bound to another key with the token message and records it", async () => {
+      tokens.cliToken.findUnique.mockResolvedValue({
+        revokedAt: null,
+        expiresAt: null,
+        cliDeviceId: "cli-device-id",
+        identityPublicKey: otherKey,
+      });
+      const manager = new RelaySessionManager();
+      const copy = new FakeSocket();
+      manager.acceptAuthenticatedSocket({ socket: copy, identity, now });
+      await manager.handleTextFrame(copy, helloFrame(copy), now);
+
+      expect(copy.closes).toEqual([{ code: 1008, reason: "identity_mismatch" }]);
+      expect(JSON.parse(String(copy.sends.at(-1)))).toMatchObject({
+        type: "protocol.error",
+        failure: "protocol_error",
+        code: "identity_mismatch",
+        message: CLI_TOKEN_IDENTITY_MISMATCH_MESSAGE,
+      });
+      // The refusal lands on the token row, never on a device credential.
+      expect(tokens.cliToken.updateMany).toHaveBeenCalledWith({
+        where: { id: identity.id },
+        data: { lastRefusedAt: now, lastRefusedReason: "identity_mismatch" },
+      });
+      expect(credentials.cliDeviceCredential.updateMany).not.toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: { lastRefusedAt: now, lastRefusedReason: "identity_mismatch" },
+        }),
+      );
+      expect(manager.getActiveCliDeviceIds()).toEqual([]);
+      manager.dispose();
+    });
+
+    it("still closes the copy when recording the token refusal fails", async () => {
+      tokens.cliToken.findUnique.mockResolvedValue({
+        revokedAt: null,
+        expiresAt: null,
+        cliDeviceId: "cli-device-id",
+        identityPublicKey: otherKey,
+      });
+      tokens.cliToken.updateMany.mockRejectedValue(new Error("db down"));
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      const manager = new RelaySessionManager();
+      const copy = new FakeSocket();
+      manager.acceptAuthenticatedSocket({ socket: copy, identity, now });
+      await manager.handleTextFrame(copy, helloFrame(copy), now);
+
+      expect(copy.closes).toEqual([{ code: 1008, reason: "identity_mismatch" }]);
+      expect(consoleError).toHaveBeenCalledWith(
+        "[relay] recording an identity refusal failed",
+        "Error",
+      );
+      consoleError.mockRestore();
+      manager.dispose();
+    });
+  });
+
   it("closes the socket when an inventory update finds the credential revoked", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity: deviceIdentity("old"), now });
-    await manager.handleTextFrame(socket, helloFrame(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
     expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
 
     // Revoked where this process's hook could not reach (another replica).
@@ -505,7 +836,7 @@ describe("revoked credentials", () => {
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity: deviceIdentity("old"), now });
     const held = holdNextRegistration();
-    const hello = manager.handleTextFrame(socket, helloFrame(), now);
+    const hello = manager.handleTextFrame(socket, helloFrame(socket), now);
     await held.started;
 
     // The revoke commits and its hook closes the (still unregistered) socket.
@@ -531,7 +862,7 @@ describe("revoked credentials", () => {
     // A later CLI for the device registers and is not evicted by the dead one.
     const current = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: current, identity: deviceIdentity("new"), now });
-    await manager.handleTextFrame(current, helloFrame(), now);
+    await manager.handleTextFrame(current, helloFrame(current), now);
     expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
     expect(current.closes).toEqual([]);
     manager.dispose();
@@ -542,7 +873,7 @@ describe("revoked credentials", () => {
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity: deviceIdentity("old"), now });
     const held = holdNextRegistration();
-    const hello = manager.handleTextFrame(socket, helloFrame(), now);
+    const hello = manager.handleTextFrame(socket, helloFrame(socket), now);
     await held.started;
 
     await manager.removeSession(socket, now);
@@ -550,7 +881,7 @@ describe("revoked credentials", () => {
     await hello;
 
     expect(manager.getActiveCliDeviceIds()).toEqual([]);
-    expect(socket.sends).toEqual([]);
+    expect(socket.sends.some((frame) => String(frame).includes('"hello.ok"'))).toBe(false);
     expect(disconnectedWrites()).toHaveLength(1);
     manager.dispose();
   });
@@ -560,13 +891,13 @@ describe("revoked credentials", () => {
     const stale = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: stale, identity: deviceIdentity("old"), now });
     const held = holdNextRegistration();
-    const hello = manager.handleTextFrame(stale, helloFrame(), now);
+    const hello = manager.handleTextFrame(stale, helloFrame(stale), now);
     await held.started;
     await manager.removeSession(stale, now);
 
     const current = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: current, identity: deviceIdentity("new"), now });
-    await manager.handleTextFrame(current, helloFrame(), now);
+    await manager.handleTextFrame(current, helloFrame(current), now);
     held.release();
     await hello;
 
@@ -617,7 +948,7 @@ describe("revoked credentials", () => {
           const detached = new FakeSocket();
           m.acceptAuthenticatedSocket({ socket: detached, identity, now });
           const held = holdNextRegistration();
-          const hello = m.handleTextFrame(detached, helloFrame(), now);
+          const hello = m.handleTextFrame(detached, helloFrame(detached), now);
           await held.started;
           await m.removeSession(detached, now);
           held.release();
@@ -632,12 +963,12 @@ describe("revoked credentials", () => {
           const detached = new FakeSocket();
           m.acceptAuthenticatedSocket({ socket: detached, identity: deviceIdentity("old"), now });
           const held = holdNextRegistration();
-          const hello = m.handleTextFrame(detached, helloFrame(), now);
+          const hello = m.handleTextFrame(detached, helloFrame(detached), now);
           await held.started;
           await m.removeSession(detached, now);
           const current = new FakeSocket();
           m.acceptAuthenticatedSocket({ socket: current, identity: deviceIdentity("new"), now });
-          await m.handleTextFrame(current, helloFrame(), now);
+          await m.handleTextFrame(current, helloFrame(current), now);
           held.release();
           await hello;
           return current;
@@ -650,7 +981,7 @@ describe("revoked credentials", () => {
       const first = new FakeSocket();
       if (ownerFirst) {
         manager.acceptAuthenticatedSocket({ socket: first, identity, now });
-        await manager.handleTextFrame(first, helloFrame(), now);
+        await manager.handleTextFrame(first, helloFrame(first), now);
       }
       const owner = await run(manager, first);
       expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
@@ -707,12 +1038,12 @@ describe("revoked credentials", () => {
       await gate; // committed at generation 1, result returned late
       return committed;
     });
-    const olderHello = manager.handleTextFrame(older, helloFrame(), now);
+    const olderHello = manager.handleTextFrame(older, helloFrame(older), now);
     await vi.waitFor(() => expect(row.generation).toBe(1));
 
     const newer = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: newer, identity: deviceIdentity("new"), now });
-    await manager.handleTextFrame(newer, helloFrame(), now);
+    await manager.handleTextFrame(newer, helloFrame(newer), now);
     expect(row.generation).toBe(2);
     releaseOlder();
     await olderHello;
@@ -749,7 +1080,7 @@ describe("revoked credentials", () => {
     };
     const first = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: first, identity: deviceIdentity("a"), now });
-    await manager.handleTextFrame(first, helloFrame(), now);
+    await manager.handleTextFrame(first, helloFrame(first), now);
 
     const probing = probe(member);
     // The CLI reconnects before the server saw the old close: the replacement
@@ -757,7 +1088,7 @@ describe("revoked credentials", () => {
     // new session.
     const second = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: second, identity: deviceIdentity("b"), now });
-    await manager.handleTextFrame(second, helloFrame(), now);
+    await manager.handleTextFrame(second, helloFrame(second), now);
     expect(first.closes).toEqual([{ code: 1000, reason: "replaced" }]);
 
     await expect(probing).resolves.toBe("superseded");
@@ -785,7 +1116,7 @@ describe("revoked credentials", () => {
     };
     const first = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: first, identity: deviceIdentity("a"), now });
-    await manager.handleTextFrame(first, helloFrame(), now);
+    await manager.handleTextFrame(first, helloFrame(first), now);
 
     const probing = probe(member);
     await vi.waitFor(() =>
@@ -809,7 +1140,7 @@ describe("revoked credentials", () => {
     );
     const second = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: second, identity: deviceIdentity("b"), now });
-    await manager.handleTextFrame(second, helloFrame(), now);
+    await manager.handleTextFrame(second, helloFrame(second), now);
 
     await expect(probing).resolves.toBe("superseded");
     manager.dispose();
@@ -878,13 +1209,13 @@ describe("revoked credentials", () => {
       await gateA;
       return committed;
     });
-    const helloA = manager.handleTextFrame(a, helloFrame(), now);
+    const helloA = manager.handleTextFrame(a, helloFrame(a), now);
     await vi.waitFor(() => expect(row.generation).toBe(1));
 
     const b = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: b, identity: deviceIdentity("b"), now });
     const heldB = holdNextRegistration();
-    const helloB = manager.handleTextFrame(b, helloFrame(), now);
+    const helloB = manager.handleTextFrame(b, helloFrame(b), now);
     await heldB.started;
     await manager.removeSession(b, now);
     heldB.release();
@@ -903,7 +1234,7 @@ describe("revoked credentials", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity, now });
-    await manager.handleTextFrame(socket, helloFrame(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
     // The stored row moved to generation 2 (successor) or is no longer
     // CONNECTED: the fenced heartbeat matches nothing and cannot resurrect it.
     db.cliDevice.updateMany.mockImplementation(async (arg) => {
@@ -928,7 +1259,7 @@ describe("revoked credentials", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity: deviceIdentity("old"), now });
-    await manager.handleTextFrame(socket, helloFrame(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
     const sendsAfterHello = socket.sends.length;
     const held = holdNextRegistration();
     const hello = JSON.parse(helloFrame()) as { endpoints: unknown[] };
@@ -954,7 +1285,7 @@ describe("revoked credentials", () => {
     const manager = new RelaySessionManager();
     const first = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: first, identity: deviceIdentity("a"), now });
-    await manager.handleTextFrame(first, helloFrame(), now);
+    await manager.handleTextFrame(first, helloFrame(first), now);
     db.cliDevice.upsert.mockResolvedValueOnce({
       id: "cli-device-2",
       userId: "user-id",
@@ -963,10 +1294,11 @@ describe("revoked credentials", () => {
     credentials.cliDeviceCredential.findUnique.mockResolvedValueOnce({
       revokedAt: null,
       cliDeviceId: "cli-device-2",
+      identityPublicKey: testIdentity.publicKey,
     });
     const second = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: second, identity: deviceIdentity("b"), now });
-    await manager.handleTextFrame(second, helloFrame(), now);
+    await manager.handleTextFrame(second, helloFrame(second), now);
     expect(manager.getActiveCliDeviceIds()).toHaveLength(2);
     // The device was deleted: its status write fails (or matches nothing).
     db.cliDevice.updateMany.mockRejectedValueOnce(new Error("gone"));
@@ -1054,13 +1386,13 @@ describe("RelaySessionManager", () => {
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity, now });
 
-    await manager.handleTextFrame(socket, helloFrame(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
 
     expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
-    expect(JSON.parse(String(socket.sends[0]))).toEqual({
+    expect(firstControl(socket, "hello.ok")).toEqual({
       type: "hello.ok",
       id: "hello-id",
-      protocolVersion: "2.8",
+      protocolVersion: "2.4",
       revision: {
         inventorySeq: 1,
         inventoryDigest: "digest",
@@ -1116,7 +1448,7 @@ describe("RelaySessionManager", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity, now });
-    await manager.handleTextFrame(socket, helloFrame(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
     socket.sends.length = 0;
 
     const incoming = new FormData();
@@ -1193,7 +1525,7 @@ describe("RelaySessionManager", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity, now });
-    await manager.handleTextFrame(socket, helloFrame(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
 
     const heartbeatAt = new Date("2026-01-01T00:00:20.000Z");
     await manager.handleTextFrame(
@@ -1218,7 +1550,7 @@ describe("RelaySessionManager", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity, now });
-    await manager.handleTextFrame(socket, helloFrame(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
 
     const closedAt = new Date("2026-01-01T00:01:00.000Z");
     await manager.removeSession(socket, closedAt);
@@ -1271,13 +1603,13 @@ describe("RelaySessionManager", () => {
     const manager = new RelaySessionManager();
     const first = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: first, identity, now });
-    await manager.handleTextFrame(first, helloFrame(), now);
+    await manager.handleTextFrame(first, helloFrame(first), now);
     await manager.removeSession(first, new Date(now.getTime() + 1_000));
 
     db.poolMember.updateMany.mockClear();
     const second = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: second, identity, now });
-    await manager.handleTextFrame(second, helloFrame(), now);
+    await manager.handleTextFrame(second, helloFrame(second), now);
 
     const dueCall = db.poolMember.updateMany.mock.calls.find(
       ([arg]) => arg?.data && "nextRetryAt" in arg.data && arg.where.healthStatus === "UNHEALTHY",
@@ -1292,14 +1624,14 @@ describe("RelaySessionManager", () => {
     });
     // Only the due time moves: a real failure state is never cleared here.
     expect(Object.keys(dueCall?.[0].data)).toEqual(["nextRetryAt"]);
-    expect(JSON.parse(String(second.sends[0])).type).toBe("hello.ok");
+    expect(firstControl(second, "hello.ok").type).toBe("hello.ok");
   });
 
   it("refuses a stale disconnect write after a successor hello claimed the device", async () => {
     const manager = new RelaySessionManager();
     const stale = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: stale, identity, now });
-    await manager.handleTextFrame(stale, helloFrame(), now);
+    await manager.handleTextFrame(stale, helloFrame(stale), now);
 
     // Simulate the stored device row having generation 2 by the time a
     // generation-1 (stale) write applies; an unfenced write matches (count 1),
@@ -1322,7 +1654,7 @@ describe("RelaySessionManager", () => {
     const held = holdNextRegistration();
     const successor = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: successor, identity, now });
-    const hello = manager.handleTextFrame(successor, helloFrame(), now);
+    const hello = manager.handleTextFrame(successor, helloFrame(successor), now);
     await held.started;
 
     // The old socket's close arrives mid-registration. detachSession sees the
@@ -1333,7 +1665,7 @@ describe("RelaySessionManager", () => {
     held.release();
     await hello;
     expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
-    expect(JSON.parse(String(successor.sends[0])).type).toBe("hello.ok");
+    expect(firstControl(successor, "hello.ok").type).toBe("hello.ok");
 
     // The write is scoped to the generation the stale session held...
     expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
@@ -1354,7 +1686,7 @@ describe("RelaySessionManager", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity, now });
-    await manager.handleTextFrame(socket, helloFrame(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
     db.poolMember.updateMany.mockClear();
 
     // No successor: the stored generation still equals the detached session's,
@@ -1397,7 +1729,7 @@ describe("RelaySessionManager", () => {
       userId: "user-id",
       slug: "desktop",
     });
-    await manager.handleTextFrame(socket, helloFrame(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
     db.cliDevice.updateMany.mockClear();
     db.poolMember.updateMany.mockClear();
 
@@ -1425,7 +1757,7 @@ describe("RelaySessionManager", () => {
     const manager = new RelaySessionManager();
     const first = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: first, identity, now });
-    await manager.handleTextFrame(first, helloFrame(), now);
+    await manager.handleTextFrame(first, helloFrame(first), now);
 
     const members = [
       {
@@ -1490,7 +1822,7 @@ describe("RelaySessionManager", () => {
 
     const second = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: second, identity, now });
-    await manager.handleTextFrame(second, helloFrame(), now);
+    await manager.handleTextFrame(second, helloFrame(second), now);
 
     // The hello's due-write pulled the cooldown to now; the same member is now
     // a routable HALF_OPEN candidate.
@@ -1517,18 +1849,18 @@ describe("RelaySessionManager", () => {
       },
     );
     try {
-      await manager.handleTextFrame(socket, helloFrame(), now);
+      await manager.handleTextFrame(socket, helloFrame(socket), now);
     } finally {
       db.poolMember.updateMany.mockReset();
     }
-    expect(JSON.parse(String(socket.sends[0])).type).toBe("hello.ok");
+    expect(firstControl(socket, "hello.ok").type).toBe("hello.ok");
   });
 
   it("marks stale sessions and their pool members unavailable", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity, now });
-    await manager.handleTextFrame(socket, helloFrame(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
 
     const staleAt = new Date(now.getTime() + RELAY_STALE_AFTER_MS + 1);
     await manager.checkStaleSessions(staleAt);
@@ -1585,7 +1917,7 @@ describe("RelaySessionManager", () => {
 
     await manager.handleTextFrame(socket, "{not-json", now);
 
-    expect(socket.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
+    expect(socket.closes).toEqual([{ code: 1002, reason: "malformed" }]);
   });
 
   it("logs schema rejection details and closes with a generic protocol error", async () => {
@@ -1597,11 +1929,12 @@ describe("RelaySessionManager", () => {
     const frame = JSON.stringify({
       type: "hello",
       id: "hello-id",
-      protocolVersion: "2.8",
+      protocolVersion: "2.4",
       cli: {
         slug: "desktop",
         hostname: "desk-01.local",
-        capabilities: capabilities26(),
+        identityPublicKey: testIdentity.publicKey,
+        capabilities: helloCapabilities(),
       },
       endpoints: [
         {
@@ -1628,7 +1961,7 @@ describe("RelaySessionManager", () => {
         }),
       ]),
     );
-    expect(socket.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
+    expect(socket.closes).toEqual([{ code: 1002, reason: "malformed" }]);
     consoleError.mockRestore();
   });
 
@@ -1638,9 +1971,9 @@ describe("RelaySessionManager", () => {
     const second = new FakeSocket();
 
     manager.acceptAuthenticatedSocket({ socket: first, identity, now });
-    await manager.handleTextFrame(first, helloFrame(), now);
+    await manager.handleTextFrame(first, helloFrame(first), now);
     manager.acceptAuthenticatedSocket({ socket: second, identity, now });
-    await manager.handleTextFrame(second, helloFrame(), now);
+    await manager.handleTextFrame(second, helloFrame(second), now);
 
     expect(first.closes).toEqual([{ code: 1000, reason: "replaced" }]);
     expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
@@ -1650,7 +1983,7 @@ describe("RelaySessionManager", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity, now });
-    await manager.handleTextFrame(socket, helloFrame(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
     socket.sends.length = 0;
 
     const extraChunks = 2;
@@ -1711,7 +2044,7 @@ describe("RelaySessionManager", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity, now });
-    await manager.handleTextFrame(socket, helloFrame(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
     socket.sends.length = 0;
     let release: (() => void) | undefined;
     const ready = new Promise<void>((resolve) => {
@@ -1753,7 +2086,7 @@ describe("RelaySessionManager", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity, now });
-    await manager.handleTextFrame(socket, helloFrame(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
     const onError = vi.fn();
     manager.registerRelayResponseHandlers({
       cliDeviceId: "cli-device-id",
@@ -1794,7 +2127,7 @@ describe("RelaySessionManager", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity, now });
-    await manager.handleTextFrame(socket, helloFrame(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
     const closed = vi.fn();
 
     manager.sendRelayRequest({
@@ -1838,7 +2171,7 @@ describe("RelaySessionManager", () => {
       const manager = new RelaySessionManager();
       const socket = new FakeSocket();
       manager.acceptAuthenticatedSocket({ socket, identity, now });
-      await manager.handleTextFrame(socket, helloFrame(), now);
+      await manager.handleTextFrame(socket, helloFrame(socket), now);
       socket.sends.length = 0;
       let resolveNext: ((result: IteratorResult<Uint8Array>) => void) | undefined;
       const closed = vi.fn();
@@ -1897,7 +2230,7 @@ describe("RelaySessionManager", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity, now });
-    await manager.handleTextFrame(socket, helloFrame(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
     socket.sends.length = 0;
 
     // Three windows of body chunks so there is always more to burst than one
@@ -1967,24 +2300,46 @@ function id16(fill = 3): string {
   return Buffer.alloc(16, fill).toString("base64url");
 }
 
-function helloCli(features?: {
-  humanTerminal?: boolean;
-  mcpCommandMode?: "off" | "supervised" | "unsupervised";
-  terminalApproval?: boolean;
-  terminalSupported?: boolean;
-}) {
+function helloCli(
+  features?: {
+    humanTerminal?: boolean;
+    mcpCommandMode?: "off" | "supervised" | "unsupervised";
+    terminalApproval?: boolean;
+    terminalSupported?: boolean;
+  },
+  socket?: FakeSocket,
+) {
+  const { nonce, origin } = socket
+    ? challengeHello(socket)
+    : { nonce: Buffer.alloc(16, 7).toString("base64url"), origin: "http://localhost:3000" };
   return JSON.stringify({
     type: "hello",
     id: "hello-cli",
-    protocolVersion: "2.8",
+    protocolVersion: "2.4",
     cli: {
       slug: "desktop",
       hostname: "desk-01.local",
+      identityPublicKey: testIdentity.publicKey,
+      identitySignature: testIdentity.sign(nonce, "desktop", origin),
       version: "9.9.9",
-      capabilities: capabilities26(features),
+      capabilities: helloCapabilities(features),
     },
     endpoints: [],
   });
+}
+
+function resignHello(socket: FakeSocket, frame: string): string {
+  const parsed = JSON.parse(frame) as {
+    cli: { slug?: string; identityPublicKey?: string; identitySignature?: string };
+  };
+  const slug = typeof parsed.cli.slug === "string" ? parsed.cli.slug : "desktop";
+  parsed.cli.identityPublicKey = testIdentity.publicKey;
+  parsed.cli.identitySignature = testIdentity.sign(
+    challengeNonce(socket),
+    slug,
+    challengeHello(socket).origin,
+  );
+  return JSON.stringify(parsed);
 }
 
 describe("relay terminal and exec sessions", () => {
@@ -2008,7 +2363,7 @@ describe("relay terminal and exec sessions", () => {
     frame = helloCli(),
   ) {
     manager.acceptAuthenticatedSocket({ socket, identity, now });
-    await manager.handleTextFrame(socket, frame, now);
+    await manager.handleTextFrame(socket, resignHello(socket, frame), now);
     return socket;
   }
 
@@ -2032,7 +2387,7 @@ describe("relay terminal and exec sessions", () => {
       }),
     );
     expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
-      protocolVersion: "2.8",
+      protocolVersion: "2.4",
       fileOps: true,
       mcpFileRead: true,
       fileRootsConfigured: true,
@@ -2092,17 +2447,17 @@ describe("relay terminal and exec sessions", () => {
     expect(socket.closes).toEqual([]);
   });
 
-  it("reports fileOps live only when the 2.8 hello's own capability says so", async () => {
-    // The live snapshot ANDs `protocolVersion >= 2.8` with the hello's own
-    // `capabilities.fileOps`. A real 2.8 hello pins fileOps true (the strict
-    // schema requires `z.literal(true)`), so the false side is reached by
-    // clearing the recorded feature, exactly as a degraded/absent capability
-    // would leave it.
+  it("reports fileOps and countContext as implied by a registered 2.4 session", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     await register(manager, socket);
     const snapshot = () => manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id");
-    expect(snapshot()).toMatchObject({ protocolVersion: "2.8", fileOps: true, mcpFileRead: false });
+    expect(snapshot()).toMatchObject({
+      protocolVersion: "2.4",
+      fileOps: true,
+      countContext: true,
+      mcpFileRead: false,
+    });
 
     const session = (
       Reflect.get(manager, "sessionsByCliDeviceId") as Map<
@@ -2111,8 +2466,12 @@ describe("relay terminal and exec sessions", () => {
       >
     ).get("cli-device-id");
     if (session) session.features = { ...session.features, fileOps: false, mcpFileRead: true };
-    // The read switch reports true, yet the capability term withdraws fileOps.
-    expect(snapshot()).toMatchObject({ protocolVersion: "2.8", fileOps: false, mcpFileRead: true });
+    expect(snapshot()).toMatchObject({
+      protocolVersion: "2.4",
+      fileOps: true,
+      countContext: true,
+      mcpFileRead: true,
+    });
   });
 
   it("drops file frames for an unknown op and refuses them before registration", async () => {
@@ -2164,12 +2523,12 @@ describe("relay terminal and exec sessions", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     await register(manager, socket, helloCli({ mcpCommandMode: "supervised" }));
-    expect(JSON.parse(String(socket.sends[0])).protocolVersion).toBe("2.8");
+    expect(firstControl(socket, "hello.ok").protocolVersion).toBe("2.4");
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         update: expect.objectContaining({
           cliVersion: "9.9.9",
-          relayProtocolVersion: "2.8",
+          relayProtocolVersion: "2.4",
           reportedHumanTerminal: true,
           reportedMcpCommandMode: "SUPERVISED",
           reportedTerminalApproval: false,
@@ -2218,31 +2577,24 @@ describe("relay terminal and exec sessions", () => {
 
   it.each([
     [
-      "a 2.6 hello (a released 0.4.x CLI)",
+      "a 2.3 hello (a released 0.3.x CLI)",
       (() => {
-        const frame = JSON.parse(helloCli()) as {
-          protocolVersion: string;
-          cli: { capabilities: Record<string, unknown> & { features: Record<string, unknown> } };
-        };
-        frame.protocolVersion = "2.6";
-        frame.cli.capabilities.protocolVersion = "2.6";
-        delete frame.cli.capabilities.nodeTelemetry;
-        delete frame.cli.capabilities.features.remoteMetricSources;
+        const frame = JSON.parse(helloCli()) as { protocolVersion: string };
+        frame.protocolVersion = "2.3";
         return JSON.stringify(frame);
       })(),
+      "upgrade_cli",
+      RELAY_UPGRADE_REQUIRED_MESSAGE,
     ],
     [
-      "a 2.5 hello",
+      "a 2.2 hello",
       (() => {
-        const frame = JSON.parse(helloCli()) as {
-          protocolVersion: string;
-          cli: { capabilities: Record<string, unknown> };
-        };
-        frame.protocolVersion = "2.5";
-        frame.cli.capabilities.protocolVersion = "2.5";
-        delete frame.cli.capabilities.supervisedCommands;
+        const frame = JSON.parse(helloCli()) as { protocolVersion: string };
+        frame.protocolVersion = "2.2";
         return JSON.stringify(frame);
       })(),
+      "upgrade_cli",
+      RELAY_UPGRADE_REQUIRED_MESSAGE,
     ],
     [
       "a 0.3.x hello (2.3 with cli.label, no hostname)",
@@ -2254,75 +2606,57 @@ describe("relay terminal and exec sessions", () => {
           slug: "desktop",
           label: "Desktop",
           version: "0.3.1",
-          capabilities: {
-            protocolVersion: "2.3",
-            inventoryAck: true,
-            inventoryReplace: true,
-            endpointTargeting: true,
-            binaryFrames: true,
-            cancellation: true,
-            maxBinaryChunkBytes: 1024 * 1024,
-            requestBodyStreaming: true,
-            requestBodyWindowChunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
-            sharedTokenizerTps: true,
-            standardizedMetrics: true,
-          },
+          capabilities: { protocolVersion: "2.3" },
         },
         endpoints: [],
       }),
+      "upgrade_cli",
+      RELAY_UPGRADE_REQUIRED_MESSAGE,
     ],
     [
-      "a 2.6 hello carrying cli.label",
+      "a 2.4 hello carrying cli.label",
       (() => {
         const frame = JSON.parse(helloCli()) as { cli: Record<string, unknown> };
         frame.cli.label = "Desktop";
         return JSON.stringify(frame);
       })(),
+      "upgrade_cli",
+      RELAY_UPGRADE_REQUIRED_MESSAGE,
     ],
     [
-      "a 2.10 hello (a CLI newer than this server)",
-      (() => {
-        const frame = JSON.parse(helloCli()) as {
-          protocolVersion: string;
-          cli: { capabilities: Record<string, unknown> };
-        };
-        frame.protocolVersion = "2.10";
-        frame.cli.capabilities.protocolVersion = "2.10";
-        return JSON.stringify(frame);
-      })(),
-    ],
-    [
-      // The top-level version alone must trip the gate: the capability echo is
-      // still 2.8, so the capability comparison would not refuse this frame.
-      "a 2.10 hello whose capability echo still says 2.8",
+      "a 2.5 hello (a CLI newer than this server)",
       (() => {
         const frame = JSON.parse(helloCli()) as { protocolVersion: string };
-        frame.protocolVersion = "2.10";
+        frame.protocolVersion = "2.5";
         return JSON.stringify(frame);
       })(),
+      "upgrade_server",
+      RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE,
     ],
-  ])("refuses %s with the upgrade message before schema parsing", async (_, frame) => {
-    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
-    const manager = new RelaySessionManager();
-    const socket = new FakeSocket();
-    await register(manager, socket, frame);
-    expect(socket.sends.map((send) => JSON.parse(String(send)))).toEqual([
-      {
+  ] as const)(
+    "refuses %s with the upgrade message before schema parsing",
+    async (_, frame, code, message) => {
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+      const manager = new RelaySessionManager();
+      const socket = new FakeSocket();
+      await register(manager, socket, frame);
+      expect(firstControl(socket, "protocol.error")).toEqual({
         type: "protocol.error",
         failure: "protocol_error",
-        message: RELAY_UPGRADE_REQUIRED_MESSAGE,
-      },
-    ]);
-    expect(socket.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
-    expect(db.cliDevice.upsert).not.toHaveBeenCalled();
-    expect(manager.getActiveCliDeviceIds()).toEqual([]);
-    // Refused before the strict schema, so no schema-rejection log.
-    expect(consoleError).not.toHaveBeenCalledWith(
-      "[relay] control frame schema rejected",
-      expect.anything(),
-    );
-    consoleError.mockRestore();
-  });
+        code,
+        message,
+        supportedVersions: [...RELAY_PROTOCOL_VERSIONS],
+      });
+      expect(socket.closes).toEqual([{ code: 1002, reason: code }]);
+      expect(db.cliDevice.upsert).not.toHaveBeenCalled();
+      expect(manager.getActiveCliDeviceIds()).toEqual([]);
+      expect(consoleError).not.toHaveBeenCalledWith(
+        "[relay] control frame schema rejected",
+        expect.anything(),
+      );
+      consoleError.mockRestore();
+    },
+  );
 
   it("records a refused hello's versions on the device a bound credential names", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -2332,37 +2666,37 @@ describe("relay terminal and exec sessions", () => {
       protocolVersion: string;
       cli: { version?: string; capabilities: Record<string, unknown> };
     };
-    frame.protocolVersion = "2.6";
-    frame.cli.version = "0.4.0";
-    frame.cli.capabilities.protocolVersion = "2.6";
+    frame.protocolVersion = "2.3";
+    frame.cli.version = "0.3.1";
+    frame.cli.capabilities.protocolVersion = "2.3";
     manager.acceptAuthenticatedSocket({
       socket,
       identity: { ...identity, kind: "deviceCredential", cliDeviceId: "bound-device" },
       now,
     });
     await manager.handleTextFrame(socket, JSON.stringify(frame), now);
-    expect(socket.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
+    expect(socket.closes).toEqual([{ code: 1002, reason: "upgrade_cli" }]);
     expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
       where: { id: "bound-device", userId: "user-id" },
       data: {
-        rejectedRelayProtocolVersion: "2.6",
-        rejectedCliVersion: "0.4.0",
+        rejectedRelayProtocolVersion: "2.3",
+        rejectedCliVersion: "0.3.1",
         relayRejectedAt: now,
       },
     });
     expect(consoleError).toHaveBeenCalledWith(
-      "[relay] refused a hello older than the minimum relay protocol",
-      { protocolVersion: "2.6", cliVersion: "0.4.0" },
+      "[relay] refused a hello this server does not speak",
+      { protocolVersion: "2.3", cliVersion: "0.3.1", code: "upgrade_cli" },
     );
 
     // An unbound token names no device: nothing is written.
     db.cliDevice.updateMany.mockClear();
     const unbound = new FakeSocket();
     await register(manager, unbound, JSON.stringify(frame));
-    expect(unbound.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
+    expect(unbound.closes).toEqual([{ code: 1002, reason: "upgrade_cli" }]);
     expect(db.cliDevice.updateMany).not.toHaveBeenCalledWith(
       expect.objectContaining({
-        data: expect.objectContaining({ rejectedRelayProtocolVersion: "2.6" }),
+        data: expect.objectContaining({ rejectedRelayProtocolVersion: "2.3" }),
       }),
     );
     consoleError.mockRestore();
@@ -2389,8 +2723,8 @@ describe("relay terminal and exec sessions", () => {
       data: { rejectedRelayProtocolVersion: null, rejectedCliVersion: null, relayRejectedAt: now },
     });
     expect(consoleError).toHaveBeenCalledWith(
-      "[relay] refused a hello older than the minimum relay protocol",
-      { protocolVersion: null, cliVersion: null },
+      "[relay] refused a hello this server does not speak",
+      { protocolVersion: null, cliVersion: null, code: "upgrade_cli" },
     );
     consoleError.mockRestore();
   });
@@ -2403,27 +2737,27 @@ describe("relay terminal and exec sessions", () => {
       protocolVersion: string;
       cli: { version?: string; capabilities: Record<string, unknown> };
     };
-    frame.protocolVersion = "2.10";
+    frame.protocolVersion = "2.5";
     frame.cli.version = "0.9.0-rc.1+build.5";
-    frame.cli.capabilities.protocolVersion = "2.10";
+    frame.cli.capabilities.protocolVersion = "2.5";
     manager.acceptAuthenticatedSocket({
       socket,
       identity: { ...identity, kind: "deviceCredential", cliDeviceId: "bound-device" },
       now,
     });
     await manager.handleTextFrame(socket, JSON.stringify(frame), now);
-    expect(socket.sends.map((send) => JSON.parse(String(send)))).toEqual([
-      {
-        type: "protocol.error",
-        failure: "protocol_error",
-        message: RELAY_UPGRADE_REQUIRED_MESSAGE,
-      },
-    ]);
-    expect(socket.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
+    expect(firstControl(socket, "protocol.error")).toEqual({
+      type: "protocol.error",
+      failure: "protocol_error",
+      code: "upgrade_server",
+      message: RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE,
+      supportedVersions: [...RELAY_PROTOCOL_VERSIONS],
+    });
+    expect(socket.closes).toEqual([{ code: 1002, reason: "upgrade_server" }]);
     expect(db.cliDevice.updateMany).toHaveBeenCalledWith({
       where: { id: "bound-device", userId: "user-id" },
       data: {
-        rejectedRelayProtocolVersion: "2.10",
+        rejectedRelayProtocolVersion: "2.5",
         rejectedCliVersion: "0.9.0-rc.1+build.5",
         relayRejectedAt: now,
       },
@@ -2434,27 +2768,25 @@ describe("relay terminal and exec sessions", () => {
     consoleError.mockRestore();
   });
 
-  it("registers a valid 2.8 hello", async () => {
+  it("registers a valid 2.4 hello", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     await register(manager, socket);
-    expect(JSON.parse(String(socket.sends[0]))).toMatchObject({ type: "hello.ok" });
+    expect(firstControl(socket, "hello.ok")).toMatchObject({ type: "hello.ok" });
     expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
   });
 
-  it("registers a valid 2.9 hello", async () => {
+  it("registers a 2.4 hello that includes custom adapter capability bits", async () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     const frame = JSON.parse(helloCli()) as {
-      protocolVersion: string;
-      cli: { capabilities: Record<string, unknown> };
+      cli: { capabilities: { features: Record<string, unknown> } };
     };
-    frame.protocolVersion = "2.9";
-    frame.cli.capabilities.protocolVersion = "2.9";
+    frame.cli.capabilities.features.remoteEngineAdapters = true;
     await register(manager, socket, JSON.stringify(frame));
-    expect(JSON.parse(String(socket.sends[0]))).toMatchObject({
+    expect(firstControl(socket, "hello.ok")).toMatchObject({
       type: "hello.ok",
-      protocolVersion: "2.9",
+      protocolVersion: "2.4",
     });
     expect(manager.getActiveCliDeviceIds()).toEqual(["cli-device-id"]);
   });
@@ -2551,7 +2883,7 @@ describe("relay terminal and exec sessions", () => {
     });
     const replacement = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket: replacement, identity, now });
-    await manager.handleTextFrame(replacement, helloCli(), now);
+    await manager.handleTextFrame(replacement, helloCli(undefined, replacement), now);
     expect(again.closes).toEqual([{ code: 1000, reason: "replaced" }]);
     expect(
       again.sends
@@ -2668,7 +3000,7 @@ describe("relay terminal viewers", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity, now });
-    await manager.handleTextFrame(socket, frame, now);
+    await manager.handleTextFrame(socket, resignHello(socket, frame), now);
     return { manager, socket };
   }
 
@@ -2720,14 +3052,14 @@ describe("relay terminal viewers", () => {
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
       expect.objectContaining({
         update: expect.objectContaining({
-          relayProtocolVersion: "2.8",
+          relayProtocolVersion: "2.4",
           reportedMcpCommandMode: "UNSUPERVISED",
           reportedHumanTerminal: true,
         }),
       }),
     );
     expect(manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")).toMatchObject({
-      protocolVersion: "2.8",
+      protocolVersion: "2.4",
       mcpCommandMode: "unsupervised",
       supervisedCommands: true,
       terminalPublicKey: uncompressedKey(),
@@ -2746,10 +3078,8 @@ describe("relay terminal viewers", () => {
   });
 
   it("keeps a CLI identity proof for the terminal list", async () => {
-    const identityKey = Buffer.alloc(65, 3);
-    identityKey[0] = 0x04;
     const terminalIdentity = {
-      publicKey: identityKey.toString("base64url"),
+      publicKey: testIdentity.publicKey,
       signature: Buffer.alloc(64, 7).toString("base64url"),
     };
     const frame = JSON.parse(helloCli()) as { cli: { capabilities: Record<string, unknown> } };
@@ -2766,6 +3096,546 @@ describe("relay terminal viewers", () => {
     expect(
       manager.getLiveCliFeatures(["cli-device-id"]).get("cli-device-id")?.terminalIdentity,
     ).toBeNull();
+  });
+
+  it("reports a deployment job on a closing socket as unsent", async () => {
+    const { manager, socket } = await setup();
+    const target = manager.deploymentSocket("cli-device-id");
+    expect(target).toBeTruthy();
+    // No `deploymentOperator` feature: the reconciler never claims interactive steps here.
+    expect(target?.deploymentOperator).toBe(false);
+    const job = { type: "deployment.job" } as unknown as Parameters<
+      typeof manager.sendDeploymentJob
+    >[1];
+    socket.readyState = 2; // CLOSING
+    const before = socket.sends.length;
+    expect(manager.sendDeploymentJob(target!, job)).toBe(false);
+    expect(socket.sends.length).toBe(before);
+  });
+
+  it("sends interactive jobs and takes operator progress only with deploymentOperator", async () => {
+    db.cliDevice.upsert.mockResolvedValue({
+      id: "cli-device-id",
+      userId: "user-id",
+      slug: "desktop",
+      allowDeployments: true,
+      connectionGeneration: 1,
+    });
+    const golden = JSON.parse(
+      readFileSync(
+        new URL("../../../cli/tests/fixtures/relay-current/deployment-jobs.json", import.meta.url),
+        "utf8",
+      ),
+    ) as {
+      jobs: Record<
+        string,
+        Parameters<InstanceType<typeof RelaySessionManager>["sendDeploymentJob"]>[1]
+      >;
+      results: Record<string, unknown>;
+    };
+    const frame = (protocolVersion: string, features: Record<string, boolean>) => {
+      const parsed = JSON.parse(helloCli()) as {
+        protocolVersion: string;
+        cli: { capabilities: { features: Record<string, unknown> } };
+      };
+      parsed.protocolVersion = protocolVersion;
+      Object.assign(parsed.cli.capabilities.features, features);
+      return JSON.stringify(parsed);
+    };
+    const cases: Array<[string, Record<string, boolean>, boolean]> = [
+      ["2.4", { deployments: true }, false],
+      ["2.4", { deploymentOperator: true }, false],
+      ["2.4", { deployments: true, deploymentOperator: true }, true],
+    ];
+    for (const [version, features, operator] of cases) {
+      const { manager, socket } = await setup(frame(version, features));
+      const target = manager.deploymentSocket("cli-device-id");
+      expect(target).toBeTruthy();
+      expect(manager.sendDeploymentJob(target!, golden.jobs.plainStart!)).toBe(true);
+      for (const name of ["interactiveStart", "interactiveStop", "stopInteractiveStart"]) {
+        const before = socket.sends.length;
+        expect(manager.sendDeploymentJob(target!, golden.jobs[name]!), `${version} ${name}`).toBe(
+          operator,
+        );
+        expect(socket.sends.length).toBe(before + (operator ? 1 : 0));
+      }
+      const result = vi.fn(async () => true);
+      manager.setDeploymentHandlers({ result, inventory: async () => true });
+      await manager.handleTextFrame(socket, JSON.stringify(golden.results.awaitingOperator), now);
+      await manager.handleTextFrame(socket, JSON.stringify(golden.results.interactiveRefused), now);
+      expect(result).toHaveBeenCalledTimes(operator ? 2 : 1);
+      expect(socket.closes).toHaveLength(0);
+    }
+  });
+
+  describe("deployment operator terminals", () => {
+    type Job = Parameters<InstanceType<typeof RelaySessionManager>["sendDeploymentJob"]>[1];
+    const golden = JSON.parse(
+      readFileSync(
+        new URL("../../../cli/tests/fixtures/relay-current/deployment-jobs.json", import.meta.url),
+        "utf8",
+      ),
+    ) as { jobs: Record<string, Job>; results: Record<string, Record<string, unknown>> };
+    const start = golden.jobs.interactiveStart as Job;
+    const terminalId = start.operator?.terminalId as string;
+
+    beforeEach(() => {
+      resetDeploymentOperatorAuditForTests();
+    });
+
+    /** A CLI with deployments and the operator feature, no browser terminals and MCP off. */
+    function operatorHello(extra: Record<string, unknown> = {}) {
+      const parsed = JSON.parse(helloCli({ humanTerminal: false, mcpCommandMode: "off" })) as {
+        cli: { capabilities: { features: Record<string, unknown> } };
+      };
+      Object.assign(parsed.cli.capabilities.features, {
+        deployments: true,
+        deploymentOperator: true,
+        ...extra,
+      });
+      return JSON.stringify(parsed);
+    }
+
+    async function operatorSetup() {
+      db.cliDevice.upsert.mockResolvedValue({
+        id: "cli-device-id",
+        userId: "user-id",
+        slug: "desktop",
+        allowHumanTerminal: false,
+        allowDeployments: true,
+        mcpCommandMode: "OFF",
+        connectionGeneration: 1,
+      });
+      const { manager, socket } = await setup(operatorHello());
+      const target = manager.deploymentSocket("cli-device-id");
+      expect(target).toBeTruthy();
+      const result = vi.fn(async () => true);
+      manager.setDeploymentHandlers({ result, inventory: async () => true });
+      const report = (status: string, fields: Record<string, unknown> = {}) =>
+        manager.handleTextFrame(
+          socket,
+          JSON.stringify({
+            ...golden.results.awaitingOperator,
+            status,
+            ...fields,
+          }),
+          now,
+        );
+      return { manager, socket, target: target!, result, report };
+    }
+
+    const outcomes = () => queuedDeploymentOperatorEventsForTests().map((row) => row.outcome);
+
+    it("registers the terminal on send and lists it once awaiting_operator names it", async () => {
+      const { manager, socket, target, result, report } = await operatorSetup();
+      expect(manager.sendDeploymentJob(target, start)).toBe(true);
+      expect(control(socket).at(-1)).toMatchObject({
+        type: "deployment.job",
+        operator: { terminalId },
+      });
+      expect(manager.hasTerminal(terminalId)).toBe(true);
+      expect(manager.listTerminalsForUser("user-id")).toEqual([]);
+      await report("awaiting_operator");
+      expect(result).toHaveBeenCalledTimes(1);
+      expect(manager.listTerminalsForUser("user-id")).toEqual([
+        expect.objectContaining({
+          terminalId,
+          origin: "deployment",
+          deployment: {
+            stepId: start.stepId,
+            instanceId: start.instanceId,
+            rank: 0,
+            action: "start",
+            state: "awaiting",
+          },
+        }),
+      ]);
+      expect(events).toContainEqual({ type: "list_changed", userId: "user-id" });
+      // Not a human terminal: never counted against the human limits.
+      expect(manager.terminalCounts("user-id", "cli-device-id")).toEqual({ user: 0, cli: 0 });
+      const row = queuedDeploymentOperatorEventsForTests()[0];
+      expect(row).toEqual({
+        userId: "user-id",
+        instanceId: start.instanceId,
+        stepId: start.stepId,
+        cliDeviceId: "cli-device-id",
+        rank: 0,
+        action: "start",
+        outcome: "opened",
+        exitCode: null,
+      });
+      expect(JSON.stringify(row)).not.toContain(start.command);
+    });
+
+    it("lets the owner attach with browser terminals and MCP commands off; others cannot", async () => {
+      const { manager, socket, target, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      // Nothing to attach to before the CLI drew the confirm screen.
+      expect(attach(manager, "a", terminalId)).toEqual({ ok: false, error: "not_found" });
+      await report("awaiting_operator");
+      const attached = attach(manager, "a", terminalId);
+      expect(attached.ok).toBe(true);
+      const viewerId = attached.ok ? attached.viewerId : "";
+      expect(control(socket).at(-1)).toMatchObject({ type: "term.attach", terminalId, viewerId });
+      // Viewer approval (term.pending) still applies: it is the CLI's handshake.
+      await manager.handleTextFrame(
+        socket,
+        JSON.stringify({ type: "term.attached", terminalId, viewerId, cliNonce: id16(6) }),
+        now,
+      );
+      expect(eventsFor("a")).toContainEqual(
+        expect.objectContaining({ type: "attached", terminalId, viewerId }),
+      );
+      expect(
+        manager.attachTerminal({
+          terminalId,
+          userId: "someone-else",
+          connId: "x",
+          browserPublicKey: uncompressedKey(),
+          browserNonce: id16(4),
+        }),
+      ).toEqual({ ok: false, error: "not_found" });
+      // A browser cannot "open" one, and a late term.opened is ignored.
+      await manager.handleTextFrame(
+        socket,
+        JSON.stringify({ type: "term.opened", terminalId, viewerId: id16(9), cliNonce: id16(6) }),
+        now,
+      );
+      expect(manager.listTerminalsForUser("user-id")).toHaveLength(1);
+    });
+
+    it("audits accept, a failed attempt, a retry and the verified success, then forgets the step", async () => {
+      const { manager, socket, target, result, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("awaiting_operator");
+      await report("operator_running");
+      expect(manager.listTerminalsForUser("user-id")[0]?.deployment?.state).toBe("running");
+      await report("awaiting_operator"); // exited;1, retry screen
+      await report("awaiting_operator"); // a repeated delivery re-reports; no row
+      await report("operator_running");
+      // The CLI ends the terminal before it verifies.
+      await manager.handleTextFrame(
+        socket,
+        JSON.stringify({ type: "term.exit", terminalId, exitCode: 0 }),
+        now,
+      );
+      expect(manager.listTerminalsForUser("user-id")).toEqual([]);
+      // An ended terminal is never reopened under its id.
+      expect(manager.sendDeploymentJob(target, start)).toBe(false);
+      await report("succeeded");
+      expect(outcomes()).toEqual(["opened", "accepted", "failed", "accepted", "succeeded"]);
+      expect(result).toHaveBeenCalledTimes(6);
+    });
+
+    it("records a decline, a close with the last exit code, and ends the record", async () => {
+      const { manager, target, result, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("awaiting_operator");
+      const attached = attach(manager, "a", terminalId);
+      expect(attached.ok).toBe(true);
+      await report("operator_closed");
+      expect(outcomes()).toEqual(["opened", "declined"]);
+      expect(events).toContainEqual(
+        expect.objectContaining({ type: "exit", terminalId, connIds: ["a"] }),
+      );
+      expect(manager.hasTerminal(terminalId)).toBe(false);
+      expect(result).toHaveBeenCalledTimes(2);
+
+      const second = { ...start, operator: { terminalId: id16(40), commandAuthor: "user" } } as Job;
+      expect(manager.sendDeploymentJob(target, second)).toBe(true);
+      const secondId = second.operator?.terminalId;
+      await report("awaiting_operator", { terminalId: secondId });
+      await report("operator_running", { terminalId: secondId });
+      await report("operator_closed", { terminalId: secondId, exitCode: 3 });
+      expect(queuedDeploymentOperatorEventsForTests().slice(2)).toEqual([
+        expect.objectContaining({ outcome: "opened", exitCode: null }),
+        expect.objectContaining({ outcome: "accepted", exitCode: null }),
+        expect.objectContaining({ outcome: "closed", exitCode: 3 }),
+      ]);
+    });
+
+    it("drops progress that does not match the tracked terminal and closes strays", async () => {
+      const { manager, socket, target, result, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("awaiting_operator", { intentHash: "f".repeat(64) });
+      await report("awaiting_operator", { ownerEpoch: "other:1" });
+      await report("operator_running"); // before any awaiting_operator
+      expect(result).not.toHaveBeenCalled();
+      expect(outcomes()).toEqual([]);
+      // Stale frames never close the tracked terminal.
+      expect(control(socket).some((frame) => frame.type === "term.close")).toBe(false);
+      const stray = id16(41);
+      await report("awaiting_operator", { terminalId: stray });
+      expect(result).not.toHaveBeenCalled();
+      expect(control(socket).at(-1)).toEqual({ type: "term.close", terminalId: stray });
+      // The tracked terminal is untouched.
+      await report("awaiting_operator");
+      expect(result).toHaveBeenCalledTimes(1);
+      expect(manager.listTerminalsForUser("user-id")).toHaveLength(1);
+    });
+
+    it("refuses a terminal id held by another terminal and re-sends a live one as is", async () => {
+      const { manager, socket, target } = await operatorSetup();
+      expect(manager.sendDeploymentJob(target, start)).toBe(true);
+      const clash = { ...(golden.jobs.interactiveStop as Job), operator: start.operator } as Job;
+      const before = socket.sends.length;
+      expect(manager.sendDeploymentJob(target, clash)).toBe(false);
+      expect(socket.sends.length).toBe(before);
+      // Re-delivery of the same terminal: sent again, one record.
+      expect(manager.sendDeploymentJob(target, start)).toBe(true);
+      expect(socket.sends.length).toBe(before + 1);
+      // A new terminal for the step replaces the old record.
+      const replaced = {
+        ...start,
+        operator: { terminalId: id16(42), commandAuthor: "user" },
+      } as Job;
+      expect(manager.sendDeploymentJob(target, replaced)).toBe(true);
+      expect(manager.hasTerminal(terminalId)).toBe(false);
+      expect(manager.hasTerminal(id16(42))).toBe(true);
+    });
+
+    it("refuses operator jobs to a CLI without terminal support", async () => {
+      db.cliDevice.upsert.mockResolvedValue({
+        id: "cli-device-id",
+        userId: "user-id",
+        slug: "desktop",
+        allowHumanTerminal: false,
+        allowDeployments: true,
+        mcpCommandMode: "OFF",
+        connectionGeneration: 1,
+      });
+      const { manager } = await setup(operatorHello({ terminalSupported: false }));
+      const target = manager.deploymentSocket("cli-device-id");
+      expect(manager.sendDeploymentJob(target!, start)).toBe(false);
+      expect(manager.hasTerminal(terminalId)).toBe(false);
+    });
+
+    it("closes by step id, records the cancel and still routes the CLI's answer", async () => {
+      const { manager, socket, target, result, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("awaiting_operator");
+      await report("operator_running");
+      expect(manager.closeDeploymentOperatorStep(start.stepId, { keepRunning: true })).toBe(
+        "running",
+      );
+      expect(manager.hasTerminal(terminalId)).toBe(true);
+      expect(manager.closeDeploymentOperatorStep(start.stepId)).toBe("closed");
+      expect(control(socket).at(-1)).toEqual({ type: "term.close", terminalId });
+      expect(manager.hasTerminal(terminalId)).toBe(false);
+      expect(manager.closeDeploymentOperatorStep(start.stepId)).toBe("absent");
+      await report("operator_closed");
+      expect(result).toHaveBeenCalledTimes(3);
+      expect(outcomes()).toEqual(["opened", "accepted", "cancelled"]);
+      expect(manager.closeDeploymentOperatorStep("no-such-step")).toBe("absent");
+    });
+
+    it("closes a terminal that spawns after a cancel sent before it existed", async () => {
+      const { manager, socket, target, result, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      expect(manager.closeDeploymentOperatorStep(start.stepId)).toBe("closed");
+      expect(outcomes()).toEqual([]);
+      await report("awaiting_operator");
+      expect(result).not.toHaveBeenCalled();
+      expect(control(socket).at(-1)).toEqual({ type: "term.close", terminalId });
+    });
+
+    it("records auto_settled when status settles a step before any terminal opened", async () => {
+      const { manager, target, result, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("succeeded");
+      expect(outcomes()).toEqual(["auto_settled"]);
+      expect(manager.hasTerminal(terminalId)).toBe(false);
+      expect(result).toHaveBeenCalledTimes(1);
+    });
+
+    it("records nothing for a spawn refusal before the terminal opened", async () => {
+      const { manager, target, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("failed", { error: "operator_terminal_limit" });
+      expect(outcomes()).toEqual([]);
+      expect(manager.hasTerminal(terminalId)).toBe(false);
+    });
+
+    it("never idle-closes an operator terminal", async () => {
+      const { manager, target, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("awaiting_operator");
+      manager.sweepExpiredPendingTerminals(Date.now() + 7 * 24 * 60 * 60 * 1000);
+      expect(manager.listTerminalsForUser("user-id")).toHaveLength(1);
+    });
+
+    it("closes waiting operator terminals when the deployments grant is revoked (§12h L5)", async () => {
+      const { manager, target, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("awaiting_operator");
+      manager.applyFeatureGrants("cli-device-id", {
+        allowHumanTerminal: false,
+        allowDeployments: false,
+        mcpCommandMode: "off",
+        mcpFileRead: false,
+      });
+      expect(manager.listTerminalsForUser("user-id")).toEqual([]);
+      expect(outcomes()).toEqual(["opened", "cancelled"]);
+      // Nothing more is sent or attached while the grant is off.
+      expect(manager.deploymentSocket("cli-device-id")).toMatchObject({
+        deploymentOperator: false,
+      });
+      const fresh = { ...start, operator: { terminalId: id16(77), commandAuthor: "user" } } as Job;
+      expect(manager.sendDeploymentJob(target, fresh)).toBe(false);
+    });
+
+    it("leaves a person's running command alone when the deployments grant is revoked", async () => {
+      const { manager, target, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("awaiting_operator");
+      await report("operator_running");
+      manager.applyFeatureGrants("cli-device-id", {
+        allowHumanTerminal: false,
+        allowDeployments: false,
+        mcpCommandMode: "off",
+        mcpFileRead: false,
+      });
+      expect(outcomes()).toEqual(["opened", "accepted"]);
+      expect(manager.closeDeploymentOperatorStep(start.stepId, { keepRunning: true })).toBe(
+        "running",
+      );
+    });
+
+    it("keeps operator terminals open when the human or MCP grants change", async () => {
+      const { manager, target, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      await report("awaiting_operator");
+      manager.applyFeatureGrants("cli-device-id", {
+        allowHumanTerminal: true,
+        mcpCommandMode: "unsupervised",
+        mcpFileRead: true,
+      });
+      manager.applyFeatureGrants("cli-device-id", {
+        allowHumanTerminal: false,
+        mcpCommandMode: "off",
+        mcpFileRead: false,
+      });
+      expect(manager.listTerminalsForUser("user-id")).toEqual([
+        expect.objectContaining({ terminalId, origin: "deployment" }),
+      ]);
+      expect(outcomes()).toEqual(["opened"]);
+    });
+
+    it("a final naming another terminal of the step leaves the current one alone", async () => {
+      const { manager, target, result, report } = await operatorSetup();
+      expect(manager.sendDeploymentJob(target, start)).toBe(true);
+      await report("awaiting_operator");
+      // A late answer to an earlier copy of the step (another terminal id).
+      await report("failed", { terminalId: "BBECAwQFBgcICQoLDA0ODw", error: "state_unavailable" });
+      expect(manager.hasTerminal(terminalId)).toBe(true);
+      expect(outcomes()).toEqual(["opened"]);
+      await report("succeeded");
+      expect(manager.hasTerminal(terminalId)).toBe(false);
+      expect(outcomes()).toEqual(["opened", "succeeded"]);
+      expect(result).toHaveBeenCalledTimes(3);
+    });
+
+    it("caps tracked steps per session; a cancelled one gives way only on a successful send", async () => {
+      const { manager, socket, target } = await operatorSetup();
+      const job = (n: number) =>
+        ({
+          ...start,
+          stepId: `step-${n}`,
+          operator: { terminalId: id16(100 + n), commandAuthor: "user" },
+        }) as Job;
+      // The reconciler sees the capability and the room before it claims a step.
+      expect(target).toMatchObject({ deploymentOperator: true, operatorRoom: true });
+      for (let n = 0; n < OPERATOR_STEPS_PER_SESSION; n += 1)
+        expect(manager.sendDeploymentJob(target, job(n))).toBe(true);
+      expect(manager.deploymentSocket("cli-device-id")?.operatorRoom).toBe(false);
+      expect(manager.sendDeploymentJob(target, job(OPERATOR_STEPS_PER_SESSION))).toBe(false);
+      expect(manager.closeDeploymentOperatorStep("step-0")).toBe("closed");
+      expect(manager.deploymentSocket("cli-device-id")?.operatorRoom).toBe(true);
+      // A failed send keeps the cancelled tracker: its operator_closed still routes.
+      socket.send = () => {
+        throw new Error("socket gone");
+      };
+      expect(manager.sendDeploymentJob(target, job(OPERATOR_STEPS_PER_SESSION))).toBe(false);
+      socket.send = (data) => {
+        socket.sends.push(data);
+      };
+      const result = vi.fn(async () => true);
+      manager.setDeploymentHandlers({ result, inventory: async () => true });
+      const closed = {
+        ...golden.results.operatorDeclined,
+        stepId: "step-0",
+        terminalId: id16(100),
+      };
+      await manager.handleTextFrame(socket, JSON.stringify(closed), now);
+      expect(result).toHaveBeenCalledTimes(1);
+      // Answered: the slot is free again.
+      expect(manager.sendDeploymentJob(target, job(OPERATOR_STEPS_PER_SESSION))).toBe(true);
+      expect(manager.sendDeploymentJob(target, job(OPERATOR_STEPS_PER_SESSION + 1))).toBe(false);
+      // At the cap, an unanswered cancelled tracker gives way to a successful send.
+      expect(manager.closeDeploymentOperatorStep("step-1")).toBe("closed");
+      expect(manager.sendDeploymentJob(target, job(OPERATOR_STEPS_PER_SESSION + 1))).toBe(true);
+      await manager.handleTextFrame(
+        socket,
+        JSON.stringify({ ...closed, stepId: "step-1", terminalId: id16(101) }),
+        now,
+      );
+      expect(result).toHaveBeenCalledTimes(1);
+    });
+
+    it("ignores another device's session reporting this session's step and terminal", async () => {
+      const { manager, socket, target, result, report } = await operatorSetup();
+      manager.sendDeploymentJob(target, start);
+      db.cliDevice.upsert.mockResolvedValueOnce({
+        id: "cli-device-2",
+        userId: "user-id",
+        slug: "laptop",
+        allowHumanTerminal: false,
+        allowDeployments: true,
+        mcpCommandMode: "OFF",
+        connectionGeneration: 1,
+      });
+      const other = new FakeSocket();
+      manager.acceptAuthenticatedSocket({ socket: other, identity, now });
+      await manager.handleTextFrame(other, resignHello(other, operatorHello()), now);
+      expect(manager.deploymentSocket("cli-device-2")).toBeTruthy();
+      const sentBefore = socket.sends.length;
+      await manager.handleTextFrame(
+        other,
+        JSON.stringify({ ...golden.results.awaitingOperator }),
+        now,
+      );
+      await manager.handleTextFrame(
+        other,
+        JSON.stringify({ ...golden.results.operatorDeclined }),
+        now,
+      );
+      expect(result).not.toHaveBeenCalled();
+      expect(manager.listTerminalsForUser("user-id")).toEqual([]);
+      expect(manager.hasTerminal(terminalId)).toBe(true);
+      expect(socket.sends.length).toBe(sentBefore);
+      // The spoofing CLI's own stray is closed on that CLI only; nothing was audited.
+      expect(outcomes()).toEqual([]);
+      await report("awaiting_operator");
+      expect(result).toHaveBeenCalledTimes(1);
+      expect(manager.listTerminalsForUser("user-id")).toHaveLength(1);
+    });
+
+    it("ends tracked steps with the session and on a ban", async () => {
+      const first = await operatorSetup();
+      first.manager.sendDeploymentJob(first.target, start);
+      await first.report("awaiting_operator");
+      first.manager.cancelDeploymentOperatorTerminalsForUser("user-id");
+      expect(first.manager.hasTerminal(terminalId)).toBe(false);
+      expect(outcomes()).toEqual(["opened", "cancelled"]);
+
+      resetDeploymentOperatorAuditForTests();
+      const second = await operatorSetup();
+      second.manager.sendDeploymentJob(second.target, start);
+      await second.report("awaiting_operator");
+      await second.manager.removeSession(second.socket, now);
+      expect(outcomes()).toEqual(["opened", "closed"]);
+      expect(events).toContainEqual(expect.objectContaining({ type: "exit", terminalId }));
+    });
   });
 
   it("lets two viewers coexist without a detached event", async () => {
@@ -3097,6 +3967,24 @@ describe("relay terminal viewers", () => {
 });
 
 describe("relay 2.7 telemetry", () => {
+  beforeEach(() => {
+    durableEpochs.clear();
+    epochGate.read = undefined;
+    epochGate.persist = undefined;
+  });
+  const gate = (stage: "read" | "persist") => {
+    let open = () => {};
+    epochGate[stage] = new Promise<void>((resolve) => {
+      open = () => {
+        epochGate[stage] = undefined;
+        resolve();
+      };
+    });
+    return open;
+  };
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 10));
+  const pendingResets = (manager: unknown) =>
+    (manager as { pendingAffinityResets: Map<string, unknown> }).pendingAffinityResets;
   const metrics = (ts: string, extra: Record<string, unknown> = {}) =>
     JSON.stringify({
       type: "node.metrics",
@@ -3115,6 +4003,7 @@ describe("relay 2.7 telemetry", () => {
       kvUsage: 0.25,
       source: "vllm-metrics",
       ts: "2026-01-01T00:00:00.000Z",
+      counterEpoch: 0,
     });
   const at = (ms: number) => new Date(now.getTime() + ms);
 
@@ -3127,27 +4016,17 @@ describe("relay 2.7 telemetry", () => {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity, now });
-    await manager.handleTextFrame(socket, helloFrame(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
     db.cliDevice.updateMany.mockClear();
     db.cliDevice.update.mockClear();
     return { manager, socket };
-  }
-
-  function helloFrame29() {
-    const frame = JSON.parse(helloFrame()) as {
-      protocolVersion: string;
-      cli: { capabilities: { protocolVersion: string } };
-    };
-    frame.protocolVersion = "2.9";
-    frame.cli.capabilities.protocolVersion = "2.9";
-    return JSON.stringify(frame);
   }
 
   async function registered29() {
     const manager = new RelaySessionManager();
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity, now });
-    await manager.handleTextFrame(socket, helloFrame29(), now);
+    await manager.handleTextFrame(socket, helloFrame(socket), now);
     db.cliDevice.updateMany.mockClear();
     db.cliDevice.update.mockClear();
     return { manager, socket };
@@ -3225,6 +4104,7 @@ describe("relay 2.7 telemetry", () => {
       waiting,
       source: "vllm-metrics",
       ts: "2026-01-01T00:00:00.000Z",
+      counterEpoch: 0,
       ...extra,
     });
   const liveLoad = (manager: InstanceType<typeof RelaySessionManager>) =>
@@ -3261,6 +4141,7 @@ describe("relay 2.7 telemetry", () => {
         kvOccupancy: 0.7,
         source: "custom",
         ts: "2026-01-01T00:00:00.000Z",
+        counterEpoch: 0,
         ...extra,
       });
     await manager.handleTextFrame(socket, custom(), now);
@@ -3298,6 +4179,307 @@ describe("relay 2.7 telemetry", () => {
       prefixCacheQueriesTotal: 47,
     });
     manager.dispose();
+  });
+
+  const inventoryLoad = (extra: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      type: "endpoint.load",
+      endpointSlug: "local-openai",
+      running: 1,
+      waiting: 0,
+      source: "vllm-metrics",
+      ts: "2026-01-01T00:00:00.000Z",
+      counterEpoch: 0,
+      ...extra,
+    });
+
+  it("does not reset KV eviction evidence on hello", async () => {
+    const { manager } = await registered();
+    expect(kvEviction.resetKvEvictionForCliDevice).not.toHaveBeenCalled();
+    expect(kvEviction.resetKvEvictionForEndpoint).not.toHaveBeenCalled();
+    manager.dispose();
+  });
+
+  it("honours prefixCacheReset on a rate-limited endpoint.load frame", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad(), now);
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ prefixCacheReset: true, running: 2 }),
+      at(200),
+    );
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledWith(
+      "cli-device-id",
+      "local-openai",
+      at(200),
+    );
+    manager.dispose();
+  });
+
+  it("ignores prefixCacheReset for a slug outside the session inventory", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, load("vllm", 1), now);
+    await manager.handleTextFrame(
+      socket,
+      JSON.stringify({ ...JSON.parse(load("vllm", 1)), prefixCacheReset: true }),
+      at(1_500),
+    );
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).not.toHaveBeenCalled();
+    manager.dispose();
+  });
+
+  it("resets KV eviction only when counterEpoch changes", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 0 }), now);
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).not.toHaveBeenCalled();
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ counterEpoch: 0, running: 2 }),
+      at(1_500),
+    );
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).not.toHaveBeenCalled();
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ counterEpoch: 1, running: 3 }),
+      at(3_000),
+    );
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledWith(
+      "cli-device-id",
+      "local-openai",
+      at(3_000),
+    );
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ counterEpoch: 2, running: 4 }),
+      at(4_500),
+    );
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(2);
+    manager.dispose();
+  });
+
+  it("seeds counterEpoch from durable endpoint rows and resets only on a change", async () => {
+    db.endpoint.findMany.mockResolvedValue([{ slug: "local-openai", loadCounterEpoch: 5 }]);
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 5 }), now);
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).not.toHaveBeenCalled();
+    expect(db.endpoint.updateMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: { loadCounterEpoch: 5 } }),
+    );
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ counterEpoch: 6, running: 2 }),
+      at(3_000),
+    );
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    expect(db.endpoint.updateMany).toHaveBeenCalledWith({
+      where: { cliDeviceId: "cli-device-id", slug: "local-openai" },
+      data: { loadCounterEpoch: 6 },
+    });
+    manager.dispose();
+  });
+
+  it("debounces KV eviction resets per endpoint", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad({ prefixCacheReset: true }), now);
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ prefixCacheReset: true, running: 2 }),
+      at(1_500),
+    );
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ prefixCacheReset: true, running: 3 }),
+      at(31_000),
+    );
+    await Promise.resolve();
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(2);
+    manager.dispose();
+  });
+
+  it("applies a debounced explicit reset later instead of dropping it", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad({ prefixCacheReset: true }), now);
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ prefixCacheReset: true, running: 2 }),
+      at(1_500),
+    );
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    // An ordinary frame after the window applies the coalesced reset, timed at its arrival.
+    await manager.handleTextFrame(socket, inventoryLoad({ running: 3 }), at(31_000));
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(2);
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenLastCalledWith(
+      "cli-device-id",
+      "local-openai",
+      at(1_500),
+    );
+    manager.dispose();
+  });
+
+  it("does not drop a reset on a new load key once the session's key cap is full", async () => {
+    const { ENDPOINT_LOAD_MAX_KEYS } = await import("./session-manager.js");
+    const { manager, socket } = await registered();
+    for (let index = 0; index < ENDPOINT_LOAD_MAX_KEYS; index += 1)
+      await manager.handleTextFrame(socket, inventoryLoad({ modelSlug: `m${index}` }), now);
+    expect(kvEviction.resetKvEvictionForEndpoint).not.toHaveBeenCalled();
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ modelSlug: "beyond-the-cap", counterEpoch: 1 }),
+      at(1_500),
+    );
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    manager.dispose();
+  });
+
+  it("resolves a missing epoch cache entry against the durable epoch", async () => {
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 0 }), now);
+    expect(durableEpochs.get("cli-device-id/local-openai")).toBe(0);
+    // Simulates eviction from the bounded cache: a miss must not read as "unchanged".
+    (
+      manager as unknown as { kvCounterEpochByEndpoint: Map<string, number> }
+    ).kvCounterEpochByEndpoint.clear();
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 0 }), at(1_500));
+    expect(kvEviction.resetKvEvictionForEndpoint).not.toHaveBeenCalled();
+    (
+      manager as unknown as { kvCounterEpochByEndpoint: Map<string, number> }
+    ).kvCounterEpochByEndpoint.clear();
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 1 }), at(3_000));
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    expect(durableEpochs.get("cli-device-id/local-openai")).toBe(1);
+    manager.dispose();
+  });
+
+  it("treats a first-seen epoch above 0 with nothing stored as a reset, and epoch 0 as a baseline", async () => {
+    const { manager, socket } = await registered();
+    // The CLI starts each endpoint at epoch 0; a later epoch with no stored
+    // value means a reset this server did not see (e.g. sent mid-inventory).
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 2 }), now);
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    expect(durableEpochs.get("cli-device-id/local-openai")).toBe(2);
+    manager.dispose();
+
+    durableEpochs.clear();
+    vi.mocked(kvEviction.resetKvEvictionForEndpoint).mockClear();
+    const second = await registered();
+    await second.manager.handleTextFrame(second.socket, inventoryLoad({ counterEpoch: 0 }), now);
+    expect(kvEviction.resetKvEvictionForEndpoint).not.toHaveBeenCalled();
+    expect(durableEpochs.get("cli-device-id/local-openai")).toBe(0);
+    second.manager.dispose();
+  });
+
+  it("treats an epoch that moves and returns while a job is pending as a reset", async () => {
+    // Earlier blocks may leave fake timers installed; these waits need the real clock.
+    vi.useRealTimers();
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 5 }), now);
+    (
+      manager as unknown as { kvCounterEpochByEndpoint: Map<string, number> }
+    ).kvCounterEpochByEndpoint.clear();
+    const open = gate("read");
+    const frames = [manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 5 }), at(2_000))];
+    await settle();
+    frames.push(
+      manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 6, running: 2 }), at(2_100)),
+      manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 5, running: 3 }), at(2_200)),
+    );
+    await settle();
+    open();
+    await Promise.all(frames);
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ counterEpoch: 5, running: 4 }),
+      at(4_000),
+    );
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalled();
+    expect(pendingResets(manager).size).toBe(0);
+    manager.dispose();
+  });
+
+  it("lets a reset complete while ordinary frames repeat its new epoch", async () => {
+    // Earlier blocks may leave fake timers installed; these waits need the real clock.
+    vi.useRealTimers();
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 0 }), now);
+    const open = gate("persist");
+    const reset = manager.handleTextFrame(
+      socket,
+      inventoryLoad({ counterEpoch: 1, prefixCacheReset: true, running: 2 }),
+      at(2_000),
+    );
+    await settle();
+    // The stock CLI's next ordinary frames carry the same new epoch.
+    const ordinary = manager.handleTextFrame(
+      socket,
+      inventoryLoad({ counterEpoch: 1, running: 3 }),
+      at(2_500),
+    );
+    await settle();
+    open();
+    await Promise.all([reset, ordinary]);
+    expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+    expect(pendingResets(manager).size).toBe(0);
+    expect(durableEpochs.get("cli-device-id/local-openai")).toBe(1);
+    manager.dispose();
+  });
+
+  it("keeps an endpoint that keeps reporting in the bounded epoch cache", async () => {
+    vi.useRealTimers();
+    const { manager, socket } = await registered();
+    await manager.handleTextFrame(socket, inventoryLoad({ counterEpoch: 0 }), now);
+    const { KV_COUNTER_EPOCH_CACHE_MAX } = await import("./session-manager.js");
+    const cache = (manager as unknown as { kvCounterEpochByEndpoint: Map<string, number> })
+      .kvCounterEpochByEndpoint;
+    for (let index = 0; cache.size < KV_COUNTER_EPOCH_CACHE_MAX; index += 1)
+      cache.set(`other${index}`, 0);
+    await manager.handleTextFrame(
+      socket,
+      inventoryLoad({ counterEpoch: 0, running: 2 }),
+      at(1_500),
+    );
+    // One more insertion by any path evicts the least recently used entry.
+    cache.set("newcomer", 0);
+    while (cache.size > KV_COUNTER_EPOCH_CACHE_MAX) {
+      const oldest = cache.keys().next().value;
+      if (oldest === undefined) break;
+      cache.delete(oldest);
+    }
+    expect(cache.has("cli-device-id\u0000local-openai")).toBe(true);
+    manager.dispose();
+  });
+
+  it("applies a delayed reset from the retry timer once it falls due", async () => {
+    vi.useFakeTimers({ now: now.getTime() });
+    try {
+      const { manager, socket } = await registered();
+      await manager.handleTextFrame(socket, inventoryLoad({ prefixCacheReset: true }), now);
+      await manager.handleTextFrame(
+        socket,
+        inventoryLoad({ prefixCacheReset: true, running: 2 }),
+        at(1_500),
+      );
+      expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(12_000);
+      expect(kvEviction.resetKvEvictionForEndpoint).toHaveBeenCalledTimes(2);
+      expect(pendingResets(manager).size).toBe(0);
+      manager.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("bounds the endpoint load keys a session keeps", async () => {
@@ -3386,7 +4568,7 @@ describe("relay 2.7 telemetry", () => {
       remoteMetricSources: [fansSource],
     });
     const unsupervised = await registered();
-    expect(JSON.parse(String(unsupervised.socket.sends[0]))).toMatchObject({ type: "hello.ok" });
+    expect(firstControl(unsupervised.socket, "hello.ok")).toMatchObject({ type: "hello.ok" });
     expect(sourceFrames(unsupervised.socket)).toEqual([
       expect.objectContaining({ type: "metrics.sources.set", sources: [fansSource] }),
     ]);
@@ -3567,23 +4749,7 @@ describe("relay 2.7 telemetry", () => {
       .filter((frame) => frame.type === "engine.adapters.set");
   }
 
-  it("does not send engine.adapters.set on a 2.8 session", async () => {
-    const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
-      .findUnique;
-    findUnique.mockResolvedValue({
-      userId: "user-id",
-      mcpCommandMode: "UNSUPERVISED",
-      remoteMetricSources: [fansSource],
-      remoteEngineAdapters: [gpuAdapter],
-    });
-    const { manager, socket } = await registered();
-    expect(adapterFrames(socket)).toEqual([]);
-    expect(await manager.onRemoteEngineAdaptersChanged("cli-device-id")).toBe(false);
-    expect(adapterFrames(socket)).toEqual([]);
-    manager.dispose();
-  });
-
-  it("sends remote engine adapters after hello.ok only on 2.9 unsupervised sessions", async () => {
+  it("sends remote engine adapters after hello.ok only on unsupervised sessions", async () => {
     const findUnique = (prisma as unknown as { cliDevice: { findUnique: MockInstance } }).cliDevice
       .findUnique;
     findUnique.mockResolvedValue({
@@ -3593,7 +4759,7 @@ describe("relay 2.7 telemetry", () => {
       remoteEngineAdapters: [gpuAdapter],
     });
     const unsupervised = await registered29();
-    expect(JSON.parse(String(unsupervised.socket.sends[0]))).toMatchObject({ type: "hello.ok" });
+    expect(firstControl(unsupervised.socket, "hello.ok")).toMatchObject({ type: "hello.ok" });
     expect(adapterFrames(unsupervised.socket)).toEqual([
       expect.objectContaining({ type: "engine.adapters.set", adapters: [gpuAdapter] }),
     ]);
@@ -3648,13 +4814,13 @@ describe("relay 2.7 telemetry", () => {
       const routingRules = [
         { metric: "node.cpu.usage_percent", op: ">", threshold: 10, effect: "full" },
       ];
-      deep.modelPool.findMany.mockResolvedValue([{ id: "pool-1", routingRules }]);
+      deep.modelPool.findMany.mockResolvedValue([{ id: "pool-1", PoolRoutingRules: routingRules }]);
       deep.poolMember.findMany.mockResolvedValue([
         {
           id: "member-1",
           poolId: "pool-1",
           ModelPool: {
-            routingRules,
+            PoolRoutingRules: routingRules,
           },
           DiscoveredModel: null,
           ExecutionTarget: { DiscoveredModel: { slug: null, Endpoint: { slug: "example" } } },
@@ -3695,7 +4861,7 @@ describe("relay 2.7 telemetry", () => {
           poolId: "pool-1",
           engineLoadMode: "AUTO",
           kvFullThreshold: null,
-          ModelPool: { routingRules: [] },
+          ModelPool: { PoolRoutingRules: [] },
           DiscoveredModel: null,
           ExecutionTarget: {
             InferenceCapacity: { engineKind: "VLLM", engineSlots: null },
@@ -3788,7 +4954,7 @@ describe("relay 2.7 telemetry", () => {
       // replaced and its pending run must never publish over the successor.
       const successor = new FakeSocket();
       manager.acceptAuthenticatedSocket({ socket: successor, identity, now: at(1_100) });
-      await manager.handleTextFrame(successor, helloFrame(), at(1_100));
+      await manager.handleTextFrame(successor, helloFrame(successor), at(1_100));
       expect(socket.closes).toEqual([{ code: 1000, reason: "replaced" }]);
       await vi.advanceTimersByTimeAsync(5_000);
       expect(routingRuns()).toBe(1);
@@ -3803,7 +4969,7 @@ describe("relay 2.7 telemetry", () => {
     const socket = new FakeSocket();
     manager.acceptAuthenticatedSocket({ socket, identity, now });
     await manager.handleTextFrame(socket, load("vllm", 1), now);
-    expect(socket.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
+    expect(socket.closes).toEqual([{ code: 1002, reason: "malformed" }]);
     expect(manager.getLiveNodeTelemetry(["cli-device-id"]).size).toBe(0);
     manager.dispose();
   });
@@ -3818,7 +4984,7 @@ describe("relay 2.7 telemetry", () => {
       metrics("2026-01-01T00:00:00.000Z", { cpu: { usagePercent: 101.3 } }),
       now,
     );
-    expect(socket.closes).toEqual([{ code: 1002, reason: "protocol_error" }]);
+    expect(socket.closes).toEqual([{ code: 1002, reason: "malformed" }]);
     expect(consoleError).not.toHaveBeenCalledWith(
       "[relay] malformed telemetry frame dropped",
       "node.metrics",

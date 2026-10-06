@@ -6,6 +6,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use std::collections::BTreeMap;
+
 use crate::config::{
     CapabilityConfidence, CapabilityOverrideMode, CapabilitySource, Config, EndpointConfig,
     ModelConfig, OpenAiCompatibleCapabilities, ProbeSnapshot, ProbeStatus, ReasoningConfig,
@@ -112,8 +114,24 @@ struct UpstreamModelSpec {
     capabilities: Option<UpstreamCapabilityFlags>,
 }
 
-pub fn probe_endpoint(endpoint: &EndpointConfig) -> ProbeReport {
-    match try_probe_endpoint(endpoint) {
+pub fn probe_from_config(endpoint: &EndpointConfig, config: &Config) -> ProbeReport {
+    probe_endpoint(
+        endpoint,
+        config.allow_remote_engine_adapters,
+        &config.approved_remote_adapters,
+    )
+}
+
+pub fn probe_endpoint(
+    endpoint: &EndpointConfig,
+    allow_remote_engine_adapters: bool,
+    approved_remote_adapters: &BTreeMap<String, String>,
+) -> ProbeReport {
+    match try_probe_endpoint(
+        endpoint,
+        allow_remote_engine_adapters,
+        approved_remote_adapters,
+    ) {
         Ok(mut report) => {
             report.endpoint_slug = endpoint.slug.clone();
             report
@@ -133,7 +151,11 @@ pub fn probe_endpoint(endpoint: &EndpointConfig) -> ProbeReport {
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
+fn try_probe_endpoint(
+    endpoint: &EndpointConfig,
+    allow_remote_engine_adapters: bool,
+    approved_remote_adapters: &BTreeMap<String, String>,
+) -> Result<ProbeReport> {
     let url = models_url(&endpoint.base_url)?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(PROBE_TIMEOUT))
@@ -184,8 +206,26 @@ fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
         .iter()
         .map(|row| (row.id.clone(), row.max_model_len))
         .collect::<Vec<_>>();
-    let engine = crate::engine::detect_engine(endpoint, &model_limits);
-    let adapter = crate::engine_adapter::probe_facts(endpoint);
+    let mut engine = crate::engine::detect_engine(endpoint, &model_limits);
+    let adapter_spec = endpoint.engine_adapter.clone().or_else(|| {
+        let remote = crate::engine_adapter::load_remote_adapters().ok()?;
+        crate::engine_adapter::effective_engine_adapter(
+            endpoint,
+            &remote,
+            allow_remote_engine_adapters,
+            approved_remote_adapters,
+        )
+    });
+    let model = rows.first().map(|row| row.id.as_str());
+    engine.count_context = Some(crate::count_context::probe_count_context(
+        endpoint,
+        engine.kind,
+        model,
+        adapter_spec
+            .as_ref()
+            .and_then(|spec| spec.count_route.as_deref()),
+    ));
+    let adapter = crate::engine_adapter::probe_facts_with(endpoint, adapter_spec.as_ref());
     Ok(ProbeReport {
         endpoint_slug: endpoint.slug.clone(),
         status: ProbeStatus::Online,

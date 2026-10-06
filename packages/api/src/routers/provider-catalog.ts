@@ -3,7 +3,7 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
-import { protectedProcedure } from "../index";
+import { humanProcedure, protectedProcedure } from "../index";
 import { loadPoolCatalogProfile } from "../lib/catalog-pool-profile";
 import {
   createProviderCatalog,
@@ -360,7 +360,7 @@ export function createProviderCatalogRouter(catalog: ProviderCatalog) {
       };
     }),
 
-    importModel: protectedProcedure
+    importModel: humanProcedure
       .input(
         z.object({
           providerAccountId: id,
@@ -567,7 +567,7 @@ export function createProviderCatalogRouter(catalog: ProviderCatalog) {
         };
       }),
 
-    setPoolExternalEquivalent: protectedProcedure
+    setPoolExternalEquivalent: humanProcedure
       .input(z.object({ poolId: id, modelId: catalogModelIdSchema.nullable() }))
       .handler(async ({ input, context }) => {
         const userId = context.session.user.id;

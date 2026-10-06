@@ -29,7 +29,7 @@ person, on the dashboard or on the machine itself.
 - **Token form** (when "Allow CLI commands" is on): each of your devices with
   its effective mode, the same per-kind refusal, and a link to its grant
   setting, and a warning when no device can run either kind.
-- **MCP `forwarder_cli_devices_list`**: `features.commands` carries `mode`
+- **MCP `forwarder_cli_devices_list`** (summaries; full device is `forwarder_cli_device_get`): `features.commands` carries `mode`
   (grant), `deviceMode` (CLI config), `effectiveMode`, and `refusals`:
   `refusals.headless` and `refusals.supervised` are `null` when the relay
   would admit that tool, else the relay's own code (`grant_disabled`,

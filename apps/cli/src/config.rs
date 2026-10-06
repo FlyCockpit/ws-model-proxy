@@ -213,8 +213,12 @@ impl ConfigLock {
 
 /// What MCP agents may run on this CLI. Read once when the relay starts.
 ///
-/// `supervised` only allows commands a person confirms in a browser terminal
-/// (Enter on a confirm screen); `unsupervised` also allows headless exec.
+/// For MCP commands, `supervised` only allows commands a person confirms in a
+/// browser terminal (Enter on a confirm screen); `unsupervised` also allows
+/// headless exec. Deployment jobs (`allow_deployments`) are not MCP commands:
+/// a job the server reports as person-approved runs in every mode, and an
+/// agent job in `supervised` relies on the server's approval flag, not a local
+/// confirm screen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum McpCommandMode {
@@ -290,6 +294,16 @@ pub struct Config {
     /// adapter still needs `wsmp endpoints adapter approve` of its canonical spec.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_remote_engine_adapters: bool,
+    /// Local deployment execution opt-in; every job rechecks the file.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_deployments: bool,
+    /// Local opt-in for interactive recipe steps: an operator terminal in
+    /// which a person runs the step's command (e.g. one that asks for a sudo
+    /// password) from the dashboard. Separate from browser terminals (it
+    /// never opens a shell). Needs `allow_deployments` too; read fresh for
+    /// every job, every Enter and every viewer.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub allow_deployment_operator_terminal: bool,
     /// Remote adapter endpoint slug -> SHA-256 (hex) of the approved canonical spec.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub approved_remote_adapters: std::collections::BTreeMap<String, String>,
@@ -362,6 +376,8 @@ struct ConfigWire {
     file_roots: Vec<PathBuf>,
     allow_remote_metric_sources: bool,
     allow_remote_engine_adapters: bool,
+    allow_deployments: bool,
+    allow_deployment_operator_terminal: bool,
     approved_remote_adapters: std::collections::BTreeMap<String, String>,
     metrics: MetricsConfig,
 }
@@ -385,6 +401,8 @@ impl Default for ConfigWire {
             file_roots: Vec::new(),
             allow_remote_metric_sources: false,
             allow_remote_engine_adapters: false,
+            allow_deployments: false,
+            allow_deployment_operator_terminal: false,
             approved_remote_adapters: std::collections::BTreeMap::new(),
             metrics: MetricsConfig::default(),
         }
@@ -414,6 +432,8 @@ impl From<ConfigWire> for Config {
             file_roots: wire.file_roots,
             allow_remote_metric_sources: wire.allow_remote_metric_sources,
             allow_remote_engine_adapters: wire.allow_remote_engine_adapters,
+            allow_deployments: wire.allow_deployments,
+            allow_deployment_operator_terminal: wire.allow_deployment_operator_terminal,
             approved_remote_adapters: wire.approved_remote_adapters,
             metrics: wire.metrics,
         }
@@ -437,6 +457,8 @@ impl Default for Config {
             file_roots: Vec::new(),
             allow_remote_metric_sources: false,
             allow_remote_engine_adapters: false,
+            allow_deployments: false,
+            allow_deployment_operator_terminal: false,
             approved_remote_adapters: std::collections::BTreeMap::new(),
             metrics: MetricsConfig::default(),
         }
@@ -892,9 +914,47 @@ impl OpenAiCompatibleCapabilities {
             chat_completions: None,
             embeddings: Some(EmbeddingsCapabilities {
                 supported: Some(true),
+                contract: None,
             }),
             responses: None,
             audio: None,
+            sampling: None,
+        }
+    }
+
+    /// A speech-to-text server: transcriptions only, with the options its
+    /// recipe declares. Version 2 is the first that carries a detailed
+    /// transcription profile (version 1 accepts only a boolean there).
+    pub fn transcription(profile: Option<&crate::deployments::TranscriptionProfile>) -> Self {
+        let profile = profile.cloned().unwrap_or_default();
+        Self {
+            version: 2,
+            protocol: "openai-compatible".to_string(),
+            surfaces: None,
+            source: None,
+            confidence: None,
+            models: Some(ModelListCapabilities { list: Some(true) }),
+            chat_completions: None,
+            embeddings: None,
+            responses: None,
+            audio: Some(AudioCapabilities {
+                transcriptions: Some(AudioOperationCapabilities::Detailed(
+                    TranscriptionCapabilities {
+                        supported: Some(true),
+                        streaming: Some(profile.streaming.unwrap_or(true)),
+                        response_formats: profile.response_formats,
+                        timestamp_granularities: profile.timestamp_granularities,
+                        diarization: profile.diarization,
+                        languages: profile.languages,
+                        language_detection: profile.language_detection,
+                        multiple_language_hints: profile.multiple_language_hints,
+                        max_upload_bytes: profile.max_upload_bytes,
+                        accepted_mime_types: profile.accepted_mime_types,
+                    },
+                )),
+                translations: None,
+                speech: None,
+            }),
             sampling: None,
         }
     }
@@ -1388,6 +1448,8 @@ pub struct ChatCompletionsCapabilities {
 pub struct EmbeddingsCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supported: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract: Option<crate::deployments::EmbeddingContract>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1571,6 +1633,10 @@ impl Config {
             validate_slug(slug).with_context(|| format!("validating CLI slug `{slug}`"))?;
         }
         for endpoint in &self.endpoints {
+            anyhow::ensure!(
+                !endpoint.slug.starts_with("inst-"),
+                "endpoint slug prefix `inst-` is reserved for managed deployments"
+            );
             validate_slug(&endpoint.slug)
                 .with_context(|| format!("validating endpoint slug `{}`", endpoint.slug))?;
             if let Some(limit) = endpoint.concurrency_limit

@@ -27,6 +27,7 @@
  * action: an H write (it takes the pool's cache-affinity fence, like the
  * affinity writer) kept here so that only H and S modules write H tables.
  */
+import { randomUUID } from "node:crypto";
 import type { PrismaClient } from "../prisma/generated/client";
 import { Prisma } from "../prisma/generated/client";
 import {
@@ -207,6 +208,27 @@ export async function purgeDeletedUserHistory(
         () => deleteOwnedBatch(db, table, "id", column, userId, batch),
         batch,
       );
+  for (const table of ["cache_affinity_scope", "cache_affinity_observer"])
+    processed += await sweepLoop(
+      () =>
+        db.$executeRaw(Prisma.sql`
+        DELETE FROM ${Prisma.raw(table)} WHERE ctid = ANY(ARRAY(
+          SELECT ctid FROM ${Prisma.raw(table)} WHERE "userId" = ${userId}
+          LIMIT ${batch} FOR UPDATE SKIP LOCKED))`),
+      batch,
+    );
+  processed += await sweepLoop(
+    () =>
+      deleteOwnedBatch(
+        db,
+        "cache_affinity_residency",
+        "executionTargetId",
+        "userId",
+        userId,
+        batch,
+      ),
+    batch,
+  );
   processed += await sweepLoop(
     () => deleteOwnedBatch(db, "capacity_runtime", "capacityId", "userId", userId, batch),
     batch,
@@ -231,7 +253,12 @@ export async function purgeDeletedUserHistory(
       }),
     batch,
   );
-  for (const table of ["usage_rollup_minute", "usage_rollup_hour", "engine_load_rollup_minute"])
+  for (const table of [
+    "usage_rollup_minute",
+    "usage_rollup_hour",
+    "engine_load_rollup_minute",
+    "node_metrics_minute",
+  ])
     processed += await sweepLoop(
       () => deleteOwnedBatch(db, table, "ctid", "ownerUserId", userId, batch),
       batch,
@@ -252,9 +279,10 @@ export async function purgeDeletedUserHistory(
     }
   }, batch);
   // History keyed by a plain user id outside the hot path (the agent audit
-  // log). A row the drain skipped (locked) or an event written after the
-  // drain (a queued audit write, another replica) is taken here, and counts
-  // as remaining until it is gone, so the entry is not retired early.
+  // log and the deployment operator audit). A row the drain skipped (locked)
+  // or an event written after the drain (a queued audit write, another
+  // replica) is taken here, and counts as remaining until it is gone, so the
+  // entry is not retired early.
   let plainRemaining = false;
   for (const [table, { userColumn }] of Object.entries(USER_PLAIN_ID_HISTORY_TABLES)) {
     processed += await sweepLoop(
@@ -274,11 +302,15 @@ export async function purgeDeletedUserHistory(
                     WHERE "userId" = ${userId} OR "tenantUserId" = ${userId})
         OR EXISTS (SELECT 1 FROM cache_affinity_node
                     WHERE "userId" = ${userId} OR "tenantUserId" = ${userId})
+        OR EXISTS (SELECT 1 FROM cache_affinity_residency WHERE "userId" = ${userId})
+        OR EXISTS (SELECT 1 FROM cache_affinity_scope WHERE "userId" = ${userId})
+        OR EXISTS (SELECT 1 FROM cache_affinity_observer WHERE "userId" = ${userId})
         OR EXISTS (SELECT 1 FROM usage_rollup_minute
                     WHERE "ownerUserId" = ${userId} OR "requesterUserId" = ${userId})
         OR EXISTS (SELECT 1 FROM usage_rollup_hour
                     WHERE "ownerUserId" = ${userId} OR "requesterUserId" = ${userId})
         OR EXISTS (SELECT 1 FROM engine_load_rollup_minute WHERE "ownerUserId" = ${userId})
+        OR EXISTS (SELECT 1 FROM node_metrics_minute WHERE "ownerUserId" = ${userId})
         AS remaining`;
   return { processed, remaining: plainRemaining || (left?.remaining ?? true) };
 }
@@ -352,20 +384,79 @@ export async function purgeDeletedUsersHistory(
 }
 
 /**
- * Clears a pool's cache-affinity records for its owner (dashboard action).
+ * Invalidates a pool's cache-affinity incarnation for its owner (dashboard action).
  * Takes the pool's cache-affinity fence first, like the affinity writer, so
  * the two serialize and the clear is exact.
  */
 export async function clearCacheAffinityRecords(
   db: Pick<PrismaClient, "$transaction">,
   { ownerUserId, poolId }: { ownerUserId: string; poolId: string },
+): Promise<{ cleared: true; reclamation: "pending" }> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await db.$transaction(
+        async (tx) => {
+          await tx.$executeRaw`SET LOCAL statement_timeout = '1000ms'`;
+          await tx.$executeRaw`SET LOCAL lock_timeout = '100ms'`;
+          await acquireFences(tx, [fences.cacheAffinity(ownerUserId, poolId)]);
+          await tx.$executeRaw`INSERT INTO cache_affinity_scope ("poolId", "userId", generation, "reclaimPending")
+              VALUES (${poolId}, ${ownerUserId}, ${randomUUID()}, true)
+              ON CONFLICT ("poolId") DO UPDATE SET generation = EXCLUDED.generation, "reclaimPending" = true
+              WHERE cache_affinity_scope."userId" = EXCLUDED."userId"`;
+          return { cleared: true, reclamation: "pending" } as const;
+        },
+        { maxWait: 1000, timeout: 2500 },
+      );
+    } catch (error) {
+      if (attempt >= 3 || !["55P03", "40P01"].includes(serverTimeoutSqlState(error) ?? ""))
+        throw error;
+      await new Promise((resolve) => setTimeout(resolve, 25 * 2 ** attempt));
+    }
+  }
+}
+
+/** One independently committed batch. A scope epoch is the logical clear receipt. */
+export async function reclaimClearedAffinity(
+  db: SweepDb,
+  { poolId, ownerUserId, limit = 256 }: { poolId: string; ownerUserId: string; limit?: number },
 ): Promise<number> {
-  return db.$transaction(async (tx) => {
-    await acquireFences(tx, [fences.cacheAffinity(ownerUserId, poolId)]);
-    const result = await tx.cacheAffinityRecord.deleteMany({
-      where: { userId: ownerUserId, poolId },
-    });
-    const nodes = await tx.cacheAffinityNode.deleteMany({ where: { userId: ownerUserId, poolId } });
-    return result.count + nodes.count;
-  });
+  return db.$transaction(
+    async (tx) => {
+      await tx.$executeRaw`SET LOCAL statement_timeout = '1000ms'`;
+      await tx.$executeRaw`SET LOCAL lock_timeout = '100ms'`;
+      await acquireFences(tx, [fences.cacheAffinity(ownerUserId, poolId)]);
+      const [scope] = await tx.$queryRaw<Array<{ generation: string }>>`
+      SELECT generation FROM cache_affinity_scope WHERE "poolId" = ${poolId}
+        AND "userId" = ${ownerUserId} AND "reclaimPending" FOR UPDATE`;
+      if (!scope) return 0;
+      const batch = Math.max(1, Math.min(256, limit));
+      await tx.$executeRaw`SET LOCAL enable_bitmapscan = off`;
+      let removed = 0;
+      let remaining = false;
+      for (const table of ["cache_affinity_record", "cache_affinity_node"]) {
+        let tableRemoved = 0;
+        // Two indexed ranges skip the potentially very large current incarnation.
+        // A <> filter alone can walk all fresh rows just to prove old work absent.
+        for (const operator of ["<", ">"] as const) {
+          tableRemoved += await tx.$executeRaw(Prisma.sql`
+        DELETE FROM ${Prisma.raw(table)} WHERE id = ANY(ARRAY(
+          SELECT id FROM ${Prisma.raw(table)} WHERE "userId" = ${ownerUserId} AND "poolId" = ${poolId}
+            AND split_part("cacheGeneration", ':pool:', 2) ${Prisma.raw(operator)} ${scope.generation}
+          ORDER BY split_part("cacheGeneration", ':pool:', 2), id LIMIT ${batch - tableRemoved} FOR UPDATE SKIP LOCKED))`);
+          const [state] = await tx.$queryRaw<Array<{ remaining: boolean }>>(Prisma.sql`
+            SELECT EXISTS(SELECT 1 FROM ${Prisma.raw(table)} WHERE "userId" = ${ownerUserId}
+              AND "poolId" = ${poolId} AND split_part("cacheGeneration", ':pool:', 2)
+                ${Prisma.raw(operator)} ${scope.generation} LIMIT 1) AS remaining`);
+          remaining ||= state?.remaining === true;
+        }
+        removed += tableRemoved;
+      }
+      if (!remaining) {
+        await tx.$executeRaw`UPDATE cache_affinity_scope SET "reclaimPending" = false
+        WHERE "poolId" = ${poolId} AND generation = ${scope.generation}`;
+      }
+      return removed;
+    },
+    { maxWait: 1000, timeout: 2500 },
+  );
 }

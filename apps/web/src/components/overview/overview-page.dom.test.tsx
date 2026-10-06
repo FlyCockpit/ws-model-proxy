@@ -11,6 +11,7 @@ const state = vi.hoisted(() => ({
   health: null as unknown,
   metricsInputs: [] as unknown[],
   metricsError: false,
+  runtimes: [] as unknown[],
 }));
 
 vi.mock("@tanstack/react-router", async (importOriginal) => {
@@ -68,6 +69,15 @@ vi.mock("@/utils/orpc", () => ({
         queryOptions: () => ({
           queryKey: ["overview", "health"],
           queryFn: async () => state.health,
+          retry: false,
+        }),
+      },
+    },
+    capacityManagement: {
+      list: {
+        queryOptions: () => ({
+          queryKey: ["capacityManagement", "list"],
+          queryFn: async () => state.runtimes,
           retry: false,
         }),
       },
@@ -153,6 +163,7 @@ describe("OverviewPage", () => {
     vi.stubGlobal("ResizeObserver", ResizeObserverStub);
     state.metricsInputs = [];
     state.metricsError = false;
+    state.runtimes = [];
     resetOverviewRangeForTests();
     window.localStorage.clear();
   });
@@ -244,23 +255,28 @@ describe("OverviewPage", () => {
             },
           ],
           engineLoad: {
-            effectiveKvFullThreshold: 0.95,
-            series: [
+            members: [
               {
-                start: "2026-09-24T10:00:00.000Z",
-                running: 2,
-                waiting: 1,
-                kvUsage: 0.4,
-                kvOccupancy: 0.7,
-                gap: false,
-              },
-              {
-                start: "2026-09-24T10:15:00.000Z",
-                running: 3,
-                waiting: 0,
-                kvUsage: 0.5,
-                kvOccupancy: 0.8,
-                gap: false,
+                poolMemberId: "member-a",
+                kvFullThreshold: 0.95,
+                series: [
+                  {
+                    start: "2026-09-24T10:00:00.000Z",
+                    running: 2,
+                    waiting: 1,
+                    kvUsage: 0.4,
+                    kvOccupancy: 0.7,
+                    gap: false,
+                  },
+                  {
+                    start: "2026-09-24T10:15:00.000Z",
+                    running: 3,
+                    waiting: 0,
+                    kvUsage: 0.5,
+                    kvOccupancy: 0.8,
+                    gap: false,
+                  },
+                ],
               },
             ],
           },
@@ -392,6 +408,72 @@ describe("OverviewPage", () => {
     await userEvent.click(screen.getByRole("button", { name: "overview.ranges.7d" }));
     expect(window.localStorage.getItem(OVERVIEW_RANGE_STORAGE_KEY)).toBe("7d");
     expect(state.metricsInputs).toContainEqual({ range: "7d" });
+  });
+
+  it("keeps the setup tracker until every step is done and points at the next one", async () => {
+    state.metrics = metrics({ setup: { hasPools: true, hasDirectTargets: false } });
+    state.health = health({
+      clis: { total: 1, online: 1, offline: [] },
+      endpoints: { total: 1, healthy: 1, unhealthy: [] },
+    });
+    renderPage();
+    expect(await screen.findByRole("heading", { name: "overview.setup.title" })).toBeTruthy();
+    expect(screen.getByText(/overview.setup.progress:\{"done":3,"total":5\}/)).toBeTruthy();
+    expect(screen.getByText(/overview.setup.next/)).toBeTruthy();
+    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe("3");
+    // Only the remaining steps keep an action.
+    expect(screen.getAllByRole("link").filter((link) => link.closest("li"))).toHaveLength(2);
+  });
+
+  it("shows health before traffic and flags runtimes with a queue", async () => {
+    state.metrics = metrics({ setup: { hasPools: true, hasDirectTargets: false } });
+    state.health = health({
+      clis: { total: 1, online: 1, offline: [] },
+      modelApiTokens: 1,
+    });
+    state.runtimes = [
+      { id: "a", label: "vLLM on studio", _count: { CapacityWaiters: 2 } },
+      { id: "b", label: "llama on mini", _count: { CapacityWaiters: 0 } },
+    ];
+    renderPage();
+    const tile = await screen.findByText("overview.health.runtimes");
+    const card = tile.closest("div.rounded-md") as HTMLElement;
+    expect(within(card).getByText(/overview.health.ratio:\{"value":1,"total":2\}/)).toBeTruthy();
+    expect(within(card).getByText("vLLM on studio")).toBeTruthy();
+    expect(within(card).getByRole("link").getAttribute("href")).toBe("/en-US/dashboard/runtimes");
+    const healthRegion = screen.getByRole("region", { name: "overview.health.sectionLabel" });
+    const kpis = screen.getByRole("region", { name: "overview.kpi.sectionLabel" });
+    expect(
+      healthRegion.compareDocumentPosition(kpis) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("colours a rising error rate as bad and a rising cache hit rate as good", async () => {
+    state.metrics = metrics({
+      setup: { hasPools: true, hasDirectTargets: false },
+      totals: {
+        current: stats({ requests: 100, errorRate: 0.1, cacheHitRate: 0.6 }),
+        previous: stats({ requests: 100, errorRate: 0.02, cacheHitRate: 0.4 }),
+      },
+    });
+    state.health = health();
+    renderPage();
+    const errorTile = (await screen.findByText("overview.kpi.errorRate")).closest(
+      "div.rounded-md",
+    ) as HTMLElement;
+    const cacheTile = screen
+      .getByText("overview.kpi.cacheHitRate")
+      .closest("div.rounded-md") as HTMLElement;
+    expect(
+      within(errorTile)
+        .getByText(/overview.kpi.deltaUp/)
+        .closest("p")?.className,
+    ).toContain("text-destructive");
+    expect(
+      within(cacheTile)
+        .getByText(/overview.kpi.deltaUp/)
+        .closest("p")?.className,
+    ).toContain("text-state-success");
   });
 
   it("shows a retryable error state when metrics fail to load", async () => {

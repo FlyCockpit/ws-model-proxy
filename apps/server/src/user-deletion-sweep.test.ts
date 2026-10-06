@@ -245,7 +245,8 @@ describe("sweepPendingUserDeletions", () => {
   it.each([
     ["terminal relay execution attempt is immutable", { abandoned: 0, failed: 1 }, "backoff"],
     ["active relay execution ownership is immutable", { abandoned: 0, failed: 1 }, "backoff"],
-    ["provider budget rules are immutable", { abandoned: 1, failed: 0 }, "abandon"],
+    ["provider budget rules are immutable", { abandoned: 0, failed: 1 }, "backoff"],
+    ["provider_budget_settlement is append-only", { abandoned: 1, failed: 0 }, "abandon"],
   ] as const)("a 55000 (%s) during the delete: %j", async (message, outcome, write) => {
     db.user.findMany.mockResolvedValue([row("attempt")]);
     const complete = vi.fn(async () => {

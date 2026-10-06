@@ -23,7 +23,7 @@ impl Screen {
 mod unix;
 
 #[cfg(unix)]
-pub(crate) use unix::{ConfirmAction, ConfirmOutcome, interact};
+pub(crate) use unix::{ConfirmAction, ConfirmOutcome, interact, wait_for_any_key};
 #[cfg(all(unix, test))]
 pub(crate) use unix::{
     Key, KeyReader, RawMode, TokenMatcher, UNKNOWN_SIZE, Wake, confirm_raw_mode, panic_tests_lock,

@@ -10,8 +10,9 @@ export function startCacheAffinityCleanup({
   sweep?: typeof sweepExpiredAffinity;
 } = {}) {
   let running = false;
+  let stopped = false;
   const run = async () => {
-    if (running) return;
+    if (running || stopped) return;
     running = true;
     try {
       let removed: number;
@@ -19,7 +20,7 @@ export function startCacheAffinityCleanup({
         removed = await sweep({ limit: 1000 });
         // The sweep returns records plus nodes (up to 2 x limit): a full batch of
         // either table means more may remain.
-      } while (removed >= 1000);
+      } while (!stopped && removed >= 1000);
     } catch (error) {
       console.error(
         "[cache-affinity] expired-record cleanup failed",
@@ -32,5 +33,8 @@ export function startCacheAffinityCleanup({
   void run();
   const timer = setInterval(() => void run(), intervalMs);
   timer.unref?.();
-  return () => clearInterval(timer);
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
 }

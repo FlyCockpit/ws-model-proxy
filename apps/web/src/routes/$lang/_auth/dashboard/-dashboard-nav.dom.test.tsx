@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ComponentType, ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -99,12 +99,12 @@ describe("dashboard sidebar", () => {
     cleanup();
     agentRequests.count = 2;
     renderLayout();
-    // Sidebar and the mobile strip each badge the Terminals link.
+    // The sidebar's Terminals link and the mobile section button each carry the badge.
     expect(screen.getAllByText("dashboard:agentRequests.badge").length).toBeGreaterThanOrEqual(2);
     expect(screen.getAllByText("2").length).toBeGreaterThanOrEqual(2);
   });
 
-  it("shows the aside at md and hides the horizontal strip at md", () => {
+  it("shows the aside at md and hides the mobile section menu at md", () => {
     useUiPreferences.setState({ sidebarCollapsed: false });
     renderLayout();
     const aside = screen.getByRole("complementary");
@@ -112,8 +112,8 @@ describe("dashboard sidebar", () => {
     expect(aside.className).toContain("md:flex");
     expect(aside.className).toContain("w-56");
     expect(aside.className).not.toContain("w-16");
-    const strip = document.querySelector("[data-dashboard-nav='strip']");
-    expect(strip?.className).toContain("md:hidden");
+    const mobile = document.querySelector("[data-dashboard-nav='mobile']");
+    expect(mobile?.className).toContain("md:hidden");
     expect(screen.getAllByRole("link", { name: "dashboard:nav.terminals" }).length).toBeGreaterThan(
       0,
     );
@@ -199,6 +199,45 @@ describe("dashboard layout flag", () => {
     expect(fill?.className).toContain("min-w-0");
     expect(within(fill as HTMLElement).getByTestId("dashboard-outlet")).toBeTruthy();
     expect(document.querySelector("[data-dashboard-layout='padded']")).toBeNull();
-    expect(document.querySelector("[data-dashboard-nav='strip']")).toBeTruthy();
+    expect(document.querySelector("[data-dashboard-nav='mobile']")).toBeTruthy();
+  });
+
+  it("groups sections in setup order", () => {
+    renderLayout();
+    const aside = screen.getByRole("complementary");
+    const groups = within(aside)
+      .getAllByRole("group")
+      .map((group) => [
+        group.getAttribute("aria-label"),
+        within(group)
+          .getAllByRole("link")
+          .map((link) => link.textContent),
+      ]);
+    expect(groups).toEqual([
+      [null, ["dashboard:nav.overview"]],
+      [
+        "dashboard:nav.groups.hardware",
+        ["dashboard:nav.clis", "dashboard:nav.runtimes", "dashboard:nav.deployments"],
+      ],
+      ["dashboard:nav.groups.routing", ["dashboard:nav.pools", "dashboard:nav.cloudProviders"]],
+      ["dashboard:nav.groups.access", ["dashboard:nav.apiTokens", "dashboard:nav.cliTokens"]],
+      [
+        "dashboard:nav.groups.tools",
+        ["dashboard:nav.chatTest", "dashboard:nav.terminals", "dashboard:nav.requestLog"],
+      ],
+    ]);
+  });
+
+  it("opens every section from the mobile menu and closes after navigating", async () => {
+    renderLayout();
+    const mobile = document.querySelector("[data-dashboard-nav='mobile']") as HTMLElement;
+    const trigger = within(mobile).getByRole("button");
+    expect(trigger.textContent).toContain("dashboard:nav.overview");
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(trigger);
+    const sheet = await screen.findByRole("dialog");
+    expect(within(sheet).getAllByRole("link")).toHaveLength(11);
+    fireEvent.click(within(sheet).getByRole("link", { name: "dashboard:nav.pools" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
   });
 });

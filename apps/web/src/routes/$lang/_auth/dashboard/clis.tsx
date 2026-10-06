@@ -7,5 +7,6 @@ export const Route = createFileRoute("/$lang/_auth/dashboard/clis")({
 });
 
 function CliEndpointsModelsPage() {
-  return <CliEndpointsModelsSection />;
+  const { lang } = Route.useParams();
+  return <CliEndpointsModelsSection lang={lang} />;
 }

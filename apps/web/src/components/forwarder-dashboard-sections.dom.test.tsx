@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 const state = vi.hoisted(() => ({
@@ -19,6 +19,7 @@ vi.mock("react-i18next", () => ({
     // which variables (slugs, not count) reach the translated message.
     t: (key: string, options?: Record<string, unknown>) =>
       options ? `${key}|${JSON.stringify(options)}` : key,
+    i18n: { language: "en-US" },
   }),
 }));
 
@@ -32,6 +33,9 @@ vi.mock("@/components/cli-device-metric-sources", () => ({
 }));
 vi.mock("@/components/cli-device-engine-adapters", () => ({
   CliDeviceEngineAdapters: () => null,
+}));
+vi.mock("@/components/cli-device-node-card", () => ({
+  CliDeviceNodeCard: () => null,
 }));
 
 vi.mock("@/utils/orpc", () => {
@@ -94,7 +98,6 @@ vi.mock("@/utils/orpc", () => {
             initialData: state.cliDevices,
           }),
         },
-        createModelPool: mutation("createModelPool"),
         updateModelPool: mutation("updateModelPool"),
         addPoolMember: mutation("addPoolMember"),
         updatePoolMember: mutation("updatePoolMember"),
@@ -237,6 +240,8 @@ const editablePool = {
   fallbackEnabled: false,
   fallbackForGrantees: false,
   externalAfterWaitMs: 2_000,
+  paidWarmProtectionEnabled: false,
+  embeddingContract: null,
   effectiveProviderEgress: false,
   recommendedSurfaceOverride: null as
     | "ANTHROPIC_MESSAGES"
@@ -253,6 +258,7 @@ const editablePool = {
   cacheHolderWaitMs: null as number | null,
   protection: {
     enabled: true,
+    evictionFeedbackEnabled: true,
     windowSeconds: 300,
     minTokens: 8192,
     share: "EQUAL_SHARE" as "EQUAL_SHARE" | "FIRST_COME" | "FIXED_PERCENT",
@@ -274,20 +280,17 @@ const editablePool = {
 function mount(
   _protocolAdaptationAvailable = true,
   options: {
-    mode?: "create" | "edit";
     capacityAvailability?: "enabled" | "disabled";
     pool?: typeof editablePool;
     sections?: Array<"identity" | "routing" | "capacity" | "media">;
   } = {},
 ) {
-  const mode = options.mode ?? "create";
   return render(
     <QueryClientProvider
       client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
     >
       <PoolForm
-        mode={mode}
-        pool={mode === "edit" ? (options.pool ?? editablePool) : undefined}
+        pool={options.pool ?? editablePool}
         directModels={[]}
         capacities={[]}
         capacityAvailability={options.capacityAvailability ?? "enabled"}
@@ -311,6 +314,26 @@ afterEach(() => {
   vi.mocked(toast.warning).mockClear();
 });
 
+describe("PoolForm capacity limits", () => {
+  it("applies a preset and saves a No limit switch as null", async () => {
+    mount(true, { sections: ["capacity"] });
+
+    fireEvent.click(screen.getByRole("button", { name: "8" }));
+    const noLimit = screen.getAllByRole("switch", { name: "dashboard:pools.capacity.noLimit" });
+    expect(noLimit).toHaveLength(3);
+    fireEvent.click(noLimit[1] as HTMLElement);
+    expect(screen.getByText("dashboard:pools.capacity.noLimitHint")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({
+      capacityConcurrencyLimit: 8,
+      capacityWaitBudgetMs: null,
+      capacityContextCeiling: 32_768,
+    });
+  });
+});
+
 describe("PoolForm protocol adaptation controls", () => {
   it("maps the protocol radio options to the two stored booleans", () => {
     mount();
@@ -328,7 +351,6 @@ describe("PoolForm protocol adaptation controls", () => {
 
   it("shows an invalid stored lossy pair as lossless translation", () => {
     mount(true, {
-      mode: "edit",
       pool: {
         ...editablePool,
         allowLossyDeveloperRoleCollapse: true,
@@ -344,7 +366,6 @@ describe("PoolForm protocol adaptation controls", () => {
 
   it("does not migrate an invalid protocol pair when saving a non-routing section", async () => {
     mount(true, {
-      mode: "edit",
       pool: {
         ...editablePool,
         allowLossyDeveloperRoleCollapse: true,
@@ -362,7 +383,6 @@ describe("PoolForm protocol adaptation controls", () => {
 
   it("repairs an untouched invalid routing pair without enabling adaptation", async () => {
     mount(true, {
-      mode: "edit",
       pool: {
         ...editablePool,
         allowLossyDeveloperRoleCollapse: true,
@@ -384,7 +404,7 @@ describe("PoolForm protocol adaptation controls", () => {
   });
 
   it("omits unchanged selectability-gated routing fields on edit (W5)", async () => {
-    mount(true, { mode: "edit", sections: ["routing"] });
+    mount(true, { sections: ["routing"] });
 
     fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
 
@@ -398,7 +418,6 @@ describe("PoolForm protocol adaptation controls", () => {
 
   it("sends the override when the user clears a stored surface", async () => {
     mount(true, {
-      mode: "edit",
       sections: ["routing"],
       pool: { ...editablePool, recommendedSurfaceOverride: "OPENAI_RESPONSES" },
     });
@@ -416,7 +435,7 @@ describe("PoolForm protocol adaptation controls", () => {
   });
 
   it("sends the override when the user sets a surface on an automatic pool", async () => {
-    mount(true, { mode: "edit", sections: ["routing"] });
+    mount(true, { sections: ["routing"] });
 
     fireEvent.change(screen.getByLabelText("dashboard:pools.recommendedSurfaceOverride"), {
       target: { value: "OPENAI_RESPONSES" },
@@ -431,7 +450,7 @@ describe("PoolForm protocol adaptation controls", () => {
   });
 
   it("sends adaptation when changed and the override when unchanged separately", async () => {
-    mount(true, { mode: "edit", sections: ["routing"] });
+    mount(true, { sections: ["routing"] });
 
     fireEvent.click(screen.getByLabelText("dashboard:pools.protocolOptions.lossless.label"));
     fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
@@ -445,7 +464,6 @@ describe("PoolForm protocol adaptation controls", () => {
 
   it("omits the stored override on routing save when the control is untouched", async () => {
     mount(true, {
-      mode: "edit",
       sections: ["routing"],
       pool: { ...editablePool, recommendedSurfaceOverride: "OPENAI_RESPONSES" },
     });
@@ -459,7 +477,6 @@ describe("PoolForm protocol adaptation controls", () => {
 
   it("omits a stored enabled adaptation on routing save when the control is untouched", async () => {
     mount(true, {
-      mode: "edit",
       sections: ["routing"],
       pool: { ...editablePool, protocolAdaptationEnabled: true },
     });
@@ -473,7 +490,6 @@ describe("PoolForm protocol adaptation controls", () => {
 
   it("sends protocolAdaptationEnabled false when the user disables a stored adaptation", async () => {
     mount(true, {
-      mode: "edit",
       sections: ["routing"],
       pool: { ...editablePool, protocolAdaptationEnabled: true },
     });
@@ -491,20 +507,17 @@ describe("PoolForm protocol adaptation controls", () => {
   it("saves exactly one pool mutation without a sheet", async () => {
     mount();
 
-    fireEvent.change(screen.getByLabelText("dashboard:pools.slug"), {
-      target: { value: "primary" },
-    });
     fireEvent.change(screen.getByLabelText("dashboard:pools.name"), {
       target: { value: "Primary" },
     });
     fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
 
-    await waitFor(() => expect(state.mutationCalls).toEqual(["createModelPool"]));
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("saves a capacity-enabled edit through updateModelPool with all capacity fields", async () => {
-    mount(true, { mode: "edit", capacityAvailability: "enabled" });
+    mount(true, { capacityAvailability: "enabled" });
 
     fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
 
@@ -533,7 +546,7 @@ describe("PoolForm protocol adaptation controls", () => {
         data: { reason: "SURFACE_NOT_SUPPORTED" },
       }),
     };
-    mount(true, { mode: "edit", sections: ["routing"] });
+    mount(true, { sections: ["routing"] });
 
     fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
 
@@ -576,7 +589,7 @@ describe("PoolForm protocol adaptation controls", () => {
       data: { reason: "PROVIDER_NOT_READY" },
     });
     state.nextReject = { name: "updateModelPool", error: other };
-    mount(true, { mode: "edit", sections: ["routing"] });
+    mount(true, { sections: ["routing"] });
 
     const save = screen.getByRole("button", { name: "common:actions.save" });
     fireEvent.click(save);
@@ -593,42 +606,8 @@ describe("PoolForm protocol adaptation controls", () => {
 });
 
 describe("PoolForm affinity defaults", () => {
-  it("initializes the affinity toggle checked in create mode and submits true", async () => {
-    mount();
-
-    const toggle = screen.getByLabelText("dashboard:pools.affinity.enabled");
-    expect((toggle as HTMLInputElement).checked).toBe(true);
-
-    fireEvent.change(screen.getByLabelText("dashboard:pools.slug"), {
-      target: { value: "primary" },
-    });
-    fireEvent.change(screen.getByLabelText("dashboard:pools.name"), {
-      target: { value: "Primary" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
-
-    await waitFor(() => expect(state.mutationCalls).toEqual(["createModelPool"]));
-    expect(state.mutationPayloads[0]?.input).toMatchObject({ affinityEnabled: true });
-  });
-
-  it("submits an explicit opt-out when the create-mode toggle is unchecked", async () => {
-    mount();
-
-    fireEvent.click(screen.getByLabelText("dashboard:pools.affinity.enabled"));
-    fireEvent.change(screen.getByLabelText("dashboard:pools.slug"), {
-      target: { value: "primary" },
-    });
-    fireEvent.change(screen.getByLabelText("dashboard:pools.name"), {
-      target: { value: "Primary" },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
-
-    await waitFor(() => expect(state.mutationCalls).toEqual(["createModelPool"]));
-    expect(state.mutationPayloads[0]?.input).toMatchObject({ affinityEnabled: false });
-  });
-
   it("renders and submits the new-conversation residency weight", async () => {
-    mount(true, { mode: "edit", sections: ["routing"] });
+    mount(true, { sections: ["routing"] });
     const field = screen.getByLabelText(
       "dashboard:pools.affinity.fields.affinityResidencyWeight",
     ) as HTMLInputElement;
@@ -640,7 +619,7 @@ describe("PoolForm affinity defaults", () => {
   });
 
   it("saves the cache-holder wait as automatic (null) or a fixed value (0 = off)", async () => {
-    mount(true, { mode: "edit", sections: ["routing"] });
+    mount(true, { sections: ["routing"] });
     const mode = screen.getByLabelText(
       "dashboard:pools.affinity.fields.cacheHolderWaitMs",
     ) as HTMLSelectElement;
@@ -659,11 +638,12 @@ describe("PoolForm affinity defaults", () => {
   });
 
   it("saves warm-session protection settings (share mode, fixed percent, owner share)", async () => {
-    mount(true, { mode: "edit", sections: ["routing"] });
+    mount(true, { sections: ["routing"] });
     fireEvent.click(screen.getByRole("button", { name: "common:actions.save" }));
     await waitFor(() => expect(state.mutationCalls).toEqual(["updateModelPool"]));
     expect(state.mutationPayloads[0]?.input).toMatchObject({
       protectionEnabled: true,
+      evictionFeedbackEnabled: true,
       protectionWindowSeconds: 300,
       protectMinTokens: 8192,
       protectionShare: "EQUAL_SHARE",
@@ -696,7 +676,7 @@ describe("PoolForm affinity defaults", () => {
   });
 
   it("does not validate hidden percent fields (a stale invalid value never blocks save)", async () => {
-    mount(true, { mode: "edit", sections: ["routing"] });
+    mount(true, { sections: ["routing"] });
     const share = screen.getByLabelText("dashboard:pools.protection.share");
     fireEvent.change(share, { target: { value: "FIXED_PERCENT" } });
     fireEvent.change(screen.getByLabelText("dashboard:pools.protection.fixedPercent"), {
@@ -713,7 +693,7 @@ describe("PoolForm affinity defaults", () => {
   });
 
   it("does not validate a hidden owner percent (PERCENT back to INHERIT still saves)", async () => {
-    mount(true, { mode: "edit", sections: ["routing"] });
+    mount(true, { sections: ["routing"] });
     const owner = screen.getByLabelText("dashboard:pools.protection.ownerShare");
     fireEvent.change(owner, { target: { value: "PERCENT" } });
     fireEvent.change(screen.getByLabelText("dashboard:pools.protection.percentLabel"), {
@@ -727,7 +707,6 @@ describe("PoolForm affinity defaults", () => {
 
   it("loads a stored owner protection percent", () => {
     mount(true, {
-      mode: "edit",
       sections: ["routing"],
       pool: { ...editablePool, protection: { ...editablePool.protection, ownerPercent: 40 } },
     });
@@ -741,7 +720,6 @@ describe("PoolForm affinity defaults", () => {
 
   it("loads a stored fixed cache-holder wait", () => {
     mount(true, {
-      mode: "edit",
       sections: ["routing"],
       pool: { ...editablePool, cacheHolderWaitMs: 1_500 },
     });
@@ -763,7 +741,6 @@ describe("PoolForm affinity defaults", () => {
 
   it("keeps a stored cache-holder wait of 0 (off) as a fixed value on save", async () => {
     mount(true, {
-      mode: "edit",
       sections: ["routing"],
       pool: { ...editablePool, cacheHolderWaitMs: 0 },
     });
@@ -790,7 +767,7 @@ describe("PoolForm affinity defaults", () => {
   it("loads the stored affinity value in edit mode", () => {
     // editablePool stores affinity disabled; the edit form must keep it off
     // instead of falling back to the create-mode ON default.
-    mount(true, { mode: "edit" });
+    mount();
 
     expect(
       (screen.getByLabelText("dashboard:pools.affinity.enabled") as HTMLInputElement).checked,
@@ -996,7 +973,7 @@ describe("CliEndpointsModelsSection capability-impact advisory", () => {
       <QueryClientProvider
         client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
       >
-        <CliEndpointsModelsSection />
+        <CliEndpointsModelsSection lang="en-US" />
       </QueryClientProvider>,
     );
   }
@@ -1006,7 +983,9 @@ describe("CliEndpointsModelsSection capability-impact advisory", () => {
     state.capabilityImpact = [{ id: "pool-1", slug: "alpha", surface: "OPENAI_RESPONSES" }];
     mountModelsSection();
 
-    fireEvent.click(screen.getByLabelText("dashboard:models.vision"));
+    // Capability toggles live in the model's Configure sheet.
+    fireEvent.click(screen.getByRole("button", { name: /^dashboard:models\.configureLabel/ }));
+    fireEvent.click(await screen.findByLabelText("dashboard:models.vision"));
 
     await waitFor(() => expect(state.mutationCalls).toEqual(["updateDiscoveredModelCapabilities"]));
     await waitFor(() =>
@@ -1018,6 +997,66 @@ describe("CliEndpointsModelsSection capability-impact advisory", () => {
         `dashboard:models.capabilityImpact|${JSON.stringify({ slugs: "alpha" })}`,
       ),
     );
+  });
+
+  it("builds the next capability save on refetched data, not the snapshot taken at open", async () => {
+    state.cliDevices = [cliDeviceWithModel];
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <CliEndpointsModelsSection lang="en-US" />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /^dashboard:models\.configureLabel/ }));
+    const vision = (await screen.findByLabelText("dashboard:models.vision")) as HTMLInputElement;
+    expect(vision.checked).toBe(false);
+
+    // A refetch after an earlier save now reports vision on.
+    const [device] = state.cliDevices as [typeof cliDeviceWithModel];
+    const [endpoint] = device.endpoints;
+    const [model] = endpoint!.models;
+    act(() =>
+      client.setQueryData(
+        ["cliDevices"],
+        [
+          {
+            ...device,
+            endpoints: [
+              {
+                ...endpoint,
+                models: [
+                  {
+                    ...model,
+                    capabilityOverrideMode: "OVERRIDE",
+                    capabilityOverrides: ["VISION_INPUT"],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      ),
+    );
+    await waitFor(() =>
+      expect((screen.getByLabelText("dashboard:models.vision") as HTMLInputElement).checked).toBe(
+        true,
+      ),
+    );
+    fireEvent.click(screen.getByLabelText("dashboard:models.audio"));
+
+    await waitFor(() => expect(state.mutationCalls).toEqual(["updateDiscoveredModelCapabilities"]));
+    expect(state.mutationPayloads[0]?.input).toMatchObject({ vision: true, audio: true });
+  });
+
+  it("shows a refused credential identity on that device only", () => {
+    state.cliDevices = [
+      { ...cliDeviceWithModel, identityRefusedAt: new Date("2026-09-28T10:00:00.000Z") },
+      { ...cliDeviceWithModel, id: "cli-2", slug: "laptop", identityRefusedAt: null },
+    ];
+    mountModelsSection();
+
+    expect(screen.getAllByText("dashboard:clis.identityRefused")).toHaveLength(1);
+    expect(screen.getByText(/^dashboard:clis\.identityRefusedDetail\|/)).toBeTruthy();
   });
 
   it("flags a device whose CLI must be upgraded for the relay protocol", () => {
@@ -1073,7 +1112,9 @@ describe("CliEndpointsModelsSection capability-impact advisory", () => {
     state.capabilityImpact = [];
     mountModelsSection();
 
-    fireEvent.click(screen.getByLabelText("dashboard:models.vision"));
+    // Capability toggles live in the model's Configure sheet.
+    fireEvent.click(screen.getByRole("button", { name: /^dashboard:models\.configureLabel/ }));
+    fireEvent.click(await screen.findByLabelText("dashboard:models.vision"));
 
     await waitFor(() => expect(state.mutationCalls).toEqual(["updateDiscoveredModelCapabilities"]));
     await waitFor(() =>
@@ -1094,7 +1135,7 @@ describe("CliEndpointsModelsSection delete conflicts", () => {
           })
         }
       >
-        <CliEndpointsModelsSection />
+        <CliEndpointsModelsSection lang="en-US" />
       </QueryClientProvider>,
     );
   }
@@ -1105,18 +1146,18 @@ describe("CliEndpointsModelsSection delete conflicts", () => {
   }
 
   it.each([
-    ["removeCliDeviceMetadata", 0, "desk", "retained_history", "retainedHistory.cliDevice"],
-    ["removeEndpointMetadata", 1, "desk/local", "delete_pending", "deletePending"],
+    ["removeCliDeviceMetadata", "cli", "desk", "retained_history", "retainedHistory.cliDevice"],
+    ["removeEndpointMetadata", "endpoint", "desk/local", "delete_pending", "deletePending"],
     [
       "removeDiscoveredModelMetadata",
-      -1,
+      "model",
       "owner/desk/local/example",
       "retained_history",
       "retainedHistory.discoveredModel",
     ],
-  ])(
+  ] as const)(
     "%s: a structured CONFLICT shows its specific copy, not the generic one",
-    async (name, buttonIndex, token, reason, key) => {
+    async (name, target, token, reason, key) => {
       state.cliDevices = [cliDeviceWithModel];
       state.nextReject = {
         name,
@@ -1124,11 +1165,18 @@ describe("CliEndpointsModelsSection delete conflicts", () => {
       };
       mountWithAppToasts();
 
-      if (buttonIndex < 0) {
-        fireEvent.click(screen.getByRole("button", { name: "dashboard:metadata.deleteModel" }));
-      } else {
+      if (target === "cli") {
+        // Removing a CLI signs it out, so it sits in the device's overflow menu.
+        fireEvent.click(screen.getByRole("button", { name: /^dashboard:clis\.moreActions/ }));
         fireEvent.click(
-          screen.getAllByRole("button", { name: "dashboard:metadata.delete" })[buttonIndex],
+          await screen.findByRole("menuitem", { name: "dashboard:clis.removeAndSignOut" }),
+        );
+      } else if (target === "endpoint") {
+        fireEvent.click(screen.getByRole("button", { name: "dashboard:endpoints.forget" }));
+      } else {
+        fireEvent.click(screen.getByRole("button", { name: /^dashboard:models\.configureLabel/ }));
+        fireEvent.click(
+          await screen.findByRole("button", { name: "dashboard:metadata.deleteModel" }),
         );
       }
       await confirmDelete(token);
@@ -1148,7 +1196,7 @@ describe("CliEndpointsModelsSection device names", () => {
       <QueryClientProvider
         client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
       >
-        <CliEndpointsModelsSection />
+        <CliEndpointsModelsSection lang="en-US" />
       </QueryClientProvider>,
     );
   }
@@ -1177,19 +1225,18 @@ describe("CliEndpointsModelsSection device names", () => {
     ];
     mountDevices();
 
-    // The CliAgentActivity section (AC 7): one collapsed toggle per device,
-    // labelled by that device, with its content hidden until opened.
-    const show = (name: string) => `clis.activity.show|${JSON.stringify({ name })}`;
-    expect(screen.getByRole("button", { name: show("desk-01.local") })).toBeTruthy();
-    expect(screen.getByRole("button", { name: show("Work laptop") })).toBeTruthy();
-    expect(screen.getAllByText("clis.activity.title")).toHaveLength(2);
+    // Each device has its own Activity tab (AC 7); nothing is fetched until it is opened.
+    const tabs = screen.getAllByRole("tab", { name: "dashboard:clis.tabs.activity" });
+    expect(tabs).toHaveLength(2);
+    expect(state.activityInputs).toHaveLength(0);
 
-    // Opening a device's section queries that device by its id, not its slug:
+    // Opening a device's tab queries that device by its id, not its slug:
     // the audit list is keyed by cliDeviceId, so a slug would silently show
     // another (nonexistent) device's empty log.
-    fireEvent.click(screen.getByRole("button", { name: show("Work laptop") }));
+    fireEvent.click(tabs[1]!);
     await waitFor(() => expect(state.activityInputs.length).toBeGreaterThan(0));
     expect(state.activityInputs.every((input) => input?.cliDeviceId === "cli-2")).toBe(true);
+    expect(screen.getAllByText("clis.activity.title")).toHaveLength(1);
   });
 
   it("finds a device by display name, hostname, or slug", () => {

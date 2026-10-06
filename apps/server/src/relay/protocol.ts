@@ -6,9 +6,20 @@ import {
   RELAY_MIN_PROTOCOL_VERSION,
   RELAY_PROTOCOL_VERSIONS,
   type RelayProtocolVersion,
+  refusedRelayProtocolReason,
   relayProtocolAtLeast,
 } from "@ws-model-proxy/api/lib/relay-protocol-version";
+import { adapterRouteIsValid } from "@ws-model-proxy/api/lib/remote-engine-adapters";
 import { normalizeReportedHostname } from "@ws-model-proxy/config/cli-device-name";
+import {
+  deploymentJobOperatorValid,
+  isCanonicalBase64Url16,
+} from "@ws-model-proxy/config/deployment-job-wire";
+import {
+  DEPLOYMENT_OPERATOR_RESULT_STATUSES,
+  type DeploymentJob,
+  deploymentOperatorResultStatus,
+} from "@ws-model-proxy/config/deployment-protocol";
 import { z } from "zod";
 import {
   FILE_BODY_MAX_BYTES,
@@ -28,19 +39,32 @@ export {
   RELAY_MIN_PROTOCOL_VERSION,
   RELAY_PROTOCOL_VERSIONS,
   type RelayProtocolVersion,
+  refusedRelayProtocolReason,
   relayProtocolAtLeast,
 };
 
 type FileSpawnSpec = z.infer<typeof fileSpawnSpecSchema>;
 
 /**
- * Sent as `protocol.error` to a CLI whose hello is older than 2.8. Every
+ * Sent as `protocol.error` to a CLI whose hello is older than 2.4. Every
  * released wsmp prints `relay protocol error: <message>` and exits, so this
  * text is what the person sees. It names the protocol rather than a wsmp
- * version: the first release that speaks 2.8 is cut separately.
+ * version: the first release that speaks 2.4 is cut separately.
  */
 export const RELAY_UPGRADE_REQUIRED_MESSAGE = `This server requires a newer wsmp (relay protocol ${RELAY_MIN_PROTOCOL_VERSION}). Upgrade wsmp and restart it.`;
+export const RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE =
+  "This wsmp speaks a newer relay protocol than the server. Upgrade WS Model Proxy and restart the CLI.";
 export const RELAY_SUBPROTOCOL = "ws-model-proxy.relay.v2";
+
+export const RELAY_PROTOCOL_ERROR_CODES = [
+  "upgrade_cli",
+  "upgrade_server",
+  "identity_mismatch",
+  "access_denied",
+  "malformed",
+  "internal",
+] as const;
+export type RelayProtocolErrorCode = (typeof RELAY_PROTOCOL_ERROR_CODES)[number];
 
 const RELAY_JSON_CONTROL_MAX_BYTES = 64 * 1024;
 export const RELAY_BINARY_CHUNK_MAX_BYTES = 1024 * 1024;
@@ -91,13 +115,10 @@ const orderedHeadersSchema = z.array(z.tuple([headerNameSchema, headerValueSchem
 
 export { type OpenAiCompatibleCapabilities, openAiCompatibleCapabilitiesSchema };
 
-/** 16 raw bytes, unpadded base64url (22 characters). */
+/** 16 raw bytes, canonical unpadded base64url (22 characters, zero trailing bits). */
 export const base64Url16ByteSchema = z
   .string()
-  .regex(/^[A-Za-z0-9_-]{22}$/)
-  .refine((value) => Buffer.from(value, "base64url").length === 16, {
-    message: "Expected 16 bytes of base64url.",
-  });
+  .refine(isCanonicalBase64Url16, { message: "Expected 16 bytes of canonical base64url." });
 
 /** Uncompressed P-256 point: 65 bytes, leading 0x04, unpadded base64url (87 characters). */
 export const uncompressedP256PublicKeySchema = z
@@ -117,9 +138,10 @@ export const p256SignatureSchema = z
   });
 
 /**
- * 2.5: the CLI's long-lived identity key and its signature over
+ * The CLI's long-lived identity key and its signature over
  * `lp16("wsmp-term-cli-id-v1") ‖ lp16(cliSlug) ‖ terminalPublicKey`. The relay
- * does not verify it; browsers do, and pin the key per CLI device.
+ * does not verify this ECDH proof; browsers do, and pin the key per CLI device.
+ * Hello also signs a server nonce with the same key (`cli.identitySignature`).
  */
 export const cliTerminalIdentitySchema = z
   .object({
@@ -143,64 +165,41 @@ const terminalIdentitySchema = z
 
 const mcpCommandModeSchema = z.enum(["off", "supervised", "unsupervised"]);
 
-const v28FeatureSchema = z
+const cliFeatureSchema = z
   .object({
     humanTerminal: z.boolean(),
     /** The CLI's own MCP command policy (`wsmp config set-mcp-commands`). */
     mcpCommandMode: mcpCommandModeSchema,
     terminalApproval: z.boolean(),
     terminalSupported: z.boolean(),
-    /**
-     * 2.7: the CLI accepts remotely defined metric sources
-     * (`metrics.sources.set`): its local opt-in is on. False until S-B part 2.
-     */
+    /** The CLI accepts remotely defined metric sources (`metrics.sources.set`). */
     remoteMetricSources: z.boolean(),
-    /**
-     * 2.9: the CLI accepts remotely defined engine adapters
-     * (`engine.adapters.set`): its local `allowRemoteEngineAdapters` opt-in
-     * is on. Absent on 2.8 hellos.
-     */
-    remoteEngineAdapters: z.boolean().optional(),
-    /**
-     * 2.8: the CLI's read-only file grant (`wsmp config set-file-read`), read
-     * from the CLI's own startup switch and reported on every hello.
-     */
+    /** The CLI accepts remotely defined engine adapters (`engine.adapters.set`). */
+    remoteEngineAdapters: z.boolean(),
+    /** The CLI's read-only file grant (`wsmp config set-file-read`). */
     mcpFileRead: z.boolean(),
-    /** 2.8: the CLI has `fileRoots` configured (mandatory for the read grant). */
+    /** The CLI has `fileRoots` configured (mandatory for the read grant). */
     fileRootsConfigured: z.boolean(),
-    /** 2.8: `wsmp config set-file-tools-as-root on` (default off). */
+    /** `wsmp config set-file-tools-as-root on` (default off). */
     allowFileToolsAsRoot: z.boolean(),
+    deployments: z.boolean().optional().default(false),
+    /**
+     * The CLI can run interactive deployment commands in an operator terminal. Counts only
+     * with `deployments` (`deploymentOperatorSupported`).
+     */
+    deploymentOperator: z.boolean().optional().default(false),
   })
   .strict();
 
 /**
- * 2.6: multi-viewer terminals (server-minted viewer ids, broadcast output),
- * CLI identity proof, and supervised terminals (`term.spawn`). 2.7: node
- * telemetry. 2.8: node file tools.
+ * Hello capabilities: only fields that vary per CLI. Protocol 2.4 always
+ * implements inventory, binary frames, terminals, exec, node telemetry,
+ * file ops, and context.count.
  */
-const v28CliCapabilitiesSchema = z
+const cliCapabilitiesSchema = z
   .object({
-    protocolVersion: z.enum(["2.8", "2.9"]),
-    inventoryAck: z.literal(true),
-    inventoryReplace: z.literal(true),
-    endpointTargeting: z.literal(true),
-    binaryFrames: z.literal(true),
-    cancellation: z.literal(true),
-    maxBinaryChunkBytes: z.literal(RELAY_BINARY_CHUNK_MAX_BYTES),
-    requestBodyStreaming: z.literal(true),
-    requestBodyWindowChunks: z.literal(RELAY_REQUEST_BODY_WINDOW_CHUNKS),
-    sharedTokenizerTps: z.literal(true),
-    standardizedMetrics: z.literal(true),
-    terminal: z.literal(true),
-    exec: z.literal(true),
-    features: v28FeatureSchema,
+    features: cliFeatureSchema,
     terminalPublicKey: uncompressedP256PublicKeySchema,
-    terminalViewers: z.literal(true),
-    supervisedCommands: z.literal(true),
-    /** 2.7: the CLI sends `node.info`, `node.metrics` and `endpoint.load`. */
-    nodeTelemetry: z.literal(true),
-    /** 2.8: the CLI runs `file.op` (answers `unsupported` for ops it has not implemented). */
-    fileOps: z.literal(true),
     /** Absent when the CLI could not load its identity; browsers then refuse it. */
     terminalIdentity: cliTerminalIdentitySchema.optional(),
   })
@@ -270,6 +269,17 @@ export const engineFactsSchema = z
       })
       .strict()
       .optional(),
+    /** Chat Completions tokenize fact recorded at probe time. */
+    countContext: engineFact(
+      z.enum([
+        "unsupported",
+        "vllm_tokenize",
+        "tgi_chat_tokenize",
+        "llama_apply_template",
+        "llama_input_tokens",
+        "adapter_count",
+      ]),
+    ).optional(),
   })
   .strict();
 
@@ -290,6 +300,7 @@ const discoveredModelSchema = z
 const endpointInventorySchema = z
   .object({
     slug: z.string().trim().min(1).max(63),
+    deploymentInstanceId: z.string().min(1).max(128).optional(),
     label: z.string().trim().min(1).max(160),
     kind: z.enum(["openai-compatible", "anthropic-compatible"]),
     status: z.enum(["unknown", "online", "degraded", "offline"]).default("unknown"),
@@ -423,7 +434,18 @@ const nodeInfoSchema = z
       )
       .max(32)
       .optional(),
-    executionMechanism: z.enum(["foreground", "systemd", "launchd", "container"]).optional(),
+    executionMechanism: z
+      .enum([
+        "foreground",
+        "systemd",
+        "launchd",
+        "container",
+        "systemd+linger",
+        "systemd-no-linger",
+        "macos",
+        "unsupported",
+      ])
+      .optional(),
     cliVersion: storedTextSchema(80).optional(),
   })
   .strict();
@@ -554,6 +576,8 @@ const nodeMetricsSchema = z
       )
       .max(NODE_ENGINE_ADAPTERS_MAX)
       .optional(),
+    /** Abandoned `.wsmp-recover-*` directories indexed by this CLI. Omitted when zero. */
+    abandonedRecovery: z.number().int().min(0).max(10_000).optional(),
   })
   .strict();
 export type NodeMetricsMessage = z.infer<typeof nodeMetricsSchema>;
@@ -574,6 +598,16 @@ const endpointLoadSchema = z
     deferred: nonNegativeCountSchema.optional(),
     prefixCacheHitsDelta: byteCounterSchema.optional(),
     prefixCacheQueriesDelta: byteCounterSchema.optional(),
+    /** Engine prefix-cache counters dropped (restart / flush). Not a delta. */
+    prefixCacheReset: z.literal(true).optional(),
+    /**
+     * Monotonic per-endpoint counter generation. The CLI bumps it when prefix
+     * counters drop or the engine identity changes, and always sends
+     * `prefixCacheReset` on a bump. Required on 2.4; the server resets
+     * KV-eviction state only when this value changes, including the first
+     * frame after a replica or reboot that stored a different epoch.
+     */
+    counterEpoch: z.number().int().min(0).max(4_294_967_295),
     source: z.enum([
       "llama.cpp-slots",
       "llama.cpp-metrics",
@@ -630,24 +664,10 @@ const adapterRouteSchema = z
   .string()
   .min(1)
   .max(1024)
-  .refine(
-    (route) => {
-      const trimmed = route.trim();
-      return (
-        trimmed.length > 0 &&
-        !trimmed.includes("\u0000") &&
-        !trimmed.includes("\\") &&
-        !trimmed.includes("://") &&
-        !trimmed.startsWith("//") &&
-        !trimmed.includes("..") &&
-        !trimmed.includes("?") &&
-        !trimmed.includes("#")
-      );
-    },
-    {
-      message: "adapter route must be a relative path with no scheme, host, .., query, or fragment",
-    },
-  );
+  .refine((route) => adapterRouteIsValid(route), {
+    message:
+      "adapter route must start with / and stay on the endpoint origin (no scheme, host, whitespace, .., query, or fragment)",
+  });
 
 const remoteEngineAdapterInputSchema = z.union([
   z.object({ route: adapterRouteSchema }).strict(),
@@ -706,6 +726,7 @@ export const remoteEngineAdapterSchema = z
           .strict(),
       )
       .optional(),
+    countRoute: adapterRouteSchema.optional(),
   })
   .strict();
 export type RemoteEngineAdapter = z.infer<typeof remoteEngineAdapterSchema>;
@@ -716,25 +737,112 @@ export const remoteEngineAdaptersSchema = z
 const relayClientControlMessageSchema = z.discriminatedUnion("type", [
   z
     .object({
+      type: z.literal("deployment.job.result"),
+      stepId: requestIdSchema,
+      instanceId: requestIdSchema,
+      rank: z.number().int().min(0).max(63),
+      intentHash: z.string().regex(/^[a-f0-9]{64}$/),
+      ownerEpoch: requestIdSchema,
+      status: z.enum(["succeeded", "failed", "running", ...DEPLOYMENT_OPERATOR_RESULT_STATUSES]),
+      stopped: z.boolean(),
+      error: z
+        .string()
+        .regex(/^[a-z0-9_]{1,64}$/)
+        .optional(),
+      /**
+       * The job's `operator.terminalId`. Required on operator progress; also on every
+       * final (`succeeded`/`failed`) of an interactive job, which binds it to its dispatch.
+       */
+      terminalId: base64Url16ByteSchema.optional(),
+      /** `operator_closed`: the last attempt's exit code. */
+      exitCode: z.number().int().min(0).max(255).optional(),
+    })
+    .strict()
+    .superRefine((result, ctx) => {
+      const operator = deploymentOperatorResultStatus(result.status);
+      if (
+        operator
+          ? result.terminalId === undefined
+          : result.status === "running" && result.terminalId !== undefined
+      )
+        ctx.addIssue({
+          code: "custom",
+          path: ["terminalId"],
+          message: "terminalId is present on operator statuses and interactive finals only.",
+        });
+      if (result.exitCode !== undefined && result.status !== "operator_closed")
+        ctx.addIssue({
+          code: "custom",
+          path: ["exitCode"],
+          message: "Only operator_closed carries an exit code.",
+        });
+      if (operator && result.stopped)
+        ctx.addIssue({
+          code: "custom",
+          path: ["stopped"],
+          message: "Operator progress never reports a stop.",
+        });
+    }),
+  z
+    .object({
+      type: z.literal("deployment.instances"),
+      snapshotId: z.string().regex(/^[a-zA-Z0-9]{32}$/),
+      chunkIndex: z.number().int().min(0).max(131071),
+      final: z.boolean(),
+      instances: z
+        .array(
+          z
+            .object({
+              instanceId: requestIdSchema,
+              revisionId: requestIdSchema,
+              rank: z.number().int().min(0).max(63),
+              intentHash: z.string().regex(/^[a-f0-9]{64}$/),
+              stepId: requestIdSchema.optional(),
+              phase: z.enum(["starting", "ready", "unhealthy", "stopping", "stopped", "unknown"]),
+              unitName: z
+                .string()
+                .regex(/^wsmp-i-[a-zA-Z0-9]+-r[0-9]+$/)
+                .max(160),
+              port: z.number().int().min(1).max(65535),
+              endpointSlug: z.string().min(1).max(63),
+              models: z.array(z.string().min(1).max(256)).max(64),
+              contextWindow: z.number().int().positive().nullable(),
+            })
+            .strict(),
+        )
+        .max(512),
+    })
+    .strict(),
+  z
+    .object({
       type: z.literal("hello"),
       id: requestIdSchema,
-      protocolVersion: z.enum(["2.8", "2.9"]),
+      protocolVersion: z.enum(RELAY_PROTOCOL_VERSIONS),
       cli: z
         .object({
           slug: z.string().trim().min(1).max(63),
-          // A fact about the machine, stored as CliDevice.reportedHostname.
+          // A display label, stored as CliDevice.reportedHostname. Spoofable
+          // (`hostnamectl`); not what a device credential is bound to.
           // Normalized rather than rejected so an odd hostname never blocks hello.
           hostname: z.string().max(1024).nullish().transform(normalizeReportedHostname),
           version: z.string().trim().max(80).optional(),
-          capabilities: v28CliCapabilitiesSchema,
+          // Persistent P-256 identity public key. Login and CLI-token TOFU bind
+          // to this key; hello must prove possession with `identitySignature`.
+          identityPublicKey: uncompressedP256PublicKeySchema,
+          // Signature over the server nonce from `hello.challenge`.
+          identitySignature: p256SignatureSchema,
+          capabilities: cliCapabilitiesSchema,
         })
-        .strict(),
+        .strict()
+        .refine(
+          (cli) =>
+            cli.capabilities.terminalIdentity === undefined ||
+            cli.capabilities.terminalIdentity.publicKey === cli.identityPublicKey,
+          { message: "terminalIdentity.publicKey must match identityPublicKey." },
+        ),
       endpoints: z.array(endpointInventorySchema).max(100).default([]),
     })
-    .strict()
-    .refine((message) => message.protocolVersion === message.cli.capabilities.protocolVersion, {
-      message: "Relay protocol version must match CLI capabilities.",
-    }),
+    .strict(),
   z
     .object({
       type: z.literal("inventory.update"),
@@ -802,6 +910,28 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
     .strict(),
   z
     .object({
+      type: z.literal("context.count.result"),
+      requestId: requestIdSchema,
+      tokens: z.number().int().min(0).max(TOKEN_COUNT_MAX),
+      method: z.enum([
+        "vllm_tokenize",
+        "tgi_chat_tokenize",
+        "llama_apply_template",
+        "llama_input_tokens",
+        "adapter_count",
+      ]),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("context.count.error"),
+      requestId: requestIdSchema,
+      failure: relayFailureSchema,
+      message: z.string().max(1000).optional(),
+    })
+    .strict(),
+  z
+    .object({
       type: z.literal("term.pending"),
       terminalId: base64Url16ByteSchema,
       viewerId: viewerIdSchema.optional(),
@@ -853,7 +983,7 @@ const relayClientControlMessageSchema = z.discriminatedUnion("type", [
       /** The CLI's input queue for this viewer was full. Sent once per run of drops. */
       type: z.literal("term.input_dropped"),
       terminalId: base64Url16ByteSchema,
-      /** Omitted on 2.4 terminals. */
+      /** Omitted only when the CLI has no viewer id for the drop. */
       viewerId: viewerIdSchema.optional(),
     })
     .strict(),
@@ -965,6 +1095,8 @@ export type DesiredModelCapability = {
 export type TerminalHandshakeIdentity = z.infer<typeof terminalIdentitySchema>;
 
 export type RelayServerControlMessage =
+  | DeploymentJob
+  | { type: "deployment.instances.ok"; snapshotId: string }
   | {
       type: "hello.ok";
       id: string;
@@ -1000,9 +1132,30 @@ export type RelayServerControlMessage =
       // this request (true when the request carries a body). When false the CLI
       // forwards the request to upstream immediately with an empty body.
       expectBody: boolean;
+      /**
+       * Near-ceiling Chat Completions: the CLI tokenizes this body first, then
+       * either forwards it upstream or returns `relay.error` `request_too_large`.
+       * The body crosses the websocket once. Omit or false for every other family.
+       */
+      countFirst?: boolean;
+      /** Inclusive token ceiling the CLI uses when `countFirst` is true. */
+      countCeiling?: number;
     }
   | { type: "relay.cancel"; requestId: string; reason: RelayFailure }
-  | { type: "protocol.error"; failure: "protocol_error"; message: string; requestId?: string }
+  | {
+      type: "protocol.error";
+      failure: "protocol_error";
+      code: RelayProtocolErrorCode;
+      message: string;
+      supportedVersions: readonly RelayProtocolVersion[];
+      requestId?: string;
+    }
+  | {
+      type: "hello.challenge";
+      nonce: string;
+      /** Canonical public origin mixed into the hello identity statement. */
+      origin: string;
+    }
   | {
       type: "term.open";
       terminalId: string;
@@ -1203,7 +1356,25 @@ export const fileTermSpawnSchema = z
     "Only write requires bodyBytes.",
   );
 
+export function protocolErrorMessage(input: {
+  code: RelayProtocolErrorCode;
+  message: string;
+  requestId?: string;
+}): Extract<RelayServerControlMessage, { type: "protocol.error" }> {
+  return {
+    type: "protocol.error",
+    failure: "protocol_error",
+    code: input.code,
+    message: input.message,
+    supportedVersions: RELAY_PROTOCOL_VERSIONS,
+    ...(input.requestId !== undefined ? { requestId: input.requestId } : {}),
+  };
+}
+
 export function encodeRelayServerControlMessage(message: RelayServerControlMessage): string {
+  if (message.type === "deployment.instances.ok" && !/^[a-zA-Z0-9]{32}$/.test(message.snapshotId)) {
+    throw new RelayProtocolError("Invalid deployment inventory acknowledgement.");
+  }
   // The one enforcement point for the only outbound message whose payload is
   // built from stored, user-authored data: a source list that fails the wire
   // schema is never framed (callers send an empty list instead).
@@ -1232,8 +1403,23 @@ export function encodeRelayServerControlMessage(message: RelayServerControlMessa
       throw new RelayProtocolError("File fields require kind file.");
     }
   }
+  // An operator terminal accompanies exactly the interactive jobs.
+  if (
+    message.type === "deployment.job" &&
+    (message.interactive === true) !==
+      (message.operator !== undefined && deploymentJobOperatorValid(message.operator))
+  ) {
+    throw new RelayProtocolError(
+      "deployment.job operator must accompany exactly interactive jobs.",
+    );
+  }
   const encoded = stringifyWellFormed(message);
-  if (message.type === "term.spawn" && utf8Length(encoded) > RELAY_JSON_CONTROL_MAX_BYTES) {
+  // Both carry user-authored commands; the CLI drops larger control frames undecoded.
+  // Deployment admission bounds jobs first, so this only backstops a bypass.
+  if (
+    (message.type === "term.spawn" || message.type === "deployment.job") &&
+    utf8Length(encoded) > RELAY_JSON_CONTROL_MAX_BYTES
+  ) {
     throw new RelayProtocolError("JSON control frame exceeds 64 KiB.");
   }
   return encoded;
@@ -1249,10 +1435,10 @@ export function parseRelayClientControlFrame(frame: string): RelayClientControlM
 }
 
 /**
- * True for a hello that is not a protocol this server speaks: older than 2.8,
+ * True for a hello that is not a protocol this server speaks: older than 2.4,
  * newer than the newest listed version, or the pre-naming `cli.label` field.
- * Checked before the strict schema so such a CLI gets
- * `RELAY_UPGRADE_REQUIRED_MESSAGE` instead of an opaque "malformed message".
+ * Checked before the strict schema so such a CLI gets a coded `protocol.error`
+ * instead of an opaque "malformed message".
  */
 export function helloNeedsUpgrade(frame: string): boolean {
   if (utf8Length(frame) > RELAY_JSON_CONTROL_MAX_BYTES) return false;
@@ -1270,13 +1456,7 @@ export function helloNeedsUpgrade(frame: string): boolean {
   if (!accepted(record.protocolVersion)) return true;
   const cli = record.cli;
   if (!cli || typeof cli !== "object" || Array.isArray(cli)) return false;
-  const cliRecord = cli as Record<string, unknown>;
-  if ("label" in cliRecord) return true;
-  const capabilities = cliRecord.capabilities;
-  if (!capabilities || typeof capabilities !== "object" || Array.isArray(capabilities)) {
-    return false;
-  }
-  return !accepted((capabilities as Record<string, unknown>).protocolVersion);
+  return "label" in (cli as Record<string, unknown>);
 }
 
 /** `major.minor`, the only shape `relayProtocolAtLeast` and the card's newer/older split read. */

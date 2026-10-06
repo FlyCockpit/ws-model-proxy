@@ -13,9 +13,14 @@ import { randomUUID } from "node:crypto";
 import {
   effectiveKvBudgetTokens,
   type KvEvictionState,
+  kvEvictionCutsApply,
 } from "@ws-model-proxy/api/lib/kv-eviction-budget";
 import prisma, { Prisma } from "@ws-model-proxy/db";
-import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
+import {
+  acquireFences,
+  fences,
+  serverTimeoutSqlState,
+} from "@ws-model-proxy/db/capacity-lock-order";
 import { hmacDigestForForwarderPurpose } from "@ws-model-proxy/db/forwarder-security";
 import {
   budgetedStableJson,
@@ -29,9 +34,14 @@ import {
   stableJson,
   visitCanonical,
 } from "./cache-affinity-layers.js";
+import {
+  affinityGenerationReadySql,
+  captureAffinityTargetGenerations,
+  queryAffinityResidency,
+} from "./cache-affinity-residency.js";
 import { estimatePayloadTokens } from "./capacity/payload-estimate.js";
 import { requestJsonDepthExceeded } from "./request-json-depth.js";
-import { protectionKvBudgetTokens } from "./warm-protection.js";
+import { authorizedKvEvictionRows, protectionKvBudgetTokens } from "./warm-protection.js";
 
 const DIGEST_VERSION = 5;
 const MAX_PREFIXES_PER_REQUEST = 64;
@@ -56,6 +66,8 @@ export type AffinityTarget = {
   poolMemberId: string;
   executionTargetId: string;
   targetIdentity: string;
+  /** Durable physical incarnation captured before this attempt is dispatched. */
+  cacheGeneration?: string;
   capacityId: string;
   hardConcurrencyLimit: number | null;
   healthPenalty: number;
@@ -74,7 +86,17 @@ export type AffinityTarget = {
   slots?: number | null;
   lastRoutedAt?: Date | null;
   engineKind?: "GENERIC" | "LLAMA_CPP" | "VLLM" | "SGLANG" | "OLLAMA" | "LM_STUDIO" | null;
+  /** Per-capacity image cap passed into the once-per-request unit estimator. */
+  imageTokenAllowance?: number | null;
 };
+
+export function affinityRuntimeIdentity(
+  target: Pick<AffinityTarget, "targetIdentity" | "cacheGeneration">,
+): string {
+  return target.cacheGeneration
+    ? `${target.targetIdentity}:cache-generation:${target.cacheGeneration}`
+    : target.targetIdentity;
+}
 
 export type AffinityDecision = {
   orderedTargetIds: string[];
@@ -94,9 +116,9 @@ export type AffinityDecision = {
   prefixTokens?: Record<string, number>;
   /**
    * Payload-aware estimate of the current request through the matched prefix
-   * depth (root + conversation units 1..depth), scaled by engine-reported
-   * prompt tokens when those are the request size. Absent when the request is
-   * not affine on that target.
+   * depth (root + conversation units 1..depth). Ranking never passes a
+   * reported value; the figure is the local request estimate. Absent when the
+   * request is not affine on that target.
    */
   matchedPrefixTokens?: Record<string, number>;
   /**
@@ -118,6 +140,7 @@ export type AffinitySessionBinding = {
   canonicalBytes: number;
   estimatedTokens?: number;
   reportedTokens?: number;
+  reportedPromptTokens?: number;
 };
 
 export function scopedAffinitySessionId(
@@ -253,7 +276,10 @@ function sessionFootprintDigest(bindingDigest: string, sessionId: string) {
 
 // Bounds the extra affinity delay before Responses EOF; routes fail closed on rejection.
 export const AFFINITY_TRANSACTION_LIMITS = { maxWait: 2000, timeout: 2500 } as const;
-export const AFFINITY_EXPIRY_BATCH = 200;
+// Each expired footprint can rebuild a different 2000-entry physical bucket.
+// Bound cross-target amplification separately from single-target retention.
+export const AFFINITY_EXPIRY_BATCH = 8;
+const AFFINITY_RETENTION_BATCH = 200;
 
 function hmacValue(value: string) {
   return hmacDigestForForwarderPurpose({ purpose: "cacheAffinity", value });
@@ -322,6 +348,7 @@ type AffinityRequestArgs = {
   runtimeIdentity: string;
   sessionBinding?: AffinitySessionBinding;
   headers?: Headers;
+  imageTokenAllowance?: number | null;
 };
 
 export type CanonicalRequest = {
@@ -337,11 +364,22 @@ export type CanonicalRequest = {
   isContinuation: boolean;
   conversation: string | undefined;
   previousResponse: boolean;
+  /**
+   * Payload-aware token prefix sums computed once per request.
+   * Index 0 is the root (instructions + tools); index `d` is root plus
+   * conversation units `1..d`.
+   */
+  unitTokenPrefixSums: number[];
 };
 
 /** Once per request; all request-derived traversal shares an 8 * 2 MiB node cap. */
 export function buildCanonicalRequest(
-  { surface, payload, headers }: Pick<AffinityRequestArgs, "surface" | "payload" | "headers">,
+  {
+    surface,
+    payload,
+    headers,
+    imageTokenAllowance,
+  }: Pick<AffinityRequestArgs, "surface" | "payload" | "headers" | "imageTokenAllowance">,
   work: CanonicalWork = { steps: 0 },
 ): CanonicalRequest | null {
   try {
@@ -479,6 +517,12 @@ export function buildCanonicalRequest(
       forwardedValue(payload.conversation) ?? forwardedValue(payload.conversation_id);
     const conversation =
       conversationValue === undefined ? undefined : encode(conversationValue, MAX_CANONICAL_BYTES);
+    const unitTokenPrefixSums = computeUnitTokenPrefixSums(
+      instructions,
+      tools,
+      conversationUnits,
+      imageTokenAllowance,
+    );
     return {
       surface: canonicalSurface,
       carrier,
@@ -494,6 +538,7 @@ export function buildCanonicalRequest(
       conversation,
       previousResponse:
         canonicalSurface === "openai-responses" && typeof payload.previous_response_id === "string",
+      unitTokenPrefixSums,
     };
   } catch {
     return null;
@@ -517,25 +562,39 @@ export function canonicalByteLength(canonical: CanonicalRequest): number {
   );
 }
 
-function encodedPayloadTokens(encoded: string): number {
+function encodedPayloadTokens(encoded: string, imageTokenAllowance?: number | null): number {
   try {
-    const tokens = estimatePayloadTokens(JSON.parse(encoded) as unknown).tokens;
+    const tokens = estimatePayloadTokens(JSON.parse(encoded) as unknown, {
+      imageTokenAllowance,
+    }).tokens;
     return Number.isFinite(tokens) && tokens > 0 ? tokens : 0;
   } catch {
     return 0;
   }
 }
 
+function computeUnitTokenPrefixSums(
+  instructions: string[],
+  tools: string | undefined,
+  conversationUnits: string[],
+  imageTokenAllowance?: number | null,
+): number[] {
+  let tokens = 0;
+  for (const instruction of instructions)
+    tokens += encodedPayloadTokens(instruction, imageTokenAllowance);
+  if (tools) tokens += encodedPayloadTokens(tools, imageTokenAllowance);
+  const sums = [tokens];
+  for (const unit of conversationUnits) {
+    tokens += encodedPayloadTokens(unit, imageTokenAllowance);
+    sums.push(tokens);
+  }
+  return sums;
+}
+
 /** Payload-aware tokens of the root plus conversation units `1..depth`. */
 export function prefixPayloadTokensAtDepth(canonical: CanonicalRequest, depth: number): number {
-  let tokens = 0;
-  for (const instruction of canonical.instructions) tokens += encodedPayloadTokens(instruction);
-  if (canonical.tools) tokens += encodedPayloadTokens(canonical.tools);
   const limit = Math.max(0, Math.min(Math.trunc(depth), canonical.conversationUnits.length));
-  for (let index = 0; index < limit; index += 1) {
-    tokens += encodedPayloadTokens(canonical.conversationUnits[index]!);
-  }
-  return tokens;
+  return canonical.unitTokenPrefixSums[limit] ?? 0;
 }
 
 /**
@@ -570,12 +629,8 @@ export function prefixTokensAtDepth(
   );
 }
 
-export function instructionTokens(
-  canonical: CanonicalRequest,
-  estimate: number,
-  reportedPromptTokens?: number | null,
-): number {
-  return prefixTokensAtDepth(canonical, 0, estimate, reportedPromptTokens);
+export function instructionTokens(canonical: CanonicalRequest, estimate: number): number {
+  return prefixTokensAtDepth(canonical, 0, estimate);
 }
 
 /** Advisory identity must never reject a served request or expose partial material. */
@@ -715,6 +770,7 @@ type IdentityScope = {
   tenantUserId: string;
   poolId: string;
   executionTargetId: string;
+  cacheGeneration?: string;
 };
 
 /**
@@ -735,6 +791,7 @@ export function affinityNodeProbeSql(
 ): Prisma.Sql {
   return Prisma.sql`SELECT "sessionId" FROM cache_affinity_node
     WHERE ${gate}
+      "cacheGeneration" = ${scope.cacheGeneration ?? ""} AND
       ("userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest", "nodeDigest", "isTip", "expiresAt")
       > (${scope.userId}, ${scope.tenantUserId}, ${scope.poolId}, ${scope.executionTargetId}, ${rootDigest}, ${digest}, ${isTip}, ${now}::timestamp)
       AND ("userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest", "nodeDigest", "isTip", "expiresAt")
@@ -751,7 +808,7 @@ export function affinityRetentionSql(scope: IdentityScope, maxRecords: number): 
       AND ("userId", "tenantUserId", "poolId", "executionTargetId", "lastUsedAt")
       <= (${scope.userId}, ${scope.tenantUserId}, ${scope.poolId}, ${scope.executionTargetId}, 'infinity'::timestamp)
     ORDER BY "userId" DESC, "tenantUserId" DESC, "poolId" DESC, "executionTargetId" DESC, "lastUsedAt" DESC, id DESC
-    LIMIT ${AFFINITY_EXPIRY_BATCH} OFFSET ${maxRecords}`;
+    LIMIT ${AFFINITY_RETENTION_BATCH} OFFSET ${maxRecords}`;
 }
 
 /**
@@ -912,8 +969,10 @@ export function affinityPrefixEvidenceSql(
      ORDER BY p.depth DESC LIMIT 1`;
 }
 
-/** Newest unexpired footprints per member KV pool, for new-conversation placement. */
+/** Newest unexpired footprints per execution target, for new-conversation placement. */
 export const AFFINITY_RESIDENCY_QUERY_LIMIT = 2_000;
+/** Slot/unknown occupancy ignores empty footprints so mixed pools stay on [0, 1]. */
+export const AFFINITY_RESIDENCY_SESSION_FLOOR = 1;
 
 export type AffinityResidencyRow = {
   capacityId: string;
@@ -924,64 +983,126 @@ export type AffinityResidencyRow = {
 };
 
 /**
- * Bounded newest-first footprints (`prefixDigest IS NULL`) grouped by
- * `execution_target.inferenceCapacityId`. Uses the
- * `[executionTargetId, expiresAt]` index. Newest 2,000 per capacity.
+ * Expand only bounded maintained buckets, never the footprint/prefix history.
+ * An incomplete bucket means unknown: suppress the entire residency term for
+ * these capacities until background repair commits. This is optional ranking
+ * metadata, independent of affinity identity, eligibility and paid fallback.
  */
 export function affinityResidencySql(
   ownerUserId: string,
   capacityIds: readonly string[],
   now: Date,
-  limitPerCapacity = AFFINITY_RESIDENCY_QUERY_LIMIT,
+  limitPerTarget = AFFINITY_RESIDENCY_QUERY_LIMIT,
+  poolId?: string,
+  includeStatus = false,
 ): Prisma.Sql {
   return Prisma.sql`
-    SELECT ranked."capacityId", ranked."sessionId", ranked.tokens,
-           ranked."sharedWithSessionId", ranked."sharedPrefixTokens"
-      FROM (
-        SELECT r."sessionId",
-               r."estimatedTokens" AS tokens,
-               r."sharedWithSessionId",
-               r."sharedPrefixTokens",
-               t."inferenceCapacityId" AS "capacityId",
-               ROW_NUMBER() OVER (
-                 PARTITION BY t."inferenceCapacityId"
-                 ORDER BY r."expiresAt" DESC, r.id DESC
-               ) AS rn
-          FROM cache_affinity_record r
-          JOIN execution_target t ON t.id = r."executionTargetId"
-         WHERE r."userId" = ${ownerUserId}
-           AND t."userId" = ${ownerUserId}
-           AND t."inferenceCapacityId" IN (${Prisma.join([...capacityIds])})
-           AND r."prefixDigest" IS NULL
-           AND r."expiresAt" > ${now}::timestamp
-      ) ranked
-     WHERE ranked.rn <= ${limitPerCapacity}`;
+    WITH selected_targets AS MATERIALIZED (
+      SELECT id, "userId", "inferenceCapacityId" FROM execution_target
+      WHERE "inferenceCapacityId" IN (${Prisma.join([...capacityIds])})
+        AND ("userId" = ${ownerUserId} OR EXISTS (
+          SELECT 1 FROM pool_member m
+          JOIN inference_contribution c ON c.id = m."inferenceContributionId"
+          JOIN execution_target allowed ON allowed.id = m."executionTargetId"
+          WHERE allowed."inferenceCapacityId" = execution_target."inferenceCapacityId"
+            AND c."poolOwnerUserId" = ${ownerUserId}
+            ${poolId === undefined ? Prisma.empty : Prisma.sql`AND m."poolId" = ${poolId}`}
+            AND c."poolId" = m."poolId" AND c."discoveredModelId" = allowed."discoveredModelId"
+            AND m."discoveredModelId" = allowed."discoveredModelId"
+            AND c."contributorUserId" = allowed."userId"
+            AND c.state = 'ACTIVE' AND c."expiresAt" > ${now}
+          LIMIT 1 OFFSET 0
+        ))
+      LIMIT 9
+    ), buckets AS MATERIALIZED (
+      SELECT t."inferenceCapacityId" AS "capacityId", COALESCE(b.entries, '[]'::jsonb) AS entries,
+        -- cache_affinity_residency_bound guarantees every entry carries poolId.
+        COALESCE(b.complete AND b."cacheGeneration" = wsmp_affinity_generation(t.id)
+          AND ${affinityGenerationReadySql(Prisma.sql`t.id`)}, false) AS complete
+      FROM selected_targets t LEFT JOIN cache_affinity_residency b
+        ON b."executionTargetId" = t.id AND b."userId" = t."userId"
+      WHERE (SELECT count(*) FROM selected_targets) <= 8
+    ), status AS MATERIALIZED (
+      SELECT (SELECT count(*) FROM selected_targets) <= 8
+        AND NOT EXISTS (SELECT 1 FROM buckets WHERE NOT complete)
+        ${
+          includeStatus
+            ? Prisma.sql`AND NOT EXISTS (SELECT 1 FROM unnest(${[...capacityIds]}::text[]) requested(capacity_id)
+          WHERE NOT EXISTS (SELECT 1 FROM selected_targets t WHERE t."inferenceCapacityId" = requested.capacity_id))`
+            : Prisma.empty
+        }
+        AS complete
+    ), resident AS (
+      SELECT b."capacityId",
+             r."sessionId",
+             r.tokens,
+             r."sharedWithSessionId",
+             r."sharedPrefixTokens"
+        FROM buckets b
+        JOIN LATERAL (
+          SELECT value->>'sessionId' AS "sessionId", (value->>'tokens')::int AS tokens,
+            value->>'sharedWithSessionId' AS "sharedWithSessionId",
+            (value->>'sharedPrefixTokens')::int AS "sharedPrefixTokens"
+          FROM jsonb_array_elements(b.entries) WITH ORDINALITY
+          LEFT JOIN cache_affinity_scope scope ON scope."poolId" = value->>'poolId'
+          WHERE (value->>'expiresAt')::timestamp > ${now}::timestamp
+            AND split_part(COALESCE(value->>'cacheGeneration', ''), ':pool:', 2) = COALESCE(scope.generation, '')
+          ORDER BY ordinality
+          LIMIT ${Math.max(0, Math.min(AFFINITY_RESIDENCY_QUERY_LIMIT, limitPerTarget))}
+        ) r ON true
+      WHERE (SELECT complete FROM status)
+    )
+    ${
+      includeStatus
+        ? Prisma.sql`SELECT status.complete, COALESCE(jsonb_agg(resident) FILTER (WHERE resident."sessionId" IS NOT NULL), '[]'::jsonb) AS rows FROM status LEFT JOIN resident ON true GROUP BY status.complete`
+        : Prisma.sql`SELECT * FROM resident`
+    }`;
 }
+
+type AffinityResidencySnapshot = { complete: boolean; rows: AffinityResidencyRow[] };
 
 function billedResidentTokens(
   row: AffinityResidencyRow,
-  residentSessionIds: ReadonlySet<string>,
+  resident: ReadonlyMap<string, AffinityResidencyRow>,
 ): number {
   const raw = Math.max(0, Number(row.tokens) || 0);
   const shared = Number(row.sharedPrefixTokens);
   const sharer = row.sharedWithSessionId;
-  if (!Number.isFinite(shared) || !sharer || !residentSessionIds.has(sharer)) return raw;
+  if (!Number.isFinite(shared) || !sharer) return raw;
+  const sharerRow = resident.get(sharer);
+  if (!sharerRow) return raw;
+  // A↔F after TTL: bill the edge once. Ignore the back-pointer (the
+  // lexicographically greater session id keeps the shared tokens).
+  if (sharerRow.sharedWithSessionId === row.sessionId && sharer >= row.sessionId) return raw;
   return Math.max(0, raw - shared);
 }
 
+function preferResidencyRow(left: AffinityResidencyRow, right: AffinityResidencyRow) {
+  const leftTokens = Math.max(0, Number(left.tokens) || 0);
+  const rightTokens = Math.max(0, Number(right.tokens) || 0);
+  if (leftTokens !== rightTokens) return leftTokens >= rightTokens ? left : right;
+  if (right.sharedWithSessionId && !left.sharedWithSessionId) return right;
+  return left;
+}
+
 function residencyByCapacity(rows: readonly AffinityResidencyRow[]) {
-  const grouped = new Map<string, AffinityResidencyRow[]>();
+  const grouped = new Map<string, Map<string, AffinityResidencyRow>>();
   for (const row of rows) {
-    const list = grouped.get(row.capacityId) ?? [];
-    list.push(row);
-    grouped.set(row.capacityId, list);
+    const sessions = grouped.get(row.capacityId) ?? new Map<string, AffinityResidencyRow>();
+    const existing = sessions.get(row.sessionId);
+    sessions.set(row.sessionId, existing ? preferResidencyRow(existing, row) : row);
+    grouped.set(row.capacityId, sessions);
   }
   const byCapacity = new Map<string, { tokens: number; sessions: number }>();
-  for (const [capacityId, list] of grouped) {
-    const residentSessionIds = new Set(list.map((row) => row.sessionId));
+  for (const [capacityId, sessions] of grouped) {
     let tokens = 0;
-    for (const row of list) tokens += billedResidentTokens(row, residentSessionIds);
-    byCapacity.set(capacityId, { tokens, sessions: list.length });
+    let sessionCount = 0;
+    for (const row of sessions.values()) {
+      const billed = billedResidentTokens(row, sessions);
+      tokens += billed;
+      if (billed >= AFFINITY_RESIDENCY_SESSION_FLOOR) sessionCount += 1;
+    }
+    byCapacity.set(capacityId, { tokens, sessions: sessionCount });
   }
   return byCapacity;
 }
@@ -1007,8 +1128,8 @@ function residencyProjected({
     const used = Math.max(0, residentTokens + Math.max(0, requestTokens) - savedTokens);
     return Math.min(1, used / kvBudgetTokens);
   }
-  if (slots !== null && slots > 0) return residentSessions / slots;
-  return residentSessions / Math.max(maxResidentSessions, 1);
+  if (slots !== null && slots > 0) return Math.min(1, residentSessions / slots);
+  return Math.min(1, residentSessions / Math.max(maxResidentSessions, 1));
 }
 
 export async function rankAffinityTargets({
@@ -1023,6 +1144,7 @@ export async function rankAffinityTargets({
   targets,
   scoreSingleTarget = false,
   collectPrefixEvidence = false,
+  evictionFeedbackEnabled = true,
   sessionBinding,
   headers,
   now = new Date(),
@@ -1041,6 +1163,8 @@ export async function rankAffinityTargets({
   scoreSingleTarget?: boolean;
   /** Read the live-tip footprint snapshot only for enabled eviction feedback. */
   collectPrefixEvidence?: boolean;
+  /** False freezes residency K: skip stored cuts. Default true. */
+  evictionFeedbackEnabled?: boolean;
   sessionBinding?: AffinitySessionBinding;
   headers?: Headers;
   now?: Date;
@@ -1069,12 +1193,51 @@ export async function rankAffinityTargets({
   // protection (S-C) needs to know whether this request continues a session
   // on it (an affinity hit is never redirected), even with nothing to reorder.
   if (!policy.enabled || targets.length < (scoreSingleTarget ? 1 : 2)) return unchanged;
+  let generationKnown = true;
+  if (db === prisma) {
+    const current = await captureAffinityTargetGenerations(targets, poolId);
+    generationKnown = current.length === targets.length;
+    if (generationKnown) targets = current;
+  }
 
-  const canonical = buildCanonicalRequest({ surface, payload, headers });
-  const materialByIdentity = new Map(
-    targets.map((target) => [
-      target.targetIdentity,
-      materialFromCanonical(
+  const firstImageTokenAllowance = targets[0]?.imageTokenAllowance;
+  const sharedCanonical = buildCanonicalRequest({
+    surface,
+    payload,
+    headers,
+    imageTokenAllowance: firstImageTokenAllowance,
+  });
+  const prefixSumsByAllowance = new Map<string, number[]>(
+    sharedCanonical
+      ? [
+          [
+            firstImageTokenAllowance == null ? "" : String(firstImageTokenAllowance),
+            sharedCanonical.unitTokenPrefixSums,
+          ],
+        ]
+      : [],
+  );
+  const canonicalForAllowance = (imageTokenAllowance?: number | null): CanonicalRequest | null => {
+    if (!sharedCanonical) return null;
+    const key = imageTokenAllowance == null ? "" : String(imageTokenAllowance);
+    const cached = prefixSumsByAllowance.get(key);
+    const unitTokenPrefixSums =
+      cached ??
+      computeUnitTokenPrefixSums(
+        sharedCanonical.instructions,
+        sharedCanonical.tools,
+        sharedCanonical.conversationUnits,
+        imageTokenAllowance,
+      );
+    if (!cached) prefixSumsByAllowance.set(key, unitTokenPrefixSums);
+    return { ...sharedCanonical, unitTokenPrefixSums };
+  };
+  const preparedTargets = targets.map((target) => {
+    const canonical = canonicalForAllowance(target.imageTokenAllowance);
+    return {
+      target,
+      canonical,
+      material: materialFromCanonical(
         {
           ownerId,
           resourceOwnerId,
@@ -1083,13 +1246,19 @@ export async function rankAffinityTargets({
           accessGrantId,
           surface,
           payload,
-          runtimeIdentity: target.targetIdentity,
+          runtimeIdentity: affinityRuntimeIdentity(target),
           sessionBinding,
           headers,
         },
         canonical,
       ),
-    ]),
+    };
+  });
+  const materialByIdentity = new Map(
+    preparedTargets.map(({ target, material }) => [target.executionTargetId, material]),
+  );
+  const canonicalByIdentity = new Map(
+    preparedTargets.map(({ target, canonical }) => [target.executionTargetId, canonical]),
   );
   const conversationPrefixDigests = [
     ...new Set([...materialByIdentity.values()].flatMap(({ digests }) => digests)),
@@ -1124,30 +1293,44 @@ export async function rankAffinityTargets({
     (material) => material.isContinuation,
   );
   const capacityIds = [...new Set(targets.map(({ capacityId }) => capacityId))];
+  const residencyWeight = policy.residencyWeight ?? 100;
+  const needResidency = generationKnown && residencyWeight > 0 && targets.length >= 2;
+  const unknownResidency: AffinityResidencySnapshot = { complete: false, rows: [] };
   const loadResidency = () =>
-    capacityIds.length === 0
-      ? Promise.resolve([] as AffinityResidencyRow[])
+    !needResidency || capacityIds.length === 0 || capacityIds.length > 8
+      ? Promise.resolve(unknownResidency)
       : Promise.resolve()
           .then(() =>
-            db.$queryRaw<AffinityResidencyRow[]>(
-              affinityResidencySql(resourceOwnerId, capacityIds, now),
+            queryAffinityResidency<AffinityResidencySnapshot[]>(
+              affinityResidencySql(resourceOwnerId, capacityIds, now, undefined, poolId, true),
+              db === prisma ? undefined : db,
             ),
           )
-          .then((rows) => (Array.isArray(rows) ? rows : []))
-          .catch(() => [] as AffinityResidencyRow[]);
+          .then((result) =>
+            result[0]?.complete === true && Array.isArray(result[0].rows)
+              ? result[0]
+              : unknownResidency,
+          )
+          .catch(() => unknownResidency);
+  const applyCuts = kvEvictionCutsApply(evictionFeedbackEnabled);
   const loadEvictions = () =>
-    Promise.resolve()
-      .then(() =>
-        db.capacityKvEviction.findMany({
-          where: {
-            capacityId: { in: capacityIds },
-            userId: resourceOwnerId,
-            expiresAt: { gt: now },
-          },
-        }),
-      )
-      .then((rows) => (Array.isArray(rows) ? rows : []))
-      .catch(() => [] as Array<KvEvictionState & { capacityId: string }>);
+    !applyCuts || capacityIds.length === 0
+      ? Promise.resolve([] as Array<KvEvictionState & { capacityId: string }>)
+      : Promise.resolve()
+          .then(() =>
+            db.capacityKvEviction.findMany({
+              where: {
+                capacityId: { in: capacityIds },
+                expiresAt: { gt: now },
+              },
+            }),
+          )
+          .then((rows) =>
+            Array.isArray(rows)
+              ? authorizedKvEvictionRows(rows, resourceOwnerId, now, db, poolId)
+              : [],
+          )
+          .catch(() => [] as Array<KvEvictionState & { capacityId: string }>);
   const [records, activeLoads, waitingLoads, residencyRows, evictions] = await Promise.all([
     db.cacheAffinityRecord.findMany({
       where: {
@@ -1167,6 +1350,7 @@ export async function rankAffinityTargets({
         sessionId: true,
         lastUsedAt: true,
         executionTargetId: true,
+        cacheGeneration: true,
         targetIdentity: true,
         bindingDigest: true,
         prefixDigest: true,
@@ -1196,17 +1380,20 @@ export async function rankAffinityTargets({
       },
       _count: { _all: true },
     }),
-    continuationRequest ? Promise.resolve([] as AffinityResidencyRow[]) : loadResidency(),
-    continuationRequest
+    continuationRequest || !needResidency ? Promise.resolve(unknownResidency) : loadResidency(),
+    continuationRequest || !needResidency
       ? Promise.resolve([] as Array<KvEvictionState & { capacityId: string }>)
       : loadEvictions(),
   ]);
   const activeByCapacity = new Map(activeLoads.map((row) => [row.capacityId, row._count._all]));
   const waitingByCapacity = new Map(waitingLoads.map((row) => [row.capacityId, row._count._all]));
-  const currentRecords = records.filter((record) => record.digestVersion === DIGEST_VERSION);
+  const currentRecords = generationKnown
+    ? records.filter((record) => record.digestVersion === DIGEST_VERSION)
+    : [];
   const scored = await Promise.all(
     targets.map(async (target, originalIndex) => {
-      const material = materialByIdentity.get(target.targetIdentity)!;
+      const material = materialByIdentity.get(target.executionTargetId)!;
+      const canonical = canonicalByIdentity.get(target.executionTargetId);
       const conversationDepthByDigest = new Map(
         material.routingNodes.map(({ digest, depth }) => [digest, depth]),
       );
@@ -1216,6 +1403,7 @@ export async function rankAffinityTargets({
       const compatible = currentRecords.filter(
         (record) =>
           record.executionTargetId === target.executionTargetId &&
+          (record.cacheGeneration ?? "") === (target.cacheGeneration ?? "") &&
           record.targetIdentity === target.targetIdentity &&
           record.bindingDigest === material.bindingDigest,
       );
@@ -1274,8 +1462,11 @@ export async function rankAffinityTargets({
         tenantUserId: ownerId,
         poolId,
         executionTargetId: target.executionTargetId,
+        cacheGeneration: target.cacheGeneration ?? "",
       };
-      const sessionId = await resolveAffinitySession(db, scope, material, now);
+      const sessionId = generationKnown
+        ? await resolveAffinitySession(db, scope, material, now)
+        : null;
       let prefixEvidence: NonNullable<AffinityDecision["prefixEvidence"]>[string] | undefined;
       if (
         collectPrefixEvidence &&
@@ -1316,8 +1507,16 @@ export async function rankAffinityTargets({
           ? 0
           : requestTokens > 0
             ? matchedPrefixTokens / requestTokens
-            : canonical && canonicalByteLength(canonical) > 0
-              ? prefixBytesAtDepth(canonical, scoredPrefixDepth) / canonicalByteLength(canonical)
+            : canonical
+              ? (() => {
+                  const total = prefixPayloadTokensAtDepth(
+                    canonical,
+                    canonical.conversationUnits.length,
+                  );
+                  return total > 0
+                    ? prefixPayloadTokensAtDepth(canonical, scoredPrefixDepth) / total
+                    : 0;
+                })()
               : 0;
       return {
         target,
@@ -1337,6 +1536,7 @@ export async function rankAffinityTargets({
         requestTokens,
         sessionId,
         prefixEvidence,
+        canonical,
         score: 0,
       };
     }),
@@ -1344,16 +1544,18 @@ export async function rankAffinityTargets({
   const anyAffine = scored.some((row) => row.affine);
   let residency = residencyRows;
   let evictionRows = evictions;
-  if (!anyAffine && continuationRequest) {
+  if (!anyAffine && continuationRequest && needResidency) {
     [residency, evictionRows] = await Promise.all([loadResidency(), loadEvictions()]);
   }
-  const resident = residencyByCapacity(residency);
-  const evictionByCapacity = new Map(evictionRows.map((row) => [row.capacityId, row] as const));
+  const spreadResidency = !anyAffine && needResidency && residency.complete;
+  const resident = spreadResidency ? residencyByCapacity(residency.rows) : new Map();
+  const evictionByCapacity = spreadResidency
+    ? new Map(evictionRows.map((row) => [row.capacityId, row] as const))
+    : new Map();
   const maxResidentSessions = Math.max(0, ...[...resident.values()].map((row) => row.sessions));
   const weights = targets.map((target) => Math.max(0, target.weight ?? 1));
   const meanWeight =
     weights.reduce((sum, weight) => sum + weight, 0) / Math.max(weights.length, 1) || 1;
-  const residencyWeight = policy.residencyWeight ?? 100;
   for (const row of scored) {
     const penalties =
       row.loadPenalty +
@@ -1368,16 +1570,23 @@ export async function rankAffinityTargets({
         penalties;
       continue;
     }
+    if (!spreadResidency) {
+      row.score = 0 - penalties;
+      continue;
+    }
     const occupancy = resident.get(row.target.capacityId) ?? { tokens: 0, sessions: 0 };
     const reportedK = protectionKvBudgetTokens(row.target.engineKind, row.target.kvBudgetTokens);
     const kvBudgetTokens = effectiveKvBudgetTokens(
       reportedK,
       evictionByCapacity.get(row.target.capacityId),
       now,
+      evictionFeedbackEnabled,
     );
     const slots = row.target.slots ?? row.target.hardConcurrencyLimit;
     const savedTokens =
-      row.instructionDepth > 0 && canonical ? instructionTokens(canonical, row.requestTokens) : 0;
+      row.instructionDepth > 0 && row.canonical
+        ? instructionTokens(row.canonical, row.requestTokens)
+        : 0;
     const projected = residencyProjected({
       residentTokens: occupancy.tokens,
       residentSessions: occupancy.sessions,
@@ -1390,19 +1599,25 @@ export async function rankAffinityTargets({
     const weight = Math.max(0, row.target.weight ?? 1);
     const cost =
       weight <= 0 || meanWeight <= 0 ? Number.POSITIVE_INFINITY : projected / (weight / meanWeight);
-    const residencyPenalty = Number.isFinite(cost)
-      ? Math.ceil(cost * residencyWeight)
-      : 1_000_000_000;
+    // Keep the weighted fill off integer ceil so small occupancy differences
+    // survive; saturated members then break on lastRoutedAt / originalIndex.
+    const residencyPenalty = Number.isFinite(cost) ? cost * residencyWeight : 1_000_000_000;
     row.score = 0 - penalties - residencyPenalty;
   }
-  scored.sort(
-    (left, right) =>
-      right.score - left.score ||
-      right.instructionDepth - left.instructionDepth ||
-      (left.target.lastRoutedAt?.getTime() ?? 0) - (right.target.lastRoutedAt?.getTime() ?? 0) ||
-      left.target.poolMemberId.localeCompare(right.target.poolMemberId) ||
-      left.originalIndex - right.originalIndex,
-  );
+  scored.sort((left, right) => {
+    const score = right.score - left.score;
+    if (score !== 0) return score;
+    const instruction = right.instructionDepth - left.instructionDepth;
+    if (instruction !== 0) return instruction;
+    if (spreadResidency) {
+      const routed =
+        (left.target.lastRoutedAt?.getTime() ?? 0) - (right.target.lastRoutedAt?.getTime() ?? 0);
+      if (routed !== 0) return routed;
+    }
+    const original = left.originalIndex - right.originalIndex;
+    if (original !== 0) return original;
+    return spreadResidency ? left.target.poolMemberId.localeCompare(right.target.poolMemberId) : 0;
+  });
   return {
     orderedTargetIds: scored.map(({ target }) => target.executionTargetId),
     scores: Object.fromEntries(
@@ -1463,6 +1678,24 @@ export async function rankAffinityTargets({
   };
 }
 
+/** Cheap placement remainder after admission. Must not run inside the hot fence. */
+export async function markPoolMemberLastRoutedAt(
+  poolMemberId: string | null | undefined,
+  at = new Date(),
+  db: {
+    poolMember: {
+      update: (args: { where: { id: string }; data: { lastRoutedAt: Date } }) => Promise<unknown>;
+    };
+  } = prisma,
+): Promise<void> {
+  if (!poolMemberId) return;
+  try {
+    await db.poolMember.update({ where: { id: poolMemberId }, data: { lastRoutedAt: at } });
+  } catch {
+    // A missed stamp must not fail a granted request.
+  }
+}
+
 export function isAffinityTargetWarm(
   decision: Pick<AffinityDecision, "prefixDepths" | "conversationMatches">,
   executionTargetId: string,
@@ -1491,6 +1724,7 @@ export async function rememberAffinity({
   estimatedTokens,
   estimatedDeltaTokens,
   reportedTokens,
+  reportedPromptTokens,
   engineCacheConfirmed,
   sessionBinding,
   headers,
@@ -1510,6 +1744,8 @@ export async function rememberAffinity({
   estimatedDeltaTokens?: number;
   /** Engine-reported prompt + completion for the served turn, when known. */
   reportedTokens?: number;
+  /** Engine-reported prompt tokens only; used to scale shared prefixes. */
+  reportedPromptTokens?: number;
   /**
    * Latest engine cache evidence from the served response. `true` (cached
    * prompt tokens reported) and `false` (cache fields reported with zero)
@@ -1531,11 +1767,14 @@ export async function rememberAffinity({
     accessGrantId,
     surface,
     payload,
-    runtimeIdentity: target.targetIdentity,
+    runtimeIdentity: affinityRuntimeIdentity(target),
     sessionBinding,
     headers,
   };
-  const canonical = buildCanonicalRequest(requestArgs);
+  const canonical = buildCanonicalRequest({
+    ...requestArgs,
+    imageTokenAllowance: target.imageTokenAllowance,
+  });
   const material = materialFromCanonical(requestArgs, canonical);
   if (
     material.instructionDigests.length === 0 &&
@@ -1556,138 +1795,158 @@ export async function rememberAffinity({
       sessionBinding.reportedTokens + (estimatedDeltaTokens ?? 0),
     );
   }
+  if (material.boundSessionId && sessionBinding?.reportedPromptTokens !== undefined) {
+    reportedPromptTokens = Math.min(
+      2_147_483_647,
+      sessionBinding.reportedPromptTokens + (estimatedDeltaTokens ?? 0),
+    );
+  }
   const expiresAt = new Date(now.getTime() + policy.ttlSeconds * 1000);
   const storedReportedTokens = clampAffinityTokens(reportedTokens);
+  const storedReportedPromptTokens = clampAffinityTokens(reportedPromptTokens);
   // Every record this call writes (created or refreshed) carries the same
   // `lastUsedAt` and `sessionId`: warm-session protection (S-C,
   // ./warm-protection.ts) groups records into one session by the id, dates it
   // by its newest record and sizes it by that instant's `estimatedTokens`.
-  return prisma.$transaction(async (tx) => {
-    await tx.$executeRaw`SET LOCAL lock_timeout = '1000ms'`;
-    // Serialize retention enforcement per owner/pool so concurrent successful
-    // requests cannot race past the configured bound: the cache-affinity
-    // fence, taken before any row (writer class H,
-    // @ws-model-proxy/db/capacity-lock-order). No pool row is locked; the
-    // pool is read without a lock and its records carry plain ids, so a pool
-    // deleted meanwhile leaves records the expiry sweep removes.
-    await acquireFences(tx, [fences.cacheAffinity(resourceOwnerId, poolId)]);
-    const pool = await tx.modelPool.findFirst({
-      where: { id: poolId, userId: resourceOwnerId },
-      select: { id: true },
-    });
-    if (!pool) return null;
-    // Bitmap plans materialize the full scope before LIMIT. Keep these bounded
-    // lookups as streaming index walks; the setting ends with this transaction.
-    await tx.$executeRaw`SET LOCAL enable_bitmapscan = off`;
-    // ARRAY makes deletion a primary-key lookup of the bounded ids; an IN
-    // subquery can become a population-scanning semi-join under misestimation.
-    // Class S drains the backlog; completion only takes an indexed batch from
-    // each table while holding the owner/pool fence.
-    await tx.$executeRaw`DELETE FROM cache_affinity_record WHERE id = ANY(ARRAY(
+  const started = Date.now();
+  const write = (limits: { maxWait: number; timeout: number }) =>
+    prisma.$transaction(async (tx) => {
+      await tx.$executeRaw`SET LOCAL lock_timeout = '1000ms'`;
+      // Serialize retention enforcement per owner/pool so concurrent successful
+      // requests cannot race past the configured bound: the cache-affinity
+      // fence, taken before any row (writer class H,
+      // @ws-model-proxy/db/capacity-lock-order). No pool row is locked; the
+      // pool is read without a lock and its records carry plain ids, so a pool
+      // deleted meanwhile leaves records the expiry sweep removes.
+      await acquireFences(tx, [fences.cacheAffinity(resourceOwnerId, poolId)]);
+      const pool = await tx.modelPool.findFirst({
+        where: { id: poolId, userId: resourceOwnerId },
+        select: { id: true },
+      });
+      if (!pool) return null;
+      // Bitmap plans materialize the full scope before LIMIT. Keep these bounded
+      // lookups as streaming index walks; the setting ends with this transaction.
+      await tx.$executeRaw`SET LOCAL enable_bitmapscan = off`;
+      // ARRAY makes deletion a primary-key lookup of the bounded ids; an IN
+      // subquery can become a population-scanning semi-join under misestimation.
+      // Class S drains the backlog; completion only takes an indexed batch from
+      // each table while holding the owner/pool fence.
+      await tx.$executeRaw`DELETE FROM cache_affinity_record WHERE id = ANY(ARRAY(
       SELECT id FROM cache_affinity_record
       WHERE ("userId", "tenantUserId", "poolId", "expiresAt")
         > (${resourceOwnerId}, ${ownerId}, ${poolId}, '-infinity'::timestamp)
         AND ("userId", "tenantUserId", "poolId", "expiresAt")
         <= (${resourceOwnerId}, ${ownerId}, ${poolId}, ${now}::timestamp)
       ORDER BY "userId", "tenantUserId", "poolId", "expiresAt" LIMIT ${AFFINITY_EXPIRY_BATCH} FOR UPDATE SKIP LOCKED))`;
-    await tx.$executeRaw`DELETE FROM cache_affinity_node WHERE id = ANY(ARRAY(
+      await tx.$executeRaw`DELETE FROM cache_affinity_node WHERE id = ANY(ARRAY(
       SELECT id FROM cache_affinity_node
       WHERE ("userId", "tenantUserId", "poolId", "expiresAt")
         > (${resourceOwnerId}, ${ownerId}, ${poolId}, '-infinity'::timestamp)
         AND ("userId", "tenantUserId", "poolId", "expiresAt")
         <= (${resourceOwnerId}, ${ownerId}, ${poolId}, ${now}::timestamp)
       ORDER BY "userId", "tenantUserId", "poolId", "expiresAt" LIMIT ${AFFINITY_EXPIRY_BATCH} FOR UPDATE SKIP LOCKED))`;
-    const scope = {
-      userId: resourceOwnerId,
-      tenantUserId: ownerId,
-      poolId,
-      executionTargetId: target.executionTargetId,
-    };
-    const sessionId = (await resolveAffinitySession(tx, scope, material, now)) ?? randomUUID();
-    // Refresh <=64 retained rows; insert only delta nodes. Edits discard the old
-    // branch. The fence was acquired before all reads; no graph locks or effects.
-    const existingNodes = material.identifiable
-      ? await tx.cacheAffinityNode.findMany({
-          where: { ...scope, sessionId, expiresAt: { gt: now } },
-          select: { nodeDigest: true, depth: true, rootDigest: true },
-        })
-      : [];
-    let sharedWithSessionId: string | null = null;
-    let sharedPrefixTokens: number | null = null;
-    if (material.identifiable && existingNodes.length === 0 && material.nodes.length > 0) {
-      const shared = await tx.$queryRaw<{ sessionId: string; depth: number }[]>(
-        affinitySharedPrefixProbeSql(scope, material, sessionId, now),
-      );
-      const hit = shared[0];
-      const depth = Number(hit?.depth);
-      if (hit?.sessionId && hit.sessionId !== sessionId && Number.isFinite(depth)) {
-        sharedWithSessionId = hit.sessionId;
-        sharedPrefixTokens = canonical
-          ? prefixTokensAtDepth(canonical, depth, estimatedTokens ?? 0, storedReportedTokens)
-          : 0;
-      }
-    }
-    const parentNodes = material.boundSessionId
-      ? material.boundSessionId === sessionId
-        ? existingNodes
-        : await tx.cacheAffinityNode.findMany({
-            where: { ...scope, sessionId: material.boundSessionId, expiresAt: { gt: now } },
+      const scope = {
+        userId: resourceOwnerId,
+        tenantUserId: ownerId,
+        poolId,
+        executionTargetId: target.executionTargetId,
+        cacheGeneration: target.cacheGeneration ?? "",
+      };
+      const sessionId = (await resolveAffinitySession(tx, scope, material, now)) ?? randomUUID();
+      // Refresh <=64 retained rows; insert only delta nodes. Edits discard the old
+      // branch. The fence was acquired before all reads; no graph locks or effects.
+      const existingNodes = material.identifiable
+        ? await tx.cacheAffinityNode.findMany({
+            where: { ...scope, sessionId, expiresAt: { gt: now } },
             select: { nodeDigest: true, depth: true, rootDigest: true },
           })
-      : [];
-    // A same-root rewrite can replace even this session's chain. The durable
-    // binding alone proves the parent tip, not ancestry of the current rows.
-    const parentChainProven = parentNodes.some(
-      (node) =>
-        node.rootDigest === material.rootDigest &&
-        node.nodeDigest === material.parentTipDigest &&
-        node.depth === material.parentTipDepth,
-    );
-    const combined = [
-      ...(parentChainProven
-        ? parentNodes
-            .filter(
-              (node) =>
-                node.rootDigest === material.rootDigest &&
-                node.depth <= (material.parentTipDepth ?? 0),
-            )
-            .map(({ nodeDigest, depth }) => ({ digest: nodeDigest, depth }))
-        : []),
-      ...material.nodes,
-    ];
-    const retained = [...new Map(combined.map((node) => [node.digest, node])).values()]
-      .sort((a, b) => b.depth - a.depth)
-      .slice(0, MAX_PREFIXES_PER_REQUEST);
-    const retainedDigests = retained.map((node) => node.digest);
-    if (material.identifiable) {
-      await tx.cacheAffinityNode.deleteMany({
-        where: { ...scope, sessionId, nodeDigest: { notIn: retainedDigests } },
-      });
-      await tx.cacheAffinityNode.updateMany({
-        where: { ...scope, sessionId },
-        data: { isTip: false, expiresAt },
-      });
-    }
-    const tip = material.nodes.at(-1);
-    if (tip) {
-      const tipEstimatedTokens = clampAffinityTokens(estimatedTokens);
-      const tipReportedTokens = storedReportedTokens;
-      const oldDigests = new Set(existingNodes.map((node) => node.nodeDigest));
-      const inserts = retained.filter(
-        (node) => !oldDigests.has(node.digest) || node.digest === tip.digest,
+        : [];
+      let sharedWithSessionId: string | null = null;
+      let sharedPrefixTokens: number | null = null;
+      if (
+        material.identifiable &&
+        existingNodes.length === 0 &&
+        material.nodes.length > 0 &&
+        !material.boundSessionId
+      ) {
+        const shared = await tx.$queryRaw<{ sessionId: string; depth: number }[]>(
+          affinitySharedPrefixProbeSql(scope, material, sessionId, now),
+        );
+        const hit = shared[0];
+        const depth = Number(hit?.depth);
+        if (hit?.sessionId && hit.sessionId !== sessionId && Number.isFinite(depth)) {
+          sharedWithSessionId = hit.sessionId;
+          sharedPrefixTokens = canonical
+            ? prefixTokensAtDepth(
+                canonical,
+                depth,
+                estimatedTokens ?? 0,
+                storedReportedPromptTokens,
+              )
+            : 0;
+        }
+      }
+      const parentNodes = material.boundSessionId
+        ? material.boundSessionId === sessionId
+          ? existingNodes
+          : await tx.cacheAffinityNode.findMany({
+              where: { ...scope, sessionId: material.boundSessionId, expiresAt: { gt: now } },
+              select: { nodeDigest: true, depth: true, rootDigest: true },
+            })
+        : [];
+      // A same-root rewrite can replace even this session's chain. The durable
+      // binding alone proves the parent tip, not ancestry of the current rows.
+      const parentChainProven = parentNodes.some(
+        (node) =>
+          node.rootDigest === material.rootDigest &&
+          node.nodeDigest === material.parentTipDigest &&
+          node.depth === material.parentTipDepth,
       );
-      // Only this write's tip receives its whole-prompt estimate. Replays and
-      // promotions replace it even with NULL; non-tip conflicts preserve any
-      // footprint from an earlier write that made that node a tip.
-      if (inserts.length)
-        await tx.$executeRaw(Prisma.sql`
+      const combined = [
+        ...(parentChainProven
+          ? parentNodes
+              .filter(
+                (node) =>
+                  node.rootDigest === material.rootDigest &&
+                  node.depth <= (material.parentTipDepth ?? 0),
+              )
+              .map(({ nodeDigest, depth }) => ({ digest: nodeDigest, depth }))
+          : []),
+        ...material.nodes,
+      ];
+      const retained = [...new Map(combined.map((node) => [node.digest, node])).values()]
+        .sort((a, b) => b.depth - a.depth)
+        .slice(0, MAX_PREFIXES_PER_REQUEST);
+      const retainedDigests = retained.map((node) => node.digest);
+      if (material.identifiable) {
+        await tx.cacheAffinityNode.deleteMany({
+          where: { ...scope, sessionId, nodeDigest: { notIn: retainedDigests } },
+        });
+        await tx.cacheAffinityNode.updateMany({
+          where: { ...scope, sessionId },
+          data: { isTip: false, expiresAt },
+        });
+      }
+      const tip = material.nodes.at(-1);
+      if (tip) {
+        const tipEstimatedTokens = clampAffinityTokens(estimatedTokens);
+        const tipReportedTokens = storedReportedTokens;
+        const oldDigests = new Set(existingNodes.map((node) => node.nodeDigest));
+        const inserts = retained.filter(
+          (node) => !oldDigests.has(node.digest) || node.digest === tip.digest,
+        );
+        // Only this write's tip receives its whole-prompt estimate. Replays and
+        // promotions replace it even with NULL; non-tip conflicts preserve any
+        // footprint from an earlier write that made that node a tip.
+        if (inserts.length)
+          await tx.$executeRaw(Prisma.sql`
         INSERT INTO cache_affinity_node
-          (id, "userId", "tenantUserId", "poolId", "executionTargetId", "rootDigest",
+          (id, "userId", "tenantUserId", "poolId", "executionTargetId", "cacheGeneration", "rootDigest",
            "nodeDigest", depth, "sessionId", "isTip", "estimatedTokens", "reportedTokens", "expiresAt") VALUES
           ${Prisma.join(
             inserts.map(
               (node) => Prisma.sql`(${randomUUID()}, ${resourceOwnerId},
-            ${ownerId}, ${poolId}, ${target.executionTargetId}, ${material.rootDigest},
+            ${ownerId}, ${poolId}, ${target.executionTargetId}, ${target.cacheGeneration ?? ""}, ${material.rootDigest},
             ${node.digest}, ${node.depth}, ${sessionId}, ${node.digest === tip.digest},
             ${node.digest === tip.digest ? tipEstimatedTokens : null},
             ${node.digest === tip.digest ? tipReportedTokens : null}, ${expiresAt})`,
@@ -1700,134 +1959,135 @@ export async function rememberAffinity({
           "reportedTokens" = CASE WHEN EXCLUDED."isTip"
             THEN COALESCE(EXCLUDED."reportedTokens", cache_affinity_node."reportedTokens")
             ELSE cache_affinity_node."reportedTokens" END`);
-    }
-    // Read the discarded node digests under the same fence before pruning hints.
-    // Instruction hints have no node row, so omitted instructions remain matchable.
-    const discardedDigests = existingNodes
-      .filter((node) => !retainedDigests.includes(node.nodeDigest))
-      .map((node) => node.nodeDigest);
-    if (discardedDigests.length)
-      await tx.cacheAffinityRecord.deleteMany({
-        where: {
-          ...scope,
-          sessionId,
-          prefixDigest: { in: discardedDigests },
-        },
-      });
-    const rebased =
-      material.identifiable &&
-      (material.boundSessionId
-        ? material.boundSessionId !== sessionId || !parentChainProven
-        : existingNodes.some((node) => node.rootDigest !== material.rootDigest));
-    const inheritedInstructions =
-      rebased && parentChainProven
-        ? await tx.cacheAffinityRecord.findMany({
-            where: {
-              ...scope,
-              sessionId: {
-                in: [
-                  material.boundSessionId!,
-                  ...(existingNodes.length > 0 &&
-                  existingNodes.every((node) => node.rootDigest === material.rootDigest)
-                    ? [sessionId]
-                    : []),
-                ],
+      }
+      // Read the discarded node digests under the same fence before pruning hints.
+      // Instruction hints have no node row, so omitted instructions remain matchable.
+      const discardedDigests = existingNodes
+        .filter((node) => !retainedDigests.includes(node.nodeDigest))
+        .map((node) => node.nodeDigest);
+      if (discardedDigests.length)
+        await tx.cacheAffinityRecord.deleteMany({
+          where: {
+            ...scope,
+            sessionId,
+            prefixDigest: { in: discardedDigests },
+          },
+        });
+      const rebased =
+        material.identifiable &&
+        (material.boundSessionId
+          ? material.boundSessionId !== sessionId || !parentChainProven
+          : existingNodes.some((node) => node.rootDigest !== material.rootDigest));
+      const inheritedInstructions =
+        rebased && parentChainProven
+          ? await tx.cacheAffinityRecord.findMany({
+              where: {
+                ...scope,
+                sessionId: {
+                  in: [
+                    material.boundSessionId!,
+                    ...(existingNodes.length > 0 &&
+                    existingNodes.every((node) => node.rootDigest === material.rootDigest)
+                      ? [sessionId]
+                      : []),
+                  ],
+                },
+                targetIdentity: target.targetIdentity,
+                bindingDigest: material.bindingDigest,
+                expiresAt: { gt: now },
+                prefixDigest: {
+                  not: null,
+                  startsWith: INSTRUCTION_HINT_PREFIX,
+                },
               },
+              select: { prefixDigest: true, prefixDepth: true },
+              take: MAX_INSTRUCTION_PREFIXES,
+            })
+          : [];
+      if (rebased) {
+        // Same-root instructions also remain valid when their shared record was
+        // last stamped by the chosen client. Conversation hints require parent proof.
+        // Chosen-client rows describe its old branch and cannot establish ancestry.
+        await tx.cacheAffinityRecord.deleteMany({
+          where: {
+            ...scope,
+            sessionId,
+            prefixDigest: {
+              not: null,
+              notIn: [
+                ...retainedDigests,
+                ...material.instructionDigests,
+                ...inheritedInstructions.flatMap((row) =>
+                  row.prefixDigest ? [row.prefixDigest] : [],
+                ),
+              ],
+            },
+          },
+        });
+      }
+      const upsertPrefix = async (prefixDigest: string, prefixDepth: number) => {
+        await tx.cacheAffinityRecord.upsert({
+          where: {
+            tenantUserId_poolId_executionTargetId_targetIdentity_bindingDigest_prefixDigest: {
+              tenantUserId: ownerId,
+              poolId,
+              executionTargetId: target.executionTargetId,
               targetIdentity: target.targetIdentity,
               bindingDigest: material.bindingDigest,
-              expiresAt: { gt: now },
-              prefixDigest: {
-                not: null,
-                startsWith: INSTRUCTION_HINT_PREFIX,
-              },
+              prefixDigest,
             },
-            select: { prefixDigest: true, prefixDepth: true },
-            take: MAX_INSTRUCTION_PREFIXES,
-          })
-        : [];
-    if (rebased) {
-      // Same-root instructions also remain valid when their shared record was
-      // last stamped by the chosen client. Conversation hints require parent proof.
-      // Chosen-client rows describe its old branch and cannot establish ancestry.
-      await tx.cacheAffinityRecord.deleteMany({
-        where: {
-          ...scope,
-          sessionId,
-          prefixDigest: {
-            not: null,
-            notIn: [
-              ...retainedDigests,
-              ...material.instructionDigests,
-              ...inheritedInstructions.flatMap((row) =>
-                row.prefixDigest ? [row.prefixDigest] : [],
-              ),
-            ],
           },
-        },
-      });
-    }
-    const upsertPrefix = async (prefixDigest: string, prefixDepth: number) => {
-      await tx.cacheAffinityRecord.upsert({
-        where: {
-          tenantUserId_poolId_executionTargetId_targetIdentity_bindingDigest_prefixDigest: {
+          create: {
+            userId: resourceOwnerId,
             tenantUserId: ownerId,
             poolId,
             executionTargetId: target.executionTargetId,
             targetIdentity: target.targetIdentity,
             bindingDigest: material.bindingDigest,
+            cacheGeneration: target.cacheGeneration ?? "",
             prefixDigest,
+            conversationDigest: null,
+            sessionId,
+            prefixDepth,
+            digestVersion: DIGEST_VERSION,
+            estimatedTokens,
+            reportedTokens: storedReportedTokens,
+            engineCacheConfirmed: engineCacheConfirmed ?? false,
+            lastUsedAt: now,
+            expiresAt,
           },
-        },
-        create: {
-          userId: resourceOwnerId,
-          tenantUserId: ownerId,
-          poolId,
-          executionTargetId: target.executionTargetId,
-          targetIdentity: target.targetIdentity,
-          bindingDigest: material.bindingDigest,
-          prefixDigest,
-          conversationDigest: null,
-          sessionId,
-          prefixDepth,
-          digestVersion: DIGEST_VERSION,
-          estimatedTokens,
-          reportedTokens: storedReportedTokens,
-          engineCacheConfirmed: engineCacheConfirmed ?? false,
-          lastUsedAt: now,
-          expiresAt,
-        },
-        update: {
-          lastUsedAt: now,
-          expiresAt,
-          sessionId,
-          estimatedTokens,
-          ...(storedReportedTokens === null ? {} : { reportedTokens: storedReportedTokens }),
-          ...(engineCacheConfirmed === undefined ? {} : { engineCacheConfirmed }),
-        },
-      });
-    };
-    const prefixes = [
-      ...new Map(
-        [
-          ...material.instructionDigests.map((digest, index) => ({ digest, depth: index + 1 })),
-          ...inheritedInstructions.flatMap((row) =>
-            row.prefixDigest ? [{ digest: row.prefixDigest, depth: row.prefixDepth }] : [],
-          ),
-          ...(material.boundSessionId ? retained : material.routingNodes),
-        ].map((node) => [node.digest, node]),
-      ).values(),
-    ];
-    // Small requests avoid bulk serialization; large histories use one statement,
-    // never 64 sequential upserts while holding the owner/pool fence.
-    if (prefixes.length < 8) {
-      for (const { digest, depth } of prefixes) await upsertPrefix(digest, depth);
-    } else {
-      await tx.$executeRaw(Prisma.sql`
+          update: {
+            lastUsedAt: now,
+            expiresAt,
+            sessionId,
+            estimatedTokens,
+            ...(storedReportedTokens === null ? {} : { reportedTokens: storedReportedTokens }),
+            ...(engineCacheConfirmed === undefined ? {} : { engineCacheConfirmed }),
+          },
+        });
+      };
+      const prefixes = [
+        ...new Map(
+          [
+            ...material.instructionDigests.map((digest, index) => ({ digest, depth: index + 1 })),
+            ...inheritedInstructions.flatMap((row) =>
+              row.prefixDigest ? [{ digest: row.prefixDigest, depth: row.prefixDepth }] : [],
+            ),
+            ...(material.boundSessionId ? retained : material.routingNodes),
+          ].map((node) => [node.digest, node]),
+        ).values(),
+      ];
+      // Small requests avoid bulk serialization; large histories use one statement,
+      // never 64 sequential upserts while holding the owner/pool fence.
+      if (prefixes.length < 8) {
+        for (const { digest, depth } of prefixes) await upsertPrefix(digest, depth);
+      } else {
+        await tx.$executeRaw(Prisma.sql`
         INSERT INTO cache_affinity_record
-          (id, "userId", "tenantUserId", "poolId", "executionTargetId", "targetIdentity",
+          (id, "userId", "tenantUserId", "poolId", "executionTargetId", "cacheGeneration", "targetIdentity",
            "bindingDigest", "prefixDigest", "conversationDigest", "sessionId", "prefixDepth",
            "digestVersion", "estimatedTokens", "reportedTokens", "engineCacheConfirmed", "lastUsedAt", "expiresAt")
-        SELECT p.id, ${resourceOwnerId}, ${ownerId}, ${poolId}, ${target.executionTargetId},
+        SELECT p.id, ${resourceOwnerId}, ${ownerId}, ${poolId}, ${target.executionTargetId}, ${target.cacheGeneration ?? ""},
           ${target.targetIdentity}, ${material.bindingDigest}, p.digest, NULL, ${sessionId}, p.depth,
           ${DIGEST_VERSION}, ${estimatedTokens ?? null}, ${storedReportedTokens}, ${engineCacheConfirmed ?? false}, ${now}, ${expiresAt}
         FROM jsonb_to_recordset(${JSON.stringify(prefixes.map((node) => ({ id: randomUUID(), ...node })))}::jsonb)
@@ -1837,17 +2097,17 @@ export async function rememberAffinity({
           "expiresAt" = EXCLUDED."expiresAt", "estimatedTokens" = COALESCE(EXCLUDED."estimatedTokens", cache_affinity_record."estimatedTokens"),
           "reportedTokens" = COALESCE(EXCLUDED."reportedTokens", cache_affinity_record."reportedTokens"),
           "engineCacheConfirmed" = COALESCE(${engineCacheConfirmed ?? null}::boolean, cache_affinity_record."engineCacheConfirmed")`);
-    }
-    const upsertConversation = async (conversationDigest: string) => {
-      // Use the partial unique index directly. A nullable-prefix ORM lookup
-      // can choose a population scan before inserting a new footprint.
-      await tx.$executeRaw`INSERT INTO cache_affinity_record
-        (id, "userId", "tenantUserId", "poolId", "executionTargetId", "targetIdentity",
+      }
+      const upsertConversation = async (conversationDigest: string) => {
+        // Use the partial unique index directly. A nullable-prefix ORM lookup
+        // can choose a population scan before inserting a new footprint.
+        await tx.$executeRaw`INSERT INTO cache_affinity_record
+        (id, "userId", "tenantUserId", "poolId", "executionTargetId", "cacheGeneration", "targetIdentity",
          "bindingDigest", "prefixDigest", "conversationDigest", "sessionId", "prefixDepth",
          "digestVersion", "estimatedTokens", "reportedTokens", "engineCacheConfirmed", "lastUsedAt", "expiresAt",
          "sharedWithSessionId", "sharedPrefixTokens")
         VALUES (${randomUUID()}, ${resourceOwnerId}, ${ownerId}, ${poolId},
-          ${target.executionTargetId}, ${target.targetIdentity}, ${material.bindingDigest},
+          ${target.executionTargetId}, ${target.cacheGeneration ?? ""}, ${target.targetIdentity}, ${material.bindingDigest},
           NULL, ${conversationDigest}, ${sessionId}, 0, ${DIGEST_VERSION},
           ${estimatedTokens ?? null}, ${storedReportedTokens}, ${engineCacheConfirmed ?? false}, ${now}, ${expiresAt},
           ${sharedWithSessionId}, ${sharedPrefixTokens})
@@ -1857,50 +2117,50 @@ export async function rememberAffinity({
           "sessionId" = EXCLUDED."sessionId", "estimatedTokens" = COALESCE(EXCLUDED."estimatedTokens", cache_affinity_record."estimatedTokens"),
           "reportedTokens" = COALESCE(EXCLUDED."reportedTokens", cache_affinity_record."reportedTokens"),
           "engineCacheConfirmed" = COALESCE(${engineCacheConfirmed ?? null}::boolean, cache_affinity_record."engineCacheConfirmed")`;
-    };
-    // Independent footprint prevents shared routing hints from erasing a sibling.
-    if (material.identifiable || material.clientSessionId)
-      await upsertConversation(sessionFootprintDigest(material.bindingDigest, sessionId));
-    if (material.conversationDigest) await upsertConversation(material.conversationDigest);
-    // Normal writes add <=74 hints. A lowered cap or legacy backlog drains
-    // across completions instead of extending one fenced transaction.
-    // Underestimated correlated scopes can choose a population sort (including
-    // Incremental Sort) on a shorter index. Use the ordered retention index.
-    // Apply this after identity resolution, whose <=64-node sort stays cheap.
-    await tx.$executeRaw`SET LOCAL enable_sort = off`;
-    await tx.$executeRaw`SET LOCAL enable_incremental_sort = off`;
-    const overflowCandidates = await tx.$queryRaw<
-      { id: string; sessionId: string; prefixDigest: string | null; expiresAt: Date }[]
-    >(affinityRetentionSql(scope, policy.maxRecords));
-    // Filter after the bounded index walk. Filtering expiry in the walk can
-    // scan an entire expired backlog to discover there are no more live rows.
-    const overflow = overflowCandidates.filter((row) => row.expiresAt > now);
-    if (overflow.length) {
-      // A known 200-id IN list can choose a heap scan after VACUUM/reuse
-      // changes its cost. The bounded initplan keeps this a primary-key walk,
-      // just like the expiry batches above, without disabling sequential scans.
-      await tx.$executeRaw`DELETE FROM cache_affinity_record
+      };
+      // Independent footprint prevents shared routing hints from erasing a sibling.
+      if (material.identifiable || material.clientSessionId)
+        await upsertConversation(sessionFootprintDigest(material.bindingDigest, sessionId));
+      if (material.conversationDigest) await upsertConversation(material.conversationDigest);
+      // Normal writes add <=74 hints. A lowered cap or legacy backlog drains
+      // across completions instead of extending one fenced transaction.
+      // Underestimated correlated scopes can choose a population sort (including
+      // Incremental Sort) on a shorter index. Use the ordered retention index.
+      // Apply this after identity resolution, whose <=64-node sort stays cheap.
+      await tx.$executeRaw`SET LOCAL enable_sort = off`;
+      await tx.$executeRaw`SET LOCAL enable_incremental_sort = off`;
+      const overflowCandidates = await tx.$queryRaw<
+        { id: string; sessionId: string; prefixDigest: string | null; expiresAt: Date }[]
+      >(affinityRetentionSql(scope, policy.maxRecords));
+      // Filter after the bounded index walk. Filtering expiry in the walk can
+      // scan an entire expired backlog to discover there are no more live rows.
+      const overflow = overflowCandidates.filter((row) => row.expiresAt > now);
+      if (overflow.length) {
+        // A known 200-id IN list can choose a heap scan after VACUUM/reuse
+        // changes its cost. The bounded initplan keeps this a primary-key walk,
+        // just like the expiry batches above, without disabling sequential scans.
+        await tx.$executeRaw`DELETE FROM cache_affinity_record
         WHERE id = ANY(ARRAY(SELECT unnest(${overflow.map(({ id }) => id)}::text[])))`;
-    }
-    // Evict nodes with their footprint, even if old routing hints remain.
-    // Otherwise a later hint overwrite could strand an unbounded orphan session.
-    // Losing an explicit hint at the record bound is conservatively treated
-    // the same way: retention pressure may split identity, never merge it.
-    const lostFootprints = new Set(
-      overflow.filter((row) => row.prefixDigest === null).map((row) => row.sessionId),
-    );
-    const evictedSessions = [...new Set(overflow.map((row) => row.sessionId))];
-    const orphanCandidates = evictedSessions.filter((session) => !lostFootprints.has(session));
-    // Keep unconditional footprint eviction separate. OFFSET 0 below preserves
-    // a per-session existence probe instead of hashing the entire record table.
-    if (lostFootprints.size)
-      await tx.$executeRaw(Prisma.sql`
+      }
+      // Evict nodes with their footprint, even if old routing hints remain.
+      // Otherwise a later hint overwrite could strand an unbounded orphan session.
+      // Losing an explicit hint at the record bound is conservatively treated
+      // the same way: retention pressure may split identity, never merge it.
+      const lostFootprints = new Set(
+        overflow.filter((row) => row.prefixDigest === null).map((row) => row.sessionId),
+      );
+      const evictedSessions = [...new Set(overflow.map((row) => row.sessionId))];
+      const orphanCandidates = evictedSessions.filter((session) => !lostFootprints.has(session));
+      // Keep unconditional footprint eviction separate. OFFSET 0 below preserves
+      // a per-session existence probe instead of hashing the entire record table.
+      if (lostFootprints.size)
+        await tx.$executeRaw(Prisma.sql`
       DELETE FROM cache_affinity_node n
       WHERE n."userId" = ${resourceOwnerId} AND n."tenantUserId" = ${ownerId}
         AND n."poolId" = ${poolId} AND n."executionTargetId" = ${target.executionTargetId}
         AND n."sessionId" = ANY(ARRAY(SELECT unnest(${[...lostFootprints]}::text[])))`);
-    if (orphanCandidates.length)
-      await tx.$executeRaw(Prisma.sql`
+      if (orphanCandidates.length)
+        await tx.$executeRaw(Prisma.sql`
       DELETE FROM cache_affinity_node n
       WHERE n."userId" = ${resourceOwnerId} AND n."tenantUserId" = ${ownerId}
         AND n."poolId" = ${poolId} AND n."executionTargetId" = ${target.executionTargetId}
@@ -1910,19 +2170,42 @@ export async function rememberAffinity({
             AND r."tenantUserId" = n."tenantUserId" AND r."poolId" = n."poolId"
             AND r."executionTargetId" = n."executionTargetId" AND r."sessionId" = n."sessionId"
           LIMIT 1 OFFSET 0)`);
-    // Footprint-only writes help routing, but cannot publish uncommitted chain lineage.
-    if (!tip || lostFootprints.has(sessionId)) return null;
-    return {
-      sessionId,
-      bindingDigest: material.bindingDigest,
-      rootDigest: material.rootDigest,
-      tipDigest: tip?.digest ?? "",
-      tipDepth: tip?.depth ?? 0,
-      canonicalBytes: material.canonicalBytes,
-      estimatedTokens,
-      ...(storedReportedTokens === null ? {} : { reportedTokens: storedReportedTokens }),
-    };
-  }, AFFINITY_TRANSACTION_LIMITS);
+      // Footprint-only writes help routing, but cannot publish uncommitted chain lineage.
+      if (!tip || lostFootprints.has(sessionId)) return null;
+      return {
+        sessionId,
+        bindingDigest: material.bindingDigest,
+        rootDigest: material.rootDigest,
+        tipDigest: tip?.digest ?? "",
+        tipDepth: tip?.depth ?? 0,
+        canonicalBytes: material.canonicalBytes,
+        estimatedTokens,
+        ...(storedReportedTokens === null ? {} : { reportedTokens: storedReportedTokens }),
+        ...(storedReportedPromptTokens === null
+          ? {}
+          : { reportedPromptTokens: storedReportedPromptTokens }),
+      };
+    }, limits);
+  for (let attempt = 0; ; attempt++) {
+    const remaining = AFFINITY_TRANSACTION_LIMITS.timeout - (Date.now() - started);
+    try {
+      return await write(
+        attempt === 0
+          ? AFFINITY_TRANSACTION_LIMITS
+          : {
+              maxWait: Math.min(AFFINITY_TRANSACTION_LIMITS.maxWait, remaining),
+              timeout: remaining,
+            },
+      );
+    } catch (error) {
+      if (
+        attempt >= 2 ||
+        Date.now() - started >= AFFINITY_TRANSACTION_LIMITS.timeout - 100 ||
+        !["55P03", "40P01"].includes(serverTimeoutSqlState(error) ?? "")
+      )
+        throw error;
+    }
+  }
 }
 
 /**

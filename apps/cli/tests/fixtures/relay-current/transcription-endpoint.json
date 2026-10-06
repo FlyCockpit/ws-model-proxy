@@ -1,0 +1,37 @@
+{
+  "defaultCapabilities": {
+    "audio": {
+      "transcriptions": {
+        "acceptedMimeTypes": ["audio/wav", "audio/mpeg"],
+        "languageDetection": true,
+        "languages": ["en", "es"],
+        "maxUploadBytes": 26214400,
+        "responseFormats": ["json", "verbose_json", "text"],
+        "streaming": true,
+        "supported": true,
+        "timestampGranularities": ["word"]
+      }
+    },
+    "models": {
+      "list": true
+    },
+    "protocol": "openai-compatible",
+    "version": 2
+  },
+  "engineFacts": {
+    "engine": {
+      "source": "config",
+      "value": "generic"
+    }
+  },
+  "kind": "openai-compatible",
+  "label": "inst-fixture-1",
+  "models": [
+    {
+      "capabilityOverrideMode": "inherit",
+      "upstreamModelId": "fixture"
+    }
+  ],
+  "slug": "inst-fixture-1",
+  "status": "online"
+}

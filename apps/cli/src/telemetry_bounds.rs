@@ -17,7 +17,7 @@
 //!   metric name, disk mount) cannot be sent are dropped.
 //!
 //! The bounds below mirror the server schema one to one; the table-driven
-//! test and the shared `relay-2.7/*-extreme.json` vectors (parsed by the
+//! test and the shared `relay-2.4/*-extreme.json` vectors (parsed by the
 //! server's tests) keep the two sides in step.
 
 use crate::protocol::{
@@ -475,6 +475,7 @@ mod tests {
                 },
             ],
             engine_adapters: Vec::new(),
+            abandoned_recovery: None,
         }
     }
 
@@ -490,6 +491,8 @@ mod tests {
             deferred: Some(LOAD_COUNT_MAX),
             prefix_cache_hits_delta: Some(u64::MAX),
             prefix_cache_queries_delta: Some(BYTE_COUNTER_MAX),
+            prefix_cache_reset: None,
+            counter_epoch: 0,
             source: LoadSource::VllmMetrics,
             ts: "2026-09-28T12:00:01.000Z".to_string(),
         }
@@ -513,7 +516,7 @@ mod tests {
         assert_eq!(
             conformed(ClientControlMessage::NodeInfo(extreme_node_info())),
             vector(include_str!(
-                "../tests/fixtures/relay-2.7/node-info-extreme.json"
+                "../tests/fixtures/relay-2.4/node-info-extreme.json"
             ))
         );
     }
@@ -523,7 +526,7 @@ mod tests {
         assert_eq!(
             conformed(ClientControlMessage::NodeMetrics(extreme_node_metrics())),
             vector(include_str!(
-                "../tests/fixtures/relay-2.7/node-metrics-extreme.json"
+                "../tests/fixtures/relay-2.4/node-metrics-extreme.json"
             ))
         );
     }
@@ -533,7 +536,7 @@ mod tests {
         assert_eq!(
             conformed(ClientControlMessage::EndpointLoad(extreme_load())),
             vector(include_str!(
-                "../tests/fixtures/relay-2.7/endpoint-load-extreme.json"
+                "../tests/fixtures/relay-2.4/endpoint-load-extreme.json"
             ))
         );
     }

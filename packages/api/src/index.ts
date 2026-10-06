@@ -39,6 +39,20 @@ const requireRequiredTwoFactor = o.middleware(async ({ context, next }) => {
 
 export const protectedProcedure = authenticatedProcedure.use(requireRequiredTwoFactor);
 
+const requireHuman = o.middleware(async ({ context, next }) => {
+  // MCP contexts carry a deployment actor; a person's session never does.
+  if (context.services?.deploymentActor)
+    throw new ORPCError("FORBIDDEN", { message: "This action requires a person." });
+  return next();
+});
+
+/**
+ * A protected procedure only a person may call: consent, credentials and
+ * paid-egress switches. Refused in the procedure itself, not only by leaving
+ * it out of the MCP tool manifest.
+ */
+export const humanProcedure = protectedProcedure.use(requireHuman);
+
 const requireAdmin = o.middleware(async ({ context, next }) => {
   // `requireAuth` is always chained before this middleware, so session is
   // non-null at runtime — but the middleware-chain types don't carry that

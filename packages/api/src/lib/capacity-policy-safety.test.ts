@@ -7,6 +7,7 @@ import {
   assertModelPoolCapacityPolicy,
   fenceExecutionTargetIdentities,
   fenceExecutionTargetPolicies,
+  GUARDED_CREATE_POLICY_FIELDS,
 } from "./capacity-policy-safety";
 
 function thrownBy(action: () => void): ORPCError {
@@ -247,9 +248,7 @@ describe("capacity policy safety", () => {
     ).toMatchObject({ reason: "POOL_POLICY_INVALID" });
   });
 
-  it("keeps the prior error envelope for callers that omit reasons", () => {
-    // Every other caller of these shared helpers passes no reasons; their
-    // thrown ORPCError must carry no `data` field, byte-for-byte as before.
+  it("names the failing fields even when the caller omits a reason code", () => {
     expect(
       thrownBy(() =>
         assertModelPoolCapacityPolicy({
@@ -259,7 +258,24 @@ describe("capacity policy safety", () => {
           contextMargin: 0,
         }),
       ).data,
-    ).toBeUndefined();
+    ).toEqual({ fields: ["capacityReservedSlots", "capacityConcurrencyLimit"] });
+    expect(
+      thrownBy(() =>
+        assertModelPoolCapacityPolicy(
+          {
+            concurrencyLimit: 2,
+            reservedSlots: 3,
+            contextCeiling: null,
+            contextMargin: 0,
+          },
+          "POOL_POLICY_INVALID",
+          GUARDED_CREATE_POLICY_FIELDS,
+        ),
+      ).data,
+    ).toEqual({
+      reason: "POOL_POLICY_INVALID",
+      fields: ["reservedSlots", "memberConcurrencyLimit"],
+    });
     expect(
       thrownBy(() =>
         assertModelPoolCapacityPolicy({
@@ -269,7 +285,7 @@ describe("capacity policy safety", () => {
           contextMargin: 100,
         }),
       ).data,
-    ).toBeUndefined();
+    ).toEqual({ fields: ["capacityContextMargin", "capacityContextCeiling"] });
     expect(
       thrownBy(() =>
         assertEffectiveConcurrencyPolicy({
@@ -279,7 +295,7 @@ describe("capacity policy safety", () => {
           memberMode: "INHERIT",
         }),
       ).data,
-    ).toBeUndefined();
+    ).toEqual({ fields: ["capacityReservedSlots", "capacityConcurrencyLimit"] });
     expect(
       thrownBy(() =>
         assertEffectiveConcurrencyPolicy({
@@ -289,7 +305,9 @@ describe("capacity policy safety", () => {
           memberMode: "INHERIT",
         }),
       ).data,
-    ).toBeUndefined();
+    ).toEqual({
+      fields: ["capacityConcurrencyLimit", "hardConcurrencyLimit", "directConcurrencyLimit"],
+    });
     expect(
       thrownBy(() =>
         assertEffectiveConcurrencyPolicy({
@@ -299,7 +317,9 @@ describe("capacity policy safety", () => {
           memberMode: "UNLIMITED",
         }),
       ).data,
-    ).toBeUndefined();
+    ).toEqual({
+      fields: ["capacityReservedSlots", "hardConcurrencyLimit", "directReservedSlots"],
+    });
     expect(
       thrownBy(() =>
         assertEffectiveContextPolicy({
@@ -311,7 +331,14 @@ describe("capacity policy safety", () => {
           memberMargin: 100,
         }),
       ).data,
-    ).toBeUndefined();
+    ).toEqual({
+      fields: [
+        "capacityContextMargin",
+        "capacityContextCeiling",
+        "directContextMargin",
+        "directContextCeiling",
+      ],
+    });
     expect(
       thrownBy(() =>
         assertEffectiveContextPolicy({
@@ -321,7 +348,15 @@ describe("capacity policy safety", () => {
           memberMode: "INHERIT",
         }),
       ).data,
-    ).toBeUndefined();
+    ).toEqual({
+      fields: [
+        "capacityContextCeiling",
+        "capacityContextMargin",
+        "directContextCeiling",
+        "directContextMargin",
+        "physicalMaxContext",
+      ],
+    });
   });
 
   it("fences unique execution-target policies in one sorted call, without row locks", async () => {

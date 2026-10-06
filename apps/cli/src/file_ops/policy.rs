@@ -345,6 +345,7 @@ fn is_recovery_path(path: &Path) -> bool {
     super::redact::fold(&path.to_string_lossy())
         .split('/')
         .any(|name| {
+            let name = name.strip_prefix(".wsmp-lock-").unwrap_or(name);
             name.strip_prefix(".wsmp-recover-").is_some_and(|suffix| {
                 suffix.len() == 10 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
             })
@@ -445,12 +446,21 @@ fn default_protected() -> Vec<Protected> {
         deny,
     };
     if let Ok(state) = crate::paths::state_dir() {
+        // Generic atomic siblings contain private credentials/authority too.
+        // Protect this app-owned directory through configured and physical
+        // aliases, including parent moves; unrelated user paths stay accessible.
+        out.push(Protected {
+            path: state.clone(),
+            subtree: true,
+            deny: Deny::ReadWrite,
+        });
         for name in [
             "device-auth.json",
             "terminal-identity.json",
             "terminal-approvals.json",
             "terminal-approval-pending.json",
             "instances.json",
+            "instances.lock",
             "relay-control.sock",
         ] {
             out.push(file(state.join(name), Deny::ReadWrite));
@@ -470,6 +480,67 @@ fn default_protected() -> Vec<Protected> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_state_subtree_is_protected_at_actual_policy_boundary() {
+        if let Some(root) = std::env::var_os("WSMP_PRIVATE_STATE_FIXTURE") {
+            let root = PathBuf::from(root);
+            let state = root.join("state");
+            std::fs::create_dir(&state).unwrap();
+            std::os::unix::fs::symlink(&state, root.join("state-alias")).unwrap();
+            let policy = Policy::from_environment(vec![], true);
+            // `check_path` decides on physical paths (callers resolve first),
+            // so the state dir is checked under its physical name and under the
+            // configured alias. macOS temp dirs sit behind the `/var` ->
+            // `/private/var` symlink, so the fixture root itself is resolved.
+            let configured = root.join("state-alias");
+            let root = std::fs::canonicalize(&root).unwrap();
+            for dir in [root.join("state"), configured] {
+                for name in [
+                    "instances.json",
+                    "instances.lock",
+                    ".tmpInFlightAuthority",
+                    "nested/future-state",
+                ] {
+                    for access in [Access::Read, Access::Write, Access::Remove] {
+                        assert!(
+                            policy.check_path(access, &dir.join(name)).is_err(),
+                            "{}/{name} {access:?}",
+                            dir.display()
+                        );
+                    }
+                }
+            }
+            assert!(policy.check_path(Access::Remove, &root).is_err());
+            for access in [Access::Read, Access::Write] {
+                assert!(
+                    policy
+                        .check_path(access, &root.join("ordinary-user-file"))
+                        .is_ok()
+                );
+            }
+            assert!(
+                policy
+                    .check_path(Access::Read, &root.join("config.json"))
+                    .is_ok(),
+                "separate config remains readable"
+            );
+            assert!(
+                policy
+                    .check_path(Access::Write, &root.join("config.json"))
+                    .is_err()
+            );
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "file_ops::policy::tests::private_state_subtree_is_protected_at_actual_policy_boundary", "--nocapture"])
+            .env("WSMP_PRIVATE_STATE_FIXTURE", fixture.path())
+            .env("WSMP_STATE_DIR", fixture.path().join("state-alias"))
+            .env("WSMP_CONFIG", fixture.path().join("config.json"))
+            .status().unwrap();
+        assert!(status.success());
+    }
 
     #[test]
     fn root_snapshot_parser_is_strict_and_preserves_deny_all() {

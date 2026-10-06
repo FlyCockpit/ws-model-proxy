@@ -28,14 +28,15 @@ import { Route as LangAdminObservabilityRouteImport } from './routes/$lang/admin
 import { Route as LangAdminSettingsRouteImport } from './routes/$lang/admin/settings'
 import { Route as LangAdminUsersRouteImport } from './routes/$lang/admin/users'
 import { Route as LangAuthDashboardIndexRouteImport } from './routes/$lang/_auth/dashboard/index'
-import { Route as LangAuthDashboardCapacityRouteImport } from './routes/$lang/_auth/dashboard/capacity'
+import { Route as LangAuthDashboardApiTokensRouteImport } from './routes/$lang/_auth/dashboard/api-tokens'
 import { Route as LangAuthDashboardChatTestRouteImport } from './routes/$lang/_auth/dashboard/chat-test'
 import { Route as LangAuthDashboardCliTokensRouteImport } from './routes/$lang/_auth/dashboard/cli-tokens'
 import { Route as LangAuthDashboardClisRouteImport } from './routes/$lang/_auth/dashboard/clis'
-import { Route as LangAuthDashboardModelApiTokensRouteImport } from './routes/$lang/_auth/dashboard/model-api-tokens'
+import { Route as LangAuthDashboardCloudProvidersRouteImport } from './routes/$lang/_auth/dashboard/cloud-providers'
+import { Route as LangAuthDashboardDeploymentsRouteImport } from './routes/$lang/_auth/dashboard/deployments'
 import { Route as LangAuthDashboardPoolsRouteImport } from './routes/$lang/_auth/dashboard/pools'
-import { Route as LangAuthDashboardProvidersRouteImport } from './routes/$lang/_auth/dashboard/providers'
-import { Route as LangAuthDashboardRelayMetadataRouteImport } from './routes/$lang/_auth/dashboard/relay-metadata'
+import { Route as LangAuthDashboardRequestLogRouteImport } from './routes/$lang/_auth/dashboard/request-log'
+import { Route as LangAuthDashboardRuntimesRouteImport } from './routes/$lang/_auth/dashboard/runtimes'
 import { Route as LangAuthDashboardTerminalsRouteImport } from './routes/$lang/_auth/dashboard/terminals'
 import { Route as LangAuthSettingsIndexRouteImport } from './routes/$lang/_auth/settings/index'
 import { Route as LangAuthSettingsMcpRouteImport } from './routes/$lang/_auth/settings/mcp'
@@ -44,11 +45,12 @@ import { Route as LangAuthDashboardPoolsIndexRouteImport } from './routes/$lang/
 import { Route as LangAuthDashboardPoolsPoolIdRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId'
 import { Route as LangAuthDashboardPoolsNewRouteImport } from './routes/$lang/_auth/dashboard/pools/new'
 import { Route as LangAuthDashboardPoolsPoolIdIndexRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId/index'
-import { Route as LangAuthDashboardPoolsPoolIdAccessRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId/access'
-import { Route as LangAuthDashboardPoolsPoolIdCapacityRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId/capacity'
 import { Route as LangAuthDashboardPoolsPoolIdFallbackRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId/fallback'
+import { Route as LangAuthDashboardPoolsPoolIdLimitsRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId/limits'
 import { Route as LangAuthDashboardPoolsPoolIdMediaRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId/media'
 import { Route as LangAuthDashboardPoolsPoolIdRoutingRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId/routing'
+import { Route as LangAuthDashboardPoolsPoolIdSettingsRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId/settings'
+import { Route as LangAuthDashboardPoolsPoolIdSharingRouteImport } from './routes/$lang/_auth/dashboard/pools/$poolId/sharing'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -144,10 +146,10 @@ const LangAuthDashboardIndexRoute = LangAuthDashboardIndexRouteImport.update({
   path: '/',
   getParentRoute: () => LangAuthDashboardRoute,
 } as any)
-const LangAuthDashboardCapacityRoute =
-  LangAuthDashboardCapacityRouteImport.update({
-    id: '/capacity',
-    path: '/capacity',
+const LangAuthDashboardApiTokensRoute =
+  LangAuthDashboardApiTokensRouteImport.update({
+    id: '/api-tokens',
+    path: '/api-tokens',
     getParentRoute: () => LangAuthDashboardRoute,
   } as any)
 const LangAuthDashboardChatTestRoute =
@@ -167,10 +169,16 @@ const LangAuthDashboardClisRoute = LangAuthDashboardClisRouteImport.update({
   path: '/clis',
   getParentRoute: () => LangAuthDashboardRoute,
 } as any)
-const LangAuthDashboardModelApiTokensRoute =
-  LangAuthDashboardModelApiTokensRouteImport.update({
-    id: '/model-api-tokens',
-    path: '/model-api-tokens',
+const LangAuthDashboardCloudProvidersRoute =
+  LangAuthDashboardCloudProvidersRouteImport.update({
+    id: '/cloud-providers',
+    path: '/cloud-providers',
+    getParentRoute: () => LangAuthDashboardRoute,
+  } as any)
+const LangAuthDashboardDeploymentsRoute =
+  LangAuthDashboardDeploymentsRouteImport.update({
+    id: '/deployments',
+    path: '/deployments',
     getParentRoute: () => LangAuthDashboardRoute,
   } as any)
 const LangAuthDashboardPoolsRoute = LangAuthDashboardPoolsRouteImport.update({
@@ -178,16 +186,16 @@ const LangAuthDashboardPoolsRoute = LangAuthDashboardPoolsRouteImport.update({
   path: '/pools',
   getParentRoute: () => LangAuthDashboardRoute,
 } as any)
-const LangAuthDashboardProvidersRoute =
-  LangAuthDashboardProvidersRouteImport.update({
-    id: '/providers',
-    path: '/providers',
+const LangAuthDashboardRequestLogRoute =
+  LangAuthDashboardRequestLogRouteImport.update({
+    id: '/request-log',
+    path: '/request-log',
     getParentRoute: () => LangAuthDashboardRoute,
   } as any)
-const LangAuthDashboardRelayMetadataRoute =
-  LangAuthDashboardRelayMetadataRouteImport.update({
-    id: '/relay-metadata',
-    path: '/relay-metadata',
+const LangAuthDashboardRuntimesRoute =
+  LangAuthDashboardRuntimesRouteImport.update({
+    id: '/runtimes',
+    path: '/runtimes',
     getParentRoute: () => LangAuthDashboardRoute,
   } as any)
 const LangAuthDashboardTerminalsRoute =
@@ -236,22 +244,16 @@ const LangAuthDashboardPoolsPoolIdIndexRoute =
     path: '/',
     getParentRoute: () => LangAuthDashboardPoolsPoolIdRoute,
   } as any)
-const LangAuthDashboardPoolsPoolIdAccessRoute =
-  LangAuthDashboardPoolsPoolIdAccessRouteImport.update({
-    id: '/access',
-    path: '/access',
-    getParentRoute: () => LangAuthDashboardPoolsPoolIdRoute,
-  } as any)
-const LangAuthDashboardPoolsPoolIdCapacityRoute =
-  LangAuthDashboardPoolsPoolIdCapacityRouteImport.update({
-    id: '/capacity',
-    path: '/capacity',
-    getParentRoute: () => LangAuthDashboardPoolsPoolIdRoute,
-  } as any)
 const LangAuthDashboardPoolsPoolIdFallbackRoute =
   LangAuthDashboardPoolsPoolIdFallbackRouteImport.update({
     id: '/fallback',
     path: '/fallback',
+    getParentRoute: () => LangAuthDashboardPoolsPoolIdRoute,
+  } as any)
+const LangAuthDashboardPoolsPoolIdLimitsRoute =
+  LangAuthDashboardPoolsPoolIdLimitsRouteImport.update({
+    id: '/limits',
+    path: '/limits',
     getParentRoute: () => LangAuthDashboardPoolsPoolIdRoute,
   } as any)
 const LangAuthDashboardPoolsPoolIdMediaRoute =
@@ -264,6 +266,18 @@ const LangAuthDashboardPoolsPoolIdRoutingRoute =
   LangAuthDashboardPoolsPoolIdRoutingRouteImport.update({
     id: '/routing',
     path: '/routing',
+    getParentRoute: () => LangAuthDashboardPoolsPoolIdRoute,
+  } as any)
+const LangAuthDashboardPoolsPoolIdSettingsRoute =
+  LangAuthDashboardPoolsPoolIdSettingsRouteImport.update({
+    id: '/settings',
+    path: '/settings',
+    getParentRoute: () => LangAuthDashboardPoolsPoolIdRoute,
+  } as any)
+const LangAuthDashboardPoolsPoolIdSharingRoute =
+  LangAuthDashboardPoolsPoolIdSharingRouteImport.update({
+    id: '/sharing',
+    path: '/sharing',
     getParentRoute: () => LangAuthDashboardPoolsPoolIdRoute,
   } as any)
 
@@ -285,14 +299,15 @@ export interface FileRoutesByFullPath {
   '/$lang/admin/settings': typeof LangAdminSettingsRoute
   '/$lang/admin/users': typeof LangAdminUsersRoute
   '/$lang/admin/': typeof LangAdminIndexRoute
-  '/$lang/dashboard/capacity': typeof LangAuthDashboardCapacityRoute
+  '/$lang/dashboard/api-tokens': typeof LangAuthDashboardApiTokensRoute
   '/$lang/dashboard/chat-test': typeof LangAuthDashboardChatTestRoute
   '/$lang/dashboard/cli-tokens': typeof LangAuthDashboardCliTokensRoute
   '/$lang/dashboard/clis': typeof LangAuthDashboardClisRoute
-  '/$lang/dashboard/model-api-tokens': typeof LangAuthDashboardModelApiTokensRoute
+  '/$lang/dashboard/cloud-providers': typeof LangAuthDashboardCloudProvidersRoute
+  '/$lang/dashboard/deployments': typeof LangAuthDashboardDeploymentsRoute
   '/$lang/dashboard/pools': typeof LangAuthDashboardPoolsRouteWithChildren
-  '/$lang/dashboard/providers': typeof LangAuthDashboardProvidersRoute
-  '/$lang/dashboard/relay-metadata': typeof LangAuthDashboardRelayMetadataRoute
+  '/$lang/dashboard/request-log': typeof LangAuthDashboardRequestLogRoute
+  '/$lang/dashboard/runtimes': typeof LangAuthDashboardRuntimesRoute
   '/$lang/dashboard/terminals': typeof LangAuthDashboardTerminalsRoute
   '/$lang/settings/mcp': typeof LangAuthSettingsMcpRoute
   '/$lang/settings/security': typeof LangAuthSettingsSecurityRoute
@@ -301,11 +316,12 @@ export interface FileRoutesByFullPath {
   '/$lang/dashboard/pools/$poolId': typeof LangAuthDashboardPoolsPoolIdRouteWithChildren
   '/$lang/dashboard/pools/new': typeof LangAuthDashboardPoolsNewRoute
   '/$lang/dashboard/pools/': typeof LangAuthDashboardPoolsIndexRoute
-  '/$lang/dashboard/pools/$poolId/access': typeof LangAuthDashboardPoolsPoolIdAccessRoute
-  '/$lang/dashboard/pools/$poolId/capacity': typeof LangAuthDashboardPoolsPoolIdCapacityRoute
   '/$lang/dashboard/pools/$poolId/fallback': typeof LangAuthDashboardPoolsPoolIdFallbackRoute
+  '/$lang/dashboard/pools/$poolId/limits': typeof LangAuthDashboardPoolsPoolIdLimitsRoute
   '/$lang/dashboard/pools/$poolId/media': typeof LangAuthDashboardPoolsPoolIdMediaRoute
   '/$lang/dashboard/pools/$poolId/routing': typeof LangAuthDashboardPoolsPoolIdRoutingRoute
+  '/$lang/dashboard/pools/$poolId/settings': typeof LangAuthDashboardPoolsPoolIdSettingsRoute
+  '/$lang/dashboard/pools/$poolId/sharing': typeof LangAuthDashboardPoolsPoolIdSharingRoute
   '/$lang/dashboard/pools/$poolId/': typeof LangAuthDashboardPoolsPoolIdIndexRoute
 }
 export interface FileRoutesByTo {
@@ -322,13 +338,14 @@ export interface FileRoutesByTo {
   '/$lang/admin/settings': typeof LangAdminSettingsRoute
   '/$lang/admin/users': typeof LangAdminUsersRoute
   '/$lang/admin': typeof LangAdminIndexRoute
-  '/$lang/dashboard/capacity': typeof LangAuthDashboardCapacityRoute
+  '/$lang/dashboard/api-tokens': typeof LangAuthDashboardApiTokensRoute
   '/$lang/dashboard/chat-test': typeof LangAuthDashboardChatTestRoute
   '/$lang/dashboard/cli-tokens': typeof LangAuthDashboardCliTokensRoute
   '/$lang/dashboard/clis': typeof LangAuthDashboardClisRoute
-  '/$lang/dashboard/model-api-tokens': typeof LangAuthDashboardModelApiTokensRoute
-  '/$lang/dashboard/providers': typeof LangAuthDashboardProvidersRoute
-  '/$lang/dashboard/relay-metadata': typeof LangAuthDashboardRelayMetadataRoute
+  '/$lang/dashboard/cloud-providers': typeof LangAuthDashboardCloudProvidersRoute
+  '/$lang/dashboard/deployments': typeof LangAuthDashboardDeploymentsRoute
+  '/$lang/dashboard/request-log': typeof LangAuthDashboardRequestLogRoute
+  '/$lang/dashboard/runtimes': typeof LangAuthDashboardRuntimesRoute
   '/$lang/dashboard/terminals': typeof LangAuthDashboardTerminalsRoute
   '/$lang/settings/mcp': typeof LangAuthSettingsMcpRoute
   '/$lang/settings/security': typeof LangAuthSettingsSecurityRoute
@@ -336,11 +353,12 @@ export interface FileRoutesByTo {
   '/$lang/settings': typeof LangAuthSettingsIndexRoute
   '/$lang/dashboard/pools/new': typeof LangAuthDashboardPoolsNewRoute
   '/$lang/dashboard/pools': typeof LangAuthDashboardPoolsIndexRoute
-  '/$lang/dashboard/pools/$poolId/access': typeof LangAuthDashboardPoolsPoolIdAccessRoute
-  '/$lang/dashboard/pools/$poolId/capacity': typeof LangAuthDashboardPoolsPoolIdCapacityRoute
   '/$lang/dashboard/pools/$poolId/fallback': typeof LangAuthDashboardPoolsPoolIdFallbackRoute
+  '/$lang/dashboard/pools/$poolId/limits': typeof LangAuthDashboardPoolsPoolIdLimitsRoute
   '/$lang/dashboard/pools/$poolId/media': typeof LangAuthDashboardPoolsPoolIdMediaRoute
   '/$lang/dashboard/pools/$poolId/routing': typeof LangAuthDashboardPoolsPoolIdRoutingRoute
+  '/$lang/dashboard/pools/$poolId/settings': typeof LangAuthDashboardPoolsPoolIdSettingsRoute
+  '/$lang/dashboard/pools/$poolId/sharing': typeof LangAuthDashboardPoolsPoolIdSharingRoute
   '/$lang/dashboard/pools/$poolId': typeof LangAuthDashboardPoolsPoolIdIndexRoute
 }
 export interface FileRoutesById {
@@ -363,14 +381,15 @@ export interface FileRoutesById {
   '/$lang/admin/settings': typeof LangAdminSettingsRoute
   '/$lang/admin/users': typeof LangAdminUsersRoute
   '/$lang/admin/': typeof LangAdminIndexRoute
-  '/$lang/_auth/dashboard/capacity': typeof LangAuthDashboardCapacityRoute
+  '/$lang/_auth/dashboard/api-tokens': typeof LangAuthDashboardApiTokensRoute
   '/$lang/_auth/dashboard/chat-test': typeof LangAuthDashboardChatTestRoute
   '/$lang/_auth/dashboard/cli-tokens': typeof LangAuthDashboardCliTokensRoute
   '/$lang/_auth/dashboard/clis': typeof LangAuthDashboardClisRoute
-  '/$lang/_auth/dashboard/model-api-tokens': typeof LangAuthDashboardModelApiTokensRoute
+  '/$lang/_auth/dashboard/cloud-providers': typeof LangAuthDashboardCloudProvidersRoute
+  '/$lang/_auth/dashboard/deployments': typeof LangAuthDashboardDeploymentsRoute
   '/$lang/_auth/dashboard/pools': typeof LangAuthDashboardPoolsRouteWithChildren
-  '/$lang/_auth/dashboard/providers': typeof LangAuthDashboardProvidersRoute
-  '/$lang/_auth/dashboard/relay-metadata': typeof LangAuthDashboardRelayMetadataRoute
+  '/$lang/_auth/dashboard/request-log': typeof LangAuthDashboardRequestLogRoute
+  '/$lang/_auth/dashboard/runtimes': typeof LangAuthDashboardRuntimesRoute
   '/$lang/_auth/dashboard/terminals': typeof LangAuthDashboardTerminalsRoute
   '/$lang/_auth/settings/mcp': typeof LangAuthSettingsMcpRoute
   '/$lang/_auth/settings/security': typeof LangAuthSettingsSecurityRoute
@@ -379,11 +398,12 @@ export interface FileRoutesById {
   '/$lang/_auth/dashboard/pools/$poolId': typeof LangAuthDashboardPoolsPoolIdRouteWithChildren
   '/$lang/_auth/dashboard/pools/new': typeof LangAuthDashboardPoolsNewRoute
   '/$lang/_auth/dashboard/pools/': typeof LangAuthDashboardPoolsIndexRoute
-  '/$lang/_auth/dashboard/pools/$poolId/access': typeof LangAuthDashboardPoolsPoolIdAccessRoute
-  '/$lang/_auth/dashboard/pools/$poolId/capacity': typeof LangAuthDashboardPoolsPoolIdCapacityRoute
   '/$lang/_auth/dashboard/pools/$poolId/fallback': typeof LangAuthDashboardPoolsPoolIdFallbackRoute
+  '/$lang/_auth/dashboard/pools/$poolId/limits': typeof LangAuthDashboardPoolsPoolIdLimitsRoute
   '/$lang/_auth/dashboard/pools/$poolId/media': typeof LangAuthDashboardPoolsPoolIdMediaRoute
   '/$lang/_auth/dashboard/pools/$poolId/routing': typeof LangAuthDashboardPoolsPoolIdRoutingRoute
+  '/$lang/_auth/dashboard/pools/$poolId/settings': typeof LangAuthDashboardPoolsPoolIdSettingsRoute
+  '/$lang/_auth/dashboard/pools/$poolId/sharing': typeof LangAuthDashboardPoolsPoolIdSharingRoute
   '/$lang/_auth/dashboard/pools/$poolId/': typeof LangAuthDashboardPoolsPoolIdIndexRoute
 }
 export interface FileRouteTypes {
@@ -406,14 +426,15 @@ export interface FileRouteTypes {
     | '/$lang/admin/settings'
     | '/$lang/admin/users'
     | '/$lang/admin/'
-    | '/$lang/dashboard/capacity'
+    | '/$lang/dashboard/api-tokens'
     | '/$lang/dashboard/chat-test'
     | '/$lang/dashboard/cli-tokens'
     | '/$lang/dashboard/clis'
-    | '/$lang/dashboard/model-api-tokens'
+    | '/$lang/dashboard/cloud-providers'
+    | '/$lang/dashboard/deployments'
     | '/$lang/dashboard/pools'
-    | '/$lang/dashboard/providers'
-    | '/$lang/dashboard/relay-metadata'
+    | '/$lang/dashboard/request-log'
+    | '/$lang/dashboard/runtimes'
     | '/$lang/dashboard/terminals'
     | '/$lang/settings/mcp'
     | '/$lang/settings/security'
@@ -422,11 +443,12 @@ export interface FileRouteTypes {
     | '/$lang/dashboard/pools/$poolId'
     | '/$lang/dashboard/pools/new'
     | '/$lang/dashboard/pools/'
-    | '/$lang/dashboard/pools/$poolId/access'
-    | '/$lang/dashboard/pools/$poolId/capacity'
     | '/$lang/dashboard/pools/$poolId/fallback'
+    | '/$lang/dashboard/pools/$poolId/limits'
     | '/$lang/dashboard/pools/$poolId/media'
     | '/$lang/dashboard/pools/$poolId/routing'
+    | '/$lang/dashboard/pools/$poolId/settings'
+    | '/$lang/dashboard/pools/$poolId/sharing'
     | '/$lang/dashboard/pools/$poolId/'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -443,13 +465,14 @@ export interface FileRouteTypes {
     | '/$lang/admin/settings'
     | '/$lang/admin/users'
     | '/$lang/admin'
-    | '/$lang/dashboard/capacity'
+    | '/$lang/dashboard/api-tokens'
     | '/$lang/dashboard/chat-test'
     | '/$lang/dashboard/cli-tokens'
     | '/$lang/dashboard/clis'
-    | '/$lang/dashboard/model-api-tokens'
-    | '/$lang/dashboard/providers'
-    | '/$lang/dashboard/relay-metadata'
+    | '/$lang/dashboard/cloud-providers'
+    | '/$lang/dashboard/deployments'
+    | '/$lang/dashboard/request-log'
+    | '/$lang/dashboard/runtimes'
     | '/$lang/dashboard/terminals'
     | '/$lang/settings/mcp'
     | '/$lang/settings/security'
@@ -457,11 +480,12 @@ export interface FileRouteTypes {
     | '/$lang/settings'
     | '/$lang/dashboard/pools/new'
     | '/$lang/dashboard/pools'
-    | '/$lang/dashboard/pools/$poolId/access'
-    | '/$lang/dashboard/pools/$poolId/capacity'
     | '/$lang/dashboard/pools/$poolId/fallback'
+    | '/$lang/dashboard/pools/$poolId/limits'
     | '/$lang/dashboard/pools/$poolId/media'
     | '/$lang/dashboard/pools/$poolId/routing'
+    | '/$lang/dashboard/pools/$poolId/settings'
+    | '/$lang/dashboard/pools/$poolId/sharing'
     | '/$lang/dashboard/pools/$poolId'
   id:
     | '__root__'
@@ -483,14 +507,15 @@ export interface FileRouteTypes {
     | '/$lang/admin/settings'
     | '/$lang/admin/users'
     | '/$lang/admin/'
-    | '/$lang/_auth/dashboard/capacity'
+    | '/$lang/_auth/dashboard/api-tokens'
     | '/$lang/_auth/dashboard/chat-test'
     | '/$lang/_auth/dashboard/cli-tokens'
     | '/$lang/_auth/dashboard/clis'
-    | '/$lang/_auth/dashboard/model-api-tokens'
+    | '/$lang/_auth/dashboard/cloud-providers'
+    | '/$lang/_auth/dashboard/deployments'
     | '/$lang/_auth/dashboard/pools'
-    | '/$lang/_auth/dashboard/providers'
-    | '/$lang/_auth/dashboard/relay-metadata'
+    | '/$lang/_auth/dashboard/request-log'
+    | '/$lang/_auth/dashboard/runtimes'
     | '/$lang/_auth/dashboard/terminals'
     | '/$lang/_auth/settings/mcp'
     | '/$lang/_auth/settings/security'
@@ -499,11 +524,12 @@ export interface FileRouteTypes {
     | '/$lang/_auth/dashboard/pools/$poolId'
     | '/$lang/_auth/dashboard/pools/new'
     | '/$lang/_auth/dashboard/pools/'
-    | '/$lang/_auth/dashboard/pools/$poolId/access'
-    | '/$lang/_auth/dashboard/pools/$poolId/capacity'
     | '/$lang/_auth/dashboard/pools/$poolId/fallback'
+    | '/$lang/_auth/dashboard/pools/$poolId/limits'
     | '/$lang/_auth/dashboard/pools/$poolId/media'
     | '/$lang/_auth/dashboard/pools/$poolId/routing'
+    | '/$lang/_auth/dashboard/pools/$poolId/settings'
+    | '/$lang/_auth/dashboard/pools/$poolId/sharing'
     | '/$lang/_auth/dashboard/pools/$poolId/'
   fileRoutesById: FileRoutesById
 }
@@ -647,11 +673,11 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAuthDashboardIndexRouteImport
       parentRoute: typeof LangAuthDashboardRoute
     }
-    '/$lang/_auth/dashboard/capacity': {
-      id: '/$lang/_auth/dashboard/capacity'
-      path: '/capacity'
-      fullPath: '/$lang/dashboard/capacity'
-      preLoaderRoute: typeof LangAuthDashboardCapacityRouteImport
+    '/$lang/_auth/dashboard/api-tokens': {
+      id: '/$lang/_auth/dashboard/api-tokens'
+      path: '/api-tokens'
+      fullPath: '/$lang/dashboard/api-tokens'
+      preLoaderRoute: typeof LangAuthDashboardApiTokensRouteImport
       parentRoute: typeof LangAuthDashboardRoute
     }
     '/$lang/_auth/dashboard/chat-test': {
@@ -675,11 +701,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAuthDashboardClisRouteImport
       parentRoute: typeof LangAuthDashboardRoute
     }
-    '/$lang/_auth/dashboard/model-api-tokens': {
-      id: '/$lang/_auth/dashboard/model-api-tokens'
-      path: '/model-api-tokens'
-      fullPath: '/$lang/dashboard/model-api-tokens'
-      preLoaderRoute: typeof LangAuthDashboardModelApiTokensRouteImport
+    '/$lang/_auth/dashboard/cloud-providers': {
+      id: '/$lang/_auth/dashboard/cloud-providers'
+      path: '/cloud-providers'
+      fullPath: '/$lang/dashboard/cloud-providers'
+      preLoaderRoute: typeof LangAuthDashboardCloudProvidersRouteImport
+      parentRoute: typeof LangAuthDashboardRoute
+    }
+    '/$lang/_auth/dashboard/deployments': {
+      id: '/$lang/_auth/dashboard/deployments'
+      path: '/deployments'
+      fullPath: '/$lang/dashboard/deployments'
+      preLoaderRoute: typeof LangAuthDashboardDeploymentsRouteImport
       parentRoute: typeof LangAuthDashboardRoute
     }
     '/$lang/_auth/dashboard/pools': {
@@ -689,18 +722,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAuthDashboardPoolsRouteImport
       parentRoute: typeof LangAuthDashboardRoute
     }
-    '/$lang/_auth/dashboard/providers': {
-      id: '/$lang/_auth/dashboard/providers'
-      path: '/providers'
-      fullPath: '/$lang/dashboard/providers'
-      preLoaderRoute: typeof LangAuthDashboardProvidersRouteImport
+    '/$lang/_auth/dashboard/request-log': {
+      id: '/$lang/_auth/dashboard/request-log'
+      path: '/request-log'
+      fullPath: '/$lang/dashboard/request-log'
+      preLoaderRoute: typeof LangAuthDashboardRequestLogRouteImport
       parentRoute: typeof LangAuthDashboardRoute
     }
-    '/$lang/_auth/dashboard/relay-metadata': {
-      id: '/$lang/_auth/dashboard/relay-metadata'
-      path: '/relay-metadata'
-      fullPath: '/$lang/dashboard/relay-metadata'
-      preLoaderRoute: typeof LangAuthDashboardRelayMetadataRouteImport
+    '/$lang/_auth/dashboard/runtimes': {
+      id: '/$lang/_auth/dashboard/runtimes'
+      path: '/runtimes'
+      fullPath: '/$lang/dashboard/runtimes'
+      preLoaderRoute: typeof LangAuthDashboardRuntimesRouteImport
       parentRoute: typeof LangAuthDashboardRoute
     }
     '/$lang/_auth/dashboard/terminals': {
@@ -759,25 +792,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAuthDashboardPoolsPoolIdIndexRouteImport
       parentRoute: typeof LangAuthDashboardPoolsPoolIdRoute
     }
-    '/$lang/_auth/dashboard/pools/$poolId/access': {
-      id: '/$lang/_auth/dashboard/pools/$poolId/access'
-      path: '/access'
-      fullPath: '/$lang/dashboard/pools/$poolId/access'
-      preLoaderRoute: typeof LangAuthDashboardPoolsPoolIdAccessRouteImport
-      parentRoute: typeof LangAuthDashboardPoolsPoolIdRoute
-    }
-    '/$lang/_auth/dashboard/pools/$poolId/capacity': {
-      id: '/$lang/_auth/dashboard/pools/$poolId/capacity'
-      path: '/capacity'
-      fullPath: '/$lang/dashboard/pools/$poolId/capacity'
-      preLoaderRoute: typeof LangAuthDashboardPoolsPoolIdCapacityRouteImport
-      parentRoute: typeof LangAuthDashboardPoolsPoolIdRoute
-    }
     '/$lang/_auth/dashboard/pools/$poolId/fallback': {
       id: '/$lang/_auth/dashboard/pools/$poolId/fallback'
       path: '/fallback'
       fullPath: '/$lang/dashboard/pools/$poolId/fallback'
       preLoaderRoute: typeof LangAuthDashboardPoolsPoolIdFallbackRouteImport
+      parentRoute: typeof LangAuthDashboardPoolsPoolIdRoute
+    }
+    '/$lang/_auth/dashboard/pools/$poolId/limits': {
+      id: '/$lang/_auth/dashboard/pools/$poolId/limits'
+      path: '/limits'
+      fullPath: '/$lang/dashboard/pools/$poolId/limits'
+      preLoaderRoute: typeof LangAuthDashboardPoolsPoolIdLimitsRouteImport
       parentRoute: typeof LangAuthDashboardPoolsPoolIdRoute
     }
     '/$lang/_auth/dashboard/pools/$poolId/media': {
@@ -794,30 +820,47 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LangAuthDashboardPoolsPoolIdRoutingRouteImport
       parentRoute: typeof LangAuthDashboardPoolsPoolIdRoute
     }
+    '/$lang/_auth/dashboard/pools/$poolId/settings': {
+      id: '/$lang/_auth/dashboard/pools/$poolId/settings'
+      path: '/settings'
+      fullPath: '/$lang/dashboard/pools/$poolId/settings'
+      preLoaderRoute: typeof LangAuthDashboardPoolsPoolIdSettingsRouteImport
+      parentRoute: typeof LangAuthDashboardPoolsPoolIdRoute
+    }
+    '/$lang/_auth/dashboard/pools/$poolId/sharing': {
+      id: '/$lang/_auth/dashboard/pools/$poolId/sharing'
+      path: '/sharing'
+      fullPath: '/$lang/dashboard/pools/$poolId/sharing'
+      preLoaderRoute: typeof LangAuthDashboardPoolsPoolIdSharingRouteImport
+      parentRoute: typeof LangAuthDashboardPoolsPoolIdRoute
+    }
   }
 }
 
 interface LangAuthDashboardPoolsPoolIdRouteChildren {
-  LangAuthDashboardPoolsPoolIdAccessRoute: typeof LangAuthDashboardPoolsPoolIdAccessRoute
-  LangAuthDashboardPoolsPoolIdCapacityRoute: typeof LangAuthDashboardPoolsPoolIdCapacityRoute
   LangAuthDashboardPoolsPoolIdFallbackRoute: typeof LangAuthDashboardPoolsPoolIdFallbackRoute
+  LangAuthDashboardPoolsPoolIdLimitsRoute: typeof LangAuthDashboardPoolsPoolIdLimitsRoute
   LangAuthDashboardPoolsPoolIdMediaRoute: typeof LangAuthDashboardPoolsPoolIdMediaRoute
   LangAuthDashboardPoolsPoolIdRoutingRoute: typeof LangAuthDashboardPoolsPoolIdRoutingRoute
+  LangAuthDashboardPoolsPoolIdSettingsRoute: typeof LangAuthDashboardPoolsPoolIdSettingsRoute
+  LangAuthDashboardPoolsPoolIdSharingRoute: typeof LangAuthDashboardPoolsPoolIdSharingRoute
   LangAuthDashboardPoolsPoolIdIndexRoute: typeof LangAuthDashboardPoolsPoolIdIndexRoute
 }
 
 const LangAuthDashboardPoolsPoolIdRouteChildren: LangAuthDashboardPoolsPoolIdRouteChildren =
   {
-    LangAuthDashboardPoolsPoolIdAccessRoute:
-      LangAuthDashboardPoolsPoolIdAccessRoute,
-    LangAuthDashboardPoolsPoolIdCapacityRoute:
-      LangAuthDashboardPoolsPoolIdCapacityRoute,
     LangAuthDashboardPoolsPoolIdFallbackRoute:
       LangAuthDashboardPoolsPoolIdFallbackRoute,
+    LangAuthDashboardPoolsPoolIdLimitsRoute:
+      LangAuthDashboardPoolsPoolIdLimitsRoute,
     LangAuthDashboardPoolsPoolIdMediaRoute:
       LangAuthDashboardPoolsPoolIdMediaRoute,
     LangAuthDashboardPoolsPoolIdRoutingRoute:
       LangAuthDashboardPoolsPoolIdRoutingRoute,
+    LangAuthDashboardPoolsPoolIdSettingsRoute:
+      LangAuthDashboardPoolsPoolIdSettingsRoute,
+    LangAuthDashboardPoolsPoolIdSharingRoute:
+      LangAuthDashboardPoolsPoolIdSharingRoute,
     LangAuthDashboardPoolsPoolIdIndexRoute:
       LangAuthDashboardPoolsPoolIdIndexRoute,
   }
@@ -847,27 +890,29 @@ const LangAuthDashboardPoolsRouteWithChildren =
   )
 
 interface LangAuthDashboardRouteChildren {
-  LangAuthDashboardCapacityRoute: typeof LangAuthDashboardCapacityRoute
+  LangAuthDashboardApiTokensRoute: typeof LangAuthDashboardApiTokensRoute
   LangAuthDashboardChatTestRoute: typeof LangAuthDashboardChatTestRoute
   LangAuthDashboardCliTokensRoute: typeof LangAuthDashboardCliTokensRoute
   LangAuthDashboardClisRoute: typeof LangAuthDashboardClisRoute
-  LangAuthDashboardModelApiTokensRoute: typeof LangAuthDashboardModelApiTokensRoute
+  LangAuthDashboardCloudProvidersRoute: typeof LangAuthDashboardCloudProvidersRoute
+  LangAuthDashboardDeploymentsRoute: typeof LangAuthDashboardDeploymentsRoute
   LangAuthDashboardPoolsRoute: typeof LangAuthDashboardPoolsRouteWithChildren
-  LangAuthDashboardProvidersRoute: typeof LangAuthDashboardProvidersRoute
-  LangAuthDashboardRelayMetadataRoute: typeof LangAuthDashboardRelayMetadataRoute
+  LangAuthDashboardRequestLogRoute: typeof LangAuthDashboardRequestLogRoute
+  LangAuthDashboardRuntimesRoute: typeof LangAuthDashboardRuntimesRoute
   LangAuthDashboardTerminalsRoute: typeof LangAuthDashboardTerminalsRoute
   LangAuthDashboardIndexRoute: typeof LangAuthDashboardIndexRoute
 }
 
 const LangAuthDashboardRouteChildren: LangAuthDashboardRouteChildren = {
-  LangAuthDashboardCapacityRoute: LangAuthDashboardCapacityRoute,
+  LangAuthDashboardApiTokensRoute: LangAuthDashboardApiTokensRoute,
   LangAuthDashboardChatTestRoute: LangAuthDashboardChatTestRoute,
   LangAuthDashboardCliTokensRoute: LangAuthDashboardCliTokensRoute,
   LangAuthDashboardClisRoute: LangAuthDashboardClisRoute,
-  LangAuthDashboardModelApiTokensRoute: LangAuthDashboardModelApiTokensRoute,
+  LangAuthDashboardCloudProvidersRoute: LangAuthDashboardCloudProvidersRoute,
+  LangAuthDashboardDeploymentsRoute: LangAuthDashboardDeploymentsRoute,
   LangAuthDashboardPoolsRoute: LangAuthDashboardPoolsRouteWithChildren,
-  LangAuthDashboardProvidersRoute: LangAuthDashboardProvidersRoute,
-  LangAuthDashboardRelayMetadataRoute: LangAuthDashboardRelayMetadataRoute,
+  LangAuthDashboardRequestLogRoute: LangAuthDashboardRequestLogRoute,
+  LangAuthDashboardRuntimesRoute: LangAuthDashboardRuntimesRoute,
   LangAuthDashboardTerminalsRoute: LangAuthDashboardTerminalsRoute,
   LangAuthDashboardIndexRoute: LangAuthDashboardIndexRoute,
 }

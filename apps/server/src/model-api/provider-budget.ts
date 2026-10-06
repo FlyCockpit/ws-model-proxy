@@ -3,6 +3,7 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { runWithDbShutdownPermit } from "@ws-model-proxy/db/shutdown-fence";
 import {
+  type BudgetPeriod,
   budgetWindow,
   type ProviderTokenUsage,
   providerBillableTokens,
@@ -39,6 +40,10 @@ export interface ProviderBudgetAttempt {
   providerModelId: string;
   credentialId?: string;
   poolId?: string;
+  /** Exact live grant for owner-paid grantee traffic; never own-key or owner. */
+  poolGrantId?: string;
+  /** Grantee identity for the live grant; spend is summed by pool + grantee. */
+  granteeUserId?: string;
   requestId: string;
   attemptId: string;
   fencingToken: bigint;
@@ -52,6 +57,8 @@ export type ProviderBudgetAdmission =
       admitted: false;
       reason:
         | "BUDGET_EXCEEDED"
+        | "GRANTEE_BUDGET_EXCEEDED"
+        | "GRANTEE_CAP_UNPRICEABLE"
         | "PROVIDER_CONCURRENCY_EXCEEDED"
         | "PROTECTION_POLICY_MISSING"
         | "CURRENCY_UNAVAILABLE"
@@ -195,6 +202,62 @@ function canonicalPayloadHash(value: unknown): string {
   return createHash("sha256")
     .update(JSON.stringify(normalize(value)))
     .digest("hex");
+}
+
+export function reservationIdentityWhere(
+  policy: { id: string; scopeType: string },
+  rule: { id: string; metric: BudgetMetric; period: BudgetPeriod; currency: string | null },
+  grantPolicyIds: readonly string[],
+): Prisma.ProviderBudgetReservationWhereInput {
+  if (policy.scopeType === "POOL_GRANT") {
+    return {
+      policyId: { in: [...grantPolicyIds] },
+      metric: rule.metric,
+      ...(rule.currency ? { currency: rule.currency } : {}),
+    };
+  }
+  return { policyId: policy.id, ruleId: rule.id };
+}
+
+export function reservationWindowWhere(
+  policy: { scopeType: string },
+  rule: { metric: BudgetMetric; period: BudgetPeriod },
+  window: { windowStart: Date | null; windowEnd: Date | null },
+  attemptId: string,
+): Prisma.ProviderBudgetReservationWhereInput {
+  if (rule.metric === "CONCURRENCY") return {};
+  if (rule.period === "PER_ATTEMPT") return { attemptId };
+  if (policy.scopeType === "POOL_GRANT") {
+    if (rule.period === "LIFETIME") {
+      return window.windowStart ? { createdAt: { gte: window.windowStart } } : {};
+    }
+    if (!window.windowStart) return {};
+    return {
+      createdAt: {
+        gte: window.windowStart,
+        ...(window.windowEnd ? { lt: window.windowEnd } : {}),
+      },
+    };
+  }
+  if (rule.period === "LIFETIME") return { windowStart: window.windowStart, windowEnd: null };
+  return { windowStart: window.windowStart, windowEnd: window.windowEnd };
+}
+
+export function grantCapDenial(
+  policy: { id: string; scopeType: string },
+  ruleId: string,
+  reason: Exclude<ProviderBudgetAdmission, { admitted: true }>["reason"],
+): Exclude<ProviderBudgetAdmission, { admitted: true }> {
+  if (policy.scopeType !== "POOL_GRANT") {
+    return { admitted: false, reason, policyId: policy.id, ruleId };
+  }
+  if (reason === "BUDGET_EXCEEDED") {
+    return { admitted: false, reason: "GRANTEE_BUDGET_EXCEEDED", policyId: policy.id, ruleId };
+  }
+  if (reason === "CURRENCY_UNAVAILABLE" || reason === "PRICING_UNAVAILABLE") {
+    return { admitted: false, reason: "GRANTEE_CAP_UNPRICEABLE", policyId: policy.id, ruleId };
+  }
+  return { admitted: false, reason, policyId: policy.id, ruleId };
 }
 
 /**
@@ -344,13 +407,17 @@ export async function admitProviderBudget(
     attempt.liability.spend === undefined ? undefined : decimal(attempt.liability.spend);
   return serializedByAdvisoryLocks(async (tx) => {
     // Writer class H (@ws-model-proxy/db/capacity-lock-order): fences only,
-    // attempt then account then (below) policy, before any row lock or
-    // write. The provider account and model are read without a lock, and the
-    // attempt, reservation and ledger rows it writes have no foreign key into
-    // the provider graph, so no insert takes an implicit account/model lock.
+    // attempt then account then grant (same level 03, "account" < "grant")
+    // then (below) policy, before any row lock or write. The provider account
+    // and model are read without a lock, and the attempt, reservation and
+    // ledger rows it writes have no foreign key into the provider graph, so
+    // no insert takes an implicit account/model lock.
     await acquireFences(tx, [
       fences.budgetAttempt(attempt.attemptId),
       fences.budgetAccount(attempt.userId, attempt.providerAccountId),
+      ...(attempt.poolId && attempt.granteeUserId
+        ? [fences.budgetGrant(attempt.userId, attempt.poolId, attempt.granteeUserId)]
+        : []),
     ]);
     // This statement runs after possibly waiting for the account lock. Use the
     // actual post-wait database clock, not this transaction's start time, when
@@ -448,26 +515,46 @@ export async function admitProviderBudget(
         return { admitted: false, reason: "PROVIDER_CONCURRENCY_EXCEEDED" };
       }
     }
-    const policies = await tx.providerBudgetPolicy.findMany({
-      where: {
-        userId: attempt.userId,
-        providerAccountId: attempt.providerAccountId,
-        active: true,
-        OR: [
-          { scopeType: "PROVIDER_ACCOUNT", poolId: null, providerModelId: null },
-          ...(attempt.poolId
-            ? [
-                {
-                  scopeType: "POOL_PROVIDER_MODEL" as const,
-                  poolId: attempt.poolId,
-                  providerModelId: attempt.providerModelId,
-                },
-              ]
-            : []),
-        ],
-      },
-      include: { Rules: true },
-      orderBy: { id: "asc" },
+    const policies = (
+      await tx.providerBudgetPolicy.findMany({
+        where: {
+          userId: attempt.userId,
+          active: true,
+          OR: [
+            {
+              scopeType: "PROVIDER_ACCOUNT",
+              providerAccountId: attempt.providerAccountId,
+              poolId: null,
+              providerModelId: null,
+            },
+            ...(attempt.poolId
+              ? [
+                  {
+                    scopeType: "POOL_PROVIDER_MODEL" as const,
+                    providerAccountId: attempt.providerAccountId,
+                    poolId: attempt.poolId,
+                    providerModelId: attempt.providerModelId,
+                  },
+                ]
+              : []),
+            ...(attempt.poolId && attempt.granteeUserId
+              ? [
+                  {
+                    scopeType: "POOL_GRANT" as const,
+                    poolId: attempt.poolId,
+                    granteeUserId: attempt.granteeUserId,
+                    providerAccountId: null,
+                  },
+                ]
+              : []),
+          ],
+        },
+        include: { Rules: true },
+      })
+    ).sort((left, right) => {
+      const rank = (scopeType: string) =>
+        scopeType === "POOL_GRANT" ? 0 : scopeType === "POOL_PROVIDER_MODEL" ? 1 : 2;
+      return rank(left.scopeType) - rank(right.scopeType) || left.id.localeCompare(right.id);
     });
     // Public egress is fail-closed: an account-wide policy may add additional
     // limits, but it does not constitute consent for a particular pool/model
@@ -512,6 +599,26 @@ export async function admitProviderBudget(
       windowEnd: Date | null;
     }> = [];
 
+    const grantCapPolicies = policies.filter((policy) => policy.scopeType === "POOL_GRANT");
+    const grantPolicyIds =
+      grantCapPolicies.length === 0
+        ? []
+        : [
+            ...new Set([
+              ...grantCapPolicies.map((policy) => policy.id),
+              ...(
+                await tx.providerBudgetPolicy.findMany({
+                  where: {
+                    userId: attempt.userId,
+                    scopeType: "POOL_GRANT",
+                    poolId: attempt.poolId,
+                    granteeUserId: attempt.granteeUserId,
+                  },
+                  select: { id: true },
+                })
+              ).map((row) => row.id),
+            ]),
+          ];
     for (const policy of policies) {
       if (!policy.activatedAt)
         throw new ProviderBudgetConfigurationError("Active policy has no activation");
@@ -519,28 +626,17 @@ export async function admitProviderBudget(
         if (rule.mode === "UNLIMITED") continue;
         const value = reservationValue(rule.metric, attempt.liability);
         if (value === null) {
-          return {
-            admitted: false,
-            reason: rule.metric === "TOKENS" ? "TOKEN_BOUND_UNAVAILABLE" : "PRICING_UNAVAILABLE",
-            policyId: policy.id,
-            ruleId: rule.id,
-          };
+          return grantCapDenial(
+            policy,
+            rule.id,
+            rule.metric === "TOKENS" ? "TOKEN_BOUND_UNAVAILABLE" : "PRICING_UNAVAILABLE",
+          );
         }
         if (rule.metric === "SPEND" && rule.currency !== currency) {
-          return {
-            admitted: false,
-            reason: "CURRENCY_UNAVAILABLE",
-            policyId: policy.id,
-            ruleId: rule.id,
-          };
+          return grantCapDenial(policy, rule.id, "CURRENCY_UNAVAILABLE");
         }
         if (rule.metric === "SPEND" && !pricingVersion) {
-          return {
-            admitted: false,
-            reason: "PRICING_UNAVAILABLE",
-            policyId: policy.id,
-            ruleId: rule.id,
-          };
+          return grantCapDenial(policy, rule.id, "PRICING_UNAVAILABLE");
         }
         if (rule.metric === "SPEND") {
           const pricing = await tx.providerPricingVersion.findFirst({
@@ -557,32 +653,21 @@ export async function admitProviderBudget(
             },
             select: { id: true },
           });
-          if (!pricing)
-            return {
-              admitted: false,
-              reason: "PRICING_UNAVAILABLE",
-              policyId: policy.id,
-              ruleId: rule.id,
-            };
+          if (!pricing) return grantCapDenial(policy, rule.id, "PRICING_UNAVAILABLE");
         }
         const window = budgetWindow(rule.period, policy.activatedAt, now);
+        const identity = reservationIdentityWhere(policy, rule, grantPolicyIds);
+        const windowWhere = reservationWindowWhere(policy, rule, window, attempt.attemptId);
         const aggregate = await tx.providerBudgetReservation.aggregate({
           where: {
-            policyId: policy.id,
-            ruleId: rule.id,
+            ...identity,
             ...(rule.metric === "CONCURRENCY"
               ? {
                   state: "RESERVED",
                   OR: [{ expiresAt: null }, { expiresAt: { gt: now } }],
                 }
               : { OR: [{ state: "RESERVED" }, { state: "SETTLED" }] }),
-            ...(rule.metric === "CONCURRENCY"
-              ? {}
-              : rule.period === "PER_ATTEMPT"
-                ? { attemptId: attempt.attemptId }
-                : rule.period === "LIFETIME"
-                  ? { windowStart: window.windowStart, windowEnd: null }
-                  : { windowStart: window.windowStart, windowEnd: window.windowEnd }),
+            ...windowWhere,
           },
           _sum: { reservedValue: true },
         });
@@ -592,14 +677,9 @@ export async function admitProviderBudget(
             ? null
             : await tx.providerBudgetReservation.aggregate({
                 where: {
-                  policyId: policy.id,
-                  ruleId: rule.id,
+                  ...identity,
                   state: "SETTLED",
-                  ...(rule.period === "PER_ATTEMPT"
-                    ? { attemptId: attempt.attemptId }
-                    : rule.period === "LIFETIME"
-                      ? { windowStart: window.windowStart, windowEnd: null }
-                      : { windowStart: window.windowStart, windowEnd: window.windowEnd }),
+                  ...windowWhere,
                 },
                 _sum: { reservedValue: true },
               });
@@ -609,13 +689,8 @@ export async function admitProviderBudget(
             : await tx.providerBudgetSettlement.aggregate({
                 where: {
                   Reservation: {
-                    policyId: policy.id,
-                    ruleId: rule.id,
-                    ...(rule.period === "PER_ATTEMPT"
-                      ? { attemptId: attempt.attemptId }
-                      : rule.period === "LIFETIME"
-                        ? { windowStart: window.windowStart, windowEnd: null }
-                        : { windowStart: window.windowStart, windowEnd: window.windowEnd }),
+                    ...identity,
+                    ...windowWhere,
                   },
                 },
                 _sum: { settledValue: true },
@@ -627,12 +702,7 @@ export async function admitProviderBudget(
           existing.length === 0 &&
           (!rule.limitValue || consumed.plus(value).greaterThan(rule.limitValue))
         ) {
-          return {
-            admitted: false,
-            reason: "BUDGET_EXCEEDED",
-            policyId: policy.id,
-            ruleId: rule.id,
-          };
+          return grantCapDenial(policy, rule.id, "BUDGET_EXCEEDED");
         }
         pending.push({ policy, rule, value, ...window });
       }

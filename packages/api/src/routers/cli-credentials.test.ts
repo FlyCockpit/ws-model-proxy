@@ -18,6 +18,9 @@ vi.mock("@ws-model-proxy/db", async () => {
 const { default: prisma } = await import("@ws-model-proxy/db");
 const { cliCredentialsRouter } = await import("./cli-credentials");
 
+const LOGIN_IDENTITY_PUBLIC_KEY =
+  "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE";
+
 const db = prisma as unknown as {
   $transaction: ReturnType<typeof vi.fn>;
   $queryRaw: ReturnType<typeof vi.fn>;
@@ -34,6 +37,7 @@ const db = prisma as unknown as {
     findUnique: ReturnType<typeof vi.fn>;
     upsert: ReturnType<typeof vi.fn>;
   };
+  capacityAuditEvent: { create: ReturnType<typeof vi.fn> };
   cliDeviceCredential: {
     create: ReturnType<typeof vi.fn>;
     findMany: ReturnType<typeof vi.fn>;
@@ -148,6 +152,9 @@ describe("cliCredentialsRouter", () => {
         lastUsedAt: null,
         revokedAt: null,
         expiresAt: null,
+        identityPublicKey: null,
+        lastRefusedAt: null,
+        lastRefusedReason: null,
       },
     ]);
     const client = createRouterClient(cliCredentialsRouter, { context: buildContext() });
@@ -163,6 +170,9 @@ describe("cliCredentialsRouter", () => {
         lastUsedAt: null,
         revokedAt: null,
         expiresAt: null,
+        identityBound: false,
+        lastRefusedAt: null,
+        lastRefusedReason: null,
       },
     ]);
     expect(db.cliToken.findMany).toHaveBeenCalledWith(
@@ -214,6 +224,7 @@ describe("cliCredentialsRouter", () => {
     const result = await client.exchangeDeviceCode({
       deviceCode: "approved-device-code",
       cliSlug: "desk-01",
+      identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
     });
 
     // The CLI gets exactly its credential; nothing about other credentials.
@@ -230,6 +241,7 @@ describe("cliCredentialsRouter", () => {
       data: expect.objectContaining({
         userId: "user-1",
         cliDeviceId: "cli-device-1",
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
       }),
       select: { id: true, userId: true },
     });
@@ -261,7 +273,11 @@ describe("cliCredentialsRouter", () => {
     });
 
     await expect(
-      client.exchangeDeviceCode({ deviceCode: "approved-device-code", cliSlug: "desk-01" }),
+      client.exchangeDeviceCode({
+        deviceCode: "approved-device-code",
+        cliSlug: "desk-01",
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
+      }),
     ).resolves.toMatchObject({ credentialId: "credential-1" });
     expect(db.cliDeviceCredential.create).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -287,7 +303,11 @@ describe("cliCredentialsRouter", () => {
     });
 
     await expect(
-      client.exchangeDeviceCode({ deviceCode: "approved-device-code", cliSlug: "desk-01" }),
+      client.exchangeDeviceCode({
+        deviceCode: "approved-device-code",
+        cliSlug: "desk-01",
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
+      }),
     ).resolves.toMatchObject({ credentialId: "credential-1" });
     expect(errorSpy).toHaveBeenCalledWith(
       "[cli-credentials] closing revoked relay sessions failed",
@@ -301,7 +321,11 @@ describe("cliCredentialsRouter", () => {
     const client = createRouterClient(cliCredentialsRouter, { context: buildContext(null) });
 
     await expect(
-      client.exchangeDeviceCode({ deviceCode: "approved-device-code", cliSlug: "desk-01" }),
+      client.exchangeDeviceCode({
+        deviceCode: "approved-device-code",
+        cliSlug: "desk-01",
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
+      }),
     ).rejects.toSatisfy((error: ORPCError) => {
       expect(error.code).toBe("BAD_REQUEST");
       expect(error.data).toBeUndefined();
@@ -318,6 +342,7 @@ describe("cliCredentialsRouter", () => {
       client.exchangeDeviceCode({
         deviceCode: "approved-device-code",
         cliSlug: "desk.01",
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
       }),
     ).rejects.toThrow();
     expect(db.deviceCode.findUnique).not.toHaveBeenCalled();
@@ -341,6 +366,7 @@ describe("cliCredentialsRouter", () => {
       client.exchangeDeviceCode({
         deviceCode: "pending-device-code",
         cliSlug: "desk-01",
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
       }),
     ).rejects.toSatisfy((error: ORPCError) => {
       expect(error).toBeInstanceOf(ORPCError);
@@ -380,7 +406,11 @@ describe("cliCredentialsRouter", () => {
     const client = createRouterClient(cliCredentialsRouter, { context: buildContext(null) });
 
     const error = await client
-      .exchangeDeviceCode({ deviceCode: "device-code", cliSlug: "desk-01" })
+      .exchangeDeviceCode({
+        deviceCode: "device-code",
+        cliSlug: "desk-01",
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
+      })
       .catch((caught: unknown) => caught);
 
     expect(error).toBeInstanceOf(ORPCError);
@@ -398,7 +428,13 @@ describe("cliCredentialsRouter", () => {
       new Request("https://example.test/rpc/exchangeDeviceCode", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ json: { deviceCode: "device-code", cliSlug: "pending-ci" } }),
+        body: JSON.stringify({
+          json: {
+            deviceCode: "device-code",
+            cliSlug: "pending-ci",
+            identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
+          },
+        }),
       }),
       { prefix: "/rpc", context: buildContext(null) },
     );
@@ -423,7 +459,11 @@ describe("cliCredentialsRouter", () => {
     });
 
     await expect(
-      client.exchangeDeviceCode({ deviceCode: "approved-device-code", cliSlug: "desk-01" }),
+      client.exchangeDeviceCode({
+        deviceCode: "approved-device-code",
+        cliSlug: "desk-01",
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
+      }),
     ).resolves.toMatchObject({ credentialId: "credential-1" });
     expect(limitDeviceCodeExchange).toHaveBeenCalledWith("approved-device-code");
   });
@@ -440,7 +480,13 @@ describe("cliCredentialsRouter", () => {
       new Request("https://example.test/rpc/exchangeDeviceCode", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ json: { deviceCode: "approved-device-code", cliSlug: "desk-01" } }),
+        body: JSON.stringify({
+          json: {
+            deviceCode: "approved-device-code",
+            cliSlug: "desk-01",
+            identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
+          },
+        }),
       }),
       { prefix: "/rpc", context: buildContext(null, { limitDeviceCodeExchange }) },
     );
@@ -471,7 +517,11 @@ describe("cliCredentialsRouter", () => {
     });
 
     const error = await client
-      .exchangeDeviceCode({ deviceCode: "approved-device-code", cliSlug: "desk-01" })
+      .exchangeDeviceCode({
+        deviceCode: "approved-device-code",
+        cliSlug: "desk-01",
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
+      })
       .catch((caught: unknown) => caught);
 
     expect(error).toBeInstanceOf(ORPCError);
@@ -556,6 +606,7 @@ describe("cliCredentialsRouter", () => {
       client.exchangeDeviceCode({
         deviceCode: "approved-device-code",
         cliSlug: "desk-01",
+        identityPublicKey: LOGIN_IDENTITY_PUBLIC_KEY,
       }),
     ).resolves.toMatchObject({ credentialId: "credential-1", userId: "approved-user" });
     expect(db.cliDevice.upsert).toHaveBeenCalledWith(
@@ -631,6 +682,109 @@ describe("cliCredentialsRouter", () => {
     await client.revokeToken({ id: "token-1" });
 
     expect(onCliCredentialsRevoked).toHaveBeenCalledWith({ kind: "cliToken", ids: ["token-1"] });
+  });
+
+  it("resets a CLI token identity bind without revoking it", async () => {
+    const now = new Date("2026-07-01T00:00:00.000Z");
+    db.cliToken.findUnique.mockResolvedValue({
+      id: "token-1",
+      userId: "user-1",
+      revokedAt: null,
+    });
+    db.cliToken.update.mockResolvedValue({
+      id: "token-1",
+      createdAt: now,
+      updatedAt: now,
+      userId: "user-1",
+      cliDeviceId: "cli-device-1",
+      name: "Laptop",
+      lookupPrefix: "wsmp_cli_abcdefghijkl",
+      lastUsedAt: null,
+      revokedAt: null,
+      expiresAt: null,
+      identityPublicKey: null,
+      lastRefusedAt: null,
+      lastRefusedReason: null,
+    });
+    const onCliCredentialsRevoked = vi.fn();
+    const client = createRouterClient(cliCredentialsRouter, {
+      context: buildContext(undefined, { onCliCredentialsRevoked }),
+    });
+
+    await expect(client.resetTokenIdentity({ id: "token-1" })).resolves.toMatchObject({
+      id: "token-1",
+      identityBound: false,
+      lastRefusedAt: null,
+    });
+    expect(db.cliToken.update).toHaveBeenCalledWith({
+      where: { id: "token-1" },
+      data: {
+        identityPublicKey: null,
+        lastRefusedAt: null,
+        lastRefusedReason: null,
+      },
+      select: expect.any(Object),
+    });
+    expect(db.capacityAuditEvent.create).toHaveBeenCalledWith({
+      data: {
+        userId: "user-1",
+        actorUserId: "user-1",
+        action: "RESET_IDENTITY",
+        resourceType: "CLI_TOKEN",
+        resourceId: "token-1",
+      },
+    });
+    expect(onCliCredentialsRevoked).toHaveBeenCalledWith({ kind: "cliToken", ids: ["token-1"] });
+  });
+
+  it.each([
+    ["another user's", { id: "token-1", userId: "user-2", revokedAt: null }],
+    ["a missing", null],
+  ])("answers NOT_FOUND when resetting %s token and writes nothing", async (_label, row) => {
+    db.cliToken.findUnique.mockResolvedValue(row);
+    const onCliCredentialsRevoked = vi.fn();
+    const client = createRouterClient(cliCredentialsRouter, {
+      context: buildContext(undefined, { onCliCredentialsRevoked }),
+    });
+
+    await expect(client.resetTokenIdentity({ id: "token-1" })).rejects.toSatisfy(
+      (error: ORPCError<string, unknown>) => error.code === "NOT_FOUND",
+    );
+    expect(db.cliToken.update).not.toHaveBeenCalled();
+    expect(db.capacityAuditEvent.create).not.toHaveBeenCalled();
+    expect(onCliCredentialsRevoked).not.toHaveBeenCalled();
+  });
+
+  it("refuses to reset a revoked token's identity bind", async () => {
+    db.cliToken.findUnique.mockResolvedValue({
+      id: "token-1",
+      userId: "user-1",
+      revokedAt: new Date("2026-07-01T00:00:00.000Z"),
+    });
+    const onCliCredentialsRevoked = vi.fn();
+    const client = createRouterClient(cliCredentialsRouter, {
+      context: buildContext(undefined, { onCliCredentialsRevoked }),
+    });
+
+    await expect(client.resetTokenIdentity({ id: "token-1" })).rejects.toSatisfy(
+      (error: ORPCError<string, unknown>) =>
+        error.code === "BAD_REQUEST" && /cannot reset their identity bind/.test(error.message),
+    );
+    expect(db.cliToken.update).not.toHaveBeenCalled();
+    expect(db.capacityAuditEvent.create).not.toHaveBeenCalled();
+    expect(onCliCredentialsRevoked).not.toHaveBeenCalled();
+  });
+
+  it("refuses an identity reset from a deployment agent before touching the token", async () => {
+    const client = createRouterClient(cliCredentialsRouter, {
+      context: buildContext(undefined, { deploymentActor: { kind: "AGENT", id: "agent-1" } }),
+    });
+
+    await expect(client.resetTokenIdentity({ id: "token-1" })).rejects.toSatisfy(
+      (error: ORPCError<string, unknown>) => error.code === "FORBIDDEN",
+    );
+    expect(db.$transaction).not.toHaveBeenCalled();
+    expect(db.cliToken.update).not.toHaveBeenCalled();
   });
 
   describe("deviceLoginRequest", () => {

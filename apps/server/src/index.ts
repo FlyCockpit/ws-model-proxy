@@ -9,8 +9,15 @@ import { env } from "@ws-model-proxy/env/server";
 import { WebSocketServer } from "ws";
 import { createApp } from "./app.js";
 import { installBetterCallErrorLogShim } from "./better-call-error-log-shim.js";
+import {
+  flushDeploymentOperatorAudit,
+  stopDeploymentOperatorAuditWriter,
+} from "./deployments/operator-audit.js";
+import { DeploymentReconciler } from "./deployments/reconciler.js";
 import { startOauthCleanup } from "./mcp/oauth-cleanup.js";
 import { startMediaCleanup } from "./media/cleanup.js";
+import { startAffinityAuthorityMaintenance } from "./model-api/cache-affinity-maintenance.js";
+import { startAffinityResidencyRepair } from "./model-api/cache-affinity-residency.js";
 import { startCacheAffinityCleanup } from "./model-api/cache-affinity-runtime.js";
 import { closeDiagnosticsCapacityRuntime } from "./model-api/diagnostics.js";
 import { stopKvEvictionFeedback } from "./model-api/kv-eviction-feedback.js";
@@ -26,6 +33,7 @@ import { flushCliAgentAudit, stopCliAgentAuditWriter } from "./relay/cli-agent-a
 import { sweepExpiredTokenCommands } from "./relay/cli-commands.js";
 import { sweepExpiredFileOps } from "./relay/cli-file-ops.js";
 import { stopEngineLoadRollup } from "./relay/engine-load-rollup.js";
+import { stopNodeMetricsRollup } from "./relay/node-metrics-rollup.js";
 import { RELAY_SUBPROTOCOL, RELAY_WS_MAX_PAYLOAD_BYTES } from "./relay/protocol.js";
 import { relaySessionManager } from "./relay/session-manager.js";
 import { terminalBrowserHub } from "./relay/terminal-websocket.js";
@@ -152,7 +160,22 @@ configureHttpServerTimeouts(server as { keepAliveTimeout: number; headersTimeout
 // bytes). No-op when media storage is not configured. Complements the lazy
 // delete-on-GET in media/routes.ts.
 const stopMediaCleanup = startMediaCleanup();
+const deploymentReconciler = new DeploymentReconciler({
+  current: (deviceId) => relaySessionManager.deploymentSocket(deviceId),
+  send: (socket, job) => relaySessionManager.sendDeploymentJob(socket, job),
+  closeOperatorStep: (stepId, options) =>
+    relaySessionManager.closeDeploymentOperatorStep(stepId, options),
+});
+relaySessionManager.setDeploymentHandlers({
+  result: (socket, result) => deploymentReconciler.acceptResult(socket, result),
+  inventory: (socket, instances) => deploymentReconciler.acceptInventory(socket, instances),
+  ready: () => deploymentReconciler.wake(),
+});
+deploymentReconciler.start();
+const stopDeploymentReconciler = () => deploymentReconciler.stop();
 const stopCacheAffinityCleanup = startCacheAffinityCleanup();
+const stopAffinityResidencyRepair = startAffinityResidencyRepair();
+const stopAffinityAuthorityMaintenance = startAffinityAuthorityMaintenance();
 const stopRelayTelemetryRecovery = startRelayTelemetryRecovery();
 const stopProviderBudgetRepair = startProviderBudgetRepair();
 const stopProviderAttemptExpiry = providerAttemptExpiryEnabled(
@@ -196,6 +219,7 @@ const stopRelayMaintenance = startRelayMaintenance({
   },
   terminalHub: terminalBrowserHub,
   stopCliAgentAudit: stopCliAgentAuditWriter,
+  stopDeploymentOperatorAudit: stopDeploymentOperatorAuditWriter,
 });
 
 // ---------------------------------------------------------------------------
@@ -208,8 +232,11 @@ const stopRelayMaintenance = startRelayMaintenance({
 // process deadline that sums them live in ./shutdown-timeouts.ts.
 installServerShutdown({
   periodicJobStops: [
+    stopDeploymentReconciler,
     stopMediaCleanup,
     stopCacheAffinityCleanup,
+    stopAffinityResidencyRepair,
+    stopAffinityAuthorityMaintenance,
     stopRelayTelemetryRecovery,
     stopProviderBudgetRepair,
     stopProviderAttemptExpiry,
@@ -218,12 +245,14 @@ installServerShutdown({
     stopUsageRetention,
     stopKvEvictionFeedback,
     stopEngineLoadRollup,
+    stopNodeMetricsRollup,
     stopRelayMaintenance,
   ],
   stopUserDeletionSweep,
   userDeletionSweepClient,
   relaySessions: relaySessionManager,
   flushAgentAudit: flushCliAgentAudit,
+  flushDeploymentOperatorAudit,
   terminalHub: terminalBrowserHub,
   server,
   capacityLifecycle,

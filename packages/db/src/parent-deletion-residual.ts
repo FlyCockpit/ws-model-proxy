@@ -78,6 +78,9 @@ export const HISTORY_DRAIN_EDGES = {
     ],
     internal: [],
   },
+  cache_affinity_residency: { delete: [["userId", "user"]], internal: [] },
+  cache_affinity_scope: { delete: [["userId", "user"]], internal: [] },
+  cache_affinity_observer: { delete: [["userId", "user"]], internal: [] },
   cache_affinity_node: {
     delete: [
       ["userId", "user"],
@@ -107,6 +110,8 @@ export const HISTORY_DRAIN_EDGES = {
   capacity_kv_eviction: { delete: [], internal: [] },
   // Persisted engine-load minutes (24h/7d Overview). Occupancy is display-only.
   engine_load_rollup_minute: { delete: [["ownerUserId", "user"]], internal: [] },
+  // Node-card sparkline minutes (7-day retention). Display only.
+  node_metrics_minute: { delete: [["ownerUserId", "user"]], internal: [] },
 } as const satisfies Record<string, { delete: readonly DrainEdge[]; internal: readonly string[] }>;
 
 /**
@@ -124,6 +129,8 @@ export const HISTORY_DRAIN_EDGES = {
  */
 export const USER_PLAIN_ID_HISTORY_TABLES = {
   cli_agent_action_event: { userColumn: "userId" },
+  // Operator-terminal audit of interactive deployment steps (append-only, no FKs).
+  deployment_operator_event: { userColumn: "userId" },
 } as const satisfies Record<string, { userColumn: string }>;
 
 /**

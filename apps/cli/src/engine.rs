@@ -81,6 +81,10 @@ pub struct DetectedEngine {
     /// Ids one engine process serves (vLLM/SGLang `--served-model-name` lists).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub served_model_aliases: Vec<String>,
+    /// Chat Completions tokenize fact recorded at probe time (`method` or
+    /// `unsupported`). `None` means this endpoint has not been probed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub count_context: Option<crate::count_context::CountContextFact>,
 }
 
 /// The engine this endpoint runs and whether the person declared it.
@@ -115,10 +119,41 @@ pub fn engine_root_url(base_url: &str) -> Result<Url> {
     Ok(url)
 }
 
-fn route_url(base_url: &str, route: &str) -> Result<Url> {
-    engine_root_url(base_url)?
+pub(crate) fn route_url(base_url: &str, route: &str) -> Result<Url> {
+    let base = engine_root_url(base_url)?;
+    let joined = base
         .join(route)
-        .with_context(|| format!("building `{route}` URL for `{base_url}`"))
+        .with_context(|| format!("building `{route}` URL for `{base_url}`"))?;
+    if joined.origin() != base.origin() {
+        anyhow::bail!("route `{route}` leaves the endpoint origin");
+    }
+    Ok(joined)
+}
+
+pub(crate) fn endpoint_header_pairs(endpoint: &EndpointConfig) -> Result<Vec<(String, String)>> {
+    let mut pairs = Vec::new();
+    for header in &endpoint.headers {
+        let value = std::env::var(&header.env).with_context(|| {
+            format!(
+                "reading endpoint header `{}` from `{}`",
+                header.name, header.env
+            )
+        })?;
+        pairs.push((header.name.clone(), value));
+    }
+    if let Some(auth) = &endpoint.auth {
+        let value = std::env::var(&auth.env)
+            .with_context(|| format!("reading typed endpoint credential from `{}`", auth.env))?;
+        match auth.mode {
+            crate::config::EndpointAuthMode::ApiKey => {
+                pairs.push(("x-api-key".to_string(), value));
+            }
+            crate::config::EndpointAuthMode::Bearer => {
+                pairs.push(("authorization".to_string(), format!("Bearer {value}")));
+            }
+        }
+    }
+    Ok(pairs)
 }
 
 pub(crate) fn http_agent(timeout: Duration) -> ureq::Agent {
@@ -139,24 +174,8 @@ pub(crate) fn fetch_route(
 ) -> Result<String> {
     let url = route_url(&endpoint.base_url, route)?;
     let mut request = agent.get(url.as_str());
-    for header in &endpoint.headers {
-        let value = std::env::var(&header.env).with_context(|| {
-            format!(
-                "reading endpoint header `{}` from `{}`",
-                header.name, header.env
-            )
-        })?;
-        request = request.header(&header.name, &value);
-    }
-    if let Some(auth) = &endpoint.auth {
-        let value = std::env::var(&auth.env)
-            .with_context(|| format!("reading typed endpoint credential from `{}`", auth.env))?;
-        request = match auth.mode {
-            crate::config::EndpointAuthMode::ApiKey => request.header("x-api-key", &value),
-            crate::config::EndpointAuthMode::Bearer => {
-                request.header("authorization", &format!("Bearer {value}"))
-            }
-        };
+    for (name, value) in endpoint_header_pairs(endpoint)? {
+        request = request.header(&name, &value);
     }
     let mut response = request
         .call()
@@ -169,7 +188,7 @@ pub(crate) fn fetch_route(
 /// limit sits beneath content decoding and counts compressed bytes, so a
 /// small gzip body could otherwise expand far past it. The wire limit stays
 /// as well; the decoded reader then stops at `limit + 1` bytes.
-fn read_decoded_body(body: &mut ureq::Body, limit: u64) -> Result<String> {
+pub(crate) fn read_decoded_body(body: &mut ureq::Body, limit: u64) -> Result<String> {
     use std::io::Read;
     let mut decoded = Vec::new();
     // ureq refuses a body that reaches its limit; one byte of slack keeps an
@@ -509,6 +528,10 @@ fn first_value(samples: &[PromSample], names: &[&str]) -> Option<f64> {
     })
 }
 
+fn process_start_time_seconds(samples: &[PromSample]) -> Option<f64> {
+    first_value(samples, &["process_start_time_seconds"]).filter(|value| *value > 0.0)
+}
+
 fn sum_values(samples: &[PromSample], names: &[&str]) -> Option<f64> {
     names.iter().find_map(|name| {
         let values = samples
@@ -543,6 +566,8 @@ pub struct LoadReading {
     /// Cumulative prefix-cache counters; the sampler turns them into deltas.
     pub prefix_cache_hits_total: Option<f64>,
     pub prefix_cache_queries_total: Option<f64>,
+    /// Prometheus `process_start_time_seconds` when the exposition has it.
+    pub process_start_time_seconds: Option<f64>,
     pub source: LoadSource,
 }
 
@@ -593,6 +618,7 @@ pub fn vllm_load(samples: &[PromSample]) -> Option<LoadReading> {
                 "vllm:prefix_cache_queries",
             ],
         ),
+        process_start_time_seconds: process_start_time_seconds(samples),
         source: LoadSource::VllmMetrics,
         ..LoadReading::default()
     })
@@ -605,6 +631,7 @@ pub fn sglang_load(samples: &[PromSample]) -> Option<LoadReading> {
         running,
         waiting: Some(count(sum_values(samples, &["sglang:num_queue_reqs"])).unwrap_or(0)),
         kv_usage: fraction(first_value(samples, &["sglang:token_usage"])),
+        process_start_time_seconds: process_start_time_seconds(samples),
         source: LoadSource::SglangMetrics,
         ..LoadReading::default()
     })
@@ -619,6 +646,7 @@ pub fn llama_metrics_load(samples: &[PromSample]) -> Option<LoadReading> {
         waiting: Some(deferred.unwrap_or(0)),
         deferred,
         kv_occupancy: fraction(first_value(samples, &["llamacpp:kv_cache_usage_ratio"])),
+        process_start_time_seconds: process_start_time_seconds(samples),
         source: LoadSource::LlamaCppMetrics,
         ..LoadReading::default()
     })
@@ -739,6 +767,24 @@ mod tests {
                 .expect("route")
                 .as_str(),
             "http://127.0.0.1:11434/api/version"
+        );
+        assert_eq!(
+            route_url("http://127.0.0.1:8080/v1", "/metrics")
+                .expect("route")
+                .as_str(),
+            "http://127.0.0.1:8080/metrics"
+        );
+        assert!(
+            route_url("http://127.0.0.1:8080/v1", "https:evil.example/x")
+                .unwrap_err()
+                .to_string()
+                .contains("leaves the endpoint origin")
+        );
+        assert!(
+            route_url("http://127.0.0.1:8080/v1", "//evil.example/x")
+                .unwrap_err()
+                .to_string()
+                .contains("leaves the endpoint origin")
         );
     }
 
@@ -924,7 +970,29 @@ mod tests {
         assert_eq!(load.kv_usage, Some(0.42));
         assert_eq!(load.prefix_cache_hits_total, Some(1200.0));
         assert_eq!(load.prefix_cache_queries_total, Some(4000.0));
+        assert_eq!(load.process_start_time_seconds, None);
         assert_eq!(load.source, LoadSource::VllmMetrics);
+    }
+
+    #[test]
+    fn process_start_time_seconds_is_read_from_prometheus() {
+        let samples = parse_prometheus(concat!(
+            "process_start_time_seconds 1700000000.5\n",
+            "vllm:num_requests_running 1\n",
+            "vllm:num_requests_waiting 0\n",
+        ));
+        let load = vllm_load(&samples).expect("load");
+        assert_eq!(load.process_start_time_seconds, Some(1_700_000_000.5));
+        let missing = parse_prometheus(concat!(
+            "process_start_time_seconds 0\n",
+            "vllm:num_requests_running 1\n",
+        ));
+        assert_eq!(
+            vllm_load(&missing)
+                .expect("load")
+                .process_start_time_seconds,
+            None
+        );
     }
 
     #[test]

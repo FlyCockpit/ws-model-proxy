@@ -65,6 +65,7 @@ import { Prisma } from "../prisma/generated/client";
 import {
   deleteTerminalRelayRequestsWithoutWaiting,
   deleteUserUnderOwnerFences,
+  fenceOwners,
   serverTimeoutSqlState,
   UserDeletionGenerationChangedError,
 } from "./capacity-lock-order";
@@ -144,6 +145,14 @@ export const PARENT_DELETION_MAX_PASSED_ADMISSIONS = 10_000;
  * so admission and lease history never block a delete.
  */
 export const RETAINED_HISTORY_EDGES = {
+  "deployment_config.poolId": "co-deleted",
+  "deployment_instance.configId": "co-deleted",
+  "deployment_instance.revisionId": "co-deleted",
+  "deployment_instance.runId": "co-deleted",
+  "deployment_instance_node.instanceId": "co-deleted",
+  "deployment_instance_node.cliDeviceId": "co-deleted",
+  "deployment_step.runId": "co-deleted",
+  "deployment_step.instanceId": "co-deleted",
   "execution_target.inferenceCapacityId": "co-deleted",
   "provider_credential.replacedById": "owner-history",
   "provider_pricing_version.providerAccountId": "owner-history",
@@ -239,7 +248,6 @@ const PERMANENT_55000_MESSAGES: readonly RegExp[] = [
   /\bis append-only\b/,
   /\bprovider_attempt is durable history\b/,
   /\bprovider budget reservations cannot be deleted\b/,
-  /\bprovider budget rules are immutable\b/,
 ];
 
 function isPermanent55000(candidate: object): boolean {
@@ -297,6 +305,11 @@ export async function findRetainedHistoryBlocker(
   parents: DeletedParents,
 ): Promise<string | null> {
   for (const userId of parents.user) {
+    const deployments = await db.$queryRaw<Array<{ one: number }>>`
+      SELECT 1 AS one FROM deployment_instance_node node JOIN deployment_instance instance ON instance.id = node."instanceId"
+       WHERE instance."userId" = ${userId} AND node."claimHeld" LIMIT 1`;
+    if (deployments.length > 0)
+      return "running or unconfirmed deployment processes (stop them before deleting the account)";
     for (const table of OWNER_RETAINED_HISTORY_TABLES) {
       const rows = await db.$queryRaw<Array<{ one: number }>>`
         SELECT 1 AS one FROM ${Prisma.raw(table)} WHERE "userId" = ${userId} LIMIT 1`;
@@ -604,6 +617,38 @@ export async function drainParentDeletionHistory(
       ),
     );
 
+  const residencyDelete = edgeFilters(
+    "a",
+    HISTORY_DRAIN_EDGES.cache_affinity_residency.delete,
+    parents,
+  );
+  if (residencyDelete.length > 0)
+    await drainLoop(report, "cache_affinity_residency.delete", budget, size, () =>
+      inBatch(
+        (tx) => tx.$executeRaw`
+          DELETE FROM cache_affinity_residency WHERE "executionTargetId" IN (
+            SELECT a."executionTargetId" FROM cache_affinity_residency a
+            WHERE ${Prisma.join(residencyDelete, " OR ")}
+            LIMIT ${size.limit} FOR UPDATE SKIP LOCKED)`,
+      ),
+    );
+
+  for (const [table, key] of [
+    ["cache_affinity_scope", "poolId"],
+    ["cache_affinity_observer", "capacityId"],
+  ] as const) {
+    const filters = edgeFilters("a", HISTORY_DRAIN_EDGES[table].delete, parents);
+    if (filters.length > 0)
+      await drainLoop(report, `${table}.delete`, budget, size, () =>
+        inBatch((tx) =>
+          tx.$executeRaw(Prisma.sql`
+          DELETE FROM ${Prisma.raw(table)} WHERE ctid = ANY(ARRAY(
+            SELECT a.ctid FROM ${Prisma.raw(table)} a WHERE ${Prisma.join(filters, " OR ")}
+            ORDER BY ${Prisma.raw(`a."${key}"`)} LIMIT ${size.limit} FOR UPDATE SKIP LOCKED))`),
+        ),
+      );
+  }
+
   // The user's terminal admission requests, with their waiters and lease
   // (H-internal ON DELETE CASCADE). The DELETE cascades into every waiter of
   // the request, and a waiter another transaction holds would make it wait.
@@ -751,6 +796,17 @@ export async function drainParentDeletionHistory(
               FOR UPDATE SKIP LOCKED)`,
       ),
     );
+    await drainLoop(report, "node_metrics_minute.delete", budget, size, () =>
+      inBatch(
+        (tx) => tx.$executeRaw`
+        DELETE FROM node_metrics_minute
+         WHERE ctid IN (
+           SELECT ctid FROM node_metrics_minute
+            WHERE "ownerUserId" = ${userId}
+            LIMIT ${size.limit}
+              FOR UPDATE SKIP LOCKED)`,
+      ),
+    );
     // The merge into other owners' sentinel rows can wait on a destination
     // row (a finalizer or compaction holds it); the batch's lock_timeout
     // bounds that wait and the drain reports pending.
@@ -843,8 +899,16 @@ export async function requestUserDeletion(
   userId: string,
 ): Promise<UserDeletionMark | null> {
   const candidate = randomUUID();
-  const [rows] = await db.$transaction([
-    db.$queryRaw<Array<{ generation: string }>>`
+  const rows = await db.$transaction(async (tx) => {
+    await fenceOwners(tx, [userId]);
+    const claims = await tx.$queryRaw<Array<{ one: number }>>`
+      SELECT 1 AS one FROM deployment_instance_node node JOIN deployment_instance instance ON instance.id = node."instanceId"
+       WHERE instance."userId" = ${userId} AND node."claimHeld" LIMIT 1`;
+    if (claims.length > 0)
+      throw new RetainedHistoryError(
+        "running or unconfirmed deployment processes (stop them before deleting the account)",
+      );
+    const marked = await tx.$queryRaw<Array<{ generation: string }>>`
       UPDATE "user"
          SET "deletionRequestedAt" = COALESCE("deletionRequestedAt", now()),
              "deletionGeneration" = CASE
@@ -861,11 +925,12 @@ export async function requestUserDeletion(
              "banExpires" = NULL,
              "updatedAt" = now()
        WHERE id = ${userId}
-       RETURNING "deletionGeneration" AS generation`,
+       RETURNING "deletionGeneration" AS generation`;
     // Every session the user acts through: their own and the ones they
     // impersonate another user with (Better Auth `impersonatedBy`, no FK).
-    db.session.deleteMany({ where: { OR: [{ userId }, { impersonatedBy: userId }] } }),
-  ]);
+    await tx.session.deleteMany({ where: { OR: [{ userId }, { impersonatedBy: userId }] } });
+    return marked;
+  });
   const generation = rows[0]?.generation;
   if (!generation) return null;
   return { generation, created: generation === candidate };

@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router";
-import { buttonVariants } from "@ws-model-proxy/ui/components/button";
+import { Button, buttonVariants } from "@ws-model-proxy/ui/components/button";
 import {
   type ChartConfig,
   ChartContainer,
@@ -7,7 +7,8 @@ import {
   ChartTooltipContent,
 } from "@ws-model-proxy/ui/components/chart";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { ArrowRight } from "lucide-react";
+import { ArrowRight, ChevronDown } from "lucide-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Area, AreaChart, CartesianGrid, XAxis, YAxis } from "recharts";
 
@@ -61,12 +62,17 @@ export function OverviewPoolCard({
   pool,
   range,
   lang,
+  defaultOpen = true,
 }: {
   pool: OverviewPool;
   range: OverviewMetrics["range"];
   lang: string;
+  /** Collapsed cards keep the summary line; the chart and member table open on demand. */
+  defaultOpen?: boolean;
 }) {
   const { t, i18n } = useTranslation("dashboard");
+  const [open, setOpen] = useState(defaultOpen);
+  const bodyId = `overview-pool-body-${pool.poolId}`;
   const locale = i18n.language;
   const series = chartSeriesForMembers(pool.members);
   const config: ChartConfig = Object.fromEntries(
@@ -90,7 +96,12 @@ export function OverviewPoolCard({
       aria-labelledby={`overview-pool-${pool.poolId}`}
       className="min-w-0 rounded-md border bg-background"
     >
-      <header className="flex min-w-0 flex-col gap-2 border-b p-4 sm:flex-row sm:items-start sm:justify-between">
+      <header
+        className={cn(
+          "flex min-w-0 flex-col gap-2 p-4 sm:flex-row sm:items-start sm:justify-between",
+          open && "border-b",
+        )}
+      >
         <div className="min-w-0">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <h3 id={`overview-pool-${pool.poolId}`} className="truncate text-base font-semibold">
@@ -113,20 +124,34 @@ export function OverviewPoolCard({
             })}
           </p>
         </div>
-        <Link
-          to="/$lang/dashboard/pools/$poolId"
-          params={{ lang, poolId: pool.poolId }}
-          className={cn(
-            buttonVariants({ variant: "outline", size: "sm" }),
-            "min-h-[44px] shrink-0 self-start",
-          )}
-        >
-          {t("overview.pools.open")}
-          <ArrowRight aria-hidden="true" />
-        </Link>
+        <div className="flex shrink-0 gap-2 self-start">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="min-h-[44px]"
+            aria-expanded={open}
+            aria-controls={bodyId}
+            onClick={() => setOpen((value) => !value)}
+          >
+            <ChevronDown
+              aria-hidden="true"
+              className={cn("size-4 transition-transform", open ? "rotate-0" : "-rotate-90")}
+            />
+            {open ? t("overview.pools.collapse") : t("overview.pools.expand")}
+          </Button>
+          <Link
+            to="/$lang/dashboard/pools/$poolId"
+            params={{ lang, poolId: pool.poolId }}
+            className={cn(buttonVariants({ variant: "outline", size: "sm" }), "min-h-[44px]")}
+          >
+            {t("overview.pools.open")}
+            <ArrowRight aria-hidden="true" />
+          </Link>
+        </div>
       </header>
 
-      <div className="min-w-0 p-4">
+      <div id={bodyId} hidden={!open} className="min-w-0 p-4">
         {pool.current.requests === 0 ? (
           <p
             className="flex items-center justify-center text-sm text-muted-foreground"
@@ -304,22 +329,39 @@ export function OverviewPoolCard({
             </tbody>
           </table>
         </WideContent>
-        {range !== "1h" && pool.engineLoad?.series.some((point) => !point.gap) ? (
-          <div className="mt-4 min-w-0" data-testid="overview-engine-load">
-            <EngineLoadSparkline
-              series={pool.engineLoad.series}
-              threshold={pool.engineLoad.effectiveKvFullThreshold}
-              caption={t("overview.pools.engineLoadCaption", { name: pool.name })}
-              labels={{
-                running: t("overview.pools.legendRunning"),
-                waiting: t("overview.pools.legendWaiting"),
-                kvUsage: t("overview.pools.legendKv"),
-                kvOccupancy: t("overview.pools.legendOccupancy"),
-                threshold: t("overview.pools.legendThreshold"),
-              }}
-            />
-          </div>
-        ) : null}
+        {range !== "1h"
+          ? pool.engineLoad?.members
+              .filter((member) => member.series.some((point) => !point.gap))
+              .map((member) => {
+                const row = pool.members.find(
+                  (candidate) => candidate.poolMemberId === member.poolMemberId,
+                );
+                const label = row ? memberLabel(row, t).primary : member.poolMemberId;
+                return (
+                  <div
+                    key={member.poolMemberId}
+                    className="mt-4 min-w-0"
+                    data-testid="overview-engine-load"
+                  >
+                    <EngineLoadSparkline
+                      series={member.series}
+                      threshold={member.kvFullThreshold}
+                      caption={t("overview.pools.engineLoadCaption", {
+                        name: pool.name,
+                        member: label,
+                      })}
+                      labels={{
+                        running: t("overview.pools.legendRunning"),
+                        waiting: t("overview.pools.legendWaiting"),
+                        kvUsage: t("overview.pools.legendKv"),
+                        kvOccupancy: t("overview.pools.legendOccupancy"),
+                        threshold: t("overview.pools.legendThreshold"),
+                      }}
+                    />
+                  </div>
+                );
+              })
+          : null}
       </div>
     </section>
   );

@@ -1,10 +1,11 @@
 import type { WebSocketLike } from "@hono/node-server";
 import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { RELAY_SUBPROTOCOL } from "./protocol.js";
+import { RELAY_PROTOCOL_VERSIONS, RELAY_SUBPROTOCOL } from "./protocol.js";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
+    BETTER_AUTH_URL: "https://proxy.example.test",
     RATE_LIMIT_AUTH_POINTS: 100,
     RATE_LIMIT_AUTH_DURATION: 60,
     RATE_LIMIT_AUTH_BLOCK_DURATION: 60,
@@ -97,6 +98,9 @@ describe("createRelayWebsocketMiddleware", () => {
     await expect(response.json()).resolves.toMatchObject({
       type: "protocol.error",
       failure: "protocol_error",
+      code: "upgrade_cli",
+      supportedVersions: RELAY_PROTOCOL_VERSIONS,
+      supportedSubprotocol: "ws-model-proxy.relay.v2",
     });
   });
 

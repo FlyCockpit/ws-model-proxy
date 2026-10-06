@@ -148,6 +148,10 @@ const SUPERVISED_REQUESTER_MAX_CHARS: usize = 100;
 const SUPERVISED_BODY_WAIT: Duration = Duration::from_secs(10);
 
 #[cfg(unix)]
+mod operator;
+#[cfg(unix)]
+pub(crate) use operator::OperatorEvent;
+#[cfg(unix)]
 mod supervised_pty;
 #[cfg(unix)]
 use supervised_pty::{MarkerEvent, Piece};
@@ -156,8 +160,9 @@ pub(crate) use supervised_pty::{
     SUPERVISED_ENV_COMMAND, SUPERVISED_ENV_FILE_ALLOW_ROOT, SUPERVISED_ENV_FILE_ARGS,
     SUPERVISED_ENV_FILE_BLOCKED, SUPERVISED_ENV_FILE_BODY, SUPERVISED_ENV_FILE_ETAG_KEY,
     SUPERVISED_ENV_FILE_OP, SUPERVISED_ENV_FILE_PREIMAGE, SUPERVISED_ENV_FILE_ROOTS,
-    SUPERVISED_ENV_MARKER, SUPERVISED_ENV_NAMES, SUPERVISED_ENV_REASON, SUPERVISED_ENV_REQUESTER,
-    SUPERVISED_ENV_SHARE, supervised_marker,
+    SUPERVISED_ENV_MARKER, SUPERVISED_ENV_MARKER_FILE, SUPERVISED_ENV_NAMES,
+    SUPERVISED_ENV_OPERATOR, SUPERVISED_ENV_REASON, SUPERVISED_ENV_REQUESTER, SUPERVISED_ENV_SHARE,
+    supervised_marker,
 };
 
 #[allow(clippy::large_enum_variant)] // 2.9 telemetry grew `ClientControlMessage`.
@@ -1505,6 +1510,9 @@ struct TerminalSession {
     pty: Option<PtyRuntime>,
     /// Set on an agent-requested (supervised) terminal.
     supervised: Option<Supervised>,
+    /// Set on a deployment operator terminal (`sessions::operator`).
+    #[cfg(unix)]
+    operator: Option<operator::OperatorTerminal>,
 }
 
 impl TerminalSession {
@@ -1516,6 +1524,11 @@ impl TerminalSession {
         if self.pty.as_ref().is_none_or(|pty| pty.exited.is_some()) {
             return false;
         }
+        #[cfg(unix)]
+        if let Some(operator) = &self.operator {
+            // Nothing reaches the PTY before the confirm screen is drawn.
+            return operator.ready_seen && !operator.invalid;
+        }
         match &self.supervised {
             None => true,
             Some(supervised) => matches!(
@@ -1523,6 +1536,13 @@ impl TerminalSession {
                 SupervisedPhase::Confirm | SupervisedPhase::Running
             ),
         }
+    }
+
+    fn is_operator(&self) -> bool {
+        #[cfg(unix)]
+        return self.operator.is_some();
+        #[cfg(not(unix))]
+        false
     }
 
     /// Supervised PTY output: markers become phase changes and never reach
@@ -1636,7 +1656,9 @@ impl TerminalSession {
                             },
                         ));
                     }
-                    Piece::Event(MarkerEvent::Invalid) => {
+                    // Agent terminals scan with the supervised grammar,
+                    // which reports `exited` as `Invalid`; never seen here.
+                    Piece::Event(MarkerEvent::Invalid | MarkerEvent::Exited(_)) => {
                         supervised.marker_invalid = true;
                     }
                 }
@@ -1918,6 +1940,24 @@ pub(crate) struct TerminalRegistry {
     /// The confirm child program. `None`: this binary, `terminal supervised-run`.
     #[cfg(unix)]
     supervised_program: Option<(String, Vec<String>)>,
+    /// The operator child program. `None`: this binary,
+    /// `terminal supervised-run --deployment`.
+    #[cfg(unix)]
+    operator_program: Option<(String, Vec<String>)>,
+    /// Operator terminal events for the session loop.
+    #[cfg(unix)]
+    operator_events: Vec<OperatorEvent>,
+    /// Stops held until a person's run on their instance has ended.
+    #[cfg(unix)]
+    deferred_jobs: Vec<crate::deployments::Job>,
+    /// Recently ended operator terminals and how they ended.
+    #[cfg(unix)]
+    ended_operators: VecDeque<(String, OperatorEvent)>,
+    /// Whether local deployments are on (fresh config read); tests replace it.
+    #[cfg(unix)]
+    operator_allowed: fn() -> bool,
+    #[cfg(unix)]
+    next_operator_gate_check: Option<Instant>,
     confirm_ttl: Duration,
     review_ttl: Duration,
     #[cfg(unix)]
@@ -1990,6 +2030,18 @@ impl TerminalRegistry {
             shell: None,
             #[cfg(unix)]
             supervised_program: None,
+            #[cfg(unix)]
+            operator_program: None,
+            #[cfg(unix)]
+            operator_events: Vec::new(),
+            #[cfg(unix)]
+            deferred_jobs: Vec::new(),
+            #[cfg(unix)]
+            ended_operators: VecDeque::new(),
+            #[cfg(unix)]
+            operator_allowed: operator::operator_terminals_allowed,
+            #[cfg(unix)]
+            next_operator_gate_check: None,
             #[cfg(all(test, unix))]
             file_child_env: Vec::new(),
             confirm_ttl: SUPERVISED_CONFIRM_TTL,
@@ -2091,10 +2143,18 @@ impl TerminalRegistry {
     }
 
     /// Human (browser-opened) terminals. Supervised terminals have their own slots.
+    /// Operator terminals are allowed by the local config right now.
+    fn operator_gate_open(&self) -> bool {
+        #[cfg(unix)]
+        return (self.operator_allowed)();
+        #[cfg(not(unix))]
+        false
+    }
+
     fn human_count(&self) -> usize {
         self.sessions
             .values()
-            .filter(|session| session.supervised.is_none())
+            .filter(|session| session.supervised.is_none() && !session.is_operator())
             .count()
     }
 
@@ -2419,6 +2479,7 @@ impl TerminalRegistry {
                 detached_at: Some(now),
                 scrollback: VecDeque::new(),
                 pty: Some(pty),
+                operator: None,
                 supervised: Some(Supervised {
                     command_id: command_id.to_string(),
                     share_output: spawn.share_output,
@@ -2618,6 +2679,7 @@ impl TerminalRegistry {
                 detached_at: Some(now),
                 scrollback: VecDeque::new(),
                 pty: Some(pty),
+                operator: None,
                 supervised: Some(Supervised {
                     command_id: command_id.to_string(),
                     share_output: false,
@@ -3169,6 +3231,7 @@ impl TerminalRegistry {
             scrollback: VecDeque::new(),
             pty: Some(pty),
             supervised: None,
+            operator: None,
         };
         let mut frames = vec![OutboundFrame::Control(ClientControlMessage::TermOpened {
             terminal_id: terminal_id.to_string(),
@@ -3195,7 +3258,12 @@ impl TerminalRegistry {
         };
         // A supervised terminal is gated by the MCP command policy, not by the
         // human terminal switch; approval still applies to every viewer.
-        let allowed = if session.supervised.is_some() {
+        // An operator terminal is gated by its own local switch (and
+        // deployments), read fresh for every viewer; not by the browser
+        // terminal switch or the MCP command mode.
+        let allowed = if session.is_operator() {
+            self.operator_gate_open()
+        } else if session.supervised.is_some() {
             startup.mcp_command_mode().allows_supervised()
         } else {
             startup.allow_human_terminal()
@@ -3542,7 +3610,11 @@ impl TerminalRegistry {
         #[cfg(unix)]
         let status = {
             let mut session = session;
-            session.pty.take().map(shutdown_pty).unwrap_or(recorded)
+            let status = session.pty.take().map(shutdown_pty).unwrap_or(recorded);
+            if let Some(operator) = session.operator.take() {
+                self.finish_operator(&operator, status);
+            }
+            status
         };
         #[cfg(not(unix))]
         let status = {
@@ -3790,6 +3862,12 @@ impl TerminalRegistry {
                 file_after_send: None,
             };
         };
+        if session.operator.is_some() {
+            return TerminalBytesDispatch {
+                frames: self.operator_bytes(terminal_id, bytes),
+                file_after_send: None,
+            };
+        }
         if session.supervised.is_some() {
             let (mut frames, file_after_send) =
                 session.supervised_bytes(terminal_id, bytes, mode_allows);
@@ -3870,6 +3948,14 @@ impl TerminalRegistry {
         let Some(session) = self.sessions.get_mut(terminal_id) else {
             return Vec::new();
         };
+        if let Some(operator) = session.operator.as_mut() {
+            // Finished once the child is reaped, so its exit status is known.
+            operator.child.eof = true;
+            if session.pty.as_ref().is_some_and(|pty| pty.exited.is_some()) {
+                return self.close(terminal_id);
+            }
+            return Vec::new();
+        }
         let Some(supervised) = session.supervised.as_mut() else {
             return self.close(terminal_id);
         };
@@ -3957,6 +4043,8 @@ impl TerminalRegistry {
         }
         frames.extend(self.recheck_approvals(now));
         #[cfg(unix)]
+        frames.extend(self.recheck_operator_gate(now));
+        #[cfg(unix)]
         frames.extend(self.close_exited_shells(now));
         // Pending viewers do not keep a terminal alive. An unanswered confirm
         // screen and an unreviewed capture have their own deadlines.
@@ -3964,6 +4052,8 @@ impl TerminalRegistry {
             .sessions
             .iter()
             .filter(|(_, session)| match session.supervised.as_ref() {
+                // A deployment step may wait for its person indefinitely.
+                _ if session.is_operator() => false,
                 Some(supervised) if supervised.awaiting() => {
                     now.saturating_duration_since(supervised.spawned_at) >= self.confirm_ttl
                 }
@@ -4008,7 +4098,11 @@ impl TerminalRegistry {
             let all_output = session
                 .supervised
                 .as_ref()
-                .is_some_and(|supervised| supervised.child.eof);
+                .is_some_and(|supervised| supervised.child.eof)
+                || session
+                    .operator
+                    .as_ref()
+                    .is_some_and(|operator| operator.child.eof);
             if pty.exited.is_some_and(|(_, _, at)| {
                 all_output || now.saturating_duration_since(at) >= TERMINAL_OUTPUT_DRAIN
             }) {

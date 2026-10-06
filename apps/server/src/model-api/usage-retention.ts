@@ -20,7 +20,10 @@
  *     older than CLI_AGENT_ACTION_RETENTION_DAYS, in `FOR UPDATE SKIP LOCKED`
  *     batches ordered by the (createdAt) index, and audit events whose user
  *     no longer exists (an independent bound for a row that outlived the
- *     deletion drain and the deleted-user purge).
+ *     deletion drain and the deleted-user purge). The deployment operator
+ *     audit (deployment_operator_event, same plain-id contract) gets the same
+ *     two sweeps with DEPLOYMENT_OPERATOR_EVENT_RETENTION_DAYS; its rows of a
+ *     deleted device or instance are bounded by the expiry.
  *  6. Hot-path history sweeps (DL-1 design (d), #78; @ws-model-proxy/db/hot-path-sweeps):
  *     terminal admission history older than RELAY_REQUEST_RETENTION_DAYS (it
  *     no longer blocks a parent delete, so it needs its own bound), the rest
@@ -37,6 +40,8 @@
  *  8. Delete engine_load_rollup_minute rows older than
  *     ENGINE_LOAD_ROLLUP_MINUTE_RETENTION_DAYS (24h/7d Overview). Occupancy
  *     is display-only in those rows.
+ *  9. Delete node_metrics_minute rows older than
+ *     NODE_METRICS_MINUTE_RETENTION_DAYS (CLI node-card sparklines).
  *
  * Multi-replica safety: every batch selects its rows with
  * `FOR UPDATE SKIP LOCKED`, so concurrent sweepers work on disjoint rows; the
@@ -54,6 +59,7 @@
 import { CLI_AGENT_ACTION_RETENTION_DAYS } from "@ws-model-proxy/config/cli-agent-audit";
 import {
   ENGINE_LOAD_ROLLUP_MINUTE_RETENTION_DAYS,
+  NODE_METRICS_MINUTE_RETENTION_DAYS,
   USAGE_ROLLUP_HOUR_RETENTION_DAYS,
   USAGE_ROLLUP_MINUTE_RETENTION_DAYS,
 } from "@ws-model-proxy/config/usage-metrics";
@@ -76,6 +82,8 @@ import {
 } from "./usage-rollup.js";
 
 export const USAGE_RETENTION_INTERVAL_MS = 60 * 60 * 1000;
+/** Deployment operator terminal audit rows (interactive recipe commands) are kept this long. */
+export const DEPLOYMENT_OPERATOR_EVENT_RETENTION_DAYS = 90;
 export const USAGE_RETENTION_BATCH = 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -97,9 +105,11 @@ export type UsageRetentionResult = {
   minuteRowsCompacted: number;
   hourRowsDeleted: number;
   agentActionsDeleted: number;
+  operatorEventsDeleted: number;
   routingVerdictsDeleted: number;
   kvEvictionsDeleted: number;
   engineLoadMinutesDeleted: number;
+  nodeMetricsMinutesDeleted: number;
   admissionHistoryPruned: number;
   deletedUserRowsPurged: number;
   orphanCapacityRuntimeDeleted: number;
@@ -402,6 +412,66 @@ export async function deleteOrphanCliAgentActions({
   }
 }
 
+/**
+ * Deletes deployment operator audit events (`deployment_operator_event`, plain ids, no
+ * foreign keys) older than {@link DEPLOYMENT_OPERATOR_EVENT_RETENTION_DAYS}, oldest first
+ * by the (createdAt) index, like {@link deleteExpiredCliAgentActions}.
+ */
+export async function deleteExpiredDeploymentOperatorEvents({
+  prisma = defaultPrisma as RetentionPrisma,
+  now,
+  retentionDays = DEPLOYMENT_OPERATOR_EVENT_RETENTION_DAYS,
+  batch = USAGE_RETENTION_BATCH,
+}: {
+  prisma?: RetentionPrisma;
+  now: Date;
+  retentionDays?: number;
+  batch?: number;
+}): Promise<number> {
+  const cutoff = new Date(now.getTime() - retentionDays * DAY_MS);
+  let deleted = 0;
+  for (;;) {
+    if (isDbShutdownFenceArmed()) return deleted;
+    const count = await prisma.$executeRaw`
+      DELETE FROM deployment_operator_event
+       WHERE ctid IN (
+         SELECT ctid FROM deployment_operator_event
+          WHERE "createdAt" < ${cutoff}
+          ORDER BY "createdAt"
+          LIMIT ${batch}
+          FOR UPDATE SKIP LOCKED)`;
+    deleted += count;
+    if (count < batch) return deleted;
+  }
+}
+
+/**
+ * Deletes deployment operator audit events whose user no longer exists: the independent
+ * bound behind the user delete's drain and the deleted-user purge, like
+ * {@link deleteOrphanCliAgentActions}.
+ */
+export async function deleteOrphanDeploymentOperatorEvents({
+  prisma = defaultPrisma as RetentionPrisma,
+  batch = USAGE_RETENTION_BATCH,
+}: {
+  prisma?: RetentionPrisma;
+  batch?: number;
+} = {}): Promise<number> {
+  let deleted = 0;
+  for (;;) {
+    if (isDbShutdownFenceArmed()) return deleted;
+    const count = await prisma.$executeRaw`
+      DELETE FROM deployment_operator_event
+       WHERE ctid IN (
+         SELECT e.ctid FROM deployment_operator_event e
+          WHERE NOT EXISTS (SELECT 1 FROM "user" u WHERE u.id = e."userId")
+          LIMIT ${batch}
+          FOR UPDATE OF e SKIP LOCKED)`;
+    deleted += count;
+    if (count < batch) return deleted;
+  }
+}
+
 export async function deleteExpiredRoutingVerdicts({
   prisma = defaultPrisma as RetentionPrisma,
   now,
@@ -479,6 +549,31 @@ export async function deleteExpiredEngineLoadMinutes({
   }
 }
 
+export async function deleteExpiredNodeMetricsMinutes({
+  prisma = defaultPrisma as RetentionPrisma,
+  now,
+  batch = USAGE_RETENTION_BATCH,
+}: {
+  prisma?: RetentionPrisma;
+  now: Date;
+  batch?: number;
+}): Promise<number> {
+  const cutoff = new Date(now.getTime() - NODE_METRICS_MINUTE_RETENTION_DAYS * DAY_MS);
+  let deleted = 0;
+  for (;;) {
+    if (isDbShutdownFenceArmed()) return deleted;
+    const count = await prisma.$executeRaw`
+      DELETE FROM node_metrics_minute
+       WHERE ctid IN (
+         SELECT ctid FROM node_metrics_minute
+          WHERE "bucketStart" < ${cutoff}
+          LIMIT ${batch}
+          FOR UPDATE SKIP LOCKED)`;
+    deleted += count;
+    if (count < batch) return deleted;
+  }
+}
+
 export async function runUsageRetention({
   prisma = defaultPrisma as RetentionPrisma,
   retentionDays,
@@ -509,9 +604,13 @@ export async function runUsageRetention({
   const agentActionsDeleted =
     (await deleteExpiredCliAgentActions({ prisma, now, batch })) +
     (await deleteOrphanCliAgentActions({ prisma, batch }));
+  const operatorEventsDeleted =
+    (await deleteExpiredDeploymentOperatorEvents({ prisma, now, batch })) +
+    (await deleteOrphanDeploymentOperatorEvents({ prisma, batch }));
   const routingVerdictsDeleted = await deleteExpiredRoutingVerdicts({ prisma, now, batch });
   const kvEvictionsDeleted = await deleteExpiredKvEvictions({ prisma, now, batch });
   const engineLoadMinutesDeleted = await deleteExpiredEngineLoadMinutes({ prisma, now, batch });
+  const nodeMetricsMinutesDeleted = await deleteExpiredNodeMetricsMinutes({ prisma, now, batch });
   const admissionHistoryPruned = await pruneTerminalCapacityHistory(prisma, {
     before: new Date(now.getTime() - retentionDays * DAY_MS),
     batch: sweepBatch,
@@ -530,9 +629,11 @@ export async function runUsageRetention({
     minuteRowsCompacted,
     hourRowsDeleted,
     agentActionsDeleted,
+    operatorEventsDeleted,
     routingVerdictsDeleted,
     kvEvictionsDeleted,
     engineLoadMinutesDeleted,
+    nodeMetricsMinutesDeleted,
     admissionHistoryPruned,
     deletedUserRowsPurged: purged.rows,
     orphanCapacityRuntimeDeleted,
@@ -570,10 +671,11 @@ export function startUsageRetention({
         result.expiredStickinessDeleted +
         result.routingVerdictsDeleted +
         result.kvEvictionsDeleted +
-        result.engineLoadMinutesDeleted;
+        result.engineLoadMinutesDeleted +
+        result.nodeMetricsMinutesDeleted;
       if (total > 0)
         console.log(
-          `[metrics] retention: reaped ${result.abandonedReaped}, deleted ${result.relayRequestsDeleted} relay request(s), compacted ${result.minuteRowsCompacted} minute rollup(s), deleted ${result.hourRowsDeleted} hourly rollup(s), deleted ${result.agentActionsDeleted} agent audit event(s), pruned ${result.admissionHistoryPruned} admission request(s), purged ${result.deletedUserRowsPurged} deleted-user row(s), deleted ${result.orphanCapacityRuntimeDeleted} orphan capacity runtime row(s), deleted ${result.expiredStickinessDeleted} expired stickiness binding(s), deleted ${result.routingVerdictsDeleted} expired routing verdict(s), deleted ${result.kvEvictionsDeleted} expired KV feedback row(s), deleted ${result.engineLoadMinutesDeleted} engine-load minute row(s).`,
+          `[metrics] retention: reaped ${result.abandonedReaped}, deleted ${result.relayRequestsDeleted} relay request(s), compacted ${result.minuteRowsCompacted} minute rollup(s), deleted ${result.hourRowsDeleted} hourly rollup(s), deleted ${result.agentActionsDeleted} agent audit event(s), pruned ${result.admissionHistoryPruned} admission request(s), purged ${result.deletedUserRowsPurged} deleted-user row(s), deleted ${result.orphanCapacityRuntimeDeleted} orphan capacity runtime row(s), deleted ${result.expiredStickinessDeleted} expired stickiness binding(s), deleted ${result.routingVerdictsDeleted} expired routing verdict(s), deleted ${result.kvEvictionsDeleted} expired KV feedback row(s), deleted ${result.engineLoadMinutesDeleted} engine-load minute row(s), deleted ${result.nodeMetricsMinutesDeleted} node-metrics minute row(s).`,
         );
     } catch (error) {
       // Prisma errors can carry SQL and parameters; log the class only.

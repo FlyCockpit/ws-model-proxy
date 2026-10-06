@@ -666,7 +666,12 @@ describe("createApp registration contract — device-code exchange limiter (CI-2
         method: "POST",
         headers: { ...HOST, "content-type": "application/json", "x-csrf-token": "orpc" },
         body: JSON.stringify({
-          json: { deviceCode: `wiring-${BASE}-code`, cliSlug: "desk-01" },
+          json: {
+            deviceCode: `wiring-${BASE}-code`,
+            cliSlug: "desk-01",
+            identityPublicKey:
+              "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE",
+          },
         }),
       });
     for (let call = 0; call < DEVICE_CODE_EXCHANGE_CODE_POINTS; call += 1) {
@@ -693,7 +698,14 @@ describe("createApp registration contract — device-code exchange limiter (CI-2
       app.request(`${BASE}/rpc/cliCredentials/exchangeDeviceCode`, {
         method: "POST",
         headers: { ...HOST, "content-type": "application/json", "x-csrf-token": "orpc" },
-        body: JSON.stringify({ json: { deviceCode: "saturation-code", cliSlug: "desk-01" } }),
+        body: JSON.stringify({
+          json: {
+            deviceCode: "saturation-code",
+            cliSlug: "desk-01",
+            identityPublicKey:
+              "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE",
+          },
+        }),
       });
     for (let call = 0; call < DEVICE_CODE_EXCHANGE_CODE_POINTS; call += 1) {
       await realExchange();
@@ -764,7 +776,8 @@ describe("createApp registration contract — device-login approval needs the CS
   it("refuses a headerless approval (a no-preflight cross-origin POST) before any auth or write", async () => {
     const app = await buildApp(false);
     for (const contentType of [undefined, "application/json", "text/plain"]) {
-      const res = await app.request(`${BASE}/rpc/cliCredentials/approveDeviceLogin`, {
+      // A browser on a sibling origin: refused by the same-origin guard.
+      const crossSite = await app.request(`${BASE}/rpc/cliCredentials/approveDeviceLogin`, {
         method: "POST",
         headers: {
           ...HOST,
@@ -773,9 +786,69 @@ describe("createApp registration contract — device-login approval needs the CS
         },
         body: new TextEncoder().encode(approveBody),
       });
-      expect(res.status, String(contentType)).toBe(403);
-      expect(await res.json()).toMatchObject({ json: { code: "CSRF_TOKEN_MISMATCH" } });
+      expect(crossSite.status, String(contentType)).toBe(403);
+      expect(await crossSite.json()).toEqual({ error: "Cross-site request blocked." });
+      // No browser provenance at all: still refused by the CSRF header check.
+      const headerless = await app.request(`${BASE}/rpc/cliCredentials/approveDeviceLogin`, {
+        method: "POST",
+        headers: { ...HOST, ...(contentType ? { "content-type": contentType } : {}) },
+        body: new TextEncoder().encode(approveBody),
+      });
+      expect(headerless.status, String(contentType)).toBe(403);
+      expect(await headerless.json()).toMatchObject({ json: { code: "CSRF_TOKEN_MISMATCH" } });
     }
+  });
+
+  it("refuses any cross-site browser mutation on /rpc and /api-reference, whatever the procedure or encoding", async () => {
+    const app = await buildApp(false);
+    for (const [path, headers] of [
+      // An unlisted procedure through a same-site sibling (Lax cookie sent).
+      ["/rpc/forwarderManagement/updateModelPool", { origin: "https://sibling.proxy.example.com" }],
+      ["/rpc/inferenceContributions/accept", { "sec-fetch-site": "same-site" }],
+      ["/api-reference/inference-contributions/accept", { "sec-fetch-site": "cross-site" }],
+    ] as const) {
+      const res = await app.request(`${BASE}${path}`, {
+        method: "POST",
+        headers: { ...HOST, ...headers, "content-type": "application/x-www-form-urlencoded" },
+        body: "id=attacker-offer",
+      });
+      expect(res.status, path).toBe(403);
+      expect(await res.json()).toEqual({ error: "Cross-site request blocked." });
+    }
+    // The app's own origin passes the guard and reaches the session check.
+    const sameOrigin = await app.request(`${BASE}/rpc/cliCredentials/approveDeviceLogin`, {
+      method: "POST",
+      headers: {
+        ...HOST,
+        origin: BASE,
+        "content-type": "application/json",
+        "x-csrf-token": "orpc",
+      },
+      body: approveBody,
+    });
+    expect(sameOrigin.status).toBe(401);
+  });
+
+  it.each([
+    "deployments/confirmPlan",
+    "deployments/createConfig",
+    "deployments/updateConfig",
+    "deployments/setNodeGrant",
+    "deployments/setAgentsMayPreempt",
+    "deployments/deleteConfig",
+    "inferenceContributions/accept",
+    "cliCredentials/resetTokenIdentity",
+    "forwarderManagement/setCliDeviceFeatureGrants",
+  ])("refuses a headerless %s before any auth or write", async (path) => {
+    const app = await buildApp(false);
+    // Headerless (no Origin, no Sec-Fetch-Site): the per-procedure CSRF check refuses it.
+    const res = await app.request(`${BASE}/rpc/${path}`, {
+      method: "POST",
+      headers: { ...HOST, "content-type": "text/plain" },
+      body: JSON.stringify({ json: {} }),
+    });
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ json: { code: "CSRF_TOKEN_MISMATCH" } });
   });
 
   it("refuses it inside a batch too, even when the inner request names the header", async () => {
@@ -812,7 +885,14 @@ describe("createApp registration contract — device-login approval needs the CS
     const res = await app.request(`${BASE}/rpc/cliCredentials/exchangeDeviceCode`, {
       method: "POST",
       headers: { ...HOST, "content-type": "application/json" },
-      body: JSON.stringify({ json: { deviceCode: "headerless-code", cliSlug: "desk-01" } }),
+      body: JSON.stringify({
+        json: {
+          deviceCode: "headerless-code",
+          cliSlug: "desk-01",
+          identityPublicKey:
+            "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE",
+        },
+      }),
     });
     // The mocked database has no such code: the procedure ran.
     expect(res.status).toBe(404);

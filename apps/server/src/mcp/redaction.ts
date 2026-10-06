@@ -98,6 +98,20 @@ function carriesProductCredential(value: string): boolean {
   return Object.values(PRODUCT_CREDENTIAL_PREFIXES).some((prefix) => value.startsWith(prefix));
 }
 
+/**
+ * A product credential embedded anywhere in text (a token pasted into a recipe
+ * command). Requires a credential-length secret, so a short mention of a
+ * prefix (in docs or an error) is left alone.
+ */
+const EMBEDDED_PRODUCT_CREDENTIAL = new RegExp(
+  `(?:${Object.values(PRODUCT_CREDENTIAL_PREFIXES).join("|")})[A-Za-z0-9_.-]{32,}`,
+  "g",
+);
+
+function redactEmbeddedCredentials(value: string): string {
+  return value.replace(EMBEDDED_PRODUCT_CREDENTIAL, MCP_REDACTED_VALUE);
+}
+
 /** Depth bound: mirrors the serialization bound; deeper nests redact whole. */
 const MAX_REDACTION_DEPTH = 24;
 
@@ -105,7 +119,7 @@ const MAX_REDACTION_DEPTH = 24;
 export function redactSecrets(value: unknown, depth = 0): unknown {
   if (depth > MAX_REDACTION_DEPTH) return MCP_REDACTED_VALUE;
   if (typeof value === "string") {
-    return carriesProductCredential(value) ? MCP_REDACTED_VALUE : value;
+    return carriesProductCredential(value) ? MCP_REDACTED_VALUE : redactEmbeddedCredentials(value);
   }
   if (Array.isArray(value)) {
     return value.map((entry) => redactSecrets(entry, depth + 1));

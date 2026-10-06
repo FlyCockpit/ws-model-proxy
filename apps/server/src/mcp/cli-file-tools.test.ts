@@ -187,3 +187,56 @@ describe("requireFilePat op classification", () => {
     expect(fileRuntime.runFileOp).not.toHaveBeenCalled();
   });
 });
+
+describe("e2e file-tools-relay script literals", () => {
+  // scripts/e2e/file-tools-relay.mjs needs PostgreSQL and real binaries, so its
+  // hard-coded message patterns are pinned here against the server constants.
+  it("matches the server's upgrade messages and canonical protocol declaration", async () => {
+    const { readFile } = await import("node:fs/promises");
+    const { join, resolve } = await import("node:path");
+    const { RELAY_MIN_PROTOCOL_VERSION, RELAY_PROTOCOL_VERSIONS, RELAY_UPGRADE_REQUIRED_MESSAGE } =
+      await import("../relay/protocol.js");
+    const root = resolve(import.meta.dirname, "../../../..");
+    const script = await readFile(join(root, "scripts/e2e/file-tools-relay.mjs"), "utf8");
+    const versionSource = await readFile(
+      join(root, "packages/api/src/lib/relay-protocol-version.ts"),
+      "utf8",
+    );
+
+    // The script derives the protocol exactly this way.
+    const scriptProtocolPattern = /const currentProtocol = \/(.+)\/\.exec\(versionSource\)/.exec(
+      script,
+    )?.[1];
+    expect(scriptProtocolPattern).toBeDefined();
+    const currentProtocol = new RegExp(scriptProtocolPattern ?? "^$").exec(versionSource)?.[1];
+    expect(currentProtocol).toBe(RELAY_PROTOCOL_VERSIONS.at(-1));
+    expect(currentProtocol).toBe(RELAY_MIN_PROTOCOL_VERSION);
+
+    // The scripted 2.3 hello's protocol.error and the real old-binary output.
+    // The script's own template literal, spelled without a placeholder here.
+    const scriptTemplate = ["`relay protocol $", "{currentProtocol}`"].join("");
+    expect(script).toContain(`upgradeMessage.message.includes(${scriptTemplate})`);
+    expect(script).toContain(`oldLog.includes(${scriptTemplate})`);
+    expect(RELAY_UPGRADE_REQUIRED_MESSAGE).toContain(`relay protocol ${currentProtocol}`);
+    const upgradeLiteral = /assert\.match\(upgradeMessage\.message, \/([^/]+)\/([a-z]*)\)/.exec(
+      script,
+    );
+    expect(upgradeLiteral).not.toBeNull();
+    expect(RELAY_UPGRADE_REQUIRED_MESSAGE).toMatch(
+      new RegExp(upgradeLiteral?.[1] ?? "^$", upgradeLiteral?.[2]),
+    );
+
+    // The file tool's refusal for a device that connected at relay 2.3.
+    const toolLiteral = /assert\.match\(upgrade\.text, \/([^/]+)\/([a-z]*)\)/.exec(script);
+    expect(toolLiteral).not.toBeNull();
+    expect(script).toContain('protocolVersion: "2.3"');
+    const refusal = new McpCliFileError({
+      ok: false,
+      code: "upgrade_required",
+      rejectedProtocolVersion: "2.3",
+    });
+    expect(refusal.code).toBe("upgrade_required");
+    expect(refusal.message).toMatch(new RegExp(toolLiteral?.[1] ?? "^$", toolLiteral?.[2]));
+    expect(script).toContain('assert.equal(upgrade.error.code, "upgrade_required")');
+  });
+});

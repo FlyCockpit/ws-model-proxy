@@ -102,6 +102,62 @@ integration("agent audit retention with real PostgreSQL", () => {
     }
   });
 
+  function operatorEvent(ageDays: number, stepId: string, userId = tag) {
+    return {
+      userId,
+      instanceId: `${tag}-instance`,
+      stepId,
+      cliDeviceId: "dev",
+      rank: 0,
+      action: "start",
+      outcome: "opened" as const,
+      createdAt: new Date(Date.now() - ageDays * DAY_MS),
+    };
+  }
+
+  it("deletes deployment operator audit events older than 90 days and orphaned ones", async () => {
+    const fixture = createFixturePrismaClient(databaseUrl as string);
+    const owner = await fixture.user.create({
+      data: {
+        name: "Operator audit retention owner",
+        email: `${tag}-operator@example.test`,
+        slug: `${tag}-operator`,
+      },
+    });
+    try {
+      await db.deploymentOperatorEvent.createMany({
+        data: [
+          operatorEvent(91, "op-old-1", owner.id),
+          operatorEvent(365, "op-old-2", owner.id),
+          operatorEvent(89, "op-recent", owner.id),
+          operatorEvent(1, "op-orphan", `${tag}-gone`),
+        ],
+      });
+      const now = new Date();
+      expect(
+        await retention.deleteExpiredDeploymentOperatorEvents({ prisma: db, now, batch: 1 }),
+      ).toBeGreaterThanOrEqual(2);
+      expect(
+        await retention.deleteOrphanDeploymentOperatorEvents({ prisma: db, batch: 1 }),
+      ).toBeGreaterThanOrEqual(1);
+      const left = await db.deploymentOperatorEvent.findMany({
+        where: { stepId: { in: ["op-old-1", "op-old-2", "op-recent", "op-orphan"] } },
+        select: { stepId: true },
+      });
+      expect(left.map((event) => event.stepId)).toEqual(["op-recent"]);
+      await db.deploymentOperatorEvent.createMany({
+        data: [operatorEvent(200, "op-old-again", owner.id)],
+      });
+      const result = await retention.runUsageRetention({ prisma: db, retentionDays: 14 });
+      expect(result.operatorEventsDeleted).toBeGreaterThanOrEqual(1);
+      expect(await db.deploymentOperatorEvent.count({ where: { stepId: "op-old-again" } })).toBe(0);
+    } finally {
+      await db.deploymentOperatorEvent.deleteMany({ where: { userId: owner.id } });
+      await fixture.user.deleteMany({ where: { id: owner.id } });
+      await fixture.$disconnect();
+    }
+  });
+
   it("runUsageRetention includes the step and reports its count", async () => {
     await db.cliAgentActionEvent.createMany({ data: [row(200, "old-again")] });
     const result = await retention.runUsageRetention({ prisma: db, retentionDays: 14 });

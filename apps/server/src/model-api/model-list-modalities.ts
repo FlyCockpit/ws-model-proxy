@@ -16,9 +16,10 @@ import { audioOperationSupported } from "@ws-model-proxy/api/lib/openai-compatib
 import type { OpenAiCompatibleCapabilities } from "../relay/protocol.js";
 
 export type ModelInputModality = "text" | "image" | "audio" | "video" | "file";
-export type ModelOutputModality = "text" | "image" | "audio";
+export type ModelOutputModality = "text" | "image" | "audio" | "embedding";
 
 export type ModelListCapabilitiesAdvertisement = {
+  embeddings: boolean;
   vision: boolean;
   video_input: boolean;
   audio_input: boolean;
@@ -39,6 +40,7 @@ export type ModelListArchitectureAdvertisement = {
  * Missing/null capabilities → text-only (safe default for listed chat models).
  */
 export type MultimodalFlags = {
+  embeddings?: boolean;
   text: boolean;
   vision: boolean;
   video: boolean;
@@ -71,10 +73,11 @@ export function multimodalFlagsFromCapabilities(
     const enabledSurfaces = surfaces.filter((surface) =>
       "operations" in surface ? surface.operations.includes("create") : surface.supported === true,
     );
-    const legacyAudio = capabilities.version === 3 ? capabilities.audio : undefined;
+    const legacyAudio = capabilities.audio;
     const audioTranscription = audioOperationSupported(legacyAudio?.transcriptions) === true;
     const audioTranslation = audioOperationSupported(legacyAudio?.translations) === true;
     return {
+      ...(capabilities.embeddings?.supported === true ? { embeddings: true } : {}),
       text: enabledSurfaces.length > 0,
       vision: enabledSurfaces.some((surface) => surface.inputImages === true),
       video: enabledSurfaces.some((surface) => surface.inputVideo === true),
@@ -97,12 +100,14 @@ export function multimodalFlagsFromCapabilities(
   const audioOutput = capabilities.audio?.speech === true;
 
   // Embedding-only models still accept text input; keep text true if embeddings.
-  const textOrEmbed = text || capabilities.embeddings?.supported === true;
+  const embeddings = capabilities.embeddings?.supported === true;
 
   return {
+    ...(embeddings ? { embeddings: true } : {}),
     text:
-      textOrEmbed ||
-      (!vision &&
+      text ||
+      (!embeddings &&
+        !vision &&
         !video &&
         !audioInput &&
         !audioOutput &&
@@ -123,6 +128,7 @@ export function unionMultimodalFlags(flags: MultimodalFlags[]): MultimodalFlags 
   }
   return flags.reduce(
     (acc, next) => ({
+      ...(acc.embeddings || next.embeddings ? { embeddings: true } : {}),
       text: acc.text || next.text,
       vision: acc.vision || next.vision,
       video: acc.video || next.video,
@@ -145,7 +151,7 @@ export function unionMultimodalFlags(flags: MultimodalFlags[]): MultimodalFlags 
 
 export function inputModalitiesFromFlags(flags: MultimodalFlags): ModelInputModality[] {
   const input: ModelInputModality[] = [];
-  if (flags.text) input.push("text");
+  if (flags.text || flags.embeddings) input.push("text");
   if (flags.vision) input.push("image");
   if (flags.audioInput || flags.audioTranscription || flags.audioTranslation) input.push("audio");
   if (flags.video) input.push("video");
@@ -154,7 +160,8 @@ export function inputModalitiesFromFlags(flags: MultimodalFlags): ModelInputModa
 }
 
 export function outputModalitiesFromFlags(flags: MultimodalFlags): ModelOutputModality[] {
-  const output: ModelOutputModality[] = ["text"];
+  const output: ModelOutputModality[] = flags.embeddings && !flags.text ? [] : ["text"];
+  if (flags.embeddings) output.push("embedding");
   if (flags.audioOutput) output.push("audio");
   return output;
 }
@@ -190,6 +197,7 @@ export function openAiModelListExtensions(flags: MultimodalFlags): {
     supports_audio_transcription: flags.audioTranscription,
     supports_audio_translation: flags.audioTranslation,
     capabilities: {
+      embeddings: flags.embeddings === true,
       vision: flags.vision,
       video_input: flags.video,
       audio_input: flags.audioInput,

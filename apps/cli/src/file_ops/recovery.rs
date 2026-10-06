@@ -29,15 +29,26 @@
 //! SMB can lack links. Other Unix uses the no-replace/link ladder and fails closed.
 //! Overwrite rename preflights privately before capture: exchange or NR dummies,
 //! then link probes on the actual S/D objects. Without a usable method nothing
-//! public moves. Exchange-less rename vacates/proves S and D, then publishes S
-//! fail-if-exists; plain link rename vacates/proves S first. Direct NR plain
-//! rename (including supervised macOS files) needs no R. Directories use NR only,
-//! never overwrite, and resolved own-subtree requests refuse invalid_input.
+//! public moves. Exchange-less NR rename vacates/proves S and D, then publishes
+//! S fail-if-exists. Link publication is link-first when the probe alias and the
+//! held source fd are the same object (stable inodes, including Linux NFS): link
+//! S onto `to`, then capture S. noino/sshfs present a different inode per name
+//! and keep vacate-first. Direct NR plain rename (including supervised macOS
+//! files) prepares R and a durable pending-effect fence. Directories use NR only, never overwrite, and resolved
+//! own-subtree requests refuse invalid_input. A direct Move that returns EINVAL
+//! while NR works inside R is a rejected destination name (`invalid_input`),
+//! not a missing capability, and captures nothing.
 //!
 //! Unsettled operations return uncertain_outcome; successful operations can report
-//! recovered paths, including delete. Find `.wsmp-recover-*` beside the target;
-//! retention is logged, recovery is manual using a shell, and no startup sweep
-//! deletes retained data. File tools may read recovery paths but refuse mutations.
+//! recovered paths, including delete. A journal, registry, pin or directory-sync
+//! failure before the first public effect is a clean refusal: pins, INTENT, the
+//! registry entry and R are removed and the error is io_error (unsafe_filesystem
+//! when directory fsync is unsupported). Find `.wsmp-recover-*` beside the target;
+//! retention is logged and no startup sweep deletes retained data. `wsmp recover
+//! --apply` rolls forward a durable `committed` journal and rolls back only
+//! interrupted `prepared`/`captured`/`capturing`/`compensating` journals and
+//! deletes in `publishing` (pin-matched `mv -n`; a replace's own temp is
+//! disposed, never restored). Rename/replace `publishing` stays manual. File tools may read recovery paths but refuse mutations.
 //!
 //! Remaining POSIX windows (no cross-process exclusion is claimed):
 //! (a) a same-user process guessing a private slot can replace it between the held
@@ -52,15 +63,35 @@
 //! (b) undo briefly vacates public names; a concurrent create blocks NOREPLACE/link
 //! restoration and leaves displaced data reported in recovery. Link restore cannot
 //! restore directories; unsupported links also stay in recovery with uncertainty.
-//! (b2) recovery rename's source is vacant from capture through operation end;
-//! exchange-less overwrite also vacates destination before publication.
+//! (b2) vacate-first recovery rename's source is vacant from capture through
+//! operation end; link-first leaves the source name in place until `to` holds
+//! that object. Exchange-less NR overwrite also vacates destination before
+//! publication. Link-first overwrite vacates only the destination, links S, then
+//! captures S.
 //! (d) a crash leaves the original and T (possibly partial tmp or renamed probe) in
 //! R with a vacant public name, a deleted file in R with its name vacant, or both
-//! published and private links. Rename can leave S/D in R and both public names
-//! vacant; preflight dummies can also survive a crash. R/s/d are logged before
-//! the first capture; no durable intent or automatic replay is maintained.
-//! Empty unreported R after power loss is harmless.
-//! (e) unheld objects are retained; they are never deleted by a snapshot.
+//! published and private links. Rename can leave S/D in R with public names
+//! vacant (vacate-first) or only the destination vacant (link-first, before the
+//! link). An `INTENT` file in R, fsynced with the directory before the first
+//! capture (including exclusive-create and Move-verification fallbacks), is a
+//! versioned map of slots to paths with phase, per-slot identity, pid, host,
+//! and CLI version. An exclusive flock on `.wsmp-lock` is held for the op;
+//! a stable sibling `.wsmp-lock-.wsmp-recover-<id>` protects final cleanup
+//! while the internal lock closes before unlink (NFS sillyrename avoidance).
+//! `wsmp recover` skips a directory it cannot lock and derives publication only
+//! against a surviving private v3 hardlink anchor's live descriptor. Legacy or
+//! missing anchors, directories and unsupported aliases retain ambiguity for
+//! manual resolution. Private INTENT/anchor integrity is required, as with the
+//! existing mode-0700 staging directory; malicious same-user tampering of all
+//! private metadata is not excluded. Exchange rename swaps `from <-> to` first so no object is
+//! reachable only through R; D is briefly visible under the source name. Live
+//! R directories are indexed in the CLI state directory. Startup reads that
+//! registry (O(registered)) and never walks file roots. Empty unreported R
+//! after power loss is harmless.
+//! (e) unheld objects are retained; they are never deleted by a snapshot. The
+//! three pre-effect hardlink anchors (at most two user objects plus generated T)
+//! are private aliases, not extra captured slots. Live link-survival guards
+//! subtract those aliases, and original unlink closes matching anchor fds too.
 //! (f) on NFS another process holding the file open can leave a `.nfs*` entry in R;
 //! our own descriptors close before unlink (except T's pinned proof at the link
 //! probe's alias unlink: clients that silly-rename per vnode, macOS/BSD NFS, may keep a
@@ -82,11 +113,14 @@
 //! commit across alias names on noino; rename keeps/restores S and keeps D.
 
 use std::ffi::{OsStr, OsString};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use nix::errno::Errno;
-use nix::fcntl::{AtFlags, OFlag, openat, renameat};
+use nix::fcntl::{AtFlags, Flock, FlockArg, OFlag, openat, renameat};
 use nix::sys::stat::{Mode, fstat, fstatat, mkdirat};
 use nix::unistd::{UnlinkatFlags, dup, linkat, unlinkat};
 use rand::distr::{Alphanumeric, SampleString};
@@ -96,6 +130,7 @@ use super::error::{ErrorCode, FileError, FileResult};
 use super::exchange::{
     Primitive, fault, is_link_unsupported, is_unsupported, link_count, no_replace, run,
 };
+use super::intent::{Intent, IntentOrder, IntentPhase};
 use super::resolve::{Kind, Resolved, Stat};
 use super::{Cancel, FileOps, Step};
 
@@ -125,6 +160,12 @@ impl Origin {
 pub(super) struct Slot {
     name: OsString,
     origin: Origin,
+}
+
+impl Slot {
+    pub(super) fn origin_dir(&self) -> &OwnedFd {
+        &self.origin.dir
+    }
 }
 
 /// Only a live fd pins an inode and authorizes disposal. The snapshot permits
@@ -205,6 +246,13 @@ impl Held {
         self.fd.is_some()
     }
 
+    /// Live inode of the held descriptor. Not a fault point: the link-order
+    /// decision compares this with the probe alias and must not consume `Identity`.
+    fn live_stat(&self) -> Option<Stat> {
+        let fd = self.fd.as_ref()?;
+        fstat(fd.as_fd()).ok().map(|raw| Stat::from_raw(&raw))
+    }
+
     /// Release this proof only after the live comparison; all duplicate handles
     /// owned by the caller must also close before the unlink syscall.
     pub(super) fn release(&mut self) {
@@ -234,6 +282,15 @@ pub(super) enum PublishMethod {
     Link,
 }
 
+/// Link publication order, learned from the source probe. Stable inodes prove
+/// the name created by `linkat` is the held source, so S can stay until `to`
+/// exists. Different presented inodes (noino, sshfs) cannot, and vacate first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum LinkOrder {
+    LinkFirst,
+    VacateFirst,
+}
+
 /// The unpublished object has exactly one owner. Generated temps are disposable;
 /// a user's source always returns to its recorded origin or stays reported in R.
 pub(super) enum Published<'a> {
@@ -253,12 +310,36 @@ pub(super) struct RecoveryDir {
     used: usize,
     kept: Vec<PathBuf>,
     unsettled: bool,
+    /// A failed persistence/barrier after a public effect is fatal to this
+    /// lifecycle. Ordinary unlink residue can follow a proven commit; this flag
+    /// cannot grant that authority.
+    durability_failed: bool,
+    /// Set immediately before the first syscall that can change a public name.
+    effect_started: bool,
+    /// A barrier failed BEFORE any public effect. Nothing public changed and R
+    /// holds only private, disposable entries (pins, INTENT, generated files):
+    /// the operation stops and cleans R, returning this error.
+    pre_effect_abort: Option<FileError>,
+    /// The `committed` INTENT is durable: later cleanup barriers cannot make
+    /// the acknowledged outcome uncertain; residue is reported as recovered.
+    committed: bool,
     finished: bool,
     last_errno: Option<Errno>,
     /// Whether this mount's link counts can be believed, learned from this operation's own
     /// link probe (see `calibrate_counts`). `Some(true)` is the only state that lets a count
     /// veto an alias unlink.
     counts_reliable: Option<bool>,
+    /// Set by the first link probe (the source object on rename). `None` until then.
+    link_order: Option<LinkOrder>,
+    intent: Option<Intent>,
+    registered: bool,
+    /// Exclusive flock on `.wsmp-lock` inside R. Recover skips a directory
+    /// it cannot lock, so a live op is never rolled back.
+    lock: Option<Flock<File>>,
+    /// Stable sibling lock survives deletion of metadata inside R.
+    cleanup_lock: Option<Flock<File>>,
+    /// Live proof for our own anchor names, never a persisted snapshot.
+    anchors: Vec<(String, Held)>,
 }
 
 /// State to return to when a capture provably changed nothing.
@@ -266,6 +347,8 @@ pub(super) struct Checkpoint {
     used: usize,
     kept: usize,
     unsettled: bool,
+    phase: Option<IntentPhase>,
+    effect_started: bool,
 }
 
 impl RecoveryDir {
@@ -312,6 +395,8 @@ impl RecoveryDir {
                     return Err(FileError::errno(errno));
                 }
             };
+            let cleanup_lock = lock_cleanup(&path, false).map_err(|error| FileError::io(&error))?;
+            let lock = lock_recovery_dir(&path);
             return Ok(Self {
                 parent,
                 dir,
@@ -320,9 +405,19 @@ impl RecoveryDir {
                 used: 0,
                 kept: Vec::new(),
                 unsettled: false,
+                durability_failed: false,
+                effect_started: false,
+                pre_effect_abort: None,
+                committed: false,
                 finished: false,
                 last_errno: None,
                 counts_reliable: None,
+                link_order: None,
+                intent: None,
+                registered: false,
+                lock,
+                cleanup_lock,
+                anchors: Vec::new(),
             });
         }
     }
@@ -361,12 +456,21 @@ impl RecoveryDir {
         slot: &mut Slot,
         destination: Origin,
     ) -> Result<Origin, Errno> {
-        super::exchange::exchange(
+        let before = self.effect_checkpoint();
+        if self.begin_public_effect().is_err() {
+            // A failed barrier already refuses every public effect; the
+            // caller's own phase write reports it first in practice.
+            return Err(Errno::EIO);
+        }
+        if let Err(errno) = super::exchange::exchange(
             self.dir.as_fd(),
             &slot.name,
             destination.dir.as_fd(),
             &destination.name,
-        )?;
+        ) {
+            self.effect_refused(before, errno);
+            return Err(errno);
+        }
         Ok(std::mem::replace(&mut slot.origin, destination))
     }
 
@@ -513,7 +617,20 @@ impl RecoveryDir {
             AtFlags::AT_SYMLINK_NOFOLLOW,
         )
         .map_err(FileError::errno)?;
-        let mut held = Held::open(&self.dir, &alias.name, Stat::from_raw(&raw))?;
+        let alias_stat = Stat::from_raw(&raw);
+        // The first probe is the source. A test may swap `probe` at LinkProbed,
+        // after count calibration, so this comparison sees that inode.
+        if self.link_order.is_none() {
+            let stable = identity
+                .live_stat()
+                .is_some_and(|live| live.same_object(&alias_stat));
+            self.link_order = Some(if stable {
+                LinkOrder::LinkFirst
+            } else {
+                LinkOrder::VacateFirst
+            });
+        }
+        let mut held = Held::open(&self.dir, &alias.name, alias_stat)?;
         // The original proof pins its inode through alias disposal (the accepted
         // per-vnode NFS exception). The alias is proven at its OWN name on noino.
         if !self.dispose_alias(ops, &alias, &mut held) {
@@ -604,6 +721,462 @@ impl RecoveryDir {
         result
     }
 
+    /// Private NR probe for a direct Move that returned EINVAL. `Ok(true)` means
+    /// the filesystem accepts no-replace, so that EINVAL was the destination
+    /// name rather than a missing flag.
+    pub(super) fn noreplace_works(&mut self, ops: &FileOps, anchor: &Resolved) -> FileResult<bool> {
+        let (mut slot, mut held) = self.dummy("preflight-1", anchor)?;
+        let probe = OsString::from("probe-nr");
+        let result = match no_replace(
+            self.dir.as_fd(),
+            &slot.name,
+            self.dir.as_fd(),
+            &probe,
+            Primitive::ProbeNoReplace,
+        ) {
+            Ok(()) => {
+                self.adopt_name(&mut slot, probe);
+                Ok(true)
+            }
+            Err(errno) if is_unsupported(errno) => Ok(false),
+            Err(errno) => {
+                if matches!(
+                    fstatat(
+                        self.dir.as_fd(),
+                        slot.name.as_os_str(),
+                        AtFlags::AT_SYMLINK_NOFOLLOW
+                    ),
+                    Err(Errno::ENOENT)
+                ) && fstatat(
+                    self.dir.as_fd(),
+                    probe.as_os_str(),
+                    AtFlags::AT_SYMLINK_NOFOLLOW,
+                )
+                .is_ok()
+                {
+                    self.adopt_name(&mut slot, probe);
+                }
+                Err(FileError::errno(errno))
+            }
+        };
+        self.dispose(ops, &slot, &mut held);
+        if !self.settled() {
+            return Err(self.uncertain());
+        }
+        result
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_link_order(&mut self, order: LinkOrder) {
+        self.link_order = Some(order);
+    }
+
+    /// Crash map for the slots this rename will capture. Fsynced before any
+    /// public name moves. Not added to `kept`: success removes it with R.
+    fn write_rename_intent(
+        &mut self,
+        order: IntentOrder,
+        from: &Resolved,
+        to: &Resolved,
+        overwrite: bool,
+        source_stat: &Stat,
+    ) -> FileResult<()> {
+        let mut intent = Intent::rename(order, &from.full_path(), &to.full_path(), overwrite);
+        intent.published =
+            Some(super::intent::IntentSlot::planned(&to.full_path()).with_stat(source_stat));
+        self.prepare_intent(intent)
+    }
+
+    pub(super) fn prepare_intent(&mut self, mut intent: Intent) -> FileResult<()> {
+        self.check_durability()?;
+        // Pin all known pre-effect objects before INTENT becomes durable. On
+        // filesystems without stable hardlinks the live operation still works,
+        // but abandoned objects cannot be automatically reconciled.
+        for record in intent.slots.values_mut() {
+            if let Some(path) = record.origin.to_path() {
+                self.anchor_path(record, &path)?;
+            }
+        }
+        if let Some(record) = intent.published.as_mut() {
+            if intent.op == super::intent::IntentOp::Replace {
+                let dir = dup(self.dir.as_fd()).map_err(FileError::errno)?;
+                self.anchor_at(record, &dir, OsStr::new("tmp"))?;
+            } else if let Some(path) = intent.source.to_path() {
+                self.anchor_path(record, &path)?;
+            }
+        }
+        self.save_intent(intent.clone())?;
+        // A failed registration can still leave an entry: cleanup unregisters.
+        self.registered = true;
+        if let Err(error) = super::registry::register(&self.path, &intent) {
+            let code = match error {
+                super::registry::RegistryError::UnsupportedDirSync(_) => {
+                    ErrorCode::UnsafeFilesystem
+                }
+                super::registry::RegistryError::Io(_) => ErrorCode::IoError,
+            };
+            return Err(self.barrier_failed(FileError::new(code, error.to_string())));
+        }
+        Ok(())
+    }
+
+    fn anchor_path(
+        &mut self,
+        record: &mut super::intent::IntentSlot,
+        path: &Path,
+    ) -> FileResult<()> {
+        let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+            return Ok(());
+        };
+        let Ok(dir) = nix::fcntl::open(
+            parent,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) else {
+            return Ok(());
+        };
+        self.anchor_at(record, &dir, name)
+    }
+
+    fn anchor_at(
+        &mut self,
+        record: &mut super::intent::IntentSlot,
+        dir: &OwnedFd,
+        name: &OsStr,
+    ) -> FileResult<()> {
+        let Ok(raw) = fstatat(dir.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
+            return Ok(());
+        };
+        let stat = Stat::from_raw(&raw);
+        if !matches!(stat.kind(), Kind::File | Kind::Symlink)
+            || (record.dev.is_some() && !record.matches(&stat))
+        {
+            return Ok(());
+        }
+        let source = Held::open(dir, name, stat)?;
+        if !source.is_held() {
+            return Ok(());
+        }
+        let anchor = format!(
+            ".wsmp-pin-{}",
+            Alphanumeric.sample_string(&mut rand::rng(), 24)
+        );
+        match linkat(
+            dir.as_fd(),
+            name,
+            self.dir.as_fd(),
+            anchor.as_str(),
+            AtFlags::empty(),
+        ) {
+            Ok(()) => {}
+            Err(errno) if is_link_unsupported(errno) => return Ok(()),
+            Err(errno) => return Err(FileError::errno(errno)),
+        }
+        let raw = fstatat(
+            self.dir.as_fd(),
+            anchor.as_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .map_err(FileError::errno)?;
+        let pin = Held::open(&self.dir, OsStr::new(&anchor), Stat::from_raw(&raw))?;
+        let same = source
+            .live_stat()
+            .zip(pin.live_stat())
+            .is_some_and(|(a, b)| a.same_object(&b));
+        if !same {
+            // Some filesystems (noino FUSE, sshfs) present a different inode per
+            // name, so this alias can never become a durable proof. The live
+            // operation still works there without a pin; only crash recovery
+            // stays manual (see `prepare_intent`).
+            return self.drop_unproven_anchor(dir, name, &source, anchor, pin);
+        }
+        self.anchors.push((anchor.clone(), pin));
+        // Do not advertise a durable pin where directory durability is not
+        // supported. Its live alias still belongs to us and is cleaned normally,
+        // but a crash leaves only ambiguity rather than destructive authority.
+        match nix::unistd::fsync(self.dir.as_fd())
+            .and_then(|()| nix::unistd::fsync(self.parent.as_fd()))
+        {
+            Ok(()) => {
+                *record = record.clone().with_stat(&source.stat);
+                record.anchor = Some(anchor);
+                Ok(())
+            }
+            Err(errno) => Err(self.barrier_failed(barrier_error(errno))),
+        }
+    }
+
+    /// Remove a pre-effect pin whose identity cannot be proven against the
+    /// source, leaving the record without an anchor. The alias is proven only at
+    /// its OWN private name (as the noino link probe is), and removed only while
+    /// the public name it was linked from still holds the source, so it is never
+    /// the last name of an object. A pin that matches the current public name instead of
+    /// the held source means the name was swapped: that, or any failed proof,
+    /// keeps the alias reported with an uncertain outcome.
+    fn drop_unproven_anchor(
+        &mut self,
+        dir: &OwnedFd,
+        name: &OsStr,
+        source: &Held,
+        anchor: String,
+        mut pin: Held,
+    ) -> FileResult<()> {
+        let public = fstatat(dir.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW)
+            .ok()
+            .map(|raw| Stat::from_raw(&raw));
+        let swapped = public
+            .zip(pin.live_stat())
+            .is_some_and(|(public, pin)| public.same_object(&pin));
+        if public.is_none()
+            || swapped
+            || !self.holds_name(dir, name, source)
+            || !self.holds_name(&self.dir, OsStr::new(&anchor), &pin)
+        {
+            self.anchors.push((anchor, pin));
+            self.unsettled = true;
+            return Err(self.uncertain());
+        }
+        // Close our pin descriptor before unlink (NFS sillyrename avoidance).
+        pin.release();
+        if unlinkat(
+            self.dir.as_fd(),
+            anchor.as_str(),
+            UnlinkatFlags::NoRemoveDir,
+        )
+        .is_err()
+        {
+            self.remember(self.path.join(&anchor));
+            self.unsettled = true;
+            return Err(self.uncertain());
+        }
+        Ok(())
+    }
+
+    pub(super) fn set_intent_phase(&mut self, phase: IntentPhase) -> FileResult<()> {
+        self.check_durability()?;
+        let Some(mut intent) = self.intent.clone() else {
+            return Ok(());
+        };
+        intent.phase = phase;
+        self.save_intent(intent)
+    }
+
+    pub(super) fn record_slot_identity(&mut self, slot: &Slot) -> FileResult<()> {
+        self.check_durability()?;
+        let Some(mut intent) = self.intent.clone() else {
+            return Ok(());
+        };
+        let key = slot.name.to_string_lossy().into_owned();
+        let raw = fstatat(
+            self.dir.as_fd(),
+            slot.name.as_os_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .map_err(FileError::errno)?;
+        let stat = Stat::from_raw(&raw);
+        let mut recorded = intent
+            .slots
+            .remove(&key)
+            .or_else(|| {
+                // Replace exchange moves the planned original into tmp, not
+                // slot-1. Transfer its pre-effect map rather than duplicate it.
+                (key == "tmp" && intent.op == super::intent::IntentOp::Replace)
+                    .then(|| intent.slots.remove("slot-1"))
+                    .flatten()
+            })
+            .unwrap_or_else(|| super::intent::IntentSlot::planned(&slot.origin.path));
+        // Exchange and capture renumber slots. Only transfer a pre-effect pin
+        // belonging to this object; a newly captured stranger gains no authority.
+        // A donor slot record whose name is absent in R described this same
+        // object before renumbering: MOVE it, so rollback never waits on a
+        // stale, absent duplicate. The published record is only copied.
+        if !recorded.matches(&stat) {
+            let donor = intent
+                .slots
+                .iter()
+                .find(|(_, candidate)| candidate.matches(&stat) && candidate.anchor.is_some())
+                .map(|(name, candidate)| (name.clone(), candidate.anchor.clone()));
+            recorded.anchor = match donor {
+                Some((name, anchor)) => {
+                    if self.slot_absent(&name) {
+                        intent.slots.remove(&name);
+                    }
+                    anchor
+                }
+                None => intent
+                    .published
+                    .iter()
+                    .find(|candidate| candidate.matches(&stat))
+                    .and_then(|candidate| candidate.anchor.clone()),
+            };
+        }
+        intent.slots.insert(key, recorded.with_stat(&stat));
+        self.save_intent(intent)
+    }
+
+    fn slot_absent(&self, name: &str) -> bool {
+        matches!(
+            fstatat(self.dir.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW),
+            Err(Errno::ENOENT)
+        )
+    }
+
+    fn check_durability(&self) -> FileResult<()> {
+        if self.durability_failed {
+            Err(FileError::mutation_uncertain())
+        } else if let Some(error) = &self.pre_effect_abort {
+            Err(error.clone())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Classify a failed persistence or barrier. After a public effect it is
+    /// fatal and retains R. Before one, nothing public changed: stop the
+    /// operation, but keep R's private entries disposable so cleanup can remove
+    /// the pins and R and report a certain error.
+    fn barrier_failed(&mut self, error: FileError) -> FileError {
+        if self.effect_started {
+            self.durability_failed = true;
+            self.unsettled = true;
+        } else if self.pre_effect_abort.is_none() {
+            tracing::warn!(recovery = %self.path.display(), error = %error.message,
+                "durability barrier failed before any public change; refusing cleanly");
+            self.pre_effect_abort = Some(error.clone());
+        }
+        error
+    }
+
+    /// The next syscall may change a public name. Refused after any failure.
+    pub(super) fn begin_public_effect(&mut self) -> FileResult<()> {
+        self.check_durability()?;
+        self.effect_started = true;
+        Ok(())
+    }
+
+    /// Whether a public effect may have started; pair with `effect_refused`.
+    pub(super) fn effect_checkpoint(&self) -> bool {
+        self.effect_started
+    }
+
+    /// The public syscall started after `before` failed with an errno that
+    /// proves nothing moved (a refused rename/link/O_EXCL create is atomic):
+    /// return to the prior effect state. Ambiguous replies (EIO, timeouts,
+    /// and ENOENT, which an NFS retransmit can return after success) keep it.
+    pub(super) fn effect_refused(&mut self, before: bool, errno: Errno) {
+        if !before && refused_without_effect(errno) {
+            self.effect_started = false;
+        }
+    }
+
+    /// Release an R that was journaled for a direct move the filesystem
+    /// refused without effect, before a fallback allocates its own R.
+    pub(super) fn close_unused(&mut self) -> FileResult<()> {
+        let _ = self.finish();
+        if self.pre_effect_abort.is_some() || !self.settled() {
+            return Err(self.uncertain());
+        }
+        Ok(())
+    }
+
+    /// A barrier failed after the durable `committed` record (a failure
+    /// before it would have refused the record itself). Identity or ownership
+    /// failures (strangers kept in R) are not barrier failures.
+    pub(super) fn committed_barrier_failed(&self) -> bool {
+        self.committed && self.durability_failed
+    }
+
+    /// Whether a successful result may be acknowledged. A barrier failure after
+    /// the durable `committed` INTENT only leaves recoverable residue.
+    pub(super) fn acknowledges_success(&self) -> bool {
+        !self.durability_failed || self.committed
+    }
+
+    /// Each attempt writes a fresh inode. Never retry fsync on an inode whose
+    /// writeback failed: Linux may already have cleaned its dirty pages.
+    fn save_intent(&mut self, intent: Intent) -> FileResult<()> {
+        self.check_durability()?;
+        let phase = intent.phase;
+        match self.persist_intent(&intent) {
+            Ok(()) => {
+                self.intent = Some(intent);
+                if phase == IntentPhase::Committed {
+                    self.committed = true;
+                }
+                Ok(())
+            }
+            Err(error) => Err(self.barrier_failed(error)),
+        }
+    }
+
+    /// Public entries become durable before private evidence may be removed.
+    ///
+    /// Before any public effect the only callers are private cleanups (probe
+    /// dummies, a refused temp, final R removal). Their durability grants no
+    /// authority: a failure there aborts the operation, and later private
+    /// cleanup proceeds without barriers.
+    pub(super) fn sync_effect(&mut self, parents: &[&OwnedFd]) -> FileResult<()> {
+        if !self.effect_started && self.pre_effect_abort.is_some() {
+            return Ok(());
+        }
+        self.check_durability()?;
+        let result = parents
+            .iter()
+            .try_for_each(|parent| nix::unistd::fsync(parent.as_fd()))
+            .and_then(|()| nix::unistd::fsync(self.dir.as_fd()))
+            .and_then(|()| nix::unistd::fsync(self.parent.as_fd()));
+        if let Err(errno) = result {
+            let error = self.barrier_failed(barrier_error(errno));
+            if self.effect_started {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn persist_intent(&self, intent: &Intent) -> FileResult<()> {
+        let body = serde_json::to_vec(intent).map_err(|err| {
+            FileError::new(ErrorCode::IoError, format!("INTENT serialize: {err}"))
+        })?;
+        let tmp_name = "INTENT.new";
+        match unlinkat(self.dir.as_fd(), tmp_name, UnlinkatFlags::NoRemoveDir) {
+            Ok(()) | Err(Errno::ENOENT) => {}
+            Err(errno) => return Err(FileError::errno(errno)),
+        }
+        let fd = openat(
+            self.dir.as_fd(),
+            tmp_name,
+            OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        )
+        .map_err(FileError::errno)?;
+        let mut file = std::fs::File::from(fd);
+        file.write_all(&body)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        drop(file);
+        renameat(self.dir.as_fd(), tmp_name, self.dir.as_fd(), "INTENT")
+            .map_err(FileError::errno)?;
+        self.fsync_dir_best_effort()
+    }
+
+    fn fsync_dir_best_effort(&self) -> FileResult<()> {
+        tolerate_dir_fsync(nix::unistd::fsync(self.dir.as_fd()), &self.path)
+    }
+
+    fn discard_intent(&mut self) {
+        match unlinkat(self.dir.as_fd(), "INTENT", UnlinkatFlags::NoRemoveDir) {
+            Ok(()) | Err(Errno::ENOENT) => {}
+            Err(_) => self.unsettled = true,
+        }
+        let _ = unlinkat(self.dir.as_fd(), "INTENT.new", UnlinkatFlags::NoRemoveDir);
+        if self.registered {
+            super::registry::unregister(&self.path);
+            self.registered = false;
+        }
+        self.intent = None;
+    }
+
     fn publish_slot(
         &self,
         slot: &Slot,
@@ -639,6 +1212,14 @@ impl RecoveryDir {
         held: &mut Held,
         published: &Published<'_>,
     ) {
+        if self
+            .intent
+            .as_ref()
+            .is_some_and(|intent| intent.phase != IntentPhase::Committed)
+            && self.set_intent_phase(IntentPhase::Compensating).is_err()
+        {
+            return;
+        }
         match published {
             Published::Temp => {
                 self.dispose(ops, slot, held);
@@ -744,6 +1325,10 @@ impl RecoveryDir {
         } else {
             None
         };
+        if let Some(slot) = &captured {
+            self.record_slot_identity(slot)?;
+            self.set_intent_phase(IntentPhase::Captured)?;
+        }
         let _ = ops.step(if matches!(published, Published::Temp) {
             Step::Vacated
         } else {
@@ -767,6 +1352,8 @@ impl RecoveryDir {
                 self.uncertain()
             });
         }
+        self.set_intent_phase(IntentPhase::Publishing)?;
+        self.begin_public_effect()?;
         let result = self.publish_slot(tmp, &target, method);
         // Rename link errors have no cross-name proof on noino; only a transferred
         // NR dentry can reconcile a lost reply. Replacement retains its protocol.
@@ -774,6 +1361,8 @@ impl RecoveryDir {
             || (matches!(method, PublishMethod::NoReplace) || matches!(published, Published::Temp))
                 && self.holds_name(&target.dir, &target.name, identity);
         if committed {
+            self.sync_effect(&[&target.dir])?;
+            self.set_intent_phase(IntentPhase::Committed)?;
             if matches!(published, Published::UserSource { .. }) {
                 let _ = ops.step(Step::Renamed);
                 if matches!(method, PublishMethod::Link) {
@@ -871,10 +1460,31 @@ impl RecoveryDir {
         method: Option<PublishMethod>,
         cancel: &Cancel,
     ) -> FileResult<bool> {
+        if matches!(method, Some(PublishMethod::Link))
+            && self.link_order == Some(LinkOrder::LinkFirst)
+        {
+            return self.commit_link_first(ops, from, to, src, dst, cancel);
+        }
+        let order = if method.is_none() {
+            IntentOrder::ExchangeFirst
+        } else if self.link_order == Some(LinkOrder::LinkFirst) {
+            IntentOrder::LinkFirst
+        } else {
+            IntentOrder::VacateFirst
+        };
         ops.step(Step::Vacating)?;
-        cancel.check()?; // last cancellation point, BEFORE S capture
+        cancel.check()?; // last cancellation point, BEFORE the first public mutation
+        self.write_rename_intent(order, from, to, dst.is_some(), &src.stat)?;
         tracing::info!(recovery = %self.path().display(), source = %from.full_path().display(),
-            destination = %to.full_path().display(), "rename capture; manual recovery after a crash");
+            destination = %to.full_path().display(), order = ?order,
+            "rename capture; manual recovery after a crash");
+        if method.is_none() {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            if let Some(dst) = dst {
+                return self.exchange_move(ops, from, to, src, dst).map(|()| false);
+            }
+            return Err(self.uncertain());
+        }
         let mark = self.checkpoint();
         let Some(mut slot) = self.capture(&from.dir, &from.name, &from.full_path()) else {
             return Err(match self.abort_capture(mark) {
@@ -883,6 +1493,8 @@ impl RecoveryDir {
                 None => self.uncertain(),
             });
         };
+        self.record_slot_identity(&slot)?;
+        self.set_intent_phase(IntentPhase::Captured)?;
         let _ = ops.step(Step::Captured);
         if !self.holds(&slot, src) {
             src.release();
@@ -900,7 +1512,7 @@ impl RecoveryDir {
         }
         let _ = ops.step(Step::Vacated);
         if let Some(method) = method {
-            return self.publish_without_exchange(
+            let result = self.publish_without_exchange(
                 ops,
                 &mut slot,
                 dst,
@@ -912,76 +1524,275 @@ impl RecoveryDir {
                     method,
                 },
             );
-        }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if let Some(dst) = dst {
-            return self
-                .exchange_move(ops, &mut slot, to, src, dst)
-                .map(|()| false);
+            return result;
         }
         self.keep(&slot);
         Err(self.uncertain())
     }
 
+    /// Stable-inode link rename. Overwrite captures D only, links the still-public
+    /// source onto `to`, then captures S. Plain rename links first and never
+    /// vacates S before `to` exists. A lost link reply is a commit when `to`
+    /// presents the held source inode.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_link_first(
+        &mut self,
+        ops: &FileOps,
+        from: &Resolved,
+        to: &Resolved,
+        src: &mut Held,
+        mut dst: Option<&mut Held>,
+        cancel: &Cancel,
+    ) -> FileResult<bool> {
+        fault(Primitive::PublishPrepare).map_err(FileError::errno)?;
+        tracing::info!(recovery = %self.path().display(), source = %from.full_path().display(),
+            destination = %to.full_path().display(), order = "link-first",
+            "rename capture; manual recovery after a crash");
+        ops.step(Step::Vacating)?;
+        cancel.check()?;
+        if !self.holds_name(&from.dir, &from.name, src) {
+            return Err(self.conflict_or_uncertain("replaced"));
+        }
+        self.write_rename_intent(IntentOrder::LinkFirst, from, to, dst.is_some(), &src.stat)?;
+        let mut captured_dest = None;
+        if dst.is_some() {
+            let _ = ops.step(Step::DestinationVacating);
+            let mark = self.checkpoint();
+            let Some(slot) = self.capture(&to.dir, &to.name, &to.full_path()) else {
+                return Err(match self.abort_capture(mark) {
+                    Some(Errno::ENOENT) => FileError::conflict("gone"),
+                    Some(errno) => FileError::errno(errno),
+                    None => self.uncertain(),
+                });
+            };
+            let Some(held) = dst.as_deref_mut() else {
+                return Err(self.uncertain());
+            };
+            let dest_matches = self.holds(&slot, held);
+            if !dest_matches {
+                self.undo_captured_destination(ops, &Some(slot), src, Some(held));
+                return Err(self.conflict_or_uncertain("replaced"));
+            }
+            // One directory entry under two names: capturing D took S as well.
+            let source_went_with_dest =
+                !self.holds_name(&from.dir, &from.name, src) && self.holds(&slot, src);
+            if source_went_with_dest {
+                self.undo_captured_destination(ops, &Some(slot), src, Some(held));
+                return Err(self.conflict_or_uncertain("gone"));
+            }
+            self.record_slot_identity(&slot)?;
+            self.set_intent_phase(IntentPhase::Captured)?;
+            captured_dest = Some(slot);
+        }
+        let _ = ops.step(Step::DestinationVacated);
+        let _ = ops.step(Step::Publishing);
+        if !self.holds_name(&from.dir, &from.name, src) {
+            self.undo_captured_destination(ops, &captured_dest, src, dst.as_deref_mut());
+            return Err(self.conflict_or_uncertain("replaced"));
+        }
+        self.set_intent_phase(IntentPhase::Publishing)?;
+        let before = self.effect_checkpoint();
+        self.begin_public_effect()?;
+        let linked = run(Primitive::PublishLink, || {
+            linkat(
+                from.dir.as_fd(),
+                from.name.as_os_str(),
+                to.dir.as_fd(),
+                to.name.as_os_str(),
+                AtFlags::empty(),
+            )
+        });
+        let committed = linked.is_ok() || self.holds_name(&to.dir, &to.name, src);
+        if !committed {
+            let errno = linked.err().unwrap_or(Errno::EIO);
+            self.effect_refused(before, errno);
+            self.undo_captured_destination(ops, &captured_dest, src, dst.as_deref_mut());
+            if !self.settled() {
+                return Err(self.uncertain());
+            }
+            return Err(if errno == Errno::EEXIST {
+                FileError::errno(Errno::EEXIST)
+            } else if errno == Errno::EINVAL {
+                FileError::invalid("destination name is not valid on this filesystem")
+            } else if is_link_unsupported(errno) {
+                FileError::unsafe_filesystem()
+            } else {
+                FileError::errno(errno)
+            });
+        }
+        self.sync_effect(&[&to.dir, &from.dir])?;
+        self.set_intent_phase(IntentPhase::Committed)?;
+        let _ = ops.step(Step::Linked);
+        // `to` holds the source. Capture S before Renamed: a racer that replaces
+        // both public names after the link would otherwise orphan the inode.
+        if !self.holds_name(&from.dir, &from.name, src) {
+            if self.holds_name(&to.dir, &to.name, src) {
+                src.release();
+                if let (Some(slot), Some(held)) = (&captured_dest, dst.as_deref_mut()) {
+                    self.dispose(ops, slot, held);
+                }
+                return Ok(true);
+            }
+            if let Some(slot) = &captured_dest {
+                self.keep(slot);
+            }
+            self.unsettled = true;
+            return Err(self.uncertain());
+        }
+        let mark = self.checkpoint();
+        let Some(source_slot) = self.capture(&from.dir, &from.name, &from.full_path()) else {
+            match self.abort_capture(mark) {
+                Some(Errno::ENOENT) if self.holds_name(&to.dir, &to.name, src) => {
+                    src.release();
+                    if let (Some(slot), Some(held)) = (&captured_dest, dst.as_deref_mut()) {
+                        self.dispose(ops, slot, held);
+                    }
+                    return Ok(true);
+                }
+                _ => {
+                    if let Some(slot) = &captured_dest {
+                        self.keep(slot);
+                    }
+                    self.unsettled = true;
+                    return Err(self.uncertain());
+                }
+            }
+        };
+        self.record_slot_identity(&source_slot)?;
+        let _ = ops.step(Step::Captured);
+        let _ = ops.step(Step::Vacated);
+        let _ = ops.step(Step::Renamed);
+        if !self.holds(&source_slot, src) {
+            src.release();
+            if self.restore(ops, &source_slot) {
+                let _ = ops.step(Step::Restored);
+            }
+            if let (Some(slot), Some(held)) = (&captured_dest, dst.as_mut()) {
+                self.dispose(ops, slot, held);
+            }
+            return self.ok_if_settled();
+        }
+        match (&captured_dest, dst.as_mut()) {
+            (Some(slot), Some(held)) => {
+                self.dispose_link_move(ops, &source_slot, src, slot, held);
+            }
+            _ => {
+                self.dispose_alias(ops, &source_slot, src);
+            }
+        }
+        // The link committed. Residue (last alias, failed cleanup) is `recovered`.
+        Ok(true)
+    }
+
+    fn conflict_or_uncertain(&mut self, current: &str) -> FileError {
+        if self.settled() {
+            FileError::conflict(current)
+        } else {
+            self.uncertain()
+        }
+    }
+
+    fn ok_if_settled(&mut self) -> FileResult<bool> {
+        if self.settled() {
+            Ok(true)
+        } else {
+            Err(self.uncertain())
+        }
+    }
+
+    fn undo_captured_destination(
+        &mut self,
+        ops: &FileOps,
+        slot: &Option<Slot>,
+        src: &mut Held,
+        dst: Option<&mut Held>,
+    ) {
+        src.release();
+        if let Some(held) = dst {
+            held.release();
+        }
+        if let Some(slot) = slot
+            && self.restore(ops, slot)
+        {
+            let _ = ops.step(Step::Restored);
+        }
+    }
+
+    /// Exchange `from <-> to` first so S is published before D is captured.
+    /// D is briefly visible under the source name; no object is R-only until
+    /// after the commit point.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn exchange_move(
         &mut self,
         ops: &FileOps,
-        slot: &mut Slot,
+        from: &Resolved,
         to: &Resolved,
         src: &mut Held,
         dst: &mut Held,
     ) -> FileResult<()> {
-        let origin = Origin::new(&to.dir, &to.name, &to.full_path());
-        let source_origin = match origin.and_then(|origin| self.exchange(slot, origin)) {
-            Ok(origin) => origin,
+        if !self.holds_name(&from.dir, &from.name, src) {
+            return Err(self.conflict_or_uncertain("replaced"));
+        }
+        if !self.holds_name(&to.dir, &to.name, dst) {
+            return Err(self.conflict_or_uncertain("replaced"));
+        }
+        self.set_intent_phase(IntentPhase::Publishing)?;
+        let before = self.effect_checkpoint();
+        self.begin_public_effect()?;
+        match super::exchange::exchange(from.dir.as_fd(), &from.name, to.dir.as_fd(), &to.name) {
+            Ok(()) => {}
+            Err(_errno) if self.holds_name(&to.dir, &to.name, src) => {
+                // Lost reply: the swap took effect.
+            }
             Err(errno) => {
-                if self.holds(slot, src) {
-                    src.release();
-                    dst.release();
-                    if self.restore(ops, slot) {
-                        let _ = ops.step(Step::Restored);
-                    }
-                } else {
-                    self.keep(slot);
-                }
+                self.effect_refused(before, errno);
                 return Err(if is_unsupported(errno) {
                     FileError::unsafe_filesystem()
                 } else {
                     FileError::errno(errno)
                 });
             }
-        };
+        }
         let _ = ops.step(Step::Exchanged);
+        if !self.holds_name(&to.dir, &to.name, src) {
+            src.release();
+            dst.release();
+            self.unsettled = true;
+            self.record_public(&to.dir, &to.name, &to.full_path());
+            self.record_public(&from.dir, &from.name, &from.full_path());
+            return Err(self.uncertain());
+        }
+        if !self.holds_name(&from.dir, &from.name, dst) {
+            src.release();
+            dst.release();
+            self.unsettled = true;
+            self.record_public(&to.dir, &to.name, &to.full_path());
+            self.record_public(&from.dir, &from.name, &from.full_path());
+            return Err(self.uncertain());
+        }
+        self.sync_effect(&[&to.dir, &from.dir])?;
+        self.set_intent_phase(IntentPhase::Committed)?;
+        let mark = self.checkpoint();
+        let Some(slot) = self.capture(&from.dir, &from.name, &from.full_path()) else {
+            src.release();
+            dst.release();
+            return match self.abort_capture(mark) {
+                Some(Errno::ENOENT) => Ok(()),
+                Some(errno) => Err(FileError::errno(errno)),
+                None => Err(self.uncertain()),
+            };
+        };
+        self.record_slot_identity(&slot)?;
         let _ = ops.step(Step::Captured);
-        if self.holds(slot, dst) {
-            src.release(); // S and D may alias on noino
-            self.dispose(ops, slot, dst);
+        let _ = ops.step(Step::Vacated);
+        if self.holds(&slot, dst) {
+            src.release();
+            self.dispose(ops, &slot, dst);
             return Ok(());
         }
         dst.release();
-        if let Some(mut candidate) = self.capture(&to.dir, &to.name, &to.full_path()) {
-            let _ = ops.step(Step::Captured);
-            if self.holds(&candidate, src) {
-                // Reclaim while the proof is LIVE, then close it unconditionally.
-                if self.reclaim_origin(&mut candidate, src, source_origin) {
-                    src.release();
-                    if self.restore(ops, slot) {
-                        let _ = ops.step(Step::Restored);
-                    }
-                    if self.restore(ops, &candidate) {
-                        let _ = ops.step(Step::Restored);
-                    }
-                } else {
-                    self.keep(&candidate);
-                }
-            } else {
-                src.release();
-                if self.restore(ops, &candidate) {
-                    let _ = ops.step(Step::Restored);
-                }
-            }
-        }
+        src.release();
+        self.keep(&slot);
         Err(if self.settled() {
             FileError::conflict("replaced")
         } else {
@@ -993,12 +1804,58 @@ impl RecoveryDir {
     /// only with identity evidence. This never authorizes disposal. Overwrite
     /// undo additionally requires holds(), so unheld objects stay at their
     /// captured destination origin.
-    pub(super) fn reclaim_origin(&self, slot: &mut Slot, held: &Held, origin: Origin) -> bool {
+    #[cfg(test)]
+    pub(super) fn reclaim_origin(&mut self, slot: &mut Slot, held: &Held, origin: Origin) -> bool {
         if !self.matches_for_restore(slot, held) {
             return false;
         }
+        if let Some(mut intent) = self.intent.clone() {
+            let key = slot.name.to_string_lossy().into_owned();
+            if let Some(record) = intent.slots.get_mut(&key) {
+                record.origin = super::intent::IntentPath::from_path(&origin.path);
+            }
+            intent.phase = IntentPhase::Compensating;
+            if self.save_intent(intent).is_err() {
+                return false;
+            }
+        }
         slot.origin = origin;
         true
+    }
+
+    /// Direct-move rejection: establish the SOURCE map before destination
+    /// capture. A crash on either side of capture must never restore at DST.
+    pub(super) fn capture_moved(
+        &mut self,
+        to: &Resolved,
+        candidate: &Held,
+        origin: Origin,
+    ) -> Option<Slot> {
+        let mut intent = self
+            .intent
+            .clone()
+            .unwrap_or_else(|| super::intent::Intent::create(&origin.path));
+        intent.phase = IntentPhase::Compensating;
+        let record = intent.slots.get_mut("slot-1")?;
+        record.origin = super::intent::IntentPath::from_path(&origin.path);
+        let anchored_candidate = record.matches(&candidate.stat) && record.anchor.is_some();
+        *record = record.clone().with_stat(&candidate.stat);
+        if !anchored_candidate && self.anchor_at(record, &to.dir, &to.name).is_err() {
+            self.unsettled = true;
+            return None;
+        }
+        if self.intent.is_none() {
+            if self.prepare_intent(intent).is_err() {
+                return None;
+            }
+        } else if self.save_intent(intent).is_err() {
+            return None;
+        }
+        let mut slot = self.capture(&to.dir, &to.name, &to.full_path())?;
+        // Disk already names the source. Live restoration uses the original FD
+        // so a renamed source parent does not redirect compensation.
+        slot.origin = origin;
+        Some(slot)
     }
 
     fn remember(&mut self, path: PathBuf) {
@@ -1013,6 +1870,22 @@ impl RecoveryDir {
         from_name: &OsStr,
         from_path: &Path,
     ) -> Option<Slot> {
+        if self.check_durability().is_err() {
+            return None;
+        }
+        if self.intent.is_none()
+            && let Err(error) = self.prepare_intent(super::intent::Intent::create(from_path))
+        {
+            tracing::warn!(
+                recovery = %self.path.display(),
+                error = %error,
+                "could not write INTENT before capture"
+            );
+            if self.pre_effect_abort.is_none() {
+                self.unsettled = true;
+            }
+            return None;
+        }
         if self.used >= 2 {
             self.unsettled = true;
             self.remember(from_path.to_path_buf());
@@ -1031,6 +1904,47 @@ impl RecoveryDir {
             name: OsString::from(format!("slot-{}", self.used)),
             origin,
         };
+        let captured_phase = self
+            .intent
+            .as_ref()
+            .map(|intent| intent.phase)
+            .unwrap_or(IntentPhase::Prepared);
+        // Dynamic compensation slots need a map too, before their public name
+        // can move. Preserve planned origins (exchange D is captured at S).
+        // A durable commit stays authoritative: a post-commit capture only
+        // collects leftovers to dispose, never restoration authority.
+        if let Some(mut intent) = self.intent.clone() {
+            let key = slot.name.to_string_lossy().into_owned();
+            if !intent.slots.contains_key(&key) {
+                // Capture renumbering (replace's temp consumes a slot number):
+                // move the pinned pre-effect record of this same origin whose
+                // slot name is absent, so a crash leaves ONE pinned record.
+                let donor = intent
+                    .slots
+                    .iter()
+                    .find(|(name, record)| {
+                        record.anchor.is_some()
+                            && record.origin.to_path().as_deref() == Some(from_path)
+                            && self.slot_absent(name)
+                    })
+                    .map(|(name, _)| name.clone());
+                let record = donor
+                    .and_then(|name| intent.slots.remove(&name))
+                    .unwrap_or_else(|| super::intent::IntentSlot::planned(from_path));
+                intent.slots.insert(key, record);
+            }
+            if intent.phase != IntentPhase::Committed {
+                intent.phase = IntentPhase::Capturing;
+            }
+            if self.save_intent(intent).is_err() {
+                self.used -= 1;
+                return None;
+            }
+        }
+        if self.begin_public_effect().is_err() {
+            self.used -= 1;
+            return None;
+        }
         let captured = no_replace(
             from_dir.as_fd(),
             from_name,
@@ -1063,6 +1977,15 @@ impl RecoveryDir {
         match captured {
             Ok(()) => {
                 self.remember(self.path.join(&slot.name));
+                // No data barrier: a captured user object's bytes are unchanged
+                // (and may be unreadable, e.g. mode 000), and CLI-written files
+                // were synced before publication. Never refsync a failed inode.
+                if self.sync_effect(&[from_dir]).is_err()
+                    || self.record_slot_identity(&slot).is_err()
+                    || self.set_intent_phase(captured_phase).is_err()
+                {
+                    return None;
+                }
                 Some(slot)
             }
             Err(errno) => {
@@ -1081,6 +2004,10 @@ impl RecoveryDir {
                 .is_ok()
                 {
                     self.remember(self.path.join(&slot.name));
+                    if self.record_slot_identity(&slot).is_err() {
+                        self.durability_failed = true;
+                        self.unsettled = true;
+                    }
                 }
                 None
             }
@@ -1092,6 +2019,8 @@ impl RecoveryDir {
             used: self.used,
             kept: self.kept.len(),
             unsettled: self.unsettled,
+            phase: self.intent.as_ref().map(|intent| intent.phase),
+            effect_started: self.effect_started,
         }
     }
 
@@ -1102,6 +2031,11 @@ impl RecoveryDir {
     /// effect, an occupied private slot, the two-object cap) stays unsettled.
     pub(super) fn abort_capture(&mut self, mark: Checkpoint) -> Option<Errno> {
         let errno = self.last_errno.take()?;
+        // An occupied private slot contradicts "moved nothing" (an NFS
+        // retransmit can report ENOENT after the capture took effect).
+        if !self.slot_absent(&format!("slot-{}", mark.used + 1)) {
+            return None;
+        }
         if !matches!(
             errno,
             Errno::ENOENT
@@ -1120,6 +2054,14 @@ impl RecoveryDir {
             return None;
         }
         self.used = mark.used;
+        // The refused rename moved nothing: no public effect started here.
+        self.effect_started = mark.effect_started;
+        if self
+            .set_intent_phase(mark.phase.unwrap_or(IntentPhase::Prepared))
+            .is_err()
+        {
+            return None;
+        }
         self.kept.truncate(mark.kept);
         self.unsettled = mark.unsettled;
         Some(errno)
@@ -1163,6 +2105,17 @@ impl RecoveryDir {
     }
 
     pub(super) fn restore(&mut self, ops: &FileOps, slot: &Slot) -> bool {
+        if self.begin_public_effect().is_err() {
+            return false;
+        }
+        if self
+            .intent
+            .as_ref()
+            .is_some_and(|intent| intent.phase != IntentPhase::Committed)
+            && self.set_intent_phase(IntentPhase::Compensating).is_err()
+        {
+            return false;
+        }
         let Origin {
             dir,
             name,
@@ -1200,6 +2153,7 @@ impl RecoveryDir {
                     )
                 })
                 .map_err(FileError::errno)?;
+                self.sync_effect(&[dir])?;
                 Ok(self.dispose_alias(ops, slot, &mut held))
             })();
             if matches!(linked, Ok(true)) {
@@ -1211,6 +2165,10 @@ impl RecoveryDir {
         }
         match restored {
             Ok(()) => {
+                if self.sync_effect(&[dir]).is_err() {
+                    self.record_public(dir, name, public_path);
+                    return false;
+                }
                 self.kept.retain(|p| *p != self.path.join(&slot.name));
                 true
             }
@@ -1287,7 +2245,8 @@ impl RecoveryDir {
             // The guard is a veto on a believable count only (Linux: forced-sync).
             // An unreadable count under a believable mount keeps the alias.
             let survives = self.counts_reliable != Some(true)
-                || link_count(self.dir.as_fd(), source.name.as_os_str())
+                || self
+                    .non_anchor_link_count(source)
                     .is_ok_and(|count| count >= 2);
             if survives {
                 self.unlink_proven(source);
@@ -1300,6 +2259,9 @@ impl RecoveryDir {
     }
 
     fn prepare_dispose(&mut self, ops: &FileOps, slot: &Slot, held: &Held, alias: bool) -> bool {
+        if self.durability_failed {
+            return false;
+        }
         // The seam is before the ownership check. Public-name successors must
         // already have been captured; tests must not simulate private exclusion.
         let _ = ops.step(Step::Disposing);
@@ -1311,7 +2273,9 @@ impl RecoveryDir {
         // believable count below 2 (see `calibrate_counts`; best effort, never a proof).
         if alias
             && self.counts_reliable == Some(true)
-            && !link_count(self.dir.as_fd(), slot.name.as_os_str()).is_ok_and(|count| count >= 2)
+            && !self
+                .non_anchor_link_count(slot)
+                .is_ok_and(|count| count >= 2)
         {
             self.unsettled = true;
             return false;
@@ -1319,17 +2283,70 @@ impl RecoveryDir {
         true
     }
 
+    fn non_anchor_link_count(&self, slot: &Slot) -> Result<u64, Errno> {
+        let raw = fstatat(
+            self.dir.as_fd(),
+            slot.name.as_os_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )?;
+        let stat = Stat::from_raw(&raw);
+        let own = self
+            .anchors
+            .iter()
+            .filter(|(_, held)| held.live_stat().is_some_and(|pin| pin.same_object(&stat)))
+            .count() as u64;
+        link_count(self.dir.as_fd(), slot.name.as_os_str()).map(|count| count.saturating_sub(own))
+    }
+
     /// The caller has proved this private name and released every possible peer.
     fn unlink_proven(&mut self, slot: &Slot) -> bool {
-        match run(Primitive::Unlink, || {
+        // A durable anchor is a name, not an fd that may sillyrename the
+        // candidate on NFS. Close our anchor peers for this inode too. The
+        // protected hardlink remains throughout, so its inode cannot recycle.
+        let candidate = fstatat(
+            self.dir.as_fd(),
+            slot.name.as_os_str(),
+            AtFlags::AT_SYMLINK_NOFOLLOW,
+        )
+        .ok()
+        .map(|raw| Stat::from_raw(&raw));
+        let mut released = Vec::new();
+        for (index, (_, held)) in self.anchors.iter_mut().enumerate() {
+            if candidate.is_some_and(|candidate| {
+                held.live_stat()
+                    .is_some_and(|pin| pin.same_object(&candidate))
+            }) {
+                held.release();
+                released.push(index);
+            }
+        }
+        let result = run(Primitive::Unlink, || {
             unlinkat(
                 self.dir.as_fd(),
                 slot.name.as_os_str(),
                 UnlinkatFlags::NoRemoveDir,
             )
-        }) {
+        });
+        for index in released {
+            let (name, held) = &mut self.anchors[index];
+            // The anchor was not unlinked, and its randomized private name is
+            // protected by the same integrity boundary as INTENT. Re-opening
+            // never adopts a mismatching occupant or an unheld proof.
+            match Held::open(&self.dir, OsStr::new(name), held.stat) {
+                Ok(reopened) if reopened.is_held() => *held = reopened,
+                _ => self.unsettled = true,
+            }
+        }
+        match result {
             Ok(()) => {
+                // The slot name is gone: never report it. A failed barrier
+                // keeps R itself (pins and INTENT) as the residue to report.
                 self.kept.retain(|p| *p != self.path.join(&slot.name));
+                if self.sync_effect(&[]).is_err() {
+                    let path = self.path.clone();
+                    self.remember(path);
+                    return false;
+                }
                 true
             }
             Err(_) => {
@@ -1346,6 +2363,84 @@ impl RecoveryDir {
     pub(super) fn finish(&mut self) -> Vec<String> {
         if !self.finished {
             self.finished = true;
+            if !self.durability_failed && self.sync_effect(&[]).is_err() {
+                self.unsettled = true;
+            }
+            let cleanup_intent = self.intent.clone();
+            if self.settled() {
+                // All candidate effects are finished. Prove every anchor with
+                // its original live descriptor, then close every peer before
+                // unlink (including NFS clients with per-vnode sillyrenames).
+                let mut proven = Vec::new();
+                for (name, held) in &self.anchors {
+                    if self.holds_name(&self.dir, OsStr::new(name), held) {
+                        proven.push(name.clone());
+                    } else {
+                        self.unsettled = true;
+                    }
+                }
+                self.anchors.clear();
+                for name in proven {
+                    if unlinkat(self.dir.as_fd(), name.as_str(), UnlinkatFlags::NoRemoveDir)
+                        .is_err()
+                    {
+                        self.unsettled = true;
+                    }
+                }
+                if self.sync_effect(&[]).is_err() {
+                    self.unsettled = true;
+                }
+            }
+            // Keep metadata for unresolved slots and foreign entries, including
+            // hidden NFS leftovers. Hold the lock through cleanup.
+            if self.settled() {
+                match self
+                    .dir
+                    .try_clone()
+                    .ok()
+                    .and_then(|fd| nix::dir::Dir::from_fd(fd).ok())
+                {
+                    Some(mut entries) => {
+                        for entry in entries.iter() {
+                            let Ok(entry) = entry else {
+                                self.unsettled = true;
+                                break;
+                            };
+                            let name = entry.file_name().to_bytes();
+                            if !matches!(
+                                name,
+                                b"." | b".." | b"INTENT" | b"INTENT.new" | b".wsmp-lock"
+                            ) {
+                                self.unsettled = true;
+                                break;
+                            }
+                        }
+                    }
+                    None => self.unsettled = true,
+                }
+            }
+            // Success and clean refusals drop the crash map with R only when R
+            // is actually empty. An unsettled operation, or a captured slot
+            // still in `kept`, keeps INTENT.
+            if self.settled() && self.cleanup_lock.is_none() {
+                // Unsupported locks cannot protect the handoff away from the
+                // internal inode. Keep discoverable metadata rather than race.
+                self.unsettled = true;
+            }
+            if self.settled() {
+                // Close the lock fd before unlink: NFS otherwise creates a
+                // silly-rename which itself prevents removing R. The owner
+                // pid remains live while this final empty cleanup runs.
+                self.lock = None;
+                self.discard_intent();
+                match unlinkat(self.dir.as_fd(), ".wsmp-lock", UnlinkatFlags::NoRemoveDir) {
+                    Ok(()) | Err(Errno::ENOENT) => {}
+                    Err(_) => self.unsettled = true,
+                }
+                if self.sync_effect(&[]).is_err() {
+                    self.unsettled = true;
+                }
+            }
             if self.unsettled
                 || run(Primitive::Rmdir, || {
                     unlinkat(
@@ -1357,14 +2452,54 @@ impl RecoveryDir {
                 .is_err()
             {
                 self.unsettled = true;
+                // A refused/failed rmdir must not strand an otherwise empty
+                // directory after its metadata was removed.
+                if self.intent.is_none()
+                    && let Some(intent) = cleanup_intent
+                {
+                    if self.persist_intent(&intent).is_ok() {
+                        self.registered = super::registry::register(&self.path, &intent).is_ok();
+                    }
+                    self.intent = Some(intent);
+                }
+                let _ = OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .mode(0o600)
+                    .custom_flags(nix::libc::O_NOFOLLOW)
+                    .open(self.path.join(".wsmp-lock"));
                 // Include the directory itself (also discovers externally added slots).
                 if self.kept.is_empty() {
                     self.remember(self.path.clone());
                 }
+            } else if self.registered {
+                super::registry::unregister(&self.path);
+                self.registered = false;
+            }
+            // R and its evidence are already gone. A lost rmdir can at most
+            // resurrect an empty R, which is harmless; it grants no authority
+            // and cannot make the operation's outcome uncertain.
+            if !self.unsettled
+                && (self.effect_started || self.pre_effect_abort.is_none())
+                && let Err(errno) = nix::unistd::fsync(self.parent.as_fd())
+            {
+                tracing::warn!(recovery = %self.path.display(), %errno, "recovery parent sync failed after rmdir; an empty recovery directory may reappear");
+            }
+            if !self.unsettled {
+                let lock_name = format!(".wsmp-lock-{}", self.name.to_string_lossy());
+                unlink_cleanup_lock(
+                    &self.parent,
+                    OsStr::new(&lock_name),
+                    self.cleanup_lock.as_ref(),
+                );
+                self.cleanup_lock = None;
             }
             if self.unsettled || !self.kept.is_empty() {
                 tracing::warn!(recovery = %self.path.display(), kept = ?self.kept, "file recovery retained; manual recovery required");
             }
+            self.lock = None;
         }
         // The wire schema bounds the list (`recovered` <= 4); the warning above
         // names every retained path, so nothing is lost by the clamp.
@@ -1376,6 +2511,16 @@ impl RecoveryDir {
     }
 
     pub(super) fn uncertain(&mut self) -> FileError {
+        // Nothing public changed: once R is cleanly gone the failure is certain.
+        if !self.effect_started
+            && let Some(error) = self.pre_effect_abort.clone()
+        {
+            let kept = self.finish();
+            if self.settled() && kept.is_empty() {
+                return error;
+            }
+        }
+        self.unsettled = true;
         let kept = self.finish();
         FileError::new(
             ErrorCode::UncertainOutcome,
@@ -1385,7 +2530,155 @@ impl RecoveryDir {
     }
 
     pub(super) fn settled(&self) -> bool {
-        !self.unsettled && self.kept.is_empty()
+        !self.durability_failed && !self.unsettled && self.kept.is_empty()
+    }
+}
+
+pub(super) fn cleanup_lock_path(path: &Path) -> PathBuf {
+    path.with_file_name(format!(
+        ".wsmp-lock-{}",
+        path.file_name().unwrap_or_default().to_string_lossy()
+    ))
+}
+
+pub(super) fn lock_cleanup(path: &Path, nonblocking: bool) -> std::io::Result<Option<Flock<File>>> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(cleanup_lock_path(path))?;
+    if file.metadata()?.len() != 0 {
+        return Err(std::io::Error::other("cleanup lock contains foreign bytes"));
+    }
+    let arg = if nonblocking {
+        FlockArg::LockExclusiveNonblock
+    } else {
+        FlockArg::LockExclusive
+    };
+    match Flock::lock(file, arg) {
+        Ok(lock) => {
+            use std::os::unix::fs::MetadataExt;
+            let held = lock.metadata()?;
+            let named = std::fs::symlink_metadata(cleanup_lock_path(path))?;
+            if !named.is_file() || held.dev() != named.dev() || held.ino() != named.ino() {
+                return Err(std::io::Error::other("cleanup lock identity changed"));
+            }
+            Ok(Some(lock))
+        }
+        Err((_, Errno::ENOTSUP | Errno::ENOSYS)) => Ok(None),
+        Err((_, errno)) => Err(std::io::Error::from_raw_os_error(errno as i32)),
+    }
+}
+
+pub(super) fn unlink_cleanup_lock(parent: &OwnedFd, name: &OsStr, lock: Option<&Flock<File>>) {
+    let Some(lock) = lock else { return };
+    let Ok(held) = fstat(lock.as_fd()) else {
+        return;
+    };
+    let Ok(named) = fstatat(parent.as_fd(), name, AtFlags::AT_SYMLINK_NOFOLLOW) else {
+        return;
+    };
+    if held.st_dev == named.st_dev && held.st_ino == named.st_ino && named.st_size == 0 {
+        // Outside R: even NFS sillyrename cannot prevent R's completed rmdir.
+        // Release the fd immediately after this final mutation.
+        let _ = unlinkat(parent.as_fd(), name, UnlinkatFlags::NoRemoveDir);
+    }
+}
+
+fn lock_recovery_dir(path: &Path) -> Option<Flock<File>> {
+    let lock_path = path.join(".wsmp-lock");
+    let file = match OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(&lock_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!(
+                recovery = %path.display(),
+                error = %error,
+                "could not create recovery lock; recover falls back to pid liveness"
+            );
+            return None;
+        }
+    };
+    match Flock::lock(file, FlockArg::LockExclusive) {
+        Ok(lock) => Some(lock),
+        Err((_, error)) => {
+            tracing::warn!(
+                recovery = %path.display(),
+                error = %error,
+                "could not flock recovery directory; recover falls back to pid liveness"
+            );
+            None
+        }
+    }
+}
+
+fn tolerate_dir_fsync(result: Result<(), Errno>, path: &Path) -> FileResult<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(errno) => {
+            tracing::warn!(recovery = %path.display(), %errno, "directory sync failed; durability is not proven");
+            Err(barrier_error(errno))
+        }
+    }
+}
+
+/// Prove the directory accepts fsync BEFORE an unjournaled public effect
+/// (create, mkdir, rmdir, case-only rename). An unsupported directory sync
+/// then refuses as `unsafe_filesystem` with nothing changed.
+pub(crate) fn probe_dir_barrier(dir: &OwnedFd) -> FileResult<()> {
+    nix::unistd::fsync(dir.as_fd()).map_err(barrier_error)
+}
+
+/// Errnos with which a rename, link or O_EXCL create is refused atomically.
+/// ENOENT is excluded: an NFS retransmit can report it after a success.
+pub(super) fn refused_without_effect(errno: Errno) -> bool {
+    matches!(
+        errno,
+        Errno::EEXIST
+            | Errno::EINVAL
+            | Errno::ENOSYS
+            | Errno::ENOTSUP
+            | Errno::EXDEV
+            | Errno::EACCES
+            | Errno::EPERM
+            | Errno::EROFS
+            | Errno::ENOSPC
+            | Errno::EDQUOT
+            | Errno::EMLINK
+            | Errno::ENAMETOOLONG
+            | Errno::ELOOP
+            | Errno::ENOTDIR
+            | Errno::EISDIR
+            | Errno::EBUSY
+    )
+}
+
+/// A directory that cannot be fsynced at all cannot carry a crash journal:
+/// that is an unsafe filesystem, not a transient I/O error.
+pub(super) fn barrier_error(errno: Errno) -> FileError {
+    match errno {
+        Errno::EINVAL | Errno::ENOTSUP => FileError::unsafe_filesystem(),
+        errno => FileError::errno(errno),
+    }
+}
+
+/// Report abandoned recovery directories from the durable registry.
+/// Never walks file roots (that can hang on a dead NFS mount). Never deletes.
+pub(crate) fn report_abandoned_recovery() {
+    for entry in super::registry::abandoned_entries() {
+        tracing::warn!(recovery = %entry.path, op = %entry.summary.op,
+            phase = %entry.summary.phase,
+            "abandoned recovery registry entry; run `wsmp recover` to inspect (directory existence not checked at startup)");
     }
 }
 
@@ -1393,6 +2686,7 @@ impl Drop for RecoveryDir {
     fn drop(&mut self) {
         if !self.finished {
             // Safety net only removes an empty directory, never a slot.
+            // INTENT is discarded only when R is empty (`settled()`).
             let _ = self.finish();
         }
     }
@@ -1772,7 +3066,10 @@ mod tests {
                     recovery.kept,
                     [recovery.path.join("tmp"), recovery.path.join("probe")]
                 );
-                assert_eq!(std::fs::read_dir(&recovery.path).unwrap().count(), 2);
+                assert_eq!(
+                    super::super::recover::present_slots(&recovery.path).len(),
+                    2
+                );
                 assert!(!recovery.settled());
             } else {
                 assert!(matches!(result.unwrap(), PublishMethod::Link));
@@ -1876,5 +3173,202 @@ mod tests {
         let _faults = FaultScope::new(&[(Primitive::Mkdir, 1, Errno::EEXIST)]);
         let mut recovery = RecoveryDir::new(&parent, &fx.root).unwrap();
         assert!(recovery.finish().is_empty());
+    }
+
+    #[test]
+    fn startup_report_names_abandoned_recovery_and_leaves_it() {
+        let fx = Fx::new();
+        let dir = fx.root.join(".wsmp-recover-abcdefghij");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("slot-1"), "kept object").unwrap();
+        let mut intent = Intent::delete(&fx.root.join("gone"));
+        intent.pid = 0;
+        super::super::registry::register(&dir, &intent).unwrap();
+        report_abandoned_recovery();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("slot-1")).unwrap(),
+            "kept object"
+        );
+        assert!(dir.is_dir());
+        let message = super::super::recover::describe_abandoned(&dir);
+        assert!(!message.contains("read INTENT"), "{message}");
+        assert!(message.contains("INTENT absent"), "{message}");
+        assert!(message.contains("slot-1"), "{message}");
+    }
+
+    #[test]
+    fn finish_keeps_intent_when_a_slot_is_retained() {
+        let fx = Fx::new();
+        let parent = root(&fx);
+        let path = fx.put("source", "kept bytes");
+        let mut recovery = RecoveryDir::new(&parent, &fx.root).unwrap();
+        recovery.prepare_intent(Intent::delete(&path)).unwrap();
+        let slot = recovery.capture(&parent, "source".as_ref(), &path).unwrap();
+        recovery.keep(&slot);
+        let kept = recovery.finish();
+        assert!(!kept.is_empty());
+        assert!(recovery.path.join("INTENT").is_file());
+        assert_eq!(
+            std::fs::read_to_string(recovery.path.join(&slot.name)).unwrap(),
+            "kept bytes"
+        );
+    }
+
+    #[test]
+    fn capture_without_prepare_writes_create_intent_and_registers() {
+        let fx = Fx::new();
+        let parent = root(&fx);
+        let path = fx.put("created", "bytes");
+        let mut recovery = RecoveryDir::new(&parent, &fx.root).unwrap();
+        let slot = recovery
+            .capture(&parent, "created".as_ref(), &path)
+            .unwrap();
+        let parsed = super::super::intent::parse_intent(
+            &std::fs::read(recovery.path.join("INTENT")).expect("INTENT"),
+        )
+        .expect("parse");
+        assert_eq!(parsed.op, super::super::intent::IntentOp::Create);
+        assert_eq!(parsed.phase, IntentPhase::Prepared);
+        assert!(
+            parsed
+                .slots
+                .contains_key(&slot.name.to_string_lossy().into_owned())
+        );
+        let registered = super::super::registry::list_entries();
+        assert!(
+            registered
+                .iter()
+                .any(|entry| entry.recovery_path() == recovery.path),
+            "{registered:?}"
+        );
+        recovery.keep(&slot);
+        let _ = recovery.finish();
+    }
+
+    #[test]
+    fn unsupported_directory_sync_cannot_grant_durability() {
+        assert!(tolerate_dir_fsync(Ok(()), Path::new("/tmp")).is_ok());
+        assert!(tolerate_dir_fsync(Err(Errno::EINVAL), Path::new("/tmp")).is_err());
+        assert!(tolerate_dir_fsync(Err(Errno::ENOTSUP), Path::new("/tmp")).is_err());
+        let error = tolerate_dir_fsync(Err(Errno::EIO), Path::new("/tmp")).unwrap_err();
+        assert_eq!(error.code, ErrorCode::IoError);
+    }
+}
+#[cfg(test)]
+mod identity_boundary_tests {
+    use super::*;
+    use crate::file_ops::tests::Fx;
+
+    #[test]
+    fn final_sidecar_cleanup_keeps_actual_replaced_inode() {
+        let fx = Fx::new();
+        let parent = nix::fcntl::open(
+            &fx.root,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY,
+            Mode::empty(),
+        )
+        .expect("parent");
+        let recovery = RecoveryDir::new(&parent, &fx.root).expect("recovery");
+        let lock_path = cleanup_lock_path(&recovery.path);
+        let successor = fx.root.join("replacement-lock");
+        std::fs::write(&successor, b"foreign successor").expect("successor");
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("mv -- \"$1\" \"$2\"")
+            .arg("wsmp-fixture")
+            .arg(&successor)
+            .arg(&lock_path)
+            .status()
+            .expect("actual competing process");
+        assert!(status.success());
+        let lock_name = lock_path.file_name().unwrap();
+        unlink_cleanup_lock(&parent, lock_name, recovery.cleanup_lock.as_ref());
+        assert_eq!(
+            std::fs::read(&lock_path).expect("foreign successor retained"),
+            b"foreign successor"
+        );
+        drop(recovery);
+        assert_eq!(
+            std::fs::read(&lock_path).expect("drop also retains successor"),
+            b"foreign successor"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_cleanup_abrupt_child_helper() {
+        let Some(root) = std::env::var_os("WSMP_RECOVERY_CRASH_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let _registry = super::super::registry::install_temp_registry();
+        let parent = nix::fcntl::open(&root, OFlag::O_RDONLY | OFlag::O_DIRECTORY, Mode::empty())
+            .expect("parent");
+        let mut recovery = RecoveryDir::new(&parent, &root).expect("recovery");
+        let dir = recovery.path.clone();
+        super::super::exchange::RMDIR_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(Box::new(move || {
+                std::fs::write(root.join("ready"), dir.as_os_str().as_encoded_bytes())
+                    .expect("ready");
+                assert!(dir.is_dir(), "directory exists before actual rmdir");
+                nix::sys::signal::kill(nix::unistd::getpid(), nix::sys::signal::Signal::SIGKILL)
+                    .expect("actual SIGKILL at syscall boundary");
+            }));
+        });
+        let _ = recovery.finish();
+        panic!("SIGKILL must not return");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_resumes_after_sigkill_at_final_rmdir_boundary() {
+        use std::os::unix::ffi::OsStringExt;
+        let fixture = tempfile::tempdir().expect("fixture");
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "file_ops::recovery::identity_boundary_tests::recovery_cleanup_abrupt_child_helper",
+                "--nocapture",
+            ])
+            .env("WSMP_RECOVERY_CRASH_FIXTURE", fixture.path())
+            .spawn()
+            .expect("child");
+        let ready = fixture.path().join("ready");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if !ready.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("child did not reach cleanup boundary");
+        }
+        let killed = child.wait().expect("wait killed child");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(killed.signal(), Some(nix::libc::SIGKILL));
+        let dir = PathBuf::from(std::ffi::OsString::from_vec(
+            std::fs::read(ready).expect("ready bytes"),
+        ));
+        assert!(
+            dir.is_dir(),
+            "residue {} after child {killed:?}; root {:?}",
+            dir.display(),
+            std::fs::read_dir(fixture.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            std::fs::read_dir(&dir)
+                .expect("empty residue")
+                .next()
+                .is_none()
+        );
+        assert_eq!(
+            super::super::recover::recover_dir(&dir, true, None).action,
+            super::super::recover::RecoverAction::Cleaned
+        );
+        assert!(!dir.exists());
+        assert!(!cleanup_lock_path(&dir).exists());
     }
 }

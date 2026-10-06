@@ -1,3 +1,4 @@
+import { NODE_HEALTH_WARNING_CODES } from "@ws-model-proxy/api/lib/node-inventory";
 import { modelApiSurfaces } from "@ws-model-proxy/api/lib/surface-capabilities";
 import {
   CLI_AGENT_ACTION_KINDS,
@@ -21,6 +22,9 @@ function keyTree(value: unknown, prefix = ""): string[] {
 }
 
 describe("dashboard locale key parity (en-US / es-MX)", () => {
+  it("has identical managed deployment and contribution keys", () => {
+    expect(keyTree(esDashboard.deployments)).toEqual(keyTree(enDashboard.deployments));
+  });
   it("has identical key trees for the models surfaces section", () => {
     expect(keyTree(esDashboard.models.surfaces)).toEqual(keyTree(enDashboard.models.surfaces));
   });
@@ -50,6 +54,16 @@ describe("dashboard locale key parity (en-US / es-MX)", () => {
     expect(keyTree(esDashboard.terminals)).toEqual(keyTree(enDashboard.terminals));
     expect(keyTree(esDashboard.nav)).toEqual(keyTree(enDashboard.nav));
     expect(keyTree(esDashboard.clis.features)).toEqual(keyTree(enDashboard.clis.features));
+  });
+
+  it("has identical CLI node card keys, covering every health warning", () => {
+    expect(keyTree(esDashboard.clis.node)).toEqual(keyTree(enDashboard.clis.node));
+    expect(Object.keys(enDashboard.clis.node.warning).sort()).toEqual(
+      [...NODE_HEALTH_WARNING_CODES].sort(),
+    );
+    expect(Object.keys(enDashboard.clis.node.kinds).sort()).toEqual(
+      ["cpu", "discrete", "unified"].sort(),
+    );
   });
 
   it("has identical agent activity keys, covering every audit kind and outcome", () => {
@@ -323,7 +337,7 @@ it("uses external-fallback wording, not egress or overflow, on the fallback surf
   }
   expect(enDashboard.pools.fallbackBadge.label).toBe("Fallback available");
   expect(enDashboard).not.toHaveProperty("pools.privacyBadge");
-  expect(enDashboard.tokens.externalAccess.savedPoolsHint).not.toMatch(/first time/i);
+  expect(enDashboard.tokens.cloudAccess.poolsRemembered).not.toMatch(/first time/i);
   expect(keyTree(esDashboard.pools.fallbackBadge)).toEqual(
     keyTree(enDashboard.pools.fallbackBadge),
   );

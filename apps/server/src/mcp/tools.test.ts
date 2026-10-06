@@ -113,6 +113,7 @@ const db = prisma as unknown as {
   providerCredential: { findMany: MockInstance };
   mcpGrant: { findUnique: MockInstance };
   user: { findUnique: MockInstance };
+  modelPool: { findUnique: MockInstance };
 };
 
 const ENVELOPE = {
@@ -226,6 +227,9 @@ const CLI_FILE_TOOL_NAMES = [
 
 /** Every PAT-only CLI tool: the three command tools and the nine node file tools. */
 const CLI_COMMAND_TOOL_NAMES = new Set<string>([
+  "deployment_plan_start",
+  "deployment_plan_stop",
+  "deployment_plan_apply",
   "forwarder_cli_command_run",
   "forwarder_cli_supervised_command_start",
   "forwarder_cli_command_result",
@@ -246,7 +250,16 @@ interface WireResult {
   content?: { type: string; text: string }[];
   structuredContent?: {
     result?: unknown;
-    error?: { code?: string; issues?: { code: string }[] };
+    error?: {
+      code?: string;
+      fields?: string[];
+      message?: string;
+      issues?: {
+        code: string;
+        unknownKeyCount?: number;
+        suggestions?: string[];
+      }[];
+    };
     requestId?: string;
   };
   isError?: boolean;
@@ -303,6 +316,129 @@ describe("tools/list — the manifest is the advertised catalog", () => {
 });
 
 describe("#117 — real input schemas and named failing fields", () => {
+  it("bounds owner-scoped deployment metadata pages through the actual MCP handler", async () => {
+    vi.mocked(prisma.deploymentConfig.findMany).mockResolvedValueOnce([]);
+    const authInfo = buildAuthInfo(["mcp:read"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "deployment_configs_list", {
+      limit: 1,
+      cursor: "another-owner-cursor",
+    });
+    expect(body.result?.structuredContent).toEqual({ result: { items: [], nextCursor: null } });
+    expect(prisma.deploymentConfig.findMany).toHaveBeenCalledWith({
+      where: { userId: "user-1", id: { gt: "another-owner-cursor" } },
+      orderBy: { id: "asc" },
+      take: 2,
+      include: { Revisions: { orderBy: { revision: "desc" }, take: 1 } },
+    });
+  });
+
+  it("walks deployment metadata pages with a non-null nextCursor until the last page", async () => {
+    const row = (id: string) => ({
+      id,
+      userId: "user-1",
+      name: id,
+      createdAt: new Date("2026-01-01T00:00:00Z"),
+      updatedAt: new Date("2026-01-01T00:00:00Z"),
+      Revisions: [],
+    });
+    vi.mocked(prisma.deploymentConfig.findMany)
+      .mockResolvedValueOnce([row("cfg-a"), row("cfg-b"), row("cfg-c")] as never)
+      .mockResolvedValueOnce([row("cfg-c")] as never);
+    const authInfo = buildAuthInfo(["mcp:read"]);
+    bindRequest(authInfo);
+
+    const first = await callTool(authInfo, "deployment_configs_list", { limit: 2 });
+    const firstPage = first.body.result?.structuredContent?.result as {
+      items: { id: string }[];
+      nextCursor: string | null;
+    };
+    expect(firstPage.items.map((item) => item.id)).toEqual(["cfg-a", "cfg-b"]);
+    expect(firstPage.nextCursor).toBe("cfg-b");
+    expect(prisma.deploymentConfig.findMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({ where: { userId: "user-1" }, take: 3 }),
+    );
+
+    const second = await callTool(authInfo, "deployment_configs_list", {
+      limit: 2,
+      cursor: firstPage.nextCursor,
+    });
+    const secondPage = second.body.result?.structuredContent?.result as {
+      items: { id: string }[];
+      nextCursor: string | null;
+    };
+    expect(secondPage.items.map((item) => item.id)).toEqual(["cfg-c"]);
+    expect(secondPage.nextCursor).toBeNull();
+    expect(prisma.deploymentConfig.findMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({ where: { userId: "user-1", id: { gt: "cfg-b" } }, take: 3 }),
+    );
+  });
+
+  it("rejects a malformed cursor as invalid input without a database read or echo", async () => {
+    const authInfo = buildAuthInfo(["mcp:read"]);
+    bindRequest(authInfo);
+    const badCursor = `not a cursor ${"x".repeat(8)}/..`;
+    const { body } = await callTool(authInfo, "deployment_configs_list", {
+      limit: 2,
+      cursor: badCursor,
+    });
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.structuredContent?.error?.fields).toEqual(["cursor"]);
+    expect(JSON.stringify(body)).not.toContain(badCursor);
+    expect(prisma.deploymentConfig.findMany).not.toHaveBeenCalled();
+  });
+
+  it("keeps safe procedure reason codes even when no declared field is supplied", async () => {
+    const { ORPCError } = await import("@orpc/server");
+    db.modelPool.findUnique.mockRejectedValueOnce(
+      new ORPCError("BAD_REQUEST", { data: { reason: "CONCURRENCY_EXCEEDS_PHYSICAL" } }),
+    );
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_model_pool_update", { id: "pool-1" });
+    expect(body.result?.structuredContent).toEqual({
+      error: { code: "invalid_input", reason: "CONCURRENCY_EXCEEDS_PHYSICAL" },
+    });
+  });
+  it("MCP trusted actor prevents a human-only paid policy mutation before database work", async () => {
+    db.modelPool.findUnique.mockClear();
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_model_pool_update", {
+      id: "pool-1",
+      paidWarmProtectionEnabled: true,
+    });
+    expect(body.result?.structuredContent).toEqual({ error: { code: "FORBIDDEN" } });
+    expect(db.modelPool.findUnique).not.toHaveBeenCalled();
+  });
+
+  it("deployment command tools are hidden without PAT consent and visible with it", async () => {
+    const handler = createMcpTransport();
+    const oauth = buildAuthInfo(["mcp:write"]);
+    bindRequest(oauth, "deployment-oauth", { kind: "oauth" });
+    const oauthResult = await handler.fetch(toolsListRequest(902), { authInfo: oauth });
+    const oauthBody = (await oauthResult.json()) as { result: { tools: Array<{ name: string }> } };
+    expect(oauthBody.result.tools.map((tool) => tool.name)).not.toContain("deployment_plan_apply");
+    const pat = buildAuthInfo(["mcp:write"]);
+    bindRequest(pat, "deployment-pat", {
+      kind: "pat",
+      tokenId: "pat-1",
+      allowCliCommands: true,
+      allowCliFileRead: false,
+      scopes: ["mcp:write"],
+      expiresAt: null,
+    });
+    const patResult = await handler.fetch(toolsListRequest(903), { authInfo: pat });
+    const patBody = (await patResult.json()) as { result: { tools: Array<{ name: string }> } };
+    expect(patBody.result.tools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining([
+        "deployment_plan_start",
+        "deployment_plan_stop",
+        "deployment_plan_apply",
+        "deployment_config_create",
+      ]),
+    );
+  });
   it("tools/list advertises the real required fields of a procedure-backed tool", async () => {
     const handler = createMcpTransport();
     const response = await handler.fetch(toolsListRequest(21), undefined);
@@ -327,20 +463,24 @@ describe("#117 — real input schemas and named failing fields", () => {
     expect(bytes).toBeLessThanOrEqual(200 * 1024);
   });
 
-  it("an unknown key on a strict procedure is reported as fixed text, never as a path or value", async () => {
-    const PLAIN = "plain-hostile-key-4242";
+  it("an unknown key on a strict procedure is never echoed; suggestions are declared names", async () => {
+    const KEY = "plain-hostile-key-4242";
+    const VALUE = "plain-hostile-value-4242";
     const authInfo = buildAuthInfo(["mcp:write"]);
     bindRequest(authInfo);
     const { body } = await callTool(authInfo, "forwarder_pool_fallback_update", {
       poolId: "pool-1",
       fallbackEnabled: true,
-      [PLAIN]: PLAIN,
+      [KEY]: VALUE,
     });
     expect(body.result?.isError).toBe(true);
     const wire = JSON.stringify(body);
-    expect(wire).not.toContain(PLAIN);
+    expect(wire).not.toContain(VALUE);
+    expect(wire).not.toContain(KEY);
     const issues = body.result?.structuredContent?.error?.issues ?? [];
     expect(issues.map((issue) => issue.code)).toContain("unrecognized_keys");
+    expect(body.result?.structuredContent?.error?.fields ?? []).not.toContain(KEY);
+    expect(issues.some((issue) => (issue.unknownKeyCount ?? 0) > 0)).toBe(true);
   });
 
   it("a missing required field is named by path and code, and the procedure stays the authority", async () => {
@@ -350,7 +490,9 @@ describe("#117 — real input schemas and named failing fields", () => {
     expect(body.result?.isError).toBe(true);
     expect(body.result?.structuredContent).toEqual({
       error: {
-        code: "BAD_REQUEST",
+        code: "invalid_input",
+        fields: ["poolId"],
+        message: "poolId: Invalid input: expected string, received undefined",
         issues: [
           {
             path: ["poolId"],
@@ -372,7 +514,7 @@ describe("#117 — real input schemas and named failing fields", () => {
       ["forwarder_pool_fallback_get", { poolId: SECRET.repeat(20) }],
       ["forwarder_pool_fallback_get", { poolId: { nested: PLAIN } }],
       ["forwarder_pool_fallback_get", { poolId: [PLAIN] }],
-      ["forwarder_pool_fallback_get", { poolId: 42, [PLAIN]: PLAIN }],
+      ["forwarder_pool_fallback_get", { poolId: 42, extraKey: PLAIN }],
       ["model_api_tokens_preview", { scopeMode: PLAIN }],
       ["model_api_tokens_preview", { scopeMode: "ALLOWLIST", modelIds: [PLAIN, 7, SECRET] }],
     ];
@@ -384,7 +526,7 @@ describe("#117 — real input schemas and named failing fields", () => {
       const wire = JSON.stringify(body);
       expect(wire).not.toContain(PLAIN);
       expect(wire).not.toContain("ZZSECRETVALUEZZ");
-      expect(body.result?.structuredContent?.error?.code).toBe("BAD_REQUEST");
+      expect(body.result?.structuredContent?.error?.code).toBe("invalid_input");
     }
   });
 
@@ -401,6 +543,132 @@ describe("#117 — real input schemas and named failing fields", () => {
     });
     expect(resultText(body.result ?? {})).toBe("Invalid input");
     expect(JSON.stringify(body)).not.toContain("SECRET");
+  });
+
+  it("a schema-valid BAD_REQUEST names the declared field and keeps the static message", async () => {
+    const { ORPCError } = await import("@orpc/server");
+    db.modelPool.findUnique.mockRejectedValueOnce(
+      new ORPCError("BAD_REQUEST", {
+        message: "Effective concurrency limit exceeds physical capacity.",
+        data: {
+          fields: ["capacityConcurrencyLimit", "hardConcurrencyLimit", "notAField", "pool id"],
+        },
+      }),
+    );
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_model_pool_update", {
+      id: "pool-1",
+      capacityConcurrencyLimit: 8,
+    });
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.structuredContent).toEqual({
+      error: {
+        code: "invalid_input",
+        fields: ["capacityConcurrencyLimit"],
+        message: "Effective concurrency limit exceeds physical capacity.",
+      },
+    });
+    expect(resultText(body.result ?? {})).toBe(
+      "Invalid input: capacityConcurrencyLimit: Effective concurrency limit exceeds physical capacity.",
+    );
+  });
+
+  it("forwards a guarded-pool-create reason next to data.fields", async () => {
+    const { ORPCError } = await import("@orpc/server");
+    db.modelPool.findUnique.mockRejectedValueOnce(
+      new ORPCError("BAD_REQUEST", {
+        message: "Effective concurrency limit exceeds physical capacity.",
+        data: {
+          fields: ["capacityConcurrencyLimit"],
+          reason: "CONCURRENCY_EXCEEDS_PHYSICAL",
+        },
+      }),
+    );
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_model_pool_update", {
+      id: "pool-1",
+      capacityConcurrencyLimit: 8,
+    });
+    expect(body.result?.structuredContent).toEqual({
+      error: {
+        code: "invalid_input",
+        fields: ["capacityConcurrencyLimit"],
+        message: "Effective concurrency limit exceeds physical capacity.",
+        reason: "CONCURRENCY_EXCEEDS_PHYSICAL",
+      },
+    });
+  });
+
+  it("drops an unknown reason on the data.fields path", async () => {
+    const { ORPCError } = await import("@orpc/server");
+    db.modelPool.findUnique.mockRejectedValueOnce(
+      new ORPCError("BAD_REQUEST", {
+        message: "Effective concurrency limit exceeds physical capacity.",
+        data: {
+          fields: ["capacityConcurrencyLimit"],
+          reason: "SECRET_REASON",
+        },
+      }),
+    );
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_model_pool_update", {
+      id: "pool-1",
+      capacityConcurrencyLimit: 8,
+    });
+    expect(body.result?.structuredContent).toEqual({
+      error: {
+        code: "invalid_input",
+        fields: ["capacityConcurrencyLimit"],
+        message: "Effective concurrency limit exceeds physical capacity.",
+      },
+    });
+    expect(JSON.stringify(body)).not.toContain("SECRET_REASON");
+  });
+
+  it("forwards guarded-create advanced.contextMargin through declared fields", async () => {
+    const authInfo = buildAuthInfo(["mcp:write"]);
+    bindRequest(authInfo);
+    const { body } = await callTool(authInfo, "forwarder_guarded_pool_create", {
+      slug: "guarded-margin",
+      name: "Guarded margin",
+      localModelIds: ["local-id"],
+      recommendedSurface: "OPENAI_RESPONSES",
+      memberConcurrencyLimit: 1,
+      memberContextCeiling: 100,
+      reservedSlots: 0,
+      localWaitBudgetMs: 30_000,
+      providerModels: [],
+      advanced: {
+        physicalCountStrategy: "CONSERVATIVE_ESTIMATE",
+        contextMargin: 100,
+        borrowPolicy: "WHEN_IDLE",
+        protocolAdaptationEnabled: false,
+        allowLossyDeveloperRoleCollapse: false,
+        affinity: {
+          enabled: false,
+          ttlSeconds: 3_600,
+          maxRecords: 10_000,
+          prefixWeight: 100,
+          conversationWeight: 150,
+          confirmedCacheWeight: 250,
+          loadPenaltyWeight: 100,
+        },
+        memberOverrides: [],
+      },
+    });
+    expect(body.result?.isError).toBe(true);
+    expect(body.result?.structuredContent).toEqual({
+      error: {
+        code: "invalid_input",
+        fields: ["advanced.contextMargin", "memberContextCeiling"],
+        message: "Pool context margin must be smaller than the context ceiling.",
+        reason: "POOL_POLICY_INVALID",
+      },
+    });
+    expect(JSON.stringify(body.result?.structuredContent)).not.toContain("capacityContextMargin");
   });
 });
 
@@ -563,6 +831,53 @@ describe("error mapping", () => {
     // The app-authored oRPC message is never copied to the tool output.
     expect(JSON.stringify(body)).not.toContain("Model API token not found");
   });
+
+  it.each([
+    {
+      tool: "forwarder_cli_device_get",
+      args: { cliDeviceId: "cli-other-owner" },
+      mock: () =>
+        vi
+          .mocked(prisma.cliDevice.findUnique)
+          .mockResolvedValue({ id: "cli-other-owner", userId: "user-2" } as never),
+      appMessage: "CLI device not found.",
+    },
+    {
+      tool: "forwarder_model_pool_get",
+      args: { poolId: "pool-other-owner" },
+      mock: () =>
+        vi
+          .mocked(prisma.modelPool.findUnique)
+          .mockResolvedValue({ id: "pool-other-owner", userId: "user-2" } as never),
+      appMessage: "Model pool not found.",
+    },
+  ])(
+    "$tool hides another owner's id as NOT_FOUND through the manifest tool",
+    async ({ tool, args, mock, appMessage }) => {
+      mock();
+      const descriptor = MCP_TOOL_MANIFEST.find((entry) => entry.name === tool);
+      if (!descriptor) throw new Error(`missing manifest tool ${tool}`);
+      const orpcContext = createMcpContext({
+        user: USER,
+        expiresAt: new Date("2026-01-01T00:00:00Z"),
+        now: new Date("2025-06-01T00:00:00Z"),
+        services: undefined,
+      });
+      const { createRouterClient } = await import("@orpc/server");
+      const { appRouter } = await import("@ws-model-proxy/api/routers/index");
+      const result = await runManifestTool(descriptor, {
+        dispatch: { orpcContext, requestId: "req-42" },
+        scopes: ["mcp:read"],
+        client: createRouterClient(appRouter, { context: orpcContext }),
+        args,
+      });
+      expect(result.isError).toBe(true);
+      expect(resultText(result)).toBe("Not found");
+      expect(result.structuredContent).toMatchObject({ error: { code: "NOT_FOUND" } });
+      expect(JSON.stringify(result)).not.toContain(appMessage);
+      expect(JSON.stringify(result)).not.toContain("user-2");
+    },
+  );
 
   it("unknown failures become the generic internal error with the request id, never the cause", async () => {
     db.modelApiToken.findUnique.mockRejectedValue(
@@ -972,7 +1287,7 @@ describe("G3 — JSON→Date input adaptation", () => {
     expect(body.result?.isError).toBe(true);
     expect(body.result?.content?.[0]?.text).toContain('"createdAfter"');
     expect(body.result?.structuredContent).toMatchObject({
-      error: { code: "INVALID_INPUT", field: "createdAfter" },
+      error: { code: "invalid_input", fields: ["createdAfter"] },
     });
     expect(findMany).not.toHaveBeenCalled();
   });
@@ -985,10 +1300,10 @@ describe("G3 — JSON→Date input adaptation", () => {
       staleBefore: "2025-12-31T00:00:00Z",
       confirm: "DELETE",
     });
-    // The procedure ran (some downstream outcome), NOT an INVALID_INPUT
+    // The procedure ran (some downstream outcome), NOT an invalid_input
     // adapter error — the Date conversion satisfied z.date().
     expect(body.result?.structuredContent).not.toMatchObject({
-      error: { code: "INVALID_INPUT" },
+      error: { code: "invalid_input" },
     });
   });
 });
@@ -1034,15 +1349,24 @@ describe("CLI presence through the MCP projection", () => {
     const authInfo = buildAuthInfo(["mcp:read"]);
     bindRequest(authInfo);
     const { body } = await callTool(authInfo, "forwarder_cli_devices_list", {});
-    const rows = body.result?.structuredContent?.result as {
-      status: string;
-      endpoints: { status: string; reportedStatus: string }[];
-    }[];
-    expect(rows.map((row) => [row.status, row.endpoints[0]?.status])).toEqual([
+    const page = body.result?.structuredContent?.result as {
+      items: {
+        status: string;
+        endpoints: { status: string; reportedStatus: string; slug: string }[];
+      }[];
+      nextCursor: string | null;
+    };
+    expect(page.items.map((row) => [row.status, row.endpoints[0]?.status])).toEqual([
       ["CONNECTED", "ONLINE"],
       ["DISCONNECTED", "OFFLINE"],
     ]);
-    expect(rows[1]?.endpoints[0]?.reportedStatus).toBe("ONLINE");
+    expect(page.items[1]?.endpoints[0]?.reportedStatus).toBe("ONLINE");
+    expect(page.items[0]?.endpoints[0]?.slug).toBe("ep");
+    expect(page.nextCursor).toBeNull();
+    const serialized = JSON.stringify(page);
+    expect(serialized).not.toContain("models");
+    expect(serialized).not.toContain("defaultCapabilities");
+    expect(serialized).not.toContain("capabilityMetadata");
   });
 });
 

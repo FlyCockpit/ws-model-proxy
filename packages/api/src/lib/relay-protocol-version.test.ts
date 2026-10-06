@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { refusedRelayProtocolReason, relayProtocolAtLeast } from "./relay-protocol-version";
+import {
+  RELAY_MIN_PROTOCOL_VERSION,
+  refusedRelayProtocolReason,
+  relayProtocolAtLeast,
+} from "./relay-protocol-version";
+
+const [currentMajor, currentMinor] = RELAY_MIN_PROTOCOL_VERSION.split(".").map(Number);
+const nextRelayProtocol = `${currentMajor}.${currentMinor! + 1}`;
 
 describe("relayProtocolAtLeast", () => {
   it("compares major and minor numerically", () => {
@@ -22,20 +29,20 @@ describe("relayProtocolAtLeast", () => {
 
 describe("refusedRelayProtocolReason", () => {
   it("calls a CLI above the newest protocol too new, numerically", () => {
-    expect(refusedRelayProtocolReason("2.10")).toBe("cli_too_new");
+    expect(refusedRelayProtocolReason(nextRelayProtocol)).toBe("cli_too_new");
     expect(refusedRelayProtocolReason("3.0")).toBe("cli_too_new");
+    expect(refusedRelayProtocolReason("2.10")).toBe("cli_too_new");
   });
 
   it("calls anything at or below it, or unreadable, too old", () => {
-    expect(refusedRelayProtocolReason("2.9")).toBe("cli_too_old");
-    expect(refusedRelayProtocolReason("2.8")).toBe("cli_too_old");
-    expect(refusedRelayProtocolReason("2.7")).toBe("cli_too_old");
-    expect(refusedRelayProtocolReason("2.6")).toBe("cli_too_old");
+    expect(refusedRelayProtocolReason(RELAY_MIN_PROTOCOL_VERSION)).toBe("cli_too_old");
+    expect(refusedRelayProtocolReason("2.4")).toBe("cli_too_old");
+    expect(refusedRelayProtocolReason("2.3")).toBe("cli_too_old");
     expect(refusedRelayProtocolReason("2.0")).toBe("cli_too_old");
     expect(refusedRelayProtocolReason("1.99")).toBe("cli_too_old");
     expect(refusedRelayProtocolReason(null)).toBe("cli_too_old");
     expect(refusedRelayProtocolReason(undefined)).toBe("cli_too_old");
-    expect(refusedRelayProtocolReason("2.8.1")).toBe("cli_too_old");
+    expect(refusedRelayProtocolReason("2.4.1")).toBe("cli_too_old");
     expect(refusedRelayProtocolReason("next")).toBe("cli_too_old");
   });
 });

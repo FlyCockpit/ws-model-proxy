@@ -3,6 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("@ws-model-proxy/db", () => ({ default: {} }));
 
 import {
+  routingRulesFromRows,
+  toStoredRoutingRuleRows,
+} from "@ws-model-proxy/api/lib/metric-routing";
+import {
   combineWithEngineLoad,
   createRoutingEvaluationState,
   MetricRoutingEvaluator,
@@ -22,7 +26,7 @@ function member(
   engineLoadMode: "AUTO" | "OFF";
   customEngineLoadMode: "OBSERVE" | "ENFORCE";
   kvFullThreshold: number | null;
-  ModelPool: { routingRules: unknown };
+  ModelPool: { PoolRoutingRules: ReturnType<typeof toStoredRoutingRuleRows> };
   DiscoveredModel: null;
   ExecutionTarget: {
     InferenceCapacity: {
@@ -40,7 +44,7 @@ function member(
     engineLoadMode: "AUTO",
     customEngineLoadMode: "OBSERVE",
     kvFullThreshold: null,
-    ModelPool: { routingRules: rules },
+    ModelPool: { PoolRoutingRules: toStoredRoutingRuleRows(rules) },
     DiscoveredModel: null,
     ExecutionTarget: {
       InferenceCapacity: null,
@@ -121,7 +125,7 @@ function harness(members: ReturnType<typeof member>[]) {
   const rows = new Map<string, Row>();
   const written: Row[] = [];
   const pools = new Map<string, unknown>(
-    members.map((entry) => [entry.poolId, entry.ModelPool.routingRules]),
+    members.map((entry) => [entry.poolId, routingRulesFromRows(entry.ModelPool.PoolRoutingRules)]),
   );
   const db = {
     poolMember: {
@@ -134,7 +138,10 @@ function harness(members: ReturnType<typeof member>[]) {
     },
     modelPool: {
       findMany: vi.fn(async () =>
-        [...pools.entries()].map(([id, routingRules]) => ({ id, routingRules })),
+        [...pools.entries()].map(([id, rules]) => ({
+          id,
+          PoolRoutingRules: toStoredRoutingRuleRows(rules),
+        })),
       ),
     },
     poolMemberRoutingVerdict: {
@@ -347,14 +354,18 @@ describe("MetricRoutingEvaluator engine load (S-D)", () => {
       { metric: "node.gpu.temperature_c", op: ">", threshold: 80, effect: "avoid" },
     ];
     const base = engineMember("m1", "VLLM");
-    const h = harness([{ ...base, ModelPool: { routingRules: avoidHot } }]);
+    const h = harness([
+      { ...base, ModelPool: { PoolRoutingRules: toStoredRoutingRuleRows(avoidHot) } },
+    ]);
     const state = createRoutingEvaluationState("user-1", "device-1");
     await h.evaluator.evaluate(state, {
       ...metrics(90, T0),
       endpointLoad: [load({ waiting: 1, waitingStreak: 2 })],
     });
     expect(writes(h)[0]).toMatchObject({ verdict: "FULL", engineState: "full_waiting" });
-    const h2 = harness([{ ...base, ModelPool: { routingRules: hotRule } }]);
+    const h2 = harness([
+      { ...base, ModelPool: { PoolRoutingRules: toStoredRoutingRuleRows(hotRule) } },
+    ]);
     await h2.evaluator.evaluate(createRoutingEvaluationState("user-1", "device-1"), {
       ...metrics(90, T0),
       endpointLoad: [load({ waiting: 1, waitingStreak: 2 })],
@@ -368,7 +379,9 @@ describe("MetricRoutingEvaluator engine load (S-D)", () => {
 
   it("a clear engine never relaxes a rule FULL", async () => {
     const base = engineMember("m1", "VLLM");
-    const h = harness([{ ...base, ModelPool: { routingRules: hotRule } }]);
+    const h = harness([
+      { ...base, ModelPool: { PoolRoutingRules: toStoredRoutingRuleRows(hotRule) } },
+    ]);
     await h.evaluator.evaluate(createRoutingEvaluationState("user-1", "device-1"), {
       ...metrics(90, T0),
       endpointLoad: [load({ kvUsage: 0.1 })],
@@ -522,7 +535,9 @@ describe("MetricRoutingEvaluator successor fences", () => {
     "sequential reconnect (with rules: %s) clears inherited FULL",
     async (withRules) => {
       const h = harness([
-        engineMember("m1", "VLLM", { ModelPool: { routingRules: withRules ? hotRule : [] } }),
+        engineMember("m1", "VLLM", {
+          ModelPool: { PoolRoutingRules: toStoredRoutingRuleRows(withRules ? hotRule : []) },
+        }),
       ]);
       const a = createRoutingEvaluationState("user-1", "device-1");
       await h.evaluator.evaluate(a, { nodeMetrics: null, endpointLoad: [load({ kvUsage: 0.99 })] });
@@ -653,7 +668,7 @@ describe("MetricRoutingEvaluator successor fences", () => {
       const members = [
         engineMember("m1", "VLLM", {
           kvFullThreshold: 0.95,
-          ModelPool: { routingRules: withRules ? hotRule : [] },
+          ModelPool: { PoolRoutingRules: toStoredRoutingRuleRows(withRules ? hotRule : []) },
         }),
       ];
       const h = harness(members);
@@ -767,7 +782,11 @@ describe("MetricRoutingEvaluator successor fences", () => {
     "rule-bearing control retains $verdict and its refresh budget with calm engine load",
     async ({ temperature, effect, verdict, ruleState }) => {
       const rules = [{ metric: "node.gpu.temperature_c", op: ">", threshold: 80, effect }];
-      const h = harness([engineMember("m1", "VLLM", { ModelPool: { routingRules: rules } })]);
+      const h = harness([
+        engineMember("m1", "VLLM", {
+          ModelPool: { PoolRoutingRules: toStoredRoutingRuleRows(rules) },
+        }),
+      ]);
       const state = createRoutingEvaluationState("user-1", "device-1");
       const inputs = () => ({
         ...metrics(temperature, h.now()),
@@ -1059,7 +1078,11 @@ describe("MetricRoutingEvaluator", () => {
     "retraction after $edit edit preserves only NONE fences ($verdict)",
     async ({ edit, verdict, effect, temperature }) => {
       const rules = [{ metric: "node.gpu.temperature_c", op: ">", threshold: 80, effect }];
-      const members = [engineMember("m1", "VLLM", { ModelPool: { routingRules: rules } })];
+      const members = [
+        engineMember("m1", "VLLM", {
+          ModelPool: { PoolRoutingRules: toStoredRoutingRuleRows(rules) },
+        }),
+      ];
       const h = harness(members);
       const state = createRoutingEvaluationState("user-1", "device-1");
       const create = h.db.poolMemberRoutingVerdict.create.getMockImplementation();

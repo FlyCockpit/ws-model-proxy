@@ -116,13 +116,22 @@ describe("OpenRouter provider type in provider management", () => {
     expect(db.providerModel.create).toHaveBeenCalled();
   });
 
-  it("rejects Responses on OpenRouter, which is not claimed", async () => {
-    await expect(
-      client().createModel(
-        modelInput({ openaiChatCompletions: surface, openaiResponses: surface }),
-      ),
-    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
-    expect(db.providerModel.create).not.toHaveBeenCalled();
+  it("accepts Responses and Messages on OpenRouter", async () => {
+    await client().createModel(
+      modelInput({ openaiChatCompletions: surface, openaiResponses: surface }),
+    );
+    expect(db.providerModel.create).toHaveBeenCalled();
+    db.providerModel.create.mockClear();
+    await client().createModel(
+      modelInput({
+        openaiChatCompletions: surface,
+        anthropicMessages: {
+          ...surface,
+          protocolVersions: [{ version: "2023-06-01" }],
+        },
+      }),
+    );
+    expect(db.providerModel.create).toHaveBeenCalled();
   });
 
   it("rejects legacy inventories that could claim surfaces through old fields", async () => {
@@ -335,7 +344,7 @@ describe("OpenRouter credential test", () => {
   // The API root answers 404 with or without a key, so probing it could never
   // succeed; /v1/key answers 401 for a bad key.
   it("probes the authenticated key endpoint on the account's base URL", async () => {
-    egressMock.request.mockResolvedValue({ statusCode: 200, resume: vi.fn() });
+    egressMock.request.mockResolvedValue({ statusCode: 200, destroy: vi.fn() });
     await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
       ok: true,
       outcome: "SUCCESS",
@@ -356,7 +365,7 @@ describe("OpenRouter credential test", () => {
   });
 
   it("reports an invalid key as a rejected credential", async () => {
-    egressMock.request.mockResolvedValue({ statusCode: 401, resume: vi.fn() });
+    egressMock.request.mockResolvedValue({ statusCode: 401, destroy: vi.fn() });
     await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
       ok: false,
       outcome: "FAILURE",
@@ -424,7 +433,7 @@ describe("OpenAI and Anthropic credential tests", () => {
     "probes OpenAI's Bearer-authenticated model list for base %s",
     async (baseUrl) => {
       await arrange("openai", baseUrl, "BEARER");
-      egressMock.request.mockResolvedValue({ statusCode: 200, resume: vi.fn() });
+      egressMock.request.mockResolvedValue({ statusCode: 200, destroy: vi.fn() });
       await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
         ok: true,
         outcome: "SUCCESS",
@@ -446,7 +455,7 @@ describe("OpenAI and Anthropic credential tests", () => {
 
   it("probes Anthropic's model list with x-api-key and anthropic-version", async () => {
     await arrange("anthropic", "https://api.anthropic.com", "API_KEY");
-    egressMock.request.mockResolvedValue({ statusCode: 200, resume: vi.fn() });
+    egressMock.request.mockResolvedValue({ statusCode: 200, destroy: vi.fn() });
     await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toMatchObject({
       ok: true,
     });
@@ -473,7 +482,7 @@ describe("OpenAI and Anthropic credential tests", () => {
     "classifies status %s as %s/%s without leaking the key",
     async (status, outcome, reason) => {
       await arrange("anthropic", "https://api.anthropic.com", "API_KEY");
-      egressMock.request.mockResolvedValue({ statusCode: status, resume: vi.fn() });
+      egressMock.request.mockResolvedValue({ statusCode: status, destroy: vi.fn() });
       await expect(client().testCredential({ providerAccountId: "acct" })).resolves.toEqual({
         ok: false,
         outcome,

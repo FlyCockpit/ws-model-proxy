@@ -24,6 +24,7 @@ const HKDF_INFO_LABEL_V2: &[u8] = b"wsmp-term-v2";
 const BROADCAST_LABEL: &[u8] = b"wsmp-term-v2-out";
 const APPROVAL_LABEL_V2: &[u8] = b"wsmp-term-approve-v2";
 const CLI_IDENTITY_LABEL: &[u8] = b"wsmp-term-cli-id-v1";
+const HELLO_IDENTITY_LABEL: &[u8] = b"wsmp-relay-hello-v1";
 pub const PLAINTEXT_OUTPUT_KEY: u8 = 0x03;
 /// Browser -> CLI: turn output review on or off for a supervised command.
 pub const PLAINTEXT_REVIEW_TOGGLE: u8 = 0x04;
@@ -790,6 +791,49 @@ pub fn verify_cli_identity(
     verifying.verify(&statement, &signature).is_ok()
 }
 
+/// `lp16("wsmp-relay-hello-v1") ‖ nonce(16) ‖ lp16(cli_slug) ‖ lp16(origin)`.
+pub fn hello_identity_statement(nonce: &[u8; 16], cli_slug: &str, origin: &str) -> Result<Vec<u8>> {
+    let mut statement = Vec::with_capacity(
+        2 + HELLO_IDENTITY_LABEL.len() + nonce.len() + 2 + cli_slug.len() + 2 + origin.len(),
+    );
+    push_length_prefixed(&mut statement, HELLO_IDENTITY_LABEL)?;
+    statement.extend_from_slice(nonce);
+    push_length_prefixed(&mut statement, cli_slug.as_bytes())?;
+    push_length_prefixed(&mut statement, origin.as_bytes())?;
+    Ok(statement)
+}
+
+/// A 64-byte IEEE P1363 (`r ‖ s`) signature over the hello identity statement.
+pub fn sign_hello_identity(
+    signing_key: &SigningKey,
+    nonce: &[u8; 16],
+    cli_slug: &str,
+    origin: &str,
+) -> Result<Vec<u8>> {
+    let statement = hello_identity_statement(nonce, cli_slug, origin)?;
+    let signature: Signature = signing_key.sign(&statement);
+    Ok(signature.to_bytes().to_vec())
+}
+
+pub fn verify_hello_identity(
+    identity_public_raw: &[u8; 65],
+    signature: &[u8],
+    nonce: &[u8; 16],
+    cli_slug: &str,
+    origin: &str,
+) -> bool {
+    let Ok(statement) = hello_identity_statement(nonce, cli_slug, origin) else {
+        return false;
+    };
+    let Ok(verifying) = VerifyingKey::from_sec1_bytes(identity_public_raw) else {
+        return false;
+    };
+    let Ok(signature) = Signature::from_slice(signature) else {
+        return false;
+    };
+    verifying.verify(&statement, &signature).is_ok()
+}
+
 /// Base32 (RFC 4648, no padding) of the first 20 bytes of SHA-256(identity
 /// public key), in space-separated groups of 4. 20 bytes give 32 characters.
 pub fn identity_fingerprint(identity_public_raw: &[u8; 65]) -> String {
@@ -824,6 +868,47 @@ fn copy_exact<const N: usize>(bytes: &[u8], what: &str) -> Result<[u8; N]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hello_identity_statement_mixes_origin_and_matches_the_server_vector() {
+        let nonce = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let statement = hello_identity_statement(&nonce, "desktop", "https://proxy.example.com")
+            .expect("statement");
+        // lp16("wsmp-relay-hello-v1") ‖ nonce(16) ‖ lp16("desktop") ‖ lp16(origin)
+        assert_eq!(
+            statement,
+            [
+                0x00, 0x13, b'w', b's', b'm', b'p', b'-', b'r', b'e', b'l', b'a', b'y', b'-', b'h',
+                b'e', b'l', b'l', b'o', b'-', b'v', b'1', 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+                0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x00, 0x07, b'd', b'e', b's',
+                b'k', b't', b'o', b'p', 0x00, 0x19, b'h', b't', b't', b'p', b's', b':', b'/', b'/',
+                b'p', b'r', b'o', b'x', b'y', b'.', b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.',
+                b'c', b'o', b'm',
+            ]
+        );
+        let signing = SigningKey::try_generate().expect("identity");
+        let public = identity_public_raw(&signing).expect("public");
+        let signature =
+            sign_hello_identity(&signing, &nonce, "desktop", "https://proxy.example.com")
+                .expect("sign");
+        assert!(verify_hello_identity(
+            &public,
+            &signature,
+            &nonce,
+            "desktop",
+            "https://proxy.example.com",
+        ));
+        assert!(!verify_hello_identity(
+            &public,
+            &signature,
+            &nonce,
+            "desktop",
+            "http://localhost:3000",
+        ));
+    }
 
     #[test]
     fn review_plaintexts_round_trip_and_reject_bad_shapes() {

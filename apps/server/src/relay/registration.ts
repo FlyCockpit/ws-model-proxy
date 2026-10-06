@@ -41,11 +41,23 @@ import {
   coarseCapabilitiesFromOpenAi,
   resolveEffectiveCapabilityMetadata,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
+import {
+  CLI_TOKEN_IDENTITY_MISMATCH_MESSAGE,
+  DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE,
+  DEVICE_CREDENTIAL_UNBOUND_MESSAGE,
+} from "@ws-model-proxy/config/cli-identity-key";
 import { directModelId, validateForwarderSlug } from "@ws-model-proxy/config/forwarder-identifiers";
 import prisma from "@ws-model-proxy/db";
 import { acquireFences, fenceOwners, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
+import { z } from "zod";
+import { MANAGED_IDENTITY_REFUSED } from "../deployments/managed-identity.js";
 import type { EndpointInventory, OpenAiCompatibleCapabilities } from "./protocol.js";
+
+/** The part of a stored recipe revision that names a managed endpoint's models. */
+const storedManagedSpec = z.object({
+  variants: z.array(z.looseObject({ key: z.string(), models: z.array(z.string()) })),
+});
 
 type JsonValue = string | number | boolean | { [key: string]: JsonValue } | JsonValue[];
 
@@ -61,7 +73,7 @@ export type DesiredModelCapability = {
 export class RelayRegistrationError extends Error {
   constructor(
     message: string,
-    public readonly code: "access_denied" | "protocol_error",
+    public readonly code: "access_denied" | "protocol_error" | "identity_mismatch",
   ) {
     super(message);
     this.name = "RelayRegistrationError";
@@ -133,6 +145,7 @@ export function inventoryDigestFor(endpoints: EndpointInventory[]): string {
 }
 
 export type ReportedRelayFeatures = {
+  reportedDeployments?: boolean;
   cliVersion: string | null;
   relayProtocolVersion: string;
   reportedHumanTerminal: boolean | null;
@@ -156,6 +169,7 @@ export async function persistRelayRegistration({
   endpointTargeting,
   connection = false,
   reported,
+  identityPublicKey,
   now = new Date(),
 }: {
   identity: CliWebsocketIdentity;
@@ -164,6 +178,12 @@ export async function persistRelayRegistration({
   inventoryConfirmed: boolean;
   endpointTargeting: boolean;
   connection?: boolean;
+  /**
+   * Hello only: the CLI identity public key the hello presented. Required for
+   * a device-credential hello (omitting it is a mismatch). Inventory updates
+   * omit it; that socket was already admitted.
+   */
+  identityPublicKey?: string;
   /** Hello only. inventory.update must omit this so reported columns stay put. */
   reported?: ReportedRelayFeatures;
   now?: Date;
@@ -171,6 +191,8 @@ export async function persistRelayRegistration({
   cliDeviceId: string;
   userId: string;
   allowHumanTerminal: boolean;
+  /** Dashboard deployments grant (operator terminals need it). */
+  allowDeployments: boolean;
   mcpCommandMode: McpCommandModeName;
   mcpFileRead: boolean;
   /** Fence for the connection this registration accepted; see the schema. */
@@ -198,6 +220,7 @@ export async function persistRelayRegistration({
           reportedTerminalApproval: reported.reportedTerminalApproval,
           reportedTerminalSupported: reported.reportedTerminalSupported,
           reportedAllowFileToolsAsRoot: reported.reportedAllowFileToolsAsRoot,
+          reportedDeployments: reported.reportedDeployments ?? false,
           reportedHostname: reported.reportedHostname,
           featuresReportedAt: reported.featuresReportedAt,
           // An accepted hello ends any "CLI upgrade required" state.
@@ -372,6 +395,7 @@ export async function persistRelayRegistration({
               inventoryAcknowledgedAt: true,
               inventoryConfirmed: true,
               allowHumanTerminal: true,
+              allowDeployments: true,
               mcpCommandMode: true,
               mcpFileRead: true,
               connectionGeneration: true,
@@ -381,13 +405,20 @@ export async function persistRelayRegistration({
           // After the device upsert, which holds the device row lock that a
           // re-login's revoking transaction and a device delete also take. A
           // device credential only ever registers as its minted device; an
-          // unbound CLI token is bound here. Any refusal rolls back the
-          // upsert, including a device row it just created.
+          // unbound CLI token is bound here (device + identity key). Any
+          // refusal rolls back the upsert, including a device row it just
+          // created — a mismatched identity key therefore does not take the
+          // device from the session that already holds it.
+          // Hello always presents the identity key. An omitted key is not a
+          // match for a device credential. Inventory updates pass null: that
+          // socket was already admitted.
+          const presentedIdentityPublicKey = connection ? (identityPublicKey ?? "") : null;
           const credentialCheck = await checkCliCredentialForDevice(
             tx,
             identity,
             cliDevice.id,
             now,
+            presentedIdentityPublicKey,
           );
           if (credentialCheck === "revoked") {
             throw new RelayRegistrationError("Credential was revoked.", "access_denied");
@@ -398,12 +429,42 @@ export async function persistRelayRegistration({
               "access_denied",
             );
           }
+          if (credentialCheck === "identityMismatch") {
+            throw new RelayRegistrationError(
+              identity.kind === "cliToken"
+                ? CLI_TOKEN_IDENTITY_MISMATCH_MESSAGE
+                : DEVICE_CREDENTIAL_IDENTITY_MISMATCH_MESSAGE,
+              "identity_mismatch",
+            );
+          }
+          if (credentialCheck === "identityUnbound") {
+            throw new RelayRegistrationError(
+              DEVICE_CREDENTIAL_UNBOUND_MESSAGE,
+              "identity_mismatch",
+            );
+          }
+          if (identity.kind === "deviceCredential") {
+            await tx.cliDeviceCredential.updateMany({
+              where: { id: identity.id, lastRefusedAt: { not: null } },
+              data: { lastRefusedAt: null, lastRefusedReason: null },
+            });
+          } else {
+            await tx.cliToken.updateMany({
+              where: { id: identity.id, lastRefusedAt: { not: null } },
+              data: { lastRefusedAt: null, lastRefusedReason: null },
+            });
+          }
 
           const inventoryChanged = cliDevice.inventoryDigest !== inventoryDigest;
           const refreshedDiscoveredModelIds: string[] = [];
           const declaredContextByCapacityId = new Map<string, number>();
           const upsertedTargetIds = new Set<string>();
           const publishedEndpointSlugs = endpoints.map((endpoint) => endpoint.slug);
+          // Managed endpoints that fail their identity check are left out on
+          // their own (unpublished) instead of refusing the whole inventory:
+          // a refused hello would keep the device offline, and a stop can only
+          // be dispatched to a connected device.
+          const refusedManagedSlugs = new Set<string>();
           const capacityWork: Array<{
             targetId: string;
             endpointId: string;
@@ -423,6 +484,41 @@ export async function persistRelayRegistration({
           }> = [];
 
           for (const endpoint of endpoints) {
+            const managed = endpoint.deploymentInstanceId
+              ? await tx.deploymentInstance.findFirst({
+                  where: {
+                    id: endpoint.deploymentInstanceId,
+                    userId: identity.userId,
+                    endpointSlug: endpoint.slug,
+                    Nodes: { some: { cliDeviceId: cliDevice.id, rank: 0, claimHeld: true } },
+                  },
+                  include: { Revision: true },
+                })
+              : null;
+            if (
+              (endpoint.slug.startsWith("inst-") && !managed) ||
+              (endpoint.deploymentInstanceId && !managed)
+            ) {
+              refusedManagedSlugs.add(endpoint.slug);
+              continue;
+            }
+            const managedPublished =
+              !managed ||
+              (managed.desiredState === "RUNNING" && managed.observedState === "RUNNING");
+            if (managed) {
+              // Compared in the relay's normalized (trimmed) form. Only the
+              // variant's models are read, so a revision stored before model
+              // ids were validated still matches its endpoint.
+              const spec = storedManagedSpec.safeParse(managed.Revision.spec);
+              const variant = spec.success
+                ? spec.data.variants.find((v) => v.key === managed.variantKey)
+                : undefined;
+              const models = new Set(variant?.models.map((model) => model.trim()));
+              if (!variant || endpoint.models.some((m) => !models.has(m.upstreamModelId))) {
+                refusedManagedSlugs.add(endpoint.slug);
+                continue;
+              }
+            }
             const coarseCapabilities = endpoint.defaultCapabilities
               ? coarseCapabilitiesFromOpenAi(endpoint.defaultCapabilities)
               : [];
@@ -451,7 +547,8 @@ export async function persistRelayRegistration({
                 probeSuggestions: jsonOrUndefined(endpoint.probeSuggestions),
                 lastSeenAt: now,
                 lastHealthCheckAt: now,
-                published: true,
+                published: managedPublished,
+                ...(managed ? { deploymentInstanceId: managed.id } : {}),
                 unpublishedAt: null,
                 ...(existingEndpoint?.status === endpointStatus(endpoint.status)
                   ? {}
@@ -472,7 +569,8 @@ export async function persistRelayRegistration({
                 probeSuggestions: jsonOrUndefined(endpoint.probeSuggestions),
                 lastSeenAt: now,
                 lastHealthCheckAt: now,
-                published: true,
+                published: managedPublished,
+                ...(managed ? { deploymentInstanceId: managed.id } : {}),
                 unpublishedAt: null,
                 statusChangedAt: now,
               },
@@ -857,8 +955,27 @@ export async function persistRelayRegistration({
           }
 
           await tx.endpoint.updateMany({
-            where: { cliDeviceId: cliDevice.id, slug: { notIn: publishedEndpointSlugs } },
+            where: {
+              cliDeviceId: cliDevice.id,
+              slug: {
+                notIn: publishedEndpointSlugs.filter((slug) => !refusedManagedSlugs.has(slug)),
+              },
+            },
             data: { published: false, unpublishedAt: now },
+          });
+          // Marked so a passing health check cannot republish what this
+          // inventory refused; cleared once the device reports it correctly.
+          await tx.endpoint.updateMany({
+            where: { cliDeviceId: cliDevice.id, slug: { in: [...refusedManagedSlugs] } },
+            data: { failureReasonCode: MANAGED_IDENTITY_REFUSED },
+          });
+          await tx.endpoint.updateMany({
+            where: {
+              cliDeviceId: cliDevice.id,
+              slug: { in: publishedEndpointSlugs.filter((slug) => !refusedManagedSlugs.has(slug)) },
+              failureReasonCode: MANAGED_IDENTITY_REFUSED,
+            },
+            data: { failureReasonCode: null },
           });
           await tx.discoveredModel.updateMany({
             where: { Endpoint: { cliDeviceId: cliDevice.id, published: false } },
@@ -915,6 +1032,7 @@ export async function persistRelayRegistration({
             cliDeviceId: cliDevice.id,
             userId: cliDevice.userId,
             allowHumanTerminal: cliDevice.allowHumanTerminal === true,
+            allowDeployments: cliDevice.allowDeployments === true,
             mcpCommandMode: mcpCommandModeFromDb(cliDevice.mcpCommandMode),
             mcpFileRead: cliDevice.mcpFileRead === true,
             connectionGeneration: cliDevice.connectionGeneration,

@@ -23,9 +23,10 @@
  * `inputSchema`. Runtime validation is unchanged: the SDK only applies the
  * loose overlay/size-bound validator, and the oRPC procedure remains the
  * SINGLE validation authority for everything else. Its BAD_REQUEST issues
- * reach the client as a sanitized `{ path, code, message }` list
- * (input-errors.ts) — never input values — so an agent can name the field it
- * got wrong.
+ * reach the client as a sanitized `{ path, code, message }` list plus
+ * `fields` (input-errors.ts) — never input values — so an agent can name the
+ * field it got wrong. A schema-valid rejection carries `data.fields` the
+ * same way.
  */
 
 import type { StandardSchemaWithJSON } from "@modelcontextprotocol/server";
@@ -353,7 +354,7 @@ const DATA_COLLECTION_INPUTS = {
 
 /** Cost statement carried by the fallback write tool's description (issue #67). */
 export const POOL_FALLBACK_COST_NOTICE =
-  "COST: fallbackEnabled=true lets requests for owner/pool:external be sent to the pool's external provider members, billed to YOUR provider accounts (real money, and request data leaves this deployment). fallbackForGrantees=true makes YOU pay for external use by every user the pool is shared with. externalAfterWaitMs sets how long an :external request waits for local capacity before paying for a provider: lower values spend more. Turning a switch off never costs anything. Every change is recorded as a POOL_FALLBACK_UPDATED provider audit event. PRECONDITIONS: turning fallbackEnabled on needs provider egress enabled on this deployment (otherwise the call fails with Not found) and, on every external member, an active LIMITED or UNLIMITED per-attempt concurrency policy with an activation audit trail; a new externalAfterWaitMs cannot exceed the pool's local wait budget (these two fail with a plain Invalid input error that has no field list, because the input itself is valid).";
+  "COST: fallbackEnabled=true lets requests for owner/pool:external be sent to the pool's external provider members, billed to YOUR provider accounts (real money, and request data leaves this deployment). fallbackForGrantees=true makes YOU pay for external use by every user the pool is shared with. externalAfterWaitMs sets how long an :external request waits for local capacity before paying for a provider: lower values spend more. Turning a switch off never costs anything. Every change is recorded as a POOL_FALLBACK_UPDATED provider audit event. PRECONDITIONS: turning fallbackEnabled on needs provider egress enabled on this deployment (otherwise the call fails with Not found) and, on every external member, an active LIMITED or UNLIMITED per-attempt concurrency policy with an activation audit trail; a new externalAfterWaitMs cannot exceed the pool's local wait budget (these fail with BAD_REQUEST naming fallbackEnabled or externalAfterWaitMs, because the input itself is schema-valid).";
 
 /**
  * Cost statement for the general pool tools, which still accept
@@ -362,6 +363,14 @@ export const POOL_FALLBACK_COST_NOTICE =
  */
 export const POOL_EXTERNAL_WAIT_COST_NOTICE =
   "fallbackEnabled and fallbackForGrantees are rejected here: use forwarder_pool_fallback_update. COST: externalAfterWaitMs sets how long an owner/pool:external request waits for local capacity before it is sent to a paid external provider billed to YOUR provider accounts: lower values spend more. Changes are recorded as POOL_FALLBACK_UPDATED provider audit events.";
+
+/** Cost statement for the per-token `:external` wait (issue #181). */
+export const TOKEN_EXTERNAL_WAIT_COST_NOTICE =
+  "COST: externalAfterWaitMs is how long this token's :external requests wait for local capacity before they may be sent to a paid external provider. Lower values spend more. Null uses each pool's setting. Pool externalAfterWaitMs is an owner floor: callers may only lengthen, up to the pool's local capacity wait budget. A request may also send x-wsmp-external-after-wait-ms; that override cannot go below the pool floor or past the local wait budget. Neither owners nor grantees can shorten requests below the pool floor. The stored value is 0..600000; each request still applies the floor and budget for that pool. Every change is recorded as a TOKEN_EXTERNAL_WAIT_UPDATED provider audit event. MCP diagnostics cannot use :external.";
+
+/** Cost statement for per-grantee owner-paid `:external` spend caps (#182). */
+export const POOL_GRANT_SPEND_CAP_COST_NOTICE =
+  "COST: a POOL_GRANT spend cap (fallbackSpend on forwarder_pool_grant_update, keyed by pool + grantee) limits how much owner-paid :external usage this grantee can charge to YOUR provider accounts (real money). Exhausting the cap fails :external for that grantee with no remaining amount in the error; local members still serve. Clearing the cap (fallbackSpend=null) never costs anything. PRECONDITIONS: you must own the pool and the grant; the cap is SPEND only (UTC_DAY or UTC_MONTH); a revoked and re-created grant for the same person keeps this cap.";
 
 // ---------------------------------------------------------------------------
 // Procedure invocation helper
@@ -429,7 +438,7 @@ const PROVIDER_EGRESS_FEATURE = "WMP_PUBLIC_PROVIDER_EGRESS_ENABLED";
 // ---------------------------------------------------------------------------
 
 /**
- * One node file tool (relay 2.8, #103) as an authored spec; `buildDescriptor`
+ * One node file tool (relay 2.9, #103) as an authored spec; `buildDescriptor`
  * generates its `inputSchema` (#117) from `coreShape`. Read-class tools are
  * scope `read`, pure, unconfirmed; write-class tools are scope `write`,
  * external, `RUN` (`DELETE` for delete). All nine are extracted cores that go
@@ -473,6 +482,66 @@ function fileToolSpec(name: FileToolName): McpToolSpec {
 
 const READ_TOOLS: readonly McpToolSpec[] = [
   {
+    name: "deployment_configs_list",
+    target: "deployments.listConfigs",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.listConfigs),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "deployment_config_get",
+    target: "deployments.getConfig",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.getConfig),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "deployment_instances_list",
+    target: "deployments.listInstances",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.listInstances),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "deployment_instance_get",
+    target: "deployments.getInstance",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.getInstance),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "deployment_plan_status",
+    target: "deployments.planStatus",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.planStatus),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "inference_contributions_list",
+    target: "inferenceContributions.list",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.inferenceContributions.list),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
     name: "app_config_get",
     target: "appConfig",
     scope: "read",
@@ -492,13 +561,25 @@ const READ_TOOLS: readonly McpToolSpec[] = [
   },
   {
     name: "forwarder_cli_devices_list",
-    target: "forwarderManagement.listCliDevices",
+    target: "forwarderManagement.listCliDeviceSummaries",
     scope: "read",
     confirmation: null,
     classification: "pure",
     descriptionNote:
-      "features.commands.effectiveMode is what an agent can run now: the stricter of the dashboard grant (mode) and the CLI's own wsmp config (deviceMode). features.commands.refusals says, per tool, what the relay would refuse right now, in its own check order: refusals.headless (forwarder_cli_command_run) and refusals.supervised (forwarder_cli_supervised_command_start) are null when admitted, else grant_disabled (dashboard grant), grant_supervised_only or cli_supervised_only (the relay's supervised_only: headless needs unsupervised, and the dashboard grant, or else wsmp config, is only supervised), offline (CLI not connected or too old), feature_disabled (wsmp config set-mcp-commands), or unsupported (no terminal support, supervised only). available is true when either tool would be admitted. A command token also needs mcp:write and allowCliCommands. fileTools follows that effective mode: unsupervised admits read/write; supervised/off admit reads only with the dashboard mcpFileRead grant, live CLI mcpFileRead and fileRootsConfigured. A read-only PAT needs allowCliFileRead and mcp:read for the four read tools; write tools retain allowCliCommands and mcp:write. Reported fields reportedMcpFileRead/reportedFileRoots describe CLI configuration; missing live features never authorize reads.",
-    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.listCliDevices),
+      "Summaries only: id, slug, status, grants, labels, endpoint slugs and probe status (status, reportedStatus, failureReasonCode). No models[] and no capability JSON. Returns { items, nextCursor }; limit defaults to 20 and max is 50. Pass nextCursor for the next page. The full device, including models and the node snapshot, is forwarder_cli_device_get. labels are human-only placement tags; a selector matches a node that has all of them (no expressions or negation). features.commands.effectiveMode is what an agent can run now: the stricter of the dashboard grant (mode) and the CLI's own wsmp config (deviceMode). features.commands.refusals says, per tool, what the relay would refuse right now, in its own check order: refusals.headless (forwarder_cli_command_run) and refusals.supervised (forwarder_cli_supervised_command_start) are null when admitted, else grant_disabled (dashboard grant), grant_supervised_only or cli_supervised_only (the relay's supervised_only: headless needs unsupervised, and the dashboard grant, or else wsmp config, is only supervised), offline (CLI not connected or too old), feature_disabled (wsmp config set-mcp-commands), or unsupported (no terminal support, supervised only). available is true when either tool would be admitted. A command token also needs mcp:write and allowCliCommands. fileTools follows that effective mode: unsupervised admits read/write; supervised/off admit reads only with the dashboard mcpFileRead grant, live CLI mcpFileRead and fileRootsConfigured. A read-only PAT needs allowCliFileRead and mcp:read for the four read tools; write tools retain allowCliCommands and mcp:write. Reported fields reportedMcpFileRead/reportedFileRoots describe CLI configuration; missing live features never authorize reads.",
+    invokeProcedure: procedureInvoker(
+      (client) => client.forwarderManagement.listCliDeviceSummaries,
+    ),
+  },
+  {
+    name: "forwarder_cli_device_get",
+    target: "forwarderManagement.getCliDevice",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    descriptionNote:
+      "Full CLI device for cliDeviceId, including endpoints, models, capability JSON, and a node snapshot (kind, GPUs, live memory, labels, usable budgets, health warnings). Labels and usable budgets are human-only writes; this tool is read-only. List summaries with forwarder_cli_devices_list.",
+    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getCliDevice),
   },
   {
     name: "forwarder_cli_activity_list",
@@ -515,12 +596,14 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     scope: "read",
     confirmation: null,
     classification: "pure",
+    descriptionNote:
+      "Read-only node telemetry for cliDeviceId: node.info, the freshest node.metrics (live or stored), endpoint.load, a node snapshot (kind, GPUs, live memory, labels, usable budgets, health warnings), last-hour minuteHistory min/avg/max gauges, 24h (history24h) and 7d (history7d) sparkline series from the 7-day minutes, and rule-addressable series. Labels and usable budgets are human-only dashboard writes; this tool never changes them. Health warnings are informational and never preflight gates.",
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getCliDeviceMetrics),
   },
   {
     name: "forwarder_pool_routing_rules_get",
     descriptionNote:
-      "Read pool rules, member live engine load, and engineLoad.kvBudget (reported/effective tokens, K source, eviction cut, floor, observation/expiry times and active state). engineLoad also reports customMode (observe/enforce), loadSource, signals, enforced, and live.kvOccupancy (display only; never FULL or eviction evidence). Custom FULL starts observe-only.",
+      "Read pool rules, member live engine load, and engineLoad.kvBudget (reportedTokens, effectiveTokens for warm protection, placementTokens for residency, K source of the reported budget, eviction cut, floor, observation/expiry times and active state). engineLoad also reports customMode (observe/enforce), loadSource, signals, enforced, and live.kvOccupancy (display only; never FULL or eviction evidence). Custom FULL starts observe-only.",
     target: "forwarderManagement.getPoolRoutingRules",
     scope: "read",
     confirmation: null,
@@ -539,11 +622,25 @@ const READ_TOOLS: readonly McpToolSpec[] = [
   },
   {
     name: "forwarder_model_pools_list",
-    target: "forwarderManagement.listModelPools",
+    target: "forwarderManagement.listModelPoolSummaries",
     scope: "read",
     confirmation: null,
     classification: "pure",
-    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.listModelPools),
+    descriptionNote:
+      "Summaries only: pool id, slug, name, grants, and member endpoint slugs with routing and health status. No member models and no capability JSON. Returns { items, nextCursor }; limit defaults to 20 and max is 50. Pass nextCursor for the next page. The full pool is forwarder_model_pool_get.",
+    invokeProcedure: procedureInvoker(
+      (client) => client.forwarderManagement.listModelPoolSummaries,
+    ),
+  },
+  {
+    name: "forwarder_model_pool_get",
+    target: "forwarderManagement.getModelPool",
+    scope: "read",
+    confirmation: null,
+    classification: "pure",
+    descriptionNote:
+      "Full model pool for poolId, including members, models, and capability JSON. List summaries with forwarder_model_pools_list.",
+    invokeProcedure: procedureInvoker((client) => client.forwarderManagement.getModelPool),
   },
   {
     name: "forwarder_pool_fallback_get",
@@ -753,7 +850,7 @@ const READ_TOOLS: readonly McpToolSpec[] = [
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.overview.health),
   },
-  // --- node file tools, read class (relay 2.8; PAT-only) ---
+  // --- node file tools, read class (relay 2.9; PAT-only) ---
   fileToolSpec("forwarder_cli_file_read"),
   fileToolSpec("forwarder_cli_file_stat"),
   fileToolSpec("forwarder_cli_dir_list"),
@@ -777,6 +874,66 @@ const READ_TOOLS: readonly McpToolSpec[] = [
 const CHAT_MESSAGES_SCHEMA = z.array(z.unknown());
 
 const WRITE_TOOLS: readonly McpToolSpec[] = [
+  {
+    name: "deployment_config_create",
+    target: "deployments.createConfig",
+    scope: "write",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.createConfig),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "deployment_config_update",
+    target: "deployments.updateConfig",
+    scope: "write",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.updateConfig),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "deployment_plan_start",
+    target: "deployments.planStart",
+    scope: "write",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.planStart),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "deployment_plan_stop",
+    target: "deployments.planStop",
+    scope: "write",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.deployments.planStop),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "deployment_plan_apply",
+    target: "deployments.applyPlan",
+    scope: "write",
+    confirmation: "RUN",
+    classification: "external",
+    invokeProcedure: procedureInvoker((client) => client.deployments.applyPlan),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
+  {
+    name: "inference_contribution_revoke",
+    target: "inferenceContributions.revoke",
+    scope: "write",
+    confirmation: null,
+    classification: "pure",
+    invokeProcedure: procedureInvoker((client) => client.inferenceContributions.revoke),
+    descriptionNote:
+      "Durable owner-scoped operation. Agent execution follows live node grants and protected-group policy. Human consent operations are dashboard-only.",
+  },
   // --- forwarder management (writes) ---
   {
     name: "forwarder_guarded_pool_create",
@@ -869,7 +1026,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     // A `full` rule can send `:external` callers to paid external providers.
     classification: "cost",
     descriptionNote:
-      "Replaces the pool's whole rule list: [{metric, labels?, aggregate: 'max', op: '>'|'>='|'<'|'<=', threshold, effect: 'full'|'avoid'}]. Discover metric names with forwarder_device_metrics_get or forwarder_pool_routing_rules_get.",
+      "Replaces the pool's whole rule list: [{metric, labels?, aggregate: 'max'|'min'|'avg', op: '>'|'>='|'<'|'<=', threshold, effect: 'full'|'avoid', memberId?, excludeMemberId?}]. memberId limits the rule to that pool member; excludeMemberId applies it to every other member; do not set both. Discover metric names with forwarder_device_metrics_get or forwarder_pool_routing_rules_get.",
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.setPoolRoutingRules),
   },
   {
@@ -1051,6 +1208,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     scope: "write",
     confirmation: null,
     classification: "pure",
+    descriptionNote: POOL_GRANT_SPEND_CAP_COST_NOTICE,
     invokeProcedure: procedureInvoker((client) => client.forwarderManagement.updatePoolGrant),
   },
   {
@@ -1281,7 +1439,16 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     classification: "pure",
     invokeProcedure: procedureInvoker((client) => client.capacityManagement.updateMemberPolicy),
   },
-  // --- token revocation (writes) ---
+  // --- token revocation and caller :external wait (writes) ---
+  {
+    name: "model_api_token_external_wait_update",
+    target: "modelApiTokens.updateExternalWait",
+    scope: "write",
+    confirmation: null,
+    classification: "pure",
+    descriptionNote: TOKEN_EXTERNAL_WAIT_COST_NOTICE,
+    invokeProcedure: procedureInvoker((client) => client.modelApiTokens.updateExternalWait),
+  },
   {
     name: "model_api_token_revoke",
     target: "modelApiTokens.revoke",
@@ -1323,7 +1490,10 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     scope: "write",
     confirmation: "RUN",
     classification: "cost",
-    coreShape: { model: z.string().min(1), messages: CHAT_MESSAGES_SCHEMA },
+    coreShape: {
+      model: z.string().min(1),
+      messages: CHAT_MESSAGES_SCHEMA,
+    },
     invokeCore: (input, deps) =>
       runChatCompletionDiagnostic({
         userId: deps.userId,
@@ -1377,7 +1547,7 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
     inputAdapter: adaptCliCommandResultInput,
     invokeCore: (input, deps) => runForwarderCliCommandResult(input, deps),
   },
-  // --- node file tools, write class (relay 2.8; PAT-only) ---
+  // --- node file tools, write class (relay 2.9; PAT-only) ---
   fileToolSpec("forwarder_cli_file_edit"),
   fileToolSpec("forwarder_cli_file_write"),
   fileToolSpec("forwarder_cli_file_rename"),
@@ -1386,8 +1556,8 @@ const WRITE_TOOLS: readonly McpToolSpec[] = [
 ];
 
 /**
- * The checked catalog: exactly 35 read tools and 60 write tools
- * (81 procedure-backed + 14 extracted cores: 2 diagnostics, 3 CLI commands
+ * The checked catalog: exactly 43 read tools and 70 write tools
+ * (99 procedure-backed + 14 extracted cores: 2 diagnostics, 3 CLI commands
  * and 9 node file tools (4 read, 5 write)).
  */
 export const MCP_TOOL_MANIFEST: readonly McpToolDescriptor[] = [...READ_TOOLS, ...WRITE_TOOLS].map(
@@ -1408,6 +1578,23 @@ export interface McpToolExclusion {
 }
 
 export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
+  ...[
+    "deployments.confirmPlan",
+    "deployments.pendingPlans",
+    "deployments.setNodeGrant",
+    "deployments.setAgentsMayPreempt",
+    "inferenceContributions.accept",
+    // Offering lends this user's machine to another owner's pool: consent, not an agent task.
+    "inferenceContributions.offer",
+    "cliCredentials.resetTokenIdentity",
+  ].map((target) => ({
+    target,
+    reason: "Human-only consent or credential identity management; never an agent tool.",
+  })),
+  {
+    target: "deployments.deleteConfig",
+    reason: "Human-only recipe deletion; agents may edit recipes but never delete them.",
+  },
   {
     target: "auth.verifyEmailTransport",
     reason: "Auth-router surface; not a model-proxy operation.",
@@ -1569,6 +1756,26 @@ export const MCP_TOOL_EXCLUSIONS: readonly McpToolExclusion[] = [
     target: "forwarderManagement.setCliDeviceFeatureGrants",
     reason:
       "Human-only device grants including read-only file consent; requires the CLI read switch and configured roots reports.",
+  },
+  {
+    target: "forwarderManagement.setCliDeviceLabels",
+    reason:
+      "Human-only node placement labels. Agents read labels on forwarder_cli_devices_list, forwarder_cli_device_get, and forwarder_device_metrics_get.",
+  },
+  {
+    target: "forwarderManagement.setCliDeviceUsableBudgets",
+    reason:
+      "Human-only usable memory/RAM/VRAM budgets. Agents read the effective budgets on forwarder_cli_device_get and forwarder_device_metrics_get.",
+  },
+  {
+    target: "forwarderManagement.listCliDevices",
+    reason:
+      "Dashboard inventory inlines models and capability JSON. Agents use forwarder_cli_devices_list and forwarder_cli_device_get.",
+  },
+  {
+    target: "forwarderManagement.listModelPools",
+    reason:
+      "Dashboard inventory inlines members and models. Agents use forwarder_model_pools_list and forwarder_model_pool_get.",
   },
   {
     target: "supervisedCommands.pending",

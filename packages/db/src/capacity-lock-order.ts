@@ -15,7 +15,7 @@
  *   `model_pool`, `pool_member`, `pool_grant`, `model_api_token`,
  *   `model_api_token_allowlist_entry`, `provider_account`, `provider_model`,
  *   `provider_credential`, `provider_budget_policy`, `provider_budget_rule`,
- *   `provider_pricing_version`, `pool_fallback_preference`.
+ *   `provider_pricing_version`, `pool_fallback_preference`, `pool_routing_rule`.
  * - Hot path, H-private ({@link HOT_PATH_TABLES}): admission and capacity
  *   runtime state, cache affinity, relay and provider history and accounting,
  *   response stickiness, usage rollups. They reference graph rows by plain id:
@@ -38,6 +38,20 @@
  *   state), each as a single-row statement or, for provider health, account
  *   row then model row (the provider order below). It reads the graph without
  *   row locks, after its fences, and never takes an `owner` fence. One
+ *   cache-specific nonblocking boundary: source record statement triggers
+ *   take a per-target residency advisory try-lock and bucket NOWAIT after
+ *   source rows. Contention aborts the transaction with 55P03; they never
+ *   wait for a bucket or acquire graph locks. The repair worker locks only
+ *   bucket/cursor rows and reads source/graph rows without locks; its upserts
+ *   and every statement/checkout have independent short server/pool bounds.
+ *   Physical reset first commits capacity cache-generation status in a bounded
+ *   standalone statement; only after that commit may it update buckets in
+ *   target order. No graph lock spans a projection/source lock. Registration's
+ *   connection generation also fences old physical warmth after reconnect.
+ *   Source publication checks current authority under the bucket lock. Source
+ *   userId is the pool principal; bucket userId is the physical target owner.
+ *   This projection lock is not an ordered, waiting capacity-domain fence.
+ *   One other
  *   documented exception: the relay disconnect
  *   (`disconnectCliDeviceAtGeneration`, packages/api/src/lib/model-pool-routing.ts)
  *   runs its per-member health statements (single-row, id order) inside a
@@ -75,6 +89,7 @@
  *      provider-budget-attempt:<attempt>    provider budget admission/settlement
  *   02 execution-target:<identity>          target discovery/creation (M)
  *   03 provider-budget-account:<user>:<account>
+ *      provider-budget-grant:<user>:<pool>:<grantee> per-grantee owner-paid spend cap
  *   04 provider-budget:<policy>
  *   05 provider-pricing:<user>:<model>
  *   06 capacity-policy:<target>             policy writers (M) and admission (H)
@@ -342,7 +357,10 @@ export const HOT_PATH_TABLES = [
   "capacity_lease",
   "capacity_runtime",
   "cache_affinity_record",
+  "cache_affinity_residency",
   "cache_affinity_node",
+  "cache_affinity_scope",
+  "cache_affinity_observer",
   "relay_request",
   "relay_execution_event",
   "relay_execution_attempt",
@@ -357,6 +375,7 @@ export const HOT_PATH_TABLES = [
   "pool_member_routing_verdict",
   "capacity_kv_eviction",
   "engine_load_rollup_minute",
+  "node_metrics_minute",
 ] as const;
 
 /** The graph (configuration) tables: fence triggers guard their writes. */
@@ -369,6 +388,15 @@ export const GRAPH_TABLES = [
   "inference_capacity",
   "model_pool",
   "pool_member",
+  "inference_contribution",
+  "deployment_config",
+  "deployment_config_revision",
+  "deployment_plan",
+  "deployment_run",
+  "deployment_instance",
+  "deployment_instance_node",
+  "deployment_step",
+  "pool_routing_rule",
   "pool_grant",
   "model_api_token",
   "model_api_token_allowlist_entry",
@@ -429,6 +457,8 @@ export const fences = {
   targetIdentity: (identity: string) => fence("02", "execution-target", identity),
   budgetAccount: (userId: string, providerAccountId: string) =>
     fence("03", "provider-budget-account", `${userId}:${providerAccountId}`),
+  budgetGrant: (userId: string, poolId: string, granteeUserId: string) =>
+    fence("03", "provider-budget-grant", `${userId}:${poolId}:${granteeUserId}`),
   budgetPolicy: (policyId: string) => fence("04", "provider-budget", policyId),
   pricing: (userId: string, providerModelId: string) =>
     fence("05", "provider-pricing", `${userId}:${providerModelId}`),
@@ -713,6 +743,21 @@ export async function resolveDeletionOwners(
   for (const grant of grants) {
     owners.add(grant.ownerUserId);
     owners.add(grant.granteeUserId);
+  }
+  const contributions = await tx.$queryRaw<
+    Array<{ contributorUserId: string; poolOwnerUserId: string }>
+  >`
+    SELECT DISTINCT contribution."contributorUserId", contribution."poolOwnerUserId"
+      FROM inference_contribution contribution
+      LEFT JOIN pool_member member ON member."inferenceContributionId" = contribution.id
+     WHERE contribution."poolId" = ANY(${parents.model_pool}::text[])
+        OR contribution."discoveredModelId" = ANY(${parents.discovered_model}::text[])
+        OR contribution."contributorUserId" = ANY(${parents.user}::text[])
+        OR contribution."poolOwnerUserId" = ANY(${parents.user}::text[])
+        OR member.id = ANY(${parents.pool_member}::text[])`;
+  for (const contribution of contributions) {
+    owners.add(contribution.contributorUserId);
+    owners.add(contribution.poolOwnerUserId);
   }
   const entryOwners = await tx.$queryRaw<Array<{ userId: string | null }>>`
     SELECT token."userId" FROM model_api_token_allowlist_entry entry

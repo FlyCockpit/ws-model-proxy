@@ -1,6 +1,7 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import type { ExternalRouteKind } from "@ws-model-proxy/api/lib/model-api-token-access";
+import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
 import { buttonVariants } from "@ws-model-proxy/ui/components/button";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
@@ -8,6 +9,7 @@ import { ArrowDown, ArrowRight, ArrowUp, Check, Circle, Minus } from "lucide-rea
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
+import { Help } from "@/components/help";
 import { InlineRetry } from "@/components/inline-retry";
 import { PoolFallbackBadge } from "@/components/pool-fallback-badge";
 import { SegmentedControl } from "@/components/segmented-control";
@@ -33,7 +35,7 @@ export const OVERVIEW_REFETCH_INTERVAL_MS = 30_000;
 type DashboardT = ReturnType<typeof useTranslation<"dashboard">>["t"];
 
 export function OverviewPage({ lang }: { lang: string }) {
-  const { t } = useTranslation("dashboard");
+  const { t, i18n } = useTranslation("dashboard");
   const [range, setRange] = useOverviewRange();
   const metrics = useQuery({
     ...orpc.overview.metrics.queryOptions({ input: { range } }),
@@ -44,6 +46,12 @@ export function OverviewPage({ lang }: { lang: string }) {
     ...orpc.overview.health.queryOptions(),
     refetchInterval: OVERVIEW_REFETCH_INTERVAL_MS,
   });
+  // Optional: the health tile is omitted when runtimes cannot be read.
+  const runtimes = useQuery({
+    ...orpc.capacityManagement.list.queryOptions(),
+    refetchInterval: OVERVIEW_REFETCH_INTERVAL_MS,
+    retry: false,
+  });
 
   return (
     <div className="flex min-w-0 flex-col gap-6">
@@ -53,6 +61,15 @@ export function OverviewPage({ lang }: { lang: string }) {
           <p className="mt-1 max-w-3xl text-sm text-muted-foreground">
             {t("overview.description")}
           </p>
+          {metrics.dataUpdatedAt ? (
+            <p className="mt-1 text-xs text-muted-foreground">
+              {t("overview.updatedAt", {
+                time: new Date(metrics.dataUpdatedAt).toLocaleTimeString(i18n.language, {
+                  timeStyle: "short",
+                }),
+              })}
+            </p>
+          ) : null}
         </div>
         <SegmentedControl
           value={range}
@@ -79,6 +96,7 @@ export function OverviewPage({ lang }: { lang: string }) {
           lang={lang}
           metrics={metrics.data}
           health={health.data}
+          runtimes={runtimes.data}
           healthPending={health.isPending}
           healthError={health.isError}
           onRetryHealth={() => void health.refetch()}
@@ -93,6 +111,7 @@ function OverviewContent({
   lang,
   metrics,
   health,
+  runtimes,
   healthPending,
   healthError,
   onRetryHealth,
@@ -101,12 +120,15 @@ function OverviewContent({
   lang: string;
   metrics: OverviewMetrics;
   health: OverviewHealth | undefined;
+  runtimes: OverviewRuntime[] | undefined;
   healthPending: boolean;
   healthError: boolean;
   onRetryHealth: () => void;
   t: DashboardT;
 }) {
-  const needsSetup = health !== undefined && (health.clis.total === 0 || !metrics.setup.hasPools);
+  const steps = health ? setupSteps(metrics, health) : null;
+  // The tracker stays until every step is done, not just until a CLI and a pool exist.
+  const needsSetup = steps?.some((step) => !step.done) ?? false;
   const hasTraffic =
     metrics.totals.current.requests > 0 ||
     metrics.pools.some((pool) => pool.current.requests > 0) ||
@@ -115,19 +137,18 @@ function OverviewContent({
 
   return (
     <>
-      {needsSetup && health ? (
-        <SetupChecklist lang={lang} metrics={metrics} health={health} t={t} />
-      ) : null}
+      {needsSetup && steps ? <SetupChecklist lang={lang} steps={steps} t={t} /> : null}
 
-      <KpiRow metrics={metrics} t={t} />
-
+      {/* Health answers "is it working?", so it comes before traffic. */}
       {healthPending ? (
         <HealthSkeleton />
       ) : healthError || !health ? (
         <InlineRetry message={t("overview.healthLoadFailed")} onRetry={onRetryHealth} />
       ) : (
-        <HealthStrip lang={lang} health={health} t={t} />
+        <HealthStrip lang={lang} health={health} runtimes={runtimes} t={t} />
       )}
+
+      <KpiRow metrics={metrics} t={t} />
 
       {!hasTraffic && !needsSetup ? (
         <div className="rounded-md border border-dashed p-8 text-center">
@@ -141,8 +162,14 @@ function OverviewContent({
           <h2 id="overview-pools" className="text-base font-semibold">
             {t("overview.pools.title")}
           </h2>
-          {metrics.pools.map((pool) => (
-            <OverviewPoolCard key={pool.poolId} pool={pool} range={metrics.range} lang={lang} />
+          {metrics.pools.map((pool, index) => (
+            <OverviewPoolCard
+              key={pool.poolId}
+              pool={pool}
+              range={metrics.range}
+              lang={lang}
+              defaultOpen={index < 2}
+            />
           ))}
         </section>
       ) : null}
@@ -158,11 +185,14 @@ function DeltaLine({
   kind,
   current,
   previous,
+  better,
   t,
 }: {
   kind: DeltaKind;
   current: number | null;
   previous: number | null;
+  /** Which direction is an improvement; omitted for neutral measures such as volume. */
+  better?: "up" | "down";
   t: DashboardT;
 }) {
   const { i18n } = useTranslation();
@@ -173,8 +203,14 @@ function DeltaLine({
   const value = formatDeltaMagnitude(i18n.language, delta, (points) =>
     t("overview.kpi.deltaPoints", { value: points }),
   );
+  const tone =
+    !better || delta.direction === "flat"
+      ? "text-muted-foreground"
+      : delta.direction === better
+        ? "text-state-success"
+        : "text-destructive";
   return (
-    <p className="mt-1 flex items-center gap-1 text-xs text-muted-foreground">
+    <p className={cn("mt-1 flex items-center gap-1 text-xs", tone)}>
       <Icon aria-hidden="true" className="size-3" />
       <span>
         {delta.direction === "up"
@@ -190,17 +226,20 @@ function DeltaLine({
 function KpiTile({
   label,
   value,
-  hint,
+  help,
   children,
 }: {
   label: string;
   value: string;
-  hint?: string;
+  help?: ReactNode;
   children?: ReactNode;
 }) {
   return (
-    <div className="min-w-0 rounded-md border bg-background p-3" title={hint}>
-      <dt className="truncate text-xs text-muted-foreground">{label}</dt>
+    <div className="min-w-0 rounded-md border bg-background p-3">
+      <dt className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
+        <span className="truncate">{label}</span>
+        {help ? <Help>{help}</Help> : null}
+      </dt>
       <dd className="mt-1 truncate text-xl font-semibold tabular-nums">{value}</dd>
       {children}
     </div>
@@ -228,6 +267,7 @@ function KpiRow({ metrics, t }: { metrics: OverviewMetrics; t: DashboardT }) {
         </KpiTile>
         <KpiTile
           label={t("overview.kpi.errorRate")}
+          help={t("overview.kpi.help.errorRate")}
           value={
             current.errorRate === null
               ? t("overview.noValue")
@@ -238,12 +278,13 @@ function KpiRow({ metrics, t }: { metrics: OverviewMetrics; t: DashboardT }) {
             kind="rate"
             current={current.errorRate}
             previous={previousOrNull(previous.errorRate)}
+            better="down"
             t={t}
           />
         </KpiTile>
         <KpiTile
           label={t("overview.kpi.cacheHitRate")}
-          hint={t("overview.kpi.cacheHitRateHint")}
+          help={t("overview.kpi.cacheHitRateHint")}
           value={
             current.cacheHitRate === null
               ? t("overview.notReported")
@@ -254,25 +295,33 @@ function KpiRow({ metrics, t }: { metrics: OverviewMetrics; t: DashboardT }) {
             kind="rate"
             current={current.cacheHitRate}
             previous={previous.cacheHitRate}
+            better="up"
             t={t}
           />
         </KpiTile>
         <KpiTile
           label={t("overview.kpi.p95Latency")}
+          help={t("overview.kpi.help.p95Latency")}
           value={optionalDuration(current.p95LatencyMs)}
         >
           <DeltaLine
             kind="duration"
             current={current.p95LatencyMs}
             previous={previous.p95LatencyMs}
+            better="down"
             t={t}
           />
         </KpiTile>
-        <KpiTile label={t("overview.kpi.p95Ttft")} value={optionalDuration(current.p95TtftMs)}>
+        <KpiTile
+          label={t("overview.kpi.p95Ttft")}
+          help={t("overview.kpi.help.p95Ttft")}
+          value={optionalDuration(current.p95TtftMs)}
+        >
           <DeltaLine
             kind="duration"
             current={current.p95TtftMs}
             previous={previous.p95TtftMs}
+            better="down"
             t={t}
           />
         </KpiTile>
@@ -300,18 +349,23 @@ function HealthTile({
   value,
   detail,
   healthy,
+  help,
   action,
 }: {
   label: string;
   value: string;
   detail?: string;
   healthy: boolean;
+  help?: ReactNode;
   action?: ReactNode;
 }) {
   return (
     <div className="flex min-w-0 items-center justify-between gap-3 rounded-md border bg-background p-3">
       <div className="min-w-0">
-        <p className="truncate text-xs text-muted-foreground">{label}</p>
+        <p className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
+          <span className="truncate">{label}</span>
+          {help ? <Help>{help}</Help> : null}
+        </p>
         <p className="mt-1 flex items-center gap-2 text-base font-semibold tabular-nums">
           <span
             aria-hidden="true"
@@ -332,6 +386,7 @@ function ReviewLink({
 }: { children: ReactNode } & (
   | { to: "/$lang/dashboard/clis"; params: { lang: string } }
   | { to: "/$lang/dashboard/pools"; params: { lang: string } }
+  | { to: "/$lang/dashboard/runtimes"; params: { lang: string } }
   | { to: "/$lang/dashboard/pools/$poolId"; params: { lang: string; poolId: string } }
 )) {
   return (
@@ -345,7 +400,20 @@ function ReviewLink({
   );
 }
 
-function HealthStrip({ lang, health, t }: { lang: string; health: OverviewHealth; t: DashboardT }) {
+type OverviewRuntime = Awaited<ReturnType<AppRouterClient["capacityManagement"]["list"]>>[number];
+
+function HealthStrip({
+  lang,
+  health,
+  runtimes,
+  t,
+}: {
+  lang: string;
+  health: OverviewHealth;
+  runtimes: OverviewRuntime[] | undefined;
+  t: DashboardT;
+}) {
+  const queued = runtimes?.filter((runtime) => runtime._count.CapacityWaiters > 0) ?? [];
   const cliHealthy = health.clis.online === health.clis.total;
   const endpointsHealthy = health.endpoints.healthy === health.endpoints.total;
   const membersHealthy =
@@ -353,7 +421,12 @@ function HealthStrip({ lang, health, t }: { lang: string; health: OverviewHealth
   const firstProblemMember = health.poolMembers.circuitOpen[0] ?? health.poolMembers.degraded[0];
   return (
     <section aria-label={t("overview.health.sectionLabel")}>
-      <div className="grid min-w-0 grid-cols-1 gap-3 md:grid-cols-3">
+      <div
+        className={cn(
+          "grid min-w-0 grid-cols-1 gap-3 md:grid-cols-2",
+          runtimes ? "xl:grid-cols-4" : "xl:grid-cols-3",
+        )}
+      >
         <HealthTile
           label={t("overview.health.clis")}
           healthy={cliHealthy}
@@ -417,6 +490,28 @@ function HealthStrip({ lang, health, t }: { lang: string; health: OverviewHealth
             ) : null
           }
         />
+        {runtimes ? (
+          <HealthTile
+            label={t("overview.health.runtimes")}
+            help={t("overview.health.runtimesHelp")}
+            healthy={queued.length === 0}
+            value={
+              runtimes.length === 0
+                ? t("overview.health.noneConfigured")
+                : queued.length === 0
+                  ? t("overview.health.noQueue")
+                  : t("overview.health.ratio", { value: queued.length, total: runtimes.length })
+            }
+            detail={queued.map((runtime) => runtime.label).join(", ") || undefined}
+            action={
+              queued.length ? (
+                <ReviewLink to="/$lang/dashboard/runtimes" params={{ lang }}>
+                  {t("overview.health.reviewRuntimes")}
+                </ReviewLink>
+              ) : null
+            }
+          />
+        ) : null}
       </div>
     </section>
   );
@@ -576,29 +671,19 @@ type SetupStep = {
   link:
     | { to: "/$lang/dashboard/clis" }
     | { to: "/$lang/dashboard/pools/new" }
-    | { to: "/$lang/dashboard/model-api-tokens" }
+    | { to: "/$lang/dashboard/api-tokens" }
     | { to: "/$lang/dashboard/chat-test" };
 };
 
-function SetupChecklist({
-  lang,
-  metrics,
-  health,
-  t,
-}: {
-  lang: string;
-  metrics: OverviewMetrics;
-  health: OverviewHealth;
-  t: DashboardT;
-}) {
-  const steps: SetupStep[] = [
+function setupSteps(metrics: OverviewMetrics, health: OverviewHealth): SetupStep[] {
+  return [
     { id: "connectCli", done: health.clis.total > 0, link: { to: "/$lang/dashboard/clis" } },
     { id: "addEndpoint", done: health.endpoints.total > 0, link: { to: "/$lang/dashboard/clis" } },
     { id: "createPool", done: metrics.setup.hasPools, link: { to: "/$lang/dashboard/pools/new" } },
     {
       id: "createToken",
       done: health.modelApiTokens > 0,
-      link: { to: "/$lang/dashboard/model-api-tokens" },
+      link: { to: "/$lang/dashboard/api-tokens" },
     },
     {
       id: "tryChat",
@@ -606,20 +691,51 @@ function SetupChecklist({
       link: { to: "/$lang/dashboard/chat-test" },
     },
   ];
+}
+
+function SetupChecklist({ lang, steps, t }: { lang: string; steps: SetupStep[]; t: DashboardT }) {
+  const doneCount = steps.filter((step) => step.done).length;
+  const next = steps.find((step) => !step.done);
   return (
     <section
       aria-labelledby="overview-setup"
       className="min-w-0 rounded-md border bg-background p-4"
     >
-      <h2 id="overview-setup" className="text-base font-semibold">
-        {t("overview.setup.title")}
-      </h2>
+      <div className="flex min-w-0 flex-wrap items-baseline justify-between gap-2">
+        <h2 id="overview-setup" className="text-base font-semibold">
+          {t("overview.setup.title")}
+        </h2>
+        <p className="text-sm text-muted-foreground">
+          {t("overview.setup.progress", { done: doneCount, total: steps.length })}
+          {next
+            ? ` · ${t("overview.setup.next", { step: t(`overview.setup.steps.${next.id}.title`) })}`
+            : null}
+        </p>
+      </div>
       <p className="mt-1 text-sm text-muted-foreground">{t("overview.setup.description")}</p>
+      <div
+        role="progressbar"
+        aria-label={t("overview.setup.title")}
+        aria-valuemin={0}
+        aria-valuemax={steps.length}
+        aria-valuenow={doneCount}
+        className="mt-3 flex gap-1"
+      >
+        {steps.map((step) => (
+          <span
+            key={step.id}
+            className={cn("h-1.5 flex-1 rounded-full", step.done ? "bg-state-success" : "bg-muted")}
+          />
+        ))}
+      </div>
       <ol className="mt-4 flex flex-col gap-2">
         {steps.map((step) => (
           <li
             key={step.id}
-            className="flex min-w-0 flex-col gap-2 rounded-md border p-3 sm:flex-row sm:items-center sm:justify-between"
+            className={cn(
+              "flex min-w-0 flex-col gap-2 rounded-md border p-3 sm:flex-row sm:items-center sm:justify-between",
+              step === next && "border-primary/50 bg-primary/5",
+            )}
           >
             <div className="flex min-w-0 items-start gap-3">
               {step.done ? (
@@ -638,9 +754,11 @@ function SetupChecklist({
                     ({step.done ? t("overview.setup.done") : t("overview.setup.todo")})
                   </span>
                 </p>
-                <p className="text-xs text-muted-foreground">
-                  {t(`overview.setup.steps.${step.id}.description`)}
-                </p>
+                {step.done ? null : (
+                  <p className="text-xs text-muted-foreground">
+                    {t(`overview.setup.steps.${step.id}.description`)}
+                  </p>
+                )}
               </div>
             </div>
             {step.done ? null : (
@@ -648,7 +766,7 @@ function SetupChecklist({
                 {...step.link}
                 params={{ lang }}
                 className={cn(
-                  buttonVariants({ variant: "outline", size: "sm" }),
+                  buttonVariants({ variant: step === next ? "default" : "outline", size: "sm" }),
                   "min-h-[44px] shrink-0 self-start sm:self-auto",
                 )}
               >
@@ -665,10 +783,10 @@ function SetupChecklist({
 function HealthSkeleton() {
   return (
     <div
-      className="grid min-w-0 grid-cols-1 gap-3 md:grid-cols-3"
+      className="grid min-w-0 grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4"
       data-testid="overview-health-skeleton"
     >
-      {[0, 1, 2].map((index) => (
+      {[0, 1, 2, 3].map((index) => (
         <div key={index} className="rounded-md border p-3">
           <Skeleton className="h-3 w-24" />
           <Skeleton className="mt-2 h-5 w-16" />
@@ -681,6 +799,7 @@ function HealthSkeleton() {
 export function OverviewSkeleton() {
   return (
     <div className="flex min-w-0 flex-col gap-6" data-testid="overview-skeleton">
+      <HealthSkeleton />
       <div className="grid min-w-0 grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
         {[0, 1, 2, 3, 4, 5].map((index) => (
           <div key={index} className="rounded-md border p-3">
@@ -690,7 +809,6 @@ export function OverviewSkeleton() {
           </div>
         ))}
       </div>
-      <HealthSkeleton />
       <div className="rounded-md border">
         <div className="border-b p-4">
           <Skeleton className="h-5 w-40" />

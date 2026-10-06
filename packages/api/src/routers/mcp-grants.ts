@@ -2,7 +2,7 @@ import { ORPCError } from "@orpc/server";
 import { isMcpPatClientId } from "@ws-model-proxy/auth/mcp-config";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { z } from "zod";
-import { protectedProcedure } from "../index";
+import { humanProcedure, protectedProcedure } from "../index";
 import { runSerializableTransaction } from "../lib/serializable-transaction";
 
 /**
@@ -499,7 +499,7 @@ export const mcpGrantsRouter = {
    * so a possibly-missed redeemable generation can never hide behind
    * `{revoked:true}`.
    */
-  revokeMine: protectedProcedure
+  revokeMine: humanProcedure
     .input(
       z.object({
         clientRecordId: z.string().min(1),

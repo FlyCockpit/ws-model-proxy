@@ -7,7 +7,7 @@ use crate::config::Config;
 #[cfg(unix)]
 use crate::control::{self, ControlCommand};
 use crate::output;
-use crate::probe::{apply_probe_report, probe_endpoint};
+use crate::probe::{apply_probe_report, probe_from_config};
 use anyhow::Result;
 use serde::Serialize;
 
@@ -74,7 +74,7 @@ fn run_offline(json: bool) -> Result<()> {
         .endpoints
         .iter()
         .filter(|endpoint| endpoint.enabled)
-        .map(probe_endpoint)
+        .map(|endpoint| probe_from_config(endpoint, &config))
         .collect::<Vec<_>>();
     Config::update(true, |candidate| {
         for report in &reports {

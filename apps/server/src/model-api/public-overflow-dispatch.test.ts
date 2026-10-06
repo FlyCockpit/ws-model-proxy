@@ -120,6 +120,15 @@ vi.mock("./provider-budget.js", () => ({
   reconcileProviderBudget,
 }));
 const rememberAffinity = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
+vi.mock("./cache-affinity-residency.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./cache-affinity-residency.js")>();
+  return {
+    ...actual,
+    captureAffinityTargetGenerations: vi.fn(async (targets: Array<{ executionTargetId: string }>) =>
+      targets.map((target) => ({ ...target, cacheGeneration: "" })),
+    ),
+  };
+});
 vi.mock("./cache-affinity.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./cache-affinity.js")>();
   return { ...actual, rememberAffinity };
@@ -1750,8 +1759,8 @@ describe("public overflow terminal response dispatch", () => {
       targets: listed.targets,
     });
     expect(mixedCurrency.targets.map((target) => target.executionTargetId)).toEqual([
-      "target-cheap",
       "target-expensive",
+      "target-cheap",
     ]);
     expect(
       mixedCurrency.targets.every((target) => target.affinity?.reason?.includes("costPenalty:0")),
@@ -1767,8 +1776,8 @@ describe("public overflow terminal response dispatch", () => {
       targets: listed.targets,
     });
     expect(incompletePricing.targets.map((target) => target.executionTargetId)).toEqual([
-      "target-cheap",
       "target-expensive",
+      "target-cheap",
     ]);
     expect(
       incompletePricing.targets.every((target) =>
@@ -3188,6 +3197,7 @@ describe("own-key dispatch and authoritative send claim", () => {
     expect(admitProviderBudget).toHaveBeenCalledWith(
       expect.objectContaining({ userId: "grantee", poolId: undefined }),
     );
+    expect(vi.mocked(admitProviderBudget).mock.calls[0]?.[0].poolGrantId).toBeUndefined();
     expect(db.cacheAffinityRecord.findMany).not.toHaveBeenCalled();
     expect(rememberAffinity).not.toHaveBeenCalled();
     expect(locks.map((sql) => sql.match(/FROM ([a-z_]+)/)?.[1])).toEqual([
@@ -3658,6 +3668,68 @@ describe("OpenRouter owner-paid settlement", () => {
           usage: expect.objectContaining({ categoriesComplete: false }),
         }),
       );
+    });
+
+    // OpenRouter Responses terminals are data-only (no `event:` line). Seeing
+    // one must not settle as COMPLETED when the transport is then cut before a
+    // clean end of stream: the liability stays retained.
+    const dataOnlyResponsesTerminal = Buffer.from(
+      `data: ${JSON.stringify({
+        type: "response.completed",
+        response: { status: "completed", usage: responsesUsage(14, 0.00008) },
+      })}\n\n`,
+    );
+
+    it("retains liability when EOF without transport completion follows a data-only terminal", async () => {
+      // Control: the same record with a completed transport settles cleanly,
+      // so the failure below is the cut, not an unrecognized terminal.
+      const clean = await startOwnerStream(
+        "openrouter",
+        [dataOnlyResponsesTerminal],
+        "owner",
+        "openai-responses",
+      );
+      await clean.response.text();
+      expect(await clean.terminal).toMatchObject({ ok: true });
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({ reason: "COMPLETED", observationComplete: true }),
+      );
+
+      const result = await startOwnerStream(
+        "openrouter",
+        [dataOnlyResponsesTerminal],
+        "owner",
+        "openai-responses",
+        false,
+      );
+      expect(await result.response.text()).toBe(dataOnlyResponsesTerminal.toString());
+      expect(await result.terminal).toMatchObject({ ok: false });
+      expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+      expect(reconcileProviderBudget).toHaveBeenCalledWith(
+        expect.objectContaining({
+          reason: "FAILED",
+          observationComplete: false,
+          usage: expect.objectContaining({ categoriesComplete: false }),
+        }),
+      );
+    });
+
+    it("retains liability when the socket resets after a data-only terminal", async () => {
+      const upstream = new Readable({ read() {} });
+      try {
+        const result = await startOwnerStream("openrouter", upstream, "owner", "openai-responses");
+        upstream.push(dataOnlyResponsesTerminal);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        upstream.destroy(new Error("socket reset after the data-only terminal"));
+        await result.response.text().catch(() => undefined);
+        expect(await result.terminal).toMatchObject({ ok: false });
+        expect(reconcileProviderBudget).toHaveBeenCalledTimes(1);
+        expect(reconcileProviderBudget).toHaveBeenCalledWith(
+          expect.objectContaining({ reason: "FAILED", observationComplete: false }),
+        );
+      } finally {
+        upstream.destroy();
+      }
     });
 
     it("holds a clean EOF terminal until settlement is durable", async () => {
@@ -5330,6 +5402,86 @@ describe("OpenRouter owner-paid settlement", () => {
     }
   });
 
+  it("does not charge a grant spend cap for the pool owner's own traffic", async () => {
+    try {
+      await settleOwnerStream("openrouter", [Buffer.from("data: [DONE]\n\n")], "owner");
+      expect(vi.mocked(admitProviderBudget).mock.calls[0]?.[0].poolGrantId).toBeUndefined();
+    } finally {
+      resetConsentState();
+    }
+  });
+
+  it("returns GRANTEE_BUDGET_EXCEEDED when the grant spend cap refuses admission", async () => {
+    vi.mocked(admitProviderBudget).mockResolvedValueOnce({
+      admitted: false,
+      reason: "GRANTEE_BUDGET_EXCEEDED",
+      policyId: "grant-cap",
+      ruleId: "rule",
+    });
+    db.modelPool.findFirst.mockResolvedValue({
+      ...dispatchPoolFixture(),
+      fallbackForGrantees: true,
+    });
+    consentState.token = { ...consentState.token, userId: "grantee" };
+    consentState.grant = currentGrant();
+    const tx = {
+      ...consentDelegates(),
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
+        mockRequesterValidityQuery(strings, values, consentDelegates()),
+      ),
+      providerAccount: {
+        findFirst: vi
+          .fn()
+          .mockResolvedValue({ providerType: "openai", allowDataCollection: false }),
+      },
+      providerCredential: {
+        findFirst: vi.fn().mockResolvedValue({
+          id: "credential-heartbeat",
+          credentialType: "BEARER",
+          aadVersion: 1,
+          algorithm: "AES-256-GCM",
+          keyVersion: "v1",
+          ciphertext: new Uint8Array(),
+          nonce: new Uint8Array(),
+          authTag: new Uint8Array(),
+        }),
+        update: vi.fn().mockResolvedValue({ id: "credential-heartbeat" }),
+      },
+    };
+    db.$transaction.mockImplementation(async (callback: (client: typeof tx) => unknown) =>
+      callback(tx),
+    );
+    try {
+      await expect(
+        dispatchPublicOverflow({
+          userId: "owner",
+          poolId: "pool",
+          requestId: "grant-cap-hit",
+          reason: "NO_COMPATIBLE_HEALTHY_PRIMARY",
+          ...ownerConsentFields("grantee"),
+          requestedProtocol: "openai",
+          requestedSurface: "openai-chat",
+          stream: false,
+          requiredFeatures: [],
+          path: "/v1/chat/completions",
+          headers: new Headers({ "content-type": "application/json" }),
+          body: new TextEncoder().encode('{"model":"pool","messages":[]}'),
+          signal: new AbortController().signal,
+          liability: { tokens: 10n, accountingVersion: "provider-billable-v1" },
+          releaseLocalCapacity: vi.fn().mockResolvedValue(undefined),
+          adaptationEnabled: false,
+          retrySafe: false,
+        }),
+      ).resolves.toEqual({ dispatched: false, reason: "GRANTEE_BUDGET_EXCEEDED" });
+      expect(providerHttpsRequest).not.toHaveBeenCalled();
+      expect(vi.mocked(admitProviderBudget)).toHaveBeenCalledWith(
+        expect.objectContaining({ userId: "owner", poolId: "pool", poolGrantId: GRANT_ID }),
+      );
+    } finally {
+      resetConsentState();
+    }
+  });
+
   // #62 AC: pool fallback settles against the pool owner's budget even when a
   // grantee made the request (own-key settles against the requester, above).
   it("settles a grantee's OpenRouter pool fallback against the owner's budget", async () => {
@@ -5347,7 +5499,7 @@ describe("OpenRouter owner-paid settlement", () => {
       });
       expect(providerBillableTokens(settled.usage)).toBe(1_280n);
       expect(vi.mocked(admitProviderBudget)).toHaveBeenLastCalledWith(
-        expect.objectContaining({ userId: "owner", poolId: "pool" }),
+        expect.objectContaining({ userId: "owner", poolId: "pool", poolGrantId: GRANT_ID }),
       );
     } finally {
       resetConsentState();
@@ -5373,11 +5525,16 @@ describe("OpenRouter owner-paid settlement", () => {
       usage: { categoriesComplete: true },
     });
     expect(settled.usage.reportedCost?.toString()).toBe(cost);
-    // OpenRouter's Responses stream sends no `event:` lines and its terminal is
-    // deliberately not recognised (read to EOF, full hold): the observation
-    // completes only where the terminal is named (Messages `message_stop`,
-    // Chat `[DONE]`).
-    expect(settled.observationComplete).toBe(surface !== "openai-responses");
+    expect(settled.observationComplete).toBe(true);
+    expect(settled.reason).toBe("COMPLETED");
+    expect(recordProviderOutcome).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    expect(recordProviderAttemptEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: "TERMINAL",
+        reason: "COMPLETED",
+        terminalState: "COMPLETED",
+      }),
+    );
   });
 
   it("does not take a Responses terminal from an event line that disagrees with its type", async () => {
@@ -5403,10 +5560,9 @@ describe("OpenRouter owner-paid settlement", () => {
     expect(settled.observationComplete).toBe(false);
   });
 
-  // AC 13: an event-less (data-only) Responses record is never a terminal, for
-  // any provider type: recognising one would cut the read off at the first
-  // such record and make billing depend on transport chunking.
-  it.each(["openrouter", "openai", "openai-compatible"] as const)(
+  // Generic dialects still require an `event:` line. OpenRouter's claimed
+  // Responses surface is data-only: JSON `type` + `response.usage` is enough.
+  it.each(["openai", "openai-compatible"] as const)(
     "does not complete an event-less Responses terminal for the %s provider type",
     async (providerType) => {
       // Strip the trailing `data: [DONE]` sentinel so nothing else ends the stream.
@@ -5425,6 +5581,50 @@ describe("OpenRouter owner-paid settlement", () => {
       expect(settled.observationComplete).toBe(false);
     },
   );
+
+  it("completes OpenRouter's data-only Responses terminal from type and usage", async () => {
+    const raw = readFileSync(
+      new URL("./fixtures/openrouter-live/responses-stream.raw", import.meta.url),
+      "utf8",
+    );
+    const withoutDone = raw.replace(/data: \[DONE\]\s*$/, "");
+    expect(withoutDone).not.toBe(raw);
+    recordProviderOutcome.mockClear();
+    const settled = await settleOwnerStream(
+      "openrouter",
+      [Buffer.from(withoutDone)],
+      "owner",
+      "openai-responses",
+    );
+    expect(settled).toMatchObject({
+      reason: "COMPLETED",
+      observationComplete: true,
+      usage: { categoriesComplete: true },
+    });
+    expect(settled.usage.reportedCost?.toString()).toBe("0.00008");
+    expect(recordProviderOutcome).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    expect(recordProviderAttemptEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: "TERMINAL",
+        reason: "COMPLETED",
+        terminalState: "COMPLETED",
+      }),
+    );
+  });
+
+  it("does not complete an OpenRouter data-only Responses record without usage", async () => {
+    const settled = await settleOwnerStream(
+      "openrouter",
+      [
+        Buffer.from(
+          'data: {"type":"response.completed","response":{"id":"resp","status":"completed","usage":null}}\n\n',
+        ),
+      ],
+      "owner",
+      "openai-responses",
+    );
+    expect(settled.observationComplete).toBe(false);
+  });
 
   // AC 14 / M5: Messages stays strict. A data-only `message_stop` with no
   // `event:` line must never be taken as a terminal, even though the record's

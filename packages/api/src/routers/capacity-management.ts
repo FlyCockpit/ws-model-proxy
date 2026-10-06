@@ -20,7 +20,7 @@ import {
 import { deletionConflict } from "../lib/deletion-conflict";
 import { enginePreset } from "../lib/engine-facts";
 import { refreshSharedAutoCapacities } from "../lib/engine-process-capacity";
-import { effectiveKvBudgetTokens } from "../lib/kv-eviction-budget";
+import { effectiveKvBudgetTokens, protectionKvBudgetTokens } from "../lib/kv-eviction-budget";
 import { parseModelApiSurface } from "../lib/model-api-surface";
 import { assertRecommendedSurfaceServable } from "../lib/pool-recommended-surface";
 import { loadPoolSurfaceMembers } from "../lib/pool-surface-members";
@@ -60,6 +60,7 @@ function assertLossyDeveloperRoleCollapseRequiresAdaptation({
   if (allowLossyDeveloperRoleCollapse && !protocolAdaptationEnabled) {
     throw new ORPCError("BAD_REQUEST", {
       message: "Lossy developer-role collapse requires protocol adaptation to be enabled.",
+      data: { fields: ["allowLossyDeveloperRoleCollapse", "protocolAdaptationEnabled"] },
     });
   }
 }
@@ -203,15 +204,17 @@ export const capacityManagementRouter = {
             where: { capacityId: { in: ids }, state: "WAITING" },
             _count: { _all: true },
           }),
-          prisma.capacityKvEviction.findMany({
-            where: { capacityId: { in: ids }, userId, expiresAt: { gt: now } },
-            select: {
-              capacityId: true,
-              cutFraction: true,
-              observedAt: true,
-              expiresAt: true,
-            },
-          }),
+          prisma.capacityKvEviction
+            .findMany({
+              where: { capacityId: { in: ids }, userId, expiresAt: { gt: now } },
+              select: {
+                capacityId: true,
+                cutFraction: true,
+                observedAt: true,
+                expiresAt: true,
+              },
+            })
+            .catch(() => []),
         ])
       : [[], [], []];
     const activeLeases = new Map(leases.map((row) => [row.capacityId, row._count._all]));
@@ -225,7 +228,7 @@ export const capacityManagementRouter = {
         kvBudgetTokens: capacity.kvBudgetTokens,
       }),
       effectiveKvBudgetTokens: effectiveKvBudgetTokens(
-        capacity.engineKind === "LLAMA_CPP" ? null : capacity.kvBudgetTokens,
+        protectionKvBudgetTokens(capacity.engineKind, capacity.kvBudgetTokens),
         evictionByCapacity.get(capacity.id),
         now,
       ),
@@ -253,7 +256,10 @@ export const capacityManagementRouter = {
       input.hardConcurrencyLimit !== undefined &&
       input.hardConcurrencyLimit < 1
     )
-      throw new ORPCError("BAD_REQUEST");
+      throw new ORPCError("BAD_REQUEST", {
+        message: "Hard concurrency limit must be at least 1.",
+        data: { fields: ["hardConcurrencyLimit"] },
+      });
     const userId = context.session.user.id;
     return capacityTransaction(
       userId,

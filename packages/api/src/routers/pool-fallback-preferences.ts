@@ -4,7 +4,7 @@ import { fenceOwners } from "@ws-model-proxy/db/capacity-lock-order";
 import { poolOwnerActive } from "@ws-model-proxy/db/user-deletion-access";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
-import { protectedProcedure } from "../index";
+import { humanProcedure, protectedProcedure } from "../index";
 
 const id = z.string().min(1).max(255);
 /** Human-only consent. Every query is scoped to the signed-in requester. */
@@ -112,7 +112,7 @@ export const poolFallbackPreferencesRouter = {
         }),
     };
   }),
-  set: protectedProcedure
+  set: humanProcedure
     .input(
       z.object({
         poolId: id,
@@ -188,7 +188,7 @@ export const poolFallbackPreferencesRouter = {
         });
       });
     }),
-  clear: protectedProcedure.input(z.object({ poolId: id })).handler(async ({ context, input }) => {
+  clear: humanProcedure.input(z.object({ poolId: id })).handler(async ({ context, input }) => {
     await prisma.$transaction(async (tx) => {
       await fenceOwners(tx, [context.session.user.id]);
       await tx.poolFallbackPreference.deleteMany({

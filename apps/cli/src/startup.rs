@@ -4,7 +4,7 @@
 //! re-read on reconnect and when an inventory reload is acknowledged; those
 //! replacements must not change the key or these flags.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::config::{Config, McpCommandMode};
 use crate::protocol::{CliCapabilities, TerminalFeatureSnapshot};
@@ -13,8 +13,8 @@ use crate::terminal_identity::{self, CliIdentity};
 
 pub struct TerminalStartup {
     key: CliTerminalKey,
-    /// Persistent identity from `terminal-identity.json`. `None` when it could
-    /// not be loaded; browsers then refuse this CLI's terminals.
+    /// Persistent identity from `terminal-identity.json`. `None` only in tests;
+    /// production startup refuses to connect without a loadable identity.
     identity: Option<CliIdentity>,
     allow_human_terminal: bool,
     mcp_command_mode: McpCommandMode,
@@ -30,24 +30,14 @@ pub struct TerminalStartup {
 impl TerminalStartup {
     pub fn capture(config: &Config) -> Result<Self> {
         let startup = Self::from_key(CliTerminalKey::generate()?, config);
-        let identity = crate::paths::state_dir()
-            .and_then(|state_dir| terminal_identity::load_or_create(&state_dir));
-        Ok(match identity {
-            Ok(identity) => {
-                tracing::info!(
-                    fingerprint = %identity.fingerprint(),
-                    "loaded the terminal identity key"
-                );
-                startup.with_identity(identity)
-            }
-            Err(error) => {
-                tracing::warn!(
-                    error = %format!("{error:#}"),
-                    "terminal identity key is unavailable; browsers will refuse terminals"
-                );
-                startup
-            }
-        })
+        let state_dir = crate::paths::state_dir().context("determining the state directory")?;
+        let identity = terminal_identity::load_or_create(&state_dir)
+            .context("loading the CLI identity key")?;
+        tracing::info!(
+            fingerprint = %identity.fingerprint(),
+            "loaded the CLI identity key"
+        );
+        Ok(startup.with_identity(identity))
     }
 
     pub fn from_key(key: CliTerminalKey, config: &Config) -> Self {
@@ -137,13 +127,20 @@ impl TerminalStartup {
     }
 }
 
-/// Hello capabilities always come from the startup snapshot, never the live config.
+/// Terminal grants remain startup-scoped; deployment opt-in is reported fresh.
 pub fn hello_capabilities(
     startup: &TerminalStartup,
-    _live: &Config,
+    live: &Config,
     cli_slug: &str,
 ) -> CliCapabilities {
-    startup.capabilities(cli_slug)
+    let mut capabilities = startup.capabilities(cli_slug);
+    capabilities.features.deployments = live.allow_deployments;
+    // Interactive deployment steps run in an operator terminal: only with
+    // both local opt-ins and a PTY.
+    capabilities.features.deployment_operator = live.allow_deployments
+        && live.allow_deployment_operator_terminal
+        && crate::protocol::terminal_supported();
+    capabilities
 }
 
 #[cfg(test)]
@@ -175,6 +172,35 @@ mod tests {
         config.allow_remote_metric_sources = false;
         config.allow_remote_engine_adapters = false;
         let capabilities = hello_capabilities(&startup, &config, "desk-01");
+        assert!(!capabilities.features.deployments);
+        config.allow_deployments = true;
+        assert!(
+            hello_capabilities(&startup, &config, "desk-01")
+                .features
+                .deployments
+        );
+        // Operator terminals need deployments, their own switch and a PTY.
+        assert!(!capabilities.features.deployment_operator);
+        assert!(
+            !hello_capabilities(&startup, &config, "desk-01")
+                .features
+                .deployment_operator,
+            "deployments alone do not enable operator terminals"
+        );
+        config.allow_deployment_operator_terminal = true;
+        assert_eq!(
+            hello_capabilities(&startup, &config, "desk-01")
+                .features
+                .deployment_operator,
+            crate::protocol::terminal_supported()
+        );
+        config.allow_deployments = false;
+        assert!(
+            !hello_capabilities(&startup, &config, "desk-01")
+                .features
+                .deployment_operator
+        );
+        config.allow_deployments = true;
         assert!(capabilities.features.human_terminal);
         assert!(
             capabilities.features.remote_metric_sources,
@@ -201,17 +227,12 @@ mod tests {
         assert!(capabilities.features.terminal_approval);
         assert_eq!(capabilities.features.terminal_supported, cfg!(unix));
         assert_eq!(capabilities.terminal_public_key, public_key);
-        assert!(capabilities.terminal);
-        assert!(capabilities.exec);
-        assert_eq!(capabilities.protocol_version, "2.9");
-        assert!(capabilities.file_ops);
         assert!(capabilities.features.mcp_file_read);
         assert!(startup.mcp_file_read());
         assert_eq!(startup.file_roots(), &[dir.path().to_path_buf()]);
         assert!(capabilities.features.file_roots_configured);
         assert!(capabilities.features.allow_file_tools_as_root);
-        assert!(capabilities.terminal_viewers);
-        assert!(capabilities.supervised_commands);
+        assert!(startup.identity().is_some());
     }
 
     #[test]

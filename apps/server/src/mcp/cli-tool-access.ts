@@ -27,6 +27,9 @@ export type McpRequestCredential =
 export type CliToolCapability = "command" | "file_read" | "file_write";
 
 const CLI_TOOL_CAPABILITIES: ReadonlyMap<string, CliToolCapability> = new Map([
+  ["deployment_plan_start", "command"],
+  ["deployment_plan_stop", "command"],
+  ["deployment_plan_apply", "command"],
   ["forwarder_cli_command_run", "command"],
   ["forwarder_cli_supervised_command_start", "command"],
   ["forwarder_cli_command_result", "command"],

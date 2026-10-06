@@ -37,7 +37,6 @@ const PERMANENT_55000 = new Set([
   "% is append-only",
   "provider_attempt is durable history",
   "provider budget reservations cannot be deleted",
-  "provider budget rules are immutable",
 ]);
 
 function hardening55000Messages(): string[] {
@@ -76,7 +75,7 @@ describe("isPermanentParentDeletionFailure", () => {
       isPermanentParentDeletionFailure(
         adapterError("55000", "provider budget rules are immutable"),
       ),
-    ).toBe(true);
+    ).toBe(false);
     // A raw query reports the SQLSTATE and message in `meta`.
     expect(
       isPermanentParentDeletionFailure({

@@ -5,7 +5,8 @@ import type { ActiveRelayResponseHandlers, RelaySessionManager } from "../relay/
 
 vi.mock("@ws-model-proxy/db", async () => {
   const { mockDeep } = await import("vitest-mock-extended");
-  return { default: mockDeep() };
+  const actual = await vi.importActual<typeof import("@ws-model-proxy/db")>("@ws-model-proxy/db");
+  return { default: mockDeep(), Prisma: actual.Prisma };
 });
 
 // pool-member-test.ts now delegates to the extracted diagnostics core, whose
@@ -13,10 +14,35 @@ vi.mock("@ws-model-proxy/db", async () => {
 // chain reads env.BETTER_AUTH_SECRET via @ws-model-proxy/db/forwarder-security
 // and pulls @ws-model-proxy/env/server validation. Mock env so no real
 // validation runs (same pattern as chat-test.test.ts).
+vi.mock("@ws-model-proxy/env/shared", () => ({
+  env: { DATABASE_URL: "postgresql://member-test", NODE_ENV: "test" },
+}));
+
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: { BETTER_AUTH_SECRET: "test-better-auth-secret-value-32chars!" },
 }));
 
+vi.mock("@ws-model-proxy/api/lib/model-api-token-access", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("@ws-model-proxy/api/lib/model-api-token-access")>();
+  return {
+    ...actual,
+    listVisibleModelTargetsForUser: vi.fn(async () => ({
+      directModels: [],
+      modelPools: [
+        {
+          id: "pool-id",
+          target: "MODEL_POOL",
+          modelId: "owner/pool",
+          ownerUserId: "user-id",
+          accessGrantId: null,
+          protocolAdaptationEnabled: false,
+          optimisticBasicTranscription: false,
+        },
+      ],
+    })),
+  };
+});
 const { createPoolMemberTestRoutes } = await import("./pool-member-test.js");
 const { classifyChatProbeReply } = await import("./diagnostics.js");
 const isSuccessfulChatProbeReply = (status: number, raw: string) =>
@@ -28,8 +54,18 @@ type SendRelayRequestArgs = Parameters<RelaySessionManager["sendRelayRequest"]>[
 type CancelRelayRequestArgs = Parameters<RelaySessionManager["cancelRelayRequest"]>[0];
 
 const db = prisma as unknown as {
+  $transaction: MockInstance;
+  $queryRaw: MockInstance;
+  modelPool: { findUnique: MockInstance };
+  poolMemberRoutingVerdict: { findMany: MockInstance };
+  user: { findUnique: MockInstance };
+  relayRequest: { create: MockInstance; update: MockInstance; updateMany: MockInstance };
+  relayExecutionAttempt: { create: MockInstance; updateMany: MockInstance };
+  relayExecutionEvent: { create: MockInstance; createMany: MockInstance };
   poolMember: {
     findUnique: MockInstance;
+    findFirst: MockInstance;
+    findMany: MockInstance;
     updateMany: MockInstance;
   };
 };
@@ -72,6 +108,10 @@ class FakeRelayManager {
 
   completeRelayRequest(requestId: string) {
     this.completed.push(requestId);
+  }
+
+  supportsCountContext() {
+    return false;
   }
 
   headers(requestId: string, status: number, headers: Record<string, string>) {
@@ -159,21 +199,37 @@ function memberRow({
 } = {}) {
   return {
     id: "member-id",
+    poolId: "pool-id",
+    tier: "PRIMARY",
+    instanceGate: "OPEN",
+    routingStatus: "ACTIVE",
+    healthStatus: "HEALTHY",
+    weight: 1,
+    ExecutionTarget: {
+      id: "model-target",
+      inferenceCapacityId: "model-capacity",
+      DiscoveredModel: null,
+    },
+    inferenceContributionId: null,
+    InferenceContribution: null,
     ModelPool: { userId: ownerUserId },
     DiscoveredModel: {
       id: "model-id",
+      userId: ownerUserId,
       published,
       upstreamModelId: "upstream-chat",
       capabilityOverrideMode,
       capabilityOverrides,
       capabilityOverrideMetadata,
       Endpoint: {
+        id: "endpoint-id",
+        status: "ONLINE",
         published: endpointPublished,
         slug: "local",
         cliDeviceId: "cli-device-id",
         capabilityMetadata: null,
         defaultCapabilities,
-        CliDevice: { status: "CONNECTED" },
+        CliDevice: { status: "CONNECTED", userId: ownerUserId },
       },
     },
   };
@@ -193,7 +249,29 @@ function appWith({
     c.set("session", authSession);
     await next();
   });
-  app.route("/", createPoolMemberTestRoutes({ manager, concurrencyLimiter: limiter }));
+  app.route(
+    "/",
+    createPoolMemberTestRoutes({
+      manager,
+      concurrencyLimiter: limiter,
+      capacityRuntime: {
+        acquire: vi.fn(async (attempt) => ({
+          state: "ADMITTED" as const,
+          lease: {
+            leaseId: "lease",
+            attemptId: attempt.attemptId,
+            capacityId: "model-capacity",
+            executionTargetId: "model-target",
+            poolMemberId: "member-id",
+            fencingToken: 1n,
+            expiresAt: new Date(Date.now() + 30_000),
+          },
+        })),
+        release: vi.fn(async () => true),
+        hold: (response) => response,
+      },
+    }),
+  );
   return { app, manager, limiter };
 }
 
@@ -236,6 +314,34 @@ describe("isSuccessfulChatProbeReply", () => {
 describe("pool member test routes", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    db.$transaction.mockImplementation(async (work: unknown) =>
+      typeof work === "function" ? work(db) : Promise.all(work as Promise<unknown>[]),
+    );
+    db.$queryRaw.mockResolvedValue([{ now: new Date() }]);
+    db.modelPool.findUnique.mockResolvedValue({
+      userId: "user-id",
+      transformerDiscoveredModelId: null,
+    });
+    db.poolMemberRoutingVerdict.findMany.mockResolvedValue([]);
+    db.user.findUnique.mockResolvedValue({
+      banned: false,
+      banExpires: null,
+      deletionRequestedAt: null,
+    });
+    db.poolMember.findMany.mockImplementation(async () => {
+      const row = await prisma.poolMember.findUnique({ where: { id: "member-id" } });
+      return row ? [row] : [];
+    });
+    db.poolMember.findFirst.mockImplementation(async () =>
+      prisma.poolMember.findUnique({ where: { id: "member-id" } }),
+    );
+    db.relayRequest.create.mockResolvedValue({ id: "relay-request-id" });
+    db.relayRequest.updateMany.mockResolvedValue({ count: 1 });
+    db.relayRequest.update.mockResolvedValue({ id: "relay-request-id" });
+    db.relayExecutionAttempt.create.mockResolvedValue({ attemptId: "attempt-id" });
+    db.relayExecutionAttempt.updateMany.mockResolvedValue({ count: 1 });
+    db.relayExecutionEvent.create.mockResolvedValue({ id: "event-id" });
+    db.relayExecutionEvent.createMany.mockResolvedValue({ count: 1 });
     db.poolMember.findUnique.mockResolvedValue(memberRow());
     db.poolMember.updateMany.mockResolvedValue({ count: 1 });
   });
@@ -264,15 +370,15 @@ describe("pool member test routes", () => {
     expect(manager.sent).toEqual([]);
   });
 
-  it("rejects embeddings-only members instead of sending a chat probe", async () => {
+  it("rejects a member without a supported diagnostic surface", async () => {
     db.poolMember.findUnique.mockResolvedValue(
       memberRow({
         capabilityOverrideMetadata: {
           version: 1,
           protocol: "openai-compatible",
-          embeddings: { supported: true },
+          chatCompletions: { supported: false },
         },
-        capabilityOverrides: ["EMBEDDING"],
+        capabilityOverrides: [],
       }),
     );
     const { app, manager } = appWith();

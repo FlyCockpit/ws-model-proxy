@@ -73,6 +73,8 @@ export type ServerShutdownDeps = {
    * deadline.
    */
   flushAgentAudit: () => Promise<void>;
+  /** Same for the deployment operator audit (session teardown records `closed`). */
+  flushDeploymentOperatorAudit?: () => Promise<void>;
   terminalHub: { closeAll(): void };
   server: ShutdownHttpServer;
   capacityLifecycle?: {
@@ -145,6 +147,7 @@ export function installServerShutdown(deps: ServerShutdownDeps): ServerShutdown 
       closeRelaySessions: async () => {
         await relaySessions.closeRelaySessions();
         await deps.flushAgentAudit();
+        await deps.flushDeploymentOperatorAudit?.();
       },
       // Admission stops first (relay drain flag makes terminal and CLI
       // upgrades return 503; server.close stops new connections), then the

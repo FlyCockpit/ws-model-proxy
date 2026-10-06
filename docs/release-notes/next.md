@@ -1,5 +1,82 @@
 # Next release (after v0.3.1): upgrade notes
 
+## 0.4.0 managed inference
+
+Durable recipe revisions, group-aware deployment plans, human confirmations and
+per-node deployment grants are available in Dashboard → Deployments. A switch
+stops every rank of each conflicting group, leaving unrelated groups untouched.
+Claims remain held until authoritative stop proof; readiness and health gate serving.
+Recipes declare measured resources rather than hardcoded model/hardware assumptions.
+Every rank's command set explicitly declares `management: ownedProcess | externalService`.
+Externally managed services require a reliable status command: exit 0 means alive,
+exit 3 proves stopped; other results remain unknown and cannot release claims.
+Inference contributions are two-party, revocable offers of specific serving models;
+accepting inference never grants control of a contributor's machines.
+
+**`wsmp config set-deployments on` gives the server a shell on that machine.**
+For a job the server reports as approved by a person, the CLI runs its commands
+(`/bin/sh -c`, as the user running wsmp) whatever the MCP command mode is,
+including `off`. The mode applies only to jobs reported as agent-authored, and
+in `supervised` it accepts the server's approval flag; there is no confirm
+screen on the node. Turn deployments on only on nodes whose server you would
+trust with a shell there. Deployments stay off by default.
+
+Interactive recipe commands (a command a person must run, e.g. one asking for
+a sudo password) are not usable yet. A recipe can mark commands `interactive`
+and be saved, but starting it is refused until a follow-up release. The
+node-local switch `wsmp config set-deployment-operator-terminal` exists (off by
+default) but has no effect yet.
+
+Recipe commands are limited to 4,096 UTF-8 bytes when saved and again after
+placeholder substitution, the same limit the CLI enforces, so a long command is
+refused at save or plan time instead of leaving an instance stuck stopping.
+Revisions saved earlier with longer commands can still be read, but planning
+refuses them. The CLI keeps its deployment state bounded: verified-stopped
+instances are dropped an hour after their stop, or sooner (oldest first) when
+the 256-instance cap needs room, and stops always have 2 MiB of state reserved,
+so state growth can no longer block a stop.
+
+Upgrade the server and every CLI together to relay protocol 2.4, the one protocol
+bump since v0.3.1 (relay 2.3). Deployment inventory is a complete snapshot
+framed by `snapshotId`, sequential `chunkIndex` and `final`; chunks carry at most 512
+records and the CLI also bounds encoded frame bytes. The server acknowledges only
+after durable current-session commit; the CLI then waits for endpoint-inventory
+acknowledgement before consuming the next queued deployment update. One absolute
+30-second deadline covers both publication phases and interrupts stalled socket
+writes; durable-commit timeout reconnects without authorizing partial inventory. A partial
+snapshot is not a complete inventory. Earlier CLI protocols are refused, not silently downgraded.
+
+CLI credential identity is bound to the credential, not a WebSocket session.
+Identity reset is a human-only audited action. Unbound CLI tokens bind once on
+first valid use; device credentials minted before identity binding are refused
+and need `wsmp login`. A pool-grantee spend cap survives revoke/re-grant;
+changing a grant's ID does not silently reset the owner's monetary protection.
+Databases built from master: the schema push drops the disposable cache column
+`capacity_kv_eviction.lastSessionId`, which `APPLY_SCHEMA=safe` refuses when
+rows exist; use `APPLY_SCHEMA=dangerous` once. Schema hardening (behavioral
+triggers and ownership/claim guards) is installed by `safe`/`dangerous` and
+`pnpm db:push`; `APPLY_SCHEMA=off` skips schema sync entirely and is not a way
+to remove it. Databases without hardening are unsupported. Hardening takes its
+table locks with NOWAIT and retries for about a minute; if a long autovacuum
+on a large cache table outlasts that, the deploy stops with a retryable lock
+conflict (55P03) and changes nothing. Re-run it, or run `VACUUM` on the named
+table first.
+
+External fallback is local-first, with separate human-only, default-off consent for
+paid cache-only protection. Embedding fallback requires an exact vector-space contract.
+Pools without connected published local service are absent from model listings.
+WMP stores no chat content; native Responses defaults to `store: false`, while an
+explicit caller may opt into the backend's storage.
+
+Clearing affinity now invalidates a pool's private hint incarnation immediately
+and returns `{cleared: true, reclamation: "pending"}` instead of a deleted-row
+count. Physical metadata is reclaimed in durable bounded batches; concurrent
+requests captured after the clear may establish new warmth. Physical reset
+confidence across relay processes uses database-clock observer leases: failed
+reset-receipt writes become unknown when the last admitted two-second lease
+expires, not through an instantaneous guarantee during a network partition.
+This optional confidence never controls permission to perform local inference.
+
 Draft notes for the release after v0.3.1 (2026-08-27). They cover the
 `:external` consent redesign (#56), the OpenRouter provider type and catalog
 (#57), the capacity lease owner (#58), provider URL fixes (#60), the web and MCP
@@ -35,6 +112,23 @@ Apply the schema and hardening before starting the new server; this adds target
 assignment provenance and automatic concurrency seed columns.
 
 ## Before you deploy
+
+- **Schema: every install with endpoints needs one `APPLY_SCHEMA=dangerous`
+  deploy for 0.4.0, after a backup.** Managed deployments add
+  `endpoint.deploymentInstanceId`, a new nullable column with a unique
+  constraint. The column starts all NULL, so the constraint cannot fail, but
+  Prisma treats any new unique constraint on a table with rows as possible
+  data loss: `APPLY_SCHEMA=safe` and `pnpm db:push` stop on it for any
+  database with at least one endpoint, whether it was built from v0.3.1 or
+  from master. (Prisma needs the constraint for the one-to-one relation, so
+  it cannot move into the schema hardening.) From a master-built database,
+  the only data the push drops is two columns: `capacity_kv_eviction.lastSessionId`
+  (a disposable cache value) and `model_pool.routingRules` (re-enter metric
+  routing rules afterwards; see below). From v0.3.1, the push also makes the
+  changes the items below list. Run `safe` first and read every warning it
+  prints, deploy once with `APPLY_SCHEMA=dangerous`, then go back to
+  `APPLY_SCHEMA=off`. One dangerous push applies every schema item in this
+  section at once; follow their conditions too (every server stopped).
 
 - **Schema: `cli_device.connectionGeneration` is added (#129).** An additive
   non-null `int` with a default of `0`, so `APPLY_SCHEMA=safe` applies it
@@ -91,11 +185,12 @@ assignment provenance and automatic concurrency seed columns.
   members were moved to the external fallback tier, and fallback was enabled
   on those pools. A pool whose members are all providers must be called as
   `owner/pool:external`; its plain name answers `400 external_required`.
-- **API tokens are private-only until a person opts in.** Existing and new
-  tokens cannot use external providers until someone turns on "Allow external
-  providers" for the token in the dashboard. Allowlist tokens also choose
-  which pools may go external. The first time an existing allowlist token is
-  enabled it includes **no** pools; check each pool you want.
+- **API tokens are private-only until a person opts in.** Tokens are created
+  local only; nothing can use external providers until someone turns on
+  **Cloud access** for the token (Dashboard → API tokens). Allowlist tokens
+  also choose which pools may go external. The first time an existing
+  allowlist token is enabled it includes **no** pools; check each pool you
+  want.
 - **`fallbackForGrantees` is off for every pool,** including existing ones.
   Owners must opt in to pay for grantees' external use.
 - **Stored-Responses bindings to provider members created before this release
@@ -108,7 +203,15 @@ assignment provenance and automatic concurrency seed columns.
   `externalAfterWaitMs` is accepted: MCP rejects `fallbackEnabled` and
   `fallbackForGrantees` (only a person may change them, in the dashboard).
 - **Context-ceiling requests on plain names now fail** instead of falling back
-  to a provider. With `:external` and token consent they may go external.
+  to a provider. A request that is too large for one local member is first
+  retried once on each other local member that could fit it (members with the
+  same engine identity only when their usable ceiling is large enough). With
+  `:external` and token consent it may then go external.
+- **Grantee spend caps are set only through the pool grant.** The cap is keyed
+  by owner, pool and grantee: its recorded spend survives revoke/re-grant and
+  period edits, and a currency change starts a new cap. `providerManagement`
+  budget procedures now refuse `POOL_GRANT` scopes; use
+  `forwarderManagement.updatePoolGrant` or its MCP tool.
 - **A wait budget of 0 means "admit only if a slot is free right now"**
   (measured on the database clock). Before, it effectively never admitted.
 - **New response headers:** `x-wsmp-route` (`local | pool-fallback |
@@ -128,6 +231,60 @@ assignment provenance and automatic concurrency seed columns.
   ids and is removed by the retention sweeps; a deleted user's remaining history is purged after 24 h.
   Accounts with provider accounting still cannot be deleted (archive them).
 
+- **Browser requests from another site are refused on the API.** Every
+  cookie-authenticated `/rpc` and `/api-reference` request that a browser
+  marks as cross-site (a foreign `Origin`, or `Sec-Fetch-Site: cross-site` /
+  `same-site` without an allowed `Origin`) is refused with 403, whatever the
+  procedure or body encoding. Non-browser clients (the CLI) are unaffected.
+- **Consent, credential and paid-egress actions refuse agents in the
+  procedure itself,** not only by being left out of the MCP tool list.
+  `inferenceContributions.offer` is now human-only and no longer an MCP tool.
+- **Inference contributions lend spare capacity.** On a contributor's machine
+  a pool gets the lowest priority, no reserved slots and may always borrow:
+  the pool owner's priority, reservation and borrow settings never hold back
+  the contributor's own traffic. Pool owners no longer see a contributor's
+  live telemetry, device name or engine-load history.
+- **Agents set recipes up; people stay in control.** While MCP commands are
+  allowed on a CLI, an agent can write recipes and start or stop them. A
+  person can always start or stop any recipe from the dashboard, also after
+  turning that CLI's MCP commands off: command modes govern agents only.
+  When a person starts commands an agent wrote (tracked per command text
+  across revisions, so editing one field does not relabel the rest), the
+  dashboard shows them for review and asks for confirmation first.
+
+- **Speech-to-text recipes.** A recipe's `attachment.type` can be `llm`,
+  `embeddings` or `transcription`. A transcription deployment joins its pool
+  as a speech-to-text model for `/audio/transcriptions`, including streamed
+  results. Without a profile it receives plain JSON requests; declare an
+  optional `attachment.transcription` profile (languages, response formats,
+  timestamp granularities, diarization, language detection, upload size and
+  MIME types) so requests that use those options route to it — and note that
+  a profile also narrows what it accepts (for example a lower upload limit).
+  Agents create these recipes through the MCP recipe tools like any other.
+  Upgrade the server and every CLI together (relay protocol 2.4 only). After
+  downgrading a CLI that ran one, remove its deployment state file.
+
+- **Recipes can be renamed while stopped.** A recipe's slug can be changed
+  while none of its deployments are running, in the dashboard or by an agent
+  over MCP (`updateConfig`, while MCP commands are allowed on a CLI). A rename
+  is refused while any deployment of the recipe runs, and a slug another
+  recipe uses is refused.
+- **Legacy recipe slugs must be renamed before starting.** A recipe saved
+  earlier whose slug ends with `-` or repeats `-` (`--`) is refused at start
+  (`invalid_recipe_slug`) because nodes refuse the endpoint it would create.
+  Rename it while it is stopped, then start it.
+- **A start that stops running models asks first.** When a start or switch
+  would stop running deployments, the dashboard shows a confirm dialog naming
+  each one before anything is stopped; cancelling leaves them running.
+- **File-tool writes need a filesystem that can sync directories.** The CLI
+  now journals file-tool writes so an interrupted one can be recovered. Where
+  a file root or the CLI state directory is on a filesystem that cannot sync
+  directories (some NFS, FUSE or sshfs mounts), writes are refused with
+  `unsafe_filesystem` before anything changes. `wsmp recover` lists
+  interrupted work; `--apply` undoes only an interrupted capture or an
+  unacknowledged delete, and a rename or replace that may have published stays
+  manual. See [`apps/cli/docs/file-recovery.md`](../../apps/cli/docs/file-recovery.md).
+
 ## Fixed
 
 - **A disconnect that arrives just after a CLI reconnects no longer re-opens
@@ -146,6 +303,73 @@ assignment provenance and automatic concurrency seed columns.
   now checks the selected target against the pool owner for pool routes, and
   against the requester for own-key and direct routes (#61). The schema deploy
   above installs it.
+
+## Security fixes
+
+- **`wsmp -vv` and trace log filters no longer print credentials or relay
+  traffic.** At trace level, the CLI used to log the WebSocket client's relay
+  connection request, including the device credential (`authorization`
+  header), and every relay frame (model requests, completions, transcripts) to
+  stderr. The HTTP and WebSocket client crates (`tungstenite`, `ureq`,
+  `reqwest`, `hyper`) are now capped at INFO unless `WSMP_LOG`/`RUST_LOG`
+  names one of them explicitly. If you have shared or stored trace logs from
+  an earlier CLI, treat them as sensitive and revoke the credential or CLI
+  token they contain from the dashboard.
+
+## Per-caller `:external` wait (#181)
+
+A model-API token can store `externalAfterWaitMs` (null uses each pool's wait).
+`:external` requests may also send `x-wsmp-external-after-wait-ms`. The pool
+value is an owner floor: callers may only lengthen, up to the local capacity
+wait budget, and cannot shorten below the floor. When fallback is off, the
+caller waits the full local budget. MCP:
+`model_api_token_external_wait_update`. The column is additive and nullable
+(`APPLY_SCHEMA=safe`).
+
+## CLI identity bind and native count
+
+- **CLI devices and CLI tokens bind to the CLI identity key, not `/etc/machine-id`.**
+  Hello signs a server nonce mixed with the server origin. Every existing
+  device credential is refused until `wsmp login` is run once per machine.
+  CLI tokens TOFU-bind the identity key on first hello; the owner can reset
+  that bind from the dashboard without revoking the token. A copied
+  `service.env` cannot take over another machine once its token has
+  connected; a never-used token binds to whichever copy connects first.
+  The CLI state directory must be writable: it holds the identity key, and
+  `wsmp connect` fails without it. Hello reports
+  `identity_mismatch` when the bound key does not match. A 2.4 CLI against an
+  older server exits with an upgrade-the-server error. Unexpected server
+  failures send `protocol.error` `internal` and the CLI reconnects.
+- **Metric routing rules live in `pool_routing_rule`.** Databases built from
+  v0.3.1 never stored `model_pool.routingRules` JSON. Unreleased master
+  databases that did lose those rules on the schema push (`APPLY_SCHEMA=safe`
+  stops on the column drop; `dangerous` drops them). Re-enter the rules in
+  the dashboard after upgrading a master-built DB.
+- **Native Chat Completions counting is per endpoint.** The CLI probe writes
+  `engineFacts.countContext` onto the inference capacity (`engineCountContext`,
+  additive, `APPLY_SCHEMA=safe`). Near-ceiling Chat Completions skip native
+  count when the method is missing or `unsupported` (Ollama, SGLang, generic,
+  failed probes). When a method exists, the same `relay.request` carries
+  `countFirst` and `countCeiling`: the CLI tokenizes, then either forwards the
+  body once or returns structured `request_too_large`. Estimates never reject.
+- **Reconnect keeps the probed count method** when the engine kind is unchanged.
+  Tokenize counts above `1e12` are refused instead of closing the relay session.
+- **Engine-load history survives a reconnect.** Disconnect no longer wipes the
+  30-minute rings. New keys at the 2000-ring (or 64-per-device) cap are refused
+  while existing live rings stay; rings older than the window are pruned.
+- **`GET /v1/models` lists only ids this token can call now.** Plain pool and
+  direct ids need a published PRIMARY local member (or the direct model) with
+  a live CLI session. Empty, unpublished, and disconnected ids are omitted.
+  FULL or saturated pools stay listed. `owner/pool:external` stays when the
+  token has access, even if no local member is live.
+- **MCP `fields` for nested argument errors are dotted paths** (`rules.0.threshold`).
+  Guarded pool-create policy errors name the create input keys (`reservedSlots`,
+  `memberConcurrencyLimit`, `memberContextCeiling`, `advanced.contextMargin`).
+- **Callers that match `context_exceeded` must switch to `context_length_exceeded`.**
+  Grant spend caps use the pool's pricing currency (`POOL_GRANT` scope). OpenRouter
+  inventories may declare Chat Completions, Responses, and Anthropic Messages.
+- **Prefix-cache resets send `delta = current` with `prefixCacheReset`.** A dropped
+  reset frame is retried on the next scrape so post-restart counts are not lost.
 
 ## Post-deploy verification
 

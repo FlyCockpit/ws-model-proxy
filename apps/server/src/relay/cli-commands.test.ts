@@ -3,7 +3,12 @@ import { notifyUserBanned, onUserBanned } from "@ws-model-proxy/auth/user-ban-li
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { commandAuditDigest } from "./command-audit-digest.js";
-import { encodeRelayBinaryFrame, RELAY_REQUEST_BODY_WINDOW_CHUNKS } from "./protocol.js";
+import { generateTestHelloIdentity } from "./hello-identity.js";
+import {
+  encodeRelayBinaryFrame,
+  RELAY_MIN_PROTOCOL_VERSION,
+  RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+} from "./protocol.js";
 import { cancelRelayWorkForBannedUser } from "./user-ban.js";
 
 vi.mock("@ws-model-proxy/db", async () => {
@@ -20,6 +25,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
     MODEL_API_TRANSCRIPTION_STALE_SPOOL_MS: 24 * 60 * 60 * 1000,
     BETTER_AUTH_SECRET: "test-better-auth-secret-value-32chars!",
+    BETTER_AUTH_URL: "http://localhost:3000",
   },
 }));
 
@@ -72,6 +78,7 @@ const identity: CliWebsocketIdentity = {
 };
 
 const now = new Date("2026-01-01T00:00:00.000Z");
+const testIdentity = generateTestHelloIdentity();
 
 class FakeSocket {
   readyState = 1;
@@ -105,44 +112,52 @@ function uncompressedKey(): string {
 
 type Mode = "off" | "supervised" | "unsupervised";
 
-function hello(slug: string, features: { mcpCommandMode: Mode }) {
+function challengeNonce(socket: FakeSocket): string {
+  for (const send of socket.sends) {
+    if (typeof send !== "string") continue;
+    const parsed = JSON.parse(send) as { type?: string; nonce?: string };
+    if (parsed.type === "hello.challenge" && typeof parsed.nonce === "string") {
+      return parsed.nonce;
+    }
+  }
+  throw new Error("expected hello.challenge");
+}
+
+function challengeOrigin(socket: FakeSocket): string {
+  for (const send of socket.sends) {
+    if (typeof send !== "string") continue;
+    const parsed = JSON.parse(send) as { type?: string; origin?: string };
+    if (parsed.type === "hello.challenge" && typeof parsed.origin === "string") {
+      return parsed.origin;
+    }
+  }
+  return "http://localhost:3000";
+}
+
+function hello(socket: FakeSocket, slug: string, features: { mcpCommandMode: Mode }) {
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion: "2.8",
+    protocolVersion: RELAY_MIN_PROTOCOL_VERSION,
     cli: {
       slug,
       hostname: `${slug}.local`,
+      identityPublicKey: testIdentity.publicKey,
+      identitySignature: testIdentity.sign(challengeNonce(socket), slug, challengeOrigin(socket)),
       version: "9.9.9",
       capabilities: {
-        protocolVersion: "2.8",
-        inventoryAck: true,
-        inventoryReplace: true,
-        endpointTargeting: true,
-        binaryFrames: true,
-        cancellation: true,
-        maxBinaryChunkBytes: 1024 * 1024,
-        requestBodyStreaming: true,
-        requestBodyWindowChunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
-        sharedTokenizerTps: true,
-        standardizedMetrics: true,
-        terminal: true,
-        exec: true,
         features: {
           humanTerminal: false,
           mcpCommandMode: features.mcpCommandMode,
           terminalApproval: false,
           terminalSupported: false,
           remoteMetricSources: false,
+          remoteEngineAdapters: false,
           mcpFileRead: false,
           fileRootsConfigured: false,
           allowFileToolsAsRoot: false,
         },
         terminalPublicKey: uncompressedKey(),
-        terminalViewers: true,
-        supervisedCommands: true,
-        nodeTelemetry: true,
-        fileOps: true,
       },
     },
     endpoints: [],
@@ -155,7 +170,7 @@ async function connect(
 ) {
   const socket = new FakeSocket();
   relaySessionManager.acceptAuthenticatedSocket({ socket, identity, now });
-  await relaySessionManager.handleTextFrame(socket, hello(slug, features), now);
+  await relaySessionManager.handleTextFrame(socket, hello(socket, slug, features), now);
   return socket;
 }
 
@@ -179,6 +194,7 @@ describe("cli commands", () => {
       revokedAt: null,
       expiresAt: null,
       cliDeviceId: null,
+      identityPublicKey: null,
     });
     db.cliToken.updateMany.mockResolvedValue({ count: 1 });
     db.user.findUnique.mockResolvedValue({ slug: "owner" });
@@ -1194,7 +1210,7 @@ describe("cli commands", () => {
       });
       await relaySessionManager.handleTextFrame(
         otherSocket,
-        hello("laptop", { mcpCommandMode: "unsupervised" }),
+        hello(otherSocket, "laptop", { mcpCommandMode: "unsupervised" }),
         now,
       );
       db.cliDevice.findUnique.mockImplementation(async (args: { where: { id: string } }) => ({

@@ -8,6 +8,7 @@ type Variables = { session: Session | null };
 export type PoolMemberTestDependencies = {
   manager?: Parameters<typeof runPoolMemberTest>[0]["manager"];
   concurrencyLimiter?: ModelApiConcurrencyLimiter;
+  capacityRuntime?: Parameters<typeof runPoolMemberTest>[0]["capacityRuntime"];
 };
 
 /**
@@ -20,6 +21,7 @@ export type PoolMemberTestDependencies = {
 export function createPoolMemberTestRoutes({
   manager,
   concurrencyLimiter,
+  capacityRuntime,
 }: PoolMemberTestDependencies = {}) {
   const app = new Hono<{ Variables: Variables }>();
 
@@ -34,6 +36,7 @@ export function createPoolMemberTestRoutes({
       // G1: the HTTP request's own signal cancels the relay attempt on
       // client disconnect (same threading the MCP wrapper applies).
       signal: c.req.raw.signal,
+      ...(capacityRuntime !== undefined ? { capacityRuntime } : {}),
       ...(manager !== undefined ? { manager } : {}),
       ...(concurrencyLimiter !== undefined ? { concurrencyLimiter } : {}),
     });

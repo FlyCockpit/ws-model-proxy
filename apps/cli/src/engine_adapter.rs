@@ -158,6 +158,9 @@ pub struct EngineAdapterConfig {
     pub timeout_secs: u32,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub map: BTreeMap<AdapterSignal, SignalSelector>,
+    /// Optional POST path that counts Chat Completions tokens, like a load route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_route: Option<String>,
 }
 
 fn default_interval_secs() -> u32 {
@@ -198,6 +201,10 @@ impl EngineAdapterConfig {
             if selector.series.trim().is_empty() {
                 bail!("adapter map series cannot be empty");
             }
+        }
+        if let Some(route) = &self.count_route {
+            validate_route(route)
+                .map_err(|reason| anyhow::anyhow!("adapter count route is invalid: {reason}"))?;
         }
         Ok(())
     }
@@ -314,23 +321,26 @@ pub enum LoadPlan {
     Adapter(EngineAdapterConfig),
 }
 
-/// Relative path on the endpoint root: no scheme, host, `..`, query, or fragment.
+/// Path on the endpoint origin: one leading `/`, no scheme, host, whitespace,
+/// `..`, query, or fragment. `Url::join` still has to stay on that origin.
 pub fn validate_route(route: &str) -> Result<(), &'static str> {
-    let route = route.trim();
     if route.is_empty() {
         return Err("empty");
     }
-    if route.as_bytes().contains(&0) {
-        return Err("nul");
+    if route.bytes().any(|byte| byte <= 32 || byte == 127) {
+        return Err("control");
     }
     if route.contains('\\') {
         return Err("backslash");
     }
-    if route.contains("://") {
+    if has_scheme_prefix(route) {
         return Err("scheme");
     }
     if route.starts_with("//") {
         return Err("host");
+    }
+    if !route.starts_with('/') {
+        return Err("path");
     }
     if route.contains("..") {
         return Err("parent");
@@ -342,6 +352,22 @@ pub fn validate_route(route: &str) -> Result<(), &'static str> {
         return Err("fragment");
     }
     Ok(())
+}
+
+fn has_scheme_prefix(route: &str) -> bool {
+    let bytes = route.as_bytes();
+    if bytes.first().is_none_or(|byte| !byte.is_ascii_alphabetic()) {
+        return false;
+    }
+    for byte in bytes.iter().skip(1) {
+        if *byte == b':' {
+            return true;
+        }
+        if !byte.is_ascii_alphanumeric() && !matches!(byte, b'+' | b'-' | b'.') {
+            return false;
+        }
+    }
+    false
 }
 
 /// Parse `--map signal=series[{k="v"}][*scale]`.
@@ -627,6 +653,7 @@ fn normalize(
             .map(|value| *value as u64),
         prefix_cache_hits_total: values.get(&AdapterSignal::PrefixCacheHitsTotal).copied(),
         prefix_cache_queries_total: values.get(&AdapterSignal::PrefixCacheQueriesTotal).copied(),
+        process_start_time_seconds: None,
         source: LoadSource::Custom,
     });
     let error = if reading.is_some() {
@@ -660,9 +687,12 @@ fn normalize_signal(signal: AdapterSignal, value: f64) -> Option<f64> {
         AdapterSignal::Running
         | AdapterSignal::Waiting
         | AdapterSignal::SlotsBusy
-        | AdapterSignal::Deferred
-        | AdapterSignal::PrefixCacheHitsTotal
-        | AdapterSignal::PrefixCacheQueriesTotal => drop_count(value, LOAD_COUNT_MAX),
+        | AdapterSignal::Deferred => drop_count(value, LOAD_COUNT_MAX),
+        AdapterSignal::PrefixCacheHitsTotal | AdapterSignal::PrefixCacheQueriesTotal => {
+            // Cumulative since engine start; bound like byte counters so a
+            // long-uptime engine keeps reporting. Wire values are deltas.
+            drop_count(value, crate::telemetry::BYTE_COUNTER_MAX)
+        }
         AdapterSignal::Slots => drop_count(value, SLOTS_MAX).filter(|kept| *kept >= 1.0),
         AdapterSignal::KvTokens | AdapterSignal::MaxModelLen | AdapterSignal::CtxPerSlot => {
             drop_count(value, TOKEN_COUNT_MAX).filter(|kept| *kept >= 1.0)
@@ -678,10 +708,41 @@ fn drop_count(value: f64, max: u64) -> Option<f64> {
     (rounded <= max as f64).then_some(rounded)
 }
 
+/// Local adapter, else an approved remote adapter for this endpoint.
+pub fn effective_engine_adapter(
+    endpoint: &EndpointConfig,
+    remote: &[RemoteEngineAdapter],
+    allow_remote: bool,
+    approved: &std::collections::BTreeMap<String, String>,
+) -> Option<EngineAdapterConfig> {
+    if let Some(spec) = endpoint.engine_adapter.clone() {
+        return spec.validate().is_ok().then_some(spec);
+    }
+    let adapter = remote
+        .iter()
+        .find(|adapter| adapter.endpoint_slug == endpoint.slug)?;
+    let spec = adapter.to_config();
+    (remote_adapter_eligibility(
+        &spec,
+        &adapter.endpoint_slug,
+        allow_remote,
+        false,
+        approved.get(&adapter.endpoint_slug).map(String::as_str),
+    ) == RemoteAdapterEligibility::Run)
+        .then_some(spec)
+}
+
 /// Probe-time adapter facts. `None` keeps the previous cache (a short outage
 /// must not drop K to null).
 pub fn probe_facts(endpoint: &EndpointConfig) -> Option<AdapterCachedFacts> {
-    let spec = endpoint.engine_adapter.as_ref()?;
+    probe_facts_with(endpoint, endpoint.engine_adapter.as_ref())
+}
+
+pub fn probe_facts_with(
+    endpoint: &EndpointConfig,
+    spec: Option<&EngineAdapterConfig>,
+) -> Option<AdapterCachedFacts> {
+    let spec = spec?;
     match sample(endpoint, spec, None) {
         Ok(sample) if !sample.facts.is_empty() => Some(sample.facts),
         _ => None,
@@ -797,7 +858,7 @@ fn canonical_value(value: &serde_json::Value) -> String {
 
 /// Compact JSON with sorted keys; SHA-256 of this is the approval pin.
 pub fn canonical_spec_json(endpoint_slug: &str, spec: &EngineAdapterConfig) -> String {
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
         "endpointSlug": endpoint_slug,
         "format": spec.format,
         "input": spec.input,
@@ -805,6 +866,11 @@ pub fn canonical_spec_json(endpoint_slug: &str, spec: &EngineAdapterConfig) -> S
         "map": spec.map,
         "timeoutSecs": spec.timeout_secs,
     });
+    if let Some(route) = &spec.count_route
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("countRoute".to_string(), serde_json::json!(route));
+    }
     canonical_value(&value)
 }
 
@@ -889,24 +955,26 @@ mod tests {
     fn json_spec(map: BTreeMap<AdapterSignal, SignalSelector>) -> EngineAdapterConfig {
         EngineAdapterConfig {
             input: AdapterInput::Route {
-                route: "stats".to_string(),
+                route: "/stats".to_string(),
             },
             format: AdapterFormat::Json,
             interval_secs: 2,
             timeout_secs: 2,
             map,
+            count_route: None,
         }
     }
 
     fn prom_spec(map: BTreeMap<AdapterSignal, SignalSelector>) -> EngineAdapterConfig {
         EngineAdapterConfig {
             input: AdapterInput::Route {
-                route: "metrics".to_string(),
+                route: "/metrics".to_string(),
             },
             format: AdapterFormat::Prometheus,
             interval_secs: 2,
             timeout_secs: 2,
             map,
+            count_route: None,
         }
     }
 
@@ -921,17 +989,21 @@ mod tests {
 
     #[test]
     fn route_validation_rejects_scheme_host_parent_query_and_fragment() {
-        assert_eq!(validate_route("metrics"), Ok(()));
         assert_eq!(validate_route("/metrics"), Ok(()));
-        assert_eq!(validate_route("v1/stats.json"), Ok(()));
+        assert_eq!(validate_route("/v1/load"), Ok(()));
         assert_eq!(validate_route(""), Err("empty"));
-        assert_eq!(validate_route("  "), Err("empty"));
+        assert_eq!(validate_route("  "), Err("control"));
+        assert_eq!(validate_route("https:evil.example/x"), Err("scheme"));
+        assert_eq!(validate_route("http:foo"), Err("scheme"));
         assert_eq!(validate_route("http://127.0.0.1/metrics"), Err("scheme"));
-        assert_eq!(validate_route("//host/metrics"), Err("host"));
-        assert_eq!(validate_route("../metrics"), Err("parent"));
-        assert_eq!(validate_route("foo/../metrics"), Err("parent"));
-        assert_eq!(validate_route("metrics?full=1"), Err("query"));
-        assert_eq!(validate_route("metrics#a"), Err("fragment"));
+        assert_eq!(validate_route("//evil.example/x"), Err("host"));
+        assert_eq!(validate_route("/\t/evil.example/x"), Err("control"));
+        assert_eq!(validate_route(" /abs"), Err("control"));
+        assert_eq!(validate_route("foo/bar"), Err("path"));
+        assert_eq!(validate_route("metrics"), Err("path"));
+        assert_eq!(validate_route("/foo/../metrics"), Err("parent"));
+        assert_eq!(validate_route("/metrics?full=1"), Err("query"));
+        assert_eq!(validate_route("/metrics#a"), Err("fragment"));
     }
 
     #[test]
@@ -994,6 +1066,46 @@ hits{model=\"b\"} 5
     }
 
     #[test]
+    fn prefix_cache_counters_use_the_byte_counter_bound() {
+        let spec = json_spec(BTreeMap::new());
+        let kept = parse_adapter_body(
+            &spec,
+            r#"{"running": 1, "prefixCacheHitsTotal": 1000001, "prefixCacheQueriesTotal": 2000000}"#,
+        )
+        .expect("parse");
+        let reading = kept.reading.expect("running");
+        assert_eq!(reading.prefix_cache_hits_total, Some(1_000_001.0));
+        assert_eq!(reading.prefix_cache_queries_total, Some(2_000_000.0));
+        // Long-uptime totals above the token bound (1e12) must still report.
+        let long_uptime = parse_adapter_body(
+            &spec,
+            r#"{"running": 1, "prefixCacheHitsTotal": 1000000000001}"#,
+        )
+        .expect("parse");
+        assert_eq!(
+            long_uptime
+                .reading
+                .expect("running")
+                .prefix_cache_hits_total,
+            Some(1_000_000_000_001.0)
+        );
+        let over = crate::telemetry::BYTE_COUNTER_MAX as f64 + 1.0;
+        let dropped = parse_adapter_body(
+            &spec,
+            &format!(r#"{{"running": 1, "prefixCacheHitsTotal": {over}}}"#),
+        )
+        .expect("parse");
+        assert_eq!(
+            dropped.reading.expect("running").prefix_cache_hits_total,
+            None
+        );
+        assert!(dropped.dropped.iter().any(|row| {
+            row.signal == AdapterSignal::PrefixCacheHitsTotal
+                && row.reason == DropReason::OutOfRange
+        }));
+    }
+
+    #[test]
     fn a_reading_without_running_is_not_sent() {
         let spec = json_spec(BTreeMap::new());
         let sample = parse_adapter_body(&spec, r#"{"waiting": 2, "kvUsage": 0.2}"#).expect("parse");
@@ -1029,6 +1141,57 @@ hits{model=\"b\"} 5
     }
 
     #[test]
+    fn effective_adapter_prefers_local_then_approved_remote() {
+        let endpoint = EndpointConfig {
+            slug: "gpu".to_string(),
+            engine: crate::config::EndpointEngine::Generic,
+            ..EndpointConfig::default()
+        };
+        let remote = crate::protocol::RemoteEngineAdapter {
+            endpoint_slug: "gpu".to_string(),
+            input: AdapterInput::Route {
+                route: "/stats".to_string(),
+            },
+            format: AdapterFormat::Json,
+            interval_secs: 2,
+            timeout_secs: 2,
+            map: BTreeMap::new(),
+            count_route: None,
+        };
+        let spec = remote.to_config();
+        let hash = spec_sha256("gpu", &spec);
+        let mut approved = BTreeMap::new();
+        approved.insert("gpu".to_string(), hash);
+        assert!(
+            effective_engine_adapter(&endpoint, std::slice::from_ref(&remote), false, &approved)
+                .is_none(),
+            "without opt-in the remote stays off"
+        );
+        let effective =
+            effective_engine_adapter(&endpoint, std::slice::from_ref(&remote), true, &approved)
+                .expect("run");
+        assert_eq!(effective, spec);
+        let mut local = endpoint.clone();
+        local.engine_adapter = Some(EngineAdapterConfig {
+            input: AdapterInput::Route {
+                route: "/local-stats".to_string(),
+            },
+            format: AdapterFormat::Json,
+            interval_secs: 2,
+            timeout_secs: 2,
+            map: BTreeMap::new(),
+            count_route: None,
+        });
+        let shadowed = effective_engine_adapter(&local, &[remote], true, &approved).expect("local");
+        assert_eq!(
+            shadowed.input,
+            AdapterInput::Route {
+                route: "/local-stats".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn prometheus_without_map_is_a_parse_error() {
         let spec = prom_spec(BTreeMap::new());
         assert_eq!(
@@ -1048,6 +1211,7 @@ hits{model=\"b\"} 5
             interval_secs: 2,
             timeout_secs: 1,
             map: BTreeMap::new(),
+            count_route: None,
         };
         let endpoint = EndpointConfig {
             slug: "local".to_string(),
@@ -1070,6 +1234,7 @@ hits{model=\"b\"} 5
             interval_secs: 2,
             timeout_secs: 2,
             map: BTreeMap::new(),
+            count_route: None,
         }
     }
 
@@ -1083,16 +1248,17 @@ hits{model=\"b\"} 5
         map.insert(AdapterSignal::Running, selector("my_running", Some(1.0)));
         let mapped = EngineAdapterConfig {
             input: AdapterInput::Route {
-                route: "metrics".to_string(),
+                route: "/metrics".to_string(),
             },
             format: AdapterFormat::Prometheus,
             interval_secs: 2,
             timeout_secs: 2,
             map,
+            count_route: None,
         };
         assert_eq!(
             canonical_spec_json("gpu", &mapped),
-            r#"{"endpointSlug":"gpu","format":"prometheus","input":{"route":"metrics"},"intervalSecs":2,"map":{"running":{"scale":1,"series":"my_running"}},"timeoutSecs":2}"#
+            r#"{"endpointSlug":"gpu","format":"prometheus","input":{"route":"/metrics"},"intervalSecs":2,"map":{"running":{"scale":1,"series":"my_running"}},"timeoutSecs":2}"#
         );
         assert_ne!(
             spec_sha256("gpu", &command_spec()),
@@ -1124,5 +1290,25 @@ hits{model=\"b\"} 5
             remote_adapter_eligibility(&spec, "gpu", true, true, Some(&hash)),
             RemoteAdapterEligibility::Refused
         );
+    }
+
+    #[test]
+    fn remote_route_that_leaves_origin_is_refused_even_with_a_matching_hash() {
+        let spec = EngineAdapterConfig {
+            input: AdapterInput::Route {
+                route: "https:evil.example/x".to_string(),
+            },
+            format: AdapterFormat::Json,
+            interval_secs: 2,
+            timeout_secs: 2,
+            map: BTreeMap::new(),
+            count_route: None,
+        };
+        let hash = spec_sha256("gpu", &spec);
+        assert_eq!(
+            remote_adapter_eligibility(&spec, "gpu", true, false, Some(&hash)),
+            RemoteAdapterEligibility::Refused
+        );
+        assert!(spec.validate().is_err());
     }
 }

@@ -1,4 +1,4 @@
-//! Long-lived CLI identity key for terminal pinning (protocol 2.5).
+//! Long-lived CLI identity key for device bind and terminal pinning.
 //!
 //! The daemon's ECDH terminal key is generated on every start and never
 //! written. This P-256 ECDSA key is created once in `terminal-identity.json`
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::approvals::write_private_atomic;
 use crate::terminal_crypto::{
     decode_exact, decode_public_key, encode_b64url, identity_fingerprint, identity_public_raw,
-    sign_cli_identity,
+    sign_cli_identity, sign_hello_identity,
 };
 
 const IDENTITY_FILE: &str = "terminal-identity.json";
@@ -109,6 +109,17 @@ impl CliIdentity {
             public_key: self.public_b64url(),
             signature: encode_b64url(&signature),
         })
+    }
+
+    /// Signs the server nonce and origin from `hello.challenge`.
+    pub fn sign_hello(&self, nonce_b64url: &str, cli_slug: &str, origin: &str) -> Result<String> {
+        let nonce = decode_exact(nonce_b64url, 16).context("decoding the hello challenge nonce")?;
+        let nonce: [u8; 16] = nonce
+            .as_slice()
+            .try_into()
+            .context("hello challenge nonce is not 16 bytes")?;
+        let signature = sign_hello_identity(&self.signing_key, &nonce, cli_slug, origin)?;
+        Ok(encode_b64url(&signature))
     }
 
     fn to_file(&self) -> IdentityFile {

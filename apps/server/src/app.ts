@@ -888,6 +888,22 @@ export async function createApp(options: CreateAppOptions = {}) {
   app.use("/rpc/*", createRateLimiterMiddleware(rpcLimiter));
   app.use("/api-reference/*", createRateLimiterMiddleware(rpcLimiter));
 
+  // Cookie-authenticated oRPC and OpenAPI mutations refuse a browser request
+  // that proves it is cross-site (a foreign Origin, or Sec-Fetch-Site
+  // cross-site/same-site with no allowed Origin), whatever the procedure and
+  // body encoding. This backs up the per-procedure CSRF header list below for
+  // same-site sibling origins. Non-browser clients (the CLI) send neither
+  // header and stay unaffected.
+  const rpcSameOriginGuard = createSameOriginGuard({
+    allowedOrigins: [
+      new URL(env.BETTER_AUTH_URL).origin,
+      ...(env.CORS_ORIGIN ? [new URL(env.CORS_ORIGIN).origin] : []),
+    ],
+    allowNonBrowser: true,
+  });
+  app.use("/rpc/*", rpcSameOriginGuard);
+  app.use("/api-reference/*", rpcSameOriginGuard);
+
   // When CORS_ORIGIN is set (cross-origin deployment), validate the x-csrf-token
   // header sent by the client's SimpleCsrfProtectionLinkPlugin on every
   // procedure. Same-origin deployments check it only on the procedures in

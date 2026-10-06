@@ -703,7 +703,20 @@ fn exchangeless_dispose_failures_report_private_alias_and_original() {
         let dirs = recovery_dirs(&fx.root);
         assert_eq!(dirs.len(), 1);
         assert_eq!(
-            std::fs::read_dir(&dirs[0]).unwrap().count(),
+            std::fs::read_dir(&dirs[0])
+                .unwrap()
+                .filter(|entry| {
+                    let name = entry
+                        .as_ref()
+                        .ok()
+                        .map(|e| e.file_name())
+                        .unwrap_or_default();
+                    name != "INTENT"
+                        && name != "INTENT.new"
+                        && name != ".wsmp-lock"
+                        && !name.to_string_lossy().starts_with(".wsmp-pin-")
+                })
+                .count(),
             2,
             "both private T names survive"
         );
@@ -735,7 +748,27 @@ fn exchangeless_dispose_failures_report_private_alias_and_original() {
         let aliases = result_paths(&value);
         assert!(has_bytes(&aliases, EDITED), "{value}");
         use std::os::unix::fs::MetadataExt;
-        assert_eq!(std::fs::metadata(fx.root.join("doc")).unwrap().nlink(), 2);
+        let dir = recovery_dirs(&fx.root).pop().expect("recovery");
+        let public = std::fs::metadata(fx.root.join("doc")).unwrap();
+        let own_pins = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".wsmp-pin-")
+            })
+            .filter(|entry| {
+                std::fs::symlink_metadata(entry.path())
+                    .is_ok_and(|pin| (pin.dev(), pin.ino()) == (public.dev(), public.ino()))
+            })
+            .count() as u64;
+        assert_eq!(
+            public.nlink() - own_pins,
+            2,
+            "exactly public + retained private alias, excluding durable identity pins"
+        );
         assert_eq!(fx.get("doc"), EDITED);
         let new_etag = fx.etag("doc");
         assert_eq!(
@@ -1368,7 +1401,8 @@ fn exchangeless_restore_link_unlink_has_no_descriptor_on_disposed_inode() {
     assert_eq!(error.code, ErrorCode::UnsafeFilesystem);
     assert_eq!(fx.get("src"), "source contents\n");
     assert_eq!(fx.get("dst"), ORIGINAL);
-    assert_eq!(*checks.lock().unwrap(), 1);
+    // Exchange-first fails closed before capturing, so no restore-alias unlink.
+    assert_eq!(*checks.lock().unwrap(), 0);
     clean(&fx);
 }
 
@@ -1507,6 +1541,7 @@ fn real_fixture(directory: &Path) -> Fx {
         ),
         cancel: Cancel::new(),
         steps: Arc::new(Mutex::new(Vec::new())),
+        _registry: crate::file_ops::registry::install_temp_registry(),
     }
 }
 
@@ -2046,7 +2081,8 @@ fn exchangeless_overwrite_initial_mismatch_closes_matching_proofs_for_restore() 
             )
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::Conflict);
-        assert_eq!(checks.lock().unwrap().len(), 1);
+        // Exchange-first refuses dest/src identity failures before capturing.
+        assert_eq!(checks.lock().unwrap().len(), 0);
         assert_eq!(
             fx.get("src"),
             if captured_destination {
@@ -2116,7 +2152,8 @@ fn exchangeless_supported_overwrite_undo_releases_source_and_destination() {
         )
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Conflict);
-    assert_eq!(*checks.lock().unwrap(), 2);
+    // Exchange-first identity failure is before the swap; nothing to restore.
+    assert_eq!(*checks.lock().unwrap(), 0);
     assert_eq!(fx.get("src"), ORIGINAL);
     assert_eq!(fx.get("dst"), RACER);
     clean(&fx);

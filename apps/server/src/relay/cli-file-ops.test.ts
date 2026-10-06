@@ -8,10 +8,11 @@ import {
   readCliAgentAdmission,
   revokeOpenCliAgentAdmissions,
 } from "./cli-agent-admission.js";
+import { generateTestHelloIdentity } from "./hello-identity.js";
 import {
   encodeRelayBinaryFrame,
   parseRelayBinaryFrame,
-  RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+  RELAY_MIN_PROTOCOL_VERSION,
 } from "./protocol.js";
 import { cancelRelayWorkForBannedUser } from "./user-ban.js";
 
@@ -28,6 +29,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES: 0,
     MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
     MODEL_API_TRANSCRIPTION_STALE_SPOOL_MS: 24 * 60 * 60 * 1000,
+    BETTER_AUTH_URL: "http://localhost:3000",
   },
 }));
 
@@ -78,6 +80,8 @@ const identity: CliWebsocketIdentity = {
 };
 
 const now = new Date("2026-01-01T00:00:00.000Z");
+const testIdentity = generateTestHelloIdentity();
+
 const waitFor = <T>(fn: () => T) => vi.waitFor(fn, { interval: 1 });
 const OP_TOKEN = { userId: "user-id", tokenId: "token", expiresAt: null } as const;
 
@@ -129,44 +133,41 @@ function uncompressedKey(): string {
 
 type Mode = "off" | "supervised" | "unsupervised";
 
-function hello(slug: string, mode: Mode, readSwitch = false, roots = false) {
+function challengeNonce(socket: FakeSocket): string {
+  for (const send of socket.sends) {
+    if (typeof send !== "string") continue;
+    const parsed = JSON.parse(send) as { type?: string; nonce?: string };
+    if (parsed.type === "hello.challenge" && typeof parsed.nonce === "string") {
+      return parsed.nonce;
+    }
+  }
+  throw new Error("expected hello.challenge");
+}
+
+function hello(socket: FakeSocket, slug: string, mode: Mode, readSwitch = false, roots = false) {
   return JSON.stringify({
     type: "hello",
     id: `hello-${slug}`,
-    protocolVersion: "2.8",
+    protocolVersion: RELAY_MIN_PROTOCOL_VERSION,
     cli: {
       slug,
       hostname: `${slug}.local`,
+      identityPublicKey: testIdentity.publicKey,
+      identitySignature: testIdentity.sign(challengeNonce(socket), slug, "http://localhost:3000"),
       version: "9.9.9",
       capabilities: {
-        protocolVersion: "2.8",
-        inventoryAck: true,
-        inventoryReplace: true,
-        endpointTargeting: true,
-        binaryFrames: true,
-        cancellation: true,
-        maxBinaryChunkBytes: 1024 * 1024,
-        requestBodyStreaming: true,
-        requestBodyWindowChunks: RELAY_REQUEST_BODY_WINDOW_CHUNKS,
-        sharedTokenizerTps: true,
-        standardizedMetrics: true,
-        terminal: true,
-        exec: true,
         features: {
           humanTerminal: false,
           mcpCommandMode: mode,
           terminalApproval: false,
           terminalSupported: false,
           remoteMetricSources: false,
+          remoteEngineAdapters: false,
           mcpFileRead: readSwitch,
           fileRootsConfigured: roots,
           allowFileToolsAsRoot: false,
         },
         terminalPublicKey: uncompressedKey(),
-        terminalViewers: true,
-        supervisedCommands: true,
-        nodeTelemetry: true,
-        fileOps: true,
       },
     },
     endpoints: [],
@@ -181,7 +182,11 @@ async function connect(
 ) {
   const socket = new FakeSocket();
   relaySessionManager.acceptAuthenticatedSocket({ socket, identity, now });
-  await relaySessionManager.handleTextFrame(socket, hello(slug, mode, readSwitch, roots), now);
+  await relaySessionManager.handleTextFrame(
+    socket,
+    hello(socket, slug, mode, readSwitch, roots),
+    now,
+  );
   socket.sends.length = 0;
   return socket;
 }
@@ -283,6 +288,7 @@ describe("cli file ops", () => {
       revokedAt: null,
       expiresAt: null,
       cliDeviceId: null,
+      identityPublicKey: null,
     });
     db.cliToken.updateMany.mockResolvedValue({ count: 1 });
     db.user.findUnique.mockResolvedValue({ slug: "owner" });
@@ -577,6 +583,9 @@ describe("cli file ops", () => {
   });
 
   describe("post-commit device grant refresh", () => {
+    beforeEach(() => {
+      vi.spyOn(relaySessionManager, "onRemoteEngineAdaptersChanged").mockResolvedValue(false);
+    });
     const policy = (mode: Mode, mcpFileRead: boolean) => ({
       id: "desktop",
       userId: "user-id",
@@ -815,7 +824,7 @@ describe("cli file ops", () => {
         relaySessionManager.acceptAuthenticatedSocket({ socket: replacement, identity, now });
         const reconnect = relaySessionManager.handleTextFrame(
           replacement,
-          hello("desktop", initialMode, true, true),
+          hello(replacement, "desktop", initialMode, true, true),
           now,
         );
         await committed.promise;
@@ -912,7 +921,7 @@ describe("cli file ops", () => {
       relaySessionManager.acceptAuthenticatedSocket({ socket: replacement, identity, now });
       const reconnect = relaySessionManager.handleTextFrame(
         replacement,
-        hello("desktop", "off", true, true),
+        hello(replacement, "desktop", "off", true, true),
         now,
       );
       await committed.promise;
@@ -967,7 +976,7 @@ describe("cli file ops", () => {
         relaySessionManager.acceptAuthenticatedSocket({ socket, identity, now });
         const registration = relaySessionManager.handleTextFrame(
           socket,
-          hello("desktop", "off", true, true),
+          hello(socket, "desktop", "off", true, true),
           now,
         );
         await committed.promise;
@@ -977,10 +986,16 @@ describe("cli file ops", () => {
         db.cliDevice.findUnique.mockClear();
         release.resolve();
         await registration;
-        // Hello already reads remote metric sources; no additional policy read.
-        expect(db.cliDevice.findUnique).toHaveBeenCalledExactlyOnceWith({
+        // Hello already reads remote metric sources and engine adapters;
+        // no additional policy read.
+        expect(db.cliDevice.findUnique).toHaveBeenCalledTimes(2);
+        expect(db.cliDevice.findUnique).toHaveBeenCalledWith({
           where: { id: "desktop" },
           select: { userId: true, mcpCommandMode: true, remoteMetricSources: true },
+        });
+        expect(db.cliDevice.findUnique).toHaveBeenCalledWith({
+          where: { id: "desktop" },
+          select: { userId: true, mcpCommandMode: true, remoteEngineAdapters: true },
         });
         expect(queue().size).toBe(0);
         expect(metrics).toHaveBeenCalledTimes(change === "none" ? 0 : 1);
@@ -1723,41 +1738,6 @@ describe("cli file ops", () => {
       await expect(
         runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op: "read", args: readArgs }),
       ).resolves.toEqual({ ok: false, code: "supervised_only" });
-      expect(socket.frames("file.op")).toEqual([]);
-    });
-
-    it("refuses every op offline when the live 2.8 session does not run file ops", async () => {
-      // A live 2.8 session whose features lack `fileOps` (the flag is ANDed into
-      // `getLiveCliFeatures().fileOps`, and the server's strict hello schema
-      // pins it true today) must dispatch nothing, even with the grant and the
-      // read switch on. Reached by dropping the recorded feature on the live
-      // session.
-      db.cliDevice.findUnique.mockImplementation(deviceRow("UNSUPERVISED", { mcpFileRead: true }));
-      const socket = await connect("desktop", "unsupervised", true, true);
-      relaySessionManager.applyFeatureGrants("desktop", {
-        allowHumanTerminal: false,
-        mcpCommandMode: "unsupervised",
-        mcpFileRead: true,
-      });
-      const session = (
-        Reflect.get(relaySessionManager, "sessionsByCliDeviceId") as Map<
-          string,
-          { features: Record<string, unknown> | null }
-        >
-      ).get("desktop");
-      expect(session?.features?.fileOps).toBe(true);
-      if (session) session.features = { ...session.features, fileOps: false };
-      expect(relaySessionManager.getLiveCliFeatures(["desktop"]).get("desktop")?.fileOps).toBe(
-        false,
-      );
-      for (const [op, args] of [
-        ["read", readArgs],
-        ["edit", editArgs],
-      ] as const) {
-        await expect(runFileOp({ ...OP_TOKEN, cliDeviceId: "desktop", op, args })).resolves.toEqual(
-          { ok: false, code: "offline" },
-        );
-      }
       expect(socket.frames("file.op")).toEqual([]);
     });
 
@@ -2635,7 +2615,7 @@ describe("cli file ops", () => {
         identity: { ...identity, id: "token-id-other", userId: "other-user" },
         now,
       });
-      await relaySessionManager.handleTextFrame(other, hello("laptop", "unsupervised"), now);
+      await relaySessionManager.handleTextFrame(other, hello(other, "laptop", "unsupervised"), now);
       other.sends.length = 0;
       db.cliDevice.findUnique.mockImplementation((args: { where: { id: string } }) => ({
         id: args.where.id,

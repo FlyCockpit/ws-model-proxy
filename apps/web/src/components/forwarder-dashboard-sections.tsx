@@ -1,5 +1,6 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { EXTERNAL_AFTER_WAIT_MS_MAX } from "@ws-model-proxy/api/lib/caller-external-wait";
 import { grantPoolAccessServerMessage } from "@ws-model-proxy/api/lib/effective-provider-egress";
 import type { ExternalRouteKind } from "@ws-model-proxy/api/lib/model-api-token-access";
 import {
@@ -21,6 +22,12 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@ws-model-proxy/ui/components/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@ws-model-proxy/ui/components/dropdown-menu";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import {
@@ -32,9 +39,20 @@ import {
 } from "@ws-model-proxy/ui/components/sheet";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
+import { Switch } from "@ws-model-proxy/ui/components/switch";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@ws-model-proxy/ui/components/tabs";
 import { Textarea } from "@ws-model-proxy/ui/components/textarea";
 import { cn } from "@ws-model-proxy/ui/lib/utils";
-import { Copy, Eye, EyeOff, Gauge, Plus, Trash2 } from "lucide-react";
+import {
+  Cloud,
+  Copy,
+  Eye,
+  EyeOff,
+  MoreHorizontal,
+  Plus,
+  SlidersHorizontal,
+  Trash2,
+} from "lucide-react";
 import type { ReactNode } from "react";
 import { useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -44,11 +62,23 @@ import { CliAgentActivity } from "@/components/cli-agent-activity";
 import { CliDeviceEngineAdapters } from "@/components/cli-device-engine-adapters";
 import { CliDeviceFeatureSwitches } from "@/components/cli-device-feature-switches";
 import { CliDeviceMetricSources } from "@/components/cli-device-metric-sources";
+import { CliDeviceNodeCard } from "@/components/cli-device-node-card";
 import { CliDeviceRename } from "@/components/cli-device-rename";
+import { CliAccessSummary } from "@/components/clis/cli-access-summary";
+import {
+  type CliDeviceFilter,
+  CliDeviceStatusBadge,
+  cliDeviceMatchesFilter,
+  cliDeviceNeedsAttention,
+  cliDeviceOnline,
+  EndpointStatusBadge,
+} from "@/components/clis/cli-device-status";
+import { ConnectCliDialog } from "@/components/clis/connect-cli-dialog";
 import { ConfirmDeleteDialog } from "@/components/confirm-delete-dialog";
 import { InlineRetry } from "@/components/inline-retry";
 import { PoolFallbackBadge } from "@/components/pool-fallback-badge";
 import { SegmentedControl } from "@/components/segmented-control";
+import { TimeAgo } from "@/components/time-ago";
 import { WideContent } from "@/components/wide-content";
 import {
   capacityAttachmentChange,
@@ -85,7 +115,6 @@ type CapacityRow = Awaited<ReturnType<AppRouterClient["capacityManagement"]["lis
 type CapacityAvailability = "enabled" | "disabled" | "loading" | "error";
 type ScopeMode = "ALL_VISIBLE" | "ALLOWLIST";
 type RoutingStatus = "ACTIVE" | "DRAINING" | "DISABLED";
-type EndpointHealthFilter = "all" | "online" | "offline" | "stale";
 type DeleteTarget =
   | { kind: "cli"; id: string; label: string }
   | { kind: "endpoint"; id: string; label: string }
@@ -249,7 +278,14 @@ function SecretDisplay({ secret, label }: { secret: string; label: string }) {
   );
 }
 
-export function CopyableModelId({ modelId }: { modelId: string }) {
+export function CopyableModelId({
+  modelId,
+  copyLabel,
+}: {
+  modelId: string;
+  /** Accessible name of the copy button when the text is not a model id. */
+  copyLabel?: string;
+}) {
   const { t } = useTranslation(["common", "dashboard"]);
   return (
     <div className="flex min-w-0 items-center gap-1">
@@ -260,7 +296,7 @@ export function CopyableModelId({ modelId }: { modelId: string }) {
         variant="ghost"
         className="shrink-0"
         onClick={() => copyToClipboard(modelId, t("common:actions.copied"))}
-        aria-label={t("dashboard:actions.copyModelId")}
+        aria-label={copyLabel ?? t("dashboard:actions.copyModelId")}
       >
         <Copy className="size-4" />
       </Button>
@@ -572,7 +608,7 @@ function modelSupportsTransformerModalities(
   return true;
 }
 
-export function CliEndpointsModelsSection() {
+export function CliEndpointsModelsSection({ lang }: { lang: string }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
   const capacityAvailability = resolveCapacityAvailability();
@@ -590,20 +626,22 @@ export function CliEndpointsModelsSection() {
     retry: false,
     enabled: capacityEnabled,
   });
-  const [policyModel, setPolicyModel] = useState<DirectModelOption | null>(null);
+  // Only the id is held: the sheet reads the model from fresh query data, so
+  // a save that refetches is reflected before the next toggle builds on it.
+  const [configModelId, setConfigModelId] = useState<string | null>(null);
+  const configModel =
+    configModelId === null
+      ? null
+      : (allDirectModels(devicesData ?? []).find((model) => model.id === configModelId) ?? null);
   const [search, setSearch] = useState("");
-  const [healthFilter, setHealthFilter] = useState<EndpointHealthFilter>("all");
+  const [deviceFilter, setDeviceFilter] = useState<CliDeviceFilter>("all");
   const matchingDevices = useMemo(() => {
     const needle = search.trim().toLocaleLowerCase();
     return (devicesData ?? []).flatMap((device) => {
+      // Filters act on machines; the search then narrows their servers and models.
+      if (!cliDeviceMatchesFilter(device, deviceFilter)) return [];
       const deviceMatches = cliDeviceMatchesSearch(device, needle);
       const endpoints = device.endpoints.flatMap((endpoint) => {
-        const matchesHealth =
-          healthFilter === "all" ||
-          (healthFilter === "online" && endpoint.status === "ONLINE") ||
-          (healthFilter === "offline" && endpoint.status === "OFFLINE") ||
-          (healthFilter === "stale" && device.isStale);
-        if (!matchesHealth) return [];
         if (!needle) return [{ ...endpoint }];
         const endpointMatches = [endpoint.slug, endpoint.label].some((value) =>
           value.toLocaleLowerCase().includes(needle),
@@ -616,16 +654,11 @@ export function CliEndpointsModelsSection() {
         if (!endpointMatches && models.length === 0) return [];
         return [{ ...endpoint, models: endpointMatches ? endpoint.models : models }];
       });
-      if (!needle) {
-        if (healthFilter === "all") return [{ ...device, endpoints }];
-        return endpoints.length > 0 ? [{ ...device, endpoints }] : [];
-      }
+      if (!needle) return [{ ...device, endpoints }];
       if (!deviceMatches && endpoints.length === 0) return [];
-      // A device-name search expands the matching device, but must not undo an
-      // active endpoint-health filter. `endpoints` is already filtered above.
       return [{ ...device, endpoints }];
     });
-  }, [devicesData, healthFilter, search]);
+  }, [devicesData, deviceFilter, search]);
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
 
   const removeCli = useMutation({
@@ -669,8 +702,7 @@ export function CliEndpointsModelsSection() {
   });
   const updateModelCapabilities = useMutation(
     orpc.forwarderManagement.updateDiscoveredModelCapabilities.mutationOptions({
-      onSuccess: (data) => {
-        queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
+      onSuccess: async (data) => {
         // The save always succeeded; the warning is additive so operators
         // still see the impact advisory.
         toast.success(t("dashboard:models.capabilitySaved"));
@@ -682,6 +714,9 @@ export function CliEndpointsModelsSection() {
             }),
           );
         }
+        // Stay pending until the refetch lands, so the next toggle builds on
+        // the saved values rather than the ones shown before the save.
+        await queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
       },
     }),
   );
@@ -719,41 +754,79 @@ export function CliEndpointsModelsSection() {
 
   const isDeleting = removeCli.isPending || removeEndpoint.isPending || removeModel.isPending;
 
+  const devices = devicesData;
+  const modelCount = devices.reduce(
+    (sum, device) =>
+      sum + device.endpoints.reduce((count, endpoint) => count + endpoint.models.length, 0),
+    0,
+  );
+  const withContext = (
+    device: (typeof matchingDevices)[number],
+    endpoint: (typeof matchingDevices)[number]["endpoints"][number],
+    model: (typeof matchingDevices)[number]["endpoints"][number]["models"][number],
+  ): DirectModelOption => ({
+    ...model,
+    endpointPublished: endpoint.published,
+    cliSlug: device.slug,
+    endpointSlug: endpoint.slug,
+    endpointLabel: endpoint.label,
+    endpointCapabilityMetadata: endpoint.capabilityMetadata,
+    endpointDefaultCapabilities: endpoint.defaultCapabilities,
+  });
+
   return (
     <section className="min-w-0 max-w-full">
       <SectionHeader
         title={t("dashboard:clis.title")}
         description={t("dashboard:clis.description")}
-        action={
-          <div className="flex w-full flex-col gap-2 sm:w-auto sm:items-end">
-            <Input
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder={t("dashboard:clis.searchPlaceholder")}
-              aria-label={t("dashboard:clis.searchLabel")}
-              className="min-h-11 w-full sm:w-80"
-            />
-            <div
-              className="flex flex-wrap gap-1"
-              aria-label={t("dashboard:clis.healthFilterLabel")}
-            >
-              {(["all", "online", "offline", "stale"] as const).map((filter) => (
-                <Button
-                  key={filter}
-                  type="button"
-                  size="touch"
-                  variant={healthFilter === filter ? "secondary" : "ghost"}
-                  onClick={() => setHealthFilter(filter)}
-                >
-                  {t(`dashboard:clis.filters.${filter}`)}
-                </Button>
-              ))}
-            </div>
-          </div>
-        }
+        action={<ConnectCliDialog lang={lang} />}
       />
 
-      {devicesData.length === 0 ? (
+      <dl className="mb-4 grid min-w-0 grid-cols-2 gap-3 sm:grid-cols-4">
+        {[
+          ["machines", devices.length],
+          ["online", devices.filter(cliDeviceOnline).length],
+          ["models", modelCount],
+          ["attention", devices.filter(cliDeviceNeedsAttention).length],
+        ].map(([key, value]) => (
+          <div key={key} className="min-w-0 rounded-md border p-3">
+            <dt className="truncate text-xs text-muted-foreground">
+              {t(`dashboard:clis.summary.${key}`)}
+            </dt>
+            <dd className="mt-1 text-xl font-semibold tabular-nums">{value}</dd>
+          </div>
+        ))}
+      </dl>
+
+      <div className="mb-4 flex min-w-0 flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div
+          className="flex flex-wrap gap-1"
+          role="group"
+          aria-label={t("dashboard:clis.healthFilterLabel")}
+        >
+          {(["all", "online", "attention", "offline"] as const).map((filter) => (
+            <Button
+              key={filter}
+              type="button"
+              size="touch"
+              aria-pressed={deviceFilter === filter}
+              variant={deviceFilter === filter ? "secondary" : "ghost"}
+              onClick={() => setDeviceFilter(filter)}
+            >
+              {t(`dashboard:clis.filters.${filter}`)}
+            </Button>
+          ))}
+        </div>
+        <Input
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          placeholder={t("dashboard:clis.searchPlaceholder")}
+          aria-label={t("dashboard:clis.searchLabel")}
+          className="min-h-11 w-full sm:w-80"
+        />
+      </div>
+
+      {devices.length === 0 ? (
         <EmptyState>{t("dashboard:clis.empty")}</EmptyState>
       ) : matchingDevices.length === 0 ? (
         <EmptyState>{t("dashboard:clis.noSearchResults")}</EmptyState>
@@ -765,12 +838,35 @@ export function CliEndpointsModelsSection() {
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
                     <h3 className="min-w-0 truncate font-medium">{device.displayName}</h3>
-                    <StatusPill muted={device.isStale}>{device.status}</StatusPill>
-                    {device.isStale ? (
-                      <StatusPill muted>{t("dashboard:status.stale")}</StatusPill>
+                    <CliDeviceStatusBadge device={device} />
+                    {device.cliVersion ? (
+                      <span className="inline-flex min-h-6 items-center rounded-full border px-2 font-mono text-xs text-muted-foreground">
+                        wsmp {device.cliVersion}
+                      </span>
                     ) : null}
-                    {device.upgradeRequired ? (
-                      <StatusPill status="OFFLINE">
+                  </div>
+                  <p className="mt-1 font-mono text-xs text-muted-foreground">{device.slug}</p>
+                  {device.identityRefusedAt ? (
+                    <div
+                      role="note"
+                      className="mt-2 rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs"
+                    >
+                      <p className="font-medium text-destructive">
+                        {t("dashboard:clis.identityRefused")}
+                      </p>
+                      <p className="mt-1 text-muted-foreground">
+                        {t("dashboard:clis.identityRefusedDetail", {
+                          value: formatDate(device.identityRefusedAt),
+                        })}
+                      </p>
+                    </div>
+                  ) : null}
+                  {device.upgradeRequired ? (
+                    <div
+                      role="note"
+                      className="mt-2 rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs"
+                    >
+                      <p className="font-medium text-destructive">
                         {t(
                           device.upgradeRequired.reason === "cli_too_new"
                             ? "dashboard:clis.serverUpgradeRequired"
@@ -781,307 +877,311 @@ export function CliEndpointsModelsSection() {
                               t("dashboard:clis.upgradeUnknownProtocol"),
                           },
                         )}
-                      </StatusPill>
-                    ) : null}
-                  </div>
-                  <p className="mt-1 font-mono text-xs text-muted-foreground">{device.slug}</p>
-                  {device.upgradeRequired ? (
-                    <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
-                      {t(
-                        device.upgradeRequired.reason === "cli_too_new"
-                          ? "dashboard:clis.serverUpgradeRequiredDetail"
-                          : "dashboard:clis.upgradeRequiredDetail",
-                        {
-                          version:
-                            device.upgradeRequired.cliVersion ??
-                            t("dashboard:clis.upgradeUnknownVersion"),
-                          value: formatDate(device.upgradeRequired.rejectedAt),
-                        },
-                      )}
-                    </p>
+                      </p>
+                      <p className="mt-1 text-muted-foreground">
+                        {t(
+                          device.upgradeRequired.reason === "cli_too_new"
+                            ? "dashboard:clis.serverUpgradeRequiredDetail"
+                            : "dashboard:clis.upgradeRequiredDetail",
+                          {
+                            version:
+                              device.upgradeRequired.cliVersion ??
+                              t("dashboard:clis.upgradeUnknownVersion"),
+                            value: formatDate(device.upgradeRequired.rejectedAt),
+                          },
+                        )}
+                      </p>
+                    </div>
                   ) : null}
                   <p className="mt-2 text-xs text-muted-foreground">
-                    {t("dashboard:clis.lastHeartbeat", {
-                      value: formatDate(device.lastHeartbeatAt),
-                    })}
-                  </p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    {device.inventoryConfirmed && device.inventoryAcknowledgedAt
-                      ? t("dashboard:clis.inventoryAcknowledged", {
-                          sequence: device.inventorySeq,
-                          value: formatDate(device.inventoryAcknowledgedAt),
-                        })
-                      : t("dashboard:clis.inventoryUnconfirmed")}
+                    {t("dashboard:clis.lastHeard")} <TimeAgo value={device.lastHeartbeatAt} />
                   </p>
                 </div>
                 <div className="flex flex-wrap gap-2">
                   <CliDeviceRename device={device} />
-                  <Button
-                    type="button"
-                    variant="destructive"
-                    size="touch"
-                    onClick={() =>
-                      setDeleteTarget({ kind: "cli", id: device.id, label: device.slug })
-                    }
-                  >
-                    <Trash2 className="size-4" />
-                    {t("dashboard:metadata.delete")}
-                  </Button>
+                  <DropdownMenu>
+                    <DropdownMenuTrigger
+                      render={
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="icon-touch"
+                          aria-label={t("dashboard:clis.moreActions", {
+                            name: device.displayName,
+                          })}
+                        />
+                      }
+                    >
+                      <MoreHorizontal className="size-4" />
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent align="end">
+                      <DropdownMenuItem
+                        variant="destructive"
+                        className="min-h-11"
+                        onClick={() =>
+                          setDeleteTarget({ kind: "cli", id: device.id, label: device.slug })
+                        }
+                      >
+                        <Trash2 className="size-4" />
+                        {t("dashboard:clis.removeAndSignOut")}
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
                 </div>
               </div>
 
-              <CliDeviceFeatureSwitches
-                cliDeviceId={device.id}
-                deviceName={device.displayName}
-                device={device}
-              />
+              <Tabs defaultValue="models" className="p-4 pt-2">
+                <TabsList>
+                  <TabsTrigger value="models">{t("dashboard:clis.tabs.models")}</TabsTrigger>
+                  <TabsTrigger value="access">{t("dashboard:clis.tabs.access")}</TabsTrigger>
+                  <TabsTrigger value="activity">{t("dashboard:clis.tabs.activity")}</TabsTrigger>
+                  <TabsTrigger value="telemetry">{t("dashboard:clis.tabs.telemetry")}</TabsTrigger>
+                  {device.node ? (
+                    <TabsTrigger value="hardware">{t("dashboard:clis.tabs.hardware")}</TabsTrigger>
+                  ) : null}
+                </TabsList>
 
-              <CliAgentActivity cliDeviceId={device.id} deviceName={device.displayName} />
-              <CliDeviceMetricSources cliDeviceId={device.id} />
-              <CliDeviceEngineAdapters cliDeviceId={device.id} />
-
-              <div className="divide-y">
-                {device.endpoints.length === 0 ? (
-                  <div className="p-4 text-sm text-muted-foreground">
-                    {t("dashboard:endpoints.empty")}
-                  </div>
-                ) : (
-                  device.endpoints.map((endpoint) => (
-                    <div key={endpoint.id} className="min-w-0 p-4">
-                      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                        <div className="min-w-0">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <h4 className="text-sm font-medium">{endpoint.label}</h4>
-                            <StatusPill>{endpoint.status}</StatusPill>
-                            <StatusPill muted>{endpoint.kind}</StatusPill>
-                            {!endpoint.published ? (
-                              <StatusPill muted>
-                                {t("dashboard:publication.unpublished")}
-                              </StatusPill>
+                <TabsContent value="models" className="divide-y">
+                  {device.endpoints.length === 0 ? (
+                    <p className="py-3 text-sm text-muted-foreground">
+                      {t("dashboard:endpoints.empty")}
+                    </p>
+                  ) : (
+                    device.endpoints.map((endpoint) => (
+                      <div key={endpoint.id} className="min-w-0 py-3">
+                        <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <h4 className="text-sm font-medium">{endpoint.label}</h4>
+                              <EndpointStatusBadge status={endpoint.status} />
+                              <span className="text-xs text-muted-foreground">
+                                {t(`dashboard:endpoints.kinds.${endpoint.kind}`)}
+                              </span>
+                              {!endpoint.published ? (
+                                <StatusPill muted>
+                                  {t("dashboard:publication.unpublished")}
+                                </StatusPill>
+                              ) : null}
+                            </div>
+                            <p className="mt-1 font-mono text-xs text-muted-foreground">
+                              {device.slug}/{endpoint.slug}
+                            </p>
+                            {endpoint.failureReasonCode ? (
+                              <p className="mt-1 text-xs text-destructive">
+                                {t("dashboard:endpoints.failureReason", {
+                                  reason: endpoint.failureReasonCode,
+                                })}
+                              </p>
                             ) : null}
                           </div>
-                          <p className="mt-1 font-mono text-xs text-muted-foreground">
-                            {device.slug}/{endpoint.slug}
-                          </p>
-                          <p className="mt-2 text-xs text-muted-foreground">
-                            {t("dashboard:endpoints.lastSeen", {
-                              value: formatDate(endpoint.lastSeenAt),
-                            })}
-                          </p>
-                          {endpoint.failureReasonCode ? (
-                            <p className="mt-1 text-xs text-destructive">
-                              {t("dashboard:endpoints.failureReason", {
-                                reason: endpoint.failureReasonCode,
-                              })}
-                            </p>
-                          ) : null}
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="touch"
+                            onClick={() =>
+                              setDeleteTarget({
+                                kind: "endpoint",
+                                id: endpoint.id,
+                                label: `${device.slug}/${endpoint.slug}`,
+                              })
+                            }
+                          >
+                            <Trash2 className="size-4" />
+                            {t("dashboard:endpoints.forget")}
+                          </Button>
                         </div>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="touch"
-                          onClick={() =>
-                            setDeleteTarget({
-                              kind: "endpoint",
-                              id: endpoint.id,
-                              label: `${device.slug}/${endpoint.slug}`,
-                            })
-                          }
-                        >
-                          <Trash2 className="size-4" />
-                          {t("dashboard:metadata.delete")}
-                        </Button>
-                      </div>
 
-                      <WideContent className="mt-3">
-                        <table className="w-full min-w-[680px] text-left text-xs">
-                          <thead className="border-b text-muted-foreground">
-                            <tr>
-                              <th className="py-2 pr-3 font-medium">
-                                {t("dashboard:models.modelId")}
-                              </th>
-                              <th className="py-2 pr-3 font-medium">
-                                {t("dashboard:models.upstream")}
-                              </th>
-                              <th className="py-2 pr-3 font-medium">
-                                {t("dashboard:models.capabilities")}
-                              </th>
-                              <th className="py-2 pr-3 font-medium">
-                                {t("dashboard:models.lastSeen")}
-                              </th>
-                              <th className="py-2 pl-3 text-right font-medium">
-                                {t("dashboard:actions.header")}
-                              </th>
-                            </tr>
-                          </thead>
-                          <tbody className="divide-y">
-                            {endpoint.models.map((model) => (
-                              <tr key={model.id}>
-                                <td className="py-2 pr-3 align-top">
-                                  <CopyableModelId modelId={model.canonicalModelId} />
-                                  {model.suggestedConnectionType ? (
-                                    <p className="mt-1 text-xs text-muted-foreground">
-                                      {t("dashboard:models.suggestedConnectionType", {
-                                        type: t(
-                                          `dashboard:connectionTypes.${model.suggestedConnectionType}`,
-                                        ),
-                                      })}
-                                    </p>
-                                  ) : null}
-                                  {!model.published ? (
-                                    <StatusPill muted>
-                                      {t("dashboard:publication.unpublished")}
-                                    </StatusPill>
-                                  ) : null}
-                                  <p className="mt-1 text-muted-foreground">
-                                    {t("dashboard:models.immutable")}
-                                  </p>
-                                </td>
-                                <td className="py-2 pr-3 align-top font-mono">
-                                  {model.upstreamModelId}
-                                </td>
-                                <td className="py-2 pr-3 align-top">
-                                  <ModelCapabilityToggles
-                                    modelId={model.id}
-                                    vision={
-                                      modelTransformerCaps({
-                                        ...model,
-                                        endpointPublished: endpoint.published,
-                                        cliSlug: device.slug,
-                                        endpointSlug: endpoint.slug,
-                                        endpointLabel: endpoint.label,
-                                        endpointCapabilityMetadata: endpoint.capabilityMetadata,
-                                        endpointDefaultCapabilities: endpoint.defaultCapabilities,
-                                      }).images
-                                    }
-                                    audio={
-                                      modelTransformerCaps({
-                                        ...model,
-                                        endpointPublished: endpoint.published,
-                                        cliSlug: device.slug,
-                                        endpointSlug: endpoint.slug,
-                                        endpointLabel: endpoint.label,
-                                        endpointCapabilityMetadata: endpoint.capabilityMetadata,
-                                        endpointDefaultCapabilities: endpoint.defaultCapabilities,
-                                      }).audio
-                                    }
-                                    video={
-                                      modelTransformerCaps({
-                                        ...model,
-                                        endpointPublished: endpoint.published,
-                                        cliSlug: device.slug,
-                                        endpointSlug: endpoint.slug,
-                                        endpointLabel: endpoint.label,
-                                        endpointCapabilityMetadata: endpoint.capabilityMetadata,
-                                        endpointDefaultCapabilities: endpoint.defaultCapabilities,
-                                      }).video
-                                    }
-                                    disabled={updateModelCapabilities.isPending}
-                                    onChange={(next) =>
-                                      updateModelCapabilities.mutate({ id: model.id, ...next })
-                                    }
-                                  />
-                                  <ModelCapabilityProfileEditor
-                                    model={{
-                                      ...model,
-                                      endpointPublished: endpoint.published,
-                                      cliSlug: device.slug,
-                                      endpointSlug: endpoint.slug,
-                                      endpointLabel: endpoint.label,
-                                      endpointCapabilityMetadata: endpoint.capabilityMetadata,
-                                      endpointDefaultCapabilities: endpoint.defaultCapabilities,
-                                    }}
-                                    endpointCapabilityMetadata={endpoint.capabilityMetadata}
-                                    disabled={setModelCapabilityProfile.isPending}
-                                    onSave={(input) =>
-                                      setModelCapabilityProfile
-                                        .mutateAsync(input)
-                                        .then(() => undefined)
-                                    }
-                                  />
-                                  <AttachmentLimitControl
-                                    key={`${model.id}-${model.maxAttachmentBytes ?? "inherit"}`}
-                                    currentBytes={model.maxAttachmentBytes}
-                                    disabled={updateModelAttachmentLimit.isPending}
-                                    onSave={(maxAttachmentBytes) =>
-                                      updateModelAttachmentLimit.mutate({
-                                        id: model.id,
-                                        maxAttachmentBytes,
-                                      })
-                                    }
-                                  />
-                                </td>
-                                <td className="py-2 pr-3 align-top tabular-nums">
-                                  {formatDate(model.lastSeenAt)}
-                                </td>
-                                <td className="py-2 pl-3 text-right align-top">
-                                  {model.executionTarget ? (
-                                    <Button
-                                      type="button"
-                                      variant="ghost"
-                                      size="icon-touch"
-                                      onClick={() =>
-                                        setPolicyModel({
-                                          ...model,
-                                          endpointPublished: endpoint.published,
-                                          cliSlug: device.slug,
-                                          endpointSlug: endpoint.slug,
-                                          endpointLabel: endpoint.label,
-                                          endpointCapabilityMetadata: endpoint.capabilityMetadata,
-                                          endpointDefaultCapabilities: endpoint.defaultCapabilities,
-                                        })
-                                      }
-                                      aria-label={t("dashboard:pools.capacity.directPolicy")}
-                                    >
-                                      <Gauge className="size-4" />
-                                    </Button>
-                                  ) : null}
-                                  <Button
-                                    type="button"
-                                    variant="ghost"
-                                    size="icon-touch"
-                                    onClick={() =>
-                                      setDeleteTarget({
-                                        kind: "model",
-                                        id: model.id,
-                                        label: model.canonicalModelId,
-                                      })
-                                    }
-                                    aria-label={t("dashboard:metadata.deleteModel")}
-                                  >
-                                    <Trash2 className="size-4" />
-                                  </Button>
-                                </td>
+                        <WideContent className="mt-2">
+                          <table className="w-full min-w-[560px] text-left text-xs">
+                            <thead className="border-b text-muted-foreground">
+                              <tr>
+                                <th className="py-2 pr-3 font-medium">
+                                  {t("dashboard:models.modelId")}
+                                </th>
+                                <th className="py-2 pr-3 font-medium">
+                                  {t("dashboard:models.inputs")}
+                                </th>
+                                <th className="py-2 pr-3 font-medium">
+                                  {t("dashboard:models.lastSeen")}
+                                </th>
+                                <th className="py-2 pl-3 text-right font-medium">
+                                  {t("dashboard:actions.header")}
+                                </th>
                               </tr>
-                            ))}
-                          </tbody>
-                        </table>
-                      </WideContent>
-                    </div>
-                  ))
-                )}
-              </div>
+                            </thead>
+                            <tbody className="divide-y">
+                              {endpoint.models.map((model) => {
+                                const option = withContext(device, endpoint, model);
+                                const caps = modelTransformerCaps(option);
+                                return (
+                                  <tr key={model.id}>
+                                    <td className="py-2 pr-3 align-top">
+                                      <CopyableModelId modelId={model.canonicalModelId} />
+                                      <p className="mt-1 font-mono text-muted-foreground">
+                                        {model.upstreamModelId}
+                                      </p>
+                                      {!model.published ? (
+                                        <StatusPill muted>
+                                          {t("dashboard:publication.unpublished")}
+                                        </StatusPill>
+                                      ) : null}
+                                    </td>
+                                    <td className="py-2 pr-3 align-top">
+                                      <div className="flex flex-wrap gap-1">
+                                        <span className="rounded-full border px-2 py-0.5">
+                                          {t("dashboard:models.inputText")}
+                                        </span>
+                                        {(["images", "audio", "video"] as const)
+                                          .filter((kind) => caps[kind])
+                                          .map((kind) => (
+                                            <span
+                                              key={kind}
+                                              className="rounded-full border px-2 py-0.5"
+                                            >
+                                              {t(`dashboard:models.inputKinds.${kind}`)}
+                                            </span>
+                                          ))}
+                                      </div>
+                                    </td>
+                                    <td className="py-2 pr-3 align-top">
+                                      <TimeAgo value={model.lastSeenAt} />
+                                    </td>
+                                    <td className="py-2 pl-3 text-right align-top">
+                                      <Button
+                                        type="button"
+                                        variant="outline"
+                                        size="touch"
+                                        aria-label={t("dashboard:models.configureLabel", {
+                                          model: model.canonicalModelId,
+                                        })}
+                                        onClick={() => setConfigModelId(option.id)}
+                                      >
+                                        <SlidersHorizontal className="size-4" />
+                                        {t("dashboard:models.configure")}
+                                      </Button>
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </WideContent>
+                      </div>
+                    ))
+                  )}
+                </TabsContent>
+
+                <TabsContent value="access">
+                  <CliAccessSummary device={device} />
+                  <CliDeviceFeatureSwitches
+                    cliDeviceId={device.id}
+                    deviceName={device.displayName}
+                    device={device}
+                  />
+                </TabsContent>
+                <TabsContent value="activity">
+                  <CliAgentActivity
+                    cliDeviceId={device.id}
+                    deviceName={device.displayName}
+                    defaultOpen
+                  />
+                </TabsContent>
+                <TabsContent value="telemetry" className="space-y-2">
+                  <CliDeviceMetricSources cliDeviceId={device.id} defaultOpen />
+                  <CliDeviceEngineAdapters cliDeviceId={device.id} defaultOpen />
+                </TabsContent>
+                {device.node ? (
+                  <TabsContent value="hardware">
+                    <CliDeviceNodeCard
+                      cliDeviceId={device.id}
+                      deviceName={device.displayName}
+                      node={device.node}
+                    />
+                  </TabsContent>
+                ) : null}
+              </Tabs>
             </div>
           ))}
         </div>
       )}
 
-      <Sheet open={Boolean(policyModel)} onOpenChange={(open) => !open && setPolicyModel(null)}>
+      <Sheet open={Boolean(configModel)} onOpenChange={(open) => !open && setConfigModelId(null)}>
         <SheetContent className="w-full overflow-hidden sm:max-w-md">
           <SheetHeader>
-            <SheetTitle>{t("dashboard:pools.capacity.directPolicy")}</SheetTitle>
-            <SheetDescription>{policyModel?.canonicalModelId}</SheetDescription>
+            <SheetTitle>{t("dashboard:models.configureTitle")}</SheetTitle>
+            <SheetDescription className="break-all">
+              {configModel?.canonicalModelId}
+            </SheetDescription>
           </SheetHeader>
-          <div className="min-h-0 overflow-y-auto overflow-x-clip px-4 pb-4">
-            {policyModel?.executionTarget ? (
-              <DirectCapacityPolicyForm
-                target={policyModel.executionTarget}
-                capacities={capacitiesData ?? []}
-                capacityAvailability={capacityAvailability}
-                onSuccess={() => setPolicyModel(null)}
-              />
-            ) : null}
-          </div>
+          {configModel ? (
+            <div className="min-h-0 space-y-6 overflow-y-auto overflow-x-clip px-4 pb-4">
+              <section className="space-y-2">
+                <h3 className="text-sm font-medium">{t("dashboard:models.acceptedInputs")}</h3>
+                <ModelCapabilityToggles
+                  modelId={configModel.id}
+                  vision={modelTransformerCaps(configModel).images}
+                  audio={modelTransformerCaps(configModel).audio}
+                  video={modelTransformerCaps(configModel).video}
+                  disabled={updateModelCapabilities.isPending}
+                  onChange={(next) =>
+                    updateModelCapabilities.mutate({ id: configModel.id, ...next })
+                  }
+                />
+                <ModelCapabilityProfileEditor
+                  model={configModel}
+                  endpointCapabilityMetadata={configModel.endpointCapabilityMetadata}
+                  disabled={setModelCapabilityProfile.isPending}
+                  onSave={(input) =>
+                    setModelCapabilityProfile.mutateAsync(input).then(() => undefined)
+                  }
+                />
+              </section>
+              <section className="space-y-2">
+                <h3 className="text-sm font-medium">
+                  {t("dashboard:models.attachmentLimitTitle")}
+                </h3>
+                <AttachmentLimitControl
+                  key={`${configModel.id}-${configModel.maxAttachmentBytes ?? "inherit"}`}
+                  currentBytes={configModel.maxAttachmentBytes}
+                  disabled={updateModelAttachmentLimit.isPending}
+                  onSave={(maxAttachmentBytes) =>
+                    updateModelAttachmentLimit.mutate({ id: configModel.id, maxAttachmentBytes })
+                  }
+                />
+              </section>
+              {configModel.executionTarget ? (
+                <section className="space-y-2">
+                  <h3 className="text-sm font-medium">
+                    {t("dashboard:pools.capacity.directPolicy")}
+                  </h3>
+                  <DirectCapacityPolicyForm
+                    target={configModel.executionTarget}
+                    capacities={capacitiesData ?? []}
+                    capacityAvailability={capacityAvailability}
+                    onSuccess={() => setConfigModelId(null)}
+                  />
+                </section>
+              ) : null}
+              <section className="space-y-2 border-t pt-4">
+                <Button
+                  type="button"
+                  variant="destructive"
+                  size="touch"
+                  onClick={() => {
+                    setDeleteTarget({
+                      kind: "model",
+                      id: configModel.id,
+                      label: configModel.canonicalModelId,
+                    });
+                    setConfigModelId(null);
+                  }}
+                >
+                  <Trash2 className="size-4" />
+                  {t("dashboard:metadata.deleteModel")}
+                </Button>
+              </section>
+            </div>
+          ) : null}
         </SheetContent>
       </Sheet>
 
@@ -1090,7 +1190,11 @@ export function CliEndpointsModelsSection() {
         onOpenChange={(open) => {
           if (!open) setDeleteTarget(null);
         }}
-        title={t("dashboard:metadata.deleteTitle")}
+        title={
+          deleteTarget?.kind === "cli"
+            ? t("dashboard:clis.removeAndSignOutTitle")
+            : t("dashboard:metadata.deleteTitle")
+        }
         description={
           deleteTarget?.kind === "cli"
             ? t("dashboard:metadata.deleteCliDescription")
@@ -1654,6 +1758,7 @@ const validPercent = (percent: number) =>
 
 function protectionSettingsFromForm(value: {
   protectionEnabled: boolean;
+  evictionFeedbackEnabled: boolean;
   protectionWindowSeconds: number;
   protectMinTokens: number;
   protectionShare: "EQUAL_SHARE" | "FIRST_COME" | "FIXED_PERCENT";
@@ -1663,6 +1768,7 @@ function protectionSettingsFromForm(value: {
 }) {
   return {
     protectionEnabled: value.protectionEnabled,
+    evictionFeedbackEnabled: value.evictionFeedbackEnabled,
     protectionWindowSeconds: value.protectionWindowSeconds,
     protectMinTokens: value.protectMinTokens,
     protectionShare: value.protectionShare,
@@ -1677,8 +1783,28 @@ function protectionSettingsFromForm(value: {
   };
 }
 
+/** Common values offered as one-tap presets on the pool limit fields. */
+const POOL_LIMIT_PRESETS = {
+  capacityConcurrencyLimit: [1, 2, 4, 8],
+  capacityWaitBudgetMs: [0, 10_000, 30_000, 120_000],
+  capacityContextCeiling: [8_192, 32_768, 131_072],
+} as const;
+
+function poolLimitPresetLabel(
+  t: (key: string, options: { count: number }) => string,
+  field: keyof typeof POOL_LIMIT_PRESETS,
+  value: number,
+): string {
+  if (field === "capacityWaitBudgetMs")
+    return value >= 60_000
+      ? t("dashboard:pools.capacity.presets.minutes", { count: value / 60_000 })
+      : t("dashboard:pools.capacity.presets.seconds", { count: value / 1000 });
+  if (field === "capacityContextCeiling")
+    return t("dashboard:pools.capacity.presets.kTokens", { count: value / 1024 });
+  return String(value);
+}
+
 export function PoolForm({
-  mode,
   pool,
   onSuccess,
   stickySave = false,
@@ -1687,8 +1813,7 @@ export function PoolForm({
   capacityAvailability,
   sections = ["identity", "routing", "capacity", "media"],
 }: {
-  mode: "create" | "edit";
-  pool?: ModelPool;
+  pool: ModelPool;
   onSuccess: () => void;
   stickySave?: boolean;
   directModels: ReturnType<typeof allDirectModels>;
@@ -1764,6 +1889,7 @@ export function PoolForm({
       cacheHolderWaitMode: z.enum(["AUTO", "FIXED"]),
       cacheHolderWaitMs: z.number().int().min(0).max(30_000),
       protectionEnabled: z.boolean(),
+      evictionFeedbackEnabled: z.boolean(),
       protectionWindowSeconds: z.number().int().min(1).max(3600),
       protectMinTokens: z.number().int().min(0).max(10_000_000),
       protectionShare: z.enum(["EQUAL_SHARE", "FIRST_COME", "FIXED_PERCENT"]),
@@ -1777,13 +1903,6 @@ export function PoolForm({
         (value.protectionShare !== "FIXED_PERCENT" || validPercent(value.protectionFixedPercent)) &&
         (value.ownerProtectionMode !== "PERCENT" || validPercent(value.ownerProtectionPercent)),
     );
-  const createPool = useMutation(
-    orpc.forwarderManagement.createModelPool.mutationOptions({
-      onSuccess: () => {
-        queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
-      },
-    }),
-  );
   const updatePool = useMutation(
     orpc.forwarderManagement.updateModelPool.mutationOptions({
       onSuccess: () => {
@@ -1793,9 +1912,9 @@ export function PoolForm({
   );
   const affinityStats = useQuery({
     ...orpc.forwarderManagement.cacheAffinityStats.queryOptions({
-      input: { poolId: pool?.id ?? "disabled" },
+      input: { poolId: pool.id ?? "disabled" },
     }),
-    enabled: Boolean(pool?.id),
+    enabled: Boolean(pool.id),
   });
   const clearAffinity = useMutation(
     orpc.forwarderManagement.clearCacheAffinity.mutationOptions({
@@ -1808,72 +1927,70 @@ export function PoolForm({
   );
   const form = useForm({
     defaultValues: {
-      slug: pool?.slug ?? "",
-      name: pool?.name ?? "",
-      description: pool?.description ?? "",
-      transformerDiscoveredModelId: pool?.transformer.discoveredModelId ?? "",
-      transformerImages: pool?.transformer.images ?? true,
-      transformerAudio: pool?.transformer.audio ?? false,
-      transformerVideo: pool?.transformer.video ?? false,
-      transformerCacheMode: pool?.transformer.cacheMode === "MEMORY" ? "MEMORY" : "OFF",
-      transformerSystemPrompt: pool?.transformer.systemPrompt ?? "",
-      transformerIncludePrimaryTools: pool?.transformer.includePrimaryTools ?? false,
-      transformerMaxTools: pool?.transformer.maxTools ?? 32,
-      transformerMaxToolChars: pool?.transformer.maxToolChars ?? 8000,
+      slug: pool.slug ?? "",
+      name: pool.name ?? "",
+      description: pool.description ?? "",
+      transformerDiscoveredModelId: pool.transformer.discoveredModelId ?? "",
+      transformerImages: pool.transformer.images ?? true,
+      transformerAudio: pool.transformer.audio ?? false,
+      transformerVideo: pool.transformer.video ?? false,
+      transformerCacheMode: pool.transformer.cacheMode === "MEMORY" ? "MEMORY" : "OFF",
+      transformerSystemPrompt: pool.transformer.systemPrompt ?? "",
+      transformerIncludePrimaryTools: pool.transformer.includePrimaryTools ?? false,
+      transformerMaxTools: pool.transformer.maxTools ?? 32,
+      transformerMaxToolChars: pool.transformer.maxToolChars ?? 8000,
       transformerTimeoutMs:
-        pool?.transformer.timeoutMs != null ? String(pool.transformer.timeoutMs) : "",
+        pool.transformer.timeoutMs != null ? String(pool.transformer.timeoutMs) : "",
       transformerMaxAssets:
-        pool?.transformer.maxAssets != null ? String(pool.transformer.maxAssets) : "",
+        pool.transformer.maxAssets != null ? String(pool.transformer.maxAssets) : "",
       maxAttachmentMiB:
-        pool?.maxAttachmentBytes != null
+        pool.maxAttachmentBytes != null
           ? String(Math.ceil(pool.maxAttachmentBytes / MEBIBYTE))
           : "",
-      optimisticBasicTranscription: pool?.optimisticBasicTranscription ?? false,
-      protocolAdaptationEnabled: pool?.protocolAdaptationEnabled ?? false,
-      allowLossyDeveloperRoleCollapse: pool?.allowLossyDeveloperRoleCollapse ?? false,
-      recommendedSurfaceOverride: poolSurfaceOverrideValue(pool?.recommendedSurfaceOverride),
-      capacityPriority: pool?.capacityPriority ?? 16,
-      capacityConcurrencyMode: (pool?.capacityConcurrencyLimit === null
+      optimisticBasicTranscription: pool.optimisticBasicTranscription ?? false,
+      protocolAdaptationEnabled: pool.protocolAdaptationEnabled ?? false,
+      allowLossyDeveloperRoleCollapse: pool.allowLossyDeveloperRoleCollapse ?? false,
+      recommendedSurfaceOverride: poolSurfaceOverrideValue(pool.recommendedSurfaceOverride),
+      capacityPriority: pool.capacityPriority ?? 16,
+      capacityConcurrencyMode: (pool.capacityConcurrencyLimit === null
         ? "UNLIMITED"
         : "LIMITED") as FiniteLimitMode,
-      capacityConcurrencyLimit: pool?.capacityConcurrencyLimit ?? 1,
-      capacityReservedSlots: pool?.capacityReservedSlots ?? 0,
-      capacityWaitBudgetMode: (pool?.capacityWaitBudgetMs === null
+      capacityConcurrencyLimit: pool.capacityConcurrencyLimit ?? 1,
+      capacityReservedSlots: pool.capacityReservedSlots ?? 0,
+      capacityWaitBudgetMode: (pool.capacityWaitBudgetMs === null
         ? "UNLIMITED"
         : "LIMITED") as FiniteLimitMode,
-      capacityWaitBudgetMs: pool?.capacityWaitBudgetMs ?? 30_000,
-      capacityContextCeilingMode: (pool?.capacityContextCeiling === null
+      capacityWaitBudgetMs: pool.capacityWaitBudgetMs ?? 30_000,
+      capacityContextCeilingMode: (pool.capacityContextCeiling === null
         ? "UNLIMITED"
         : "LIMITED") as FiniteLimitMode,
-      capacityContextCeiling: pool?.capacityContextCeiling ?? 32_768,
-      capacityContextMargin: pool?.capacityContextMargin ?? 1_024,
-      capacityBorrowPolicy: (pool?.capacityBorrowPolicy === "NEVER" ? "NEVER" : "WHEN_IDLE") as
+      capacityContextCeiling: pool.capacityContextCeiling ?? 32_768,
+      capacityContextMargin: pool.capacityContextMargin ?? 1_024,
+      capacityBorrowPolicy: (pool.capacityBorrowPolicy === "NEVER" ? "NEVER" : "WHEN_IDLE") as
         | "NEVER"
         | "WHEN_IDLE",
-      // Create mode (no existing pool) defaults affinity ON, matching the
-      // guarded wizard; edit mode always receives the stored value from the
-      // pool detail query, so the fallback never masks it.
-      affinityEnabled: pool?.affinity.enabled ?? true,
-      affinityTtlSeconds: pool?.affinity.ttlSeconds ?? 3600,
-      affinityMaxRecords: pool?.affinity.maxRecords ?? 10_000,
-      affinityPrefixWeight: pool?.affinity.prefixWeight ?? 100,
-      affinityConversationWeight: pool?.affinity.conversationWeight ?? 150,
-      affinityLoadPenaltyWeight: pool?.affinity.loadPenaltyWeight ?? 100,
-      affinityResidencyWeight: pool?.affinity.residencyWeight ?? 100,
+      affinityEnabled: pool.affinity.enabled ?? true,
+      affinityTtlSeconds: pool.affinity.ttlSeconds ?? 3600,
+      affinityMaxRecords: pool.affinity.maxRecords ?? 10_000,
+      affinityPrefixWeight: pool.affinity.prefixWeight ?? 100,
+      affinityConversationWeight: pool.affinity.conversationWeight ?? 150,
+      affinityLoadPenaltyWeight: pool.affinity.loadPenaltyWeight ?? 100,
+      affinityResidencyWeight: pool.affinity.residencyWeight ?? 100,
       // S-A cache-holder wait: null = automatic; 0 = off; N = fixed ms.
-      cacheHolderWaitMode: (pool?.cacheHolderWaitMs == null ? "AUTO" : "FIXED") as "AUTO" | "FIXED",
-      cacheHolderWaitMs: pool?.cacheHolderWaitMs ?? 2_000,
+      cacheHolderWaitMode: (pool.cacheHolderWaitMs == null ? "AUTO" : "FIXED") as "AUTO" | "FIXED",
+      cacheHolderWaitMs: pool.cacheHolderWaitMs ?? 2_000,
       // S-C warm-session protection ("Protect active conversations").
-      protectionEnabled: pool?.protection.enabled ?? true,
-      protectionWindowSeconds: pool?.protection.windowSeconds ?? 300,
-      protectMinTokens: pool?.protection.minTokens ?? 8192,
-      protectionShare: (pool?.protection.share ?? "EQUAL_SHARE") as
+      protectionEnabled: pool.protection.enabled ?? true,
+      evictionFeedbackEnabled: pool.protection.evictionFeedbackEnabled ?? true,
+      protectionWindowSeconds: pool.protection.windowSeconds ?? 300,
+      protectMinTokens: pool.protection.minTokens ?? 8192,
+      protectionShare: (pool.protection.share ?? "EQUAL_SHARE") as
         | "EQUAL_SHARE"
         | "FIRST_COME"
         | "FIXED_PERCENT",
-      protectionFixedPercent: pool?.protection.fixedPercent ?? 50,
-      ownerProtectionMode: ownerProtectionModeOf(pool?.protection.ownerPercent ?? null),
-      ownerProtectionPercent: pool?.protection.ownerPercent || 50,
+      protectionFixedPercent: pool.protection.fixedPercent ?? 50,
+      ownerProtectionMode: ownerProtectionModeOf(pool.protection.ownerPercent ?? null),
+      ownerProtectionPercent: pool.protection.ownerPercent || 50,
     },
     validators: { onSubmit: poolSchema },
     onSubmit: async ({ value }) => {
@@ -1936,12 +2053,11 @@ export function PoolForm({
       // changed them: the server revalidates recommended-surface selectability
       // whenever these are present in an update, so always sending them would
       // block unrelated routing saves on pools with legacy-invalid overrides.
-      // In create mode `pool` is undefined and this object is unused.
       const surfaceOverrideChanged =
         value.recommendedSurfaceOverride !==
-        poolSurfaceOverrideValue(pool?.recommendedSurfaceOverride);
+        poolSurfaceOverrideValue(pool.recommendedSurfaceOverride);
       const adaptationChanged =
-        value.protocolAdaptationEnabled !== (pool?.protocolAdaptationEnabled ?? false);
+        value.protocolAdaptationEnabled !== (pool.protocolAdaptationEnabled ?? false);
       const routing = show("routing")
         ? {
             ...(adaptationChanged
@@ -1971,51 +2087,22 @@ export function PoolForm({
             ...protectionSettingsFromForm(value),
           }
         : {};
-      if (mode === "create") {
-        await createPool.mutateAsync({
-          slug: value.slug.trim(),
-          name: value.name.trim(),
-          description: value.description.trim() || null,
-          ...transformer,
-          maxAttachmentBytes: value.maxAttachmentMiB.trim()
-            ? Number(value.maxAttachmentMiB) * MEBIBYTE
-            : null,
-          optimisticBasicTranscription: value.optimisticBasicTranscription,
-          protocolAdaptationEnabled: value.protocolAdaptationEnabled,
-          allowLossyDeveloperRoleCollapse: value.allowLossyDeveloperRoleCollapse,
-          recommendedSurfaceOverride:
-            value.recommendedSurfaceOverride === "" ? null : value.recommendedSurfaceOverride,
-          ...capacityPolicy,
-          affinityEnabled: value.affinityEnabled,
-          affinityTtlSeconds: value.affinityTtlSeconds,
-          affinityMaxRecords: value.affinityMaxRecords,
-          affinityPrefixWeight: value.affinityPrefixWeight,
-          affinityConversationWeight: value.affinityConversationWeight,
-          affinityLoadPenaltyWeight: value.affinityLoadPenaltyWeight,
-          affinityResidencyWeight: value.affinityResidencyWeight,
-          cacheHolderWaitMs: value.cacheHolderWaitMode === "FIXED" ? value.cacheHolderWaitMs : null,
-          ...protectionSettingsFromForm(value),
-        });
-        toast.success(t("dashboard:pools.created"));
-        onSuccess();
-      } else if (pool) {
-        const updateInput: Parameters<typeof updatePool.mutateAsync>[0] = { id: pool.id };
-        Object.assign(updateInput, identity, media, routing, capacityPolicy);
-        try {
-          await updatePool.mutateAsync(updateInput);
-        } catch (error) {
-          // The server revalidates recommended-surface selectability on
-          // input-touching updates; map that rejection onto the field instead
-          // of letting it surface as a generic failure.
-          if (poolMutationFailureReason(error) === "SURFACE_NOT_SUPPORTED") {
-            setSurfaceUnsupported(true);
-            return;
-          }
-          throw error;
+      const updateInput: Parameters<typeof updatePool.mutateAsync>[0] = { id: pool.id };
+      Object.assign(updateInput, identity, media, routing, capacityPolicy);
+      try {
+        await updatePool.mutateAsync(updateInput);
+      } catch (error) {
+        // The server revalidates recommended-surface selectability on
+        // input-touching updates; map that rejection onto the field instead
+        // of letting it surface as a generic failure.
+        if (poolMutationFailureReason(error) === "SURFACE_NOT_SUPPORTED") {
+          setSurfaceUnsupported(true);
+          return;
         }
-        toast.success(t("dashboard:pools.updated"));
-        onSuccess();
+        throw error;
       }
+      toast.success(t("dashboard:pools.updated"));
+      onSuccess();
     },
   });
 
@@ -2254,11 +2341,17 @@ export function PoolForm({
                 variant="outline"
                 size="sm"
                 className="min-h-11"
-                disabled={clearAffinity.isPending || !affinityStats.data?.activeRecords}
+                disabled={
+                  clearAffinity.isPending ||
+                  !(affinityStats.data?.activeRecords || affinityStats.data?.activeNodes)
+                }
                 onClick={() => clearAffinity.mutate({ poolId: pool.id })}
               >
                 {t("dashboard:pools.affinity.clear")}
               </Button>
+              {clearAffinity.isSuccess ? (
+                <span role="status">{t("dashboard:pools.affinity.cleared")}</span>
+              ) : null}
             </div>
           ) : null}
         </details>
@@ -2285,6 +2378,22 @@ export function PoolForm({
               </label>
             )}
           </form.Field>
+          <form.Field name="evictionFeedbackEnabled">
+            {(field) => (
+              <label className="flex min-h-11 items-center gap-3 text-sm">
+                <input
+                  type="checkbox"
+                  className="size-4"
+                  checked={field.state.value}
+                  onChange={(event) => field.handleChange(event.target.checked)}
+                />
+                {t("dashboard:pools.protection.evictionFeedback")}
+              </label>
+            )}
+          </form.Field>
+          <p className="mb-3 text-xs text-muted-foreground">
+            {t("dashboard:pools.protection.evictionFeedbackHint")}
+          </p>
           <div className="mt-3 grid gap-4 sm:grid-cols-2">
             <form.Field name="protectionWindowSeconds">
               {(field) => (
@@ -2462,38 +2571,55 @@ export function PoolForm({
                 <form.Field key={modeName} name={modeName}>
                   {(modeField) => (
                     <div className="min-w-0 space-y-2">
-                      <Label htmlFor={modeName}>
-                        {t(`dashboard:pools.capacity.fields.${valueName}`)}
-                      </Label>
-                      <select
-                        id={modeName}
-                        className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
-                        value={modeField.state.value}
-                        onChange={(event) =>
-                          modeField.handleChange(event.target.value as FiniteLimitMode)
-                        }
-                      >
-                        <option value="LIMITED">
-                          {t("dashboard:pools.capacity.modes.limited")}
-                        </option>
-                        <option value="UNLIMITED">
-                          {t("dashboard:pools.capacity.modes.unlimited")}
-                        </option>
-                      </select>
+                      <div className="flex min-h-11 items-center justify-between gap-3">
+                        <Label htmlFor={modeField.state.value === "LIMITED" ? valueName : modeName}>
+                          {t(`dashboard:pools.capacity.fields.${valueName}`)}
+                        </Label>
+                        <Label className="flex min-h-11 items-center gap-2 text-xs font-normal text-muted-foreground">
+                          <Switch
+                            id={modeName}
+                            checked={modeField.state.value === "UNLIMITED"}
+                            onCheckedChange={(checked) =>
+                              modeField.handleChange(checked ? "UNLIMITED" : "LIMITED")
+                            }
+                          />
+                          {t("dashboard:pools.capacity.noLimit")}
+                        </Label>
+                      </div>
                       {modeField.state.value === "LIMITED" ? (
                         <form.Field name={valueName}>
                           {(field) => (
-                            <Input
-                              className="min-h-11"
-                              type="number"
-                              min={valueName === "capacityWaitBudgetMs" ? 0 : 1}
-                              value={field.state.value}
-                              onChange={(event) => field.handleChange(Number(event.target.value))}
-                              aria-label={t("dashboard:pools.capacity.limitValue")}
-                            />
+                            <>
+                              <Input
+                                id={valueName}
+                                className="min-h-11"
+                                type="number"
+                                min={valueName === "capacityWaitBudgetMs" ? 0 : 1}
+                                value={field.state.value}
+                                onChange={(event) => field.handleChange(Number(event.target.value))}
+                              />
+                              <div className="flex flex-wrap gap-1">
+                                {POOL_LIMIT_PRESETS[valueName].map((preset) => (
+                                  <Button
+                                    key={preset}
+                                    type="button"
+                                    size="touch"
+                                    variant={field.state.value === preset ? "secondary" : "ghost"}
+                                    aria-pressed={field.state.value === preset}
+                                    onClick={() => field.handleChange(preset)}
+                                  >
+                                    {poolLimitPresetLabel(t, valueName, preset)}
+                                  </Button>
+                                ))}
+                              </div>
+                            </>
                           )}
                         </form.Field>
-                      ) : null}
+                      ) : (
+                        <p className="text-xs text-muted-foreground">
+                          {t("dashboard:pools.capacity.noLimitHint")}
+                        </p>
+                      )}
                     </div>
                   )}
                 </form.Field>
@@ -3496,6 +3622,7 @@ export function CliTokensSection() {
   const [name, setName] = useState("");
   const [secret, setSecret] = useState("");
   const [revokeToken, setRevokeToken] = useState<CliToken | null>(null);
+  const [resetIdentityToken, setResetIdentityToken] = useState<CliToken | null>(null);
   const create = useMutation(
     orpc.cliCredentials.createToken.mutationOptions({
       onSuccess: (result) => {
@@ -3511,6 +3638,15 @@ export function CliTokensSection() {
         queryClient.invalidateQueries({ queryKey: orpc.cliCredentials.key() });
         toast.success(t("dashboard:tokens.revoked"));
         setRevokeToken(null);
+      },
+    }),
+  );
+  const resetIdentity = useMutation(
+    orpc.cliCredentials.resetTokenIdentity.mutationOptions({
+      onSuccess: () => {
+        queryClient.invalidateQueries({ queryKey: orpc.cliCredentials.key() });
+        toast.success(t("dashboard:tokens.identityReset"));
+        setResetIdentityToken(null);
       },
     }),
   );
@@ -3578,7 +3714,7 @@ export function CliTokensSection() {
                 <DialogFooter>
                   {secret ? (
                     <Button type="button" size="touch" onClick={() => setCreateOpen(false)}>
-                      {t("common:close")}
+                      {t("common:actions.close")}
                     </Button>
                   ) : (
                     <Button type="submit" size="touch" disabled={!name || create.isPending}>
@@ -3593,7 +3729,11 @@ export function CliTokensSection() {
           </Dialog>
         }
       />
-      <TokenTable tokens={tokensData} onRevoke={setRevokeToken} />
+      <TokenTable
+        tokens={tokensData}
+        onRevoke={setRevokeToken}
+        onResetIdentity={setResetIdentityToken}
+      />
       <ConfirmDeleteDialog
         open={Boolean(revokeToken)}
         onOpenChange={(open) => !open && setRevokeToken(null)}
@@ -3609,6 +3749,21 @@ export function CliTokensSection() {
           if (revokeToken) revoke.mutate({ id: revokeToken.id });
         }}
       />
+      <ConfirmDeleteDialog
+        open={Boolean(resetIdentityToken)}
+        onOpenChange={(open) => !open && setResetIdentityToken(null)}
+        title={t("dashboard:tokens.resetIdentityTitle")}
+        description={t("dashboard:tokens.resetIdentityDescription")}
+        confirmToken={resetIdentityToken?.name ?? ""}
+        typePrompt={t("dashboard:tokens.typeTokenName")}
+        copyAriaLabel={t("dashboard:actions.copyConfirm")}
+        confirmLabel={t("dashboard:tokens.resetIdentity")}
+        pendingLabel={t("dashboard:tokens.resettingIdentity")}
+        isPending={resetIdentity.isPending}
+        onConfirm={() => {
+          if (resetIdentityToken) resetIdentity.mutate({ id: resetIdentityToken.id });
+        }}
+      />
     </section>
   );
 }
@@ -3616,9 +3771,14 @@ export function CliTokensSection() {
 function TokenTable<TToken extends CliToken | ModelApiToken>({
   tokens,
   onRevoke,
+  onResetIdentity,
+  renderActions,
 }: {
   tokens: TToken[];
   onRevoke: (token: TToken) => void;
+  onResetIdentity?: (token: TToken) => void;
+  /** Extra actions for active tokens, before Revoke. */
+  renderActions?: (token: TToken) => ReactNode;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
 
@@ -3634,6 +3794,12 @@ function TokenTable<TToken extends CliToken | ModelApiToken>({
             <th className="p-3 font-medium">{t("dashboard:tokens.scope")}</th>
             <th className="p-3 font-medium">{t("dashboard:tokens.lastUsed")}</th>
             <th className="p-3 font-medium">{t("dashboard:tokens.createdAt")}</th>
+            {"scopeMode" in (tokens[0] ?? {}) ? (
+              <th className="p-3 font-medium">{t("dashboard:tokens.expiresAt")}</th>
+            ) : null}
+            {"identityBound" in (tokens[0] ?? {}) ? (
+              <th className="p-3 font-medium">{t("dashboard:tokens.lastRefused")}</th>
+            ) : null}
             <th className="p-3 text-right font-medium">{t("dashboard:actions.header")}</th>
           </tr>
         </thead>
@@ -3656,19 +3822,59 @@ function TokenTable<TToken extends CliToken | ModelApiToken>({
               </td>
               <td className="p-3 align-top tabular-nums">{formatDate(token.lastUsedAt)}</td>
               <td className="p-3 align-top tabular-nums">{formatDate(token.createdAt)}</td>
+              {"scopeMode" in token ? (
+                <td className="p-3 align-top tabular-nums">
+                  {token.expiresAt === null ? (
+                    t("dashboard:tokens.neverExpires")
+                  ) : new Date(token.expiresAt).getTime() <= Date.now() ? (
+                    <StatusPill muted>{t("dashboard:tokens.expired")}</StatusPill>
+                  ) : (
+                    formatDate(token.expiresAt)
+                  )}
+                </td>
+              ) : null}
+              {"identityBound" in token ? (
+                <td className="p-3 align-top">
+                  {token.lastRefusedAt ? (
+                    <span>
+                      {t("dashboard:tokens.refusedIdentityMismatch")}
+                      <span className="mt-1 block tabular-nums text-muted-foreground">
+                        {formatDate(token.lastRefusedAt)}
+                      </span>
+                    </span>
+                  ) : token.identityBound ? (
+                    t("dashboard:tokens.identityBound")
+                  ) : (
+                    t("dashboard:tokens.identityUnbound")
+                  )}
+                </td>
+              ) : null}
               <td className="p-3 text-right align-top">
                 {token.revokedAt ? (
                   <StatusPill muted>{t("dashboard:tokens.revokedStatus")}</StatusPill>
                 ) : (
-                  <Button
-                    type="button"
-                    variant="destructive"
-                    size="touch"
-                    onClick={() => onRevoke(token)}
-                  >
-                    <Trash2 className="size-4" />
-                    {t("dashboard:tokens.revoke")}
-                  </Button>
+                  <div className="flex min-w-0 flex-wrap justify-end gap-2">
+                    {renderActions?.(token)}
+                    {"identityBound" in token && token.identityBound && onResetIdentity ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="touch"
+                        onClick={() => onResetIdentity(token)}
+                      >
+                        {t("dashboard:tokens.resetIdentity")}
+                      </Button>
+                    ) : null}
+                    <Button
+                      type="button"
+                      variant="destructive"
+                      size="touch"
+                      onClick={() => onRevoke(token)}
+                    >
+                      <Trash2 className="size-4" />
+                      {t("dashboard:tokens.revoke")}
+                    </Button>
+                  </div>
                 )}
               </td>
             </tr>
@@ -3687,7 +3893,7 @@ export function ModelApiTokensSection() {
     isPending: tokensIsPending,
     isError: tokensIsError,
     refetch: refetchTokens,
-  } = useQuery(orpc.modelApiTokens.list.queryOptions());
+  } = useQuery(orpc.modelApiTokens.list.queryOptions({ input: { limit: 100 } }));
   const {
     data: visibleModelsData,
     isPending: visibleModelsIsPending,
@@ -3695,8 +3901,17 @@ export function ModelApiTokensSection() {
     refetch: refetchVisibleModels,
   } = useQuery(orpc.forwarderManagement.visibleModels.queryOptions());
   const [createOpen, setCreateOpen] = useState(false);
-  const [creatingToken, setCreatingToken] = useState(false);
+  // Creating, or a one-time secret not yet acknowledged: the dialog must stay open.
+  const [createLocked, setCreateLocked] = useState(false);
+  const [showRevoked, setShowRevoked] = useState(false);
+  // Revoked tokens load separately and only on request, so they never take
+  // page slots from active tokens that may still need revoking.
+  const withRevoked = useQuery({
+    ...orpc.modelApiTokens.list.queryOptions({ input: { includeRevoked: true, limit: 100 } }),
+    enabled: showRevoked,
+  });
   const [revokeToken, setRevokeToken] = useState<ModelApiToken | null>(null);
+  const [cloudToken, setCloudToken] = useState<ModelApiToken | null>(null);
   const revoke = useMutation(
     orpc.modelApiTokens.revoke.mutationOptions({
       onSuccess: () => {
@@ -3727,6 +3942,10 @@ export function ModelApiTokensSection() {
       />
     );
   }
+  const revokedTokens = showRevoked
+    ? (withRevoked.data ?? []).filter((token) => token.revokedAt)
+    : [];
+  const shownTokens = [...tokensData, ...revokedTokens];
 
   return (
     <section className="min-w-0 max-w-full">
@@ -3737,7 +3956,7 @@ export function ModelApiTokensSection() {
           <Dialog
             open={createOpen}
             onOpenChange={(open) => {
-              if (!creatingToken) setCreateOpen(open);
+              if (!createLocked) setCreateOpen(open);
             }}
           >
             <DialogTrigger
@@ -3748,7 +3967,7 @@ export function ModelApiTokensSection() {
                 </Button>
               }
             />
-            <DialogContent className="sm:max-w-2xl">
+            <DialogContent className="sm:max-w-2xl" showCloseButton={!createLocked}>
               <DialogHeader>
                 <DialogTitle>{t("dashboard:tokens.createModelApiTitle")}</DialogTitle>
                 <DialogDescription>
@@ -3758,7 +3977,11 @@ export function ModelApiTokensSection() {
               {createOpen ? (
                 <ModelApiTokenCreateForm
                   visibleModels={visibleModelsData}
-                  onPendingChange={setCreatingToken}
+                  onLockChange={setCreateLocked}
+                  onDone={() => {
+                    setCreateLocked(false);
+                    setCreateOpen(false);
+                  }}
                 />
               ) : null}
             </DialogContent>
@@ -3771,12 +3994,43 @@ export function ModelApiTokensSection() {
         </div>
       ) : null}
       <TokenEgressWarnings pools={visibleModelsData.modelPools} />
-      <TokenTable tokens={tokensData} onRevoke={setRevokeToken} />
-      <TokenExternalAccess
-        tokens={tokensData}
-        pools={visibleModelsData.modelPools}
-        providerEgressEnabled={visibleModelsData.providerEgressEnabled}
+      <label className="mb-2 flex min-h-11 items-center gap-3 text-sm">
+        <Switch checked={showRevoked} onCheckedChange={setShowRevoked} />
+        {t("dashboard:tokens.showRevoked")}
+        {showRevoked && withRevoked.isPending ? (
+          <Skeleton className="h-4 w-16" aria-hidden="true" />
+        ) : null}
+      </label>
+      {showRevoked && withRevoked.isError ? (
+        <InlineRetry
+          message={t("dashboard:tokens.loadFailed")}
+          onRetry={() => withRevoked.refetch()}
+        />
+      ) : null}
+      <TokenTable
+        tokens={shownTokens}
+        onRevoke={setRevokeToken}
+        renderActions={(token) => (
+          <Button type="button" variant="outline" size="touch" onClick={() => setCloudToken(token)}>
+            <Cloud className="size-4" />
+            {t("dashboard:tokens.cloudAccess.button")}
+            {/* Names the row for screen readers while keeping the On/Off state in the name. */}
+            <span className="sr-only">
+              {t("dashboard:tokens.cloudAccess.forToken", { name: token.name })}
+            </span>
+            <CloudAccessSummary token={token} />
+          </Button>
+        )}
       />
+      {cloudToken ? (
+        <TokenCloudAccessDialog
+          key={cloudToken.id}
+          token={cloudToken}
+          pools={visibleModelsData.modelPools}
+          providerEgressEnabled={visibleModelsData.providerEgressEnabled}
+          onClose={() => setCloudToken(null)}
+        />
+      ) : null}
       <ConfirmDeleteDialog
         open={Boolean(revokeToken)}
         onOpenChange={(open) => !open && setRevokeToken(null)}
@@ -3796,29 +4050,57 @@ export function ModelApiTokensSection() {
   );
 }
 
+function CloudAccessSummary({ token }: { token: ModelApiToken }) {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <span className="text-muted-foreground">
+      {!token.allowExternal
+        ? t("dashboard:tokens.cloudAccess.off")
+        : token.scopeMode !== "ALLOWLIST"
+          ? t("dashboard:tokens.cloudAccess.on")
+          : t("dashboard:tokens.cloudAccess.onPools", {
+              count: token.allowlist.externalModelPoolIds.length,
+              total: token.allowlist.modelPoolIds.length,
+            })}
+    </span>
+  );
+}
+
+function tokenExternalWaitInputSchema() {
+  return z
+    .string()
+    .trim()
+    .refine(
+      (value) =>
+        value === "" ||
+        (/^(0|[1-9]\d*)$/.test(value) && Number(value) <= EXTERNAL_AFTER_WAIT_MS_MAX),
+    );
+}
+
+const TOKEN_EXPIRY_DAYS = { never: null, days30: 30, days90: 90, days365: 365 } as const;
+type TokenExpiry = keyof typeof TOKEN_EXPIRY_DAYS;
+
+/** Creates a local-only token: cloud access is a separate human choice made afterwards. */
 function ModelApiTokenCreateForm({
   visibleModels,
-  onPendingChange,
+  onLockChange,
+  onDone,
 }: {
   visibleModels: VisibleModels;
-  onPendingChange: (pending: boolean) => void;
+  onLockChange: (locked: boolean) => void;
+  onDone: () => void;
 }) {
   const { t } = useTranslation(["common", "dashboard"]);
   const queryClient = useQueryClient();
   const [secret, setSecret] = useState("");
-  const [consentFailed, setConsentFailed] = useState(false);
+  const [secretSaved, setSecretSaved] = useState(false);
   const create = useMutation(orpc.modelApiTokens.create.mutationOptions());
-  const update = useMutation({
-    ...orpc.modelApiTokens.updateExternalAccess.mutationOptions(),
-    meta: { skipGlobalErrorToast: true },
-  });
   const form = useForm({
     defaultValues: {
       name: "",
       scopeMode: "ALL_VISIBLE" as ScopeMode,
       modelIds: [] as string[],
-      allowExternal: false,
-      excludedPoolIds: [] as string[],
+      expiry: "never" as TokenExpiry,
     },
     validators: {
       onSubmit: z
@@ -3826,54 +4108,48 @@ function ModelApiTokenCreateForm({
           name: z.string().trim().min(1).max(120),
           scopeMode: z.enum(["ALL_VISIBLE", "ALLOWLIST"]),
           modelIds: z.array(z.string()),
-          allowExternal: z.boolean(),
-          excludedPoolIds: z.array(z.string()),
+          expiry: z.enum(["never", "days30", "days90", "days365"]),
         })
         .refine((value) => value.scopeMode !== "ALLOWLIST" || value.modelIds.length > 0),
     },
     onSubmit: async ({ value }) => {
       if (secret) return;
-      onPendingChange(true);
+      onLockChange(true);
+      const days = TOKEN_EXPIRY_DAYS[value.expiry];
       try {
         const result = await create.mutateAsync({
           name: value.name,
           scopeMode: value.scopeMode,
           modelIds: value.scopeMode === "ALLOWLIST" ? value.modelIds : [],
+          ...(days ? { expiresAt: new Date(Date.now() + days * 86_400_000) } : {}),
         });
-        // Retain the one-time secret even if the separate human consent save fails.
+        // The dialog stays locked until the one-time secret is acknowledged.
         setSecret(result.secret);
-        let consentSaved = true;
-        if (value.allowExternal && visibleModels.providerEgressEnabled) {
-          try {
-            await update.mutateAsync({
-              id: result.token.id,
-              allowExternal: true,
-              ...(value.scopeMode === "ALLOWLIST"
-                ? {
-                    externalModelPoolIds: visibleModels.modelPools
-                      .filter(
-                        (pool) =>
-                          value.modelIds.includes(pool.modelId) &&
-                          !value.excludedPoolIds.includes(pool.id),
-                      )
-                      .map((pool) => pool.id),
-                  }
-                : {}),
-            });
-          } catch {
-            consentSaved = false;
-            setConsentFailed(true);
-          }
-        }
         void queryClient.invalidateQueries({ queryKey: orpc.modelApiTokens.key() });
-        if (consentSaved) toast.success(t("dashboard:tokens.created"));
+        toast.success(t("dashboard:tokens.created"));
       } catch {
         // The standard mutation error toast reports creation failures.
-      } finally {
-        onPendingChange(false);
+        onLockChange(false);
       }
     },
   });
+  if (secret) {
+    return (
+      <div className="min-w-0 space-y-4">
+        <SecretDisplay secret={secret} label={t("dashboard:tokens.modelApiSecret")} />
+        <p className="text-sm text-muted-foreground">{t("dashboard:tokens.cloudAfterCreate")}</p>
+        <label className="flex min-h-11 items-center gap-3 text-sm">
+          <Switch checked={secretSaved} onCheckedChange={setSecretSaved} />
+          {t("dashboard:tokens.secretSaved")}
+        </label>
+        <DialogFooter>
+          <Button type="button" size="touch" disabled={!secretSaved} onClick={onDone}>
+            {t("dashboard:tokens.done")}
+          </Button>
+        </DialogFooter>
+      </div>
+    );
+  }
   return (
     <form
       className="min-w-0 space-y-4"
@@ -3883,10 +4159,7 @@ function ModelApiTokenCreateForm({
         void form.handleSubmit();
       }}
     >
-      <fieldset
-        disabled={create.isPending || update.isPending || Boolean(secret)}
-        className="min-w-0 space-y-4"
-      >
+      <fieldset disabled={create.isPending} className="min-w-0 space-y-4">
         <form.Field name="name">
           {(field) => (
             <div className="space-y-2">
@@ -3894,6 +4167,7 @@ function ModelApiTokenCreateForm({
               <Input
                 id="model-api-token-name"
                 className="min-h-11"
+                maxLength={120}
                 value={field.state.value}
                 onBlur={field.handleBlur}
                 onChange={(event) => field.handleChange(event.target.value)}
@@ -3926,61 +4200,19 @@ function ModelApiTokenCreateForm({
                   onSelectedModelIdsChange={(ids) => form.setFieldValue("modelIds", ids)}
                 />
               ) : null}
-              <label className="flex min-h-11 items-center gap-3 text-sm">
-                <Checkbox
-                  // With the switch off it can still be turned off (nothing
-                  // external is saved at creation then), never on.
-                  disabled={!visibleModels.providerEgressEnabled && !values.allowExternal}
-                  checked={values.allowExternal}
-                  onCheckedChange={(checked) =>
-                    form.setFieldValue("allowExternal", checked === true)
-                  }
+              <div className="space-y-2">
+                <Label>{t("dashboard:tokens.expiry.label")}</Label>
+                <SegmentedControl
+                  value={values.expiry}
+                  onChange={(value: TokenExpiry) => form.setFieldValue("expiry", value)}
+                  ariaLabel={t("dashboard:tokens.expiry.label")}
+                  items={(Object.keys(TOKEN_EXPIRY_DAYS) as TokenExpiry[]).map((value) => ({
+                    value,
+                    label: t(`dashboard:tokens.expiry.${value}`),
+                  }))}
                 />
-                {t("dashboard:tokens.externalAccess.createAllow")}
-              </label>
-              <p className="text-sm text-muted-foreground">
-                {t("dashboard:tokens.externalAccess.description")}
-              </p>
-              {!visibleModels.providerEgressEnabled ? (
-                <p role="note" className="text-sm text-muted-foreground">
-                  {t("dashboard:tokens.externalAccess.createDisabledDeployment")}
-                </p>
-              ) : null}
-              {values.allowExternal && values.scopeMode === "ALLOWLIST" ? (
-                <div className="space-y-1">
-                  <p className="text-xs text-muted-foreground">
-                    {t("dashboard:tokens.externalAccess.poolsHint")}
-                  </p>
-                  {visibleModels.modelPools
-                    .filter((pool) => values.modelIds.includes(pool.modelId))
-                    .map((pool) => (
-                      <label key={pool.id} className="flex min-h-11 items-center gap-3 text-sm">
-                        {/* Draft only: nothing is saved until submit, and with
-                            the switch off submit saves no external access, so
-                            re-checking an unchecked pool never widens anything. */}
-                        <Checkbox
-                          checked={!values.excludedPoolIds.includes(pool.id)}
-                          onCheckedChange={(checked) =>
-                            form.setFieldValue(
-                              "excludedPoolIds",
-                              checked === true
-                                ? values.excludedPoolIds.filter((id) => id !== pool.id)
-                                : [...values.excludedPoolIds, pool.id],
-                            )
-                          }
-                        />
-                        {pool.name}
-                      </label>
-                    ))}
-                </div>
-              ) : null}
+              </div>
               <TokenScopePreview scopeMode={values.scopeMode} modelIds={values.modelIds} />
-
-              {consentFailed ? (
-                <p role="alert" className="text-sm text-destructive">
-                  {t("dashboard:tokens.externalAccess.createFailed")}
-                </p>
-              ) : null}
               <DialogFooter>
                 <Button
                   type="submit"
@@ -3988,7 +4220,6 @@ function ModelApiTokenCreateForm({
                   disabled={
                     !values.name.trim() ||
                     isSubmitting ||
-                    Boolean(secret) ||
                     (values.scopeMode === "ALLOWLIST" && values.modelIds.length === 0)
                   }
                 >
@@ -3999,9 +4230,6 @@ function ModelApiTokenCreateForm({
           )}
         </form.Subscribe>
       </fieldset>
-      {secret ? (
-        <SecretDisplay secret={secret} label={t("dashboard:tokens.modelApiSecret")} />
-      ) : null}
     </form>
   );
 }
@@ -4026,102 +4254,240 @@ function TokenScopePreview({ scopeMode, modelIds }: { scopeMode: ScopeMode; mode
 }
 
 /**
- * Human-only consent for `owner/pool:external` (never exposed to MCP). New and
- * existing tokens are private-only until a person turns this on. Allowlist
- * tokens also choose which allowlisted pools may use external providers.
+ * Human-only consent for `owner/pool:external` (never exposed to MCP), edited as a draft and
+ * saved in one call. Allowlist tokens choose which allowlisted pools may use cloud providers;
+ * all-visible tokens are all-or-nothing. Turning access off keeps the per-pool choices.
  */
-function TokenExternalAccess({
-  tokens,
+function TokenCloudAccessDialog({
+  token,
   pools,
   providerEgressEnabled,
+  onClose,
 }: {
-  providerEgressEnabled: boolean;
-  tokens: ModelApiToken[];
+  token: ModelApiToken;
   pools: VisibleModels["modelPools"];
+  providerEgressEnabled: boolean;
+  onClose: () => void;
 }) {
   const { t } = useTranslation(["dashboard"]);
   const queryClient = useQueryClient();
-  const update = useMutation(
+  const baseId = useId();
+  const save = useMutation(
     orpc.modelApiTokens.updateExternalAccess.mutationOptions({
       onSuccess: () => {
         queryClient.invalidateQueries({ queryKey: orpc.modelApiTokens.key() });
-        toast.success(t("dashboard:tokens.externalAccess.saved"));
+        toast.success(t("dashboard:tokens.cloudAccess.saved"));
+        onClose();
       },
     }),
   );
-  const activeTokens = tokens.filter((token) => !token.revokedAt);
-  if (activeTokens.length === 0) return null;
-  const poolNameById = new Map(pools.map((pool) => [pool.id, pool.name] as const));
+  const allowlist = token.scopeMode === "ALLOWLIST";
+  const savedPoolIds = token.allowlist.externalModelPoolIds;
+  const poolById = new Map(pools.map((pool) => [pool.id, pool] as const));
+  const form = useForm({
+    defaultValues: {
+      allowExternal: token.allowExternal,
+      poolIds: savedPoolIds,
+      wait: token.externalAfterWaitMs == null ? "" : String(token.externalAfterWaitMs),
+    },
+    validators: {
+      onSubmit: z
+        .object({ allowExternal: z.boolean(), poolIds: z.array(z.string()), wait: z.string() })
+        .superRefine((value, ctx) => {
+          if (value.allowExternal && !tokenExternalWaitInputSchema().safeParse(value.wait).success)
+            ctx.addIssue({
+              code: "custom",
+              path: ["wait"],
+              message: t("dashboard:tokens.externalWait.invalid"),
+            });
+        }),
+    },
+    onSubmit: async ({ value }) => {
+      const wait = value.wait.trim() === "" ? null : Number(value.wait.trim());
+      await save
+        .mutateAsync({
+          id: token.id,
+          allowExternal: value.allowExternal,
+          // Pool choices are written only when they changed; turning access off keeps them.
+          ...(value.allowExternal &&
+          allowlist &&
+          (value.poolIds.length !== savedPoolIds.length ||
+            value.poolIds.some((id) => !savedPoolIds.includes(id)))
+            ? { externalModelPoolIds: value.poolIds }
+            : {}),
+          ...(value.allowExternal && wait !== token.externalAfterWaitMs
+            ? { externalAfterWaitMs: wait }
+            : {}),
+        })
+        .catch(() => undefined);
+    },
+  });
   return (
-    <div className="mt-4 min-w-0 max-w-full space-y-3 rounded-md border p-4">
-      <div className="space-y-1">
-        <h3 className="text-sm font-medium">{t("dashboard:tokens.externalAccess.title")}</h3>
-        <p className="text-xs text-muted-foreground">
-          {t("dashboard:tokens.externalAccess.description")}
-        </p>
-      </div>
-      {!providerEgressEnabled ? (
-        <p role="note" className="text-sm text-muted-foreground">
-          {t("dashboard:tokens.externalAccess.disabledDeployment")}
-        </p>
-      ) : null}
-      <ul className="divide-y">
-        {activeTokens.map((token) => {
-          const allowlistPoolIds =
-            token.scopeMode === "ALLOWLIST" ? token.allowlist.modelPoolIds : [];
-          const included = new Set(token.allowlist.externalModelPoolIds);
-          return (
-            <li key={token.id} className="min-w-0 space-y-2 py-3">
-              <label className="flex min-h-11 items-center gap-3 text-sm">
-                <Checkbox
-                  checked={token.allowExternal}
-                  disabled={update.isPending || (!providerEgressEnabled && !token.allowExternal)}
-                  onCheckedChange={(checked) =>
-                    update.mutate({
-                      id: token.id,
-                      allowExternal: checked === true,
-                    })
-                  }
-                />
-                <span className="min-w-0 break-words">
-                  {t("dashboard:tokens.externalAccess.allow", { name: token.name })}
-                </span>
-              </label>
-              {token.allowExternal && allowlistPoolIds.length > 0 ? (
-                <div className="space-y-1 pl-8">
-                  <p className="text-xs text-muted-foreground">
-                    {t("dashboard:tokens.externalAccess.savedPoolsHint")}
-                  </p>
-                  {allowlistPoolIds.map((poolId) => (
-                    <label key={poolId} className="flex min-h-11 items-center gap-3 text-sm">
-                      <Checkbox
-                        checked={included.has(poolId)}
-                        disabled={
-                          update.isPending || (!providerEgressEnabled && !included.has(poolId))
-                        }
-                        onCheckedChange={(checked) => {
-                          const next = new Set(included);
-                          if (checked === true) next.add(poolId);
-                          else next.delete(poolId);
-                          update.mutate({
-                            id: token.id,
-                            allowExternal: true,
-                            externalModelPoolIds: [...next],
-                          });
-                        }}
-                      />
-                      <span className="min-w-0 break-words">
-                        {poolNameById.get(poolId) ?? poolId}
-                      </span>
-                    </label>
-                  ))}
-                </div>
-              ) : null}
-            </li>
-          );
-        })}
-      </ul>
-    </div>
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open && !save.isPending) onClose();
+      }}
+    >
+      <DialogContent className="sm:max-w-xl">
+        <DialogHeader>
+          <DialogTitle>{t("dashboard:tokens.cloudAccess.title", { name: token.name })}</DialogTitle>
+          <DialogDescription>{t("dashboard:tokens.cloudAccess.description")}</DialogDescription>
+        </DialogHeader>
+        <form
+          className="min-w-0 space-y-4"
+          onSubmit={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            void form.handleSubmit();
+          }}
+        >
+          {!providerEgressEnabled ? (
+            <p role="note" className="text-sm text-muted-foreground">
+              {t("dashboard:tokens.cloudAccess.disabledDeployment")}
+            </p>
+          ) : null}
+          <form.Subscribe selector={(state) => state.values}>
+            {(values) => {
+              // Only pools with cloud providers serve `:external`; others are never offered.
+              const selectedPools = allowlist
+                ? values.poolIds.flatMap((id) => {
+                    const pool = poolById.get(id);
+                    return pool?.effectiveProviderEgress ? [pool] : [];
+                  })
+                : pools.filter((pool) => pool.effectiveProviderEgress);
+              const cloudCapable = (poolId: string) =>
+                poolById.get(poolId)?.effectiveProviderEgress === true;
+              return (
+                <fieldset disabled={save.isPending} className="min-w-0 space-y-4">
+                  <label className="flex min-h-11 items-center gap-3 text-sm font-medium">
+                    <Switch
+                      checked={values.allowExternal}
+                      // With providers off it can still be turned off, never on.
+                      disabled={!providerEgressEnabled && !values.allowExternal}
+                      onCheckedChange={(checked) => form.setFieldValue("allowExternal", checked)}
+                    />
+                    {t("dashboard:tokens.cloudAccess.allow")}
+                  </label>
+                  {values.allowExternal ? (
+                    <>
+                      <p
+                        role="note"
+                        className="rounded-md border border-state-warning/40 bg-state-warning/10 p-3 text-sm"
+                      >
+                        {t("dashboard:tokens.cloudAccess.warning")}
+                      </p>
+                      {allowlist ? (
+                        <div className="space-y-1">
+                          <p className="text-sm font-medium">
+                            {t("dashboard:tokens.cloudAccess.pools")}
+                          </p>
+                          <p className="text-xs text-muted-foreground">
+                            {t("dashboard:tokens.cloudAccess.poolsRemembered")}
+                          </p>
+                          {!token.allowlist.modelPoolIds.some(
+                            (poolId) => cloudCapable(poolId) || savedPoolIds.includes(poolId),
+                          ) ? (
+                            <p className="text-sm text-muted-foreground">
+                              {t("dashboard:tokens.cloudAccess.noPools")}
+                            </p>
+                          ) : (
+                            token.allowlist.modelPoolIds.map((poolId) => {
+                              const included = values.poolIds.includes(poolId);
+                              // A saved choice can still be removed after its providers go.
+                              const offered = cloudCapable(poolId) || savedPoolIds.includes(poolId);
+                              return (
+                                <label
+                                  key={poolId}
+                                  className="flex min-h-11 items-center gap-3 text-sm"
+                                >
+                                  <Checkbox
+                                    checked={included}
+                                    disabled={
+                                      !included &&
+                                      (!offered ||
+                                        (!providerEgressEnabled && !savedPoolIds.includes(poolId)))
+                                    }
+                                    onCheckedChange={(checked) =>
+                                      form.setFieldValue(
+                                        "poolIds",
+                                        checked === true
+                                          ? [...values.poolIds, poolId]
+                                          : values.poolIds.filter((id) => id !== poolId),
+                                      )
+                                    }
+                                  />
+                                  <span className="min-w-0 break-words">
+                                    {poolById.get(poolId)?.name ?? poolId}
+                                    {cloudCapable(poolId) ? null : (
+                                      <span className="block text-xs text-muted-foreground">
+                                        {t("dashboard:tokens.cloudAccess.noProviders")}
+                                      </span>
+                                    )}
+                                  </span>
+                                </label>
+                              );
+                            })
+                          )}
+                        </div>
+                      ) : (
+                        <p className="text-sm text-muted-foreground">
+                          {t("dashboard:tokens.cloudAccess.allVisible")}
+                        </p>
+                      )}
+                      <form.Field name="wait">
+                        {(field) => (
+                          <div className="space-y-2">
+                            <Label htmlFor={`${baseId}-wait`}>
+                              {t("dashboard:tokens.externalWait.label")}
+                            </Label>
+                            <Input
+                              id={`${baseId}-wait`}
+                              className="min-h-11"
+                              inputMode="numeric"
+                              placeholder={t("dashboard:tokens.externalWait.placeholder")}
+                              value={field.state.value}
+                              onBlur={field.handleBlur}
+                              onChange={(event) => field.handleChange(event.target.value)}
+                              autoComplete="off"
+                            />
+                            <p className="text-xs text-muted-foreground">
+                              {t("dashboard:tokens.externalWait.hint")}
+                            </p>
+                            {field.state.meta.errors.length > 0 ? (
+                              <p className="text-sm text-destructive">
+                                {t("dashboard:tokens.externalWait.invalid")}
+                              </p>
+                            ) : null}
+                          </div>
+                        )}
+                      </form.Field>
+                      {selectedPools.length > 0 ? (
+                        <div className="space-y-1">
+                          <p className="text-sm font-medium">
+                            {t("dashboard:tokens.cloudAccess.modelIds")}
+                          </p>
+                          {selectedPools.map((pool) => (
+                            <CopyableModelId key={pool.id} modelId={`${pool.modelId}:external`} />
+                          ))}
+                        </div>
+                      ) : null}
+                    </>
+                  ) : null}
+                </fieldset>
+              );
+            }}
+          </form.Subscribe>
+          <DialogFooter>
+            <Button type="submit" size="touch" disabled={save.isPending}>
+              {save.isPending
+                ? t("dashboard:tokens.cloudAccess.saving")
+                : t("dashboard:tokens.cloudAccess.save")}
+            </Button>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
   );
 }
 

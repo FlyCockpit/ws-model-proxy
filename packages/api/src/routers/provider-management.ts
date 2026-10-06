@@ -4,7 +4,7 @@ import prisma, { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fenceOwners, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { env } from "@ws-model-proxy/env/server";
 import { z } from "zod";
-import { protectedProcedure } from "../index";
+import { humanProcedure, protectedProcedure } from "../index";
 import {
   assertDirectCapacityPolicy,
   assertEffectiveConcurrencyPolicy,
@@ -20,6 +20,7 @@ import {
   poolIdsWithMembers,
   providerModelPoolMemberWhere,
 } from "../lib/pool-capability-impact";
+
 import {
   decryptProviderCredential,
   encryptProviderCredential,
@@ -664,7 +665,7 @@ export const providerManagementRouter = {
    * collect data". Off (the default) sends `provider.data_collection:
    * "deny"` on every OpenRouter request of this account. Excluded from MCP.
    */
-  setAllowDataCollection: protectedProcedure
+  setAllowDataCollection: humanProcedure
     .input(z.object({ id, allowDataCollection: z.boolean() }))
     .handler(async ({ input, context }) => {
       enabled();
@@ -1243,7 +1244,7 @@ export const providerManagementRouter = {
         },
       });
     }),
-  createCredential: protectedProcedure
+  createCredential: humanProcedure
     .input(z.object({ providerAccountId: id, credential: z.string().min(1).max(16_384) }))
     .handler(async ({ input, context }) => {
       enabled();
@@ -1303,7 +1304,7 @@ export const providerManagementRouter = {
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
       );
     }),
-  replaceCredential: protectedProcedure
+  replaceCredential: humanProcedure
     .input(z.object({ providerAccountId: id, credential: z.string().min(1).max(16_384) }))
     .handler(async ({ input, context }) => {
       enabled();
@@ -1911,13 +1912,19 @@ export const providerManagementRouter = {
             : ({ type: "API_KEY", apiKey: secret } as const);
         const response = await providerHttpsRequest(
           probe.url,
-          { method: "GET", headers: probe.headers },
+          {
+            method: "GET",
+            headers: probe.headers,
+            ...(callerSignal ? { signal: callerSignal } : {}),
+          },
           policy(),
           protocol,
           providerAuth,
         );
-        response.resume();
         statusCode = response.statusCode ?? null;
+        // The probe needs headers only. Stop an arbitrary active response body
+        // immediately so it cannot retain the owned egress socket indefinitely.
+        response.destroy();
       } catch (error) {
         requestError = error;
       }
@@ -1964,7 +1971,10 @@ export const providerManagementRouter = {
   listBudgetPolicies: protectedProcedure.handler(({ context }) => {
     readRevokeOrDeleteAllowed();
     return prisma.providerBudgetPolicy.findMany({
-      where: { userId: context.session.user.id, ProviderAccount: { deletedAt: null } },
+      where: {
+        userId: context.session.user.id,
+        OR: [{ scopeType: "POOL_GRANT" }, { ProviderAccount: { deletedAt: null } }],
+      },
       include: { Rules: true },
     });
   }),
@@ -1972,9 +1982,10 @@ export const providerManagementRouter = {
     .input(
       z.object({
         scopeType: z.enum(["PROVIDER_ACCOUNT", "POOL_PROVIDER_MODEL"]),
-        providerAccountId: id,
+        providerAccountId: id.nullable().optional(),
         poolId: id.nullable(),
         providerModelId: id.nullable(),
+        poolGrantId: id.nullable().optional(),
         active: z.boolean().default(false),
         rules: z.array(rule).min(1),
       }),
@@ -1983,16 +1994,24 @@ export const providerManagementRouter = {
       enabled();
       const userId = context.session.user.id;
       if (
+        !input.providerAccountId ||
+        input.poolGrantId ||
         (input.scopeType === "POOL_PROVIDER_MODEL") !==
-        Boolean(input.poolId && input.providerModelId)
+          Boolean(input.poolId && input.providerModelId)
       )
-        throw new ORPCError("BAD_REQUEST");
+        throw new ORPCError("BAD_REQUEST", {
+          message: input.poolGrantId
+            ? "Set a grant spend cap with updatePoolGrant (fallbackSpend)."
+            : undefined,
+        });
       return prisma.$transaction(async (tx) => {
         await fenceOwners(tx, [userId]);
-        await acquireFences(tx, [fences.budgetAccount(userId, input.providerAccountId)]);
-        await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${input.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
+        const providerAccountId = input.providerAccountId;
+        if (!providerAccountId) throw new ORPCError("BAD_REQUEST");
+        await acquireFences(tx, [fences.budgetAccount(userId, providerAccountId)]);
+        await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
         const account = await tx.providerAccount.findFirst({
-          where: { id: input.providerAccountId, userId, deletedAt: null },
+          where: { id: providerAccountId, userId, deletedAt: null },
           select: { id: true },
         });
         if (!account) throw missing();
@@ -2022,7 +2041,7 @@ export const providerManagementRouter = {
           data: {
             userId,
             scopeType: input.scopeType,
-            providerAccountId: input.providerAccountId,
+            providerAccountId,
             poolId: input.poolId,
             providerModelId: input.providerModelId,
             active: input.active,
@@ -2039,7 +2058,7 @@ export const providerManagementRouter = {
         await tx.providerAuditEvent.create({
           data: {
             userId,
-            providerAccountId: input.providerAccountId,
+            providerAccountId,
             action: "BUDGET_CREATED",
             subjectId: row.id,
             metadata: budgetAuditMetadata(input.rules),
@@ -2057,9 +2076,14 @@ export const providerManagementRouter = {
         where: { id: input.id, userId },
       });
       if (!current) throw missing();
+      if (current.scopeType === "POOL_GRANT")
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Change a grant spend cap with updatePoolGrant (fallbackSpend).",
+        });
       return prisma.$transaction(
         async (tx) => {
           await fenceOwners(tx, [userId]);
+          if (!current.providerAccountId) throw missing();
           await acquireFences(tx, [fences.budgetAccount(userId, current.providerAccountId)]);
           await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${current.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
           await tx.$queryRaw`SELECT id FROM provider_budget_policy WHERE id = ${current.id} AND "userId" = ${userId} FOR UPDATE`;
@@ -2093,6 +2117,7 @@ export const providerManagementRouter = {
               providerAccountId: locked.providerAccountId,
               poolId: locked.poolId,
               providerModelId: locked.providerModelId,
+              poolGrantId: locked.poolGrantId,
               version: locked.version + 1,
               active: input.active,
               activatedAt: input.active ? new Date() : null,
@@ -2126,12 +2151,17 @@ export const providerManagementRouter = {
       const userId = context.session.user.id;
       const current = await prisma.providerBudgetPolicy.findFirst({
         where: { id: input.id, userId },
-        select: { id: true, providerAccountId: true },
+        select: { id: true, providerAccountId: true, poolGrantId: true, scopeType: true },
       });
       if (!current) throw missing();
+      if (current.scopeType === "POOL_GRANT")
+        throw new ORPCError("BAD_REQUEST", {
+          message: "Change a grant spend cap with updatePoolGrant (fallbackSpend).",
+        });
       await prisma.$transaction(
         async (tx) => {
           await fenceOwners(tx, [userId]);
+          if (!current.providerAccountId) throw missing();
           await acquireFences(tx, [fences.budgetAccount(userId, current.providerAccountId)]);
           await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${current.providerAccountId} AND "userId" = ${userId} FOR UPDATE`;
           await tx.$queryRaw`SELECT id FROM provider_budget_policy WHERE id = ${current.id} AND "userId" = ${userId} FOR UPDATE`;

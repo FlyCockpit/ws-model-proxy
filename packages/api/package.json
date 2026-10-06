@@ -2,6 +2,15 @@
   "name": "@ws-model-proxy/api",
   "type": "module",
   "exports": {
+    "./lib/deployment-service": {
+      "default": "./src/lib/deployment-service.ts"
+    },
+    "./lib/deployment-spec": {
+      "default": "./src/lib/deployment-spec.ts"
+    },
+    "./lib/deployment-planner": {
+      "default": "./src/lib/deployment-planner.ts"
+    },
     ".": {
       "default": "./src/index.ts"
     },
@@ -26,11 +35,17 @@
     "./lib/model-api-token-access": {
       "default": "./src/lib/model-api-token-access.ts"
     },
+    "./lib/caller-external-wait": {
+      "default": "./src/lib/caller-external-wait.ts"
+    },
     "./lib/media-attachment-limits": {
       "default": "./src/lib/media-attachment-limits.ts"
     },
     "./lib/openai-compatible-capabilities": {
       "default": "./src/lib/openai-compatible-capabilities.ts"
+    },
+    "./lib/embedding-contract": {
+      "default": "./src/lib/embedding-contract.ts"
     },
     "./lib/pool-model-capabilities": {
       "default": "./src/lib/pool-model-capabilities.ts"
@@ -70,6 +85,12 @@
     },
     "./lib/metric-routing": {
       "default": "./src/lib/metric-routing.ts"
+    },
+    "./lib/node-inventory": {
+      "default": "./src/lib/node-inventory.ts"
+    },
+    "./lib/pool-grant-spend-cap-schema": {
+      "default": "./src/lib/pool-grant-spend-cap-schema.ts"
     },
     "./lib/remote-engine-adapters": {
       "default": "./src/lib/remote-engine-adapters.ts"
@@ -117,7 +138,7 @@
   "scripts": {
     "check-types": "tsc -p tsconfig.check-types.json --noEmit",
     "test": "vitest run --passWithNoTests",
-    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism src/lib/capacity-policy-races.postgres.integration.test.ts src/lib/capacity-lock-order.postgres.integration.test.ts src/lib/model-pool-trial-lease.postgres.integration.test.ts src/lib/writer-classes.postgres.integration.test.ts src/lib/capacity-cycles.postgres.integration.test.ts src/lib/parent-deletion.postgres.integration.test.ts src/lib/deletion-commit-point.postgres.integration.test.ts src/routers/forwarder-management.postgres.integration.test.ts src/routers/model-api-tokens.postgres.integration.test.ts src/routers/mcp-tokens.postgres.integration.test.ts src/lib/cli-credential-access.postgres.integration.test.ts src/lib/mcp-file-read-defaults.postgres.integration.test.ts src/lib/model-pool-routing.disconnect-fence.postgres.integration.test.ts src/routers/overview.postgres.integration.test.ts src/routers/provider-catalog.postgres.integration.test.ts src/routers/cli-agent-activity.postgres.integration.test.ts",
+    "test:postgres": "vitest run --maxWorkers=1 --no-file-parallelism src/lib/capacity-policy-races.postgres.integration.test.ts src/lib/capacity-lock-order.postgres.integration.test.ts src/lib/model-pool-trial-lease.postgres.integration.test.ts src/lib/writer-classes.postgres.integration.test.ts src/lib/capacity-cycles.postgres.integration.test.ts src/lib/parent-deletion.postgres.integration.test.ts src/lib/deletion-commit-point.postgres.integration.test.ts src/routers/forwarder-management.postgres.integration.test.ts src/routers/model-api-tokens.postgres.integration.test.ts src/routers/mcp-tokens.postgres.integration.test.ts src/lib/cli-credential-access.postgres.integration.test.ts src/lib/mcp-file-read-defaults.postgres.integration.test.ts src/lib/model-pool-routing.disconnect-fence.postgres.integration.test.ts src/routers/overview.postgres.integration.test.ts src/routers/provider-catalog.postgres.integration.test.ts src/routers/cli-agent-activity.postgres.integration.test.ts src/routers/forwarder-cli-devices.postgres.integration.test.ts src/routers/inference-contributions.postgres.integration.test.ts",
     "test:postgres:volume": "WMP_PARENT_DELETE_ROWS=1400000 vitest run --maxWorkers=1 --no-file-parallelism src/lib/parent-deletion.postgres.integration.test.ts"
   },
   "dependencies": {

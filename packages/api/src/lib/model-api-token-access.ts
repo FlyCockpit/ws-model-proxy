@@ -63,6 +63,8 @@ export type VisibleModelPoolTarget = {
   /** Configured external fallback (provider) members, regardless of health. */
   externalMemberCount: number;
   externalEquivalentModel?: string | null;
+  embeddingContract?: Prisma.JsonValue | null;
+  paidWarmProtectionEnabled?: boolean;
   ownKeyProviderModelId?: string | null;
   /**
    * Static availability for this viewer: deployment switch, pool fallback,
@@ -97,6 +99,8 @@ export type ModelApiTokenIdentity = {
   scopeMode: ModelApiTokenScopeMode;
   /** Human-set consent for `owner/pool:external`; false (private only) by default. */
   allowExternal: boolean;
+  /** Null uses each pool's `externalAfterWaitMs`. Capped per pool at request time. */
+  externalAfterWaitMs: number | null;
   lookupPrefix: string;
   expiresAt: Date | null;
   lastUsedAt: Date | null;
@@ -130,6 +134,8 @@ const modelPoolSelect = {
   fallbackEnabled: true,
   fallbackForGrantees: true,
   externalEquivalentModel: true,
+  embeddingContract: true,
+  paidWarmProtectionEnabled: true,
   allowLossyDeveloperRoleCollapse: true,
   recommendedSurfaceOverride: true,
   PoolMembers: {
@@ -209,6 +215,8 @@ function serializeModelPool(
     fallbackEnabled: row.fallbackEnabled,
     fallbackForGrantees: row.fallbackForGrantees,
     externalEquivalentModel: row.externalEquivalentModel,
+    embeddingContract: row.embeddingContract,
+    paidWarmProtectionEnabled: row.paidWarmProtectionEnabled,
     externalMemberCount: (row.PoolMembers ?? []).length,
     ...disclosure,
     externalRoutes: disclosure.effectiveProviderEgress ? ["pool-fallback"] : [],
@@ -698,6 +706,7 @@ export async function authenticateModelApiTokenSecret(
       userId: true,
       scopeMode: true,
       allowExternal: true,
+      externalAfterWaitMs: true,
       lookupPrefix: true,
       secretDigest: true,
       lastUsedAt: true,
@@ -731,6 +740,7 @@ export async function authenticateModelApiTokenSecret(
     userId: token.userId,
     scopeMode: String(token.scopeMode) as ModelApiTokenScopeMode,
     allowExternal: token.allowExternal === true,
+    externalAfterWaitMs: token.externalAfterWaitMs ?? null,
     lookupPrefix: token.lookupPrefix,
     expiresAt: token.expiresAt,
     lastUsedAt,

@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import type {
   LiveCliFeatureSnapshot,
   LiveEndpointLoad,
@@ -31,7 +31,37 @@ import {
 import type { OpenAiCompatibleCapabilities } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import { parseStoredRemoteEngineAdapters } from "@ws-model-proxy/api/lib/remote-engine-adapters";
 import type { SupervisedCommandStatus } from "@ws-model-proxy/api/lib/supervised-command-types";
+import {
+  type DeploymentInstancesFrame,
+  type DeploymentJob,
+  type DeploymentJobResult,
+  type DeploymentObservedInstance,
+  deploymentJobNeedsOperator,
+  deploymentOperatorResultStatus,
+  deploymentOperatorSupported,
+} from "@ws-model-proxy/config/deployment-protocol";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
+import {
+  type DeploymentOperatorAction,
+  type DeploymentOperatorOutcome,
+  isDeploymentOperatorAction,
+  recordDeploymentOperatorEvent,
+} from "../deployments/operator-audit.js";
+import type { DeploymentLiveSocket, DeploymentSocket } from "../deployments/reconciler.js";
+import {
+  persistAffinityCounterEpoch,
+  readAffinityCounterEpoch,
+} from "../model-api/cache-affinity-generation.js";
+import {
+  acknowledgeAffinityObservations,
+  discoverAffinityObservers,
+  observeAffinityReset,
+  recoverAffinityObservers,
+  registerAffinityObservers,
+  renewAffinityObservers,
+} from "../model-api/cache-affinity-observers.js";
+import { beginAffinityReset } from "../model-api/cache-affinity-residency.js";
+import { resetKvEvictionForEndpoint } from "../model-api/kv-eviction-feedback.js";
 import { startRelayAttempt } from "../model-api/relay-executor.js";
 import { EngineLoadHistoryStore } from "./engine-load-history.js";
 import { observeEngineLoadRollup } from "./engine-load-rollup.js";
@@ -47,11 +77,13 @@ import {
   supervisedFileRejectReasonSchema,
 } from "./file-protocol.js";
 import { sanitizeRelayRequestHeaders } from "./headers.js";
+import { relayHelloOrigin, verifyHelloIdentitySignature } from "./hello-identity.js";
 import {
   createRoutingEvaluationState,
   MetricRoutingEvaluator,
   type RoutingEvaluationState,
 } from "./metric-routing-evaluator.js";
+import { observeNodeMetricsRollup } from "./node-metrics-rollup.js";
 import {
   listDueOwnedPoolMemberRecoveries,
   type OwnedRecoveryMember,
@@ -69,20 +101,23 @@ import {
   type NodeMetricsMessage,
   parseRelayBinaryFrame,
   parseRelayClientControlFrame,
+  protocolErrorMessage,
   RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+  RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE,
   RELAY_STALE_AFTER_MS,
   RELAY_UNREGISTERED_STALE_AFTER_MS,
   RELAY_UPGRADE_REQUIRED_MESSAGE,
   type RelayBinaryFrameMetadata,
   type RelayClientControlMessage,
   type RelayFailure,
+  type RelayProtocolErrorCode,
   type RelayProtocolVersion,
   type RelayResponseBodyMetadata,
   type RelayServerControlMessage,
   type RemoteEngineAdapter,
   type RemoteMetricSource,
+  refusedRelayProtocolReason,
   rejectedHelloFacts,
-  relayProtocolAtLeast,
   remoteEngineAdaptersSchema,
   remoteMetricSourcesSchema,
   type TerminalHandshakeIdentity,
@@ -130,6 +165,9 @@ async function closeBodyStream(stream: OutboundBodyStream | undefined) {
 }
 
 export type CliReportedFeatures = {
+  deployments?: boolean;
+  /** Interactive deployment commands; see `deploymentOperatorSupported`. */
+  deploymentOperator?: boolean;
   humanTerminal: boolean;
   /** The CLI's own MCP command mode (its config), from hello. */
   mcpCommandMode: McpCommandModeName;
@@ -274,10 +312,17 @@ export type TerminalRecord = {
    * `agent`: a supervised terminal the CLI spawned for an MCP request. It
    * has its own slot limits, is gated by the MCP command mode (not the human
    * terminal grant), and starts with no viewers.
+   * `deployment`: the operator terminal of an interactive deployment step
+   * Registered when the job is sent, open once the CLI reports
+   * `awaiting_operator` for it; gated by the node's deployment operator
+   * capability (not the human grant or the MCP mode); never idle-closed and
+   * never counted against the human terminal limits.
    */
-  origin: "user" | "agent";
+  origin: TerminalOrigin;
   /** Set iff `origin` is `agent`. */
   supervised: TrackedSupervisedCommand | null;
+  /** Set iff `origin` is `deployment`. */
+  deployment?: DeploymentTerminalInfo;
   /**
    * Agent terminals: browser sockets that sent Decline. They hear whether an
    * Enter beat it (`decline` event, once, on the waiting -> running step) and
@@ -286,6 +331,42 @@ export type TerminalRecord = {
    * is removed); bounded by the owner's sockets.
    */
   decliners?: Set<string>;
+};
+
+export type TerminalOrigin = "user" | "agent" | "deployment";
+
+/** What the terminal list shows for a deployment operator terminal (no command text). */
+export type DeploymentTerminalInfo = {
+  stepId: string;
+  instanceId: string;
+  rank: number;
+  action: DeploymentOperatorAction;
+  /** `awaiting`: the confirm screen waits for Enter; `running`: the command runs. */
+  state: "awaiting" | "running";
+};
+
+/**
+ * One interactive step the session sent with an operator terminal, by step id,
+ * from the send until its final result, `operator_closed`, a replacement, a
+ * server cancel, or the session's end. It outlives the `TerminalRecord`: the
+ * CLI reports `term.exit` before the worker's final result.
+ */
+type OperatorStepTracker = {
+  stepId: string;
+  instanceId: string;
+  rank: number;
+  action: DeploymentOperatorAction;
+  intentHash: string;
+  ownerEpoch: string;
+  terminalId: string;
+  userId: string;
+  cliDeviceId: string;
+  /** `spawning` until the first `awaiting_operator`. */
+  phase: "spawning" | "awaiting" | "running";
+  /** An Enter started the command at least once in this terminal. */
+  attempted: boolean;
+  /** The server closed the terminal (`cancelled` is recorded); only routing remains. */
+  cancelled: boolean;
 };
 
 export type TerminalWriterLabel = "you" | "other" | "none";
@@ -351,6 +432,11 @@ export function registerTerminalBridge(bridge: TerminalBridge) {
 }
 
 export const TERMINAL_USER_LIMIT = 4;
+/**
+ * Interactive steps one session may track at once. The reconciler opens at
+ * most a few operator terminals per node (design §4: 4); the CLI caps 8.
+ */
+export const OPERATOR_STEPS_PER_SESSION = 16;
 export const TERMINAL_CLI_LIMIT = 2;
 /** 2.5: attached viewers plus pending approvals per terminal. */
 export const TERMINAL_VIEWER_LIMIT = 8;
@@ -383,12 +469,35 @@ const TELEMETRY_FRAME_TYPES: ReadonlySet<string> = new Set([
 export const ENDPOINT_LOAD_MIN_INTERVAL_MS = 1_000;
 /** Distinct endpoint/model load keys kept per session. */
 export const ENDPOINT_LOAD_MAX_KEYS = 1_000;
+/** KV-eviction reset (epoch change or prefixCacheReset) at most this often per endpoint. */
+export const KV_EVICTION_RESET_DEBOUNCE_MS = 30_000;
+/**
+ * Bounds the per-endpoint epoch cache. A miss is never read as "unchanged": it costs one
+ * durable epoch read, so this bounds memory, not correctness.
+ */
+export const KV_COUNTER_EPOCH_CACHE_MAX = 16_384;
 
 function addCapped(total: number, delta: number): number {
   return Math.min(Number.MAX_SAFE_INTEGER, total + delta);
 }
 
 type LiveEndpointLoadEntry = LiveEndpointLoad & { receivedAtMs: number };
+
+export const DEPLOYMENT_SNAPSHOT_TIMEOUT_MS = 30_000;
+const DEPLOYMENT_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+const DEPLOYMENT_SNAPSHOT_RECORDS = 65_536;
+const DEPLOYMENT_SNAPSHOT_GLOBAL_BYTES = 32 * 1024 * 1024;
+const DEPLOYMENT_SNAPSHOT_SLOTS = 64;
+type DeploymentSnapshot = {
+  id: string;
+  nextIndex: number;
+  bytes: number;
+  instances: DeploymentObservedInstance[];
+  keys: Set<string>;
+  completing: boolean;
+  released: boolean;
+  timer: ReturnType<typeof setTimeout>;
+};
 
 type SessionState = {
   socket: RelaySocket;
@@ -409,6 +518,12 @@ type SessionState = {
   /** Serialises `engine.adapters.set` sends the same way. */
   remoteAdaptersQueue: Promise<void>;
   inventoryConfirmed: boolean;
+  /** Connection generation whose complete deployment inventory was committed; null otherwise. */
+  deploymentInventoryGeneration: number | null;
+  deploymentSnapshot: DeploymentSnapshot | null;
+  lastDeploymentSnapshotId: string | null;
+  /** Slugs from the last accepted hello / inventory.update. */
+  inventorySlugs: Set<string>;
   endpointTargeting: boolean;
   protocolVersion: RelayProtocolVersion | null;
   cliVersion: string | null;
@@ -419,6 +534,11 @@ type SessionState = {
   /** 2.5 CLI identity proof, relayed to browsers as is. */
   terminalIdentity: CliTerminalIdentity | null;
   allowHumanTerminal: boolean;
+  /**
+   * Server grant for deployments (dashboard `allowDeployments`). Operator terminals need it
+   * (send, attach); revoking it closes the waiting ones (design §12h L5).
+   */
+  allowDeployments: boolean;
   mcpFileRead: boolean;
   /** Server grant for MCP commands (dashboard). The CLI's own mode is in `features`. */
   mcpCommandMode: McpCommandModeName;
@@ -428,6 +548,8 @@ type SessionState = {
   filesById: Map<string, TrackedFileOp>;
   /** Supervised commands by command id, from `term.spawn` until their terminal ends. */
   supervisedById: Map<string, TrackedSupervisedCommand>;
+  /** Interactive deployment steps with an operator terminal, by step id. */
+  operatorSteps: Map<string, OperatorStepTracker>;
   /**
    * Supervised commands whose terminal the server ended, by terminal id,
    * until the CLI's own `term.exit` for it: a `supervised.accepted` still in
@@ -435,6 +557,8 @@ type SessionState = {
    */
   endingSupervised: Map<string, TrackedSupervisedCommand>;
   unauthenticatedTimer: ReturnType<typeof setTimeout>;
+  /** One-shot nonce from `hello.challenge`; consumed when hello is verified. */
+  helloNonce: string | null;
   bodyStreamsByRequest: Map<string, OutboundBodyStream>;
   /** 2.7 telemetry, in memory only (see `handleTelemetry`). */
   nodeInfoAcceptedAtMs: number | null;
@@ -450,12 +574,24 @@ type SessionState = {
 export type ActiveRelayResponseHandlers = {
   /** Called only after request-body bytes have been accepted by the relay socket. */
   onRequestBodySent?(byteLength: number): void;
+  /** Count-first Chat: the CLI reports tokenize before headers or a too-large error. */
+  onCountResult?(message: CountContextResultMessage): void;
+  onCountError?(message: CountContextErrorMessage): void;
   onHeaders(message: Extract<RelayClientControlMessage, { type: "relay.response.headers" }>): void;
   onBody(chunk: Uint8Array, metadata: RelayResponseBodyMetadata): void;
   onComplete(message: Extract<RelayClientControlMessage, { type: "relay.complete" }>): void;
   onError(message: Extract<RelayClientControlMessage, { type: "relay.error" }>): void;
   onCancelled(message: Extract<RelayClientControlMessage, { type: "relay.cancelled" }>): void;
 };
+
+export type CountContextResultMessage = Extract<
+  RelayClientControlMessage,
+  { type: "context.count.result" }
+>;
+export type CountContextErrorMessage = Extract<
+  RelayClientControlMessage,
+  { type: "context.count.error" }
+>;
 
 type ActiveRelayRequest = ActiveRelayResponseHandlers & {
   cliDeviceId: string;
@@ -471,9 +607,12 @@ function interactiveCapabilities(capabilities: HelloMessage["cli"]["capabilities
   terminalIdentity: CliTerminalIdentity | null;
 } {
   return {
-    features: { ...capabilities.features, fileOps: capabilities.fileOps === true },
+    features: {
+      ...capabilities.features,
+      fileOps: true,
+    },
     terminalPublicKey: capabilities.terminalPublicKey,
-    terminalViewers: capabilities.terminalViewers === true,
+    terminalViewers: true,
     terminalIdentity: capabilities.terminalIdentity ?? null,
   };
 }
@@ -566,6 +705,7 @@ function reportedFeaturesFromHello(message: HelloMessage, now: Date): ReportedRe
     reportedTerminalApproval: features.terminalApproval,
     reportedTerminalSupported: features.terminalSupported,
     reportedAllowFileToolsAsRoot: features.allowFileToolsAsRoot,
+    reportedDeployments: features.deployments ?? false,
     reportedHostname: message.cli.hostname ?? null,
     featuresReportedAt: now,
   };
@@ -605,24 +745,448 @@ function interactiveTargetFromBinary(
   }
 }
 
-function closeWithProtocolError(socket: RelaySocket, message: string) {
+function closeCodeForProtocolError(code: RelayProtocolErrorCode): number {
+  if (code === "access_denied" || code === "identity_mismatch") return 1008;
+  if (code === "internal") return 1011;
+  return 1002;
+}
+
+function closeWithProtocolError(
+  socket: RelaySocket,
+  code: RelayProtocolErrorCode,
+  message: string,
+  requestId?: string,
+) {
   if (socket.readyState === WS_READY_STATE_OPEN) {
     socket.send(
-      encodeRelayServerControlMessage({
-        type: "protocol.error",
-        failure: "protocol_error",
-        message,
-      }),
+      encodeRelayServerControlMessage(protocolErrorMessage({ code, message, requestId })),
     );
   }
-  socket.close(1002, "protocol_error");
+  socket.close(closeCodeForProtocolError(code), code);
+}
+
+function protocolErrorFromRegistration(error: unknown): {
+  code: RelayProtocolErrorCode;
+  message: string;
+} {
+  if (error instanceof RelayRegistrationError) {
+    if (error.code === "identity_mismatch") {
+      return { code: "identity_mismatch", message: error.message };
+    }
+    if (error.code === "access_denied") {
+      return { code: "access_denied", message: error.message };
+    }
+    return { code: "malformed", message: error.message };
+  }
+  return { code: "internal", message: "internal" };
 }
 
 export class RelaySessionManager {
+  private readonly affinityObserverManagerId = randomUUID();
+  private affinityObserverTimer: ReturnType<typeof setInterval> | undefined;
+  private affinityObserverRunning: Promise<void> | undefined;
+  private affinityObserverRecovery: Promise<void> | undefined;
+  private pendingAffinityResets = new Map<
+    string,
+    {
+      cliDeviceId: string;
+      connectionGeneration: number;
+      slug: string;
+      epoch: number;
+      reset: boolean;
+      /** The cached previous epoch was missing: compare against the durable epoch. */
+      epochUnknown: boolean;
+      /** A debounced explicit reset is delayed until here, never dropped. */
+      notBefore: number;
+      now: Date;
+      version: number;
+      release: () => void;
+      running?: Promise<void>;
+    }
+  >();
+  private affinityResetTimer: ReturnType<typeof setInterval> | undefined;
+  private affinityResetRecoveryRunning = false;
+  private affinityResetClosed = false;
+  private affinityResetWrites = new Set<Promise<void>>();
+  private deploymentSnapshotBytes = 0;
+  private deploymentSnapshotSlots = 0;
+  private deploymentHandlers: {
+    result(socket: DeploymentSocket, result: DeploymentJobResult): Promise<unknown>;
+    inventory(socket: DeploymentSocket, instances: DeploymentObservedInstance[]): Promise<unknown>;
+    /** Called once a session is dispatch-ready (its inventory committed for this generation). */
+    ready?(socket: DeploymentSocket): void;
+  } | null = null;
+  setDeploymentHandlers(handlers: typeof this.deploymentHandlers) {
+    this.deploymentHandlers = handlers;
+  }
+  deploymentSocket(cliDeviceId: string): DeploymentLiveSocket | null {
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    if (this.relayDrain || !session?.registered || session.connectionGeneration === null)
+      return null;
+    return {
+      cliDeviceId,
+      userId: session.identity.userId,
+      generation: session.connectionGeneration,
+      // Inventory counts only for the generation that committed it; an in-place generation
+      // change (a newer hello settled under this session) requires fresh inventory.
+      inventoryComplete: session.deploymentInventoryGeneration === session.connectionGeneration,
+      // The reconciler claims interactive steps only where the send below would go through.
+      deploymentOperator: this.deploymentTerminalPolicyAllows(session),
+      operatorRoom:
+        session.operatorSteps.size < OPERATOR_STEPS_PER_SESSION ||
+        [...session.operatorSteps.values()].some((tracker) => tracker.cancelled),
+    };
+  }
+  sendDeploymentJob(socket: DeploymentSocket, job: DeploymentJob) {
+    const session = this.sessionsByCliDeviceId.get(socket.cliDeviceId);
+    if (
+      this.relayDrain ||
+      !session?.registered ||
+      session.connectionGeneration !== socket.generation ||
+      session.identity.userId !== socket.userId ||
+      // A closing socket would drop the frame silently; report it unsent.
+      session.socket.readyState !== WS_READY_STATE_OPEN ||
+      // Interactive jobs reach only a CLI that reported it can run them.
+      (deploymentJobNeedsOperator(job) && !this.sessionRunsOperatorJobs(session))
+    )
+      return false;
+    if (job.operator !== undefined) return this.sendOperatorJob(session, socket, job);
+    try {
+      this.sendControl(session, job);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  private sessionRunsOperatorJobs(session: SessionState) {
+    return deploymentOperatorSupported({
+      protocolVersion: session.protocolVersion,
+      deployments: session.features?.deployments,
+      deploymentOperator: session.features?.deploymentOperator,
+    });
+  }
+
+  /**
+   * Whether this node may hold operator terminals the owner can attach to:
+   * the deployment operator capability plus browser terminal crypto. NOT the
+   * human-terminal grant or the MCP command mode (design §5, §11.5). The
+   * node owner's opt-in (U1, design §12i: a separate node-local switch, off by
+   * default) is enforced by the CLI: it reports `deploymentOperator` only
+   * while that switch, deployments and a PTY are all on, and re-checks the
+   * switch at attach. The server's view is the hello snapshot.
+   */
+  private deploymentTerminalPolicyAllows(session: SessionState): boolean {
+    return (
+      // The dashboard grant too (design §12h L5): revoking it blocks sends and attaches.
+      session.allowDeployments &&
+      this.sessionRunsOperatorJobs(session) &&
+      session.features?.terminalSupported === true &&
+      session.terminalPublicKey !== null
+    );
+  }
+
+  /**
+   * Send an interactive job and pre-register its operator terminal (origin
+   * `deployment`, phase `opening`; listed once `awaiting_operator` names it).
+   * A repeated send of the same terminal for the same step re-sends the job and
+   * keeps the record (the CLI re-reports its state). A new terminal for a step
+   * replaces the old one: the CLI closes it itself on the new job. Terminal ids
+   * are never reused: an id held by any other terminal refuses the send.
+   */
+  private sendOperatorJob(session: SessionState, socket: DeploymentSocket, job: DeploymentJob) {
+    const operator = job.operator;
+    if (
+      operator === undefined ||
+      job.interactive !== true ||
+      !isDeploymentOperatorAction(job.action) ||
+      !this.deploymentTerminalPolicyAllows(session)
+    )
+      return false;
+    const terminalId = operator.terminalId;
+    const previous = session.operatorSteps.get(job.stepId);
+    const repeat =
+      previous !== undefined &&
+      previous.terminalId === terminalId &&
+      !previous.cancelled &&
+      previous.intentHash === job.intentHash &&
+      previous.ownerEpoch === job.ownerEpoch &&
+      previous.instanceId === job.instanceId &&
+      previous.rank === job.rank &&
+      // An ended terminal is never reopened under its id (the CLI would spawn a
+      // new one): a re-dispatch after `term.exit` needs a freshly minted id.
+      session.terminalsById.get(terminalId)?.origin === "deployment";
+    // At the cap a cancelled tracker gives way, but only once the send succeeded:
+    // until then it still routes the CLI's answer to the server's own close.
+    let evict: OperatorStepTracker | null = null;
+    if (!repeat) {
+      if (this.hasTerminal(terminalId) || this.operatorTerminalIdTracked(terminalId)) return false;
+      if (previous === undefined && session.operatorSteps.size >= OPERATOR_STEPS_PER_SESSION) {
+        evict = [...session.operatorSteps.values()].find((tracker) => tracker.cancelled) ?? null;
+        if (evict === null) return false;
+      }
+    }
+    let frame: string;
+    try {
+      // Encoded first: a job the CLI could not read throws here, before
+      // anything is registered or sent.
+      frame = encodeRelayServerControlMessage(job);
+    } catch {
+      return false;
+    }
+    try {
+      session.socket.send(frame);
+    } catch {
+      return false;
+    }
+    if (repeat) return true;
+    if (evict !== null) session.operatorSteps.delete(evict.stepId);
+    if (previous !== undefined) this.replaceOperatorStep(session, previous);
+    session.operatorSteps.set(job.stepId, {
+      stepId: job.stepId,
+      instanceId: job.instanceId,
+      rank: job.rank,
+      action: job.action,
+      intentHash: job.intentHash,
+      ownerEpoch: job.ownerEpoch,
+      terminalId,
+      userId: socket.userId,
+      cliDeviceId: socket.cliDeviceId,
+      phase: "spawning",
+      attempted: false,
+      cancelled: false,
+    });
+    session.terminalsById.set(terminalId, {
+      terminalId,
+      userId: socket.userId,
+      cliDeviceId: socket.cliDeviceId,
+      cols: 80,
+      rows: 24,
+      multiViewer: true,
+      viewers: new Map(),
+      pendingViewers: new Map(),
+      writerViewerId: null,
+      phase: "opening",
+      createdAt: Date.now(),
+      origin: "deployment",
+      supervised: null,
+      deployment: {
+        stepId: job.stepId,
+        instanceId: job.instanceId,
+        rank: job.rank,
+        action: job.action,
+        state: "awaiting",
+      },
+    });
+    return true;
+  }
+
+  private operatorTerminalIdTracked(terminalId: string): boolean {
+    for (const session of this.sessionsByCliDeviceId.values()) {
+      for (const tracker of session.operatorSteps.values()) {
+        if (tracker.terminalId === terminalId) return true;
+      }
+    }
+    return false;
+  }
+
+  private recordOperatorEvent(
+    tracker: OperatorStepTracker,
+    outcome: DeploymentOperatorOutcome,
+    exitCode?: number,
+  ) {
+    recordDeploymentOperatorEvent({
+      userId: tracker.userId,
+      instanceId: tracker.instanceId,
+      stepId: tracker.stepId,
+      cliDeviceId: tracker.cliDeviceId,
+      rank: tracker.rank,
+      action: tracker.action,
+      outcome,
+      ...(exitCode !== undefined ? { exitCode } : {}),
+    });
+  }
+
+  /**
+   * A new terminal replaced this step's terminal: forget the old one and end
+   * its record (viewers see the exit). The CLI closes the old terminal itself
+   * when it takes the new job; `closed` is recorded when it had opened.
+   */
+  private replaceOperatorStep(session: SessionState, tracker: OperatorStepTracker) {
+    if (session.operatorSteps.get(tracker.stepId) === tracker)
+      session.operatorSteps.delete(tracker.stepId);
+    if (tracker.phase !== "spawning" && !tracker.cancelled)
+      this.recordOperatorEvent(tracker, "closed");
+    const terminal = session.terminalsById.get(tracker.terminalId);
+    if (terminal?.origin === "deployment") this.closeTerminal(session, terminal, false);
+  }
+
+  /**
+   * Operator progress (`awaiting_operator`, `operator_running`,
+   * `operator_closed`) for this session. Only progress naming the terminal
+   * this session sent for exactly that step (id, intent hash, owner epoch,
+   * instance, rank) is passed on; anything else is dropped, and a live
+   * terminal nobody tracks is closed on the CLI. Writes the audit rows.
+   * Returns whether the result goes on to the reconciler.
+   */
+  private observeOperatorProgress(session: SessionState, result: DeploymentJobResult): boolean {
+    const terminalId = result.terminalId;
+    if (terminalId === undefined) return false;
+    const tracker = session.operatorSteps.get(result.stepId);
+    const matches =
+      tracker !== undefined &&
+      tracker.terminalId === terminalId &&
+      tracker.intentHash === result.intentHash &&
+      tracker.ownerEpoch === result.ownerEpoch &&
+      tracker.instanceId === result.instanceId &&
+      tracker.rank === result.rank;
+    if (!matches || tracker === undefined) {
+      // A terminal this session no longer tracks (replaced, or never sent)
+      // must not stay open on its CLI. A tracked one stays: a mismatched
+      // (stale) frame naming it is only dropped. Only this session's state is
+      // consulted, so a CLI learns nothing about other sessions' terminals.
+      if (
+        result.status !== "operator_closed" &&
+        !session.terminalsById.has(terminalId) &&
+        ![...session.operatorSteps.values()].some((other) => other.terminalId === terminalId) &&
+        session.socket.readyState === WS_READY_STATE_OPEN
+      )
+        this.sendControl(session, { type: "term.close", terminalId });
+      return false;
+    }
+    if (tracker.cancelled) {
+      // Only the CLI's answer to the server's own close still matters. A
+      // terminal that spawned after that close reached the CLI is closed again.
+      if (result.status === "operator_closed") {
+        session.operatorSteps.delete(tracker.stepId);
+        return true;
+      }
+      if (session.socket.readyState === WS_READY_STATE_OPEN)
+        this.sendControl(session, { type: "term.close", terminalId });
+      return false;
+    }
+    const terminal = session.terminalsById.get(terminalId);
+    const record = terminal?.origin === "deployment" ? terminal : undefined;
+    if (result.status === "awaiting_operator") {
+      if (tracker.phase === "spawning") this.recordOperatorEvent(tracker, "opened");
+      // An attempt ended without success (exit code n != 0); the person may retry.
+      else if (tracker.phase === "running") this.recordOperatorEvent(tracker, "failed");
+      tracker.phase = "awaiting";
+      if (record?.deployment) {
+        record.phase = "open";
+        record.deployment.state = "awaiting";
+        this.notifyTerminalListChanged(record.userId);
+      }
+      return true;
+    }
+    if (result.status === "operator_running") {
+      if (tracker.phase === "spawning") return false;
+      if (tracker.phase === "awaiting") this.recordOperatorEvent(tracker, "accepted");
+      tracker.phase = "running";
+      tracker.attempted = true;
+      if (record?.deployment && record.deployment.state !== "running") {
+        record.deployment.state = "running";
+        this.notifyTerminalListChanged(record.userId);
+      }
+      return true;
+    }
+    // operator_closed: declined (nothing ran), or the terminal ended without success.
+    session.operatorSteps.delete(tracker.stepId);
+    if (tracker.phase !== "spawning") {
+      if (result.exitCode !== undefined || tracker.attempted || tracker.phase === "running")
+        this.recordOperatorEvent(tracker, "closed", result.exitCode);
+      else this.recordOperatorEvent(tracker, "declined");
+    }
+    if (record) this.closeTerminal(session, record, false);
+    return true;
+  }
+
+  /**
+   * A final result (`succeeded` / `failed`) for a tracked interactive step:
+   * `succeeded`/`failed` when its terminal had been opened, `auto_settled`
+   * when the CLI's status-first check settled a step nobody ran. A failure
+   * before any terminal opened (spawn refused) records nothing.
+   */
+  private observeOperatorFinal(session: SessionState, result: DeploymentJobResult) {
+    if (result.status !== "succeeded" && result.status !== "failed") return;
+    const tracker = session.operatorSteps.get(result.stepId);
+    if (
+      tracker === undefined ||
+      // A final names its dispatch's terminal: a late answer to an earlier copy of the step
+      // must not end (or be audited against) the current terminal.
+      tracker.terminalId !== result.terminalId ||
+      tracker.intentHash !== result.intentHash ||
+      tracker.ownerEpoch !== result.ownerEpoch ||
+      tracker.instanceId !== result.instanceId ||
+      tracker.rank !== result.rank
+    )
+      return;
+    session.operatorSteps.delete(tracker.stepId);
+    // Recorded even after a server cancel: a verify that won the race is the truth.
+    if (tracker.phase !== "spawning")
+      this.recordOperatorEvent(tracker, result.status === "succeeded" ? "succeeded" : "failed");
+    else if (result.status === "succeeded") this.recordOperatorEvent(tracker, "auto_settled");
+    const terminal = session.terminalsById.get(tracker.terminalId);
+    // The CLI ends the terminal before it verifies; a record still here is stale.
+    if (terminal?.origin === "deployment") this.closeTerminal(session, terminal, true);
+  }
+
+  /**
+   * Close the operator terminal of a deployment step, by step id (design
+   * §12b: a step reset to PENDING loses its stored terminal id). Any session
+   * holding the step is searched. Records `cancelled` when the terminal had
+   * opened. `keepRunning` leaves a terminal whose command already runs alone
+   * (answer `running`). The CLI's `operator_closed` answer still reaches the
+   * reconciler.
+   */
+  closeDeploymentOperatorStep(
+    stepId: string,
+    options: { keepRunning?: boolean } = {},
+  ): "closed" | "running" | "absent" {
+    for (const session of this.sessionsByCliDeviceId.values()) {
+      const tracker = session.operatorSteps.get(stepId);
+      if (tracker === undefined || tracker.cancelled) continue;
+      if (options.keepRunning === true && tracker.phase === "running") return "running";
+      this.cancelOperatorStep(session, tracker);
+      return "closed";
+    }
+    return "absent";
+  }
+
+  /** Ban fence: close every operator terminal of this user (see `./user-ban.ts`). */
+  cancelDeploymentOperatorTerminalsForUser(userId: string) {
+    for (const session of this.sessionsByCliDeviceId.values()) {
+      if (session.identity.userId !== userId) continue;
+      for (const tracker of [...session.operatorSteps.values()]) {
+        if (!tracker.cancelled) this.cancelOperatorStep(session, tracker);
+      }
+    }
+  }
+
+  private cancelOperatorStep(session: SessionState, tracker: OperatorStepTracker) {
+    if (tracker.phase !== "spawning") this.recordOperatorEvent(tracker, "cancelled");
+    tracker.cancelled = true;
+    const terminal = session.terminalsById.get(tracker.terminalId);
+    if (terminal?.origin === "deployment") this.closeTerminal(session, terminal, true);
+    else if (session.socket.readyState === WS_READY_STATE_OPEN)
+      this.sendControl(session, { type: "term.close", terminalId: tracker.terminalId });
+  }
+
+  /** The session ended: its operator terminals are gone with it. */
+  private endOperatorSteps(session: SessionState) {
+    for (const tracker of [...session.operatorSteps.values()]) {
+      session.operatorSteps.delete(tracker.stepId);
+      if (tracker.phase !== "spawning" && !tracker.cancelled)
+        this.recordOperatorEvent(tracker, "closed");
+    }
+  }
   private sessionsBySocket = new Map<RelaySocket, SessionState>();
   private sessionsByCliDeviceId = new Map<string, SessionState>();
   /** Manager-level so a reconnect does not wipe the 30-minute ring. */
   private engineLoadHistory = new EngineLoadHistoryStore();
+  /** Last `counterEpoch` per (device, endpoint). Survives reconnect of this process. */
+  private kvCounterEpochByEndpoint = new Map<string, number>();
+  /** Last KV-eviction reset time per (device, endpoint), for debounce. */
+  private kvResetAtByEndpoint = new Map<string, number>();
   private featureGrantsRefreshByCliDeviceId = new Map<string, Promise<void>>();
   private grantChangeSeq = 0;
   // One integer per device changed since process start. There is no device-delete
@@ -686,10 +1250,11 @@ export class RelaySessionManager {
       }
       return false;
     }
+    const helloNonce = randomBytes(16).toString("base64url");
     const unauthenticatedTimer = setTimeout(() => {
       const session = this.sessionsBySocket.get(socket);
       if (!session?.registered) {
-        closeWithProtocolError(socket, "Registration was not received in time.");
+        closeWithProtocolError(socket, "malformed", "Registration was not received in time.");
         this.removeSession(socket, new Date());
       }
     }, RELAY_UNREGISTERED_STALE_AFTER_MS);
@@ -706,6 +1271,10 @@ export class RelaySessionManager {
       remoteSourcesQueue: Promise.resolve(),
       remoteAdaptersQueue: Promise.resolve(),
       inventoryConfirmed: false,
+      deploymentInventoryGeneration: null,
+      deploymentSnapshot: null,
+      lastDeploymentSnapshotId: null,
+      inventorySlugs: new Set(),
       endpointTargeting: false,
       protocolVersion: null,
       cliVersion: null,
@@ -714,14 +1283,17 @@ export class RelaySessionManager {
       terminalViewers: false,
       terminalIdentity: null,
       allowHumanTerminal: false,
+      allowDeployments: false,
       mcpCommandMode: "off",
       mcpFileRead: false,
       terminalsById: new Map(),
       commandsById: new Map(),
       filesById: new Map(),
       supervisedById: new Map(),
+      operatorSteps: new Map(),
       endingSupervised: new Map(),
       unauthenticatedTimer,
+      helloNonce,
       bodyStreamsByRequest: new Map(),
       nodeInfoAcceptedAtMs: null,
       nodeMetrics: null,
@@ -731,6 +1303,15 @@ export class RelaySessionManager {
       malformedTelemetryLoggedAtMs: null,
       routingEvaluation: null,
     });
+    if (socket.readyState === WS_READY_STATE_OPEN) {
+      socket.send(
+        encodeRelayServerControlMessage({
+          type: "hello.challenge",
+          nonce: helloNonce,
+          origin: relayHelloOrigin(),
+        }),
+      );
+    }
     return true;
   }
 
@@ -740,8 +1321,16 @@ export class RelaySessionManager {
     // (an "upgrade wsmp" text), not an opaque schema rejection. Every released CLI treats protocol.error as fatal.
     if (!session.registered && helloNeedsUpgrade(frame)) {
       const rejected = rejectedHelloFacts(frame);
-      console.error("[relay] refused a hello older than the minimum relay protocol", rejected);
-      closeWithProtocolError(socket, RELAY_UPGRADE_REQUIRED_MESSAGE);
+      const reason = refusedRelayProtocolReason(rejected.protocolVersion);
+      const code = reason === "cli_too_new" ? "upgrade_server" : "upgrade_cli";
+      console.error("[relay] refused a hello this server does not speak", { ...rejected, code });
+      closeWithProtocolError(
+        socket,
+        code,
+        code === "upgrade_server"
+          ? RELAY_SERVER_UPGRADE_REQUIRED_MESSAGE
+          : RELAY_UPGRADE_REQUIRED_MESSAGE,
+      );
       await this.recordRejectedHello(session, rejected, now);
       await this.removeSession(socket, now);
       return;
@@ -761,12 +1350,28 @@ export class RelaySessionManager {
       } else {
         console.error("[relay] control frame parse failed", description.name);
       }
-      closeWithProtocolError(socket, "Malformed relay protocol message.");
+      closeWithProtocolError(socket, "malformed", "Malformed relay protocol message.");
       await this.removeSession(socket, now);
       return;
     }
 
     if (message.type === "hello") {
+      const nonce = session.helloNonce;
+      session.helloNonce = null;
+      if (
+        !nonce ||
+        !verifyHelloIdentitySignature({
+          identityPublicKey: message.cli.identityPublicKey,
+          signature: message.cli.identitySignature,
+          nonce,
+          cliSlug: message.cli.slug,
+          origin: relayHelloOrigin(),
+        })
+      ) {
+        closeWithProtocolError(socket, "malformed", "Hello identity proof is invalid.");
+        await this.removeSession(socket, now);
+        return;
+      }
       try {
         const helloSeq = this.grantChangeSeq;
         const registration = await persistRelayRegistration({
@@ -777,6 +1382,7 @@ export class RelaySessionManager {
           endpointTargeting: true,
           connection: true,
           reported: reportedFeaturesFromHello(message, now),
+          identityPublicKey: message.cli.identityPublicKey,
           now,
         });
         if (this.sessionsBySocket.get(socket) !== session) {
@@ -824,7 +1430,12 @@ export class RelaySessionManager {
         this.installSessionFeatureGrants(
           session,
           stalePolicy
-            ? { allowHumanTerminal: false, mcpCommandMode: "off", mcpFileRead: false }
+            ? {
+                allowHumanTerminal: false,
+                allowDeployments: false,
+                mcpCommandMode: "off",
+                mcpFileRead: false,
+              }
             : registration,
         );
         const interactive = interactiveCapabilities(message.cli.capabilities);
@@ -841,6 +1452,8 @@ export class RelaySessionManager {
         clearTimeout(session.unauthenticatedTimer);
         this.reconcileInteractiveGrants(session);
         this.replaceDuplicateSession(session);
+        session.inventorySlugs = new Set(message.endpoints.map((endpoint) => endpoint.slug));
+        this.pruneCounterEpochs(registration.cliDeviceId, session.inventorySlugs);
         if (stalePolicy) {
           void this.refreshFeatureGrants(registration.cliDeviceId).catch((error: unknown) => {
             console.error(
@@ -857,6 +1470,13 @@ export class RelaySessionManager {
           now: new Date(),
         }).catch(() => 0);
         this.poolMemberRecovery.wake();
+        await registerAffinityObservers({
+          cliDeviceId: registration.cliDeviceId,
+          slugs: [...session.inventorySlugs],
+          connectionGeneration: registration.connectionGeneration,
+          managerId: this.affinityObserverManagerId,
+        }).catch(() => {});
+        this.startAffinityObserverMaintenance();
         socket.send(
           encodeRelayServerControlMessage({
             type: "hello.ok",
@@ -866,31 +1486,31 @@ export class RelaySessionManager {
             desiredCapabilities: registration.desiredCapabilities,
           }),
         );
+        await this.seedCounterEpochs(registration.cliDeviceId);
         await this.sendRemoteMetricSources(session);
         await this.sendRemoteEngineAdapters(session);
       } catch (error) {
         // Already detached and closed by whoever detached it.
         if (this.sessionsBySocket.get(socket) !== session) return;
-        const relayError =
-          error instanceof RelayRegistrationError && error.code === "access_denied"
-            ? "access_denied"
-            : "protocol_error";
-        socket.send(
-          encodeRelayServerControlMessage({
-            type: "protocol.error",
-            failure: "protocol_error",
-            message: relayError,
-            requestId: message.id,
-          }),
-        );
-        socket.close(1008, relayError);
+        // An identity-key mismatch rolls the registration back, so the session
+        // already serving this device stays. The message tells the copy to
+        // log in again; it is not an opaque protocol error.
+        if (error instanceof RelayRegistrationError && error.code === "identity_mismatch") {
+          await this.recordIdentityRefusal(session.identity, now);
+        }
+        const mapped = protocolErrorFromRegistration(error);
+        closeWithProtocolError(socket, mapped.code, mapped.message, message.id);
         await this.removeSession(socket, now);
       }
       return;
     }
 
     if (!session.registered || !session.cliDeviceId) {
-      closeWithProtocolError(socket, "Registration is required before relay messages.");
+      closeWithProtocolError(
+        socket,
+        "malformed",
+        "Registration is required before relay messages.",
+      );
       await this.removeSession(socket, now);
       return;
     }
@@ -919,6 +1539,8 @@ export class RelaySessionManager {
         // Detached during the write: nothing to acknowledge. An inventory
         // update never writes connection state, so there is nothing to undo.
         if (this.sessionsBySocket.get(socket) !== session) return;
+        session.inventorySlugs = new Set(message.endpoints.map((endpoint) => endpoint.slug));
+        this.pruneCounterEpochs(registration.cliDeviceId, session.inventorySlugs);
         socket.send(
           encodeRelayServerControlMessage({
             type: "inventory.ok",
@@ -932,12 +1554,13 @@ export class RelaySessionManager {
         if (error instanceof RelayRegistrationError && error.code === "access_denied") {
           // The credential was revoked (or its owner removed) since the hello.
           socket.send(
-            encodeRelayServerControlMessage({
-              type: "protocol.error",
-              failure: "protocol_error",
-              message: "access_denied",
-              requestId: message.id,
-            }),
+            encodeRelayServerControlMessage(
+              protocolErrorMessage({
+                code: "access_denied",
+                message: "access_denied",
+                requestId: message.id,
+              }),
+            ),
           );
           socket.close(1008, "access_denied");
           await this.removeSession(socket, now);
@@ -953,6 +1576,27 @@ export class RelaySessionManager {
           }),
         );
       }
+      return;
+    }
+
+    if (message.type === "deployment.job.result" || message.type === "deployment.instances") {
+      const current = this.sessionsByCliDeviceId.get(session.cliDeviceId);
+      if (current !== session || session.connectionGeneration === null) return;
+      const identity = {
+        cliDeviceId: session.cliDeviceId,
+        userId: session.identity.userId,
+        generation: session.connectionGeneration,
+      };
+      if (message.type === "deployment.job.result") {
+        // Operator progress answers only interactive jobs, which only a CLI that
+        // reported `deploymentOperator` is ever sent.
+        if (deploymentOperatorResultStatus(message.status)) {
+          if (!this.sessionRunsOperatorJobs(session)) return;
+          // Only progress for the operator terminal this session sent goes on.
+          if (!this.observeOperatorProgress(session, message)) return;
+        } else this.observeOperatorFinal(session, message);
+        await this.deploymentHandlers?.result(identity, message);
+      } else await this.receiveDeploymentSnapshot(session, identity, message, frame);
       return;
     }
 
@@ -995,12 +1639,12 @@ export class RelaySessionManager {
     }
 
     if (message.type === "relay.response.headers") {
-      this.activeRelayRequests.get(message.requestId)?.onHeaders(message);
+      this.ownedRelayRequest(session, message.requestId)?.onHeaders(message);
       return;
     }
 
     if (message.type === "relay.complete") {
-      const activeRequest = this.takeActiveRelayRequest(message.requestId);
+      const activeRequest = this.takeOwnedRelayRequest(session, message.requestId);
       if (!activeRequest) return;
       activeRequest.onComplete(message);
       this.considerDrainClose(activeRequest.cliDeviceId);
@@ -1008,7 +1652,7 @@ export class RelaySessionManager {
     }
 
     if (message.type === "relay.error") {
-      const activeRequest = this.takeActiveRelayRequest(message.requestId);
+      const activeRequest = this.takeOwnedRelayRequest(session, message.requestId);
       if (!activeRequest) return;
       activeRequest.onError(message);
       this.considerDrainClose(activeRequest.cliDeviceId);
@@ -1016,10 +1660,20 @@ export class RelaySessionManager {
     }
 
     if (message.type === "relay.cancelled") {
-      const activeRequest = this.takeActiveRelayRequest(message.requestId);
+      const activeRequest = this.takeOwnedRelayRequest(session, message.requestId);
       if (!activeRequest) return;
       activeRequest.onCancelled(message);
       this.considerDrainClose(activeRequest.cliDeviceId);
+      return;
+    }
+
+    if (message.type === "context.count.result") {
+      this.ownedRelayRequest(session, message.requestId)?.onCountResult?.(message);
+      return;
+    }
+
+    if (message.type === "context.count.error") {
+      this.ownedRelayRequest(session, message.requestId)?.onCountError?.(message);
       return;
     }
 
@@ -1067,9 +1721,10 @@ export class RelaySessionManager {
       if (!session) return;
       const parsed = parseRelayBinaryFrame(frame);
       if (parsed.metadata.type === "relay.response.body") {
-        this.activeRelayRequests
-          .get(parsed.metadata.requestId)
-          ?.onBody(parsed.body, parsed.metadata);
+        this.ownedRelayRequest(session, parsed.metadata.requestId)?.onBody(
+          parsed.body,
+          parsed.metadata,
+        );
         return;
       }
       if (parsed.metadata.type === "term.sealed") {
@@ -1138,10 +1793,21 @@ export class RelaySessionManager {
 
   /** Stops background recovery in controlled shutdowns and unit tests. */
   dispose() {
+    this.stopAffinityResetRecovery();
     this.poolMemberRecovery.stop();
     for (const session of this.sessionsBySocket.values()) {
+      this.clearDeploymentSnapshot(session);
+      session.deploymentInventoryGeneration = null;
       if (session.routingEvaluation) this.routingEvaluator.cancel(session.routingEvaluation);
     }
+  }
+
+  private stopAffinityResetRecovery() {
+    this.affinityResetClosed = true;
+    clearInterval(this.affinityResetTimer);
+    clearInterval(this.affinityObserverTimer);
+    for (const job of this.pendingAffinityResets.values()) job.release();
+    this.pendingAffinityResets.clear();
   }
 
   private async removeSessionWithStatus(
@@ -1164,6 +1830,125 @@ export class RelaySessionManager {
    * if any. Shutdown detaches every socket before it awaits a single write, so
    * a slow database cannot keep later sockets open.
    */
+  private clearDeploymentSnapshot(session: SessionState) {
+    const snapshot = session.deploymentSnapshot;
+    if (!snapshot) return;
+    clearTimeout(snapshot.timer);
+    // The callback still owns its array after disconnect/timeout; keep that memory charged until it joins.
+    if (!snapshot.completing) this.releaseDeploymentSnapshot(snapshot);
+    session.deploymentSnapshot = null;
+  }
+
+  private releaseDeploymentSnapshot(snapshot: DeploymentSnapshot) {
+    if (snapshot.released) return;
+    snapshot.released = true;
+    this.deploymentSnapshotBytes -= snapshot.bytes;
+    this.deploymentSnapshotSlots--;
+  }
+
+  private async receiveDeploymentSnapshot(
+    session: SessionState,
+    identity: DeploymentSocket,
+    frame: DeploymentInstancesFrame,
+    encoded: string,
+  ) {
+    const reject = async () => {
+      session.deploymentInventoryGeneration = null;
+      this.clearDeploymentSnapshot(session);
+      closeWithProtocolError(session.socket, "malformed", "Invalid deployment inventory snapshot.");
+      await this.removeSession(session.socket, new Date());
+    };
+    let snapshot = session.deploymentSnapshot;
+    if (frame.chunkIndex === 0) {
+      // A fresh start replaces an incomplete snapshot; never a committing callback.
+      session.deploymentInventoryGeneration = null;
+      if (
+        snapshot?.completing ||
+        snapshot?.id === frame.snapshotId ||
+        session.lastDeploymentSnapshotId === frame.snapshotId
+      )
+        return reject();
+      this.clearDeploymentSnapshot(session);
+      if (this.deploymentSnapshotSlots >= DEPLOYMENT_SNAPSHOT_SLOTS) return reject();
+      const timer = setTimeout(() => {
+        if (session.deploymentSnapshot !== snapshot) return;
+        const code = snapshot?.completing ? "internal" : "malformed";
+        session.deploymentInventoryGeneration = null;
+        this.clearDeploymentSnapshot(session);
+        closeWithProtocolError(session.socket, code, "Deployment inventory snapshot timed out.");
+        void this.removeSession(session.socket, new Date()).catch(() => {});
+      }, DEPLOYMENT_SNAPSHOT_TIMEOUT_MS);
+      timer.unref();
+      snapshot = {
+        id: frame.snapshotId,
+        nextIndex: 0,
+        bytes: 0,
+        instances: [],
+        keys: new Set(),
+        completing: false,
+        released: false,
+        timer,
+      };
+      session.deploymentSnapshot = snapshot;
+      this.deploymentSnapshotSlots++;
+    }
+    const bytes = Buffer.byteLength(encoded, "utf8");
+    if (
+      !snapshot ||
+      snapshot.completing ||
+      snapshot.id !== frame.snapshotId ||
+      snapshot.nextIndex !== frame.chunkIndex ||
+      snapshot.bytes + bytes > DEPLOYMENT_SNAPSHOT_BYTES ||
+      this.deploymentSnapshotBytes + bytes > DEPLOYMENT_SNAPSHOT_GLOBAL_BYTES ||
+      snapshot.instances.length + frame.instances.length > DEPLOYMENT_SNAPSHOT_RECORDS
+    )
+      return reject();
+    for (const instance of frame.instances) {
+      const key = `${instance.instanceId}:${instance.rank}`;
+      if (snapshot.keys.has(key)) return reject();
+      snapshot.keys.add(key);
+    }
+    snapshot.bytes += bytes;
+    this.deploymentSnapshotBytes += bytes;
+    snapshot.nextIndex++;
+    snapshot.instances.push(...frame.instances);
+    if (!frame.final) return;
+    snapshot.completing = true;
+    try {
+      if (!this.deploymentHandlers) throw new Error("deployment_inventory_handler_missing");
+      const accepted = await this.deploymentHandlers.inventory(identity, snapshot.instances);
+      if (accepted === false) throw new Error("deployment_inventory_not_committed");
+      if (
+        accepted !== false &&
+        this.sessionsByCliDeviceId.get(identity.cliDeviceId) === session &&
+        session.deploymentSnapshot === snapshot
+      ) {
+        session.lastDeploymentSnapshotId = snapshot.id;
+        session.deploymentInventoryGeneration = identity.generation;
+        session.socket.send(
+          encodeRelayServerControlMessage({
+            type: "deployment.instances.ok",
+            snapshotId: snapshot.id,
+          }),
+        );
+        this.deploymentHandlers.ready?.(identity);
+      }
+    } catch {
+      session.deploymentInventoryGeneration = null;
+      closeWithProtocolError(
+        session.socket,
+        "internal",
+        "Deployment inventory could not be committed.",
+      );
+      await this.removeSession(session.socket, new Date());
+    } finally {
+      if (session.deploymentSnapshot === snapshot) this.clearDeploymentSnapshot(session);
+      this.releaseDeploymentSnapshot(snapshot);
+    }
+    // ACK is emitted only by the current generation after durable completion.
+    // A rejected/timed-out/detached callback never acknowledges its snapshot.
+  }
+
   private detachSession(
     socket: RelaySocket,
     {
@@ -1178,6 +1963,8 @@ export class RelaySessionManager {
   ): (() => Promise<void>) | null {
     const session = this.sessionsBySocket.get(socket);
     if (!session) return null;
+    this.clearDeploymentSnapshot(session);
+    session.deploymentInventoryGeneration = null;
     this.teardownInteractiveWork(session);
     clearTimeout(session.unauthenticatedTimer);
     if (session.routingEvaluation) this.routingEvaluator.cancel(session.routingEvaluation);
@@ -1331,6 +2118,7 @@ export class RelaySessionManager {
    */
   beginDrain() {
     this.relayDrain = true;
+    this.stopAffinityResetRecovery();
   }
 
   isDraining(): boolean {
@@ -1340,6 +2128,7 @@ export class RelaySessionManager {
   /** Shutdown step: cancel interactive work, close remaining CLI sockets, mark devices disconnected. */
   async closeRelaySessions(now = new Date()) {
     this.beginDrain();
+    await Promise.allSettled([...this.affinityResetWrites]);
     await this.shutdownRelaySessions([...this.sessionsBySocket.values()], now);
   }
 
@@ -1401,6 +2190,25 @@ export class RelaySessionManager {
     return active;
   }
 
+  private ownedRelayRequest(
+    session: SessionState,
+    requestId: string,
+  ): ActiveRelayRequest | undefined {
+    const active = this.activeRelayRequests.get(requestId);
+    if (!active || active.cliDeviceId !== session.cliDeviceId) return undefined;
+    return active;
+  }
+
+  private takeOwnedRelayRequest(
+    session: SessionState,
+    requestId: string,
+  ): ActiveRelayRequest | undefined {
+    const active = this.ownedRelayRequest(session, requestId);
+    if (!active) return undefined;
+    this.activeRelayRequests.delete(requestId);
+    return active;
+  }
+
   /** During drain, close a CLI socket once its last model request has finished. */
   private considerDrainClose(cliDeviceId: string | null | undefined) {
     if (!this.relayDrain || !cliDeviceId) return;
@@ -1438,10 +2246,16 @@ export class RelaySessionManager {
         try {
           const device = await prisma.cliDevice.findUnique({
             where: { id: cliDeviceId },
-            select: { allowHumanTerminal: true, mcpCommandMode: true, mcpFileRead: true },
+            select: {
+              allowHumanTerminal: true,
+              allowDeployments: true,
+              mcpCommandMode: true,
+              mcpFileRead: true,
+            },
           });
           this.applyFeatureGrants(cliDeviceId, {
             allowHumanTerminal: device?.allowHumanTerminal === true,
+            allowDeployments: device?.allowDeployments === true,
             mcpCommandMode: device ? mcpCommandModeFromDb(device.mcpCommandMode) : "off",
             mcpFileRead: device?.mcpFileRead === true,
           });
@@ -1450,6 +2264,7 @@ export class RelaySessionManager {
           // unsupervised access. Reconciliation cancels work before we rethrow.
           this.applyFeatureGrants(cliDeviceId, {
             allowHumanTerminal: false,
+            allowDeployments: false,
             mcpCommandMode: "off",
             mcpFileRead: false,
           });
@@ -1529,7 +2344,14 @@ export class RelaySessionManager {
    * `session.impersonatedBy`) exists only on browser sessions.
    */
   async closeSessionsForUser(userId: string, now = new Date()) {
+    const deviceIds = new Set<string>();
+    for (const session of this.sessionsByCliDeviceId.values()) {
+      if (session.identity.userId === userId && session.cliDeviceId) {
+        deviceIds.add(session.cliDeviceId);
+      }
+    }
     await this.closeSessionsMatching((session) => session.identity.userId === userId, now);
+    for (const cliDeviceId of deviceIds) this.engineLoadHistory.dropDevice(cliDeviceId);
   }
 
   private async closeSessionsMatching(matches: (session: SessionState) => boolean, now: Date) {
@@ -1541,11 +2363,9 @@ export class RelaySessionManager {
       this.teardownInteractiveWork(session);
       if (session.socket.readyState === WS_READY_STATE_OPEN) {
         session.socket.send(
-          encodeRelayServerControlMessage({
-            type: "protocol.error",
-            failure: "protocol_error",
-            message: "access_denied",
-          }),
+          encodeRelayServerControlMessage(
+            protocolErrorMessage({ code: "access_denied", message: "access_denied" }),
+          ),
         );
         session.socket.close(1008, "access_denied");
       }
@@ -1572,6 +2392,8 @@ export class RelaySessionManager {
     cliDeviceId: string,
     grants: {
       allowHumanTerminal: boolean;
+      /** Absent: the deployments grant is unchanged. */
+      allowDeployments?: boolean;
       mcpCommandMode: McpCommandModeName;
       mcpFileRead: boolean;
     },
@@ -1587,13 +2409,120 @@ export class RelaySessionManager {
     session: SessionState,
     grants: {
       allowHumanTerminal: boolean;
+      allowDeployments?: boolean;
       mcpCommandMode: McpCommandModeName;
       mcpFileRead: boolean;
     },
   ) {
     session.allowHumanTerminal = grants.allowHumanTerminal;
+    if (grants.allowDeployments !== undefined) session.allowDeployments = grants.allowDeployments;
     session.mcpCommandMode = grants.mcpCommandMode;
     session.mcpFileRead = grants.mcpFileRead === true;
+  }
+
+  /**
+   * Seed last-seen `counterEpoch` from durable endpoint rows so a replica or
+   * reboot still resets KV evidence only on a real epoch change.
+   */
+  private async seedCounterEpochs(cliDeviceId: string) {
+    try {
+      const rows = await prisma.endpoint.findMany({
+        where: { cliDeviceId },
+        select: { slug: true, loadCounterEpoch: true },
+      });
+      for (const row of rows ?? []) {
+        if (row.loadCounterEpoch == null) continue;
+        const key = `${cliDeviceId}\0${row.slug}`;
+        if (!this.kvCounterEpochByEndpoint.has(key))
+          this.kvCounterEpochByEndpoint.set(key, row.loadCounterEpoch);
+      }
+    } catch (error) {
+      console.error(
+        "[relay] seeding load counter epochs failed",
+        error instanceof Error ? error.name : typeof error,
+      );
+    }
+  }
+
+  private startAffinityObserverMaintenance() {
+    this.affinityObserverTimer ??= setInterval(() => {
+      if (this.affinityResetClosed || this.affinityObserverRunning) return;
+      this.affinityObserverRunning = (async () => {
+        try {
+          await renewAffinityObservers(
+            this.affinityObserverManagerId,
+            [...this.sessionsByCliDeviceId.keys()],
+            [...this.pendingAffinityResets.values()].map(
+              (job) => `${job.cliDeviceId}\u0001${job.slug}`,
+            ),
+          );
+        } catch {
+          // Database-clock lease expiry suppresses confidence without stopping inference.
+        }
+      })().finally(() => {
+        this.affinityObserverRunning = undefined;
+      });
+      this.affinityResetWrites.add(this.affinityObserverRunning);
+      const running = this.affinityObserverRunning;
+      void running.finally(() => this.affinityResetWrites.delete(running));
+      if (!this.affinityObserverRecovery) {
+        this.affinityObserverRecovery = (async () => {
+          await recoverAffinityObservers();
+          if (!this.affinityResetClosed)
+            await discoverAffinityObservers(
+              this.affinityObserverManagerId,
+              [...this.sessionsByCliDeviceId.keys()],
+              [...this.pendingAffinityResets.values()].map(
+                (job) => `${job.cliDeviceId}\u0001${job.slug}`,
+              ),
+            );
+        })()
+          .catch(() => {})
+          .finally(() => {
+            this.affinityObserverRecovery = undefined;
+          });
+        const recovery = this.affinityObserverRecovery;
+        this.affinityResetWrites.add(recovery);
+        void recovery.finally(() => this.affinityResetWrites.delete(recovery));
+      }
+    }, 500);
+    this.affinityObserverTimer.unref?.();
+  }
+
+  private pruneCounterEpochs(cliDeviceId: string, slugs: ReadonlySet<string>) {
+    const prefix = `${cliDeviceId}\0`;
+    for (const key of this.kvCounterEpochByEndpoint.keys()) {
+      if (key.startsWith(prefix) && !slugs.has(key.slice(prefix.length))) {
+        this.kvCounterEpochByEndpoint.delete(key);
+        this.kvResetAtByEndpoint.delete(key);
+      }
+    }
+    while (this.kvCounterEpochByEndpoint.size > KV_COUNTER_EPOCH_CACHE_MAX) {
+      const first = this.kvCounterEpochByEndpoint.keys().next().value;
+      if (first === undefined) break;
+      this.kvCounterEpochByEndpoint.delete(first);
+      this.kvResetAtByEndpoint.delete(first);
+    }
+  }
+
+  /**
+   * Record an identity-key refusal on the credential or token after the
+   * registration transaction has rolled back, so the dashboard can show it.
+   */
+  private async recordIdentityRefusal(identity: CliWebsocketIdentity, now: Date) {
+    const data = { lastRefusedAt: now, lastRefusedReason: "identity_mismatch" };
+    try {
+      if (identity.kind === "deviceCredential") {
+        await prisma.cliDeviceCredential.updateMany({ where: { id: identity.id }, data });
+      } else {
+        await prisma.cliToken.updateMany({ where: { id: identity.id }, data });
+      }
+    } catch (error) {
+      console.error(
+        "[relay] recording an identity refusal failed",
+        error instanceof Error ? error.name : typeof error,
+      );
+    }
   }
 
   /**
@@ -1628,6 +2557,166 @@ export class RelaySessionManager {
   }
 
   /**
+   * Reset KV-eviction evidence on a `counterEpoch` change or an explicit `prefixCacheReset`.
+   * Hello must not wipe rows. Unknown inventory slugs are ignored.
+   *
+   * Only positive proof skips work: a cached epoch equal to the frame's. A missing cache entry
+   * (eviction, pruning) is resolved against the durable epoch, and repeated explicit resets
+   * inside the debounce window are coalesced into one delayed reset rather than dropped.
+   */
+  private async noteKvEvictionResetSignal(
+    session: SessionState,
+    load: Pick<EndpointLoadMessage, "endpointSlug" | "prefixCacheReset" | "counterEpoch">,
+    now: Date,
+  ) {
+    const cliDeviceId = session.cliDeviceId;
+    if (!cliDeviceId || !session.inventorySlugs.has(load.endpointSlug)) return;
+    const key = `${cliDeviceId}\0${load.endpointSlug}`;
+    if (this.affinityResetClosed) return;
+    const previousEpoch = this.kvCounterEpochByEndpoint.get(key);
+    const epochUnknown = previousEpoch === undefined;
+    const epochChanged = !epochUnknown && load.counterEpoch !== previousEpoch;
+    const lastResetMs = this.kvResetAtByEndpoint.get(key);
+    const nowMs = now.getTime();
+    const resetRequested = epochChanged || load.prefixCacheReset === true;
+    const notBefore =
+      resetRequested &&
+      !epochChanged &&
+      lastResetMs !== undefined &&
+      Number.isFinite(nowMs) &&
+      nowMs - lastResetMs < KV_EVICTION_RESET_DEBOUNCE_MS
+        ? lastResetMs + KV_EVICTION_RESET_DEBOUNCE_MS
+        : 0;
+    if (!resetRequested && !epochUnknown && !this.pendingAffinityResets.has(key)) {
+      // Least-recently-used: an endpoint that keeps reporting stays cached.
+      this.kvCounterEpochByEndpoint.delete(key);
+      this.kvCounterEpochByEndpoint.set(key, load.counterEpoch);
+      return;
+    }
+    try {
+      const existing = this.pendingAffinityResets.get(key);
+      if (existing) {
+        // New reset evidence supersedes an in-flight snapshot: its completion may not clear
+        // this newer fence, even when the signal was rate-dropped. Evidence is judged against
+        // the pending job, not the (stale until it completes) cache: any epoch movement is a
+        // reset, and frames repeating the job's epoch leave it alone so it can complete.
+        const epochMoved = existing.epoch !== load.counterEpoch;
+        if (
+          load.prefixCacheReset === true ||
+          epochMoved ||
+          (epochUnknown && !existing.epochUnknown)
+        ) {
+          existing.epoch = load.counterEpoch;
+          existing.reset ||= resetRequested || epochMoved;
+          existing.epochUnknown ||= epochUnknown;
+          existing.notBefore = Math.min(existing.notBefore, notBefore);
+          existing.now = now;
+          existing.version++;
+        }
+      } else {
+        this.pendingAffinityResets.set(key, {
+          cliDeviceId,
+          connectionGeneration: session.connectionGeneration ?? 0,
+          slug: load.endpointSlug,
+          epoch: load.counterEpoch,
+          reset: resetRequested,
+          epochUnknown,
+          notBefore,
+          now,
+          version: 0,
+          release: beginAffinityReset(cliDeviceId, load.endpointSlug, session.identity.userId),
+        });
+      }
+    } catch {
+      // Only bounded observation-ledger overload relinquishes a connection;
+      // ordinary metadata persistence failures preserve all serving streams.
+      session.socket.close(1011, "cache_generation_unavailable");
+      await this.removeSession(session.socket, now);
+      return;
+    }
+    this.affinityResetTimer ??= setInterval(() => {
+      if (this.affinityResetClosed || this.affinityResetRecoveryRunning) return;
+      this.affinityResetRecoveryRunning = true;
+      void (async () => {
+        // At most four due jobs each tick; rotation prevents a locked first endpoint from
+        // monopolizing quiet recovery, and delayed (debounced) jobs never crowd out due ones.
+        const nowMs = Date.now();
+        const due = [...this.pendingAffinityResets.entries()]
+          .filter(([, job]) => job.notBefore <= nowMs && !job.running)
+          .slice(0, 4);
+        for (const [retryKey] of due) {
+          if (this.affinityResetClosed) break;
+          await this.runAffinityReset(retryKey);
+        }
+      })().finally(() => {
+        this.affinityResetRecoveryRunning = false;
+      });
+    }, 1000);
+    this.affinityResetTimer.unref?.();
+    await this.runAffinityReset(key, nowMs);
+  }
+
+  /** `nowMs` is the triggering frame's receipt time, or the clock for timer retries. */
+  private runAffinityReset(key: string, nowMs = Date.now()): Promise<void> {
+    const job = this.pendingAffinityResets.get(key);
+    if (!job || this.affinityResetClosed) return Promise.resolve();
+    if (job.running) return job.running;
+    const { cliDeviceId, connectionGeneration, slug, epoch, epochUnknown, now, version } = job;
+    // Move attempts to the tail, keeping a bounded fair recovery worklist.
+    this.pendingAffinityResets.delete(key);
+    this.pendingAffinityResets.set(key, job);
+    // A delayed reset keeps local confidence paused (its ledger entry is held) until it runs.
+    if (job.notBefore > nowMs) return Promise.resolve();
+    job.running = (async () => {
+      try {
+        const reset =
+          job.reset ||
+          (epochUnknown &&
+            (await readAffinityCounterEpoch(cliDeviceId, slug).then((durable) =>
+              // A CLI process starts each endpoint's counters at epoch 0. With
+              // nothing stored yet, a later epoch means a reset this server may
+              // not have seen (one sent while the slug was still being
+              // inventoried), so it is treated as one; epoch 0 is a baseline.
+              durable === null ? epoch > 0 : durable !== epoch,
+            )));
+        const observations = reset
+          ? await observeAffinityReset({
+              cliDeviceId,
+              slugs: [slug],
+              connectionGeneration,
+              managerId: this.affinityObserverManagerId,
+            })
+          : [];
+        if (reset) await resetKvEvictionForEndpoint(cliDeviceId, slug, now);
+        await persistAffinityCounterEpoch(cliDeviceId, slug, epoch);
+        if (this.affinityResetClosed || job.version !== version) return;
+        await acknowledgeAffinityObservations(observations);
+        if (this.affinityResetClosed || job.version !== version) return;
+        this.kvCounterEpochByEndpoint.set(key, epoch);
+        while (this.kvCounterEpochByEndpoint.size > KV_COUNTER_EPOCH_CACHE_MAX) {
+          const first = this.kvCounterEpochByEndpoint.keys().next().value;
+          if (first === undefined) break;
+          this.kvCounterEpochByEndpoint.delete(first);
+          this.kvResetAtByEndpoint.delete(first);
+        }
+        if (reset && Number.isFinite(now.getTime()))
+          this.kvResetAtByEndpoint.set(key, now.getTime());
+        job.release();
+        this.pendingAffinityResets.delete(key);
+      } catch {
+        // The affected physical capacity remains unknown until durable intent
+        // and epoch consumption both commit. Ordinary routing is unaffected.
+      } finally {
+        job.running = undefined;
+      }
+    })();
+    const running = job.running;
+    this.affinityResetWrites.add(running);
+    void running.finally(() => this.affinityResetWrites.delete(running));
+    return running;
+  }
+
+  /**
    * 2.7 telemetry. Frames above the rate limits are dropped, never fatal.
    * `endpoint.load` and the freshest metrics stay in memory; the CliDevice
    * row gets `node.info` once per connection and a metrics snapshot at most
@@ -1643,6 +2732,9 @@ export class RelaySessionManager {
     const nowMs = now.getTime();
     if (message.type === "endpoint.load") {
       const { type: _type, ...load } = message;
+      // Reset evidence is evaluated for every frame before any lossy load bookkeeping (rate
+      // limit, key cap): a dropped reading must never drop a physical cache reset.
+      await this.noteKvEvictionResetSignal(session, load, now);
       const key = `${load.endpointSlug}\u0000${load.modelSlug ?? ""}`;
       const previous = session.endpointLoad.get(key);
       const hitsDelta = load.prefixCacheHitsDelta ?? 0;
@@ -1723,6 +2815,24 @@ export class RelaySessionManager {
     session.nodeMetricsAcceptedAtMs = nowMs;
     const { type: _type, ...sample } = message;
     session.nodeMetrics = { sample, receivedAt: now };
+    const gpuTemps = (sample.gpus ?? []).map((gpu) => gpu.temperatureC);
+    const gpuUtils = (sample.gpus ?? []).map((gpu) => gpu.utilizationPercent);
+    observeNodeMetricsRollup({
+      ownerUserId: session.identity.userId,
+      cliDeviceId,
+      receivedAt: now,
+      cpuPercent: sample.cpu?.usagePercent,
+      memoryAvailableMiB: sample.memory?.availableMiB,
+      memoryTotalMiB: sample.memory?.totalMiB,
+      gpuTemperatureC: gpuTemps.reduce<number | null>(
+        (max, value) => (value == null ? max : max == null ? value : Math.max(max, value)),
+        null,
+      ),
+      gpuUtilizationPercent: gpuUtils.reduce<number | null>(
+        (max, value) => (value == null ? max : max == null ? value : Math.max(max, value)),
+        null,
+      ),
+    });
     this.scheduleRoutingEvaluation(session);
     if (
       session.nodeMetricsPersistedAtMs !== null &&
@@ -1859,7 +2969,6 @@ export class RelaySessionManager {
   }
 
   private async sendRemoteEngineAdaptersNow(session: SessionState): Promise<boolean> {
-    if (!relayProtocolAtLeast(session.protocolVersion, "2.9")) return false;
     const cliDeviceId = session.cliDeviceId;
     if (!cliDeviceId) return false;
     let adapters: RemoteEngineAdapter[] = [];
@@ -1973,19 +3082,16 @@ export class RelaySessionManager {
         cliVersion: session.cliVersion,
         humanTerminal: session.features?.humanTerminal ?? false,
         mcpCommandMode: session.features?.mcpCommandMode ?? "off",
-        supervisedCommands: relayProtocolAtLeast(session.protocolVersion, "2.6"),
+        supervisedCommands: true,
         terminalSupported: session.features?.terminalSupported ?? false,
         terminalApproval: session.features?.terminalApproval ?? false,
-        fileOps:
-          relayProtocolAtLeast(session.protocolVersion, "2.8") &&
-          session.features?.fileOps === true,
+        fileOps: true,
+        countContext: true,
         mcpFileRead: session.features?.mcpFileRead ?? false,
         fileRootsConfigured: session.features?.fileRootsConfigured ?? false,
         allowFileToolsAsRoot: session.features?.allowFileToolsAsRoot ?? false,
-        terminalPublicKey: relayProtocolAtLeast(session.protocolVersion, "2.4")
-          ? session.terminalPublicKey
-          : null,
-        terminalIdentity: session.terminalViewers ? session.terminalIdentity : null,
+        terminalPublicKey: session.terminalPublicKey,
+        terminalIdentity: session.terminalIdentity,
       });
     }
     return snapshots;
@@ -1996,8 +3102,9 @@ export class RelaySessionManager {
     let cli = 0;
     for (const session of this.sessionsByCliDeviceId.values()) {
       for (const terminal of session.terminalsById.values()) {
-        // Supervised terminals have their own limits (see cli-commands.ts).
-        if (terminal.phase === "pending" || terminal.origin === "agent") continue;
+        // Supervised terminals have their own limits (see cli-commands.ts);
+        // operator terminals are bounded per session (OPERATOR_STEPS_PER_SESSION).
+        if (terminal.phase === "pending" || terminal.origin !== "user") continue;
         if (terminal.userId === userId) user += 1;
         if (terminal.cliDeviceId === cliDeviceId) cli += 1;
       }
@@ -2027,17 +3134,19 @@ export class RelaySessionManager {
     viewerCount: number;
     attachedHere: boolean;
     writerHere: boolean;
-    origin: "user" | "agent";
+    origin: TerminalOrigin;
     /** Present for agent terminals. Server-asserted request details. */
     supervised?: SupervisedTerminalListing;
+    /** Present for deployment operator terminals: which step it runs (no command text). */
+    deployment?: DeploymentTerminalInfo;
   }> {
     const terminals: ReturnType<RelaySessionManager["listTerminalsForUser"]> = [];
     for (const session of this.sessionsByCliDeviceId.values()) {
       for (const terminal of session.terminalsById.values()) {
         if (terminal.userId !== userId) continue;
-        // A supervised terminal is listed once the CLI spawned it: before
-        // that there is nothing to attach to.
-        if (terminal.origin === "agent" && terminal.phase !== "open") continue;
+        // A supervised or operator terminal is listed once the CLI spawned
+        // it: before that there is nothing to attach to.
+        if (terminal.origin !== "user" && terminal.phase !== "open") continue;
         const writer = terminalWriterViewerId(terminal);
         const writerConn = writer ? terminal.viewers.get(writer)?.connId : undefined;
         terminals.push({
@@ -2049,6 +3158,7 @@ export class RelaySessionManager {
           writerHere: connId !== undefined && writerConn === connId,
           origin: terminal.origin,
           ...(terminal.supervised ? { supervised: terminal.supervised.listing() } : {}),
+          ...(terminal.deployment ? { deployment: { ...terminal.deployment } } : {}),
         });
       }
     }
@@ -2144,7 +3254,11 @@ export class RelaySessionManager {
     if (!located) return { ok: false, error: "not_found" };
     const { session, terminal } = located;
     const allowed =
-      terminal.origin === "agent" ? this.canRunSupervised(session) : this.canStartTerminal(session);
+      terminal.origin === "agent"
+        ? this.canRunSupervised(session)
+        : terminal.origin === "deployment"
+          ? this.canAttachDeploymentTerminal(session)
+          : this.canStartTerminal(session);
     if (!allowed) return { ok: false, error: "offline" };
     const now = Date.now();
     if (!terminal.multiViewer) {
@@ -2518,10 +3632,7 @@ export class RelaySessionManager {
     if (!session) return null;
     const readGrant = {
       server: session.mcpFileRead === true,
-      live:
-        session.features?.mcpFileRead === true &&
-        session.features.fileOps === true &&
-        relayProtocolAtLeast(session.protocolVersion, "2.8"),
+      live: session.features?.mcpFileRead === true && session.features.fileOps === true,
       roots: session.features?.fileRootsConfigured === true,
     };
     return (
@@ -2546,6 +3657,8 @@ export class RelaySessionManager {
     bodyChunks = [],
     bodySource,
     timeoutMs,
+    countFirst = false,
+    countCeiling,
   }: {
     cliDeviceId: string;
     endpointSlug: string;
@@ -2564,6 +3677,8 @@ export class RelaySessionManager {
     bodyChunks?: Uint8Array[];
     bodySource?: { size: number; open(): AsyncIterable<Uint8Array> };
     timeoutMs: number;
+    countFirst?: boolean;
+    countCeiling?: number;
   }) {
     if (this.relayDrain) throw new Error("CLI session is disconnected.");
     const session = this.sessionsByCliDeviceId.get(cliDeviceId);
@@ -2582,6 +3697,12 @@ export class RelaySessionManager {
       timeoutMs,
       endpointSlug,
       expectBody: (bodySource?.size ?? 0) > 0 || bodyChunks.length > 0,
+      ...(countFirst
+        ? {
+            countFirst: true as const,
+            ...(countCeiling != null ? { countCeiling } : {}),
+          }
+        : {}),
     };
     session.socket.send(encodeRelayServerControlMessage(control));
 
@@ -2600,6 +3721,11 @@ export class RelaySessionManager {
       pumping: false,
     });
     void this.pumpBodyStream(session, requestId);
+  }
+
+  supportsCountContext(cliDeviceId: string): boolean {
+    const session = this.sessionsByCliDeviceId.get(cliDeviceId);
+    return session?.registered === true;
   }
 
   private grantBodyCredits(session: SessionState, requestId: string, credits: number) {
@@ -2756,6 +3882,8 @@ export class RelaySessionManager {
       // the device's terminals and live features changed without them asking.
       const owners = new Set<string>([newSession.identity.userId]);
       for (const terminal of existing.terminalsById.values()) owners.add(terminal.userId);
+      this.clearDeploymentSnapshot(existing);
+      existing.deploymentInventoryGeneration = null;
       this.teardownInteractiveWork(existing);
       // A replaced session must publish no more verdicts: its pending run
       // would start later than the successor's fence and win with an older reading.
@@ -2795,7 +3923,6 @@ export class RelaySessionManager {
 
   private canStartTerminal(session: SessionState): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.4") &&
       session.allowHumanTerminal &&
       session.features?.humanTerminal === true &&
       session.features.terminalSupported === true &&
@@ -2810,9 +3937,8 @@ export class RelaySessionManager {
    * Without a terminal, whether any terminal frame may be sent at all.
    */
   private canSignalTerminal(session: SessionState, terminal?: TerminalRecord): boolean {
-    if (!relayProtocolAtLeast(session.protocolVersion, "2.6")) return false;
     if (session.socket.readyState !== WS_READY_STATE_OPEN) return false;
-    if (terminal?.origin === "agent") return true;
+    if (terminal?.origin === "agent" || terminal?.origin === "deployment") return true;
     if (terminal === undefined) return true;
     return session.features?.humanTerminal === true;
   }
@@ -2845,7 +3971,6 @@ export class RelaySessionManager {
   /** Supervised terminals: MCP command mode, not the human terminal grant. */
   private supervisedPolicyAllows(session: SessionState): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
       allowsSupervisedCommands(this.effectiveCommandMode(session)) &&
       session.features?.terminalSupported === true &&
       session.terminalPublicKey !== null
@@ -2858,9 +3983,16 @@ export class RelaySessionManager {
     );
   }
 
+  /** Operator terminals: the deployment operator policy, not the human or MCP grants. */
+  private canAttachDeploymentTerminal(session: SessionState): boolean {
+    return (
+      this.deploymentTerminalPolicyAllows(session) &&
+      session.socket.readyState === WS_READY_STATE_OPEN
+    );
+  }
+
   private canStartExec(session: SessionState): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
       allowsHeadlessCommands(this.effectiveCommandMode(session)) &&
       session.socket.readyState === WS_READY_STATE_OPEN
     );
@@ -2869,7 +4001,6 @@ export class RelaySessionManager {
   /** Node file ops (2.8) follow the effective mode through the one file matrix. */
   private canStartFile(session: SessionState, opClass: FileOpClass): boolean {
     return (
-      relayProtocolAtLeast(session.protocolVersion, "2.8") &&
       session.cliDeviceId !== null &&
       this.fileOpModeRefusal(session.cliDeviceId, opClass) === null &&
       session.features?.fileOps === true &&
@@ -2878,17 +4009,11 @@ export class RelaySessionManager {
   }
 
   private canSignalFile(session: SessionState): boolean {
-    return (
-      relayProtocolAtLeast(session.protocolVersion, "2.8") &&
-      session.socket.readyState === WS_READY_STATE_OPEN
-    );
+    return session.socket.readyState === WS_READY_STATE_OPEN;
   }
 
   private canSignalExec(session: SessionState): boolean {
-    return (
-      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
-      session.socket.readyState === WS_READY_STATE_OPEN
-    );
+    return session.socket.readyState === WS_READY_STATE_OPEN;
   }
 
   private sendControl(session: SessionState, message: RelayServerControlMessage) {
@@ -2898,7 +4023,6 @@ export class RelaySessionManager {
 
   private reconcileInteractiveGrants(session: SessionState) {
     const terminalOk =
-      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
       session.allowHumanTerminal &&
       session.features?.humanTerminal === true &&
       session.features.terminalSupported === true;
@@ -2909,14 +4033,20 @@ export class RelaySessionManager {
     if (!this.supervisedPolicyAllows(session)) {
       this.closeAllTerminals(session, this.canSignalTerminal(session), "policy", "agent");
     }
-    const execOk =
-      relayProtocolAtLeast(session.protocolVersion, "2.6") &&
-      allowsHeadlessCommands(this.effectiveCommandMode(session));
+    const execOk = allowsHeadlessCommands(this.effectiveCommandMode(session));
     if (!execOk) this.cancelAllCommands(session);
     this.cancelFileOpsNoLongerAllowed(session);
+    // Operator terminals follow the deployment operator policy (dashboard grant included):
+    // waiting ones close; a person's command already running is left to finish, like the
+    // CLI's own switch (its attach is refused meanwhile).
+    if (!this.deploymentTerminalPolicyAllows(session))
+      for (const tracker of [...session.operatorSteps.values()])
+        if (!tracker.cancelled && tracker.phase !== "running")
+          this.cancelOperatorStep(session, tracker);
   }
 
   private teardownInteractiveWork(session: SessionState) {
+    this.endOperatorSteps(session);
     this.closeAllTerminals(session, this.canSignalTerminal(session), "disconnected");
     this.cancelAllCommands(session);
     this.cancelAllFileOps(session);
@@ -2992,7 +4122,8 @@ export class RelaySessionManager {
       connIds: terminalConnIds(terminal),
       ...(supervised ? supervisedExitFields(supervised) : {}),
     });
-    if (supervised) this.notifyTerminalListChanged(terminal.userId);
+    if (supervised || terminal.origin === "deployment")
+      this.notifyTerminalListChanged(terminal.userId);
   }
 
   /** 2.4: the new viewer takes the terminal and every other tab hears `detached`. */
@@ -3248,13 +4379,15 @@ export class RelaySessionManager {
         ...(message.signal !== undefined ? { signal: message.signal } : {}),
         ...(supervised ? { supervisedStatus: supervised.listing().status } : {}),
       });
-      if (supervised) this.notifyTerminalListChanged(terminal.userId);
+      if (supervised || terminal.origin === "deployment")
+        this.notifyTerminalListChanged(terminal.userId);
       return;
     }
-    // A supervised terminal is spawned with `term.spawn`, never opened by a
-    // browser; before `term.spawned` nothing on it can be attached.
+    // A supervised terminal is spawned with `term.spawn` and an operator
+    // terminal with its deployment job, never opened by a browser; before
+    // `term.spawned` / `awaiting_operator` nothing on it can be attached.
     if (
-      terminal.origin === "agent" &&
+      terminal.origin !== "user" &&
       (message.type === "term.opened" || terminal.phase !== "open")
     ) {
       return;
@@ -3674,6 +4807,22 @@ export class RelaySessionManager {
         console.error("[relay] malformed telemetry frame dropped", type);
       }
       return true;
+    }
+    if (type === "context.count.result" || type === "context.count.error") {
+      const requestId = typeof record.requestId === "string" ? record.requestId : null;
+      if (!requestId) return false;
+      const relay = this.ownedRelayRequest(session, requestId);
+      if (relay) {
+        relay.onCountError?.({
+          type: "context.count.error",
+          requestId,
+          failure: "protocol_error",
+          message: "Malformed context.count frame.",
+        });
+        console.error("[relay] malformed context.count frame");
+        return true;
+      }
+      return false;
     }
     return false;
   }

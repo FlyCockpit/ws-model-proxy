@@ -211,6 +211,7 @@ fn replace_impl(
     // replace_inner closes staging/read files before any final unlink.
     let recovered = recovery.finish();
     match result {
+        Ok(_) if !recovery.acknowledges_success() => Err(recovery.uncertain()),
         Ok(stat) => Ok((stat, recovered)),
         Err(error) if error.code == ErrorCode::UncertainOutcome || !recovery.settled() => {
             Err(recovery.uncertain())
@@ -246,6 +247,8 @@ fn replace_inner(
     let mut armed = true;
     let prepared = (|| -> FileResult<Stat> {
         ops.step(Step::TempCreated)?;
+        // A failed write or writeback of the private temp is disposed below by
+        // its held proof (never fsynced again, never published or certified).
         tmp_file.write_all(content)?;
         ops.step(Step::TempWritten)?;
         tmp_file.sync_all()?;
@@ -259,6 +262,7 @@ fn replace_inner(
         ops.step(Step::Chowned)?;
         fchmod(tmp_file.as_fd(), perm_mode(orig_stat.mode & 0o7777)).map_err(FileError::errno)?;
         ops.step(Step::Chmodded)?;
+        tmp_file.sync_all()?;
         let new_stat = Stat::from_metadata(&tmp_file.metadata()?);
         recheck(ops, dir, name, &mut orig, orig_stat, orig_etag, cancel)?;
         ops.step(Step::EtagRechecked)?;
@@ -267,6 +271,10 @@ fn replace_inner(
             ops.step(Step::SupervisedPinVerified)?;
         }
         cancel.check()?;
+        let mut intent = super::intent::Intent::replace(&dir_path.join(name));
+        intent.published =
+            Some(super::intent::IntentSlot::planned(&dir_path.join(name)).with_stat(&new_stat));
+        recovery.prepare_intent(intent)?;
         Ok(new_stat)
     })();
     // The Held proofs are now the only descriptors on these inodes. Their
@@ -288,7 +296,11 @@ fn replace_inner(
         // Cancellation is no longer honored after commit, including a hook error.
         ops.step(Step::BeforeDirSync)
             .map_err(|_| FileError::mutation_uncertain())?;
-        fsync(dir.as_fd()).map_err(FileError::errno)?;
+        // The commit already crossed this directory's barrier before its
+        // durable `committed` record; a repeat failure cannot undo it.
+        if let Err(errno) = fsync(dir.as_fd()) {
+            tracing::warn!(%errno, "directory sync after committed replace failed");
+        }
         let _ = ops.step(Step::DirSynced);
         if linked {
             // Link publication gives the public name its own directory entry. On a
@@ -325,19 +337,25 @@ fn commit_stage(
 ) -> FileResult<bool> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
+        recovery.set_intent_phase(super::intent::IntentPhase::Publishing)?;
         match recovery.exchange_temp(tmp) {
             Ok(()) => {
                 *armed = false;
+                recovery.record_slot_identity(tmp)?;
                 let _ = ops.step(Step::Exchanged);
                 let _ = ops.step(Step::Captured);
                 if recovery.holds(tmp, original) {
+                    recovery.sync_effect(&[tmp.origin_dir()])?;
+                    recovery.set_intent_phase(super::intent::IntentPhase::Committed)?;
                     // Committed: cleanup failure is reported in recovered.
                     recovery.dispose(ops, tmp, original);
                     return Ok(false);
                 }
+                recovery.set_intent_phase(super::intent::IntentPhase::Compensating)?;
                 original.release(); // no longer needed; undo may link this inode
                 let y = recovery.capture_origin(tmp);
-                if y.is_some() {
+                if let Some(slot) = &y {
+                    recovery.record_slot_identity(slot)?;
                     let _ = ops.step(Step::Captured);
                 }
                 if let Some(y) = &y
@@ -369,7 +387,9 @@ fn commit_stage(
                 };
             }
             Err(Errno::ENOENT) => return Err(FileError::conflict("gone")),
-            Err(errno) if is_unsupported(errno) => {}
+            Err(errno) if is_unsupported(errno) => {
+                recovery.set_intent_phase(super::intent::IntentPhase::Prepared)?;
+            }
             Err(errno) => return Err(FileError::errno(errno)),
         }
     }
@@ -428,13 +448,22 @@ pub(crate) fn create_new(
 ) -> FileResult<(Stat, Vec<String>)> {
     let mut recovery = RecoveryDir::new(dir, dir_path)?;
     let result = (|| -> FileResult<Stat> {
+        // Unsupported directory sync refuses before anything is created.
+        super::recovery::probe_dir_barrier(dir)?;
+        // The exclusive create is itself a public effect: later barrier
+        // failures while disposing it cannot be reported as a clean refusal.
+        let before = recovery.effect_checkpoint();
+        recovery.begin_public_effect()?;
         let fd = openat(
             dir.as_fd(),
             name,
             OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_WRONLY | OFlag::O_CLOEXEC,
             perm_mode(mode & 0o777),
         )
-        .map_err(FileError::errno)?;
+        .map_err(|errno| {
+            recovery.effect_refused(before, errno);
+            FileError::errno(errno)
+        })?;
         let mut file = File::from(fd);
         let identity = match Held::from_file(&file) {
             Ok(held) => held,
@@ -453,6 +482,9 @@ pub(crate) fn create_new(
         };
         let finish = (|| -> FileResult<Stat> {
             ops.step(Step::Created)?;
+            // On failure the guard captures and disposes the created file by its
+            // held identity: its bytes were never acknowledged, and disposal
+            // never fsyncs the failed inode again.
             file.write_all(content)?;
             file.sync_all()?;
             fsync(dir.as_fd()).map_err(FileError::errno)?;
@@ -469,6 +501,8 @@ pub(crate) fn create_new(
     })();
     let recovered = recovery.finish();
     match result {
+        // The created file and its directory entry were synced before success:
+        // a later cleanup barrier failure only leaves reported residue.
         Ok(stat) => Ok((stat, recovered)),
         Err(_) if !recovery.settled() => Err(recovery.uncertain()),
         Err(error) => Err(error),

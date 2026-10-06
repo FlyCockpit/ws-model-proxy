@@ -1,0 +1,30 @@
+enum InferenceContributionState {
+  PENDING
+  ACTIVE
+  REVOKED
+}
+
+/// Two-party inference-only consent. Does not authorize any device commands.
+model InferenceContribution {
+  id                String                     @id @default(cuid(2))
+  createdAt         DateTime                   @default(now())
+  updatedAt         DateTime                   @default(now()) @updatedAt
+  contributorUserId String
+  poolOwnerUserId   String
+  poolId            String
+  discoveredModelId String
+  state             InferenceContributionState @default(PENDING)
+  expiresAt         DateTime
+  acceptedAt        DateTime?
+  revokedAt         DateTime?
+  Contributor       User                       @relation("InferenceContributor", fields: [contributorUserId], references: [id], onDelete: Cascade)
+  PoolOwner         User                       @relation("InferencePoolOwner", fields: [poolOwnerUserId], references: [id], onDelete: Cascade)
+  ModelPool         ModelPool                  @relation(fields: [poolId, poolOwnerUserId], references: [id, userId], onDelete: Cascade)
+  DiscoveredModel   DiscoveredModel            @relation(fields: [discoveredModelId, contributorUserId], references: [id, userId], onDelete: Cascade)
+  PoolMembers       PoolMember[]
+
+  @@index([contributorUserId, state, createdAt])
+  @@index([poolOwnerUserId, state, createdAt])
+  @@index([poolId, state])
+  @@map("inference_contribution")
+}

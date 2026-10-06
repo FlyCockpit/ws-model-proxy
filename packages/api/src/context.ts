@@ -22,6 +22,8 @@ export type LiveCliFeatureSnapshot = {
   terminalApproval: boolean;
   /** 2.8: the CLI implements `file.op`. */
   fileOps: boolean;
+  /** 2.4: the CLI implements `context.count`. */
+  countContext: boolean;
   /** 2.8: the CLI's own read-only file grant. */
   mcpFileRead: boolean;
   /** 2.8: the CLI has `fileRoots` configured. */
@@ -72,6 +74,8 @@ export type LiveNodeTelemetrySnapshot = {
 };
 
 export type ContextServices = {
+  /** Verified MCP transport identity; absence means cookie-authenticated human. */
+  deploymentActor?: { kind: "AGENT"; id: string };
   /** Server-owned accounting repair. Kept injectable so the API package does not depend on the server. */
   repairExpiredProviderBudgets?: (scope: {
     userId: string;

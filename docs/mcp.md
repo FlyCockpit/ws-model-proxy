@@ -11,15 +11,21 @@ excluded procedure) is maintained in the generated, test-enforced artifact
 [docs/mcp-tool-coverage.md](./mcp-tool-coverage.md). This document describes the
 server behavior around it; it does not duplicate the catalog.
 
-Node telemetry (relay protocol 2.7) is read-only over MCP. Node file tools
-(relay protocol 2.8) are described in [CLI file tools](#cli-file-tools-relay-protocol-28).
+Node telemetry (relay protocol 2.4) is read-only over MCP. Node file tools
+(relay protocol 2.4) are described in [CLI file tools](#cli-file-tools-relay-protocol-24).
 `forwarder_device_metrics_get` (`{ cliDeviceId }`) returns a CLI device's static
 `node.info`, its freshest `node.metrics` (live from the relay session, else the
-stored once-a-minute snapshot, with `nodeMetricsSource`), and the live
-`endpoint.load` readings the relay holds in memory. Detected engine facts
+stored once-a-minute snapshot, with `nodeMetricsSource`), the live
+`endpoint.load` readings the relay holds in memory, a `node` snapshot (kind,
+GPUs, live memory, labels, usable budgets, health warnings), and last-hour
+`minuteHistory` min/avg/max gauges. Labels and usable budgets are human-only
+dashboard writes; this tool is read-only. Health warnings are informational
+and never preflight gates. Detected engine facts
 (`engineKind`, `engineSlots`, `kvBudgetTokens`, `maxModelLen`,
 `engineFactsSource`, `engineFactsAt`) and the derived `enginePreset` appear on
-every capacity in `capacity_records_list`. Neither ever contains prompt text:
+every capacity in `capacity_records_list`. `effectiveKvBudgetTokens` is the
+capacity-card cut (live prefix-eviction applied to reported K, or the reported
+K when the eviction read fails). Neither ever contains prompt text:
 the CLI reads only slot ids, context sizes and busy flags from llama.cpp
 `/slots`.
 
@@ -72,9 +78,13 @@ Metric routing rules (S-B part 2):
   (`full_waiting`, `full_kv`, `full_slots`, `full_deferred`, `clear`, `stale`,
   `none`, `off`). `kvOccupancy` is display only: it never marks FULL and is not
   eviction evidence. `engineLoad.kvBudget` includes `reportedTokens`,
-  `effectiveTokens`, `source` (`PROBE` / `CONFIG` / `CUSTOM`), `cutFraction` (0–0.5), `floorFraction` (0.5),
+  `effectiveTokens` (warm-protection K for this pool; equals reported when
+  protection is off), `placementTokens` (residency spreading K; always the
+  live cut), `source` (`PROBE` / `CONFIG` / `CUSTOM` — provenance of the
+  **reported** K, null when K is unknown), `cutFraction` (0–0.5), `floorFraction` (0.5),
   `lastObservedAt`, `expiresAt`, and `active`. Prefix-eviction feedback
-  temporarily lowers token-mode warm-protection budgets; slot mode (including
+  temporarily lowers token-mode warm-protection and residency-placement
+  budgets; slot mode (including
   llama.cpp) has null effective tokens and is inactive. Failed feedback reads
   fall back to the reported budget. `endpoint.kv_occupancy` is also available as
   an explicit routing-rule series.
@@ -87,10 +97,13 @@ Metric routing rules (S-B part 2):
   leases alone. Classified `cost` like the rules.
 - `forwarder_pool_routing_rules_set` (`{ poolId, rules, confirm: "RUN" }`)
   replaces the whole list (at most 16). A rule is a flat record
-  `{ metric, labels?, aggregate: "max", op: ">" | ">=" | "<" | "<=",
-  threshold, effect: "full" | "avoid" }`; there is no expression language.
-  Label keys and values use the metric-name charset, and `__proto__` is not
-  accepted as a label key (the rule is rejected, never widened).
+  `{ metric, labels?, aggregate: "max" | "min" | "avg", op: ">" | ">=" |
+  "<" | "<=", threshold, effect: "full" | "avoid", memberId?,
+  excludeMemberId? }`; there is no expression language. `memberId` limits
+  the rule to that pool member; `excludeMemberId` applies it to every other
+  member; the two must not both be set. Label keys and values use the
+  metric-name charset, and `__proto__` is not accepted as a label key (the
+  rule is rejected, never widened).
   `full` makes the member FULL: the request queues, goes to another member, or
   (for `:external` callers only) goes external after `externalAfterWaitMs`.
   `avoid` ranks the member last among free members and never makes it
@@ -148,7 +161,7 @@ Owners see every requester on their pools; grantees see only their own. A
 foreign pool or member returns `NOT_FOUND`. Engine prefix-cache counters stay
 on the engine-load charts and are not mixed into this tool.
 
-## CLI file tools (relay protocol 2.8)
+## CLI file tools (relay protocol 2.4)
 
 Nine PAT-only tools read and change files on a CLI device (a node): `forwarder_cli_file_read`,
 `forwarder_cli_file_stat`, `forwarder_cli_dir_list`, `forwarder_cli_file_search`
@@ -270,8 +283,14 @@ supported. A concurrent local process that moves directories can still race a
 held fd after resolution; these tools do not confine arbitrary local processes.
 Without roots, unsupervised retains whole-filesystem access minus the protected set.
 
-`listCliDevices` reports `fileTools: {read, write}` (`headless`, `supervised`, `off`),
-`mcpFileRead`, `reportedMcpFileRead`, `reportedFileRoots`, and `allowFileToolsAsRoot`.
+`forwarder_cli_devices_list` returns summaries (id, slug, status, grants, endpoint
+slugs and probe status) and still reports `fileTools: {read, write}` (`headless`,
+`supervised`, `off`), `mcpFileRead`, `reportedMcpFileRead`, `reportedFileRoots`, and
+`allowFileToolsAsRoot`. It does not include `models[]` or capability JSON. Pages are
+`{ items, nextCursor }` (`limit` default 20, max 50). `forwarder_cli_device_get`
+`{ cliDeviceId }` returns one full device. `forwarder_model_pools_list` is the same
+kind of page (pool id, slug, name, grants, member endpoint slugs, routing and health
+status); `forwarder_model_pool_get` `{ poolId }` returns the full pool.
 `supervised` writes need a person's keypress. For a supervised read
 without the grant, request `cat` via a supervised command or enable the grant.
 The CLI independently checks local mode, read switch, roots and UID at every op;
@@ -331,10 +350,12 @@ concurrent create at the vacant name survives; the original stays in recovery
 and the tool returns `uncertain_outcome`. If no safe publish primitive works,
 `unsafe_filesystem` is a definitive headless refusal: nothing was changed. A
 supervised error after acceptance remains unknown under the code-only outcome
-contract, including `unsafe_filesystem`. Overwrite rename first preflights privately,
-then captures and verifies the source. It exchanges that slot with the destination
-when supported; otherwise it captures/proves the destination too and publishes the
-source with no-replace rename or a non-following hard link. Unpublished user sources
+contract, including `unsafe_filesystem`. Overwrite rename first preflights privately.
+It exchanges the captured source with the destination when supported. Otherwise
+no-replace, and link publication on mounts that present a different inode per name
+(noino, sshfs), capture and prove both objects and publish the source fail-if-exists.
+Stable-inode link publication, including Linux NFS, links the still-public source
+onto the destination and then captures the source. Unpublished user sources
 are never disposed: they return only to the source name or stay named in recovery. Every captured
 object has a recorded origin; undo restores only to that origin, using identity
 proof to return a moved source to its original source name. An unsettled
@@ -356,9 +377,10 @@ when the confirmation child has exited. The child remains display-only; approval
 creates no read grant and recovery paths never reach the agent through these results.
 Inspect those paths using a shell, compare file contents, and restore them manually
 without overwriting newer files before retrying. Find crash leftovers by listing
-`.wsmp-recover-*` beside the target (a partial replace temp or probe is inside it). File tools
+`.wsmp-recover-*` beside the target (a partial replace temp, probe, or `INTENT` file is inside it). File tools
 permit reads and listing, but refuse writes, deletes, renames and creates inside recovery directories.
-Recovered objects are never automatically deleted; no startup recovery sweep runs.
+Recovered objects are never automatically deleted. Startup reports `.wsmp-recover-*` under
+configured roots and does not delete them.
 
 **Delete rule.** On every filesystem, files and symlinks are first captured into
 recovery, checked against a live held identity, and only that proven object is
@@ -388,14 +410,19 @@ permissions and link-count limits depend on the object. NFS and 9p
 reject rename flags but usually support links. exFAT and CIFS support
 no-replace rename only; exFAT has no hard links. Linux vfat supports both
 exchange and no-replace rename. macOS HFS+ supports RENAME_EXCL but not
-RENAME_SWAP. Overwrite rename works on no-replace-capable and link-only mounts:
-source and destination are captured and proven, then source is published into the
-vacant destination. On mounts with neither primitive, `unsafe_filesystem` refuses
-before moving anything; the unchanged public snapshot has no recovery residue.
-Plain file/symlink rename uses direct no-replace where supported (including
-supervised macOS files), otherwise vacate-first link publication. Directories move
-only with no-replace, never overwrite even an empty directory, and a directory
-moved into its resolved physical subtree refuses `invalid_input` before allocating R.
+RENAME_SWAP. Overwrite rename works on no-replace-capable and link-only mounts.
+No-replace and noino/sshfs link publication capture and prove source and destination,
+then publish source into the vacant destination. Stable-inode link publication links
+the still-public source onto the destination before capturing the source, so that
+name stays until the destination holds the object. On mounts with neither primitive,
+`unsafe_filesystem` refuses before moving anything; the unchanged public snapshot has
+no recovery residue. Plain file/symlink rename uses direct no-replace where supported
+(including supervised macOS files); otherwise it uses that same link order. A direct
+rename that returns EINVAL while no-replace works inside R is `invalid_input` (the
+destination name is not valid on this filesystem) and captures nothing. EINVAL while
+no-replace is also rejected stays `unsafe_filesystem`. Directories move only with
+no-replace, never overwrite even an empty directory, and a directory moved into its
+resolved physical subtree refuses `invalid_input` before allocating R.
 Private aliases are proven at their own names, including mounts where hard-link
 names present different inode numbers. A successful link syscall commits; a rename
 link error with ambiguous effect keeps/restores source and keeps destination, with
@@ -428,19 +455,45 @@ recovery (plain rename verification and exclusive-create cleanup instead keep a
 foreign object in recovery and report it). Unsupported
 NOREPLACE restore uses EEXIST-safe linkat followed by held-fd-proven private-slot
 unlink; directories and unsupported links stay in recovery with `uncertain_outcome`.
-(b2) recovery rename's SOURCE name is vacant from its initial capture until the
-operation ends. A concurrent create remains there on success; if it prevents a
-restore, it is kept and reported with `uncertain_outcome`. Independently of the
+(b2) vacate-first recovery rename and exchange-less no-replace overwrite leave the
+source name vacant from its capture until the operation ends. Link-first leaves the
+source name in place until the destination holds that object, and vacates only the
+destination on overwrite. A concurrent create remains at a vacant name on success;
+if it prevents a restore, it is kept and reported with `uncertain_outcome`. Independently of the
 filesystem, an in-place write into the inspected inode after the etag read can
 be lost on replace or delete: the etag proves content only up to that read.
 (d) a crash leaves `.wsmp-recover-*`, including a partial replace temp or
-`probe`, preflight dummies, or both links. A rename crash can leave source and
-destination in R with both public names vacant. The daemon logs R and both paths
-before the first capture; no durable intent file or replay runs. On stable-inode
-NFS, plain rename has this source-in-R crash shape only on link-only mounts;
-no-replace-capable mounts retain direct rename. A crash during exchange-less replace can leave the
-original and temp in recovery with the public name vacant; a delete crash can
-leave the captured file or symlink in recovery with its public name vacant.
+`probe`, preflight dummies, or both links. Before the first capture, every R-using
+op (rename, replace, delete, including exchange overwrite) writes `INTENT` in that
+directory and fsyncs the file; directory fsync `EINVAL`/`ENOTSUP` is best-effort.
+`INTENT` is a versioned JSON object (`version` 2): `op`, `phase`
+(`prepared`/`captured`/`committed`), `order` (`link-first`, `vacate-first`, or
+`exchange-first`), `source`/`destination` as `{display, bytes}` (hex path bytes next
+to a lossy display string), `slots` mapping `slot-1`/`slot-2` to `{origin, dev, ino,
+kind, size}`, plus `pid`, `host`, `createdAt`, and `cliVersion`. Link-first overwrite
+stores the destination in `slot-1` and the source in `slot-2`; exchange-first
+overwrite stores the destination in `slot-1` (swap `from <-> to` first, then capture
+D from `from`, so D is briefly visible under the source name); other orders store
+the source in `slot-1`. Success removes `INTENT` only when R is empty. There is no
+automatic replay. A rename crash can leave source and destination in R with both
+public names vacant (vacate-first), only the destination vacant (link-first, before
+the link), or D under the source name (exchange-first, after the swap). Live R
+directories are indexed in the CLI state directory (`file-recovery/`). Startup reads
+that registry (O(registered)) and never walks file roots. `wsmp recover` lists
+abandoned R dirs; `wsmp recover --apply` rolls back (`mv -n` from slots) when phase
+is prepared/captured and rolls forward (dispose leftovers) when committed;
+`--scan` walks configured roots for unregistered dirs. Find R beside the
+destination, in the registry, or in the startup log: wsmp reports each abandoned
+`.wsmp-recover-<10 alnum>` directory and never deletes it. If INTENT is absent, the
+log lists present slots; it does not say "read INTENT". `mv -n` a missing public
+path back from its slot, and do not overwrite a newer file. If both public names
+exist and the destination is a hard link of the source, the link may already have
+committed: compare, then remove only the private slots, `INTENT`, and the empty
+directory. On stable-inode NFS, plain rename uses link-first when rename flags are
+rejected; no-replace-capable mounts keep direct rename and do not write `INTENT`. A
+crash during replace can leave the original and temp in recovery with the public
+name vacant; a delete crash can leave the captured file or symlink in recovery with
+its public name vacant.
 (e) unheld objects are never deleted and remain reported in recovery;
 (f) on NFS a file that another process still holds open keeps a `.nfs*` entry in the
 recovery directory after its unlink, so the directory is retained and listed in `recovered`;
@@ -492,10 +545,7 @@ stable-inode alias pairs still refuse.
 
 
 **Version skew.** `uncertain_outcome` and `unsafe_filesystem` are new file error
-codes of relay 2.8. Upgrade the server before the `wsmp` CLI: a server that
-predates these codes treats the CLI's rejection frame as malformed instead of
-reporting the typed error (retained files stay on disk). An older CLI never
-emits `unsafe_filesystem`.
+codes of relay protocol 2.4. Upgrade the server and every CLI together (relay protocol 2.4 only).
 
 **Revocation and bans.** Revoking or narrowing a personal token, revoking a CLI
 credential or device, and deleting a user end that principal's in-flight file operations and
@@ -539,6 +589,35 @@ relay protocol returns `upgrade_required`
 ("this CLI speaks relay <v>; upgrade wsmp").
 
 ## Setup
+
+### Durable deployments and inference contributions (0.4.0)
+
+Recipe tools (`deployment_configs_list`, `deployment_config_get`,
+`deployment_config_create`, `deployment_config_update`) read and save immutable
+specifications; updates require `expectedRevision`. Deployment lists return
+`{items, nextCursor}` with `limit` default 50, maximum 100; use `cursor` for the
+next page. Config reads return the latest immutable revision; a plan's preview
+resolves its exact start revision and stopped groups rather than substituting a
+newer revision. Instance and plan step detail includes the latest 100 steps,
+with `stepsTruncated` and database step counts when history is longer.
+Deployment lifecycle tools
+(`deployment_plan_start`, `deployment_plan_stop`, `deployment_plan_apply`) require
+a command-enabled personal token, `mcp:write`, and live node command permissions.
+OAuth or a general write token never grants machine execution. Apply additionally
+requires `confirm: "RUN"`; this MCP literal does not replace a required person's
+confirmation. Read `deployment_plan_status` for the immutable commands and whole
+groups affected. Human confirmation, node grants and protected-instance preemption
+permission are dashboard-only. CLI local policy always remains authoritative.
+
+Inference tools list, offer and revoke a specific serving model contribution.
+`inferenceContributions.accept` is human-only. A pool contribution grants inference,
+not shell or deployment rights, and either party may revoke it.
+
+Pool summaries load at most 20 grants and 20 members per pool in the database.
+`grantCount` and `memberCount` are full database counts; `grantsTruncated` and
+`membersTruncated` explicitly report abbreviated inline lists. Budget policies are
+queried only for those selected grants, so truncation never drops their spend cap.
+Use the owner-scoped full pool read when detailed configuration is required.
 
 Required environment:
 
@@ -733,11 +812,22 @@ dashboard, is recorded as a `POOL_FALLBACK_UPDATED` provider audit event
 (`metadata.source` is `mcp` or `dashboard`), readable with
 `provider_audit_events_list` (`poolId` filters one pool's history) and shown
 as the fallback change history on the pool's Fallback tab in the dashboard.
-The tool description also lists the preconditions an agent otherwise sees only
-as a plain "Invalid input". The general pool tools reject the two switches (the
-advertised schema describes each as forbidden and names this tool); they still
-accept `externalAfterWaitMs`, and their descriptions
+The tool description lists those preconditions. When they fail, the error
+names `fallbackEnabled` or `externalAfterWaitMs`. The general pool tools reject
+the two switches (the advertised schema describes each as forbidden and names
+this tool); they still accept `externalAfterWaitMs`, and their descriptions
 state its cost.
+
+`model_api_token_external_wait_update` (`{ id, externalAfterWaitMs }`, write,
+no confirmation) stores how long this token's `:external` requests wait for
+local capacity. Null uses each pool's `externalAfterWaitMs`. Pool
+`externalAfterWaitMs` is an owner floor: callers may only lengthen, up to the
+local capacity wait budget. A request may also send
+`x-wsmp-external-after-wait-ms`; that override cannot go below the pool floor
+or past the local wait budget. Neither owners nor grantees can shorten requests below the pool floor.
+The stored value is 0..600000; each request still applies the floor and budget
+for that pool. Every change records `TOKEN_EXTERNAL_WAIT_UPDATED` in the content-free
+provider audit log. MCP diagnostics cannot use `:external`.
 
 Still human-only: token external consent (`allowExternal`, `includeExternal`),
 own-key preferences, the pool external-equivalent picker, catalog search,
@@ -835,12 +925,13 @@ ignores the schema gets the same checks.
 ## Tool errors
 
 A failed tool call returns `isError: true`, a short stable text, and
-`structuredContent.error.code`. Application messages are never copied into
-tool output. Allowlisted oRPC codes keep their name (`BAD_REQUEST`,
+`structuredContent.error.code`. Application messages are not copied into
+tool output except sanitized static argument-shaped `BAD_REQUEST` messages described below.
+Allowlisted oRPC codes keep their name (`BAD_REQUEST`,
 `UNAUTHORIZED`, `FORBIDDEN`, `NOT_FOUND`, `CONFLICT`, `TOO_MANY_REQUESTS`);
 anything else is `INTERNAL_ERROR` with a `requestId`. Wrapper-level errors
 use their own codes (for example `INSUFFICIENT_SCOPE`, `CONFIRMATION_REQUIRED`,
-`INVALID_INPUT`, `OUTPUT_TOO_LARGE`, `REQUEST_ABORTED`).
+`invalid_input`, `OUTPUT_TOO_LARGE`, `REQUEST_ABORTED`).
 
 A deletion-related `CONFLICT` also carries a stable `reason`
 (`@ws-model-proxy/config/deletion-conflict`), in the text (`Conflict:
@@ -861,27 +952,57 @@ A deletion-related `CONFLICT` also carries a stable `reason`
 
 Only these values are forwarded; any other `data` on a `CONFLICT` is dropped.
 
-A `BAD_REQUEST` caused by invalid arguments also lists what was wrong, in the
-text (`Invalid input: poolId: Invalid input: expected string, received
-undefined`) and in `structuredContent`:
+An argument-shaped failure uses `invalid_input` and names the failing fields,
+in the text and in `structuredContent`:
+
+A schema rejection includes `issues`:
 
 ```json
 {
   "error": {
-    "code": "BAD_REQUEST",
+    "code": "invalid_input",
+    "fields": ["poolId"],
+    "message": "poolId: Invalid input: expected string, received undefined",
     "issues": [{ "path": ["poolId"], "code": "invalid_type", "message": "Invalid input: expected string, received undefined" }]
   }
 }
 ```
 
-`path` names the failing field (array indexes are numbers; a segment that is
-not a field the tool declares is `"?"`), `code` is the validator's issue code (anything outside a short allowlist
-of standard codes is reported as `invalid`),
-and `message` is the validator's own text. Input values are never echoed:
-messages that could quote a value (`custom`, `unrecognized_keys`, unknown
-codes) are replaced by fixed text, and at most 20 issues are returned. A
-`BAD_REQUEST` the procedure raises for a reason other than argument shape
-(for example a failed precondition) stays the plain "Invalid input".
+A schema-valid rejection names the procedure's fields and keeps its static message:
+
+```json
+{
+  "error": {
+    "code": "invalid_input",
+    "fields": ["capacityConcurrencyLimit"],
+    "message": "Effective concurrency limit exceeds physical capacity."
+  }
+}
+```
+
+`fields` contains only failing dotted caller-input paths (for example
+`advanced.contextMargin` or `rules.0.threshold`), never suggested replacement names.
+Suggestions remain separately on each issue; their total comparison work is bounded
+independently of tool-schema size. `unknownKeyCount` is the total count, not the number
+of suggestions. Safe declared reason enums survive even when no field can be named.
+Timestamp adapter failures use the same `invalid_input` / `fields` contract.
+`fields` is present whenever the failure is argument-shaped and at least one
+key can be named: missing or out-of-range values, a key that is not on this
+object (`unrecognized_keys`, counted on the issue as `unknownKeyCount` with
+`suggestions` drawn from the tool's declared names), and a
+schema-valid rejection such as a concurrency limit past physical capacity
+(`data.fields` on the procedure error, kept only when that tool advertises
+the name). `message` is the explanation. Validator `issues` are included when
+the failure came from the schema: `path` names the failing field (array
+indexes are numbers; a segment that is not a field the tool declares is
+`"?"`), `code` is the validator's issue code (anything outside a short
+allowlist of standard codes is reported as `invalid`), and each issue
+`message` is the validator's own text. Input values and caller-chosen key
+names are never echoed: messages that could quote a value (`custom`,
+`unrecognized_keys`, unknown codes) are replaced by fixed text, unrecognized
+keys become a count plus server-chosen suggestions, and at most 20 issues
+are returned. A `BAD_REQUEST` that is not about an argument (for example a
+failed precondition with no field list) stays the plain "Invalid input".
 
 ## Login, consent, and scope step-up
 

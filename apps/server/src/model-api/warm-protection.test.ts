@@ -5,6 +5,8 @@ const readDb = vi.hoisted(() => ({
   capacityLease: { groupBy: vi.fn() },
   $queryRaw: vi.fn(),
 }));
+// No database in unit tests: the real env module would demand DATABASE_URL.
+vi.mock("@ws-model-proxy/env/server", () => ({ env: {} }));
 vi.mock("@ws-model-proxy/db", async () => ({
   default: readDb,
   Prisma: (await import("../../../../packages/db/prisma/generated/client")).Prisma,
@@ -913,6 +915,35 @@ describe("effective KV assessment", () => {
     });
     expect(result.get("a")).toMatchObject({ state, effectiveKvBudgetTokens: effective });
   });
+  it("freeze admits on reported K and ignores a stored cut", async () => {
+    const result = await assessWarmProtection({
+      ownerId: "owner",
+      policy: policy({ share: "FIRST_COME", evictionFeedbackEnabled: false }),
+      members: [member],
+      now,
+      source: {
+        load: async () => ({
+          activeByCapacity: new Map(),
+          sessionsByCapacity: new Map([["cap-a", [session("alice", 10, 30_000)]]]),
+          kvEvictionByCapacity: new Map([["cap-a", { cutFraction: 0.5, observedAt: now }]]),
+        }),
+      },
+    });
+    expect(result.get("a")).toMatchObject({ state: "FREE", effectiveKvBudgetTokens: 100_000 });
+  });
+  it("frozen production source skips the eviction SQL", async () => {
+    readDb.capacityLease.groupBy.mockResolvedValue([]);
+    readDb.$queryRaw.mockResolvedValue([]);
+    readDb.capacityKvEviction.findMany.mockClear();
+    await assessWarmProtection({
+      ownerId: "owner",
+      policy: policy({ evictionFeedbackEnabled: false }),
+      members: [member],
+      source: warmProtectionSource,
+      now,
+    });
+    expect(readDb.capacityKvEviction.findMany).not.toHaveBeenCalled();
+  });
   it.each([
     { effective: 100_000, state: "PROTECTED" },
     { effective: 200_000, state: "PROTECTED" },
@@ -1034,7 +1065,7 @@ describe("effective KV assessment", () => {
       effectiveKvBudgetTokens: kind === "active" ? 50_000 : 100_000,
     });
     expect(readDb.capacityKvEviction.findMany).toHaveBeenLastCalledWith({
-      where: { capacityId: { in: ["cap-a"] }, userId: "owner", expiresAt: { gt: now } },
+      where: { capacityId: { in: ["cap-a"] }, expiresAt: { gt: now } },
     });
   });
 

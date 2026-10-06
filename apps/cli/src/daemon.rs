@@ -94,10 +94,10 @@ use crate::probe::{ProbeReport, apply_probe_report, probe_endpoint};
 use crate::protocol::parse_binary_frame;
 use crate::protocol::{
     CliInventory, ClientControlMessage, EndpointInventory, EndpointStatus, FrameFault,
-    RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS, RELAY_REQUEST_BODY_WINDOW_CHUNKS, RELAY_SUBPROTOCOL,
-    RelayBinaryFrameMetadata, RelayFailure, ServerControlMessage, binary_frame_fault,
-    control_frame_fault, encode_binary_frame, encode_control, endpoint_inventory,
-    hello_rejection_message, parse_server_control,
+    ProtocolErrorCode, RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS, RELAY_PROTOCOL_VERSION,
+    RELAY_REQUEST_BODY_WINDOW_CHUNKS, RELAY_SUBPROTOCOL, RelayBinaryFrameMetadata, RelayFailure,
+    ServerControlMessage, binary_frame_fault, control_frame_fault, encode_binary_frame,
+    encode_control, hello_rejection_message, parse_server_control,
 };
 use crate::relay_bus::{FromWorker, WsFrame};
 use crate::sessions::{
@@ -107,12 +107,200 @@ use crate::slug::generated_slug;
 use crate::startup::{self, TerminalStartup};
 use crate::tokens::{CompletionTextCollector, standardized_completion_metrics};
 
+/// The session reactor is the sole deployment publisher. A complete snapshot
+/// must receive its durable ACK before its endpoints, then the next update.
+#[derive(Default)]
+struct DeploymentPublisher {
+    initialized: bool,
+    pending: Option<(DeploymentPublication, Instant)>,
+    watchdog: Option<PublicationWatchdog>,
+}
+
+/// One watchdog per connection enforces the absolute deadline even when a
+/// blocking TLS/plain write keeps making partial progress. It owns a clone of
+/// this exact socket, never a device name or successor connection.
+///
+/// On Windows, `shutdown` does not interrupt a send already blocked in
+/// another thread, so a stalled write there ends at the native write timeout
+/// instead. Deployments run only on Unix; a Windows node publishes just the
+/// empty snapshot, one small frame.
+type PublicationDeadlineSignals = (
+    std::sync::Mutex<(bool, Option<Instant>)>,
+    std::sync::Condvar,
+);
+struct PublicationWatchdog {
+    state: Arc<PublicationDeadlineSignals>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl PublicationWatchdog {
+    fn start(stream: &tungstenite::stream::MaybeTlsStream<std::net::TcpStream>) -> Result<Self> {
+        let tcp = match stream {
+            tungstenite::stream::MaybeTlsStream::Plain(tcp) => tcp,
+            tungstenite::stream::MaybeTlsStream::Rustls(tls) => &tls.sock,
+            _ => anyhow::bail!("unsupported websocket deadline transport"),
+        }
+        .try_clone()
+        .context("cloning websocket deadline socket")?;
+        let state = Arc::new((
+            std::sync::Mutex::new((false, None::<Instant>)),
+            std::sync::Condvar::new(),
+        ));
+        let watched = state.clone();
+        let join = thread::Builder::new()
+            .name("wsmp-publication-deadline".into())
+            .spawn(move || {
+                let (lock, wake) = &*watched;
+                let Ok(mut state) = lock.lock() else {
+                    let _ = tcp.shutdown(std::net::Shutdown::Both);
+                    return;
+                };
+                loop {
+                    if state.0 {
+                        return;
+                    }
+                    if let Some(deadline) = state.1 {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            let _ = tcp.shutdown(std::net::Shutdown::Both);
+                            return;
+                        }
+                        match wake.wait_timeout(state, deadline - now) {
+                            Ok((next, _)) => state = next,
+                            Err(_) => {
+                                let _ = tcp.shutdown(std::net::Shutdown::Both);
+                                return;
+                            }
+                        }
+                    } else {
+                        match wake.wait(state) {
+                            Ok(next) => state = next,
+                            Err(_) => {
+                                let _ = tcp.shutdown(std::net::Shutdown::Both);
+                                return;
+                            }
+                        }
+                    }
+                }
+            })
+            .context("starting websocket publication deadline")?;
+        Ok(Self {
+            state,
+            join: Some(join),
+        })
+    }
+
+    fn arm(&self, deadline: Option<Instant>) -> Result<()> {
+        let mut state = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| anyhow::anyhow!("websocket publication deadline unavailable"))?;
+        state.1 = deadline;
+        self.state.1.notify_all();
+        Ok(())
+    }
+}
+
+impl Drop for PublicationWatchdog {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.0.lock() {
+            state.0 = true;
+            self.state.1.notify_all();
+        }
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+enum DeploymentPublication {
+    Snapshot { id: String, publish_endpoints: bool },
+    Endpoints { id: String },
+}
+
+impl DeploymentPublisher {
+    fn check_deadline(&self) -> RelaySessionResult<()> {
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|(_, deadline)| Instant::now() >= *deadline)
+        {
+            return Err(RelaySessionError::Reconnectable {
+                error: anyhow::anyhow!("deployment publication acknowledgement timed out"),
+                reset_backoff: true,
+            });
+        }
+        Ok(())
+    }
+    fn begin(&mut self, id: String, publish_endpoints: bool) -> Result<()> {
+        anyhow::ensure!(
+            self.pending.is_none(),
+            "deployment publication already pending"
+        );
+        self.initialized = true;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        if let Some(watchdog) = &self.watchdog {
+            watchdog.arm(Some(deadline))?;
+        }
+        self.pending = Some((
+            DeploymentPublication::Snapshot {
+                id,
+                publish_endpoints,
+            },
+            deadline,
+        ));
+        Ok(())
+    }
+
+    fn acknowledge_snapshot(&mut self, id: &str) -> Result<bool> {
+        let Some((
+            DeploymentPublication::Snapshot {
+                id: expected,
+                publish_endpoints,
+            },
+            deadline,
+        )) = &self.pending
+        else {
+            anyhow::bail!("unexpected deployment inventory acknowledgement");
+        };
+        anyhow::ensure!(
+            expected == id && Instant::now() < *deadline,
+            "stale deployment inventory acknowledgement"
+        );
+        let publish_endpoints = *publish_endpoints;
+        if let Some(watchdog) = &self.watchdog {
+            watchdog.arm(None)?;
+        }
+        self.pending = None;
+        Ok(publish_endpoints)
+    }
+
+    fn acknowledge_endpoints(&mut self, id: &str) -> Result<()> {
+        let Some((DeploymentPublication::Endpoints { id: expected }, deadline)) = &self.pending
+        else {
+            anyhow::bail!("unexpected deployment endpoint acknowledgement");
+        };
+        anyhow::ensure!(
+            expected == id && Instant::now() < *deadline,
+            "stale deployment endpoint acknowledgement"
+        );
+        if let Some(watchdog) = &self.watchdog {
+            watchdog.arm(None)?;
+        }
+        self.pending = None;
+        Ok(())
+    }
+}
+
 const RELAY_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const RELAY_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(300);
 /// How long the main loop parks in `socket.read()` before waking to drain worker
 /// output and send heartbeats. Bounds worker-frame latency (response streaming)
 /// without busy-spinning.
 const RELAY_SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// Bound on waiting for `hello.challenge`. An old server never sends it.
+const HELLO_CHALLENGE_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bounded capacity for the worker -> main-loop outbound frame channel. Provides
 /// backpressure toward workers (and therefore upstream response reads) so a fast
 /// upstream cannot grow unbounded memory ahead of the websocket writer.
@@ -447,6 +635,8 @@ pub fn connect_foreground() -> Result<()> {
     config.validate()?;
     let mut control = ControlServer::bind()?;
     let startup = TerminalStartup::capture(&config)?;
+    #[cfg(unix)]
+    crate::file_ops::report_abandoned_recovery();
     let mut last_inventory_revision = None;
     // The mtime accompanies the last server-acknowledged local snapshot. It
     // prevents an edit-and-revert from being treated as an unchanged desired
@@ -455,6 +645,10 @@ pub fn connect_foreground() -> Result<()> {
     let mut reconnect_delay = RELAY_RECONNECT_INITIAL_DELAY;
     loop {
         check_shutdown()?;
+        if crate::deployments::refresh_snapshot().is_err() {
+            crate::deployments::replace_snapshot(Vec::new(), Vec::new(), Vec::new());
+            tracing::warn!("deployment snapshot unavailable; publication remains closed");
+        }
         // Reuse only a locally unchanged snapshot that the server has already
         // acknowledged. Reconnect registration still replaces the server
         // inventory, but no network probe or config rewrite is needed.
@@ -574,7 +768,15 @@ fn config_file_modified_at() -> Result<SystemTime> {
 }
 
 fn inventory_snapshot_from_config(config: &Config) -> Vec<EndpointInventory> {
-    config
+    let remote = crate::engine_adapter::load_remote_adapters().unwrap_or_default();
+    inventory_snapshot_from_config_with_remote(config, &remote)
+}
+
+fn inventory_snapshot_from_config_with_remote(
+    config: &Config,
+    remote: &[crate::protocol::RemoteEngineAdapter],
+) -> Vec<EndpointInventory> {
+    let mut endpoints = config
         .endpoints
         .iter()
         .filter(|endpoint| endpoint.enabled)
@@ -584,9 +786,17 @@ fn inventory_snapshot_from_config(config: &Config) -> Vec<EndpointInventory> {
                 Some(crate::config::ProbeStatus::Offline) => EndpointStatus::Offline,
                 None => EndpointStatus::Unknown,
             };
-            endpoint_inventory(endpoint, status)
+            let adapter = crate::engine_adapter::effective_engine_adapter(
+                endpoint,
+                remote,
+                config.allow_remote_engine_adapters,
+                &config.approved_remote_adapters,
+            );
+            crate::protocol::endpoint_inventory_with(endpoint, status, adapter.as_ref())
         })
-        .collect()
+        .collect::<Vec<_>>();
+    endpoints.extend(crate::deployments::managed_inventory());
+    endpoints
 }
 
 fn acknowledged_inventory_matches_config(
@@ -655,6 +865,7 @@ fn same_desired_config(left: &Config, right: &Config) -> bool {
 /// acknowledged identity, and nothing is written to the config file.
 fn config_with_fresh_engine_facts(active: &Config) -> (Config, Vec<EndpointInventory>) {
     let mut refreshed = active.clone();
+    let remote = crate::engine_adapter::load_remote_adapters().unwrap_or_default();
     let targets = refreshed
         .endpoints
         .iter()
@@ -662,7 +873,13 @@ fn config_with_fresh_engine_facts(active: &Config) -> (Config, Vec<EndpointInven
         .filter(|(_, endpoint)| {
             endpoint.enabled
                 && (endpoint.engine != crate::config::EndpointEngine::Generic
-                    || endpoint.engine_adapter.is_some())
+                    || crate::engine_adapter::effective_engine_adapter(
+                        endpoint,
+                        &remote,
+                        active.allow_remote_engine_adapters,
+                        &active.approved_remote_adapters,
+                    )
+                    .is_some())
                 && endpoint
                     .last_probe
                     .as_ref()
@@ -704,14 +921,22 @@ fn config_with_fresh_engine_facts(active: &Config) -> (Config, Vec<EndpointInven
                 .filter_map(|(index, handle)| handle.join().ok().map(|engine| (index, engine)))
                 .collect::<Vec<_>>()
         });
-        for (index, engine) in detected {
+        for (index, mut engine) in detected {
             // A failed re-detection keeps the facts the last probe found.
             if re_detection_replaces_stored(&engine)
                 && let Some(probe) = refreshed.endpoints[index].last_probe.as_mut()
             {
+                preserve_count_context(probe.engine.as_ref(), &mut engine);
                 probe.engine = Some(engine);
             }
-            if let Some(facts) = crate::engine_adapter::probe_facts(&refreshed.endpoints[index])
+            let spec = crate::engine_adapter::effective_engine_adapter(
+                &refreshed.endpoints[index],
+                &remote,
+                active.allow_remote_engine_adapters,
+                &active.approved_remote_adapters,
+            );
+            if let Some(facts) =
+                crate::engine_adapter::probe_facts_with(&refreshed.endpoints[index], spec.as_ref())
                 && let Some(probe) = refreshed.endpoints[index].last_probe.as_mut()
             {
                 probe.adapter = Some(facts);
@@ -734,6 +959,17 @@ fn config_with_fresh_engine_facts(active: &Config) -> (Config, Vec<EndpointInven
 /// successful detection (this fast path, a reload or a full probe).
 fn re_detection_replaces_stored(engine: &crate::engine::DetectedEngine) -> bool {
     engine.kind.is_some()
+}
+
+/// Keep the probed count-context fact across reconnect when the engine kind
+/// did not change. Detection never sets `count_context`.
+fn preserve_count_context(
+    previous: Option<&crate::engine::DetectedEngine>,
+    next: &mut crate::engine::DetectedEngine,
+) {
+    if previous.and_then(|engine| engine.kind) == next.kind {
+        next.count_context = previous.and_then(|engine| engine.count_context);
+    }
 }
 
 /// Probe a stable desired snapshot without holding the config lock across
@@ -820,6 +1056,7 @@ fn run_relay_session(
     _control: &mut ControlServer,
     last_inventory_revision: &mut Option<crate::protocol::InventoryRevision>,
 ) -> RelaySessionResult<()> {
+    let mut remote_adapters = crate::engine_adapter::load_remote_adapters().unwrap_or_default();
     let mut request = ws_url
         .as_str()
         .into_client_request()
@@ -844,7 +1081,15 @@ fn run_relay_session(
             "server did not accept relay websocket subprotocol `{RELAY_SUBPROTOCOL}`"
         )));
     }
-    set_socket_read_timeout(socket.get_mut(), RELAY_SOCKET_POLL_INTERVAL);
+    set_socket_timeouts(
+        socket.get_mut(),
+        RELAY_SOCKET_POLL_INTERVAL,
+        Duration::from_secs(5),
+    )
+    .map_err(|error| RelaySessionError::Reconnectable {
+        error,
+        reset_backoff: false,
+    })?;
 
     // Created before hello so an early `?` still drops (and kills) every child.
     let (worker_tx, worker_rx) = mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
@@ -871,12 +1116,23 @@ fn run_relay_session(
         )
     };
 
+    let identity = startup.identity().ok_or_else(|| {
+        RelaySessionError::Fatal(anyhow::anyhow!(
+            "CLI identity key is unavailable; cannot bind this device"
+        ))
+    })?;
+    let (nonce, origin) = wait_for_hello_challenge(&mut socket)?;
+    let identity_signature = identity
+        .sign_hello(&nonce, cli_slug, &origin)
+        .map_err(RelaySessionError::Fatal)?;
     let hello = ClientControlMessage::Hello {
         id: next_id("hello"),
         protocol_version: crate::protocol::RELAY_PROTOCOL_VERSION.to_string(),
         cli: CliInventory {
             slug: cli_slug.to_string(),
             hostname: crate::hostname::reported_hostname(),
+            identity_public_key: identity.public_b64url(),
+            identity_signature,
             version: Some(env!("CARGO_PKG_VERSION").to_string()),
             capabilities: startup::hello_capabilities(startup, config, cli_slug),
         },
@@ -905,14 +1161,93 @@ fn run_relay_session(
     let mut reload_preparing = false;
 
     let mut registered = false;
+    let mut deployment_publisher = DeploymentPublisher {
+        watchdog: Some(
+            PublicationWatchdog::start(socket.get_ref()).map_err(RelaySessionError::Fatal)?,
+        ),
+        ..Default::default()
+    };
+    #[cfg(unix)]
+    let deployment_runner = crate::deployments::service::Runner::start().ok();
     // 2.7 telemetry starts after `hello.ok` and stops with this session.
     let mut telemetry: Option<crate::telemetry::Telemetry> = None;
     let mut next_telemetry_sync = Instant::now();
     let mut next_heartbeat =
         Instant::now() + Duration::from_secs(RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS);
-    let result = loop {
+    let result = 'session: loop {
         if let Some(signal) = crate::shutdown::requested() {
-            break Err(RelaySessionError::Shutdown(signal));
+            break 'session Err(RelaySessionError::Shutdown(signal));
+        }
+        if let Err(error) = deployment_publisher.check_deadline() {
+            break 'session Err(error);
+        }
+        if registered && !deployment_publisher.initialized {
+            let snapshot = match crate::deployments::instances_frames() {
+                Ok(snapshot) => snapshot,
+                Err(error) => break 'session Err(RelaySessionError::Fatal(error)),
+            };
+            if let Err(error) = deployment_publisher.begin(snapshot.id, false) {
+                break 'session Err(RelaySessionError::Fatal(error));
+            }
+            for text in snapshot.frames {
+                if let Err(error) = deployment_publisher.check_deadline() {
+                    break 'session Err(error);
+                }
+                if let Err(error) = socket.send(Message::Text(text.into())) {
+                    break 'session Err(websocket_session_error(
+                        error,
+                        "reporting deployment instances",
+                        true,
+                    ));
+                }
+            }
+        }
+        #[cfg(unix)]
+        if registered
+            && deployment_publisher.pending.is_none()
+            && let Some(runner) = deployment_runner.as_ref()
+            && let Some(update) = runner.try_update()
+        {
+            crate::deployments::replace_snapshot(
+                update.instances,
+                update.published,
+                update.endpoints,
+            );
+            let frames = (|| -> RelaySessionResult<()> {
+                if let Some(result) = update.result {
+                    send_deployment_result(&mut socket, &result)?;
+                }
+                if let Some(open) = update.operator {
+                    // The step is durable; only a person can run it now.
+                    match terminals.spawn_operator(config, &open) {
+                        Ok(frames) => send_outbound_frames(&mut socket, frames)?,
+                        // Retryable: the step still waits for its person; a
+                        // reopen dispatches a new terminal.
+                        Err(code) => {
+                            if let Some(result) =
+                                crate::deployments::JobResult::operator_failed(&open.job, code)
+                            {
+                                send_deployment_result(&mut socket, &result)?;
+                            }
+                        }
+                    }
+                }
+                let snapshot =
+                    crate::deployments::instances_frames().map_err(RelaySessionError::Fatal)?;
+                deployment_publisher
+                    .begin(snapshot.id, true)
+                    .map_err(RelaySessionError::Fatal)?;
+                for text in snapshot.frames {
+                    deployment_publisher.check_deadline()?;
+                    socket.send(Message::Text(text.into())).map_err(|error| {
+                        websocket_session_error(error, "sending deployment instances", true)
+                    })?;
+                }
+                Ok(())
+            })();
+            if let Err(error) = frames {
+                break 'session Err(error);
+            }
         }
         if let Err(error) = drain_worker_output(
             &mut socket,
@@ -939,6 +1274,10 @@ fn run_relay_session(
         if let Err(error) =
             send_outbound_frames(&mut socket, terminals.poll_with_startup(startup, now))
         {
+            break Err(error);
+        }
+        #[cfg(unix)]
+        if let Err(error) = forward_operator_events(&mut socket, &mut terminals) {
             break Err(error);
         }
         if let Err(error) = send_outbound_frames(&mut socket, execs.poll(now)) {
@@ -1000,14 +1339,16 @@ fn run_relay_session(
         }
 
         if registered && Instant::now() >= next_telemetry_sync {
+            let mut telemetry_endpoints = config.endpoints.clone();
+            telemetry_endpoints.extend(crate::deployments::managed_endpoints());
             // Follow acknowledged reloads: the sampled endpoints are the live
             // routing map's.
             match telemetry.as_ref() {
-                Some(telemetry) => telemetry.set_endpoints(&config.endpoints),
+                Some(telemetry) => telemetry.set_endpoints(&telemetry_endpoints),
                 None => {
                     telemetry = Some(crate::telemetry::Telemetry::start(
                         worker_tx.clone(),
-                        &config.endpoints,
+                        &telemetry_endpoints,
                         crate::metric_sources::RunnerSettings::from_environment(
                             startup.allow_remote_metric_sources(),
                         ),
@@ -1018,7 +1359,7 @@ fn run_relay_session(
             next_telemetry_sync = Instant::now() + TELEMETRY_SYNC_INTERVAL;
         }
 
-        if Instant::now() >= next_heartbeat {
+        if registered && Instant::now() >= next_heartbeat {
             let heartbeat = ClientControlMessage::Heartbeat {
                 id: next_id("heartbeat"),
                 sent_at: None,
@@ -1051,7 +1392,9 @@ fn run_relay_session(
                 #[cfg(unix)]
                 &mut files,
                 &mut registered,
+                &mut deployment_publisher,
                 telemetry.as_ref(),
+                &mut remote_adapters,
             ),
             Ok(Message::Binary(bytes)) => handle_binary(
                 &mut socket,
@@ -1087,6 +1430,9 @@ fn run_relay_session(
                 true,
             )),
         };
+        if let Err(error) = deployment_publisher.check_deadline() {
+            break Err(error);
+        }
         if let Err(error) = outcome {
             break Err(error);
         }
@@ -1280,19 +1626,7 @@ where
                 let Some(pending) = pending_preparation.take() else {
                     continue;
                 };
-                let endpoints = candidate
-                    .endpoints
-                    .iter()
-                    .filter(|endpoint| endpoint.enabled)
-                    .map(|endpoint| {
-                        let status = match endpoint.last_probe.as_ref().map(|probe| &probe.status) {
-                            Some(crate::config::ProbeStatus::Online) => EndpointStatus::Online,
-                            Some(crate::config::ProbeStatus::Offline) => EndpointStatus::Offline,
-                            None => EndpointStatus::Unknown,
-                        };
-                        endpoint_inventory(endpoint, status)
-                    })
-                    .collect();
+                let endpoints = inventory_snapshot_from_config(&candidate);
                 let id = next_id("inventory");
                 if let Err(error) = send_control(
                     socket,
@@ -1383,20 +1717,7 @@ fn restore_previous_routing_after_timeout(config: &mut Config, previous: &Config
 
 #[cfg(unix)]
 fn inventory_digest_for_config(config: &Config) -> String {
-    let inventory = config
-        .endpoints
-        .iter()
-        .filter(|endpoint| endpoint.enabled)
-        .map(|endpoint| {
-            let status = match endpoint.last_probe.as_ref().map(|probe| &probe.status) {
-                Some(crate::config::ProbeStatus::Online) => EndpointStatus::Online,
-                Some(crate::config::ProbeStatus::Offline) => EndpointStatus::Offline,
-                None => EndpointStatus::Unknown,
-            };
-            endpoint_inventory(endpoint, status)
-        })
-        .collect::<Vec<_>>();
-    crate::protocol::inventory_digest(&inventory)
+    crate::protocol::inventory_digest(&inventory_snapshot_from_config(config))
 }
 
 #[cfg(unix)]
@@ -1633,11 +1954,53 @@ fn handle_text<S>(
     execs: &mut ExecRegistry,
     #[cfg(unix)] files: &mut crate::file_relay::FileRelay,
     registered: &mut bool,
+    deployment_publisher: &mut DeploymentPublisher,
     telemetry: Option<&crate::telemetry::Telemetry>,
+    remote_adapters: &mut Vec<crate::protocol::RemoteEngineAdapter>,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
 {
+    if text.len() <= crate::protocol::RELAY_JSON_CONTROL_MAX_BYTES
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+        && value.get("type").and_then(serde_json::Value::as_str) == Some("deployment.job")
+    {
+        let job = match serde_json::from_value::<crate::deployments::Job>(value) {
+            Ok(job) => job,
+            Err(_) => {
+                tracing::warn!("malformed deployment job refused");
+                return Ok(());
+            }
+        };
+        // A stop for the instance cancels its start/prepare still waiting for
+        // a person. A person's command already running is never cut off: the
+        // stop waits for that run to end (so it cannot settle from status
+        // while the run may still be starting the service).
+        #[cfg(unix)]
+        if *registered && job.action == crate::deployments::Action::Stop {
+            let (frames, busy) =
+                terminals.close_operator_for_instance(&job.instance_id, &job.step_id);
+            send_outbound_frames(socket, frames)?;
+            if busy {
+                terminals.defer_until_runs_end(job);
+                return Ok(());
+            }
+        }
+        #[cfg(unix)]
+        let refused = !*registered || crate::deployments::service::submit(job.clone()).is_err();
+        #[cfg(not(unix))]
+        let refused = true;
+        if refused {
+            let result =
+                crate::deployments::JobResult::failure(&job, "deployment_worker_unavailable");
+            let text = serde_json::to_string(&result)
+                .map_err(|error| RelaySessionError::Fatal(error.into()))?;
+            socket
+                .send(Message::Text(text.into()))
+                .map_err(|error| websocket_session_error(error, "refusing deployment job", true))?;
+        }
+        return Ok(());
+    }
     let message = match parse_server_control(text) {
         Ok(message) => message,
         Err(error) => {
@@ -1647,9 +2010,46 @@ where
     let state_dir = crate::paths::state_dir().ok();
     match message {
         ServerControlMessage::HelloOk { id, revision, .. } => {
+            if *registered {
+                return Err(RelaySessionError::Fatal(anyhow::anyhow!(
+                    "duplicate relay registration acknowledgement"
+                )));
+            }
             *registered = true;
             *last_inventory_revision = Some(revision);
             tracing::info!(id, "relay registration accepted");
+        }
+        ServerControlMessage::DeploymentInstancesOk { snapshot_id } => {
+            deployment_publisher.check_deadline()?;
+            let deadline = deployment_publisher
+                .pending
+                .as_ref()
+                .map(|(_, deadline)| *deadline)
+                .context("unexpected deployment inventory acknowledgement")
+                .map_err(RelaySessionError::Fatal)?;
+            if deployment_publisher
+                .acknowledge_snapshot(&snapshot_id)
+                .map_err(RelaySessionError::Fatal)?
+            {
+                let id = next_id("deployment-inventory");
+                if let Some(watchdog) = &deployment_publisher.watchdog {
+                    watchdog
+                        .arm(Some(deadline))
+                        .map_err(RelaySessionError::Fatal)?;
+                }
+                deployment_publisher.pending = Some((
+                    DeploymentPublication::Endpoints { id: id.clone() },
+                    deadline,
+                ));
+                send_control(
+                    socket,
+                    &ClientControlMessage::InventoryUpdate {
+                        id,
+                        endpoints: inventory_snapshot_from_config(config),
+                    },
+                    "publishing deployment inventory",
+                )?;
+            }
         }
         ServerControlMessage::HeartbeatPong { id, .. } => {
             tracing::debug!(id, "relay heartbeat acknowledged");
@@ -1659,6 +2059,19 @@ where
             revision,
             desired_capabilities: _,
         } => {
+            if id.starts_with("deployment-inventory-") {
+                deployment_publisher.check_deadline()?;
+                deployment_publisher
+                    .acknowledge_endpoints(&id)
+                    .map_err(RelaySessionError::Fatal)?;
+                if last_inventory_revision
+                    .as_ref()
+                    .is_none_or(|previous| revision.inventory_seq > previous.inventory_seq)
+                {
+                    *last_inventory_revision = Some(revision);
+                }
+                return Ok(());
+            }
             #[cfg(not(unix))]
             let _ = &id;
             #[cfg(unix)]
@@ -1723,6 +2136,12 @@ where
             }
         }
         ServerControlMessage::InventoryError { id, message } => {
+            if id.starts_with("deployment-inventory-") {
+                return Err(RelaySessionError::Reconnectable {
+                    error: anyhow::anyhow!("deployment endpoint publication rejected"),
+                    reset_backoff: true,
+                });
+            }
             tracing::warn!(id, message, "relay inventory rejected");
             #[cfg(unix)]
             if pending_reload
@@ -1766,14 +2185,24 @@ where
                 tracing::warn!(id, "late inventory rejection resolved uncertain publish");
             }
         }
-        ServerControlMessage::ProtocolError { message, .. } => {
-            // Before `hello.ok`, a pre-2.6 server rejects the hello itself.
+        ServerControlMessage::ProtocolError { message, code, .. } => {
+            if matches!(code, Some(ProtocolErrorCode::Internal)) {
+                return Err(RelaySessionError::Reconnectable {
+                    error: anyhow::anyhow!("relay protocol error: {message}"),
+                    reset_backoff: false,
+                });
+            }
             let text = if *registered {
                 format!("relay protocol error: {message}")
             } else {
-                hello_rejection_message(&message)
+                hello_rejection_message(&message, code.as_ref())
             };
             return Err(RelaySessionError::Fatal(anyhow::anyhow!(text)));
+        }
+        ServerControlMessage::HelloChallenge { .. } => {
+            return Err(RelaySessionError::Fatal(anyhow::anyhow!(
+                "server sent hello.challenge after hello"
+            )));
         }
         ServerControlMessage::RelayCancel { request_id, reason } => {
             tracing::warn!(request_id, ?reason, "relay request cancelled");
@@ -1800,11 +2229,14 @@ where
             timeout_ms,
             endpoint_slug,
             expect_body,
+            count_first,
+            count_ceiling,
             ..
         } => {
             start_relay_request(
                 socket,
                 config,
+                remote_adapters,
                 worker_tx,
                 workers,
                 recent_finished,
@@ -1815,6 +2247,8 @@ where
                 timeout_ms,
                 endpoint_slug,
                 expect_body,
+                count_first,
+                count_ceiling,
             )?;
         }
         ServerControlMessage::Unknown { type_name } => {
@@ -2000,8 +2434,9 @@ where
                 );
             }
             if let Some(telemetry) = telemetry {
-                telemetry.set_remote_adapters(adapters);
+                telemetry.set_remote_adapters(adapters.clone());
             }
+            *remote_adapters = adapters;
         }
     }
     Ok(())
@@ -2011,6 +2446,7 @@ where
 fn start_relay_request<S>(
     socket: &mut tungstenite::WebSocket<S>,
     config: &Config,
+    remote_adapters: &[crate::protocol::RemoteEngineAdapter],
     worker_tx: &SyncSender<FromWorker>,
     workers: &mut BTreeMap<String, WorkerHandle>,
     recent_finished: &RecentlyFinished,
@@ -2021,6 +2457,8 @@ fn start_relay_request<S>(
     timeout_ms: u64,
     endpoint_slug: String,
     expect_body: bool,
+    count_first: bool,
+    count_ceiling: Option<u64>,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
@@ -2042,9 +2480,11 @@ where
         return Ok(());
     }
 
+    let managed = crate::deployments::managed_endpoints();
     let Some(endpoint) = config
         .endpoints
         .iter()
+        .chain(managed.iter())
         .find(|endpoint| endpoint.enabled && endpoint.slug == endpoint_slug)
     else {
         send_relay_error(
@@ -2080,6 +2520,40 @@ where
             &config.media_trusted_origins,
         ),
     };
+
+    if count_first && expect_body {
+        let (method, adapter_count_route) = endpoint_count_plan(config, endpoint, remote_adapters);
+        let (cancellation, cancellation_rx) = CancellationHandle::new();
+        let thread_tx = worker_tx.clone();
+        let thread_cancellation = cancellation.clone();
+        let (body_tx, body_rx) = mpsc::sync_channel::<BodyChunk>(REQUEST_BODY_INGRESS_CAPACITY);
+        let endpoint = endpoint.clone();
+        let plan = CountFirstPlan {
+            method,
+            adapter_count_route,
+            count_ceiling,
+        };
+        let handle = thread::spawn(move || {
+            run_count_first_worker(
+                spec,
+                endpoint,
+                plan,
+                body_rx,
+                thread_tx,
+                thread_cancellation,
+                cancellation_rx,
+            );
+        });
+        workers.insert(
+            request_id,
+            WorkerHandle {
+                body_tx: Some(body_tx),
+                cancellation,
+                join: handle,
+            },
+        );
+        return Ok(());
+    }
 
     let (cancellation, cancellation_rx) = CancellationHandle::new();
     let thread_tx = worker_tx.clone();
@@ -2350,6 +2824,160 @@ where
             Ok(())
         }
     }
+}
+
+const COUNT_FIRST_TIMEOUT_MS: u64 = 5_000;
+
+fn count_first_exceeds_ceiling(tokens: u64, ceiling: Option<u64>) -> bool {
+    ceiling.is_some_and(|max| tokens > max)
+}
+
+struct CountFirstPlan {
+    method: Option<crate::count_context::CountContextMethod>,
+    adapter_count_route: Option<String>,
+    count_ceiling: Option<u64>,
+}
+
+fn endpoint_count_plan(
+    config: &Config,
+    endpoint: &crate::config::EndpointConfig,
+    remote: &[crate::protocol::RemoteEngineAdapter],
+) -> (
+    Option<crate::count_context::CountContextMethod>,
+    Option<String>,
+) {
+    let method = endpoint
+        .last_probe
+        .as_ref()
+        .and_then(|probe| probe.engine.as_ref())
+        .and_then(|engine| engine.count_context)
+        .and_then(crate::count_context::CountContextFact::method);
+    let adapter_count_route = crate::engine_adapter::effective_engine_adapter(
+        endpoint,
+        remote,
+        config.allow_remote_engine_adapters,
+        &config.approved_remote_adapters,
+    )
+    .and_then(|spec| spec.count_route);
+    (method, adapter_count_route)
+}
+
+fn run_count_first_worker(
+    spec: UpstreamRequestSpec,
+    endpoint: crate::config::EndpointConfig,
+    plan: CountFirstPlan,
+    body_rx: Receiver<BodyChunk>,
+    tx: SyncSender<FromWorker>,
+    cancellation: CancellationHandle,
+    cancellation_rx: watch::Receiver<bool>,
+) {
+    let request_id = spec.request_id.clone();
+    let proceed = (|| {
+        let bytes = match collect_request_body(
+            &body_rx,
+            &tx,
+            &request_id,
+            crate::count_context::COUNT_CONTEXT_MAX_BODY_BYTES,
+        ) {
+            Ok(bytes) => bytes,
+            Err(CollectError::Aborted) => return None,
+            Err(CollectError::TooLarge) => {
+                let _ = worker_send_control(
+                    &tx,
+                    &ClientControlMessage::RelayError {
+                        request_id: request_id.clone(),
+                        failure: RelayFailure::RequestTooLarge,
+                        message: Some("request body exceeds its size limit".to_string()),
+                        upstream_status_code: None,
+                    },
+                );
+                return None;
+            }
+        };
+        if cancellation.cancelled.load(Ordering::SeqCst) {
+            return None;
+        }
+        let Some(method) = plan.method else {
+            return Some(bytes);
+        };
+        let body = match crate::count_context::parse_count_context_body(&bytes) {
+            Ok(body) => body,
+            Err(error) => {
+                let _ = worker_send_control(
+                    &tx,
+                    &ClientControlMessage::CountContextError {
+                        request_id: request_id.clone(),
+                        failure: error.kind.relay_failure(),
+                        message: Some(error.message),
+                    },
+                );
+                return Some(bytes);
+            }
+        };
+        let model = body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let timeout = Duration::from_millis(COUNT_FIRST_TIMEOUT_MS.min(spec.timeout_ms).max(1));
+        match crate::count_context::count_chat(
+            &endpoint,
+            &model,
+            &body,
+            Some(method),
+            plan.adapter_count_route.as_deref(),
+            timeout,
+        ) {
+            Ok(outcome) => {
+                let _ = worker_send_control(
+                    &tx,
+                    &ClientControlMessage::CountContextResult {
+                        request_id: request_id.clone(),
+                        tokens: outcome.tokens,
+                        method: outcome.method,
+                    },
+                );
+                if count_first_exceeds_ceiling(outcome.tokens, plan.count_ceiling) {
+                    let _ = worker_send_control(
+                        &tx,
+                        &ClientControlMessage::RelayError {
+                            request_id: request_id.clone(),
+                            failure: RelayFailure::RequestTooLarge,
+                            message: Some("prompt exceeds the context ceiling".to_string()),
+                            upstream_status_code: None,
+                        },
+                    );
+                    return None;
+                }
+            }
+            Err(error) => {
+                let _ = worker_send_control(
+                    &tx,
+                    &ClientControlMessage::CountContextError {
+                        request_id: request_id.clone(),
+                        failure: error.kind.relay_failure(),
+                        message: Some(error.message),
+                    },
+                );
+            }
+        }
+        Some(bytes)
+    })();
+    if cancellation.cancelled.load(Ordering::SeqCst) {
+        let _ = tx.send(FromWorker::Finished(request_id));
+        return;
+    }
+    let Some(bytes) = proceed else {
+        let _ = tx.send(FromWorker::Finished(request_id));
+        return;
+    };
+    let (body_tx, body_rx) = mpsc::sync_channel(1);
+    let _ = body_tx.send(BodyChunk {
+        data: bytes,
+        last: true,
+    });
+    drop(body_tx);
+    run_upstream_worker(spec, Some(body_rx), tx, cancellation, cancellation_rx);
 }
 
 /// Run one upstream request on a worker thread: stream the request body (if any)
@@ -2875,7 +3503,9 @@ fn worker_send_control(tx: &SyncSender<FromWorker>, message: &ClientControlMessa
         | ClientControlMessage::RelayResponseHeaders { request_id, .. }
         | ClientControlMessage::RelayComplete { request_id, .. }
         | ClientControlMessage::RelayError { request_id, .. }
-        | ClientControlMessage::RelayCancelled { request_id } => request_id.clone(),
+        | ClientControlMessage::RelayCancelled { request_id }
+        | ClientControlMessage::CountContextResult { request_id, .. }
+        | ClientControlMessage::CountContextError { request_id, .. } => request_id.clone(),
         ClientControlMessage::Hello { .. }
         | ClientControlMessage::InventoryUpdate { .. }
         | ClientControlMessage::Heartbeat { .. }
@@ -3022,6 +3652,157 @@ where
     Ok(())
 }
 
+#[cfg(unix)]
+fn send_deployment_result<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    result: &crate::deployments::JobResult,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    let text =
+        serde_json::to_string(result).map_err(|error| RelaySessionError::Fatal(error.into()))?;
+    socket
+        .send(Message::Text(text.into()))
+        .map_err(|error| websocket_session_error(error, "sending deployment result", true))
+}
+
+/// Operator terminal events become operator progress results and worker
+/// requests. A reported `exited;0` is only a request for the status proof:
+/// the worker sends the step's final result.
+#[cfg(unix)]
+fn forward_operator_events<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    terminals: &mut TerminalRegistry,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    use crate::sessions::OperatorEvent;
+    for event in terminals.take_operator_events() {
+        match event {
+            OperatorEvent::Progress(job, progress) => {
+                if let Some(result) = crate::deployments::JobResult::operator(&job, progress) {
+                    send_deployment_result(socket, &result)?;
+                }
+            }
+            OperatorEvent::Accepted(job) => {
+                if crate::deployments::service::submit_operator_accepted(job).is_err() {
+                    tracing::warn!("could not record an operator accept");
+                }
+            }
+            OperatorEvent::Verify(job) => {
+                if crate::deployments::service::submit_operator_verify(job.clone()).is_err() {
+                    send_deployment_result(
+                        socket,
+                        &crate::deployments::JobResult::failure(
+                            &job,
+                            "deployment_worker_unavailable",
+                        ),
+                    )?;
+                }
+            }
+        }
+    }
+    // After the events: a held stop follows the verify of the run it waited for.
+    for job in terminals.take_released_jobs() {
+        if crate::deployments::service::submit(job.clone()).is_err() {
+            send_deployment_result(
+                socket,
+                &crate::deployments::JobResult::failure(&job, "deployment_worker_unavailable"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn old_server_upgrade_error() -> RelaySessionError {
+    RelaySessionError::Fatal(anyhow::anyhow!(
+        "the server did not complete the relay handshake for protocol {RELAY_PROTOCOL_VERSION}; upgrade the WS Model Proxy server"
+    ))
+}
+
+fn wait_for_hello_challenge<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+) -> RelaySessionResult<(String, String)>
+where
+    S: std::io::Read + std::io::Write,
+{
+    let deadline = Instant::now() + HELLO_CHALLENGE_TIMEOUT;
+    loop {
+        if Instant::now() >= deadline {
+            return Err(old_server_upgrade_error());
+        }
+        if let Some(signal) = crate::shutdown::requested() {
+            return Err(RelaySessionError::Shutdown(signal));
+        }
+        match socket.read() {
+            Ok(Message::Text(text)) => match parse_server_control(&text) {
+                Ok(ServerControlMessage::HelloChallenge { nonce, origin }) => {
+                    let Some(origin) = origin.filter(|value| !value.is_empty()) else {
+                        return Err(old_server_upgrade_error());
+                    };
+                    return Ok((nonce, origin));
+                }
+                Ok(ServerControlMessage::ProtocolError { message, code, .. }) => {
+                    if matches!(code, Some(ProtocolErrorCode::Internal)) {
+                        return Err(RelaySessionError::Reconnectable {
+                            error: anyhow::anyhow!("relay protocol error: {message}"),
+                            reset_backoff: false,
+                        });
+                    }
+                    return Err(RelaySessionError::Fatal(anyhow::anyhow!(
+                        hello_rejection_message(&message, code.as_ref())
+                    )));
+                }
+                Ok(other) => {
+                    let type_name = match other {
+                        ServerControlMessage::Unknown { type_name } => type_name,
+                        _ => "a control frame".to_string(),
+                    };
+                    return Err(RelaySessionError::Fatal(anyhow::anyhow!(
+                        "expected hello.challenge, received {type_name}"
+                    )));
+                }
+                Err(error) => {
+                    return Err(RelaySessionError::Reconnectable {
+                        error: anyhow::anyhow!("invalid hello.challenge frame: {error}"),
+                        reset_backoff: false,
+                    });
+                }
+            },
+            Ok(Message::Ping(bytes)) => {
+                socket
+                    .send(Message::Pong(bytes))
+                    .map_err(|error| websocket_session_error(error, "sending relay pong", true))?;
+            }
+            Ok(Message::Pong(_) | Message::Frame(_)) => {}
+            Ok(Message::Binary(_)) => {
+                return Err(RelaySessionError::Fatal(anyhow::anyhow!(
+                    "unexpected binary frame before hello"
+                )));
+            }
+            Ok(Message::Close(frame)) => {
+                tracing::warn!(?frame, "relay websocket closed by server before hello");
+                return Err(RelaySessionError::Reconnectable {
+                    error: anyhow::anyhow!("relay websocket closed before hello.challenge"),
+                    reset_backoff: false,
+                });
+            }
+            Err(tungstenite::Error::Io(err))
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(err) => {
+                return Err(websocket_session_error(
+                    err,
+                    "reading hello.challenge",
+                    true,
+                ));
+            }
+        }
+    }
+}
+
 fn send_control<S>(
     socket: &mut tungstenite::WebSocket<S>,
     message: &ClientControlMessage,
@@ -3064,6 +3845,8 @@ fn next_reconnect_delay(current: Duration) -> Duration {
 /// to `prepare_inventory_candidate`, which rechecks the desired snapshot under
 /// the short-lived config lock before it writes anything.
 fn inventory_from_config(config: &mut Config) -> Vec<EndpointInventory> {
+    let allow_remote = config.allow_remote_engine_adapters;
+    let approved = config.approved_remote_adapters.clone();
     let enabled = config
         .endpoints
         .iter()
@@ -3078,9 +3861,12 @@ fn inventory_from_config(config: &mut Config) -> Vec<EndpointInventory> {
                 .cloned()
                 .map(|endpoint| {
                     let probe_endpoint_config = endpoint.clone();
+                    let approved = approved.clone();
                     (
                         endpoint,
-                        scope.spawn(move || probe_endpoint(&probe_endpoint_config)),
+                        scope.spawn(move || {
+                            probe_endpoint(&probe_endpoint_config, allow_remote, &approved)
+                        }),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -3111,35 +3897,25 @@ fn inventory_from_config(config: &mut Config) -> Vec<EndpointInventory> {
             tracing::warn!(error = %error, endpoint = report.endpoint_slug, "failed to apply probe report");
         }
     }
-    config
-        .endpoints
-        .iter()
-        .filter(|endpoint| endpoint.enabled)
-        .map(|endpoint| {
-            let status = match endpoint.last_probe.as_ref().map(|probe| &probe.status) {
-                Some(crate::config::ProbeStatus::Online) => EndpointStatus::Online,
-                Some(crate::config::ProbeStatus::Offline) => EndpointStatus::Offline,
-                None => EndpointStatus::Unknown,
-            };
-            endpoint_inventory(endpoint, status)
-        })
-        .collect()
+    inventory_snapshot_from_config(config)
 }
 
-fn set_socket_read_timeout(
+fn set_socket_timeouts(
     stream: &mut tungstenite::stream::MaybeTlsStream<std::net::TcpStream>,
-    timeout: Duration,
-) {
+    read_timeout: Duration,
+    write_timeout: Duration,
+) -> Result<()> {
     let tcp = match stream {
         tungstenite::stream::MaybeTlsStream::Plain(stream) => Some(stream),
         tungstenite::stream::MaybeTlsStream::Rustls(stream) => Some(&mut stream.sock),
         _ => None,
     };
-    if let Some(tcp) = tcp
-        && let Err(error) = tcp.set_read_timeout(Some(timeout))
-    {
-        tracing::warn!(error = %error, "failed to set websocket read timeout");
-    }
+    let tcp = tcp.context("unsupported websocket transport timeout configuration")?;
+    tcp.set_read_timeout(Some(read_timeout))
+        .context("setting websocket read timeout")?;
+    tcp.set_write_timeout(Some(write_timeout))
+        .context("setting websocket write timeout")?;
+    Ok(())
 }
 
 fn websocket_url(server_url: &str) -> Result<Url> {
@@ -3187,6 +3963,145 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    // Unix only: Windows `shutdown` does not interrupt a blocked send (see
+    // `PublicationWatchdog`).
+    #[cfg(unix)]
+    #[test]
+    fn publication_watchdog_interrupts_actual_stalled_websocket_write() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().expect("address");
+        let (stop, stopped) = mpsc::channel();
+        let peer = thread::spawn(move || {
+            let (tcp, _) = listener.accept().expect("accept");
+            let _socket = tungstenite::accept(tcp).expect("handshake");
+            let _ = stopped.recv_timeout(Duration::from_secs(5));
+        });
+        let (mut socket, _) = connect(format!("ws://{address}")).expect("client");
+        set_socket_timeouts(
+            socket.get_mut(),
+            RELAY_SOCKET_POLL_INTERVAL,
+            Duration::from_secs(5),
+        )
+        .expect("timeouts");
+        let guard = PublicationWatchdog::start(socket.get_ref()).expect("guard");
+        socket
+            .send(Message::Text("legitimate initial frame".into()))
+            .expect("normal send");
+        let start = Instant::now();
+        guard
+            .arm(Some(start + Duration::from_millis(150)))
+            .expect("arm");
+        let mut failed = false;
+        for _ in 0..512 {
+            if socket
+                .send(Message::Binary(vec![0; 65_536].into()))
+                .is_err()
+            {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "a stopped reader must interrupt the actual write");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "absolute deadline beats the five-second native write timeout"
+        );
+        drop(guard);
+        let _ = stop.send(());
+        peer.join().expect("join peer");
+    }
+
+    #[test]
+    fn publication_watchdog_disarm_rearm_drop_preserve_live_and_successor_sockets() {
+        let pair = || {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+            let tcp = std::net::TcpStream::connect(listener.local_addr().expect("address"))
+                .expect("connect");
+            let (peer, _) = listener.accept().expect("accept");
+            (tungstenite::stream::MaybeTlsStream::Plain(tcp), peer)
+        };
+        let (mut socket, _peer) = pair();
+        let guard = PublicationWatchdog::start(&socket).expect("guard");
+        guard
+            .arm(Some(Instant::now() + Duration::from_millis(40)))
+            .expect("arm");
+        guard.arm(None).expect("disarm");
+        thread::sleep(Duration::from_millis(70));
+        socket
+            .write_all(b"still live after ACK")
+            .expect("disarmed socket remains live");
+        guard
+            .arm(Some(Instant::now() + Duration::from_millis(40)))
+            .expect("old phase");
+        guard
+            .arm(Some(Instant::now() + Duration::from_millis(200)))
+            .expect("next phase");
+        thread::sleep(Duration::from_millis(70));
+        socket
+            .write_all(b"next phase live")
+            .expect("old deadline cannot terminate a rearmed phase");
+        let (mut successor, _successor_peer) = pair();
+        drop(guard);
+        thread::sleep(Duration::from_millis(220));
+        socket
+            .write_all(b"drop joined without killing socket")
+            .expect("drop cancels timer");
+        successor
+            .write_all(b"separate connection")
+            .expect("old guard cannot affect successor");
+    }
+
+    #[test]
+    fn deployment_publication_requires_exact_ack_and_excludes_overlap() {
+        let mut publisher = DeploymentPublisher::default();
+        publisher.begin("a".repeat(32), true).expect("first");
+        assert!(publisher.begin("b".repeat(32), true).is_err());
+        assert!(publisher.acknowledge_snapshot(&"b".repeat(32)).is_err());
+        assert!(publisher.pending.is_some());
+        assert!(
+            publisher
+                .acknowledge_snapshot(&"a".repeat(32))
+                .expect("ACK")
+        );
+        assert!(publisher.acknowledge_snapshot(&"a".repeat(32)).is_err());
+        publisher.pending = Some((
+            DeploymentPublication::Endpoints {
+                id: "inventory-a".into(),
+            },
+            Instant::now() + Duration::from_secs(30),
+        ));
+        assert!(publisher.begin("b".repeat(32), true).is_err());
+        assert!(publisher.acknowledge_endpoints("inventory-b").is_err());
+        publisher
+            .acknowledge_endpoints("inventory-a")
+            .expect("endpoints ACK");
+        publisher.begin("b".repeat(32), false).expect("next");
+        assert!(
+            !publisher
+                .acknowledge_snapshot(&"b".repeat(32))
+                .expect("empty initial ACK")
+        );
+    }
+
+    #[test]
+    fn deployment_publication_expired_ack_does_not_release_successor() {
+        let mut publisher = DeploymentPublisher::default();
+        publisher.begin("a".repeat(32), true).expect("begin");
+        if let Some((_, deadline)) = &mut publisher.pending {
+            *deadline = Instant::now();
+        }
+        assert!(publisher.acknowledge_snapshot(&"a".repeat(32)).is_err());
+        assert!(publisher.pending.is_some());
+        let mut successor = DeploymentPublisher::default();
+        successor.begin("b".repeat(32), false).expect("successor");
+        assert!(successor.acknowledge_snapshot(&"a".repeat(32)).is_err());
+        assert!(
+            !successor
+                .acknowledge_snapshot(&"b".repeat(32))
+                .expect("successor ACK")
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn status_json_exposes_local_probe_and_server_acknowledgement() {
@@ -3209,7 +4124,7 @@ mod tests {
             .endpoints
             .iter()
             .filter(|endpoint| endpoint.enabled)
-            .map(|endpoint| endpoint_inventory(endpoint, EndpointStatus::Online))
+            .map(|endpoint| crate::protocol::endpoint_inventory(endpoint, EndpointStatus::Online))
             .collect::<Vec<_>>();
         let revision = crate::protocol::InventoryRevision {
             inventory_seq: 42,
@@ -3561,6 +4476,77 @@ mod tests {
         )
     }
 
+    fn challenge_socket(message: Message) -> tungstenite::WebSocket<io::Cursor<Vec<u8>>> {
+        let mut server = sink_socket();
+        server.send(message).unwrap();
+        tungstenite::WebSocket::from_raw_socket(
+            io::Cursor::new(server.get_ref().written.clone()),
+            tungstenite::protocol::Role::Client,
+            None,
+        )
+    }
+
+    #[test]
+    fn hello_challenge_transient_close_and_parse_failure_reconnect() {
+        for message in [Message::Close(None), Message::Text("{garbled".into())] {
+            let mut socket = challenge_socket(message);
+            assert!(matches!(
+                wait_for_hello_challenge(&mut socket),
+                Err(RelaySessionError::Reconnectable {
+                    reset_backoff: false,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn hello_challenge_keeps_coded_internal_retryable_and_old_server_actionable() {
+        let mut socket = challenge_socket(Message::Text(
+            r#"{"type":"protocol.error","failure":"protocol_error","message":"database unavailable","code":"internal"}"#
+                .into(),
+        ));
+        assert!(matches!(
+            wait_for_hello_challenge(&mut socket),
+            Err(RelaySessionError::Reconnectable {
+                reset_backoff: false,
+                ..
+            })
+        ));
+        let mut socket = challenge_socket(Message::Text(
+            r#"{"type":"protocol.error","failure":"protocol_error","message":"Registration was not received in time."}"#
+                .into(),
+        ));
+        match wait_for_hello_challenge(&mut socket) {
+            Err(RelaySessionError::Fatal(error)) => assert!(
+                error
+                    .to_string()
+                    .contains("upgrade the WS Model Proxy server")
+            ),
+            _ => panic!("expected actionable old server refusal"),
+        }
+    }
+
+    #[test]
+    fn hello_challenge_requires_origin_and_accepts_current_server() {
+        let mut socket = challenge_socket(Message::Text(
+            r#"{"type":"hello.challenge","nonce":"AAAAAAAAAAAAAAAAAAAAAA"}"#.into(),
+        ));
+        assert!(matches!(
+            wait_for_hello_challenge(&mut socket),
+            Err(RelaySessionError::Fatal(_))
+        ));
+        let mut socket = challenge_socket(Message::Text(
+            r#"{"type":"hello.challenge","nonce":"AAAAAAAAAAAAAAAAAAAAAA","origin":"https://example.test"}"#.into()));
+        assert_eq!(
+            wait_for_hello_challenge(&mut socket).ok().unwrap(),
+            (
+                "AAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                "https://example.test".to_string()
+            )
+        );
+    }
+
     /// A malformed `exec.start` / `term.spawn` names a command but cannot be
     /// read as a request, so it never reaches a registry. The daemon still
     /// owes that command its one outcome line (AC 8): without the explicit
@@ -3644,6 +4630,7 @@ mod tests {
         let result = start_relay_request(
             &mut socket,
             &config,
+            &[],
             &worker_tx,
             &mut workers,
             &recent_finished,
@@ -3654,6 +4641,8 @@ mod tests {
             1_000,
             "local".to_string(),
             false,
+            false,
+            None,
         );
         assert!(result.is_ok(), "start_relay_request should not error");
 
@@ -3680,6 +4669,7 @@ mod tests {
         let result = start_relay_request(
             &mut socket,
             &config,
+            &[],
             &worker_tx,
             &mut workers,
             &recent_finished,
@@ -3690,6 +4680,8 @@ mod tests {
             1_000,
             "local".to_string(),
             false,
+            false,
+            None,
         );
         assert!(result.is_ok(), "start_relay_request should not error");
 
@@ -3872,6 +4864,39 @@ mod tests {
     }
 
     #[test]
+    fn count_first_exceeds_ceiling_is_exclusive() {
+        assert!(!count_first_exceeds_ceiling(8, None));
+        assert!(!count_first_exceeds_ceiling(8, Some(8)));
+        assert!(count_first_exceeds_ceiling(9, Some(8)));
+    }
+
+    #[test]
+    fn reconnect_keeps_count_context_when_the_kind_matches() {
+        let previous = crate::engine::DetectedEngine {
+            kind: Some(crate::engine::EngineKind::LlamaCpp),
+            count_context: Some(crate::count_context::CountContextFact::LlamaInputTokens),
+            slots: Some(4),
+            ..crate::engine::DetectedEngine::default()
+        };
+        let mut next = crate::engine::DetectedEngine {
+            kind: Some(crate::engine::EngineKind::LlamaCpp),
+            slots: Some(4),
+            ..crate::engine::DetectedEngine::default()
+        };
+        preserve_count_context(Some(&previous), &mut next);
+        assert_eq!(
+            next.count_context,
+            Some(crate::count_context::CountContextFact::LlamaInputTokens)
+        );
+        let mut changed = crate::engine::DetectedEngine {
+            kind: Some(crate::engine::EngineKind::Vllm),
+            ..crate::engine::DetectedEngine::default()
+        };
+        preserve_count_context(Some(&previous), &mut changed);
+        assert_eq!(changed.count_context, None);
+    }
+
+    #[test]
     fn the_reconnect_fast_path_hands_the_session_the_facts_its_hello_advertises() {
         // An acknowledged auto endpoint whose engine was not detectable at the
         // last probe; on reconnect `/props` answers. The hello advertises
@@ -3936,6 +4961,105 @@ mod tests {
         let mut edited = config.clone();
         edited.endpoints[0].label = "other".to_string();
         assert!(!same_desired_config(&edited, &active));
+    }
+
+    #[test]
+    fn approved_remote_adapter_publishes_load_adapter_on_inventory() {
+        use crate::engine_adapter::{
+            AdapterFormat, AdapterInput, AdapterSignal, EngineAdapterConfig, SignalSelector,
+        };
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            AdapterSignal::Running,
+            SignalSelector {
+                series: "running".to_string(),
+                labels: Default::default(),
+                aggregate: None,
+                scale: None,
+            },
+        );
+        map.insert(
+            AdapterSignal::KvOccupancy,
+            SignalSelector {
+                series: "kv".to_string(),
+                labels: Default::default(),
+                aggregate: None,
+                scale: None,
+            },
+        );
+        let spec = EngineAdapterConfig {
+            input: AdapterInput::Route {
+                route: "/stats".to_string(),
+            },
+            format: AdapterFormat::Json,
+            interval_secs: 2,
+            timeout_secs: 2,
+            map: map.clone(),
+            count_route: None,
+        };
+        let hash = crate::engine_adapter::spec_sha256("gpu", &spec);
+        let remote = crate::protocol::RemoteEngineAdapter {
+            endpoint_slug: "gpu".to_string(),
+            input: AdapterInput::Route {
+                route: "/stats".to_string(),
+            },
+            format: AdapterFormat::Json,
+            interval_secs: 2,
+            timeout_secs: 2,
+            map,
+            count_route: None,
+        };
+        let mut config = Config {
+            allow_remote_engine_adapters: true,
+            ..Config::default()
+        };
+        config
+            .approved_remote_adapters
+            .insert("gpu".to_string(), hash);
+        config.endpoints.push(crate::config::EndpointConfig {
+            slug: "gpu".to_string(),
+            enabled: true,
+            engine: crate::config::EndpointEngine::Generic,
+            engine_adapter: None,
+            last_probe: Some(crate::config::ProbeSnapshot {
+                status: crate::config::ProbeStatus::Online,
+                models: Vec::new(),
+                suggested_capabilities: crate::config::OpenAiCompatibleCapabilities::default(),
+                engine: None,
+                adapter: None,
+            }),
+            ..crate::config::EndpointConfig::default()
+        });
+
+        let mut unapproved = config.clone();
+        unapproved.approved_remote_adapters.clear();
+        let pending =
+            inventory_snapshot_from_config_with_remote(&unapproved, std::slice::from_ref(&remote));
+        assert!(
+            pending[0]
+                .engine_facts
+                .as_ref()
+                .and_then(|facts| facts.load_adapter.as_ref())
+                .is_none(),
+            "an unapproved remote adapter stays off the wire"
+        );
+
+        let inventory = inventory_snapshot_from_config_with_remote(&config, &[remote]);
+        let load = inventory[0]
+            .engine_facts
+            .as_ref()
+            .and_then(|facts| facts.load_adapter.as_ref())
+            .expect("approved remote adapter publishes loadAdapter");
+        assert_eq!(load.source, crate::protocol::FactSource::Config);
+        assert!(
+            !load.value.signals.is_empty(),
+            "the remote spec's signal list is published on the wire"
+        );
+        assert!(
+            load.value
+                .signals
+                .contains(&crate::engine_adapter::AdapterSignal::Running)
+        );
     }
 
     #[test]

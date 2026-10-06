@@ -4,6 +4,12 @@
   "private": true,
   "type": "module",
   "exports": {
+    "./deployment-protocol": {
+      "default": "./src/deployment-protocol.ts"
+    },
+    "./deployment-job-wire": {
+      "default": "./src/deployment-job-wire.ts"
+    },
     "./tsconfig.base.json": "./tsconfig.base.json",
     "./biome.json": "./biome.json",
     "./postcss.config.mjs": "./postcss.config.mjs",
@@ -18,6 +24,12 @@
     },
     "./cli-device-login": {
       "default": "./src/cli-device-login.ts"
+    },
+    "./cli-identity-key": {
+      "default": "./src/cli-identity-key.ts"
+    },
+    "./decimal-input": {
+      "default": "./src/decimal-input.ts"
     },
     "./theme-init": {
       "default": "./src/theme-init.ts"

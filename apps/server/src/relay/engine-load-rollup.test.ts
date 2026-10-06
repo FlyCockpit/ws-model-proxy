@@ -8,11 +8,13 @@ vi.mock("@ws-model-proxy/db/shutdown-fence", () => ({ isDbShutdownFenceArmed: ()
 
 import {
   createEngineLoadRollupWriter,
+  ENGINE_LOAD_ROLLUP_INT4_MAX,
   ENGINE_LOAD_ROLLUP_MAX_PENDING,
   type EngineLoadRollupSample,
   incrementKeyString,
   mergeEngineLoadIncrements,
   truncateToMinute,
+  writeEngineLoadIncrements,
 } from "./engine-load-rollup.js";
 
 const NOW = new Date("2026-09-30T12:00:30.000Z");
@@ -53,6 +55,21 @@ describe("engine-load rollup merge", () => {
     expect(second.maxKvOccupancy).toBe(0.8);
     expect(second.prefixCacheHits).toBe(6);
     expect(second.samples).toBe(2);
+  });
+
+  it("clamps prefix-cache counters to int4 so one minute cannot overflow the column", () => {
+    const merged = mergeEngineLoadIncrements(
+      undefined,
+      sample({ prefixCacheHitsDelta: ENGINE_LOAD_ROLLUP_INT4_MAX, prefixCacheQueriesDelta: 2 }),
+      "cap-1",
+    );
+    const overflowed = mergeEngineLoadIncrements(
+      merged,
+      sample({ prefixCacheHitsDelta: 10, prefixCacheQueriesDelta: ENGINE_LOAD_ROLLUP_INT4_MAX }),
+      "cap-1",
+    );
+    expect(overflowed.prefixCacheHits).toBe(ENGINE_LOAD_ROLLUP_INT4_MAX);
+    expect(overflowed.prefixCacheQueries).toBe(ENGINE_LOAD_ROLLUP_INT4_MAX);
   });
 
   it("sorts upserts by a stable key", () => {
@@ -101,6 +118,88 @@ describe("engine-load rollup writer", () => {
     });
   });
 
+  it("logs rows rejected one by one, with counts, instead of losing them silently", async () => {
+    const logs: unknown[] = [];
+    const writer = createEngineLoadRollupWriter({
+      clock: () => NOW.getTime() + 2_000,
+      write: async () => 0,
+      resolveCapacities: async () => [
+        { capacityId: "cap-1", endpointSlug: "gpu", modelSlug: "qwen" },
+      ],
+      log: (counts) => logs.push(counts),
+    });
+    writers.push(writer);
+    writer.observe(sample());
+    await writer.flushNow();
+    expect(logs).toEqual([{ written: 0, failed: 1 }]);
+  });
+
+  it("maps a null sample slug onto every capacity on that endpoint", async () => {
+    const writes: unknown[] = [];
+    const writer = createEngineLoadRollupWriter({
+      clock: () => NOW.getTime() + 2_000,
+      write: async (increments) => {
+        writes.push(increments);
+        return increments.length;
+      },
+      resolveCapacities: async () => [
+        { capacityId: "cap-qwen", endpointSlug: "gpu", modelSlug: "qwen" },
+        { capacityId: "cap-other", endpointSlug: "gpu", modelSlug: "other" },
+        { capacityId: "cap-cpu", endpointSlug: "cpu", modelSlug: "qwen" },
+      ],
+    });
+    writers.push(writer);
+    writer.observe(sample({ modelSlug: null, running: 6, kvOccupancy: 0.4 }));
+    await writer.flushNow();
+    expect(writes).toHaveLength(1);
+    const increments = writes[0] as Array<{
+      capacityId: string;
+      modelSlug: string;
+      maxRunning: number;
+      maxKvOccupancy: number | null;
+    }>;
+    expect(increments).toHaveLength(2);
+    expect(increments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          capacityId: "cap-qwen",
+          modelSlug: "qwen",
+          maxRunning: 6,
+          maxKvOccupancy: 0.4,
+        }),
+        expect.objectContaining({
+          capacityId: "cap-other",
+          modelSlug: "other",
+          maxRunning: 6,
+          maxKvOccupancy: 0.4,
+        }),
+      ]),
+    );
+    expect(increments.some((row) => row.capacityId === "cap-cpu")).toBe(false);
+  });
+
+  it("keeps a non-null sample slug on its own capacity", async () => {
+    const writes: unknown[] = [];
+    const writer = createEngineLoadRollupWriter({
+      clock: () => NOW.getTime() + 2_000,
+      write: async (increments) => {
+        writes.push(increments);
+        return increments.length;
+      },
+      resolveCapacities: async () => [
+        { capacityId: "cap-qwen", endpointSlug: "gpu", modelSlug: "qwen" },
+        { capacityId: "cap-other", endpointSlug: "gpu", modelSlug: "other" },
+      ],
+    });
+    writers.push(writer);
+    writer.observe(sample({ modelSlug: "qwen", running: 3 }));
+    await writer.flushNow();
+    const increments = writes[0] as Array<{ capacityId: string; modelSlug: string }>;
+    expect(increments).toEqual([
+      expect.objectContaining({ capacityId: "cap-qwen", modelSlug: "qwen" }),
+    ]);
+  });
+
   it("refuses new pending keys at the process cap while a flush is in flight", async () => {
     const rows = [{ capacityId: "cap-1", endpointSlug: "gpu", modelSlug: "qwen" }];
     let releaseFirst: ((value: typeof rows) => void) | undefined;
@@ -135,5 +234,24 @@ describe("engine-load rollup writer", () => {
     const flushed = writes.flat() as Array<{ endpointSlug: string }>;
     expect(flushed.length).toBeLessThanOrEqual(ENGINE_LOAD_ROLLUP_MAX_PENDING + 1);
     expect(flushed.some((row) => row.endpointSlug === "ep-2010")).toBe(false);
+  });
+
+  it("isolates a failed increment so later rows still write", async () => {
+    const calls: unknown[] = [];
+    const written = await writeEngineLoadIncrements(
+      [
+        mergeEngineLoadIncrements(undefined, sample({ endpointSlug: "a" }), "cap-1"),
+        mergeEngineLoadIncrements(undefined, sample({ endpointSlug: "b" }), "cap-2"),
+      ],
+      {
+        $executeRaw: async (sql) => {
+          calls.push(sql);
+          if (calls.length === 1) throw new Error("int4 overflow");
+          return 1;
+        },
+      },
+    );
+    expect(calls).toHaveLength(2);
+    expect(written).toBe(1);
   });
 });

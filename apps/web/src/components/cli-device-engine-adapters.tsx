@@ -48,9 +48,16 @@ function reportedAdapters(nodeMetrics: unknown): AdapterStatus[] {
 }
 
 /** Engine adapter statuses from live node.metrics. Loaded when opened. */
-export function CliDeviceEngineAdapters({ cliDeviceId }: { cliDeviceId: string }) {
+export function CliDeviceEngineAdapters({
+  cliDeviceId,
+  defaultOpen = false,
+}: {
+  cliDeviceId: string;
+  /** Open when shown on its own (a device tab). */
+  defaultOpen?: boolean;
+}) {
   const { t } = useTranslation(["dashboard"]);
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(defaultOpen);
   const metrics = useQuery({
     ...orpc.forwarderManagement.getCliDeviceMetrics.queryOptions({ input: { cliDeviceId } }),
     enabled: open,

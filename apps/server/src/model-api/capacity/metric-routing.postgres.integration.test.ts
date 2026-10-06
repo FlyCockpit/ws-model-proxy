@@ -324,12 +324,14 @@ integration("PostgreSQL metric routing at grant time", () => {
       const { MetricRoutingEvaluator, createRoutingEvaluationState } = await import(
         "../../relay/metric-routing-evaluator.js"
       );
-      await db.modelPool.update({
-        where: { id: f.pool.id },
+      await db.poolRoutingRule.create({
         data: {
-          routingRules: [
-            { metric: "node.gpu.temperature_c", op: ">", threshold: 80, effect: "full" },
-          ],
+          poolId: f.pool.id,
+          position: 0,
+          metric: "node.gpu.temperature_c",
+          op: ">",
+          threshold: 80,
+          effect: "full",
         },
       });
       const at = new Date();

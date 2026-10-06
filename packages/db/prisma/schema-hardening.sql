@@ -18,7 +18,9 @@ BEGIN;
 -- locks is included by the backfills below; one that starts after they are
 -- released sees the installed triggers.
 LOCK TABLE "user", cli_device, endpoint, discovered_model, execution_target, model_pool,
-  model_api_token, pool_member, pool_grant, pool_fallback_preference,
+  inference_contribution, deployment_config, deployment_config_revision, deployment_plan,
+  deployment_run, deployment_instance, deployment_instance_node, deployment_step,
+  deployment_operator_event, model_api_token, pool_member, pool_routing_rule, pool_grant, pool_fallback_preference,
   model_api_token_allowlist_entry, response_stickiness_record,
   relay_request, inference_capacity, capacity_runtime, admission_request, capacity_waiter,
   capacity_lease, capacity_audit_event, provider_account, provider_model, provider_credential,
@@ -26,7 +28,8 @@ LOCK TABLE "user", cli_device, endpoint, discovered_model, execution_target, mod
   provider_usage_ledger, provider_pricing_version, provider_budget_settlement,
   provider_audit_event, public_provider_attempt_event, relay_execution_attempt,
   relay_execution_event, usage_rollup_minute, usage_rollup_hour, engine_load_rollup_minute,
-  cache_affinity_record, cache_affinity_node, capacity_kv_eviction, session IN ACCESS EXCLUSIVE MODE NOWAIT;
+  node_metrics_minute, cache_affinity_record, cache_affinity_residency, cache_affinity_residency_cursor, cache_affinity_node,
+  cache_affinity_scope, cache_affinity_observer, capacity_kv_eviction, session IN ACCESS EXCLUSIVE MODE NOWAIT;
 
 -- Deploy writer (class D): the backfills below rewrite graph rows while every
 -- table is locked exclusively, so no fence can be contended. The graph-write
@@ -165,6 +168,15 @@ CREATE UNIQUE INDEX IF NOT EXISTS cache_affinity_conversation_unique
     ("tenantUserId", "poolId", "executionTargetId", "targetIdentity", "bindingDigest", "conversationDigest")
   WHERE "conversationDigest" IS NOT NULL AND "prefixDigest" IS NULL;
 
+-- Newest-first footprints for new-conversation residency. The LATERAL
+-- per-target LIMIT in affinityResidencySql walks this instead of ranking
+-- every live prefix row. DROP first so existing deployments replace the
+-- old (executionTargetId, expiresAt DESC) shape.
+DROP INDEX IF EXISTS cache_affinity_record_residency;
+CREATE INDEX cache_affinity_record_residency
+  ON cache_affinity_record ("userId", "executionTargetId", "expiresAt" DESC, id DESC)
+  WHERE "prefixDigest" IS NULL;
+
 ALTER TABLE cache_affinity_record DROP CONSTRAINT IF EXISTS cache_affinity_record_shape_check;
 ALTER TABLE cache_affinity_record ADD CONSTRAINT cache_affinity_record_shape_check CHECK (
   "digestVersion" >= 5
@@ -180,9 +192,85 @@ ALTER TABLE cache_affinity_record ADD CONSTRAINT cache_affinity_record_shape_che
         AND "conversationDigest" IS NOT NULL
         AND length("conversationDigest") BETWEEN 32 AND 128))
   AND length("sessionId") BETWEEN 1 AND 128
+  AND length(id) BETWEEN 1 AND 128
+  AND ("sharedWithSessionId" IS NULL OR length("sharedWithSessionId") BETWEEN 1 AND 128)
   AND length("targetIdentity") BETWEEN 1 AND 2048
   AND ("sharedPrefixTokens" IS NULL OR "sharedPrefixTokens" >= 0)
 );
+
+ALTER TABLE cache_affinity_record ADD COLUMN IF NOT EXISTS "cacheGeneration" text NOT NULL DEFAULT '';
+ALTER TABLE cache_affinity_node ADD COLUMN IF NOT EXISTS "cacheGeneration" text NOT NULL DEFAULT '';
+ALTER TABLE cache_affinity_residency ADD COLUMN IF NOT EXISTS "cacheGeneration" text NOT NULL DEFAULT '';
+ALTER TABLE inference_capacity ADD COLUMN IF NOT EXISTS "cacheGeneration" text NOT NULL DEFAULT '';
+
+-- Reconnect is a conservative physical-cache boundary, including a reset whose
+-- durable write failed before the old process/socket disappeared. Registration
+-- advances connectionGeneration before installing the new serving connection.
+CREATE OR REPLACE FUNCTION wsmp_affinity_generation(target_id text)
+RETURNS text LANGUAGE plpgsql STABLE AS $affinity_generation$
+DECLARE generation text;
+BEGIN
+  SELECT COALESCE(c."cacheGeneration", '') ||
+    CASE WHEN COALESCE(d."connectionGeneration", 0) = 0 THEN ''
+      ELSE ':connection:' || d."connectionGeneration"::text END
+  INTO generation
+  FROM execution_target t
+  LEFT JOIN inference_capacity c ON c.id = t."inferenceCapacityId"
+  LEFT JOIN discovered_model m ON m.id = t."discoveredModelId"
+  LEFT JOIN endpoint e ON e.id = m."endpointId"
+  LEFT JOIN cli_device d ON d.id = e."cliDeviceId"
+  WHERE t.id = target_id;
+  RETURN generation;
+END
+$affinity_generation$;
+
+-- Confidence is shared across processes. A missing/currently expired observer
+-- cannot be made safe by releasing a process-local pending map. Retired rows
+-- are retained until the physical capacity disappears; retirement happens only
+-- after a committed generation advance.
+CREATE OR REPLACE FUNCTION wsmp_affinity_generation_ready(target_id text)
+RETURNS boolean LANGUAGE sql STABLE AS $affinity_ready$
+  SELECT NOT EXISTS (
+    SELECT 1 FROM cache_affinity_observer o
+    WHERE o."capacityId" = t."inferenceCapacityId" AND NOT o.retired
+      AND (o.pending OR o."validUntil" <= statement_timestamp())
+  ) AND NOT EXISTS (
+    SELECT 1 FROM execution_target alias
+    JOIN discovered_model m ON m.id = alias."discoveredModelId"
+    JOIN endpoint e ON e.id = m."endpointId"
+    JOIN cli_device d ON d.id = e."cliDeviceId"
+    WHERE alias."inferenceCapacityId" = t."inferenceCapacityId"
+      AND d."connectionGeneration" > 0
+      AND NOT EXISTS (
+        SELECT 1 FROM cache_affinity_observer o
+        WHERE o."capacityId" = alias."inferenceCapacityId"
+          AND o."cliDeviceId" = d.id AND o."endpointSlug" = e.slug
+          AND o."connectionGeneration" = d."connectionGeneration"
+      )
+  ) FROM execution_target t WHERE t.id = target_id
+$affinity_ready$;
+
+CREATE OR REPLACE FUNCTION wsmp_affinity_scope_generation(target_id text, pool_id text)
+RETURNS text LANGUAGE sql STABLE AS $affinity_scope_generation$
+  SELECT wsmp_affinity_generation(target_id) || COALESCE(
+    (SELECT ':pool:' || generation FROM cache_affinity_scope WHERE "poolId" = pool_id), '')
+$affinity_scope_generation$;
+
+ALTER TABLE cache_affinity_scope DROP CONSTRAINT IF EXISTS cache_affinity_scope_shape;
+ALTER TABLE cache_affinity_scope ADD CONSTRAINT cache_affinity_scope_shape CHECK (
+  length("poolId") BETWEEN 1 AND 128 AND length("userId") BETWEEN 1 AND 128
+  AND length(generation) = 36
+);
+ALTER TABLE cache_affinity_observer DROP CONSTRAINT IF EXISTS cache_affinity_observer_shape;
+ALTER TABLE cache_affinity_observer ADD CONSTRAINT cache_affinity_observer_shape CHECK (
+  length("capacityId") BETWEEN 1 AND 128 AND length("userId") BETWEEN 1 AND 128
+  AND length("cliDeviceId") BETWEEN 1 AND 128 AND length("endpointSlug") BETWEEN 1 AND 63
+  AND length("managerId") = 36 AND length(version) = 36 AND "connectionGeneration" > 0
+);
+ALTER TABLE cache_affinity_record DROP CONSTRAINT IF EXISTS cache_affinity_record_generation_shape;
+ALTER TABLE cache_affinity_record ADD CONSTRAINT cache_affinity_record_generation_shape CHECK (length("cacheGeneration") <= 128);
+ALTER TABLE cache_affinity_node DROP CONSTRAINT IF EXISTS cache_affinity_node_generation_shape;
+ALTER TABLE cache_affinity_node ADD CONSTRAINT cache_affinity_node_generation_shape CHECK (length("cacheGeneration") <= 128);
 
 CREATE OR REPLACE FUNCTION enforce_cache_affinity_identity_immutable()
 RETURNS trigger LANGUAGE plpgsql AS $cache_affinity_identity_immutable$
@@ -191,6 +279,7 @@ BEGIN
     OR NEW."tenantUserId" IS DISTINCT FROM OLD."tenantUserId"
     OR NEW."poolId" IS DISTINCT FROM OLD."poolId"
     OR NEW."executionTargetId" IS DISTINCT FROM OLD."executionTargetId"
+    OR NEW."cacheGeneration" IS DISTINCT FROM OLD."cacheGeneration"
     OR NEW."targetIdentity" IS DISTINCT FROM OLD."targetIdentity"
     OR NEW."digestVersion" IS DISTINCT FROM OLD."digestVersion"
     OR NEW."bindingDigest" IS DISTINCT FROM OLD."bindingDigest"
@@ -210,11 +299,10 @@ BEFORE UPDATE ON cache_affinity_record
 FOR EACH ROW EXECUTE FUNCTION enforce_cache_affinity_identity_immutable();
 
 -- DL-1 (d): cache affinity is hot-path history without foreign keys to the
--- graph. What the (poolId, userId) and (executionTargetId, userId) foreign
--- keys enforced is kept here with plain reads: a record's pool and target
--- belong to its owner. A parent that no longer exists is tolerated (a
--- concurrent delete; the record is orphaned history, removed at expiry or by
--- the pool's clear); a parent of another owner is refused.
+-- graph. Source/node userId is the pool principal, not the machine owner.
+-- A cross-owner target requires the exact active contribution/member graph.
+-- Plain reads preserve the DL history contract without acquiring graph locks.
+-- A revoked in-flight contribution may lose optional metadata at completion.
 CREATE OR REPLACE FUNCTION enforce_cache_affinity_owner()
 RETURNS trigger LANGUAGE plpgsql AS $cache_affinity_owner$
 DECLARE
@@ -225,8 +313,18 @@ BEGIN
     RAISE EXCEPTION 'cache affinity pool must belong to its owner' USING ERRCODE = '23514';
   END IF;
   SELECT "userId" INTO parent_owner FROM execution_target WHERE id = NEW."executionTargetId";
-  IF FOUND AND parent_owner IS DISTINCT FROM NEW."userId" THEN
-    RAISE EXCEPTION 'cache affinity target must belong to its owner' USING ERRCODE = '23514';
+  IF FOUND AND parent_owner IS DISTINCT FROM NEW."userId" AND NOT EXISTS (
+    SELECT 1 FROM pool_member m
+    JOIN inference_contribution c ON c.id = m."inferenceContributionId"
+    JOIN execution_target t ON t.id = m."executionTargetId"
+    WHERE m."poolId" = NEW."poolId" AND t.id = NEW."executionTargetId"
+      AND c."poolId" = m."poolId" AND c."poolOwnerUserId" = NEW."userId"
+      AND c."contributorUserId" = t."userId"
+      AND c."discoveredModelId" = t."discoveredModelId"
+      AND m."discoveredModelId" = t."discoveredModelId"
+      AND c.state = 'ACTIVE' AND c."expiresAt" > clock_timestamp()
+  ) THEN
+    RAISE EXCEPTION 'cache affinity target requires its owner or active pool contribution' USING ERRCODE = '23514';
   END IF;
   RETURN NEW;
 END;
@@ -236,6 +334,224 @@ DROP TRIGGER IF EXISTS cache_affinity_owner ON cache_affinity_record;
 CREATE TRIGGER cache_affinity_owner
 BEFORE INSERT ON cache_affinity_record
 FOR EACH ROW EXECUTE FUNCTION enforce_cache_affinity_owner();
+
+-- Check each distinct generation once per source statement, rather than
+-- repeating the physical graph lookup for every node/prefix in a bulk write.
+-- Residency publication also rechecks under its bucket lock, so a concurrent
+-- reset between this read and publication still cannot publish old warmth.
+CREATE OR REPLACE FUNCTION enforce_cache_affinity_generation_statement()
+RETURNS trigger LANGUAGE plpgsql AS $affinity_generation_statement$
+DECLARE source_generation RECORD;
+BEGIN
+  FOR source_generation IN
+    SELECT DISTINCT "executionTargetId", "poolId", "cacheGeneration", "userId", "tenantUserId" FROM generation_rows
+  LOOP
+    IF EXISTS (SELECT 1 FROM "user" u WHERE u.id IN (source_generation."userId", source_generation."tenantUserId")
+      AND u."deletionGeneration" IS NOT NULL) OR
+      wsmp_affinity_generation_ready(source_generation."executionTargetId") = false OR
+      source_generation."cacheGeneration" IS DISTINCT FROM
+      COALESCE(wsmp_affinity_scope_generation(source_generation."executionTargetId", source_generation."poolId"), '') THEN
+      RAISE EXCEPTION 'cache affinity generation has reset' USING ERRCODE = '23514';
+    END IF;
+  END LOOP;
+  RETURN NULL;
+END
+$affinity_generation_statement$;
+DROP TRIGGER IF EXISTS cache_affinity_generation_insert ON cache_affinity_record;
+CREATE TRIGGER cache_affinity_generation_insert AFTER INSERT ON cache_affinity_record
+REFERENCING NEW TABLE AS generation_rows FOR EACH STATEMENT
+EXECUTE FUNCTION enforce_cache_affinity_generation_statement();
+DROP TRIGGER IF EXISTS cache_affinity_generation_update ON cache_affinity_record;
+CREATE TRIGGER cache_affinity_generation_update AFTER UPDATE ON cache_affinity_record
+REFERENCING NEW TABLE AS generation_rows FOR EACH STATEMENT
+EXECUTE FUNCTION enforce_cache_affinity_generation_statement();
+DROP TRIGGER IF EXISTS cache_affinity_generation_insert ON cache_affinity_node;
+CREATE TRIGGER cache_affinity_generation_insert AFTER INSERT ON cache_affinity_node
+REFERENCING NEW TABLE AS generation_rows FOR EACH STATEMENT
+EXECUTE FUNCTION enforce_cache_affinity_generation_statement();
+DROP TRIGGER IF EXISTS cache_affinity_generation_update ON cache_affinity_node;
+CREATE TRIGGER cache_affinity_generation_update AFTER UPDATE ON cache_affinity_node
+REFERENCING NEW TABLE AS generation_rows FOR EACH STATEMENT
+EXECUTE FUNCTION enforce_cache_affinity_generation_statement();
+
+-- Residency is an optional, bounded projection, never an access decision.
+-- Request writes merge only the existing bucket and their changed tuples.
+-- Deletions/decreasing expiry can uncover older footprints: mark unknown and
+-- let the statement-bounded background repair walk durable 256-row pages.
+-- No deploy-time scan/backfill: bounded background discovery warms old targets.
+ALTER TABLE cache_affinity_residency DROP CONSTRAINT IF EXISTS cache_affinity_residency_bound;
+ALTER TABLE cache_affinity_residency_cursor DROP CONSTRAINT IF EXISTS cache_affinity_residency_cursor_singleton;
+ALTER TABLE cache_affinity_residency_cursor ADD CONSTRAINT cache_affinity_residency_cursor_singleton CHECK (id = 1);
+-- Every published entry carries its consumer pool, so the reader can apply the
+-- pool-clear scope fence without a second per-request JSON traversal. Buckets
+-- written before entries carried poolId become unknown (repair rebuilds them
+-- from source rows); the constraint below re-validates every bucket anyway.
+UPDATE cache_affinity_residency SET entries = '[]'::jsonb, complete = false,
+  "repairEntries" = '[]'::jsonb, "repairCursor" = NULL,
+  revision = revision + 1, "repairAfter" = clock_timestamp()
+WHERE jsonb_path_exists(entries, '$[*] ? (!exists(@.poolId))')
+  OR jsonb_path_exists("repairEntries", '$[*] ? (!exists(@.poolId))');
+ALTER TABLE cache_affinity_residency ADD CONSTRAINT cache_affinity_residency_bound CHECK (
+  length("cacheGeneration") <= 128 AND
+  jsonb_typeof(entries) = 'array' AND jsonb_array_length(entries) <= 2000
+  AND octet_length(entries::text) <= 4194304
+  AND NOT jsonb_path_exists(entries, '$[*] ? (!exists(@.poolId))')
+  AND jsonb_typeof("repairEntries") = 'array' AND jsonb_array_length("repairEntries") <= 2000
+  AND octet_length("repairEntries"::text) <= 4194304
+  AND revision >= 0
+);
+CREATE INDEX IF NOT EXISTS cache_affinity_record_residency_repair
+  ON cache_affinity_record ("userId", "executionTargetId", id)
+  WHERE "prefixDigest" IS NULL;
+CREATE INDEX IF NOT EXISTS cache_affinity_record_target_generation_repair
+  ON cache_affinity_record ("executionTargetId", "cacheGeneration", id)
+  WHERE "prefixDigest" IS NULL;
+CREATE INDEX IF NOT EXISTS cache_affinity_record_physical_generation_repair
+  ON cache_affinity_record ("executionTargetId", split_part("cacheGeneration", ':pool:', 1), id)
+  WHERE "prefixDigest" IS NULL;
+CREATE INDEX IF NOT EXISTS cache_affinity_record_scope_reclaim
+  ON cache_affinity_record ("userId", "poolId", split_part("cacheGeneration", ':pool:', 2), id);
+CREATE INDEX IF NOT EXISTS cache_affinity_node_scope_reclaim
+  ON cache_affinity_node ("userId", "poolId", split_part("cacheGeneration", ':pool:', 2), id);
+
+CREATE OR REPLACE FUNCTION wsmp_affinity_residency_merge(previous jsonb, added jsonb, removed text[])
+RETURNS jsonb LANGUAGE sql IMMUTABLE AS $residency_merge$
+  SELECT COALESCE(jsonb_agg(e ORDER BY (e->>'expiresAt')::timestamp DESC, e->>'id' DESC), '[]'::jsonb)
+  FROM (
+    SELECT e FROM (
+      SELECT e FROM jsonb_array_elements(previous) e WHERE NOT (e->>'id' = ANY(removed))
+      UNION ALL
+      SELECT e FROM jsonb_array_elements(added) e
+    ) candidates
+    ORDER BY (e->>'expiresAt')::timestamp DESC, e->>'id' DESC LIMIT 2000
+  ) bounded
+$residency_merge$;
+
+CREATE OR REPLACE FUNCTION wsmp_affinity_residency_change(
+  owner_id text, target_id text, removed text[], added jsonb, invalidated text[]
+) RETURNS void LANGUAGE plpgsql AS $residency_change$
+DECLARE bucket cache_affinity_residency%ROWTYPE; physical_owner text; generation text;
+BEGIN
+  SELECT "userId" INTO physical_owner FROM execution_target WHERE id = target_id;
+  IF physical_owner IS NULL THEN
+    SELECT "userId" INTO physical_owner FROM cache_affinity_residency WHERE "executionTargetId" = target_id;
+  END IF;
+  physical_owner := COALESCE(physical_owner, owner_id); -- deleted-parent history only
+  -- Source rows may already be locked. Never wait for another target writer:
+  -- a conflict rolls the whole source statement back (55P03), without any
+  -- half-published projection. No graph lock or FK is acquired here.
+  IF NOT pg_try_advisory_xact_lock(hashtextextended('wsmp:residency:' || target_id, 0)) THEN
+    RAISE EXCEPTION 'cache residency target is busy' USING ERRCODE = '55P03';
+  END IF;
+  INSERT INTO cache_affinity_residency ("executionTargetId", "userId")
+    VALUES (target_id, physical_owner) ON CONFLICT ("executionTargetId") DO NOTHING;
+  SELECT * INTO STRICT bucket FROM cache_affinity_residency
+    WHERE "executionTargetId" = target_id FOR UPDATE NOWAIT;
+  IF bucket."userId" IS DISTINCT FROM physical_owner THEN
+    RAISE EXCEPTION 'cache residency target owner mismatch' USING ERRCODE = '23514';
+  END IF;
+  generation := COALESCE(wsmp_affinity_generation(target_id), bucket."cacheGeneration");
+  IF bucket."cacheGeneration" IS DISTINCT FROM generation THEN
+    bucket."cacheGeneration" := generation;
+    bucket.entries := '[]'::jsonb;
+    bucket.complete := true;
+  END IF;
+  IF EXISTS (SELECT 1 FROM jsonb_array_elements(added) e
+    WHERE split_part(COALESCE(e->>'cacheGeneration', ''), ':pool:', 1) IS DISTINCT FROM bucket."cacheGeneration") THEN
+    RAISE EXCEPTION 'cache affinity generation has reset' USING ERRCODE = '23514';
+  END IF;
+  UPDATE cache_affinity_residency SET
+    "cacheGeneration" = bucket."cacheGeneration",
+    entries = wsmp_affinity_residency_merge(bucket.entries, added, removed),
+    complete = bucket.complete AND NOT (
+      jsonb_array_length(bucket.entries) = 2000 AND EXISTS (
+        SELECT 1 FROM jsonb_array_elements(bucket.entries) e WHERE e->>'id' = ANY(invalidated)
+      )
+    ),
+    revision = bucket.revision + 1,
+    "repairEntries" = '[]'::jsonb, "repairCursor" = NULL,
+    "repairAfter" = clock_timestamp()
+  WHERE "executionTargetId" = target_id;
+END
+$residency_change$;
+
+CREATE OR REPLACE FUNCTION wsmp_affinity_residency_insert()
+RETURNS trigger LANGUAGE plpgsql AS $residency_insert$
+DECLARE scope record; added jsonb;
+BEGIN
+  FOR scope IN SELECT min("userId") AS "userId", "executionTargetId" FROM new_records
+    WHERE "prefixDigest" IS NULL GROUP BY "executionTargetId" ORDER BY "executionTargetId"
+  LOOP
+    SELECT COALESCE(jsonb_agg(to_jsonb(r)), '[]'::jsonb) INTO added FROM (
+      SELECT id, "expiresAt", "sessionId", "estimatedTokens" AS tokens, "cacheGeneration", "poolId",
+        "sharedWithSessionId", "sharedPrefixTokens"
+      FROM new_records WHERE "prefixDigest" IS NULL
+        AND "executionTargetId" = scope."executionTargetId"
+      ORDER BY "expiresAt" DESC, id DESC LIMIT 2000
+    ) r;
+    PERFORM wsmp_affinity_residency_change(scope."userId", scope."executionTargetId", ARRAY[]::text[], added, ARRAY[]::text[]);
+  END LOOP;
+  RETURN NULL;
+END
+$residency_insert$;
+
+CREATE OR REPLACE FUNCTION wsmp_affinity_residency_update()
+RETURNS trigger LANGUAGE plpgsql AS $residency_update$
+DECLARE scope record; added jsonb; removed text[]; invalidated text[];
+BEGIN
+  FOR scope IN SELECT min("userId") AS "userId", "executionTargetId" FROM new_records
+    WHERE "prefixDigest" IS NULL GROUP BY "executionTargetId" ORDER BY "executionTargetId"
+  LOOP
+    SELECT array_agg(n.id), COALESCE(array_agg(n.id) FILTER (WHERE n."expiresAt" < o."expiresAt"), ARRAY[]::text[])
+      INTO removed, invalidated FROM new_records n JOIN old_records o USING (id)
+      WHERE n."prefixDigest" IS NULL AND n."executionTargetId" = scope."executionTargetId";
+    SELECT COALESCE(jsonb_agg(to_jsonb(r)), '[]'::jsonb) INTO added FROM (
+      SELECT id, "expiresAt", "sessionId", "estimatedTokens" AS tokens, "cacheGeneration", "poolId",
+        "sharedWithSessionId", "sharedPrefixTokens"
+      FROM new_records WHERE "prefixDigest" IS NULL
+        AND "executionTargetId" = scope."executionTargetId"
+      ORDER BY "expiresAt" DESC, id DESC LIMIT 2000
+    ) r;
+    PERFORM wsmp_affinity_residency_change(scope."userId", scope."executionTargetId", removed, added, invalidated);
+  END LOOP;
+  RETURN NULL;
+END
+$residency_update$;
+
+CREATE OR REPLACE FUNCTION wsmp_affinity_residency_delete()
+RETURNS trigger LANGUAGE plpgsql AS $residency_delete$
+DECLARE scope record;
+BEGIN
+  FOR scope IN SELECT "executionTargetId" FROM old_records
+    WHERE "prefixDigest" IS NULL GROUP BY "executionTargetId" ORDER BY "executionTargetId"
+  LOOP
+    IF NOT pg_try_advisory_xact_lock(hashtextextended('wsmp:residency:' || scope."executionTargetId", 0)) THEN
+      RAISE EXCEPTION 'cache residency target is busy' USING ERRCODE = '55P03';
+    END IF;
+    PERFORM 1 FROM cache_affinity_residency WHERE "executionTargetId" = scope."executionTargetId" FOR UPDATE NOWAIT;
+  END LOOP;
+  -- Do not deserialize, merge or even copy retained bucket payloads. A sparse
+  -- tenant deletion costs metadata rows, independent of other tenants' JSON.
+  -- Repair reconstructs surviving cohorts under the changed revision.
+  UPDATE cache_affinity_residency SET entries = '[]'::jsonb, complete = false,
+    "repairEntries" = '[]'::jsonb, "repairCursor" = NULL,
+    revision = revision + 1, "repairAfter" = clock_timestamp()
+  WHERE "executionTargetId" IN (
+    SELECT "executionTargetId" FROM old_records WHERE "prefixDigest" IS NULL
+  );
+  RETURN NULL;
+END
+$residency_delete$;
+
+DROP TRIGGER IF EXISTS cache_affinity_residency_insert ON cache_affinity_record;
+CREATE TRIGGER cache_affinity_residency_insert AFTER INSERT ON cache_affinity_record
+  REFERENCING NEW TABLE AS new_records FOR EACH STATEMENT EXECUTE FUNCTION wsmp_affinity_residency_insert();
+DROP TRIGGER IF EXISTS cache_affinity_residency_update ON cache_affinity_record;
+CREATE TRIGGER cache_affinity_residency_update AFTER UPDATE ON cache_affinity_record
+  REFERENCING OLD TABLE AS old_records NEW TABLE AS new_records FOR EACH STATEMENT EXECUTE FUNCTION wsmp_affinity_residency_update();
+DROP TRIGGER IF EXISTS cache_affinity_residency_delete ON cache_affinity_record;
+CREATE TRIGGER cache_affinity_residency_delete AFTER DELETE ON cache_affinity_record
+  REFERENCING OLD TABLE AS old_records FOR EACH STATEMENT EXECUTE FUNCTION wsmp_affinity_residency_delete();
 
 -- Class-H engine-load minutes; occupancy is display-only (0..1).
 ALTER TABLE engine_load_rollup_minute DROP CONSTRAINT IF EXISTS engine_load_rollup_minute_shape_check;
@@ -253,13 +569,59 @@ ALTER TABLE engine_load_rollup_minute ADD CONSTRAINT engine_load_rollup_minute_s
   AND "prefixCacheHits" >= 0 AND "prefixCacheQueries" >= 0
 );
 
+-- Class-H node-metrics minutes for CLI node-card sparklines (min/avg/max).
+ALTER TABLE node_metrics_minute DROP CONSTRAINT IF EXISTS node_metrics_minute_shape_check;
+ALTER TABLE node_metrics_minute ADD CONSTRAINT node_metrics_minute_shape_check CHECK (
+  length("ownerUserId") BETWEEN 1 AND 128
+  AND length("cliDeviceId") BETWEEN 1 AND 128
+  AND samples >= 0 AND "cpuSamples" >= 0 AND "memorySamples" >= 0
+  AND "cpuSamples" <= samples AND "memorySamples" <= samples
+  AND ("minCpuPercent" IS NULL OR ("minCpuPercent" >= 0 AND "minCpuPercent" <= 100))
+  AND ("maxCpuPercent" IS NULL OR ("maxCpuPercent" >= 0 AND "maxCpuPercent" <= 100))
+  AND ("sumCpuPercent" IS NULL OR "sumCpuPercent" >= 0)
+  AND ("minMemoryAvailableMiB" IS NULL OR "minMemoryAvailableMiB" >= 0)
+  AND ("maxMemoryAvailableMiB" IS NULL OR "maxMemoryAvailableMiB" >= 0)
+  AND ("sumMemoryAvailableMiB" IS NULL OR "sumMemoryAvailableMiB" >= 0)
+  AND ("minMemoryUsedPercent" IS NULL OR ("minMemoryUsedPercent" >= 0 AND "minMemoryUsedPercent" <= 100))
+  AND ("maxMemoryUsedPercent" IS NULL OR ("maxMemoryUsedPercent" >= 0 AND "maxMemoryUsedPercent" <= 100))
+  AND ("sumMemoryUsedPercent" IS NULL OR "sumMemoryUsedPercent" >= 0)
+  AND ("maxGpuUtilizationPercent" IS NULL OR ("maxGpuUtilizationPercent" >= 0 AND "maxGpuUtilizationPercent" <= 100))
+);
+
 -- Disposable class H feedback; no graph locks or foreign keys.
+CREATE OR REPLACE FUNCTION capacity_kv_eviction_session_ids_ok(ids text[])
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+PARALLEL SAFE
+AS $$
+  SELECT array_position(ids, NULL) IS NULL
+     AND NOT EXISTS (
+       SELECT 1 FROM unnest(ids) AS session_id
+        WHERE length(session_id) NOT BETWEEN 1 AND 128
+     );
+$$;
+
 ALTER TABLE capacity_kv_eviction DROP CONSTRAINT IF EXISTS capacity_kv_eviction_shape_check;
 ALTER TABLE capacity_kv_eviction ADD CONSTRAINT capacity_kv_eviction_shape_check CHECK (
   "cutFraction" >= 0 AND "cutFraction" <= 1
   AND length("capacityId") BETWEEN 1 AND 128
-  AND length("lastSessionId") BETWEEN 1 AND 128
+  AND cardinality("sessionIds") <= 16
+  AND capacity_kv_eviction_session_ids_ok("sessionIds")
+  AND "missCount" >= 0
+  AND "continuationCount" >= 0
+  AND "missCount" <= "continuationCount"
   AND "expiresAt" >= "observedAt"
+);
+
+-- Owner-written node budgets and labels. Values above 1e6 GiB or the wrong
+-- JSON shape are rejected here; kind-appropriate GPU keys are an app check.
+ALTER TABLE cli_device DROP CONSTRAINT IF EXISTS cli_device_node_budget_check;
+ALTER TABLE cli_device ADD CONSTRAINT cli_device_node_budget_check CHECK (
+  cardinality(labels) <= 32
+  AND ("usableMemoryGb" IS NULL OR ("usableMemoryGb" >= 0 AND "usableMemoryGb" <= 1000000))
+  AND ("usableRamGb" IS NULL OR ("usableRamGb" >= 0 AND "usableRamGb" <= 1000000))
+  AND ("usableVramGb" IS NULL OR jsonb_typeof("usableVramGb") = 'object')
 );
 
 -- Digest-only class H state; indexed probes are ordered without a population sort.
@@ -277,9 +639,9 @@ FOR EACH ROW EXECUTE FUNCTION enforce_cache_affinity_owner();
 CREATE OR REPLACE FUNCTION enforce_cache_affinity_node_immutable()
 RETURNS trigger LANGUAGE plpgsql AS $cache_affinity_node_immutable$
 BEGIN
-  IF (NEW."userId", NEW."tenantUserId", NEW."poolId", NEW."executionTargetId",
+  IF (NEW."userId", NEW."tenantUserId", NEW."poolId", NEW."executionTargetId", NEW."cacheGeneration",
       NEW."rootDigest", NEW."nodeDigest", NEW.depth, NEW."sessionId") IS DISTINCT FROM
-     (OLD."userId", OLD."tenantUserId", OLD."poolId", OLD."executionTargetId",
+    (OLD."userId", OLD."tenantUserId", OLD."poolId", OLD."executionTargetId", OLD."cacheGeneration",
       OLD."rootDigest", OLD."nodeDigest", OLD.depth, OLD."sessionId") THEN
     RAISE EXCEPTION 'cache affinity node identity is immutable' USING ERRCODE = '23514';
   END IF;
@@ -314,6 +676,66 @@ ALTER TABLE pool_member ADD CONSTRAINT pool_member_tier_shape_check CHECK (
 CREATE UNIQUE INDEX IF NOT EXISTS pool_member_public_order_unique
   ON pool_member ("poolId", "publicOrder") WHERE tier = 'PUBLIC_OVERFLOW';
 
+-- Member-scoped routing rules: pool deletes cascade. Targeted memberId rules
+-- are deleted with the member; exclude rules SET NULL and become pool-wide.
+-- exclude without a member is invalid on write; a memberId must be PRIMARY.
+ALTER TABLE pool_routing_rule DROP CONSTRAINT IF EXISTS pool_routing_rule_shape_check;
+ALTER TABLE pool_routing_rule ADD CONSTRAINT pool_routing_rule_shape_check CHECK (
+  position BETWEEN 0 AND 15
+  AND length(metric) BETWEEN 1 AND 64
+  AND metric ~ '^[A-Za-z0-9_.:-]{1,64}$'
+  AND aggregate IN ('max', 'min', 'avg')
+  AND op IN ('>', '>=', '<', '<=')
+  AND effect IN ('full', 'avoid')
+  AND "threshold" = "threshold"
+  AND "threshold" BETWEEN -1e308 AND 1e308
+  AND (NOT exclude OR "memberId" IS NOT NULL)
+  AND ("memberId" IS NULL OR length("memberId") BETWEEN 1 AND 128)
+  AND (labels IS NULL OR jsonb_typeof(labels) = 'object')
+);
+
+ALTER TABLE pool_routing_rule DROP CONSTRAINT IF EXISTS pool_routing_rule_memberId_fkey;
+ALTER TABLE pool_routing_rule
+  ADD CONSTRAINT pool_routing_rule_memberId_fkey
+  FOREIGN KEY ("memberId") REFERENCES pool_member(id)
+  ON DELETE SET NULL ON UPDATE CASCADE;
+
+CREATE OR REPLACE FUNCTION enforce_pool_routing_rule_member()
+RETURNS trigger LANGUAGE plpgsql AS $pool_routing_rule_member$
+BEGIN
+  IF NEW."memberId" IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM pool_member
+     WHERE id = NEW."memberId" AND "poolId" = NEW."poolId" AND tier = 'PRIMARY'
+  ) THEN
+    RAISE EXCEPTION 'pool routing rule member must be a PRIMARY member of the pool'
+      USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$pool_routing_rule_member$;
+
+DROP TRIGGER IF EXISTS pool_routing_rule_member ON pool_routing_rule;
+CREATE TRIGGER pool_routing_rule_member
+BEFORE INSERT OR UPDATE OF "poolId", "memberId" ON pool_routing_rule
+FOR EACH ROW EXECUTE FUNCTION enforce_pool_routing_rule_member();
+
+CREATE OR REPLACE FUNCTION pool_routing_rule_on_member_delete()
+RETURNS trigger LANGUAGE plpgsql AS $pool_routing_rule_on_member_delete$
+BEGIN
+  DELETE FROM pool_routing_rule
+   WHERE "memberId" = OLD.id AND exclude IS NOT TRUE;
+  UPDATE pool_routing_rule
+     SET "memberId" = NULL, exclude = false
+   WHERE "memberId" = OLD.id AND exclude IS TRUE;
+  RETURN OLD;
+END;
+$pool_routing_rule_on_member_delete$;
+
+DROP TRIGGER IF EXISTS pool_routing_rule_on_member_delete ON pool_member;
+CREATE TRIGGER pool_routing_rule_on_member_delete
+BEFORE DELETE ON pool_member
+FOR EACH ROW EXECUTE FUNCTION pool_routing_rule_on_member_delete();
+
 -- Fallback redesign: a pool's plain name never leaves the deployment.
 -- PRIMARY members are always local (discovered) models; provider models can
 -- only be PUBLIC_OVERFLOW (external fallback) members, which the runtime uses
@@ -332,7 +754,18 @@ BEGIN
     FROM execution_target WHERE id = NEW."executionTargetId";
   SELECT "userId" INTO pool_owner
     FROM model_pool WHERE id = NEW."poolId";
-  IF target_owner IS DISTINCT FROM pool_owner THEN
+  IF (target_owner IS DISTINCT FROM pool_owner OR NEW."inferenceContributionId" IS NOT NULL) AND NOT (
+    NEW.tier = 'PRIMARY' AND EXISTS (
+      SELECT 1 FROM inference_contribution contribution
+      WHERE contribution.id = NEW."inferenceContributionId"
+        AND contribution.state = 'ACTIVE'
+        AND contribution."poolId" = NEW."poolId"
+        AND contribution."poolOwnerUserId" = pool_owner
+        AND contribution."contributorUserId" = target_owner
+        AND contribution."discoveredModelId" = NEW."discoveredModelId"
+        AND contribution."discoveredModelId" = (SELECT "discoveredModelId" FROM execution_target WHERE id = NEW."executionTargetId")
+    )
+  ) THEN
     RAISE EXCEPTION 'pool member target must have the same owner as its pool'
       USING ERRCODE = '23514';
   END IF;
@@ -350,8 +783,295 @@ $pool_member_tier_source$;
 
 DROP TRIGGER IF EXISTS pool_member_tier_source ON pool_member;
 CREATE TRIGGER pool_member_tier_source
-BEFORE INSERT OR UPDATE OF "poolId", "executionTargetId", tier, "publicOrder" ON pool_member
+BEFORE INSERT OR UPDATE OF "poolId", "executionTargetId", "discoveredModelId", "inferenceContributionId", tier, "publicOrder" ON pool_member
 FOR EACH ROW EXECUTE FUNCTION enforce_pool_member_tier_source();
+
+CREATE OR REPLACE FUNCTION enforce_inference_contribution_transition()
+RETURNS trigger LANGUAGE plpgsql AS $inference_contribution_transition$
+BEGIN
+  IF TG_OP = 'INSERT' AND (NEW.state <> 'PENDING' OR NEW."acceptedAt" IS NOT NULL OR NEW."revokedAt" IS NOT NULL) THEN
+    RAISE EXCEPTION 'inference contributions begin pending' USING ERRCODE = '23514';
+  END IF;
+  IF TG_OP = 'UPDATE' THEN
+    IF (NEW.id, NEW."poolId", NEW."poolOwnerUserId", NEW."contributorUserId", NEW."discoveredModelId", NEW."expiresAt")
+      IS DISTINCT FROM (OLD.id, OLD."poolId", OLD."poolOwnerUserId", OLD."contributorUserId", OLD."discoveredModelId", OLD."expiresAt") THEN
+      RAISE EXCEPTION 'inference contribution binding is immutable' USING ERRCODE = '23514';
+    END IF;
+    IF OLD.state = 'REVOKED' AND NEW.state <> 'REVOKED' OR OLD.state = 'ACTIVE' AND NEW.state = 'PENDING' THEN
+      RAISE EXCEPTION 'revoked inference consent cannot be restored' USING ERRCODE = '23514';
+    END IF;
+    IF NEW.state = 'ACTIVE' AND OLD.state = 'PENDING' AND (OLD."expiresAt" <= now() OR NEW."acceptedAt" IS NULL) THEN
+      RAISE EXCEPTION 'expired inference offer cannot be accepted' USING ERRCODE = '23514';
+    END IF;
+    IF NEW."acceptedAt" IS DISTINCT FROM OLD."acceptedAt"
+       AND NOT (OLD.state = 'PENDING' AND NEW.state = 'ACTIVE' AND NEW."acceptedAt" IS NOT NULL) THEN
+      RAISE EXCEPTION 'inference contribution acceptance evidence is immutable' USING ERRCODE = '23514';
+    END IF;
+  END IF;
+  IF NEW."contributorUserId" = NEW."poolOwnerUserId" THEN
+    RAISE EXCEPTION 'inference contribution must be between independent owners' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$inference_contribution_transition$;
+DROP TRIGGER IF EXISTS inference_contribution_transition ON inference_contribution;
+CREATE TRIGGER inference_contribution_transition BEFORE INSERT OR UPDATE ON inference_contribution
+FOR EACH ROW EXECUTE FUNCTION enforce_inference_contribution_transition();
+
+CREATE OR REPLACE FUNCTION enforce_deployment_integrity()
+RETURNS trigger LANGUAGE plpgsql AS $deployment_integrity$
+DECLARE owner_id TEXT;
+BEGIN
+  IF TG_TABLE_NAME = 'deployment_config_revision' AND TG_OP = 'UPDATE' THEN
+    RAISE EXCEPTION 'deployment recipe revisions are immutable' USING ERRCODE = '23514';
+  ELSIF TG_TABLE_NAME = 'deployment_config' THEN
+    -- A null pool is a detached recipe (its pool was deleted); it cannot start instances.
+    IF NEW."poolId" IS NOT NULL AND NOT EXISTS (SELECT 1 FROM model_pool WHERE id = NEW."poolId" AND "userId" = NEW."userId") THEN
+      RAISE EXCEPTION 'deployment pool must belong to recipe owner' USING ERRCODE = '23514';
+    END IF;
+  ELSIF TG_TABLE_NAME = 'deployment_instance' THEN
+    -- Operator need normalisation: generic writers that stop, restart or start an
+    -- instance never have to know about it. A RESTART need ("stopped, needs you") CARRIED
+    -- OVER unchanged from the old row ends once the instance is no longer meant to run or
+    -- is no longer stopped. Values the writer sets in this update are never rewritten: a
+    -- contradictory explicit write (RESTART on a stopping instance, a lone timestamp) hits
+    -- deployment_instance_operator_shape and fails.
+    IF TG_OP = 'UPDATE' THEN
+      IF NEW."needsOperator" = 'RESTART' AND OLD."needsOperator" IS NOT DISTINCT FROM 'RESTART'
+        AND NEW."needsOperatorSince" IS NOT DISTINCT FROM OLD."needsOperatorSince"
+        AND NOT (NEW."desiredState" = 'RUNNING' AND NEW."observedState" IN ('STOPPED', 'FAILED')) THEN
+        NEW."needsOperator" := NULL;
+        NEW."needsOperatorSince" := NULL;
+      END IF;
+    END IF;
+    IF (TG_OP = 'INSERT' OR (TG_OP = 'UPDATE' AND NEW."desiredState" = 'RUNNING'
+      AND (OLD."desiredState" = 'STOPPED' OR (NEW."observedState" = 'STARTING' AND OLD."observedState" <> 'STARTING'))))
+      AND NOT EXISTS (SELECT 1 FROM "user" owner WHERE owner.id = NEW."userId" AND owner."deletionRequestedAt" IS NULL
+      AND (owner.banned IS NOT TRUE OR owner."banExpires" <= now())) THEN
+      RAISE EXCEPTION 'inactive owners cannot acquire deployment claims' USING ERRCODE = '23514';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM deployment_config config JOIN deployment_config_revision revision ON revision."configId" = config.id
+      JOIN deployment_run run ON run.id = NEW."runId" JOIN deployment_plan plan ON plan.id = run."planId"
+      WHERE config.id = NEW."configId" AND config."userId" = NEW."userId" AND revision.id = NEW."revisionId" AND plan."userId" = NEW."userId") THEN
+      RAISE EXCEPTION 'deployment instance binding must have one owner' USING ERRCODE = '23514';
+    END IF;
+    IF TG_OP = 'INSERT' AND NOT EXISTS (SELECT 1 FROM deployment_config WHERE id = NEW."configId" AND "poolId" IS NOT NULL) THEN
+      RAISE EXCEPTION 'detached deployment recipes cannot start instances' USING ERRCODE = '23514';
+    END IF;
+  ELSIF TG_TABLE_NAME IN ('deployment_instance_node', 'deployment_step') THEN
+    SELECT "userId" INTO owner_id FROM deployment_instance WHERE id = NEW."instanceId";
+    IF NOT EXISTS (SELECT 1 FROM cli_device WHERE id = NEW."cliDeviceId" AND "userId" = owner_id) THEN
+      RAISE EXCEPTION 'deployment rank cannot control another owner device' USING ERRCODE = '23514';
+    END IF;
+    IF TG_OP = 'UPDATE' AND (NEW."instanceId", NEW."cliDeviceId", NEW.rank) IS DISTINCT FROM (OLD."instanceId", OLD."cliDeviceId", OLD.rank) THEN
+      RAISE EXCEPTION 'deployment rank binding is immutable' USING ERRCODE = '23514';
+    END IF;
+    IF TG_TABLE_NAME = 'deployment_step' AND TG_OP = 'UPDATE' THEN
+      IF (NEW.intent, NEW."intentHash", NEW.phase, NEW.sequence) IS DISTINCT FROM (OLD.intent, OLD."intentHash", OLD.phase, OLD.sequence) THEN
+        RAISE EXCEPTION 'deployment job intent is immutable' USING ERRCODE = '23514';
+      END IF;
+      -- Operator column normalisation: generic writers (result settlement, inventory
+      -- adoption, deadline resets, undeliver) never have to know about operator terminals.
+      -- A terminal id lives only while AWAITING_OPERATOR or RUNNING; PENDING is a fresh
+      -- attempt with no operator state; history stays in deployment_operator_event. Only
+      -- values CARRIED OVER unchanged from the old row are cleared: a value the writer sets
+      -- in this update that contradicts the new state hits deployment_step_operator_shape.
+      IF NEW.state NOT IN ('AWAITING_OPERATOR', 'RUNNING')
+        AND NEW."operatorTerminalId" IS NOT DISTINCT FROM OLD."operatorTerminalId" THEN
+        NEW."operatorTerminalId" := NULL;
+      END IF;
+      IF NEW.state = 'PENDING' THEN
+        IF NEW."operatorSince" IS NOT DISTINCT FROM OLD."operatorSince" THEN
+          NEW."operatorSince" := NULL;
+        END IF;
+        IF NEW."operatorAcceptedAt" IS NOT DISTINCT FROM OLD."operatorAcceptedAt" THEN
+          NEW."operatorAcceptedAt" := NULL;
+        END IF;
+        IF NEW."operatorLastExit" IS NOT DISTINCT FROM OLD."operatorLastExit" THEN
+          NEW."operatorLastExit" := NULL;
+        END IF;
+      END IF;
+      -- Operator terminals (interactive commands): a step reaches AWAITING_OPERATOR only from
+      -- RUNNING (the dispatched job drew its confirm screen) and leaves it only for RUNNING (the
+      -- person pressed Enter), PENDING (reopen / reconnect), FAILED (cancelled) or SUCCEEDED
+      -- (a final result that overtook its "operator running" report; it carries the
+      -- acceptance in the same update).
+      IF NEW.state = 'AWAITING_OPERATOR' AND OLD.state NOT IN ('RUNNING', 'AWAITING_OPERATOR') THEN
+        RAISE EXCEPTION 'deployment step enters AWAITING_OPERATOR only from RUNNING' USING ERRCODE = '23514';
+      END IF;
+      IF OLD.state = 'AWAITING_OPERATOR' AND NEW.state NOT IN ('AWAITING_OPERATOR', 'RUNNING', 'PENDING', 'FAILED', 'SUCCEEDED') THEN
+        RAISE EXCEPTION 'deployment step leaves AWAITING_OPERATOR only for RUNNING, PENDING, FAILED or SUCCEEDED' USING ERRCODE = '23514';
+      END IF;
+      IF OLD.state = 'AWAITING_OPERATOR' AND NEW.state = 'SUCCEEDED' AND (
+        NEW."operatorAcceptedAt" IS NULL OR NEW."operatorSince" IS DISTINCT FROM OLD."operatorSince") THEN
+        RAISE EXCEPTION 'only an accepted operator command can succeed' USING ERRCODE = '23514';
+      END IF;
+      -- The open time belongs to the terminal: a retry cycle in the same terminal
+      -- (AWAITING -> RUNNING -> AWAITING) keeps it.
+      IF OLD.state = 'RUNNING' AND NEW.state = 'AWAITING_OPERATOR'
+        AND OLD."operatorTerminalId" IS NOT NULL AND OLD."operatorSince" IS NOT NULL
+        AND NEW."operatorTerminalId" IS NOT DISTINCT FROM OLD."operatorTerminalId"
+        AND NEW."operatorSince" IS DISTINCT FROM OLD."operatorSince" THEN
+        RAISE EXCEPTION 'an operator terminal keeps its open time' USING ERRCODE = '23514';
+      END IF;
+      IF OLD.state = 'AWAITING_OPERATOR' AND NEW.state = 'AWAITING_OPERATOR' AND (
+        NEW."operatorSince" IS DISTINCT FROM OLD."operatorSince"
+        OR (NEW."operatorTerminalId" IS NOT NULL AND NEW."operatorTerminalId" IS DISTINCT FROM OLD."operatorTerminalId")) THEN
+        RAISE EXCEPTION 'an awaiting operator terminal can only close; reopen through PENDING' USING ERRCODE = '23514';
+      END IF;
+      IF OLD.state = 'AWAITING_OPERATOR' AND NEW.state = 'RUNNING' AND (
+        OLD."operatorTerminalId" IS NULL OR NEW."operatorTerminalId" IS DISTINCT FROM OLD."operatorTerminalId"
+        OR NEW."operatorAcceptedAt" IS NULL OR NEW."operatorSince" IS DISTINCT FROM OLD."operatorSince") THEN
+        RAISE EXCEPTION 'only an open operator terminal can be accepted' USING ERRCODE = '23514';
+      END IF;
+    ELSIF TG_TABLE_NAME = 'deployment_step' THEN
+      -- Nested: NEW.state does not exist on deployment_instance_node rows.
+      IF NEW.state = 'AWAITING_OPERATOR' THEN
+        RAISE EXCEPTION 'deployment step enters AWAITING_OPERATOR only from RUNNING' USING ERRCODE = '23514';
+      END IF;
+    END IF;
+    IF TG_TABLE_NAME = 'deployment_step' THEN
+      IF NOT EXISTS (SELECT 1 FROM deployment_run run JOIN deployment_plan plan ON plan.id = run."planId" WHERE run.id = NEW."runId" AND plan."userId" = owner_id) THEN
+        RAISE EXCEPTION 'deployment step run must share instance owner' USING ERRCODE = '23514';
+      END IF;
+      IF TG_OP = 'UPDATE' THEN
+        -- Dispatch only. Recording an operator's accept (AWAITING_OPERATOR -> RUNNING) is
+        -- evidence of a command already running (the CLI writes `go` on Enter), not a new
+        -- start, so it is never refused here.
+        IF NEW.state = 'RUNNING' AND OLD.state NOT IN ('RUNNING', 'AWAITING_OPERATOR') AND lower(NEW.phase) <> 'stop' AND NOT EXISTS (
+          SELECT 1 FROM "user" owner WHERE owner.id = owner_id AND owner."deletionRequestedAt" IS NULL
+            AND (owner.banned IS NOT TRUE OR owner."banExpires" <= now())) THEN
+          RAISE EXCEPTION 'inactive owners cannot start deployment jobs' USING ERRCODE = '23514';
+        END IF;
+      END IF;
+    ELSIF TG_TABLE_NAME = 'deployment_instance_node' AND TG_OP = 'UPDATE' THEN
+      IF NEW."claimHeld" AND NOT OLD."claimHeld" AND NOT EXISTS (
+        SELECT 1 FROM "user" owner WHERE owner.id = owner_id AND owner."deletionRequestedAt" IS NULL
+          AND (owner.banned IS NOT TRUE OR owner."banExpires" <= now())) THEN
+        RAISE EXCEPTION 'inactive owners cannot reclaim deployment resources' USING ERRCODE = '23514';
+      END IF;
+      -- Retaking a claim covers resources released without proof of a stop (interactive
+      -- commands, banned-owner policy): a generic reclaim never has to know about it. An
+      -- explicit contradictory write hits deployment_instance_node_held_unknown.
+      IF NEW."claimHeld" AND NOT OLD."claimHeld"
+        AND NEW."heldUnknownSince" IS NOT DISTINCT FROM OLD."heldUnknownSince" THEN
+        NEW."heldUnknownSince" := NULL;
+      END IF;
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$deployment_integrity$;
+DO $deployment_integrity_triggers$
+DECLARE relation TEXT;
+BEGIN
+  FOREACH relation IN ARRAY ARRAY['deployment_config','deployment_config_revision','deployment_instance','deployment_instance_node','deployment_step'] LOOP
+    EXECUTE format('DROP TRIGGER IF EXISTS deployment_integrity ON %I', relation);
+    EXECUTE format('CREATE TRIGGER deployment_integrity BEFORE INSERT OR UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION enforce_deployment_integrity()', relation);
+  END LOOP;
+END;
+$deployment_integrity_triggers$;
+ALTER TABLE deployment_instance_node DROP CONSTRAINT IF EXISTS deployment_instance_node_bounds;
+ALTER TABLE deployment_instance_node ADD CONSTRAINT deployment_instance_node_bounds
+  CHECK (rank BETWEEN 0 AND 63 AND port BETWEEN 1024 AND 65535 AND ("distPort" IS NULL OR "distPort" BETWEEN 1024 AND 65535) AND ("claimHeld" OR "stoppedAt" IS NOT NULL));
+CREATE UNIQUE INDEX IF NOT EXISTS deployment_instance_node_held_port ON deployment_instance_node ("cliDeviceId", port) WHERE "claimHeld";
+-- Resources released without proof the service stopped stay reserved for placement
+-- (deployment-service loadDeploymentState) but never alongside a held claim.
+ALTER TABLE deployment_instance_node DROP CONSTRAINT IF EXISTS deployment_instance_node_held_unknown;
+ALTER TABLE deployment_instance_node ADD CONSTRAINT deployment_instance_node_held_unknown
+  CHECK ("heldUnknownSince" IS NULL OR NOT "claimHeld");
+-- The reconciler's per-tick status-check sweep pages these rows by id; the table keeps every
+-- rank ever deployed, so only the (rare) held-unknown rows are indexed.
+CREATE INDEX IF NOT EXISTS deployment_instance_node_held_unknown_id
+  ON deployment_instance_node (id) WHERE "heldUnknownSince" IS NOT NULL;
+
+-- Operator terminals of interactive steps. Row shape only (the deployment_integrity
+-- trigger first clears values carried over from the old row; explicit contradictory
+-- writes fail here); transitions are in
+-- enforce_deployment_integrity. Operator columns exist only on an interactive
+-- prepare/start/after_join/stop intent; a terminal id only while AWAITING_OPERATOR or
+-- RUNNING; AWAITING_OPERATOR has an open time and no wall-clock deadline; PENDING carries
+-- no operator state (a reopen or reconnect starts a fresh terminal).
+ALTER TABLE deployment_step DROP CONSTRAINT IF EXISTS deployment_step_operator_shape;
+ALTER TABLE deployment_step ADD CONSTRAINT deployment_step_operator_shape CHECK (
+  ("operatorTerminalId" IS NULL
+    OR (state IN ('AWAITING_OPERATOR', 'RUNNING') AND length("operatorTerminalId") BETWEEN 1 AND 128))
+  AND (state <> 'AWAITING_OPERATOR' OR ("operatorSince" IS NOT NULL AND deadline IS NULL))
+  AND ("operatorAcceptedAt" IS NULL OR "operatorSince" IS NOT NULL)
+  AND ("operatorLastExit" IS NULL OR "operatorSince" IS NOT NULL)
+  AND (state <> 'PENDING' OR ("operatorTerminalId" IS NULL AND "operatorSince" IS NULL
+    AND "operatorAcceptedAt" IS NULL AND "operatorLastExit" IS NULL))
+  AND (("operatorTerminalId" IS NULL AND "operatorSince" IS NULL)
+    -- IS TRUE: a missing key yields NULL, which a CHECK would accept.
+    OR (intent -> 'interactive' = 'true'::jsonb
+      AND intent ->> 'action' IN ('prepare', 'start', 'after_join', 'stop')) IS TRUE));
+-- needsOperator and its timestamp travel together; RESTART ("stopped, needs you") only
+-- for an instance that should run but has stopped. The trigger clears a carried-over
+-- RESTART; an explicit contradictory write fails here.
+ALTER TABLE deployment_instance DROP CONSTRAINT IF EXISTS deployment_instance_operator_shape;
+ALTER TABLE deployment_instance ADD CONSTRAINT deployment_instance_operator_shape CHECK (
+  ("needsOperator" IS NULL) = ("needsOperatorSince" IS NULL)
+  AND ("needsOperator" IS DISTINCT FROM 'RESTART'
+    OR ("desiredState" = 'RUNNING' AND "observedState" IN ('STOPPED', 'FAILED'))));
+
+-- Operator audit log: plain ids, no foreign keys (drained on user delete by
+-- USER_PLAIN_ID_HISTORY_TABLES), no command text, append-only. Deletes stay allowed
+-- for that drain and the deleted-user purge.
+ALTER TABLE deployment_operator_event DROP CONSTRAINT IF EXISTS deployment_operator_event_shape;
+ALTER TABLE deployment_operator_event ADD CONSTRAINT deployment_operator_event_shape CHECK (
+  rank BETWEEN 0 AND 63
+  AND action IN ('prepare', 'start', 'after_join', 'stop')
+  AND length("userId") BETWEEN 1 AND 128
+  AND length("instanceId") BETWEEN 1 AND 128
+  AND length("stepId") BETWEEN 1 AND 128
+  AND length("cliDeviceId") BETWEEN 1 AND 128
+  AND ("exitCode" IS NULL OR outcome IN ('succeeded', 'failed', 'closed')));
+CREATE OR REPLACE FUNCTION enforce_deployment_operator_event_append_only()
+RETURNS trigger LANGUAGE plpgsql AS $deployment_operator_event_append_only$
+BEGIN
+  RAISE EXCEPTION 'deployment operator events are append-only' USING ERRCODE = '23514';
+END;
+$deployment_operator_event_append_only$;
+DROP TRIGGER IF EXISTS deployment_operator_event_append_only ON deployment_operator_event;
+CREATE TRIGGER deployment_operator_event_append_only BEFORE UPDATE ON deployment_operator_event
+FOR EACH ROW EXECUTE FUNCTION enforce_deployment_operator_event_append_only();
+
+CREATE OR REPLACE FUNCTION cleanup_stopped_deployment_owner()
+RETURNS trigger LANGUAGE plpgsql AS $deployment_owner_cleanup$
+BEGIN
+  IF EXISTS (SELECT 1 FROM deployment_instance_node node JOIN deployment_instance instance ON instance.id = node."instanceId"
+    WHERE instance."userId" = OLD.id AND node."claimHeld") THEN
+    RAISE EXCEPTION 'deployment processes must be confirmed stopped before deleting their owner' USING ERRCODE = '23514';
+  END IF;
+  DELETE FROM deployment_step WHERE "instanceId" IN (SELECT id FROM deployment_instance WHERE "userId" = OLD.id); -- policy: bounded-delete
+  DELETE FROM deployment_instance_node WHERE "instanceId" IN (SELECT id FROM deployment_instance WHERE "userId" = OLD.id); -- policy: bounded-delete
+  DELETE FROM deployment_instance WHERE "userId" = OLD.id; -- policy: bounded-delete
+  DELETE FROM deployment_config WHERE "userId" = OLD.id; -- policy: bounded-delete
+  DELETE FROM deployment_plan WHERE "userId" = OLD.id; -- policy: bounded-delete
+  RETURN OLD;
+END;
+$deployment_owner_cleanup$;
+DROP TRIGGER IF EXISTS deployment_owner_cleanup ON "user";
+CREATE TRIGGER deployment_owner_cleanup BEFORE DELETE ON "user"
+FOR EACH ROW EXECUTE FUNCTION cleanup_stopped_deployment_owner();
+
+CREATE OR REPLACE FUNCTION cleanup_stopped_deployment_device()
+RETURNS trigger LANGUAGE plpgsql AS $deployment_device_cleanup$
+DECLARE instances TEXT[];
+BEGIN
+  SELECT array_agg("instanceId") INTO instances FROM deployment_instance_node WHERE "cliDeviceId" = OLD.id;
+  IF EXISTS (SELECT 1 FROM deployment_instance_node WHERE "instanceId" = ANY(instances) AND "claimHeld") THEN
+    RAISE EXCEPTION 'deployment group must be confirmed stopped before deleting its device' USING ERRCODE = '23514';
+  END IF;
+  DELETE FROM deployment_step WHERE "instanceId" = ANY(instances); -- policy: bounded-delete
+  DELETE FROM deployment_instance_node WHERE "instanceId" = ANY(instances); -- policy: bounded-delete
+  DELETE FROM deployment_instance WHERE id = ANY(instances); -- policy: bounded-delete
+  RETURN OLD;
+END;
+$deployment_device_cleanup$;
+DROP TRIGGER IF EXISTS deployment_device_cleanup ON cli_device;
+CREATE TRIGGER deployment_device_cleanup BEFORE DELETE ON cli_device
+FOR EACH ROW EXECUTE FUNCTION cleanup_stopped_deployment_device();
 
 -- The former "remove members before disabling / revoking acknowledgement"
 -- rules are gone: disabling fallback keeps members configured and the runtime
@@ -501,11 +1221,16 @@ ALTER TABLE response_stickiness_record
 -- on rollback, so no writer can observe an unenforced compatibility window.
 DROP TRIGGER IF EXISTS response_stickiness_provider_binding_immutable
   ON response_stickiness_record;
+-- Compatibility backfills run under the deploy's exclusive table locks and
+-- are audited before these guards are reinstalled. They must not be mistaken
+-- for application mutations of an already persisted historical identity.
+DROP TRIGGER IF EXISTS stickiness_execution_target_consistency ON response_stickiness_record;
+DROP TRIGGER IF EXISTS relay_request_execution_target_consistency ON relay_request;
 
 CREATE OR REPLACE FUNCTION enforce_response_stickiness_provider_binding_immutable()
 RETURNS trigger LANGUAGE plpgsql AS $response_stickiness_provider_binding_immutable$
 BEGIN
-  IF NEW."routingVersion" >= 3 AND (
+  IF (OLD."routingVersion" >= 3 OR NEW."routingVersion" >= 3) AND (
     OLD."routingVersion" < 3
     OR NEW."routingVersion" IS DISTINCT FROM OLD."routingVersion"
     OR NEW."userId" IS DISTINCT FROM OLD."userId"
@@ -715,7 +1440,10 @@ BEGIN
   SELECT true, "userId", "inferenceCapacityId" INTO target_found, target_owner, target_capacity
     FROM execution_target WHERE id = NEW."executionTargetId";
   IF request_owner IS NULL OR request_owner <> NEW."userId"
-     OR (target_found AND (target_owner <> NEW."userId"
+     OR (target_found AND ((target_owner <> NEW."userId" AND NOT (
+       wsmp_pool_target_inference_authorized(NEW."poolId", NEW."executionTargetId")
+       OR (TG_OP = 'UPDATE' AND (NEW."userId", NEW."poolId", NEW."poolMemberId", NEW."executionTargetId", NEW."capacityId", NEW."admissionRequestId")
+         IS NOT DISTINCT FROM (OLD."userId", OLD."poolId", OLD."poolMemberId", OLD."executionTargetId", OLD."capacityId", OLD."admissionRequestId"))))
        OR target_capacity IS DISTINCT FROM NEW."capacityId")) THEN
     RAISE EXCEPTION 'capacity admission references must share owner and physical capacity'
       USING ERRCODE = '23514';
@@ -769,9 +1497,13 @@ BEGIN
        WHERE member.id = NEW."poolMemberId"
          -- S-C: a grantee's grant queue priority (recorded on the request
          -- when the attempt was created) replaces the pool/member priority.
-         AND (NEW."effectivePriority" = COALESCE(member."capacityPriority", pool."capacityPriority")
-           OR (request_priority_grant IS NOT NULL
-             AND NEW."effectivePriority" = request_base_priority))
+         -- A contributed member runs on its contributor's machine: the pool
+         -- owner's priority, reservation and borrow policy do not apply there.
+         AND ((member."inferenceContributionId" IS NOT NULL AND NEW."effectivePriority" = 0)
+           OR (member."inferenceContributionId" IS NULL
+             AND (NEW."effectivePriority" = COALESCE(member."capacityPriority", pool."capacityPriority")
+               OR (request_priority_grant IS NOT NULL
+                 AND NEW."effectivePriority" = request_base_priority))))
          AND NEW."effectiveConcurrencyLimit" IS NOT DISTINCT FROM
            CASE member."capacityConcurrencyMode"
              WHEN 'LIMITED' THEN member."capacityConcurrencyLimit"
@@ -781,8 +1513,12 @@ BEGIN
            WHEN member."capacityConcurrencyMode" = 'INHERIT' THEN 'POOL' ELSE 'MEMBER' END
          AND NEW."effectiveConcurrencyScopeId" = CASE
            WHEN member."capacityConcurrencyMode" = 'INHERIT' THEN pool.id ELSE member.id END
-         AND NEW."effectiveReservedSlots" = COALESCE(member."capacityReservedSlots", pool."capacityReservedSlots")
-         AND NEW."effectiveBorrowPolicy" = COALESCE(member."capacityBorrowPolicy", pool."capacityBorrowPolicy")
+         AND NEW."effectiveReservedSlots" = CASE
+           WHEN member."inferenceContributionId" IS NOT NULL THEN 0
+           ELSE COALESCE(member."capacityReservedSlots", pool."capacityReservedSlots") END
+         AND NEW."effectiveBorrowPolicy" = CASE
+           WHEN member."inferenceContributionId" IS NOT NULL THEN 'WHEN_IDLE'
+           ELSE COALESCE(member."capacityBorrowPolicy", pool."capacityBorrowPolicy") END
     ) THEN
       RAISE EXCEPTION 'capacity waiter policy snapshot must match its pool member policy'
         USING ERRCODE = '23514';
@@ -828,6 +1564,39 @@ CREATE TRIGGER capacity_lease_reference_consistency
 BEFORE INSERT OR UPDATE OF "userId", "admissionRequestId", "requestId", "attemptId", "capacityId",
   "executionTargetId", "poolId", "poolMemberId" ON capacity_lease
 FOR EACH ROW EXECUTE FUNCTION enforce_capacity_reference_consistency();
+
+-- A lease/admission is durable evidence of the exact historical request that
+-- was authorized. Lifecycle updates may not lend that evidence to a successor.
+CREATE OR REPLACE FUNCTION enforce_capacity_history_identity()
+RETURNS trigger LANGUAGE plpgsql AS $capacity_history_identity$
+BEGIN
+  IF TG_TABLE_NAME = 'admission_request' THEN
+    IF (NEW.id, NEW."userId", NEW."requestId", NEW."attemptId", NEW."sourceKind", NEW."poolId", NEW."directExecutionTargetId")
+       IS DISTINCT FROM
+       (OLD.id, OLD."userId", OLD."requestId", OLD."attemptId", OLD."sourceKind", OLD."poolId", OLD."directExecutionTargetId")
+       OR (NEW."relayRequestId" IS DISTINCT FROM OLD."relayRequestId" AND NOT (
+         NEW."relayRequestId" IS NULL AND OLD."relayRequestId" IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM relay_request WHERE id = OLD."relayRequestId"))) THEN
+      RAISE EXCEPTION 'admission historical request identity is immutable' USING ERRCODE = '23514';
+    END IF;
+  ELSE
+    IF (NEW.id, NEW."userId", NEW."admissionRequestId", NEW."requestId", NEW."attemptId", NEW."capacityId",
+        NEW."executionTargetId", NEW."poolId", NEW."poolMemberId", NEW."fencingToken")
+       IS DISTINCT FROM
+       (OLD.id, OLD."userId", OLD."admissionRequestId", OLD."requestId", OLD."attemptId", OLD."capacityId",
+        OLD."executionTargetId", OLD."poolId", OLD."poolMemberId", OLD."fencingToken") THEN
+      RAISE EXCEPTION 'capacity lease historical identity is immutable' USING ERRCODE = '23514';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$capacity_history_identity$;
+DROP TRIGGER IF EXISTS admission_history_identity ON admission_request;
+CREATE TRIGGER admission_history_identity BEFORE UPDATE ON admission_request
+FOR EACH ROW EXECUTE FUNCTION enforce_capacity_history_identity();
+DROP TRIGGER IF EXISTS capacity_lease_history_identity ON capacity_lease;
+CREATE TRIGGER capacity_lease_history_identity BEFORE UPDATE ON capacity_lease
+FOR EACH ROW EXECUTE FUNCTION enforce_capacity_history_identity();
 
 -- The Prisma field remains text so deployments can add future API surfaces
 -- without a PostgreSQL enum migration. Normalize legacy/out-of-band values and
@@ -1332,6 +2101,41 @@ UPDATE relay_request AS consumer
 -- to bless cross-owner, mismatched, or incorrectly typed target references;
 -- the surrounding transaction rolls every backfill change back and reports
 -- the exact consumer rows an operator must reconcile.
+-- Historical consent proves only attribution of retained history, never live
+-- inference authority. Consent identities are immutable after acceptance.
+CREATE OR REPLACE FUNCTION wsmp_pool_target_historical_contribution(pool_id TEXT, target_id TEXT, owner_id TEXT)
+RETURNS BOOLEAN LANGUAGE sql STABLE AS $pool_historical_contribution$
+  SELECT EXISTS (
+    SELECT 1 FROM inference_contribution contribution
+    JOIN execution_target target ON target."discoveredModelId" = contribution."discoveredModelId"
+    WHERE contribution."poolId" = pool_id AND target.id = target_id
+      AND contribution."poolOwnerUserId" = owner_id
+      AND contribution."contributorUserId" = target."userId"
+      AND contribution."acceptedAt" IS NOT NULL
+  )
+$pool_historical_contribution$;
+
+CREATE OR REPLACE FUNCTION wsmp_relay_request_historical_pool_selection(request relay_request, target_id TEXT)
+RETURNS BOOLEAN LANGUAGE sql STABLE AS $relay_historical_selection$
+  SELECT COALESCE(request."requestedModelPoolId" IS NOT NULL
+    AND request."fallbackRoute" = 'local'
+    AND request."selectedExecutionTargetId" = target_id
+    AND EXISTS (
+      SELECT 1 FROM capacity_lease lease
+      JOIN admission_request admission ON admission.id = lease."admissionRequestId"
+      WHERE admission."relayRequestId" = request.id AND admission."sourceKind" = 'POOL'
+        AND admission."poolId" = request."requestedModelPoolId"
+        AND admission."userId" = request."resourceOwnerUserId"
+        AND lease."userId" = admission."userId" AND lease."poolId" = admission."poolId"
+        AND lease."poolMemberId" = request."selectedPoolMemberId"
+        AND lease."executionTargetId" = target_id
+        AND (request."admissionAttemptId" IS NULL OR request."admissionAttemptId" = lease."attemptId")
+        AND (request."admissionLeaseId" IS NULL OR request."admissionLeaseId" = lease.id)
+        AND (request."admissionCapacityId" IS NULL OR request."admissionCapacityId" = lease."capacityId")
+        AND (request."admissionFencingToken" IS NULL OR request."admissionFencingToken" = lease."fencingToken")
+    ), false)
+$relay_historical_selection$;
+
 DO $invalid_consumers$
 DECLARE
   invalid_detail TEXT;
@@ -1342,7 +2146,12 @@ BEGIN
       FROM pool_member member
       JOIN model_pool pool ON pool.id = member."poolId"
       JOIN execution_target target ON target.id = member."executionTargetId"
-     WHERE target."userId" <> pool."userId"
+     WHERE (target."userId" <> pool."userId" AND NOT EXISTS (
+       SELECT 1 FROM inference_contribution contribution
+        WHERE contribution.id = member."inferenceContributionId" AND contribution.state = 'ACTIVE'
+          AND contribution."poolId" = pool.id AND contribution."poolOwnerUserId" = pool."userId"
+          AND contribution."contributorUserId" = target."userId"
+          AND contribution."discoveredModelId" = target."discoveredModelId"))
         OR (member."discoveredModelId" IS NOT NULL
             AND target."discoveredModelId" IS DISTINCT FROM member."discoveredModelId")
     UNION ALL
@@ -1371,10 +2180,12 @@ BEGIN
       JOIN execution_target target ON target.id = record."selectedExecutionTargetId"
       LEFT JOIN model_pool pool ON pool.id = record."targetModelPoolId"
      WHERE record."routingVersion" < 3
-       AND (target."userId" IS DISTINCT FROM CASE
+       AND (((record."targetModelPoolId" IS NULL OR pool.id IS NOT NULL)
+             AND target."userId" IS DISTINCT FROM CASE
               WHEN record."targetModelPoolId" IS NULL THEN record."userId"
               ELSE pool."userId"
-            END
+            END AND NOT wsmp_pool_target_historical_contribution(
+              record."targetModelPoolId", target.id, pool."userId"))
         OR (record."selectedDiscoveredModelId" IS NOT NULL
             AND target."discoveredModelId" IS DISTINCT FROM record."selectedDiscoveredModelId"))
     UNION ALL
@@ -1449,7 +2260,10 @@ BEGIN
     SELECT format('relay request target row=%s', request.id)
       FROM relay_request request
       JOIN execution_target target ON target.id = request."requestedExecutionTargetId"
-     WHERE target."userId" <> request."userId"
+     WHERE (target."userId" IS DISTINCT FROM CASE WHEN request."requestedModelPoolId" IS NULL
+              THEN request."userId" ELSE request."resourceOwnerUserId" END
+            AND NOT wsmp_pool_target_historical_contribution(request."requestedModelPoolId", target.id, request."resourceOwnerUserId")
+            AND NOT wsmp_relay_request_historical_pool_selection(request, target.id))
         OR (request."requestedDiscoveredModelId" IS NOT NULL
             AND target."discoveredModelId" IS DISTINCT FROM request."requestedDiscoveredModelId")
     UNION ALL
@@ -1459,11 +2273,13 @@ BEGIN
       LEFT JOIN model_pool pool ON pool.id = request."requestedModelPoolId"
      -- DL-1 (d): once the pool is gone the durable resource owner stands in
      -- for it, as in enforce_execution_target_consumer_consistency.
-     WHERE target."userId" IS DISTINCT FROM CASE
+     WHERE (target."userId" IS DISTINCT FROM CASE
              WHEN request."fallbackRoute" = 'own-key' OR request."requestedModelPoolId" IS NULL
                THEN request."userId"
              ELSE COALESCE(pool."userId", request."resourceOwnerUserId")
-           END
+           END AND NOT (request."fallbackRoute" IS DISTINCT FROM 'own-key'
+             AND (wsmp_pool_target_historical_contribution(request."requestedModelPoolId", target.id, request."resourceOwnerUserId")
+               OR wsmp_relay_request_historical_pool_selection(request, target.id))))
         OR (request."selectedDiscoveredModelId" IS NOT NULL
             AND target."discoveredModelId" IS DISTINCT FROM request."selectedDiscoveredModelId")
   ) invalid;
@@ -1505,6 +2321,11 @@ ALTER TABLE relay_request ADD CONSTRAINT relay_request_fallback_route_check CHEC
 ALTER TABLE model_pool DROP CONSTRAINT IF EXISTS model_pool_external_after_wait_check;
 ALTER TABLE model_pool ADD CONSTRAINT model_pool_external_after_wait_check CHECK (
   "externalAfterWaitMs" BETWEEN 0 AND 600000
+);
+
+ALTER TABLE model_api_token DROP CONSTRAINT IF EXISTS model_api_token_external_after_wait_check;
+ALTER TABLE model_api_token ADD CONSTRAINT model_api_token_external_after_wait_check CHECK (
+  "externalAfterWaitMs" IS NULL OR "externalAfterWaitMs" BETWEEN 0 AND 600000
 );
 
 -- Saturation S-A: null = automatic, 0 = off, otherwise fixed (capped at 30 s).
@@ -1690,6 +2511,21 @@ FOR EACH ROW EXECUTE FUNCTION canonicalize_execution_target_consumer();
 -- Compatibility consumers retain their legacy discovered-model columns for a
 -- rollback window. Reject cross-owner and mismatched dual writes at the DB
 -- boundary while continuing to permit nullable historical telemetry.
+-- A contributed target remains its real owner's engine, shared across pools.
+-- Used only for new pool-scoped selections; direct-target ownership is unchanged.
+CREATE OR REPLACE FUNCTION wsmp_pool_target_inference_authorized(pool_id TEXT, target_id TEXT)
+RETURNS BOOLEAN LANGUAGE sql STABLE AS $pool_inference_authorized$
+  SELECT EXISTS (
+    SELECT 1 FROM pool_member member
+    JOIN inference_contribution contribution ON contribution.id = member."inferenceContributionId"
+    JOIN execution_target target ON target.id = member."executionTargetId"
+    WHERE member."poolId" = pool_id AND member."executionTargetId" = target_id
+      AND member.tier = 'PRIMARY' AND contribution.state = 'ACTIVE'
+      AND contribution."poolId" = pool_id AND contribution."discoveredModelId" = target."discoveredModelId"
+      AND contribution."contributorUserId" = target."userId"
+  )
+$pool_inference_authorized$;
+
 CREATE OR REPLACE FUNCTION enforce_execution_target_consumer_consistency()
 RETURNS trigger LANGUAGE plpgsql AS $consumer_check$
 DECLARE
@@ -1703,6 +2539,8 @@ DECLARE
   provider_endpoint_version INTEGER;
   pool_owner TEXT;
   token_owner TEXT;
+  historical_pool_admission BOOLEAN := false;
+  exact_history BOOLEAN := false;
 BEGIN
   IF TG_TABLE_NAME = 'pool_member' THEN
     IF NEW."executionTargetId" IS NULL THEN
@@ -1716,7 +2554,11 @@ BEGIN
       INTO target_owner, target_model, consumer_owner
       FROM execution_target et, model_pool pool
      WHERE et.id = NEW."executionTargetId" AND pool.id = NEW."poolId";
-    IF target_owner IS NULL OR target_owner <> consumer_owner
+    IF target_owner IS NULL OR (target_owner <> consumer_owner AND NOT EXISTS (
+       SELECT 1 FROM inference_contribution contribution
+        WHERE contribution.id = NEW."inferenceContributionId" AND contribution.state = 'ACTIVE'
+          AND contribution."poolId" = NEW."poolId" AND contribution."poolOwnerUserId" = consumer_owner
+          AND contribution."contributorUserId" = target_owner AND contribution."discoveredModelId" = target_model))
        OR (NEW."discoveredModelId" IS NOT NULL
            AND target_model IS DISTINCT FROM NEW."discoveredModelId") THEN
       RAISE EXCEPTION 'pool_member execution target must match its owner and discovered model'
@@ -1744,6 +2586,26 @@ BEGIN
         USING ERRCODE = '23514';
     END IF;
   ELSIF TG_TABLE_NAME = 'response_stickiness_record' THEN
+    -- Every routing identity is bound. Expiry/warm telemetry refreshes confer
+    -- no authority, even after a grant/member/parent disappears. There are no
+    -- graph foreign keys here, hence no SET NULL exemption is needed.
+    IF TG_OP = 'UPDATE' AND
+       (NEW.id, NEW."userId", NEW."modelApiTokenId", NEW."routingKeyDigest", NEW."routingVersion",
+        NEW."targetModelPoolId", NEW."poolGrantId", NEW."targetExecutionTargetId", NEW."targetDiscoveredModelId",
+        NEW."selectedExecutionTargetId", NEW."selectedDiscoveredModelId", NEW."fallbackRoute",
+        NEW."providerAccountId", NEW."providerModelId", NEW."providerEndpointIdentity", NEW."providerEndpointVersion",
+        NEW."providerUpstreamModelId", NEW."nativeSurface", NEW."upstreamResponseIdDigest")
+       IS NOT DISTINCT FROM
+       (OLD.id, OLD."userId", OLD."modelApiTokenId", OLD."routingKeyDigest", OLD."routingVersion",
+        OLD."targetModelPoolId", OLD."poolGrantId", OLD."targetExecutionTargetId", OLD."targetDiscoveredModelId",
+        OLD."selectedExecutionTargetId", OLD."selectedDiscoveredModelId", OLD."fallbackRoute",
+        OLD."providerAccountId", OLD."providerModelId", OLD."providerEndpointIdentity", OLD."providerEndpointVersion",
+       OLD."providerUpstreamModelId", OLD."nativeSurface", OLD."upstreamResponseIdDigest") THEN
+      RETURN NEW;
+    END IF;
+    IF TG_OP = 'UPDATE' AND OLD."routingVersion" < 3 THEN
+      RAISE EXCEPTION 'local stickiness binding is immutable' USING ERRCODE = '23514';
+    END IF;
     IF NEW."routingVersion" >= 3 THEN
       SELECT et."userId", et."providerModelId", model."providerAccountId",
              model."upstreamModelId", acct."endpointIdentity", acct."endpointVersion",
@@ -1805,26 +2667,6 @@ BEGIN
     -- graph, like a pool relay_request: the requester is the owner (no grant)
     -- or holds the exact grant, whose deletion cascades the binding away.
     -- Without a pool the binding is direct and the requester owns the target.
-    -- These are write-time rules. An UPDATE that changes no identity column
-    -- and at most clears a reference (such as the SET NULL action of a
-    -- deleted discovered model while the pool owner's whole account is
-    -- deleted in one cascade, after its pool and grant rows are gone)
-    -- authorizes nothing new, so it is not re-checked.
-    IF TG_OP = 'UPDATE'
-       AND NEW."userId" IS NOT DISTINCT FROM OLD."userId"
-       AND NEW."routingVersion" IS NOT DISTINCT FROM OLD."routingVersion"
-       AND NEW."targetModelPoolId" IS NOT DISTINCT FROM OLD."targetModelPoolId"
-       AND NEW."poolGrantId" IS NOT DISTINCT FROM OLD."poolGrantId"
-       AND (NEW."targetExecutionTargetId" IS NULL
-            OR NEW."targetExecutionTargetId" IS NOT DISTINCT FROM OLD."targetExecutionTargetId")
-       AND (NEW."targetDiscoveredModelId" IS NULL
-            OR NEW."targetDiscoveredModelId" IS NOT DISTINCT FROM OLD."targetDiscoveredModelId")
-       AND (NEW."selectedExecutionTargetId" IS NULL
-            OR NEW."selectedExecutionTargetId" IS NOT DISTINCT FROM OLD."selectedExecutionTargetId")
-       AND (NEW."selectedDiscoveredModelId" IS NULL
-            OR NEW."selectedDiscoveredModelId" IS NOT DISTINCT FROM OLD."selectedDiscoveredModelId") THEN
-      RETURN NEW;
-    END IF;
     consumer_owner := NEW."userId";
     IF NEW."targetModelPoolId" IS NOT NULL THEN
       -- A binding targets a pool or a direct model, never both: routing
@@ -1865,7 +2707,8 @@ BEGIN
     IF NEW."selectedExecutionTargetId" IS NOT NULL THEN
       SELECT "userId", "discoveredModelId" INTO target_owner, target_model
         FROM execution_target WHERE id = NEW."selectedExecutionTargetId";
-      IF target_owner IS NULL OR target_owner IS DISTINCT FROM consumer_owner
+      IF target_owner IS NULL OR (target_owner IS DISTINCT FROM consumer_owner AND NOT (
+        wsmp_pool_target_inference_authorized(NEW."targetModelPoolId", NEW."selectedExecutionTargetId")))
          OR (NEW."selectedDiscoveredModelId" IS NOT NULL
              AND target_model IS DISTINCT FROM NEW."selectedDiscoveredModelId") THEN
         RAISE EXCEPTION 'stickiness selection must match its owner and discovered model'
@@ -1875,9 +2718,6 @@ BEGIN
       -- selection is written. Membership is mutable, so unchanged historical
       -- rows are not re-checked; follow-up routing re-checks it live.
       IF NEW."targetModelPoolId" IS NOT NULL
-         AND (TG_OP = 'INSERT'
-           OR NEW."selectedExecutionTargetId" IS DISTINCT FROM OLD."selectedExecutionTargetId"
-           OR NEW."targetModelPoolId" IS DISTINCT FROM OLD."targetModelPoolId")
          AND NOT EXISTS (
            SELECT 1 FROM pool_member member
             WHERE member."poolId" = NEW."targetModelPoolId"
@@ -1888,6 +2728,56 @@ BEGIN
       END IF;
     END IF;
   ELSIF TG_TABLE_NAME = 'relay_request' THEN
+    -- The only persisted-selection exemption compares the whole identity.
+    -- Status, counters, times, usage and outcome telemetry may progress; actor,
+    -- route, source, requested object, served model/member and capacity binding
+    -- cannot borrow an old selection's authorization after changing identity.
+    IF TG_OP = 'UPDATE' THEN
+      exact_history :=
+        (NEW.id, NEW."userId", NEW."resourceOwnerUserId", NEW."modelApiTokenId", NEW.source,
+         NEW."requestedModelPoolId", NEW."requestedExecutionTargetId", NEW."requestedDiscoveredModelId",
+         NEW."selectedExecutionTargetId", NEW."selectedDiscoveredModelId", NEW."selectedPoolMemberId",
+         NEW."selectedPoolMemberTier", NEW."fallbackRoute", NEW."admissionAttemptId", NEW."admissionLeaseId",
+         NEW."admissionCapacityId", NEW."admissionFencingToken", NEW."providerAccountId", NEW."providerModelId",
+         NEW."providerAttemptId", NEW."providerFencingToken", NEW."localAttemptId")
+        IS NOT DISTINCT FROM
+        (OLD.id, OLD."userId", OLD."resourceOwnerUserId", OLD."modelApiTokenId", OLD.source,
+         OLD."requestedModelPoolId", OLD."requestedExecutionTargetId", OLD."requestedDiscoveredModelId",
+         OLD."selectedExecutionTargetId", OLD."selectedDiscoveredModelId", OLD."selectedPoolMemberId",
+         OLD."selectedPoolMemberTier", OLD."fallbackRoute", OLD."admissionAttemptId", OLD."admissionLeaseId",
+         OLD."admissionCapacityId", OLD."admissionFencingToken", OLD."providerAccountId", OLD."providerModelId",
+         OLD."providerAttemptId", OLD."providerFencingToken", OLD."localAttemptId");
+      IF exact_history THEN RETURN NEW; END IF;
+      IF OLD.status <> 'PENDING' THEN
+        RAISE EXCEPTION 'relay request selection must match its immutable terminal identity'
+          USING ERRCODE = '23514';
+      END IF;
+    END IF;
+    -- A revoked member can disappear after admission but before the first
+    -- relay selection write. Its terminalizer preserves the authorized
+    -- historical identity only when a durable admission/lease binds this
+    -- exact request, pool, member and target. This never authorizes a send
+    -- or a PENDING selection; no mutable live grant is resurrected.
+    IF TG_OP = 'UPDATE' AND OLD.status = 'PENDING'
+       AND NEW.status::text IN ('SUCCEEDED', 'FAILED', 'CANCELED')
+       AND NEW.id IS NOT DISTINCT FROM OLD.id
+       AND NEW."userId" IS NOT DISTINCT FROM OLD."userId"
+       AND NEW.source IS NOT DISTINCT FROM OLD.source
+       AND NEW."modelApiTokenId" IS NOT DISTINCT FROM OLD."modelApiTokenId"
+       AND NEW."resourceOwnerUserId" IS NOT DISTINCT FROM OLD."resourceOwnerUserId"
+       AND NEW."requestedExecutionTargetId" IS NOT DISTINCT FROM OLD."requestedExecutionTargetId"
+       AND NEW."requestedDiscoveredModelId" IS NOT DISTINCT FROM OLD."requestedDiscoveredModelId"
+       AND NEW."requestedModelPoolId" IS NOT DISTINCT FROM OLD."requestedModelPoolId"
+       AND NEW."requestedModelPoolId" IS NOT NULL
+       AND (OLD."fallbackRoute" IS NULL OR OLD."fallbackRoute" = 'local')
+       AND (OLD."selectedExecutionTargetId" IS NULL OR OLD."selectedExecutionTargetId" IS NOT DISTINCT FROM NEW."selectedExecutionTargetId")
+       AND (OLD."selectedPoolMemberId" IS NULL OR OLD."selectedPoolMemberId" IS NOT DISTINCT FROM NEW."selectedPoolMemberId")
+       AND (NEW."selectedPoolMemberTier" IS NULL OR NEW."selectedPoolMemberTier" = 'PRIMARY')
+       AND (NEW."providerAccountId", NEW."providerModelId", NEW."providerAttemptId", NEW."providerFencingToken")
+         IS NOT DISTINCT FROM (OLD."providerAccountId", OLD."providerModelId", OLD."providerAttemptId", OLD."providerFencingToken")
+       AND NEW."fallbackRoute" = 'local' THEN
+      historical_pool_admission := wsmp_relay_request_historical_pool_selection(NEW, NEW."selectedExecutionTargetId");
+    END IF;
     -- relay_request is hot-path history (DL-1 design (d), #78): it names its
     -- pool, targets and member by plain id and keeps them after they are
     -- deleted. A live parent is always checked; a deleted one is not (the
@@ -1897,43 +2787,22 @@ BEGIN
     IF NEW."requestedExecutionTargetId" IS NOT NULL THEN
       SELECT "userId", "discoveredModelId" INTO target_owner, target_model
         FROM execution_target WHERE id = NEW."requestedExecutionTargetId";
-      IF FOUND AND (target_owner IS DISTINCT FROM NEW."userId"
-         OR (NEW."requestedDiscoveredModelId" IS NOT NULL
-             AND target_model IS DISTINCT FROM NEW."requestedDiscoveredModelId")) THEN
-        RAISE EXCEPTION 'relay request target must match its owner and discovered model'
-          USING ERRCODE = '23514';
-      END IF;
-    END IF;
-    -- A PENDING pool request whose pool is already gone (deleted while the
-    -- request was in flight) keeps its durable resource owner but no
-    -- ownership anchor. Its late finalizer, which re-writes the pool owner's
-    -- selection (route identity, pool member), must still commit its status
-    -- and counters, so that selection is dropped, never persisted. A terminal
-    -- row, and a target of anyone else, are still rejected below.
-    -- resourceOwnerUserId is derived and pinned by
-    -- a_relay_request_resource_owner, which runs before this trigger.
-    IF TG_OP = 'UPDATE' AND OLD.status = 'PENDING'
-       AND NEW."requestedModelPoolId" IS NULL
-       AND OLD."requestedModelPoolId" IS NULL
-       AND NEW."resourceOwnerUserId" IS NOT NULL
-       AND NEW."resourceOwnerUserId" IS DISTINCT FROM NEW."userId"
-       AND NEW."userId" IS NOT DISTINCT FROM OLD."userId"
-       AND NEW."fallbackRoute" IS DISTINCT FROM 'own-key'
-       AND (NEW."selectedExecutionTargetId" IS NOT NULL OR NEW."selectedPoolMemberId" IS NOT NULL) THEN
-      -- A target that no longer exists (deleted with the owner's account or
-      -- device) can never be persisted either, so it is dropped the same way.
-      target_owner := NULL;
-      IF NEW."selectedExecutionTargetId" IS NOT NULL THEN
-        SELECT "userId" INTO target_owner
-          FROM execution_target WHERE id = NEW."selectedExecutionTargetId";
-      END IF;
-      IF NEW."selectedExecutionTargetId" IS NULL
-         OR target_owner IS NULL
-         OR target_owner IS NOT DISTINCT FROM NEW."resourceOwnerUserId" THEN
-        NEW."selectedExecutionTargetId" := NULL;
-        NEW."selectedDiscoveredModelId" := NULL;
-        NEW."selectedPoolMemberId" := NULL;
-        RETURN NEW;
+      IF FOUND THEN
+        -- Pool hops (including media transformers) target the pool owner's
+        -- machine. Direct targets still belong to the requester.
+        consumer_owner := NEW."userId";
+        IF NEW."requestedModelPoolId" IS NOT NULL THEN
+          SELECT "userId" INTO pool_owner FROM model_pool WHERE id = NEW."requestedModelPoolId";
+          consumer_owner := COALESCE(pool_owner, NEW."resourceOwnerUserId", NEW."userId");
+        END IF;
+        IF (target_owner IS DISTINCT FROM consumer_owner AND NOT (
+          wsmp_pool_target_inference_authorized(NEW."requestedModelPoolId", NEW."requestedExecutionTargetId")
+          OR (historical_pool_admission AND NEW."requestedExecutionTargetId" = NEW."selectedExecutionTargetId")))
+           OR (NEW."requestedDiscoveredModelId" IS NOT NULL
+               AND target_model IS DISTINCT FROM NEW."requestedDiscoveredModelId") THEN
+          RAISE EXCEPTION 'relay request target must match its owner and discovered model'
+            USING ERRCODE = '23514';
+        END IF;
       END IF;
     END IF;
     IF NEW."selectedExecutionTargetId" IS NOT NULL THEN
@@ -1949,12 +2818,49 @@ BEGIN
           SELECT "userId" INTO pool_owner FROM model_pool WHERE id = NEW."requestedModelPoolId";
           consumer_owner := COALESCE(pool_owner, NEW."resourceOwnerUserId");
         END IF;
-        IF target_owner IS DISTINCT FROM consumer_owner
+        IF (target_owner IS DISTINCT FROM consumer_owner AND NOT (
+          (NEW."fallbackRoute" IS DISTINCT FROM 'own-key' AND wsmp_pool_target_inference_authorized(NEW."requestedModelPoolId", NEW."selectedExecutionTargetId"))
+          OR historical_pool_admission
+          ))
            OR (NEW."selectedDiscoveredModelId" IS NOT NULL
                AND target_model IS DISTINCT FROM NEW."selectedDiscoveredModelId") THEN
           RAISE EXCEPTION 'relay request selection must match its owner and discovered model'
             USING ERRCODE = '23514';
         END IF;
+      END IF;
+      -- INSERT-time membership: the selected target belonged to the requested
+      -- pool when this selection was written (same idea as stickiness v3).
+      -- Membership is mutable, so later status-only updates are not re-checked.
+      -- Grantee LOCAL rows keep the pool-owner graph; the caller need not own
+      -- the target. own-key selections are the caller's provider, not a member.
+      IF NEW."requestedModelPoolId" IS NOT NULL
+         AND NOT historical_pool_admission
+         AND NEW."fallbackRoute" IS DISTINCT FROM 'own-key'
+         -- Deleted parent: the late finalizer must still commit status.
+         AND EXISTS (SELECT 1 FROM model_pool WHERE id = NEW."requestedModelPoolId")
+         -- Media transformers are pool-owned and need not be members.
+         AND NOT (
+           NEW.source = 'TRANSFORMER'
+           AND EXISTS (
+             SELECT 1 FROM model_pool pool
+               JOIN execution_target transformer
+                 ON transformer."discoveredModelId" = pool."transformerDiscoveredModelId"
+              WHERE pool.id = NEW."requestedModelPoolId"
+                AND transformer.id = NEW."selectedExecutionTargetId"
+           )
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM pool_member member
+            WHERE member."poolId" = NEW."requestedModelPoolId"
+              AND member."executionTargetId" = NEW."selectedExecutionTargetId"
+              AND (NEW."selectedPoolMemberId" IS NULL OR member.id = NEW."selectedPoolMemberId")
+              AND member.tier = CASE
+                WHEN NEW."fallbackRoute" = 'pool-external' THEN 'PUBLIC_OVERFLOW'::"PoolMemberTier"
+                ELSE 'PRIMARY'::"PoolMemberTier"
+              END
+         ) THEN
+        RAISE EXCEPTION 'relay request selection must be a member of its pool'
+          USING ERRCODE = '23514';
       END IF;
     END IF;
   END IF;
@@ -1975,9 +2881,7 @@ FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
 
 DROP TRIGGER IF EXISTS stickiness_execution_target_consistency ON response_stickiness_record;
 CREATE TRIGGER stickiness_execution_target_consistency
-BEFORE INSERT OR UPDATE OF "userId", "targetDiscoveredModelId", "targetExecutionTargetId",
-  "selectedDiscoveredModelId", "selectedExecutionTargetId", "targetModelPoolId", "poolGrantId",
-  "routingVersion" ON response_stickiness_record
+BEFORE INSERT OR UPDATE ON response_stickiness_record
 FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
 
 -- Durable usage attribution for relay requests (#66, P3C-2). Derived here,
@@ -2025,8 +2929,7 @@ UPDATE relay_request AS request
 
 DROP TRIGGER IF EXISTS relay_request_execution_target_consistency ON relay_request;
 CREATE TRIGGER relay_request_execution_target_consistency
-BEFORE INSERT OR UPDATE OF "userId", "requestedDiscoveredModelId", "requestedExecutionTargetId",
-  "selectedDiscoveredModelId", "selectedExecutionTargetId", "requestedModelPoolId", "fallbackRoute" ON relay_request
+BEFORE INSERT OR UPDATE ON relay_request
 FOR EACH ROW EXECUTE FUNCTION enforce_execution_target_consumer_consistency();
 
 UPDATE provider_account SET "endpointIdentity" = "baseUrl" WHERE "endpointIdentity" = '';
@@ -2118,11 +3021,30 @@ ALTER TABLE provider_credential ADD CONSTRAINT provider_credential_shape_check C
     OR (status = 'REVOKED' AND "revokedAt" IS NOT NULL))
 );
 
+-- POOL_GRANT is grant-wide (no account attachment), keyed by pool + grantee
+-- so revoke/re-grant keep the cap. poolGrantId is last-seen audit, not an FK.
+ALTER TABLE provider_budget_policy ADD COLUMN IF NOT EXISTS "poolGrantId" TEXT;
+ALTER TABLE provider_budget_policy ADD COLUMN IF NOT EXISTS "granteeUserId" TEXT;
+ALTER TABLE provider_budget_policy ALTER COLUMN "providerAccountId" DROP NOT NULL;
+-- The transition trigger (installed on re-runs) forbids this UPDATE. Drop it
+-- for the backfill; the CREATE TRIGGER later in this file reinstalls it.
+DROP TRIGGER IF EXISTS provider_budget_policy_transition ON provider_budget_policy;
+UPDATE provider_budget_policy AS policy
+   SET "granteeUserId" = grant_row."granteeUserId"
+  FROM pool_grant AS grant_row
+ WHERE policy."scopeType" = 'POOL_GRANT'
+   AND policy."granteeUserId" IS NULL
+   AND grant_row.id = policy."poolGrantId";
+
 ALTER TABLE provider_budget_policy DROP CONSTRAINT IF EXISTS provider_budget_policy_scope_check;
 ALTER TABLE provider_budget_policy ADD CONSTRAINT provider_budget_policy_scope_check CHECK (
   version > 0
-  AND (("scopeType" = 'PROVIDER_ACCOUNT' AND "poolId" IS NULL AND "providerModelId" IS NULL)
-    OR ("scopeType" = 'POOL_PROVIDER_MODEL' AND "poolId" IS NOT NULL AND "providerModelId" IS NOT NULL))
+  AND (("scopeType" = 'PROVIDER_ACCOUNT' AND "poolId" IS NULL AND "providerModelId" IS NULL
+        AND "poolGrantId" IS NULL AND "granteeUserId" IS NULL AND "providerAccountId" IS NOT NULL)
+    OR ("scopeType" = 'POOL_PROVIDER_MODEL' AND "poolId" IS NOT NULL AND "providerModelId" IS NOT NULL
+        AND "poolGrantId" IS NULL AND "granteeUserId" IS NULL AND "providerAccountId" IS NOT NULL)
+    OR ("scopeType" = 'POOL_GRANT' AND "granteeUserId" IS NOT NULL AND "poolId" IS NOT NULL
+        AND "providerModelId" IS NULL AND "providerAccountId" IS NULL))
   AND ((active AND "activatedAt" IS NOT NULL AND "deactivatedAt" IS NULL)
     OR (NOT active AND ("activatedAt" IS NULL OR "deactivatedAt" IS NOT NULL)))
 );
@@ -2133,12 +3055,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_account_version_unique
 CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_attachment_version_unique
   ON provider_budget_policy ("userId", "providerAccountId", "poolId", "providerModelId", version)
   WHERE "scopeType" = 'POOL_PROVIDER_MODEL';
+DROP INDEX IF EXISTS provider_budget_policy_grant_version_unique;
+CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_grant_version_unique
+  ON provider_budget_policy ("userId", "poolId", "granteeUserId", version)
+  WHERE "scopeType" = 'POOL_GRANT';
 CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_one_active_account
   ON provider_budget_policy ("userId", "providerAccountId")
   WHERE active AND "scopeType" = 'PROVIDER_ACCOUNT';
 CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_one_active_attachment
   ON provider_budget_policy ("userId", "providerAccountId", "poolId", "providerModelId")
   WHERE active AND "scopeType" = 'POOL_PROVIDER_MODEL';
+DROP INDEX IF EXISTS provider_budget_policy_one_active_grant;
+CREATE UNIQUE INDEX IF NOT EXISTS provider_budget_policy_one_active_grant
+  ON provider_budget_policy ("userId", "poolId", "granteeUserId")
+  WHERE active AND "scopeType" = 'POOL_GRANT';
 
 ALTER TABLE provider_budget_rule DROP CONSTRAINT IF EXISTS provider_budget_rule_shape_check;
 ALTER TABLE provider_budget_rule ADD CONSTRAINT provider_budget_rule_shape_check CHECK (
@@ -2191,6 +3121,11 @@ SELECT DISTINCT ON (r."attemptId", r."fencingToken")
          AND r."pricingVersion" IS NOT NULL THEN r."pricingVersion" END,
   r."accountingVersion"
 FROM provider_budget_reservation r
+-- BEFORE INSERT runs before ON CONFLICT. Existing anchors can legitimately
+-- outlive a deleted pool; do not reauthorize a no-op historical backfill.
+-- The deploy holds both tables exclusively, so this anti-join cannot race.
+WHERE NOT EXISTS (SELECT 1 FROM provider_attempt existing
+  WHERE existing."attemptId" = r."attemptId" AND existing."fencingToken" = r."fencingToken")
 ON CONFLICT ("attemptId", "fencingToken") DO NOTHING;
 
 ALTER TABLE provider_attempt DROP CONSTRAINT IF EXISTS provider_attempt_shape_check;
@@ -2629,10 +3564,23 @@ RETURNS trigger LANGUAGE plpgsql AS $provider_budget_graph$
 DECLARE p RECORD; r RECORD; c RECORD;
 BEGIN
   IF TG_TABLE_NAME = 'provider_budget_policy' THEN
+    IF NEW."providerAccountId" IS NOT NULL AND NOT EXISTS (
+      SELECT 1 FROM provider_account a WHERE a.id = NEW."providerAccountId"
+        AND a."userId" = NEW."userId") THEN
+      RAISE EXCEPTION 'budget policy account must belong to its owner' USING ERRCODE = '23514';
+    END IF;
     IF NEW."providerModelId" IS NOT NULL AND NOT EXISTS (
       SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
         AND m."userId" = NEW."userId" AND m."providerAccountId" = NEW."providerAccountId") THEN
       RAISE EXCEPTION 'budget policy model must belong to its provider account' USING ERRCODE = '23514';
+    END IF;
+    IF NEW."scopeType" = 'POOL_GRANT' AND (
+         NEW."granteeUserId" IS NULL
+         OR NOT EXISTS (
+           SELECT 1 FROM model_pool mp
+            WHERE mp.id = NEW."poolId" AND mp."userId" = NEW."userId")
+       ) THEN
+      RAISE EXCEPTION 'budget policy grant must belong to the pool owner' USING ERRCODE = '23514';
     END IF;
   ELSIF TG_TABLE_NAME = 'provider_attempt' THEN
     IF NOT EXISTS (SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
@@ -2661,17 +3609,21 @@ BEGIN
        OR p."userId" <> NEW."userId" OR p.version <> NEW."policyVersion"
        OR r.metric::text <> NEW.metric::text OR r.period::text <> NEW.period::text
        OR r.currency IS DISTINCT FROM NEW.currency
-       OR p."providerAccountId" <> NEW."providerAccountId"
+       OR (p."scopeType" <> 'POOL_GRANT'
+         AND p."providerAccountId" IS DISTINCT FROM NEW."providerAccountId")
        OR NEW."providerModelId" = ''
        OR (p."scopeType" = 'POOL_PROVIDER_MODEL'
          AND (p."poolId" IS DISTINCT FROM NEW."poolId"
-           OR p."providerModelId" IS DISTINCT FROM NEW."providerModelId")) THEN
+           OR p."providerModelId" IS DISTINCT FROM NEW."providerModelId"))
+       OR (p."scopeType" = 'POOL_GRANT'
+         AND p."poolId" IS DISTINCT FROM NEW."poolId") THEN
       RAISE EXCEPTION 'budget reservation must match its policy version and rule' USING ERRCODE = '23514';
     END IF;
     IF NEW."credentialId" IS NOT NULL THEN
       SELECT * INTO c FROM provider_credential WHERE id = NEW."credentialId";
-      IF c."userId" IS DISTINCT FROM NEW."userId" OR c."providerAccountId" IS DISTINCT FROM p."providerAccountId" THEN
-        RAISE EXCEPTION 'budget reservation credential must match policy account' USING ERRCODE = '23514';
+      IF c."userId" IS DISTINCT FROM NEW."userId"
+         OR c."providerAccountId" IS DISTINCT FROM NEW."providerAccountId" THEN
+        RAISE EXCEPTION 'budget reservation credential must match the reservation account' USING ERRCODE = '23514';
       END IF;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM provider_model m WHERE m.id = NEW."providerModelId"
@@ -2806,6 +3758,8 @@ BEGIN
        OR NEW."providerAccountId" IS DISTINCT FROM OLD."providerAccountId"
        OR NEW."poolId" IS DISTINCT FROM OLD."poolId"
        OR NEW."providerModelId" IS DISTINCT FROM OLD."providerModelId"
+       OR NEW."poolGrantId" IS DISTINCT FROM OLD."poolGrantId"
+       OR NEW."granteeUserId" IS DISTINCT FROM OLD."granteeUserId"
        OR NEW.version IS DISTINCT FROM OLD.version OR NEW."activatedAt" IS DISTINCT FROM OLD."activatedAt"
        OR NEW.active OR NEW."deactivatedAt" IS NULL THEN
       RAISE EXCEPTION 'activated provider budget policy is immutable except deactivation' USING ERRCODE = '55000';
@@ -2820,6 +3774,8 @@ BEGIN
        OR NEW."providerAccountId" IS DISTINCT FROM OLD."providerAccountId"
        OR NEW."poolId" IS DISTINCT FROM OLD."poolId"
        OR NEW."providerModelId" IS DISTINCT FROM OLD."providerModelId"
+       OR NEW."poolGrantId" IS DISTINCT FROM OLD."poolGrantId"
+       OR NEW."granteeUserId" IS DISTINCT FROM OLD."granteeUserId"
        OR NEW.version IS DISTINCT FROM OLD.version
        OR NOT NEW.active OR NEW."activatedAt" IS NULL OR NEW."deactivatedAt" IS NOT NULL THEN
       RAISE EXCEPTION 'provider budget policy permits only controlled activation' USING ERRCODE = '55000';
@@ -2830,7 +3786,9 @@ END;
 $provider_budget_history$;
 
 DROP TRIGGER IF EXISTS provider_budget_rule_immutable ON provider_budget_rule;
-CREATE TRIGGER provider_budget_rule_immutable BEFORE UPDATE OR DELETE ON provider_budget_rule
+-- UPDATE stays forbidden. DELETE is allowed so pool/user cascade can drop
+-- rules with their policy (an immutable trigger on DELETE blocked revoke).
+CREATE TRIGGER provider_budget_rule_immutable BEFORE UPDATE ON provider_budget_rule
 FOR EACH ROW EXECUTE FUNCTION enforce_provider_budget_history_transitions();
 DROP TRIGGER IF EXISTS provider_budget_policy_transition ON provider_budget_policy;
 CREATE TRIGGER provider_budget_policy_transition BEFORE UPDATE ON provider_budget_policy
@@ -3057,7 +4015,14 @@ BEGIN
     WHEN 'user' THEN ARRAY[row_data ->> 'id']
     WHEN 'pool_member' THEN ARRAY[
       (SELECT "userId" FROM model_pool WHERE id = row_data ->> 'poolId')]
+    WHEN 'pool_routing_rule' THEN ARRAY[
+      (SELECT "userId" FROM model_pool WHERE id = row_data ->> 'poolId')]
     WHEN 'pool_grant' THEN ARRAY[row_data ->> 'ownerUserId', row_data ->> 'granteeUserId']
+    WHEN 'inference_contribution' THEN ARRAY[row_data ->> 'contributorUserId', row_data ->> 'poolOwnerUserId']
+    WHEN 'deployment_config_revision' THEN ARRAY[(SELECT "userId" FROM deployment_config WHERE id = row_data ->> 'configId')]
+    WHEN 'deployment_run' THEN ARRAY[(SELECT "userId" FROM deployment_plan WHERE id = row_data ->> 'planId')]
+    WHEN 'deployment_instance_node' THEN ARRAY[(SELECT "userId" FROM deployment_instance WHERE id = row_data ->> 'instanceId')]
+    WHEN 'deployment_step' THEN ARRAY[(SELECT "userId" FROM deployment_instance WHERE id = row_data ->> 'instanceId')]
     WHEN 'model_api_token_allowlist_entry' THEN ARRAY[
       (SELECT "userId" FROM model_api_token WHERE id = row_data ->> 'modelApiTokenId'),
       (SELECT "userId" FROM model_pool WHERE id = row_data ->> 'modelPoolId'),
@@ -3176,15 +4141,24 @@ BEGIN
     ('inference_capacity', 'id,userId,runtimeIdentityKey', 'hardConcurrencyLimit'),
     ('model_pool', 'id,userId,slug,transformerDiscoveredModelId',
       'capacityPriority,capacityConcurrencyLimit,capacityReservedSlots,capacityBorrowPolicy,capacityWaitBudgetMs,capacityContextCeiling,capacityContextMargin'),
-    ('pool_member', 'id,poolId,discoveredModelId,executionTargetId',
+    ('pool_member', 'id,poolId,discoveredModelId,executionTargetId,inferenceContributionId',
       'tier,capacityPriority,capacityConcurrencyMode,capacityConcurrencyLimit,capacityReservedSlots,capacityBorrowPolicy,capacityWaitBudgetMode,capacityWaitBudgetMs,capacityContextCeilingMode,capacityContextCeiling,capacityContextMargin'),
+    ('pool_routing_rule', 'id,poolId,memberId,exclude,position,metric,labels,aggregate,op,threshold,effect', ''),
     ('pool_grant', 'id,poolId,ownerUserId,granteeUserId', ''),
+    ('inference_contribution', 'id,poolId,poolOwnerUserId,contributorUserId,discoveredModelId,state', ''),
+    ('deployment_config', 'id,userId,poolId', ''),
+    ('deployment_config_revision', 'id,configId,revision,contentHash,spec', ''),
+    ('deployment_plan', 'id,userId,contents,state', ''),
+    ('deployment_run', 'id,planId', ''),
+    ('deployment_instance', 'id,userId,configId,revisionId,runId,desiredState', ''),
+    ('deployment_instance_node', 'id,instanceId,cliDeviceId,rank,claimHeld', ''),
+    ('deployment_step', 'id,runId,instanceId,cliDeviceId,rank,intent,intentHash,state', ''),
     ('model_api_token', 'id,userId,lookupPrefix,secretDigest', ''),
     ('model_api_token_allowlist_entry', 'id,modelApiTokenId,target,discoveredModelId,executionTargetId,modelPoolId', ''),
     ('provider_account', 'id,userId,currentCredentialId', ''),
     ('provider_model', 'id,userId,providerAccountId,upstreamModelId', ''),
     ('provider_credential', 'id,userId,providerAccountId,replacedById', ''),
-    ('provider_budget_policy', 'id,userId,scopeType,providerAccountId,poolId,providerModelId', ''),
+    ('provider_budget_policy', 'id,userId,scopeType,providerAccountId,poolId,providerModelId,poolGrantId,granteeUserId', ''),
     ('provider_budget_rule', 'id,policyId', ''),
     ('provider_pricing_version', 'id,userId,providerAccountId,providerModelId', ''),
     ('pool_fallback_preference', 'id,userId,poolId,poolGrantId,providerModelId', '')

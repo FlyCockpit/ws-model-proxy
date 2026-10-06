@@ -133,9 +133,14 @@ const GENERIC_NAME_SECRET_COLUMNS: Readonly<Record<string, string>> = {
  * each with the reason it is safe to return.
  */
 const NON_SECRET_COLUMNS: Readonly<Record<string, string>> = {
+  contentHash: "Digest of an immutable deployment recipe, not credential material.",
+  variantKey: "Public recipe variant identifier, not a secret key.",
+  intentHash: "Digest of a durable deployment job intent, not credential material.",
+  errorCode: "Bounded deployment error classification, not an authorization code.",
   tokenEndpointAuthMethod: "OAuth client metadata (auth method name).",
   signingKeyId: "Key identifier, not key material.",
   publicKey: "Public half of a JWKS key pair.",
+  identityPublicKey: "Public half of the CLI identity key pair.",
   inventoryDigest: "Digest of a CLI's published model inventory.",
   payloadHash: "Digest of an accounting payload for idempotency.",
   bindingDigest: "Cache-affinity routing digest of request content structure.",

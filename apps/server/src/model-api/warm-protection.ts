@@ -1,8 +1,14 @@
 import {
   effectiveKvBudgetTokens,
   type KvEvictionState,
+  kvEvictionCutsApply,
+  protectionKvBudgetTokens,
 } from "@ws-model-proxy/api/lib/kv-eviction-budget";
+
+export { protectionKvBudgetTokens };
+
 import prisma, { Prisma } from "@ws-model-proxy/db";
+import { affinityGenerationReadySql } from "./cache-affinity-residency.js";
 
 /**
  * Saturation S-C: warm-session protection (redirect-only).
@@ -51,24 +57,6 @@ export type ProtectionEngineKind =
   | "OLLAMA"
   | "LM_STUDIO";
 
-/**
- * The KV budget token mode may use: the reported one (vLLM, SGLang), never
- * llama.cpp's (slot-based), and none when unknown or not positive.
- */
-export function protectionKvBudgetTokens(
-  engineKind: ProtectionEngineKind | null | undefined,
-  kvBudgetTokens: number | null | undefined,
-): number | null {
-  if (engineKind === "LLAMA_CPP") return null;
-  return kvBudgetTokens !== null &&
-    kvBudgetTokens !== undefined &&
-    Number.isInteger(kvBudgetTokens) &&
-    kvBudgetTokens > 0 &&
-    kvBudgetTokens <= 2_147_483_647
-    ? kvBudgetTokens
-    : null;
-}
-
 /** The window one member's warm sessions are protected for (seconds, at least 1). */
 export function protectionWindowSecondsFor(
   windowSeconds: number,
@@ -83,6 +71,11 @@ export type ProtectionShareMode = "EQUAL_SHARE" | "FIRST_COME" | "FIXED_PERCENT"
 
 export type WarmProtectionPolicy = {
   enabled: boolean;
+  /**
+   * Default true. False is a real freeze: admission uses the reported K and
+   * ignores stored cuts. Rows stay unused until unfreeze.
+   */
+  evictionFeedbackEnabled?: boolean;
   windowSeconds: number;
   minTokens: number;
   share: ProtectionShareMode;
@@ -429,6 +422,32 @@ export interface WarmProtectionSource {
   }): Promise<WarmProtectionSnapshot>;
 }
 
+/** Physical feedback is shared only through an exact live serving capability. */
+export async function authorizedKvEvictionRows<T extends { capacityId: string; userId: string }>(
+  rows: readonly T[],
+  ownerId: string,
+  now: Date,
+  db: Pick<typeof prisma, "$queryRaw"> = prisma,
+  poolId?: string,
+): Promise<T[]> {
+  const foreign = rows.filter((row) => row.userId !== ownerId);
+  if (!foreign.length) return [...rows];
+  const allowed = await db.$queryRaw<Array<{ id: string }>>(Prisma.sql`
+    SELECT DISTINCT t."inferenceCapacityId" AS id FROM execution_target t
+    JOIN pool_member m ON m."executionTargetId" = t.id
+    JOIN inference_contribution c ON c.id = m."inferenceContributionId"
+    JOIN model_pool p ON p.id = m."poolId"
+    WHERE t."inferenceCapacityId" = ANY(${foreign.map((row) => row.capacityId)}::text[])
+      AND p."userId" = ${ownerId} AND c."poolOwnerUserId" = p."userId"
+      AND c."poolId" = p.id AND c."contributorUserId" = t."userId"
+      AND c."discoveredModelId" = t."discoveredModelId"
+      AND m."discoveredModelId" = t."discoveredModelId"
+      AND c.state = 'ACTIVE' AND c."expiresAt" > ${now}
+      ${poolId === undefined ? Prisma.empty : Prisma.sql`AND p.id = ${poolId}`}`);
+  const ids = new Set(allowed.map((row) => row.id));
+  return rows.filter((row) => row.userId === ownerId || ids.has(row.capacityId));
+}
+
 type WarmSessionRow = {
   capacityId: string;
   userId: string;
@@ -481,8 +500,21 @@ export async function loadWarmSessions({
              r."executionTargetId", t."inferenceCapacityId" AS "capacityId"
         FROM cache_affinity_record r
         JOIN execution_target t ON t.id = r."executionTargetId"
-       WHERE r."userId" = ${ownerId}
-         AND t."userId" = ${ownerId}
+        LEFT JOIN cache_affinity_residency b ON b."executionTargetId" = t.id
+       WHERE (t."userId" = ${ownerId} OR EXISTS (
+         SELECT 1 FROM pool_member m
+         JOIN inference_contribution c ON c.id = m."inferenceContributionId"
+         JOIN execution_target allowed ON allowed.id = m."executionTargetId"
+         WHERE allowed."inferenceCapacityId" = t."inferenceCapacityId"
+           AND c."poolOwnerUserId" = ${ownerId} AND c."poolId" = m."poolId"
+           AND c."contributorUserId" = allowed."userId"
+           AND c."discoveredModelId" = allowed."discoveredModelId"
+           AND m."discoveredModelId" = allowed."discoveredModelId"
+           AND c.state = 'ACTIVE' AND c."expiresAt" > ${now}
+         LIMIT 1 OFFSET 0
+       ))
+           AND r."cacheGeneration" = COALESCE(wsmp_affinity_scope_generation(t.id, r."poolId"), '')
+         AND ${affinityGenerationReadySql(Prisma.sql`t.id`)}
          AND t."inferenceCapacityId" IN (${Prisma.join([...capacityIds])})
          AND r."lastUsedAt" >= ${since}
          AND r."expiresAt" > ${now}
@@ -530,7 +562,9 @@ export async function loadWarmSessions({
         LEFT JOIN LATERAL (
           SELECT r."sharedWithSessionId", r."sharedPrefixTokens"
             FROM cache_affinity_record r
-           WHERE r."userId" = ${ownerId}
+           WHERE r."userId" = s."userId"
+             AND r."tenantUserId" = s."tenantUserId" AND r."poolId" = s."poolId"
+             AND r."executionTargetId" = s."executionTargetId"
              AND r."sessionId" = s."sessionKey"
              AND r."prefixDigest" IS NULL
              AND r."expiresAt" > ${now}
@@ -579,6 +613,7 @@ export async function loadWarmSessions({
 /** Production source: active leases and warm sessions, plain reads only. */
 export const warmProtectionSource: WarmProtectionSource = {
   async load({ ownerId, capacityIds, policy, now = new Date() }) {
+    const applyCuts = kvEvictionCutsApply(policy.evictionFeedbackEnabled);
     const [active, sessionsByCapacity, kvEvictions] = await Promise.all([
       prisma.capacityLease.groupBy({
         by: ["capacityId"],
@@ -586,11 +621,17 @@ export const warmProtectionSource: WarmProtectionSource = {
         _count: { _all: true },
       }),
       loadWarmSessions({ ownerId, capacityIds, policy, now }),
-      prisma.capacityKvEviction
-        .findMany({
-          where: { capacityId: { in: [...capacityIds] }, userId: ownerId, expiresAt: { gt: now } },
-        })
-        .catch(() => []),
+      applyCuts
+        ? prisma.capacityKvEviction
+            .findMany({
+              where: {
+                capacityId: { in: [...capacityIds] },
+                expiresAt: { gt: now },
+              },
+            })
+            .then((rows) => authorizedKvEvictionRows(rows, ownerId, now))
+            .catch(() => [])
+        : Promise.resolve([]),
     ]);
     return {
       activeByCapacity: new Map(active.map((row) => [row.capacityId, row._count._all])),
@@ -642,11 +683,13 @@ export async function assessWarmProtection({
       kvBudgetTokens: protectionKvBudgetTokens(member.engineKind, member.kvBudgetTokens),
     };
     // Eviction feedback lowers ONLY the PROTECTED threshold; the equity shares
-    // stay on the reported K (a lower K never un-protects a session).
+    // stay on the reported K (a lower K never un-protects a session). A freeze
+    // ignores stored cuts and admits on the reported K.
     load.effectiveKvBudgetTokens = effectiveKvBudgetTokens(
       load.kvBudgetTokens,
       snapshot.kvEvictionByCapacity.get(member.capacityId),
       now,
+      policy.evictionFeedbackEnabled,
     );
     const protectedSessions = protectedWarmSessions(
       snapshot.sessionsByCapacity.get(member.capacityId) ?? [],

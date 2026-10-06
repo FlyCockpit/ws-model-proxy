@@ -7,15 +7,23 @@ vi.mock("@ws-model-proxy/db", () => ({
     sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({ strings, values }),
   },
 }));
+// No database in unit tests: the real env module would demand DATABASE_URL.
+vi.mock("@ws-model-proxy/env/server", () => ({ env: {} }));
 vi.mock("@ws-model-proxy/db/shutdown-fence", () => ({ isDbShutdownFenceArmed: () => false }));
+vi.mock("./cache-affinity-generation.js", () => ({
+  resetAffinityForCapacities: vi.fn(async () => undefined),
+}));
 
 import {
   createKvEvictionFeedback,
+  createKvEvictionResetLedger,
   EVICTION_MISS_FRACTION,
   KV_EVICTION_FLUSH_MIN_INTERVAL_MS,
   MAX_PENDING_CAPACITIES,
+  MAX_RESET_CAPACITIES,
   qualifiesAsEvictionEvidence,
   recordKvEvictionObservations,
+  resetKvEvictionForEndpoint,
 } from "./kv-eviction-feedback.js";
 
 const now = new Date("2026-09-30T12:00:00Z");
@@ -48,6 +56,11 @@ describe("eviction evidence", () => {
     {
       name: "disabled protection",
       patch: { policy: { ...valid.policy, enabled: false } },
+      expected: false,
+    },
+    {
+      name: "frozen eviction feedback",
+      patch: { policy: { ...valid.policy, evictionFeedbackEnabled: false } },
       expected: false,
     },
     { name: "llama.cpp", patch: { engineKind: "LLAMA_CPP" as const }, expected: false },
@@ -99,13 +112,18 @@ describe("eviction evidence", () => {
       expected: true,
     },
     {
-      name: "5% boundary",
-      patch: { usage: { ...valid.usage, cacheReadTokens: 400 } },
+      name: "5% boundary of prompt",
+      patch: { usage: { ...valid.usage, cacheReadTokens: 450 } },
       expected: true,
     },
     {
-      name: "above 5%",
-      patch: { usage: { ...valid.usage, cacheReadTokens: 401 } },
+      name: "above 5% of prompt",
+      patch: { usage: { ...valid.usage, cacheReadTokens: 451 } },
+      expected: false,
+    },
+    {
+      name: "stale vs restart reset",
+      patch: { resetAtMs: now.getTime() + 1 },
       expected: false,
     },
     {
@@ -128,7 +146,7 @@ describe("eviction evidence", () => {
     expect(qualifiesAsEvictionEvidence({ ...valid, ...patch })).toBe(expected),
   );
 
-  it("a 12k reported prefix with an 18k estimate and 700 cached tokens is not evidence", () => {
+  it("a 12k reported prefix with an 18k estimate and 700 cached tokens is a hit on prompt", () => {
     const usage = { promptTokens: 12_000, cacheReadTokens: 700 };
     expect(
       qualifiesAsEvictionEvidence({
@@ -142,6 +160,56 @@ describe("eviction evidence", () => {
         ...valid,
         usage,
         evidence: { ...valid.evidence!, tokens: 18_000 },
+      }),
+    ).toBe(false);
+  });
+
+  it("endpoint reset deletes only matching capacity rows", async () => {
+    const findMany = vi.fn(async () => [{ id: "c1" }, { id: "c2" }]);
+    const deleteMany = vi.fn(async () => ({ count: 2 }));
+    const db = {
+      inferenceCapacity: { findMany },
+      capacityKvEviction: { deleteMany },
+    } as unknown as NonNullable<Parameters<typeof resetKvEvictionForEndpoint>[3]>;
+    await resetKvEvictionForEndpoint("device", "vllm", now, db);
+    expect(deleteMany).toHaveBeenCalledWith({ where: { capacityId: { in: ["c1", "c2"] } } });
+    expect(findMany).toHaveBeenCalledWith({
+      where: {
+        ExecutionTargets: {
+          some: { DiscoveredModel: { Endpoint: { cliDeviceId: "device", slug: "vllm" } } },
+        },
+      },
+      select: { id: true },
+    });
+  });
+
+  it("freeze holds K: misses are not evidence until unfrozen", () => {
+    const frozen = { ...valid, policy: { ...valid.policy, evictionFeedbackEnabled: false } };
+    expect(qualifiesAsEvictionEvidence(frozen)).toBe(false);
+    expect(
+      qualifiesAsEvictionEvidence({ ...frozen, policy: { ...valid.policy, enabled: false } }),
+    ).toBe(false);
+    expect(
+      qualifiesAsEvictionEvidence({
+        ...frozen,
+        policy: { ...valid.policy, evictionFeedbackEnabled: true },
+      }),
+    ).toBe(true);
+  });
+
+  it("reasoning follow-up with large C is not evidence when cache read covers P", () => {
+    expect(
+      qualifiesAsEvictionEvidence({
+        ...valid,
+        usage: { promptTokens: 9_000, cacheReadTokens: 9_000 },
+        evidence: { ...valid.evidence!, tokens: 209_000 },
+      }),
+    ).toBe(false);
+    expect(
+      qualifiesAsEvictionEvidence({
+        ...valid,
+        usage: { promptTokens: 9_000, cacheReadTokens: 0 },
+        evidence: { ...valid.evidence!, tokens: 209_000 },
       }),
     ).toBe(true);
   });
@@ -262,17 +330,18 @@ describe("buffered recorder", () => {
       ownerId: "o",
       sessionIds: ["s"],
       now,
+      kind: "miss",
     });
     for (let i = 0; i < 7; i++) r.observe("c", "o", `t${i}`);
     await vi.advanceTimersByTimeAsync(999);
     expect(r.write).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
-    expect(r.write).toHaveBeenCalledTimes(2);
+    expect(r.write).toHaveBeenCalledTimes(8);
     expect(r.write).toHaveBeenLastCalledWith(
-      expect.objectContaining({ sessionIds: ["t0", "t1", "t2", "t3", "t4", "t5", "t6"] }),
+      expect.objectContaining({ sessionIds: ["t6"], kind: "miss" }),
     );
     await vi.advanceTimersByTimeAsync(1000);
-    expect(r.write).toHaveBeenCalledTimes(2);
+    expect(r.write).toHaveBeenCalledTimes(8);
     expect(vi.getTimerCount()).toBe(0);
   });
   it("coalesces the same session in the buffer", async () => {
@@ -329,11 +398,12 @@ describe("buffered recorder", () => {
     for (let i = 0; i < 100; i++) r.observe("a", "o", `s${i}`);
     r.observe("b", "o", "t");
     await vi.advanceTimersByTimeAsync(1000);
-    expect(r.write).toHaveBeenCalledTimes(4);
+    expect(r.write).toHaveBeenCalledTimes(13);
     expect(r.write).toHaveBeenCalledWith(
       expect.objectContaining({
         capacityId: "a",
-        sessionIds: Array.from({ length: 10 }, (_, i) => `s${i}`),
+        sessionIds: ["s9"],
+        kind: "miss",
       }),
     );
     expect(r.write).toHaveBeenLastCalledWith(
@@ -372,19 +442,20 @@ describe("buffered recorder", () => {
     expect(r.write).toHaveBeenCalledTimes(1);
     settle!();
     await vi.advanceTimersByTimeAsync(1000);
-    expect(r.write).toHaveBeenCalledTimes(2);
+    expect(r.write).toHaveBeenCalledTimes(11);
     expect(r.write).toHaveBeenLastCalledWith(
       expect.objectContaining({
         capacityId: "a",
-        sessionIds: Array.from({ length: 10 }, (_, i) => `s${i}`),
+        sessionIds: ["s9"],
+        kind: "miss",
       }),
     );
     await vi.advanceTimersByTimeAsync(1000);
-    expect(r.write).toHaveBeenCalledTimes(2);
+    expect(r.write).toHaveBeenCalledTimes(11);
     expect(vi.getTimerCount()).toBe(0);
     r.observe("a", "o", "s");
     await vi.advanceTimersByTimeAsync(0);
-    expect(r.write).toHaveBeenCalledTimes(3);
+    expect(r.write).toHaveBeenCalledTimes(12);
     expect(r.write).toHaveBeenLastCalledWith(expect.objectContaining({ sessionIds: ["s"] }));
   });
   it("delayed failures that settle together still log at most once per minute", async () => {
@@ -432,11 +503,84 @@ describe("buffered recorder", () => {
     expect(r.write).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
   });
-  it("hits leave K untouched without any writer call", async () => {
+  it("hits flush as continuations without counting as misses", async () => {
     const r = setup();
-    if (qualifiesAsEvictionEvidence({ ...valid, usage: { ...valid.usage, cacheReadTokens: 8000 } }))
-      r.observe("a", "o", "s");
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(r.write).not.toHaveBeenCalled();
+    expect(
+      qualifiesAsEvictionEvidence({ ...valid, usage: { ...valid.usage, cacheReadTokens: 8000 } }),
+    ).toBe(false);
+    r.observe("a", "o", "s", "hit");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(r.write).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionIds: ["s"], kind: "hit" }),
+    );
+  });
+});
+
+describe("bounded reset generations", () => {
+  it("never revives a long stream after target removal, churn or a backwards reset clock", () => {
+    const ledger = createKvEvictionResetLedger();
+    const oldRequest = ledger.snapshot();
+    ledger.note(["target"], now);
+    ledger.note(["target"], new Date(now.getTime() - 1000));
+    expect(ledger.resetMs("target", oldRequest)).toBe(Number.POSITIVE_INFINITY);
+    expect(ledger.resetMs("target", ledger.snapshot())).toBe(now.getTime());
+    // Removed targets need no explicit delete: the ledger is bounded even if
+    // every future reset is a different target. Old request tokens live alone.
+    for (let index = 0; index < MAX_RESET_CAPACITIES * 3; index++)
+      ledger.note([`churn-${index}`], new Date(now.getTime() + index));
+    expect(ledger.size()).toBe(MAX_RESET_CAPACITIES);
+    expect(
+      qualifiesAsEvictionEvidence({ ...valid, resetAtMs: ledger.resetMs("target", oldRequest) }),
+    ).toBe(false);
+    // Completing in reverse request order cannot lower either frontier.
+    const current = ledger.snapshot();
+    expect(ledger.resetMs("target", current)).toBeGreaterThanOrEqual(now.getTime());
+    expect(ledger.resetMs("target", oldRequest)).toBe(Number.POSITIVE_INFINITY);
+  });
+  it("preserves unrelated evidence before churn and fresh evidence after pruning", () => {
+    const ledger = createKvEvictionResetLedger();
+    const first = ledger.snapshot();
+    ledger.note(["reset-target"], now);
+    expect(ledger.resetMs("unrelated", first)).toBeUndefined();
+    for (let index = 0; index < MAX_RESET_CAPACITIES + 1; index++)
+      ledger.note([`churn-${index}`], now);
+    const fresh = ledger.snapshot();
+    expect(
+      qualifiesAsEvictionEvidence({ ...valid, resetAtMs: ledger.resetMs("unrelated", fresh) }),
+    ).toBe(true);
+    expect(
+      qualifiesAsEvictionEvidence({
+        ...valid,
+        evidence: { ...valid.evidence!, lastUsedAt: now.getTime() - 1 },
+        resetAtMs: ledger.resetMs("unrelated", fresh),
+      }),
+    ).toBe(false);
+  });
+  it("fences a retained target reset even with equal or backwards timestamps", () => {
+    for (const offset of [0, -1000]) {
+      const ledger = createKvEvictionResetLedger();
+      const requestGeneration = ledger.snapshot();
+      ledger.note(["target"], new Date(now.getTime() + offset));
+      expect(
+        qualifiesAsEvictionEvidence({
+          ...valid,
+          resetAtMs: ledger.resetMs("target", requestGeneration),
+        }),
+      ).toBe(false);
+      expect(
+        qualifiesAsEvictionEvidence({
+          ...valid,
+          resetAtMs: ledger.resetMs("target", ledger.snapshot()),
+        }),
+      ).toBe(true);
+    }
+  });
+
+  it("rejects malformed reset identifiers and dates without consuming capacity", () => {
+    const ledger = createKvEvictionResetLedger();
+    ledger.note(["", "a".repeat(129)], now);
+    ledger.note(["target"], new Date(Number.NaN));
+    expect(ledger.size()).toBe(0);
+    expect(ledger.snapshot()).toBe(0);
   });
 });

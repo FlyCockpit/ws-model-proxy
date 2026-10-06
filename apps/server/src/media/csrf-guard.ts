@@ -27,6 +27,14 @@ import type { Context, MiddlewareHandler } from "hono";
 export interface SameOriginGuardOptions {
   /** Exact app origins that may issue mutating requests (e.g. app + SPA origin). */
   allowedOrigins: string[];
+  /**
+   * Allow requests that carry no browser provenance at all (no Origin, no
+   * Sec-Fetch-Site): non-browser clients such as the CLI. Only a browser can
+   * carry a victim's session cookie, and browsers send at least one of these
+   * headers on every state-changing request, so cross-site browser requests
+   * are still refused.
+   */
+  allowNonBrowser?: boolean;
 }
 
 function normalizeOrigin(value: string): string | null {
@@ -39,6 +47,7 @@ function normalizeOrigin(value: string): string | null {
 
 export function createSameOriginGuard({
   allowedOrigins,
+  allowNonBrowser = false,
 }: SameOriginGuardOptions): MiddlewareHandler {
   const allowed = new Set(
     allowedOrigins.map(normalizeOrigin).filter((o): o is string => o !== null),
@@ -64,6 +73,7 @@ export function createSameOriginGuard({
     // cross-site HTML form cannot forge.
     const secFetchSite = c.req.header("sec-fetch-site");
     if (secFetchSite === "same-origin" || secFetchSite === "none") return next();
+    if (allowNonBrowser && secFetchSite === undefined) return next();
 
     // Neither an allowed Origin nor a same-origin attestation — fail closed.
     return reject(c);

@@ -77,6 +77,19 @@ describe("redactSecrets — key-fragment matrix", () => {
     });
   });
 
+  it("redacts a full product credential embedded inside other text", () => {
+    const token = `wsmp_cli_${"A".repeat(43)}`;
+    expect(
+      redactSecrets({
+        start: `WSMP_TOKEN=${token} wsmp connect`,
+        mention: "set WSMP_TOKEN to your wsmp_cli_ token",
+      }),
+    ).toEqual({
+      start: `WSMP_TOKEN=${MCP_REDACTED_VALUE} wsmp connect`,
+      mention: "set WSMP_TOKEN to your wsmp_cli_ token",
+    });
+  });
+
   it("redacts product-credential VALUES under any key", () => {
     expect(
       redactSecrets({

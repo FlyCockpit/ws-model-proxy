@@ -27,20 +27,22 @@ All require an active session, enforced by the `_auth` layout.
 | `/{lang}/dashboard` | Overview: owner-scoped traffic, prompt-cache, latency, error metrics, and engine-load (24h / 7d) per pool and direct model (1h / 24h / 7d), a health strip for CLIs, endpoints, and pool members, and a setup checklist for new users. |
 | `/{lang}/dashboard/chat-test` | Authenticated model chat test surface. |
 | `/{lang}/dashboard/clis` | Own CLI devices and discovered endpoint/model metadata. |
+| `/{lang}/dashboard/deployments` | Durable recipe revisions, group-aware start/stop previews and human confirmations, node deployment grants, instance claims, and inference contribution consent. |
 | `/{lang}/dashboard/terminals` | Browser terminals on the user's own CLIs. |
 | `/{lang}/dashboard/cli-tokens` | Own manually created CLI tokens. |
-| `/{lang}/dashboard/model-api-tokens` | Own OpenAI-compatible model API tokens. |
-| `/{lang}/dashboard/providers` | Own provider keys and per-shared-pool own-key preferences; read/clear while egress is disabled. |
-| `/{lang}/dashboard/pools` | Own model pools with static external-availability badges and provider operations (read/revoke/delete when external providers are disabled); pool cards lead to their dedicated detail pages. |
+| `/{lang}/dashboard/api-tokens` | Own OpenAI-compatible API tokens: scope, expiry, per-token cloud access consent, revocation. |
+| `/{lang}/dashboard/cloud-providers` | Own provider keys and per-shared-pool own-key preferences; read/clear while egress is disabled. |
+| `/{lang}/dashboard/pools` | Own model pools with a request-flow strip, health badges, 24h requests/errors with sparklines, and static external-availability badges; pool cards lead to their dedicated detail pages. |
 | `/{lang}/dashboard/pools/new` | Guided model-pool creation. |
-| `/{lang}/dashboard/pools/{poolId}` | Owner-only model-pool overview, identity editor, and local members. |
-| `/{lang}/dashboard/pools/{poolId}/fallback` | Owner-only external fallback and grantee switches, copyable local/:external model names, ordered providers, plus the external-equivalent model picker (OpenRouter catalog; declaring one is the owner's BYOK consent), aggregate successful own-key requests, and the fallback change history (source: dashboard or MCP). |
-| `/{lang}/dashboard/pools/{poolId}/routing` | Owner-only protocol compatibility and cache-affinity settings. |
-| `/{lang}/dashboard/pools/{poolId}/capacity` | Owner-only pool admission and capacity policy. |
+| `/{lang}/dashboard/pools/{poolId}` | Owner-only model-pool overview: cache stats and local members with their custom limits. |
+| `/{lang}/dashboard/pools/{poolId}/fallback` | Owner-only external fallback and grantee switches, side-by-side local and :external model names, the provider order with move controls, plus the external-equivalent model picker (OpenRouter catalog; declaring one is the owner's BYOK consent), aggregate successful own-key requests, and the fallback change history (source: dashboard or MCP). |
+| `/{lang}/dashboard/pools/{poolId}/routing` | Owner-only execution policy (paid warm protection, embedding contract), protocol compatibility, cache-affinity and cache-protection settings, and metric routing rules shown as sentences. |
+| `/{lang}/dashboard/pools/{poolId}/limits` | Owner-only pool limits and queueing (admission and capacity policy). |
 | `/{lang}/dashboard/pools/{poolId}/media` | Owner-only media transformer, transcription fallback, and attachment settings. |
-| `/{lang}/dashboard/pools/{poolId}/access` | Owner-only pool grants; external use is separately controlled by pool settings and caller token/request consent. |
-| `/{lang}/dashboard/capacity` | Owner-scoped shared inference capacity for direct models and pools. |
-| `/{lang}/dashboard/relay-metadata` | Own relay request metadata cleanup. |
+| `/{lang}/dashboard/pools/{poolId}/sharing` | Owner-only pool grants; external use is separately controlled by pool settings and caller token/request consent. |
+| `/{lang}/dashboard/pools/{poolId}/settings` | Owner-only pool identity (name, slug, description) and the danger zone (delete pool). |
+| `/{lang}/dashboard/runtimes` | Owner-scoped runtimes: the physical engine limits shared by direct models and pools. |
+| `/{lang}/dashboard/request-log` | Own relay request metadata (request log) and its cleanup. |
 | `/{lang}/settings` | Profile settings. |
 | `/{lang}/settings/security` | Two-factor authentication enable/disable. |
 | `/{lang}/settings/mcp` | Own MCP (Model Context Protocol) authorizations: personal access tokens plus per-client OAuth grant list and revocation. Stays available while MCP is disabled so outstanding access can be killed during an emergency shutdown. Token creation is disabled while MCP is off. |

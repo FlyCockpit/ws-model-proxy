@@ -1,7 +1,10 @@
 import { useForm } from "@tanstack/react-form";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, Outlet } from "@tanstack/react-router";
+import { Link, Outlet, useNavigate } from "@tanstack/react-router";
+import { poolGrantSpendCapSchema } from "@ws-model-proxy/api/lib/pool-grant-spend-cap-schema";
 import type { AppRouterClient } from "@ws-model-proxy/api/routers/index";
+import { parseLocaleDecimal } from "@ws-model-proxy/config/decimal-input";
+import { DEFAULT_LOCALE } from "@ws-model-proxy/config/locales";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Checkbox } from "@ws-model-proxy/ui/components/checkbox";
 import {
@@ -10,13 +13,13 @@ import {
   DialogDescription,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from "@ws-model-proxy/ui/components/dialog";
 import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { toast } from "@ws-model-proxy/ui/components/sileo";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
-import { Gauge, Plus, Trash2 } from "lucide-react";
+import { cn } from "@ws-model-proxy/ui/lib/utils";
+import { ArrowDown, ArrowRight, ArrowUp, Cpu, Gauge, Network, Plus, Trash2 } from "lucide-react";
 import type { ReactNode } from "react";
 import { createContext, useContext, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -32,12 +35,16 @@ import {
   PoolMemberForm,
   resolveCapacityAvailability,
 } from "@/components/forwarder-dashboard-sections";
+import { Help } from "@/components/help";
 import { InlineRetry } from "@/components/inline-retry";
 import { PoolCacheStats } from "@/components/pool-cache-stats";
 import { CapacityEngineLoadChart } from "@/components/pool-engine-load";
+import { PoolExecutionPolicy } from "@/components/pool-execution-policy";
 import { ownerFallbackRoutes, PoolFallbackBadge } from "@/components/pool-fallback-badge";
 import { PoolMetricRoutingRules } from "@/components/pool-metric-routing-rules";
 import { ProviderOperationsSection } from "@/components/provider-operations-section";
+import { SlotMeter } from "@/components/slot-meter";
+import { Sparkline } from "@/components/sparkline";
 import { useDeploymentFlags } from "@/hooks/use-deployment-flags";
 import { poolMutationFailureReason } from "@/lib/pool-mutation-failure-reason";
 import { friendly } from "@/utils/friendly-error";
@@ -107,32 +114,70 @@ function usePoolDetail() {
   return detail;
 }
 
+/** Where a request goes: local members first, the cloud only for :external when they are busy. */
+function PoolFlowStrip() {
+  const { t } = useTranslation(["dashboard"]);
+  const steps = [
+    t("dashboard:pools.flow.app"),
+    t("dashboard:pools.flow.pool"),
+    t("dashboard:pools.flow.models"),
+  ];
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-2 rounded-md border bg-muted/30 p-3 text-xs">
+      {steps.map((step, index) => (
+        <span key={step} className="flex items-center gap-2">
+          {index > 0 ? (
+            <ArrowRight aria-hidden="true" className="size-3.5 text-muted-foreground" />
+          ) : null}
+          <span className="rounded-md border bg-background px-2 py-1 font-medium">{step}</span>
+        </span>
+      ))}
+      <span className="flex items-center gap-2 text-muted-foreground">
+        <ArrowRight aria-hidden="true" className="size-3.5" />
+        <span className="rounded-md border border-dashed px-2 py-1">
+          {t("dashboard:pools.flow.cloud")}
+        </span>
+      </span>
+    </div>
+  );
+}
+
+function PoolHealthBadge({ healthy, total }: { healthy: number; total: number }) {
+  const { t } = useTranslation(["dashboard"]);
+  const tone =
+    total === 0
+      ? "bg-muted-foreground"
+      : healthy === total
+        ? "bg-state-success"
+        : "bg-state-warning";
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-xs">
+      <span aria-hidden="true" className={cn("size-1.5 rounded-full", tone)} />
+      {total === 0
+        ? t("dashboard:pools.healthNoMembers")
+        : healthy === total
+          ? t("dashboard:pools.healthAll")
+          : t("dashboard:pools.healthSome", { healthy, total })}
+    </span>
+  );
+}
+
 export function PoolsListPage({ lang }: { lang: string }) {
-  const { t } = useTranslation(["common", "dashboard"]);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const { t, i18n } = useTranslation(["common", "dashboard"]);
   const pools = useQuery(orpc.forwarderManagement.listModelPools.queryOptions());
-  const devices = useQuery(orpc.forwarderManagement.listCliDevices.queryOptions());
-  const capacityAvailability = resolveCapacityAvailability();
-  const capacities = useQuery({
-    ...orpc.capacityManagement.list.queryOptions(),
+  // Optional traffic summary; the list renders without it.
+  const traffic = useQuery({
+    ...orpc.overview.metrics.queryOptions({ input: { range: "24h" } }),
     retry: false,
-    enabled: capacityAvailability === "enabled",
   });
 
-  if (pools.isPending || devices.isPending) return <PageSkeleton />;
-  if (pools.isError || devices.isError) {
+  if (pools.isPending) return <PageSkeleton />;
+  if (pools.isError) {
     return (
-      <InlineRetry
-        message={t("dashboard:pools.loadFailed")}
-        onRetry={() => {
-          void pools.refetch();
-          void devices.refetch();
-        }}
-      />
+      <InlineRetry message={t("dashboard:pools.loadFailed")} onRetry={() => void pools.refetch()} />
     );
   }
 
-  const directModels = allDirectModels(devices.data ?? []);
   return (
     <section className="min-w-0 max-w-full space-y-6">
       <PageHeader
@@ -147,32 +192,11 @@ export function PoolsListPage({ lang }: { lang: string }) {
               <Plus className="size-4" />
               {t("dashboard:pools.wizard.open")}
             </Button>
-            <Dialog open={advancedOpen} onOpenChange={setAdvancedOpen}>
-              <DialogTrigger
-                render={
-                  <Button size="touch" variant="outline">
-                    <Plus className="size-4" />
-                    {t("dashboard:pools.advancedCreate")}
-                  </Button>
-                }
-              />
-              <DialogContent className="max-h-[min(92vh,56rem)] overflow-x-hidden overflow-y-auto sm:max-w-2xl">
-                <DialogHeader>
-                  <DialogTitle>{t("dashboard:pools.createTitle")}</DialogTitle>
-                  <DialogDescription>{t("dashboard:pools.createDescription")}</DialogDescription>
-                </DialogHeader>
-                <PoolForm
-                  mode="create"
-                  directModels={directModels}
-                  capacities={capacities.data ?? []}
-                  capacityAvailability={capacityAvailability}
-                  onSuccess={() => setAdvancedOpen(false)}
-                />
-              </DialogContent>
-            </Dialog>
           </div>
         }
       />
+
+      <PoolFlowStrip />
 
       {pools.data.length === 0 ? (
         <div className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
@@ -186,6 +210,7 @@ export function PoolsListPage({ lang }: { lang: string }) {
             const healthyCount = pool.members.filter(
               (member) => member.healthStatus === "HEALTHY",
             ).length;
+            const poolTraffic = traffic.data?.pools.find((entry) => entry.poolId === pool.id);
             return (
               <article key={pool.id} className="min-w-0 rounded-md border p-4">
                 <div className="flex min-w-0 flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
@@ -201,7 +226,7 @@ export function PoolsListPage({ lang }: { lang: string }) {
                             : [],
                         )}
                       />
-                      <span className="text-xs text-muted-foreground">{pool.slug}</span>
+                      <PoolHealthBadge healthy={healthyCount} total={pool.members.length} />
                     </div>
                     <div className="mt-2 max-w-2xl">
                       <CopyableModelId modelId={pool.canonicalModelId} />
@@ -209,9 +234,9 @@ export function PoolsListPage({ lang }: { lang: string }) {
                     {pool.description ? (
                       <p className="mt-2 text-sm text-muted-foreground">{pool.description}</p>
                     ) : null}
-                    <dl className="mt-3 grid min-w-0 gap-x-5 gap-y-2 text-xs text-muted-foreground sm:grid-cols-2 lg:grid-cols-4">
+                    <dl className="mt-3 grid min-w-0 gap-x-5 gap-y-2 text-xs text-muted-foreground sm:grid-cols-3 lg:grid-cols-5">
                       <div>
-                        <dt>{t("dashboard:pools.memberTiers.PRIMARY")}</dt>
+                        <dt>{t("dashboard:pools.localMembers")}</dt>
                         <dd className="font-medium text-foreground">{primaryCount}</dd>
                       </div>
                       <div>
@@ -219,16 +244,35 @@ export function PoolsListPage({ lang }: { lang: string }) {
                         <dd className="font-medium text-foreground">{overflowCount}</dd>
                       </div>
                       <div>
-                        <dt>{t("dashboard:pools.health")}</dt>
-                        <dd className="font-medium text-foreground">
-                          {healthyCount}/{pool.members.length}
-                        </dd>
-                      </div>
-                      <div>
-                        <dt>{t("dashboard:pools.grantsLabel")}</dt>
+                        <dt>{t("dashboard:pools.sharedWith")}</dt>
                         <dd className="font-medium text-foreground">{pool.grants.length}</dd>
                       </div>
+                      {poolTraffic ? (
+                        <>
+                          <div>
+                            <dt>{t("dashboard:pools.requests24h")}</dt>
+                            <dd className="font-medium text-foreground tabular-nums">
+                              {poolTraffic.current.requests.toLocaleString(i18n.language)}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>{t("dashboard:pools.errors24h")}</dt>
+                            <dd className="font-medium text-foreground tabular-nums">
+                              {poolTraffic.current.errors.toLocaleString(i18n.language)}
+                            </dd>
+                          </div>
+                        </>
+                      ) : null}
                     </dl>
+                    {poolTraffic && poolTraffic.current.requests > 0 ? (
+                      <Sparkline
+                        className="mt-3 max-w-xs"
+                        label={t("dashboard:pools.trafficTrend", { name: pool.name })}
+                        values={poolTraffic.series.map((bucket) =>
+                          Object.values(bucket.values).reduce((sum, value) => sum + value, 0),
+                        )}
+                      />
+                    ) : null}
                     <p className="mt-3 text-xs text-muted-foreground">
                       {t("dashboard:pools.recommendedSurface")}:{" "}
                       {pool.compatibility.recommendedSurface
@@ -260,8 +304,6 @@ export function PoolsListPage({ lang }: { lang: string }) {
           })}
         </div>
       )}
-
-      <ProviderOperationsSection />
     </section>
   );
 }
@@ -284,11 +326,14 @@ export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lan
   const [deletePoolOpen, setDeletePoolOpen] = useState(false);
   const [deleteMemberId, setDeleteMemberId] = useState<string | null>(null);
   const [revokeEmail, setRevokeEmail] = useState<string | null>(null);
+  const navigate = useNavigate();
   const deletePool = useMutation({
     ...orpc.forwarderManagement.deleteModelPool.mutationOptions({
       onSuccess: () => {
         void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() });
         setDeletePoolOpen(false);
+        // The pool's own pages no longer exist; return to the list.
+        void navigate({ to: "/$lang/dashboard/pools", params: { lang } });
       },
     }),
     meta: { deletionEntity: "pool" },
@@ -381,10 +426,6 @@ export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lan
                 <Plus className="size-4" />
                 {t("dashboard:pools.addMember")}
               </Button>
-              <Button size="touch" variant="destructive" onClick={() => setDeletePoolOpen(true)}>
-                <Trash2 className="size-4" />
-                {t("common:actions.delete")}
-              </Button>
             </div>
           }
         />
@@ -398,9 +439,10 @@ export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lan
                 ["overview", "/$lang/dashboard/pools/$poolId"],
                 ["fallback", "/$lang/dashboard/pools/$poolId/fallback"],
                 ["routing", "/$lang/dashboard/pools/$poolId/routing"],
-                ["capacity", "/$lang/dashboard/pools/$poolId/capacity"],
+                ["limits", "/$lang/dashboard/pools/$poolId/limits"],
                 ["media", "/$lang/dashboard/pools/$poolId/media"],
-                ["access", "/$lang/dashboard/pools/$poolId/access"],
+                ["sharing", "/$lang/dashboard/pools/$poolId/sharing"],
+                ["settings", "/$lang/dashboard/pools/$poolId/settings"],
               ] as const
             ).map(([tab, to]) => (
               <Link
@@ -500,32 +542,155 @@ export function PoolDetailPage({ poolId, lang = "en-US" }: { poolId: string; lan
   );
 }
 
+type PoolMemberLimits = {
+  capacityPriority: number | null;
+  capacityConcurrencyMode: string;
+  capacityConcurrencyLimit: number | null;
+  capacityReservedSlots: number | null;
+  capacityBorrowPolicy: string | null;
+  capacityWaitBudgetMode: string;
+  capacityWaitBudgetMs: number | null;
+  capacityContextCeilingMode: string;
+  capacityContextCeiling: number | null;
+  capacityContextMargin: number | null;
+};
+
+/** The member limits that differ from the pool's, as short "label value" strings. */
+function memberCustomLimits(
+  member: PoolMemberLimits,
+  t: (key: string, options?: { count: number }) => string,
+  locale: string,
+): string[] {
+  const field = (name: string) => t(`dashboard:pools.capacity.fields.${name}`);
+  const unlimited = t("dashboard:pools.capacity.modes.unlimited");
+  const number = (value: number | null) => (value ?? 0).toLocaleString(locale);
+  const seconds = (ms: number | null) =>
+    t("dashboard:pools.capacity.presets.seconds", { count: (ms ?? 0) / 1000 });
+  const limited = (mode: string, value: number | null, format = number) =>
+    mode === "UNLIMITED" ? unlimited : format(value);
+  const out: string[] = [];
+  if (member.capacityPriority !== null)
+    out.push(`${field("capacityPriority")} ${member.capacityPriority}`);
+  if (member.capacityConcurrencyMode !== "INHERIT")
+    out.push(
+      `${field("capacityConcurrencyLimit")} ${limited(member.capacityConcurrencyMode, member.capacityConcurrencyLimit)}`,
+    );
+  if (member.capacityReservedSlots !== null)
+    out.push(`${field("capacityReservedSlots")} ${member.capacityReservedSlots}`);
+  if (member.capacityWaitBudgetMode !== "INHERIT")
+    out.push(
+      `${field("capacityWaitBudgetMs")} ${limited(member.capacityWaitBudgetMode, member.capacityWaitBudgetMs, seconds)}`,
+    );
+  if (member.capacityContextCeilingMode !== "INHERIT")
+    out.push(
+      `${field("capacityContextCeiling")} ${limited(member.capacityContextCeilingMode, member.capacityContextCeiling)}`,
+    );
+  if (member.capacityContextMargin !== null)
+    out.push(`${field("capacityContextMargin")} ${number(member.capacityContextMargin)}`);
+  if (member.capacityBorrowPolicy !== null)
+    out.push(
+      `${field("capacityBorrowPolicy")} ${
+        member.capacityBorrowPolicy === "NEVER"
+          ? t("dashboard:pools.capacity.borrowNever")
+          : t("dashboard:pools.capacity.borrowIdle")
+      }`,
+    );
+  return out;
+}
+
+type OverflowMember = PoolDetailContextValue["pool"]["members"][number];
+
+/** Cloud fallback members in the order they are tried, with move controls. */
+function PoolProviderOrder({
+  members,
+  enabled,
+}: {
+  members: readonly OverflowMember[];
+  enabled: boolean;
+}) {
+  const { t } = useTranslation(["dashboard"]);
+  const queryClient = useQueryClient();
+  // Failures use the global mutation toast (one toast per failure).
+  const reorder = useMutation({
+    ...orpc.forwarderManagement.reorderProviderPoolMember.mutationOptions({
+      onSuccess: () =>
+        void queryClient.invalidateQueries({ queryKey: orpc.forwarderManagement.key() }),
+    }),
+    meta: { errorFallbackKey: "dashboard:providers.feedback.failed" },
+  });
+  return (
+    <section className="space-y-2" aria-labelledby="pool-provider-order-title">
+      <h4 id="pool-provider-order-title" className="text-sm font-semibold">
+        {t("dashboard:pools.providerOrder.title")}
+      </h4>
+      <p className="text-xs text-muted-foreground">{t("dashboard:pools.providerOrder.hint")}</p>
+      <ol className="space-y-2">
+        {members.map((member, index) => {
+          const name =
+            member.providerModel?.upstreamModelId ?? member.model?.canonicalModelId ?? member.id;
+          return (
+            <li
+              key={member.id}
+              className="flex min-w-0 flex-wrap items-center gap-3 border p-3"
+              data-testid="provider-order-row"
+            >
+              <span
+                className="flex size-7 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-semibold tabular-nums"
+                aria-hidden="true"
+              >
+                {index + 1}
+              </span>
+              <div className="min-w-0 flex-1">
+                <code className="block break-all text-xs">{name}</code>
+                {member.providerModel?.ProviderAccount.label ? (
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {member.providerModel.ProviderAccount.label}
+                  </p>
+                ) : null}
+              </div>
+              <div className="flex shrink-0 gap-1">
+                <Button
+                  type="button"
+                  size="touch"
+                  variant="outline"
+                  disabled={!enabled || index === 0 || reorder.isPending}
+                  aria-label={t("dashboard:pools.providerOrder.moveEarlier", { name })}
+                  onClick={() => reorder.mutate({ id: member.id, direction: "EARLIER" })}
+                >
+                  <ArrowUp className="size-4" />
+                </Button>
+                <Button
+                  type="button"
+                  size="touch"
+                  variant="outline"
+                  disabled={!enabled || index === members.length - 1 || reorder.isPending}
+                  aria-label={t("dashboard:pools.providerOrder.moveLater", { name })}
+                  onClick={() => reorder.mutate({ id: member.id, direction: "LATER" })}
+                >
+                  <ArrowDown className="size-4" />
+                </Button>
+              </div>
+            </li>
+          );
+        })}
+      </ol>
+    </section>
+  );
+}
+
 export function PoolDetailTab({
   tab,
 }: {
-  tab: "overview" | "fallback" | "routing" | "capacity" | "media" | "access";
+  tab: "overview" | "fallback" | "routing" | "limits" | "media" | "sharing" | "settings";
 }) {
-  const { t } = useTranslation(["common", "dashboard"]);
+  const { t, i18n } = useTranslation(["common", "dashboard"]);
   const detail = usePoolDetail();
   const { pool } = detail;
 
   if (tab === "overview") {
     return (
       <div className="space-y-6">
-        <PoolForm
-          key={`${pool.id}-identity`}
-          mode="edit"
-          pool={pool}
-          directModels={detail.directModels}
-          capacities={detail.capacities}
-          capacityAvailability={detail.capacityAvailability}
-          sections={["identity"]}
-          stickySave
-          onSuccess={() => undefined}
-        />
-        <div className="border-t pt-6">
-          <PoolCacheStats poolId={pool.id} />
-        </div>
+        <PoolCacheStats poolId={pool.id} />
         <section className="space-y-3 border-t pt-6" aria-labelledby="pool-members-title">
           <h3 id="pool-members-title" className="text-base font-semibold">
             {t("dashboard:pools.membersTitle")}
@@ -535,75 +700,41 @@ export function PoolDetailTab({
           ) : (
             <ul className="space-y-2">
               {pool.members.map((member) => {
-                const hasOverride =
-                  member.capacityPriority !== null ||
-                  member.capacityConcurrencyMode !== "INHERIT" ||
-                  member.capacityReservedSlots !== null ||
-                  member.capacityBorrowPolicy !== null ||
-                  member.capacityWaitBudgetMode !== "INHERIT" ||
-                  member.capacityContextCeilingMode !== "INHERIT" ||
-                  member.capacityContextMargin !== null;
-                const concurrencyLimit =
-                  member.capacityConcurrencyMode === "INHERIT"
-                    ? pool.capacityConcurrencyLimit
-                    : member.capacityConcurrencyMode === "UNLIMITED"
-                      ? null
-                      : member.capacityConcurrencyLimit;
-                const waitBudget =
-                  member.capacityWaitBudgetMode === "INHERIT"
-                    ? pool.capacityWaitBudgetMs
-                    : member.capacityWaitBudgetMode === "UNLIMITED"
-                      ? null
-                      : member.capacityWaitBudgetMs;
-                const contextCeiling =
-                  member.capacityContextCeilingMode === "INHERIT"
-                    ? pool.capacityContextCeiling
-                    : member.capacityContextCeilingMode === "UNLIMITED"
-                      ? null
-                      : member.capacityContextCeiling;
-                const borrowPolicy = member.capacityBorrowPolicy ?? pool.capacityBorrowPolicy;
+                const custom = memberCustomLimits(member, t, i18n.language);
                 return (
                   <li
                     key={member.id}
                     className="flex min-w-0 flex-wrap items-center justify-between gap-3 border p-3"
                   >
-                    <div className="min-w-0">
+                    <div className="min-w-0 space-y-1">
                       <code className="block break-all font-mono text-xs">
                         {member.model?.canonicalModelId ?? member.discoveredModelId ?? member.id}
                       </code>
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        {member.routingStatus} ·{" "}
-                        {member.tier === "PUBLIC_OVERFLOW"
-                          ? t("dashboard:pools.memberTiers.PUBLIC_OVERFLOW")
-                          : `${t("dashboard:pools.weight")}: ${member.weight}`}
+                      <p className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+                        <span
+                          className={cn(
+                            "rounded-sm border px-1.5 py-0.5 font-medium",
+                            member.routingStatus === "ACTIVE"
+                              ? "border-emerald-600/40 text-emerald-700 dark:text-emerald-300"
+                              : "border-amber-600/40 text-amber-700 dark:text-amber-300",
+                          )}
+                        >
+                          {t(`dashboard:overview.pools.routing.${member.routingStatus}`)}
+                        </span>
+                        <span className="text-muted-foreground">
+                          {member.tier === "PUBLIC_OVERFLOW"
+                            ? t("dashboard:pools.memberTiers.PUBLIC_OVERFLOW")
+                            : `${t("dashboard:pools.weight")}: ${member.weight}`}
+                        </span>
                       </p>
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        {hasOverride
-                          ? t("dashboard:pools.capacity.modes.override")
-                          : t("dashboard:pools.inherited")}
-                        : {t("dashboard:pools.capacity.fields.capacityPriority")}{" "}
-                        {member.capacityPriority ?? pool.capacityPriority}
-                        {" · "}
-                        {t("dashboard:pools.capacity.fields.capacityConcurrencyLimit")}{" "}
-                        {concurrencyLimit ?? t("dashboard:pools.capacity.modes.unlimited")}
-                        {" · "}
-                        {t("dashboard:pools.capacity.fields.capacityReservedSlots")}{" "}
-                        {member.capacityReservedSlots ?? pool.capacityReservedSlots}
-                        {" · "}
-                        {t("dashboard:pools.capacity.fields.capacityWaitBudgetMs")}{" "}
-                        {waitBudget ?? t("dashboard:pools.capacity.modes.unlimited")}
-                        {" · "}
-                        {t("dashboard:pools.capacity.fields.capacityContextCeiling")}{" "}
-                        {contextCeiling ?? t("dashboard:pools.capacity.modes.unlimited")}
-                        {" · "}
-                        {t("dashboard:pools.capacity.fields.capacityContextMargin")}{" "}
-                        {member.capacityContextMargin ?? pool.capacityContextMargin}
-                        {" · "}
-                        {t("dashboard:pools.capacity.fields.capacityBorrowPolicy")}{" "}
-                        {borrowPolicy === "NEVER"
-                          ? t("dashboard:pools.capacity.borrowNever")
-                          : t("dashboard:pools.capacity.borrowIdle")}
-                      </p>
+                      {/* Capacity limits govern local members only. */}
+                      {member.tier === "PUBLIC_OVERFLOW" ? null : (
+                        <p className="text-xs text-muted-foreground" data-testid="member-limits">
+                          {custom.length === 0
+                            ? t("dashboard:pools.memberLimits.inherited")
+                            : `${t("dashboard:pools.memberLimits.custom", { count: custom.length })}: ${custom.join(" · ")}`}
+                        </p>
+                      )}
                     </div>
                     <div className="flex shrink-0 flex-wrap gap-2">
                       <Button
@@ -630,12 +761,44 @@ export function PoolDetailTab({
       </div>
     );
   }
-  if (tab === "routing") {
+  if (tab === "settings") {
     return (
       <div className="space-y-8">
         <PoolForm
+          key={`${pool.id}-identity`}
+          pool={pool}
+          directModels={detail.directModels}
+          capacities={detail.capacities}
+          capacityAvailability={detail.capacityAvailability}
+          sections={["identity"]}
+          stickySave
+          onSuccess={() => undefined}
+        />
+        <section
+          className="space-y-3 rounded-md border border-destructive/40 p-4"
+          aria-labelledby="pool-danger-title"
+        >
+          <h3 id="pool-danger-title" className="text-base font-semibold text-destructive">
+            {t("dashboard:pools.dangerZone.title")}
+          </h3>
+          <p className="text-sm text-muted-foreground">{t("dashboard:pools.dangerZone.body")}</p>
+          <Button size="touch" variant="destructive" onClick={detail.openDelete}>
+            <Trash2 className="size-4" />
+            {t("common:actions.delete")}
+          </Button>
+        </section>
+      </div>
+    );
+  }
+  if (tab === "routing") {
+    return (
+      <div className="space-y-8">
+        <PoolExecutionPolicy
+          key={`${pool.id}-${String(pool.paidWarmProtectionEnabled)}-${JSON.stringify(pool.embeddingContract)}`}
+          pool={pool}
+        />
+        <PoolForm
           key={`${pool.id}-${tab}`}
-          mode="edit"
           pool={pool}
           directModels={detail.directModels}
           capacities={detail.capacities}
@@ -650,22 +813,21 @@ export function PoolDetailTab({
       </div>
     );
   }
-  if (tab === "capacity" || tab === "media") {
+  if (tab === "limits" || tab === "media") {
     return (
       <PoolForm
         key={`${pool.id}-${tab}`}
-        mode="edit"
         pool={pool}
         directModels={detail.directModels}
         capacities={detail.capacities}
         capacityAvailability={detail.capacityAvailability}
-        sections={[tab]}
+        sections={[tab === "limits" ? "capacity" : "media"]}
         stickySave
         onSuccess={() => undefined}
       />
     );
   }
-  if (tab === "access") {
+  if (tab === "sharing") {
     return (
       <PoolGrantsSection
         pool={pool}
@@ -691,10 +853,11 @@ export function PoolDetailTab({
     );
   const overflowMembers = pool.members
     .filter((member) => member.tier === "PUBLIC_OVERFLOW")
+    // Same order as the server: publicOrder, then id.
     .sort(
       (left, right) =>
         (left.publicOrder ?? Number.MAX_SAFE_INTEGER) -
-        (right.publicOrder ?? Number.MAX_SAFE_INTEGER),
+          (right.publicOrder ?? Number.MAX_SAFE_INTEGER) || left.id.localeCompare(right.id),
     );
   const fallbackEnabled = detail.providerEgressEnabled;
   return (
@@ -719,20 +882,7 @@ export function PoolDetailTab({
       />
       <PoolFallbackHistory poolId={pool.id} />
       {overflowMembers.length ? (
-        <ol className="space-y-2">
-          {overflowMembers.map((member, index) => (
-            <li key={member.id} className="min-w-0 border p-3">
-              <code className="break-all text-xs">
-                {member.providerModel?.upstreamModelId ??
-                  member.model?.canonicalModelId ??
-                  member.id}
-              </code>
-              <p className="mt-1 text-xs text-muted-foreground">
-                {t("dashboard:pools.publicOrder", { order: member.publicOrder ?? index + 1 })}
-              </p>
-            </li>
-          ))}
-        </ol>
+        <PoolProviderOrder members={overflowMembers} enabled={fallbackEnabled} />
       ) : (
         <div className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
           <p>{t("dashboard:pools.fallbackEmpty")}</p>
@@ -865,6 +1015,18 @@ function protectionOverrideLabel(
   return t("dashboard:pools.grantRouting.percentValue", { percent });
 }
 
+function spendCapLabel(
+  spend: PoolGrantRow["fallbackSpend"],
+  t: ReturnType<typeof useTranslation>["t"],
+): string {
+  if (!spend) return t("dashboard:pools.grantRouting.spendCapNone");
+  return t("dashboard:pools.grantRouting.spendCapSummary", {
+    limit: spend.limit,
+    currency: spend.currency,
+    period: t(`dashboard:providers.enums.${spend.period}`),
+  });
+}
+
 function PoolGrantsSection({
   pool,
   openGrant,
@@ -906,6 +1068,7 @@ function PoolGrantsSection({
                       grant.queuePriority === null
                         ? t("dashboard:pools.grantRouting.inherit")
                         : grant.queuePriority,
+                    spendCap: spendCapLabel(grant.fallbackSpend, t),
                   })}
                 </span>
               </div>
@@ -972,7 +1135,8 @@ function PoolGrantRoutingForm({
   grant: PoolGrantRow;
   onSaved: () => void;
 }) {
-  const { t } = useTranslation(["common", "dashboard"]);
+  const { t, i18n } = useTranslation(["common", "dashboard"]);
+  const locale = i18n.language || DEFAULT_LOCALE;
   const queryClient = useQueryClient();
   const update = useMutation({
     ...orpc.forwarderManagement.updatePoolGrant.mutationOptions({
@@ -997,6 +1161,10 @@ function PoolGrantRoutingForm({
       protectionPercent: grant.protectionOverridePercent || 50,
       priorityMode: (grant.queuePriority === null ? "INHERIT" : "SET") as "INHERIT" | "SET",
       queuePriority: grant.queuePriority ?? 16,
+      spendMode: (grant.fallbackSpend == null ? "NONE" : "SET") as "NONE" | "SET",
+      spendLimit: grant.fallbackSpend?.limit ?? "10",
+      spendCurrency: grant.fallbackSpend?.currency ?? "USD",
+      spendPeriod: (grant.fallbackSpend?.period ?? "UTC_MONTH") as "UTC_DAY" | "UTC_MONTH",
     },
     validators: {
       // A hidden field (its mode not selected) is never validated.
@@ -1006,6 +1174,10 @@ function PoolGrantRoutingForm({
           protectionPercent: z.number(),
           priorityMode: z.enum(["INHERIT", "SET"]),
           queuePriority: z.number(),
+          spendMode: z.enum(["NONE", "SET"]),
+          spendLimit: z.string(),
+          spendCurrency: z.string(),
+          spendPeriod: z.enum(["UTC_DAY", "UTC_MONTH"]),
         })
         .refine(
           (value) =>
@@ -1020,7 +1192,44 @@ function PoolGrantRoutingForm({
             (Number.isInteger(value.queuePriority) &&
               value.queuePriority >= 0 &&
               value.queuePriority <= 31),
-        ),
+        )
+        .superRefine((value, ctx) => {
+          if (value.spendMode !== "SET") return;
+          const limit = parseLocaleDecimal(value.spendLimit, locale);
+          if (limit === null) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["spendLimit"],
+              message: t("dashboard:pools.grantRouting.spendLimitInvalid"),
+            });
+            return;
+          }
+          const currency = value.spendCurrency.trim().toUpperCase();
+          const parsed = poolGrantSpendCapSchema.safeParse({
+            limit,
+            currency,
+            period: value.spendPeriod,
+          });
+          const positive = Number(limit) > 0;
+          if (parsed.success && positive) return;
+          const paths = new Set(
+            (parsed.success ? [] : parsed.error.issues).map((issue) => issue.path[0]),
+          );
+          if (!parsed.success && paths.has("currency")) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["spendCurrency"],
+              message: t("dashboard:pools.grantRouting.spendCurrencyInvalid"),
+            });
+          }
+          if (!positive || paths.has("limit") || paths.size === 0) {
+            ctx.addIssue({
+              code: "custom",
+              path: ["spendLimit"],
+              message: t("dashboard:pools.grantRouting.spendLimitInvalid"),
+            });
+          }
+        }),
     },
     onSubmit: async ({ value }) => {
       await update
@@ -1034,6 +1243,14 @@ function PoolGrantRoutingForm({
                 ? 0
                 : value.protectionPercent,
           queuePriority: value.priorityMode === "INHERIT" ? null : value.queuePriority,
+          fallbackSpend:
+            value.spendMode === "NONE"
+              ? null
+              : {
+                  limit: parseLocaleDecimal(value.spendLimit, locale) ?? value.spendLimit,
+                  currency: value.spendCurrency.trim().toUpperCase(),
+                  period: value.spendPeriod,
+                },
         })
         .catch(() => undefined);
     },
@@ -1120,6 +1337,102 @@ function PoolGrantRoutingForm({
             ) : null}
             <p className="text-xs text-muted-foreground">
               {t("dashboard:pools.grantRouting.priorityHint")}
+            </p>
+          </div>
+        )}
+      </form.Field>
+      <form.Field name="spendMode">
+        {(modeField) => (
+          <div className="min-w-0 space-y-2">
+            <Label htmlFor={`grant-spend-${grant.id}`}>
+              {t("dashboard:pools.grantRouting.spendCap")}
+            </Label>
+            <select
+              id={`grant-spend-${grant.id}`}
+              className="h-11 w-full rounded-md border bg-transparent px-3 text-sm"
+              value={modeField.state.value}
+              onChange={(event) => modeField.handleChange(event.target.value as "NONE" | "SET")}
+            >
+              <option value="NONE">{t("dashboard:pools.grantRouting.spendCapNone")}</option>
+              <option value="SET">{t("dashboard:pools.grantRouting.spendCapSet")}</option>
+            </select>
+            {modeField.state.value === "SET" ? (
+              <div className="grid min-w-0 gap-2 sm:grid-cols-3">
+                <form.Field name="spendLimit">
+                  {(field) => (
+                    <div className="min-w-0 space-y-1">
+                      <Input
+                        className="min-h-11 min-w-0"
+                        inputMode="decimal"
+                        aria-invalid={field.state.meta.errors.length > 0}
+                        aria-describedby={
+                          field.state.meta.errors.length > 0
+                            ? `grant-spend-errors-${grant.id}`
+                            : undefined
+                        }
+                        value={field.state.value}
+                        onChange={(event) => field.handleChange(event.target.value)}
+                        aria-label={t("dashboard:pools.grantRouting.spendLimit")}
+                      />
+                      <div id={`grant-spend-errors-${grant.id}`}>
+                        {field.state.meta.errors.map((error) => (
+                          <p key={error?.message} className="text-sm text-destructive">
+                            {error?.message}
+                          </p>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </form.Field>
+                <form.Field name="spendCurrency">
+                  {(field) => (
+                    <div className="min-w-0 space-y-1">
+                      <Input
+                        className="min-h-11 min-w-0 uppercase"
+                        maxLength={3}
+                        aria-invalid={field.state.meta.errors.length > 0}
+                        aria-describedby={
+                          field.state.meta.errors.length > 0
+                            ? `grant-currency-errors-${grant.id}`
+                            : undefined
+                        }
+                        value={field.state.value}
+                        onChange={(event) => field.handleChange(event.target.value.toUpperCase())}
+                        aria-label={t("dashboard:pools.grantRouting.spendCurrency")}
+                      />
+                      <div id={`grant-currency-errors-${grant.id}`}>
+                        {field.state.meta.errors.map((error) => (
+                          <p key={error?.message} className="text-sm text-destructive">
+                            {error?.message}
+                          </p>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </form.Field>
+                <form.Field name="spendPeriod">
+                  {(field) => (
+                    <select
+                      className="h-11 min-w-0 rounded-md border bg-transparent px-3 text-sm"
+                      value={field.state.value}
+                      onChange={(event) =>
+                        field.handleChange(event.target.value as "UTC_DAY" | "UTC_MONTH")
+                      }
+                      aria-label={t("dashboard:pools.grantRouting.spendPeriod")}
+                    >
+                      <option value="UTC_DAY">
+                        {t("dashboard:pools.grantRouting.spendPeriodDay")}
+                      </option>
+                      <option value="UTC_MONTH">
+                        {t("dashboard:pools.grantRouting.spendPeriodMonth")}
+                      </option>
+                    </select>
+                  )}
+                </form.Field>
+              </div>
+            ) : null}
+            <p className="text-xs text-muted-foreground">
+              {t("dashboard:pools.grantRouting.spendCapHint")}
             </p>
           </div>
         )}
@@ -1229,9 +1542,21 @@ function PoolFallbackSettings({
           modelId: pool.canonicalModelId,
         })}
       </p>
-      <div className="space-y-2">
-        <CopyableModelId modelId={pool.canonicalModelId} />
-        <CopyableModelId modelId={`${pool.canonicalModelId}:external`} />
+      <div className="grid min-w-0 gap-3 sm:grid-cols-2">
+        <div className="min-w-0 space-y-1 rounded-md border p-3">
+          <p className="text-sm font-medium">{t("dashboard:pools.fallbackCompare.localTitle")}</p>
+          <p className="text-xs text-muted-foreground">
+            {t("dashboard:pools.fallbackCompare.localBody")}
+          </p>
+          <CopyableModelId modelId={pool.canonicalModelId} />
+        </div>
+        <div className="min-w-0 space-y-1 rounded-md border border-dashed p-3">
+          <p className="text-sm font-medium">{t("dashboard:pools.fallbackCompare.cloudTitle")}</p>
+          <p className="text-xs text-muted-foreground">
+            {t("dashboard:pools.fallbackCompare.cloudBody")}
+          </p>
+          <CopyableModelId modelId={`${pool.canonicalModelId}:external`} />
+        </div>
       </div>
       <form.Field name="fallbackEnabled">
         {(field) => (
@@ -1325,21 +1650,22 @@ function CapacityEngineFacts({ capacity }: { capacity: PoolDetailCapacity }) {
         )
       : null,
     capacity.kvBudgetTokens !== null
-      ? withProvenance(
-          [
+      ? [
+          withProvenance(
             t("dashboard:pools.capacity.engineFacts.kvBudget", {
               value: capacity.kvBudgetTokens.toLocaleString(),
             }),
-            typeof capacity.effectiveKvBudgetTokens === "number"
-              ? t("dashboard:pools.capacity.engineFacts.kvBudgetEffective", {
-                  value: capacity.effectiveKvBudgetTokens.toLocaleString(),
-                })
-              : null,
-          ]
-            .filter((part): part is string => part !== null)
-            .join(" · "),
-          capacity.kvBudgetTokensSource,
-        )
+            capacity.kvBudgetTokensSource,
+          ),
+          typeof capacity.effectiveKvBudgetTokens === "number" &&
+          capacity.effectiveKvBudgetTokens < capacity.kvBudgetTokens
+            ? t("dashboard:pools.capacity.engineFacts.kvBudgetEffective", {
+                value: capacity.effectiveKvBudgetTokens.toLocaleString(),
+              })
+            : null,
+        ]
+          .filter((part): part is string => part !== null)
+          .join(" · ")
       : null,
     capacity.maxModelLen !== null
       ? withProvenance(
@@ -1368,6 +1694,33 @@ function CapacityEngineFacts({ capacity }: { capacity: PoolDetailCapacity }) {
         </>
       ) : null}
       {showChart ? <CapacityEngineLoadChart capacityId={capacity.id} /> : null}
+    </div>
+  );
+}
+
+/** What a runtime limits versus what a pool's limits divide. */
+function RuntimeLayers() {
+  const { t } = useTranslation(["dashboard"]);
+  return (
+    <div className="grid min-w-0 overflow-hidden rounded-md border md:grid-cols-2">
+      <div className="min-w-0 space-y-1 p-4">
+        <p className="flex items-center gap-2 text-sm font-semibold">
+          <Cpu aria-hidden="true" className="size-4 shrink-0 text-primary" />
+          {t("dashboard:pools.capacity.layers.runtimeTitle")}
+        </p>
+        <p className="text-xs text-muted-foreground">
+          {t("dashboard:pools.capacity.layers.runtimeBody")}
+        </p>
+      </div>
+      <div className="min-w-0 space-y-1 border-t p-4 md:border-t-0 md:border-s">
+        <p className="flex items-center gap-2 text-sm font-semibold">
+          <Network aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+          {t("dashboard:pools.capacity.layers.poolTitle")}
+        </p>
+        <p className="text-xs text-muted-foreground">
+          {t("dashboard:pools.capacity.layers.poolBody")}
+        </p>
+      </div>
     </div>
   );
 }
@@ -1419,6 +1772,7 @@ export function InferenceCapacityPage() {
           </Button>
         }
       />
+      <RuntimeLayers />
       {availability !== "enabled" ? (
         <p className="rounded-md border bg-muted/40 p-3 text-sm text-muted-foreground">
           {t(
@@ -1449,10 +1803,25 @@ export function InferenceCapacityPage() {
                   <p className="mt-1 truncate text-sm text-muted-foreground">
                     {capacity.runtimeModel}
                   </p>
+                  <div className="mt-3 space-y-1">
+                    <div className="flex items-center justify-between gap-2 text-xs">
+                      <span className="flex items-center gap-1 text-muted-foreground">
+                        {t("dashboard:pools.capacity.slotsInUse")}
+                        <Help>{t("dashboard:pools.capacity.slotsHelp")}</Help>
+                      </span>
+                      <span className="font-medium tabular-nums">
+                        {capacity._count.CapacityLeases} / {capacity.hardConcurrencyLimit ?? "∞"}
+                      </span>
+                    </div>
+                    <SlotMeter
+                      active={capacity._count.CapacityLeases}
+                      slots={capacity.hardConcurrencyLimit}
+                      waiting={capacity._count.CapacityWaiters}
+                    />
+                  </div>
                   <p className="mt-2 text-xs text-muted-foreground">
-                    {t("dashboard:pools.capacity.active", {
-                      count: capacity._count.CapacityLeases,
-                      limit: capacity.hardConcurrencyLimit ?? "∞",
+                    {t("dashboard:pools.capacity.usedBy", {
+                      count: capacity._count.ExecutionTargets,
                     })}
                   </p>
                   <CapacityEngineFacts capacity={capacity} />

@@ -11,6 +11,8 @@ export const ENGINE_LOAD_HISTORY_WINDOW_MS =
   ENGINE_LOAD_HISTORY_POINTS * ENGINE_LOAD_HISTORY_BUCKET_MS;
 export const ENGINE_LOAD_HISTORY_MAX_KEYS_PER_DEVICE = 64;
 export const ENGINE_LOAD_HISTORY_MAX_KEYS = 2_000;
+/** Full prune cadence. Independent of the per-device key cap. */
+export const ENGINE_LOAD_HISTORY_PRUNE_EVERY_MS = 10_000;
 
 export type EngineLoadHistorySample = {
   running: number;
@@ -61,6 +63,7 @@ type Ring = {
   lastMs: number;
 };
 
+/** Same shape as live `endpoint.load`: null sample slug is the endpoint-wide key. */
 export function historyKey(
   cliDeviceId: string,
   endpointSlug: string,
@@ -147,6 +150,7 @@ export function expandHistorySeries(
 export class EngineLoadHistoryStore {
   private rings = new Map<string, Ring>();
   private keysByDevice = new Map<string, Set<string>>();
+  private lastPruneMs = Number.NEGATIVE_INFINITY;
 
   get size(): number {
     return this.rings.size;
@@ -162,29 +166,40 @@ export class EngineLoadHistoryStore {
     modelSlug: string | null,
     sample: EngineLoadHistorySample,
   ): boolean {
+    const receivedMs = sample.receivedAt.getTime();
+    if (
+      this.lastPruneMs === Number.NEGATIVE_INFINITY ||
+      receivedMs - this.lastPruneMs >= ENGINE_LOAD_HISTORY_PRUNE_EVERY_MS
+    ) {
+      this.lastPruneMs = receivedMs;
+      this.prune(sample.receivedAt);
+    }
     const key = historyKey(cliDeviceId, endpointSlug, modelSlug);
     const existing = this.rings.get(key);
     if (!existing) {
       if (
-        (this.keysByDevice.get(cliDeviceId)?.size ?? 0) >= ENGINE_LOAD_HISTORY_MAX_KEYS_PER_DEVICE
+        (this.keysByDevice.get(cliDeviceId)?.size ?? 0) >=
+          ENGINE_LOAD_HISTORY_MAX_KEYS_PER_DEVICE &&
+        !this.evictStaleForDevice(cliDeviceId, receivedMs)
       ) {
         return false;
       }
-      if (this.rings.size >= ENGINE_LOAD_HISTORY_MAX_KEYS) return false;
-    }
-    const receivedMs = sample.receivedAt.getTime();
-    this.pruneRing(existing, receivedMs);
-    const startMs = bucketStartMs(receivedMs);
-    const bucket = mergeSampleIntoBucket(existing?.buckets.get(startMs), sample);
-    if (!existing) {
-      const buckets = new Map<number, EngineLoadHistoryBucket>([[startMs, bucket]]);
+      if (this.rings.size >= ENGINE_LOAD_HISTORY_MAX_KEYS && !this.evictStale(receivedMs)) {
+        return false;
+      }
+      const startMs = bucketStartMs(receivedMs);
+      const buckets = new Map<number, EngineLoadHistoryBucket>([
+        [startMs, mergeSampleIntoBucket(undefined, sample)],
+      ]);
       this.rings.set(key, { cliDeviceId, buckets, lastMs: receivedMs });
       const set = this.keysByDevice.get(cliDeviceId) ?? new Set<string>();
       set.add(key);
       this.keysByDevice.set(cliDeviceId, set);
       return true;
     }
-    existing.buckets.set(startMs, bucket);
+    this.pruneRing(existing, receivedMs);
+    const startMs = bucketStartMs(receivedMs);
+    existing.buckets.set(startMs, mergeSampleIntoBucket(existing.buckets.get(startMs), sample));
     existing.lastMs = Math.max(existing.lastMs, receivedMs);
     return true;
   }
@@ -195,12 +210,13 @@ export class EngineLoadHistoryStore {
     modelSlug: string | null,
     now: Date,
   ): EngineLoadHistoryPoint[] {
-    const ring = this.rings.get(historyKey(cliDeviceId, endpointSlug, modelSlug));
-    this.pruneRing(ring, now.getTime());
-    if (ring && ring.buckets.size === 0) {
-      this.drop(historyKey(cliDeviceId, endpointSlug, modelSlug), cliDeviceId);
+    const exact = this.ringSeries(cliDeviceId, endpointSlug, modelSlug, now);
+    // CLI samples are endpoint-wide (`modelSlug: null`). A member keyed by
+    // DiscoveredModel.slug falls back to that ring, like pickEndpointLoad.
+    if (modelSlug && !exact.ring) {
+      return this.ringSeries(cliDeviceId, endpointSlug, null, now).points;
     }
-    return expandHistorySeries(ring?.buckets.values() ?? [], now);
+    return exact.points;
   }
 
   snapshot(
@@ -220,11 +236,36 @@ export class EngineLoadHistoryStore {
     }
   }
 
+  dropDevice(cliDeviceId: string): void {
+    const keys = this.keysByDevice.get(cliDeviceId);
+    if (!keys) return;
+    for (const key of [...keys]) this.rings.delete(key);
+    this.keysByDevice.delete(cliDeviceId);
+  }
+
+  private ringSeries(
+    cliDeviceId: string,
+    endpointSlug: string,
+    modelSlug: string | null,
+    now: Date,
+  ): { ring: Ring | undefined; points: EngineLoadHistoryPoint[] } {
+    const key = historyKey(cliDeviceId, endpointSlug, modelSlug);
+    const ring = this.rings.get(key);
+    this.pruneRing(ring, now.getTime());
+    if (ring && ring.buckets.size === 0) {
+      this.drop(key, cliDeviceId);
+      return { ring: undefined, points: expandHistorySeries([], now) };
+    }
+    return { ring, points: expandHistorySeries(ring?.buckets.values() ?? [], now) };
+  }
+
   private pruneRing(ring: Ring | undefined, nowMs: number): void {
     if (!ring) return;
     const windowStart = windowStartMs(nowMs);
-    for (const startMs of [...ring.buckets.keys()]) {
-      if (startMs < windowStart) ring.buckets.delete(startMs);
+    // Buckets are inserted in time order; stop at the first one still in window.
+    for (const startMs of ring.buckets.keys()) {
+      if (startMs >= windowStart) break;
+      ring.buckets.delete(startMs);
     }
   }
 
@@ -233,5 +274,35 @@ export class EngineLoadHistoryStore {
     const set = this.keysByDevice.get(cliDeviceId);
     set?.delete(key);
     if (set && set.size === 0) this.keysByDevice.delete(cliDeviceId);
+  }
+
+  /** Drop one ring whose last sample is older than the history window. */
+  private evictStaleForDevice(cliDeviceId: string, nowMs: number): boolean {
+    const keys = this.keysByDevice.get(cliDeviceId);
+    if (!keys || keys.size === 0) return false;
+    return this.evictOldestStale(keys, nowMs);
+  }
+
+  private evictStale(nowMs: number): boolean {
+    return this.evictOldestStale(this.rings.keys(), nowMs);
+  }
+
+  private evictOldestStale(keys: Iterable<string>, nowMs: number): boolean {
+    const staleBefore = windowStartMs(nowMs);
+    let oldestKey: string | undefined;
+    let oldestMs = Number.POSITIVE_INFINITY;
+    let oldestDevice: string | undefined;
+    for (const key of keys) {
+      const ring = this.rings.get(key);
+      if (!ring || ring.lastMs >= staleBefore) continue;
+      if (ring.lastMs < oldestMs) {
+        oldestMs = ring.lastMs;
+        oldestKey = key;
+        oldestDevice = ring.cliDeviceId;
+      }
+    }
+    if (!oldestKey || !oldestDevice) return false;
+    this.drop(oldestKey, oldestDevice);
+    return true;
   }
 }

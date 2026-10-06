@@ -8,6 +8,7 @@ import {
   lockCrossCapacityAdmissionRequests,
 } from "@ws-model-proxy/db/capacity-lock-order";
 import { isDbShutdownFenceArmed, runWithDbShutdownPermit } from "@ws-model-proxy/db/shutdown-fence";
+import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import {
   type AdmissionSnapshot,
   type GrantPlan,
@@ -567,7 +568,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         const target = await tx.executionTarget.findFirst({
           where: {
             id: candidate.executionTargetId,
-            userId: attempt.ownerId,
+            ...(attempt.sourceKind === "DIRECT" ? { userId: attempt.ownerId } : {}),
             inferenceCapacityId: candidate.capacityId,
           },
         });
@@ -597,10 +598,30 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             executionTargetId: candidate.executionTargetId,
             ModelPool: { userId: attempt.ownerId },
           },
-          include: { ModelPool: true },
+          include: {
+            ModelPool: true,
+            InferenceContribution: {
+              include: {
+                Contributor: {
+                  select: { banned: true, banExpires: true, deletionRequestedAt: true },
+                },
+              },
+            },
+          },
         });
         if (!member)
           throw new Error("Admission pool candidate is not an owned member of the requested pool.");
+        if (target.userId !== attempt.ownerId) {
+          const consent = member.InferenceContribution;
+          if (
+            consent?.state !== "ACTIVE" ||
+            consent.poolId !== attempt.poolId ||
+            consent.discoveredModelId !== target.discoveredModelId ||
+            consent.contributorUserId !== target.userId ||
+            userCredentialAccessBlocked(consent.Contributor, new Date())
+          )
+            throw new Error("Inference contribution is no longer authorized.");
+        }
         const hasMemberConcurrencyOverride =
           member.capacityConcurrencyMode === "LIMITED" ||
           (member.capacityConcurrencyMode === undefined &&
@@ -611,10 +632,15 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             : hasMemberConcurrencyOverride
               ? (member.capacityConcurrencyLimit ?? undefined)
               : (member.ModelPool.capacityConcurrencyLimit ?? undefined);
+        // A contributed member runs on its contributor's machine: the pool
+        // owner's priority, reservation and borrow settings do not apply there,
+        // so it never outranks or holds back the contributor's own traffic.
+        const contributed = member.inferenceContributionId !== null;
         return {
           ...candidate,
-          priority:
-            grantQueuePriority ?? member.capacityPriority ?? member.ModelPool.capacityPriority,
+          priority: contributed
+            ? 0
+            : (grantQueuePriority ?? member.capacityPriority ?? member.ModelPool.capacityPriority),
           memberConcurrencyCeiling,
           concurrencyScope:
             member.capacityConcurrencyMode === "INHERIT" ||
@@ -628,8 +654,11 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
               member.capacityConcurrencyLimit === null)
               ? member.ModelPool.id
               : member.id,
-          reservedSlots: member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots,
+          reservedSlots: contributed
+            ? 0
+            : (member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots),
           allowBorrowReserved:
+            contributed ||
             (member.capacityBorrowPolicy ?? member.ModelPool.capacityBorrowPolicy) === "WHEN_IDLE",
         };
       }),
@@ -831,6 +860,23 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             // and use provider health, checked at dispatch.
             OR: [
               { routingStatus: { not: "ACTIVE" } },
+              { instanceGate: "CLOSED" },
+              {
+                inferenceContributionId: { not: null },
+                InferenceContribution: { is: { state: { not: "ACTIVE" } } },
+              },
+              { inferenceContributionId: { not: null }, InferenceContribution: { is: null } },
+              {
+                inferenceContributionId: { not: null },
+                InferenceContribution: {
+                  Contributor: {
+                    OR: [
+                      { deletionRequestedAt: { not: null } },
+                      { banned: true, OR: [{ banExpires: null }, { banExpires: { gt: now } }] },
+                    ],
+                  },
+                },
+              },
               { tier: "PRIMARY", weight: { lte: 0 } },
               { tier: "PRIMARY", healthStatus: "UNHEALTHY", nextRetryAt: { gt: now } },
             ],
@@ -843,7 +889,9 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         where: {
           capacityId,
           state: "WAITING",
-          poolMemberId: { in: unroutableMembers.map((member) => member.id) },
+          poolMemberId: {
+            in: unroutableMembers.map((member) => member.id),
+          },
         },
         data: {
           state: "CANCELLED",
@@ -937,6 +985,9 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         capacityReservedSlots: target.directReservedSlots,
       });
     for (const member of configuredReservationMembers) {
+      // A pool on someone else's machine (an inference contribution) borrows
+      // spare capacity: it reserves nothing there.
+      if (member.ModelPool.userId !== capacity.userId) continue;
       const slots = member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots;
       if (slots > 0)
         configuredReservations.push({
