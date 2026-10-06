@@ -3,10 +3,12 @@ import { nodesContract as c } from "../contracts/nodes";
 import { credentialProcedures, enrollmentProcedures } from "../nodes/enrollment";
 import { nodeProcedures as n } from "../nodes/procedures";
 import { secretProcedures } from "../nodes/secrets";
+import { nodeOperatorRouters } from "./node-operator";
 
 /**
  * Lane B implements the node definition, trust, fabrics, enrollment and activity
- * (`src/nodes/`); terminals, queued commands, commands and files are lane D's stubs.
+ * (`src/nodes/`); lane D terminals, queued commands and commands (`./node-operator.ts`).
+ * Files are still stubs.
  */
 export const nodesRouter = {
   list: n.list,
@@ -23,19 +25,10 @@ export const nodesRouter = {
   enrollmentCodes: enrollmentProcedures,
   credentials: credentialProcedures,
   activity: n.activity,
-  terminals: {
-    openTicket: stub(c.terminals.openTicket),
-  },
-  queued: {
-    list: stub(c.queued.list),
-    enqueue: stub(c.queued.enqueue),
-    run: stub(c.queued.run),
-    dismiss: stub(c.queued.dismiss),
-  },
-  commands: {
-    run: stub(c.commands.run),
-    get: stub(c.commands.get),
-  },
+  // Lane D (node-operator.ts): browser terminals, queued commands, node commands.
+  terminals: nodeOperatorRouters.terminals,
+  queued: nodeOperatorRouters.queued,
+  commands: nodeOperatorRouters.commands,
   files: {
     read: stub(c.files.read),
     write: stub(c.files.write),

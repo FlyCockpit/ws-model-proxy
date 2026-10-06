@@ -61,6 +61,7 @@ All require an active session (`_auth` layout).
 | `/{lang}/access/contributions` | Pools you may contribute to (add a served model), what you contribute, runtime definitions shared with you (fork). |
 | `/{lang}/activity` | Metrics explorer: scope (pool / runtime / version / node), metric, range and step, compare versions. |
 | `/{lang}/activity/requests` | Request log with filters and delete. |
+| `/{lang}/activity/commands` | Command log: commands agents and people ran on your nodes (state incl. interrupted, program, who), live output and cancel. |
 | `/{lang}/settings` | Profile, locale, alert e-mails. |
 | `/{lang}/settings/security` | Password and two-factor authentication. |
 
@@ -91,7 +92,7 @@ Gated by the `admin` layout; non-admins see a 404.
 - Mobile: the existing `BottomNav` with Overview · Models · Pools · Runtimes · More (sheet with the
   rest, Needs-you badge on More).
 
-41 pages: 6 public (plus the `/` redirect), 31 signed-in, 4 admin.
+42 pages: 6 public (plus the `/` redirect), 32 signed-in, 4 admin.
 
 
 ## Notes

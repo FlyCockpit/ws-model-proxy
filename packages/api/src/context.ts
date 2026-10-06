@@ -44,6 +44,71 @@ export type ContextServices = {
    * rows wait for the server's lifecycle sweep.
    */
   dispatchRuntimeOperation?: (input: { userId: string; operationId: string }) => Promise<void>;
+  /**
+   * Lane D (access): a credential or grant was revoked and committed. The server drops any
+   * cached admission for it and closes live MCP sessions or terminals it authorized.
+   * TODO(server): wire in apps/server; until then a revoked credential stops working on the
+   * next lookup (every lookup reads `revokedAt`).
+   */
+  onAccessRevoked?: (event: AccessRevokedEvent) => Promise<void>;
+  /** Lane D (terminals, node commands): the relay surfaces these procedures need. */
+  nodeOperator?: NodeOperatorServices;
+};
+
+export type AccessRevokedEvent =
+  | { kind: "api_key"; userId: string; apiKeyId: string }
+  | { kind: "agent_token"; userId: string; agentTokenId: string; grantId: string }
+  | { kind: "oauth_grant"; userId: string; grantId: string; clientId: string }
+  | { kind: "share"; ownerUserId: string; granteeUserId: string; poolId: string };
+
+/** A node command's live status from the node (`exec.status`); null output when offline. */
+export type NodeCommandLiveStatus = {
+  state: "RUNNING" | "SUCCEEDED" | "FAILED" | "CANCELLED" | "TIMED_OUT" | "INTERRUPTED" | "UNKNOWN";
+  exitCode?: number;
+  /** Masked end of the output. */
+  output: string;
+  truncated?: boolean;
+  finishedAt?: Date;
+};
+
+/**
+ * Relay hooks for browser terminals and node commands (implemented in apps/server). Every hook
+ * receives ids the procedure already checked belong to `userId`; the server re-checks the node
+ * is online and at Full control and refuses otherwise.
+ */
+export type NodeOperatorServices = {
+  /**
+   * Mint a one-use ticket for the browser terminal socket. `typedCommand` is written into the
+   * shell without a newline (the person presses Enter).
+   */
+  openTerminalTicket(args: {
+    userId: string;
+    sessionId: string;
+    nodeId: string;
+    cols: number;
+    rows: number;
+    typedCommand?: string;
+  }): Promise<{ ticket: string; terminalId: string; expiresAt: Date }>;
+  /** `exec.start`: start a command; resolves once the node answered `exec.started`. */
+  startCommand(args: {
+    userId: string;
+    nodeId: string;
+    commandId: string;
+    command: string;
+    cwd?: string;
+    timeoutMs: number;
+  }): Promise<{ startedAt: Date; endsBy: Date }>;
+  /**
+   * `exec.poll` (or `exec.cancel` when `cancel`): the node's view of a command, waiting up to
+   * `waitMs` for it to finish. Null when the node is offline.
+   */
+  pollCommand(args: {
+    userId: string;
+    nodeId: string;
+    commandId: string;
+    waitMs: number;
+    cancel: boolean;
+  }): Promise<NodeCommandLiveStatus | null>;
 };
 
 /**

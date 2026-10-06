@@ -156,6 +156,7 @@ const INVENTORY = [
   "activity.metrics.query",
   "activity.requests.list",
   "activity.requests.delete",
+  "activity.commands.list",
   "activity.overview.summary",
   "activity.needsYou.list",
 ];

@@ -117,7 +117,7 @@ describe("Better Auth user.update.after hook", () => {
   ])("notifies for %s", async (_label, fields) => {
     const listener = vi.fn();
     unsubscribes.push(onUserBanned(listener));
-    await after()?.(row(fields));
+    await after()?.(row(fields), null);
     expect(listener).toHaveBeenCalledTimes(1);
     expect(listener).toHaveBeenCalledWith("banned-user");
   });
@@ -131,14 +131,14 @@ describe("Better Auth user.update.after hook", () => {
   ])("does not notify for %s", async (_label, fields) => {
     const listener = vi.fn();
     unsubscribes.push(onUserBanned(listener));
-    await after()?.(row(fields));
+    await after()?.(row(fields), null);
     expect(listener).not.toHaveBeenCalled();
   });
 
   it("ignores a missing row (the update matched nothing)", async () => {
     const listener = vi.fn();
     unsubscribes.push(onUserBanned(listener));
-    await after()?.(null as never);
+    await after()?.(null as never, null);
     expect(listener).not.toHaveBeenCalled();
   });
 });

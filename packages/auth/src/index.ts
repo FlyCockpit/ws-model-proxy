@@ -22,10 +22,18 @@ import { sanitizedApiErrorLogLine } from "./api-error-logging";
 import { resolveAuthLogCall } from "./auth-logger-bridge";
 import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
+import {
+  acceptShareInvitesForProvenEmail,
+  isEmailVerificationPath,
+} from "./share-invite-acceptance";
 import { resolveSignupLocale } from "./signup-locale";
 import { getSignupAccessState, resolveBootstrapAdminIdentity } from "./signup-policy";
 import { notifyUserBanned } from "./user-ban-listeners";
-import { resolveUserCreatePolicy, toUserCreatePolicyInput } from "./user-create-policy";
+import {
+  isAdminCreateUserPath,
+  resolveUserCreatePolicy,
+  toUserCreatePolicyInput,
+} from "./user-create-policy";
 import {
   mapSessionRefusalToForbidden,
   refuseAdminRestoreOfDeletingUser,
@@ -38,6 +46,23 @@ import { withVerificationCallback } from "./verification-callback";
 const isCrossOrigin = !!env.CORS_ORIGIN;
 /** Email/SMTP is optional; when configured, verification is required. */
 const emailConfigured = isEmailConfigured();
+
+/** Invite acceptance never fails the sign-up or update that triggered it. */
+async function acceptInvitesQuietly(user: unknown): Promise<void> {
+  const row = user as { id?: unknown; email?: unknown; emailVerified?: unknown } | null;
+  if (!row || typeof row.id !== "string" || typeof row.email !== "string") return;
+  try {
+    // Without SMTP every account is created "verified" without proof, so an e-mail match
+    // counts only when verification is on (inviteAcceptance: otherwise the link is needed).
+    await acceptShareInvitesForProvenEmail({
+      id: row.id,
+      email: row.email,
+      emailVerified: emailConfigured && row.emailVerified === true,
+    });
+  } catch (error) {
+    console.error("share invite acceptance failed", error instanceof Error ? error.name : "error");
+  }
+}
 
 const userSlugInputSchema = z
   .string()
@@ -363,6 +388,15 @@ export const auth = betterAuth({
             },
           };
         },
+        // Pending share invites to this e-mail become shares once the e-mail is proven.
+        after: async (user, context) => {
+          // An admin-created account's e-mail is marked verified without proof (the admin
+          // knows its temporary password), so its invites wait for the invite link.
+          if (isAdminCreateUserPath(typeof context?.path === "string" ? context.path : null)) {
+            return;
+          }
+          await acceptInvitesQuietly(user);
+        },
       },
       update: {
         // A user row that now carries an ACTIVE ban (`/admin/ban-user`, or an
@@ -370,8 +404,11 @@ export const auth = betterAuth({
         // relay work. Better Auth runs `after` once the update's transaction
         // committed. Any later update of a still-banned user notifies again;
         // the cancel is idempotent. An unban or an expired ban notifies nothing.
-        after: async (user) => {
+        after: async (user, context) => {
           if (!user) return;
+          // Verifying the e-mail accepts the invites sent to it (only on the verification
+          // routes: an admin-created account is "verified" without proof).
+          if (isEmailVerificationPath(context?.path)) await acceptInvitesQuietly(user);
           const row = user as { id: string; banned?: unknown; banExpires?: unknown };
           if (
             isUserBanned(

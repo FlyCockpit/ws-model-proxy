@@ -1,0 +1,8 @@
+{
+  "subject": "{{owner}} compartió un pool contigo",
+  "heading": "Compartieron un pool contigo",
+  "body": "{{owner}} compartió el pool {{pool}} con esta dirección de correo en WS Model Proxy. Crea una cuenta con esta dirección para empezar a usarlo.",
+  "cta": "Crear tu cuenta",
+  "expiry": "Este enlace funciona hasta el {{expiresAt}} y se puede usar una sola vez.",
+  "ignoreFooter": "Si no esperabas esta invitación, puedes ignorar este correo de forma segura."
+}

@@ -32,7 +32,8 @@
     },
     "activity": {
       "metrics": "Métricas",
-      "requests": "Solicitudes"
+      "requests": "Solicitudes",
+      "commands": "Comandos"
     }
   },
   "pages": {
@@ -151,6 +152,10 @@
     "activityRequests": {
       "title": "Solicitudes",
       "description": "El registro de solicitudes, con filtros."
+    },
+    "activityCommands": {
+      "title": "Comandos",
+      "description": "Comandos que agentes y personas ejecutaron en tus nodos. La salida llega en vivo desde el nodo y solo se guarda ahí."
     }
   },
   "help": {

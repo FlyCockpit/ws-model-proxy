@@ -1,12 +1,34 @@
 import prisma from "@ws-model-proxy/db";
 import { verifyTransport } from "@ws-model-proxy/mailer";
-import { contractProcedure, publicContractProcedure, publicStub } from "../contract-procedure";
+import { contractProcedure, publicContractProcedure } from "../contract-procedure";
 import { authContract as c } from "../contracts/account";
+import { callableIdOf } from "../lib/access-views";
 import { canUserChangePassword } from "../lib/password-capabilities";
+import { pendingInviteWhere, shareInviteDigest } from "../lib/share-invites";
 
 export const authRouter = {
-  /** The invite sign-up page (lane B2). */
-  inviteInfo: publicStub(c.inviteInfo),
+  /**
+   * The invite sign-up page: who invited this e-mail to which pool. Answers `valid: false`
+   * (and nothing else) for an unknown, used, withdrawn or expired link, so it reveals nothing
+   * without a live token. TODO(server): rate-limit like sign-in (apps/server `/rpc` limiter).
+   */
+  inviteInfo: publicContractProcedure(c.inviteInfo).handler(async ({ input }) => {
+    const invite = await prisma.shareInvite.findFirst({
+      where: { tokenDigest: shareInviteDigest(input.token), ...pendingInviteWhere(new Date()) },
+      select: {
+        email: true,
+        Owner: { select: { name: true } },
+        Pool: { select: { slug: true, User: { select: { slug: true } } } },
+      },
+    });
+    if (!invite) return { valid: false, email: null, ownerName: null, callableId: null };
+    return {
+      valid: true,
+      email: invite.email,
+      ownerName: invite.Owner.name,
+      callableId: callableIdOf(invite.Pool.User.slug, invite.Pool.slug),
+    };
+  }),
   /**
    * Delivery-aware preflight for the email-OTP second factor. The login challenge calls this
    * BEFORE `authClient.twoFactor.sendOtp()` because Better Auth's send-otp endpoint swallows
