@@ -27,10 +27,9 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
 const CONTROL_MAX_REQUEST_BYTES: usize = 4096;
-/// Status includes one row per locally configured endpoint, so it needs a
-/// materially larger bound than the tiny command request. Keep this finite to
-/// prevent a compromised local daemon from making the CLI allocate without
-/// limit.
+/// Status gains runtime and instance rows (C2), so it keeps a materially
+/// larger bound than the tiny command request. Keep this finite to prevent a
+/// compromised local daemon from making the CLI allocate without limit.
 #[cfg(unix)]
 const CONTROL_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 #[cfg(unix)]
@@ -41,7 +40,6 @@ const CONTROL_MAX_CLIENTS: usize = 32;
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlCommand {
-    Reload,
     Status,
 }
 
@@ -57,40 +55,15 @@ pub struct ControlResponse<'a> {
     pub state: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoints: Option<usize>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inventory_seq: Option<u64>,
     /// Live websocket state reported by the daemon, never inferred from a PID.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connection: Option<&'a str>,
-    /// Digest of the daemon's desired local inventory snapshot. This is
-    /// intentionally separate from the server acknowledgement below.
+    /// This node's slug.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub desired_inventory_digest: Option<String>,
-    /// Last modification timestamp of the desired config file, as Unix epoch
-    /// milliseconds so the JSON schema is stable without locale formatting.
+    pub node: Option<&'a str>,
+    /// The node's effective trust (`full` or `relay`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub config_modified_at_ms: Option<u64>,
-    /// Desired local endpoint/probe state from the daemon's active config.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub desired_endpoints: Option<Vec<ControlEndpointStatus<'a>>>,
-    /// Server-authoritative acknowledgement fields. They are absent until hello
-    /// or an inventory update has been durably accepted by the server.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inventory_digest: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub inventory_acknowledged_at: Option<&'a str>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ControlEndpointStatus<'a> {
-    pub slug: &'a str,
-    pub enabled: bool,
-    pub local_probe: &'a str,
-    pub model_count: usize,
-    pub published: &'a str,
+    pub trust: Option<&'a str>,
 }
 
 #[cfg(unix)]
@@ -276,14 +249,9 @@ fn respond_busy(mut stream: UnixStream) -> Result<()> {
             ok: false,
             state: "busy",
             message: Some("relay control plane is busy; retry shortly"),
-            endpoints: None,
-            inventory_seq: None,
             connection: None,
-            desired_inventory_digest: None,
-            config_modified_at_ms: None,
-            desired_endpoints: None,
-            inventory_digest: None,
-            inventory_acknowledged_at: None,
+            node: None,
+            trust: None,
         },
     )?;
     stream.write_all(b"\n")?;
@@ -317,7 +285,6 @@ pub fn request(command: ControlCommand) -> Result<serde_json::Value> {
     let mut stream = UnixStream::connect(&path)
         .with_context(|| format!("connecting to relay control socket `{}`", path.display()))?;
     let read_timeout = match command {
-        ControlCommand::Reload => Duration::from_secs(5 * 60),
         ControlCommand::Status => Duration::from_secs(5),
     };
     stream.set_read_timeout(Some(read_timeout))?;
@@ -374,32 +341,20 @@ mod tests {
     }
 
     #[test]
-    fn response_limit_allows_a_multi_endpoint_status_payload() {
-        let endpoints = (0..128)
-            .map(|index| ControlEndpointStatus {
-                slug: "endpoint-with-a-deliberately-long-name",
-                enabled: true,
-                local_probe: "online",
-                model_count: index,
-                published: "current",
-            })
-            .collect();
-        let digest = "b".repeat(64);
+    fn status_response_uses_camel_case_and_skips_absent_fields() {
         let response = ControlResponse {
             ok: true,
-            state: "connected",
+            state: "running",
             message: None,
-            endpoints: Some(128),
-            inventory_seq: Some(42),
             connection: Some("connected"),
-            desired_inventory_digest: Some("a".repeat(64)),
-            config_modified_at_ms: Some(1),
-            desired_endpoints: Some(endpoints),
-            inventory_digest: Some(&digest),
-            inventory_acknowledged_at: Some("2026-08-05T00:00:00Z"),
+            node: Some("spark-1"),
+            trust: Some("full"),
         };
-        let serialized = serde_json::to_vec(&response).expect("serialize status response");
-        assert!(serialized.len() > CONTROL_MAX_REQUEST_BYTES);
+        let serialized = serde_json::to_string(&response).expect("serialize status response");
+        assert_eq!(
+            serialized,
+            r#"{"ok":true,"state":"running","connection":"connected","node":"spark-1","trust":"full"}"#
+        );
         assert!(serialized.len() <= CONTROL_MAX_RESPONSE_BYTES);
     }
 }

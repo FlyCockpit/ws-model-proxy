@@ -17,9 +17,9 @@ use serde_json::Value;
 use super::canonical::canonical_json;
 use super::runtime_spec::{
     DeclaredHardware, EmbeddingContract, Engine, FABRIC_MEMBERS_MAX, ModelCapability,
-    NODE_FABRICS_MAX, NODE_METRIC_COMMANDS_MAX_BYTES,
-    NodeFeatures, NodeMetricCommand, RUNTIME_SPEC_MAX_BYTES, ReaderSignal, RuntimeApi, RuntimeKind,
-    RuntimeSpec, TranscriptionProfile,
+    NODE_FABRICS_MAX, NODE_METRIC_COMMANDS_MAX_BYTES, NodeFeatures, NodeMetricCommand,
+    RUNTIME_SPEC_MAX_BYTES, ReaderSignal, RuntimeApi, RuntimeKind, RuntimeSpec,
+    TranscriptionProfile,
 };
 use crate::stt_wire::SttEvent;
 
@@ -721,7 +721,10 @@ impl std::fmt::Debug for SecretSet {
 
 impl SecretSet {
     pub fn validate(&self) -> Result<(), FrameRuleError> {
-        rule(is_secret_name(&self.name), "node secrets are named WSMP_SECRET_*")?;
+        rule(
+            is_secret_name(&self.name),
+            "node secrets are named WSMP_SECRET_*",
+        )?;
         rule(
             !self.value.is_empty() && self.value.len() <= NODE_SECRET_VALUE_MAX_BYTES,
             "a secret value is 1 byte to 16 KiB",
@@ -1662,18 +1665,14 @@ impl DefinitionEnvelope {
             .launch
             .iter()
             .flat_map(|launch| launch.secrets.iter().flatten());
-        let auth = self
-            .spec
-            .address
-            .iter()
-            .flat_map(|address| {
-                address.auth.iter().map(|auth| &auth.env).chain(
-                    address
-                        .headers
-                        .iter()
-                        .flat_map(|headers| headers.iter().map(|header| &header.env)),
-                )
-            });
+        let auth = self.spec.address.iter().flat_map(|address| {
+            address.auth.iter().map(|auth| &auth.env).chain(
+                address
+                    .headers
+                    .iter()
+                    .flat_map(|headers| headers.iter().map(|header| &header.env)),
+            )
+        });
         rule(
             secrets.chain(auth).all(|name| is_secret_name(name)),
             "node secrets are named WSMP_SECRET_*",

@@ -1,13 +1,20 @@
-//! Daemon-lifetime terminal key, identity key, and feature flags.
+//! Daemon-lifetime terminal key, identity key, trust and features.
 //!
 //! `connect_foreground` captures this before the reconnect loop. Config is
-//! re-read on reconnect and when an inventory reload is acknowledged; those
-//! replacements must not change the key or these flags.
+//! re-read on reconnect; that must not change the key, the trust or these
+//! features (hot reload with `node.state` lands with config v3, C1).
+//!
+//! S0 trust bridge: until `config.json` v3 carries `trust` (C1), the node is
+//! at Full control exactly when the old most permissive switch is set
+//! (`mcpCommandMode: unsupervised`, which allowed headless commands and file
+//! ops); every other config is Relay only. Relay only refuses commands, file
+//! ops, browser terminals and runtime definitions on this node.
 
 use anyhow::{Context, Result};
 
 use crate::config::{Config, McpCommandMode};
-use crate::protocol::{CliCapabilities, TerminalFeatureSnapshot};
+use crate::protocol::frames::{HelloNode, NodeTerminalIdentity, TrustState, TrustValue};
+use crate::protocol::runtime_spec::{FileFeatures, NodeFeatures, TerminalFeatures};
 use crate::terminal_crypto::CliTerminalKey;
 use crate::terminal_identity::{self, CliIdentity};
 
@@ -17,15 +24,13 @@ pub struct TerminalStartup {
     /// production startup refuses to connect without a loadable identity.
     identity: Option<CliIdentity>,
     allow_human_terminal: bool,
-    mcp_command_mode: McpCommandMode,
+    /// Full control until lowered; a lowering latches for the daemon's life.
+    full: std::sync::atomic::AtomicBool,
     require_terminal_approval: bool,
     max_terminals: usize,
     allow_file_tools_as_root: bool,
-    mcp_file_read: bool,
     file_roots: Vec<std::path::PathBuf>,
     file_roots_configured: bool,
-    allow_remote_metric_sources: bool,
-    allow_remote_engine_adapters: bool,
 }
 
 impl TerminalStartup {
@@ -46,15 +51,14 @@ impl TerminalStartup {
             key,
             identity: None,
             allow_human_terminal: config.allow_human_terminal,
-            mcp_command_mode: config.mcp_command_mode,
+            full: std::sync::atomic::AtomicBool::new(
+                config.mcp_command_mode == McpCommandMode::Unsupervised,
+            ),
             require_terminal_approval: config.require_terminal_approval,
             max_terminals: usize::try_from(config.effective_max_terminals()).unwrap_or(usize::MAX),
             allow_file_tools_as_root: config.allow_file_tools_as_root,
-            mcp_file_read: config.mcp_file_read,
             file_roots: config.file_roots.clone(),
             file_roots_configured: crate::config::file_roots_usable(&config.file_roots),
-            allow_remote_metric_sources: config.allow_remote_metric_sources,
-            allow_remote_engine_adapters: config.allow_remote_engine_adapters,
         }
     }
 
@@ -75,8 +79,32 @@ impl TerminalStartup {
         self.allow_human_terminal
     }
 
-    pub fn mcp_command_mode(&self) -> McpCommandMode {
-        self.mcp_command_mode
+    /// The node's trust for this daemon's lifetime.
+    pub fn trust_value(&self) -> TrustValue {
+        if self.full_control() {
+            TrustValue::Full
+        } else {
+            TrustValue::Relay
+        }
+    }
+
+    /// `trust.lower`: Relay only from now on. There is no way back up here.
+    pub fn lower_trust(&self) {
+        self.full.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Full control: definitions, commands, file ops and browser terminals.
+    pub fn full_control(&self) -> bool {
+        self.full.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The hello / `node.state` trust: frozen exactly at Relay only.
+    pub fn trust(&self) -> TrustState {
+        let value = self.trust_value();
+        TrustState {
+            value,
+            frozen: value == TrustValue::Relay,
+        }
     }
 
     pub fn require_terminal_approval(&self) -> bool {
@@ -93,185 +121,143 @@ impl TerminalStartup {
         self.allow_file_tools_as_root
     }
 
-    pub fn mcp_file_read(&self) -> bool {
-        self.mcp_file_read
-    }
     pub fn file_roots(&self) -> &[std::path::PathBuf] {
         &self.file_roots
     }
-    /// The local remote-metric-source opt-in, fixed for the daemon's lifetime.
-    pub fn allow_remote_metric_sources(&self) -> bool {
-        self.allow_remote_metric_sources
+
+    /// What this node offers (the hello `features`).
+    pub fn features(&self) -> NodeFeatures {
+        NodeFeatures {
+            terminals: TerminalFeatures {
+                supported: crate::protocol::terminal_supported() && self.allow_human_terminal,
+                max: u8::try_from(self.max_terminals).unwrap_or(u8::MAX),
+                approval_required: self.require_terminal_approval,
+            },
+            // Operator terminals run interactive steps of runtime jobs, which
+            // land with the runtime store (C2/C3).
+            operator_terminals: false,
+            files: FileFeatures {
+                roots: self.file_roots_configured.then(|| {
+                    self.file_roots
+                        .iter()
+                        .map(|root| root.display().to_string())
+                        .collect()
+                }),
+                as_root: self.allow_file_tools_as_root,
+            },
+            runtime_hosts: Vec::new(),
+            media_expand: true,
+            live_stt: true,
+            // Node secrets (`secrets.env`) land with config v3 (C1).
+            secrets: Vec::new(),
+        }
     }
 
-    pub fn allow_remote_engine_adapters(&self) -> bool {
-        self.allow_remote_engine_adapters
-    }
-
-    /// `cli_slug` is the slug this hello reports; the identity signs it with
-    /// the ECDH key.
-    pub fn capabilities(&self, cli_slug: &str) -> CliCapabilities {
+    /// The hello `node`: `identity_signature` signs the challenge, and the
+    /// terminal identity proves this session's ECDH key.
+    pub fn hello_node(&self, node_slug: &str, identity_signature: String) -> HelloNode {
         let terminal_identity = self.identity.as_ref().and_then(|identity| {
             identity
-                .prove(cli_slug, self.key.public_raw())
+                .prove(node_slug, self.key.public_raw())
                 .inspect_err(|error| {
                     tracing::warn!(error = %error, "signing the terminal key failed");
                 })
                 .ok()
+                .map(|proof| NodeTerminalIdentity {
+                    public_key: proof.public_key,
+                    signature: proof.signature,
+                })
         });
-        CliCapabilities::from_snapshot(&TerminalFeatureSnapshot {
-            allow_human_terminal: self.allow_human_terminal,
-            mcp_command_mode: self.mcp_command_mode,
-            require_terminal_approval: self.require_terminal_approval,
-            allow_file_tools_as_root: self.allow_file_tools_as_root,
-            mcp_file_read: self.mcp_file_read,
-            file_roots_configured: self.file_roots_configured,
-            allow_remote_metric_sources: self.allow_remote_metric_sources,
-            allow_remote_engine_adapters: self.allow_remote_engine_adapters,
-            terminal_public_key_b64url: self.key.public_b64url().to_string(),
+        HelloNode {
+            slug: node_slug.to_string(),
+            hostname: crate::hostname::reported_hostname(),
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            identity_public_key: self
+                .identity
+                .as_ref()
+                .map(CliIdentity::public_b64url)
+                .unwrap_or_default(),
+            identity_signature,
+            terminal_public_key: self.key.public_b64url().to_string(),
             terminal_identity,
-        })
+        }
     }
-}
-
-/// Terminal grants remain startup-scoped; deployment opt-in is reported fresh.
-pub fn hello_capabilities(
-    startup: &TerminalStartup,
-    live: &Config,
-    cli_slug: &str,
-) -> CliCapabilities {
-    let mut capabilities = startup.capabilities(cli_slug);
-    capabilities.features.deployments = live.allow_deployments;
-    // Interactive deployment steps run in an operator terminal: only with
-    // both local opt-ins and a PTY.
-    capabilities.features.deployment_operator = live.allow_deployments
-        && live.allow_deployment_operator_terminal
-        && crate::protocol::terminal_supported();
-    capabilities
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn key() -> CliTerminalKey {
+        CliTerminalKey::generate().expect("key")
+    }
+
     #[test]
-    fn capabilities_ignore_config_changes_after_startup() {
+    fn features_ignore_config_changes_after_startup() {
         let dir = tempfile::tempdir().expect("roots");
         let mut config = Config {
-            mcp_file_read: true,
             file_roots: vec![dir.path().to_path_buf()],
             allow_human_terminal: true,
             mcp_command_mode: McpCommandMode::Unsupervised,
             require_terminal_approval: true,
             allow_file_tools_as_root: true,
-            allow_remote_metric_sources: true,
-            allow_remote_engine_adapters: true,
             ..Config::default()
         };
         let startup = TerminalStartup::capture(&config).expect("startup");
-        let public_key = startup.key().public_b64url().to_string();
         config.allow_human_terminal = false;
         config.mcp_command_mode = McpCommandMode::Off;
-        config.require_terminal_approval = false;
-        config.allow_file_tools_as_root = false;
-        config.mcp_file_read = false;
         config.file_roots.clear();
-        config.allow_remote_metric_sources = false;
-        config.allow_remote_engine_adapters = false;
-        let capabilities = hello_capabilities(&startup, &config, "desk-01");
-        assert!(!capabilities.features.deployments);
-        config.allow_deployments = true;
-        assert!(
-            hello_capabilities(&startup, &config, "desk-01")
-                .features
-                .deployments
-        );
-        // Operator terminals need deployments, their own switch and a PTY.
-        assert!(!capabilities.features.deployment_operator);
-        assert!(
-            !hello_capabilities(&startup, &config, "desk-01")
-                .features
-                .deployment_operator,
-            "deployments alone do not enable operator terminals"
-        );
-        config.allow_deployment_operator_terminal = true;
+        let features = startup.features();
+        assert_eq!(features.terminals.supported, cfg!(unix));
+        assert!(features.terminals.approval_required);
+        assert_eq!(features.terminals.max, 4);
         assert_eq!(
-            hello_capabilities(&startup, &config, "desk-01")
-                .features
-                .deployment_operator,
-            crate::protocol::terminal_supported()
+            features.files.roots,
+            Some(vec![dir.path().display().to_string()])
         );
-        config.allow_deployments = false;
-        assert!(
-            !hello_capabilities(&startup, &config, "desk-01")
-                .features
-                .deployment_operator
-        );
-        config.allow_deployments = true;
-        assert!(capabilities.features.human_terminal);
-        assert!(
-            capabilities.features.remote_metric_sources,
-            "the opt-in is read once at startup"
-        );
-        assert!(
-            capabilities.features.remote_engine_adapters,
-            "adapter opt-in is read once at startup"
-        );
-        assert!(
-            !TerminalStartup::from_key(
-                CliTerminalKey::generate().expect("key"),
-                &Config::default()
-            )
-            .capabilities("desk-01")
-            .features
-            .remote_metric_sources,
-            "off by default"
-        );
+        assert!(features.files.as_root);
+        assert!(!features.operator_terminals);
+        assert!(startup.full_control());
         assert_eq!(
-            capabilities.features.mcp_command_mode,
-            McpCommandMode::Unsupervised
+            startup.trust(),
+            TrustState {
+                value: TrustValue::Full,
+                frozen: false
+            }
         );
-        assert!(capabilities.features.terminal_approval);
-        assert_eq!(capabilities.features.terminal_supported, cfg!(unix));
-        assert_eq!(capabilities.terminal_public_key, public_key);
-        assert!(capabilities.features.mcp_file_read);
-        assert!(startup.mcp_file_read());
-        assert_eq!(startup.file_roots(), &[dir.path().to_path_buf()]);
-        assert!(capabilities.features.file_roots_configured);
-        assert!(capabilities.features.allow_file_tools_as_root);
         assert!(startup.identity().is_some());
     }
 
     #[test]
-    fn broken_roots_are_not_reported_as_configured() {
+    fn anything_but_unsupervised_is_relay_only_and_frozen() {
+        for mode in [McpCommandMode::Off, McpCommandMode::Supervised] {
+            let config = Config {
+                mcp_command_mode: mode,
+                ..Config::default()
+            };
+            let startup = TerminalStartup::from_key(key(), &config);
+            assert!(!startup.full_control());
+            let trust = startup.trust();
+            assert_eq!(trust.value, TrustValue::Relay);
+            assert!(trust.frozen);
+            assert!(trust.validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn broken_roots_are_not_reported() {
         let dir = tempfile::tempdir().expect("dir");
         let config = Config {
-            mcp_file_read: true,
             file_roots: vec![dir.path().join("missing")],
             ..Config::default()
         };
-        let startup = TerminalStartup::from_key(CliTerminalKey::generate().expect("key"), &config);
-        assert!(
-            !startup
-                .capabilities("test-cli")
-                .features
-                .file_roots_configured
-        );
+        let startup = TerminalStartup::from_key(key(), &config);
+        assert_eq!(startup.features().files.roots, None);
         assert_eq!(startup.file_roots(), config.file_roots);
-        assert!(
-            !TerminalStartup::from_key(
-                CliTerminalKey::generate().expect("key"),
-                &Config::default()
-            )
-            .capabilities("test-cli")
-            .features
-            .mcp_file_read
-        );
     }
 
     #[test]
     fn the_terminal_limit_is_the_configured_one_or_four() {
-        let key = || CliTerminalKey::generate().expect("key");
         assert_eq!(
             TerminalStartup::from_key(key(), &Config::default()).max_terminals(),
             4
@@ -284,23 +270,24 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_carry_a_signature_over_the_ecdh_key_and_slug() {
+    fn the_hello_node_carries_a_signature_over_the_ecdh_key_and_slug() {
         use crate::terminal_crypto::{decode_exact, decode_public_key, verify_cli_identity};
 
         let config = Config::default();
-        let without = TerminalStartup::from_key(CliTerminalKey::generate().expect("key"), &config);
-        assert!(without.capabilities("desk-01").terminal_identity.is_none());
-        let identity = CliIdentity::from_scalar_bytes(&[7_u8; 32]).expect("identity");
-        let fingerprint = identity.fingerprint();
-        let startup = without.with_identity(identity);
-        assert_eq!(
-            startup.identity().map(CliIdentity::fingerprint),
-            Some(fingerprint)
+        let without = TerminalStartup::from_key(key(), &config);
+        assert!(
+            without
+                .hello_node("desk-01", String::new())
+                .terminal_identity
+                .is_none()
         );
-        let proof = startup
-            .capabilities("desk-01")
-            .terminal_identity
-            .expect("proof");
+        let identity = CliIdentity::from_scalar_bytes(&[7_u8; 32]).expect("identity");
+        let startup = without.with_identity(identity);
+        let node = startup.hello_node("desk-01", "sig".to_string());
+        assert_eq!(node.slug, "desk-01");
+        assert_eq!(node.identity_signature, "sig");
+        assert_eq!(node.terminal_public_key, startup.key().public_b64url());
+        let proof = node.terminal_identity.expect("proof");
         let public = decode_public_key(&proof.public_key).expect("public");
         let signature = decode_exact(&proof.signature, 64).expect("signature");
         assert!(verify_cli_identity(

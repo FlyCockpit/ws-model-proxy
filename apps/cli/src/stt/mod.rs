@@ -32,7 +32,7 @@ use anyhow::{Context, Result};
 use crate::config::{
     AudioOperationCapabilities, EndpointAuthMode, EndpointConfig, RealtimeAdapter,
 };
-use crate::protocol::{ClientControlMessage, RelayFailure};
+use crate::protocol::{NodeFrame, RelayFailure};
 use crate::relay_bus::FromWorker;
 use crate::stt_wire::{SttConfig, SttEvent, SttServerMessage, is_session_id};
 
@@ -156,11 +156,7 @@ impl SttRegistry {
     /// end now (`not_found`, "model_unavailable") and no new one opens there
     /// until a start job for it arrives, the endpoint leaves the snapshot, or
     /// the stop (`step_id`) is refused or fails ([`Self::stop_failed`]).
-    pub fn endpoint_stopping(
-        &mut self,
-        endpoint_slug: &str,
-        step_id: &str,
-    ) -> Vec<ClientControlMessage> {
+    pub fn endpoint_stopping(&mut self, endpoint_slug: &str, step_id: &str) -> Vec<NodeFrame> {
         self.stopping.insert(
             endpoint_slug.to_string(),
             StopMark {
@@ -240,11 +236,11 @@ impl SttRegistry {
         message: SttServerMessage,
         managed: &[EndpointConfig],
         now: Instant,
-    ) -> Vec<ClientControlMessage> {
+    ) -> Vec<NodeFrame> {
         match message {
             SttServerMessage::Open {
                 session_id,
-                endpoint_slug,
+                handle: endpoint_slug,
                 upstream_model,
                 adapter,
                 config,
@@ -279,7 +275,7 @@ impl SttRegistry {
             SttServerMessage::Close { session_id, .. } => {
                 if self.end(&session_id) {
                     tracing::info!(session_id, "speech-to-text session closed");
-                    vec![ClientControlMessage::SttClosed { session_id }]
+                    vec![NodeFrame::SttClosed { session_id }]
                 } else {
                     Vec::new()
                 }
@@ -288,12 +284,7 @@ impl SttRegistry {
     }
 
     /// One `stt.audio` frame (metadata and body already checked).
-    pub fn audio(
-        &mut self,
-        session_id: &str,
-        seq: u64,
-        body: Vec<u8>,
-    ) -> Vec<ClientControlMessage> {
+    pub fn audio(&mut self, session_id: &str, seq: u64, body: Vec<u8>) -> Vec<NodeFrame> {
         let Some(session) = self.sessions.get_mut(session_id) else {
             // Unknown or ended: late audio is expected after a close.
             return Vec::new();
@@ -332,7 +323,7 @@ impl SttRegistry {
     /// A malformed `stt.*` frame that names `session_id`. A live session
     /// fails (its audio or commands would be lost otherwise); a malformed
     /// `stt.open` for an id never seen is refused by name.
-    pub fn malformed(&mut self, session_id: &str, open: bool) -> Vec<ClientControlMessage> {
+    pub fn malformed(&mut self, session_id: &str, open: bool) -> Vec<NodeFrame> {
         if self.is_live(session_id) {
             return self.fail(
                 session_id,
@@ -354,23 +345,19 @@ impl SttRegistry {
     /// A frame a session thread produced. Returns it when it should go out:
     /// frames of ended sessions are dropped, acknowledgements return credit
     /// and an `stt.error` ends the session.
-    pub fn outbound(
-        &mut self,
-        session_id: &str,
-        message: ClientControlMessage,
-    ) -> Option<ClientControlMessage> {
+    pub fn outbound(&mut self, session_id: &str, message: NodeFrame) -> Option<NodeFrame> {
         let session = self.sessions.get_mut(session_id)?;
         match message {
-            ClientControlMessage::SttAudioAck { session_id, bytes } => {
+            NodeFrame::SttAudioAck { session_id, bytes } => {
                 // Never acknowledge more than was received.
                 let bytes = u64::from(bytes).min(session.outstanding);
                 session.outstanding -= bytes;
-                (bytes > 0).then_some(ClientControlMessage::SttAudioAck {
+                (bytes > 0).then_some(NodeFrame::SttAudioAck {
                     session_id,
                     bytes: bytes as u32,
                 })
             }
-            ClientControlMessage::SttError { .. } => {
+            NodeFrame::SttError { .. } => {
                 self.end(session_id);
                 Some(message)
             }
@@ -380,7 +367,7 @@ impl SttRegistry {
 
     /// Ends a session whose frame the encoder refused, and returns the one
     /// `stt.error` to send instead (always within the contract).
-    pub fn refused_by_encoder(&mut self, session_id: &str) -> Option<ClientControlMessage> {
+    pub fn refused_by_encoder(&mut self, session_id: &str) -> Option<NodeFrame> {
         self.end(session_id);
         if !is_session_id(session_id) {
             return None;
@@ -400,7 +387,7 @@ impl SttRegistry {
         &mut self,
         now: Instant,
         managed: impl FnOnce() -> Vec<EndpointConfig>,
-    ) -> Vec<ClientControlMessage> {
+    ) -> Vec<NodeFrame> {
         let mut frames = Vec::new();
         let expired: Vec<String> = self
             .sessions
@@ -453,7 +440,7 @@ impl SttRegistry {
         request: OpenRequest,
         managed: &[EndpointConfig],
         now: Instant,
-    ) -> Vec<ClientControlMessage> {
+    ) -> Vec<NodeFrame> {
         let id = request.session_id.clone();
         if self.is_live(&id) {
             // A reused live id: the session and the request both fail.
@@ -634,7 +621,7 @@ impl SttRegistry {
         Vec::new()
     }
 
-    fn forward(&mut self, session_id: &str, input: Input) -> Vec<ClientControlMessage> {
+    fn forward(&mut self, session_id: &str, input: Input) -> Vec<NodeFrame> {
         let Some(session) = self.sessions.get(session_id) else {
             return Vec::new();
         };
@@ -652,12 +639,7 @@ impl SttRegistry {
         Vec::new()
     }
 
-    fn fail(
-        &mut self,
-        session_id: &str,
-        failure: RelayFailure,
-        message: &str,
-    ) -> Vec<ClientControlMessage> {
+    fn fail(&mut self, session_id: &str, failure: RelayFailure, message: &str) -> Vec<NodeFrame> {
         if !self.end(session_id) {
             return Vec::new();
         }
@@ -717,19 +699,19 @@ struct OpenRequest {
 }
 
 /// The session a CLI to server `stt.*` frame names.
-pub fn session_of(message: &ClientControlMessage) -> Option<&str> {
+pub fn session_of(message: &NodeFrame) -> Option<&str> {
     match message {
-        ClientControlMessage::SttOpened { session_id }
-        | ClientControlMessage::SttAudioAck { session_id, .. }
-        | ClientControlMessage::SttEvent { session_id, .. }
-        | ClientControlMessage::SttError { session_id, .. }
-        | ClientControlMessage::SttClosed { session_id } => Some(session_id),
+        NodeFrame::SttOpened { session_id }
+        | NodeFrame::SttAudioAck { session_id, .. }
+        | NodeFrame::SttEvent { session_id, .. }
+        | NodeFrame::SttError { session_id, .. }
+        | NodeFrame::SttClosed { session_id } => Some(session_id),
         _ => None,
     }
 }
 
-fn error(session_id: &str, failure: RelayFailure, message: &str) -> ClientControlMessage {
-    ClientControlMessage::SttError {
+fn error(session_id: &str, failure: RelayFailure, message: &str) -> NodeFrame {
+    NodeFrame::SttError {
         session_id: session_id.to_string(),
         failure,
         message: Some(message.to_string()),
@@ -737,7 +719,7 @@ fn error(session_id: &str, failure: RelayFailure, message: &str) -> ClientContro
 }
 
 /// Sends from a session thread; false once the relay loop is gone.
-fn emit(tx: &SyncSender<FromWorker>, session_id: &str, message: ClientControlMessage) -> bool {
+fn emit(tx: &SyncSender<FromWorker>, session_id: &str, message: NodeFrame) -> bool {
     tx.send(FromWorker::Stt {
         session_id: session_id.to_string(),
         message: Box::new(message),
@@ -749,7 +731,7 @@ fn emit_event(tx: &SyncSender<FromWorker>, session_id: &str, event: SttEvent) ->
     emit(
         tx,
         session_id,
-        ClientControlMessage::SttEvent {
+        NodeFrame::SttEvent {
             session_id: session_id.to_string(),
             event,
         },
@@ -821,8 +803,8 @@ struct SessionThread {
     cancel: watch::Receiver<bool>,
 }
 
-fn ack(session_id: &str, bytes: u32) -> ClientControlMessage {
-    ClientControlMessage::SttAudioAck {
+fn ack(session_id: &str, bytes: u32) -> NodeFrame {
+    NodeFrame::SttAudioAck {
         session_id: session_id.to_string(),
         bytes,
     }
@@ -865,7 +847,7 @@ fn run_session(session: SessionThread) {
     if !emit(
         &tx,
         &session_id,
-        ClientControlMessage::SttOpened {
+        NodeFrame::SttOpened {
             session_id: session_id.clone(),
         },
     ) {

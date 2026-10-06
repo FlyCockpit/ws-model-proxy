@@ -73,7 +73,8 @@ pub fn resolve_credential(config: &Config) -> Result<ResolvedCredential> {
             );
         }
         return Err(MissingCredential(
-            "no CLI token env var is configured and no device credential exists; run `wsmp login` or `wsmp token login <ENV_VAR>`".to_string(),
+            "no CLI token env var is configured and no device credential exists; run `wsmp login`"
+                .to_string(),
         )
         .into());
     };

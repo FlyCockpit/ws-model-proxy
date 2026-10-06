@@ -1,34 +1,29 @@
-//! Relay protocol frame helpers matching `apps/server/src/relay/protocol.ts`.
+//! Relay protocol 3.0: the frame types (`frames`), the runtime definition
+//! shape (`runtime_spec`), canonical JSON for `launchHash` (`canonical`), and
+//! the codec the daemon uses on top of them.
 //!
-//! The relay 3.0 contract (0.4.0) lives in the submodules below; this file's
-//! 2.4 codec is rewritten around them in S0b.
+//! The server accepts exactly protocol 3.0 and so does this CLI. Server
+//! frames are parsed strictly (`deny_unknown_fields`) and then checked for
+//! the cross-field rules serde cannot express (`ServerFrame::validate`). A
+//! frame that fails either is classified by [`control_frame_fault`] or
+//! [`binary_frame_fault`]: it ends at most the request, terminal, command,
+//! file op or speech session it names, except a malformed model-relay frame,
+//! which ends the session.
 
 pub mod canonical;
 pub mod frames;
 pub mod runtime_spec;
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 
-use crate::config::{
-    CapabilityOverrideMode, EndpointConfig, EndpointKind, McpCommandMode,
-    OpenAiCompatibleCapabilities,
+pub use frames::{
+    NodeBinaryMetadata, NodeFrame, ProtocolErrorCode, RELAY_PROTOCOL_VERSION, RELAY_SUBPROTOCOL,
+    RelayFailure, ServerBinaryMetadata, ServerFrame,
 };
-pub use crate::terminal_identity::TerminalIdentityProof;
 
-/// The one protocol bump of this release (v0.3.1 spoke 2.3), which also
-/// carries live speech-to-text frames (`stt.*`, `crate::stt_wire`). The
-/// server accepts only this version.
-pub const RELAY_PROTOCOL_VERSION: &str = "2.4";
-#[cfg(test)]
-const TEST_IDENTITY_PUBLIC_KEY: &str =
-    "BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A";
-#[cfg(test)]
-const TEST_IDENTITY_SIGNATURE: &str =
-    "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIg";
-pub const RELAY_SUBPROTOCOL: &str = "ws-model-proxy.relay.v2";
 pub const RELAY_JSON_CONTROL_MAX_BYTES: usize = 64 * 1024;
 pub const RELAY_BINARY_CHUNK_MAX_BYTES: usize = 1024 * 1024;
 pub const RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS: u64 = 20;
@@ -37,37 +32,24 @@ pub const RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS: u64 = 20;
 /// credit (`relay.request.body.ack`) to the server for each chunk its upstream
 /// request consumes. Mirrors `RELAY_REQUEST_BODY_WINDOW_CHUNKS` on the server.
 pub const RELAY_REQUEST_BODY_WINDOW_CHUNKS: usize = 16;
-/// What an older server (2.6 or earlier) answers when its strict hello schema
-/// rejects a newer hello.
-pub const OLDER_SERVER_HELLO_REJECTION: &str = "Malformed relay protocol message.";
-/// Engine facts, node telemetry and live load frame limits. They mirror the
-/// server's strict 2.7 schemas (`apps/server/src/relay/protocol.ts`).
+/// Node telemetry list bounds; they mirror the server's strict schemas
+/// (`apps/server/src/relay/frames.ts`).
 pub const NODE_METRICS_CUSTOM_MAX: usize = 50;
-pub const NODE_METRICS_SOURCES_MAX: usize = 50;
-pub const NODE_ENGINE_ADAPTERS_MAX: usize = 64;
+pub const NODE_METRIC_COMMANDS_MAX: usize = 16;
 pub const NODE_GPU_MAX: usize = 32;
 pub const NODE_INTERFACE_MAX: usize = 32;
 pub const NODE_INTERFACE_ADDRESS_MAX: usize = 16;
 pub const NODE_DISK_MAX: usize = 16;
 
-/// Wire `protocol.error.code`. Unknown values stay `Other` so a newer server
-/// still prints its message instead of looking like a malformed frame.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProtocolErrorCode {
-    UpgradeCli,
-    UpgradeServer,
-    IdentityMismatch,
-    AccessDenied,
-    Malformed,
-    Internal,
-    #[serde(other)]
-    Other,
+/// Browser terminals need a PTY, which this CLI only has on Unix.
+pub fn terminal_supported() -> bool {
+    cfg!(unix)
 }
 
-/// The fatal error for a `protocol.error` that arrives before `hello.ok`.
-/// An older server has no `code` and never sends `hello.challenge.origin`;
-/// say plainly to upgrade the server. A coded `upgrade_cli` still names the CLI.
+/// The fatal error for a `protocol.error` (or an older server's reply) that
+/// arrives before `hello.ok`. A reply without a code comes from a server that
+/// does not speak 3.0: say plainly to upgrade the server. A coded
+/// `upgrade_cli` names the CLI.
 pub fn hello_rejection_message(message: &str, code: Option<&ProtocolErrorCode>) -> String {
     let server_too_old = matches!(code, Some(ProtocolErrorCode::UpgradeServer) | None);
     if server_too_old {
@@ -79,2201 +61,62 @@ pub fn hello_rejection_message(message: &str, code: Option<&ProtocolErrorCode>) 
     }
 }
 
-/// A supervised file op's result (`supervised.done.fileResult`), 2.8.
-#[derive(Debug, Clone, Serialize)]
-pub struct FileOpResult {
-    pub op: FileMutationOp,
-    pub result: Value,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FileMutationOp {
-    Edit,
-    Write,
-    Rename,
-    Mkdir,
-    Delete,
-}
-
-/// Stable code carried by `supervised.done.fileError`. The wire deliberately
-/// has no message/detail field: file paths and contents must not escape through
-/// an error produced after the person accepted a file operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FileErrorCode {
-    PathDenied,
-    SecretFile,
-    NotFound,
-    NotAFile,
-    NotADir,
-    BinaryFile,
-    TooLarge,
-    Conflict,
-    UncertainOutcome,
-    UnsafeFilesystem,
-    MatchCount,
-    NoMatch,
-    RedactedSpan,
-    Exists,
-    HardLinked,
-    OwnerMismatch,
-    Setuid,
-    SpecialFile,
-    IoError,
-    Timeout,
-    InvalidInput,
-    Unsupported,
-    Cancelled,
-    Limit,
-}
-
-impl FileErrorCode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::PathDenied => "path_denied",
-            Self::SecretFile => "secret_file",
-            Self::NotFound => "not_found",
-            Self::NotAFile => "not_a_file",
-            Self::NotADir => "not_a_dir",
-            Self::BinaryFile => "binary_file",
-            Self::TooLarge => "too_large",
-            Self::Conflict => "conflict",
-            Self::UncertainOutcome => "uncertain_outcome",
-            Self::UnsafeFilesystem => "unsafe_filesystem",
-            Self::MatchCount => "match_count",
-            Self::NoMatch => "no_match",
-            Self::RedactedSpan => "redacted_span",
-            Self::Exists => "exists",
-            Self::HardLinked => "hard_linked",
-            Self::OwnerMismatch => "owner_mismatch",
-            Self::Setuid => "setuid",
-            Self::SpecialFile => "special_file",
-            Self::IoError => "io_error",
-            Self::Timeout => "timeout",
-            Self::InvalidInput => "invalid_input",
-            Self::Unsupported => "unsupported",
-            Self::Cancelled => "cancelled",
-            Self::Limit => "limit",
-        }
-    }
-
-    pub fn from_wire_code(code: &str) -> Option<Self> {
-        Some(match code {
-            "path_denied" => Self::PathDenied,
-            "secret_file" => Self::SecretFile,
-            "not_found" => Self::NotFound,
-            "not_a_file" => Self::NotAFile,
-            "not_a_dir" => Self::NotADir,
-            "binary_file" => Self::BinaryFile,
-            "too_large" => Self::TooLarge,
-            "conflict" => Self::Conflict,
-            "uncertain_outcome" => Self::UncertainOutcome,
-            "unsafe_filesystem" => Self::UnsafeFilesystem,
-            "match_count" => Self::MatchCount,
-            "no_match" => Self::NoMatch,
-            "redacted_span" => Self::RedactedSpan,
-            "exists" => Self::Exists,
-            "hard_linked" => Self::HardLinked,
-            "owner_mismatch" => Self::OwnerMismatch,
-            "setuid" => Self::Setuid,
-            "special_file" => Self::SpecialFile,
-            "io_error" => Self::IoError,
-            "timeout" => Self::Timeout,
-            "invalid_input" => Self::InvalidInput,
-            "unsupported" => Self::Unsupported,
-            "cancelled" => Self::Cancelled,
-            "limit" => Self::Limit,
-            _ => return None,
-        })
-    }
-}
-
-#[cfg(unix)]
-impl From<crate::file_ops::ErrorCode> for FileErrorCode {
-    fn from(code: crate::file_ops::ErrorCode) -> Self {
-        use crate::file_ops::ErrorCode as Source;
-        match code {
-            Source::PathDenied => Self::PathDenied,
-            Source::SecretFile => Self::SecretFile,
-            Source::NotFound => Self::NotFound,
-            Source::NotAFile => Self::NotAFile,
-            Source::NotADir => Self::NotADir,
-            Source::BinaryFile => Self::BinaryFile,
-            Source::TooLarge => Self::TooLarge,
-            Source::Conflict => Self::Conflict,
-            Source::UncertainOutcome => Self::UncertainOutcome,
-            Source::UnsafeFilesystem => Self::UnsafeFilesystem,
-            Source::MatchCount => Self::MatchCount,
-            Source::NoMatch => Self::NoMatch,
-            Source::RedactedSpan => Self::RedactedSpan,
-            Source::Exists => Self::Exists,
-            Source::HardLinked => Self::HardLinked,
-            Source::OwnerMismatch => Self::OwnerMismatch,
-            Source::Setuid => Self::Setuid,
-            Source::SpecialFile => Self::SpecialFile,
-            Source::IoError => Self::IoError,
-            Source::Timeout => Self::Timeout,
-            Source::InvalidInput => Self::InvalidInput,
-            Source::Unsupported => Self::Unsupported,
-            Source::Cancelled => Self::Cancelled,
-            Source::Limit => Self::Limit,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct FileOpError {
-    pub code: FileErrorCode,
-}
-
-/// The file-specific portion of `supervised.done`. This is a type-level union:
-/// a frame may carry one result, one code-only error, or neither (commands),
-/// but it can never carry both file arms.
-#[derive(Debug, Clone, Serialize)]
-#[serde(untagged)]
-pub enum SupervisedFileOutcome {
-    Result {
-        #[serde(rename = "fileResult")]
-        file_result: FileOpResult,
-    },
-    Error {
-        #[serde(rename = "fileError")]
-        file_error: FileOpError,
-    },
-    None {},
-}
-
-impl SupervisedFileOutcome {
-    pub fn result(op: String, mut result: Value) -> Self {
-        let op = match op.as_str() {
-            "edit" => FileMutationOp::Edit,
-            "write" => FileMutationOp::Write,
-            "rename" => FileMutationOp::Rename,
-            "mkdir" => FileMutationOp::Mkdir,
-            "delete" => FileMutationOp::Delete,
-            _ => return Self::error(FileErrorCode::IoError),
-        };
-        // The only wire-enforcement point for the supervised no-read rule.
-        // A future library result must not leak a diff through this frame.
-        if let Some(object) = result.as_object_mut() {
-            object.remove("recovered");
-            if matches!(op, FileMutationOp::Edit | FileMutationOp::Write) {
-                object.remove("diff");
-                object.remove("hunks");
-            }
-        }
-        Self::Result {
-            file_result: FileOpResult { op, result },
-        }
-    }
-
-    pub fn error(code: FileErrorCode) -> Self {
-        Self::Error {
-            file_error: FileOpError { code },
-        }
-    }
-}
-
-impl Default for SupervisedFileOutcome {
-    fn default() -> Self {
-        Self::None {}
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(
-    tag = "type",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-pub enum ClientControlMessage {
-    #[serde(rename = "hello")]
-    Hello {
-        id: String,
-        protocol_version: String,
-        cli: CliInventory,
-        endpoints: Vec<EndpointInventory>,
-    },
-    #[serde(rename = "inventory.update")]
-    InventoryUpdate {
-        id: String,
-        endpoints: Vec<EndpointInventory>,
-    },
-    #[serde(rename = "heartbeat")]
-    Heartbeat {
-        id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        sent_at: Option<String>,
-    },
-    #[serde(rename = "relay.request.body.ack")]
-    RelayRequestBodyAck { request_id: String, credits: u32 },
-    #[serde(rename = "relay.response.headers")]
-    RelayResponseHeaders {
-        request_id: String,
-        status: u16,
-        /// Ordered pairs preserve repeated fields such as `warning` and
-        /// `x-ratelimit-*`; servers also accept the legacy object form.
-        headers: Vec<(String, String)>,
-    },
-    #[serde(rename = "relay.complete")]
-    RelayComplete {
-        request_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        usage: Option<RelayUsage>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        metrics: Option<RelayMetrics>,
-    },
-    #[serde(rename = "relay.error")]
-    RelayError {
-        request_id: String,
-        failure: RelayFailure,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        message: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        upstream_status_code: Option<u16>,
-    },
-    #[serde(rename = "relay.cancelled")]
-    RelayCancelled { request_id: String },
-    #[serde(rename = "term.pending")]
-    TermPending {
-        terminal_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        viewer_id: Option<String>,
-        cli_nonce: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        approval_code: Option<String>,
-    },
-    #[serde(rename = "term.opened")]
-    TermOpened {
-        terminal_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        viewer_id: Option<String>,
-        cli_nonce: String,
-    },
-    #[serde(rename = "term.attached")]
-    TermAttached {
-        terminal_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        viewer_id: Option<String>,
-        cli_nonce: String,
-    },
-    #[serde(rename = "term.rejected")]
-    TermRejected {
-        terminal_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        viewer_id: Option<String>,
-        reason: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        approval_code: Option<String>,
-    },
-    /// 2.5 only. The viewer that most recently typed; omitted when there is
-    /// no writer. Carries no size.
-    #[serde(rename = "term.writer")]
-    TermWriter {
-        terminal_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        viewer_id: Option<String>,
-    },
-    /// Browser input for this terminal was dropped because the CLI's
-    /// per-terminal input queue was full (the program is not reading). The
-    /// relay shows that viewer its "input dropped" notice. Sent once per run
-    /// of dropped frames per viewer; `viewerId` is omitted on a 2.4 terminal.
-    #[serde(rename = "term.input_dropped")]
-    TermInputDropped {
-        terminal_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        viewer_id: Option<String>,
-    },
-    #[serde(rename = "term.exit")]
-    TermExit {
-        terminal_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        exit_code: Option<i32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        signal: Option<String>,
-    },
-    /// A supervised terminal's confirm screen is running (no viewers yet).
-    #[serde(rename = "term.spawned")]
-    TermSpawned {
-        terminal_id: String,
-        command_id: String,
-    },
-    /// `term.spawn` was refused; nothing ran.
-    #[serde(rename = "supervised.rejected")]
-    SupervisedRejected { command_id: String, reason: String },
-    /// Enter was pressed on the drawn confirm screen; the command was exec'd.
-    #[serde(rename = "supervised.accepted")]
-    SupervisedAccepted { command_id: String },
-    /// Declined on the confirm screen, or the confirm child ended without accepting.
-    #[serde(rename = "supervised.declined")]
-    SupervisedDeclined { command_id: String },
-    /// The accepted command exited. `review`: output was withheld for review.
-    /// `output_bytes` only when `supervised.output` frames were sent.
-    #[serde(rename = "supervised.done")]
-    SupervisedDone {
-        command_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        exit_code: Option<i32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        signal: Option<String>,
-        review: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        output_bytes: Option<u64>,
-        /// 2.8: exactly one result/error arm for a supervised file op, or
-        /// neither for a supervised command.
-        #[serde(flatten)]
-        file: SupervisedFileOutcome,
-    },
-    #[serde(rename = "exec.started")]
-    ExecStarted { command_id: String },
-    #[serde(rename = "exec.rejected")]
-    ExecRejected { command_id: String, reason: String },
-    #[serde(rename = "exec.done")]
-    ExecDone {
-        command_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        exit_code: Option<i32>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        signal: Option<String>,
-        timed_out: bool,
-    },
-    /// 2.8: a node file op finished. When `data_field` is set, that (emptied)
-    /// result field's text follows as a binary `file.data` frame of
-    /// `body_bytes` bytes.
-    #[serde(rename = "file.result")]
-    FileResult {
-        op_id: String,
-        op: String,
-        result: Value,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        data_field: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        body_bytes: Option<usize>,
-    },
-    /// 2.8: a node file op was refused or failed (`reason` is a file error
-    /// code or `bad_frame` / `supervised_only` / `feature_disabled`).
-    #[serde(rename = "file.rejected")]
-    FileRejected {
-        op_id: String,
-        reason: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        detail: Option<Value>,
-    },
-    /// 2.4: Chat Completions engine tokenize finished.
-    #[serde(rename = "context.count.result")]
-    CountContextResult {
-        request_id: String,
-        tokens: u64,
-        method: crate::count_context::CountContextMethod,
-    },
-    /// 2.4: Chat Completions engine tokenize failed.
-    #[serde(rename = "context.count.error")]
-    CountContextError {
-        request_id: String,
-        failure: RelayFailure,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        message: Option<String>,
-    },
-    /// 2.7: static node facts, once per connection after `hello.ok`.
-    #[serde(rename = "node.info")]
-    NodeInfo(NodeInfo),
-    /// 2.7: periodic node metrics (built-ins every 20 s; never closer than 5 s).
-    #[serde(rename = "node.metrics")]
-    NodeMetrics(NodeMetrics),
-    /// 2.7: live engine load for one endpoint (or one model on it).
-    #[serde(rename = "endpoint.load")]
-    EndpointLoad(EndpointLoad),
-    /// 2.4: the engine side of a live speech-to-text session is ready.
-    #[serde(rename = "stt.opened")]
-    SttOpened { session_id: String },
-    /// 2.4: audio bytes handed to the engine; returns that much credit.
-    #[serde(rename = "stt.audio.ack")]
-    SttAudioAck { session_id: String, bytes: u32 },
-    /// 2.4: one normalized transcription event.
-    #[serde(rename = "stt.event")]
-    SttEvent {
-        session_id: String,
-        event: crate::stt_wire::SttEvent,
-    },
-    /// 2.4: the session failed (before or after open); terminal.
-    #[serde(rename = "stt.error")]
-    SttError {
-        session_id: String,
-        failure: RelayFailure,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        message: Option<String>,
-    },
-    /// 2.4: the answer to `stt.close`.
-    #[serde(rename = "stt.closed")]
-    SttClosed { session_id: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct DesiredModelCapability {
-    pub endpoint_slug: String,
-    pub upstream_model_id: String,
-    pub capability_override_mode: CapabilityOverrideMode,
-    pub capabilities: OpenAiCompatibleCapabilities,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RelayUsage {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(alias = "prompt_tokens")]
-    pub prompt_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(alias = "completion_tokens")]
-    pub completion_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(alias = "total_tokens")]
-    pub total_tokens: Option<u32>,
-}
-
-/// Internal benchmark metrics, deliberately separate from provider usage.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RelayMetrics {
-    pub completion_tokens: u32,
-    pub tokenizer: RelayMetricTokenizer,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum RelayMetricTokenizer {
-    Cl100kBase,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CliInventory {
-    pub slug: String,
-    /// This machine's hostname, a display label. Omitted when unavailable.
-    /// Not the credential bind: that is `identity_public_key`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hostname: Option<String>,
-    /// Persistent P-256 identity public key. Login and CLI-token TOFU bind to
-    /// this key; hello proves possession with `identity_signature`.
-    pub identity_public_key: String,
-    /// Signature over the server nonce from `hello.challenge`.
-    pub identity_signature: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    pub capabilities: CliCapabilities,
-}
-
-/// Startup feature flags and the daemon's terminal public key.
-///
-/// Hello capabilities are built from this snapshot. Later config reloads do not
-/// change it.
-#[derive(Debug, Clone)]
-pub struct TerminalFeatureSnapshot {
-    pub allow_human_terminal: bool,
-    pub mcp_command_mode: McpCommandMode,
-    pub require_terminal_approval: bool,
-    /// `allowFileToolsAsRoot` from config (2.8).
-    pub allow_file_tools_as_root: bool,
-    pub mcp_file_read: bool,
-    pub file_roots_configured: bool,
-    /// The local `allowRemoteMetricSources` opt-in, read at startup.
-    pub allow_remote_metric_sources: bool,
-    /// The local `allowRemoteEngineAdapters` opt-in, read at startup.
-    pub allow_remote_engine_adapters: bool,
-    /// 65-byte uncompressed SEC1, base64url without padding.
-    pub terminal_public_key_b64url: String,
-    /// The persistent identity key and its signature over the ECDH key above.
-    /// `None` when the identity file could not be loaded.
-    pub terminal_identity: Option<TerminalIdentityProof>,
-}
-
-fn deployment_disabled(value: &bool) -> bool {
-    !value
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CliReportedFeatures {
-    #[serde(skip_serializing_if = "deployment_disabled")]
-    pub deployments: bool,
-    /// This CLI can run interactive deployment commands in an operator
-    /// terminal: deployments and the operator-terminal switch are on and
-    /// terminals are supported (Unix). Omitted while false.
-    #[serde(skip_serializing_if = "deployment_disabled")]
-    pub deployment_operator: bool,
-    pub human_terminal: bool,
-    pub mcp_command_mode: McpCommandMode,
-    pub terminal_approval: bool,
-    pub terminal_supported: bool,
-    /// 2.7: whether this CLI accepts remotely defined metric sources
-    /// (`metrics.sources.set`): the local `allowRemoteMetricSources` opt-in.
-    pub remote_metric_sources: bool,
-    /// 2.9: whether this CLI accepts remotely defined engine adapters.
-    pub remote_engine_adapters: bool,
-    /// 2.8: the CLI's read-only file grant. From the startup config.
-    pub mcp_file_read: bool,
-    /// 2.8: `fileRoots` are configured. All configured roots were usable at startup.
-    pub file_roots_configured: bool,
-    /// 2.8: `allowFileToolsAsRoot` (config-backed, default false).
-    pub allow_file_tools_as_root: bool,
-}
-
-/// Hello capabilities: only fields that vary per CLI. Protocol 2.4 always
-/// implements inventory, binary frames, terminals, exec, node telemetry,
-/// file ops, and context.count.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CliCapabilities {
-    pub features: CliReportedFeatures,
-    pub terminal_public_key: String,
-    /// The browser pins this key and checks the signature before any
-    /// terminal handshake.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub terminal_identity: Option<TerminalIdentityProof>,
-}
-
-impl CliCapabilities {
-    pub fn from_snapshot(snapshot: &TerminalFeatureSnapshot) -> Self {
-        Self {
-            features: CliReportedFeatures {
-                deployments: false,
-                deployment_operator: false,
-                human_terminal: snapshot.allow_human_terminal,
-                mcp_command_mode: snapshot.mcp_command_mode,
-                terminal_approval: snapshot.require_terminal_approval,
-                terminal_supported: cfg!(unix),
-                remote_metric_sources: snapshot.allow_remote_metric_sources,
-                remote_engine_adapters: snapshot.allow_remote_engine_adapters,
-                mcp_file_read: snapshot.mcp_file_read,
-                file_roots_configured: snapshot.file_roots_configured,
-                allow_file_tools_as_root: snapshot.allow_file_tools_as_root,
-            },
-            terminal_public_key: snapshot.terminal_public_key_b64url.clone(),
-            terminal_identity: snapshot.terminal_identity.clone(),
-        }
-    }
-}
-
-pub fn terminal_supported() -> bool {
-    cfg!(unix)
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EndpointInventory {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deployment_instance_id: Option<String>,
-    pub slug: String,
-    pub label: String,
-    pub kind: String,
-    pub status: EndpointStatus,
-    pub default_capabilities: OpenAiCompatibleCapabilities,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub probe_suggestions: Option<OpenAiCompatibleCapabilities>,
-    pub models: Vec<DiscoveredModelInventory>,
-    /// 2.7: static engine facts for the whole endpoint. Digest-excluded.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub engine_facts: Option<EngineFacts>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum EndpointStatus {
-    Unknown,
-    Online,
-    Offline,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DiscoveredModelInventory {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub slug: Option<String>,
-    pub upstream_model_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub capabilities: Option<OpenAiCompatibleCapabilities>,
-    pub capability_override_mode: CapabilityOverrideMode,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub probe_suggestions: Option<OpenAiCompatibleCapabilities>,
-    /// Omitted from the inventory digest. The server stores it on create and
-    /// when an auto capacity limit is still null.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub concurrency_limit: Option<u32>,
-    /// 2.7: per-model engine facts; each field overrides the endpoint's.
-    /// Digest-excluded.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub engine_facts: Option<EngineFacts>,
-}
-
-/// Where one engine fact came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FactSource {
-    Probe,
-    Config,
-    Custom,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct EngineFact<T> {
-    pub value: T,
-    pub source: FactSource,
-}
-
-impl<T> EngineFact<T> {
-    pub fn probe(value: T) -> Self {
-        Self {
-            value,
-            source: FactSource::Probe,
-        }
-    }
-
-    pub fn config(value: T) -> Self {
-        Self {
-            value,
-            source: FactSource::Config,
-        }
-    }
-
-    pub fn custom(value: T) -> Self {
-        Self {
-            value,
-            source: FactSource::Custom,
-        }
-    }
-}
-
-/// 2.7 static engine facts. Every field is optional and carries its source.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EngineFacts {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub engine: Option<EngineFact<crate::engine::EngineKind>>,
-    /// Concurrent sequences the engine runs.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub slots: Option<EngineFact<u32>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ctx_per_slot: Option<EngineFact<u64>>,
-    /// Total KV capacity in tokens.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kv_tokens: Option<EngineFact<u64>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub max_model_len: Option<EngineFact<u64>>,
-    /// llama.cpp `--cache-ram`. Not detected yet; defined for the presets.
-    #[serde(rename = "hostPromptCacheMiB", skip_serializing_if = "Option::is_none")]
-    pub host_prompt_cache_mib: Option<EngineFact<u64>>,
-    /// Model ids one engine process serves.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub served_model_aliases: Option<EngineFact<Vec<String>>>,
-    /// 2.9: a custom engine adapter is configured on this endpoint.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub load_adapter: Option<EngineFact<LoadAdapterValue>>,
-    /// Chat Completions tokenize fact recorded at probe time.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub count_context: Option<EngineFact<crate::count_context::CountContextFact>>,
-}
-
-/// 2.9 `engineFacts.loadAdapter.value`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LoadAdapterValue {
-    pub input: crate::engine_adapter::AdapterInputKind,
-    pub signals: Vec<crate::engine_adapter::AdapterSignal>,
-}
-
-impl EngineFacts {
-    pub fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
-}
-
-/// 2.7 `node.info`: static facts about this machine. Every field is optional.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NodeInfo {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub os: Option<NodeOs>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu: Option<NodeCpu>,
-    #[serde(rename = "memoryTotalMiB", skip_serializing_if = "Option::is_none")]
-    pub memory_total_mib: Option<u64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub gpus: Vec<NodeGpuInfo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unified_memory: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub node_kind: Option<NodeKind>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub interfaces: Vec<NodeInterfaceInfo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub execution_mechanism: Option<ExecutionMechanism>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cli_version: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NodeOs {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kernel: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub arch: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NodeCpu {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
-    /// Logical CPUs available to this process.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cores: Option<u32>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NodeGpuInfo {
-    pub index: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub uuid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub driver_version: Option<String>,
-    /// `None` on unified-memory GPUs (nvidia-smi reports `[N/A]`).
-    #[serde(rename = "vramTotalMiB", skip_serializing_if = "Option::is_none")]
-    pub vram_total_mib: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum NodeKind {
-    Unified,
-    Discrete,
-    Cpu,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NodeInterfaceInfo {
-    pub name: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub addresses: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub link_speed_mbps: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mtu: Option<u32>,
-}
-
-/// How the CLI process runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ExecutionMechanism {
-    #[serde(rename = "systemd+linger")]
-    SystemdLinger,
-    #[serde(rename = "systemd-no-linger")]
-    SystemdNoLinger,
-    Macos,
-    Unsupported,
-    Foreground,
-    Systemd,
-    Launchd,
-    Container,
-}
-
-/// 2.7 `node.metrics`. `[N/A]` readings are omitted.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NodeMetrics {
-    /// RFC 3339 sample time.
-    pub ts: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpu: Option<NodeCpuMetrics>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory: Option<NodeMemoryMetrics>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub disks: Vec<NodeDiskMetrics>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub gpus: Vec<NodeGpuMetrics>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub interfaces: Vec<NodeInterfaceMetrics>,
-    /// Custom metric series (S-B part 2). At most `NODE_METRICS_CUSTOM_MAX`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub custom: Vec<CustomMetric>,
-    /// Status of each configured or remotely defined metric source.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub sources: Vec<MetricSourceStatus>,
-    /// 2.9: per-endpoint custom engine adapter status. No command text.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub engine_adapters: Vec<crate::engine_adapter::EngineAdapterStatus>,
-    /// Abandoned `.wsmp-recover-*` directories this CLI still has indexed.
-    /// Omitted when zero so older hello/metrics vectors stay identical.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub abandoned_recovery: Option<u32>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NodeCpuMetrics {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub usage_percent: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub load1: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub load5: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub load15: Option<f64>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct NodeMemoryMetrics {
-    #[serde(rename = "totalMiB", skip_serializing_if = "Option::is_none")]
-    pub total_mib: Option<u64>,
-    /// `/proc/meminfo` `MemAvailable`; on unified memory this is the GPU budget too.
-    #[serde(rename = "availableMiB", skip_serializing_if = "Option::is_none")]
-    pub available_mib: Option<u64>,
-    #[serde(rename = "swapTotalMiB", skip_serializing_if = "Option::is_none")]
-    pub swap_total_mib: Option<u64>,
-    #[serde(rename = "swapFreeMiB", skip_serializing_if = "Option::is_none")]
-    pub swap_free_mib: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct NodeDiskMetrics {
-    pub mount: String,
-    #[serde(rename = "totalMiB", skip_serializing_if = "Option::is_none")]
-    pub total_mib: Option<u64>,
-    #[serde(rename = "freeMiB", skip_serializing_if = "Option::is_none")]
-    pub free_mib: Option<u64>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NodeGpuMetrics {
-    pub index: u32,
-    #[serde(rename = "vramUsedMiB", skip_serializing_if = "Option::is_none")]
-    pub vram_used_mib: Option<u64>,
-    #[serde(rename = "vramTotalMiB", skip_serializing_if = "Option::is_none")]
-    pub vram_total_mib: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub utilization_percent: Option<f64>,
-    #[serde(rename = "temperatureC", skip_serializing_if = "Option::is_none")]
-    pub temperature_c: Option<f64>,
-    #[serde(rename = "powerW", skip_serializing_if = "Option::is_none")]
-    pub power_w: Option<f64>,
-    #[serde(rename = "smClockMHz", skip_serializing_if = "Option::is_none")]
-    pub sm_clock_mhz: Option<f64>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NodeInterfaceMetrics {
-    pub name: String,
-    /// Lifetime totals since boot, saturated at `Number.MAX_SAFE_INTEGER`
-    /// (see `telemetry::BYTE_COUNTER_MAX`) so the server's strict schema keeps
-    /// accepting the frame. Treat a value at the cap as "at least this much".
-    pub rx_bytes: u64,
-    /// See [`Self::rx_bytes`].
-    pub tx_bytes: u64,
-}
-
-/// One custom series. Names and label keys/values match `[A-Za-z0-9_.:-]{1,64}`.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CustomMetric {
-    pub source: String,
-    pub name: String,
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub labels: std::collections::BTreeMap<String, String>,
-    pub value: f64,
-    pub ts: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MetricSourceOrigin {
-    Local,
-    Remote,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MetricSourceState {
-    Active,
-    PendingApproval,
-    Refused,
-    Unsupported,
-    Disabled,
-    Failing,
-}
-
-/// Why a source's last run produced nothing. Never command output or stderr.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MetricSourceError {
-    Spawn,
-    Timeout,
-    ExitStatus,
-    OutputTooLarge,
-    Parse,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MetricSourceStatus {
-    pub name: String,
-    pub origin: MetricSourceOrigin,
-    pub state: MetricSourceState,
-    /// SHA-256 (hex) of the exact command string, for hash-pinned approval.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub command_sha256: Option<String>,
-    /// The source's run interval in seconds (`5..=86_400`). The server marks
-    /// a source's series stale after 3× this (S-B part 2). Local sources are
-    /// defined only in the CLI config, so this is the server's only way to
-    /// learn their cadence. Absent when the source has no schedule.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub interval_secs: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<MetricSourceError>,
-}
-
-/// 2.7 `endpoint.load`.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EndpointLoad {
-    pub endpoint_slug: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub model_slug: Option<String>,
-    pub running: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub waiting: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kv_usage: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kv_occupancy: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub slots_busy: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deferred: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefix_cache_hits_delta: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefix_cache_queries_delta: Option<u64>,
-    /// Engine prefix-cache counters dropped (restart / flush). Not a delta.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prefix_cache_reset: Option<bool>,
-    /// Bumped when prefix-cache counters drop or the engine identity changes.
-    pub counter_epoch: u32,
-    pub source: crate::engine::LoadSource,
-    pub ts: String,
-}
-
-/// 2.7 `metrics.sources.set` (server to CLI): remotely defined custom metric
-/// sources. They run only with the local opt-in (`allowRemoteMetricSources`)
-/// and a local hash approval of the exact command (`wsmp metrics approve`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RemoteMetricSource {
-    pub name: String,
-    pub command: String,
-    pub interval_secs: u32,
-    pub timeout_secs: u32,
-    pub format: MetricSourceFormat,
-}
-
-/// 2.9 `engine.adapters.set` (server to CLI): remotely defined engine adapters.
-/// They run only with the local opt-in (`allowRemoteEngineAdapters`) and a
-/// local hash approval of the canonical spec (`wsmp endpoints adapter approve`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct RemoteEngineAdapter {
-    pub endpoint_slug: String,
-    pub input: crate::engine_adapter::AdapterInput,
-    pub format: crate::engine_adapter::AdapterFormat,
-    pub interval_secs: u32,
-    pub timeout_secs: u32,
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub map: std::collections::BTreeMap<
-        crate::engine_adapter::AdapterSignal,
-        crate::engine_adapter::SignalSelector,
-    >,
-    /// Optional POST path that counts Chat Completions tokens.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub count_route: Option<String>,
-}
-
-impl RemoteEngineAdapter {
-    pub fn to_config(&self) -> crate::engine_adapter::EngineAdapterConfig {
-        crate::engine_adapter::EngineAdapterConfig {
-            input: self.input.clone(),
-            format: self.format,
-            interval_secs: self.interval_secs,
-            timeout_secs: self.timeout_secs,
-            map: self.map.clone(),
-            count_route: self.count_route.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MetricSourceFormat {
-    #[default]
-    Number,
-    Json,
-    Prometheus,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct InventoryRevision {
-    pub inventory_seq: u64,
-    pub inventory_digest: String,
-    pub inventory_acknowledged_at: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TerminalIdentity {
-    pub public_key: String,
-    /// Present on `term.auth`. Open and attach carry the public key only; the
-    /// signature is over a transcript that includes the CLI nonce from `term.pending`.
-    #[serde(default)]
-    pub signature: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(
-    tag = "type",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-enum KnownServerControlMessage {
-    #[serde(rename = "deployment.instances.ok")]
-    DeploymentInstancesOk { snapshot_id: String },
-    #[serde(rename = "hello.challenge")]
-    HelloChallenge {
-        nonce: String,
-        #[serde(default)]
-        origin: Option<String>,
-    },
-    #[serde(rename = "hello.ok")]
-    HelloOk {
-        id: String,
-        protocol_version: String,
-        revision: InventoryRevision,
-        #[serde(default)]
-        desired_capabilities: Vec<DesiredModelCapability>,
-    },
-    #[serde(rename = "inventory.ok")]
-    InventoryOk {
-        id: String,
-        revision: InventoryRevision,
-        #[serde(default)]
-        desired_capabilities: Vec<DesiredModelCapability>,
-    },
-    #[serde(rename = "inventory.error")]
-    InventoryError { id: String, message: String },
-    #[serde(rename = "heartbeat.pong")]
-    HeartbeatPong { id: String, received_at: String },
-    #[serde(rename = "relay.request")]
-    RelayRequest {
-        request_id: String,
-        family: String,
-        method: String,
-        path: String,
-        headers: std::collections::BTreeMap<String, String>,
-        timeout_ms: u64,
-        endpoint_slug: String,
-        expect_body: bool,
-        #[serde(default)]
-        count_first: bool,
-        #[serde(default)]
-        count_ceiling: Option<u64>,
-    },
-    #[serde(rename = "relay.cancel")]
-    RelayCancel {
-        request_id: String,
-        reason: RelayFailure,
-    },
-    #[serde(rename = "protocol.error")]
-    ProtocolError {
-        failure: RelayFailure,
-        #[serde(default)]
-        code: Option<ProtocolErrorCode>,
-        message: String,
-        #[serde(default)]
-        supported_versions: Vec<String>,
-        request_id: Option<String>,
-    },
-    #[serde(rename = "term.open")]
-    TermOpen {
-        terminal_id: String,
-        cols: u16,
-        rows: u16,
-        browser_public_key: String,
-        browser_nonce: String,
-        #[serde(default)]
-        identity: Option<TerminalIdentity>,
-        #[serde(default)]
-        viewer_id: Option<String>,
-    },
-    #[serde(rename = "term.attach")]
-    TermAttach {
-        terminal_id: String,
-        #[serde(default)]
-        viewer_id: Option<String>,
-        browser_public_key: String,
-        browser_nonce: String,
-        #[serde(default)]
-        identity: Option<TerminalIdentity>,
-    },
-    #[serde(rename = "term.detach")]
-    TermDetach {
-        terminal_id: String,
-        #[serde(default)]
-        viewer_id: Option<String>,
-    },
-    #[serde(rename = "term.close")]
-    TermClose { terminal_id: String },
-    #[serde(rename = "term.auth")]
-    TermAuth {
-        terminal_id: String,
-        #[serde(default)]
-        viewer_id: Option<String>,
-        signature: String,
-    },
-    #[serde(rename = "exec.start")]
-    ExecStart {
-        command_id: String,
-        command: String,
-        #[serde(default)]
-        cwd: Option<String>,
-    },
-    #[serde(rename = "exec.cancel")]
-    ExecCancel { command_id: String },
-    #[serde(rename = "term.spawn")]
-    TermSpawn {
-        terminal_id: String,
-        command_id: String,
-        command: String,
-        #[serde(default)]
-        cwd: Option<String>,
-        #[serde(default)]
-        reason: Option<String>,
-        requester: String,
-        share_output: bool,
-        #[serde(default)]
-        kind: Option<String>,
-        #[serde(default)]
-        file_op: Option<FileSpawnOp>,
-        #[serde(default)]
-        body_bytes: Option<usize>,
-    },
-    #[serde(rename = "supervised.cancel")]
-    SupervisedCancel {
-        command_id: String,
-        #[serde(default)]
-        reason: Option<String>,
-    },
-    #[serde(rename = "metrics.sources.set")]
-    MetricsSourcesSet {
-        id: String,
-        sources: Vec<RemoteMetricSource>,
-    },
-    #[serde(rename = "engine.adapters.set")]
-    EngineAdaptersSet {
-        id: String,
-        adapters: Vec<RemoteEngineAdapter>,
-    },
-    #[serde(rename = "file.op")]
-    FileOp {
-        op_id: String,
-        op: String,
-        args: Value,
-        #[serde(default)]
-        body_bytes: Option<usize>,
-        mode: McpCommandMode,
-        read_grant: bool,
-    },
-    #[serde(rename = "file.cancel")]
-    FileCancel { op_id: String },
-}
-
-/// The supervised-file payload of `term.spawn` (`kind:"file"`), 2.8.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FileSpawnOp {
-    pub op: String,
-    pub args: Value,
-}
-
-/// A supervised command request, as `term.spawn` carries it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SupervisedSpawn {
-    pub terminal_id: String,
-    pub command_id: String,
-    pub command: String,
-    pub cwd: Option<String>,
-    pub reason: Option<String>,
-    pub requester: String,
-    pub share_output: bool,
-    /// 2.8: `Some("file")` for a supervised file op;
-    /// `None`/`Some("command")` for a command.
-    pub kind: Option<String>,
-    pub file_op: Option<FileSpawnOp>,
-    pub body_bytes: Option<usize>,
-}
-
-impl SupervisedSpawn {
-    /// True for a supervised file op.
-    pub fn is_file(&self) -> bool {
-        self.kind.as_deref() == Some("file") || self.file_op.is_some()
-    }
-
-    /// Enforce the `term.spawn` command/file union before anything reaches a
-    /// PTY. Strict per-operation argument decoding remains at the FileOps
-    /// preparation boundary, where path and state errors can be classified.
-    pub fn file_shape_is_valid(&self) -> bool {
-        use base64::Engine;
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
-        if self.kind.as_deref() != Some("file")
-            || self.share_output
-            || self.cwd.is_some()
-            || self.command.len() > 4096
-            || self.command_id.len() != 22
-            || URL_SAFE_NO_PAD
-                .decode(&self.command_id)
-                .map(|decoded| decoded.len() != 16)
-                .unwrap_or(true)
-        {
-            return false;
-        }
-        let Some(file_op) = self.file_op.as_ref() else {
-            return false;
-        };
-        let Some(args) = file_op.args.as_object() else {
-            return false;
-        };
-        match (file_op.op.as_str(), self.body_bytes) {
-            ("write", Some(bytes)) if bytes <= RELAY_BINARY_CHUNK_MAX_BYTES => {
-                !args.contains_key("content") && !args.contains_key("encoding")
-            }
-            ("edit" | "rename" | "mkdir" | "delete", None) => true,
-            _ => false,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum ServerControlMessage {
-    DeploymentInstancesOk {
-        snapshot_id: String,
-    },
-    HelloOk {
-        id: String,
-        protocol_version: String,
-        revision: InventoryRevision,
-        desired_capabilities: Vec<DesiredModelCapability>,
-    },
-    InventoryOk {
-        id: String,
-        revision: InventoryRevision,
-        desired_capabilities: Vec<DesiredModelCapability>,
-    },
-    InventoryError {
-        id: String,
-        message: String,
-    },
-    HeartbeatPong {
-        id: String,
-        received_at: String,
-    },
-    RelayRequest {
-        request_id: String,
-        family: String,
-        method: String,
-        path: String,
-        headers: std::collections::BTreeMap<String, String>,
-        timeout_ms: u64,
-        endpoint_slug: String,
-        expect_body: bool,
-        count_first: bool,
-        count_ceiling: Option<u64>,
-    },
-    RelayCancel {
-        request_id: String,
-        reason: RelayFailure,
-    },
-    ProtocolError {
-        failure: RelayFailure,
-        code: Option<ProtocolErrorCode>,
-        message: String,
-        supported_versions: Vec<String>,
-        request_id: Option<String>,
-    },
-    HelloChallenge {
-        nonce: String,
-        origin: Option<String>,
-    },
-    TermOpen {
-        terminal_id: String,
-        cols: u16,
-        rows: u16,
-        browser_public_key: String,
-        browser_nonce: String,
-        identity: Option<TerminalIdentity>,
-        viewer_id: Option<String>,
-    },
-    TermAttach {
-        terminal_id: String,
-        viewer_id: Option<String>,
-        browser_public_key: String,
-        browser_nonce: String,
-        identity: Option<TerminalIdentity>,
-    },
-    TermDetach {
-        terminal_id: String,
-        viewer_id: Option<String>,
-    },
-    TermClose {
-        terminal_id: String,
-    },
-    TermAuth {
-        terminal_id: String,
-        viewer_id: Option<String>,
-        signature: String,
-    },
-    ExecStart {
-        command_id: String,
-        command: String,
-        cwd: Option<String>,
-    },
-    ExecCancel {
-        command_id: String,
-    },
-    TermSpawn(SupervisedSpawn),
-    SupervisedCancel {
-        command_id: String,
-        /// `true` for the server's confirm deadline (`reason: "expire"`) or a
-        /// browser decline (`reason: "decline"`): a request the CLI decides
-        /// against an Enter it may already have taken. Without a reason (or
-        /// with another one) the terminal simply ends.
-        if_waiting: bool,
-    },
-    /// 2.7: remotely defined metric sources (replaces the previous list).
-    MetricsSourcesSet {
-        id: String,
-        sources: Vec<RemoteMetricSource>,
-    },
-    /// 2.9: remotely defined engine adapters (replaces the previous list).
-    EngineAdaptersSet {
-        id: String,
-        adapters: Vec<RemoteEngineAdapter>,
-    },
-    /// 2.8: run one node file op (`args` is validated by `FileOps::execute`).
-    FileOp {
-        op_id: String,
-        op: String,
-        args: Value,
-        body_bytes: Option<usize>,
-        mode: McpCommandMode,
-        read_grant: bool,
-    },
-    /// 2.8: cancel a pending file op.
-    FileCancel {
-        op_id: String,
-    },
-    /// 2.4: live speech-to-text control.
-    Stt(crate::stt_wire::SttServerMessage),
-    Unknown {
-        type_name: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RelayFailure {
-    Transport,
-    Timeout,
-    Disconnected,
-    Upstream5xx,
-    Upstream4xx,
-    UnsupportedCapability,
-    NotFound,
-    AccessDenied,
-    RateLimited,
-    RequestTooLarge,
-    Cancelled,
-    ProtocolError,
-    Unknown,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all_fields = "camelCase")]
-pub enum RelayBinaryFrameMetadata {
-    #[serde(rename = "relay.request.body")]
-    RequestBody {
-        request_id: String,
-        chunk_id: String,
-        #[serde(rename = "final", default, skip_serializing_if = "Option::is_none")]
-        final_chunk: Option<bool>,
-    },
-    #[serde(rename = "relay.response.body")]
-    ResponseBody {
-        request_id: String,
-        chunk_id: String,
-        #[serde(rename = "final", default, skip_serializing_if = "Option::is_none")]
-        final_chunk: Option<bool>,
-    },
-    /// 2.5 adds exactly one routing field on CLI->browser frames: `viewerId`
-    /// for unicast (pairwise keys) or `epoch` for broadcast (shared output
-    /// key). Browser->CLI frames carry the `viewerId` the server stamped.
-    /// 2.4 frames carry neither.
-    #[serde(rename = "term.sealed")]
-    TermSealed {
-        terminal_id: String,
-        seq: u64,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        viewer_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        epoch: Option<u32>,
-    },
-    #[serde(rename = "exec.stdout")]
-    ExecStdout { command_id: String, seq: u64 },
-    #[serde(rename = "exec.stderr")]
-    ExecStderr { command_id: String, seq: u64 },
-    /// Shared supervised output (never while under review): the first bytes
-    /// (`head`) or the last bytes (`tail`) after the accept marker.
-    #[serde(rename = "supervised.output")]
-    SupervisedOutput {
-        command_id: String,
-        part: SupervisedOutputPart,
-        seq: u64,
-    },
-    /// 2.8, server to CLI: the content of a file write (one frame, <= 1 MiB).
-    #[serde(rename = "file.body")]
-    FileBody { op_id: String },
-    /// 2.8, CLI to server: a `file.result` text field above the inline 48 KiB.
-    #[serde(rename = "file.data")]
-    FileData { op_id: String },
-    /// 2.4, server to CLI: live speech-to-text PCM (s16le, 24 kHz mono).
-    #[serde(rename = "stt.audio")]
-    SttAudio { session_id: String, seq: u64 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SupervisedOutputPart {
-    Head,
-    Tail,
-}
-
-impl RelayBinaryFrameMetadata {
-    pub fn routing_id(&self) -> &str {
-        match self {
-            Self::RequestBody { request_id, .. } | Self::ResponseBody { request_id, .. } => {
-                request_id
-            }
-            Self::TermSealed { terminal_id, .. } => terminal_id,
-            Self::ExecStdout { command_id, .. }
-            | Self::ExecStderr { command_id, .. }
-            | Self::SupervisedOutput { command_id, .. } => command_id,
-            Self::FileBody { op_id } | Self::FileData { op_id } => op_id,
-            Self::SttAudio { session_id, .. } => session_id,
-        }
-    }
-}
-
-/// Token counts the server's strict schema accepts (`1..=1e12`). A value
-/// outside it is dropped here so one odd engine report cannot fail hello.
-const ENGINE_TOKEN_COUNT_MAX: u64 = 1_000_000_000_000;
-
-fn token_fact(value: Option<u64>) -> Option<EngineFact<u64>> {
-    value
-        .filter(|value| (1..=ENGINE_TOKEN_COUNT_MAX).contains(value))
-        .map(EngineFact::probe)
-}
-
-/// Endpoint-level engine facts: the declared or detected engine, probed
-/// numbers, and `slots`: the configured concurrency when set, else the
-/// engine's reported slots.
-pub fn endpoint_engine_facts(endpoint: &EndpointConfig) -> Option<EngineFacts> {
-    endpoint_engine_facts_with(endpoint, endpoint.engine_adapter.as_ref())
-}
-
-/// Endpoint-level engine facts using the effective adapter (local, else
-/// approved remote) for `loadAdapter`.
-pub fn endpoint_engine_facts_with(
-    endpoint: &EndpointConfig,
-    adapter: Option<&crate::engine_adapter::EngineAdapterConfig>,
-) -> Option<EngineFacts> {
-    let detected = endpoint
-        .last_probe
-        .as_ref()
-        .and_then(|probe| probe.engine.as_ref());
-    let engine = crate::engine::effective_kind(endpoint).map(|(kind, declared)| {
-        if declared {
-            EngineFact::config(kind)
-        } else {
-            EngineFact::probe(kind)
-        }
-    });
-    let probed_slots = detected
-        .and_then(|engine| engine.slots)
-        .filter(|slots| (1..=10_000).contains(slots));
-    // Detection is overridable by config (#70 §B): a concurrency set with
-    // `wsmp endpoints concurrency` wins over the engine's reported slots (for
-    // example to keep some llama.cpp slots free for direct local use); the
-    // probed count only fills an unset value.
-    let configured_slots = endpoint
-        .concurrency_limit
-        .filter(|limit| (1..=10_000).contains(limit));
-    let configured_kv = endpoint
-        .kv_tokens
-        .filter(|tokens| (1..=ENGINE_TOKEN_COUNT_MAX).contains(tokens));
-    let cached = endpoint
-        .last_probe
-        .as_ref()
-        .and_then(|probe| probe.adapter.as_ref());
-    let adapter_slots = cached
-        .and_then(|facts| facts.slots)
-        .filter(|slots| (1..=10_000).contains(slots));
-    let adapter_kv = cached
-        .and_then(|facts| facts.kv_tokens)
-        .filter(|tokens| (1..=ENGINE_TOKEN_COUNT_MAX).contains(tokens));
-    let load_adapter = adapter.map(|spec| {
-        EngineFact::config(LoadAdapterValue {
-            input: spec.input_kind(),
-            signals: spec.signals(),
-        })
-    });
-    let facts = EngineFacts {
-        engine,
-        slots: configured_slots
-            .map(EngineFact::config)
-            .or_else(|| adapter_slots.map(EngineFact::custom))
-            .or_else(|| probed_slots.map(EngineFact::probe)),
-        ctx_per_slot: cached
-            .and_then(|facts| facts.ctx_per_slot)
-            .filter(|value| (1..=ENGINE_TOKEN_COUNT_MAX).contains(value))
-            .map(EngineFact::custom)
-            .or_else(|| token_fact(detected.and_then(|engine| engine.ctx_per_slot))),
-        kv_tokens: configured_kv
-            .map(EngineFact::config)
-            .or_else(|| adapter_kv.map(EngineFact::custom))
-            .or_else(|| token_fact(detected.and_then(|engine| engine.kv_tokens))),
-        max_model_len: cached
-            .and_then(|facts| facts.max_model_len)
-            .filter(|value| (1..=ENGINE_TOKEN_COUNT_MAX).contains(value))
-            .map(EngineFact::custom)
-            .or_else(|| token_fact(detected.and_then(|engine| engine.max_model_len))),
-        host_prompt_cache_mib: None,
-        served_model_aliases: detected
-            .map(|engine| {
-                engine
-                    .served_model_aliases
-                    .iter()
-                    .filter(|alias| {
-                        // Trimmed as the server's zod `.trim()` trims.
-                        let trimmed =
-                            alias.trim_matches(crate::telemetry_bounds::is_js_trim_whitespace);
-                        !trimmed.is_empty() && trimmed.len() <= 512
-                    })
-                    .take(64)
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-            .filter(|aliases| !aliases.is_empty())
-            .map(EngineFact::probe),
-        load_adapter,
-        count_context: detected
-            .and_then(|engine| engine.count_context)
-            .map(EngineFact::probe),
-    };
-    (!facts.is_empty()).then_some(facts)
-}
-
-/// Per-model facts that differ from the endpoint's (vLLM `max_model_len`).
-fn model_engine_facts(endpoint: &EndpointConfig, upstream_model_id: &str) -> Option<EngineFacts> {
-    let max_model_len = token_fact(
-        endpoint
-            .last_probe
-            .as_ref()
-            .and_then(|probe| probe.engine.as_ref())
-            .and_then(|engine| engine.model_max_len.get(upstream_model_id).copied()),
-    )?;
-    Some(EngineFacts {
-        max_model_len: Some(max_model_len),
-        ..EngineFacts::default()
-    })
-}
-
-pub fn endpoint_inventory(endpoint: &EndpointConfig, status: EndpointStatus) -> EndpointInventory {
-    endpoint_inventory_with(endpoint, status, endpoint.engine_adapter.as_ref())
-}
-
-pub fn endpoint_inventory_with(
-    endpoint: &EndpointConfig,
-    status: EndpointStatus,
-    adapter: Option<&crate::engine_adapter::EngineAdapterConfig>,
-) -> EndpointInventory {
-    let mut default_capabilities = endpoint.default_capabilities.clone();
-    if endpoint.engine.accepts_top_k() {
-        default_capabilities.advertise_top_k();
-    }
-    EndpointInventory {
-        deployment_instance_id: None,
-        slug: endpoint.slug.clone(),
-        label: endpoint.label.clone(),
-        kind: match endpoint.kind {
-            EndpointKind::OpenAiCompatible => "openai-compatible",
-            EndpointKind::AnthropicCompatible => "anthropic-compatible",
-        }
-        .to_string(),
-        status,
-        default_capabilities,
-        probe_suggestions: endpoint
-            .last_probe
-            .as_ref()
-            .map(|probe| probe.suggested_capabilities.clone()),
-        models: endpoint
-            .models
-            .iter()
-            .map(|model| {
-                let mut capabilities = model.capabilities.clone();
-                if endpoint.engine.accepts_top_k()
-                    && let Some(capabilities) = capabilities.as_mut()
-                {
-                    capabilities.advertise_top_k();
-                }
-                DiscoveredModelInventory {
-                    slug: model.slug.clone(),
-                    upstream_model_id: model.upstream_model_id.clone(),
-                    capabilities,
-                    capability_override_mode: model.capability_override_mode.clone(),
-                    probe_suggestions: model.probe_suggestions.clone(),
-                    concurrency_limit: endpoint.concurrency_limit,
-                    engine_facts: model_engine_facts(endpoint, &model.upstream_model_id),
-                }
-            })
-            .collect(),
-        engine_facts: endpoint_engine_facts_with(endpoint, adapter),
-    }
-}
-
-/// SHA-256 identity for the server's complete inventory replacement snapshot.
-///
-/// This deliberately excludes volatile probe health and suggestions. It mirrors
-/// `inventoryDigestFor` in the server registration module: object keys are
-/// sorted recursively, endpoints are ordered by slug, and models by upstream
-/// model id. Keep the test vector below in sync with that implementation.
-pub fn inventory_digest(endpoints: &[EndpointInventory]) -> String {
-    let mut identity = endpoints
-        .iter()
-        .map(|endpoint| {
-            let mut models = endpoint
-                .models
-                .iter()
-                .map(|model| {
-                    json!({
-                        "slug": &model.slug,
-                        "upstreamModelId": &model.upstream_model_id,
-                        "capabilityOverrideMode": &model.capability_override_mode,
-                        "capabilities": &model.capabilities,
-                    })
-                })
-                .collect::<Vec<_>>();
-            models.sort_by(|left, right| {
-                left["upstreamModelId"]
-                    .as_str()
-                    .cmp(&right["upstreamModelId"].as_str())
-            });
-            json!({
-                "slug": &endpoint.slug,
-                "label": &endpoint.label,
-                "kind": &endpoint.kind,
-                "defaultCapabilities": &endpoint.default_capabilities,
-                "models": models,
-            })
-        })
-        .collect::<Vec<_>>();
-    identity.sort_by(|left, right| left["slug"].as_str().cmp(&right["slug"].as_str()));
-    let canonical = stable_json(&Value::Array(identity));
-    // digest 0.11 returns `hybrid_array::Array`, which (unlike the old
-    // `generic_array::GenericArray`) does not implement `LowerHex`, so encode
-    // the bytes ourselves rather than pull in a hex crate.
-    Sha256::digest(canonical.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
-fn stable_json(value: &Value) -> String {
-    match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => value.to_string(),
-        Value::Array(values) => format!(
-            "[{}]",
-            values.iter().map(stable_json).collect::<Vec<_>>().join(",")
-        ),
-        Value::Object(values) => stable_object_json(values),
-    }
-}
-
-fn stable_object_json(values: &Map<String, Value>) -> String {
-    let mut keys = values.keys().collect::<Vec<_>>();
-    keys.sort_unstable();
-    format!(
-        "{{{}}}",
-        keys.into_iter()
-            .map(|key| format!(
-                "{}:{}",
-                Value::String(key.clone()),
-                stable_json(&values[key])
-            ))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
-
-pub fn encode_control(message: &ClientControlMessage) -> Result<String> {
-    crate::stt_wire::validate_client_message(message)?;
-    let text = serde_json::to_string(message).context("serializing relay control frame")?;
-    if text.len() <= RELAY_JSON_CONTROL_MAX_BYTES {
-        return Ok(text);
-    }
-    if let Some(text) = inventory_without_engine_facts(message)? {
-        return Ok(text);
-    }
-    anyhow::bail!("JSON control frame exceeds 64 KiB");
-}
-
-/// A `hello` or `inventory.update` over the frame cap sheds its engine facts
-/// (digest-excluded and advisory) before it is refused, least useful first:
-/// per-model facts, then served-model aliases, then every endpoint fact. The
-/// inventory itself is never trimmed. `None` when shedding is not enough.
-fn inventory_without_engine_facts(message: &ClientControlMessage) -> Result<Option<String>> {
-    let steps: [fn(&mut EndpointInventory); 3] = [
-        |endpoint| {
-            for model in &mut endpoint.models {
-                model.engine_facts = None;
-            }
-        },
-        |endpoint| {
-            if let Some(facts) = endpoint.engine_facts.as_mut() {
-                facts.served_model_aliases = None;
-            }
-        },
-        |endpoint| endpoint.engine_facts = None,
-    ];
-    let mut shed = message.clone();
-    for (index, step) in steps.iter().enumerate() {
-        match &mut shed {
-            ClientControlMessage::Hello { endpoints, .. }
-            | ClientControlMessage::InventoryUpdate { endpoints, .. } => {
-                endpoints.iter_mut().for_each(step);
-            }
-            _ => return Ok(None),
-        }
-        let text = serde_json::to_string(&shed).context("serializing relay control frame")?;
-        if text.len() <= RELAY_JSON_CONTROL_MAX_BYTES {
-            tracing::warn!(
-                shed_steps = index + 1,
-                "the endpoint inventory exceeds 64 KiB with engine facts; sent without some of them"
-            );
-            return Ok(Some(text));
-        }
-    }
-    Ok(None)
-}
-
-pub fn parse_server_control(text: &str) -> Result<ServerControlMessage> {
-    if text.len() > RELAY_JSON_CONTROL_MAX_BYTES {
-        anyhow::bail!("JSON control frame exceeds 64 KiB");
-    }
+/// Serializes one node frame after checking its cross-field rules and the
+/// control-frame size cap.
+pub fn encode_control(frame: &NodeFrame) -> Result<String> {
+    frame
+        .validate()
+        .map_err(|error| anyhow::anyhow!("relay frame breaks a protocol rule: {error}"))?;
+    crate::stt_wire::validate_node_frame(frame)?;
+    let text = serde_json::to_string(frame).context("serializing relay control frame")?;
+    anyhow::ensure!(
+        text.len() <= RELAY_JSON_CONTROL_MAX_BYTES,
+        "JSON control frame exceeds 64 KiB"
+    );
+    Ok(text)
+}
+
+/// Parses one server control frame strictly (shape, then cross-field rules).
+pub fn parse_server_control(text: &str) -> Result<ServerFrame> {
+    anyhow::ensure!(
+        text.len() <= RELAY_JSON_CONTROL_MAX_BYTES,
+        "JSON control frame exceeds 64 KiB"
+    );
     let value: Value = serde_json::from_str(text).context("parsing relay server control frame")?;
-    let Some(type_name) = value.get("type").and_then(Value::as_str) else {
-        anyhow::bail!("parsing relay server control frame");
-    };
-    if type_name.starts_with("stt.") {
-        // serde reads a struct from an array too, and an `Option` from null;
-        // the server's strict schema allows neither.
-        if let Some(config) = value.get("config") {
-            let strict = config
-                .as_object()
-                .is_some_and(|fields| fields.values().all(Value::is_string));
-            anyhow::ensure!(strict, "stt config must be an object of strings");
-        }
-        let message: crate::stt_wire::SttServerMessage =
-            serde_json::from_value(value).context("parsing relay stt frame")?;
-        message.validate()?;
-        return Ok(ServerControlMessage::Stt(message));
-    }
-    if !known_server_frame(type_name) {
-        return Ok(ServerControlMessage::Unknown {
-            type_name: type_name.to_string(),
-        });
-    }
-    if type_name == "term.spawn" {
-        let allowed = [
-            "type",
-            "terminalId",
-            "commandId",
-            "command",
-            "cwd",
-            "reason",
-            "requester",
-            "shareOutput",
-            "kind",
-            "fileOp",
-            "bodyBytes",
-        ];
-        let object = value
+    let type_name = value
+        .get("type")
+        .and_then(Value::as_str)
+        .context("relay server control frame has no type")?;
+    if type_name.starts_with("stt.")
+        && let Some(config) = value.get("config")
+    {
+        // serde reads a struct from an array too; the server's strict schema
+        // allows only an object of strings.
+        let strict = config
             .as_object()
-            .ok_or_else(|| anyhow::anyhow!("term.spawn is not an object"))?;
-        if object.keys().any(|key| !allowed.contains(&key.as_str())) {
-            anyhow::bail!("term.spawn carries an unknown field");
-        }
+            .is_some_and(|fields| fields.values().all(Value::is_string));
+        anyhow::ensure!(strict, "stt config must be an object of strings");
     }
-    if type_name == "deployment.instances.ok" {
-        let object = value
-            .as_object()
-            .context("deployment inventory acknowledgement is not an object")?;
-        anyhow::ensure!(
-            object
-                .keys()
-                .all(|key| key == "type" || key == "snapshotId"),
-            "deployment inventory acknowledgement carries an unknown field"
-        );
-    }
-    let known: KnownServerControlMessage =
+    let frame: ServerFrame =
         serde_json::from_value(value).context("parsing relay server control frame")?;
-    if let KnownServerControlMessage::DeploymentInstancesOk { snapshot_id } = &known {
-        anyhow::ensure!(
-            snapshot_id.len() == 32 && snapshot_id.bytes().all(|byte| byte.is_ascii_alphanumeric()),
-            "invalid deployment inventory acknowledgement"
-        );
-    }
-    if let KnownServerControlMessage::MetricsSourcesSet { sources, .. } = &known {
-        validate_remote_metric_sources(sources)?;
-    }
-    if let KnownServerControlMessage::EngineAdaptersSet { adapters, .. } = &known {
-        validate_remote_engine_adapters(adapters)?;
-    }
-    Ok(known.into())
+    frame
+        .validate()
+        .map_err(|error| anyhow::anyhow!("relay server frame breaks a protocol rule: {error}"))?;
+    crate::stt_wire::validate_server_frame(&frame)?;
+    Ok(frame)
 }
 
-/// The server's strict 2.7 `metrics.sources.set` contract
-/// (`remoteMetricSourcesSchema`), enforced here too: a list that breaks it
-/// is refused whole (and then ignored, never fatal; see `control_frame_fault`).
-/// Unknown fields are refused by `deny_unknown_fields`, the format by its enum.
-pub fn validate_remote_metric_sources(sources: &[RemoteMetricSource]) -> Result<()> {
-    if sources.len() > NODE_METRICS_SOURCES_MAX {
-        anyhow::bail!("metrics.sources.set lists more than {NODE_METRICS_SOURCES_MAX} sources");
-    }
-    for source in sources {
-        // zod counts UTF-16 code units.
-        let command_units = source.command.encode_utf16().count();
-        if !crate::telemetry::is_metric_name(&source.name)
-            || !(1..=4096).contains(&command_units)
-            || !(crate::telemetry::METRIC_SOURCE_INTERVAL_MIN_SECS
-                ..=crate::telemetry::METRIC_SOURCE_INTERVAL_MAX_SECS)
-                .contains(&source.interval_secs)
-            || !(1..=300).contains(&source.timeout_secs)
-        {
-            anyhow::bail!("metrics.sources.set carries a source outside the 2.7 contract");
-        }
-    }
-    Ok(())
-}
-
-pub fn validate_remote_engine_adapters(adapters: &[RemoteEngineAdapter]) -> Result<()> {
-    if adapters.len() > NODE_ENGINE_ADAPTERS_MAX {
-        anyhow::bail!("engine.adapters.set lists more than {NODE_ENGINE_ADAPTERS_MAX} adapters");
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    for adapter in adapters {
-        if !seen.insert(adapter.endpoint_slug.as_str())
-            || crate::slug::validate_slug(&adapter.endpoint_slug).is_err()
-            || adapter.to_config().validate().is_err()
-        {
-            anyhow::bail!("engine.adapters.set carries an adapter outside the 2.9 contract");
-        }
-    }
-    Ok(())
-}
-
-fn known_server_frame(type_name: &str) -> bool {
-    matches!(
-        type_name,
-        "hello.challenge"
-            | "deployment.instances.ok"
-            | "hello.ok"
-            | "inventory.ok"
-            | "inventory.error"
-            | "heartbeat.pong"
-            | "relay.request"
-            | "relay.cancel"
-            | "protocol.error"
-            | "term.open"
-            | "term.attach"
-            | "term.detach"
-            | "term.close"
-            | "term.auth"
-            | "exec.start"
-            | "exec.cancel"
-            | "term.spawn"
-            | "supervised.cancel"
-            | "metrics.sources.set"
-            | "engine.adapters.set"
-            | "file.op"
-            | "file.cancel"
-    )
-}
-
-impl From<KnownServerControlMessage> for ServerControlMessage {
-    fn from(message: KnownServerControlMessage) -> Self {
-        match message {
-            KnownServerControlMessage::DeploymentInstancesOk { snapshot_id } => {
-                Self::DeploymentInstancesOk { snapshot_id }
-            }
-            KnownServerControlMessage::HelloChallenge { nonce, origin } => {
-                Self::HelloChallenge { nonce, origin }
-            }
-            KnownServerControlMessage::HelloOk {
-                id,
-                protocol_version,
-                revision,
-                desired_capabilities,
-            } => Self::HelloOk {
-                id,
-                protocol_version,
-                revision,
-                desired_capabilities,
-            },
-            KnownServerControlMessage::InventoryOk {
-                id,
-                revision,
-                desired_capabilities,
-            } => Self::InventoryOk {
-                id,
-                revision,
-                desired_capabilities,
-            },
-            KnownServerControlMessage::InventoryError { id, message } => {
-                Self::InventoryError { id, message }
-            }
-            KnownServerControlMessage::HeartbeatPong { id, received_at } => {
-                Self::HeartbeatPong { id, received_at }
-            }
-            KnownServerControlMessage::RelayRequest {
-                request_id,
-                family,
-                method,
-                path,
-                headers,
-                timeout_ms,
-                endpoint_slug,
-                expect_body,
-                count_first,
-                count_ceiling,
-            } => Self::RelayRequest {
-                request_id,
-                family,
-                method,
-                path,
-                headers,
-                timeout_ms,
-                endpoint_slug,
-                expect_body,
-                count_first,
-                count_ceiling,
-            },
-            KnownServerControlMessage::RelayCancel { request_id, reason } => {
-                Self::RelayCancel { request_id, reason }
-            }
-            KnownServerControlMessage::ProtocolError {
-                failure,
-                code,
-                message,
-                supported_versions,
-                request_id,
-            } => Self::ProtocolError {
-                failure,
-                code,
-                message,
-                supported_versions,
-                request_id,
-            },
-            KnownServerControlMessage::TermOpen {
-                terminal_id,
-                cols,
-                rows,
-                browser_public_key,
-                browser_nonce,
-                identity,
-                viewer_id,
-            } => Self::TermOpen {
-                terminal_id,
-                cols,
-                rows,
-                browser_public_key,
-                browser_nonce,
-                identity,
-                viewer_id,
-            },
-            KnownServerControlMessage::TermAttach {
-                terminal_id,
-                viewer_id,
-                browser_public_key,
-                browser_nonce,
-                identity,
-            } => Self::TermAttach {
-                terminal_id,
-                viewer_id,
-                browser_public_key,
-                browser_nonce,
-                identity,
-            },
-            KnownServerControlMessage::TermDetach {
-                terminal_id,
-                viewer_id,
-            } => Self::TermDetach {
-                terminal_id,
-                viewer_id,
-            },
-            KnownServerControlMessage::TermClose { terminal_id } => Self::TermClose { terminal_id },
-            KnownServerControlMessage::TermAuth {
-                terminal_id,
-                viewer_id,
-                signature,
-            } => Self::TermAuth {
-                terminal_id,
-                viewer_id,
-                signature,
-            },
-            KnownServerControlMessage::ExecStart {
-                command_id,
-                command,
-                cwd,
-            } => Self::ExecStart {
-                command_id,
-                command,
-                cwd,
-            },
-            KnownServerControlMessage::ExecCancel { command_id } => Self::ExecCancel { command_id },
-            KnownServerControlMessage::TermSpawn {
-                terminal_id,
-                command_id,
-                command,
-                cwd,
-                reason,
-                requester,
-                share_output,
-                kind,
-                file_op,
-                body_bytes,
-            } => Self::TermSpawn(SupervisedSpawn {
-                terminal_id,
-                command_id,
-                command,
-                cwd,
-                reason,
-                requester,
-                share_output,
-                kind,
-                file_op,
-                body_bytes,
-            }),
-            KnownServerControlMessage::SupervisedCancel { command_id, reason } => {
-                Self::SupervisedCancel {
-                    command_id,
-                    if_waiting: matches!(reason.as_deref(), Some("expire" | "decline")),
-                }
-            }
-            KnownServerControlMessage::MetricsSourcesSet { id, sources } => {
-                Self::MetricsSourcesSet { id, sources }
-            }
-            KnownServerControlMessage::EngineAdaptersSet { id, adapters } => {
-                Self::EngineAdaptersSet { id, adapters }
-            }
-            KnownServerControlMessage::FileOp {
-                op_id,
-                op,
-                args,
-                body_bytes,
-                mode,
-                read_grant,
-            } => Self::FileOp {
-                op_id,
-                op,
-                args,
-                body_bytes,
-                mode,
-                read_grant,
-            },
-            KnownServerControlMessage::FileCancel { op_id } => Self::FileCancel { op_id },
-        }
-    }
-}
-
-#[cfg(test)]
-mod inventory_digest_tests {
-    use super::*;
-
-    /// Cross-language canonicalization vector shared with the server's
-    /// `inventoryDigestFor`: SHA-256 of the canonical empty replacement list.
-    #[test]
-    fn inventory_digest_matches_shared_empty_snapshot_vector() {
-        assert_eq!(
-            inventory_digest(&[]),
-            "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
-        );
-    }
-
-    #[test]
-    fn inventory_digest_matches_shared_nonempty_snapshot_vector() {
-        let endpoints = vec![EndpointInventory {
-            deployment_instance_id: None,
-            slug: "example".to_string(),
-            label: "Example".to_string(),
-            kind: "openai-compatible".to_string(),
-            status: EndpointStatus::Online,
-            default_capabilities: OpenAiCompatibleCapabilities::default(),
-            probe_suggestions: None,
-            models: vec![DiscoveredModelInventory {
-                slug: None,
-                upstream_model_id: "model-a".to_string(),
-                capabilities: None,
-                capability_override_mode: CapabilityOverrideMode::Inherit,
-                probe_suggestions: None,
-                concurrency_limit: None,
-                engine_facts: None,
-            }],
-            engine_facts: None,
-        }];
-        assert_eq!(
-            inventory_digest(&endpoints),
-            "52e5e23c121ae39dcc319aa506661ec50474c3c8c645cbe09a8121a47d37bc23"
-        );
-    }
-}
-
-pub fn encode_binary_frame(metadata: &RelayBinaryFrameMetadata, body: &[u8]) -> Result<Vec<u8>> {
-    if body.len() > RELAY_BINARY_CHUNK_MAX_BYTES {
-        anyhow::bail!("binary body chunk exceeds 1 MiB");
-    }
+/// `[u32 big-endian metadata length][metadata JSON][body]`.
+pub fn encode_binary_frame<M: Serialize>(metadata: &M, body: &[u8]) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        body.len() <= RELAY_BINARY_CHUNK_MAX_BYTES,
+        "binary body chunk exceeds 1 MiB"
+    );
     let metadata = serde_json::to_vec(metadata).context("serializing relay binary metadata")?;
-    if metadata.len() > RELAY_JSON_CONTROL_MAX_BYTES {
-        anyhow::bail!("binary frame metadata exceeds 64 KiB");
-    }
+    anyhow::ensure!(
+        metadata.len() <= RELAY_JSON_CONTROL_MAX_BYTES,
+        "binary frame metadata exceeds 64 KiB"
+    );
     let metadata_len = u32::try_from(metadata.len()).context("binary metadata is too large")?;
     let mut frame = Vec::with_capacity(4 + metadata.len() + body.len());
     frame.extend_from_slice(&metadata_len.to_be_bytes());
@@ -2282,40 +125,45 @@ pub fn encode_binary_frame(metadata: &RelayBinaryFrameMetadata, body: &[u8]) -> 
     Ok(frame)
 }
 
-pub fn parse_binary_frame(frame: &[u8]) -> Result<(RelayBinaryFrameMetadata, Vec<u8>)> {
-    if frame.len() < 4 {
-        anyhow::bail!("binary frame is missing metadata length");
-    }
-    let length_bytes: [u8; 4] = frame[0..4]
-        .try_into()
-        .context("reading binary metadata length")?;
-    let metadata_len = u32::from_be_bytes(length_bytes) as usize;
-    if metadata_len > RELAY_JSON_CONTROL_MAX_BYTES {
-        anyhow::bail!("binary frame metadata exceeds 64 KiB");
-    }
+/// Splits a binary frame and parses its metadata as `M` (strict serde).
+pub fn decode_binary_frame<M: DeserializeOwned>(frame: &[u8]) -> Result<(M, Vec<u8>)> {
+    anyhow::ensure!(frame.len() >= 4, "binary frame is missing metadata length");
+    let metadata_len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+    anyhow::ensure!(
+        metadata_len <= RELAY_JSON_CONTROL_MAX_BYTES,
+        "binary frame metadata exceeds 64 KiB"
+    );
     let body_offset = 4 + metadata_len;
-    if body_offset > frame.len() {
-        anyhow::bail!("binary frame metadata length is invalid");
-    }
-    let body_len = frame.len() - body_offset;
-    if body_len > RELAY_BINARY_CHUNK_MAX_BYTES {
-        anyhow::bail!("binary body chunk exceeds 1 MiB");
-    }
+    anyhow::ensure!(
+        body_offset <= frame.len(),
+        "binary frame metadata length is invalid"
+    );
+    anyhow::ensure!(
+        frame.len() - body_offset <= RELAY_BINARY_CHUNK_MAX_BYTES,
+        "binary body chunk exceeds 1 MiB"
+    );
     let metadata =
         serde_json::from_slice(&frame[4..body_offset]).context("parsing relay binary metadata")?;
-    if let RelayBinaryFrameMetadata::SttAudio { session_id, seq } = &metadata {
-        // The server's metadata schema is strict; this enum is not.
-        let object: Map<String, Value> = serde_json::from_slice(&frame[4..body_offset])
-            .context("parsing relay binary metadata")?;
-        anyhow::ensure!(
-            object
-                .keys()
-                .all(|key| matches!(key.as_str(), "type" | "sessionId" | "seq")),
-            "stt.audio metadata carries an unknown field"
-        );
-        crate::stt_wire::validate_audio_frame(session_id, *seq, body_len)?;
-    }
     Ok((metadata, frame[body_offset..].to_vec()))
+}
+
+/// Parses a server binary frame and checks `stt.audio` against its limits.
+pub fn parse_binary_frame(frame: &[u8]) -> Result<(ServerBinaryMetadata, Vec<u8>)> {
+    let (metadata, body) = decode_binary_frame::<ServerBinaryMetadata>(frame)?;
+    if let ServerBinaryMetadata::SttAudio { session_id, seq } = &metadata {
+        crate::stt_wire::validate_audio_frame(session_id, *seq, body.len())?;
+    }
+    Ok((metadata, body))
+}
+
+/// Which session a server binary frame belongs to.
+pub fn server_binary_routing_id(metadata: &ServerBinaryMetadata) -> &str {
+    match metadata {
+        ServerBinaryMetadata::RelayRequestBody { request_id, .. } => request_id,
+        ServerBinaryMetadata::TermSealed { terminal_id, .. } => terminal_id,
+        ServerBinaryMetadata::FileBody { op_id } => op_id,
+        ServerBinaryMetadata::SttAudio { session_id, .. } => session_id,
+    }
 }
 
 /// What a frame the daemon cannot accept as a normal message must do.
@@ -2329,7 +177,7 @@ pub enum FrameFault {
     CloseTerminal {
         terminal_id: String,
     },
-    /// 2.5: a malformed frame that names a viewer removes only that viewer.
+    /// A malformed frame that names a viewer removes only that viewer.
     DropViewer {
         terminal_id: String,
         viewer_id: String,
@@ -2337,35 +185,27 @@ pub enum FrameFault {
     CloseCommand {
         command_id: String,
     },
-    /// A malformed `term.spawn` that names a command: refuse it, spawn nothing.
-    RejectSupervised {
-        command_id: String,
-        reason: &'static str,
-    },
     /// A malformed `exec.start` that names a command: refuse it, run nothing
     /// (a command already running under that id is left alone).
     RejectExec {
         command_id: String,
     },
-    /// A malformed `supervised.*` that names a command: end that command.
-    CancelSupervised {
-        command_id: String,
-    },
-    /// 2.8: a malformed `file.op` that names an op: answer `file.rejected bad_frame`.
+    /// A malformed `file.op` that names an op: answer `file.rejected bad_frame`.
     RejectFile {
         op_id: String,
     },
-    /// 2.4: a malformed `stt.open` that names a session: answer `stt.error`.
+    /// A malformed `stt.open` that names a session: answer `stt.error`.
     RejectStt {
         session_id: String,
     },
-    /// 2.4: any other malformed `stt.*` frame (text or `stt.audio`) that
-    /// names a session: a live session fails, an unknown one is ignored.
+    /// Any other malformed `stt.*` frame (text or `stt.audio`) that names a
+    /// session: a live session fails, an unknown one is ignored.
     FailStt {
         session_id: String,
     },
 }
 
+/// Classifies a server control frame that failed [`parse_server_control`].
 pub fn control_frame_fault(text: &str) -> FrameFault {
     if text.len() > RELAY_JSON_CONTROL_MAX_BYTES {
         // Byte 256 can fall inside a multibyte char; `&str` indexing panics.
@@ -2374,8 +214,7 @@ pub fn control_frame_fault(text: &str) -> FrameFault {
         while end > 0 && !text.is_char_boundary(end) {
             end -= 1;
         }
-        let head = &text[..end];
-        if head.contains("\"relay.request\"") {
+        if text[..end].contains("\"relay.request\"") {
             return FrameFault::Fatal;
         }
         return FrameFault::Ignore;
@@ -2465,11 +304,9 @@ fn replace_lone_surrogate_escapes(text: &str) -> Option<String> {
     Some(repaired)
 }
 
-pub fn binary_frame_fault(frame: &[u8]) -> Result<(RelayBinaryFrameMetadata, Vec<u8>), FrameFault> {
-    match parse_binary_frame(frame) {
-        Ok(parsed) => Ok(parsed),
-        Err(_) => Err(classify_binary_metadata(frame)),
-    }
+/// Parses a server binary frame, or says what its failure must do.
+pub fn binary_frame_fault(frame: &[u8]) -> Result<(ServerBinaryMetadata, Vec<u8>), FrameFault> {
+    parse_binary_frame(frame).map_err(|_| classify_binary_metadata(frame))
 }
 
 fn classify_binary_metadata(frame: &[u8]) -> FrameFault {
@@ -2495,23 +332,42 @@ fn classify_binary_metadata(frame: &[u8]) -> FrameFault {
     if type_name == "relay.request.body" {
         return FrameFault::Fatal;
     }
-    if !known_binary_type(type_name) {
+    if !matches!(type_name, "term.sealed" | "file.body" | "stt.audio") {
         return FrameFault::Ignore;
     }
     interactive_fault(&value, false)
 }
 
-fn known_binary_type(type_name: &str) -> bool {
+/// Every server control frame type of protocol 3.0.
+fn known_server_frame(type_name: &str) -> bool {
     matches!(
         type_name,
-        "relay.request.body"
-            | "relay.response.body"
-            | "term.sealed"
-            | "exec.stdout"
-            | "exec.stderr"
-            | "supervised.output"
-            | "file.body"
-            | "stt.audio"
+        "hello.challenge"
+            | "hello.ok"
+            | "protocol.error"
+            | "heartbeat.pong"
+            | "trust.lower"
+            | "runtime.define"
+            | "runtime.detect"
+            | "runtime.inventory.ok"
+            | "runtime.inventory.error"
+            | "runtime.job"
+            | "relay.request"
+            | "relay.cancel"
+            | "term.open"
+            | "term.attach"
+            | "term.detach"
+            | "term.close"
+            | "term.auth"
+            | "exec.start"
+            | "exec.cancel"
+            | "file.op"
+            | "file.cancel"
+            | "stt.open"
+            | "stt.update"
+            | "stt.commit"
+            | "stt.clear"
+            | "stt.close"
     )
 }
 
@@ -2520,13 +376,8 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
     if type_name == "relay.request" || type_name == "relay.request.body" {
         return FrameFault::Fatal;
     }
-    // 2.7 telemetry control is advisory: a malformed definition list is
-    // dropped and the relay keeps running.
-    if type_name == "metrics.sources.set" || type_name == "engine.adapters.set" {
-        return FrameFault::Ignore;
-    }
-    // 2.8 file frames: a bad `file.op` is refused by name; any other bad
-    // `file.*` frame is dropped (an unknown opId is never fatal).
+    // A bad `file.op` is refused by name; any other bad `file.*` frame is
+    // dropped (an unknown opId is never fatal).
     if type_name == "file.op"
         && let Some(op_id) = string_field(value, "opId").filter(|id| is_op_id_shaped(id))
     {
@@ -2535,7 +386,7 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
     if type_name.starts_with("file.") {
         return FrameFault::Ignore;
     }
-    // 2.4 live speech-to-text: a bad frame concerns one session, never the
+    // Live speech-to-text: a bad frame concerns one session, never the
     // relay. A bad `stt.open` is refused by name so the server can try
     // another node at once; any other bad frame for a live session fails
     // that session (its audio or commands would be lost otherwise).
@@ -2549,22 +400,6 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
             return FrameFault::RejectStt { session_id };
         }
         return FrameFault::FailStt { session_id };
-    }
-    if type_name == "term.spawn"
-        && let Some(command_id) = string_field(value, "commandId")
-    {
-        let file = value.get("kind").and_then(Value::as_str) == Some("file")
-            || value.get("fileOp").is_some();
-        return FrameFault::RejectSupervised {
-            command_id,
-            reason: if file { "bad_frame" } else { "bad_command" },
-        };
-    }
-    if type_name.starts_with("supervised.") {
-        return match string_field(value, "commandId") {
-            Some(command_id) => FrameFault::CancelSupervised { command_id },
-            None => FrameFault::Ignore,
-        };
     }
     if type_name.starts_with("term.") {
         let Some(terminal_id) = string_field(value, "terminalId") else {
@@ -2591,7 +426,9 @@ fn interactive_fault(value: &Value, text_frame: bool) -> FrameFault {
             None => FrameFault::Ignore,
         };
     }
-    if text_frame {
+    // A malformed frame of a known 3.0 type is a broken server; a frame type
+    // this protocol does not have is refused and dropped.
+    if text_frame && known_server_frame(type_name) {
         return FrameFault::Fatal;
     }
     FrameFault::Ignore
@@ -2622,307 +459,106 @@ fn bytes_contain(haystack: &[u8], needle: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn deployment_commit_ack_decoder_is_strict_and_bounded() {
-        let valid =
-            serde_json::json!({ "type": "deployment.instances.ok", "snapshotId": "A".repeat(32) });
-        assert!(
-            matches!(super::parse_server_control(&valid.to_string()).expect("ACK"), super::ServerControlMessage::DeploymentInstancesOk { snapshot_id } if snapshot_id == "A".repeat(32))
-        );
-        for invalid in [
-            serde_json::json!({ "type": "deployment.instances.ok", "snapshotId": "old" }),
-            serde_json::json!({ "type": "deployment.instances.ok", "snapshotId": "A".repeat(32), "extra": true }),
-            serde_json::json!({ "type": "deployment.instances.ok" }),
-        ] {
-            assert!(super::parse_server_control(&invalid.to_string()).is_err());
-        }
-    }
     use super::*;
 
-    #[test]
-    fn llama_and_vllm_advertise_top_k_and_copy_concurrency() {
-        let mut endpoint = EndpointConfig {
-            slug: "local".to_string(),
-            label: "Local".to_string(),
-            engine: crate::config::EndpointEngine::LlamaCpp,
-            concurrency_limit: Some(4),
-            models: vec![crate::config::ModelConfig {
-                upstream_model_id: "llama-local".to_string(),
-                capabilities: Some(OpenAiCompatibleCapabilities::openai_defaults()),
-                ..crate::config::ModelConfig::default()
-            }],
-            ..EndpointConfig::default()
-        };
-        let inventory = endpoint_inventory(&endpoint, EndpointStatus::Unknown);
-        let sampling = inventory
-            .default_capabilities
-            .sampling
-            .as_ref()
-            .expect("default sampling");
-        assert!(
-            sampling
-                .parameters
-                .iter()
-                .any(|parameter| parameter == "top_k")
-        );
-        let model = &inventory.models[0];
-        assert_eq!(model.concurrency_limit, Some(4));
-        assert!(
-            model
-                .capabilities
-                .as_ref()
-                .and_then(|capabilities| capabilities.sampling.as_ref())
-                .is_some_and(|sampling| sampling
-                    .parameters
-                    .iter()
-                    .any(|parameter| parameter == "top_k"))
-        );
-        let encoded = serde_json::to_value(&inventory).expect("encode");
-        assert!(encoded["models"][0]["concurrencyLimit"].as_u64() == Some(4));
-        assert!(!inventory_digest(std::slice::from_ref(&inventory)).is_empty());
+    /// Field names of an object, for strict metadata checks.
+    fn keys(value: &Value) -> Vec<String> {
+        value
+            .as_object()
+            .map(|object| object.keys().cloned().collect())
+            .unwrap_or_default()
+    }
 
-        endpoint.engine = crate::config::EndpointEngine::Generic;
-        endpoint.concurrency_limit = None;
-        let plain = endpoint_inventory(&endpoint, EndpointStatus::Unknown);
-        assert!(plain.default_capabilities.sampling.is_none());
-        assert!(plain.models[0].concurrency_limit.is_none());
-
-        endpoint.engine = crate::config::EndpointEngine::Vllm;
-        let vllm = endpoint_inventory(&endpoint, EndpointStatus::Unknown);
-        assert!(
-            vllm.default_capabilities
-                .sampling
-                .as_ref()
-                .is_some_and(|sampling| sampling
-                    .parameters
-                    .iter()
-                    .any(|parameter| parameter == "top_k"))
-        );
+    fn binary(metadata: &[u8]) -> Vec<u8> {
+        let mut frame = (metadata.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(metadata);
+        frame
     }
 
     #[test]
     fn rejects_oversized_binary_chunks() {
-        let metadata = RelayBinaryFrameMetadata::ResponseBody {
+        let metadata = NodeBinaryMetadata::RelayResponseBody {
             request_id: "request".to_string(),
             chunk_id: "0".to_string(),
-            final_chunk: None,
+            is_final: None,
         };
         let body = vec![0_u8; RELAY_BINARY_CHUNK_MAX_BYTES + 1];
         assert!(encode_binary_frame(&metadata, &body).is_err());
     }
 
     #[test]
-    fn round_trips_binary_frame() {
-        let metadata = RelayBinaryFrameMetadata::RequestBody {
+    fn round_trips_binary_frames() {
+        let metadata = ServerBinaryMetadata::RelayRequestBody {
             request_id: "request".to_string(),
             chunk_id: "0".to_string(),
-            final_chunk: Some(true),
+            is_final: Some(true),
         };
         let encoded = encode_binary_frame(&metadata, b"abc").expect("encode");
         let (decoded, body) = parse_binary_frame(&encoded).expect("parse");
         assert_eq!(decoded, metadata);
         assert_eq!(body, b"abc");
+        assert_eq!(server_binary_routing_id(&decoded), "request");
+
+        let node = NodeBinaryMetadata::FileData {
+            op_id: "op".to_string(),
+        };
+        let encoded = encode_binary_frame(&node, b"out").expect("encode");
+        let (decoded, body) = decode_binary_frame::<NodeBinaryMetadata>(&encoded).expect("parse");
+        assert_eq!(decoded, node);
+        assert_eq!(body, b"out");
+        let (value, _) = decode_binary_frame::<Value>(&encoded).expect("value");
+        assert_eq!(keys(&value), ["opId", "type"]);
     }
 
     #[test]
-    fn hello_omits_an_unavailable_hostname() {
-        let inventory = CliInventory {
-            slug: "desktop".to_string(),
-            hostname: None,
-            identity_public_key: TEST_IDENTITY_PUBLIC_KEY.to_string(),
-            identity_signature: TEST_IDENTITY_SIGNATURE.to_string(),
-            version: None,
-            capabilities: CliCapabilities::from_snapshot(&TerminalFeatureSnapshot {
-                allow_human_terminal: false,
-                mcp_command_mode: McpCommandMode::Off,
-                require_terminal_approval: false,
-                allow_file_tools_as_root: false,
-                mcp_file_read: false,
-                file_roots_configured: false,
-                allow_remote_metric_sources: false,
-                allow_remote_engine_adapters: false,
-                terminal_public_key_b64url: "AQID".to_string(),
-                terminal_identity: None,
-            }),
+    fn node_frames_are_checked_before_they_leave() {
+        let bad = NodeFrame::RuntimeJobResult {
+            step_id: "s".to_string(),
+            instance_id: "i".to_string(),
+            rank: 0,
+            intent_hash: "h".to_string(),
+            owner_epoch: "e".to_string(),
+            status: frames::JobStatus::Failed,
+            stopped: false,
+            error: None,
+            detail: None,
+            terminal_id: None,
+            exit_code: None,
         };
-        let encoded = serde_json::to_string(&inventory).expect("encode");
-        assert!(!encoded.contains("hostname"));
-        assert!(encoded.contains(&format!(
-            r#""identityPublicKey":"{TEST_IDENTITY_PUBLIC_KEY}""#
-        )));
-        assert!(!encoded.contains("machineId"));
-        assert!(!encoded.contains("label"));
-    }
-
-    #[test]
-    fn control_frames_use_server_field_casing() {
-        let message = ClientControlMessage::Hello {
-            id: "hello-1".to_string(),
-            protocol_version: RELAY_PROTOCOL_VERSION.to_string(),
-            cli: CliInventory {
-                slug: "desktop".to_string(),
-                hostname: Some("desk-01.local".to_string()),
-                identity_public_key: TEST_IDENTITY_PUBLIC_KEY.to_string(),
-                identity_signature: TEST_IDENTITY_SIGNATURE.to_string(),
-                version: None,
-                capabilities: CliCapabilities::from_snapshot(&TerminalFeatureSnapshot {
-                    allow_human_terminal: false,
-                    mcp_command_mode: McpCommandMode::Supervised,
-                    require_terminal_approval: false,
-                    allow_file_tools_as_root: false,
-                    mcp_file_read: false,
-                    file_roots_configured: false,
-                    allow_remote_metric_sources: false,
-                    allow_remote_engine_adapters: false,
-                    terminal_public_key_b64url: "AQID".to_string(),
-                    terminal_identity: Some(TerminalIdentityProof {
-                        public_key: "BAQE".to_string(),
-                        signature: "Sig".to_string(),
-                    }),
-                }),
-            },
-            endpoints: vec![EndpointInventory {
-                deployment_instance_id: None,
-                slug: "local".to_string(),
-                label: "Local".to_string(),
-                kind: "openai-compatible".to_string(),
-                status: EndpointStatus::Online,
-                default_capabilities: OpenAiCompatibleCapabilities::openai_defaults(),
-                probe_suggestions: None,
-                models: Vec::new(),
-                engine_facts: None,
-            }],
-        };
-
-        let encoded = encode_control(&message).expect("encode");
-
-        assert!(encoded.contains(&format!(r#""protocolVersion":"{RELAY_PROTOCOL_VERSION}""#)));
-        assert!(!encoded.contains(r#""nodeTelemetry""#));
-        assert!(!encoded.contains(r#""fileOps""#));
-        assert!(!encoded.contains(r#""countContext""#));
-        assert!(encoded.contains(r#""mcpFileRead":false"#));
-        assert!(encoded.contains(r#""fileRootsConfigured":false"#));
-        assert!(encoded.contains(r#""allowFileToolsAsRoot":false"#));
-        assert!(encoded.contains(r#""remoteMetricSources":false"#));
-        assert!(!encoded.contains(r#""supervisedCommands""#));
-        assert!(encoded.contains(r#""hostname":"desk-01.local""#));
-        assert!(encoded.contains(&format!(
-            r#""identityPublicKey":"{TEST_IDENTITY_PUBLIC_KEY}""#
-        )));
-        assert!(encoded.contains(&format!(
-            r#""identitySignature":"{TEST_IDENTITY_SIGNATURE}""#
-        )));
-        assert!(!encoded.contains("machineId"));
-        assert!(!encoded.contains(r#""label":"Desktop""#));
-        assert!(!encoded.contains(r#""terminalViewers""#));
-        assert!(encoded.contains(r#""terminalIdentity":{"publicKey":"BAQE","signature":"Sig"}"#));
-        assert!(!encoded.contains(r#""sharedTokenizerTps""#));
-        assert!(!encoded.contains(r#""standardizedMetrics""#));
-        assert!(!encoded.contains(r#""terminal":true"#));
-        assert!(!encoded.contains(r#""exec":true"#));
-        assert!(encoded.contains(r#""terminalPublicKey":"AQID""#));
-        assert!(encoded.contains(r#""mcpCommandMode":"supervised""#));
-        assert!(!encoded.contains(r#""mcpCommands""#));
-        assert!(encoded.contains(r#""humanTerminal":false"#));
-        assert!(!encoded.contains(r#""maxBinaryChunkBytes""#));
-        assert!(!encoded.contains(r#""requestBodyStreaming""#));
-        assert!(!encoded.contains(r#""requestBodyWindowChunks""#));
-        assert!(!encoded.contains("protocol_version"));
-        assert!(!encoded.contains(":null"));
-        // Omitted while false (`hello_capabilities` sets it from the
-        // live deployments switch).
-        assert!(!encoded.contains("deploymentOperator"));
-        let ClientControlMessage::Hello { cli, .. } = &message else {
-            unreachable!("hello")
-        };
-        let mut features = cli.capabilities.features.clone();
-        features.deployments = true;
-        features.deployment_operator = true;
-        let features = serde_json::to_value(&features).expect("features");
-        assert_eq!(features["deployments"], true);
-        assert_eq!(features["deploymentOperator"], true);
-
-        let ack = encode_control(&ClientControlMessage::RelayRequestBodyAck {
-            request_id: "request-1".to_string(),
-            credits: 3,
-        })
-        .expect("encode ack");
-        assert!(ack.contains(r#""type":"relay.request.body.ack""#));
-        assert!(ack.contains(r#""requestId":"request-1""#));
-        assert!(ack.contains(r#""credits":3"#));
-
-        let heartbeat = encode_control(&ClientControlMessage::Heartbeat {
-            id: "heartbeat-1".to_string(),
+        assert!(encode_control(&bad).is_err());
+        let heartbeat = NodeFrame::Heartbeat {
+            id: "hb-1".to_string(),
             sent_at: None,
-        })
-        .expect("encode heartbeat");
-        assert!(!heartbeat.contains("sentAt"));
-        assert!(!heartbeat.contains(":null"));
+        };
+        assert_eq!(
+            encode_control(&heartbeat).expect("encodes"),
+            r#"{"type":"heartbeat","id":"hb-1"}"#
+        );
+    }
 
-        let relay_error = encode_control(&ClientControlMessage::RelayError {
-            request_id: "request-1".to_string(),
-            failure: RelayFailure::Transport,
-            message: None,
-            upstream_status_code: None,
-        })
-        .expect("encode relay error");
-        assert!(!relay_error.contains("message"));
-        assert!(!relay_error.contains("upstreamStatusCode"));
-        assert!(!relay_error.contains(":null"));
-
-        let parsed = parse_server_control(
-            r#"{"type":"relay.request","requestId":"request-1","family":"generic","method":"POST","path":"/v1/chat/completions","headers":{},"timeoutMs":30000,"endpointSlug":"local","expectBody":true}"#,
-        )
-        .expect("parse server control");
-        match parsed {
-            ServerControlMessage::RelayRequest {
-                request_id,
-                timeout_ms,
-                expect_body,
-                ..
-            } => {
-                assert_eq!(request_id, "request-1");
-                assert_eq!(timeout_ms, 30_000);
-                assert!(expect_body);
-            }
-            other => panic!("unexpected message: {other:?}"),
-        }
-
-        let count_first = parse_server_control(
-            r#"{"type":"relay.request","requestId":"request-2","family":"chat.completions","method":"POST","path":"/v1/chat/completions","headers":{},"timeoutMs":30000,"endpointSlug":"local","expectBody":true,"countFirst":true,"countCeiling":8192}"#,
-        )
-        .expect("parse count-first relay.request");
-        match count_first {
-            ServerControlMessage::RelayRequest {
-                count_first,
-                count_ceiling,
-                ..
-            } => {
-                assert!(count_first);
-                assert_eq!(count_ceiling, Some(8192));
-            }
-            other => panic!("unexpected message: {other:?}"),
-        }
-
-        let count_result = encode_control(&ClientControlMessage::CountContextResult {
-            request_id: "r1".to_string(),
-            tokens: 12,
-            method: crate::count_context::CountContextMethod::VllmTokenize,
-        })
-        .expect("encode context.count.result");
-        assert!(count_result.contains(r#""type":"context.count.result""#));
-        assert!(count_result.contains(r#""requestId":"r1""#));
-        assert!(count_result.contains(r#""tokens":12"#));
-        assert!(count_result.contains(r#""method":"vllm_tokenize""#));
-
-        let unknown =
-            parse_server_control(r#"{"type":"future.frame","extra":1}"#).expect("unknown");
+    #[test]
+    fn server_frames_are_parsed_strictly() {
         assert!(matches!(
-            unknown,
-            ServerControlMessage::Unknown { type_name } if type_name == "future.frame"
+            parse_server_control(r#"{"type":"heartbeat.pong","id":"1","receivedAt":"now"}"#),
+            Ok(ServerFrame::HeartbeatPong { .. })
         ));
-        assert!(parse_server_control(r#"{"type":"hello.ok"}"#).is_err());
-        assert!(parse_server_control(r#"{"type":"term.open","terminalId":"t"}"#).is_err());
+        // Unknown fields and 2.x frames are refused.
+        assert!(
+            parse_server_control(r#"{"type":"heartbeat.pong","id":"1","receivedAt":"now","x":1}"#)
+                .is_err()
+        );
+        assert!(parse_server_control(r#"{"type":"inventory.ok","id":"1"}"#).is_err());
+        // A hello.challenge without an origin (a 2.x server) is refused.
+        assert!(parse_server_control(r#"{"type":"hello.challenge","nonce":"n"}"#).is_err());
+        // An stt config must be an object of strings.
+        let open = |config: &str| {
+            format!(
+                r#"{{"type":"stt.update","sessionId":"AAECAwQFBgcICQoLDA0ODw","config":{config}}}"#
+            )
+        };
+        assert!(parse_server_control(&open("{}")).is_ok());
+        assert!(parse_server_control(&open("[]")).is_err());
+        assert!(parse_server_control(&open(r#"{"language":5}"#)).is_err());
     }
 
     #[test]
@@ -2948,10 +584,6 @@ mod tests {
             }
         );
         assert_eq!(
-            control_frame_fault(r#"{"type":"exec.cancel","commandId":7}"#),
-            FrameFault::Ignore
-        );
-        assert_eq!(
             control_frame_fault(r#"{"type":"exec.cancel","commandId":"cmd-1","x":{}}"#),
             FrameFault::CloseCommand {
                 command_id: "cmd-1".to_string(),
@@ -2965,57 +597,49 @@ mod tests {
             control_frame_fault(r#"{"type":"hello.ok"}"#),
             FrameFault::Fatal
         );
+        // A removed 2.x frame type is dropped, never acted on.
+        assert_eq!(
+            control_frame_fault(r#"{"type":"term.spawn","commandId":"c"}"#),
+            FrameFault::Ignore
+        );
+        assert_eq!(
+            control_frame_fault(r#"{"type":"metrics.sources.set","id":"1"}"#),
+            FrameFault::Ignore
+        );
 
-        let unknown_meta = br#"{"type":"no.such"}"#;
-        let mut unknown = (unknown_meta.len() as u32).to_be_bytes().to_vec();
-        unknown.extend_from_slice(unknown_meta);
         assert!(matches!(
-            binary_frame_fault(&unknown),
+            binary_frame_fault(&binary(br#"{"type":"no.such"}"#)),
             Err(FrameFault::Ignore)
         ));
-        let mut sealed = br#"{"type":"term.sealed","terminalId":"term-9"}"#.to_vec();
         // Missing seq makes the known metadata fail schema validation.
-        let mut bad_sealed = (sealed.len() as u32).to_be_bytes().to_vec();
-        bad_sealed.append(&mut sealed);
         assert_eq!(
-            binary_frame_fault(&bad_sealed).expect_err("malformed sealed"),
+            binary_frame_fault(&binary(br#"{"type":"term.sealed","terminalId":"term-9"}"#))
+                .expect_err("malformed sealed"),
             FrameFault::CloseTerminal {
                 terminal_id: "term-9".to_string(),
             }
         );
-        let mut request = br#"{"type":"relay.request.body"}"#.to_vec();
-        let mut bad_request = (request.len() as u32).to_be_bytes().to_vec();
-        bad_request.append(&mut request);
         assert_eq!(
-            binary_frame_fault(&bad_request).expect_err("malformed body"),
+            binary_frame_fault(&binary(br#"{"type":"relay.request.body"}"#))
+                .expect_err("malformed body"),
             FrameFault::Fatal
         );
     }
 
     #[test]
     fn a_lone_surrogate_fails_only_the_request_that_carries_it() {
-        // serde_json cannot hold an unpaired surrogate, so the normal parse fails.
-        let spawn = r#"{"type":"term.spawn","terminalId":"t","commandId":"c","command":"echo \ud800","requester":"a","shareOutput":false}"#;
-        assert!(parse_server_control(spawn).is_err());
+        let exec = r#"{"type":"exec.start","commandId":"e","command":"ls","cwd":"\udc00"}"#;
+        assert!(parse_server_control(exec).is_err());
         assert_eq!(
-            control_frame_fault(spawn),
-            FrameFault::RejectSupervised {
-                command_id: "c".to_string(),
-                reason: "bad_command",
-            }
-        );
-        assert_eq!(
-            control_frame_fault(
-                r#"{"type":"exec.start","commandId":"e","command":"ls","cwd":"\udc00"}"#
-            ),
+            control_frame_fault(exec),
             FrameFault::RejectExec {
                 command_id: "e".to_string()
             }
         );
         // The id itself may be the bad string: it is still named, as U+FFFD.
         assert_eq!(
-            control_frame_fault(r#"{"type":"supervised.cancel","commandId":"\udbff"}"#),
-            FrameFault::CancelSupervised {
+            control_frame_fault(r#"{"type":"exec.cancel","commandId":"\udbff"}"#),
+            FrameFault::CloseCommand {
                 command_id: "\u{fffd}".to_string()
             }
         );
@@ -3034,12 +658,11 @@ mod tests {
             FrameFault::Fatal
         );
         assert_eq!(control_frame_fault("not json \\ud800"), FrameFault::Fatal);
-        // Binary metadata gets the same treatment.
-        let meta = br#"{"type":"term.sealed","terminalId":"t9","x":"\udfff"}"#;
-        let mut frame = (meta.len() as u32).to_be_bytes().to_vec();
-        frame.extend_from_slice(meta);
         assert_eq!(
-            binary_frame_fault(&frame).expect_err("malformed sealed"),
+            binary_frame_fault(&binary(
+                br#"{"type":"term.sealed","terminalId":"t9","x":"\udfff"}"#
+            ))
+            .expect_err("malformed sealed"),
             FrameFault::CloseTerminal {
                 terminal_id: "t9".to_string()
             }
@@ -3052,407 +675,45 @@ mod tests {
             replace_lone_surrogate_escapes(r#"{"a":"plain \u0041"}"#),
             None
         );
-        // A valid escaped pair is left alone.
         assert_eq!(
             replace_lone_surrogate_escapes(r#"{"a":"\ud83d\ude00"}"#),
             None
         );
-        // An escaped backslash followed by text that looks like an escape.
         assert_eq!(replace_lone_surrogate_escapes(r#"{"a":"\\ud800"}"#), None);
         assert_eq!(
             replace_lone_surrogate_escapes(r#"{"a":"x\ud800y","b":"\udc00","c":"\ud800\u0041"}"#)
                 .as_deref(),
             Some(r#"{"a":"x\ufffdy","b":"\ufffd","c":"\ufffd\u0041"}"#)
         );
-        // Outside strings nothing is touched (and the JSON stays invalid).
         assert_eq!(replace_lone_surrogate_escapes(r#"{\ud800}"#), None);
     }
 
     #[test]
     fn oversized_multibyte_control_frame_is_ignored_without_panic() {
-        // `你` is E4 BD A0. 256 % 3 == 1, so byte 256 is inside a character.
-        // The frame must also exceed the 64 KiB control limit.
         let text = "你".repeat((RELAY_JSON_CONTROL_MAX_BYTES / 3) + 2);
         assert!(text.len() > RELAY_JSON_CONTROL_MAX_BYTES);
         assert!(!text.is_char_boundary(256));
         assert_eq!(control_frame_fault(&text), FrameFault::Ignore);
 
-        let ignored = " ".repeat(RELAY_JSON_CONTROL_MAX_BYTES + 1);
-        assert_eq!(control_frame_fault(&ignored), FrameFault::Ignore);
-
-        // 24-byte ASCII needle, then `你`. 256 % 3 == 1, so the cut is mid-character
-        // and the walk-back must still see `"relay.request"`.
         let mut fatal = r#"{"type":"relay.request"}"#.to_string();
         fatal.push_str(&"你".repeat((RELAY_JSON_CONTROL_MAX_BYTES / 3) + 2));
-        assert!(fatal.len() > RELAY_JSON_CONTROL_MAX_BYTES);
         assert!(!fatal.is_char_boundary(256));
         assert_eq!(control_frame_fault(&fatal), FrameFault::Fatal);
     }
+
     #[test]
-    fn an_older_server_rejection_says_to_upgrade_the_server() {
-        let message = hello_rejection_message(OLDER_SERVER_HELLO_REJECTION, None);
+    fn rejection_messages_name_who_must_upgrade() {
+        let message = hello_rejection_message("Malformed relay protocol message.", None);
         assert!(
             message.contains(&format!("rejected relay protocol {RELAY_PROTOCOL_VERSION}")),
             "{message}"
         );
-        assert!(
-            message.contains("upgrade the WS Model Proxy server"),
-            "{message}"
-        );
-        assert!(
-            hello_rejection_message("access_denied", None)
-                .contains("upgrade the WS Model Proxy server")
-        );
-        assert!(hello_rejection_message(
-            "This wsmp speaks a newer relay protocol than the server. Upgrade WS Model Proxy and restart the CLI.",
-            Some(&ProtocolErrorCode::UpgradeServer),
-        )
-        .contains("upgrade the WS Model Proxy server"));
-    }
-
-    #[test]
-    fn a_future_server_upgrade_required_reply_stays_a_cli_too_old_error() {
-        // A coded `upgrade_cli` from a newer server still names the CLI.
-        let reply =
-            "This server requires a newer wsmp (relay protocol 3.0). Upgrade wsmp and restart it.";
+        assert!(message.contains("upgrade the WS Model Proxy server"));
+        let reply = "This server requires a newer wsmp. Upgrade wsmp and restart it.";
         assert_eq!(
             hello_rejection_message(reply, Some(&ProtocolErrorCode::UpgradeCli)),
             format!("relay protocol error: {reply}")
         );
-        assert_eq!(
-            hello_rejection_message(
-                "identity mismatch",
-                Some(&ProtocolErrorCode::IdentityMismatch)
-            ),
-            "relay protocol error: identity mismatch"
-        );
-    }
-
-    #[test]
-    fn hello_challenge_keeps_origin_optional_so_an_old_server_still_parses() {
-        let with_origin = parse_server_control(
-            r#"{"type":"hello.challenge","nonce":"AAECAwQFBgcICQoLDA0ODw","origin":"https://proxy.example.com"}"#,
-        )
-        .expect("challenge");
-        match with_origin {
-            ServerControlMessage::HelloChallenge { origin, .. } => {
-                assert_eq!(origin.as_deref(), Some("https://proxy.example.com"));
-            }
-            other => panic!("expected challenge, got {other:?}"),
-        }
-        let without_origin =
-            parse_server_control(r#"{"type":"hello.challenge","nonce":"AAECAwQFBgcICQoLDA0ODw"}"#)
-                .expect("old challenge");
-        match without_origin {
-            ServerControlMessage::HelloChallenge { origin, .. } => {
-                assert_eq!(origin, None);
-            }
-            other => panic!("expected challenge, got {other:?}"),
-        }
-        let internal = parse_server_control(
-            r#"{"type":"protocol.error","failure":"protocol_error","code":"internal","message":"internal","supportedVersions":["2.4"]}"#,
-        )
-        .expect("internal");
-        match internal {
-            ServerControlMessage::ProtocolError { code, .. } => {
-                assert_eq!(code, Some(ProtocolErrorCode::Internal));
-            }
-            other => panic!("expected protocol.error, got {other:?}"),
-        }
-        let mismatch = parse_server_control(
-            r#"{"type":"protocol.error","failure":"protocol_error","code":"identity_mismatch","message":"bound to another key","supportedVersions":["2.4"]}"#,
-        )
-        .expect("mismatch");
-        match mismatch {
-            ServerControlMessage::ProtocolError { code, .. } => {
-                assert_eq!(code, Some(ProtocolErrorCode::IdentityMismatch));
-            }
-            other => panic!("expected protocol.error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn supervised_messages_use_server_field_casing() {
-        let spawn = parse_server_control(
-            r#"{"type":"term.spawn","terminalId":"t","commandId":"c","command":"ls -l","cwd":"~/x","reason":"why","requester":"agent","shareOutput":true}"#,
-        )
-        .expect("spawn");
-        match spawn {
-            ServerControlMessage::TermSpawn(spawn) => {
-                assert_eq!(spawn.command, "ls -l");
-                assert_eq!(spawn.cwd.as_deref(), Some("~/x"));
-                assert_eq!(spawn.reason.as_deref(), Some("why"));
-                assert_eq!(spawn.requester, "agent");
-                assert!(spawn.share_output);
-            }
-            other => panic!("unexpected message: {other:?}"),
-        }
-        let minimal = parse_server_control(
-            r#"{"type":"term.spawn","terminalId":"t","commandId":"c","command":"ls","requester":"a","shareOutput":false}"#,
-        )
-        .expect("minimal spawn");
-        assert!(
-            matches!(minimal, ServerControlMessage::TermSpawn(ref s) if s.cwd.is_none() && s.reason.is_none())
-        );
-        let cancel = parse_server_control(r#"{"type":"supervised.cancel","commandId":"c"}"#)
-            .expect("cancel");
-        assert!(
-            matches!(cancel, ServerControlMessage::SupervisedCancel { command_id, if_waiting: false } if command_id == "c")
-        );
-        let expire = parse_server_control(
-            r#"{"type":"supervised.cancel","commandId":"c","reason":"expire"}"#,
-        )
-        .expect("expire");
-        assert!(matches!(
-            expire,
-            ServerControlMessage::SupervisedCancel {
-                if_waiting: true,
-                ..
-            }
-        ));
-        let decline = parse_server_control(
-            r#"{"type":"supervised.cancel","commandId":"c","reason":"decline"}"#,
-        )
-        .expect("decline");
-        assert!(matches!(
-            decline,
-            ServerControlMessage::SupervisedCancel {
-                if_waiting: true,
-                ..
-            }
-        ));
-        // Any other reason ends the terminal.
-        let other = parse_server_control(
-            r#"{"type":"supervised.cancel","commandId":"c","reason":"later"}"#,
-        )
-        .expect("other");
-        assert!(matches!(
-            other,
-            ServerControlMessage::SupervisedCancel {
-                if_waiting: false,
-                ..
-            }
-        ));
-        assert_eq!(
-            encode_control(&ClientControlMessage::TermSpawned {
-                terminal_id: "t".to_string(),
-                command_id: "c".to_string(),
-            })
-            .expect("spawned"),
-            r#"{"type":"term.spawned","terminalId":"t","commandId":"c"}"#
-        );
-        assert_eq!(
-            encode_control(&ClientControlMessage::SupervisedDone {
-                command_id: "c".to_string(),
-                exit_code: Some(0),
-                signal: None,
-                review: false,
-                output_bytes: Some(12),
-                file: SupervisedFileOutcome::default(),
-            })
-            .expect("done"),
-            r#"{"type":"supervised.done","commandId":"c","exitCode":0,"review":false,"outputBytes":12}"#
-        );
-        assert_eq!(
-            encode_control(&ClientControlMessage::SupervisedDone {
-                command_id: "c".to_string(),
-                exit_code: None,
-                signal: Some("9".to_string()),
-                review: true,
-                output_bytes: None,
-                file: SupervisedFileOutcome::default(),
-            })
-            .expect("done review"),
-            r#"{"type":"supervised.done","commandId":"c","signal":"9","review":true}"#
-        );
-        assert_eq!(
-            encode_control(&ClientControlMessage::SupervisedRejected {
-                command_id: "c".to_string(),
-                reason: "disabled".to_string(),
-            })
-            .expect("rejected"),
-            r#"{"type":"supervised.rejected","commandId":"c","reason":"disabled"}"#
-        );
-        let output = RelayBinaryFrameMetadata::SupervisedOutput {
-            command_id: "c".to_string(),
-            part: SupervisedOutputPart::Tail,
-            seq: 2,
-        };
-        let encoded = encode_binary_frame(&output, b"x").expect("output");
-        let text = String::from_utf8_lossy(&encoded[4..encoded.len() - 1]).to_string();
-        assert_eq!(
-            text,
-            r#"{"type":"supervised.output","commandId":"c","part":"tail","seq":2}"#
-        );
-        assert_eq!(
-            control_frame_fault(r#"{"type":"term.spawn","terminalId":"t","commandId":"c"}"#),
-            FrameFault::RejectSupervised {
-                command_id: "c".to_string(),
-                reason: "bad_command",
-            }
-        );
-        assert_eq!(
-            control_frame_fault(r#"{"type":"supervised.cancel","commandId":7}"#),
-            FrameFault::Ignore
-        );
-        assert_eq!(
-            control_frame_fault(r#"{"type":"supervised.cancel","commandId":"c","x":{}}"#),
-            FrameFault::CancelSupervised {
-                command_id: "c".to_string()
-            }
-        );
-    }
-
-    #[test]
-    fn term_messages_carry_viewer_ids_in_camel_case() {
-        let pending = encode_control(&ClientControlMessage::TermPending {
-            terminal_id: "t".to_string(),
-            viewer_id: Some("v".to_string()),
-            cli_nonce: "n".to_string(),
-            approval_code: None,
-        })
-        .expect("pending");
-        assert!(pending.contains(r#""viewerId":"v""#));
-        for (message, viewer) in [
-            (
-                ClientControlMessage::TermOpened {
-                    terminal_id: "t".to_string(),
-                    viewer_id: Some("v".to_string()),
-                    cli_nonce: "n".to_string(),
-                },
-                true,
-            ),
-            (
-                ClientControlMessage::TermAttached {
-                    terminal_id: "t".to_string(),
-                    viewer_id: None,
-                    cli_nonce: "n".to_string(),
-                },
-                false,
-            ),
-            (
-                ClientControlMessage::TermRejected {
-                    terminal_id: "t".to_string(),
-                    viewer_id: Some("v".to_string()),
-                    reason: "viewer_limit".to_string(),
-                    approval_code: None,
-                },
-                true,
-            ),
-        ] {
-            let text = encode_control(&message).expect("encode");
-            assert_eq!(text.contains(r#""viewerId":"v""#), viewer, "{text}");
-            assert!(!text.contains("viewer_id"));
-            assert!(!text.contains(":null"));
-        }
-        let writer = encode_control(&ClientControlMessage::TermWriter {
-            terminal_id: "t".to_string(),
-            viewer_id: Some("v".to_string()),
-        })
-        .expect("writer");
-        assert_eq!(
-            writer,
-            r#"{"type":"term.writer","terminalId":"t","viewerId":"v"}"#
-        );
-        let none = encode_control(&ClientControlMessage::TermWriter {
-            terminal_id: "t".to_string(),
-            viewer_id: None,
-        })
-        .expect("writer");
-        assert_eq!(none, r#"{"type":"term.writer","terminalId":"t"}"#);
-        let dropped = encode_control(&ClientControlMessage::TermInputDropped {
-            terminal_id: "t".to_string(),
-            viewer_id: Some("v".to_string()),
-        })
-        .expect("input dropped");
-        assert_eq!(
-            dropped,
-            r#"{"type":"term.input_dropped","terminalId":"t","viewerId":"v"}"#
-        );
-
-        let key = "A".repeat(87);
-        let nonce = "B".repeat(22);
-        let open = parse_server_control(&format!(
-            r#"{{"type":"term.open","terminalId":"t","viewerId":"v","cols":80,"rows":24,"browserPublicKey":"{key}","browserNonce":"{nonce}"}}"#
-        ))
-        .expect("open");
-        assert!(
-            matches!(open, ServerControlMessage::TermOpen { viewer_id: Some(v), .. } if v == "v")
-        );
-        let attach = parse_server_control(&format!(
-            r#"{{"type":"term.attach","terminalId":"t","viewerId":"v","browserPublicKey":"{key}","browserNonce":"{nonce}"}}"#
-        ))
-        .expect("attach");
-        assert!(
-            matches!(attach, ServerControlMessage::TermAttach { viewer_id: Some(v), .. } if v == "v")
-        );
-        let legacy_attach = parse_server_control(&format!(
-            r#"{{"type":"term.attach","terminalId":"t","browserPublicKey":"{key}","browserNonce":"{nonce}"}}"#
-        ))
-        .expect("legacy attach");
-        assert!(matches!(
-            legacy_attach,
-            ServerControlMessage::TermAttach {
-                viewer_id: None,
-                ..
-            }
-        ));
-        let detach =
-            parse_server_control(r#"{"type":"term.detach","terminalId":"t","viewerId":"v"}"#)
-                .expect("detach");
-        assert!(
-            matches!(detach, ServerControlMessage::TermDetach { viewer_id: Some(v), .. } if v == "v")
-        );
-        let auth = parse_server_control(
-            r#"{"type":"term.auth","terminalId":"t","viewerId":"v","signature":"sig"}"#,
-        )
-        .expect("auth");
-        assert!(
-            matches!(auth, ServerControlMessage::TermAuth { viewer_id: Some(v), signature, .. } if v == "v" && signature == "sig")
-        );
-    }
-
-    #[test]
-    fn sealed_metadata_sets_viewer_or_epoch() {
-        let unicast = RelayBinaryFrameMetadata::TermSealed {
-            terminal_id: "t".to_string(),
-            seq: 1,
-            viewer_id: Some("v".to_string()),
-            epoch: None,
-        };
-        let encoded = encode_binary_frame(&unicast, b"x").expect("unicast");
-        let text = String::from_utf8_lossy(&encoded[4..encoded.len() - 1]).to_string();
-        assert_eq!(
-            text,
-            r#"{"type":"term.sealed","terminalId":"t","seq":1,"viewerId":"v"}"#
-        );
-        let broadcast = RelayBinaryFrameMetadata::TermSealed {
-            terminal_id: "t".to_string(),
-            seq: 2,
-            viewer_id: None,
-            epoch: Some(3),
-        };
-        let encoded = encode_binary_frame(&broadcast, b"x").expect("broadcast");
-        let text = String::from_utf8_lossy(&encoded[4..encoded.len() - 1]).to_string();
-        assert_eq!(
-            text,
-            r#"{"type":"term.sealed","terminalId":"t","seq":2,"epoch":3}"#
-        );
-        let (parsed, _) = parse_binary_frame(&encoded).expect("parse");
-        assert_eq!(parsed, broadcast);
-        // An incoming 2.4 frame has neither field.
-        let meta = br#"{"type":"term.sealed","terminalId":"t","seq":4}"#;
-        let mut legacy = (meta.len() as u32).to_be_bytes().to_vec();
-        legacy.extend_from_slice(meta);
-        let (parsed, _) = parse_binary_frame(&legacy).expect("legacy");
-        assert!(matches!(
-            parsed,
-            RelayBinaryFrameMetadata::TermSealed {
-                viewer_id: None,
-                epoch: None,
-                ..
-            }
-        ));
     }
 
     #[test]
@@ -3470,1081 +731,39 @@ mod tests {
                 terminal_id: "t".to_string(),
             }
         );
-        let meta = br#"{"type":"term.sealed","terminalId":"t","viewerId":"v"}"#;
-        let mut frame = (meta.len() as u32).to_be_bytes().to_vec();
-        frame.extend_from_slice(meta);
         assert_eq!(
-            binary_frame_fault(&frame).expect_err("malformed"),
+            binary_frame_fault(&binary(
+                br#"{"type":"term.sealed","terminalId":"t","viewerId":"v"}"#
+            ))
+            .expect_err("malformed"),
             FrameFault::DropViewer {
                 terminal_id: "t".to_string(),
                 viewer_id: "v".to_string(),
             }
         );
     }
-}
-
-/// Cross-language vectors shared with `apps/server/src/relay/protocol.test.ts`:
-/// the server's strict 2.4 schemas must accept exactly what this CLI encodes.
-#[cfg(test)]
-mod relay_24_vectors {
-    use super::*;
-    use crate::config::{ModelConfig, ProbeSnapshot, ProbeStatus};
-    use crate::engine::{DetectedEngine, EngineKind, LoadSource};
-
-    fn vector(text: &str) -> Value {
-        serde_json::from_str(text).expect("vector is JSON")
-    }
-
-    fn encoded(message: &ClientControlMessage) -> Value {
-        serde_json::from_str(&encode_control(message).expect("encode")).expect("json")
-    }
-
-    fn probed(engine: DetectedEngine, models: &[&str]) -> Option<ProbeSnapshot> {
-        Some(ProbeSnapshot {
-            status: ProbeStatus::Online,
-            models: models.iter().map(|id| (*id).to_string()).collect(),
-            suggested_capabilities: OpenAiCompatibleCapabilities::default(),
-            engine: Some(engine),
-            adapter: None,
-        })
-    }
-
-    fn inventory(endpoint: &EndpointConfig) -> EndpointInventory {
-        // Vectors pin the facts, not capability profiles.
-        let mut inventory = endpoint_inventory(endpoint, EndpointStatus::Online);
-        inventory.default_capabilities = OpenAiCompatibleCapabilities::default();
-        inventory.probe_suggestions = None;
-        inventory
-    }
-
-    #[test]
-    fn llama_alias_probe_survives_endpoint_inventory_wire_projection() {
-        for (props, expected) in [
-            (r#"{"total_slots":4}"#, Some(vec!["a", "b"])),
-            (r#"{"role":"router","total_slots":4}"#, None),
-        ] {
-            let detected = crate::engine::detect_with(
-                None,
-                &[("a".to_string(), None), ("b".to_string(), None)],
-                |route, _| (route == "props").then(|| props.to_string()),
-            );
-            let endpoint = EndpointConfig {
-                last_probe: probed(detected, &["a", "b"]),
-                ..EndpointConfig::default()
-            };
-            let encoded = serde_json::to_value(inventory(&endpoint)).expect("inventory wire");
-            let aliases = encoded["engineFacts"].get("servedModelAliases");
-            match expected {
-                Some(ids) => assert_eq!(
-                    aliases,
-                    Some(&serde_json::json!({"value": ids, "source": "probe"}))
-                ),
-                None => assert!(aliases.is_none()),
-            }
-        }
-    }
-
-    #[test]
-    fn hello_with_engine_facts_matches_the_shared_vector() {
-        let vllm = EndpointConfig {
-            slug: "vllm".to_string(),
-            label: "vLLM".to_string(),
-            concurrency_limit: Some(8),
-            models: vec![ModelConfig {
-                slug: Some("llama".to_string()),
-                upstream_model_id: "meta/llama".to_string(),
-                ..ModelConfig::default()
-            }],
-            last_probe: probed(
-                DetectedEngine {
-                    kind: Some(EngineKind::Vllm),
-                    kv_tokens: Some(32_768),
-                    model_max_len: [("meta/llama".to_string(), 131_072)].into_iter().collect(),
-                    served_model_aliases: vec!["meta/llama".to_string(), "llama-alias".to_string()],
-                    ..DetectedEngine::default()
-                },
-                &["meta/llama", "llama-alias"],
-            ),
-            ..EndpointConfig::default()
-        };
-        let llama = EndpointConfig {
-            slug: "llama".to_string(),
-            label: "llama.cpp".to_string(),
-            engine: crate::config::EndpointEngine::LlamaCpp,
-            models: vec![ModelConfig {
-                slug: Some("qwen".to_string()),
-                upstream_model_id: "qwen".to_string(),
-                ..ModelConfig::default()
-            }],
-            last_probe: probed(
-                DetectedEngine {
-                    kind: Some(EngineKind::LlamaCpp),
-                    slots: Some(4),
-                    ctx_per_slot: Some(32_768),
-                    max_model_len: Some(32_768),
-                    ..DetectedEngine::default()
-                },
-                &["qwen"],
-            ),
-            ..EndpointConfig::default()
-        };
-        let mut capabilities = CliCapabilities::from_snapshot(&TerminalFeatureSnapshot {
-            allow_human_terminal: false,
-            mcp_command_mode: McpCommandMode::Off,
-            require_terminal_approval: false,
-            allow_file_tools_as_root: false,
-            mcp_file_read: false,
-            file_roots_configured: false,
-            allow_remote_metric_sources: false,
-            allow_remote_engine_adapters: false,
-            terminal_public_key_b64url: "BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0A".to_string(),
-            terminal_identity: None,
-        });
-        capabilities.features.terminal_supported = true;
-        let hello = ClientControlMessage::Hello {
-            id: "hello-1".to_string(),
-            protocol_version: RELAY_PROTOCOL_VERSION.to_string(),
-            cli: CliInventory {
-                slug: "desk".to_string(),
-                hostname: Some("desk-01.local".to_string()),
-                identity_public_key: TEST_IDENTITY_PUBLIC_KEY.to_string(),
-                identity_signature: TEST_IDENTITY_SIGNATURE.to_string(),
-                version: Some("0.4.0".to_string()),
-                capabilities,
-            },
-            endpoints: vec![inventory(&vllm), inventory(&llama)],
-        };
-        let mut legacy_vector = vector(include_str!("../tests/fixtures/relay-2.4/hello.json"));
-        // Other fields remain the shared historical wire vector. Only the
-        // negotiated current protocol changes in this release.
-        legacy_vector["protocolVersion"] = RELAY_PROTOCOL_VERSION.into();
-        assert_eq!(encoded(&hello), legacy_vector);
-    }
-
-    #[test]
-    fn engine_facts_never_change_the_inventory_digest() {
-        let mut endpoint = EndpointConfig {
-            slug: "vllm".to_string(),
-            label: "vLLM".to_string(),
-            models: vec![ModelConfig {
-                upstream_model_id: "m".to_string(),
-                ..ModelConfig::default()
-            }],
-            ..EndpointConfig::default()
-        };
-        let without = inventory_digest(&[endpoint_inventory(&endpoint, EndpointStatus::Online)]);
-        endpoint.concurrency_limit = Some(3);
-        endpoint.kv_tokens = Some(262_144);
-        endpoint.last_probe = probed(
-            DetectedEngine {
-                kind: Some(EngineKind::Vllm),
-                kv_tokens: Some(1_000),
-                model_max_len: [("m".to_string(), 4_096)].into_iter().collect(),
-                ..DetectedEngine::default()
-            },
-            &["m"],
-        );
-        let with = endpoint_inventory(&endpoint, EndpointStatus::Online);
-        assert!(with.engine_facts.is_some());
-        assert!(with.models[0].engine_facts.is_some());
-        assert_eq!(inventory_digest(&[with]), without);
-    }
-
-    #[test]
-    fn no_facts_are_sent_for_an_undetected_generic_endpoint() {
-        let endpoint = EndpointConfig {
-            slug: "remote".to_string(),
-            engine: crate::config::EndpointEngine::Auto,
-            ..EndpointConfig::default()
-        };
-        assert_eq!(endpoint_engine_facts(&endpoint), None);
-        let declared = EndpointConfig {
-            engine: crate::config::EndpointEngine::Ollama,
-            concurrency_limit: Some(2),
-            ..endpoint
-        };
-        let facts = endpoint_engine_facts(&declared).expect("facts");
-        assert_eq!(facts.engine, Some(EngineFact::config(EngineKind::Ollama)));
-        assert_eq!(facts.slots, Some(EngineFact::config(2)));
-    }
-
-    #[test]
-    fn a_configured_concurrency_wins_over_probed_engine_slots() {
-        // `wsmp endpoints concurrency local 4` on a llama.cpp started with
-        // `-np 8`: the hello reports 4 (config), so the server's AUTO limit
-        // stays at 4; the probed 8 only fills an unset value.
-        let mut endpoint = EndpointConfig {
-            slug: "local".to_string(),
-            concurrency_limit: Some(4),
-            last_probe: probed(
-                DetectedEngine {
-                    kind: Some(EngineKind::LlamaCpp),
-                    slots: Some(8),
-                    ..DetectedEngine::default()
-                },
-                &[],
-            ),
-            ..EndpointConfig::default()
-        };
-        let facts = endpoint_engine_facts(&endpoint).expect("facts");
-        assert_eq!(facts.slots, Some(EngineFact::config(4)));
-        endpoint.concurrency_limit = None;
-        let facts = endpoint_engine_facts(&endpoint).expect("facts");
-        assert_eq!(facts.slots, Some(EngineFact::probe(8)));
-    }
-
-    #[test]
-    fn a_configured_kv_tokens_wins_over_probed() {
-        let mut endpoint = EndpointConfig {
-            slug: "generic".to_string(),
-            kv_tokens: Some(262_144),
-            last_probe: probed(
-                DetectedEngine {
-                    kind: Some(EngineKind::Vllm),
-                    kv_tokens: Some(1_000),
-                    ..DetectedEngine::default()
-                },
-                &[],
-            ),
-            ..EndpointConfig::default()
-        };
-        let facts = endpoint_engine_facts(&endpoint).expect("facts");
-        assert_eq!(facts.kv_tokens, Some(EngineFact::config(262_144)));
-        endpoint.kv_tokens = None;
-        let facts = endpoint_engine_facts(&endpoint).expect("facts");
-        assert_eq!(facts.kv_tokens, Some(EngineFact::probe(1_000)));
-    }
-
-    #[test]
-    fn adapter_facts_sit_between_config_and_probe() {
-        use crate::engine_adapter::{
-            AdapterCachedFacts, AdapterFormat, AdapterInput, AdapterSignal, EngineAdapterConfig,
-            SignalSelector,
-        };
-        let mut map = std::collections::BTreeMap::new();
-        map.insert(
-            AdapterSignal::Running,
-            SignalSelector {
-                series: "running".to_string(),
-                labels: Default::default(),
-                aggregate: None,
-                scale: None,
-            },
-        );
-        let mut endpoint = EndpointConfig {
-            slug: "generic".to_string(),
-            engine: crate::config::EndpointEngine::Generic,
-            engine_adapter: Some(EngineAdapterConfig {
-                input: AdapterInput::Route {
-                    route: "/stats".to_string(),
-                },
-                format: AdapterFormat::Json,
-                interval_secs: 2,
-                timeout_secs: 2,
-                map,
-                count_route: None,
-            }),
-            last_probe: Some(ProbeSnapshot {
-                status: ProbeStatus::Online,
-                models: Vec::new(),
-                suggested_capabilities: OpenAiCompatibleCapabilities::default(),
-                engine: Some(DetectedEngine {
-                    kind: Some(EngineKind::Generic),
-                    slots: Some(1),
-                    kv_tokens: Some(1_000),
-                    max_model_len: Some(2_048),
-                    ..DetectedEngine::default()
-                }),
-                adapter: Some(AdapterCachedFacts {
-                    slots: Some(8),
-                    kv_tokens: Some(262_144),
-                    max_model_len: Some(8_192),
-                    ctx_per_slot: None,
-                }),
-            }),
-            ..EndpointConfig::default()
-        };
-        let facts = endpoint_engine_facts(&endpoint).expect("facts");
-        assert_eq!(facts.slots, Some(EngineFact::custom(8)));
-        assert_eq!(facts.kv_tokens, Some(EngineFact::custom(262_144)));
-        assert_eq!(facts.max_model_len, Some(EngineFact::custom(8_192)));
-        assert_eq!(
-            facts.load_adapter.as_ref().map(|fact| fact.source),
-            Some(FactSource::Config)
-        );
-        endpoint.kv_tokens = Some(4096);
-        endpoint.concurrency_limit = Some(4);
-        let facts = endpoint_engine_facts(&endpoint).expect("facts");
-        assert_eq!(facts.slots, Some(EngineFact::config(4)));
-        assert_eq!(facts.kv_tokens, Some(EngineFact::config(4096)));
-    }
-
-    #[test]
-    fn an_approved_remote_adapter_publishes_load_adapter_facts() {
-        use crate::engine_adapter::{
-            AdapterFormat, AdapterInput, AdapterSignal, EngineAdapterConfig, SignalSelector,
-        };
-        let mut map = std::collections::BTreeMap::new();
-        map.insert(
-            AdapterSignal::Running,
-            SignalSelector {
-                series: "running".to_string(),
-                labels: Default::default(),
-                aggregate: None,
-                scale: None,
-            },
-        );
-        map.insert(
-            AdapterSignal::KvUsage,
-            SignalSelector {
-                series: "kv".to_string(),
-                labels: Default::default(),
-                aggregate: None,
-                scale: None,
-            },
-        );
-        let spec = EngineAdapterConfig {
-            input: AdapterInput::Route {
-                route: "/stats".to_string(),
-            },
-            format: AdapterFormat::Json,
-            interval_secs: 2,
-            timeout_secs: 2,
-            map,
-            count_route: None,
-        };
-        let endpoint = EndpointConfig {
-            slug: "gpu".to_string(),
-            engine: crate::config::EndpointEngine::Generic,
-            engine_adapter: None,
-            ..EndpointConfig::default()
-        };
-        assert!(
-            endpoint_engine_facts(&endpoint)
-                .and_then(|facts| facts.load_adapter)
-                .is_none(),
-            "local-only facts omit a remote-only adapter"
-        );
-        let facts = endpoint_engine_facts_with(&endpoint, Some(&spec)).expect("facts");
-        let load = facts.load_adapter.expect("loadAdapter");
-        assert_eq!(load.source, FactSource::Config);
-        assert_eq!(
-            load.value.input,
-            crate::engine_adapter::AdapterInputKind::Route
-        );
-        assert!(
-            !load.value.signals.is_empty(),
-            "the remote spec's signal list is published on the wire"
-        );
-        assert!(load.value.signals.contains(&AdapterSignal::Running));
-        assert!(load.value.signals.contains(&AdapterSignal::KvUsage));
-        let inventory = endpoint_inventory_with(&endpoint, EndpointStatus::Online, Some(&spec));
-        assert_eq!(
-            inventory
-                .engine_facts
-                .as_ref()
-                .and_then(|facts| facts.load_adapter.as_ref())
-                .map(|fact| fact.value.signals.len()),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn served_model_aliases_are_trimmed_like_the_server_trims() {
-        let endpoint = EndpointConfig {
-            slug: "vllm".to_string(),
-            last_probe: probed(
-                DetectedEngine {
-                    kind: Some(EngineKind::Vllm),
-                    served_model_aliases: vec!["\u{FEFF} ".to_string(), "llama".to_string()],
-                    ..DetectedEngine::default()
-                },
-                &[],
-            ),
-            ..EndpointConfig::default()
-        };
-        let facts = endpoint_engine_facts(&endpoint).expect("facts");
-        assert_eq!(
-            facts.served_model_aliases,
-            Some(EngineFact::probe(vec!["llama".to_string()]))
-        );
-    }
-
-    #[test]
-    fn node_info_matches_the_shared_vector() {
-        let info = NodeInfo {
-            os: Some(NodeOs {
-                name: Some("Ubuntu".to_string()),
-                version: Some("24.04".to_string()),
-                kernel: Some("6.8.0-45-generic".to_string()),
-                arch: Some("aarch64".to_string()),
-            }),
-            cpu: Some(NodeCpu {
-                model: Some("Cortex-X925".to_string()),
-                cores: Some(20),
-            }),
-            memory_total_mib: Some(124_000),
-            gpus: vec![NodeGpuInfo {
-                index: 0,
-                name: Some("NVIDIA GB10".to_string()),
-                uuid: Some("GPU-bbbb".to_string()),
-                driver_version: Some("580.82.07".to_string()),
-                vram_total_mib: None,
-            }],
-            unified_memory: Some(true),
-            node_kind: Some(NodeKind::Unified),
-            interfaces: vec![NodeInterfaceInfo {
-                name: "enP7s7".to_string(),
-                addresses: vec!["192.168.1.20".to_string(), "fe80::1".to_string()],
-                link_speed_mbps: Some(10_000),
-                mtu: Some(1500),
-            }],
-            execution_mechanism: Some(ExecutionMechanism::Systemd),
-            cli_version: Some("0.4.0".to_string()),
-        };
-        assert_eq!(
-            encoded(&ClientControlMessage::NodeInfo(info)),
-            vector(include_str!("../tests/fixtures/relay-2.4/node-info.json"))
-        );
-    }
-
-    #[test]
-    fn node_metrics_matches_the_shared_vector() {
-        let metrics = NodeMetrics {
-            ts: "2026-09-28T12:00:00.000Z".to_string(),
-            cpu: Some(NodeCpuMetrics {
-                usage_percent: Some(12.5),
-                load1: Some(0.5),
-                load5: Some(1.25),
-                load15: Some(2.0),
-            }),
-            memory: Some(NodeMemoryMetrics {
-                total_mib: Some(124_000),
-                available_mib: Some(64_000),
-                swap_total_mib: Some(0),
-                swap_free_mib: Some(0),
-            }),
-            disks: vec![NodeDiskMetrics {
-                mount: "/".to_string(),
-                total_mib: Some(1_900_000),
-                free_mib: Some(800_000),
-            }],
-            gpus: vec![NodeGpuMetrics {
-                index: 0,
-                utilization_percent: Some(3.0),
-                temperature_c: Some(40.0),
-                sm_clock_mhz: Some(2418.0),
-                ..NodeGpuMetrics::default()
-            }],
-            interfaces: vec![NodeInterfaceMetrics {
-                name: "enP7s7".to_string(),
-                rx_bytes: 123_456_789,
-                tx_bytes: 98_765,
-            }],
-            custom: vec![CustomMetric {
-                source: "fans".to_string(),
-                name: "gpu_fan_rpm".to_string(),
-                labels: [("gpu".to_string(), "0".to_string())].into_iter().collect(),
-                value: 1800.0,
-                ts: "2026-09-28T11:59:58.000Z".to_string(),
-            }],
-            sources: vec![
-                MetricSourceStatus {
-                    name: "fans".to_string(),
-                    origin: MetricSourceOrigin::Remote,
-                    state: MetricSourceState::Unsupported,
-                    command_sha256: Some(
-                        "4a1d8f0a2c0e3f6a0b5c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a"
-                            .to_string(),
-                    ),
-                    interval_secs: Some(10),
-                    error: None,
-                },
-                MetricSourceStatus {
-                    name: "psu".to_string(),
-                    origin: MetricSourceOrigin::Local,
-                    state: MetricSourceState::Failing,
-                    command_sha256: Some(
-                        "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c"
-                            .to_string(),
-                    ),
-                    interval_secs: Some(60),
-                    error: Some(MetricSourceError::Timeout),
-                },
-            ],
-            engine_adapters: Vec::new(),
-            abandoned_recovery: None,
-        };
-        assert_eq!(
-            encoded(&ClientControlMessage::NodeMetrics(metrics)),
-            vector(include_str!(
-                "../tests/fixtures/relay-2.4/node-metrics.json"
-            ))
-        );
-    }
-
-    #[test]
-    fn endpoint_load_matches_the_shared_vector() {
-        let load = EndpointLoad {
-            endpoint_slug: "vllm".to_string(),
-            model_slug: None,
-            running: 3,
-            waiting: Some(2),
-            kv_usage: Some(0.42),
-            kv_occupancy: None,
-            slots_busy: None,
-            deferred: None,
-            prefix_cache_hits_delta: Some(50),
-            prefix_cache_queries_delta: Some(200),
-            prefix_cache_reset: None,
-            counter_epoch: 0,
-            source: LoadSource::VllmMetrics,
-            ts: "2026-09-28T12:00:01.000Z".to_string(),
-        };
-        assert_eq!(
-            encoded(&ClientControlMessage::EndpointLoad(load)),
-            vector(include_str!(
-                "../tests/fixtures/relay-2.4/endpoint-load.json"
-            ))
-        );
-    }
-
-    #[test]
-    fn custom_endpoint_load_matches_the_shared_vector() {
-        let load = EndpointLoad {
-            endpoint_slug: "generic".to_string(),
-            model_slug: None,
-            running: 3,
-            waiting: None,
-            kv_usage: Some(0.4),
-            kv_occupancy: Some(0.7),
-            slots_busy: Some(3),
-            deferred: None,
-            prefix_cache_hits_delta: None,
-            prefix_cache_queries_delta: None,
-            prefix_cache_reset: None,
-            counter_epoch: 0,
-            source: LoadSource::Custom,
-            ts: "2026-09-28T12:00:01.000Z".to_string(),
-        };
-        assert_eq!(
-            encoded(&ClientControlMessage::EndpointLoad(load)),
-            vector(include_str!(
-                "../tests/fixtures/relay-2.4/endpoint-load-custom.json"
-            ))
-        );
-    }
-
-    #[test]
-    fn an_inventory_over_the_frame_cap_sheds_engine_facts_before_it_is_refused() {
-        let model = |index: usize| DiscoveredModelInventory {
-            slug: None,
-            upstream_model_id: format!("org/model-{index:04}-{}", "x".repeat(40)),
-            capabilities: None,
-            capability_override_mode: CapabilityOverrideMode::Inherit,
-            probe_suggestions: None,
-            concurrency_limit: None,
-            engine_facts: Some(EngineFacts {
-                max_model_len: Some(EngineFact::probe(131_072)),
-                ..EngineFacts::default()
-            }),
-        };
-        let endpoint = |models: usize| EndpointInventory {
-            deployment_instance_id: None,
-            slug: "router".to_string(),
-            label: "Router".to_string(),
-            kind: "openai-compatible".to_string(),
-            status: EndpointStatus::Online,
-            default_capabilities: OpenAiCompatibleCapabilities::default(),
-            probe_suggestions: None,
-            models: (0..models).map(model).collect(),
-            engine_facts: Some(EngineFacts {
-                engine: Some(EngineFact::probe(EngineKind::Vllm)),
-                ..EngineFacts::default()
-            }),
-        };
-        let update = |models: usize| ClientControlMessage::InventoryUpdate {
-            id: "u".to_string(),
-            endpoints: vec![endpoint(models)],
-        };
-        // 500 models fit without their facts and do not fit with them.
-        let full = serde_json::to_string(&update(500)).expect("json");
-        assert!(full.len() > RELAY_JSON_CONTROL_MAX_BYTES, "{}", full.len());
-        let text = encode_control(&update(500)).expect("facts are shed, not the inventory");
-        assert!(text.len() <= RELAY_JSON_CONTROL_MAX_BYTES);
-        assert!(!text.contains("maxModelLen"));
-        assert!(
-            text.contains(r#""engine":{"value":"vllm""#),
-            "endpoint facts kept"
-        );
-        assert_eq!(text.matches("upstreamModelId").count(), 500);
-        // A frame within the cap is untouched.
-        let small = encode_control(&update(2)).expect("small");
-        assert_eq!(small.matches("maxModelLen").count(), 2);
-        // An inventory too large even without facts is still refused.
-        assert!(encode_control(&update(2_000)).is_err());
-    }
-
-    #[test]
-    fn metrics_sources_set_parses_from_the_shared_vector() {
-        let message = parse_server_control(include_str!(
-            "../tests/fixtures/relay-2.4/metrics-sources-set.json"
-        ))
-        .expect("parse");
-        let ServerControlMessage::MetricsSourcesSet { id, sources } = message else {
-            panic!("expected metrics.sources.set");
-        };
-        assert_eq!(id, "sources-1");
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].name, "fans");
-        assert_eq!(sources[0].interval_secs, 10);
-        assert_eq!(sources[0].format, MetricSourceFormat::Number);
-        // Everything the server's strict schema refuses is refused here too.
-        let valid = r#"{"name":"ok","command":"echo 1","intervalSecs":5,"timeoutSecs":1,"format":"number"}"#;
-        let frame = |source: String| {
-            format!(r#"{{"type":"metrics.sources.set","id":"x","sources":[{source}]}}"#)
-        };
-        assert!(parse_server_control(&frame(valid.to_string())).is_ok());
-        let command = |command: &str| {
-            valid.replace(
-                r#""echo 1""#,
-                &serde_json::to_string(command).expect("json"),
-            )
-        };
-        let invalid = [
-            valid.replace(r#""ok""#, r#""bad name""#),
-            valid.replace(r#""ok""#, r#""""#),
-            command(""),
-            command(&"x".repeat(4097)),
-            valid.replace(r#""intervalSecs":5"#, r#""intervalSecs":4"#),
-            valid.replace(r#""intervalSecs":5"#, r#""intervalSecs":86401"#),
-            valid.replace(r#""timeoutSecs":1"#, r#""timeoutSecs":0"#),
-            valid.replace(r#""timeoutSecs":1"#, r#""timeoutSecs":301"#),
-            valid.replace(r#""number""#, r#""yaml""#),
-            valid.replace('}', r#","stderr":"x"}"#),
-        ];
-        for source in invalid {
-            assert!(
-                parse_server_control(&frame(source.clone())).is_err(),
-                "{source}"
-            );
-            assert_eq!(control_frame_fault(&frame(source)), FrameFault::Ignore);
-        }
-        // 4096 UTF-16 units is the bound, not 4096 bytes.
-        assert!(parse_server_control(&frame(command(&"é".repeat(4096)))).is_ok());
-        let fifty_one = vec![valid; NODE_METRICS_SOURCES_MAX + 1].join(",");
-        assert!(parse_server_control(&frame(fifty_one)).is_err());
-        let fifty = vec![valid; NODE_METRICS_SOURCES_MAX].join(",");
-        assert!(parse_server_control(&frame(fifty)).is_ok());
-        // A malformed list is dropped, never fatal.
-        assert_eq!(
-            control_frame_fault(r#"{"type":"metrics.sources.set","id":"x","sources":"nope"}"#),
-            FrameFault::Ignore
-        );
-    }
-}
-
-/// Relay 2.4 file frames, checked against the shared vectors in
-/// `tests/fixtures/relay-2.4/` that `apps/server/src/relay/file-protocol.test.ts`
-/// parses with its strict schemas: server-to-CLI frames must decode to exactly
-/// the vector's values, CLI-to-server frames must encode to exactly them.
-#[cfg(test)]
-mod relay_24_file_vectors {
-    use super::*;
-
-    const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/relay-2.4");
-    const OPS: [&str; 9] = [
-        "read", "stat", "list", "search", "edit", "write", "rename", "mkdir", "delete",
-    ];
-
-    fn vector(name: &str) -> Value {
-        let text = std::fs::read_to_string(format!("{FIXTURES}/{name}.json")).expect("fixture");
-        serde_json::from_str(&text).expect("vector is JSON")
-    }
-
-    fn text_of(name: &str) -> String {
-        std::fs::read_to_string(format!("{FIXTURES}/{name}.json")).expect("fixture")
-    }
-
-    fn encoded(message: &ClientControlMessage) -> Value {
-        serde_json::from_str(&encode_control(message).expect("encode")).expect("json")
-    }
-
-    fn str_field(value: &Value, key: &str) -> String {
-        value[key].as_str().expect(key).to_string()
-    }
-
-    #[test]
-    fn every_file_op_vector_decodes_to_its_values() {
-        for op in OPS {
-            let name = format!("file-op-{op}");
-            let frame = vector(&name);
-            let ServerControlMessage::FileOp {
-                op_id,
-                op: decoded_op,
-                args,
-                body_bytes,
-                mode,
-                read_grant,
-            } = parse_server_control(&text_of(&name)).expect("parse")
-            else {
-                panic!("{name} is not a file.op");
-            };
-            assert_eq!(op_id, str_field(&frame, "opId"), "{name}");
-            assert_eq!(decoded_op, op, "{name}");
-            assert_eq!(mode, McpCommandMode::Unsupervised);
-            assert!(!read_grant);
-            assert_eq!(args, frame["args"], "{name}");
-            assert_eq!(
-                body_bytes,
-                frame
-                    .get("bodyBytes")
-                    .map(|v| v.as_u64().expect("n") as usize)
-            );
-            assert_eq!(body_bytes.is_some(), op == "write", "{name}");
-        }
-    }
-
-    #[test]
-    fn file_permission_frame_requires_explicit_valid_consent() {
-        let valid = vector("file-op-read");
-        for field in ["mode", "readGrant"] {
-            let mut missing = valid.clone();
-            missing.as_object_mut().expect("object").remove(field);
-            assert!(
-                parse_server_control(&missing.to_string()).is_err(),
-                "{field}"
-            );
-        }
-        for (field, bad) in [
-            ("mode", json!("on")),
-            ("mode", Value::Null),
-            ("mode", json!({"mode":"off"})),
-            ("readGrant", json!("true")),
-            ("readGrant", Value::Null),
-            ("readGrant", json!(1)),
-        ] {
-            let mut malformed = valid.clone();
-            malformed[field] = bad;
-            assert!(
-                parse_server_control(&malformed.to_string()).is_err(),
-                "{field}"
-            );
-        }
-        let mut granted = valid;
-        granted["mode"] = json!("off");
-        granted["readGrant"] = json!(true);
-        assert!(matches!(
-            parse_server_control(&granted.to_string()).expect("grant"),
-            ServerControlMessage::FileOp {
-                mode: McpCommandMode::Off,
-                read_grant: true,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn file_cancel_and_the_supervised_file_spawn_decode() {
-        let cancel = vector("file-cancel");
-        assert!(matches!(
-            parse_server_control(&text_of("file-cancel")).expect("parse"),
-            ServerControlMessage::FileCancel { op_id } if op_id == str_field(&cancel, "opId")
-        ));
-        let spawn = vector("file-term-spawn");
-        let ServerControlMessage::TermSpawn(decoded) =
-            parse_server_control(&text_of("file-term-spawn")).expect("parse")
-        else {
-            panic!("not a term.spawn");
-        };
-        assert!(decoded.is_file());
-        assert_eq!(decoded.kind.as_deref(), Some("file"));
-        let file_op = decoded.file_op.expect("fileOp");
-        assert_eq!(file_op.op, "edit");
-        assert_eq!(file_op.args, spawn["fileOp"]["args"]);
-        assert_eq!(decoded.command, str_field(&spawn, "command"));
-        // A plain command spawn is not a file op.
-        let command = r#"{"type":"term.spawn","terminalId":"t","commandId":"c","command":"ls","requester":"a","shareOutput":false}"#;
-        let ServerControlMessage::TermSpawn(plain) = parse_server_control(command).expect("parse")
-        else {
-            panic!("not a term.spawn");
-        };
-        assert!(!plain.is_file());
-        // An unknown field inside `fileOp` refuses the whole frame.
-        let loose =
-            text_of("file-term-spawn").replace("\"op\": \"edit\"", "\"op\": \"edit\", \"x\": 1");
-        assert!(parse_server_control(&loose).is_err());
-    }
-
-    #[test]
-    fn binary_metadata_vectors_round_trip() {
-        for (name, is_body) in [("file-body-metadata", true), ("file-data-metadata", false)] {
-            let frame = vector(name);
-            let op_id = str_field(&frame, "opId");
-            let metadata = if is_body {
-                RelayBinaryFrameMetadata::FileBody {
-                    op_id: op_id.clone(),
-                }
-            } else {
-                RelayBinaryFrameMetadata::FileData {
-                    op_id: op_id.clone(),
-                }
-            };
-            assert_eq!(
-                serde_json::to_value(&metadata).expect("json"),
-                frame,
-                "{name}"
-            );
-            let encoded = encode_binary_frame(&metadata, b"payload").expect("encode");
-            let (decoded, body) = parse_binary_frame(&encoded).expect("parse");
-            assert_eq!(decoded, metadata);
-            assert_eq!(decoded.routing_id(), op_id);
-            assert_eq!(body, b"payload");
-        }
-        // One frame carries at most 1 MiB.
-        let metadata = RelayBinaryFrameMetadata::FileData {
-            op_id: "x".to_string(),
-        };
-        assert!(encode_binary_frame(&metadata, &vec![0; RELAY_BINARY_CHUNK_MAX_BYTES]).is_ok());
-        assert!(
-            encode_binary_frame(&metadata, &vec![0; RELAY_BINARY_CHUNK_MAX_BYTES + 1]).is_err()
-        );
-    }
-
-    fn result_message(frame: &Value) -> ClientControlMessage {
-        ClientControlMessage::FileResult {
-            op_id: str_field(frame, "opId"),
-            op: str_field(frame, "op"),
-            result: frame["result"].clone(),
-            data_field: frame
-                .get("dataField")
-                .map(|v| v.as_str().expect("s").to_string()),
-            body_bytes: frame
-                .get("bodyBytes")
-                .map(|v| v.as_u64().expect("n") as usize),
-        }
-    }
-
-    #[test]
-    fn every_file_result_and_rejection_vector_encodes_exactly() {
-        let mut names: Vec<String> = OPS.iter().map(|op| format!("file-result-{op}")).collect();
-        names
-            .extend(["file-result-read-unchanged", "file-result-read-spilled"].map(str::to_string));
-        for name in names {
-            let frame = vector(&name);
-            assert_eq!(encoded(&result_message(&frame)), frame, "{name}");
-        }
-        for name in [
-            "file-rejected-conflict",
-            "file-rejected-bad-frame",
-            "file-rejected-match-count",
-            "file-rejected-grant-disabled",
-        ] {
-            let frame = vector(name);
-            let message = ClientControlMessage::FileRejected {
-                op_id: str_field(&frame, "opId"),
-                reason: str_field(&frame, "reason"),
-                detail: frame.get("detail").cloned(),
-            };
-            assert_eq!(encoded(&message), frame, "{name}");
-        }
-        // The wire refusal reasons `FileRelay::refuse` emits must be inside this
-        // set; `file-rejected-grant-disabled` covers `admit`'s third branch.
-        // `file_relay` exists on unix only.
-        #[cfg(unix)]
-        {
-            for reason in crate::file_relay::WIRE_REFUSAL_REASONS {
-                let message = ClientControlMessage::FileRejected {
-                    op_id: str_field(&vector("file-rejected-bad-frame"), "opId"),
-                    reason: reason.to_string(),
-                    detail: None,
-                };
-                let as_value: Value =
-                    serde_json::from_str(&encode_control(&message).expect("encode")).expect("json");
-                assert_eq!(as_value["reason"], reason);
-            }
-        }
-    }
-
-    #[test]
-    fn supervised_file_vectors_encode_result_error_neither_accept_and_reject() {
-        for name in [
-            "file-supervised-done",
-            "file-supervised-done-edit",
-            "file-supervised-done-write",
-            "file-supervised-done-rename",
-            "file-supervised-done-delete",
-        ] {
-            let frame = vector(name);
-            let message = ClientControlMessage::SupervisedDone {
-                command_id: str_field(&frame, "commandId"),
-                exit_code: None,
-                signal: None,
-                review: false,
-                output_bytes: None,
-                file: SupervisedFileOutcome::result(
-                    str_field(&frame["fileResult"], "op"),
-                    frame["fileResult"]["result"].clone(),
-                ),
-            };
-            assert_eq!(encoded(&message), frame, "{name}");
-        }
-
-        for (name, code) in [
-            ("file-supervised-done-error", FileErrorCode::Conflict),
-            (
-                "file-supervised-done-unsafe",
-                FileErrorCode::UnsafeFilesystem,
-            ),
-            (
-                "file-supervised-done-uncertain",
-                FileErrorCode::UncertainOutcome,
-            ),
-        ] {
-            let frame = vector(name);
-            let message = ClientControlMessage::SupervisedDone {
-                command_id: str_field(&frame, "commandId"),
-                exit_code: None,
-                signal: None,
-                review: false,
-                output_bytes: None,
-                file: SupervisedFileOutcome::error(code),
-            };
-            assert_eq!(encoded(&message), frame);
-            assert_eq!(FileErrorCode::from_wire_code(code.as_str()), Some(code));
-            #[cfg(unix)]
-            match code {
-                FileErrorCode::UncertainOutcome => assert_eq!(
-                    FileErrorCode::from(crate::file_ops::ErrorCode::UncertainOutcome),
-                    code
-                ),
-                FileErrorCode::UnsafeFilesystem => assert_eq!(
-                    FileErrorCode::from(crate::file_ops::ErrorCode::UnsafeFilesystem),
-                    code
-                ),
-                _ => {}
-            }
-        }
-
-        let frame = vector("file-supervised-done-neither");
-        let message = ClientControlMessage::SupervisedDone {
-            command_id: str_field(&frame, "commandId"),
-            exit_code: Some(0),
-            signal: None,
-            review: false,
-            output_bytes: None,
-            file: SupervisedFileOutcome::default(),
-        };
-        assert_eq!(encoded(&message), frame);
-
-        let frame = vector("file-supervised-accepted");
-        assert_eq!(
-            encoded(&ClientControlMessage::SupervisedAccepted {
-                command_id: str_field(&frame, "commandId"),
-            }),
-            frame
-        );
-        let frame = vector("file-supervised-rejected");
-        assert_eq!(
-            encoded(&ClientControlMessage::SupervisedRejected {
-                command_id: str_field(&frame, "commandId"),
-                reason: str_field(&frame, "reason"),
-            }),
-            frame
-        );
-    }
-
-    #[test]
-    fn supervised_file_result_never_serializes_diff_hunks_or_recovery_paths() {
-        for op in ["edit", "write", "rename"] {
-            let mut payload = serde_json::json!({"etag":"h:fixture", "recovered":["/workspace/.wsmp-recover-a1b2c3d4e5/slot-1"]});
-            if op != "rename" {
-                payload["diff"] = Value::String("must stay local".to_owned());
-                payload["hunks"] = serde_json::json!([[1, 3]]);
-            }
-            let file = SupervisedFileOutcome::result(op.to_owned(), payload);
-            let encoded = serde_json::to_value(file).expect("serialize outcome");
-            assert_eq!(encoded["fileResult"]["op"], op);
-            assert_eq!(
-                encoded["fileResult"]["result"],
-                serde_json::json!({"etag":"h:fixture"})
-            );
-        }
-    }
-
-    #[test]
-    fn gap_file_spawn_rejects_forged_display_fields_at_wire_boundary() {
-        for field in ["diff", "preview", "etag"] {
-            for location in ["spawn", "fileOp"] {
-                let mut frame = vector("file-term-spawn");
-                let target = if location == "spawn" {
-                    &mut frame
-                } else {
-                    &mut frame["fileOp"]
-                };
-                target[field] = Value::String("FORGED DISPLAY".to_owned());
-                assert!(
-                    parse_server_control(&frame.to_string()).is_err(),
-                    "{location}.{field}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn supervised_file_spawn_union_rejects_unknown_and_bad_body_shapes() {
-        let good = parse_server_control(&vector("file-term-spawn").to_string()).expect("spawn");
-        let ServerControlMessage::TermSpawn(spawn) = good else {
-            panic!("not a spawn");
-        };
-        assert!(spawn.file_shape_is_valid());
-
-        let base = vector("file-term-spawn");
-        let mut cases = Vec::new();
-        let mut unknown = base.clone();
-        unknown["fileOp"]["diff"] = Value::String("forged".to_string());
-        cases.push(unknown);
-        let mut fake_op = base.clone();
-        fake_op["fileOp"]["op"] = Value::String("read".to_string());
-        cases.push(fake_op);
-        let mut body_on_edit = base.clone();
-        body_on_edit["bodyBytes"] = Value::from(1);
-        cases.push(body_on_edit);
-        let mut share = base;
-        share["shareOutput"] = Value::Bool(true);
-        cases.push(share);
-        for case in cases {
-            match parse_server_control(&case.to_string()) {
-                Err(_) => {}
-                Ok(ServerControlMessage::TermSpawn(spawn)) => {
-                    assert!(!spawn.file_shape_is_valid(), "{case}")
-                }
-                Ok(other) => panic!("unexpected message: {other:?}"),
-            }
-        }
-    }
 
     #[test]
     fn a_malformed_file_op_is_rejected_by_name_and_other_bad_file_frames_are_ignored() {
         let id = "AAECAwQFBgcICQoLDA0ODw";
-        // Missing `args`: unparsable, but it names its op.
         let missing = format!(r#"{{"type":"file.op","opId":"{id}","op":"read"}}"#);
         assert!(parse_server_control(&missing).is_err());
         assert!(matches!(
             control_frame_fault(&missing),
             FrameFault::RejectFile { op_id } if op_id == id
         ));
-        // Wrong types and a lone-surrogate escape in the args still name it.
-        let wrong = format!(r#"{{"type":"file.op","opId":"{id}","op":5,"args":{{}}}}"#);
+        // 2.x consent fields are refused too, by name.
+        let with_mode = format!(
+            r#"{{"type":"file.op","opId":"{id}","op":"read","args":{{}},"mode":"unsupervised","readGrant":true}}"#
+        );
+        assert!(parse_server_control(&with_mode).is_err());
         assert!(matches!(
-            control_frame_fault(&wrong),
+            control_frame_fault(&with_mode),
             FrameFault::RejectFile { .. }
         ));
-        // A frame with no usable opId, and a bad file.cancel, are dropped.
         for text in [
             r#"{"type":"file.op","op":"read"}"#,
             r#"{"type":"file.op","opId":"short","op":"read"}"#,
-            r#"{"type":"file.op","opId":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"}"#,
             r#"{"type":"file.cancel"}"#,
             r#"{"type":"file.cancel","opId":7}"#,
         ] {
@@ -4553,10 +772,7 @@ mod relay_24_file_vectors {
                 "{text}"
             );
         }
-        // Bad `file.body` metadata is ignored, never fatal.
-        let metadata = br#"{"type":"file.body"}"#;
-        let mut frame = (metadata.len() as u32).to_be_bytes().to_vec();
-        frame.extend_from_slice(metadata);
+        let mut frame = binary(br#"{"type":"file.body"}"#);
         frame.extend_from_slice(b"x");
         assert!(matches!(
             binary_frame_fault(&frame),

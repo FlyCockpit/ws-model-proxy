@@ -61,18 +61,13 @@ fn main() {
 fn run(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
         Command::Login(args) => commands::login::run(args),
-        Command::Token(args) => commands::token::run(args),
         Command::Config(args) => commands::config::run(args),
-        Command::Endpoints(args) => commands::endpoints::run(args),
-        Command::Connect(args) => commands::connect::run(args),
-        Command::Daemon(args) => commands::daemon::run(args),
+        Command::Run(args) => commands::run::run(args),
         Command::Service(args) => commands::service::run(args),
-        Command::Reload(args) => commands::reload::run(args),
-        Command::Status { json } => commands::daemon::run_status(*json),
+        Command::Status(args) => commands::status::run(args),
         Command::Logout(args) => commands::logout::run(args),
         Command::Completions(args) => commands::completions::run(args),
         Command::Terminal(args) => commands::terminal::run(args),
-        Command::Metrics(args) => commands::metrics::run(args),
         Command::Recover(args) => commands::recover::run(args),
     }
 }

@@ -21,24 +21,6 @@ pub struct Args {
 
 #[derive(Debug, clap::Subcommand)]
 enum Sub {
-    /// Opt in to durable model deployment jobs (off by default). Each job
-    /// rechecks this flag; reconnect to refresh the server's feature report.
-    ///
-    /// Turning this on lets the server run shell commands on this machine
-    /// (`/bin/sh -c`, as the user running wsmp) for deployment jobs. The MCP
-    /// command mode does not limit jobs the server reports as approved by a
-    /// person: they run even when `set-mcp-commands` is `off`. Only jobs the
-    /// server reports as agent-authored are checked against the mode, and in
-    /// `supervised` their approval is the server's word, not a confirm screen
-    /// on this machine. Turn it on only for a server you would trust with a
-    /// shell here.
-    SetDeployments { state: Switch },
-    /// Allow operator terminals for interactive recipe steps (off by default).
-    /// Needs deployments on and terminal support; it never enables browser
-    /// shells. The owner runs each step's exact command after pressing Enter in
-    /// a terminal opened from the dashboard. Without it the server refuses to
-    /// plan interactive recipes on this node.
-    SetDeploymentOperatorTerminal { state: Switch },
     /// Print the path to the config file.
     Path,
     /// Create a default JSON config file if one does not already exist.
@@ -66,13 +48,13 @@ enum Sub {
     SetSlug { slug: String },
     /// Allow browser terminals. Takes effect the next time wsmp starts.
     SetHumanTerminal { state: Switch },
-    /// Choose what MCP agents may run: `off`, `supervised` (a person confirms
-    /// each command in a browser terminal), or `unsupervised` (headless exec
-    /// too). Takes effect the next time wsmp starts. This does not limit
-    /// person-approved deployment jobs; see `set-deployments`.
+    /// Choose the node's trust until `wsmp trust` lands: `unsupervised` is
+    /// Full control (commands, file ops, browser terminals and runtime
+    /// definitions); `off` and `supervised` are Relay only. Takes effect the
+    /// next time wsmp starts.
     SetMcpCommands { mode: McpMode },
-    /// Opt in to headless read-only file access with the dashboard grant.
-    /// Requires explicit file roots. Restart wsmp to apply.
+    /// The 0.3 read-only file grant. Relay 3.0 file ops follow the node's
+    /// trust instead; the key goes away with config v3.
     SetFileRead { state: Switch },
     /// Confine every file tool to these directories. Suggested roots (never
     /// applied automatically): ~/models, ~/deploy, ~/.config/llama-swap,
@@ -81,15 +63,15 @@ enum Sub {
         #[arg(required = true, num_args = 1..)]
         paths: Vec<PathBuf>,
     },
-    /// Clear the file allowlist; headless reads outside unsupervised then refuse.
+    /// Clear the file allowlist; file ops are then refused (`no_roots`).
     /// Restart wsmp to apply.
     ClearFileRoots,
     /// Require approval before a browser can open a terminal.
     SetTerminalApproval { state: Switch },
     /// Cap the browser terminals open at once on this machine (1 to 32,
     /// default 4). The server also caps terminals per CLI and per user; the
-    /// lowest limit applies. Supervised commands and operator terminals have
-    /// their own slots. Takes effect the next time wsmp starts.
+    /// lowest limit applies. Operator terminals have their own slots. Takes
+    /// effect the next time wsmp starts.
     SetMaxTerminals {
         #[arg(value_parser = clap::value_parser!(u32).range(1..=32))]
         count: u32,
@@ -97,15 +79,6 @@ enum Sub {
     /// Let the MCP node file tools run when wsmp itself runs as root (they
     /// refuse `unsupported` by default). Takes effect the next time wsmp starts.
     SetFileToolsAsRoot { state: Switch },
-    /// Accept metric sources defined remotely (dashboard or MCP). Each one
-    /// still needs `wsmp metrics approve`. Takes effect the next time wsmp
-    /// starts.
-    SetRemoteMetricSources { state: Switch },
-    /// Accept engine adapters defined remotely (dashboard or MCP). Separate
-    /// from metric-source opt-in. Each one still needs
-    /// `wsmp endpoints adapter approve`. Takes effect the next time wsmp
-    /// starts.
-    SetRemoteEngineAdapters { state: Switch },
 }
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -139,39 +112,6 @@ impl Switch {
 
 pub fn run(args: &Args) -> Result<()> {
     match &args.command {
-        Sub::SetDeployments { state } => {
-            Config::update(false, |config| {
-                config.allow_deployments = state.enabled();
-                Ok(())
-            })?;
-            if args.json {
-                output::json(
-                    &serde_json::json!({"key":"allowDeployments","value":state.enabled()}),
-                )?;
-            } else {
-                output::line(format!(
-                    "set `allowDeployments` to `{}`; reconnect to refresh server preflight",
-                    state.enabled()
-                ))?;
-            }
-        }
-        Sub::SetDeploymentOperatorTerminal { state } => {
-            Config::update(false, |config| {
-                config.allow_deployment_operator_terminal = state.enabled();
-                Ok(())
-            })?;
-            if args.json {
-                output::json(&serde_json::json!({
-                    "key": "allowDeploymentOperatorTerminal",
-                    "value": state.enabled()
-                }))?;
-            } else {
-                output::line(format!(
-                    "set `allowDeploymentOperatorTerminal` to `{}`; reconnect to refresh server preflight",
-                    state.enabled()
-                ))?;
-            }
-        }
         Sub::Path => {
             let path = crate::paths::config_file()?;
             if args.json {
@@ -299,11 +239,6 @@ pub fn run(args: &Args) -> Result<()> {
                 })?;
             } else {
                 output::line(format!("set `mcpCommandMode` to `{}`", mode.as_str()))?;
-                if mode == McpCommandMode::Supervised {
-                    output::line(
-                        "Tip: `wsmp config set-terminal-approval on` makes browsers prove an approved identity before they can confirm a command.",
-                    )?;
-                }
                 output::line("Restart wsmp to apply.")?;
             }
         }
@@ -363,26 +298,6 @@ pub fn run(args: &Args) -> Result<()> {
             set_flag(args.json, "allowFileToolsAsRoot", state.enabled(), |cfg| {
                 cfg.allow_file_tools_as_root = state.enabled();
             })?;
-        }
-        Sub::SetRemoteMetricSources { state } => {
-            set_flag(
-                args.json,
-                "allowRemoteMetricSources",
-                state.enabled(),
-                |cfg| {
-                    cfg.allow_remote_metric_sources = state.enabled();
-                },
-            )?;
-        }
-        Sub::SetRemoteEngineAdapters { state } => {
-            set_flag(
-                args.json,
-                "allowRemoteEngineAdapters",
-                state.enabled(),
-                |cfg| {
-                    cfg.allow_remote_engine_adapters = state.enabled();
-                },
-            )?;
         }
     }
     Ok(())

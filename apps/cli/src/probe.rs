@@ -6,8 +6,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use std::collections::BTreeMap;
-
 use crate::config::{
     CapabilityConfidence, CapabilityOverrideMode, CapabilitySource, Config, EndpointConfig,
     ModelConfig, OpenAiCompatibleCapabilities, ProbeSnapshot, ProbeStatus, ReasoningConfig,
@@ -27,9 +25,6 @@ pub struct ProbeReport {
     /// Engine detection result (online probes only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engine: Option<crate::engine::DetectedEngine>,
-    /// Integer facts from a configured adapter (online probes only).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub adapter: Option<crate::engine_adapter::AdapterCachedFacts>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,24 +109,8 @@ struct UpstreamModelSpec {
     capabilities: Option<UpstreamCapabilityFlags>,
 }
 
-pub fn probe_from_config(endpoint: &EndpointConfig, config: &Config) -> ProbeReport {
-    probe_endpoint(
-        endpoint,
-        config.allow_remote_engine_adapters,
-        &config.approved_remote_adapters,
-    )
-}
-
-pub fn probe_endpoint(
-    endpoint: &EndpointConfig,
-    allow_remote_engine_adapters: bool,
-    approved_remote_adapters: &BTreeMap<String, String>,
-) -> ProbeReport {
-    match try_probe_endpoint(
-        endpoint,
-        allow_remote_engine_adapters,
-        approved_remote_adapters,
-    ) {
+pub fn probe_endpoint(endpoint: &EndpointConfig) -> ProbeReport {
+    match try_probe_endpoint(endpoint) {
         Ok(mut report) => {
             report.endpoint_slug = endpoint.slug.clone();
             report
@@ -144,18 +123,13 @@ pub fn probe_endpoint(
             model_suggestions: Vec::new(),
             error: Some(error.to_string()),
             engine: None,
-            adapter: None,
         },
     }
 }
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn try_probe_endpoint(
-    endpoint: &EndpointConfig,
-    allow_remote_engine_adapters: bool,
-    approved_remote_adapters: &BTreeMap<String, String>,
-) -> Result<ProbeReport> {
+fn try_probe_endpoint(endpoint: &EndpointConfig) -> Result<ProbeReport> {
     let url = models_url(&endpoint.base_url)?;
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(PROBE_TIMEOUT))
@@ -207,25 +181,15 @@ fn try_probe_endpoint(
         .map(|row| (row.id.clone(), row.max_model_len))
         .collect::<Vec<_>>();
     let mut engine = crate::engine::detect_engine(endpoint, &model_limits);
-    let adapter_spec = endpoint.engine_adapter.clone().or_else(|| {
-        let remote = crate::engine_adapter::load_remote_adapters().ok()?;
-        crate::engine_adapter::effective_engine_adapter(
-            endpoint,
-            &remote,
-            allow_remote_engine_adapters,
-            approved_remote_adapters,
-        )
-    });
     let model = rows.first().map(|row| row.id.as_str());
+    // A definition's reader `countRoute` joins the probe with the runtime
+    // metrics reader (C4); until then only the built-in engine routes count.
     engine.count_context = Some(crate::count_context::probe_count_context(
         endpoint,
         engine.kind,
         model,
-        adapter_spec
-            .as_ref()
-            .and_then(|spec| spec.count_route.as_deref()),
+        None,
     ));
-    let adapter = crate::engine_adapter::probe_facts_with(endpoint, adapter_spec.as_ref());
     Ok(ProbeReport {
         endpoint_slug: endpoint.slug.clone(),
         status: ProbeStatus::Online,
@@ -234,7 +198,6 @@ fn try_probe_endpoint(
         model_suggestions,
         error: None,
         engine: Some(engine),
-        adapter,
     })
 }
 
@@ -243,23 +206,17 @@ pub fn apply_probe_report(config: &mut Config, report: &ProbeReport, replace: bo
         anyhow::bail!("endpoint `{}` no longer exists", report.endpoint_slug);
     };
     // An offline probe keeps the engine facts the last online probe found,
-    // so a restarting upstream does not flap its facts. Adapter facts are
-    // kept the same way when this run produced none.
+    // so a restarting upstream does not flap its facts.
     let previous_engine = endpoint
         .last_probe
         .as_ref()
         .and_then(|probe| probe.engine.clone());
-    let previous_adapter = endpoint
-        .last_probe
-        .as_ref()
-        .and_then(|probe| probe.adapter.clone());
     if report.status == ProbeStatus::Online {
         endpoint.last_probe = Some(ProbeSnapshot {
             status: ProbeStatus::Online,
             models: report.discovered_model_ids.clone(),
             suggested_capabilities: endpoint.default_capabilities.clone(),
             engine: report.engine.clone(),
-            adapter: report.adapter.clone().or(previous_adapter),
         });
         let discovered: std::collections::HashSet<&str> = report
             .discovered_model_ids
@@ -306,7 +263,6 @@ pub fn apply_probe_report(config: &mut Config, report: &ProbeReport, replace: bo
             models: Vec::new(),
             suggested_capabilities: endpoint.default_capabilities.clone(),
             engine: previous_engine,
-            adapter: previous_adapter,
         });
     }
     Ok(())
@@ -727,7 +683,6 @@ mod tests {
                 model_suggestions: vec![],
                 error: None,
                 engine: None,
-                adapter: None,
             },
             false,
         )
@@ -785,7 +740,6 @@ mod tests {
                 }],
                 error: None,
                 engine: None,
-                adapter: None,
             },
             true,
         )

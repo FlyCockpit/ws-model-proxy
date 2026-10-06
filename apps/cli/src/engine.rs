@@ -1,6 +1,6 @@
 //! Inference engine detection and live load parsing.
 //!
-//! Detection runs at probe time (connect, reconnect, `wsmp reload`) and reads
+//! Detection runs at probe time (connect, reconnect) and reads
 //! static facts: slot count, per-slot context, KV capacity. Load sampling runs
 //! on the telemetry thread (`crate::telemetry`) and reads running/waiting
 //! counts. Every parser here is pure so recorded fixtures can test it.

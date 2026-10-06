@@ -1,4 +1,4 @@
-//! Foreground websocket relay daemon.
+//! Foreground websocket relay daemon (relay protocol 3.0).
 //!
 //! Request bodies are streamed to the upstream endpoint as they arrive over the
 //! websocket instead of being fully buffered first. Each relayed request runs on
@@ -7,9 +7,21 @@
 //! main loop: workers hand outbound frames back through a channel that the main
 //! loop drains, and the server paces request-body frames with credit-based flow
 //! control (`relay.request.body.ack`).
+//!
+//! S0 stubs (the lanes replace them, the frames stay):
+//! - runtime handles resolve against the configured endpoints by slug until
+//!   the runtime store (`runtimes.json`, C2) holds definitions;
+//! - `runtime.define` stores nothing: every version is rejected (`invalid`, or
+//!   `trust_relay` at Relay only) and the held set stays empty;
+//! - `runtime.job` fails before admission (`definition_missing`, or
+//!   `definition_frozen` at Relay only), so the rank is released;
+//! - `runtime.inventory` is one empty snapshot after `hello.ok`;
+//! - `runtime.detect` answers an empty scan (detection lands in C2);
+//! - `trust.lower` latches Relay only for this daemon and persists it through
+//!   the 0.3 command switch (config v3 `trust` lands in C1);
+//! - commands that a daemon restart interrupted are not reported as
+//!   `interrupted` yet (needs a persisted table of running ids, C3).
 
-#[cfg(unix)]
-use std::collections::HashMap;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::{self};
@@ -28,270 +40,35 @@ use tungstenite::{Message, connect};
 use url::Url;
 
 use crate::auth::{join, resolve_credential};
-use crate::config::{Config, ConfigLock, EndpointAuthMode};
+use crate::config::{Config, ConfigLock, EndpointAuthMode, McpCommandMode};
 use crate::control::ControlServer;
 #[cfg(unix)]
-use crate::control::{
-    self, ControlCommand, ControlEndpointStatus, ControlResponse, PendingRequest,
-};
-
-#[cfg(unix)]
-type PendingReload = (String, Config, Config, Option<PendingRequest>, Instant);
-#[cfg(unix)]
-// A timeout restores the previous map immediately. Keep the candidate only for
-// bounded late-ack correlation, and the previous map for late rejection.
-type TimedOutReload = (Config, Config);
-
-/// Correlation records for acknowledgement timeouts. Insertion order is kept
-/// separately so bounding this state evicts only the oldest record rather than
-/// dropping every still-relevant late acknowledgement at once.
-#[cfg(unix)]
-struct TimedOutReloads {
-    by_id: HashMap<String, TimedOutReload>,
-    order: VecDeque<String>,
-}
-
-#[cfg(unix)]
-impl TimedOutReloads {
-    fn new() -> Self {
-        Self {
-            by_id: HashMap::new(),
-            order: VecDeque::new(),
-        }
-    }
-
-    fn insert(&mut self, id: String, reload: TimedOutReload) {
-        if self.by_id.remove(&id).is_some() {
-            self.order.retain(|existing| existing != &id);
-        }
-        while self.by_id.len() >= TIMED_OUT_RELOAD_ID_CAPACITY {
-            let Some(oldest) = self.order.pop_front() else {
-                break;
-            };
-            self.by_id.remove(&oldest);
-        }
-        self.order.push_back(id.clone());
-        self.by_id.insert(id, reload);
-    }
-
-    fn remove(&mut self, id: &str) -> Option<TimedOutReload> {
-        let reload = self.by_id.remove(id)?;
-        self.order.retain(|existing| existing != id);
-        Some(reload)
-    }
-
-    fn clear_for_new_reload(&mut self) {
-        self.by_id.clear();
-        self.order.clear();
-    }
-}
+use crate::control::{self, ControlCommand, ControlResponse};
 use crate::media::{
     FetchedMedia, MEDIA_EXPAND_MAX_ASSET_BYTES, MEDIA_EXPAND_MAX_BODY_BYTES, MediaExpandError,
     TrustedOrigins, expand_media_in_body, trusted_media_urls_in_body,
 };
-use crate::probe::{ProbeReport, apply_probe_report, probe_endpoint};
 #[cfg(test)]
-use crate::protocol::parse_binary_frame;
+use crate::protocol::decode_binary_frame;
+use crate::protocol::frames::{
+    CountMethod, DefineEntryResult, DefineNodeResult, DefineRejectReason, DefineStatus, HttpMethod,
+    JobError, JobStatus, RelayUsage, SecretRefusal, SecretStatus,
+};
 use crate::protocol::{
-    CliInventory, ClientControlMessage, EndpointInventory, EndpointStatus, FrameFault,
-    ProtocolErrorCode, RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS, RELAY_PROTOCOL_VERSION,
-    RELAY_REQUEST_BODY_WINDOW_CHUNKS, RELAY_SUBPROTOCOL, RelayBinaryFrameMetadata, RelayFailure,
-    ServerControlMessage, binary_frame_fault, control_frame_fault, encode_binary_frame,
-    encode_control, hello_rejection_message, parse_server_control,
+    FrameFault, NodeBinaryMetadata, NodeFrame, ProtocolErrorCode,
+    RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS, RELAY_PROTOCOL_VERSION, RELAY_REQUEST_BODY_WINDOW_CHUNKS,
+    RELAY_SUBPROTOCOL, RelayFailure, ServerBinaryMetadata, ServerFrame, binary_frame_fault,
+    control_frame_fault, encode_binary_frame, encode_control, hello_rejection_message,
+    parse_server_control,
 };
 use crate::relay_bus::{FromWorker, WsFrame};
 use crate::sessions::{
-    DEFAULT_EXEC_TIMEOUT, ExecRegistry, OutboundFrame, TermHandshake, TerminalRegistry,
+    DEFAULT_COMMAND_MAX, ExecRegistry, OutboundFrame, TermHandshake, TerminalRegistry,
 };
 use crate::slug::generated_slug;
-use crate::startup::{self, TerminalStartup};
+use crate::startup::TerminalStartup;
+use crate::stt_wire::SttServerMessage;
 use crate::tokens::{CompletionTextCollector, standardized_completion_metrics};
-
-/// The session reactor is the sole deployment publisher. A complete snapshot
-/// must receive its durable ACK before its endpoints, then the next update.
-#[derive(Default)]
-struct DeploymentPublisher {
-    initialized: bool,
-    pending: Option<(DeploymentPublication, Instant)>,
-    watchdog: Option<PublicationWatchdog>,
-}
-
-/// One watchdog per connection enforces the absolute deadline even when a
-/// blocking TLS/plain write keeps making partial progress. It owns a clone of
-/// this exact socket, never a device name or successor connection.
-///
-/// On Windows, `shutdown` does not interrupt a send already blocked in
-/// another thread, so a stalled write there ends at the native write timeout
-/// instead. Deployments run only on Unix; a Windows node publishes just the
-/// empty snapshot, one small frame.
-type PublicationDeadlineSignals = (
-    std::sync::Mutex<(bool, Option<Instant>)>,
-    std::sync::Condvar,
-);
-struct PublicationWatchdog {
-    state: Arc<PublicationDeadlineSignals>,
-    join: Option<JoinHandle<()>>,
-}
-
-impl PublicationWatchdog {
-    fn start(stream: &tungstenite::stream::MaybeTlsStream<std::net::TcpStream>) -> Result<Self> {
-        let tcp = match stream {
-            tungstenite::stream::MaybeTlsStream::Plain(tcp) => tcp,
-            tungstenite::stream::MaybeTlsStream::Rustls(tls) => &tls.sock,
-            _ => anyhow::bail!("unsupported websocket deadline transport"),
-        }
-        .try_clone()
-        .context("cloning websocket deadline socket")?;
-        let state = Arc::new((
-            std::sync::Mutex::new((false, None::<Instant>)),
-            std::sync::Condvar::new(),
-        ));
-        let watched = state.clone();
-        let join = thread::Builder::new()
-            .name("wsmp-publication-deadline".into())
-            .spawn(move || {
-                let (lock, wake) = &*watched;
-                let Ok(mut state) = lock.lock() else {
-                    let _ = tcp.shutdown(std::net::Shutdown::Both);
-                    return;
-                };
-                loop {
-                    if state.0 {
-                        return;
-                    }
-                    if let Some(deadline) = state.1 {
-                        let now = Instant::now();
-                        if now >= deadline {
-                            let _ = tcp.shutdown(std::net::Shutdown::Both);
-                            return;
-                        }
-                        match wake.wait_timeout(state, deadline - now) {
-                            Ok((next, _)) => state = next,
-                            Err(_) => {
-                                let _ = tcp.shutdown(std::net::Shutdown::Both);
-                                return;
-                            }
-                        }
-                    } else {
-                        match wake.wait(state) {
-                            Ok(next) => state = next,
-                            Err(_) => {
-                                let _ = tcp.shutdown(std::net::Shutdown::Both);
-                                return;
-                            }
-                        }
-                    }
-                }
-            })
-            .context("starting websocket publication deadline")?;
-        Ok(Self {
-            state,
-            join: Some(join),
-        })
-    }
-
-    fn arm(&self, deadline: Option<Instant>) -> Result<()> {
-        let mut state = self
-            .state
-            .0
-            .lock()
-            .map_err(|_| anyhow::anyhow!("websocket publication deadline unavailable"))?;
-        state.1 = deadline;
-        self.state.1.notify_all();
-        Ok(())
-    }
-}
-
-impl Drop for PublicationWatchdog {
-    fn drop(&mut self) {
-        if let Ok(mut state) = self.state.0.lock() {
-            state.0 = true;
-            self.state.1.notify_all();
-        }
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
-    }
-}
-
-enum DeploymentPublication {
-    Snapshot { id: String, publish_endpoints: bool },
-    Endpoints { id: String },
-}
-
-impl DeploymentPublisher {
-    fn check_deadline(&self) -> RelaySessionResult<()> {
-        if self
-            .pending
-            .as_ref()
-            .is_some_and(|(_, deadline)| Instant::now() >= *deadline)
-        {
-            return Err(RelaySessionError::Reconnectable {
-                error: anyhow::anyhow!("deployment publication acknowledgement timed out"),
-                reset_backoff: true,
-            });
-        }
-        Ok(())
-    }
-    fn begin(&mut self, id: String, publish_endpoints: bool) -> Result<()> {
-        anyhow::ensure!(
-            self.pending.is_none(),
-            "deployment publication already pending"
-        );
-        self.initialized = true;
-        let deadline = Instant::now() + Duration::from_secs(30);
-        if let Some(watchdog) = &self.watchdog {
-            watchdog.arm(Some(deadline))?;
-        }
-        self.pending = Some((
-            DeploymentPublication::Snapshot {
-                id,
-                publish_endpoints,
-            },
-            deadline,
-        ));
-        Ok(())
-    }
-
-    fn acknowledge_snapshot(&mut self, id: &str) -> Result<bool> {
-        let Some((
-            DeploymentPublication::Snapshot {
-                id: expected,
-                publish_endpoints,
-            },
-            deadline,
-        )) = &self.pending
-        else {
-            anyhow::bail!("unexpected deployment inventory acknowledgement");
-        };
-        anyhow::ensure!(
-            expected == id && Instant::now() < *deadline,
-            "stale deployment inventory acknowledgement"
-        );
-        let publish_endpoints = *publish_endpoints;
-        if let Some(watchdog) = &self.watchdog {
-            watchdog.arm(None)?;
-        }
-        self.pending = None;
-        Ok(publish_endpoints)
-    }
-
-    fn acknowledge_endpoints(&mut self, id: &str) -> Result<()> {
-        let Some((DeploymentPublication::Endpoints { id: expected }, deadline)) = &self.pending
-        else {
-            anyhow::bail!("unexpected deployment endpoint acknowledgement");
-        };
-        anyhow::ensure!(
-            expected == id && Instant::now() < *deadline,
-            "stale deployment endpoint acknowledgement"
-        );
-        if let Some(watchdog) = &self.watchdog {
-            watchdog.arm(None)?;
-        }
-        self.pending = None;
-        Ok(())
-    }
-}
 
 const RELAY_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const RELAY_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(300);
@@ -313,12 +90,6 @@ const RELAY_MEDIA_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// event without retaining an unbounded generated response in the relay.
 const RELAY_USAGE_TAIL_MAX_BYTES: usize = 256 * 1024;
 
-#[cfg(unix)]
-const INVENTORY_ACK_TIMEOUT: Duration = Duration::from_secs(15);
-/// Avoid serially multiplying the per-endpoint probe timeout during reload
-/// while also preventing a large configuration from opening unbounded local
-/// connections.
-const INVENTORY_PROBE_CONCURRENCY: usize = 4;
 /// How often the relay loop hands the live endpoint list to the telemetry thread.
 const TELEMETRY_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 /// The async handoff owns one request chunk after a credit is returned. The
@@ -326,8 +97,6 @@ const TELEMETRY_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 /// worker has had a chance to run.
 const UPSTREAM_BODY_HANDOFF_CAPACITY: usize = 1;
 const REQUEST_BODY_INGRESS_CAPACITY: usize = RELAY_REQUEST_BODY_WINDOW_CHUNKS;
-#[cfg(unix)]
-const TIMED_OUT_RELOAD_ID_CAPACITY: usize = 64;
 
 // Request workers are synchronous threads, but their HTTP work is async. Keep
 // one process-long runtime and connection pool instead of constructing a Tokio
@@ -517,7 +286,7 @@ fn streaming_request_body(
                     if body_tx.blocking_send(Ok(data)).is_err() {
                         return;
                     }
-                    let ack = ClientControlMessage::RelayRequestBodyAck {
+                    let ack = NodeFrame::RelayRequestBodyAck {
                         request_id: request_id.clone(),
                         credits: 1,
                     };
@@ -636,45 +405,10 @@ pub fn connect_foreground() -> Result<()> {
     let startup = TerminalStartup::capture(&config)?;
     #[cfg(unix)]
     crate::file_ops::report_abandoned_recovery();
-    let mut last_inventory_revision = None;
-    // The mtime accompanies the last server-acknowledged local snapshot. It
-    // prevents an edit-and-revert from being treated as an unchanged desired
-    // inventory on reconnect.
-    let mut acknowledged_config_modified_at = None;
     let mut reconnect_delay = RELAY_RECONNECT_INITIAL_DELAY;
     loop {
         check_shutdown()?;
-        if crate::deployments::refresh_snapshot().is_err() {
-            crate::deployments::replace_snapshot(Vec::new(), Vec::new(), Vec::new());
-            tracing::warn!("deployment snapshot unavailable; publication remains closed");
-        }
-        // Reuse only a locally unchanged snapshot that the server has already
-        // acknowledged. Reconnect registration still replaces the server
-        // inventory, but no network probe or config rewrite is needed.
-        let (candidate, endpoints) = match reconnect_inventory_candidate(
-            &config,
-            last_inventory_revision.as_ref(),
-            acknowledged_config_modified_at,
-        ) {
-            Ok(candidate) => candidate,
-            Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    retry_delay_secs = reconnect_delay.as_secs(),
-                    "preparing relay inventory failed; retrying before websocket connection"
-                );
-                wait_for_reconnect(
-                    &mut control,
-                    &config,
-                    &last_inventory_revision,
-                    reconnect_delay,
-                )?;
-                reconnect_delay = next_reconnect_delay(reconnect_delay);
-                continue;
-            }
-        };
-        config = candidate;
-        let cli_slug = ensure_cli_slug(&mut config)?;
+        let node_slug = ensure_cli_slug(&mut config)?;
         let credential = match resolve_credential(&config) {
             Ok(credential) => credential,
             // Definitely no credential: stop only where nothing restarts us in
@@ -692,12 +426,7 @@ pub fn connect_foreground() -> Result<()> {
                     retry_delay_secs = reconnect_delay.as_secs(),
                     "relay credential unavailable; retrying"
                 );
-                wait_for_reconnect(
-                    &mut control,
-                    &config,
-                    &last_inventory_revision,
-                    reconnect_delay,
-                )?;
+                wait_for_reconnect(&mut control, &startup, &node_slug, reconnect_delay)?;
                 reconnect_delay = next_reconnect_delay(reconnect_delay);
                 continue;
             }
@@ -716,14 +445,12 @@ pub fn connect_foreground() -> Result<()> {
 
         tracing::info!(url = %ws_url, "connecting relay websocket");
         match run_relay_session(
-            &mut config,
+            &config,
             &startup,
-            &cli_slug,
+            &node_slug,
             &ws_url,
             auth_value,
-            endpoints,
             &mut control,
-            &mut last_inventory_revision,
         ) {
             Ok(()) => {
                 tracing::warn!(
@@ -750,339 +477,129 @@ pub fn connect_foreground() -> Result<()> {
                 return Err(crate::shutdown::ShutdownRequested { signal }.into());
             }
         }
-        acknowledged_config_modified_at =
-            acknowledged_inventory_matches_config(&config, last_inventory_revision.as_ref())
-                .then(config_file_modified_at)
-                .transpose()?;
-        wait_for_reconnect(
-            &mut control,
-            &config,
-            &last_inventory_revision,
-            reconnect_delay,
-        )?;
-        // Do not replace the live routing snapshot from disk during reconnect.
-        // A local file write is only desired state; replacing this map before a
-        // durable inventory acknowledgement would route requests through an
-        // unpublished candidate. `reload` owns candidate loading and swaps it
-        // only after `inventory.ok`.
+        wait_for_reconnect(&mut control, &startup, &node_slug, reconnect_delay)?;
+        // Endpoint edits apply on reconnect (hot reload lands with config v3).
+        match Config::load_required().and_then(|fresh| fresh.validate().map(|()| fresh)) {
+            Ok(fresh) => config = fresh,
+            Err(error) => tracing::warn!(
+                error = %format!("{error:#}"),
+                "re-reading the config failed; keeping the previous one"
+            ),
+        }
         reconnect_delay = next_reconnect_delay(reconnect_delay);
     }
 }
 
-fn load_reconnect_candidate(active: &Config) -> Result<(Config, SystemTime)> {
-    let _lock = ConfigLock::exclusive()?;
-    let candidate = Config::load_required()?;
-    candidate.validate()?;
-    if candidate.server_url != active.server_url
-        || candidate.public_origin != active.public_origin
-        || candidate.cli_slug != active.cli_slug
-        || candidate.cli_token_env != active.cli_token_env
-    {
-        anyhow::bail!(
-            "server URL, public origin, CLI slug, or credential source changed; restart the relay to apply it"
-        );
+/// The trust word `wsmp status` shows.
+fn trust_word(startup: &TerminalStartup) -> &'static str {
+    if startup.full_control() {
+        "full"
+    } else {
+        "relay"
     }
-    Ok((candidate, config_file_modified_at()?))
-}
-
-fn config_file_modified_at() -> Result<SystemTime> {
-    let path = crate::paths::config_file()?;
-    std::fs::metadata(&path)
-        .with_context(|| format!("reading config metadata `{}`", path.display()))?
-        .modified()
-        .with_context(|| format!("reading config modification time `{}`", path.display()))
-}
-
-fn inventory_snapshot_from_config(config: &Config) -> Vec<EndpointInventory> {
-    let remote = crate::engine_adapter::load_remote_adapters().unwrap_or_default();
-    inventory_snapshot_from_config_with_remote(config, &remote)
-}
-
-fn inventory_snapshot_from_config_with_remote(
-    config: &Config,
-    remote: &[crate::protocol::RemoteEngineAdapter],
-) -> Vec<EndpointInventory> {
-    let mut endpoints = config
-        .endpoints
-        .iter()
-        .filter(|endpoint| endpoint.enabled)
-        .map(|endpoint| {
-            let status = match endpoint.last_probe.as_ref().map(|probe| &probe.status) {
-                Some(crate::config::ProbeStatus::Online) => EndpointStatus::Online,
-                Some(crate::config::ProbeStatus::Offline) => EndpointStatus::Offline,
-                None => EndpointStatus::Unknown,
-            };
-            let adapter = crate::engine_adapter::effective_engine_adapter(
-                endpoint,
-                remote,
-                config.allow_remote_engine_adapters,
-                &config.approved_remote_adapters,
-            );
-            crate::protocol::endpoint_inventory_with(endpoint, status, adapter.as_ref())
-        })
-        .collect::<Vec<_>>();
-    endpoints.extend(crate::deployments::managed_inventory());
-    endpoints
-}
-
-fn acknowledged_inventory_matches_config(
-    config: &Config,
-    revision: Option<&crate::protocol::InventoryRevision>,
-) -> bool {
-    revision.is_some_and(|value| {
-        value.inventory_digest
-            == crate::protocol::inventory_digest(&inventory_snapshot_from_config(config))
-    })
-}
-
-fn should_reuse_reconnect_inventory(
-    active: &Config,
-    desired: &Config,
-    acknowledged_modified_at: Option<SystemTime>,
-    desired_modified_at: SystemTime,
-    revision: Option<&crate::protocol::InventoryRevision>,
-) -> bool {
-    same_desired_config(active, desired)
-        && acknowledged_modified_at == Some(desired_modified_at)
-        && acknowledged_inventory_matches_config(active, revision)
-}
-
-fn reconnect_inventory_candidate(
-    active: &Config,
-    revision: Option<&crate::protocol::InventoryRevision>,
-    acknowledged_modified_at: Option<SystemTime>,
-) -> Result<(Config, Vec<EndpointInventory>)> {
-    let (desired, desired_modified_at) = load_reconnect_candidate(active)?;
-    if should_reuse_reconnect_inventory(
-        active,
-        &desired,
-        acknowledged_modified_at,
-        desired_modified_at,
-        revision,
-    ) {
-        return Ok(config_with_fresh_engine_facts(active));
-    }
-    prepare_inventory_candidate(active)
-}
-
-/// Whether two configs are the same desired snapshot. Detected engine facts
-/// are left out: the reconnect fast path refreshes them in memory only (they
-/// are digest-excluded), so the running config may carry newer facts than
-/// the file without being a different desired inventory.
-fn same_desired_config(left: &Config, right: &Config) -> bool {
-    let without_engine_facts = |config: &Config| {
-        let mut config = config.clone();
-        for endpoint in &mut config.endpoints {
-            if let Some(probe) = endpoint.last_probe.as_mut() {
-                probe.engine = None;
-                probe.adapter = None;
-            }
-        }
-        config
-    };
-    left == right || without_engine_facts(left) == without_engine_facts(right)
-}
-
-/// The reconnect config and inventory for an unchanged, acknowledged
-/// snapshot, with engine facts re-detected (an engine may have restarted with
-/// other slots, or become detectable). The returned config carries the same
-/// facts as the inventory, so the session's load sampler scrapes the engine
-/// the hello advertises. Facts are digest-excluded, so this never changes the
-/// acknowledged identity, and nothing is written to the config file.
-fn config_with_fresh_engine_facts(active: &Config) -> (Config, Vec<EndpointInventory>) {
-    let mut refreshed = active.clone();
-    let remote = crate::engine_adapter::load_remote_adapters().unwrap_or_default();
-    let targets = refreshed
-        .endpoints
-        .iter()
-        .enumerate()
-        .filter(|(_, endpoint)| {
-            endpoint.enabled
-                && (endpoint.engine != crate::config::EndpointEngine::Generic
-                    || crate::engine_adapter::effective_engine_adapter(
-                        endpoint,
-                        &remote,
-                        active.allow_remote_engine_adapters,
-                        &active.approved_remote_adapters,
-                    )
-                    .is_some())
-                && endpoint
-                    .last_probe
-                    .as_ref()
-                    .is_some_and(|probe| probe.status == crate::config::ProbeStatus::Online)
-        })
-        .map(|(index, endpoint)| (index, endpoint.clone()))
-        .collect::<Vec<_>>();
-    for batch in targets.chunks(INVENTORY_PROBE_CONCURRENCY) {
-        let detected = thread::scope(|scope| {
-            let handles = batch
-                .iter()
-                .map(|(index, endpoint)| {
-                    (
-                        *index,
-                        scope.spawn(move || {
-                            let previous = endpoint
-                                .last_probe
-                                .as_ref()
-                                .and_then(|probe| probe.engine.as_ref());
-                            let models = endpoint
-                                .last_probe
-                                .as_ref()
-                                .map(|probe| probe.models.clone())
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(|id| {
-                                    let limit = previous
-                                        .and_then(|engine| engine.model_max_len.get(&id).copied());
-                                    (id, limit)
-                                })
-                                .collect::<Vec<_>>();
-                            crate::engine::detect_engine(endpoint, &models)
-                        }),
-                    )
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .filter_map(|(index, handle)| handle.join().ok().map(|engine| (index, engine)))
-                .collect::<Vec<_>>()
-        });
-        for (index, mut engine) in detected {
-            // A failed re-detection keeps the facts the last probe found.
-            if re_detection_replaces_stored(&engine)
-                && let Some(probe) = refreshed.endpoints[index].last_probe.as_mut()
-            {
-                preserve_count_context(probe.engine.as_ref(), &mut engine);
-                probe.engine = Some(engine);
-            }
-            let spec = crate::engine_adapter::effective_engine_adapter(
-                &refreshed.endpoints[index],
-                &remote,
-                active.allow_remote_engine_adapters,
-                &active.approved_remote_adapters,
-            );
-            if let Some(facts) =
-                crate::engine_adapter::probe_facts_with(&refreshed.endpoints[index], spec.as_ref())
-                && let Some(probe) = refreshed.endpoints[index].last_probe.as_mut()
-            {
-                probe.adapter = Some(facts);
-            }
-        }
-    }
-    let inventory = inventory_snapshot_from_config(&refreshed);
-    (refreshed, inventory)
-}
-
-/// Whether a fast-path re-detection should replace the stored engine facts.
-/// The `model_max_len` map is seeded from the stored snapshot (the fast path
-/// never fetches `/v1/models`), so its emptiness says nothing about the probe
-/// result. A re-detection that found no kind found no facts of its own and
-/// must not wipe what the last full probe stored. Mirrors
-/// [`crate::probe::apply_probe_report`], which keeps previous facts on an
-/// offline probe. Kept facts are re-sent as they are, and the server stamps
-/// `engineFactsAt` on every hello that carries facts, so that timestamp means
-/// "last reported", not "last measured": kept facts stay until the next
-/// successful detection (this fast path, a reload or a full probe).
-fn re_detection_replaces_stored(engine: &crate::engine::DetectedEngine) -> bool {
-    engine.kind.is_some()
-}
-
-/// Keep the probed count-context fact across reconnect when the engine kind
-/// did not change. Detection never sets `count_context`.
-fn preserve_count_context(
-    previous: Option<&crate::engine::DetectedEngine>,
-    next: &mut crate::engine::DetectedEngine,
-) {
-    if previous.and_then(|engine| engine.kind) == next.kind {
-        next.count_context = previous.and_then(|engine| engine.count_context);
-    }
-}
-
-/// Probe a stable desired snapshot without holding the config lock across
-/// network I/O. Before persisting the probe results, reacquire the lock and
-/// ensure no standalone mutation replaced the snapshot. This avoids both lost
-/// updates and a long-held lock that would make control status wait on probes.
-fn prepare_inventory_candidate(active: &Config) -> Result<(Config, Vec<EndpointInventory>)> {
-    let (mut candidate, _) = load_reconnect_candidate(active)?;
-    let desired_before_probe = candidate.clone();
-    let inventory = inventory_from_config(&mut candidate);
-
-    let _lock = ConfigLock::exclusive()?;
-    let current = Config::load_required()?;
-    if current != desired_before_probe {
-        anyhow::bail!(
-            "local endpoint configuration changed while probing; retry reload so the final desired snapshot can be published"
-        );
-    }
-    candidate.save()?;
-    Ok((candidate, inventory))
 }
 
 #[cfg(unix)]
+fn status_response<'a>(
+    startup: &TerminalStartup,
+    node_slug: &'a str,
+    connection: &'a str,
+) -> ControlResponse<'a> {
+    ControlResponse {
+        ok: true,
+        state: "running",
+        message: None,
+        connection: Some(connection),
+        node: Some(node_slug),
+        trust: Some(trust_word(startup)),
+    }
+}
+
+/// Answer `wsmp status` while the relay is connected or reconnecting.
+#[cfg(unix)]
+fn answer_control_requests(
+    control: &mut ControlServer,
+    startup: &TerminalStartup,
+    node_slug: &str,
+    connection: &str,
+) -> Result<()> {
+    for pending in control.drain()? {
+        match pending.request.command {
+            ControlCommand::Status => {
+                let _ = control::respond(pending, &status_response(startup, node_slug, connection));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn answer_control_requests(
+    _control: &mut ControlServer,
+    _startup: &TerminalStartup,
+    _node_slug: &str,
+    _connection: &str,
+) -> Result<()> {
+    Ok(())
+}
+
 fn wait_for_reconnect(
     control: &mut ControlServer,
-    config: &Config,
-    revision: &Option<crate::protocol::InventoryRevision>,
+    startup: &TerminalStartup,
+    node_slug: &str,
     delay: Duration,
 ) -> Result<()> {
     let deadline = Instant::now() + delay;
     while Instant::now() < deadline {
         check_shutdown()?;
-        for pending in control.drain()? {
-            if matches!(pending.request.command, ControlCommand::Status) {
-                let desired = desired_config_snapshot().unwrap_or_else(|error| {
-                    tracing::warn!(error = %error, "reading desired config for relay status");
-                    config.clone()
-                });
-                let response =
-                    live_status_response(&desired, revision.as_ref(), "reconnecting", None);
-                let _ = control::respond(pending, &response);
-                continue;
-            }
-            let response = ControlResponse {
-                ok: false,
-                state: "reconnecting",
-                message: Some("relay websocket is reconnecting; retry reload after it registers"),
-                endpoints: None,
-                inventory_seq: None,
-                connection: Some("reconnecting"),
-                desired_inventory_digest: None,
-                config_modified_at_ms: None,
-                desired_endpoints: None,
-                inventory_digest: None,
-                inventory_acknowledged_at: None,
-            };
-            let _ = control::respond(pending, &response);
-        }
+        answer_control_requests(control, startup, node_slug, "reconnecting")?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         thread::sleep(remaining.min(Duration::from_millis(100)));
     }
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn wait_for_reconnect(
-    _control: &mut ControlServer,
-    _config: &Config,
-    _revision: &Option<crate::protocol::InventoryRevision>,
-    delay: Duration,
-) -> Result<()> {
-    thread::sleep(delay);
-    check_shutdown()
+/// Everything one relay connection owns. Dropping it ends every terminal,
+/// command, file op and speech session it started.
+struct Session {
+    worker_tx: SyncSender<FromWorker>,
+    workers: BTreeMap<String, WorkerHandle>,
+    recent_finished: RecentlyFinished,
+    terminals: TerminalRegistry,
+    execs: ExecRegistry,
+    stt: crate::stt::SttRegistry,
+    #[cfg(unix)]
+    files: crate::file_relay::FileRelay,
+    registered: bool,
+    telemetry: Option<crate::telemetry::Telemetry>,
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The hello `features`, with the names of the node's secrets.
+fn node_features(startup: &TerminalStartup) -> crate::protocol::runtime_spec::NodeFeatures {
+    let mut features = startup.features();
+    features.secrets = crate::secrets::entries();
+    features
+}
+
+/// The endpoints that stand in for runtime handles until the runtime store
+/// lands (C2): enabled endpoints, keyed by slug.
+fn enabled_endpoints(config: &Config) -> Vec<crate::config::EndpointConfig> {
+    config
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.enabled)
+        .cloned()
+        .collect()
+}
+
 fn run_relay_session(
-    config: &mut Config,
+    config: &Config,
     startup: &TerminalStartup,
-    cli_slug: &str,
+    node_slug: &str,
     ws_url: &Url,
     auth_value: HeaderValue,
-    endpoints: Vec<EndpointInventory>,
-    _control: &mut ControlServer,
-    last_inventory_revision: &mut Option<crate::protocol::InventoryRevision>,
+    control: &mut ControlServer,
 ) -> RelaySessionResult<()> {
-    let mut remote_adapters = crate::engine_adapter::load_remote_adapters().unwrap_or_default();
     let mut request = ws_url
         .as_str()
         .into_client_request()
@@ -1101,7 +618,7 @@ fn run_relay_session(
         != Some(RELAY_SUBPROTOCOL)
     {
         return Err(RelaySessionError::Fatal(anyhow::anyhow!(
-            "server did not accept relay websocket subprotocol `{RELAY_SUBPROTOCOL}`"
+            "server did not accept relay websocket subprotocol `{RELAY_SUBPROTOCOL}`; upgrade the WS Model Proxy server"
         )));
     }
     set_socket_timeouts(
@@ -1116,89 +633,58 @@ fn run_relay_session(
 
     // Created before hello so an early `?` still drops (and kills) every child.
     let (worker_tx, worker_rx) = mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
-    let mut terminals = TerminalRegistry::new(worker_tx.clone());
-    let mut execs = ExecRegistry::new(worker_tx.clone(), DEFAULT_EXEC_TIMEOUT);
-    // 2.4 live speech-to-text sessions; dropping the registry ends them all.
-    let mut stt = crate::stt::SttRegistry::new(worker_tx.clone());
-    // 2.8 node file ops run on the daemon's file pool, never on this loop; the
-    // relay keeps only the ops it has pending. Dropping it cancels them all.
-    #[cfg(unix)]
-    let mut files = {
-        let runtime = crate::file_relay::shared_runtime(
-            startup.allow_file_tools_as_root(),
-            startup.file_roots(),
-        );
-        terminals.set_file_runtime(Arc::clone(&runtime));
-        let tx = worker_tx.clone();
-        let sink: crate::file_relay::FileSink = Arc::new(move |op_id, frames| {
-            let _ = tx.send(FromWorker::FileFrames { op_id, frames });
-        });
-        crate::file_relay::FileRelay::new(
-            runtime,
-            startup.mcp_command_mode(),
-            startup.mcp_file_read(),
-            sink,
-        )
+    let mut session = Session {
+        worker_tx: worker_tx.clone(),
+        workers: BTreeMap::new(),
+        recent_finished: RecentlyFinished::new(),
+        terminals: TerminalRegistry::new(worker_tx.clone()),
+        execs: ExecRegistry::new(worker_tx.clone(), DEFAULT_COMMAND_MAX),
+        // Live speech-to-text sessions; dropping the registry ends them all.
+        stt: crate::stt::SttRegistry::new(worker_tx.clone()),
+        // Node file ops run on the daemon's file pool, never on this loop;
+        // the relay keeps only the ops it has pending.
+        #[cfg(unix)]
+        files: {
+            let runtime = crate::file_relay::shared_runtime(
+                startup.allow_file_tools_as_root(),
+                startup.file_roots(),
+            );
+            let tx = worker_tx.clone();
+            let sink: crate::file_relay::FileSink = Arc::new(move |op_id, frames| {
+                let _ = tx.send(FromWorker::FileFrames { op_id, frames });
+            });
+            crate::file_relay::FileRelay::new(runtime, startup.full_control(), sink)
+        },
+        registered: false,
+        telemetry: None,
     };
 
     let server_url = config.server_url.as_deref().unwrap_or_default();
     let hello_origin = config.hello_origin().map_err(RelaySessionError::Fatal)?;
     let identity = startup.identity().ok_or_else(|| {
         RelaySessionError::Fatal(anyhow::anyhow!(
-            "CLI identity key is unavailable; cannot bind this device"
+            "CLI identity key is unavailable; cannot bind this node"
         ))
     })?;
     let (nonce, origin) = wait_for_hello_challenge(&mut socket)?;
     check_hello_origin(&origin, &hello_origin, server_url)?;
     let identity_signature = identity
-        .sign_hello(&nonce, cli_slug, &origin)
+        .sign_hello(&nonce, node_slug, &origin)
         .map_err(RelaySessionError::Fatal)?;
-    let hello = ClientControlMessage::Hello {
+    let hello = NodeFrame::Hello {
         id: next_id("hello"),
-        protocol_version: crate::protocol::RELAY_PROTOCOL_VERSION.to_string(),
-        cli: CliInventory {
-            slug: cli_slug.to_string(),
-            hostname: crate::hostname::reported_hostname(),
-            identity_public_key: identity.public_b64url(),
-            identity_signature,
-            version: Some(env!("CARGO_PKG_VERSION").to_string()),
-            capabilities: startup::hello_capabilities(startup, config, cli_slug),
-        },
-        endpoints,
+        protocol_version: RELAY_PROTOCOL_VERSION.to_string(),
+        node: startup.hello_node(node_slug, identity_signature),
+        trust: startup.trust(),
+        features: node_features(startup),
+        // Nothing is held until the runtime store lands (C2).
+        definitions: Vec::new(),
+        held_metric_commands_hash: None,
+        held_port_range: None,
+        held_fabrics_hash: None,
     };
-    let hello = encode_control(&hello).map_err(RelaySessionError::Fatal)?;
-    socket
-        .send(Message::Text(hello.into()))
-        .map_err(|error| websocket_session_error(error, "sending relay hello", false))?;
+    send_control(&mut socket, &hello, "sending relay hello")?;
 
-    let mut workers = BTreeMap::<String, WorkerHandle>::new();
-    let mut recent_finished = RecentlyFinished::new();
-    #[cfg(unix)]
-    // The candidate is adopted before `inventory.update` leaves this process.
-    // That closes the server-persisted/CLI-old-map routing window; rejection
-    // and acknowledgement timeout restore the prior acknowledged map. A late
-    // matching acknowledgement is the only timeout recovery that adopts it.
-    let mut pending_reload: Option<PendingReload> = None;
-    #[cfg(unix)]
-    let mut timed_out_reload_candidates = TimedOutReloads::new();
-    #[cfg(unix)]
-    let mut rejected_inventory_digest: Option<String> = None;
-    #[cfg(unix)]
-    let mut pending_preparation: Option<PendingRequest> = None;
-    #[cfg(unix)]
-    let mut reload_preparing = false;
-
-    let mut registered = false;
-    let mut deployment_publisher = DeploymentPublisher {
-        watchdog: Some(
-            PublicationWatchdog::start(socket.get_ref()).map_err(RelaySessionError::Fatal)?,
-        ),
-        ..Default::default()
-    };
-    #[cfg(unix)]
-    let deployment_runner = crate::deployments::service::Runner::start().ok();
-    // 2.7 telemetry starts after `hello.ok` and stops with this session.
-    let mut telemetry: Option<crate::telemetry::Telemetry> = None;
     let mut next_telemetry_sync = Instant::now();
     let mut next_heartbeat =
         Instant::now() + Duration::from_secs(RELAY_CLIENT_HEARTBEAT_INTERVAL_SECS);
@@ -1206,201 +692,48 @@ fn run_relay_session(
         if let Some(signal) = crate::shutdown::requested() {
             break 'session Err(RelaySessionError::Shutdown(signal));
         }
-        if let Err(error) = deployment_publisher.check_deadline() {
-            break 'session Err(error);
-        }
-        if registered && !deployment_publisher.initialized {
-            let snapshot = match crate::deployments::instances_frames() {
-                Ok(snapshot) => snapshot,
-                Err(error) => break 'session Err(RelaySessionError::Fatal(error)),
-            };
-            if let Err(error) = deployment_publisher.begin(snapshot.id, false) {
-                break 'session Err(RelaySessionError::Fatal(error));
-            }
-            for text in snapshot.frames {
-                if let Err(error) = deployment_publisher.check_deadline() {
-                    break 'session Err(error);
-                }
-                if let Err(error) = socket.send(Message::Text(text.into())) {
-                    break 'session Err(websocket_session_error(
-                        error,
-                        "reporting deployment instances",
-                        true,
-                    ));
-                }
-            }
-        }
-        #[cfg(unix)]
-        if registered
-            && deployment_publisher.pending.is_none()
-            && let Some(runner) = deployment_runner.as_ref()
-            && let Some(update) = runner.try_update()
-        {
-            crate::deployments::replace_snapshot(
-                update.instances,
-                update.published,
-                update.endpoints,
-            );
-            let frames = (|| -> RelaySessionResult<()> {
-                if let Some(result) = update.result {
-                    // A failed stop leaves its endpoint serving.
-                    if result.status == "failed" {
-                        stt.stop_failed(&result.step_id);
-                    } else if result.status == "succeeded" {
-                        // A start that arrived meanwhile may take sessions again.
-                        stt.stop_finished(&result.step_id);
-                    }
-                    send_deployment_result(&mut socket, &result)?;
-                }
-                if let Some(open) = update.operator {
-                    // The step is durable; only a person can run it now.
-                    match terminals.spawn_operator(config, &open) {
-                        Ok(frames) => send_outbound_frames(&mut socket, frames)?,
-                        // Retryable: the step still waits for its person; a
-                        // reopen dispatches a new terminal.
-                        Err(code) => {
-                            if let Some(result) =
-                                crate::deployments::JobResult::operator_failed(&open.job, code)
-                            {
-                                send_deployment_result(&mut socket, &result)?;
-                            }
-                        }
-                    }
-                }
-                let snapshot =
-                    crate::deployments::instances_frames().map_err(RelaySessionError::Fatal)?;
-                deployment_publisher
-                    .begin(snapshot.id, true)
-                    .map_err(RelaySessionError::Fatal)?;
-                for text in snapshot.frames {
-                    deployment_publisher.check_deadline()?;
-                    socket.send(Message::Text(text.into())).map_err(|error| {
-                        websocket_session_error(error, "sending deployment instances", true)
-                    })?;
-                }
-                Ok(())
-            })();
-            if let Err(error) = frames {
-                break 'session Err(error);
-            }
-        }
-        if let Err(error) = drain_worker_output(
-            &mut socket,
-            config,
-            &worker_rx,
-            startup,
-            &mut workers,
-            &mut recent_finished,
-            #[cfg(unix)]
-            &mut terminals,
-            &mut execs,
-            #[cfg(unix)]
-            &mut files,
-            #[cfg(unix)]
-            &mut reload_preparing,
-            #[cfg(unix)]
-            &mut pending_preparation,
-            #[cfg(unix)]
-            &mut pending_reload,
-            &mut stt,
-        ) {
+        if let Err(error) = drain_worker_output(&mut socket, &worker_rx, &mut session) {
             break Err(error);
         }
         let now = Instant::now();
-        if let Err(error) =
-            send_outbound_frames(&mut socket, terminals.poll_with_startup(startup, now))
-        {
+        #[cfg(unix)]
+        if let Err(error) = send_outbound_frames(&mut socket, session.terminals.poll(now)) {
+            break Err(error);
+        }
+        if let Err(error) = send_outbound_frames(&mut socket, session.execs.poll(now)) {
+            break Err(error);
+        }
+        let stt_frames = session.stt.poll(now, || enabled_endpoints(config));
+        if let Err(error) = send_stt_frames(&mut socket, &mut session.stt, stt_frames) {
             break Err(error);
         }
         #[cfg(unix)]
-        if let Err(error) = forward_operator_events(&mut socket, &mut terminals, &mut stt) {
+        if let Err(error) = send_file_frames(&mut socket, session.files.expire_stale(now)) {
             break Err(error);
         }
-        if let Err(error) = send_outbound_frames(&mut socket, execs.poll(now)) {
-            break Err(error);
+        let connection = if session.registered {
+            "connected"
+        } else {
+            "registering"
+        };
+        if let Err(error) = answer_control_requests(control, startup, node_slug, connection) {
+            break Err(RelaySessionError::Fatal(error));
         }
-        let stt_frames = stt.poll(now, crate::deployments::managed_endpoints);
-        if let Err(error) = send_stt_frames(&mut socket, &mut stt, stt_frames) {
-            break Err(error);
-        }
-        #[cfg(unix)]
-        if let Err(error) = send_file_frames(&mut socket, files.expire_stale(now)) {
-            break Err(error);
-        }
-
-        #[cfg(unix)]
-        if pending_reload
-            .as_ref()
-            .is_some_and(|(_, _, _, _, deadline)| Instant::now() >= *deadline)
-            && let Some((id, candidate, previous, pending, _)) = pending_reload.take()
-        {
-            if let Some(pending) = pending {
-                let _ = control::respond(
-                    pending,
-                    &ControlResponse {
-                        ok: false,
-                        state: "publish_uncertain",
-                        message: Some("timed out waiting for inventory acknowledgement"),
-                        endpoints: None,
-                        inventory_seq: None,
-                        connection: Some("connected"),
-                        desired_inventory_digest: None,
-                        config_modified_at_ms: None,
-                        desired_endpoints: None,
-                        inventory_digest: None,
-                        inventory_acknowledged_at: None,
-                    },
-                );
-            }
-            // `published` means durably acknowledged. A timeout therefore
-            // restores the previous acknowledged routes immediately rather
-            // than leaving removed slugs executable indefinitely. Keep only
-            // a bounded correlation record: a late `inventory.ok` can make
-            // the exact candidate live, while a late rejection confirms the
-            // already-restored previous map.
-            restore_previous_routing_after_timeout(config, &previous);
-            timed_out_reload_candidates.insert(id, (candidate, previous));
-        }
-
-        #[cfg(unix)]
-        if let Err(error) = handle_control_requests(
-            _control,
-            &mut socket,
-            config,
-            last_inventory_revision,
-            &mut pending_reload,
-            &mut timed_out_reload_candidates,
-            &mut pending_preparation,
-            &mut reload_preparing,
-            &mut rejected_inventory_digest,
-            &worker_tx,
-        ) {
-            break Err(error);
-        }
-
-        if registered && Instant::now() >= next_telemetry_sync {
-            let mut telemetry_endpoints = config.endpoints.clone();
-            telemetry_endpoints.extend(crate::deployments::managed_endpoints());
-            // Follow acknowledged reloads: the sampled endpoints are the live
-            // routing map's.
-            match telemetry.as_ref() {
-                Some(telemetry) => telemetry.set_endpoints(&telemetry_endpoints),
+        if session.registered && Instant::now() >= next_telemetry_sync {
+            let endpoints = enabled_endpoints(config);
+            match session.telemetry.as_ref() {
+                Some(telemetry) => telemetry.set_endpoints(&endpoints),
                 None => {
-                    telemetry = Some(crate::telemetry::Telemetry::start(
+                    session.telemetry = Some(crate::telemetry::Telemetry::start(
                         worker_tx.clone(),
-                        &telemetry_endpoints,
-                        crate::metric_sources::RunnerSettings::from_environment(
-                            startup.allow_remote_metric_sources(),
-                        ),
-                        startup.allow_remote_engine_adapters(),
+                        &endpoints,
                     ));
                 }
             }
             next_telemetry_sync = Instant::now() + TELEMETRY_SYNC_INTERVAL;
         }
-
-        if registered && Instant::now() >= next_heartbeat {
-            let heartbeat = ClientControlMessage::Heartbeat {
+        if session.registered && Instant::now() >= next_heartbeat {
+            let heartbeat = NodeFrame::Heartbeat {
                 id: next_id("heartbeat"),
                 sent_at: None,
             };
@@ -1412,42 +745,10 @@ fn run_relay_session(
         }
 
         let outcome = match socket.read() {
-            Ok(Message::Text(text)) => handle_text(
-                &mut socket,
-                config,
-                startup,
-                last_inventory_revision,
-                #[cfg(unix)]
-                &mut pending_reload,
-                #[cfg(unix)]
-                &mut timed_out_reload_candidates,
-                #[cfg(unix)]
-                &mut rejected_inventory_digest,
-                &text,
-                &worker_tx,
-                &mut workers,
-                &mut recent_finished,
-                &mut terminals,
-                &mut execs,
-                #[cfg(unix)]
-                &mut files,
-                &mut registered,
-                &mut deployment_publisher,
-                telemetry.as_ref(),
-                &mut remote_adapters,
-                &mut stt,
-            ),
-            Ok(Message::Binary(bytes)) => handle_binary(
-                &mut socket,
-                &bytes,
-                startup,
-                (&mut workers, &mut recent_finished),
-                &mut terminals,
-                &mut execs,
-                #[cfg(unix)]
-                &mut files,
-                &mut stt,
-            ),
+            Ok(Message::Text(text)) => {
+                handle_text(&mut socket, config, startup, &mut session, &text)
+            }
+            Ok(Message::Binary(bytes)) => handle_binary(&mut socket, &bytes, &mut session),
             Ok(Message::Close(frame)) => {
                 tracing::warn!(?frame, "relay websocket closed by server");
                 Err(RelaySessionError::Reconnectable {
@@ -1467,66 +768,25 @@ fn run_relay_session(
                 true,
             )),
         };
-        if let Err(error) = deployment_publisher.check_deadline() {
-            break Err(error);
-        }
         if let Err(error) = outcome {
             break Err(error);
         }
     };
 
-    #[cfg(unix)]
-    if let Some(pending) = pending_preparation.take() {
-        let _ = control::respond(
-            pending,
-            &ControlResponse {
-                ok: false,
-                state: "reconnecting",
-                message: Some("relay disconnected while preparing inventory reload"),
-                endpoints: None,
-                inventory_seq: None,
-                connection: Some("disconnected"),
-                desired_inventory_digest: None,
-                config_modified_at_ms: None,
-                desired_endpoints: None,
-                inventory_digest: None,
-                inventory_acknowledged_at: None,
-            },
-        );
-    }
-    #[cfg(unix)]
-    if let Some((_, _, _, Some(pending), _)) = pending_reload.take() {
-        let _ = control::respond(
-            pending,
-            &ControlResponse {
-                ok: false,
-                state: "publish_uncertain",
-                message: Some("relay disconnected before inventory acknowledgement"),
-                endpoints: None,
-                inventory_seq: None,
-                connection: Some("disconnected"),
-                desired_inventory_digest: None,
-                config_modified_at_ms: None,
-                desired_endpoints: None,
-                inventory_digest: None,
-                inventory_acknowledged_at: None,
-            },
-        );
-    }
     // Stops the sampling thread; a scrape in flight finishes on its own.
-    drop(telemetry);
-    let _ = send_outbound_frames(&mut socket, terminals.kill_all());
-    let _ = send_outbound_frames(&mut socket, execs.kill_all());
+    drop(session.telemetry.take());
+    let _ = send_outbound_frames(&mut socket, session.terminals.kill_all());
+    let _ = send_outbound_frames(&mut socket, session.execs.kill_all());
     // In-flight file ops are cancelled; their results are dropped.
     #[cfg(unix)]
-    files.cancel_all();
+    session.files.cancel_all();
     // The server fails these sessions itself when the relay drops.
-    stt.abort_all();
-    abort_all_workers(workers);
+    session.stt.abort_all();
+    abort_all_workers(std::mem::take(&mut session.workers));
     let result = settle_after_shutdown(result, crate::shutdown::requested());
     if matches!(result, Err(RelaySessionError::Shutdown(_))) {
         // The connection is still open: say goodbye so the server marks the
-        // CLI offline now instead of waiting for a heartbeat timeout. The
+        // node offline now instead of waiting for a heartbeat timeout. The
         // shutdown deadline bounds a peer that never answers.
         let _ = socket.close(Some(tungstenite::protocol::CloseFrame {
             code: tungstenite::protocol::frame::coding::CloseCode::Away,
@@ -1590,34 +850,21 @@ fn worker_frame_is_current(workers: &BTreeMap<String, WorkerHandle>, request_id:
     workers.contains_key(request_id)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn drain_worker_output<S>(
     socket: &mut tungstenite::WebSocket<S>,
-    _config: &mut Config,
     worker_rx: &Receiver<FromWorker>,
-    startup: &TerminalStartup,
-    workers: &mut BTreeMap<String, WorkerHandle>,
-    recent_finished: &mut RecentlyFinished,
-    #[cfg(unix)] terminals: &mut TerminalRegistry,
-    execs: &mut ExecRegistry,
-    #[cfg(unix)] files: &mut crate::file_relay::FileRelay,
-    #[cfg(unix)] reload_preparing: &mut bool,
-    #[cfg(unix)] pending_preparation: &mut Option<PendingRequest>,
-    #[cfg(unix)] pending_reload: &mut Option<PendingReload>,
-    stt: &mut crate::stt::SttRegistry,
+    session: &mut Session,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
 {
-    #[cfg(not(unix))]
-    let _ = startup;
     loop {
         match worker_rx.try_recv() {
             Ok(FromWorker::Send { request_id, frame }) => {
                 // A cancellation removes the live handle before acknowledging
                 // it. Suppress any racing worker frame already queued behind
                 // that cancellation so cancelled requests never complete late.
-                if !worker_frame_is_current(workers, &request_id) {
+                if !worker_frame_is_current(&session.workers, &request_id) {
                     continue;
                 }
                 match frame {
@@ -1630,20 +877,18 @@ where
                 // Remember the id so late body chunks the server is still
                 // flushing get dropped silently instead of faulted as
                 // "before request metadata".
-                recent_finished.record(&request_id);
-                if let Some(worker) = workers.remove(&request_id) {
+                session.recent_finished.record(&request_id);
+                if let Some(worker) = session.workers.remove(&request_id) {
                     let _ = worker.join.join();
                 }
             }
             #[cfg(unix)]
             Ok(FromWorker::TerminalBytes { terminal_id, bytes }) => {
-                terminals
-                    .on_bytes_with_startup(startup, &terminal_id, &bytes)
-                    .transmit(terminals, |frames| send_outbound_frames(socket, frames))?;
+                send_outbound_frames(socket, session.terminals.on_bytes(&terminal_id, &bytes))?;
             }
             #[cfg(unix)]
             Ok(FromWorker::TerminalEof { terminal_id }) => {
-                send_outbound_frames(socket, terminals.on_eof(&terminal_id))?;
+                send_outbound_frames(socket, session.terminals.on_eof(&terminal_id))?;
             }
             #[cfg(unix)]
             Ok(FromWorker::TerminalWriteFailed { terminal_id }) => {
@@ -1651,24 +896,22 @@ where
                     terminal_id,
                     "writing terminal input failed; closing the terminal"
                 );
-                send_outbound_frames(socket, terminals.close(&terminal_id))?;
+                send_outbound_frames(socket, session.terminals.close(&terminal_id))?;
             }
             Ok(FromWorker::ExecBytes {
                 command_id,
                 stderr,
                 bytes,
-            }) => {
-                send_outbound_frames(socket, execs.on_bytes(&command_id, stderr, &bytes))?;
-            }
+            }) => session.execs.on_bytes(&command_id, stderr, &bytes),
             Ok(FromWorker::ExecEof { command_id, stderr }) => {
-                send_outbound_frames(socket, execs.on_eof(&command_id, stderr))?;
+                session.execs.on_eof(&command_id, stderr);
             }
             Ok(FromWorker::Stt {
                 session_id,
                 message,
             }) => {
-                if let Some(message) = stt.outbound(&session_id, *message) {
-                    send_stt(socket, stt, message)?;
+                if let Some(message) = session.stt.outbound(&session_id, *message) {
+                    send_stt(socket, &mut session.stt, message)?;
                 }
             }
             Ok(FromWorker::Telemetry(text)) => {
@@ -1679,100 +922,8 @@ where
             #[cfg(unix)]
             Ok(FromWorker::FileFrames { op_id, frames }) => {
                 // Cancelled or torn-down ops are no longer pending: drop them.
-                if files.complete(&op_id) {
+                if session.files.complete(&op_id) {
                     send_file_frames(socket, frames)?;
-                }
-            }
-            #[cfg(unix)]
-            Ok(FromWorker::SupervisedFilePrepared {
-                command_id,
-                generation,
-                outcome,
-            }) => {
-                send_outbound_frames(
-                    socket,
-                    terminals.on_file_prepared(startup, _config, &command_id, generation, *outcome),
-                )?;
-            }
-            #[cfg(unix)]
-            Ok(FromWorker::SupervisedFileApplied {
-                command_id,
-                generation,
-                outcome,
-            }) => {
-                send_outbound_frames(
-                    socket,
-                    terminals.on_file_applied(&command_id, generation, outcome),
-                )?;
-            }
-            #[cfg(unix)]
-            Ok(FromWorker::InventoryPrepared { candidate }) => {
-                *reload_preparing = false;
-                let Some(pending) = pending_preparation.take() else {
-                    continue;
-                };
-                let endpoints = inventory_snapshot_from_config(&candidate);
-                let id = next_id("inventory");
-                if let Err(error) = send_control(
-                    socket,
-                    &ClientControlMessage::InventoryUpdate {
-                        id: id.clone(),
-                        endpoints,
-                    },
-                    "sending inventory update",
-                ) {
-                    let _ = control::respond(
-                        pending,
-                        &ControlResponse {
-                            ok: false,
-                            state: "reconnecting",
-                            message: Some("relay disconnected before inventory could be published"),
-                            endpoints: None,
-                            inventory_seq: None,
-                            connection: Some("disconnected"),
-                            desired_inventory_digest: None,
-                            config_modified_at_ms: None,
-                            desired_endpoints: None,
-                            inventory_digest: None,
-                            inventory_acknowledged_at: None,
-                        },
-                    );
-                    return Err(error);
-                }
-                // Make the endpoint-targeted routing map ready before the
-                // server can durably expose this inventory. If the server
-                // rejects it we restore `previous`; before persistence the
-                // candidate cannot receive a server-selected request.
-                let previous = _config.clone();
-                *_config = pending_reload_routing_map(&previous, &candidate);
-                *pending_reload = Some((
-                    id,
-                    candidate,
-                    previous,
-                    Some(pending),
-                    Instant::now() + INVENTORY_ACK_TIMEOUT,
-                ));
-            }
-            #[cfg(unix)]
-            Ok(FromWorker::InventoryPreparationFailed { message }) => {
-                *reload_preparing = false;
-                if let Some(pending) = pending_preparation.take() {
-                    let _ = control::respond(
-                        pending,
-                        &ControlResponse {
-                            ok: false,
-                            state: "local_invalid",
-                            message: Some(&message),
-                            endpoints: None,
-                            inventory_seq: None,
-                            connection: Some("connected"),
-                            desired_inventory_digest: None,
-                            config_modified_at_ms: None,
-                            desired_endpoints: None,
-                            inventory_digest: None,
-                            inventory_acknowledged_at: None,
-                        },
-                    );
                 }
             }
             Err(mpsc::TryRecvError::Empty) => return Ok(()),
@@ -1781,553 +932,202 @@ where
     }
 }
 
-/// While an inventory replacement is pending, preserve routes for the old
-/// acknowledged slugs and make candidate slugs available for an early server
-/// dispatch. The exact candidate becomes live only at `inventory.ok`.
-#[cfg(unix)]
-fn pending_reload_routing_map(previous: &Config, candidate: &Config) -> Config {
-    let mut combined = candidate.clone();
-    for endpoint in &previous.endpoints {
-        if combined.endpoint(&endpoint.slug).is_none() {
-            combined.endpoints.push(endpoint.clone());
-        }
-    }
-    combined
-}
-
-#[cfg(unix)]
-fn restore_previous_routing_after_timeout(config: &mut Config, previous: &Config) {
-    *config = previous.clone();
-}
-
-#[cfg(unix)]
-fn inventory_digest_for_config(config: &Config) -> String {
-    crate::protocol::inventory_digest(&inventory_snapshot_from_config(config))
-}
-
-#[cfg(unix)]
-fn restore_timed_out_reload_on_rejection(
-    timed_out_reloads: &mut TimedOutReloads,
-    id: &str,
-    config: &mut Config,
-    rejected_inventory_digest: &mut Option<String>,
-) -> bool {
-    let Some((candidate, previous)) = timed_out_reloads.remove(id) else {
-        return false;
-    };
-    *config = previous;
-    *rejected_inventory_digest = Some(inventory_digest_for_config(&candidate));
-    true
-}
-
-#[cfg(unix)]
-fn adopt_timed_out_reload_ack(
-    timed_out_reloads: &mut TimedOutReloads,
-    id: &str,
-    revision: crate::protocol::InventoryRevision,
-    config: &mut Config,
-    last_inventory_revision: &mut Option<crate::protocol::InventoryRevision>,
-) -> bool {
-    let Some((candidate, _)) = timed_out_reloads.remove(id) else {
-        return false;
-    };
-    *config = candidate;
-    *last_inventory_revision = Some(revision);
-    true
-}
-
-#[cfg(unix)]
-fn live_status_response<'a>(
-    config: &'a Config,
-    revision: Option<&'a crate::protocol::InventoryRevision>,
-    connection: &'a str,
-    rejected_inventory_digest: Option<&str>,
-) -> ControlResponse<'a> {
-    let config_modified_at_ms = crate::paths::config_file()
-        .ok()
-        .and_then(|path| std::fs::metadata(path).ok())
-        .and_then(|metadata| metadata.modified().ok())
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .and_then(|duration| u64::try_from(duration.as_millis()).ok());
-    // Never infer publication from a live connection or from an unrelated
-    // earlier acknowledgement. The desired on-disk identity is current only
-    // when it exactly equals the server acknowledgement retained by the live
-    // daemon.
-    let desired_digest = inventory_digest_for_config(config);
-    let rejected = rejected_inventory_digest.is_some_and(|digest| digest == desired_digest);
-    let published = if rejected {
-        "rejected"
-    } else {
-        match revision {
-            Some(revision) if revision.inventory_digest == desired_digest => "current",
-            Some(_) => "pending",
-            None => "unconfirmed",
-        }
-    };
-    let desired_endpoints = config
-        .endpoints
-        .iter()
-        .map(|endpoint| {
-            let local_probe = if !endpoint.enabled {
-                "disabled"
-            } else {
-                match endpoint.last_probe.as_ref().map(|probe| &probe.status) {
-                    Some(crate::config::ProbeStatus::Online) => "online",
-                    Some(crate::config::ProbeStatus::Offline) => "offline",
-                    None => "unknown",
-                }
-            };
-            ControlEndpointStatus {
-                slug: &endpoint.slug,
-                enabled: endpoint.enabled,
-                local_probe,
-                model_count: endpoint.models.len(),
-                published: if endpoint.enabled {
-                    published
-                } else {
-                    "unpublished"
-                },
-            }
-        })
-        .collect();
-    ControlResponse {
-        ok: !rejected,
-        state: if rejected { "rejected" } else { connection },
-        message: rejected
-            .then_some("server rejected the desired inventory; revise it and retry reload"),
-        endpoints: Some(
-            config
-                .endpoints
-                .iter()
-                .filter(|endpoint| endpoint.enabled)
-                .count(),
-        ),
-        inventory_seq: revision.map(|value| value.inventory_seq),
-        connection: Some(connection),
-        desired_inventory_digest: Some(desired_digest),
-        config_modified_at_ms,
-        desired_endpoints: Some(desired_endpoints),
-        inventory_digest: revision.map(|value| value.inventory_digest.as_str()),
-        inventory_acknowledged_at: revision.map(|value| value.inventory_acknowledged_at.as_str()),
-    }
-}
-
-/// Read desired disk state while participating in the transitional config lock.
-/// The daemon's active routing map intentionally remains unchanged until an
-/// acknowledgement, so it is not an honest source for `wsmp status` desired
-/// state after a standalone mutation.
-#[cfg(unix)]
-fn desired_config_snapshot() -> Result<Config> {
-    let _lock = ConfigLock::exclusive()?;
-    Config::load_required()
-}
-
-#[cfg(unix)]
-#[allow(clippy::too_many_arguments)]
-fn handle_control_requests<S>(
-    control_server: &mut ControlServer,
-    _socket: &mut tungstenite::WebSocket<S>,
-    config: &mut Config,
-    last_inventory_revision: &mut Option<crate::protocol::InventoryRevision>,
-    pending_reload: &mut Option<PendingReload>,
-    timed_out_reload_candidates: &mut TimedOutReloads,
-    pending_preparation: &mut Option<PendingRequest>,
-    reload_preparing: &mut bool,
-    rejected_inventory_digest: &mut Option<String>,
-    worker_tx: &SyncSender<FromWorker>,
-) -> RelaySessionResult<()>
-where
-    S: std::io::Read + std::io::Write,
-{
-    for pending in control_server.drain().map_err(RelaySessionError::Fatal)? {
-        match pending.request.command {
-            ControlCommand::Status => {
-                let desired = desired_config_snapshot().unwrap_or_else(|error| {
-                    tracing::warn!(error = %error, "reading desired config for relay status");
-                    config.clone()
-                });
-                let response = live_status_response(
-                    &desired,
-                    last_inventory_revision.as_ref(),
-                    "connected",
-                    rejected_inventory_digest.as_deref(),
-                );
-                let _ = control::respond(pending, &response);
-            }
-            ControlCommand::Reload => {
-                if last_inventory_revision.is_none() {
-                    let _ = control::respond(
-                        pending,
-                        &ControlResponse {
-                            ok: false,
-                            state: "registering",
-                            message: Some("relay registration has not been acknowledged"),
-                            endpoints: None,
-                            inventory_seq: None,
-                            connection: Some("connected"),
-                            desired_inventory_digest: None,
-                            config_modified_at_ms: None,
-                            desired_endpoints: None,
-                            inventory_digest: None,
-                            inventory_acknowledged_at: None,
-                        },
-                    );
-                    continue;
-                }
-                if *reload_preparing || pending_preparation.is_some() || pending_reload.is_some() {
-                    let _ = control::respond(
-                        pending,
-                        &ControlResponse {
-                            ok: false,
-                            state: "reload_in_progress",
-                            message: Some(
-                                "an inventory reload is already awaiting acknowledgement",
-                            ),
-                            endpoints: None,
-                            inventory_seq: None,
-                            connection: Some("connected"),
-                            desired_inventory_digest: None,
-                            config_modified_at_ms: None,
-                            desired_endpoints: None,
-                            inventory_digest: None,
-                            inventory_acknowledged_at: None,
-                        },
-                    );
-                    continue;
-                }
-                // A new explicit reload supersedes every earlier uncertain
-                // attempt. A late A acknowledgement/rejection must never
-                // overwrite the successful candidate B the operator just
-                // requested.
-                timed_out_reload_candidates.clear_for_new_reload();
-                *reload_preparing = true;
-                *rejected_inventory_digest = None;
-                *pending_preparation = Some(pending);
-                let active_config = config.clone();
-                let tx = worker_tx.clone();
-                thread::spawn(move || {
-                    let outcome = prepare_inventory_candidate(&active_config)
-                        .map(|(candidate, _inventory)| candidate);
-                    let message = match outcome {
-                        Ok(candidate) => FromWorker::InventoryPrepared { candidate },
-                        Err(error) => FromWorker::InventoryPreparationFailed {
-                            message: error.to_string(),
-                        },
-                    };
-                    let _ = tx.send(message);
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
 fn handle_text<S>(
     socket: &mut tungstenite::WebSocket<S>,
-    config: &mut Config,
+    config: &Config,
     startup: &TerminalStartup,
-    last_inventory_revision: &mut Option<crate::protocol::InventoryRevision>,
-    #[cfg(unix)] pending_reload: &mut Option<PendingReload>,
-    #[cfg(unix)] timed_out_reload_candidates: &mut TimedOutReloads,
-    #[cfg(unix)] rejected_inventory_digest: &mut Option<String>,
+    session: &mut Session,
     text: &str,
-    worker_tx: &SyncSender<FromWorker>,
-    workers: &mut BTreeMap<String, WorkerHandle>,
-    recent_finished: &mut RecentlyFinished,
-    terminals: &mut TerminalRegistry,
-    execs: &mut ExecRegistry,
-    #[cfg(unix)] files: &mut crate::file_relay::FileRelay,
-    registered: &mut bool,
-    deployment_publisher: &mut DeploymentPublisher,
-    telemetry: Option<&crate::telemetry::Telemetry>,
-    remote_adapters: &mut Vec<crate::protocol::RemoteEngineAdapter>,
-    stt: &mut crate::stt::SttRegistry,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
 {
-    if text.len() <= crate::protocol::RELAY_JSON_CONTROL_MAX_BYTES
-        && let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
-        && value.get("type").and_then(serde_json::Value::as_str) == Some("deployment.job")
-    {
-        let job = match serde_json::from_value::<crate::deployments::Job>(value) {
-            Ok(job) => job,
-            Err(_) => {
-                tracing::warn!("malformed deployment job refused");
-                return Ok(());
-            }
-        };
-        // Live speech-to-text sessions on the endpoint end before its stop
-        // runs, and none opens there until a start job for it arrives.
-        if job.action == crate::deployments::Action::Stop {
-            let frames = stt.endpoint_stopping(&job.endpoint_slug, &job.step_id);
-            send_stt_frames(socket, stt, frames)?;
-        } else if job.action == crate::deployments::Action::Start {
-            stt.endpoint_starting(&job.endpoint_slug);
-        }
-        // A stop for the instance cancels its start/prepare still waiting for
-        // a person. A person's command already running is never cut off: the
-        // stop waits for that run to end (so it cannot settle from status
-        // while the run may still be starting the service).
-        #[cfg(unix)]
-        if *registered && job.action == crate::deployments::Action::Stop {
-            let (frames, busy) =
-                terminals.close_operator_for_instance(&job.instance_id, &job.step_id);
-            send_outbound_frames(socket, frames)?;
-            if busy {
-                terminals.defer_until_runs_end(job);
-                return Ok(());
-            }
-        }
-        #[cfg(unix)]
-        let refused = !*registered || crate::deployments::service::submit(job.clone()).is_err();
-        #[cfg(not(unix))]
-        let refused = true;
-        if refused {
-            // A refused stop leaves its endpoint serving.
-            stt.stop_failed(&job.step_id);
-            let result =
-                crate::deployments::JobResult::failure(&job, "deployment_worker_unavailable");
-            let text = serde_json::to_string(&result)
-                .map_err(|error| RelaySessionError::Fatal(error.into()))?;
-            socket
-                .send(Message::Text(text.into()))
-                .map_err(|error| websocket_session_error(error, "refusing deployment job", true))?;
-        }
-        return Ok(());
-    }
-    let message = match parse_server_control(text) {
-        Ok(message) => message,
+    let frame = match parse_server_control(text) {
+        Ok(frame) => frame,
         Err(error) => {
             let fault = control_frame_fault(text);
-            if let Some(result) = apply_stt_fault(socket, stt, &fault) {
+            if let Some(result) = apply_stt_fault(socket, &mut session.stt, &fault) {
                 return result;
             }
-            return apply_frame_fault(socket, fault, terminals, execs, &error);
+            return apply_frame_fault(
+                socket,
+                fault,
+                &mut session.terminals,
+                &mut session.execs,
+                &error,
+            );
         }
     };
+    if let Some(message) = SttServerMessage::from_frame(&frame) {
+        let endpoints = if matches!(message, SttServerMessage::Open { .. }) {
+            enabled_endpoints(config)
+        } else {
+            Vec::new()
+        };
+        let frames = session.stt.handle(message, &endpoints, Instant::now());
+        return send_stt_frames(socket, &mut session.stt, frames);
+    }
     let state_dir = crate::paths::state_dir().ok();
-    match message {
-        ServerControlMessage::HelloOk { id, revision, .. } => {
-            if *registered {
+    match frame {
+        ServerFrame::HelloOk {
+            id,
+            node_id,
+            definition_sync,
+            ..
+        } => {
+            if session.registered {
                 return Err(RelaySessionError::Fatal(anyhow::anyhow!(
                     "duplicate relay registration acknowledgement"
                 )));
             }
-            *registered = true;
-            *last_inventory_revision = Some(revision);
-            tracing::info!(id, "relay registration accepted");
+            session.registered = true;
+            tracing::info!(id, node_id, ?definition_sync, "relay registration accepted");
+            // One empty snapshot until the runtime store lands (C2).
+            send_control(
+                socket,
+                &NodeFrame::RuntimeInventory {
+                    snapshot_id: next_id("inventory"),
+                    chunk_index: 0,
+                    is_final: true,
+                    always_on: Vec::new(),
+                    instances: Vec::new(),
+                },
+                "sending the runtime inventory",
+            )?;
         }
-        ServerControlMessage::DeploymentInstancesOk { snapshot_id } => {
-            deployment_publisher.check_deadline()?;
-            let deadline = deployment_publisher
-                .pending
-                .as_ref()
-                .map(|(_, deadline)| *deadline)
-                .context("unexpected deployment inventory acknowledgement")
-                .map_err(RelaySessionError::Fatal)?;
-            if deployment_publisher
-                .acknowledge_snapshot(&snapshot_id)
-                .map_err(RelaySessionError::Fatal)?
-            {
-                let id = next_id("deployment-inventory");
-                if let Some(watchdog) = &deployment_publisher.watchdog {
-                    watchdog
-                        .arm(Some(deadline))
-                        .map_err(RelaySessionError::Fatal)?;
-                }
-                deployment_publisher.pending = Some((
-                    DeploymentPublication::Endpoints { id: id.clone() },
-                    deadline,
-                ));
-                send_control(
-                    socket,
-                    &ClientControlMessage::InventoryUpdate {
-                        id,
-                        endpoints: inventory_snapshot_from_config(config),
-                    },
-                    "publishing deployment inventory",
-                )?;
-            }
+        ServerFrame::HelloChallenge { .. } => {
+            return Err(RelaySessionError::Fatal(anyhow::anyhow!(
+                "server sent hello.challenge after hello"
+            )));
         }
-        ServerControlMessage::HeartbeatPong { id, .. } => {
-            tracing::debug!(id, "relay heartbeat acknowledged");
-        }
-        ServerControlMessage::InventoryOk {
-            id,
-            revision,
-            desired_capabilities: _,
-        } => {
-            if id.starts_with("deployment-inventory-") {
-                deployment_publisher.check_deadline()?;
-                deployment_publisher
-                    .acknowledge_endpoints(&id)
-                    .map_err(RelaySessionError::Fatal)?;
-                if last_inventory_revision
-                    .as_ref()
-                    .is_none_or(|previous| revision.inventory_seq > previous.inventory_seq)
-                {
-                    *last_inventory_revision = Some(revision);
-                }
-                return Ok(());
-            }
-            #[cfg(not(unix))]
-            let _ = &id;
-            #[cfg(unix)]
-            if pending_reload
-                .as_ref()
-                .is_some_and(|(pending_id, _, _, _, _)| pending_id == &id)
-                && let Some((_, candidate, _, pending, _)) = pending_reload.take()
-            {
-                *last_inventory_revision = Some(revision.clone());
-                *rejected_inventory_digest = None;
-                tracing::info!(id, inventory_seq = revision.inventory_seq, inventory_digest = %revision.inventory_digest, acknowledged_at = %revision.inventory_acknowledged_at, "relay inventory acknowledged");
-                let endpoints = candidate
-                    .endpoints
-                    .iter()
-                    .filter(|endpoint| endpoint.enabled)
-                    .count();
-                *config = candidate;
-                if let Some(pending) = pending {
-                    let _ = control::respond(
-                        pending,
-                        &ControlResponse {
-                            ok: true,
-                            state: "published",
-                            message: None,
-                            endpoints: Some(endpoints),
-                            inventory_seq: Some(revision.inventory_seq),
-                            connection: Some("connected"),
-                            desired_inventory_digest: None,
-                            config_modified_at_ms: None,
-                            desired_endpoints: None,
-                            inventory_digest: Some(&revision.inventory_digest),
-                            inventory_acknowledged_at: Some(&revision.inventory_acknowledged_at),
-                        },
-                    );
-                }
-                return Ok(());
-            }
-            #[cfg(unix)]
-            if adopt_timed_out_reload_ack(
-                timed_out_reload_candidates,
-                &id,
-                revision.clone(),
-                config,
-                last_inventory_revision,
-            ) {
-                tracing::info!(id, inventory_seq = revision.inventory_seq, inventory_digest = %revision.inventory_digest, acknowledged_at = %revision.inventory_acknowledged_at, "late inventory acknowledgement resolved uncertain publish");
-                return Ok(());
-            }
-            #[cfg(unix)]
-            if pending_reload
-                .as_ref()
-                .is_none_or(|(pending_id, _, _, _, _)| pending_id != &id)
-            {
-                tracing::warn!(
-                    id,
-                    "ignoring uncorrelated inventory acknowledgement after an uncertain publish"
-                );
-            }
-            #[cfg(not(unix))]
-            {
-                *last_inventory_revision = Some(revision);
-            }
-        }
-        ServerControlMessage::InventoryError { id, message } => {
-            if id.starts_with("deployment-inventory-") {
-                return Err(RelaySessionError::Reconnectable {
-                    error: anyhow::anyhow!("deployment endpoint publication rejected"),
-                    reset_backoff: true,
-                });
-            }
-            tracing::warn!(id, message, "relay inventory rejected");
-            #[cfg(unix)]
-            if pending_reload
-                .as_ref()
-                .is_some_and(|(pending_id, _, _, _, _)| pending_id == &id)
-                && let Some((_, candidate, previous, pending, _)) = pending_reload.take()
-            {
-                *config = previous;
-                *rejected_inventory_digest = Some(inventory_digest_for_config(&candidate));
-                if let Some(pending) = pending {
-                    let _ = control::respond(
-                        pending,
-                        &ControlResponse {
-                            ok: false,
-                            state: "rejected",
-                            message: Some(&message),
-                            endpoints: None,
-                            inventory_seq: None,
-                            connection: Some("connected"),
-                            desired_inventory_digest: None,
-                            config_modified_at_ms: None,
-                            desired_endpoints: None,
-                            inventory_digest: None,
-                            inventory_acknowledged_at: None,
-                        },
-                    );
-                }
-            }
-            #[cfg(unix)]
-            if restore_timed_out_reload_on_rejection(
-                timed_out_reload_candidates,
-                &id,
-                config,
-                rejected_inventory_digest,
-            ) {
-                // The caller already received `publish_uncertain`, but an
-                // explicit late rejection is authoritative. Revert the
-                // temporary union map so removed routes cannot remain
-                // executable, and retain the rejected desired identity for
-                // truthful status reporting against the on-disk candidate.
-                tracing::warn!(id, "late inventory rejection resolved uncertain publish");
-            }
-        }
-        ServerControlMessage::ProtocolError { message, code, .. } => {
-            if matches!(code, Some(ProtocolErrorCode::Internal)) {
+        ServerFrame::ProtocolError { message, code, .. } => {
+            if code == ProtocolErrorCode::Internal {
                 return Err(RelaySessionError::Reconnectable {
                     error: anyhow::anyhow!("relay protocol error: {message}"),
                     reset_backoff: false,
                 });
             }
-            let text = if *registered {
+            let text = if session.registered {
                 format!("relay protocol error: {message}")
             } else {
-                hello_rejection_message(&message, code.as_ref())
+                hello_rejection_message(&message, Some(&code))
             };
             return Err(RelaySessionError::Fatal(anyhow::anyhow!(text)));
         }
-        ServerControlMessage::HelloChallenge { .. } => {
-            return Err(RelaySessionError::Fatal(anyhow::anyhow!(
-                "server sent hello.challenge after hello"
-            )));
+        ServerFrame::HeartbeatPong { id, .. } => {
+            tracing::debug!(id, "relay heartbeat acknowledged");
         }
-        ServerControlMessage::RelayCancel { request_id, reason } => {
+        ServerFrame::TrustLower { id, .. } => {
+            lower_trust(socket, startup, session, &id)?;
+        }
+        ServerFrame::RuntimeDefine {
+            op_id,
+            chunk_index,
+            is_final,
+            put,
+            node,
+            ..
+        } => {
+            send_control(
+                socket,
+                &define_refusal(startup, op_id, chunk_index, is_final, put, node.is_some()),
+                "answering a runtime definition",
+            )?;
+        }
+        ServerFrame::RuntimeDetect { id } => {
+            send_control(
+                socket,
+                &NodeFrame::RuntimeDetected {
+                    id: Some(id),
+                    scanned_at: crate::telemetry::now_rfc3339(),
+                    servers: Vec::new(),
+                },
+                "answering a detection scan",
+            )?;
+        }
+        ServerFrame::RuntimeInventoryOk { snapshot_id } => {
+            tracing::debug!(snapshot_id, "runtime inventory acknowledged");
+        }
+        ServerFrame::RuntimeInventoryError {
+            snapshot_id,
+            message,
+        } => {
+            tracing::warn!(
+                snapshot_id,
+                message,
+                "the server rejected the runtime inventory"
+            );
+        }
+        ServerFrame::RuntimeJob(job) => {
+            // Jobs render from held definitions only; nothing is held yet, so
+            // the rank fails before admission and the server releases it.
+            let error = if startup.full_control() {
+                JobError::DefinitionMissing
+            } else {
+                JobError::DefinitionFrozen
+            };
+            tracing::warn!(
+                step_id = job.step_id,
+                ?error,
+                "refusing a runtime job: no definition is held"
+            );
+            send_control(
+                socket,
+                &NodeFrame::RuntimeJobResult {
+                    step_id: job.step_id,
+                    instance_id: job.instance_id,
+                    rank: job.rank,
+                    intent_hash: job.intent_hash,
+                    owner_epoch: job.owner_epoch,
+                    status: JobStatus::Failed,
+                    stopped: true,
+                    error: Some(error),
+                    detail: None,
+                    terminal_id: None,
+                    exit_code: None,
+                },
+                "refusing a runtime job",
+            )?;
+        }
+        ServerFrame::SecretSet(secret) => {
+            let result = crate::secrets::set(startup.full_control(), &secret.name, &secret.value);
+            send_control(
+                socket,
+                &secret_result(secret.id, secret.name, result),
+                "answering a secret write",
+            )?;
+        }
+        ServerFrame::SecretDelete { id, name } => {
+            let result = crate::secrets::delete(startup.full_control(), &name);
+            send_control(
+                socket,
+                &secret_result(id, name, result),
+                "answering a secret removal",
+            )?;
+        }
+        ServerFrame::RelayCancel { request_id, reason } => {
             tracing::warn!(request_id, ?reason, "relay request cancelled");
             // Cancelled request: any body chunks still in flight are late, not
             // premature — drop them silently rather than faulting them.
-            recent_finished.record(&request_id);
-            if let Some(worker) = workers.remove(&request_id) {
+            session.recent_finished.record(&request_id);
+            if let Some(worker) = session.workers.remove(&request_id) {
                 worker.cancellation.cancel();
                 drop(worker.body_tx);
                 drop(worker.join);
-                let cancelled = ClientControlMessage::RelayCancelled { request_id };
                 send_control(
                     socket,
-                    &cancelled,
+                    &NodeFrame::RelayCancelled { request_id },
                     "sending relay cancellation acknowledgement",
                 )?;
             }
         }
-        ServerControlMessage::RelayRequest {
+        ServerFrame::RelayRequest {
             request_id,
             method,
             path,
             headers,
             timeout_ms,
-            endpoint_slug,
+            handle,
             expect_body,
             count_first,
             count_ceiling,
@@ -2336,48 +1136,38 @@ where
             start_relay_request(
                 socket,
                 config,
-                remote_adapters,
-                worker_tx,
-                workers,
-                recent_finished,
-                request_id,
-                method,
-                path,
-                headers,
-                timeout_ms,
-                endpoint_slug,
-                expect_body,
-                count_first,
-                count_ceiling,
+                &session.worker_tx,
+                &mut session.workers,
+                &session.recent_finished,
+                RelayRequest {
+                    request_id,
+                    method: match method {
+                        HttpMethod::Get => "GET",
+                        HttpMethod::Post => "POST",
+                    }
+                    .to_string(),
+                    path,
+                    headers,
+                    timeout_ms,
+                    handle,
+                    expect_body,
+                    count_first: count_first.unwrap_or(false),
+                    count_ceiling,
+                },
             )?;
         }
-        ServerControlMessage::Unknown { type_name } => {
-            tracing::warn!(
-                frame_type = type_name,
-                "ignoring unknown relay server frame"
-            );
-        }
-        ServerControlMessage::Stt(message) => {
-            let managed = if matches!(message, crate::stt_wire::SttServerMessage::Open { .. }) {
-                crate::deployments::managed_endpoints()
-            } else {
-                Vec::new()
-            };
-            let frames = stt.handle(message, &managed, Instant::now());
-            send_stt_frames(socket, stt, frames)?;
-        }
-        ServerControlMessage::TermOpen {
+        ServerFrame::TermOpen {
             terminal_id,
+            viewer_id,
             cols,
             rows,
             browser_public_key,
             browser_nonce,
             identity,
-            viewer_id,
         } => {
             send_outbound_frames(
                 socket,
-                terminals.open(
+                session.terminals.open(
                     startup,
                     config,
                     state_dir.as_deref(),
@@ -2393,7 +1183,7 @@ where
                 ),
             )?;
         }
-        ServerControlMessage::TermAttach {
+        ServerFrame::TermAttach {
             terminal_id,
             viewer_id,
             browser_public_key,
@@ -2402,7 +1192,7 @@ where
         } => {
             send_outbound_frames(
                 socket,
-                terminals.attach(
+                session.terminals.attach(
                     startup,
                     state_dir.as_deref(),
                     TermHandshake {
@@ -2417,23 +1207,26 @@ where
                 ),
             )?;
         }
-        ServerControlMessage::TermDetach {
+        ServerFrame::TermDetach {
             terminal_id,
             viewer_id,
         } => {
-            send_outbound_frames(socket, terminals.detach(&terminal_id, viewer_id.as_deref()))?;
+            send_outbound_frames(
+                socket,
+                session.terminals.detach(&terminal_id, viewer_id.as_deref()),
+            )?;
         }
-        ServerControlMessage::TermClose { terminal_id } => {
-            send_outbound_frames(socket, terminals.close(&terminal_id))?;
+        ServerFrame::TermClose { terminal_id } => {
+            send_outbound_frames(socket, session.terminals.close(&terminal_id))?;
         }
-        ServerControlMessage::TermAuth {
+        ServerFrame::TermAuth {
             terminal_id,
             viewer_id,
             signature,
         } => {
             send_outbound_frames(
                 socket,
-                terminals.auth(
+                session.terminals.auth(
                     startup,
                     config,
                     state_dir.as_deref(),
@@ -2443,53 +1236,60 @@ where
                 ),
             )?;
         }
-        ServerControlMessage::ExecStart {
+        ServerFrame::ExecStart {
             command_id,
             command,
             cwd,
+            timeout_ms,
         } => {
             send_outbound_frames(
                 socket,
-                execs.start(startup, config, &command_id, &command, cwd.as_deref()),
+                session.execs.start(
+                    startup,
+                    config,
+                    &command_id,
+                    &command,
+                    cwd.as_deref(),
+                    timeout_ms,
+                ),
             )?;
         }
-        ServerControlMessage::ExecCancel { command_id } => {
-            send_outbound_frames(socket, execs.cancel(&command_id))?;
-        }
-        ServerControlMessage::TermSpawn(spawn) => {
-            send_outbound_frames(socket, terminals.spawn_supervised(startup, config, &spawn))?;
-        }
-        ServerControlMessage::SupervisedCancel {
+        ServerFrame::ExecPoll {
             command_id,
-            if_waiting,
+            tail_bytes,
         } => {
-            send_outbound_frames(socket, terminals.cancel_supervised(&command_id, if_waiting))?;
+            send_outbound_frames(
+                socket,
+                session
+                    .execs
+                    .status(&command_id, usize::try_from(tail_bytes).unwrap_or(0)),
+            )?;
         }
-        ServerControlMessage::FileOp {
+        ServerFrame::ExecCancel { command_id } => {
+            send_outbound_frames(socket, session.execs.cancel(&command_id))?;
+        }
+        ServerFrame::FileOp {
             op_id,
             op,
             args,
             body_bytes,
-            mode,
-            read_grant,
         } => {
             #[cfg(unix)]
             send_file_frames(
                 socket,
-                files.handle_op(
+                session.files.handle_op(
                     &op_id,
-                    &op,
+                    crate::file_relay::op_name(op),
                     args,
-                    body_bytes,
-                    crate::file_relay::FilePermission { mode, read_grant },
+                    body_bytes.and_then(|bytes| usize::try_from(bytes).ok()),
                 ),
             )?;
             #[cfg(not(unix))]
             {
-                let _ = (&op, &args, &body_bytes, mode, read_grant);
+                let _ = (op, args, body_bytes);
                 send_control(
                     socket,
-                    &ClientControlMessage::FileRejected {
+                    &NodeFrame::FileRejected {
                         op_id,
                         reason: "unsupported".to_string(),
                         detail: None,
@@ -2498,80 +1298,159 @@ where
                 )?;
             }
         }
-        ServerControlMessage::FileCancel { op_id } => {
+        ServerFrame::FileCancel { op_id } => {
             #[cfg(unix)]
-            files.handle_cancel(&op_id);
+            session.files.handle_cancel(&op_id);
             #[cfg(not(unix))]
             let _ = op_id;
         }
-        ServerControlMessage::MetricsSourcesSet { id, sources } => {
-            // Stored even without the opt-in so `wsmp metrics list` and
-            // `wsmp metrics approve` can show them. A remote source runs only
-            // with `allowRemoteMetricSources` and a local approval of its
-            // exact command; states go out in the next `node.metrics`.
-            tracing::info!(
-                id,
-                sources = sources.len(),
-                opt_in = startup.allow_remote_metric_sources(),
-                "received remote metric source definitions"
-            );
-            if let Err(error) = crate::metric_sources::save_remote_sources(&sources) {
-                tracing::warn!(
-                    error = %format!("{error:#}"),
-                    "storing remote metric sources failed; they apply to this session only"
-                );
-            }
-            if let Some(telemetry) = telemetry {
-                telemetry.set_remote_sources(sources);
-            }
-        }
-        ServerControlMessage::EngineAdaptersSet { id, adapters } => {
-            // Stored even without the opt-in so `wsmp endpoints adapter show`
-            // and `approve` can show them. A remote adapter runs only with
-            // `allowRemoteEngineAdapters` and a local approval of its
-            // canonical spec; states go out in `node.metrics.engineAdapters`.
-            tracing::info!(
-                id,
-                adapters = adapters.len(),
-                opt_in = startup.allow_remote_engine_adapters(),
-                "received remote engine adapter definitions"
-            );
-            if let Err(error) = crate::engine_adapter::save_remote_adapters(&adapters) {
-                tracing::warn!(
-                    error = %format!("{error:#}"),
-                    "storing remote engine adapters failed; they apply to this session only"
-                );
-            }
-            if let Some(telemetry) = telemetry {
-                telemetry.set_remote_adapters(adapters.clone());
-            }
-            *remote_adapters = adapters;
-        }
+        // Speech frames were handled above.
+        ServerFrame::SttOpen { .. }
+        | ServerFrame::SttUpdate { .. }
+        | ServerFrame::SttCommit { .. }
+        | ServerFrame::SttClear { .. }
+        | ServerFrame::SttClose { .. } => {}
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn start_relay_request<S>(
+/// `trust.lower`: Relay only from now on, persisted, and every Full-only
+/// session ends. Answered with `node.state`.
+fn lower_trust<S>(
     socket: &mut tungstenite::WebSocket<S>,
-    config: &Config,
-    remote_adapters: &[crate::protocol::RemoteEngineAdapter],
-    worker_tx: &SyncSender<FromWorker>,
-    workers: &mut BTreeMap<String, WorkerHandle>,
-    recent_finished: &RecentlyFinished,
+    startup: &TerminalStartup,
+    session: &mut Session,
+    id: &str,
+) -> RelaySessionResult<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    startup.lower_trust();
+    #[cfg(unix)]
+    session.files.lower_trust();
+    send_outbound_frames(socket, session.terminals.kill_all())?;
+    send_outbound_frames(socket, session.execs.kill_all())?;
+    // The S0 trust bridge: anything but `unsupervised` is Relay only.
+    if let Err(error) = Config::update(true, |config| {
+        config.mcp_command_mode = McpCommandMode::Off;
+        Ok(())
+    }) {
+        tracing::warn!(
+            error = %format!("{error:#}"),
+            "persisting the lowered trust failed; it holds until wsmp restarts"
+        );
+    }
+    tracing::warn!(id, "a person lowered this node to Relay only");
+    send_control(
+        socket,
+        &NodeFrame::NodeState {
+            trust: startup.trust(),
+            features: node_features(startup),
+        },
+        "reporting the lowered trust",
+    )
+}
+
+/// The S0 answer to one `runtime.define` chunk: nothing is stored, every
+/// version is rejected, and the final chunk reports an empty held set.
+fn define_refusal(
+    startup: &TerminalStartup,
+    op_id: String,
+    chunk_index: u32,
+    is_final: bool,
+    put: Option<Vec<crate::protocol::frames::DefinitionEnvelope>>,
+    has_node: bool,
+) -> NodeFrame {
+    let reason = if startup.full_control() {
+        DefineRejectReason::Invalid
+    } else {
+        DefineRejectReason::TrustRelay
+    };
+    let results = put
+        .unwrap_or_default()
+        .into_iter()
+        .map(|envelope| DefineEntryResult {
+            runtime_id: envelope.runtime_id,
+            version_id: envelope.version_id,
+            status: DefineStatus::Rejected,
+            reason: Some(reason),
+            detail: None,
+        })
+        .collect();
+    NodeFrame::RuntimeDefineResult {
+        op_id,
+        chunk_index,
+        is_final,
+        results,
+        node: has_node.then_some(DefineNodeResult {
+            status: DefineStatus::Rejected,
+            reason: Some(reason),
+        }),
+        held: is_final.then(Vec::new),
+        held_metric_commands_hash: is_final.then_some(None),
+        held_port_range: is_final.then_some(None),
+        held_fabrics_hash: is_final.then_some(None),
+        frozen: is_final.then(|| !startup.full_control()),
+    }
+}
+
+fn secret_result(
+    id: String,
+    name: String,
+    result: Result<crate::secrets::Outcome, SecretRefusal>,
+) -> NodeFrame {
+    let (status, reason, updated_at) = match result {
+        Ok(crate::secrets::Outcome::Set { updated_at }) => {
+            (SecretStatus::Set, None, Some(updated_at))
+        }
+        Ok(crate::secrets::Outcome::Deleted) => (SecretStatus::Deleted, None, None),
+        Ok(crate::secrets::Outcome::NotFound) => (SecretStatus::NotFound, None, None),
+        Err(reason) => (SecretStatus::Refused, Some(reason), None),
+    };
+    NodeFrame::SecretResult {
+        id,
+        name,
+        status,
+        reason,
+        updated_at,
+    }
+}
+
+/// One `relay.request`, as the daemon routes it.
+struct RelayRequest {
     request_id: String,
     method: String,
     path: String,
     headers: BTreeMap<String, String>,
     timeout_ms: u64,
-    endpoint_slug: String,
+    handle: String,
     expect_body: bool,
     count_first: bool,
     count_ceiling: Option<u64>,
+}
+
+fn start_relay_request<S>(
+    socket: &mut tungstenite::WebSocket<S>,
+    config: &Config,
+    worker_tx: &SyncSender<FromWorker>,
+    workers: &mut BTreeMap<String, WorkerHandle>,
+    recent_finished: &RecentlyFinished,
+    request: RelayRequest,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
 {
+    let RelayRequest {
+        request_id,
+        method,
+        path,
+        headers,
+        timeout_ms,
+        handle,
+        expect_body,
+        count_first,
+        count_ceiling,
+    } = request;
     // Reject a `relay.request` whose id is already live or was recently seen. The
     // server assigns globally-unique request ids and rejects its own duplicates,
     // so any reuse is a protocol violation. Spawning a second worker for a live id
@@ -2589,18 +1468,18 @@ where
         return Ok(());
     }
 
-    let managed = crate::deployments::managed_endpoints();
+    // S0: a runtime handle resolves to the enabled endpoint of that slug
+    // (the runtime store replaces this in C2).
     let Some(endpoint) = config
         .endpoints
         .iter()
-        .chain(managed.iter())
-        .find(|endpoint| endpoint.enabled && endpoint.slug == endpoint_slug)
+        .find(|endpoint| endpoint.enabled && endpoint.slug == handle)
     else {
         send_relay_error(
             socket,
             &request_id,
             RelayFailure::NotFound,
-            Some(format!("endpoint `{endpoint_slug}` is not enabled")),
+            Some(format!("runtime `{handle}` is not available on this node")),
             None,
         )?;
         return Ok(());
@@ -2631,15 +1510,14 @@ where
     };
 
     if count_first && expect_body {
-        let (method, adapter_count_route) = endpoint_count_plan(config, endpoint, remote_adapters);
         let (cancellation, cancellation_rx) = CancellationHandle::new();
         let thread_tx = worker_tx.clone();
         let thread_cancellation = cancellation.clone();
         let (body_tx, body_rx) = mpsc::sync_channel::<BodyChunk>(REQUEST_BODY_INGRESS_CAPACITY);
         let endpoint = endpoint.clone();
         let plan = CountFirstPlan {
-            method,
-            adapter_count_route,
+            method: endpoint_count_method(&endpoint),
+            adapter_count_route: None,
             count_ceiling,
         };
         let handle = thread::spawn(move || {
@@ -2706,7 +1584,7 @@ where
 fn send_stt<S>(
     socket: &mut tungstenite::WebSocket<S>,
     stt: &mut crate::stt::SttRegistry,
-    message: ClientControlMessage,
+    message: NodeFrame,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
@@ -2738,7 +1616,7 @@ where
 fn send_stt_frames<S>(
     socket: &mut tungstenite::WebSocket<S>,
     stt: &mut crate::stt::SttRegistry,
-    frames: Vec<ClientControlMessage>,
+    frames: Vec<NodeFrame>,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
@@ -2812,41 +1690,17 @@ where
             // which logs that command's one outcome line.
             send_outbound_frames(socket, execs.reject_malformed(&command_id))
         }
-        FrameFault::RejectSupervised { command_id, reason } => {
-            tracing::warn!(
-                command_id,
-                "refusing a malformed supervised command request"
-            );
-            // The request never reaches `TerminalRegistry`, so this is that
-            // command's one outcome line.
-            crate::sessions::log_command_rejected("supervised", &command_id, reason);
-            send_control(
-                socket,
-                &ClientControlMessage::SupervisedRejected {
-                    command_id,
-                    reason: reason.to_string(),
-                },
-                "sending a supervised command rejection",
-            )
-        }
         FrameFault::RejectFile { op_id } => {
             tracing::warn!("refusing a malformed file op");
             send_control(
                 socket,
-                &ClientControlMessage::FileRejected {
+                &NodeFrame::FileRejected {
                     op_id,
                     reason: "bad_frame".to_string(),
                     detail: None,
                 },
                 "sending a file op rejection",
             )
-        }
-        FrameFault::CancelSupervised { command_id } => {
-            tracing::warn!(
-                command_id,
-                "ending a supervised command after a malformed frame"
-            );
-            send_outbound_frames(socket, terminals.cancel_supervised(&command_id, false))
         }
         // Speech-to-text faults go to the session registry first
         // (`apply_stt_fault`); one arriving here has nothing left to name.
@@ -2857,97 +1711,64 @@ where
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn handle_binary<S>(
     socket: &mut tungstenite::WebSocket<S>,
     bytes: &[u8],
-    startup: &TerminalStartup,
-    request_state: (&mut BTreeMap<String, WorkerHandle>, &mut RecentlyFinished),
-    terminals: &mut TerminalRegistry,
-    execs: &mut ExecRegistry,
-    #[cfg(unix)] files: &mut crate::file_relay::FileRelay,
-    stt: &mut crate::stt::SttRegistry,
+    session: &mut Session,
 ) -> RelaySessionResult<()>
 where
     S: std::io::Read + std::io::Write,
 {
-    #[cfg(not(unix))]
-    let _ = startup;
-    let (workers, recent_finished) = request_state;
     let (metadata, body) = match binary_frame_fault(bytes) {
         Ok(parsed) => parsed,
         Err(fault) => {
-            if let Some(result) = apply_stt_fault(socket, stt, &fault) {
+            if let Some(result) = apply_stt_fault(socket, &mut session.stt, &fault) {
                 return result;
             }
             return apply_frame_fault(
                 socket,
                 fault,
-                terminals,
-                execs,
+                &mut session.terminals,
+                &mut session.execs,
                 &anyhow::anyhow!("malformed relay binary frame"),
             );
         }
     };
-    let RelayBinaryFrameMetadata::RequestBody {
-        request_id,
-        final_chunk,
-        ..
-    } = metadata
-    else {
-        return match metadata {
-            RelayBinaryFrameMetadata::TermSealed {
-                terminal_id,
-                seq,
-                viewer_id,
-                ..
-            } => {
-                send_outbound_frames(
-                    socket,
-                    terminals.handle_sealed(&terminal_id, viewer_id.as_deref(), seq, &body),
-                )?;
-                Ok(())
-            }
-            RelayBinaryFrameMetadata::ExecStdout { command_id, .. }
-            | RelayBinaryFrameMetadata::ExecStderr { command_id, .. } => {
-                tracing::warn!(
-                    command_id,
-                    "closing a command after an unexpected exec frame"
-                );
-                send_outbound_frames(socket, execs.cancel(&command_id))?;
-                Ok(())
-            }
-            RelayBinaryFrameMetadata::ResponseBody { .. } => {
-                tracing::warn!("ignoring an unexpected relay response body");
-                Ok(())
-            }
-            RelayBinaryFrameMetadata::SupervisedOutput { .. } => {
-                tracing::warn!("ignoring an unexpected supervised output frame");
-                Ok(())
-            }
-            RelayBinaryFrameMetadata::FileBody { op_id } => {
-                #[cfg(unix)]
-                match terminals.handle_supervised_body(startup, &op_id, body) {
-                    Ok(frames) => send_outbound_frames(socket, frames)?,
-                    Err(body) => send_file_frames(socket, files.handle_body(&op_id, body))?,
-                }
-                #[cfg(not(unix))]
-                let _ = (&op_id, &body);
-                Ok(())
-            }
-            RelayBinaryFrameMetadata::FileData { .. } => {
-                tracing::warn!("ignoring an unexpected file.data frame");
-                Ok(())
-            }
-            RelayBinaryFrameMetadata::SttAudio { session_id, seq } => {
-                let frames = stt.audio(&session_id, seq, body);
-                send_stt_frames(socket, stt, frames)
-            }
-            RelayBinaryFrameMetadata::RequestBody { .. } => Ok(()),
-        };
+    let (request_id, is_final) = match metadata {
+        ServerBinaryMetadata::RelayRequestBody {
+            request_id,
+            is_final,
+            ..
+        } => (request_id, is_final),
+        ServerBinaryMetadata::TermSealed {
+            terminal_id,
+            seq,
+            viewer_id,
+            ..
+        } => {
+            return send_outbound_frames(
+                socket,
+                session
+                    .terminals
+                    .handle_sealed(&terminal_id, viewer_id.as_deref(), seq, &body),
+            );
+        }
+        ServerBinaryMetadata::FileBody { op_id } => {
+            #[cfg(unix)]
+            send_file_frames(socket, session.files.handle_body(&op_id, body))?;
+            #[cfg(not(unix))]
+            let _ = (&op_id, &body);
+            return Ok(());
+        }
+        ServerBinaryMetadata::SttAudio { session_id, seq } => {
+            let frames = session.stt.audio(&session_id, seq, body);
+            return send_stt_frames(socket, &mut session.stt, frames);
+        }
     };
 
-    let last = final_chunk == Some(true);
+    let last = is_final == Some(true);
+    let workers = &mut session.workers;
+    let recent_finished = &mut session.recent_finished;
 
     let Some(worker) = workers.get(&request_id) else {
         // The worker is gone. Distinguish "already finished" (a fast upstream
@@ -3029,30 +1850,6 @@ struct CountFirstPlan {
     count_ceiling: Option<u64>,
 }
 
-fn endpoint_count_plan(
-    config: &Config,
-    endpoint: &crate::config::EndpointConfig,
-    remote: &[crate::protocol::RemoteEngineAdapter],
-) -> (
-    Option<crate::count_context::CountContextMethod>,
-    Option<String>,
-) {
-    let method = endpoint
-        .last_probe
-        .as_ref()
-        .and_then(|probe| probe.engine.as_ref())
-        .and_then(|engine| engine.count_context)
-        .and_then(crate::count_context::CountContextFact::method);
-    let adapter_count_route = crate::engine_adapter::effective_engine_adapter(
-        endpoint,
-        remote,
-        config.allow_remote_engine_adapters,
-        &config.approved_remote_adapters,
-    )
-    .and_then(|spec| spec.count_route);
-    (method, adapter_count_route)
-}
-
 fn run_count_first_worker(
     spec: UpstreamRequestSpec,
     endpoint: crate::config::EndpointConfig,
@@ -3075,7 +1872,7 @@ fn run_count_first_worker(
             Err(CollectError::TooLarge) => {
                 let _ = worker_send_control(
                     &tx,
-                    &ClientControlMessage::RelayError {
+                    &NodeFrame::RelayError {
                         request_id: request_id.clone(),
                         failure: RelayFailure::RequestTooLarge,
                         message: Some("request body exceeds its size limit".to_string()),
@@ -3096,7 +1893,7 @@ fn run_count_first_worker(
             Err(error) => {
                 let _ = worker_send_control(
                     &tx,
-                    &ClientControlMessage::CountContextError {
+                    &NodeFrame::ContextCountError {
                         request_id: request_id.clone(),
                         failure: error.kind.relay_failure(),
                         message: Some(error.message),
@@ -3122,16 +1919,16 @@ fn run_count_first_worker(
             Ok(outcome) => {
                 let _ = worker_send_control(
                     &tx,
-                    &ClientControlMessage::CountContextResult {
+                    &NodeFrame::ContextCountResult {
                         request_id: request_id.clone(),
                         tokens: outcome.tokens,
-                        method: outcome.method,
+                        method: count_method(outcome.method),
                     },
                 );
                 if count_first_exceeds_ceiling(outcome.tokens, plan.count_ceiling) {
                     let _ = worker_send_control(
                         &tx,
-                        &ClientControlMessage::RelayError {
+                        &NodeFrame::RelayError {
                             request_id: request_id.clone(),
                             failure: RelayFailure::RequestTooLarge,
                             message: Some("prompt exceeds the context ceiling".to_string()),
@@ -3144,7 +1941,7 @@ fn run_count_first_worker(
             Err(error) => {
                 let _ = worker_send_control(
                     &tx,
-                    &ClientControlMessage::CountContextError {
+                    &NodeFrame::ContextCountError {
                         request_id: request_id.clone(),
                         failure: error.kind.relay_failure(),
                         message: Some(error.message),
@@ -3190,7 +1987,7 @@ fn run_upstream_worker(
         tracing::warn!(error = %error, "relay upstream request failed");
         let _ = worker_send_control(
             &tx,
-            &ClientControlMessage::RelayError {
+            &NodeFrame::RelayError {
                 request_id: request_id.clone(),
                 failure: RelayFailure::Transport,
                 message: Some("upstream request failed".to_string()),
@@ -3345,7 +2142,7 @@ async fn relay_response_back(
         .collect::<Vec<_>>();
     worker_send_control(
         tx,
-        &ClientControlMessage::RelayResponseHeaders {
+        &NodeFrame::RelayResponseHeaders {
             request_id: spec.request_id.clone(),
             status,
             headers,
@@ -3366,10 +2163,10 @@ async fn relay_response_back(
         completion_text.feed(&bytes);
         relay_response_chunk(tx, &spec.request_id, &bytes, &mut index)?;
     }
-    let metadata = RelayBinaryFrameMetadata::ResponseBody {
+    let metadata = NodeBinaryMetadata::RelayResponseBody {
         request_id: spec.request_id.clone(),
         chunk_id: index.to_string(),
-        final_chunk: Some(true),
+        is_final: Some(true),
     };
     worker_send_binary(tx, &metadata, &[])?;
     // Preserve provider usage while attaching separate `cl100k_base` metrics
@@ -3379,7 +2176,7 @@ async fn relay_response_back(
     let metrics = standardized_completion_metrics(completion_text.finish().as_deref());
     worker_send_control(
         tx,
-        &ClientControlMessage::RelayComplete {
+        &NodeFrame::RelayComplete {
             request_id: spec.request_id.clone(),
             usage,
             metrics,
@@ -3404,19 +2201,65 @@ fn append_usage_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
     tail.extend_from_slice(chunk);
 }
 
+/// The engine tokenize route this endpoint's last probe found.
+fn endpoint_count_method(
+    endpoint: &crate::config::EndpointConfig,
+) -> Option<crate::count_context::CountContextMethod> {
+    endpoint
+        .last_probe
+        .as_ref()
+        .and_then(|probe| probe.engine.as_ref())
+        .and_then(|engine| engine.count_context)
+        .and_then(crate::count_context::CountContextFact::method)
+}
+
+/// The wire name of a count method (`AdapterCount` is a reader count).
+fn count_method(method: crate::count_context::CountContextMethod) -> CountMethod {
+    use crate::count_context::CountContextMethod as Local;
+    match method {
+        Local::VllmTokenize => CountMethod::VllmTokenize,
+        Local::TgiChatTokenize => CountMethod::TgiChatTokenize,
+        Local::LlamaApplyTemplate => CountMethod::LlamaApplyTemplate,
+        Local::LlamaInputTokens => CountMethod::LlamaInputTokens,
+        Local::AdapterCount => CountMethod::ReaderCount,
+    }
+}
+
+/// Usage as an OpenAI-compatible upstream reports it (snake_case, with
+/// extra fields the relay ignores).
+#[derive(serde::Deserialize)]
+struct UpstreamUsage {
+    #[serde(default, alias = "promptTokens")]
+    prompt_tokens: Option<u64>,
+    #[serde(default, alias = "completionTokens")]
+    completion_tokens: Option<u64>,
+    #[serde(default, alias = "totalTokens")]
+    total_tokens: Option<u64>,
+}
+
+impl From<UpstreamUsage> for RelayUsage {
+    fn from(usage: UpstreamUsage) -> Self {
+        Self {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+        }
+    }
+}
+
 /// Extract upstream-provided terminal usage from either a JSON completion or
 /// the final OpenAI SSE `data:` event. Shared-tokenizer accounting is separate
 /// from usage and happens in [`standardized_completion_metrics`].
-fn terminal_usage_from_response(bytes: &[u8]) -> Option<crate::protocol::RelayUsage> {
+fn terminal_usage_from_response(bytes: &[u8]) -> Option<RelayUsage> {
     #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
     struct Completion {
-        usage: Option<crate::protocol::RelayUsage>,
+        usage: Option<UpstreamUsage>,
     }
 
     serde_json::from_slice::<Completion>(bytes)
         .ok()
         .and_then(|completion| completion.usage)
+        .map(RelayUsage::from)
         .or_else(|| terminal_usage_from_json_tail(bytes))
         .or_else(|| {
             std::str::from_utf8(bytes).ok().and_then(|body| {
@@ -3428,6 +2271,7 @@ fn terminal_usage_from_response(bytes: &[u8]) -> Option<crate::protocol::RelayUs
                             .and_then(|completion| completion.usage)
                     })
                     .next_back()
+                    .map(RelayUsage::from)
             })
         })
 }
@@ -3435,7 +2279,7 @@ fn terminal_usage_from_response(bytes: &[u8]) -> Option<crate::protocol::RelayUs
 /// Parse a complete `usage` object from a bounded trailing window of a large
 /// non-stream JSON response. Unlike deserializing the whole tail, this remains
 /// valid when the beginning of the document was intentionally discarded.
-fn terminal_usage_from_json_tail(bytes: &[u8]) -> Option<crate::protocol::RelayUsage> {
+fn terminal_usage_from_json_tail(bytes: &[u8]) -> Option<RelayUsage> {
     const USAGE_KEY: &[u8] = b"\"usage\"";
     bytes
         .windows(USAGE_KEY.len())
@@ -3455,8 +2299,45 @@ fn terminal_usage_from_json_tail(bytes: &[u8]) -> Option<crate::protocol::RelayU
                 index += 1;
             }
             let end = json_object_end(bytes, index)?;
-            serde_json::from_slice(&bytes[index..end]).ok()
+            serde_json::from_slice::<UpstreamUsage>(&bytes[index..end])
+                .ok()
+                .map(RelayUsage::from)
         })
+}
+
+fn worker_send_control(tx: &SyncSender<FromWorker>, message: &NodeFrame) -> Result<()> {
+    let request_id = match message {
+        NodeFrame::RelayRequestBodyAck { request_id, .. }
+        | NodeFrame::RelayResponseHeaders { request_id, .. }
+        | NodeFrame::RelayComplete { request_id, .. }
+        | NodeFrame::RelayError { request_id, .. }
+        | NodeFrame::RelayCancelled { request_id }
+        | NodeFrame::ContextCountResult { request_id, .. }
+        | NodeFrame::ContextCountError { request_id, .. } => request_id.clone(),
+        _ => anyhow::bail!("worker emitted non-request relay control"),
+    };
+    let text = encode_control(message)?;
+    tx.send(FromWorker::Send {
+        request_id,
+        frame: WsFrame::Text(text),
+    })
+    .map_err(|_| anyhow::anyhow!("relay outbound channel closed"))
+}
+
+fn worker_send_binary(
+    tx: &SyncSender<FromWorker>,
+    metadata: &NodeBinaryMetadata,
+    body: &[u8],
+) -> Result<()> {
+    let NodeBinaryMetadata::RelayResponseBody { request_id, .. } = metadata else {
+        anyhow::bail!("worker emitted a non-request binary frame");
+    };
+    let frame = encode_binary_frame(metadata, body)?;
+    tx.send(FromWorker::Send {
+        request_id: request_id.clone(),
+        frame: WsFrame::Binary(frame),
+    })
+    .map_err(|_| anyhow::anyhow!("relay outbound channel closed"))
 }
 
 /// Return the exclusive end of a JSON object starting at `start`, respecting
@@ -3548,7 +2429,7 @@ fn collect_request_body(
 /// Return one request-body flow-control credit to the server. Returns false when
 /// the outbound channel is gone.
 fn send_body_credit(tx: &SyncSender<FromWorker>, request_id: &str) -> bool {
-    let ack = ClientControlMessage::RelayRequestBodyAck {
+    let ack = NodeFrame::RelayRequestBodyAck {
         request_id: request_id.to_string(),
         credits: 1,
     };
@@ -3576,7 +2457,7 @@ fn send_media_error(
     };
     worker_send_control(
         tx,
-        &ClientControlMessage::RelayError {
+        &NodeFrame::RelayError {
             request_id: request_id.to_string(),
             failure: error.relay_failure(),
             message: Some(error.message()),
@@ -3688,68 +2569,6 @@ fn media_fetch_reason(error: &reqwest::Error) -> String {
     }
 }
 
-fn worker_send_control(tx: &SyncSender<FromWorker>, message: &ClientControlMessage) -> Result<()> {
-    let request_id = match message {
-        ClientControlMessage::RelayRequestBodyAck { request_id, .. }
-        | ClientControlMessage::RelayResponseHeaders { request_id, .. }
-        | ClientControlMessage::RelayComplete { request_id, .. }
-        | ClientControlMessage::RelayError { request_id, .. }
-        | ClientControlMessage::RelayCancelled { request_id }
-        | ClientControlMessage::CountContextResult { request_id, .. }
-        | ClientControlMessage::CountContextError { request_id, .. } => request_id.clone(),
-        ClientControlMessage::Hello { .. }
-        | ClientControlMessage::InventoryUpdate { .. }
-        | ClientControlMessage::Heartbeat { .. }
-        | ClientControlMessage::TermPending { .. }
-        | ClientControlMessage::TermOpened { .. }
-        | ClientControlMessage::TermAttached { .. }
-        | ClientControlMessage::TermRejected { .. }
-        | ClientControlMessage::TermWriter { .. }
-        | ClientControlMessage::TermInputDropped { .. }
-        | ClientControlMessage::TermExit { .. }
-        | ClientControlMessage::TermSpawned { .. }
-        | ClientControlMessage::SupervisedRejected { .. }
-        | ClientControlMessage::SupervisedAccepted { .. }
-        | ClientControlMessage::SupervisedDeclined { .. }
-        | ClientControlMessage::SupervisedDone { .. }
-        | ClientControlMessage::ExecStarted { .. }
-        | ClientControlMessage::ExecRejected { .. }
-        | ClientControlMessage::ExecDone { .. }
-        | ClientControlMessage::FileResult { .. }
-        | ClientControlMessage::FileRejected { .. }
-        | ClientControlMessage::NodeInfo(_)
-        | ClientControlMessage::NodeMetrics(_)
-        | ClientControlMessage::EndpointLoad(_)
-        | ClientControlMessage::SttOpened { .. }
-        | ClientControlMessage::SttAudioAck { .. }
-        | ClientControlMessage::SttEvent { .. }
-        | ClientControlMessage::SttError { .. }
-        | ClientControlMessage::SttClosed { .. } => {
-            anyhow::bail!("worker emitted non-request relay control")
-        }
-    };
-    let text = encode_control(message)?;
-    tx.send(FromWorker::Send {
-        request_id,
-        frame: WsFrame::Text(text),
-    })
-    .map_err(|_| anyhow::anyhow!("relay outbound channel closed"))
-}
-
-fn worker_send_binary(
-    tx: &SyncSender<FromWorker>,
-    metadata: &RelayBinaryFrameMetadata,
-    body: &[u8],
-) -> Result<()> {
-    let request_id = metadata.routing_id().to_string();
-    let frame = encode_binary_frame(metadata, body)?;
-    tx.send(FromWorker::Send {
-        request_id,
-        frame: WsFrame::Binary(frame),
-    })
-    .map_err(|_| anyhow::anyhow!("relay outbound channel closed"))
-}
-
 /// Encode an upstream transport chunk as one or more bounded relay frames.
 fn relay_response_chunk(
     tx: &SyncSender<FromWorker>,
@@ -3760,10 +2579,10 @@ fn relay_response_chunk(
     // A reqwest chunk is not bounded by the relay frame limit. Preserve the
     // response while splitting it into protocol-valid binary frames.
     for chunk in bytes.chunks(crate::protocol::RELAY_BINARY_CHUNK_MAX_BYTES) {
-        let metadata = RelayBinaryFrameMetadata::ResponseBody {
+        let metadata = NodeBinaryMetadata::RelayResponseBody {
             request_id: request_id.to_string(),
             chunk_id: index.to_string(),
-            final_chunk: None,
+            is_final: None,
         };
         worker_send_binary(tx, &metadata, chunk)?;
         *index += 1;
@@ -3783,7 +2602,7 @@ where
 {
     send_control(
         socket,
-        &ClientControlMessage::RelayError {
+        &NodeFrame::RelayError {
             request_id: request_id.to_string(),
             failure,
             message,
@@ -3848,73 +2667,6 @@ where
     Ok(())
 }
 
-#[cfg(unix)]
-fn send_deployment_result<S>(
-    socket: &mut tungstenite::WebSocket<S>,
-    result: &crate::deployments::JobResult,
-) -> RelaySessionResult<()>
-where
-    S: std::io::Read + std::io::Write,
-{
-    let text =
-        serde_json::to_string(result).map_err(|error| RelaySessionError::Fatal(error.into()))?;
-    socket
-        .send(Message::Text(text.into()))
-        .map_err(|error| websocket_session_error(error, "sending deployment result", true))
-}
-
-/// Operator terminal events become operator progress results and worker
-/// requests. A reported `exited;0` is only a request for the status proof:
-/// the worker sends the step's final result.
-#[cfg(unix)]
-fn forward_operator_events<S>(
-    socket: &mut tungstenite::WebSocket<S>,
-    terminals: &mut TerminalRegistry,
-    stt: &mut crate::stt::SttRegistry,
-) -> RelaySessionResult<()>
-where
-    S: std::io::Read + std::io::Write,
-{
-    use crate::sessions::OperatorEvent;
-    for event in terminals.take_operator_events() {
-        match event {
-            OperatorEvent::Progress(job, progress) => {
-                if let Some(result) = crate::deployments::JobResult::operator(&job, progress) {
-                    send_deployment_result(socket, &result)?;
-                }
-            }
-            OperatorEvent::Accepted(job) => {
-                if crate::deployments::service::submit_operator_accepted(job).is_err() {
-                    tracing::warn!("could not record an operator accept");
-                }
-            }
-            OperatorEvent::Verify(job) => {
-                if crate::deployments::service::submit_operator_verify(job.clone()).is_err() {
-                    stt.stop_failed(&job.step_id);
-                    send_deployment_result(
-                        socket,
-                        &crate::deployments::JobResult::failure(
-                            &job,
-                            "deployment_worker_unavailable",
-                        ),
-                    )?;
-                }
-            }
-        }
-    }
-    // After the events: a held stop follows the verify of the run it waited for.
-    for job in terminals.take_released_jobs() {
-        if crate::deployments::service::submit(job.clone()).is_err() {
-            stt.stop_failed(&job.step_id);
-            send_deployment_result(
-                socket,
-                &crate::deployments::JobResult::failure(&job, "deployment_worker_unavailable"),
-            )?;
-        }
-    }
-    Ok(())
-}
-
 fn old_server_upgrade_error() -> RelaySessionError {
     RelaySessionError::Fatal(anyhow::anyhow!(
         "the server did not complete the relay handshake for protocol {RELAY_PROTOCOL_VERSION}; upgrade the WS Model Proxy server"
@@ -3957,6 +2709,26 @@ fn check_hello_origin(
     )))
 }
 
+/// A reply to the hello wait that strict 3.0 parsing refused, read loosely:
+/// an older server sends `protocol.error` without a code, or a challenge
+/// without an origin. Both mean "upgrade the server".
+fn older_server_reply(text: &str) -> Option<RelaySessionError> {
+    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    match value.get("type").and_then(serde_json::Value::as_str)? {
+        "protocol.error" => {
+            let message = value
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("protocol error");
+            Some(RelaySessionError::Fatal(anyhow::anyhow!(
+                hello_rejection_message(message, None)
+            )))
+        }
+        "hello.challenge" => Some(old_server_upgrade_error()),
+        _ => None,
+    }
+}
+
 fn wait_for_hello_challenge<S>(
     socket: &mut tungstenite::WebSocket<S>,
 ) -> RelaySessionResult<(String, String)>
@@ -3973,33 +2745,32 @@ where
         }
         match socket.read() {
             Ok(Message::Text(text)) => match parse_server_control(&text) {
-                Ok(ServerControlMessage::HelloChallenge { nonce, origin }) => {
-                    let Some(origin) = origin.filter(|value| !value.is_empty()) else {
+                Ok(ServerFrame::HelloChallenge { nonce, origin }) => {
+                    if origin.is_empty() {
                         return Err(old_server_upgrade_error());
-                    };
+                    }
                     return Ok((nonce, origin));
                 }
-                Ok(ServerControlMessage::ProtocolError { message, code, .. }) => {
-                    if matches!(code, Some(ProtocolErrorCode::Internal)) {
+                Ok(ServerFrame::ProtocolError { message, code, .. }) => {
+                    if code == ProtocolErrorCode::Internal {
                         return Err(RelaySessionError::Reconnectable {
                             error: anyhow::anyhow!("relay protocol error: {message}"),
                             reset_backoff: false,
                         });
                     }
                     return Err(RelaySessionError::Fatal(anyhow::anyhow!(
-                        hello_rejection_message(&message, code.as_ref())
+                        hello_rejection_message(&message, Some(&code))
                     )));
                 }
-                Ok(other) => {
-                    let type_name = match other {
-                        ServerControlMessage::Unknown { type_name } => type_name,
-                        _ => "a control frame".to_string(),
-                    };
+                Ok(_) => {
                     return Err(RelaySessionError::Fatal(anyhow::anyhow!(
-                        "expected hello.challenge, received {type_name}"
+                        "expected hello.challenge, received another control frame"
                     )));
                 }
                 Err(error) => {
+                    if let Some(refusal) = older_server_reply(&text) {
+                        return Err(refusal);
+                    }
                     return Err(RelaySessionError::Reconnectable {
                         error: anyhow::anyhow!("invalid hello.challenge frame: {error}"),
                         reset_backoff: false,
@@ -4038,7 +2809,7 @@ where
 
 fn send_control<S>(
     socket: &mut tungstenite::WebSocket<S>,
-    message: &ClientControlMessage,
+    message: &NodeFrame,
     context: &'static str,
 ) -> RelaySessionResult<()>
 where
@@ -4121,65 +2892,6 @@ fn next_reconnect_delay(current: Duration) -> Duration {
         .min(RELAY_RECONNECT_MAX_DELAY)
 }
 
-/// Probe a candidate snapshot and construct its inventory. Persistence belongs
-/// to `prepare_inventory_candidate`, which rechecks the desired snapshot under
-/// the short-lived config lock before it writes anything.
-fn inventory_from_config(config: &mut Config) -> Vec<EndpointInventory> {
-    let allow_remote = config.allow_remote_engine_adapters;
-    let approved = config.approved_remote_adapters.clone();
-    let enabled = config
-        .endpoints
-        .iter()
-        .filter(|endpoint| endpoint.enabled)
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut reports = Vec::with_capacity(enabled.len());
-    for batch in enabled.chunks(INVENTORY_PROBE_CONCURRENCY) {
-        let batch_reports = thread::scope(|scope| {
-            let handles = batch
-                .iter()
-                .cloned()
-                .map(|endpoint| {
-                    let probe_endpoint_config = endpoint.clone();
-                    let approved = approved.clone();
-                    (
-                        endpoint,
-                        scope.spawn(move || {
-                            probe_endpoint(&probe_endpoint_config, allow_remote, &approved)
-                        }),
-                    )
-                })
-                .collect::<Vec<_>>();
-            handles
-                .into_iter()
-                .map(|(endpoint, handle)| match handle.join() {
-                    Ok(report) => report,
-                    Err(_) => {
-                        tracing::warn!(endpoint = %endpoint.slug, "endpoint probe worker panicked");
-                        ProbeReport {
-                            endpoint_slug: endpoint.slug,
-                            status: crate::config::ProbeStatus::Offline,
-                            discovered_model_ids: Vec::new(),
-                            suggested_default_capabilities: endpoint.default_capabilities,
-                            model_suggestions: Vec::new(),
-                            error: Some("endpoint probe worker panicked".to_string()),
-                            engine: None,
-                            adapter: None,
-                        }
-                    }
-                })
-                .collect::<Vec<_>>()
-        });
-        reports.extend(batch_reports);
-    }
-    for report in reports {
-        if let Err(error) = apply_probe_report(config, &report, false) {
-            tracing::warn!(error = %error, endpoint = report.endpoint_slug, "failed to apply probe report");
-        }
-    }
-    inventory_snapshot_from_config(config)
-}
-
 /// A relay socket read that returned without data and can simply be retried:
 /// the poll timeout set by [`set_socket_timeouts`], or a shutdown signal
 /// that landed on this thread (`EINTR`; a socket timeout keeps the read from
@@ -4258,220 +2970,6 @@ mod tests {
 
     // Unix only: Windows `shutdown` does not interrupt a blocked send (see
     // `PublicationWatchdog`).
-    #[cfg(unix)]
-    #[test]
-    fn publication_watchdog_interrupts_actual_stalled_websocket_write() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
-        let address = listener.local_addr().expect("address");
-        let (stop, stopped) = mpsc::channel();
-        let peer = thread::spawn(move || {
-            let (tcp, _) = listener.accept().expect("accept");
-            let _socket = tungstenite::accept(tcp).expect("handshake");
-            let _ = stopped.recv_timeout(Duration::from_secs(5));
-        });
-        let (mut socket, _) = connect(format!("ws://{address}")).expect("client");
-        set_socket_timeouts(
-            socket.get_mut(),
-            RELAY_SOCKET_POLL_INTERVAL,
-            Duration::from_secs(5),
-        )
-        .expect("timeouts");
-        let guard = PublicationWatchdog::start(socket.get_ref()).expect("guard");
-        socket
-            .send(Message::Text("legitimate initial frame".into()))
-            .expect("normal send");
-        let start = Instant::now();
-        guard
-            .arm(Some(start + Duration::from_millis(150)))
-            .expect("arm");
-        let mut failed = false;
-        for _ in 0..512 {
-            if socket
-                .send(Message::Binary(vec![0; 65_536].into()))
-                .is_err()
-            {
-                failed = true;
-                break;
-            }
-        }
-        assert!(failed, "a stopped reader must interrupt the actual write");
-        assert!(
-            start.elapsed() < Duration::from_secs(1),
-            "absolute deadline beats the five-second native write timeout"
-        );
-        drop(guard);
-        let _ = stop.send(());
-        peer.join().expect("join peer");
-    }
-
-    #[test]
-    fn publication_watchdog_disarm_rearm_drop_preserve_live_and_successor_sockets() {
-        let pair = || {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
-            let tcp = std::net::TcpStream::connect(listener.local_addr().expect("address"))
-                .expect("connect");
-            let (peer, _) = listener.accept().expect("accept");
-            (tungstenite::stream::MaybeTlsStream::Plain(tcp), peer)
-        };
-        let (mut socket, _peer) = pair();
-        let guard = PublicationWatchdog::start(&socket).expect("guard");
-        guard
-            .arm(Some(Instant::now() + Duration::from_millis(40)))
-            .expect("arm");
-        guard.arm(None).expect("disarm");
-        thread::sleep(Duration::from_millis(70));
-        socket
-            .write_all(b"still live after ACK")
-            .expect("disarmed socket remains live");
-        guard
-            .arm(Some(Instant::now() + Duration::from_millis(40)))
-            .expect("old phase");
-        guard
-            .arm(Some(Instant::now() + Duration::from_millis(200)))
-            .expect("next phase");
-        thread::sleep(Duration::from_millis(70));
-        socket
-            .write_all(b"next phase live")
-            .expect("old deadline cannot terminate a rearmed phase");
-        let (mut successor, _successor_peer) = pair();
-        drop(guard);
-        thread::sleep(Duration::from_millis(220));
-        socket
-            .write_all(b"drop joined without killing socket")
-            .expect("drop cancels timer");
-        successor
-            .write_all(b"separate connection")
-            .expect("old guard cannot affect successor");
-    }
-
-    #[test]
-    fn deployment_publication_requires_exact_ack_and_excludes_overlap() {
-        let mut publisher = DeploymentPublisher::default();
-        publisher.begin("a".repeat(32), true).expect("first");
-        assert!(publisher.begin("b".repeat(32), true).is_err());
-        assert!(publisher.acknowledge_snapshot(&"b".repeat(32)).is_err());
-        assert!(publisher.pending.is_some());
-        assert!(
-            publisher
-                .acknowledge_snapshot(&"a".repeat(32))
-                .expect("ACK")
-        );
-        assert!(publisher.acknowledge_snapshot(&"a".repeat(32)).is_err());
-        publisher.pending = Some((
-            DeploymentPublication::Endpoints {
-                id: "inventory-a".into(),
-            },
-            Instant::now() + Duration::from_secs(30),
-        ));
-        assert!(publisher.begin("b".repeat(32), true).is_err());
-        assert!(publisher.acknowledge_endpoints("inventory-b").is_err());
-        publisher
-            .acknowledge_endpoints("inventory-a")
-            .expect("endpoints ACK");
-        publisher.begin("b".repeat(32), false).expect("next");
-        assert!(
-            !publisher
-                .acknowledge_snapshot(&"b".repeat(32))
-                .expect("empty initial ACK")
-        );
-    }
-
-    #[test]
-    fn deployment_publication_expired_ack_does_not_release_successor() {
-        let mut publisher = DeploymentPublisher::default();
-        publisher.begin("a".repeat(32), true).expect("begin");
-        if let Some((_, deadline)) = &mut publisher.pending {
-            *deadline = Instant::now();
-        }
-        assert!(publisher.acknowledge_snapshot(&"a".repeat(32)).is_err());
-        assert!(publisher.pending.is_some());
-        let mut successor = DeploymentPublisher::default();
-        successor.begin("b".repeat(32), false).expect("successor");
-        assert!(successor.acknowledge_snapshot(&"a".repeat(32)).is_err());
-        assert!(
-            !successor
-                .acknowledge_snapshot(&"b".repeat(32))
-                .expect("successor ACK")
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn status_json_exposes_local_probe_and_server_acknowledgement() {
-        let mut config = Config::default();
-        config.endpoints.push(crate::config::EndpointConfig {
-            slug: "local".to_string(),
-            label: "Local".to_string(),
-            enabled: true,
-            models: vec![crate::config::ModelConfig::default()],
-            last_probe: Some(crate::config::ProbeSnapshot {
-                status: crate::config::ProbeStatus::Online,
-                models: vec!["model-a".to_string()],
-                suggested_capabilities: crate::config::OpenAiCompatibleCapabilities::default(),
-                engine: None,
-                adapter: None,
-            }),
-            ..Default::default()
-        });
-        let desired_inventory = config
-            .endpoints
-            .iter()
-            .filter(|endpoint| endpoint.enabled)
-            .map(|endpoint| crate::protocol::endpoint_inventory(endpoint, EndpointStatus::Online))
-            .collect::<Vec<_>>();
-        let revision = crate::protocol::InventoryRevision {
-            inventory_seq: 42,
-            inventory_digest: crate::protocol::inventory_digest(&desired_inventory),
-            inventory_acknowledged_at: "2026-08-05T00:00:00Z".to_string(),
-        };
-
-        let value = serde_json::to_value(live_status_response(
-            &config,
-            Some(&revision),
-            "connected",
-            None,
-        ))
-        .expect("serialize status");
-
-        assert_eq!(value["connection"], "connected");
-        assert_eq!(value["inventorySeq"], 42);
-        assert_eq!(value["inventoryDigest"], revision.inventory_digest);
-        assert_eq!(value["inventoryAcknowledgedAt"], "2026-08-05T00:00:00Z");
-        assert_eq!(
-            value["desiredInventoryDigest"].as_str().map(str::len),
-            Some(64)
-        );
-        assert_eq!(value["desiredEndpoints"][0]["localProbe"], "online");
-        assert_eq!(value["desiredEndpoints"][0]["published"], "current");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn status_marks_a_server_rejected_desired_inventory_as_rejected() {
-        let config = Config::default();
-        let revision = crate::protocol::InventoryRevision {
-            inventory_seq: 7,
-            inventory_digest: crate::protocol::inventory_digest(&[]),
-            inventory_acknowledged_at: "2026-08-05T00:00:00Z".to_string(),
-        };
-        let rejected = crate::protocol::inventory_digest(&[]);
-        let value = serde_json::to_value(live_status_response(
-            &config,
-            Some(&revision),
-            "connected",
-            Some(&rejected),
-        ))
-        .expect("serialize rejected status");
-
-        assert_eq!(value["ok"], false);
-        assert_eq!(value["state"], "rejected");
-        assert!(
-            value["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("server rejected"))
-        );
-    }
-
     fn drain_acks(rx: &Receiver<FromWorker>) -> Vec<String> {
         let mut acks = Vec::new();
         while let Ok(message) = rx.try_recv() {
@@ -4627,8 +3125,9 @@ mod tests {
             else {
                 panic!("expected binary response frame");
             };
-            let (metadata, body) = parse_binary_frame(&encoded).expect("parse bounded frame");
-            let RelayBinaryFrameMetadata::ResponseBody { chunk_id, .. } = metadata else {
+            let (metadata, body) =
+                decode_binary_frame::<NodeBinaryMetadata>(&encoded).expect("parse bounded frame");
+            let NodeBinaryMetadata::RelayResponseBody { chunk_id, .. } = metadata else {
                 panic!("expected a response body frame");
             };
             assert_eq!(chunk_id, expected_index.to_string());
@@ -4877,7 +3376,7 @@ mod tests {
     #[test]
     fn hello_challenge_keeps_coded_internal_retryable_and_old_server_actionable() {
         let mut socket = challenge_socket(Message::Text(
-            r#"{"type":"protocol.error","failure":"protocol_error","message":"database unavailable","code":"internal"}"#
+            r#"{"type":"protocol.error","failure":"protocol_error","message":"database unavailable","code":"internal","supportedVersions":["3.0"]}"#
                 .into(),
         ));
         assert!(matches!(
@@ -5039,15 +3538,13 @@ mod tests {
             let mut terminals = TerminalRegistry::new(tx);
             let (exec_tx, _exec_rx) =
                 mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
-            let mut execs = ExecRegistry::new(exec_tx, DEFAULT_EXEC_TIMEOUT);
+            let mut execs = ExecRegistry::new(exec_tx, DEFAULT_COMMAND_MAX);
             let error = anyhow::anyhow!("malformed relay frame");
-            // Each frame names a command but its command string is NUL-bearing:
-            // `control_frame_fault` attributes it and `apply_frame_fault`
-            // refuses it without ever reaching a registry.
-            for frame in [
-                r#"{"type":"exec.start","commandId":"cmd-exec-9f3a","command":"x\u0000y"}"#,
-                r#"{"type":"term.spawn","commandId":"cmd-sup-9f3a","command":"x\u0000y"}"#,
-            ] {
+            // The frame names a command but its command string is NUL-bearing
+            // (and it lacks `timeoutMs`): `control_frame_fault` attributes it
+            // and `apply_frame_fault` refuses it without reaching a registry.
+            let frame = r#"{"type":"exec.start","commandId":"cmd-exec-9f3a","command":"x\u0000y"}"#;
+            {
                 let mut socket = sink_socket();
                 let fault = crate::protocol::control_frame_fault(frame);
                 assert!(
@@ -5070,7 +3567,6 @@ mod tests {
                 .count()
         };
         assert_eq!(outcomes("cmd-exec-9f3a"), 1, "{log}");
-        assert_eq!(outcomes("cmd-sup-9f3a"), 1, "{log}");
         assert!(log.contains("rejected:bad_command"), "{log}");
         assert!(
             !log.contains("x\\u0000y") && !log.contains("x\u{0}"),
@@ -5086,7 +3582,7 @@ mod tests {
         let mut socket = sink_socket();
         // A transcript over the wire limit: the encoder refuses it, the
         // session gets one stt.error, and the relay goes on.
-        let oversized = ClientControlMessage::SttEvent {
+        let oversized = NodeFrame::SttEvent {
             session_id: session.to_string(),
             event: crate::stt_wire::SttEvent::Delta {
                 item_seq: 0,
@@ -5144,19 +3640,20 @@ mod tests {
         let result = start_relay_request(
             &mut socket,
             &config,
-            &[],
             &worker_tx,
             &mut workers,
             &recent_finished,
-            "req-1".to_string(),
-            "POST".to_string(),
-            "/v1/chat/completions".to_string(),
-            BTreeMap::new(),
-            1_000,
-            "local".to_string(),
-            false,
-            false,
-            None,
+            RelayRequest {
+                request_id: "req-1".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                headers: BTreeMap::new(),
+                timeout_ms: 1_000,
+                handle: "local".to_string(),
+                expect_body: false,
+                count_first: false,
+                count_ceiling: None,
+            },
         );
         assert!(result.is_ok(), "start_relay_request should not error");
 
@@ -5183,19 +3680,20 @@ mod tests {
         let result = start_relay_request(
             &mut socket,
             &config,
-            &[],
             &worker_tx,
             &mut workers,
             &recent_finished,
-            "req-done".to_string(),
-            "POST".to_string(),
-            "/v1/chat/completions".to_string(),
-            BTreeMap::new(),
-            1_000,
-            "local".to_string(),
-            false,
-            false,
-            None,
+            RelayRequest {
+                request_id: "req-done".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                headers: BTreeMap::new(),
+                timeout_ms: 1_000,
+                handle: "local".to_string(),
+                expect_body: false,
+                count_first: false,
+                count_ceiling: None,
+            },
         );
         assert!(result.is_ok(), "start_relay_request should not error");
 
@@ -5361,66 +3859,6 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_reuses_only_an_unchanged_acknowledged_snapshot() {
-        let active = Config::default();
-        let inventory = inventory_snapshot_from_config(&active);
-        let revision = crate::protocol::InventoryRevision {
-            inventory_seq: 7,
-            inventory_digest: crate::protocol::inventory_digest(&inventory),
-            inventory_acknowledged_at: "2026-08-06T00:00:00Z".to_string(),
-        };
-        let modified_at = UNIX_EPOCH + Duration::from_secs(42);
-
-        assert!(should_reuse_reconnect_inventory(
-            &active,
-            &active,
-            Some(modified_at),
-            modified_at,
-            Some(&revision),
-        ));
-
-        let mut changed = active.clone();
-        changed.endpoints.push(crate::config::EndpointConfig {
-            slug: "changed-endpoint".to_string(),
-            ..Default::default()
-        });
-        assert!(!should_reuse_reconnect_inventory(
-            &active,
-            &changed,
-            Some(modified_at),
-            modified_at,
-            Some(&revision),
-        ));
-        assert!(!should_reuse_reconnect_inventory(
-            &active,
-            &active,
-            Some(modified_at),
-            modified_at + Duration::from_secs(1),
-            Some(&revision),
-        ));
-    }
-
-    #[test]
-    fn a_re_detection_that_found_no_kind_keeps_the_stored_engine_facts() {
-        // The fast path seeds `model_max_len` from the stored snapshot, so a
-        // probe that found nothing still carries model-level facts. It must
-        // not be treated as a successful detection: that wiped kind/slots/
-        // kvTokens on the server for the rest of the session (G1b-1).
-        let found_nothing_but_seeded = crate::engine::DetectedEngine {
-            kind: None,
-            model_max_len: std::collections::BTreeMap::from([("m".to_string(), 32768)]),
-            ..crate::engine::DetectedEngine::default()
-        };
-        assert!(!re_detection_replaces_stored(&found_nothing_but_seeded));
-
-        let re_detected = crate::engine::DetectedEngine {
-            kind: Some(crate::engine::EngineKind::Vllm),
-            ..crate::engine::DetectedEngine::default()
-        };
-        assert!(re_detection_replaces_stored(&re_detected));
-    }
-
-    #[test]
     fn count_first_exceeds_ceiling_is_exclusive() {
         assert!(!count_first_exceeds_ceiling(8, None));
         assert!(!count_first_exceeds_ceiling(8, Some(8)));
@@ -5428,203 +3866,11 @@ mod tests {
     }
 
     #[test]
-    fn reconnect_keeps_count_context_when_the_kind_matches() {
-        let previous = crate::engine::DetectedEngine {
-            kind: Some(crate::engine::EngineKind::LlamaCpp),
-            count_context: Some(crate::count_context::CountContextFact::LlamaInputTokens),
-            slots: Some(4),
-            ..crate::engine::DetectedEngine::default()
-        };
-        let mut next = crate::engine::DetectedEngine {
-            kind: Some(crate::engine::EngineKind::LlamaCpp),
-            slots: Some(4),
-            ..crate::engine::DetectedEngine::default()
-        };
-        preserve_count_context(Some(&previous), &mut next);
-        assert_eq!(
-            next.count_context,
-            Some(crate::count_context::CountContextFact::LlamaInputTokens)
-        );
-        let mut changed = crate::engine::DetectedEngine {
-            kind: Some(crate::engine::EngineKind::Vllm),
-            ..crate::engine::DetectedEngine::default()
-        };
-        preserve_count_context(Some(&previous), &mut changed);
-        assert_eq!(changed.count_context, None);
-    }
-
-    #[test]
-    fn the_reconnect_fast_path_hands_the_session_the_facts_its_hello_advertises() {
-        // An acknowledged auto endpoint whose engine was not detectable at the
-        // last probe; on reconnect `/props` answers. The hello advertises
-        // llama.cpp, and the config the session (and its load sampler) runs
-        // on must carry the same detection, or llama.cpp load is never scraped.
-        let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
-            Ok(listener) => listener,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
-            Err(error) => panic!("bind test engine: {error}"),
-        };
-        let address = listener.local_addr().expect("test engine address");
-        thread::spawn(move || {
-            for stream in listener.incoming().take(16) {
-                let Ok(mut stream) = stream else { continue };
-                let mut request = [0_u8; 4096];
-                let read = std::io::Read::read(&mut stream, &mut request).unwrap_or(0);
-                let head = String::from_utf8_lossy(&request[..read]).to_string();
-                let response = if head.starts_with("GET /props ") {
-                    let body = r#"{"total_slots":4,"default_generation_settings":{"n_ctx":8192}}"#;
-                    format!(
-                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                } else {
-                    "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
-                        .to_string()
-                };
-                let _ = stream.write_all(response.as_bytes());
-            }
-        });
-        let mut active = Config::default();
-        active.endpoints.push(crate::config::EndpointConfig {
-            slug: "auto".to_string(),
-            base_url: format!("http://{address}/v1"),
-            last_probe: Some(crate::config::ProbeSnapshot {
-                status: crate::config::ProbeStatus::Online,
-                models: vec!["m".to_string()],
-                suggested_capabilities: crate::config::OpenAiCompatibleCapabilities::default(),
-                engine: None,
-                adapter: None,
-            }),
-            ..crate::config::EndpointConfig::default()
-        });
-        assert!(crate::telemetry::load_targets(&active.endpoints).is_empty());
-
-        let (config, inventory) = config_with_fresh_engine_facts(&active);
-        let advertised = inventory[0]
-            .engine_facts
-            .as_ref()
-            .and_then(|facts| facts.engine.as_ref())
-            .map(|fact| fact.value);
-        assert_eq!(advertised, Some(crate::engine::EngineKind::LlamaCpp));
-        let targets = crate::telemetry::load_targets(&config.endpoints);
-        assert_eq!(targets.len(), 1, "the sampler scrapes the detected engine");
-        assert_eq!(
-            targets[0].1,
-            crate::engine_adapter::LoadPlan::BuiltIn(crate::engine::EngineKind::LlamaCpp)
-        );
-        // The refreshed facts do not make the snapshot a different desired
-        // inventory, so the next reconnect still takes the fast path.
-        assert!(same_desired_config(&config, &active));
-        let mut edited = config.clone();
-        edited.endpoints[0].label = "other".to_string();
-        assert!(!same_desired_config(&edited, &active));
-    }
-
-    #[test]
-    fn approved_remote_adapter_publishes_load_adapter_on_inventory() {
-        use crate::engine_adapter::{
-            AdapterFormat, AdapterInput, AdapterSignal, EngineAdapterConfig, SignalSelector,
-        };
-        let mut map = std::collections::BTreeMap::new();
-        map.insert(
-            AdapterSignal::Running,
-            SignalSelector {
-                series: "running".to_string(),
-                labels: Default::default(),
-                aggregate: None,
-                scale: None,
-            },
-        );
-        map.insert(
-            AdapterSignal::KvOccupancy,
-            SignalSelector {
-                series: "kv".to_string(),
-                labels: Default::default(),
-                aggregate: None,
-                scale: None,
-            },
-        );
-        let spec = EngineAdapterConfig {
-            input: AdapterInput::Route {
-                route: "/stats".to_string(),
-            },
-            format: AdapterFormat::Json,
-            interval_secs: 2,
-            timeout_secs: 2,
-            map: map.clone(),
-            count_route: None,
-        };
-        let hash = crate::engine_adapter::spec_sha256("gpu", &spec);
-        let remote = crate::protocol::RemoteEngineAdapter {
-            endpoint_slug: "gpu".to_string(),
-            input: AdapterInput::Route {
-                route: "/stats".to_string(),
-            },
-            format: AdapterFormat::Json,
-            interval_secs: 2,
-            timeout_secs: 2,
-            map,
-            count_route: None,
-        };
-        let mut config = Config {
-            allow_remote_engine_adapters: true,
-            ..Config::default()
-        };
-        config
-            .approved_remote_adapters
-            .insert("gpu".to_string(), hash);
-        config.endpoints.push(crate::config::EndpointConfig {
-            slug: "gpu".to_string(),
-            enabled: true,
-            engine: crate::config::EndpointEngine::Generic,
-            engine_adapter: None,
-            last_probe: Some(crate::config::ProbeSnapshot {
-                status: crate::config::ProbeStatus::Online,
-                models: Vec::new(),
-                suggested_capabilities: crate::config::OpenAiCompatibleCapabilities::default(),
-                engine: None,
-                adapter: None,
-            }),
-            ..crate::config::EndpointConfig::default()
-        });
-
-        let mut unapproved = config.clone();
-        unapproved.approved_remote_adapters.clear();
-        let pending =
-            inventory_snapshot_from_config_with_remote(&unapproved, std::slice::from_ref(&remote));
-        assert!(
-            pending[0]
-                .engine_facts
-                .as_ref()
-                .and_then(|facts| facts.load_adapter.as_ref())
-                .is_none(),
-            "an unapproved remote adapter stays off the wire"
-        );
-
-        let inventory = inventory_snapshot_from_config_with_remote(&config, &[remote]);
-        let load = inventory[0]
-            .engine_facts
-            .as_ref()
-            .and_then(|facts| facts.load_adapter.as_ref())
-            .expect("approved remote adapter publishes loadAdapter");
-        assert_eq!(load.source, crate::protocol::FactSource::Config);
-        assert!(
-            !load.value.signals.is_empty(),
-            "the remote spec's signal list is published on the wire"
-        );
-        assert!(
-            load.value
-                .signals
-                .contains(&crate::engine_adapter::AdapterSignal::Running)
-        );
-    }
-
-    #[test]
     fn terminal_usage_comes_from_the_final_sse_completion_event() {
         let response = b"data: {\"usage\":{\"completionTokens\":2}}\n\ndata: {\"usage\":{\"promptTokens\":3,\"completionTokens\":5,\"totalTokens\":8}}\n\ndata: [DONE]\n\n";
         assert_eq!(
             terminal_usage_from_response(response),
-            Some(crate::protocol::RelayUsage {
+            Some(RelayUsage {
                 prompt_tokens: Some(3),
                 completion_tokens: Some(5),
                 total_tokens: Some(8),
@@ -5648,166 +3894,11 @@ mod tests {
 
         assert_eq!(
             terminal_usage_from_response(&tail),
-            Some(crate::protocol::RelayUsage {
+            Some(RelayUsage {
                 prompt_tokens: Some(3),
                 completion_tokens: Some(5),
                 total_tokens: Some(8),
             })
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn pending_reload_routes_both_old_and_candidate_slugs_until_acknowledgement() {
-        let mut live = Config::default();
-        live.endpoints.push(crate::config::EndpointConfig {
-            slug: "old-endpoint".to_string(),
-            enabled: true,
-            ..Default::default()
-        });
-        let mut candidate = Config::default();
-        candidate.endpoints.push(crate::config::EndpointConfig {
-            slug: "new-endpoint".to_string(),
-            enabled: true,
-            ..Default::default()
-        });
-
-        let pending = pending_reload_routing_map(&live, &candidate);
-
-        // A request selected from the already acknowledged inventory still
-        // reaches its old endpoint, while an early server dispatch selected
-        // from the candidate can reach the new endpoint.
-        assert!(pending.endpoint("old-endpoint").is_some());
-        assert!(pending.endpoint("new-endpoint").is_some());
-        // `inventory.ok` is the atomic cutover point.
-        assert!(candidate.endpoint("old-endpoint").is_none());
-        assert!(candidate.endpoint("new-endpoint").is_some());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn acknowledgement_timeout_restores_previous_routes_before_late_acknowledgement() {
-        let mut previous = Config::default();
-        previous.endpoints.push(crate::config::EndpointConfig {
-            slug: "old-endpoint".to_string(),
-            enabled: true,
-            ..Default::default()
-        });
-        let mut candidate = Config::default();
-        candidate.endpoints.push(crate::config::EndpointConfig {
-            slug: "new-endpoint".to_string(),
-            enabled: true,
-            ..Default::default()
-        });
-        let mut live = pending_reload_routing_map(&previous, &candidate);
-
-        restore_previous_routing_after_timeout(&mut live, &previous);
-
-        assert_eq!(live, previous);
-        assert!(live.endpoint("new-endpoint").is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn late_inventory_rejection_restores_the_previous_routing_map() {
-        let mut previous = Config::default();
-        previous.endpoints.push(crate::config::EndpointConfig {
-            slug: "old-endpoint".to_string(),
-            enabled: true,
-            ..Default::default()
-        });
-        let mut candidate = Config::default();
-        candidate.endpoints.push(crate::config::EndpointConfig {
-            slug: "new-endpoint".to_string(),
-            enabled: true,
-            ..Default::default()
-        });
-        let candidate_digest = inventory_digest_for_config(&candidate);
-        let mut live = pending_reload_routing_map(&previous, &candidate);
-        let mut timed_out = TimedOutReloads::new();
-        timed_out.insert("inventory-1".to_string(), (candidate, previous.clone()));
-        let mut rejected_digest = None;
-
-        assert!(restore_timed_out_reload_on_rejection(
-            &mut timed_out,
-            "inventory-1",
-            &mut live,
-            &mut rejected_digest,
-        ));
-        assert_eq!(live, previous);
-        assert_eq!(rejected_digest.as_deref(), Some(candidate_digest.as_str()));
-        assert!(timed_out.by_id.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn late_ack_for_superseded_a_cannot_clobber_successful_b() {
-        let mut candidate_a = Config::default();
-        candidate_a.endpoints.push(crate::config::EndpointConfig {
-            slug: "candidate-a".to_string(),
-            ..Default::default()
-        });
-        let mut candidate_b = Config::default();
-        candidate_b.endpoints.push(crate::config::EndpointConfig {
-            slug: "candidate-b".to_string(),
-            ..Default::default()
-        });
-        let revision_b = crate::protocol::InventoryRevision {
-            inventory_seq: 2,
-            inventory_digest: "digest-b".to_string(),
-            inventory_acknowledged_at: "2026-08-05T00:00:00Z".to_string(),
-        };
-        let mut timed_out = TimedOutReloads::new();
-        timed_out.insert("inventory-a".to_string(), (candidate_a, Config::default()));
-
-        // Starting B deliberately supersedes uncertain A before B is prepared.
-        timed_out.clear_for_new_reload();
-        let mut live = candidate_b.clone();
-        let mut acknowledged = Some(revision_b.clone());
-        let late_a = crate::protocol::InventoryRevision {
-            inventory_seq: 1,
-            inventory_digest: "digest-a".to_string(),
-            inventory_acknowledged_at: "2026-08-05T00:00:01Z".to_string(),
-        };
-
-        assert!(!adopt_timed_out_reload_ack(
-            &mut timed_out,
-            "inventory-a",
-            late_a,
-            &mut live,
-            &mut acknowledged,
-        ));
-        assert_eq!(live, candidate_b);
-        assert_eq!(
-            acknowledged.as_ref().map(|revision| revision.inventory_seq),
-            Some(revision_b.inventory_seq)
-        );
-        assert_eq!(
-            acknowledged
-                .as_ref()
-                .map(|revision| revision.inventory_digest.as_str()),
-            Some(revision_b.inventory_digest.as_str())
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn timed_out_reload_capacity_evicts_only_the_oldest_candidate() {
-        let mut timed_out = TimedOutReloads::new();
-        for index in 0..=TIMED_OUT_RELOAD_ID_CAPACITY {
-            timed_out.insert(
-                format!("inventory-{index}"),
-                (Config::default(), Config::default()),
-            );
-        }
-
-        assert_eq!(timed_out.by_id.len(), TIMED_OUT_RELOAD_ID_CAPACITY);
-        assert!(!timed_out.by_id.contains_key("inventory-0"));
-        assert!(timed_out.by_id.contains_key("inventory-1"));
-        assert!(
-            timed_out
-                .by_id
-                .contains_key(&format!("inventory-{TIMED_OUT_RELOAD_ID_CAPACITY}"))
         );
     }
 

@@ -301,7 +301,7 @@ pub fn render_systemd_user_unit(
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart={exec} daemon start --foreground\n\
+         ExecStart={exec} run\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          # Exit 4: the credential is missing or was rejected (HTTP 401, including a\n\
@@ -394,7 +394,7 @@ pub fn render_macos_service_wrapper(
          \t. \"$ENV_FILE\"\n\
          \tset +a\n\
          fi\n\
-         exec '{executable}' daemon start --foreground\n",
+         exec '{executable}' run\n",
         env_file = shell_single_quote(env_file),
         executable = shell_single_quote(executable),
     )
@@ -638,7 +638,7 @@ fn print_install_notes(env_file: &Path, pinned: &[(&str, String)]) -> Result<()>
         "device login credentials are read from the CLI state directory and need no env file",
     )?;
     output::line(
-        "if you use `wsmp token login <ENV>` or endpoint header env vars, run \
+        "if you use endpoint header env vars, run \
          `wsmp service env-sync` from a shell where those variables are exported, then restart the service",
     )?;
     #[cfg(target_os = "linux")]
@@ -775,7 +775,7 @@ mod tests {
                 ("PATH", "/home/user/.local/bin:/usr/bin".to_string()),
             ],
         );
-        assert!(unit.contains("ExecStart=\"/opt/ws model/wsmp\" daemon start --foreground"));
+        assert!(unit.contains("ExecStart=\"/opt/ws model/wsmp\" run"));
         assert!(unit.contains("EnvironmentFile=-/home/user/.config/ws-model-proxy/service.env"));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains(&format!(
@@ -877,7 +877,7 @@ mod tests {
         assert!(script.contains("export WSMP_STATE_DIR='/Users/x/it'\"'\"'s state'\n"));
         assert!(script.contains("ENV_FILE='/Users/x/.config/ws-model-proxy/service.env'"));
         assert!(script.contains(". \"$ENV_FILE\""));
-        assert!(script.contains("exec '/usr/local/bin/wsmp' daemon start --foreground"));
+        assert!(script.contains("exec '/usr/local/bin/wsmp' run"));
     }
 
     #[test]

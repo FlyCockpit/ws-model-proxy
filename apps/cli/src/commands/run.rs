@@ -1,12 +1,10 @@
-//! `wsmp connect`.
+//! `wsmp run`: the relay in the foreground (what the service runs).
 
 use anyhow::Result;
-
-use crate::daemon::connect_foreground;
 
 #[derive(Debug, clap::Args)]
 pub struct Args {}
 
 pub fn run(_args: &Args) -> Result<()> {
-    connect_foreground()
+    crate::daemon::connect_foreground()
 }

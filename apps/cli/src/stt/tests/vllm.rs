@@ -310,7 +310,7 @@ fn vllm_profile(
     max_sessions: Option<u32>,
 ) -> Option<RealtimeTranscriptionProfile> {
     Some(RealtimeTranscriptionProfile {
-        adapter: RealtimeAdapter::Vllm,
+        adapter: SpecAdapter::Vllm,
         max_item_seconds,
         max_sessions,
     })
@@ -382,13 +382,13 @@ fn opened(engine: &FakeVllm, max_item_seconds: Option<u32>) -> (SttRegistry, Rec
     );
     let first = pump(&mut registry, &rx, |sent| !sent.is_empty());
     assert!(
-        matches!(first[..], [ClientControlMessage::SttOpened { .. }]),
+        matches!(first[..], [NodeFrame::SttOpened { .. }]),
         "{first:?}"
     );
     (registry, rx)
 }
 
-fn summary(sent: &[ClientControlMessage]) -> Vec<String> {
+fn summary(sent: &[NodeFrame]) -> Vec<String> {
     events(sent)
         .into_iter()
         .filter(|event| !matches!(event, SttEvent::Delta { .. }))
@@ -401,16 +401,16 @@ fn summary(sent: &[ClientControlMessage]) -> Vec<String> {
         .collect()
 }
 
-fn acked(sent: &[ClientControlMessage]) -> u64 {
+fn acked(sent: &[NodeFrame]) -> u64 {
     sent.iter()
         .filter_map(|message| match message {
-            ClientControlMessage::SttAudioAck { bytes, .. } => Some(u64::from(*bytes)),
+            NodeFrame::SttAudioAck { bytes, .. } => Some(u64::from(*bytes)),
             _ => None,
         })
         .sum()
 }
 
-fn completed(item: u32) -> impl Fn(&[ClientControlMessage]) -> bool {
+fn completed(item: u32) -> impl Fn(&[NodeFrame]) -> bool {
     has_event(
         move |event| matches!(event, SttEvent::Completed { item_seq, .. } if *item_seq == item),
     )
@@ -629,7 +629,7 @@ fn vllm_engine_socket_loss_ends_the_session() {
     }
     let sent = pump(&mut registry, &rx, |sent| {
         sent.iter()
-            .any(|message| matches!(message, ClientControlMessage::SttError { .. }))
+            .any(|message| matches!(message, NodeFrame::SttError { .. }))
     });
     assert!(
         sent.iter()
@@ -765,10 +765,7 @@ fn vllm_close_hangs_up_on_the_engine_mid_item() {
         &[],
         Instant::now(),
     );
-    assert!(matches!(
-        closed[..],
-        [ClientControlMessage::SttClosed { .. }]
-    ));
+    assert!(matches!(closed[..], [NodeFrame::SttClosed { .. }]));
     let started = Instant::now();
     assert!(engine.wait(|seen| seen.hung_up == 1));
     assert!(started.elapsed() < Duration::from_secs(2));
@@ -793,7 +790,7 @@ fn vllm_transcripts_stay_within_the_wire_contract() {
         if let SttEvent::Delta { text, .. } = event {
             assert!(text.len() <= crate::stt_wire::STT_DELTA_TEXT_MAX_BYTES);
         }
-        let frame = ClientControlMessage::SttEvent {
+        let frame = NodeFrame::SttEvent {
             session_id: SESSION.into(),
             event: event.clone(),
         };

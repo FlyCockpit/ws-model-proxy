@@ -211,14 +211,9 @@ impl ConfigLock {
     }
 }
 
-/// What MCP agents may run on this CLI. Read once when the relay starts.
-///
-/// For MCP commands, `supervised` only allows commands a person confirms in a
-/// browser terminal (Enter on a confirm screen); `unsupervised` also allows
-/// headless exec. Deployment jobs (`allow_deployments`) are not MCP commands:
-/// a job the server reports as person-approved runs in every mode, and an
-/// agent job in `supervised` relies on the server's approval flag, not a local
-/// confirm screen.
+/// The 0.3 command switch, read once when the relay starts. Until config v3
+/// carries `trust` (C1) it decides the node's trust: `unsupervised` is Full
+/// control, anything else is Relay only (see `crate::startup`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum McpCommandMode {
@@ -239,16 +234,6 @@ impl McpCommandMode {
 
     pub fn is_off(&self) -> bool {
         matches!(self, Self::Off)
-    }
-
-    /// Headless `exec.start` is allowed.
-    pub fn allows_exec(self) -> bool {
-        matches!(self, Self::Unsupervised)
-    }
-
-    /// Supervised terminals (`term.spawn`) are allowed.
-    pub fn allows_supervised(self) -> bool {
-        !matches!(self, Self::Off)
     }
 }
 
@@ -297,50 +282,6 @@ pub struct Config {
     /// Explicit directory allowlist for every file operation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_roots: Vec<PathBuf>,
-    /// Accept remotely defined metric sources (`metrics.sources.set`). Only
-    /// settable locally; read once when the relay starts. Each remote source
-    /// still needs `wsmp metrics approve` of its exact command.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub allow_remote_metric_sources: bool,
-    /// Accept remotely defined engine adapters (`engine.adapters.set`). Separate
-    /// from metric-source opt-in; read once when the relay starts. Each remote
-    /// adapter still needs `wsmp endpoints adapter approve` of its canonical spec.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub allow_remote_engine_adapters: bool,
-    /// Local deployment execution opt-in; every job rechecks the file.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub allow_deployments: bool,
-    /// Local opt-in for interactive recipe steps: an operator terminal in
-    /// which a person runs the step's command (e.g. one that asks for a sudo
-    /// password) from the dashboard. Separate from browser terminals (it
-    /// never opens a shell). Needs `allow_deployments` too; read fresh for
-    /// every job, every Enter and every viewer.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub allow_deployment_operator_terminal: bool,
-    /// Remote adapter endpoint slug -> SHA-256 (hex) of the approved canonical spec.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub approved_remote_adapters: std::collections::BTreeMap<String, String>,
-    /// Custom metric sources and remote-source approvals.
-    #[serde(default, skip_serializing_if = "MetricsConfig::is_empty")]
-    pub metrics: MetricsConfig,
-}
-
-/// `metrics` in the config file.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct MetricsConfig {
-    /// Local sources, keyed by source name (`[A-Za-z0-9_.:-]{1,64}`).
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub sources: std::collections::BTreeMap<String, MetricSourceConfig>,
-    /// Remote source name -> SHA-256 (hex) of the exact approved command.
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub approved_remote_sources: std::collections::BTreeMap<String, String>,
-}
-
-impl MetricsConfig {
-    pub fn is_empty(&self) -> bool {
-        self.sources.is_empty() && self.approved_remote_sources.is_empty()
-    }
 }
 
 impl Config {
@@ -489,30 +430,6 @@ pub const DEFAULT_MAX_TERMINALS: u32 = 4;
 /// Accepted `maxTerminals` values (`wsmp config set-max-terminals`).
 pub const MAX_TERMINALS_RANGE: std::ops::RangeInclusive<u32> = 1..=32;
 
-pub const METRIC_SOURCE_DEFAULT_INTERVAL_SECS: u32 = 10;
-pub const METRIC_SOURCE_DEFAULT_TIMEOUT_SECS: u32 = 5;
-
-fn default_metric_interval() -> u32 {
-    METRIC_SOURCE_DEFAULT_INTERVAL_SECS
-}
-
-fn default_metric_timeout() -> u32 {
-    METRIC_SOURCE_DEFAULT_TIMEOUT_SECS
-}
-
-/// One local metric source: a command run every `intervalSecs`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MetricSourceConfig {
-    pub command: String,
-    #[serde(default = "default_metric_interval")]
-    pub interval_secs: u32,
-    #[serde(default = "default_metric_timeout")]
-    pub timeout_secs: u32,
-    #[serde(default)]
-    pub format: crate::protocol::MetricSourceFormat,
-}
-
 /// The on-disk shape, including the legacy `allowMcpCommands` switch that
 /// older wsmp releases wrote. `true` there loads as `unsupervised`; the key is
 /// never written back.
@@ -535,12 +452,6 @@ struct ConfigWire {
     mcp_file_read: bool,
     #[serde(deserialize_with = "deserialize_file_roots")]
     file_roots: Vec<PathBuf>,
-    allow_remote_metric_sources: bool,
-    allow_remote_engine_adapters: bool,
-    allow_deployments: bool,
-    allow_deployment_operator_terminal: bool,
-    approved_remote_adapters: std::collections::BTreeMap<String, String>,
-    metrics: MetricsConfig,
 }
 
 impl Default for ConfigWire {
@@ -562,12 +473,6 @@ impl Default for ConfigWire {
             allow_file_tools_as_root: false,
             mcp_file_read: false,
             file_roots: Vec::new(),
-            allow_remote_metric_sources: false,
-            allow_remote_engine_adapters: false,
-            allow_deployments: false,
-            allow_deployment_operator_terminal: false,
-            approved_remote_adapters: std::collections::BTreeMap::new(),
-            metrics: MetricsConfig::default(),
         }
     }
 }
@@ -595,12 +500,6 @@ impl From<ConfigWire> for Config {
             allow_file_tools_as_root: wire.allow_file_tools_as_root,
             mcp_file_read: wire.mcp_file_read,
             file_roots: wire.file_roots,
-            allow_remote_metric_sources: wire.allow_remote_metric_sources,
-            allow_remote_engine_adapters: wire.allow_remote_engine_adapters,
-            allow_deployments: wire.allow_deployments,
-            allow_deployment_operator_terminal: wire.allow_deployment_operator_terminal,
-            approved_remote_adapters: wire.approved_remote_adapters,
-            metrics: wire.metrics,
         }
     }
 }
@@ -622,12 +521,6 @@ impl Default for Config {
             allow_file_tools_as_root: false,
             mcp_file_read: false,
             file_roots: Vec::new(),
-            allow_remote_metric_sources: false,
-            allow_remote_engine_adapters: false,
-            allow_deployments: false,
-            allow_deployment_operator_terminal: false,
-            approved_remote_adapters: std::collections::BTreeMap::new(),
-            metrics: MetricsConfig::default(),
         }
     }
 }
@@ -653,10 +546,6 @@ pub struct EndpointConfig {
     /// `concurrencyLimit`; when set it wins over a probed K.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_tokens: Option<u64>,
-    /// Custom engine adapter. Digest-excluded; when set it replaces the
-    /// built-in load scrape for this endpoint.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub engine_adapter: Option<crate::engine_adapter::EngineAdapterConfig>,
     /// Upstream engine. `auto` (the default) detects it at probe time; an
     /// explicit value overrides detection. llama.cpp and vLLM advertise
     /// `top_k` in the inventory only when declared explicitly.
@@ -681,7 +570,6 @@ impl Default for EndpointConfig {
             expand_media: false,
             concurrency_limit: None,
             kv_tokens: None,
-            engine_adapter: None,
             engine: EndpointEngine::Auto,
             default_capabilities: OpenAiCompatibleCapabilities::default(),
             headers: Vec::new(),
@@ -820,10 +708,6 @@ pub struct ProbeSnapshot {
     /// the inventory and never part of the inventory digest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<crate::engine::DetectedEngine>,
-    /// Integer facts from the last successful adapter run. Kept across a
-    /// failing run so K does not flap to null.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub adapter: Option<crate::engine_adapter::AdapterCachedFacts>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1092,7 +976,9 @@ impl OpenAiCompatibleCapabilities {
     /// A speech-to-text server: transcriptions only, with the options its
     /// recipe declares. Version 2 is the first that carries a detailed
     /// transcription profile (version 1 accepts only a boolean there).
-    pub fn transcription(profile: Option<&crate::deployments::TranscriptionProfile>) -> Self {
+    pub fn transcription(
+        profile: Option<&crate::protocol::runtime_spec::TranscriptionProfile>,
+    ) -> Self {
         let profile = profile.cloned().unwrap_or_default();
         Self {
             version: 2,
@@ -1115,12 +1001,19 @@ impl OpenAiCompatibleCapabilities {
                         languages: profile.languages,
                         language_detection: profile.language_detection,
                         multiple_language_hints: profile.multiple_language_hints,
-                        max_upload_bytes: profile.max_upload_bytes,
+                        max_upload_bytes: profile.max_upload_bytes.map(u64::from),
                         accepted_mime_types: profile.accepted_mime_types,
                         realtime: profile.realtime.map(|realtime| {
                             RealtimeTranscriptionCapabilities {
                                 supported: Some(true),
-                                adapter: realtime.adapter,
+                                adapter: match realtime.adapter {
+                                    crate::protocol::runtime_spec::RealtimeAdapter::Vllm => {
+                                        RealtimeAdapter::Vllm
+                                    }
+                                    crate::protocol::runtime_spec::RealtimeAdapter::Segmented => {
+                                        RealtimeAdapter::Segmented
+                                    }
+                                },
                                 max_item_seconds: realtime.max_item_seconds,
                                 max_sessions: realtime.max_sessions,
                             }
@@ -1624,7 +1517,7 @@ pub struct EmbeddingsCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supported: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub contract: Option<crate::deployments::EmbeddingContract>,
+    pub contract: Option<crate::protocol::runtime_spec::EmbeddingContract>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1881,11 +1774,6 @@ impl Config {
                     "endpoint `{}` kvTokens must be an integer from 1 to 1000000000000",
                     endpoint.slug
                 );
-            }
-            if let Some(adapter) = &endpoint.engine_adapter {
-                adapter.validate().with_context(|| {
-                    format!("validating engine adapter for endpoint `{}`", endpoint.slug)
-                })?;
             }
             if let Some(auth) = &endpoint.auth {
                 validate_env_name(&auth.env)?;
@@ -2735,7 +2623,6 @@ mod tests {
             models: Vec::new(),
             suggested_capabilities: OpenAiCompatibleCapabilities::default(),
             engine: None,
-            adapter: None,
         });
         assert!(config.validate().is_err());
 

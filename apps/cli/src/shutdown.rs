@@ -185,16 +185,6 @@ mod tracked {
     #[must_use = "the cleanup is unregistered when this guard drops"]
     pub struct ExitCleanup(u64);
 
-    #[cfg(all(test, unix))]
-    impl ExitCleanup {
-        pub(crate) fn run_registered(&self) {
-            let cleanups = CLEANUPS.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(cleanup) = cleanups.get(&self.0) {
-                cleanup();
-            }
-        }
-    }
-
     impl Drop for ExitCleanup {
         fn drop(&mut self) {
             CLEANUPS
@@ -308,7 +298,7 @@ mod unix {
     }
 
     /// SIGTERM, SIGINT, and SIGHUP, minus any the relay inherited as ignored
-    /// (`nohup`, as `wsmp daemon start` uses, or a background job of a
+    /// (`nohup`, or a background job of a
     /// non-interactive shell). Installing a handler would undo that choice.
     fn shutdown_signals() -> Vec<Signal> {
         let ignored = inherited_ignored_mask();

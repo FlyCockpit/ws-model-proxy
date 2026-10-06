@@ -27,7 +27,7 @@
 //! the program is not reading and the queue is full, further input is dropped
 //! and the viewer is told with `term.input_dropped`.
 //!
-//! Protocol 2.5 terminals have many viewers. Each viewer has pairwise v2 keys
+//! Terminals have many viewers. Each viewer has pairwise v2 keys
 //! for its input and for unicast frames (output-key delivery and its scrollback
 //! replay). Live output and PTY-size frames are sealed once under a shared
 //! per-terminal output key; the relay fans them out. The key rotates to a new
@@ -52,19 +52,14 @@ use std::sync::{Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-
 use crate::approvals::{approved_public_key, record_pending};
 use crate::child_env::{self, scrub_parent_env};
 use crate::config::Config;
 use crate::output_mask::StreamMasker;
-#[cfg(unix)]
-use crate::protocol::SupervisedOutputPart;
-use crate::protocol::{
-    ClientControlMessage, RelayBinaryFrameMetadata, SupervisedSpawn, TerminalIdentity,
-    terminal_supported,
+use crate::protocol::frames::{
+    ExecState, ExecStatus, NODE_COMMAND_MAX_MS, NODE_COMMAND_TAIL_MAX_BYTES, TerminalIdentity,
 };
+use crate::protocol::{NodeBinaryMetadata, NodeFrame, terminal_supported};
 use crate::relay_bus::FromWorker;
 use crate::startup::TerminalStartup;
 use crate::terminal_crypto::{
@@ -79,7 +74,8 @@ const SCROLLBACK_LIMIT: usize = 256 * 1024;
 const READ_CHUNK: usize = 8 * 1024;
 const SEAL_CHUNK: usize = 16 * 1024;
 const DEFAULT_IDLE: Duration = Duration::from_secs(15 * 60);
-pub(crate) const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// A node command's longest lifetime until the node definition says otherwise.
+pub(crate) const DEFAULT_COMMAND_MAX: Duration = Duration::from_millis(NODE_COMMAND_MAX_MS);
 const PENDING_TTL: Duration = Duration::from_secs(2 * 60);
 /// How often attached 2.5 viewers are re-checked against the approvals file.
 const APPROVAL_RECHECK: Duration = Duration::from_secs(5);
@@ -108,6 +104,8 @@ const TERMINAL_OUTPUT_DRAIN: Duration = Duration::from_millis(500);
 const LEGACY_VIEWER: &str = "";
 
 const REASON_DISABLED: &str = "disabled";
+/// A command refused because the node is at Relay only.
+const REASON_TRUST_RELAY: &str = "trust_relay";
 const REASON_UNSUPPORTED: &str = "unsupported";
 const REASON_LIMIT: &str = "limit";
 const REASON_VIEWER_LIMIT: &str = "viewer_limit";
@@ -120,54 +118,11 @@ const REASON_ALREADY_OPEN: &str = "already_open";
 const REASON_SPAWN_FAILED: &str = "spawn_failed";
 const REASON_BAD_HANDSHAKE: &str = "bad_handshake";
 const REASON_BAD_FRAME: &str = "bad_frame";
-#[cfg(unix)]
-const REASON_INVALID_INPUT: &str = "invalid_input";
 const REASON_EXPIRED: &str = "expired";
-const REASON_SUPERVISED_ONLY: &str = "supervised_only";
-/// The supervised working directory is not valid UTF-8, so the confirm
-/// screen could not show it exactly. Passed through to the agent as the
-/// rejection reason.
-const REASON_CWD_NOT_UTF8: &str = "cwd_not_utf8";
-
-/// Supervised terminals waiting for Enter (starting or on the confirm screen).
-const MAX_SUPERVISED_AWAITING: usize = 1;
-/// Supervised terminals with a live PTY (awaiting Enter or running). With
-/// one awaiting slot this is "1 awaiting + 1 running", enforced at spawn: an
-/// Enter on a drawn screen is never refused. Finished review-pending
-/// terminals (no PTY) do not count.
-const MAX_SUPERVISED_LIVE: usize = 2;
-/// Safety net for a confirm screen nobody answered. The server expires the
-/// request at 15 minutes and normally cancels it first.
-const SUPERVISED_CONFIRM_TTL: Duration = Duration::from_secs(16 * 60);
-/// How long a finished command's output capture waits for review.
-const SUPERVISED_REVIEW_TTL: Duration = Duration::from_secs(15 * 60);
-const SUPERVISED_REASON_MAX_CHARS: usize = 500;
-const SUPERVISED_REQUESTER_MAX_CHARS: usize = 100;
-#[cfg(unix)]
-const SUPERVISED_BODY_WAIT: Duration = Duration::from_secs(10);
-
-#[cfg(unix)]
-mod operator;
-#[cfg(unix)]
-pub(crate) use operator::OperatorEvent;
-#[cfg(unix)]
-mod supervised_pty;
-#[cfg(unix)]
-use supervised_pty::{MarkerEvent, Piece};
-#[cfg(unix)]
-pub(crate) use supervised_pty::{
-    SUPERVISED_ENV_COMMAND, SUPERVISED_ENV_FILE_ALLOW_ROOT, SUPERVISED_ENV_FILE_ARGS,
-    SUPERVISED_ENV_FILE_BLOCKED, SUPERVISED_ENV_FILE_BODY, SUPERVISED_ENV_FILE_ETAG_KEY,
-    SUPERVISED_ENV_FILE_OP, SUPERVISED_ENV_FILE_PREIMAGE, SUPERVISED_ENV_FILE_ROOTS,
-    SUPERVISED_ENV_MARKER, SUPERVISED_ENV_MARKER_FILE, SUPERVISED_ENV_NAMES,
-    SUPERVISED_ENV_OPERATOR, SUPERVISED_ENV_REASON, SUPERVISED_ENV_REQUESTER, SUPERVISED_ENV_SHARE,
-    supervised_marker,
-};
-
-#[allow(clippy::large_enum_variant)] // 2.9 telemetry grew `ClientControlMessage`.
+#[allow(clippy::large_enum_variant)] // `NodeFrame` carries the telemetry shapes.
 pub(crate) enum OutboundFrame {
-    Control(ClientControlMessage),
-    Binary(RelayBinaryFrameMetadata, Vec<u8>),
+    Control(NodeFrame),
+    Binary(NodeBinaryMetadata, Vec<u8>),
 }
 
 #[derive(Clone, Copy)]
@@ -192,8 +147,6 @@ enum Incoming {
     Ignore,
     /// An authenticated frame with a bad payload removes only its viewer.
     DropViewer,
-    /// A supervised command's "review output before sending" checkbox.
-    ReviewToggle(bool),
 }
 
 /// Why a browser terminal cannot open: `open` live browser terminals against
@@ -545,7 +498,8 @@ fn prepare_handshake(
     };
     if let Some(reason) = terminal_block_reason(
         terminal_supported(),
-        startup.allow_human_terminal(),
+        // Browser terminals need the local switch and Full control.
+        startup.allow_human_terminal() && startup.full_control(),
         counted,
         startup.max_terminals(),
     ) {
@@ -560,7 +514,7 @@ fn term_pending(
     cli_nonce: &str,
     approval_code: Option<String>,
 ) -> OutboundFrame {
-    OutboundFrame::Control(ClientControlMessage::TermPending {
+    OutboundFrame::Control(NodeFrame::TermPending {
         terminal_id: terminal_id.to_string(),
         viewer_id: viewer_id.map(str::to_string),
         cli_nonce: cli_nonce.to_string(),
@@ -574,7 +528,7 @@ fn term_rejected(
     reason: &str,
     approval_code: Option<String>,
 ) -> OutboundFrame {
-    OutboundFrame::Control(ClientControlMessage::TermRejected {
+    OutboundFrame::Control(NodeFrame::TermRejected {
         terminal_id: terminal_id.to_string(),
         viewer_id: viewer_id.map(str::to_string),
         reason: reason.to_string(),
@@ -583,7 +537,7 @@ fn term_rejected(
 }
 
 fn term_writer(terminal_id: &str, writer: Option<&str>) -> OutboundFrame {
-    OutboundFrame::Control(ClientControlMessage::TermWriter {
+    OutboundFrame::Control(NodeFrame::TermWriter {
         terminal_id: terminal_id.to_string(),
         viewer_id: writer.map(str::to_string),
     })
@@ -597,7 +551,7 @@ fn sealed_frame(
     body: Vec<u8>,
 ) -> OutboundFrame {
     OutboundFrame::Binary(
-        RelayBinaryFrameMetadata::TermSealed {
+        NodeBinaryMetadata::TermSealed {
             terminal_id: terminal_id.to_string(),
             seq,
             viewer_id: viewer_id.map(str::to_string),
@@ -607,7 +561,7 @@ fn sealed_frame(
     )
 }
 
-/// One info line per command operation (headless `exec` or `supervised`):
+/// One info line per command operation (`exec`):
 /// the operation, the relay command id and a stable outcome code. Never the
 /// command text, cwd, environment or output (the server's audit log holds a
 /// hash of the command text plus its program name; this log is the CLI-side
@@ -620,16 +574,13 @@ fn rejected_outcome(reason: &str) -> String {
     format!("rejected:{reason}")
 }
 
-/// One info line for a command-op rejection the relay could not read as a
-/// request at all (a malformed `term.spawn` frame). Otherwise the request
-/// never reaches `TerminalRegistry`, so this is the only place it is logged.
-pub(crate) fn log_command_rejected(op: &'static str, command_id: &str, reason: &str) {
-    log_command_op(op, command_id, &rejected_outcome(reason));
-}
-
-fn done_outcome(exit_code: Option<i32>, signal: Option<i32>, timed_out: bool) -> String {
-    if timed_out {
+fn done_outcome(exit_code: Option<i32>, signal: Option<i32>, cause: EndCause) -> String {
+    if cause == EndCause::TimedOut {
         "timed_out".to_string()
+    } else if cause == EndCause::Cancelled {
+        "cancelled".to_string()
+    } else if cause == EndCause::Interrupted {
+        "interrupted".to_string()
     } else if let Some(code) = exit_code {
         format!("exited:{code}")
     } else if let Some(signal) = signal {
@@ -641,7 +592,7 @@ fn done_outcome(exit_code: Option<i32>, signal: Option<i32>, timed_out: bool) ->
 
 fn exec_rejected(command_id: &str, reason: &str) -> OutboundFrame {
     log_command_op("exec", command_id, &rejected_outcome(reason));
-    OutboundFrame::Control(ClientControlMessage::ExecRejected {
+    OutboundFrame::Control(NodeFrame::ExecRejected {
         command_id: command_id.to_string(),
         reason: reason.to_string(),
     })
@@ -649,22 +600,6 @@ fn exec_rejected(command_id: &str, reason: &str) -> OutboundFrame {
 
 fn signal_token(signal: Option<i32>) -> Option<String> {
     signal.map(|value| value.to_string())
-}
-
-fn exec_done(
-    command_id: &str,
-    exit_code: Option<i32>,
-    signal: Option<i32>,
-    timed_out: bool,
-) -> OutboundFrame {
-    let outcome = done_outcome(exit_code, signal, timed_out);
-    log_command_op("exec", command_id, &outcome);
-    OutboundFrame::Control(ClientControlMessage::ExecDone {
-        command_id: command_id.to_string(),
-        exit_code,
-        signal: signal_token(signal),
-        timed_out,
-    })
 }
 
 #[cfg(unix)]
@@ -984,20 +919,6 @@ impl InputQueue {
         Ok(true)
     }
 
-    /// The daemon's own bytes (the supervised `go` token): queued behind
-    /// what is already there, never dropped for a full queue.
-    fn push_control(&self, bytes: Vec<u8>) -> std::io::Result<()> {
-        let mut state = self.lock();
-        if state.failed || state.closed {
-            return Err(std::io::Error::other("terminal input is closed"));
-        }
-        state.pending += bytes.len();
-        state.chunks.push_back(bytes);
-        drop(state);
-        self.ready.notify_one();
-        Ok(())
-    }
-
     /// The next chunk for the writer, or `None` once the terminal closes.
     fn next(&self, stop: &AtomicBool) -> Option<Vec<u8>> {
         let mut state = self.lock();
@@ -1148,13 +1069,6 @@ fn wipe(bytes: &mut [u8]) {
     std::hint::black_box(&*bytes);
 }
 
-fn wipe_capture_message(message: &mut TermPlaintextV2) {
-    if let TermPlaintextV2::ReviewCapture { head, tail, .. } = message {
-        wipe(head);
-        wipe(tail);
-    }
-}
-
 /// One browser tab.
 struct Viewer {
     keys: DirectionKeys,
@@ -1238,272 +1152,6 @@ impl Drop for OutputKey {
     }
 }
 
-/// The bytes a command printed after Enter, bounded like the server's exec
-/// buffers: the first [`terminal_crypto::CAPTURE_HEAD_MAX`] bytes and a
-/// rolling last [`terminal_crypto::CAPTURE_TAIL_MAX`] bytes of the stream,
-/// whose start is moved on to a terminal-parser boundary (see
-/// [`crate::terminal_parse`]).
-#[derive(Default)]
-struct Capture {
-    head: Vec<u8>,
-    tail: VecDeque<u8>,
-    /// Masked byte count, before head/tail retention.
-    total: u64,
-    /// The terminal parser across the bytes dropped from the tail's front.
-    #[cfg_attr(
-        not(unix),
-        expect(
-            dead_code,
-            reason = "only the Unix PTY path (`supervised_pty`) pushes into a capture"
-        )
-    )]
-    tail_state: crate::terminal_parse::TerminalByteState,
-}
-
-impl Capture {
-    /// The server's view: the tail only once the stream is past the head.
-    fn parts(&self) -> (Vec<u8>, Vec<u8>) {
-        let tail = if self.total > terminal_crypto::CAPTURE_HEAD_MAX as u64 {
-            self.tail.iter().copied().collect()
-        } else {
-            Vec::new()
-        };
-        (self.head.clone(), tail)
-    }
-}
-
-impl Drop for Capture {
-    fn drop(&mut self) {
-        wipe(&mut self.head);
-        self.tail.iter_mut().for_each(|byte| *byte = 0);
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    not(unix),
-    expect(
-        dead_code,
-        reason = "only the Unix PTY path (`supervised_pty`) creates a supervised terminal; \
-                  elsewhere the shared checks below only ever see `None`"
-    )
-)]
-enum SupervisedPhase {
-    /// The confirm child is starting; its screen is not drawn yet.
-    Starting,
-    /// The confirm screen is drawn and waits for Enter.
-    Confirm,
-    /// Enter was pressed; the command runs in the PTY.
-    Running,
-    /// The command exited and its capture waits for review. No PTY.
-    Finished,
-}
-
-#[cfg(unix)]
-struct PrivateBody {
-    path: PathBuf,
-    directory: PathBuf,
-    _exit_cleanup: crate::shutdown::ExitCleanup,
-}
-
-#[cfg(unix)]
-impl PrivateBody {
-    fn create(bytes: &[u8]) -> std::io::Result<Self> {
-        Self::create_with(bytes, |_| Ok(()))
-    }
-
-    fn create_with(
-        bytes: &[u8],
-        before_open: impl FnOnce(&Path) -> std::io::Result<()>,
-    ) -> std::io::Result<Self> {
-        let nonce = terminal_crypto::random_nonce().map_err(std::io::Error::other)?;
-        let name = nonce
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let directory = std::env::temp_dir().join(format!("wsmp-supervised-{name}"));
-        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
-        let path = directory.join("body");
-        let cleanup_path = path.clone();
-        let cleanup_directory = directory.clone();
-        let body = Self {
-            path,
-            directory,
-            _exit_cleanup: crate::shutdown::register_exit_cleanup(move || {
-                let _ = std::fs::remove_file(&cleanup_path);
-                let _ = std::fs::remove_dir(&cleanup_directory);
-            }),
-        };
-        let result: std::io::Result<()> = (|| {
-            before_open(&body.path)?;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&body.path)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            Ok(())
-        })();
-        result?;
-        Ok(body)
-    }
-}
-
-#[cfg(unix)]
-impl Drop for PrivateBody {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-        let _ = std::fs::remove_dir(&self.directory);
-    }
-}
-
-#[cfg(unix)]
-struct SupervisedFile {
-    generation: u64,
-    op: String,
-    summary: crate::file_relay::OpSummary,
-    prepared: Option<crate::file_ops::PreparedSupervised>,
-    cancel: crate::file_ops::Cancel,
-    _body: Option<PrivateBody>,
-    applied: bool,
-    settled: bool,
-    blocked: Option<crate::protocol::FileErrorCode>,
-}
-
-#[cfg(unix)]
-impl Drop for SupervisedFile {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-    }
-}
-
-/// An agent-requested terminal: a confirm screen, then exactly one command.
-struct Supervised {
-    command_id: String,
-    share_output: bool,
-    /// Terminal-wide "review output before sending".
-    review: bool,
-    phase: SupervisedPhase,
-    /// The confirm child's markers, the `go` token and PTY EOF.
-    #[cfg(unix)]
-    child: supervised_pty::ChildLink,
-    capture: Capture,
-    /// Only the shared/review copy is masked; the PTY display stays raw.
-    #[cfg(unix)]
-    mask: StreamMasker,
-    spawned_at: Instant,
-    finished_at: Option<Instant>,
-    /// Kept for the `term.exit` of a finished session.
-    exit_status: (Option<i32>, Option<i32>),
-    /// A person pressed Enter but `go` could not be written (the PTY is
-    /// going away): the command never started, and this is not a decline.
-    start_failed: bool,
-    /// Whether the one `command operation` outcome line for this command was
-    /// written. `close` is the only path that can run after another one
-    /// already ended the command, so it asks before logging.
-    logged_outcome: bool,
-    /// Present only for `kind:"file"`; owns the pinned preparation and its
-    /// cancellation token until the worker settles or the session is removed.
-    #[cfg(unix)]
-    file: Option<SupervisedFile>,
-    /// A trusted child emitted a blocked state error after human dismissal.
-    #[cfg(unix)]
-    blocked: Option<crate::protocol::FileErrorCode>,
-    /// A marker carrying this request token had invalid grammar/state.
-    #[cfg(unix)]
-    marker_invalid: bool,
-}
-
-#[cfg(unix)]
-enum PendingFileStage {
-    Body { expected: usize },
-    Preparing,
-}
-
-#[cfg(unix)]
-struct PendingFile {
-    spawn: SupervisedSpawn,
-    generation: u64,
-    stage: PendingFileStage,
-    body: Option<Vec<u8>>,
-    preview_key: crate::file_ops::EtagKey,
-    preview_key_hex: String,
-    cancel: crate::file_ops::Cancel,
-    created: Instant,
-}
-
-impl Supervised {
-    #[cfg(unix)]
-    fn capture_bytes(&mut self, bytes: &[u8]) {
-        self.capture.push(&self.mask.push(bytes));
-    }
-
-    #[cfg(unix)]
-    fn finish_capture(&mut self) {
-        self.capture.push(&self.mask.finish());
-    }
-
-    fn awaiting(&self) -> bool {
-        matches!(
-            self.phase,
-            SupervisedPhase::Starting | SupervisedPhase::Confirm
-        )
-    }
-
-    /// The outcome of a command that never took an Enter.
-    fn waiting_outcome(&self) -> &'static str {
-        if self.start_failed {
-            "start_failed"
-        } else {
-            "declined"
-        }
-    }
-
-    /// The one outcome line for this command, whichever path ends it. Later
-    /// paths see the flag and stay silent, so a command never logs twice.
-    fn log_outcome(&mut self, outcome: &str) {
-        if self.logged_outcome {
-            return;
-        }
-        self.logged_outcome = true;
-        #[cfg(unix)]
-        if let Some(file) = self.file.as_ref() {
-            crate::file_relay::log_outcome(&file.summary, outcome);
-            return;
-        }
-        log_command_op("supervised", &self.command_id, outcome);
-    }
-
-    /// The outcome for a path that ends the command without its own report
-    /// (`close`): a running command is `cancelled`, one that never took an
-    /// Enter is its decline/start_failed outcome, and one that already
-    /// reported (its exit, a decline from the declined frame path, or the
-    /// close of a waiting screen) is `None` — that line was already written.
-    fn closing_outcome(&self) -> Option<&'static str> {
-        if self.logged_outcome {
-            return None;
-        }
-        match self.phase {
-            SupervisedPhase::Running => Some("cancelled"),
-            // A Finished terminal already reported its exit through
-            // `finish_supervised`; closing it (review expiry, a stop) must
-            // not report a second time.
-            SupervisedPhase::Finished => None,
-            SupervisedPhase::Starting | SupervisedPhase::Confirm => Some(self.waiting_outcome()),
-        }
-    }
-
-    fn capture_message(&self) -> TermPlaintextV2 {
-        let (head, tail) = self.capture.parts();
-        TermPlaintextV2::ReviewCapture {
-            total: self.capture.total,
-            head,
-            tail,
-        }
-    }
-}
-
 struct TerminalSession {
     viewers: BTreeMap<String, Viewer>,
     /// The viewer that most recently typed.
@@ -1515,199 +1163,16 @@ struct TerminalSession {
     scrollback: VecDeque<u8>,
     #[cfg(unix)]
     pty: Option<PtyRuntime>,
-    /// Set on an agent-requested (supervised) terminal.
-    supervised: Option<Supervised>,
-    /// Set on a deployment operator terminal (`sessions::operator`).
-    #[cfg(unix)]
-    operator: Option<operator::OperatorTerminal>,
 }
 
 impl TerminalSession {
-    /// Whether viewer keystrokes may reach the PTY now. A supervised terminal
-    /// takes input only once its confirm screen is drawn and while the
-    /// command has not exited; everything else is dropped, never queued.
+    /// Whether viewer keystrokes may reach the PTY now: not once the shell
+    /// has exited.
     fn accepts_input(&self) -> bool {
         #[cfg(unix)]
-        if self.pty.as_ref().is_none_or(|pty| pty.exited.is_some()) {
-            return false;
-        }
-        #[cfg(unix)]
-        if let Some(operator) = &self.operator {
-            // Nothing reaches the PTY before the confirm screen is drawn.
-            return operator.ready_seen && !operator.invalid;
-        }
-        match &self.supervised {
-            None => true,
-            Some(supervised) => matches!(
-                supervised.phase,
-                SupervisedPhase::Confirm | SupervisedPhase::Running
-            ),
-        }
-    }
-
-    fn is_operator(&self) -> bool {
-        #[cfg(unix)]
-        return self.operator.is_some();
+        return self.pty.as_ref().is_some_and(|pty| pty.exited.is_none());
         #[cfg(not(unix))]
         false
-    }
-
-    /// Supervised PTY output: markers become phase changes and never reach
-    /// viewers; bytes after Enter also go to the capture.
-    #[cfg(unix)]
-    fn supervised_bytes(
-        &mut self,
-        terminal_id: &str,
-        bytes: &[u8],
-        mode_allows: bool,
-    ) -> (Vec<OutboundFrame>, bool) {
-        let mut frames = Vec::new();
-        let mut display = Vec::new();
-        // An Enter that starts the command logs its outcome outside the
-        // borrow below, so the log line instruction stays out of the loop.
-        let mut accepted = false;
-        let mut file_after_send = false;
-        {
-            let Some(supervised) = self.supervised.as_mut() else {
-                return (frames, file_after_send);
-            };
-            if supervised.phase == SupervisedPhase::Finished {
-                return (frames, file_after_send);
-            }
-            for piece in supervised.child.scanner.feed(bytes) {
-                match piece {
-                    Piece::Bytes(bytes) => {
-                        if supervised.phase == SupervisedPhase::Running {
-                            supervised.capture_bytes(&bytes);
-                        }
-                        display.extend(bytes);
-                    }
-                    Piece::Event(MarkerEvent::Ready) => {
-                        if supervised.phase == SupervisedPhase::Starting {
-                            supervised.phase = SupervisedPhase::Confirm;
-                        }
-                    }
-                    Piece::Event(MarkerEvent::Accepted) => {
-                        // The decision point: only a request still waiting
-                        // here starts; the child execs only on `go`.
-                        if supervised.phase != SupervisedPhase::Confirm {
-                            continue;
-                        }
-                        if supervised
-                            .file
-                            .as_ref()
-                            .is_some_and(|file| file.blocked.is_some())
-                        {
-                            supervised.marker_invalid = true;
-                            continue;
-                        }
-                        if !mode_allows {
-                            supervised.start_failed = true;
-                            supervised.marker_invalid = true;
-                            let reject = if supervised.file.is_some() {
-                                supervised_file_rejected
-                            } else {
-                                supervised_rejected
-                            };
-                            frames.push(reject(&supervised.command_id, REASON_DISABLED));
-                            continue;
-                        }
-                        let released = self
-                            .pty
-                            .as_ref()
-                            .map(|pty| pty.input.push_control(supervised.child.go.clone()));
-                        if let Some(Ok(())) = released {
-                            supervised.phase = SupervisedPhase::Running;
-                            accepted = true;
-                            file_after_send = supervised.file.is_some();
-                            frames.push(OutboundFrame::Control(
-                                ClientControlMessage::SupervisedAccepted {
-                                    command_id: supervised.command_id.clone(),
-                                },
-                            ));
-                        } else {
-                            // The PTY is going away; the child exits without
-                            // running anything. Only `term.exit` reports it:
-                            // a person pressed Enter, so it is no decline.
-                            supervised.start_failed = true;
-                            tracing::warn!(terminal_id, "could not start a confirmed command");
-                        }
-                    }
-                    Piece::Event(MarkerEvent::Blocked(code)) => {
-                        if supervised.phase != SupervisedPhase::Confirm || supervised.file.is_none()
-                        {
-                            supervised.marker_invalid = true;
-                            continue;
-                        }
-                        // The authenticated child recomputes its preview from
-                        // the real disk. Its state error can therefore differ
-                        // from the daemon's earlier preparation (including an
-                        // earlier allowed preview); the marker's request token,
-                        // grammar, phase and file-session binding are the trust
-                        // boundary, not equality with that stale snapshot.
-                        if let Some(file) = supervised.file.as_mut() {
-                            file.cancel.cancel();
-                            file.settled = true;
-                        }
-                        supervised.blocked = Some(code);
-                        supervised.log_outcome(code.as_str());
-                        supervised.phase = SupervisedPhase::Finished;
-                        frames.push(OutboundFrame::Control(
-                            ClientControlMessage::SupervisedDone {
-                                command_id: supervised.command_id.clone(),
-                                exit_code: None,
-                                signal: None,
-                                review: false,
-                                output_bytes: None,
-                                file: crate::protocol::SupervisedFileOutcome::error(code),
-                            },
-                        ));
-                    }
-                    // Agent terminals scan with the supervised grammar,
-                    // which reports `exited` as `Invalid`; never seen here.
-                    Piece::Event(MarkerEvent::Invalid | MarkerEvent::Exited(_)) => {
-                        supervised.marker_invalid = true;
-                    }
-                }
-            }
-        }
-        if accepted {
-            // "started" is not the command's outcome line: only the path that
-            // ends the command logs that, and only once.
-            if let Some(supervised) = self.supervised.as_ref() {
-                log_command_op("supervised", &supervised.command_id, "started");
-            }
-        }
-        if !display.is_empty() {
-            push_scrollback(&mut self.scrollback, &display);
-            frames.extend(self.broadcast_data(terminal_id, &display));
-        }
-        (frames, file_after_send)
-    }
-
-    /// Unicast to a joining viewer: the review flag, and the capture when a
-    /// finished command waits for review.
-    fn supervised_join_frames(&mut self, terminal_id: &str, viewer_id: &str) -> Vec<OutboundFrame> {
-        let Some(supervised) = self.supervised.as_ref() else {
-            return Vec::new();
-        };
-        if !supervised.share_output {
-            return Vec::new();
-        }
-        let review = supervised.review;
-        let capture = (supervised.phase == SupervisedPhase::Finished && review)
-            .then(|| supervised.capture_message());
-        let mut frames = Vec::new();
-        frames.extend(self.seal_unicast(
-            terminal_id,
-            viewer_id,
-            &TermPlaintextV2::ReviewState(review),
-        ));
-        if let Some(mut message) = capture {
-            frames.extend(self.seal_unicast(terminal_id, viewer_id, &message));
-            wipe_capture_message(&mut message);
-        }
-        frames
     }
 
     /// One v2 frame under a viewer's pairwise CLI->browser key.
@@ -1864,10 +1329,11 @@ impl TerminalSession {
         match terminal_crypto::decode_plaintext_v2(&plaintext) {
             Ok(TermPlaintextV2::Data(bytes)) => Incoming::Write(bytes),
             Ok(TermPlaintextV2::Resize { cols, rows }) => Incoming::Resize { cols, rows },
-            Ok(TermPlaintextV2::ReviewToggle(on)) => Incoming::ReviewToggle(on),
-            // A browser never sends an output key, a capture, or a review state.
+            // A browser never sends an output key; review frames belonged to
+            // the removed supervised terminals.
             Ok(
                 TermPlaintextV2::OutputKey { .. }
+                | TermPlaintextV2::ReviewToggle(_)
                 | TermPlaintextV2::ReviewCapture { .. }
                 | TermPlaintextV2::ReviewState(_),
             )
@@ -1901,38 +1367,7 @@ fn wire_viewer(viewer_key: &str) -> Option<&str> {
     (viewer_key != LEGACY_VIEWER).then_some(viewer_key)
 }
 
-#[cfg(unix)]
-struct FileApplyAfterSend {
-    terminal_id: String,
-    command_id: String,
-    generation: u64,
-}
-
-/// Frames produced by one PTY read and its single-use post-transmission work.
-#[cfg(unix)]
-pub(crate) struct TerminalBytesDispatch {
-    frames: Vec<OutboundFrame>,
-    file_after_send: Option<FileApplyAfterSend>,
-}
-
-#[cfg(unix)]
-impl TerminalBytesDispatch {
-    pub(crate) fn transmit<E>(
-        self,
-        terminals: &mut TerminalRegistry,
-        mut send: impl FnMut(Vec<OutboundFrame>) -> Result<(), E>,
-    ) -> Result<(), E> {
-        send(self.frames)?;
-        if let Some(after_send) = self.file_after_send {
-            send(terminals.queue_file_apply(after_send))?;
-        }
-        Ok(())
-    }
-}
-
 pub(crate) struct TerminalRegistry {
-    #[cfg(all(test, unix))]
-    file_child_env: Vec<(String, String)>,
     sessions: BTreeMap<String, TerminalSession>,
     pending: BTreeMap<PendingKey, PendingTerminal>,
     #[cfg(unix)]
@@ -1944,77 +1379,17 @@ pub(crate) struct TerminalRegistry {
     shut_down: bool,
     #[cfg(unix)]
     shell: Option<(String, Vec<String>)>,
-    /// The confirm child program. `None`: this binary, `terminal supervised-run`.
-    #[cfg(unix)]
-    supervised_program: Option<(String, Vec<String>)>,
-    /// The operator child program. `None`: this binary,
-    /// `terminal supervised-run --deployment`.
-    #[cfg(unix)]
-    operator_program: Option<(String, Vec<String>)>,
-    /// Operator terminal events for the session loop.
-    #[cfg(unix)]
-    operator_events: Vec<OperatorEvent>,
-    /// Stops held until a person's run on their instance has ended.
-    #[cfg(unix)]
-    deferred_jobs: Vec<crate::deployments::Job>,
-    /// Recently ended operator terminals and how they ended.
-    #[cfg(unix)]
-    ended_operators: VecDeque<(String, OperatorEvent)>,
-    /// Whether local deployments are on (fresh config read); tests replace it.
-    #[cfg(unix)]
-    operator_allowed: fn() -> bool,
-    #[cfg(unix)]
-    next_operator_gate_check: Option<Instant>,
-    confirm_ttl: Duration,
-    review_ttl: Duration,
-    #[cfg(unix)]
-    file_runtime: Option<Arc<crate::file_relay::FileRuntime>>,
-    #[cfg(unix)]
-    pending_files: BTreeMap<String, PendingFile>,
-    #[cfg(unix)]
-    next_file_generation: u64,
 }
 
-/// Closed pre-display file refusal contract, mirrored by the server schema.
-const SUPERVISED_FILE_REJECT_REASONS: &[&str] = &[
-    "disabled",
-    "unsupported",
-    "limit",
-    "already_open",
-    "spawn_failed",
-    "bad_command",
-    "bad_frame",
-    "invalid_input",
-    "path_denied",
-    "secret_file",
-    "too_large",
-    "redacted_span",
-    "special_file",
-];
-
-/// The only file rejection reason mapping. Internal failures and unexpected
-/// state-dependent prepare errors reveal no filesystem state before display.
-fn supervised_file_rejected(command_id: &str, reason: &str) -> OutboundFrame {
-    let reason = if SUPERVISED_FILE_REJECT_REASONS.contains(&reason) {
-        reason
-    } else {
-        REASON_SPAWN_FAILED
-    };
-    supervised_rejected(command_id, reason)
-}
-
-fn supervised_rejected(command_id: &str, reason: &str) -> OutboundFrame {
-    log_command_op("supervised", command_id, &format!("rejected:{reason}"));
-    OutboundFrame::Control(ClientControlMessage::SupervisedRejected {
-        command_id: command_id.to_string(),
-        reason: reason.to_string(),
-    })
+/// A wire exit code (`0..=255`); a status outside it is not reported.
+fn wire_exit_code(code: Option<i32>) -> Option<u8> {
+    code.and_then(|code| u8::try_from(code).ok())
 }
 
 fn term_exit(terminal_id: &str, status: (Option<i32>, Option<i32>)) -> OutboundFrame {
-    OutboundFrame::Control(ClientControlMessage::TermExit {
+    OutboundFrame::Control(NodeFrame::TermExit {
         terminal_id: terminal_id.to_string(),
-        exit_code: status.0,
+        exit_code: wire_exit_code(status.0),
         signal: signal_token(status.1),
     })
 }
@@ -2035,1015 +1410,11 @@ impl TerminalRegistry {
             shut_down: false,
             #[cfg(unix)]
             shell: None,
-            #[cfg(unix)]
-            supervised_program: None,
-            #[cfg(unix)]
-            operator_program: None,
-            #[cfg(unix)]
-            operator_events: Vec::new(),
-            #[cfg(unix)]
-            deferred_jobs: Vec::new(),
-            #[cfg(unix)]
-            ended_operators: VecDeque::new(),
-            #[cfg(unix)]
-            operator_allowed: operator::operator_terminals_allowed,
-            #[cfg(unix)]
-            next_operator_gate_check: None,
-            #[cfg(all(test, unix))]
-            file_child_env: Vec::new(),
-            confirm_ttl: SUPERVISED_CONFIRM_TTL,
-            review_ttl: SUPERVISED_REVIEW_TTL,
-            #[cfg(unix)]
-            file_runtime: None,
-            #[cfg(unix)]
-            pending_files: BTreeMap::new(),
-            #[cfg(unix)]
-            next_file_generation: 1,
         }
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn set_file_runtime(&mut self, runtime: Arc<crate::file_relay::FileRuntime>) {
-        self.file_runtime = Some(runtime);
-    }
-
-    #[cfg(unix)]
-    fn queue_file_prepare(&mut self, command_id: &str) -> Vec<OutboundFrame> {
-        let Some(runtime) = self.file_runtime.as_ref().map(Arc::clone) else {
-            self.pending_files.remove(command_id);
-            return vec![supervised_file_rejected(command_id, REASON_UNSUPPORTED)];
-        };
-        let Some(pending) = self.pending_files.get_mut(command_id) else {
-            return Vec::new();
-        };
-        pending.stage = PendingFileStage::Preparing;
-        let Some(file_op) = pending.spawn.file_op.as_ref() else {
-            self.pending_files.remove(command_id);
-            return vec![supervised_file_rejected(command_id, REASON_BAD_FRAME)];
-        };
-        let op = file_op.op.clone();
-        let args = file_op.args.clone();
-        let body = pending.body.clone();
-        let preview_key = pending.preview_key.clone();
-        let cancel = pending.cancel.clone();
-        let generation = pending.generation;
-        let tx = self.tx.clone();
-        let callback_id = command_id.to_string();
-        let queued =
-            runtime.prepare_supervised(op, args, body, preview_key, cancel, move |outcome| {
-                let _ = tx.send(FromWorker::SupervisedFilePrepared {
-                    command_id: callback_id,
-                    generation,
-                    outcome: Box::new(outcome),
-                });
-            });
-        match queued {
-            Ok(()) => Vec::new(),
-            Err(error) => {
-                self.pending_files.remove(command_id);
-                vec![supervised_file_rejected(command_id, error.code.as_str())]
-            }
-        }
-    }
-
-    /// Route `file.body` to a supervised write before the ordinary FileRelay.
-    /// `Err(body)` means this registry did not own the op id.
-    #[cfg(unix)]
-    pub(crate) fn handle_supervised_body(
-        &mut self,
-        startup: &TerminalStartup,
-        command_id: &str,
-        body: Vec<u8>,
-    ) -> Result<Vec<OutboundFrame>, Vec<u8>> {
-        let Some(pending) = self.pending_files.get(command_id) else {
-            return Err(body);
-        };
-        if !startup.mcp_command_mode().allows_supervised() {
-            let pending = self.pending_files.remove(command_id);
-            if let Some(pending) = pending {
-                pending.cancel.cancel();
-            }
-            return Ok(vec![supervised_file_rejected(command_id, REASON_DISABLED)]);
-        }
-        let expected = match pending.stage {
-            PendingFileStage::Body { expected } => expected,
-            PendingFileStage::Preparing => {
-                let pending = self.pending_files.remove(command_id);
-                if let Some(pending) = pending {
-                    pending.cancel.cancel();
-                }
-                return Ok(vec![supervised_file_rejected(command_id, REASON_BAD_FRAME)]);
-            }
-        };
-        if body.len() != expected {
-            let pending = self.pending_files.remove(command_id);
-            if let Some(pending) = pending {
-                pending.cancel.cancel();
-            }
-            return Ok(vec![supervised_file_rejected(command_id, REASON_BAD_FRAME)]);
-        }
-        if let Some(pending) = self.pending_files.get_mut(command_id) {
-            pending.body = Some(body);
-            pending.stage = PendingFileStage::Preparing;
-        }
-        Ok(self.queue_file_prepare(command_id))
-    }
-
-    /// Human (browser-opened) terminals. Supervised terminals have their own slots.
-    /// Operator terminals are allowed by the local config right now.
-    fn operator_gate_open(&self) -> bool {
-        #[cfg(unix)]
-        return (self.operator_allowed)();
-        #[cfg(not(unix))]
-        false
     }
 
     fn human_count(&self) -> usize {
-        self.sessions
-            .values()
-            .filter(|session| session.supervised.is_none() && !session.is_operator())
-            .count()
-    }
-
-    fn supervised_counts(&self) -> (usize, usize) {
-        #[cfg(unix)]
-        let mut awaiting = self.pending_files.len();
-        #[cfg(not(unix))]
-        let mut awaiting = 0;
-        let mut running = 0;
-        for supervised in self
-            .sessions
-            .values()
-            .filter_map(|session| session.supervised.as_ref())
-        {
-            if supervised.awaiting() {
-                awaiting += 1;
-            } else if supervised.phase == SupervisedPhase::Running {
-                running += 1;
-            }
-        }
-        (awaiting, running)
-    }
-
-    /// `term.spawn`: a viewer-less terminal whose PTY child shows the confirm
-    /// screen for exactly this command. Nothing runs until a viewer presses
-    /// Enter on that screen.
-    pub(crate) fn spawn_supervised(
-        &mut self,
-        startup: &TerminalStartup,
-        config: &Config,
-        spawn: &SupervisedSpawn,
-    ) -> Vec<OutboundFrame> {
-        let command_id = spawn.command_id.as_str();
-        if !valid_id(command_id) || !valid_id(&spawn.terminal_id) {
-            return vec![supervised_rejected(command_id, REASON_BAD_COMMAND)];
-        }
-        if !terminal_supported() {
-            return vec![supervised_rejected(command_id, REASON_UNSUPPORTED)];
-        }
-        if spawn.is_file() {
-            return self.spawn_supervised_file(startup, spawn);
-        }
-        if !matches!(spawn.kind.as_deref(), None | Some("command"))
-            || spawn.file_op.is_some()
-            || spawn.body_bytes.is_some()
-        {
-            return vec![supervised_rejected(command_id, REASON_BAD_FRAME)];
-        }
-        if !startup.mcp_command_mode().allows_supervised() {
-            return vec![supervised_rejected(command_id, REASON_DISABLED)];
-        }
-        if self.sessions.contains_key(&spawn.terminal_id)
-            || self.sessions.values().any(|session| {
-                session
-                    .supervised
-                    .as_ref()
-                    .is_some_and(|supervised| supervised.command_id == command_id)
-            })
-        {
-            return vec![supervised_rejected(command_id, REASON_ALREADY_OPEN)];
-        }
-        let (awaiting, running) = self.supervised_counts();
-        if awaiting >= MAX_SUPERVISED_AWAITING || awaiting + running >= MAX_SUPERVISED_LIVE {
-            return vec![supervised_rejected(command_id, REASON_LIMIT)];
-        }
-        if spawn.command.is_empty() || child_env::validate_command(&spawn.command).is_err() {
-            return vec![supervised_rejected(command_id, REASON_BAD_COMMAND)];
-        }
-        let reason = spawn.reason.as_deref().unwrap_or("");
-        if reason.contains('\0')
-            || reason.chars().count() > SUPERVISED_REASON_MAX_CHARS
-            || spawn.requester.is_empty()
-            || spawn.requester.contains('\0')
-            || spawn.requester.chars().count() > SUPERVISED_REQUESTER_MAX_CHARS
-        {
-            return vec![supervised_rejected(command_id, REASON_BAD_COMMAND)];
-        }
-        let home = match user_home() {
-            Ok(path) => path,
-            Err(_) => return vec![supervised_rejected(command_id, REASON_BAD_CWD)],
-        };
-        let cwd = match child_env::resolve_cwd(spawn.cwd.as_deref(), &home) {
-            Ok(path) => path,
-            Err(reason) => {
-                tracing::warn!(
-                    command_id,
-                    reason,
-                    "rejecting a supervised working directory"
-                );
-                return vec![supervised_rejected(command_id, REASON_BAD_CWD)];
-            }
-        };
-        // I1: the confirm screen shows `getcwd()` (the physical path). Refuse
-        // before any PTY or child exists when that path cannot be shown
-        // exactly, and spawn in the checked physical path.
-        let cwd = match child_env::confirm_screen_cwd(&cwd) {
-            Ok((physical, _)) => physical,
-            Err(child_env::ConfirmCwdError::Unresolvable) => {
-                tracing::warn!(
-                    command_id,
-                    "rejecting an unresolvable supervised working directory"
-                );
-                return vec![supervised_rejected(command_id, REASON_BAD_CWD)];
-            }
-            Err(child_env::ConfirmCwdError::NotUtf8) => {
-                tracing::warn!(
-                    command_id,
-                    "rejecting a non-UTF-8 supervised working directory"
-                );
-                return vec![supervised_rejected(command_id, REASON_CWD_NOT_UTF8)];
-            }
-        };
-        #[cfg(not(unix))]
-        {
-            let _ = (config, cwd, reason);
-            vec![supervised_rejected(command_id, REASON_UNSUPPORTED)]
-        }
-        #[cfg(unix)]
-        {
-            self.spawn_supervised_unix(config, spawn, reason, &cwd)
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn spawn_supervised_file(
-        &mut self,
-        _startup: &TerminalStartup,
-        spawn: &SupervisedSpawn,
-    ) -> Vec<OutboundFrame> {
-        vec![supervised_file_rejected(
-            &spawn.command_id,
-            REASON_UNSUPPORTED,
-        )]
-    }
-
-    #[cfg(unix)]
-    fn spawn_supervised_file(
-        &mut self,
-        startup: &TerminalStartup,
-        spawn: &SupervisedSpawn,
-    ) -> Vec<OutboundFrame> {
-        let command_id = spawn.command_id.as_str();
-        if !spawn.file_shape_is_valid() {
-            if spawn.file_op.as_ref().is_some_and(|file| {
-                !matches!(
-                    file.op.as_str(),
-                    "edit" | "write" | "rename" | "mkdir" | "delete"
-                )
-            }) {
-                return vec![supervised_file_rejected(command_id, REASON_BAD_COMMAND)];
-            }
-            if spawn
-                .file_op
-                .as_ref()
-                .is_some_and(|file| file.op == "write")
-                && spawn
-                    .body_bytes
-                    .is_some_and(|bytes| bytes > crate::protocol::RELAY_BINARY_CHUNK_MAX_BYTES)
-            {
-                return vec![supervised_file_rejected(command_id, "too_large")];
-            }
-            return vec![supervised_file_rejected(command_id, REASON_BAD_FRAME)];
-        }
-        if !startup.mcp_command_mode().allows_supervised() {
-            return vec![supervised_file_rejected(command_id, REASON_DISABLED)];
-        }
-        let Some(runtime) = self.file_runtime.as_ref() else {
-            return vec![supervised_file_rejected(command_id, REASON_UNSUPPORTED)];
-        };
-        if let Err(error) = runtime.policy().check_process() {
-            return vec![supervised_file_rejected(command_id, error.code.as_str())];
-        }
-        if self.sessions.contains_key(&spawn.terminal_id)
-            || self.pending_files.values().any(|pending| {
-                pending.spawn.terminal_id == spawn.terminal_id
-                    || pending.spawn.command_id == spawn.command_id
-            })
-            || self.sessions.values().any(|session| {
-                session
-                    .supervised
-                    .as_ref()
-                    .is_some_and(|supervised| supervised.command_id == command_id)
-            })
-        {
-            return vec![supervised_file_rejected(command_id, REASON_ALREADY_OPEN)];
-        }
-        let (awaiting, running) = self.supervised_counts();
-        if awaiting >= MAX_SUPERVISED_AWAITING || awaiting + running >= MAX_SUPERVISED_LIVE {
-            return vec![supervised_file_rejected(command_id, REASON_LIMIT)];
-        }
-        if spawn.requester.is_empty()
-            || spawn.requester.contains('\0')
-            || spawn.requester.chars().count() > SUPERVISED_REQUESTER_MAX_CHARS
-        {
-            return vec![supervised_file_rejected(command_id, REASON_INVALID_INPUT)];
-        }
-        let Some(file_op) = spawn.file_op.as_ref() else {
-            return vec![supervised_file_rejected(command_id, REASON_BAD_FRAME)];
-        };
-        let first = match terminal_crypto::random_nonce() {
-            Ok(value) => value,
-            Err(_) => return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)],
-        };
-        let second = match terminal_crypto::random_nonce() {
-            Ok(value) => value,
-            Err(_) => return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)],
-        };
-        let mut key = [0_u8; 32];
-        key[..16].copy_from_slice(&first);
-        key[16..].copy_from_slice(&second);
-        let preview_key_hex = key
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        let generation = self.next_file_generation;
-        self.next_file_generation = self.next_file_generation.wrapping_add(1).max(1);
-        let stage = match (file_op.op.as_str(), spawn.body_bytes) {
-            ("write", Some(expected)) => PendingFileStage::Body { expected },
-            _ => PendingFileStage::Preparing,
-        };
-        self.pending_files.insert(
-            command_id.to_string(),
-            PendingFile {
-                spawn: spawn.clone(),
-                generation,
-                stage,
-                body: None,
-                preview_key: crate::file_ops::EtagKey::from_bytes(key),
-                preview_key_hex,
-                cancel: crate::file_ops::Cancel::new(),
-                created: Instant::now(),
-            },
-        );
-        if matches!(
-            self.pending_files
-                .get(command_id)
-                .map(|pending| &pending.stage),
-            Some(PendingFileStage::Preparing)
-        ) {
-            return self.queue_file_prepare(command_id);
-        }
-        Vec::new()
-    }
-
-    #[cfg(unix)]
-    fn spawn_supervised_unix(
-        &mut self,
-        config: &Config,
-        spawn: &SupervisedSpawn,
-        reason: &str,
-        cwd: &Path,
-    ) -> Vec<OutboundFrame> {
-        let command_id = spawn.command_id.as_str();
-        let terminal_id = spawn.terminal_id.as_str();
-        let marker = match terminal_crypto::random_nonce() {
-            Ok(bytes) => bytes
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>(),
-            Err(error) => {
-                tracing::warn!(error = %error, command_id, "generating a supervised marker failed");
-                return vec![supervised_rejected(command_id, REASON_SPAWN_FAILED)];
-            }
-        };
-        let out = match OutputKey::first() {
-            Ok(out) => out,
-            Err(error) => {
-                tracing::warn!(error = %error, command_id, "generating a terminal output key failed");
-                return vec![supervised_rejected(command_id, REASON_SPAWN_FAILED)];
-            }
-        };
-        let (program, args) = match self.supervised_program.clone() {
-            Some(program) => program,
-            None => match std::env::current_exe() {
-                Ok(path) => (
-                    path.to_string_lossy().into_owned(),
-                    vec!["terminal".to_string(), "supervised-run".to_string()],
-                ),
-                Err(error) => {
-                    tracing::warn!(error = %error, command_id, "locating the wsmp binary failed");
-                    return vec![supervised_rejected(command_id, REASON_SPAWN_FAILED)];
-                }
-            },
-        };
-        let mut env = terminal_env(config);
-        env.push((SUPERVISED_ENV_COMMAND.to_string(), spawn.command.clone()));
-        env.push((SUPERVISED_ENV_REASON.to_string(), reason.to_string()));
-        env.push((
-            SUPERVISED_ENV_REQUESTER.to_string(),
-            spawn.requester.clone(),
-        ));
-        env.push((
-            SUPERVISED_ENV_SHARE.to_string(),
-            if spawn.share_output { "1" } else { "0" }.to_string(),
-        ));
-        env.push((SUPERVISED_ENV_MARKER.to_string(), marker.clone()));
-        let (cols, rows) = (80, 24);
-        let pty = match spawn_pty(
-            &program,
-            &args,
-            cwd,
-            &env,
-            cols,
-            rows,
-            &self.tx,
-            terminal_id,
-        ) {
-            Ok(pty) => pty,
-            Err(error) => {
-                tracing::warn!(error = %error, command_id, "starting a supervised terminal failed");
-                return vec![supervised_rejected(command_id, REASON_SPAWN_FAILED)];
-            }
-        };
-        let now = Instant::now();
-        self.sessions.insert(
-            terminal_id.to_string(),
-            TerminalSession {
-                viewers: BTreeMap::new(),
-                writer: None,
-                pty_size: (cols, rows),
-                out: Some(out),
-                detached_at: Some(now),
-                scrollback: VecDeque::new(),
-                pty: Some(pty),
-                operator: None,
-                supervised: Some(Supervised {
-                    command_id: command_id.to_string(),
-                    share_output: spawn.share_output,
-                    review: false,
-                    phase: SupervisedPhase::Starting,
-                    child: supervised_pty::ChildLink::new(&marker),
-                    capture: Capture::default(),
-                    mask: StreamMasker::new(&spawn.command),
-                    spawned_at: now,
-                    finished_at: None,
-                    exit_status: (None, None),
-                    start_failed: false,
-                    logged_outcome: false,
-                    file: None,
-                    blocked: None,
-                    marker_invalid: false,
-                }),
-            },
-        );
-        vec![OutboundFrame::Control(ClientControlMessage::TermSpawned {
-            terminal_id: terminal_id.to_string(),
-            command_id: command_id.to_string(),
-        })]
-    }
-
-    /// Finish the off-loop snapshot stage. A stale generation is dropped: a
-    /// cancelled command id may already have been reused by a later request.
-    #[cfg(unix)]
-    pub(crate) fn on_file_prepared(
-        &mut self,
-        startup: &TerminalStartup,
-        config: &Config,
-        command_id: &str,
-        generation: u64,
-        outcome: crate::file_ops::FileResult<crate::file_ops::PreparedSupervised>,
-    ) -> Vec<OutboundFrame> {
-        if !self
-            .pending_files
-            .get(command_id)
-            .is_some_and(|pending| pending.generation == generation)
-        {
-            return Vec::new();
-        }
-        if !startup.mcp_command_mode().allows_supervised() {
-            self.pending_files.remove(command_id);
-            return vec![supervised_file_rejected(command_id, REASON_DISABLED)];
-        }
-        let prepared = match outcome {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.pending_files.remove(command_id);
-                return vec![supervised_file_rejected(command_id, error.code.as_str())];
-            }
-        };
-        let Some(pending) = self.pending_files.remove(command_id) else {
-            return Vec::new();
-        };
-        self.spawn_supervised_file_unix(startup, config, pending, prepared)
-    }
-
-    #[cfg(unix)]
-    fn spawn_supervised_file_unix(
-        &mut self,
-        startup: &TerminalStartup,
-        config: &Config,
-        pending: PendingFile,
-        prepared: crate::file_ops::PreparedSupervised,
-    ) -> Vec<OutboundFrame> {
-        let command_id = pending.spawn.command_id.as_str();
-        let terminal_id = pending.spawn.terminal_id.as_str();
-        let child_op = prepared.child_input().op.clone();
-        let child_args = prepared.child_input().args.clone();
-        let child_preimage = prepared.child_input().preview_etag.clone();
-        let child_blocked: Option<crate::protocol::FileErrorCode> =
-            prepared.child_input().blocked.map(Into::into);
-        let args = match serde_json::to_string(&child_args) {
-            Ok(args) => args,
-            Err(_) => return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)],
-        };
-        let roots = match serde_json::to_string(&prepared.child_input().roots) {
-            Ok(roots) => roots,
-            Err(_) => return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)],
-        };
-        let body_file = match pending.body.as_deref() {
-            Some(body) => match PrivateBody::create(body) {
-                Ok(file) => Some(file),
-                Err(error) => {
-                    tracing::warn!(error = %error, command_id, "creating a supervised body failed");
-                    return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)];
-                }
-            },
-            None => None,
-        };
-        let marker = match terminal_crypto::random_nonce() {
-            Ok(bytes) => bytes
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>(),
-            Err(error) => {
-                tracing::warn!(error = %error, command_id, "generating a supervised marker failed");
-                return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)];
-            }
-        };
-        let out = match OutputKey::first() {
-            Ok(out) => out,
-            Err(error) => {
-                tracing::warn!(error = %error, command_id, "generating a terminal output key failed");
-                return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)];
-            }
-        };
-        let (program, program_args) = match self.supervised_program.clone() {
-            Some(program) => program,
-            None => match std::env::current_exe() {
-                Ok(path) => (
-                    path.to_string_lossy().into_owned(),
-                    vec!["terminal".to_string(), "supervised-file".to_string()],
-                ),
-                Err(error) => {
-                    tracing::warn!(error = %error, command_id, "locating the wsmp binary failed");
-                    return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)];
-                }
-            },
-        };
-        let home = match user_home() {
-            Ok(home) => home,
-            Err(_) => return vec![supervised_file_rejected(command_id, REASON_BAD_CWD)],
-        };
-        let cwd = match child_env::confirm_screen_cwd(&home) {
-            Ok((physical, _)) => physical,
-            Err(_) => return vec![supervised_file_rejected(command_id, REASON_BAD_CWD)],
-        };
-        let mut env = terminal_env(config);
-        env.extend([
-            (SUPERVISED_ENV_FILE_OP.to_string(), child_op.clone()),
-            (SUPERVISED_ENV_FILE_ARGS.to_string(), args),
-            (SUPERVISED_ENV_FILE_ROOTS.to_string(), roots),
-            (
-                SUPERVISED_ENV_FILE_ETAG_KEY.to_string(),
-                pending.preview_key_hex.clone(),
-            ),
-            (SUPERVISED_ENV_FILE_PREIMAGE.to_string(), child_preimage),
-            (
-                SUPERVISED_ENV_FILE_ALLOW_ROOT.to_string(),
-                if startup.allow_file_tools_as_root() {
-                    "1".to_string()
-                } else {
-                    "0".to_string()
-                },
-            ),
-            (
-                SUPERVISED_ENV_REQUESTER.to_string(),
-                pending.spawn.requester.clone(),
-            ),
-            (SUPERVISED_ENV_MARKER.to_string(), marker.clone()),
-        ]);
-        if let Some(body) = body_file.as_ref() {
-            let Some(path) = body.path.to_str() else {
-                return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)];
-            };
-            env.push((SUPERVISED_ENV_FILE_BODY.to_string(), path.to_string()));
-        }
-        if let Some(code) = child_blocked {
-            env.push((
-                SUPERVISED_ENV_FILE_BLOCKED.to_string(),
-                code.as_str().to_string(),
-            ));
-        }
-        #[cfg(test)]
-        {
-            self.file_child_env.clone_from(&env);
-        }
-        let (cols, rows) = (80, 24);
-        let pty = match spawn_pty(
-            &program,
-            &program_args,
-            &cwd,
-            &env,
-            cols,
-            rows,
-            &self.tx,
-            terminal_id,
-        ) {
-            Ok(pty) => pty,
-            Err(error) => {
-                tracing::warn!(error = %error, command_id, "starting a supervised file terminal failed");
-                return vec![supervised_file_rejected(command_id, REASON_SPAWN_FAILED)];
-            }
-        };
-        let now = Instant::now();
-        self.sessions.insert(
-            terminal_id.to_string(),
-            TerminalSession {
-                viewers: BTreeMap::new(),
-                writer: None,
-                pty_size: (cols, rows),
-                out: Some(out),
-                detached_at: Some(now),
-                scrollback: VecDeque::new(),
-                pty: Some(pty),
-                operator: None,
-                supervised: Some(Supervised {
-                    command_id: command_id.to_string(),
-                    share_output: false,
-                    review: false,
-                    phase: SupervisedPhase::Starting,
-                    child: supervised_pty::ChildLink::new(&marker),
-                    capture: Capture::default(),
-                    mask: StreamMasker::new(""),
-                    spawned_at: now,
-                    finished_at: None,
-                    exit_status: (None, None),
-                    start_failed: false,
-                    logged_outcome: false,
-                    file: Some(SupervisedFile {
-                        generation: pending.generation,
-                        summary: crate::file_relay::summarize(&child_op, &child_args),
-                        op: child_op,
-                        prepared: Some(prepared),
-                        cancel: pending.cancel,
-                        _body: body_file,
-                        applied: false,
-                        settled: false,
-                        blocked: child_blocked,
-                    }),
-                    blocked: None,
-                    marker_invalid: false,
-                }),
-            },
-        );
-        vec![OutboundFrame::Control(ClientControlMessage::TermSpawned {
-            terminal_id: terminal_id.to_string(),
-            command_id: command_id.to_string(),
-        })]
-    }
-
-    #[cfg(unix)]
-    fn queue_file_apply(&mut self, after_send: FileApplyAfterSend) -> Vec<OutboundFrame> {
-        let (command_id, generation, prepared, cancel) = {
-            let Some(supervised) = self
-                .sessions
-                .get_mut(&after_send.terminal_id)
-                .and_then(|session| session.supervised.as_mut())
-            else {
-                return Vec::new();
-            };
-            if supervised.phase != SupervisedPhase::Running
-                || supervised.command_id != after_send.command_id
-            {
-                return Vec::new();
-            }
-            let Some(file) = supervised.file.as_mut() else {
-                return Vec::new();
-            };
-            if file.applied || file.generation != after_send.generation {
-                return Vec::new();
-            }
-            // Claim the only submission before moving the snapshot out.
-            file.applied = true;
-            // The real child already unlinked at open. Also dispose of the
-            // daemon's fallback name/dir now; the job owns the prepared bytes.
-            file._body.take();
-            (
-                supervised.command_id.clone(),
-                file.generation,
-                file.prepared.take(),
-                file.cancel.clone(),
-            )
-        };
-        let Some(prepared) = prepared else {
-            return self.on_file_applied(
-                &command_id,
-                generation,
-                Err(crate::file_ops::FileError::new(
-                    crate::file_ops::ErrorCode::IoError,
-                    "prepared file request was missing",
-                )),
-            );
-        };
-        let Some(runtime) = self.file_runtime.as_ref().map(Arc::clone) else {
-            return self.on_file_applied(
-                &command_id,
-                generation,
-                Err(crate::file_ops::FileError::new(
-                    crate::file_ops::ErrorCode::IoError,
-                    "file runtime was missing",
-                )),
-            );
-        };
-        let tx = self.tx.clone();
-        let callback_id = command_id.clone();
-        match runtime.apply_supervised(prepared, cancel, move |outcome| {
-            let _ = tx.send(FromWorker::SupervisedFileApplied {
-                command_id: callback_id,
-                generation,
-                outcome,
-            });
-        }) {
-            Ok(()) => Vec::new(),
-            Err(error) => self.on_file_applied(&command_id, generation, Err(error)),
-        }
-    }
-
-    #[cfg(unix)]
-    pub(crate) fn on_file_applied(
-        &mut self,
-        command_id: &str,
-        generation: u64,
-        outcome: crate::file_ops::FileResult<serde_json::Value>,
-    ) -> Vec<OutboundFrame> {
-        let found = self.sessions.iter().find_map(|(terminal_id, session)| {
-            let supervised = session.supervised.as_ref()?;
-            let file = supervised.file.as_ref()?;
-            (supervised.command_id == command_id
-                && file.generation == generation
-                && file.applied
-                && !file.settled)
-                .then(|| (terminal_id.clone(), file.op.clone()))
-        });
-        let Some((terminal_id, op)) = found else {
-            return Vec::new();
-        };
-        let (file, mut outcome_code) = match outcome {
-            Ok(result) => (
-                crate::protocol::SupervisedFileOutcome::result(op, result),
-                "ok",
-            ),
-            Err(error) => (
-                crate::protocol::SupervisedFileOutcome::error(error.code.into()),
-                error.code.as_str(),
-            ),
-        };
-        let mut message = ClientControlMessage::SupervisedDone {
-            command_id: command_id.to_string(),
-            exit_code: None,
-            signal: None,
-            review: false,
-            output_bytes: None,
-            file,
-        };
-        if crate::protocol::encode_control(&message).is_err() {
-            if let ClientControlMessage::SupervisedDone { file, .. } = &mut message {
-                *file = crate::protocol::SupervisedFileOutcome::error(
-                    crate::protocol::FileErrorCode::IoError,
-                );
-            }
-            outcome_code = "io_error";
-        } else if let ClientControlMessage::SupervisedDone {
-            file: crate::protocol::SupervisedFileOutcome::Error { file_error },
-            ..
-        } = &message
-        {
-            outcome_code = file_error.code.as_str();
-        }
-        if let Some(supervised) = self
-            .sessions
-            .get_mut(&terminal_id)
-            .and_then(|session| session.supervised.as_mut())
-        {
-            if let Some(file) = supervised.file.as_mut() {
-                file.settled = true;
-            }
-            supervised.log_outcome(outcome_code);
-        }
-        let mut frames = vec![OutboundFrame::Control(message)];
-        frames.extend(self.close(&terminal_id));
-        frames
-    }
-
-    /// `supervised.cancel`: end the command's terminal in whatever state it
-    /// is. With `if_waiting` (the server's confirm deadline, or a decline
-    /// from the browser) it is a request this registry decides: a request
-    /// still waiting is declined (`supervised.declined`, then `term.exit`)
-    /// and its command never starts; one whose Enter was already taken keeps
-    /// running, and the `supervised.accepted` already sent is the answer.
-    pub(crate) fn cancel_supervised(
-        &mut self,
-        command_id: &str,
-        if_waiting: bool,
-    ) -> Vec<OutboundFrame> {
-        #[cfg(unix)]
-        if let Some(pending) = self.pending_files.remove(command_id) {
-            pending.cancel.cancel();
-            return if if_waiting {
-                vec![OutboundFrame::Control(
-                    ClientControlMessage::SupervisedDeclined {
-                        command_id: command_id.to_string(),
-                    },
-                )]
-            } else {
-                Vec::new()
-            };
-        }
-        let found = self.sessions.iter().find_map(|(terminal_id, session)| {
-            session
-                .supervised
-                .as_ref()
-                .filter(|supervised| supervised.command_id == command_id)
-                .map(|supervised| {
-                    (
-                        terminal_id.clone(),
-                        supervised.awaiting(),
-                        supervised.start_failed,
-                    )
-                })
-        });
-        let Some((terminal_id, awaiting, start_failed)) = found else {
-            return Vec::new();
-        };
-        // Not a decline request, or an Enter whose `go` could not be written:
-        // end the terminal. It never started, so `close` logs that outcome.
-        if !if_waiting || start_failed {
-            return self.close(&terminal_id);
-        }
-        if !awaiting {
-            return Vec::new();
-        }
-        let mut frames = vec![OutboundFrame::Control(
-            ClientControlMessage::SupervisedDeclined {
-                command_id: command_id.to_string(),
-            },
-        )];
-        frames.extend(self.close(&terminal_id));
-        frames
-    }
-
-    /// The confirm child or the command exited: report the outcome, then end
-    /// the terminal, or keep a finished one whose capture waits for review.
-    #[cfg(unix)]
-    fn finish_supervised(&mut self, terminal_id: &str, now: Instant) -> Vec<OutboundFrame> {
-        let (status, phase, command_id, share_output, review, terminal_outcome, is_file) = {
-            let Some(session) = self.sessions.get_mut(terminal_id) else {
-                return Vec::new();
-            };
-            let Some(phase) = session
-                .supervised
-                .as_ref()
-                .map(|supervised| supervised.phase)
-            else {
-                return Vec::new();
-            };
-            if phase == SupervisedPhase::Finished {
-                return Vec::new();
-            }
-            let status = session.pty.take().map(shutdown_pty).unwrap_or((None, None));
-            let Some(supervised) = session.supervised.as_mut() else {
-                return Vec::new();
-            };
-            supervised.exit_status = status;
-            supervised.finish_capture();
-            if phase == SupervisedPhase::Starting {
-                supervised.start_failed = true;
-            }
-            // This path ends the command, so it logs the one outcome line:
-            // a running command reports its exit status, a never-started one
-            // its decline/start_failed outcome. `close` later logs nothing.
-            let terminal_outcome = if phase == SupervisedPhase::Running {
-                done_outcome(status.0, status.1, false)
-            } else {
-                supervised.waiting_outcome().to_string()
-            };
-            if supervised.file.is_none() || phase != SupervisedPhase::Running {
-                supervised.log_outcome(&terminal_outcome);
-            }
-            (
-                status,
-                phase,
-                supervised.command_id.clone(),
-                supervised.share_output,
-                supervised.review,
-                terminal_outcome,
-                supervised.file.is_some(),
-            )
-        };
-        let mut frames = Vec::new();
-        if phase != SupervisedPhase::Running {
-            // No Enter was taken (or its `go` never reached the child): the
-            // command did not start. Only a real decline says `declined`.
-            if terminal_outcome == "declined" {
-                frames.push(OutboundFrame::Control(
-                    ClientControlMessage::SupervisedDeclined { command_id },
-                ));
-            }
-            self.sessions.remove(terminal_id);
-            frames.push(term_exit(terminal_id, status));
-            return frames;
-        }
-        // The file child exits immediately after `go`; its exit is not the
-        // operation outcome. Keep the registry entry until the sole apply job
-        // reports, so an accepted request can never turn into a decline or a
-        // command-style done merely because the PTY went away normally.
-        if is_file {
-            return frames;
-        }
-        let done = |review: bool, output_bytes: Option<u64>| {
-            OutboundFrame::Control(ClientControlMessage::SupervisedDone {
-                command_id: command_id.clone(),
-                exit_code: status.0,
-                signal: signal_token(status.1),
-                review,
-                output_bytes,
-                file: crate::protocol::SupervisedFileOutcome::default(),
-            })
-        };
-        if share_output && review {
-            frames.push(done(true, None));
-            let Some(session) = self.sessions.get_mut(terminal_id) else {
-                return frames;
-            };
-            let message = session.supervised.as_mut().map(|supervised| {
-                supervised.phase = SupervisedPhase::Finished;
-                supervised.finished_at = Some(now);
-                supervised.capture_message()
-            });
-            if let Some(mut message) = message {
-                let viewers = session.viewers.keys().cloned().collect::<Vec<_>>();
-                for viewer_id in viewers {
-                    frames.extend(session.seal_unicast(terminal_id, &viewer_id, &message));
-                }
-                wipe_capture_message(&mut message);
-            }
-            return frames;
-        }
-        if share_output {
-            let (head, tail, total) = match self
-                .sessions
-                .get(terminal_id)
-                .and_then(|session| session.supervised.as_ref())
-            {
-                Some(supervised) => {
-                    let (head, tail) = supervised.capture.parts();
-                    (head, tail, supervised.capture.total)
-                }
-                None => (Vec::new(), Vec::new(), 0),
-            };
-            for (seq, part, body) in [
-                (1, SupervisedOutputPart::Head, head),
-                (2, SupervisedOutputPart::Tail, tail),
-            ] {
-                if body.is_empty() {
-                    continue;
-                }
-                frames.push(OutboundFrame::Binary(
-                    RelayBinaryFrameMetadata::SupervisedOutput {
-                        command_id: command_id.clone(),
-                        part,
-                        seq,
-                    },
-                    body,
-                ));
-            }
-            frames.push(done(false, Some(total)));
-        } else {
-            frames.push(done(false, None));
-        }
-        self.sessions.remove(terminal_id);
-        frames.push(term_exit(terminal_id, status));
-        frames
+        self.sessions.len()
     }
 
     /// A registry with a test shell.
@@ -3080,24 +1451,6 @@ impl TerminalRegistry {
             return Vec::new();
         }
         self.shut_down = true;
-        #[cfg(unix)]
-        {
-            for (_, pending) in std::mem::take(&mut self.pending_files) {
-                pending.cancel.cancel();
-            }
-            for session in self.sessions.values_mut() {
-                if let Some(file) = session
-                    .supervised
-                    .as_mut()
-                    .and_then(|supervised| supervised.file.as_mut())
-                {
-                    file.cancel.cancel();
-                    // Shutdown cannot wait for worker delivery on this dead
-                    // websocket; permit the forced removal below.
-                    file.settled = true;
-                }
-            }
-        }
         let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
         let mut frames = Vec::new();
         for id in ids {
@@ -3237,10 +1590,8 @@ impl TerminalRegistry {
             detached_at: None,
             scrollback: VecDeque::new(),
             pty: Some(pty),
-            supervised: None,
-            operator: None,
         };
-        let mut frames = vec![OutboundFrame::Control(ClientControlMessage::TermOpened {
+        let mut frames = vec![OutboundFrame::Control(NodeFrame::TermOpened {
             terminal_id: terminal_id.to_string(),
             viewer_id: viewer_id.map(str::to_string),
             cli_nonce: terminal_crypto::encode_b64url(&cli_nonce),
@@ -3263,18 +1614,8 @@ impl TerminalRegistry {
         let Some(session) = self.sessions.get(terminal_id) else {
             return vec![*handshake_rejected(&handshake, REASON_NOT_FOUND)];
         };
-        // A supervised terminal is gated by the MCP command policy, not by the
-        // human terminal switch; approval still applies to every viewer.
-        // An operator terminal is gated by its own local switch (and
-        // deployments), read fresh for every viewer; not by the browser
-        // terminal switch or the MCP command mode.
-        let allowed = if session.is_operator() {
-            self.operator_gate_open()
-        } else if session.supervised.is_some() {
-            startup.mcp_command_mode().allows_supervised()
-        } else {
-            startup.allow_human_terminal()
-        };
+        // Browser terminals need the local switch and Full control.
+        let allowed = startup.allow_human_terminal() && startup.full_control();
         if !allowed || !terminal_supported() {
             return vec![*handshake_rejected(
                 &handshake,
@@ -3495,13 +1836,12 @@ impl TerminalRegistry {
             Viewer::new(keys, None, approved_identity),
         );
         session.detached_at = None;
-        let mut frames = vec![OutboundFrame::Control(ClientControlMessage::TermAttached {
+        let mut frames = vec![OutboundFrame::Control(NodeFrame::TermAttached {
             terminal_id: terminal_id.to_string(),
             viewer_id: viewer_id.map(str::to_string),
             cli_nonce: terminal_crypto::encode_b64url(&cli_nonce),
         })];
         frames.extend(session.join_frames(terminal_id, viewer_key));
-        frames.extend(session.supervised_join_frames(terminal_id, viewer_key));
         frames
     }
 
@@ -3575,58 +1915,20 @@ impl TerminalRegistry {
         frames
     }
 
-    /// End the terminal now. A supervised command killed here (a stop, a
-    /// malformed frame, shutdown, or an expired confirm screen/review) gets
-    /// its one outcome line, unless it already reported one (its exit, or a
-    /// decline from a path that logged before calling `close`).
+    /// End the terminal now.
     pub(crate) fn close(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
-        #[cfg(unix)]
-        if let Some(session) = self.sessions.get_mut(terminal_id)
-            && let Some(supervised) = session.supervised.as_mut()
-            && supervised.phase == SupervisedPhase::Running
-            && let Some(file) = supervised.file.as_mut()
-            && !file.settled
-        {
-            // Accepted file operations retain their registry ownership until
-            // the worker reports. Losing the PTY cancels before commit, but it
-            // must not turn accepted into declined or suppress the one done.
-            file.cancel.cancel();
-            file._body.take();
-            let status = session
-                .pty
-                .take()
-                .map(shutdown_pty)
-                .unwrap_or(supervised.exit_status);
-            supervised.exit_status = status;
-            session.viewers.clear();
-            session.writer = None;
-            return Vec::new();
-        }
-        let Some(mut session) = self.sessions.remove(terminal_id) else {
+        let Some(session) = self.sessions.remove(terminal_id) else {
             return Vec::new();
         };
-        if let Some(supervised) = session.supervised.as_mut()
-            && let Some(outcome) = supervised.closing_outcome()
-        {
-            supervised.log_outcome(outcome);
-        }
-        let recorded = session
-            .supervised
-            .as_ref()
-            .map_or((None, None), |supervised| supervised.exit_status);
         #[cfg(unix)]
         let status = {
             let mut session = session;
-            let status = session.pty.take().map(shutdown_pty).unwrap_or(recorded);
-            if let Some(operator) = session.operator.take() {
-                self.finish_operator(&operator, status);
-            }
-            status
+            session.pty.take().map(shutdown_pty).unwrap_or((None, None))
         };
         #[cfg(not(unix))]
         let status = {
             drop(session);
-            recorded
+            (None, None)
         };
         vec![term_exit(terminal_id, status)]
     }
@@ -3655,8 +1957,7 @@ impl TerminalRegistry {
         };
         match action {
             Incoming::Write(bytes) => {
-                // Type-ahead before a supervised confirm screen is drawn, and
-                // input after its command exited, is dropped here for good.
+                // Input after the shell exited is dropped here for good.
                 if !self
                     .sessions
                     .get(terminal_id)
@@ -3679,15 +1980,6 @@ impl TerminalRegistry {
                 frames
             }
             Incoming::Resize { cols, rows } => {
-                #[cfg(unix)]
-                if self
-                    .sessions
-                    .get(terminal_id)
-                    .is_some_and(|session| session.pty.is_none())
-                {
-                    // A finished supervised command has no PTY to resize.
-                    return Vec::new();
-                }
                 let applies = {
                     let Some(session) = self.sessions.get_mut(terminal_id) else {
                         return Vec::new();
@@ -3708,44 +2000,12 @@ impl TerminalRegistry {
                     Err(_) => self.close(terminal_id),
                 }
             }
-            Incoming::ReviewToggle(on) => self.toggle_review(terminal_id, &viewer_key, on),
             Incoming::Ignore => Vec::new(),
             Incoming::DropViewer => {
                 tracing::warn!(terminal_id, "removing a viewer after a bad terminal frame");
                 self.remove_viewer(terminal_id, &viewer_key, Some(REASON_BAD_FRAME))
             }
         }
-    }
-
-    /// Any viewer may turn review on or off until the command exits. Every
-    /// viewer hears the new state. On a human terminal the frame is invalid.
-    fn toggle_review(
-        &mut self,
-        terminal_id: &str,
-        viewer_key: &str,
-        on: bool,
-    ) -> Vec<OutboundFrame> {
-        let Some(session) = self.sessions.get_mut(terminal_id) else {
-            return Vec::new();
-        };
-        let Some(supervised) = session.supervised.as_mut() else {
-            tracing::warn!(
-                terminal_id,
-                "removing a viewer after a review frame on a human terminal"
-            );
-            return self.remove_viewer(terminal_id, viewer_key, Some(REASON_BAD_FRAME));
-        };
-        if !supervised.share_output
-            || supervised.phase == SupervisedPhase::Finished
-            || supervised.review == on
-        {
-            return Vec::new();
-        }
-        supervised.review = on;
-        session
-            .seal_broadcast(terminal_id, &TermPlaintextV2::ReviewState(on))
-            .into_iter()
-            .collect()
     }
 
     /// Track dropped input per viewer. The first drop in a run yields one
@@ -3770,12 +2030,10 @@ impl TerminalRegistry {
         }
         viewer.input_drop_notified = true;
         tracing::warn!(terminal_id, "terminal input queue is full; dropping input");
-        Some(OutboundFrame::Control(
-            ClientControlMessage::TermInputDropped {
-                terminal_id: terminal_id.to_string(),
-                viewer_id: wire_viewer(viewer_key).map(str::to_string),
-            },
-        ))
+        Some(OutboundFrame::Control(NodeFrame::TermInputDropped {
+            terminal_id: terminal_id.to_string(),
+            viewer_id: wire_viewer(viewer_key).map(str::to_string),
+        }))
     }
 
     /// A data frame from a non-writer makes it the writer and applies its
@@ -3829,210 +2087,27 @@ impl TerminalRegistry {
             .collect())
     }
 
+    /// PTY output: recorded in the scrollback, sealed for the viewers.
     #[cfg(unix)]
-    pub(crate) fn on_bytes_with_startup(
-        &mut self,
-        startup: &TerminalStartup,
-        terminal_id: &str,
-        bytes: &[u8],
-    ) -> TerminalBytesDispatch {
-        self.on_bytes_mode(
-            startup.mcp_command_mode().allows_supervised(),
-            terminal_id,
-            bytes,
-        )
-    }
-
-    #[cfg(all(test, unix))]
     pub(crate) fn on_bytes(&mut self, terminal_id: &str, bytes: &[u8]) -> Vec<OutboundFrame> {
-        let dispatch = self.on_bytes_mode(true, terminal_id, bytes);
-        let mut frames = Vec::new();
-        dispatch
-            .transmit(self, |sent| {
-                frames.extend(sent);
-                Ok::<(), std::convert::Infallible>(())
-            })
-            .expect("infallible test transmission");
-        frames
-    }
-
-    #[cfg(unix)]
-    fn on_bytes_mode(
-        &mut self,
-        mode_allows: bool,
-        terminal_id: &str,
-        bytes: &[u8],
-    ) -> TerminalBytesDispatch {
         let Some(session) = self.sessions.get_mut(terminal_id) else {
-            return TerminalBytesDispatch {
-                frames: Vec::new(),
-                file_after_send: None,
-            };
+            return Vec::new();
         };
-        if session.operator.is_some() {
-            return TerminalBytesDispatch {
-                frames: self.operator_bytes(terminal_id, bytes),
-                file_after_send: None,
-            };
-        }
-        if session.supervised.is_some() {
-            let (mut frames, file_after_send) =
-                session.supervised_bytes(terminal_id, bytes, mode_allows);
-            let state = self.sessions.get(terminal_id).and_then(|session| {
-                session.supervised.as_ref().map(|supervised| {
-                    (
-                        supervised.command_id.clone(),
-                        supervised.blocked.is_some(),
-                        supervised.marker_invalid,
-                        (supervised.phase == SupervisedPhase::Running)
-                            .then_some(supervised.file.as_ref())
-                            .flatten()
-                            .filter(|file| !file.applied)
-                            .map(|file| file.generation),
-                    )
-                })
-            });
-            let Some((command_id, blocked, invalid, apply_generation)) = state else {
-                return TerminalBytesDispatch {
-                    frames,
-                    file_after_send: None,
-                };
-            };
-            if invalid {
-                if frames.is_empty() {
-                    let is_file = self.sessions.get(terminal_id).is_some_and(|session| {
-                        session
-                            .supervised
-                            .as_ref()
-                            .is_some_and(|supervised| supervised.file.is_some())
-                    });
-                    let reject = if is_file {
-                        supervised_file_rejected
-                    } else {
-                        supervised_rejected
-                    };
-                    frames.push(reject(&command_id, REASON_BAD_FRAME));
-                }
-                frames.extend(self.close(terminal_id));
-                return TerminalBytesDispatch {
-                    frames,
-                    file_after_send: None,
-                };
-            }
-            if blocked {
-                frames.extend(self.close(terminal_id));
-                return TerminalBytesDispatch {
-                    frames,
-                    file_after_send: None,
-                };
-            }
-            let file_after_send = if file_after_send {
-                apply_generation.map(|generation| FileApplyAfterSend {
-                    terminal_id: terminal_id.to_string(),
-                    command_id,
-                    generation,
-                })
-            } else {
-                None
-            };
-            return TerminalBytesDispatch {
-                frames,
-                file_after_send,
-            };
-        }
         // Scrollback is always recorded; output is sealed only for viewers.
         push_scrollback(&mut session.scrollback, bytes);
-        TerminalBytesDispatch {
-            frames: session.broadcast_data(terminal_id, bytes),
-            file_after_send: None,
-        }
+        session.broadcast_data(terminal_id, bytes)
     }
 
-    /// PTY EOF. A supervised terminal is finished only after its child is
-    /// reaped, so the outcome and exit status are never lost.
+    /// PTY EOF.
     #[cfg(unix)]
     pub(crate) fn on_eof(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
-        let Some(session) = self.sessions.get_mut(terminal_id) else {
-            return Vec::new();
-        };
-        if let Some(operator) = session.operator.as_mut() {
-            // Finished once the child is reaped, so its exit status is known.
-            operator.child.eof = true;
-            if session.pty.as_ref().is_some_and(|pty| pty.exited.is_some()) {
-                return self.close(terminal_id);
-            }
-            return Vec::new();
-        }
-        let Some(supervised) = session.supervised.as_mut() else {
-            return self.close(terminal_id);
-        };
-        supervised.child.eof = true;
-        supervised.finish_capture();
-        if session.pty.as_ref().is_some_and(|pty| pty.exited.is_some()) {
-            return self.finish_supervised(terminal_id, Instant::now());
-        }
-        Vec::new()
+        self.close(terminal_id)
     }
 
-    pub(crate) fn poll_with_startup(
-        &mut self,
-        startup: &TerminalStartup,
-        now: Instant,
-    ) -> Vec<OutboundFrame> {
-        self.poll_inner(now, startup.mcp_command_mode().allows_supervised())
-    }
-
-    #[cfg(all(test, unix))]
+    /// Expire pending approvals, re-check approvals, close exited shells and
+    /// idle detached terminals.
     pub(crate) fn poll(&mut self, now: Instant) -> Vec<OutboundFrame> {
-        self.poll_inner(now, true)
-    }
-
-    fn poll_inner(&mut self, now: Instant, mode_allows: bool) -> Vec<OutboundFrame> {
-        #[cfg(not(unix))]
-        let _ = mode_allows;
         let mut frames = Vec::new();
-        #[cfg(unix)]
-        {
-            let expired_files = self
-                .pending_files
-                .iter()
-                .filter_map(|(command_id, pending)| {
-                    let body_expired = matches!(pending.stage, PendingFileStage::Body { .. })
-                        && now.saturating_duration_since(pending.created) >= SUPERVISED_BODY_WAIT;
-                    (!mode_allows || body_expired).then(|| {
-                        (
-                            command_id.clone(),
-                            if mode_allows {
-                                REASON_BAD_FRAME
-                            } else {
-                                REASON_DISABLED
-                            },
-                        )
-                    })
-                })
-                .collect::<Vec<_>>();
-            for (command_id, reason) in expired_files {
-                if let Some(pending) = self.pending_files.remove(&command_id) {
-                    pending.cancel.cancel();
-                    frames.push(supervised_file_rejected(&command_id, reason));
-                }
-            }
-            if !mode_allows {
-                let live_files = self
-                    .sessions
-                    .iter()
-                    .filter_map(|(terminal_id, session)| {
-                        let supervised = session.supervised.as_ref()?;
-                        (supervised.awaiting() && supervised.file.is_some())
-                            .then(|| (terminal_id.clone(), supervised.command_id.clone()))
-                    })
-                    .collect::<Vec<_>>();
-                for (terminal_id, command_id) in live_files {
-                    frames.push(supervised_file_rejected(&command_id, REASON_DISABLED));
-                    frames.extend(self.close(&terminal_id));
-                }
-            }
-        }
         let expired_pending = self
             .pending
             .iter()
@@ -4050,29 +2125,16 @@ impl TerminalRegistry {
         }
         frames.extend(self.recheck_approvals(now));
         #[cfg(unix)]
-        frames.extend(self.recheck_operator_gate(now));
-        #[cfg(unix)]
         frames.extend(self.close_exited_shells(now));
-        // Pending viewers do not keep a terminal alive. An unanswered confirm
-        // screen and an unreviewed capture have their own deadlines.
+        // Pending viewers do not keep a terminal alive.
         let expired = self
             .sessions
             .iter()
-            .filter(|(_, session)| match session.supervised.as_ref() {
-                // A deployment step may wait for its person indefinitely.
-                _ if session.is_operator() => false,
-                Some(supervised) if supervised.awaiting() => {
-                    now.saturating_duration_since(supervised.spawned_at) >= self.confirm_ttl
-                }
-                Some(supervised) if supervised.phase == SupervisedPhase::Finished => supervised
-                    .finished_at
-                    .is_some_and(|at| now.saturating_duration_since(at) >= self.review_ttl),
-                _ => {
-                    session.viewers.is_empty()
-                        && session.detached_at.is_some_and(|detached| {
-                            now.saturating_duration_since(detached) >= self.idle_limit
-                        })
-                }
+            .filter(|(_, session)| {
+                session.viewers.is_empty()
+                    && session.detached_at.is_some_and(|detached| {
+                        now.saturating_duration_since(detached) >= self.idle_limit
+                    })
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
@@ -4100,29 +2162,15 @@ impl TerminalRegistry {
                     pty.exited = Some((code, signal, now));
                 }
             }
-            // A supervised command whose PTY already hit EOF has delivered
-            // all of its output; it need not wait out the drain.
-            let all_output = session
-                .supervised
-                .as_ref()
-                .is_some_and(|supervised| supervised.child.eof)
-                || session
-                    .operator
-                    .as_ref()
-                    .is_some_and(|operator| operator.child.eof);
             if pty.exited.is_some_and(|(_, _, at)| {
-                all_output || now.saturating_duration_since(at) >= TERMINAL_OUTPUT_DRAIN
+                now.saturating_duration_since(at) >= TERMINAL_OUTPUT_DRAIN
             }) {
-                drained.push((terminal_id.clone(), session.supervised.is_some()));
+                drained.push(terminal_id.clone());
             }
         }
         let mut frames = Vec::new();
-        for (terminal_id, supervised) in drained {
-            if supervised {
-                frames.extend(self.finish_supervised(&terminal_id, now));
-            } else {
-                frames.extend(self.close(&terminal_id));
-            }
+        for terminal_id in drained {
+            frames.extend(self.close(&terminal_id));
         }
         frames
     }
@@ -4326,17 +2374,59 @@ fn spawn_pty(
     })
 }
 
+/// Masked output a command keeps for `exec.poll` (a ring: the newest bytes).
+const EXEC_OUTPUT_RING_BYTES: usize = 1024 * 1024;
+/// Ended commands whose status `exec.poll` still answers.
+const EXEC_RECENT_MAX: usize = 64;
+/// The tail an unprompted end status carries.
+const EXEC_END_TAIL_BYTES: usize = 4 * 1024;
+
+/// The newest masked output bytes of one command, stdout and stderr in the
+/// order they were read.
+#[derive(Default)]
+struct OutputRing {
+    bytes: VecDeque<u8>,
+    total: u64,
+}
+
+impl OutputRing {
+    fn push(&mut self, bytes: &[u8]) {
+        self.total = self.total.saturating_add(bytes.len() as u64);
+        self.bytes.extend(bytes);
+        let overflow = self.bytes.len().saturating_sub(EXEC_OUTPUT_RING_BYTES);
+        if overflow > 0 {
+            self.bytes.drain(..overflow);
+        }
+    }
+
+    /// The last at most `max` bytes as text, cut on a character boundary.
+    fn tail(&self, max: usize) -> String {
+        let start = self.bytes.len().saturating_sub(max);
+        let raw = self.bytes.iter().skip(start).copied().collect::<Vec<_>>();
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        // Lossy decoding can grow the text; keep it within `max`.
+        let mut cut = text.len().saturating_sub(max);
+        while !text.is_char_boundary(cut) {
+            cut += 1;
+        }
+        text[cut..].to_string()
+    }
+}
+
 struct ExecSession {
     child: Option<ExecChild>,
     stdout_thread: Option<JoinHandle<()>>,
     stderr_thread: Option<JoinHandle<()>>,
     stop: Arc<AtomicBool>,
-    started: Instant,
-    stdout_seq: u64,
-    stderr_seq: u64,
+    /// The end of this command's lifetime: its `timeout_ms`, capped by the
+    /// node's `command_max_ms`.
+    deadline: Instant,
+    started_at: String,
+    ends_by: String,
     /// Independent restartable state: stdout cannot open a run on stderr.
     stdout_mask: StreamMasker,
     stderr_mask: StreamMasker,
+    output: OutputRing,
     stdout_done: bool,
     stderr_done: bool,
     timed_out: bool,
@@ -4347,19 +2437,39 @@ struct ExecSession {
     _tracked: LiveChildGuard,
 }
 
+/// A command that ended, kept for `exec.poll`.
+struct EndedCommand {
+    status: ExecStatus,
+    output: OutputRing,
+}
+
+/// How a command ended, when the node itself ended it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EndCause {
+    /// It exited (or the node saw it gone).
+    Exited,
+    Cancelled,
+    TimedOut,
+    /// The daemon shut down with the command running.
+    Interrupted,
+}
+
 pub(crate) struct ExecRegistry {
     sessions: BTreeMap<String, ExecSession>,
+    ended: VecDeque<(String, EndedCommand)>,
     tx: SyncSender<FromWorker>,
-    timeout: Duration,
+    /// The node's `command_max_ms`: no command lives longer.
+    command_max: Duration,
     shut_down: bool,
 }
 
 impl ExecRegistry {
-    pub(crate) fn new(tx: SyncSender<FromWorker>, timeout: Duration) -> Self {
+    pub(crate) fn new(tx: SyncSender<FromWorker>, command_max: Duration) -> Self {
         Self {
             sessions: BTreeMap::new(),
+            ended: VecDeque::new(),
             tx,
-            timeout,
+            command_max,
             shut_down: false,
         }
     }
@@ -4369,14 +2479,10 @@ impl ExecRegistry {
             return Vec::new();
         }
         self.shut_down = true;
-        let ids = self
-            .sessions
-            .iter()
-            .map(|(id, session)| (id.clone(), session.timed_out))
-            .collect::<Vec<_>>();
+        let ids = self.sessions.keys().cloned().collect::<Vec<_>>();
         let mut frames = Vec::new();
-        for (id, timed_out) in ids {
-            frames.extend(self.finish(&id, true, timed_out));
+        for id in ids {
+            frames.extend(self.finish(&id, EndCause::Interrupted));
         }
         frames
     }
@@ -4388,20 +2494,14 @@ impl ExecRegistry {
         command_id: &str,
         command: &str,
         cwd: Option<&str>,
+        timeout_ms: u64,
     ) -> Vec<OutboundFrame> {
         if !valid_id(command_id) {
             return vec![exec_rejected(command_id, REASON_BAD_COMMAND)];
         }
-        let mode = startup.mcp_command_mode();
-        if !mode.allows_exec() {
-            // `supervised` lets an agent act here only through a person
-            // pressing Enter on a supervised terminal.
-            let reason = if mode.allows_supervised() {
-                REASON_SUPERVISED_ONLY
-            } else {
-                REASON_DISABLED
-            };
-            return vec![exec_rejected(command_id, reason)];
+        // Commands run only at Full control.
+        if !startup.full_control() {
+            return vec![exec_rejected(command_id, REASON_TRUST_RELAY)];
         }
         if self.sessions.contains_key(command_id) {
             return vec![exec_rejected(command_id, REASON_ALREADY_OPEN)];
@@ -4427,13 +2527,19 @@ impl ExecRegistry {
                 return vec![exec_rejected(command_id, REASON_BAD_CWD)];
             }
         };
-        match spawn_exec(&self.tx, command_id, command, &cwd, config) {
+        let lifetime = Duration::from_millis(timeout_ms).min(self.command_max);
+        match spawn_exec(&self.tx, command_id, command, &cwd, config, lifetime) {
             Ok(session) => {
+                let frame = NodeFrame::ExecStarted {
+                    command_id: command_id.to_string(),
+                    started_at: session.started_at.clone(),
+                    ends_by: session.ends_by.clone(),
+                };
+                // A restarted command id replaces its ended record.
+                self.ended.retain(|(id, _)| id != command_id);
                 self.sessions.insert(command_id.to_string(), session);
                 log_command_op("exec", command_id, "started");
-                vec![OutboundFrame::Control(ClientControlMessage::ExecStarted {
-                    command_id: command_id.to_string(),
-                })]
+                vec![OutboundFrame::Control(frame)]
             }
             Err(error) => {
                 tracing::warn!(error = %error, command_id, "starting an exec failed");
@@ -4443,7 +2549,47 @@ impl ExecRegistry {
     }
 
     pub(crate) fn cancel(&mut self, command_id: &str) -> Vec<OutboundFrame> {
-        self.finish(command_id, true, false)
+        self.finish(command_id, EndCause::Cancelled)
+    }
+
+    /// `exec.poll`: the command's state and the last `tail_bytes` of its
+    /// masked output. An unknown id answers `unknown`.
+    pub(crate) fn status(&self, command_id: &str, tail_bytes: usize) -> Vec<OutboundFrame> {
+        let tail_bytes = tail_bytes.min(NODE_COMMAND_TAIL_MAX_BYTES);
+        let status = if let Some(session) = self.sessions.get(command_id) {
+            with_tail(
+                ExecStatus {
+                    command_id: command_id.to_string(),
+                    state: ExecState::Running,
+                    exit_code: None,
+                    signal: None,
+                    started_at: Some(session.started_at.clone()),
+                    ends_by: Some(session.ends_by.clone()),
+                    finished_at: None,
+                    tail: None,
+                    truncated: None,
+                    output_bytes: None,
+                },
+                &session.output,
+                tail_bytes,
+            )
+        } else if let Some((_, ended)) = self.ended.iter().find(|(id, _)| id == command_id) {
+            with_tail(ended.status.clone(), &ended.output, tail_bytes)
+        } else {
+            ExecStatus {
+                command_id: command_id.to_string(),
+                state: ExecState::Unknown,
+                exit_code: None,
+                signal: None,
+                started_at: None,
+                ends_by: None,
+                finished_at: Some(crate::telemetry::now_rfc3339()),
+                tail: None,
+                truncated: None,
+                output_bytes: None,
+            }
+        };
+        vec![OutboundFrame::Control(NodeFrame::ExecStatus(status))]
     }
 
     /// An `exec.start` the daemon could not read (for example a string with
@@ -4456,37 +2602,30 @@ impl ExecRegistry {
         vec![exec_rejected(command_id, REASON_BAD_COMMAND)]
     }
 
-    pub(crate) fn on_bytes(
-        &mut self,
-        command_id: &str,
-        stderr: bool,
-        bytes: &[u8],
-    ) -> Vec<OutboundFrame> {
+    pub(crate) fn on_bytes(&mut self, command_id: &str, stderr: bool, bytes: &[u8]) {
         if bytes.is_empty() {
-            return Vec::new();
+            return;
         }
         let Some(session) = self.sessions.get_mut(command_id) else {
-            return Vec::new();
+            return;
         };
         if session.finished {
-            return Vec::new();
+            return;
         }
         let masked = if stderr {
             session.stderr_mask.push(bytes)
         } else {
             session.stdout_mask.push(bytes)
         };
-        exec_output_frame(command_id, session, stderr, masked)
-            .into_iter()
-            .collect()
+        session.output.push(&masked);
     }
 
-    pub(crate) fn on_eof(&mut self, command_id: &str, stderr: bool) -> Vec<OutboundFrame> {
+    pub(crate) fn on_eof(&mut self, command_id: &str, stderr: bool) {
         let Some(session) = self.sessions.get_mut(command_id) else {
-            return Vec::new();
+            return;
         };
         if session.finished {
-            return Vec::new();
+            return;
         }
         let masked = if stderr {
             session.stderr_done = true;
@@ -4497,9 +2636,7 @@ impl ExecRegistry {
         };
         // Pipes can close while the process is still running (`sleep
         // >/dev/null`). Reaping happens on `poll` via `try_wait`.
-        exec_output_frame(command_id, session, stderr, masked)
-            .into_iter()
-            .collect()
+        session.output.push(&masked);
     }
 
     pub(crate) fn poll(&mut self, now: Instant) -> Vec<OutboundFrame> {
@@ -4513,7 +2650,7 @@ impl ExecRegistry {
                 if session.finished {
                     continue;
                 }
-                let timed_out = now.saturating_duration_since(session.started) >= self.timeout;
+                let timed_out = now >= session.deadline;
                 if timed_out && !session.timed_out {
                     session.timed_out = true;
                     kill_exec(session.pid, session.child.as_mut(), true);
@@ -4543,54 +2680,59 @@ impl ExecRegistry {
                 let drained = session.stdout_done && session.stderr_done;
                 let waited = now.saturating_duration_since(reaped_at) >= EXEC_OUTPUT_DRAIN;
                 if drained || waited {
-                    Some(((code, signal), session.timed_out))
+                    let cause = if session.timed_out {
+                        EndCause::TimedOut
+                    } else {
+                        EndCause::Exited
+                    };
+                    Some(((code, signal), cause))
                 } else {
                     None
                 }
             };
-            if let Some((parts, timed_out)) = action {
-                frames.extend(self.complete(&id, parts, timed_out));
+            if let Some((parts, cause)) = action {
+                frames.extend(self.complete(&id, parts, cause));
             }
         }
         frames
     }
 
-    fn finish(&mut self, command_id: &str, kill: bool, timed_out: bool) -> Vec<OutboundFrame> {
+    fn finish(&mut self, command_id: &str, cause: EndCause) -> Vec<OutboundFrame> {
         let Some(session) = self.sessions.get_mut(command_id) else {
             return Vec::new();
         };
         if session.finished {
             return Vec::new();
         }
-        session.timed_out = timed_out || session.timed_out;
         session.stop.store(true, Ordering::SeqCst);
-        if kill {
-            kill_exec(session.pid, session.child.as_mut(), true);
-        }
+        kill_exec(session.pid, session.child.as_mut(), true);
         let status = reap_child(session.child.as_mut());
-        let timed_out = session.timed_out;
-        self.complete(command_id, status, timed_out)
+        let cause = if session.timed_out {
+            EndCause::TimedOut
+        } else {
+            cause
+        };
+        self.complete(command_id, status, cause)
     }
 
     fn complete(
         &mut self,
         command_id: &str,
         status: (Option<i32>, Option<i32>),
-        timed_out: bool,
+        cause: EndCause,
     ) -> Vec<OutboundFrame> {
         let Some(mut session) = self.sessions.remove(command_id) else {
             return Vec::new();
         };
-        // Completion/cancel/drain timeout can precede pipe EOF. Send every held
-        // masked tail before ExecDone; late worker bytes cannot reopen a stream.
-        let mut frames = Vec::new();
+        // Completion/cancel/drain timeout can precede pipe EOF. Keep every
+        // held masked tail; late worker bytes cannot reopen a stream.
         for stderr in [false, true] {
             let masked = if stderr {
                 session.stderr_mask.finish()
             } else {
                 session.stdout_mask.finish()
             };
-            frames.extend(exec_output_frame(command_id, &mut session, stderr, masked));
+            session.output.push(&masked);
         }
         session.finished = true;
         session.stop.store(true, Ordering::SeqCst);
@@ -4599,13 +2741,42 @@ impl ExecRegistry {
         drop(session.stdout_thread.take());
         drop(session.stderr_thread.take());
         drop(session.child.take());
-        frames.push(exec_done(
-            command_id,
-            status.0,
-            status.1,
-            timed_out || session.timed_out,
+        let (state, exit_code) = match cause {
+            EndCause::Cancelled => (ExecState::Cancelled, None),
+            EndCause::TimedOut => (ExecState::TimedOut, None),
+            EndCause::Interrupted => (ExecState::Interrupted, None),
+            EndCause::Exited => match status {
+                (Some(0), _) => (ExecState::Succeeded, Some(0)),
+                (Some(code), _) => (ExecState::Failed, wire_exit_code(Some(code))),
+                (None, _) => (ExecState::Failed, None),
+            },
+        };
+        log_command_op("exec", command_id, &done_outcome(status.0, status.1, cause));
+        let ended = ExecStatus {
+            command_id: command_id.to_string(),
+            state,
+            exit_code,
+            signal: signal_token(status.1),
+            started_at: Some(session.started_at.clone()),
+            ends_by: Some(session.ends_by.clone()),
+            finished_at: Some(crate::telemetry::now_rfc3339()),
+            tail: None,
+            truncated: None,
+            output_bytes: None,
+        };
+        let frame = with_tail(ended.clone(), &session.output, EXEC_END_TAIL_BYTES);
+        self.ended.retain(|(id, _)| id != command_id);
+        self.ended.push_back((
+            command_id.to_string(),
+            EndedCommand {
+                status: ended,
+                output: std::mem::take(&mut session.output),
+            },
         ));
-        frames
+        while self.ended.len() > EXEC_RECENT_MAX {
+            self.ended.pop_front();
+        }
+        vec![OutboundFrame::Control(NodeFrame::ExecStatus(frame))]
     }
 
     #[cfg(test)]
@@ -4620,34 +2791,22 @@ impl Drop for ExecRegistry {
     }
 }
 
-/// Frame only masked bytes, allocating sequence numbers only for emitted data.
-fn exec_output_frame(
-    command_id: &str,
-    session: &mut ExecSession,
-    stderr: bool,
-    bytes: Vec<u8>,
-) -> Option<OutboundFrame> {
-    if bytes.is_empty() {
-        return None;
+/// `status` with the output tail, shrunk until the frame fits one control
+/// frame (escaping can grow text past its byte count).
+fn with_tail(mut status: ExecStatus, output: &OutputRing, max: usize) -> ExecStatus {
+    status.output_bytes = Some(output.total);
+    let mut max = max.min(NODE_COMMAND_TAIL_MAX_BYTES);
+    loop {
+        let tail = output.tail(max);
+        status.truncated = Some((tail.len() as u64) < output.total);
+        status.tail = (!tail.is_empty()).then_some(tail);
+        let fits = serde_json::to_string(&NodeFrame::ExecStatus(status.clone()))
+            .is_ok_and(|text| text.len() <= crate::protocol::RELAY_JSON_CONTROL_MAX_BYTES);
+        if fits || max == 0 {
+            return status;
+        }
+        max /= 2;
     }
-    let seq = if stderr {
-        &mut session.stderr_seq
-    } else {
-        &mut session.stdout_seq
-    };
-    *seq = seq.saturating_add(1);
-    let metadata = if stderr {
-        RelayBinaryFrameMetadata::ExecStderr {
-            command_id: command_id.to_string(),
-            seq: *seq,
-        }
-    } else {
-        RelayBinaryFrameMetadata::ExecStdout {
-            command_id: command_id.to_string(),
-            seq: *seq,
-        }
-    };
-    Some(OutboundFrame::Binary(metadata, bytes))
 }
 
 fn reap_child(child: Option<&mut ExecChild>) -> (Option<i32>, Option<i32>) {
@@ -4690,6 +2849,7 @@ fn spawn_exec(
     command: &str,
     cwd: &Path,
     config: &Config,
+    lifetime: Duration,
 ) -> anyhow::Result<ExecSession> {
     let (program, flag) = child_env::exec_shell();
     let mut process = std::process::Command::new(program);
@@ -4759,16 +2919,18 @@ fn spawn_exec(
             stderr: true,
         },
     );
+    let started = std::time::SystemTime::now();
     Ok(ExecSession {
         child: Some(child),
         stdout_thread: Some(stdout_thread),
         stderr_thread: Some(stderr_thread),
         stop,
-        started: Instant::now(),
-        stdout_seq: 0,
-        stderr_seq: 0,
+        deadline: Instant::now() + lifetime,
+        started_at: crate::telemetry::rfc3339(started),
+        ends_by: crate::telemetry::rfc3339(started + lifetime),
         stdout_mask: StreamMasker::new(command),
         stderr_mask: StreamMasker::new(command),
+        output: OutputRing::default(),
         stdout_done: false,
         stderr_done: false,
         timed_out: false,
@@ -4783,6 +2945,9 @@ fn spawn_exec(
 mod tests {
     use super::*;
     use crate::config::McpCommandMode;
+
+    /// A command lifetime longer than any test.
+    const TEST_TIMEOUT_MS: u64 = 600_000;
     use crate::terminal_crypto::CliTerminalKey;
 
     fn channel() -> (SyncSender<FromWorker>, mpsc::Receiver<FromWorker>) {
@@ -4832,10 +2997,11 @@ mod tests {
                 "windows-tree",
                 &command,
                 Some(tree.cwd().to_str().expect("fixture cwd")),
+                TEST_TIMEOUT_MS,
             );
             assert!(matches!(
                 &frames[0],
-                OutboundFrame::Control(ClientControlMessage::ExecStarted { .. })
+                OutboundFrame::Control(NodeFrame::ExecStarted { .. })
             ));
             let grandchild = tree.read_marker().parse().expect("grandchild PID");
             let root = execs.pid("windows-tree").expect("exec root");
@@ -4935,14 +3101,19 @@ mod tests {
             .finish();
         tracing::subscriber::with_default(subscriber, || {
             let (tx, _rx) = channel();
-            let mut execs = ExecRegistry::new(tx, DEFAULT_EXEC_TIMEOUT);
+            let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);
             let startup = enabled_startup(false);
             let config = Config::default();
             // Refused: bad cwd, and the command carries a secret-looking token.
             let secret_cmd = "echo TOPSECRET_TOKEN_9f3a";
-            let _ = execs.start(&startup, &config, "ref1", secret_cmd, Some("relative"));
-            let _ = supervised_rejected("sup1", REASON_LIMIT);
-            let _ = exec_done("done1", Some(3), None, false);
+            let _ = execs.start(
+                &startup,
+                &config,
+                "ref1",
+                secret_cmd,
+                Some("relative"),
+                TEST_TIMEOUT_MS,
+            );
         });
         let log = String::from_utf8(buf.0.lock().map(|b| b.clone()).unwrap_or_default())
             .unwrap_or_default();
@@ -4951,9 +3122,7 @@ mod tests {
             "{log}"
         );
         assert!(log.contains("rejected:bad_cwd"), "{log}");
-        assert!(log.contains("rejected:limit"), "{log}");
-        assert!(log.contains("exited:3"), "{log}");
-        assert!(log.contains("ref1") && log.contains("sup1"), "{log}");
+        assert!(log.contains("ref1"), "{log}");
         assert!(!log.contains("TOPSECRET_TOKEN_9f3a"), "{log}");
         assert!(!log.contains("relative"), "{log}");
     }
@@ -4981,10 +3150,11 @@ mod tests {
                 "started1",
                 command,
                 Some(&dir),
+                TEST_TIMEOUT_MS,
             );
             assert!(matches!(
                 started[0],
-                OutboundFrame::Control(ClientControlMessage::ExecStarted { .. })
+                OutboundFrame::Control(NodeFrame::ExecStarted { .. })
             ));
             let pid = execs.pid("started1").expect("pid");
             drop(execs);
@@ -5011,25 +3181,39 @@ mod tests {
     #[test]
     fn exec_rejects_size_nul_cwd_and_the_concurrency_cap() {
         let (tx, _rx) = channel();
-        let mut execs = ExecRegistry::new(tx, DEFAULT_EXEC_TIMEOUT);
+        let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);
         let startup = enabled_startup(false);
         let config = Config::default();
-        let rejected = execs.start(&startup, &config, "one", &"a".repeat(4097), None);
+        let rejected = execs.start(
+            &startup,
+            &config,
+            "one",
+            &"a".repeat(4097),
+            None,
+            TEST_TIMEOUT_MS,
+        );
         assert!(matches!(
             &rejected[0],
-            OutboundFrame::Control(ClientControlMessage::ExecRejected { reason, .. })
+            OutboundFrame::Control(NodeFrame::ExecRejected { reason, .. })
                 if reason == REASON_BAD_COMMAND
         ));
-        let rejected = execs.start(&startup, &config, "two", "echo\0no", None);
+        let rejected = execs.start(&startup, &config, "two", "echo\0no", None, TEST_TIMEOUT_MS);
         assert!(matches!(
             &rejected[0],
-            OutboundFrame::Control(ClientControlMessage::ExecRejected { reason, .. })
+            OutboundFrame::Control(NodeFrame::ExecRejected { reason, .. })
                 if reason == REASON_BAD_COMMAND
         ));
-        let rejected = execs.start(&startup, &config, "three", "echo ok", Some("relative"));
+        let rejected = execs.start(
+            &startup,
+            &config,
+            "three",
+            "echo ok",
+            Some("relative"),
+            TEST_TIMEOUT_MS,
+        );
         assert!(matches!(
             &rejected[0],
-            OutboundFrame::Control(ClientControlMessage::ExecRejected { reason, .. })
+            OutboundFrame::Control(NodeFrame::ExecRejected { reason, .. })
                 if reason == REASON_BAD_CWD
         ));
         assert!(execs.sessions.is_empty());
@@ -5037,17 +3221,38 @@ mod tests {
         let (tx, rx) = channel();
         let mut execs = ExecRegistry::new(tx, Duration::from_secs(30));
         assert!(matches!(
-            execs.start(&startup, &config, "a", slow_command(), None)[0],
-            OutboundFrame::Control(ClientControlMessage::ExecStarted { .. })
+            execs.start(
+                &startup,
+                &config,
+                "a",
+                slow_command(),
+                None,
+                TEST_TIMEOUT_MS
+            )[0],
+            OutboundFrame::Control(NodeFrame::ExecStarted { .. })
         ));
         assert!(matches!(
-            execs.start(&startup, &config, "b", slow_command(), None)[0],
-            OutboundFrame::Control(ClientControlMessage::ExecStarted { .. })
+            execs.start(
+                &startup,
+                &config,
+                "b",
+                slow_command(),
+                None,
+                TEST_TIMEOUT_MS
+            )[0],
+            OutboundFrame::Control(NodeFrame::ExecStarted { .. })
         ));
-        let rejected = execs.start(&startup, &config, "c", slow_command(), None);
+        let rejected = execs.start(
+            &startup,
+            &config,
+            "c",
+            slow_command(),
+            None,
+            TEST_TIMEOUT_MS,
+        );
         assert!(matches!(
             &rejected[0],
-            OutboundFrame::Control(ClientControlMessage::ExecRejected { reason, .. })
+            OutboundFrame::Control(NodeFrame::ExecRejected { reason, .. })
                 if reason == REASON_LIMIT
         ));
         assert_eq!(execs.sessions.len(), 2);
@@ -5060,7 +3265,14 @@ mod tests {
         let (tx, rx) = channel();
         let mut execs = ExecRegistry::new(tx, Duration::from_millis(200));
         let startup = enabled_startup(false);
-        execs.start(&startup, &Config::default(), "slow", slow_command(), None);
+        execs.start(
+            &startup,
+            &Config::default(),
+            "slow",
+            slow_command(),
+            None,
+            TEST_TIMEOUT_MS,
+        );
         std::thread::sleep(Duration::from_millis(350));
         let deadline = Instant::now() + Duration::from_secs(2);
         let frames = loop {
@@ -5071,10 +3283,10 @@ mod tests {
                         stderr,
                         bytes,
                     } => {
-                        let _ = execs.on_bytes(&command_id, stderr, &bytes);
+                        execs.on_bytes(&command_id, stderr, &bytes);
                     }
                     FromWorker::ExecEof { command_id, stderr } => {
-                        let _ = execs.on_eof(&command_id, stderr);
+                        execs.on_eof(&command_id, stderr);
                     }
                     _ => {}
                 }
@@ -5090,7 +3302,7 @@ mod tests {
         };
         assert!(matches!(
             &frames[0],
-            OutboundFrame::Control(ClientControlMessage::ExecDone { timed_out, .. }) if *timed_out
+            OutboundFrame::Control(NodeFrame::ExecStatus(status)) if status.state == ExecState::TimedOut
         ));
         drop(execs);
         drop(rx);
@@ -5117,6 +3329,7 @@ mod tests {
                 "slow",
                 slow_command(),
                 None,
+                TEST_TIMEOUT_MS,
             );
             std::thread::sleep(Duration::from_millis(350));
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -5128,10 +3341,10 @@ mod tests {
                             stderr,
                             bytes,
                         } => {
-                            let _ = execs.on_bytes(&command_id, stderr, &bytes);
+                            execs.on_bytes(&command_id, stderr, &bytes);
                         }
                         FromWorker::ExecEof { command_id, stderr } => {
-                            let _ = execs.on_eof(&command_id, stderr);
+                            execs.on_eof(&command_id, stderr);
                         }
                         _ => {}
                     }
@@ -5158,13 +3371,14 @@ mod tests {
     fn dropping_the_exec_registry_reaps_the_child() {
         let (tx, rx) = channel();
         let pid = {
-            let mut execs = ExecRegistry::new(tx, DEFAULT_EXEC_TIMEOUT);
+            let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);
             execs.start(
                 &enabled_startup(false),
                 &Config::default(),
                 "sleep",
                 slow_command(),
                 None,
+                TEST_TIMEOUT_MS,
             );
             let pid = execs.pid("sleep").expect("pid");
             drop(execs);
@@ -5185,13 +3399,14 @@ mod tests {
             "temp path is unsafe to inline in a shell command"
         );
         let (tx, rx) = channel();
-        let mut execs = ExecRegistry::new(tx, DEFAULT_EXEC_TIMEOUT);
+        let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);
         execs.start(
             &enabled_startup(false),
             &Config::default(),
             "group",
             &command,
             Some(dir.path().to_str().expect("utf8")),
+            TEST_TIMEOUT_MS,
         );
         let shell_pid = execs.pid("group").expect("shell");
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -5252,7 +3467,7 @@ mod tests {
         );
         assert!(matches!(
             &frames[0],
-            OutboundFrame::Control(ClientControlMessage::TermOpened { .. })
+            OutboundFrame::Control(NodeFrame::TermOpened { .. })
         ));
         let deadline = Instant::now() + Duration::from_secs(3);
         let expected = b"wsmp-pty-ok";
@@ -5309,8 +3524,8 @@ mod tests {
                 },
             );
             match &frames[0] {
-                OutboundFrame::Control(ClientControlMessage::TermOpened { .. }) => opened += 1,
-                OutboundFrame::Control(ClientControlMessage::TermRejected { reason, .. }) => {
+                OutboundFrame::Control(NodeFrame::TermOpened { .. }) => opened += 1,
+                OutboundFrame::Control(NodeFrame::TermRejected { reason, .. }) => {
                     assert_eq!(reason, REASON_LIMIT);
                     break;
                 }
@@ -5329,6 +3544,7 @@ mod tests {
         assert_eq!(open_until_refused(&enabled_startup(false)), 4);
         let config = Config {
             allow_human_terminal: true,
+            mcp_command_mode: McpCommandMode::Unsupervised,
             max_terminals: Some(1),
             ..Config::default()
         };
@@ -5368,7 +3584,7 @@ mod tests {
         let frames = terminals.poll(Instant::now() + Duration::from_secs(120));
         assert!(matches!(
             &frames[0],
-            OutboundFrame::Control(ClientControlMessage::TermExit { terminal_id, .. })
+            OutboundFrame::Control(NodeFrame::TermExit { terminal_id, .. })
                 if terminal_id == "idle"
         ));
         assert!(!terminals.sessions.contains_key("idle"));
@@ -5475,7 +3691,7 @@ mod tests {
             },
         );
         let (cli_nonce, code) = match &frames[0] {
-            OutboundFrame::Control(ClientControlMessage::TermPending {
+            OutboundFrame::Control(NodeFrame::TermPending {
                 cli_nonce,
                 approval_code,
                 ..
@@ -5506,7 +3722,7 @@ mod tests {
         );
         assert!(matches!(
             &opened[0],
-            OutboundFrame::Control(ClientControlMessage::TermOpened { cli_nonce: opened_nonce, .. })
+            OutboundFrame::Control(NodeFrame::TermOpened { cli_nonce: opened_nonce, .. })
                 if opened_nonce == &cli_nonce
         ));
         assert!(terminals.pending.is_empty());
@@ -5530,6 +3746,7 @@ mod tests {
             "sleep",
             command,
             None,
+            TEST_TIMEOUT_MS,
         );
         let pid = execs.pid("sleep").expect("pid");
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -5539,12 +3756,11 @@ mod tests {
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(FromWorker::ExecEof { stderr, .. }) => {
                     let started = Instant::now();
-                    let frames = execs.on_eof("sleep", stderr);
+                    execs.on_eof("sleep", stderr);
                     assert!(
                         started.elapsed() < Duration::from_millis(500),
                         "eof handling blocked"
                     );
-                    assert!(frames.is_empty());
                     if stderr {
                         stderr_done = true;
                     } else {
@@ -5588,6 +3804,7 @@ mod tests {
             "group",
             &command,
             Some(dir.path().to_str().expect("utf8")),
+            TEST_TIMEOUT_MS,
         );
         let shell_pid = execs.pid("group").expect("shell");
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -5607,12 +3824,10 @@ mod tests {
         loop {
             let _ = rx.try_recv();
             let frames = execs.poll(Instant::now());
-            if frames.iter().any(|frame| {
-                matches!(
-                    frame,
-                    OutboundFrame::Control(ClientControlMessage::ExecDone { .. })
-                )
-            }) {
+            if frames
+                .iter()
+                .any(|frame| matches!(frame, OutboundFrame::Control(NodeFrame::ExecStatus(_))))
+            {
                 break;
             }
             if Instant::now() > deadline {
@@ -5667,7 +3882,7 @@ mod tests {
         );
         assert!(matches!(
             &frames[0],
-            OutboundFrame::Control(ClientControlMessage::TermExit { .. })
+            OutboundFrame::Control(NodeFrame::TermExit { .. })
         ));
         drop(terminals);
         drop(rx);
@@ -5805,7 +4020,7 @@ mod tests {
             let mut seen = Vec::new();
             for frame in frames {
                 let OutboundFrame::Binary(
-                    RelayBinaryFrameMetadata::TermSealed {
+                    NodeBinaryMetadata::TermSealed {
                         seq,
                         viewer_id,
                         epoch,
@@ -5885,9 +4100,9 @@ mod tests {
             .iter()
             .find_map(|frame| match frame {
                 OutboundFrame::Control(
-                    ClientControlMessage::TermOpened { cli_nonce, .. }
-                    | ClientControlMessage::TermAttached { cli_nonce, .. }
-                    | ClientControlMessage::TermPending { cli_nonce, .. },
+                    NodeFrame::TermOpened { cli_nonce, .. }
+                    | NodeFrame::TermAttached { cli_nonce, .. }
+                    | NodeFrame::TermPending { cli_nonce, .. },
                 ) => Some(cli_nonce.clone()),
                 _ => None,
             })
@@ -5895,7 +4110,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn controls(frames: &[OutboundFrame]) -> Vec<&ClientControlMessage> {
+    fn controls(frames: &[OutboundFrame]) -> Vec<&NodeFrame> {
         frames
             .iter()
             .filter_map(|frame| match frame {
@@ -5910,7 +4125,7 @@ mod tests {
         controls(frames)
             .into_iter()
             .filter_map(|message| match message {
-                ClientControlMessage::TermWriter { viewer_id, .. } => Some(viewer_id.clone()),
+                NodeFrame::TermWriter { viewer_id, .. } => Some(viewer_id.clone()),
                 _ => None,
             })
             .collect()
@@ -5921,7 +4136,7 @@ mod tests {
         controls(frames)
             .into_iter()
             .find_map(|message| match message {
-                ClientControlMessage::TermRejected {
+                NodeFrame::TermRejected {
                     viewer_id, reason, ..
                 } => Some((viewer_id.clone(), reason.clone())),
                 _ => None,
@@ -6000,7 +4215,7 @@ mod tests {
         let frames = open_viewer(&mut terminals, &startup, &mut a);
         assert!(matches!(
             controls(&frames)[0],
-            ClientControlMessage::TermOpened { viewer_id: Some(id), .. } if id == &a.id
+            NodeFrame::TermOpened { viewer_id: Some(id), .. } if id == &a.id
         ));
         assert_eq!(
             a.receive(MULTI_TERMINAL, &frames),
@@ -6030,7 +4245,7 @@ mod tests {
         let attached = attach_viewer(&mut terminals, &startup, &mut b);
         assert!(matches!(
             controls(&attached)[0],
-            ClientControlMessage::TermAttached { viewer_id: Some(id), .. } if id == &b.id
+            NodeFrame::TermAttached { viewer_id: Some(id), .. } if id == &b.id
         ));
         // Join order: key, PTY size, scrollback. The epoch does not change,
         // and nothing in the join is visible to A.
@@ -6097,7 +4312,7 @@ mod tests {
         assert_eq!(writer_changes(&frames), vec![Some(b.id.clone())]);
         assert!(matches!(
             &frames[0],
-            OutboundFrame::Control(ClientControlMessage::TermWriter { .. })
+            OutboundFrame::Control(NodeFrame::TermWriter { .. })
         ));
         assert_eq!(
             a.receive(MULTI_TERMINAL, &frames),
@@ -6243,7 +4458,7 @@ mod tests {
             vec![Seen::Data(b"after".to_vec())]
         );
         let OutboundFrame::Binary(
-            RelayBinaryFrameMetadata::TermSealed {
+            NodeBinaryMetadata::TermSealed {
                 seq,
                 epoch: Some(epoch),
                 ..
@@ -6371,7 +4586,7 @@ mod tests {
         let frames = terminals.poll(past_idle());
         assert!(matches!(
             controls(&frames)[0],
-            ClientControlMessage::TermExit { terminal_id, .. } if terminal_id == MULTI_TERMINAL
+            NodeFrame::TermExit { terminal_id, .. } if terminal_id == MULTI_TERMINAL
         ));
     }
 
@@ -6423,7 +4638,7 @@ mod tests {
         );
         assert!(matches!(
             controls(&pending)[0],
-            ClientControlMessage::TermPending { viewer_id: Some(id), .. } if id == &a.id
+            NodeFrame::TermPending { viewer_id: Some(id), .. } if id == &a.id
         ));
         let a_nonce = cli_nonce_of(&pending);
         let a_id = a.id.clone();
@@ -6437,7 +4652,7 @@ mod tests {
         );
         assert!(matches!(
             controls(&opened)[0],
-            ClientControlMessage::TermOpened { viewer_id: Some(id), .. } if id == &a.id
+            NodeFrame::TermOpened { viewer_id: Some(id), .. } if id == &a.id
         ));
         a.bind(&startup, MULTI_TERMINAL, &a_nonce);
         assert_eq!(
@@ -6459,7 +4674,7 @@ mod tests {
             );
             assert!(matches!(
                 controls(&pending)[0],
-                ClientControlMessage::TermPending { viewer_id: Some(id), .. } if id == &viewer.id
+                NodeFrame::TermPending { viewer_id: Some(id), .. } if id == &viewer.id
             ));
             nonces.push(cli_nonce_of(&pending));
         }
@@ -6511,7 +4726,7 @@ mod tests {
         ] {
             assert!(matches!(
                 controls(frames)[0],
-                ClientControlMessage::TermAttached { viewer_id: Some(id), .. } if id == &viewer.id
+                NodeFrame::TermAttached { viewer_id: Some(id), .. } if id == &viewer.id
             ));
             viewer.bind(&startup, MULTI_TERMINAL, nonce);
             assert_eq!(
@@ -6537,7 +4752,7 @@ mod tests {
             .filter(|message| {
                 matches!(
                     message,
-                    ClientControlMessage::TermRejected { reason, .. }
+                    NodeFrame::TermRejected { reason, .. }
                         if reason == REASON_APPROVAL_REQUIRED
                 )
             })
@@ -6575,7 +4790,7 @@ mod tests {
         controls(frames)
             .into_iter()
             .filter_map(|message| match message {
-                ClientControlMessage::TermInputDropped { viewer_id, .. } => Some(viewer_id.clone()),
+                NodeFrame::TermInputDropped { viewer_id, .. } => Some(viewer_id.clone()),
                 _ => None,
             })
             .collect()
@@ -6640,10 +4855,7 @@ mod tests {
             "close waited on the blocked writer for {:?}",
             started.elapsed()
         );
-        assert!(matches!(
-            controls(&closed)[0],
-            ClientControlMessage::TermExit { .. }
-        ));
+        assert!(matches!(controls(&closed)[0], NodeFrame::TermExit { .. }));
         drop(rx);
     }
 
@@ -6879,7 +5091,7 @@ mod tests {
         );
         assert!(matches!(
             &opened[0],
-            OutboundFrame::Control(ClientControlMessage::TermOpened { .. })
+            OutboundFrame::Control(NodeFrame::TermOpened { .. })
         ));
         let started = Instant::now();
         let deadline = started + Duration::from_secs(10);
@@ -6906,7 +5118,7 @@ mod tests {
             for frame in frames {
                 match frame {
                     OutboundFrame::Binary(..) if exit.is_none() => sealed_output = true,
-                    OutboundFrame::Control(ClientControlMessage::TermExit {
+                    OutboundFrame::Control(NodeFrame::TermExit {
                         terminal_id,
                         exit_code,
                         signal,
@@ -6986,13 +5198,14 @@ mod tests {
             .and_then(|session| session.pty.as_ref())
             .and_then(|pty| pty.pid)
             .expect("shell pid");
-        let mut execs = ExecRegistry::new(tx, DEFAULT_EXEC_TIMEOUT);
+        let mut execs = ExecRegistry::new(tx, DEFAULT_COMMAND_MAX);
         execs.start(
             &startup,
             &Config::default(),
             "forced",
             &format!("sleep 120 & echo $! > '{}'; wait", exec_file.display()),
             Some(dir.path().to_str().expect("utf8")),
+            TEST_TIMEOUT_MS,
         );
         let exec = execs.pid("forced").expect("exec pid");
         let read_pid = |path: &Path| {
@@ -7047,336 +5260,8 @@ mod tests {
         drop(rx);
     }
 
-    // Supervised (agent-requested) terminals.
-
-    #[cfg(unix)]
-    const SUPERVISED_COMMAND_ID: &str = "cmd-supervised-1";
-
-    /// The confirm script that ends a started command by itself (exit 3 after
-    /// `after-accept`), so a test needs no cancel to reach `done`.
-    #[cfg(unix)]
-    fn self_ending_confirm(witness: Option<&Path>) -> String {
-        let touch = witness.map_or(String::new(), |path| {
-            format!("touch '{}'\n", path.display())
-        });
-        let record_pid = witness.map_or(String::new(), |path| {
-            format!("echo $$ > '{}'\n", path.with_extension("pid").display())
-        });
-        let go_len = supervised_marker("go", "00112233445566778899aabbccddeeff").len();
-        format!(
-            r#"{record_pid}sleep 0.4
-printf 'SCREEN\n'
-printf '\033]7717;wsmp-supervised;ready;%s\007' "$WSMP_SUPERVISED_MARKER"
-IFS= read -r line
-stty -echo -icanon min 1 time 0
-printf '\033]7717;wsmp-supervised;accepted;%s\007' "$WSMP_SUPERVISED_MARKER"
-go=$(head -c {go_len})
-stty echo icanon
-[ "$go" = "$(printf '\033]7717;wsmp-supervised;go;%s\007' "$WSMP_SUPERVISED_MARKER")" ] || exit 99
-{touch}printf 'after-accept\n'
-exit 3
-"#
-        )
-    }
-
-    /// Stands in for `wsmp terminal supervised-run`: draws a screen, prints the
-    /// ready marker, reads one line (canonical tty, so type-ahead would be
-    /// read too), declines on `q`, else prints the accepted marker and "runs".
-    #[cfg(unix)]
-    /// A stand-in for `wsmp terminal supervised-run` with the same marker
-    /// and `go` handshake: after Enter it prints `accepted` with echo off,
-    /// then runs its "command" only once the daemon's `go` token arrives.
-    #[cfg(unix)]
-    fn fake_confirm(witness: Option<&Path>) -> String {
-        fake_confirm_output(witness, "printf 'after-accept\\n'")
-    }
-
-    #[cfg(unix)]
-    fn fake_confirm_output(witness: Option<&Path>, output: &str) -> String {
-        let go_len = supervised_marker("go", "00112233445566778899aabbccddeeff").len();
-        let touch = witness.map_or(String::new(), |path| {
-            format!("touch '{}'\n", path.display())
-        });
-        let record_pid = witness.map_or(String::new(), |path| {
-            format!("echo $$ > '{}'\n", path.with_extension("pid").display())
-        });
-        format!(
-            r#"{record_pid}sleep 0.4
-printf 'SCREEN\n'
-printf '\033]7717;wsmp-supervised;ready;%s\007' "$WSMP_SUPERVISED_MARKER"
-IFS= read -r line
-case "$line" in q*) printf 'Declined\n'; exit 0;; esac
-printf 'got[%s]\n' "$line"
-stty -echo -icanon min 1 time 0
-printf '\033]7717;wsmp-supervised;accepted;%s\007' "$WSMP_SUPERVISED_MARKER"
-go=$(head -c {go_len})
-stty echo icanon
-[ "$go" = "$(printf '\033]7717;wsmp-supervised;go;%s\007' "$WSMP_SUPERVISED_MARKER")" ] || exit 99
-{touch}{output}
-printf '\033]7717;wsmp-supervised;ready;%s\007' "$WSMP_SUPERVISED_MARKER"
-exit 3
-"#
-        )
-    }
-
-    #[cfg(unix)]
-    fn fake_file_confirm(blocked: Option<&str>) -> String {
-        let go_len = supervised_marker("go", "00112233445566778899aabbccddeeff").len();
-        match blocked {
-            Some(code) => format!(
-                r#"printf 'FILE SCREEN\n'
-printf '\033]7717;wsmp-supervised;ready;%s\007' "$WSMP_SUPERVISED_MARKER"
-IFS= read -r line
-printf '\033]7717;wsmp-supervised;blocked;{code};%s\007' "$WSMP_SUPERVISED_MARKER"
-exit 0
-"#
-            ),
-            None => format!(
-                r#"printf 'FILE SCREEN\n'
-printf '\033]7717;wsmp-supervised;ready;%s\007' "$WSMP_SUPERVISED_MARKER"
-IFS= read -r line
-case "$line" in q*) printf 'Declined\n'; exit 0;; esac
-stty -echo -icanon min 1 time 0
-printf '\033]7717;wsmp-supervised;accepted;%s\007' "$WSMP_SUPERVISED_MARKER"
-go=$(head -c {go_len})
-stty echo icanon
-[ "$go" = "$(printf '\033]7717;wsmp-supervised;go;%s\007' "$WSMP_SUPERVISED_MARKER")" ] || exit 99
-exit 0
-"#
-            ),
-        }
-    }
-
     #[cfg(unix)]
     mod output_mask_tests;
-
-    /// Waits until the confirm child recorded next to `witness` can no longer
-    /// run. A reaped or zombie child cannot create the witness later, so the
-    /// caller can then assert its absence without guessing how long a live
-    /// child would need. Zombie-aware on purpose: the child is the test's own
-    /// direct child, and on macOS `kill(pid, 0)` keeps succeeding for a zombie
-    /// that the test has not reaped yet (reaping here would lose the exit
-    /// status this helper does not need, so it just stops waiting).
-    #[cfg(unix)]
-    fn wait_for_confirm_child_exit(witness: &Path) {
-        let pid = std::fs::read_to_string(witness.with_extension("pid"))
-            .expect("the confirm child records its pid before it draws")
-            .trim()
-            .parse::<u32>()
-            .expect("pid");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !process_dead(pid) {
-            assert!(Instant::now() < deadline, "the confirm child kept running");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    #[cfg(unix)]
-    fn supervised_startup(mode: McpCommandMode, approval: bool) -> TerminalStartup {
-        let config = Config {
-            allow_human_terminal: false,
-            mcp_command_mode: mode,
-            require_terminal_approval: approval,
-            ..Config::default()
-        };
-        TerminalStartup::from_key(CliTerminalKey::generate().expect("key"), &config)
-    }
-
-    #[cfg(unix)]
-    fn supervised_registry(tx: SyncSender<FromWorker>, script: &str) -> TerminalRegistry {
-        crate::logging::init_test_subscriber();
-        let mut terminals = multi_registry(tx);
-        terminals.supervised_program = Some((
-            "/bin/sh".to_string(),
-            vec!["-c".to_string(), script.to_string()],
-        ));
-        terminals
-    }
-
-    #[cfg(unix)]
-    fn supervised_file_registry(tx: SyncSender<FromWorker>, script: &str) -> TerminalRegistry {
-        let mut terminals = supervised_registry(tx, script);
-        terminals.set_file_runtime(Arc::new(crate::file_relay::FileRuntime::new(
-            crate::file_ops::FileOps::new(
-                crate::file_ops::Policy::from_environment(Vec::new(), true),
-                crate::file_ops::EtagKey::random(),
-            ),
-        )));
-        terminals
-    }
-
-    #[cfg(unix)]
-    fn spawn_request(share_output: bool) -> SupervisedSpawn {
-        SupervisedSpawn {
-            terminal_id: MULTI_TERMINAL.to_string(),
-            command_id: SUPERVISED_COMMAND_ID.to_string(),
-            command: "make install".to_string(),
-            cwd: None,
-            reason: Some("needs your password".to_string()),
-            requester: "test agent".to_string(),
-            share_output,
-            kind: None,
-            file_op: None,
-            body_bytes: None,
-        }
-    }
-
-    #[cfg(unix)]
-    fn file_spawn_request(
-        op: &str,
-        args: serde_json::Value,
-        body_bytes: Option<usize>,
-    ) -> SupervisedSpawn {
-        SupervisedSpawn {
-            terminal_id: MULTI_TERMINAL.to_string(),
-            command_id: "AAECAwQFBgcICQoLDA0ODw".to_string(),
-            command: format!("file {op}"),
-            cwd: None,
-            reason: Some("forged spawn reason is ignored".to_string()),
-            requester: "test agent".to_string(),
-            share_output: false,
-            kind: Some("file".to_string()),
-            file_op: Some(crate::protocol::FileSpawnOp {
-                op: op.to_string(),
-                args,
-            }),
-            body_bytes,
-        }
-    }
-
-    #[cfg(unix)]
-    fn phase(terminals: &TerminalRegistry) -> Option<SupervisedPhase> {
-        terminals
-            .sessions
-            .get(MULTI_TERMINAL)
-            .and_then(|session| session.supervised.as_ref())
-            .map(|supervised| supervised.phase)
-    }
-
-    /// Run the relay loop's worker and poll steps until `done` holds.
-    #[cfg(unix)]
-    fn pump_until(
-        terminals: &mut TerminalRegistry,
-        rx: &mpsc::Receiver<FromWorker>,
-        frames: &mut Vec<OutboundFrame>,
-        done: impl Fn(&TerminalRegistry, &[OutboundFrame]) -> bool,
-    ) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !done(terminals, frames) {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting on the supervised terminal"
-            );
-            match rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(FromWorker::TerminalBytes { terminal_id, bytes }) => {
-                    frames.extend(terminals.on_bytes(&terminal_id, &bytes));
-                }
-                Ok(FromWorker::TerminalEof { terminal_id }) => {
-                    frames.extend(terminals.on_eof(&terminal_id));
-                }
-                _ => {}
-            }
-            frames.extend(terminals.poll(Instant::now()));
-        }
-    }
-
-    #[cfg(unix)]
-    fn pump_file_until(
-        terminals: &mut TerminalRegistry,
-        rx: &mpsc::Receiver<FromWorker>,
-        startup: &TerminalStartup,
-        frames: &mut Vec<OutboundFrame>,
-        done: impl Fn(&TerminalRegistry, &[OutboundFrame]) -> bool,
-    ) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !done(terminals, frames) {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting on file registry"
-            );
-            match rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(FromWorker::SupervisedFilePrepared {
-                    command_id,
-                    generation,
-                    outcome,
-                }) => frames.extend(terminals.on_file_prepared(
-                    startup,
-                    &Config::default(),
-                    &command_id,
-                    generation,
-                    *outcome,
-                )),
-                Ok(FromWorker::SupervisedFileApplied {
-                    command_id,
-                    generation,
-                    outcome,
-                }) => frames.extend(terminals.on_file_applied(&command_id, generation, outcome)),
-                Ok(FromWorker::TerminalBytes { terminal_id, bytes }) => {
-                    terminals
-                        .on_bytes_with_startup(startup, &terminal_id, &bytes)
-                        .transmit(terminals, |sent| {
-                            frames.extend(sent);
-                            Ok::<(), std::convert::Infallible>(())
-                        })
-                        .expect("infallible test transmission");
-                }
-                Ok(FromWorker::TerminalEof { terminal_id }) => {
-                    frames.extend(terminals.on_eof(&terminal_id));
-                }
-                _ => {}
-            }
-            frames.extend(terminals.poll_with_startup(startup, Instant::now()));
-        }
-    }
-
-    #[cfg(unix)]
-    fn has_exit(_: &TerminalRegistry, frames: &[OutboundFrame]) -> bool {
-        controls(frames)
-            .iter()
-            .any(|message| matches!(message, ClientControlMessage::TermExit { .. }))
-    }
-
-    #[cfg(unix)]
-    fn seen_data(seen: &[Seen]) -> Vec<u8> {
-        seen.iter()
-            .filter_map(|item| match item {
-                Seen::Data(bytes) => Some(bytes.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect()
-    }
-
-    #[cfg(unix)]
-    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-        supervised_pty::find_subslice(haystack, needle).is_some()
-    }
-
-    #[cfg(unix)]
-    fn outcome_kinds(frames: &[OutboundFrame]) -> Vec<&'static str> {
-        frames
-            .iter()
-            .filter_map(|frame| match frame {
-                OutboundFrame::Control(ClientControlMessage::TermSpawned { .. }) => Some("spawned"),
-                OutboundFrame::Control(ClientControlMessage::SupervisedAccepted { .. }) => {
-                    Some("accepted")
-                }
-                OutboundFrame::Control(ClientControlMessage::SupervisedDeclined { .. }) => {
-                    Some("declined")
-                }
-                OutboundFrame::Control(ClientControlMessage::SupervisedDone { .. }) => Some("done"),
-                OutboundFrame::Control(ClientControlMessage::TermExit { .. }) => Some("exit"),
-                OutboundFrame::Binary(
-                    RelayBinaryFrameMetadata::SupervisedOutput { part, .. },
-                    _,
-                ) => Some(match part {
-                    SupervisedOutputPart::Head => "head",
-                    SupervisedOutputPart::Tail => "tail",
-                }),
-                _ => None,
-            })
-            .collect()
-    }
 
     /// The `command operation` info lines as `(op, command_id, outcome)`.
     /// The default formatter writes the message last, then the fields in the
@@ -7406,1739 +5291,4 @@ exit 0
             })
             .collect()
     }
-
-    /// The one line that ends this command (its outcome, never `started`),
-    /// with the "logged exactly once" invariant: zero is missing, two double.
-    #[cfg(unix)]
-    fn sole_supervised_end(log: &str, command_id: &str) -> (String, String, String) {
-        let ops = command_ops(log);
-        let mine = ops
-            .iter()
-            .filter(|(_, id, outcome)| id == command_id && outcome != "started")
-            .collect::<Vec<_>>();
-        assert_eq!(
-            mine.len(),
-            1,
-            "expected exactly one ending line for {command_id}: {ops:?}\nlog:\n{log}"
-        );
-        let (op, id, outcome) = mine[0];
-        (op.clone(), id.clone(), outcome.clone())
-    }
-
-    /// The number of `started` lines for a command, which is 1 only while it
-    /// runs and 0 for a request that never took an Enter.
-    #[cfg(unix)]
-    fn started_lines(log: &str, command_id: &str) -> usize {
-        command_ops(log)
-            .iter()
-            .filter(|(_, id, outcome)| id == command_id && outcome == "started")
-            .count()
-    }
-
-    /// The command text of the log-invariant requests: the child echoes it,
-    /// and it must never reach the log.
-    #[cfg(unix)]
-    const SUPERVISED_COMMAND_TEXT: &str = "echo SUPERVISED_COMMAND_TEXT_9f3a";
-
-    /// What the supervised child prints after it is accepted, never logged.
-    #[cfg(unix)]
-    const SUPERVISED_OUTPUT_TEXT: &str = "after-accept";
-
-    /// The `reason` of the log-invariant requests, never logged.
-    #[cfg(unix)]
-    const SUPERVISED_CWD_TEXT: &str = "wsmp-supervised-reason-9f3a";
-
-    #[cfg(unix)]
-    fn supervised_outcome_log(
-        script: &str,
-        witness: Option<&Path>,
-        review: bool,
-        end: impl FnOnce(
-            &mut TerminalRegistry,
-            &mut TestViewer,
-            &mpsc::Receiver<FromWorker>,
-        ) -> Vec<OutboundFrame>,
-        outcome: &str,
-    ) -> (String, Vec<OutboundFrame>) {
-        // The command reports its exit and its session is removed by `end`.
-        supervised_outcome_log_then_close(script, witness, review, end, outcome, false)
-    }
-
-    /// Like [`supervised_outcome_log`], but the terminal keeps its session
-    /// until it is closed after `end`; with `review` this is the double-log
-    /// scenario: the command reports its exit, stays Finished, and a later
-    /// close must not log a second outcome.
-    #[cfg(unix)]
-    fn supervised_outcome_log_then_close(
-        script: &str,
-        witness: Option<&Path>,
-        review: bool,
-        body: impl FnOnce(
-            &mut TerminalRegistry,
-            &mut TestViewer,
-            &mpsc::Receiver<FromWorker>,
-        ) -> Vec<OutboundFrame>,
-        outcome: &str,
-        close_after: bool,
-    ) -> (String, Vec<OutboundFrame>) {
-        let _capture = crate::logging::test_capture_lock();
-        let buf = LogBuf::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(buf.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        let mut cwd_dir = None;
-        let frames = tracing::subscriber::with_default(subscriber, || {
-            let (tx, rx) = channel();
-            let mut terminals = supervised_registry(tx, script);
-            let startup = supervised_startup(McpCommandMode::Supervised, false);
-            // The cwd must exist (the confirm screen shows the physical path),
-            // but neither it nor the command text may reach the log.
-            let cwd = tempfile::tempdir().expect("tempdir");
-            let request = SupervisedSpawn {
-                cwd: Some(cwd.path().to_string_lossy().into_owned()),
-                command: SUPERVISED_COMMAND_TEXT.to_string(),
-                reason: Some(SUPERVISED_CWD_TEXT.to_string()),
-                share_output: review,
-                ..spawn_request(review)
-            };
-            cwd_dir = Some(cwd);
-            let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &request);
-            assert_eq!(outcome_kinds(&frames), vec!["spawned"]);
-            let mut a = TestViewer::new(7);
-            let _ = attach_viewer(&mut terminals, &startup, &mut a);
-            pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
-                phase(terminals) == Some(SupervisedPhase::Confirm)
-            });
-            let label = a.id.clone();
-            // Review-pending ends hold the capture, so turn review on before
-            // the Enter when the caller keeps the Finished terminal.
-            if review && close_after {
-                frames.extend(send(
-                    &mut terminals,
-                    &mut a,
-                    &label,
-                    &TermPlaintextV2::ReviewToggle(true),
-                ));
-            }
-            frames.extend(send(
-                &mut terminals,
-                &mut a,
-                &label,
-                &TermPlaintextV2::Data(b"ok\r".to_vec()),
-            ));
-            frames.extend(body(&mut terminals, &mut a, &rx));
-            if close_after {
-                frames.extend(terminals.close(MULTI_TERMINAL));
-            }
-            frames
-        });
-        let log = String::from_utf8(buf.0.lock().map(|b| b.clone()).unwrap_or_default())
-            .unwrap_or_default();
-        let line = sole_supervised_end(&log, SUPERVISED_COMMAND_ID);
-        assert_eq!(line.0, "supervised", "{log}");
-        assert_eq!(line.2, outcome, "{log}");
-        // "started" appears exactly once while the command runs, and not at
-        // all for a request that never took an Enter.
-        let started = started_lines(&log, SUPERVISED_COMMAND_ID);
-        if outcome == "exited:3" || outcome == "cancelled" {
-            assert_eq!(started, 1, "the running command logged no started: {log}");
-        } else {
-            assert_eq!(started, 0, "a command that never ran logged started: {log}");
-        }
-        for leaked in [
-            SUPERVISED_COMMAND_TEXT,
-            SUPERVISED_OUTPUT_TEXT,
-            SUPERVISED_CWD_TEXT,
-        ] {
-            assert!(!log.contains(leaked), "log leaked {leaked:?}: {log}");
-        }
-        if let Some(cwd) = cwd_dir {
-            let path = cwd.path().to_string_lossy().into_owned();
-            assert!(!log.contains(&path), "log leaked the cwd {path}: {log}");
-        }
-        if let Some(witness) = witness {
-            wait_for_confirm_child_exit(witness);
-        }
-        (log, frames)
-    }
-
-    /// Every supervised ending, each asserted to write exactly one outcome
-    /// line and never the command text, cwd or output (AC 8's supervised
-    /// half): accept, browser/confirm decline, stop of a waiting screen, stop
-    /// of a running command, `start_failed`, and the confirm deadline.
-    #[cfg(unix)]
-    #[test]
-    fn supervised_logs_one_outcome_per_command_for_every_ending() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        // 1. A person's Enter starts the command.
-        let witness = tmp.path().join("started-ran");
-        let (log, frames) = supervised_outcome_log(
-            &self_ending_confirm(Some(&witness)),
-            Some(&witness),
-            true,
-            |terminals, _, rx| {
-                let mut frames = Vec::new();
-                pump_until(terminals, rx, &mut frames, has_exit);
-                frames
-            },
-            "exited:3",
-        );
-        assert_eq!(
-            outcome_kinds(&frames),
-            vec!["spawned", "accepted", "head", "done", "exit"],
-            "{log}"
-        );
-        assert!(witness.exists());
-
-        // 2. A browser decline / confirm deadline while the screen waits.
-        let witness = tmp.path().join("declined-ran");
-        let (log, frames) = supervised_outcome_log(
-            &fake_confirm(Some(&witness)),
-            Some(&witness),
-            true,
-            |terminals, _, _| terminals.cancel_supervised(SUPERVISED_COMMAND_ID, true),
-            "declined",
-        );
-        assert_eq!(
-            outcome_kinds(&frames),
-            vec!["spawned", "declined", "exit"],
-            "{log}"
-        );
-        assert!(!witness.exists(), "the declined command must not run");
-
-        // 3. A server stop of a running command (`if_waiting` false): the
-        //    command was killed mid-run, so it is cancelled, not done.
-        let witness = tmp.path().join("stopped-ran");
-        let (log, frames) = supervised_outcome_log(
-            &self_ending_confirm(Some(&witness)),
-            Some(&witness),
-            false,
-            |terminals, _, rx| {
-                let mut frames = Vec::new();
-                pump_until(terminals, rx, &mut frames, |terminals, _| {
-                    phase(terminals) == Some(SupervisedPhase::Running)
-                });
-                frames.extend(terminals.cancel_supervised(SUPERVISED_COMMAND_ID, false));
-                frames
-            },
-            "cancelled",
-        );
-        assert_eq!(
-            outcome_kinds(&frames),
-            vec!["spawned", "accepted", "exit"],
-            "{log}"
-        );
-
-        // 4. Enter was pressed but `go` could not be written: the command
-        //    never started, and calling it a decline would be a lie.
-        let witness = tmp.path().join("start-failed-ran");
-        let (log, frames) = supervised_outcome_log(
-            &fake_confirm(Some(&witness)),
-            Some(&witness),
-            true,
-            |terminals, _, rx| {
-                let held = hold_output_until(rx, b"wsmp-supervised;accepted;");
-                terminals
-                    .sessions
-                    .get(MULTI_TERMINAL)
-                    .and_then(|session| session.pty.as_ref())
-                    .expect("pty")
-                    .input
-                    .fail();
-                let mut frames = Vec::new();
-                for bytes in held {
-                    frames.extend(terminals.on_bytes(MULTI_TERMINAL, &bytes));
-                }
-                frames.extend(terminals.cancel_supervised(SUPERVISED_COMMAND_ID, true));
-                frames
-            },
-            "start_failed",
-        );
-        assert_eq!(outcome_kinds(&frames), vec!["spawned", "exit"], "{log}");
-        assert!(!witness.exists(), "the command started without go");
-
-        // 5. A confirm screen nobody answered past its deadline, ended by a
-        //    stop while it still waits (`if_waiting` false). It never ran:
-        //    the log must say declined, not cancelled.
-        let witness = tmp.path().join("expired-ran");
-        let (log, frames) = supervised_outcome_log(
-            &fake_confirm(Some(&witness)),
-            Some(&witness),
-            false,
-            |terminals, _, _| terminals.cancel_supervised(SUPERVISED_COMMAND_ID, false),
-            "declined",
-        );
-        assert_eq!(outcome_kinds(&frames), vec!["spawned", "exit"], "{log}");
-        assert!(!witness.exists());
-
-        // 6. The confirm screen's own deadline (`poll`) closes the terminal
-        //    directly (no `supervised.declined` frame), and `close` logs the
-        //    declined outcome for it.
-        let witness = tmp.path().join("poll-ran");
-        let (log, frames) = supervised_outcome_log(
-            &fake_confirm(Some(&witness)),
-            Some(&witness),
-            true,
-            |terminals, _, _| {
-                // The registry's confirm TTL is 15 minutes; move the clock.
-                terminals.confirm_ttl = Duration::ZERO;
-                terminals.poll(Instant::now() + Duration::from_secs(1))
-            },
-            "declined",
-        );
-        assert_eq!(outcome_kinds(&frames), vec!["spawned", "exit"], "{log}");
-        assert!(!witness.exists());
-    }
-
-    /// A review-pending capture ends the command, then the terminal is closed
-    /// later: the outcome must still appear exactly once (the close path must
-    /// not log a second line for an already-reported command).
-    #[cfg(unix)]
-    #[test]
-    fn a_closed_review_pending_supervised_command_logs_one_outcome() {
-        let witness: Option<&Path> = None;
-        let (log, frames) = supervised_outcome_log_then_close(
-            &self_ending_confirm(witness),
-            witness,
-            true,
-            |terminals, _, rx| {
-                let mut frames = Vec::new();
-                pump_until(terminals, rx, &mut frames, |terminals, _| {
-                    phase(terminals) == Some(SupervisedPhase::Finished)
-                });
-                frames
-            },
-            "exited:3",
-            true,
-        );
-        assert!(outcome_kinds(&frames).contains(&"exit"), "{log}");
-        assert_eq!(started_lines(&log, SUPERVISED_COMMAND_ID), 1, "{log}");
-    }
-    #[cfg(unix)]
-    fn supervised_rejection_reason(frames: &[OutboundFrame]) -> Option<&str> {
-        frames.iter().find_map(|frame| match frame {
-            OutboundFrame::Control(ClientControlMessage::SupervisedRejected { reason, .. }) => {
-                Some(reason.as_str())
-            }
-            _ => None,
-        })
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn supervised_file_logs_the_real_outcome_once_including_missing_runtime() {
-        for (op, blocked, missing_runtime, outcome) in [
-            ("mkdir", None, false, "ok"),
-            ("delete", Some("not_found"), false, "not_found"),
-            ("mkdir", None, true, "io_error"),
-        ] {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let target = dir.path().join("target");
-            let _capture = crate::logging::test_capture_lock();
-            let buf = LogBuf::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(buf.clone())
-                .with_ansi(false)
-                .finish();
-            tracing::subscriber::with_default(subscriber, || {
-                let (tx, rx) = channel();
-                let mut terminals = supervised_file_registry(tx, &fake_file_confirm(blocked));
-                let startup = supervised_startup(McpCommandMode::Supervised, false);
-                let request = file_spawn_request(op, serde_json::json!({ "path": target }), None);
-                let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &request);
-                pump_file_until(
-                    &mut terminals,
-                    &rx,
-                    &startup,
-                    &mut frames,
-                    |terminals, _| phase(terminals) == Some(SupervisedPhase::Confirm),
-                );
-                if missing_runtime {
-                    terminals.file_runtime = None;
-                }
-                let mut viewer = TestViewer::new(81);
-                frames.extend(attach_viewer(&mut terminals, &startup, &mut viewer));
-                let label = viewer.id.clone();
-                frames.extend(send(
-                    &mut terminals,
-                    &mut viewer,
-                    &label,
-                    &TermPlaintextV2::Data(b"\r".to_vec()),
-                ));
-                pump_file_until(&mut terminals, &rx, &startup, &mut frames, has_exit);
-                assert_eq!(
-                    outcome_kinds(&frames)
-                        .iter()
-                        .filter(|kind| **kind == "done")
-                        .count(),
-                    1
-                );
-                assert!(terminals.sessions.is_empty());
-                assert!(!outcome_kinds(&frames).contains(&"declined"));
-            });
-            let log = String::from_utf8(buf.0.lock().expect("log").clone()).expect("utf8");
-            let lines: Vec<_> = log
-                .lines()
-                .filter(|line| line.contains("file op"))
-                .collect();
-            assert_eq!(lines.len(), 1, "{log}");
-            assert!(lines[0].contains(&format!("op={op}")), "{log}");
-            assert!(lines[0].contains(&format!("outcome={outcome}")), "{log}");
-            assert!(!log.contains("outcome=cancelled"), "{log}");
-            assert!(!target.exists() || outcome == "ok");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn supervised_write_body_is_private_and_removed_on_every_pre_apply_end() {
-        use std::os::unix::fs::PermissionsExt;
-
-        #[derive(Clone, Copy, Debug)]
-        enum End {
-            Decline,
-            Cancel,
-            Timeout,
-            SessionLoss,
-            Panic,
-        }
-        for end in [
-            End::Decline,
-            End::Cancel,
-            End::Timeout,
-            End::SessionLoss,
-            End::Panic,
-        ] {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let target = dir.path().join("unchanged");
-            let (tx, rx) = channel();
-            let mut terminals = supervised_file_registry(tx, &fake_file_confirm(None));
-            let startup = supervised_startup(McpCommandMode::Supervised, false);
-            let request =
-                file_spawn_request("write", serde_json::json!({ "path": target }), Some(3));
-            let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &request);
-            frames.extend(
-                terminals
-                    .handle_supervised_body(&startup, &request.command_id, b"new".to_vec())
-                    .expect("body"),
-            );
-            pump_file_until(
-                &mut terminals,
-                &rx,
-                &startup,
-                &mut frames,
-                |terminals, _| phase(terminals) == Some(SupervisedPhase::Confirm),
-            );
-            let private = terminals.sessions[MULTI_TERMINAL]
-                .supervised
-                .as_ref()
-                .and_then(|supervised| supervised.file.as_ref())
-                .and_then(|file| file._body.as_ref())
-                .expect("private body");
-            let body = private.path.clone();
-            let directory = private.directory.clone();
-            assert_eq!(
-                std::fs::metadata(&body)
-                    .expect("body metadata")
-                    .permissions()
-                    .mode()
-                    & 0o7777,
-                0o600
-            );
-            assert_eq!(
-                std::fs::metadata(&directory)
-                    .expect("dir metadata")
-                    .permissions()
-                    .mode()
-                    & 0o7777,
-                0o700
-            );
-            assert_eq!(std::fs::read(&body).expect("body bytes"), b"new");
-            match end {
-                End::Decline => {
-                    let mut viewer = TestViewer::new(80);
-                    frames.extend(attach_viewer(&mut terminals, &startup, &mut viewer));
-                    let label = viewer.id.clone();
-                    frames.extend(send(
-                        &mut terminals,
-                        &mut viewer,
-                        &label,
-                        &TermPlaintextV2::Data(b"q\r".to_vec()),
-                    ));
-                    pump_file_until(&mut terminals, &rx, &startup, &mut frames, has_exit);
-                    assert!(outcome_kinds(&frames).contains(&"declined"));
-                }
-                End::Cancel => {
-                    frames.extend(terminals.cancel_supervised(&request.command_id, true))
-                }
-                End::Timeout => {
-                    terminals.confirm_ttl = Duration::ZERO;
-                    frames.extend(
-                        terminals
-                            .poll_with_startup(&startup, Instant::now() + Duration::from_secs(1)),
-                    );
-                }
-                End::SessionLoss => frames.extend(terminals.kill_all()),
-                End::Panic => {
-                    let unwind =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                            let _owned = terminals;
-                            panic!("injected registry unwind");
-                        }));
-                    assert!(unwind.is_err());
-                }
-            }
-            assert!(!body.exists(), "{end:?}: body leaked");
-            assert!(!directory.exists(), "{end:?}: private directory leaked");
-            assert!(!target.exists(), "{end:?}: pre-apply end changed disk");
-            assert!(!outcome_kinds(&frames).contains(&"accepted"), "{end:?}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn supervised_file_pending_body_entry_limit_cancel_mode_and_deadline_are_closed() {
-        let (tx, rx) = channel();
-        let mut terminals = supervised_file_registry(tx, &fake_file_confirm(None));
-        let on = supervised_startup(McpCommandMode::Supervised, false);
-        let off = supervised_startup(McpCommandMode::Off, false);
-
-        let invalid =
-            file_spawn_request("read", serde_json::json!({ "path": "/tmp/not-used" }), None);
-        let frames = terminals.spawn_supervised(&on, &Config::default(), &invalid);
-        assert_eq!(
-            supervised_rejection_reason(&frames),
-            Some(REASON_BAD_COMMAND)
-        );
-
-        let forged = file_spawn_request(
-            "mkdir",
-            serde_json::json!({ "path": "/tmp/not-used", "diff": "forged" }),
-            None,
-        );
-        assert!(
-            terminals
-                .spawn_supervised(&on, &Config::default(), &forged)
-                .is_empty()
-        );
-        let (command_id, generation, outcome) = match rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("strict preparation result")
-        {
-            FromWorker::SupervisedFilePrepared {
-                command_id,
-                generation,
-                outcome,
-            } => (command_id, generation, *outcome),
-            _ => panic!("unexpected worker message"),
-        };
-        let frames =
-            terminals.on_file_prepared(&on, &Config::default(), &command_id, generation, outcome);
-        assert_eq!(
-            supervised_rejection_reason(&frames),
-            Some(REASON_INVALID_INPUT)
-        );
-
-        let write = file_spawn_request(
-            "write",
-            serde_json::json!({
-                "path": "/tmp/wsmp-registry-body",
-                "ifExists": "fail",
-                "reason": null
-            }),
-            Some(3),
-        );
-        let frames = terminals.spawn_supervised(&off, &Config::default(), &write);
-        assert_eq!(supervised_rejection_reason(&frames), Some(REASON_DISABLED));
-        let mut oversized = write.clone();
-        oversized.body_bytes = Some(crate::protocol::RELAY_BINARY_CHUNK_MAX_BYTES + 1);
-        let frames = terminals.spawn_supervised(&on, &Config::default(), &oversized);
-        assert_eq!(supervised_rejection_reason(&frames), Some("too_large"));
-        assert!(terminals.pending_files.is_empty());
-        assert!(
-            terminals
-                .spawn_supervised(&on, &Config::default(), &write)
-                .is_empty()
-        );
-        let mut second = write.clone();
-        second.command_id = "EBESExQVFhcYGRobHB0eHw".to_string();
-        second.terminal_id = "second-file-terminal".to_string();
-        let frames = terminals.spawn_supervised(&on, &Config::default(), &second);
-        assert_eq!(supervised_rejection_reason(&frames), Some(REASON_LIMIT));
-        let frames = terminals.poll_with_startup(&on, Instant::now() + SUPERVISED_BODY_WAIT);
-        assert_eq!(supervised_rejection_reason(&frames), Some(REASON_BAD_FRAME));
-        assert!(terminals.pending_files.is_empty());
-
-        assert!(
-            terminals
-                .spawn_supervised(&on, &Config::default(), &write)
-                .is_empty()
-        );
-        assert_eq!(
-            outcome_kinds(&terminals.cancel_supervised(&write.command_id, true)),
-            vec!["declined"]
-        );
-        assert!(terminals.pending_files.is_empty());
-
-        assert!(
-            terminals
-                .spawn_supervised(&on, &Config::default(), &write)
-                .is_empty()
-        );
-        let frames = terminals
-            .handle_supervised_body(&off, &write.command_id, b"abc".to_vec())
-            .expect("supervised body");
-        assert_eq!(supervised_rejection_reason(&frames), Some(REASON_DISABLED));
-
-        assert!(
-            terminals
-                .spawn_supervised(&on, &Config::default(), &write)
-                .is_empty()
-        );
-        let frames = terminals
-            .handle_supervised_body(&on, &write.command_id, b"ab".to_vec())
-            .expect("supervised body");
-        assert_eq!(supervised_rejection_reason(&frames), Some(REASON_BAD_FRAME));
-        assert!(terminals.pending_files.is_empty());
-
-        let empty_write = file_spawn_request(
-            "write",
-            serde_json::json!({ "path": "/tmp/wsmp-registry-empty", "ifExists": "fail" }),
-            Some(0),
-        );
-        assert!(
-            empty_write.file_shape_is_valid(),
-            "zero-byte writes are valid"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn supervised_file_blocked_marker_uses_child_state_and_settles_once() {
-        struct Case {
-            name: &'static str,
-            op: &'static str,
-            child_code: &'static str,
-            prepared_code: Option<crate::protocol::FileErrorCode>,
-        }
-
-        let cases = [
-            Case {
-                name: "daemon allowed then child conflict",
-                op: "mkdir",
-                child_code: "conflict",
-                prepared_code: None,
-            },
-            Case {
-                name: "daemon not-found then child conflict",
-                op: "delete",
-                child_code: "conflict",
-                prepared_code: Some(crate::protocol::FileErrorCode::NotFound),
-            },
-            Case {
-                name: "daemon and child report not-found",
-                op: "delete",
-                child_code: "not_found",
-                prepared_code: Some(crate::protocol::FileErrorCode::NotFound),
-            },
-        ];
-
-        for (index, case) in cases.into_iter().enumerate() {
-            let dir = tempfile::tempdir().expect("tempdir");
-            let target = dir.path().join("target");
-            let (tx, rx) = channel();
-            let mut terminals =
-                supervised_file_registry(tx, &fake_file_confirm(Some(case.child_code)));
-            let startup = supervised_startup(McpCommandMode::Supervised, false);
-            let args = match case.op {
-                "mkdir" => serde_json::json!({ "path": target, "parents": false }),
-                "delete" => serde_json::json!({ "path": target }),
-                _ => unreachable!("table contains only mutation operations"),
-            };
-            let request = file_spawn_request(case.op, args, None);
-            let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &request);
-            pump_file_until(
-                &mut terminals,
-                &rx,
-                &startup,
-                &mut frames,
-                |terminals, _| phase(terminals) == Some(SupervisedPhase::Confirm),
-            );
-            let file = terminals
-                .sessions
-                .get(MULTI_TERMINAL)
-                .and_then(|session| session.supervised.as_ref())
-                .and_then(|supervised| supervised.file.as_ref())
-                .expect("prepared file request");
-            assert_eq!(file.blocked, case.prepared_code, "{}", case.name);
-            let cancel = file.cancel.clone();
-
-            let mut viewer = TestViewer::new(70 + index as u8);
-            frames.extend(attach_viewer(&mut terminals, &startup, &mut viewer));
-            let label = viewer.id.clone();
-            frames.extend(send(
-                &mut terminals,
-                &mut viewer,
-                &label,
-                &TermPlaintextV2::Data(b"q\r".to_vec()),
-            ));
-            pump_file_until(&mut terminals, &rx, &startup, &mut frames, has_exit);
-
-            let kinds = outcome_kinds(&frames);
-            assert_eq!(
-                kinds.iter().filter(|kind| **kind == "done").count(),
-                1,
-                "{}: {kinds:?}",
-                case.name
-            );
-            assert_eq!(
-                kinds.iter().filter(|kind| **kind == "exit").count(),
-                1,
-                "{}: {kinds:?}",
-                case.name
-            );
-            assert!(!kinds.contains(&"accepted"), "{}: {kinds:?}", case.name);
-            assert!(!kinds.contains(&"declined"), "{}: {kinds:?}", case.name);
-            assert!(
-                cancel.is_cancelled(),
-                "{}: preparation not cancelled",
-                case.name
-            );
-            assert!(
-                !target.exists(),
-                "{}: blocked request mutated disk",
-                case.name
-            );
-
-            let done = controls(&frames)
-                .into_iter()
-                .find(|message| matches!(message, ClientControlMessage::SupervisedDone { .. }))
-                .expect("one done frame");
-            let encoded = serde_json::to_value(done).expect("encode done");
-            assert_eq!(
-                encoded["fileError"],
-                serde_json::json!({ "code": case.child_code }),
-                "{}",
-                case.name
-            );
-            assert!(encoded.get("fileResult").is_none(), "{}", case.name);
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn supervised_file_rechecks_mode_in_confirm_before_go() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("must-not-exist");
-        let (tx, rx) = channel();
-        let mut terminals = supervised_file_registry(tx, &fake_file_confirm(None));
-        let on = supervised_startup(McpCommandMode::Supervised, false);
-        let off = supervised_startup(McpCommandMode::Off, false);
-        let request = file_spawn_request(
-            "mkdir",
-            serde_json::json!({ "path": target, "parents": false }),
-            None,
-        );
-        let mut frames = terminals.spawn_supervised(&on, &Config::default(), &request);
-        pump_file_until(&mut terminals, &rx, &on, &mut frames, |terminals, _| {
-            phase(terminals) == Some(SupervisedPhase::Confirm)
-        });
-        let mut viewer = TestViewer::new(73);
-        frames.extend(attach_viewer(&mut terminals, &on, &mut viewer));
-        let label = viewer.id.clone();
-        frames.extend(send(
-            &mut terminals,
-            &mut viewer,
-            &label,
-            &TermPlaintextV2::Data(b"\r".to_vec()),
-        ));
-        // Deliver the already-emitted accepted marker directly with mode off.
-        // Polling first could close the confirm screen before the decision,
-        // accidentally letting this test pass with the go-time guard removed.
-        let held = hold_output_until(&rx, b"wsmp-supervised;accepted;");
-        for bytes in held {
-            terminals
-                .on_bytes_with_startup(&off, MULTI_TERMINAL, &bytes)
-                .transmit(&mut terminals, |sent| {
-                    frames.extend(sent);
-                    Ok::<(), std::convert::Infallible>(())
-                })
-                .expect("infallible test transmission");
-        }
-        pump_file_until(&mut terminals, &rx, &off, &mut frames, has_exit);
-        assert_eq!(supervised_rejection_reason(&frames), Some(REASON_DISABLED));
-        let kinds = outcome_kinds(&frames);
-        assert!(!kinds.contains(&"accepted"), "{kinds:?}");
-        assert!(!target.exists(), "mode-off confirm applied the request");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn supervised_file_accepts_once_applies_once_and_never_declines_after_child_exit() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let created = dir.path().join("created");
-        let (tx, rx) = channel();
-        let mut terminals = supervised_file_registry(tx, &fake_file_confirm(None));
-        let startup = supervised_startup(McpCommandMode::Supervised, false);
-        let request = file_spawn_request(
-            "mkdir",
-            serde_json::json!({ "path": created, "parents": false, "reason": "create output" }),
-            None,
-        );
-        let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &request);
-        pump_file_until(
-            &mut terminals,
-            &rx,
-            &startup,
-            &mut frames,
-            |terminals, _| phase(terminals) == Some(SupervisedPhase::Confirm),
-        );
-        let mut viewer = TestViewer::new(71);
-        frames.extend(attach_viewer(&mut terminals, &startup, &mut viewer));
-        let label = viewer.id.clone();
-        frames.extend(send(
-            &mut terminals,
-            &mut viewer,
-            &label,
-            &TermPlaintextV2::Data(b"\r".to_vec()),
-        ));
-        pump_file_until(&mut terminals, &rx, &startup, &mut frames, has_exit);
-        assert!(created.is_dir(), "accepted mkdir was not applied");
-        let kinds = outcome_kinds(&frames);
-        assert_eq!(kinds.iter().filter(|kind| **kind == "accepted").count(), 1);
-        assert_eq!(kinds.iter().filter(|kind| **kind == "done").count(), 1);
-        assert!(!kinds.contains(&"declined"), "{kinds:?}");
-        let done = controls(&frames)
-            .into_iter()
-            .find(|message| matches!(message, ClientControlMessage::SupervisedDone { .. }))
-            .expect("done");
-        let encoded = serde_json::to_value(done).expect("encode done");
-        assert_eq!(encoded["fileResult"]["op"], "mkdir");
-        assert!(encoded.get("fileError").is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn supervised_file_send_failure_after_accept_does_not_submit_apply() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("must-not-be-created");
-        let (tx, rx) = channel();
-        let mut terminals = supervised_file_registry(tx, &fake_file_confirm(None));
-        let startup = supervised_startup(McpCommandMode::Supervised, false);
-        let request = file_spawn_request(
-            "mkdir",
-            serde_json::json!({ "path": target, "parents": false }),
-            None,
-        );
-        let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &request);
-        pump_file_until(
-            &mut terminals,
-            &rx,
-            &startup,
-            &mut frames,
-            |terminals, _| phase(terminals) == Some(SupervisedPhase::Confirm),
-        );
-        let generation = terminals.sessions[MULTI_TERMINAL]
-            .supervised
-            .as_ref()
-            .and_then(|supervised| supervised.file.as_ref())
-            .map(|file| file.generation)
-            .expect("prepared file generation");
-        assert!(
-            terminals
-                .queue_file_apply(FileApplyAfterSend {
-                    terminal_id: MULTI_TERMINAL.to_string(),
-                    command_id: SUPERVISED_COMMAND_ID.to_string(),
-                    generation,
-                })
-                .is_empty()
-        );
-        assert!(!target.exists(), "pre-confirm continuation submitted a job");
-        let mut viewer = TestViewer::new(74);
-        frames.extend(attach_viewer(&mut terminals, &startup, &mut viewer));
-        let label = viewer.id.clone();
-        frames.extend(send(
-            &mut terminals,
-            &mut viewer,
-            &label,
-            &TermPlaintextV2::Data(b"\r".to_vec()),
-        ));
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            assert!(
-                Instant::now() < deadline,
-                "accepted marker was not received"
-            );
-            if let Ok(FromWorker::TerminalBytes { terminal_id, bytes }) =
-                rx.recv_timeout(Duration::from_millis(20))
-            {
-                let dispatch = terminals.on_bytes_with_startup(&startup, &terminal_id, &bytes);
-                if dispatch.file_after_send.is_some() {
-                    for after_send in [
-                        FileApplyAfterSend {
-                            terminal_id: "wrong-terminal".to_string(),
-                            command_id: SUPERVISED_COMMAND_ID.to_string(),
-                            generation,
-                        },
-                        FileApplyAfterSend {
-                            terminal_id: MULTI_TERMINAL.to_string(),
-                            command_id: "wrong-command".to_string(),
-                            generation,
-                        },
-                        FileApplyAfterSend {
-                            terminal_id: MULTI_TERMINAL.to_string(),
-                            command_id: SUPERVISED_COMMAND_ID.to_string(),
-                            generation: generation.wrapping_add(1),
-                        },
-                    ] {
-                        assert!(terminals.queue_file_apply(after_send).is_empty());
-                    }
-                    assert!(!target.exists(), "mismatched continuation submitted a job");
-                    let mut sent = Vec::new();
-                    let result = dispatch.transmit(&mut terminals, |outbound| {
-                        let is_accepted = outcome_kinds(&outbound).contains(&"accepted");
-                        sent.extend(outbound);
-                        if is_accepted {
-                            Err("injected accepted transport failure")
-                        } else {
-                            Ok(())
-                        }
-                    });
-                    assert!(result.is_err());
-                    assert!(outcome_kinds(&sent).contains(&"accepted"));
-                    break;
-                }
-                dispatch
-                    .transmit(&mut terminals, |outbound| {
-                        frames.extend(outbound);
-                        Ok::<(), std::convert::Infallible>(())
-                    })
-                    .expect("infallible test transmission");
-            }
-        }
-
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(
-            !target.exists(),
-            "failed accepted send submitted the file job"
-        );
-        assert!(terminals.close(MULTI_TERMINAL).is_empty());
-        std::thread::sleep(Duration::from_millis(50));
-        assert!(
-            !target.exists(),
-            "teardown allowed a deferred file job to run"
-        );
-        assert!(
-            rx.try_iter()
-                .all(|message| !matches!(message, FromWorker::SupervisedFileApplied { .. }))
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn supervised_file_terminal_loss_after_go_cancels_before_commit_and_still_reports_done() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let target = dir.path().join("cancelled");
-        std::fs::write(&target, b"old").expect("old file");
-        let (reached_tx, reached_rx) = mpsc::sync_channel(1);
-        let (release_tx, release_rx) = mpsc::sync_channel(1);
-        let release_rx = Arc::new(Mutex::new(release_rx));
-        let hook: crate::file_ops::StepHook = Arc::new(move |step| {
-            if step == crate::file_ops::Step::TempSynced {
-                let _ = reached_tx.send(());
-                release_rx
-                    .lock()
-                    .map_err(|_| {
-                        crate::file_ops::FileError::new(
-                            crate::file_ops::ErrorCode::IoError,
-                            "test release lock poisoned",
-                        )
-                    })?
-                    .recv_timeout(Duration::from_secs(5))
-                    .map_err(|_| {
-                        crate::file_ops::FileError::new(
-                            crate::file_ops::ErrorCode::Timeout,
-                            "test release timed out",
-                        )
-                    })?;
-            }
-            Ok(())
-        });
-        let etag_key = crate::file_ops::EtagKey::random();
-        let stat =
-            crate::file_ops::resolve::Stat::from_metadata(&std::fs::metadata(&target).unwrap());
-        let expected_etag = etag_key.strong(&stat, b"old");
-        let ops = crate::file_ops::FileOps::new(
-            crate::file_ops::Policy::from_environment(Vec::new(), true),
-            etag_key,
-        )
-        .with_step_hook(hook);
-        let (tx, rx) = channel();
-        let mut terminals = supervised_registry(tx, &fake_file_confirm(None));
-        terminals.set_file_runtime(Arc::new(crate::file_relay::FileRuntime::new(ops)));
-        let startup = supervised_startup(McpCommandMode::Supervised, false);
-        let request = file_spawn_request(
-            "write",
-            serde_json::json!({
-                "path": target,
-                "ifExists": "replace",
-                "expectedEtag": expected_etag,
-                "reason": "test cancel"
-            }),
-            Some(3),
-        );
-        let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &request);
-        frames.extend(
-            terminals
-                .handle_supervised_body(&startup, &request.command_id, b"new".to_vec())
-                .expect("supervised body"),
-        );
-        pump_file_until(
-            &mut terminals,
-            &rx,
-            &startup,
-            &mut frames,
-            |terminals, _| phase(terminals) == Some(SupervisedPhase::Confirm),
-        );
-        let private_body = terminals.sessions[MULTI_TERMINAL]
-            .supervised
-            .as_ref()
-            .and_then(|supervised| supervised.file.as_ref())
-            .and_then(|file| file._body.as_ref())
-            .map(|body| (body.path.clone(), body.directory.clone()))
-            .expect("write body before go");
-        let mut viewer = TestViewer::new(72);
-        frames.extend(attach_viewer(&mut terminals, &startup, &mut viewer));
-        let label = viewer.id.clone();
-        frames.extend(send(
-            &mut terminals,
-            &mut viewer,
-            &label,
-            &TermPlaintextV2::Data(b"\r".to_vec()),
-        ));
-        pump_file_until(&mut terminals, &rx, &startup, &mut frames, |_, frames| {
-            outcome_kinds(frames).contains(&"accepted")
-        });
-        reached_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("apply reached pre-commit hook");
-        assert!(!private_body.0.exists());
-        assert!(!private_body.1.exists());
-        assert!(terminals.close(MULTI_TERMINAL).is_empty());
-        release_tx.send(()).expect("release apply");
-        pump_file_until(&mut terminals, &rx, &startup, &mut frames, has_exit);
-        assert_eq!(
-            std::fs::read(&target).expect("old file remains"),
-            b"old",
-            "cancelled accepted write committed"
-        );
-        let kinds = outcome_kinds(&frames);
-        assert!(kinds.contains(&"accepted"));
-        assert!(kinds.contains(&"done"));
-        assert!(!kinds.contains(&"declined"), "{kinds:?}");
-        let done = controls(&frames)
-            .into_iter()
-            .find(|message| matches!(message, ClientControlMessage::SupervisedDone { .. }))
-            .expect("done");
-        let encoded = serde_json::to_value(done).expect("encode done");
-        assert_eq!(encoded["fileError"]["code"], "cancelled");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn type_ahead_before_the_screen_is_dropped_and_enter_after_it_runs_and_shares() {
-        let (tx, rx) = channel();
-        let mut terminals = supervised_registry(tx, &fake_confirm(None));
-        // No human terminal switch: supervised terminals do not need it.
-        let startup = supervised_startup(McpCommandMode::Supervised, false);
-        let mut frames =
-            terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
-        assert_eq!(outcome_kinds(&frames), vec!["spawned"]);
-        assert_eq!(phase(&terminals), Some(SupervisedPhase::Starting));
-
-        let mut a = TestViewer::new(1);
-        let joined = attach_viewer(&mut terminals, &startup, &mut a);
-        let mut seen = a.receive(MULTI_TERMINAL, &joined);
-        assert!(seen.contains(&Seen::Review(false)), "{seen:?}");
-
-        // Typed before the confirm screen was drawn: dropped, never queued.
-        let label = a.id.clone();
-        assert!(
-            send(
-                &mut terminals,
-                &mut a,
-                &label,
-                &TermPlaintextV2::Data(b"early\r".to_vec())
-            )
-            .is_empty()
-        );
-        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
-            phase(terminals) == Some(SupervisedPhase::Confirm)
-        });
-        frames.extend(send(
-            &mut terminals,
-            &mut a,
-            &label,
-            &TermPlaintextV2::Data(b"ok\r".to_vec()),
-        ));
-        pump_until(&mut terminals, &rx, &mut frames, has_exit);
-
-        assert_eq!(
-            outcome_kinds(&frames),
-            vec!["spawned", "accepted", "head", "done", "exit"]
-        );
-        seen.extend(a.receive(MULTI_TERMINAL, &frames));
-        let shown = seen_data(&seen);
-        assert!(contains(&shown, b"SCREEN"));
-        assert!(
-            contains(&shown, b"got[ok]"),
-            "{}",
-            String::from_utf8_lossy(&shown)
-        );
-        assert!(!contains(&shown, b"early"));
-        // The markers before Enter never reach a viewer.
-        let before_accept =
-            &shown[..supervised_pty::find_subslice(&shown, b"after-accept").expect("output")];
-        assert!(!contains(before_accept, b"wsmp-supervised"));
-
-        let head = frames
-            .iter()
-            .find_map(|frame| match frame {
-                OutboundFrame::Binary(RelayBinaryFrameMetadata::SupervisedOutput { .. }, body) => {
-                    Some(body.clone())
-                }
-                _ => None,
-            })
-            .expect("head");
-        assert!(contains(&head, b"after-accept"));
-        assert!(!contains(&head, b"got["));
-        assert!(!contains(&head, b"SCREEN"));
-        // The spoofed marker the command printed after Enter is plain output.
-        assert!(contains(&head, b"wsmp-supervised;ready"));
-        let done = controls(&frames)
-            .into_iter()
-            .find_map(|message| match message {
-                ClientControlMessage::SupervisedDone {
-                    exit_code,
-                    review,
-                    output_bytes,
-                    ..
-                } => Some((*exit_code, *review, *output_bytes)),
-                _ => None,
-            })
-            .expect("done");
-        assert_eq!(done, (Some(3), false, Some(head.len() as u64)));
-        assert!(terminals.sessions.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn declining_reports_declined_then_exit_and_runs_nothing() {
-        let (tx, rx) = channel();
-        let mut terminals = supervised_registry(tx, &fake_confirm(None));
-        let startup = supervised_startup(McpCommandMode::Unsupervised, false);
-        let mut frames =
-            terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
-        let mut a = TestViewer::new(2);
-        let _ = attach_viewer(&mut terminals, &startup, &mut a);
-        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
-            phase(terminals) == Some(SupervisedPhase::Confirm)
-        });
-        let label = a.id.clone();
-        frames.extend(send(
-            &mut terminals,
-            &mut a,
-            &label,
-            &TermPlaintextV2::Data(b"q\r".to_vec()),
-        ));
-        pump_until(&mut terminals, &rx, &mut frames, has_exit);
-        assert_eq!(outcome_kinds(&frames), vec!["spawned", "declined", "exit"]);
-    }
-
-    /// Raw PTY output of the supervised terminal, not yet handed to the
-    /// registry, until `needle` shows up.
-    #[cfg(unix)]
-    fn hold_output_until(rx: &mpsc::Receiver<FromWorker>, needle: &[u8]) -> Vec<Vec<u8>> {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut held = Vec::new();
-        let mut seen = Vec::new();
-        while !contains(&seen, needle) {
-            assert!(Instant::now() < deadline, "timed out waiting for output");
-            if let Ok(FromWorker::TerminalBytes { bytes, .. }) =
-                rx.recv_timeout(Duration::from_millis(20))
-            {
-                seen.extend(&bytes);
-                held.push(bytes);
-            }
-        }
-        held
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn an_expiry_handled_before_the_enter_declines_and_the_command_never_starts() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let witness = tmp.path().join("ran");
-        let (tx, rx) = channel();
-        let mut terminals = supervised_registry(tx, &fake_confirm(Some(&witness)));
-        let startup = supervised_startup(McpCommandMode::Supervised, false);
-        let mut frames =
-            terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
-        let mut a = TestViewer::new(9);
-        let _ = attach_viewer(&mut terminals, &startup, &mut a);
-        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
-            phase(terminals) == Some(SupervisedPhase::Confirm)
-        });
-        let label = a.id.clone();
-        frames.extend(send(
-            &mut terminals,
-            &mut a,
-            &label,
-            &TermPlaintextV2::Data(b"ok\r".to_vec()),
-        ));
-        // Enter was pressed and the child said so, but the expiry is handled
-        // before the daemon reads that: the request is still waiting.
-        let held = hold_output_until(&rx, b"wsmp-supervised;accepted;");
-        let answer = terminals.cancel_supervised(SUPERVISED_COMMAND_ID, true);
-        assert_eq!(outcome_kinds(&answer), vec!["declined", "exit"]);
-        for bytes in held {
-            assert!(terminals.on_bytes(MULTI_TERMINAL, &bytes).is_empty());
-        }
-        wait_for_confirm_child_exit(&witness);
-        assert!(
-            !witness.exists(),
-            "the command started without the daemon's go"
-        );
-        assert!(terminals.sessions.is_empty());
-        // Nothing but the waiting request is answered: an unknown id is a no-op.
-        assert!(terminals.cancel_supervised("cmd-unknown", true).is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn an_enter_taken_before_the_expiry_keeps_running_to_its_end() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let witness = tmp.path().join("ran");
-        let (tx, rx) = channel();
-        let mut terminals = supervised_registry(tx, &fake_confirm(Some(&witness)));
-        let startup = supervised_startup(McpCommandMode::Supervised, false);
-        let mut frames =
-            terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
-        let mut a = TestViewer::new(10);
-        let _ = attach_viewer(&mut terminals, &startup, &mut a);
-        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
-            phase(terminals) == Some(SupervisedPhase::Confirm)
-        });
-        let label = a.id.clone();
-        frames.extend(send(
-            &mut terminals,
-            &mut a,
-            &label,
-            &TermPlaintextV2::Data(b"ok\r".to_vec()),
-        ));
-        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
-            phase(terminals) == Some(SupervisedPhase::Running)
-        });
-        // The expiry arrives after the Enter was taken: it is not obeyed.
-        assert!(
-            terminals
-                .cancel_supervised(SUPERVISED_COMMAND_ID, true)
-                .is_empty()
-        );
-        pump_until(&mut terminals, &rx, &mut frames, has_exit);
-        assert_eq!(
-            outcome_kinds(&frames),
-            vec!["spawned", "accepted", "head", "done", "exit"]
-        );
-        assert!(witness.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_browser_decline_after_the_enter_is_ignored_and_the_command_runs_to_its_end() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let witness = tmp.path().join("ran");
-        let (tx, rx) = channel();
-        let mut terminals = supervised_registry(tx, &fake_confirm(Some(&witness)));
-        let startup = supervised_startup(McpCommandMode::Supervised, false);
-        let mut frames =
-            terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
-        let mut a = TestViewer::new(11);
-        let _ = attach_viewer(&mut terminals, &startup, &mut a);
-        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
-            phase(terminals) == Some(SupervisedPhase::Confirm)
-        });
-        let label = a.id.clone();
-        frames.extend(send(
-            &mut terminals,
-            &mut a,
-            &label,
-            &TermPlaintextV2::Data(b"ok\r".to_vec()),
-        ));
-        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
-            phase(terminals) == Some(SupervisedPhase::Running)
-        });
-        // The server's decline request, exactly as it arrives on the wire.
-        let wire = format!(
-            r#"{{"type":"supervised.cancel","commandId":"{SUPERVISED_COMMAND_ID}","reason":"decline"}}"#
-        );
-        let Ok(crate::protocol::ServerControlMessage::SupervisedCancel {
-            command_id,
-            if_waiting,
-        }) = crate::protocol::parse_server_control(&wire)
-        else {
-            panic!("decline request did not parse");
-        };
-        assert!(if_waiting);
-        // Enter came first: the decline is not obeyed.
-        assert!(
-            terminals
-                .cancel_supervised(&command_id, if_waiting)
-                .is_empty()
-        );
-        pump_until(&mut terminals, &rx, &mut frames, has_exit);
-        assert_eq!(
-            outcome_kinds(&frames),
-            vec!["spawned", "accepted", "head", "done", "exit"]
-        );
-        assert!(witness.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn an_enter_whose_go_cannot_be_written_is_not_reported_as_a_decline() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let witness = tmp.path().join("ran");
-        let (tx, rx) = channel();
-        let mut terminals = supervised_registry(tx, &fake_confirm(Some(&witness)));
-        let startup = supervised_startup(McpCommandMode::Supervised, false);
-        let mut frames =
-            terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
-        let mut a = TestViewer::new(12);
-        let _ = attach_viewer(&mut terminals, &startup, &mut a);
-        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
-            phase(terminals) == Some(SupervisedPhase::Confirm)
-        });
-        let label = a.id.clone();
-        frames.extend(send(
-            &mut terminals,
-            &mut a,
-            &label,
-            &TermPlaintextV2::Data(b"ok\r".to_vec()),
-        ));
-        let held = hold_output_until(&rx, b"wsmp-supervised;accepted;");
-        // The PTY input fails before the daemon takes the accepted marker.
-        terminals
-            .sessions
-            .get(MULTI_TERMINAL)
-            .and_then(|session| session.pty.as_ref())
-            .expect("pty")
-            .input
-            .fail();
-        for bytes in held {
-            let out = terminals.on_bytes(MULTI_TERMINAL, &bytes);
-            assert!(!outcome_kinds(&out).contains(&"accepted"));
-        }
-        // A stop now ends the terminal without claiming anyone declined.
-        let answer = terminals.cancel_supervised(SUPERVISED_COMMAND_ID, true);
-        assert_eq!(outcome_kinds(&answer), vec!["exit"]);
-        wait_for_confirm_child_exit(&witness);
-        assert!(!witness.exists(), "the command started without go");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn review_withholds_output_from_the_relay_and_hands_the_capture_to_viewers() {
-        let (tx, rx) = channel();
-        let mut terminals = supervised_registry(tx, &fake_confirm(None));
-        let startup = supervised_startup(McpCommandMode::Supervised, false);
-        let mut frames =
-            terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(true));
-        let mut a = TestViewer::new(3);
-        let joined = attach_viewer(&mut terminals, &startup, &mut a);
-        let _ = a.receive(MULTI_TERMINAL, &joined);
-        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
-            phase(terminals) == Some(SupervisedPhase::Confirm)
-        });
-        let label = a.id.clone();
-        let toggled = send(
-            &mut terminals,
-            &mut a,
-            &label,
-            &TermPlaintextV2::ReviewToggle(true),
-        );
-        assert_eq!(
-            a.receive(MULTI_TERMINAL, &toggled),
-            vec![Seen::Review(true)]
-        );
-        frames.extend(send(
-            &mut terminals,
-            &mut a,
-            &label,
-            &TermPlaintextV2::Data(b"ok\r".to_vec()),
-        ));
-        pump_until(&mut terminals, &rx, &mut frames, |_, frames| {
-            outcome_kinds(frames).contains(&"done")
-        });
-        assert_eq!(outcome_kinds(&frames), vec!["spawned", "accepted", "done"]);
-        assert!(controls(&frames).iter().any(|message| matches!(
-            message,
-            ClientControlMessage::SupervisedDone {
-                review: true,
-                output_bytes: None,
-                ..
-            }
-        )));
-        let capture = a
-            .receive(MULTI_TERMINAL, &frames)
-            .into_iter()
-            .find_map(|item| match item {
-                Seen::Capture(total, head, tail) => Some((total, head, tail)),
-                _ => None,
-            })
-            .expect("capture for the attached viewer");
-        assert!(contains(&capture.1, b"after-accept"));
-        assert_eq!(capture.0, capture.1.len() as u64);
-        assert!(capture.2.is_empty());
-        assert_eq!(phase(&terminals), Some(SupervisedPhase::Finished));
-
-        // Input after the command exited goes nowhere; a later viewer still
-        // gets the review state and the capture.
-        assert!(
-            send(
-                &mut terminals,
-                &mut a,
-                &label,
-                &TermPlaintextV2::Data(b"x".to_vec())
-            )
-            .is_empty()
-        );
-        assert!(
-            send(
-                &mut terminals,
-                &mut a,
-                &label,
-                &TermPlaintextV2::ReviewToggle(false)
-            )
-            .is_empty()
-        );
-        let mut b = TestViewer::new(4);
-        let joined = attach_viewer(&mut terminals, &startup, &mut b);
-        let seen = b.receive(MULTI_TERMINAL, &joined);
-        assert!(seen.contains(&Seen::Review(true)), "{seen:?}");
-        assert!(seen.iter().any(|item| matches!(item, Seen::Capture(..))));
-
-        let ended = terminals.cancel_supervised(SUPERVISED_COMMAND_ID, false);
-        assert_eq!(outcome_kinds(&ended), vec!["exit"]);
-        assert!(controls(&ended).iter().any(|message| matches!(
-            message,
-            ClientControlMessage::TermExit {
-                exit_code: Some(3),
-                ..
-            }
-        )));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn private_output_never_leaves_the_cli_and_review_cannot_be_toggled() {
-        let (tx, rx) = channel();
-        let mut terminals = supervised_registry(tx, &fake_confirm(None));
-        let startup = supervised_startup(McpCommandMode::Supervised, false);
-        let mut frames =
-            terminals.spawn_supervised(&startup, &Config::default(), &spawn_request(false));
-        let mut a = TestViewer::new(5);
-        let joined = attach_viewer(&mut terminals, &startup, &mut a);
-        let seen = a.receive(MULTI_TERMINAL, &joined);
-        assert!(!seen.iter().any(|item| matches!(item, Seen::Review(_))));
-        pump_until(&mut terminals, &rx, &mut frames, |terminals, _| {
-            phase(terminals) == Some(SupervisedPhase::Confirm)
-        });
-        let label = a.id.clone();
-        assert!(
-            send(
-                &mut terminals,
-                &mut a,
-                &label,
-                &TermPlaintextV2::ReviewToggle(true)
-            )
-            .is_empty()
-        );
-        frames.extend(send(
-            &mut terminals,
-            &mut a,
-            &label,
-            &TermPlaintextV2::Data(b"ok\r".to_vec()),
-        ));
-        pump_until(&mut terminals, &rx, &mut frames, has_exit);
-        assert_eq!(
-            outcome_kinds(&frames),
-            vec!["spawned", "accepted", "done", "exit"]
-        );
-        assert!(controls(&frames).iter().any(|message| matches!(
-            message,
-            ClientControlMessage::SupervisedDone {
-                review: false,
-                output_bytes: None,
-                ..
-            }
-        )));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn supervised_spawn_refuses_a_cwd_the_confirm_screen_cannot_show_exactly() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-
-        let root = tempfile::tempdir().expect("tempdir");
-        let bad = root.path().join(OsStr::from_bytes(b"a\xff"));
-        std::fs::create_dir(&bad).expect("non-utf8 dir");
-        // The agent's cwd is text, so a non-UTF-8 directory arrives through
-        // a symlink (or the `$HOME` default / `~/` expansion); the check is
-        // on the resolved physical path either way.
-        let link = root.path().join("link");
-        std::os::unix::fs::symlink(&bad, &link).expect("symlink");
-        let (tx, _rx) = channel();
-        let mut terminals = supervised_registry(tx, "sleep 30");
-        let supervised = supervised_startup(McpCommandMode::Supervised, false);
-        let mut request = spawn_request(true);
-        request.cwd = Some(link.to_str().expect("utf8 link").to_string());
-        let frames = terminals.spawn_supervised(&supervised, &Config::default(), &request);
-        assert_eq!(frames.len(), 1);
-        assert!(matches!(
-            controls(&frames)[0],
-            ClientControlMessage::SupervisedRejected { reason, .. } if reason == REASON_CWD_NOT_UTF8
-        ));
-        assert!(terminals.sessions.is_empty());
-
-        // A UTF-8 directory is accepted.
-        let good = root.path().join("good");
-        std::fs::create_dir(&good).expect("dir");
-        request.cwd = Some(good.to_str().expect("utf8").to_string());
-        let frames = terminals.spawn_supervised(&supervised, &Config::default(), &request);
-        assert_eq!(outcome_kinds(&frames), vec!["spawned"]);
-    }
-
-    /// Roots, symlinked root spellings and oversized disk-derived arguments reach the registry screen (a blocked screen, never a pre-display rejection).
-    #[cfg(unix)]
-    #[test]
-    fn supervised_file_root_and_size_boundaries_reach_registry_screen_without_results() {
-        for state in ["alias", "outside", "escape", "removed", "long"] {
-            if state == "long" && !cfg!(target_os = "linux") {
-                continue;
-            }
-            let dir = tempfile::tempdir().unwrap();
-            let base = dir.path().canonicalize().unwrap();
-            let root = base.join("root");
-            let outside = base.join("outside");
-            std::fs::create_dir(&root).unwrap();
-            std::fs::create_dir(&outside).unwrap();
-            std::fs::write(root.join("source"), b"old\n").unwrap();
-            std::fs::write(outside.join("source"), b"old\n").unwrap();
-            std::os::unix::fs::symlink(&root, base.join("alias")).unwrap();
-            std::os::unix::fs::symlink(&outside, root.join("escape")).unwrap();
-            let roots = if state == "long" {
-                Vec::new()
-            } else {
-                vec![root.clone()]
-            };
-            let ops = crate::file_ops::FileOps::new(
-                crate::file_ops::Policy::from_environment(roots, true),
-                crate::file_ops::EtagKey::random(),
-            );
-            if state == "removed" {
-                std::fs::remove_dir_all(&root).unwrap();
-            }
-            let target = match state {
-                "alias" => base.join("alias/source"),
-                "outside" => outside.join("source"),
-                "escape" => root.join("escape/source"),
-                "long" => {
-                    let suffix = (0..15)
-                        .map(|_| "a".repeat(240))
-                        .collect::<Vec<_>>()
-                        .join("/");
-                    for i in 0..39 {
-                        std::os::unix::fs::symlink(
-                            format!("link{}/{suffix}", i + 1),
-                            root.join(format!("link{i}")),
-                        )
-                        .unwrap();
-                    }
-                    root.join("link0/target")
-                }
-                _ => root.join("source"),
-            };
-            let expected = if state == "alias" {
-                None
-            } else if state == "long" {
-                Some("too_large")
-            } else {
-                Some("path_denied")
-            };
-            let (tx, rx) = channel();
-            let mut terminals = supervised_registry(tx, &fake_file_confirm(expected));
-            terminals.set_file_runtime(Arc::new(crate::file_relay::FileRuntime::new(ops)));
-            let startup = supervised_startup(McpCommandMode::Supervised, false);
-            let request = file_spawn_request(
-                "edit",
-                serde_json::json!({"path":target,"edits":[{"oldText":"old","newText":"new"}]}),
-                None,
-            );
-            let mut frames = terminals.spawn_supervised(&startup, &Config::default(), &request);
-            pump_file_until(
-                &mut terminals,
-                &rx,
-                &startup,
-                &mut frames,
-                |terminals, frames| {
-                    phase(terminals) == Some(SupervisedPhase::Confirm)
-                        || supervised_rejection_reason(frames).is_some()
-                },
-            );
-            assert_eq!(outcome_kinds(&frames), vec!["spawned"], "{state}");
-            let screen =
-                crate::supervised_file::screen_from_registry_env(&terminals.file_child_env)
-                    .unwrap();
-            match expected {
-                Some(code) => assert!(
-                    screen.contains(&format!("Error code: {code}")),
-                    "{state}: {screen}"
-                ),
-                None => assert!(screen.contains("Unified diff"), "{state}: {screen}"),
-            }
-            assert_eq!(std::fs::read(outside.join("source")).unwrap(), b"old\n");
-            if state != "removed" {
-                assert_eq!(std::fs::read(root.join("source")).unwrap(), b"old\n");
-            }
-            let mut viewer = TestViewer::new(117);
-            frames.extend(attach_viewer(&mut terminals, &startup, &mut viewer));
-            let label = viewer.id.clone();
-            frames.extend(send(
-                &mut terminals,
-                &mut viewer,
-                &label,
-                &TermPlaintextV2::Data(b"q\r".to_vec()),
-            ));
-            pump_file_until(&mut terminals, &rx, &startup, &mut frames, has_exit);
-            if let Some(code) = expected {
-                let done = controls(&frames)
-                    .into_iter()
-                    .find(|message| matches!(message, ClientControlMessage::SupervisedDone { .. }))
-                    .expect("blocked done after dismissal");
-                assert_eq!(
-                    serde_json::to_value(done).unwrap()["fileError"]["code"],
-                    code
-                );
-            }
-            assert!(!outcome_kinds(&frames).contains(&"accepted"));
-            assert_eq!(std::fs::read(outside.join("source")).unwrap(), b"old\n");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn supervised_file_spawn_without_a_runtime_is_unsupported() {
-        let (tx, _rx) = channel();
-        let mut terminals = supervised_registry(tx, "sleep 30");
-        let supervised = supervised_startup(McpCommandMode::Unsupervised, false);
-        let request = file_spawn_request("mkdir", serde_json::json!({ "path": "~/x" }), None);
-        let frames = terminals.spawn_supervised(&supervised, &Config::default(), &request);
-        assert_eq!(frames.len(), 1);
-        assert!(matches!(
-            controls(&frames)[0],
-            ClientControlMessage::SupervisedRejected { reason, .. } if reason == REASON_UNSUPPORTED
-        ));
-        assert!(terminals.sessions.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn policy_gates_supervised_spawn_attach_and_exec() {
-        let (tx, _rx) = channel();
-        let mut terminals = supervised_registry(tx.clone(), "sleep 30");
-        let off = supervised_startup(McpCommandMode::Off, false);
-        let frames = terminals.spawn_supervised(&off, &Config::default(), &spawn_request(true));
-        assert!(matches!(
-            controls(&frames)[0],
-            ClientControlMessage::SupervisedRejected { reason, .. } if reason == REASON_DISABLED
-        ));
-        assert!(terminals.sessions.is_empty());
-
-        let supervised = supervised_startup(McpCommandMode::Supervised, false);
-        let frames =
-            terminals.spawn_supervised(&supervised, &Config::default(), &spawn_request(true));
-        assert_eq!(outcome_kinds(&frames), vec!["spawned"]);
-        // One request waiting for Enter per CLI.
-        let mut second = spawn_request(true);
-        second.terminal_id = "term-supervised-2".to_string();
-        second.command_id = "cmd-supervised-2".to_string();
-        assert!(matches!(
-            controls(&terminals.spawn_supervised(&supervised, &Config::default(), &second))[0],
-            ClientControlMessage::SupervisedRejected { reason, .. } if reason == REASON_LIMIT
-        ));
-        // With the policy off, a viewer cannot attach to it.
-        let mut a = TestViewer::new(6);
-        let refused = terminals.attach(&off, None, a.handshake(MULTI_TERMINAL, 0, 0));
-        assert_eq!(
-            rejection(&refused),
-            Some((Some(a.id.clone()), REASON_DISABLED.to_string()))
-        );
-        // Approval still applies to supervised terminals.
-        let approval = supervised_startup(McpCommandMode::Supervised, true);
-        let identity = TerminalIdentity {
-            public_key: CliTerminalKey::generate()
-                .expect("id")
-                .public_b64url()
-                .to_string(),
-            signature: None,
-        };
-        let mut handshake = a.handshake(MULTI_TERMINAL, 0, 0);
-        handshake.identity = Some(&identity);
-        let pending = terminals.attach(&approval, None, handshake);
-        assert!(matches!(
-            controls(&pending)[0],
-            ClientControlMessage::TermPending { .. }
-        ));
-        let _ = &mut a;
-
-        // The supervised terminal does not take a human terminal slot.
-        let human = enabled_startup(false);
-        for tag in [7, 8] {
-            let viewer = TestViewer::new(tag);
-            let id = format!("term-human-{tag}");
-            let frames = terminals.open(
-                &human,
-                &Config::default(),
-                None,
-                viewer.handshake(&id, 80, 24),
-            );
-            assert!(
-                matches!(
-                    controls(&frames)[0],
-                    ClientControlMessage::TermOpened { .. }
-                ),
-                "human terminal {tag} was refused"
-            );
-        }
-
-        let mut execs = ExecRegistry::new(tx, DEFAULT_EXEC_TIMEOUT);
-        let frames = execs.start(&supervised, &Config::default(), "cmd-exec-1", "true", None);
-        assert!(matches!(
-            controls(&frames)[0],
-            ClientControlMessage::ExecRejected { reason, .. } if reason == REASON_SUPERVISED_ONLY
-        ));
-        let frames = execs.start(&off, &Config::default(), "cmd-exec-2", "true", None);
-        assert!(matches!(
-            controls(&frames)[0],
-            ClientControlMessage::ExecRejected { reason, .. } if reason == REASON_DISABLED
-        ));
-        let _ = terminals.kill_all();
-    }
-    #[cfg(unix)]
-    include!("sessions/file_gap_tests.rs");
 }

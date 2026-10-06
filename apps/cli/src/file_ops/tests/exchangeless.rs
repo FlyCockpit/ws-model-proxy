@@ -2297,11 +2297,7 @@ fn supervised_exchangeless_replace_uses_safe_publication_and_cancel_boundary() {
                     let error = result.unwrap_err();
                     assert!(has_bytes(&kept(&error), ORIGINAL));
                     assert_eq!(fx.get("doc"), RACER);
-                    let wire = serde_json::to_value(crate::protocol::SupervisedFileOutcome::error(
-                        error.code.into(),
-                    ))
-                    .unwrap();
-                    assert_eq!(wire, json!({"fileError":{"code":"uncertain_outcome"}}));
+                    assert_eq!(error.code, ErrorCode::UncertainOutcome);
                 } else {
                     assert!(result.unwrap().get("recovered").is_none());
                     assert_eq!(fx.get("doc"), EDITED);

@@ -50,33 +50,17 @@ pub enum Command {
     /// Start device-code login and store the approved device credential.
     Login(crate::commands::login::Args),
 
-    /// Configure a manually created CLI token env var.
-    Token(crate::commands::token::Args),
-
     /// Inspect the configuration file and resolved paths.
     Config(crate::commands::config::Args),
 
-    /// Manage local OpenAI-compatible endpoints.
-    Endpoints(crate::commands::endpoints::Args),
-
-    /// Run the foreground websocket relay daemon.
-    Connect(crate::commands::connect::Args),
-
-    /// Manage a local background relay daemon.
-    Daemon(crate::commands::daemon::Args),
+    /// Run the relay in the foreground (what the service runs).
+    Run(crate::commands::run::Args),
 
     /// Install or inspect a per-user operating-system service for the relay.
     Service(crate::commands::service::Args),
 
-    /// Publish the current endpoint inventory through the running relay daemon.
-    Reload(crate::commands::reload::Args),
-
-    /// Show live relay, local endpoint, and acknowledged inventory status.
-    Status {
-        /// Emit a stable JSON status object.
-        #[arg(long)]
-        json: bool,
-    },
+    /// Show whether the relay is running and connected.
+    Status(crate::commands::status::Args),
 
     /// Remove stored local authentication state.
     Logout(crate::commands::logout::Args),
@@ -86,9 +70,6 @@ pub enum Command {
 
     /// Approve browser identities and show the CLI identity for terminals.
     Terminal(crate::commands::terminal::Args),
-
-    /// List, test and approve custom metric sources.
-    Metrics(crate::commands::metrics::Args),
 
     /// List or apply crash-safe file recovery from abandoned `.wsmp-recover-*` directories.
     Recover(crate::commands::recover::Args),

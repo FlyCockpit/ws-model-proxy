@@ -1363,9 +1363,6 @@ mod argument_size_tests {
     #[test]
     fn child_args_cap_reserves_linux_exec_name_equals_and_terminator() {
         assert_eq!(MAX_CHILD_ARGS_BYTES, 128 * 1024 - 256);
-        assert!(include_str!("../sessions/supervised_pty.rs").contains(
-            "pub(crate) const SUPERVISED_ENV_FILE_ARGS: &str = \"WSMP_SUPERVISED_FILE_ARGS\";"
-        ));
         let full_string = "WSMP_SUPERVISED_FILE_ARGS".len() + 1 + MAX_CHILD_ARGS_BYTES + 1;
         assert!(
             full_string < 131_072,

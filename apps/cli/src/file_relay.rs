@@ -1,4 +1,4 @@
-//! Relay 2.8 node file ops: the CLI side of `file.op`.
+//! Node file ops (relay 3.0 `file.op`): the CLI side.
 //!
 //! One [`FileRelay`] lives for one relay session (the daemon builds it beside
 //! its terminal and exec registries). It never touches the filesystem on the
@@ -9,11 +9,11 @@
 //! point, [`settle`], which also writes the info log line (op, path, outcome;
 //! never content).
 //!
-//! Admission ([`admit`]) is a pure function re-checked on every op: the CLI's
-//! own `mcpCommandMode` (`off` -> `feature_disabled`, `supervised` ->
-//! `supervised_only`; supervised writes use the terminal confirmation path; read grants are checked independently) and
-//! the root refusal (`unsupported` at euid 0 unless `allowFileToolsAsRoot`).
-//! The server's admission is a separate, independent check.
+//! Admission ([`admit`]) is a pure function re-checked on every op: the
+//! node's trust (Relay only -> `trust_relay`), configured file roots (none ->
+//! `no_roots`) and the root refusal (`unsupported` at euid 0 unless
+//! `allowFileToolsAsRoot`). The server's admission is a separate,
+//! independent check.
 //!
 //! Frames, per `apps/server/src/relay/file-protocol.ts`:
 //! - `file.op` -> `file.result` (+ a binary `file.data` frame when the op's big
@@ -32,15 +32,14 @@ use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use serde_json::{Map, Value};
 
-use crate::config::McpCommandMode;
 use crate::display_escape::escape_for_display;
 use crate::file_ops::pool::{FilePool, MAX_IN_FLIGHT};
 use crate::file_ops::{
     Cancel, ErrorCode, EtagKey, FileError, FileOps, FileResult, Policy, PreparedSupervised,
 };
+use crate::protocol::frames::FileOpKind;
 use crate::protocol::{
-    ClientControlMessage, RELAY_BINARY_CHUNK_MAX_BYTES, RELAY_JSON_CONTROL_MAX_BYTES,
-    RelayBinaryFrameMetadata,
+    NodeBinaryMetadata, NodeFrame, RELAY_BINARY_CHUNK_MAX_BYTES, RELAY_JSON_CONTROL_MAX_BYTES,
 };
 
 /// Text above this many bytes travels as a binary `file.data` frame.
@@ -65,12 +64,43 @@ pub fn is_read_op(op: &str) -> bool {
     matches!(op, "read" | "stat" | "list" | "search")
 }
 
+/// The wire name of an op, or `None` for a name 3.0 does not have.
+pub fn op_kind(op: &str) -> Option<FileOpKind> {
+    Some(match op {
+        "read" => FileOpKind::Read,
+        "stat" => FileOpKind::Stat,
+        "list" => FileOpKind::List,
+        "search" => FileOpKind::Search,
+        "edit" => FileOpKind::Edit,
+        "write" => FileOpKind::Write,
+        "rename" => FileOpKind::Rename,
+        "mkdir" => FileOpKind::Mkdir,
+        "delete" => FileOpKind::Delete,
+        _ => return None,
+    })
+}
+
+/// The op name of a wire kind (the inverse of [`op_kind`]).
+pub fn op_name(kind: FileOpKind) -> &'static str {
+    match kind {
+        FileOpKind::Read => "read",
+        FileOpKind::Stat => "stat",
+        FileOpKind::List => "list",
+        FileOpKind::Search => "search",
+        FileOpKind::Edit => "edit",
+        FileOpKind::Write => "write",
+        FileOpKind::Rename => "rename",
+        FileOpKind::Mkdir => "mkdir",
+        FileOpKind::Delete => "delete",
+    }
+}
+
 /// A frame a settled op wants sent, in order.
 #[derive(Debug, Clone)]
-#[allow(clippy::large_enum_variant)] // 2.9 telemetry grew `ClientControlMessage`.
+#[allow(clippy::large_enum_variant)] // `NodeFrame` carries the telemetry shapes.
 pub enum FileFrame {
-    Control(ClientControlMessage),
-    Binary(RelayBinaryFrameMetadata, Vec<u8>),
+    Control(NodeFrame),
+    Binary(NodeBinaryMetadata, Vec<u8>),
 }
 
 /// Receives `(opId, frames)` when an op settles on a pool worker. The daemon
@@ -83,8 +113,6 @@ pub struct FileRuntime {
     /// pool joins its workers, which a worker cannot do to itself).
     ops: Arc<FileOps>,
     pool: FilePool,
-    #[cfg(test)]
-    apply_submissions: std::sync::atomic::AtomicUsize,
 }
 
 impl FileRuntime {
@@ -92,8 +120,6 @@ impl FileRuntime {
         Self {
             ops: Arc::new(ops),
             pool: FilePool::new(),
-            #[cfg(test)]
-            apply_submissions: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -102,15 +128,7 @@ impl FileRuntime {
         Self {
             ops: Arc::new(ops),
             pool,
-            #[cfg(test)]
-            apply_submissions: std::sync::atomic::AtomicUsize::new(0),
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn apply_submissions(&self) -> usize {
-        self.apply_submissions
-            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn policy(&self) -> &Policy {
@@ -162,9 +180,6 @@ impl FileRuntime {
     where
         F: FnOnce(FileResult<Value>) + Send + 'static,
     {
-        #[cfg(test)]
-        self.apply_submissions
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let ops = Arc::clone(&self.ops);
         let job = move || -> FileResult<()> {
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -195,55 +210,34 @@ pub fn shared_runtime(allow_root: bool, roots: &[std::path::PathBuf]) -> Arc<Fil
     }))
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct FilePermission {
-    pub mode: McpCommandMode,
-    pub read_grant: bool,
-}
-
 /// Every reason `refuse` can pass: the wire reasons from `admit`/framing plus
 /// the file error codes the pending cap and the root check use. Mirrored by
 /// `FILE_WIRE_REASONS` + `FILE_ERROR_CODES` in
 /// `apps/server/src/relay/file-protocol.ts`; a reason outside that union fails
 /// the server's strict schema, which settles the op as io_error.
-pub const WIRE_REFUSAL_REASONS: [&str; 4] = [
-    "bad_frame",
-    "supervised_only",
-    "grant_disabled",
-    "feature_disabled",
-];
+pub const WIRE_REFUSAL_REASONS: [&str; 3] = ["bad_frame", "trust_relay", "no_roots"];
 /// {@link WIRE_REFUSAL_REASONS} plus the two file error codes `refuse` passes.
-pub const REFUSE_REASONS: [&str; 6] = [
+pub const REFUSE_REASONS: [&str; 5] = [
     "bad_frame",
-    "supervised_only",
-    "grant_disabled",
-    "feature_disabled",
+    "trust_relay",
+    "no_roots",
     "unsupported",
     "limit",
 ];
 
-/// Pure admission table. Unknown classes fail closed; writes can never use
-/// the read grant. Root UID consent remains independent of modes/grants.
+/// Pure admission table: Full control, configured roots, and the root UID
+/// consent, in that order.
 pub fn admit(
-    local_mode: McpCommandMode,
-    permission: FilePermission,
-    read: bool,
-    read_switch: bool,
+    full_control: bool,
     roots: bool,
     euid: u32,
     allow_root: bool,
 ) -> Result<(), &'static str> {
-    let mode = local_mode.min(permission.mode);
-    if mode != McpCommandMode::Unsupervised
-        && !(read && permission.read_grant && read_switch && roots)
-    {
-        return Err(if mode == McpCommandMode::Supervised {
-            "supervised_only"
-        } else if permission.mode == McpCommandMode::Off {
-            "grant_disabled"
-        } else {
-            "feature_disabled"
-        });
+    if !full_control {
+        return Err("trust_relay");
+    }
+    if !roots {
+        return Err("no_roots");
     }
     if euid == 0 && !allow_root {
         return Err("unsupported");
@@ -404,8 +398,8 @@ fn split_result(op: &str, mut result: Value) -> FileResult<(Value, Spilled)> {
     Ok((result, Some((field, bytes))))
 }
 
-fn rejected(op_id: &str, reason: &str, detail: Option<Value>) -> ClientControlMessage {
-    ClientControlMessage::FileRejected {
+fn rejected(op_id: &str, reason: &str, detail: Option<Value>) -> NodeFrame {
+    NodeFrame::FileRejected {
         op_id: op_id.to_string(),
         reason: reason.to_string(),
         detail,
@@ -459,12 +453,16 @@ fn frames_for(op_id: &str, op: &str, outcome: FileResult<Value>) -> (Vec<FileFra
 fn encode_result(op_id: &str, op: &str, value: Value) -> Option<Vec<FileFrame>> {
     let (result, data) = split_result(op, value).ok()?;
     let (data_field, body_bytes, body) = match data {
-        Some((field, bytes)) => (Some(field.to_string()), Some(bytes.len()), Some(bytes)),
+        Some((field, bytes)) => (
+            Some(field.to_string()),
+            Some(u32::try_from(bytes.len()).ok()?),
+            Some(bytes),
+        ),
         None => (None, None, None),
     };
-    let message = ClientControlMessage::FileResult {
+    let message = NodeFrame::FileResult {
         op_id: op_id.to_string(),
-        op: op.to_string(),
+        op: op_kind(op)?,
         result,
         data_field,
         body_bytes,
@@ -476,7 +474,7 @@ fn encode_result(op_id: &str, op: &str, value: Value) -> Option<Vec<FileFrame>> 
     let mut frames = vec![FileFrame::Control(message)];
     if let Some(bytes) = body {
         frames.push(FileFrame::Binary(
-            RelayBinaryFrameMetadata::FileData {
+            NodeBinaryMetadata::FileData {
                 op_id: op_id.to_string(),
             },
             bytes,
@@ -526,28 +524,28 @@ struct Pending {
 /// Per-session state: the ops in flight and the runtime that runs them.
 pub struct FileRelay {
     runtime: Arc<FileRuntime>,
-    mode: McpCommandMode,
-    read_switch: bool,
+    full_control: bool,
     sink: FileSink,
     pending: HashMap<String, Pending>,
 }
 
 impl FileRelay {
-    /// `mode` is the startup snapshot of `mcpCommandMode` (config changes need
-    /// a restart, like commands); it is checked again on every op.
-    pub fn new(
-        runtime: Arc<FileRuntime>,
-        mode: McpCommandMode,
-        read_switch: bool,
-        sink: FileSink,
-    ) -> Self {
+    /// `full_control` is the daemon's trust snapshot; it is checked again on
+    /// every op.
+    pub fn new(runtime: Arc<FileRuntime>, full_control: bool, sink: FileSink) -> Self {
         Self {
             runtime,
-            mode,
-            read_switch,
+            full_control,
             sink,
             pending: HashMap::new(),
         }
+    }
+
+    /// `trust.lower`: refuse every later op (`trust_relay`) and cancel the
+    /// pending ones.
+    pub fn lower_trust(&mut self) {
+        self.full_control = false;
+        self.cancel_all();
     }
 
     pub fn pending_len(&self) -> usize {
@@ -562,7 +560,6 @@ impl FileRelay {
         op: &str,
         args: Value,
         body_bytes: Option<usize>,
-        permission: FilePermission,
     ) -> Vec<FileFrame> {
         if !valid_op_id(op_id) {
             tracing::warn!("dropping a file.op with an invalid opId");
@@ -599,10 +596,7 @@ impl FileRelay {
         }
         let policy = self.runtime.policy();
         if let Err(reason) = admit(
-            self.mode,
-            permission,
-            is_read_op(op),
-            self.read_switch,
+            self.full_control,
             policy.roots_configured(),
             policy.euid(),
             policy.allow_root(),
