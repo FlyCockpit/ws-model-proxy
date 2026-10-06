@@ -17,8 +17,9 @@
  * owner-paid share traffic) whether or not a cap exists, before any row lock or write. Every
  * admission on a subject therefore runs after the previous one committed, and its consumption
  * read sees that attempt. A cap edit committing concurrently linearizes before or after the
- * admission. Reconciliation and repair take the `spend-attempt` fence, then the attempt row
- * FOR UPDATE (the heartbeat's renewal takes the same row). Provider account and model rows are
+ * admission. Reconciliation takes the `spend-attempt` fence, then the attempt row FOR UPDATE
+ * (the heartbeat's renewal takes the same row); repair settles through it, or, for an attempt
+ * that already has a ledger revision, only ends its state under the same fence. Provider account and model rows are
  * read without a lock, and the rows written here (attempt, reservations, settlements, ledger)
  * are hot-path rows with no foreign key into the graph. Consumption is read in one statement
  * (@ws-model-proxy/db/spend), so a settlement committing concurrently is counted either as

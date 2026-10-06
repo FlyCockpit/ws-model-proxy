@@ -159,14 +159,14 @@ describe("provider attempt failure policy", () => {
     expect(tx.providerModel.update).toHaveBeenCalledWith({
       where: { id: "model", userId: "owner" },
       data: expect.objectContaining({
-        healthStatus: "DEGRADED",
+        health: "DEGRADED",
         healthNextRetryAt: new Date("2026-08-25T00:00:45.000Z"),
       }),
     });
     expect(tx.providerAccount.update).toHaveBeenCalledWith({
       where: { id: "account", userId: "owner" },
       data: expect.objectContaining({
-        healthStatus: "DEGRADED",
+        health: "DEGRADED",
         healthNextRetryAt: new Date("2026-08-25T00:00:45.000Z"),
       }),
     });
@@ -220,7 +220,9 @@ describe("provider attempt failure policy", () => {
       $queryRaw: vi.fn(async (parts: TemplateStringsArray) => {
         const sql = parts.join("");
         if (sql.includes("SELECT EXISTS")) return [{ eligible: true }];
-        return sql.includes("FROM provider_attempt") ? [{ id: "durable-attempt" }] : [];
+        return sql.includes("FROM attempt") && sql.includes('"AttemptKind"')
+          ? [{ id: "durable-attempt" }]
+          : [];
       }),
       providerAccount: {
         findUniqueOrThrow: vi.fn().mockResolvedValue(healthy),

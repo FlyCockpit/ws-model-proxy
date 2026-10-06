@@ -1331,7 +1331,8 @@ export async function listPublicOverflowTargets(
       capabilityInventory,
     };
     if (!model.enabled || !account.enabled || !credential || credential.status !== "ACTIVE") {
-      unavailable.push(identity);
+      // A placeholder identity is never a binding's identity.
+      if (!targetPending) unavailable.push(identity);
       return [];
     }
     // The rule claimProviderHealthTrial applies under its locks.
@@ -2973,7 +2974,10 @@ export async function dispatchPublicOverflow(
     liability: request.liability,
     contextTokens: 0n,
   };
-  const compatibleTargets = (targets: PublicProviderTarget[]) => {
+  const compatibleTargets = (
+    targets: PublicProviderTarget[],
+    { ignoreEligibility = false }: { ignoreEligibility?: boolean } = {},
+  ) => {
     const memberEligible = targetsForForcedPoolMember(targets, request.forcedPoolMemberId);
     const eligible = binding
       ? memberEligible.filter((target) => matchesExactResponsesBinding(target, binding))
@@ -2992,6 +2996,7 @@ export async function dispatchPublicOverflow(
       )
         return [];
       if (
+        !ignoreEligibility &&
         request.eligibleExecutionTargetIds &&
         !request.eligibleExecutionTargetIds.includes(target.executionTargetId)
       )
@@ -3021,6 +3026,14 @@ export async function dispatchPublicOverflow(
   // permanently invalid: no retry can make it match again.
   if (compatible.length === 0 && binding)
     return { dispatched: false, reason: "BOUND_TARGET_INVALID" };
+  // The caller's servable set emptied it (a member changed between the caller's listing and
+  // this one): transient, not an incompatible request.
+  if (
+    compatible.length === 0 &&
+    request.eligibleExecutionTargetIds &&
+    compatibleTargets(listed.targets, { ignoreEligibility: true }).length > 0
+  )
+    return { dispatched: false, reason: "PROVIDER_UNAVAILABLE" };
   if (compatible.length === 0) {
     await Promise.allSettled(
       listed.targets.map((target) =>

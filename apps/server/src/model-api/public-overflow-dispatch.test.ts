@@ -341,7 +341,8 @@ describe("owner/pool:external dispatch", () => {
       ...request(),
       eligibleExecutionTargetIds: ["another-target"],
     });
-    expect(result).toMatchObject({ dispatched: false, reason: "NO_COMPATIBLE_PROVIDER" });
+    // The member is compatible, just not in the caller's set: transient.
+    expect(result).toMatchObject({ dispatched: false, reason: "PROVIDER_UNAVAILABLE" });
     expect(world.calls).toEqual([]);
   });
 
