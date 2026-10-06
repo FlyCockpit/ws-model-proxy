@@ -62,7 +62,7 @@ pub fn run(args: &Args) -> Result<()> {
             output::line(format!("open: {url}"))?;
         }
     }
-    offer_browser_open(&started, approval_url.as_deref())?;
+    offer_browser_open(&started, approval_url.as_deref(), &server_url)?;
 
     let mut interval = Duration::from_secs(started.interval.unwrap_or(5).max(1));
     let expires_in = Duration::from_secs(started.expires_in.unwrap_or(600));
@@ -188,6 +188,7 @@ fn approval_url(started: &crate::auth::DeviceCodeStartResponse) -> Option<String
 fn offer_browser_open(
     started: &crate::auth::DeviceCodeStartResponse,
     approval_url: Option<&str>,
+    server_url: &str,
 ) -> Result<()> {
     let Some(url) = approval_url else {
         return Ok(());
@@ -195,6 +196,19 @@ fn offer_browser_open(
     if !interactive_terminal() {
         return Ok(());
     }
+    // The approval URL comes from the server. Only a URL on the configured
+    // server's origin reaches the OS opener; anything else is printed for the
+    // person to judge.
+    let checked = match browser_url(url, server_url) {
+        Ok(checked) => checked,
+        Err(error) => {
+            output::diagnostic(format!(
+                "not opening the browser: {error:#}; open {url} yourself and enter code {} to continue",
+                started.user_code
+            ))?;
+            return Ok(());
+        }
+    };
 
     output::diagnostic("press Enter to open the verification URL in your browser")?;
     let mut ignored = String::new();
@@ -209,7 +223,7 @@ fn offer_browser_open(
         return Ok(());
     }
 
-    match open_browser(url) {
+    match open_browser(&checked) {
         Ok(()) => Ok(()),
         Err(error) => {
             output::diagnostic(format!(
@@ -231,19 +245,71 @@ fn prompt(text: &str) -> Result<()> {
     err.flush().context("flushing prompt to stderr")
 }
 
+/// Checks a server-supplied approval URL before any OS opener sees it.
+///
+/// It must be https (http only on a loopback host, for local development) and
+/// on the configured server's origin, with no embedded credentials. The
+/// returned URL is the parser's normalized form, so it holds no whitespace,
+/// quotes or control characters.
+fn browser_url(candidate: &str, server_url: &str) -> Result<url::Url> {
+    let url = url::Url::parse(candidate).context("the approval URL is not a valid URL")?;
+    match url.scheme() {
+        "https" => {}
+        "http" if is_loopback_host(&url) => {}
+        "http" => anyhow::bail!("the approval URL uses http on a non-loopback host"),
+        scheme => anyhow::bail!("the approval URL uses the unsupported scheme {scheme:?}"),
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("the approval URL carries credentials");
+    }
+    let server = url::Url::parse(server_url).context("the configured server URL is not valid")?;
+    if url.origin() != server.origin() {
+        anyhow::bail!(
+            "the approval URL is not on the configured server {}",
+            server.origin().ascii_serialization()
+        );
+    }
+    // The parser percent-encodes these; refuse rather than rely on that.
+    if url
+        .as_str()
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control() || ch == '"')
+    {
+        anyhow::bail!("the approval URL contains characters that cannot be passed safely");
+    }
+    Ok(url)
+}
+
+fn is_loopback_host(url: &url::Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
+}
+
 #[cfg(target_os = "macos")]
-fn open_browser(url: &str) -> Result<()> {
-    run_opener(Command::new("open").arg(url))
+fn open_browser(url: &url::Url) -> Result<()> {
+    run_opener(Command::new("open").arg(url.as_str()))
+}
+
+/// Windows opener arguments. `rundll32` hands the URL to the shell's URL
+/// protocol handler without `cmd.exe`, so `&`, `|`, `^` and `%` in the URL
+/// are never interpreted as shell syntax.
+#[cfg(any(target_os = "windows", test))]
+fn windows_opener_args(url: &url::Url) -> [&str; 2] {
+    ["url.dll,FileProtocolHandler", url.as_str()]
 }
 
 #[cfg(target_os = "windows")]
-fn open_browser(url: &str) -> Result<()> {
-    run_opener(Command::new("cmd").args(["/C", "start", "", url]))
+fn open_browser(url: &url::Url) -> Result<()> {
+    run_opener(Command::new("rundll32.exe").args(windows_opener_args(url)))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn open_browser(url: &str) -> Result<()> {
-    run_opener(Command::new("xdg-open").arg(url))
+fn open_browser(url: &url::Url) -> Result<()> {
+    run_opener(Command::new("xdg-open").arg(url.as_str()))
 }
 
 fn run_opener(command: &mut Command) -> Result<()> {
@@ -326,5 +392,79 @@ mod tests {
     #[test]
     fn blank_answer_without_a_default_is_invalid() {
         assert!(chosen_slug("\n", None).is_err());
+    }
+
+    const SERVER: &str = "https://wsmp.example.com";
+
+    #[test]
+    fn approval_url_on_the_configured_https_origin_opens() {
+        let url = browser_url(
+            "https://wsmp.example.com/device?user_code=ABCD-EFGH&x=1",
+            "https://wsmp.example.com/",
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://wsmp.example.com/device?user_code=ABCD-EFGH&x=1"
+        );
+    }
+
+    #[test]
+    fn http_approval_url_opens_only_on_loopback() {
+        for (candidate, server) in [
+            ("http://localhost:3000/device", "http://localhost:3000"),
+            ("http://127.0.0.1:3000/device", "http://127.0.0.1:3000"),
+            ("http://[::1]:3000/device", "http://[::1]:3000"),
+        ] {
+            assert!(browser_url(candidate, server).is_ok(), "{candidate}");
+        }
+        let error = browser_url("http://wsmp.lan:3000/device", "http://wsmp.lan:3000")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-loopback"), "{error}");
+    }
+
+    #[test]
+    fn approval_url_with_another_scheme_is_refused() {
+        for candidate in [
+            "file:///C:/Windows/System32/calc.exe",
+            "javascript:alert(1)",
+            "ms-settings:",
+            "ftp://wsmp.example.com/device",
+            r"\\evil\share\x.exe",
+            "calc.exe",
+            "",
+        ] {
+            assert!(browser_url(candidate, SERVER).is_err(), "{candidate:?}");
+        }
+    }
+
+    #[test]
+    fn approval_url_off_the_configured_origin_is_refused() {
+        for candidate in [
+            "https://evil.example.com/device",
+            "https://wsmp.example.com:8443/device",
+            "https://wsmp.example.com.evil.example/device",
+            format!("https://{}:{}@wsmp.example.com/device", "user", "pass").as_str(),
+            "https://wsmp.example.com@evil.example/device",
+        ] {
+            assert!(browser_url(candidate, SERVER).is_err(), "{candidate}");
+        }
+        // Same host, but the configured server is plain http.
+        assert!(browser_url("https://localhost/device", "http://localhost").is_err());
+    }
+
+    #[test]
+    fn shell_metacharacters_reach_the_windows_opener_as_one_plain_argument() {
+        // Under the old `cmd /C start`, `&` ended the command and ran the rest.
+        let url = browser_url(
+            "https://wsmp.example.com/device?user_code=AB&calc.exe|whoami^%PATH%\"\t x",
+            SERVER,
+        )
+        .unwrap();
+        let [handler, arg] = windows_opener_args(&url);
+        assert_eq!(handler, "url.dll,FileProtocolHandler");
+        assert!(arg.starts_with("https://wsmp.example.com/device?user_code=AB&calc.exe"));
+        assert!(!arg.chars().any(|ch| ch.is_whitespace() || ch == '"'));
     }
 }
