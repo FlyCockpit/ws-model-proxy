@@ -115,7 +115,12 @@
     "stopBeforeChange": "Detén los despliegues de esta receta antes de renombrarla o moverla a otro pool.",
     "slugTaken": "Otra receta ya usa este slug.",
     "invalidRecipeSlug": "El slug de esta receta no es válido en los nodos (termina en guion o repite guiones). Renombra la receta mientras ninguno de sus despliegues esté en ejecución y vuelve a iniciarla.",
-    "interactiveUnsupported": "Esta receta tiene comandos marcados como interactivos. Todavía no se puede iniciar una receta así; será posible en una versión posterior. Para iniciarla ahora, quita \"interactive\" de esos comandos en la receta."
+    "operatorUnavailable": "Esta receta tiene comandos que una persona ejecuta en una terminal del nodo, y al menos uno de los nodos elegidos no puede abrir esas terminales. En ese nodo ejecuta `wsmp config set-deployment-operator-terminal on` (los despliegues deben estar activados y el nodo debe admitir terminales), vuelve a conectarlo y planifica de nuevo.",
+    "stopPending": "WS Model Proxy todavía está comprobando que el servicio anterior de este despliegue se detuvo. Reinícialo cuando termine esa comprobación; si la comprobación espera por ti, respóndela primero.",
+    "resourcesUnconfirmed": "Los recursos de este nodo siguen reservados hasta que WS Model Proxy confirme que un despliegue anterior se detuvo allí. Mantén los despliegues permitidos y el nodo conectado, con su interruptor de terminal de operador activado, para que la comprobación pueda ejecutarse, o elimina el dispositivo.",
+    "operatorRequired": "Aplicar este plan abre terminales donde tú mismo ejecutas comandos:",
+    "operatorNodeNotReady": "Este nodo no puede abrir terminales de operador en este momento; la detención espera allí hasta que pueda.",
+    "interactiveFlagUnused": "La marca \"interactive\" en {{command}} (variante {{variant}}) no tiene efecto: ese comando no se ejecuta allí."
   },
   "actions": {
     "copyConfirm": "Copiar texto de confirmación",
@@ -2252,5 +2257,75 @@
     "failed": "No se pudo guardar tu elección. Inténtalo de nuevo.",
     "aggregate": "Solicitudes atendidas con claves propias de los usuarios invitados: {{count}}",
     "adaptation": "Permitir la adaptación de protocolo para mi modelo"
+  },
+  "deploymentOperator": {
+    "badge_one": "{{count}} despliegue te necesita",
+    "badge_other": "{{count}} despliegues te necesitan",
+    "noticeTitle_one": "Un despliegue te está esperando",
+    "noticeTitle_other": "{{count}} despliegues te están esperando",
+    "noticeStep": "{{endpoint}} te necesita: ejecuta un comando en una terminal del nodo, o activa la terminal de operador del nodo.",
+    "noticeRestart": "{{endpoint}} se detuvo y espera que lo reinicies.",
+    "open": "Abrir despliegues",
+    "tabLabel": "Paso de despliegue · {{cli}}",
+    "closeStep": "Cerrar terminal",
+    "closeStepTitle": "¿Cerrar la terminal de este paso de despliegue?",
+    "closeStepDescription": "Todavía no se ejecutó nada. El despliegue sigue esperándote; vuelve a abrir el paso desde Despliegues cuando estés listo.",
+    "closeRunningDescription": "El comando que se ejecuta en esta terminal también se detiene. El despliegue sigue esperándote; vuelve a abrir el paso desde Despliegues para ejecutarlo de nuevo.",
+    "panelTitle": "Paso de despliegue: {{action}} en el rango {{rank}}",
+    "panelTitleUnknown": "Paso de despliegue",
+    "panelAwaiting": "La terminal muestra el comando exacto. Presiona Enter allí para ejecutarlo, o q para cerrarla. Nunca abre un shell.",
+    "panelRunning": "El comando se está ejecutando. Cerrar esta terminal lo detiene.",
+    "view": "Ver",
+    "ended": "La terminal de este paso de despliegue terminó. Despliegues muestra qué sigue.",
+    "actions": {
+      "prepare": "Preparar",
+      "start": "Iniciar",
+      "after_join": "Iniciar tras la unión",
+      "stop": "Detener"
+    },
+    "status": {
+      "waitingTerminal": "esperándote en su terminal",
+      "closed": "terminal cerrada; vuelve a abrirla para ejecutar el paso",
+      "running": "ejecutándose en su terminal",
+      "overdue": "lleva más tiempo del esperado; puede estar esperando una entrada en su terminal",
+      "pending": "esperando para abrir su terminal",
+      "heldCheck": "comprobando que un servicio anterior se detuvo"
+    },
+    "reasons": {
+      "capabilityMissing": "El nodo no puede abrir terminales de operador. En el nodo ejecuta `wsmp config set-deployment-operator-terminal on` y vuelve a conectarlo.",
+      "sessionFull": "El nodo tiene demasiadas terminales abiertas; se abrirá cuando se cierre una.",
+      "nodeFull": "El nodo ya muestra el máximo de terminales de pasos a la vez; se abrirá cuando termine una.",
+      "terminalFailed": "El nodo no pudo abrir la terminal. Vuelve a abrir el paso para intentarlo de nuevo.",
+      "terminalLimit": "El nodo tiene demasiadas terminales abiertas. Cierra una y vuelve a abrir el paso.",
+      "unverified": "El comando terminó, pero la comprobación de estado no lo confirmó. Vuelve a abrir el paso; la comprobación de estado decide de nuevo.",
+      "heldCheck": "Una comprobación de estado de que el servicio anterior se detuvo.",
+      "other": "Motivo: {{code}}"
+    },
+    "needStep": "Te necesita: ejecuta un paso en su terminal del nodo, o haz lo que indica su motivo abajo (por ejemplo, activar la terminal de operador del nodo).",
+    "needRestart": "Detenido, te necesita: su inicio se ejecuta en una terminal, así que nunca se reinicia automáticamente.",
+    "stepsLabel": "Pasos que ejecutas tú",
+    "stepTitle": "{{action}} · rango {{rank}} · nodo {{node}}",
+    "lastExit": "La última ejecución terminó con el código {{code}}.",
+    "openTerminal": "Abrir terminal",
+    "reopen": "Volver a abrir el paso",
+    "restart": "Reiniciar",
+    "heldTitle": "Recursos reservados hasta confirmar una detención anterior",
+    "heldNode": "Nodo {{node}}, rango {{rank}}, puerto {{port}}",
+    "heldHint": "Siguen reservados para que ningún otro despliegue los use mientras el servicio anterior podría seguir ejecutándose. Una comprobación de estado los libera cuando el nodo está conectado.",
+    "planStep": "{{action}} en el rango {{rank}}, nodo {{node}}",
+    "planStopStep": "{{action}} de {{instance}} en el rango {{rank}}, nodo {{node}}",
+    "moreSteps_one": "Y {{count}} paso más.",
+    "moreSteps_other": "Y {{count}} pasos más.",
+    "unusedReasons": {
+      "single_node": "Un despliegue de un solo nodo no lo ejecuta.",
+      "not_head": "Solo el nodo principal lo ejecuta.",
+      "after_join_replaces_start": "El nodo principal ejecuta afterJoin en lugar de start.",
+      "no_command": "La receta no define ese comando."
+    },
+    "author": {
+      "user": "Lo escribiste tú.",
+      "agent": "Lo escribió un agente. Léelo antes de ejecutarlo.",
+      "unknown": "Aquí no se sabe quién lo escribió. Léelo antes de ejecutarlo."
+    }
   }
 }

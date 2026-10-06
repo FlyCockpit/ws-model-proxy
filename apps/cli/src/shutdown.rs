@@ -1,15 +1,23 @@
 //! Graceful relay shutdown on SIGTERM, SIGINT, and SIGHUP, and on Windows
 //! on Ctrl-C, Ctrl-Break, console close, and system shutdown.
 //!
-//! [`install`] blocks those signals in the calling thread before any other
-//! thread exists, so every later thread inherits the mask and none of them
-//! can be killed by the default action. One dedicated thread takes the
-//! signals with `sigwait` (no handler, so no `unsafe`). The relay loop polls
-//! [`requested`] and unwinds through its normal cleanup: every exec process
-//! group and terminal session is killed, the server hears `exec.done` /
-//! `term.exit` and a close frame, and the control socket and PID file guards
-//! drop. The process then dies from the same signal, so the parent sees the
-//! conventional status (143, 130, 129).
+//! On Unix, [`install`] registers those signals with tokio's handler, which
+//! one dedicated thread drives. Nothing blocks them: every thread, and every
+//! child the relay starts, keeps an empty signal mask. (std hands a child the
+//! caller's mask unchanged, and bash keeps an inherited mask for everything
+//! it runs, so a blocked mask would make exec commands, metric sources, and
+//! deployment start/stop commands immune to `kill`, `timeout`, and `pkill`.)
+//! The relay loop polls [`requested`] and unwinds through its normal
+//! cleanup: every exec process group and terminal session is killed, the
+//! server hears `exec.done` / `term.exit` and a close frame, and the control
+//! socket and PID file guards drop. The process then dies from the same
+//! signal, so the parent sees the conventional status (143, 130, 129).
+//! Because a handler stays installed, dying from the signal goes through
+//! `signal-hook`'s safe default-action emulation (see [`terminate_by_signal`]).
+//!
+//! A signal can land on any thread, so a blocking call with a timeout may
+//! fail once with `EINTR` (`ErrorKind::Interrupted`). Relay socket reads treat
+//! that like their poll timeout.
 //!
 //! Telemetry runs (`nvidia-smi` and custom metric commands) are killed with
 //! their process groups on every way out, through
@@ -18,9 +26,6 @@
 //! Cleanup is bounded by [`SHUTDOWN_DEADLINE`]. When it expires, or when a
 //! second signal arrives, the watcher kills every tracked child directly,
 //! removes the registered runtime files, and exits at once.
-//!
-//! Children never inherit the blocked mask: `std::process::Command` and
-//! `portable-pty` both reset it before `exec`.
 //!
 //! Windows takes console control events through tokio's handler on its own
 //! thread and follows the same path: flag, deadline, forced kill of tracked
@@ -57,11 +62,18 @@ pub fn signal_of(err: &anyhow::Error) -> Option<i32> {
         .map(|shutdown| shutdown.signal)
 }
 
-/// End the process the way `signal` would have: re-raise it with its default
-/// action, falling back to exit status `128 + signal`.
+/// End the process the way `signal` would have, so a service manager sees a
+/// death by SIGTERM (a clean stop to systemd) rather than exit status 143.
+///
+/// On Unix, `signal_hook::low_level::emulate_default_handler` puts the
+/// default action back in place of the relay's handler, unblocks `signal`,
+/// and raises it. Exit status `128 + signal` is only the last resort, for a
+/// signal it does not know.
 pub fn terminate_by_signal(signal: i32) -> ! {
     #[cfg(unix)]
-    unix::raise_default(signal);
+    {
+        let _ = signal_hook::low_level::emulate_default_handler(signal);
+    }
     std::process::exit(128_i32.saturating_add(signal))
 }
 
@@ -245,83 +257,111 @@ mod unix {
     use std::thread;
 
     use anyhow::{Context, Result};
-    use nix::sys::signal::{SigSet, Signal};
+    use nix::sys::signal::Signal;
+    use tokio::signal::unix::{SignalKind, signal};
 
+    /// Set once tokio's handler is in place for the shutdown signals.
     static INSTALLED: OnceLock<()> = OnceLock::new();
 
-    /// Start taking shutdown signals. Call from the main thread before any
-    /// other thread is spawned; threads that already exist keep the default
+    /// Start taking shutdown signals. The handlers are registered before
+    /// this returns, so a signal that lands later (even before the watcher
+    /// thread runs) starts a graceful shutdown instead of the default
     /// action. Later calls are no-ops.
+    ///
+    /// Nothing is blocked: threads and children keep their signal mask.
     pub fn install() -> Result<()> {
         if INSTALLED.get().is_some() {
             return Ok(());
         }
-        let signals = shutdown_signals();
-        signals
-            .thread_block()
-            .context("blocking shutdown signals for the relay")?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("starting the shutdown signal runtime")?;
+        let listeners = {
+            let _entered = runtime.enter();
+            shutdown_signals()
+                .into_iter()
+                .map(|kind| {
+                    signal(SignalKind::from_raw(kind as i32))
+                        .map(|listener| (kind, listener))
+                        .with_context(|| format!("listening for {}", kind.as_str()))
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
         thread::Builder::new()
             .name("wsmp-signals".to_string())
-            .spawn(move || watch(signals))
+            .spawn(move || {
+                runtime.block_on(async move {
+                    for (kind, mut listener) in listeners {
+                        tokio::spawn(async move {
+                            while listener.recv().await.is_some() {
+                                super::tracked::receive(kind as i32, kind.as_str());
+                            }
+                        });
+                    }
+                    std::future::pending::<()>().await;
+                });
+            })
             .context("starting the shutdown signal thread")?;
         let _ = INSTALLED.set(());
         Ok(())
     }
 
     /// SIGTERM, SIGINT, and SIGHUP, minus any the relay inherited as ignored
-    /// (`nohup`, or a background job of a non-interactive shell). Blocking an
-    /// ignored signal would let `sigwait` accept it on Linux and undo that
-    /// choice.
-    fn shutdown_signals() -> SigSet {
-        let mut signals = SigSet::empty();
-        for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP] {
-            if !inherited_ignored(signal) {
-                signals.add(signal);
-            }
-        }
-        signals
+    /// (`nohup`, as `wsmp daemon start` uses, or a background job of a
+    /// non-interactive shell). Installing a handler would undo that choice.
+    fn shutdown_signals() -> Vec<Signal> {
+        let ignored = inherited_ignored_mask();
+        [Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP]
+            .into_iter()
+            .filter(|signal| ignored & signal_bit(*signal) == 0)
+            .collect()
     }
 
+    /// The bit for `signal` in a kernel signal mask.
+    fn signal_bit(signal: Signal) -> u64 {
+        1_u64 << ((signal as u32).saturating_sub(1) & 63)
+    }
+
+    /// The signals this process inherited as ignored, from the kernel's
+    /// view of this process. Nothing has replaced an action yet.
     #[cfg(target_os = "linux")]
-    fn inherited_ignored(signal: Signal) -> bool {
-        let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-            return false;
-        };
-        let bit = 1_u64 << ((signal as u32).saturating_sub(1) & 63);
-        status
-            .lines()
-            .find_map(|line| line.strip_prefix("SigIgn:"))
-            .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
-            .is_some_and(|mask| mask & bit != 0)
+    fn inherited_ignored_mask() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("SigIgn:"))
+                    .and_then(parse_mask)
+            })
+            .unwrap_or(0)
     }
 
-    /// Other kernels discard a signal whose action is SIG_IGN even while it
-    /// is blocked, so an inherited ignore keeps working without a check.
+    /// Without `/proc`, ask `ps` (BSD `sigignore`, a hex mask); reading the
+    /// action directly takes `sigaction`, which needs `unsafe`. When `ps`
+    /// fails, assume nothing is ignored.
     #[cfg(not(target_os = "linux"))]
-    fn inherited_ignored(_signal: Signal) -> bool {
-        false
+    fn inherited_ignored_mask() -> u64 {
+        std::process::Command::new("/bin/ps")
+            .args(["-o", "sigignore=", "-p"])
+            .arg(std::process::id().to_string())
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| parse_mask(&String::from_utf8_lossy(&output.stdout)))
+            .unwrap_or(0)
     }
 
-    fn watch(signals: SigSet) {
-        loop {
-            let Ok(signal) = signals.wait() else {
-                continue;
-            };
-            super::tracked::receive(signal as i32, signal.as_str());
-        }
-    }
-
-    /// Unblock `signal` in this thread and raise it. With the default action
-    /// still in place this terminates the whole process.
-    pub(super) fn raise_default(signal: i32) {
-        let Ok(signal) = Signal::try_from(signal) else {
-            return;
-        };
-        let mut set = SigSet::empty();
-        set.add(signal);
-        if set.thread_unblock().is_ok() {
-            let _ = nix::sys::signal::raise(signal);
-        }
+    fn parse_mask(text: &str) -> Option<u64> {
+        let text = text.trim();
+        let text = text
+            .strip_prefix("0x")
+            .or_else(|| text.strip_prefix("0X"))
+            .unwrap_or(text);
+        u64::from_str_radix(text, 16).ok()
     }
 
     #[cfg(test)]
@@ -331,9 +371,24 @@ mod unix {
         #[test]
         fn shutdown_signals_skip_only_inherited_ignores() {
             let signals = shutdown_signals();
+            let ignored = inherited_ignored_mask();
             for signal in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP] {
-                assert_eq!(signals.contains(signal), !inherited_ignored(signal));
+                assert_eq!(signals.contains(&signal), ignored & signal_bit(signal) == 0);
             }
+        }
+
+        #[test]
+        fn signal_masks_parse_with_or_without_a_prefix() {
+            assert_eq!(parse_mask(" 0000000000001000\n"), Some(0x1000));
+            assert_eq!(parse_mask("0x1"), Some(1));
+            assert_eq!(parse_mask(""), None);
+            assert_eq!(signal_bit(Signal::SIGHUP), 1);
+            assert_eq!(
+                signal_bit(Signal::SIGTERM)
+                    | signal_bit(Signal::SIGINT)
+                    | signal_bit(Signal::SIGHUP),
+                0x4003
+            );
         }
     }
 }

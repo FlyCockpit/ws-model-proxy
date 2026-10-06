@@ -374,6 +374,10 @@ model CliDevice {
   allowHumanTerminal           Boolean                  @default(false)
   allowDeployments             Boolean                  @default(false)
   reportedDeployments          Boolean?
+  /// Hello: the node can run interactive recipe commands (2.4 `deploymentOperator`: its
+  /// node-local operator-terminal switch, deployments and a PTY are all on). Null until a hello
+  /// reports it. The planner refuses interactive recipes on nodes without it.
+  reportedDeploymentOperator   Boolean?
   deploymentPortStart          Int                      @default(30000)
   deploymentPortEnd            Int                      @default(30999)
   DeploymentInstanceNodes      DeploymentInstanceNode[]

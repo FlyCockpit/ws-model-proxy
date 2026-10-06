@@ -141,6 +141,7 @@ describe("parseTerminalServerMessage", () => {
           terminalId: "t1",
           origin: "user",
           supervised: null,
+          deployment: null,
           cliDeviceId: "c1",
           cols: 80,
           rows: 24,
@@ -153,6 +154,7 @@ describe("parseTerminalServerMessage", () => {
           terminalId: "t2",
           origin: "user",
           supervised: null,
+          deployment: null,
           cliDeviceId: "c2",
           cols: 80,
           rows: 24,
@@ -209,6 +211,36 @@ describe("agent terminals", () => {
       terminals: [
         { terminalId: "t1", origin: "agent", supervised: null },
         { terminalId: "t2", origin: "user", supervised: null },
+      ],
+    });
+  });
+});
+
+describe("deployment operator terminals", () => {
+  it("reads the step a deployment terminal runs, never auto-attachable as a user shell", () => {
+    const parsed = parseTerminalServerMessage({
+      type: "terminals",
+      clis: [],
+      terminals: [
+        {
+          terminalId: "t1",
+          cliDeviceId: "c1",
+          origin: "deployment",
+          deployment: { stepId: "s1", instanceId: "i1", rank: 1, action: "stop", state: "running" },
+        },
+        { terminalId: "t2", cliDeviceId: "c1", origin: "deployment", deployment: { rank: -1 } },
+      ],
+    });
+    expect(parsed).toMatchObject({
+      terminals: [
+        {
+          terminalId: "t1",
+          origin: "deployment",
+          supervised: null,
+          deployment: { stepId: "s1", instanceId: "i1", rank: 1, action: "stop", state: "running" },
+        },
+        // Unreadable details: still a deployment terminal, never the user's own shell.
+        { terminalId: "t2", origin: "deployment", deployment: null },
       ],
     });
   });

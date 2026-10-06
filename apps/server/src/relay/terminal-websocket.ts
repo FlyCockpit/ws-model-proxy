@@ -28,9 +28,8 @@ import {
   type RelaySocket,
   registerTerminalBridge,
   relaySessionManager,
-  TERMINAL_CLI_LIMIT,
-  TERMINAL_USER_LIMIT,
   type TerminalLifecycleEvent,
+  terminalLimitReached,
 } from "./session-manager.js";
 import { settleSocketHandler } from "./socket-handler.js";
 
@@ -1051,10 +1050,7 @@ export class TerminalBrowserHub {
     }
     const approvalRequired = live?.terminalApproval === true;
     const counts = relaySessionManager.terminalCounts(conn.userId, row.id);
-    if (
-      !approvalRequired &&
-      (counts.user >= TERMINAL_USER_LIMIT || counts.cli >= TERMINAL_CLI_LIMIT)
-    ) {
+    if (!approvalRequired && terminalLimitReached(counts)) {
       this.sendError(conn, "limit", ref);
       return;
     }

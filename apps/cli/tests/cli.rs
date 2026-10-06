@@ -1295,6 +1295,61 @@ fn config_file_tools_as_root_defaults_off_persists_and_shows() {
         .failure();
 }
 
+#[test]
+fn config_max_terminals_defaults_to_four_and_accepts_one_to_thirty_two() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args(["config", "init"])
+        .assert()
+        .success();
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert!(cfg.get("maxTerminals").is_none());
+    cli(&config, &state)
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""maxTerminals": 4"#));
+    for rejected in ["0", "33", "-1", "many"] {
+        cli(&config, &state)
+            .args(["config", "set-max-terminals", rejected])
+            .assert()
+            .failure();
+    }
+    cli(&config, &state)
+        .args(["config", "--json", "set-max-terminals", "32"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""key":"maxTerminals""#))
+        .stdout(predicate::str::contains(r#""value":32"#));
+    cli(&config, &state)
+        .args(["config", "set-max-terminals", "1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Restart wsmp to apply."));
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["maxTerminals"], 1);
+    // A hand-edited value outside the range stops the relay before it connects.
+    let mut cfg = cfg;
+    cfg["maxTerminals"] = json!(0);
+    fs::write(&config, serde_json::to_vec(&cfg).unwrap()).unwrap();
+    cli(&config, &state)
+        .args(["connect"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "`maxTerminals` must be an integer from 1 to 32",
+        ));
+    // `config show` flags it rather than presenting it as the limit in effect.
+    cli(&config, &state)
+        .args(["config", "--json", "show"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""maxTerminalsInvalid":true"#))
+        .stderr(predicate::str::contains("the relay will not start"));
+}
+
 #[cfg(unix)]
 #[test]
 fn supervised_run_without_the_daemon_env_fails_and_runs_nothing() {
@@ -1933,10 +1988,8 @@ mod signal_shutdown {
             .expect("relay socket");
         let shell_pid = setup.dir.join("shell.pid");
         let grand_pid = setup.dir.join("grand.pid");
-        // On Linux, a child of the shell also records its own blocked mask.
         let command = format!(
-            "if [ -r /proc/self/status ]; then grep SigBlk: /proc/self/status > '{}'; fi; echo $$ > '{}'; sleep 300 & echo $! > '{}'; wait",
-            setup.dir.join("mask").display(),
+            "echo $$ > '{}'; sleep 300 & echo $! > '{}'; wait",
             shell_pid.display(),
             grand_pid.display()
         );
@@ -1982,17 +2035,86 @@ mod signal_shutdown {
         let mut setup = start_relay(&["connect"]);
         let (shell, grand) = start_exec(&setup);
         assert!(process_alive(&shell) && process_alive(&grand));
-        // The relay blocks shutdown signals; its children must not inherit that.
-        if let Ok(line) = fs::read_to_string(setup.dir.join("mask")) {
-            let blocked = line
-                .strip_prefix("SigBlk:")
-                .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
-                .expect("SigBlk");
-            // SIGHUP, SIGINT, SIGTERM.
-            assert_eq!(blocked & 0x4003, 0, "exec children start unblocked");
-        }
+        assert_takes_shutdown_signals(&shell);
+        assert_takes_shutdown_signals(&grand);
         signal(setup.child.id(), "TERM");
         assert_clean_shutdown(&mut setup, &shell, &grand, 15);
+    }
+
+    /// SIGHUP, SIGINT, and SIGTERM.
+    const SHUTDOWN_SIGNALS: u64 = 0x4003;
+
+    /// Linux only: the signals `pid` blocks, read by this process from the
+    /// kernel. Never ask a shell to report it: dash clears its mask at
+    /// startup and would hide a mask the relay passed down.
+    fn blocked_signals(pid: &str) -> Option<u64> {
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        let mask = status
+            .lines()
+            .find_map(|line| line.strip_prefix("SigBlk:"))?;
+        u64::from_str_radix(mask.trim(), 16).ok()
+    }
+
+    /// The relay's children must start with the shutdown signals unblocked,
+    /// or `kill`, `timeout`, and deployment stop commands cannot end them.
+    fn assert_takes_shutdown_signals(pid: &str) {
+        if let Some(blocked) = blocked_signals(pid) {
+            assert_eq!(
+                blocked & SHUTDOWN_SIGNALS,
+                0,
+                "process {pid} started with shutdown signals blocked ({blocked:#x})"
+            );
+        }
+    }
+
+    /// Exec commands run by bash, which (unlike dash) keeps the signal mask
+    /// it inherits and passes it to every program it starts. A plain SIGTERM
+    /// must still end such a program. bash stands in for `sh` through
+    /// `PATH`; it is `/bin/sh` on macOS, Fedora, RHEL, and Arch.
+    #[test]
+    fn exec_commands_under_bash_can_be_stopped_with_sigterm() {
+        let Some(bash) = ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"]
+            .into_iter()
+            .map(Path::new)
+            .find(|path| path.is_file())
+        else {
+            return;
+        };
+        let bin = tempfile::tempdir().expect("tempdir");
+        std::os::unix::fs::symlink(bash, bin.path().join("sh")).expect("link sh to bash");
+        let path = std::env::join_paths(std::iter::once(bin.path().to_path_buf()).chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+        ))
+        .expect("join PATH");
+        let path = path.to_str().expect("utf-8 PATH");
+        let mut setup =
+            start_relay_logged(&["connect"], json!({}), &[("PATH", path)], Stdio::null());
+        let (shell, grand) = start_exec(&setup);
+        assert!(process_alive(&shell) && process_alive(&grand));
+        assert_takes_shutdown_signals(&shell);
+        assert_takes_shutdown_signals(&grand);
+        // What `kill`, `pkill`, `timeout`, or a deployment stop command does.
+        signal(grand.parse().expect("grandchild pid"), "TERM");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while process_alive(&grand) {
+            assert!(
+                Instant::now() < deadline,
+                "SIGTERM did not end a program an exec command started under bash"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            setup.relay.next_text("exec.done")["commandId"],
+            "sig-1",
+            "the command ends once its program does"
+        );
+        signal(setup.child.id(), "TERM");
+        let status = wait_for_exit(&mut setup.child);
+        assert_eq!(
+            status.signal(),
+            Some(15),
+            "the relay dies from the signal it took: {status:?}"
+        );
     }
 
     /// A relay whose custom metric source is running: hello.ok has been sent

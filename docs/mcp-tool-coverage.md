@@ -67,10 +67,13 @@ fails the suite when a leaf is unclassified.
 | `deployments.getInstance` | `deployment_instance_get` | read | — | pure | — | — | — |
 | `deployments.listConfigs` | `deployment_configs_list` | read | — | pure | — | — | — |
 | `deployments.listInstances` | `deployment_instances_list` | read | — | pure | — | — | — |
+| `deployments.operatorNeeds` | — (excluded) | — | — | — | — | — | Dashboard notice feed; agents read the same needsOperator fields through deployment_instances_list. |
 | `deployments.pendingPlans` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
 | `deployments.planStart` | `deployment_plan_start` | write | — | pure | — | — | — |
 | `deployments.planStatus` | `deployment_plan_status` | read | — | pure | — | — | — |
 | `deployments.planStop` | `deployment_plan_stop` | write | — | pure | — | — | — |
+| `deployments.reopenOperatorStep` | — (excluded) | — | — | — | — | — | Human-only: interactive recipe steps wait for the owner, who restarts or reopens them from the dashboard; never an agent tool. |
+| `deployments.restartInstance` | — (excluded) | — | — | — | — | — | Human-only: interactive recipe steps wait for the owner, who restarts or reopens them from the dashboard; never an agent tool. |
 | `deployments.setAgentsMayPreempt` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
 | `deployments.setNodeGrant` | — (excluded) | — | — | — | — | — | Human-only consent or credential identity management; never an agent tool. |
 | `deployments.updateConfig` | `deployment_config_update` | write | — | pure | — | — | — |

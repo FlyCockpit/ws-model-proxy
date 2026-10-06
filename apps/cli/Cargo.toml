@@ -67,7 +67,11 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 # Named directly only to install the process-wide `ring` crypto provider (see
 # `wsmp::tls`); default features would add aws-lc-rs back.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "net", "io-util"] }
+# `signal`: shutdown signals (SIGTERM/SIGINT/SIGHUP on Unix; console control
+# events on Windows) start the bounded relay shutdown (`wsmp::shutdown`). On
+# Unix a handler replaces blocking them for `sigwait`, so children never
+# inherit a blocked mask.
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
 # The `Stream` trait lets a request body remain credit-paced while reqwest owns
 # the cancellable connection future.
 futures-core = "0.3"
@@ -104,6 +108,12 @@ similar = { version = "3", default-features = false, features = ["std", "text"] 
 # (statvfs) and `net` (getifaddrs) feed relay 2.7 node telemetry. `dir` backs
 # the file_ops fd-based directory walker.
 nix = { version = "0.31", default-features = false, features = ["fs", "dir", "hostname", "net", "socket", "user", "signal", "process", "poll", "term"] }
+# Dies from a shutdown signal after cleanup: `emulate_default_handler` safely
+# puts the default action back in place of tokio's handler and re-raises it,
+# so a service manager sees SIGTERM rather than exit status 143. Already in the
+# tree through tokio's `signal` feature (signal-hook-registry); default
+# features (channel, iterator) are not needed.
+signal-hook = { version = "0.3", default-features = false }
 # Unix PTY. Its unsafe code stays inside the crate (`unsafe_code` is forbid
 # here). Windows v1 reports terminals unsupported and does not link this crate.
 portable-pty = "0.9"
@@ -135,9 +145,6 @@ rustix = { version = "1.1", default-features = false, features = ["fs", "std"] }
 # that conversion needs no extra Tokio feature. Windows kill-on-drop is also
 # synchronous and does not wait (ChildDropGuard delegates to std Child::kill).
 process-wrap = { version = "10", default-features = false, features = ["tokio1", "job-object", "kill-on-drop"] }
-# Console control events (Ctrl-C, Ctrl-Break, close, shutdown) start the same
-# bounded relay shutdown as SIGINT/SIGTERM on Unix. Unix keeps `sigwait`.
-tokio = { version = "1", features = ["signal"] }
 
 [dev-dependencies]
 # Black-box CLI testing: run the built binary and assert on stdout/stderr/exit.

@@ -274,6 +274,12 @@ pub struct Config {
     /// Require a locally approved browser identity before opening a terminal.
     #[serde(default, skip_serializing_if = "is_false")]
     pub require_terminal_approval: bool,
+    /// Browser terminals this machine keeps open at once
+    /// ([`MAX_TERMINALS_RANGE`]; unset means [`DEFAULT_MAX_TERMINALS`]).
+    /// Supervised and operator terminals have their own slots. Read once
+    /// when the relay starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_terminals: Option<u32>,
     /// Run the MCP node file tools even when the daemon is root (euid 0). Read
     /// once when the relay starts; off by default.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -330,6 +336,12 @@ impl MetricsConfig {
     }
 }
 
+/// Browser terminals open at once on one machine when `maxTerminals` is unset.
+/// The server applies its own per-CLI and per-user limits too; the lowest wins.
+pub const DEFAULT_MAX_TERMINALS: u32 = 4;
+/// Accepted `maxTerminals` values (`wsmp config set-max-terminals`).
+pub const MAX_TERMINALS_RANGE: std::ops::RangeInclusive<u32> = 1..=32;
+
 pub const METRIC_SOURCE_DEFAULT_INTERVAL_SECS: u32 = 10;
 pub const METRIC_SOURCE_DEFAULT_TIMEOUT_SECS: u32 = 5;
 
@@ -370,6 +382,7 @@ struct ConfigWire {
     mcp_command_mode: Option<McpCommandMode>,
     allow_mcp_commands: Option<bool>,
     require_terminal_approval: bool,
+    max_terminals: Option<u32>,
     allow_file_tools_as_root: bool,
     mcp_file_read: bool,
     #[serde(deserialize_with = "deserialize_file_roots")]
@@ -396,6 +409,7 @@ impl Default for ConfigWire {
             mcp_command_mode: None,
             allow_mcp_commands: None,
             require_terminal_approval: false,
+            max_terminals: None,
             allow_file_tools_as_root: false,
             mcp_file_read: false,
             file_roots: Vec::new(),
@@ -427,6 +441,7 @@ impl From<ConfigWire> for Config {
             allow_human_terminal: wire.allow_human_terminal,
             mcp_command_mode,
             require_terminal_approval: wire.require_terminal_approval,
+            max_terminals: wire.max_terminals,
             allow_file_tools_as_root: wire.allow_file_tools_as_root,
             mcp_file_read: wire.mcp_file_read,
             file_roots: wire.file_roots,
@@ -452,6 +467,7 @@ impl Default for Config {
             allow_human_terminal: false,
             mcp_command_mode: McpCommandMode::Off,
             require_terminal_approval: false,
+            max_terminals: None,
             allow_file_tools_as_root: false,
             mcp_file_read: false,
             file_roots: Vec::new(),
@@ -1562,6 +1578,27 @@ pub struct AudioCapabilities {
 }
 
 impl Config {
+    /// The browser terminal limit this machine applies: `maxTerminals`, or
+    /// [`DEFAULT_MAX_TERMINALS`] when unset.
+    pub fn effective_max_terminals(&self) -> u32 {
+        self.max_terminals.unwrap_or(DEFAULT_MAX_TERMINALS)
+    }
+
+    /// `maxTerminals` is unset or within [`MAX_TERMINALS_RANGE`]; the relay
+    /// refuses to start otherwise.
+    pub fn validate_max_terminals(&self) -> Result<()> {
+        if let Some(count) = self.max_terminals
+            && !MAX_TERMINALS_RANGE.contains(&count)
+        {
+            anyhow::bail!(
+                "`maxTerminals` must be an integer from {} to {}",
+                MAX_TERMINALS_RANGE.start(),
+                MAX_TERMINALS_RANGE.end()
+            );
+        }
+        Ok(())
+    }
+
     /// Execute a complete local read-modify-write under the transitional
     /// exclusive lock. Callers must not call `save` from `update`; this method
     /// persists the returned candidate before releasing the lock.
@@ -1663,6 +1700,7 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         validate_file_root_shape(&self.file_roots)?;
+        self.validate_max_terminals()?;
         if let Some(slug) = &self.cli_slug {
             validate_slug(slug).with_context(|| format!("validating CLI slug `{slug}`"))?;
         }

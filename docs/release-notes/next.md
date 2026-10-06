@@ -22,10 +22,28 @@ screen on the node. Turn deployments on only on nodes whose server you would
 trust with a shell there. Deployments stay off by default.
 
 Interactive recipe commands (a command a person must run, e.g. one asking for
-a sudo password) are not usable yet. A recipe can mark commands `interactive`
-and be saved, but starting it is refused until a follow-up release. The
-node-local switch `wsmp config set-deployment-operator-terminal` exists (off by
-default) but has no effect yet.
+a sudo password) are marked `interactive` in the recipe. When such a step is
+due, the deployment waits for you: the node opens an operator terminal that
+shows the exact command, runs it only after you press Enter there (never a
+shell), and for starts and stops checks the recipe's status command before the
+step counts as done.
+An interactive start or `afterJoin` requires `management: externalService`, and
+any interactive command requires a `status` command. Automatic stops (a failed
+start, a node going offline, preemption) also wait for you, with the
+deployment's resources held; an instance whose start is interactive is never
+restarted automatically, it waits for you to restart it. Agents can write and
+plan such recipes but can never answer, reopen or restart these steps.
+Each node must opt in with `wsmp config set-deployment-operator-terminal on`
+(off by default; it also needs deployments on and terminal support, and does not
+enable browser shells). Planning refuses an interactive recipe on a node
+without it, naming the setting. A sudoers `NOPASSWD` rule for the exact
+absolute command remains the fully automatic alternative.
+
+Browser terminal limits are configurable and higher by default: 8 open per
+user (`WMP_TERMINAL_USER_LIMIT`, was 4) and 4 per CLI (`WMP_TERMINAL_CLI_LIMIT`,
+was 2), each 1 to 64, and each node caps its own with
+`wsmp config set-max-terminals <n>` (1 to 32, default 4, was 2). The lowest
+limit applies; supervised command and operator terminals are not counted.
 
 Recipe commands are limited to 4,096 UTF-8 bytes when saved and again after
 placeholder substitution, the same limit the CLI enforces, so a long command is
@@ -369,6 +387,14 @@ assignment provenance and automatic concurrency seed columns.
 
 ## Fixed
 
+- **Commands the CLI starts can be stopped with signals again (since #51).**
+  The relay blocked SIGTERM, SIGINT and SIGHUP for its own shutdown handling,
+  and every command it started (exec commands, metric sources, engine
+  adapters, deployment start/stop/status commands) inherited that mask. Where
+  `/bin/sh` is bash (macOS, Fedora/RHEL, Arch) those commands then ignored
+  `kill`, `pkill` and `timeout`, and a stop command could not end a `nohup`'d
+  backend. The CLI now takes shutdown signals with a handler instead, so its
+  commands start with nothing blocked; relay shutdown behaves as before.
 - **A disconnect that arrives just after a CLI reconnects no longer re-opens
   its pool members (#113, #129).** The reconnect hello had already made the
   members due, but the old socket's close could still be processed during the

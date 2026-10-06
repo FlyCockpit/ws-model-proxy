@@ -200,6 +200,8 @@ const GRAPH_WRITERS: Record<string, string> = {
     "M: owner-fenced recipes, revisions, plans and human-only grants",
   "apps/server/src/deployments/reconciler.ts":
     "M: durable deployment graph steps and gates under graph-owner/deployment-owner/sorted node then capacity fences",
+  "packages/api/src/lib/deployment-operator-notify.ts":
+    "H status: deployment_instance.needsOperatorNotifiedAt only (an unfenced notice column), one guarded row per statement",
   "packages/api/src/routers/metric-routing.ts":
     "M: pool routing rules (owner fence, replace table rows) and member engine-load override (one owner-scoped row update of non-key columns)",
   "apps/server/src/relay/registration.ts": "M: relay registration",

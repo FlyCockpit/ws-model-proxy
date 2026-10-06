@@ -41,6 +41,7 @@ import {
   deploymentOperatorSupported,
 } from "@ws-model-proxy/config/deployment-protocol";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
+import { env } from "@ws-model-proxy/env/server";
 import {
   type DeploymentOperatorAction,
   type DeploymentOperatorOutcome,
@@ -439,13 +440,27 @@ export function registerTerminalBridge(bridge: TerminalBridge) {
   terminalBridge = bridge;
 }
 
-export const TERMINAL_USER_LIMIT = 4;
+/**
+ * Open browser terminals allowed per user and per CLI
+ * (`WMP_TERMINAL_USER_LIMIT`, `WMP_TERMINAL_CLI_LIMIT`). Supervised and
+ * operator terminals have their own limits. The CLI also enforces its local
+ * `maxTerminals` (default 4) and refuses with `limit`; the lowest limit wins.
+ */
+export function terminalLimits(): { user: number; cli: number } {
+  return { user: env.WMP_TERMINAL_USER_LIMIT, cli: env.WMP_TERMINAL_CLI_LIMIT };
+}
+
+/** Whether one more browser terminal would exceed {@link terminalLimits}. */
+export function terminalLimitReached(counts: { user: number; cli: number }): boolean {
+  const limits = terminalLimits();
+  return counts.user >= limits.user || counts.cli >= limits.cli;
+}
+
 /**
  * Interactive steps one session may track at once. The reconciler opens at
  * most a few operator terminals per node (design §4: 4); the CLI caps 8.
  */
 export const OPERATOR_STEPS_PER_SESSION = 16;
-export const TERMINAL_CLI_LIMIT = 2;
 /** 2.5: attached viewers plus pending approvals per terminal. */
 export const TERMINAL_VIEWER_LIMIT = 8;
 const CLI_SEALED_BUFFER_LIMIT = 1024 * 1024;
@@ -716,6 +731,7 @@ function reportedFeaturesFromHello(message: HelloMessage, now: Date): ReportedRe
     reportedTerminalSupported: features.terminalSupported,
     reportedAllowFileToolsAsRoot: features.allowFileToolsAsRoot,
     reportedDeployments: features.deployments ?? false,
+    reportedDeploymentOperator: features.deploymentOperator ?? false,
     reportedHostname: message.cli.hostname ?? null,
     featuresReportedAt: now,
   };
@@ -3236,12 +3252,7 @@ export class RelaySessionManager {
     if (this.hasTerminal(input.terminalId)) return false;
     const approvalRequired = session.features?.terminalApproval === true;
     const counts = this.terminalCounts(input.userId, input.cliDeviceId);
-    if (
-      !approvalRequired &&
-      (counts.user >= TERMINAL_USER_LIMIT || counts.cli >= TERMINAL_CLI_LIMIT)
-    ) {
-      return false;
-    }
+    if (!approvalRequired && terminalLimitReached(counts)) return false;
     const now = Date.now();
     const viewerId = input.viewerId ?? mintViewerId();
     const multiViewer = session.terminalViewers;
@@ -4676,7 +4687,8 @@ export class RelaySessionManager {
 
   private terminalOverLimit(terminal: TerminalRecord): boolean {
     const counts = this.terminalCounts(terminal.userId, terminal.cliDeviceId);
-    return counts.user > TERMINAL_USER_LIMIT || counts.cli > TERMINAL_CLI_LIMIT;
+    const limits = terminalLimits();
+    return counts.user > limits.user || counts.cli > limits.cli;
   }
 
   private handleExecControl(

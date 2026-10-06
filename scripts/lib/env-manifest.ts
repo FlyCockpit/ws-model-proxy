@@ -364,6 +364,26 @@ export const ENV_VARS: EnvVar[] = [
     ],
   },
   {
+    key: "WMP_TERMINAL_USER_LIMIT",
+    group: "runtime",
+    source: "default",
+    default: "8",
+    comment: [
+      "Browser terminals one user may have open at once, across all CLIs (1-64).",
+      "Supervised command and operator terminals have their own limits and do not count.",
+    ],
+  },
+  {
+    key: "WMP_TERMINAL_CLI_LIMIT",
+    group: "runtime",
+    source: "default",
+    default: "4",
+    comment: [
+      "Browser terminals open at once on one CLI, across all users (1-64). A backstop:",
+      "each CLI also applies its own `wsmp config set-max-terminals` (default 4); the lowest limit wins.",
+    ],
+  },
+  {
     key: "WMP_PROVIDER_CREDENTIAL_ENCRYPTION_KEYS",
     group: "runtime",
     source: "generate",

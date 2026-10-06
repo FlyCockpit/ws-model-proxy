@@ -35,6 +35,8 @@ vi.mock("@ws-model-proxy/env/server", () => ({
     MODEL_API_TRANSCRIPTION_MIN_FREE_BYTES: 0,
     MODEL_API_TRANSCRIPTION_UPLOAD_TIMEOUT_MS: 30_000,
     MODEL_API_TRANSCRIPTION_STALE_SPOOL_MS: 24 * 60 * 60 * 1000,
+    WMP_TERMINAL_USER_LIMIT: 8,
+    WMP_TERMINAL_CLI_LIMIT: 4,
   },
 }));
 
@@ -64,6 +66,7 @@ vi.mock("../rate-limit.js", () => ({
 }));
 
 const { default: prisma } = await import("@ws-model-proxy/db");
+const { env } = await import("@ws-model-proxy/env/server");
 const { relaySessionManager } = await import("./session-manager.js");
 const {
   admitBrowserConnection,
@@ -561,23 +564,46 @@ describe("terminal browser hub", () => {
     }
   });
 
-  it("enforces per-CLI and per-user terminal limits", async () => {
+  it("enforces the default per-CLI (4) and per-user (8) terminal limits", async () => {
+    const first = await connectCli("one");
+    const second = await connectCli("two");
+    const third = await connectCli("three");
+    const browser = attachBrowser();
+    for (let index = 0; index < 5; index += 1) await open(browser, "one");
+    expect(browser.jsonSends().at(-1)).toMatchObject({
+      code: "limit",
+      message: "Terminal limit reached.",
+    });
+    expect(first.jsonSends().filter((message) => message.type === "term.open")).toHaveLength(4);
+
+    for (let index = 0; index < 4; index += 1) await open(browser, "two");
+    await open(browser, "three");
+    expect(browser.jsonSends().at(-1)).toMatchObject({ code: "limit" });
+    expect(third.jsonSends().some((message) => message.type === "term.open")).toBe(false);
+    expect(second.jsonSends().filter((message) => message.type === "term.open")).toHaveLength(4);
+  });
+
+  it("applies configured terminal limits", async () => {
+    const limits = env as { WMP_TERMINAL_USER_LIMIT: number; WMP_TERMINAL_CLI_LIMIT: number };
+    limits.WMP_TERMINAL_CLI_LIMIT = 1;
+    limits.WMP_TERMINAL_USER_LIMIT = 2;
+    onTestFinished(() => {
+      limits.WMP_TERMINAL_CLI_LIMIT = 4;
+      limits.WMP_TERMINAL_USER_LIMIT = 8;
+    });
     const first = await connectCli("one");
     const second = await connectCli("two");
     const third = await connectCli("three");
     const browser = attachBrowser();
     await open(browser, "one");
     await open(browser, "one");
-    await open(browser, "one");
     expect(browser.jsonSends().at(-1)).toMatchObject({ code: "limit" });
-    expect(first.jsonSends().filter((message) => message.type === "term.open")).toHaveLength(2);
-
-    await open(browser, "two");
+    expect(first.jsonSends().filter((message) => message.type === "term.open")).toHaveLength(1);
     await open(browser, "two");
     await open(browser, "three");
     expect(browser.jsonSends().at(-1)).toMatchObject({ code: "limit" });
+    expect(second.jsonSends().filter((message) => message.type === "term.open")).toHaveLength(1);
     expect(third.jsonSends().some((message) => message.type === "term.open")).toBe(false);
-    expect(second.jsonSends().filter((message) => message.type === "term.open")).toHaveLength(2);
   });
 
   it("detaches on tab close and when the browser buffer exceeds 4 MiB without killing the terminal", async () => {

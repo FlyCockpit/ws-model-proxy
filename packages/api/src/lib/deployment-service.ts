@@ -8,12 +8,17 @@ import {
   type DeploymentJob,
   type DeploymentJobOperator,
   deploymentJobFrameBytes,
+  deploymentOperatorSupported,
 } from "@ws-model-proxy/config/deployment-protocol";
 import prisma, { type Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fenceOwners, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { userCredentialAccessBlocked } from "@ws-model-proxy/db/user-deletion-access";
 import { z } from "zod";
-import { deploymentDerivedIntents, originalDeploymentStopIntent } from "./deployment-job-intent";
+import {
+  deploymentDerivedIntents,
+  deploymentJobIntentSchema,
+  originalDeploymentStopIntent,
+} from "./deployment-job-intent";
 import {
   type DeploymentNode,
   deploymentFingerprint,
@@ -31,7 +36,6 @@ import {
   deploymentSpecSchema,
   rankValue,
   storedDeploymentSpecSchema,
-  variantHasInteractiveCommands,
 } from "./deployment-spec";
 import { gpuBudgetKey, parseNodeInfo, resolveUsableBudgets } from "./node-inventory";
 
@@ -82,6 +86,12 @@ export async function loadDeploymentState(tx: Tx, userId: string) {
       protocolVersion: n.relayProtocolVersion,
       allowDeployments: n.allowDeployments,
       reportedDeployments: n.reportedDeployments,
+      operator:
+        deploymentOperatorSupported({
+          protocolVersion: n.relayProtocolVersion,
+          deployments: n.reportedDeployments,
+          deploymentOperator: n.reportedDeploymentOperator,
+        }) && n.reportedTerminalSupported === true,
       mode: n.mcpCommandMode,
       localMode: n.reportedMcpCommandMode,
       execution: raw.success ? (raw.data.executionMechanism ?? "unsupported") : "unsupported",
@@ -313,13 +323,69 @@ export async function deploymentOperatorCommandAuthor(
 ): Promise<DeploymentCommandAuthor> {
   const revision = await tx.deploymentConfigRevision.findUnique({
     where: { id: instance.revisionId },
-    select: { configId: true, revision: true, spec: true },
+    select: { configId: true, revision: true },
   });
   if (!revision) return "unknown";
-  const spec = storedDeploymentSpecSchema.safeParse(revision.spec);
-  const variant = spec.success
-    ? spec.data.variants.find((candidate) => candidate.key === instance.variantKey)
-    : undefined;
+  const history = await loadDeploymentAuthorship(tx, revision.configId, [revision.revision]);
+  return deploymentCommandAuthorFromHistory(
+    history,
+    { revision: revision.revision, variantKey: instance.variantKey },
+    job,
+  );
+}
+/** A recipe's revisions, newest first, each parsed once (null: unreadable). */
+export type DeploymentAuthorshipHistory = ReadonlyArray<{
+  revision: number;
+  editorKind: string;
+  spec: z.infer<typeof storedDeploymentSpecSchema> | null;
+}>;
+/**
+ * The revision history the authorship rule reads for every given revision number of one
+ * recipe, in ONE query: for each revision r, the rule reads the newest
+ * {@link AUTHORSHIP_REVISION_LIMIT} revisions <= r, and those all lie within the newest
+ * `limit + (max - min)` revisions <= max (revision numbers are unique per recipe).
+ */
+export async function loadDeploymentAuthorship(
+  tx: Pick<Tx, "deploymentConfigRevision">,
+  configId: string,
+  revisions: readonly number[],
+): Promise<DeploymentAuthorshipHistory> {
+  if (!revisions.length) return [];
+  const max = Math.max(...revisions);
+  const min = Math.min(...revisions);
+  const rows = await tx.deploymentConfigRevision.findMany({
+    where: { configId, revision: { lte: max } },
+    orderBy: { revision: "desc" },
+    take: AUTHORSHIP_REVISION_LIMIT + (max - min),
+    select: { revision: true, editorKind: true, spec: true },
+  });
+  return rows.map((row) => {
+    const spec = storedDeploymentSpecSchema.safeParse(row.spec);
+    return {
+      revision: row.revision,
+      editorKind: row.editorKind,
+      spec: spec.success ? spec.data : null,
+    };
+  });
+}
+/**
+ * The authorship rule (chunk 5; the node's confirm screen shows its result) over a loaded
+ * history: the raw recipe text the step runs, then `agent` if any AGENT revision up to the
+ * instance's holds that exact text, `user` only if the earliest revision holding it was saved
+ * by USER, else `unknown` (SCHEDULE, an unreadable revision, more than
+ * {@link AUTHORSHIP_REVISION_LIMIT} revisions, or a missing revision, variant or command).
+ */
+export function deploymentCommandAuthorFromHistory(
+  history: DeploymentAuthorshipHistory,
+  instance: { revision: number; variantKey: string },
+  job: Pick<DeploymentJob, "rank" | "action">,
+): DeploymentCommandAuthor {
+  const window = history
+    .filter((candidate) => candidate.revision <= instance.revision)
+    .slice(0, AUTHORSHIP_REVISION_LIMIT);
+  const own = window[0];
+  if (own?.revision !== instance.revision) return "unknown";
+  const variant = own.spec?.variants.find((candidate) => candidate.key === instance.variantKey);
   if (!variant) return "unknown";
   const source = deploymentCommandSource(variant, job.rank, job.action);
   let text: unknown;
@@ -330,28 +396,23 @@ export async function deploymentOperatorCommandAuthor(
   }
   if (typeof text !== "string") return "unknown";
   const raw = text;
-  const history = await tx.deploymentConfigRevision.findMany({
-    where: { configId: revision.configId, revision: { lte: revision.revision } },
-    orderBy: { revision: "desc" },
-    take: AUTHORSHIP_REVISION_LIMIT,
-    select: { revision: true, editorKind: true, spec: true },
-  });
   let earliest: { editorKind: string } | undefined;
   let unreadable = false;
-  for (const candidate of history) {
-    const parsed = storedDeploymentSpecSchema.safeParse(candidate.spec);
-    if (!parsed.success) {
+  for (const candidate of window) {
+    if (!candidate.spec) {
       unreadable = true;
       continue;
     }
-    const holds = parsed.data.variants.some((v) => variantCommandTexts(v.commands).includes(raw));
+    const holds = candidate.spec.variants.some((v) =>
+      variantCommandTexts(v.commands).includes(raw),
+    );
     if (!holds) continue;
     if (candidate.editorKind === "AGENT") return "agent";
-    // `history` is newest first, so the last match is the earliest revision holding the text.
+    // `window` is newest first, so the last match is the earliest revision holding the text.
     earliest = candidate;
   }
   // An unreadable revision may be an agent's; a truncated scan may miss the first author.
-  if (unreadable || history.length >= AUTHORSHIP_REVISION_LIMIT) return "unknown";
+  if (unreadable || window.length >= AUTHORSHIP_REVISION_LIMIT) return "unknown";
   return earliest?.editorKind === "USER" ? "user" : "unknown";
 }
 /**
@@ -401,8 +462,9 @@ export async function deploymentStartsInteractive(tx: Tx, instanceId: string) {
 }
 /**
  * Keep `needsOperator` in step with what the instance waits for:
- * - `STEP` while a step waits for its person (AWAITING_OPERATOR), or a person's run is past
- *   its timeout (it may hang on a prompt);
+ * - `STEP` while a step waits for its person (AWAITING_OPERATOR), a person's run is past
+ *   its timeout (it may hang on a prompt), or a step is held before its terminal can open
+ *   (`operatorHold`);
  * - otherwise `RESTART` ("stopped, needs you") while an instance meant to run, whose start is
  *   interactive, has stopped with no restart pending and restarts left;
  * - otherwise none.
@@ -428,6 +490,9 @@ export async function syncDeploymentOperatorNeed(tx: Tx, instanceId: string) {
       OR: [
         { state: "AWAITING_OPERATOR" },
         { state: "RUNNING", operatorSince: { not: null }, deadline: { lte: now } },
+        // Held before its terminal can open (the node's operator-terminal switch is off, or
+        // it has no room): the person must act on the node (security review L1).
+        { state: "PENDING", operatorHold: { not: null } },
       ],
     },
   });
@@ -443,7 +508,12 @@ export async function syncDeploymentOperatorNeed(tx: Tx, instanceId: string) {
   if (need === instance.needsOperator) return;
   await tx.deploymentInstance.update({
     where: { id: instanceId },
-    data: { needsOperator: need, needsOperatorSince: need ? now : null },
+    // A new need is a new notice: its send-failure count starts over.
+    data: {
+      needsOperator: need,
+      needsOperatorSince: need ? now : null,
+      needsOperatorNotifyFailures: 0,
+    },
   });
 }
 /**
@@ -506,6 +576,7 @@ export async function restartDeploymentInstance(
           operatorRestartRequestedAt: now,
           needsOperator: null,
           needsOperatorSince: null,
+          needsOperatorNotifyFailures: 0,
         },
       });
     },
@@ -615,6 +686,27 @@ export const deploymentPlanContentsSchema = z.object({
   effectiveMode: z.enum(["OFF", "SUPERVISED", "UNSUPERVISED"]),
   headAddr: z.string(),
   warnings: z.array(z.string()),
+  /**
+   * Commands a person runs in an operator terminal if the plan is applied (the start's
+   * interactive phases and stops, and the interactive stops of the instances it stops), for
+   * the plan and confirm dialogs. At most {@link PLAN_OPERATOR_STEPS_MAX}; `operatorStepCount`
+   * is the full number. Absent on plans stored before interactive commands.
+   */
+  operatorSteps: z
+    .array(
+      z.object({
+        /** The instance being stopped; null for the instance this plan starts. */
+        instanceId: z.string().nullable(),
+        nodeId: z.string(),
+        rank: z.number().int(),
+        action: z.enum(["prepare", "start", "after_join", "stop"]),
+        command: z.string(),
+        /** The node reported it can open operator terminals. */
+        nodeReady: z.boolean(),
+      }),
+    )
+    .optional(),
+  operatorStepCount: z.number().int().optional(),
 });
 export type DeploymentPlanContents = z.infer<typeof deploymentPlanContentsSchema>;
 async function getVariant(tx: Tx, userId: string, revisionId: string, key: string) {
@@ -681,21 +773,27 @@ export async function createDeploymentPlan(
           input.start.revisionId,
           input.start.variantKey,
         );
-        assertInteractiveCommandsSupported(variant);
         const plan = planDeployment({ ...state, variant, ...input.start, actor: requester.kind });
         // Refuse undeliverable jobs now rather than after confirmation. Apply re-renders with
         // the real identities, whose lengths these placeholders match.
+        const rendered: RenderedDeploymentRank[] = [];
         for (let group = 0; group < input.start.groupCount; group++)
-          renderDeploymentGroup(
-            variant,
-            {
-              id: "0".repeat(32),
-              revisionId: revision.id,
-              endpointSlug: `inst-${revision.Config.slug}-${"0".repeat(12)}`,
-            },
-            plan.placements.filter((p) => p.group === group),
-            state.nodes,
+          rendered.push(
+            ...renderDeploymentGroup(
+              variant,
+              {
+                id: "0".repeat(32),
+                revisionId: revision.id,
+                endpointSlug: `inst-${revision.Config.slug}-${"0".repeat(12)}`,
+              },
+              plan.placements.filter((p) => p.group === group),
+              state.nodes,
+            ),
           );
+        const operator = [
+          ...startOperatorSteps(rendered, state.nodes),
+          ...(await stopOperatorSteps(tx, plan.stopIds, state.nodes)),
+        ];
         // Commands an agent wrote are shown to a person for review before that
         // person starts them; once confirmed the jobs run as the person's, also
         // where agent commands have since been turned off.
@@ -706,7 +804,12 @@ export async function createDeploymentPlan(
           action: "start",
           start: input.start,
           requiresConfirmation: plan.requiresConfirmation || agentAuthored,
-          warnings: agentAuthored ? [...plan.warnings, AGENT_EDITED_REVISION] : plan.warnings,
+          warnings: [
+            ...plan.warnings,
+            ...(agentAuthored ? [AGENT_EDITED_REVISION] : []),
+            ...operatorWarnings(operator),
+          ],
+          ...operatorContents(operator),
         };
       } else {
         const instance = state.existing.find((i) => i.id === input.stopInstanceId);
@@ -723,6 +826,7 @@ export async function createDeploymentPlan(
           new Set(affectedNodeIds),
           state.nodes.filter((n) => instance.rankNodeIds.includes(n.id)),
         );
+        const operator = await stopOperatorSteps(tx, [instance.id], state.nodes);
         contents = {
           action: "stop",
           stopInstanceId: instance.id,
@@ -731,7 +835,8 @@ export async function createDeploymentPlan(
           placements: [],
           ...permission,
           headAddr: "",
-          warnings: [],
+          warnings: operatorWarnings(operator),
+          ...operatorContents(operator),
         };
       }
       const plan = await tx.deploymentPlan.create({
@@ -750,17 +855,115 @@ export async function createDeploymentPlan(
     { isolationLevel: "ReadCommitted", timeout: 30_000 },
   );
 }
+/** Plan warning: applying the plan opens operator terminals a person must answer. */
+const INTERACTIVE_OPERATOR_REQUIRED = "interactive_operator_required";
 /**
- * Until operator terminals ship, no job a person must run is ever dispatched: a CLI that does
- * not know the interactive fields would refuse the job, and one that ignored them would run the
- * command unattended. Saving such a recipe is allowed; starting it is not.
+ * Plan warning: a stop that needs a person runs on a node that cannot open operator terminals
+ * (now). The stop waits, its claims held, until the node can (it is never refused: an owner
+ * can always stop).
  */
-function assertInteractiveCommandsSupported(variant: DeploymentVariant) {
-  if (variantHasInteractiveCommands(variant))
-    throw new ORPCError("BAD_REQUEST", {
-      message: "Interactive recipe commands are not supported yet",
-      data: { reason: "interactive_commands_unsupported" },
+const INTERACTIVE_OPERATOR_UNAVAILABLE = "interactive_operator_unavailable";
+const PLAN_OPERATOR_STEPS_MAX = 64;
+type PlanOperatorStep = NonNullable<DeploymentPlanContents["operatorSteps"]>[number];
+type RenderedDeploymentRank = ReturnType<typeof renderDeploymentGroup>[number];
+/**
+ * The commands of the instance being started that a person runs, per rank: its interactive
+ * phases and its interactive stop. Refuses the plan when such a rank is placed on a node that
+ * cannot open operator terminals (design §12i): the start would only wait there. The check
+ * covers `interactive` and `stopInteractive` alike (IC1-2), since the stop must run later.
+ */
+function startOperatorSteps(
+  ranks: readonly RenderedDeploymentRank[],
+  nodes: readonly DeploymentNode[],
+): PlanOperatorStep[] {
+  const steps: PlanOperatorStep[] = [];
+  const missing = new Set<string>();
+  for (const { placement, steps: jobs } of ranks) {
+    const nodeReady = nodes.find((n) => n.id === placement.nodeId)?.operator === true;
+    const stop = jobs.find((job) => job.intent.stopInteractive)?.intent.stopCommand;
+    const commands = [
+      ...jobs.flatMap((job) =>
+        job.intent.interactive && job.intent.action !== "readiness"
+          ? [{ action: job.intent.action, command: job.intent.command }]
+          : [],
+      ),
+      ...(stop !== undefined ? [{ action: "stop" as const, command: stop }] : []),
+    ];
+    for (const { action, command } of commands) {
+      if (!isOperatorAction(action)) continue;
+      if (!nodeReady) missing.add(placement.nodeId);
+      steps.push({
+        instanceId: null,
+        nodeId: placement.nodeId,
+        rank: placement.rank,
+        action,
+        command,
+        nodeReady,
+      });
+    }
+  }
+  if (missing.size)
+    throw new ORPCError("PRECONDITION_FAILED", {
+      message:
+        "This recipe has commands a person runs in a terminal on the node, but these nodes cannot open operator terminals: " +
+        `${[...missing].sort().join(", ")}. On each node run \`wsmp config set-deployment-operator-terminal on\` ` +
+        "(deployments must be on and the node must support terminals), then reconnect it and plan again.",
+      data: { reason: "deployment_operator_unavailable", nodeIds: [...missing].sort() },
     });
+  return steps;
+}
+function isOperatorAction(action: string): action is PlanOperatorStep["action"] {
+  return action === "prepare" || action === "start" || action === "after_join" || action === "stop";
+}
+/**
+ * The interactive stops of the instances a plan stops (each held rank's stop replays its
+ * latest start intent). Never refused: the stop waits for its person, also on a node that
+ * cannot open operator terminals now.
+ */
+async function stopOperatorSteps(
+  tx: Tx,
+  instanceIds: readonly string[],
+  nodes: readonly DeploymentNode[],
+): Promise<PlanOperatorStep[]> {
+  if (!instanceIds.length) return [];
+  const held = await tx.deploymentInstanceNode.findMany({
+    where: { instanceId: { in: [...instanceIds] }, claimHeld: true },
+    orderBy: [{ instanceId: "asc" }, { rank: "asc" }],
+    take: 4096,
+  });
+  const steps: PlanOperatorStep[] = [];
+  for (const node of held) {
+    const start = await tx.deploymentStep.findFirst({
+      where: { instanceId: node.instanceId, rank: node.rank, phase: "start" },
+      orderBy: { createdAt: "desc" },
+      select: { intent: true },
+    });
+    const intent = start ? deploymentJobIntentSchema.safeParse(start.intent) : null;
+    if (!intent?.success || !intent.data.stopInteractive) continue;
+    steps.push({
+      instanceId: node.instanceId,
+      nodeId: node.cliDeviceId,
+      rank: node.rank,
+      action: "stop",
+      command: intent.data.stopCommand,
+      nodeReady: nodes.find((n) => n.id === node.cliDeviceId)?.operator === true,
+    });
+  }
+  return steps;
+}
+function operatorWarnings(steps: readonly PlanOperatorStep[]) {
+  return [
+    ...(steps.length ? [INTERACTIVE_OPERATOR_REQUIRED] : []),
+    ...(steps.some((step) => !step.nodeReady) ? [INTERACTIVE_OPERATOR_UNAVAILABLE] : []),
+  ];
+}
+function operatorContents(steps: readonly PlanOperatorStep[]) {
+  return steps.length
+    ? {
+        operatorSteps: steps.slice(0, PLAN_OPERATOR_STEPS_MAX),
+        operatorStepCount: steps.length,
+      }
+    : {};
 }
 /** The recipe command a phase runs, which decides whether that phase is interactive. */
 type DeploymentPhaseSource = "start" | "prepare" | "afterJoin" | null;
@@ -1085,7 +1288,6 @@ export async function applyDeploymentPlan(
           contents.start.revisionId,
           contents.start.variantKey,
         );
-        assertInteractiveCommandsSupported(variant);
         for (let group = 0; group < contents.start.groupCount; group++) {
           const id = randomUUID().replaceAll("-", "");
           const identity = {
@@ -1100,6 +1302,8 @@ export async function applyDeploymentPlan(
             contents.placements.filter((p) => p.group === group),
             state.nodes,
           );
+          // The plan's fingerprint covers node capabilities; checked again before any write.
+          startOperatorSteps(ranks, state.nodes);
           await tx.deploymentInstance.create({
             data: {
               ...identity,

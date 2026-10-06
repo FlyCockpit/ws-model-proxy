@@ -84,6 +84,7 @@ function tab(localId: string, cliDeviceId: string): TerminalTab {
     opener: false,
     origin: "user",
     supervised: null,
+    deployment: null,
     reviewOutput: null,
     reviewCapture: null,
     exitCode: null,

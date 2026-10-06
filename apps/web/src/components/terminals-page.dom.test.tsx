@@ -8,6 +8,7 @@ const state = vi.hoisted(() => ({
   openCli: vi.fn(),
   endSession: vi.fn(),
   declineRequest: vi.fn(),
+  selectTab: vi.fn(),
   tabs: [] as Array<Record<string, unknown>>,
   activeLocalId: null as string | null,
   status: "open" as "connecting" | "open" | "closed" | "unauthorized",
@@ -32,7 +33,7 @@ vi.mock("@/hooks/use-terminal-workspace", () => ({
     cliTrust: { "cli-1": { status: "trusted", fingerprint: "ABCD EFGH" } },
     tabs: state.tabs,
     activeLocalId: state.activeLocalId,
-    selectTab: () => undefined,
+    selectTab: state.selectTab,
     detachTab: () => undefined,
     endSession: state.endSession,
     declineRequest: state.declineRequest,
@@ -238,6 +239,67 @@ describe("new-terminal CLI picker", () => {
     openPicker();
     const search = screen.getByPlaceholderText("dashboard:terminals.cliSearch") as HTMLInputElement;
     expect(search.value).toBe("");
+  });
+});
+
+describe("deployment step tabs", () => {
+  function deploymentTab(state: "awaiting" | "running", phase = "waiting") {
+    return {
+      localId: "local-d",
+      terminalId: "term-d",
+      cliDeviceId: "cli-1",
+      cols: 80,
+      rows: 24,
+      phase,
+      approvalCode: null,
+      rejectionReason: null,
+      error: null,
+      viewerId: null,
+      writer: "none",
+      viewerCount: 0,
+      ptyCols: null,
+      ptyRows: null,
+      opener: false,
+      origin: "deployment",
+      supervised: null,
+      deployment: { stepId: "s", instanceId: "i", rank: 1, action: "stop", state },
+      reviewOutput: null,
+      reviewCapture: null,
+      exitCode: null,
+      exitSignal: null,
+      decline: null,
+      ending: null,
+    };
+  }
+
+  it("labels the step, offers View while waiting, and closes it as a step, not a shell", () => {
+    state.tabs = [deploymentTab("awaiting")];
+    state.activeLocalId = "local-d";
+    render(<TerminalWorkspaceView visible />);
+    expect(screen.getByText("dashboard:deploymentOperator.tabLabel")).toBeTruthy();
+    expect(screen.getByText("dashboard:deploymentOperator.panelTitle")).toBeTruthy();
+    expect(screen.getByText("dashboard:deploymentOperator.panelAwaiting")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:deploymentOperator.view" }));
+    expect(state.selectTab).toHaveBeenCalledWith("local-d");
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:terminals.actions" }));
+    fireEvent.click(screen.getByText("dashboard:deploymentOperator.closeStep"));
+    expect(screen.getByText("dashboard:deploymentOperator.closeStepDescription")).toBeTruthy();
+  });
+
+  it("warns that closing a running step's terminal stops its command", () => {
+    state.tabs = [deploymentTab("running", "live")];
+    state.activeLocalId = "local-d";
+    render(<TerminalWorkspaceView visible />);
+    expect(screen.getByText("dashboard:deploymentOperator.panelRunning")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "dashboard:terminals.actions" }));
+    fireEvent.click(screen.getByText("dashboard:deploymentOperator.closeStep"));
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog.textContent).toContain("dashboard:deploymentOperator.closeRunningDescription");
+    const confirm = [...dialog.querySelectorAll("button")].find(
+      (button) => button.textContent === "dashboard:deploymentOperator.closeStep",
+    );
+    fireEvent.click(confirm as HTMLElement);
+    expect(state.endSession).toHaveBeenCalledWith("local-d");
   });
 });
 

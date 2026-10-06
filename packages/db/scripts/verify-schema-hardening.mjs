@@ -732,6 +732,22 @@ async function verifyDeploymentOperatorHardening() {
     await expectConstraintFailure(statement);
     negatives += 1;
   };
+  // A hold reason only on a PENDING step, only a known code; leaving PENDING clears it.
+  await refuse(`UPDATE deployment_step SET "operatorHold" = 'whatever' WHERE id = 'op-plain'`);
+  await client.query(
+    `UPDATE deployment_step SET "operatorHold" = 'operator_capability_missing' WHERE id = 'op-plain'`,
+  );
+  await client.query(
+    `UPDATE deployment_step SET state = 'FAILED', "errorCode" = 'held' WHERE id = 'op-plain'`,
+  );
+  const unheld = (
+    await client.query(`SELECT "operatorHold" FROM deployment_step WHERE id = 'op-plain'`)
+  ).rows[0];
+  if (unheld?.operatorHold !== null) throw new Error("leaving PENDING keeps operatorHold");
+  await refuse(
+    `UPDATE deployment_step SET "operatorHold" = 'operator_node_full' WHERE id = 'op-plain'`,
+  );
+  positives += 1;
   // Resources released without proof of a stop (held unknown): never with a held claim;
   // retaking the claim clears the mark.
   await refuse(`UPDATE deployment_instance_node SET "claimHeld" = true, "stoppedAt" = NULL,

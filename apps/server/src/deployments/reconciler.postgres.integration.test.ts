@@ -26,6 +26,8 @@ let reopenDeploymentOperatorStep: DeploymentService["reopenDeploymentOperatorSte
 let restartDeploymentInstance: DeploymentService["restartDeploymentInstance"];
 let DeploymentReconciler: typeof import("./reconciler.js").DeploymentReconciler;
 let flushDeploymentOperatorAudit: typeof import("./operator-audit.js").flushDeploymentOperatorAudit;
+let createDeploymentPlan: DeploymentService["createDeploymentPlan"];
+let applyDeploymentPlan: DeploymentService["applyDeploymentPlan"];
 
 integration("deployment result fencing at PostgreSQL", () => {
   let fixture: ReturnType<typeof createFixturePrismaClient>;
@@ -346,8 +348,13 @@ integration("interactive operator steps at PostgreSQL", () => {
     production = createPrismaClient(databaseUrl);
     ({ DeploymentReconciler } = await import("./reconciler.js"));
     ({ flushDeploymentOperatorAudit } = await import("./operator-audit.js"));
-    ({ loadDeploymentState, reopenDeploymentOperatorStep, restartDeploymentInstance } =
-      await import("@ws-model-proxy/api/lib/deployment-service"));
+    ({
+      loadDeploymentState,
+      reopenDeploymentOperatorStep,
+      restartDeploymentInstance,
+      createDeploymentPlan,
+      applyDeploymentPlan,
+    } = await import("@ws-model-proxy/api/lib/deployment-service"));
   });
   afterAll(async () => {
     for (const reconciler of reconcilers) await reconciler.stop();
@@ -1951,13 +1958,28 @@ integration("interactive operator steps at PostgreSQL", () => {
       where: { id: s.instance.id },
       data: { desiredState: "RUNNING", observedState: "STOPPED" },
     });
-    const h = harness([{ ...socketFor(user.id, device.id), deploymentOperator: false }]);
+    const socket = socketFor(user.id, device.id);
+    const h = harness([{ ...socket, deploymentOperator: false }]);
     const probe = async () =>
       fixture.deploymentStep.findFirst({
         where: { instanceId: s.instance.id, phase: "stop", sequence: { gte: 5000 } },
       });
     await h.tickUntil(async () => (await probe())?.errorCode === "operator_capability_missing");
-    expect(await probe()).toMatchObject({ state: "PENDING" });
+    expect(await probe()).toMatchObject({
+      state: "PENDING",
+      operatorHold: "operator_capability_missing",
+    });
+    // The held check needs its person first (turn on the node's operator terminal): STEP, not
+    // RESTART (security review L1), so a restart is refused.
+    expect(await need(s.instance.id)).toBe("STEP");
+    await expect(
+      restartDeploymentInstance(user.id, s.instance.id, production),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    expect(h.jobs).toEqual([]);
+    // The node can open terminals: the check goes, the need is RESTART again, and a restart
+    // still waits for the check instead of clearing the need.
+    h.live.set(device.id, socket);
+    await h.tickUntil(() => h.jobs.length > 0);
     expect(await need(s.instance.id)).toBe("RESTART");
     await expect(
       restartDeploymentInstance(user.id, s.instance.id, production),
@@ -1966,7 +1988,6 @@ integration("interactive operator steps at PostgreSQL", () => {
       needsOperator: "RESTART",
       nextRestartAt: null,
     });
-    expect(h.jobs).toEqual([]);
   }, 30_000);
 
   it("deleting the device clears its held-unknown resources", async () => {
@@ -1984,5 +2005,151 @@ integration("interactive operator steps at PostgreSQL", () => {
     expect((await production.$transaction((tx) => loadDeploymentState(tx, user.id))).held).toEqual(
       [],
     );
+  }, 30_000);
+
+  // ---- Chunk 9: the planner lifts the interactive refusal behind the capability gate ----
+
+  it("plans and starts an interactive recipe only on a node that can open operator terminals", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    // Only the recipe (config, revision, pool) of this fixture is used; its own instance is
+    // stopped and released so the node is free.
+    const recipe = await instance(user.id, [device.id], { stopInteractive: true, stopping: true });
+    await fixture.deploymentStep.updateMany({
+      where: { instanceId: recipe.instance.id, phase: "stop" },
+      data: { state: "FAILED", errorCode: "fixture" },
+    });
+    await fixture.deploymentInstanceNode.updateMany({
+      where: { instanceId: recipe.instance.id },
+      data: { claimHeld: false, stoppedAt: new Date() },
+    });
+    await fixture.deploymentInstance.update({
+      where: { id: recipe.instance.id },
+      data: { observedState: "STOPPED" },
+    });
+    const requester = { userId: user.id, id: user.id, kind: "USER" as const };
+    const start = { revisionId: recipe.instance.revisionId, variantKey: "one", groupCount: 1 };
+    await expect(createDeploymentPlan(requester, { start })).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+      data: { reason: "deployment_operator_unavailable", nodeIds: [device.id] },
+    });
+    await fixture.cliDevice.update({
+      where: { id: device.id },
+      data: { reportedDeploymentOperator: true, reportedTerminalSupported: true },
+    });
+    const plan = await createDeploymentPlan(requester, { start });
+    expect(plan.contents).toMatchObject({
+      warnings: ["interactive_operator_required"],
+      operatorSteps: [
+        { instanceId: null, nodeId: device.id, action: "start", nodeReady: true },
+        { instanceId: null, nodeId: device.id, action: "stop", nodeReady: true },
+      ],
+    });
+    await applyDeploymentPlan(requester, plan.id, false);
+    const started = await fixture.deploymentInstance.findFirstOrThrow({
+      where: { userId: user.id, id: { not: recipe.instance.id } },
+    });
+    const h = harness([socketFor(user.id, device.id)]);
+    await h.tickUntil(() => h.jobs.length > 0);
+    expect(h.jobs[0]).toMatchObject({
+      instanceId: started.id,
+      action: "start",
+      interactive: true,
+      stopInteractive: true,
+    });
+    expect(h.jobs[0]!.operator?.commandAuthor).toBe("user");
+  }, 30_000);
+
+  // ---- Chunk 10: "needs you" email notices ----
+
+  it("emails a settled need once, in the owner's locale, and only to an active verified owner", async () => {
+    const { notifyDeploymentOperatorNeeds } = await import(
+      "@ws-model-proxy/api/lib/deployment-operator-notify"
+    );
+    const user = await owner();
+    await fixture.user.update({
+      where: { id: user.id },
+      data: { emailVerified: true, locale: "es-MX" },
+    });
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id]);
+    const since = new Date(Date.now() - 10 * 60_000);
+    await fixture.deploymentInstance.update({
+      where: { id: s.instance.id },
+      data: { needsOperator: "STEP", needsOperatorSince: since },
+    });
+    const sent: Array<{ to: string; subject: string; html: string }> = [];
+    const send = async (message: { to: string; subject: string; html: string }) => {
+      sent.push(message);
+    };
+    const notify = () => notifyDeploymentOperatorNeeds({ db: production, send, configured: true });
+    const before = (await inst(s.instance.id)).updatedAt;
+    await notify();
+    // The claim keeps updatedAt: the offline grace and maintenance order are not reset.
+    expect((await inst(s.instance.id)).updatedAt).toEqual(before);
+    const mine = () => sent.filter((message) => message.to === user.email);
+    expect(mine()).toHaveLength(1);
+    expect(mine()[0]?.subject).toBe("Un despliegue te necesita");
+    expect(mine()[0]?.html).toContain(s.instance.endpointSlug);
+    // Claimed: a second sweep (or another replica) sends nothing more.
+    await notify();
+    expect(mine()).toHaveLength(1);
+    expect((await inst(s.instance.id)).needsOperatorNotifiedAt?.getTime()).toBeGreaterThan(
+      since.getTime(),
+    );
+    // A banned owner gets nothing, even for a fresh need.
+    const other = await instance(user.id, [device.id], { port: 30900 });
+    await fixture.deploymentInstance.update({
+      where: { id: other.instance.id },
+      data: { needsOperator: "STEP", needsOperatorSince: since },
+    });
+    await fixture.user.update({ where: { id: user.id }, data: { banned: true } });
+    await notify();
+    expect(mine()).toHaveLength(1);
+  }, 30_000);
+
+  // ---- Security review L1: a step held before its terminal can open needs its person ----
+
+  it("an automatic stop held for a node without the capability raises needs-you and keeps its reason", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id], { stopInteractive: true, stopping: true });
+    const stopId = s.stops[0]!.id;
+    await fixture.deploymentStep.update({
+      where: { id: stopId },
+      data: { errorCode: "node_offline" },
+    });
+    const socket = socketFor(user.id, device.id);
+    const h = harness([{ ...socket, deploymentOperator: false }]);
+    await h.tickUntil(async () => (await need(s.instance.id)) === "STEP");
+    expect(await step(stopId)).toMatchObject({
+      state: "PENDING",
+      operatorHold: "operator_capability_missing",
+      // The gang-stop reason stays.
+      errorCode: "node_offline",
+    });
+    expect(h.jobs).toEqual([]);
+    // The node can open terminals again: the claim clears the hold, and the need follows.
+    h.live.set(device.id, socket);
+    await h.tickUntil(() => h.jobs.some((job) => job.stepId === stopId));
+    expect(await step(stopId)).toMatchObject({ state: "RUNNING", operatorHold: null });
+    expect(await need(s.instance.id)).toBeNull();
+  }, 30_000);
+
+  it("a new need starts its email notice over: the failure count resets (N2)", async () => {
+    const user = await owner();
+    const device = await node(user.id);
+    const s = await instance(user.id, [device.id]);
+    await fixture.deploymentInstance.update({
+      where: { id: s.instance.id },
+      data: { needsOperatorNotifyFailures: 1 },
+    });
+    const h = harness([socketFor(user.id, device.id)]);
+    await h.tickUntil(() => h.jobs.length > 0);
+    expect(await h.report(h.jobs[0]!, "awaiting_operator")).toBe(true);
+    expect(await inst(s.instance.id)).toMatchObject({
+      needsOperator: "STEP",
+      needsOperatorNotifyFailures: 0,
+    });
   }, 30_000);
 });

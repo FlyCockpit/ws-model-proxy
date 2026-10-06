@@ -127,37 +127,44 @@ model DeploymentRun {
 }
 
 model DeploymentInstance {
-  id                         String                   @id @default(cuid(2))
-  userId                     String
-  configId                   String
-  revisionId                 String
-  runId                      String
-  variantKey                 String
-  endpointSlug               String
-  createdAt                  DateTime                 @default(now())
-  updatedAt                  DateTime                 @default(now()) @updatedAt
-  desiredState               DeploymentDesiredState   @default(RUNNING)
-  observedState              DeploymentObservedState  @default(PENDING)
-  startedBy                  DeploymentActor
-  agentsMayPreempt           Boolean                  @default(false)
-  restartAttempts            Int                      @default(0)
-  nextRestartAt              DateTime?
-  healthFailures             Int                      @default(0)
-  healthSuccesses            Int                      @default(0)
-  lastHealthAt               DateTime?
+  id                          String                   @id @default(cuid(2))
+  userId                      String
+  configId                    String
+  revisionId                  String
+  runId                       String
+  variantKey                  String
+  endpointSlug                String
+  createdAt                   DateTime                 @default(now())
+  updatedAt                   DateTime                 @default(now()) @updatedAt
+  desiredState                DeploymentDesiredState   @default(RUNNING)
+  observedState               DeploymentObservedState  @default(PENDING)
+  startedBy                   DeploymentActor
+  agentsMayPreempt            Boolean                  @default(false)
+  restartAttempts             Int                      @default(0)
+  nextRestartAt               DateTime?
+  healthFailures              Int                      @default(0)
+  healthSuccesses             Int                      @default(0)
+  lastHealthAt                DateTime?
   /// Set (with `needsOperatorSince`) while the instance waits for a person; see
   /// DeploymentOperatorNeed. RESTART only with desired RUNNING and observed STOPPED/FAILED.
-  needsOperator              DeploymentOperatorNeed?
-  needsOperatorSince         DateTime?
+  needsOperator               DeploymentOperatorNeed?
+  needsOperatorSince          DateTime?
   /// When a person last asked for a restart of an interactive start.
-  operatorRestartRequestedAt DateTime?
-  User                       User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  Config                     DeploymentConfig         @relation(fields: [configId], references: [id], onDelete: Restrict)
-  Revision                   DeploymentConfigRevision @relation(fields: [revisionId], references: [id], onDelete: Restrict)
-  Run                        DeploymentRun            @relation(fields: [runId], references: [id], onDelete: Restrict)
-  Nodes                      DeploymentInstanceNode[]
-  Steps                      DeploymentStep[]
-  Endpoint                   Endpoint?
+  operatorRestartRequestedAt  DateTime?
+  /// When the owner was last emailed that this instance needs them (SMTP configured only).
+  /// Claimed with a guarded update so one replica sends each notice.
+  needsOperatorNotifiedAt     DateTime?
+  /// Failed sends of the current notice: the first failure is retried once soon, a second
+  /// falls back to the regular interval (no repeated mail when a send was delivered but
+  /// reported as failed).
+  needsOperatorNotifyFailures Int                      @default(0)
+  User                        User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  Config                      DeploymentConfig         @relation(fields: [configId], references: [id], onDelete: Restrict)
+  Revision                    DeploymentConfigRevision @relation(fields: [revisionId], references: [id], onDelete: Restrict)
+  Run                         DeploymentRun            @relation(fields: [runId], references: [id], onDelete: Restrict)
+  Nodes                       DeploymentInstanceNode[]
+  Steps                       DeploymentStep[]
+  Endpoint                    Endpoint?
 
   @@unique([userId, endpointSlug])
   @@index([userId, desiredState, observedState])
@@ -220,6 +227,11 @@ model DeploymentStep {
   operatorAcceptedAt DateTime?
   /// Exit code of the last command run in the operator terminal.
   operatorLastExit   Int?
+  /// Why a PENDING interactive step cannot open its terminal yet (operator_capability_missing,
+  /// operator_session_full, operator_node_full): it needs its person (`needsOperator=STEP`).
+  /// Kept apart from `errorCode`, which keeps a stop's gang-stop reason. PENDING only
+  /// (schema-hardening.sql clears a carried-over value when the step leaves PENDING).
+  operatorHold       String?
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @default(now()) @updatedAt
   Run                DeploymentRun       @relation(fields: [runId], references: [id], onDelete: Restrict)

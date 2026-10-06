@@ -628,8 +628,7 @@ fn check_shutdown() -> Result<()> {
 }
 
 pub fn connect_foreground() -> Result<()> {
-    // First, before any thread exists, so every thread inherits the blocked
-    // shutdown signals and only the watcher thread takes them.
+    // First, so a stop that lands during startup still unwinds cleanly.
     crate::shutdown::install()?;
     let mut config = Config::load_required()?;
     config.validate()?;
@@ -1434,12 +1433,7 @@ fn run_relay_session(
                 .map_err(|error| websocket_session_error(error, "sending relay pong", true)),
             Ok(Message::Pong(_)) => Ok(()),
             Ok(Message::Frame(_)) => Ok(()),
-            Err(tungstenite::Error::Io(err))
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                Ok(())
-            }
+            Err(tungstenite::Error::Io(err)) if read_poll_woke(&err) => Ok(()),
             Err(err) => Err(websocket_session_error(
                 err,
                 "reading relay websocket",
@@ -1502,6 +1496,7 @@ fn run_relay_session(
     // The server fails these sessions itself when the relay drops.
     stt.abort_all();
     abort_all_workers(workers);
+    let result = settle_after_shutdown(result, crate::shutdown::requested());
     if matches!(result, Err(RelaySessionError::Shutdown(_))) {
         // The connection is still open: say goodbye so the server marks the
         // CLI offline now instead of waiting for a heartbeat timeout. The
@@ -1510,9 +1505,45 @@ fn run_relay_session(
             code: tungstenite::protocol::frame::coding::CloseCode::Away,
             reason: "cli shutting down".into(),
         }));
-        let _ = socket.flush();
+        flush_through_interrupts(&mut socket);
     }
     result
+}
+
+/// A session that failed after a shutdown signal arrived still ends as a
+/// shutdown. The signal itself can cause the failure: a relay write blocked
+/// under the socket's send timeout returns `EINTR` when the handler runs on
+/// this thread, which would otherwise read as a lost connection and skip the
+/// goodbye close frame.
+fn settle_after_shutdown<T>(
+    result: RelaySessionResult<T>,
+    requested: Option<i32>,
+) -> RelaySessionResult<T> {
+    match (result, requested) {
+        (
+            Err(RelaySessionError::Reconnectable { error, .. } | RelaySessionError::Fatal(error)),
+            Some(signal),
+        ) => {
+            tracing::debug!(
+                error = %format!("{error:#}"),
+                signal,
+                "relay session error after a shutdown signal; stopping as shut down"
+            );
+            Err(RelaySessionError::Shutdown(signal))
+        }
+        (result, _) => result,
+    }
+}
+
+/// Flush the queued close frame, retrying a write a signal interrupted
+/// (bounded, so a peer that keeps failing cannot hold the shutdown).
+fn flush_through_interrupts<S: io::Read + io::Write>(socket: &mut tungstenite::WebSocket<S>) {
+    for _ in 0..8 {
+        match socket.flush() {
+            Err(tungstenite::Error::Io(error)) if error.kind() == io::ErrorKind::Interrupted => {}
+            _ => return,
+        }
+    }
 }
 
 /// Mark every in-flight worker cancelled and drop their handles. Dropping each
@@ -3930,9 +3961,7 @@ where
                     reset_backoff: false,
                 });
             }
-            Err(tungstenite::Error::Io(err))
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(tungstenite::Error::Io(err)) if read_poll_woke(&err) => {}
             Err(err) => {
                 return Err(websocket_session_error(
                     err,
@@ -4039,6 +4068,19 @@ fn inventory_from_config(config: &mut Config) -> Vec<EndpointInventory> {
         }
     }
     inventory_snapshot_from_config(config)
+}
+
+/// A relay socket read that returned without data and can simply be retried:
+/// the poll timeout set by [`set_socket_timeouts`], or a shutdown signal
+/// that landed on this thread (`EINTR`; a socket timeout keeps the read from
+/// restarting). The loop then checks for shutdown as after a timeout.
+fn read_poll_woke(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::Interrupted
+    )
 }
 
 fn set_socket_timeouts(
@@ -4625,6 +4667,87 @@ mod tests {
             tungstenite::protocol::Role::Client,
             None,
         )
+    }
+
+    /// Fails the first `interrupts` writes with `EINTR`, as a write blocked
+    /// under a send timeout does when a signal handler runs on the thread.
+    struct InterruptedStream {
+        interrupts: usize,
+        written: Vec<u8>,
+    }
+
+    impl io::Read for InterruptedStream {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl io::Write for InterruptedStream {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.interrupts > 0 {
+                self.interrupts -= 1;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn session_errors_after_a_shutdown_signal_end_as_shutdown() {
+        let interrupted = || RelaySessionError::Reconnectable {
+            error: anyhow::Error::new(io::Error::from(io::ErrorKind::Interrupted)),
+            reset_backoff: true,
+        };
+        assert!(matches!(
+            settle_after_shutdown::<()>(Err(interrupted()), Some(15)),
+            Err(RelaySessionError::Shutdown(15))
+        ));
+        assert!(matches!(
+            settle_after_shutdown::<()>(
+                Err(RelaySessionError::Fatal(anyhow::anyhow!("x"))),
+                Some(2)
+            ),
+            Err(RelaySessionError::Shutdown(2))
+        ));
+        assert!(matches!(
+            settle_after_shutdown::<()>(Err(interrupted()), None),
+            Err(RelaySessionError::Reconnectable { .. })
+        ));
+        assert!(matches!(
+            settle_after_shutdown::<()>(Err(RelaySessionError::Shutdown(1)), Some(15)),
+            Err(RelaySessionError::Shutdown(1))
+        ));
+        assert!(settle_after_shutdown(Ok(()), Some(15)).is_ok());
+    }
+
+    #[test]
+    fn the_goodbye_close_frame_survives_interrupted_writes() {
+        let mut socket = tungstenite::WebSocket::from_raw_socket(
+            InterruptedStream {
+                interrupts: 2,
+                written: Vec::new(),
+            },
+            // Server role: frames are unmasked, so the reason can be read back.
+            tungstenite::protocol::Role::Server,
+            None,
+        );
+        let _ = socket.close(Some(tungstenite::protocol::CloseFrame {
+            code: tungstenite::protocol::frame::coding::CloseCode::Away,
+            reason: "cli shutting down".into(),
+        }));
+        flush_through_interrupts(&mut socket);
+        let written = &socket.get_ref().written;
+        assert_eq!(written.first(), Some(&0x88), "a close frame was written");
+        assert!(
+            written
+                .windows(b"cli shutting down".len())
+                .any(|window| window == b"cli shutting down".as_slice()),
+            "the close frame was written whole"
+        );
     }
 
     #[test]
