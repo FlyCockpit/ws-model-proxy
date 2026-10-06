@@ -66,6 +66,11 @@ use crate::terminal_crypto::{
     self, DIR_BROWSER_TO_CLI, DIR_CLI_TO_BROWSER, DirectionKeys, TermPlaintextV2,
 };
 
+mod operator;
+pub(crate) use operator::OperatorDelivery;
+#[cfg(unix)]
+pub(crate) use operator::operator_base_env;
+
 /// Attached viewers plus pending approvals, per terminal (protocol 2.5).
 const MAX_VIEWERS: usize = 8;
 const MAX_EXECS: usize = 8;
@@ -1163,6 +1168,9 @@ struct TerminalSession {
     scrollback: VecDeque<u8>,
     #[cfg(unix)]
     pty: Option<PtyRuntime>,
+    /// Set iff this is the operator terminal of an interactive runtime step
+    /// (`operator`): no PTY until a person accepts on the confirm screen.
+    operator: Option<operator::OperatorState>,
 }
 
 impl TerminalSession {
@@ -1379,6 +1387,9 @@ pub(crate) struct TerminalRegistry {
     shut_down: bool,
     #[cfg(unix)]
     shell: Option<(String, Vec<String>)>,
+    /// Operator terminals submitted to a runner thread and not yet opened, and
+    /// every operator terminal id this session took (ids are never reused).
+    operators: operator::OperatorBook,
 }
 
 /// A wire exit code (`0..=255`); a status outside it is not reported.
@@ -1410,11 +1421,16 @@ impl TerminalRegistry {
             shut_down: false,
             #[cfg(unix)]
             shell: None,
+            operators: operator::OperatorBook::default(),
         }
     }
 
+    /// Browser shells only: operator terminals have their own cap.
     fn human_count(&self) -> usize {
-        self.sessions.len()
+        self.sessions
+            .values()
+            .filter(|session| session.operator.is_none())
+            .count()
     }
 
     /// A registry with a test shell.
@@ -1590,6 +1606,7 @@ impl TerminalRegistry {
             detached_at: None,
             scrollback: VecDeque::new(),
             pty: Some(pty),
+            operator: None,
         };
         let mut frames = vec![OutboundFrame::Control(NodeFrame::TermOpened {
             terminal_id: terminal_id.to_string(),
@@ -1614,8 +1631,11 @@ impl TerminalRegistry {
         let Some(session) = self.sessions.get(terminal_id) else {
             return vec![*handshake_rejected(&handshake, REASON_NOT_FOUND)];
         };
-        // Browser terminals need the local switch and Full control.
-        let allowed = startup.allow_human_terminal() && startup.full_control();
+        // Browser terminals need the local switch and Full control. An
+        // operator terminal (one a received `runtime.job.operator` named) is
+        // attachable at every trust level (spec §4.4, §4.7).
+        let allowed = session.operator.is_some()
+            || (startup.allow_human_terminal() && startup.full_control());
         if !allowed || !terminal_supported() {
             return vec![*handshake_rejected(
                 &handshake,
@@ -1673,6 +1693,18 @@ impl TerminalRegistry {
         let Some(pending) = self.pending.get(&key) else {
             return Vec::new();
         };
+        // Only a join to an operator terminal is allowed below Full control;
+        // anything else needs the browser-terminal switch and Full control now,
+        // not just when it was queued.
+        let operator_join = pending.attach
+            && self
+                .sessions
+                .get(terminal_id)
+                .is_some_and(|session| session.operator.is_some());
+        if !operator_join && !(startup.allow_human_terminal() && startup.full_control()) {
+            self.pending.remove(&key);
+            return vec![term_rejected(terminal_id, viewer_id, REASON_DISABLED, None)];
+        }
         if !approval_signature_ok(
             &pending.identity,
             signature,
@@ -1842,6 +1874,8 @@ impl TerminalRegistry {
             cli_nonce: terminal_crypto::encode_b64url(&cli_nonce),
         })];
         frames.extend(session.join_frames(terminal_id, viewer_key));
+        // An operator terminal still on its confirm screen shows it.
+        frames.extend(session.confirm_screen_for(terminal_id, viewer_key));
         frames
     }
 
@@ -1917,20 +1951,22 @@ impl TerminalRegistry {
 
     /// End the terminal now.
     pub(crate) fn close(&mut self, terminal_id: &str) -> Vec<OutboundFrame> {
-        let Some(session) = self.sessions.remove(terminal_id) else {
+        let Some(mut session) = self.sessions.remove(terminal_id) else {
             return Vec::new();
         };
         #[cfg(unix)]
-        let status = {
-            let mut session = session;
-            session.pty.take().map(shutdown_pty).unwrap_or((None, None))
+        let (ran, status) = match session.pty.take() {
+            Some(pty) => (true, shutdown_pty(pty)),
+            None => (false, (None, None)),
         };
         #[cfg(not(unix))]
-        let status = {
-            drop(session);
-            (None, None)
-        };
-        vec![term_exit(terminal_id, status)]
+        let (ran, status) = (false, (None, None));
+        let mut frames = vec![term_exit(terminal_id, status)];
+        // An operator terminal answers for its step after its exit.
+        if let Some(state) = session.operator.take() {
+            frames.extend(state.ended(ran, status));
+        }
+        frames
     }
 
     pub(crate) fn handle_sealed(
@@ -1956,6 +1992,15 @@ impl TerminalRegistry {
             session.decode_incoming(terminal_id, &viewer_key, seq, body)
         };
         match action {
+            Incoming::Write(bytes)
+                if self
+                    .sessions
+                    .get(terminal_id)
+                    .is_some_and(TerminalSession::confirming) =>
+            {
+                // The confirm screen reads keys itself; nothing reaches a process.
+                self.confirm_input(terminal_id, &viewer_key, &bytes)
+            }
             Incoming::Write(bytes) => {
                 // Input after the shell exited is dropped here for good.
                 if !self
@@ -2081,10 +2126,13 @@ impl TerminalRegistry {
         let Some(session) = self.sessions.get_mut(terminal_id) else {
             return Ok(Vec::new());
         };
-        Ok(session
+        let mut frames: Vec<OutboundFrame> = session
             .seal_broadcast(terminal_id, &TermPlaintextV2::Resize { cols, rows })
             .into_iter()
-            .collect())
+            .collect();
+        // A confirm screen is laid out again for the new width.
+        frames.extend(session.confirm_repaint(terminal_id));
+        Ok(frames)
     }
 
     /// PTY output: recorded in the scrollback, sealed for the viewers.
@@ -2131,7 +2179,9 @@ impl TerminalRegistry {
             .sessions
             .iter()
             .filter(|(_, session)| {
-                session.viewers.is_empty()
+                // An operator step may wait for its person indefinitely.
+                session.operator.is_none()
+                    && session.viewers.is_empty()
                     && session.detached_at.is_some_and(|detached| {
                         now.saturating_duration_since(detached) >= self.idle_limit
                     })
@@ -2233,6 +2283,11 @@ impl TerminalRegistry {
         let Some(session) = self.sessions.get_mut(terminal_id) else {
             return Err(std::io::Error::other("terminal is closed"));
         };
+        if session.confirming() {
+            // No PTY yet: the size waits for the command's PTY.
+            session.pty_size = (cols, rows);
+            return Ok(());
+        }
         let Some(pty) = session.pty.as_mut() else {
             return Err(std::io::Error::other("terminal is closed"));
         };
@@ -5514,6 +5569,9 @@ mod tests {
 
     #[cfg(unix)]
     mod output_mask_tests;
+
+    #[cfg(unix)]
+    mod operator_tests;
 
     /// The `command operation` info lines as `(op, command_id, outcome)`.
     /// The default formatter writes the message last, then the fields in the

@@ -241,6 +241,76 @@ struct State {
     records: BTreeMap<String, Record>,
 }
 
+/// The code a failed step answers: an explicit [`Fail`], else the phase's
+/// default.
+fn failure_code(job: &Job, error: &anyhow::Error) -> JobError {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<Fail>().map(|fail| fail.0))
+        .unwrap_or(match job.action {
+            JobPhase::Prepare | JobPhase::Start | JobPhase::AfterJoin => {
+                if job.management() == Management::Process {
+                    JobError::OwnedLaunchUnconfirmed
+                } else {
+                    JobError::LaunchUnconfirmed
+                }
+            }
+            JobPhase::Readiness => JobError::ReadinessFailed,
+            JobPhase::Health | JobPhase::Status => JobError::HealthFailed,
+            JobPhase::Stop => JobError::CommandFailed,
+        })
+}
+
+/// A new launch may change the version (a restart), but only while nothing
+/// of the old one runs.
+fn same_instance(record: &Record, job: &Job) -> Result<()> {
+    anyhow::ensure!(
+        record.job.identity_matches(job)
+            || (matches!(job.action, JobPhase::Prepare | JobPhase::Start)
+                && record.invocations.is_empty()),
+        "instance identity changed"
+    );
+    Ok(())
+}
+
+/// What `execute` would refuse for `job` against an existing record, short
+/// of running anything: another instance identity, the same step with
+/// another intent, a start that already launched, or another step still
+/// unresolved. An operator step is checked before its person can run it.
+fn admissible(record: &Record, job: &Job) -> Result<()> {
+    same_instance(record, job)?;
+    if let Some(done) = record.completed.get(&job.step_id) {
+        anyhow::ensure!(done.hash == job.intent_hash, "step intent changed");
+    }
+    if let Some(pending) = &record.pending {
+        anyhow::ensure!(
+            (pending.step_id == job.step_id && pending.intent_hash == job.intent_hash)
+                || job.action == JobPhase::Stop
+                || matches!(
+                    pending.action,
+                    JobPhase::Readiness | JobPhase::Health | JobPhase::Status
+                ),
+            "another step is unresolved"
+        );
+    }
+    if matches!(job.action, JobPhase::Start | JobPhase::AfterJoin) {
+        anyhow::ensure!(
+            !record.invocations.contains_key(&phase_unit(job)),
+            "instance is already launched"
+        );
+    }
+    Ok(())
+}
+
+/// What a record looked like before an operator step was recorded pending.
+#[derive(Debug)]
+pub struct OperatorMark {
+    created: bool,
+    phase: InstancePhase,
+    pending: Option<Job>,
+    job: Job,
+}
+
 /// Executes the steps of one instance rank (one state file).
 pub struct Executor {
     path: PathBuf,
@@ -343,6 +413,121 @@ impl Executor {
             .map(|record| record.job.clone())
     }
 
+    /// The recorded outcome of this exact step, when it already finished (a
+    /// re-delivery answers it without running anything).
+    pub fn done(&self, job: &Job) -> Option<Outcome> {
+        self.state
+            .records
+            .get(&job.key())
+            .and_then(|record| record.completed.get(&job.step_id))
+            .filter(|done| done.hash == job.intent_hash)
+            .map(|done| done.outcome.clone())
+    }
+
+    /// Durable intent before an operator terminal opens: the step is
+    /// recorded pending (fsynced) before a person can run anything, so a
+    /// crash during the run leaves a record that a re-dispatch observes
+    /// (status first, then the adopt path) instead of replaying blind.
+    /// Returns what [`Executor::abandon_operator`] restores.
+    pub fn begin_operator(&mut self, job: &Job) -> std::result::Result<OperatorMark, JobError> {
+        let key = job.key();
+        let mark = match self.state.records.get_mut(&key) {
+            Some(record) => {
+                // Refused exactly as `execute` would refuse it, before a
+                // person can run anything.
+                if let Err(error) = admissible(record, job) {
+                    let code = failure_code(job, &error);
+                    tracing::warn!(step_id = job.step_id, error = ?code, "refused an operator step");
+                    return Err(code);
+                }
+                let mark = OperatorMark {
+                    created: false,
+                    phase: record.phase,
+                    pending: record.pending.clone(),
+                    job: record.job.clone(),
+                };
+                if matches!(job.action, JobPhase::Prepare | JobPhase::Start)
+                    && record.invocations.is_empty()
+                {
+                    record.job = job.clone();
+                }
+                record.pending = Some(job.clone());
+                record.phase = if job.action == JobPhase::Stop {
+                    InstancePhase::Stopping
+                } else {
+                    InstancePhase::Starting
+                };
+                mark
+            }
+            None => {
+                if job.action == JobPhase::Stop {
+                    return Err(JobError::InstanceUnknown);
+                }
+                self.state.records.insert(
+                    key.clone(),
+                    Record {
+                        job: job.clone(),
+                        phase: InstancePhase::Starting,
+                        invocations: BTreeMap::new(),
+                        pending: Some(job.clone()),
+                        completed: BTreeMap::new(),
+                        observed_step: job.step_id.clone(),
+                        observed_hash: job.intent_hash.clone(),
+                        consecutive_health_failures: 0,
+                        consecutive_health_successes: 0,
+                        stopped_at: None,
+                    },
+                );
+                OperatorMark {
+                    created: true,
+                    phase: InstancePhase::Unknown,
+                    pending: None,
+                    job: job.clone(),
+                }
+            }
+        };
+        if let Err(error) = self.persist() {
+            tracing::warn!(error = %format!("{error:#}"), "recording an operator step failed");
+            self.abandon_operator(job, mark, false);
+            return Err(JobError::LocalConfigUnavailable);
+        }
+        Ok(mark)
+    }
+
+    /// The operator terminal ended without the command succeeding: nothing
+    /// is left pending for this step, so a fresh dispatch (a reopen) runs.
+    ///
+    /// `ran`: a person pressed Enter, so the command ran (it failed or was
+    /// killed). The record then stays, unresolved (`Unknown`), so a later
+    /// stop tears down and proves what it may have left; only a step whose
+    /// command never ran is undone.
+    pub fn abandon_operator(&mut self, job: &Job, mark: OperatorMark, ran: bool) {
+        let key = job.key();
+        let Some(record) = self.state.records.get_mut(&key) else {
+            return;
+        };
+        if record
+            .pending
+            .as_ref()
+            .is_none_or(|pending| pending.step_id != job.step_id)
+        {
+            return;
+        }
+        if ran {
+            record.pending = mark.pending;
+            record.phase = InstancePhase::Unknown;
+        } else if mark.created && record.invocations.is_empty() && record.completed.is_empty() {
+            self.state.records.remove(&key);
+        } else {
+            record.pending = mark.pending;
+            record.phase = mark.phase;
+            record.job = mark.job;
+        }
+        if let Err(error) = self.persist() {
+            tracing::warn!(error = %format!("{error:#}"), "clearing an operator step failed");
+        }
+    }
+
     /// Verified stopped long enough ago that nothing will ask about it.
     pub fn expired(&self) -> bool {
         let now = (self.clock)();
@@ -360,21 +545,7 @@ impl Executor {
         match self.execute_inner(&job, runtime, deadline) {
             Ok(outcome) => outcome,
             Err(error) => {
-                let code = error
-                    .chain()
-                    .find_map(|cause| cause.downcast_ref::<Fail>().map(|fail| fail.0))
-                    .unwrap_or(match job.action {
-                        JobPhase::Prepare | JobPhase::Start | JobPhase::AfterJoin => {
-                            if job.management() == Management::Process {
-                                JobError::OwnedLaunchUnconfirmed
-                            } else {
-                                JobError::LaunchUnconfirmed
-                            }
-                        }
-                        JobPhase::Readiness => JobError::ReadinessFailed,
-                        JobPhase::Health | JobPhase::Status => JobError::HealthFailed,
-                        JobPhase::Stop => JobError::CommandFailed,
-                    });
+                let code = failure_code(&job, &error);
                 tracing::warn!(
                     step_id = job.step_id,
                     instance_id = job.instance_id,
@@ -409,14 +580,7 @@ impl Executor {
         }
         let mut admitted = false;
         if let Some(record) = self.state.records.get(&key) {
-            // A new launch may change the version (a restart), but only while
-            // nothing of the old one runs.
-            anyhow::ensure!(
-                record.job.identity_matches(job)
-                    || (matches!(job.action, JobPhase::Prepare | JobPhase::Start)
-                        && record.invocations.is_empty()),
-                "instance identity changed"
-            );
+            same_instance(record, job)?;
             if let Some(done) = record.completed.get(&job.step_id) {
                 anyhow::ensure!(done.hash == job.intent_hash, "step intent changed");
                 if done.action == JobPhase::Stop {
@@ -817,6 +981,69 @@ impl Executor {
                 )
             })
             .collect()
+    }
+}
+
+/// The machine as an interactive step sees it once a person's run of its
+/// command exited 0 (or status showed it is not needed): that run was the
+/// launch. A prepare is done; a start or after-join counts only once its
+/// status command shows the service alive (recorded as `external`, so every
+/// later check asks status). Everything else is the inner runtime.
+pub struct OperatorRan<'a, R: Runtime> {
+    pub inner: &'a R,
+}
+
+impl<R: Runtime> OperatorRan<'_, R> {
+    fn launched(&self, job: &Job, deadline: Deadline) -> Result<String> {
+        if job.action == JobPhase::Prepare {
+            return Ok("external".to_owned());
+        }
+        let status = job
+            .status_command
+            .as_deref()
+            .ok_or_else(|| fail(JobError::LaunchUnconfirmed))?;
+        if wait_for_status(job, self.inner, status, true, deadline)? {
+            Ok("external".to_owned())
+        } else {
+            Err(fail(JobError::LaunchUnconfirmed))
+        }
+    }
+}
+
+impl<R: Runtime> Runtime for OperatorRan<'_, R> {
+    fn cancelled(&self) -> bool {
+        self.inner.cancelled()
+    }
+    fn launch(&self, job: &Job, _owner: &str, _unit: &str, deadline: Deadline) -> Result<String> {
+        self.launched(job, deadline)
+    }
+    fn identity(&self, unit: &str, owner: &str, deadline: Deadline) -> Result<Option<String>> {
+        self.inner.identity(unit, owner, deadline)
+    }
+    fn launch_completed(
+        &self,
+        job: &Job,
+        _owner: &str,
+        deadline: Deadline,
+    ) -> Result<Option<String>> {
+        self.launched(job, deadline).map(Some)
+    }
+    fn shell_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<()> {
+        // An interactive stop's command already ran in its operator terminal
+        // (or status showed it is not needed): never run it again here.
+        if job.action == JobPhase::Stop && command == job.stop_command {
+            return Ok(());
+        }
+        self.inner.shell_until(job, command, deadline)
+    }
+    fn status_until(&self, job: &Job, command: &str, deadline: Deadline) -> Result<bool> {
+        self.inner.status_until(job, command, deadline)
+    }
+    fn stop(&self, unit: &str, owner: &str, invocation: &str, deadline: Deadline) -> Result<()> {
+        self.inner.stop(unit, owner, invocation, deadline)
+    }
+    fn healthy_until(&self, job: &Job, deadline: Deadline) -> bool {
+        self.inner.healthy_until(job, deadline)
     }
 }
 
