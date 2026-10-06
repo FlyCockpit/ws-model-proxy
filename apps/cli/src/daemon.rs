@@ -401,6 +401,8 @@ pub fn connect_foreground() -> Result<()> {
     let startup = TerminalStartup::capture(&config)?;
     #[cfg(unix)]
     crate::file_ops::report_abandoned_recovery();
+    let mut link =
+        NodeLink::new(&crate::runtime_store::load_for(startup.trust_value()).unwrap_or_default());
     let mut reconnect_delay = RELAY_RECONNECT_INITIAL_DELAY;
     loop {
         check_shutdown()?;
@@ -422,7 +424,13 @@ pub fn connect_foreground() -> Result<()> {
                     retry_delay_secs = reconnect_delay.as_secs(),
                     "relay credential unavailable; retrying"
                 );
-                wait_for_reconnect(&mut control, &startup, &node_slug, reconnect_delay)?;
+                wait_for_reconnect(
+                    &mut control,
+                    &startup,
+                    &node_slug,
+                    reconnect_delay,
+                    &mut link,
+                )?;
                 reconnect_delay = next_reconnect_delay(reconnect_delay);
                 continue;
             }
@@ -444,6 +452,7 @@ pub fn connect_foreground() -> Result<()> {
             &ws_url,
             auth_value,
             &mut control,
+            &mut link,
         ) {
             Ok(()) => {
                 tracing::warn!(
@@ -470,7 +479,13 @@ pub fn connect_foreground() -> Result<()> {
                 return Err(crate::shutdown::ShutdownRequested { signal }.into());
             }
         }
-        wait_for_reconnect(&mut control, &startup, &node_slug, reconnect_delay)?;
+        wait_for_reconnect(
+            &mut control,
+            &startup,
+            &node_slug,
+            reconnect_delay,
+            &mut link,
+        )?;
         // Endpoint edits apply on reconnect (hot reload lands with config v3).
         match Config::load_required().and_then(|fresh| fresh.validate().map(|()| fresh)) {
             Ok(fresh) => config = fresh,
@@ -689,17 +704,30 @@ fn wait_for_reconnect(
     startup: &TerminalStartup,
     node_slug: &str,
     delay: Duration,
+    link: &mut NodeLink,
 ) -> Result<()> {
     let deadline = Instant::now() + delay;
     let mut watch = ConfigWatch::new();
     while Instant::now() < deadline {
         check_shutdown()?;
+        link.drain_offline();
         // Trust and features changed while disconnected reach the next hello.
-        let _ = answer_control_requests(control, startup, node_slug, "reconnecting")?;
-        if watch.changed()
-            && let Err(error) = reload_config(startup)
-        {
-            tracing::warn!(error = %format!("{error:#}"), "reloading the config failed");
+        let changes = answer_control_requests(control, startup, node_slug, "reconnecting")?;
+        if changes.contains(&NodeChange::Lowered) {
+            let interrupted = link.execs.interrupt_all();
+            link.deferred.extend(interrupted);
+        }
+        if watch.changed() {
+            match reload_config(startup) {
+                Ok(changes) if changes.contains(&NodeChange::Lowered) => {
+                    let interrupted = link.execs.interrupt_all();
+                    link.deferred.extend(interrupted);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(error = %format!("{error:#}"), "reloading the config failed");
+                }
+            }
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         thread::sleep(remaining.min(Duration::from_millis(100)));
@@ -780,12 +808,13 @@ impl NodeRuntimes {
 
 /// Everything one relay connection owns. Dropping it ends every terminal,
 /// command, file op and speech session it started.
-struct Session {
+struct Session<'a> {
     worker_tx: SyncSender<FromWorker>,
     workers: BTreeMap<String, WorkerHandle>,
     recent_finished: RecentlyFinished,
     terminals: TerminalRegistry,
-    execs: ExecRegistry,
+    /// Node commands outlive a connection (daemon lifetime, `NodeLink`).
+    execs: &'a mut ExecRegistry,
     stt: crate::stt::SttRegistry,
     #[cfg(unix)]
     files: crate::file_relay::FileRelay,
@@ -795,6 +824,66 @@ struct Session {
     runtimes: NodeRuntimes,
     #[cfg(unix)]
     runner: Option<crate::runtimes::runner::Runner>,
+}
+
+/// What outlives one relay connection: the worker channel and the node
+/// commands (a long command keeps running through a reconnect), plus the
+/// command results that ended while disconnected.
+struct NodeLink {
+    worker_tx: SyncSender<FromWorker>,
+    worker_rx: Receiver<FromWorker>,
+    execs: ExecRegistry,
+    deferred: Vec<OutboundFrame>,
+}
+
+impl NodeLink {
+    fn new(store: &Store) -> Self {
+        let (worker_tx, worker_rx) =
+            mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
+        let mut execs = ExecRegistry::new(worker_tx.clone(), DEFAULT_COMMAND_MAX);
+        let mut deferred = Vec::new();
+        match crate::paths::state_dir() {
+            Ok(dir) => {
+                let (with_table, interrupted) = execs.with_table(dir.join("node-commands.json"));
+                execs = with_table;
+                deferred = interrupted;
+            }
+            Err(error) => tracing::warn!(
+                error = %format!("{error:#}"),
+                "running commands are not recorded"
+            ),
+        }
+        if let Some(max) = store.command_max_ms() {
+            execs.set_command_max(Duration::from_millis(max));
+        }
+        Self {
+            worker_tx,
+            worker_rx,
+            execs,
+            deferred,
+        }
+    }
+
+    /// While disconnected: keep command output flowing into the registry
+    /// (so commands never block on a full pipe) and keep their end results
+    /// for the next connection. Everything else from a closed session drops.
+    fn drain_offline(&mut self) {
+        while let Ok(message) = self.worker_rx.try_recv() {
+            match message {
+                FromWorker::ExecBytes {
+                    command_id,
+                    stderr,
+                    bytes,
+                } => self.execs.on_bytes(&command_id, stderr, &bytes),
+                FromWorker::ExecEof { command_id, stderr } => {
+                    self.execs.on_eof(&command_id, stderr);
+                }
+                _ => {}
+            }
+        }
+        let ended = self.execs.poll(Instant::now());
+        self.deferred.extend(ended);
+    }
 }
 
 /// The hello `features`, with the names of the node's secrets.
@@ -811,6 +900,7 @@ fn run_relay_session(
     ws_url: &Url,
     auth_value: HeaderValue,
     control: &mut ControlServer,
+    link: &mut NodeLink,
 ) -> RelaySessionResult<()> {
     let mut request = ws_url
         .as_str()
@@ -844,13 +934,15 @@ fn run_relay_session(
     })?;
 
     // Created before hello so an early `?` still drops (and kills) every child.
-    let (worker_tx, worker_rx) = mpsc::sync_channel::<FromWorker>(RELAY_WORKER_OUTBOUND_CAPACITY);
+    let worker_tx = link.worker_tx.clone();
+    let worker_rx = &link.worker_rx;
+    let deferred = &mut link.deferred;
     let mut session = Session {
         worker_tx: worker_tx.clone(),
         workers: BTreeMap::new(),
         recent_finished: RecentlyFinished::new(),
         terminals: TerminalRegistry::new(worker_tx.clone()),
-        execs: ExecRegistry::new(worker_tx.clone(), DEFAULT_COMMAND_MAX),
+        execs: &mut link.execs,
         // Live speech-to-text sessions; dropping the registry ends them all.
         stt: crate::stt::SttRegistry::new(worker_tx.clone()),
         // Node file ops run on the daemon's file pool, never on this loop;
@@ -915,7 +1007,13 @@ fn run_relay_session(
         if let Some(signal) = crate::shutdown::requested() {
             break 'session Err(RelaySessionError::Shutdown(signal));
         }
-        if let Err(error) = drain_worker_output(&mut socket, &worker_rx, &mut session) {
+        if session.registered && !deferred.is_empty() {
+            // Commands that ended (or were interrupted) while disconnected.
+            if let Err(error) = send_outbound_frames(&mut socket, std::mem::take(deferred)) {
+                break Err(error);
+            }
+        }
+        if let Err(error) = drain_worker_output(&mut socket, worker_rx, &mut session) {
             break Err(error);
         }
         if let Err(error) = drain_runner(&mut socket, &mut session) {
@@ -1016,7 +1114,10 @@ fn run_relay_session(
     // Stops the sampling thread; a scrape in flight finishes on its own.
     drop(session.telemetry.take());
     let _ = send_outbound_frames(&mut socket, session.terminals.kill_all());
-    let _ = send_outbound_frames(&mut socket, session.execs.kill_all());
+    // Commands outlive a reconnect; a shutdown ends them (interrupted).
+    if crate::shutdown::requested().is_some() {
+        let _ = send_outbound_frames(&mut socket, session.execs.kill_all());
+    }
     // In-flight file ops are cancelled; their results are dropped.
     #[cfg(unix)]
     session.files.cancel_all();
@@ -1154,6 +1255,9 @@ where
                     send_stt(socket, &mut session.stt, message)?;
                 }
             }
+            // A frame queued by a closed session's worker never precedes
+            // this session's hello.
+            Ok(FromWorker::Telemetry(_)) if !session.registered => {}
             Ok(FromWorker::Telemetry(text)) => {
                 socket
                     .send(Message::Text(text.into()))
@@ -1189,13 +1293,7 @@ where
             if let Some(result) = apply_stt_fault(socket, &mut session.stt, &fault) {
                 return result;
             }
-            return apply_frame_fault(
-                socket,
-                fault,
-                &mut session.terminals,
-                &mut session.execs,
-                &error,
-            );
+            return apply_frame_fault(socket, fault, &mut session.terminals, session.execs, &error);
         }
     };
     if let Some(message) = SttServerMessage::from_frame(&frame) {
@@ -1263,6 +1361,9 @@ where
                     send_control(socket, &outcome.answer, "answering a runtime definition")?;
                     if outcome.changed {
                         session.runtimes.reload(startup.trust_value());
+                        if let Some(max) = session.runtimes.store.command_max_ms() {
+                            session.execs.set_command_max(Duration::from_millis(max));
+                        }
                         send_inventory(session);
                     }
                 }
@@ -2093,7 +2194,7 @@ where
                 socket,
                 fault,
                 &mut session.terminals,
-                &mut session.execs,
+                session.execs,
                 &anyhow::anyhow!("malformed relay binary frame"),
             );
         }

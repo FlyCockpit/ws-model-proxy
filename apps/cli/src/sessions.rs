@@ -68,7 +68,7 @@ use crate::terminal_crypto::{
 
 /// Attached viewers plus pending approvals, per terminal (protocol 2.5).
 const MAX_VIEWERS: usize = 8;
-const MAX_EXECS: usize = 2;
+const MAX_EXECS: usize = 8;
 #[cfg(unix)]
 const SCROLLBACK_LIMIT: usize = 256 * 1024;
 const READ_CHUNK: usize = 8 * 1024;
@@ -2461,6 +2461,36 @@ pub(crate) struct ExecRegistry {
     /// The node's `command_max_ms`: no command lives longer.
     command_max: Duration,
     shut_down: bool,
+    /// `node-commands.json`: the commands running now, so a daemon that died
+    /// can report them `interrupted` (and end their process groups) when it
+    /// starts again. `None` in tests that do not persist.
+    table: Option<PathBuf>,
+}
+
+/// One running command as persisted (no command text, no output).
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RunningCommand {
+    command_id: String,
+    pid: u32,
+    /// `/proc/<pid>/stat` start time, so a reused pid is never signalled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start_ticks: Option<u64>,
+    started_at: String,
+    ends_by: String,
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // Field 22 overall; the 20th after `pid (comm)`.
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_start_ticks(_pid: u32) -> Option<u64> {
+    None
 }
 
 impl ExecRegistry {
@@ -2471,6 +2501,86 @@ impl ExecRegistry {
             tx,
             command_max,
             shut_down: false,
+            table: None,
+        }
+    }
+
+    /// Persist running commands to `path`, and report the ones a previous
+    /// daemon left running as `interrupted`: their process groups are ended
+    /// first (only when the pid still names the same process).
+    pub(crate) fn with_table(mut self, path: PathBuf) -> (Self, Vec<OutboundFrame>) {
+        let left: Vec<RunningCommand> = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let mut frames = Vec::new();
+        for command in left {
+            if !valid_id(&command.command_id) {
+                continue;
+            }
+            #[cfg(unix)]
+            if command.start_ticks.is_some()
+                && process_start_ticks(command.pid) == command.start_ticks
+            {
+                kill_process_group(command.pid, false);
+            }
+            let status = ExecStatus {
+                command_id: command.command_id.clone(),
+                state: ExecState::Interrupted,
+                exit_code: None,
+                signal: None,
+                started_at: Some(command.started_at),
+                ends_by: Some(command.ends_by),
+                finished_at: Some(crate::telemetry::now_rfc3339()),
+                tail: None,
+                truncated: None,
+                output_bytes: None,
+            };
+            log_command_op("exec", &command.command_id, "interrupted by a restart");
+            self.ended.push_back((
+                command.command_id,
+                EndedCommand {
+                    status: status.clone(),
+                    output: OutputRing::default(),
+                },
+            ));
+            frames.push(OutboundFrame::Control(NodeFrame::ExecStatus(status)));
+        }
+        while self.ended.len() > EXEC_RECENT_MAX {
+            self.ended.pop_front();
+        }
+        self.table = Some(path);
+        self.save_table();
+        (self, frames)
+    }
+
+    /// The node definition's `commandMaxMs` (applies to later commands).
+    pub(crate) fn set_command_max(&mut self, command_max: Duration) {
+        self.command_max = command_max.min(DEFAULT_COMMAND_MAX);
+    }
+
+    fn save_table(&self) {
+        let Some(path) = &self.table else {
+            return;
+        };
+        let running: Vec<RunningCommand> = self
+            .sessions
+            .iter()
+            .map(|(id, session)| RunningCommand {
+                command_id: id.clone(),
+                pid: session.pid,
+                start_ticks: process_start_ticks(session.pid),
+                started_at: session.started_at.clone(),
+                ends_by: session.ends_by.clone(),
+            })
+            .collect();
+        let written = serde_json::to_vec(&running)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| {
+                crate::approvals::write_private_atomic(path, &bytes, "node commands", false)
+            });
+        if let Err(error) = written {
+            tracing::warn!(error = %format!("{error:#}"), "recording running commands failed");
         }
     }
 
@@ -2549,6 +2659,7 @@ impl ExecRegistry {
                 // A restarted command id replaces its ended record.
                 self.ended.retain(|(id, _)| id != command_id);
                 self.sessions.insert(command_id.to_string(), session);
+                self.save_table();
                 log_command_op("exec", command_id, "started");
                 vec![OutboundFrame::Control(frame)]
             }
@@ -2735,6 +2846,7 @@ impl ExecRegistry {
         let Some(mut session) = self.sessions.remove(command_id) else {
             return Vec::new();
         };
+        self.save_table();
         // Completion/cancel/drain timeout can precede pipe EOF. Keep every
         // held masked tail; late worker bytes cannot reopen a stream.
         for stderr in [false, true] {
@@ -3230,28 +3342,19 @@ mod tests {
 
         let (tx, rx) = channel();
         let mut execs = ExecRegistry::new(tx, Duration::from_secs(30));
-        assert!(matches!(
-            execs.start(
-                &startup,
-                &config,
-                "a",
-                slow_command(),
-                None,
-                TEST_TIMEOUT_MS
-            )[0],
-            OutboundFrame::Control(NodeFrame::ExecStarted { .. })
-        ));
-        assert!(matches!(
-            execs.start(
-                &startup,
-                &config,
-                "b",
-                slow_command(),
-                None,
-                TEST_TIMEOUT_MS
-            )[0],
-            OutboundFrame::Control(NodeFrame::ExecStarted { .. })
-        ));
+        for index in 0..MAX_EXECS {
+            assert!(matches!(
+                execs.start(
+                    &startup,
+                    &config,
+                    &format!("cmd-{index}"),
+                    slow_command(),
+                    None,
+                    TEST_TIMEOUT_MS
+                )[0],
+                OutboundFrame::Control(NodeFrame::ExecStarted { .. })
+            ));
+        }
         let rejected = execs.start(
             &startup,
             &config,
@@ -3265,9 +3368,74 @@ mod tests {
             OutboundFrame::Control(NodeFrame::ExecRejected { reason, .. })
                 if reason == REASON_LIMIT
         ));
-        assert_eq!(execs.sessions.len(), 2);
+        assert_eq!(execs.sessions.len(), MAX_EXECS);
         drop(execs);
         drop(rx);
+    }
+
+    /// A daemon that died left a command running: the next daemon ends its
+    /// process group and reports it `interrupted`, once.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn commands_a_restart_interrupted_are_killed_and_reported() {
+        use std::os::unix::process::CommandExt;
+        let dir = tempfile::tempdir().expect("dir");
+        let table = dir.path().join("node-commands.json");
+        let mut child = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .expect("sleep");
+        let pid = child.id();
+        let running = vec![RunningCommand {
+            command_id: "left-1".into(),
+            pid,
+            start_ticks: process_start_ticks(pid),
+            started_at: "2026-10-06T00:00:00Z".into(),
+            ends_by: "2026-10-07T00:00:00Z".into(),
+        }];
+        std::fs::write(&table, serde_json::to_vec(&running).expect("json")).expect("table");
+        let (tx, _rx) = channel();
+        let (execs, frames) =
+            ExecRegistry::new(tx, Duration::from_secs(30)).with_table(table.clone());
+        assert_eq!(frames.len(), 1);
+        let OutboundFrame::Control(NodeFrame::ExecStatus(status)) = &frames[0] else {
+            panic!("exec.status");
+        };
+        assert_eq!(status.state, ExecState::Interrupted);
+        assert!(status.validate().is_ok());
+        // Polls keep answering it, and the table is now empty.
+        let polled = execs.status("left-1", 0);
+        assert!(matches!(
+            &polled[0],
+            OutboundFrame::Control(NodeFrame::ExecStatus(s)) if s.state == ExecState::Interrupted
+        ));
+        assert_eq!(std::fs::read_to_string(&table).expect("table"), "[]");
+        let exited = child.wait().expect("reaped");
+        assert!(!exited.success(), "the left command was killed");
+        // A pid whose start time no longer matches is never signalled.
+        let mut other = std::process::Command::new("sleep")
+            .arg("300")
+            .process_group(0)
+            .spawn()
+            .expect("sleep");
+        let stale = vec![RunningCommand {
+            command_id: "left-2".into(),
+            pid: other.id(),
+            start_ticks: Some(1),
+            started_at: "2026-10-06T00:00:00Z".into(),
+            ends_by: "2026-10-07T00:00:00Z".into(),
+        }];
+        std::fs::write(&table, serde_json::to_vec(&stale).expect("json")).expect("table");
+        let (tx, _rx) = channel();
+        let (_execs, frames) = ExecRegistry::new(tx, Duration::from_secs(30)).with_table(table);
+        assert_eq!(frames.len(), 1);
+        assert!(
+            other.try_wait().expect("poll").is_none(),
+            "an unrelated process survives"
+        );
+        let _ = other.kill();
+        let _ = other.wait();
     }
 
     #[test]
