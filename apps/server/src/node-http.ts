@@ -24,19 +24,29 @@ import {
 import { env } from "@ws-model-proxy/env/server";
 import type { Context, Env, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
+import type { RateLimiterMemory } from "rate-limiter-flexible";
 import { resolveClientIp } from "./client-ip.js";
 import {
   consumeEnrollmentExchange,
   enrollmentExchangeIpLimiter,
   enrollmentExchangeUserLimiter,
   type RateLimiter,
+  refundEnrollmentExchange,
 } from "./rate-limit.js";
 
-/** Where `install.sh` builds the CLI from until release builds of 0.4.0 are published. */
+/**
+ * Where `install.sh` builds the CLI from until release builds of 0.4.0 are published. A
+ * deployment pins an exact commit with `WMP_CLI_SOURCE_REV` (recommended: a branch moves);
+ * without it the installer follows the branch.
+ */
 export const CLI_SOURCE = {
   repository: "https://github.com/FlyCockpit/ws-model-proxy",
   ref: "redesign-0.4.0",
 } as const;
+
+function cargoSourceArgs(rev: string | undefined): string {
+  return rev ? `--rev '${rev}'` : `--branch '${CLI_SOURCE.ref}'`;
+}
 
 export const NODE_ENROLL_PATH = "/api/node/enroll";
 export const NODE_ENROLL_MAX_BODY_BYTES = 16 * 1024;
@@ -46,7 +56,7 @@ function canonicalOrigin(): string {
 }
 
 /** The POSIX installer: checks for cargo, then builds and installs `wsmp` from source. */
-export function installScript(origin: string): string {
+export function installScript(origin: string, rev: string | undefined = undefined): string {
   return `#!/bin/sh
 # WS Model Proxy node CLI (wsmp) installer for ${origin}
 # Builds wsmp ${CLI_SOURCE.ref} from source with cargo (release builds of 0.4.0 are not published yet).
@@ -55,8 +65,8 @@ if ! command -v cargo >/dev/null 2>&1; then
   echo "wsmp: cargo is not installed. Install Rust from https://rustup.rs, then run this again." >&2
   exit 1
 fi
-echo "wsmp: building ${CLI_SOURCE.ref} from ${CLI_SOURCE.repository} (this takes a few minutes)..."
-cargo install --git '${CLI_SOURCE.repository}' --branch '${CLI_SOURCE.ref}' --locked --force wsmp
+echo "wsmp: building ${rev ?? CLI_SOURCE.ref} from ${CLI_SOURCE.repository} (this takes a few minutes)..."
+cargo install --git '${CLI_SOURCE.repository}' ${cargoSourceArgs(rev)} --locked --force wsmp
 echo "wsmp: installed $(command -v wsmp || echo "$HOME/.cargo/bin/wsmp")."
 echo "wsmp: if 'wsmp' is not found, add \\"$HOME/.cargo/bin\\" to your PATH."
 `;
@@ -73,7 +83,7 @@ function rateLimited(retryAfterMs: number): Refusal {
 }
 
 export type NodeEnrollDeps = {
-  ipLimiter?: RateLimiter;
+  ipLimiter?: RateLimiter & Pick<RateLimiterMemory, "reward">;
   userLimiter?: RateLimiter;
   exchange?: typeof exchangeEnrollmentCode;
   findOwner?: typeof findEnrollmentCodeOwner;
@@ -88,8 +98,11 @@ export function nodeEnrollHandler(deps: NodeEnrollDeps = {}) {
   const exchange = deps.exchange ?? exchangeEnrollmentCode;
   const findOwner = deps.findOwner ?? findEnrollmentCodeOwner;
   return async (c: Context) => {
-    // Every attempt counts, before parsing or any lookup (code guessing spends the IP budget).
-    const byIp = await consumeEnrollmentExchange(ipLimiter, `ip:${resolveClientIp(c)}`);
+    // Every attempt counts, before parsing or any lookup (code guessing spends the IP budget);
+    // a successful enrollment gives its point back, so a fleet behind one address can use a
+    // multi-use code.
+    const ipKey = `ip:${resolveClientIp(c)}`;
+    const byIp = await consumeEnrollmentExchange(ipLimiter, ipKey);
     if (!byIp.allowed) return c.json(rateLimited(byIp.retryAfterMs), 429);
     let body: unknown;
     try {
@@ -113,7 +126,12 @@ export function nodeEnrollHandler(deps: NodeEnrollDeps = {}) {
         // Revoked rows refuse the next authentication; the old socket ends at its recheck.
       }
     }
-    return c.json(outcome.response, outcome.response.ok ? 200 : 400);
+    if (outcome.response.ok) {
+      await refundEnrollmentExchange(ipLimiter, ipKey);
+      // The credential is in this body: never cached.
+      return c.json(outcome.response, 200, { "cache-control": "no-store" });
+    }
+    return c.json(outcome.response, outcome.response.error === "rate_limited" ? 429 : 400);
   };
 }
 
@@ -133,7 +151,7 @@ export function registerNodeHttpRoutes<E extends Env>(
     ),
   );
   app.get("/install.sh", (c) =>
-    c.body(installScript(canonicalOrigin()), 200, {
+    c.body(installScript(canonicalOrigin(), env.WMP_CLI_SOURCE_REV), 200, {
       "content-type": "text/x-shellscript; charset=utf-8",
       "cache-control": "no-store",
     }),

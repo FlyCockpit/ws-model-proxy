@@ -86,12 +86,18 @@ describe("node bootstrap HTTP", () => {
       `cargo install --git '${CLI_SOURCE.repository}' --branch '${CLI_SOURCE.ref}' --locked --force wsmp`,
     );
     expect(text.startsWith("#!/bin/sh\n")).toBe(true);
+    // A deployment pins the exact commit (WMP_CLI_SOURCE_REV) instead of following the branch.
+    const pinned = installScript("https://proxy.example.com", "0123abc");
+    expect(pinned).toContain("--rev '0123abc' --locked");
+    expect(pinned).not.toContain("--branch");
   });
 
   it("enrolls and closes the sessions of credentials the exchange revoked", async () => {
     const { post, exchange, closeRevokedSessions } = app();
     const res = await post(body());
     expect(res.status).toBe(200);
+    // The credential is in this body: never cached.
+    expect(res.headers.get("cache-control")).toBe("no-store");
     expect(await res.json()).toMatchObject({ ok: true, nodeId: "node-1" });
     expect(exchange).toHaveBeenCalledWith(
       expect.objectContaining({ code: CODE, slug: "desk-01", replaceConfirmed: false }),
@@ -109,13 +115,17 @@ describe("node bootstrap HTTP", () => {
     expect(findOwner).not.toHaveBeenCalled();
   });
 
-  it("charges the IP budget before any lookup, then the owner's", async () => {
+  it("charges the IP budget before any lookup (successes give it back), then the owner's", async () => {
     const byIp = app({ ipLimiter: limiter(1) });
+    // A fleet behind one address: successful enrollments do not use up the IP budget.
     expect((await byIp.post(body())).status).toBe(200);
+    expect((await byIp.post(body())).status).toBe(200);
+    // A failure keeps its point; the next attempt from that address is refused before lookup.
+    expect((await byIp.post("{nope")).status).toBe(400);
     const limited = await byIp.post(body());
     expect(limited.status).toBe(429);
     expect(await limited.json()).toMatchObject({ ok: false, error: "rate_limited" });
-    expect(byIp.findOwner).toHaveBeenCalledTimes(1);
+    expect(byIp.findOwner).toHaveBeenCalledTimes(2);
 
     const byOwner = app({ userLimiter: limiter(1) });
     expect((await byOwner.post(body())).status).toBe(200);

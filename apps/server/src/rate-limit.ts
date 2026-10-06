@@ -129,6 +129,18 @@ export const enrollmentExchangeUserLimiter = new RateLimiterMemory({
 
 export type ExchangeLimit = { allowed: true } | { allowed: false; retryAfterMs: number };
 
+/** Gives back one point of a successful exchange (an honest fleet's enrollments do not add up). */
+export async function refundEnrollmentExchange(
+  limiter: Pick<RateLimiterMemory, "reward">,
+  key: string,
+): Promise<void> {
+  try {
+    await limiter.reward(createHash("sha256").update(key).digest("base64url"), 1);
+  } catch {
+    // A failed refund only keeps the point charged.
+  }
+}
+
 /**
  * Charges one enrollment exchange to a limiter key (the client IP, then the code owner's
  * user id). An unexpected limiter error fails open, like the middleware.

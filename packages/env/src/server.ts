@@ -172,6 +172,12 @@ export const env = createEnv({
     // to omit those plugins and answer the MCP surface with real 404s. Human
     // grant listing/revocation stays available while disabled.
     WMP_MCP_ENABLED: strictBooleanFlag(true),
+    // The commit /install.sh builds the CLI from (`cargo install --rev`); unset follows the
+    // preview branch.
+    WMP_CLI_SOURCE_REV: z
+      .string()
+      .regex(/^[0-9a-f]{7,40}$/)
+      .optional(),
     // Agent tokens default to 90 days when expiresAt is omitted.
     // This flag still allows an explicit no-expiry (null) mint. Turn it off
     // to refuse that choice; an omitted expiry stays 90 days, and a chosen

@@ -345,6 +345,17 @@ export const ENV_VARS: EnvVar[] = [
     ],
   },
   {
+    key: "WMP_CLI_SOURCE_REV",
+    group: "runtime",
+    source: "manual",
+    example: "0123456789abcdef0123456789abcdef01234567",
+    comment: [
+      "Optional. The commit /install.sh builds the wsmp CLI from (cargo install",
+      "--rev). Pin it to the commit this server runs: unset, the installer follows",
+      "the redesign-0.4.0 branch, so whoever can push to it reaches every new node.",
+    ],
+  },
+  {
     key: "WMP_AGENT_TOKEN_ALLOW_NO_EXPIRY",
     group: "runtime",
     source: "default",

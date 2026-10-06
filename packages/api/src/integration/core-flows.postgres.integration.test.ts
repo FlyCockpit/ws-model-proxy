@@ -123,7 +123,7 @@ integration("core flows on PostgreSQL with the schema hardening", () => {
       replaceConfirmed: false,
     });
     expect(again.response).toMatchObject({ ok: false, error: "used" });
-    // The same machine logging in again with a new code keeps its node.
+    // A code never takes over an existing node, not even with its (public) identity key.
     const second = await me.nodes.enrollmentCodes.create({});
     const relogin = await modules.enroll.exchangeEnrollmentCode({
       code: second.secret,
@@ -131,8 +131,33 @@ integration("core flows on PostgreSQL with the schema hardening", () => {
       slug: `desk-${suffix}`,
       replaceConfirmed: false,
     });
-    expect(relogin.response).toMatchObject({ ok: true, nodeId });
-    expect(relogin.revokedCredentialIds).toHaveLength(1);
+    expect(relogin.response).toMatchObject({ ok: false, error: "slug_taken" });
+    expect(relogin.revokedCredentialIds).toEqual([]);
+    // A Replace code (the person's approval for this node) moves it to a new identity.
+    const replace = await me.nodes.enrollmentCodes.create({ replaceNodeId: nodeId });
+    const unconfirmed = await modules.enroll.exchangeEnrollmentCode({
+      code: replace.secret,
+      identityPublicKey: IDENTITY_KEY,
+      slug: `ignored-${suffix}`,
+      replaceConfirmed: false,
+    });
+    expect(unconfirmed.response).toMatchObject({
+      ok: false,
+      error: "replace_confirmation_required",
+      replaces: { slug: `desk-${suffix}` },
+    });
+    const replaced = await modules.enroll.exchangeEnrollmentCode({
+      code: replace.secret,
+      identityPublicKey: IDENTITY_KEY,
+      slug: `ignored-${suffix}`,
+      replaceConfirmed: true,
+    });
+    expect(replaced.response).toMatchObject({
+      ok: true,
+      nodeId,
+      replaced: { slug: `desk-${suffix}` },
+    });
+    expect(replaced.revokedCredentialIds).toHaveLength(1);
 
     // The relay hello (stand-in): Full control, online.
     await modules.fixtures.node.update({

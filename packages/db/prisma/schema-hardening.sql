@@ -674,6 +674,19 @@ ALTER TABLE runtime_operation ADD CONSTRAINT runtime_operation_shape CHECK (
   AND fingerprint ~ '^[0-9a-f]{64}$'
   AND jsonb_typeof(summary) = 'object'
 );
+-- A profile apply is recorded with its profile (only the profile's delete clears it later).
+CREATE OR REPLACE FUNCTION enforce_runtime_operation_profile()
+RETURNS trigger LANGUAGE plpgsql AS $runtime_operation_profile$
+BEGIN
+  IF NEW.kind = 'PROFILE_APPLY' AND NEW."profileId" IS NULL THEN
+    RAISE EXCEPTION 'a profile apply names its profile' USING ERRCODE = '23514';
+  END IF;
+  RETURN NEW;
+END;
+$runtime_operation_profile$;
+DROP TRIGGER IF EXISTS runtime_operation_profile ON runtime_operation;
+CREATE TRIGGER runtime_operation_profile BEFORE INSERT ON runtime_operation
+FOR EACH ROW EXECUTE FUNCTION enforce_runtime_operation_profile();
 
 -- One model on one instance, or one provider model.
 ALTER TABLE execution_target DROP CONSTRAINT IF EXISTS execution_target_kind_source_xor_check;

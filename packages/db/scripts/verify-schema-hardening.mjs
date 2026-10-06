@@ -96,6 +96,7 @@ const REQUIRED_OBJECTS = [
   "runtime_instance_notify_failures",
   "runtime_instance_operator_shape",
   "runtime_instance_launch_version",
+  "runtime_operation_profile",
   "instance_rank_bounds",
   "instance_rank_reserved_port",
   "instance_rank_claim_shape",

@@ -7,8 +7,10 @@
  * - The code is found by its purpose digest; an unknown, revoked, expired or used-up code is
  *   refused by name (the caller already holds the code, so the name leaks nothing new).
  * - A new slug creates the node with the code's labels and temporary-node policy. An existing
- *   slug is taken over only when its active credential is bound to the same identity key (the
- *   same machine logging in again); otherwise `slug_taken`.
+ *   slug is always `slug_taken`: a code proves the person approved a new node, not possession of
+ *   an existing node's private key, so it can never revoke that node's credential (a public key
+ *   is not secret). A machine that lost its credential is re-enrolled with a Replace code, the
+ *   person's explicit approval for that node.
  * - A Replace code moves the named node to this identity after `replaceConfirmed`, revoking its
  *   old credential; a Relay-only node stays Relay only (`trustLowerPending`).
  * - Everything is one transaction under the owner fence (node is a fenced graph table); the
@@ -16,6 +18,7 @@
  *
  * Rate limits (per IP before any lookup, per code owner after) are the caller's (apps/server).
  */
+import { ORPCError } from "@orpc/server";
 import prisma from "@ws-model-proxy/db";
 import {
   credentialDigest,
@@ -138,34 +141,20 @@ export async function exchangeEnrollmentCode(
       } else {
         const existing = await tx.node.findUnique({
           where: { userId_slug: { userId, slug: request.slug } },
-          select: {
-            id: true,
-            Credentials: {
-              where: { revokedAt: null },
-              select: { identityPublicKey: true },
-            },
-          },
+          select: { id: true },
         });
-        if (existing) {
-          // The same machine logging in again keeps its node; any other key is refused.
-          const sameKey = existing.Credentials.some(
-            (credential) => credential.identityPublicKey === request.identityPublicKey,
-          );
-          if (!sameKey) throw new EnrollRefused(refused("slug_taken"));
-          nodeId = existing.id;
-        } else {
-          const created = await tx.node.create({
-            data: {
-              userId,
-              slug: request.slug,
-              hostname: request.hostname ?? null,
-              labels: code.labels,
-              removeAfterOfflineMs: code.removeAfterOfflineMs,
-            },
-            select: { id: true },
-          });
-          nodeId = created.id;
-        }
+        if (existing) throw new EnrollRefused(refused("slug_taken"));
+        const created = await tx.node.create({
+          data: {
+            userId,
+            slug: request.slug,
+            hostname: request.hostname ?? null,
+            labels: code.labels,
+            removeAfterOfflineMs: code.removeAfterOfflineMs,
+          },
+          select: { id: true },
+        });
+        nodeId = created.id;
         slug = request.slug;
       }
 
@@ -221,9 +210,38 @@ export async function exchangeEnrollmentCode(
   } catch (error) {
     if (error instanceof EnrollRefused)
       return { response: error.refusal, ownerUserId: userId, revokedCredentialIds: [] };
+    // The code expired (or was revoked) after the pre-check: the trigger's now() decides.
+    if (sqlState(error) === "55000")
+      return { response: refused("expired"), ownerUserId: userId, revokedCredentialIds: [] };
+    // Contended fences: retry shortly (the code took no use).
+    if (error instanceof ORPCError && error.code === "CONFLICT")
+      return {
+        response: refused("rate_limited", { retryAfterSec: 2 }),
+        ownerUserId: userId,
+        revokedCredentialIds: [],
+      };
     // A concurrent exchange created the same slug first (unique `(userId, slug)`).
     if (isUniqueViolation(error))
       return { response: refused("slug_taken"), ownerUserId: userId, revokedCredentialIds: [] };
     throw error;
   }
+}
+
+/** The PostgreSQL SQLSTATE anywhere in a Prisma error's cause chain. */
+function sqlState(error: unknown): string | undefined {
+  const seen = new Set<unknown>();
+  const pending: unknown[] = [error];
+  while (pending.length > 0) {
+    const candidate = pending.pop();
+    if (!candidate || typeof candidate !== "object" || seen.has(candidate)) continue;
+    seen.add(candidate);
+    for (const key of ["originalCode", "code"]) {
+      const code = Reflect.get(candidate, key);
+      if (typeof code === "string" && /^[0-9A-Z]{5}$/.test(code) && !code.startsWith("P"))
+        return code;
+    }
+    for (const key of ["meta", "cause", "driverAdapterError"])
+      pending.push(Reflect.get(candidate, key));
+  }
+  return undefined;
 }
