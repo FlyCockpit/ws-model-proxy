@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   initialRealtimeState,
+  liveModelOptions,
   micProblem,
   pcm16Base64,
   problemMessageKey,
@@ -22,6 +23,24 @@ describe("realtime transcription helpers", () => {
     expect(realtimeSocketUrl("m", { href: "http://localhost:3001/x", protocol: "http:" })).toMatch(
       /^ws:\/\/localhost:3001\/api\/internal\/chat-test\/realtime\?/,
     );
+  });
+
+  it("offers only the models that advertise live transcription", () => {
+    const visible = {
+      directModels: [
+        { modelId: "me/asr", upstreamModelId: "whisper", realtimeTranscription: true },
+        { modelId: "me/chat", upstreamModelId: "llm", realtimeTranscription: false },
+      ],
+      modelPools: [
+        { modelId: "team/asr", name: "Team ASR", realtimeTranscription: true },
+        { modelId: "team/chat", name: "Team chat", realtimeTranscription: false },
+      ],
+    } as unknown as Parameters<typeof liveModelOptions>[0];
+    expect(liveModelOptions(visible)).toEqual([
+      { modelId: "me/asr", label: "whisper" },
+      { modelId: "team/asr", label: "Team ASR" },
+    ]);
+    expect(liveModelOptions(undefined)).toEqual([]);
   });
 
   it("base64-encodes PCM, including buffers larger than one chunk", () => {

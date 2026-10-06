@@ -1,3 +1,4 @@
+import { useQuery } from "@tanstack/react-query";
 import { Button } from "@ws-model-proxy/ui/components/button";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
@@ -10,17 +11,29 @@ import {
 } from "@ws-model-proxy/ui/components/select";
 import { Skeleton } from "@ws-model-proxy/ui/components/skeleton";
 import { CornerDownLeft, Mic, Square } from "lucide-react";
-import { type ReactNode, useId, useState } from "react";
+import { type ReactNode, useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { useRealtimeTranscription } from "@/hooks/use-realtime-transcription";
 import {
+  type LiveModelOption,
+  liveModelOptions,
   problemMessageKey,
   type RealtimeItem,
   type RealtimeState,
 } from "@/lib/realtime-transcription";
+import { orpc } from "@/utils/orpc";
 
-export type LiveModelOption = { modelId: string; label: string };
+/**
+ * The Chat Test toolbar's live transcription entry: reads the visible models
+ * itself (the page's own query, shared through the query cache) and offers
+ * the live-capable ones.
+ */
+export function ChatTestLiveTranscription() {
+  const { data, isPending } = useQuery(orpc.forwarderManagement.visibleModels.queryOptions());
+  const models = useMemo(() => liveModelOptions(data), [data]);
+  return <LiveTranscriptionLauncher models={models} modelsPending={isPending} />;
+}
 
 /**
  * The Chat Test header's microphone button and its panel. The panel is

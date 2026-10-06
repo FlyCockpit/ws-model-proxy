@@ -1,3 +1,5 @@
+import type { VisibleModels } from "@/components/chat-test/chat-test-types";
+
 /**
  * Pure pieces of the Chat Test live transcription panel: the socket address,
  * PCM encoding, and the reducer that turns the realtime transcription events
@@ -6,6 +8,21 @@
  * The panel's socket is the dashboard's own: the session cookie signs it in,
  * as for every other Chat Test request. No token is typed, sent or stored.
  */
+
+export type LiveModelOption = { modelId: string; label: string };
+
+/** Models whose capabilities advertise live transcription (a hint; the server decides). */
+export function liveModelOptions(visibleModels: VisibleModels | undefined): LiveModelOption[] {
+  if (!visibleModels) return [];
+  return [
+    ...visibleModels.directModels
+      .filter((model) => model.realtimeTranscription)
+      .map((model) => ({ modelId: model.modelId, label: model.upstreamModelId })),
+    ...visibleModels.modelPools
+      .filter((pool) => pool.realtimeTranscription)
+      .map((pool) => ({ modelId: pool.modelId, label: pool.name })),
+  ];
+}
 
 export const CHAT_TEST_REALTIME_PATH = "/api/internal/chat-test/realtime";
 export const REALTIME_WORKLET_URL = "/realtime-pcm-worklet.js";

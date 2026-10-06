@@ -40,10 +40,6 @@ import type {
   VisibleModels,
 } from "@/components/chat-test/chat-test-types";
 import { ChatTranscript } from "@/components/chat-test/chat-transcript";
-import {
-  type LiveModelOption,
-  LiveTranscriptionLauncher,
-} from "@/components/chat-test/live-transcription-panel";
 import { ModelPicker } from "@/components/chat-test/model-picker";
 import { RequestSettingsFields } from "@/components/chat-test/request-settings";
 import { InlineRetry } from "@/components/inline-retry";
@@ -96,19 +92,6 @@ const LONG_THREAD_FIXTURE_COUNT = 200;
 
 function newId(prefix: string) {
   return `${prefix}_${crypto.randomUUID().replaceAll("-", "_")}`;
-}
-
-/** Models whose capabilities advertise live transcription (a hint; the server decides). */
-function liveModelOptions(visibleModels: VisibleModels | undefined): LiveModelOption[] {
-  if (!visibleModels) return [];
-  return [
-    ...visibleModels.directModels
-      .filter((model) => model.realtimeTranscription)
-      .map((model) => ({ modelId: model.modelId, label: model.upstreamModelId })),
-    ...visibleModels.modelPools
-      .filter((pool) => pool.realtimeTranscription)
-      .map((pool) => ({ modelId: pool.modelId, label: pool.name })),
-  ];
 }
 
 function modelOptions(visibleModels: VisibleModels | undefined): ModelOption[] {
@@ -187,7 +170,6 @@ export function ChatTestPage({ lang }: { lang: string }) {
   // Collapsed by default so the mobile transcript keeps most of the viewport;
   // users expand only when they need a session system prompt.
   const [systemPromptOpen, setSystemPromptOpen] = useState(false);
-  const liveModels = useMemo(() => liveModelOptions(visibleModelsData), [visibleModelsData]);
   const systemPromptId = useId();
   const systemPromptPanelId = `${systemPromptId}-panel`;
   const systemPromptHelpId = `${systemPromptId}-help`;
@@ -1204,7 +1186,6 @@ export function ChatTestPage({ lang }: { lang: string }) {
           >
             <MessageSquarePlus className="size-4" />
           </Button>
-          <LiveTranscriptionLauncher models={liveModels} modelsPending={visibleModelsIsPending} />
           {import.meta.env.DEV ? (
             <Button
               type="button"
