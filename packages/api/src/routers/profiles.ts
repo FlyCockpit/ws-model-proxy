@@ -1,11 +1,10 @@
-import { stub } from "../contract-procedure";
-import { profilesContract as c } from "../contracts/profiles";
+import { profileProcedures } from "../profiles/procedures";
 
-/** S0c: bound to the contract with NOT_IMPLEMENTED handlers; implemented in lane A5. */
+/** Lane B: profiles (`src/profiles/`). */
 export const profilesRouter = {
-  list: stub(c.list),
-  get: stub(c.get),
-  save: stub(c.save),
-  delete: stub(c.delete),
-  apply: stub(c.apply),
+  list: profileProcedures.list,
+  get: profileProcedures.get,
+  save: profileProcedures.save,
+  delete: profileProcedures.delete,
+  apply: profileProcedures.apply,
 };
