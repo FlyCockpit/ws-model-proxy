@@ -2,6 +2,7 @@ import { auth, type Session } from "@ws-model-proxy/auth";
 import { cookieSessionHeaders } from "@ws-model-proxy/auth/cookie-session";
 import type { Context as HonoContext } from "hono";
 import type { AnonymousAuth, CallerAuth } from "./contracts/auth-context";
+import type { NodeRelayServices } from "./lib/node-relay-services";
 
 export type CreateContextOptions = {
   context: HonoContext;
@@ -23,6 +24,8 @@ export type ContextServices = {
    * relay clears the pool's stored verdicts: hot-path rows a management writer must not write.
    */
   onPoolRoutingRulesChanged?: (poolId: string) => Promise<void>;
+  /** Lane B: node and profile relay hooks (`lib/node-relay-services.ts`). */
+  nodes?: NodeRelayServices;
 };
 
 /**

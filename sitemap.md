@@ -48,9 +48,9 @@ All require an active session (`_auth` layout).
 | `/{lang}/runtimes/{runtimeId}/definition` | Definition form and raw JSON, version history with notes and diffs, agent-written badges, applies-live vs needs-restart hints. |
 | `/{lang}/runtimes/{runtimeId}/advanced` | Limits and advanced settings (automatic / override), metrics reader, restart settings. |
 | `/{lang}/profiles` | Profiles: nodes, items, satisfied, pins outdated, Apply. |
-| `/{lang}/profiles/{profileId}` | Profile editor (nodes, pinned items, Update pins) and Apply → preview → Confirm. |
-| `/{lang}/nodes` | Node cards (online, trust, hardware, free memory, runtimes), Add node dialog. |
-| `/{lang}/nodes/{nodeId}` | Hardware (effective with sources, declaration incl. reserved memory), trust card (Lower to Relay only; raise with `wsmp trust full` on the node), labels, port range, node metric commands, detected servers, activity, Replace, delete. |
+| `/{lang}/profiles/{profileId}` | Profile editor (nodes with hold lines, pinned items, Update pins), delete, and Apply → preview → Confirm. |
+| `/{lang}/nodes` | Node cards (online, trust, hold, temporary, hardware, free memory, runtimes), Add node dialog (multi-use, labels, temporary), install codes, fabrics. |
+| `/{lang}/nodes/{nodeId}` | Hardware (effective with sources, declaration incl. reserved memory), trust card (Lower to Relay only; raise with `wsmp trust full` on the node), hold, temporary, labels, port range, command lifetime, fabric memberships, node metric commands, secrets (write-only), what runs here and detected servers, logins, activity, Replace, delete. |
 | `/{lang}/terminals` | Browser terminals (Full-control nodes), commands agents queued for you (Run / Dismiss), interactive steps waiting for you. |
 | `/{lang}/providers` | Provider accounts with this month's spend against the monthly cap, health; add account. |
 | `/{lang}/providers/{accountId}` | Key (replace/revoke), models (enable, type, pricing), monthly cap, data collection, usage. |

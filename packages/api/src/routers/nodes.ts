@@ -1,38 +1,28 @@
 import { stub } from "../contract-procedure";
 import { nodesContract as c } from "../contracts/nodes";
+import { credentialProcedures, enrollmentProcedures } from "../nodes/enrollment";
+import { nodeProcedures as n } from "../nodes/procedures";
+import { secretProcedures } from "../nodes/secrets";
 
-/** S0c: bound to the contract with NOT_IMPLEMENTED handlers; implemented in lane A1. */
+/**
+ * Lane B implements the node definition, trust, fabrics, enrollment and activity
+ * (`src/nodes/`); terminals, queued commands, commands and files are lane D's stubs.
+ */
 export const nodesRouter = {
-  list: stub(c.list),
-  get: stub(c.get),
-  update: stub(c.update),
-  secrets: {
-    set: stub(c.secrets.set),
-    delete: stub(c.secrets.delete),
-  },
-  setHold: stub(c.setHold),
-  setTemporary: stub(c.setTemporary),
-  fabrics: {
-    list: stub(c.fabrics.list),
-    rename: stub(c.fabrics.rename),
-    delete: stub(c.fabrics.delete),
-  },
-  rename: stub(c.rename),
-  delete: stub(c.delete),
-  lowerTrustPreview: stub(c.lowerTrustPreview),
-  lowerTrust: stub(c.lowerTrust),
-  enrollmentCodes: {
-    list: stub(c.enrollmentCodes.list),
-    create: stub(c.enrollmentCodes.create),
-    revoke: stub(c.enrollmentCodes.revoke),
-  },
-  credentials: {
-    list: stub(c.credentials.list),
-    revoke: stub(c.credentials.revoke),
-  },
-  activity: {
-    list: stub(c.activity.list),
-  },
+  list: n.list,
+  get: n.get,
+  update: n.update,
+  secrets: secretProcedures,
+  setHold: n.setHold,
+  setTemporary: n.setTemporary,
+  fabrics: n.fabrics,
+  rename: n.rename,
+  delete: n.delete,
+  lowerTrustPreview: n.lowerTrustPreview,
+  lowerTrust: n.lowerTrust,
+  enrollmentCodes: enrollmentProcedures,
+  credentials: credentialProcedures,
+  activity: n.activity,
   terminals: {
     openTicket: stub(c.terminals.openTicket),
   },
