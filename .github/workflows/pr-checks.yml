@@ -442,7 +442,7 @@ jobs:
           DATABASE_URL: ${{ env.SCHEMA_VALIDATION_DATABASE_URL }}
         run: pnpm --filter @ws-model-proxy/db db:push
 
-      - name: Prove provider management and capacity policy races
+      - name: API PostgreSQL integration suites (core flows)
         run: pnpm --filter @ws-model-proxy/api test:postgres
 
   # ── React Doctor (React health scan: hooks, a11y, perf, security) ─

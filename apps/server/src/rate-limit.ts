@@ -108,22 +108,23 @@ export const realtimeUpgradeLimiter = new RateLimiterMemory({
  * pre-approved secret, so a caller guessing codes spends its own IP budget; the exchange also
  * charges the code's owner (per user) once the code is known. No `blockDuration`: an honest
  * installer that retried too fast recovers within one window. Per process, like every limiter
- * here.
+ * here. Budgets from contracts/http.ts: 10 per IP per 15 minutes, 20 per code owner per hour.
  */
-export const ENROLLMENT_EXCHANGE_IP_POINTS = 30;
-export const ENROLLMENT_EXCHANGE_USER_POINTS = 60;
-export const ENROLLMENT_EXCHANGE_DURATION_SECONDS = 60;
+export const ENROLLMENT_EXCHANGE_IP_POINTS = 10;
+export const ENROLLMENT_EXCHANGE_IP_DURATION_SECONDS = 15 * 60;
+export const ENROLLMENT_EXCHANGE_USER_POINTS = 20;
+export const ENROLLMENT_EXCHANGE_USER_DURATION_SECONDS = 60 * 60;
 
 export const enrollmentExchangeIpLimiter = new RateLimiterMemory({
   keyPrefix: "rl:enroll-ip",
   points: ENROLLMENT_EXCHANGE_IP_POINTS,
-  duration: ENROLLMENT_EXCHANGE_DURATION_SECONDS,
+  duration: ENROLLMENT_EXCHANGE_IP_DURATION_SECONDS,
 });
 
 export const enrollmentExchangeUserLimiter = new RateLimiterMemory({
   keyPrefix: "rl:enroll-user",
   points: ENROLLMENT_EXCHANGE_USER_POINTS,
-  duration: ENROLLMENT_EXCHANGE_DURATION_SECONDS,
+  duration: ENROLLMENT_EXCHANGE_USER_DURATION_SECONDS,
 });
 
 export type ExchangeLimit = { allowed: true } | { allowed: false; retryAfterMs: number };

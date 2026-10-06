@@ -193,6 +193,8 @@ const GRAPH_WRITERS: Record<string, string> = {
     "M: runtime versions, written inside lane C's graphWrite (owner fence, then capacity fences of the runtime's instances)",
   "packages/api/src/lib/share-invite-accept.ts":
     "M: invite acceptance creates the share under both owners' fences (sorted), then the invite row",
+  "packages/api/src/nodes/enroll-exchange.ts":
+    "M: enrollment exchange creates or takes over the node under graphWrite (the code owner's fence), code row FOR UPDATE",
   "packages/api/src/nodes/fabrics.ts":
     "M: fabric memberships, written inside nodes.update's graphWrite (owner fence first)",
   "packages/api/src/nodes/procedures.ts":

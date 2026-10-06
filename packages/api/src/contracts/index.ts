@@ -67,7 +67,7 @@ export const CSRF_REQUIRED_PROCEDURES: ReadonlySet<string> = new Set(
 export const SENSITIVE_INPUT_PROCEDURES: ReadonlySet<string> = new Set(["nodes.secrets.set"]);
 
 export * from "./auth-context";
-export { TEST_INSTANCE_HEADER } from "./http";
+export * from "./http";
 export {
   advertisedInputSchema,
   MCP_EXCLUDED_SESSION_PROCEDURES,

@@ -669,7 +669,8 @@ ALTER TABLE runtime_operation DROP CONSTRAINT IF EXISTS runtime_operation_shape;
 ALTER TABLE runtime_operation ADD CONSTRAINT runtime_operation_shape CHECK (
   (actor = 'AGENT') = (num_nonnulls("agentTokenId", "mcpGrantId") = 1)
   AND num_nonnulls("agentTokenId", "mcpGrantId") <= 1
-  AND (kind = 'PROFILE_APPLY') = ("profileId" IS NOT NULL)
+  -- Only a profile apply names a profile; deleting the profile nulls it (history stays).
+  AND (kind = 'PROFILE_APPLY' OR "profileId" IS NULL)
   AND fingerprint ~ '^[0-9a-f]{64}$'
   AND jsonb_typeof(summary) = 'object'
 );

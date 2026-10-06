@@ -98,6 +98,7 @@ import {
 } from "./model-api/realtime/websocket.js";
 import { createModelApiRoutes } from "./model-api/routes.js";
 import { transcriptionContentLengthGuard } from "./model-api/transcription-body-guard.js";
+import { registerNodeHttpRoutes } from "./node-http.js";
 import { logOrpcError } from "./orpc-error-log.js";
 import {
   authLimiter,
@@ -675,6 +676,12 @@ export async function createApp(options: CreateAppOptions = {}) {
   // — before the static-asset middleware and the SSR catch-all below — so the
   // `/$lang/...` router never swallows them and returns the SPA HTML shell.
   registerSeoRoutes(app);
+
+  // Node bootstrap (contracts/http.ts): /.well-known/wsmp, /install.sh, POST /api/node/enroll.
+  // No session, no CSRF (the enrollment code is the credential); rate-limited inside.
+  registerNodeHttpRoutes(app, {
+    closeRevokedSessions: (ids) => relaySessionManager.closeSessionsForRevokedCredentials({ ids }),
+  });
 
   app.use("/api/cli/ws", createRelayWebsocketMiddleware());
   app.get("/api/cli/ws", relayUpgradeHandler());

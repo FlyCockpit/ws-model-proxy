@@ -11,6 +11,9 @@
     "./lib/runtime-launch-hash": {
       "default": "./src/lib/runtime-launch-hash.ts"
     },
+    "./nodes/enroll-exchange": {
+      "default": "./src/nodes/enroll-exchange.ts"
+    },
     "./contracts": {
       "default": "./src/contracts/index.ts"
     },
