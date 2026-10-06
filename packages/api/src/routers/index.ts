@@ -4,6 +4,8 @@ import { env } from "@ws-model-proxy/env/server";
 import { contractProcedure, publicContractProcedure } from "../contract-procedure";
 import { appContract } from "../contracts/account";
 import { providerCredentialKeyringConfigured } from "../lib/provider-credential-crypto";
+// Registers share-invite acceptance with the Better Auth hooks (side effect).
+import "../lib/share-invite-accept";
 import { accessRouter } from "./access";
 import { activityRouter } from "./activity";
 import { adminObservabilityRouter } from "./admin-observability";

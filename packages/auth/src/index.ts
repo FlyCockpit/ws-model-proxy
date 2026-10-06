@@ -23,7 +23,7 @@ import { resolveAuthLogCall } from "./auth-logger-bridge";
 import { isUserBanned } from "./is-user-banned";
 import { resolveMcpPlugins } from "./mcp-plugins";
 import {
-  acceptShareInvitesForVerifiedEmail,
+  acceptShareInvitesForProvenEmail,
   isEmailVerificationPath,
 } from "./share-invite-acceptance";
 import { resolveSignupLocale } from "./signup-locale";
@@ -52,10 +52,13 @@ async function acceptInvitesQuietly(user: unknown): Promise<void> {
   const row = user as { id?: unknown; email?: unknown; emailVerified?: unknown } | null;
   if (!row || typeof row.id !== "string" || typeof row.email !== "string") return;
   try {
-    await acceptShareInvitesForVerifiedEmail(
-      { id: row.id, email: row.email, emailVerified: row.emailVerified === true },
-      { emailConfigured },
-    );
+    // Without SMTP every account is created "verified" without proof, so an e-mail match
+    // counts only when verification is on (inviteAcceptance: otherwise the link is needed).
+    await acceptShareInvitesForProvenEmail({
+      id: row.id,
+      email: row.email,
+      emailVerified: emailConfigured && row.emailVerified === true,
+    });
   } catch (error) {
     console.error("share invite acceptance failed", error instanceof Error ? error.name : "error");
   }

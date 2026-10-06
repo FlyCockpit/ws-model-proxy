@@ -45,7 +45,6 @@ import { runSerializableTransaction } from "../lib/serializable-transaction";
 import {
   generateShareInviteToken,
   pendingInviteWhere,
-  SHARE_INVITE_MAX_LIFETIME_MS,
   SHARE_INVITE_MAX_PENDING_PER_OWNER,
   SHARE_INVITE_RESEND_COOLDOWN_MS,
   SHARE_INVITE_TTL_MS,
@@ -459,17 +458,9 @@ async function writeInvite(
           data: { reason: "rate_limited" },
         });
       }
-      // An invite lives at most 30 days from its creation (share_invite_shape).
-      const latest = invite.createdAt.getTime() + SHARE_INVITE_MAX_LIFETIME_MS;
-      const rotatedExpiry = new Date(Math.min(expiresAt.getTime(), latest));
-      if (rotatedExpiry.getTime() - now.getTime() < 86_400_000) {
-        throw new ORPCError("CONFLICT", {
-          message: "This invite is too old to resend. Withdraw it and invite again.",
-        });
-      }
       const rotated = await tx.shareInvite.updateMany({
         where: { id: args.inviteId, ownerUserId: args.ownerUserId, ...pendingInviteWhere(now) },
-        data: { tokenDigest, expiresAt: rotatedExpiry, emailSentAt: null },
+        data: { tokenDigest, expiresAt, emailSentAt: null },
       });
       if (rotated.count !== 1) throw notFound();
       return tx.shareInvite.findUniqueOrThrow({
@@ -509,11 +500,11 @@ async function writeInvite(
         select: shareInviteSelect,
       })
       .catch((error: unknown) => {
-        // Until pending-only uniqueness lands, an earlier accepted/revoked/expired row for
-        // the same pool and e-mail blocks a new invite.
+        // One pending invite per pool and e-mail (partial unique index): a concurrent invite
+        // to the same address won.
         if (isUniqueViolation(error)) {
           throw new ORPCError("CONFLICT", {
-            message: "This e-mail was invited to this pool before. Try again later.",
+            message: "This e-mail already has a pending invite to this pool. Resend it instead.",
           });
         }
         throw error;
