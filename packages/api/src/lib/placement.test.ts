@@ -651,4 +651,115 @@ describe("preemption", () => {
     const next = planner.place(request({ runtimeId: "rt-x", ...QWEN_FLASH, labels: ["spark"] }));
     expect(next.ok).toBe(false);
   });
+
+  it("on one shared fabric, stops one two-node instance rather than two singles", () => {
+    const instances = [
+      running("glm", ["s1", "s2"], 110),
+      ...["s3", "s4", "s5", "s6", "s7", "s8"].map((id) => running(`q-${id}`, [id], 100)),
+    ];
+    const planner = new PlacementPlanner(context({ fabrics: [SWITCH], instances }));
+    const result = ok(
+      planner.place(
+        request({ groupSize: 2, resources: [{ kind: "unified", memoryGb: 96 }], preempt: true }),
+      ),
+    );
+    expect(result.stops.map((stop) => stop.instanceId)).toEqual(["glm"]);
+    expect(nodesOf(result).sort()).toEqual(["s1", "s2"]);
+  });
+});
+
+describe("review fixes", () => {
+  const twoGpus = () =>
+    node("gpu", {
+      memoryGb: 64,
+      gpus: [
+        { key: "nvidia:0", vendor: "nvidia", vramGb: 12 },
+        { key: "nvidia:1", vendor: "nvidia", vramGb: 12 },
+      ],
+    });
+  const discrete = (vramGb: number): RuntimeResource[] => [
+    { kind: "discrete", gpuCount: 1, vramGb },
+  ];
+
+  it("records the GPUs a rank takes and replays them, whatever the instance ids", () => {
+    // Place b, c, d (4 each) and a (6) in that order, then carry the claims to a new plan.
+    const first = new PlacementPlanner(context({ nodes: [twoGpus()] }));
+    const claims: PlacementInstance[] = [];
+    for (const [id, vram] of [
+      ["b", 4],
+      ["c", 4],
+      ["d", 4],
+      ["a", 6],
+    ] as const) {
+      const placed = ok(first.place(request({ runtimeId: `rt-${id}`, resources: discrete(vram) })));
+      const placement = placed.start.placements[0];
+      if (!placement) throw new Error("placement");
+      expect(placement.resources.gpus).toHaveLength(1);
+      claims.push(
+        running(id, ["gpu"], 0, {
+          ranks: [
+            { nodeId: "gpu", port: placement.port, distPort: null, resources: placement.resources },
+          ],
+        }),
+      );
+    }
+    // 24 - 18 = 6 GiB are left on one GPU: a 6 GiB start fits there in the next plan too.
+    const next = new PlacementPlanner(context({ nodes: [twoGpus()], instances: claims }));
+    expect(ok(next.place(request({ runtimeId: "rt-e", resources: discrete(6) }))).ok).toBe(true);
+    const full = next.place(request({ runtimeId: "rt-f", resources: discrete(2) }));
+    expect(full.ok).toBe(false);
+  });
+
+  it("never admits more VRAM than the GPUs have, even for over-committed claims", () => {
+    // 26 GiB claimed on 24 GiB without recorded GPUs (claims from before lane F).
+    const claims = [
+      running("x", ["gpu"], 0, {
+        ranks: [{ nodeId: "gpu", port: 30000, distPort: null, resources: discrete(10)[0] }],
+      }),
+      running("y", ["gpu"], 0, {
+        ranks: [{ nodeId: "gpu", port: 30001, distPort: null, resources: discrete(10)[0] }],
+      }),
+      running("z", ["gpu"], 0, {
+        ranks: [{ nodeId: "gpu", port: 30002, distPort: null, resources: discrete(6)[0] }],
+      }),
+    ];
+    const planner = new PlacementPlanner(context({ nodes: [twoGpus()], instances: claims }));
+    expect(planner.place(request({ resources: discrete(2) })).ok).toBe(false);
+  });
+
+  it("keeps the fingerprinted warning text free of live numbers", () => {
+    const nodes = [node("h1", { liveFreeMemoryGb: 10 })];
+    const planner = new PlacementPlanner(context({ nodes }));
+    const result = ok(planner.place(request()));
+    expect(result.warnings).toEqual([
+      {
+        code: "low_free_memory",
+        nodeId: "h1",
+        detail: "The node reports less free memory than this rank declares.",
+      },
+    ]);
+  });
+
+  it("explains a multi-node refusal by the fabric's nodes, not unrelated ones", () => {
+    const nodes = [
+      ...lab().map((n) => (n.id === "s1" ? { ...n, held: true } : n)),
+      node("far", { online: false }),
+    ];
+    const planner = new PlacementPlanner(
+      context({ nodes, fabrics: [PAIRS[0] as PlacementFabric] }),
+    );
+    const result = planner.place(request({ ...GLM }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.refusal.reason).toBe("node_held");
+  });
+
+  it("says no_free_ports when stopping others would free memory but not a port", () => {
+    const nodes = [node("a", { portRange: [30000, 30000] })];
+    const planner = new PlacementPlanner(
+      context({ nodes, instances: [running("busy", ["a"], 126)] }),
+    );
+    const result = planner.place(request({ preempt: true }));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.refusal.reason).toBe("no_free_ports");
+  });
 });

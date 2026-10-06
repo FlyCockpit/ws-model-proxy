@@ -514,6 +514,21 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
     });
   });
 
+  it("a restart writes the new version's resources onto each rank's claim", async () => {
+    setupStart(nodeRow(), [claimant("inst-1", [{ port: 30004, memoryGb: 8 }])]);
+    db.runtimeInstance.findFirst.mockResolvedValue({
+      id: "inst-1",
+      Ranks: [{ nodeId: "node-1", port: 30004, distPort: null }],
+    } as never);
+    db.instanceRank.update.mockResolvedValue({} as never);
+    await client(CALLERS.fullAgent()).start({ runtimeId: "rt-1", instanceId: "inst-1" });
+    expect(fenceLog.held).toEqual([`00:owner:${OWNER}`, "08:capacity:inst-1"]);
+    expect(db.instanceRank.update.mock.calls[0]?.[0]).toMatchObject({
+      where: { instanceId_rank: { instanceId: "inst-1", rank: 0 } },
+      data: { claim: "HELD", port: 30004, resources: { kind: "unified", memoryGb: 16 } },
+    });
+  });
+
   it("refuses as stale when a preempted instance stopped meanwhile", async () => {
     setupStart(nodeRow(), [claimant("victim", [{ port: 30000, memoryGb: 60 }])]);
     db.runtimeInstance.updateMany.mockResolvedValue({ count: 0 });

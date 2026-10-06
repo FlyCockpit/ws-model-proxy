@@ -301,16 +301,22 @@ export const runtimeStart = contractProcedure(c.start).handler(async ({ input, c
               fabricId: start.fabric?.fabricId ?? null,
             },
           });
-          await tx.instanceRank.updateMany({
-            where: { instanceId: start.instanceId },
-            data: {
-              claim: "HELD",
-              claimChangedAt: now,
-              stoppedAt: null,
-              distPort: start.distPort,
-              blockedBy,
-            },
-          });
+          // Each rank takes the new version's resources (and the GPUs the plan picked).
+          for (const placement of start.placements)
+            await tx.instanceRank.update({
+              where: {
+                instanceId_rank: { instanceId: start.instanceId, rank: placement.nodeNumber - 1 },
+              },
+              data: {
+                claim: "HELD",
+                claimChangedAt: now,
+                stoppedAt: null,
+                port: placement.port,
+                distPort: start.distPort,
+                resources: placement.resources as object,
+                blockedBy,
+              },
+            });
           continue;
         }
         const id = newRowId();

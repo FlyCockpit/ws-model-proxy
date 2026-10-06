@@ -175,9 +175,25 @@ type Needs = { memoryGb: number; gpuCount: number; vramGb: number; vendor: GpuVe
 
 const NO_NEEDS: Needs = { memoryGb: 0, gpuCount: 0, vramGb: 0, vendor: null };
 
+/**
+ * The GPUs a discrete claim holds, as the planner recorded them in the rank's `resources`
+ * (`gpus`: GPU keys). Absent on claims written before lane F.
+ */
+export function recordedGpuKeys(resources: unknown): string[] | null {
+  if (!resources || typeof resources !== "object") return null;
+  const gpus = Reflect.get(resources, "gpus");
+  if (!Array.isArray(gpus) || !gpus.every((key) => typeof key === "string")) return null;
+  return gpus;
+}
+
 /** What a rank's resources take from a node. Unparseable JSON takes nothing. */
 export function resourceNeeds(resources: unknown): Needs {
-  const parsed = runtimeResourceSchema.safeParse(resources);
+  let spec = resources;
+  if (resources && typeof resources === "object" && "gpus" in resources) {
+    const { gpus: _recorded, ...rest } = resources as Record<string, unknown>;
+    spec = rest;
+  }
+  const parsed = runtimeResourceSchema.safeParse(spec);
   if (!parsed.success) return NO_NEEDS;
   const resource = parsed.data;
   switch (resource.kind) {
@@ -257,6 +273,34 @@ function apply(budget: Budget, needs: Needs, gpuKeys: readonly string[], sign: 1
   }
 }
 
+/**
+ * The GPUs an existing claim holds: the keys it recorded when they still exist with the vendor
+ * it needs, else the best-fit pick, else (an over-committed node) the GPUs with the most free
+ * VRAM. Over-commit then shows as negative free VRAM, so nothing more fits there.
+ */
+function claimGpus(budget: Budget, needs: Needs, resources: unknown): string[] {
+  if (needs.gpuCount === 0) return [];
+  const recorded = recordedGpuKeys(resources);
+  if (
+    recorded &&
+    recorded.length === needs.gpuCount &&
+    new Set(recorded).size === recorded.length &&
+    recorded.every((key) =>
+      budget.gpus.some(
+        (gpu) => gpu.key === key && (needs.vendor === null || gpu.vendor === needs.vendor),
+      ),
+    )
+  )
+    return recorded;
+  return (
+    pickGpus(budget.gpus, needs) ??
+    [...budget.gpus]
+      .sort((a, b) => b.freeGb - a.freeGb || compareCodePoints(a.key, b.key))
+      .slice(0, needs.gpuCount)
+      .map((gpu) => gpu.key)
+  );
+}
+
 /** The lowest free port of the node's range (or the fixed one), or null. */
 function freePort(budget: Budget, node: PlacementNode, fixed: number | undefined): number | null {
   if (fixed !== undefined) return budget.ports.has(fixed) ? null : fixed;
@@ -279,6 +323,13 @@ function fit(
   if (needs.memoryGb > budget.memoryGb + EPSILON) return { ok: false, reason: "not_enough_memory" };
   const gpuKeys = pickGpus(budget.gpus, needs);
   if (!gpuKeys) return { ok: false, reason: "not_enough_memory" };
+  // Over-committed claims show as negative free VRAM on some GPU: the vendor's total must
+  // cover the rank too, so no over-commit is ever placed on top.
+  const totalFree = budget.gpus
+    .filter((gpu) => needs.vendor === null || gpu.vendor === needs.vendor)
+    .reduce((sum, gpu) => sum + gpu.freeGb, 0);
+  if (needs.gpuCount > 0 && totalFree + EPSILON < needs.gpuCount * needs.vramGb)
+    return { ok: false, reason: "not_enough_memory" };
   const port = freePort(budget, node, fixedPort);
   if (port === null)
     return { ok: false, reason: fixedPort === undefined ? "no_free_ports" : "port_in_use" };
@@ -434,14 +485,7 @@ export class PlacementPlanner {
         budget.ports.add(rank.port);
         if (rank.distPort !== null) budget.ports.add(rank.distPort);
         const needs = resourceNeeds(rank.resources);
-        // An over-committed node (claims beyond its budget) still records what it holds: the
-        // GPUs with the most free VRAM, so nothing more fits there.
-        const gpuKeys =
-          pickGpus(budget.gpus, needs) ??
-          [...budget.gpus]
-            .sort((a, b) => b.freeGb - a.freeGb || compareCodePoints(a.key, b.key))
-            .slice(0, needs.gpuCount)
-            .map((gpu) => gpu.key);
+        const gpuKeys = claimGpus(budget, needs, rank.resources);
         this.#gpuClaims.set(`${instance.id}|${index}`, gpuKeys);
         if (!this.#stopping.has(instance.id)) apply(budget, needs, gpuKeys, 1);
       });
@@ -509,7 +553,8 @@ export class PlacementPlanner {
         warnings.push({
           code: "low_free_memory",
           nodeId: rank.node.id,
-          detail: `The node reports ${gib(live)} free; this rank declares ${gib(rank.needs.memoryGb)}.`,
+          // Fixed text: a live number would change the fingerprint with every sample.
+          detail: "The node reports less free memory than this rank declares.",
         });
     }
     const memberIp = (nodeId: string) =>
@@ -524,7 +569,12 @@ export class PlacementPlanner {
           nodeNumber: index + 1,
           port: rank.port,
           fabricIp: memberIp(rank.node.id),
-          resources: { ...(rankResources(request.launch, index) as Record<string, unknown>) },
+          // The GPUs this rank takes are recorded with its claim (`gpus`), so later plans
+          // account the same GPUs.
+          resources: {
+            ...(rankResources(request.launch, index) as Record<string, unknown>),
+            ...(rank.gpuKeys.length > 0 ? { gpus: [...rank.gpuKeys] } : {}),
+          },
         })),
         fabric:
           fabric && head
@@ -593,20 +643,33 @@ export class PlacementPlanner {
   ): InstanceChoice | { refusal: PlacementRefusal } {
     const { launch } = request;
     const reasons = new Set<RefusalReason>();
+    const nodeReasons = new Map<string, RefusalReason>();
     const eligible: PlacementNode[] = [];
     for (const node of [...this.#nodes.values()].sort((a, b) =>
       compareCodePoints(a.slug, b.slug),
     )) {
       if (request.allowedNodeIds && !request.allowedNodeIds.has(node.id)) continue;
       const reason = this.#ineligible(node, request);
-      if (reason) reasons.add(reason);
+      if (reason) nodeReasons.set(node.id, reason);
       else eligible.push(node);
     }
 
+    // Fit reasons of the last pass explain the refusal (with preemption, what is left after
+    // every allowed stop).
+    const fitReasons = new Set<RefusalReason>();
+    const pass = (run: (preempt: boolean, into: Set<RefusalReason>) => InstanceChoice | null) => {
+      const plain = run(false, fitReasons);
+      if (plain || !request.preempt) return plain;
+      fitReasons.clear();
+      return run(true, fitReasons);
+    };
+
     if (launch.groupSize === 1) {
-      const attempt = (preempt: boolean) =>
-        this.#bestGroup(working, request, eligible, null, preempt, reasons);
-      const choice = attempt(false) ?? (request.preempt ? attempt(true) : null);
+      for (const reason of nodeReasons.values()) reasons.add(reason);
+      const choice = pass((preempt, into) =>
+        this.#bestGroup(working, request, eligible, null, preempt, into),
+      );
+      for (const reason of fitReasons) reasons.add(reason);
       return choice ?? { refusal: this.#autoRefusal(reasons, request, eligible) };
     }
 
@@ -622,20 +685,24 @@ export class PlacementPlanner {
             : `No fabric has ${launch.groupSize} nodes; a multi-node instance stays inside one fabric.`,
         ),
       };
+    // Only nodes of these fabrics explain a multi-node refusal.
+    for (const [nodeId, reason] of nodeReasons)
+      if (fabrics.some((fabric) => fabric.members.some((member) => member.nodeId === nodeId)))
+        reasons.add(reason);
     const membersOf = (fabric: PlacementFabric) =>
       eligible.filter((node) => fabric.members.some((member) => member.nodeId === node.id));
-    const pass = (preempt: boolean): InstanceChoice | null => {
+    const choice = pass((preempt, into) => {
       let best: InstanceChoice | null = null;
       for (const fabric of fabrics) {
         const members = membersOf(fabric);
         if (members.length < launch.groupSize) continue;
-        const choice = this.#bestGroup(working, request, members, fabric, preempt, reasons);
-        if (choice && (!best || compareInstanceChoice(choice, best) < 0)) best = choice;
+        const candidate = this.#bestGroup(working, request, members, fabric, preempt, into);
+        if (candidate && (!best || compareInstanceChoice(candidate, best) < 0)) best = candidate;
       }
       return best;
-    };
-    const choice = pass(false) ?? (request.preempt ? pass(true) : null);
+    });
     if (choice) return choice;
+    for (const reason of fitReasons) reasons.add(reason);
     if (!fabrics.some((fabric) => membersOf(fabric).length >= launch.groupSize)) {
       // Fabrics with enough members exist, but too few of them may take a rank.
       const reason = REASON_ORDER.find(
@@ -658,10 +725,45 @@ export class PlacementPlanner {
     preempt: boolean,
     reasons: Set<RefusalReason>,
   ): InstanceChoice | null {
+    let best = this.#greedyGroup(base, request, candidates, fabric, preempt, reasons, null);
+    if (!preempt || request.launch.groupSize === 1) return best;
+    // Rank by rank, one single-node victim always looks cheaper than a multi-node one, though
+    // stopping that one instance may free several ranks at once. Try each multi-node victim
+    // among the candidates as a seed and keep the least disruptive whole plan.
+    const candidateIds = new Set(candidates.map((node) => node.id));
+    const seeds = [...this.#instances.values()]
+      .filter(
+        (instance) =>
+          !base.victims.has(instance.id) &&
+          instance.ranks.filter((rank) => rank.nodeId !== null && candidateIds.has(rank.nodeId))
+            .length > 1 &&
+          this.#preemptible(instance, request),
+      )
+      .sort((a, b) => compareCodePoints(a.id, b.id));
+    for (const seed of seeds) {
+      const choice = this.#greedyGroup(base, request, candidates, fabric, preempt, reasons, seed);
+      if (choice && (!best || compareInstanceChoice(choice, best) < 0)) best = choice;
+    }
+    return best;
+  }
+
+  #greedyGroup(
+    base: Working,
+    request: PlacementRequest,
+    candidates: readonly PlacementNode[],
+    fabric: PlacementFabric | null,
+    preempt: boolean,
+    reasons: Set<RefusalReason>,
+    seed: PlacementInstance | null,
+  ): InstanceChoice | null {
     const working: Working = {
       budgets: new Map([...base.budgets].map(([id, budget]) => [id, cloneBudget(budget)])),
       victims: new Set(base.victims),
     };
+    if (seed) {
+      working.victims.add(seed.id);
+      this.#freeInstance(working, seed.id, false);
+    }
     const used = new Set<string>();
     const ranks: RankChoice[] = [];
     for (let index = 0; index < request.launch.groupSize; index++) {
@@ -724,6 +826,8 @@ export class PlacementPlanner {
       .slice(0, MAX_VICTIMS_PER_NODE);
     let best: RankChoice | null = null;
     let bestCost: Cost | null = null;
+    // Stops free memory, never ports: a trial that fits memory but not a port says so.
+    let reason: "not_enough_memory" | "port_in_use" | "no_free_ports" = "not_enough_memory";
     const total = 1 << candidates.length;
     for (let mask = 1; mask < total; mask++) {
       const victims = candidates.filter((_, index) => (mask & (1 << index)) !== 0);
@@ -732,11 +836,14 @@ export class PlacementPlanner {
       const trial = cloneBudget(budget);
       for (const victim of victims) this.#freeOnNode(trial, victim, node.id);
       const fitted = fit(node, trial, resources, fixedPort);
-      if (!fitted.ok) continue;
+      if (!fitted.ok) {
+        if (fitted.reason !== "not_enough_memory") reason = fitted.reason;
+        continue;
+      }
       best = rankChoice(node, trial, fitted, victims);
       bestCost = cost;
     }
-    return best ?? { reason: "not_enough_memory" };
+    return best ?? { reason };
   }
 
   /** Frees the chosen victims everywhere, then takes the rank's claim. */
@@ -750,6 +857,7 @@ export class PlacementPlanner {
     if (!budget) return;
     // GPUs again on the freed budget (identical to the trial's pick: same state, same rule).
     const gpuKeys = pickGpus(budget.gpus, choice.needs) ?? choice.gpuKeys;
+    choice.gpuKeys = gpuKeys;
     apply(budget, choice.needs, gpuKeys, 1);
     budget.ports.add(choice.port);
   }
