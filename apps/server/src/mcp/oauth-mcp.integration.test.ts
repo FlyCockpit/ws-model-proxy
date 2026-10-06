@@ -1739,6 +1739,7 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
             accept: "application/json",
             host: new URL(BASE).host,
             "mcp-method": "tools/list",
+            "mcp-protocol-version": "2026-07-28",
             authorization: `Bearer ${accessToken}`,
           },
           body: JSON.stringify({
@@ -1951,6 +1952,7 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
         // with the body method, Mcp-Name with params.name when present
         // (validateStandardRequestHeaders mismatch -32020).
         "mcp-method": method,
+        "mcp-protocol-version": "2026-07-28",
         ...(typeof params.name === "string" ? { "mcp-name": params.name } : {}),
         ...(accessToken ? { authorization: `Bearer ${accessToken}` } : {}),
       },
@@ -2191,6 +2193,7 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
         accept: JSON_TYPE,
         host: new URL(base).host,
         "mcp-method": "tools/list",
+        "mcp-protocol-version": "2026-07-28",
         authorization: `${scheme} ${accessToken}`,
         ...(proof === undefined ? {} : { dpop: proof }),
       },
@@ -2632,6 +2635,7 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
         accept: JSON_TYPE,
         host: new URL(BASE).host,
         "mcp-method": "tools/list",
+        "mcp-protocol-version": "2026-07-28",
         authorization: `Bearer ${tokens.accessToken}`,
       },
       body: mcpListBody(2003),
@@ -3048,6 +3052,7 @@ integration("MCP OAuth end-to-end over disposable PostgreSQL", () => {
         accept: JSON_TYPE,
         host: new URL(BASE).host,
         "mcp-method": "tools/list",
+        "mcp-protocol-version": "2026-07-28",
         authorization: `Bearer ${tokens.accessToken}`,
       },
       body: mcpListBody(2205),

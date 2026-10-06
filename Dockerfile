@@ -26,7 +26,7 @@ RUN apt-get update -y && apt-get install -y \
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
 ENV NODE_OPTIONS="--max-old-space-size=4096"
-RUN corepack enable && corepack prepare pnpm@11.1.2 --activate
+RUN corepack enable && corepack prepare pnpm@11.28.2 --activate
 
 # --- Builder stage ---
 # pnpm install runs here with source files present so workspace symlinks resolve correctly
