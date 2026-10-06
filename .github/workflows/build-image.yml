@@ -62,7 +62,7 @@ jobs:
       # no patch available so we don't fail builds on advisories the user
       # cannot resolve. Drop that flag if you want to fail on those too.
       - name: Scan ${{ matrix.name }} image with Trivy
-        uses: aquasecurity/trivy-action@314ff8b43182423b84c50b1670b0e10f858f2d98 # v0.36.0 + 1 CI-only commit (untagged master, 2026-05-13)
+        uses: aquasecurity/trivy-action@c03d123cb480c08c69b054af418ea5e69fe6e57e # v0.36.0 + 1 CI-only commit (untagged master, 2026-05-13)
         with:
           image-ref: ${{ github.event.repository.name }}-${{ matrix.name }}:${{ github.sha }}
           severity: HIGH,CRITICAL
