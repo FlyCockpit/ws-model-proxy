@@ -12,8 +12,8 @@
 //! server hears `exec.done` / `term.exit` and a close frame, and the control
 //! socket and PID file guards drop. The process then dies from the same
 //! signal, so the parent sees the conventional status (143, 130, 129).
-//! Because a handler stays installed, dying from the signal re-executes this
-//! binary in a mode that only raises it (see [`terminate_by_signal`]).
+//! Because a handler stays installed, dying from the signal goes through
+//! `signal-hook`'s safe default-action emulation (see [`terminate_by_signal`]).
 //!
 //! A signal can land on any thread, so a blocking call with a timeout may
 //! fail once with `EINTR` (`ErrorKind::Interrupted`). Relay socket reads treat
@@ -62,47 +62,19 @@ pub fn signal_of(err: &anyhow::Error) -> Option<i32> {
         .map(|shutdown| shutdown.signal)
 }
 
-/// End the process the way `signal` would have, falling back to exit status
-/// `128 + signal`.
+/// End the process the way `signal` would have, so a service manager sees a
+/// death by SIGTERM (a clean stop to systemd) rather than exit status 143.
 ///
-/// On Unix the relay's handler for `signal` cannot be reset without
-/// `unsafe`, so once [`install`] has run this re-executes the binary (same
-/// PID) with [`DIE_BY_SIGNAL_ARG`]: `exec` puts caught signals back to
-/// their default action, and the new image raises `signal` at once (see
-/// [`die_if_reexecuted`]). A service manager then sees a death by SIGTERM
-/// (a clean stop to systemd) rather than exit status 143.
+/// On Unix, `signal_hook::low_level::emulate_default_handler` puts the
+/// default action back in place of the relay's handler, unblocks `signal`,
+/// and raises it. Exit status `128 + signal` is only the last resort, for a
+/// signal it does not know.
 pub fn terminate_by_signal(signal: i32) -> ! {
     #[cfg(unix)]
-    unix::die_by(signal);
-    std::process::exit(128_i32.saturating_add(signal))
-}
-
-/// First argument of the re-executed image that only dies from a signal.
-/// Not a command: [`die_if_reexecuted`] handles it before argument parsing.
-#[cfg(unix)]
-pub const DIE_BY_SIGNAL_ARG: &str = "__wsmp-die-by-signal";
-
-/// Call first in `main`. When this image was started by
-/// [`terminate_by_signal`], raise the signal it names and never return.
-pub fn die_if_reexecuted() {
-    #[cfg(unix)]
     {
-        let args = std::env::args_os().skip(1).collect::<Vec<_>>();
-        let [mode, signal] = args.as_slice() else {
-            return;
-        };
-        if mode != DIE_BY_SIGNAL_ARG {
-            return;
-        }
-        let Some(signal) = signal
-            .to_str()
-            .and_then(|signal| signal.parse::<i32>().ok())
-        else {
-            return;
-        };
-        unix::raise_default(signal);
-        std::process::exit(128_i32.saturating_add(signal))
+        let _ = signal_hook::low_level::emulate_default_handler(signal);
     }
+    std::process::exit(128_i32.saturating_add(signal))
 }
 
 #[cfg(any(unix, windows))]
@@ -282,19 +254,14 @@ mod tracked {
 #[cfg(unix)]
 mod unix {
     use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
 
     use anyhow::{Context, Result};
-    use nix::sys::signal::{SigSet, Signal};
+    use nix::sys::signal::Signal;
     use tokio::signal::unix::{SignalKind, signal};
 
     /// Set once tokio's handler is in place for the shutdown signals.
     static INSTALLED: OnceLock<()> = OnceLock::new();
-    /// Set the moment tokio's handler replaces the default action for any
-    /// shutdown signal, before the watcher thread exists: from then on only
-    /// a re-executed image can die from the signal (see [`die_by`]).
-    static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
     /// Start taking shutdown signals. The handlers are registered before
     /// this returns, so a signal that lands later (even before the watcher
@@ -315,10 +282,9 @@ mod unix {
             shutdown_signals()
                 .into_iter()
                 .map(|kind| {
-                    let listener = signal(SignalKind::from_raw(kind as i32))
-                        .with_context(|| format!("listening for {}", kind.as_str()))?;
-                    HANDLER_INSTALLED.store(true, Ordering::SeqCst);
-                    Ok((kind, listener))
+                    signal(SignalKind::from_raw(kind as i32))
+                        .map(|listener| (kind, listener))
+                        .with_context(|| format!("listening for {}", kind.as_str()))
                 })
                 .collect::<Result<Vec<_>>>()?
         };
@@ -396,50 +362,6 @@ mod unix {
             .or_else(|| text.strip_prefix("0X"))
             .unwrap_or(text);
         u64::from_str_radix(text, 16).ok()
-    }
-
-    /// End the process with `signal`. Once the handler is installed only a
-    /// new image has the default action back; if `exec` fails the caller
-    /// falls back to an exit status.
-    pub(super) fn die_by(signal: i32) {
-        if HANDLER_INSTALLED.load(Ordering::SeqCst) {
-            reexec_to_raise(signal);
-        } else {
-            raise_default(signal);
-        }
-    }
-
-    /// Replace this image (same PID, so the parent still waits on it) with
-    /// one that raises `signal` before doing anything else. Linux uses
-    /// `/proc/self/exe`, which still works after the binary was replaced
-    /// on disk. Returns only when `exec` failed.
-    fn reexec_to_raise(signal: i32) {
-        use std::os::unix::process::CommandExt;
-        let exe = if cfg!(target_os = "linux") {
-            std::path::PathBuf::from("/proc/self/exe")
-        } else {
-            match std::env::current_exe() {
-                Ok(exe) => exe,
-                Err(_) => return,
-            }
-        };
-        let _error = std::process::Command::new(exe)
-            .arg(super::DIE_BY_SIGNAL_ARG)
-            .arg(signal.to_string())
-            .exec();
-    }
-
-    /// Unblock `signal` in this thread and raise it. With the default action
-    /// in place this terminates the whole process.
-    pub(super) fn raise_default(signal: i32) {
-        let Ok(signal) = Signal::try_from(signal) else {
-            return;
-        };
-        let mut set = SigSet::empty();
-        set.add(signal);
-        if set.thread_unblock().is_ok() {
-            let _ = nix::sys::signal::raise(signal);
-        }
     }
 
     #[cfg(test)]
