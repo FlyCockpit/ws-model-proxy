@@ -206,6 +206,7 @@ try {
         authorization: `Bearer ${patCredential.secret}`,
         "content-type": "application/json",
         accept: "application/json, text/event-stream",
+        "mcp-protocol-version": "2026-07-28",
         "mcp-method": method,
         ...headers,
       },

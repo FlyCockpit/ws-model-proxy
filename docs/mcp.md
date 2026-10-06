@@ -1370,9 +1370,10 @@ Let `ISSUER` = `<BETTER_AUTH_URL>/api/auth` and `RESOURCE` =
    revoked **current** token fails and deletes the whole refresh family
    (see [Grants and revocation](#grants-and-revocation)).
 4. **Tool call** — `POST /mcp` (JSON, one JSON-RPC message per request). The
-   `2026-07-28` wire requires header/body agreement: `Mcp-Method` must repeat
-   the body `method`, and `Mcp-Name` must repeat `params.name` when present
-   (a mismatch fails with `-32020`). `params._meta` carries the protocol
+   `2026-07-28` wire requires header/body agreement: `MCP-Protocol-Version`
+   must repeat the `_meta` protocol version, `Mcp-Method` must repeat the body
+   `method`, and `Mcp-Name` must repeat `params.name` when present (a missing
+   or mismatched header fails with `-32020`). `params._meta` carries the protocol
    version, client info, and capabilities:
 
    ```
@@ -1381,6 +1382,7 @@ Let `ISSUER` = `<BETTER_AUTH_URL>/api/auth` and `RESOURCE` =
    Content-Type: application/json
    Accept: application/json
    Authorization: Bearer <access JWT>
+   MCP-Protocol-Version: 2026-07-28
    Mcp-Method: tools/call
    Mcp-Name: forwarder_model_pools_list
 
