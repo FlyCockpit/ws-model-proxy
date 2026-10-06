@@ -1,11 +1,8 @@
 import { upgradeWebSocket, type WebSocketLike } from "@hono/node-server";
-import {
-  authenticateCliWebsocketSecret,
-  type CliWebsocketIdentity,
-} from "@ws-model-proxy/api/lib/cli-credential-access";
 import type { Context, MiddlewareHandler } from "hono";
 import type { WSContext, WSEvents } from "hono/ws";
 import { authLimiter, createRateLimiterMiddleware } from "../rate-limit.js";
+import { authenticateNodeCredential, type NodeIdentity } from "./node-credential-auth.js";
 import {
   parseRelaySubprotocolHeader,
   protocolErrorMessage,
@@ -15,7 +12,7 @@ import { type RelaySocket, relaySessionManager } from "./session-manager.js";
 import { settleSocketHandler } from "./socket-handler.js";
 
 type RelayVariables = {
-  relayIdentity: CliWebsocketIdentity;
+  relayIdentity: NodeIdentity;
 };
 
 function bearerSecret(header: string | undefined): string | null {
@@ -54,12 +51,12 @@ export function createRelayWebsocketMiddleware(): MiddlewareHandler<{ Variables:
 
     const secret = bearerSecret(c.req.header("authorization"));
     if (!secret) {
-      return c.json({ error: "CLI websocket authentication required." }, 401);
+      return c.json({ error: "Node credential required." }, 401);
     }
 
-    const identity = await authenticateCliWebsocketSecret(secret);
+    const identity = await authenticateNodeCredential(secret);
     if (!identity) {
-      return c.json({ error: "Invalid or revoked CLI websocket credential." }, 401);
+      return c.json({ error: "Invalid or revoked node credential." }, 401);
     }
     c.set("relayIdentity", identity);
     await next();
@@ -102,12 +99,12 @@ function relaySocketFor(ws: RelayWsContext): RelaySocket {
 }
 
 /**
- * The socket events of one upgraded CLI relay connection, for the identity the
+ * The socket events of one upgraded node relay connection, for the identity the
  * middleware authenticated. Exported for the wiring tests. `onOpen` runs after
  * the awaited authentication, so it is where a socket that authenticated
  * during shutdown is refused ({@link RelaySessionManager.acceptAuthenticatedSocket}).
  */
-export function relaySocketEvents(identity: CliWebsocketIdentity): WSEvents<WebSocketLike> {
+export function relaySocketEvents(identity: NodeIdentity): WSEvents<WebSocketLike> {
   return {
     onOpen(_event, ws) {
       const socket = relaySocketFor(ws);
@@ -118,7 +115,7 @@ export function relaySocketEvents(identity: CliWebsocketIdentity): WSEvents<WebS
     onMessage(event, ws) {
       const socket = relaySocketFor(ws);
       if (typeof event.data === "string") {
-        settleSocketHandler("cli text", relaySessionManager.handleTextFrame(socket, event.data));
+        settleSocketHandler("node text", relaySessionManager.handleTextFrame(socket, event.data));
         return;
       }
       if (event.data instanceof ArrayBuffer) {
@@ -128,7 +125,7 @@ export function relaySocketEvents(identity: CliWebsocketIdentity): WSEvents<WebS
     onClose(_event, ws) {
       const socket = relaySocketFor(ws);
       settleSocketHandler(
-        "cli close",
+        "node close",
         relaySessionManager.removeSession(socket).finally(() => {
           relaySockets.delete(ws);
         }),
@@ -137,7 +134,7 @@ export function relaySocketEvents(identity: CliWebsocketIdentity): WSEvents<WebS
     onError(_event, ws) {
       const socket = relaySocketFor(ws);
       settleSocketHandler(
-        "cli error",
+        "node error",
         relaySessionManager.removeSession(socket).finally(() => {
           relaySockets.delete(ws);
         }),

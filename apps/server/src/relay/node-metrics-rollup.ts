@@ -15,7 +15,7 @@ const MINUTE_MS = 60_000;
 
 export type NodeMetricsRollupSample = {
   ownerUserId: string;
-  cliDeviceId: string;
+  nodeId: string;
   receivedAt: Date;
   cpuPercent?: number | null;
   memoryAvailableMiB?: number | null;
@@ -27,7 +27,7 @@ export type NodeMetricsRollupSample = {
 export type NodeMetricsRollupIncrement = {
   bucketStart: Date;
   ownerUserId: string;
-  cliDeviceId: string;
+  nodeId: string;
   samples: number;
   cpuSamples: number;
   minCpuPercent: number | null;
@@ -77,7 +77,7 @@ function memoryUsedPercent(available: number | null, total: number | null): numb
 function pendingKey(sample: NodeMetricsRollupSample): string {
   return [
     sample.ownerUserId,
-    sample.cliDeviceId,
+    sample.nodeId,
     String(truncateToMinute(sample.receivedAt).getTime()),
   ].join("\u0000");
 }
@@ -94,7 +94,7 @@ export function mergeNodeMetricsIncrements(
   const next: NodeMetricsRollupIncrement = current ?? {
     bucketStart: truncateToMinute(sample.receivedAt),
     ownerUserId: sample.ownerUserId,
-    cliDeviceId: sample.cliDeviceId,
+    nodeId: sample.nodeId,
     samples: 0,
     cpuSamples: 0,
     minCpuPercent: null,
@@ -130,7 +130,7 @@ export function mergeNodeMetricsIncrements(
 }
 
 export function incrementKeyString(increment: NodeMetricsRollupIncrement): string {
-  return [increment.bucketStart.toISOString(), increment.ownerUserId, increment.cliDeviceId].join(
+  return [increment.bucketStart.toISOString(), increment.ownerUserId, increment.nodeId].join(
     "\u0000",
   );
 }
@@ -138,12 +138,12 @@ export function incrementKeyString(increment: NodeMetricsRollupIncrement): strin
 function upsertSql(increment: NodeMetricsRollupIncrement): Prisma.Sql {
   return Prisma.sql`
     INSERT INTO node_metrics_minute AS existing
-      ("bucketStart", "ownerUserId", "cliDeviceId", samples, "cpuSamples",
+      ("bucketStart", "ownerUserId", "nodeId", samples, "cpuSamples",
        "minCpuPercent", "sumCpuPercent", "maxCpuPercent", "memorySamples",
        "minMemoryAvailableMiB", "sumMemoryAvailableMiB", "maxMemoryAvailableMiB",
        "minMemoryUsedPercent", "sumMemoryUsedPercent", "maxMemoryUsedPercent",
        "maxGpuTemperatureC", "maxGpuUtilizationPercent")
-    VALUES (${increment.bucketStart}, ${increment.ownerUserId}, ${increment.cliDeviceId},
+    VALUES (${increment.bucketStart}, ${increment.ownerUserId}, ${increment.nodeId},
       ${increment.samples}, ${increment.cpuSamples},
       ${increment.minCpuPercent}, ${increment.sumCpuPercent}, ${increment.maxCpuPercent},
       ${increment.memorySamples}, ${increment.minMemoryAvailableMiB},
@@ -151,7 +151,7 @@ function upsertSql(increment: NodeMetricsRollupIncrement): Prisma.Sql {
       ${increment.minMemoryUsedPercent}, ${increment.sumMemoryUsedPercent},
       ${increment.maxMemoryUsedPercent}, ${increment.maxGpuTemperatureC},
       ${increment.maxGpuUtilizationPercent})
-    ON CONFLICT ("bucketStart", "ownerUserId", "cliDeviceId")
+    ON CONFLICT ("bucketStart", "ownerUserId", "nodeId")
     DO UPDATE SET
       samples = existing.samples + EXCLUDED.samples,
       "cpuSamples" = existing."cpuSamples" + EXCLUDED."cpuSamples",
@@ -197,7 +197,7 @@ function upsertSql(increment: NodeMetricsRollupIncrement): Prisma.Sql {
 }
 
 function incrementValues(increment: NodeMetricsRollupIncrement): Prisma.Sql {
-  return Prisma.sql`(${increment.bucketStart}, ${increment.ownerUserId}, ${increment.cliDeviceId},
+  return Prisma.sql`(${increment.bucketStart}, ${increment.ownerUserId}, ${increment.nodeId},
     ${increment.samples}, ${increment.cpuSamples},
     ${increment.minCpuPercent}, ${increment.sumCpuPercent}, ${increment.maxCpuPercent},
     ${increment.memorySamples}, ${increment.minMemoryAvailableMiB},
@@ -210,13 +210,13 @@ function incrementValues(increment: NodeMetricsRollupIncrement): Prisma.Sql {
 function upsertManySql(increments: readonly NodeMetricsRollupIncrement[]): Prisma.Sql {
   return Prisma.sql`
     INSERT INTO node_metrics_minute AS existing
-      ("bucketStart", "ownerUserId", "cliDeviceId", samples, "cpuSamples",
+      ("bucketStart", "ownerUserId", "nodeId", samples, "cpuSamples",
        "minCpuPercent", "sumCpuPercent", "maxCpuPercent", "memorySamples",
        "minMemoryAvailableMiB", "sumMemoryAvailableMiB", "maxMemoryAvailableMiB",
        "minMemoryUsedPercent", "sumMemoryUsedPercent", "maxMemoryUsedPercent",
        "maxGpuTemperatureC", "maxGpuUtilizationPercent")
     VALUES ${Prisma.join(increments.map(incrementValues))}
-    ON CONFLICT ("bucketStart", "ownerUserId", "cliDeviceId")
+    ON CONFLICT ("bucketStart", "ownerUserId", "nodeId")
     DO UPDATE SET
       samples = existing.samples + EXCLUDED.samples,
       "cpuSamples" = existing."cpuSamples" + EXCLUDED."cpuSamples",
@@ -437,11 +437,7 @@ export function createNodeMetricsRollupWriter({
         stop();
         return;
       }
-      if (
-        !sample.ownerUserId ||
-        !sample.cliDeviceId ||
-        !Number.isFinite(sample.receivedAt.getTime())
-      )
+      if (!sample.ownerUserId || !sample.nodeId || !Number.isFinite(sample.receivedAt.getTime()))
         return;
       const key = pendingKey(sample);
       const current = pending.get(key);
@@ -463,3 +459,4 @@ export function createNodeMetricsRollupWriter({
 const writer = createNodeMetricsRollupWriter();
 export const observeNodeMetricsRollup = writer.observe;
 export const stopNodeMetricsRollup = writer.stop;
+export const flushNodeMetricsRollup = writer.flushNow;

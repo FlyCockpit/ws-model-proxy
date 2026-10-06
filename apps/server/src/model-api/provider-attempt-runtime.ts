@@ -40,16 +40,17 @@ export async function heartbeatProviderAttempt(input: {
   extensionMs: number;
 }): Promise<boolean> {
   return prisma.$transaction(async (tx) => {
-    const attempt = await tx.providerAttempt.findUnique({
-      where: {
-        attemptId_fencingToken: {
-          attemptId: input.attemptId,
-          fencingToken: input.fencingToken,
-        },
-      },
+    // One attempt pipeline (lane B4): a cloud attempt is an `attempt` row of kind CLOUD.
+    const row = await tx.attempt.findUnique({
+      where: { id_fencingToken: { id: input.attemptId, fencingToken: input.fencingToken } },
       select: { userId: true, providerAccountId: true, providerModelId: true },
     });
-    if (!attempt) return false;
+    if (!row?.providerAccountId || !row.providerModelId) return false;
+    const attempt = {
+      userId: row.userId,
+      providerAccountId: row.providerAccountId,
+      providerModelId: row.providerModelId,
+    };
     await tx.$queryRaw`SELECT id FROM provider_account WHERE id = ${attempt.providerAccountId} AND "userId" = ${attempt.userId} FOR UPDATE`;
     await tx.$queryRaw`SELECT id FROM provider_model WHERE id = ${attempt.providerModelId} AND "userId" = ${attempt.userId} FOR UPDATE`;
     const [accountHealth, modelHealth] = await Promise.all([
@@ -75,9 +76,9 @@ export async function heartbeatProviderAttempt(input: {
     // Evaluate expiry only after every contended ownership lock is held. A
     // timestamp captured before the wait could renew an already-expired lease.
     const now = new Date();
-    const updated = await tx.providerAttempt.updateMany({
+    const updated = await tx.attempt.updateMany({
       where: {
-        attemptId: input.attemptId,
+        id: input.attemptId,
         fencingToken: input.fencingToken,
         state: "ACTIVE",
         expiresAt: { gt: now },
@@ -448,11 +449,35 @@ export async function recordProviderAttemptEvent(input: {
   usage?: Record<string, string | number | boolean | null>;
   metadata?: Record<string, string | number | boolean | null>;
 }): Promise<void> {
-  await prisma.publicProviderAttemptEvent.create({
-    data: {
-      ...input,
-      reservationIds: input.reservationIds ? [...input.reservationIds] : undefined,
-    },
+  // One event stream for every attempt (`attempt_event`): the identity columns are plain, the
+  // rest is metadata (no prompts, no secrets). The sequence is the next one of the attempt.
+  const { userId, requestId, attemptId, eventType, reason, metadata, usage, ...details } = input;
+  const facts: Record<string, string | number | boolean | null> = { ...metadata };
+  for (const [key, value] of Object.entries(details)) {
+    if (value === undefined) continue;
+    if (value instanceof Date) facts[key] = value.toISOString();
+    else if (typeof value === "bigint") facts[key] = value.toString();
+    else if (typeof value === "object") facts[key] = value.join(",");
+    else facts[key] = value;
+  }
+  if (usage) for (const [key, value] of Object.entries(usage)) facts[`usage.${key}`] = value;
+  await prisma.$transaction(async (tx) => {
+    const last = await tx.attemptEvent.findFirst({
+      where: { attemptId },
+      orderBy: { sequence: "desc" },
+      select: { sequence: true },
+    });
+    await tx.attemptEvent.create({
+      data: {
+        userId,
+        attemptId,
+        requestId,
+        sequence: (last?.sequence ?? 0) + 1,
+        eventType,
+        reason: reason ?? null,
+        metadata: facts,
+      },
+    });
   });
 }
 

@@ -7,12 +7,11 @@ import { REQUEST_JSON_DEPTH_ERROR, requestJsonDepthExceeded } from "./request-js
  * Synthetic requests and responses are never persisted as content.
  */
 
-import { markPoolMemberRelaySuccess } from "@ws-model-proxy/api/lib/model-pool-routing";
 import {
-  resolveEffectiveCapabilityMetadata,
+  openAiCapabilitiesFromCoarse,
   supportsChatCompletions,
 } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
-import prisma, { Prisma } from "@ws-model-proxy/db";
+import prisma from "@ws-model-proxy/db";
 import { type RelaySessionManager, relaySessionManager } from "../relay/session-manager.js";
 import { PostgresCapacityAdmissionStore } from "./capacity/postgres-store.js";
 import { withCapacityRequestScope } from "./capacity/request-scope.js";
@@ -24,6 +23,7 @@ import { splitModelVariant } from "./external-route.js";
 import { type ModelApiConcurrencyLimiter, modelApiConcurrencyLimiter } from "./limits.js";
 import { extractAssistantTextFromChatCompletion, readResponseUtf8 } from "./media-transform.js";
 import { PROBE_MAX_TOKENS, probeReasoningFields } from "./probe-settings.js";
+import { poolRoutes } from "./resolve.js";
 import { chatTestCompletionsHandler, poolMemberDiagnosticHandler } from "./routes.js";
 
 const TEST_TIMEOUT_MS = 20_000;
@@ -112,7 +112,7 @@ function classifyEmbeddingProbeReply(status: number, raw: string): ChatProbeRepl
 
 type DiagnosticsManager = Pick<
   RelaySessionManager,
-  | "getActiveCliDeviceIds"
+  | "getOnlineNodeIds"
   | "registerRelayResponseHandlers"
   | "sendRelayRequest"
   | "cancelRelayRequest"
@@ -166,41 +166,6 @@ export type PoolMemberTestResult =
   | { outcome: "probe-failed"; status: number; latencyMs: number; reason: string }
   | { outcome: "probe-error"; latencyMs: number; reason: string };
 
-/** One relay-capable model view (shared by both resolution arms below). */
-const poolMemberModelSelect = {
-  id: true,
-  published: true,
-  upstreamModelId: true,
-  capabilityOverrideMode: true,
-  capabilityOverrides: true,
-  capabilityOverrideMetadata: true,
-  Endpoint: {
-    select: {
-      published: true,
-      slug: true,
-      cliDeviceId: true,
-      capabilityMetadata: true,
-      defaultCapabilities: true,
-      CliDevice: { select: { status: true } },
-    },
-  },
-} satisfies Prisma.DiscoveredModelSelect;
-
-/** EXACT select from the original Hono route (ownership + capability views). */
-const poolMemberTestSelect = {
-  id: true,
-  poolId: true,
-  ModelPool: { select: { userId: true } },
-  ExecutionTarget: {
-    select: {
-      DiscoveredModel: { select: poolMemberModelSelect },
-    },
-  },
-  DiscoveredModel: { select: poolMemberModelSelect },
-} satisfies Prisma.PoolMemberSelect;
-
-type PoolMemberTestRow = Prisma.PoolMemberGetPayload<{ select: typeof poolMemberTestSelect }>;
-
 /**
  * Run the chat-completions probe against one pool member, owned by `userId`.
  * The `tokenId` used for the global concurrency lease is the SAME stable
@@ -232,9 +197,9 @@ async function poolMemberTest({
    */
   signal?: AbortSignal;
 } & DiagnosticCoreDependencies): Promise<PoolMemberTestResult> {
-  const member: PoolMemberTestRow | null = await prisma.poolMember.findUnique({
+  const member = await prisma.poolMember.findUnique({
     where: { id: memberId },
-    select: poolMemberTestSelect,
+    select: { id: true, poolId: true, kind: true, Pool: { select: { userId: true } } },
   });
   // G1: post-lookup cancellation check. The ownership lookup is the core's
   // first await — a caller (or the shutdown gate) that aborted while it was
@@ -244,31 +209,31 @@ async function poolMemberTest({
   if (signal?.aborted) {
     return { outcome: "probe-error", latencyMs: 0, reason: "Member test was cancelled." };
   }
-  if (!member || member.ModelPool.userId !== userId) {
+  if (!member || member.Pool.userId !== userId) {
     return { outcome: "not-found" };
   }
-  const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
+  // A LOCAL member is probed through its pool's routes (one per instance serving it).
+  const routes =
+    member.kind === "LOCAL"
+      ? (await poolRoutes(member.poolId)).filter((route) => route.member.id === member.id)
+      : [];
+  const model = routes[0]?.model;
   if (!model) {
     return { outcome: "not-relay-capable" };
   }
-  if (!model.published || !model.Endpoint.published) {
-    return { outcome: "unpublished" };
-  }
-  const effectiveCapabilities = resolveEffectiveCapabilityMetadata({
-    capabilityOverrideMode: model.capabilityOverrideMode,
-    capabilityOverrideMetadata: model.capabilityOverrideMetadata,
-    endpointCapabilityMetadata: model.Endpoint.capabilityMetadata,
-  });
+  const effectiveCapabilities = openAiCapabilitiesFromCoarse(model.capabilities);
   const supportsChat = supportsChatCompletions({
     capabilities: effectiveCapabilities,
-    coarse:
-      model.capabilityOverrideMode === "OVERRIDE"
-        ? model.capabilityOverrides
-        : model.Endpoint.defaultCapabilities,
+    coarse: model.capabilities,
   });
-  const embeddings = !supportsChat && effectiveCapabilities?.embeddings?.supported === true;
+  const embeddings = !supportsChat && effectiveCapabilities.embeddings?.supported === true;
   if (!supportsChat && !embeddings) return { outcome: "not-chat-capable" };
-  if (!manager.getActiveCliDeviceIds().includes(model.Endpoint.cliDeviceId)) {
+  const online = new Set(manager.getOnlineNodeIds());
+  if (
+    !routes.some(
+      (route) => route.instance.ready && route.instance.nodeId && online.has(route.instance.nodeId),
+    )
+  ) {
     return { outcome: "cli-disconnected" };
   }
 
@@ -326,7 +291,7 @@ async function poolMemberTest({
         reason: "Member did not return a valid diagnostic response.",
       };
     }
-    await markPoolMemberRelaySuccess(member.id, { trialStartedAt: null });
+    // Target health was already settled by the relay path that served the probe.
     return {
       outcome: "ok",
       status,
@@ -445,7 +410,7 @@ async function chatCompletionDiagnostic({
     manager,
     limiter: concurrencyLimiter,
     capacityRuntime: capacityRuntime ?? diagnosticsCapacityRuntime(),
-    source: "MCP",
+    source: "AGENT_TEST",
   });
 
   if (response.status === 400) {

@@ -4,29 +4,23 @@
  * Request data leaves the deployment for a provider only when ALL of these
  * hold (the "egress gate"):
  *   1. the deployment switch WMP_PUBLIC_PROVIDER_EGRESS_ENABLED is on;
- *   2. the caller asked for it in the model name: `owner/pool:external`;
- *   3. the caller's credential consents: an API token with `allowExternal`
- *      (ALLOWLIST tokens also need the pool entry's `includeExternal`), or the
- *      signed-in user's own Chat Test session choosing the `:external` name;
- *   4. for pool fallback, the owner enabled fallback (`fallbackEnabled`);
- *   5. the requester is the pool owner, or the owner pays for grantees
- *      (`fallbackForGrantees`). Own-key instead requires the owner equivalent
- *      declaration and a grantee preference for a requester-owned provider.
+ *   2. the caller asked for it in the model name: `owner/pool:external` (an API key, or a
+ *      person's own Test page request; agent tests have no consent channel);
+ *   3. the pool's cloud mode covers the caller (`pool_fallback.mode`: OWNER for the owner,
+ *      OWNER_AND_SHARES for share holders too; OFF: nobody). Own-key instead requires the
+ *      owner's equivalent-model consent and the share holder's own provider model.
  *
  * `evaluateExternalEgress` is the only way to obtain an
  * `ExternalEgressConsent`. Provider dispatch (`dispatchPublicOverflow`)
- * requires an issued consent for the exact pool, requester and token, and
- * re-checks the switch, the pool flags, the token's consent and the
- * requester's grant against fresh database state immediately before sending,
- * so a missing, forged, or withdrawn consent fails closed.
+ * requires an issued consent for the exact pool and requester, and re-checks
+ * the switch, the cloud mode and the requester's share against fresh database
+ * state immediately before sending, so a missing, forged, or withdrawn consent
+ * fails closed.
  */
-import type {
-  VisibleDirectModelTarget,
-  VisibleModelPoolTarget,
-} from "@ws-model-proxy/api/lib/model-api-token-access";
 import { env } from "@ws-model-proxy/env/server";
 import { anthropicErrorResponse } from "./anthropic-protocol.js";
 import { openAiErrorBody } from "./openai-errors.js";
+import type { CallablePool, TestTarget } from "./resolve.js";
 
 /** The only v1 model-name variant. Lowercase only; never stacked. */
 export const EXTERNAL_MODEL_VARIANT = "external";
@@ -80,7 +74,7 @@ export type ExternalRouteErrorCode =
 
 export type ExternalRouteError = { code: ExternalRouteErrorCode; message: string };
 
-/** Non-leaky refusal when a grantee's owner-paid spend cap is exhausted. */
+/** Non-leaky refusal when a share holder's owner-paid spend cap is exhausted. */
 export const GRANTEE_SPEND_CAP_MESSAGE = "External fallback is not available for this access.";
 
 const errorStatus: Record<ExternalRouteErrorCode, number> = {
@@ -179,8 +173,8 @@ export function withResponseHeaders(
 }
 
 export type ModelNameResolution =
-  | { kind: "direct"; target: VisibleDirectModelTarget }
-  | { kind: "pool"; target: VisibleModelPoolTarget; externalRequested: boolean }
+  | { kind: "test"; target: TestTarget }
+  | { kind: "pool"; target: CallablePool; externalRequested: boolean }
   | { kind: "error"; error: ExternalRouteError }
   | { kind: "not_found" };
 
@@ -188,22 +182,20 @@ export type ModelNameResolution =
  * Resolves a requested model name against the caller's VISIBLE targets only,
  * so no error ever reveals whether an invisible pool exists. The grammar is
  * `user-slug/pool-slug[:external]`; a suffix is recognised only when the part
- * before it exactly matches a visible pool (pool-shaped by construction).
+ * before it exactly matches a visible pool (pool-shaped by construction). TEST
+ * targets (`runtime:<runtimeId>:<upstreamModelId>`) match exactly and take no suffix.
  */
 export function resolveRequestedModelName(
-  targets: {
-    directModels: readonly VisibleDirectModelTarget[];
-    modelPools: readonly VisibleModelPoolTarget[];
-  },
+  targets: { tests: readonly TestTarget[]; pools: readonly CallablePool[] },
   model: string,
 ): ModelNameResolution {
-  const direct = targets.directModels.find((target) => target.modelId === model);
-  if (direct) return { kind: "direct", target: direct };
-  const pool = targets.modelPools.find((target) => target.modelId === model);
+  const test = targets.tests.find((target) => target.modelId === model);
+  if (test) return { kind: "test", target: test };
+  const pool = targets.pools.find((target) => target.modelId === model);
   if (pool) return { kind: "pool", target: pool, externalRequested: false };
   const { base, variant } = splitModelVariant(model);
   if (variant === null) return { kind: "not_found" };
-  const basePool = targets.modelPools.find((target) => target.modelId === base);
+  const basePool = targets.pools.find((target) => target.modelId === base);
   if (basePool) {
     if (variant === EXTERNAL_MODEL_VARIANT)
       return { kind: "pool", target: basePool, externalRequested: true };
@@ -215,15 +207,6 @@ export function resolveRequestedModelName(
       },
     };
   }
-  const baseDirect = targets.directModels.find((target) => target.modelId === base);
-  if (baseDirect)
-    return {
-      kind: "error",
-      error: {
-        code: "model_not_found",
-        message: `Model "${model}" was not found. Variants such as ":${EXTERNAL_MODEL_VARIANT}" apply only to pool model ids (owner/pool); direct model ids never take a suffix. Use "${baseDirect.modelId}".`,
-      },
-    };
   return { kind: "not_found" };
 }
 
@@ -231,23 +214,20 @@ export type ExternalEgressDenial =
   | "NOT_REQUESTED"
   | "DEPLOYMENT_DISABLED"
   | "SOURCE_UNSUPPORTED"
-  | "TOKEN_NOT_PERMITTED"
   | "POOL_FALLBACK_DISABLED"
-  | "GRANTEE_NOT_COVERED";
+  | "SHARE_NOT_COVERED";
 
 export type ExternalEgressConsent = {
   readonly poolId: string;
   readonly ownerUserId: string;
   readonly requesterUserId: string;
   readonly requesterIsOwner: boolean;
-  readonly modelApiTokenId: string | null;
+  readonly apiKeyId: string | null;
   /**
-   * The exact grant the request was resolved under (the visible pool target's
-   * `accessGrantId`, which for a stored-response operation equals the
-   * binding's grant): null for the pool owner. The send boundary requires this
-   * same grant row, so a replacement grant never revives the request.
+   * The exact share the request was resolved under (null for the pool owner). The send
+   * boundary requires this same share row, so a replacement share never revives the request.
    */
-  readonly accessGrantId: string | null;
+  readonly shareId: string | null;
   readonly ownKeyProviderModelId?: string;
 };
 
@@ -264,17 +244,16 @@ export function isIssuedExternalConsent(
 
 export type ExternalEgressRequester = {
   userId: string;
-  source: "API_TOKEN" | "CHAT_TEST" | "MCP" | "TRANSFORMER";
-  modelApiTokenId: string | null;
+  source: "API_KEY" | "TEST" | "AGENT_TEST" | "SIDECAR";
+  apiKeyId: string | null;
 };
 
 export type ExternalEgressPool = Pick<
-  VisibleModelPoolTarget,
+  CallablePool,
   | "id"
   | "ownerUserId"
-  | "accessGrantId"
-  | "fallbackEnabled"
-  | "fallbackForGrantees"
+  | "shareId"
+  | "fallbackMode"
   | "externalEquivalentModel"
   | "ownKeyProviderModelId"
 >;
@@ -284,44 +263,37 @@ export type ExternalEgressDecision =
   | { granted: false; denial: ExternalEgressDenial };
 
 /**
- * Evaluates the five egress conditions for one request. `tokenPermitsPool` is
- * the API token's consent for this pool (see
- * listVisibleModelTargetsWithExternalPermissionForToken); it is ignored for a
- * signed-in Chat Test session, where choosing the `:external` name is the
- * user's own explicit consent. MCP diagnostics have no consent channel in v1.
+ * Evaluates the egress conditions for one request. Asking for `:external` is the caller's
+ * consent (an API key or a person's Test page request); agent tests and sidecar hops have no
+ * consent channel.
  */
 export function evaluateExternalEgress(input: {
   requested: boolean;
   requester: ExternalEgressRequester;
-  tokenPermitsPool: boolean;
   pool: ExternalEgressPool;
 }): ExternalEgressDecision {
   if (!input.requested) return { granted: false, denial: "NOT_REQUESTED" };
   if (env.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED !== true)
     return { granted: false, denial: "DEPLOYMENT_DISABLED" };
-  if (input.requester.source === "API_TOKEN") {
-    if (!input.requester.modelApiTokenId || input.tokenPermitsPool !== true)
-      return { granted: false, denial: "TOKEN_NOT_PERMITTED" };
-  } else if (input.requester.source !== "CHAT_TEST") {
+  if (input.requester.source !== "API_KEY" && input.requester.source !== "TEST")
     return { granted: false, denial: "SOURCE_UNSUPPORTED" };
-  }
   const ownKey =
     input.requester.userId !== input.pool.ownerUserId &&
-    input.pool.accessGrantId &&
+    input.pool.shareId &&
     input.pool.externalEquivalentModel &&
     input.pool.ownKeyProviderModelId;
-  if (!ownKey && input.pool.fallbackEnabled !== true)
+  if (!ownKey && input.pool.fallbackMode === "OFF")
     return { granted: false, denial: "POOL_FALLBACK_DISABLED" };
   const requesterIsOwner = input.requester.userId === input.pool.ownerUserId;
-  if (!ownKey && !requesterIsOwner && input.pool.fallbackForGrantees !== true)
-    return { granted: false, denial: "GRANTEE_NOT_COVERED" };
+  if (!ownKey && !requesterIsOwner && input.pool.fallbackMode !== "OWNER_AND_SHARES")
+    return { granted: false, denial: "SHARE_NOT_COVERED" };
   const consent: ExternalEgressConsent = Object.freeze({
     poolId: input.pool.id,
     ownerUserId: input.pool.ownerUserId,
     requesterUserId: input.requester.userId,
     requesterIsOwner,
-    modelApiTokenId: input.requester.modelApiTokenId,
-    accessGrantId: requesterIsOwner ? null : input.pool.accessGrantId,
+    apiKeyId: input.requester.apiKeyId,
+    shareId: requesterIsOwner ? null : input.pool.shareId,
     ...(ownKey ? { ownKeyProviderModelId: ownKey } : {}),
   });
   issuedConsents.add(consent);
@@ -331,22 +303,17 @@ export function evaluateExternalEgress(input: {
 /** Caller-facing error for a denial that must stop the request (not serve local). */
 export function externalDenialError(
   denial: ExternalEgressDenial,
-  pool: Pick<VisibleModelPoolTarget, "modelId">,
+  pool: Pick<CallablePool, "modelId">,
 ): ExternalRouteError | null {
   if (denial === "DEPLOYMENT_DISABLED")
     return {
       code: "external_providers_disabled",
-      message: `External providers are disabled on this deployment. Use "${pool.modelId}" to use local members only.`,
-    };
-  if (denial === "TOKEN_NOT_PERMITTED")
-    return {
-      code: "external_not_permitted",
-      message: `This API token does not allow external providers for "${pool.modelId}". A person can turn on cloud access for the token (Dashboard → API tokens → Cloud access, and include this pool for allowlist tokens), or use "${pool.modelId}" to use local members only.`,
+      message: `Cloud providers are turned off on this server. Use "${pool.modelId}" to use local members only.`,
     };
   if (denial === "SOURCE_UNSUPPORTED")
     return {
       code: "external_not_supported_for_mcp",
-      message: `MCP diagnostics cannot use external providers. Use "${pool.modelId}".`,
+      message: `Agent tests cannot use cloud providers. Use "${pool.modelId}".`,
     };
   return null;
 }
@@ -354,11 +321,11 @@ export function externalDenialError(
 /** Why no external plan exists for an allowed-but-unavailable request (D5 header path). */
 export function externalUnavailableMessage(
   denial: ExternalEgressDenial | "NO_EXTERNAL_MEMBERS",
-  pool: Pick<VisibleModelPoolTarget, "modelId">,
+  pool: Pick<CallablePool, "modelId">,
 ): string {
   if (denial === "POOL_FALLBACK_DISABLED")
-    return `The owner of "${pool.modelId}" has not enabled external fallback, and the pool has no local members that can serve this request.`;
-  if (denial === "GRANTEE_NOT_COVERED")
-    return `The owner of "${pool.modelId}" has not enabled external fallback for people they share the pool with, and the pool has no local members that can serve this request.`;
+    return `The owner of "${pool.modelId}" has not turned on cloud fallback, and the pool has no local members that can serve this request.`;
+  if (denial === "SHARE_NOT_COVERED")
+    return `The owner of "${pool.modelId}" has not turned on cloud fallback for people they share the pool with, and the pool has no local members that can serve this request.`;
   return `"${pool.modelId}" has no available external fallback members and no local members that can serve this request.`;
 }

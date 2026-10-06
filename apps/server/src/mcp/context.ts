@@ -1,59 +1,44 @@
 import type { ContextServices, Context as ProductionContext } from "@ws-model-proxy/api/context";
+import type { CallerAuth } from "@ws-model-proxy/api/contracts";
 import type { Session } from "@ws-model-proxy/auth";
 
 /**
- * Synthetic oRPC context for MCP requests (Phase 4 item 8).
+ * The oRPC context of one MCP request.
  *
- * MCP requests arrive with a VERIFIED access JWT, not a Better Auth cookie
- * session. The tools (Phase 5) call oRPC procedures through
- * `createRouterClient(appRouter, { context })`, and ownership checks read
- * `context.session.user.id` — so the MCP path builds a SYNTHETIC session
- * from the verified claims plus the live FULL Prisma user row.
+ * MCP requests arrive with a verified agent credential (an agent token or an OAuth access
+ * token), not a Better Auth cookie. Procedures check `context.auth` (who is calling, with the
+ * credential's level) and read `context.session.user` (the live user row), so the MCP path
+ * builds a synthetic session from the verified principal plus the full Prisma user row.
  *
- * CONTRACT (F4, Part F pass 2): the synthetic session is explicitly
- * COMPATIBLE with the production oRPC `Context`
- * (packages/api/src/context.ts → Better Auth `$Infer.Session`) — the
- * session/user shapes are derived FROM those types (not re-declared), and
- * the type-level assertion at the bottom of this file fails `pnpm
- * check-types` if the two ever drift apart. Constructing the context from
- * the production types (no casts) is what makes that guarantee real.
+ * SECURITY INVARIANT: the synthetic session never contains the presented credential (or any
+ * digest of it). Its `token` field is a fixed marker; its expiry mirrors the credential's.
  *
- * SECURITY INVARIANT (load-bearing): the synthetic session NEVER contains
- * the presented access token (or any digest of it). Its `token` field is a
- * fixed synthetic marker; the expiry mirrors the token's `exp` claim so
- * downstream freshness logic sees a horizon consistent with the credential.
- * Pinned by tests: the serialized session must not contain the token bytes.
- *
- * The services object is the SAME `ContextServices` used by the normal
- * server path (`packages/api/src/context.ts` → `repairExpiredProviderBudgets`
- * injected by app.ts) — MCP must not fork the server's dependency surface.
+ * `McpContextSatisfiesProductionContext` (bottom) fails type checking if this shape drifts
+ * from the production oRPC `Context`.
  */
 
 /** Fixed marker for the synthetic session's token slot — never a real credential. */
 export const MCP_SYNTHETIC_SESSION_TOKEN = "mcp-synthetic-session";
 
-/**
- * The user carried by the synthetic session: the FULL user row of the
- * production `Session` type (invariant 5 — mcp/auth.ts loads the complete
- * live Prisma user, never a projection).
- */
+/** The full live user row (never a projection). */
 export type McpSessionUser = Session["user"];
 
-/** The synthetic session shape: exactly the production `Session` shape. */
-export type McpSyntheticSession = Session;
+/** An agent credential level: READ tokens see the read tools, FULL tokens all 27. */
+export type McpLevel = "READ" | "FULL";
 
-/** The per-request MCP context handed to Phase 5's router client. */
-export interface McpContext {
-  session: McpSyntheticSession;
-  services: ContextServices | undefined;
-}
+/** How a request was admitted (never inferred from a client id). */
+export type McpRequestCredential =
+  | { kind: "agent_token"; tokenId: string; level: McpLevel; expiresAt: Date | null }
+  | { kind: "oauth"; grantId: string; level: McpLevel };
 
-/**
- * Build the synthetic session. `user` must be the LIVE full Prisma row
- * loaded by requireMcpAuth after the ban/2FA checks (never trust
- * JWT-embedded profile claims). `expiresAt` is the access token's `exp`
- * claim as a Date; `now` stamps the synthetic row's audit timestamps.
- */
+/** The agent `CallerAuth` of a verified MCP credential. */
+export type McpCallerAuth = Extract<CallerAuth, { kind: "agent_token" | "oauth_access_token" }>;
+
+export type McpContext = ProductionContext & {
+  session: Session;
+  auth: McpCallerAuth;
+};
+
 export function createMcpSyntheticSession({
   user,
   expiresAt,
@@ -62,12 +47,9 @@ export function createMcpSyntheticSession({
   user: McpSessionUser;
   expiresAt: Date;
   now: Date;
-}): McpSyntheticSession {
+}): Session {
   return {
     session: {
-      // Session id is the VERIFIED user id with an `mcp:` marker — it
-      // identifies the principal, never a cookie-session row (there is
-      // none), and never carries token material.
       id: `mcp:${user.id}`,
       userId: user.id,
       createdAt: now,
@@ -82,39 +64,34 @@ export function createMcpSyntheticSession({
   };
 }
 
-/** Build the oRPC-shaped context for one MCP request. */
+/** The caller identity procedures see for a verified credential. */
+export function mcpCallerAuth(userId: string, credential: McpRequestCredential): McpCallerAuth {
+  return credential.kind === "agent_token"
+    ? { kind: "agent_token", userId, agentTokenId: credential.tokenId, level: credential.level }
+    : { kind: "oauth_access_token", userId, grantId: credential.grantId, level: credential.level };
+}
+
+/** Build the oRPC context for one verified MCP request. */
 export function createMcpContext({
   user,
+  credential,
   expiresAt,
   now,
   services,
 }: {
   user: McpSessionUser;
+  credential: McpRequestCredential;
   expiresAt: Date;
   now: Date;
   services: ContextServices | undefined;
 }): McpContext {
   return {
     session: createMcpSyntheticSession({ user, expiresAt, now }),
-    // This marker is created only after requireMcpAuth verifies the principal.
-    // Every MCP procedure is an agent action, including mixed human/agent APIs.
-    services: { ...services, deploymentActor: { kind: "AGENT", id: `mcp:${user.id}` } },
+    auth: mcpCallerAuth(user.id, credential),
+    ...(services ? { services } : {}),
   };
 }
 
-// ---------------------------------------------------------------------------
-// Type-level contract assertion (F4) — runs in normal `pnpm check-types`.
-//
-// `McpContext` must remain assignable to the production oRPC `Context` so
-// Phase 5's `createRouterClient(appRouter, { context })` accepts it without
-// casts. The generic constraint fails to compile the moment the synthetic
-// shape drifts from the production one (missing session timestamps, missing
-// user fields, incompatible services).
-// ---------------------------------------------------------------------------
-
 type AssertAssignable<Base, Derived extends Base> = Derived;
-// Exported only so the assertion lives in the module's compiled surface; it
-// has no value-space consumer by design. The generic constraint is checked
-// at declaration time, so `pnpm check-types` fails the moment `McpContext`
-// drifts from the production oRPC `Context`.
+/** Compile-time pin: an MCP context is a production oRPC context. */
 export type McpContextSatisfiesProductionContext = AssertAssignable<ProductionContext, McpContext>;

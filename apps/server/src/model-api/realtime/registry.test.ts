@@ -21,11 +21,10 @@ function fakeSession() {
 }
 
 const candidate = {
-  cliDeviceId: "cli",
-  endpointSlug: "inst-aaaaaaaaaaaaaaaa",
+  nodeId: "node",
+  handle: "i-aaaaaaaaaaaa",
   upstreamModel: "m",
   capabilities: null,
-  deploymentManaged: true,
   memberId: "m1",
 };
 
@@ -63,14 +62,14 @@ describe("realtime session registry", () => {
     const recheck = vi.fn(async () => ({ ok: true as const }));
     const registry = new RealtimeSessionRegistry(recheck);
     const registration = registry.add(fakeSession(), token("t"), "user");
-    registration?.resolved({ kind: "direct", target: { id: "dm" } as never }, "owner/asr");
+    registration?.resolved({ kind: "test", target: { id: "rm" } as never }, "owner/asr");
     registration?.opened(candidate, null);
     await registry.recheckSessions();
     expect(recheck).toHaveBeenCalledWith({
       credential: { kind: "token", tokenId: "t" },
       userId: "user",
       model: "owner/asr",
-      resolved: { kind: "direct", target: { id: "dm" } },
+      resolved: { kind: "test", target: { id: "rm" } },
       candidate,
     });
   });
@@ -139,14 +138,13 @@ describe("realtime session registry", () => {
           kind: "pool",
           poolId: "p",
           poolMemberId: "m1",
-          discoveredModelId: "dm",
-          endpointId: "ep",
+          runtimeModelId: "rm",
           executionTargetId: "et",
-          capacityId: "cap",
+          instanceId: "inst",
           ownerUserId: "pool-owner",
           engineOwnerUserId: "banned",
-          accessGrantId: "g",
-          contributionId: "ic",
+          shareId: "s",
+          contributedShareId: "sc",
         },
       },
       null,

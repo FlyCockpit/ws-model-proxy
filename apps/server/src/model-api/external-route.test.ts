@@ -1,8 +1,5 @@
-import type {
-  VisibleDirectModelTarget,
-  VisibleModelPoolTarget,
-} from "@ws-model-proxy/api/lib/model-api-token-access";
 import { describe, expect, it, vi } from "vitest";
+import type { CallablePool, TestTarget } from "./resolve.js";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: { WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: true },
@@ -32,44 +29,42 @@ const {
   withResponseHeaders,
 } = await import("./external-route.js");
 
-const pool: VisibleModelPoolTarget = {
-  target: "MODEL_POOL",
+const pool: CallablePool = {
+  target: "POOL",
   id: "pool-id",
   modelId: "owner/pool.v2",
   name: "Pool",
   description: null,
+  modelType: "LLM",
   ownerUserId: "owner-id",
   ownerUserSlug: "owner",
-  accessGrantId: null,
   poolSlug: "pool.v2",
+  shareId: null,
   maxAttachmentBytes: null,
   optimisticBasicTranscription: false,
   protocolAdaptationEnabled: false,
-  fallbackEnabled: true,
-  fallbackForGrantees: false,
-  externalMemberCount: 1,
-  effectiveProviderEgress: true,
-  providerAccountLabels: [],
-  providerTypes: [],
-  externalRoutes: [],
   allowLossyDeveloperRoleCollapse: false,
   recommendedSurfaceOverride: null,
+  fallbackMode: "OWNER",
+  externalMemberCount: 1,
+  externalEquivalentModel: null,
+  embeddingContract: null,
+  paidWarmProtection: false,
+  ownKeyProviderModelId: null,
 };
 
-const direct: VisibleDirectModelTarget = {
-  target: "DIRECT_MODEL",
-  id: "direct-id",
-  modelId: "owner/cli/endpoint/qwen3%3A8b",
+const direct: TestTarget = {
+  target: "TEST",
+  id: "runtime-model-id",
+  modelId: "runtime:rt_1:qwen3:8b",
+  runtimeId: "rt_1",
   upstreamModelId: "qwen3:8b",
   ownerUserId: "owner-id",
   ownerUserSlug: "owner",
-  endpointId: "endpoint-id",
-  endpointSlug: "endpoint",
-  cliDeviceSlug: "cli",
   maxAttachmentBytes: null,
 };
 
-const targets = { directModels: [direct], modelPools: [pool] };
+const targets = { tests: [direct], pools: [pool] };
 
 describe("model name grammar", () => {
   it("splits at the first colon only", () => {
@@ -84,7 +79,7 @@ describe("model name grammar", () => {
     });
   });
 
-  it("resolves plain and :external names of visible pools and exact direct ids", () => {
+  it("resolves plain and :external names of visible pools and exact TEST names", () => {
     expect(resolveRequestedModelName(targets, "owner/pool.v2")).toMatchObject({
       kind: "pool",
       externalRequested: false,
@@ -95,8 +90,8 @@ describe("model name grammar", () => {
       externalRequested: true,
     });
     expect(resolveRequestedModelName(targets, direct.modelId)).toMatchObject({
-      kind: "direct",
-      target: { id: "direct-id" },
+      kind: "test",
+      target: { id: "runtime-model-id" },
     });
   });
 
@@ -105,7 +100,6 @@ describe("model name grammar", () => {
     ["an uppercase variant", "owner/pool.v2:External"],
     ["a stacked variant", "owner/pool.v2:external:external"],
     ["an empty variant", "owner/pool.v2:"],
-    ["a suffix on a direct id", `${direct.modelId}:external`],
   ])("rejects %s with a helpful model_not_found", (_label, model) => {
     const resolution = resolveRequestedModelName(targets, model);
     expect(resolution).toMatchObject({ kind: "error", error: { code: "model_not_found" } });
@@ -120,65 +114,48 @@ describe("model name grammar", () => {
     expect(resolveRequestedModelName(targets, "stranger/secret:bogus")).toEqual({
       kind: "not_found",
     });
-    // A sloppy raw colon in a direct id is not a pool variant.
-    expect(resolveRequestedModelName(targets, "owner/cli/endpoint/qwen3:8b")).toEqual({
+    // A TEST name takes no variant, and an unknown runtime is not found.
+    expect(resolveRequestedModelName(targets, `${direct.modelId}:external`)).toEqual({
+      kind: "not_found",
+    });
+    expect(resolveRequestedModelName(targets, "runtime:rt_2:qwen3:8b")).toEqual({
       kind: "not_found",
     });
   });
 });
 
 describe("egress gate", () => {
-  const owner = { userId: "owner-id", source: "API_TOKEN" as const, modelApiTokenId: "token" };
-  const grantee = { userId: "grantee-id", source: "API_TOKEN" as const, modelApiTokenId: "token" };
+  const owner = { userId: "owner-id", source: "API_KEY" as const, apiKeyId: "key" };
+  const grantee = { userId: "grantee-id", source: "API_KEY" as const, apiKeyId: "key" };
 
   type Case = {
     switchOn: boolean;
     requested: boolean;
-    tokenPermits: boolean;
-    fallbackEnabled: boolean;
+    fallbackMode: CallablePool["fallbackMode"];
     requesterIsOwner: boolean;
-    fallbackForGrantees: boolean;
   };
   const cases: Case[] = [];
   for (const switchOn of [true, false])
     for (const requested of [true, false])
-      for (const tokenPermits of [true, false])
-        for (const fallbackEnabled of [true, false])
-          for (const requesterIsOwner of [true, false])
-            for (const fallbackForGrantees of [true, false])
-              cases.push({
-                switchOn,
-                requested,
-                tokenPermits,
-                fallbackEnabled,
-                requesterIsOwner,
-                fallbackForGrantees,
-              });
+      for (const fallbackMode of ["OFF", "OWNER", "OWNER_AND_SHARES"] as const)
+        for (const requesterIsOwner of [true, false])
+          cases.push({ switchOn, requested, fallbackMode, requesterIsOwner });
 
   it.each(cases)(
     "grants only when every condition holds: %o",
-    ({
-      switchOn,
-      requested,
-      tokenPermits,
-      fallbackEnabled,
-      requesterIsOwner,
-      fallbackForGrantees,
-    }) => {
+    ({ switchOn, requested, fallbackMode, requesterIsOwner }) => {
       const decision = withSwitch(switchOn, () =>
         evaluateExternalEgress({
           requested,
           requester: requesterIsOwner ? owner : grantee,
-          tokenPermitsPool: tokenPermits,
-          pool: { ...pool, fallbackEnabled, fallbackForGrantees },
+          pool: { ...pool, fallbackMode, shareId: requesterIsOwner ? null : "share" },
         }),
       );
       const expected =
         switchOn &&
         requested &&
-        tokenPermits &&
-        fallbackEnabled &&
-        (requesterIsOwner || fallbackForGrantees);
+        fallbackMode !== "OFF" &&
+        (requesterIsOwner || fallbackMode === "OWNER_AND_SHARES");
       expect(decision.granted).toBe(expected);
       if (decision.granted) {
         expect(isIssuedExternalConsent(decision.consent)).toBe(true);
@@ -186,6 +163,8 @@ describe("egress gate", () => {
           poolId: "pool-id",
           ownerUserId: "owner-id",
           requesterIsOwner,
+          apiKeyId: "key",
+          shareId: requesterIsOwner ? null : "share",
         });
       }
     },
@@ -200,8 +179,7 @@ describe("egress gate", () => {
         evaluateExternalEgress({
           requested: true,
           requester: grantee,
-          tokenPermitsPool: false,
-          pool: { ...pool, fallbackEnabled: false },
+          pool: { ...pool, shareId: "share", fallbackMode: "OFF" },
           ...overrides,
         }),
       );
@@ -209,48 +187,34 @@ describe("egress gate", () => {
     };
     expect(deny(false, { requested: false })).toBe("NOT_REQUESTED");
     expect(deny(false)).toBe("DEPLOYMENT_DISABLED");
-    expect(deny(true)).toBe("TOKEN_NOT_PERMITTED");
-    expect(deny(true, { tokenPermitsPool: true })).toBe("POOL_FALLBACK_DISABLED");
-    expect(deny(true, { tokenPermitsPool: true, pool: { ...pool, fallbackEnabled: true } })).toBe(
-      "GRANTEE_NOT_COVERED",
+    expect(deny(true, { requester: { ...grantee, source: "AGENT_TEST", apiKeyId: null } })).toBe(
+      "SOURCE_UNSUPPORTED",
+    );
+    expect(deny(true)).toBe("POOL_FALLBACK_DISABLED");
+    expect(deny(true, { pool: { ...pool, shareId: "share", fallbackMode: "OWNER" } })).toBe(
+      "SHARE_NOT_COVERED",
     );
   });
 
-  it("treats a signed-in Chat Test user as consenting and MCP as unsupported", () => {
-    const chatTest = evaluateExternalEgress({
+  it("treats a signed-in Test page user as consenting and agent tests and sidecars as unsupported", () => {
+    const test = evaluateExternalEgress({
       requested: true,
-      requester: { userId: "owner-id", source: "CHAT_TEST", modelApiTokenId: null },
-      tokenPermitsPool: false,
+      requester: { userId: "owner-id", source: "TEST", apiKeyId: null },
       pool,
     });
-    expect(chatTest.granted).toBe(true);
-    for (const source of ["MCP", "TRANSFORMER"] as const) {
+    expect(test.granted).toBe(true);
+    for (const source of ["AGENT_TEST", "SIDECAR"] as const) {
       const decision = evaluateExternalEgress({
         requested: true,
-        requester: { userId: "owner-id", source, modelApiTokenId: null },
-        tokenPermitsPool: true,
+        requester: { userId: "owner-id", source, apiKeyId: null },
         pool,
       });
       expect(decision).toEqual({ granted: false, denial: "SOURCE_UNSUPPORTED" });
     }
-    // An API token requester without a token id never consents.
-    expect(
-      evaluateExternalEgress({
-        requested: true,
-        requester: { userId: "owner-id", source: "API_TOKEN", modelApiTokenId: null },
-        tokenPermitsPool: true,
-        pool,
-      }),
-    ).toEqual({ granted: false, denial: "TOKEN_NOT_PERMITTED" });
   });
 
   it("never treats a structurally identical object as an issued consent", () => {
-    const decision = evaluateExternalEgress({
-      requested: true,
-      requester: owner,
-      tokenPermitsPool: true,
-      pool,
-    });
+    const decision = evaluateExternalEgress({ requested: true, requester: owner, pool });
     if (!decision.granted) throw new Error("expected consent");
     expect(isIssuedExternalConsent({ ...decision.consent })).toBe(false);
     expect(isIssuedExternalConsent(null)).toBe(false);
@@ -261,15 +225,12 @@ describe("egress gate", () => {
       code: "external_providers_disabled",
       message: expect.stringContaining('"owner/pool.v2"'),
     });
-    expect(externalDenialError("TOKEN_NOT_PERMITTED", pool)).toMatchObject({
-      code: "external_not_permitted",
-    });
     expect(externalDenialError("SOURCE_UNSUPPORTED", pool)).toMatchObject({
       code: "external_not_supported_for_mcp",
     });
     // Owner-side denials serve locally with `x-wsmp-fallback: unavailable`.
     expect(externalDenialError("POOL_FALLBACK_DISABLED", pool)).toBeNull();
-    expect(externalDenialError("GRANTEE_NOT_COVERED", pool)).toBeNull();
+    expect(externalDenialError("SHARE_NOT_COVERED", pool)).toBeNull();
   });
 });
 
@@ -329,35 +290,32 @@ describe("client-facing errors and headers", () => {
 describe("own-key initial E0", () => {
   const input = () => ({
     requested: true,
-    requester: { userId: "grantee", source: "API_TOKEN" as const, modelApiTokenId: "token" },
-    tokenPermitsPool: true,
+    requester: { userId: "grantee", source: "API_KEY" as const, apiKeyId: "key" },
     pool: {
       ...pool,
-      accessGrantId: "exact-grant",
+      shareId: "exact-share",
       externalEquivalentModel: "vendor/model",
       ownKeyProviderModelId: "own-model",
-      fallbackEnabled: false,
-      fallbackForGrantees: false,
+      fallbackMode: "OFF" as CallablePool["fallbackMode"],
     },
   });
-  it("permits a grantee own key independently of owner-paid flags", () => {
+  it("permits a share holder's own key independently of the owner-paid fallback mode", () => {
     expect(evaluateExternalEgress(input())).toMatchObject({
       granted: true,
-      consent: { ownKeyProviderModelId: "own-model", accessGrantId: "exact-grant" },
+      consent: { ownKeyProviderModelId: "own-model", shareId: "exact-share" },
     });
   });
-  it.each(["suffix", "switch", "token", "grant", "equivalent", "preference", "owner", "mcp"])(
+  it.each(["suffix", "switch", "share", "equivalent", "preference", "owner", "agent"])(
     "refuses when %s is absent",
     (condition) => {
       const request = input();
       if (condition === "suffix") request.requested = false;
-      if (condition === "token") request.tokenPermitsPool = false;
-      if (condition === "grant") Object.assign(request.pool, { accessGrantId: null });
+      if (condition === "share") Object.assign(request.pool, { shareId: null });
       if (condition === "equivalent")
         Object.assign(request.pool, { externalEquivalentModel: null });
       if (condition === "preference") Object.assign(request.pool, { ownKeyProviderModelId: null });
       if (condition === "owner") request.requester.userId = pool.ownerUserId;
-      if (condition === "mcp") Object.assign(request.requester, { source: "MCP" });
+      if (condition === "agent") Object.assign(request.requester, { source: "AGENT_TEST" });
       const result = withSwitch(condition !== "switch", () => evaluateExternalEgress(request));
       expect(result.granted).toBe(false);
     },

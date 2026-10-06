@@ -25,7 +25,7 @@ const NOW = new Date("2026-09-30T12:00:30.000Z");
 function sample(overrides: Partial<NodeMetricsRollupSample> = {}): NodeMetricsRollupSample {
   return {
     ownerUserId: "owner",
-    cliDeviceId: "cli-1",
+    nodeId: "cli-1",
     receivedAt: NOW,
     cpuPercent: 20,
     memoryAvailableMiB: 80_000,
@@ -71,8 +71,8 @@ describe("node-metrics rollup merge", () => {
   });
 
   it("sorts upserts by a stable key", () => {
-    const left = mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "a" }));
-    const right = mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "b" }));
+    const left = mergeNodeMetricsIncrements(undefined, sample({ nodeId: "a" }));
+    const right = mergeNodeMetricsIncrements(undefined, sample({ nodeId: "b" }));
     expect(incrementKeyString(left) < incrementKeyString(right)).toBe(true);
   });
 });
@@ -122,7 +122,7 @@ describe("node-metrics rollup writer", () => {
     await Promise.resolve();
     expect(release).toBeTypeOf("function");
     for (let index = 0; index < NODE_METRICS_ROLLUP_MAX_PENDING + 5; index += 1) {
-      writer.observe(sample({ cliDeviceId: `cli-${index}`, receivedAt: NOW }));
+      writer.observe(sample({ nodeId: `cli-${index}`, receivedAt: NOW }));
     }
     release?.();
     await flushing;
@@ -133,8 +133,8 @@ describe("node-metrics rollup writer", () => {
     const calls: unknown[] = [];
     const written = await writeNodeMetricsIncrements(
       [
-        mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "a" })),
-        mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "b" })),
+        mergeNodeMetricsIncrements(undefined, sample({ nodeId: "a" })),
+        mergeNodeMetricsIncrements(undefined, sample({ nodeId: "b" })),
       ],
       {
         $executeRaw: async (sql) => {
@@ -152,8 +152,8 @@ describe("node-metrics rollup writer", () => {
     await expect(
       writeNodeMetricsIncrements(
         [
-          mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "a" })),
-          mergeNodeMetricsIncrements(undefined, sample({ cliDeviceId: "b" })),
+          mergeNodeMetricsIncrements(undefined, sample({ nodeId: "a" })),
+          mergeNodeMetricsIncrements(undefined, sample({ nodeId: "b" })),
         ],
         {
           $executeRaw: async () => {
@@ -184,7 +184,7 @@ describe("node-metrics rollup writer", () => {
     await writer.flushNow();
     expect(log).toHaveBeenCalledWith({ written: 0, failed: 1 });
     fail = false;
-    writer.observe(sample({ cliDeviceId: "restored" }));
+    writer.observe(sample({ nodeId: "restored" }));
     const flushing = writer.flushNow();
     await Promise.resolve();
     const stopping = writer.stop();
@@ -194,7 +194,7 @@ describe("node-metrics rollup writer", () => {
     });
     await Promise.resolve();
     expect(settled).toBe(false);
-    writer.observe(sample({ cliDeviceId: "late" }));
+    writer.observe(sample({ nodeId: "late" }));
     finish?.();
     await stopping;
     await flushing;

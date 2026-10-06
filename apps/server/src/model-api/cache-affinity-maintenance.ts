@@ -39,16 +39,15 @@ export function startAffinityAuthorityMaintenance() {
       if (!stopped) {
         await owned.prisma.$executeRaw`DELETE FROM cache_affinity_observer WHERE ctid = ANY(ARRAY(
           SELECT o.ctid FROM cache_affinity_observer o WHERE NOT EXISTS (
-            SELECT 1 FROM inference_capacity c WHERE c.id = o."capacityId")
+            SELECT 1 FROM runtime_instance i WHERE i.id = o."capacityId")
           OR (o.retired AND NOT EXISTS (
-            SELECT 1 FROM execution_target t JOIN discovered_model m ON m.id = t."discoveredModelId"
-            JOIN endpoint e ON e.id = m."endpointId" JOIN cli_device d ON d.id = e."cliDeviceId"
-            WHERE t."inferenceCapacityId" = o."capacityId" AND e."cliDeviceId" = o."cliDeviceId"
-              AND e.slug = o."endpointSlug" AND d."connectionGeneration" = o."connectionGeneration"))
+            SELECT 1 FROM runtime_instance i JOIN node n ON n."userId" = i."userId"
+            WHERE i.id = o."capacityId" AND n.id = o."nodeId" AND i.handle = o."instanceHandle"
+              AND n."connectionGeneration" = o."connectionGeneration"))
           LIMIT 64 FOR UPDATE SKIP LOCKED))`;
         await owned.prisma.$executeRaw`DELETE FROM cache_affinity_scope WHERE "poolId" IN (
           SELECT s."poolId" FROM cache_affinity_scope s WHERE NOT s."reclaimPending" AND NOT EXISTS (
-            SELECT 1 FROM model_pool p WHERE p.id = s."poolId") LIMIT 64 FOR UPDATE SKIP LOCKED)`;
+            SELECT 1 FROM pool p WHERE p.id = s."poolId") LIMIT 64 FOR UPDATE SKIP LOCKED)`;
       }
     })()
       .catch(() => {})

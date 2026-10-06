@@ -99,7 +99,7 @@ export type SttClientMessage = Extract<RelayClientControlMessage, { type: `stt.$
 
 /** One CLI relay connection as the hub sees it. Identity is the key. */
 export interface SttRelayLink {
-  readonly cliDeviceId: string;
+  readonly nodeId: string;
   isOpen(): boolean;
   bufferedAmount(): number;
   send(data: string | ArrayBuffer): void;
@@ -111,7 +111,7 @@ export type SttLinkResolution =
 
 export type SttHubDeps = {
   /** The live, registered connection of a CLI whose current inventory has the endpoint. */
-  resolveLink(cliDeviceId: string, endpointSlug: string): SttLinkResolution;
+  resolveLink(nodeId: string, handle: string): SttLinkResolution;
   /**
    * The link has no opening or open legs left (closing ones may remain).
    * Called synchronously from inside the hub; defer any work that re-enters it.
@@ -121,13 +121,11 @@ export type SttHubDeps = {
 
 /** A candidate member, as routing (chunk 6) found it. */
 export type SttAttachTarget = {
-  cliDeviceId: string;
-  endpointSlug: string;
+  nodeId: string;
+  handle: string;
   upstreamModel: string;
-  /** The endpoint's effective capabilities. Only `audio.transcriptions.realtime` is read. */
+  /** The served model's effective capabilities. Only `audio.transcriptions.realtime` is read. */
   capabilities: OpenAiCompatibleCapabilities | null | undefined;
-  /** The server's deployment records own this endpoint (recipe-managed members only). */
-  deploymentManaged: boolean;
 };
 
 export type SttOpenFailureReason =
@@ -244,17 +242,11 @@ export function realtimeTranscriptionCapability(
   return realtime?.supported === true ? realtime : null;
 }
 
-/**
- * Why a candidate can never take this session, or null. Recipe-managed
- * endpoints only (chunk 3 decision): the CLI refuses any other.
- */
+/** Why a candidate can never take this session, or null. */
 export function sttTargetRefusal(
   target: SttAttachTarget,
   configs: readonly SttConfig[],
 ): string | null {
-  if (!target.deploymentManaged || !target.endpointSlug.startsWith("inst-")) {
-    return "not a recipe-managed endpoint";
-  }
   const realtime = realtimeTranscriptionCapability(target.capabilities);
   if (!realtime) return "no live transcription capability";
   if (realtime.adapter === "vllm" && configs.some((config) => !configEmpty(config))) {
@@ -266,7 +258,7 @@ export function sttTargetRefusal(
 type Leg = {
   sessionId: string;
   link: SttRelayLink;
-  endpointSlug: string;
+  handle: string;
   state: "opening" | "open" | "closing";
   owner: SttRelaySession | null;
   timer: Timer | null;
@@ -536,7 +528,7 @@ export class SttRelaySession {
     }
     const realtime = realtimeTranscriptionCapability(target.capabilities);
     if (!realtime) throw new Error("unreachable: eligibility checked the capability");
-    const resolution = this.deps.resolveLink(target.cliDeviceId, target.endpointSlug);
+    const resolution = this.deps.resolveLink(target.nodeId, target.handle);
     if (!resolution.ok) {
       return Promise.resolve({
         status: "failed",
@@ -552,7 +544,7 @@ export class SttRelaySession {
     const leg: Leg = {
       sessionId: newSessionId(),
       link,
-      endpointSlug: target.endpointSlug,
+      handle: target.handle,
       state: "opening",
       owner: this,
       timer: null,
@@ -562,7 +554,7 @@ export class SttRelaySession {
       wire = encodeRelayServerControlMessage({
         type: "stt.open",
         sessionId: leg.sessionId,
-        endpointSlug: target.endpointSlug,
+        handle: target.handle,
         upstreamModel: target.upstreamModel,
         adapter: realtime.adapter,
         config: this.openConfig,
@@ -1354,7 +1346,7 @@ export class SttRelayHub {
   endpointsChanged(link: SttRelayLink, slugs: ReadonlySet<string>) {
     const legs = [...(this.registry.byLink.get(link) ?? [])];
     for (const leg of legs) {
-      if (leg.state === "closing" || slugs.has(leg.endpointSlug)) continue;
+      if (leg.state === "closing" || slugs.has(leg.handle)) continue;
       leg.owner?.onEndpointGone(leg);
     }
   }

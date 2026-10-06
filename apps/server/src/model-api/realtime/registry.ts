@@ -20,10 +20,10 @@ import { REALTIME_CLOSE_CODES } from "./transcription-session.js";
  *
  * - `closeAll()` (shutdown) ends each with 1001 and refuses later additions.
  * - `recheckSessions()` (every 60 s, relay maintenance) rechecks the
- *   credential (a model API token, or a Chat Test dashboard session),
+ *   credential (an API key, or a Chat Test dashboard session),
  *   model access and the opened member for each session and ends a session
  *   that lost any of them: 1008 for the credential or the model, 1011 for a
- *   member that is no longer published or recipe-managed. A lookup that
+ *   member that is no longer a live-capable route of its target. A lookup that
  *   throws skips that session for one sweep (the terminal rechecks' rule).
  * - A lost capacity lease ends its session with 1011.
  */
@@ -178,7 +178,7 @@ export class RealtimeSessionRegistry {
     }
   }
 
-  /** A model API token was revoked: its sessions end at once (1008). */
+  /** An API key was revoked: its sessions end at once (1008). */
   terminateForToken(tokenId: string) {
     for (const entry of [...this.entries]) {
       if (entry.credential.kind === "token" && entry.credential.tokenId === tokenId) {

@@ -7,24 +7,22 @@ function candidate(
   route: Partial<NonNullable<RealtimeCandidate["route"]>> = {},
 ): RealtimeCandidate {
   return {
-    cliDeviceId: "cli",
-    endpointSlug: "inst-aaaaaaaaaaaaaaaa",
+    nodeId: "node",
+    handle: "i-aaaaaaaaaaaa",
     upstreamModel: "m",
     capabilities: null,
-    deploymentManaged: true,
     memberId: "m1",
     route: {
       kind: "pool",
       poolId: "pool-1",
       poolMemberId: "m1",
-      discoveredModelId: "dm",
-      endpointId: "ep",
+      runtimeModelId: "rm",
       executionTargetId: "et",
-      capacityId: "cap",
+      instanceId: "cap",
       ownerUserId: "owner",
-      accessGrantId: "grant",
       engineOwnerUserId: "owner",
-      contributionId: null,
+      shareId: "share",
+      contributedShareId: null,
       ...route,
     },
   };
@@ -60,7 +58,7 @@ describe("realtime capacity admission", () => {
         ownerId: "owner",
         sourceKind: "POOL",
         poolId: "pool-1",
-        accessGrantId: "grant",
+        priorityShareId: "share",
         connectionOwner: "model-api-realtime",
         candidates: [
           expect.objectContaining({
@@ -89,20 +87,20 @@ describe("realtime capacity admission", () => {
     });
     const { fake, runtime: rt } = runtime("ADMITTED");
     expect(
-      await createRealtimeAdmit(rt)(candidate({ capacityId: null }), new AbortController().signal),
+      await createRealtimeAdmit(rt)(candidate({ instanceId: "" }), new AbortController().signal),
     ).toEqual({ ok: false });
     expect(fake.acquire).not.toHaveBeenCalled();
   });
 
-  it("admits a direct model as DIRECT, without pool fields", async () => {
+  it("admits a test target as TEST, without pool fields", async () => {
     const { fake, runtime: rt } = runtime("ADMITTED");
     await createRealtimeAdmit(rt)(
-      candidate({ kind: "direct", poolId: null, poolMemberId: null, accessGrantId: null }),
+      candidate({ kind: "test", poolId: null, poolMemberId: null, shareId: null }),
       new AbortController().signal,
     );
     const [attempt] = fake.acquire.mock.calls[0] as unknown as [Record<string, unknown>];
-    expect(attempt.sourceKind).toBe("DIRECT");
+    expect(attempt.sourceKind).toBe("TEST");
     expect(attempt).not.toHaveProperty("poolId");
-    expect(attempt).not.toHaveProperty("accessGrantId");
+    expect(attempt).not.toHaveProperty("priorityShareId");
   });
 });

@@ -74,6 +74,7 @@ import {
   sttAudioMetadataSchema,
   sttClientControlSchemas,
   sttConfigSchema,
+  sttHandleSchema,
   sttSessionIdSchema,
 } from "./stt-protocol.js";
 
@@ -1340,7 +1341,7 @@ export const serverToNodeControlFrameSchema = z.discriminatedUnion("type", [
     .object({
       type: z.literal("stt.open"),
       sessionId: sttSessionIdSchema,
-      handle: runtimeHandleSchema,
+      handle: sttHandleSchema,
       upstreamModel: z
         .string()
         .min(1)

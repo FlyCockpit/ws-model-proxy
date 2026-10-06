@@ -1,5 +1,4 @@
 import { embeddingContractsMatch } from "@ws-model-proxy/api/lib/embedding-contract";
-import { resolveEffectiveCapabilityMetadata } from "@ws-model-proxy/api/lib/openai-compatible-capabilities";
 import prisma, { Prisma } from "@ws-model-proxy/db";
 import { acquireFences, fenceOwners, fences } from "@ws-model-proxy/db/capacity-lock-order";
 import { poolOwnerActive } from "@ws-model-proxy/db/user-deletion-access";
@@ -30,59 +29,36 @@ export class LocalSendRefused extends Error {
 /** Snapshot of the EXACT destination used to construct the request body. */
 export type LocalSendBinding = {
   requesterUserId: string;
-  modelApiTokenId?: string | null;
+  apiKeyId?: string | null;
+  /** The owner of the served model (the pool owner, or a contributor). */
   engineOwnerUserId: string;
-  discoveredModelId: string;
+  runtimeModelId: string;
   executionTargetId: string | undefined;
+  /** The instance (capacityId). */
   capacityId: string | null | undefined;
-  endpointId: string;
-  cliDeviceId: string;
-  endpointSlug: string;
+  /** The head node the request is relayed to. */
+  nodeId: string;
+  /** The instance handle the node routes by. */
+  handle: string;
   upstreamModelId: string;
   pool?: {
     id: string;
     ownerUserId: string;
-    accessGrantId: string | null;
+    /** The share the requester reached the pool through; null for the owner. */
+    shareId: string | null;
     memberId: string | null;
-    contributionId?: string | null;
-    /** A transformer is owner-owned, and must still be the configured transformer. */
-    transformer?: boolean;
+    /** The contributing share of a contributed member (null for the owner's own). */
+    contributedShareId?: string | null;
     embeddingContract?: unknown;
   };
 };
-
-const modelSelect = {
-  id: true,
-  userId: true,
-  upstreamModelId: true,
-  published: true,
-  capabilityOverrideMode: true,
-  capabilityOverrideMetadata: true,
-  ExecutionTarget: { select: { id: true, inferenceCapacityId: true } },
-  Endpoint: {
-    select: {
-      id: true,
-      slug: true,
-      cliDeviceId: true,
-      published: true,
-      status: true,
-      capabilityMetadata: true,
-      CliDevice: { select: { status: true, userId: true } },
-    },
-  },
-} satisfies Prisma.DiscoveredModelSelect;
 
 async function checkPermission(tx: Prisma.TransactionClient, input: LocalSendBinding) {
   const deny = (reason: LocalSendDenial): never => {
     throw new LocalSendRefused(reason);
   };
   const pool = input.pool;
-  if (
-    !input.executionTargetId ||
-    !input.capacityId ||
-    !input.endpointId ||
-    !input.engineOwnerUserId
-  )
+  if (!input.executionTargetId || !input.capacityId || !input.nodeId || !input.engineOwnerUserId)
     deny("MEMBER_UNAVAILABLE");
   // All fences precede graph rows. Management writers cannot acquire a fence
   // while this permission transaction holds a row they need. Never acquire
@@ -94,171 +70,141 @@ async function checkPermission(tx: Prisma.TransactionClient, input: LocalSendBin
   ]);
   await acquireFences(tx, [fences.capacityPolicy(input.executionTargetId!)]);
   if (pool) {
-    await tx.$queryRaw`SELECT id FROM model_pool WHERE id = ${pool.id} FOR SHARE`;
-    const current = await tx.modelPool.findUnique({
+    await tx.$queryRaw`SELECT id FROM pool WHERE id = ${pool.id} FOR SHARE`;
+    const current = await tx.pool.findUnique({
       where: { id: pool.id },
-      select: {
-        userId: true,
-        transformerDiscoveredModelId: true,
-        embeddingContract: true,
-      },
+      select: { userId: true, Fallback: { select: { embeddingContract: true } } },
     });
     if (!current || current.userId !== pool.ownerUserId) deny("ACCESS_REVOKED");
-    if ((input.requesterUserId === pool.ownerUserId) !== (pool.accessGrantId === null))
+    if ((input.requesterUserId === pool.ownerUserId) !== (pool.shareId === null))
       deny("ACCESS_REVOKED");
-    if (pool.accessGrantId !== null) {
-      await tx.$queryRaw`SELECT id FROM pool_grant WHERE id = ${pool.accessGrantId} FOR SHARE`;
-      const grant = await tx.poolGrant.findFirst({
+    if (pool.shareId !== null) {
+      await tx.$queryRaw`SELECT id FROM share WHERE id = ${pool.shareId} FOR SHARE`;
+      const share = await tx.share.findFirst({
         where: {
-          id: pool.accessGrantId,
+          id: pool.shareId,
           poolId: pool.id,
           ownerUserId: pool.ownerUserId,
           granteeUserId: input.requesterUserId,
+          canUse: true,
         },
         select: { id: true },
       });
-      if (!grant) deny("ACCESS_REVOKED");
+      if (!share) deny("ACCESS_REVOKED");
     }
     if (
-      pool.transformer &&
-      (input.engineOwnerUserId !== pool.ownerUserId ||
-        current!.transformerDiscoveredModelId !== input.discoveredModelId)
-    )
-      deny("MEMBER_UNAVAILABLE");
-    if (
       pool.embeddingContract &&
-      !embeddingContractsMatch(pool.embeddingContract, current!.embeddingContract)
+      !embeddingContractsMatch(pool.embeddingContract, current!.Fallback?.embeddingContract)
     )
       deny("MEMBER_UNAVAILABLE");
   } else if (input.requesterUserId !== input.engineOwnerUserId) deny("ACCESS_REVOKED");
 
-  // Registration takes device -> endpoint -> model -> member. Operational
-  // writers without owner fences can change these rows; SHARE catches them.
-  await tx.$queryRaw`SELECT id FROM cli_device WHERE id = ${input.cliDeviceId} FOR SHARE`;
-  await tx.$queryRaw`SELECT id FROM endpoint WHERE id = ${input.endpointId} FOR SHARE`;
-  await tx.$queryRaw`SELECT id FROM discovered_model WHERE id = ${input.discoveredModelId} FOR SHARE`;
-  let model: Prisma.DiscoveredModelGetPayload<{ select: typeof modelSelect }> | null;
+  // Registration and lifecycle writers change the node and instance rows without the owner
+  // fence for status columns; SHARE locks catch them.
+  await tx.$queryRaw`SELECT id FROM node WHERE id = ${input.nodeId} FOR SHARE`;
+  await tx.$queryRaw`SELECT id FROM runtime_instance WHERE id = ${input.capacityId} FOR SHARE`;
+  // KEY SHARE: the target's identity columns are immutable and only its deletion matters here;
+  // health writers (FOR NO KEY UPDATE) must not queue behind every send.
+  await tx.$queryRaw`SELECT id FROM execution_target WHERE id = ${input.executionTargetId} FOR KEY SHARE`;
   if (pool?.memberId) {
     await tx.$queryRaw`SELECT id FROM pool_member WHERE id = ${pool.memberId} FOR SHARE`;
     const member = await tx.poolMember.findFirst({
       where: { id: pool.memberId, poolId: pool.id },
       select: {
-        executionTargetId: true,
-        discoveredModelId: true,
-        tier: true,
-        routingStatus: true,
-        instanceGate: true,
-        ExecutionTarget: {
-          select: { id: true, inferenceCapacityId: true, DiscoveredModel: { select: modelSelect } },
-        },
-        DiscoveredModel: { select: modelSelect },
-        inferenceContributionId: true,
-        InferenceContribution: {
-          select: {
-            id: true,
-            state: true,
-            poolId: true,
-            poolOwnerUserId: true,
-            contributorUserId: true,
-            discoveredModelId: true,
-          },
-        },
+        kind: true,
+        state: true,
+        runtimeModelId: true,
+        shareId: true,
+        Share: { select: { canContribute: true, granteeUserId: true, poolId: true } },
       },
     });
     if (
       !member ||
-      member.ExecutionTarget?.id !== input.executionTargetId ||
-      member.ExecutionTarget?.inferenceCapacityId !== input.capacityId ||
-      member.tier !== "PRIMARY" ||
-      member.routingStatus === "DISABLED" ||
-      member.instanceGate !== "OPEN"
+      member.kind !== "LOCAL" ||
+      member.state !== "ACTIVE" ||
+      member.runtimeModelId !== input.runtimeModelId ||
+      (member.shareId ?? null) !== (pool.contributedShareId ?? null)
     )
       deny("MEMBER_UNAVAILABLE");
-    model = member!.ExecutionTarget?.DiscoveredModel ?? member!.DiscoveredModel;
-    const consent = member!.InferenceContribution;
-    if ((member!.inferenceContributionId ?? null) !== (pool.contributionId ?? null))
-      deny("MEMBER_UNAVAILABLE");
-    if (member!.inferenceContributionId) {
+    if (member!.shareId) {
+      const share = member!.Share;
       if (
-        !consent ||
-        consent.id !== member!.inferenceContributionId ||
-        consent.state !== "ACTIVE" ||
-        consent.poolId !== pool.id ||
-        consent.poolOwnerUserId !== pool.ownerUserId ||
-        consent.contributorUserId !== input.engineOwnerUserId ||
-        consent.discoveredModelId !== input.discoveredModelId
+        !share ||
+        !share.canContribute ||
+        share.poolId !== pool.id ||
+        share.granteeUserId !== input.engineOwnerUserId
       )
         deny("MEMBER_UNAVAILABLE");
     } else if (input.engineOwnerUserId !== pool.ownerUserId) deny("MEMBER_UNAVAILABLE");
-  } else {
-    if (pool && !pool.transformer) deny("MEMBER_UNAVAILABLE");
-    model = await tx.discoveredModel.findUnique({
-      where: { id: input.discoveredModelId },
-      select: modelSelect,
-    });
-    if (
-      model?.ExecutionTarget?.id !== input.executionTargetId ||
-      model?.ExecutionTarget?.inferenceCapacityId !== input.capacityId
-    )
-      deny("MEMBER_UNAVAILABLE");
-  }
+  } else if (pool) deny("MEMBER_UNAVAILABLE");
+  const target = await tx.executionTarget.findUnique({
+    where: { id: input.executionTargetId! },
+    select: {
+      userId: true,
+      instanceId: true,
+      runtimeModelId: true,
+      RuntimeModel: { select: { upstreamModelId: true, embeddingContract: true } },
+      Instance: {
+        select: {
+          handle: true,
+          phase: true,
+          Runtime: { select: { kind: true, nodeId: true } },
+          Ranks: { where: { rank: 0 }, select: { nodeId: true } },
+        },
+      },
+    },
+  });
+  const headNodeId =
+    target?.Instance?.Runtime.kind === "ALWAYS_ON"
+      ? target.Instance.Runtime.nodeId
+      : (target?.Instance?.Ranks[0]?.nodeId ?? null);
+  const node = headNodeId
+    ? await tx.node.findUnique({
+        where: { id: headNodeId },
+        select: { userId: true, connection: true },
+      })
+    : null;
   if (
-    !model ||
-    model.id !== input.discoveredModelId ||
-    model.userId !== input.engineOwnerUserId ||
-    !model.published ||
-    model.upstreamModelId !== input.upstreamModelId ||
-    model.Endpoint.id !== input.endpointId ||
-    model.Endpoint.slug !== input.endpointSlug ||
-    model.Endpoint.cliDeviceId !== input.cliDeviceId ||
-    !model.Endpoint.published ||
-    model.Endpoint.status === "OFFLINE" ||
-    model.Endpoint.CliDevice.status !== "CONNECTED" ||
-    model.Endpoint.CliDevice.userId !== input.engineOwnerUserId
+    !target ||
+    target.userId !== input.engineOwnerUserId ||
+    target.instanceId !== input.capacityId ||
+    target.runtimeModelId !== input.runtimeModelId ||
+    target.RuntimeModel?.upstreamModelId !== input.upstreamModelId ||
+    target.Instance?.handle !== input.handle ||
+    target.Instance.phase !== "READY" ||
+    headNodeId !== input.nodeId ||
+    node?.connection !== "ONLINE" ||
+    node.userId !== input.engineOwnerUserId
   )
     deny("MEMBER_UNAVAILABLE");
-  if (pool?.embeddingContract) {
-    const caps = resolveEffectiveCapabilityMetadata({
-      capabilityOverrideMode: model!.capabilityOverrideMode,
-      capabilityOverrideMetadata: model!.capabilityOverrideMetadata,
-      endpointCapabilityMetadata: model!.Endpoint.capabilityMetadata,
-    });
-    if (!embeddingContractsMatch(pool.embeddingContract, caps?.embeddings?.contract))
-      deny("MEMBER_UNAVAILABLE");
-  }
+  if (
+    pool?.embeddingContract &&
+    !embeddingContractsMatch(pool.embeddingContract, target!.RuntimeModel?.embeddingContract)
+  )
+    deny("MEMBER_UNAVAILABLE");
   let expiresAt: Date | null = null;
-  if (input.modelApiTokenId) {
-    await tx.$queryRaw`SELECT id FROM model_api_token WHERE id = ${input.modelApiTokenId} FOR SHARE`;
-    await tx.$queryRaw`SELECT id FROM model_api_token_allowlist_entry WHERE "modelApiTokenId" = ${input.modelApiTokenId} ORDER BY id FOR SHARE`;
-    const token = await tx.modelApiToken.findUnique({
-      where: { id: input.modelApiTokenId },
+  if (input.apiKeyId) {
+    await tx.$queryRaw`SELECT id FROM api_key WHERE id = ${input.apiKeyId} FOR SHARE`;
+    const key = await tx.apiKey.findUnique({
+      where: { id: input.apiKeyId },
       select: {
         userId: true,
         revokedAt: true,
         expiresAt: true,
-        scopeMode: true,
-        AllowlistEntries: {
-          where: pool
-            ? { modelPoolId: pool.id }
-            : {
-                OR: [
-                  { discoveredModelId: input.discoveredModelId },
-                  { executionTargetId: input.executionTargetId },
-                ],
-              },
-          select: { id: true },
-        },
+        scope: true,
+        Pools: pool ? { where: { poolId: pool.id }, select: { poolId: true } } : false,
       },
     });
     if (
-      !token ||
-      token.userId !== input.requesterUserId ||
-      token.revokedAt ||
-      (token.expiresAt && token.expiresAt.getTime() <= Date.now()) ||
-      (token.scopeMode === "ALLOWLIST" && token.AllowlistEntries.length === 0)
+      !key ||
+      !pool ||
+      key.userId !== input.requesterUserId ||
+      key.revokedAt ||
+      (key.expiresAt && key.expiresAt.getTime() <= Date.now()) ||
+      (key.scope === "SELECTED_POOLS" && (key.Pools?.length ?? 0) === 0)
     )
       deny("ACCESS_REVOKED");
-    expiresAt = token!.expiresAt;
+    expiresAt = key!.expiresAt;
   }
   // A Better Auth ban is an unfenced user UPDATE. Explicit row locks are
   // required; sorted identity order also bounds multi-account lock ordering.
@@ -369,12 +315,15 @@ export async function checkLocalSendPermission(
  * retry this transaction: enqueue is an external effect. A commit failure
  * cancels the possibly accepted attempt and denies further work.
  */
+/** Relay attempt arguments (head node and instance handle). */
+export type LocalRelayAttemptArgs = Parameters<typeof startRelayAttempt>[0];
+
 export async function startAuthorizedLocalRelayAttempt(
   binding: LocalSendBinding,
-  args: Parameters<typeof startRelayAttempt>[0],
+  args: LocalRelayAttemptArgs,
   db: Pick<typeof prisma, "$transaction"> = prisma,
 ): Promise<RelayAttempt> {
-  if (binding.cliDeviceId !== args.cliDeviceId || binding.endpointSlug !== args.endpointSlug) {
+  if (binding.nodeId !== args.nodeId || binding.handle !== args.handle) {
     throw new LocalSendRefused("MEMBER_UNAVAILABLE");
   }
   return withAuthorizedLocalSend(

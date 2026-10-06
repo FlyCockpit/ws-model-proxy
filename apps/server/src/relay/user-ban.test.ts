@@ -1,17 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
-  cancelCommandsForUser: vi.fn(),
+  cancelNodeCommandsForUser: vi.fn(),
   cancelFileOpsForUser: vi.fn(),
-  cancelDeploymentOperatorTerminalsForUser: vi.fn(),
 }));
-vi.mock("./cli-commands.js", () => ({ cancelCommandsForUser: mocks.cancelCommandsForUser }));
-vi.mock("./cli-file-ops.js", () => ({ cancelFileOpsForUser: mocks.cancelFileOpsForUser }));
-vi.mock("./session-manager.js", () => ({
-  relaySessionManager: {
-    cancelDeploymentOperatorTerminalsForUser: mocks.cancelDeploymentOperatorTerminalsForUser,
-  },
+vi.mock("./node-commands.js", () => ({
+  cancelNodeCommandsForUser: mocks.cancelNodeCommandsForUser,
 }));
+vi.mock("./node-file-ops.js", () => ({ cancelFileOpsForUser: mocks.cancelFileOpsForUser }));
 
 const { cancelRelayWorkForBannedUser } = await import("./user-ban.js");
 
@@ -20,21 +16,17 @@ describe("cancelRelayWorkForBannedUser", () => {
     vi.clearAllMocks();
   });
 
-  it("closes the user's deployment operator terminals with the rest of their work", () => {
+  it("ends the user's node commands and file ops", () => {
     cancelRelayWorkForBannedUser("user-1");
-    expect(mocks.cancelCommandsForUser).toHaveBeenCalledWith("user-1");
+    expect(mocks.cancelNodeCommandsForUser).toHaveBeenCalledWith("user-1");
     expect(mocks.cancelFileOpsForUser).toHaveBeenCalledWith("user-1");
-    expect(mocks.cancelDeploymentOperatorTerminalsForUser).toHaveBeenCalledWith("user-1");
   });
 
-  it("still closes operator terminals when an earlier cancel throws", () => {
-    mocks.cancelCommandsForUser.mockImplementationOnce(() => {
+  it("still ends file ops when the command sweep throws", () => {
+    mocks.cancelNodeCommandsForUser.mockImplementationOnce(() => {
       throw new Error("commands");
     });
-    mocks.cancelFileOpsForUser.mockImplementationOnce(() => {
-      throw new Error("files");
-    });
     expect(() => cancelRelayWorkForBannedUser("user-1")).toThrow();
-    expect(mocks.cancelDeploymentOperatorTerminalsForUser).toHaveBeenCalledWith("user-1");
+    expect(mocks.cancelFileOpsForUser).toHaveBeenCalledWith("user-1");
   });
 });

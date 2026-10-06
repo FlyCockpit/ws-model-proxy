@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import type { DeviceCodeExchangeLimit } from "@ws-model-proxy/api/context";
 import type { Session } from "@ws-model-proxy/auth";
 import { env } from "@ws-model-proxy/env/server";
 import type { Context, Next } from "hono";
@@ -105,82 +104,47 @@ export const realtimeUpgradeLimiter = new RateLimiterMemory({
 });
 
 /**
- * `POST /api/auth/device/code` (the start of `wsmp login`), per client IP.
- * Minting a device code grants nothing: a person still has to approve it in
- * the dashboard. So it leaves the strict credential-stuffing bucket and its
- * 15-minute block, which a fleet re-login behind one NAT tripped. 20 per
- * minute and no block: an over-eager caller recovers within one window.
+ * Enrollment-code exchanges (`POST /api/node/enroll`, lane A1), per client IP. A code is a
+ * pre-approved secret, so a caller guessing codes spends its own IP budget; the exchange also
+ * charges the code's owner (per user) once the code is known. No `blockDuration`: an honest
+ * installer that retried too fast recovers within one window. Per process, like every limiter
+ * here.
  */
-export const DEVICE_CODE_MINT_PATH = "/api/auth/device/code";
-export const DEVICE_CODE_MINT_POINTS = 20;
-export const DEVICE_CODE_MINT_DURATION_SECONDS = 60;
+export const ENROLLMENT_EXCHANGE_IP_POINTS = 30;
+export const ENROLLMENT_EXCHANGE_USER_POINTS = 60;
+export const ENROLLMENT_EXCHANGE_DURATION_SECONDS = 60;
 
-export const deviceCodeMintLimiter = new RateLimiterMemory({
-  keyPrefix: "rl:device-code",
-  points: DEVICE_CODE_MINT_POINTS,
-  duration: DEVICE_CODE_MINT_DURATION_SECONDS,
+export const enrollmentExchangeIpLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:enroll-ip",
+  points: ENROLLMENT_EXCHANGE_IP_POINTS,
+  duration: ENROLLMENT_EXCHANGE_DURATION_SECONDS,
 });
 
-/**
- * Exactly `POST /api/auth/device/code` on the raw pathname. Any other method
- * or spelling (`/api/%61uth/...`, a trailing slash) keeps the strict limiter.
- */
-export function isDeviceCodeMintRequest(c: Context): boolean {
-  return c.req.method === "POST" && new URL(c.req.url).pathname === DEVICE_CODE_MINT_PATH;
-}
-
-/**
- * `cliCredentials.exchangeDeviceCode` limiters: the public device-flow
- * redemption a `wsmp login` polls (every 5 s for up to 30 min). One bucket per
- * client IP and one per device code; see {@link consumeDeviceCodeExchange}.
- * A released CLI answers the refusal (`slow_down`) by polling more slowly, so
- * the budgets sit well above an honest poller: 12/min per code, a few
- * concurrent logins behind one address. Per process, like every limiter here.
- */
-export const DEVICE_CODE_EXCHANGE_IP_POINTS = 60;
-export const DEVICE_CODE_EXCHANGE_CODE_POINTS = 20;
-export const DEVICE_CODE_EXCHANGE_DURATION_SECONDS = 60;
-
-export const deviceCodeExchangeIpLimiter = new RateLimiterMemory({
-  keyPrefix: "rl:device-exchange-ip",
-  points: DEVICE_CODE_EXCHANGE_IP_POINTS,
-  duration: DEVICE_CODE_EXCHANGE_DURATION_SECONDS,
+export const enrollmentExchangeUserLimiter = new RateLimiterMemory({
+  keyPrefix: "rl:enroll-user",
+  points: ENROLLMENT_EXCHANGE_USER_POINTS,
+  duration: ENROLLMENT_EXCHANGE_DURATION_SECONDS,
 });
 
-export const deviceCodeExchangeCodeLimiter = new RateLimiterMemory({
-  keyPrefix: "rl:device-exchange-code",
-  points: DEVICE_CODE_EXCHANGE_CODE_POINTS,
-  duration: DEVICE_CODE_EXCHANGE_DURATION_SECONDS,
-});
+export type ExchangeLimit = { allowed: true } | { allowed: false; retryAfterMs: number };
 
 /**
- * Charges one exchange to the client IP, then to the device code. The IP
- * bucket comes first so a caller spraying made-up codes spends its own budget
- * before creating code buckets. The device code is a secret only its CLI
- * holds, so its bucket is no lockout lever for anyone else; it is keyed by a
- * digest so limiter memory never holds the code and each key has a fixed size.
- * No `blockDuration`: an honest CLI that polled too fast recovers within one
- * window. An unexpected limiter error fails open, like the middleware.
+ * Charges one enrollment exchange to a limiter key (the client IP, then the code owner's
+ * user id). An unexpected limiter error fails open, like the middleware.
  */
-export async function consumeDeviceCodeExchange(
-  clientIp: string,
-  deviceCode: string,
-  limiters: { ip: RateLimiter; code: RateLimiter } = {
-    ip: deviceCodeExchangeIpLimiter,
-    code: deviceCodeExchangeCodeLimiter,
-  },
-): Promise<DeviceCodeExchangeLimit> {
-  const codeKey = createHash("sha256").update(deviceCode).digest("base64url");
+export async function consumeEnrollmentExchange(
+  limiter: RateLimiter,
+  key: string,
+): Promise<ExchangeLimit> {
   try {
-    await limiters.ip.consume(clientIp);
-    await limiters.code.consume(codeKey);
+    await limiter.consume(createHash("sha256").update(key).digest("base64url"));
     return { allowed: true };
   } catch (rejection: unknown) {
     if (rejection instanceof RateLimiterRes) {
       return { allowed: false, retryAfterMs: rejection.msBeforeNext };
     }
     console.error(
-      `[rate-limit] Unexpected device-code exchange limiter error, failing open: (${
+      `[rate-limit] Unexpected enrollment limiter error, failing open: (${
         rejection instanceof Error ? (rejection.constructor?.name ?? "Error") : typeof rejection
       })`,
     );

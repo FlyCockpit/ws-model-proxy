@@ -1,33 +1,30 @@
 /**
- * Per-device evaluation of metric routing rules (S-B part 2).
+ * Per-node evaluation of metric routing rules and engine load, keyed (pool member × execution
+ * target) in 0.4.0: a LOCAL member names a served model, and each instance serving it is one
+ * target, so a member can be FULL on one instance and free on another.
  *
- * On each accepted `node.metrics` or `endpoint.load` frame the relay session
- * schedules an evaluation of every pool member served by that device.
- * At most one evaluation runs per device per second (a frame
- * inside the window schedules one trailing run). Each member's verdict is
- * upserted into the H-class `pool_member_routing_verdict` table when it
- * changes, and otherwise refreshed at most every {@link VERDICT_REFRESH_MS}
- * so its `expiresAt` follows the metrics. Admission reads that table with a
- * plain, non-locking SELECT; this writer takes no capacity lock and the
- * table has no foreign keys, so it adds no lock-order edge (DL-1).
+ * On each accepted `node.metrics` or `runtime.load` frame the relay session schedules an
+ * evaluation of every (member, target) pair whose instance's head runs on that node. At most
+ * one evaluation runs per node per second (a frame inside the window schedules one trailing
+ * run). Each verdict is upserted into the H-class `routing_verdict` table when it changes, and
+ * otherwise refreshed at most every {@link VERDICT_REFRESH_MS} so its `expiresAt` follows the
+ * metrics. Admission reads that table with a plain, non-locking SELECT; this writer takes no
+ * capacity lock and the table has no foreign keys, so it adds no lock-order edge (DL-1).
  *
- * S-D: the same run also turns the member's live engine load (vLLM/SGLang
- * waiting or KV pressure, llama.cpp busy slots or deferred requests) into a
- * FULL verdict, OR-combined with the rules (engine load only ever adds FULL).
- * A member without rules gets a row while engine load holds it FULL, plus
- * one clearing write. Each session also publishes once per member to fence
- * inherited or in-flight predecessor verdicts, including on reconnect. Idle
- * frames then stay quiet until membership changes. Clears and retractions
- * preserve NONE rows so their durable successor fences survive every process.
+ * The same run turns the instance's live engine load (vLLM/SGLang waiting or KV pressure,
+ * llama.cpp busy slots or deferred requests) into a FULL verdict, OR-combined with the rules.
+ * The engine-load gate is the runtime version's (`AUTO`, `ENFORCE`, `OBSERVE`). Each session
+ * publishes once per pair to fence inherited or in-flight predecessor verdicts. Clears and
+ * retractions keep NONE rows so their durable successor fences survive every process.
  *
  * The inputs are numbers, names and labels only; no prompt text reaches here.
  */
 
 import { randomUUID } from "node:crypto";
 import {
+  type EngineKind,
   type EngineLoadFacts,
   type EngineLoadVerdict,
-  engineKindFromDb,
   evaluateEngineLoad,
 } from "@ws-model-proxy/api/lib/engine-load";
 import {
@@ -43,29 +40,36 @@ import {
 } from "@ws-model-proxy/api/lib/metric-routing";
 import prisma from "@ws-model-proxy/db";
 
-/** Minimum gap between two evaluations of one device. */
+/** Minimum gap between two evaluations of one node. */
 export const ROUTING_EVALUATION_MIN_INTERVAL_MS = 1_000;
 /** An unchanged verdict is re-written at most this often (to extend `expiresAt`). */
 export const VERDICT_REFRESH_MS = 5_000;
 
+/**
+ * A live `runtime.load` reading as the evaluator matches it: `endpointSlug` is the instance
+ * handle, `modelSlug` the served model (null: instance-wide).
+ */
+export type RuntimeLoadReading = EndpointLoadSample;
+
 export type RoutingEvaluationInputs = {
   nodeMetrics: { sample: NodeMetricsSample; receivedAt: Date } | null;
-  endpointLoad: readonly EndpointLoadSample[];
+  runtimeLoad: readonly RuntimeLoadReading[];
 };
 
 /** Held by one relay session. */
 export type RoutingEvaluationState = {
   /** Identifies this state as the publisher of the verdict rows it writes. */
   publisherId: string;
+  /** The node's owner (only their instances run on it). */
   userId: string;
-  cliDeviceId: string;
+  nodeId: string;
   lastRunAtMs: number | null;
   timer: ReturnType<typeof setTimeout> | null;
   running: boolean;
   rerun: boolean;
   closed: boolean;
   written: Map<string, { key: string; writtenAtMs: number; epoch: number }>;
-  /** Members successfully published by this session, including idle successor fences. */
+  /** Pairs successfully published by this session, including idle successor fences. */
   probed: Set<string>;
 };
 
@@ -84,12 +88,12 @@ export function combineWithEngineLoad(
 
 export function createRoutingEvaluationState(
   userId: string,
-  cliDeviceId: string,
+  nodeId: string,
 ): RoutingEvaluationState {
   return {
     publisherId: randomUUID(),
     userId,
-    cliDeviceId,
+    nodeId,
     lastRunAtMs: null,
     timer: null,
     running: false,
@@ -100,25 +104,50 @@ export function createRoutingEvaluationState(
   };
 }
 
-type Db = Pick<typeof prisma, "poolMember" | "poolMemberRoutingVerdict" | "modelPool">;
+type Db = Pick<typeof prisma, "executionTarget" | "routingVerdict" | "pool">;
 
 const VERDICT_TO_DB = { none: "NONE", avoid: "AVOID", full: "FULL" } as const satisfies Record<
   RoutingVerdict,
   "NONE" | "AVOID" | "FULL"
 >;
 
+/** The 0.4.0 engine vocabulary as the engine-load evaluator names it. */
+const ENGINE_TO_KIND: Readonly<Record<string, EngineKind>> = {
+  VLLM: "VLLM",
+  SGLANG: "SGLANG",
+  LLAMA_CPP: "LLAMA_CPP",
+  OLLAMA: "OLLAMA",
+  LM_STUDIO: "LM_STUDIO",
+  OTHER: "GENERIC",
+};
+
+/** The version's engine-load gate as the evaluator's mode pair. */
+export function gateFacts(gate: string | null | undefined): {
+  mode: EngineLoadFacts["mode"];
+  customMode: NonNullable<EngineLoadFacts["customMode"]>;
+} {
+  if (gate === "OBSERVE") return { mode: "OFF", customMode: "OBSERVE" };
+  if (gate === "ENFORCE") return { mode: "AUTO", customMode: "ENFORCE" };
+  return { mode: "AUTO", customMode: "OBSERVE" };
+}
+
 /** The rules an evaluation used, in a form that compares by value. */
 function rulesKey(rules: unknown): string {
   return JSON.stringify(rules);
 }
 
-/** The member's engine-load override an evaluation used, compared by value. */
-function overrideKey(mode: string, kvFullThreshold: number | null, customMode?: string): string {
-  return `${mode}:${kvFullThreshold ?? ""}:${customMode ?? ""}`;
+/** The instance's engine-load gate an evaluation used, compared by value. */
+function overrideKey(gate: string | null, kvFullThreshold: number | null): string {
+  return `${gate ?? ""}:${kvFullThreshold ?? ""}`;
+}
+
+function pairKey(memberId: string, targetId: string): string {
+  return `${memberId}\u0000${targetId}`;
 }
 
 type PublishedEntry = {
   memberId: string;
+  targetId: string;
   poolId: string;
   rulesKey: string;
   overrideKey: string;
@@ -128,13 +157,39 @@ type VerdictData = {
   publisherId: string;
   userId: string;
   poolId: string;
-  cliDeviceId: string;
+  nodeId: string;
   verdict: "NONE" | "AVOID" | "FULL";
   ruleStates: string[];
   engineState: string;
   evaluatedAt: Date;
   expiresAt: Date;
 };
+
+const RULE_SELECT = {
+  orderBy: { position: "asc" as const },
+  select: {
+    position: true,
+    metric: true,
+    labels: true,
+    aggregate: true,
+    op: true,
+    threshold: true,
+    effect: true,
+    memberId: true,
+    exclude: true,
+  },
+};
+
+/** Targets whose instance's head runs on the node (always-on: the runtime's node; else rank 0). */
+function headOnNode(userId: string, nodeId: string) {
+  return {
+    kind: "INSTANCE_MODEL" as const,
+    userId,
+    Instance: {
+      OR: [{ Runtime: { nodeId } }, { Ranks: { some: { rank: 0, nodeId } } }],
+    },
+  };
+}
 
 export class MetricRoutingEvaluator {
   /** Bumped when a pool's verdicts are cleared, so cached "already written" entries stop applying. */
@@ -145,7 +200,7 @@ export class MetricRoutingEvaluator {
     private readonly clock: () => Date = () => new Date(),
   ) {}
 
-  /** Request an evaluation; coalesced to one run per device per second. */
+  /** Request an evaluation; coalesced to one run per node per second. */
   schedule(state: RoutingEvaluationState, inputs: () => RoutingEvaluationInputs): void {
     if (state.closed) return;
     if (state.running) {
@@ -193,65 +248,33 @@ export class MetricRoutingEvaluator {
   }
 
   async evaluate(state: RoutingEvaluationState, inputs: RoutingEvaluationInputs): Promise<void> {
-    // The evaluation's own time, taken BEFORE anything is read: it orders
-    // this evaluation against every other one for the same member (see
-    // `publish`), so a run that stalls in a query cannot later overwrite a
-    // verdict a newer run already wrote.
+    // The evaluation's own time, taken BEFORE anything is read: it orders this evaluation
+    // against every other one for the same pair (see `publish`).
     const now = this.clock();
-    // Cached writes belong to the epoch captured before reads: a clear
-    // during publication must invalidate them on the next run. Idle probes
-    // remain valid because clears preserve their durable NONE fences.
     const epoch = this.clearEpoch;
-    const members = await this.db.poolMember.findMany({
-      where: {
-        tier: "PRIMARY",
-        ModelPool: { userId: state.userId },
-        OR: [
-          {
-            ExecutionTarget: { DiscoveredModel: { Endpoint: { cliDeviceId: state.cliDeviceId } } },
-          },
-          {
-            executionTargetId: null,
-            DiscoveredModel: { Endpoint: { cliDeviceId: state.cliDeviceId } },
-          },
-        ],
-      },
+    const targets = await this.db.executionTarget.findMany({
+      where: headOnNode(state.userId, state.nodeId),
       select: {
         id: true,
-        poolId: true,
-        engineLoadMode: true,
-        customEngineLoadMode: true,
-        kvFullThreshold: true,
-        ModelPool: {
+        Instance: {
           select: {
-            PoolRoutingRules: {
-              orderBy: { position: "asc" as const },
-              select: {
-                position: true,
-                metric: true,
-                labels: true,
-                aggregate: true,
-                op: true,
-                threshold: true,
-                effect: true,
-                memberId: true,
-                exclude: true,
-              },
-            },
+            handle: true,
+            engineSlots: true,
+            loadSignals: true,
+            Version: { select: { engine: true, engineLoadGate: true, kvFullThreshold: true } },
           },
         },
-        DiscoveredModel: { select: { slug: true, Endpoint: { select: { slug: true } } } },
-        ExecutionTarget: {
+        RuntimeModel: {
           select: {
-            InferenceCapacity: {
+            upstreamModelId: true,
+            Members: {
+              where: { kind: "LOCAL" as const },
               select: {
-                engineKind: true,
-                engineSlots: true,
-                engineLoadSource: true,
-                engineLoadSignals: true,
+                id: true,
+                poolId: true,
+                Pool: { select: { userId: true, RoutingRules: RULE_SELECT } },
               },
             },
-            DiscoveredModel: { select: { slug: true, Endpoint: { select: { slug: true } } } },
           },
         },
       },
@@ -263,137 +286,122 @@ export class MetricRoutingEvaluator {
       : [];
     const seen = new Set<string>();
     const published: PublishedEntry[] = [];
-    for (const member of members) {
-      const rules = routingRulesFromRows(member.ModelPool.PoolRoutingRules ?? []);
-      const model = member.ExecutionTarget?.DiscoveredModel ?? member.DiscoveredModel;
-      if (!model) continue;
-      const memberRef = { endpointSlug: model.Endpoint.slug, modelSlug: model.slug ?? null };
-      const capacity = member.ExecutionTarget?.InferenceCapacity ?? null;
-      const reading = pickEndpointLoad(inputs.endpointLoad, memberRef);
-      const loadSource =
-        capacity?.engineLoadSource === "CUSTOM" || reading?.source === "custom"
-          ? ("custom" as const)
-          : ("builtin" as const);
+    for (const target of targets) {
+      const instance = target.Instance;
+      const model = target.RuntimeModel;
+      if (!instance || !model) continue;
+      const ref = { endpointSlug: instance.handle, modelSlug: model.upstreamModelId };
+      const reading = pickEndpointLoad(inputs.runtimeLoad, ref);
+      const gate = gateFacts(instance.Version.engineLoadGate);
       const facts: EngineLoadFacts = {
-        engineKind: engineKindFromDb(capacity?.engineKind),
-        engineSlots: capacity?.engineSlots ?? null,
-        mode: member.engineLoadMode === "OFF" ? "OFF" : "AUTO",
-        kvFullThreshold: member.kvFullThreshold ?? null,
-        loadSource,
-        signals: capacity?.engineLoadSignals ?? [],
-        customMode: member.customEngineLoadMode === "ENFORCE" ? "ENFORCE" : "OBSERVE",
+        engineKind: ENGINE_TO_KIND[instance.Version.engine ?? ""] ?? null,
+        engineSlots: instance.engineSlots ?? null,
+        mode: gate.mode,
+        kvFullThreshold: instance.Version.kvFullThreshold ?? null,
+        loadSource:
+          reading?.source === "route" || reading?.source === "command" ? "custom" : "builtin",
+        signals: instance.loadSignals,
+        customMode: gate.customMode,
       };
       const engine = evaluateEngineLoad(
         facts,
         reading ? { ...reading, waitingStreak: reading.waitingStreak ?? 0 } : null,
         now,
       );
-      const previous = state.written.get(member.id);
-      seen.add(member.id);
-      // Empty session memory may hide inherited FULL or an older publication
-      // still in flight. Publish one NONE fence before skipping idle frames.
-      if (rules.length === 0 && !engine.full && !previous && state.probed.has(member.id)) continue;
-      const series = [...nodeSeries, ...endpointLoadSeries(inputs.endpointLoad, memberRef, now)];
-      const evaluation = combineWithEngineLoad(
-        rules.length === 0
-          ? { verdict: "none", ruleStates: [], expiresAt: now }
-          : evaluateRoutingRules(rules, series, now, member.id),
-        engine,
-      );
-      // Rules and overrides invalidate the cache even when edited on another process.
-      const key = `${evaluation.verdict}:${evaluation.ruleStates.join(",")}:${engine.state}:${engine.enforced}:${rulesKey(rules)}:${overrideKey(facts.mode, facts.kvFullThreshold, facts.customMode)}`;
-      if (
-        previous &&
-        previous.key === key &&
-        previous.epoch === epoch &&
-        nowMs - previous.writtenAtMs < VERDICT_REFRESH_MS
-      ) {
-        continue;
-      }
-      const data = {
-        publisherId: state.publisherId,
-        userId: state.userId,
-        poolId: member.poolId,
-        cliDeviceId: state.cliDeviceId,
-        verdict: VERDICT_TO_DB[evaluation.verdict],
-        ruleStates: evaluation.ruleStates,
-        engineState: engine.state,
-        evaluatedAt: now,
-        expiresAt: evaluation.expiresAt,
-      };
-      // The session ended while an earlier write was in flight: publish nothing more.
-      if (state.closed) break;
-      if (await this.publish(member.id, data)) {
-        state.probed.add(member.id);
-        // A rule-less member's NONE fence never gates and needs no refresh,
-        // so only FULL verdicts remain in the cached writes.
-        if (rules.length === 0 && evaluation.verdict === "none") state.written.delete(member.id);
-        else state.written.set(member.id, { key, writtenAtMs: nowMs, epoch });
-        published.push({
-          memberId: member.id,
+      const series = [...nodeSeries, ...endpointLoadSeries(inputs.runtimeLoad, ref, now)];
+      for (const member of model.Members) {
+        const rules = routingRulesFromRows(member.Pool.RoutingRules ?? []);
+        const pair = pairKey(member.id, target.id);
+        const previous = state.written.get(pair);
+        seen.add(pair);
+        // Empty session memory may hide inherited FULL or an older publication still in
+        // flight. Publish one NONE fence before skipping idle frames.
+        if (rules.length === 0 && !engine.full && !previous && state.probed.has(pair)) continue;
+        const evaluation = combineWithEngineLoad(
+          rules.length === 0
+            ? { verdict: "none", ruleStates: [], expiresAt: now }
+            : evaluateRoutingRules(rules, series, now, member.id),
+          engine,
+        );
+        const override = overrideKey(
+          instance.Version.engineLoadGate,
+          instance.Version.kvFullThreshold ?? null,
+        );
+        const key = `${evaluation.verdict}:${evaluation.ruleStates.join(",")}:${engine.state}:${engine.enforced}:${rulesKey(rules)}:${override}`;
+        if (
+          previous &&
+          previous.key === key &&
+          previous.epoch === epoch &&
+          nowMs - previous.writtenAtMs < VERDICT_REFRESH_MS
+        ) {
+          continue;
+        }
+        const data: VerdictData = {
+          publisherId: state.publisherId,
+          userId: member.Pool.userId,
           poolId: member.poolId,
-          rulesKey: rulesKey(rules),
-          overrideKey: overrideKey(facts.mode, facts.kvFullThreshold, facts.customMode),
-        });
+          nodeId: state.nodeId,
+          verdict: VERDICT_TO_DB[evaluation.verdict],
+          ruleStates: evaluation.ruleStates,
+          engineState: engine.state,
+          evaluatedAt: now,
+          expiresAt: evaluation.expiresAt,
+        };
+        // The session ended while an earlier write was in flight: publish nothing more.
+        if (state.closed) return;
+        if (await this.publish(member.id, target.id, data)) {
+          state.probed.add(pair);
+          // A rule-less pair's NONE fence never gates and needs no refresh.
+          if (rules.length === 0 && evaluation.verdict === "none") state.written.delete(pair);
+          else state.written.set(pair, { key, writtenAtMs: nowMs, epoch });
+          published.push({
+            memberId: member.id,
+            targetId: target.id,
+            poolId: member.poolId,
+            rulesKey: rulesKey(rules),
+            overrideKey: override,
+          });
+        }
       }
     }
     await this.retractIfRulesChanged(state, published, now);
-    for (const memberId of state.written.keys()) {
-      if (!seen.has(memberId)) state.written.delete(memberId);
-    }
-    for (const memberId of state.probed) {
-      if (!seen.has(memberId)) state.probed.delete(memberId);
-    }
+    for (const pair of state.written.keys()) if (!seen.has(pair)) state.written.delete(pair);
+    for (const pair of state.probed) if (!seen.has(pair)) state.probed.delete(pair);
   }
+
   /**
-   * The ONE write of a verdict: never older than what is stored. The row is
-   * replaced only when its `evaluatedAt` is strictly older than this
-   * evaluation's, or is this same publisher's own row (an equal timestamp
-   * from ANOTHER publisher belongs to whoever wrote first, so a cancelled
-   * session's delayed write cannot overwrite its successor even within one
-   * millisecond). A missing row is created, and losing that creation race
-   * (unique violation) is decided again the same way. True when this
-   * evaluation's verdict is now the stored one.
+   * The ONE write of a verdict: never older than what is stored. The row is replaced only
+   * when its `evaluatedAt` is strictly older than this evaluation's, or is this same
+   * publisher's own row. A missing row is created, and losing that creation race (unique
+   * violation) is decided again the same way. True when this verdict is now the stored one.
    */
-  private async publish(memberId: string, data: VerdictData): Promise<boolean> {
+  private async publish(memberId: string, targetId: string, data: VerdictData): Promise<boolean> {
     const replaceable = {
       poolMemberId: memberId,
+      executionTargetId: targetId,
       OR: [
         { evaluatedAt: { lt: data.evaluatedAt } },
         { evaluatedAt: data.evaluatedAt, publisherId: data.publisherId },
       ],
     };
-    const updated = await this.db.poolMemberRoutingVerdict.updateMany({
-      where: replaceable,
-      data,
-    });
+    const updated = await this.db.routingVerdict.updateMany({ where: replaceable, data });
     if (updated.count > 0) return true;
     try {
-      await this.db.poolMemberRoutingVerdict.create({ data: { poolMemberId: memberId, ...data } });
+      await this.db.routingVerdict.create({
+        data: { poolMemberId: memberId, executionTargetId: targetId, ...data },
+      });
       return true;
     } catch (error) {
       if ((error as { code?: unknown } | null)?.code !== "P2002") throw error;
-      // Another evaluation created the row first. It may be an OLDER one, so
-      // decide by `evaluatedAt` again instead of assuming a newer wrote.
-      const retried = await this.db.poolMemberRoutingVerdict.updateMany({
-        where: replaceable,
-        data,
-      });
+      const retried = await this.db.routingVerdict.updateMany({ where: replaceable, data });
       return retried.count > 0;
     }
   }
 
   /**
-   * A rule edit or engine-load override change can commit between what this
-   * evaluation read and its write. After the write is committed, re-read the
-   * pools and members: if their rules or override differ, the edit's clear
-   * may have missed our publication, so delete
-   * exactly the gating rows this evaluation wrote (a newer evaluation's row
-   * has a different `evaluatedAt` or publisher and is kept). NONE rows stay
-   * as durable successor fences even when their snapshot is outdated.
-   * A gating row committed before the re-read is either seen here or
-   * deleted by the edit's own clearing,
-   * because the edit clears after its rules commit.
+   * A rule edit or engine-load gate change can commit between what this evaluation read and
+   * its write. Re-read the pools and the instances' versions after the write: if they differ,
+   * delete exactly the gating rows this evaluation wrote. NONE rows stay as successor fences.
    */
   private async retractIfRulesChanged(
     state: RoutingEvaluationState,
@@ -402,76 +410,59 @@ export class MetricRoutingEvaluator {
   ): Promise<void> {
     if (published.length === 0) return;
     const poolIds = [...new Set(published.map((entry) => entry.poolId))];
-    const pools = await this.db.modelPool.findMany({
+    const pools = await this.db.pool.findMany({
       where: { id: { in: poolIds } },
+      select: { id: true, RoutingRules: RULE_SELECT },
+    });
+    const currentRules = new Map(
+      pools.map((pool) => [pool.id, rulesKey(routingRulesFromRows(pool.RoutingRules ?? []))]),
+    );
+    const targets = await this.db.executionTarget.findMany({
+      where: { id: { in: [...new Set(published.map((entry) => entry.targetId))] } },
       select: {
         id: true,
-        PoolRoutingRules: {
-          orderBy: { position: "asc" },
-          select: {
-            position: true,
-            metric: true,
-            labels: true,
-            aggregate: true,
-            op: true,
-            threshold: true,
-            effect: true,
-            memberId: true,
-            exclude: true,
-          },
+        Instance: {
+          select: { Version: { select: { engineLoadGate: true, kvFullThreshold: true } } },
         },
       },
     });
-    const current = new Map(
-      pools.map((pool) => [pool.id, rulesKey(routingRulesFromRows(pool.PoolRoutingRules ?? []))]),
-    );
-    const members = await this.db.poolMember.findMany({
-      where: { id: { in: published.map((entry) => entry.memberId) } },
-      select: { id: true, engineLoadMode: true, customEngineLoadMode: true, kvFullThreshold: true },
-    });
     const currentOverride = new Map(
-      members.map((member) => [
-        member.id,
+      targets.map((target) => [
+        target.id,
         overrideKey(
-          member.engineLoadMode === "OFF" ? "OFF" : "AUTO",
-          member.kvFullThreshold,
-          member.customEngineLoadMode === "ENFORCE" ? "ENFORCE" : "OBSERVE",
+          target.Instance?.Version.engineLoadGate ?? null,
+          target.Instance?.Version.kvFullThreshold ?? null,
         ),
       ]),
     );
     const stale = published.filter(
       (entry) =>
-        current.get(entry.poolId) !== entry.rulesKey ||
-        currentOverride.get(entry.memberId) !== entry.overrideKey,
+        currentRules.get(entry.poolId) !== entry.rulesKey ||
+        currentOverride.get(entry.targetId) !== entry.overrideKey,
     );
-    if (stale.length === 0) return;
-    await this.db.poolMemberRoutingVerdict.deleteMany({
-      where: {
-        poolMemberId: { in: stale.map((entry) => entry.memberId) },
-        evaluatedAt,
-        publisherId: state.publisherId,
-        verdict: { not: "NONE" },
-      },
-    });
     for (const entry of stale) {
-      state.written.delete(entry.memberId);
-      state.probed.delete(entry.memberId);
+      await this.db.routingVerdict.deleteMany({
+        where: {
+          poolMemberId: entry.memberId,
+          executionTargetId: entry.targetId,
+          evaluatedAt,
+          publisherId: state.publisherId,
+          verdict: { not: "NONE" },
+        },
+      });
+      const pair = pairKey(entry.memberId, entry.targetId);
+      state.written.delete(pair);
+      state.probed.delete(pair);
     }
   }
 
   /**
-   * A pool's rules were replaced (the rule editor committed): its stored
-   * gating verdicts belong to the old rules. Cleared here, in the hot-path (H)
-   * module, because a management writer must not write H tables; an
-   * evaluation still in flight is retracted by `retractIfRulesChanged`.
+   * A pool's rules were replaced (the rule editor committed): its stored gating verdicts
+   * belong to the old rules. Cleared here, in the hot-path (H) module, because a management
+   * writer must not write H tables; an evaluation still in flight is retracted above.
    */
   async clearPool(poolId: string): Promise<void> {
-    // Cached verdicts are re-written at once afterwards (also for rules
-    // saved unchanged). Idle rule-less members retain their NONE fences
-    // without re-probing; deleting those rows could admit a delayed older write.
     this.clearEpoch += 1;
-    await this.db.poolMemberRoutingVerdict.deleteMany({
-      where: { poolId, verdict: { not: "NONE" } },
-    });
+    await this.db.routingVerdict.deleteMany({ where: { poolId, verdict: { not: "NONE" } } });
   }
 }

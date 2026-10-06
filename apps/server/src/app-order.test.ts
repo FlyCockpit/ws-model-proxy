@@ -118,7 +118,7 @@ import { resolveMcpPlugins } from "../../../packages/auth/src/mcp-plugins";
 import { createApp } from "./app";
 import { MCP_WELL_KNOWN_PATHS } from "./mcp-discovery";
 import { MCP_OAUTH_RATE_LIMITED_ROUTES } from "./mcp-oauth-route-match";
-import { authLimiter, deviceCodeMintLimiter, mcpClientRegistrationLimiter } from "./rate-limit";
+import { mcpClientRegistrationLimiter } from "./rate-limit";
 import { getUserDeletionSweepHealth, startUserDeletionSweep } from "./user-deletion-sweep";
 
 const prismaMock = prismaDefault as unknown as DeepMockProxy<typeof prismaDefault>;
@@ -675,150 +675,11 @@ describe("createApp readiness probe — GET /ready through the real route (#79 i
   });
 });
 
-describe("createApp registration contract — device-code exchange limiter (CI-2)", () => {
-  it("binds exchangeDeviceCode to the per-code limiter: slow_down after the budget", async () => {
-    const { DEVICE_CODE_EXCHANGE_CODE_POINTS } = await import("./rate-limit");
-    const app = await buildApp(false);
-    mockGetConnInfo.mockReturnValue({ remote: { address: "203.0.113.77" } });
-    const exchange = () =>
-      app.request(`${BASE}/rpc/cliCredentials/exchangeDeviceCode`, {
-        method: "POST",
-        headers: { ...HOST, "content-type": "application/json", "x-csrf-token": "orpc" },
-        body: JSON.stringify({
-          json: {
-            deviceCode: `wiring-${BASE}-code`,
-            cliSlug: "desk-01",
-            identityPublicKey:
-              "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE",
-          },
-        }),
-      });
-    for (let call = 0; call < DEVICE_CODE_EXCHANGE_CODE_POINTS; call += 1) {
-      const res = await exchange();
-      // The mocked database has no such code.
-      expect(res.status, `call ${call}`).toBe(404);
-    }
-    const limited = await exchange();
-    expect(limited.status).toBe(429);
-    expect(await limited.json()).toMatchObject({
-      json: { code: "TOO_MANY_REQUESTS", data: { deviceFlowError: "slow_down" } },
-    });
-  });
-
-  it("answers the pre-0.4.0 upgrade sentinel even after the code bucket is saturated", async () => {
-    const { CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE, CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE } =
-      await import("@ws-model-proxy/config/cli-device-login");
-    const { DEVICE_CODE_EXCHANGE_CODE_POINTS } = await import("./rate-limit");
-    const app = await buildApp(false);
-    mockGetConnInfo.mockReturnValue({ remote: { address: "[IP_ADDRESS]" } });
-    // A real code saturates the shared per-code bucket first, as an
-    // unauthenticated caller flooding the known constant sentinel would.
-    const realExchange = () =>
-      app.request(`${BASE}/rpc/cliCredentials/exchangeDeviceCode`, {
-        method: "POST",
-        headers: { ...HOST, "content-type": "application/json", "x-csrf-token": "orpc" },
-        body: JSON.stringify({
-          json: {
-            deviceCode: "saturation-code",
-            cliSlug: "desk-01",
-            identityPublicKey:
-              "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE",
-          },
-        }),
-      });
-    for (let call = 0; call < DEVICE_CODE_EXCHANGE_CODE_POINTS; call += 1) {
-      await realExchange();
-    }
-    expect((await realExchange()).status).toBe(429);
-
-    // Every sentinel poll must still get the upgrade message a 0.3.x CLI
-    // prints — never the 429 that its poll loop treats as retryable. Thirty
-    // polls keep the whole test inside the 60-point per-IP bucket.
-    const sentinelExchange = () =>
-      app.request(`${BASE}/rpc/cliCredentials/exchangeDeviceCode`, {
-        method: "POST",
-        headers: { ...HOST, "content-type": "application/json", "x-csrf-token": "orpc" },
-        body: JSON.stringify({
-          json: { deviceCode: CLI_DEVICE_LOGIN_UPGRADE_DEVICE_CODE, cliSlug: "desk-01" },
-        }),
-      });
-    for (let call = 0; call < 30; call += 1) {
-      const res = await sentinelExchange();
-      expect(res.status, `sentinel call ${call}`).toBe(400);
-      expect(await res.json(), `sentinel call ${call}`).toMatchObject({
-        json: { code: "BAD_REQUEST", message: CLI_LOGIN_UPGRADE_REQUIRED_MESSAGE },
-      });
-    }
-  });
-});
-
-describe("createApp registration contract — device-code mint budget", () => {
-  const IP = "10.9.9.9";
-  afterEach(async () => {
-    await deviceCodeMintLimiter.delete(IP);
-    await authLimiter.delete(IP);
-  });
-
-  it("POST /api/auth/device/code has its own per-IP bucket and leaves the strict auth bucket alone", async () => {
-    mockGetConnInfo.mockReturnValue({ remote: { address: IP } });
-    const app = await buildApp(false);
-    const post = (path: string) =>
-      app.request(`${BASE}${path}`, {
-        method: "POST",
-        headers: { ...HOST, "content-type": "application/json" },
-        body: JSON.stringify({ client_id: "ws-model-proxy", scope: "cli-slug:desk-01" }),
-      });
-    for (let call = 0; call < 20; call += 1) {
-      const res = await post("/api/auth/device/code");
-      expect(res.status, `mint ${call}`).not.toBe(429);
-      expect(res.headers.get("x-ratelimit-limit"), `mint ${call}`).toBe("20");
-    }
-    const limited = await post("/api/auth/device/code");
-    expect(limited.status).toBe(429);
-    const retryAfter = Number(limited.headers.get("retry-after"));
-    // No 15-minute block: the wait is at most one 60 s window.
-    expect(retryAfter).toBeGreaterThan(0);
-    expect(retryAfter).toBeLessThanOrEqual(60);
-    // The mints never touched the strict bucket: sign-in from the same IP is its first hit.
-    const signIn = await post("/api/auth/sign-in/email");
-    expect(signIn.headers.get("x-ratelimit-limit")).toBe("500");
-    expect(signIn.headers.get("x-ratelimit-remaining")).toBe("499");
-    // A near-miss spelling keeps the strict limiter.
-    const encoded = await post("/api/%61uth/device/code");
-    expect(encoded.headers.get("x-ratelimit-limit")).toBe("500");
-  });
-});
-
-describe("createApp registration contract — device-code body cap runs first (f3-F2)", () => {
-  it("refuses an unlength'd oversized /device/code body without buffering it", async () => {
-    const { DEVICE_CODE_BODY_MAX_BYTES } = await import("./device-code-upgrade-gate");
-    const app = await buildApp(false);
-    const chunk = new TextEncoder().encode("x".repeat(1024));
-    let pulls = 0;
-    // 1 MiB offered in 1 KiB chunks, with no Content-Length. The app-wide
-    // 10 MB limit would read all of it before any later middleware ran.
-    const body = new ReadableStream<Uint8Array>({
-      pull(controller) {
-        pulls += 1;
-        if (pulls > 1024) controller.close();
-        else controller.enqueue(chunk);
-      },
-    });
-    const res = await app.request(`${BASE}/api/auth/device/code`, {
-      method: "POST",
-      headers: { ...HOST, "content-type": "application/json" },
-      body,
-      duplex: "half",
-    } as RequestInit);
-    expect(res.status).toBe(413);
-    // 16 chunks fill the cap and the 17th crosses it; a few more are read ahead.
-    expect(pulls).toBeLessThanOrEqual(DEVICE_CODE_BODY_MAX_BYTES / 1024 + 4);
-  });
-});
-
-describe("createApp registration contract — device-login approval needs the CSRF header", () => {
-  const approveBody = JSON.stringify({ json: { userCode: "ABCDEFGH", slug: "desk-01" } });
-  // A same-origin deployment: no CORS_ORIGIN, so the rest of /rpc checks no
+describe("createApp registration contract — human procedures need the CSRF header", () => {
+  // A person's approval (minting an enrollment code is the approval of a new node).
+  const humanPath = "nodes/enrollmentCodes/create";
+  const humanBody = JSON.stringify({ json: {} });
+  // A same-origin deployment: no CORS_ORIGIN, so only the human procedures check the
   // CSRF header (read by createApp at construction).
   let savedCorsOrigin: string | undefined;
   beforeEach(() => {
@@ -829,26 +690,26 @@ describe("createApp registration contract — device-login approval needs the CS
     if (savedCorsOrigin !== undefined) envMock.CORS_ORIGIN = savedCorsOrigin;
   });
 
-  it("refuses a headerless approval (a no-preflight cross-origin POST) before any auth or write", async () => {
+  it("refuses a headerless human call (a no-preflight cross-origin POST) before any auth or write", async () => {
     const app = await buildApp(false);
     for (const contentType of [undefined, "application/json", "text/plain"]) {
       // A browser on a sibling origin: refused by the same-origin guard.
-      const crossSite = await app.request(`${BASE}/rpc/cliCredentials/approveDeviceLogin`, {
+      const crossSite = await app.request(`${BASE}/rpc/${humanPath}`, {
         method: "POST",
         headers: {
           ...HOST,
           origin: "https://evil.example.com",
           ...(contentType ? { "content-type": contentType } : {}),
         },
-        body: new TextEncoder().encode(approveBody),
+        body: new TextEncoder().encode(humanBody),
       });
       expect(crossSite.status, String(contentType)).toBe(403);
       expect(await crossSite.json()).toEqual({ error: "Cross-site request blocked." });
       // No browser provenance at all: still refused by the CSRF header check.
-      const headerless = await app.request(`${BASE}/rpc/cliCredentials/approveDeviceLogin`, {
+      const headerless = await app.request(`${BASE}/rpc/${humanPath}`, {
         method: "POST",
         headers: { ...HOST, ...(contentType ? { "content-type": contentType } : {}) },
-        body: new TextEncoder().encode(approveBody),
+        body: new TextEncoder().encode(humanBody),
       });
       expect(headerless.status, String(contentType)).toBe(403);
       expect(await headerless.json()).toMatchObject({ json: { code: "CSRF_TOKEN_MISMATCH" } });
@@ -858,10 +719,10 @@ describe("createApp registration contract — device-login approval needs the CS
   it("refuses any cross-site browser mutation on /rpc and /api-reference, whatever the procedure or encoding", async () => {
     const app = await buildApp(false);
     for (const [path, headers] of [
-      // An unlisted procedure through a same-site sibling (Lax cookie sent).
-      ["/rpc/forwarderManagement/updateModelPool", { origin: "https://sibling.proxy.example.com" }],
-      ["/rpc/inferenceContributions/accept", { "sec-fetch-site": "same-site" }],
-      ["/api-reference/inference-contributions/accept", { "sec-fetch-site": "cross-site" }],
+      // A procedure that does not need the header, through a same-site sibling (Lax cookie sent).
+      ["/rpc/pools/update", { origin: "https://sibling.proxy.example.com" }],
+      ["/rpc/access/shares/create", { "sec-fetch-site": "same-site" }],
+      ["/api-reference/access/shares/create", { "sec-fetch-site": "cross-site" }],
     ] as const) {
       const res = await app.request(`${BASE}${path}`, {
         method: "POST",
@@ -872,7 +733,7 @@ describe("createApp registration contract — device-login approval needs the CS
       expect(await res.json()).toEqual({ error: "Cross-site request blocked." });
     }
     // The app's own origin passes the guard and reaches the session check.
-    const sameOrigin = await app.request(`${BASE}/rpc/cliCredentials/approveDeviceLogin`, {
+    const sameOrigin = await app.request(`${BASE}/rpc/${humanPath}`, {
       method: "POST",
       headers: {
         ...HOST,
@@ -880,21 +741,20 @@ describe("createApp registration contract — device-login approval needs the CS
         "content-type": "application/json",
         "x-csrf-token": "orpc",
       },
-      body: approveBody,
+      body: humanBody,
     });
     expect(sameOrigin.status).toBe(401);
   });
 
   it.each([
-    "deployments/confirmPlan",
-    "deployments/createConfig",
-    "deployments/updateConfig",
-    "deployments/setNodeGrant",
-    "deployments/setAgentsMayPreempt",
-    "deployments/deleteConfig",
-    "inferenceContributions/accept",
-    "cliCredentials/resetTokenIdentity",
-    "forwarderManagement/setCliDeviceFeatureGrants",
+    "nodes/enrollmentCodes/create",
+    "nodes/lowerTrust",
+    "nodes/setHold",
+    "nodes/setTemporary",
+    "nodes/terminals/openTicket",
+    "access/shares/create",
+    "access/agentTokens/create",
+    "nodes/queued/run",
   ])("refuses a headerless %s before any auth or write", async (path) => {
     const app = await buildApp(false);
     // Headerless (no Origin, no Sec-Fetch-Site): the per-procedure CSRF check refuses it.
@@ -914,9 +774,9 @@ describe("createApp registration contract — device-login approval needs the CS
       headers: { ...HOST, "content-type": "application/json", "x-orpc-batch": "buffered" },
       body: JSON.stringify([
         {
-          url: `${BASE}/rpc/cliCredentials/approveDeviceLogin`,
+          url: `${BASE}/rpc/${humanPath}`,
           headers: { "x-csrf-token": "orpc" },
-          body: JSON.parse(approveBody),
+          body: JSON.parse(humanBody),
         },
       ]),
     });
@@ -927,30 +787,22 @@ describe("createApp registration contract — device-login approval needs the CS
 
   it("lets a request with the header reach the procedure (the session check answers)", async () => {
     const app = await buildApp(false);
-    const res = await app.request(`${BASE}/rpc/cliCredentials/approveDeviceLogin`, {
+    const res = await app.request(`${BASE}/rpc/${humanPath}`, {
       method: "POST",
       headers: { ...HOST, "content-type": "application/json", "x-csrf-token": "orpc" },
-      body: approveBody,
+      body: humanBody,
     });
     expect(res.status).toBe(401);
   });
 
-  it("leaves the CLI's headerless exchange alone on a same-origin deployment", async () => {
+  it("leaves a headerless agent-level call alone on a same-origin deployment", async () => {
     const app = await buildApp(false);
-    mockGetConnInfo.mockReturnValue({ remote: { address: "198.51.100.44" } });
-    const res = await app.request(`${BASE}/rpc/cliCredentials/exchangeDeviceCode`, {
+    const res = await app.request(`${BASE}/rpc/nodes/list`, {
       method: "POST",
       headers: { ...HOST, "content-type": "application/json" },
-      body: JSON.stringify({
-        json: {
-          deviceCode: "headerless-code",
-          cliSlug: "desk-01",
-          identityPublicKey:
-            "BBERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERERE",
-        },
-      }),
+      body: JSON.stringify({ json: {} }),
     });
-    // The mocked database has no such code: the procedure ran.
-    expect(res.status).toBe(404);
+    // Not refused for CSRF: the procedure's own access check answers (no caller).
+    expect(res.status).toBe(401);
   });
 });

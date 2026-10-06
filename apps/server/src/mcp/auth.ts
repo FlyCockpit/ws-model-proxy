@@ -2,11 +2,6 @@ import { requireMcpAuth } from "@better-auth/mcp";
 import type { AuthInfo } from "@modelcontextprotocol/server";
 import type { ContextServices } from "@ws-model-proxy/api/context";
 import {
-  authenticateMcpPersonalToken,
-  isMcpPersonalTokenSecret,
-  type McpPersonalTokenIdentity,
-} from "@ws-model-proxy/api/lib/mcp-token-access";
-import {
   MCP_ISSUER,
   MCP_RESOURCE_URL,
   mcpPatClientId,
@@ -22,8 +17,18 @@ import { mcpIdentityKey, mcpIdentityQuotaLimiter } from "../mcp-rate-limit";
 import { cloneRequestOntoPublicOrigin, PublicRequestError } from "../public-request-url";
 import { MCP_CLOSE_SHADOW_AWAIT_MS } from "../shutdown-timeouts";
 import { createMcpAdmissionGate, type McpAdmission, type McpAdmissionGate } from "./admission";
-import type { McpRequestCredential } from "./cli-tool-access";
-import { createMcpContext, type McpContext, type McpSessionUser } from "./context";
+import {
+  type AgentTokenIdentity,
+  authenticateAgentToken,
+  isAgentTokenSecret,
+} from "./agent-token-access";
+import {
+  createMcpContext,
+  type McpContext,
+  type McpLevel,
+  type McpRequestCredential,
+  type McpSessionUser,
+} from "./context";
 import {
   mcpForbiddenResponse,
   mcpInternalErrorResponse,
@@ -138,14 +143,11 @@ export interface CreateMcpRequestHandlerOptions {
    */
   onVerified?: (verified: McpVerifiedRequest) => void;
   /**
-   * MCP personal-token verifier. Default looks up hashed `wsmp_mcp_` secrets.
-   * Injectable so unit tests can exercise the PAT admission branch without a
+   * Agent-token verifier. Default looks up hashed `wsmp_agent_` secrets.
+   * Injectable so unit tests can exercise the agent-token branch without a
    * real credential table.
    */
-  authenticatePersonalToken?: (
-    rawSecret: string,
-    now: Date,
-  ) => Promise<McpPersonalTokenIdentity | null>;
+  authenticateAgentToken?: (rawSecret: string, now: Date) => Promise<AgentTokenIdentity | null>;
 }
 
 /** Hono context variables the /mcp route reads (requestId from the wrapper). */
@@ -183,8 +185,13 @@ export function mcpReadBaselineMatcher(requiredScope: string, grantedScopes: Rea
 async function loadMcpGrant(prisma: McpAuthPrisma, id: string) {
   return prisma.mcpGrant.findUnique({
     where: { id },
-    select: { id: true, userId: true, clientId: true, revokedAt: true },
+    select: { id: true, userId: true, clientId: true, revokedAt: true, level: true },
   });
+}
+
+/** An OAuth request is FULL only when its grant is FULL and the token carries mcp:write. */
+export function oauthLevel(grantLevel: McpLevel, scopes: readonly string[]): McpLevel {
+  return grantLevel === "FULL" && mcpScopesAllow([...scopes], "write") ? "FULL" : "READ";
 }
 
 /** Extract the presented Bearer/DPoP credential from the Authorization header. */
@@ -213,9 +220,9 @@ export interface McpVerifiedRequest {
    */
   signal: AbortSignal;
   /**
-   * How this request was admitted. The personal-token branch sets `pat`
-   * from the token row; the OAuth verifier path sets `oauth`. Never inferred
-   * from `clientId`.
+   * How this request was admitted, with its level. The agent-token branch
+   * takes it from the token row; the OAuth path from the grant and the
+   * token's scopes. Never inferred from `clientId`.
    */
   credential: McpRequestCredential;
 }
@@ -498,8 +505,7 @@ async function handleAdmittedRequest(
   }
 
   const presented = extractPresentedCredential(canonicalRequest.headers.get("authorization"));
-  const isPersonalToken =
-    presented?.scheme === "Bearer" && isMcpPersonalTokenSecret(presented.token);
+  const isAgentToken = presented?.scheme === "Bearer" && isAgentTokenSecret(presented.token);
 
   // Built per request (a cheap closure) so the request ID threads into the
   // admission sequence's error responses and sanitized logs.
@@ -515,7 +521,7 @@ async function handleAdmittedRequest(
         consumeIdentityQuota,
         now,
         signal,
-        mcpCredential: { kind: "oauth" },
+        agentToken: null,
       }),
     {
       issuer: issuerUrl,
@@ -526,15 +532,14 @@ async function handleAdmittedRequest(
   );
   try {
     let response: Response;
-    if (isPersonalToken && presented) {
-      const authenticatePersonalToken =
-        options.authenticatePersonalToken ?? authenticateMcpPersonalToken;
-      let identity: McpPersonalTokenIdentity | null;
+    if (isAgentToken && presented) {
+      const verifyAgentToken = options.authenticateAgentToken ?? authenticateAgentToken;
+      let identity: AgentTokenIdentity | null;
       try {
-        identity = await authenticatePersonalToken(presented.token, now());
+        identity = await verifyAgentToken(presented.token, now());
       } catch (error) {
         mcpSanitizedLog(
-          `personal token lookup failed (${
+          `agent token lookup failed (${
             error instanceof Error ? error.constructor.name : typeof error
           })`,
           { requestId: c.get("requestId") },
@@ -549,7 +554,7 @@ async function handleAdmittedRequest(
         return finalizeMcpEarlyExitResponse(
           c,
           mcpUnauthorizedResponse({
-            description: "Invalid MCP personal token",
+            description: "Invalid agent token",
             resourceUrl,
           }),
         );
@@ -559,7 +564,7 @@ async function handleAdmittedRequest(
         claims: {
           sub: identity.userId,
           client_id: mcpPatClientId(identity.id),
-          scope: identity.scopes.join(" "),
+          scope: identity.level === "FULL" ? "mcp:read mcp:write" : "mcp:read",
           [MCP_GRANT_ID_CLAIM]: identity.grantId,
           ...(identity.expiresAt ? { exp: Math.floor(identity.expiresAt.getTime() / 1000) } : {}),
         },
@@ -569,14 +574,7 @@ async function handleAdmittedRequest(
         consumeIdentityQuota,
         now,
         signal,
-        mcpCredential: {
-          kind: "pat",
-          tokenId: identity.id,
-          allowCliCommands: identity.allowCliCommands === true,
-          allowCliFileRead: identity.allowCliFileRead === true,
-          scopes: identity.scopes,
-          expiresAt: identity.expiresAt,
-        },
+        agentToken: identity,
       });
     } else {
       response = await wrapped(canonicalRequest);
@@ -737,7 +735,7 @@ async function handleVerifiedRequest({
   consumeIdentityQuota,
   now,
   signal,
-  mcpCredential,
+  agentToken,
 }: {
   request: Request;
   claims: Record<string, unknown>;
@@ -748,8 +746,8 @@ async function handleVerifiedRequest({
   now: () => Date;
   /** Owned admission signal — every stage below is fenced on it (F8). */
   signal: AbortSignal;
-  /** Admission branch credential. Not derived from clientId. */
-  mcpCredential: McpRequestCredential;
+  /** The verified agent token (agent-token branch), or null for OAuth. */
+  agentToken: AgentTokenIdentity | null;
 }): Promise<Response> {
   // STAGE FENCES (F8 piece 2): after EVERY awaited stage, an aborted signal
   // stops the sequence HERE — the next stage (especially the user lookup,
@@ -822,6 +820,22 @@ async function handleVerifiedRequest({
     mcpSanitizedLog("rejected: grant missing, mismatched, or revoked", { sub, clientId });
     return mcpForbiddenResponse();
   }
+
+  // The request's level: an agent token's own level; an OAuth grant's level,
+  // and FULL only when the access token also carries mcp:write.
+  const mcpCredential: McpRequestCredential =
+    agentToken !== null
+      ? {
+          kind: "agent_token",
+          tokenId: agentToken.id,
+          level: agentToken.level,
+          expiresAt: agentToken.expiresAt,
+        }
+      : {
+          kind: "oauth",
+          grantId: grant.id,
+          level: oauthLevel(grant.level, scopes),
+        };
 
   // 6-7. Live user: missing → 401; active ban or pending deletion → 403; forced 2FA not set up → 403.
   // FULL Prisma user row (invariant 5): the synthetic oRPC context must
@@ -915,6 +929,7 @@ async function handleVerifiedRequest({
   };
   const orpcContext = createMcpContext({
     user,
+    credential: mcpCredential,
     expiresAt: new Date((expiresAt ?? Math.floor(now().getTime() / 1000) + 60) * 1000),
     now: now(),
     // G1: thread the request's OWNED admission signal into the services so

@@ -5,7 +5,6 @@ import {
   McpServer,
   PROTOCOL_VERSION_META_KEY,
 } from "@modelcontextprotocol/server";
-import type { McpPersonalTokenIdentity } from "@ws-model-proxy/api/lib/mcp-token-access";
 import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -107,6 +106,7 @@ vi.mock("@better-auth/mcp", async (importOriginal) => {
 });
 
 import { createMcpAdmissionGate } from "./admission";
+import type { AgentTokenIdentity } from "./agent-token-access";
 import {
   createMcpRequestHandler,
   extractPresentedCredential,
@@ -118,18 +118,6 @@ import {
 } from "./auth";
 import { MCP_SYNTHETIC_SESSION_TOKEN, type McpSessionUser } from "./context";
 import { createMcpTransport } from "./handler";
-
-vi.mock("../relay/cli-commands.js", () => ({
-  startCliCommand: vi.fn(),
-  waitCliCommand: vi.fn(),
-  snapshotCliCommand: vi.fn(),
-}));
-vi.mock("../relay/cli-file-ops.js", () => ({
-  runFileOp: vi.fn(),
-  cancelFileOpsForToken: vi.fn(),
-  sweepExpiredFileOps: vi.fn(),
-  auditRefusedFileInput: vi.fn(),
-}));
 
 const BASE = "https://proxy.example.com";
 const RESOURCE = `${BASE}/mcp`;
@@ -157,7 +145,13 @@ const healthyUser: McpSessionUser = {
   operationalAlerts: true,
 };
 
-type GrantRow = { id: string; userId: string; clientId: string; revokedAt: Date | null };
+type GrantRow = {
+  id: string;
+  userId: string;
+  clientId: string;
+  revokedAt: Date | null;
+  level?: "READ" | "FULL";
+};
 
 function buildPrisma({
   grant = { id: GRANT_ID, userId: SUB, clientId: CLIENT_ID, revokedAt: null } satisfies GrantRow,
@@ -317,7 +311,14 @@ describe("createMcpRequestHandler — admission decisions", () => {
     expect(verified[0]?.orpcContext.session.user.id).toBe(SUB);
     expect(verified[0]?.orpcContext.session.session.token).toBe(MCP_SYNTHETIC_SESSION_TOKEN);
     expect(JSON.stringify(verified[0]?.orpcContext)).not.toContain(TOKEN);
-    expect(verified[0]?.credential).toEqual({ kind: "oauth" });
+    // The grant fixture has no FULL level, so the request is READ.
+    expect(verified[0]?.credential).toEqual({ kind: "oauth", grantId: GRANT_ID, level: "READ" });
+    expect(verified[0]?.orpcContext.auth).toEqual({
+      kind: "oauth_access_token",
+      userId: SUB,
+      grantId: GRANT_ID,
+      level: "READ",
+    });
   });
 
   it("DPoP-presented credential is carried with the same AuthInfo shape", async () => {
@@ -1633,85 +1634,71 @@ describe("createMcpRequestHandler — F10 pass 5: losing continuation cannot mis
   });
 });
 
-describe("createMcpRequestHandler — personal token admission", () => {
-  const PAT = `wsmp_mcp_${"a".repeat(43)}`;
-  const PAT_ID = "token-pat-1";
+describe("createMcpRequestHandler — agent token admission", () => {
+  const PAT = `wsmp_agent_${"a".repeat(43)}`;
+  const PAT_ID = "token-agent-1";
   const PAT_CLIENT_ID = `pat:${PAT_ID}`;
 
-  /** Verified-identity fixture for the PAT branch (matching grant via patGrant). */
-  function patIdentity(overrides: Partial<McpPersonalTokenIdentity> = {}) {
+  /** Verified-identity fixture for the agent-token branch (matching grant via patGrant). */
+  function patIdentity(overrides: Partial<AgentTokenIdentity> = {}): AgentTokenIdentity {
     return {
       id: PAT_ID,
       userId: SUB,
       grantId: GRANT_ID,
-      scopes: ["mcp:read"],
+      level: "READ",
       expiresAt: null,
-      lookupPrefix: "wsmp_mcp_aaaaaaaaaaaa",
-      allowCliCommands: false,
-      allowCliFileRead: false,
       ...overrides,
     };
   }
 
-  /** The McpGrant row the PAT claims must bind to (synthetic pat: clientId). */
+  /** The McpGrant row the token claims must bind to (synthetic pat: clientId). */
   function patGrant(overrides: Partial<GrantRow> = {}): GrantRow {
     return { id: GRANT_ID, userId: SUB, clientId: PAT_CLIENT_ID, revokedAt: null, ...overrides };
   }
 
-  it("admits a live personal token without invoking the JWT verifier", async () => {
-    const authenticatePersonalToken = vi.fn(async () => ({
-      id: PAT_ID,
-      userId: SUB,
-      grantId: GRANT_ID,
-      scopes: ["mcp:read"],
-      expiresAt: null,
-      lookupPrefix: "wsmp_mcp_aaaaaaaaaaaa",
-      allowCliCommands: false,
-      allowCliFileRead: false,
-    }));
+  it("admits a live agent token without invoking the JWT verifier", async () => {
+    const authenticateAgentToken = vi.fn(async () => patIdentity());
     const { handler, transport, quota, verified } = buildHandler({
-      authenticatePersonalToken,
-      prisma: buildPrisma({
-        grant: { id: GRANT_ID, userId: SUB, clientId: `pat:${PAT_ID}`, revokedAt: null },
-      }),
+      authenticateAgentToken,
+      prisma: buildPrisma({ grant: patGrant() }),
     });
     const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
     expect(res.status).toBe(200);
-    expect(authenticatePersonalToken).toHaveBeenCalledWith(PAT, new Date("2026-06-01T00:00:00Z"));
+    expect(authenticateAgentToken).toHaveBeenCalledWith(PAT, new Date("2026-06-01T00:00:00Z"));
     expect(upstreamState.receivedRequest).toBeNull();
     expect(transport.calls[0]?.authInfo?.clientId).toBe(`pat:${PAT_ID}`);
     expect(transport.calls[0]?.authInfo?.scopes).toEqual(["mcp:read"]);
     expect(quota).toHaveBeenCalledWith(SUB, `pat:${PAT_ID}`);
     expect(verified[0]?.orpcContext.session.user.id).toBe(SUB);
     expect(verified[0]?.credential).toEqual({
-      kind: "pat",
+      kind: "agent_token",
       tokenId: PAT_ID,
-      scopes: ["mcp:read"],
-      allowCliCommands: false,
-      allowCliFileRead: false,
+      level: "READ",
       expiresAt: null,
     });
+    expect(verified[0]?.orpcContext.auth).toEqual({
+      kind: "agent_token",
+      userId: SUB,
+      agentTokenId: PAT_ID,
+      level: "READ",
+    });
+    expect(JSON.stringify(verified[0]?.orpcContext)).not.toContain(PAT);
   });
 
-  it("binds explicit read-only file consent and current scopes to the PAT credential", async () => {
-    const { handler, verified } = buildHandler({
-      authenticatePersonalToken: async () =>
-        patIdentity({ allowCliFileRead: true, allowCliCommands: false, scopes: ["mcp:read"] }),
+  it("a FULL agent token carries its level and the write scope", async () => {
+    const { handler, transport, verified } = buildHandler({
+      authenticateAgentToken: async () => patIdentity({ level: "FULL" }),
       prisma: buildPrisma({ grant: patGrant() }),
     });
     const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
     expect(res.status).toBe(200);
-    expect(verified[0]?.credential).toMatchObject({
-      kind: "pat",
-      allowCliCommands: false,
-      allowCliFileRead: true,
-      scopes: ["mcp:read"],
-    });
+    expect(transport.calls[0]?.authInfo?.scopes).toEqual(["mcp:read", "mcp:write"]);
+    expect(verified[0]?.credential).toMatchObject({ kind: "agent_token", level: "FULL" });
   });
 
-  it("an invalid personal token is 401 and never reaches the transport", async () => {
+  it("an invalid agent token is 401 and never reaches the transport", async () => {
     const { handler, transport } = buildHandler({
-      authenticatePersonalToken: async () => null,
+      authenticateAgentToken: async () => null,
     });
     const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
     expect(res.status).toBe(401);
@@ -1737,7 +1724,7 @@ describe("createMcpRequestHandler — personal token admission", () => {
   ])("PAT with %s → 403 with NO challenge and no transport call", async (_label, makePrisma) => {
     const prisma = makePrisma();
     const { handler, transport } = buildHandler({
-      authenticatePersonalToken: async () => patIdentity(),
+      authenticateAgentToken: async () => patIdentity(),
       prisma,
     });
     const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
@@ -1749,7 +1736,7 @@ describe("createMcpRequestHandler — personal token admission", () => {
 
   it("token owner no longer exists → 401 invalid_token (stale subject)", async () => {
     const { handler, transport } = buildHandler({
-      authenticatePersonalToken: async () => patIdentity(),
+      authenticateAgentToken: async () => patIdentity(),
       prisma: buildPrisma({ grant: patGrant(), user: null }),
     });
     const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
@@ -1767,7 +1754,7 @@ describe("createMcpRequestHandler — personal token admission", () => {
     };
 
     const denied = buildHandler({
-      authenticatePersonalToken: async () => patIdentity(),
+      authenticateAgentToken: async () => patIdentity(),
       prisma: buildPrisma({ grant: patGrant(), user: banned }),
     });
     const deniedRes = await callHandler(
@@ -1778,7 +1765,7 @@ describe("createMcpRequestHandler — personal token admission", () => {
     expect(denied.transport.calls).toHaveLength(0);
 
     const admitted = buildHandler({
-      authenticatePersonalToken: async () => patIdentity(),
+      authenticateAgentToken: async () => patIdentity(),
       prisma: buildPrisma({ grant: patGrant(), user: expiredBan }),
     });
     expect(
@@ -1789,7 +1776,7 @@ describe("createMcpRequestHandler — personal token admission", () => {
   it("force-2FA policy on + owner without 2FA → 403; policy off → admitted", async () => {
     const noTwoFactor: McpSessionUser = { ...healthyUser, twoFactorEnabled: false };
     const enforced = buildHandler({
-      authenticatePersonalToken: async () => patIdentity(),
+      authenticateAgentToken: async () => patIdentity(),
       prisma: buildPrisma({ grant: patGrant(), user: noTwoFactor }),
       isForceTwoFactorRequired: async () => true,
     });
@@ -1801,7 +1788,7 @@ describe("createMcpRequestHandler — personal token admission", () => {
     expect(enforced.transport.calls).toHaveLength(0);
 
     const policyOff = buildHandler({
-      authenticatePersonalToken: async () => patIdentity(),
+      authenticateAgentToken: async () => patIdentity(),
       prisma: buildPrisma({ grant: patGrant(), user: noTwoFactor }),
       isForceTwoFactorRequired: async () => false,
     });
@@ -1812,7 +1799,7 @@ describe("createMcpRequestHandler — personal token admission", () => {
 
   it("identity quota exhausted → 429 with Retry-After, transport NOT reached", async () => {
     const { handler, transport } = buildHandler({
-      authenticatePersonalToken: async () => patIdentity(),
+      authenticateAgentToken: async () => patIdentity(),
       prisma: buildPrisma({ grant: patGrant() }),
       consumeIdentityQuota: async () => ({ ok: false, retryAfterSeconds: 42 }),
     });
@@ -1824,7 +1811,7 @@ describe("createMcpRequestHandler — personal token admission", () => {
 
   it("identity quota is keyed by the token owner sub + pat:<tokenId> (pinned by the consume call)", async () => {
     const { handler, quota } = buildHandler({
-      authenticatePersonalToken: async () => patIdentity(),
+      authenticateAgentToken: async () => patIdentity(),
       prisma: buildPrisma({ grant: patGrant() }),
     });
     await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
@@ -1835,7 +1822,7 @@ describe("createMcpRequestHandler — personal token admission", () => {
     const expiresAt = new Date("2026-12-01T00:00:00Z");
     const exp = Math.floor(expiresAt.getTime() / 1000);
     const { handler, transport, verified } = buildHandler({
-      authenticatePersonalToken: async () => patIdentity({ expiresAt, allowCliCommands: true }),
+      authenticateAgentToken: async () => patIdentity({ expiresAt, level: "FULL" }),
       prisma: buildPrisma({ grant: patGrant() }),
     });
     const res = await callHandler(handler, mcpRequest({ authorization: `Bearer ${PAT}` }));
@@ -1844,11 +1831,9 @@ describe("createMcpRequestHandler — personal token admission", () => {
     expect(authInfo?.expiresAt).toBe(exp);
     expect(authInfo?.extra).toMatchObject({ exp });
     expect(verified[0]?.credential).toEqual({
-      kind: "pat",
+      kind: "agent_token",
       tokenId: PAT_ID,
-      scopes: ["mcp:read"],
-      allowCliFileRead: false,
-      allowCliCommands: true,
+      level: "FULL",
       expiresAt,
     });
   });

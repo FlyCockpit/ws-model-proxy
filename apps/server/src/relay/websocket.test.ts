@@ -18,8 +18,8 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   },
 }));
 
-vi.mock("@ws-model-proxy/api/lib/cli-credential-access", () => ({
-  authenticateCliWebsocketSecret: vi.fn(),
+vi.mock("./node-credential-auth.js", () => ({
+  authenticateNodeCredential: vi.fn(),
 }));
 
 vi.mock("@ws-model-proxy/db", async () => {
@@ -42,14 +42,12 @@ vi.mock("../rate-limit.js", () => ({
     },
 }));
 
-const { authenticateCliWebsocketSecret } = await import(
-  "@ws-model-proxy/api/lib/cli-credential-access"
-);
+const { authenticateNodeCredential } = await import("./node-credential-auth.js");
 const { createRelayWebsocketMiddleware, relaySocketEvents } = await import("./websocket.js");
 const { relaySessionManager } = await import("./session-manager.js");
 const { WSContext } = await import("hono/ws");
 
-const authenticateMock = vi.mocked(authenticateCliWebsocketSecret);
+const authenticateMock = vi.mocked(authenticateNodeCredential);
 
 function app() {
   const hono = new Hono();
@@ -81,7 +79,7 @@ describe("createRelayWebsocketMiddleware", () => {
 
     expect(response.status).toBe(401);
     await expect(response.json()).resolves.toEqual({
-      error: "CLI websocket authentication required.",
+      error: "Node credential required.",
     });
   });
 
@@ -89,8 +87,8 @@ describe("createRelayWebsocketMiddleware", () => {
     const response = await app().request("/api/cli/ws", {
       method: "GET",
       headers: websocketHeaders({
-        Authorization: "Bearer wsmp_cli_secret",
-        "Sec-WebSocket-Protocol": "ws-model-proxy.relay.v1",
+        Authorization: "Bearer wsmp_node_secret",
+        "Sec-WebSocket-Protocol": "ws-model-proxy.relay.v2",
       }),
     });
 
@@ -100,7 +98,7 @@ describe("createRelayWebsocketMiddleware", () => {
       failure: "protocol_error",
       code: "upgrade_cli",
       supportedVersions: RELAY_PROTOCOL_VERSIONS,
-      supportedSubprotocol: "ws-model-proxy.relay.v2",
+      supportedSubprotocol: "ws-model-proxy.relay.v3",
     });
   });
 
@@ -116,7 +114,7 @@ describe("createRelayWebsocketMiddleware", () => {
 
     const response = await hono.request("/api/cli/ws", {
       method: "GET",
-      headers: websocketHeaders({ Authorization: "Bearer wsmp_cli_secret" }),
+      headers: websocketHeaders({ Authorization: "Bearer wsmp_node_secret" }),
     });
 
     expect(response.status).toBe(429);
@@ -132,22 +130,23 @@ describe("createRelayWebsocketMiddleware", () => {
 
     const response = await app().request("/api/cli/ws", {
       method: "GET",
-      headers: websocketHeaders({ Authorization: "Bearer wsmp_cli_secret" }),
+      headers: websocketHeaders({ Authorization: "Bearer wsmp_node_secret" }),
     });
 
     expect(response.status).toBe(401);
     await expect(response.json()).resolves.toEqual({
-      error: "Invalid or revoked CLI websocket credential.",
+      error: "Invalid or revoked node credential.",
     });
   });
 });
 
 describe("relay upgrade during shutdown", () => {
-  const identity = {
+  const identity: Parameters<typeof relaySocketEvents>[0] = {
+    credentialId: "cred-id",
     userId: "user-id",
-    cliCredentialId: "cred-id",
-    cliDeviceId: null,
-  } as unknown as Parameters<typeof relaySocketEvents>[0];
+    nodeId: "node-id",
+    identityPublicKey: "key",
+  };
 
   function fakeWs() {
     const closes: Array<{ code?: number; reason?: string }> = [];
@@ -195,7 +194,7 @@ describe("relay upgrade during shutdown", () => {
     // The drain check passed; authentication is now in flight.
     const upgrade = hono.request("/api/cli/ws", {
       method: "GET",
-      headers: websocketHeaders({ Authorization: "Bearer wsmp_cli_secret" }),
+      headers: websocketHeaders({ Authorization: "Bearer wsmp_node_secret" }),
     });
     await vi.waitFor(() => expect(authenticateMock).toHaveBeenCalledTimes(1));
     expect(relaySessionManager.isDraining()).toBe(false);

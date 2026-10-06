@@ -1,7 +1,14 @@
-import { assertPriority } from "./types.js";
+import { assertPriority, PRIORITY_CLASS_COUNT } from "./types.js";
 
-export const PRIORITY_CLASS_COUNT = 32;
-export const SCHEDULER_VERSION = 1;
+export { PRIORITY_CLASS_COUNT };
+/**
+ * Version 2: three priority classes (BACKGROUND, NORMAL, HIGH) weighted
+ * 1 / 4 / 16. A persisted state of another version or shape restarts the
+ * fairness credit (`schedulerStateFromRow` in postgres-store).
+ */
+export const SCHEDULER_VERSION = 2;
+/** Deficit round robin quanta by class rank: HIGH about 4x NORMAL, NORMAL about 4x BACKGROUND. */
+export const PRIORITY_CLASS_QUANTA: readonly number[] = [1, 4, 16];
 
 export type SchedulerCandidate = {
   admissionRequestId: string;
@@ -29,7 +36,7 @@ export function capacityCandidateEligible({
   memberLimit,
   memberActive,
   reservedSlots,
-  higherPriorityWaiting,
+  reservationOwnerWaiting,
   borrowing,
 }: {
   physicalLimit?: number;
@@ -37,12 +44,12 @@ export function capacityCandidateEligible({
   memberLimit?: number;
   memberActive: number;
   reservedSlots: number;
-  higherPriorityWaiting: boolean;
+  reservationOwnerWaiting: boolean;
   borrowing: boolean;
 }): boolean {
   if (physicalLimit !== undefined && physicalActive >= physicalLimit) return false;
   if (memberLimit !== undefined && memberActive >= memberLimit) return false;
-  if (higherPriorityWaiting && borrowing) return false;
+  if (reservationOwnerWaiting && borrowing) return false;
   if (
     physicalLimit !== undefined &&
     reservedSlots > 0 &&
@@ -65,7 +72,7 @@ export function compareSchedulerCandidates(a: SchedulerCandidate, b: SchedulerCa
 }
 
 export function defaultPriorityQuanta(): number[] {
-  return Array.from({ length: PRIORITY_CLASS_COUNT }, (_, priority) => 1 + priority);
+  return [...PRIORITY_CLASS_QUANTA];
 }
 
 export function scheduleWeightedDeficitRoundRobin({
@@ -118,7 +125,7 @@ function validateScheduler(state: SchedulerState, quanta: readonly number[]) {
   if (!Number.isInteger(state.cursor) || state.cursor < 0 || state.cursor >= PRIORITY_CLASS_COUNT)
     throw new RangeError("Scheduler cursor is invalid.");
   if (state.deficits.length !== PRIORITY_CLASS_COUNT || quanta.length !== PRIORITY_CLASS_COUNT)
-    throw new RangeError("Scheduler arrays must contain 32 priority classes.");
+    throw new RangeError(`Scheduler arrays must contain ${PRIORITY_CLASS_COUNT} priority classes.`);
   if (quanta.some((quantum) => !Number.isInteger(quantum) || quantum <= 0))
     throw new RangeError("Every scheduler quantum must be a positive integer.");
 }

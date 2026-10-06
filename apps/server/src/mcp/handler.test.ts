@@ -50,23 +50,10 @@ vi.mock("@ws-model-proxy/db", async () => {
   return { default: mockDeep() };
 });
 
-vi.mock("../relay/cli-commands.js", () => ({
-  startCliCommand: vi.fn(),
-  waitCliCommand: vi.fn(),
-  snapshotCliCommand: vi.fn(),
-}));
-vi.mock("../relay/cli-file-ops.js", () => ({
-  runFileOp: vi.fn(),
-  cancelFileOpsForToken: vi.fn(),
-  sweepExpiredFileOps: vi.fn(),
-  auditRefusedFileInput: vi.fn(),
-}));
-
 /** Minimal well-typed CallToolResult for the probe tool. */
 type ProbeToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
 
-import { isCliTool } from "./cli-tool-access";
-import { MCP_TOOL_MANIFEST } from "./tool-manifest";
+import { MCP_READ_TOOLS } from "@ws-model-proxy/api/contracts";
 import { registerMcpTools } from "./tools";
 
 const ENVELOPE = {
@@ -155,24 +142,17 @@ describe("createMcpTransport — pinned configuration", () => {
     });
   });
 
-  it("the Phase 5 tool manifest backs the default registration: tools/list advertises the catalog except credential-gated CLI commands", () => {
-    expect(MCP_TOOL_MANIFEST.length).toBeGreaterThan(0);
+  it("the default registration lists only the read tools when no verified credential is bound", () => {
     const server = new McpServer({ name: "t", version: "1" });
     registerMcpTools(server);
     const handler = createMcpTransport();
     return handler.fetch(modernRequest("tools/list", 1), undefined).then(async (res) => {
-      // No authInfo is bound, so the CLI command and node file tools are not
-      // registered. Every other catalog name is advertised.
       expect(res.status).toBe(200);
       const body = (await res.json()) as {
         result?: { tools?: { name: string }[] };
       };
       const names = body.result?.tools?.map((tool) => tool.name).sort();
-      expect(names).toEqual(
-        MCP_TOOL_MANIFEST.map((tool) => tool.name)
-          .filter((name) => !isCliTool(name))
-          .sort(),
-      );
+      expect(names).toEqual([...MCP_READ_TOOLS].sort());
     });
   });
 });

@@ -23,7 +23,7 @@ import {
   MAX_RESET_CAPACITIES,
   qualifiesAsEvictionEvidence,
   recordKvEvictionObservations,
-  resetKvEvictionForEndpoint,
+  resetKvEvictionForInstance,
 } from "./kv-eviction-feedback.js";
 
 const now = new Date("2026-09-30T12:00:00Z");
@@ -164,23 +164,22 @@ describe("eviction evidence", () => {
     ).toBe(false);
   });
 
-  it("endpoint reset deletes only matching capacity rows", async () => {
+  it("instance reset deletes only matching capacity rows", async () => {
+    const findUnique = vi.fn(async () => ({ userId: "owner" }));
     const findMany = vi.fn(async () => [{ id: "c1" }, { id: "c2" }]);
     const deleteMany = vi.fn(async () => ({ count: 2 }));
     const db = {
-      inferenceCapacity: { findMany },
+      node: { findUnique },
+      runtimeInstance: { findMany },
       capacityKvEviction: { deleteMany },
-    } as unknown as NonNullable<Parameters<typeof resetKvEvictionForEndpoint>[3]>;
-    await resetKvEvictionForEndpoint("device", "vllm", now, db);
-    expect(deleteMany).toHaveBeenCalledWith({ where: { capacityId: { in: ["c1", "c2"] } } });
+    } as unknown as NonNullable<Parameters<typeof resetKvEvictionForInstance>[3]>;
+    await resetKvEvictionForInstance("node", "vllm", now, db);
+    expect(findUnique).toHaveBeenCalledWith({ where: { id: "node" }, select: { userId: true } });
     expect(findMany).toHaveBeenCalledWith({
-      where: {
-        ExecutionTargets: {
-          some: { DiscoveredModel: { Endpoint: { cliDeviceId: "device", slug: "vllm" } } },
-        },
-      },
+      where: { userId: "owner", handle: "vllm" },
       select: { id: true },
     });
+    expect(deleteMany).toHaveBeenCalledWith({ where: { capacityId: { in: ["c1", "c2"] } } });
   });
 
   it("freeze holds K: misses are not evidence until unfrozen", () => {

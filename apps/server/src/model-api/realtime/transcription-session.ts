@@ -41,7 +41,7 @@ import type { RealtimeAdmission } from "./limits.js";
  * and only failures that reflect a member's health are reported as such.
  *
  * The socket, the router (model resolution against the token, live-capable
- * recipe-managed members from the database) and the admission lease are
+ * live-capable routes from the database) and the admission lease are
  * ports, wired by the endpoint (chunk 6b). The admission lease is acquired by
  * the caller before this object exists, and released exactly once here.
  *
@@ -87,23 +87,25 @@ export type RealtimeCloseCode = (typeof REALTIME_CLOSE_CODES)[keyof typeof REALT
  * accounting need. Opaque to this module; the router fills it.
  */
 export type RealtimeRouteIdentity = {
-  kind: "pool" | "direct";
+  /** A pool, or (dashboard Chat Test only) one of the caller's own served models. */
+  kind: "pool" | "test";
   poolId: string | null;
   poolMemberId: string | null;
-  discoveredModelId: string;
-  endpointId: string;
-  executionTargetId: string | null;
-  capacityId: string | null;
-  /** The admission owner: the pool owner for pools, the model owner for direct models. */
+  runtimeModelId: string;
+  executionTargetId: string;
+  /** The runtime instance serving the model (the capacity identity). */
+  instanceId: string;
+  /** The admission owner: the pool owner for pools, the model owner for tests. */
   ownerUserId: string;
-  /** The model's owner (a contributor's model in a pool may belong to someone else). */
+  /** The served model's owner (a contributed member's model belongs to its grantee). */
   engineOwnerUserId: string;
-  accessGrantId: string | null;
-  /** The member's inference contribution, when the model is contributed. */
-  contributionId: string | null;
+  /** The share the requester reached the pool through; null for the owner and tests. */
+  shareId: string | null;
+  /** The contributing share of a contributed member; null for the owner's own. */
+  contributedShareId: string | null;
 };
 
-/** A candidate member, in route order. `deploymentManaged` comes from the database. */
+/** A candidate member, in route order. */
 export type RealtimeCandidate = SttAttachTarget & {
   memberId: string | null;
   route?: RealtimeRouteIdentity;
@@ -115,8 +117,8 @@ export type RealtimeRouteResult =
 
 export interface RealtimeRouter {
   /**
-   * Resolves `model` for the token and returns its live-capable,
-   * recipe-managed members in route order. Unknown and forbidden models are
+   * Resolves `model` for the credential and returns its
+   * live-capable routes in route order. Unknown and forbidden models are
    * both `model_not_found`.
    */
   candidates(input: {

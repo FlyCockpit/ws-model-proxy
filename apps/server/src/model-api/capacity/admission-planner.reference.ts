@@ -11,7 +11,9 @@ import {
   scheduleWeightedDeficitRoundRobin,
 } from "./scheduler.js";
 
-// Frozen bc0c677 planner. Test oracle only; keep its algorithm unchanged.
+// The bc0c677 planner with the limits-redesign rules (several scope limits
+// per waiter; kept slots are a guarantee). Test oracle only: a direct,
+// unoptimized statement of the rules; keep it simple.
 type Entry = { waiter: PlannerWaiter; candidate: SchedulerCandidate };
 
 /** Waiter passes the deadline filter of one admission pass at `now`. */
@@ -66,9 +68,7 @@ export function referencePlanGrants(
   const grantable = (entry: Entry) => !entry.waiter.notBefore || entry.waiter.notBefore <= now;
   const ownerActive = (owner: string) => activeByOwner.get(owner) ?? 0;
   const scopeHasRoom = (waiter: PlannerWaiter) =>
-    waiter.memberLimit === null ||
-    waiter.memberLimit === undefined ||
-    (scopeActive.get(waiter.scopeKey) ?? 0) < waiter.memberLimit;
+    waiter.scopeLimits.every(({ key, limit }) => (scopeActive.get(key) ?? 0) < limit);
 
   // Every grant removes at least one waiter from the queue, so the queue size
   // plus one final "nothing more" pass bounds the work; there is no constant.
@@ -94,33 +94,19 @@ export function referencePlanGrants(
     const remaining = (owner: string) =>
       Math.max(0, (reservations.get(owner) ?? 0) - ownerActive(owner));
     for (const owner of reservations.keys()) reservedRemainingTotal += remaining(owner);
-    // Best priority of a grantable waiter whose owner still has unmet
-    // reservation and whose scope has room ("queued reservation owner needs a
-    // slot"), for the best owner and the best among all other owners.
-    let needy: { priority: number; owner: string; otherPriority: number } | null | undefined;
-    const needyFor = (ownerKey: string): number => {
-      if (needy === undefined) {
-        const byOwner = new Map<string, number>();
-        for (const entry of entries) {
-          if (!grantable(entry)) continue;
-          const owner = entry.waiter.ownerKey;
-          if ((reservations.get(owner) ?? 0) <= ownerActive(owner)) continue;
-          if (!scopeHasRoom(entry.waiter)) continue;
-          byOwner.set(owner, Math.max(byOwner.get(owner) ?? -1, entry.waiter.priority));
-        }
-        let best: [string, number] | undefined;
-        for (const pair of byOwner) if (!best || pair[1] > best[1]) best = pair;
-        if (!best) needy = null;
-        else {
-          let other = -1;
-          for (const [owner, priority] of byOwner)
-            if (owner !== best[0]) other = Math.max(other, priority);
-          needy = { priority: best[1], owner: best[0], otherPriority: other };
-        }
-      }
-      if (needy === null) return -1;
-      return needy.owner === ownerKey ? needy.otherPriority : needy.priority;
-    };
+    // Owners with unmet reservation and a grantable waiter whose scope has
+    // room ("queued reservation owner needs a slot"): any one of them other
+    // than the borrower's own owner blocks the borrower, whatever the class.
+    const needyOwners = new Set<string>();
+    for (const entry of entries) {
+      if (!grantable(entry)) continue;
+      const owner = entry.waiter.ownerKey;
+      if ((reservations.get(owner) ?? 0) <= ownerActive(owner)) continue;
+      if (!scopeHasRoom(entry.waiter)) continue;
+      needyOwners.add(owner);
+    }
+    const ownerWaitingBesides = (ownerKey: string) =>
+      [...needyOwners].some((owner) => owner !== ownerKey);
 
     const eligible: Entry[] = [];
     const borrowedByWaiter = new Map<string, boolean>();
@@ -137,8 +123,8 @@ export function referencePlanGrants(
         remaining(waiter.ownerKey) === 0 &&
         reservedForOthers > 0 &&
         limit - active <= reservedForOthers;
-      if (borrowed && needyFor(waiter.ownerKey) > waiter.priority) continue;
-      if (borrowed && waiter.borrowPolicy === "NEVER") continue;
+      if (borrowed && ownerWaitingBesides(waiter.ownerKey)) continue;
+      if (borrowed && !waiter.borrowReserved) continue;
       eligible.push(entry);
       borrowedByWaiter.set(waiter.waiterId, borrowed);
     }

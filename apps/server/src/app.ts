@@ -10,6 +10,7 @@ import {
   type ContextServices,
   createContext,
 } from "@ws-model-proxy/api/context";
+import { CSRF_REQUIRED_PROCEDURES } from "@ws-model-proxy/api/contracts";
 import { appRouter } from "@ws-model-proxy/api/routers/index";
 import type { Session } from "@ws-model-proxy/auth";
 import { auth as defaultAuth } from "@ws-model-proxy/auth";
@@ -25,10 +26,7 @@ import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { betterAuthAdminGate } from "./better-auth-admin-gate.js";
-import { resolveClientIp } from "./client-ip.js";
 import { CORS_ALLOW_HEADERS } from "./cors-headers.js";
-import { ALWAYS_CSRF_PROTECTED_PROCEDURES } from "./csrf-policy.js";
-import { deviceCodeBodyCap, deviceCodeUpgradeGate } from "./device-code-upgrade-gate.js";
 import {
   EMAIL_RECIPIENT_PATHS,
   emailRecipientLimit,
@@ -87,7 +85,6 @@ import {
 import { MODEL_API_MAX_REQUEST_BODY_BYTES } from "./model-api/limits.js";
 import { openAiErrorBody } from "./model-api/openai-errors.js";
 import { createPoolMemberTestRoutes } from "./model-api/pool-member-test.js";
-import { repairExpiredProviderBudgets } from "./model-api/provider-budget.js";
 import {
   DASHBOARD_REALTIME_PATH,
   dashboardRealtimeRoutes,
@@ -104,11 +101,8 @@ import { transcriptionContentLengthGuard } from "./model-api/transcription-body-
 import { logOrpcError } from "./orpc-error-log.js";
 import {
   authLimiter,
-  consumeDeviceCodeExchange,
   createRateLimiterMiddleware,
-  deviceCodeMintLimiter,
   emailRecipientLimiter,
-  isDeviceCodeMintRequest,
   mcpClientRegistrationLimiter,
   rpcLimiter,
   signinFailureLimiter,
@@ -116,12 +110,7 @@ import {
   signupRecipientLimiter,
 } from "./rate-limit.js";
 import { readinessResponse } from "./readiness.js";
-import {
-  cancelCommandsForToken,
-  listPendingSupervised,
-  submitSupervisedOutput,
-} from "./relay/cli-commands.js";
-import { cancelFileOpsForToken } from "./relay/cli-file-ops.js";
+import type { NodeIdentity } from "./relay/node-credential-auth.js";
 import { relaySessionManager } from "./relay/session-manager.js";
 import {
   createTerminalWebsocketMiddleware,
@@ -180,7 +169,7 @@ import { getUserDeletionSweepHealth } from "./user-deletion-sweep.js";
 type AppVariables = {
   requestId: string;
   session: Session | null;
-  relayIdentity: import("@ws-model-proxy/api/lib/cli-credential-access").CliWebsocketIdentity;
+  relayIdentity: NodeIdentity;
 };
 
 /** The auth dependency shape consumed by the app: only `handler` is used. */
@@ -257,39 +246,15 @@ onUserBanned(cancelRelayWorkForBannedUser);
 // or pools serve, at once (not at the next 60 s recheck).
 onUserBanned((userId) => realtimeSessionRegistry.terminateForUser(userId));
 
-function cliContextServices() {
+/**
+ * The server hooks procedures may call (packages/api context). S0 wires the pool-routing
+ * push; the lanes add theirs (credential revocation, relay pushes, live node state) next to
+ * the procedures that need them.
+ */
+function contextServices(): ContextServices {
   return {
-    repairExpiredProviderBudgets: (scope: { userId: string; providerAccountId: string }) =>
-      repairExpiredProviderBudgets(new Date(), scope),
-    onCliFeatureGrantsChanged: (cliDeviceId: string) =>
-      relaySessionManager.onCliFeatureGrantsChanged(cliDeviceId),
-    onRemoteMetricSourcesChanged: (cliDeviceId: string) =>
-      relaySessionManager.onRemoteMetricSourcesChanged(cliDeviceId),
-    onRemoteEngineAdaptersChanged: (cliDeviceId: string) =>
-      relaySessionManager.onRemoteEngineAdaptersChanged(cliDeviceId),
     onPoolRoutingRulesChanged: (poolId: string) =>
       relaySessionManager.onPoolRoutingRulesChanged(poolId),
-    onModelApiTokenRevoked: (tokenId: string) => realtimeSessionRegistry.terminateForToken(tokenId),
-    onCliCredentialsRevoked: (revoked: {
-      kind: "cliToken" | "deviceCredential";
-      ids: readonly string[];
-    }) => relaySessionManager.closeSessionsForRevokedCredentials(revoked),
-    cancelMcpTokenCommands: (tokenId: string) => {
-      cancelCommandsForToken(tokenId);
-      cancelFileOpsForToken(tokenId);
-    },
-    getLiveCliFeatures: (cliDeviceIds: readonly string[]) =>
-      relaySessionManager.getLiveCliFeatures(cliDeviceIds),
-    getLiveNodeTelemetry: (cliDeviceIds: readonly string[]) =>
-      relaySessionManager.getLiveNodeTelemetry(cliDeviceIds),
-    getLiveEngineLoadHistory: (
-      keys: Parameters<NonNullable<ContextServices["getLiveEngineLoadHistory"]>>[0],
-      now?: Date,
-    ) => relaySessionManager.getLiveEngineLoadHistory(keys, now),
-    supervisedCommands: {
-      listPending: listPendingSupervised,
-      submitOutput: submitSupervisedOutput,
-    },
   };
 }
 
@@ -620,7 +585,7 @@ export async function createApp(options: CreateAppOptions = {}) {
       prisma,
       isForceTwoFactorRequired,
       admissionGate: mcpAdmissionGate,
-      services: cliContextServices(),
+      services: contextServices(),
       // Phase 5 tool dispatch binding: after every admission check passes,
       // the verified AuthInfo (passed VERBATIM by the SDK into the transport
       // factory's request context) is bound to the per-request oRPC context,
@@ -634,11 +599,6 @@ export async function createApp(options: CreateAppOptions = {}) {
         bindMcpToolDispatch(authInfo, { orpcContext, requestId, signal, credential }),
     }),
   );
-
-  // `wsmp login`'s public, unauthenticated start: its 16 KiB cap must run
-  // BEFORE the global limit below, which buffers a body without
-  // Content-Length (up to 10 MB) before calling the next middleware.
-  app.use("/api/auth/device/code", deviceCodeBodyCap);
 
   // Body-limit — reject oversized payloads early (before JSON parsing) to
   // prevent memory exhaustion. 10 MB covers image uploads and large form
@@ -815,23 +775,12 @@ export async function createApp(options: CreateAppOptions = {}) {
     app.use("/api/auth/*", mcpOauthRateLimits);
   }
 
-  // `wsmp login`'s device-code mint gets its own per-IP budget without the
-  // strict limiter's 15-minute block: approval is human, so a minted code
-  // grants nothing by itself (see `deviceCodeMintLimiter`).
-  const deviceCodeMintLimit = createRateLimiterMiddleware(deviceCodeMintLimiter, {
-    resolveKey: resolveClientIp,
-  });
-  app.use("/api/auth/device/code", async (c, next) =>
-    isDeviceCodeMintRequest(c) ? deviceCodeMintLimit(c, next) : next(),
-  );
-
   // Rate limit auth endpoints (credential-stuffing defense), EXCEPT get-session
-  // (handled above), the device-code mint (handled above) and the flag-on MCP
-  // OAuth allowlist (handled by the MCP OAuth limiters above). Must be mounted
-  // BEFORE the auth handler so every auth request is throttled.
+  // (handled above) and the flag-on MCP OAuth allowlist (handled by the MCP
+  // OAuth limiters above). Must be mounted BEFORE the auth handler so every auth
+  // request is throttled.
   app.use("/api/auth/*", async (c, next) => {
     if (c.req.path.endsWith("/get-session")) return next();
-    if (isDeviceCodeMintRequest(c)) return next();
     if (env.WMP_MCP_ENABLED && isMcpOauthRateLimitedRequest(c)) return next();
     return createRateLimiterMiddleware(authLimiter)(c, next);
   });
@@ -848,12 +797,6 @@ export async function createApp(options: CreateAppOptions = {}) {
   // reservation only after a 401 password failure here, so rotating IPs cannot
   // multiply guesses against a single account.
   app.use(SIGNIN_FAILURE_PATH, signinFailureLimit(signinFailureLimiter));
-
-  // Better Auth's `/device`, `/device/approve`, `/device/deny` and
-  // `/device/token` are disabled (`DISABLED_DEVICE_AUTHORIZATION_PATHS`): the
-  // approval page claims and approves in `cliCredentials.approveDeviceLogin`.
-  // A `wsmp login` too old to name its CLI slug gets an upgrade message it prints.
-  app.use("/api/auth/device/code", deviceCodeUpgradeGate);
 
   // Admin gate for Better-Auth's admin plugin endpoints. The plugin role-checks
   // by default, but these routes can set roles, reset passwords, impersonate
@@ -954,16 +897,19 @@ export async function createApp(options: CreateAppOptions = {}) {
 
   // When CORS_ORIGIN is set (cross-origin deployment), validate the x-csrf-token
   // header sent by the client's SimpleCsrfProtectionLinkPlugin on every
-  // procedure. Same-origin deployments check it only on the procedures in
-  // ALWAYS_CSRF_PROTECTED_PROCEDURES: a cross-origin page (a same-site
-  // sibling subdomain, whose request still carries the SameSite=Lax session
-  // cookie) cannot add the header without a CORS preflight, which a
-  // same-origin deployment never grants.
+  // procedure. Same-origin deployments check it on every human and human_admin
+  // procedure (CSRF_REQUIRED_PROCEDURES, derived from the contract): a
+  // cross-origin page (a same-site sibling subdomain, whose request still
+  // carries the SameSite=Lax session cookie) cannot add the header without a
+  // CORS preflight, which a same-origin deployment never grants. The context
+  // also records whether the header was present (CallerAuth.csrfVerified), so a
+  // human procedure refuses a cookie caller without it even where this plugin
+  // is bypassed.
   const csrfPlugins = [
     new SimpleCsrfProtectionHandlerPlugin<ApiContext>({
       exclude: env.CORS_ORIGIN
         ? false
-        : ({ path }) => !ALWAYS_CSRF_PROTECTED_PROCEDURES.has(path.join(".")),
+        : ({ path }) => !CSRF_REQUIRED_PROCEDURES.has(path.join(".")),
     }),
   ];
 
@@ -986,15 +932,7 @@ export async function createApp(options: CreateAppOptions = {}) {
   });
 
   app.use("/*", async (c, next) => {
-    const context = await createContext({
-      context: c,
-      services: {
-        ...cliContextServices(),
-        // `cliCredentials.exchangeDeviceCode`, per call (a batch is several).
-        limitDeviceCodeExchange: (deviceCode: string) =>
-          consumeDeviceCodeExchange(resolveClientIp(c), deviceCode),
-      },
-    });
+    const context = await createContext({ context: c, services: contextServices() });
 
     const rpcResult = await rpcHandler.handle(c.req.raw, {
       prefix: "/rpc",

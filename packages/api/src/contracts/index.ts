@@ -60,6 +60,13 @@ export const CSRF_REQUIRED_PROCEDURES: ReadonlySet<string> = new Set(
 export const SENSITIVE_INPUT_PROCEDURES: ReadonlySet<string> = new Set(["nodes.secrets.set"]);
 
 export * from "./auth-context";
-export { MCP_EXCLUDED_SESSION_PROCEDURES, MCP_TOOLS, type McpToolContract } from "./mcp-tools";
+export { TEST_INSTANCE_HEADER } from "./http";
+export {
+  advertisedInputSchema,
+  MCP_EXCLUDED_SESSION_PROCEDURES,
+  MCP_TOOLS,
+  type McpToolContract,
+} from "./mcp-tools";
 export * from "./procedure";
+export { REFUSAL_REASONS, type RefusalReason } from "./refusals";
 export * from "./tool-names";

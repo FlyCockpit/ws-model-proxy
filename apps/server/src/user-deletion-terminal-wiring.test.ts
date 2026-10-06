@@ -6,18 +6,13 @@ import {
 import type { MockInstance } from "vitest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("./relay/cli-commands.js", () => ({
-  startCliCommand: vi.fn(),
-  waitCliCommand: vi.fn(),
-  snapshotCliCommand: vi.fn(),
-  cancelCommandsForToken: vi.fn(),
-  cancelCommandsForUser: vi.fn(),
-  startSupervisedCommand: vi.fn(),
-  snapshotSupervisedCommand: vi.fn(),
-  listPendingSupervised: vi.fn(() => []),
-  submitSupervisedOutput: vi.fn(),
+vi.mock("./relay/node-commands.js", () => ({
+  startNodeCommand: vi.fn(),
+  cancelNodeCommandsForToken: vi.fn(),
+  cancelNodeCommandsForUser: vi.fn(),
+  sweepExpiredNodeCommands: vi.fn(() => 0),
 }));
-vi.mock("./relay/cli-file-ops.js", () => ({
+vi.mock("./relay/node-file-ops.js", () => ({
   runFileOp: vi.fn(),
   cancelFileOpsForToken: vi.fn(),
   cancelFileOpsForUser: vi.fn(),
@@ -100,8 +95,10 @@ const { admitBrowserConnection, terminalBrowserHub } = await import(
   "./relay/terminal-websocket.js"
 );
 const { relaySessionManager } = await import("./relay/session-manager.js");
-const { cancelCommandsForUser } = await import("./relay/cli-commands.js");
-const { cancelFileOpsForUser } = await import("./relay/cli-file-ops.js");
+const { cancelNodeCommandsForUser: cancelCommandsForUser } = await import(
+  "./relay/node-commands.js"
+);
+const { cancelFileOpsForUser } = await import("./relay/node-file-ops.js");
 
 const db = prisma as unknown as { session: { findUnique: MockInstance } };
 

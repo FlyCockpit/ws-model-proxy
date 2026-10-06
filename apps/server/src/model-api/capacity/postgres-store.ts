@@ -17,13 +17,16 @@ import {
   type PlannerWaiter,
   planGrants,
 } from "./admission-planner.js";
-import { SCHEDULER_VERSION } from "./scheduler.js";
-import type {
-  AdmissionAttempt,
-  AdmissionResult,
-  AdmissionTerminalizationResult,
-  CapacityAdmissionStore,
-  CapacityLeaseHandle,
+import { effectiveInstanceConcurrency } from "./instance-limits.js";
+import { PRIORITY_CLASS_COUNT, SCHEDULER_VERSION, type SchedulerState } from "./scheduler.js";
+import {
+  type AdmissionAttempt,
+  type AdmissionResult,
+  type AdmissionTerminalizationResult,
+  type CapacityAdmissionStore,
+  type CapacityLeaseHandle,
+  NORMAL_PRIORITY_RANK,
+  priorityClassRank,
 } from "./types.js";
 
 type Db = typeof prisma;
@@ -38,10 +41,8 @@ export const ADMISSION_ROW_BATCH_SIZE = 500;
 export { isRetryableCapacityTransactionError };
 
 /**
- * A `relay_request.admissionTerminalState` projection. The store writes it
- * after its transaction commits, as its own single-row statement: no store
- * transaction ever waits on a relay row (see the admission-internal order in
- * @ws-model-proxy/db/capacity-lock-order).
+ * An admission-state projection of a relay request (collected, not written in 0.4.0; see
+ * #projectRelayAdmissionStates).
  */
 type RelayAdmissionProjection = {
   relayRequestId: string;
@@ -190,9 +191,9 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         where: { attemptId: attempt.attemptId },
         include: { Lease: true, Waiters: true },
       });
-      // S-C: a grantee's queue priority is read with the policy snapshot
-      // (plain read, no lock) and replaces the pool/member priority.
-      const grantQueuePriority = existing ? null : await resolveGrantQueuePriority(tx, attempt);
+      // A share holder's class (the share's priorityClass) is read with the policy snapshot
+      // (plain read, no lock) and replaces the pool's class.
+      const grantQueuePriority = existing ? null : await resolveSharePriority(tx, attempt);
       const resolvedCandidates = existing
         ? []
         : await this.#resolveCandidates(tx, attempt, grantQueuePriority);
@@ -213,22 +214,19 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         !orderedCapacityIds.includes(existing.Lease.capacityId)
       )
         orderedCapacityIds.push(existing.Lease.capacityId);
-      const candidateScopeFences: Fence[] = existing
-        ? existing.Waiters.flatMap((candidate) =>
-            candidate.effectiveConcurrencyLimit === null
-              ? []
-              : [
-                  fences.concurrencyScope(
-                    candidate.effectiveConcurrencyScope,
-                    candidate.effectiveConcurrencyScopeId,
-                  ),
-                ],
-          )
-        : resolvedCandidates.flatMap((candidate) =>
-            candidate.memberConcurrencyCeiling === undefined
-              ? []
-              : [fences.concurrencyScope(candidate.concurrencyScope, candidate.concurrencyScopeId)],
-          );
+      const candidateScopeFences: Fence[] = (
+        existing
+          ? existing.Waiters.flatMap((candidate) => waiterScopeLimits(candidate))
+          : resolvedCandidates.flatMap((candidate) =>
+              waiterScopeLimits({
+                poolId: attempt.poolId ?? null,
+                effectiveConcurrencyLimit: candidate.memberConcurrencyCeiling ?? null,
+                effectiveConcurrencyScope: candidate.concurrencyScope,
+                effectiveConcurrencyScopeId: candidate.concurrencyScopeId,
+                effectivePoolConcurrencyLimit: candidate.poolConcurrencyCeiling ?? null,
+              }),
+            )
+      ).map((limit) => fences.concurrencyScope(limit.scope, limit.scopeId));
       // Every shared scope fence sorts before every physical-capacity fence,
       // so release/reclaim and acquire take them in the same order (no fence
       // inversion). fenceCapacityAdmission re-derives the durable scope set
@@ -442,14 +440,12 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
             attemptId: attempt.attemptId,
             sourceKind: attempt.sourceKind,
             poolId: attempt.poolId,
-            directExecutionTargetId:
-              attempt.sourceKind === "DIRECT"
-                ? attempt.candidates[0]?.executionTargetId
-                : undefined,
+            testTargetId:
+              attempt.sourceKind === "TEST" ? attempt.candidates[0]?.executionTargetId : undefined,
             basePriority: grantQueuePriority ?? attempt.basePriority,
-            // The schema trigger accepts the grant priority as the waiters'
-            // policy snapshot only when the request names its grant.
-            priorityGrantId: grantQueuePriority === null ? null : attempt.accessGrantId,
+            // The schema trigger accepts the share's class rank as the waiters'
+            // policy snapshot only when the request names its share.
+            priorityShareId: grantQueuePriority === null ? null : attempt.priorityShareId,
             warmSessionIds: [...new Set(attempt.warmSessionIds ?? [])],
             enqueueSequence,
             // The database-clock schedule anchor of this attempt (see
@@ -478,8 +474,9 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
                 effectiveConcurrencyLimit: candidate.memberConcurrencyCeiling,
                 effectiveConcurrencyScope: candidate.concurrencyScope,
                 effectiveConcurrencyScopeId: candidate.concurrencyScopeId,
+                effectivePoolConcurrencyLimit: candidate.poolConcurrencyCeiling,
                 effectiveReservedSlots: candidate.reservedSlots,
-                effectiveBorrowPolicy: candidate.allowBorrowReserved ? "WHEN_IDLE" : "NEVER",
+                effectiveBorrowReserved: candidate.allowBorrowReserved,
               })),
             },
           },
@@ -552,11 +549,17 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   async #resolveCandidates(
     tx: Prisma.TransactionClient,
     attempt: AdmissionAttempt,
-    grantQueuePriority: number | null,
+    shareQueuePriority: number | null,
   ) {
     if (!attempt.candidates.length) throw new Error("Admission requires at least one candidate.");
     const orders = new Set<number>();
     const targets = new Set<string>();
+    const routing =
+      attempt.sourceKind === "POOL" && attempt.poolId
+        ? await tx.poolRouting.findFirst({
+            where: { poolId: attempt.poolId, Pool: { userId: attempt.ownerId } },
+          })
+        : null;
     return Promise.all(
       attempt.candidates.map(async (candidate) => {
         if (!Number.isInteger(candidate.candidateOrder) || candidate.candidateOrder < 0)
@@ -565,44 +568,47 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           throw new Error("Admission candidates must have unique order and execution targets.");
         orders.add(candidate.candidateOrder);
         targets.add(candidate.executionTargetId);
+        // capacityId = the runtime instance the target serves on.
         const target = await tx.executionTarget.findFirst({
           where: {
             id: candidate.executionTargetId,
-            ...(attempt.sourceKind === "DIRECT" ? { userId: attempt.ownerId } : {}),
-            inferenceCapacityId: candidate.capacityId,
+            ...(attempt.sourceKind === "TEST" ? { userId: attempt.ownerId } : {}),
+            instanceId: candidate.capacityId,
           },
         });
         if (!target)
           throw new Error(
-            "Admission candidate does not belong to the requested owner and capacity.",
+            "Admission candidate does not belong to the requested owner and instance.",
           );
-        if (attempt.sourceKind === "DIRECT") {
+        if (attempt.sourceKind === "TEST") {
           if (attempt.poolId || candidate.poolMemberId || attempt.candidates.length !== 1)
-            throw new Error("Direct admission requires exactly one direct execution target.");
+            throw new Error("A test admission has exactly one served-model target.");
+          // A direct test (D1): NORMAL, no scope limit, keeps nothing, may borrow.
           return {
             ...candidate,
-            priority: target.directPriority,
-            memberConcurrencyCeiling: target.directConcurrencyLimit ?? undefined,
-            concurrencyScope: "DIRECT_TARGET",
+            priority: NORMAL_PRIORITY_RANK,
+            memberConcurrencyCeiling: undefined,
+            poolConcurrencyCeiling: undefined,
+            concurrencyScope: "TEST",
             concurrencyScopeId: target.id,
-            reservedSlots: target.directReservedSlots,
-            allowBorrowReserved: target.directBorrowPolicy === "WHEN_IDLE",
+            reservedSlots: 0,
+            allowBorrowReserved: true,
           };
         }
-        if (!attempt.poolId || !candidate.poolMemberId)
+        if (!attempt.poolId || !candidate.poolMemberId || !routing)
           throw new Error("Pool admission requires a pool and member for every candidate.");
         const member = await tx.poolMember.findFirst({
           where: {
             id: candidate.poolMemberId,
             poolId: attempt.poolId,
-            executionTargetId: candidate.executionTargetId,
-            ModelPool: { userId: attempt.ownerId },
+            kind: "LOCAL",
+            runtimeModelId: target.runtimeModelId,
+            Pool: { userId: attempt.ownerId },
           },
           include: {
-            ModelPool: true,
-            InferenceContribution: {
+            Share: {
               include: {
-                Contributor: {
+                Grantee: {
                   select: { banned: true, banExpires: true, deletionRequestedAt: true },
                 },
               },
@@ -610,73 +616,52 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           },
         });
         if (!member)
-          throw new Error("Admission pool candidate is not an owned member of the requested pool.");
+          throw new Error("Admission pool candidate is not a member of the requested pool.");
         if (target.userId !== attempt.ownerId) {
-          const consent = member.InferenceContribution;
+          // A contributed member: the target must belong to the share's grantee, who still
+          // may contribute and whose account is active.
+          const share = member.Share;
           if (
-            consent?.state !== "ACTIVE" ||
-            consent.poolId !== attempt.poolId ||
-            consent.discoveredModelId !== target.discoveredModelId ||
-            consent.contributorUserId !== target.userId ||
-            userCredentialAccessBlocked(consent.Contributor, new Date())
+            !share ||
+            !share.canContribute ||
+            share.poolId !== attempt.poolId ||
+            share.granteeUserId !== target.userId ||
+            userCredentialAccessBlocked(share.Grantee, new Date())
           )
-            throw new Error("Inference contribution is no longer authorized.");
+            throw new Error("The contribution is no longer authorized.");
         }
-        const hasMemberConcurrencyOverride =
-          member.capacityConcurrencyMode === "LIMITED" ||
-          (member.capacityConcurrencyMode === undefined &&
-            member.capacityConcurrencyLimit !== null);
-        const memberConcurrencyCeiling =
-          member.capacityConcurrencyMode === "UNLIMITED"
-            ? undefined
-            : hasMemberConcurrencyOverride
-              ? (member.capacityConcurrencyLimit ?? undefined)
-              : (member.ModelPool.capacityConcurrencyLimit ?? undefined);
-        // A contributed member runs on its contributor's machine: the pool
-        // owner's priority, reservation and borrow settings do not apply there,
-        // so it never outranks or holds back the contributor's own traffic.
-        const contributed = member.inferenceContributionId !== null;
+        // The pool cap binds every member (scope POOL). A contributed member runs on its
+        // contributor's hardware: BACKGROUND, keeps nothing, may borrow; it never outranks
+        // or holds back the contributor's own traffic.
+        const contributed = member.shareId !== null;
         return {
           ...candidate,
           priority: contributed
-            ? 0
-            : (grantQueuePriority ?? member.capacityPriority ?? member.ModelPool.capacityPriority),
-          memberConcurrencyCeiling,
-          concurrencyScope:
-            member.capacityConcurrencyMode === "INHERIT" ||
-            (member.capacityConcurrencyMode === undefined &&
-              member.capacityConcurrencyLimit === null)
-              ? "POOL"
-              : "MEMBER",
-          concurrencyScopeId:
-            member.capacityConcurrencyMode === "INHERIT" ||
-            (member.capacityConcurrencyMode === undefined &&
-              member.capacityConcurrencyLimit === null)
-              ? member.ModelPool.id
-              : member.id,
-          reservedSlots: contributed
-            ? 0
-            : (member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots),
-          allowBorrowReserved:
-            contributed ||
-            (member.capacityBorrowPolicy ?? member.ModelPool.capacityBorrowPolicy) === "WHEN_IDLE",
+            ? priorityClassRank("BACKGROUND")
+            : (shareQueuePriority ?? priorityClassRank(routing.priorityClass)),
+          memberConcurrencyCeiling: routing.concurrencyLimit ?? undefined,
+          poolConcurrencyCeiling: undefined,
+          concurrencyScope: "POOL",
+          concurrencyScopeId: attempt.poolId,
+          reservedSlots: contributed ? 0 : routing.keptSlots,
+          allowBorrowReserved: contributed || routing.borrowKept,
         };
       }),
     );
   }
 
   /**
-   * The capacity's durable scheduler state (`capacity_runtime`, writer class
+   * The capacity's durable scheduler state (`capacity_scheduler`, writer class
    * H). Created on first use under the capacity fence the caller holds, with
    * a fencing token above every lease token the capacity ever issued.
    */
   async #capacityRuntime(tx: Prisma.TransactionClient, capacityId: string, userId: string) {
     await tx.$executeRaw`
-      INSERT INTO capacity_runtime ("capacityId", "userId", "nextFencingToken")
+      INSERT INTO capacity_scheduler ("capacityId", "userId", "nextFencingToken")
       SELECT ${capacityId}, ${userId}, COALESCE(MAX(lease."fencingToken"), 0) + 1
         FROM capacity_lease lease WHERE lease."capacityId" = ${capacityId}
       ON CONFLICT ("capacityId") DO NOTHING`;
-    return tx.capacityRuntime.findUniqueOrThrow({ where: { capacityId } });
+    return tx.capacityScheduler.findUniqueOrThrow({ where: { capacityId } });
   }
 
   /**
@@ -692,17 +677,15 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   ): Promise<boolean> {
     const target = await tx.executionTarget.findUnique({
       where: { id: waiter.executionTargetId },
-      select: { inferenceCapacityId: true },
+      select: { instanceId: true, runtimeModelId: true },
     });
-    if (target?.inferenceCapacityId !== capacityId) return false;
+    if (target?.instanceId !== capacityId) return false;
     if (!waiter.poolMemberId) return true;
     const member = await tx.poolMember.findUnique({
       where: { id: waiter.poolMemberId },
-      select: { poolId: true, executionTargetId: true },
+      select: { poolId: true, runtimeModelId: true },
     });
-    return (
-      member?.poolId === waiter.poolId && member.executionTargetId === waiter.executionTargetId
-    );
+    return member?.poolId === waiter.poolId && member.runtimeModelId === target.runtimeModelId;
   }
 
   /**
@@ -756,16 +739,16 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     projections: RelayAdmissionProjection[],
   ): Promise<W[]> {
     if (!waiters.length) return [...waiters];
-    const liveTargets = new Set(
+    const liveTargets = new Map(
       (
         await tx.executionTarget.findMany({
           where: {
             id: { in: [...new Set(waiters.map((waiter) => waiter.executionTargetId))] },
-            inferenceCapacityId: capacityId,
+            instanceId: capacityId,
           },
-          select: { id: true },
+          select: { id: true, runtimeModelId: true },
         })
-      ).map((target) => target.id),
+      ).map((target) => [target.id, target.runtimeModelId]),
     );
     const memberIds = [
       ...new Set(waiters.flatMap((waiter) => (waiter.poolMemberId ? [waiter.poolMemberId] : []))),
@@ -774,7 +757,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       (memberIds.length
         ? await tx.poolMember.findMany({
             where: { id: { in: memberIds } },
-            select: { id: true, poolId: true, executionTargetId: true },
+            select: { id: true, poolId: true, runtimeModelId: true },
           })
         : []
       ).map((member) => [member.id, member]),
@@ -786,7 +769,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         liveTargets.has(waiter.executionTargetId) &&
         (!waiter.poolMemberId ||
           (member?.poolId === waiter.poolId &&
-            member.executionTargetId === waiter.executionTargetId));
+            member.runtimeModelId === liveTargets.get(waiter.executionTargetId)));
       if (alive) live.push(waiter);
       else await this.#cancelOrphanedWaiter(tx, waiter, now, projections);
     }
@@ -855,43 +838,56 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       ? await tx.poolMember.findMany({
           where: {
             id: { in: queuedMemberIds },
-            // Weight and pool-member health route PRIMARY (local) members
-            // only: external members are ordered by publicOrder with weight 0
-            // and use provider health, checked at dispatch.
             OR: [
-              { routingStatus: { not: "ACTIVE" } },
-              { instanceGate: "CLOSED" },
+              { state: { not: "ACTIVE" } },
+              { weight: { lte: 0 } },
+              { shareId: { not: null }, Share: { is: { canContribute: false } } },
               {
-                inferenceContributionId: { not: null },
-                InferenceContribution: { is: { state: { not: "ACTIVE" } } },
-              },
-              { inferenceContributionId: { not: null }, InferenceContribution: { is: null } },
-              {
-                inferenceContributionId: { not: null },
-                InferenceContribution: {
-                  Contributor: {
-                    OR: [
-                      { deletionRequestedAt: { not: null } },
-                      { banned: true, OR: [{ banExpires: null }, { banExpires: { gt: now } }] },
-                    ],
+                shareId: { not: null },
+                Share: {
+                  is: {
+                    Grantee: {
+                      OR: [
+                        { deletionRequestedAt: { not: null } },
+                        { banned: true, OR: [{ banExpires: null }, { banExpires: { gt: now } }] },
+                      ],
+                    },
                   },
                 },
               },
-              { tier: "PRIMARY", weight: { lte: 0 } },
-              { tier: "PRIMARY", healthStatus: "UNHEALTHY", nextRetryAt: { gt: now } },
             ],
           },
           select: { id: true },
         })
       : [];
-    if (unroutableMembers.length)
+    // Target health is per (instance, served model): a target in its UNHEALTHY cooldown is
+    // not routable either, whichever member queued for it.
+    const queuedTargetIds = (
+      await tx.capacityWaiter.findMany({
+        where: { capacityId, state: "WAITING" },
+        select: { executionTargetId: true },
+        distinct: ["executionTargetId"],
+      })
+    ).map((row) => row.executionTargetId);
+    const unhealthyTargets = queuedTargetIds.length
+      ? await tx.executionTarget.findMany({
+          where: {
+            id: { in: queuedTargetIds },
+            health: "UNHEALTHY",
+            nextRetryAt: { gt: now },
+          },
+          select: { id: true },
+        })
+      : [];
+    if (unroutableMembers.length || unhealthyTargets.length)
       await tx.capacityWaiter.updateMany({
         where: {
           capacityId,
           state: "WAITING",
-          poolMemberId: {
-            in: unroutableMembers.map((member) => member.id),
-          },
+          OR: [
+            { poolMemberId: { in: unroutableMembers.map((member) => member.id) } },
+            { executionTargetId: { in: unhealthyTargets.map((target) => target.id) } },
+          ],
         },
         data: {
           state: "CANCELLED",
@@ -902,11 +898,23 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     // A graph row, read without a lock: the capacity fence the caller holds
     // excludes every writer of its policy. A deleted capacity admits nothing;
     // its waiters are orphans the capacity sweeper terminalizes.
-    const capacity = await tx.inferenceCapacity.findUnique({
+    const instance = await tx.runtimeInstance.findUnique({
       where: { id: capacityId },
-      select: { userId: true, hardConcurrencyLimit: true },
+      select: {
+        userId: true,
+        engineSlots: true,
+        Version: { select: { concurrencyLimit: true, engine: true } },
+      },
     });
-    if (!capacity) return null;
+    if (!instance) return null;
+    const capacity = {
+      userId: instance.userId,
+      hardConcurrencyLimit: effectiveInstanceConcurrency({
+        override: instance.Version.concurrencyLimit,
+        engineSlots: instance.engineSlots,
+        engine: instance.Version.engine,
+      }),
+    };
     const activeLeases = await tx.capacityLease.findMany({
       where: { capacityId, state: "ACTIVE" },
       select: { executionTargetId: true, poolMemberId: true },
@@ -962,33 +970,25 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       lastChance: new Set(lastChanceWaiterIds),
     });
     const waiters = livingWaiters.filter((waiter) => !metricFull.has(waiter.id));
-    const configuredReservationMembers = await tx.poolMember.findMany({
-      // Every PRIMARY (always local) execution target sharing this physical
-      // capacity takes part in the same reservation accounting. External
-      // fallback (PUBLIC_OVERFLOW) members stay outside the primary scheduler.
-      where: {
-        tier: "PRIMARY",
-        ExecutionTarget: {
-          inferenceCapacityId: capacityId,
-        },
-      },
-      include: { ModelPool: true },
-    });
+    // Every LOCAL member serving a model of this instance takes part in the same kept-slot
+    // accounting: kept slots are the pool's (pool_routing.keptSlots). Contributed members keep
+    // nothing (they run on someone else's hardware).
+    const servedModels = (
+      await tx.executionTarget.findMany({
+        where: { instanceId: capacityId, runtimeModelId: { not: null } },
+        select: { runtimeModelId: true },
+      })
+    ).flatMap((target) => (target.runtimeModelId ? [target.runtimeModelId] : []));
+    const configuredReservationMembers = servedModels.length
+      ? await tx.poolMember.findMany({
+          where: { kind: "LOCAL", shareId: null, runtimeModelId: { in: servedModels } },
+          select: { id: true, Pool: { select: { userId: true, Routing: true } } },
+        })
+      : [];
     const configuredReservations: Array<{ ownerKey: string; capacityReservedSlots: number }> = [];
-    const configuredDirectReservations = await tx.executionTarget.findMany({
-      where: { inferenceCapacityId: capacityId, directReservedSlots: { gt: 0 } },
-      select: { id: true, directReservedSlots: true },
-    });
-    for (const target of configuredDirectReservations)
-      configuredReservations.push({
-        ownerKey: `direct:${target.id}`,
-        capacityReservedSlots: target.directReservedSlots,
-      });
     for (const member of configuredReservationMembers) {
-      // A pool on someone else's machine (an inference contribution) borrows
-      // spare capacity: it reserves nothing there.
-      if (member.ModelPool.userId !== capacity.userId) continue;
-      const slots = member.capacityReservedSlots ?? member.ModelPool.capacityReservedSlots;
+      if (member.Pool.userId !== capacity.userId) continue;
+      const slots = member.Pool.Routing?.keptSlots ?? 0;
       if (slots > 0)
         configuredReservations.push({
           ownerKey: `member:${member.id}`,
@@ -1008,23 +1008,23 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     }
     // ACTIVE lease counts of every concurrency scope some waiter is limited
     // by: one grouped query per scope kind (not one count per scope).
-    const scopeKeys = new Map<string, { kind: "POOL" | "MEMBER" | "TARGET"; id: string }>();
+    const scopeKeys = new Map<string, { kind: "POOL" | "TARGET"; id: string }>();
+    const limitsByWaiter = new Map<string, { key: string; limit: number }[]>();
     for (const waiter of waiters) {
-      if (waiter.effectiveConcurrencyLimit === null) continue;
-      scopeKeys.set(`${waiter.effectiveConcurrencyScope}:${waiter.effectiveConcurrencyScopeId}`, {
-        kind:
-          waiter.effectiveConcurrencyScope === "POOL"
-            ? "POOL"
-            : waiter.effectiveConcurrencyScope === "MEMBER"
-              ? "MEMBER"
-              : "TARGET",
-        id: waiter.effectiveConcurrencyScopeId,
-      });
+      const limits = waiterScopeLimits(waiter);
+      limitsByWaiter.set(
+        waiter.id,
+        limits.map((limit) => ({ key: limit.key, limit: limit.limit })),
+      );
+      for (const limit of limits)
+        scopeKeys.set(limit.key, {
+          kind: limit.scope === "POOL" ? "POOL" : "TARGET",
+          id: limit.scopeId,
+        });
     }
     const scopeActive = new Map<string, number>();
     for (const [kind, column] of [
       ["POOL", "poolId"],
-      ["MEMBER", "poolMemberId"],
       ["TARGET", "executionTargetId"],
     ] as const) {
       const ids = [
@@ -1069,21 +1069,19 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         ownerKey: waiter.poolMemberId
           ? `member:${waiter.poolMemberId}`
           : `direct:${waiter.executionTargetId}`,
-        memberLimit: waiter.effectiveConcurrencyLimit,
-        scopeKey: `${waiter.effectiveConcurrencyScope}:${waiter.effectiveConcurrencyScopeId}`,
-        borrowPolicy: waiter.effectiveBorrowPolicy === "NEVER" ? "NEVER" : "WHEN_IDLE",
+        scopeLimits: limitsByWaiter.get(waiter.id) ?? [],
+        borrowReserved: waiter.effectiveBorrowReserved,
         leaseScopeKeys: [
           ...(waiter.poolId ? [`POOL:${waiter.poolId}`] : []),
-          ...(waiter.poolMemberId ? [`MEMBER:${waiter.poolMemberId}`] : []),
-          `DIRECT_TARGET:${waiter.executionTargetId}`,
+          `TEST:${waiter.executionTargetId}`,
         ],
       };
     });
-    // The scheduler state is H (capacity_runtime), created lazily under the
+    // The scheduler state is H (capacity_scheduler), created lazily under the
     // capacity fence; a pass with no waiter plans nothing and needs none.
     const runtime = waiters.length
       ? await this.#capacityRuntime(tx, capacityId, capacity.userId)
-      : { schedulerCursor: 31, schedulerDeficits: null, schedulerVersion: SCHEDULER_VERSION };
+      : null;
     return {
       snapshot: {
         capacityLimit: capacity.hardConcurrencyLimit,
@@ -1092,11 +1090,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
         reservationsByOwner,
         scopeActive,
         waiters: plannerWaiters,
-        scheduler: {
-          cursor: runtime.schedulerCursor,
-          deficits: schedulerDeficits(runtime.schedulerDeficits),
-          version: runtime.schedulerVersion,
-        },
+        scheduler: schedulerStateFromRow(runtime),
       },
       rows,
       userId: capacity.userId,
@@ -1104,8 +1098,8 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   }
 
   /**
-   * Waiters that must not be granted because their pool member is
-   * metric-FULL (a fresh `full` verdict in `pool_member_routing_verdict`).
+   * Waiters that must not be granted because their (member, target) pair is
+   * metric-FULL (a fresh `FULL` verdict in `routing_verdict`).
    *
    * Plain, non-locking reads only: the verdict table is H-class (no foreign
    * keys, written by the relay's rule evaluator outside any capacity lock),
@@ -1126,21 +1120,30 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
       id: string;
       admissionRequestId: string;
       poolMemberId: string | null;
+      executionTargetId: string;
       AdmissionRequest: { metricFailOpen: boolean };
     }>,
     now: Date,
     /** The planner's eligibility exceptions for this pass; siblings are judged by the same rule. */
     window: { creatingRequestId: string | undefined; lastChance: ReadonlySet<string> },
   ): Promise<Set<string>> {
-    const memberIds = [
-      ...new Set(waiters.flatMap((waiter) => (waiter.poolMemberId ? [waiter.poolMemberId] : []))),
-    ];
-    if (memberIds.length === 0) return new Set();
-    const fullMembers = await metricFullMemberIds(tx, memberIds, now);
-    if (fullMembers.size === 0) return new Set();
-    const blocked = waiters.filter(
-      (waiter) => waiter.poolMemberId !== null && fullMembers.has(waiter.poolMemberId),
+    const pairKey = (waiter: { poolMemberId: string | null; executionTargetId: string }) =>
+      waiter.poolMemberId === null ? null : `${waiter.poolMemberId}:${waiter.executionTargetId}`;
+    const pairs = waiters.flatMap((waiter) =>
+      waiter.poolMemberId
+        ? [{ poolMemberId: waiter.poolMemberId, executionTargetId: waiter.executionTargetId }]
+        : [],
     );
+    if (pairs.length === 0) return new Set();
+    const fullPairs = await metricFullPairs(tx, pairs, now);
+    if (fullPairs.size === 0) return new Set();
+    const seenPairs = new Set(
+      pairs.map((pair) => `${pair.poolMemberId}:${pair.executionTargetId}`),
+    );
+    const blocked = waiters.filter((waiter) => {
+      const key = pairKey(waiter);
+      return key !== null && fullPairs.has(key);
+    });
     const failOpenCandidates = [
       ...new Set(
         blocked
@@ -1163,6 +1166,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           id: true,
           admissionRequestId: true,
           poolMemberId: true,
+          executionTargetId: true,
           deadlineAt: true,
           notBefore: true,
           AdmissionRequest: { select: { deadlineAt: true, heartbeatAt: true } },
@@ -1199,22 +1203,20 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
           )
         );
       });
-      const unknownMembers = [
-        ...new Set(
-          siblings.flatMap((sibling) =>
-            sibling.poolMemberId && !memberIds.includes(sibling.poolMemberId)
-              ? [sibling.poolMemberId]
-              : [],
-          ),
-        ),
-      ];
-      for (const id of await metricFullMemberIds(tx, unknownMembers, now)) fullMembers.add(id);
+      const unknownPairs = siblings.flatMap((sibling) =>
+        sibling.poolMemberId &&
+        !seenPairs.has(`${sibling.poolMemberId}:${sibling.executionTargetId}`)
+          ? [{ poolMemberId: sibling.poolMemberId, executionTargetId: sibling.executionTargetId }]
+          : [],
+      );
+      for (const key of await metricFullPairs(tx, unknownPairs, now)) fullPairs.add(key);
       for (const requestId of failOpenCandidates) {
         const candidates = siblings.filter((sibling) => sibling.admissionRequestId === requestId);
         if (
-          candidates.every(
-            (sibling) => sibling.poolMemberId !== null && fullMembers.has(sibling.poolMemberId),
-          )
+          candidates.every((sibling) => {
+            const key = pairKey(sibling);
+            return key !== null && fullPairs.has(key);
+          })
         ) {
           failOpen.add(requestId);
           logMetricFailOpen(requestId);
@@ -1248,7 +1250,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
    * committed durable state and completes.
    *
    * Nothing is carried across transaction attempts: every retry re-reads and
-   * re-plans, and fencing tokens come from the capacity_runtime counter.
+   * re-plans, and fencing tokens come from the capacity_scheduler counter.
    */
   async #persistGrants(
     tx: Prisma.TransactionClient,
@@ -1276,7 +1278,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
     if (!persisted.length) return { persisted: [], stale };
     const last = persisted[persisted.length - 1]!;
     await this.#capacityRuntime(tx, capacityId, userId);
-    const updatedRuntime = await tx.capacityRuntime.update({
+    const updatedRuntime = await tx.capacityScheduler.update({
       where: { capacityId },
       data: {
         schedulerCursor: last.schedulerAfter.cursor,
@@ -1421,28 +1423,12 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
   }
 
   /**
-   * Writes the relay admission-state projections a committed store
-   * transaction produced, each as its own single-row statement holding
-   * nothing else. Telemetry only: a failure is logged, never raised, and
-   * leaves the relay row's `admissionTerminalState` stale.
+   * 0.4.0 trimmed the relay row's admission projection columns: admission outcomes live on
+   * `admission_request` (and the request's `rejection`/`queueWaitMs`). The store still
+   * collects the projections its transactions produce; the scheduler port removes the
+   * plumbing. Writes nothing.
    */
-  async #projectRelayAdmissionStates(projections: readonly RelayAdmissionProjection[]) {
-    for (const projection of projections) {
-      try {
-        await this.db.relayRequest.updateMany({
-          where: {
-            id: projection.relayRequestId,
-            admissionAttemptId: projection.admissionAttemptId,
-          },
-          data: { admissionTerminalState: projection.state },
-        });
-      } catch (error) {
-        console.warn("[capacity] relay admission-state projection failed", {
-          errorClass: error instanceof Error ? error.name : "UnknownError",
-        });
-      }
-    }
-  }
+  async #projectRelayAdmissionStates(_projections: readonly RelayAdmissionProjection[]) {}
 
   async heartbeat(lease: CapacityLeaseHandle, extensionMs: number): Promise<boolean> {
     if (!Number.isFinite(extensionMs) || extensionMs <= 0)
@@ -1777,12 +1763,12 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
               WHERE waiter."admissionRequestId" = request.id
                 AND waiter.state = 'WAITING'
                 AND (target.id IS NULL
-                  OR target."inferenceCapacityId" IS DISTINCT FROM waiter."capacityId"
+                  OR target."instanceId" IS DISTINCT FROM waiter."capacityId"
                   OR (waiter."poolMemberId" IS NOT NULL AND member.id IS NULL)))
            OR EXISTS (
              SELECT 1 FROM capacity_lease lease
                LEFT JOIN execution_target target ON target.id = lease."executionTargetId"
-               LEFT JOIN inference_capacity capacity ON capacity.id = lease."capacityId"
+               LEFT JOIN runtime_instance capacity ON capacity.id = lease."capacityId"
               WHERE lease."admissionRequestId" = request.id
                 AND lease.state = 'ACTIVE'
                 AND (target.id IS NULL OR capacity.id IS NULL)))
@@ -1835,7 +1821,7 @@ export class PostgresCapacityAdmissionStore implements CapacityAdmissionStore {
               where: { id: lease.executionTargetId },
               select: { id: true },
             }),
-            tx.inferenceCapacity.findUnique({
+            tx.runtimeInstance.findUnique({
               where: { id: lease.capacityId },
               select: { id: true },
             }),
@@ -1985,23 +1971,23 @@ export function candidateDeadlineAt(
 
 /**
  * Saturation S-C per-grant queue priority: for a grantee's pool admission,
- * `PoolGrant.queuePriority` replaces the pool/member capacity priority,
- * clamped to 0..31; null (or no grant, or a grant of another pool) inherits.
- * A plain read inside the admission transaction: `pool_grant` is outside the
- * capacity lock order and is never locked here.
+ * the rank of `PoolGrant.queuePriorityClass` replaces the pool's class; null
+ * (or no grant, or a grant of another pool) inherits. A plain read inside
+ * the admission transaction: `pool_grant` is outside the capacity lock order
+ * and is never locked here.
  */
-async function resolveGrantQueuePriority(
+async function resolveSharePriority(
   tx: Prisma.TransactionClient,
   attempt: AdmissionAttempt,
 ): Promise<number | null> {
-  if (attempt.sourceKind !== "POOL" || !attempt.poolId || !attempt.accessGrantId) return null;
-  const grant = await tx.poolGrant.findFirst({
-    where: { id: attempt.accessGrantId, poolId: attempt.poolId, ownerUserId: attempt.ownerId },
-    select: { queuePriority: true },
+  if (attempt.sourceKind !== "POOL" || !attempt.poolId || !attempt.priorityShareId) return null;
+  const share = await tx.share.findFirst({
+    where: { id: attempt.priorityShareId, poolId: attempt.poolId, ownerUserId: attempt.ownerId },
+    select: { priorityClass: true },
   });
-  const priority = grant?.queuePriority;
-  if (priority === null || priority === undefined) return null;
-  return Math.min(31, Math.max(0, Math.trunc(priority)));
+  const priorityClass = share?.priorityClass;
+  if (priorityClass === null || priorityClass === undefined) return null;
+  return priorityClassRank(priorityClass);
 }
 
 /**
@@ -2018,18 +2004,25 @@ async function noLiveCandidateReason(
   return unroutable > 0 ? MEMBER_UNROUTABLE_REASON : "candidate_deadlines";
 }
 
-/** Members with a fresh `full` routing verdict (plain read of an H-class table). */
-async function metricFullMemberIds(
+/**
+ * (member, target) pairs with a fresh `FULL` routing verdict (plain read of an H-class table),
+ * as `member:target` keys.
+ */
+async function metricFullPairs(
   tx: Prisma.TransactionClient,
-  memberIds: readonly string[],
+  pairs: ReadonlyArray<{ poolMemberId: string; executionTargetId: string }>,
   now: Date,
 ): Promise<Set<string>> {
-  if (memberIds.length === 0) return new Set();
-  const rows = await tx.poolMemberRoutingVerdict.findMany({
-    where: { poolMemberId: { in: [...memberIds] }, verdict: "FULL", expiresAt: { gt: now } },
-    select: { poolMemberId: true },
+  if (pairs.length === 0) return new Set();
+  const rows = await tx.routingVerdict.findMany({
+    where: {
+      poolMemberId: { in: [...new Set(pairs.map((pair) => pair.poolMemberId))] },
+      verdict: "FULL",
+      expiresAt: { gt: now },
+    },
+    select: { poolMemberId: true, executionTargetId: true },
   });
-  return new Set(rows.map((row) => row.poolMemberId));
+  return new Set(rows.map((row) => `${row.poolMemberId}:${row.executionTargetId}`));
 }
 
 const METRIC_FAIL_OPEN_LOGGED_MAX = 1_000;
@@ -2045,10 +2038,70 @@ function logMetricFailOpen(admissionRequestId: string) {
   });
 }
 
-function schedulerDeficits(value: Prisma.JsonValue): number[] {
-  if (Array.isArray(value) && value.length === 32)
-    return value.map((entry) => (typeof entry === "number" && entry >= 0 ? entry : 0));
-  return Array(32).fill(0);
+/**
+ * The persisted scheduler state, or a fresh one: a row of another scheduler
+ * version (the 32-class version 1) or of the wrong shape restarts the
+ * fairness credit, which is safe (it only affects the next few picks).
+ */
+function schedulerStateFromRow(
+  row: {
+    schedulerCursor: number;
+    schedulerDeficits: Prisma.JsonValue;
+    schedulerVersion: number;
+  } | null,
+): SchedulerState {
+  const fresh: SchedulerState = {
+    cursor: PRIORITY_CLASS_COUNT - 1,
+    deficits: Array(PRIORITY_CLASS_COUNT).fill(0),
+    version: SCHEDULER_VERSION,
+  };
+  if (!row || row.schedulerVersion !== SCHEDULER_VERSION) return fresh;
+  const value = row.schedulerDeficits;
+  if (
+    !Array.isArray(value) ||
+    value.length !== PRIORITY_CLASS_COUNT ||
+    !Number.isInteger(row.schedulerCursor) ||
+    row.schedulerCursor < 0 ||
+    row.schedulerCursor >= PRIORITY_CLASS_COUNT
+  )
+    return fresh;
+  return {
+    cursor: row.schedulerCursor,
+    deficits: value.map((entry) => (typeof entry === "number" && entry >= 0 ? entry : 0)),
+    version: SCHEDULER_VERSION,
+  };
+}
+
+type WaiterScopeLimit = { key: string; scope: string; scopeId: string; limit: number };
+
+/**
+ * Every concurrency ceiling a waiter is bound by, as `<scope>:<scopeId>`
+ * keys: its own scope (POOL, MEMBER or DIRECT_TARGET) when that has a limit,
+ * plus the pool-wide cap of a MEMBER-scoped pool waiter.
+ */
+function waiterScopeLimits(waiter: {
+  poolId: string | null;
+  effectiveConcurrencyLimit: number | null;
+  effectiveConcurrencyScope: string;
+  effectiveConcurrencyScopeId: string;
+  effectivePoolConcurrencyLimit: number | null;
+}): WaiterScopeLimit[] {
+  const limits: WaiterScopeLimit[] = [];
+  if (waiter.effectiveConcurrencyLimit !== null)
+    limits.push({
+      key: `${waiter.effectiveConcurrencyScope}:${waiter.effectiveConcurrencyScopeId}`,
+      scope: waiter.effectiveConcurrencyScope,
+      scopeId: waiter.effectiveConcurrencyScopeId,
+      limit: waiter.effectiveConcurrencyLimit,
+    });
+  if (waiter.effectivePoolConcurrencyLimit !== null && waiter.poolId)
+    limits.push({
+      key: `POOL:${waiter.poolId}`,
+      scope: "POOL",
+      scopeId: waiter.poolId,
+      limit: waiter.effectivePoolConcurrencyLimit,
+    });
+  return limits;
 }
 
 export function allocateReservationSlots(

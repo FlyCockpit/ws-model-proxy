@@ -1,8 +1,8 @@
 import type { WebSocketLike } from "@hono/node-server";
-import type { ModelApiTokenIdentity } from "@ws-model-proxy/api/lib/model-api-token-access";
 import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
+import type { ApiKeyIdentity } from "../resolve.js";
 import { dashboardRequester, tokenRequester } from "./requester.js";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
@@ -61,17 +61,15 @@ const {
 
 type Deps = Parameters<typeof realtimeSocketEvents>[1];
 
-const TOKEN: ModelApiTokenIdentity = {
+const TOKEN: ApiKeyIdentity = {
   id: "token-1",
   userId: "user-1",
-  scopeMode: "ALL_VISIBLE",
-  allowExternal: false,
-  externalAfterWaitMs: null,
-  lookupPrefix: "wsmp_model_abc",
+  scope: "ALL_POOLS",
+  lookupPrefix: "wsmp_key_abc",
   expiresAt: null,
   lastUsedAt: null,
 };
-const SECRET = "wsmp_model_secret";
+const SECRET = "wsmp_key_secret";
 
 function deps(overrides: Partial<Deps> = {}) {
   const hub = new SttRelayHub({ resolveLink: () => ({ ok: false, reason: "offline" }) });
@@ -83,7 +81,7 @@ function deps(overrides: Partial<Deps> = {}) {
   const value: Deps = {
     relay: {
       createSttSession: (input) => hub.createSession(input),
-      getActiveCliDeviceIds: () => [],
+      getOnlineNodeIds: () => [],
       isDraining: () => draining.value,
     },
     counters,
@@ -149,8 +147,7 @@ describe("realtime upgrade middleware", () => {
     const path = "/v1/realtime?intent=transcription";
     expect((await app(t.deps).request(path, upgrade())).status).toBe(401);
     expect(
-      (await app(t.deps).request(path, upgrade({ Authorization: "Bearer wsmp_model_wrong" })))
-        .status,
+      (await app(t.deps).request(path, upgrade({ Authorization: "Bearer wsmp_key_wrong" }))).status,
     ).toBe(401);
     expect(t.counters.count("server")).toBe(0);
   });
@@ -294,11 +291,10 @@ describe("realtime socket events", () => {
           ok: true,
           candidates: [
             {
-              cliDeviceId: "cli",
-              endpointSlug: "inst-aaaaaaaaaaaaaaaa",
+              nodeId: "node",
+              handle: "i-aaaaaaaaaaaa",
               upstreamModel: "m",
               capabilities: null,
-              deploymentManaged: true,
               memberId: null,
             },
           ],
@@ -322,7 +318,7 @@ describe("realtime socket events", () => {
     events.onOpen?.(new Event("open"), ws);
     events.onClose?.(new CloseEvent("close"), ws);
     expect(createMeter).toHaveBeenCalledWith({
-      source: "API_TOKEN",
+      source: "API_KEY",
       tokenId: TOKEN.id,
       userId: TOKEN.userId,
       tokenLookupPrefix: TOKEN.lookupPrefix,
@@ -357,12 +353,12 @@ describe("realtime socket events", () => {
       [
         {
           userId: TOKEN.userId,
-          source: "API_TOKEN",
+          source: "API_KEY",
           tokenId: TOKEN.id,
           tokenLookupPrefix: TOKEN.lookupPrefix,
         },
       ],
-      [{ userId: "user-1", source: "CHAT_TEST", tokenId: null, tokenLookupPrefix: null }],
+      [{ userId: "user-1", source: "TEST", tokenId: null, tokenLookupPrefix: null }],
     ]);
     expect(authorizeOpen.mock.calls).toEqual([
       [{ tokenId: TOKEN.id, userId: TOKEN.userId }],

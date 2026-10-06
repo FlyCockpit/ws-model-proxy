@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from "vitest";
-import { mockRequesterValidityQuery } from "./external-consent.test-helper.js";
 
 const db = vi.hoisted(() => ({ $transaction: vi.fn() }));
 vi.mock("@ws-model-proxy/db", () => ({ default: db }));
@@ -10,10 +9,7 @@ vi.mock("@ws-model-proxy/env/server", () => ({
   },
 }));
 
-import {
-  encryptProviderCredential,
-  parseProviderCredentialKeyring,
-} from "@ws-model-proxy/api/lib/provider-credential-crypto";
+import { parseProviderCredentialKeyring } from "@ws-model-proxy/api/lib/provider-credential-crypto";
 import { env } from "@ws-model-proxy/env/server";
 import { type ExternalEgressConsent, evaluateExternalEgress } from "./external-route.js";
 import { PROVIDER_HALF_OPEN_LEASE_MS, providerHealthCoolingDown } from "./provider-health-state.js";
@@ -68,14 +64,14 @@ function issuedConsent(poolId = "pool"): ExternalEgressConsent {
   try {
     const decision = evaluateExternalEgress({
       requested: true,
-      requester: { userId: "owner", source: "API_TOKEN", modelApiTokenId: "token" },
-      tokenPermitsPool: true,
+      requester: { userId: "owner", source: "API_KEY", apiKeyId: "token" },
       pool: {
         id: poolId,
         ownerUserId: "owner",
-        accessGrantId: null,
-        fallbackEnabled: true,
-        fallbackForGrantees: false,
+        shareId: null,
+        fallbackMode: "OWNER",
+        externalEquivalentModel: null,
+        ownKeyProviderModelId: null,
       },
     });
     if (!decision.granted) throw new Error("expected an issued consent");
@@ -571,540 +567,38 @@ describe("public overflow compatibility", () => {
     expect(providerHealthOutcome(429)).toBe("FAILURE");
     expect(providerHealthOutcome(503)).toBe("FAILURE");
   });
-  it("commits the credential send-start claim before provider I/O can begin", async () => {
-    const keyring = parseProviderCredentialKeyring(`v1:${Buffer.alloc(32, 7).toString("base64")}`);
-    const identity = {
-      credentialId: "credential",
-      userId: "owner",
-      providerAccountId: "account",
-      credentialType: "BEARER" as const,
-      aadVersion: 1,
-    };
-    const envelope = encryptProviderCredential("provider-secret", identity, keyring);
-    const order: string[] = [];
-    const tx = {
-      $executeRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
-        const sql = strings.join("?");
-        // C1b-6: `is_local = true` keeps the timeout inside the claim; a
-        // session-level setting would outlive it on the pooled connection.
-        const scope = /,\s*true\s*\)\s*$/.test(sql) ? "local" : "session";
-        order.push(
-          `set:${sql.includes("set_config('lock_timeout'") ? "lock_timeout" : "?"}=${String(values[0])}:${scope}`,
-        );
-        return 0;
-      }),
-      $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
-        if (strings.join("").includes('AS "requesterValid"'))
-          return mockRequesterValidityQuery(strings, values, tx);
-        order.push(`lock:${lockedTable(strings)}`);
-        return [];
-      }),
-      ...consentTx(order),
-      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
-      providerCredential: {
-        findFirst: vi.fn(async () => ({
-          id: identity.credentialId,
-          credentialType: identity.credentialType,
-          aadVersion: identity.aadVersion,
-          ...envelope,
-        })),
-        update: vi.fn(async () => {
-          order.push("durable-claim");
-          return { id: identity.credentialId };
-        }),
-      },
-    };
-    db.$transaction.mockImplementationOnce(async (callback: (value: typeof tx) => unknown) => {
-      const result = await callback(tx);
-      order.push("commit");
-      return result;
-    });
-    const target = {
-      poolMemberId: "member",
-      executionTargetId: "target",
-      publicOrder: 0,
-      providerModelId: "model",
-      upstreamModelId: "upstream",
-      contextWindow: 1_000,
-      maxOutputTokens: 100,
-      protocol: "openai" as const,
-      providerAccountId: identity.providerAccountId,
-      endpointIdentity: "provider-endpoint",
-      endpointVersion: 1,
-      concurrencyLimit: null,
-      providerVersion: null,
-      dataCollectionPolicy: null,
-      baseUrl: "https://provider.example",
-      authType: "BEARER" as const,
-      healthStatus: "HEALTHY" as const,
-      nativeProtocols: ["openai" as const],
-      nativeSurfaces: ["openai-chat" as const],
-      supportsStreaming: true,
-      supportedFeatures: [],
-      credential: {
-        id: identity.credentialId,
-        credentialType: identity.credentialType,
-        keyVersion: envelope.keyVersion,
-        aadVersion: identity.aadVersion,
-        algorithm: envelope.algorithm,
-        ciphertext: envelope.ciphertext,
-        nonce: envelope.nonce,
-        authTag: envelope.authTag,
-      },
-    };
-
-    const mismatch = await withEgressEnabled(() =>
-      claimPublicProviderCredentialForSend({
-        userId: identity.userId,
-        target,
-        keyring,
-        consent: { ...GRANTEE_TOKEN_CONSENT, ownKeyProviderModelId: "different-model" },
-      }),
-    );
-    expect(mismatch).toEqual({ claimed: false, reason: "OWN_KEY_CONSENT_WITHDRAWN" });
-    expect(tx.providerCredential.update).not.toHaveBeenCalled();
-
-    const claim = await withEgressEnabled(() =>
-      claimPublicProviderCredentialForSend({
-        userId: identity.userId,
-        target,
-        keyring,
-        consent: GRANTEE_TOKEN_CONSENT,
-      }),
-    );
-    order.push("network-may-start");
-
-    expect(claim).toEqual({ claimed: true, secret: "provider-secret", dataCollectionPolicy: null });
-    // E0 send boundary: consent rows FOR SHARE in the canonical order, read
-    // under those locks, then the provider account/credential lifecycle locks,
-    // the durable claim, and commit, all before any network I/O.
-    expect(order).toEqual([
-      // L1b: the first statement bounds every lock wait of the claim
-      // (transaction-local, so it ends with the claim).
-      "set:lock_timeout=2000ms:local",
-      "lock:model_pool FOR SHARE",
-      "lock:pool_grant FOR SHARE",
-      "lock:model_api_token FOR SHARE",
-      "lock:model_api_token_allowlist_entry FOR SHARE",
-      "read:pool",
-      "read:consent",
-      "read:account",
-      "read:consent",
-      "read:consent",
-      "lock:provider_account FOR UPDATE",
-      "lock:provider_model FOR SHARE",
-      "lock:provider_credential FOR UPDATE",
-      // Time and the (unlocked) account row, re-read after the last wait.
-      "read:consent",
-      "read:account",
-      // The listed target (provider model, pool member), after consent.
-      "read:target",
-      "read:target",
-      "durable-claim",
-      "commit",
-      "network-may-start",
-    ]);
-    expect(db.$transaction).toHaveBeenCalledWith(expect.any(Function), {
-      maxWait: 5_000,
-      timeout: 10_000,
-    });
-  });
-
-  it.each([
-    ["the owner turned fallback off", { pool: { fallbackEnabled: false } }, "POOL_PRIVATE"],
-    [
-      "the owner stopped covering grantees",
-      { pool: { fallbackEnabled: true, fallbackForGrantees: false } },
-      "GRANTEE_NOT_COVERED",
-    ],
-    ["the grant was deleted", { grant: null }, "REQUESTER_NOT_VISIBLE"],
-    [
-      "the grant was replaced by another grant",
-      { grant: { id: "replacement-grant" } },
-      "REQUESTER_NOT_VISIBLE",
-    ],
-    [
-      "the requester's account is marked for deletion",
-      { account: { deletionRequestedAt: new Date() } },
-      "REQUESTER_ACCESS_BLOCKED",
-    ],
-    ["the requester is banned", { account: { banned: true } }, "REQUESTER_ACCESS_BLOCKED"],
-    ["the token was revoked", { token: { revokedAt: new Date() } }, "CALLER_CONSENT_WITHDRAWN"],
-    [
-      "the token no longer allows external",
-      { token: { allowExternal: false } },
-      "CALLER_CONSENT_WITHDRAWN",
-    ],
-    [
-      "the allowlist entry no longer includes external",
-      { entry: { includeExternal: false } },
-      "CALLER_CONSENT_WITHDRAWN",
-    ],
-  ] as const)(
-    "refuses the send claim when %s, before any credential lock",
-    async (_label, change, reason) => {
-      const order: string[] = [];
-      const tx = {
-        $executeRaw: vi.fn(async () => 0),
-        $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
-          if (strings.join("").includes('AS "requesterValid"'))
-            return mockRequesterValidityQuery(strings, values, tx);
-          order.push(`lock:${lockedTable(strings)}`);
-          return [];
-        }),
-        ...consentTx(order, change),
-        providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
-        providerCredential: { findFirst: vi.fn(), update: vi.fn() },
-      };
-      db.$transaction.mockImplementationOnce(async (callback: (value: typeof tx) => unknown) =>
-        callback(tx),
-      );
-      const keyring = parseProviderCredentialKeyring(
-        `v1:${Buffer.alloc(32, 7).toString("base64")}`,
-      );
-
-      const claim = await withEgressEnabled(() =>
-        claimPublicProviderCredentialForSend({
-          userId: "owner",
-          target: claimTarget(),
-          keyring,
-          consent: GRANTEE_TOKEN_CONSENT,
-        }),
-      );
-
-      expect(claim).toEqual({ claimed: false, reason });
-      expect(order.filter((step) => step.startsWith("lock:provider"))).toEqual([]);
-      expect(tx.providerCredential.update).not.toHaveBeenCalled();
-    },
-  );
-
-  // #64 decision: the listed target is re-read after the last lock wait. A
-  // removed or disabled member, a disabled or replaced provider model, or a
-  // changed endpoint version is refused before the durable claim.
-  it.each([
-    ["the member was removed or disabled", { member: null }, false, "PROVIDER_UNAVAILABLE"],
-    [
-      "the member was removed (stored-response binding)",
-      { member: null },
-      true,
-      "BOUND_TARGET_INVALID",
-    ],
-    [
-      "the provider model is gone or its endpoint changed",
-      { model: null },
-      false,
-      "PROVIDER_UNAVAILABLE",
-    ],
-    [
-      "the endpoint changed (stored-response binding)",
-      { model: null },
-      true,
-      "BOUND_TARGET_INVALID",
-    ],
-    [
-      "the provider model was disabled",
-      { model: { enabled: false } },
-      false,
-      "PROVIDER_UNAVAILABLE",
-    ],
-    [
-      "the provider model was disabled (stored-response binding)",
-      { model: { enabled: false } },
-      true,
-      "PROVIDER_UNAVAILABLE",
-    ],
-    [
-      "the provider account was disabled",
-      { model: { ProviderAccount: { enabled: false } } },
-      false,
-      "PROVIDER_UNAVAILABLE",
-    ],
-  ] as const)(
-    "refuses the send claim when %s, after the last lock wait",
-    async (_label, change, exactBinding, reason) => {
-      const order: string[] = [];
-      const tx = {
-        $executeRaw: vi.fn(async () => 0),
-        $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
-          if (strings.join("").includes('AS "requesterValid"'))
-            return mockRequesterValidityQuery(strings, values, tx);
-          order.push(`lock:${lockedTable(strings)}`);
-          return [];
-        }),
-        ...consentTx(order, change),
-        providerCredential: { findFirst: vi.fn(), update: vi.fn() },
-      };
-      db.$transaction.mockImplementationOnce(async (callback: (value: typeof tx) => unknown) =>
-        callback(tx),
-      );
-      const keyring = parseProviderCredentialKeyring(
-        `v1:${Buffer.alloc(32, 7).toString("base64")}`,
-      );
-      const claim = await withEgressEnabled(() =>
-        claimPublicProviderCredentialForSend({
-          userId: "owner",
-          target: claimTarget(),
-          keyring,
-          consent: GRANTEE_TOKEN_CONSENT,
-          exactBinding,
-        }),
-      );
-      expect(claim).toEqual({ claimed: false, reason });
-      // Read after the last lock (credential) and after the account re-read.
-      expect(order.lastIndexOf("lock:provider_credential FOR UPDATE")).toBeLessThan(
-        order.indexOf("read:target"),
-      );
-      expect(order.lastIndexOf("read:account")).toBeLessThan(order.indexOf("read:target"));
-      expect(tx.providerModel.findFirst).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: expect.objectContaining({
-            deletedAt: null,
-            ProviderAccount: expect.objectContaining({ endpointVersion: expect.any(Number) }),
-          }),
-        }),
-      );
-      expect(tx.poolMember.findFirst).toHaveBeenCalledWith({
-        where: expect.objectContaining({
-          poolId: "pool",
-          tier: "PUBLIC_OVERFLOW",
-          routingStatus: "ACTIVE",
-        }),
-        select: { id: true },
-      });
-      expect(tx.providerCredential.update).not.toHaveBeenCalled();
-    },
-  );
-
-  // R1-B / R1-C: validity that lapses without a write to a locked row (time,
-  // and the requester's account row, which the claim does not lock) is
-  // re-evaluated after the provider account/credential lock waits, before
-  // the durable claim.
-  it.each([
-    [
-      "the token expired",
-      (tx: ReturnType<typeof consentTx>) => {
-        void tx;
-        vi.setSystemTime(new Date(CLAIM_START.getTime() + 2_000));
-      },
-      "CALLER_CONSENT_WITHDRAWN",
-    ],
-    [
-      "the requester's account was marked for deletion",
-      (tx: ReturnType<typeof consentTx>) => {
-        tx.user.findUnique.mockResolvedValue({
-          banned: false,
-          banExpires: null,
-          deletionRequestedAt: new Date(),
-        });
-      },
-      "REQUESTER_ACCESS_BLOCKED",
-    ],
-    [
-      "the requester was banned",
-      (tx: ReturnType<typeof consentTx>) => {
-        tx.user.findUnique.mockResolvedValue({
-          banned: true,
-          banExpires: null,
-          deletionRequestedAt: null,
-        });
-      },
-      "REQUESTER_ACCESS_BLOCKED",
-    ],
-  ] as const)(
-    "refuses the send claim when %s while it waited on the provider locks",
-    async (_label, lapse, reason) => {
-      vi.useFakeTimers({ toFake: ["Date"] });
-      vi.setSystemTime(CLAIM_START);
-      try {
-        const order: string[] = [];
-        const consent = consentTx(order, {
-          token: { expiresAt: new Date(CLAIM_START.getTime() + 1_000) },
-        });
-        const tx = {
-          $executeRaw: vi.fn(async () => 0),
-          $queryRaw: vi.fn(async (strings: TemplateStringsArray, ...values: unknown[]) => {
-            if (strings.join("").includes('AS "requesterValid"'))
-              return mockRequesterValidityQuery(strings, values, tx);
-            const table = lockedTable(strings);
-            order.push(`lock:${table}`);
-            // The change commits while the claim waits for the account lock.
-            if (table === "provider_account FOR UPDATE") lapse(consent);
-            return [];
-          }),
-          ...consent,
-          providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
-          providerCredential: { findFirst: vi.fn(), update: vi.fn() },
-        };
-        db.$transaction.mockImplementationOnce(async (callback: (value: typeof tx) => unknown) =>
-          callback(tx),
-        );
-        const keyring = parseProviderCredentialKeyring(
-          `v1:${Buffer.alloc(32, 7).toString("base64")}`,
-        );
-
-        const claim = await withEgressEnabled(() =>
-          claimPublicProviderCredentialForSend({
-            userId: "owner",
-            target: claimTarget(),
-            keyring,
-            consent: GRANTEE_TOKEN_CONSENT,
-          }),
-        );
-
-        expect(claim).toEqual({ claimed: false, reason });
-        expect(order).toContain("lock:provider_credential FOR UPDATE");
-        expect(tx.providerCredential.findFirst).not.toHaveBeenCalled();
-        expect(tx.providerCredential.update).not.toHaveBeenCalled();
-      } finally {
-        vi.useRealTimers();
-      }
-    },
-  );
-
-  it.each(["initial", "post-lock"] as const)(
-    "rejects a continuously renewed ban at the %s requester read despite delayed delivery",
-    async (phase) => {
-      vi.useFakeTimers({ toFake: ["Date"] });
-      vi.setSystemTime(CLAIM_START);
-      try {
-        const keyring = parseProviderCredentialKeyring(
-          `v1:${Buffer.alloc(32, 7).toString("base64")}`,
-        );
-        const identity = {
-          credentialId: "credential",
-          userId: "owner",
-          providerAccountId: "account",
-          credentialType: "BEARER" as const,
-          aadVersion: 1,
-        };
-        const envelope = encryptProviderCredential("test-provider-secret", identity, keyring);
-        let banned = phase === "initial";
-        let liveBanExpires = new Date(Date.now() + 1000);
-        let observations = 0;
-        const rows = consentTx([]);
-        rows.user.findUnique.mockImplementation(async () => {
-          if (!banned) return { banned: false, banExpires: null, deletionRequestedAt: null };
-          const readAt = Date.now();
-          const snapshot = { banned: true, banExpires: liveBanExpires, deletionRequestedAt: null };
-          expect(liveBanExpires.getTime()).toBeGreaterThan(readAt);
-          liveBanExpires = new Date(readAt + 3000);
-          await Promise.resolve();
-          vi.setSystemTime(readAt + 2000);
-          observations += 1;
-          expect(liveBanExpires.getTime()).toBeGreaterThan(Date.now());
-          return snapshot;
-        });
-        const tx = {
-          ...rows,
-          $executeRaw: vi.fn(async () => 0),
-          $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
-            if (strings.join("").includes("FROM provider_account")) banned = true;
-            return mockRequesterValidityQuery(strings, values, rows);
-          }),
-          providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
-          providerCredential: {
-            findFirst: vi
-              .fn()
-              .mockResolvedValue({ ...identity, id: identity.credentialId, ...envelope }),
-            update: vi.fn().mockResolvedValue({ id: identity.credentialId }),
-          },
-        };
-        db.$transaction.mockImplementationOnce(async (callback: (value: typeof tx) => unknown) =>
-          callback(tx),
-        );
-        await expect(
-          withEgressEnabled(() =>
-            claimPublicProviderCredentialForSend({
-              userId: "owner",
-              target: claimTarget(),
-              keyring,
-              consent: GRANTEE_TOKEN_CONSENT,
-            }),
-          ),
-        ).resolves.toEqual({ claimed: false, reason: "REQUESTER_ACCESS_BLOCKED" });
-        expect(observations).toBe(1);
-        expect(tx.providerCredential.update).not.toHaveBeenCalled();
-      } finally {
-        vi.useRealTimers();
-      }
-    },
-  );
-
-  it("refuses the send claim with the deployment switch off without opening a transaction", async () => {
+  it("keeps the S0 send claim fail-closed: nothing is decrypted or sent", async () => {
     db.$transaction.mockClear();
     const keyring = parseProviderCredentialKeyring(`v1:${Buffer.alloc(32, 7).toString("base64")}`);
-    await expect(
-      claimPublicProviderCredentialForSend({
-        userId: "owner",
-        target: claimTarget(),
-        keyring,
-        consent: GRANTEE_TOKEN_CONSENT,
-      }),
-    ).resolves.toEqual({ claimed: false, reason: "DEPLOYMENT_GATE_DISABLED" });
-    expect(db.$transaction).not.toHaveBeenCalled();
-  });
-
-  it("fails a send-start claim when revocation won the lifecycle lock", async () => {
-    const tx = {
-      $executeRaw: vi.fn(async () => 0),
-      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) =>
-        mockRequesterValidityQuery(strings, values, tx),
-      ),
-      ...consentTx([]),
-      providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
-      providerCredential: {
-        findFirst: vi.fn().mockResolvedValue(null),
-        update: vi.fn(),
-      },
+    const consent = {
+      requesterUserId: "owner",
+      apiKeyId: "key",
+      poolId: "pool",
+      ownerUserId: "owner",
+      shareId: null,
     };
-    db.$transaction.mockImplementationOnce(async (callback: (value: typeof tx) => unknown) =>
-      callback(tx),
-    );
-    const keyring = parseProviderCredentialKeyring(`v1:${Buffer.alloc(32, 7).toString("base64")}`);
-
+    const target = claimTarget();
     await expect(
-      withEgressEnabled(() =>
+      claimPublicProviderCredentialForSend({ userId: "owner", target, keyring, consent }),
+    ).resolves.toEqual({ claimed: false, reason: "DEPLOYMENT_GATE_DISABLED" });
+    const mutableEnv = env as { WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: boolean };
+    mutableEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
+    try {
+      await expect(
+        claimPublicProviderCredentialForSend({ userId: "owner", target, keyring, consent }),
+      ).resolves.toEqual({ claimed: false, reason: "PROVIDER_UNAVAILABLE" });
+      await expect(
         claimPublicProviderCredentialForSend({
           userId: "owner",
-          consent: GRANTEE_TOKEN_CONSENT,
-          target: {
-            poolMemberId: "member",
-            executionTargetId: "target",
-            publicOrder: 0,
-            providerModelId: "model",
-            upstreamModelId: "upstream",
-            contextWindow: 1_000,
-            maxOutputTokens: 100,
-            protocol: "openai",
-            providerAccountId: "account",
-            endpointIdentity: "provider-endpoint",
-            endpointVersion: 1,
-            concurrencyLimit: null,
-            providerVersion: null,
-            dataCollectionPolicy: null,
-            baseUrl: "https://provider.example",
-            authType: "BEARER",
-            healthStatus: "HEALTHY",
-            nativeProtocols: ["openai"],
-            nativeSurfaces: ["openai-chat"],
-            supportsStreaming: true,
-            supportedFeatures: [],
-            credential: {
-              id: "credential",
-              credentialType: "BEARER",
-              keyVersion: "v1",
-              aadVersion: 1,
-              algorithm: "AES-256-GCM",
-              ciphertext: new Uint8Array(),
-              nonce: new Uint8Array(),
-              authTag: new Uint8Array(),
-            },
-          },
+          target,
           keyring,
+          consent: { ...consent, ownKeyProviderModelId: "other-model" },
         }),
-      ),
-    ).rejects.toThrow("no longer current");
-    expect(tx.providerCredential.update).not.toHaveBeenCalled();
+      ).resolves.toEqual({ claimed: false, reason: "OWN_KEY_CONSENT_WITHDRAWN" });
+    } finally {
+      mutableEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = false;
+    }
+    expect(db.$transaction).not.toHaveBeenCalled();
   });
 
   it("fails closed when context or native capability inventory is unknown", () => {
@@ -1540,111 +1034,6 @@ describe("engine cache confirmation evidence", () => {
   });
 });
 
-const CLAIM_START = new Date("2026-09-26T12:00:00.000Z");
-
-type AccountRow = { banned: boolean; banExpires: Date | null; deletionRequestedAt: Date | null };
-
-/** A grantee's API-token request: every consent row kind is involved. */
-const GRANTEE_TOKEN_CONSENT = {
-  requesterUserId: "grantee",
-  modelApiTokenId: "token",
-  poolId: "pool",
-  ownerUserId: "owner",
-  accessGrantId: "grant",
-};
-
-function lockedTable(strings: TemplateStringsArray): string {
-  const sql = strings.join("?").replace(/\s+/g, " ");
-  const table = sql.match(/FROM (\w+)/)?.[1] ?? "?";
-  const mode = sql.match(/FOR (SHARE|UPDATE|NO KEY UPDATE)/)?.[0] ?? "";
-  return `${table} ${mode}`.trim();
-}
-
-async function withEgressEnabled<T>(work: () => Promise<T>): Promise<T> {
-  const mutableEnv = env as { WMP_PUBLIC_PROVIDER_EGRESS_ENABLED: boolean };
-  const previous = mutableEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED;
-  mutableEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = true;
-  try {
-    return await work();
-  } finally {
-    mutableEnv.WMP_PUBLIC_PROVIDER_EGRESS_ENABLED = previous;
-  }
-}
-
-/** Consent rows as the send-claim transaction reads them, all granting by default. */
-function consentTx(
-  order: string[],
-  change: {
-    pool?: Record<string, unknown>;
-    grant?: Record<string, unknown> | null;
-    token?: Record<string, unknown>;
-    entry?: Record<string, unknown>;
-    account?: Record<string, unknown>;
-    member?: null;
-    model?: Record<string, unknown> | null;
-  } = {},
-) {
-  const read = <T>(label: string, value: T) =>
-    vi.fn(async () => {
-      order.push(label);
-      return value;
-    });
-  return {
-    modelPool: {
-      findFirst: read("read:pool", {
-        fallbackEnabled: true,
-        fallbackForGrantees: true,
-        ...change.pool,
-      }),
-    },
-    poolGrant: {
-      findUnique: read(
-        "read:consent",
-        change.grant === null ? null : { id: "grant", ownerUserId: "owner", ...change.grant },
-      ),
-    },
-    user: {
-      findUnique: read<AccountRow>("read:account", {
-        banned: false,
-        banExpires: null,
-        deletionRequestedAt: null,
-        ...change.account,
-      }),
-    },
-    modelApiToken: {
-      findUnique: read("read:consent", {
-        userId: "grantee",
-        scopeMode: "ALLOWLIST",
-        allowExternal: true,
-        revokedAt: null,
-        expiresAt: null,
-        ...change.token,
-      }),
-    },
-    modelApiTokenAllowlistEntry: {
-      findUnique: read("read:consent", {
-        target: "MODEL_POOL",
-        includeExternal: true,
-        ...change.entry,
-      }),
-    },
-    // D9: the account's privacy policy, read under the account lock.
-    providerAccount: { findFirst: vi.fn().mockResolvedValue(claimPrivacyAccount()) },
-    // The target re-read after the last lock wait (member, provider model).
-    poolMember: {
-      findFirst: read("read:target", change.member === null ? null : { id: "member" }),
-    },
-    providerModel: {
-      findFirst: read(
-        "read:target",
-        change.model === null
-          ? null
-          : { enabled: true, ProviderAccount: { enabled: true }, ...change.model },
-      ),
-    },
-  };
-}
-
 function claimTarget() {
   return {
     poolMemberId: "member",
@@ -1725,8 +1114,3 @@ it("keeps unrecognized gateway cache/cost metadata conservative without changing
     categoriesComplete: false,
   });
 });
-
-/** The provider account row the send claim re-reads for the D9 policy. */
-function claimPrivacyAccount() {
-  return { providerType: "openai", allowDataCollection: false };
-}

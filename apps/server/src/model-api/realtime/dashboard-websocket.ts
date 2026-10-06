@@ -17,13 +17,13 @@ import {
 /**
  * `GET /api/internal/chat-test/realtime?intent=transcription[&model=…]`: the
  * Chat Test microphone panel's live transcription socket, signed in with the
- * dashboard session cookie instead of a model API token (chunk 10).
+ * dashboard session cookie instead of an API key (chunk 10).
  *
  * Everything after the upgrade is the `/v1/realtime` session: the same
  * events, caps, admission, locked send claim, routing, registry rechecks and
  * metering. Only the login and the requester differ, and the requester is the
  * HTTP Chat Test's: the session user, every model they can see, no token,
- * source `CHAT_TEST`, and `chat-test:<userId>` as the per-credential cap key.
+ * source `TEST`, and `chat-test:<userId>` as the per-credential cap key.
  *
  * Mounted behind the `/api/internal/chat-test/*` session middleware and RPC
  * limiter. Upgrade checks, in order: an upgrade request (426), not draining

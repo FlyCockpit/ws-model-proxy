@@ -14,24 +14,22 @@ const requester = { tokenId: "token-1", userId: "grantee" };
 
 function candidate(route: Partial<NonNullable<Candidate["route"]>> = {}): Candidate {
   return {
-    cliDeviceId: "cli-1",
-    endpointSlug: "inst-aaaaaaaaaaaaaaaa",
+    nodeId: "node-1",
+    handle: "i-aaaaaaaaaaaa",
     upstreamModel: "whisper-large",
     capabilities: null,
-    deploymentManaged: true,
     memberId: "m1",
     route: {
       kind: "pool",
       poolId: "pool-1",
       poolMemberId: "m1",
-      discoveredModelId: "dm-1",
-      endpointId: "ep-1",
+      runtimeModelId: "rm-1",
       executionTargetId: "et-1",
-      capacityId: "cap-1",
+      instanceId: "inst-1",
       ownerUserId: "owner",
       engineOwnerUserId: "contributor",
-      accessGrantId: "grant-1",
-      contributionId: "ic-1",
+      shareId: "share-1",
+      contributedShareId: "share-c",
       ...route,
     },
   };
@@ -41,32 +39,31 @@ describe("realtime send binding", () => {
   it("binds the exact pool destination as the HTTP send does", () => {
     expect(realtimeLocalSendBinding(requester, candidate())).toEqual({
       requesterUserId: "grantee",
-      modelApiTokenId: "token-1",
+      apiKeyId: "token-1",
       engineOwnerUserId: "contributor",
-      discoveredModelId: "dm-1",
+      runtimeModelId: "rm-1",
       executionTargetId: "et-1",
-      capacityId: "cap-1",
-      endpointId: "ep-1",
-      cliDeviceId: "cli-1",
-      endpointSlug: "inst-aaaaaaaaaaaaaaaa",
+      capacityId: "inst-1",
+      nodeId: "node-1",
+      handle: "i-aaaaaaaaaaaa",
       upstreamModelId: "whisper-large",
       pool: {
         id: "pool-1",
         ownerUserId: "owner",
-        accessGrantId: "grant-1",
+        shareId: "share-1",
         memberId: "m1",
-        contributionId: "ic-1",
+        contributedShareId: "share-c",
       },
     });
   });
 
-  it("binds a direct model without a pool, and refuses a target without capacity identity", () => {
-    const direct = realtimeLocalSendBinding(
+  it("binds a test target without a pool, and refuses a target without capacity identity", () => {
+    const test = realtimeLocalSendBinding(
       requester,
-      candidate({ kind: "direct", poolId: null, poolMemberId: null, accessGrantId: null }),
+      candidate({ kind: "test", poolId: null, poolMemberId: null, shareId: null }),
     );
-    expect(direct).not.toHaveProperty("pool");
-    expect(realtimeLocalSendBinding(requester, candidate({ capacityId: null }))).toBeNull();
+    expect(test).not.toHaveProperty("pool");
+    expect(realtimeLocalSendBinding(requester, candidate({ instanceId: "" }))).toBeNull();
     expect(realtimeLocalSendBinding(requester, { ...candidate(), route: undefined })).toBeNull();
   });
 });
@@ -113,7 +110,7 @@ describe("realtime send claim", () => {
     const open = vi.fn();
     const claim = vi.fn();
     const authorize = createRealtimeAuthorizer(requester, claim);
-    expect(await authorize(candidate({ executionTargetId: null }), open, vi.fn())).toEqual({
+    expect(await authorize(candidate({ executionTargetId: "" }), open, vi.fn())).toEqual({
       ok: false,
       denial: "member",
     });

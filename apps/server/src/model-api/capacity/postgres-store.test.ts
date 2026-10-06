@@ -180,11 +180,12 @@ describe("capacity lease release", () => {
       poolId: null,
       poolMemberId: null,
       candidateOrder: 0,
-      effectivePriority: 16,
+      effectivePriority: 1,
       effectiveConcurrencyLimit: null,
       effectiveConcurrencyScope: "DIRECT_TARGET",
       effectiveConcurrencyScopeId: "target",
-      effectiveBorrowPolicy: "WHEN_IDLE",
+      effectivePoolConcurrencyLimit: null,
+      effectiveBorrowReserved: true,
       AdmissionRequest: {
         requestId: "request",
         attemptId: "attempt-1",
@@ -228,10 +229,15 @@ describe("capacity lease release", () => {
       },
       // The capacity's policy is a graph row read without a lock; its
       // scheduler state lives in capacity_runtime (writer class H).
-      inferenceCapacity: {
-        findUnique: vi.fn().mockResolvedValue({ userId: "user", hardConcurrencyLimit: 2 }),
+      runtimeInstance: {
+        findUnique: vi.fn().mockResolvedValue({
+          id: "capacity",
+          userId: "user",
+          engineSlots: null,
+          Version: { concurrencyLimit: 2, engine: "VLLM" },
+        }),
       },
-      capacityRuntime: {
+      capacityScheduler: {
         findUniqueOrThrow: vi.fn().mockResolvedValue({
           capacityId: "capacity",
           schedulerCursor: 16,
@@ -249,7 +255,11 @@ describe("capacity lease release", () => {
         findMany: vi.fn(async (args: { where: { id?: unknown } }) =>
           args.where.id ? [{ id: "target" }] : [],
         ),
-        findUnique: vi.fn().mockResolvedValue({ inferenceCapacityId: "capacity" }),
+        findUnique: vi.fn().mockResolvedValue({
+          id: "target",
+          instanceId: "capacity",
+          runtimeModelId: null,
+        }),
       },
       admissionRequest: {
         updateMany: vi.fn().mockResolvedValue({ count: 1 }),
@@ -338,7 +348,7 @@ describe("capacity lease release", () => {
     expect(tx.capacityLease.updateMany).toHaveBeenCalledTimes(2);
     // New work stays fenced: the queued waiter was not admitted.
     expect(leaseInserts(tx)).toHaveLength(0);
-    expect(tx.capacityRuntime.update).not.toHaveBeenCalled();
+    expect(tx.capacityScheduler.update).not.toHaveBeenCalled();
   });
 
   it("fills the queued waiter on a retried release when the fence is not armed", async () => {
@@ -358,18 +368,18 @@ describe("capacity lease release", () => {
       ["08:capacity:capacity"],
     ]);
     for (const call of tx.$queryRaw.mock.calls)
-      expect(sqlOf(call)).not.toMatch(/FROM inference_capacity/);
-    // Scheduler state and the fencing token come from capacity_runtime,
+      expect(sqlOf(call)).not.toMatch(/FROM runtime_instance/);
+    // Scheduler state and the fencing token come from capacity_scheduler,
     // created lazily before it is read.
     expect(
       tx.$executeRaw.mock.calls.some((call) =>
-        sqlOf(call).includes("INSERT INTO capacity_runtime"),
+        sqlOf(call).includes("INSERT INTO capacity_scheduler"),
       ),
     ).toBe(true);
-    expect(tx.capacityRuntime.findUniqueOrThrow).toHaveBeenCalledWith({
+    expect(tx.capacityScheduler.findUniqueOrThrow).toHaveBeenCalledWith({
       where: { capacityId: "capacity" },
     });
-    expect(tx.capacityRuntime.update).toHaveBeenCalledWith({
+    expect(tx.capacityScheduler.update).toHaveBeenCalledWith({
       where: { capacityId: "capacity" },
       data: expect.objectContaining({ nextFencingToken: { increment: 1 } }),
     });
@@ -394,18 +404,11 @@ describe("capacity lease release", () => {
     expect(insertSql).toMatch(/"heartbeatAt", "expiresAt"\)/);
     // The waiter's graph was checked (batched, one read) before it was planned.
     expect(tx.executionTarget.findMany).toHaveBeenCalledWith({
-      where: { id: { in: ["target"] }, inferenceCapacityId: "capacity" },
-      select: { id: true },
+      where: { id: { in: ["target"] }, instanceId: "capacity" },
+      select: { id: true, runtimeModelId: true },
     });
-    // The released attempt's relay row is projected once, after the commit.
-    expect(relayRequest.updateMany).toHaveBeenCalledTimes(1);
-    expect(relayRequest.updateMany).toHaveBeenCalledWith({
-      where: { id: "relay-1", admissionAttemptId: "attempt" },
-      data: { admissionTerminalState: "TERMINAL" },
-    });
-    expect(relayRequest.updateMany.mock.invocationCallOrder[0]).toBeGreaterThan(
-      Math.max(...tx.$executeRaw.mock.invocationCallOrder),
-    );
+    // 0.4.0 has no relay-row admission projection: nothing is written to relay_request.
+    expect(relayRequest.updateMany).not.toHaveBeenCalled();
   });
 
   it("batches the lease INSERT by ADMISSION_ROW_BATCH_SIZE and persists every winner", async () => {
@@ -416,9 +419,11 @@ describe("capacity lease release", () => {
     const winners = ADMISSION_ROW_BATCH_SIZE * 2 + 200;
     const { tx, store, lease } = releaseFixture(winners);
     // The fixture's scheduler state must leave room for every winner.
-    tx.inferenceCapacity.findUnique.mockResolvedValue({
+    tx.runtimeInstance.findUnique.mockResolvedValue({
+      id: "capacity",
       userId: "user",
-      hardConcurrencyLimit: null,
+      engineSlots: 1_000_000,
+      Version: { concurrencyLimit: null, engine: "VLLM" },
     });
     await expect(store.release(lease)).resolves.toBe(true);
     const rowCounts = leaseInsertRowCounts(tx);
@@ -435,7 +440,7 @@ describe("capacity lease release", () => {
       Array.from({ length: winners }, (_, index) => `request-${index + 1}`).sort(),
     );
     // The fencing counter advances by the whole plan, not per batch.
-    expect(tx.capacityRuntime.update).toHaveBeenCalledWith(
+    expect(tx.capacityScheduler.update).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ nextFencingToken: { increment: winners } }),
       }),
@@ -473,7 +478,7 @@ describe("capacity lease release", () => {
     });
     await expect(store.release(lease)).resolves.toBe(true);
     expect(leaseInserts(tx)).toHaveLength(0);
-    expect(tx.capacityRuntime.update).not.toHaveBeenCalled();
+    expect(tx.capacityScheduler.update).not.toHaveBeenCalled();
     expect(tx.capacityWaiter.updateMany).toHaveBeenCalledWith({
       where: { id: "waiter-1", state: "WAITING" },
       data: expect.objectContaining({ state: "CANCELLED", terminalReason: "parent_deleted" }),
@@ -482,17 +487,8 @@ describe("capacity lease release", () => {
       where: { id: "request-1" },
       data: expect.objectContaining({ state: "CANCELLED", terminalReason: "parent_deleted" }),
     });
-    // Only the committed attempt's projections are written.
-    expect(relayRequest.updateMany.mock.calls.map(([args]) => args)).toEqual([
-      {
-        where: { id: "relay-1", admissionAttemptId: "attempt" },
-        data: { admissionTerminalState: "TERMINAL" },
-      },
-      {
-        where: { id: "relay-2", admissionAttemptId: "attempt-1" },
-        data: { admissionTerminalState: "CANCELLED" },
-      },
-    ]);
+    // 0.4.0 has no relay-row admission projection: nothing is written to relay_request.
+    expect(relayRequest.updateMany).not.toHaveBeenCalled();
   });
 });
 
@@ -691,8 +687,8 @@ it("preserves a lease renewed between idempotent acquire's expiry read and UPDAT
       requestId: "request",
       attemptId: "attempt",
       ownerId: "owner",
-      sourceKind: "DIRECT",
-      basePriority: 16,
+      sourceKind: "TEST",
+      basePriority: 1,
       connectionOwner: "test",
       deadlineAt: now,
       candidates: [],

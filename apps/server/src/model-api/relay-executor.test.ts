@@ -65,8 +65,8 @@ function harness(abortSignal?: AbortSignal) {
   };
   const attempt = startRelayAttempt({
     manager,
-    cliDeviceId: "cli-1",
-    endpointSlug: "neutral-upstream",
+    nodeId: "cli-1",
+    handle: "neutral-upstream",
     family: "audio",
     method: "POST",
     path: "/v1/audio/transcriptions",
@@ -92,8 +92,8 @@ describe("relay response backpressure", () => {
     };
     const attempt = startRelayAttempt({
       manager,
-      cliDeviceId: "cli-1",
-      endpointSlug: "neutral-upstream",
+      nodeId: "cli-1",
+      handle: "neutral-upstream",
       family: "audio",
       method: "POST",
       path: "/v1/audio/transcriptions",
@@ -116,7 +116,7 @@ describe("relay response backpressure", () => {
       type: "relay.response.headers",
       requestId: attempt.requestId,
       status: 200,
-      headers: { "content-type": "text/event-stream" },
+      headers: [["content-type", "text/event-stream"]],
     });
     const { body } = await attempt.started;
     const chunk = new Uint8Array(1024 * 1024);
@@ -136,7 +136,7 @@ describe("relay response backpressure", () => {
     await expect(attempt.terminal).resolves.toMatchObject({ ok: false, failure: "cancelled" });
     await expect(body.getReader().read()).rejects.toThrow("buffer limit");
     expect(manager.cancelRelayRequest).toHaveBeenCalledWith({
-      cliDeviceId: "cli-1",
+      nodeId: "cli-1",
       requestId: attempt.requestId,
       reason: "cancelled",
     });
@@ -148,7 +148,7 @@ describe("relay response backpressure", () => {
       type: "relay.response.headers",
       requestId: attempt.requestId,
       status: 200,
-      headers: {},
+      headers: [],
     });
     const { body } = await attempt.started;
     const reader = body.getReader();
@@ -180,8 +180,8 @@ describe("G1 — an ALREADY-aborted signal starts nothing (synchronous entry che
     controller.abort();
     const attempt = startRelayAttempt({
       manager,
-      cliDeviceId: "cli-1",
-      endpointSlug: "neutral-upstream",
+      nodeId: "cli-1",
+      handle: "neutral-upstream",
       family: "chat.completions",
       method: "POST",
       path: "/v1/chat/completions",
@@ -224,7 +224,7 @@ describe("capacity lease loss is not a client cancellation", () => {
     });
     // The wire protocol has no lease-loss reason; the CLI is told to stop.
     expect(manager.cancelRelayRequest).toHaveBeenCalledWith({
-      cliDeviceId: "cli-1",
+      nodeId: "cli-1",
       requestId: attempt.requestId,
       reason: "cancelled",
     });
@@ -237,7 +237,7 @@ describe("capacity lease loss is not a client cancellation", () => {
       type: "relay.response.headers",
       requestId: attempt.requestId,
       status: 200,
-      headers: { "content-type": "text/event-stream" },
+      headers: [["content-type", "text/event-stream"]],
     });
     const { body } = await attempt.started;
     lease.abort(new CapacityLeaseLostError("heartbeat_timeout"));
@@ -267,8 +267,8 @@ describe("capacity lease loss is not a client cancellation", () => {
     lease.abort(new CapacityLeaseLostError("ownership_lost"));
     const attempt = startRelayAttempt({
       manager,
-      cliDeviceId: "cli-1",
-      endpointSlug: "neutral-upstream",
+      nodeId: "cli-1",
+      handle: "neutral-upstream",
       family: "chat.completions",
       method: "POST",
       path: "/v1/chat/completions",
