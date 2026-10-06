@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { ORPCError } from "@orpc/server";
 import prisma from "@ws-model-proxy/db";
-import { contractProcedure, type SignedInContext, stub } from "../contract-procedure";
+import { contractProcedure, type SignedInContext } from "../contract-procedure";
 import { agentRulesApply } from "../contracts/auth-context";
 import { runtimesContract as c, runtimeSlugSchema } from "../contracts/runtimes";
 import { callerActor } from "../lib/caller-actor";
@@ -49,6 +49,7 @@ import {
 } from "../lib/runtime-views";
 import { normalizeBaseUrl, parseDetectedServers } from "../nodes/views";
 import { runtimeStart, runtimeStop } from "./runtime-lifecycle";
+import { runtimeSteps } from "./runtime-steps";
 
 function userIdOf(context: SignedInContext): string {
   return context.session.user.id;
@@ -697,13 +698,7 @@ export const runtimesRouter = {
   start: runtimeStart,
   stop: runtimeStop,
 
-  // TODO(server): operator terminals (attach tickets), step re-runs and Forget belong to the
-  // server's lifecycle engine; they stay NOT_IMPLEMENTED until it exposes a hook.
-  steps: {
-    attach: stub(c.steps.attach),
-    reopen: stub(c.steps.reopen),
-    cancel: stub(c.steps.cancel),
-  },
+  steps: runtimeSteps,
   instances: {
     /**
      * A person gives up proving a stop (node gone or unable to prove it): the rank's claim
@@ -770,7 +765,7 @@ export const runtimesRouter = {
               state: "PENDING",
               attempts: 0,
             },
-            data: { state: "CANCELLED" },
+            data: { state: "CANCELLED", operatorHold: null },
           });
           // The engine recomputes the instance's need (and settles it) on its next pass.
           return operation.id;

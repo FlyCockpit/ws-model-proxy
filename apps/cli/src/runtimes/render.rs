@@ -168,14 +168,10 @@ pub fn render(
         .get(usize::from(job.rank))
         .or_else(|| (launch.commands.len() == 1).then(|| &launch.commands[0]))
         .ok_or_else(|| refuse(JobError::BadJob, "rank"))?;
-    if phase_interactive(commands, job.phase)
-        || (job.phase == JobPhase::Stop && phase_interactive(commands, JobPhase::Stop))
-        || job.operator.is_some()
-    {
-        return Err(Refusal {
-            error: JobError::InteractiveUnsupported,
-            detail: None,
-        });
+    // An interactive phase runs only in the operator terminal the server
+    // minted for it, and only an interactive phase gets one.
+    if phase_interactive(commands, job.phase) != job.operator.is_some() {
+        return Err(refuse(JobError::BadJob, "operator"));
     }
     let values = typed_values(job, launch, store, facts)?;
     let render_one = |text: &str, field: &str| -> Result<String, Refusal> {

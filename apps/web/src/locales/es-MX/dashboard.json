@@ -1122,6 +1122,7 @@
         "unhealthyRestartMs": "Reiniciar tras fallar durante",
         "unavailableStopMs": "Detener los demás nodos si uno está desconectado durante"
       }
-    }
+    },
+    "answerInTerminals": "Respóndelo en la página Terminales"
   }
 }

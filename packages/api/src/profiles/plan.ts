@@ -15,10 +15,6 @@ import type { refusalSchema } from "../contracts/refusals";
 import type { previewWarningSchema, startPreviewSchema } from "../contracts/runtimes";
 import { compareCodePoints } from "../lib/canonical-json";
 import {
-  INTERACTIVE_STEPS_SUPPORTED,
-  INTERACTIVE_UNSUPPORTED_MESSAGE,
-} from "../lib/interactive-steps";
-import {
   type PlacementFabric,
   type PlacementFrozenFabric,
   type PlacementGpu,
@@ -304,12 +300,6 @@ export function profilePlan(input: PlanInput): ProfilePlan {
     if (
       launch.commands.some((commands) => Object.values(commands.interactive ?? {}).some(Boolean))
     ) {
-      if (!INTERACTIVE_STEPS_SUPPORTED) {
-        refusals.push(
-          refusal("interactive_needs_person", item.runtimeId, INTERACTIVE_UNSUPPORTED_MESSAGE),
-        );
-        continue;
-      }
       warnings.push({
         code: "interactive_needs_person",
         nodeId: null,

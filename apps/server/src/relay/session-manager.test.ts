@@ -99,7 +99,7 @@ function challenge(socket: FakeSocket): string {
 
 function hello(
   socket: FakeSocket,
-  overrides: { trust?: "full" | "relay"; signature?: string } = {},
+  overrides: { trust?: "full" | "relay"; signature?: string; operatorTerminals?: boolean } = {},
 ) {
   const trust = overrides.trust ?? "full";
   return JSON.stringify({
@@ -116,7 +116,7 @@ function hello(
     trust: { value: trust, frozen: trust === "relay" },
     features: {
       terminals: { supported: true, max: 4, approvalRequired: false },
-      operatorTerminals: false,
+      operatorTerminals: overrides.operatorTerminals ?? false,
       files: { roots: ["/home/me"], asRoot: false },
       runtimeHosts: [],
       mediaExpand: false,
@@ -358,7 +358,11 @@ describe("RelaySessionManager (relay 3.0)", () => {
   it("pins lane sends to the live session and its Full control", async () => {
     await connect();
     const session = manager.nodeSession("node-1");
-    expect(session).toEqual({ connectionGeneration: generation, trust: "full" });
+    expect(session).toEqual({
+      connectionGeneration: generation,
+      trust: "full",
+      operatorTerminals: false,
+    });
     const frame = { type: "runtime.detect" as const, id: "d2" };
     expect(manager.sendToNode("node-1", frame, { connectionGeneration: generation + 1 })).toBe(
       false,
@@ -497,5 +501,172 @@ describe("RelaySessionManager (relay 3.0)", () => {
         connId: "conn-1",
       }),
     ).toBe(false);
+  });
+
+  describe("operator terminals (interactive steps)", () => {
+    const terminalId = Buffer.alloc(16, 5).toString("base64url");
+    const step = {
+      stepId: "step-1",
+      instanceId: "inst-1",
+      rank: 0,
+      intentHash: "a".repeat(64),
+      ownerEpoch: "e1:1",
+    };
+    const job = (id = terminalId) => ({
+      type: "runtime.job" as const,
+      ...step,
+      runtimeId: "rt-1",
+      launchVersionId: "v-1",
+      launchHash: "b".repeat(64),
+      generation: 1,
+      nnodes: 1,
+      phase: "start" as const,
+      handle: "i-abcdefabcdef",
+      unitName: "wsmp-i-abcdefabcdef-r0",
+      placeholders: { port: 30_000 },
+      timeoutMs: 60_000,
+      operator: { terminalId: id, commandAuthor: "user" as const },
+    });
+    const result = (
+      status: "awaiting_operator" | "operator_running" | "operator_closed" | "succeeded",
+      extra: Record<string, unknown> = {},
+    ) =>
+      JSON.stringify({
+        type: "runtime.job.result",
+        ...step,
+        status,
+        stopped: false,
+        terminalId,
+        ...extra,
+      });
+    const attach = {
+      terminalId,
+      stepId: "step-1",
+      userId: "user-1",
+      connId: "conn-1",
+      browserPublicKey: TERMINAL_KEY,
+      browserNonce: Buffer.alloc(16, 2).toString("base64url"),
+    };
+
+    it("never sends an interactive job to a node without operator terminals", async () => {
+      await connect();
+      expect(manager.nodeSession("node-1")?.operatorTerminals).toBe(false);
+      expect(manager.sendToNode("node-1", job())).toBe(false);
+    });
+
+    it("tracks the step's terminal and attaches people by step, also at Relay only", async () => {
+      const socket = await connect({ trust: "relay", operatorTerminals: true });
+      const handler = vi.fn();
+      manager.setNodeFrameHandlers({ "runtime.job.result": handler });
+      expect(manager.nodeSession("node-1")?.operatorTerminals).toBe(true);
+      expect(manager.sendToNode("node-1", job())).toBe(true);
+      expect(socket.last("runtime.job")).toMatchObject({ operator: { terminalId } });
+      // Not attachable before the node shows its screen.
+      expect(manager.operatorStepTerminal("step-1", "user-1")).toBeNull();
+      expect(manager.attachOperatorTerminal(attach)).toEqual({ ok: false, error: "not_found" });
+
+      await manager.handleTextFrame(socket, result("awaiting_operator"));
+      expect(handler).toHaveBeenCalledTimes(1);
+      expect(manager.operatorStepTerminal("step-1", "user-1")).toEqual({
+        nodeId: "node-1",
+        terminalId,
+        state: "awaiting",
+      });
+      expect(manager.operatorStepTerminal("step-1", "user-2")).toBeNull();
+      // Never a browser shell: not listed, not counted, not attachable without its step.
+      expect(manager.listTerminalsForUser("user-1")).toEqual([]);
+      expect(manager.terminalCounts("user-1", "node-1")).toEqual({ user: 0, node: 0 });
+      expect(
+        manager.attachTerminal({
+          terminalId,
+          userId: "user-1",
+          connId: "conn-1",
+          browserPublicKey: TERMINAL_KEY,
+          browserNonce: attach.browserNonce,
+        }),
+      ).toEqual({ ok: false, error: "not_found" });
+      expect(manager.closeTerminalFromBrowser(terminalId, "user-1")).toBe(false);
+      expect(manager.attachOperatorTerminal({ ...attach, stepId: "step-2" })).toEqual({
+        ok: false,
+        error: "not_found",
+      });
+      const attached = manager.attachOperatorTerminal(attach);
+      expect(attached.ok).toBe(true);
+      expect(socket.last("term.attach")).toMatchObject({ terminalId });
+
+      // A person pressed Enter: the run is never cut off.
+      await manager.handleTextFrame(socket, result("operator_running"));
+      expect(manager.closeOperatorStep("step-1", { keepRunning: true })).toBe("running");
+      await manager.handleTextFrame(socket, result("operator_closed", { exitCode: 1 }));
+      expect(handler).toHaveBeenCalledTimes(3);
+      expect(manager.operatorStepTerminal("step-1", "user-1")).toBeNull();
+      expect(manager.hasTerminal(terminalId)).toBe(false);
+    });
+
+    it("drops progress for a terminal it did not send, and closes it on the node", async () => {
+      const socket = await connect({ operatorTerminals: true });
+      const handler = vi.fn();
+      manager.setNodeFrameHandlers({ "runtime.job.result": handler });
+      const stray = Buffer.alloc(16, 6).toString("base64url");
+      await manager.handleTextFrame(socket, result("awaiting_operator", { terminalId: stray }));
+      expect(handler).not.toHaveBeenCalled();
+      expect(socket.last("term.close")).toEqual({ type: "term.close", terminalId: stray });
+      // A final always goes on (the engine checks the stored terminal id).
+      await manager.handleTextFrame(socket, result("succeeded", { terminalId: stray }));
+      expect(handler).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps operator terminals when trust lowers; a server close ends them", async () => {
+      const socket = await connect({ operatorTerminals: true });
+      const handler = vi.fn();
+      manager.setNodeFrameHandlers({ "runtime.job.result": handler });
+      expect(manager.sendToNode("node-1", job())).toBe(true);
+      await manager.handleTextFrame(socket, result("awaiting_operator"));
+      manager.requestTrustLower("node-1", new Date());
+      expect(manager.operatorStepTerminal("step-1", "user-1")).not.toBeNull();
+      // Ids are never reused, and one step has one terminal.
+      expect(manager.sendToNode("node-1", { ...job(), stepId: "step-9" })).toBe(false);
+
+      expect(manager.closeOperatorStep("step-1", { keepRunning: true })).toBe("closed");
+      expect(socket.last("term.close")).toEqual({ type: "term.close", terminalId });
+      expect(manager.operatorStepTerminal("step-1", "user-1")).toBeNull();
+      expect(manager.closeOperatorStep("step-1")).toBe("absent");
+      // The node's answer to the close still reaches the engine; a late screen does not.
+      await manager.handleTextFrame(socket, result("awaiting_operator"));
+      expect(handler).toHaveBeenCalledTimes(1);
+      await manager.handleTextFrame(socket, result("operator_closed"));
+      expect(handler).toHaveBeenCalledTimes(2);
+    });
+
+    it("closes a replaced terminal on the node, and terminals no step owns", async () => {
+      const socket = await connect({ operatorTerminals: true });
+      expect(manager.sendToNode("node-1", job())).toBe(true);
+      await manager.handleTextFrame(socket, result("awaiting_operator"));
+      // The step's next dispatch names a fresh terminal: the old one is closed on the node.
+      const fresh = Buffer.alloc(16, 7).toString("base64url");
+      expect(manager.sendToNode("node-1", job(fresh))).toBe(true);
+      expect(socket.json().filter((frame) => frame.type === "term.close")).toEqual([
+        { type: "term.close", terminalId },
+      ]);
+      // A live terminal id is never sent for another step.
+      expect(manager.sendToNode("node-1", { ...job(fresh), stepId: "step-2" })).toBe(false);
+      // The engine dropped an answer naming the fresh terminal: it is closed too.
+      manager.closeOperatorTerminal("node-1", fresh);
+      expect(socket.last("term.close")).toEqual({ type: "term.close", terminalId: fresh });
+      expect(manager.operatorStepTerminal("step-1", "user-1")).toBeNull();
+      // One nothing tracks is closed on the node directly.
+      const stray = Buffer.alloc(16, 8).toString("base64url");
+      manager.closeOperatorTerminal("node-1", stray);
+      expect(socket.last("term.close")).toEqual({ type: "term.close", terminalId: stray });
+    });
+
+    it("closes the user's operator terminals on a ban", async () => {
+      const socket = await connect({ operatorTerminals: true });
+      expect(manager.sendToNode("node-1", job())).toBe(true);
+      await manager.handleTextFrame(socket, result("awaiting_operator"));
+      manager.cancelOperatorTerminalsForUser("user-1");
+      expect(socket.last("term.close")).toEqual({ type: "term.close", terminalId });
+      expect(manager.operatorStepTerminal("step-1", "user-1")).toBeNull();
+    });
   });
 });

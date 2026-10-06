@@ -29,10 +29,37 @@ describe("terminal tickets", () => {
     const { tickets } = store();
     const minted = tickets.mint({ ...owner, nodeId: "node-1" });
     expect(tickets.redeem({ ...owner, ticket: minted.ticket })).toEqual({
+      kind: "open",
       nodeId: "node-1",
       terminalId: minted.terminalId,
     });
     expect(tickets.redeem({ ...owner, ticket: minted.ticket })).toBeNull();
+  });
+
+  it("binds an attach ticket to its step and that step's operator terminal", () => {
+    const { tickets } = store();
+    const terminalId = Buffer.alloc(16, 7).toString("base64url");
+    const minted = tickets.mint({
+      ...owner,
+      nodeId: "node-1",
+      attach: { stepId: "step-1", terminalId },
+    });
+    expect(minted.terminalId).toBe(terminalId);
+    expect(
+      tickets.redeem({ userId: owner.userId, sessionId: "session-2", ticket: minted.ticket }),
+    ).toBeNull();
+    const again = tickets.mint({
+      ...owner,
+      nodeId: "node-1",
+      attach: { stepId: "step-1", terminalId },
+    });
+    expect(tickets.redeem({ ...owner, ticket: again.ticket })).toEqual({
+      kind: "attach",
+      nodeId: "node-1",
+      terminalId,
+      stepId: "step-1",
+    });
+    expect(tickets.redeem({ ...owner, ticket: again.ticket })).toBeNull();
   });
 
   it("refuses an expired ticket", () => {

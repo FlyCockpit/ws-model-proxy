@@ -270,15 +270,33 @@ fn the_fabric_address_must_be_local() {
 }
 
 #[test]
-fn interactive_steps_are_refused_before_admission() {
-    let mut interactive = spec("serve {{port}}", 1);
+fn interactive_steps_render_only_with_their_operator_terminal() {
+    let mut interactive = spec("sudo systemctl start x --port {{port}}", 1);
     interactive["launch"]["management"] = json!("service");
     interactive["launch"]["commands"][0]["interactive"] = json!({ "start": true });
     let (store, hash) = store_with(interactive);
+    // Without the operator terminal the server minted: refused.
     let refused =
         render(&job(&hash, 0, 1), TrustValue::Full, &store, &facts("eth0")).expect_err("refused");
-    assert_eq!(refused.error, JobError::InteractiveUnsupported);
+    assert_eq!(refused.error, JobError::BadJob);
+    assert_eq!(refused.detail.as_deref(), Some("operator"));
     assert!(refused.error.is_pre_admission());
+    // With it: rendered like any other step, at Relay only from the frozen copy too.
+    let mut with_operator = job(&hash, 0, 1);
+    with_operator.operator = Some(crate::protocol::frames::JobOperator {
+        terminal_id: "AAAAAAAAAAAAAAAAAAAAAA".into(),
+        command_author: crate::protocol::frames::CommandAuthor::Agent,
+    });
+    let rendered = render(&with_operator, TrustValue::Full, &store, &facts("eth0"))
+        .expect("an interactive start renders");
+    assert_eq!(rendered.command, "sudo systemctl start x --port 30001");
+    // A non-interactive phase never takes an operator terminal.
+    let (plain, plain_hash) = store_with(spec("serve {{port}}", 1));
+    let mut stray = job(&plain_hash, 0, 1);
+    stray.operator = with_operator.operator.clone();
+    let refused = render(&stray, TrustValue::Full, &plain, &facts("eth0")).expect_err("refused");
+    assert_eq!(refused.error, JobError::BadJob);
+    assert_eq!(refused.detail.as_deref(), Some("operator"));
 }
 
 #[test]

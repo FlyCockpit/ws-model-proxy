@@ -62,6 +62,53 @@
     "ticket_invalid": "This terminal link expired or was already used. Open the terminal again.",
     "declined": "The terminal was declined on the node.",
     "bad_handshake": "The secure handshake with the node failed.",
-    "other": "The terminal was refused ({{reason}})."
+    "other": "The terminal was refused ({{reason}}).",
+    "step_detached": "This terminal was disconnected. Open it again from Steps waiting for you."
+  },
+  "steps": {
+    "title": "Steps waiting for you",
+    "description": "A runtime step that needs a person (for example a sudo password) runs in its own terminal on the node, also on Relay-only nodes. Check the command and who wrote it before you run it.",
+    "empty": "No step waits for you.",
+    "loadFailed": "Could not load the steps waiting for you.",
+    "attach": "Open terminal",
+    "reopen": "Run again",
+    "cancel": "Cancel step",
+    "reopened": "The step runs again in a fresh terminal.",
+    "cancelled": "Step cancelled.",
+    "since": "Asked",
+    "passwordNote": "What you type in this terminal, a sudo password included, passes through this server and the page it serves. Press Enter in the terminal to run the command, or q to close it without running.",
+    "waiting": "Its terminal is open and waits for you.",
+    "running": "The command is running in its terminal.",
+    "closed": "The terminal closed without success. Run it again, or cancel the step.",
+    "queued": "Its terminal is opening on the node.",
+    "done": "This step is finished.",
+    "phase": {
+      "PREPARE": "Prepare",
+      "START": "Start",
+      "AFTER_JOIN": "After join",
+      "STOP": "Stop",
+      "STATUS": "Status",
+      "HEALTH": "Health",
+      "READINESS": "Readiness"
+    },
+    "author": {
+      "user": "Written by you",
+      "agent": "Written by an agent",
+      "unknown": "Author unknown"
+    },
+    "hold": {
+      "operator_capability_missing": "The node cannot open operator terminals right now (offline, or wsmp needs an update).",
+      "operator_session_full": "The node holds too many terminals; this one opens when one ends.",
+      "operator_node_full": "Four steps already wait on this node; this one opens when one of them ends.",
+      "operator_terminals_disabled": "The node could not open the terminal. Run it again once the node can."
+    },
+    "refusal": {
+      "not_interactive": "This step does not run in a terminal.",
+      "not_waiting": "This step no longer waits for you.",
+      "running": "The command is already running in its terminal; it finishes there.",
+      "superseded": "The runtime stopped or restarted since; this step no longer runs.",
+      "terminal_closed": "The terminal closed. Run the step again to get a new one.",
+      "terminal_unavailable": "The terminal is not open on the node yet, or the node is offline. Try again shortly."
+    }
   }
 }

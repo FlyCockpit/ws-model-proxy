@@ -62,6 +62,53 @@
     "ticket_invalid": "Este enlace de terminal venció o ya se usó. Vuelve a abrir la terminal.",
     "declined": "La terminal fue rechazada en el nodo.",
     "bad_handshake": "Falló el intercambio seguro con el nodo.",
-    "other": "La terminal fue rechazada ({{reason}})."
+    "other": "La terminal fue rechazada ({{reason}}).",
+    "step_detached": "Esta terminal se desconectó. Ábrela de nuevo desde Pasos que te esperan."
+  },
+  "steps": {
+    "title": "Pasos que te esperan",
+    "description": "Un paso de un runtime que necesita a una persona (por ejemplo, una contraseña de sudo) se ejecuta en su propia terminal en el nodo, también en nodos de solo retransmisión. Revisa el comando y quién lo escribió antes de ejecutarlo.",
+    "empty": "Ningún paso te espera.",
+    "loadFailed": "No se pudieron cargar los pasos que te esperan.",
+    "attach": "Abrir terminal",
+    "reopen": "Ejecutar de nuevo",
+    "cancel": "Cancelar paso",
+    "reopened": "El paso se ejecuta de nuevo en una terminal nueva.",
+    "cancelled": "Paso cancelado.",
+    "since": "Solicitado",
+    "passwordNote": "Lo que escribas en esta terminal, incluida una contraseña de sudo, pasa por este servidor y por la página que sirve. Presiona Enter en la terminal para ejecutar el comando, o q para cerrarla sin ejecutarlo.",
+    "waiting": "Su terminal está abierta y te espera.",
+    "running": "El comando se está ejecutando en su terminal.",
+    "closed": "La terminal se cerró sin éxito. Ejecútalo de nuevo o cancela el paso.",
+    "queued": "Su terminal se está abriendo en el nodo.",
+    "done": "Este paso terminó.",
+    "phase": {
+      "PREPARE": "Preparar",
+      "START": "Iniciar",
+      "AFTER_JOIN": "Después de unirse",
+      "STOP": "Detener",
+      "STATUS": "Estado",
+      "HEALTH": "Salud",
+      "READINESS": "Disponibilidad"
+    },
+    "author": {
+      "user": "Escrito por ti",
+      "agent": "Escrito por un agente",
+      "unknown": "Autor desconocido"
+    },
+    "hold": {
+      "operator_capability_missing": "El nodo no puede abrir terminales de operador ahora (sin conexión, o wsmp necesita actualizarse).",
+      "operator_session_full": "El nodo tiene demasiadas terminales; esta se abre cuando termine una.",
+      "operator_node_full": "Ya hay cuatro pasos esperando en este nodo; este se abre cuando termine uno de ellos.",
+      "operator_terminals_disabled": "El nodo no pudo abrir la terminal. Ejecútalo de nuevo cuando el nodo pueda."
+    },
+    "refusal": {
+      "not_interactive": "Este paso no se ejecuta en una terminal.",
+      "not_waiting": "Este paso ya no te espera.",
+      "running": "El comando ya se está ejecutando en su terminal; termina ahí.",
+      "superseded": "El runtime se detuvo o reinició desde entonces; este paso ya no se ejecuta.",
+      "terminal_closed": "La terminal se cerró. Ejecuta el paso de nuevo para obtener una nueva.",
+      "terminal_unavailable": "La terminal aún no está abierta en el nodo, o el nodo está sin conexión. Inténtalo de nuevo en un momento."
+    }
   }
 }

@@ -152,9 +152,9 @@ impl TerminalStartup {
                 max: u8::try_from(self.max_terminals).unwrap_or(u8::MAX),
                 approval_required: self.require_terminal_approval,
             },
-            // Interactive runtime steps are not run by this node yet: the
-            // server places no interactive definition here.
-            operator_terminals: false,
+            // Interactive runtime steps run in operator terminals wherever a
+            // PTY can be offered, at every trust level (spec §4.7).
+            operator_terminals: crate::protocol::terminal_supported(),
             files: FileFeatures {
                 roots: self.file_roots_configured.then(|| {
                     self.file_roots
@@ -234,7 +234,8 @@ mod tests {
             Some(vec![dir.path().display().to_string()])
         );
         assert!(features.files.as_root);
-        assert!(!features.operator_terminals);
+        // Operator terminals need only a PTY: no switch, any trust level.
+        assert_eq!(features.operator_terminals, cfg!(unix));
         assert!(startup.full_control());
         assert_eq!(
             startup.trust(),

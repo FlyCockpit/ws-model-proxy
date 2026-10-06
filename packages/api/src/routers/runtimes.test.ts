@@ -472,6 +472,51 @@ describe("runtimes.start / stop: the agent trust rule and the preview echo", () 
     expect(String(created?.handle)).toMatch(/^i-[a-z0-9]{12}$/);
   });
 
+  describe("interactive steps", () => {
+    const interactive: RuntimeSpec = {
+      ...SPEC,
+      launch: {
+        ...(SPEC.launch as NonNullable<RuntimeSpec["launch"]>),
+        management: "service",
+        commands: [
+          {
+            start: "sudo systemctl start qwen",
+            stop: "sudo systemctl stop qwen",
+            status: "systemctl is-active qwen",
+            interactive: { start: true },
+          },
+        ],
+      },
+    };
+    function setupInteractive(node: ReturnType<typeof nodeRow>) {
+      setupStart(node);
+      db.runtimeVersion.findFirst.mockResolvedValue({ id: "ver-1", spec: interactive } as never);
+    }
+
+    it("a person's preview places it and warns that a step waits for a person", async () => {
+      setupInteractive(nodeRow());
+      const preview = await client(CALLERS.person()).start({
+        runtimeId: "rt-1",
+        nodeIds: ["node-1"],
+        preview: true,
+      });
+      if (preview.mode !== "preview") throw new Error("expected a preview");
+      expect(preview.preview.refusals).toEqual([]);
+      expect(preview.preview.warnings.map((w) => w.code)).toContain("interactive_needs_person");
+    });
+
+    it("an agent starts one on a Full-control node, never on a Relay-only one", async () => {
+      setupInteractive(nodeRow());
+      expect((await client(CALLERS.fullAgent()).start({ runtimeId: "rt-1" })).mode).toBe("applied");
+      setupInteractive(nodeRow({ trust: "RELAY" }));
+      expect(
+        await reasonOf(
+          client(CALLERS.fullAgent()).start({ runtimeId: "rt-1", nodeIds: ["node-1"] }),
+        ),
+      ).toBe("trust_relay");
+    });
+  });
+
   it("a person must echo the preview fingerprint (required, then stale)", async () => {
     setupStart(nodeRow({ trust: "RELAY" }));
     expect(await reasonOf(client().start({ runtimeId: "rt-1", nodeIds: ["node-1"] }))).toBe(
@@ -996,7 +1041,7 @@ describe("runtimes.instances.forget", () => {
         state: "PENDING",
         attempts: 0,
       },
-      data: { state: "CANCELLED" },
+      data: { state: "CANCELLED", operatorHold: null },
     });
   });
 });
