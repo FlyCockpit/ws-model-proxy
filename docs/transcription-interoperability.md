@@ -147,7 +147,9 @@ Connect to `GET /v1/realtime?intent=transcription` (optionally `&model=…`)
 with a model API token, either as `Authorization: Bearer <token>` or, from a
 browser, as the subprotocol pair `realtime` and
 `openai-insecure-api-key.<token>` (the server selects only `realtime`). Keys in
-the URL are refused. Then:
+the URL are refused. (The dashboard's Chat Test microphone panel runs the same
+session through its own socket, signed in with the dashboard session and
+recorded as Chat Test usage; it needs no token.) Then:
 
 1. Receive `session.created`.
 2. Send

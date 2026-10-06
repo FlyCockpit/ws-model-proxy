@@ -88,6 +88,10 @@ import { MODEL_API_MAX_REQUEST_BODY_BYTES } from "./model-api/limits.js";
 import { openAiErrorBody } from "./model-api/openai-errors.js";
 import { createPoolMemberTestRoutes } from "./model-api/pool-member-test.js";
 import { repairExpiredProviderBudgets } from "./model-api/provider-budget.js";
+import {
+  DASHBOARD_REALTIME_PATH,
+  dashboardRealtimeRoutes,
+} from "./model-api/realtime/dashboard-websocket.js";
 import { realtimeSessionRegistry } from "./model-api/realtime/registry.js";
 import {
   createRealtimeWebsocketMiddleware,
@@ -413,12 +417,11 @@ export async function createApp(options: CreateAppOptions = {}) {
   // ride the victim's cookies. The guard only acts on mutating methods, so the
   // GET config + signed GET /media routes are unaffected. Allowed origins are the
   // app's own origin and, on a split-origin deploy, the SPA origin (CORS_ORIGIN).
-  const mediaCsrfGuard = createSameOriginGuard({
-    allowedOrigins: [
-      new URL(env.BETTER_AUTH_URL).origin,
-      ...(env.CORS_ORIGIN ? [new URL(env.CORS_ORIGIN).origin] : []),
-    ],
-  });
+  const dashboardOrigins = [
+    new URL(env.BETTER_AUTH_URL).origin,
+    ...(env.CORS_ORIGIN ? [new URL(env.CORS_ORIGIN).origin] : []),
+  ];
+  const mediaCsrfGuard = createSameOriginGuard({ allowedOrigins: dashboardOrigins });
 
   // Ephemeral media upload (session-authenticated). Mounted with its OWN body
   // limit of MEDIA_MAX_UPLOAD_BYTES and registered BEFORE the global 10 MB
@@ -862,6 +865,17 @@ export async function createApp(options: CreateAppOptions = {}) {
   // cookie-bearing non-browser callers without an Origin header are rejected.
   app.use("/api/internal/chat-test/*", mediaCsrfGuard);
   app.use("/api/internal/chat-test/*", createRateLimiterMiddleware(rpcLimiter));
+  // Chat Test live transcription (chunk 10): the `/v1/realtime` session behind
+  // the dashboard cookie, attributed as HTTP Chat Test. The CSRF guard above
+  // passes the GET upgrade; the socket's own Origin check refuses cross-site
+  // pages. Registered ahead of the Chat Test sub-app (its catch-all and its
+  // capacity request scope never see the upgrade; the session owns its lease).
+  const dashboardRealtime = dashboardRealtimeRoutes(
+    { allowedOrigins: dashboardOrigins },
+    realtimeDeps,
+  );
+  app.use(DASHBOARD_REALTIME_PATH, dashboardRealtime.middleware);
+  app.get(DASHBOARD_REALTIME_PATH, dashboardRealtime.handler);
   app.route("/api/internal/chat-test", createChatTestRoutes());
 
   app.use("/api/internal/pools/*", sessionMiddleware);

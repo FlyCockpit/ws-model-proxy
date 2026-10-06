@@ -1,5 +1,4 @@
 import { Button } from "@ws-model-proxy/ui/components/button";
-import { Input } from "@ws-model-proxy/ui/components/input";
 import { Label } from "@ws-model-proxy/ui/components/label";
 import { ResponsiveDialog } from "@ws-model-proxy/ui/components/responsive-dialog";
 import {
@@ -15,16 +14,15 @@ import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { useRealtimeTranscription } from "@/hooks/use-realtime-transcription";
-import { isModelApiToken, problemMessageKey } from "@/lib/realtime-transcription";
+import { problemMessageKey } from "@/lib/realtime-transcription";
 
 export type LiveModelOption = { modelId: string; label: string };
 
 /**
  * Chat Test → Live transcription: speak into the microphone and watch a
- * live-capable model transcribe it through the public `/v1/realtime` API, as
- * a third-party client would. The model API token is typed here, held only in
- * this dialog's state, sent as a WebSocket subprotocol (never in the URL) and
- * dropped when the dialog closes.
+ * live-capable model transcribe it through the same live session API clients
+ * use (`/v1/realtime` events). Signed in with the dashboard session, like the
+ * rest of Chat Test: no token is asked for.
  */
 export function LiveTranscriptionPanel({
   open,
@@ -40,22 +38,17 @@ export function LiveTranscriptionPanel({
   const { t } = useTranslation(["dashboard"]);
   const ids = useId();
   const { state, start, commit, reset } = useRealtimeTranscription();
-  const [token, setToken] = useState("");
   const [chosenModel, setChosenModel] = useState<string | null>(null);
   const model =
     chosenModel && models.some((option) => option.modelId === chosenModel)
       ? chosenModel
       : (models[0]?.modelId ?? null);
   const running = state.phase === "starting" || state.phase === "live";
-  const tokenValid = isModelApiToken(token);
-  const canStart = !running && model !== null && tokenValid;
+  const canStart = !running && model !== null;
 
   const handleOpenChange = (next: boolean) => {
-    if (!next) {
-      // Closing ends the session and forgets the token.
-      reset();
-      setToken("");
-    }
+    // Closing ends the session.
+    if (!next) reset();
     onOpenChange(next);
   };
 
@@ -100,26 +93,6 @@ export function LiveTranscriptionPanel({
           )}
         </div>
 
-        <div className="flex flex-col gap-2">
-          <Label htmlFor={`${ids}-token`}>{t("dashboard:chatTest.live.token")}</Label>
-          <Input
-            id={`${ids}-token`}
-            type="password"
-            autoComplete="off"
-            spellCheck={false}
-            className="min-h-[44px]"
-            value={token}
-            disabled={running}
-            onChange={(event) => setToken(event.target.value)}
-            aria-describedby={`${ids}-token-help`}
-          />
-          <p id={`${ids}-token-help`} className="text-sm text-muted-foreground">
-            {token.length > 0 && !tokenValid
-              ? t("dashboard:chatTest.live.tokenInvalid")
-              : t("dashboard:chatTest.live.tokenHelp")}
-          </p>
-        </div>
-
         <div className="flex flex-wrap gap-2">
           {running ? (
             <>
@@ -144,7 +117,7 @@ export function LiveTranscriptionPanel({
               size="touch"
               disabled={!canStart}
               onClick={() => {
-                if (model) void start({ token, model });
+                if (model) void start({ model });
               }}
             >
               <Mic className="size-4" />

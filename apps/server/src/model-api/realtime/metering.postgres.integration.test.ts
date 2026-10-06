@@ -72,11 +72,51 @@ integration("live transcription usage rows on PostgreSQL", () => {
     };
   }
 
+  it("writes a Chat Test session as a CHAT_TEST row with no token, rolled up per user", async () => {
+    const requester = await user();
+    const times = [new Date("2026-10-05T11:00:00.000Z"), new Date("2026-10-05T11:00:30.000Z")];
+    const meter = new metering.RealtimeSessionMeter(
+      { userId: requester.id, source: "CHAT_TEST", tokenId: null, tokenLookupPrefix: null },
+      strict,
+      () => times.shift() ?? new Date(),
+    );
+    const candidate = directCandidate(requester.id);
+    meter.opened(candidate);
+    meter.ended({
+      candidate,
+      closeCode: 1008,
+      errorCode: "dashboard_session_ended",
+      sentAudioBytes: 96_000,
+    });
+    await metering.flushRealtimeMetering();
+    const rows = await strict.relayRequest.findMany({ where: { userId: requester.id } });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      source: "CHAT_TEST",
+      modelApiTokenId: null,
+      modelApiTokenLookupPrefix: null,
+      status: "FAILED",
+      httpStatusCode: 401,
+      errorClass: "dashboard_session_ended",
+      audioInputMs: 2_000,
+    });
+    const minute = await strict.usageRollupMinute.findMany({
+      where: { requesterUserId: requester.id },
+    });
+    expect(minute).toHaveLength(1);
+    expect(minute[0]).toMatchObject({ requests: 1, audioInputMs: 2_000n });
+  }, 20_000);
+
   it("writes one row and one rollup per session, with audio and engine tokens", async () => {
     const requester = await user();
     const times = [new Date("2026-10-05T10:00:00.000Z"), new Date("2026-10-05T10:02:00.000Z")];
     const meter = new metering.RealtimeSessionMeter(
-      { userId: requester.id, tokenId: `token-${randomUUID()}`, tokenLookupPrefix: "wsmp_model_x" },
+      {
+        userId: requester.id,
+        source: "API_TOKEN",
+        tokenId: `token-${randomUUID()}`,
+        tokenLookupPrefix: "wsmp_model_x",
+      },
       strict,
       () => times.shift() ?? new Date(),
     );
@@ -156,7 +196,12 @@ integration("live transcription usage rows on PostgreSQL", () => {
   it("a session ended by the server is a failed request with its status", async () => {
     const requester = await user();
     const meter = new metering.RealtimeSessionMeter(
-      { userId: requester.id, tokenId: `token-${randomUUID()}`, tokenLookupPrefix: "wsmp_model_y" },
+      {
+        userId: requester.id,
+        source: "API_TOKEN",
+        tokenId: `token-${randomUUID()}`,
+        tokenLookupPrefix: "wsmp_model_y",
+      },
       strict,
     );
     const candidate = directCandidate(requester.id);
@@ -228,7 +273,12 @@ integration("live transcription usage rows on PostgreSQL", () => {
       },
     };
     const meter = new metering.RealtimeSessionMeter(
-      { userId: requester.id, tokenId: `token-${randomUUID()}`, tokenLookupPrefix: "wsmp_model_z" },
+      {
+        userId: requester.id,
+        source: "API_TOKEN",
+        tokenId: `token-${randomUUID()}`,
+        tokenLookupPrefix: "wsmp_model_z",
+      },
       strict,
     );
     meter.opened(poolCandidate);

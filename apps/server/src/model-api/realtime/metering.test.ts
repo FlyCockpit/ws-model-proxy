@@ -63,7 +63,12 @@ function clock(...times: string[]) {
   return () => queue.shift() ?? new Date(0);
 }
 
-const requester = { userId: "user-1", tokenId: "token-1", tokenLookupPrefix: "wsmp_model_abc" };
+const requester = {
+  userId: "user-1",
+  source: "API_TOKEN" as const,
+  tokenId: "token-1",
+  tokenLookupPrefix: "wsmp_model_abc",
+};
 const item = {
   itemSeq: 0,
   itemId: "item_x",
@@ -111,6 +116,25 @@ describe("live transcription usage rows", () => {
       },
       select: { id: true },
     });
+  });
+
+  it("writes a Chat Test session as a CHAT_TEST row with no token, like HTTP Chat Test", async () => {
+    const { db } = fakeDb();
+    new RealtimeSessionMeter(
+      { userId: "user-1", source: "CHAT_TEST", tokenId: null, tokenLookupPrefix: null },
+      db as never,
+    ).opened(candidate());
+    await flushRealtimeMetering();
+    expect(db.relayRequest.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          userId: "user-1",
+          source: "CHAT_TEST",
+          modelApiTokenId: null,
+          modelApiTokenLookupPrefix: null,
+        }),
+      }),
+    );
   });
 
   it("names a direct model as the requested target", async () => {
@@ -253,6 +277,7 @@ describe("live transcription usage rows", () => {
       [1000, "session_expired", "SUCCEEDED", 200],
       [1001, "server_shutting_down", "CANCELED", 503],
       [1008, "invalid_api_key", "FAILED", 401],
+      [1008, "dashboard_session_ended", "FAILED", 401],
       [1008, "model_not_found", "FAILED", 404],
       [1008, "rate_limited", "FAILED", 429],
       [1011, "capacity_lease_lost", "FAILED", 503],

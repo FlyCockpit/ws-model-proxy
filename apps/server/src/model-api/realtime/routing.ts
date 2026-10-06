@@ -1,4 +1,5 @@
 import {
+  listVisibleModelTargetsForUser,
   listVisibleModelTargetsWithExternalPermissionForToken,
   type ModelApiTokenIdentity,
   type VisibleDirectModelTarget,
@@ -23,6 +24,8 @@ import type { SttConfig } from "../../relay/stt-protocol.js";
 import { realtimeTranscriptionCapability } from "../../relay/stt-relay.js";
 import { resolveRequestedModelName } from "../external-route.js";
 import { recheckRealtimePermission } from "./authorize.js";
+import { checkDashboardSession } from "./dashboard-session.js";
+import type { RealtimeCredentialRef, RealtimeTargetAccess } from "./requester.js";
 import type {
   RealtimeCandidate,
   RealtimeRouteResult,
@@ -360,10 +363,15 @@ export type RealtimeResolvedTarget =
   | { kind: "direct"; target: VisibleDirectModelTarget };
 
 export async function resolveRealtimeModel(
-  token: RealtimeTokenIdentity,
+  access: RealtimeTargetAccess,
   model: string,
 ): Promise<RealtimeResolvedTarget | { error: "model_not_found" | "external_variant_unsupported" }> {
-  const { targets } = await listVisibleModelTargetsWithExternalPermissionForToken(token);
+  // A token sees its allowlist; Chat Test sees every model the user can see,
+  // as HTTP Chat Test does.
+  const targets =
+    access.kind === "token"
+      ? (await listVisibleModelTargetsWithExternalPermissionForToken(access.token)).targets
+      : await listVisibleModelTargetsForUser(access.userId);
   const resolution = resolveRequestedModelName(targets, model);
   if (resolution.kind === "not_found" || resolution.kind === "error") {
     return { error: "model_not_found" };
@@ -378,18 +386,18 @@ export async function resolveRealtimeModel(
 
 /** The production router for one session. */
 export function createRealtimeRouter({
-  token,
+  access,
   activeCliDeviceIds,
   onResolved,
 }: {
-  token: RealtimeTokenIdentity;
+  access: RealtimeTargetAccess;
   activeCliDeviceIds: () => readonly string[];
   /** The target the model resolved to (for the access rechecks). */
   onResolved?: (resolved: RealtimeResolvedTarget, model: string) => void;
 }): RealtimeRouter {
   return {
     async candidates({ model, config }): Promise<RealtimeRouteResult> {
-      const resolved = await resolveRealtimeModel(token, model);
+      const resolved = await resolveRealtimeModel(access, model);
       if ("error" in resolved) return { ok: false, code: resolved.error };
       onResolved?.(resolved, model);
       const candidates =
@@ -437,7 +445,9 @@ export type RealtimeAccessVerdict =
 
 /**
  * The 60 s recheck of an open (or routing) session (release decision 6):
- * the token is still valid and its owner may use credentials; the model
+ * the token is still valid and its owner may use credentials (for Chat Test:
+ * the dashboard session still exists for an unblocked, 2FA-compliant user,
+ * {@link checkDashboardSession}); the model
  * still resolves to the same target with the same access; and the member the
  * session opened on is still a recipe-managed, live-capable, published
  * member of it. Health is not rechecked: a degraded member keeps its session.
@@ -445,15 +455,19 @@ export type RealtimeAccessVerdict =
  * skips that sweep, as the terminal rechecks do).
  */
 export async function recheckRealtimeAccess({
-  tokenId,
+  credential,
+  userId,
   model,
   resolved,
   candidate,
   config,
   now = new Date(),
   permission = recheckRealtimePermission,
+  dashboardSession = checkDashboardSession,
 }: {
-  tokenId: string;
+  credential: RealtimeCredentialRef;
+  /** The session's user (a token's own user is read from its row). */
+  userId: string;
   model: string | null;
   resolved: RealtimeResolvedTarget | null;
   candidate: RealtimeCandidate | null;
@@ -461,38 +475,12 @@ export async function recheckRealtimeAccess({
   now?: Date;
   /** The HTTP send claim's permission check, without a send (review 6b M1). */
   permission?: typeof recheckRealtimePermission;
+  dashboardSession?: typeof checkDashboardSession;
 }): Promise<RealtimeAccessVerdict> {
-  const token = await prisma.modelApiToken.findUnique({
-    where: { id: tokenId },
-    select: {
-      id: true,
-      userId: true,
-      scopeMode: true,
-      allowExternal: true,
-      revokedAt: true,
-      expiresAt: true,
-      User: { select: { banned: true, banExpires: true, deletionRequestedAt: true } },
-    },
-  });
-  if (
-    !token ||
-    token.revokedAt ||
-    (token.expiresAt && token.expiresAt <= now) ||
-    !token.User ||
-    userCredentialAccessBlocked(token.User, now)
-  ) {
-    return { ok: false, reason: "credential" };
-  }
+  const requester = await recheckCredential(credential, userId, now, dashboardSession);
+  if (!requester) return { ok: false, reason: "credential" };
   if (!model || !resolved) return { ok: true };
-  const current = await resolveRealtimeModel(
-    {
-      id: token.id,
-      userId: token.userId,
-      scopeMode: token.scopeMode,
-      allowExternal: token.allowExternal === true,
-    },
-    model,
-  );
+  const current = await resolveRealtimeModel(requester.access, model);
   if (
     "error" in current ||
     current.kind !== resolved.kind ||
@@ -538,12 +526,63 @@ export async function recheckRealtimeAccess({
   }
   // The same locked permission check an HTTP send takes: CLI device of the
   // model owner and connected, the token's allowlist entry for this exact
-  // target, the grant row, every user active.
-  const denied = await permission({ tokenId: token.id, userId: token.userId }, candidate);
+  // target (none for Chat Test), the grant row, every user active.
+  const denied = await permission(
+    { tokenId: requester.tokenId, userId: requester.userId },
+    candidate,
+  );
   if (denied === "requester") return { ok: false, reason: "credential" };
   if (denied === "access") return { ok: false, reason: "model" };
   if (denied === "member") return { ok: false, reason: "member" };
   return { ok: true };
+}
+
+/** The credential's current state; null when it no longer authorizes the session. */
+async function recheckCredential(
+  credential: RealtimeCredentialRef,
+  userId: string,
+  now: Date,
+  dashboardSession: typeof checkDashboardSession,
+): Promise<{ userId: string; tokenId: string | null; access: RealtimeTargetAccess } | null> {
+  if (credential.kind === "dashboard") {
+    const verdict = await dashboardSession({ sessionId: credential.sessionId, userId, now });
+    if (verdict !== "ok") return null;
+    return { userId, tokenId: null, access: { kind: "dashboard", userId } };
+  }
+  const token = await prisma.modelApiToken.findUnique({
+    where: { id: credential.tokenId },
+    select: {
+      id: true,
+      userId: true,
+      scopeMode: true,
+      allowExternal: true,
+      revokedAt: true,
+      expiresAt: true,
+      User: { select: { banned: true, banExpires: true, deletionRequestedAt: true } },
+    },
+  });
+  if (
+    !token ||
+    token.revokedAt ||
+    (token.expiresAt && token.expiresAt <= now) ||
+    !token.User ||
+    userCredentialAccessBlocked(token.User, now)
+  ) {
+    return null;
+  }
+  return {
+    userId: token.userId,
+    tokenId: token.id,
+    access: {
+      kind: "token",
+      token: {
+        id: token.id,
+        userId: token.userId,
+        scopeMode: token.scopeMode,
+        allowExternal: token.allowExternal === true,
+      },
+    },
+  };
 }
 
 function memberStillServes(

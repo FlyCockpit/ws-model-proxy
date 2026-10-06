@@ -19,7 +19,8 @@ import type {
  * dashboard metrics show it like any other request.
  *
  * - Created PENDING when the session opens (`opened` hook), with the
- *   requester, token, pool or direct model, member and execution target.
+ *   requester, source and token (none for Chat Test, as its HTTP rows), pool
+ *   or direct model, member and execution target.
  * - Finalized through THE terminal transition (`transitionRelayRequestTerminal`:
  *   PENDING -> terminal plus its rollup increment, exactly once) when the
  *   session ends (`ended` hook): the wall time measured in the hooks, the PCM
@@ -99,7 +100,7 @@ export function realtimeTerminal(
   if (code === 1001) return { status: "CANCELED", httpStatusCode: 503, errorClass: error };
   if (code === 1008) {
     const httpStatusCode =
-      error === "invalid_api_key"
+      error === "invalid_api_key" || error === "dashboard_session_ended"
         ? 401
         : error === "model_not_found"
           ? 404
@@ -128,8 +129,10 @@ export class RealtimeSessionMeter {
   constructor(
     private readonly requester: {
       userId: string;
-      tokenId: string;
-      tokenLookupPrefix: string;
+      /** `API_TOKEN` for `/v1/realtime`; `CHAT_TEST` (no token) as HTTP Chat Test rows. */
+      source: "API_TOKEN" | "CHAT_TEST";
+      tokenId: string | null;
+      tokenLookupPrefix: string | null;
     },
     private readonly db: MeterDb = prisma,
     private readonly now: () => Date = () => new Date(),
@@ -145,7 +148,7 @@ export class RealtimeSessionMeter {
     const pool = route.kind === "pool";
     const data: Prisma.RelayRequestUncheckedCreateInput = {
       userId: this.requester.userId,
-      source: "API_TOKEN",
+      source: this.requester.source,
       modelApiTokenId: this.requester.tokenId,
       modelApiTokenLookupPrefix: this.requester.tokenLookupPrefix,
       requestedModelPoolId: pool ? route.poolId : null,

@@ -5,8 +5,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useRealtimeTranscription } from "./use-realtime-transcription";
 
-const TOKEN = "wsmp_model_abcdefghIJKL-_0123";
-
 class FakePort {
   onmessage: ((event: MessageEvent) => void) | null = null;
   posted: unknown[] = [];
@@ -66,10 +64,12 @@ class FakeSocket {
   closedWith: number | null = null;
   onmessage: ((event: MessageEvent) => void) | null = null;
   onclose: ((event: CloseEvent) => void) | null = null;
+  readonly protocols: unknown;
   constructor(
     readonly url: string,
-    readonly protocols: string[],
+    ...rest: unknown[]
   ) {
+    this.protocols = rest[0];
     FakeSocket.last = this;
   }
   send(data: string) {
@@ -110,7 +110,7 @@ afterEach(() => {
 async function started() {
   const hook = renderHook(() => useRealtimeTranscription());
   await act(async () => {
-    await hook.result.current.start({ token: TOKEN, model: "owner/asr" });
+    await hook.result.current.start({ model: "owner/asr" });
   });
   const socket = FakeSocket.last;
   if (!socket) throw new Error("no socket");
@@ -118,7 +118,7 @@ async function started() {
 }
 
 describe("useRealtimeTranscription", () => {
-  it("opens the mic, then the socket with the subprotocol login and no token in the URL", async () => {
+  it("opens the mic, then the dashboard-signed Chat Test socket with no token or subprotocol", async () => {
     const { hook, socket } = await started();
     expect(getUserMedia).toHaveBeenCalledWith({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
@@ -127,10 +127,9 @@ describe("useRealtimeTranscription", () => {
       "/realtime-pcm-worklet.js",
     );
     expect(socket.url).toBe(
-      "ws://localhost:3000/v1/realtime?intent=transcription&model=owner%2Fasr",
+      "ws://localhost:3000/api/internal/chat-test/realtime?intent=transcription&model=owner%2Fasr",
     );
-    expect(socket.url).not.toContain(TOKEN);
-    expect(socket.protocols).toEqual(["realtime", `openai-insecure-api-key.${TOKEN}`]);
+    expect(socket.protocols).toBeUndefined();
     expect(hook.result.current.state.phase).toBe("starting");
     act(() => socket.serverEvent({ type: "session.created" }));
     expect(hook.result.current.state.phase).toBe("live");
@@ -159,7 +158,7 @@ describe("useRealtimeTranscription", () => {
     );
     const hook = renderHook(() => useRealtimeTranscription());
     await act(async () => {
-      await hook.result.current.start({ token: TOKEN, model: "owner/asr" });
+      await hook.result.current.start({ model: "owner/asr" });
     });
     expect(hook.result.current.state).toMatchObject({
       phase: "failed",
@@ -172,7 +171,7 @@ describe("useRealtimeTranscription", () => {
     vi.stubGlobal("AudioWorkletNode", undefined);
     const hook = renderHook(() => useRealtimeTranscription());
     await act(async () => {
-      await hook.result.current.start({ token: TOKEN, model: "owner/asr" });
+      await hook.result.current.start({ model: "owner/asr" });
     });
     expect(hook.result.current.state.problem).toEqual({ kind: "mic", reason: "unsupported" });
   });

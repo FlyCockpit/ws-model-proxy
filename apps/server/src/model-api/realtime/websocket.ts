@@ -30,6 +30,14 @@ import {
   type RealtimeSessionRegistry,
   realtimeSessionRegistry,
 } from "./registry.js";
+import {
+  credentialEndedError,
+  credentialRef,
+  type RealtimeRequester,
+  requesterTokenId,
+  targetAccess,
+  tokenRequester,
+} from "./requester.js";
 import { createRealtimeRouter, type RealtimeResolvedTarget } from "./routing.js";
 import {
   REALTIME_CLOSE_CODES,
@@ -78,18 +86,16 @@ export type RealtimeEndpointDeps = {
   capacityRuntime?: CapacityAdmissionRuntime;
   /** Tests replace the send claim (the default is the HTTP send's locked check). */
   authorizeOpen?: (requester: {
-    tokenId: string;
+    tokenId: string | null;
     userId: string;
   }) => NonNullable<RealtimeSessionHooks["authorizeOpen"]>;
   /** Tests replace the usage meter (the default writes RelayRequest rows). */
-  createMeter?: (requester: {
-    tokenId: string;
-    userId: string;
-    tokenLookupPrefix: string;
-  }) => Pick<RealtimeSessionMeter, "opened" | "itemFinished" | "ended">;
+  createMeter?: (
+    requester: ConstructorParameters<typeof RealtimeSessionMeter>[0],
+  ) => Pick<RealtimeSessionMeter, "opened" | "itemFinished" | "ended">;
   /** Tests replace the database router. */
   router?: (input: {
-    token: ModelApiTokenIdentity;
+    requester: RealtimeRequester;
     onResolved: (target: RealtimeResolvedTarget, model: string) => void;
   }) => RealtimeRouter;
 };
@@ -106,13 +112,14 @@ export function productionRealtimeDeps(
   };
 }
 
-type RealtimeAuth = {
-  token: ModelApiTokenIdentity;
+/** One admitted upgrade: who it acts for, its session-cap admission and `?model=`. */
+export type RealtimeAuth = {
+  requester: RealtimeRequester;
   admission: RealtimeAdmission;
   model: string | null;
 };
 
-type RealtimeVariables = { realtimeAuth: RealtimeAuth };
+export type RealtimeVariables = { realtimeAuth: RealtimeAuth };
 
 function errorResponse(
   c: Context,
@@ -240,7 +247,11 @@ export function createRealtimeWebsocketMiddleware(
       );
     }
     // The session caps, before the upgrade and before any relay session.
-    const admitted = deps.counters.acquire({ tokenId: token.id, userId: token.userId });
+    const requester = tokenRequester(token);
+    const admitted = deps.counters.acquire({
+      tokenId: requester.limitKey,
+      userId: requester.userId,
+    });
     if (!admitted.ok) {
       return errorResponse(
         c,
@@ -250,7 +261,7 @@ export function createRealtimeWebsocketMiddleware(
         "Too many live transcription sessions.",
       );
     }
-    c.set("realtimeAuth", { token, admission: admitted.admission, model: query.model });
+    c.set("realtimeAuth", { requester, admission: admitted.admission, model: query.model });
     try {
       await next();
     } finally {
@@ -308,18 +319,23 @@ export function realtimeSocketEvents(
     const holder: { registration: RealtimeRegistration | null } = { registration: null };
     const onResolved = (target: RealtimeResolvedTarget, model: string) =>
       holder.registration?.resolved(target, model);
+    const identity = auth.requester;
     const router = deps.router
-      ? deps.router({ token: auth.token, onResolved })
+      ? deps.router({ requester: identity, onResolved })
       : createRealtimeRouter({
-          token: auth.token,
+          access: targetAccess(identity),
           activeCliDeviceIds: () => deps.relay.getActiveCliDeviceIds(),
           onResolved,
         });
-    const requester = { tokenId: auth.token.id, userId: auth.token.userId };
+    const requester = { tokenId: requesterTokenId(identity), userId: identity.userId };
+    const token = identity.credential.kind === "token" ? identity.credential.token : null;
+    // Attributed as the HTTP request of the same credential: a token's
+    // request, or a Chat Test request with no token.
     const meterRequester = {
-      tokenId: auth.token.id,
-      userId: auth.token.userId,
-      tokenLookupPrefix: auth.token.lookupPrefix,
+      userId: identity.userId,
+      source: token ? ("API_TOKEN" as const) : ("CHAT_TEST" as const),
+      tokenId: token?.id ?? null,
+      tokenLookupPrefix: token?.lookupPrefix ?? null,
     };
     const meter = deps.createMeter
       ? deps.createMeter(meterRequester)
@@ -348,9 +364,10 @@ export function realtimeSocketEvents(
       admission: auth.admission,
       initialModel: auth.model,
       hooks,
+      credentialEnded: credentialEndedError(identity.credential.kind),
     });
     session = created;
-    const registration = deps.registry.add(created, auth.token.id, auth.token.userId);
+    const registration = deps.registry.add(created, credentialRef(identity), identity.userId);
     if (!registration || deps.relay.isDraining()) {
       registration?.remove();
       created.terminate(REALTIME_CLOSE_CODES.goingAway, {

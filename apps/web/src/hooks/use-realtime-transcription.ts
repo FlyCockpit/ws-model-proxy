@@ -9,7 +9,6 @@ import {
   type RealtimeState,
   realtimeReducer,
   realtimeSocketUrl,
-  realtimeSubprotocols,
 } from "@/lib/realtime-transcription";
 
 /** Client-side cap on bytes queued toward the server before audio is dropped. */
@@ -26,8 +25,8 @@ type Resources = {
 
 export type RealtimeTranscription = {
   state: RealtimeState;
-  /** Opens the microphone, then the session. The token is used for this socket only. */
-  start(input: { token: string; model: string }): Promise<void>;
+  /** Opens the microphone, then the session (signed in by the dashboard cookie). */
+  start(input: { model: string }): Promise<void>;
   /** Ends the current turn: the audio captured so far is sent, then committed. */
   commit(): void;
   stop(): void;
@@ -36,9 +35,9 @@ export type RealtimeTranscription = {
 
 /**
  * The Chat Test live transcription session: microphone capture through an
- * AudioWorklet (24 kHz PCM16 mono), the `/v1/realtime` socket with the
- * browser subprotocol login, and teardown on stop, failure and unmount. The
- * token is never stored here beyond the socket handshake.
+ * AudioWorklet (24 kHz PCM16 mono), the Chat Test realtime socket (the
+ * `/v1/realtime` protocol, signed in by the dashboard session cookie), and
+ * teardown on stop, failure and unmount.
  */
 export function useRealtimeTranscription(): RealtimeTranscription {
   const [state, dispatch] = useReducer(realtimeReducer, initialRealtimeState);
@@ -69,7 +68,7 @@ export function useRealtimeTranscription(): RealtimeTranscription {
   }, [release]);
 
   const start = useCallback(
-    async ({ token, model }: { token: string; model: string }) => {
+    async ({ model }: { model: string }) => {
       stop();
       const attempt = ++generation.current;
       dispatch({ type: "starting" });
@@ -113,10 +112,7 @@ export function useRealtimeTranscription(): RealtimeTranscription {
         return;
       }
 
-      const socket = new WebSocket(
-        realtimeSocketUrl(model, window.location),
-        realtimeSubprotocols(token),
-      );
+      const socket = new WebSocket(realtimeSocketUrl(model, window.location));
       resources.socket = socket;
       socket.onmessage = (message) => {
         if (generation.current !== attempt || typeof message.data !== "string") return;

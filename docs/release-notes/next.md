@@ -320,10 +320,13 @@ assignment provenance and automatic concurrency seed columns.
 
 - **Live transcription test panel.** Chat Test has a microphone button that
   opens a live transcription panel for a live-capable model you can use. It
-  connects to `/v1/realtime` like any client: paste a model API token, which
-  stays in the open panel only and is sent as the WebSocket subprotocol, never
-  in the URL. The microphone needs HTTPS or localhost. Stop ends the session
-  without transcribing the turn in progress; use End turn first.
+  signs in with your dashboard session (no token to paste) and runs the same
+  live session as `/v1/realtime`, as you: every model you can see, the same
+  limits and access checks, and usage recorded as Chat Test. The socket only
+  accepts the dashboard's own origin; signing out or revoking the session ends
+  a live session within 60 seconds, and a ban ends it at once. The microphone
+  needs HTTPS or localhost. Stop ends the session without transcribing the
+  turn in progress; use End turn first.
 
 - **Live transcription sessions (`GET /v1/realtime?intent=transcription`).**
   A WebSocket API following the OpenAI Realtime GA transcription events

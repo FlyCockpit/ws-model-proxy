@@ -8,6 +8,10 @@ vi.mock("@ws-model-proxy/db", async () => {
 const { RealtimeSessionRegistry } = await import("./registry.js");
 const { CapacityLeaseLostError } = await import("../capacity/lease-loss.js");
 
+function token(tokenId: string) {
+  return { kind: "token" as const, tokenId };
+}
+
 function fakeSession() {
   return { terminate: vi.fn() };
 }
@@ -29,12 +33,12 @@ describe("realtime session registry", () => {
       ["member", "member"],
       ["fine", null],
     ]);
-    const registry = new RealtimeSessionRegistry(async ({ tokenId }) => {
-      const reason = verdicts.get(tokenId);
+    const registry = new RealtimeSessionRegistry(async ({ credential }) => {
+      const reason = verdicts.get(credential.kind === "token" ? credential.tokenId : "");
       return reason ? { ok: false, reason } : { ok: true };
     });
     const sessions = Object.fromEntries([...verdicts.keys()].map((id) => [id, fakeSession()]));
-    for (const [id, session] of Object.entries(sessions)) registry.add(session, id, "user");
+    for (const [id, session] of Object.entries(sessions)) registry.add(session, token(id), "user");
     await registry.recheckSessions();
     expect(sessions.waiting?.terminate).toHaveBeenCalledWith(
       1008,
@@ -54,12 +58,13 @@ describe("realtime session registry", () => {
   it("passes the resolved model and opened member to the recheck", async () => {
     const recheck = vi.fn(async () => ({ ok: true as const }));
     const registry = new RealtimeSessionRegistry(recheck);
-    const registration = registry.add(fakeSession(), "t", "user");
+    const registration = registry.add(fakeSession(), token("t"), "user");
     registration?.resolved({ kind: "direct", target: { id: "dm" } as never }, "owner/asr");
     registration?.opened(candidate, null);
     await registry.recheckSessions();
     expect(recheck).toHaveBeenCalledWith({
-      tokenId: "t",
+      credential: { kind: "token", tokenId: "t" },
+      userId: "user",
       model: "owner/asr",
       resolved: { kind: "direct", target: { id: "dm" } },
       candidate,
@@ -72,7 +77,7 @@ describe("realtime session registry", () => {
       throw new Error("db down");
     });
     const session = fakeSession();
-    registry.add(session, "t", "user");
+    registry.add(session, token("t"), "user");
     await registry.recheckSessions();
     expect(session.terminate).not.toHaveBeenCalled();
     expect(errors).toHaveBeenCalled();
@@ -88,7 +93,7 @@ describe("realtime session registry", () => {
         }),
     );
     const session = fakeSession();
-    const registration = registry.add(session, "t", "user");
+    const registration = registry.add(session, token("t"), "user");
     const sweep = registry.recheckSessions();
     registration?.remove();
     finish({ ok: false, reason: "credential" });
@@ -103,10 +108,10 @@ describe("realtime session registry", () => {
     const lostController = new AbortController();
     const releasedController = new AbortController();
     registry
-      .add(lost, "a", "user")
+      .add(lost, token("a"), "user")
       ?.opened(candidate, { release() {}, signal: lostController.signal });
     registry
-      .add(released, "b", "user")
+      .add(released, token("b"), "user")
       ?.opened(candidate, { release() {}, signal: releasedController.signal });
     releasedController.abort(new DOMException("Aborted", "AbortError"));
     lostController.abort(new CapacityLeaseLostError("heartbeat_timeout"));
@@ -122,8 +127,8 @@ describe("realtime session registry", () => {
     const own = fakeSession();
     const served = fakeSession();
     const other = fakeSession();
-    registry.add(own, "t1", "banned");
-    registry.add(served, "t2", "someone")?.opened(
+    registry.add(own, token("t1"), "banned");
+    registry.add(served, token("t2"), "someone")?.opened(
       {
         ...candidate,
         route: {
@@ -142,7 +147,7 @@ describe("realtime session registry", () => {
       },
       null,
     );
-    registry.add(other, "t3", "someone");
+    registry.add(other, token("t3"), "someone");
     registry.terminateForUser("banned");
     expect(own.terminate).toHaveBeenCalledWith(
       1008,
@@ -160,8 +165,8 @@ describe("realtime session registry", () => {
     const registry = new RealtimeSessionRegistry(async () => ({ ok: true }));
     const revoked = fakeSession();
     const kept = fakeSession();
-    registry.add(revoked, "revoked", "u");
-    registry.add(kept, "kept", "u");
+    registry.add(revoked, token("revoked"), "u");
+    registry.add(kept, token("kept"), "u");
     registry.terminateForToken("revoked");
     expect(revoked.terminate).toHaveBeenCalledWith(
       1008,
@@ -173,13 +178,13 @@ describe("realtime session registry", () => {
   it("closeAll ends every session with 1001 and refuses later ones", () => {
     const registry = new RealtimeSessionRegistry(async () => ({ ok: true }));
     const session = fakeSession();
-    registry.add(session, "t", "user");
+    registry.add(session, token("t"), "user");
     registry.closeAll();
     expect(session.terminate).toHaveBeenCalledWith(
       1001,
       expect.objectContaining({ code: "server_shutting_down" }),
     );
-    expect(registry.add(fakeSession(), "t", "user")).toBeNull();
+    expect(registry.add(fakeSession(), token("t"), "user")).toBeNull();
     expect(registry.closing).toBe(true);
     expect(registry.size).toBe(0);
   });

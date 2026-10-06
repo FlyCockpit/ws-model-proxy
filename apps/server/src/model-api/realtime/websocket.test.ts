@@ -3,6 +3,7 @@ import type { ModelApiTokenIdentity } from "@ws-model-proxy/api/lib/model-api-to
 import { Hono } from "hono";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WebSocket } from "ws";
+import { tokenRequester } from "./requester.js";
 
 vi.mock("@ws-model-proxy/env/server", () => ({
   env: {
@@ -246,7 +247,7 @@ describe("realtime socket events", () => {
   function admitted(t: ReturnType<typeof deps>) {
     const result = t.counters.acquire({ tokenId: TOKEN.id, userId: TOKEN.userId });
     if (!result.ok) throw new Error("cap");
-    return { token: TOKEN, admission: result.admission, model: null };
+    return { requester: tokenRequester(TOKEN), admission: result.admission, model: null };
   }
 
   it("opens a session, answers events, and releases everything on close", () => {
@@ -321,6 +322,7 @@ describe("realtime socket events", () => {
     events.onOpen?.(new Event("open"), ws);
     events.onClose?.(new CloseEvent("close"), ws);
     expect(createMeter).toHaveBeenCalledWith({
+      source: "API_TOKEN",
       tokenId: TOKEN.id,
       userId: TOKEN.userId,
       tokenLookupPrefix: TOKEN.lookupPrefix,

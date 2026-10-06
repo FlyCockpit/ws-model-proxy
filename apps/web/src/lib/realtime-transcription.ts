@@ -1,38 +1,26 @@
 /**
  * Pure pieces of the Chat Test live transcription panel: the socket address,
- * the browser login (subprotocols), PCM encoding, and the reducer that turns
- * `/v1/realtime` transcription events into a short transcript list.
+ * PCM encoding, and the reducer that turns the realtime transcription events
+ * (the `/v1/realtime` protocol) into a short transcript list.
  *
- * The API token travels only as the `openai-insecure-api-key.<token>`
- * subprotocol (the server selects `realtime` and never echoes it). It is
- * never put in the URL and never stored.
+ * The panel's socket is the dashboard's own: the session cookie signs it in,
+ * as for every other Chat Test request. No token is typed, sent or stored.
  */
 
-export const REALTIME_SUBPROTOCOL = "realtime";
-export const REALTIME_KEY_SUBPROTOCOL_PREFIX = "openai-insecure-api-key.";
+export const CHAT_TEST_REALTIME_PATH = "/api/internal/chat-test/realtime";
 export const REALTIME_WORKLET_URL = "/realtime-pcm-worklet.js";
 export const REALTIME_WORKLET_NAME = "realtime-pcm";
-/** Model API tokens; the subprotocol needs a token of URL-safe characters. */
-const MODEL_API_TOKEN = /^wsmp_model_[A-Za-z0-9_-]{8,}$/;
 /** Transcript entries kept on screen. */
 export const REALTIME_ITEMS_MAX = 50;
 
-export function isModelApiToken(value: string): boolean {
-  return MODEL_API_TOKEN.test(value.trim());
-}
-
-/** Same-origin `/v1/realtime`, with only the intent and the model in the query. */
+/** The same-origin Chat Test socket, with only the intent and the model in the query. */
 export function realtimeSocketUrl(model: string, location: Pick<Location, "href" | "protocol">) {
-  const url = new URL("/v1/realtime", location.href);
+  const url = new URL(CHAT_TEST_REALTIME_PATH, location.href);
   url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
   url.search = "";
   url.searchParams.set("intent", "transcription");
   url.searchParams.set("model", model);
   return url.toString();
-}
-
-export function realtimeSubprotocols(token: string): string[] {
-  return [REALTIME_SUBPROTOCOL, `${REALTIME_KEY_SUBPROTOCOL_PREFIX}${token.trim()}`];
 }
 
 /** Base64 of raw PCM bytes, in chunks so large buffers never overflow the call stack. */
@@ -182,7 +170,7 @@ export function micProblem(error: unknown): RealtimeProblem {
 }
 
 const SERVER_PROBLEM_KEYS: Record<string, string> = {
-  invalid_api_key: "invalidKey",
+  dashboard_session_ended: "signedOut",
   model_not_found: "modelNotFound",
   model_not_available: "busy",
   server_busy: "busy",
@@ -208,8 +196,8 @@ const CLOSE_PROBLEM_KEYS: Record<number, string> = {
 
 /**
  * The `dashboard:chatTest.live.problems.*` key for a problem. An abnormal
- * close (1006) is how a browser reports a refused upgrade (bad token, no
- * live member, rate limit): it cannot see the HTTP status.
+ * close (1006) is how a browser reports a refused upgrade (signed out, too
+ * many sessions, the server restarting): it cannot see the HTTP status.
  */
 export function problemMessageKey(problem: RealtimeProblem): string {
   if (problem.kind === "mic") return `mic.${problem.reason}`;

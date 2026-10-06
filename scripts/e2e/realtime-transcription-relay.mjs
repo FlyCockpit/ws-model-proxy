@@ -514,10 +514,51 @@ try {
   assert.equal(busy.state.closed.code, 1013);
   assert.equal(busy.events.find((event) => event.type === "error")?.error.code, "server_busy");
 
+  // ---- session 3b: Chat Test, signed in with the dashboard cookie ----
+  // The same live session behind the dashboard session: attributed as HTTP
+  // Chat Test (source CHAT_TEST, no token), refused cross-site and signed out.
+  const dashboardSessionId = randomUUID();
+  const dashboardToken = randomBytes(32).toString("base64url");
+  await db.query(
+    `INSERT INTO session (id, "createdAt", "updatedAt", "expiresAt", token, "userId")
+     VALUES ($1, now(), now(), now() + interval '1 hour', $2, $3)`,
+    [dashboardSessionId, dashboardToken, userId],
+  );
+  const dashboardSignature = createHmac("sha256", betterAuthSecret)
+    .update(dashboardToken)
+    .digest("base64");
+  const cookie = `better-auth.session_token=${encodeURIComponent(`${dashboardToken}.${dashboardSignature}`)}`;
+  const chatTestUrl = `${wsUrl}/api/internal/chat-test/realtime?intent=transcription&model=${encodeURIComponent(liveModel)}`;
+  const crossSite = realtimeClient(chatTestUrl, {
+    headers: { cookie, origin: "https://evil.example" },
+  });
+  await waitFor(() => crossSite.state.refused, "cross-site refusal");
+  assert.equal(crossSite.state.refused, 403);
+  const signedOut = realtimeClient(chatTestUrl, { headers: { origin: serverUrl } });
+  await waitFor(() => signedOut.state.refused, "signed-out refusal");
+  assert.equal(signedOut.state.refused, 401);
+  const chatTest = realtimeClient(chatTestUrl, { headers: { cookie, origin: serverUrl } });
+  await chatTest.next("session.created");
+  assert.equal(chatTest.socket.protocol, "");
+  await waitFor(() => sessions.size === 2, "stt.open for the Chat Test session");
+  for (let offset = 0; offset < pcm.length; offset += 2_400) {
+    chatTest.send({
+      type: "input_audio_buffer.append",
+      audio: pcm.subarray(offset, offset + 2_400).toString("base64"),
+    });
+  }
+  chatTest.send({ type: "input_audio_buffer.commit" });
+  const chatTestCompleted = await chatTest.next(
+    "conversation.item.input_audio_transcription.completed",
+  );
+  assert.equal(chatTestCompleted.transcript, transcriptPrivacyMarker);
+  chatTest.socket.close(1000);
+  await waitFor(() => [...sessions.values()][1].closed, "Chat Test stt.close", 2_000);
+
   // ---- session 4: the CLI disconnects mid-session ----
   const doomed = realtimeClient(realtimeUrl, { headers: bearer });
   await doomed.next("session.created");
-  await waitFor(() => sessions.size === 2, "second stt.open");
+  await waitFor(() => sessions.size === 3, "third stt.open");
   doomed.send({
     type: "input_audio_buffer.append",
     audio: pcm.subarray(0, 4_800).toString("base64"),
@@ -525,7 +566,7 @@ try {
   await waitFor(
     () =>
       cliFrames.filter((frame) => frame.type === "stt.audio").length > 0 &&
-      [...sessions.values()][1].audio.length > 0,
+      [...sessions.values()][2].audio.length > 0,
     "audio of the second session",
   );
   clearInterval(heartbeat);
@@ -544,11 +585,15 @@ try {
         ORDER BY "createdAt" ASC`,
       [userId],
     );
-    return result.rows.length === 2 && result.rows.every((row) => row.status !== "PENDING")
+    return result.rows.length === 3 && result.rows.every((row) => row.status !== "PENDING")
       ? result.rows
       : null;
   }, "finalized live session rows");
-  const [served, failed] = rows;
+  const [served, chatTestRow, failed] = rows;
+  assert.equal(chatTestRow.source, "CHAT_TEST");
+  assert.equal(chatTestRow.modelApiTokenId, null);
+  assert.equal(chatTestRow.status, "SUCCEEDED");
+  assert.equal(chatTestRow.audioInputMs, 250);
   assert.equal(served.status, "SUCCEEDED");
   assert.equal(served.errorClass, null);
   assert.equal(served.audioInputMs, 250);
@@ -565,9 +610,9 @@ try {
          FROM usage_rollup_minute WHERE "requesterUserId" = $1`,
       [userId],
     );
-    return Number(result.rows[0]?.requests) === 2 ? result.rows[0] : null;
+    return Number(result.rows[0]?.requests) === 3 ? result.rows[0] : null;
   }, "usage rollups");
-  assert.equal(Number(rollup.audio), 350);
+  assert.equal(Number(rollup.audio), 600);
 
   // ---- privacy: no audio or transcript in logs or stored metadata ----
   const haystacks = [serverLog, JSON.stringify(rows)];

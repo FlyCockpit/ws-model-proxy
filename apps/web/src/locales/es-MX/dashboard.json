@@ -282,12 +282,9 @@
     "live": {
       "open": "Transcripción en vivo",
       "title": "Transcripción en vivo",
-      "description": "Habla al micrófono y observa cómo un modelo con sesiones en vivo lo transcribe mediante /v1/realtime, como lo haría un cliente de la API.",
+      "description": "Habla al micrófono y observa cómo un modelo con sesiones en vivo lo transcribe con la misma API de sesiones en vivo que usan los clientes (/v1/realtime). Se ejecuta como tú, igual que el resto de Chat Test, y cuenta como uso de Chat Test.",
       "model": "Modelo",
       "noModels": "Ningún modelo que puedas usar acepta sesiones en vivo. Una receta de voz a texto necesita un perfil realtime y un miembro en vivo en ejecución.",
-      "token": "Token de la API de modelos",
-      "tokenHelp": "Pega un token de la API de modelos que pueda usar este modelo. Se queda en este diálogo, se envía como subprotocolo de WebSocket (nunca en la URL) y se olvida al cerrarlo.",
-      "tokenInvalid": "Eso no es un token de la API de modelos (empieza con wsmp_model_).",
       "start": "Iniciar micrófono",
       "stop": "Detener",
       "commit": "Terminar turno",
@@ -310,8 +307,8 @@
           "failed": "No se pudo iniciar el micrófono.",
           "unsupported": "Este navegador no puede capturar audio del micrófono para la transcripción en vivo."
         },
-        "invalidKey": "El token de la API no es válido (revocado o vencido).",
-        "modelNotFound": "Este token no puede usar ese modelo.",
+        "signedOut": "Tu sesión del panel terminó. Inicia sesión de nuevo.",
+        "modelNotFound": "No puedes usar ese modelo o ya no está disponible.",
         "busy": "No hay ningún miembro en vivo libre ahora. Inténtalo de nuevo en un momento.",
         "backlog": "El audio llegó más rápido de lo que el modelo podía procesarlo.",
         "upstream": "El nodo de transcripción falló o se desconectó.",
@@ -320,7 +317,7 @@
         "idle": "La sesión terminó tras dos minutos sin audio.",
         "emptyCommit": "No se dijo nada desde el último turno.",
         "denied": "El servidor rechazó la sesión o su acceso terminó.",
-        "connection": "No se pudo conectar. Revisa el token y que el modelo tenga un miembro en vivo.",
+        "connection": "No se pudo conectar. Revisa que sigas con la sesión iniciada y que el modelo tenga un miembro en vivo.",
         "server": "El servidor informó un error."
       }
     }

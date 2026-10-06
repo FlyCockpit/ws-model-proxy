@@ -44,7 +44,7 @@ describe("LiveTranscriptionPanel", () => {
     ).toBe(true);
   });
 
-  it("starts only with a model API token, and passes it to the session, not the page", () => {
+  it("asks for no token: it starts the dashboard-signed session with the chosen model", () => {
     render(
       <LiveTranscriptionPanel
         open
@@ -53,15 +53,11 @@ describe("LiveTranscriptionPanel", () => {
         modelsPending={false}
       />,
     );
+    expect(document.querySelector("input[type=password]")).toBeNull();
+    expect(screen.queryByText(/token/i)).toBeNull();
     const button = screen.getByRole("button", { name: /dashboard:chatTest.live.start/ });
-    const input = screen.getByLabelText("dashboard:chatTest.live.token") as HTMLInputElement;
-    expect(input.type).toBe("password");
-    fireEvent.change(input, { target: { value: "not-a-token" } });
-    expect(screen.getByText("dashboard:chatTest.live.tokenInvalid")).toBeTruthy();
-    expect((button as HTMLButtonElement).disabled).toBe(true);
-    fireEvent.change(input, { target: { value: "wsmp_model_abcdefghIJKL" } });
     expect((button as HTMLButtonElement).disabled).toBe(false);
     fireEvent.click(button);
-    expect(start).toHaveBeenCalledWith({ token: "wsmp_model_abcdefghIJKL", model: "owner/asr" });
+    expect(start).toHaveBeenCalledWith({ model: "owner/asr" });
   });
 });

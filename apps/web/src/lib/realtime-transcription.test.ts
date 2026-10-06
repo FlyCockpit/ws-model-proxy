@@ -2,41 +2,26 @@ import { describe, expect, it } from "vitest";
 
 import {
   initialRealtimeState,
-  isModelApiToken,
   micProblem,
   pcm16Base64,
   problemMessageKey,
   REALTIME_ITEMS_MAX,
   realtimeReducer,
   realtimeSocketUrl,
-  realtimeSubprotocols,
 } from "./realtime-transcription";
 
-const TOKEN = "wsmp_model_abcdefghIJKL-_0123";
-
 describe("realtime transcription helpers", () => {
-  it("builds a same-origin socket URL that never carries the token", () => {
+  it("builds the same-origin Chat Test socket URL, with only the intent and model", () => {
     const url = realtimeSocketUrl("owner/asr pool", {
       href: "https://proxy.example.com/en-US/dashboard/chat-test?x=1",
       protocol: "https:",
     });
     expect(url).toBe(
-      "wss://proxy.example.com/v1/realtime?intent=transcription&model=owner%2Fasr+pool",
+      "wss://proxy.example.com/api/internal/chat-test/realtime?intent=transcription&model=owner%2Fasr+pool",
     );
-    expect(url).not.toContain("wsmp_model_");
     expect(realtimeSocketUrl("m", { href: "http://localhost:3001/x", protocol: "http:" })).toMatch(
-      /^ws:\/\/localhost:3001\/v1\/realtime\?/,
+      /^ws:\/\/localhost:3001\/api\/internal\/chat-test\/realtime\?/,
     );
-  });
-
-  it("logs in with the subprotocol pair", () => {
-    expect(realtimeSubprotocols(` ${TOKEN} `)).toEqual([
-      "realtime",
-      `openai-insecure-api-key.${TOKEN}`,
-    ]);
-    expect(isModelApiToken(TOKEN)).toBe(true);
-    expect(isModelApiToken("wsmp_cli_abcdefghijkl")).toBe(false);
-    expect(isModelApiToken("wsmp_model_has space")).toBe(false);
   });
 
   it("base64-encodes PCM, including buffers larger than one chunk", () => {
@@ -52,7 +37,9 @@ describe("realtime transcription helpers", () => {
     expect(micProblem(named("NotFoundError"))).toEqual({ kind: "mic", reason: "missing" });
     expect(micProblem(named("AbortError"))).toEqual({ kind: "mic", reason: "failed" });
     expect(problemMessageKey({ kind: "mic", reason: "denied" })).toBe("mic.denied");
-    expect(problemMessageKey({ kind: "server", code: "invalid_api_key" })).toBe("invalidKey");
+    expect(problemMessageKey({ kind: "server", code: "dashboard_session_ended" })).toBe(
+      "signedOut",
+    );
     expect(problemMessageKey({ kind: "server", code: "something_new" })).toBe("server");
     expect(problemMessageKey({ kind: "close", code: 1013 })).toBe("busy");
     expect(problemMessageKey({ kind: "close", code: 1006 })).toBe("connection");

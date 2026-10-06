@@ -390,6 +390,8 @@ export class RealtimeTranscriptionSession {
       /** `?model=` from the URL, already bounded by the caller. */
       initialModel?: string | null;
       hooks?: RealtimeSessionHooks;
+      /** The error for a requester the send claim refused (default: the API key's). */
+      credentialEnded?: { code: string; message: string };
     },
   ) {
     this.view = { id: realtimeId("sess"), model: null };
@@ -747,8 +749,10 @@ export class RealtimeTranscriptionSession {
         if (!authorized.ok && authorized.denial === "requester") {
           this.fail(REALTIME_CLOSE_CODES.policy, {
             type: "invalid_request_error",
-            code: "invalid_api_key",
-            message: "The API key is no longer valid.",
+            ...(this.deps.credentialEnded ?? {
+              code: "invalid_api_key",
+              message: "The API key is no longer valid.",
+            }),
           });
           return;
         }

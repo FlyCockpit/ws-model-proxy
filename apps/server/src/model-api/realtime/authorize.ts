@@ -19,7 +19,7 @@ import type { RealtimeAuthorizeResult, RealtimeCandidate } from "./transcription
 
 /** The exact destination of an open, as the HTTP send binds it. */
 export function realtimeLocalSendBinding(
-  requester: { tokenId: string; userId: string },
+  requester: { tokenId: string | null; userId: string },
   candidate: RealtimeCandidate,
 ): LocalSendBinding | null {
   const route = candidate.route;
@@ -69,7 +69,7 @@ type Claim = typeof withAuthorizedLocalSend;
 
 /** The `authorizeOpen` hook for one token's sessions. */
 export function createRealtimeAuthorizer(
-  requester: { tokenId: string; userId: string },
+  requester: { tokenId: string | null; userId: string },
   claim: Claim = withAuthorizedLocalSend,
 ) {
   return async (
@@ -93,7 +93,7 @@ export function createRealtimeAuthorizer(
 
 /** The recheck form: null when still authorized. A failed transaction throws. */
 export async function recheckRealtimePermission(
-  requester: { tokenId: string; userId: string },
+  requester: { tokenId: string | null; userId: string },
   candidate: RealtimeCandidate,
   check: typeof checkLocalSendPermission = checkLocalSendPermission,
 ): Promise<"requester" | "access" | "member" | null> {

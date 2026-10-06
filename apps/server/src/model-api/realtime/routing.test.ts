@@ -8,7 +8,14 @@ vi.mock("@ws-model-proxy/db", async () => {
 const visible = vi.hoisted(() => ({
   targets: { directModels: [] as unknown[], modelPools: [] as unknown[] },
 }));
+const userTargets = vi.hoisted(() => ({
+  calls: [] as string[],
+}));
 vi.mock("@ws-model-proxy/api/lib/model-api-token-access", () => ({
+  listVisibleModelTargetsForUser: vi.fn(async (userId: string) => {
+    userTargets.calls.push(userId);
+    return visible.targets;
+  }),
   listVisibleModelTargetsWithExternalPermissionForToken: vi.fn(async () => ({
     targets: visible.targets,
     externalPoolIds: new Set<string>(),
@@ -318,17 +325,24 @@ describe("direct candidates and model resolution", () => {
       ],
     };
     const token = { id: "t", userId: "u", scopeMode: "ALL_VISIBLE" as const, allowExternal: true };
-    expect(await resolveRealtimeModel(token, "nope")).toEqual({ error: "model_not_found" });
-    expect(await resolveRealtimeModel(token, "owner/asr:external")).toEqual({
+    expect(await resolveRealtimeModel({ kind: "token", token }, "nope")).toEqual({
+      error: "model_not_found",
+    });
+    expect(await resolveRealtimeModel({ kind: "token", token }, "owner/asr:external")).toEqual({
       error: "external_variant_unsupported",
     });
-    expect(await resolveRealtimeModel(token, "owner/asr")).toMatchObject({ kind: "pool" });
+    expect(await resolveRealtimeModel({ kind: "token", token }, "owner/asr")).toMatchObject({
+      kind: "pool",
+    });
   });
 
   it("reports a configuration refusal without touching member health", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     const router = createRealtimeRouter({
-      token: { id: "t", userId: "u", scopeMode: "ALL_VISIBLE", allowExternal: false },
+      access: {
+        kind: "token",
+        token: { id: "t", userId: "u", scopeMode: "ALL_VISIBLE", allowExternal: false },
+      },
       activeCliDeviceIds: () => [],
     });
     router.memberMisconfigured?.(
@@ -363,7 +377,10 @@ describe("direct candidates and model resolution", () => {
     db.poolMember.findMany.mockResolvedValue([]);
     const resolved = vi.fn();
     const router = createRealtimeRouter({
-      token: { id: "t", userId: "u", scopeMode: "ALL_VISIBLE", allowExternal: false },
+      access: {
+        kind: "token",
+        token: { id: "t", userId: "u", scopeMode: "ALL_VISIBLE", allowExternal: false },
+      },
       activeCliDeviceIds: () => ["cli-1"],
       onResolved: resolved,
     });
@@ -417,7 +434,8 @@ describe("access rechecks", () => {
     });
     if (!candidate) throw new Error("no candidate");
     return {
-      tokenId: "t",
+      credential: { kind: "token" as const, tokenId: "t" },
+      userId: "u",
       model: "owner/asr",
       resolved: { kind: "pool" as const, target: poolTarget as never },
       candidate,
@@ -484,5 +502,57 @@ describe("access rechecks", () => {
     });
     db.poolMember.findFirst.mockResolvedValue(null);
     expect(await recheckRealtimeAccess(input)).toEqual({ ok: false, reason: "member" });
+  });
+
+  it("rechecks a Chat Test session by its dashboard session, with the user's models and no token", async () => {
+    const input = await opened();
+    const dashboard = {
+      ...input,
+      credential: { kind: "dashboard" as const, sessionId: "sess-1" },
+      userId: "u",
+    };
+    db.modelApiToken.findUnique.mockReset();
+    db.poolMember.findFirst.mockResolvedValue(member("m1", model()));
+    userTargets.calls = [];
+    const dashboardSession = vi.fn(async () => "ok" as const);
+    const permission = vi.fn(async () => null);
+    expect(await recheckRealtimeAccess({ ...dashboard, dashboardSession, permission })).toEqual({
+      ok: true,
+    });
+    expect(dashboardSession).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "sess-1", userId: "u" }),
+    );
+    expect(userTargets.calls).toEqual(["u"]);
+    expect(permission).toHaveBeenCalledWith({ tokenId: null, userId: "u" }, input.candidate);
+    expect(db.modelApiToken.findUnique).not.toHaveBeenCalled();
+  });
+
+  it.each(["ended", "blocked", "two_factor_required"] as const)(
+    "ends a Chat Test session whose dashboard session is %s",
+    async (verdict) => {
+      const input = await opened();
+      const permission = vi.fn(async () => null);
+      expect(
+        await recheckRealtimeAccess({
+          ...input,
+          credential: { kind: "dashboard", sessionId: "sess-1" },
+          dashboardSession: async () => verdict,
+          permission,
+        }),
+      ).toEqual({ ok: false, reason: "credential" });
+      expect(permission).not.toHaveBeenCalled();
+    },
+  );
+
+  it("resolves a Chat Test model among every model the user can see", async () => {
+    visible.targets = { directModels: [], modelPools: [poolTarget] };
+    userTargets.calls = [];
+    expect(
+      await resolveRealtimeModel({ kind: "dashboard", userId: "u" }, "owner/asr"),
+    ).toMatchObject({ kind: "pool" });
+    expect(
+      await resolveRealtimeModel({ kind: "dashboard", userId: "u" }, "owner/asr:external"),
+    ).toEqual({ error: "external_variant_unsupported" });
+    expect(userTargets.calls).toEqual(["u", "u"]);
   });
 });
