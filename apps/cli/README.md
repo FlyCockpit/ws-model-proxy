@@ -44,6 +44,8 @@ wsmp token login WSMP_TOKEN         # store the env var name for a CLI token
 wsmp config path                    # where the config file lives
 wsmp config --json show             # print config as JSON
 wsmp config init                    # write a default config
+wsmp config set-server https://wsmp.example.com   # the server this CLI connects to
+wsmp config set-server http://10.0.0.5:3000 --public-origin https://wsmp.example.com  # connect over the LAN, sign the public origin
 wsmp config set-slug desk-01        # set this CLI connection's slug
 wsmp endpoints add local http://127.0.0.1:11434
 wsmp endpoints add local http://127.0.0.1:11434 --expand-media  # inline WMP media URLs
@@ -76,6 +78,24 @@ wsmp completions zsh                # shell completions
 ```
 
 Configuration is stored in a JSON file. `wsmp config path` prints the resolved path for the current platform. `WSMP_CONFIG` selects that file. `WSMP_STATE_DIR` selects the state directory used by the daemon (PID file, control socket, `terminal-identity.json`, and durable `load-counters.json`) and by `wsmp terminal approve` (pending and approved browser identities). When it is unset, the CLI uses `$XDG_STATE_HOME/ws-model-proxy` or `~/.local/state/ws-model-proxy`. The state directory must be writable: connecting fails if the persistent identity key cannot be loaded or created. Logs go to stderr; pass `-v`/`-vv` for more, `--quiet` for less, or set `WSMP_LOG`. HTTP and WebSocket client libraries (`tungstenite`, `ureq`, `reqwest`, `hyper`) stay at INFO even at trace, because their debug output contains credentials and relay traffic; name one explicitly (for example `WSMP_LOG=tungstenite=trace`) only when you need it and will not share the output.
+
+The relay hello signs the server's origin, and the CLI signs only the origin
+configured on this machine: `--public-origin` when set, else the server URL's
+origin. The server never chooses it. If this machine reaches the server
+through another address than its public URL (a LAN IP or an internal
+hostname), pin the server's public origin (the origin of its
+`BETTER_AUTH_URL`) with `wsmp config set-server <connect URL> --public-origin
+<origin>` and restart wsmp; no new login is needed. The public origin is
+`scheme://host[:port]` with no path or credentials, and its host must be an IP
+address or a DNS name of ASCII letters, digits and hyphens. A plain-http
+origin is accepted, for a LAN server whose `BETTER_AUTH_URL` is http: it is
+only the name the signature binds. `set-server` warns when the connect URL
+itself is plain http off loopback, since the credential and relay traffic go
+there unencrypted.
+`wsmp config show` prints the effective `helloOrigin`, and `wsmp login` warns
+when the server's origin differs from it. That warning and the relay's refusal
+suggest the exact command, with its arguments single-quoted (for PowerShell on
+Windows), but only when the server's origin is a valid public origin.
 
 ### MCP commands
 

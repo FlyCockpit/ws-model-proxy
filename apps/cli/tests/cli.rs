@@ -171,6 +171,101 @@ fn config_set_server_and_slug_write_json() {
 }
 
 #[test]
+fn config_set_server_pins_and_clears_a_public_origin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config.json");
+    let state = tmp.path().join("state");
+    cli(&config, &state)
+        .args(["config", "init"])
+        .assert()
+        .success();
+
+    let mut set = cli(&config, &state);
+    set.args([
+        "config",
+        "--json",
+        "set-server",
+        "http://10.0.0.5:3000",
+        "--public-origin",
+        "https://WSMP.example.com:443/",
+    ]);
+    let value = json_stdout(set);
+    assert_eq!(value["value"], "http://10.0.0.5:3000");
+    // Stored canonical: lowercase host, default port and root path dropped.
+    assert_eq!(value["publicOrigin"], "https://wsmp.example.com");
+    let mut show = cli(&config, &state);
+    show.args(["config", "--json", "show"]);
+    let shown = json_stdout(show);
+    assert_eq!(shown["serverUrl"], "http://10.0.0.5:3000");
+    assert_eq!(shown["publicOrigin"], "https://wsmp.example.com");
+    assert_eq!(shown["helloOrigin"], "https://wsmp.example.com");
+
+    // Not an origin, or a host a shell would interpret: refused, config
+    // unchanged. Built at run time so the source holds no literal credential URL for secret scanners.
+    let with_credentials = format!("https://{}:{}@wsmp.example.com", "user", "pw");
+    for bad in [
+        "https://wsmp.example.com/app",
+        with_credentials.as_str(),
+        "ftp://wsmp.example.com",
+        "https://wsmp.example.com/?x=1",
+        "https://a$({touch,pwned}).com",
+        "https://a;id.com",
+    ] {
+        cli(&config, &state)
+            .args(["config", "set-server", "http://10.0.0.5:3000"])
+            .args(["--public-origin", bad])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("public origin"));
+    }
+    let cfg: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(cfg["publicOrigin"], "https://wsmp.example.com");
+
+    // Setting the server again without the flag clears the pin, and says so.
+    cli(&config, &state)
+        .args(["config", "set-server", "http://10.0.0.5:3000"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "cleared the pinned public origin `https://wsmp.example.com`",
+        ));
+    let mut show = cli(&config, &state);
+    show.args(["config", "--json", "show"]);
+    let shown = json_stdout(show);
+    assert!(shown.get("publicOrigin").is_none());
+    assert_eq!(shown["helloOrigin"], "http://10.0.0.5:3000");
+
+    // The warning is about the connect URL, where the traffic goes: a
+    // plain-http LAN connect URL warns, a plain-http pin alone does not.
+    cli(&config, &state)
+        .args(["config", "set-server", "http://10.0.0.5:3000"])
+        .args(["--public-origin", "http://wsmp.lan:3000"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "the server URL `http://10.0.0.5:3000` uses plain http",
+        ));
+    cli(&config, &state)
+        .args(["config", "set-server", "https://wsmp.example.com"])
+        .args(["--public-origin", "http://wsmp.lan:3000"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("plain http").not());
+    cli(&config, &state)
+        .args(["config", "set-server", "http://127.0.0.1:3000"])
+        .args(["--public-origin", "http://wsmp.lan:3000"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("plain http").not());
+    // Clearing the pin via --json names it.
+    let mut clear = cli(&config, &state);
+    clear.args(["config", "--json", "set-server", "http://10.0.0.5:3000"]);
+    let value = json_stdout(clear);
+    assert_eq!(value["clearedPublicOrigin"], "http://wsmp.lan:3000");
+    assert!(value["publicOrigin"].is_null());
+}
+
+#[test]
 fn token_login_records_env_var_name_not_secret_value() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config.json");
@@ -1781,9 +1876,12 @@ mod signal_shutdown {
                 stream
                     .write_all(response.as_bytes())
                     .expect("write handshake");
+                // The CLI signs only its configured server's origin.
                 write_text(
                     &mut stream,
-                    r#"{"type":"hello.challenge","nonce":"AAECAwQFBgcICQoLDA0ODw","origin":"http://127.0.0.1"}"#,
+                    &format!(
+                        r#"{{"type":"hello.challenge","nonce":"AAECAwQFBgcICQoLDA0ODw","origin":"http://{addr}"}}"#
+                    ),
                 );
                 let _ = socket_tx.send(stream.try_clone().expect("clone relay socket"));
                 while let Some((opcode, payload)) = read_frame(&mut stream) {

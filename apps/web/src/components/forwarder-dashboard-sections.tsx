@@ -3811,10 +3811,11 @@ function TokenTable<TToken extends CliToken | ModelApiToken>({
               <td className="p-3 align-top">
                 {"scopeMode" in token ? (
                   <span>
-                    {token.scopeMode}
                     {token.scopeMode === "ALLOWLIST"
-                      ? ` (${token.allowlist.directModelCount + token.allowlist.modelPoolCount})`
-                      : ""}
+                      ? t("dashboard:tokens.allowlistCount", {
+                          count: token.allowlist.directModelCount + token.allowlist.modelPoolCount,
+                        })
+                      : t("dashboard:tokens.allVisible")}
                   </span>
                 ) : (
                   "—"

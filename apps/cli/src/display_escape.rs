@@ -60,9 +60,28 @@ pub fn escape_for_display(text: &str) -> String {
     out
 }
 
+/// [`escape_for_display`] for text printed on one terminal line, such as a
+/// server-supplied URL or code: line feeds are escaped too, so no escape
+/// sequence (including an OSC 8 hyperlink) or line break reaches the terminal.
+pub fn escape_single_line(text: &str) -> String {
+    escape_for_display(text).replace('\n', "\\u{a}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_line_escape_neutralizes_terminal_sequences() {
+        let hostile = "https://a.test/\u{1b}]8;;https://evil.test\u{7}x\u{1b}]8;;\u{7}\nnext\u{9b}31m\u{202e}";
+        let shown = escape_single_line(hostile);
+        assert!(!shown.chars().any(|ch| ch.is_control()), "{shown}");
+        assert!(!shown.contains('\u{202e}'));
+        assert_eq!(
+            shown,
+            "https://a.test/\\u{1b}]8;;https://evil.test\\u{7}x\\u{1b}]8;;\\u{7}\\u{a}next\\u{9b}31m\\u{202e}"
+        );
+    }
 
     #[derive(serde::Deserialize)]
     struct Shared {

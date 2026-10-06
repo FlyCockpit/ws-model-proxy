@@ -748,11 +748,12 @@ fn load_reconnect_candidate(active: &Config) -> Result<(Config, SystemTime)> {
     let candidate = Config::load_required()?;
     candidate.validate()?;
     if candidate.server_url != active.server_url
+        || candidate.public_origin != active.public_origin
         || candidate.cli_slug != active.cli_slug
         || candidate.cli_token_env != active.cli_token_env
     {
         anyhow::bail!(
-            "server URL, CLI slug, or credential source changed; restart the relay to apply it"
+            "server URL, public origin, CLI slug, or credential source changed; restart the relay to apply it"
         );
     }
     Ok((candidate, config_file_modified_at()?))
@@ -1117,12 +1118,15 @@ fn run_relay_session(
         )
     };
 
+    let server_url = config.server_url.as_deref().unwrap_or_default();
+    let hello_origin = config.hello_origin().map_err(RelaySessionError::Fatal)?;
     let identity = startup.identity().ok_or_else(|| {
         RelaySessionError::Fatal(anyhow::anyhow!(
             "CLI identity key is unavailable; cannot bind this device"
         ))
     })?;
     let (nonce, origin) = wait_for_hello_challenge(&mut socket)?;
+    check_hello_origin(&origin, &hello_origin, server_url)?;
     let identity_signature = identity
         .sign_hello(&nonce, cli_slug, &origin)
         .map_err(RelaySessionError::Fatal)?;
@@ -3894,6 +3898,42 @@ fn old_server_upgrade_error() -> RelaySessionError {
     ))
 }
 
+/// Refuses to sign a hello origin other than the one this CLI trusts.
+///
+/// The signature binds the origin so it cannot be replayed to another server.
+/// Signing whatever origin the challenge names would let a relay or a
+/// wrong-URL server that already holds the bearer credential forward a valid
+/// signature to the real server. So the origin must be `expected`: the public
+/// origin a person pinned on this machine, else the server URL's origin
+/// ([`Config::hello_origin`]). The server never chooses it.
+fn check_hello_origin(
+    challenge_origin: &str,
+    expected: &str,
+    server_url: &str,
+) -> RelaySessionResult<()> {
+    if challenge_origin == expected {
+        return Ok(());
+    }
+    let shown = crate::display_escape::escape_single_line(challenge_origin);
+    // Suggest the pin only for a value that is itself a valid public origin,
+    // with both arguments quoted for this platform's shell.
+    let fix = crate::config::set_server_command(server_url, challenge_origin)
+        .map(|command| {
+            format!(
+                " If `{shown}` is your server's public address, run `{}` and restart wsmp; \
+                 no new login is needed.",
+                crate::display_escape::escape_single_line(&command)
+            )
+        })
+        .unwrap_or_else(|| {
+            " Check the server URL and public origin with `wsmp config show`.".to_string()
+        });
+    Err(RelaySessionError::Fatal(anyhow::anyhow!(
+        "server hello names origin `{shown}`, but this CLI signs only `{expected}`; \
+         refusing to sign it.{fix}"
+    )))
+}
+
 fn wait_for_hello_challenge<S>(
     socket: &mut tungstenite::WebSocket<S>,
 ) -> RelaySessionResult<(String, String)>
@@ -4809,6 +4849,106 @@ mod tests {
                 "https://example.test".to_string()
             )
         );
+    }
+
+    fn config_with(server_url: &str, public_origin: Option<&str>) -> Config {
+        Config {
+            server_url: Some(server_url.to_string()),
+            public_origin: public_origin.map(str::to_string),
+            ..Config::default()
+        }
+    }
+
+    fn refusal(origin: &str, config: &Config) -> String {
+        let expected = config.hello_origin().expect("hello origin");
+        let server_url = config.server_url.as_deref().expect("server URL");
+        match check_hello_origin(origin, &expected, server_url) {
+            Err(RelaySessionError::Fatal(error)) => error.to_string(),
+            _ => panic!("{origin:?} must be refused as fatal"),
+        }
+    }
+
+    #[test]
+    fn hello_origin_defaults_to_the_server_url_origin() {
+        for (server_url, origin) in [
+            (
+                "https://proxy.example.com/base/",
+                "https://proxy.example.com",
+            ),
+            ("http://127.0.0.1:3000", "http://127.0.0.1:3000"),
+            ("https://proxy.example.com:443", "https://proxy.example.com"),
+            // An http LAN URL with no pin keeps working as before.
+            ("http://10.0.0.5:3000", "http://10.0.0.5:3000"),
+        ] {
+            let config = config_with(server_url, None);
+            assert_eq!(config.hello_origin().unwrap(), origin);
+            assert!(check_hello_origin(origin, origin, server_url).is_ok());
+        }
+
+        let config = config_with("https://proxy.example.com", None);
+        for origin in [
+            "https://other.example.com",
+            "http://proxy.example.com",
+            "https://proxy.example.com:8443",
+            "https://proxy.example.com/",
+            "https://PROXY.example.com",
+            "null",
+        ] {
+            assert!(refusal(origin, &config).contains("refusing to sign"));
+        }
+    }
+
+    #[test]
+    fn a_pinned_public_origin_is_the_only_origin_signed() {
+        // Connect over the LAN, sign the public origin.
+        let config = config_with("http://10.0.0.5:3000", Some("https://wsmp.example.com"));
+        assert_eq!(config.hello_origin().unwrap(), "https://wsmp.example.com");
+        assert!(
+            check_hello_origin(
+                "https://wsmp.example.com",
+                "https://wsmp.example.com",
+                "http://10.0.0.5:3000"
+            )
+            .is_ok()
+        );
+        // The connect address itself is no longer signed once a pin exists.
+        let error = refusal("http://10.0.0.5:3000", &config);
+        assert!(
+            error.contains("signs only `https://wsmp.example.com`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn hello_origin_refusal_names_the_exact_fix() {
+        let config = config_with("http://10.0.0.5:3000", None);
+        let error = refusal("https://wsmp.example.com", &config);
+        assert!(
+            error.contains(
+                "run `wsmp config set-server 'http://10.0.0.5:3000' --public-origin 'https://wsmp.example.com'` and restart wsmp; no new login is needed"
+            ),
+            "{error}"
+        );
+        // A plain-http LAN origin can be pinned too.
+        let error = refusal("http://wsmp.lan:3000", &config);
+        assert!(
+            error.contains("--public-origin 'http://wsmp.lan:3000'"),
+            "{error}"
+        );
+        // A host the URL parser accepts but a shell would run gets no command,
+        // and terminal control characters are shown escaped.
+        for hostile in [
+            "https://a$({touch,pwned}).com",
+            "https://a`id`.com",
+            "https://a;id.com",
+            "https://a&calc.com",
+            "http://evil.example\u{1b}]8;;x\u{7}",
+        ] {
+            let error = refusal(hostile, &config);
+            assert!(!error.contains("--public-origin"), "{error}");
+            assert!(!error.contains("set-server"), "{error}");
+            assert!(!error.chars().any(|ch| ch.is_control()), "{error}");
+        }
     }
 
     /// A malformed `exec.start` / `term.spawn` names a command but cannot be

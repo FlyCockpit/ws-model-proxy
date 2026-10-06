@@ -24,6 +24,10 @@ struct ApprovalFile {
     /// Insertion order for the pending file. Empty on older files.
     #[serde(default)]
     order: Vec<String>,
+    /// Pending file only: codes that two different browser identities asked
+    /// for. Neither can be approved by that code until it is revoked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    conflicted: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -40,12 +44,43 @@ pub fn approved_path(state_dir: &Path) -> PathBuf {
     state_dir.join(APPROVED_FILE)
 }
 
+/// Records a browser identity that asked for approval and returns its code.
+///
+/// Codes are short (40 bits), so another identity with the same code can be
+/// ground. A code is never moved to a different identity: one already
+/// approved for another identity is refused, and a pending one is marked
+/// conflicted, so neither identity can be approved by that code.
 pub fn record_pending(state_dir: &Path, public_raw: &[u8; 65]) -> Result<String> {
     let code = approval_code(public_raw);
     let public_key = encode_b64url(public_raw);
+    if read_file(&approved_path(state_dir))?
+        .get(&code)
+        .is_some_and(|approved| approved != &public_key)
+    {
+        anyhow::bail!(
+            "terminal approval code `{code}` is already approved for another browser identity"
+        );
+    }
     let mut file = read_approval(&pending_path(state_dir))?;
+    if file.conflicted.contains(&code) {
+        anyhow::bail!("{}", conflicted_message(&code));
+    }
     if file.order.is_empty() {
         file.order = file.entries.keys().cloned().collect();
+    }
+    if file
+        .entries
+        .get(&code)
+        .is_some_and(|pending| pending != &public_key)
+    {
+        file.entries.remove(&code);
+        file.order.retain(|existing| existing != &code);
+        file.conflicted.push(code.clone());
+        if file.conflicted.len() > PENDING_CAP {
+            file.conflicted.remove(0);
+        }
+        write_approval(&pending_path(state_dir), &file)?;
+        anyhow::bail!("{}", conflicted_message(&code));
     }
     file.entries.insert(code.clone(), public_key);
     file.order.retain(|existing| existing != &code);
@@ -79,16 +114,37 @@ pub fn approved_public_key(state_dir: &Path, code: &str) -> Result<Option<[u8; 6
 pub fn approve(state_dir: &Path, code: &str) -> Result<String> {
     let code = normalize_code(code)?;
     let mut pending = read_approval(&pending_path(state_dir))?;
+    if pending.conflicted.contains(&code) {
+        anyhow::bail!("{}", conflicted_message(&code));
+    }
     let Some(public_key) = pending.entries.remove(&code) else {
         return Err(anyhow::anyhow!("terminal approval `{code}` not found")
             .context(CodedError::new(ExitCode::NotFound)));
     };
+    let mut approved = read_file(&approved_path(state_dir))?;
+    if approved
+        .get(&code)
+        .is_some_and(|existing| existing != &public_key)
+    {
+        anyhow::bail!(
+            "terminal approval code `{code}` is already approved for another browser identity; \
+             it is not replaced"
+        );
+    }
     pending.order.retain(|existing| existing != &code);
     write_approval(&pending_path(state_dir), &pending)?;
-    let mut approved = read_file(&approved_path(state_dir))?;
     approved.insert(code.clone(), public_key);
     write_file(&approved_path(state_dir), &approved)?;
     Ok(code)
+}
+
+fn conflicted_message(code: &str) -> String {
+    format!(
+        "terminal approval code `{code}` was requested by two different browser identities, \
+         so it cannot be approved; run `wsmp terminal approvals revoke {code}` to clear it. \
+         If your browser shows this code again, clear the dashboard's site data in that \
+         browser so it creates a new identity"
+    )
 }
 
 pub fn list(state_dir: &Path) -> Result<Vec<ApprovalEntry>> {
@@ -104,7 +160,9 @@ pub fn revoke(state_dir: &Path, code: &str) -> Result<String> {
     let mut approved = read_file(&approved_path(state_dir))?;
     let mut pending = read_approval(&pending_path(state_dir))?;
     let removed_approved = approved.remove(&code).is_some();
-    let removed_pending = pending.entries.remove(&code).is_some();
+    let removed_conflict = pending.conflicted.contains(&code);
+    pending.conflicted.retain(|existing| existing != &code);
+    let removed_pending = pending.entries.remove(&code).is_some() || removed_conflict;
     if !removed_approved && !removed_pending {
         return Err(anyhow::anyhow!("terminal approval `{code}` not found")
             .context(CodedError::new(ExitCode::NotFound)));
@@ -152,6 +210,7 @@ fn write_file(path: &Path, entries: &BTreeMap<String, String>) -> Result<()> {
         &ApprovalFile {
             entries: entries.clone(),
             order: Vec::new(),
+            conflicted: Vec::new(),
         },
     )
 }
@@ -317,6 +376,97 @@ mod tests {
         assert_eq!(file.order.len(), 64);
         assert!(!file.entries.contains_key(&first));
         assert!(!file.order.iter().any(|code| code == &first));
+    }
+
+    /// Two distinct keys; the tests make `other` claim `key`'s code, standing
+    /// in for a ground 40-bit collision.
+    fn two_keys() -> (CliTerminalKey, CliTerminalKey) {
+        (
+            CliTerminalKey::generate().expect("key"),
+            CliTerminalKey::generate().expect("other"),
+        )
+    }
+
+    #[test]
+    fn a_pending_code_collision_blocks_both_identities() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (key, other) = two_keys();
+        let code = record_pending(dir.path(), key.public_raw()).expect("pending");
+        // Recording the same identity again is not a collision.
+        assert_eq!(
+            record_pending(dir.path(), key.public_raw()).expect("again"),
+            code
+        );
+        // Another identity got there first with the same code.
+        let mut file = read_approval(&pending_path(dir.path())).expect("read");
+        file.entries
+            .insert(code.clone(), encode_b64url(other.public_raw()));
+        write_approval(&pending_path(dir.path()), &file).expect("write");
+
+        let error = record_pending(dir.path(), key.public_raw()).expect_err("collision");
+        assert!(
+            error
+                .to_string()
+                .contains("two different browser identities")
+        );
+        let file = read_approval(&pending_path(dir.path())).expect("read");
+        assert!(
+            !file.entries.contains_key(&code),
+            "neither key stays pending"
+        );
+        assert_eq!(file.conflicted, vec![code.clone()]);
+
+        // Neither identity can be approved by the code, nor re-recorded.
+        assert!(approve(dir.path(), &code).is_err());
+        assert!(record_pending(dir.path(), key.public_raw()).is_err());
+        assert!(
+            approved_public_key(dir.path(), &code)
+                .expect("read")
+                .is_none()
+        );
+
+        // Revoking the code clears the block.
+        revoke(dir.path(), &code).expect("revoke clears the conflict");
+        assert_eq!(
+            record_pending(dir.path(), key.public_raw()).expect("pending"),
+            code
+        );
+        approve(dir.path(), &code).expect("approve");
+        assert_eq!(
+            approved_public_key(dir.path(), &code).expect("approved"),
+            Some(*key.public_raw())
+        );
+    }
+
+    #[test]
+    fn an_approved_code_is_never_moved_to_another_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (key, other) = two_keys();
+        let code = record_pending(dir.path(), key.public_raw()).expect("pending");
+        approve(dir.path(), &code).expect("approve");
+
+        // A colliding identity cannot become pending under the approved code.
+        let mut approved = read_file(&approved_path(dir.path())).expect("read");
+        approved.insert(code.clone(), encode_b64url(other.public_raw()));
+        write_file(&approved_path(dir.path()), &approved).expect("write");
+        let error = record_pending(dir.path(), key.public_raw()).expect_err("approved for other");
+        assert!(error.to_string().contains("already approved"));
+
+        // Nor can a pending entry for it replace the approved identity.
+        approved.insert(code.clone(), encode_b64url(key.public_raw()));
+        write_file(&approved_path(dir.path()), &approved).expect("write");
+        let mut pending = read_approval(&pending_path(dir.path())).expect("read");
+        pending
+            .entries
+            .insert(code.clone(), encode_b64url(other.public_raw()));
+        pending.order.push(code.clone());
+        write_approval(&pending_path(dir.path()), &pending).expect("write");
+        let error = approve(dir.path(), &code).expect_err("no overwrite");
+        assert!(error.to_string().contains("not replaced"));
+        assert_eq!(
+            approved_public_key(dir.path(), &code).expect("approved"),
+            Some(*key.public_raw())
+        );
     }
 
     #[test]

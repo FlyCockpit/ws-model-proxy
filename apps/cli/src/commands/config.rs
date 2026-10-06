@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
-use crate::config::{Config, McpCommandMode};
+use crate::config::{Config, McpCommandMode, normalize_public_origin, server_url_http_warning};
 use crate::output;
 use crate::slug::validate_slug;
 
@@ -45,8 +45,23 @@ enum Sub {
     Init,
     /// Print the effective JSON config.
     Show,
-    /// Set the self-hosted web app server URL.
-    SetServer { url: String },
+    /// Set the self-hosted web app server URL this CLI connects to.
+    ///
+    /// The relay hello signs the server's origin, and the CLI signs only the
+    /// origin set here: `--public-origin`, else this URL's origin. When this
+    /// machine reaches the server through another address (a LAN IP or an
+    /// internal hostname), pass the server's public origin (the origin of its
+    /// `BETTER_AUTH_URL`), for example
+    /// `wsmp config set-server http://10.0.0.5:3000 --public-origin https://wsmp.example.com`.
+    /// Setting the server again without `--public-origin` clears it. Restart
+    /// wsmp to apply; no new login is needed.
+    SetServer {
+        url: String,
+        /// The server's public origin (`https://host[:port]`) when it differs
+        /// from the URL's origin. Plain http is accepted.
+        #[arg(long)]
+        public_origin: Option<String>,
+    },
     /// Set this CLI connection's slug.
     SetSlug { slug: String },
     /// Allow browser terminals. Takes effect the next time wsmp starts.
@@ -184,6 +199,16 @@ pub fn run(args: &Args) -> Result<()> {
             shown["mcpFileRead"] = cfg.mcp_file_read.into();
             shown["fileRoots"] = serde_json::to_value(&cfg.file_roots)?;
             shown["maxTerminals"] = cfg.effective_max_terminals().into();
+            // The origin the relay hello signs (pinned, else the server URL's).
+            if cfg.server_url.is_some() || cfg.public_origin.is_some() {
+                shown["helloOrigin"] = match cfg.hello_origin() {
+                    Ok(origin) => origin.into(),
+                    Err(error) => {
+                        output::diagnostic(format!("warning: {error:#}"))?;
+                        serde_json::Value::Null
+                    }
+                };
+            }
             // An out-of-range value is shown as written, but flagged: the
             // relay refuses to start with it, so no limit is in effect.
             if let Err(error) = cfg.validate_max_terminals() {
@@ -199,19 +224,42 @@ pub fn run(args: &Args) -> Result<()> {
                 output::line("")?;
             }
         }
-        Sub::SetServer { url } => {
+        Sub::SetServer { url, public_origin } => {
             url::Url::parse(url).with_context(|| format!("parsing server URL `{url}`"))?;
-            Config::update(false, |cfg| {
+            let public_origin = public_origin
+                .as_deref()
+                .map(|origin| {
+                    normalize_public_origin(origin)
+                        .with_context(|| format!("checking public origin `{origin}`"))
+                })
+                .transpose()?;
+            // The pin dropped by setting the server again without the flag.
+            let cleared = Config::update(false, |cfg| {
                 cfg.server_url = Some(url.clone());
-                Ok(())
+                let previous = std::mem::replace(&mut cfg.public_origin, public_origin.clone());
+                Ok(previous.filter(|_| public_origin.is_none()))
             })?;
+            // The CLI's traffic goes to the connect URL; a plain-http public
+            // origin is only a name and needs no warning.
+            if let Some(warning) = server_url_http_warning(url) {
+                output::diagnostic(warning)?;
+            }
             if args.json {
-                output::json(&SetValue {
+                output::json(&SetServer {
                     key: "serverUrl",
                     value: url,
+                    public_origin: public_origin.as_deref(),
+                    cleared_public_origin: cleared.as_deref(),
                 })?;
             } else {
                 output::line(format!("set server URL to `{url}`"))?;
+                match (&public_origin, &cleared) {
+                    (Some(origin), _) => output::line(format!("set public origin to `{origin}`"))?,
+                    (None, Some(previous)) => output::line(format!(
+                        "cleared the pinned public origin `{previous}`; the relay now signs the server URL's origin"
+                    ))?,
+                    (None, None) => output::line("public origin: the server URL's origin")?,
+                }
             }
         }
         Sub::SetSlug { slug } => {
@@ -384,6 +432,19 @@ impl ConfigInit {
             created,
         }
     }
+}
+
+/// `set-server --json`: the `SetValue` shape plus the pinned public origin
+/// (`null` when the server URL's origin is used).
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetServer<'a> {
+    key: &'static str,
+    value: &'a str,
+    public_origin: Option<&'a str>,
+    /// The previously pinned origin this call removed, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cleared_public_origin: Option<&'a str>,
 }
 
 #[derive(Debug, Serialize)]
