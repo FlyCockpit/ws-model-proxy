@@ -22,6 +22,9 @@ export type CallerActor = {
  * as USER would show its commands as person-written to whoever reviews them.
  */
 export function callerActor(auth: CallerAuth | AnonymousAuth, userId: string): CallerActor {
+  // Read-only agents never write (the MCP layer hides write tools too; this is the backstop).
+  if ((auth.kind === "agent_token" || auth.kind === "oauth_access_token") && auth.level !== "FULL")
+    throw new ORPCError("FORBIDDEN", { message: "A Read-only agent cannot change anything." });
   if (auth.kind === "agent_token")
     return { actor: "AGENT", actorUserId: userId, agentTokenId: auth.agentTokenId };
   if (auth.kind === "oauth_access_token")

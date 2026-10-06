@@ -38,6 +38,7 @@ import {
   versionDetail,
   versionSummary,
 } from "../lib/runtime-views";
+import { runSerializableTransaction } from "../lib/serializable-transaction";
 import { runtimeStart, runtimeStop } from "./runtime-lifecycle";
 
 function userIdOf(context: SignedInContext): string {
@@ -237,6 +238,11 @@ function runtimeModelView(model: RuntimeModelRow) {
 }
 
 /** A version the caller may read: of their own runtime, or of one shared with them. */
+/** Grantees see whether a person or an agent edited a version, never the owner's ids. */
+function redactedEditor(editor: ReturnType<typeof versionSummary>["editor"]) {
+  return { actor: editor.actor, userId: null, agentTokenId: null, label: null };
+}
+
 async function readableVersion(userId: string, versionId: string) {
   const version = await prisma.runtimeVersion.findFirst({
     where: {
@@ -352,9 +358,10 @@ export const runtimesRouter = {
           id: input.runtimeId,
           OR: [{ userId }, { Shares: { some: { granteeUserId: userId } } }],
         },
-        select: { id: true },
+        select: { id: true, userId: true },
       });
       if (!runtime) throw notFound("That runtime does not exist.");
+      const forGrantee = runtime.userId !== userId;
       const before = input.cursor ? Number.parseInt(input.cursor, 10) : null;
       const rows = await prisma.runtimeVersion.findMany({
         where: {
@@ -371,7 +378,10 @@ export const runtimesRouter = {
       // `rows` holds one version past the page, so every item's predecessor is in it (or the
       // item is version 1).
       const hashes = previousLaunchHashes(rows);
-      const items = page.map((row) => versionSummary(row, hashes.get(row.version) ?? null));
+      const items = page.map((row) => {
+        const summary = versionSummary(row, hashes.get(row.version) ?? null);
+        return forGrantee ? { ...summary, editor: redactedEditor(summary.editor) } : summary;
+      });
       const last = page.at(-1);
       return {
         items,
@@ -379,8 +389,14 @@ export const runtimesRouter = {
       };
     }),
     get: contractProcedure(c.versions.get).handler(async ({ input, context }) => {
-      const version = await readableVersion(userIdOf(context), input.versionId);
-      return versionDetail(version, await previousLaunchHashOf(version.runtimeId, version.version));
+      const userId = userIdOf(context);
+      const version = await readableVersion(userId, input.versionId);
+      const detail = versionDetail(
+        version,
+        await previousLaunchHashOf(version.runtimeId, version.version),
+      );
+      const owned = await prisma.runtime.count({ where: { id: version.runtimeId, userId } });
+      return owned > 0 ? detail : { ...detail, editor: redactedEditor(detail.editor) };
     }),
   },
 
@@ -476,20 +492,6 @@ export const runtimesRouter = {
         );
     }
 
-    const instances = await prisma.runtimeInstance.findMany({
-      where: { runtimeId: runtime.id, userId, ...ACTIVE_INSTANCE },
-      select: {
-        id: true,
-        desiredState: true,
-        LaunchVersion: { select: { launchHash: true } },
-        Ranks: {
-          select: {
-            claim: true,
-            Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } },
-          },
-        },
-      },
-    });
     const agent = agentRulesApply(context.auth);
     const adoptedLive: string[] = [];
     const restarted: string[] = [];
@@ -497,29 +499,50 @@ export const runtimesRouter = {
       instanceId: string;
       reason: "launch_changed" | "trust_relay" | "interactive_needs_person";
     }> = [];
-    for (const instance of instances) {
-      // Always-on: the address is the launch; nothing to restart. A started instance adopts
-      // live only when what it launched has the new launch hash (an earlier launch change it
-      // was never restarted for still needs a restart).
-      if (instance.desiredState === null || instance.LaunchVersion.launchHash === hashes.launchHash)
-        adoptedLive.push(instance.id);
-      else if (
-        !input.restartRunning ||
-        // Released claims (failed, stopped ranks) are re-placed by a start, not here.
-        instance.Ranks.some((rank) => rank.claim !== "HELD")
-      )
-        needsRestart.push({ instanceId: instance.id, reason: "launch_changed" });
-      else if (
-        agent &&
-        instance.Ranks.some((rank) => !rank.Node || effectiveTrust(rank.Node) !== "FULL")
-      )
-        needsRestart.push({ instanceId: instance.id, reason: "trust_relay" });
-      else if (agent && specIsInteractive(spec))
-        needsRestart.push({ instanceId: instance.id, reason: "interactive_needs_person" });
-      else restarted.push(instance.id);
-    }
+    const { version, operationId } = await runSerializableTransaction(async (tx) => {
+      // Read and classify inside the serializable transaction (trust may change meanwhile).
+      adoptedLive.length = 0;
+      restarted.length = 0;
+      needsRestart.length = 0;
+      const instances = await tx.runtimeInstance.findMany({
+        where: { runtimeId: runtime.id, userId, ...ACTIVE_INSTANCE },
+        select: {
+          id: true,
+          desiredState: true,
+          LaunchVersion: { select: { launchHash: true } },
+          Ranks: {
+            select: {
+              claim: true,
+              Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } },
+            },
+          },
+        },
+      });
+      for (const instance of instances) {
+        // Always-on: the address is the launch; nothing to restart. A started instance adopts
+        // live only when what it launched has the new launch hash (an earlier launch change it
+        // was never restarted for still needs a restart).
+        if (
+          instance.desiredState === null ||
+          instance.LaunchVersion.launchHash === hashes.launchHash
+        )
+          adoptedLive.push(instance.id);
+        else if (
+          !input.restartRunning ||
+          // Released claims (failed, stopped ranks) are re-placed by a start, not here.
+          instance.Ranks.some((rank) => rank.claim !== "HELD")
+        )
+          needsRestart.push({ instanceId: instance.id, reason: "launch_changed" });
+        else if (
+          agent &&
+          instance.Ranks.some((rank) => !rank.Node || effectiveTrust(rank.Node) !== "FULL")
+        )
+          needsRestart.push({ instanceId: instance.id, reason: "trust_relay" });
+        else if (agent && specIsInteractive(spec))
+          needsRestart.push({ instanceId: instance.id, reason: "interactive_needs_person" });
+        else restarted.push(instance.id);
+      }
 
-    const { version, operationId } = await prisma.$transaction(async (tx) => {
       const created = await createVersion(tx, {
         runtimeId: runtime.id,
         version: current.version + 1,
@@ -770,8 +793,11 @@ export const runtimesRouter = {
               runtimeId: share.runtimeId,
               ownerEmail: share.Owner.email,
               name: share.Runtime.name,
-              // The grantee sees versions, not the owner's launch history.
-              currentVersion: versionSummary(current, null),
+              // The grantee sees the definition, not who on the owner's side edited it.
+              currentVersion: (() => {
+                const summary = versionSummary(current, null);
+                return { ...summary, editor: redactedEditor(summary.editor) };
+              })(),
             },
           ];
         }),

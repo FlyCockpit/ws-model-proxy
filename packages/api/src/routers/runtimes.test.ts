@@ -618,3 +618,36 @@ describe("review follow-ups", () => {
     });
   });
 });
+
+describe("second authz review follow-ups", () => {
+  it("a Read-only agent cannot write", async () => {
+    const readAgent = {
+      kind: "agent_token" as const,
+      userId: OWNER,
+      agentTokenId: "tok-r",
+      level: "READ" as const,
+    };
+    expect(
+      await reasonOf(
+        client(readAgent).create({ slug: "qwen", name: "Q", kind: "STARTABLE", spec: SPEC }),
+      ),
+    ).toBe("FORBIDDEN");
+    expect(await reasonOf(client(readAgent).stop({ instanceId: "inst-1" }))).toBe("FORBIDDEN");
+    expect(db.runtime.create).not.toHaveBeenCalled();
+    expect(db.runtimeInstance.findMany).not.toHaveBeenCalled();
+  });
+
+  it("a grantee reads versions without the owner's editor ids", async () => {
+    db.runtime.findFirst.mockResolvedValue({ id: "rt-1", userId: "someone-else" } as never);
+    db.runtimeVersion.findMany.mockResolvedValue([
+      versionRow({ editor: "AGENT", agentTokenId: "tok-owner" }),
+    ] as never);
+    const page = await client().versions.list({ runtimeId: "rt-1" });
+    expect(page.items[0]?.editor).toEqual({
+      actor: "AGENT",
+      userId: null,
+      agentTokenId: null,
+      label: null,
+    });
+  });
+});

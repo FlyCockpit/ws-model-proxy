@@ -440,27 +440,29 @@ export const runtimeStop = contractProcedure(c.stop).handler(async ({ input, con
           desiredState: "RUNNING" as const,
           ...(input.nodeId ? { Ranks: { some: { nodeId: input.nodeId } } } : {}),
         };
-  const instances = await prisma.runtimeInstance.findMany({
-    where,
-    select: {
-      id: true,
-      Ranks: {
-        select: { Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } } },
+  // Read, check and write in one serializable transaction, so a trust lowering that lands
+  // in between cannot let an agent's stop through.
+  const operationId = await runSerializableTransaction(async (tx) => {
+    const instances = await tx.runtimeInstance.findMany({
+      where,
+      select: {
+        id: true,
+        Ranks: {
+          select: { Node: { select: { id: true, trust: true, trustLowerRequestedAt: true } } },
+        },
       },
-    },
-  });
-  if (instances.length === 0) throw notFound("Nothing of this runtime is running there.");
-  if (agentRulesApply(context.auth))
-    for (const instance of instances)
-      for (const rank of instance.Ranks)
-        if (!rank.Node || effectiveTrust(rank.Node) !== "FULL")
-          throw refusal(
-            "trust_relay",
-            REFUSAL_MESSAGES.trust_relay ?? "trust_relay",
-            rank.Node?.id ?? instance.id,
-          );
-  const ids = instances.map((instance) => instance.id);
-  const operationId = await prisma.$transaction(async (tx) => {
+    });
+    if (instances.length === 0) throw notFound("Nothing of this runtime is running there.");
+    if (agentRulesApply(context.auth))
+      for (const instance of instances)
+        for (const rank of instance.Ranks)
+          if (!rank.Node || effectiveTrust(rank.Node) !== "FULL")
+            throw refusal(
+              "trust_relay",
+              REFUSAL_MESSAGES.trust_relay ?? "trust_relay",
+              rank.Node?.id ?? instance.id,
+            );
+    const ids = instances.map((instance) => instance.id);
     const operation = await tx.runtimeOperation.create({
       data: {
         userId,
