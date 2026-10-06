@@ -1,0 +1,364 @@
+// ───────────────────────────── Hot path (writer class H) ─────────────────────────────
+// No foreign keys to or from graph tables (DL-1). capacityId = RuntimeInstance.id;
+// executionTargetId = ExecutionTarget.id. Ported from 0.4-dev + limits-redesign.
+
+enum AdmissionSourceKind {
+  /// A pool request (API key, sidecar hop, or a pool test).
+  POOL
+  /// A direct runtime-model test from the web UI or model_test (never the public API).
+  TEST
+}
+
+enum AdmissionRequestState {
+  WAITING
+  ADMITTED
+  CANCELLED
+  EXPIRED
+  TERMINAL
+}
+
+enum CapacityWaiterState {
+  WAITING
+  ADMITTED
+  CANCELLED
+  EXPIRED
+}
+
+enum CapacityLeaseState {
+  ACTIVE
+  RELEASED
+  EXPIRED
+  RECLAIMED
+}
+
+enum RoutingVerdictValue {
+  NONE
+  AVOID
+  FULL
+}
+
+model AdmissionRequest {
+  id              String                @id @default(cuid(2))
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @default(now()) @updatedAt
+  userId          String
+  requestId       String
+  relayRequestId  String?
+  attemptId       String                @unique
+  sourceKind      AdmissionSourceKind
+  poolId          String?
+  testTargetId    String?
+  /// Priority class rank 0..2.
+  basePriority    Int
+  /// The share whose priorityClass set basePriority. No FK.
+  priorityShareId String?
+  warmSessionIds  String[]              @default([])
+  enqueueSequence BigInt
+  enqueuedAt      DateTime              @default(now())
+  deadlineAt      DateTime?
+  connectionOwner String
+  heartbeatAt     DateTime
+  state           AdmissionRequestState @default(WAITING)
+  terminalAt      DateTime?
+  terminalReason  String?
+  metricFailOpen  Boolean               @default(true)
+
+  Waiters CapacityWaiter[]
+  Lease   CapacityLease?
+
+  @@unique([userId, requestId, attemptId])
+  @@index([userId, state, deadlineAt])
+  @@index([state, heartbeatAt])
+  @@index([state, updatedAt])
+  @@index([basePriority, enqueueSequence, id])
+  @@index([relayRequestId])
+  @@index([poolId])
+  @@index([testTargetId])
+  @@map("admission_request")
+}
+
+model CapacityWaiter {
+  id                            String              @id @default(cuid(2))
+  createdAt                     DateTime            @default(now())
+  updatedAt                     DateTime            @default(now()) @updatedAt
+  userId                        String
+  admissionRequestId            String
+  requestId                     String
+  attemptId                     String
+  enqueueSequence               BigInt
+  capacityId                    String
+  executionTargetId             String
+  poolId                        String?
+  poolMemberId                  String?
+  candidateOrder                Int
+  deadlineAt                    DateTime?
+  notBefore                     DateTime?
+  effectivePriority             Int                 @default(1)
+  effectiveConcurrencyLimit     Int?
+  effectiveConcurrencyScope     String              @default("")
+  effectiveConcurrencyScopeId   String              @default("")
+  effectiveReservedSlots        Int                 @default(0)
+  effectiveBorrowReserved       Boolean             @default(true)
+  effectivePoolConcurrencyLimit Int?
+  state                         CapacityWaiterState @default(WAITING)
+  stateChangedAt                DateTime            @default(now())
+  terminalReason                String?
+
+  AdmissionRequest AdmissionRequest @relation(fields: [admissionRequestId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([admissionRequestId, candidateOrder])
+  @@unique([attemptId, candidateOrder])
+  @@unique([admissionRequestId, capacityId, executionTargetId, poolMemberId])
+  @@index([capacityId, state, deadlineAt, candidateOrder])
+  @@index([admissionRequestId, state])
+  @@index([poolMemberId, state])
+  @@index([executionTargetId])
+  @@index([poolId])
+  @@map("capacity_waiter")
+}
+
+model CapacityLease {
+  id                  String             @id @default(cuid(2))
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @default(now()) @updatedAt
+  userId              String
+  admissionRequestId  String             @unique
+  requestId           String
+  attemptId           String             @unique
+  capacityId          String
+  executionTargetId   String
+  poolId              String?
+  poolMemberId        String?
+  priority            Int
+  reservationClass    Int
+  borrowed            Boolean            @default(false)
+  fencingToken        BigInt
+  state               CapacityLeaseState @default(ACTIVE)
+  ownerServerInstance String
+  acquiredAt          DateTime           @default(now())
+  heartbeatAt         DateTime
+  expiresAt           DateTime
+  releasedAt          DateTime?
+  releaseReason       String?
+
+  AdmissionRequest AdmissionRequest @relation(fields: [admissionRequestId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([capacityId, fencingToken])
+  @@index([capacityId, state, expiresAt])
+  @@index([ownerServerInstance, state, heartbeatAt])
+  @@index([poolMemberId, state])
+  @@index([executionTargetId])
+  @@index([poolId])
+  @@map("capacity_lease")
+}
+
+/// Scheduler state per capacity (was CapacityRuntime). Version 2: three classes, HIGH first.
+model CapacityScheduler {
+  capacityId        String   @id
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @default(now()) @updatedAt
+  userId            String
+  schedulerCursor   Int      @default(2)
+  schedulerDeficits Json     @default("[0,0,0]")
+  schedulerVersion  Int      @default(2)
+  nextFencingToken  BigInt   @default(1)
+
+  @@index([userId])
+  @@map("capacity_scheduler")
+}
+
+model CapacityKvEviction {
+  capacityId        String   @id
+  userId            String
+  cutFraction       Float
+  observedAt        DateTime
+  expiresAt         DateTime
+  sessionIds        String[] @default([])
+  missCount         Int      @default(0)
+  continuationCount Int      @default(0)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("capacity_kv_eviction")
+}
+
+/// Metric-rule + engine-load verdict per (member, target). Plain non-locking reads only.
+model RoutingVerdict {
+  poolMemberId      String
+  executionTargetId String
+  userId            String
+  poolId            String
+  nodeId            String
+  verdict           RoutingVerdictValue
+  ruleStates        Json
+  engineState       String              @default("none")
+  evaluatedAt       DateTime
+  publisherId       String              @default("")
+  expiresAt         DateTime
+
+  @@id([poolMemberId, executionTargetId])
+  @@index([poolId])
+  @@index([expiresAt])
+  @@map("routing_verdict")
+}
+
+// ── Cache affinity (unchanged in shape; executionTargetId now means instance × model) ──
+
+model CacheAffinityScope {
+  poolId         String   @id
+  userId         String
+  generation     String
+  reclaimPending Boolean  @default(true)
+  reclaimAfter   DateTime @default(now())
+
+  @@index([userId])
+  @@index([reclaimPending, reclaimAfter, poolId])
+  @@map("cache_affinity_scope")
+}
+
+model CacheAffinityObserver {
+  capacityId           String
+  nodeId               String
+  instanceHandle       String
+  userId               String
+  managerId            String
+  connectionGeneration Int
+  version              String
+  validUntil           DateTime
+  retryAfter           DateTime @default(now())
+  pending              Boolean  @default(true)
+  retired              Boolean  @default(false)
+
+  @@id([capacityId, nodeId, instanceHandle])
+  @@index([userId])
+  @@index([managerId])
+  @@index([pending, validUntil])
+  @@index([retired, retryAfter])
+  @@map("cache_affinity_observer")
+}
+
+model CacheAffinityResidencyCursor {
+  id       Int      @id
+  cursor   String   @default("")
+  resumeAt DateTime @default(now())
+
+  @@map("cache_affinity_residency_cursor")
+}
+
+model CacheAffinityResidency {
+  executionTargetId String   @id
+  cacheGeneration   String   @default("")
+  userId            String
+  entries           Json     @default("[]")
+  complete          Boolean  @default(false)
+  revision          BigInt   @default(0)
+  repairEntries     Json     @default("[]")
+  repairCursor      String?
+  repairAfter       DateTime @default(now())
+
+  @@index([userId])
+  @@index([complete, repairAfter])
+  @@map("cache_affinity_residency")
+}
+
+model CacheAffinityRecord {
+  id                   String   @id @default(cuid(2))
+  createdAt            DateTime @default(now())
+  lastUsedAt           DateTime @default(now())
+  expiresAt            DateTime
+  userId               String
+  tenantUserId         String
+  poolId               String
+  executionTargetId    String
+  cacheGeneration      String   @default("")
+  targetIdentity       String
+  digestVersion        Int      @default(5)
+  bindingDigest        String
+  prefixDigest         String?
+  conversationDigest   String?
+  sessionId            String
+  prefixDepth          Int
+  estimatedTokens      Int?
+  reportedTokens       Int?
+  engineCacheConfirmed Boolean  @default(false)
+  sharedWithSessionId  String?
+  sharedPrefixTokens   Int?
+
+  @@unique([tenantUserId, poolId, executionTargetId, targetIdentity, bindingDigest, prefixDigest])
+  @@index([tenantUserId, poolId, prefixDigest, expiresAt])
+  @@index([tenantUserId, poolId, conversationDigest, expiresAt])
+  @@index([userId, poolId, expiresAt])
+  @@index([executionTargetId, expiresAt])
+  @@index([executionTargetId, lastUsedAt])
+  @@index([sessionId])
+  @@index([userId, tenantUserId, poolId, executionTargetId, lastUsedAt, id])
+  @@index([userId, tenantUserId, poolId, expiresAt, id], map: "cache_affinity_record_expiry_batch")
+  @@map("cache_affinity_record")
+}
+
+model CacheAffinityNode {
+  id                String   @id @default(cuid(2))
+  userId            String
+  tenantUserId      String
+  poolId            String
+  executionTargetId String
+  cacheGeneration   String   @default("")
+  rootDigest        String
+  nodeDigest        String
+  depth             Int
+  sessionId         String
+  isTip             Boolean
+  estimatedTokens   Int?
+  reportedTokens    Int?
+  expiresAt         DateTime
+
+  @@unique([userId, tenantUserId, poolId, executionTargetId, rootDigest, nodeDigest, sessionId], map: "cache_affinity_node_owner_unique")
+  @@index([userId, tenantUserId, poolId, executionTargetId, rootDigest, nodeDigest, isTip, expiresAt, sessionId], map: "cache_affinity_node_probe")
+  @@index([sessionId])
+  @@index([expiresAt, id])
+  @@index([userId, poolId, expiresAt])
+  @@index([tenantUserId])
+  @@index([userId, tenantUserId, poolId, expiresAt, id], map: "cache_affinity_node_expiry_batch")
+  @@index([userId, tenantUserId, poolId, executionTargetId, sessionId], map: "cache_affinity_node_session_owner")
+  @@map("cache_affinity_node")
+}
+
+/// Responses API `previous_response_id` continuity (local target or consented cloud binding).
+model ResponseStickinessRecord {
+  id                       String    @id @default(cuid(2))
+  createdAt                DateTime  @default(now())
+  updatedAt                DateTime  @default(now()) @updatedAt
+  userId                   String
+  apiKeyId                 String?
+  warmSessionId            String?
+  warmBindingDigest        String?
+  warmRootDigest           String?
+  warmTipDigest            String?
+  warmTipDepth             Int?
+  warmCanonicalBytes       Int?
+  warmEstimatedTokens      Int?
+  routingKeyDigest         String
+  poolId                   String?
+  selectedTargetId         String?
+  providerAccountId        String?
+  providerModelId          String?
+  providerEndpointIdentity String?
+  providerEndpointVersion  Int?
+  providerUpstreamModelId  String?
+  shareId                  String?
+  nativeSurface            String?
+  upstreamResponseIdDigest String?
+  /// "local" | "cloud" | "own_key".
+  route                    String?
+  expiresAt                DateTime?
+
+  @@unique([userId, routingKeyDigest])
+  @@index([apiKeyId])
+  @@index([poolId])
+  @@index([selectedTargetId])
+  @@index([providerAccountId, providerEndpointVersion])
+  @@index([providerModelId])
+  @@index([shareId])
+  @@index([expiresAt])
+  @@map("response_stickiness_record")
+}

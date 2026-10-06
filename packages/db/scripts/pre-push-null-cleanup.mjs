@@ -4,13 +4,11 @@
  * mode (--accept-data-loss) deletes them.
  *
  * Authority per check:
- * - `cache_affinity_record."tenantUserId"` / `"bindingDigest"` / `"sessionId"`: the same
- *   predicates schema-hardening.sql deletes after the push (its
- *   `"tenantUserId" IS NULL` and `"bindingDigest" IS NULL` DELETEs); running
- *   them first only moves that deletion ahead of the push.
- * - `cli_device_credential."cliDeviceId"`: hardening has no equivalent. This
- *   cleanup is the only authority. The rows are credentials `master` left
- *   unbound after a device delete (SET NULL); their CLIs must log in again.
+ * - `cache_affinity_record."tenantUserId"` / `"bindingDigest"` / `"sessionId"`:
+ *   disposable prediction rows that cannot satisfy the NOT NULL columns.
+ *   (0.4.0 is a fresh baseline: these checks only matter when someone pushes
+ *   the new schema over an old database, which the release notes advise
+ *   against; they keep that push from failing on disposable rows.)
  *
  * Runs under the caller's session limits: push-schema.mjs connects with
  * lock_timeout and statement_timeout and retries lock conflicts. `pg` is
@@ -32,11 +30,6 @@ const CHECKS = [
     table: "cache_affinity_record",
     column: "bindingDigest",
     dangerousDelete: `DELETE FROM cache_affinity_record WHERE "bindingDigest" IS NULL`,
-  },
-  {
-    table: "cli_device_credential",
-    column: "cliDeviceId",
-    dangerousDelete: `DELETE FROM cli_device_credential WHERE "cliDeviceId" IS NULL`,
   },
 ];
 

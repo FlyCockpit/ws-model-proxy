@@ -1,0 +1,269 @@
+// ───────────────────────────── Nodes ─────────────────────────────
+
+/// What the server may do on a node. ONE value, held by the node (`config.json` "trust").
+/// Lowering latches on the node (a browser request is persisted there); only `wsmp trust full`
+/// on the node raises it. Read fresh on every action.
+enum NodeTrust {
+  /// Relay inference to the runtimes the node holds; PEOPLE (never agents) may start/stop the
+  /// definitions the node held when it entered RELAY (frozen), incl. their interactive steps.
+  /// No commands, files, browser shells, or definition / metric-command changes.
+  RELAY
+  /// The server is trusted with a shell on this node.
+  FULL
+}
+
+enum NodeConnection {
+  OFFLINE
+  ONLINE
+}
+
+/// Who did something. Shared by every audit and provenance column.
+enum Actor {
+  USER
+  AGENT
+  SYSTEM
+}
+
+model Node {
+  id                      String         @id @default(cuid(2))
+  createdAt               DateTime       @default(now())
+  updatedAt               DateTime       @default(now()) @updatedAt
+  userId                  String
+  /// Chosen at enrollment (default: hostname). Unique per user; never silently re-bound.
+  slug                    String
+  /// Display name set in the browser. Hello never writes it.
+  name                    String?
+  connection              NodeConnection @default(OFFLINE)
+  /// Monotonic fence: +1 per accepted hello; a stale disconnect cannot overwrite a successor.
+  connectionGeneration    Int            @default(0)
+  lastConnectedAt         DateTime?
+  lastDisconnectedAt      DateTime?
+  lastHeartbeatAt         DateTime?
+  cliVersion              String?
+  protocolVersion         String?
+  hostname                String?
+  rejectedProtocolVersion String?
+  rejectedCliVersion      String?
+  rejectedAt              DateTime?
+  /// The node's trust as the node reports it (hello / node.state). Null before the first hello.
+  trust                   NodeTrust?
+  trustChangedAt          DateTime?
+  /// A person lowered trust in the browser. From this moment the server treats the node as
+  /// RELAY; it sends `trust.lower` until the node reports RELAY, then clears these.
+  trustLowerRequestedAt   DateTime?
+  trustLowerRequestedBy   String?
+  /// Node-reported: every runtime version it holds (several per runtime are normal),
+  /// [{ runtimeId, versionId, launchHash }]. Frozen while trust is RELAY (no separate flag).
+  heldDefinitions         Json           @default("[]")
+  /// Node-reported (RELAY only): [{ runtimeId, headAddr }], the head each frozen multi-node
+  /// runtime last joined. A Relay-only multi-node start is refused in the preview without it.
+  frozenPeers             Json?
+  /// Node-reported: hash of the node metric commands it holds.
+  heldMetricCommandsHash  String?
+  /// Node metric commands: part of the node's definition, edited by people/agents at FULL,
+  /// pushed with runtime.define, frozen at RELAY, no hash approvals:
+  /// [{ name, command, intervalSecs, timeoutSecs, format: json|prometheus|lines, map }].
+  metricCommands          Json           @default("[]")
+  metricCommandsHash      String?
+  /// Node-reported features (terminals, operator terminals, file roots, file tools as root,
+  /// terminal approval, max terminals, runtime hosts, media expansion, live STT).
+  features                Json?
+  featuresAt              DateTime?
+  /// Latest node.info (detected hardware + the node-side declaration, each field with its source).
+  nodeInfo                Json?
+  nodeInfoAt              DateTime?
+  /// Latest node.metrics sample (at most one write a minute).
+  nodeMetrics             Json?
+  nodeMetricsAt           DateTime?
+  /// Browser/agent hardware declaration (agents only at FULL; audited). Wins over the node's own
+  /// declaration and detection, field by field: { kind, memoryGb, acceleratorMemoryGb,
+  /// reservedMemoryGb, reservedVramGb{gpuKey}, gpus[{vendor,index,name,vramGb}] }.
+  declaredResources       Json?
+  declaredResourcesAt     DateTime?
+  /// Placement labels (people; agents at FULL, audited). Effective = these ∪ node-declared.
+  labels                  String[]       @default([])
+  /// Port range for started instances (people; agents at FULL, audited).
+  portStart               Int            @default(30000)
+  portEnd                 Int            @default(30999)
+  /// Local servers the node found on common ports (runtime.detected).
+  detectedServers         Json?
+  detectedServersAt       DateTime?
+
+  User           User                 @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Credentials    NodeCredential[]
+  Runtimes       Runtime[]
+  Ranks          InstanceRank[]
+  QueuedCommands QueuedNodeCommand[]
+  ProfileNodes   ProfileNode[]
+  EnrolledBy     NodeEnrollmentCode[] @relation("EnrollmentUsedBy")
+  ReplacedBy     NodeEnrollmentCode[] @relation("EnrollmentReplaces")
+
+  @@unique([userId, slug])
+  @@unique([id, userId])
+  @@index([userId, connection])
+  @@index([lastHeartbeatAt])
+  @@map("node")
+}
+
+/// The one node credential type (replaces CliToken + CliDeviceCredential). Minted only by an
+/// enrollment-code exchange; bound to the identity key presented there. Hello signs a server
+/// nonce with that key.
+model NodeCredential {
+  id                String    @id @default(cuid(2))
+  createdAt         DateTime  @default(now())
+  userId            String
+  nodeId            String
+  lookupPrefix      String    @unique
+  secretDigest      String    @unique
+  /// Uncompressed P-256 public key, unpadded base64url.
+  identityPublicKey String
+  lastUsedAt        DateTime?
+  lastRefusedAt     DateTime?
+  lastRefusedReason String?
+  revokedAt         DateTime?
+
+  User User @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Node Node @relation(fields: [nodeId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([nodeId])
+  @@index([userId, revokedAt])
+  @@map("node_credential")
+}
+
+/// The only way to log a node in: a single-use, pre-approved code baked into the "Add a node"
+/// one-liner. Minting it is the person's approval (human-only). Secret: `wsmp_enr_` + 26
+/// base32 chars (130 bits); only sha256 is stored. Default TTL 1 h, max 7 d. Exchange is
+/// rate-limited per IP and per user.
+model NodeEnrollmentCode {
+  id            String    @id @default(cuid(2))
+  createdAt     DateTime  @default(now())
+  userId        String
+  /// The 8 characters after `wsmp_enr_`, for display.
+  codePrefix    String
+  codeDigest    String    @unique
+  expiresAt     DateTime
+  suggestedSlug String?
+  /// Set only by an explicit "Replace node <slug>" in the browser: the exchange moves that node
+  /// (definitions, instances, traffic) to the new identity key and revokes its old credential.
+  /// Without it, an existing slug with a different key is refused (`slug_taken`).
+  replaceNodeId String?
+  usedAt        DateTime?
+  usedByNodeId  String?
+  revokedAt     DateTime?
+
+  User        User  @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  UsedByNode  Node? @relation("EnrollmentUsedBy", fields: [usedByNodeId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  ReplaceNode Node? @relation("EnrollmentReplaces", fields: [replaceNodeId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([userId, expiresAt])
+  @@index([expiresAt])
+  @@map("node_enrollment_code")
+}
+
+enum NodeAuditKind {
+  command
+  file_read
+  file_stat
+  file_list
+  file_search
+  file_write
+  file_edit
+  file_rename
+  file_mkdir
+  file_delete
+  command_queued_for_user
+  browser_terminal
+  operator_terminal
+  runtime_define
+  runtime_remove
+  metric_commands_define
+  node_update
+  trust_lower
+  claim_forget
+}
+
+enum NodeAuditOutcome {
+  completed
+  refused
+  failed
+  cancelled
+  declined
+  expired
+  unknown
+  opened
+  accepted
+  closed
+  auto_settled
+}
+
+/// Everything done on or to a node by an agent or a person: commands, files, terminals,
+/// definition pushes, trust and Forget. Metadata only (never content, output or command
+/// text: commands are an HMAC digest + allowlisted program name). Plain ids, no foreign keys
+/// (owner history outside the deletion lock graph). Append-only. Replaces CliAgentActionEvent
+/// and DeploymentOperatorEvent.
+model NodeAuditEvent {
+  id           String           @id @default(cuid(2))
+  createdAt    DateTime         @default(now())
+  userId       String
+  nodeId       String
+  actor        Actor
+  agentTokenId String?
+  kind         NodeAuditKind
+  /// File path, `hmac-sha256:<hex> <program>` for commands, `runtime:<id>@<version>`, etc.
+  subject      String
+  etagBefore   String?
+  etagAfter    String?
+  bytes        BigInt?
+  instanceId   String?
+  stepId       String?
+  rank         Int?
+  exitCode     Int?
+  outcome      NodeAuditOutcome
+  reason       String?
+  startedAt    DateTime
+  finishedAt   DateTime?
+
+  @@index([userId, createdAt])
+  @@index([nodeId, createdAt])
+  @@index([createdAt])
+  @@map("node_audit_event")
+}
+
+enum QueuedCommandState {
+  QUEUED
+  RUN
+  DISMISSED
+  EXPIRED
+  REFUSED
+}
+
+/// A command an agent queued for a person (`node_command_queue_for_user`). The Terminals page
+/// lists QUEUED rows; "Run" opens a browser terminal with the text typed (the person presses
+/// Enter), "Dismiss" closes it. Holds the command text (unlike NodeAuditEvent). Rows are
+/// deleted 7 days after leaving QUEUED (the audit event keeps the digest for 90 days).
+model QueuedNodeCommand {
+  id           String             @id @default(cuid(2))
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @default(now()) @updatedAt
+  userId       String
+  nodeId       String
+  agentTokenId String?
+  /// ≤ 16 KiB, deployment text rules (no hidden characters).
+  command      String
+  note         String?
+  state        QueuedCommandState @default(QUEUED)
+  /// Default 24 h after creation.
+  expiresAt    DateTime
+  decidedAt    DateTime?
+  decidedBy    String?
+  /// REFUSED reason (node became Relay only, node offline at Run) or the browser terminal id.
+  outcome      String?
+
+  Node Node @relation(fields: [nodeId, userId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([userId, state, expiresAt])
+  @@index([nodeId, state])
+  @@index([state, expiresAt])
+  @@index([decidedAt])
+  @@map("queued_node_command")
+}

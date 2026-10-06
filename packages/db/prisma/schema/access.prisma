@@ -1,0 +1,126 @@
+// ───────────────────────────── Access ─────────────────────────────
+
+enum ApiKeyScope {
+  /// Every pool the user owns or has a share of, now and later.
+  ALL_POOLS
+  /// Only the pools in ApiKeyPool.
+  SELECTED_POOLS
+}
+
+/// Caller credential for /v1. Pools only (D1); no cloud flag (callers opt in with `:external`).
+model ApiKey {
+  id           String      @id @default(cuid(2))
+  createdAt    DateTime    @default(now())
+  userId       String
+  name         String
+  scope        ApiKeyScope @default(ALL_POOLS)
+  lookupPrefix String      @unique
+  secretDigest String      @unique
+  lastUsedAt   DateTime?
+  revokedAt    DateTime?
+  expiresAt    DateTime?
+
+  User  User         @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Pools ApiKeyPool[]
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+  @@map("api_key")
+}
+
+model ApiKeyPool {
+  apiKeyId String
+  poolId   String
+
+  ApiKey ApiKey @relation(fields: [apiKeyId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Pool   Pool   @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@id([apiKeyId, poolId])
+  @@index([poolId])
+  @@map("api_key_pool")
+}
+
+/// MCP OAuth/PAT grant tombstone (unchanged; not a Better Auth model).
+model McpGrant {
+  id          String     @id @default(cuid(2))
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @default(now()) @updatedAt
+  userId      String
+  clientId    String
+  referenceId String
+  /// READ or FULL (OAuth `mcp:read` / `mcp:write`). OAuth clients may be FULL.
+  level       AgentLevel @default(READ)
+  revokedAt   DateTime?
+
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  AgentToken AgentToken?
+
+  @@unique([userId, clientId, referenceId])
+  @@index([userId, clientId])
+  @@map("mcp_grant")
+}
+
+enum AgentLevel {
+  /// Every *_get tool, metrics_query, requests_list.
+  READ
+  /// Everything an agent may do (configure, start/stop/preempt, node commands and files on
+  /// FULL-trust nodes). Never grants anything (§6.3).
+  FULL
+}
+
+/// Human-minted agent (MCP) token. Replaces McpPersonalToken (scopes + allowCliCommands +
+/// allowCliFileRead collapse into `level`).
+model AgentToken {
+  id           String     @id
+  createdAt    DateTime   @default(now())
+  userId       String
+  name         String
+  level        AgentLevel
+  lookupPrefix String     @unique
+  secretDigest String     @unique
+  grantId      String     @unique
+  lastUsedAt   DateTime?
+  revokedAt    DateTime?
+  expiresAt    DateTime?
+
+  user  User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  grant McpGrant @relation(fields: [grantId], references: [id], onDelete: Cascade)
+
+  @@index([userId, revokedAt])
+  @@index([expiresAt])
+  @@map("agent_token")
+}
+
+/// A person's access to the owner's pool. Two permissions: "can use" (call it) and "can
+/// contribute" (add their own runtime models as members directly; replaces the 0.3 offer/accept
+/// contribution flow). Human-only.
+model Share {
+  id                       String         @id @default(cuid(2))
+  createdAt                DateTime       @default(now())
+  updatedAt                DateTime       @default(now()) @updatedAt
+  poolId                   String
+  ownerUserId              String
+  granteeUserId            String
+  canUse                   Boolean        @default(true)
+  canContribute            Boolean        @default(false)
+  /// Replaces the pool's class for this person. Null = the pool's class.
+  priorityClass            PriorityClass?
+  /// Advanced: warm-cache protection share for this person (0 = none, 1..100 %). Null = pool rule.
+  protectionPercent        Int?
+  /// Grantee-chosen own-key provider model (BYOK), allowed only while the pool declares
+  /// ownKeyEquivalentModel. Must belong to the grantee.
+  ownKeyProviderModelId    String?
+  ownKeyProtocolAdaptation Boolean        @default(false)
+
+  Pool        Pool           @relation(fields: [poolId, ownerUserId], references: [id, userId], onDelete: Cascade, onUpdate: Cascade)
+  Owner       User           @relation("ShareOwner", fields: [ownerUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Grantee     User           @relation("ShareGrantee", fields: [granteeUserId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  OwnKeyModel ProviderModel? @relation(fields: [ownKeyProviderModelId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+  SpendCap    SpendCap?
+  Contributed PoolMember[]
+
+  @@unique([poolId, granteeUserId])
+  @@index([granteeUserId])
+  @@index([ownKeyProviderModelId])
+  @@map("share")
+}

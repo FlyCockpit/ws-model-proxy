@@ -1,0 +1,199 @@
+// ───────────────────────────── Pools ─────────────────────────────
+
+/// Admission priority class; DRR weights 1 / 4 / 16 (ported from limits-redesign).
+/// Hot-path rows store the rank: 0 BACKGROUND, 1 NORMAL, 2 HIGH.
+enum PriorityClass {
+  BACKGROUND
+  NORMAL
+  HIGH
+}
+
+/// Who may make this pool spend cloud money. Callers still opt in per request with
+/// `owner/pool:external`. Human-only.
+enum FallbackMode {
+  OFF
+  OWNER
+  OWNER_AND_SHARES
+}
+
+enum MemberKind {
+  /// A runtime model: the owner's own or a contributed one.
+  LOCAL
+  /// A provider model of the pool owner (used only for `:external` within FallbackMode).
+  CLOUD
+}
+
+enum MemberState {
+  ACTIVE
+  DISABLED
+}
+
+enum SidecarInput {
+  IMAGE
+  AUDIO
+  VIDEO
+}
+
+/// The thing clients call: `owner/pool` (and `owner/pool:external`). Sub-objects live in
+/// 1:1 child tables created with the pool (trigger pool_create_children).
+model Pool {
+  id          String    @id @default(cuid(2))
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @default(now()) @updatedAt
+  userId      String
+  slug        String
+  name        String
+  description String?
+  /// Every LOCAL member's model and every CLOUD member must be of this type.
+  modelType   ModelType
+
+  User         User              @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Routing      PoolRouting?
+  Fallback     PoolFallback?
+  Advanced     PoolAdvanced?
+  Sidecars     PoolSidecar[]     @relation("PoolSidecars")
+  SidecarFor   PoolSidecar[]     @relation("PoolSidecarTarget")
+  Members      PoolMember[]
+  RoutingRules PoolRoutingRule[]
+  Shares       Share[]
+  ApiKeys      ApiKeyPool[]
+
+  @@unique([userId, slug])
+  @@unique([id, userId])
+  @@map("pool")
+}
+
+/// Fairness (the "Routing" tab): limits that are not physical.
+model PoolRouting {
+  poolId           String        @id
+  priorityClass    PriorityClass @default(NORMAL)
+  /// Pool-wide cap across all members (binds every member). Null = none.
+  concurrencyLimit Int?
+  /// Slots the pool keeps on each member instance (a guarantee, not a preference).
+  keptSlots        Int           @default(0)
+  /// May use slots other owners keep while they have no waiter.
+  borrowKept       Boolean       @default(true)
+  /// Route only to the owner's own runtimes: contributed members stay listed but are skipped,
+  /// and share holders cannot add new ones.
+  ownHardwareOnly  Boolean       @default(false)
+
+  Pool Pool @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@map("pool_routing")
+}
+
+/// Cloud fallback (the "Cloud" tab). `mode`, `paidWarmProtection` and `ownKeyEquivalentModel`
+/// are spend/egress consent: human-only.
+model PoolFallback {
+  poolId                String       @id
+  mode                  FallbackMode @default(OFF)
+  /// Exact vector space a cloud embeddings member must match.
+  embeddingContract     Json?
+  paidWarmProtection    Boolean      @default(false)
+  /// OpenRouter catalog id the owner declares equivalent: consent that share holders may use
+  /// their OWN provider keys for this pool (BYOK). Null = no consent.
+  ownKeyEquivalentModel String?
+
+  Pool Pool @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@map("pool_fallback")
+}
+
+/// Automatic defaults with optional overrides (the "Advanced" tab; agents may edit).
+/// Columns are what admission reads or fences on; everything else is one JSON object
+/// validated by the pool-defaults registry (null/absent = automatic).
+model PoolAdvanced {
+  poolId         String @id
+  /// THE one wait (owner decision): how long a request may queue for local capacity. A plain
+  /// request is then refused; an `:external` request then goes to the cloud. The cache-holder
+  /// spill-over wait is derived (automatic estimate, capped at this). Null = automatic (30 s).
+  maxWaitMs      Int?
+  contextCeiling Int?
+  contextMargin  Int?
+  /// { affinity: {enabled, ttlSeconds, maxRecords, prefixWeight, conversationWeight,
+  ///   confirmedCacheWeight, loadPenaltyWeight, residencyWeight},
+  ///   protection: {enabled, evictionFeedback, windowSeconds, minTokens, share,
+  ///   fixedPercent, ownerPercent},
+  ///   protocolAdaptation, allowLossyDeveloperRoleCollapse, recommendedSurface,
+  ///   maxAttachmentBytes, optimisticBasicTranscription }
+  overrides      Json   @default("{}")
+
+  Pool Pool @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@map("pool_advanced")
+}
+
+/// "Images go to pool X, audio to pool Y": media → text through another pool, which brings
+/// its own load balancing, admission, health and metrics (G8).
+model PoolSidecar {
+  id           String       @id @default(cuid(2))
+  poolId       String
+  input        SidecarInput
+  targetPoolId String
+  prompt       String?
+  timeoutMs    Int?
+  maxAssets    Int?
+
+  Pool       Pool @relation("PoolSidecars", fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  TargetPool Pool @relation("PoolSidecarTarget", fields: [targetPoolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@unique([poolId, input])
+  @@index([targetPoolId])
+  @@map("pool_sidecar")
+}
+
+model PoolMember {
+  id              String      @id @default(cuid(2))
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @default(now()) @updatedAt
+  poolId          String
+  kind            MemberKind
+  runtimeModelId  String?
+  providerModelId String?
+  /// Set when a share holder with "can contribute" added their own runtime model. Deleting the
+  /// share (or clearing canContribute) removes these members.
+  shareId         String?
+  /// Proportional share of new conversations among LOCAL members.
+  weight          Int         @default(1)
+  state           MemberState @default(ACTIVE)
+  /// CLOUD only: try order.
+  cloudOrder      Int?
+
+  Pool          Pool              @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  RuntimeModel  RuntimeModel?     @relation(fields: [runtimeModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  ProviderModel ProviderModel?    @relation(fields: [providerModelId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Share         Share?            @relation(fields: [shareId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  RoutingRules  PoolRoutingRule[]
+
+  @@unique([poolId, runtimeModelId])
+  @@unique([poolId, providerModelId])
+  @@index([runtimeModelId])
+  @@index([providerModelId])
+  @@index([shareId])
+  @@map("pool_member")
+}
+
+/// Metric-driven `full` / `avoid` rules over node metrics (incl. node metric commands) and
+/// runtime reader signals. At most 16 per pool. Agent-editable via pool_update.advanced.rules;
+/// the web shows them read-only on Advanced (no editor in 0.4.0).
+model PoolRoutingRule {
+  id        String   @id @default(cuid(2))
+  createdAt DateTime @default(now())
+  poolId    String
+  position  Int
+  metric    String
+  labels    Json?
+  aggregate String   @default("max")
+  op        String
+  threshold Float
+  effect    String
+  memberId  String?
+  exclude   Boolean  @default(false)
+
+  Pool   Pool        @relation(fields: [poolId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+  Member PoolMember? @relation(fields: [memberId], references: [id], onDelete: SetNull, onUpdate: Cascade)
+
+  @@unique([poolId, position])
+  @@index([memberId])
+  @@map("pool_routing_rule")
+}
